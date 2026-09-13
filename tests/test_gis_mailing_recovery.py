@@ -297,7 +297,7 @@ class TestJobEnrichmentDefersUnreachedParcels:
         assert row.mailing_address is None
         assert row.enrichment_data["mailing_lookup_deferred"] is True
         assert row.enrichment_data["situs_note"] == "kept"
-        assert summary.get("mailing_deferred") == 1
+        assert summary.get("mailing_deferred") == 1  # one parcel
 
     async def test_a_county_that_answered_is_not_deferred(
         self, db, business_user, redis_client, monkeypatch,
@@ -449,4 +449,20 @@ class TestCommitFailureKeepsTheDeferral(TestJobEnrichmentDefersUnreachedParcels)
         row = await _get(db, rid)
         assert row.mailing_address is None
         assert row.enrichment_data["mailing_lookup_deferred"] is True
-        assert summary.get("mailing_deferred") == 1
+        assert summary.get("mailing_deferred") == 1  # one parcel
+
+
+# ─── Codex gate, round 5 (2026-09-13) ─────────────────────────────────────────
+
+async def test_the_gis_kill_switch_stops_the_sweep(db, business_user, monkeypatch):
+    from src.config import settings
+
+    job_id = await _job(db, business_user, county="snohomish")
+    rid = await _row(db, business_user, job_id, parcel="00522400008900")
+    calls = _county_answers(monkeypatch, {"00522400008900": TX_MAIL})
+    monkeypatch.setattr(settings, "GIS_ENRICHMENT_ENABLED", False, raising=False)
+
+    stats = await asyncio.to_thread(mr.recover_deferred_gis_mailing)
+
+    assert calls == [] and stats["skipped"] == "GIS_ENRICHMENT_ENABLED is off"
+    assert (await _get(db, rid)).enrichment_data["mailing_lookup_deferred"] is True

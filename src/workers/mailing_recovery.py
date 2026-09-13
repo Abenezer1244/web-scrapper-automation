@@ -544,6 +544,11 @@ def recover_deferred_gis_mailing() -> dict:
 
     stats = {"candidates": 0, "parcels": 0, "found": 0, "none": 0, "unverified": 0,
              "errors": 0}
+    if not settings.GIS_ENRICHMENT_ENABLED:
+        # The operator kill switch covers background GIS requests too (Codex P2).
+        # Deferred rows keep their marker and resume once it is turned back on.
+        stats["skipped"] = "GIS_ENRICHMENT_ENABLED is off"
+        return stats
     counties = gis_mailing_source_counties("WA")
     if not counties:
         return stats

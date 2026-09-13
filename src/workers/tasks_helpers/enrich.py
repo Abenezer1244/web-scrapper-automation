@@ -304,7 +304,9 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                 batch_pids, config.county, config.state, stats=gis_stats
             )
             batch_updated = 0
-            batch_deferred = 0
+            # Parcels, not rows: one lookup serves every lead on a parcel, and the
+            # King summary counts parcels too (Codex P2).
+            batch_deferred: set[str] = set()
             for pid, gis_data in gis_results.items():
                 prop = gis_data.get("property_address")
                 mail = gis_data.get("mailing_address")
@@ -368,7 +370,7 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                         if ed.get("mailing_lookup_deferred") is not True:
                             ed["mailing_lookup_deferred"] = True
                             res.enrichment_data = ed
-                            batch_deferred += 1
+                            batch_deferred.add(pid)
             try:
                 db.commit()
             except Exception as exc:
@@ -392,7 +394,7 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                     # the lookup produced. Leave a marker-only write behind so the
                     # recovery sweep asks again; without it they read as "no address"
                     # forever (Codex P1). Counted only once it is actually stored.
-                    batch_deferred = 0
+                    batch_deferred = set()
                     try:
                         for pid in batch_pids:
                             for res in parcel_map.get(pid, []):
@@ -403,9 +405,9 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                                 if ed.get("mailing_lookup_deferred") is not True:
                                     ed["mailing_lookup_deferred"] = True
                                     res.enrichment_data = ed
-                                    batch_deferred += 1
+                                    batch_deferred.add(pid)
                         db.commit()
-                        gis_mailing_deferred += batch_deferred
+                        gis_mailing_deferred += len(batch_deferred)
                     except Exception as mark_exc:
                         db.rollback()
                         _logger.warning(
@@ -413,7 +415,7 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                             "not stored either: %s", job_id, str(mark_exc)[:120],
                         )
                 continue
-            gis_mailing_deferred += batch_deferred
+            gis_mailing_deferred += len(batch_deferred)
             rows_updated += batch_updated
             _publish_log(
                 r, job_id, "info",

@@ -19,6 +19,28 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-13 - Stripe follow-ups closed: timeouts, post-commit notices, the Redis read gone early
+
+**Built / Shipped:** backend #293 (`1d13554`): every Stripe call bounded by `STRIPE_TIMEOUT_SECONDS=10` and
+`STRIPE_MAX_NETWORK_RETRIES=1` (`src/config/stripe_client.py`, applied in the API and the Celery app); the
+payment-failed email and in-app notice now run as background tasks only after the webhook commits. Backend #292
+(`aa769d4`): the pre-ledger Redis dedup read and its test removed. Frontend #131 (`6b5afff`): API types
+regenerated for #290's webhook docstring. Railway api + worker SUCCESS on each.
+
+**Tried / Decided:** first notification design used SQLAlchemy `after_commit` session events; Codex failed it (the
+listener runs synchronously on the event loop and fires on savepoint commits). Returning notifications as data and
+scheduling them after the route's commit is simpler. Accepted trade: at-most-once notices. #292 was planned for
+after 2026-09-16 (3-day key TTL); Codex noted rolling deploys could have written keys after the deploy time, so
+production Redis was scanned read-only instead: 0 `stripe_event:*` keys, so it merged the same day.
+
+**Failed / Blocked:** Codex and pytest background runs were killed three times for low memory; foreground
+`gh run watch` was reliable. The API's `REDIS_URL` host is private; the Redis service's public URL worked.
+
+**Caught & fixed:** a test spy for `_dispatch_stripe_event` returned None once dispatch returned notifications.
+Dropped a planned email-masking change: `setup_logger` already redacts emails.
+
+**Pending / Handoff:** claim sandbox `acct_1UF5cBIoeMQyAQ5z` by 2026-09-20 for the 3-month test-clock run.
+
 ## 2026-09-13 - King mailing follow-ups: a 2-line tax-bill parser, 3,511 truncated addresses, em dashes
 
 **Built / Shipped:** #288 `2f1cb5c` (coordinate-less code violations get a terminal

@@ -44,7 +44,11 @@ SOURCE = "king_gis_point_in_parcel"
 # A lead address naming a unit ("#6", "UNIT 6", "APT 6", "STE 6") cannot be proven by a
 # street comparison: the normalizer strips units, so two condo units on one base parcel
 # would compare equal and one owner's mailing would land on another's lead (Codex P1).
-_UNIT_RE = re.compile(r"(?:#\s*\w+|\b(?:UNIT|APT|APARTMENT|STE|SUITE|BLDG|SPC|LOT)\s+\w+)", re.I)
+# Scanned across the WHOLE address and tolerant of "Apt. 6" / "Unit-6" (Codex r2 P1). A
+# false positive only leaves a lead unmatched, which is the safe direction.
+_UNIT_RE = re.compile(
+    r"(?:#\s*\w+|\b(?:UNIT|APT|APARTMENT|STE|SUITE|BLDG|BUILDING|SPC|SPACE|LOT|RM|ROOM|FL|FLOOR)"
+    r"\b\.?[\s\-]*\w+)", re.I)
 
 
 @dataclass(frozen=True)
@@ -68,7 +72,7 @@ def locate(lat: object, lon: object, property_address: str | None) -> Located:
         return Located("error")
     if not (-90 <= lat_f <= 90 and -180 <= lon_f <= 180):
         return Located("error")
-    if _UNIT_RE.search((property_address or "").split(",")[0]):
+    if _UNIT_RE.search(property_address or ""):
         return Located("unit_address")
     try:
         resp = safe_get(PARCEL_LAYER, params={

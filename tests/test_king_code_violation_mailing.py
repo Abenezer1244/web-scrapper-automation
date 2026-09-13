@@ -165,7 +165,9 @@ async def test_backfill_fills_done_rows_keeps_parcel_id_null_and_converges(
 def test_a_unit_address_is_never_matched_to_the_base_parcel(monkeypatch):
     _layer(monkeypatch, P0904)
     assert kpl.locate(47.6, -122.4, "5412 39TH AVE W #6, SEATTLE WA 98199").status == "unit_address"
-    assert kpl.locate(47.6, -122.4, "5412 39TH AVE W UNIT 6, SEATTLE WA 98199").status == "unit_address"
+    for addr in ("5412 39TH AVE W UNIT 6, SEATTLE WA 98199", "5412 39TH AVE W, APT 6, SEATTLE WA 98199",
+                 "5412 39TH AVE W Apt. 6, SEATTLE WA 98199", "5412 39TH AVE W Unit-6, SEATTLE WA 98199"):
+        assert kpl.locate(47.6, -122.4, addr).status == "unit_address", addr
 
 
 def test_a_truncated_response_is_not_one_polygon(monkeypatch):

@@ -14,6 +14,11 @@ Two passes over King County (WA) leads on terminal jobs:
                                   proof of provenance, so nothing is NULLed on it (Codex P1).
   2. DEFERRED FILL. Rows whose mailing lookup was deferred (King rate-limited the
      tax-bill page) get the extract's address when it has exactly one.
+  3. TRUNCATION REPAIR. Before #289 the tax-bill parser kept at most two lines, so a
+     three-line address was stored without its city, state and ZIP ("400 KC ADMIN
+     BLDG/4TH AVE, STE #830"). A row with no recorded mailing_source whose mailing does
+     not end in a postal code (`MAILING_POSTAL_TAIL_RE`, the parser's own rule) gets the
+     extract's address when it has exactly one; otherwise it is left as it is.
 
 Every write is a guarded single-row UPDATE (id, user_id, parcel_id and the old mailing
 value must all still match), stamps the source and the extract date, and recomputes the
@@ -42,6 +47,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from sqlalchemy import text  # noqa: E402
 
 REPAIR_REASON = "situs_echo"
+TRUNCATED_REASON = "truncated_taxbill"
 
 
 _CANDIDATES_SQL = """
@@ -88,6 +94,7 @@ _UPDATE_SQL = """
       AND ((CAST(:pass AS text) = 'echo_repair'
             AND btrim(coalesce(enrichment_data::jsonb->>'mailing_recovery_outcome', '')) = ''
             AND property_address IS NOT DISTINCT FROM :old_prop)
+           OR (CAST(:pass AS text) = 'truncated_repair' AND mailing_address IS NOT NULL)
            OR (CAST(:pass AS text) = 'deferred_fill'
                AND mailing_address IS NULL
                AND coalesce(enrichment_data::jsonb->>'mailing_lookup_deferred', '') = 'true'
@@ -117,12 +124,29 @@ def is_situs_echo(row) -> bool:
     return _street(mail) == _street(row.property_address) and bool(_ECHO_TAIL_RE.search(mail))
 
 
+def is_truncated(row) -> bool:
+    """An unsourced mailing that does not end in a postal code: the pre-#289 2-line cut."""
+    from src.scrapers.enrichment.king_county_assessor import MAILING_POSTAL_TAIL_RE
+
+    mail = row.mailing_address
+    if not mail or (row.mailing_source or "").strip():
+        return False
+    return not MAILING_POSTAL_TAIL_RE.search(mail)
+
+
 def plan(rows, answers) -> list[dict]:
     """Decide every candidate. Pure: no I/O, so the decision rules are tested directly."""
     decisions = []
     for row in rows:
         answer = answers.get(row.pid)
         if row.mailing_address is not None:
+            if is_truncated(row):
+                found = answer is not None and answer.status == "found"
+                decisions.append({"row": row,
+                                  "pass": "truncated_repair" if found else "truncated_unresolved",
+                                  "status": answer.status if answer else "absent",
+                                  "new_mail": answer.mailing_address if found else None})
+                continue
             if not is_situs_echo(row):
                 continue
             if answer is not None and answer.status == "found":
@@ -158,8 +182,9 @@ def apply(db, decisions, snapshot: str, *, commit_every: int = 500) -> Counter:
         payload: dict = {"mailing_rpacct_checked_at": now, "mailing_rpacct_snapshot": snapshot,
                          "mailing_source": SOURCE, "mailing_lookup_deferred": False,
                          "mailing_recovery_outcome": "found"}
-        if d["pass"] == "echo_repair":
-            payload["mailing_repair_reason"] = REPAIR_REASON
+        if d["pass"] in ("echo_repair", "truncated_repair"):
+            payload["mailing_repair_reason"] = (
+                REPAIR_REASON if d["pass"] == "echo_repair" else TRUNCATED_REASON)
             payload["mailing_repair_previous"] = row.mailing_address
         result = db.execute(text(_UPDATE_SQL), {
             "new_mail": d["new_mail"], "rid": row.id, "uid": row.user_id,

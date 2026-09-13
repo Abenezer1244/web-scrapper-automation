@@ -149,12 +149,23 @@ def _release_claims_of_cancelled_job(db, job_id: str, user_id) -> None:
     on the two exits that still had it (Codex).
 
     ``user_id`` must be a plain value, for the reason in _alert_dedup_release_failed.
+
+    The job's state is re-checked INSIDE the delete, not trusted from the caller:
+    both callers only know the job is terminal, and 'done' is terminal too. A
+    stale attempt overlapping a watchdog retry that already completed and billed
+    would otherwise strip a finished job's claims, and the next run would deliver
+    and bill those properties again (Codex). Only a job that is cancelled and was
+    never billed gives its claims up.
     """
     try:
         db.execute(
             sa_text(
                 "DELETE FROM delivered_records "
-                "WHERE first_job_id = :jid AND user_id = CAST(:uid AS uuid)"
+                "WHERE first_job_id = :jid AND user_id = CAST(:uid AS uuid) "
+                "  AND EXISTS (SELECT 1 FROM jobs j "
+                "              WHERE j.id = :jid AND j.user_id = CAST(:uid AS uuid) "
+                "                AND j.status = 'cancelled' "
+                "                AND j.billing_applied_at IS NULL)"
             ),
             {"jid": job_id, "uid": str(user_id)},
         )

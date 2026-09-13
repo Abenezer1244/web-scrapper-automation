@@ -420,6 +420,9 @@ async def test_a_run_cancelled_after_taking_a_claim_hands_it_back(
     new_job, _row_id = await _found_again(db, starter_user, scraper_config, h, old_job)
     assert await _transfer(db, new_job, starter_user.id) == 1
 
+    cancelled = await _fresh(db, Job, new_job)
+    cancelled.status = "cancelled"
+    await db.commit()
     await db.run_sync(lambda s: _release_claims_of_cancelled_job(s, new_job, starter_user.id))
     await db.commit()
 
@@ -431,3 +434,24 @@ async def test_a_run_cancelled_after_taking_a_claim_hands_it_back(
     assert (await _fresh(db, Result, anchor)).duplicate_reason == "superseded"
     # Only the cancelled run's claims go.
     assert (await _fresh(db, DeliveredRecord, other_claim)) is not None
+
+
+@pytest.mark.parametrize("status,billed", [("done", True), ("enriching", False), ("failed", False)])
+async def test_only_a_cancelled_unbilled_run_gives_its_claims_up(
+    db, starter_user: User, scraper_config: ScraperConfig, status, billed,
+):
+    """Both callers only know the job is terminal, and 'done' is terminal. A stale
+    attempt reaching the guard after a watchdog retry already finished must not
+    strip that finished run's claims (Codex)."""
+    from src.workers.tasks import _release_claims_of_cancelled_job
+
+    h = _strong()
+    job_id = await _job(db, starter_user, scraper_config, status=status,
+                        billed_at=AFTER_RULE if billed else None)
+    row = await _row(db, job_id, starter_user.id, h, property_address="5006 61ST ST CT E")
+    claim = await _claim(db, starter_user.id, h, row, job_id)
+
+    await db.run_sync(lambda s: _release_claims_of_cancelled_job(s, job_id, starter_user.id))
+    await db.commit()
+
+    assert (await _fresh(db, DeliveredRecord, claim)) is not None

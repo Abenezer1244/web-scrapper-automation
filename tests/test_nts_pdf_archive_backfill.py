@@ -116,14 +116,16 @@ def test_recent_issue_dates_are_oldest_first_and_weekday_anchored():
 def test_every_source_is_paired_with_its_own_parser():
     """King under the shared colon parser yields garbage — and a garbage row is worse
     than no row, because it upserts over the cache under a real TS number."""
-    from src.scrapers.sources.nts_king_pdf import parse_king_notice
-    from src.scrapers.sources.nts_tacoma_index import parse_nts_notice
+    from src.scrapers.sources.nts_king_pdf import parse_king_notice, parse_snoho_notice
 
     m = _backfill_module()
     srcs = m._sources()
     assert srcs["queen_anne_news"]["parse"] is parse_king_notice
     assert srcs["queen_anne_news"]["county"] == "king"
-    assert srcs["snohomish_tribune"]["parse"] is parse_nts_notice
+    # The Tribune carries the same Affinia / no-TS layouts (2026-09-09 issue), so its
+    # crawler task passes parse_snoho_notice (King's parser minus the collision-prone
+    # APN- key); the backfill must match the crawler.
+    assert srcs["snohomish_tribune"]["parse"] is parse_snoho_notice
     assert srcs["snohomish_tribune"]["county"] == "snohomish"
 
 

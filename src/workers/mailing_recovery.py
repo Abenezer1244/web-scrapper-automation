@@ -257,6 +257,27 @@ def _recover_impl(stats: dict, deadline: float | None = None) -> dict:
         )
 
         from src.scrapers.enrichment.king_county_assessor import batch_enrich_king_county
+        from src.scrapers.enrichment.king_rpacct import resolve_pins
+
+        # The Assessor extract answers most deferred parcels with no page request at
+        # all. Those are written as "found" now and removed from this tick's page list,
+        # so the rate-limited tax-bill page only sees what the file cannot answer.
+        _extract = resolve_pins(set(parcels))
+        if _extract is not None:
+            _answers, _snapshot = _extract
+            _hits = [p for p in parcels if _answers.get(p) and _answers[p].status == "found"]
+            if _hits:
+                _apply(db, by_parcel, _hits, {
+                    p: {"mailing_address": _answers[p].mailing_address, "mailing_lookup": "found",
+                        "source": "king_rpacct", "snapshot": _snapshot}
+                    for p in _hits
+                }, stats)
+                parcels = [p for p in parcels if p not in set(_hits)]
+                stats["extract_found"] = len(_hits)
+                _logger.info("Mailing recovery: %d parcel(s) answered by the King extract (%s)",
+                             len(_hits), _snapshot)
+            if not parcels:
+                return stats
 
         enriched: dict[str, dict] = {}
         king_stats: dict = {}
@@ -381,13 +402,15 @@ def _apply(db, by_parcel: dict, parcels: list[str], enriched: dict, stats: dict)
             # Terminal when the source gave a real answer of "no mailing address",
             # or when we have asked enough times. Anything else stays eligible.
             terminal = outcome in ("found", "none") or attempts >= _MAX_ATTEMPTS
-            _write_row(db, row, mailing, outcome, attempts, terminal, now_iso, stats)
+            _write_row(db, row, mailing, outcome, attempts, terminal, now_iso, stats,
+                       source=data.get("source") if mailing else None)
 
         stats[{"found": "found", "none": "none",
                "identity_unverified": "unverified"}.get(outcome, "errors")] += 1
 
 
-def _write_row(db, row, mailing, outcome, attempts, terminal, now_iso, stats) -> None:
+def _write_row(db, row, mailing, outcome, attempts, terminal, now_iso, stats,
+               source: str | None = None) -> None:
     """Conditional single-row write. Never overwrites, never widens its blast radius.
 
     The guard is the WHERE clause, not a read-then-write: this tick's lookup began
@@ -410,6 +433,10 @@ def _write_row(db, row, mailing, outcome, attempts, terminal, now_iso, stats) ->
         OUTCOME_KEY: outcome,
         DEFERRED_KEY: not terminal,
     }
+    if source:
+        # Provenance: a value from the Assessor extract must stay distinguishable
+        # from a tax-bill page answer (the extract is a dated snapshot).
+        payload["mailing_source"] = source
     # The owner-location flags are derived from the mailing address, and the job's
     # own recompute (tasks.py) ran while it was still NULL. Without this a recovered
     # absentee owner never reaches the absentee / out-of-state filters. Computed only

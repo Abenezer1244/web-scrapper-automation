@@ -296,3 +296,168 @@ async def test_an_unresolvable_echo_is_never_written(db, business_user, tmp_path
     assert stats["writes"] == {"left_unchanged_unresolved": 1}
     assert (await db.execute(text("SELECT mailing_address FROM results WHERE id = :i"),
                              {"i": rid})).scalar() == "506 S 330TH PL, FEDERAL WAY, WA 98003-5900"
+
+
+# ─── Phase B: live enrichment + recovery consult the extract first ───────────
+
+class TestCachedExtract:
+    def test_a_fresh_file_is_reused_without_downloading(self, monkeypatch, tmp_path):
+        from src.scrapers.enrichment import king_rpacct as mod
+
+        cache = tmp_path / "cache"
+        cache.mkdir()
+        (cache / "rpacct.zip").write_bytes(_extract(tmp_path, []).read_bytes())
+        (cache / "snapshot.json").write_text('{"snapshot": "2026-09-05"}', encoding="utf-8")
+        monkeypatch.setattr(mod, "_CACHE_DIR", cache)
+        monkeypatch.setattr(mod, "download_extract",
+                            lambda *a, **kw: (_ for _ in ()).throw(AssertionError("downloaded")))
+        path, snap = _REAL_CACHED_EXTRACT()
+        assert path == cache / "rpacct.zip" and snap == "2026-09-05"
+
+    def test_a_failed_refresh_keeps_the_old_file(self, monkeypatch, tmp_path):
+        import os
+        import time
+
+        from src.scrapers.enrichment import king_rpacct as mod
+
+        cache = tmp_path / "cache"
+        cache.mkdir()
+        z = cache / "rpacct.zip"
+        z.write_bytes(_extract(tmp_path, []).read_bytes())
+        old = time.time() - 3 * 24 * 3600
+        os.utime(z, (old, old))
+        monkeypatch.setattr(mod, "_CACHE_DIR", cache)
+
+        def _fail(*a, **kw):
+            raise RuntimeError("county site down")
+
+        monkeypatch.setattr(mod, "download_extract", _fail)
+        assert _REAL_CACHED_EXTRACT()[0] == z
+
+    def test_no_file_and_no_download_means_fall_back_to_pages(self, monkeypatch, tmp_path):
+        from src.scrapers.enrichment import king_rpacct as mod
+
+        monkeypatch.setattr(mod, "_CACHE_DIR", tmp_path / "empty")
+
+        def _fail(*a, **kw):
+            raise RuntimeError("county site down")
+
+        monkeypatch.setattr(mod, "download_extract", _fail)
+        assert _REAL_CACHED_EXTRACT() is None
+
+
+_REAL_CACHED_EXTRACT = kr.cached_extract  # captured at import, before conftest patches it
+
+
+def _use_extract(monkeypatch, path):
+    monkeypatch.setattr(kr, "cached_extract", lambda *a, **kw: (path, "2026-09-05"))
+
+
+def test_job_prefill_fills_only_missing_rows_from_an_unambiguous_answer(monkeypatch, tmp_path):
+    from src.workers.tasks_helpers.enrich import _fill_king_mailing_from_extract
+
+    _use_extract(monkeypatch, _extract(tmp_path, [
+        _acct("132140", "0230", "2736 ROSECLIFF TERRACE", "GRAPEVINE TX", "76051"),
+        _acct("145360", "1063", "12541 A 35TH AVE NE", "SEATTLE WA", "98125"),
+        _acct("145360", "1063", "560 NACHES AVE SW #110", "RENTON WA", "98057"),
+    ]))
+    empty = SimpleNamespace(mailing_address=None, enrichment_data={"keep": 1})
+    already = SimpleNamespace(mailing_address="PO BOX 1, KENT, WA 98032", enrichment_data=None)
+    ambiguous = SimpleNamespace(mailing_address=None, enrichment_data=None)
+
+    filled = _fill_king_mailing_from_extract(
+        {"1321400230": [empty, already], "1453601063": [ambiguous]}, "job")
+
+    assert filled == 1
+    assert empty.mailing_address == "2736 ROSECLIFF TERRACE, GRAPEVINE, TX 76051"
+    assert empty.enrichment_data == {"keep": 1, "mailing_source": "king_rpacct",
+                                     "mailing_rpacct_snapshot": "2026-09-05"}
+    assert already.mailing_address == "PO BOX 1, KENT, WA 98032"
+    assert ambiguous.mailing_address is None
+
+
+def test_job_prefill_without_an_extract_changes_nothing(monkeypatch):
+    from src.workers.tasks_helpers.enrich import _fill_king_mailing_from_extract
+
+    row = SimpleNamespace(mailing_address=None, enrichment_data=None)
+    assert _fill_king_mailing_from_extract({"1321400230": [row]}, "job") == 0
+    assert row.mailing_address is None
+
+
+@pytest.mark.asyncio
+async def test_recovery_takes_the_extract_answer_and_never_asks_the_page(
+    db, business_user, tmp_path, monkeypatch,
+):
+    from src.workers import mailing_recovery as mr
+
+    rid, _ = await _king_row(db, business_user, mailing=None, deferred=True)
+    _use_extract(monkeypatch, _extract(tmp_path, [
+        _acct("132140", "0230", "2736 ROSECLIFF TERRACE", "GRAPEVINE TX", "76051")]))
+    monkeypatch.setattr("src.scrapers.enrichment.source_health.is_source_available",
+                        lambda *a, **kw: True)
+    monkeypatch.setattr(mr, "_acquire_single_flight", lambda: False)
+    monkeypatch.setattr(mr, "_release_single_flight", lambda _c: None)
+    asked: list = []
+
+    async def _page(parcels, **kw):
+        asked.extend(parcels)
+        return {}
+
+    monkeypatch.setattr(
+        "src.scrapers.enrichment.king_county_assessor.batch_enrich_king_county", _page)
+
+    stats = await asyncio.to_thread(mr.recover_deferred_king_mailing)
+
+    assert asked == [] and stats["extract_found"] == 1
+    row = (await db.execute(text("SELECT mailing_address, enrichment_data FROM results "
+                                 "WHERE id = :i"), {"i": rid})).first()
+    assert row.mailing_address == "2736 ROSECLIFF TERRACE, GRAPEVINE, TX 76051"
+    assert row.enrichment_data["mailing_source"] == "king_rpacct"
+    assert row.enrichment_data["mailing_recovery_outcome"] == "found"
+
+
+@pytest.mark.asyncio
+async def test_a_live_king_job_skips_the_tax_bill_page_for_extract_answered_parcels(
+    db, business_user, redis_client, tmp_path, monkeypatch,
+):
+    """Behavioral, not source-shape: run the real enrichment pass for a King job."""
+    answered, _ = await _king_row(db, business_user, mailing=None, status="enriching",
+                                  parcel="1321400230")
+    job_id = (await db.execute(text("SELECT job_id FROM results WHERE id = :i"),
+                               {"i": answered})).scalar()
+    other = str(uuid.uuid4())
+    db.add(Result(id=other, user_id=business_user.id, job_id=job_id, party_name="DOE JANE",
+                  parcel_id="9999900001", property_address="1 MAIN ST", mailing_address=None,
+                  skip_trace_status="not_attempted", is_duplicate=False))
+    await db.commit()
+    _use_extract(monkeypatch, _extract(tmp_path, [
+        _acct("132140", "0230", "2736 ROSECLIFF TERRACE", "GRAPEVINE TX", "76051")]))
+    page_mailing_asked: list = []
+
+    async def _king(parcel_ids, **kw):
+        if kw.get("tax_urls_out") is not None:          # pass 1: property + tax-bill URL
+            for p in parcel_ids:
+                kw["tax_urls_out"][p] = f"https://payment.kingcounty.gov/x?p={p}"
+            return {p: {"property_address": None} for p in parcel_ids}
+        page_mailing_asked.extend(kw.get("tax_urls_in") or {})  # pass 2: mailing page
+        return {}
+
+    monkeypatch.setattr(
+        "src.scrapers.enrichment.king_county_assessor.batch_enrich_king_county", _king)
+    monkeypatch.setattr("src.scrapers.enrichment.county_gis.batch_enrich_parcels_gis",
+                        lambda *a, **kw: {})
+
+    def _go():
+        from src.db.session import system_sync_session
+        from src.workers.tasks_helpers.enrich import _run_inline_enrichment
+
+        with system_sync_session() as sdb:
+            job = sdb.get(Job, str(job_id))
+            config = sdb.get(ScraperConfig, job.scraper_config_id)
+            _run_inline_enrichment(sdb, job, redis_client, str(job_id), config, summary={})
+
+    await asyncio.to_thread(_go)
+
+    assert page_mailing_asked == ["9999900001"]
+    assert (await db.execute(text("SELECT mailing_address FROM results WHERE id = :i"),
+                             {"i": answered})).scalar() == "2736 ROSECLIFF TERRACE, GRAPEVINE, TX 76051"

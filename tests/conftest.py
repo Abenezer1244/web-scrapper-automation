@@ -104,6 +104,22 @@ def _flush_redis():
     yield
 
 
+# ─── King Assessor extract: off unless a test opts in ─────────────────────────
+
+@pytest.fixture(autouse=True)
+def _no_king_extract_download(monkeypatch):
+    """King enrichment now consults an 18 MB county download before the tax-bill pages.
+
+    No test may reach the network for it, and a cached file from another run must not
+    silently change what an unrelated King test observes. A test of the extract itself
+    re-patches `cached_extract` with a zip it builds in tmp_path (the later patch wins).
+    """
+    from src.scrapers.enrichment import king_rpacct
+
+    monkeypatch.setattr(king_rpacct, "cached_extract", lambda *a, **kw: None)
+    yield
+
+
 # ─── Database fixture ─────────────────────────────────────────────────────────
 
 @pytest_asyncio.fixture

@@ -28,7 +28,11 @@ from __future__ import annotations
 
 import csv
 import io
+import json
+import os
 import re
+import tempfile
+import time
 import zipfile
 from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
@@ -74,6 +78,56 @@ def download_extract(dest: Path, timeout: int = 300) -> str:
     snapshot = parsedate_to_datetime(modified).date().isoformat() if modified else "unknown"
     _logger.info("King RPAcct extract downloaded: %d bytes, snapshot %s", len(body), snapshot)
     return snapshot
+
+
+# Worker-local cache. The file changes weekly, so one download a day per container is
+# plenty, and a job must never pay an 18 MB download per run.
+_CACHE_DIR = Path(tempfile.gettempdir()) / "bridgeleads_king_rpacct"
+_CACHE_MAX_AGE_S = 24 * 3600
+
+
+def cached_extract(max_age_s: float = _CACHE_MAX_AGE_S) -> tuple[Path, str] | None:
+    """(zip path, snapshot date) for a recent extract, downloading when stale or missing.
+
+    Returns None when there is no usable file at all; the caller then falls back to the
+    per-parcel tax-bill pages exactly as before. A failed refresh keeps using the file
+    already on disk (a days-old snapshot beats none), and says so in the log.
+    """
+    zip_path = _CACHE_DIR / "rpacct.zip"
+    meta_path = _CACHE_DIR / "snapshot.json"
+    fresh = zip_path.exists() and (time.time() - zip_path.stat().st_mtime) < max_age_s
+    if not fresh:
+        try:
+            _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            # Download beside the target and rename: two workers refreshing at once
+            # must never leave a half-written zip for a third to read.
+            tmp = _CACHE_DIR / f"rpacct.{os.getpid()}.part"
+            snapshot = download_extract(tmp)
+            os.replace(tmp, zip_path)
+            meta_path.write_text(json.dumps({"snapshot": snapshot}), encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001 -- enrichment falls back to the pages
+            _logger.warning("King RPAcct refresh failed: %s", str(exc)[:160])
+            if not zip_path.exists():
+                return None
+    try:
+        snapshot = json.loads(meta_path.read_text(encoding="utf-8")).get("snapshot", "unknown")
+    except (OSError, ValueError):
+        snapshot = "unknown"
+    return zip_path, snapshot
+
+
+def resolve_pins(pins: set[str]) -> tuple[dict[str, Answer], str] | None:
+    """Answers for ``pins`` from the cached extract, or None when no extract is usable."""
+    cached = cached_extract()
+    if cached is None or not pins:
+        return None
+    zip_path, snapshot = cached
+    try:
+        accounts = load_accounts(zip_path, pins)
+    except Exception as exc:  # noqa: BLE001 -- a bad file must not break enrichment
+        _logger.warning("King RPAcct read failed: %s", str(exc)[:160])
+        return None
+    return {pin: resolve(accounts.get(pin)) for pin in pins}, snapshot
 
 
 def _csv_name(zf: zipfile.ZipFile) -> str:

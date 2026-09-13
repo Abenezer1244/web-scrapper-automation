@@ -65,6 +65,10 @@ WITH orphan AS (
     FROM results r
     WHERE r.is_duplicate IS TRUE
       AND r.dedup_hash IS NOT NULL
+      -- 'superseded': the row held a claim it never delivered and a later run
+      -- took it over (transfer_undelivered_claims). Its flag is not an assertion
+      -- of delivery, so a released claim does not make it an orphan (Codex).
+      AND COALESCE(r.duplicate_reason, '') <> 'superseded'
       AND (CAST(:uid AS uuid) IS NULL OR r.user_id = CAST(:uid AS uuid))
       -- Scoped to the seed job's OWNER as well as its hashes. Matching on
       -- dedup_hash alone made an orphan in a DIFFERENT account eligible
@@ -91,6 +95,8 @@ ranked AS (
     JOIN orphan o ON o.user_id = r.user_id AND o.dedup_hash = r.dedup_hash
     JOIN jobs j ON j.id = r.job_id AND j.user_id = r.user_id
     WHERE j.status = 'done'
+      -- A superseded row was never delivered: it can never be the delivery.
+      AND COALESCE(r.duplicate_reason, '') <> 'superseded'
 )
 """
 
@@ -158,7 +164,7 @@ WHERE dr.user_id = r.user_id
   AND own.status = 'done'
   AND r.job_id <> dr.first_job_id
   AND r.is_duplicate IS TRUE
-  AND COALESCE(r.duplicate_reason, '') <> 'same_run'
+  AND COALESCE(r.duplicate_reason, '') NOT IN ('same_run', 'superseded')
   AND dr.first_result_id = ANY(CAST(:ids AS uuid[]))
 """
 

@@ -57,6 +57,12 @@ to understand *why* the code is the way it is and *what's been attempted before*
   isolated DB (it copied the env from the handoff). Reruns alone were clean. Never overlap the two.
 
 **Caught & fixed:** 2 P1 (round 6), 2 P1 + 1 P2 (round 7), 1 P2 (round 8), 1 P2 (round 9).
+Round 10 (after merging origin/main #279-#293, reconciling #280's dispatcher filter and sweep with the
+billed/pre-stamp delivery rule): P2 fixed, `repair_orphaned_duplicate_flags.py` could resurrect a
+`superseded` row whose claim the plan cap later released. P1 REJECTED on the design record (handoff §5):
+"use claim-time evidence" would transfer a claim whose old row mailing recovery already put in that run's
+live download, delivering the property twice and billing it again. Suite on the merge: 3,147 passed; the 9
+failures (7 entitlement + 2 `test_promo_access` webhook) fail identically on a clean origin/main worktree.
 
 **Pending / Handoff:** Codex round 10 on `effe66e` (then repeat until no P1/P2); owner approval before push/PR;
 after deploy verify the worker role still has DELETE on `delivered_records` (the sweep raises without it) and

@@ -456,6 +456,40 @@ async def test_a_promoted_row_the_plan_cap_then_excludes_releases_the_claim(
     assert (await _fresh(db, Result, anchor)).duplicate_reason == "superseded"
 
 
+async def test_the_orphan_repair_never_resurrects_a_superseded_row(
+    db, starter_user: User, scraper_config: ScraperConfig,
+):
+    """After the handover the plan cap released the claim, so the old row is a
+    duplicate with no claim behind it: exactly what
+    scripts/repair_orphaned_duplicate_flags.py restores. It must not: that row was
+    never delivered, and promoting it would undo the handover (Codex review
+    round 10). The script's own ranking query decides what it would restore."""
+    import importlib.util
+    from pathlib import Path
+
+    from sqlalchemy import text
+
+    h, old_job, anchor, _ = await _setup_undelivered(db, starter_user, scraper_config)
+    new_job, row = await _found_again(db, starter_user, scraper_config, h, old_job)
+    await _transfer(db, new_job, starter_user.id)
+    capped = await _fresh(db, Result, row)
+    capped.enrichment_data = {DELIVERY_EXCLUDED_KEY: OVER_QUOTA}
+    await db.commit()
+    await db.run_sync(lambda s: release_capped_dedup_claims(s, str(starter_user.id), new_job, [row]))
+    await db.commit()
+
+    path = Path(__file__).resolve().parents[1] / "scripts" / "repair_orphaned_duplicate_flags.py"
+    spec = importlib.util.spec_from_file_location("repair_orphaned_duplicate_flags", path)
+    repair = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(repair)
+    summary = (await db.execute(
+        text(repair._Q_SUMMARY), {"uid": str(starter_user.id), "jid": None}
+    )).first()
+
+    assert summary.winners == 0
+    assert (await _fresh(db, Result, anchor)).duplicate_reason == "superseded"
+
+
 async def test_another_accounts_claim_on_the_same_property_is_untouched(
     db, starter_user: User, business_user: User, scraper_config: ScraperConfig,
 ):

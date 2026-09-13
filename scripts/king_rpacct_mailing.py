@@ -10,8 +10,8 @@ Two passes over King County (WA) leads on terminal jobs:
      property, then ", CITY, WA ZIP") and nothing records a verified mailing source.
        extract has one address -> that address (even when it IS the property: then the
                                   county itself says the owner gets mail there)
-       otherwise               -> NULL + mailing_lookup_deferred, so the tax-bill
-                                  recovery sweep asks the county page instead
+       otherwise               -> left exactly as it is, and counted. Shape alone is not
+                                  proof of provenance, so nothing is NULLed on it (Codex P1).
   2. DEFERRED FILL. Rows whose mailing lookup was deferred (King rate-limited the
      tax-bill page) get the extract's address when it has exactly one.
 
@@ -82,6 +82,17 @@ _UPDATE_SQL = """
       AND user_id = :uid
       AND parcel_id = :raw_pid
       AND mailing_address IS NOT DISTINCT FROM :old_mail
+      -- Fail closed on metadata this merge could destroy: an array or scalar (rows an old
+      -- null-merge bug already damaged) is skipped, never replaced (Codex P1).
+      AND (enrichment_data IS NULL OR jsonb_typeof(enrichment_data::jsonb) IN ('object', 'null'))
+      -- Eligibility re-asserted at write time, not only at read time (Codex P1).
+      AND coalesce(enrichment_data::jsonb->>'mailing_source', '')
+          NOT IN ('king_assessor_tax_bill', 'king_rpacct')
+      AND coalesce(enrichment_data::jsonb->>'mailing_recovery_outcome', '') <> 'found'
+      AND (CAST(:pass AS text) = 'echo_repair'
+           OR (mailing_address IS NULL
+               AND coalesce(enrichment_data::jsonb->>'mailing_lookup_deferred', '') = 'true'))
+      AND EXISTS (SELECT 1 FROM jobs j WHERE j.id = results.job_id AND j.status = 'done')
 """
 
 _ECHO_TAIL_RE = re.compile(r",\s*[A-Z][A-Z .'\-]*,\s*WA\s+\d{5}(?:-\d{4})?\s*$", re.I)
@@ -112,14 +123,14 @@ def plan(rows, answers) -> list[dict]:
                 continue
             if answer is not None and answer.status == "found":
                 decisions.append({"row": row, "pass": "echo_repair", "status": answer.status,
-                                  "new_mail": answer.mailing_address, "defer": False})
+                                  "new_mail": answer.mailing_address})
             else:
-                decisions.append({"row": row, "pass": "echo_repair",
+                decisions.append({"row": row, "pass": "echo_unresolved",
                                   "status": answer.status if answer else "absent",
-                                  "new_mail": None, "defer": True})
+                                  "new_mail": None})
         elif row.deferred and answer is not None and answer.status == "found":
             decisions.append({"row": row, "pass": "deferred_fill", "status": answer.status,
-                              "new_mail": answer.mailing_address, "defer": False})
+                              "new_mail": answer.mailing_address})
     return decisions
 
 
@@ -129,29 +140,29 @@ def apply(db, decisions, snapshot: str, *, commit_every: int = 500) -> Counter:
 
     counts: Counter = Counter()
     now = datetime.now(UTC).isoformat()
-    for i, d in enumerate(decisions, 1):
+    writable = [d for d in decisions if d["new_mail"]]
+    if len(decisions) > len(writable):
+        counts["left_unchanged_unresolved"] = len(decisions) - len(writable)
+    for i, d in enumerate(writable, 1):
         row = d["row"]
         flags = compute_owner_flags(
             row.property_address, d["new_mail"], property_city=row.property_city,
             property_state=row.property_state, property_zip=row.property_zip,
         )
-        payload: dict = {"mailing_rpacct_checked_at": now, "mailing_rpacct_snapshot": snapshot}
-        if d["new_mail"]:
-            payload.update({"mailing_source": SOURCE, "mailing_lookup_deferred": False,
-                            "mailing_recovery_outcome": "found"})
-        else:
-            payload.update({"mailing_lookup_deferred": True})
+        payload: dict = {"mailing_rpacct_checked_at": now, "mailing_rpacct_snapshot": snapshot,
+                         "mailing_source": SOURCE, "mailing_lookup_deferred": False,
+                         "mailing_recovery_outcome": "found"}
         if d["pass"] == "echo_repair":
             payload["mailing_repair_reason"] = REPAIR_REASON
             payload["mailing_repair_previous"] = row.mailing_address
         result = db.execute(text(_UPDATE_SQL), {
             "new_mail": d["new_mail"], "rid": row.id, "uid": row.user_id,
-            "raw_pid": row.raw_pid, "old_mail": row.mailing_address,
+            "raw_pid": row.raw_pid, "old_mail": row.mailing_address, "pass": d["pass"],
             "payload": json.dumps(payload),
             "f_property_state": flags["property_state"], "f_owner_state": flags["owner_state"],
             "f_absentee": flags["absentee_owner"], "f_out_of_state": flags["out_of_state_owner"],
         })
-        counts["written" if result.rowcount else "changed_under_us"] += 1
+        counts["written" if result.rowcount else "skipped_by_write_guard"] += 1
         if i % commit_every == 0:
             db.commit()
     db.commit()
@@ -169,7 +180,7 @@ def run(db, zip_path: Path, snapshot: str, *, apply_writes: bool, report: Path |
 
     summary: Counter = Counter()
     for d in decisions:
-        outcome = "replace" if d["new_mail"] else "null_and_defer"
+        outcome = "replace" if d["new_mail"] else "left_unchanged"
         same = d["new_mail"] is not None and d["row"].mailing_address is not None and (
             _street(d["new_mail"]) == _street(d["row"].mailing_address))
         summary[f"{d['pass']}:{outcome}{':county_confirms_property' if same else ''}"] += 1

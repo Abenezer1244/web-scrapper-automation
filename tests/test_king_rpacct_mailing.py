@@ -81,6 +81,16 @@ class TestFormatAndResolve:
         b = _acct("000020", "0006", "2835 140TH AVE NE", "BELLEVUE WA", "98005-1234")
         assert kr.resolve([a, b]).status == "found"
 
+    def test_same_street_in_two_cities_is_ambiguous(self):
+        a = _acct("100000", "0001", "100 MAIN ST", "KENT WA", "98032")
+        b = _acct("100000", "0001", "100 MAIN ST", "AUBURN WA", "98002")
+        assert kr.resolve([a, b]) == kr.Answer("ambiguous")
+
+    def test_malformed_major_minor_never_matches(self):
+        assert kr.pin_of("12A456", "0001") is None
+        assert kr.pin_of("1234567", "0001") is None
+        assert kr.pin_of("000020", "0001") == "0000200001"
+
     def test_absent_and_no_address(self):
         assert kr.resolve(None) == kr.Answer("absent")
         assert kr.resolve([_acct("1", "2", "", "SEATTLE WA", "98101")]) == kr.Answer("no_address")
@@ -124,9 +134,9 @@ class TestPlan:
         [d] = km.plan([_row()], {"1321400230": TX})
         assert (d["pass"], d["new_mail"]) == ("echo_repair", TX.mailing_address)
 
-    def test_an_unresolvable_echo_is_cleared_and_deferred_never_kept(self):
+    def test_an_unresolvable_echo_is_left_alone_never_nulled(self):
         [d] = km.plan([_row()], {"1321400230": kr.Answer("ambiguous")})
-        assert (d["new_mail"], d["defer"]) == (None, True)
+        assert (d["pass"], d["new_mail"]) == ("echo_unresolved", None)
 
     def test_a_tax_bill_formatted_value_is_not_an_echo(self):
         # The real tax-bill parser writes "STREET, CITY ST ZIP" (no comma before the state).
@@ -246,6 +256,38 @@ async def test_a_row_that_changed_since_the_read_is_not_overwritten(db, business
             return km.apply(sdb, decisions, "2026-09-05")
 
     counts = await asyncio.to_thread(_race)
-    assert counts["changed_under_us"] == 1
+    assert counts["skipped_by_write_guard"] == 1
     assert (await db.execute(text("SELECT mailing_address FROM results WHERE id = :i"),
                              {"i": rid})).scalar() == "PO BOX 9, KENT, WA 98032"
+
+
+@pytest.mark.asyncio
+async def test_non_object_enrichment_data_is_skipped_not_replaced(db, business_user, tmp_path):
+    rid, _ = await _king_row(db, business_user, mailing="506 S 330TH PL, FEDERAL WAY, WA 98003-5900")
+    await db.execute(text("UPDATE results SET enrichment_data = CAST(:v AS json) WHERE id = :i"),
+                     {"v": '[null, {"situs_city": "FEDERAL WAY"}]', "i": rid})
+    await db.commit()
+    path = _extract(tmp_path, [_acct("132140", "0230", "2736 ROSECLIFF TERRACE", "GRAPEVINE TX", "76051")])
+
+    stats = await asyncio.to_thread(_run, path, True, tmp_path)
+
+    assert stats["writes"]["skipped_by_write_guard"] == 1
+    row = (await db.execute(text("SELECT mailing_address, enrichment_data::text AS ed FROM results "
+                                 "WHERE id = :i"), {"i": rid})).first()
+    assert row.mailing_address == "506 S 330TH PL, FEDERAL WAY, WA 98003-5900"
+    assert "situs_city" in row.ed
+
+
+@pytest.mark.asyncio
+async def test_an_unresolvable_echo_is_never_written(db, business_user, tmp_path):
+    rid, _ = await _king_row(db, business_user, mailing="506 S 330TH PL, FEDERAL WAY, WA 98003-5900")
+    path = _extract(tmp_path, [
+        _acct("132140", "0230", "506 S 330TH PL", "FEDERAL WAY WA", "98003"),
+        _acct("132140", "0230", "560 NACHES AVE SW #110", "RENTON WA", "98057"),
+    ])
+
+    stats = await asyncio.to_thread(_run, path, True, tmp_path)
+
+    assert stats["writes"] == {"left_unchanged_unresolved": 1}
+    assert (await db.execute(text("SELECT mailing_address FROM results WHERE id = :i"),
+                             {"i": rid})).scalar() == "506 S 330TH PL, FEDERAL WAY, WA 98003-5900"

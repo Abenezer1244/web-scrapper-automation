@@ -83,9 +83,16 @@ def _csv_name(zf: zipfile.ZipFile) -> str:
     return names[0]
 
 
-def pin_of(major: str, minor: str) -> str:
-    """The 10-digit PIN BridgeLeads stores as King's parcel_id (Major 6 + Minor 4)."""
-    return (major or "").strip().zfill(6) + (minor or "").strip().zfill(4)
+def pin_of(major: str, minor: str) -> str | None:
+    """The 10-digit PIN BridgeLeads stores as King's parcel_id (Major 6 + Minor 4).
+
+    None for a malformed row: zero-padding a non-numeric or over-long value could make it
+    collide with a real parcel and attach another owner's address (Codex P2).
+    """
+    major, minor = (major or "").strip(), (minor or "").strip()
+    if not (major.isdigit() and minor.isdigit() and len(major) <= 6 and len(minor) <= 4):
+        return None
+    return major.zfill(6) + minor.zfill(4)
 
 
 def load_accounts(zip_path: Path, pins: set[str]) -> dict[str, list[dict[str, str]]]:
@@ -98,7 +105,7 @@ def load_accounts(zip_path: Path, pins: set[str]) -> dict[str, list[dict[str, st
             raise RuntimeError(f"King RPAcct schema changed, missing columns: {sorted(missing)}")
         for row in reader:
             pin = pin_of(row["Major"], row["Minor"])
-            if pin in pins:
+            if pin is not None and pin in pins:
                 out.setdefault(pin, []).append(
                     {k: row.get(k) or "" for k in ("AddrLine", "CityState", "ZipCode")})
     return out
@@ -131,11 +138,16 @@ def format_mailing(row: dict[str, str]) -> str | None:
 
 
 def _identity(address: str) -> str:
-    """Formatting-insensitive key: two accounts naming one address are one answer."""
-    street, _, rest = address.partition(",")
-    zip5 = re.search(r"\b(\d{5})\b", rest)
-    return " ".join(re.sub(r"[^A-Z0-9# ]", " ", street.upper()).split()) + "|" + (
-        zip5.group(1) if zip5 else rest.strip().upper())
+    """Formatting-insensitive key: two accounts naming one address are one answer.
+
+    Street, locality and ZIP5 all take part (Codex P2): one street in two cities is two
+    addresses. ZIP+4 is ignored because accounts spell one address with and without it.
+    An account with no address is not an answer and does not make a parcel ambiguous.
+    """
+    norm = " ".join(re.sub(r"[^A-Z0-9# ]", " ", address.upper()).split())
+    tail = re.search(r"\s(\d{5})(?:\s\d{4})?$", norm)
+    body = norm[: tail.start()] if tail else norm
+    return body + "|" + (tail.group(1) if tail else "")
 
 
 def resolve(accounts: list[dict[str, str]] | None) -> Answer:

@@ -24,6 +24,7 @@ from src.db.models import DeliveredRecord, Job, Result, ScraperConfig, User
 from src.db.session import system_sync_session
 from src.workers.property_identity import legacy_strong_signature
 from src.workers.tasks_helpers.dedup import (
+    BILLING_STAMP_RELIABLE_SINCE,
     NO_ADDRESS_NOT_BILLED_SINCE,
     release_capped_dedup_claims,
     transfer_undelivered_claims,
@@ -32,6 +33,8 @@ from src.workers.tasks_helpers.dedup import (
 PARCEL = "0320248026"
 AFTER_RULE = NO_ADDRESS_NOT_BILLED_SINCE + timedelta(days=2)
 BEFORE_RULE = NO_ADDRESS_NOT_BILLED_SINCE - timedelta(hours=3)
+# Created before billing was stamped: a NULL billing_applied_at proves nothing.
+LEGACY = BILLING_STAMP_RELIABLE_SINCE - timedelta(days=1)
 
 
 def _strong(parcel=PARCEL, address=None) -> str:
@@ -41,10 +44,11 @@ def _strong(parcel=PARCEL, address=None) -> str:
 
 
 async def _job(db, user: User, config: ScraperConfig, *, status="done",
-               billed_at=AFTER_RULE) -> str:
+               billed_at=AFTER_RULE, created_at=None) -> str:
     job_id = str(uuid.uuid4())
+    extra = {"created_at": created_at} if created_at is not None else {}
     db.add(Job(id=job_id, user_id=user.id, scraper_config_id=config.id,
-               status=status, trigger="manual", billing_applied_at=billed_at))
+               status=status, trigger="manual", billing_applied_at=billed_at, **extra))
     await db.commit()
     return job_id
 
@@ -234,6 +238,54 @@ async def test_an_addressed_row_on_a_run_that_never_billed_still_delivered_nothi
     assert old.duplicate_reason == "superseded"
 
 
+@pytest.mark.parametrize("status", ["failed", "cancelled"])
+async def test_a_run_from_before_billing_was_stamped_keeps_its_claim(
+    db, starter_user: User, scraper_config: ScraperConfig, status,
+):
+    """Before migration 063 a job could charge and still end failed or cancelled
+    with no billing stamp. For those runs NULL does not mean unbilled, so the
+    claim must keep suppressing (Codex review round 7)."""
+    h, old_job, _, _ = await _setup_undelivered(
+        db, starter_user, scraper_config, status=status, billed_at=None, created_at=LEGACY)
+    new_job, row = await _found_again(db, starter_user, scraper_config, h, old_job)
+
+    assert await _transfer(db, new_job, starter_user.id) == 0
+    assert (await _fresh(db, Result, row)).is_duplicate is True
+
+
+async def test_a_sibling_the_old_run_delivered_keeps_the_claim(
+    db, starter_user: User, scraper_config: ScraperConfig,
+):
+    """Before same-run collapse existed, one run could hold two unflagged rows for a
+    property. The claim may name the one without an address while the other was
+    exported and billed; the property was delivered (Codex review round 7)."""
+    h, old_job, _, _ = await _setup_undelivered(db, starter_user, scraper_config)
+    await _row(db, old_job, starter_user.id, h, property_address="5006 61ST ST CT E")
+    new_job, row = await _found_again(db, starter_user, scraper_config, h, old_job)
+
+    assert await _transfer(db, new_job, starter_user.id) == 0
+    assert (await _fresh(db, Result, row)).is_duplicate is True
+
+
+async def test_every_undelivered_row_of_the_old_run_is_hidden_not_only_the_anchor(
+    db, starter_user: User, scraper_config: ScraperConfig,
+):
+    """An unflagged sibling with no address was not delivered either, but a later
+    mailing backfill would put it in the old run's live download next to the
+    promoted row. It is superseded with the anchor."""
+    h, old_job, anchor, _ = await _setup_undelivered(db, starter_user, scraper_config)
+    sibling = await _row(db, old_job, starter_user.id, h)
+    new_job, row = await _found_again(db, starter_user, scraper_config, h, old_job)
+
+    assert await _transfer(db, new_job, starter_user.id) == 1
+
+    for rid in (anchor, sibling):
+        hidden = await _fresh(db, Result, rid)
+        assert hidden.is_duplicate is True
+        assert hidden.duplicate_reason == "superseded"
+    assert (await _fresh(db, Result, row)).is_duplicate is False
+
+
 async def test_a_run_still_in_flight_is_never_robbed(
     db, starter_user: User, scraper_config: ScraperConfig,
 ):
@@ -407,9 +459,9 @@ async def test_another_accounts_claim_on_the_same_property_is_untouched(
 async def test_two_runs_racing_for_one_claim_deliver_it_once(
     db, starter_user: User, scraper_config: ScraperConfig,
 ):
-    """Both later runs found the property with an address. The claim row lock
-    serialises them; the loser re-reads an anchor that is now actionable and
-    stops, so exactly one row ships."""
+    """Both later runs found the property with an address. The row and claim locks
+    serialise them; the loser finds the claim already moved and stops, so exactly
+    one row ships."""
     h, old_job, _, claim = await _setup_undelivered(db, starter_user, scraper_config)
     job_a, row_a = await _found_again(db, starter_user, scraper_config, h, old_job)
     job_b, row_b = await _found_again(db, starter_user, scraper_config, h, old_job)
@@ -496,25 +548,46 @@ async def test_only_a_cancelled_unbilled_run_gives_its_claims_up(
     assert (await _fresh(db, DeliveredRecord, claim)) is not None
 
 
+async def test_a_cancelled_run_from_before_billing_was_stamped_keeps_its_claims(
+    db, starter_user: User, scraper_config: ScraperConfig,
+):
+    """A requeued pre-063 job can reach this exit; its NULL stamp proves nothing."""
+    from src.workers.tasks import _release_claims_of_cancelled_job
+
+    h = _strong()
+    job_id = await _job(db, starter_user, scraper_config, status="cancelled",
+                        billed_at=None, created_at=LEGACY)
+    row = await _row(db, job_id, starter_user.id, h, property_address="5006 61ST ST CT E")
+    claim = await _claim(db, starter_user.id, h, row, job_id)
+
+    await db.run_sync(lambda s: _release_claims_of_cancelled_job(s, job_id, starter_user.id))
+    await db.commit()
+
+    assert (await _fresh(db, DeliveredRecord, claim)) is not None
+
+
 # ── the sweep: claims of a job that ended while no worker ran it ─────────────
 
 
-@pytest.mark.parametrize("status,billed,released", [
-    ("cancelled", False, True),    # worker died, then the job was cancelled
-    ("failed", False, True),       # watchdog permanent-fail writes only status
-    ("done", True, False),         # a real delivery
-    ("done", False, False),        # done before billing was stamped (pre-063): delivered
-    ("cancelled", True, False),    # billed: something was charged, keep it
-    ("enriching", False, False),   # still running
+@pytest.mark.parametrize("status,billed,legacy,released", [
+    ("cancelled", False, False, True),   # worker died, then the job was cancelled
+    ("failed", False, False, True),      # watchdog permanent-fail writes only status
+    ("done", True, False, False),        # a real delivery
+    ("done", False, False, False),       # done before billing was stamped (pre-063): delivered
+    ("cancelled", True, False, False),   # billed: something was charged, keep it
+    ("enriching", False, False, False),  # still running
+    ("failed", False, True, False),      # pre-063: a NULL stamp does not prove unbilled
+    ("cancelled", False, True, False),   # pre-063, same
 ])
 async def test_the_sweep_releases_only_claims_nothing_was_delivered_for(
-    db, starter_user: User, scraper_config: ScraperConfig, status, billed, released,
+    db, starter_user: User, scraper_config: ScraperConfig, status, billed, legacy, released,
 ):
     from src.workers.tasks_helpers.status import sweep_stranded_dedup_claims
 
     h = _strong()
     job_id = await _job(db, starter_user, scraper_config, status=status,
-                        billed_at=AFTER_RULE if billed else None)
+                        billed_at=AFTER_RULE if billed else None,
+                        created_at=LEGACY if legacy else None)
     row = await _row(db, job_id, starter_user.id, h, property_address="5006 61ST ST CT E")
     claim = await _claim(db, starter_user.id, h, row, job_id)
 

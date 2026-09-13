@@ -834,6 +834,14 @@ def reconcile_same_run_survivors(db, job_id: str, user_id, record_type=None) -> 
 # rule, billed 0), so the merge instant is exact enough on both sides.
 NO_ADDRESS_NOT_BILLED_SINCE = datetime(2026, 9, 3, 12, 5, 28, tzinfo=UTC)
 
+# From when a NULL jobs.billing_applied_at proves a job never charged. Migration
+# 063 added the stamp with PR #59 (merged and deployed 2026-06-18 01:35 UTC);
+# an older job could charge records_used and still end failed or cancelled with
+# no stamp. Compared with jobs.created_at (a job's lifetime; started_at resets
+# on every watchdog retry). The day of margin only makes a few newer jobs keep
+# suppressing, which is the safe direction.
+BILLING_STAMP_RELIABLE_SINCE = datetime(2026, 6, 19, tzinfo=UTC)
+
 
 def transfer_undelivered_claims(db, job_id: str, user_id, record_type=None) -> int:
     """Hand a claim to THIS run when the run holding it never delivered the lead.
@@ -854,9 +862,9 @@ def transfer_undelivered_claims(db, job_id: str, user_id, record_type=None) -> i
     Runs after enrichment and the survivor re-election (actionability is known)
     and BEFORE the plan cap, so the cap ranks the promoted row and billing,
     export and skip trace all see it. Each hash is its own transaction; per hash,
-    every condition is re-evaluated after the claim row is locked, so two runs
-    transferring the same claim cannot both win (the second re-reads the first
-    run's actionable anchor and stops).
+    every condition is re-evaluated after the holding run's rows and the claim
+    are locked, so two runs transferring the same claim cannot both win (the
+    second finds the claim already moved and stops).
 
     A claim is transferred only when all of these hold:
       - its hash is STRONG, proven from the parcel/address stored ON THE CLAIM at
@@ -866,11 +874,15 @@ def transfer_undelivered_claims(db, job_id: str, user_id, record_type=None) -> i
       - its anchor row still exists for this user on another job. A NULL anchor
         means the source run was purged; delivery cannot be disproved, so the
         claim keeps suppressing.
-      - the anchor's run delivered nothing chargeable for it: failed/cancelled
-        and never billed (no export exists, so its row's address does not
-        matter), or done, billed after NO_ADDRESS_NOT_BILLED_SINCE, with the
-        anchor not actionable (no address, or excluded by the plan cap).
+      - the anchor's run delivered nothing chargeable for it: failed/cancelled,
+        never billed and created after BILLING_STAMP_RELIABLE_SINCE (no export
+        exists, so its rows' addresses do not matter), or done, billed after
+        NO_ADDRESS_NOT_BILLED_SINCE, with no unflagged actionable row for the
+        property (none with an address and not excluded by the plan cap).
         A run still in flight is never robbed.
+
+    The anchor and every unflagged row of the old run for the property become
+    'superseded'.
 
     Returns the number of claims transferred (each un-flags exactly one row).
     """
@@ -913,9 +925,49 @@ def transfer_undelivered_claims(db, job_id: str, user_id, record_type=None) -> i
 
 def _transfer_one_claim(db, job_id, uid, user_id, dedup_hash, members, record_type) -> bool:
     """One hash of transfer_undelivered_claims, in its own transaction. Returns
-    True when the claim moved. Every condition is evaluated under the lock."""
+    True when the claim moved.
+
+    Lock order is result rows, then the claim: reconciliation, the same-run
+    collapse and the plan cap all take them in that order, so the reverse would
+    deadlock against them (Codex review round 7). The claim is first read without
+    a lock only to learn which run holds it; every condition is then evaluated
+    after both locks, and a claim that moved in between is left alone.
+    """
     from src.api.lead_actionability import actionable_sql
 
+    peek = db.execute(
+        sa_text(
+            "SELECT d.first_result_id, a.job_id "
+            "FROM delivered_records d "
+            "JOIN results a ON a.id = d.first_result_id AND a.user_id = d.user_id "
+            "WHERE d.user_id = CAST(:uid AS uuid) AND d.dedup_hash = :hash"
+        ),
+        {"uid": uid, "hash": dedup_hash},
+    ).first()
+    # No claim, or its anchor row is gone (a purged source run cannot disprove
+    # delivery), or this run already holds it.
+    if peek is None or str(peek.job_id) == str(job_id):
+        db.rollback()
+        return False
+    old_job = str(peek.job_id)
+
+    # Every row of the holding run for this property, not only the anchor: before
+    # the same-run collapse existed one run could hold two unflagged rows for a
+    # property, and the one the claim names may not be the one it delivered.
+    # Ordered by id with this run's rows, so concurrent transfers lock alike.
+    locked = db.execute(
+        sa_text(
+            "SELECT r.id, r.job_id, r.is_duplicate, "
+            f"  {actionable_sql('r')} AS actionable "
+            "FROM results r "
+            "WHERE r.user_id = CAST(:uid AS uuid) "
+            "  AND (r.id = ANY(CAST(:mids AS uuid[])) "
+            "       OR (r.job_id = CAST(:ojid AS uuid) AND r.dedup_hash = :hash)) "
+            "ORDER BY r.id FOR UPDATE"
+        ),
+        {"uid": uid, "hash": dedup_hash, "ojid": old_job,
+         "mids": [str(m.get("id")) for m in members]},
+    ).fetchall()
     claim = db.execute(
         sa_text(
             "SELECT id, first_result_id, parcel_id, property_address "
@@ -925,41 +977,44 @@ def _transfer_one_claim(db, job_id, uid, user_id, dedup_hash, members, record_ty
         ),
         {"uid": uid, "hash": dedup_hash},
     ).first()
-    if claim is None or claim.first_result_id is None:
-        db.rollback()
-        return False
-    if legacy_strong_signature(claim.parcel_id, claim.property_address) != dedup_hash:
-        db.rollback()
-        return False
-    anchor = db.execute(
-        sa_text(
-            "SELECT a.id, a.job_id, j.status, j.billing_applied_at, "
-            f"  {actionable_sql('a')} AS actionable "
-            "FROM results a JOIN jobs j ON j.id = a.job_id "
-            "WHERE a.id = CAST(:aid AS uuid) AND a.user_id = CAST(:uid AS uuid) "
-            "FOR UPDATE OF a"
-        ),
-        {"aid": str(claim.first_result_id), "uid": uid},
-    ).first()
+    old_rows = [r for r in locked if str(r.job_id) == old_job]
     if (
-        anchor is None
-        or str(anchor.job_id) == str(job_id)
-        or not (
-            # A job can bill and only later be marked failed/cancelled (a cancel
-            # racing the done-CAS), so a terminal status alone does not prove
-            # "charged nothing"; the sweep and the cancellation release use the
-            # same rule. Such a run never wrote an export (export_key comes only
-            # from the done-CAS), so whether its row has an address is
-            # irrelevant: nobody received it (Codex review round 6).
-            (anchor.status in ("failed", "cancelled") and anchor.billing_applied_at is None)
-            or (
-                # A done run delivered every actionable row, so only a row that
-                # was not actionable can have been left undelivered.
-                anchor.status == "done"
-                and not anchor.actionable
-                and anchor.billing_applied_at is not None
-                and anchor.billing_applied_at >= NO_ADDRESS_NOT_BILLED_SINCE
-            )
+        claim is None
+        or str(claim.first_result_id) != str(peek.first_result_id)
+        or not any(str(r.id) == str(claim.first_result_id) for r in old_rows)
+        or legacy_strong_signature(claim.parcel_id, claim.property_address) != dedup_hash
+    ):
+        db.rollback()
+        return False
+    holder = db.execute(
+        sa_text(
+            "SELECT status, billing_applied_at, created_at FROM jobs "
+            "WHERE id = CAST(:ojid AS uuid) AND user_id = CAST(:uid AS uuid)"
+        ),
+        {"ojid": old_job, "uid": uid},
+    ).first()
+    # The worker's own export and billing predicate. The live download adds view
+    # filters on top, but never ships a row outside this set.
+    delivered_a_row = any(not r.is_duplicate and r.actionable for r in old_rows)
+    if holder is None or not (
+        # A job can bill and only later be marked failed/cancelled (a cancel
+        # racing the done-CAS), so a terminal status alone does not prove
+        # "charged nothing"; the sweep and the cancellation release use the same
+        # rule. Such a run never wrote an export (export_key comes only from the
+        # done-CAS), so whether its rows have an address is irrelevant: nobody
+        # received them (Codex review round 6). Before billing was stamped a
+        # NULL stamp proves nothing (Codex review round 7).
+        (
+            holder.status in ("failed", "cancelled")
+            and holder.billing_applied_at is None
+            and holder.created_at >= BILLING_STAMP_RELIABLE_SINCE
+        )
+        or (
+            # A done run delivered every unflagged actionable row it holds.
+            holder.status == "done"
+            and not delivered_a_row
+            and holder.billing_applied_at is not None
+            and holder.billing_applied_at >= NO_ADDRESS_NOT_BILLED_SINCE
         )
     ):
         db.rollback()
@@ -1001,13 +1056,18 @@ def _transfer_one_claim(db, job_id, uid, user_id, dedup_hash, members, record_ty
             db, user_id, elected.get("id"),
             _merged_survivor_fields(elected, members, record_type),
         )
+    # The anchor and every unflagged row of the old run for this property: none
+    # was delivered, and a later mailing backfill on any of them would otherwise
+    # put the property in the old run's live download next to the promoted row.
+    hidden = sorted({str(claim.first_result_id)}
+                    | {str(r.id) for r in old_rows if not r.is_duplicate})
     db.execute(
         sa_text(
             "UPDATE results SET is_duplicate = true, duplicate_reason = 'superseded', "
             "  duplicate_source_job_id = :jid, duplicate_source_at = clock_timestamp() "
-            "WHERE id = CAST(:aid AS uuid) AND user_id = CAST(:uid AS uuid)"
+            "WHERE id = ANY(CAST(:hidden AS uuid[])) AND user_id = CAST(:uid AS uuid)"
         ),
-        {**params, "aid": str(anchor.id)},
+        {**params, "hidden": hidden},
     )
     db.commit()
     return True

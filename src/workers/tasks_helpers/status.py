@@ -19,6 +19,7 @@ from sqlalchemy import text
 from src.api.quota_window import reservation_is_current_sql
 from src.config import settings
 from src.utils.logger import setup_logger
+from src.workers.tasks_helpers.dedup import BILLING_STAMP_RELIABLE_SINCE
 
 _logger = setup_logger("worker.task")
 
@@ -380,7 +381,9 @@ def sweep_stranded_dedup_claims(limit: int = 5000) -> int:
 
     The state is exact: failed or cancelled AND never billed. Such a job exported
     nothing a customer can reach (export_key is only written by the done-CAS) and
-    charged nothing. A 'done' job, or any job that billed, is never touched.
+    charged nothing. A 'done' job, or any job that billed, is never touched. Nor
+    is a job created before BILLING_STAMP_RELIABLE_SINCE: it could have charged
+    without leaving a stamp, so its claims keep suppressing (Codex review round 7).
 
     Deliberately raises on error rather than logging: a sweep that silently could
     not delete is how 16,761 claims stranded on 2026-09-04.
@@ -398,10 +401,11 @@ def sweep_stranded_dedup_claims(limit: int = 5000) -> int:
                 "  JOIN jobs j ON j.id = d.first_job_id AND j.user_id = d.user_id "
                 "  WHERE j.status IN ('failed', 'cancelled') "
                 "    AND j.billing_applied_at IS NULL "
+                "    AND j.created_at >= :since "
                 "  LIMIT :lim"
                 ")"
             ),
-            {"lim": limit},
+            {"lim": limit, "since": BILLING_STAMP_RELIABLE_SINCE},
         )
         db.commit()
         released = result.rowcount or 0

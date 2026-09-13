@@ -200,7 +200,7 @@ def recover_deferred_king_mailing() -> dict:
         _release_single_flight(lock)
 
 
-def _recover_impl(stats: dict) -> dict:
+def _recover_impl(stats: dict, deadline: float | None = None) -> dict:
     from src.db.session import system_sync_session
     from src.scrapers.enrichment.source_health import (
         KING_EREALPROPERTY,
@@ -208,7 +208,13 @@ def _recover_impl(stats: dict) -> dict:
         is_source_available,
     )
 
-    deadline = time.monotonic() + _TICK_BUDGET_S
+    if deadline is None:
+        deadline = time.monotonic() + _TICK_BUDGET_S
+    if deadline - time.monotonic() < 60:
+        # Not enough of the shared tick left for even one paced King batch. The next
+        # tick picks it up; starting now would only overrun the schedule.
+        stats["skipped"] = "tick budget spent before the King sweep"
+        return stats
 
     with system_sync_session() as db:
         # Respect the same gate as every other caller. The canary, not this sweep,
@@ -614,12 +620,16 @@ def run_mailing_recovery_tick() -> dict:
         king["skipped"] = "another tick is running"
         return {"gis": {}, "king": king}
     try:
+        # ONE budget for the whole tick (Codex P2): the King sweep gets what the GIS
+        # sweep left, not a fresh 480 s, so a slow GIS pass cannot push the tick past
+        # the 10-minute schedule and make the next beat skip on the lock.
+        deadline = time.monotonic() + _TICK_BUDGET_S
         gis: dict = {}
         try:
             gis = recover_deferred_gis_mailing()
         except Exception as exc:  # noqa: BLE001 -- must not block the King tick
             _logger.warning("GIS mailing recovery tick failed: %s", str(exc)[:160])
-        return {"gis": gis, "king": _recover_impl(king)}
+        return {"gis": gis, "king": _recover_impl(king, deadline=deadline)}
     finally:
         _release_single_flight(lock)
 

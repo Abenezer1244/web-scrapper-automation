@@ -836,6 +836,8 @@ _MAIL_STREET_START_RE = re.compile(
     r"(?:\b|(?<=\s))(?:\d|#|P\.?\s*O\.?\s*B|PSC\b|RR\b|HC\b)", re.I
 )
 
+_MAIL_PO_BOX_START_RE = re.compile(r"(?:\b|(?<=\s))P\.?\s*O\.?\s*B(?:OX)?\b", re.I)
+
 # Values that are a stand-in for "no data", not an address. UNKNOWN is the token
 # address_intel._PLACEHOLDER_STREET_RE already measured in production.
 _MAIL_PLACEHOLDER_RE = re.compile(r"^\s*(?:UNKNOWN|NONE|N/?A|NULL)\s*$", re.I)
@@ -892,7 +894,11 @@ def _compose_mailing(attrs: dict, gis_config: dict) -> str | None:
             continue
         trimmed = candidate
         if _ADDRESSEE_PREFIX_RE.match(candidate):
-            start = _MAIL_STREET_START_RE.search(candidate)
+            # A post-office box is an unambiguous street start, so it wins over an
+            # earlier bare number: in "DEPT 42 PO BOX 330310" the 42 belongs to the
+            # addressee, and cutting there stored "42 PO BOX 330310" (Codex P2).
+            start = _MAIL_PO_BOX_START_RE.search(candidate) or _MAIL_STREET_START_RE.search(
+                candidate)
             trimmed = candidate[start.start():].strip() if start else candidate
         if _MAIL_STREET_SHAPE_RE.match(trimmed):
             street = trimmed

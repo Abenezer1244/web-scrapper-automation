@@ -304,6 +304,7 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                 batch_pids, config.county, config.state, stats=gis_stats
             )
             batch_updated = 0
+            batch_deferred = 0
             for pid, gis_data in gis_results.items():
                 prop = gis_data.get("property_address")
                 mail = gis_data.get("mailing_address")
@@ -367,7 +368,7 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                         if ed.get("mailing_lookup_deferred") is not True:
                             ed["mailing_lookup_deferred"] = True
                             res.enrichment_data = ed
-                            gis_mailing_deferred += 1
+                            batch_deferred += 1
             try:
                 db.commit()
             except Exception as exc:
@@ -385,7 +386,34 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                     "Job %s: GIS batch commit failed at %d/%d: %s",
                     job_id, i, len(all_pids), str(exc)[:120],
                 )
+                if gis_mailing_source:
+                    # The rollback discarded this batch's mailing fills AND any
+                    # deferral markers, so none of its rows got the mailing answer
+                    # the lookup produced. Leave a marker-only write behind so the
+                    # recovery sweep asks again; without it they read as "no address"
+                    # forever (Codex P1). Counted only once it is actually stored.
+                    batch_deferred = 0
+                    try:
+                        for pid in batch_pids:
+                            for res in parcel_map.get(pid, []):
+                                if res.mailing_address:
+                                    continue
+                                ed = (dict(res.enrichment_data)
+                                      if isinstance(res.enrichment_data, dict) else {})
+                                if ed.get("mailing_lookup_deferred") is not True:
+                                    ed["mailing_lookup_deferred"] = True
+                                    res.enrichment_data = ed
+                                    batch_deferred += 1
+                        db.commit()
+                        gis_mailing_deferred += batch_deferred
+                    except Exception as mark_exc:
+                        db.rollback()
+                        _logger.warning(
+                            "Job %s: deferral markers after a failed GIS commit were "
+                            "not stored either: %s", job_id, str(mark_exc)[:120],
+                        )
                 continue
+            gis_mailing_deferred += batch_deferred
             rows_updated += batch_updated
             _publish_log(
                 r, job_id, "info",

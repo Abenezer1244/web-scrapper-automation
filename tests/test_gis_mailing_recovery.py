@@ -383,3 +383,70 @@ async def test_the_gis_sweep_does_not_run_when_another_tick_holds_the_lock(
 
     assert calls == []
     assert tick["king"]["skipped"] == "another tick is running"
+
+
+# ─── Codex gate, round 4 (2026-09-13) ─────────────────────────────────────────
+
+def test_a_po_box_after_a_numbered_department_is_where_the_street_starts():
+    cfg = {"mailing_street_fields": ["taxprline1"],
+           "mailing_locality_fields": ["taxprcity", "taxprstate", "taxprzip"]}
+    out = cg._compose_mailing({"taxprline1": "DEPT 42 PO BOX 330310", "taxprcity": "SEATTLE",
+                               "taxprstate": "WA", "taxprzip": "98133"}, cfg)
+    assert out == "PO BOX 330310, SEATTLE, WA 98133"
+
+
+async def test_the_king_sweep_gets_only_what_the_gis_sweep_left(monkeypatch):
+    import time as _time
+
+    monkeypatch.setattr(mr, "_acquire_single_flight", lambda: False)
+    monkeypatch.setattr(mr, "_release_single_flight", lambda _c: None)
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(_time, "monotonic", lambda: clock["now"])
+
+    def _slow_gis():
+        clock["now"] += mr._TICK_BUDGET_S - 30   # GIS ate almost the whole tick
+        return {"parcels": 0}
+
+    monkeypatch.setattr(mr, "recover_deferred_gis_mailing", _slow_gis)
+    tick = await asyncio.to_thread(mr.run_mailing_recovery_tick)
+    assert tick["king"]["skipped"] == "tick budget spent before the King sweep"
+
+
+class TestCommitFailureKeepsTheDeferral(TestJobEnrichmentDefersUnreachedParcels):
+    async def test_markers_survive_a_rolled_back_gis_batch(
+        self, db, business_user, redis_client, monkeypatch,
+    ):
+        """The batch commit fails once. Its fills are lost, but the rows must still be
+        queued for recovery, and the summary must count only what was stored."""
+        from sqlalchemy.orm import Session
+
+        real_commit = Session.commit
+        state = {"failed": False}
+
+        def _flaky_commit(self_):
+            if not state["failed"] and any(
+                isinstance(o, Result) and o.mailing_address for o in self_.dirty
+            ):
+                state["failed"] = True
+                raise RuntimeError("simulated commit failure")
+            return real_commit(self_)
+
+        monkeypatch.setattr(Session, "commit", _flaky_commit)
+
+        class _Resp:
+            status_code = 200
+
+            def json(self):
+                return {"features": [{"attributes": {
+                    "parcel_id": "00522400008900", "situsline1": "22801 64TH PL W",
+                    "taxprline1": "PO BOX 961089", "taxprcity": "FORT WORTH",
+                    "taxprstate": "TX", "taxprzip": "76161-0089"}}]}
+
+        rid, summary = await self._enrich(db, business_user, redis_client, monkeypatch,
+                                          county="snohomish", parcel="00522400008900",
+                                          safe_get=lambda *a, **kw: _Resp())
+        assert state["failed"] is True
+        row = await _get(db, rid)
+        assert row.mailing_address is None
+        assert row.enrichment_data["mailing_lookup_deferred"] is True
+        assert summary.get("mailing_deferred") == 1

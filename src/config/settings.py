@@ -139,6 +139,13 @@ class Settings(BaseSettings):
     STRIPE_PRODUCT_PRO: str = ""
     STRIPE_PRODUCT_BUSINESS: str = ""
     STRIPE_PRODUCT_AGENCY: str = ""
+    # Plan prices that are no longer sold but still carry subscriptions, so the
+    # webhooks keep recognising them. Comma-separated `price_id:plan:interval`,
+    # e.g. "price_abc:agency:month". Needed when a plan price is re-issued on a
+    # new Product (a Stripe price cannot move products): the single-customer
+    # promotion coupon must apply to a product that sells no yearly price.
+    # Recognised for existing subscriptions only, never offered at checkout.
+    STRIPE_LEGACY_PLAN_PRICES: str = ""
     # Sprint 4: Stripe metered billing for skip-trace lookups
     STRIPE_PRODUCT_SKIP_TRACE: str = ""
     STRIPE_METER_SKIP_TRACE: str = ""

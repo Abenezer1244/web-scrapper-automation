@@ -1564,3 +1564,24 @@ class ExternalSourceHealth(Base):
     updated_at = Column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )
+
+
+class StripeWebhookEvent(Base):
+    """A Stripe webhook event whose handling has COMMITTED (migration 095).
+
+    The row is inserted in the same transaction as the entitlement changes the
+    event caused, so "recorded" and "applied" cannot disagree: a handler that
+    raises, a failed commit, or a process killed mid-request leaves no row, and
+    Stripe's retry is processed. It replaced a Redis claim that was written
+    before handling and so could swallow the retry of an event that never took
+    effect, which for a fully discounted checkout is the only event that
+    activates the plan.
+
+    Not tenant data: event ids and types only, written by the API webhook.
+    """
+
+    __tablename__ = "stripe_webhook_events"
+
+    event_id = Column(String(255), primary_key=True)
+    event_type = Column(String(100), nullable=False)
+    processed_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)

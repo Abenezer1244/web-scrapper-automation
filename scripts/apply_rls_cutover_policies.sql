@@ -309,6 +309,16 @@ DROP POLICY IF EXISTS notifications_system ON public.notifications;
 CREATE POLICY notifications_system ON public.notifications
     FOR ALL TO bridgeleads_system USING (true) WITH CHECK (true);
 
+-- ── stripe_webhook_events (095): app SELECT + INSERT, every row. The webhook
+--    runs with no tenant GUC and the table holds event ids only, no tenant
+--    data. Append-only: no UPDATE/DELETE policy (and no grant). No system use.
+DROP POLICY IF EXISTS stripe_webhook_events_app_select ON public.stripe_webhook_events;
+CREATE POLICY stripe_webhook_events_app_select ON public.stripe_webhook_events
+    FOR SELECT TO bridgeleads_app USING (true);
+DROP POLICY IF EXISTS stripe_webhook_events_app_insert ON public.stripe_webhook_events;
+CREATE POLICY stripe_webhook_events_app_insert ON public.stripe_webhook_events
+    FOR INSERT TO bridgeleads_app WITH CHECK (true);
+
 COMMIT;
 
 -- ── Verification (informational) ────────────────────────────────────────────

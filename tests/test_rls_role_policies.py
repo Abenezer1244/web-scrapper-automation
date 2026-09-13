@@ -586,3 +586,41 @@ def test_system_role_can_use_external_source_health(cutover_ready: bool) -> None
             {"k": key},
         ).scalar() == "healthy"
         conn.rollback()
+
+
+def test_app_role_can_record_but_never_rewrite_stripe_webhook_events(
+    cutover_ready: bool,
+) -> None:
+    """The webhook ledger (migration 095) under the real runtime role.
+
+    The Stripe webhook runs as bridgeleads_app with no tenant GUC. It must be able
+    to check for and record an event id, and it must NOT be able to update or
+    delete one: a rewritable ledger would let a record be removed and an event
+    applied twice. Separate SELECT and INSERT policies are asserted by the round
+    trip; the refusals prove there is no UPDATE/DELETE grant.
+    """
+    if not cutover_ready:
+        pytest.skip("RLS cutover roles not provisioned")
+    event_id = f"evt_rls_{uuid.uuid4().hex}"
+    with sync_engine.begin() as conn:
+        conn.execute(text("SET LOCAL ROLE bridgeleads_app"))
+        conn.execute(
+            text(
+                "INSERT INTO stripe_webhook_events (event_id, event_type) "
+                "VALUES (:e, 'checkout.session.completed')"
+            ),
+            {"e": event_id},
+        )
+        assert conn.execute(
+            text("SELECT event_type FROM stripe_webhook_events WHERE event_id = :e"),
+            {"e": event_id},
+        ).scalar() == "checkout.session.completed"
+        for statement in (
+            "UPDATE stripe_webhook_events SET event_type = 'x' WHERE event_id = :e",
+            "DELETE FROM stripe_webhook_events WHERE event_id = :e",
+        ):
+            nested = conn.begin_nested()
+            with pytest.raises(Exception, match="permission denied"):
+                conn.execute(text(statement), {"e": event_id})
+            nested.rollback()
+        conn.rollback()

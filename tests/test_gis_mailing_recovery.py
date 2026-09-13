@@ -27,6 +27,17 @@ from src.workers import mailing_recovery as mr
 
 pytestmark = pytest.mark.asyncio
 
+
+@pytest.fixture(autouse=True)
+def _licensed_mailing_enabled(monkeypatch):
+    """These tests exercise the county-GIS mailing mechanism itself, which ships
+    switched OFF for license-restricted layers (Snohomish, Cowlitz) until counsel
+    clears commercial use. Turn it on here; test_county_gis_license_gate.py pins
+    the default-off behaviour."""
+    from src.config import settings
+
+    monkeypatch.setattr(settings, "COUNTY_GIS_RESTRICTED_MAILING_ENABLED", True)
+
 TX_MAIL = "PO BOX 961089, FORT WORTH, TX 76161-0089"
 
 

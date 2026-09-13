@@ -94,6 +94,12 @@ _KNOWN_GIS_ENDPOINTS: dict[str, dict] = {
             "parcel_id,situsline1,situscity,situsstate,situszip,"
             "taxprline1,taxprcity,taxprstate,taxprzip"
         ),
+        # LICENSE: the county open-data terms for this parcel dataset say users "will
+        # not use any lists of individuals, or data from which such lists may be
+        # compiled, for any commercial purpose" (RCW 42.56.070(8)). The taxpayer
+        # mailing block stays OFF until counsel clears it; see _effective_gis_config.
+        "mailing_license_restricted": True,
+        "situs_only_out_fields": "parcel_id,situsline1,situscity,situsstate,situszip",
     },
     # Cowlitz County — Assessor parcel layer. Same story as Snohomish: no mailing
     # source before this entry (0/22 live probate leads, 2026-09-10).
@@ -132,8 +138,37 @@ _KNOWN_GIS_ENDPOINTS: dict[str, dict] = {
             "DEED_HOLDER_ADDRESS_1,DEED_HOLDER_ADDRESS_2,DEED_HOLDER_CITY,"
             "DEED_HOLDER_STATE,DEED_HOLDER_ZIPCODE"
         ),
+        # Owner (deed holder) mailing held OFF with Snohomish pending legal review of
+        # commercial use (owner decision 2026-09-13); see _effective_gis_config.
+        "mailing_license_restricted": True,
+        "situs_only_out_fields": (
+            "PARCNO,SITUS_STREET_NUMBER,SITUS_STREET_DIRECTION,SITUS_STREET_NAME,"
+            "SITUS_STREET_SUFFIX,SITUS_STREET_UNIT,SITUS_CITY,SITUS_ZIP_CODE"
+        ),
     },
 }
+
+_MAILING_KEYS = ("mailing_street_fields", "mailing_locality_fields", "mailing_fields")
+
+
+def _effective_gis_config(county_key: str) -> dict | None:
+    """The county GIS config actually used, with license-restricted mailing removed.
+
+    A config marked ``mailing_license_restricted`` keeps its situs (property address)
+    lookup but loses every mailing field, and requests only situs columns, unless
+    ``settings.COUNTY_GIS_RESTRICTED_MAILING_ENABLED`` is on. So while it is off, no
+    owner or taxpayer mailing data is requested, stored, or offered as a source.
+    Every lookup of _KNOWN_GIS_ENDPOINTS goes through here.
+    """
+    cfg = _KNOWN_GIS_ENDPOINTS.get(county_key)
+    if not cfg or not cfg.get("mailing_license_restricted"):
+        return cfg
+    if settings.COUNTY_GIS_RESTRICTED_MAILING_ENABLED:
+        return cfg
+    gated = {k: v for k, v in cfg.items() if k not in _MAILING_KEYS}
+    gated["out_fields"] = cfg["situs_only_out_fields"]
+    return gated
+
 
 # ─── Statewide GIS endpoints (covers ALL counties in a state) ────────────────
 # WA State publishes all 39 counties in a single ArcGIS service.
@@ -207,8 +242,15 @@ def enrich_parcel_gis(
     gis_config = None
     if gis_endpoint:
         gis_config = _make_generic_config(gis_endpoint)
+        # An explicit endpoint override must not reopen a license-restricted
+        # county's mailing: drop every mailing field so none is parsed or stored.
+        # (out_fields is left as the override's own list; its column names are
+        # not guaranteed to match the known layer's situs fields.)
+        known = _KNOWN_GIS_ENDPOINTS.get(county_key) or {}
+        if known.get("mailing_license_restricted") and not settings.COUNTY_GIS_RESTRICTED_MAILING_ENABLED:
+            gis_config = {k: v for k, v in gis_config.items() if k not in _MAILING_KEYS}
     elif county_key in _KNOWN_GIS_ENDPOINTS:
-        gis_config = _KNOWN_GIS_ENDPOINTS[county_key]
+        gis_config = _effective_gis_config(county_key)
 
     # Try county-specific endpoint first (by parcel ID)
     county_mailing: str | None = None
@@ -606,7 +648,7 @@ def has_gis_mailing_source(county: str, state: str) -> bool:
     King is deliberately False: its public layer withholds the taxpayer block and its
     mailing comes from the per-parcel eRealProperty pass instead.
     """
-    cfg = _KNOWN_GIS_ENDPOINTS.get(f"{(county or '').lower()}_{(state or '').upper()}") or {}
+    cfg = _effective_gis_config(f"{(county or '').lower()}_{(state or '').upper()}") or {}
     return bool(cfg.get("mailing_street_fields") or cfg.get("mailing_fields"))
 
 
@@ -643,7 +685,7 @@ def batch_enrich_parcels_gis(
 
     results: dict[str, dict] = {}
     county_key = f"{county.lower()}_{state.upper()}"
-    gis_config = _KNOWN_GIS_ENDPOINTS.get(county_key)
+    gis_config = _effective_gis_config(county_key)
 
     # Step 1: County-specific endpoint (has real mailing addresses)
     if gis_config:

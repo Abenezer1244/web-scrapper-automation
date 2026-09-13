@@ -70,8 +70,16 @@ class TestLocate:
         _layer(monkeypatch, P0904)
         assert kpl.locate(47.6, -122.4, "5412 39TH AVE W, SEATTLE WA 98107").status == "address_mismatch"
 
-    def test_bad_coordinates_and_service_errors_are_errors(self, monkeypatch):
-        assert kpl.locate("abc", None, "x").status == "error"
+    def test_unusable_coordinates_are_terminal_and_never_call_the_layer(self, monkeypatch):
+        def _no_call(*a, **kw):
+            raise AssertionError("the parcel layer must not be queried without coordinates")
+
+        monkeypatch.setattr(kpl, "safe_get", _no_call)
+        for lat, lon in ((None, None), ("", ""), ("  ", "-122.4"), ("abc", "-122.4"),
+                         ("nan", "-122.4"), ("inf", "-122.4"), ("91", "-122.4"), ("47.6", "-181")):
+            assert kpl.locate(lat, lon, "5412 39TH AVE W").status == "no_coordinates", (lat, lon)
+
+    def test_service_errors_are_errors(self, monkeypatch):
         monkeypatch.setattr(kpl, "safe_get", lambda *a, **kw: _Resp({"error": {"code": 500}}))
         assert kpl.locate(47.6, -122.4, "5412 39TH AVE W").status == "error"
 
@@ -81,6 +89,12 @@ def test_a_transient_error_leaves_no_status_so_the_row_retries(monkeypatch):
     monkeypatch.setattr(kpl.time, "sleep", lambda s: None)
     decisions, _ = kpl.resolve_code_violation_mailing([("r1", 47.6, -122.4, "5412 39TH AVE W")])
     assert decisions == {}
+
+
+def test_rows_without_coordinates_get_a_terminal_status(monkeypatch):
+    monkeypatch.setattr(kpl.time, "sleep", lambda s: None)
+    decisions, snap = kpl.resolve_code_violation_mailing([("r1", None, None, "3418 S Holly PL")])
+    assert decisions == {"r1": {"kc_pin_status": "no_coordinates"}} and snap is None
 
 
 def test_matched_parcel_gets_extract_mailing_and_one_lookup_per_point(monkeypatch, tmp_path):
@@ -105,7 +119,8 @@ def test_matched_parcel_gets_extract_mailing_and_one_lookup_per_point(monkeypatc
         assert decisions[key]["mailing_address"] == "PO BOX 5003, BELLEVUE, WA 98009"
 
 
-async def _cv_row(db, user: User, *, status="done", parcel=None, mailing=None) -> str:
+async def _cv_row(db, user: User, *, status="done", parcel=None, mailing=None,
+                  lat="47.66817947", lon="-122.40862917") -> str:
     config = ScraperConfig(id=str(uuid.uuid4()), user_id=user.id, name="King CV",
                            county="king", state="WA", record_type="code_violation",
                            fields=["party_name"], enrichment=[], schedule={"frequency": "manual"},
@@ -120,7 +135,7 @@ async def _cv_row(db, user: User, *, status="done", parcel=None, mailing=None) -
     db.add(Result(id=rid, user_id=user.id, job_id=job_id, party_name="Weeds 5412 39TH AVE W",
                   parcel_id=parcel, property_address="5412 39TH AVE W, SEATTLE WA 98199",
                   mailing_address=mailing, skip_trace_status="not_attempted", is_duplicate=False,
-                  enrichment_data={"latitude": "47.66817947", "longitude": "-122.40862917",
+                  enrichment_data={"latitude": lat, "longitude": lon,
                                    "record_number": "000630-26CP"}))
     await db.commit()
     return rid
@@ -132,6 +147,7 @@ async def test_backfill_fills_done_rows_keeps_parcel_id_null_and_converges(
 ):
     done = await _cv_row(db, business_user)
     live = await _cv_row(db, business_user, status="enriching")
+    nocoord = await _cv_row(db, business_user, lat=None, lon=None)
     _layer(monkeypatch, P0904)
     monkeypatch.setattr(kpl.time, "sleep", lambda s: None)
     zp = _extract(tmp_path, [_acct("090400", "0025", "PO BOX 5003", "BELLEVUE WA", "98009")])
@@ -145,18 +161,20 @@ async def test_backfill_fills_done_rows_keeps_parcel_id_null_and_converges(
                           report=tmp_path / "ev.jsonl", pace_s=0)
 
     dry = await asyncio.to_thread(_run, False)
-    assert dry["candidates"] == 1 and "writes" not in dry
+    assert dry["candidates"] == 2 and "writes" not in dry
     stats = await asyncio.to_thread(_run, True)
-    assert stats["writes"] == {"written": 1, "skipped_by_write_guard": 0}
+    assert stats["writes"] == {"written": 2, "skipped_by_write_guard": 0}
 
     got = {str(r.id): r for r in (await db.execute(text(
         "SELECT id, parcel_id, mailing_address, owner_state, enrichment_data FROM results "
-        "WHERE id = ANY(:ids)"), {"ids": [done, live]})).all()}
+        "WHERE id = ANY(:ids)"), {"ids": [done, live, nocoord]})).all()}
     assert got[done].mailing_address == "PO BOX 5003, BELLEVUE, WA 98009"
     assert got[done].parcel_id is None
     assert got[done].enrichment_data["kc_pin"] == "0904000025"
     assert got[done].enrichment_data["record_number"] == "000630-26CP"
     assert got[live].mailing_address is None
+    assert got[nocoord].mailing_address is None
+    assert got[nocoord].enrichment_data["kc_pin_status"] == "no_coordinates"
 
     again = await asyncio.to_thread(_run, True)
     assert again["candidates"] == 0

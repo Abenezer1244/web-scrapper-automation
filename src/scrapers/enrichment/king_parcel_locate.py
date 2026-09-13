@@ -25,6 +25,7 @@ row and must not change underneath it.
 """
 from __future__ import annotations
 
+import math
 import re
 import time
 from dataclasses import dataclass
@@ -53,7 +54,8 @@ _UNIT_RE = re.compile(
 
 @dataclass(frozen=True)
 class Located:
-    status: str      # matched | no_parcel | multiple | address_mismatch | unit_address | error
+    # matched | no_parcel | multiple | address_mismatch | unit_address | no_coordinates | error
+    status: str
     pin: str | None = None
     parcel_address: str | None = None
 
@@ -66,12 +68,16 @@ def _street_and_zip(address: str | None) -> tuple[str, str]:
 
 def locate(lat: object, lon: object, property_address: str | None) -> Located:
     """The single parcel under (lat, lon) whose situs is this lead's address, if any."""
+    # Missing or unusable coordinates are a property of the stored record, not a passing
+    # failure: retrying can never locate them, so they get a terminal status instead of
+    # "error" (15 prod rows with JSON-null coordinates were revisited on every run).
     try:
-        lat_f, lon_f = float(lat), float(lon)
+        lat_f, lon_f = float(str(lat).strip()), float(str(lon).strip())
     except (TypeError, ValueError):
-        return Located("error")
-    if not (-90 <= lat_f <= 90 and -180 <= lon_f <= 180):
-        return Located("error")
+        return Located("no_coordinates")
+    if not (math.isfinite(lat_f) and math.isfinite(lon_f)
+            and -90 <= lat_f <= 90 and -180 <= lon_f <= 180):
+        return Located("no_coordinates")
     if _UNIT_RE.search(property_address or ""):
         return Located("unit_address")
     try:

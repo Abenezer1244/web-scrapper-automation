@@ -130,14 +130,16 @@ def cached_extract(max_age_s: float = _CACHE_MAX_AGE_S) -> tuple[Path, str] | No
         except Exception as exc:  # noqa: BLE001 -- enrichment falls back to the pages
             _reraise_time_limit(exc)
             _logger.warning("King RPAcct refresh failed: %s", str(exc)[:160])
+        finally:
+            # Also on a re-raised time limit, so repeated timeouts leave no debris.
             for leftover in (tmp, meta_tmp):
                 try:
                     leftover.unlink(missing_ok=True)
                 except OSError:
                     pass
         age = _age()
-        if age is None or age >= _STALE_LIMIT_S:
-            return None
+    if age is None or age >= _STALE_LIMIT_S:
+        return None
     try:
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
         snapshot = str(meta.get("snapshot") or "unknown") if isinstance(meta, dict) else "unknown"

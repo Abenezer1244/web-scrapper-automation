@@ -62,6 +62,77 @@ _KNOWN_GIS_ENDPOINTS: dict[str, dict] = {
         "skip_statewide_fallback": True,
         "out_fields": "PIN,ADDR_FULL,POSTALCTYNAME,STATE_ABBR,ZIP5",
     },
+    # Snohomish County — public hosted parcel layer. Before this entry Snohomish had
+    # NO mailing source at all: it fell through to the WA statewide situs-only layer,
+    # so property_address filled and mailing_address was structurally always NULL
+    # (0/30 live pre_foreclosure + trustee_sale leads, 2026-09-10).
+    #
+    # `taxpr*` is the TAXPAYER block (who the tax bill is mailed to) — the same thing
+    # King's tax-bill scrape reads. `owner*` is a separate block on this layer; taxpayer
+    # is the mailing-of-record and is what the other counties store.
+    #
+    # taxprline2/3 are deliberately NOT read: line3 is empty layer-wide and line2 is
+    # populated on 6 parcels out of ~250k, half of them "C/O <person>" — an addressee
+    # NAME, which this codebase does not collect. taxprname is a name for the same
+    # reason. parcel_id is a 14-char string with leading zeros; NEVER int-cast it.
+    "snohomish_WA": {
+        "endpoint": (
+            "https://gis.snoco.org/host/rest/services"
+            "/Hosted/CADASTRAL__parcels/FeatureServer/0/query"
+        ),
+        "parcel_field": "parcel_id",
+        "address_field": "situsline1",
+        # Structured situs only — NOT address_suffix_fields, which would fold city/
+        # state/zip into property_address itself. These counties reach here from the
+        # statewide layer today, which stores a street-only property_address plus
+        # separate property_city/state/zip; keep that shape byte-for-byte so adding
+        # a mailing source does not silently reformat every existing lead's address.
+        "situs_part_fields": ["situscity", "situsstate", "situszip"],
+        "mailing_street_fields": ["taxprline1"],
+        "mailing_locality_fields": ["taxprcity", "taxprstate", "taxprzip"],
+        "out_fields": (
+            "parcel_id,situsline1,situscity,situsstate,situszip,"
+            "taxprline1,taxprcity,taxprstate,taxprzip"
+        ),
+    },
+    # Cowlitz County — Assessor parcel layer. Same story as Snohomish: no mailing
+    # source before this entry (0/22 live probate leads, 2026-09-10).
+    #
+    # Two shapes this layer needs that no other config had:
+    #   * situs is SPLIT across five columns, so `address_part_fields` composes it;
+    #   * the mailing street is in DEED_HOLDER_ADDRESS_2 for 53,109 parcels while
+    #     _ADDRESS_1 holds an "ATTN …"/"C/O …" addressee. _2 is therefore tried first
+    #     and _1 only when it independently looks like a street (203 such parcels).
+    #
+    # Use Assessor/Parcels, NOT Assessor/Cowlitz_Tax_Parcels — the latter shares
+    # DEED_HOLDER_NAME but publishes no mailing columns at all. PARCNO is a string and
+    # carries leading zeros ("08931001"); verified 2026-09-10 that none contain dashes.
+    "cowlitz_WA": {
+        "endpoint": (
+            "https://gis.cowlitzwa.gov/ccserver/rest/services"
+            "/Assessor/Parcels/MapServer/0/query"
+        ),
+        "parcel_field": "PARCNO",
+        "address_part_fields": [
+            "SITUS_STREET_NUMBER", "SITUS_STREET_DIRECTION", "SITUS_STREET_NAME",
+            "SITUS_STREET_SUFFIX", "SITUS_STREET_UNIT",
+        ],
+        # No SITUS_STATE column exists on this layer; the state is WA by construction
+        # (it is the Cowlitz County assessor's own service), the same reasoning
+        # _situs_parts applies to the WA statewide layer.
+        "situs_part_fields": ["SITUS_CITY", None, "SITUS_ZIP_CODE"],
+        "situs_state_literal": "WA",
+        "mailing_street_fields": ["DEED_HOLDER_ADDRESS_2", "DEED_HOLDER_ADDRESS_1"],
+        "mailing_locality_fields": [
+            "DEED_HOLDER_CITY", "DEED_HOLDER_STATE", "DEED_HOLDER_ZIPCODE",
+        ],
+        "out_fields": (
+            "PARCNO,SITUS_STREET_NUMBER,SITUS_STREET_DIRECTION,SITUS_STREET_NAME,"
+            "SITUS_STREET_SUFFIX,SITUS_STREET_UNIT,SITUS_CITY,SITUS_ZIP_CODE,"
+            "DEED_HOLDER_ADDRESS_1,DEED_HOLDER_ADDRESS_2,DEED_HOLDER_CITY,"
+            "DEED_HOLDER_STATE,DEED_HOLDER_ZIPCODE"
+        ),
+    },
 }
 
 # ─── Statewide GIS endpoints (covers ALL counties in a state) ────────────────
@@ -140,6 +211,7 @@ def enrich_parcel_gis(
         gis_config = _KNOWN_GIS_ENDPOINTS[county_key]
 
     # Try county-specific endpoint first (by parcel ID)
+    county_mailing: str | None = None
     if gis_config and parcel_id:
         result = _query_gis(parcel_id, gis_config, county_key)
         if result.get("property_address"):
@@ -150,6 +222,11 @@ def enrich_parcel_gis(
         # (skip_statewide_fallback). Return the matched-vacant result as-is.
         if result.get("matched") and gis_config.get("skip_statewide_fallback"):
             return result
+        # The county knew where the owner gets mail but not where the property is.
+        # Every fallback below is situs-only, so returning one of them wholesale
+        # would discard that mailing address — the same loss the batch path was
+        # fixed for (Codex P1, 2026-09-10). Carry it forward instead.
+        county_mailing = result.get("mailing_address")
 
     # Fallback: WA statewide parcel service (covers all 39 WA counties).
     #
@@ -163,6 +240,10 @@ def enrich_parcel_gis(
     if state.upper() == "WA" and parcel_id:
         result = _query_wa_statewide(parcel_id, county)
         if result.get("property_address"):
+            if county_mailing and not result.get("mailing_address"):
+                # Same parcel id, so the county's mailing address still describes
+                # this property's owner. The statewide layer has none to offer.
+                result = {**result, "mailing_address": county_mailing}
             return result
 
     # Fallback: search by owner name. Skipped when a parcel id is in hand AND an
@@ -196,6 +277,13 @@ def enrich_parcel_gis(
             _logger.info("WA statewide name search succeeded for %s", owner_name)
             return result
 
+    # Nothing located the property. The county's mailing address is still a real
+    # answer for the parcel that was asked about, so it is returned rather than
+    # thrown away with the miss. The two name-search returns above deliberately do
+    # NOT carry it: they may have landed on a DIFFERENT parcel, and this mailing
+    # address belongs to the one identified by parcel_id.
+    if county_mailing:
+        return {**_empty(), "mailing_address": county_mailing}
     return _empty()
 
 
@@ -412,7 +500,12 @@ def _parse_gis_response(data: dict, gis_config: dict) -> dict[str, str | None]:
 
     # Property/situs STREET address
     address_field = gis_config.get("address_field", "Site_Address")
-    street = attrs.get(address_field) or None
+    if gis_config.get("address_part_fields"):
+        # Layers that publish the situs street in components (house number,
+        # prefix, name, suffix, unit) rather than one column.
+        street = _compose_street_parts(attrs, gis_config["address_part_fields"])
+    else:
+        street = attrs.get(address_field) or None
     if street:
         street = str(street).replace("&nbsp;", "").strip() or None
 
@@ -438,7 +531,12 @@ def _parse_gis_response(data: dict, gis_config: dict) -> dict[str, str | None]:
     # The stricter rule wins; King's `echo_property_to_mailing: False` is now
     # simply redundant, and harmless.
     mailing_fields = gis_config.get("mailing_fields", [])
-    if mailing_fields:
+    if gis_config.get("mailing_street_fields"):
+        # Layers whose mailing block is street + separate city/state/zip, and whose
+        # street may live in one of several columns. Formatted "STREET, CITY, ST ZIP"
+        # instead of the flat join below, which would emit "…, WA, 98043".
+        mailing_address = _compose_mailing(attrs, gis_config)
+    elif mailing_fields:
         parts = []
         for field in mailing_fields:
             val = attrs.get(field)
@@ -461,7 +559,8 @@ def _parse_gis_response(data: dict, gis_config: dict) -> dict[str, str | None]:
         "parcel_id": attrs.get(parcel_field) or None,
         # 085 structured situs (#188) and the match/vacant signals (#153) are
         # disjoint key sets and BOTH are consumed downstream — keep both.
-        **_situs_parts_from_confirmed_mailing(attrs, property_address, gis_config),
+        **(_situs_parts_direct(attrs, gis_config, has_street=bool(street))
+           or _situs_parts_from_confirmed_mailing(attrs, property_address, gis_config)),
         "matched": True,
         "vacant_no_situs": not street,
         "situs_city": situs_city,
@@ -501,8 +600,27 @@ def _empty() -> dict[str, str | None]:
     return {"property_address": None, "mailing_address": None}
 
 
+def has_gis_mailing_source(county: str, state: str) -> bool:
+    """True when this county's own GIS layer publishes the owner's mailing address.
+
+    King is deliberately False: its public layer withholds the taxpayer block and its
+    mailing comes from the per-parcel eRealProperty pass instead.
+    """
+    cfg = _KNOWN_GIS_ENDPOINTS.get(f"{(county or '').lower()}_{(state or '').upper()}") or {}
+    return bool(cfg.get("mailing_street_fields") or cfg.get("mailing_fields"))
+
+
+def gis_mailing_source_counties(state: str = "WA") -> list[str]:
+    """Lower-case county names whose GIS layer carries a mailing address."""
+    suffix = f"_{state.upper()}"
+    return sorted(
+        key[: -len(suffix)] for key in _KNOWN_GIS_ENDPOINTS
+        if key.endswith(suffix) and has_gis_mailing_source(key[: -len(suffix)], state)
+    )
+
+
 def batch_enrich_parcels_gis(
-    parcel_ids: list[str], county: str, state: str
+    parcel_ids: list[str], county: str, state: str, stats: dict | None = None
 ) -> dict[str, dict[str, str | None]]:
     """Batch enrich multiple parcels via GIS API.
 
@@ -511,7 +629,15 @@ def batch_enrich_parcels_gis(
     2. Fall back to WA statewide for any parcels not found
 
     Processes in chunks of 50 (ArcGIS URL length limit).
+
+    ``stats`` (optional out-param): ``county_unreached`` lists the caller parcel ids
+    whose county request did not produce a usable answer (non-200, exception, or an
+    ArcGIS error body). For a county with a mailing source those parcels were never
+    looked up, which is different from "looked up, no mailing address", so the caller
+    can defer them to background recovery instead of leaving a silent NULL.
     """
+    if stats is not None:
+        stats.setdefault("county_unreached", [])
     if state.upper() != "WA":
         return {}
 
@@ -521,7 +647,10 @@ def batch_enrich_parcels_gis(
 
     # Step 1: County-specific endpoint (has real mailing addresses)
     if gis_config:
-        results = _batch_query_county(parcel_ids, gis_config)
+        results = _batch_query_county(
+            parcel_ids, gis_config,
+            unreached=stats["county_unreached"] if stats is not None else None,
+        )
 
     # Step 2: WA statewide fallback ONLY for parcels the county endpoint did not
     # MATCH at all. A parcel that matched but has no street (vacant/raw land) is
@@ -533,9 +662,37 @@ def batch_enrich_parcels_gis(
     skip_statewide = bool(gis_config and gis_config.get("skip_statewide_fallback"))
     if not skip_statewide:
         missing = [pid for pid in parcel_ids if pid not in results and pid and len(pid.strip()) >= 6]
-        if missing:
-            statewide = _batch_query_wa_statewide(missing, county)
-            results.update(statewide)
+        # Rows the county answered with a mailing address but no situs street. They
+        # are already in `results`, so the `missing` filter above skips them; they
+        # still need the statewide layer for the property address. A plain
+        # `results.update()` would replace the county row wholesale and drop the
+        # mailing address we came here for, so these merge field-by-field instead.
+        needs_situs = [
+            pid for pid in parcel_ids
+            if pid in results and results[pid].get("needs_situs_fallback")
+        ]
+        if missing or needs_situs:
+            statewide = _batch_query_wa_statewide(missing + needs_situs, county)
+            for pid, sw_row in statewide.items():
+                county_row = results.get(pid)
+                if county_row and county_row.get("needs_situs_fallback"):
+                    merged = dict(sw_row)
+                    # County mailing wins; the statewide layer has none to offer.
+                    merged["mailing_address"] = (
+                        county_row.get("mailing_address") or sw_row.get("mailing_address")
+                    )
+                    # Same parcel, so the county's own situs parts stay valid wherever
+                    # the statewide row has none (Codex P2): replacing the row wholesale
+                    # dropped a city/ZIP the county had already published.
+                    for key in ("property_city", "property_state", "property_zip"):
+                        if not merged.get(key) and county_row.get(key):
+                            merged[key] = county_row[key]
+                    results[pid] = merged
+                else:
+                    results[pid] = sw_row
+
+    for row in results.values():
+        row.pop("needs_situs_fallback", None)
 
     return results
 
@@ -547,6 +704,56 @@ def _arcgis_literal(value: str) -> str:
     stray quote in a parsed value must not break or reshape the predicate (Codex).
     """
     return "'" + value.replace("'", "''") + "'"
+
+
+def _callers_for(pid: object, clean_to_originals: dict[str, list[str]]) -> list[str]:
+    """Caller parcel ids a returned feature is allowed to answer for.
+
+    The query is an exact ``IN`` over values we supplied, but nothing forced the
+    server to echo them verbatim: an ArcGIS layer typed numeric, or a JSON decoder,
+    can hand back ``8931001`` for the ``08931001`` we asked about. Matching only on
+    the raw string silently misses those, and the previous ``or [str(pid)]`` fallback
+    did something worse — it invented a caller id nobody requested and filed a real
+    owner's mailing address under it.
+
+    Match on the raw string first, then on a dash- and leading-zero-insensitive form.
+    The county path keys its requests dashless while the statewide path can key them
+    dashed (Kitsap), so a layer echoing "602543-087-0" for "6025430870", or the
+    reverse, still resolves (Codex P2). A feature that still corresponds to no
+    requested id is dropped, never guessed at.
+    """
+    raw = str(pid).strip()
+    exact = clean_to_originals.get(raw)
+    if exact:
+        return exact
+
+    def _loose(value: str) -> str:
+        return value.replace("-", "").strip().lstrip("0")
+
+    loose = _loose(raw)
+    if loose:
+        # Distinct caller lists, not keys: Kitsap queries two dashed spellings of ONE
+        # caller's parcel, and those must not read as two competing parcels.
+        hits: list[list[str]] = []
+        for clean, originals in clean_to_originals.items():
+            if _loose(clean) == loose and originals not in hits:
+                hits.append(originals)
+        # Only when exactly ONE requested parcel collapses to this form. If a chunk
+        # holds both "0123456" and "123456" they are different parcels that share a
+        # loose key, and picking either would put one owner's mailing address on the
+        # other's property. Ambiguity resolves to "drop", never to a guess.
+        if len(hits) == 1:
+            return hits[0]
+        if len(hits) > 1:
+            _logger.warning(
+                "County GIS parcel %r is ambiguous across %d requested ids, dropped",
+                raw, len(hits),
+            )
+            return []
+    _logger.warning(
+        "County GIS returned parcel %r that matches no requested id, dropped", raw
+    )
+    return []
 
 
 def _map_county_features(
@@ -574,6 +781,20 @@ def _map_county_features(
         if not pid:
             continue
         parsed = _parse_gis_response({"features": [feature]}, gis_config)
+        if (not parsed.get("property_address")
+                and not gis_config.get("skip_statewide_fallback")
+                and parsed.get("mailing_address")):
+            # The county knows where the owner gets mail but not where the property
+            # is. Dropping the row here (as the branch below does) threw that mailing
+            # address away and let the situs-only statewide layer answer instead, so
+            # the lead ended up with a property address and NO mailing — the exact
+            # shape of the bug this file is being changed to fix (Codex, 2026-09-10).
+            # Keep it and let the statewide layer top up the situs.
+            parsed["needs_situs_fallback"] = True
+            parsed["parcel_id"] = pid
+            for caller_pid in _callers_for(pid, clean_to_originals):
+                results[caller_pid] = dict(parsed)
+            continue
         if not parsed.get("property_address") and not gis_config.get("skip_statewide_fallback"):
             # No street. For a county that still uses the WA statewide fallback,
             # dropping the row is right — statewide may know the address.
@@ -585,14 +806,123 @@ def _map_county_features(
             # trace is never billed, and the situs city/zip still ride along.
             continue
         parsed["parcel_id"] = pid
-        for caller_pid in clean_to_originals.get(str(pid)) or [str(pid)]:
+        for caller_pid in _callers_for(pid, clean_to_originals):
             results[caller_pid] = dict(parsed)
     return results
 
 
+# An addressee line is NOT a street. Cowlitz files "ATTN ALAN M ANNIS, DIRECTOR OF
+# TAXES" and "C/O LLOYD MILTON PURSLEY" in DEED_HOLDER_ADDRESS_1 while the real street
+# sits in _2 (measured 2026-09-10: 53,109 rows street-in-_2-only, 4,473 with _1 as an
+# attn/c-o line, 203 with _1 only). Taking _1 blindly would both corrupt the address and
+# store a taxpayer NAME, which this codebase deliberately does not collect (the same
+# boundary pierce_atip._drop_person_line enforces for ATIP). A real street line starts
+# with a house number, a post-office box, or a military/rural route designator.
+_MAIL_STREET_SHAPE_RE = re.compile(r"^\s*(?:\d|#|P\.?\s*O\.?\s*B|POB\b|PSC\b|RR\b|HC\b)", re.I)
+
+# An addressee marker glued onto the FRONT of an otherwise good street, which the
+# counties do inline as well as in a separate column: "C/O RYAN LLC 10500 NE 8TH ST",
+# "ATTN SUSAN CORNELL 981 POWELL AVE SW". Where a street plainly begins further along
+# the line, the addressee is dropped and the street kept — losing the whole value would
+# throw away a mailable address, and keeping it whole would store a person's name.
+_ADDRESSEE_PREFIX_RE = re.compile(
+    r"^\s*(?:C\s*/\s*O|ATTN|ATTENTION|DEPT|DEPARTMENT|PROP\s+TAX)\b", re.I
+)
+
+# Where the street itself begins, used to cut an addressee prefix at the right point.
+# "PO BOX" has to be found as a street start, not skipped past: cutting at the first
+# DIGIT instead turned "DEPT OF TRANS PO BOX 330310" into a bare "330310".
+_MAIL_STREET_START_RE = re.compile(
+    r"(?:\b|(?<=\s))(?:\d|#|P\.?\s*O\.?\s*B|PSC\b|RR\b|HC\b)", re.I
+)
+
+_MAIL_PO_BOX_START_RE = re.compile(r"(?:\b|(?<=\s))P\.?\s*O\.?\s*B(?:OX)?\b", re.I)
+
+# Values that are a stand-in for "no data", not an address. UNKNOWN is the token
+# address_intel._PLACEHOLDER_STREET_RE already measured in production.
+_MAIL_PLACEHOLDER_RE = re.compile(r"^\s*(?:UNKNOWN|NONE|N/?A|NULL)\s*$", re.I)
+
 # A LIKE metacharacter (% or _) in an interpolated value silently widens the
 # predicate to unrelated rows. Values carrying one are rejected, not rewritten.
 _LIKE_META = re.compile(r"[%_]")
+
+
+def _attr_text(attrs: dict, field: str | None) -> str | None:
+    """One trimmed attribute, or None for null/blank/whitespace."""
+    if not field:
+        return None
+    val = attrs.get(field)
+    if val is None:
+        return None
+    text = str(val).replace("&nbsp;", "").strip()
+    return text or None
+
+
+def _compose_street_parts(attrs: dict, part_fields: list[str]) -> str | None:
+    """Join a situs street published as components into one street line.
+
+    Space-joined in the configured order and collapsed, so a null middle component
+    ("W" in "5919 W 218TH AVE NE") never leaves a double space.
+    """
+    parts = [_attr_text(attrs, f) for f in part_fields]
+    street = " ".join(p for p in parts if p)
+    return " ".join(street.split()) or None
+
+
+def _compose_mailing(attrs: dict, gis_config: dict) -> str | None:
+    """Build "STREET, CITY, ST ZIP" from a street column plus locality columns.
+
+    ``mailing_street_fields`` is tried in order and the FIRST value that looks like a
+    street wins (see ``_MAIL_STREET_SHAPE_RE``) — this is a priority list, not a
+    concatenation, because the runner-up column is usually an addressee name.
+
+    A locality with no street is dropped rather than stored: "EVERETT, WA 98203" alone
+    is not somewhere you can mail a letter, and persisting it would turn an unknown into
+    a false positive on the mailing-coverage numbers.
+    """
+    fields = gis_config.get("mailing_street_fields") or []
+    # The shape check exists to CHOOSE between columns. Where a layer designates a
+    # single mailing-street column there is nothing to choose, so demanding a
+    # house-number start there only discards real addresses: 0.31% of sampled
+    # Snohomish taxprline1 values fail it, and some ("ONE ASHLEY WAY") are genuine.
+    disambiguating = len(fields) > 1
+
+    street = None
+    for field in fields:
+        candidate = _attr_text(attrs, field)
+        if not candidate or _MAIL_PLACEHOLDER_RE.match(candidate):
+            continue
+        trimmed = candidate
+        if _ADDRESSEE_PREFIX_RE.match(candidate):
+            # A post-office box is an unambiguous street start, so it wins over an
+            # earlier bare number: in "DEPT 42 PO BOX 330310" the 42 belongs to the
+            # addressee, and cutting there stored "42 PO BOX 330310" (Codex P2).
+            start = _MAIL_PO_BOX_START_RE.search(candidate) or _MAIL_STREET_START_RE.search(
+                candidate)
+            trimmed = candidate[start.start():].strip() if start else candidate
+        if _MAIL_STREET_SHAPE_RE.match(trimmed):
+            street = trimmed
+            break
+        if not disambiguating and not _ADDRESSEE_PREFIX_RE.match(candidate):
+            # Sole designated column, no addressee marker, not a placeholder: a
+            # street that simply does not open with a number.
+            street = candidate
+            break
+    if not street:
+        return None
+
+    locality = gis_config.get("mailing_locality_fields") or []
+
+    def _loc(i: int) -> str | None:
+        return _attr_text(attrs, locality[i]) if i < len(locality) else None
+
+    city, state, zipcode = _loc(0), _loc(1), _loc(2)
+    tail = ", ".join(p for p in (city, state) if p)
+    if zipcode:
+        tail = f"{tail} {zipcode}".strip()
+    return f"{street}, {tail}" if tail else street
+
+
 _CITY_STATE_RE = re.compile(r"^\s*(.+?)\s*,\s*([A-Z]{2})\s*$")
 # "PO BOX", "P.O. BOX", "P O BOX", "P.O BOX", "POB" — any post-office box spelling.
 _PO_BOX_RE = re.compile(r"^\s*P\.?\s*O\.?\s*B(?:OX)?\b", re.I)
@@ -624,6 +954,37 @@ def _situs_parts_from_confirmed_mailing(
     }
 
 
+def _situs_parts_direct(
+    attrs: dict, gis_config: dict, has_street: bool = False
+) -> dict[str, str | None]:
+    """Structured situs from a layer that publishes its OWN situs city/state/zip.
+
+    Unlike _situs_parts_from_confirmed_mailing, no inference is needed: these columns
+    already describe the property, so nothing has to be proven about where the owner
+    receives mail. ``situs_state_literal`` covers a layer with no state column, where
+    the state is fixed by which county's service is being queried.
+    """
+    fields = gis_config.get("situs_part_fields") or []
+    if not fields:
+        return {}
+
+    def _part(i: int) -> str | None:
+        return _attr_text(attrs, fields[i]) if i < len(fields) else None
+
+    city, zipcode = _part(0), _part(2)
+    if not city and not zipcode and not _part(1) and not has_street:
+        # Nothing located this parcel. `situs_state_literal` alone would assert a
+        # state for a row we know nothing else about, and property_state feeds the
+        # absentee / out-of-state owner flags — so emit nothing rather than a
+        # half-fact the flags would then reason from.
+        return {}
+    return {
+        "property_city": city,
+        "property_state": _part(1) or gis_config.get("situs_state_literal") or None,
+        "property_zip": zipcode[:10] if zipcode else None,
+    }
+
+
 def _situs_parts(city: str, zipcode: str) -> dict[str, str | None]:
     """Structured SITUS location from a WA statewide row (SITUS_CITY_NM /
     SITUS_ZIP_NR). The state is WA by construction (the service is the WA parcel
@@ -638,12 +999,34 @@ def _situs_parts(city: str, zipcode: str) -> dict[str, str | None]:
     }
 
 
+def _warn_on_arcgis_anomaly(data: object, label: str) -> None:
+    """Log the two ArcGIS responses that otherwise read as "no data for these parcels".
+
+    ArcGIS reports a bad query (renamed field, token now required) as HTTP 200 with an
+    ``error`` body and no ``features`` key, and a capped page as ``exceededTransferLimit``.
+    Both were swallowed as an empty result, so a layer change looked exactly like a
+    county that publishes no mailing address. Telemetry only: the caller's handling of
+    the features it did get is unchanged.
+    """
+    if not isinstance(data, dict):
+        _logger.warning("%s: response was not a JSON object", label)
+        return
+    error = data.get("error")
+    if error:
+        detail = error.get("message") if isinstance(error, dict) else error
+        _logger.warning("%s: ArcGIS error in a 200 response: %s", label, str(detail)[:120])
+    if data.get("exceededTransferLimit"):
+        _logger.warning("%s: ArcGIS truncated the page (exceededTransferLimit)", label)
+
+
 def _batch_query_county(
-    parcel_ids: list[str], gis_config: dict
+    parcel_ids: list[str], gis_config: dict, unreached: list[str] | None = None
 ) -> dict[str, dict[str, str | None]]:
     """Batch query a county-specific ArcGIS endpoint (has mailing address).
 
-    Results are keyed by the CALLER's parcel id (see _map_county_features)."""
+    Results are keyed by the CALLER's parcel id (see _map_county_features). When
+    ``unreached`` is given, the caller ids of every chunk that got no usable answer
+    are appended to it."""
     endpoint = gis_config["endpoint"]
     parcel_field = gis_config["parcel_field"]
     out_fields = gis_config.get("out_fields", "*")
@@ -674,13 +1057,27 @@ def _batch_query_county(
             resp = safe_get(endpoint, params=params, require_allowlisted=False, timeout=30)
             if resp.status_code != 200:
                 _logger.warning("County GIS batch returned %d", resp.status_code)
+                _note_unreached(unreached, clean_to_originals)
                 continue
 
             data = resp.json()
+            _warn_on_arcgis_anomaly(data, "County GIS batch")
+            if not isinstance(data, dict) or data.get("error"):
+                # An error body is not an answer about these parcels.
+                _note_unreached(unreached, clean_to_originals)
+                continue
             found = _map_county_features(
                 data.get("features") or [], gis_config, clean_to_originals
             )
             results.update(found)
+            if data.get("exceededTransferLimit"):
+                # A capped page is not an answer about the parcels it left out (one
+                # parcel can carry several features, e.g. condo units). Those were
+                # never looked up, so they must be deferable, not read as "none".
+                _note_unreached(unreached, {
+                    clean: [pid for pid in originals if pid not in found]
+                    for clean, originals in clean_to_originals.items()
+                })
 
             # Count distinct APNs, not fanned-out caller ids, so the ratio is honest.
             # Also report how many carry a STREET: for a county whose vacant/raw-land
@@ -695,8 +1092,18 @@ def _batch_query_county(
 
         except Exception as exc:
             _logger.warning("County GIS batch error: %s", str(exc)[:80])
+            _note_unreached(unreached, clean_to_originals)
 
     return results
+
+
+def _note_unreached(unreached: list[str] | None, clean_to_originals: dict[str, list[str]]) -> None:
+    if unreached is None:
+        return
+    for originals in clean_to_originals.values():
+        for pid in originals:
+            if pid not in unreached:
+                unreached.append(pid)
 
 
 def _batch_query_wa_statewide(
@@ -738,9 +1145,15 @@ def _batch_query_wa_statewide(
         if not query_pairs:
             continue
 
-        # Reverse map: query_value -> original caller parcel_id
-        query_to_original = dict(query_pairs)
-        in_values = list(query_to_original.keys())
+        # Reverse map: query_value -> every caller parcel_id that asked for it. The
+        # same _callers_for resolver as the county path, so a returned id that
+        # matches no request is dropped rather than filed under itself (Codex P2).
+        query_to_originals: dict[str, list[str]] = {}
+        for query_value, original in query_pairs:
+            callers = query_to_originals.setdefault(query_value, [])
+            if original not in callers:
+                callers.append(original)
+        in_values = list(query_to_originals.keys())
 
         in_clause = ",".join(_arcgis_literal(p) for p in in_values)
         where = f"ORIG_PARCEL_ID IN ({in_clause})"
@@ -762,6 +1175,7 @@ def _batch_query_wa_statewide(
                 continue
 
             data = resp.json()
+            _warn_on_arcgis_anomaly(data, "Statewide GIS batch")
             for feature in data.get("features") or []:
                 attrs = feature.get("attributes") or {}
                 pid = attrs.get("ORIG_PARCEL_ID")
@@ -769,23 +1183,22 @@ def _batch_query_wa_statewide(
                 if not pid or not address:
                     continue
 
-                # Map back to caller's original parcel_id
-                caller_pid = query_to_original.get(pid, pid)
-
                 address = " ".join(address.strip().split())
                 city = (attrs.get("SITUS_CITY_NM") or "").strip()
                 zipcode = (attrs.get("SITUS_ZIP_NR") or "").strip()
-                results[caller_pid] = {
+                row = {
                     "property_address": address,
                     "mailing_address": None,  # situs-only layer: owner's mail unknown
-                    "parcel_id": pid,  # canonical format from server
+                    "parcel_id": str(pid),  # canonical format from server
                     **_situs_parts(city, zipcode),
                 }
+                for caller_pid in _callers_for(pid, query_to_originals):
+                    results[caller_pid] = dict(row)
 
             _logger.info(
                 "Statewide GIS batch: %d/%d parcels enriched",
-                len([qv for qv, orig in query_pairs if orig in results]),
-                len(query_pairs),
+                len({orig for _, orig in query_pairs if orig in results}),
+                len({orig for _, orig in query_pairs}),
             )
 
         except Exception as exc:

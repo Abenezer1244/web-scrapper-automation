@@ -104,6 +104,28 @@ def normalize_pdf_text(raw: str) -> str:
     return t.strip()
 
 
+# ── Is this extraction a real legal-notices issue? ────────────────────────────
+# A weekly Legals PDF with no trustee sale in it is normal and yields 0 notice
+# blocks; a failed or empty text extraction ALSO yields 0 blocks. Only the first may
+# be read as "no sales this week". Measured on real issues (2025-12-17 to 2026-09-09,
+# Snohomish Tribune and Queen Anne News): 67,193 to 163,363 normalized characters and
+# 36 to 85 occurrences of "NOTICE". The floors below sit about 3x under the smallest.
+_ISSUE_MIN_CHARS = 20_000
+_ISSUE_MIN_NOTICE_WORDS = 10
+_NOTICE_WORD = re.compile(r"\bNOTICE\b")
+
+
+def looks_like_legals_issue(normalized: str) -> bool:
+    """True when normalized text is plausibly a whole legal-notices issue.
+
+    Independent of trustee sales: a sale-free issue still carries summonses,
+    probate notices to creditors and bids, so it passes.
+    """
+    if len(normalized) < _ISSUE_MIN_CHARS:
+        return False
+    return len(_NOTICE_WORD.findall(normalized)) >= _ISSUE_MIN_NOTICE_WORDS
+
+
 # ── Pre-header identity preamble ──────────────────────────────────────────────
 # Some trustees print the notice's OWN identity ("TS No <x> TO No <y>" for MTC /
 # Trustee Corps, "TS #: <x> Title Order #: <y>" for North Star) IMMEDIATELY BEFORE

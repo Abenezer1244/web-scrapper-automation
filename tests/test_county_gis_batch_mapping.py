@@ -66,12 +66,45 @@ class TestMapCountyFeatures:
         assert res["602543-087-0"] is not res["6025430870"]  # independent copies
         assert res["602543-087-0"] == res["6025430870"]
 
-    def test_unknown_server_id_falls_back_to_server_key(self):
-        res = _map_county_features([_PIERCE_FEATURE], _PIERCE_CFG, {})
-        assert list(res) == ["6025430870"]
+    def test_unknown_server_id_is_dropped_not_filed_under_itself(self):
+        """Was: fall back to keying by the server's id. Changed 2026-09-10 (Codex).
 
-    def test_feature_without_address_is_skipped(self):
+        `_batch_query_county` builds `clean_to_originals` PER CHUNK and builds that
+        chunk's `IN` clause from the same dict, so every id the server can legitimately
+        answer with is already a key. A feature that matches none of them was never
+        requested, and keying it by itself files a real owner's mailing address under
+        a parcel id no lead asked about. Dropping is the conservative choice.
+        """
+        res = _map_county_features([_PIERCE_FEATURE], _PIERCE_CFG, {})
+        assert res == {}
+
+    def test_leading_zero_coercion_still_reaches_the_caller(self):
+        """Dropping unknown ids must not break a layer that echoes 8931001 for the
+        08931001 we asked about."""
+        feature = {"attributes": {**_PIERCE_FEATURE["attributes"],
+                                  "TaxParcelNumber": 6025430870}}
+        res = _map_county_features([feature], _PIERCE_CFG, {"6025430870": ["602543-087-0"]})
+        assert list(res) == ["602543-087-0"]
+
+    def test_feature_without_situs_but_with_mailing_is_kept(self):
+        """Was: skipped entirely. Changed 2026-09-10 (Codex).
+
+        Dropping the row threw away a real mailing address and let the situs-only
+        statewide layer answer instead, so the lead ended up with a property address
+        and NO mailing. It is now kept and flagged so statewide tops up the situs,
+        and `batch_enrich_parcels_gis` merges rather than overwrites.
+        """
         feature = {"attributes": {**_PIERCE_FEATURE["attributes"], "Site_Address": None}}
+        res = _map_county_features([feature], _PIERCE_CFG, {"6025430870": ["602543-087-0"]})
+        row = res["602543-087-0"]
+        assert row["property_address"] is None
+        assert row["mailing_address"] == "9226 175TH STREET CT E, PUYALLUP, WA, 98375-4018"
+        assert row["needs_situs_fallback"] is True
+
+    def test_feature_with_neither_situs_nor_mailing_is_still_skipped(self):
+        feature = {"attributes": {**_PIERCE_FEATURE["attributes"],
+                                  "Site_Address": None, "Delivery_Address": None,
+                                  "City_State": None, "Zipcode": None}}
         assert _map_county_features([feature], _PIERCE_CFG, {"6025430870": ["602543-087-0"]}) == {}
 
 

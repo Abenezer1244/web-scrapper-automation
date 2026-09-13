@@ -45,7 +45,7 @@ import re
 import tempfile
 from collections import Counter
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
 from itertools import chain
 from urllib.parse import urljoin
@@ -72,8 +72,13 @@ add_scrape_domain(_HOST)
 # Targeted extraction of the bulk-file download anchor from the landing page.
 # (A narrow href match — not general HTML parsing — disambiguated below by the
 # surrounding text so the "description of the fields" twin link is excluded.)
+# Relative OR absolute on the county host. The page switched the data link to an
+# absolute URL (seen 2026-09-13) while the description twin stayed relative; a
+# relative-only pattern then saw only the twin, which serves an old April file.
 _DOC_LINK_RE = re.compile(
-    r'href="(/DocumentCenter/View/\d+/snohomish_tax_data_totals[^"]*)"', re.IGNORECASE
+    r'href="((?:https://www\.snohomishcountywa\.gov)?'
+    r'/DocumentCenter/View/\d+/snohomish_tax_data_totals[^"]*)"',
+    re.IGNORECASE,
 )
 
 @dataclass(frozen=True)
@@ -181,6 +186,13 @@ _MAX_HEAD_SCAN_LINES = 5_000
 # or the source is mid-rotation. Ratio-gated rather than zero-tolerance so one
 # stray row can't take the connector down (measured: 0 disagreement on the live file).
 _MAX_AS_OF_DISAGREEMENT_RATIO = 0.10
+# Freshness of the file's as-of (publish) date. The county republishes roughly
+# monthly (as-of 20260901 on the file live 2026-09-13). Two missed cycles means we
+# are reading a stale or wrong file, which is exactly what the April description
+# twin looked like, so the scrape fails loudly instead of shipping old balances.
+_MAX_AS_OF_AGE_DAYS = 62
+# A publish date more than this far in the future is a corrupt cell, not a file.
+_MAX_AS_OF_FUTURE_DAYS = 2
 
 # TEXT-shape canary. The amount invariant only protects the amount block; a
 # permutation could preserve billed == paid + owed and still swap owner/address
@@ -244,7 +256,12 @@ def _select_current_tax_list_url(html: str, base_url: str) -> str:
     for href, window in candidates:
         if "description of the fields" not in window:
             return urljoin(base_url, href)
-    return urljoin(base_url, candidates[0][0])
+    # Only the description twin is left. It resolves to a real but OLD tax list,
+    # so returning it would ship stale leads with no error. Fail instead.
+    raise ValueError(
+        "Snohomish treasurer page: only the field-description link was found, not "
+        "the 'Current Tax List' data link (page layout may have changed)"
+    )
 
 
 def _to_decimal(raw: str) -> Decimal | None:
@@ -302,7 +319,13 @@ def _is_number_like(raw: str) -> bool:
 
 
 def _as_of_year(raw: str) -> int | None:
-    """Year from a Snohomish as-of date cell, else None.
+    """Year from a Snohomish as-of date cell, else None (see _as_of_date)."""
+    parsed = _as_of_date(raw)
+    return parsed.year if parsed is not None else None
+
+
+def _as_of_date(raw: str) -> date | None:
+    """Calendar date from a Snohomish as-of date cell, else None.
 
     Two published formats: 'mm/dd/yyyy' (v17) and 'YYYYMMDD' (v15, live since
     2026-07-01). Returning None here is NOT benign -- the as-of year is what
@@ -330,7 +353,30 @@ def _as_of_year(raw: str) -> int | None:
         parsed = datetime.strptime(s, fmt)
     except ValueError:
         return None
-    return parsed.year if _MIN_AS_OF_YEAR <= parsed.year <= _MAX_AS_OF_YEAR else None
+    if not _MIN_AS_OF_YEAR <= parsed.year <= _MAX_AS_OF_YEAR:
+        return None
+    return parsed.date()
+
+
+def _check_as_of_fresh(as_of: date | None, today: date) -> None:
+    """Raise unless the file's as-of date is recent and not in the future.
+
+    None is left to the caller's unparseable-as-of check, which runs first.
+    """
+    if as_of is None:
+        return
+    age_days = (today - as_of).days
+    if age_days > _MAX_AS_OF_AGE_DAYS:
+        raise RuntimeError(
+            f"Snohomish tax list is stale: as-of {as_of.isoformat()} is {age_days} "
+            f"days old (limit {_MAX_AS_OF_AGE_DAYS}). The resolved link is likely "
+            "an old file; refusing to ship outdated balances"
+        )
+    if -age_days > _MAX_AS_OF_FUTURE_DAYS:
+        raise RuntimeError(
+            f"Snohomish tax list as-of {as_of.isoformat()} is in the future. The "
+            "as-of column is corrupt; refusing to classify delinquency from it"
+        )
 
 
 def _join_address(*parts: str | None) -> str | None:
@@ -420,6 +466,7 @@ def parse_tax_list(
     stream = iter(lines)
     head: list[str] = []
     as_of_votes: Counter[int] = Counter()
+    as_of_date_votes: Counter[date] = Counter()
     sampled = 0
     for line in stream:
         head.append(line)
@@ -440,14 +487,18 @@ def parse_tax_list(
             continue
         if not (f[0].strip().isdigit() and len(f[1].strip()) == 4 and f[1].strip().isdigit()):
             continue
-        year_seen = _as_of_year(f[layout.as_of])
-        if year_seen is not None:
-            as_of_votes[year_seen] += 1
+        date_seen = _as_of_date(f[layout.as_of])
+        if date_seen is not None:
+            as_of_votes[date_seen.year] += 1
+            as_of_date_votes[date_seen] += 1
         sampled += 1
         if sampled >= _AS_OF_SAMPLE_ROWS:
             break
     if as_of_votes:
         current_year = as_of_votes.most_common(1)[0][0]
+    majority_as_of_date = (
+        as_of_date_votes.most_common(1)[0][0] if as_of_date_votes else None
+    )
     as_of_disagreement = sum(as_of_votes.values()) - max(as_of_votes.values(), default=0)
 
     for line in chain(head, stream):
@@ -481,8 +532,11 @@ def parse_tax_list(
         # spliced file whose first rows agree would otherwise classify the entire
         # remainder against the wrong cutoff without any signal. Counted over every
         # structurally valid row, not just the in-scope slice.
+        # Compared by full DATE, not just year: a same-year splice (fresh head, stale
+        # tail) would otherwise pass the freshness guard on the head's majority date.
+        # Measured on both live revisions: every valid row carries one as-of date.
         as_of_rows += 1
-        if _as_of_year(f[layout.as_of]) != current_year:
+        if _as_of_date(f[layout.as_of]) != majority_as_of_date:
             as_of_mismatch += 1
 
         ref_year = current_year or fallback_year
@@ -598,7 +652,10 @@ def parse_tax_list(
         # No legal description in the Snohomish tax bulk file — leave None rather
         # than standing in the parcel number (parcel_id is its own field above).
         rec.legal_description = None
-        rec.date_recorded = f"01/01/{bill_year}"
+        # NO DATE (same as King, #210). A tax roll carries a tax YEAR, not a
+        # filing or delinquency date; "01/01/<year>" asserted an event that never
+        # happened. The year is surfaced as oldest_tax_year / delinquent_bill_year.
+        rec.date_recorded = None
         # doc_type left None (like King tax rows): the daily-cache records filter
         # for tax_delinquent matches `doc_type IS NULL` OR keyword ILIKE patterns
         # ("TAX DELINQUENT", ...); the slug "tax_delinquent" would match neither
@@ -638,6 +695,9 @@ def parse_tax_list(
         "delinquent_rows": delinquent_rows,
         "capped_out": capped_out,
         "as_of_year": current_year,
+        # Majority as-of DATE over the sampled head: the file's publish date, used
+        # by the caller's staleness guard. None when no sampled row had one.
+        "as_of_date": majority_as_of_date,
         "layout": layout.name if layout else None,
         # Semantic-canary telemetry for the caller's structural validation.
         "invariant_checked": invariant_checked,
@@ -656,6 +716,98 @@ def parse_tax_list(
         "head_buffered": len(head),
     }
     return records, stats
+
+
+def _validate_parsed(records: list[ScrapedRecord], stats: dict, today: date) -> None:
+    """Fail loudly unless a parsed tax list is structurally and semantically sound.
+
+    Pure (no network) so the exact checks the scraper runs are testable on
+    parse_tax_list output. Raises RuntimeError on the first failed check.
+    """
+    total = stats["total"]
+    malformed = stats["malformed"]
+    # Structural validation: catch a silently-wrong file (county swapped the
+    # layout / served an error page) — not just the zero-row case.
+    if total == 0:
+        raise RuntimeError(
+            "Snohomish tax list download produced no rows (wrong or empty file)"
+        )
+    if malformed / total > _MAX_MALFORMED_RATIO:
+        raise RuntimeError(
+            f"Snohomish tax list format unexpected: {malformed}/{total} rows "
+            f"malformed (>{int(_MAX_MALFORMED_RATIO * 100)}%) — possible source "
+            f"change (layout={stats['layout']!r}; known widths "
+            f"{sorted(_LAYOUTS)})"
+        )
+    # The as-of year is what separates "delinquent" from "current". If it did
+    # not parse, parse_tax_list fell back to the wall-clock year — harmless in
+    # mid-year, but across a year boundary it would classify the entire current
+    # tax year as delinquent. Structural, so fail rather than ship bad leads.
+    if stats["as_of_year"] is None:
+        raise RuntimeError(
+            "Snohomish tax list as-of date unparseable (layout="
+            f"{stats['layout']!r}) — refusing to classify delinquency from the "
+            "wall clock; the source date format likely changed"
+        )
+    _check_as_of_fresh(stats["as_of_date"], today)
+    # SEMANTIC validation. The checks above only prove the file has the right
+    # SHAPE. If the county republished the same width with the columns in a
+    # different order, every check so far would pass and we would emit wrong
+    # owners and wrong amounts silently. The billed == paid + owed relationship
+    # is a property of the data, so a permutation breaks it immediately.
+    checked = stats["invariant_checked"]
+    violations = stats["invariant_violations"]
+    if checked and violations / checked > _MAX_INVARIANT_VIOLATION_RATIO:
+        raise RuntimeError(
+            f"Snohomish tax list failed its amount invariant: {violations} of "
+            f"{checked} checked rows have billed != paid + owed "
+            f"(layout={stats['layout']!r}) — the amount columns have almost "
+            "certainly moved; refusing to emit leads with wrong balances"
+        )
+    # Same treatment for the non-amount columns: an amount-preserving reorder
+    # that moved owner/address would otherwise ship wrong leads silently.
+    text_checked = stats["text_checked"]
+    text_violations = stats["text_violations"]
+    if text_checked and text_violations / text_checked > _MAX_TEXT_VIOLATION_RATIO:
+        raise RuntimeError(
+            f"Snohomish tax list failed its text-shape checks: {text_violations} "
+            f"of {text_checked} rows have an empty/numeric owner or a malformed "
+            f"situs state/zip (layout={stats['layout']!r}) — the text columns have "
+            "likely moved; refusing to emit leads with wrong owner or address"
+        )
+    # A head that cannot agree on the as-of year means two files were spliced or
+    # the source is mid-rotation. Majority-vote alone would paper over that.
+    # Whole-file check first: the head sample can agree while the tail is spliced.
+    as_of_rows = stats["as_of_rows"]
+    as_of_mismatch = stats["as_of_mismatch"]
+    if as_of_rows and as_of_mismatch / as_of_rows > _MAX_AS_OF_DISAGREEMENT_RATIO:
+        raise RuntimeError(
+            f"Snohomish tax list as-of date is not consistent across the file: "
+            f"{as_of_mismatch} of {as_of_rows} rows disagree with "
+            f"{stats['as_of_date']} — refusing to classify delinquency from a "
+            "mixed source"
+        )
+    votes = stats["as_of_votes"]
+    disagreement = stats["as_of_disagreement"]
+    if votes and disagreement / votes > _MAX_AS_OF_DISAGREEMENT_RATIO:
+        raise RuntimeError(
+            f"Snohomish tax list as-of year is not consistent: {disagreement} of "
+            f"{votes} sampled rows disagree with the majority "
+            f"({stats['as_of_year']}) — refusing to classify delinquency from a "
+            "mixed source"
+        )
+    elif disagreement or as_of_mismatch:
+        _logger.warning(
+            "Snohomish tax list as-of drift under the abort limit: %d of %d sampled "
+            "rows disagreed on the year, %d of %d rows differ from the majority date "
+            "%s. Worth checking the source",
+            disagreement, votes, as_of_mismatch, as_of_rows, stats["as_of_date"],
+        )
+    if not records:
+        raise RuntimeError(
+            "Snohomish tax list parsed but found 0 delinquent real-property "
+            "parcels — possible format or source change"
+        )
 
 
 class SnohomishWATaxDelinquentScraper(BridgeScraper):
@@ -729,86 +881,7 @@ class SnohomishWATaxDelinquentScraper(BridgeScraper):
 
         total = stats["total"]
         malformed = stats["malformed"]
-        # Structural validation: catch a silently-wrong file (county swapped the
-        # layout / served an error page) — not just the zero-row case.
-        if total == 0:
-            raise RuntimeError(
-                "Snohomish tax list download produced no rows (wrong or empty file)"
-            )
-        if malformed / total > _MAX_MALFORMED_RATIO:
-            raise RuntimeError(
-                f"Snohomish tax list format unexpected: {malformed}/{total} rows "
-                f"malformed (>{int(_MAX_MALFORMED_RATIO * 100)}%) — possible source "
-                f"change (layout={stats['layout']!r}; known widths "
-                f"{sorted(_LAYOUTS)})"
-            )
-        # The as-of year is what separates "delinquent" from "current". If it did
-        # not parse, parse_tax_list fell back to the wall-clock year — harmless in
-        # mid-year, but across a year boundary it would classify the entire current
-        # tax year as delinquent. Structural, so fail rather than ship bad leads.
-        if stats["as_of_year"] is None:
-            raise RuntimeError(
-                "Snohomish tax list as-of date unparseable (layout="
-                f"{stats['layout']!r}) — refusing to classify delinquency from the "
-                "wall clock; the source date format likely changed"
-            )
-        # SEMANTIC validation. The checks above only prove the file has the right
-        # SHAPE. If the county republished the same width with the columns in a
-        # different order, every check so far would pass and we would emit wrong
-        # owners and wrong amounts silently. The billed == paid + owed relationship
-        # is a property of the data, so a permutation breaks it immediately.
-        checked = stats["invariant_checked"]
-        violations = stats["invariant_violations"]
-        if checked and violations / checked > _MAX_INVARIANT_VIOLATION_RATIO:
-            raise RuntimeError(
-                f"Snohomish tax list failed its amount invariant: {violations} of "
-                f"{checked} checked rows have billed != paid + owed "
-                f"(layout={stats['layout']!r}) — the amount columns have almost "
-                "certainly moved; refusing to emit leads with wrong balances"
-            )
-        # Same treatment for the non-amount columns: an amount-preserving reorder
-        # that moved owner/address would otherwise ship wrong leads silently.
-        text_checked = stats["text_checked"]
-        text_violations = stats["text_violations"]
-        if text_checked and text_violations / text_checked > _MAX_TEXT_VIOLATION_RATIO:
-            raise RuntimeError(
-                f"Snohomish tax list failed its text-shape checks: {text_violations} "
-                f"of {text_checked} rows have an empty/numeric owner or a malformed "
-                f"situs state/zip (layout={stats['layout']!r}) — the text columns have "
-                "likely moved; refusing to emit leads with wrong owner or address"
-            )
-        # A head that cannot agree on the as-of year means two files were spliced or
-        # the source is mid-rotation. Majority-vote alone would paper over that.
-        # Whole-file check first: the head sample can agree while the tail is spliced.
-        as_of_rows = stats["as_of_rows"]
-        as_of_mismatch = stats["as_of_mismatch"]
-        if as_of_rows and as_of_mismatch / as_of_rows > _MAX_AS_OF_DISAGREEMENT_RATIO:
-            raise RuntimeError(
-                f"Snohomish tax list as-of year is not consistent across the file: "
-                f"{as_of_mismatch} of {as_of_rows} rows disagree with "
-                f"{stats['as_of_year']} — refusing to classify delinquency from a "
-                "mixed source"
-            )
-        votes = stats["as_of_votes"]
-        disagreement = stats["as_of_disagreement"]
-        if votes and disagreement / votes > _MAX_AS_OF_DISAGREEMENT_RATIO:
-            raise RuntimeError(
-                f"Snohomish tax list as-of year is not consistent: {disagreement} of "
-                f"{votes} sampled rows disagree with the majority "
-                f"({stats['as_of_year']}) — refusing to classify delinquency from a "
-                "mixed source"
-            )
-        elif disagreement or as_of_mismatch:
-            _logger.warning(
-                "Snohomish tax list: %d of %d sampled rows disagreed on the as-of "
-                "year (using majority %s) — worth checking the source",
-                disagreement, votes, stats["as_of_year"],
-            )
-        if not records:
-            raise RuntimeError(
-                "Snohomish tax list parsed but found 0 delinquent real-property "
-                "parcels — possible format or source change"
-            )
+        _validate_parsed(records, stats, _now.date())
 
         _logger.info(
             "Snohomish tax delinquent complete — %d bytes, %d rows (%d malformed), "

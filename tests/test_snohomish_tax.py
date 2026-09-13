@@ -5,14 +5,21 @@ captured from the live Treasurer "Current Tax List" file and the real landing
 page structure. (The HTTP download + redirect path is exercised by safe_http's
 own tests and the live Railway smoke run.)
 """
+from datetime import date, timedelta
 from decimal import Decimal
 
 import pytest
 
+from src.api.tax_filters import tax_cap_min_year
 from src.scrapers.snohomish_wa_tax_delinquent import (
+    _MAX_AS_OF_AGE_DAYS,
+    _MAX_AS_OF_FUTURE_DAYS,
+    _as_of_date,
     _as_of_year,
+    _check_as_of_fresh,
     _select_current_tax_list_url,
     _to_decimal,
+    _validate_parsed,
     parse_tax_list,
 )
 
@@ -115,6 +122,7 @@ def test_parse_filters_to_delinquent_real_property():
     assert stats["malformed"] == 0
     assert stats["delinquent_rows"] == 4  # CISSNA 1 + SCHWAB 1 + LORME 2
     assert stats["as_of_year"] == 2026
+    assert stats["as_of_date"] == date(2026, 6, 1)
 
 
 def test_parse_aggregates_multi_year_parcel():
@@ -130,7 +138,8 @@ def test_parse_aggregates_multi_year_parcel():
     assert ed["delinquent_years"] == [2024, 2025]
     assert ed["delinquent_year_count"] == 2
     assert ed["source"] == "snohomish_county_delinquent_taxes"
-    assert lorme.date_recorded == "01/01/2024"
+    # A tax roll has a tax YEAR, not a date: no fabricated January 1st.
+    assert lorme.date_recorded is None
     # delinquent_amount must round-trip cleanly to a Decimal (no float drift)
     assert Decimal(ed["delinquent_amount"]) == Decimal("10464.62")
 
@@ -548,3 +557,124 @@ def test_cap_none_disables_cap_back_compat():
     assert set(by) == {"00100000000001", "00200000000002"}
     assert stats["capped_out"] == 0
     assert by["00100000000001"].enrichment_data["bill_year"] == 2010
+
+
+# ─── current landing page: absolute data link, relative description twin ─────
+# Shape of the live page on 2026-09-13. The data file (id 151113, as-of 20260901)
+# is linked ABSOLUTELY; the field-description twin (id 148137) stays relative and
+# serves an old April 2026 file. A relative-only pattern saw only the twin.
+
+_LANDING_HTML_ABSOLUTE = (
+    '<p>Current Tax List:&nbsp; To view the &ldquo;Current Tax List&rdquo;, which '
+    'contains information for all parcels in Snohomish County and their current '
+    'taxes due please click <a aria-describedby="audioeye_new_window_message" '
+    'href="https://www.snohomishcountywa.gov/DocumentCenter/View/151113/'
+    'snohomish_tax_data_totals" rel="noopener" target="_blank">here</a> (last '
+    'updated 09/01/2026). For a description of the fields on the Current Tax list, '
+    'please <a aria-describedby="audioeye_new_window_message" '
+    'href="/DocumentCenter/View/148137/snohomish_tax_data_totals" '
+    'target="_blank">click here</a>.</p>'
+)
+_LANDING = "https://www.snohomishcountywa.gov/5568/Treasurer-Public-Records"
+
+
+def test_select_picks_absolute_data_link_over_relative_twin():
+    url = _select_current_tax_list_url(_LANDING_HTML_ABSOLUTE, _LANDING)
+    assert url == (
+        "https://www.snohomishcountywa.gov/DocumentCenter/View/151113/snohomish_tax_data_totals"
+    )
+
+
+def test_select_raises_when_only_the_description_twin_is_linked():
+    # Returning the twin would silently ship an old file's balances.
+    twin_only = (
+        '<p>For a description of the fields on the Current Tax list, please <a '
+        'href="/DocumentCenter/View/148137/snohomish_tax_data_totals">click here</a>.</p>'
+    )
+    with pytest.raises(ValueError, match="only the field-description link"):
+        _select_current_tax_list_url(twin_only, _LANDING)
+
+
+def test_select_ignores_absolute_links_on_other_hosts():
+    foreign = _LANDING_HTML_ABSOLUTE.replace(
+        "https://www.snohomishcountywa.gov/DocumentCenter", "https://evil.example/DocumentCenter"
+    )
+    with pytest.raises(ValueError, match="only the field-description link"):
+        _select_current_tax_list_url(foreign, _LANDING)
+
+
+# ─── as-of freshness (the old April twin would have failed this) ──────────────
+
+def test_as_of_date_parses_both_formats():
+    assert _as_of_date("20260901") == date(2026, 9, 1)
+    assert _as_of_date("04/21/2026") == date(2026, 4, 21)
+    assert _as_of_date("20260229") is None
+
+
+def test_fresh_as_of_passes_at_the_age_limit():
+    today = date(2026, 9, 13)
+    _check_as_of_fresh(today - timedelta(days=_MAX_AS_OF_AGE_DAYS), today)
+    _check_as_of_fresh(today + timedelta(days=_MAX_AS_OF_FUTURE_DAYS), today)
+    _check_as_of_fresh(None, today)  # the unparseable case is the caller's check
+
+
+def test_stale_as_of_raises():
+    today = date(2026, 9, 13)
+    with pytest.raises(RuntimeError, match="stale"):
+        _check_as_of_fresh(today - timedelta(days=_MAX_AS_OF_AGE_DAYS + 1), today)
+    # The real description-twin file on 2026-09-13.
+    with pytest.raises(RuntimeError, match="stale"):
+        _check_as_of_fresh(date(2026, 4, 21), today)
+
+
+def test_future_as_of_raises():
+    today = date(2026, 9, 13)
+    with pytest.raises(RuntimeError, match="in the future"):
+        _check_as_of_fresh(today + timedelta(days=_MAX_AS_OF_FUTURE_DAYS + 1), today)
+
+
+# ─── the August-to-December outage, end to end through the parser ────────────
+
+_SEPT_ROWS = """\
+00200000000002|2025|2 NEW ST|EVERETT|WA|98201|NEW OWNER|EVERETT|WA|98201|20260901|300.00|0.00|300.00|600.00
+00100000000001|2024|1 OLD ST|EVERETT|WA|98201|OLD OWNER|EVERETT|WA|98201|20260901|100.00|0.00|100.00|200.00
+00100000000001|2025|1 OLD ST|EVERETT|WA|98201|OLD OWNER|EVERETT|WA|98201|20260901|200.00|0.00|200.00|400.00
+00300000000003|2026|3 CUR ST|EVERETT|WA|98201|CUR OWNER|EVERETT|WA|98201|20260901|500.00|0.00|500.00|1000.00
+""".splitlines()
+
+
+@pytest.mark.parametrize("today", [date(2026, 8, 1), date(2026, 9, 13), date(2026, 12, 31)])
+def test_last_years_delinquency_survives_the_cap_from_august(today):
+    records, stats = parse_tax_list(
+        _SEPT_ROWS, fallback_year=today.year, cap_min_year=tax_cap_min_year(today)
+    )
+    by = _by_parcel(records)
+    # Oldest unpaid year 2025 is kept; before the fix this set was empty.
+    assert set(by) == {"00200000000002"}
+    assert by["00200000000002"].enrichment_data["bill_year"] == 2025
+    # 2024 oldest is still capped (recency cap unchanged for older debt).
+    assert stats["capped_out"] == 1
+    # The current tax year is never treated as delinquent.
+    assert "00300000000003" not in by
+    assert stats["layout"] == "v15_2026_07"
+
+
+def test_same_year_splice_is_tallied_by_date():
+    # Codex P2: a fresh head over a stale tail from the SAME year used to pass,
+    # because the whole-file check compared years only.
+    rows = [_SEPT_ROWS[0]] * 10 + [_SEPT_ROWS[0].replace("20260901", "20260421")] * 10
+    _, stats = parse_tax_list(rows, fallback_year=2026)
+    assert stats["as_of_date"] == date(2026, 9, 1)
+    assert stats["as_of_mismatch"] == 10
+    with pytest.raises(RuntimeError, match="as-of date is not consistent"):
+        _validate_parsed(*parse_tax_list(rows, fallback_year=2026), date(2026, 9, 13))
+
+
+def test_validation_passes_a_fresh_file_and_rejects_a_stale_one():
+    # The same checks scrape() runs, on real parser output (Codex P3).
+    today = date(2026, 9, 13)
+    cap = tax_cap_min_year(today)
+    _validate_parsed(*parse_tax_list(_SEPT_ROWS, fallback_year=2026, cap_min_year=cap), today)
+    stale = [r.replace("20260901", "20260421") for r in _SEPT_ROWS]
+    with pytest.raises(RuntimeError, match="stale"):
+        _validate_parsed(*parse_tax_list(stale, fallback_year=2026, cap_min_year=cap), today)

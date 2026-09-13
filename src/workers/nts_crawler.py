@@ -116,6 +116,7 @@ def crawl_nts_tacoma_index() -> dict:
     from src.utils.safe_http import safe_get
 
     today = datetime.now(UTC).date()
+    listing_pages_read = 0
 
     def _fetch_listing(page: int):
         """I/O for one listing page: returns (status_code, html) or None on failure.
@@ -123,6 +124,7 @@ def crawl_nts_tacoma_index() -> dict:
         A transient failure returns None so collect_notice_urls skips just this page
         (a later page may still carry trustee sales) instead of abandoning the crawl.
         """
+        nonlocal listing_pages_read
         if page > 1:
             time.sleep(_LISTING_DELAY_S)  # polite: we now walk multiple pages every run
         url = nts.BASE_URL + nts.LEGAL_NOTICES_PATH + (f"page/{page}/" if page > 1 else "")
@@ -131,6 +133,8 @@ def crawl_nts_tacoma_index() -> dict:
         except Exception as exc:  # noqa: BLE001 — a bad page must not kill the crawl
             _logger.warning("NTS listing page %d fetch failed: %s", page, str(exc)[:120])
             return None
+        if resp.status_code == 200:
+            listing_pages_read += 1
         return (resp.status_code, resp.text)
 
     notice_urls = nts.collect_notice_urls(
@@ -194,6 +198,10 @@ def crawl_nts_tacoma_index() -> dict:
             {"today": today, "cutoff": datetime.now(UTC) - _td_days(_CACHE_DAYS)},
         ).rowcount
         db.commit()
+        # The listing was READ (a day with no trustee sale still counts), and any
+        # trustee-sale notice it listed parsed (all failing is parser drift).
+        if listing_pages_read and (not notice_urls or upserted > 0):
+            _record_crawl_heartbeat(db, nts.COUNTY)
 
     summary = {"candidates": len(notice_urls), "upserted": upserted,
                "skipped": skipped, "errored": errored, "expired": expired or 0,
@@ -331,6 +339,10 @@ def crawl_nts_columbian_clark() -> dict:
              "cutoff": datetime.now(UTC) - _td_days(_CACHE_DAYS)},
         ).rowcount or 0
         db.commit()
+        # Read = the listing had ads and at least one ad detail was fetched. Most
+        # Clark ads are not trustee sales, so 0 upserts is still a real read.
+        if ad_urls and summary["errored"] < len(ad_urls):
+            _record_crawl_heartbeat(db, col.COUNTY)
 
     _logger.info("Clark NTS crawl done: %s", summary)
     # Clark legitimately has 0 trustee sales on many days (the listing is mostly court
@@ -388,6 +400,15 @@ def _fetch_legals_blocks(pdf_url: str) -> list[str]:
     """Download one legals PDF (SSRF-guarded, byte-capped) and split it into notice
     blocks. Raises on download/extract failure — callers decide whether that is fatal.
     """
+    return _fetch_legals_issue(pdf_url)[0]
+
+
+def _fetch_legals_issue(pdf_url: str) -> tuple[list[str], bool]:
+    """Like _fetch_legals_blocks, plus whether the text is a real legals issue.
+
+    The flag separates "this week's issue carries no trustee sale" (a real issue,
+    0 blocks) from "the extraction produced nothing usable" (0 blocks too).
+    """
     import os
     import tempfile
 
@@ -408,9 +429,8 @@ def _fetch_legals_blocks(pdf_url: str) -> list[str]:
             os.remove(path)
         except OSError:
             pass
-    return nts_pdf.split_notice_blocks(
-        nts_pdf.normalize_pdf_text(nts_pdf.extract_pdf_text(data))
-    )
+    text = nts_pdf.normalize_pdf_text(nts_pdf.extract_pdf_text(data))
+    return nts_pdf.split_notice_blocks(text), nts_pdf.looks_like_legals_issue(text)
 
 
 def _ingest_pdf_blocks(
@@ -540,6 +560,7 @@ def _crawl_pacific_publishing_pdf(
         parse_fn = nts.parse_nts_notice
 
     today = datetime.now(UTC).date()
+    parsed_ok = False
     summary = {"source": source, "pdf_url": None, "blocks": 0,
                "upserted": 0, "skipped": 0, "errored": 0, "expired": 0,
                "archive_candidates": 0, "archive_fetched": 0, "archive_upserted": 0}
@@ -549,9 +570,10 @@ def _crawl_pacific_publishing_pdf(
 
     blocks: list[str] = []
     current_upserted = 0
+    issue_read = False
     if pdf_url:
         try:
-            blocks = _fetch_legals_blocks(pdf_url)
+            blocks, issue_read = _fetch_legals_issue(pdf_url)
         except Exception as exc:  # noqa: BLE001 — a bad download/PDF must not crash the beat
             summary["errored"] += 1
             _logger.warning("NTS PDF download/extract failed (%s): %s", pdf_url, str(exc)[:160])
@@ -595,7 +617,14 @@ def _crawl_pacific_publishing_pdf(
              "cutoff": datetime.now(UTC) - _td_days(_CACHE_DAYS)},
         ).rowcount or 0
         db.commit()
+        # Read AND parsed: a real issue whose trustee-sale notices all failed to parse
+        # is parser drift, and must not look like a fresh cache with no sales.
+        parsed_ok = not blocks or current_upserted > 0
+        if issue_read and parsed_ok:
+            _record_crawl_heartbeat(db, county)
 
+    summary["issue_read"] = issue_read
+    summary["heartbeat"] = issue_read and parsed_ok
     _logger.info("NTS PDF crawl done (%s): %s", source, summary)
     # Barren alerting deliberately judges the CURRENT ISSUE ONLY (Codex P2). Folding the
     # archive's recoveries into `upserted` would let a healthy back-catalogue hide the
@@ -819,6 +848,21 @@ def _alert_if_crawl_barren(
             "the crawler logs."
         ),
     )
+
+
+def _record_crawl_heartbeat(db, county: str) -> None:
+    """Record that this county's crawler READ its source (trustee_sale freshness).
+
+    Only ever marks healthy: the source canary probes throttled/blocked rows, so a
+    heartbeat row is never probed. Best-effort, like every source_health write.
+    """
+    try:
+        from src.scrapers.enrichment.source_health import mark_source_healthy
+        from src.scrapers.trustee_sale import nts_crawl_heartbeat_key
+
+        mark_source_healthy(db, nts_crawl_heartbeat_key(county))
+    except Exception as exc:  # noqa: BLE001 — the crawl's own data is already committed
+        _logger.error("NTS crawl heartbeat not recorded for %s: %s", county, str(exc)[:160])
 
 
 def _td_days(days: int):

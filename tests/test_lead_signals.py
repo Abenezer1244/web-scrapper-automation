@@ -7,33 +7,35 @@ from datetime import date
 
 from src.utils.lead_signals import (
     contactability_score,
+    delinquency_anchor,
     derive_signals,
     freshness_days,
     months_delinquent,
     wa_foreclosure_eligible,
 )
 
-TODAY = date(2026, 6, 12)  # base = 2026*12 + 5 = 24317
+TODAY = date(2026, 6, 12)  # May-1 anchor = 2026*12 + 5 - 4 = 24313
 
 
 class TestMonthsDelinquent:
     def test_none_bill_year(self):
         assert months_delinquent(None, TODAY) is None
 
-    def test_three_full_years(self):
-        # bill_year 2023, today 2026-06 -> 24317 - 2023*12(=24276) = 41 months
-        assert months_delinquent(2023, TODAY) == 41
+    def test_counted_from_may_first_of_the_bill_year(self):
+        # 2023's first half went delinquent 2023-05-01; June 2026 is 37 months on.
+        assert months_delinquent(2023, TODAY) == 37
 
-    def test_current_year_small(self):
-        assert months_delinquent(2026, TODAY) == 5
+    def test_current_year_after_april(self):
+        assert months_delinquent(2026, TODAY) == 1
+        assert months_delinquent(2026, date(2026, 5, 1)) == 0
 
-    def test_future_year_unclamped(self):
-        # exact tax_filters parity (Codex): no floor — future bill_year is negative
-        assert months_delinquent(2030, TODAY) < 0
+    def test_not_yet_delinquent_is_zero_not_negative(self):
+        # A current-year bill before May, or a future year, shows 0.
+        assert months_delinquent(2026, date(2026, 4, 30)) == 0
+        assert months_delinquent(2030, TODAY) == 0
 
-    def test_matches_tax_filters_base_formula(self):
-        base = TODAY.year * 12 + (TODAY.month - 1)
-        assert months_delinquent(2020, TODAY) == base - 2020 * 12
+    def test_matches_the_shared_anchor(self):
+        assert months_delinquent(2020, TODAY) == delinquency_anchor(TODAY) - 2020 * 12
 
 
 class TestWaForeclosureEligible:
@@ -93,9 +95,9 @@ class TestContactabilityScore:
         )
         assert score == 1
 
-    def test_months_formula_unclamped_matches_filter(self):
-        # exact parity with tax_filters: future bill_year goes negative, not 0
-        assert months_delinquent(2030, TODAY) == TODAY.year * 12 + (TODAY.month - 1) - 2030 * 12
+    def test_months_clamped_for_a_future_bill_year(self):
+        # Parity with tax_filters holds with the clamp (see test_tax_filters).
+        assert months_delinquent(2030, TODAY) == 0
 
     def test_object_phones_tolerated(self):
         class _PC:

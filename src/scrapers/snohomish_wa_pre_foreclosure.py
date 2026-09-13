@@ -24,9 +24,12 @@ import re
 import tempfile
 from urllib.parse import urlparse
 
+import requests
+
 from src.config import settings
 from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord
 from src.scrapers.preforeclosure import strip_vesting_clause
+from src.scrapers.reliability import ScraperExecutionError, TransientScrapeError
 from src.scrapers.sources import nts_pdf
 from src.scrapers.sources import nts_tacoma_index as nts
 from src.utils.logger import setup_logger
@@ -52,14 +55,40 @@ _SOURCE = "snohomish_tribune"
 _HREF_PDF = re.compile(r'href="([^"]+\.pdf)"', re.I)
 
 
+# Statuses that mean "the site is having a moment", worth a retry. The page's normal
+# answer is a soft 404 that still carries the links, so 404 is NOT in this set.
+_RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
+# Transport failures only. A malformed URL, a refused redirect or an SSRF block is
+# not going to clear on a retry and must fail as itself.
+_TRANSPORT_ERRORS = (
+    requests.ConnectionError,
+    requests.Timeout,
+    requests.exceptions.ChunkedEncodingError,
+)
+
+
+def _transient(reason: str) -> TransientScrapeError:
+    return TransientScrapeError(
+        "snohomish", "snohomish_tribune", reason, record_type="pre_foreclosure"
+    )
+
+
 def _discover_pdf_url() -> str | None:
+    """The current Legals PDF URL, or None when a fetched page carries no link.
+
+    A network failure used to be swallowed and reported as "page layout/source
+    change", a permanent failure. It is now a TransientScrapeError, so the worker
+    retries, and the layout message is kept for a page that really has no link.
+    """
     try:
         resp = safe_get_following(
             _PAGE_URL, timeout=settings.DEFAULT_TIMEOUT, headers={"User-Agent": _BROWSER_UA}
         )
-    except Exception as exc:  # noqa: BLE001
-        _logger.warning("Snohomish NTS discovery failed: %s", str(exc)[:140])
-        return None
+    except _TRANSPORT_ERRORS as exc:
+        raise _transient(f"legal-notices page unreachable: {type(exc).__name__}") from exc
+    # Before trusting any link: a 429/5xx body may be a cached or partial page.
+    if resp.status_code in _RETRYABLE_STATUS:
+        raise _transient(f"legal-notices page answered HTTP {resp.status_code}")
     for raw in _HREF_PDF.findall(resp.text):
         url = _html.unescape(raw)
         p = urlparse(url)
@@ -67,6 +96,34 @@ def _discover_pdf_url() -> str | None:
         if p.hostname == _PDF_HOST and p.path.startswith(_PDF_PREFIX) and "legal" in base:
             return url
     _logger.info("Snohomish NTS discovery: no legals PDF on %s (HTTP %d)", _PAGE_URL, resp.status_code)
+    return None
+
+
+def assess_notice_parse(block_count: int, parsed_count: int, issue_read: bool) -> str | None:
+    """Raise when an issue's result cannot be trusted; return a partial-coverage note.
+
+    Pure. Three cases the old code all reported as a normal run:
+      * the extraction is not a real legals issue -> raise (not "no sales")
+      * trustee-sale blocks exist but none parsed -> raise (parser drift)
+      * some blocks did not parse -> deliver, and return a note to log
+    A real issue with no trustee-sale block returns None: genuinely no sales.
+    """
+    if not issue_read:
+        raise ScraperExecutionError(
+            "snohomish", "snohomish_tribune",
+            "the Legals PDF text is not a readable legal-notices issue "
+            "(empty or failed extraction); refusing to report 0 leads",
+            record_type="pre_foreclosure",
+        )
+    if block_count and not parsed_count:
+        raise ScraperExecutionError(
+            "snohomish", "snohomish_tribune",
+            f"{block_count} trustee-sale notices found but none parsed; the notice "
+            "layout has likely changed",
+            record_type="pre_foreclosure",
+        )
+    if parsed_count < block_count:
+        return f"{block_count - parsed_count} of {block_count} trustee-sale notices did not parse"
     return None
 
 
@@ -140,20 +197,23 @@ class SnohomishWAPreForeclosureScraper(BridgeScraper):
         fd, path = tempfile.mkstemp(suffix=".pdf", prefix="snoho_nts_")
         os.close(fd)
         try:
-            safe_download_to_file(
-                pdf_url, path, max_bytes=_MAX_PDF_BYTES, require_https=True,
-                headers={"User-Agent": _BROWSER_UA}, timeout=settings.DEFAULT_TIMEOUT,
-            )
+            try:
+                safe_download_to_file(
+                    pdf_url, path, max_bytes=_MAX_PDF_BYTES, require_https=True,
+                    headers={"User-Agent": _BROWSER_UA}, timeout=settings.DEFAULT_TIMEOUT,
+                )
+            except _TRANSPORT_ERRORS as exc:
+                raise _transient(f"Legals PDF download failed: {type(exc).__name__}") from exc
             with open(path, "rb") as fh:
                 data = fh.read()
-            text = nts_pdf.extract_pdf_text(data)
+            text = nts_pdf.normalize_pdf_text(nts_pdf.extract_pdf_text(data))
         finally:
             try:
                 os.remove(path)
             except OSError:
                 pass
 
-        blocks = nts_pdf.split_notice_blocks(nts_pdf.normalize_pdf_text(text))
+        blocks = nts_pdf.split_notice_blocks(text)
         records: list[ScrapedRecord] = []
         for block in blocks:
             parsed = nts.parse_nts_notice(block)
@@ -161,10 +221,11 @@ class SnohomishWAPreForeclosureScraper(BridgeScraper):
                 continue  # commercial/MTC/other format we don't yet parse — safely skipped
             records.append(_record_from_notice(parsed))
 
-        if not records:
-            # The dominant Quality Loan / North Star formats parse; a week with zero
-            # parseable NTS is plausible (small paper) but worth surfacing, not crashing.
-            _logger.warning("Snohomish Tribune: %d notice blocks, 0 parseable NTS leads", len(blocks))
+        partial = assess_notice_parse(
+            len(blocks), len(records), nts_pdf.looks_like_legals_issue(text)
+        )
+        if partial:
+            _logger.warning("Snohomish Tribune: partial coverage, %s (%s)", partial, pdf_url)
         _logger.info("Snohomish pre_foreclosure complete — %d blocks → %d leads", len(blocks), len(records))
         if self.on_progress:
             self.on_progress(1, 1, len(records))

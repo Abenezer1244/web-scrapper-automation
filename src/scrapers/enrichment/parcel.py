@@ -47,7 +47,10 @@ async def enrich_parcel(
             from src.scrapers.enrichment.county_gis import enrich_parcel_gis
 
             result = enrich_parcel_gis(parcel_id, county, state, owner_name=owner_name)
-            if result.get("property_address"):
+            # A county can publish the owner's mailing address for a parcel with no
+            # situs street (vacant land). That is a real answer; falling through would
+            # discard it and end at "(enrichment unavailable)" (Codex P2).
+            if result.get("property_address") or result.get("mailing_address"):
                 _logger.info("GIS enrichment succeeded for parcel %s", parcel_id)
                 return result
 

@@ -239,7 +239,9 @@ class PierceWACodeViolationScraper(BridgeScraper):
                 # any free-text complaint field (it can carry complainant PII).
                 case_type = (attr.get("casetype") or "").strip()
                 status = (attr.get("currentstatus") or "").strip()
-                record.party_name = f"{case_type} — {address}" if address else case_type
+                # Plain hyphen: party_name is shown to customers, and a " - <number>"
+                # separator is what skip-trace eligibility reads as a case description.
+                record.party_name = f"{case_type} - {address}" if address else case_type
 
                 # Legal description — use case number
                 record.legal_description = case_num

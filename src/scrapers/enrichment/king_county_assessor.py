@@ -445,6 +445,44 @@ async def _batch_extract_king_owners(
     return owners
 
 
+# The rendered tax bill ends the mailing block with its postal line, often glued to the
+# next label ("PORTLAND OR 97210Pay by mail"). Shared with scripts that find the rows
+# the old 2-line parser truncated, so "complete" means the same thing in both places.
+# A real state code is required before a US ZIP so "PO BOX 12345" never ends a block early.
+_US_STATE_CODES = (
+    "AL AK AZ AR CA CO CT DE DC FL GA HI ID IL IN IA KS KY LA ME MD MA MI MN MS MO MT NE NV "
+    "NH NJ NM NY NC ND OH OK OR PA RI SC SD TN TX UT VT VA WA WV WI WY PR GU VI AS MP AA AE AP"
+).split()
+MAILING_POSTAL_TAIL_RE = re.compile(
+    rf"(?:\b(?:{'|'.join(_US_STATE_CODES)}),?\s+\d{{5}}(?:-\d{{4}})?|\b[A-Z]\d[A-Z] ?\d[A-Z]\d)\s*$",
+    re.IGNORECASE)
+_MAILING_BLOCK_END_RE = re.compile(r"Pay by|Annual statement|Billing Details")
+_MAILING_BLOCK_MAX_LINES = 5
+
+
+def parse_mailing_block(body: str) -> str | None:
+    """The taxpayer mailing address from a rendered King tax-bill page, or None.
+
+    Lines after "Mailing Address" up to and including the first one ending in a US ZIP
+    or Canadian postal code, joined as "LINE1, LINE2, CITY ST ZIP". The old parser kept
+    at most two lines and stopped only at a line STARTING with "Pay by", so a three-line
+    address ("2250 NW FLANDERS ST / SUITE GARDEN 02 / PORTLAND OR 97210") was stored
+    without its city, state and ZIP (2,777 King rows, 2026-09-13). No postal line within
+    the first few lines means the block is not understood, so nothing is returned.
+    """
+    if "Mailing Address" not in body:
+        return None
+    after = body[body.index("Mailing Address") + len("Mailing Address"):]
+    end = _MAILING_BLOCK_END_RE.search(after)
+    if end:
+        after = after[:end.start()]
+    lines = [ln.strip() for ln in after.split("\n") if ln.strip()][:_MAILING_BLOCK_MAX_LINES]
+    for i, line in enumerate(lines):
+        if MAILING_POSTAL_TAIL_RE.search(line):
+            return " ".join(", ".join(lines[:i + 1]).split())
+    return None
+
+
 def _read_parcel_page(page_html: str) -> tuple[str | None, str | None, str | None]:
     """(site address, tax-bill URL, owner) from one eRealProperty page.
 
@@ -1067,19 +1105,11 @@ async def _king_mailing_phase(results, tax_urls, st, _over_budget, pace_s,
                             "discarding its Mailing Address block", _probe,
                         )
                     elif "Mailing Address" in body:
-                        idx = body.index("Mailing Address") + len("Mailing Address")
-                        after = body[idx:idx + 200]
-                        lines = [ln.strip() for ln in after.split("\n") if ln.strip()]
-                        addr_lines = []
-                        for line in lines:
-                            if line.startswith("Pay by") or line.startswith("Annual") or line.startswith("Billing"):
-                                break
-                            if len(line) > 3:
-                                addr_lines.append(line)
-                            if len(addr_lines) >= 2:
-                                break
-                        if addr_lines:
-                            mailing = " ".join(", ".join(addr_lines).strip().split())
+                        # A block that does not end in a postal code is a partial or
+                        # unexpected render: it stays "error" (unknown, retried),
+                        # never a truncated "found".
+                        mailing = parse_mailing_block(body)
+                        if mailing:
                             results[pid]["mailing_address"] = mailing
                             results[pid]["mailing_lookup"] = "found"
 

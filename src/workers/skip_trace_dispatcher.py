@@ -93,6 +93,16 @@ def dispatch_pending_skip_trace() -> dict:
                 if not rows:
                     continue
 
+                # Never buy a lookup for a lead that is no longer delivered.
+                rows, withdrawn = _partition_still_deliverable(db, rows)
+                if withdrawn:
+                    _cancel_undeliverable(db, withdrawn)
+                    _logger.info(
+                        "Dispatcher: %d %s row(s) withdrawn before submit: the lead "
+                        "is now a duplicate or over the plan limit",
+                        len(withdrawn), trace_type,
+                    )
+
                 # Tracerfy's batch endpoint REQUIRES address + city + state on
                 # every row, and a row missing one is not rejected loudly — it is
                 # dropped from the upload. Production queue 162456: we sent 4 rows,
@@ -111,9 +121,9 @@ def dispatch_pending_skip_trace() -> dict:
                     errors.append(msg)
                     _logger.warning("Dispatcher: %s", msg)
                 if not rows:
-                    # Nothing submittable left: commit the failures on their own
-                    # (no claim follows to carry them).
-                    if unsubmittable:
+                    # Nothing submittable left: commit the failures and withdrawals
+                    # on their own (no claim follows to carry them).
+                    if unsubmittable or withdrawn:
                         db.commit()
                     continue
 
@@ -383,6 +393,84 @@ def _fail_unsubmittable(db, rows: list) -> None:
             Result.skip_trace_status.in_(("queued", "submitted")),
         )
         .values(skip_trace_status="errored", skip_trace_attempted_at=datetime.now(UTC))
+    )
+
+
+def _partition_still_deliverable(db, rows: list) -> tuple[list, list]:
+    """Split rows into (still deliverable, no longer delivered), FIFO order kept.
+
+    A row is queued at the moment its lead is decided, but the flags that decide
+    delivery can still change afterwards (a watchdog re-run repeats the survivor
+    election and the plan cap). A row whose Result is now a duplicate, or excluded
+    by the plan cap, is never delivered or billed, so paying Tracerfy for it buys
+    contact data nobody receives. This re-reads those two flags for the FIFO head
+    inside the same locked selection, before anything is claimed.
+
+    A Result that no longer exists falls in the second bucket too: its pending row
+    would only be CASCADE-deleted anyway, and a lookup for it could never be
+    ingested.
+    """
+    if not rows:
+        return [], []
+    from sqlalchemy import func, select, tuple_
+
+    from src.api.lead_actionability import DELIVERY_EXCLUDED_KEY, OVER_QUOTA
+    from src.db.models import Result
+
+    # Tenant-paired like every other write from this cross-tenant head.
+    deliverable = {
+        (str(rid), str(uid))
+        for rid, uid in db.execute(
+            select(Result.id, Result.user_id).where(
+                tuple_(Result.id, Result.user_id).in_(
+                    [(r.result_id, r.user_id) for r in rows]
+                ),
+                Result.is_duplicate.is_(False),
+                # Same spelling as lead_actionability.actionable_condition; a NULL
+                # blob yields NULL from ->>, which the COALESCE turns into ''.
+                func.coalesce(
+                    Result.enrichment_data.op("->>")(DELIVERY_EXCLUDED_KEY), ""
+                ) != OVER_QUOTA,
+            )
+        ).all()
+    }
+    keep: list = []
+    drop: list = []
+    for r in rows:
+        (keep if (str(r.result_id), str(r.user_id)) in deliverable else drop).append(r)
+    return keep, drop
+
+
+def _cancel_undeliverable(db, rows: list) -> None:
+    """Withdraw queued rows whose lead is no longer delivered. Never charged.
+
+    The pending row becomes 'cancelled' and its Result goes back to
+    'not_attempted', not 'errored': nothing failed, and if a later re-run makes
+    the lead deliverable again the normal enqueue picks it up.
+
+    Does NOT commit, for the reason spelled out in _fail_unsubmittable: the caller
+    holds FOR UPDATE SKIP LOCKED on the whole head until the claim commits.
+    """
+    if not rows:
+        return
+    from sqlalchemy import tuple_, update
+
+    from src.db.models import PendingSkipTraceRow, Result
+
+    db.execute(
+        update(PendingSkipTraceRow)
+        .where(PendingSkipTraceRow.id.in_([r.id for r in rows]))
+        .values(status="cancelled")
+    )
+    db.execute(
+        update(Result)
+        .where(
+            tuple_(Result.id, Result.user_id).in_(
+                [(r.result_id, r.user_id) for r in rows]
+            ),
+            Result.skip_trace_status == "queued",
+        )
+        .values(skip_trace_status="not_attempted")
     )
 
 

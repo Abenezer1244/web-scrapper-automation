@@ -950,17 +950,12 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
             no_parcel_no_legal, has_parcel, legal_no_parcel,
         )
 
-    # ── Sprint 4: skip trace enqueue ─────────────────────────────────────
-    # Only runs if:
-    #   1. SKIP_TRACE_ENABLED globally (env flag)
-    #   2. The user's scraper config has skip_trace_enabled=True
-    #   3. The user's plan permits skip trace (Starter blocked)
-    #   4. TRACERFY_API_TOKEN is configured
-    # Matching records are either hydrated from skip_trace_cache (free)
-    # or inserted into pending_skip_trace_rows for the dispatcher to
-    # submit in a batch. Actual Tracerfy calls happen in the dispatcher;
-    # this step is instant and never blocks scrape completion.
-    _enqueue_skip_trace_rows(db, job, r, job_id, config)
+    # Skip trace is deliberately NOT enqueued here. Which rows are delivered is
+    # still undecided at this point: the same-run survivor re-election, the claim
+    # transfer and the plan cap all run after enrichment and can each change it.
+    # A lookup bought now could land on a row that ends up suppressed, while the
+    # row actually delivered is never traced. tasks.py calls
+    # _enqueue_skip_trace_rows once those have settled.
 
 
 def pierce_address_recovery(db, r, job_id: str, config, all_results) -> None:

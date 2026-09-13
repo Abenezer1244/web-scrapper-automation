@@ -1732,21 +1732,40 @@ def run_scrape_job(self, job_id: str) -> None:
                     "Job %s: plan cap excluded %d actionable rows (remaining=%d)",
                     job_id, len(_capped_ids), _remaining,
                 )
-            # Reload whenever the cap RAN — after the mark AND after the clear.
-            #
-            # populate_existing is load-bearing, not defensive: the sessions are
-            # built with expire_on_commit=False (src/db/session.py), and these
-            # Result identities were already loaded by the post-enrichment refetch
-            # above. A plain re-SELECT returns those SAME objects with their STALE
-            # enrichment_data, so `is_actionable(res)` at export time would miss
-            # the marker the raw SQL just wrote — the export would ship over-quota
-            # rows while billing (which reads the DB) charged for fewer. That is
-            # exactly the file/bill disagreement this cap exists to prevent, and
-            # no test caught it because nothing exercises the worker cap
-            # end-to-end (Codex, 2026-09-03).
-            #
-            # The clear path needs it too: with no rows newly marked, stale
-            # objects could still carry a PREVIOUS run's marker and under-export.
+
+        # ── SKIP TRACE ENQUEUE (once delivery is decided) ────────────────────
+        # Only here, after the survivor re-election and the plan cap, which are
+        # the last steps that decide which rows ship. It used to run at the end
+        # of inline enrichment, before both: a lookup could be bought for a row
+        # the re-election then demoted or the cap then excluded, while the row
+        # actually delivered was never traced. The enqueue selects non-duplicate,
+        # actionable (so not over-quota), not-yet-attempted rows, so reading the
+        # settled flags is all the fix needs.
+        #
+        # Non-fatal, exactly as it was inside enrichment: everything before this
+        # point has already committed, so the rollback can only discard the
+        # enqueue's own uncommitted work, and an unqueued lead stays
+        # 'not_attempted' for a later backfill rather than failing a delivery.
+        try:
+            _enqueue_skip_trace_rows(db, job, r, job_id, config)
+        except Exception as exc:
+            db.rollback()
+            _logger.warning(
+                "Job %s: skip trace enqueue failed: %s", job_id, str(exc)[:160]
+            )
+
+        # Reload the rows every consumer below reads, for EVERY plan.
+        #
+        # populate_existing is load-bearing, not defensive: the sessions are
+        # built with expire_on_commit=False (src/db/session.py), and these
+        # Result identities were already loaded by the post-enrichment refetch
+        # above. A plain re-SELECT returns those SAME objects with their STALE
+        # state, so the export would miss what raw SQL wrote since: the plan
+        # cap's over-quota marker (the export would ship rows billing then
+        # refuses to charge, Codex 2026-09-03), a row the claim transfer
+        # promoted, and the contact data a skip-trace cache hit just copied in.
+        # Billing reads the DB, so a stale export is a file/bill disagreement.
+        if refreshed is not None:
             refreshed = db.execute(
                 select(Result)
                 .where(Result.job_id == job_id, Result.user_id == job.user_id)

@@ -18,7 +18,10 @@ from src.db.session import system_sync_session
 from src.workers.skip_trace_dispatcher import dispatch_pending_skip_trace
 
 
-def _seed_pending(user_id: str, *, status: str = "queued", submitted_at=None) -> tuple[str, str]:
+def _seed_pending(
+    user_id: str, *, status: str = "queued", submitted_at=None,
+    is_duplicate: bool = False, enrichment_data: str = "{}",
+) -> tuple[str, str]:
     """scraper_config → job → result (skip_trace_status='queued') → pending row."""
     sc_id, job_id, result_id, pending_id = (str(uuid.uuid4()) for _ in range(4))
     with system_sync_session() as db:
@@ -44,11 +47,13 @@ def _seed_pending(user_id: str, *, status: str = "queued", submitted_at=None) ->
         db.execute(
             text("""
                 INSERT INTO results (id, job_id, user_id, is_duplicate, skip_trace_status,
-                                     party_name, property_address, created_at)
-                VALUES (:rid, :job_id, :user_id, false, 'queued',
-                        'SAARENAS AVELINO G', '5128 BEVERLY AVE NE', now())
+                                     party_name, property_address, enrichment_data, created_at)
+                VALUES (:rid, :job_id, :user_id, :dup, 'queued',
+                        'SAARENAS AVELINO G', '5128 BEVERLY AVE NE',
+                        CAST(:ed AS json), now())
             """),
-            {"rid": result_id, "job_id": job_id, "user_id": user_id},
+            {"rid": result_id, "job_id": job_id, "user_id": user_id,
+             "dup": is_duplicate, "ed": enrichment_data},
         )
         db.execute(
             text("""
@@ -179,3 +184,59 @@ async def test_release_cannot_clobber_a_newer_claim_on_the_same_rows(
         )
         db.commit()
     assert _pending_state(pending_id)[0] == "queued"
+
+
+# ── A lead that stopped being delivered is withdrawn, never bought ───────────
+
+
+@pytest.mark.asyncio
+async def test_a_row_whose_lead_became_a_duplicate_is_withdrawn_not_submitted(
+    starter_user, _dispatcher_enabled
+):
+    """Queued while it was the survivor, flagged duplicate before the tick (a
+    watchdog re-run repeating the survivor election). Nothing is claimed or
+    POSTed: the non-HTTPS endpoint would have produced an error if it had been."""
+    pending_id, result_id = _seed_pending(starter_user.id, is_duplicate=True)
+
+    out = dispatch_pending_skip_trace()
+
+    assert out == {"submitted_batches": 0, "submitted_rows": 0, "errors": []}
+    status, submitted_at = _pending_state(pending_id)
+    assert status == "cancelled"
+    assert submitted_at is None
+    # Back to not_attempted, not errored: nothing failed, and a lead that becomes
+    # deliverable again must be enqueueable again.
+    assert _result_status(result_id) == "not_attempted"
+
+
+@pytest.mark.asyncio
+async def test_a_row_the_plan_cap_excluded_is_withdrawn_not_submitted(
+    starter_user, _dispatcher_enabled
+):
+    pending_id, result_id = _seed_pending(
+        starter_user.id, enrichment_data='{"delivery_excluded_reason": "over_quota"}')
+
+    out = dispatch_pending_skip_trace()
+
+    assert out == {"submitted_batches": 0, "submitted_rows": 0, "errors": []}
+    assert _pending_state(pending_id)[0] == "cancelled"
+    assert _result_status(result_id) == "not_attempted"
+
+
+@pytest.mark.asyncio
+async def test_withdrawal_does_not_hold_back_the_deliverable_rows_beside_it(
+    starter_user, _dispatcher_enabled
+):
+    """One FIFO head, one withdrawn row and one live row. The live row still goes
+    through the claim path (and is released as errored by the fake endpoint's
+    definite rejection); the withdrawn one is cancelled in the same tick."""
+    dup_pending, dup_result = _seed_pending(starter_user.id, is_duplicate=True)
+    live_pending, live_result = _seed_pending(starter_user.id)
+
+    out = dispatch_pending_skip_trace()
+
+    assert any("HTTPS" in e for e in out["errors"])
+    assert _pending_state(dup_pending)[0] == "cancelled"
+    assert _result_status(dup_result) == "not_attempted"
+    assert _pending_state(live_pending)[0] == "errored"
+    assert _result_status(live_result) == "errored"

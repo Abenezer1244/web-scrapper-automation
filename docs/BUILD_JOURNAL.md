@@ -19,6 +19,23 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-13 - Three dropped Snohomish trustee sales, and the identities that keep them single
+
+**Built / Shipped (branch `fix/nts-parser-formats`):** the 9-9-26 Tribune had 10 notice blocks,
+7 valid. Causes: an Affinia notice with no TS number (Snohomish used the shared parser, which never
+builds a surrogate); a Burns Law commercial notice titled its own section "I. NOTICE OF TRUSTEE'S
+SALE", so the splitter cut one notice in two; a worded sale date blocked by "o'clock". Snohomish now
+parses with `parse_snoho_notice` (King's parser, but an APN-only identity is rejected), the splitter
+skips a header right after " I. ", and a bounded o'clock date form is tried last.
+
+**Caught & fixed (Codex, four rounds):** APN-<parcel> surrogates collide across liens (rejected for
+Snohomish); a real TS row now retires exactly its `REF-<recording number>` twin; a retired twin is
+not re-activated by re-crawling an older issue, including after a postponement.
+
+**Facts learned:** 9/9, 8/8, 7/7 valid on the Tribune fixtures; recovered 3, 0 changed fields on
+previously valid notices across 7 PDFs and 17 Pierce/King/Clark fixtures. Residual: the " I. " split
+exception and the commercial-notice gate each rest on one real sample.
+
 ## 2026-09-13 - a 100%-off promotion is a price, not a plan (and a 3-month coupon is a free YEAR on annual)
 
 > **Update, later 2026-09-13 (owner: keep FOUNDING25 for everyone, finish the risks, verify in Stripe yourself).**

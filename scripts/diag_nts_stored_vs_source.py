@@ -29,10 +29,9 @@ COMPARED = ("ts_number", "auction_date", "principal_owing", "property_address_no
 
 
 def _parsers() -> dict:
-    from src.scrapers.sources import nts_tacoma_index as nts
-    from src.scrapers.sources.nts_king_pdf import parse_king_notice
+    from src.scrapers.sources.nts_king_pdf import parse_king_notice, parse_snoho_notice
 
-    return {"queen_anne_news": parse_king_notice, "snohomish_tribune": nts.parse_nts_notice}
+    return {"queen_anne_news": parse_king_notice, "snohomish_tribune": parse_snoho_notice}
 
 
 def _counties() -> dict:

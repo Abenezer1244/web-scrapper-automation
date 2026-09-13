@@ -1264,7 +1264,8 @@ class PendingSkipTraceRow(Base):
     mail_zip = Column(String(16), nullable=True)
     trace_type = Column(String(16), nullable=False, default="normal")
     status = Column(String(16), nullable=False, default="queued", index=True)
-    # queued | submitted | completed | errored
+    # queued | submitting | submitted | completed | unmatched | errored | cancelled
+    # (cancelled: never sent; the job failed or the lead will not be delivered)
     tracerfy_queue_id = Column(Integer, nullable=True, index=True)
     enqueued_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     submitted_at = Column(DateTime(timezone=True), nullable=True)

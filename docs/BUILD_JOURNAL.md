@@ -19,6 +19,23 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-13 - Tracerfy stops being paid for leads nobody receives
+
+**Built / Shipped (branch `fix/skip-trace-over-quota`):** skip trace is enqueued in
+`run_scrape_job` AFTER the plan cap (was the last step of `_run_inline_enrichment`, before
+the cap marked over_quota), so `actionable_condition()` keeps capped leads out. The
+dispatcher now claims only rows whose job is `done` and whose lead is still `queued`,
+non-duplicate and not over quota (SQL-side, `FOR UPDATE OF` the queue), and a per-tick sweep
+cancels queued rows of failed/cancelled jobs or undeliverable leads (new status `cancelled`,
+never submitted, never billed), releasing the lead only if no other active row references it.
+
+**Tried / Decided:** Codex consult: adopted reference-safe cancel, tenant pins, queued-only
+cancel; rejected "cache hits before the cap" (the cap counts lead quota, not traces). Review r1
+P1 rollback-scope fixed with a commit boundary; r2 GATE PASS.
+
+**Facts learned:** on unfixed main the dispatcher submitted an over_quota lead. Dispatch now
+waits for DONE (at most one 5-minute tick later); the dialer already waited for settled rows.
+
 ## 2026-09-13 - Auction and pre-foreclosure lists stop calling a dead source "0 leads"
 
 **Built / Shipped (branch `fix/nts-silent-empty`):**

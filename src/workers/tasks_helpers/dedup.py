@@ -822,3 +822,163 @@ def reconcile_same_run_survivors(db, job_id: str, user_id, record_type=None) -> 
         )
 
     return swapped
+
+
+# ─── Claim transfer: a claim nobody was ever delivered ─────────────────────────
+
+# When "a row with no property AND no mailing address is not a lead" started
+# deciding BILLING: the merge of #191. Jobs billed before it charged for and
+# exported address-less rows, so an address-less claim anchor from then WAS a
+# delivery and must keep suppressing. Production shows no job holding such rows
+# was billed between 2026-09-02 09:38 (old rule) and 2026-09-04 09:32 (new
+# rule, billed 0), so the merge instant is exact enough on both sides.
+NO_ADDRESS_NOT_BILLED_SINCE = datetime(2026, 9, 3, 12, 5, 28, tzinfo=UTC)
+
+
+def transfer_undelivered_claims(db, job_id: str, user_id, record_type=None) -> int:
+    """Hand a claim to THIS run when the run holding it never delivered the lead.
+
+    The claim is written for every row with a hash before enrichment decides
+    whether the row has an address. An address-less row is not a lead (not
+    listed, exported or billed) but it keeps the claim, so a later run that finds
+    the same property WITH an address flags it "already delivered" and hides it.
+    Production held 419 such rows, and nothing ever lets them through: the claim
+    has no expiry.
+
+    Releasing the claim at the end of the first run was rejected (Codex): a later
+    mailing backfill can give that old row an address, the old run's live
+    download would then ship it, and the next run would deliver and bill it again.
+    Moving the claim instead keeps exactly one holder at every instant. The old
+    anchor is marked 'superseded', so it stays hidden however its address changes.
+
+    Runs after enrichment and the survivor re-election (actionability is known)
+    and BEFORE the plan cap, so the cap ranks the promoted row and billing,
+    export and skip trace all see it. Each hash is its own transaction; per hash,
+    every condition is re-evaluated after the claim row is locked, so two runs
+    transferring the same claim cannot both win (the second re-reads the first
+    run's actionable anchor and stops).
+
+    A claim is transferred only when all of these hold:
+      - its hash is STRONG, proven from the parcel/address stored ON THE CLAIM at
+        claim time (results.property_address is rewritten by enrichment, so the
+        row cannot prove it). A weak NAME|DATE hash identifies a filing, and
+        moving it could hide an unrelated lead.
+      - its anchor row still exists for this user on another job. A NULL anchor
+        means the source run was purged; delivery cannot be disproved, so the
+        claim keeps suppressing.
+      - the anchor is not actionable (no address, or excluded by the plan cap).
+      - the anchor's run delivered nothing chargeable for it: failed/cancelled,
+        or done and billed after NO_ADDRESS_NOT_BILLED_SINCE. A run still in
+        flight is never robbed.
+
+    Returns the number of claims transferred (each un-flags exactly one row).
+    """
+    from src.api.lead_actionability import actionable_sql
+
+    uid = str(user_id)
+    candidates = db.execute(
+        sa_text(
+            f"SELECT {_GROUP_COLUMNS} FROM results "
+            "WHERE job_id = :jid AND user_id = CAST(:uid AS uuid) "
+            "  AND dedup_hash IS NOT NULL AND is_duplicate = true "
+            "  AND duplicate_reason = 'prior_run' "
+            f"  AND {actionable_sql('results')}"
+        ),
+        {"jid": job_id, "uid": uid},
+    ).fetchall()
+    groups: dict[str, list[dict]] = defaultdict(list)
+    for row in candidates:
+        groups[row.dedup_hash].append(dict(row._mapping))
+
+    transferred = 0
+    # Sorted: a stable lock order across concurrent runs of the same user.
+    for dedup_hash in sorted(groups):
+        members = groups[dedup_hash]
+        claim = db.execute(
+            sa_text(
+                "SELECT id, first_result_id, parcel_id, property_address "
+                "FROM delivered_records "
+                "WHERE user_id = CAST(:uid AS uuid) AND dedup_hash = :hash "
+                "FOR UPDATE"
+            ),
+            {"uid": uid, "hash": dedup_hash},
+        ).first()
+        if claim is None or claim.first_result_id is None:
+            db.rollback()
+            continue
+        if legacy_strong_signature(claim.parcel_id, claim.property_address) != dedup_hash:
+            db.rollback()
+            continue
+        anchor = db.execute(
+            sa_text(
+                "SELECT a.id, a.job_id, j.status, j.billing_applied_at, "
+                f"  {actionable_sql('a')} AS actionable "
+                "FROM results a JOIN jobs j ON j.id = a.job_id "
+                "WHERE a.id = CAST(:aid AS uuid) AND a.user_id = CAST(:uid AS uuid) "
+                "FOR UPDATE OF a"
+            ),
+            {"aid": str(claim.first_result_id), "uid": uid},
+        ).first()
+        if (
+            anchor is None
+            or str(anchor.job_id) == str(job_id)
+            or anchor.actionable
+            or not (
+                anchor.status in ("failed", "cancelled")
+                or (
+                    anchor.status == "done"
+                    and anchor.billing_applied_at is not None
+                    and anchor.billing_applied_at >= NO_ADDRESS_NOT_BILLED_SINCE
+                )
+            )
+        ):
+            db.rollback()
+            continue
+
+        elected = sorted(members, key=sort_key_for(record_type))[0]
+        others = [str(m.get("id")) for m in members if m is not elected]
+        params = {"uid": uid, "jid": job_id, "eid": str(elected.get("id"))}
+
+        db.execute(
+            sa_text(
+                "UPDATE delivered_records SET first_result_id = CAST(:eid AS uuid), "
+                "  first_job_id = :jid, first_delivered_at = clock_timestamp() "
+                "WHERE id = :cid"
+            ),
+            {**params, "cid": str(claim.id)},
+        )
+        db.execute(
+            sa_text(
+                "UPDATE results SET is_duplicate = false, duplicate_reason = NULL, "
+                "  duplicate_source_job_id = NULL, duplicate_source_at = NULL "
+                "WHERE id = CAST(:eid AS uuid) AND user_id = CAST(:uid AS uuid)"
+            ),
+            params,
+        )
+        if others:
+            # Same property, same run: exactly what the collapse makes of
+            # siblings, so they read "combined", not "already delivered".
+            db.execute(
+                sa_text(
+                    "UPDATE results SET duplicate_reason = 'same_run', "
+                    "  duplicate_source_job_id = :jid, duplicate_source_at = NULL "
+                    "WHERE id = ANY(CAST(:ids AS uuid[])) "
+                    "  AND user_id = CAST(:uid AS uuid)"
+                ),
+                {**params, "ids": others},
+            )
+            _apply_survivor_merge(
+                db, user_id, elected.get("id"),
+                _merged_survivor_fields(elected, members, record_type),
+            )
+        db.execute(
+            sa_text(
+                "UPDATE results SET is_duplicate = true, duplicate_reason = 'superseded', "
+                "  duplicate_source_job_id = :jid, duplicate_source_at = clock_timestamp() "
+                "WHERE id = CAST(:aid AS uuid) AND user_id = CAST(:uid AS uuid)"
+            ),
+            {**params, "aid": str(anchor.id)},
+        )
+        db.commit()
+        transferred += 1
+    return transferred

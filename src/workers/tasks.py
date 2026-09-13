@@ -1433,6 +1433,32 @@ def run_scrape_job(self, job_id: str) -> None:
                 "Job %s: same-run reconciliation failed: %s", job_id, str(exc)[:160]
             )
 
+        # Take over any claim whose holder never delivered the lead: an earlier
+        # run's address-less row pins a property that THIS run found with an
+        # address, and without this the lead is hidden as "already delivered"
+        # forever. HERE: actionability is settled (after enrichment and the
+        # re-election) and the refetch below still precedes the plan cap, skip
+        # trace, the re-export and billing, so all four see the promoted row.
+        # Each claim commits on its own. Non-fatal: a failure leaves the rows
+        # flagged exactly as the cross-run dedup left them.
+        try:
+            from src.workers.tasks_helpers.dedup import transfer_undelivered_claims
+
+            _transferred = transfer_undelivered_claims(
+                db, job_id, job.user_id, config.record_type
+            )
+            if _transferred:
+                dup_count -= _transferred
+                _logger.info(
+                    "Job %s: took over %d claim(s) an earlier run held without "
+                    "ever delivering the lead", job_id, _transferred,
+                )
+        except Exception as exc:
+            db.rollback()
+            _logger.warning(
+                "Job %s: claim transfer failed: %s", job_id, str(exc)[:160]
+            )
+
         # Fetch post-enrichment rows ONCE; reused by re-export AND membership.
         # Same deterministic order as the in-app download (jobs.py) so the emailed/
         # R2 CSV and the download are byte-identical, not just same-columns (Codex).

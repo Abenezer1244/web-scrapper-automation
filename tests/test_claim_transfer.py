@@ -286,6 +286,30 @@ async def test_every_undelivered_row_of_the_old_run_is_hidden_not_only_the_ancho
     assert (await _fresh(db, Result, row)).is_duplicate is False
 
 
+@pytest.mark.parametrize("hash_kind", ["strong", "weak"])
+async def test_a_claim_released_after_this_run_flagged_the_row_is_taken_by_this_run(
+    db, starter_user: User, scraper_config: ScraperConfig, hash_kind,
+):
+    """The stranded-claim sweep released a failed run's claim after this run's
+    dedup step had already flagged the row "already delivered". Nobody holds the
+    property now, so this run claims it exactly as its dedup step would have,
+    weak hash included; otherwise a one-off run silently loses the lead
+    (Codex review round 9)."""
+    h = _strong() if hash_kind == "strong" else "weak-name-date-" + uuid.uuid4().hex
+    dead = await _job(db, starter_user, scraper_config, status="failed", billed_at=None)
+    new_job, row = await _found_again(db, starter_user, scraper_config, h, dead)
+
+    assert await _transfer(db, new_job, starter_user.id) == 1
+
+    assert (await _fresh(db, Result, row)).is_duplicate is False
+    held = (await db.execute(
+        select(DeliveredRecord).where(
+            DeliveredRecord.user_id == starter_user.id, DeliveredRecord.dedup_hash == h)
+    )).scalar_one()
+    assert str(held.first_result_id) == row
+    assert str(held.first_job_id) == new_job
+
+
 async def test_a_run_still_in_flight_is_never_robbed(
     db, starter_user: User, scraper_config: ScraperConfig,
 ):

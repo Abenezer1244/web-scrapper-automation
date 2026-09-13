@@ -6,6 +6,7 @@ to the originals in tasks.py.
 """
 
 import time
+import uuid
 from collections import defaultdict
 from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
@@ -932,6 +933,10 @@ def _transfer_one_claim(db, job_id, uid, user_id, dedup_hash, members, record_ty
     deadlock against them (Codex review round 7). The claim is first read without
     a lock only to learn which run holds it; every condition is then evaluated
     after both locks, and a claim that moved in between is left alone.
+
+    A claim that no longer exists at all (the stranded-claim sweep released it
+    after this run's dedup step flagged the row) is taken by this run, exactly as
+    its dedup step would have taken it (Codex review round 9).
     """
     from src.api.lead_actionability import actionable_sql
 
@@ -939,17 +944,17 @@ def _transfer_one_claim(db, job_id, uid, user_id, dedup_hash, members, record_ty
         sa_text(
             "SELECT d.first_result_id, a.job_id "
             "FROM delivered_records d "
-            "JOIN results a ON a.id = d.first_result_id AND a.user_id = d.user_id "
+            "LEFT JOIN results a ON a.id = d.first_result_id AND a.user_id = d.user_id "
             "WHERE d.user_id = CAST(:uid AS uuid) AND d.dedup_hash = :hash"
         ),
         {"uid": uid, "hash": dedup_hash},
     ).first()
-    # No claim, or its anchor row is gone (a purged source run cannot disprove
-    # delivery), or this run already holds it.
-    if peek is None or str(peek.job_id) == str(job_id):
+    # Its anchor row is gone (a purged source run cannot disprove delivery), or
+    # this run already holds it.
+    if peek is not None and (peek.job_id is None or str(peek.job_id) == str(job_id)):
         db.rollback()
         return False
-    old_job = str(peek.job_id)
+    old_job = str(peek.job_id) if peek is not None else None
 
     # Every row of the holding run for this property, not only the anchor: before
     # the same-run collapse existed one run could hold two unflagged rows for a
@@ -957,7 +962,7 @@ def _transfer_one_claim(db, job_id, uid, user_id, dedup_hash, members, record_ty
     # Ordered by id with this run's rows, so concurrent transfers lock alike.
     locked = db.execute(
         sa_text(
-            "SELECT r.id, r.job_id, r.is_duplicate, "
+            "SELECT r.id, r.job_id, r.is_duplicate, r.duplicate_reason, "
             f"  {actionable_sql('r')} AS actionable "
             "FROM results r "
             "WHERE r.user_id = CAST(:uid AS uuid) "
@@ -977,9 +982,12 @@ def _transfer_one_claim(db, job_id, uid, user_id, dedup_hash, members, record_ty
         ),
         {"uid": uid, "hash": dedup_hash},
     ).first()
+    if claim is None:
+        return _take_unheld_claim(db, job_id, uid, user_id, dedup_hash, members,
+                                  record_type, locked)
     old_rows = [r for r in locked if str(r.job_id) == old_job]
     if (
-        claim is None
+        peek is None
         or str(claim.first_result_id) != str(peek.first_result_id)
         or not any(str(r.id) == str(claim.first_result_id) for r in old_rows)
         or legacy_strong_signature(claim.parcel_id, claim.property_address) != dedup_hash
@@ -1021,7 +1029,6 @@ def _transfer_one_claim(db, job_id, uid, user_id, dedup_hash, members, record_ty
         return False
 
     elected = sorted(members, key=sort_key_for(record_type))[0]
-    others = [str(m.get("id")) for m in members if m is not elected]
     params = {"uid": uid, "jid": job_id, "eid": str(elected.get("id"))}
 
     db.execute(
@@ -1032,6 +1039,66 @@ def _transfer_one_claim(db, job_id, uid, user_id, dedup_hash, members, record_ty
         ),
         {**params, "cid": str(claim.id)},
     )
+    _promote_elected(db, job_id, uid, user_id, elected, members, record_type)
+    # The anchor and every unflagged row of the old run for this property: none
+    # was delivered, and a later mailing backfill on any of them would otherwise
+    # put the property in the old run's live download next to the promoted row.
+    hidden = sorted({str(claim.first_result_id)}
+                    | {str(r.id) for r in old_rows if not r.is_duplicate})
+    db.execute(
+        sa_text(
+            "UPDATE results SET is_duplicate = true, duplicate_reason = 'superseded', "
+            "  duplicate_source_job_id = :jid, duplicate_source_at = clock_timestamp() "
+            "WHERE id = ANY(CAST(:hidden AS uuid[])) AND user_id = CAST(:uid AS uuid)"
+        ),
+        {**params, "hidden": hidden},
+    )
+    db.commit()
+    return True
+
+
+def _take_unheld_claim(db, job_id, uid, user_id, dedup_hash, members, record_type,
+                       locked) -> bool:
+    """No claim exists for a hash this run was told was already delivered: it was
+    released (a failed or cancelled run that never billed) after the dedup step
+    flagged this run's rows. Take it the way the dedup step does, so a one-off run
+    does not silently lose the lead. The caller holds the row locks. ON CONFLICT
+    DO NOTHING keeps one winner if another run claims the hash at the same time.
+    """
+    still_flagged = {
+        str(r.id) for r in locked
+        if r.is_duplicate and r.duplicate_reason == "prior_run"
+    }
+    members = [m for m in members if str(m.get("id")) in still_flagged]
+    if not members:
+        db.rollback()
+        return False
+    elected = sorted(members, key=sort_key_for(record_type))[0]
+    won = db.execute(
+        sa_text(
+            "INSERT INTO delivered_records "
+            "  (id, user_id, dedup_hash, first_result_id, first_job_id, "
+            "   parcel_id, property_address, first_delivered_at) "
+            "VALUES (CAST(:cid AS uuid), CAST(:uid AS uuid), :hash, CAST(:eid AS uuid), "
+            "        :jid, :parcel, :address, clock_timestamp()) "
+            "ON CONFLICT (user_id, dedup_hash) DO NOTHING RETURNING id"
+        ),
+        {"cid": str(uuid.uuid4()), "uid": uid, "hash": dedup_hash,
+         "eid": str(elected.get("id")), "jid": job_id,
+         "parcel": elected.get("parcel_id"), "address": elected.get("property_address")},
+    ).first()
+    if won is None:
+        db.rollback()
+        return False
+    _promote_elected(db, job_id, uid, user_id, elected, members, record_type)
+    db.commit()
+    return True
+
+
+def _promote_elected(db, job_id, uid, user_id, elected, members, record_type) -> None:
+    """Un-flag the elected row; its same-run siblings become 'combined' under it."""
+    others = [str(m.get("id")) for m in members if m is not elected]
+    params = {"uid": uid, "jid": job_id, "eid": str(elected.get("id"))}
     db.execute(
         sa_text(
             "UPDATE results SET is_duplicate = false, duplicate_reason = NULL, "
@@ -1056,18 +1123,3 @@ def _transfer_one_claim(db, job_id, uid, user_id, dedup_hash, members, record_ty
             db, user_id, elected.get("id"),
             _merged_survivor_fields(elected, members, record_type),
         )
-    # The anchor and every unflagged row of the old run for this property: none
-    # was delivered, and a later mailing backfill on any of them would otherwise
-    # put the property in the old run's live download next to the promoted row.
-    hidden = sorted({str(claim.first_result_id)}
-                    | {str(r.id) for r in old_rows if not r.is_duplicate})
-    db.execute(
-        sa_text(
-            "UPDATE results SET is_duplicate = true, duplicate_reason = 'superseded', "
-            "  duplicate_source_job_id = :jid, duplicate_source_at = clock_timestamp() "
-            "WHERE id = ANY(CAST(:hidden AS uuid[])) AND user_id = CAST(:uid AS uuid)"
-        ),
-        {**params, "hidden": hidden},
-    )
-    db.commit()
-    return True

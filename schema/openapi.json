@@ -6342,7 +6342,7 @@
     },
     "/jobs/{job_id}/logs": {
       "get": {
-        "description": "SSE endpoint: replays existing logs then streams new ones via Redis Pub/Sub.",
+        "description": "SSE endpoint: replays existing logs then streams new ones via Redis Pub/Sub.\n\nA finished job replays and ends with ``{\"type\": \"done\"}``. A running job\nneeds a stream lease (``src/api/sse_leases.py``); over the per-user cap the\nrequest is refused with 429 + Retry-After before any stream opens. A live\nstream ends with the job's terminal event, or ``{\"type\": \"timeout\"}`` after\n30 minutes or if its lease was reclaimed, after which the client reconnects.\nNothing here affects the job itself: the worker never reads stream state.",
         "operationId": "stream_logs_jobs__job_id__logs_get",
         "parameters": [
           {

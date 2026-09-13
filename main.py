@@ -73,6 +73,9 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type", "Accept", "X-Requested-With"],
+    # Retry-After is not CORS-safelisted, so without this the app (a different
+    # origin from the API) cannot read how long to wait after a 429/503.
+    expose_headers=["Retry-After"],
 )
 
 # ─── Routers ──────────────────────────────────────────────────────────────────

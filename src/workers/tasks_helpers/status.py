@@ -100,9 +100,16 @@ def _redis() -> sync_redis.Redis:
 
 
 def _publish_log(r: sync_redis.Redis, job_id: str, level: str, message: str, db=None) -> None:
-    """Publish a log line to Redis Pub/Sub and persist it to the DB.
+    """Persist a log line to the DB, then publish it to Redis Pub/Sub.
 
     Pass an existing ``db`` session to avoid opening a new connection per log line.
+
+    Commit BEFORE publish (load-bearing). The live log stream subscribes and
+    then reads stored lines, so a line is either committed before that read
+    or published after the subscription. Publishing first let a line go out
+    before a viewer subscribed yet commit after its read, and it was lost to
+    that viewer until a reload. The payload id is the row id, so a line seen
+    both ways is dropped by the client. A failed commit publishes nothing.
     """
     import uuid
 
@@ -115,7 +122,6 @@ def _publish_log(r: sync_redis.Redis, job_id: str, level: str, message: str, db=
         "created_at": _now().isoformat(),
         "type": "log",
     }
-    r.publish(f"job_logs:{job_id}", json.dumps(payload))
 
     # Persist to DB for SSE replay
     if db is not None:
@@ -141,6 +147,8 @@ def _publish_log(r: sync_redis.Redis, job_id: str, level: str, message: str, db=
                 message=message,
             ))
             _db.commit()
+
+    r.publish(f"job_logs:{job_id}", json.dumps(payload))
 
 
 _TERMINAL_STATUSES = ("done", "failed", "cancelled")

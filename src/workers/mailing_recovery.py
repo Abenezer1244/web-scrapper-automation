@@ -167,7 +167,8 @@ _CANDIDATE_PARCELS_SQL = """
 """
 
 _CANDIDATE_SQL = """
-    SELECT r.id, r.user_id, r.parcel_id, r.enrichment_data
+    SELECT r.id, r.user_id, r.parcel_id, r.enrichment_data,
+           r.property_address, r.property_city, r.property_state, r.property_zip
     FROM results r
     JOIN jobs j ON j.id = r.job_id
     JOIN scraper_configs sc ON sc.id = j.scraper_config_id
@@ -398,10 +399,35 @@ def _write_row(db, row, mailing, outcome, attempts, terminal, now_iso, stats) ->
         OUTCOME_KEY: outcome,
         DEFERRED_KEY: not terminal,
     }
+    # The owner-location flags are derived from the mailing address, and the job's
+    # own recompute (tasks.py) ran while it was still NULL. Without this a recovered
+    # absentee owner never reaches the absentee / out-of-state filters. Computed only
+    # from the value this UPDATE writes: the `mailing_address IS NULL` guard below
+    # makes the write a no-op if anything else filled it first, so the flags can never
+    # describe a different address than the stored one.
+    flags: dict = {}
+    if mailing:
+        from src.utils.address_intel import compute_owner_flags
+
+        flags = compute_owner_flags(
+            getattr(row, "property_address", None), mailing,
+            property_city=getattr(row, "property_city", None),
+            property_state=getattr(row, "property_state", None),
+            property_zip=getattr(row, "property_zip", None),
+        )
     try:
         result = db.execute(
             sa_text(
                 "UPDATE results SET "
+                # Flags move only when this write supplies a mailing address.
+                "  property_state = CASE WHEN CAST(:mailing AS text) IS NOT NULL "
+                "    THEN CAST(:f_property_state AS varchar) ELSE property_state END, "
+                "  owner_state = CASE WHEN CAST(:mailing AS text) IS NOT NULL "
+                "    THEN CAST(:f_owner_state AS varchar) ELSE owner_state END, "
+                "  absentee_owner = CASE WHEN CAST(:mailing AS text) IS NOT NULL "
+                "    THEN CAST(:f_absentee AS boolean) ELSE absentee_owner END, "
+                "  out_of_state_owner = CASE WHEN CAST(:mailing AS text) IS NOT NULL "
+                "    THEN CAST(:f_out_of_state AS boolean) ELSE out_of_state_owner END, "
                 "  mailing_address = COALESCE(mailing_address, :mailing), "
                 # `results.enrichment_data` is JSON, not JSONB, and `||` is a
                 # JSONB operator: merging without the casts raises
@@ -420,6 +446,10 @@ def _write_row(db, row, mailing, outcome, attempts, terminal, now_iso, stats) ->
                 "pid": row.parcel_id,
                 "mailing": mailing,
                 "payload": _json(payload),
+                "f_property_state": flags.get("property_state"),
+                "f_owner_state": flags.get("owner_state"),
+                "f_absentee": flags.get("absentee_owner"),
+                "f_out_of_state": flags.get("out_of_state_owner"),
             },
         )
         db.commit()
@@ -441,6 +471,129 @@ def _json(payload: dict) -> str:
     return json.dumps(payload)
 
 
+# ─── County GIS mailing recovery ─────────────────────────────────────────────
+#
+# The same backfill contract as King above, for counties whose own ArcGIS parcel
+# layer publishes the owner's mailing address (Snohomish, Cowlitz, Pierce). Rows get
+# here two ways: a live job whose county request failed marks them deferred
+# (enrich.py), and the historical repair script marks rows from before those
+# counties had a mailing source at all.
+#
+# No source-health gate: these are public bulk ArcGIS layers answering 50 parcels per
+# request, not a per-parcel page scrape that has blocked us. The bound is the batch
+# size and the attempt ceiling, and one tick is a handful of requests per county.
+_GIS_BATCH_PARCELS = 200
+
+_GIS_CANDIDATE_PARCELS_SQL = """
+    SELECT DISTINCT ON (lower(sc.county), btrim(r.parcel_id))
+           lower(sc.county) AS county, btrim(r.parcel_id) AS parcel_id,
+           coalesce((r.enrichment_data->>'mailing_recovery_attempts')::int, 0) AS attempts,
+           coalesce(r.enrichment_data->>'mailing_recovery_last_at', '') AS last_at
+    FROM results r
+    JOIN jobs j ON j.id = r.job_id
+    JOIN scraper_configs sc ON sc.id = j.scraper_config_id
+    WHERE r.mailing_address IS NULL
+      AND r.parcel_id IS NOT NULL
+      AND length(btrim(r.parcel_id)) >= 6
+      AND coalesce(r.enrichment_data->>'mailing_lookup_deferred', '') = 'true'
+      AND coalesce((r.enrichment_data->>'mailing_recovery_attempts')::int, 0) < :max_attempts
+      AND j.status = 'done'
+      AND lower(sc.county) = ANY(:counties)
+      AND upper(sc.state) = 'WA'
+    ORDER BY lower(sc.county), btrim(r.parcel_id),
+             coalesce((r.enrichment_data->>'mailing_recovery_attempts')::int, 0) ASC,
+             r.id ASC
+"""
+
+_GIS_CANDIDATE_SQL = """
+    SELECT r.id, r.user_id, r.parcel_id, r.enrichment_data,
+           r.property_address, r.property_city, r.property_state, r.property_zip
+    FROM results r
+    JOIN jobs j ON j.id = r.job_id
+    JOIN scraper_configs sc ON sc.id = j.scraper_config_id
+    WHERE r.mailing_address IS NULL
+      AND r.parcel_id IS NOT NULL
+      AND coalesce(r.enrichment_data->>'mailing_lookup_deferred', '') = 'true'
+      AND coalesce((r.enrichment_data->>'mailing_recovery_attempts')::int, 0) < :max_attempts
+      AND j.status = 'done'
+      AND lower(sc.county) = :county
+      AND upper(sc.state) = 'WA'
+      AND btrim(r.parcel_id) = ANY(:parcels)
+    ORDER BY r.id ASC
+"""
+
+
+def recover_deferred_gis_mailing() -> dict:
+    """One bounded recovery tick for county-GIS mailing sources."""
+    from src.db.session import system_sync_session
+    from src.scrapers.enrichment.county_gis import (
+        batch_enrich_parcels_gis,
+        gis_mailing_source_counties,
+    )
+
+    stats = {"candidates": 0, "parcels": 0, "found": 0, "none": 0, "unverified": 0,
+             "errors": 0}
+    counties = gis_mailing_source_counties("WA")
+    if not counties:
+        return stats
+
+    with system_sync_session() as db:
+        parcel_rows = db.execute(
+            sa_text(_GIS_CANDIDATE_PARCELS_SQL),
+            {"max_attempts": _MAX_ATTEMPTS, "counties": counties},
+        ).all()
+        picked = sorted(parcel_rows,
+                        key=lambda r: (r.attempts, r.last_at, r.county, r.parcel_id))
+        picked = picked[:_GIS_BATCH_PARCELS]
+        by_county: dict[str, list[str]] = {}
+        for row in picked:
+            by_county.setdefault(row.county, []).append(row.parcel_id)
+        rows_by_county: dict[str, list] = {}
+        for county, parcels in by_county.items():
+            rows_by_county[county] = db.execute(
+                sa_text(_GIS_CANDIDATE_SQL),
+                {"max_attempts": _MAX_ATTEMPTS, "county": county, "parcels": parcels},
+            ).all()
+        db.rollback()  # release the read snapshot before any network I/O
+
+        for county, parcels in by_county.items():
+            rows = rows_by_county.get(county) or []
+            if not rows:
+                continue
+            stats["candidates"] += len(rows)
+            by_parcel: dict[str, list] = {}
+            for row in rows:
+                by_parcel.setdefault(row.parcel_id.strip(), []).append(row)
+
+            gis_stats: dict = {}
+            try:
+                found = batch_enrich_parcels_gis(parcels, county, "WA", stats=gis_stats)
+            except Exception as exc:  # noqa: BLE001 -- best-effort background recovery
+                _logger.warning("GIS mailing recovery: %s lookup failed: %s",
+                                county, str(exc)[:120])
+                continue
+
+            # A parcel whose county request failed was not looked up: it keeps its
+            # attempt count and only rotates to the back of the queue, exactly like an
+            # un-attempted King parcel.
+            unreached = {p for p in gis_stats.get("county_unreached", []) if p in by_parcel}
+            attempted = [p for p in parcels if p in by_parcel and p not in unreached]
+            enriched = {
+                pid: {
+                    "mailing_address": (found.get(pid) or {}).get("mailing_address"),
+                    # The county answered this request. No mailing address in that
+                    # answer, matched or not, is a real "none" from the source.
+                    "mailing_lookup": "none",
+                }
+                for pid in attempted
+            }
+            stats["parcels"] += len(attempted)
+            _apply(db, by_parcel, attempted, enriched, stats)
+            if unreached:
+                _rotate(db, by_parcel, sorted(unreached), stats)
+    return stats
+
+
 # ─── Celery task ─────────────────────────────────────────────────────────────
 
 def _register() -> None:
@@ -452,7 +605,21 @@ try:  # pragma: no cover -- registration only
 
     @app.task(name="src.workers.mailing_recovery.recover_deferred_mailing")
     def recover_deferred_mailing() -> dict:
-        """Beat entry point: one bounded King mailing-recovery tick."""
+        """Beat entry point: one bounded county-GIS tick, then one King tick.
+
+        GIS first because it is a few bulk requests and must not wait behind King's
+        up-to-480 s page-scrape tick, nor be skipped while King is in cooldown.
+        """
+        try:
+            gis_stats = recover_deferred_gis_mailing()
+            if gis_stats.get("parcels"):
+                _logger.info(
+                    "GIS mailing recovery: %d parcel(s) looked up, %d found, %d none, "
+                    "%d error", gis_stats["parcels"], gis_stats["found"],
+                    gis_stats["none"], gis_stats["errors"],
+                )
+        except Exception as exc:  # noqa: BLE001 -- must not block the King tick
+            _logger.warning("GIS mailing recovery tick failed: %s", str(exc)[:160])
         stats = recover_deferred_king_mailing()
         if stats.get("skipped"):
             _logger.info("Mailing recovery skipped: %s", stats["skipped"])

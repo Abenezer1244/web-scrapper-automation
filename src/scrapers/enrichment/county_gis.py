@@ -600,8 +600,27 @@ def _empty() -> dict[str, str | None]:
     return {"property_address": None, "mailing_address": None}
 
 
+def has_gis_mailing_source(county: str, state: str) -> bool:
+    """True when this county's own GIS layer publishes the owner's mailing address.
+
+    King is deliberately False: its public layer withholds the taxpayer block and its
+    mailing comes from the per-parcel eRealProperty pass instead.
+    """
+    cfg = _KNOWN_GIS_ENDPOINTS.get(f"{(county or '').lower()}_{(state or '').upper()}") or {}
+    return bool(cfg.get("mailing_street_fields") or cfg.get("mailing_fields"))
+
+
+def gis_mailing_source_counties(state: str = "WA") -> list[str]:
+    """Lower-case county names whose GIS layer carries a mailing address."""
+    suffix = f"_{state.upper()}"
+    return sorted(
+        key[: -len(suffix)] for key in _KNOWN_GIS_ENDPOINTS
+        if key.endswith(suffix) and has_gis_mailing_source(key[: -len(suffix)], state)
+    )
+
+
 def batch_enrich_parcels_gis(
-    parcel_ids: list[str], county: str, state: str
+    parcel_ids: list[str], county: str, state: str, stats: dict | None = None
 ) -> dict[str, dict[str, str | None]]:
     """Batch enrich multiple parcels via GIS API.
 
@@ -610,7 +629,15 @@ def batch_enrich_parcels_gis(
     2. Fall back to WA statewide for any parcels not found
 
     Processes in chunks of 50 (ArcGIS URL length limit).
+
+    ``stats`` (optional out-param): ``county_unreached`` lists the caller parcel ids
+    whose county request did not produce a usable answer (non-200, exception, or an
+    ArcGIS error body). For a county with a mailing source those parcels were never
+    looked up, which is different from "looked up, no mailing address", so the caller
+    can defer them to background recovery instead of leaving a silent NULL.
     """
+    if stats is not None:
+        stats.setdefault("county_unreached", [])
     if state.upper() != "WA":
         return {}
 
@@ -620,7 +647,10 @@ def batch_enrich_parcels_gis(
 
     # Step 1: County-specific endpoint (has real mailing addresses)
     if gis_config:
-        results = _batch_query_county(parcel_ids, gis_config)
+        results = _batch_query_county(
+            parcel_ids, gis_config,
+            unreached=stats["county_unreached"] if stats is not None else None,
+        )
 
     # Step 2: WA statewide fallback ONLY for parcels the county endpoint did not
     # MATCH at all. A parcel that matched but has no street (vacant/raw land) is
@@ -982,11 +1012,13 @@ def _warn_on_arcgis_anomaly(data: object, label: str) -> None:
 
 
 def _batch_query_county(
-    parcel_ids: list[str], gis_config: dict
+    parcel_ids: list[str], gis_config: dict, unreached: list[str] | None = None
 ) -> dict[str, dict[str, str | None]]:
     """Batch query a county-specific ArcGIS endpoint (has mailing address).
 
-    Results are keyed by the CALLER's parcel id (see _map_county_features)."""
+    Results are keyed by the CALLER's parcel id (see _map_county_features). When
+    ``unreached`` is given, the caller ids of every chunk that got no usable answer
+    are appended to it."""
     endpoint = gis_config["endpoint"]
     parcel_field = gis_config["parcel_field"]
     out_fields = gis_config.get("out_fields", "*")
@@ -1017,10 +1049,15 @@ def _batch_query_county(
             resp = safe_get(endpoint, params=params, require_allowlisted=False, timeout=30)
             if resp.status_code != 200:
                 _logger.warning("County GIS batch returned %d", resp.status_code)
+                _note_unreached(unreached, clean_to_originals)
                 continue
 
             data = resp.json()
             _warn_on_arcgis_anomaly(data, "County GIS batch")
+            if not isinstance(data, dict) or data.get("error"):
+                # An error body is not an answer about these parcels.
+                _note_unreached(unreached, clean_to_originals)
+                continue
             found = _map_county_features(
                 data.get("features") or [], gis_config, clean_to_originals
             )
@@ -1039,8 +1076,18 @@ def _batch_query_county(
 
         except Exception as exc:
             _logger.warning("County GIS batch error: %s", str(exc)[:80])
+            _note_unreached(unreached, clean_to_originals)
 
     return results
+
+
+def _note_unreached(unreached: list[str] | None, clean_to_originals: dict[str, list[str]]) -> None:
+    if unreached is None:
+        return
+    for originals in clean_to_originals.values():
+        for pid in originals:
+            if pid not in unreached:
+                unreached.append(pid)
 
 
 def _batch_query_wa_statewide(

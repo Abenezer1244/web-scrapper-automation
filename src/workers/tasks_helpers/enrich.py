@@ -31,6 +31,9 @@ _GIS_COMMIT_BATCH = 500
 # token inside the street (house numbers, road numbers).
 _TRAILING_ZIP_RE = re.compile(r"\b(\d{5})(?:-\d{4})?\s*$")
 
+# Seattle SDCI code-violation statuses that are never sent to a paid skip trace.
+SETTLED_COMPLAINT_STATUSES = frozenset({"Completed", "Open Duplicate"})
+
 
 def _keep_situs_parts(res, gis_data: dict) -> None:
     """Fill results.property_city / property_state / property_zip (migration 085)
@@ -1397,6 +1400,26 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config) -> None:
             "we do not have",
             db=db,
         )
+
+    # A code-violation complaint the city already closed as Completed, or filed as a
+    # duplicate of another complaint, is not a lead worth a paid lookup (owner decision
+    # 2026-09-13). Exact SDCI status values; "Closed" is deliberately still traced.
+    if config.record_type == "code_violation":
+        settled_rows = [
+            rec for rec in eligible
+            if isinstance(rec.enrichment_data, dict)
+            and isinstance(rec.enrichment_data.get("status"), str)
+            and rec.enrichment_data["status"] in SETTLED_COMPLAINT_STATUSES
+        ]
+        if settled_rows:
+            _settled_ids = {rec.id for rec in settled_rows}
+            eligible = [rec for rec in eligible if rec.id not in _settled_ids]
+            _publish_log(
+                r, job_id, "info",
+                f"Skip trace skipped for {len(settled_rows)} code violation lead(s) whose "
+                "complaint is already completed or is a duplicate",
+                db=db,
+            )
 
     if not eligible:
         return

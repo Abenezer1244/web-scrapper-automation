@@ -559,7 +559,7 @@ def _parse_gis_response(data: dict, gis_config: dict) -> dict[str, str | None]:
         "parcel_id": attrs.get(parcel_field) or None,
         # 085 structured situs (#188) and the match/vacant signals (#153) are
         # disjoint key sets and BOTH are consumed downstream — keep both.
-        **(_situs_parts_direct(attrs, gis_config)
+        **(_situs_parts_direct(attrs, gis_config, has_street=bool(street))
            or _situs_parts_from_confirmed_mailing(attrs, property_address, gis_config)),
         "matched": True,
         "vacant_no_situs": not street,
@@ -948,7 +948,9 @@ def _situs_parts_from_confirmed_mailing(
     }
 
 
-def _situs_parts_direct(attrs: dict, gis_config: dict) -> dict[str, str | None]:
+def _situs_parts_direct(
+    attrs: dict, gis_config: dict, has_street: bool = False
+) -> dict[str, str | None]:
     """Structured situs from a layer that publishes its OWN situs city/state/zip.
 
     Unlike _situs_parts_from_confirmed_mailing, no inference is needed: these columns
@@ -964,7 +966,7 @@ def _situs_parts_direct(attrs: dict, gis_config: dict) -> dict[str, str | None]:
         return _attr_text(attrs, fields[i]) if i < len(fields) else None
 
     city, zipcode = _part(0), _part(2)
-    if not city and not zipcode and not _part(1):
+    if not city and not zipcode and not _part(1) and not has_street:
         # Nothing located this parcel. `situs_state_literal` alone would assert a
         # state for a row we know nothing else about, and property_state feeds the
         # absentee / out-of-state owner flags — so emit nothing rather than a
@@ -1062,6 +1064,14 @@ def _batch_query_county(
                 data.get("features") or [], gis_config, clean_to_originals
             )
             results.update(found)
+            if data.get("exceededTransferLimit"):
+                # A capped page is not an answer about the parcels it left out (one
+                # parcel can carry several features, e.g. condo units). Those were
+                # never looked up, so they must be deferable, not read as "none".
+                _note_unreached(unreached, {
+                    clean: [pid for pid in originals if pid not in found]
+                    for clean, originals in clean_to_originals.items()
+                })
 
             # Count distinct APNs, not fanned-out caller ids, so the ratio is honest.
             # Also report how many carry a STREET: for a county whose vacant/raw-land

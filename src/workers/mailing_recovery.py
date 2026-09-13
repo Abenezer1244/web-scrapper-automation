@@ -599,6 +599,31 @@ def recover_deferred_gis_mailing() -> dict:
     return stats
 
 
+def run_mailing_recovery_tick() -> dict:
+    """One beat tick: the county-GIS sweep, then the King sweep, under ONE lock.
+
+    GIS first because it is a few bulk requests and must not wait behind King's
+    up-to-480 s page-scrape tick, nor be skipped while King is in cooldown. Both sit
+    inside the single-flight lock: a tick that overran the 10-minute interval must not
+    let the next one re-select and re-request the same deferred GIS rows (Codex P2).
+    """
+    king = {"candidates": 0, "parcels": 0, "unreached": 0, "found": 0, "none": 0,
+            "unverified": 0, "errors": 0, "skipped": ""}
+    lock = _acquire_single_flight()
+    if lock is None:
+        king["skipped"] = "another tick is running"
+        return {"gis": {}, "king": king}
+    try:
+        gis: dict = {}
+        try:
+            gis = recover_deferred_gis_mailing()
+        except Exception as exc:  # noqa: BLE001 -- must not block the King tick
+            _logger.warning("GIS mailing recovery tick failed: %s", str(exc)[:160])
+        return {"gis": gis, "king": _recover_impl(king)}
+    finally:
+        _release_single_flight(lock)
+
+
 # ─── Celery task ─────────────────────────────────────────────────────────────
 
 def _register() -> None:
@@ -610,22 +635,16 @@ try:  # pragma: no cover -- registration only
 
     @app.task(name="src.workers.mailing_recovery.recover_deferred_mailing")
     def recover_deferred_mailing() -> dict:
-        """Beat entry point: one bounded county-GIS tick, then one King tick.
-
-        GIS first because it is a few bulk requests and must not wait behind King's
-        up-to-480 s page-scrape tick, nor be skipped while King is in cooldown.
-        """
-        try:
-            gis_stats = recover_deferred_gis_mailing()
-            if gis_stats.get("parcels"):
-                _logger.info(
-                    "GIS mailing recovery: %d parcel(s) looked up, %d found, %d none, "
-                    "%d error", gis_stats["parcels"], gis_stats["found"],
-                    gis_stats["none"], gis_stats["errors"],
-                )
-        except Exception as exc:  # noqa: BLE001 -- must not block the King tick
-            _logger.warning("GIS mailing recovery tick failed: %s", str(exc)[:160])
-        stats = recover_deferred_king_mailing()
+        """Beat entry point: see run_mailing_recovery_tick."""
+        tick = run_mailing_recovery_tick()
+        gis_stats = tick["gis"]
+        if gis_stats.get("parcels"):
+            _logger.info(
+                "GIS mailing recovery: %d parcel(s) looked up, %d found, %d none, "
+                "%d error", gis_stats["parcels"], gis_stats["found"],
+                gis_stats["none"], gis_stats["errors"],
+            )
+        stats = tick["king"]
         if stats.get("skipped"):
             _logger.info("Mailing recovery skipped: %s", stats["skipped"])
         elif stats.get("parcels"):

@@ -412,7 +412,7 @@ def test_statewide_top_up_keeps_the_county_situs_parts_it_lacks(monkeypatch):
     from src.scrapers.enrichment import county_gis as cg
 
     mail = "PO BOX 961089, FORT WORTH, TX 76161-0089"
-    monkeypatch.setattr(cg, "_batch_query_county", lambda pids, cfg: {
+    monkeypatch.setattr(cg, "_batch_query_county", lambda pids, cfg, **kw: {
         "08931001": {"property_address": None, "mailing_address": mail,
                      "property_city": "LONGVIEW", "property_state": "WA",
                      "property_zip": "98632", "needs_situs_fallback": True},

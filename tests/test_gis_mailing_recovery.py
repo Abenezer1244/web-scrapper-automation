@@ -332,3 +332,54 @@ class TestJobEnrichmentDefersUnreachedParcels:
         row = await _get(db, rid)
         assert "mailing_lookup_deferred" not in row.enrichment_data
         assert not summary.get("mailing_deferred")
+
+
+# ─── Codex gate, round 3 (2026-09-13) ─────────────────────────────────────────
+
+def test_parcels_left_off_a_truncated_page_are_unreached(monkeypatch):
+    class _Resp:
+        status_code = 200
+
+        def json(self):
+            return {"exceededTransferLimit": True, "features": [{"attributes": {
+                "parcel_id": "00522400008900", "situsline1": "22801 64TH PL W",
+                "taxprline1": "PO BOX 1", "taxprcity": "LYNNWOOD", "taxprstate": "WA",
+                "taxprzip": "98046"}}]}
+
+    monkeypatch.setattr(cg, "safe_get", lambda *a, **kw: _Resp())
+    monkeypatch.setattr(cg, "_batch_query_wa_statewide", lambda *a, **kw: {})
+    stats: dict = {}
+    out = cg.batch_enrich_parcels_gis(["00522400008900", "00647500007600"], "snohomish",
+                                      "WA", stats=stats)
+    assert out["00522400008900"]["mailing_address"] == "PO BOX 1, LYNNWOOD, WA 98046"
+    assert stats["county_unreached"] == ["00647500007600"]
+
+
+def test_a_street_only_cowlitz_match_keeps_the_layer_state():
+    parsed = cg._parse_gis_response({"features": [{"attributes": {
+        "PARCNO": "08931001", "SITUS_STREET_NUMBER": "3738",
+        "SITUS_STREET_NAME": "PENNSYLVANIA", "SITUS_STREET_SUFFIX": "ST",
+    }}]}, cg._KNOWN_GIS_ENDPOINTS["cowlitz_WA"])
+    assert parsed["property_address"] == "3738 PENNSYLVANIA ST"
+    assert parsed["property_state"] == "WA"
+    assert parsed["property_city"] is None
+
+
+def test_a_cowlitz_match_with_nothing_located_asserts_no_state():
+    parsed = cg._parse_gis_response({"features": [{"attributes": {"PARCNO": "08931001"}}]},
+                                    cg._KNOWN_GIS_ENDPOINTS["cowlitz_WA"])
+    assert "property_state" not in parsed
+
+
+async def test_the_gis_sweep_does_not_run_when_another_tick_holds_the_lock(
+    db, business_user, monkeypatch,
+):
+    job_id = await _job(db, business_user, county="snohomish")
+    await _row(db, business_user, job_id, parcel="00522400008900")
+    calls = _county_answers(monkeypatch, {"00522400008900": TX_MAIL})
+    monkeypatch.setattr(mr, "_acquire_single_flight", lambda: None)
+
+    tick = await asyncio.to_thread(mr.run_mailing_recovery_tick)
+
+    assert calls == []
+    assert tick["king"]["skipped"] == "another tick is running"

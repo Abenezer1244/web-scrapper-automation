@@ -122,6 +122,9 @@ def format_mailing(row: dict[str, str]) -> str | None:
     if not street or _PLACEHOLDER_RE.match(street):
         return None
     locality = " ".join((row.get("CityState") or "").split())
+    if not locality:
+        # A street with nowhere to send it is not a mailing address (Codex P2).
+        return None
     zipcode = re.sub(r"\s+", "", row.get("ZipCode") or "")
     if not zipcode.strip("0"):
         zipcode = ""

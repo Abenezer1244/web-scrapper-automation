@@ -43,8 +43,6 @@ from sqlalchemy import text  # noqa: E402
 
 REPAIR_REASON = "situs_echo"
 
-# Sources that already mean "a real county mailing answer": never second-guessed here.
-_VERIFIED = ("king_assessor_tax_bill", "king_rpacct")
 
 _CANDIDATES_SQL = """
     SELECT r.id, r.user_id, btrim(r.parcel_id) AS pid, r.parcel_id AS raw_pid,
@@ -86,12 +84,15 @@ _UPDATE_SQL = """
       -- null-merge bug already damaged) is skipped, never replaced (Codex P1).
       AND (enrichment_data IS NULL OR jsonb_typeof(enrichment_data::jsonb) IN ('object', 'null'))
       -- Eligibility re-asserted at write time, not only at read time (Codex P1).
-      AND coalesce(enrichment_data::jsonb->>'mailing_source', '')
-          NOT IN ('king_assessor_tax_bill', 'king_rpacct')
-      AND coalesce(enrichment_data::jsonb->>'mailing_recovery_outcome', '') <> 'found'
-      AND (CAST(:pass AS text) = 'echo_repair'
-           OR (mailing_address IS NULL
-               AND coalesce(enrichment_data::jsonb->>'mailing_lookup_deferred', '') = 'true'))
+      AND btrim(coalesce(enrichment_data::jsonb->>'mailing_source', '')) = ''
+      AND ((CAST(:pass AS text) = 'echo_repair'
+            AND btrim(coalesce(enrichment_data::jsonb->>'mailing_recovery_outcome', '')) = ''
+            AND property_address IS NOT DISTINCT FROM :old_prop)
+           OR (CAST(:pass AS text) = 'deferred_fill'
+               AND mailing_address IS NULL
+               AND coalesce(enrichment_data::jsonb->>'mailing_lookup_deferred', '') = 'true'
+               AND coalesce(enrichment_data::jsonb->>'mailing_recovery_outcome', '')
+                   IN ('', 'error', 'identity_unverified')))
       AND EXISTS (SELECT 1 FROM jobs j WHERE j.id = results.job_id AND j.status = 'done')
 """
 
@@ -108,7 +109,10 @@ def is_situs_echo(row) -> bool:
     mail = row.mailing_address
     if not mail or not row.property_address:
         return False
-    if row.mailing_source in _VERIFIED or row.recovery_outcome == "found":
+    # ANY recorded provenance means some path looked this value up, so it is never
+    # second-guessed here, whatever the source is called (Codex P1: a positive "untagged
+    # legacy" condition, not a deny-list of known source names).
+    if (row.mailing_source or "").strip() or (row.recovery_outcome or "").strip():
         return False
     return _street(mail) == _street(row.property_address) and bool(_ECHO_TAIL_RE.search(mail))
 
@@ -128,7 +132,9 @@ def plan(rows, answers) -> list[dict]:
                 decisions.append({"row": row, "pass": "echo_unresolved",
                                   "status": answer.status if answer else "absent",
                                   "new_mail": None})
-        elif row.deferred and answer is not None and answer.status == "found":
+        elif (row.deferred and answer is not None and answer.status == "found"
+              and not (row.mailing_source or "").strip()
+              and (row.recovery_outcome or "").strip() in ("", "error", "identity_unverified")):
             decisions.append({"row": row, "pass": "deferred_fill", "status": answer.status,
                               "new_mail": answer.mailing_address})
     return decisions
@@ -158,6 +164,7 @@ def apply(db, decisions, snapshot: str, *, commit_every: int = 500) -> Counter:
         result = db.execute(text(_UPDATE_SQL), {
             "new_mail": d["new_mail"], "rid": row.id, "uid": row.user_id,
             "raw_pid": row.raw_pid, "old_mail": row.mailing_address, "pass": d["pass"],
+            "old_prop": row.property_address,
             "payload": json.dumps(payload),
             "f_property_state": flags["property_state"], "f_owner_state": flags["owner_state"],
             "f_absentee": flags["absentee_owner"], "f_out_of_state": flags["out_of_state_owner"],

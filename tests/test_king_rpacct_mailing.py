@@ -143,9 +143,14 @@ class TestPlan:
         row = _row(mailing_address="506 S 330TH PL, FEDERAL WAY WA 98003")
         assert km.plan([row], {"1321400230": TX}) == []
 
-    def test_a_verified_source_is_never_second_guessed(self):
-        for kw in ({"mailing_source": "king_assessor_tax_bill"}, {"recovery_outcome": "found"}):
+    def test_any_recorded_provenance_is_never_second_guessed(self):
+        for kw in ({"mailing_source": "king_assessor_tax_bill"}, {"mailing_source": "Some_Other"},
+                   {"recovery_outcome": "found"}, {"recovery_outcome": "none"}):
             assert km.plan([_row(**kw)], {"1321400230": TX}) == []
+
+    def test_a_blank_locality_is_no_address(self):
+        assert kr.format_mailing({"AddrLine": "100 MAIN ST", "CityState": "  ",
+                                  "ZipCode": "98032"}) is None
 
     def test_a_real_different_mailing_is_left_alone(self):
         row = _row(mailing_address="PO BOX 1, KENT, WA 98032")

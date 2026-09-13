@@ -4,10 +4,14 @@ Pure unit tests (no DB). The DB application (predicates ANDed into get_results /
 download) is exercised in CI; here we lock the months<->bill_year arithmetic
 that is easy to get off-by-one and the predicate-building shape.
 """
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 
-from src.api.tax_filters import bill_year_bounds_for_months, build_tax_conditions
+from src.api.tax_filters import (
+    bill_year_bounds_for_months,
+    build_tax_conditions,
+    tax_cap_min_year,
+)
 
 # A fixed "today" so the math is deterministic (no Date.now in tests).
 TODAY = date(2026, 6, 15)  # base = 2026*12 + 5 = 24317
@@ -52,6 +56,28 @@ class TestBillYearBounds:
         # 12 months in Jan 2026: 2025 bill is exactly 12 months -> kept.
         max_year12, _ = bill_year_bounds_for_months(12, None, jan)
         assert max_year12 == 2025
+
+
+class TestTaxCapMinYear:
+    def test_last_year_is_never_capped_on_any_day_of_the_year(self):
+        # Regression: from Aug 1 the calendar math alone returned the CURRENT year,
+        # and a full tax roll can only call PRIOR years delinquent, so Snohomish
+        # returned nothing from Aug 1 to Dec 31. Walk every day, leap year included.
+        for year in (2026, 2028):
+            day = date(year, 1, 1)
+            while day.year == year:
+                assert tax_cap_min_year(day) == year - 1, day
+                day += timedelta(days=1)
+
+    def test_two_years_back_stays_capped(self):
+        # The floor only protects last year; the 18-month recency cap still drops
+        # older delinquency (user decision 2026-06-16).
+        assert tax_cap_min_year(date(2026, 1, 1)) > 2024
+        assert tax_cap_min_year(date(2026, 12, 31)) > 2024
+
+    def test_rolls_forward_at_the_new_year(self):
+        assert tax_cap_min_year(date(2026, 12, 31)) == 2025
+        assert tax_cap_min_year(date(2027, 1, 1)) == 2026
 
 
 class TestBuildConditions:

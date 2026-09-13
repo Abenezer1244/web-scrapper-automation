@@ -19,6 +19,35 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-13 - FOUNDING25 was never enterable, and three webhooks trusted stale state
+
+**Built / Shipped:** PR #285: `scripts/stripe_founding_code_and_webhook_events.py`; run LIVE with owner approval,
+it created promotion code `FOUNDING25` (`promo_1UFBJtHE9wT1C7yZS3O21fcH`) on the coupon /billing/plans had been
+advertising with no code behind it. PR #290 (stacked on #285): `customer.subscription.updated` and `.deleted`
+take the user row lock BEFORE re-reading Stripe; `invoice.payment_failed` re-reads the invoice and the recorded
+subscription, freezes only while Stripe says past_due/unpaid, notifies only while the invoice is open, raises
+on an unreadable Stripe or a missing invoice id; `_handle_payment_succeeded` + `mark_payment_succeeded` removed.
+
+**Tried / Decided:** the owner approved enabling `invoice.payment_succeeded` on the live webhook; I withheld it.
+The handoff said dunning "never lifts" without it, but `apply_plan_change` already clears the grace when
+`customer.subscription.updated` reports active, and the handler it would have switched on had three Codex Highs.
+Owner rule: dunning follows the subscription's current Stripe status, not any single unpaid invoice.
+First design (invoice events delegate to `_handle_subscription_updated`) rejected by Codex: it drags in plan
+changes, first-observer quota resets, scraper reconciliation and alerts.
+
+**Failed / Blocked:** my first test run skipped 10 new tests silently: the local env had no `STRIPE_PRICE_*`
+(copy CI's placeholder ids). Sandbox `acct_1UF5cBIoeMQyAQ5z` still unclaimed, so the 3-month clock run waits.
+
+**Caught & fixed:** Codex gate found `.deleted` had the same lock-after-read race (High) and a missing invoice
+id failed open (Medium). `test_billing_webhook_gap` passed `db=None` and relied on no DB access before the
+early return. Codex's "`coupon=` removed on clover" was wrong for us: stripe 11.4.0 pins `2024-12-18.acacia`.
+
+**Pending / Handoff:** merge #285 then #290. Follow-up (Codex Medium, pre-existing): bounded Stripe timeouts and
+post-commit notification instead of work under the row lock. After 2026-09-16 remove the Redis dual-read.
+
+**Facts learned:** the live webhook's `api_version` only shapes event payloads; request shape follows the SDK pin.
+Full local suite: 3,098 passed; `test_session_refresh_contract.py` fails only in batch order (passes alone).
+
 ## 2026-09-13 - Closing the Snohomish coverage work, and a schema check that finally runs
 
 **Built / Shipped:** backend #284 (`3aefcce`, license-restricted county GIS mailing held off) and

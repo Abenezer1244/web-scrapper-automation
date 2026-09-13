@@ -40,9 +40,12 @@ async def test_webhook_enqueues_payment_notification():
     # is disproportionate for this external-API-shaped boundary.
     db = AsyncMock()
     db.execute = AsyncMock(return_value=_Result())
-    data = {"customer": "cus_1", "attempt_count": 3}
+    # A one-off invoice (no subscription) that Stripe still reports as open.
+    data = {"id": "in_1", "customer": "cus_1", "attempt_count": 3}
 
-    with patch("src.workers.delivery._send_payment_failed_email"), \
+    with patch("src.api.routes.billing.stripe.Invoice.retrieve",
+               return_value={"id": "in_1", "status": "open"}), \
+         patch("src.workers.delivery._send_payment_failed_email"), \
          patch("src.workers.tasks.emit_payment_notification.delay") as m:
         await _handle_payment_failed(data, db)
     m.assert_called_once_with("user-xyz", 3)

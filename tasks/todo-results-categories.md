@@ -34,7 +34,8 @@ Owner instruction 2026-09-13: "solve all D1-D5 with codex".
       failures = 7 test_plan_entitlement_audit (identical on clean main, local Stripe price env) + 1 auth
       lockout flake (passes alone and as its file).
 - [x] Codex diff review rounds 1-5: 7 P1s + 2 P2s found and fixed (cancelled-run claims, recheck race, partial counts, done-job guard, refetch-failure billing, traces for failed jobs, lock inversion, claim sweep, billed failed anchors). See docs/HANDOFF-results-categories-2026-09-13.md.
-- [ ] Codex review round 6 + full suite on the latest commit.
+- [x] Codex review rounds 6-9 + full suite after each fix (see Review).
+- [ ] Codex review round 10 on `effe66e` (two attempts killed by memory pressure).
 - [ ] Owner approval -> push + PR.
 
 ## Phase B (NOT started; needs owner approval of billing semantics): D2 + D3 + D4 claim ledger
@@ -52,4 +53,8 @@ Billing consequences to approve first: same property in two lists = two charges;
 number on a delivered property = a new charge; two cases on one parcel in one run = two charges.
 
 ## Review
-In progress. Handoff: docs/HANDOFF-results-categories-2026-09-13.md (§8 = next steps).
+Rounds 6-9 (2026-09-13): 2 P1 + 2 P1 + 1 P2 + 1 P2 + 1 P2 fixed, each with a test that failed first
+(`0043390`, `dc41cd7`, `304d7e3`, `59666b2`, `effe66e`); one round-7 P1 downgraded to P3 with Codex's
+agreement. Full suite on `effe66e`: 3,020 passed, 7 known entitlement failures. §14 security review: clean
+(two passes). NOT done: Codex round 10 (memory), owner approval, push/PR. Details: BUILD_JOURNAL 2026-09-13
+and docs/HANDOFF-results-categories-2026-09-13.md §8.

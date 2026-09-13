@@ -19,6 +19,58 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-13 - "Already delivered" claims: Codex gate rounds 6-9 (D1 + D5, branch not pushed)
+
+**Built / Shipped (local branch `investigate/results-categories`, NOT pushed, no PR):**
+- `0043390` a failed/cancelled run that never billed delivered nothing even when its row has an
+  address: the transfer's actionability guard now applies only to `done` anchors.
+- `dc41cd7` `cancel_job` is one guarded `UPDATE ... WHERE status IN CANCELLABLE RETURNING` (+ `finished_at`).
+  The old read-then-write-by-PK let a cancel overwrite a job the worker had just billed and marked
+  `done` (customer charged, download live, job read cancelled). The dispatcher treats a billed job as
+  delivered whatever its status.
+- `304d7e3` `BILLING_STAMP_RELIABLE_SINCE` (2026-06-19, one day after PR #59 / migration 063 deployed):
+  a NULL `billing_applied_at` proves "never charged" only for newer jobs; applied to the claim sweep,
+  the cancellation release and the transfer. The transfer now locks every row of the holding run for the
+  hash (results, then claim, matching reconciliation/collapse/plan cap), refuses if any unflagged row is
+  actionable, and supersedes all of them.
+- `59666b2` dispatcher: a pre-stamp failed/cancelled job buys its lookups (as before the withdrawal existed).
+- `effe66e` a run whose flagged row lost its claim to the sweep takes the unheld claim
+  (`INSERT ... ON CONFLICT DO NOTHING`, one winner) and promotes the row instead of losing the lead.
+- Every fix has a test that failed before it (a real lock-ordered API race for the cancel).
+  Full suite on `effe66e`: 3,020 passed; only the 7 known `test_plan_entitlement_audit` failures
+  (local Stripe price ids, identical on main).
+
+**Tried / Decided:**
+- Round-7 "releasing a claim leaves later prior_run rows flagged": accepted as P3 WITH Codex. Promoting a
+  done run's row ships an unbilled lead (bill != file); the next run delivers and bills it once.
+- Round-6 extras NOT folded in (pre-existing on main, not introduced here): watchdog stale-ORM write can
+  resurrect a cancelled job; results page lists rows of failed jobs; dialer outbox drain has no job-status
+  gate; five in-task claim DELETEs in `tasks.py` (322/1166/1335/1760/1893) have no billing or legacy fence;
+  prod may hold cancelled jobs with `export_key` set from the old cancel race.
+
+**Failed / Blocked:**
+- Codex round 10 on `effe66e` did NOT complete: two attempts died under memory pressure (Codex could not
+  create subprocesses, `0xC0000142`; the harness killed the wrappers). The gate is therefore NOT clean yet.
+- Read-only prod sizing of the round-7 findings was blocked by the permission classifier; decisions were
+  made from code, not data.
+- Two full-suite runs showed phantom FK/deadlock failures: `codex review` itself ran pytest against the same
+  isolated DB (it copied the env from the handoff). Reruns alone were clean. Never overlap the two.
+
+**Caught & fixed:** 2 P1 (round 6), 2 P1 + 1 P2 (round 7), 1 P2 (round 8), 1 P2 (round 9).
+
+**Pending / Handoff:** Codex round 10 on `effe66e` (then repeat until no P1/P2); owner approval before push/PR;
+after deploy verify the worker role still has DELETE on `delivered_records` (the sweep raises without it) and
+that the sweep's first ticks release ~0. D2/D3/D4 and the Results UX still need owner approval.
+
+**Security (§14, two passes):** no Critical/High. All new SQL is bound or constant-interpolated
+(`_GROUP_COLUMNS`, `actionable_sql`); every tenant write filters `user_id`; the sweep is a system task joined
+on `j.user_id = d.user_id`; no new endpoints, fields, secrets, or dependencies; errors stay internal.
+
+**Facts learned:** billing + done commit in one transaction, so billed implies delivered; `/download` is gated
+on `export_key`, not status; `codex review` executes tests.
+
+---
+
 ## 2026-09-13 - Auction and pre-foreclosure lists stop calling a dead source "0 leads"
 
 **Built / Shipped (branch `fix/nts-silent-empty`):**

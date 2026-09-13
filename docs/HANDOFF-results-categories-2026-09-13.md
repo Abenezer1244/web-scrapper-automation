@@ -154,6 +154,16 @@ Round 5 finished; its result is recorded below.
 
 ROUND 5 (done): full suite on `3e4ce26` = 3,002 passed, only the 7 known entitlement failures. Codex found one [P1]: the transfer accepted a failed/cancelled anchor job even if it had BILLED (a job can bill and later be marked failed by a watchdog retry). Fixed in the handoff commit: failed/cancelled anchors now also require `billing_applied_at IS NULL`, with a mutation-proven test (`test_a_run_that_billed_before_it_was_marked_failed_keeps_its_claim`); `tests/test_claim_transfer.py` 31 passed. **Round 6 has NOT been run and the full suite has NOT been re-run after this last fix. Do both first.**
 
+ROUNDS 6-9 (done, 2026-09-13 later session): fixes `0043390` (failed unbilled anchor transfers even with an
+address), `dc41cd7` (atomic `cancel_job`; dispatcher treats billed as delivered), `304d7e3`
+(`BILLING_STAMP_RELIABLE_SINCE` fence on sweep/cancel release/transfer; transfer checks and supersedes every
+same-hash row of the holding run; lock order results -> claim), `59666b2` (dispatcher buys for pre-stamp
+terminal jobs), `effe66e` (a run takes a claim released after it flagged the row). Full suite on `effe66e`:
+3,020 passed, 7 known failures. §14 security review clean. **Codex round 10 on `effe66e` has NOT completed**
+(two attempts died: Codex could not spawn processes under memory pressure). Pre-existing issues deliberately not
+fixed here are listed in BUILD_JOURNAL 2026-09-13. WARNING: `codex review` runs pytest on
+`bridgeleads_rescat_test`; never run the suite at the same time.
+
 Next steps, in order:
 
 1. If round 5 reports a P1/P2: verify it against the code (Codex has been right on every P1 so far,

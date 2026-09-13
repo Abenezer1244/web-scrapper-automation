@@ -282,3 +282,109 @@ def test_two_parcels_sharing_a_loose_key_are_never_guessed_between():
     assert _callers_for("123456", {"0123456": ["0123456"], "123456": ["123456"]}) == [
         "123456"]  # exact match still wins
     assert _callers_for("00123456", {"0123456": ["0123456"], "123456": ["123456"]}) == []
+
+
+# ─── Codex gate on the Phase 1 diff (2026-09-10) ─────────────────────────────
+#
+# Only the network boundary is replaced below (the county/statewide HTTP call, as
+# test_county_gis_parse.TestFallbackOrder already does). The mapping, id resolution
+# and merge logic under test all run for real.
+
+class _Resp:
+    status_code = 200
+
+    def __init__(self, payload):
+        self._payload = payload
+
+    def json(self):
+        return self._payload
+
+
+def test_statewide_unrequested_parcel_is_dropped_not_filed_under_itself(monkeypatch):
+    """P2. The statewide path used query_to_original.get(pid, pid), the same
+    invent-a-caller pattern the county path dropped."""
+    from src.scrapers.enrichment import county_gis as cg
+
+    monkeypatch.setattr(cg, "safe_get", lambda *a, **kw: _Resp({"features": [
+        {"attributes": {"ORIG_PARCEL_ID": "5555555", "SITUS_ADDRESS": "1 OTHER ST"}},
+    ]}))
+    assert cg._batch_query_wa_statewide(["2231502"], "cowlitz") == {}
+
+
+def test_statewide_leading_zero_echo_still_reaches_its_caller(monkeypatch):
+    from src.scrapers.enrichment import county_gis as cg
+
+    monkeypatch.setattr(cg, "safe_get", lambda *a, **kw: _Resp({"features": [
+        {"attributes": {"ORIG_PARCEL_ID": "8931001", "SITUS_ADDRESS": "3738 PENNSYLVANIA ST",
+                        "SITUS_CITY_NM": "LONGVIEW", "SITUS_ZIP_NR": "98632"}},
+    ]}))
+    out = cg._batch_query_wa_statewide(["08931001"], "cowlitz")
+    assert list(out) == ["08931001"]
+    assert out["08931001"]["property_address"] == "3738 PENNSYLVANIA ST"
+    assert out["08931001"]["mailing_address"] is None
+
+
+def test_arcgis_error_inside_a_200_is_logged_not_read_as_no_data(monkeypatch, caplog):
+    """A renamed field or a newly required token comes back as HTTP 200 + error body,
+    which used to look exactly like a county with no mailing data."""
+    from src.scrapers.enrichment import county_gis as cg
+
+    monkeypatch.setattr(cg, "safe_get", lambda *a, **kw: _Resp(
+        {"error": {"code": 499, "message": "Token Required"}}))
+    with caplog.at_level("WARNING"):
+        assert cg._batch_query_county(["00522400008900"], SNOHOMISH) == {}
+    assert "Token Required" in caplog.text
+
+
+def test_truncated_arcgis_page_is_logged(caplog):
+    from src.scrapers.enrichment import county_gis as cg
+
+    with caplog.at_level("WARNING"):
+        cg._warn_on_arcgis_anomaly({"features": [], "exceededTransferLimit": True}, "x")
+    assert "exceededTransferLimit" in caplog.text
+
+
+class TestSingleParcelKeepsCountyMailing:
+    """P1. enrich_parcel_gis asked the county, got a mailing address but no situs, then
+    returned a situs-only fallback wholesale and lost the mailing address."""
+
+    MAIL = "PO BOX 961089, FORT WORTH, TX 76161-0089"
+
+    def _patch(self, monkeypatch, statewide, statewide_name=None):
+        from src.scrapers.enrichment import county_gis as cg
+
+        monkeypatch.setattr(cg.settings, "GIS_ENRICHMENT_ENABLED", True, raising=False)
+        monkeypatch.setattr(cg, "_query_gis", lambda *a, **kw: {
+            **cg._empty(), "matched": True, "mailing_address": self.MAIL})
+        monkeypatch.setattr(cg, "_query_wa_statewide", lambda *a, **kw: statewide)
+        monkeypatch.setattr(cg, "_query_gis_by_name", lambda *a, **kw: cg._empty())
+        monkeypatch.setattr(cg, "_query_wa_statewide_by_name",
+                            lambda *a, **kw: statewide_name or cg._empty())
+        return cg
+
+    def test_statewide_situs_is_topped_up_with_the_county_mailing(self, monkeypatch):
+        cg = self._patch(monkeypatch, {"property_address": "1302 CASCADE DR",
+                                       "mailing_address": None})
+        out = cg.enrich_parcel_gis("90293", "cowlitz", "WA")
+        assert out["property_address"] == "1302 CASCADE DR"
+        assert out["mailing_address"] == self.MAIL
+
+    def test_nothing_located_still_returns_the_county_mailing(self, monkeypatch):
+        cg = self._patch(monkeypatch, cg_empty := {"property_address": None,
+                                                   "mailing_address": None})
+        out = cg.enrich_parcel_gis("90293", "cowlitz", "WA")
+        assert out["property_address"] is None
+        assert out["mailing_address"] == self.MAIL
+        assert cg_empty["mailing_address"] is None
+
+    def test_mailing_is_never_attached_to_a_name_search_hit(self, monkeypatch):
+        """A name search may land on a DIFFERENT parcel. This parcel's mailing address
+        must not ride along onto it."""
+        cg = self._patch(
+            monkeypatch,
+            {"property_address": None, "mailing_address": None},
+            statewide_name={"property_address": "999 SOMEONE ELSES RD",
+                            "mailing_address": None},
+        )
+        out = cg.enrich_parcel_gis(None, "cowlitz", "WA", owner_name="FOYEN VERLINDA")
+        assert out["mailing_address"] is None

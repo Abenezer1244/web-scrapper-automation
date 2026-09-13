@@ -211,6 +211,7 @@ def enrich_parcel_gis(
         gis_config = _KNOWN_GIS_ENDPOINTS[county_key]
 
     # Try county-specific endpoint first (by parcel ID)
+    county_mailing: str | None = None
     if gis_config and parcel_id:
         result = _query_gis(parcel_id, gis_config, county_key)
         if result.get("property_address"):
@@ -221,6 +222,11 @@ def enrich_parcel_gis(
         # (skip_statewide_fallback). Return the matched-vacant result as-is.
         if result.get("matched") and gis_config.get("skip_statewide_fallback"):
             return result
+        # The county knew where the owner gets mail but not where the property is.
+        # Every fallback below is situs-only, so returning one of them wholesale
+        # would discard that mailing address — the same loss the batch path was
+        # fixed for (Codex P1, 2026-09-10). Carry it forward instead.
+        county_mailing = result.get("mailing_address")
 
     # Fallback: WA statewide parcel service (covers all 39 WA counties).
     #
@@ -234,6 +240,10 @@ def enrich_parcel_gis(
     if state.upper() == "WA" and parcel_id:
         result = _query_wa_statewide(parcel_id, county)
         if result.get("property_address"):
+            if county_mailing and not result.get("mailing_address"):
+                # Same parcel id, so the county's mailing address still describes
+                # this property's owner. The statewide layer has none to offer.
+                result = {**result, "mailing_address": county_mailing}
             return result
 
     # Fallback: search by owner name. Skipped when a parcel id is in hand AND an
@@ -267,6 +277,13 @@ def enrich_parcel_gis(
             _logger.info("WA statewide name search succeeded for %s", owner_name)
             return result
 
+    # Nothing located the property. The county's mailing address is still a real
+    # answer for the parcel that was asked about, so it is returned rather than
+    # thrown away with the miss. The two name-search returns above deliberately do
+    # NOT carry it: they may have landed on a DIFFERENT parcel, and this mailing
+    # address belongs to the one identified by parcel_id.
+    if county_mailing:
+        return {**_empty(), "mailing_address": county_mailing}
     return _empty()
 
 
@@ -684,12 +701,12 @@ def _callers_for(pid: object, clean_to_originals: dict[str, list[str]]) -> list[
             return hits[0]
         if len(hits) > 1:
             _logger.warning(
-                "County GIS parcel %r is ambiguous across %d requested ids — dropped",
+                "County GIS parcel %r is ambiguous across %d requested ids, dropped",
                 raw, len(hits),
             )
             return []
     _logger.warning(
-        "County GIS returned parcel %r that matches no requested id — dropped", raw
+        "County GIS returned parcel %r that matches no requested id, dropped", raw
     )
     return []
 
@@ -853,6 +870,8 @@ def _compose_mailing(attrs: dict, gis_config: dict) -> str | None:
     if zipcode:
         tail = f"{tail} {zipcode}".strip()
     return f"{street}, {tail}" if tail else street
+
+
 _CITY_STATE_RE = re.compile(r"^\s*(.+?)\s*,\s*([A-Z]{2})\s*$")
 # "PO BOX", "P.O. BOX", "P O BOX", "P.O BOX", "POB" — any post-office box spelling.
 _PO_BOX_RE = re.compile(r"^\s*P\.?\s*O\.?\s*B(?:OX)?\b", re.I)
@@ -927,6 +946,26 @@ def _situs_parts(city: str, zipcode: str) -> dict[str, str | None]:
     }
 
 
+def _warn_on_arcgis_anomaly(data: object, label: str) -> None:
+    """Log the two ArcGIS responses that otherwise read as "no data for these parcels".
+
+    ArcGIS reports a bad query (renamed field, token now required) as HTTP 200 with an
+    ``error`` body and no ``features`` key, and a capped page as ``exceededTransferLimit``.
+    Both were swallowed as an empty result, so a layer change looked exactly like a
+    county that publishes no mailing address. Telemetry only: the caller's handling of
+    the features it did get is unchanged.
+    """
+    if not isinstance(data, dict):
+        _logger.warning("%s: response was not a JSON object", label)
+        return
+    error = data.get("error")
+    if error:
+        detail = error.get("message") if isinstance(error, dict) else error
+        _logger.warning("%s: ArcGIS error in a 200 response: %s", label, str(detail)[:120])
+    if data.get("exceededTransferLimit"):
+        _logger.warning("%s: ArcGIS truncated the page (exceededTransferLimit)", label)
+
+
 def _batch_query_county(
     parcel_ids: list[str], gis_config: dict
 ) -> dict[str, dict[str, str | None]]:
@@ -966,6 +1005,7 @@ def _batch_query_county(
                 continue
 
             data = resp.json()
+            _warn_on_arcgis_anomaly(data, "County GIS batch")
             found = _map_county_features(
                 data.get("features") or [], gis_config, clean_to_originals
             )
@@ -1027,9 +1067,15 @@ def _batch_query_wa_statewide(
         if not query_pairs:
             continue
 
-        # Reverse map: query_value -> original caller parcel_id
-        query_to_original = dict(query_pairs)
-        in_values = list(query_to_original.keys())
+        # Reverse map: query_value -> every caller parcel_id that asked for it. The
+        # same _callers_for resolver as the county path, so a returned id that
+        # matches no request is dropped rather than filed under itself (Codex P2).
+        query_to_originals: dict[str, list[str]] = {}
+        for query_value, original in query_pairs:
+            callers = query_to_originals.setdefault(query_value, [])
+            if original not in callers:
+                callers.append(original)
+        in_values = list(query_to_originals.keys())
 
         in_clause = ",".join(_arcgis_literal(p) for p in in_values)
         where = f"ORIG_PARCEL_ID IN ({in_clause})"
@@ -1051,6 +1097,7 @@ def _batch_query_wa_statewide(
                 continue
 
             data = resp.json()
+            _warn_on_arcgis_anomaly(data, "Statewide GIS batch")
             for feature in data.get("features") or []:
                 attrs = feature.get("attributes") or {}
                 pid = attrs.get("ORIG_PARCEL_ID")
@@ -1058,23 +1105,22 @@ def _batch_query_wa_statewide(
                 if not pid or not address:
                     continue
 
-                # Map back to caller's original parcel_id
-                caller_pid = query_to_original.get(pid, pid)
-
                 address = " ".join(address.strip().split())
                 city = (attrs.get("SITUS_CITY_NM") or "").strip()
                 zipcode = (attrs.get("SITUS_ZIP_NR") or "").strip()
-                results[caller_pid] = {
+                row = {
                     "property_address": address,
                     "mailing_address": None,  # situs-only layer: owner's mail unknown
-                    "parcel_id": pid,  # canonical format from server
+                    "parcel_id": str(pid),  # canonical format from server
                     **_situs_parts(city, zipcode),
                 }
+                for caller_pid in _callers_for(pid, query_to_originals):
+                    results[caller_pid] = dict(row)
 
             _logger.info(
                 "Statewide GIS batch: %d/%d parcels enriched",
-                len([qv for qv, orig in query_pairs if orig in results]),
-                len(query_pairs),
+                len({orig for _, orig in query_pairs if orig in results}),
+                len({orig for _, orig in query_pairs}),
             )
 
         except Exception as exc:

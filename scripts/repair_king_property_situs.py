@@ -47,11 +47,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from sqlalchemy import text  # noqa: E402
 
-from src.workers.tasks_helpers.enrich import (  # noqa: E402
-    ED_MERGE_SQL,
-    ED_MERGEABLE_SQL,
-    KING_ACCOUNT_RESOLVER,
-)
+from src.workers.tasks_helpers.enrich import KING_ACCOUNT_RESOLVER  # noqa: E402
 
 REASON_CONDO = "king_condo_unit"
 REASON_ACCOUNT = "king_account_number"
@@ -77,7 +73,9 @@ _CANDIDATES_SQL = """
     ORDER BY r.id
 """
 
-_UPDATE_SQL = f"""
+# Fully static: every value is a bound parameter. enrichment_data merges only into a JSON
+# object (JSON null counts as empty); an array or scalar is skipped, never replaced.
+_UPDATE_SQL = """
     UPDATE results SET
       property_address = :address,
       property_city = COALESCE(property_city, CAST(:city AS varchar)),
@@ -86,11 +84,13 @@ _UPDATE_SQL = f"""
       owner_state = CAST(:f_owner_state AS varchar),
       absentee_owner = CAST(:f_absentee AS boolean),
       out_of_state_owner = CAST(:f_out_of_state AS boolean),
-      enrichment_data = {ED_MERGE_SQL}
+      enrichment_data = ((CASE WHEN jsonb_typeof(enrichment_data::jsonb) = 'object'
+                               THEN enrichment_data::jsonb ELSE '{}'::jsonb END)
+                         || CAST(:patch AS jsonb))::json
     WHERE id = :rid AND user_id = :uid AND parcel_id = :raw_pid
       AND coalesce(btrim(property_address), '') IN ('', '(enrichment unavailable)')
       AND mailing_address IS NOT DISTINCT FROM :old_mail
-      AND {ED_MERGEABLE_SQL}
+      AND (enrichment_data IS NULL OR jsonb_typeof(enrichment_data::jsonb) IN ('object', 'null'))
       AND (CAST(:resolved_pin AS text) IS NULL
            OR coalesce(enrichment_data::jsonb->>'resolved_parcel_id', '') IN ('', :resolved_pin))
       AND EXISTS (SELECT 1 FROM jobs j WHERE j.id = results.job_id AND j.status = 'done')

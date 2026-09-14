@@ -197,7 +197,6 @@ async def test_a_row_changed_after_the_read_is_not_overwritten(
 
     def _go():
         from src.db.session import system_sync_session
-
         from src.scrapers.enrichment.king_condo_units import load_units, unit_situs
 
         with system_sync_session() as sdb:

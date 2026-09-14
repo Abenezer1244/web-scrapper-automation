@@ -29,6 +29,7 @@ from src.utils.lead_formatting import (
     split_owner_for_display,
 )
 from src.utils.lead_signals import auction_reference_date, derive_signals
+from src.utils.located_parcel import PARCEL_SOURCE_LABEL, located_parcel_id
 
 # Canonical column order. Existing reference/legacy columns first, dialer-import
 # split columns + enrichment passthrough appended at END (backward-compatible for
@@ -81,6 +82,9 @@ LEAD_CSV_COLUMNS: list[str] = [
     # humble scan aid ("Different owner on title" / "Held by trust or entity" / blank).
     # King probate/death only; blank elsewhere. Appended at END (back-compat).
     "current_owner", "title_status",
+    # Located parcel provenance (2026-09-14): set when parcel_id was filled from a
+    # county parcel-map match because the source had no parcel number. Appended at END.
+    "parcel_source",
 ]
 
 
@@ -126,6 +130,7 @@ _TYPE_EXTRA_COLUMNS: dict[str, tuple[str, ...]] = {
     "code_violation": (
         "code_violation_type", "code_violation_status",
         "code_violation_description", "code_violation_last_inspection",
+        "parcel_source",
     ),
     "pre_foreclosure": (
         "auction_date", "days_to_auction", "default_amount", "trustee", "ts_number",
@@ -400,7 +405,13 @@ def build_lead_export_row(
         ),
         "party_name": sanitize_for_csv(_get(record, "party_name")),
         "heirs": sanitize_for_csv(_get(record, "heirs")),
-        "parcel_id": sanitize_for_csv(_get(record, "parcel_id")),
+        # A located parcel (exact map match, never stored as parcel_id) fills the
+        # column only when the source gave none; parcel_source says where it came from.
+        "parcel_id": sanitize_for_csv(_get(record, "parcel_id") or located_parcel_id(enr)),
+        "parcel_source": (
+            "" if _get(record, "parcel_id") or not located_parcel_id(enr)
+            else PARCEL_SOURCE_LABEL
+        ),
         "property_address": sanitize_for_csv(_get(record, "property_address")),
         "mailing_address": sanitize_for_csv(_get(record, "mailing_address")),
         "legal_description": sanitize_for_csv(_get(record, "legal_description")),
@@ -438,7 +449,9 @@ def build_lead_export_row(
         # exporters build SimpleNamespaces that don't carry enrichment_data, so they
         # SELECT it as a top-level `lead_subtype` scalar — read whichever is present.
         "lead_subtype": _enrich_str(enr, "lead_subtype") or sanitize_for_csv(_get(record, "lead_subtype")),
-        "code_violation_type": _enrich_str(enr, "record_type", "case_type"),
+        # SDCI's category ("Vacant Building") is the violation; its record_type is only
+        # the case kind ("Complaint"), so it is the fallback. Tacoma stores case_type.
+        "code_violation_type": _enrich_str(enr, "violation_category", "record_type", "case_type"),
         "code_violation_status": _enrich_str(enr, "status"),
         "code_violation_description": _enrich_str(enr, "description"),
         "code_violation_last_inspection": _enrich_str(enr, "last_inspection"),

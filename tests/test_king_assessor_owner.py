@@ -246,11 +246,12 @@ def test_page_for_the_requested_parcel_is_accepted():
     )
 
 
-def test_missing_echo_is_trusted_only_for_a_well_formed_king_pin():
-    # A layout change that drops the Parcel Number cell must not zero out every
-    # King lookup — a 10-digit PIN cannot be truncated, so it stays trusted...
-    assert parcel_page_is_for("<tr><td>Name</td><td>SMITH JANE</td></tr>", "3751604519")
-    # ...but a malformed id with no echo has no evidence at all and fails CLOSED.
+def test_a_page_that_names_no_parcel_is_never_trusted():
+    # It used to be trusted for a well-formed 10-digit PIN (so a layout change
+    # could not zero every lookup). Any page without the cell could then lend its
+    # owner or site address to whichever parcel was requested. Fail closed; the
+    # phase-1 breaker and the source canary make a real layout change loud.
+    assert not parcel_page_is_for("<tr><td>Name</td><td>SMITH JANE</td></tr>", "3751604519")
     assert not parcel_page_is_for("<tr><td>Name</td><td>SMITH JANE</td></tr>", "64116000027")
     assert not parcel_page_is_for("<tr><td>Name</td><td>SMITH JANE</td></tr>", "012603938700")
 

@@ -31,6 +31,13 @@ import time
 from dataclasses import dataclass
 
 from src.utils.address_intel import _normalize_street, parse_property_for_display
+from src.utils.located_parcel import (
+    KING_GIS_POINT_SOURCE,
+    MATCH_CONDO_COMPLEX,
+    MATCH_EXACT,
+    MATCH_STREET_ONLY,
+    located_parcel_id,
+)
 from src.utils.logger import setup_logger
 from src.utils.safe_http import safe_get
 
@@ -40,7 +47,12 @@ PARCEL_LAYER = (
     "https://gismaps.kingcounty.gov/arcgis/rest/services"
     "/Property/KingCo_PropertyInfo/MapServer/2/query"
 )
-SOURCE = "king_gis_point_in_parcel"
+SOURCE = KING_GIS_POINT_SOURCE
+# The owner is the taxpayer named on the King Assessor's eRealProperty page for the PIN.
+OWNER_SOURCE = "king_erealproperty"
+# King Assessor property type "K" = condominium complex (verified on the layer:
+# ZULO CONDOMINIUM, PREUSE_DESC "Condominium(Residential)").
+_CONDO_PROPTYPE = "K"
 
 # A lead address naming a unit ("#6", "UNIT 6", "APT 6", "STE 6") cannot be proven by a
 # street comparison: the normalizer strips units, so two condo units on one base parcel
@@ -58,6 +70,10 @@ class Located:
     status: str
     pin: str | None = None
     parcel_address: str | None = None
+    # For a match: "exact" when both ZIPs were known and equal, "street_only" when one
+    # side had no ZIP (the street still matched), "condo_complex" when the parcel is a
+    # whole condominium. Only "exact" is shown as a Parcel ID or used to name the owner.
+    match: str | None = None
 
 
 def _street_and_zip(address: str | None) -> tuple[str, str]:
@@ -84,7 +100,7 @@ def locate(lat: object, lon: object, property_address: str | None) -> Located:
         resp = safe_get(PARCEL_LAYER, params={
             "geometry": f"{lon_f},{lat_f}", "geometryType": "esriGeometryPoint",
             "inSR": "4326", "spatialRel": "esriSpatialRelIntersects",
-            "outFields": "PIN,ADDR_FULL,ZIP5", "returnGeometry": "false", "f": "json",
+            "outFields": "PIN,ADDR_FULL,ZIP5,PROPTYPE", "returnGeometry": "false", "f": "json",
         }, headers={"User-Agent": "Mozilla/5.0 BridgeLeads/1.0"}, timeout=15)
         data = resp.json() if resp.status_code == 200 else None
     except Exception as exc:  # noqa: BLE001 -- one failed lookup must not stop a batch
@@ -111,7 +127,16 @@ def locate(lat: object, lon: object, property_address: str | None) -> Located:
             or parcel_street != lead_street
             or (lead_zip and parcel_zip and lead_zip != parcel_zip)):
         return Located("address_mismatch", parcel_address=attrs.get("ADDR_FULL"))
-    return Located("matched", pin=pin, parcel_address=attrs.get("ADDR_FULL"))
+    if str(attrs.get("PROPTYPE") or "").strip().upper() == _CONDO_PROPTYPE:
+        # The whole-complex parcel (minor 0000): every unit sits under this polygon and
+        # shares its street, so neither the PIN nor its taxpayer identifies the unit
+        # owner the complaint is about.
+        match = MATCH_CONDO_COMPLEX
+    elif lead_zip and parcel_zip:
+        match = MATCH_EXACT
+    else:
+        match = MATCH_STREET_ONLY
+    return Located("matched", pin=pin, parcel_address=attrs.get("ADDR_FULL"), match=match)
 
 
 def locate_many(items: list[tuple[str, object, object, str | None]], *,
@@ -128,6 +153,48 @@ def locate_many(items: list[tuple[str, object, object, str | None]], *,
         out[key] = locate(lat, lon, address)
         time.sleep(pace_s)
     return out
+
+
+def owner_lookup_pins(rows) -> dict[str, list]:
+    """{exact located PIN: [rows]} for code-violation rows that still have no owner.
+
+    Only an EXACT location (see src/utils/located_parcel.py) may name the owner: the
+    county's taxpayer on a parcel we are not sure of would put a stranger's name on the
+    lead. A row that already has a party_name is never offered for replacement.
+    """
+    out: dict[str, list] = {}
+    for res in rows:
+        if res.party_name:
+            continue
+        pin = located_parcel_id(res.enrichment_data)
+        if pin:
+            out.setdefault(pin, []).append(res)
+    return out
+
+
+def apply_owner_names(pin_map: dict[str, list], owners: dict[str, str], *,
+                      checked_at: str) -> int:
+    """Write each resolved owner onto its rows; returns how many rows were named.
+
+    `owners` is batch_extract_king_owners' answer ({pin: name}), which only carries
+    names read from a page the county served for that same PIN. Re-checks both guards
+    on the row itself so a row changed since selection is left alone.
+    """
+    named = 0
+    for pin, owner in owners.items():
+        name = (owner or "").strip()[:512]
+        if not name:
+            continue
+        for res in pin_map.get(pin, []):
+            if res.party_name or located_parcel_id(res.enrichment_data) != pin:
+                continue
+            res.party_name = name
+            ed = dict(res.enrichment_data)
+            ed.update({"owner_source": OWNER_SOURCE, "owner_pin": pin,
+                       "owner_checked_at": checked_at})
+            res.enrichment_data = ed
+            named += 1
+    return named
 
 
 def resolve_code_violation_mailing(
@@ -159,7 +226,8 @@ def resolve_code_violation_mailing(
         for key in keys:
             d = {"kc_pin_status": loc.status}
             if loc.status == "matched":
-                d.update({"kc_pin": loc.pin, "kc_parcel_address": loc.parcel_address})
+                d.update({"kc_pin": loc.pin, "kc_parcel_address": loc.parcel_address,
+                          "kc_pin_match": loc.match})
             decisions[key] = d
     pins = {d["kc_pin"] for d in decisions.values() if d.get("kc_pin")}
     snapshot = None

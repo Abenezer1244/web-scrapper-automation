@@ -40,7 +40,7 @@ SETTLED_COMPLAINT_STATUSES = frozenset({"Completed", "Open Duplicate"})
 # means. `OWNER_DEFERRED_KEY` True: this run did not get an answer, and
 # `OWNER_DEFERRED_REASON_KEY` says why (not_admitted, source_unavailable,
 # budget_exhausted, lease_lost, breaker_tripped, timeout, error,
-# transient_failure, unverified_page). `OWNER_OUTCOME_KEY` == not_on_record: the
+# transient_failure, parcel_mismatch). `OWNER_OUTCOME_KEY` == not_on_record: the
 # parcel's own county page named it and showed no owner, a settled answer.
 OWNER_DEFERRED_KEY = "owner_lookup_deferred"
 OWNER_DEFERRED_REASON_KEY = "owner_lookup_deferred_reason"
@@ -69,6 +69,28 @@ def enrichment_completion_log(summary: dict) -> tuple[str, str]:
         noun = "name" if owner == 1 else "names"
         parts.append(f"{owner:,} owner {noun} could not be looked up during this run.")
     return "info", " ".join(parts)
+
+
+def _tax_parcel_priority(pid_map: dict[str, list]) -> list[str]:
+    """Tax parcels in the order the plan cap will deliver their leads.
+
+    King's per-parcel lookups (owner name, site address) run on a wall-clock budget
+    that reaches a few hundred of a job's parcels, BEFORE the cap decides which
+    leads ship. Walking parcels in set order spent that budget on leads the
+    customer would never receive. This mirrors the cap's tax ranking
+    (plan_cap._TAX_RANK_ORDER): largest balance, older delinquency, parcel id.
+    Only non-duplicate rows count (a duplicate is never delivered); a parcel with
+    no such row goes last.
+    """
+    def _key(pid: str):
+        live = [res for res in pid_map[pid] if not res.is_duplicate]
+        amounts = [res.delinquent_amount for res in live if res.delinquent_amount is not None]
+        top = max(amounts) if amounts else None
+        years = [res.delinquent_bill_year for res in live
+                 if res.delinquent_amount == top and res.delinquent_bill_year is not None]
+        return (not live, top is None, -(top or 0), min(years) if years else 9999, pid)
+
+    return sorted(pid_map, key=_key)
 
 
 def _keep_situs_parts(res, gis_data: dict) -> None:
@@ -869,7 +891,8 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
             for k, d in _cv_decisions.items():
                 res = _cv_rows[k]
                 ed = dict(res.enrichment_data)
-                ed.update({key: d[key] for key in ("kc_pin_status", "kc_pin", "kc_parcel_address")
+                ed.update({key: d[key] for key in ("kc_pin_status", "kc_pin", "kc_parcel_address",
+                                                   "kc_pin_match")
                            if key in d})
                 if d.get("kc_pin"):
                     ed["kc_pin_source"] = _KC_PIN_SOURCE
@@ -886,6 +909,56 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
             except Exception as exc:
                 db.rollback()
                 _logger.warning("Job %s: code violation mailing commit failed: %s",
+                                job_id, str(exc)[:120])
+
+        # SDCI names the complaint, never the owner, so party_name arrives empty. An
+        # EXACT located PIN names the owner through the same owner-only eRealProperty
+        # path King tax uses: lease-guarded, paced, breaker-protected, and it drops any
+        # page the county served for a different parcel. This job has no parcel_id, so
+        # the parcel-keyed owner pass below never runs for it; this takes its 300 s
+        # slot in that budget sum. Rows not reached keep no owner and are picked up by
+        # scripts/backfill_king_code_violation_owner.py.
+        from src.scrapers.enrichment.king_parcel_locate import (
+            apply_owner_names,
+            owner_lookup_pins,
+        )
+        _cv_owner_map = owner_lookup_pins(all_results)
+        if _cv_owner_map:
+            from src.scrapers.enrichment.king_county_assessor import (
+                KingOwnerLookupBlockedError,
+                batch_extract_king_owners,
+            )
+            from src.scrapers.enrichment.source_health import SourceUnavailableError
+
+            _publish_log(r, job_id, "info",
+                         f"Looking up property owners for {len(_cv_owner_map)} code violation "
+                         "parcels...", db=db)
+            _cv_owners: dict[str, str] = {}
+            try:
+                asyncio.run(asyncio.wait_for(
+                    batch_extract_king_owners(
+                        list(_cv_owner_map), delay=1.0, circuit_window=20,
+                        max_transient_rate=0.10, max_unresolved_rate=0.50,
+                        fetch_attempts=1, out=_cv_owners, time_budget_s=240,
+                    ),
+                    timeout=300,
+                ))
+            except TimeoutError:
+                _logger.warning("Job %s: code violation owner lookup hit the hard timeout; "
+                                "keeping %d names", job_id, len(_cv_owners))
+            except (KingOwnerLookupBlockedError, SourceUnavailableError) as exc:
+                # Names read before the breaker tripped are still real; keep them.
+                _logger.warning("Job %s: code violation owner lookup aborted: %s",
+                                job_id, str(exc)[:180])
+            _cv_named = apply_owner_names(
+                _cv_owner_map, _cv_owners, checked_at=_now().isoformat())
+            try:
+                db.commit()
+                _publish_log(r, job_id, "info",
+                             f"Found {_cv_named} property owners for code violations.", db=db)
+            except Exception as exc:
+                db.rollback()
+                _logger.warning("Job %s: code violation owner commit failed: %s",
                                 job_id, str(exc)[:120])
 
     # King County: eRealProperty + Tax Bill for property + mailing
@@ -916,6 +989,9 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                 if pid not in pid_map:
                     pid_map[pid] = []
                 pid_map[pid].append(res)
+            if is_tax_delinquent:
+                # Spend the lookup budget on the leads the plan cap will deliver.
+                pids = _tax_parcel_priority(pid_map)
             # ── Mailing from the Assessor bulk extract FIRST ──────────────────────
             # The tax-bill page below costs 5-10 s per parcel and King rate-blocks it:
             # a 16,630-parcel job on 2026-09-13 deferred every lookup and put the
@@ -1319,7 +1395,9 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                 # than recording it as "no owner". Those are safety valves, not
                 # caps, and are deliberately kept: they are what stops a repeat of
                 # the eRealProperty IP rate-block.
-                o_pids = list(o_pid_map.keys())
+                # Largest balance first, the order the plan cap delivers in, so a
+                # budget that runs out leaves the undelivered leads unnamed.
+                o_pids = _tax_parcel_priority(o_pid_map)
                 # Caller-owned result dicts: names AND the per-parcel outcome ledger
                 # are kept even if the outer wait_for cancels or the breaker raises.
                 owners: dict[str, str] = {}
@@ -1365,7 +1443,7 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                     )
                 o_reason = o_reason or o_stats.get("outcome") or "error"
                 _transient = set(o_stats.get("transient", []))
-                _unverified = set(o_stats.get("unverified", []))
+                _mismatch = set(o_stats.get("parcel_mismatch", []))
                 _no_owner = set(o_stats.get("no_owner_on_record", []))
 
                 # One outcome per parcel, fanned out to every lead on it. A lead is
@@ -1399,7 +1477,7 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                             ed[OWNER_DEFERRED_KEY] = True
                             ed[OWNER_DEFERRED_REASON_KEY] = (
                                 "transient_failure" if pid in _transient
-                                else "unverified_page" if pid in _unverified
+                                else "parcel_mismatch" if pid in _mismatch
                                 else o_reason
                             )
                             owner_deferred_rows += 1

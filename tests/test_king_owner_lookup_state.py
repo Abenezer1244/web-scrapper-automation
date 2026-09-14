@@ -116,8 +116,8 @@ async def test_only_a_page_that_names_the_parcel_can_prove_there_is_no_owner(mon
     pages = {
         _NAMED: _Resp(200, _page(_NAMED, "SHAN HOMES2 LLC")),
         _NO_OWNER: _Resp(200, _page(_NO_OWNER, None)),
-        # An interstitial with no parcel cell: parcel_page_is_for trusts it for a
-        # 10-digit PIN, but it proves nothing about the owner.
+        # An interstitial with no parcel cell proves nothing about any parcel: a
+        # failed lookup, retryable, never "no owner on record".
         _NO_ECHO: _Resp(200, "<html><body>Please wait</body></html>"),
     }
     monkeypatch.setattr(kca, "safe_get", lambda url, **k: pages[url[-10:]])
@@ -128,10 +128,10 @@ async def test_only_a_page_that_names_the_parcel_can_prove_there_is_no_owner(mon
 
     assert owners == {_NAMED: "SHAN HOMES2 LLC"}
     assert stats["outcome"] == "complete"
-    assert stats["attempted"] == [_NAMED, _NO_OWNER, _NO_ECHO]
+    assert stats["attempted"] == [_NAMED, _NO_OWNER]
     assert stats["no_owner_on_record"] == [_NO_OWNER]
-    assert stats["unverified"] == [_NO_ECHO]
-    assert stats["transient"] == []
+    assert stats["transient"] == [_NO_ECHO]
+    assert stats["parcel_mismatch"] == []
 
 
 async def test_a_tripped_breaker_is_recorded_before_it_raises(monkeypatch):
@@ -361,3 +361,35 @@ async def test_a_parcel_id_that_can_never_be_requested_is_not_promised_a_lookup(
     ed = (await _rows(db, ids))["mailed"].enrichment_data
     assert "owner_lookup_deferred" not in ed and "owner_lookup_outcome" not in ed
     assert not summary.get("owner_deferred")
+
+
+async def test_both_king_passes_ask_about_the_largest_balances_first(
+    db, business_user, redis_client, monkeypatch,
+):
+    """The lookup budget reaches a few hundred parcels; it must be spent on the
+    leads the tax plan cap delivers (largest balance first), not in set order."""
+    _lease(monkeypatch, admitted=True)
+    job_id, ids = await _tax_job(db, business_user)
+    for key, amount in (("mailed", "31729.74"), ("unmailed", "14.71"), ("sibling", "14.71")):
+        await db.execute(text("UPDATE results SET delinquent_amount = :a WHERE id = :i"),
+                         {"a": amount, "i": ids[key]})
+    await db.commit()
+    phase1_order: list[list[str]] = []
+    owner_order: list[str] = []
+
+    async def _phase1_records_order(parcel_ids, **kw):
+        phase1_order.append(list(parcel_ids))
+        return {}
+
+    def _get(url, **k):
+        owner_order.append(url.rsplit("=", 1)[-1])
+        return _Resp(200, _page(url[-10:], None))
+
+    monkeypatch.setattr(kca, "_batch_enrich_king_county", _phase1_records_order)
+    monkeypatch.setattr(kca, "safe_get", _get)
+
+    await asyncio.to_thread(_enrich, job_id, redis_client)
+
+    # The reverse of parcel-id order, so a plain sort cannot pass this.
+    assert phase1_order == [[_NAMED, _NO_OWNER]]
+    assert owner_order == [_NAMED, _NO_OWNER]

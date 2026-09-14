@@ -1689,18 +1689,14 @@ def run_scrape_job(self, job_id: str) -> None:
                         {"jid": job_id, "uid": str(job.user_id),
                          "key": DELIVERY_EXCLUDED_KEY, "reason": OVER_QUOTA},
                     )
-                    _capped_ids = [
-                        str(_row[0]) for _row in db.execute(
-                            sa_text(
-                                "WITH ranked AS (  SELECT id, row_number() OVER (    ORDER BY party_name, date_recorded, id  ) AS rn  FROM results  WHERE job_id = :jid AND user_id = CAST(:uid AS uuid)    AND is_duplicate = false    AND {addr_rule}) UPDATE results r SET enrichment_data =   (CASE WHEN jsonb_typeof(COALESCE(r.enrichment_data, '{{}}')::jsonb) = 'object' THEN COALESCE(r.enrichment_data, '{{}}')::jsonb ELSE '{{}}'::jsonb END    || jsonb_build_object(:key, :reason))::json FROM ranked WHERE r.id = ranked.id AND ranked.rn > :remaining RETURNING r.id".format(
-                                    addr_rule=address_actionable_sql("results")
-                                )
-                            ),
-                            {"jid": job_id, "uid": str(job.user_id),
-                             "key": DELIVERY_EXCLUDED_KEY, "reason": OVER_QUOTA,
-                             "remaining": _remaining},
-                        ).fetchall()
-                    ]
+                    # Tax delinquent ranks largest balance first and code violations
+                    # open-then-newest (plan_cap.py); others keep party_name, date, id.
+                    from src.workers.tasks_helpers.plan_cap import mark_over_quota_rows
+
+                    _capped_ids = mark_over_quota_rows(
+                        db, job_id=job_id, user_id=str(job.user_id),
+                        remaining=_remaining, record_type=config.record_type,
+                    )
                     if _capped_ids:
                         # A capped row's SAME-RUN siblings must inherit the
                         # exclusion (Codex P1). The cap ranks non-duplicates only,

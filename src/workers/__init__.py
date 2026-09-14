@@ -44,6 +44,8 @@ app = Celery(
         # doing nothing at all in production. Third time this trap has been hit
         # here; see batch_tasks and nts_crawler above (Codex).
         "src.workers.mailing_recovery",
+        # Deferred King tax owner-name recovery: a BEAT task, same trap as above.
+        "src.workers.owner_recovery",
     ],
 )
 

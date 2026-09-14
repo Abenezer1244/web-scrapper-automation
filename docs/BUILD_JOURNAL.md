@@ -60,6 +60,32 @@ The live Dashboard page carries the parcel cell. Prod has 0 rows with `parcel_lo
 
 ---
 
+## 2026-09-14 - King code violations shipped: merged, deployed, 1,782 prod rows repaired
+
+**Built / Shipped:** #299 `89d3b0c` (semantics, located parcel, owner pass, skip trace gate, repair
+script, live-pass test), #301 `0bc9ef5` (plan cap ranks code violations open cases first, newest first;
+stacked on the King tax session's #300, which merged first), FE #134 `de79fc7` (Parcel fallback, Violation
+and Case #, "Seattle only" / "Tacoma only" labels, honest skip-trace tooltip). Railway api + worker SUCCESS
+at `0bc9ef5`; Vercel production success; live /coverage shows both labels.
+
+**Applied to prod (owner "Do all"):** `scripts/backfill_king_code_violation_owner.py --owners --apply`
+from a clean `origin/main` checkout, via the Redis public URL wrapper. 936/936 owner pages resolved (no
+breaker), 1,782 written, 0 guard skips; 1,159 named, 623 labels cleared (no exact parcel). Read-only
+after: parcel_id still 0, shown parcel 1,159, owner 1,159 (654 of 1,060 non-duplicate leads), category
+key 1,782 (1,334 non-empty), mailing unchanged 1,298, skip trace untouched, 0 queued. 5/5 random named rows
+match eRealProperty name + site address and the rendered tax-bill mailing.
+
+**Tried / Decided:** Codex wanted "Open Duplicate" removed from delivery; kept it ranked last (removal
+changes what customers receive, left to the owner). Street-only matches (141) kept mailing after 5/5
+verified; they still show no parcel/owner per the exact-only decision. Tooltip copy took three Codex rounds;
+its r2 P1 was refuted with the code-violation gate.
+
+**Failed / Blocked:** the repair's shell wrapper and two background waiters were killed for low memory;
+the Python child survived and finished (checked by PID before any retry, so no double run). One CI run
+failed only on the SBOM artifact upload (403); rerun passed.
+
+**Facts learned:** "H5 CAPITAL - SEATTLE REAL E" is a real King owner name, so " - " is not a label test.
+
 ## 2026-09-14 - King code violations: Parcel ID N/A, a complaint label as Party Name, and "King County" meaning Seattle
 
 **Built / Shipped (branches, not merged):** backend `investigate/king-code-violation-parcel` `2c80364`,

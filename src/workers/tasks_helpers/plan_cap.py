@@ -11,7 +11,7 @@ from src.api.lead_actionability import (
     address_actionable_sql,
 )
 
-# Every record type except tax delinquent ranks by who and when, which also keeps
+# Every record type without its own order below ranks by who and when, which also keeps
 # an estate's records together.
 _DEFAULT_RANK_ORDER = "party_name, date_recorded, id"
 
@@ -27,9 +27,29 @@ _TAX_RANK_ORDER = (
 )
 
 
+# Code violation: open cases before cases the city already settled, the newest case
+# first, then a stable key. King (Seattle SDCI) code violations carry no owner at
+# scrape time and get one only for exactly located parcels inside a time budget, so
+# ranking by party_name would let enrichment timing decide which leads are billed.
+# "Completed" / "Open Duplicate" are SDCI's settled statuses (the same set auto skip
+# trace skips); they rank last, they are not removed. Tacoma uses other status words,
+# so the settled bucket is scoped to the SDCI source. Every input is fixed at scrape
+# time, so a watchdog re-run ranks the same way.
+_CODE_VIOLATION_RANK_ORDER = (
+    "CASE WHEN enrichment_data->>'source' = 'seattle_sdci_code_violations'"
+    " AND enrichment_data->>'status' IN ('Completed', 'Open Duplicate') THEN 1 ELSE 0 END,"
+    " date_recorded_parsed DESC NULLS LAST, id"
+)
+
+_RANK_ORDER_BY_RECORD_TYPE = {
+    "tax_delinquent": _TAX_RANK_ORDER,
+    "code_violation": _CODE_VIOLATION_RANK_ORDER,
+}
+
+
 def cap_rank_order_sql(record_type: str | None) -> str:
     """ORDER BY body the plan cap ranks a job's deliverable leads by."""
-    return _TAX_RANK_ORDER if record_type == "tax_delinquent" else _DEFAULT_RANK_ORDER
+    return _RANK_ORDER_BY_RECORD_TYPE.get(record_type or "", _DEFAULT_RANK_ORDER)
 
 
 def mark_over_quota_rows(db, *, job_id: str, user_id: str, remaining: int,
@@ -42,7 +62,7 @@ def mark_over_quota_rows(db, *, job_id: str, user_id: str, remaining: int,
     a second batch). Rows with no address are never ranked, never marked and never
     billed. The caller clears this job's previous marks first and commits.
     """
-    statement = (  # noqa: S608 -- splices only the two module ORDER BY constants and address_actionable_sql; every value is bound
+    statement = (  # noqa: S608 -- splices only the module ORDER BY constants and address_actionable_sql; every value is bound
         "WITH ranked AS ("
         "  SELECT id, row_number() OVER (ORDER BY {order}) AS rn"
         "  FROM results"

@@ -68,6 +68,8 @@ _CANDIDATES_SQL = """
       AND sc.record_type = :record_type
       AND j.status = 'done'
       AND (CAST(:job_id AS text) IS NULL OR j.id = CAST(:job_id AS uuid))
+      AND r.is_duplicate = false
+      AND r.enrichment_data::jsonb->>'delivery_excluded_reason' IS NULL
       AND coalesce(btrim(r.property_address), '') IN ('', '(enrichment unavailable)')
       AND btrim(coalesce(r.parcel_id, '')) ~ '^[0-9]{10}$|^[0-9]{12}$'
     ORDER BY r.id
@@ -91,8 +93,16 @@ _UPDATE_SQL = """
       AND coalesce(btrim(property_address), '') IN ('', '(enrichment unavailable)')
       AND mailing_address IS NOT DISTINCT FROM :old_mail
       AND (enrichment_data IS NULL OR jsonb_typeof(enrichment_data::jsonb) IN ('object', 'null'))
+      AND is_duplicate = false
+      AND enrichment_data::jsonb->>'delivery_excluded_reason' IS NULL
       AND (CAST(:resolved_pin AS text) IS NULL
            OR coalesce(enrichment_data::jsonb->>'resolved_parcel_id', '') IN ('', :resolved_pin))
+      -- The PIN the decision was made about is still the one this row looks up (a row
+      -- this run resolves still looks up its raw parcel until the write lands).
+      AND (CASE WHEN enrichment_data::jsonb->>'resolved_by' = 'rpacct_account_number'
+                THEN enrichment_data::jsonb->>'resolved_parcel_id' ELSE btrim(parcel_id) END)
+          = (CASE WHEN CAST(:resolved_pin AS text) IS NOT NULL THEN btrim(parcel_id)
+                  ELSE CAST(:lookup_pin AS text) END)
       AND EXISTS (SELECT 1 FROM jobs j WHERE j.id = results.job_id AND j.status = 'done')
 """
 
@@ -191,7 +201,7 @@ def apply(db, decisions: list[Decision], snapshots: dict[str, str], *, commit_ev
             "f_owner_state": flags["owner_state"], "f_absentee": flags["absentee_owner"],
             "f_out_of_state": flags["out_of_state_owner"], "patch": json.dumps(patch),
             "rid": row.id, "uid": row.user_id, "raw_pid": row.raw_pid, "old_mail": row.mailing_address,
-            "resolved_pin": d.resolved_pin,
+            "resolved_pin": d.resolved_pin, "lookup_pin": d.lookup_pin,
         })
         counts["written" if result.rowcount else "skipped_by_write_guard"] += 1
         if i % commit_every == 0:

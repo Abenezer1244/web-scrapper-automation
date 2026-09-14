@@ -399,10 +399,12 @@ def _apply(db, by_parcel: dict, parcels: list[str], enriched: dict, stats: dict)
         mailing = (data.get("mailing_address") or "").strip() or None
         lookup = data.get("mailing_lookup") or "error"
 
-        if mailing:
+        if data.get("parcel_lookup") == "mismatch":
+            # Checked FIRST: a page that names another parcel says nothing about this one,
+            # so no mailing address it carries may be taken.
+            outcome, mailing = "parcel_mismatch", None
+        elif mailing:
             outcome = "found"
-        elif data.get("parcel_lookup") == "mismatch" and not data.get("mailing_lookup"):
-            outcome = "parcel_mismatch"      # the page names another parcel: settled
         elif lookup == "none":
             outcome = "none"                 # source answered: no mailing address
         elif lookup == "identity_unverified":

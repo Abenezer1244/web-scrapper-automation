@@ -26,7 +26,7 @@ from src.db.models import Job, Result, ScraperConfig, User
 from src.scrapers.enrichment import king_condo_units as kc
 from src.scrapers.enrichment.source_health import KING_EREALPROPERTY
 from src.workers import property_recovery as prc
-from tests.test_king_condo_unit_situs import G204, _condo_zip, _gis_row
+from tests.test_king_condo_unit_situs import G204, _condo_zip, _gis_row, _unit
 
 pytestmark = pytest.mark.asyncio
 
@@ -278,3 +278,36 @@ async def test_a_job_marks_only_the_leads_no_source_settled(db, business_user, r
     assert pb.get("property_lookup_outcome") == "no_site_address" and "property_lookup_deferred" not in pb
     assert "property_lookup_deferred" not in (await _get(db, filled)).enrichment_data
     assert "property_lookup_deferred" not in (await _get(db, vacant)).enrichment_data
+
+
+async def test_a_non_condo_page_answer_never_borrows_a_neighbouring_parcels_city(db, business_user, tmp_path,
+                                                                                monkeypatch):
+    job_id = await _job(db, business_user)
+    rid = await _lead(db, business_user, job_id, "6000000020")
+    # A real condo unit on the SAME major in the same tick puts that complex in the lookup.
+    await _lead(db, business_user, job_id, "6000000010")
+    monkeypatch.setattr(kc, "cached_extract", lambda *a, **kw: (_condo_zip(tmp_path, [
+        _unit("600000", "0010", "5 UNIT ST #1 98032", "98032", "1")]), "2026-09-14"))
+    # major+0000 is a different real parcel here, in the same ZIP: its city must not be taken.
+    _gis(monkeypatch, {"6000000000": _gis_row("1 OTHER ST", "KENT", "98032")})
+    _page(monkeypatch, lambda p: {"property_address": "17 LOT ST 98032", "parcel_lookup": "verified"})
+
+    await asyncio.to_thread(_tick)
+    r = await _get(db, rid)
+    assert r.property_address == "17 LOT ST 98032" and r.property_city is None
+
+
+async def test_a_result_for_a_pin_that_was_not_requested_writes_nothing(db, business_user, monkeypatch):
+    job_id = await _job(db, business_user)
+    rid = await _lead(db, business_user, job_id, "6000000030")
+    _gis(monkeypatch, {})
+
+    async def _erp(parcel_ids, **kw):
+        kw["stats"]["requested_pids"] = []
+        return {p: {"property_address": "9 CACHED ST 98001", "parcel_lookup": "verified"} for p in parcel_ids}
+
+    monkeypatch.setattr("src.scrapers.enrichment.king_county_assessor.batch_enrich_king_county", _erp)
+    stats = await asyncio.to_thread(_tick)
+    assert stats["unreached"] == 1
+    r = await _get(db, rid)
+    assert r.property_address is None and "property_recovery_attempts" not in r.enrichment_data

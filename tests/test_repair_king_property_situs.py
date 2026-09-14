@@ -86,11 +86,11 @@ async def _job(db, user, *, county="king", status="done"):
     return job_id
 
 
-def _row(db, user, job_id, parcel, *, mailing=None):
+def _row(db, user, job_id, parcel, *, mailing=None, fp=None):
     rid = str(uuid.uuid4())
     db.add(Result(id=rid, user_id=user.id, job_id=job_id, party_name="DOE JANE", parcel_id=parcel,
                   property_address=None, mailing_address=mailing, skip_trace_status="not_attempted",
-                  is_duplicate=False, dedup_hash=f"hash-{parcel}", source_fingerprint=f"fp-{parcel}",
+                  is_duplicate=False, dedup_hash=f"hash-{parcel}", source_fingerprint=fp or f"fp-{parcel}",
                   enrichment_data={"source": "king_landmark_json", "instrument_number": "20260709000383"}))
     return rid
 
@@ -134,6 +134,10 @@ async def test_dry_run_then_apply_then_rerun(db, business_user, tmp_path, monkey
     running_row = _row(db, business_user, running_job, "0268000490")
     other_county = await _job(db, business_user, county="pierce")
     pierce_row = _row(db, business_user, other_county, "0268000490")
+    dup_row = _row(db, business_user, job_id, "0268000490", fp="fp-dup")
+
+    await db.commit()
+    await db.execute(text("UPDATE results SET is_duplicate = true WHERE id = :i"), {"i": dup_row})
     await db.commit()
     rp, condo, _ = _setup(tmp_path, monkeypatch)
     report = tmp_path / "evidence.jsonl"
@@ -170,6 +174,7 @@ async def test_dry_run_then_apply_then_rerun(db, business_user, tmp_path, monkey
 
     assert (await _get(db, running_row)).property_address is None
     assert (await _get(db, pierce_row)).property_address is None
+    assert (await _get(db, dup_row)).property_address is None
     job_after = (await db.execute(text("SELECT billed_count, billing_applied_at, record_count FROM jobs "
                                        "WHERE id = :j"), {"j": job_id})).first()
     assert tuple(job_after) == tuple(job_before)

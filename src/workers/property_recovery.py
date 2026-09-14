@@ -140,6 +140,7 @@ _WRITE_SQL = f"""
                                THEN r.enrichment_data::jsonb ELSE '{{}}'::jsonb END)
                          || CAST(:payload AS jsonb))::json
     WHERE r.id = :rid AND r.user_id = :uid AND r.parcel_id = :raw_pid
+      AND {_LOOKUP_PIN} = :lookup_pin
       AND r.mailing_address IS NOT DISTINCT FROM :old_mail
       AND {_ELIGIBLE_ROW}
       AND EXISTS (SELECT 1 FROM jobs j JOIN scraper_configs sc ON sc.id = j.scraper_config_id
@@ -229,10 +230,12 @@ def _tick(stats: dict) -> dict:
 
         # 1) The condo extract: no request to King's pages.
         units = {}
+        unit_pins: set[str] = set()   # the extract confirms these PINs are condo units
         resolved = resolve_units(set(pins))
         snapshot = None
         if resolved is not None:
             answers, snapshot = resolved
+            unit_pins = {p for p, s in answers.items() if s.status != "absent"}
             units = {p: s for p, s in answers.items() if s.status == "found" and s.zip}
         complex_gis = {}
         if units:
@@ -287,12 +290,20 @@ def _tick(stats: dict) -> dict:
             prop = (data.get("property_address") or "").strip() or None
             lookup = data.get("parcel_lookup")
             for row in by_pin[pin]:
-                if prop and lookup == "verified":
-                    # A unit's page line has no city; take it only with the same corroboration.
+                if pin not in requested:
+                    # No request for this PIN was issued this tick: nothing it returned is an
+                    # answer about it. Rotate, never fill or settle.
+                    stats["unreached"] += 1
+                    _rotate(db, [row])
+                elif prop and lookup == "verified":
+                    # A unit's page line has no city. Only a parcel the extract confirms is a
+                    # condo unit may borrow its complex's locality: for any other parcel,
+                    # major+0000 can be a different real parcel.
                     tail = _TRAILING_ZIP_RE.search(prop)
                     street = prop[: tail.start()] if tail else prop
-                    fill = compose_fill(UnitSitus("found", street=street, zip=tail.group(1) if tail else None),
-                                        complex_gis.get(complex_pin(pin)))
+                    fill = (compose_fill(UnitSitus("found", street=street, zip=tail.group(1) if tail else None),
+                                         complex_gis.get(complex_pin(pin)))
+                            if pin in unit_pins else None)
                     stats[_write(db, row, "found_page",
                                  address=fill.property_address if fill else prop,
                                  city=fill.city if fill else None, state=fill.state if fill else None,
@@ -302,11 +313,8 @@ def _tick(stats: dict) -> dict:
                     stats[_write(db, row, "no_site_address")] += 1
                 elif lookup == "mismatch":
                     stats[_write(db, row, "parcel_mismatch")] += 1
-                elif pin in requested:
-                    stats[_write(db, row, "transient")] += 1
                 else:
-                    stats["unreached"] += 1
-                    _rotate(db, [row])
+                    stats[_write(db, row, "transient")] += 1
 
     _logger.info("Property recovery: %s", {k: v for k, v in stats.items() if v})
     return stats
@@ -325,6 +333,8 @@ def _rotate(db, rows: list) -> None:
             db.commit()
         except Exception as exc:  # noqa: BLE001
             db.rollback()
+            if type(exc).__name__ in ("SoftTimeLimitExceeded", "TimeLimitExceeded"):
+                raise
             _logger.warning("Property recovery: could not rotate row %s: %s", str(row.id)[:8], str(exc)[:120])
 
 
@@ -361,6 +371,7 @@ def _write(db, row, outcome: str, *, address: str | None = None, city: str | Non
     try:
         result = db.execute(sa_text(_WRITE_SQL), {
             "rid": row.id, "uid": row.user_id, "raw_pid": row.parcel_id, "old_mail": row.mailing_address,
+            "lookup_pin": row.pin,
             "address": address, "city": city, "state": state, "zip": zip_,
             "f_owner_state": flags.get("owner_state"), "f_absentee": flags.get("absentee_owner"),
             "f_out_of_state": flags.get("out_of_state_owner"),
@@ -370,6 +381,8 @@ def _write(db, row, outcome: str, *, address: str | None = None, city: str | Non
         return label if result.rowcount else "stale"
     except Exception as exc:  # noqa: BLE001
         db.rollback()
+        if type(exc).__name__ in ("SoftTimeLimitExceeded", "TimeLimitExceeded"):
+            raise
         _logger.warning("Property recovery: write failed for row %s: %s", str(row.id)[:8], str(exc)[:160])
         return "errors"
 

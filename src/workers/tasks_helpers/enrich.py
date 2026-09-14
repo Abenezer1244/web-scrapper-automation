@@ -464,6 +464,10 @@ _SQL_MARK_PROPERTY_DEFERRED = f"""
        SET enrichment_data = {ED_MERGE_SQL}
      WHERE id = ANY(CAST(:ids AS uuid[])) AND user_id = CAST(:uid AS uuid)
        AND job_id = CAST(:jid AS uuid) AND {ED_MERGEABLE_SQL} AND {_PROPERTY_IS_EMPTY}
+       -- Re-checked in SQL, not only on this job's ORM copy: a sweep may have settled
+       -- the row meanwhile, and re-marking it would start a pointless retry.
+       AND coalesce(enrichment_data::jsonb->>'property_lookup_outcome', '')
+           NOT IN ('found', 'no_site_address', 'parcel_mismatch', 'gave_up')
 """
 
 
@@ -1153,7 +1157,9 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                                     "resolved_by": data.get("resolved_by"),
                                 }}
                             continue
-                        if (not prop and not res.property_address
+                        if (not prop
+                                and (not res.property_address
+                                     or res.property_address == "(enrichment unavailable)")
                                 and data.get("parcel_lookup") in ("verified", "mismatch")):
                             # The page answered: it names this parcel and has no site
                             # address, or it names a different parcel. Either way asking

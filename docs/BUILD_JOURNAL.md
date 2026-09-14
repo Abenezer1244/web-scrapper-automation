@@ -19,6 +19,47 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-14 - King tax delinquent: 0 owner names, "N/A" everywhere, and a plan cap that billed random rows
+
+**Built / Shipped (all merged to main unless noted):** #298 `873bb7b` per-lead owner lookup state
+(`owner_lookup_deferred` + reason, or `owner_lookup_outcome=not_on_record`), owner pass no longer gated on
+mailing, honest per-field completion copy. #300 `d4a7f1f` tax plan cap ranks `delinquent_amount DESC`, older
+year, parcel, id (`tasks_helpers/plan_cap.py`); King tax lookups walk the same order. #302 `ce31d5f`
+`parcel_page_is_for` is strict: a page that names no parcel is a failed, deferred, breaker-counted lookup,
+never a source of an owner or address. #303 `92de366` `src/workers/owner_recovery.py` beat sweep (15 min,
+120 parcels, kill switch `OWNER_RECOVERY_ENABLED`, fail-closed token lock, delivered leads only, largest
+balance first, fill-only guarded UPDATE). Open: #304 `scripts/requeue_king_tax_owner_recovery.py` (marks
+pre-#298 leads for the sweep, dry-run default, `--jobs`); FE `fix/tax-results-honest-states` (Pending / Not
+on record / No site address labels, Oldest Tax Year replaces the empty Date column).
+
+**Tried / Decided:** Owner chose largest balance first for the tax cap and closing the parcel-echo gap.
+Enrichment cannot target the delivered rows while the cap ranks by the field enrichment fills (Codex P1,
+verified), so the cap moved to scrape-time fields. Rejected a new global King rate limiter: every
+eRealProperty pass shares one SourceAdmission lease and self-paces. Date stays NULL (receivable roll has
+no event date; #214). Street-only / blank site addresses stay NULL, never the mailing address.
+
+**Failed / Blocked:** Local portable Postgres PANICked twice mid-suite (`could not truncate file ...
+Permission denied`, a Windows file lock): 100+ fake F/E, reset DB and rerun clean. A `codex exec` prompt
+over 32 KB failed "Argument list too long"; pipe it on stdin (`codex exec ... - < file`). One Codex diff
+review raised two P1s that were artifacts of main moving mid-review (another session merged #299/#301).
+No live King job has run on the new code yet; FE visual check delegated.
+
+**Caught & fixed:** my owner block dropped the blank-name guard before assigning; digit-free ids were
+marked deferred with reason "complete"; `parcel_page_is_for` trusted interstitials for 10-digit PINs;
+mutated `plan_cap.py` left on disk after a mutation check (untracked file, `git checkout` cannot restore
+it; restored from a saved copy); owner sweep lock failed open and released unconditionally.
+
+**Pending / Handoff:** Owner approval to apply #304 per job (prod dry run: 24,830 leads / 7 jobs; job
+b2f2ecd5 = 840). Merge FE after visual verification. Session 86 (bl-wt-kingprefc) owns condo unit situs,
+12-digit PID resolution and a property-address sweep. Verify `OPS_ALERT_EMAIL` is set in prod (canary
+alerts are the loud path for a King layout change).
+
+**Facts learned:** King balance/oldest year 6/6 exact vs Socrata dsv3-ct3e (principal only). eRealProperty
+has an owner for every parcel sampled; the delivered set's 216 unmailed leads never got an owner lookup.
+The live Dashboard page carries the parcel cell. Prod has 0 rows with `parcel_lookup=echo_absent`.
+
+---
+
 ## 2026-09-14 - King code violations: Parcel ID N/A, a complaint label as Party Name, and "King County" meaning Seattle
 
 **Built / Shipped (branches, not merged):** backend `investigate/king-code-violation-parcel` `2c80364`,

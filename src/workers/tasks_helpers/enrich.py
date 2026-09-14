@@ -351,13 +351,18 @@ def _king_lookup_pin(res, default: str | None = None) -> str:
 # still empty IN THE DATABASE, and enrichment_data is merged key by key rather than
 # replaced. The ORM object is then synced to what was committed, so later passes in
 # this job see the real value and nothing is flushed twice.
-_ED_IS_OBJECT = "(enrichment_data IS NULL OR json_typeof(enrichment_data) = 'object')"
+# enrichment_data merges only into a JSON object. A JSON null is treated as empty; an
+# array or scalar (damaged by an old merge bug) is skipped, never replaced: jsonb || on
+# anything but an object builds an array.
+ED_MERGEABLE_SQL = "(enrichment_data IS NULL OR jsonb_typeof(enrichment_data::jsonb) IN ('object', 'null'))"
+ED_MERGE_SQL = ("((CASE WHEN jsonb_typeof(enrichment_data::jsonb) = 'object' "
+                "THEN enrichment_data::jsonb ELSE '{}'::jsonb END) || CAST(:patch AS jsonb))::json")
 _PROPERTY_IS_EMPTY = ("coalesce(btrim(property_address), '') IN ('', '(enrichment unavailable)')")
 
 _SQL_RESOLVE_ACCOUNT = f"""
     UPDATE results
-       SET enrichment_data = (COALESCE(enrichment_data, '{{}}'::json)::jsonb || CAST(:patch AS jsonb))::json
-     WHERE id = :rid AND user_id = :uid AND {_ED_IS_OBJECT}
+       SET enrichment_data = {ED_MERGE_SQL}
+     WHERE id = :rid AND user_id = :uid AND {ED_MERGEABLE_SQL}
        AND (enrichment_data->>'resolved_parcel_id') IS NULL
  RETURNING enrichment_data
 """
@@ -368,15 +373,15 @@ _SQL_FILL_PROPERTY = f"""
            property_city = COALESCE(property_city, :city),
            property_state = COALESCE(property_state, :state),
            property_zip = COALESCE(property_zip, :zip),
-           enrichment_data = (COALESCE(enrichment_data, '{{}}'::json)::jsonb || CAST(:patch AS jsonb))::json
-     WHERE id = :rid AND user_id = :uid AND {_ED_IS_OBJECT} AND {_PROPERTY_IS_EMPTY}
+           enrichment_data = {ED_MERGE_SQL}
+     WHERE id = :rid AND user_id = :uid AND {ED_MERGEABLE_SQL} AND {_PROPERTY_IS_EMPTY}
  RETURNING property_address, property_city, property_state, property_zip, enrichment_data
 """
 
 _SQL_MARK_PROPERTY = f"""
     UPDATE results
-       SET enrichment_data = (COALESCE(enrichment_data, '{{}}'::json)::jsonb || CAST(:patch AS jsonb))::json
-     WHERE id = :rid AND user_id = :uid AND {_ED_IS_OBJECT} AND {_PROPERTY_IS_EMPTY}
+       SET enrichment_data = {ED_MERGE_SQL}
+     WHERE id = :rid AND user_id = :uid AND {ED_MERGEABLE_SQL} AND {_PROPERTY_IS_EMPTY}
  RETURNING enrichment_data
 """
 

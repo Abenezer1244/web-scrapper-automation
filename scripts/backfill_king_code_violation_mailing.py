@@ -97,7 +97,8 @@ def run(db, *, apply_writes: bool, limit: int | None, report: Path | None,
         mail = d.get("mailing_address")
         flags = compute_owner_flags(r.property_address, mail, property_city=r.property_city,
                                     property_state=r.property_state, property_zip=r.property_zip)
-        payload = {key: d[key] for key in ("kc_pin_status", "kc_pin", "kc_parcel_address") if key in d}
+        payload = {key: d[key] for key in ("kc_pin_status", "kc_pin", "kc_parcel_address",
+                                           "kc_pin_match") if key in d}
         payload["kc_pin_checked_at"] = now
         if d.get("kc_pin"):
             payload["kc_pin_source"] = SOURCE

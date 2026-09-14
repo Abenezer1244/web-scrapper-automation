@@ -1,3 +1,46 @@
+# King Code Violation: Parcel ID N/A + Party Name semantics (2026-09-14)
+
+Branch `investigate/king-code-violation-parcel`, worktree `C:/Users/Windows/bl-wt-kingcv` (off main `dbe8b44`).
+Status: DIAGNOSIS DONE (read-only). NO code written. Awaiting owner decisions + plan approval.
+
+## Proven findings
+- Only King CV job ever: `fbd872b6` (config `74db2d63` "sdfdhgfj", 08/13-09/12/2026, done, manual,
+  skip_trace_enabled=false). 1,782 rows = 1,057 new (`record_count`) + 722 already delivered (+3 weak).
+- Completeness: date 100%, party_name non-null 100% but REAL OWNER 0%, parcel_id 0%, kc_pin 1,389 (77.9%),
+  property address 1,779 (99.8%), mailing 1,298 (72.8%), case id (recordnum) 100%, status 100%,
+  violation category only inside party_name, phone/email 0%.
+- Source: Seattle SDCI `data.seattle.gov ez4a-iug7`. City of Seattle ONLY. No parcel/owner/mailing field.
+- Parcel = Case B. PR #283 locates PIN (strict point-in-polygon + street + ZIP, units rejected) into
+  `enrichment_data.kc_pin`; never `parcel_id`, correctly: `_collapse_groups` (dedup.py:634) and reuse gate
+  (enrich.py:156) require signature(current parcel_id, address) == stored dedup_hash; writing parcel_id = double billing.
+  Defect = the located PIN is never surfaced to API/UI/export.
+- Mailing: 1,265 king_rpacct + 33 king_tax_bill, 100% via kc_pin. Legit.
+- Party name: scraper builds `"{recordtypedesc or recordtype} - {addr}"` on purpose. recordtypedesc (the
+  category) is stored nowhere else. No King source in use has owner names (RPAcct extract is NoName; GIS layer none).
+- Tracerfy: 0 pending rows for ANY code_violation ever; 0 spend. Gate works today only by string sniffing the label.
+- Dedup: billing identity is address (parcel NULL); 1,782 cases on 1,462 addresses; separate cases at one property collapse by design.
+- Codex GATE FAIL (verified): coverage labeling P1; party_name feeds source_fingerprint (tasks.py:892) and weak NAME|DATE hash (3 rows) P1.
+
+## Owner decisions (2026-09-14)
+- Parcel ID: show located PIN for STRICT (street + ZIP) matches only; never write parcel_id.
+- Coverage: label code violations as Seattle (King County).
+- Skip trace: code_violation rows with no real owner stay excluded (explicit record-type policy).
+- Party name: owner asked "don't King County display real party names?" -> VERIFIED yes: eRealProperty
+  Detail.aspx?ParcelNbr=9138100481 shows Name "7011 ROOSEVELT WAY NE LLC"; existing lease-guarded,
+  parcel-echo-checked `batch_extract_king_owners` can resolve it by kc_pin.
+
+## Proposed Phase 1 (backend, <=5 files) - NOT STARTED
+- [ ] Scraper: stop writing the label into party_name; store `violation_category` (recordtypedesc) +
+      `violation_type` (recordtype); `raw_html_hash` from recordnum (fingerprint no longer reads party_name).
+      Addressless weak-hash rows (3/month) handled per Codex before merge.
+- [ ] Read-side located parcel on ResultRow + export (strict matches only, with source), never parcel_id/property_key/dedup.
+- [ ] Export `code_violation_type` prefers category.
+- [ ] Explicit record-type skip-trace policy: code_violation without a resolved owner is never traced.
+- [ ] Tests for each; ruff + full suite on isolated DB; Codex gate.
+## Phase 2: live owner pass for King CV (kc_pin strict -> batch_extract_king_owners -> party_name + owner_source), budgeted
+## Phase 3: historical repair dry-run (category via Socrata refetch by recordnum; owners via paced eRealProperty on ~1,200 PINs; label party_name cleared only where owner resolved or with approval). Apply needs approval.
+## Phase 4: FE columns (Violation Type, Case ID, Parcel) + Seattle label; Playwright desktop/mobile
+
 # SSE "Too many concurrent streams (max 5)" (2026-09-13)
 
 Branches: BE `investigate/sse-stream-cap` (worktree `bridgeleads-worktrees/sse-stream-cap`),

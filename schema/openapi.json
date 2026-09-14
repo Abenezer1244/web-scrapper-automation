@@ -2587,6 +2587,17 @@
             ],
             "title": "Legal Description"
           },
+          "located_parcel_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Located Parcel Id"
+          },
           "mailing_address": {
             "anyOf": [
               {

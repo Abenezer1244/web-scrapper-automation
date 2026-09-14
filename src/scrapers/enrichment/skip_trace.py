@@ -815,6 +815,36 @@ def legacy_cache_locality(result) -> tuple[str | None, str | None]:
     return parsed["city"], parsed["state"]
 
 
+# enrichment_data.source of the code-violation scrapers (king_wa_code_violation,
+# pierce_wa_code_violation).
+CODE_VIOLATION_SOURCES = frozenset({"seattle_sdci_code_violations", "tacoma_code_violations"})
+
+
+def code_violation_owner_is_known(result) -> bool:
+    """False only for a code-violation row with no county-sourced owner name.
+
+    Every other row returns True (this gate does not apply to it).
+    """
+    ed = getattr(result, "enrichment_data", None)
+    if not isinstance(ed, dict) or ed.get("source") not in CODE_VIOLATION_SOURCES:
+        return True
+    if not (getattr(result, "party_name", None) or "").strip():
+        return False
+    if ed["source"] == "seattle_sdci_code_violations":
+        from src.scrapers.enrichment.king_parcel_locate import OWNER_SOURCE
+        from src.utils.located_parcel import located_parcel_id
+
+        # The name must have been read for the parcel the row is CURRENTLY located on,
+        # and that location must still be exact: stale owner metadata left behind by a
+        # changed location would trace (and bill) the wrong person (Codex P1).
+        pin = located_parcel_id(ed)
+        return (ed.get("owner_source") == OWNER_SOURCE
+                and pin is not None and ed.get("owner_pin") == pin)
+    # Tacoma: no owner enrichment exists yet, so no row can pass. A future Pierce owner
+    # pass defines its own proof here rather than borrowing King's (Codex r2 P1).
+    return False
+
+
 # ─── Helper: build a PendingSkipTraceRow payload from a Result ─────────────
 
 def build_pending_row_payload(result) -> dict | None:
@@ -834,6 +864,15 @@ def build_pending_row_payload(result) -> dict | None:
     # "(enrichment unavailable)" placeholder is not one (lead_actionability).
     prop = (result.property_address or "").strip()
     if not prop or prop == "(enrichment unavailable)":
+        return None
+
+    # A code-violation case names a complaint, not a person. It is traceable only once
+    # enrichment has named the property's owner from a county record (owner_source).
+    # Keyed on the STORED source, not on what party_name happens to look like: the
+    # label check below only worked while the scrapers wrote the case label into
+    # party_name, and a blank party_name would otherwise fall through to a paid
+    # address-only trace (owner decision 2026-09-14: keep these excluded).
+    if not code_violation_owner_is_known(result):
         return None
 
     # Post-M9 audit gate: reject records whose party_name is a

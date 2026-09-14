@@ -29,7 +29,14 @@ Status: DIAGNOSIS DONE (read-only). NO code written. Awaiting owner decisions + 
   Detail.aspx?ParcelNbr=9138100481 shows Name "7011 ROOSEVELT WAY NE LLC"; existing lease-guarded,
   parcel-echo-checked `batch_extract_king_owners` can resolve it by kc_pin.
 
-## Proposed Phase 1 (backend, <=5 files) - NOT STARTED
+## Review (2026-09-14, owner said "Proceed with all")
+- [x] Phase 1 backend `2c80364`: scraper semantics, located tiers, API/CSV located parcel, skip trace gate. Full suite green (4 batches), ruff, OpenAPI check. Codex r4 GATE PASS.
+- [x] Phase 2 live owner pass (enrich.py code_violation block, existing owner-only path).
+- [x] Phase 3 repair script + prod DRY-RUN only (tiers exact 1,159 / street_only 141 / condo 89 / none 393; 936 PINs). Sample owners 6/6; 5/5 verified at county sources. APPLY NEEDS OWNER APPROVAL.
+- [x] Phase 4 FE `3fe82ac` (bridgeleads-web): Parcel fallback, Violation + Case #, coverage notes. tsc/eslint clean, Playwright desktop + mobile, CSV via local API. Codex GATE PASS.
+- [ ] Merge BE, deploy, then FE; then approved repair `--owners --apply` via Redis public URL wrapper.
+
+## Proposed Phase 1 (backend, <=5 files) - DONE (see Review)
 - [ ] Scraper: stop writing the label into party_name; store `violation_category` (recordtypedesc) +
       `violation_type` (recordtype); `raw_html_hash` from recordnum (fingerprint no longer reads party_name).
       Addressless weak-hash rows (3/month) handled per Codex before merge.

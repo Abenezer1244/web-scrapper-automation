@@ -84,8 +84,7 @@ _ELIGIBLE_ROW = """
   AND r.enrichment_data->>'delivery_excluded_reason' IS NULL
   AND coalesce(r.enrichment_data->>'owner_lookup_deferred', '') = 'true'
   AND (r.party_name IS NULL OR btrim(r.party_name) = '')
-  AND r.parcel_id ~ '[0-9]'
-  AND length(btrim(r.parcel_id)) >= 6
+  AND btrim(r.parcel_id) ~ '^[0-9]{10}$'
   AND coalesce((r.enrichment_data->>'owner_recovery_attempts')::int, 0) < :max_attempts
 """
 
@@ -121,7 +120,8 @@ _CANDIDATE_ROWS_SQL = f"""
     ORDER BY r.id
 """  # noqa: S608 -- splices only the _ELIGIBLE_ROW constant; every value is bound
 
-# The write re-applies the eligibility predicate against the row as it is NOW.
+# The write re-applies the eligibility predicate against the row AND its job as they
+# are NOW, so neither a row nor a job that changed during the lookup is written.
 _WRITE_SQL = f"""
     UPDATE results r SET
       party_name = COALESCE(CAST(:owner AS varchar), r.party_name),
@@ -132,6 +132,11 @@ _WRITE_SQL = f"""
         || CAST(:payload AS jsonb))::json
     WHERE r.id = :rid AND r.user_id = :uid AND btrim(r.parcel_id) = :pid
       AND {_ELIGIBLE_ROW}
+      AND EXISTS (
+        SELECT 1 FROM jobs j JOIN scraper_configs sc ON sc.id = j.scraper_config_id
+        WHERE j.id = r.job_id AND j.status = 'done'
+          AND lower(sc.county) = 'king' AND upper(sc.state) = 'WA'
+          AND sc.record_type = 'tax_delinquent')
 """  # noqa: S608 -- splices only the _ELIGIBLE_ROW constant; every value is bound
 
 

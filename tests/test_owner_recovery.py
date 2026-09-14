@@ -327,3 +327,35 @@ def test_the_sweep_is_registered_and_scheduled():
     assert "src.workers.owner_recovery" in app.conf.include
     entries = {e["task"] for e in app.conf.beat_schedule.values()}
     assert "src.workers.owner_recovery.recover_deferred_owners" in entries
+
+
+async def test_a_job_that_is_no_longer_done_is_not_written(db, business_user, monkeypatch):
+    _lease(monkeypatch)
+    job_id = await _job(db, business_user)
+    rid = await _row(db, business_user, job_id, parcel="1000000031")
+
+    def _get_and_reopen(url, **_k):
+        from src.db.session import system_sync_session
+
+        with system_sync_session() as sdb:
+            sdb.execute(text("UPDATE jobs SET status = 'enriching' WHERE id = :j"), {"j": job_id})
+            sdb.commit()
+        return _Resp(200, _page(url.rsplit("=", 1)[-1], "STALE ANSWER"))
+
+    monkeypatch.setattr(kca, "safe_get", _get_and_reopen)
+    stats = await asyncio.to_thread(_tick)
+
+    assert (await _get(db, rid)).party_name is None
+    assert stats["stale"] == 1
+
+
+async def test_only_a_well_formed_king_pin_is_looked_up(db, business_user, monkeypatch):
+    _lease(monkeypatch)
+    asked = _county(monkeypatch, {})
+    job_id = await _job(db, business_user)
+    await _row(db, business_user, job_id, parcel="012603938700")   # 12-digit recorder id
+    await _row(db, business_user, job_id, parcel="PENDING-1")
+
+    stats = await asyncio.to_thread(_tick)
+
+    assert asked == [] and stats["parcels"] == 0

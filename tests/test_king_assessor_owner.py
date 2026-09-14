@@ -125,7 +125,7 @@ async def test_batch_extract_king_owners_filters_non_numeric_parcels():
 
 
 async def test_batch_extract_king_owners_trips_on_transient_window(monkeypatch):
-    async def blocked(_pid, *, max_attempts=1):
+    async def blocked(_pid, *, max_attempts=1, **_kw):
         return None, True
 
     monkeypatch.setattr(
@@ -148,7 +148,7 @@ async def test_batch_extract_king_owners_trips_on_transient_window(monkeypatch):
 
 
 async def test_batch_extract_king_owners_trips_on_miss_window(monkeypatch):
-    async def missing(_pid, *, max_attempts=1):
+    async def missing(_pid, *, max_attempts=1, **_kw):
         return None, False
 
     monkeypatch.setattr(
@@ -172,7 +172,7 @@ async def test_batch_extract_king_owners_trips_on_miss_window(monkeypatch):
 
 
 async def test_batch_extract_king_owners_allows_sparse_real_misses(monkeypatch):
-    async def mostly_found(pid, *, max_attempts=1):
+    async def mostly_found(pid, *, max_attempts=1, **_kw):
         if pid.endswith("00") or pid.endswith("37"):
             return None, False
         return f"OWNER {pid}", False

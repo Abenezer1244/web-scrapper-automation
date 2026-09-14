@@ -49,6 +49,67 @@ Phase 2 (awaiting go):
   Codex round 2 agreed it is not a blocker. Reported to owner.
 - Round 2 P2 "db.flush() before the guard": both call sites run right after a commit with nothing
   pending; noted, not changed.
+# King data quality: tax owner/situs, pre-foreclosure situs/auction, CV parcel/party (2026-09-13)
+
+Branch `investigate/king-tax-owner-situs` (worktree `C:/Users/Windows/bl-wt-kingtax`). DIAGNOSIS ONLY.
+Status: diagnosis reported, Codex consulted; AWAITING OWNER APPROVAL before any code or prod write.
+
+Jobs: tax `b2f2ecd5` (16,847 rows, 840 deliverable), prefc `85692303` (155), CV `fbd872b6` (1,060).
+
+Root causes (evidence in session report):
+1. eRealProperty phase 1 (the only live source of owner name + condo unit situs) was denied by
+   SourceAdmission ("not admitted (source busy)") for every King job 12:51-13:31 UTC 2026-09-13;
+   the denial writes only `mailing_lookup_deferred`, and only on rows missing mailing, which the RPAcct
+   extract had already filled. Recovery sweep is mailing-only. Result: no retry for owner/situs.
+2. King GIS parcel layer has no features for condo UNIT PINs (45/47 prefc, 3,358 tax gaps);
+   EXTR_CondoUnit2 has the unit address (verified = eRealProperty Site Address).
+3. 12-digit recorder PIDs (2 prefc rows) never match GIS/RPAcct; first 10 digits are the real parcel.
+4. Auction/default: not in the LandmarkWeb index or any cached NTS notice (0/155). Document gap, not parser.
+5. CV: source has no parcel/owner; kc_pin resolved for 809/1,060 but hidden; party_name is a case label.
+
+Proposed phases (not started):
+- [ ] P1 Condo unit situs from EXTR_CondoUnit2 in live King enrichment (fill-only, provenance key)
+- [ ] P2 Owner/situs deferral markers independent of mailing + bounded owner/situs recovery sweep
+      (lease-aware, delivered rows first, no quota/Tracerfy side effects)
+- [ ] P3 12-digit PID -> 10-digit parcel resolution with legal-description STR check (beside parcel_id)
+- [ ] P4 Honest UI/log states: Pending for owner/property when a lookup is deferred; fix completion copy
+- [ ] P5 CV: surface kc_pin as a separate resolved parcel field; violation type/status columns; party_name decision
+- [ ] P6 Backfill dry-run (scope below), then apply only on approval
+
+## 2026-09-14 King TAX follow-up (same job b2f2ecd5; no newer King tax job exists)
+
+Verified today (read-only prod + live source, 6 eRealProperty GETs at 5s, lease free, source healthy):
+- Delivered 840 (600 billed + 240 no-address rows that bypass the cap): date 0, party 0, parcel/balance/
+  oldest year 840, property 308 (37%), mailing 624 (74%), phone/email 0 (skip tracing off on this config).
+- Balance + oldest year: 6/6 exact vs Socrata dsv3-ct3e (principal only; feed has no penalty/interest).
+- Owner name exists on eRealProperty for 6/6. Site address: 1 full (already in BL), 1 condo unit (GIS gap),
+  2 street-only vacant land, 2 blank. Leading-zero parcels GIS-matched correctly: NOT a cause.
+- Date NULL is correct (receivable roll has no event date; fabricated 01/01/<year> removed in #214).
+- New defects: (a) `enrich.py:959` counts ALL deferred pids as "mailing still being looked up" (16,859)
+  though 16,576 had mailing; completion line repeats it. (b) owner-only pass requires mailing_address, so
+  no-mailing rows (216 of the delivered 840) never get an owner lookup. (c) plan cap ranks by
+  `party_name, date_recorded, id` (`tasks.py:1702`): which rows get billed depends on which ~240 random
+  parcels the owner pass reached. Circular with "enrich delivered rows first" (Codex P1, verified).
+- Party % history: Jun23 11.8, Aug10 0, Sep2 0, Sep4 1.2, Sep7 10.0, Sep13 0. Long-standing capacity
+  limit (per-parcel page, 1 req/s, 240s owner budget), made total on 09-13 by lease denial.
+
+Revised tax plan (Codex gate FAIL on the old P2; corrected below). NOT STARTED, awaiting approval:
+- [ ] T0 DECISION (owner): King tax cap order before enrichment (e.g. largest balance first), so the
+      billed set is fixed before owner lookups and those lookups can target it.
+- [x] T1 Copy: per-field counts (found / still deferred / no source value) for mailing and owner; no
+      "pending" for rows that already have the value. No em dash in new copy.
+- [x] T2 (owner half) Owner retry state per lead, reason retryable vs settled not_on_record (only when the
+      page echoes the parcel); owner pass no longer gated on mailing_address. Situs half NOT built.
+      Branch fix/king-tax-owner-lookup-state, uncommitted. 8 new tests; full suite green (9 billing
+      failures were local env, pass with CI STRIPE_PRICE_* vars); ruff clean. Codex gate: fixed name
+      guard + digit-free ids; OPEN: positive owners not gated on parcel echo (pre-existing, both paths).
+      Session 86 (bl-wt-kingprefc) claims shared King enrichment work; told it this is built. Owner to decide.
+- [ ] T3 Bounded owner/situs recovery sweep in the worker (acquires the real lease), delivered rows
+      first, fill-only, barred from cap/billing/delivery/Tracerfy paths.
+- [ ] T4 Condo unit situs (= old P1). T5 property_address_status: street_only / no_site_address so the
+      UI can say so instead of N/A (never substitute mailing).
+- [ ] T6 FE: tax_delinquent shows "Tax year" instead of an empty Date column.
+- [ ] T7 Historical repair dry-run for recent King tax delivered rows; apply only on approval.
 
 # SSE "Too many concurrent streams (max 5)" (2026-09-13)
 

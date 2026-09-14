@@ -40,7 +40,7 @@ SETTLED_COMPLAINT_STATUSES = frozenset({"Completed", "Open Duplicate"})
 # means. `OWNER_DEFERRED_KEY` True: this run did not get an answer, and
 # `OWNER_DEFERRED_REASON_KEY` says why (not_admitted, source_unavailable,
 # budget_exhausted, lease_lost, breaker_tripped, timeout, error,
-# transient_failure, unverified_page). `OWNER_OUTCOME_KEY` == not_on_record: the
+# transient_failure, parcel_mismatch). `OWNER_OUTCOME_KEY` == not_on_record: the
 # parcel's own county page named it and showed no owner, a settled answer.
 OWNER_DEFERRED_KEY = "owner_lookup_deferred"
 OWNER_DEFERRED_REASON_KEY = "owner_lookup_deferred_reason"
@@ -1140,7 +1140,7 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                     )
                 o_reason = o_reason or o_stats.get("outcome") or "error"
                 _transient = set(o_stats.get("transient", []))
-                _unverified = set(o_stats.get("unverified", []))
+                _mismatch = set(o_stats.get("parcel_mismatch", []))
                 _no_owner = set(o_stats.get("no_owner_on_record", []))
 
                 # One outcome per parcel, fanned out to every lead on it. A lead is
@@ -1174,7 +1174,7 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                             ed[OWNER_DEFERRED_KEY] = True
                             ed[OWNER_DEFERRED_REASON_KEY] = (
                                 "transient_failure" if pid in _transient
-                                else "unverified_page" if pid in _unverified
+                                else "parcel_mismatch" if pid in _mismatch
                                 else o_reason
                             )
                             owner_deferred_rows += 1

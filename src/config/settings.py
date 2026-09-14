@@ -308,6 +308,10 @@ class Settings(BaseSettings):
     # ─── Free Enrichment (County GIS + AI Assessor) ───────────────────────────
     GIS_ENRICHMENT_ENABLED: bool = True
     AI_ENRICHMENT_ENABLED: bool = True
+    # Background sweep that looks up King tax owner names a job deferred
+    # (src/workers/owner_recovery.py). Kill switch: False stops it before any
+    # eRealProperty request, e.g. while King is rate-limiting us.
+    OWNER_RECOVERY_ENABLED: bool = True
 
     # ─── Skip Trace (Tracerfy, Sprint 4) ──────────────────────────────────────
     TRACERFY_API_TOKEN: str = ""

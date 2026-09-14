@@ -1689,8 +1689,8 @@ def run_scrape_job(self, job_id: str) -> None:
                         {"jid": job_id, "uid": str(job.user_id),
                          "key": DELIVERY_EXCLUDED_KEY, "reason": OVER_QUOTA},
                     )
-                    # Tax delinquent ranks largest balance first; every other
-                    # record type keeps party_name, date_recorded, id.
+                    # Tax delinquent ranks largest balance first and code violations
+                    # open-then-newest (plan_cap.py); others keep party_name, date, id.
                     from src.workers.tasks_helpers.plan_cap import mark_over_quota_rows
 
                     _capped_ids = mark_over_quota_rows(

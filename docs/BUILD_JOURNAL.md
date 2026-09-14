@@ -19,6 +19,47 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-14 - King code violations: Parcel ID N/A, a complaint label as Party Name, and "King County" meaning Seattle
+
+**Built / Shipped (branches, not merged):** backend `investigate/king-code-violation-parcel` `2c80364`,
+frontend `fix/king-cv-parcel-owner-columns` `3fe82ac`. SDCI scraper stores no label in party_name,
+stores `violation_category`, and keys the job insert on the case number (`raw_html_hash`).
+`king_parcel_locate` records a tier (exact / street_only / condo_complex via PROPTYPE K).
+`src/utils/located_parcel.py` is the one rule for showing a located PIN: `ResultRow.located_parcel_id`,
+CSV `parcel_id` + `parcel_source`. Live enrichment names the owner from eRealProperty for exact PINs.
+Skip trace: a code-violation row is traced only with an eRealProperty owner for its current exact PIN.
+`scripts/backfill_king_code_violation_owner.py` (dry-run default). FE: Parcel fallback, Violation and
+Case # columns, "Seattle only" / "Tacoma only" coverage notes.
+
+**Tried / Decided:** writing the PIN into `results.parcel_id` rejected with evidence: `_collapse_groups`
+and the enrichment-reuse gate recompute the frozen dedup signature from the CURRENT parcel_id, so it
+would bill same-property siblings twice. Owner decisions: parcel shown for exact matches only; no-owner
+code violations never skip traced; coverage relabeled. Owner asked "don't King County display real party
+names?": yes, eRealProperty does (the bulk extract is the NoName build), so the existing lease-guarded
+owner-only path is reused by PIN.
+
+**Failed / Blocked:** local Postgres went into crash recovery twice (low RAM). Codex CLI failed with
+"Argument list too long" for a 60 KB inline diff; `codex exec -` with the prompt on stdin works.
+`.env.local` writes are permission-denied; Next.js took the env from the process instead. My source
+verifier looked for a "Parcel Number" cell; eRealProperty Detail.aspx labels it "Parcel".
+
+**Caught & fixed:** Codex consult (3 P1: coverage label, party_name in source_fingerprint, weak hash);
+review r1-r3 P1s: repair UPDATE pins kc_pin/status/match/source; skip trace gate needs owner_pin ==
+exact located PIN and is source-specific (Tacoma can never pass); blank party names count as unnamed.
+One r3 P1 refuted (Codex had not seen `located_parcel.py`); r4 GATE PASS; FE GATE PASS.
+Two settled-complaint tests used a code-violation row named "DOE JANE" with no owner source, a shape prod never had.
+
+**Pending / Handoff:** merge backend then frontend (FE api-types drift gate reads backend main).
+Prod historical repair NOT applied: dry-run 1,782 rows, 1,782 labels, tiers exact 1,159 / street_only 141 /
+condo_complex 89 / unmatched 393, 936 exact PINs to name (~35 min at 2 s spacing via the Redis public URL
+wrapper). The plan cap orders by party_name, so named rows now rank first (open owner decision T0).
+Live owner pass has no integration test (helpers are tested). PhoneCell says "not a person" for every
+not_attempted row, whatever the reason (pre-existing).
+
+**Facts learned:** only one King CV job ever ran (`fbd872b6`). Condo complex parcels have no tax
+account (0 of 89 had mailing). SDCI recordtypedesc is empty on ~23% of cases. Sample owner lookup 6/6;
+5/5 verified against SDCI, King GIS, eRealProperty and the rendered tax bill.
+
 ## 2026-09-13 - "Already delivered" claims: Codex gate rounds 6-9 (D1 + D5, branch not pushed)
 
 **Built / Shipped (local branch `investigate/results-categories`, NOT pushed, no PR):**

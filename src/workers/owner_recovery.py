@@ -291,7 +291,7 @@ def _classify(parcels: list[str], owners: dict, o_stats: dict) -> dict[str, str]
             fetched.add(in_flight)
     out: dict[str, str] = {}
     for pid in parcels:
-        if pid in owners:
+        if (owners.get(pid) or "").strip():
             out[pid] = "found"
         elif pid in no_owner:
             out[pid] = "not_on_record"

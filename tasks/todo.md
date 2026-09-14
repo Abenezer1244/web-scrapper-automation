@@ -42,17 +42,18 @@ Verified today (read-only prod + live source, 6 eRealProperty GETs at 5s, lease 
 - Party % history: Jun23 11.8, Aug10 0, Sep2 0, Sep4 1.2, Sep7 10.0, Sep13 0. Long-standing capacity
   limit (per-parcel page, 1 req/s, 240s owner budget), made total on 09-13 by lease denial.
 
-Revised tax plan (Codex gate FAIL on the old P2; corrected below). NOT STARTED, awaiting approval:
-- [ ] T0 DECISION (owner): King tax cap order before enrichment (e.g. largest balance first), so the
-      billed set is fixed before owner lookups and those lookups can target it.
+Revised tax plan (Codex gate FAIL on the old P2; corrected below). T0-T2 BUILT, T3-T7 not started:
+- [x] T0 Owner chose largest balance first. PR #300 (stacked on #298): plan_cap.mark_over_quota_rows ranks
+      tax_delinquent by delinquent_amount DESC, older year, parcel, id; King tax lookups walk the same order.
+      Full suite 3,232 passed, Codex PASS. Not merged (merge = prod deploy, awaiting owner).
 - [x] T1 Copy: per-field counts (found / still deferred / no source value) for mailing and owner; no
       "pending" for rows that already have the value. No em dash in new copy.
 - [x] T2 (owner half) Owner retry state per lead, reason retryable vs settled not_on_record (only when the
       page echoes the parcel); owner pass no longer gated on mailing_address. Situs half NOT built.
-      Branch fix/king-tax-owner-lookup-state, uncommitted. 8 new tests; full suite green (9 billing
+      PR #298 (CI green, not merged). 8 new tests; full suite green (9 billing
       failures were local env, pass with CI STRIPE_PRICE_* vars); ruff clean. Codex gate: fixed name
       guard + digit-free ids; OPEN: positive owners not gated on parcel echo (pre-existing, both paths).
-      Session 86 (bl-wt-kingprefc) claims shared King enrichment work; told it this is built. Owner to decide.
+      Owner: this session lands #298; session 86 (bl-wt-kingprefc) owns condo/12-digit PID/situs/sweep.
 - [ ] T3 Bounded owner/situs recovery sweep in the worker (acquires the real lease), delivered rows
       first, fill-only, barred from cap/billing/delivery/Tracerfy paths.
 - [ ] T4 Condo unit situs (= old P1). T5 property_address_status: street_only / no_site_address so the

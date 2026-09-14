@@ -57,6 +57,7 @@ _CANDIDATES_SQL = f"""
     WHERE lower(sc.county) = 'king' AND upper(sc.state) = 'WA'
       AND sc.record_type = 'tax_delinquent'
       AND j.status = 'done'
+      AND (CAST(:jobs AS text[]) IS NULL OR CAST(r.job_id AS text) = ANY(CAST(:jobs AS text[])))
       AND {_ELIGIBLE}
     ORDER BY r.job_id, r.id
 """  # noqa: S608 -- splices only the _ELIGIBLE constant; every value is bound
@@ -73,9 +74,14 @@ _MARK_SQL = f"""
 """  # noqa: S608 -- splices only the _ELIGIBLE constant; every value is bound
 
 
-def requeue(db, *, apply: bool, report: Path | None = None) -> dict:
-    """Mark eligible rows deferred. Returns counts; writes nothing unless ``apply``."""
-    rows = db.execute(text(_CANDIDATES_SQL)).all()
+def requeue(db, *, apply: bool, report: Path | None = None,
+            jobs: list[str] | None = None) -> dict:
+    """Mark eligible rows deferred. Returns counts; writes nothing unless ``apply``.
+
+    ``jobs`` limits the repair to those job ids. The whole backlog is ~24,830 leads,
+    about 50 hours of the sweep holding the King source lease, so apply it in slices.
+    """
+    rows = db.execute(text(_CANDIDATES_SQL), {"jobs": jobs or None}).all()
     stats: dict = {
         "candidates": len(rows),
         "distinct_parcels": len({r.parcel_id for r in rows}),
@@ -111,6 +117,8 @@ def requeue(db, *, apply: bool, report: Path | None = None) -> dict:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--apply", action="store_true", help="write markers (default: dry-run)")
+    ap.add_argument("--jobs", default="",
+                    help="comma-separated job ids to limit the repair to (default: all)")
     ap.add_argument("--report", type=Path,
                     default=Path(f"requeue_king_tax_owner_{datetime.now(UTC):%Y%m%dT%H%M%SZ}.jsonl"),
                     help="JSON-lines evidence file (one line per candidate row)")
@@ -119,7 +127,8 @@ def main(argv: list[str] | None = None) -> int:
     from src.db.session import system_sync_session
 
     with system_sync_session() as db:
-        stats = requeue(db, apply=args.apply, report=args.report)
+        jobs = [j.strip() for j in args.jobs.split(",") if j.strip()]
+        stats = requeue(db, apply=args.apply, report=args.report, jobs=jobs)
     print(json.dumps(stats, indent=2))
     print(f"evidence -> {args.report}")
     return 0

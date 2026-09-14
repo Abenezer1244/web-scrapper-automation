@@ -107,6 +107,25 @@ async def test_only_delivered_unnamed_king_tax_leads_are_queued(db, business_use
     assert again["candidates"] == 0 and again["marked"] == 0
 
 
+async def test_the_repair_can_be_limited_to_named_jobs(db, business_user, tmp_path):
+    from src.db.session import system_sync_session
+
+    wanted = await _job(db, business_user)
+    other = await _job(db, business_user)
+    await _row(db, business_user, wanted, parcel="1000000081")
+    left = await _row(db, business_user, other, parcel="1000000082")
+
+    def _go():
+        with system_sync_session() as sdb:
+            return rq.requeue(sdb, apply=True, report=tmp_path / "e.jsonl", jobs=[wanted])
+
+    stats = await asyncio.to_thread(_go)
+    assert stats["marked"] == 1
+    ed = (await db.execute(text("SELECT enrichment_data FROM results WHERE id = :i"),
+                           {"i": left})).scalar()
+    assert ed.get("owner_lookup_deferred") is not True
+
+
 async def test_a_queued_lead_is_one_the_owner_sweep_selects(db, business_user, tmp_path):
     from src.workers import owner_recovery as orc
 

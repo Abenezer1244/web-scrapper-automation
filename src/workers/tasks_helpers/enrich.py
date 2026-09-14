@@ -71,6 +71,28 @@ def enrichment_completion_log(summary: dict) -> tuple[str, str]:
     return "info", " ".join(parts)
 
 
+def _tax_parcel_priority(pid_map: dict[str, list]) -> list[str]:
+    """Tax parcels in the order the plan cap will deliver their leads.
+
+    King's per-parcel lookups (owner name, site address) run on a wall-clock budget
+    that reaches a few hundred of a job's parcels, BEFORE the cap decides which
+    leads ship. Walking parcels in set order spent that budget on leads the
+    customer would never receive. This mirrors the cap's tax ranking
+    (plan_cap._TAX_RANK_ORDER): largest balance, older delinquency, parcel id.
+    Only non-duplicate rows count (a duplicate is never delivered); a parcel with
+    no such row goes last.
+    """
+    def _key(pid: str):
+        live = [res for res in pid_map[pid] if not res.is_duplicate]
+        amounts = [res.delinquent_amount for res in live if res.delinquent_amount is not None]
+        top = max(amounts) if amounts else None
+        years = [res.delinquent_bill_year for res in live
+                 if res.delinquent_amount == top and res.delinquent_bill_year is not None]
+        return (not live, top is None, -(top or 0), min(years) if years else 9999, pid)
+
+    return sorted(pid_map, key=_key)
+
+
 def _keep_situs_parts(res, gis_data: dict) -> None:
     """Fill results.property_city / property_state / property_zip (migration 085)
     from REAL sources only, without touching property_address itself.
@@ -735,6 +757,9 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                 if pid not in pid_map:
                     pid_map[pid] = []
                 pid_map[pid].append(res)
+            if is_tax_delinquent:
+                # Spend the lookup budget on the leads the plan cap will deliver.
+                pids = _tax_parcel_priority(pid_map)
             # ── Mailing from the Assessor bulk extract FIRST ──────────────────────
             # The tax-bill page below costs 5-10 s per parcel and King rate-blocks it:
             # a 16,630-parcel job on 2026-09-13 deferred every lookup and put the
@@ -1118,7 +1143,9 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                 # than recording it as "no owner". Those are safety valves, not
                 # caps, and are deliberately kept: they are what stops a repeat of
                 # the eRealProperty IP rate-block.
-                o_pids = list(o_pid_map.keys())
+                # Largest balance first, the order the plan cap delivers in, so a
+                # budget that runs out leaves the undelivered leads unnamed.
+                o_pids = _tax_parcel_priority(o_pid_map)
                 # Caller-owned result dicts: names AND the per-parcel outcome ledger
                 # are kept even if the outer wait_for cancels or the breaker raises.
                 owners: dict[str, str] = {}

@@ -44,7 +44,7 @@ class TestTitleTrailingDash:
 class TestNullAmountAlert:
     def test_wording_carries_operator_context(self):
         subject, body = null_amount_alert("job-1", "pierce/WA", 1, 6, ["nid-1"])
-        assert subject == "Auction leads without Default Owed: 1/6 (pierce/WA)"
+        assert subject == "Auction leads without Principal Owing: 1/6 (pierce/WA)"
         assert "job-1" in body and "nid-1" in body and "parser" in body
         assert "repair_trustee_sale_from_notices.py" in body
 

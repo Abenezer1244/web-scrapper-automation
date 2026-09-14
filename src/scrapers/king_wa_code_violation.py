@@ -8,10 +8,13 @@ Covers City of Seattle code enforcement (weeds, junk, building, noise, etc.)
 Properties facing code violations are motivated sellers — facing fines and
 repair orders. Easier to sell as-is.
 
-NOTE: Only covers City of Seattle, not all of King County.
-No parcel ID in API — relies on GIS enrichment from address/coordinates.
+NOTE: Only covers City of Seattle, not all of King County (no other King jurisdiction
+is scraped for code violations).
+No parcel ID or owner in the API. Enrichment locates the King parcel from the
+coordinates (enrichment_data.kc_pin, never parcel_id) and reads the owner from it.
 """
 
+import hashlib
 import random
 import time
 from datetime import datetime
@@ -37,7 +40,7 @@ _PAGE_SIZE = 1000
 # loop forever (1000 pages × _PAGE_SIZE = 1M rows, far beyond any real window).
 _MAX_PAGES = 1000
 
-# Cap the structured party label so a runaway recordtypedesc can't bloat the row.
+# Cap the stored violation category so a runaway recordtypedesc can't bloat the row.
 _LABEL_MAX = 120
 
 # Per-page fetch retries for transient Socrata failures (read timeout / 429 /
@@ -209,26 +212,33 @@ class KingWACodeViolationScraper(BridgeScraper):
                             opendate, rec_num, exc,
                         )
 
-                # Party name — case type + address (no owner name in API). Build the
-                # label from STRUCTURED fields ONLY; NEVER fall back to `description`
-                # (a free-text complainant narrative carrying tenant PII).
-                label = (
-                    item.get("recordtypedesc")
-                    or item.get("recordtype")
-                    or "Code Violation"
-                ).strip()[:_LABEL_MAX]
-                # Plain hyphen: party_name is shown to customers, and a " - <number>"
-                # separator is what skip-trace eligibility reads as a case description.
-                record.party_name = f"{label} - {addr}" if addr else label
+                # Party name is the property OWNER, and SDCI has none: it names the
+                # complaint, not who owns the building. The label used to be written
+                # here ("Complaint - 7011 ROOSEVELT WAY NE"), so the category read as an
+                # owner. The owner is filled from the county parcel record during
+                # enrichment (king_parcel_locate -> eRealProperty), or stays empty.
+                record.party_name = None
 
                 # Legal description — record number
                 record.legal_description = rec_num
 
+                # Per-case idempotency key for the job insert (Result.raw_html_hash,
+                # String(32)). Without it the key is a tuple that includes party_name,
+                # so a watchdog re-run straddling a party_name change would append the
+                # same cases again instead of conflicting (Codex P1).
+                record.raw_html_hash = hashlib.sha256(
+                    f"seattle_sdci|{rec_num}".encode()
+                ).hexdigest()[:32]
+
                 # Enrichment data — structured fields only (no `description`: it
-                # persists complainant PII).
+                # persists complainant PII). violation_category is SDCI's own category
+                # ("Weeds", "Vacant Building"); record_type is the case kind
+                # ("Complaint", "Notice of Violation", "Citation").
+                category = (item.get("recordtypedesc") or "").strip()[:_LABEL_MAX]
                 record.enrichment_data = {
                     "source": "seattle_sdci_code_violations",
                     "record_number": rec_num,
+                    "violation_category": category or None,
                     "record_type": item.get("recordtype"),
                     "status": item.get("statuscurrent"),
                     "last_inspection": item.get("lastinspdate"),

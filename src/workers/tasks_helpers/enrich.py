@@ -453,6 +453,55 @@ def _resolve_king_account_parcels(db, rows: list, job_id: str) -> int:
     return done
 
 
+# Property recovery markers (read by src/workers/property_recovery.py).
+PROPERTY_DEFERRED_KEY = "property_lookup_deferred"
+PROPERTY_OUTCOME_KEY = "property_lookup_outcome"
+# Outcomes that settle a parcel: no source can give it a property address.
+PROPERTY_SETTLED_OUTCOMES = ("no_site_address", "parcel_mismatch")
+
+_SQL_MARK_PROPERTY_DEFERRED = f"""
+    UPDATE results
+       SET enrichment_data = {ED_MERGE_SQL}
+     WHERE id = ANY(CAST(:ids AS uuid[])) AND user_id = CAST(:uid AS uuid)
+       AND job_id = CAST(:jid AS uuid) AND {ED_MERGEABLE_SQL} AND {_PROPERTY_IS_EMPTY}
+"""
+
+
+def _mark_king_property_deferred(db, rows: list, job_id: str, user_id: str) -> int:
+    """Mark this job's King leads whose property address is still unknown. Returns rows.
+
+    One set-based, guarded UPDATE: a row filled in the meantime is left alone. The ORM
+    copies of enrichment_data are expired so no later flush in this job writes the
+    unmarked version back. The caller commits.
+    """
+    import json
+
+    from sqlalchemy import text as _sa_text
+
+    ids = []
+    for res in rows:
+        ed = res.enrichment_data if isinstance(res.enrichment_data, dict) else {}
+        if (res.property_address and res.property_address != "(enrichment unavailable)"):
+            continue
+        if (not _KING_PIN_RE.fullmatch(_king_lookup_pin(res)) or ed.get("vacant_no_situs")
+                or ed.get(PROPERTY_OUTCOME_KEY) in PROPERTY_SETTLED_OUTCOMES
+                or ed.get(PROPERTY_DEFERRED_KEY) is True):
+            continue
+        ids.append(res)
+    if not ids:
+        return 0
+    db.flush()
+    result = db.execute(_sa_text(_SQL_MARK_PROPERTY_DEFERRED), {
+        "ids": [str(res.id) for res in ids], "uid": user_id, "jid": job_id,
+        "patch": json.dumps({PROPERTY_DEFERRED_KEY: True}),
+    })
+    for res in ids:
+        db.expire(res, ["enrichment_data"])
+    _logger.info("Job %s: %d King lead(s) still have no property address; queued for recovery",
+                 job_id, result.rowcount or 0)
+    return result.rowcount or 0
+
+
 def _fill_king_condo_unit_situs(db, rows: list, job_id: str) -> int:
     """Fill King condo UNIT property addresses from the Assessor condo extract.
 
@@ -1104,6 +1153,18 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                                     "resolved_by": data.get("resolved_by"),
                                 }}
                             continue
+                        if (not prop and not res.property_address
+                                and data.get("parcel_lookup") in ("verified", "mismatch")):
+                            # The page answered: it names this parcel and has no site
+                            # address, or it names a different parcel. Either way asking
+                            # King again later cannot produce an address, so the property
+                            # recovery sweep must not spend a request on it.
+                            res.enrichment_data = {
+                                **(res.enrichment_data if isinstance(res.enrichment_data, dict) else {}),
+                                PROPERTY_OUTCOME_KEY: ("no_site_address"
+                                                       if data["parcel_lookup"] == "verified"
+                                                       else "parcel_mismatch"),
+                            }
                         if prop and (not res.property_address
                                      or res.property_address == "(enrichment unavailable)"):
                             res.property_address = prop
@@ -1547,6 +1608,23 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                     except Exception as exc:
                         _logger.warning("Job %s: owner-only progress log failed: %s", job_id, str(exc)[:120])
                         db.rollback()  # log write failed; swaps already settled — keep going
+
+    if is_king:
+        # Every King pass is done. A lead that still has no property address, whose
+        # parcel no source has settled (not vacant land, no page answer), is marked for
+        # the property recovery sweep: the per-parcel page may simply not have run
+        # (lease busy, breaker, budget, or the lead never needed that pass). Only this
+        # job's rows, so nothing historical is swept without a deliberate repair.
+        try:
+            _deferred = _mark_king_property_deferred(db, all_results, job_id, str(job.user_id))
+            db.commit()
+            if _deferred and summary is not None:
+                summary["property_deferred"] = _deferred
+        except Exception as exc:  # noqa: BLE001 -- enrichment is best-effort
+            if type(exc).__name__ in ("SoftTimeLimitExceeded", "TimeLimitExceeded"):
+                raise
+            db.rollback()
+            _logger.warning("Job %s: property deferral markers not stored: %s", job_id, str(exc)[:120])
 
     # ── Post-enrichment: log unactionable records (kept for visibility) ──
     # Records with no property_address and no mailing_address can't be

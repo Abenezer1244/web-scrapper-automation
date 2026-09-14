@@ -85,14 +85,16 @@ _ELIGIBLE_ROW = """
   AND coalesce(r.enrichment_data->>'owner_lookup_deferred', '') = 'true'
   AND (r.party_name IS NULL OR btrim(r.party_name) = '')
   AND btrim(r.parcel_id) ~ '^[0-9]{10}$'
-  AND coalesce((r.enrichment_data->>'owner_recovery_attempts')::int, 0) < :max_attempts
+  AND (CASE WHEN r.enrichment_data->>'owner_recovery_attempts' ~ '^[0-9]{1,6}$'
+            THEN (r.enrichment_data->>'owner_recovery_attempts')::int ELSE 0 END) < :max_attempts
 """
 
 # Pick PARCELS, not rows (two leads on one parcel share one lookup): fewest
 # attempts first, then the longest since last tried, then the largest balance.
 _CANDIDATE_PARCELS_SQL = f"""
     SELECT btrim(r.parcel_id) AS parcel_id,
-           min(coalesce((r.enrichment_data->>'owner_recovery_attempts')::int, 0)) AS attempts,
+           min(CASE WHEN r.enrichment_data->>'owner_recovery_attempts' ~ '^[0-9]{1,6}$'
+                    THEN (r.enrichment_data->>'owner_recovery_attempts')::int ELSE 0 END) AS attempts,
            min(coalesce(r.enrichment_data->>'owner_recovery_last_at', '')) AS last_at,
            max(r.delinquent_amount) AS amount
     FROM results r
@@ -144,23 +146,38 @@ def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def _acquire_lock():
-    """Redis SET NX single-flight. None = another tick holds it; False = no Redis, run."""
+# Delete the lock only if this tick still owns it. A tick that outlived the TTL must
+# not remove the lock a newer tick now holds.
+_RELEASE_IF_OWNER = """
+if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) end
+return 0
+"""
+
+
+def _acquire_lock() -> tuple | str:
+    """Single-flight lock: (client, token) when held, otherwise the reason to skip.
+
+    Fails CLOSED. Without the lock two ticks could pick the same parcels and send
+    King the same requests twice; a skipped tick costs nothing but 15 minutes.
+    """
+    import uuid
+
     try:
         import redis as sync_redis
 
         client = sync_redis.from_url(settings.REDIS_URL, **settings.redis_kwargs())
-        return client if client.set(_LOCK_KEY, _now_iso(), nx=True, ex=_LOCK_TTL_S) else None
+        token = uuid.uuid4().hex
+        if client.set(_LOCK_KEY, token, nx=True, ex=_LOCK_TTL_S):
+            return client, token
+        return "another tick is running"
     except Exception as exc:  # noqa: BLE001
-        _logger.warning("Owner recovery: lock unavailable (%s), running unlocked", str(exc)[:120])
-        return False
+        return f"lock unavailable: {type(exc).__name__}"
 
 
-def _release_lock(client) -> None:
-    if not client:
-        return
+def _release_lock(lock: tuple) -> None:
+    client, token = lock
     try:
-        client.delete(_LOCK_KEY)
+        client.eval(_RELEASE_IF_OWNER, 1, _LOCK_KEY, token)
     except Exception:  # noqa: BLE001, S110 -- the TTL releases it anyway
         pass
 
@@ -174,8 +191,8 @@ def recover_deferred_king_owners() -> dict:
         stats["skipped"] = "OWNER_RECOVERY_ENABLED is off"
         return stats
     lock = _acquire_lock()
-    if lock is None:
-        stats["skipped"] = "another tick is running"
+    if isinstance(lock, str):
+        stats["skipped"] = lock
         return stats
     try:
         return _tick(stats)
@@ -211,6 +228,11 @@ def _tick(stats: dict) -> dict:
         by_parcel: dict[str, list] = {}
         for row in rows:
             by_parcel.setdefault(row.parcel_id, []).append(row)
+        # Ask King only about parcels that still have an eligible row after the
+        # second read; one that lost its rows in between is not worth a request.
+        parcels = [p for p in parcels if p in by_parcel]
+        if not parcels:
+            return stats
         stats["parcels"], stats["rows"] = len(parcels), len(rows)
 
         owners: dict[str, str] = {}
@@ -252,11 +274,21 @@ def _classify(parcels: list[str], owners: dict, o_stats: dict) -> dict[str, str]
     fetched, never from absence in one list: a parcel King answered in a way no
     list names is treated as transient (retried, charged) rather than silently
     rotated forever.
+
+    Every normal exit of the lookup records an `outcome`. None means it was cut
+    off mid-request (an exception or the outer timeout). It walks parcels in order,
+    one at a time, so the first parcel it has no record of is the one in flight:
+    charge it as transient, or a parcel that crashes the lookup would retry for
+    free on every tick.
     """
     no_owner = set(o_stats.get("no_owner_on_record", []))
     mismatch = set(o_stats.get("parcel_mismatch", []))
     transient = set(o_stats.get("transient", []))
     fetched = set(o_stats.get("attempted", [])) | transient
+    if o_stats.get("outcome") is None:
+        in_flight = next((p for p in parcels if p not in fetched and p not in owners), None)
+        if in_flight is not None:
+            fetched.add(in_flight)
     out: dict[str, str] = {}
     for pid in parcels:
         if pid in owners:
@@ -328,4 +360,5 @@ try:  # pragma: no cover -- registration only
         """Beat entry point: see recover_deferred_king_owners."""
         return recover_deferred_king_owners()
 except Exception as exc:  # pragma: no cover -- import-time safety only
-    _logger.debug("Owner recovery task not registered: %s", str(exc)[:120])
+    # Loud: beat would keep publishing a task nobody runs.
+    _logger.error("Owner recovery task NOT registered: %s", str(exc)[:120])

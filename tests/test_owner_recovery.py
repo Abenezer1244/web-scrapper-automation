@@ -359,3 +359,54 @@ async def test_only_a_well_formed_king_pin_is_looked_up(db, business_user, monke
     stats = await asyncio.to_thread(_tick)
 
     assert asked == [] and stats["parcels"] == 0
+
+
+async def test_without_redis_the_sweep_does_not_run(db, business_user, monkeypatch):
+    import redis as sync_redis
+
+    _lease(monkeypatch)
+    asked = _county(monkeypatch, {})
+    job_id = await _job(db, business_user)
+    await _row(db, business_user, job_id, parcel="1000000041")
+
+    def _no_redis(*_a, **_k):
+        raise ConnectionError("redis down")
+
+    monkeypatch.setattr(sync_redis, "from_url", _no_redis)
+    stats = await asyncio.to_thread(_tick)
+
+    assert asked == [] and stats["skipped"].startswith("lock unavailable")
+
+
+async def test_a_tick_never_releases_a_lock_it_does_not_own():
+    lock = orc._acquire_lock()
+    assert isinstance(lock, tuple)
+    # The TTL expired and a newer tick took the lock.
+    lock[0].set(orc._LOCK_KEY, "someone-else")
+    orc._release_lock(lock)
+    assert lock[0].get(orc._LOCK_KEY) in (b"someone-else", "someone-else")
+    lock[0].delete(orc._LOCK_KEY)
+
+
+async def test_the_parcel_in_flight_when_the_lookup_crashed_is_charged(
+    db, business_user, monkeypatch,
+):
+    _lease(monkeypatch)
+    job_id = await _job(db, business_user)
+    first = await _row(db, business_user, job_id, parcel="1000000051", amount="900.00")
+    crashed = await _row(db, business_user, job_id, parcel="1000000052", amount="500.00")
+    never = await _row(db, business_user, job_id, parcel="1000000053", amount="100.00")
+
+    async def _fetch(pid, *, max_attempts=1, **_kw):
+        if pid == "1000000052":
+            raise RuntimeError("parser blew up")
+        return "FIRST OWNER", False
+
+    monkeypatch.setattr(kca, "_fetch_king_owner", _fetch)
+    stats = await asyncio.to_thread(_tick)
+
+    assert (await _get(db, first)).party_name == "FIRST OWNER"
+    ed = (await _get(db, crashed)).enrichment_data
+    assert ed["owner_recovery_attempts"] == 1 and ed["owner_lookup_deferred"] is True
+    assert "owner_recovery_attempts" not in (await _get(db, never)).enrichment_data
+    assert stats["transient"] == 1 and stats["unreached"] == 1

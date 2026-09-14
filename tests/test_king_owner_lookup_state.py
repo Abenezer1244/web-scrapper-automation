@@ -116,8 +116,8 @@ async def test_only_a_page_that_names_the_parcel_can_prove_there_is_no_owner(mon
     pages = {
         _NAMED: _Resp(200, _page(_NAMED, "SHAN HOMES2 LLC")),
         _NO_OWNER: _Resp(200, _page(_NO_OWNER, None)),
-        # An interstitial with no parcel cell: parcel_page_is_for trusts it for a
-        # 10-digit PIN, but it proves nothing about the owner.
+        # An interstitial with no parcel cell proves nothing about any parcel: a
+        # failed lookup, retryable, never "no owner on record".
         _NO_ECHO: _Resp(200, "<html><body>Please wait</body></html>"),
     }
     monkeypatch.setattr(kca, "safe_get", lambda url, **k: pages[url[-10:]])
@@ -128,10 +128,10 @@ async def test_only_a_page_that_names_the_parcel_can_prove_there_is_no_owner(mon
 
     assert owners == {_NAMED: "SHAN HOMES2 LLC"}
     assert stats["outcome"] == "complete"
-    assert stats["attempted"] == [_NAMED, _NO_OWNER, _NO_ECHO]
+    assert stats["attempted"] == [_NAMED, _NO_OWNER]
     assert stats["no_owner_on_record"] == [_NO_OWNER]
-    assert stats["unverified"] == [_NO_ECHO]
-    assert stats["transient"] == []
+    assert stats["transient"] == [_NO_ECHO]
+    assert stats["parcel_mismatch"] == []
 
 
 async def test_a_tripped_breaker_is_recorded_before_it_raises(monkeypatch):

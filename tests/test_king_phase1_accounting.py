@@ -382,3 +382,81 @@ class TestAttemptedIsPositiveEvidence:
         ))
         assert stats.get("requested_pids", []) == []
         assert set(stats["unreached"]) == set(pids)
+
+
+class TestAPageMustNameTheParcelItDescribes:
+    """Nothing is attached from an eRealProperty page that does not name our parcel.
+
+    parcel_page_is_for used to trust a page with NO parcel cell whenever the id we
+    asked for was a well-formed 10-digit PIN, so a layout change would not zero out
+    every lookup. The price was that any page without that cell (an interstitial,
+    a maintenance notice, a partial render) could lend its owner or site address to
+    whichever parcel was requested. Now such a page is a failed lookup: retryable,
+    counted by the breaker (so a real layout change trips it and the canary alerts),
+    and never sent down the malformed-parcel repair path.
+    """
+
+    _NO_PARCEL_CELL = (
+        "<table>"
+        "<td>Name</td><td>SOMEONE ELSE</td>"
+        "<td>Site Address</td><td>9 ELSEWHERE AVE 98101</td>"
+        "</table>"
+    )
+
+    def test_a_page_without_the_parcel_is_deferred_and_attaches_nothing(
+        self, monkeypatch, offline, no_admission, instant_sleep
+    ):
+        monkeypatch.setattr(kca, "safe_get", lambda *a, **k: _Resp(200, self._NO_PARCEL_CELL))
+
+        def _never(*_a, **_k):
+            raise AssertionError("a page with no parcel cell is not a malformed parcel")
+
+        monkeypatch.setattr(kca, "resolve_malformed_parcel", _never)
+        stats: dict = {}
+        out = asyncio.run(kca.batch_enrich_king_county(
+            ["1234500000"], stats=stats, do_mailing=False, pace_s=0.1,
+        ))
+
+        assert "1234500000" not in out
+        assert stats["deferred"] == ["1234500000"]
+        assert stats["unreached"] == []           # we did ask; a retry may be charged
+        assert stats["parcel_mismatch"] == 0      # not the truncation class
+        assert stats["property_found"] == 0
+
+    def test_a_run_of_such_pages_trips_the_breaker(self, monkeypatch, offline,
+                                                   no_admission, instant_sleep):
+        blocked: list[str] = []
+        monkeypatch.setattr(kca, "record_source_blocked", lambda _k, msg, *a: blocked.append(msg))
+        monkeypatch.setattr(kca, "safe_get", lambda *a, **k: _Resp(200, self._NO_PARCEL_CELL))
+        pids = _pids(kca._PHASE1_BREAKER_WINDOW + 10)
+        stats: dict = {}
+
+        asyncio.run(kca.batch_enrich_king_county(pids, stats=stats, do_mailing=False, pace_s=0.1))
+
+        assert blocked and "HTTP200_no_parcel" in blocked[0]
+        assert stats["budget_exhausted"] is True
+        assert set(stats["deferred"]) == set(pids)
+        assert stats["property_found"] == 0
+
+    def test_a_repair_refetch_that_does_not_name_the_parcel_attaches_nothing(
+        self, monkeypatch, offline, no_admission, instant_sleep
+    ):
+        from src.scrapers.enrichment.king_parcel_repair import ResolvedParcel
+
+        mismatch = "<table><td>Parcel Number</td><td>641160-0002</td><td>Name</td><td>SNYDER JACOB</td></table>"
+        pages = {"64116000027": mismatch, "6411600027": self._NO_PARCEL_CELL}
+        monkeypatch.setattr(kca, "safe_get", lambda url, **k: _Resp(200, pages[url.rsplit("=", 1)[-1]]))
+        monkeypatch.setattr(
+            kca, "resolve_malformed_parcel",
+            lambda pid, party, st: ResolvedParcel(parcel_id="6411600027", method="gis_singleton",
+                                                  candidates_generated=1),
+        )
+        stats: dict = {}
+        out = asyncio.run(kca.batch_enrich_king_county(
+            ["64116000027"], stats=stats, do_mailing=False, pace_s=0.1,
+        ))
+
+        assert out["64116000027"]["owner_name"] is None
+        assert out["64116000027"]["property_address"] is None
+        assert out["64116000027"]["parcel_lookup"] == "mismatch"
+        assert stats["parcel_recovered"] == 0

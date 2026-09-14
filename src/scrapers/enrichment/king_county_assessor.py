@@ -76,11 +76,6 @@ _PARCEL_ECHO_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
-# King PIN = 6-digit major + 4-digit minor. A requested id of exactly this shape
-# cannot be truncated, so it is the only case where a page that omits the echo
-# (layout change) may still be trusted.
-_KING_PIN_DIGITS = 10
-
 # Delay before each parcel-repair candidate lookup. Repair is rare and its
 # requests are extra, so they are paced conservatively.
 _REPAIR_PACE_S = 0.5
@@ -105,36 +100,23 @@ def _extract_parcel_echo(page_html: str) -> str | None:
     return None
 
 
-def _page_has_parcel_cell(page_html: str) -> bool:
-    """True if the page carries a parcel-labelled cell at all (even a blank one).
-
-    Distinguishes "this page has no such cell" (a layout change) from "the cell is
-    present but says N/A" — the latter is a page that declined to name its parcel,
-    which is not evidence that it is ours.
-    """
-    return _PARCEL_ECHO_RE.search(page_html) is not None
-
-
 def parcel_page_is_for(page_html: str, requested_pid: str) -> bool:
-    """True if this eRealProperty page is really about ``requested_pid``.
+    """True only if this eRealProperty page itself names ``requested_pid``.
 
     MISMATCH -> False: we asked about parcel X and the county answered about
-    parcel Y, so nothing on the page may be attributed to this lead.
-    NO PARCEL CELL AT ALL -> trusted only when the requested id is already a
-    well-formed 10-digit King PIN (the truncation class cannot apply to it); a
-    malformed id with no echo fails CLOSED.
-    PARCEL CELL PRESENT BUT UNREADABLE ("N/A", blank) -> always False (Codex P3):
-    the page declined to name its parcel, which is not evidence that it is ours.
+    parcel Y (King truncates an over-length id), so nothing on the page may be
+    attributed to this lead.
+    NO READABLE PARCEL ON THE PAGE -> False, for every id. It used to be trusted
+    for a well-formed 10-digit PIN so a layout change could not zero out every
+    lookup, which let any page without that cell (an interstitial, a maintenance
+    notice, a partial render) lend its owner or site address to whichever parcel
+    was requested. Callers treat such a page as a failed lookup instead: retryable,
+    counted by the phase-1 breaker, and reported by the source canary, so a real
+    layout change is loud rather than silently wrong. The live Dashboard page
+    carries the parcel cell (verified 2026-09-14).
     """
     want = _digits(requested_pid)
-    if not want:
-        return False
-    echoed = _extract_parcel_echo(page_html)
-    if echoed is None:
-        if _page_has_parcel_cell(page_html):
-            return False
-        return len(want) == _KING_PIN_DIGITS
-    return echoed == want
+    return bool(want) and _extract_parcel_echo(page_html) == want
 
 
 class KingOwnerLookupBlockedError(RuntimeError):
@@ -206,6 +188,22 @@ class _Phase1Ledger:
             parts += [f"->{k}x{v}" for k, v in sorted(self.redirects.items(), key=lambda kv: -kv[1])]
         return " ".join(parts) or "no requests"
 
+    def mark_last_failed(self, key: str) -> None:
+        """Reclassify the request just recorded as a failure, as ONE observation.
+
+        For a 200 that turned out to be unusable (a page that names no parcel).
+        Rewrites the entry `record` appended instead of adding a second, so one
+        request can never count twice. A no-op if that entry is already a failure.
+        """
+        if not self._window or self._window[-1]:
+            return
+        self._window[-1] = True
+        self.failed += 1
+        self.statuses["HTTP200"] -= 1
+        if not self.statuses["HTTP200"]:
+            del self.statuses["HTTP200"]
+        self.statuses[key] = self.statuses.get(key, 0) + 1
+
     @property
     def window_failures(self) -> int:
         return self._window.count(True)
@@ -267,14 +265,14 @@ async def _fetch_king_owner(
     has no owner cell is a GENUINE miss -> (None, False). A persistent non-200
     (429/5xx/4xx) or exception after max_attempts attempts is a TRANSIENT
     failure -> (None, True), so a caller can avoid treating it as "no such owner".
+    So is a 200 whose page names NO parcel: it is not about any parcel we can
+    attribute (an interstitial, a partial render), so it proves neither an owner
+    nor the absence of one.
 
-    ``evidence``, when given, receives ``echo_confirmed``: True only when the page
-    itself names the requested parcel. A miss is only proof that the county
-    record has no owner when this is True. `parcel_page_is_for` deliberately
-    trusts a page with NO parcel cell for a well-formed 10-digit PIN (so a layout
-    change cannot zero out every lookup), which means a throttle or interstitial
-    page is "for" every such parcel and names no owner. Good enough to refuse a
-    wrong owner, not good enough to record an absence.
+    ``evidence``, when given, receives ``parcel_mismatch`` = True when the page
+    named a DIFFERENT parcel. That (None, False) is not "the county record has no
+    owner" either: it is King truncating a malformed id, and asking again returns
+    the same page.
     """
     attempts = max(1, max_attempts)
     for attempt in range(attempts):
@@ -283,19 +281,21 @@ async def _fetch_king_owner(
             # in depth — same call the full enricher uses.
             r = safe_get(f"{_ERP_URL}{pid}", headers=_HEADERS, timeout=10)
             if r.status_code == 200:
-                if evidence is not None:
-                    evidence["echo_confirmed"] = _extract_parcel_echo(r.text) == _digits(pid)
-                # The county may have silently resolved a DIFFERENT parcel (see
-                # parcel_page_is_for). A wrong owner is worse than no owner — this
-                # path repairs placeholder party_name — so treat it as a genuine
-                # miss, not a transient error (retrying would return the same page).
-                if not parcel_page_is_for(r.text, pid):
+                echoed = _extract_parcel_echo(r.text)
+                if echoed is None:
+                    _logger.debug("King owner lookup: page for %s names no parcel", pid)
+                elif not parcel_page_is_for(r.text, pid):
+                    # The county silently resolved a DIFFERENT parcel. A wrong owner
+                    # is worse than no owner, and a retry returns the same page.
+                    if evidence is not None:
+                        evidence["parcel_mismatch"] = True
                     _logger.warning(
                         "King owner lookup: eRealProperty resolved a DIFFERENT parcel for "
-                        "requested=%s (echoed=%s) — discarding", pid, _extract_parcel_echo(r.text),
+                        "requested=%s (echoed=%s) — discarding", pid, echoed,
                     )
                     return None, False
-                return _extract_owner_name(r.text), False  # genuine result (name or miss)
+                else:
+                    return _extract_owner_name(r.text), False  # genuine result (name or miss)
         except Exception as exc:
             _logger.debug(
                 "Owner fetch error parcel=%s attempt=%d: %s", pid, attempt + 1, str(exc)[:160]
@@ -310,13 +310,13 @@ def _new_owner_stats() -> dict:
 
     ``outcome``: not_admitted | source_unavailable | budget_exhausted | lease_lost |
     breaker_tripped | complete (None while running). Parcel lists, disjoint:
-    ``attempted`` got a usable page (named or not), ``transient`` did not.
-    Within ``attempted`` a miss is ``no_owner_on_record`` only when the page named
-    the requested parcel, otherwise ``unverified``. A parcel in none of them was
-    never reached.
+    ``attempted`` got a page naming a parcel (ours or another), ``transient`` did
+    not (error, non-200, or a page naming no parcel). Within ``attempted`` a miss is
+    ``no_owner_on_record`` when the page named OUR parcel and ``parcel_mismatch``
+    when it named a different one. A parcel in none of them was never reached.
     """
     return {"outcome": None, "attempted": [], "transient": [],
-            "no_owner_on_record": [], "unverified": []}
+            "no_owner_on_record": [], "parcel_mismatch": []}
 
 
 async def batch_extract_king_owners(parcel_ids: list[str], delay: float = 0.1, **kwargs):
@@ -472,10 +472,10 @@ async def _batch_extract_king_owners(
         else:
             misses += 1
             st["attempted"].append(pid)
-            if evidence.get("echo_confirmed"):
-                st["no_owner_on_record"].append(pid)
+            if evidence.get("parcel_mismatch"):
+                st["parcel_mismatch"].append(pid)
             else:
-                st["unverified"].append(pid)
+                st["no_owner_on_record"].append(pid)
         window.append(_OwnerLookupOutcome(resolved=bool(owner), transient=errored))
         if len(window) == window.maxlen:
             transient_rate = sum(o.transient for o in window) / len(window)
@@ -807,11 +807,9 @@ async def _batch_enrich_king_county(
                 # S4: safe_http (SSRF defense-in-depth). Fixed HTTPS eRealProperty
                 # endpoint, but safe_get re-validates (resolve=True), disables
                 # ambient proxy, and refuses redirect-to-internal. Same Response API.
-                # allow_redirects stays FALSE: parcel_page_is_for() trusts a page
-                # with no parcel cell when the requested id is a well-formed 10-digit
-                # King PIN, so following a 302 to a block page would hand us a 200
-                # we would then record as "this parcel has no data" — precisely what
-                # this breaker exists to prevent. We record where it pointed instead.
+                # allow_redirects stays FALSE: a 302 is King refusing us, and the
+                # breaker needs to see it as such rather than whatever 200 the block
+                # page would return. We record where it pointed instead.
                 r = safe_get(f"{_ERP_URL}{pid}", headers=_HEADERS, timeout=10)
             except Exception as fetch_exc:  # noqa: BLE001
                 exc = fetch_exc
@@ -821,6 +819,14 @@ async def _batch_enrich_king_county(
             # ONE observation per request, recorded before anything can raise.
             st["requested_pids"].append(pid)
             failed = _p1.record(r, exc)
+            if not failed and _extract_parcel_echo(r.text) is None:
+                # A 200 that names no parcel is not a page about ANY parcel we can
+                # attribute. Count it as a failure (one observation) so a layout
+                # change or interstitial trips the breaker, and defer the parcel
+                # below instead of reading someone's owner off it. It is not the
+                # truncation class either, so it never enters the repair path.
+                _p1.mark_last_failed("HTTP200_no_parcel")
+                failed = True
 
             if _p1.should_trip():
                 msg = (
@@ -950,13 +956,9 @@ async def _batch_enrich_king_county(
                     "property_address": prop,
                     "mailing_address": None,
                     "owner_name": owner,
-                    # Provenance (Codex): "verified" = the page echoed the parcel we
-                    # asked for; "echo_absent" = the page carried no Parcel Number
-                    # cell but our id was a well-formed 10-digit King PIN, so the
-                    # truncation class could not apply.
-                    "parcel_lookup": (
-                        "verified" if _extract_parcel_echo(r.text) else "echo_absent"
-                    ),
+                    # Provenance (Codex): the page echoed the parcel we asked for.
+                    # A page without the echo never reaches this point.
+                    "parcel_lookup": "verified",
                 }
                 if tax_url:
                     tax_urls[pid] = tax_url

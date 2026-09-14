@@ -64,6 +64,7 @@ from src.workers.tasks_helpers.enrich import (  # noqa: F401  (re-export)
     _reuse_enrichment_for_duplicates,
     _run_inline_enrichment,
     _run_scraper,
+    enrichment_completion_log,
 )
 from src.workers.tasks_helpers.status import (
     _DELIVERY_TOKEN_TTL,  # noqa: F401  (re-export)
@@ -1401,16 +1402,8 @@ def run_scrape_job(self, job_id: str) -> None:
             enrich_summary: dict = {}
             _run_inline_enrichment(db, job, r, job_id, config, summary=enrich_summary)
             _enrichment_ok = True
-            _pending_mail = int(enrich_summary.get("mailing_deferred") or 0)
-            if _pending_mail:
-                _publish_log(
-                    r, job_id, "info",
-                    f"Address enrichment partly complete. Property addresses were added, "
-                    f"and {_pending_mail} mailing address lookups are still pending.",
-                    db=db,
-                )
-            else:
-                _publish_log(r, job_id, "success", "Enrichment complete: addresses added", db=db)
+            _level, _msg = enrichment_completion_log(enrich_summary)
+            _publish_log(r, job_id, _level, _msg, db=db)
         except Exception as exc:
             _logger.warning("Inline enrichment error: %s", str(exc)[:200])
             _publish_log(

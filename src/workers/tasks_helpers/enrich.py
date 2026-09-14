@@ -34,6 +34,42 @@ _TRAILING_ZIP_RE = re.compile(r"\b(\d{5})(?:-\d{4})?\s*$")
 # Seattle SDCI code-violation statuses that are never sent to a paid skip trace.
 SETTLED_COMPLAINT_STATUSES = frozenset({"Completed", "Open Duplicate"})
 
+# King tax owner-name state, per lead, in enrichment_data. The owner name is the
+# field these leads lose most (eRealProperty is the only source, one page per
+# parcel), so a NULL party_name has to say which of two very different things it
+# means. `OWNER_DEFERRED_KEY` True: this run did not get an answer, and
+# `OWNER_DEFERRED_REASON_KEY` says why (not_admitted, source_unavailable,
+# budget_exhausted, lease_lost, breaker_tripped, timeout, error,
+# transient_failure, unverified_page). `OWNER_OUTCOME_KEY` == not_on_record: the
+# parcel's own county page named it and showed no owner, a settled answer.
+OWNER_DEFERRED_KEY = "owner_lookup_deferred"
+OWNER_DEFERRED_REASON_KEY = "owner_lookup_deferred_reason"
+OWNER_OUTCOME_KEY = "owner_lookup_outcome"
+OWNER_NOT_ON_RECORD = "not_on_record"
+
+
+def enrichment_completion_log(summary: dict) -> tuple[str, str]:
+    """(level, message) for the line that closes a job's enrichment.
+
+    One clause per field that is actually incomplete, with its own count. The old
+    line always said "Property addresses were added" and counted only mailing,
+    so a job that added no property address and named none of its owners still
+    read as nearly done. The success wording is unchanged: the results endpoint
+    matches its "Enrichment complete" prefix.
+    """
+    mail = int(summary.get("mailing_deferred") or 0)
+    owner = int(summary.get("owner_deferred") or 0)
+    if not mail and not owner:
+        return "success", "Enrichment complete: addresses added"
+    parts = ["Address enrichment partly complete."]
+    if mail:
+        verb = "lookup is" if mail == 1 else "lookups are"
+        parts.append(f"{mail:,} mailing address {verb} still pending.")
+    if owner:
+        noun = "name" if owner == 1 else "names"
+        parts.append(f"{owner:,} owner {noun} could not be looked up during this run.")
+    return "info", " ".join(parts)
+
 
 def _keep_situs_parts(res, gis_data: dict) -> None:
     """Fill results.property_city / property_state / property_zip (migration 085)
@@ -272,8 +308,10 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
     this function has many early-exit paths, and every one of them should leave
     the caller with "nothing to report" rather than needing its own return.
 
-    Keys (all optional): ``mailing_deferred`` -- parcels whose mailing lookup did
-    not happen and is now queued for background recovery.
+    Keys (all optional): ``mailing_deferred`` -- parcels still missing a mailing
+    address whose lookup did not happen and is now queued for background recovery.
+    ``owner_deferred`` -- King tax leads still missing an owner name because this
+    run's lookup did not get an answer (see OWNER_DEFERRED_KEY).
     """
     from sqlalchemy import func
     from sqlalchemy import select as sa_select
@@ -684,10 +722,13 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
             and (not res.mailing_address or (is_tax_delinquent and not res.party_name))
         ]
         if needs:
-            _publish_log(r, job_id, "info", f"Looking up {len(needs)} mailing addresses...", db=db)
             from src.scrapers.enrichment.king_county_assessor import batch_enrich_king_county
             from src.scrapers.enrichment.king_parcel_repair import owner_matches_party
             pids = list({res.parcel_id.strip() for res in needs})
+            # Parcels, not rows, and not only mailing: this pass also fetches the
+            # owner and the site address.
+            _publish_log(r, job_id, "info",
+                         f"Looking up county records for {len(pids):,} properties...", db=db)
             pid_map: dict[str, list] = {}
             for res in needs:
                 pid = res.parcel_id.strip()
@@ -973,10 +1014,17 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
             # Durable marker for parcels the budget/cap/failure never reached, so a
             # later sweep can find them (never a silent gap — Codex).
             deferred = [p for p in dict.fromkeys(king_stats.get("deferred", [])) if p in pid_map]
+            # A deferred parcel is one phase 1 or 2 never reached. That is NOT the
+            # same as a parcel still waiting for a MAILING address: the bulk extract
+            # usually filled mailing already, and the job then told the user 16,859
+            # of 16,859 mailing lookups were pending when 16,576 were done. Count
+            # only parcels that still have a row with no mailing address.
+            mailing_pending = 0
             for pid in deferred:
-                for res in pid_map.get(pid, []):
-                    if res.mailing_address:
-                        continue
+                missing = [res for res in pid_map.get(pid, []) if not res.mailing_address]
+                if missing:
+                    mailing_pending += 1
+                for res in missing:
                     ed = dict(res.enrichment_data) if isinstance(res.enrichment_data, dict) else {}
                     ed["mailing_lookup_deferred"] = True
                     res.enrichment_data = ed
@@ -997,47 +1045,60 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                 # them the one thing that matters: their leads are not lost.
                 _logger.warning(
                     "Job %s: King mailing pass incomplete — requested=%d attempted=%d "
-                    "found=%d deferred=%d phase1_outcomes=%s error=%s",
+                    "found=%d deferred=%d mailing_pending=%d phase1_outcomes=%s error=%s",
                     job_id, len(pids), king_stats.get("mailing_attempted", 0), found,
-                    len(deferred), king_stats.get("phase1_outcomes", "n/a"),
+                    len(deferred), mailing_pending, king_stats.get("phase1_outcomes", "n/a"),
                     king_error or "none",
                 )
                 if summary is not None:
-                    summary["mailing_deferred"] = len(deferred)
+                    summary["mailing_deferred"] = mailing_pending
                 # USER-FACING: what happened, what was kept, what happens next.
-                _publish_log(
-                    r, job_id, "warning",
-                    f"Mailing addresses are still being looked up for {len(deferred)} "
-                    f"of {len(pids)} properties. County records were slow to respond, "
-                    "so those lookups will finish automatically in the background. "
-                    "Property addresses already found are saved and your leads are "
-                    "not affected.",
-                    db=db,
-                )
+                if mailing_pending:
+                    _publish_log(
+                        r, job_id, "warning",
+                        f"Mailing addresses are still being looked up for {mailing_pending:,} "
+                        f"of {len(pids):,} properties. County records were slow to respond, "
+                        "so those lookups will finish automatically in the background. "
+                        "Property addresses already found are saved and your leads are "
+                        "not affected.",
+                        db=db,
+                    )
             else:
                 _publish_log(r, job_id, "info", f"Found {found}/{len(pids)} mailing addresses", db=db)
 
-        # Owner-only repair for King tax-delinquent rows that ALREADY have a
-        # mailing address (so the missing-mailing pass above skipped them — e.g.
-        # mailing was COALESCE-copied onto a duplicate by
-        # _reuse_enrichment_for_duplicates) yet still carry the placeholder
-        # party_name. King tax is a point-in-time snapshot, so fresh jobs are
-        # ~100% duplicates that all hit this path. We resolve the owner with an
-        # HTTP-only lookup (no Playwright mailing fetch — that data is already
-        # present), under the SAME dual gate as the swap above: record_type ==
-        # tax_delinquent (belt) + exact placeholder shape (suspenders).
+        # Owner-only pass for King tax-delinquent rows that still have no owner
+        # name after phase 1: the rows phase 1 never reached (budget, busy source)
+        # and rows it did not ask about (e.g. mailing COALESCE-copied onto a
+        # duplicate by _reuse_enrichment_for_duplicates). HTTP-only, no Playwright,
+        # under the SAME dual gate as the swap above: record_type == tax_delinquent
+        # (belt) + blank or exact placeholder party (suspenders).
+        #
+        # It used to require a mailing address as well. That excluded exactly the
+        # leads the bulk extract could not mail (216 of the 840 delivered on job
+        # b2f2ecd5), so nothing ever asked who owns them. Phase 1 already looks up
+        # owners for every row regardless of mailing; this pass must too.
         if config.record_type == "tax_delinquent":
             from src.scrapers.king_wa_tax_delinquent import is_tax_placeholder_party
+
+            def _ed(res) -> dict:
+                return dict(res.enrichment_data) if isinstance(res.enrichment_data, dict) else {}
+
             owner_needs = [
                 res for res in all_results
                 if res.parcel_id and len(res.parcel_id.strip()) >= 6
-                and res.mailing_address
+                # The same shape batch_extract_king_owners will actually request. A
+                # digit-free id is dropped there unasked, and marking it "deferred"
+                # would promise a lookup that can never happen.
+                and any(c.isdigit() for c in res.parcel_id)
                 and (not res.party_name or is_tax_placeholder_party(res.party_name))
+                # Settled: the parcel's own county page named it and showed no owner.
+                # Asking again spends a request on the same answer.
+                and _ed(res).get(OWNER_OUTCOME_KEY) != OWNER_NOT_ON_RECORD
             ]
             if owner_needs:
                 _publish_log(
                     r, job_id, "info",
-                    f"Resolving owner names for {len(owner_needs)} tax-delinquent leads...",
+                    f"Resolving owner names for {len(owner_needs):,} tax-delinquent leads...",
                     db=db,
                 )
                 from src.scrapers.enrichment.king_county_assessor import (
@@ -1048,7 +1109,6 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                 o_pid_map: dict[str, list] = {}
                 for res in owner_needs:
                     o_pid_map.setdefault(res.parcel_id.strip(), []).append(res)
-                o_pids_all = list(o_pid_map.keys())
                 # No count cap (product decision 2026-09-03): a lead without an
                 # owner name is barely a lead, and a fixed 25 meant at most 6.5% of
                 # a 384-row job could ever be named. Volume is bounded instead by
@@ -1058,11 +1118,12 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                 # than recording it as "no owner". Those are safety valves, not
                 # caps, and are deliberately kept: they are what stops a repeat of
                 # the eRealProperty IP rate-block.
-                o_pids = o_pids_all
-                overflow = 0
-                # Caller-owned result dict: names are kept even if the outer
-                # wait_for cancels, and even if the breaker raises mid-run.
+                o_pids = list(o_pid_map.keys())
+                # Caller-owned result dicts: names AND the per-parcel outcome ledger
+                # are kept even if the outer wait_for cancels or the breaker raises.
                 owners: dict[str, str] = {}
+                o_stats: dict = {}
+                o_reason: str | None = None
                 try:
                     asyncio.run(asyncio.wait_for(
                         batch_extract_king_owners(
@@ -1073,6 +1134,7 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                             max_unresolved_rate=0.50,
                             fetch_attempts=1,
                             out=owners,
+                            stats=o_stats,
                             # Stop cooperatively just inside the hard timeout so the
                             # loop exits on its own terms rather than being killed.
                             time_budget_s=240,
@@ -1080,45 +1142,67 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                         timeout=300,
                     ))
                 except TimeoutError:
+                    o_reason = "timeout"
                     _logger.warning(
                         "Job %s: King owner-only lookup hit the hard timeout; "
                         "keeping %d owner names already resolved",
                         job_id, len(owners),
                     )
                 except (KingOwnerLookupBlockedError, SourceUnavailableError) as exc:
+                    # Keep what was already resolved. The breaker guards against
+                    # reading a throttle as "this parcel has no owner"; it does not
+                    # make the names fetched BEFORE it tripped any less real.
                     _logger.warning(
                         "Job %s: King owner-only lookup aborted: %s",
                         job_id, str(exc)[:180],
                     )
-                    try:
-                        _publish_log(
-                            r, job_id, "warning",
-                            # Says only what is true. The background recovery sweep
-                            # fills MAILING ADDRESSES and explicitly never touches
-                            # party_name, so promising owner names "will finish
-                            # automatically" would be a promise with nothing behind
-                            # it (Codex) -- the same shape of defect as the
-                            # deferred marker that no sweep ever read.
-                            "Owner name lookup stopped early because county records "
-                            "were slow to respond. Names already found are saved. "
-                            "Re-run this scraper to resolve the rest.",
-                            db=db,
-                        )
-                    except Exception:
-                        db.rollback()
-                    # Keep what was already resolved. The breaker guards against
-                    # reading a throttle as "this parcel has no owner"; it does not
-                    # make the names fetched BEFORE it tripped any less real, and
-                    # discarding them threw away good data on every trip.
+                except Exception as exc:  # noqa: BLE001 — best-effort county lookup, as phase 1
+                    o_reason = "error"
+                    _logger.warning(
+                        "Job %s: King owner-only lookup failed: %s: %s",
+                        job_id, type(exc).__name__, str(exc)[:160],
+                    )
+                o_reason = o_reason or o_stats.get("outcome") or "error"
+                _transient = set(o_stats.get("transient", []))
+                _unverified = set(o_stats.get("unverified", []))
+                _no_owner = set(o_stats.get("no_owner_on_record", []))
+
+                # One outcome per parcel, fanned out to every lead on it. A lead is
+                # named, settled as having no owner on the county record, or marked
+                # for another attempt with the reason this one did not happen. A
+                # retry marker never claims the county said anything.
                 swapped = 0
-                for pid, owner in owners.items():
-                    for res in o_pid_map.get(pid, []):
-                        # Fill only a BLANK or placeholder party_name (never clobber
-                        # a real owner). King tax rows now ship blank, so accept
-                        # None as well as the legacy placeholder.
-                        if not res.party_name or is_tax_placeholder_party(res.party_name):
+                owner_deferred_rows = 0
+                not_on_record_parcels = 0
+                for pid, rows in o_pid_map.items():
+                    owner = owners.get(pid)
+                    if not owner and pid in _no_owner:
+                        not_on_record_parcels += 1
+                    for res in rows:
+                        if res.party_name and not is_tax_placeholder_party(res.party_name):
+                            # Named since owner_needs was built. Never clobber a
+                            # real owner, and a named lead needs no owner marker.
+                            continue
+                        ed = _ed(res)
+                        if owner:
                             res.party_name = owner
                             swapped += 1
+                            if OWNER_DEFERRED_KEY in ed:
+                                ed[OWNER_DEFERRED_KEY] = False
+                            ed.pop(OWNER_DEFERRED_REASON_KEY, None)
+                        elif pid in _no_owner:
+                            ed[OWNER_OUTCOME_KEY] = OWNER_NOT_ON_RECORD
+                            ed[OWNER_DEFERRED_KEY] = False
+                            ed.pop(OWNER_DEFERRED_REASON_KEY, None)
+                        else:
+                            ed[OWNER_DEFERRED_KEY] = True
+                            ed[OWNER_DEFERRED_REASON_KEY] = (
+                                "transient_failure" if pid in _transient
+                                else "unverified_page" if pid in _unverified
+                                else o_reason
+                            )
+                            owner_deferred_rows += 1
+                        res.enrichment_data = ed
                 # Decide persisted-vs-failed on the OWNER commit alone, THEN publish.
                 # _publish_log(db=db) commits too, so folding the success log into
                 # the same try would mislabel a persisted swap as "not persisted"
@@ -1133,25 +1217,52 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                         job_id, swapped, str(exc)[:120],
                     )
                     db.rollback()
-                # Guard the post-commit log: _publish_log(db=db) commits, and a
+                if summary is not None:
+                    summary["owner_deferred"] = (
+                        owner_deferred_rows if committed else len(owner_needs)
+                    )
+                # USER-FACING, one line per fact, and only facts. "Resolved 0 owner
+                # names from 0/16576 parcels" read as a finished lookup that found
+                # nothing, when the county had never been asked.
+                if committed:
+                    lines: list[tuple[str, str]] = []
+                    if owners or o_stats.get("attempted"):
+                        lines.append((
+                            "info",
+                            f"Resolved {swapped} owner names from "
+                            f"{len(owners)}/{len(o_pids)} parcels",
+                        ))
+                    if not_on_record_parcels:
+                        lines.append((
+                            "info",
+                            f"{not_on_record_parcels:,} "
+                            f"{'parcel has' if not_on_record_parcels == 1 else 'parcels have'} "
+                            "no owner name on the county record.",
+                        ))
+                    if owner_deferred_rows:
+                        # No promise of an automatic retry: nothing re-runs owner
+                        # lookups yet, and a promise with nothing behind it is the
+                        # defect this line replaces.
+                        lines.append((
+                            "warning",
+                            f"Owner names could not be looked up for {owner_deferred_rows:,} "
+                            f"{'lead' if owner_deferred_rows == 1 else 'leads'} during this run. "
+                            "Names already found are saved.",
+                        ))
+                else:
+                    lines = [(
+                        "warning",
+                        "Owner-name resolution failed to persist (will retry next run)",
+                    )]
+                # Guard the post-commit logs: _publish_log(db=db) commits, and a
                 # failure HERE must not crash after the swaps already persisted nor
                 # skip the skip-trace enqueue that follows this block.
-                if committed:
-                    deferred = f" ({overflow} deferred to backfill)" if overflow else ""
-                    msg, level = (
-                        f"Resolved {swapped} owner names from {len(owners)}/{len(o_pids)} parcels{deferred}",
-                        "info",
-                    )
-                else:
-                    msg, level = (
-                        "Owner-name resolution failed to persist (will retry next run)",
-                        "warning",
-                    )
-                try:
-                    _publish_log(r, job_id, level, msg, db=db)
-                except Exception as exc:
-                    _logger.warning("Job %s: owner-only progress log failed: %s", job_id, str(exc)[:120])
-                    db.rollback()  # log write failed; swaps already settled — keep going
+                for level, msg in lines:
+                    try:
+                        _publish_log(r, job_id, level, msg, db=db)
+                    except Exception as exc:
+                        _logger.warning("Job %s: owner-only progress log failed: %s", job_id, str(exc)[:120])
+                        db.rollback()  # log write failed; swaps already settled — keep going
 
     # ── Post-enrichment: log unactionable records (kept for visibility) ──
     # Records with no property_address and no mailing_address can't be

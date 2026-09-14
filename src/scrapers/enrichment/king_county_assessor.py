@@ -24,6 +24,7 @@ from src.config import settings
 from src.scrapers.base_scraper import BridgeScraper
 from src.scrapers.enrichment.source_health import (
     KING_EREALPROPERTY,
+    SourceUnavailableError,
     check_source_or_raise,
     record_source_blocked,
 )
@@ -257,13 +258,23 @@ def _extract_owner_name(page_html: str) -> str | None:
     return name
 
 
-async def _fetch_king_owner(pid: str, *, max_attempts: int = 1) -> tuple[str | None, bool]:
+async def _fetch_king_owner(
+    pid: str, *, max_attempts: int = 1, evidence: dict | None = None,
+) -> tuple[str | None, bool]:
     """Resolve one parcel's owner with bounded retry.
 
     Returns (owner_name_or_None, had_transient_error). A 200 response whose page
     has no owner cell is a GENUINE miss -> (None, False). A persistent non-200
     (429/5xx/4xx) or exception after max_attempts attempts is a TRANSIENT
     failure -> (None, True), so a caller can avoid treating it as "no such owner".
+
+    ``evidence``, when given, receives ``echo_confirmed``: True only when the page
+    itself names the requested parcel. A miss is only proof that the county
+    record has no owner when this is True. `parcel_page_is_for` deliberately
+    trusts a page with NO parcel cell for a well-formed 10-digit PIN (so a layout
+    change cannot zero out every lookup), which means a throttle or interstitial
+    page is "for" every such parcel and names no owner. Good enough to refuse a
+    wrong owner, not good enough to record an absence.
     """
     attempts = max(1, max_attempts)
     for attempt in range(attempts):
@@ -272,6 +283,8 @@ async def _fetch_king_owner(pid: str, *, max_attempts: int = 1) -> tuple[str | N
             # in depth — same call the full enricher uses.
             r = safe_get(f"{_ERP_URL}{pid}", headers=_HEADERS, timeout=10)
             if r.status_code == 200:
+                if evidence is not None:
+                    evidence["echo_confirmed"] = _extract_parcel_echo(r.text) == _digits(pid)
                 # The county may have silently resolved a DIFFERENT parcel (see
                 # parcel_page_is_for). A wrong owner is worse than no owner — this
                 # path repairs placeholder party_name — so treat it as a genuine
@@ -292,6 +305,20 @@ async def _fetch_king_owner(pid: str, *, max_attempts: int = 1) -> tuple[str | N
     return None, True
 
 
+def _new_owner_stats() -> dict:
+    """Fresh outcome ledger for one owner-only pass.
+
+    ``outcome``: not_admitted | source_unavailable | budget_exhausted | lease_lost |
+    breaker_tripped | complete (None while running). Parcel lists, disjoint:
+    ``attempted`` got a usable page (named or not), ``transient`` did not.
+    Within ``attempted`` a miss is ``no_owner_on_record`` only when the page named
+    the requested parcel, otherwise ``unverified``. A parcel in none of them was
+    never reached.
+    """
+    return {"outcome": None, "attempted": [], "transient": [],
+            "no_owner_on_record": [], "unverified": []}
+
+
 async def batch_extract_king_owners(parcel_ids: list[str], delay: float = 0.1, **kwargs):
     """Admission-controlled wrapper around the owner-only lookup.
 
@@ -305,11 +332,19 @@ async def batch_extract_king_owners(parcel_ids: list[str], delay: float = 0.1, *
     A caller that cannot get in returns what it has rather than queueing: the
     owner-only path is re-runnable by design (the rows still carry a placeholder),
     so deferring costs a later pass, not the data.
+
+    ``stats``, when given, is filled with what happened (see `_new_owner_stats`).
+    It is seeded BEFORE the lease is requested: a denied lease used to return the
+    same empty dict as "every parcel has no owner", and a real job logged
+    "Resolved 0 owner names from 0/16576 parcels" with nothing on any row to say
+    the county was never asked.
     """
     import time as _t
 
     from src.scrapers.enrichment.source_admission import SourceAdmission
 
+    if kwargs.get("stats") is not None:
+        kwargs["stats"].update(_new_owner_stats())
     _t0 = _t.monotonic()
     with SourceAdmission(KING_EREALPROPERTY, max_wait_s=45.0) as admission:
         _waited = _t.monotonic() - _t0
@@ -327,6 +362,8 @@ async def batch_extract_king_owners(parcel_ids: list[str], delay: float = 0.1, *
                 "King owner lookup: another pass holds the source lease; skipping "
                 "%d parcel(s) this run (re-runnable)", len(parcel_ids),
             )
+            if kwargs.get("stats") is not None:
+                kwargs["stats"]["outcome"] = "not_admitted"
             out = kwargs.get("out")
             return out if out is not None else {}
         return await _batch_extract_king_owners(
@@ -344,6 +381,7 @@ async def _batch_extract_king_owners(
     fetch_attempts: int = 1,
     out: dict[str, str] | None = None,
     time_budget_s: float | None = None,
+    stats: dict | None = None,
 ) -> dict[str, str]:
     """Owner/taxpayer name per parcel from eRealProperty — HTTP only, no Playwright.
 
@@ -375,6 +413,11 @@ async def _batch_extract_king_owners(
     # `time_budget_s` is the cooperative version of the same idea: stop cleanly
     # (keeping results) instead of being killed from outside.
     owners: dict[str, str] = out if out is not None else {}
+    # Same idea for the outcome ledger: written as each fetch settles, so a caller
+    # whose wait_for cancels this coroutine still knows which parcels were asked.
+    st = stats if stats is not None else {}
+    for _k, _v in _new_owner_stats().items():
+        st.setdefault(_k, _v)
     import time as _time
     _deadline = (_time.monotonic() + time_budget_s) if time_budget_s is not None else None
     # parcel_id comes from our own scraped DB rows (not user input), but require a
@@ -384,12 +427,17 @@ async def _batch_extract_king_owners(
         if pid and len(pid.strip()) >= 6 and any(c.isdigit() for c in pid)
     ))
     if not clean:
+        st["outcome"] = "complete"
         return owners
 
     # Shared cross-process gate. The per-run breaker below only stops THIS run;
     # this stops every worker/backfill while King is still refusing us. Raises
     # SourceUnavailableError, which callers degrade on (they must not retry).
-    check_source_or_raise(KING_EREALPROPERTY)
+    try:
+        check_source_or_raise(KING_EREALPROPERTY)
+    except SourceUnavailableError:
+        st["outcome"] = "source_unavailable"
+        raise
 
     _logger.info("Owner-only lookup for %d parcels...", len(clean))
     failures = 0
@@ -401,6 +449,7 @@ async def _batch_extract_king_owners(
                 "Owner-only lookup: time budget exhausted after %d/%d parcels "
                 "(%d resolved so far, kept)", i, len(clean), len(owners),
             )
+            st["outcome"] = "budget_exhausted"
             break
         if i % 100 == 0 and i > 0:
             _logger.info("  owner HTTP: %d / %d ...", i, len(clean))
@@ -409,14 +458,24 @@ async def _batch_extract_king_owners(
                 "Owner-only lookup: lost the source lease after %d/%d parcels "
                 "(%d resolved, kept)", i, len(clean), len(owners),
             )
+            st["outcome"] = "lease_lost"
             break
-        owner, errored = await _fetch_king_owner(pid, max_attempts=fetch_attempts)
+        evidence: dict = {}
+        owner, errored = await _fetch_king_owner(
+            pid, max_attempts=fetch_attempts, evidence=evidence)
         if owner:
             owners[pid] = owner
+            st["attempted"].append(pid)
         elif errored:
             failures += 1
+            st["transient"].append(pid)
         else:
             misses += 1
+            st["attempted"].append(pid)
+            if evidence.get("echo_confirmed"):
+                st["no_owner_on_record"].append(pid)
+            else:
+                st["unverified"].append(pid)
         window.append(_OwnerLookupOutcome(resolved=bool(owner), transient=errored))
         if len(window) == window.maxlen:
             transient_rate = sum(o.transient for o in window) / len(window)
@@ -433,9 +492,12 @@ async def _batch_extract_king_owners(
                 # Persist it: the breaker alone would let the next process start
                 # hammering the same blocked source seconds later.
                 record_source_blocked(KING_EREALPROPERTY, msg)
+                st["outcome"] = "breaker_tripped"
                 raise KingOwnerLookupBlockedError(msg)
         await asyncio.sleep(delay)
 
+    if st["outcome"] is None:
+        st["outcome"] = "complete"
     if failures:
         _logger.warning(
             "Owner-only lookup: %d/%d parcels failed after %d retries (transient — "

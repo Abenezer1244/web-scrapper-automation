@@ -39,6 +39,7 @@ REASON = "historical_lead_before_owner_markers"
 
 _ELIGIBLE = """
       r.is_duplicate = false
+  AND (r.enrichment_data IS NULL OR jsonb_typeof(r.enrichment_data::jsonb) IN ('object', 'null'))
   AND r.enrichment_data::jsonb->>'delivery_excluded_reason' IS NULL
   AND (r.party_name IS NULL OR btrim(r.party_name) = '')
   AND btrim(r.parcel_id) ~ '^[0-9]{10}$'
@@ -71,6 +72,11 @@ _MARK_SQL = f"""
          || CAST(:payload AS jsonb))::json
     WHERE r.id = :rid AND r.user_id = :uid
       AND {_ELIGIBLE}
+      AND EXISTS (
+        SELECT 1 FROM jobs j JOIN scraper_configs sc ON sc.id = j.scraper_config_id
+        WHERE j.id = r.job_id AND j.status = 'done'
+          AND lower(sc.county) = 'king' AND upper(sc.state) = 'WA'
+          AND sc.record_type = 'tax_delinquent')
 """  # noqa: S608 -- splices only the _ELIGIBLE constant; every value is bound
 
 

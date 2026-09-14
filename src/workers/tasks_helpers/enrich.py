@@ -234,7 +234,13 @@ def _fill_king_mailing_from_extract(pid_map: dict[str, list], job_id: str) -> in
     """
     from src.scrapers.enrichment.king_rpacct import SOURCE, resolve_pins
 
-    wanted = {pid for pid, rows in pid_map.items()
+    # Keyed by the PIN the extract knows: a recorder account number resolved to its
+    # PIN is looked up under that PIN, while parcel_id keeps what the recorder printed.
+    by_pin: dict[str, list] = {}
+    for pid, rows in pid_map.items():
+        for res in rows:
+            by_pin.setdefault(_king_lookup_pin(res, pid), []).append(res)
+    wanted = {pin for pin, rows in by_pin.items()
               if any(not res.mailing_address for res in rows)}
     if not wanted:
         return 0
@@ -247,7 +253,7 @@ def _fill_king_mailing_from_extract(pid_map: dict[str, list], job_id: str) -> in
     for pid, answer in answers.items():
         if answer.status != "found":
             continue
-        for res in pid_map.get(pid, []):
+        for res in by_pin.get(pid, []):
             if res.mailing_address:
                 continue
             res.mailing_address = answer.mailing_address
@@ -258,6 +264,198 @@ def _fill_king_mailing_from_extract(pid_map: dict[str, list], job_id: str) -> in
             filled += 1
     _logger.info("Job %s: King extract filled %d row(s) across %d requested parcel(s)",
                  job_id, filled, len(wanted))
+    return filled
+
+
+# enrichment_data["resolved_by"] for a recorder account number mapped to its PIN through
+# the Assessor extract. Exact, so it is the only resolution King lookups key on.
+KING_ACCOUNT_RESOLVER = "rpacct_account_number"
+_KING_ACCOUNT_RE = re.compile(r"\d{12}")
+_KING_PIN_RE = re.compile(r"\d{10}")
+
+
+def _king_lookup_pin(res, default: str | None = None) -> str:
+    """The PIN to ask King sources about for this row. Never a replacement for parcel_id.
+
+    parcel_id stays what the recorder printed (it feeds the frozen dedup_hash). Only an
+    exact account-number resolution changes what is looked up.
+    """
+    ed = getattr(res, "enrichment_data", None)
+    if isinstance(ed, dict) and ed.get("resolved_by") == KING_ACCOUNT_RESOLVER:
+        pin = str(ed.get("resolved_parcel_id") or "")
+        if _KING_PIN_RE.fullmatch(pin):
+            return pin
+    return default if default is not None else (getattr(res, "parcel_id", None) or "").strip()
+
+
+# Guarded writes. The enrichment pass holds ORM objects for a whole job while the
+# mailing recovery sweep may update the same rows, so a field is filled only if it is
+# still empty IN THE DATABASE, and enrichment_data is merged key by key rather than
+# replaced. The ORM object is then synced to what was committed, so later passes in
+# this job see the real value and nothing is flushed twice.
+_ED_IS_OBJECT = "(enrichment_data IS NULL OR json_typeof(enrichment_data) = 'object')"
+_PROPERTY_IS_EMPTY = ("coalesce(btrim(property_address), '') IN ('', '(enrichment unavailable)')")
+
+_SQL_RESOLVE_ACCOUNT = f"""
+    UPDATE results
+       SET enrichment_data = (COALESCE(enrichment_data, '{{}}'::json)::jsonb || CAST(:patch AS jsonb))::json
+     WHERE id = :rid AND user_id = :uid AND {_ED_IS_OBJECT}
+       AND (enrichment_data->>'resolved_parcel_id') IS NULL
+ RETURNING enrichment_data
+"""
+
+_SQL_FILL_PROPERTY = f"""
+    UPDATE results
+       SET property_address = :address,
+           property_city = COALESCE(property_city, :city),
+           property_state = COALESCE(property_state, :state),
+           property_zip = COALESCE(property_zip, :zip),
+           enrichment_data = (COALESCE(enrichment_data, '{{}}'::json)::jsonb || CAST(:patch AS jsonb))::json
+     WHERE id = :rid AND user_id = :uid AND {_ED_IS_OBJECT} AND {_PROPERTY_IS_EMPTY}
+ RETURNING property_address, property_city, property_state, property_zip, enrichment_data
+"""
+
+_SQL_MARK_PROPERTY = f"""
+    UPDATE results
+       SET enrichment_data = (COALESCE(enrichment_data, '{{}}'::json)::jsonb || CAST(:patch AS jsonb))::json
+     WHERE id = :rid AND user_id = :uid AND {_ED_IS_OBJECT} AND {_PROPERTY_IS_EMPTY}
+ RETURNING enrichment_data
+"""
+
+
+def _guarded_update(db, res, sql: str, params: dict, columns: tuple[str, ...]) -> bool:
+    """Run one guarded UPDATE for ``res``; sync the ORM object to what was written."""
+    import json
+
+    from sqlalchemy import text as _sa_text
+    from sqlalchemy.orm.attributes import set_committed_value
+
+    db.flush()
+    # A None value is "nothing to say", never an instruction to blank a stored key.
+    patch = {k: v for k, v in params["patch"].items() if v is not None}
+    row = db.execute(_sa_text(sql), {
+        **params, "rid": str(res.id), "uid": str(res.user_id), "patch": json.dumps(patch),
+    }).first()
+    if row is None:
+        # The guard refused: the database no longer matches what this job loaded.
+        # Reload, so no later pass in this job writes its stale copy back over it. A row
+        # deleted meanwhile (its job was removed) is dropped from the session instead:
+        # raising here would roll back every fill this sweep already made.
+        from sqlalchemy.exc import InvalidRequestError
+
+        try:
+            db.refresh(res)
+        except InvalidRequestError:
+            db.expunge(res)
+        return False
+    for col in columns:
+        set_committed_value(res, col, row._mapping[col])
+    return True
+
+
+def _resolve_king_account_parcels(db, rows: list, job_id: str) -> int:
+    """Map recorder-printed 12-digit account numbers to their PIN. Returns rows resolved.
+
+    Only rows the King recorder index produced qualify: a 12-digit value from any other
+    source is not known to be an account number. The caller commits.
+    """
+    from src.scrapers.enrichment.king_rpacct import resolve_account_pins
+
+    candidates = [
+        res for res in rows
+        if _KING_ACCOUNT_RE.fullmatch((res.parcel_id or "").strip())
+        and isinstance(res.enrichment_data, dict)
+        and res.enrichment_data.get("source") == "king_landmark_json"
+        and not res.enrichment_data.get("resolved_parcel_id")
+    ]
+    if not candidates:
+        return 0
+    resolved = resolve_account_pins({res.parcel_id.strip() for res in candidates})
+    if resolved is None:
+        _logger.info("Job %s: King extract unavailable, %d account-number parcel(s) unresolved",
+                     job_id, len(candidates))
+        return 0
+    pins, snapshot = resolved
+    done = 0
+    for res in candidates:
+        pin = pins.get(res.parcel_id.strip())
+        if not pin:
+            continue
+        patch = {"resolved_parcel_id": pin, "source_parcel_id": res.parcel_id.strip(),
+                 "resolved_by": KING_ACCOUNT_RESOLVER, "resolved_snapshot": snapshot}
+        if _guarded_update(db, res, _SQL_RESOLVE_ACCOUNT, {"patch": patch}, ("enrichment_data",)):
+            done += 1
+    _logger.info("Job %s: %d of %d King account-number parcel(s) resolved to a PIN",
+                 job_id, done, len(candidates))
+    return done
+
+
+def _fill_king_condo_unit_situs(db, rows: list, job_id: str) -> int:
+    """Fill King condo UNIT property addresses from the Assessor condo extract.
+
+    King GIS has no feature for a unit PIN, so without this a unit's address came only
+    from the per-parcel eRealProperty page. Returns rows filled; the caller commits.
+    A unit whose address cannot be completed (no site address, ZIP conflict, no
+    corroborated city) is left empty with the reason and extract date, so the page
+    lookup can still fill it and a later sweep knows why it is blank.
+    """
+    from src.scrapers.enrichment import county_gis
+    from src.scrapers.enrichment.king_condo_units import (
+        SOURCE,
+        complex_pin,
+        compose_fill,
+        resolve_units,
+    )
+
+    todo: dict[str, list] = {}
+    for res in rows:
+        if res.property_address and res.property_address != "(enrichment unavailable)":
+            continue
+        pin = _king_lookup_pin(res)
+        if _KING_PIN_RE.fullmatch(pin):
+            todo.setdefault(pin, []).append(res)
+    if not todo:
+        return 0
+    resolved = resolve_units(set(todo))
+    if resolved is None:
+        _logger.info("Job %s: King condo extract unavailable, unit addresses use the pages", job_id)
+        return 0
+    answers, snapshot = resolved
+    units = {pin: situs for pin, situs in answers.items() if situs.status != "absent"}
+    complexes = sorted({complex_pin(pin) for pin, s in units.items() if s.status == "found" and s.zip})
+    complex_gis: dict = {}
+    if complexes:
+        try:
+            complex_gis = county_gis.batch_enrich_parcels_gis(complexes, "king", "WA")
+        except Exception as exc:  # noqa: BLE001 -- no locality means no fill, never a guess
+            if type(exc).__name__ in ("SoftTimeLimitExceeded", "TimeLimitExceeded"):
+                raise
+            _logger.warning("Job %s: King complex locality lookup failed: %s", job_id, str(exc)[:120])
+    filled = 0
+    for pin, situs in units.items():
+        cpin = complex_pin(pin)
+        fill = compose_fill(situs, complex_gis.get(cpin))
+        for res in todo[pin]:
+            if fill is None:
+                status = "no_locality" if situs.status == "found" else situs.status
+                patch = {"condo_unit_status": status, "condo_unit_snapshot": snapshot,
+                         "condo_unit_nbr": situs.unit_nbr}
+                _guarded_update(db, res, _SQL_MARK_PROPERTY, {"patch": patch}, ("enrichment_data",))
+                continue
+            patch = {"property_source": SOURCE, "property_source_snapshot": snapshot,
+                     "property_locality_source": f"king_gis_complex:{cpin}",
+                     "condo_unit_nbr": situs.unit_nbr,
+                     "condo_unit_status": "found", "condo_unit_snapshot": snapshot}
+            if _guarded_update(
+                db, res, _SQL_FILL_PROPERTY,
+                {"address": fill.property_address, "city": fill.city, "state": fill.state,
+                 "zip": fill.zip, "patch": patch},
+                ("property_address", "property_city", "property_state", "property_zip",
+                 "enrichment_data"),
+            ):
+                filled += 1
+    _logger.info("Job %s: King condo extract filled %d of %d unit row(s)", job_id, filled,
+                 sum(len(todo[p]) for p in units))
     return filled
 
 
@@ -304,6 +502,22 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
         sa_select(Result).where(Result.job_id == job_id, Result.user_id == job.user_id)
     ).scalars().all()
 
+    is_king = config.county.lower() == "king" and config.state.upper() == "WA"
+    if is_king:
+        # Before any parcel-keyed lookup, so GIS, the RPAcct mailing prefill and the condo
+        # extract all ask about the real PIN. One streamed extract scan, only when a
+        # recorder account number is present. Best-effort: unresolved rows are simply
+        # looked up as printed, exactly as before.
+        try:
+            if _resolve_king_account_parcels(db, all_results, job_id):
+                db.commit()
+        except Exception as exc:  # noqa: BLE001 -- enrichment is best-effort
+            if type(exc).__name__ in ("SoftTimeLimitExceeded", "TimeLimitExceeded"):
+                raise
+            db.rollback()
+            _logger.warning("Job %s: King account-number resolution failed: %s",
+                            job_id, str(exc)[:120])
+
     # GIS batch enrichment for property AND mailing addresses
     # Run for records missing either property address or mailing address
     results_need_addr = [
@@ -324,7 +538,7 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
         gis_mailing_deferred = 0
         parcel_map: dict[str, list] = {}
         for res in results_need_addr:
-            pid = res.parcel_id.strip()
+            pid = _king_lookup_pin(res) if is_king else res.parcel_id.strip()
             if pid not in parcel_map:
                 parcel_map[pid] = []
             parcel_map[pid].append(res)
@@ -477,6 +691,24 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                 "addresses are unfilled (best-effort; re-run to fill)",
                 job_id, commit_failures,
             )
+
+    if is_king:
+        # Condo UNIT addresses, which King GIS never has. After the GIS sweep (so only its
+        # misses are asked) and before the eRealProperty pass, which still runs for owner
+        # and mailing and still fills any unit this could not complete. One streamed scan
+        # of a ~7 MB weekly file plus one GIS request per 50 complexes.
+        try:
+            _condo_filled = _fill_king_condo_unit_situs(db, all_results, job_id)
+            db.commit()
+            if _condo_filled:
+                _publish_log(r, job_id, "info",
+                             f"Found {_condo_filled} condo unit property addresses in King "
+                             "County assessor records.", db=db)
+        except Exception as exc:  # noqa: BLE001 -- enrichment is best-effort
+            if type(exc).__name__ in ("SoftTimeLimitExceeded", "TimeLimitExceeded"):
+                raise
+            db.rollback()
+            _logger.warning("Job %s: King condo unit lookup failed: %s", job_id, str(exc)[:120])
 
     # Name-based PACS fallback for records with no parcel (e.g. probate
     # estate filings: Cert of Death, Letters Testamentary, Personal Rep
@@ -732,7 +964,26 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                             # Two leads can share one malformed PID with different
                             # parties, and that evidence does not transfer (Codex P1).
                             continue
-                        if prop and not res.property_address:
+                        _ed_now = res.enrichment_data if isinstance(res.enrichment_data, dict) else {}
+                        if (
+                            _ed_now.get("resolved_by") == KING_ACCOUNT_RESOLVER
+                            and data.get("resolved_parcel_id") != _ed_now.get("resolved_parcel_id")
+                        ):
+                            # The Assessor extract already mapped this recorder account
+                            # number to its PIN exactly. The page was requested with the
+                            # 12-digit value, so only a page PROVEN to be that same PIN may
+                            # write onto this lead. One naming a different parcel is a
+                            # conflict (recorded, never a correction); one naming none proves
+                            # nothing. Either way nothing from it is written, whatever the
+                            # lookup status says.
+                            if data.get("resolved_parcel_id"):
+                                res.enrichment_data = {**_ed_now, "resolved_conflict": {
+                                    "resolved_parcel_id": data.get("resolved_parcel_id"),
+                                    "resolved_by": data.get("resolved_by"),
+                                }}
+                            continue
+                        if prop and (not res.property_address
+                                     or res.property_address == "(enrichment unavailable)"):
                             res.property_address = prop
                         if prop and not res.property_zip:
                             # eRealProperty's Site Address sometimes ends in the ZIP
@@ -761,7 +1012,8 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                         # real one. parcel_id STAYS as the county printed it (it feeds
                         # the frozen dedup_hash); the resolved PIN + the evidence that
                         # chose it are recorded beside it (Codex).
-                        if data.get("parcel_lookup") in ("recovered", "mismatch"):
+                        if (data.get("parcel_lookup") in ("recovered", "mismatch")
+                                and _ed_now.get("resolved_by") != KING_ACCOUNT_RESOLVER):
                             ed = dict(res.enrichment_data) if isinstance(res.enrichment_data, dict) else {}
                             ed["parcel_lookup"] = data["parcel_lookup"]
                             for k, v in data.items():

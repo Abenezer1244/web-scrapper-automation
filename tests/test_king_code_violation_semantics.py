@@ -428,6 +428,76 @@ async def test_repair_write_skips_a_row_relocated_since_it_was_read(db, business
     assert await asyncio.to_thread(_write, "9138100481") == 1
 
 
+@pytest.mark.asyncio
+async def test_a_live_king_cv_job_locates_the_parcel_names_the_owner_and_keeps_parcel_id_null(
+    db, business_user, redis_client, tmp_path, monkeypatch,
+):
+    """Behavioral: the real inline enrichment pass for an enriching King code-violation job."""
+    from tests.test_king_rpacct_mailing import _acct, _extract, _use_extract
+
+    base_ed = {"source": "seattle_sdci_code_violations", "record_type": "Complaint",
+               "latitude": "47.67934", "longitude": "-122.31749"}
+    exact, dedup = await _stored_row(db, business_user, party=None, status="enriching",
+                                     address="7011 ROOSEVELT WAY NE, SEATTLE WA 98115",
+                                     ed={**base_ed, "record_number": "012954-26CP"})
+    job_id = (await db.execute(text("SELECT job_id FROM results WHERE id = :i"),
+                               {"i": exact})).scalar()
+    # Same job: no ZIP in the source address -> street-only match, no owner lookup.
+    street = str(uuid.uuid4())
+    db.add(Result(id=street, user_id=business_user.id, job_id=job_id, party_name=None,
+                  property_address="7011 ROOSEVELT WAY NE", legal_description="012955-26CP",
+                  mailing_address=None, skip_trace_status="not_attempted", is_duplicate=False,
+                  enrichment_data={**base_ed, "record_number": "012955-26CP"}))
+    await db.execute(text("UPDATE results SET mailing_address = NULL WHERE id = :i"), {"i": exact})
+    await db.commit()
+
+    _layer(monkeypatch, ROOSEVELT_PARCEL)
+    monkeypatch.setattr(kpl.time, "sleep", lambda s: None)
+    _use_extract(monkeypatch, _extract(tmp_path, [
+        _acct("913810", "0481", "7556 12TH AVE NE", "SEATTLE WA", "98115")]))
+    owner_pages: list = []
+
+    def _erp(url, *a, **kw):
+        owner_pages.append(url)
+        return _Resp(text_body=ROOSEVELT_PAGE)
+
+    monkeypatch.setattr(kca, "safe_get", _erp)
+
+    async def _no_wait(_s):
+        return None
+
+    monkeypatch.setattr(kca.asyncio, "sleep", _no_wait)
+    monkeypatch.setattr("src.scrapers.enrichment.county_gis.batch_enrich_parcels_gis",
+                        lambda *a, **kw: {})
+
+    def _go():
+        from src.db.session import system_sync_session
+        from src.workers.tasks_helpers.enrich import _run_inline_enrichment
+
+        with system_sync_session() as sdb:
+            job = sdb.get(Job, str(job_id))
+            config = sdb.get(ScraperConfig, job.scraper_config_id)
+            _run_inline_enrichment(sdb, job, redis_client, str(job_id), config, summary={})
+
+    await asyncio.to_thread(_go)
+
+    got = {str(r.id): r for r in (await db.execute(text(
+        "SELECT id, party_name, parcel_id, dedup_hash, mailing_address, enrichment_data "
+        "FROM results WHERE id = ANY(:ids)"), {"ids": [exact, street]})).all()}
+    e, s = got[exact], got[street]
+    assert e.party_name == "7011 ROOSEVELT WAY NE LLC 7"
+    assert e.enrichment_data["owner_source"] == "king_erealproperty"
+    assert e.enrichment_data["owner_pin"] == "9138100481"
+    assert e.enrichment_data["kc_pin_match"] == "exact"
+    assert e.mailing_address == "7556 12TH AVE NE, SEATTLE, WA 98115"
+    assert (e.parcel_id, e.dedup_hash) == (None, dedup)
+    assert located_parcel_id(e.enrichment_data) == "9138100481"
+    assert s.enrichment_data["kc_pin_match"] == "street_only"
+    assert s.party_name is None and s.parcel_id is None
+    assert located_parcel_id(s.enrichment_data) is None
+    assert len(owner_pages) == 1  # one page for the one exact PIN
+
+
 def test_repair_refuses_owner_lookups_on_the_private_redis_host(monkeypatch):
     monkeypatch.setenv("REDIS_URL", "redis://default:x@redis.railway.internal:6379")
     with pytest.raises(SystemExit):

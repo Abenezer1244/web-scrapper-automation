@@ -181,6 +181,9 @@ async def test_download_after_switch_uses_crm_headers(client, db, starter_user, 
         assert url.status_code == 200, url.text
         file = await client.get(url.json()["url"])
         assert file.status_code == 200
+        # The file is live: a browser-cacheable response served the OLD headers after
+        # a switch for an hour (found by a real-browser check), so it must be no-store.
+        assert file.headers["cache-control"] == "no-store"
         return list(csv.reader(io.StringIO(file.text)))[0]
 
     assert await _header() == resolve_lead_export_columns("pre_foreclosure")

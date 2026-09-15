@@ -1263,9 +1263,13 @@ class ResultRow(BaseModel):
     days_to_auction: int | None = None
     # The county parcel this lead was located on by map point when the source gave no
     # parcel number (King/Seattle code violations): shown as the Parcel ID, but it is
-    # NOT parcel_id, which stays the billing/dedup identity. Only an exact street + ZIP
-    # match is exposed (src/utils/located_parcel.py). None whenever parcel_id is set.
+    # NOT parcel_id, which stays the billing/dedup identity. Exact (street + ZIP) and
+    # street-only matches are exposed, condo complexes never (src/utils/located_parcel.py).
+    # None whenever parcel_id is set.
     located_parcel_id: str | None = None
+    # How the located parcel matched: "exact" (street + ZIP) or "street_only" (the
+    # source gave no ZIP). None whenever located_parcel_id is None.
+    located_parcel_match: str | None = None
 
     model_config = {"from_attributes": True}
 
@@ -1326,9 +1330,11 @@ class ResultRow(BaseModel):
         object.__setattr__(self, "contactability_score", sig["contactability_score"])
         object.__setattr__(self, "days_to_auction", sig["days_to_auction"])
         if self.located_parcel_id is None and not self.parcel_id:
-            from src.utils.located_parcel import located_parcel_id
+            from src.utils.located_parcel import located_parcel_id, located_parcel_match
             object.__setattr__(self, "located_parcel_id",
                                located_parcel_id(self.enrichment_data))
+            object.__setattr__(self, "located_parcel_match",
+                               located_parcel_match(self.enrichment_data))
 
 
 class DuplicateSource(BaseModel):

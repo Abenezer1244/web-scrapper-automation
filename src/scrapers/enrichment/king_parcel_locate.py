@@ -72,7 +72,8 @@ class Located:
     parcel_address: str | None = None
     # For a match: "exact" when both ZIPs were known and equal, "street_only" when one
     # side had no ZIP (the street still matched), "condo_complex" when the parcel is a
-    # whole condominium. Only "exact" is shown as a Parcel ID or used to name the owner.
+    # whole condominium. "exact" and "street_only" are shown and name the owner
+    # (src/utils/located_parcel.py); paid skip trace accepts "exact" only.
     match: str | None = None
 
 
@@ -156,9 +157,9 @@ def locate_many(items: list[tuple[str, object, object, str | None]], *,
 
 
 def owner_lookup_pins(rows) -> dict[str, list]:
-    """{exact located PIN: [rows]} for code-violation rows that still have no owner.
+    """{shown located PIN: [rows]} for code-violation rows that still have no owner.
 
-    Only an EXACT location (see src/utils/located_parcel.py) may name the owner: the
+    Only a shown location (exact or street-level, see src/utils/located_parcel.py) may name the owner: the
     county's taxpayer on a parcel we are not sure of would put a stranger's name on the
     lead. A row that already has a party_name is never offered for replacement.
     """

@@ -970,7 +970,7 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                                 job_id, str(exc)[:120])
 
         # SDCI names the complaint, never the owner, so party_name arrives empty. An
-        # EXACT located PIN names the owner through the same owner-only eRealProperty
+        # exact or street-level located PIN names the owner through the same owner-only eRealProperty
         # path King tax uses: lease-guarded, paced, breaker-protected, and it drops any
         # page the county served for a different parcel. This job has no parcel_id, so
         # the parcel-keyed owner pass below never runs for it; this takes its 300 s

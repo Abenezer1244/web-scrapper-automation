@@ -111,6 +111,7 @@ class KingWACodeViolationScraper(BridgeScraper):
             try:
                 got = await source.fetch(date_from, date_to)
             except Exception as exc:
+                source.on_progress = None
                 # A Celery time limit is the job's deadline, not this source's failure.
                 if type(exc).__name__ in ("SoftTimeLimitExceeded", "TimeLimitExceeded"):
                     raise
@@ -120,6 +121,7 @@ class KingWACodeViolationScraper(BridgeScraper):
                               source.key, date_from, date_to, type(exc).__name__,
                               str(exc)[:300])
                 continue
+            source.on_progress = None  # never outlives this source's fetch
             self.source_status[source.key] = SOURCE_OK
             records.extend(got)
             _logger.info("King code violation source %s: %d records", source.key, len(got))

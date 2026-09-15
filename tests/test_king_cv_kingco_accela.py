@@ -353,6 +353,18 @@ def test_parcel_numbers_are_normalized_like_every_king_source():
     assert ka.parse_case_detail(short, "ENFR26-0938").parcel_numbers == []
 
 
+@pytest.mark.parametrize("second", ["162606907", "N/A"])
+def test_a_valid_pin_beside_an_unreadable_one_is_not_the_cases_single_parcel(second):
+    # The captured parcel entry, repeated with an unreadable second parcel number.
+    entry = "Parcel Number:1626069072"
+    both = DETAIL_1626069072.replace(entry, f"{entry}</div><div>Parcel Number:{second}", 1)
+    assert both.count("Parcel Number:") == 2
+    detail = ka.parse_case_detail(both, "ENFR26-0938")
+    assert detail.parcel_numbers == []
+    row = next(r for r in ka.parse_results_page(PAGE1).rows if r.case_number == "ENFR26-0938")
+    assert ka.build_record(row, detail).parcel_id is None
+
+
 def test_detail_links_must_stay_on_the_portal():
     assert ka.detail_url(ka.parse_results_page(PAGE1).rows[0].detail_path).startswith(_DETAIL_PREFIX)
     for bad in ("https://evil.example/KINGCO/Cap/CapDetail.aspx?x=1", "//evil.example/KINGCO/Cap/CapDetail.aspx",
@@ -391,7 +403,8 @@ async def test_a_one_day_fetch_ships_the_case_with_its_parcel(monkeypatch):
     recs = await ka.KingCountyAccelaSource().fetch("09/13/2026", "09/13/2026")
     assert [(r.legal_description, r.parcel_id, r.date_recorded, r.raw_html_hash) for r in recs] == [
         ("ENFR26-0931", "1180001661", "09/13/2026", _hash("ENFR26-0931"))]
-    assert [c[0] for c in portal.calls] == ["search", "detail"]
+    # The search landed on the case page, so the case is not fetched a second time.
+    assert [c[0] for c in portal.calls] == ["search"]
 
 
 async def test_a_multi_day_window_that_lands_on_one_case_is_searched_day_by_day(monkeypatch):
@@ -420,7 +433,7 @@ async def test_a_transient_failure_is_retried_and_a_persistent_one_fails_the_sou
     portal = use_fixture_portal(monkeypatch, searches=searches,
                                 fail=[RuntimeError("the portal returned its error page")])
     recs = await ka.KingCountyAccelaSource().fetch("09/13/2026", "09/13/2026")
-    assert len(recs) == 1 and [c[0] for c in portal.calls] == ["search", "search", "detail"]
+    assert len(recs) == 1 and [c[0] for c in portal.calls] == ["search", "search"]
 
     from src.config import settings
     portal = use_fixture_portal(monkeypatch, searches=searches, fail=[

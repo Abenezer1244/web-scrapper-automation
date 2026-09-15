@@ -335,10 +335,13 @@ def parse_case_detail(html: str, expected_case: str) -> CaseDetail:
             # "Parcel Number:" is a layout change, not a case without a parcel.
             raise AccelaFormatError(
                 f"{KINGCO_ACCELA}: case {case} lists parcel information without a readable parcel number")
-        for raw in found:
-            pin = normalize_king_pin(raw)
-            if pin and pin not in pins:
-                pins.append(pin)
+        normalized = [normalize_king_pin(raw) for raw in found]
+        if len(found) == parcel_text.count("Parcel Number:") and all(normalized):
+            for pin in normalized:
+                if pin not in pins:
+                    pins.append(pin)
+        # Otherwise some labeled parcel is not a provable PIN: no parcel is recorded, so a
+        # valid PIN beside an unreadable one can never pass as the case's single parcel.
     street = zipcode = None
     location = soup.select_one("#divWorkLocationInfo")
     if location is not None:
@@ -541,6 +544,8 @@ class KingCountyAccelaSource(CodeViolationSource):
     def __init__(self) -> None:
         super().__init__()
         self._deadline = float("inf")
+        #: case number -> detail parsed from a search that landed on the case page.
+        self._landed_details: dict[str, CaseDetail] = {}
 
     async def _retrying(self, what: str, call):
         """Run one portal step with bounded retries; walls and budget errors are final."""
@@ -575,10 +580,12 @@ class KingCountyAccelaSource(CodeViolationSource):
         self._deadline = time.monotonic() + TIME_BUDGET_SECONDS
         async with self.portal_class() as portal:
             portal.deadline = self._deadline
+            self._landed_details = {}
             rows = await self._list_cases(portal, start, end)
             records = []
             for n, row in enumerate(rows, start=1):
-                detail = await self._retrying(
+                # A one-case search already landed on (and parsed) this detail page.
+                detail = self._landed_details.get(row.case_number) or await self._retrying(
                     f"{self.key} case {row.case_number}",
                     lambda row=row: self._case_detail(portal, row))
                 records.append(build_record(row, detail))
@@ -610,7 +617,13 @@ class KingCountyAccelaSource(CodeViolationSource):
 
     async def _search_window(self, portal, start: date, end: date) -> list[GridRow] | None:
         """The window's rows, or None when a multi-day search landed on a single case."""
-        return rows_from_search(await portal.search(start, end), start, end)
+        pages = await portal.search(start, end)
+        rows = rows_from_search(pages, start, end)
+        if rows and is_detail_page(pages[0]):
+            # Keep the parsed detail so the case is not fetched a second time.
+            self._landed_details[rows[0].case_number] = parse_case_detail(
+                pages[0].html, rows[0].case_number)
+        return rows
 
     async def _case_detail(self, portal, row: GridRow) -> CaseDetail:
         snap = await portal.case_detail(row.detail_path)

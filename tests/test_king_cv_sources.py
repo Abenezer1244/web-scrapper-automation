@@ -227,6 +227,27 @@ async def test_bellevue_pages_by_object_id_until_a_short_page(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_a_server_that_caps_pages_below_the_page_size_skips_nothing(monkeypatch):
+    # The same real features, served 2 at a time (below the requested 3) with the
+    # server's exceededTransferLimit flag while more remain.
+    monkeypatch.setattr(bellevue, "_PAGE_SIZE", BEL_PAGED["page_size"])
+    pages = BEL_PAGED["pages"]
+    every = [f for off in sorted(pages, key=int) for f in pages[off]["features"]]
+    template = pages["0"]
+
+    def _capped(p):
+        off = p["resultOffset"]
+        chunk = every[off:off + 2]
+        return {**template, "features": chunk, "exceededTransferLimit": off + 2 < len(every)}
+
+    arc = _ArcGIS(bellevue_query=_capped)
+    monkeypatch.setattr(base, "safe_get", arc)
+    recs = await bellevue.BellevueSource().fetch("09/01/2026", "09/14/2026")
+    assert len(recs) == 17
+    assert [p["resultOffset"] for u, p in arc.calls if u.endswith("/query")][:3] == [0, 2, 4]
+
+
+@pytest.mark.asyncio
 async def test_bellevue_window_is_the_pacific_day_and_both_edges_are_kept(monkeypatch):
     monkeypatch.setattr(base, "safe_get", _ArcGIS(bellevue_query=_bellevue_full))
     recs = await bellevue.BellevueSource().fetch("07/16/2026", "07/20/2026")
@@ -513,11 +534,13 @@ async def test_a_progress_callback_never_outlives_the_scrape_that_set_it(monkeyp
     seen: list = []
     scraper.on_progress = lambda *a: seen.append(a)
     await scraper.scrape("01/01/2026", "09/14/2026")
-    assert seen and source.on_progress is not None
+    assert seen and source.on_progress is None
+    count = len(seen)
 
     scraper.on_progress = None
     await scraper.scrape("01/01/2026", "09/14/2026")
     assert source.on_progress is None and scraper.source_status == {source.key: "ok"}
+    assert len(seen) == count
 
 
 def test_run_scraper_still_builds_the_connector_from_its_class():

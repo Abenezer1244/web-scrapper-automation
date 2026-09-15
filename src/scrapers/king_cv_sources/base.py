@@ -149,7 +149,9 @@ def arcgis_query_all(url: str, params: dict, *, page_size: int, what: str,
             on_page(page_num + 1, len(rows))
         if not features or (not data.get("exceededTransferLimit") and len(features) < page_size):
             return rows
-        offset += page_size
+        # Advance by what the server actually returned: a server that caps a page below
+        # page_size while flagging exceededTransferLimit would otherwise skip rows.
+        offset += len(features)
     raise RuntimeError(f"{what}: hit the {MAX_PAGES}-page guard without a short final page")
 
 

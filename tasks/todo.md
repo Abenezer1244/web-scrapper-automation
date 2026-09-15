@@ -1,3 +1,85 @@
+# CRM/dialer-ready CSV layout (2026-09-14)
+
+Branch `feat/crm-ready-csv-columns` (worktree `C:/Users/Windows/bl-wt-crmcsv`, off origin/main 47698a8).
+Owner decisions: **versioned layout** (existing scrapers keep `legacy_v1`, new scrapers get `crm_v1`,
+per-scraper switch); **read-only prod reads allowed** for format sampling + real CSV verification.
+
+## Proven (investigation)
+- ONE canonical builder already: `src/utils/lead_export.py` `build_lead_export_row` / `write_lead_csv`.
+  Manual download (`GET /jobs/{id}/download`) and scheduled per-job export (`DataExporter` csv/excel/json)
+  both use it with lean per-record-type columns. Batch + Lists use `OVERLAP_LEAD_COLUMNS` (same values).
+  FE never builds CSV. Webhook/Zapier/PhoneBurner/Tracerfy each have their OWN field mapping.
+- Split columns ALREADY exist (snake_case, appended): first_name, last_name, property_street/city/state/zip,
+  mailing_street/city/state/zip, phone/phone_2/phone_3, email/email_2/email_3. Headers are pinned by an
+  append-only compat contract + `docs/batchdialer-import-guide.md` tells customers to SAVE mappings on them.
+- Stored structured: property_city/state/zip (mig 085), phones[]/emails[] (phone == phones[0] by
+  construction). NOT stored: first/last name, mailing city/state/zip, county/state/record_type on Result
+  (they live on ScraperConfig).
+- Prod sample (read-only): name ORDER depends on source. Recorder `LAST FIRST M` = King/Pierce/Clark/
+  Cowlitz probate+prefc, Snohomish tax, King CV. NATURAL `FIRST M LAST` = trustee_sale (all counties),
+  Snohomish prefc. Okanogan probate mixed. Pierce CV party_name is a case label, not a person.
+- Current CSV corrupts names today: natural-order sources reversed (`SHIRLEY A JOHNSON` -> first `A`),
+  `JOHN AND JANE SMITH` -> `AND`/`JOHN`, `..., HUSBAND AND WIFE` -> `HUSBAND`, `WEBB JR HAROLD` -> `JR`.
+- Address parser: good on real US data; bugs: trailing country becomes city (`..., CANADA` -> city CANADA),
+  placeholder `UNKNOWN UNKNOWN, UNKNOWN WA` -> city UNKNOWN.
+- Drift bug: scheduled export projection `_RESULT_EXPORT_COLUMNS` (tasks.py:214) omits stored
+  property_city/state/zip, so scheduled files can blank city/zip that the manual download fills.
+- Separate (NOT fixed here, report): skip-trace `_parse_full_address` sends state `CA` for Canada, `UN` for
+  United Kingdom to Tracerfy; PhoneBurner `_split_name` is naive; batch/Lists CSVs keep legacy layout.
+
+## Plan
+### Phase 1 - parsing correctness + layout spec (backend, 2 src files + tests)
+- [x] `lead_formatting.py`: `split_first_person(party_name, name_order)` (recorder / natural / comma_only /
+      None -> blank). Two-level joiners, entity-in-cell blanks, roles + uncommaed vesting blank, C/O cut,
+      trailing EST OF / HEIRS OF(+) stripped, initials never a First, ambiguous recorder shapes blank.
+- [x] `lead_formatting.py`: address - foreign country / tail Canadian postal code -> no split; trailing USA
+      dropped; UNKNOWN placeholders; USPS AA/AE/AP.
+- [x] `lead_export.py`: `name_order_for` map + (county, type) overrides; `crm_v1` (key, label) spec;
+      `resolve_export_layout`; row `context` + new keys county / county_state / record_type / case_id;
+      `write_lead_csv(labels=, context=)`, labels sanitized.
+- [x] Tests: `test_lead_formatting.py` (+ prod regressions), new `test_lead_export_crm_layout.py`.
+      370 passed. Mutation check caught flips. `test_data_exporter::test_csv_has_dialer_split_columns`
+      fails until Phase 2 passes context (expected; same PR).
+- [x] Prod READ-ONLY old-vs-new diff, 163,261 rows, 5 iterations: every changed name hand-reviewed.
+      Codex P1 pass 1 = FAIL (5 P1); 3 real fixed, 1 defense adopted, 1 not real (tested).
+- Residual (accepted): double surnames 'Jessica M. Hernandez Olvera' -> last 'Olvera'.
+### Phase 2 - wiring (<=5 src files)
+- [x] `schemas.py`: `DeliverConfig.csv_layout: Literal["legacy_v1","crm_v1"] | None`; response reports the
+      EFFECTIVE layout; `DeliverUpdate.csv_layout` declared (extra="forbid" + GET echo would 422 every edit).
+- [x] `scrapers.py`: create stamps `crm_v1`; `_merge_deliver` keeps a valid stored layout when omitted.
+- [x] `jobs.py` download + `tasks.py` scheduled export + `data_exporter.py` (csv/excel labels, xlsx '@' text
+      cells for ids/zips/phones, JSON snake_case) resolve the same layout + source context; scheduled
+      projection now carries stored property_city/state/zip (drift bug fixed).
+- [x] `tests/test_csv_layout_delivery.py` (21, real endpoints + DB, mutation-checked: 10 fail when wiring removed).
+- [x] Full suite: local runs killed for low memory; owner chose CI. PR #315 CI: 3652 passed, 1 failed (key-set
+      test copy, fixed in 76b3524). OpenAPI regen additive only (0 deletions), CI drift check passed.
+- [x] Codex Phase 2: 1 P1 + 2 P2, all verified NOT real against the code (unconditional export block; stored
+      deliver always a dict; invalid stored layout already normalized to None on edit).
+- Batch children + batch/Lists combined CSVs stay legacy this PR (report).
+### Phase 3 - verification + docs + FE
+- [x] Real CSVs, read-only, 8 prod jobs / 935 rows: 0 column mismatches vs DB values (local files deleted, PII).
+- [ ] Playwright Results -> Download CSV: needs deploy or local full stack (not done).
+- [ ] FE layout toggle; BatchDialer guide for crm_v1.
+
+### Follow-up - double surnames (owner request 2026-09-15)
+- [x] Read-only scan of every 4+-word prod name (573 non-blank splits read): double surnames were mostly
+      RECORDER order ('ALATORRE HERNANDEZ JOSE LUIS' -> first HERNANDEZ), plus missed organizations,
+      role abbreviations (TTEE/EXEC/PER REP) and scrambled Vietnamese cells.
+- [x] Codex design consult before code; reconciled (adopted: role strip, phrase-only org words, list
+      safeguards, particle pairs, LE blank; kept with evidence: backslash joiner, MRS blank, OF/FOR).
+- [x] Implemented in `lead_formatting.py` (export-only helpers; title-status parser untouched).
+- [x] Prod diff vs committed branch, 163,261 rows, 2 runs: 39 changed (all correct), 2 filled (correct),
+      457 now blank (orgs / VN scrambles / double surname + initial). 12 over-blanks from run 1 fixed.
+- [x] Tests: 485 pass; mutation check (24 fail with rules disabled). Codex review FAIL -> P1 disproven
+      with HEAD comparison -> GATE PASS. Residual: rare surnames equal to org words (CITY, STATE) blank.
+
+## Review
+Contract change, not new parsing: split columns already existed. Versioned layout keeps every existing customer's
+headers; new scrapers get crm_v1. The real win is correctness: source-aware names (213 corrected, 405 wrong ->
+blank on 163,261 prod rows) and no fabricated address parts. Two latent bugs fixed (scheduled situs drop, Pierce
+case id). One deploy-breaking bug avoided (DeliverUpdate extra=forbid). Double surnames handled in the
+follow-up; residuals: rare surnames equal to org words blank, natural-order names leaked into recorder cells.
+
 # King property follow-ups (2026-09-15)
 
 Branch `fix/king-property-followups`. Owner said "run fix and work with codex on all" after the
@@ -494,7 +576,10 @@ page was heap order and OFFSET paging over the ties was unstable. Codex design c
 - [x] Prod EXPLAIN: top-N heapsort, +~75ms warm on the largest (17k-row) job; no index added
 - [x] Local UI verification in Chromium on real prod date shapes (desktop + 390px)
 - [x] Codex diff review: GATE PASS, P3 (ascending pagination test) adopted
-- [ ] Push + PRs (BE first: FE CI regenerates types from backend main), merge, deploy, prod UI check
+- [x] Push + PRs (BE #313 `7a04a53`, FE #138 `30b2a6c`), merged, deployed (Railway SUCCESS, Vercel prod success)
+- [x] Prod UI check (2026-09-15, owner's account): King code violation job (1,057 rows) newest first Sep 11, toggle to
+      oldest first starts Aug 13 (range start), toggle back, page 1 ends Sep 10 / page 2 starts Sep 10; tax job header
+      "Oldest Tax Year", aria-sort flips, `sort=created_at` -> 422. Sort adds ~70ms warm of a ~1.7s page request.
 
 ### Review
 Stored `date_recorded` text is deliberately untouched: it feeds `dedup_hash` and `source_fingerprint`, so normalizing
@@ -502,3 +587,13 @@ it could re-deliver already-paid leads. Exports (party_name, date_recorded, id),
 their existing deterministic orders. Not changed, reported: trustee_sale and some Snohomish prefc rows store the future
 auction date in `date_recorded` (semantic, owner decision); scraper records page (`county_records`) orders by
 `scraped_at DESC` with no tie-breaker.
+
+### Follow-ups (2026-09-15, branch `fix/results-open-items`)
+- [x] Auction date stored as Date (trustee_sale, Snohomish prefc fallback): documented intentional design (trustee_sale
+      2026-09-03 forward window; Snohomish "closest recording-like date"). Codex consult: leave semantics, owner decision.
+      No code change: rewriting date_recorded changes dedup identity; relabeling Date would duplicate the Auction Date column.
+- [x] Cached records page (`GET /scrapers/{id}/records`): ORDER BY scraped_at DESC alone (Benton 2,574 rows share one
+      scraped_at). Now scraped_at DESC, parsed date DESC NULLS LAST, id ASC, as a Core select. First attempt compiled the
+      parser to a literal SQL string: literal_binds DOUBLED the regex backslashes (would match nothing); caught before tests.
+- [x] Parser refactor: shared exception-free `_valid_date` for numeric and month-name dates; 17 PostgreSQL-evaluated
+      totality cases incl. prod junk (instrument numbers, UI text). 3 of 4 endpoint tests red on the old query.

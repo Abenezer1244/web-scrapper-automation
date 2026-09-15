@@ -1263,6 +1263,21 @@
       },
       "DeliverConfig": {
         "properties": {
+          "csv_layout": {
+            "anyOf": [
+              {
+                "enum": [
+                  "legacy_v1",
+                  "crm_v1"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Csv Layout"
+          },
           "dialer_type": {
             "anyOf": [
               {
@@ -1368,6 +1383,17 @@
         "additionalProperties": false,
         "description": "Deliver payload for PATCH /scrapers/{id} (edit). SHAPE-ONLY: every field is\nlenient here because the route re-validates the merged result by constructing a\nfull DeliverConfig (single source of delivery validation). Two reasons this is\na dedicated model and not DeliverConfig:\n\n1. Secret preservation — webhook_secret / dialer_webhook_secret /\n   phoneburner_access_token are write-only (GET redacts them to *_set bool\n   flags). On edit, omitted / null / blank means \"keep the stored secret\", a\n   non-blank value means \"replace\". DeliverConfig's min-length + cross-field\n   (require_connector_credentials) validators would wrongly reject a blank\n   \"keep\" token, so they must NOT run until the route has injected the stored\n   secrets back in.\n2. The frontend pre-fills the edit form from GET, whose deliver dict carries\n   the write-only readback flags (webhook_secret_set, …). Those are declared\n   below (and excluded from model_dump so they never reach DeliverConfig) so\n   echoing them back is accepted — while extra=\"forbid\" still rejects any OTHER\n   unknown key. That matters because this is a REPLACE-whole payload: a silent\n   typo like \"webhook_ur\" would otherwise drop the real webhook_url + its secret\n   (Codex). A misspelled field 422s instead.",
         "properties": {
+          "csv_layout": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Csv Layout"
+          },
           "dialer_type": {
             "anyOf": [
               {

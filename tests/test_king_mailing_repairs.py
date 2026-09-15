@@ -110,10 +110,19 @@ async def test_taxbill_check_fills_code_violations_and_repairs_truncations(
 ):
     trunc = await _row_in_job(db, business_user, record_type="tax_delinquent",
                               parcel="1321400230", mailing=TRUNCATED)
+    # Only a shown tier may carry a mailing address (src/utils/located_parcel.py).
+    tier = {"kc_pin_status": "matched", "kc_pin_source": "king_gis_point_in_parcel",
+            "kc_pin_match": "exact"}
     cv = await _row_in_job(db, business_user, record_type="code_violation",
-                           ed={"kc_pin_status": "matched", "kc_pin": "0904000025", "record_number": "X-1"})
+                           ed={**tier, "kc_pin": "0904000025", "record_number": "X-1"})
     gone = await _row_in_job(db, business_user, record_type="code_violation",
-                             ed={"kc_pin_status": "matched", "kc_pin": "0904000099"})
+                             ed={**tier, "kc_pin": "0904000099"})
+    # A condo complex and an address-only candidate are never mailed.
+    await _row_in_job(db, business_user, record_type="code_violation",
+                      ed={**tier, "kc_pin": "0904000077", "kc_pin_match": "condo_complex"})
+    await _row_in_job(db, business_user, record_type="code_violation",
+                      ed={**tier, "kc_pin": "0904000066", "kc_pin_match": "address_only",
+                          "kc_pin_source": "king_gis_address_point"})
     # Neither PIN is in the extract, so both go to the tax bill.
     zp = _extract(tmp_path, [_acct("111111", "1111", "1 OTHER ST", "KENT WA", "98032")])
     asked: list = []
@@ -140,6 +149,7 @@ async def test_taxbill_check_fills_code_violations_and_repairs_truncations(
 
     dry = await asyncio.to_thread(_run, False)
     assert dry["would_write"] == 3 and "writes" not in dry
+    assert asked and not {"0904000077", "0904000066"} & {p for batch in asked for p in batch}
     stats = await asyncio.to_thread(_run, True)
     assert stats["writes"] == {"written": 3}
 

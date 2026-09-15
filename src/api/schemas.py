@@ -508,6 +508,11 @@ class DeliverConfig(BaseModel):
     # responses (redacted in ScraperConfigResponse, like the HMAC secrets).
     phoneburner_access_token: str | None = None
     phoneburner_owner_id: str | None = None
+    # Lead CSV/Excel header layout (src/utils/lead_export.py LAYOUT_*). None = "not
+    # sent": a create stamps crm_v1 and an edit KEEPS the stored value, so saving an
+    # existing scraper from a client that doesn't know this field can never switch
+    # the headers a customer's importer is mapped to. A stored None reads legacy_v1.
+    csv_layout: Literal["legacy_v1", "crm_v1"] | None = None
 
     @field_validator("dialer_type")
     @classmethod
@@ -645,6 +650,7 @@ class DeliverConfigDict(TypedDict, total=False):
     dialer_type: str | None              # Thread 3: dialer connector id (None = generic)
     phoneburner_access_token: str | None  # Thread 3: PhoneBurner OAuth token (write-only)
     phoneburner_owner_id: str | None
+    csv_layout: str | None               # legacy_v1 | crm_v1 (missing/None = legacy_v1)
 
 
 class ScraperConfigCreate(BaseModel):
@@ -728,6 +734,12 @@ class ScraperConfigResponse(BaseModel):
         self.deliver.setdefault("formats", ["csv"])
         self.deliver.setdefault("emails", [])
         self.deliver.setdefault("webhook_url", None)
+        # The EFFECTIVE export layout, resolved exactly like the exporter does
+        # (anything but crm_v1 exports legacy headers), so the UI never shows a
+        # layout the file doesn't have.
+        self.deliver["csv_layout"] = (
+            "crm_v1" if self.deliver.get("csv_layout") == "crm_v1" else "legacy_v1"
+        )
         # Security (Codex): HMAC secrets are WRITE-ONLY — never return them. A
         # stolen frontend token / XSS could otherwise read them and forge signed
         # webhook/dialer payloads. Expose only presence flags so the UI can show
@@ -794,6 +806,10 @@ class DeliverUpdate(BaseModel):
     dialer_type: str | None = None
     phoneburner_access_token: str | None = None
     phoneburner_owner_id: str | None = None
+    # Declared because GET now returns the effective layout and a verbatim form echo
+    # would otherwise 422 under extra="forbid" (breaking EVERY scraper edit). None =
+    # keep stored (_merge_deliver); the merged DeliverConfig validates the value.
+    csv_layout: str | None = None
 
     # Write-only readback flags emitted by GET. Accepted (so a verbatim form echo
     # doesn't 422) but excluded from model_dump — they are not real deliver fields
@@ -1263,12 +1279,14 @@ class ResultRow(BaseModel):
     days_to_auction: int | None = None
     # The county parcel this lead was located on by map point when the source gave no
     # parcel number (King/Seattle code violations): shown as the Parcel ID, but it is
-    # NOT parcel_id, which stays the billing/dedup identity. Exact (street + ZIP) and
-    # street-only matches are exposed, condo complexes never (src/utils/located_parcel.py).
-    # None whenever parcel_id is set.
+    # NOT parcel_id, which stays the billing/dedup identity. Exact (street + ZIP),
+    # street-only and County address-point matches are exposed; address-only candidates
+    # and condo complexes never (src/utils/located_parcel.py). None whenever parcel_id is set.
     located_parcel_id: str | None = None
-    # How the located parcel matched: "exact" (street + ZIP) or "street_only" (the
-    # source gave no ZIP). None whenever located_parcel_id is None.
+    # How the located parcel matched: "exact" (street + ZIP), "street_only" (the source
+    # gave no ZIP) or "address_point" (King's own address point for this address names
+    # this parcel, and the complaint's coordinates fall on it). None whenever
+    # located_parcel_id is None.
     located_parcel_match: str | None = None
 
     model_config = {"from_attributes": True}

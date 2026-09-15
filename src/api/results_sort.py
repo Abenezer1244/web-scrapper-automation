@@ -26,10 +26,10 @@ updated, so enrichment rewriting names or addresses cannot move a row.
 """
 from typing import Literal
 
-from sqlalchemy import Integer, Text, case, cast, func, or_
+from sqlalchemy import Integer, Text, and_, case, cast, func
 from sqlalchemy.dialects.postgresql import ARRAY
 
-from src.db.models import Result
+from src.db.models import CountyRecord, Result
 
 ResultsSort = Literal["date_desc", "date_asc"]
 DEFAULT_RESULTS_SORT: ResultsSort = "date_desc"
@@ -47,30 +47,57 @@ _MONTH_NUMBERS = {
 }
 
 
-def _month_name_date(column):
-    """DATE from a "Month D, YYYY" string, or NULL. Never raises.
+# "3/20/2026", "03/13/2026". Captures month, day, year.
+_NUMERIC_DATE = r"^\s*(\d{1,2})/(\d{1,2})/(\d{4})\s*$"
+
+
+def _valid_date(year, month, day):
+    """The calendar date year-month-day when it is real, else NULL. Never raises.
 
     ``make_date`` errors on an impossible date, and one bad row would fail the whole
-    page, so every value it receives is proven valid first. The guards are NESTED
-    CASEs because Postgres guarantees a CASE evaluates its branch only when the
-    condition holds, and does not guarantee the evaluation order of AND/OR.
+    page. Guarding it with CASE is not enough on its own: the planner may evaluate a
+    constant expression inside a branch that never runs (Codex). So ``make_date``
+    only ever receives values clamped into range (month 1-12, day 1, year 1-9999),
+    whatever the input, and the day is added with date arithmetic, which cannot
+    raise. Out-of-range or NULL parts (no regex match, unknown month word) and a day
+    that rolls into the next month (April 31) all come out NULL.
     """
+    safe_year = case((year.between(1, 9999), year), else_=2000)
+    safe_month = case((month.between(1, 12), month), else_=1)
+    safe_day = case((day.between(1, 31), day), else_=1)
+    candidate = func.make_date(safe_year, safe_month, 1) + (safe_day - 1)
+    is_real = and_(
+        year.between(1, 9999),
+        month.between(1, 12),
+        day.between(1, 31),
+        # A real day stays in its month; day 31 of a 30-day month does not.
+        func.date_part("month", candidate) == month,
+    )
+    return case((is_real, candidate), else_=None)
+
+
+def _month_name_date(column):
+    """DATE from a "Month D, YYYY" string, or NULL. Never raises."""
     parts = func.regexp_match(column, _MONTH_NAME_DATE, type_=ARRAY(Text))
     month = case(_MONTH_NUMBERS, value=func.lower(parts[1]), else_=None)
-    day = cast(parts[2], Integer)
-    year = cast(parts[3], Integer)
-    # Day 31 of a 30-day month rolls into the next month; a real day stays put.
-    stays_in_month = (
-        func.date_part("month", func.make_date(year, month, 1) + (day - 1)) == month
+    return _valid_date(cast(parts[3], Integer), month, cast(parts[2], Integer))
+
+
+def _numeric_date(column):
+    """DATE from an "M/D/YYYY" string, or NULL. Never raises.
+
+    Same text ``results.date_recorded_parsed`` accepts. Results keeps reading that
+    stored column; this is for tables that have no parsed date.
+    """
+    parts = func.regexp_match(column, _NUMERIC_DATE, type_=ARRAY(Text))
+    return _valid_date(
+        cast(parts[3], Integer), cast(parts[1], Integer), cast(parts[2], Integer)
     )
-    return case(
-        # month IS NULL covers "no regex match" (all parts NULL) and unknown words.
-        # make_date rejects year 0, which \d{4} would otherwise let through.
-        (or_(month.is_(None), year < 1), None),
-        else_=case(
-            (day.between(1, 31), case((stays_in_month, func.make_date(year, month, day)))),
-        ),
-    )
+
+
+def _text_date(column):
+    """DATE from either date form a county source writes, or NULL. Never raises."""
+    return func.coalesce(_numeric_date(column), _month_name_date(column))
 
 
 def results_order_by(record_type: str | None, sort: ResultsSort) -> list:
@@ -83,3 +110,19 @@ def results_order_by(record_type: str | None, sort: ResultsSort) -> list:
     # Explicit in both directions: Postgres puts NULLs FIRST on DESC by default,
     # which would open the page with the undated rows.
     return [ordered.nulls_last(), Result.id.asc()]
+
+
+def cached_records_order_by() -> list:
+    """ORDER BY clauses for the cached records page (GET /scrapers/{id}/records).
+
+    The cache is refreshed in batches that share one scraped_at (Benton: 2,574 rows,
+    one timestamp), so scraped_at alone left each batch in heap order. It stays the
+    primary key, which the "new since you last looked" feed depends on; within a batch
+    rows run newest date first, undated last, and id makes the order total.
+    county_records has no parsed date column, so the text is parsed here.
+    """
+    return [
+        CountyRecord.scraped_at.desc(),
+        _text_date(CountyRecord.date_recorded).desc().nulls_last(),
+        CountyRecord.id.asc(),
+    ]

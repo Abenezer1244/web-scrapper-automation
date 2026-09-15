@@ -90,9 +90,14 @@ class BellevueSource(CodeViolationSource):
                 continue
             info = meta.get("editingInfo") if isinstance(meta.get("editingInfo"), dict) else {}
             stamp = info.get("dataLastEditDate")
-            edited[service] = stamp if isinstance(stamp, int) and not isinstance(stamp, bool) else 0
+            if not isinstance(stamp, int) or isinstance(stamp, bool) or stamp <= 0:
+                # Without an edit date the copy's freshness is unproven: never pick it.
+                _logger.warning("Bellevue %s metadata has no data edit date", service)
+                continue
+            edited[service] = stamp
         if not edited:
-            raise RuntimeError(f"{self.key}: neither Bellevue permit service answered its metadata")
+            raise RuntimeError(
+                f"{self.key}: neither Bellevue permit service answered its metadata with a data edit date")
         # max() keeps the first of equal stamps, so SERVICES order breaks a tie.
         return max(edited, key=lambda s: edited[s])
 

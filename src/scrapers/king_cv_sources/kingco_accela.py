@@ -300,7 +300,8 @@ def parse_results_page(html: str) -> ResultsPage:
     m = _SHOWING_RE.search(grid.get_text(" ", strip=True))
     if m:
         showing = (int(m.group(1)), int(m.group(2)), int(m.group(3)), m.group(4) == "+")
-    if rows and (showing is None or len(rows) != showing[1] - showing[0] + 1):
+    if (rows or showing is not None) and (
+            showing is None or len(rows) != showing[1] - showing[0] + 1):
         raise AccelaFormatError(
             f"{KINGCO_ACCELA}: the grid lists {len(rows)} rows but its range reads "
             f"{'nothing' if showing is None else f'{showing[0]}-{showing[1]}'}; "
@@ -326,7 +327,15 @@ def parse_case_detail(html: str, expected_case: str) -> CaseDetail:
     pins: list[str] = []
     parcels = soup.select_one(SEL_DETAIL_PARCELS)
     if parcels is not None:
-        for raw in _PARCEL_RE.findall(parcels.get_text(" ", strip=True)):
+        parcel_text = parcels.get_text(" ", strip=True)
+        found = _PARCEL_RE.findall(parcel_text)
+        if not found:
+            # The portal prints this section only for a case with a parcel (a case
+            # without one has no section at all), so a section with no readable
+            # "Parcel Number:" is a layout change, not a case without a parcel.
+            raise AccelaFormatError(
+                f"{KINGCO_ACCELA}: case {case} lists parcel information without a readable parcel number")
+        for raw in found:
             pin = normalize_king_pin(raw)
             if pin and pin not in pins:
                 pins.append(pin)

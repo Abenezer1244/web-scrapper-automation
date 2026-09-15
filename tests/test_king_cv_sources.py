@@ -161,6 +161,22 @@ def test_bellevue_uses_the_other_service_when_one_is_down_and_fails_when_both_ar
         bellevue.BellevueSource().pick_service()
 
 
+@pytest.mark.parametrize("stamp", ["missing", None, "1786950000000", 0, True])
+def test_a_bellevue_copy_without_a_data_edit_date_is_never_picked(monkeypatch, stamp):
+    undated = json.loads(json.dumps(BEL_LAYERS))
+    if stamp == "missing":
+        del undated["Bellevue_Permits"]["editingInfo"]["dataLastEditDate"]
+    else:
+        undated["Bellevue_Permits"]["editingInfo"]["dataLastEditDate"] = stamp
+    monkeypatch.setattr(base, "safe_get", _ArcGIS(layers=undated))
+    assert bellevue.BellevueSource().pick_service() == "Bellevue_Permit"
+
+    del undated["Bellevue_Permit"]["editingInfo"]
+    monkeypatch.setattr(base, "safe_get", _ArcGIS(layers=undated))
+    with pytest.raises(RuntimeError, match="with a data edit date"):
+        bellevue.BellevueSource().pick_service()
+
+
 @pytest.mark.asyncio
 async def test_bellevue_parses_real_cases_with_the_pin_as_parcel_id(monkeypatch):
     arc = _ArcGIS(bellevue_query=_bellevue_full)
@@ -483,6 +499,27 @@ async def test_the_partial_failure_warning_reaches_the_job_log(
     pubsub.close()
 
 
+def test_a_connector_without_sources_is_refused():
+    with pytest.raises(ValueError, match="at least one source"):
+        kcv.KingWACodeViolationScraper(sources=[])
+
+
+@pytest.mark.asyncio
+async def test_a_progress_callback_never_outlives_the_scrape_that_set_it(monkeypatch):
+    monkeypatch.setattr(burien, "_PAGE_SIZE", BUR_PAGED["page_size"])
+    monkeypatch.setattr(base, "safe_get", _ArcGIS(burien_pages=BUR_PAGED))
+    source = burien.BurienSource()
+    scraper = kcv.KingWACodeViolationScraper(sources=[source])
+    seen: list = []
+    scraper.on_progress = lambda *a: seen.append(a)
+    await scraper.scrape("01/01/2026", "09/14/2026")
+    assert seen and source.on_progress is not None
+
+    scraper.on_progress = None
+    await scraper.scrape("01/01/2026", "09/14/2026")
+    assert source.on_progress is None and scraper.source_status == {source.key: "ok"}
+
+
 def test_run_scraper_still_builds_the_connector_from_its_class():
     # The worker passes record_type only when the constructor takes it; `sources` is not
     # something the worker ever sets.
@@ -671,10 +708,11 @@ async def test_a_king_cv_job_names_and_mails_parcel_source_rows_without_touching
     assert bel.mailing_address == "188 BELLEVUE WAY NE UNIT 903, BELLEVUE, WA 98004"
     assert bur.mailing_address == "4801 115TH ST SW, LAKEWOOD, WA 98499"
     # Named from the county page for their own PIN, so paid skip trace may take them.
-    for row in (bel, bur):
+    for row, address in ((bel, "10202 SE 13th Pl, Bellevue WA 98004"),
+                         (bur, "13007 12th Ave SW, Burien WA")):
         assert build_pending_row_payload(SimpleNamespace(
             id=row.id, job_id=job_id, user_id=business_user.id, party_name=row.party_name,
-            parcel_id=row.parcel_id, property_address="10202 SE 13th Pl, Bellevue WA 98004",
+            parcel_id=row.parcel_id, property_address=address,
             mailing_address=row.mailing_address, property_city=None, property_state="WA",
             property_zip=None, enrichment_data=row.enrichment_data)) is not None
     assert any(url.endswith("2571200050") for url in erp_calls)

@@ -198,6 +198,17 @@ def test_one_unreadable_row_or_a_row_count_off_the_printed_range_fails_the_page(
         ka.parse_results_page(no_range)
     with pytest.raises(ka.AccelaFormatError, match="cannot prove the page is complete"):
         ka.parse_results_page(PAGE1.replace("Showing 1-10 of 34", "Showing 1-11 of 34"))
+    # A range printed over a grid whose case rows are gone entirely.
+    no_rows = PAGE1.replace("ACA_TabRow_Odd", "x").replace("ACA_TabRow_Even", "x")
+    with pytest.raises(ka.AccelaFormatError, match="grid lists 0 rows"):
+        ka.parse_results_page(no_rows)
+
+
+def test_a_parcel_section_without_a_readable_parcel_number_is_a_format_break():
+    renamed = DETAIL_1626069072.replace("Parcel Number:1626069072", "Parcel No.:1626069072")
+    assert renamed != DETAIL_1626069072
+    with pytest.raises(ka.AccelaFormatError, match="without a readable parcel number"):
+        ka.parse_case_detail(renamed, "ENFR26-0938")
 
 
 def test_paging_stops_inside_a_search_at_the_case_limit_or_the_time_budget(monkeypatch):
@@ -245,9 +256,11 @@ def test_the_street_and_zip_are_stored_apart_so_skip_trace_never_reads_the_zip_a
     # After parcel enrichment names the owner and the city, the traced street is the street.
     owned = {"source": "kingco_accela_code_enforcement", "owner_source": "king_erealproperty",
              "owner_pin": "1626069072"}
+    # The insert path persists rec.property_zip into results.property_zip (tasks.py); no
+    # mailing address here, so the traced ZIP can only come from that column.
     payload = build_pending_row_payload(_accela_row(
         party_name="OWNER LLC", property_address=record.property_address, property_city="WOODINVILLE",
-        property_zip=record.property_zip, enrichment_data=owned))
+        property_zip=record.property_zip, mailing_address=None, enrichment_data=owned))
     assert (payload["property_address"], payload["city"], payload["state"], payload["zip"]) == (
         "21617 NE 159TH ST", "WOODINVILLE", "WA", "98077")
 

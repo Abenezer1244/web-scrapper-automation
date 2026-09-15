@@ -88,6 +88,8 @@ class KingWACodeViolationScraper(BridgeScraper):
         super().__init__()
         self.sources: list[CodeViolationSource] = (
             list(sources) if sources is not None else [cls() for cls in SOURCES])
+        if not self.sources:
+            raise ValueError("King code violations need at least one source")
         #: {source key: "ok" | "failed"} for the last scrape.
         self.source_status: dict[str, str] = {}
         #: Customer-facing warnings from the last scrape, published to the job log.
@@ -100,10 +102,12 @@ class KingWACodeViolationScraper(BridgeScraper):
         failures: list[tuple[CodeViolationSource, Exception]] = []
 
         for source in self.sources:
-            if self.on_progress is not None:
-                # The record count is cumulative across sources; pages are per source.
-                source.on_progress = (lambda pages, total, count, _done=len(records):
-                                      self.on_progress(pages, total, _done + count))
+            # Set on every scrape, so a callback from an earlier scrape never outlives it.
+            # The record count is cumulative across sources; pages are per source.
+            source.on_progress = (
+                (lambda pages, total, count, _done=len(records), _cb=self.on_progress:
+                 _cb(pages, total, _done + count))
+                if self.on_progress is not None else None)
             try:
                 got = await source.fetch(date_from, date_to)
             except Exception as exc:

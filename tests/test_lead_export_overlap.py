@@ -23,6 +23,7 @@ class TestOverlapCsvBuilder:
     def test_overlap_word_when_multi_list_and_dialer_ready_fields(self):
         rec = {
             "party_name": "DOE, JOHN",
+            "record_type": "probate",  # batch/Lists SQL rows select sc.record_type
             "property_address": "123 MAIN ST, KENT WA 98031",
             "phone": "(206) 555-1234",
             "date_recorded": "03/14/2026",

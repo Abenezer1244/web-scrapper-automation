@@ -45,7 +45,12 @@ def test_csv_header_is_canonical_columns(exporter):
 
 
 def test_csv_has_dialer_split_columns(exporter):
-    path = exporter.to_csv(LEAD_RECORDS, filename="split")
+    # The scheduled export passes the scraper's source; without a record type the
+    # party-name order is unknown and First/Last stay blank (never a guess).
+    path = exporter.to_csv(
+        LEAD_RECORDS, filename="split",
+        context={"county": "pierce", "state": "WA", "record_type": "probate"},
+    )
     with open(path, newline="", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
     # "Smith, John" -> first John / last Smith (case preserved); address splits.

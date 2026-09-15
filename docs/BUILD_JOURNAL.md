@@ -19,6 +19,60 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-15 - CRM/dialer-ready CSV layout (versioned), and the name split that was backwards for whole sources
+
+**Built / Shipped:** draft PR #315 (`feat/crm-ready-csv-columns`, not merged). `crm_v1` layout (First Name,
+Last Name, Party Name, Property Address/City/State/Zip, Mailing Address/City/State/Zip, Phone 1-3, Email 1-3,
+Parcel ID, County, County State, Record Type, Date Recorded, record-type block, reference block) selected per
+scraper by `deliver.csv_layout`. New scrapers get crm_v1; existing ones keep `legacy_v1` headers byte for byte.
+Source-aware `split_first_person` (recorder / natural / comma_only / unknown -> blank) in
+`src/utils/lead_formatting.py`; address guards (foreign tail, Canadian postal tail, USA tail, UNKNOWN
+placeholders, AA/AE/AP). Manual download, scheduled CSV/Excel/JSON use one layout + source context.
+Fixed on the way: scheduled export dropped stored property_city/state/zip; Pierce CV `case_number` never exported.
+
+**Tried / Decided:** investigation found the split columns ALREADY existed (snake_case, appended), so this was a
+contract change, not new parsing. Owner chose a versioned layout over a hard switch because the BatchDialer guide
+tells customers to save mappings on the old headers. First/Last name the FIRST-listed individual only when its
+full name reads unambiguously in the source's declared order. Labels: `County State` (not `State`, which would
+collide with Property/Mailing State) and `Date Recorded` (not `Date`, vs Auction Date). `default_amount` is
+principal owing, so `Principal Owing`, not "Default Owed". Batch children and batch/Lists combined CSVs stay legacy.
+
+**Failed / Blocked:** local full pytest killed 3 times for low memory (other sessions' suites; 480 MB free), plus
+one Codex run; used the draft PR's CI instead (3652 passed / 1 failed, the failure was a copy of a key-set test I
+had updated elsewhere; fixed). First CI run failed at pip install (PyPI `sqlalchemy` fetch), re-run. Production
+reads were blocked by the permission classifier until the owner allowed read-only. Playwright UI download check
+and the FE layout toggle not done (FE repo, and needs a deploy or a local full stack).
+
+**Caught & fixed:** my own first split cut entities apart ('WSDOT R/E SERVICES' -> first 'R'), forced natural
+order after 'ESTATE OF' in recorder data, and read 'V' as a suffix; a read-only prod old-vs-new diff (163,261
+rows, 6 runs) caught each, now pinned as tests. Codex P1s: C/O as co-owner, bare initials as First, uncommaed
+vesting words, unspaced '&'. `DeliverUpdate` is `extra="forbid"` and the FE echoes GET: without declaring
+`csv_layout` there, EVERY scraper edit would have 422'd after deploy. `_merge_deliver` replaces non-secret
+fields, so an omitted layout would have silently flipped a config; now sticky.
+Codex Phase 2 P1 (NameError in re-export) rejected with evidence: the first export block is unconditional, the
+same scope `export_columns` / `exporter` / `object_key` always had.
+
+**Pending / Handoff:** CI green on 76b3524, then undraft. FE: layout toggle + types regen; BatchDialer guide for
+crm_v1; Playwright Results -> Download CSV on a crm_v1 scraper after deploy. Separate bugs: skip-trace
+`_parse_full_address` sends state CA/UN for foreign addresses; PhoneBurner `_split_name` is naive. (Trustee-sale
+`date_recorded` holding the auction date is documented design, see the Results date-sort entry below.)
+
+**Follow-up (same day, double surnames):** the natural-order case ('Jessica M. Hernandez Olvera') was
+the ONLY one in prod; the real volume was recorder order ('GUZMAN CAMPOS MARIA F' -> first CAMPOS).
+Added a curated Hispanic surname list (given-name-like surnames excluded) as evidence a word is not a
+first name, particle pairs (DE LOS, VAN DER), trailing-role strip (TTEE, EXEC, PER REP, ADMN), AKA cut,
+phrase-safe organization words, and a Vietnamese given-name-slot check. First prod diff over-blanked 12
+correct names ('DANG CATHY TRAN', 'BAEK JONG HO', 'PHAM ANH THE') and exposed a glued role
+('RITA HSIU-HUI KAO-TRUSTEE'); narrowed and re-diffed to 39 corrected / 2 filled / 457 blank, all
+reviewed. Codex FAIL was a claimed regression that the committed version already had; withdrawn -> PASS.
+
+**Facts learned:** party_name order is per SOURCE: WA recorder + assessor/treasurer = LAST FIRST; trustee's-sale
+notices (all trustee_sale, Snohomish pre_foreclosure) = FIRST LAST; Okanogan probate mixes both; Pierce CV
+party_name is "{case_type} - {address}". Recorder shape "LAST F MIDDLE" is indistinguishable from a leaked
+"FIRST M LAST". Real CSVs from 8 prod jobs (935 rows) matched DB values cell for cell.
+
+---
+
 ## 2026-09-15 - Results date sort follow-ups: prod verified, cached records page ordered, auction-date question settled
 
 **Built / Shipped (branch `fix/results-open-items`):** `GET /scrapers/{id}/records` rows query is now a Core select

@@ -8,6 +8,7 @@ import csv
 import io
 
 from src.utils.lead_export import (
+    CRM_V1_LABELS,
     HIDEABLE_OUTPUT_FIELDS,
     LEAD_CSV_COLUMNS,
     build_lead_export_row,
@@ -26,13 +27,14 @@ class _Obj:
 
 
 class TestBuildRow:
-    def test_keys_match_columns_exactly(self):
+    def test_keys_cover_both_layouts_exactly(self):
         row = build_lead_export_row({})
-        assert set(row.keys()) == set(LEAD_CSV_COLUMNS)
+        assert set(row.keys()) == set(LEAD_CSV_COLUMNS) | set(CRM_V1_LABELS)
 
     def test_dict_with_phones_array(self):
         rec = {
             "party_name": "SMITH JOHN",
+            "record_type": "probate",  # recorder-order source
             "property_address": "123 MAIN ST, TACOMA, WA 98401",
             "phone": "(206) 555-1234",
             "phones": [
@@ -68,6 +70,7 @@ class TestBuildRow:
     def test_orm_like_object(self):
         rec = _Obj(
             party_name="VAN DYKE JOHN",
+            record_type="pre_foreclosure",
             property_address="500 PINE ST SEATTLE WA 98101",
             phone="206.555.7777",
             delinquent_amount=None,

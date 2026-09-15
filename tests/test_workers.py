@@ -9,7 +9,7 @@ from src.api.auth import hash_password
 from src.db.models import Job, ScraperConfig, User
 from src.db.session import SyncSessionLocal
 from src.utils.data_exporter import DataExporter
-from src.utils.lead_export import LEAD_CSV_COLUMNS, build_lead_export_row
+from src.utils.lead_export import CRM_V1_LABELS, LEAD_CSV_COLUMNS, build_lead_export_row
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -71,7 +71,8 @@ def test_canonical_row_has_all_columns():
     row = build_lead_export_row(
         {"date_recorded": "01/01/2024", "party_name": "Test", "parcel_id": "1111111111"}
     )
-    assert set(row.keys()) == set(LEAD_CSV_COLUMNS)
+    # Every legacy AND crm_v1 column, nothing else (one builder serves both layouts).
+    assert set(row.keys()) == set(LEAD_CSV_COLUMNS) | set(CRM_V1_LABELS)
 
 
 def test_canonical_row_sanitizes_formulas():

@@ -23,10 +23,14 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from src.api.middleware.security import sanitize_for_csv
+from src.config.constants import record_type_label
 from src.utils.lead_formatting import (
+    NAME_ORDER_COMMA_ONLY,
+    NAME_ORDER_NATURAL,
+    NAME_ORDER_RECORDER,
     normalize_phone_for_dialer,
     parse_property_for_display,
-    split_owner_for_display,
+    split_first_person,
 )
 from src.utils.lead_signals import auction_reference_date, derive_signals
 from src.utils.located_parcel import located_parcel_id, parcel_source_label
@@ -168,6 +172,145 @@ def resolve_lead_export_columns(record_type: str | None) -> list[str]:
         return list(LEAD_CSV_COLUMNS)
     allowed = set(LEAN_BASE_COLUMNS) | set(_TYPE_EXTRA_COLUMNS[record_type])
     return [c for c in LEAD_CSV_COLUMNS if c in allowed]
+
+
+# ── Versioned export layouts ────────────────────────────────────────────────
+# legacy_v1 = LEAD_CSV_COLUMNS above, byte-for-byte the headers customers have saved
+# importer mappings against (docs/batchdialer-import-guide.md), so it never changes.
+# crm_v1 = the same row VALUES under CRM/dialer-import headers in identity ->
+# property -> mailing -> contact -> source -> record-specific -> reference order.
+# Both layouts read one built row, so they cannot disagree on a value. A scraper
+# config selects its layout (deliver.csv_layout); a missing/unknown value is
+# legacy_v1, which keeps every pre-existing config exporting exactly as before.
+LAYOUT_LEGACY_V1 = "legacy_v1"
+LAYOUT_CRM_V1 = "crm_v1"
+EXPORT_LAYOUTS: frozenset[str] = frozenset({LAYOUT_LEGACY_V1, LAYOUT_CRM_V1})
+
+_CRM_CORE: tuple[tuple[str, str], ...] = (
+    ("first_name", "First Name"), ("last_name", "Last Name"), ("party_name", "Party Name"),
+    ("property_street", "Property Address"), ("property_city", "Property City"),
+    ("property_state", "Property State"), ("property_zip", "Property Zip"),
+    ("mailing_street", "Mailing Address"), ("mailing_city", "Mailing City"),
+    ("mailing_state", "Mailing State"), ("mailing_zip", "Mailing Zip"),
+    ("phone", "Phone 1"), ("phone_2", "Phone 2"), ("phone_3", "Phone 3"),
+    ("email", "Email 1"), ("email_2", "Email 2"), ("email_3", "Email 3"),
+    ("parcel_id", "Parcel ID"), ("county", "County"), ("county_state", "County State"),
+    ("record_type", "Record Type"), ("date_recorded", "Date Recorded"),
+)
+_CRM_AUCTION: tuple[tuple[str, str], ...] = (
+    ("auction_date", "Auction Date"), ("days_to_auction", "Days To Auction"),
+    # default_amount is the notice's principal owing (models.Result, migration 059).
+    ("default_amount", "Principal Owing"), ("trustee", "Trustee"), ("ts_number", "TS Number"),
+)
+_CRM_TAX: tuple[tuple[str, str], ...] = (
+    # delinquent_amount = SUM(billed - paid) over every delinquent year; bill_year is
+    # the TRUE oldest delinquent year (king_wa_tax_delinquent / snohomish scrapers).
+    ("delinquent_amount", "Tax Balance Owed"), ("delinquent_bill_year", "Oldest Tax Year"),
+    ("months_delinquent", "Months Delinquent"),
+    ("wa_foreclosure_eligible", "WA Foreclosure Eligible"),
+    ("tax_billed_amount", "Tax Billed Amount"), ("tax_paid_amount", "Tax Paid Amount"),
+    ("tax_account_status", "Tax Account Status"),
+)
+_CRM_CODE_VIOLATION: tuple[tuple[str, str], ...] = (
+    ("case_id", "Case ID"), ("code_violation_type", "Violation Type"),
+    ("code_violation_status", "Violation Status"),
+    ("code_violation_description", "Violation Description"),
+    ("code_violation_last_inspection", "Last Inspection"), ("parcel_source", "Parcel Source"),
+)
+_CRM_OWNER_ON_TITLE: tuple[tuple[str, str], ...] = (
+    ("current_owner", "Current Owner"), ("title_status", "Title Status"),
+)
+_CRM_TYPE_BLOCKS: dict[str, tuple[tuple[str, str], ...]] = {
+    "probate": (("lead_subtype", "Lead Subtype"), *_CRM_OWNER_ON_TITLE),
+    "death_certificate": _CRM_OWNER_ON_TITLE,
+    "divorce": (),
+    "eviction": (),
+    "tax_delinquent": _CRM_TAX,
+    "code_violation": _CRM_CODE_VIOLATION,
+    "pre_foreclosure": _CRM_AUCTION,
+    "trustee_sale": _CRM_AUCTION,
+}
+_CRM_REFERENCE: tuple[tuple[str, str], ...] = (
+    ("heirs", "Heirs"), ("property_address", "Full Property Address"),
+    ("mailing_address", "Full Mailing Address"), ("legal_description", "Legal Description"),
+    ("doc_type", "Doc Type"), ("instrument_number", "Instrument Number"),
+    ("phone_type", "Phone 1 Type"), ("assessed_value", "Assessed Value"),
+    ("absentee_owner", "Absentee Owner"), ("out_of_state_owner", "Out Of State Owner"),
+    ("owner_state", "Owner State"), ("freshness_days", "Freshness Days"),
+    ("contactability_score", "Contactability Score"),
+)
+CRM_V1_LABELS: dict[str, str] = dict(
+    (*_CRM_CORE, *_CRM_AUCTION, *_CRM_TAX, *_CRM_CODE_VIOLATION,
+     *_CRM_TYPE_BLOCKS["probate"], *_CRM_REFERENCE)
+)
+
+
+def resolve_crm_export_columns(record_type: str | None) -> list[str]:
+    """Ordered crm_v1 column KEYS: core, then the record type's block, then reference.
+
+    Unknown/None record_type carries EVERY type block (never silently drop data),
+    mirroring resolve_lead_export_columns. Keys are row keys; labels come from
+    CRM_V1_LABELS, so hidden-field blanking keeps working on internal keys.
+    """
+    blocks = (
+        [_CRM_TYPE_BLOCKS[record_type]]
+        if record_type in _CRM_TYPE_BLOCKS
+        else [_CRM_AUCTION, _CRM_TAX, _CRM_CODE_VIOLATION, _CRM_TYPE_BLOCKS["probate"]]
+    )
+    keys: list[str] = []
+    for key, _label in (*_CRM_CORE, *(pair for block in blocks for pair in block), *_CRM_REFERENCE):
+        if key not in keys:
+            keys.append(key)
+    return keys
+
+
+def resolve_export_layout(
+    layout: str | None, record_type: str | None
+) -> tuple[list[str], dict[str, str] | None]:
+    """(column keys, header labels or None) for a per-job export in ``layout``.
+
+    None labels = the legacy header (the keys themselves). Anything other than
+    crm_v1 resolves to legacy_v1: an absent or unrecognized stored value must keep
+    exporting the headers that config has always exported.
+    """
+    if layout == LAYOUT_CRM_V1:
+        return resolve_crm_export_columns(record_type), CRM_V1_LABELS
+    return resolve_lead_export_columns(record_type), None
+
+
+# ── Party-name order per source ─────────────────────────────────────────────
+# Verified 2026-09-14 against scraper code AND a read-only prod sample: county
+# recorder indexes and assessor/treasurer owner names are 'LAST FIRST [MIDDLE]';
+# trustee's-sale notices write the grantor 'FIRST [MIDDLE] LAST'. A source missing
+# here gets NO first/last (blank beats a reversed name in a dialer).
+_NAME_ORDER_BY_RECORD_TYPE: dict[str, str] = {
+    "probate": NAME_ORDER_RECORDER,
+    "pre_foreclosure": NAME_ORDER_RECORDER,
+    "divorce": NAME_ORDER_RECORDER,
+    "death_certificate": NAME_ORDER_RECORDER,
+    "tax_delinquent": NAME_ORDER_RECORDER,
+    "code_violation": NAME_ORDER_RECORDER,
+    "trustee_sale": NAME_ORDER_NATURAL,
+}
+# (county, record_type) exceptions. A None value means party_name is not a person
+# name at all for that source.
+_NAME_ORDER_OVERRIDES: dict[tuple[str, str], str | None] = {
+    # Snohomish pre-foreclosure is parsed from trustee's-sale notices, not a recorder.
+    ("snohomish", "pre_foreclosure"): NAME_ORDER_NATURAL,
+    # Okanogan probate mixes 'ESTATE OF GLENNA K JONES' with 'JONES, GLENNA K'.
+    ("okanogan", "probate"): NAME_ORDER_COMMA_ONLY,
+    # Pierce code violations synthesize "{case_type} - {address}" as party_name.
+    ("pierce", "code_violation"): None,
+}
+
+
+def name_order_for(record_type: str | None, county: str | None) -> str | None:
+    """The declared party_name word order for a source, or None when unknown."""
+    rt = (record_type or "").strip().lower()
+    key = ((county or "").strip().lower(), rt)
+    if key in _NAME_ORDER_OVERRIDES:
+        return _NAME_ORDER_OVERRIDES[key]
+    return _NAME_ORDER_BY_RECORD_TYPE.get(rt)
 
 
 # User-controllable OUTPUT visibility (delivery/view preference — NOT scrape scope;
@@ -356,16 +499,25 @@ _TITLE_STATUS_LABELS: dict[str, str] = {
 
 
 def build_lead_export_row(
-    record: Any, today: date | None = None, *, auction_today: date | None = None
+    record: Any,
+    today: date | None = None,
+    *,
+    auction_today: date | None = None,
+    context: dict[str, Any] | None = None,
 ) -> dict[str, str]:
     """Build one canonical CSV row dict from an ORM Result or a plain dict.
 
     Parses raw name/address, THEN sanitizes each emitted value (never before
     parsing — escaping changes the string shape). Phones are normalized to bare
     10-digit (digits-only output is inherently CSV-injection-safe). Numerics are
-    rendered plainly. Keys exactly match LEAD_CSV_COLUMNS. `today` is injected for
-    the derived freshness/delinquency signals (defaults to UTC today) so exports
-    are reproducible and tests don't freeze the clock.
+    rendered plainly. Keys cover LEAD_CSV_COLUMNS and every crm_v1 key. `today` is
+    injected for the derived freshness/delinquency signals (defaults to UTC today)
+    so exports are reproducible and tests don't freeze the clock.
+
+    `context` carries the source (`county`, `state`, `record_type`) for rows that
+    don't: a per-job ORM Result has none of them (they live on ScraperConfig), while
+    batch/Lists SQL rows select them. The record's own value wins. Without a record
+    type the party-name order is unknown, so first/last stay blank.
     """
     if today is None:
         today = datetime.now(UTC).date()
@@ -374,7 +526,13 @@ def build_lead_export_row(
     # are the real entry points — this module never reads a hidden clock of its own.
     if auction_today is None:
         auction_today = today
-    first, last = split_owner_for_display(_get(record, "party_name"))
+    ctx = context or {}
+    record_type = _get(record, "record_type") or ctx.get("record_type")
+    county = _get(record, "county") or ctx.get("county")
+    county_state = _get(record, "state") or ctx.get("state")
+    first, last = split_first_person(
+        _get(record, "party_name"), name_order_for(record_type, county)
+    )
     prop = parse_property_for_display(_get(record, "property_address"))
     # Same parser for the mailing address — it is address-generic (validated
     # state/zip, PO-Box/unit aware) despite the property-flavored name. Parts it
@@ -484,12 +642,23 @@ def build_lead_export_row(
         # current_owner is the Assessor's owner NOW; title_status is a factual scan aid.
         "current_owner": _enrich_str(enr, "assessor_current_owner"),
         "title_status": _TITLE_STATUS_LABELS.get(enr.get("title_status"), ""),
+        # Source identity (crm_v1). County/state come from the scraper config, so
+        # they name the county the lead was pulled from, not the owner's location.
+        "county": sanitize_for_csv(str(county).strip().title()) if county else "",
+        "county_state": sanitize_for_csv(str(county_state).strip().upper()) if county_state else "",
+        "record_type": sanitize_for_csv(record_type_label(record_type)) if record_type else "",
+        # Code-enforcement case number: Seattle SDCI stores record_number, Tacoma/
+        # Pierce stores case_number (which no column carried before crm_v1).
+        "case_id": _enrich_str(enr, "record_number", "case_number"),
     }
 
 
 def write_lead_csv(
     records: list[Any], filelike, hidden_fields: set[str] | None = None,
     columns: list[str] | None = None,
+    *,
+    labels: dict[str, str] | None = None,
+    context: dict[str, Any] | None = None,
 ) -> None:
     """Write the canonical lead CSV (header + rows) to an open text file/StringIO.
 
@@ -504,6 +673,10 @@ def write_lead_csv(
     built full-width; `extrasaction="ignore"` drops the keys not in `columns`, so the
     lean file and the full file share identical values for the columns they have in
     common (no separate builder, no drift).
+
+    `labels` (from `resolve_export_layout`) replaces the header TEXT only; None
+    writes the keys themselves (legacy_v1). `context` is the source county/state/
+    record_type for rows that don't carry it (see build_lead_export_row).
     """
     # One consistent pair of "today"s for the whole file: UTC for the tax signals,
     # county-local for the auction countdown (lead_signals.AUCTION_TZ). Derived from a
@@ -512,13 +685,21 @@ def write_lead_csv(
     _now = datetime.now(UTC)
     today = _now.date()
     auction_today = auction_reference_date(_now)
-    writer = csv.DictWriter(
-        filelike, fieldnames=columns or LEAD_CSV_COLUMNS, extrasaction="ignore"
-    )
-    writer.writeheader()
+    fieldnames = columns or LEAD_CSV_COLUMNS
+    writer = csv.DictWriter(filelike, fieldnames=fieldnames, extrasaction="ignore")
+    if labels:
+        # Same csv dialect as DictWriter, so quoting/line endings match the rows.
+        csv.writer(filelike).writerow(
+            [sanitize_for_csv(labels.get(key, key)) for key in fieldnames]
+        )
+    else:
+        writer.writeheader()
     for rec in records:
         writer.writerow(_apply_visibility(
-            build_lead_export_row(rec, today, auction_today=auction_today), hidden_fields
+            build_lead_export_row(
+                rec, today, auction_today=auction_today, context=context
+            ),
+            hidden_fields,
         ))
 
 

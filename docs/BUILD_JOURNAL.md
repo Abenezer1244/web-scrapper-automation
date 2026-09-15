@@ -19,6 +19,29 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-15 - Results date sort follow-ups: prod verified, cached records page ordered, auction-date question settled
+
+**Built / Shipped (branch `fix/results-open-items`):** `GET /scrapers/{id}/records` rows query is now a Core select
+ordered `scraped_at DESC, parsed date DESC NULLS LAST, id ASC` (`cached_records_order_by` in
+`src/api/results_sort.py`). The date parser is shared and exception-free for M/D/YYYY and Month D, YYYY.
+
+**Tried / Decided:** trustee_sale and Snohomish prefc `date_recorded` holding the auction date is documented design,
+not a bug; Codex agreed it stays an owner decision (rewriting it changes dedup identity). Kept scraped_at primary on
+the records page (its "new since you last looked" feed); date only orders rows inside a refresh batch.
+
+**Failed / Blocked:** compiling the parser to a literal SQL string for the raw text() query doubled every regex
+backslash (`'^\s*...'`), which under standard_conforming_strings matches nothing: a silent all-NULL sort. Replaced by a
+Core select with bound patterns. Prod UI check: Chromium "Target crashed" on a second job (box low on memory); one job
+per run worked. One prod page-2 API call returned a non-JSON body while the API log shows 200 for it; six repeats were
+all 200, cause not identified (edge side).
+
+**Pending / Handoff:** owner: whether auction leads should show a different Date label/value.
+
+**Facts learned:** SQLAlchemy `literal_binds` on the postgresql dialect escapes backslashes in string literals; never
+inline regex literals into raw SQL. Prod results page request is ~1.7s end to end; the sort is ~70ms of it.
+
+---
+
 ## 2026-09-15 - King tax property repair applied (3,006 rows), and the beat sweeps deploys were starving
 
 **Built / Shipped:** PR #310 `9f8f7cc` (merged): every beat entry of 10 min or slower is a wall-clock

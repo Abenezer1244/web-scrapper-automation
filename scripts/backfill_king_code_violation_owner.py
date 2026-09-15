@@ -22,6 +22,17 @@ row carries `cv_semantics_repaired_at`; --retry-owners revisits exact/street-onl
     railway run --service worker python scripts/backfill_king_code_violation_owner.py              # dry-run
     railway run --service worker python scripts/backfill_king_code_violation_owner.py --owners --apply
 
+--address-points is a separate pass for rows the strict point rule left unmatched
+(address_mismatch, multiple, no_parcel, no_coordinates): it applies King's address-point
+rule (`src/scrapers/enrichment/king_address_points.py`), records the tier and its
+evidence, and fills an EMPTY mailing address from the Assessor extract for the shown
+address_point tier only. Guarded UPDATEs pin every prior kc_* value, the mailing value
+read and parcel_id NULL; nothing else changes. Name the new owners afterwards with
+`--owners --retry-owners`.
+
+    railway run --service worker python scripts/backfill_king_code_violation_owner.py --address-points          # dry-run
+    railway run --service worker python scripts/backfill_king_code_violation_owner.py --address-points --apply
+
 Owner lookups need the King source lease in the SAME Redis as the workers. Off Railway,
 `railway run` injects the private Redis host, where the lease fails OPEN; point
 REDIS_URL at the Redis service's public URL first (the script refuses otherwise).
@@ -64,7 +75,7 @@ _CANDIDATES_SQL = """
       AND r.enrichment_data::jsonb->>'source' = :source
       AND (NOT (r.enrichment_data::jsonb ? 'cv_semantics_repaired_at')
            OR (:retry_owners AND coalesce(btrim(r.party_name), '') = ''
-               AND r.enrichment_data::jsonb->>'kc_pin_match' IN ('exact', 'street_only')
+               AND r.enrichment_data::jsonb->>'kc_pin_match' IN ('exact', 'street_only', 'address_point')
                AND NOT (r.enrichment_data::jsonb ? 'owner_source')))
     ORDER BY r.id
 """
@@ -84,6 +95,147 @@ _UPDATE_SQL = """
       AND NOT (enrichment_data::jsonb ? 'owner_source')
       AND EXISTS (SELECT 1 FROM jobs j WHERE j.id = results.job_id AND j.status = 'done')
 """
+
+
+_AP_CANDIDATES_SQL = """
+    SELECT r.id, r.user_id, r.property_address, r.property_city, r.property_state,
+           r.property_zip, r.mailing_address, r.enrichment_data::jsonb AS ed
+    FROM results r
+    JOIN jobs j ON j.id = r.job_id
+    JOIN scraper_configs sc ON sc.id = j.scraper_config_id
+    WHERE lower(sc.county) = 'king' AND upper(sc.state) = 'WA'
+      AND sc.record_type = 'code_violation'
+      AND j.status = 'done'
+      AND r.parcel_id IS NULL
+      AND jsonb_typeof(r.enrichment_data::jsonb) = 'object'
+      AND r.enrichment_data::jsonb->>'source' = :source
+      AND r.enrichment_data::jsonb->>'kc_pin_status' = ANY(:statuses)
+      AND NOT (r.enrichment_data::jsonb ? 'kc_address_point_evidence')
+      AND NOT (r.enrichment_data::jsonb ? 'owner_source')
+    ORDER BY r.id
+"""
+
+_AP_UPDATE_SQL = """
+    UPDATE results SET
+      mailing_address = CASE WHEN CAST(:new_mail AS text) IS NOT NULL
+                             THEN CAST(:new_mail AS text) ELSE mailing_address END,
+      property_state = CASE WHEN CAST(:new_mail AS text) IS NOT NULL
+                            THEN CAST(:f_property_state AS varchar) ELSE property_state END,
+      owner_state = CASE WHEN CAST(:new_mail AS text) IS NOT NULL
+                         THEN CAST(:f_owner_state AS varchar) ELSE owner_state END,
+      absentee_owner = CASE WHEN CAST(:new_mail AS text) IS NOT NULL
+                            THEN CAST(:f_absentee AS boolean) ELSE absentee_owner END,
+      out_of_state_owner = CASE WHEN CAST(:new_mail AS text) IS NOT NULL
+                                THEN CAST(:f_out_of_state AS boolean) ELSE out_of_state_owner END,
+      enrichment_data = (enrichment_data::jsonb || CAST(:payload AS jsonb))::json
+    WHERE id = :rid AND user_id = :uid
+      AND parcel_id IS NULL
+      AND mailing_address IS NOT DISTINCT FROM CAST(:old_mail AS text)
+      AND (CAST(:new_mail AS text) IS NULL OR coalesce(btrim(mailing_address), '') = '')
+      AND jsonb_typeof(enrichment_data::jsonb) = 'object'
+      AND enrichment_data::jsonb->>'source' = :source
+      AND enrichment_data::jsonb->>'kc_pin_status' = CAST(:old_pin_status AS text)
+      AND enrichment_data::jsonb->>'kc_pin' IS NOT DISTINCT FROM CAST(:old_pin AS text)
+      AND enrichment_data::jsonb->>'kc_pin_match' IS NOT DISTINCT FROM CAST(:old_pin_match AS text)
+      AND enrichment_data::jsonb->>'kc_pin_source' IS NOT DISTINCT FROM CAST(:old_pin_source AS text)
+      AND NOT (enrichment_data::jsonb ? 'kc_address_point_evidence')
+      AND NOT (enrichment_data::jsonb ? 'owner_source')
+      AND EXISTS (SELECT 1 FROM jobs j WHERE j.id = results.job_id AND j.status = 'done')
+"""
+
+
+def run_address_points(db, *, apply_writes: bool, limit: int | None = None,
+                       report: Path | None = None, gis_pace_s: float = 1.1) -> dict:
+    """Resolve point-rule leftovers through King's address points (see module doc)."""
+    from src.scrapers.enrichment import king_address_points as kap
+    from src.scrapers.enrichment.king_rpacct import resolve_pins
+    from src.utils.address_intel import compute_owner_flags
+    from src.utils.located_parcel import mailing_lookup_pin
+
+    rows = db.execute(text(_AP_CANDIDATES_SQL), {
+        "source": _SOURCE, "statuses": sorted(kap.FALLBACK_STATUSES)}).all()
+    db.rollback()
+    if limit:
+        rows = rows[:limit]
+    now = datetime.now(UTC).isoformat()
+    counts: Counter = Counter()
+    plans: list[tuple] = []
+    for r in rows:
+        ed = r.ed
+        decision = kap.match_address_point(
+            ed.get("latitude"), ed.get("longitude"), r.property_address,
+            point_status=ed.get("kc_pin_status"), pace_s=gis_pace_s)
+        time.sleep(gis_pace_s)
+        fields = kap.decision_fields(decision, checked_at=now)
+        if not fields:
+            counts["transient_error_left_for_retry"] += 1
+            continue
+        counts[f"outcome_{decision.outcome}"] += 1
+        counts[f"tier_{decision.match}" if decision.match else
+               f"reason_{decision.evidence.get('reason')}"] += 1
+        plans.append((r, fields))
+
+    wanted = {pin for r, f in plans
+              if not (r.mailing_address or "").strip() and (pin := mailing_lookup_pin(f))}
+    answers, snapshot = {}, None
+    if wanted:
+        resolved = resolve_pins(wanted)
+        if resolved is None:
+            # Stamping a match now would exclude the row from every later run with no
+            # mailing: those rows are left for a later run instead.
+            counts["extract_unusable_left_for_retry"] = sum(
+                1 for r, f in plans if mailing_lookup_pin(f) in wanted
+                and not (r.mailing_address or "").strip())
+            plans = [(r, f) for r, f in plans
+                     if not (mailing_lookup_pin(f) in wanted and not (r.mailing_address or "").strip())]
+        else:
+            answers, snapshot = resolved
+
+    written = skipped = 0
+    fh = report.open("w", encoding="utf-8") if report is not None else None
+    try:
+        for i, (r, fields) in enumerate(plans, 1):
+            payload = dict(fields)
+            new_mail = None
+            pin = mailing_lookup_pin(fields)
+            ans = answers.get(pin) if pin and not (r.mailing_address or "").strip() else None
+            if ans is not None and ans.status == "found":
+                new_mail = ans.mailing_address
+                payload.update({"mailing_source": "king_rpacct",
+                                "mailing_rpacct_snapshot": snapshot})
+                counts["mailing_found"] += 1
+            if fh is not None:
+                fh.write(json.dumps({"result_id": str(r.id),
+                                     "property_address": r.property_address,
+                                     "new_mailing_address": new_mail, **payload}) + "\n")
+            if not apply_writes:
+                continue
+            flags = compute_owner_flags(r.property_address, new_mail,
+                                        property_city=r.property_city,
+                                        property_state=r.property_state,
+                                        property_zip=r.property_zip)
+            res = db.execute(text(_AP_UPDATE_SQL), {
+                "new_mail": new_mail, "old_mail": r.mailing_address, "rid": r.id,
+                "uid": r.user_id, "payload": json.dumps(payload), "source": _SOURCE,
+                "f_property_state": flags["property_state"], "f_owner_state": flags["owner_state"],
+                "f_absentee": flags["absentee_owner"], "f_out_of_state": flags["out_of_state_owner"],
+                # Decided for THIS point outcome; a row changed since it was read is skipped.
+                "old_pin_status": r.ed.get("kc_pin_status"), "old_pin": r.ed.get("kc_pin"),
+                "old_pin_match": r.ed.get("kc_pin_match"),
+                "old_pin_source": r.ed.get("kc_pin_source")})
+            written += bool(res.rowcount)
+            skipped += not res.rowcount
+            if i % 200 == 0:
+                db.commit()
+        if apply_writes:
+            db.commit()
+    finally:
+        if fh is not None:
+            fh.close()
+    stats = {"candidates": len(rows), "planned": len(plans), **dict(counts)}
+    if apply_writes:
+        stats["writes"] = {"written": written, "skipped_by_write_guard": skipped}
+    return stats
 
 
 def old_scraper_label(raw: dict) -> str:
@@ -245,19 +397,30 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--owners", action="store_true", help="look up owners on eRealProperty")
     ap.add_argument("--retry-owners", action="store_true",
                     help="also revisit repaired exact rows that still have no owner")
+    ap.add_argument("--address-points", action="store_true",
+                    help="resolve point-rule leftovers through King address points "
+                         "(runs alone; name owners afterwards with --owners --retry-owners)")
+    ap.add_argument("--gis-pace", type=float, default=1.1,
+                    help="seconds between King GIS requests for --address-points")
     ap.add_argument("--limit", type=int, help="only the first N candidates")
     ap.add_argument("--owner-delay", type=float, default=2.0, help="seconds between owner pages")
     ap.add_argument("--report", type=Path,
                     default=Path(f"king_cv_owner_{datetime.now(UTC):%Y%m%dT%H%M%SZ}.jsonl"))
     args = ap.parse_args(argv)
+    if args.address_points and (args.owners or args.retry_owners):
+        ap.error("--address-points runs alone; name owners afterwards with --owners --retry-owners")
     if args.owners:
         _refuse_private_redis()
     from src.db.session import system_sync_session
 
     with system_sync_session() as db:
-        stats = run(db, apply_writes=args.apply, owners=args.owners,
-                    retry_owners=args.retry_owners, limit=args.limit, report=args.report,
-                    owner_delay=args.owner_delay)
+        if args.address_points:
+            stats = run_address_points(db, apply_writes=args.apply, limit=args.limit,
+                                       report=args.report, gis_pace_s=args.gis_pace)
+        else:
+            stats = run(db, apply_writes=args.apply, owners=args.owners,
+                        retry_owners=args.retry_owners, limit=args.limit, report=args.report,
+                        owner_delay=args.owner_delay)
     print(json.dumps(stats, indent=2))
     print(f"evidence -> {args.report}")
     if not args.apply:

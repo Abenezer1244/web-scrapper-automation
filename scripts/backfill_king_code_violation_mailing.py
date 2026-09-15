@@ -68,7 +68,7 @@ _UPDATE_SQL = """
 
 def run(db, *, apply_writes: bool, limit: int | None, report: Path | None,
         pace_s: float = 0.35) -> dict:
-    from src.scrapers.enrichment.king_parcel_locate import SOURCE, resolve_code_violation_mailing
+    from src.scrapers.enrichment.king_parcel_locate import resolve_code_violation_mailing
     from src.utils.address_intel import compute_owner_flags
 
     rows = db.execute(text(_CANDIDATES_SQL)).all()
@@ -98,10 +98,8 @@ def run(db, *, apply_writes: bool, limit: int | None, report: Path | None,
         flags = compute_owner_flags(r.property_address, mail, property_city=r.property_city,
                                     property_state=r.property_state, property_zip=r.property_zip)
         payload = {key: d[key] for key in ("kc_pin_status", "kc_pin", "kc_parcel_address",
-                                           "kc_pin_match") if key in d}
+                                           "kc_pin_match", "kc_pin_source") if key in d}
         payload["kc_pin_checked_at"] = now
-        if d.get("kc_pin"):
-            payload["kc_pin_source"] = SOURCE
         if mail:
             payload.update({"mailing_source": "king_rpacct", "mailing_rpacct_snapshot": snapshot})
         res = db.execute(text(_UPDATE_SQL), {

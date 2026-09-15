@@ -49,7 +49,7 @@ _CHUNK = 150  # batch_enrich_king_county caps one mailing pass at 200 pages
 _CV_CANDIDATES_SQL = """
     SELECT r.id, r.user_id, r.parcel_id AS raw_pid, r.enrichment_data::jsonb->>'kc_pin' AS pid,
            r.property_address, r.property_city, r.property_state, r.property_zip,
-           r.mailing_address
+           r.mailing_address, r.enrichment_data::jsonb AS ed
     FROM results r
     JOIN jobs j ON j.id = r.job_id
     JOIN scraper_configs sc ON sc.id = j.scraper_config_id
@@ -116,7 +116,12 @@ def select_candidates(db, answers_for) -> list[dict]:
     krm = _load_rpacct_script()
     stamped = {str(x) for x in db.execute(text(_STAMPED_SQL)).scalars()}
     parcel_rows = [r for r in db.execute(text(krm._CANDIDATES_SQL)).all() if str(r.id) not in stamped]
-    cv_rows = db.execute(text(_CV_CANDIDATES_SQL)).all()
+    from src.utils.located_parcel import mailing_lookup_pin
+
+    # The tier decides whether a located PIN may carry a mailing address: an address-only
+    # candidate (no coordinates to corroborate it) never does.
+    cv_rows = [r for r in db.execute(text(_CV_CANDIDATES_SQL)).all()
+               if mailing_lookup_pin(r.ed) == r.pid]
     db.rollback()
     answers = answers_for({r.pid for r in parcel_rows} | {r.pid for r in cv_rows})
 

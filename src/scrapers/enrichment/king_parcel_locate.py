@@ -29,6 +29,7 @@ import math
 import re
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 from src.utils.address_intel import _normalize_street, parse_property_for_display
 from src.utils.located_parcel import (
@@ -37,6 +38,7 @@ from src.utils.located_parcel import (
     MATCH_EXACT,
     MATCH_STREET_ONLY,
     located_parcel_id,
+    mailing_lookup_pin,
 )
 from src.utils.logger import setup_logger
 from src.utils.safe_http import safe_get
@@ -53,6 +55,9 @@ OWNER_SOURCE = "king_erealproperty"
 # King Assessor property type "K" = condominium complex (verified on the layer:
 # ZULO CONDOMINIUM, PREUSE_DESC "Condominium(Residential)").
 _CONDO_PROPTYPE = "K"
+# Worst case for one address-point request (its timeout): the fallback only starts while
+# two of them still fit inside the caller's time budget.
+_ADDRESS_POINT_WORST_S = 15
 
 # A lead address naming a unit ("#6", "UNIT 6", "APT 6", "STE 6") cannot be proven by a
 # street comparison: the normalizer strips units, so two condo units on one base parcel
@@ -75,6 +80,9 @@ class Located:
     # whole condominium. "exact" and "street_only" are shown and name the owner
     # (src/utils/located_parcel.py); paid skip trace accepts "exact" only.
     match: str | None = None
+    # (PIN, PROPTYPE) of every polygon the layer returned under the point, when that set
+    # is complete; the address-point fallback reuses it instead of asking again.
+    point_parcels: tuple[tuple[str, str], ...] | None = None
 
 
 def _street_and_zip(address: str | None) -> tuple[str, str]:
@@ -115,10 +123,14 @@ def locate(lat: object, lon: object, property_address: str | None) -> Located:
         # A capped page does not prove "exactly one polygon" (Codex P1).
         return Located("multiple")
     features = data.get("features") or []
+    point_parcels = tuple(
+        (str((f.get("attributes") or {}).get("PIN") or "").strip(),
+         str((f.get("attributes") or {}).get("PROPTYPE") or "").strip().upper())
+        for f in features)
     if not features:
-        return Located("no_parcel")
+        return Located("no_parcel", point_parcels=point_parcels)
     if len(features) != 1:
-        return Located("multiple")
+        return Located("multiple", point_parcels=point_parcels)
     attrs = features[0].get("attributes") or {}
     pin = str(attrs.get("PIN") or "").strip()
     parcel_street = _normalize_street(attrs.get("ADDR_FULL"))
@@ -127,7 +139,8 @@ def locate(lat: object, lon: object, property_address: str | None) -> Located:
     if (not pin or not pin.isdigit() or len(pin) != 10 or not parcel_street
             or parcel_street != lead_street
             or (lead_zip and parcel_zip and lead_zip != parcel_zip)):
-        return Located("address_mismatch", parcel_address=attrs.get("ADDR_FULL"))
+        return Located("address_mismatch", parcel_address=attrs.get("ADDR_FULL"),
+                       point_parcels=point_parcels)
     if str(attrs.get("PROPTYPE") or "").strip().upper() == _CONDO_PROPTYPE:
         # The whole-complex parcel (minor 0000): every unit sits under this polygon and
         # shares its street, so neither the PIN nor its taxpayer identifies the unit
@@ -159,7 +172,8 @@ def locate_many(items: list[tuple[str, object, object, str | None]], *,
 def owner_lookup_pins(rows) -> dict[str, list]:
     """{shown located PIN: [rows]} for code-violation rows that still have no owner.
 
-    Only a shown location (exact or street-level, see src/utils/located_parcel.py) may name the owner: the
+    Only a shown location (exact, street-level or address point, see
+    src/utils/located_parcel.py) may name the owner: the
     county's taxpayer on a parcel we are not sure of would put a stranger's name on the
     lead. A row that already has a party_name is never offered for replacement.
     """
@@ -200,49 +214,73 @@ def apply_owner_names(pin_map: dict[str, list], owners: dict[str, str], *,
 
 def resolve_code_violation_mailing(
     items: list[tuple[str, object, object, str | None]], *,
-    pace_s: float = 0.25, budget_s: float | None = None,
+    pace_s: float = 0.25, budget_s: float | None = None, address_points: bool = False,
 ) -> tuple[dict[str, dict], str | None]:
     """For each (key, lat, lon, address): locate the parcel, then its extract mailing.
 
     Returns ({key: decision}, extract snapshot). A decision always carries `kc_pin_status`
     for a definite outcome (so a row is never re-located forever; a transient "error" is
-    left without one so it retries) and, when matched, `kc_pin`/`kc_parcel_address`;
-    `mailing_address` is present only for a strict parcel match with an unambiguous
-    extract answer. Keys the budget did not reach are absent.
+    left without one so it retries) and, when matched, `kc_pin`/`kc_parcel_address`/
+    `kc_pin_match`/`kc_pin_source`. With ``address_points``, a point outcome the address
+    points may resolve (`king_address_points.FALLBACK_STATUSES`) is retried there within
+    the same budget, and a definite answer adds `kc_address_point_evidence`.
+    `mailing_address` is present only for a tier `located_parcel.mailing_lookup_pin`
+    allows, with an unambiguous extract answer. Keys the budget did not reach are absent.
     """
+    from src.scrapers.enrichment import king_address_points as kap
     from src.scrapers.enrichment.king_rpacct import resolve_pins
 
+    deadline = time.monotonic() + budget_s if budget_s is not None else None
     # One lookup per distinct point+address: a complaint often has several records.
-    by_point: dict[tuple, list[str]] = {}
+    by_point: dict[tuple, list[tuple[str, str | None]]] = {}
     for key, lat, lon, address in items:
-        by_point.setdefault((str(lat), str(lon), (address or "").strip().upper()), []).append(key)
-    located = locate_many([(k, pt[0], pt[1], pt[2]) for pt, keys in by_point.items()
-                           for k in keys[:1]], pace_s=pace_s, budget_s=budget_s)
+        by_point.setdefault((str(lat), str(lon), (address or "").strip().upper()),
+                            []).append((key, address))
+    located = locate_many([(group[0][0], pt[0], pt[1], group[0][1])
+                           for pt, group in by_point.items()], pace_s=pace_s, budget_s=budget_s)
+    checked_at = datetime.now(UTC).isoformat()
     decisions: dict[str, dict] = {}
-    for keys in by_point.values():
-        loc = located.get(keys[0])
+    for (lat, lon, _), group in by_point.items():
+        first_key, first_address = group[0]
+        loc = located.get(first_key)
         # Not reached, or a transient failure: no status, so a later run retries it.
         if loc is None or loc.status == "error":
             continue
-        for key in keys:
-            d = {"kc_pin_status": loc.status}
-            if loc.status == "matched":
-                d.update({"kc_pin": loc.pin, "kc_parcel_address": loc.parcel_address,
-                          "kc_pin_match": loc.match})
-            decisions[key] = d
-    pins = {d["kc_pin"] for d in decisions.values() if d.get("kc_pin")}
+        d = {"kc_pin_status": loc.status}
+        if loc.status == "matched":
+            d.update({"kc_pin": loc.pin, "kc_parcel_address": loc.parcel_address,
+                      "kc_pin_match": loc.match, "kc_pin_source": SOURCE})
+        elif (address_points and loc.status in kap.FALLBACK_STATUSES
+              # Room for both address-point requests to time out before the deadline.
+              and (deadline is None
+                   or time.monotonic() + 2 * _ADDRESS_POINT_WORST_S + pace_s < deadline)):
+            ap = kap.match_address_point(lat, lon, first_address,
+                                         point_parcels=loc.point_parcels,
+                                         point_status=loc.status, pace_s=pace_s)
+            d.update(kap.decision_fields(ap, checked_at=checked_at))
+            time.sleep(pace_s)
+        for key, _address in group:
+            decisions[key] = dict(d)
+    pins = {pin for d in decisions.values() if (pin := mailing_lookup_pin(d))}
     snapshot = None
     if pins:
         resolved = resolve_pins(pins)
         if resolved is None:
             # The extract is temporarily unusable. A matched row stamped now would be
-            # excluded from every later run with no mailing (Codex P1), so matched rows
-            # carry no status and retry; definite non-matches keep theirs.
-            decisions = {k: d for k, d in decisions.items() if d["kc_pin_status"] != "matched"}
+            # excluded from every later run with no mailing (Codex P1), so a strict match
+            # carries no status and retries; an address-point match falls back to its
+            # point outcome with no evidence, so the address-point repair retries it.
+            kept: dict[str, dict] = {}
+            for k, d in decisions.items():
+                if d["kc_pin_status"] != "matched":
+                    kept[k] = d
+                elif d.get("kc_pin_source") == kap.SOURCE:
+                    kept[k] = {"kc_pin_status": d[kap.EVIDENCE_KEY]["point_status"]}
+            decisions = kept
         else:
             answers, snapshot = resolved
             for d in decisions.values():
-                ans = answers.get(d.get("kc_pin"))
+                ans = answers.get(mailing_lookup_pin(d))
                 if ans is not None and ans.status == "found":
                     d["mailing_address"] = ans.mailing_address
     return decisions, snapshot

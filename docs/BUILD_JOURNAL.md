@@ -125,7 +125,7 @@ FE: dropped the planned new `/auth/me` field; `/billing/usage` already was the a
 guard read before the row lock, in-flight reservations, frozen accounts, conversion race. First Chromium run: dev
 server + API killed "for low memory"; the orphaned `next dev` then 500'd `/api/auth/session` on `write EPIPE` (its
 stdout pipe died with the wrapper) until relaunched detached with file logs. PowerShell `bash` resolved to the WSL
-stub (`C:\windows\system32ash.exe`); use `C:\Program Files\Gitinash.exe`.
+stub (`C:\windows\system32\bash.exe`); use `C:\Program Files\Git\bin\bash.exe`.
 
 **Caught & fixed:** Codex BE challenge PASS; adopted malformed-ledger guard (billed_count with NULL
 billing_applied_at), SQLSTATE 55P03 lock detection, explicit success set; disproved NULL job status. A mutation run

@@ -51,7 +51,7 @@ from sqlalchemy import text as sa_text
 
 from src.api.lead_actionability import actionable_sql
 from src.config import settings
-from src.utils.located_parcel import located_parcel_id
+from src.utils.located_parcel import located_parcel_id, shown_tier_sql
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("worker.cv_owner_recovery")
@@ -82,9 +82,11 @@ _LOCK_TTL_S = 1200
 
 # Delivered King code-violation leads still waiting for an owner, located at a
 # shown tier. Mirrors src/utils/located_parcel.py located_parcel_id (kc_pin a
-# 10-digit string, status matched, point-in-parcel source, exact or street_only)
-# so SQL and Python cannot disagree; the Python rule is checked again before a
-# lookup. The same predicate guards every write.
+# 10-digit string, status matched, and a shown tier with the source allowed to
+# produce it: exact/street_only from the point rule, address_point from the address
+# points; never address_only or condo_complex). The tier predicate is generated from
+# located_parcel.py so SQL and Python cannot disagree; the Python rule is checked
+# again before a lookup. The same predicate guards every write.
 _ELIGIBLE_ROW = """
       r.is_duplicate = false
   AND jsonb_typeof(r.enrichment_data::jsonb) = 'object'
@@ -92,9 +94,8 @@ _ELIGIBLE_ROW = """
   AND (r.party_name IS NULL OR r.party_name ~ '^[[:space:]]*$')
   AND r.enrichment_data::jsonb->>'source' = 'seattle_sdci_code_violations'
   AND r.enrichment_data::jsonb->>'kc_pin_status' = 'matched'
-  AND r.enrichment_data::jsonb->>'kc_pin_source' = 'king_gis_point_in_parcel'
-  AND r.enrichment_data::jsonb->>'kc_pin_match' IN ('exact', 'street_only')
-  AND jsonb_typeof(r.enrichment_data::jsonb->'kc_pin') = 'string'
+""" + f"""  AND {shown_tier_sql("r.enrichment_data::jsonb")}
+""" + """  AND jsonb_typeof(r.enrichment_data::jsonb->'kc_pin') = 'string'
   AND r.enrichment_data::jsonb->>'kc_pin' ~ '^[0-9]{10}$'
   AND NOT (r.enrichment_data::jsonb ? 'owner_source')
   AND coalesce(r.enrichment_data::jsonb->>'cv_owner_recovery_outcome', '')

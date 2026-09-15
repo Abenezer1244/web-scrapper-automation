@@ -40,6 +40,23 @@ _SHOWN_MATCHES_BY_SOURCE = {
     KING_GIS_POINT_SOURCE: frozenset({MATCH_EXACT, MATCH_STREET_ONLY}),
     KING_GIS_ADDRESS_POINT_SOURCE: frozenset({MATCH_ADDRESS_POINT}),
 }
+
+
+def shown_tier_sql(ed_expr: str) -> str:
+    """SQL predicate equal to "located_parcel_match(ed) is not None" for tier and source.
+
+    ``ed_expr`` is a trusted jsonb expression written by the caller (e.g.
+    ``r.enrichment_data::jsonb``); the tier and source values are this module's own
+    constants, so SQL filters and the Python rule cannot drift apart. kc_pin shape and
+    kc_pin_status are checked by the caller as before.
+    """
+    pairs = " OR ".join(
+        f"({ed_expr}->>'kc_pin_source' = '{source}' AND {ed_expr}->>'kc_pin_match' IN ("
+        + ", ".join(f"'{m}'" for m in sorted(matches)) + "))"
+        for source, matches in sorted(_SHOWN_MATCHES_BY_SOURCE.items()))
+    return f"({pairs})"
+
+
 _LABELS = {
     MATCH_EXACT: PARCEL_SOURCE_LABEL,
     MATCH_STREET_ONLY: PARCEL_SOURCE_LABEL_STREET_ONLY,

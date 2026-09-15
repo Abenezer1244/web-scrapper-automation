@@ -60,6 +60,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from sqlalchemy import text  # noqa: E402
 
+from src.utils.located_parcel import shown_tier_sql  # noqa: E402
+
 _SOURCE = "seattle_sdci_code_violations"
 _SOCRATA_URL = "https://data.seattle.gov/resource/ez4a-iug7.json"
 _SOCRATA_BATCH = 100
@@ -67,6 +69,7 @@ _LABEL_MAX = 120  # the old scraper's cap, needed to rebuild its label byte for 
 _RECORDNUM_RE = re.compile(r"^[0-9A-Za-z-]{1,32}$")
 UNCONFIRMED = "unconfirmed"
 
+# S608: the only interpolation is shown_tier_sql(), built from located_parcel.py constants.
 _CANDIDATES_SQL = """
     SELECT r.id, r.user_id, r.party_name, r.property_address, r.legal_description,
            r.enrichment_data::jsonb AS ed
@@ -80,10 +83,10 @@ _CANDIDATES_SQL = """
       AND r.enrichment_data::jsonb->>'source' = :source
       AND (NOT (r.enrichment_data::jsonb ? 'cv_semantics_repaired_at')
            OR (:retry_owners AND coalesce(btrim(r.party_name), '') = ''
-               AND r.enrichment_data::jsonb->>'kc_pin_match' IN ('exact', 'street_only', 'address_point')
+               AND {shown_tiers}
                AND NOT (r.enrichment_data::jsonb ? 'owner_source')))
     ORDER BY r.id
-"""
+""".format(shown_tiers=shown_tier_sql("r.enrichment_data::jsonb"))  # noqa: S608
 
 _UPDATE_SQL = """
     UPDATE results SET

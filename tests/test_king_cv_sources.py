@@ -552,6 +552,16 @@ async def test_seattle_requests_require_the_scrape_allowlist(monkeypatch):
     validate_scraping_target(calls[0][0], require_allowlisted=True, resolve=False)
 
 
+def test_stored_upstream_labels_are_collapsed_and_capped():
+    long = "OPEN " * 100
+    for label in (bellevue._label, burien.label):
+        assert label(long) == " ".join(long.split())[:base.LABEL_MAX]
+        assert len(label(long)) == base.LABEL_MAX
+        assert label("  In   Review ") == "In Review"
+        assert label(None) is None and label("   ") is None
+        assert label(3389900395) == "3389900395"
+
+
 def test_a_connector_without_sources_is_refused():
     with pytest.raises(ValueError, match="at least one source"):
         kcv.KingWACodeViolationScraper(sources=[])

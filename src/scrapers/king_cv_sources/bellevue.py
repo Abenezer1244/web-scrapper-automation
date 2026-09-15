@@ -56,6 +56,12 @@ def _epoch_ms_to_local(value: object) -> datetime | None:
         return None
 
 
+def _label(value: object) -> str | None:
+    """An upstream label as stored: whitespace collapsed, capped at LABEL_MAX, or None."""
+    text = " ".join(str(value).split())[:LABEL_MAX] if value is not None else ""
+    return text or None
+
+
 def _address(attrs: dict) -> str | None:
     street = " ".join(str(attrs.get("SITEADDRESS") or "").split())
     if not street:
@@ -145,12 +151,12 @@ class BellevueSource(CodeViolationSource):
             record.enrichment_data = {
                 "source": self.key,
                 "case_number": case,
-                "status": attrs.get("PERMITSTATUS"),
+                "status": _label(attrs.get("PERMITSTATUS")),
                 "violation_category": category[:LABEL_MAX] or None,
-                "case_type": attrs.get("SUBTYPE"),
+                "case_type": _label(attrs.get("SUBTYPE")),
                 "applied_at": applied.isoformat(),
                 "closed_at": finaled.isoformat() if finaled else None,
-                "source_parcel_number": raw_pin,
+                "source_parcel_number": _label(raw_pin),
                 "source_service": service,
             }
             records.append(record)

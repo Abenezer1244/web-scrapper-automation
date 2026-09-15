@@ -363,7 +363,7 @@ def detail_url(path: str) -> str:
         port = -1
     if (parts.scheme != "https" or parts.hostname != _HOST or port not in (None, 443)
             or parts.username is not None or parts.password is not None
-            or not parts.path.startswith("/KINGCO/Cap/CapDetail.aspx")):
+            or parts.path != "/KINGCO/Cap/CapDetail.aspx"):
         raise AccelaFormatError(f"{KINGCO_ACCELA}: unexpected case detail link {path[:120]!r}")
     return url
 

@@ -391,7 +391,8 @@ def test_detail_links_must_stay_on_the_portal():
                 "/KINGCO/Login.aspx", "http://aca-prod.accela.com/KINGCO/Cap/CapDetail.aspx?x=1",
                 "https://aca-prod.accela.com:8443/KINGCO/Cap/CapDetail.aspx?x=1",
                 "https://aca-prod.accela.com:x/KINGCO/Cap/CapDetail.aspx?x=1",
-                "https://u:p@aca-prod.accela.com/KINGCO/Cap/CapDetail.aspx?x=1"):
+                "https://u:p@aca-prod.accela.com/KINGCO/Cap/CapDetail.aspx?x=1",
+                "/KINGCO/Cap/CapDetail.aspx.evil?x=1", "/KINGCO/Cap/CapDetail.aspx/extra?x=1"):
         with pytest.raises(ka.AccelaFormatError, match="unexpected case detail link"):
             ka.detail_url(bad)
 

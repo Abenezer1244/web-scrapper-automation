@@ -26,6 +26,7 @@ from src.api.middleware.security import add_scrape_domain
 from src.scrapers.base_scraper import ScrapedRecord
 from src.scrapers.king_cv_sources import BURIEN
 from src.scrapers.king_cv_sources.base import (
+    LABEL_MAX,
     CodeViolationSource,
     arcgis_query_all,
     normalize_king_pin,
@@ -44,6 +45,12 @@ _PAGE_SIZE = 2000
 _DATE_RE = re.compile(r"^\s*(\d{2})/(\d{2})/(\d{4})\s*$")
 _ZIP_RE = re.compile(r"\b(\d{5})(?:-\d{4})?\s*$")
 _TRAILING_CITY_RE = re.compile(r"\s+BURIEN$", re.IGNORECASE)
+
+
+def label(value: object) -> str | None:
+    """An upstream label as stored: whitespace collapsed, capped at LABEL_MAX, or None."""
+    text = " ".join(str(value).split())[:LABEL_MAX] if value is not None else ""
+    return text or None
 
 
 def _parse_date(value: object) -> date | None:
@@ -112,12 +119,12 @@ class BurienSource(CodeViolationSource):
                 "case_number": case,
                 # Cityworks' numeric id, for looking the case up with the city.
                 "case_id": int(case_id) if isinstance(case_id, (int, float)) else None,
-                "status": attrs.get("CaseStatus"),
+                "status": label(attrs.get("CaseStatus")),
                 # Burien publishes no violation category.
                 "violation_category": None,
-                "case_type": attrs.get("CaseType"),
-                "applied_date": attrs.get("AppliedDate"),
-                "source_parcel_number": raw_pin,
+                "case_type": label(attrs.get("CaseType")),
+                "applied_date": label(attrs.get("AppliedDate")),
+                "source_parcel_number": label(raw_pin),
             }
             records.append(record)
         self.check_canary(len(rows), parsed)

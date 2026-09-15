@@ -494,7 +494,10 @@ page was heap order and OFFSET paging over the ties was unstable. Codex design c
 - [x] Prod EXPLAIN: top-N heapsort, +~75ms warm on the largest (17k-row) job; no index added
 - [x] Local UI verification in Chromium on real prod date shapes (desktop + 390px)
 - [x] Codex diff review: GATE PASS, P3 (ascending pagination test) adopted
-- [ ] Push + PRs (BE first: FE CI regenerates types from backend main), merge, deploy, prod UI check
+- [x] Push + PRs (BE #313 `7a04a53`, FE #138 `30b2a6c`), merged, deployed (Railway SUCCESS, Vercel prod success)
+- [x] Prod UI check (2026-09-15, owner's account): King code violation job (1,057 rows) newest first Sep 11, toggle to
+      oldest first starts Aug 13 (range start), toggle back, page 1 ends Sep 10 / page 2 starts Sep 10; tax job header
+      "Oldest Tax Year", aria-sort flips, `sort=created_at` -> 422. Sort adds ~70ms warm of a ~1.7s page request.
 
 ### Review
 Stored `date_recorded` text is deliberately untouched: it feeds `dedup_hash` and `source_fingerprint`, so normalizing
@@ -502,3 +505,13 @@ it could re-deliver already-paid leads. Exports (party_name, date_recorded, id),
 their existing deterministic orders. Not changed, reported: trustee_sale and some Snohomish prefc rows store the future
 auction date in `date_recorded` (semantic, owner decision); scraper records page (`county_records`) orders by
 `scraped_at DESC` with no tie-breaker.
+
+### Follow-ups (2026-09-15, branch `fix/results-open-items`)
+- [x] Auction date stored as Date (trustee_sale, Snohomish prefc fallback): documented intentional design (trustee_sale
+      2026-09-03 forward window; Snohomish "closest recording-like date"). Codex consult: leave semantics, owner decision.
+      No code change: rewriting date_recorded changes dedup identity; relabeling Date would duplicate the Auction Date column.
+- [x] Cached records page (`GET /scrapers/{id}/records`): ORDER BY scraped_at DESC alone (Benton 2,574 rows share one
+      scraped_at). Now scraped_at DESC, parsed date DESC NULLS LAST, id ASC, as a Core select. First attempt compiled the
+      parser to a literal SQL string: literal_binds DOUBLED the regex backslashes (would match nothing); caught before tests.
+- [x] Parser refactor: shared exception-free `_valid_date` for numeric and month-name dates; 17 PostgreSQL-evaluated
+      totality cases incl. prod junk (instrument numbers, UI text). 3 of 4 endpoint tests red on the old query.

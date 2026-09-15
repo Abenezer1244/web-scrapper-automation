@@ -202,6 +202,16 @@ def test_one_unreadable_row_or_a_row_count_off_the_printed_range_fails_the_page(
     no_rows = PAGE1.replace("ACA_TabRow_Odd", "x").replace("ACA_TabRow_Even", "x")
     with pytest.raises(ka.AccelaFormatError, match="grid lists 0 rows"):
         ka.parse_results_page(no_rows)
+    # ...or a grid with neither case rows nor a range (only the no-results message is empty).
+    with pytest.raises(ka.AccelaFormatError, match="grid lists 0 rows"):
+        ka.parse_results_page(no_rows.replace("Showing 1-10 of 34", ""))
+
+
+def test_a_one_case_page_off_the_portal_origin_is_refused():
+    for url in ("https://evil.example/KINGCO/Cap/CapDetail.aspx?capID3=00931",
+                "https://aca-prod.accela.com:8443/KINGCO/Cap/CapDetail.aspx?capID3=00931"):
+        with pytest.raises(ka.AccelaFormatError, match="unexpected case detail link"):
+            ka.rows_from_search([_snap(SINGLE_RESULT, url)], date(2026, 9, 13), date(2026, 9, 13))
 
 
 def test_a_parcel_section_without_a_readable_parcel_number_is_a_format_break():
@@ -351,6 +361,12 @@ def test_parcel_numbers_are_normalized_like_every_king_source():
     assert ka.parse_case_detail(dashed, "ENFR26-0938").parcel_numbers == ["1626069072"]
     short = DETAIL_1626069072.replace("Parcel Number:1626069072", "Parcel Number:162606907")
     assert ka.parse_case_detail(short, "ENFR26-0938").parcel_numbers == []
+
+
+def test_a_parcel_number_with_trailing_characters_is_not_a_pin():
+    for tail in ("X", "0", "-A"):
+        bad = DETAIL_1626069072.replace("Parcel Number:1626069072", f"Parcel Number:1626069072{tail}")
+        assert ka.parse_case_detail(bad, "ENFR26-0938").parcel_numbers == []
 
 
 @pytest.mark.parametrize("second", ["162606907", "N/A"])

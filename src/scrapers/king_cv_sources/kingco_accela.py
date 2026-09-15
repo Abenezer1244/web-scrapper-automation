@@ -109,7 +109,9 @@ EXPECTED_HEADERS = {
 
 _DATE_RE = re.compile(r"^(\d{2})/(\d{2})/(\d{4})$")
 _SHOWING_RE = re.compile(r"Showing\s+(\d+)\s*-\s*(\d+)\s+of\s+(\d+)(\+?)")
-_PARCEL_RE = re.compile(r"Parcel Number:\s*([\d\-]+)")
+# The whole printed value (up to whitespace), so trailing characters make it unreadable
+# instead of leaving a valid-looking 10-digit prefix.
+_PARCEL_RE = re.compile(r"Parcel Number:\s*(\S+)")
 _ZIP_TAIL_RE = re.compile(r"(?:,?\s*(?:WA\s+)?(\d{5})(?:-\d{4})?)?(?:\s+United States)?\s*$",
                           re.IGNORECASE)
 _CASE_RE = re.compile(r"^[A-Z]{2,6}\d{2}-\d{3,6}$")
@@ -300,8 +302,9 @@ def parse_results_page(html: str) -> ResultsPage:
     m = _SHOWING_RE.search(grid.get_text(" ", strip=True))
     if m:
         showing = (int(m.group(1)), int(m.group(2)), int(m.group(3)), m.group(4) == "+")
-    if (rows or showing is not None) and (
-            showing is None or len(rows) != showing[1] - showing[0] + 1):
+    # The portal answers "no results" with the message and no grid, so a grid is only
+    # complete with case rows and a range that counts exactly them.
+    if not rows or showing is None or len(rows) != showing[1] - showing[0] + 1:
         raise AccelaFormatError(
             f"{KINGCO_ACCELA}: the grid lists {len(rows)} rows but its range reads "
             f"{'nothing' if showing is None else f'{showing[0]}-{showing[1]}'}; "
@@ -373,7 +376,9 @@ def single_result_row(snapshot: PageSnapshot, day: date) -> GridRow:
     """The grid row for a one-day search the portal answered with the case's detail page.
 
     The detail page prints no opened date; the search covered only ``day``, so that is it.
+    The page is only trusted on the portal's own origin and detail path, like a link.
     """
+    detail_url(snapshot.url)
     soup = BeautifulSoup(snapshot.html, "lxml")
     case = _text(soup.select_one(SEL_DETAIL_CASE))
     if not case or not _CASE_RE.match(case):

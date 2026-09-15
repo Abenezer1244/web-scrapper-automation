@@ -52,6 +52,23 @@ _SSE_HEADERS = {
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 
 
+def _job_response(job: Job, config: ScraperConfig | None) -> JobResponse:
+    """A JobResponse with the fields that live on the job's scraper config.
+
+    The one place both the list and the single-job endpoints fill them. GET
+    /jobs/{id} used to skip this, so record_type came back null there and the
+    Results page could not tell an auction-lead job (its "Notice Date" header).
+    """
+    resp = JobResponse.model_validate(job)
+    if config is not None:
+        resp.scraper_name = config.name
+        resp.county = config.county
+        resp.state = config.state
+        resp.record_type = config.record_type
+        resp.batch_id = config.batch_id  # None for standalone; set for batch children
+    return resp
+
+
 @router.get("", response_model=list[JobResponse])
 async def list_jobs(
     current_user: CurrentUser,
@@ -96,15 +113,9 @@ async def list_jobs(
 
     responses = []
     for j in jobs:
-        resp = JobResponse.model_validate(j)
-        sc = config_map.get(str(j.scraper_config_id))
-        if sc:
-            resp.scraper_name = sc.name
-            resp.county = sc.county
-            resp.state = sc.state
-            resp.record_type = sc.record_type
-            resp.batch_id = sc.batch_id  # None for standalone; set for batch children
-        responses.append(resp)
+        responses.append(
+            _job_response(j, config_map.get(str(j.scraper_config_id)))
+        )
     return responses
 
 
@@ -302,7 +313,13 @@ async def get_job(
     job = result.scalar_one_or_none()
     if job is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
-    return JobResponse.model_validate(job)
+    config = (await db.execute(
+        select(ScraperConfig).where(
+            ScraperConfig.id == job.scraper_config_id,
+            ScraperConfig.user_id == current_user.id,  # defense-in-depth owner filter
+        )
+    )).scalar_one_or_none()
+    return _job_response(job, config)
 
 
 @router.delete("/{job_id}", status_code=status.HTTP_204_NO_CONTENT)

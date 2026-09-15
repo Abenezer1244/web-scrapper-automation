@@ -385,6 +385,45 @@ def test_a_state_written_without_a_comma_is_not_part_of_the_street():
     assert (p.street, p.zip5, p.letter) == ("ALLEN PL", "98103", "N")
 
 
+@pytest.mark.parametrize("body", [{}, {"features": None}, {"features": [None]},
+                                  {"features": [{"attributes": None}]}, {"features": "x"}])
+def test_a_malformed_answer_is_transient_not_a_rejection(body, monkeypatch):
+    monkeypatch.setattr(kap, "safe_get", lambda *a, **kw: _Resp(body))
+    monkeypatch.setattr(kap.time, "sleep", lambda s: None)
+    d = _decide("47.52", "-122.35", "9043 A 18TH AVE SW, SEATTLE WA 98106")
+    assert d.outcome == "error" and kap.decision_fields(d, checked_at="t") == {}
+
+
+@pytest.mark.asyncio
+async def test_the_mailing_backfill_never_relocates_an_address_point_row(
+    db, business_user, tmp_path, monkeypatch,
+):
+    spec = importlib.util.spec_from_file_location(
+        "backfill_king_cv_mailing_ap", _SCRIPT.parent / "backfill_king_code_violation_mailing.py")
+    mail = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mail)
+    ed = {**_ap_ed(), "kc_address_point_evidence": {"outcome": "accepted"}}
+    rid, _, _ = await _stored_row(db, business_user, address="9043 A 18TH AVE SW, SEATTLE WA 98106",
+                                  ed=ed)
+    # Even the live path's revert shape (point outcome, no evidence) keeps a status.
+    reverted, _, _ = await _stored_row(db, business_user, address="9043 A 18TH AVE SW, SEATTLE WA 98106",
+                                       ed=_stored_ed("013845-26CP", "address_mismatch",
+                                                     "47.52163912", "-122.35809767"))
+    gis = _gis(monkeypatch, points=[AP_9043A], under_point=[PARCEL_9043A])
+
+    def _go():
+        from src.db.session import system_sync_session
+
+        with system_sync_session() as sdb:
+            return mail.run(sdb, apply_writes=True, limit=None, report=None, pace_s=0)
+
+    stats = await asyncio.to_thread(_go)
+    assert stats["candidates"] == 0 and gis.calls == []
+    got = (await db.execute(text("SELECT enrichment_data FROM results WHERE id = :i"),
+                            {"i": rid})).scalar()
+    assert got == ed
+
+
 def test_a_capped_answer_is_transient_not_a_rejection(monkeypatch):
     monkeypatch.setattr(kap, "safe_get", lambda *a, **kw: _Resp(
         {"features": [{"attributes": AP_9043A}], "exceededTransferLimit": True}))

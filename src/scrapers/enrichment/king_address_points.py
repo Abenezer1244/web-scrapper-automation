@@ -163,6 +163,12 @@ def _query(url: str, params: dict) -> dict | None:
         return None
     if not isinstance(data, dict) or data.get("error"):
         return None
+    features = data.get("features")
+    # A body without a well-formed feature list is a broken answer, not "no match"
+    # (Codex r2 P2): treating it as empty would stamp a terminal rejection.
+    if not isinstance(features, list) or not all(
+            isinstance(f, dict) and isinstance(f.get("attributes"), dict) for f in features):
+        return None
     return data
 
 

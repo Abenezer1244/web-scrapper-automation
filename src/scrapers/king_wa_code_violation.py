@@ -128,6 +128,7 @@ async def _alert_source_failure(source: CodeViolationSource, exc: Exception,
     loop = asyncio.get_running_loop()
     finished = loop.create_future()
     alert = source_failure_alert(source, exc, date_from, date_to)
+    slots = _ALERT_THREADS  # released on the object acquired, even if the name is rebound
 
     def _notify() -> None:
         if not finished.done():
@@ -137,20 +138,20 @@ async def _alert_source_failure(source: CodeViolationSource, exc: Exception,
         try:
             send_ops_alert(*alert)
         finally:
-            _ALERT_THREADS.release()
+            slots.release()
             try:
                 loop.call_soon_threadsafe(_notify)
             except RuntimeError:
                 pass  # the loop already closed: nobody is waiting any more
 
-    if not _ALERT_THREADS.acquire(blocking=False):
+    if not slots.acquire(blocking=False):
         _logger.error("ops alert NOT sent for King code violation source %s: earlier alerts are "
                       "still stuck (Redis, database or email provider not answering)", source.key)
         return
     try:
         threading.Thread(target=_send, name=f"ops-alert-{source.key}", daemon=True).start()
     except RuntimeError as start_exc:  # the process cannot start another thread
-        _ALERT_THREADS.release()
+        slots.release()
         _logger.error("ops alert NOT sent for King code violation source %s: %s",
                       source.key, str(start_exc)[:160])
         return

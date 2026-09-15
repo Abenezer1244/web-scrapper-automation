@@ -14,9 +14,11 @@ tax_delinquent dry run (12,306 candidates / 7 jobs: fill_condo 2,977, fill_gis 2
 
 ## Plan
 - [x] A0 Codex consult on A + B (inline prompt, no repo access); reconcile (see Codex reconciliation)
-- [ ] A1 Tax repair apply via guarded harness `kp_data/tax_apply_guarded.py` (count gate, before/after
-      images, lock_timeout 5 s); peers told (no collision). `--dry` run: 12,306 / 3,006 fills, clean.
-- [ ] A2 Verify: re-run dry run writes 0 fills; per-job property counts before/after; billing untouched
+- [x] A1 Tax repair apply via guarded harness `kp_data/tax_apply_guarded.py` (exact reviewed-map gate,
+      fsynced before/after images, lock_timeout 5 s); peers told (no collision). Applied after the owner's
+      "proceed and complete": 3,006 written, 0 refused, 0 problems.
+- [x] A2 Verify: merged script re-run finds 0 fills (9,300 unresolved); repaired rows per job equal the
+      decisions; every job's billing_applied_at predates the repair
 - [x] B1 Beat: interval entries >= 10 min -> wall-clock crontab, staggered (mailing 3-59/10, owners
       5-59/15, property 7-59/20, min 2 min apart; hourly at :17/:25/:39/:41/:57); comments say why
 - [x] B2 `tests/test_beat_schedule.py` (14): no slow interval, fresh boot runs within its step, replay of
@@ -32,8 +34,17 @@ tax_delinquent dry run (12,306 candidates / 7 jobs: fill_condo 2,977, fill_gis 2
 - Not changed: lease oversubscription (rates unchanged, pre-existing; empty ticks exit fast); 300 s
   entries stay intervals (a deploy costs one short period; aligning marks bunches paid dispatch).
 - Prod: first-ever `recover_deferred_property` tick 01:49:32 UTC succeeded, 0 parcels.
-- [ ] B3 ruff + targeted tests + full suite; Codex diff review; PR
-- [ ] B4 After deploy: confirm a `recover_deferred_property` tick succeeds in worker logs
+
+## Plan (continued)
+- [x] B3 ruff clean; full suite 3,555 passed (2 RLS failures reproduce on untouched main after a test-DB
+      recreate; CI green); Codex diff review no P1/P2; PR #310 merged `9f8f7cc`
+- [x] B4 After the #310 deploy (beat boot 02:29:57 UTC): mailing sent 02:33 + 02:43, owners 02:35 + 02:50,
+      property 02:47; all succeeded in the worker (property 0 parcels; mailing 1 row unreached, rotated)
+
+## Review
+- Shipped #310 (beat crontabs) and applied the King tax property repair (3,006 rows). Harness gates
+  came from two Codex rounds; three Codex claims were disproved with code or log evidence.
+- Left by design: 9,300 tax rows with no permitted address source. Owner-session UI check still open.
 
 # King pre-foreclosure data quality: job 85692303 (2026-09-14)
 
@@ -468,3 +479,26 @@ them after the route's commit is simpler. Dropped: masking emails in delivery.py
 - [ ] PR, CI, merge, deploy check.
 Trade accepted: at-most-once notification (a crash between commit and send loses one email, logged) instead of a
 duplicate email after a failed commit.
+
+## Results date sorting across all record types (2026-09-14, branch `fix/results-date-sort`, BE + FE)
+Report: completed-scrape Results rows not chronological (Sep 18, Feb 4, Sep 18, Sep 18). Root cause proven in prod
+(read-only): `get_results` ordered by `Result.created_at`, which every row of a job shares (one insert txn), so the
+page was heap order and OFFSET paging over the ties was unstable. Codex design consult: GATE PASS.
+- [x] Trace DB -> query -> API -> FE (FE never sorts; API order is rendered as-is)
+- [x] Canonical date audit per record type + prod format census (only 13 Snohomish prefc rows are "Month D, YYYY")
+- [x] `src/api/results_sort.py`: tax_delinquent -> `delinquent_bill_year`; others -> `date_recorded_parsed` with a
+      guarded month-name fallback; NULLS LAST both ways; `Result.id` tie-break; ordered before OFFSET/LIMIT
+- [x] Allowlisted `sort=date_desc|date_asc` (422 otherwise); openapi.json regenerated (additive only)
+- [x] FE: sortable first-column header (aria-sort + arrow), mobile toggle, sort in query key, page resets to 1
+- [x] Tests: 27 in `tests/test_results_date_sort.py` (25 of the first 26 verified red on the old code; the 26th is the scope test, green on both); full suite 3,383 passed
+- [x] Prod EXPLAIN: top-N heapsort, +~75ms warm on the largest (17k-row) job; no index added
+- [x] Local UI verification in Chromium on real prod date shapes (desktop + 390px)
+- [x] Codex diff review: GATE PASS, P3 (ascending pagination test) adopted
+- [ ] Push + PRs (BE first: FE CI regenerates types from backend main), merge, deploy, prod UI check
+
+### Review
+Stored `date_recorded` text is deliberately untouched: it feeds `dedup_hash` and `source_fingerprint`, so normalizing
+it could re-deliver already-paid leads. Exports (party_name, date_recorded, id), Lists and batch combined leads keep
+their existing deterministic orders. Not changed, reported: trustee_sale and some Snohomish prefc rows store the future
+auction date in `date_recorded` (semantic, owner decision); scraper records page (`county_records`) orders by
+`scraped_at DESC` with no tie-breaker.

@@ -18,6 +18,7 @@ from src.api.dialer_filters import dialer_ready_conditions
 from src.api.lead_actionability import actionable_condition, has_address_condition
 from src.api.middleware import audit_log, rate_limit, sanitize_search
 from src.api.owner_filters import build_owner_conditions
+from src.api.results_sort import DEFAULT_RESULTS_SORT, ResultsSort, results_order_by
 from src.api.schemas import (
     DuplicateSource,
     JobCreate,
@@ -364,6 +365,9 @@ async def get_results(
     # stored tri-state exactly (unknown/NULL rows excluded from a definite filter).
     absentee: bool | None = Query(None),
     out_of_state: bool | None = Query(None),
+    # Allowlisted order of the first column (Date, or Oldest Tax Year on tax jobs).
+    # Anything else is a 422, so no caller-supplied column ever reaches ORDER BY.
+    sort: ResultsSort = Query(DEFAULT_RESULTS_SORT),
 ) -> ResultsPage:
     # Rate-limit before the (expensive, multi-query) read to prevent DB-amplification DoS.
     await rate_limit(request, zone="general", identifier=current_user.id)
@@ -459,8 +463,8 @@ async def get_results(
     total = count_result.scalar_one()
 
     rows_result = await db.execute(
-        # is_duplicate is no longer a sort key — the query excludes them entirely.
-        base_query.order_by(Result.created_at.asc())
+        # Sorted over the whole filtered set BEFORE offset/limit (see results_sort).
+        base_query.order_by(*results_order_by(config.record_type if config else None, sort))
         .offset((page - 1) * page_size)
         .limit(page_size)
     )

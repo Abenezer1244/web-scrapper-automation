@@ -1252,6 +1252,10 @@ class ResultRow(BaseModel):
     auction_date: date | None = None
     default_amount: float | None = None
     nts_match_confidence: float | None = None
+    # True when date_recorded is the auction date a scraper stood in for a missing
+    # notice date (trustee_sale, Snohomish pre_foreclosure). Not a notice date: show and
+    # export it as blank. date_recorded itself is left as stored (it feeds dedup).
+    date_is_auction_date: bool = False
     created_at: datetime
     # Derived signals (Tier 0, src/utils/lead_signals.py): computed at serialize
     # time, never stored. Populated in model_post_init from the fields above.

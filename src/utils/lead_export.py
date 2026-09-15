@@ -30,6 +30,7 @@ from src.utils.lead_formatting import (
 )
 from src.utils.lead_signals import auction_reference_date, derive_signals
 from src.utils.located_parcel import located_parcel_id, parcel_source_label
+from src.utils.source_dates import is_auction_date_fallback
 
 # Canonical column order. Existing reference/legacy columns first, dialer-import
 # split columns + enrichment passthrough appended at END (backward-compatible for
@@ -396,11 +397,15 @@ def build_lead_export_row(
         # the exact synthetic "01/01/{bill_year}" string, not any row that merely has a
         # bill_year — a coalesced overlap row (probate death-cert date + tax bill_year)
         # keeps its real date (Codex).
+        # The same holds for the auction date a scraper stood in for a missing notice
+        # date (trustee_sale, Snohomish pre_foreclosure): it is not a notice date, and a
+        # dialer would read it as one. Column name and stored value are unchanged.
         "date_recorded": (
             ""
             if _is_synthetic_tax_date(
                 _get(record, "date_recorded"), year, _get(record, "record_type")
             )
+            or is_auction_date_fallback(_get(record, "date_recorded"), enr)
             else sanitize_for_csv(_get(record, "date_recorded"))
         ),
         "party_name": sanitize_for_csv(_get(record, "party_name")),

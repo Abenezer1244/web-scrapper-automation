@@ -25,8 +25,10 @@ import src.db.session as _db_session
 from src.api.results_sort import auction_date_fallback_condition
 from src.db.models import Job, Result, ScraperConfig, User
 from src.utils.lead_export import (
+    LAYOUT_CRM_V1,
     LEAD_CSV_COLUMNS,
     build_lead_export_row,
+    resolve_export_layout,
     write_lead_csv,
     write_lead_csv_with_overlap,
 )
@@ -219,3 +221,17 @@ def test_both_csv_writers_keep_their_columns_and_blank_the_stand_in():
     overlap_rows = list(csv.DictReader(io.StringIO(overlap.getvalue())))
     assert "filed_date" in overlap_rows[0]
     assert [r["filed_date"] for r in overlap_rows] == ["", "2/4/2026"]
+
+
+@pytest.mark.parametrize("record_type", ["trustee_sale", "pre_foreclosure"])
+def test_crm_layout_date_recorded_column_is_blank_for_the_stand_in(record_type):
+    """The CRM layout relabels the same built row; its "Date Recorded" must match."""
+    columns, labels = resolve_export_layout(LAYOUT_CRM_V1, record_type)
+    buf = io.StringIO(newline="")
+    write_lead_csv(
+        [_record("10/9/2026", TRUSTEE("2026-10-09")), _record("6/30/2026", TRUSTEE("2026-10-09"))],
+        buf, columns=columns, labels=labels,
+        context={"county": "pierce", "state": "WA", "record_type": record_type},
+    )
+    rows = list(csv.DictReader(io.StringIO(buf.getvalue(), newline="")))
+    assert [r["Date Recorded"] for r in rows] == ["", "6/30/2026"]

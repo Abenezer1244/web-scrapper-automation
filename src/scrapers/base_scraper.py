@@ -107,6 +107,11 @@ class ScrapedRecord:
     mailing_address: str | None = None
     enrichment_data: dict[str, Any] = field(default_factory=dict)
     raw_html_hash: str | None = None
+    #: The situs ZIP when the source prints it apart from a street-only property_address
+    #: (results.property_zip; a ZIP parsed from property_address wins). Deliberately NOT
+    #: in to_dict(): scrapers hash to_dict() into raw_html_hash, and adding a key would
+    #: change every existing record's identity.
+    property_zip: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -147,6 +152,7 @@ class BridgeScraper:
         self._playwright: Playwright | None = None
         self._browser: Browser | None = None
         self._context: BrowserContext | None = None
+        self._user_agent: str | None = None
         self.page: Page | None = None
         self.on_progress: ProgressCallback | None = None
 
@@ -223,9 +229,28 @@ class BridgeScraper:
                 )
                 resolved_ua = LEGACY_BROWSER_UA
 
+        self._user_agent = resolved_ua
+        await self._open_context()
+
+        # Log the resolved identity every startup: this is the evidence trail
+        # when Playwright changes browser packaging again (1.57 moved Chromium
+        # to Chrome for Testing) or when a portal starts behaving differently.
+        _logger.info(
+            "Browser context started (headless=%s, DISPLAY=%s, chromium=%s, ua_mode=%s, ua=%r, "
+            f"plain={self._plain_browser})",
+            use_headless,
+            os.environ.get("DISPLAY", "unset"),
+            self._browser.version,
+            settings.SCRAPER_BROWSER_UA_MODE,
+            resolved_ua,
+        )
+        return self
+
+    async def _open_context(self) -> None:
+        """Open a browser context and page with the resolved identity and SSRF guard."""
         # A plain browser gets a stock context: no UA, viewport or locale override at all.
         context_kwargs: dict = {} if self._plain_browser else {
-            "user_agent": resolved_ua, "viewport": {"width": 1280, "height": 800},
+            "user_agent": self._user_agent, "viewport": {"width": 1280, "height": 800},
             "locale": "en-US"}
         self._context = await self._browser.new_context(**context_kwargs)
         # Per-hop SSRF enforcement: validate every DOCUMENT navigation
@@ -250,19 +275,22 @@ class BridgeScraper:
             """)
             self.init_scripts_registered = 1
 
-        # Log the resolved identity every startup: this is the evidence trail
-        # when Playwright changes browser packaging again (1.57 moved Chromium
-        # to Chrome for Testing) or when a portal starts behaving differently.
-        _logger.info(
-            "Browser context started (headless=%s, DISPLAY=%s, chromium=%s, ua_mode=%s, ua=%r, "
-            f"plain={self._plain_browser})",
-            use_headless,
-            os.environ.get("DISPLAY", "unset"),
-            self._browser.version,
-            settings.SCRAPER_BROWSER_UA_MODE,
-            resolved_ua,
-        )
-        return self
+    async def reset_context(self) -> None:
+        """Replace the browser context (cookies, server session) with a fresh one.
+
+        For portals whose server session carries state between searches. The browser,
+        identity, plain-browser setting and SSRF guard are the same as the context
+        __aenter__ opened.
+        """
+        if self._browser is None:
+            raise RuntimeError("BridgeScraper not started — use 'async with BridgeScraper()'")
+        old, self._context, self.page = self._context, None, None
+        if old is not None:
+            try:
+                await old.close()
+            except Exception as exc:
+                _logger.warning("context.close failed (leak risk): %s", str(exc)[:120])
+        await self._open_context()
 
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
         # H13 (full-SaaS review): defensively close every layer with

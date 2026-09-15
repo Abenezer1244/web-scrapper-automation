@@ -1,0 +1,1317 @@
+{
+"_note": "Real ArcGIS response fetched 2026-09-14 (read-only, UA Mozilla/5.0 BridgeLeads/1.0); only unused keys (fields, spatialReference) removed.",
+"where": "CaseType='Code Enforcement' AND (AppliedDate LIKE '%/2026')",
+"page_size": 40,
+"pages": {
+"0": {
+"exceededTransferLimit": true,
+"features": [
+{
+"attributes": {
+"OBJECTID": 334,
+"CaseID": 77890,
+"SiteParcelNumber": "7635800650",
+"CaseNumber": "CE26-01234",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "05/13/2026",
+"CaseAddress": "1822 SW 152ND ST,  BURIEN,  98166"
+}
+},
+{
+"attributes": {
+"OBJECTID": 3111,
+"CaseID": 78765,
+"SiteParcelNumber": "7835800148",
+"CaseNumber": "CE26-02109",
+"CaseType": "Code Enforcement",
+"CaseStatus": "VIOLATION",
+"AppliedDate": "08/12/2026",
+"CaseAddress": "13007 12th Ave SW"
+}
+},
+{
+"attributes": {
+"OBJECTID": 3113,
+"CaseID": 78903,
+"SiteParcelNumber": "3361400395",
+"CaseNumber": "CE26-02247",
+"CaseType": "Code Enforcement",
+"CaseStatus": "VIOLATION",
+"AppliedDate": "08/31/2026",
+"CaseAddress": "11271 Glendale Way S"
+}
+},
+{
+"attributes": {
+"OBJECTID": 3463,
+"CaseID": 77002,
+"SiteParcelNumber": "4338800450",
+"CaseNumber": "CE26-00346",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "02/06/2026",
+"CaseAddress": "646 SW 139TH ST,  BURIEN,  WA,  98166"
+}
+},
+{
+"attributes": {
+"OBJECTID": 3516,
+"CaseID": 77709,
+"SiteParcelNumber": "2423039107",
+"CaseNumber": "CE26-01053",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "04/27/2026",
+"CaseAddress": "1817 SW 152nd St"
+}
+},
+{
+"attributes": {
+"OBJECTID": 3516,
+"CaseID": 77716,
+"SiteParcelNumber": "2423039107",
+"CaseNumber": "CE26-01060",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "04/28/2026",
+"CaseAddress": "12311 AMBAUM BLVD SW,  BURIEN,  WA,  98146"
+}
+},
+{
+"attributes": {
+"OBJECTID": 3640,
+"CaseID": 77392,
+"SiteParcelNumber": "7835800378",
+"CaseNumber": "CE26-00736",
+"CaseType": "Code Enforcement",
+"CaseStatus": "VIOLATION",
+"AppliedDate": "03/18/2026",
+"CaseAddress": "845 SW 134TH ST,  BURIEN,  WA,  98146"
+}
+},
+{
+"attributes": {
+"OBJECTID": 3700,
+"CaseID": 78035,
+"SiteParcelNumber": "8627600030",
+"CaseNumber": "CE26-01379",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "05/28/2026",
+"CaseAddress": "613 SW 122nd St"
+}
+},
+{
+"attributes": {
+"OBJECTID": 3900,
+"CaseID": 76894,
+"SiteParcelNumber": "6385600065",
+"CaseNumber": "CE26-00238",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "01/28/2026",
+"CaseAddress": "13022 15th Ave SW"
+}
+},
+{
+"attributes": {
+"OBJECTID": 3919,
+"CaseID": 77180,
+"SiteParcelNumber": "9200000035",
+"CaseNumber": "CE26-00524",
+"CaseType": "Code Enforcement",
+"CaseStatus": "PENDING",
+"AppliedDate": "02/26/2026",
+"CaseAddress": "11848 12th Ave S Burien, WA 98168"
+}
+},
+{
+"attributes": {
+"OBJECTID": 4104,
+"CaseID": 76855,
+"SiteParcelNumber": "4338800815",
+"CaseNumber": "CE26-00199",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "01/23/2026",
+"CaseAddress": "839 SW 136TH ST"
+}
+},
+{
+"attributes": {
+"OBJECTID": 4189,
+"CaseID": 76893,
+"SiteParcelNumber": "0084000280",
+"CaseNumber": "CE26-00237",
+"CaseType": "Code Enforcement",
+"CaseStatus": "VIOLATION",
+"AppliedDate": "01/28/2026",
+"CaseAddress": "257 SW 131st St"
+}
+},
+{
+"attributes": {
+"OBJECTID": 4433,
+"CaseID": 78840,
+"SiteParcelNumber": "1446800810",
+"CaseNumber": "CE26-02184",
+"CaseType": "Code Enforcement",
+"CaseStatus": "VIOLATION",
+"AppliedDate": "08/19/2026",
+"CaseAddress": "12024 Occidental Ave S"
+}
+},
+{
+"attributes": {
+"OBJECTID": 6227,
+"CaseID": 77348,
+"SiteParcelNumber": "3195000025",
+"CaseNumber": "CE26-00692",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "03/13/2026",
+"CaseAddress": "1042 SW 132ND ST"
+}
+},
+{
+"attributes": {
+"OBJECTID": 6252,
+"CaseID": 78470,
+"SiteParcelNumber": "8018600532",
+"CaseNumber": "CE26-01814",
+"CaseType": "Code Enforcement",
+"CaseStatus": "PENDING",
+"AppliedDate": "07/14/2026",
+"CaseAddress": "12413 14TH AVE S,  BURIEN,  WA,  98168"
+}
+},
+{
+"attributes": {
+"OBJECTID": 6738,
+"CaseID": 77149,
+"SiteParcelNumber": "0923049466",
+"CaseNumber": "CE26-00493",
+"CaseType": "Code Enforcement",
+"CaseStatus": "PENDING",
+"AppliedDate": "02/24/2026",
+"CaseAddress": "12400 28th Ave S"
+}
+},
+{
+"attributes": {
+"OBJECTID": 7426,
+"CaseID": 76711,
+"SiteParcelNumber": "4330600500",
+"CaseNumber": "CE26-00055",
+"CaseType": "Code Enforcement",
+"CaseStatus": "VIOLATION",
+"AppliedDate": "01/07/2026",
+"CaseAddress": "13922 4TH AVE SW"
+}
+},
+{
+"attributes": {
+"OBJECTID": 7713,
+"CaseID": 78292,
+"SiteParcelNumber": "5044800045",
+"CaseNumber": "CE26-01636",
+"CaseType": "Code Enforcement",
+"CaseStatus": "PENDING",
+"AppliedDate": "06/24/2026",
+"CaseAddress": "13642 OCCIDENTAL AVE S,  BURIEN,  WA,  98168"
+}
+},
+{
+"attributes": {
+"OBJECTID": 8035,
+"CaseID": 77391,
+"SiteParcelNumber": "7835800375",
+"CaseNumber": "CE26-00735",
+"CaseType": "Code Enforcement",
+"CaseStatus": "PENDING",
+"AppliedDate": "03/18/2026",
+"CaseAddress": "846 SW 135TH ST,  BURIEN,  WA,  98146"
+}
+},
+{
+"attributes": {
+"OBJECTID": 8426,
+"CaseID": 76665,
+"SiteParcelNumber": "2407000190",
+"CaseNumber": "CE26-00009",
+"CaseType": "Code Enforcement",
+"CaseStatus": "PENDING",
+"AppliedDate": "01/05/2026",
+"CaseAddress": "13449 1ST AVE SW"
+}
+},
+{
+"attributes": {
+"OBJECTID": 8444,
+"CaseID": 78424,
+"SiteParcelNumber": "2923049479",
+"CaseNumber": "CE26-01768",
+"CaseType": "Code Enforcement",
+"CaseStatus": "PENDING",
+"AppliedDate": "07/09/2026",
+"CaseAddress": "121 S 174th St"
+}
+},
+{
+"attributes": {
+"OBJECTID": 8862,
+"CaseID": 77270,
+"SiteParcelNumber": "2407000270",
+"CaseNumber": "CE26-00614",
+"CaseType": "Code Enforcement",
+"CaseStatus": "PENDING",
+"AppliedDate": "03/06/2026",
+"CaseAddress": "13430 1ST AVE SW"
+}
+},
+{
+"attributes": {
+"OBJECTID": 9433,
+"CaseID": 77169,
+"SiteParcelNumber": "3990200060",
+"CaseNumber": "CE26-00513",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "02/25/2026",
+"CaseAddress": "1526 SW 160th St"
+}
+},
+{
+"attributes": {
+"OBJECTID": 9772,
+"CaseID": 76953,
+"SiteParcelNumber": "3223049170",
+"CaseNumber": "CE26-00297",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "02/03/2026",
+"CaseAddress": "18055 Occidental Ave S"
+}
+},
+{
+"attributes": {
+"OBJECTID": 9910,
+"CaseID": 77016,
+"SiteParcelNumber": "2928600250",
+"CaseNumber": "CE26-00360",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "02/09/2026",
+"CaseAddress": "2612 SW 172ND ST"
+}
+},
+{
+"attributes": {
+"OBJECTID": 13202,
+"CaseID": 76944,
+"SiteParcelNumber": "0723049237",
+"CaseNumber": "CE26-00288",
+"CaseType": "Code Enforcement",
+"CaseStatus": "VIOLATION",
+"AppliedDate": "02/02/2026",
+"CaseAddress": "11904 1st Ave SW"
+}
+},
+{
+"attributes": {
+"OBJECTID": 13247,
+"CaseID": 78428,
+"SiteParcelNumber": "8018600355",
+"CaseNumber": "CE26-01772",
+"CaseType": "Code Enforcement",
+"CaseStatus": "VIOLATION",
+"AppliedDate": "07/09/2026",
+"CaseAddress": "12461 16TH AVE S"
+}
+},
+{
+"attributes": {
+"OBJECTID": 13251,
+"CaseID": 77390,
+"SiteParcelNumber": "6341000243",
+"CaseNumber": "CE26-00734",
+"CaseType": "Code Enforcement",
+"CaseStatus": "PENDING",
+"AppliedDate": "03/18/2026",
+"CaseAddress": "714 SW 126TH ST,  BURIEN,  WA,  98146"
+}
+},
+{
+"attributes": {
+"OBJECTID": 13264,
+"CaseID": 76834,
+"SiteParcelNumber": "0723049467",
+"CaseNumber": "CE26-00178",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "01/21/2026",
+"CaseAddress": "461 SW 126TH ST"
+}
+},
+{
+"attributes": {
+"OBJECTID": 14486,
+"CaseID": 77046,
+"SiteParcelNumber": "2968800920",
+"CaseNumber": "CE26-00390",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "02/11/2026",
+"CaseAddress": "1411 SW 162ND ST,  BURIEN,  WA,  98166"
+}
+},
+{
+"attributes": {
+"OBJECTID": 15608,
+"CaseID": 76797,
+"SiteParcelNumber": "1823049137",
+"CaseNumber": "CE26-00141",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "01/15/2026",
+"CaseAddress": "1238 SW 137TH ST UNIT 503"
+}
+},
+{
+"attributes": {
+"OBJECTID": 15608,
+"CaseID": 76947,
+"SiteParcelNumber": "1823049137",
+"CaseNumber": "CE26-00291",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "02/02/2026",
+"CaseAddress": "13808 12th Ave SW"
+}
+},
+{
+"attributes": {
+"OBJECTID": 15632,
+"CaseID": 76728,
+"SiteParcelNumber": "0985000486",
+"CaseNumber": "CE26-00072",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "01/08/2026",
+"CaseAddress": null
+}
+},
+{
+"attributes": {
+"OBJECTID": 15634,
+"CaseID": 77258,
+"SiteParcelNumber": "4245400070",
+"CaseNumber": "CE26-00602",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "03/05/2026",
+"CaseAddress": "2217 S 111TH PL,  BURIEN,  WA,  98168"
+}
+},
+{
+"attributes": {
+"OBJECTID": 16090,
+"CaseID": 77507,
+"SiteParcelNumber": "7250000081",
+"CaseNumber": "CE26-00851",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "04/02/2026",
+"CaseAddress": "612 S 162ND ST,  BURIEN,  WA,  98148"
+}
+},
+{
+"attributes": {
+"OBJECTID": 16185,
+"CaseID": 77580,
+"SiteParcelNumber": "6707200095",
+"CaseNumber": "CE26-00924",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "04/09/2026",
+"CaseAddress": "845 SW 135TH ST,  BURIEN,  WA,  98146"
+}
+},
+{
+"attributes": {
+"OBJECTID": 16196,
+"CaseID": 76694,
+"SiteParcelNumber": "8096000155",
+"CaseNumber": "CE26-00038",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "01/06/2026",
+"CaseAddress": "2848 SW 172ND ST"
+}
+},
+{
+"attributes": {
+"OBJECTID": 16403,
+"CaseID": 77981,
+"SiteParcelNumber": "2968801595",
+"CaseNumber": "CE26-01325",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "05/21/2026",
+"CaseAddress": "16215 8TH AVE SW,  BURIEN,  WA,  98166"
+}
+},
+{
+"attributes": {
+"OBJECTID": 16419,
+"CaseID": 78901,
+"SiteParcelNumber": "4331400025",
+"CaseNumber": "CE26-02245",
+"CaseType": "Code Enforcement",
+"CaseStatus": "VIOLATION",
+"AppliedDate": "08/31/2026",
+"CaseAddress": "14235 AMBAUM BLVD SW"
+}
+},
+{
+"attributes": {
+"OBJECTID": 16522,
+"CaseID": 77177,
+"SiteParcelNumber": "1923049317",
+"CaseNumber": "CE26-00521",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "02/26/2026",
+"CaseAddress": "14429 8th Ave SW"
+}
+}
+]
+},
+"40": {
+"exceededTransferLimit": true,
+"features": [
+{
+"attributes": {
+"OBJECTID": 16814,
+"CaseID": 77506,
+"SiteParcelNumber": "1899400120",
+"CaseNumber": "CE26-00850",
+"CaseType": "Code Enforcement",
+"CaseStatus": "PENDING",
+"AppliedDate": "04/02/2026",
+"CaseAddress": "1000 SW 149th St"
+}
+},
+{
+"attributes": {
+"OBJECTID": 16817,
+"CaseID": 77168,
+"SiteParcelNumber": "1899400310",
+"CaseNumber": "CE26-00512",
+"CaseType": "Code Enforcement",
+"CaseStatus": "PENDING",
+"AppliedDate": "02/25/2026",
+"CaseAddress": "15020 Ambaum Blvd SW"
+}
+},
+{
+"attributes": {
+"OBJECTID": 17203,
+"CaseID": 77948,
+"SiteParcelNumber": "4338800800",
+"CaseNumber": "CE26-01292",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "05/18/2026",
+"CaseAddress": "13602 AMBAUM BLVD SW,  BURIEN,  WA,  98166"
+}
+},
+{
+"attributes": {
+"OBJECTID": 17356,
+"CaseID": 78475,
+"SiteParcelNumber": "2023049170",
+"CaseNumber": "CE26-01819",
+"CaseType": "Code Enforcement",
+"CaseStatus": "PENDING",
+"AppliedDate": "07/14/2026",
+"CaseAddress": "612 S 160TH ST,  BURIEN,  WA,  98148"
+}
+},
+{
+"attributes": {
+"OBJECTID": 18169,
+"CaseID": 77006,
+"SiteParcelNumber": "4331400050",
+"CaseNumber": "CE26-00350",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "02/06/2026",
+"CaseAddress": "14307 AMBAUM BLVD SW"
+}
+},
+{
+"attributes": {
+"OBJECTID": 18169,
+"CaseID": 78018,
+"SiteParcelNumber": "4331400050",
+"CaseNumber": "CE26-01362",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "05/27/2026",
+"CaseAddress": "1006 SW 144th St"
+}
+},
+{
+"attributes": {
+"OBJECTID": 19604,
+"CaseID": 76743,
+"SiteParcelNumber": "2023049043",
+"CaseNumber": "CE26-00087",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "01/12/2026",
+"CaseAddress": "15217 DES MOINES MEMORIAL DR S"
+}
+},
+{
+"attributes": {
+"OBJECTID": 19604,
+"CaseID": 77450,
+"SiteParcelNumber": "2023049043",
+"CaseNumber": "CE26-00794",
+"CaseType": "Code Enforcement",
+"CaseStatus": "PENDING",
+"AppliedDate": "03/26/2026",
+"CaseAddress": "15217 DES MOINES MEMORIAL DR S"
+}
+},
+{
+"attributes": {
+"OBJECTID": 20638,
+"CaseID": 78083,
+"SiteParcelNumber": "4337000125",
+"CaseNumber": "CE26-01427",
+"CaseType": "Code Enforcement",
+"CaseStatus": "PENDING",
+"AppliedDate": "06/03/2026",
+"CaseAddress": "13855 1ST AVE S,  BURIEN,  WA,  98168"
+}
+},
+{
+"attributes": {
+"OBJECTID": 20695,
+"CaseID": 77469,
+"SiteParcelNumber": "1446800050",
+"CaseNumber": "CE26-00813",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "03/30/2026",
+"CaseAddress": "12206 1ST AVE S,  BURIEN,  98168"
+}
+},
+{
+"attributes": {
+"OBJECTID": 21011,
+"CaseID": 77305,
+"SiteParcelNumber": "3023049365",
+"CaseNumber": "CE26-00649",
+"CaseType": "Code Enforcement",
+"CaseStatus": "PENDING",
+"AppliedDate": "03/10/2026",
+"CaseAddress": "149 SW 160TH ST,  BURIEN,  98166"
+}
+},
+{
+"attributes": {
+"OBJECTID": 21540,
+"CaseID": 78001,
+"SiteParcelNumber": "3154600005",
+"CaseNumber": "CE26-01345",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "05/26/2026",
+"CaseAddress": "13205 8TH PL SW,  BURIEN,  WA,  98146"
+}
+},
+{
+"attributes": {
+"OBJECTID": 21790,
+"CaseID": 78842,
+"SiteParcelNumber": "1219000060",
+"CaseNumber": "CE26-02186",
+"CaseType": "Code Enforcement",
+"CaseStatus": "VIOLATION",
+"AppliedDate": "08/19/2026",
+"CaseAddress": "707 SW 156th St"
+}
+},
+{
+"attributes": {
+"OBJECTID": 21847,
+"CaseID": 77166,
+"SiteParcelNumber": "3223049259",
+"CaseNumber": "CE26-00510",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "02/25/2026",
+"CaseAddress": "18043 2nd Pl S"
+}
+},
+{
+"attributes": {
+"OBJECTID": 22838,
+"CaseID": 76940,
+"SiteParcelNumber": "3575000000",
+"CaseNumber": "CE26-00284",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "02/02/2026",
+"CaseAddress": "12434 AMBAUM BLVD SW BLDG B109"
+}
+},
+{
+"attributes": {
+"OBJECTID": 23880,
+"CaseID": 77451,
+"SiteParcelNumber": "0985001115",
+"CaseNumber": "CE26-00795",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "03/26/2026",
+"CaseAddress": "12606 16TH AVE S,  BURIEN,  WA,  98168"
+}
+},
+{
+"attributes": {
+"OBJECTID": 24499,
+"CaseID": 77239,
+"SiteParcelNumber": "1923049301",
+"CaseNumber": "CE26-00583",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "03/04/2026",
+"CaseAddress": "631 SW 150TH ST,  BURIEN,  WA,  98166"
+}
+},
+{
+"attributes": {
+"OBJECTID": 24936,
+"CaseID": 77038,
+"SiteParcelNumber": "2968800855",
+"CaseNumber": "CE26-00382",
+"CaseType": "Code Enforcement",
+"CaseStatus": "PENDING",
+"AppliedDate": "02/11/2026",
+"CaseAddress": "1417 SW 162nd St"
+}
+},
+{
+"attributes": {
+"OBJECTID": 25496,
+"CaseID": 78361,
+"SiteParcelNumber": "7779200080",
+"CaseNumber": "CE26-01705",
+"CaseType": "Code Enforcement",
+"CaseStatus": "VIOLATION",
+"AppliedDate": "06/30/2026",
+"CaseAddress": "12605 Shorewood Dr SW"
+}
+},
+{
+"attributes": {
+"OBJECTID": 25763,
+"CaseID": 77762,
+"SiteParcelNumber": "2023049506",
+"CaseNumber": "CE26-01106",
+"CaseType": "Code Enforcement",
+"CaseStatus": "PENDING",
+"AppliedDate": "04/30/2026",
+"CaseAddress": "15310 1ST AV S"
+}
+},
+{
+"attributes": {
+"OBJECTID": 26175,
+"CaseID": 76748,
+"SiteParcelNumber": "1430800008",
+"CaseNumber": "CE26-00092",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "01/12/2026",
+"CaseAddress": "1425 SW 144TH PL"
+}
+},
+{
+"attributes": {
+"OBJECTID": 26248,
+"CaseID": 76824,
+"SiteParcelNumber": "2928600295",
+"CaseNumber": "CE26-00168",
+"CaseType": "Code Enforcement",
+"CaseStatus": "APPEALED",
+"AppliedDate": "01/20/2026",
+"CaseAddress": "3145 SW 171ST ST, BURIEN, WA, 98166"
+}
+},
+{
+"attributes": {
+"OBJECTID": 26870,
+"CaseID": 77927,
+"SiteParcelNumber": "2023049115",
+"CaseNumber": "CE26-01271",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "05/14/2026",
+"CaseAddress": "125 S 156TH ST,  BURIEN,  WA,  98148"
+}
+},
+{
+"attributes": {
+"OBJECTID": 27119,
+"CaseID": 77889,
+"SiteParcelNumber": "0985000384",
+"CaseNumber": "CE26-01233",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "05/13/2026",
+"CaseAddress": "11657 DES MOINES MEMORIAL DR S,  BURIEN,  WA,  98168"
+}
+},
+{
+"attributes": {
+"OBJECTID": 27147,
+"CaseID": 77036,
+"SiteParcelNumber": "2968800915",
+"CaseNumber": "CE26-00380",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "02/11/2026",
+"CaseAddress": "1405 SW 162ND ST,  BURIEN,  WA,  98166"
+}
+},
+{
+"attributes": {
+"OBJECTID": 27519,
+"CaseID": 76942,
+"SiteParcelNumber": "7520000220",
+"CaseNumber": "CE26-00286",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "02/02/2026",
+"CaseAddress": "1256 SW 119TH ST,  BURIEN,  WA,  98146"
+}
+},
+{
+"attributes": {
+"OBJECTID": 27969,
+"CaseID": 77096,
+"SiteParcelNumber": "1827200430",
+"CaseNumber": "CE26-00440",
+"CaseType": "Code Enforcement",
+"CaseStatus": "VIOLATION",
+"AppliedDate": "02/18/2026",
+"CaseAddress": "2135 SW 173RD PL"
+}
+},
+{
+"attributes": {
+"OBJECTID": 29158,
+"CaseID": 76669,
+"SiteParcelNumber": "1220000845",
+"CaseNumber": "CE26-00013",
+"CaseType": "Code Enforcement",
+"CaseStatus": "PENDING",
+"AppliedDate": "01/05/2026",
+"CaseAddress": "15325 6TH AVE SW"
+}
+},
+{
+"attributes": {
+"OBJECTID": 29561,
+"CaseID": 77416,
+"SiteParcelNumber": "4331000015",
+"CaseNumber": "CE26-00760",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "03/24/2026",
+"CaseAddress": "13929 4TH AVE SW,  BURIEN,  WA,  98166"
+}
+},
+{
+"attributes": {
+"OBJECTID": 30271,
+"CaseID": 76955,
+"SiteParcelNumber": "1220000380",
+"CaseNumber": "CE26-00299",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "02/03/2026",
+"CaseAddress": "15409 9th Ave SW"
+}
+},
+{
+"attributes": {
+"OBJECTID": 30560,
+"CaseID": 77968,
+"SiteParcelNumber": "3511000015",
+"CaseNumber": "CE26-01312",
+"CaseType": "Code Enforcement",
+"CaseStatus": "PENDING",
+"AppliedDate": "05/20/2026",
+"CaseAddress": "119 SW 148TH ST,  BURIEN,  WA,  98166"
+}
+},
+{
+"attributes": {
+"OBJECTID": 30709,
+"CaseID": 77976,
+"SiteParcelNumber": "0985000470",
+"CaseNumber": "CE26-01320",
+"CaseType": "Code Enforcement",
+"CaseStatus": "PENDING",
+"AppliedDate": "05/20/2026",
+"CaseAddress": "11836 DES MOINES MEMORIAL DR S,  BURIEN,  WA,  98168"
+}
+},
+{
+"attributes": {
+"OBJECTID": 31168,
+"CaseID": 77097,
+"SiteParcelNumber": "4171200055",
+"CaseNumber": "CE26-00441",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "02/18/2026",
+"CaseAddress": "14426 5TH AVE S, BURIEN, WA, 98168"
+}
+},
+{
+"attributes": {
+"OBJECTID": 31321,
+"CaseID": 77015,
+"SiteParcelNumber": "7889602055",
+"CaseNumber": "CE26-00359",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "02/09/2026",
+"CaseAddress": "12405 3rd Ave SW"
+}
+},
+{
+"attributes": {
+"OBJECTID": 31382,
+"CaseID": 77322,
+"SiteParcelNumber": "0923049039",
+"CaseNumber": "CE26-00666",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "03/11/2026",
+"CaseAddress": "2806 S 128TH ST,  BURIEN,  WA,  98168"
+}
+},
+{
+"attributes": {
+"OBJECTID": 31387,
+"CaseID": 76659,
+"SiteParcelNumber": "1760600301",
+"CaseNumber": "CE26-00003",
+"CaseType": "Code Enforcement",
+"CaseStatus": "VIOLATION",
+"AppliedDate": "01/02/2026",
+"CaseAddress": "505 S 150TH ST"
+}
+},
+{
+"attributes": {
+"OBJECTID": 31875,
+"CaseID": 77566,
+"SiteParcelNumber": "3207200050",
+"CaseNumber": "CE26-00910",
+"CaseType": "Code Enforcement",
+"CaseStatus": "PENDING",
+"AppliedDate": "04/07/2026",
+"CaseAddress": "620 SW 149TH ST,  BURIEN,  WA,  98166"
+}
+},
+{
+"attributes": {
+"OBJECTID": 32132,
+"CaseID": 77286,
+"SiteParcelNumber": "1923049177",
+"CaseNumber": "CE26-00630",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "03/09/2026",
+"CaseAddress": "230 SW 146TH ST,  BURIEN,  WA,  98166"
+}
+},
+{
+"attributes": {
+"OBJECTID": 32250,
+"CaseID": 78828,
+"SiteParcelNumber": "9900000235",
+"CaseNumber": "CE26-02172",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "08/18/2026",
+"CaseAddress": "1251 SW 149th St"
+}
+},
+{
+"attributes": {
+"OBJECTID": 32782,
+"CaseID": 76952,
+"SiteParcelNumber": "2015000080",
+"CaseNumber": "CE26-00296",
+"CaseType": "Code Enforcement",
+"CaseStatus": "VIOLATION",
+"AppliedDate": "02/02/2026",
+"CaseAddress": "506 S 188th St"
+}
+}
+]
+},
+"80": {
+"features": [
+{
+"attributes": {
+"OBJECTID": 32821,
+"CaseID": 76981,
+"SiteParcelNumber": "1220000905",
+"CaseNumber": "CE26-00325",
+"CaseType": "Code Enforcement",
+"CaseStatus": "VIOLATION",
+"AppliedDate": "02/04/2026",
+"CaseAddress": "429 SW 153rd St"
+}
+},
+{
+"attributes": {
+"OBJECTID": 32970,
+"CaseID": 78275,
+"SiteParcelNumber": "3744600960",
+"CaseNumber": "CE26-01619",
+"CaseType": "Code Enforcement",
+"CaseStatus": "APPEALED",
+"AppliedDate": "06/24/2026",
+"CaseAddress": "12708 13th LN SW"
+}
+},
+{
+"attributes": {
+"OBJECTID": 33213,
+"CaseID": 78346,
+"SiteParcelNumber": "1899400490",
+"CaseNumber": "CE26-01690",
+"CaseType": "Code Enforcement",
+"CaseStatus": "PENDING",
+"AppliedDate": "06/29/2026",
+"CaseAddress": "15101 AMBAUM BLVD SW,  BURIEN,  WA,  98166"
+}
+},
+{
+"attributes": {
+"OBJECTID": 33384,
+"CaseID": 76963,
+"SiteParcelNumber": "9200700080",
+"CaseNumber": "CE26-00307",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "02/03/2026",
+"CaseAddress": "12640 23rd Ave S"
+}
+},
+{
+"attributes": {
+"OBJECTID": 33413,
+"CaseID": 77303,
+"SiteParcelNumber": "2923049406",
+"CaseNumber": "CE26-00647",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "03/10/2026",
+"CaseAddress": "260 S 163RD PL,  BURIEN,  WA,  98148"
+}
+},
+{
+"attributes": {
+"OBJECTID": 33821,
+"CaseID": 77263,
+"SiteParcelNumber": "1591600647",
+"CaseNumber": "CE26-00607",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "03/06/2026",
+"CaseAddress": "1634 SW 114th St"
+}
+},
+{
+"attributes": {
+"OBJECTID": 33913,
+"CaseID": 78754,
+"SiteParcelNumber": "1723049024",
+"CaseNumber": "CE26-02098",
+"CaseType": "Code Enforcement",
+"CaseStatus": "PENDING",
+"AppliedDate": "08/11/2026",
+"CaseAddress": "14016 5th Ave S"
+}
+},
+{
+"attributes": {
+"OBJECTID": 34322,
+"CaseID": 77220,
+"SiteParcelNumber": "1599000000",
+"CaseNumber": "CE26-00564",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "03/03/2026",
+"CaseAddress": "11803 AMBAUM BLVD SW,  BURIEN,  WA,  98146"
+}
+},
+{
+"attributes": {
+"OBJECTID": 34412,
+"CaseID": 77219,
+"SiteParcelNumber": "1723049021",
+"CaseNumber": "CE26-00563",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "03/03/2026",
+"CaseAddress": "14001 1ST AVE S,  BURIEN,  98168"
+}
+},
+{
+"attributes": {
+"OBJECTID": 34413,
+"CaseID": 76767,
+"SiteParcelNumber": "1823049283",
+"CaseNumber": "CE26-00111",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "01/13/2026",
+"CaseAddress": null
+}
+},
+{
+"attributes": {
+"OBJECTID": 34460,
+"CaseID": 77505,
+"SiteParcelNumber": "1446403265",
+"CaseNumber": "CE26-00849",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "04/02/2026",
+"CaseAddress": "12849 7th Ave S"
+}
+},
+{
+"attributes": {
+"OBJECTID": 34774,
+"CaseID": 76954,
+"SiteParcelNumber": "1221000135",
+"CaseNumber": "CE26-00298",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "02/03/2026",
+"CaseAddress": "131 SW 152nd St"
+}
+},
+{
+"attributes": {
+"OBJECTID": 35499,
+"CaseID": 76688,
+"SiteParcelNumber": "0923049222",
+"CaseNumber": "CE26-00032",
+"CaseType": "Code Enforcement",
+"CaseStatus": "VIOLATION",
+"AppliedDate": "01/06/2026",
+"CaseAddress": "11263 ROSEBERG AVE S"
+}
+},
+{
+"attributes": {
+"OBJECTID": 35713,
+"CaseID": 77383,
+"SiteParcelNumber": "0723049304",
+"CaseNumber": "CE26-00727",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "03/18/2026",
+"CaseAddress": "11807 4TH AVE SW,  BURIEN,  WA,  98146"
+}
+},
+{
+"attributes": {
+"OBJECTID": 35908,
+"CaseID": 77150,
+"SiteParcelNumber": "8103000066",
+"CaseNumber": "CE26-00494",
+"CaseType": "Code Enforcement",
+"CaseStatus": "PENDING",
+"AppliedDate": "02/24/2026",
+"CaseAddress": "11240 28th Ave SW"
+}
+},
+{
+"attributes": {
+"OBJECTID": 36318,
+"CaseID": 77289,
+"SiteParcelNumber": "7635801320",
+"CaseNumber": "CE26-00633",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "03/09/2026",
+"CaseAddress": "2433 SW 149th St"
+}
+},
+{
+"attributes": {
+"OBJECTID": 36468,
+"CaseID": 76864,
+"SiteParcelNumber": "2023049026",
+"CaseNumber": "CE26-00208",
+"CaseType": "Code Enforcement",
+"CaseStatus": "PENDING",
+"AppliedDate": "01/26/2026",
+"CaseAddress": "105 S 152nd St"
+}
+},
+{
+"attributes": {
+"OBJECTID": 36483,
+"CaseID": 77410,
+"SiteParcelNumber": "1723049455",
+"CaseNumber": "CE26-00754",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "03/23/2026",
+"CaseAddress": "1047 S 136TH ST,  BURIEN,  WA,  98168"
+}
+},
+{
+"attributes": {
+"OBJECTID": 36544,
+"CaseID": 77328,
+"SiteParcelNumber": "7835800252",
+"CaseNumber": "CE26-00672",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "03/12/2026",
+"CaseAddress": "13249 12TH AVE SW "
+}
+},
+{
+"attributes": {
+"OBJECTID": 36544,
+"CaseID": 77329,
+"SiteParcelNumber": "7835800252",
+"CaseNumber": "CE26-00673",
+"CaseType": "Code Enforcement",
+"CaseStatus": "VIOLATION",
+"AppliedDate": "03/12/2026",
+"CaseAddress": "13249 12TH AVE SW,  BURIEN,  WA,  98146"
+}
+},
+{
+"attributes": {
+"OBJECTID": 36555,
+"CaseID": 77045,
+"SiteParcelNumber": "2968800876",
+"CaseNumber": "CE26-00389",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "02/11/2026",
+"CaseAddress": "16234 15TH AVE SW"
+}
+},
+{
+"attributes": {
+"OBJECTID": 36820,
+"CaseID": 76755,
+"SiteParcelNumber": "6902200245",
+"CaseNumber": "CE26-00099",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "01/12/2026",
+"CaseAddress": "1108 SW 148TH ST"
+}
+},
+{
+"attributes": {
+"OBJECTID": 36890,
+"CaseID": 77384,
+"SiteParcelNumber": "1222000092",
+"CaseNumber": "CE26-00728",
+"CaseType": "Code Enforcement",
+"CaseStatus": "PENDING",
+"AppliedDate": "03/18/2026",
+"CaseAddress": "15747 AMBAUM BLVD SW,  BURIEN,  WA,  98166"
+}
+},
+{
+"attributes": {
+"OBJECTID": 37474,
+"CaseID": 76770,
+"SiteParcelNumber": "2927600337",
+"CaseNumber": "CE26-00114",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "01/13/2026",
+"CaseAddress": "3111 SW 170th st"
+}
+},
+{
+"attributes": {
+"OBJECTID": 38257,
+"CaseID": 77229,
+"SiteParcelNumber": "1842000336",
+"CaseNumber": "CE26-00573",
+"CaseType": "Code Enforcement",
+"CaseStatus": "PENDING",
+"AppliedDate": "03/04/2026",
+"CaseAddress": "\t11639 26TH AVE SW"
+}
+},
+{
+"attributes": {
+"OBJECTID": 38568,
+"CaseID": 78037,
+"SiteParcelNumber": "1220000285",
+"CaseNumber": "CE26-01381",
+"CaseType": "Code Enforcement",
+"CaseStatus": "PENDING",
+"AppliedDate": "05/28/2026",
+"CaseAddress": "15410 10TH AVE SW,  BURIEN,  98166"
+}
+},
+{
+"attributes": {
+"OBJECTID": 38575,
+"CaseID": 77680,
+"SiteParcelNumber": "4331000115",
+"CaseNumber": "CE26-01024",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "04/22/2026",
+"CaseAddress": "426 SW 143RD ST,  BURIEN,  WA,  98166"
+}
+},
+{
+"attributes": {
+"OBJECTID": 45937,
+"CaseID": 76658,
+"SiteParcelNumber": "3361400091",
+"CaseNumber": "CE26-00002",
+"CaseType": "Code Enforcement",
+"CaseStatus": "CLOSED",
+"AppliedDate": "01/02/2026",
+"CaseAddress": "833 S 112TH ST"
+}
+}
+]
+}
+}
+}

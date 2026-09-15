@@ -20,9 +20,11 @@ import pytest
 import pytest_asyncio
 from httpx import AsyncClient
 from sqlalchemy import delete, literal, select
+from sqlalchemy import text as text_sql
+from sqlalchemy.dialects import postgresql
 
 import src.db.session as _db_session
-from src.api.results_sort import _text_date
+from src.api.results_sort import _text_date, _valid_date
 from src.db.models import CountyRecord, ScraperConfig, User
 
 
@@ -52,7 +54,7 @@ async def _cache(county: str, scraped_at: datetime, specs: list[dict]) -> list[s
     ids = []
     async with _db_session.AsyncSessionLocal() as s:
         for spec in specs:
-            rid = str(uuid.uuid4())
+            rid = spec.get("id") or str(uuid.uuid4())
             ids.append(rid)
             s.add(CountyRecord(
                 id=rid, county=county, state="WA",
@@ -102,19 +104,22 @@ async def test_pages_are_slices_of_one_total_order(
 ):
     config_id = await _config(starter_user, cache_county)
     batch = datetime(2026, 3, 20, 22, 52, tzinfo=UTC)
-    # 20 rows share one date, so only the id tie-break can keep pages apart.
-    ids = await _cache(cache_county, batch, [{"date": "3/1/2026"}] * 20 + [{"date": "4/1/2026"}] * 3)
+    # 20 rows share one date, so only the id tie-break can keep pages apart. Their ids
+    # are inserted in DESCENDING order, so heap order is the reverse of the expected
+    # one and a query without the tie-break cannot pass by luck.
+    same_date = [f"00000000-0000-4000-8000-{n:012d}" for n in range(20, 0, -1)]
+    newer = [f"00000000-0000-4000-9000-{n:012d}" for n in range(3, 0, -1)]
+    await _cache(
+        cache_county, batch,
+        [{"id": i, "date": "3/1/2026"} for i in same_date]
+        + [{"id": i, "date": "4/1/2026"} for i in newer],
+    )
 
-    full = await _page(client, config_id, starter_token, page_size=100)
     paged = []
     for page in range(1, 6):
         paged += (await _page(client, config_id, starter_token, page=page, page_size=5))["items"]
 
-    assert [r["id"] for r in paged] == [r["id"] for r in full["items"]]
-    assert sorted(r["id"] for r in paged) == sorted(ids)
-    assert [r["date_recorded"] for r in paged[:3]] == ["4/1/2026"] * 3
-    same_date_ids = [r["id"] for r in paged[3:]]
-    assert same_date_ids == sorted(same_date_ids)
+    assert [r["id"] for r in paged] == sorted(newer) + sorted(same_date)
 
 
 async def test_a_newer_batch_stays_above_an_older_batch_with_later_dates(
@@ -131,6 +136,10 @@ async def test_a_newer_batch_stays_above_an_older_batch_with_later_dates(
     assert [r["party_name"] for r in body["items"]] == ["NEW BATCH", "OLD BATCH"]
     # First view: nothing has been seen yet, so both are new.
     assert [r["is_new"] for r in body["items"]] == [True, True]
+    # Second view: both were scraped before the first view, so neither is new, and
+    # the flag is a real false rather than a missing value.
+    again = await _page(client, config_id, starter_token)
+    assert [r["is_new"] for r in again["items"]] == [False, False]
 
 
 async def test_search_and_doc_type_filters_still_apply(
@@ -173,4 +182,20 @@ async def test_search_and_doc_type_filters_still_apply(
 async def test_text_date_parser_is_total(db, text: str | None, expected: str | None):
     """Every input yields a date or NULL. Evaluated by PostgreSQL, not Python."""
     value = (await db.execute(select(_text_date(literal(text))))).scalar_one()
+    assert (value.isoformat() if value else None) == expected
+
+
+@pytest.mark.parametrize(("year", "month", "day", "expected"), [
+    (2027, 2, 29, None), (2026, 13, 1, None), (2026, 0, 5, None), (0, 1, 1, None),
+    (2026, 4, 31, None), (2026, 1, 0, None), (2026, 1, 99, None), (99999, 1, 1, None),
+    (2028, 2, 29, "2028-02-29"), (9999, 12, 31, "9999-12-31"),
+])
+async def test_date_guard_survives_inlined_constants(db, year, month, day, expected):
+    """The guard with every value INLINED as a SQL constant, not bound. The planner
+    may evaluate constant expressions in branches that never run, so this is the
+    harshest form: an impossible date must still come out NULL, never an error."""
+    stmt = select(_valid_date(literal(year), literal(month), literal(day)))
+    sql = str(stmt.compile(dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}))
+    assert ":" not in sql  # really inlined, nothing left to bind
+    value = (await db.execute(text_sql(sql))).scalar_one()
     assert (value.isoformat() if value else None) == expected

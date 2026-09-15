@@ -26,7 +26,7 @@ updated, so enrichment rewriting names or addresses cannot move a row.
 """
 from typing import Literal
 
-from sqlalchemy import Integer, Text, case, cast, func, or_
+from sqlalchemy import Integer, Text, and_, case, cast, func
 from sqlalchemy.dialects.postgresql import ARRAY
 
 from src.db.models import CountyRecord, Result
@@ -52,26 +52,28 @@ _NUMERIC_DATE = r"^\s*(\d{1,2})/(\d{1,2})/(\d{4})\s*$"
 
 
 def _valid_date(year, month, day):
-    """make_date(year, month, day) when that is a real calendar date, else NULL.
+    """The calendar date year-month-day when it is real, else NULL. Never raises.
 
     ``make_date`` errors on an impossible date, and one bad row would fail the whole
-    page, so every value it receives is proven valid first. The guards are NESTED
-    CASEs because Postgres guarantees a CASE evaluates its branch only when the
-    condition holds, and does not guarantee the evaluation order of AND/OR (each
-    operand of the OR below is a plain comparison, safe in any order).
+    page. Guarding it with CASE is not enough on its own: the planner may evaluate a
+    constant expression inside a branch that never runs (Codex). So ``make_date``
+    only ever receives values clamped into range (month 1-12, day 1, year 1-9999),
+    whatever the input, and the day is added with date arithmetic, which cannot
+    raise. Out-of-range or NULL parts (no regex match, unknown month word) and a day
+    that rolls into the next month (April 31) all come out NULL.
     """
-    # Day 31 of a 30-day month rolls into the next month; a real day stays put.
-    stays_in_month = (
-        func.date_part("month", func.make_date(year, month, 1) + (day - 1)) == month
+    safe_year = case((year.between(1, 9999), year), else_=2000)
+    safe_month = case((month.between(1, 12), month), else_=1)
+    safe_day = case((day.between(1, 31), day), else_=1)
+    candidate = func.make_date(safe_year, safe_month, 1) + (safe_day - 1)
+    is_real = and_(
+        year.between(1, 9999),
+        month.between(1, 12),
+        day.between(1, 31),
+        # A real day stays in its month; day 31 of a 30-day month does not.
+        func.date_part("month", candidate) == month,
     )
-    return case(
-        # NULL parts mean "no regex match" or an unknown month word. make_date also
-        # rejects year 0 and months outside 1-12, which the patterns let through.
-        (or_(month.is_(None), year.is_(None), year < 1, month < 1, month > 12), None),
-        else_=case(
-            (day.between(1, 31), case((stays_in_month, func.make_date(year, month, day)))),
-        ),
-    )
+    return case((is_real, candidate), else_=None)
 
 
 def _month_name_date(column):

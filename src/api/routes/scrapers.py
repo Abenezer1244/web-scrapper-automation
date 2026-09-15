@@ -6,7 +6,7 @@ from collections.abc import Iterable
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from sqlalchemy import func, select, text
+from sqlalchemy import case, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.auth import CurrentUser, require_admin_mfa
@@ -1121,7 +1121,11 @@ async def get_cached_records(
     records_stmt = (
         select(
             *CountyRecord.__table__.c,
-            (CountyRecord.scraped_at > (previous_viewed or _EPOCH)).label("is_new"),
+            # CASE, not a bare comparison: always true/false, never NULL, as before.
+            case(
+                (CountyRecord.scraped_at > (previous_viewed if previous_viewed is not None else _EPOCH), True),
+                else_=False,
+            ).label("is_new"),
         )
         .where(
             func.lower(CountyRecord.county) == county,

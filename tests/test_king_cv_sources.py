@@ -866,7 +866,7 @@ def test_owner_lookup_keys_parcel_sources_by_their_printed_pin():
     assert bur.party_name is None
 
 
-def test_printed_pin_parcels_are_asked_first_because_no_sweep_names_them_later():
+def test_printed_pin_parcels_the_ones_we_are_sure_of_are_asked_first():
     sdci = _parcel_row(parcel_id=None, enrichment_data={
         "source": "seattle_sdci_code_violations", "kc_pin": "9138100481", "kc_pin_status": "matched",
         "kc_pin_source": "king_gis_point_in_parcel", "kc_pin_match": "exact"})

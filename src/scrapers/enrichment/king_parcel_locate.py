@@ -197,9 +197,9 @@ def owner_lookup_pins(rows) -> dict[str, list]:
     party_name is never offered for replacement.
 
     Printed-PIN parcels come first in the returned order, which is the order the
-    time-budgeted owner pass asks King in: a printed-PIN row this pass does not reach is
-    never named later (the cv_owner_recovery sweep selects SDCI rows only), while an
-    unreached SDCI row is.
+    time-budgeted owner pass asks King in: a printed parcel is the one we are sure of.
+    A row of either kind this pass does not reach is named later by the
+    cv_owner_recovery sweep.
     """
     printed: dict[str, list] = {}
     located: dict[str, list] = {}

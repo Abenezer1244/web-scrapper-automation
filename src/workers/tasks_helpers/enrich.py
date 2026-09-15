@@ -1042,9 +1042,9 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
         # names the owner through the same owner-only eRealProperty path King tax uses:
         # lease-guarded, paced, breaker-protected, and it drops any page the county served
         # for a different parcel. The tax-only owner pass below never runs for this job;
-        # this takes its 300 s slot in the budget sum. SDCI rows not reached keep no owner
-        # and are named later by the beat sweep src/workers/cv_owner_recovery.py, which
-        # selects SDCI rows only, so printed-PIN parcels are asked first.
+        # this takes its 300 s slot in the budget sum. Rows not reached keep no owner and
+        # are named later by the beat sweep src/workers/cv_owner_recovery.py; printed-PIN
+        # parcels, the ones we are sure of, are asked first.
         from src.scrapers.enrichment.king_parcel_locate import (
             apply_owner_names,
             owner_lookup_pins,

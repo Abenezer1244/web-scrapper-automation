@@ -1,3 +1,54 @@
+# King pre-foreclosure data quality: job 85692303 (2026-09-14)
+
+Branch `investigate/king-prefc-dq` (worktree `C:/Users/Windows/bl-wt-kingprefc`).
+Owner decisions 2026-09-14: this session builds the shared King property fixes with Codex; "Default
+Owed" is RENAMED; Phase 1 (K1+K2) approved. Owner/completion copy went to the tax session (#298 merged),
+so K4 is dropped here. Owner sweep (T3) and parcel-echo gate belong to the tax session.
+
+## Proven (read-only prod + live King sources)
+- Job 85692303, user ba64975a, config bc9d1ac8 "test8", 06/15-09/13/2026, doc_types NTS, 157 rows,
+  155 new (2 same_run dups), billed 153. Skip trace off.
+- ALL 157: date/party/parcel 100%, property 69.4%, mailing 98.7%, auction 0, default 0, phone/email 0.
+  parcel+no property 48; parcel+mailing+no property 46; no auction+no default 157; property+mailing 109.
+- Property: King GIS has 0 features for all 47 missing parcels. 45 = condo UNIT pins; 2 = 12-digit
+  recorder PIDs. eRealProperty (the only live unit source) was NOT ADMITTED (lease busy; worker log
+  `attempted=0 deferred=155 phase1_outcomes=not admitted (source busy)`). Deferral marker + recovery are
+  mailing-only (enrich.py:925-931, mailing_recovery.py:155/175), so property is never retried.
+- Regression boundary: property 98.7% on 09-02 (eRP filled 42/42), 70.3% 09-07 (breaker), 69.4% 09-13 (lease).
+- 4 reps verified on eRealProperty = EXTR_CondoUnit2 unit address. 8135200390 sold 7/13/2026 (owner
+  LYUBARSKY), NTS party is the old borrower.
+- Auction/default: 0/155 in nts_notices (1 King paper, 37 notices). Recorded NTS has both, but King
+  Recorder terms (re-verified live) forbid automated access/image mining. Not a parser defect.
+- "Default Owed" = NTS Section IV principal/sum owing, not Section III arrears.
+- Leading zeros: not a cause. Merge (_write_match) is event-atomic by design; PR #213 already COALESCEs
+  notice re-crawls. Repair in place cannot touch dedup_hash, billing CAS, or Tracerfy enqueue.
+- Repair scope: 103 rows / 49 parcels / 8 jobs: 44 condo extract, 2 via 10-digit PIN, 3 blank in extract.
+
+## Plan
+Phase 1 (commit 06fa78e, local, not pushed):
+- [x] K1 Condo unit situs from EXTR_CondoUnit2: complete "STREET, CITY, ST ZIP" only when complex GIS
+      ZIP == unit ZIP; published street kept, UnitNbr never appended; else snapshot-stamped condo_unit_status
+- [x] K2 12-digit recorder value = tax ACCOUNT number (739,983/739,983 AcctNbr[:10]==PIN). Exact unanimous
+      extract match, recorder-sourced rows only; STR check dropped (it cannot prove the minor)
+- [x] Guarded DB writes, ORM sync/reload, eRP page may not overwrite an account resolution
+- [x] Tests (27, mutation-checked), full suite 3241 passed, ruff clean, Codex design + 2 diff rounds
+- [x] Real-data dry run: 45/48 blank rows filled in job 85692303, 4/4 equal eRealProperty
+Phase 2 (awaiting go):
+- [ ] Merge origin/main (#298) and re-verify
+- [ ] K3 Property deferral marker + bounded lease-aware property recovery sweep; stop mailing recovery
+      retrying 12-digit PIDs (use the resolved PIN)
+- [ ] K5 Rename "Default Owed" in FE (bridgeleads-web) + export header, no em dash
+- [ ] K6 Repair script: dry-run first, fill-only guarded UPDATE, apply only on approval
+- [ ] K7 UI verification in Chromium after deploy
+
+## Codex disagreements (recorded)
+- Round 2 P1 "phase-2 mailing blocked by the guard": disproved. Phase 2 returns phase 1's seeded row
+  (king_county_assessor.py:678, results[pid] writes), so resolved_parcel_id is top-level; test
+  test_a_mailing_page_seeded_with_the_same_pin_is_applied proves it.
+- Round 1 P1 "all later eRealProperty ORM writes should be atomic": pre-existing, outside this diff;
+  Codex round 2 agreed it is not a blocker. Reported to owner.
+- Round 2 P2 "db.flush() before the guard": both call sites run right after a commit with nothing
+  pending; noted, not changed.
 # King Code Violation: Parcel ID N/A + Party Name semantics (2026-09-14)
 
 Branch `investigate/king-code-violation-parcel`, worktree `C:/Users/Windows/bl-wt-kingcv` (off main `dbe8b44`).

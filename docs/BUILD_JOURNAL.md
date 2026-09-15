@@ -19,6 +19,42 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-14 - King pre-foreclosure: 69% property addresses, condo units, and 12-digit account numbers
+
+**Built / Shipped (PR #306 BE open, FE bridgeleads-web #136 open, NOT merged):** job enrichment fills King
+condo UNIT situs from the Assessor condo extract (`king_condo_units.py`; complex GIS locality only when ZIPs
+agree; UnitNbr never appended); 12-digit recorder values resolve to the PIN via RPAcct `AcctNbr`
+(`resolved_*` beside `parcel_id`); guarded DB writes; `property_lookup_deferred` marker + `property_recovery.py`
+beat sweep (extract, then eRealProperty property-only under the shared lease); mailing recovery keyed by the
+resolved PIN and settling `parcel_mismatch`; `scripts/repair_king_property_situs.py` (dry-run, not applied);
+FE label "Default Owed" -> "Principal Owing".
+
+**Tried / Decided:** a section/township/range check to resolve 12-digit PIDs was dropped: it proves only the
+major, never the minor. Appending `UnitNbr` was rejected: it is not a postal unit (E409 is mailed #409).
+COALESCE-ing auction fields across notices was rejected (Codex P1): `_write_match` is event-atomic by design.
+Fetching the recorded NTS images for auction/default was rejected: King Recorder terms (re-read live) forbid
+automated access and image mining. The sweep reads only markers new jobs write, so it cannot become an
+unapproved historical backfill; history goes through the reviewed repair script.
+
+**Failed / Blocked:** Auction Date / Principal Owing stay NULL for ~99% of King prefc: no permitted source.
+
+**Caught & fixed:** Codex found (and tests now pin) a stale ORM copy after a refused guarded write, a
+status-gated conflict guard, `db.refresh` on a deleted row rolling back a whole sweep, a page result applied to
+an unrequested PIN, a non-condo parcel borrowing a neighbouring parcel's city, a mismatch page's mailing being
+taken, and the repair touching non-delivered rows. One Codex P1 (phase-2 mailing blocked) was disproved by a
+test. My own mutation checks found 4 tests that passed without the fix they claimed to cover.
+
+**Pending / Handoff:** owner approval to merge #306/#136 and to run the repair (`--apply`, prefc: 92 fills).
+Add `PROPERTY_RECOVERY_ENABLED` to `.env.example` (agent cannot edit `.env*`). Verify the Results UI in
+Chromium after deploy. King tax condo gaps (~3,358) need a separate `--record-type tax_delinquent` dry run.
+
+**Facts learned:** property % by job 99.3 (06-23), 98.7 (09-02), 70.3 (09-07 breaker), 69.4 (09-13 lease):
+a silent dependency, not a code regression. All 739,983 RPAcct accounts are 12 digits with `[:10]` = PIN; 537
+repeats are taxable/exempt splits. Condo extract PINs are unique; 12,682 units have no site address. 8135200390
+sold 7/13/2026 before its NTS was recorded: the NTS grantor is not always the current owner.
+
+---
+
 ## 2026-09-14 - King tax delinquent: 0 owner names, "N/A" everywhere, and a plan cap that billed random rows
 
 **Built / Shipped (all merged to main unless noted):** #298 `873bb7b` per-lead owner lookup state

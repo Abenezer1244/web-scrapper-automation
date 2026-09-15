@@ -264,6 +264,16 @@ app.conf.beat_schedule = {
         "task": "src.workers.owner_recovery.recover_deferred_owners",
         "schedule": 900.0,  # every 15 minutes
     },
+    "recover-deferred-property": {
+        # The reading half of `property_lookup_deferred`: fills King property
+        # addresses a job could not look up (condo unit extract first, then the
+        # eRealProperty page under the shared King lease). Only leads a job marked,
+        # delivered only; bounded (120 parcels, 300 s), gated on source health and
+        # PROPERTY_RECOVERY_ENABLED. Never bills, never creates a job, never
+        # enqueues a skip trace, never copies mailing into property.
+        "task": "src.workers.property_recovery.recover_deferred_property",
+        "schedule": 1200.0,  # every 20 minutes
+    },
     "batch-completion-sweep": {
         # Piece 2: finalize batch_runs whose child jobs are ALL terminal — build
         # the one combined CSV + deliver. Claims each run via a reclaimable lease;

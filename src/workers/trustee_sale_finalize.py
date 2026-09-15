@@ -296,7 +296,7 @@ def null_amount_alert(
     Carries what an operator needs to tell a legitimate source omission from a
     parser gap: county, job, counts, and the source notice ids to re-check.
     """
-    subject = f"Auction leads without Default Owed: {null_count}/{total} ({county})"
+    subject = f"Auction leads without Principal Owing: {null_count}/{total} ({county})"
     body = (
         f"Job {job_id} ({county}) delivered {null_count} of {total} trustee_sale lead(s) "
         f"with no default_amount. This is allowed (the notice may state no sum owing) "

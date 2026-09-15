@@ -400,9 +400,18 @@ def _expire_trials_impl(subscription_lookup=None) -> None:
     rather than deferred to the next boundary like a paid downgrade, because an
     expired trial is not something the customer paid for — deferring would hand
     them another month of Pro quota for free. The window itself needs no special
-    handling: a trial user's window ENDS at ``trial_ends_at``, so it is already
-    eligible to roll and the next charging statement (or the reconciliation)
-    advances it to a post-trial window at the Starter limit set here.
+    handling for anyone registered since migration 088: registration ends a
+    trial user's window AT ``trial_ends_at``, so it is already eligible to roll
+    and the next charging statement (or the reconciliation) advances it to a
+    post-trial window at the Starter limit set here.
+
+    That premise did NOT hold for users who were mid-trial at the 088 deploy.
+    Its backfill put them on a calendar window running past the trial end, so
+    the Pro-trial usage survived this downgrade under the Starter limit
+    (production read 1,001 / 50). Those windows are closed by
+    ``scripts/repair_trial_window_backfill.py``; nothing written since can
+    produce that shape, because registration and paid conversion are the only
+    writers of ``trial_ends_at``.
 
     ``trial_consumed_at`` is stamped permanently. It is the anti-farming control
     for trial -> paid -> cancel -> trial-again: ``trial_ends_at`` is CLEARED on

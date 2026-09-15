@@ -158,6 +158,42 @@ party_name is "{case_type} - {address}". Recorder shape "LAST F MIDDLE" is indis
 
 ---
 
+## 2026-09-15 - Starter account read 1,001 / 50: migration 088 stretched trial windows past the trial end
+
+**Built / Shipped:** BE PR #320 `scripts/repair_trial_window_backfill.py` (+16 tests) and a corrected
+`_expire_trials_impl` docstring. Repair APPLIED in prod: 2 accounts, 1001 -> 0 and 104 -> 0, window
+[trial end, 2026-10-01). FE PR bridgeleads-web #144: dashboard card, quota banner and sidebar badge read the one
+window-aware `/billing/usage` (new `hooks/use-usage.ts`), usage re-read when jobs finish, "over plan limit" instead
+of a clamped 100%, "reached" at exactly the limit, no fabricated 0 while loading.
+
+**Tried / Decided:** Proven from prod before any change: the 1,001 was the account's own ledger (16 jobs, all billed
+inside its Pro trial, 0 after), counter == ledger for all 7 users, 0 cross-owner jobs or results rows, 0 stranded
+reservations. Cause: 088 `BACKFILL_WINDOWS` put users mid-trial on a calendar window running to Oct 1, while
+post-088 registration ends a trial's window at `trial_ends_at` (and `expire_trials` relies on that). Owner approved
+the outcome (0/50 from trial end, same as any post-088 signup). Chose a one-shot locked repair over a standing
+reconcile step because only registration and paid conversion write `trial_ends_at`, so the population is closed.
+FE: dropped the planned new `/auth/me` field; `/billing/usage` already was the authoritative object.
+
+**Failed / Blocked:** My first fix (an hourly reconcile step) FAILED the Codex gate: no `trial_ends_at <= now`,
+guard read before the row lock, in-flight reservations, frozen accounts, conversion race. First Chromium run: dev
+server + API killed "for low memory"; the orphaned `next dev` then 500'd `/api/auth/session` on `write EPIPE` (its
+stdout pipe died with the wrapper) until relaunched detached with file logs. PowerShell `bash` resolved to the WSL
+stub (`C:\windows\system32\bash.exe`); use `C:\Program Files\Git\bin\bash.exe`.
+
+**Caught & fixed:** Codex BE challenge PASS; adopted malformed-ledger guard (billed_count with NULL
+billing_applied_at), SQLSTATE 55P03 lock detection, explicit success set; disproved NULL job status. A mutation run
+showed a value guard under the row lock was unreachable, so it was removed rather than kept untested. Codex FE: first
+jobs snapshot never invalidated usage (P1, fixed), lossy finished-jobs signature, loading shown as 0, limit 0 (fixed);
+"unlimited shows banner" P1 disproved (banner returns null for -1 first). The at-limit banner said "over" (fixed).
+
+**Pending / Handoff:** merge #320 then #144 (Vercel deploys on merge). Codex P3s left. Drop local DB
+`bridgeleads_quota1001_test` (qa-* seed rows). The trial -> paid anchor path is still unexercised by a real payer.
+
+**Facts learned:** `/auth/me.records_used` is the RAW counter; only `/billing/usage` is window-aware. A migration
+backfill that re-derives quota windows must respect `trial_ends_at`, or trial usage survives the downgrade. The
+worker only reserves/settles jobs whose non-terminal status it has already committed (`_set_status` CAS), so a
+repair can read jobs unlocked and lock only the users row without inverting the jobs -> users lock order.
+
 ## 2026-09-15 - Results date sort follow-ups: prod verified, cached records page ordered, auction-date question settled
 
 **Built / Shipped (branch `fix/results-open-items`):** `GET /scrapers/{id}/records` rows query is now a Core select

@@ -309,6 +309,11 @@ async def _build_scraper_config(
     )
 
     schedule = body.schedule.model_dump()
+    deliver = body.deliver.model_dump()
+    # New scrapers export the CRM/dialer-ready layout unless the client chose one.
+    # Existing configs never pass through here, so their stored headers are untouched.
+    if deliver.get("csv_layout") is None:
+        deliver["csv_layout"] = "crm_v1"
     config = ScraperConfig(
         id=str(uuid.uuid4()),
         user_id=current_user.id,
@@ -319,7 +324,7 @@ async def _build_scraper_config(
         fields=body.fields.model_dump(),
         enrichment=body.enrichment.model_dump(),
         schedule=schedule,
-        deliver=body.deliver.model_dump(),
+        deliver=deliver,
         skip_trace_enabled=eff_skip_trace_enabled,
         doc_types=body.doc_types,  # Phase 2b: None = legacy/full output
         include_living_owner_tod=eff_include_living_owner_tod,  # Phase 3
@@ -496,6 +501,11 @@ def _merge_deliver(stored: dict, update) -> DeliverConfig:
         new_val = merged.get(secret)
         if not (isinstance(new_val, str) and new_val.strip()) or _is_secret_placeholder(new_val):
             merged[secret] = stored.get(secret)  # keep stored
+    # The export layout is sticky like a secret: an edit that doesn't send it (every
+    # client built before the field existed) keeps the stored value, so saving a
+    # schedule change can never switch the CSV headers a customer imports against.
+    if merged.get("csv_layout") is None and stored.get("csv_layout") in ("legacy_v1", "crm_v1"):
+        merged["csv_layout"] = stored["csv_layout"]
     # Drop orphaned secrets when their destination is gone.
     if not merged.get("webhook_url"):
         merged["webhook_secret"] = None

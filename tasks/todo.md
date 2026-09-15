@@ -1,3 +1,64 @@
+# CRM/dialer-ready CSV layout (2026-09-14)
+
+Branch `feat/crm-ready-csv-columns` (worktree `C:/Users/Windows/bl-wt-crmcsv`, off origin/main 47698a8).
+Owner decisions: **versioned layout** (existing scrapers keep `legacy_v1`, new scrapers get `crm_v1`,
+per-scraper switch); **read-only prod reads allowed** for format sampling + real CSV verification.
+
+## Proven (investigation)
+- ONE canonical builder already: `src/utils/lead_export.py` `build_lead_export_row` / `write_lead_csv`.
+  Manual download (`GET /jobs/{id}/download`) and scheduled per-job export (`DataExporter` csv/excel/json)
+  both use it with lean per-record-type columns. Batch + Lists use `OVERLAP_LEAD_COLUMNS` (same values).
+  FE never builds CSV. Webhook/Zapier/PhoneBurner/Tracerfy each have their OWN field mapping.
+- Split columns ALREADY exist (snake_case, appended): first_name, last_name, property_street/city/state/zip,
+  mailing_street/city/state/zip, phone/phone_2/phone_3, email/email_2/email_3. Headers are pinned by an
+  append-only compat contract + `docs/batchdialer-import-guide.md` tells customers to SAVE mappings on them.
+- Stored structured: property_city/state/zip (mig 085), phones[]/emails[] (phone == phones[0] by
+  construction). NOT stored: first/last name, mailing city/state/zip, county/state/record_type on Result
+  (they live on ScraperConfig).
+- Prod sample (read-only): name ORDER depends on source. Recorder `LAST FIRST M` = King/Pierce/Clark/
+  Cowlitz probate+prefc, Snohomish tax, King CV. NATURAL `FIRST M LAST` = trustee_sale (all counties),
+  Snohomish prefc. Okanogan probate mixed. Pierce CV party_name is a case label, not a person.
+- Current CSV corrupts names today: natural-order sources reversed (`SHIRLEY A JOHNSON` -> first `A`),
+  `JOHN AND JANE SMITH` -> `AND`/`JOHN`, `..., HUSBAND AND WIFE` -> `HUSBAND`, `WEBB JR HAROLD` -> `JR`.
+- Address parser: good on real US data; bugs: trailing country becomes city (`..., CANADA` -> city CANADA),
+  placeholder `UNKNOWN UNKNOWN, UNKNOWN WA` -> city UNKNOWN.
+- Drift bug: scheduled export projection `_RESULT_EXPORT_COLUMNS` (tasks.py:214) omits stored
+  property_city/state/zip, so scheduled files can blank city/zip that the manual download fills.
+- Separate (NOT fixed here, report): skip-trace `_parse_full_address` sends state `CA` for Canada, `UN` for
+  United Kingdom to Tracerfy; PhoneBurner `_split_name` is naive; batch/Lists CSVs keep legacy layout.
+
+## Plan
+### Phase 1 - parsing correctness + layout spec (backend, 2 src files + tests)
+- [x] `lead_formatting.py`: `split_first_person(party_name, name_order)` (recorder / natural / comma_only /
+      None -> blank). Two-level joiners, entity-in-cell blanks, roles + uncommaed vesting blank, C/O cut,
+      trailing EST OF / HEIRS OF(+) stripped, initials never a First, ambiguous recorder shapes blank.
+- [x] `lead_formatting.py`: address - foreign country / tail Canadian postal code -> no split; trailing USA
+      dropped; UNKNOWN placeholders; USPS AA/AE/AP.
+- [x] `lead_export.py`: `name_order_for` map + (county, type) overrides; `crm_v1` (key, label) spec;
+      `resolve_export_layout`; row `context` + new keys county / county_state / record_type / case_id;
+      `write_lead_csv(labels=, context=)`, labels sanitized.
+- [x] Tests: `test_lead_formatting.py` (+ prod regressions), new `test_lead_export_crm_layout.py`.
+      370 passed. Mutation check caught flips. `test_data_exporter::test_csv_has_dialer_split_columns`
+      fails until Phase 2 passes context (expected; same PR).
+- [x] Prod READ-ONLY old-vs-new diff, 163,261 rows, 5 iterations: every changed name hand-reviewed.
+      Codex P1 pass 1 = FAIL (5 P1); 3 real fixed, 1 defense adopted, 1 not real (tested).
+- Residual (accepted): double surnames 'Jessica M. Hernandez Olvera' -> last 'Olvera'.
+### Phase 2 - wiring (<=5 src files)
+- [x] `schemas.py`: `DeliverConfig.csv_layout: Literal["legacy_v1","crm_v1"] | None`; response reports the
+      EFFECTIVE layout; `DeliverUpdate.csv_layout` declared (extra="forbid" + GET echo would 422 every edit).
+- [x] `scrapers.py`: create stamps `crm_v1`; `_merge_deliver` keeps a valid stored layout when omitted.
+- [x] `jobs.py` download + `tasks.py` scheduled export + `data_exporter.py` (csv/excel labels, xlsx '@' text
+      cells for ids/zips/phones, JSON snake_case) resolve the same layout + source context; scheduled
+      projection now carries stored property_city/state/zip (drift bug fixed).
+- [x] `tests/test_csv_layout_delivery.py` (21, real endpoints + DB, mutation-checked: 10 fail when wiring removed).
+- [ ] Full suite (4 batches) ; OpenAPI regen ; Codex review of Phase 2 diff.
+- Batch children + batch/Lists combined CSVs stay legacy this PR (report).
+### Phase 3 - verification + docs + FE
+- [ ] Real CSVs from completed prod jobs (prefc, tax, CV, probate, trustee_sale) compared to DB values.
+- [ ] Playwright (Chromium, not Claude-in-Chrome): Results -> Download CSV -> parse the file.
+- [ ] FE toggle in bridgeleads-web; update BatchDialer guide for crm_v1.
+- [ ] Codex review of every phase diff; security Master Review; journal entry.
+
 # King property follow-ups (2026-09-15)
 
 Branch `fix/king-property-followups`. Owner said "run fix and work with codex on all" after the

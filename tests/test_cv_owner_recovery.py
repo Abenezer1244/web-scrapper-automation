@@ -376,14 +376,71 @@ async def test_python_located_parcel_rule_is_checked_before_a_lookup(
     _lease(monkeypatch)
     asked = _county(monkeypatch, {})
     job_id = await _job(db, business_user)
-    # SQL-eligible, but a JSON number PIN is not a located parcel to the read-side rule.
-    rid = await _row(db, business_user, job_id, pin="1000000041",
-                     ed={**_located("1000000041"), "kc_pin": 1000000041})
+    # SQL-eligible row; the read-side rule is made to disagree, so only the Python
+    # guard can stop the lookup.
+    rid = await _row(db, business_user, job_id, pin="1000000041")
+    monkeypatch.setattr(cvr, "located_parcel_id", lambda _ed, **_k: None)
 
     stats = await asyncio.to_thread(_tick)
 
     assert asked == [] and stats["parcels"] == 0
     assert "cv_owner_recovery_last_at" not in (await _get(db, rid)).enrichment_data
+
+
+async def test_python_located_parcel_rule_is_checked_again_at_write(db, business_user, monkeypatch):
+    from types import SimpleNamespace
+
+    from src.db.session import system_sync_session
+
+    job_id = await _job(db, business_user)
+    rid = await _row(db, business_user, job_id, pin="1000000042")
+    row = SimpleNamespace(id=rid, user_id=business_user.id, pin="1000000042",
+                          enrichment_data=_located("1000000042"))
+    monkeypatch.setattr(cvr, "located_parcel_id", lambda _ed, **_k: "1000000099")
+
+    def _go():
+        with system_sync_session() as sdb:
+            return cvr._write(sdb, row, "found", "SOMEONE")
+
+    assert await asyncio.to_thread(_go) == "stale"
+    assert (await _get(db, rid)).party_name is None
+
+
+async def test_the_write_phase_stops_at_its_budget(db, business_user, monkeypatch):
+    _lease(monkeypatch)
+    job_id = await _job(db, business_user)
+    rid = await _row(db, business_user, job_id, pin="1000000043")
+    _county(monkeypatch, {"1000000043": _Resp(200, _page("1000000043", "LATE OWNER"))})
+    monkeypatch.setattr(cvr, "_WRITE_BUDGET_S", 0.0)
+
+    stats = await asyncio.to_thread(_tick)
+
+    row = await _get(db, rid)
+    assert row.party_name is None and "cv_owner_recovery_last_at" not in row.enrichment_data
+    assert stats["skipped"] == "write budget exhausted" and stats["found"] == 0
+
+
+async def test_a_celery_time_limit_is_not_swallowed(db, business_user, monkeypatch):
+    from celery.exceptions import SoftTimeLimitExceeded
+
+    _lease(monkeypatch)
+    job_id = await _job(db, business_user)
+    rid = await _row(db, business_user, job_id, pin="1000000044")
+
+    async def _fetch(pid, *, max_attempts=1, **_kw):
+        raise SoftTimeLimitExceeded()
+
+    monkeypatch.setattr(kca, "_fetch_king_owner", _fetch)
+    with pytest.raises(SoftTimeLimitExceeded):
+        await asyncio.to_thread(_tick)
+
+    assert "cv_owner_recovery_last_at" not in (await _get(db, rid)).enrichment_data
+    assert isinstance(cvr._acquire_lock(), tuple)   # the lock was still released
+    import redis as sync_redis
+
+    from src.config import settings
+
+    sync_redis.from_url(settings.REDIS_URL, **settings.redis_kwargs()).delete(cvr._LOCK_KEY)
 
 
 async def test_two_cases_on_one_parcel_share_one_lookup_newest_first(

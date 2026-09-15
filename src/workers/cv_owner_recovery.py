@@ -46,6 +46,7 @@ import json
 import time
 from datetime import UTC, datetime
 
+from celery.exceptions import SoftTimeLimitExceeded, TimeLimitExceeded
 from sqlalchemy import text as sa_text
 
 from src.api.lead_actionability import actionable_sql
@@ -69,6 +70,12 @@ _MAX_ATTEMPTS = 5
 _BATCH_PARCELS = 120
 _PACE_S = 1.0
 _TICK_BUDGET_S = 300.0
+# The writes after the lookup get their own bound, and each UPDATE its own timeout.
+_WRITE_BUDGET_S = 120.0
+_WRITE_STATEMENT_TIMEOUT_MS = 10000
+
+# Never swallowed: the worker is ending the task.
+_CELERY_TIME_LIMITS = (SoftTimeLimitExceeded, TimeLimitExceeded)
 
 _LOCK_KEY = "bl:cv_owner_recovery:lock"
 _LOCK_TTL_S = 1200
@@ -277,6 +284,8 @@ def _tick(stats: dict, lock: tuple) -> dict:
                 ),
                 timeout=max(30.0, deadline - time.monotonic()),
             ))
+        except _CELERY_TIME_LIMITS:
+            raise                                # the worker is ending this task: stop now
         except (KingOwnerLookupBlockedError, SourceUnavailableError) as exc:
             stats["skipped"] = f"stopped: {str(exc)[:120]}"
             _logger.warning("Code violation owner recovery: %s", stats["skipped"])
@@ -285,16 +294,24 @@ def _tick(stats: dict, lock: tuple) -> dict:
             _logger.warning("Code violation owner recovery: lookup failed: %s", stats["skipped"])
 
         outcomes = _classify(pins, owners, o_stats)
-        # Ownership is proven before EVERY write, not once per parcel: a parcel can
-        # carry any number of rows, so no fixed write-phase length fits inside the TTL.
+        # Bounded write phase. Ownership is proven before EVERY write, not once per
+        # parcel (a parcel can carry any number of rows), and the phase stops at its
+        # own budget. A row not written keeps its state: no name, no charge, and it is
+        # selected again next tick.
+        write_deadline = time.monotonic() + _WRITE_BUDGET_S
+        stop = ""
         for pin, outcome in outcomes.items():
             for row in by_pin.get(pin, []):
-                if not _renew_lock(lock):
-                    stats["skipped"] = "lock lost before writing"
-                    _logger.warning("Code violation owner recovery: %s", stats["skipped"])
+                if time.monotonic() >= write_deadline:
+                    stop = "write budget exhausted"
+                elif not _renew_lock(lock):
+                    stop = "lock lost before writing"
+                if stop:
                     break
                 stats[_write(db, row, outcome, owners.get(pin))] += 1
-            if stats["skipped"] == "lock lost before writing":
+            if stop:
+                stats["skipped"] = stop
+                _logger.warning("Code violation owner recovery: %s", stop)
                 break
 
     _logger.info(
@@ -372,6 +389,9 @@ def _write(db, row, outcome: str, owner: str | None) -> str:
                         RECOVERY_OUTCOME_KEY: "gave_up" if gave_up else "transient_failure"})
         label = "gave_up" if gave_up else "transient"
     try:
+        # A row locked by another writer must not stall the tick for the session's
+        # default statement timeout.
+        db.execute(sa_text(f"SET LOCAL statement_timeout = '{_WRITE_STATEMENT_TIMEOUT_MS}'"))
         result = db.execute(sa_text(_WRITE_SQL), {
             "rid": row.id, "uid": row.user_id, "pin": row.pin,
             "owner": name or None, "payload": json.dumps(payload),
@@ -379,6 +399,9 @@ def _write(db, row, outcome: str, owner: str | None) -> str:
         })
         db.commit()
         return label if result.rowcount else "stale"
+    except _CELERY_TIME_LIMITS:
+        db.rollback()
+        raise
     except Exception as exc:  # noqa: BLE001
         db.rollback()
         _logger.warning("Code violation owner recovery: write failed for row %s: %s",

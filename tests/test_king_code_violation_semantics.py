@@ -223,7 +223,8 @@ def test_code_violation_label_is_not_traced():
     tacoma = _cv_result(party_name="Nuisance - 100 MAIN ST",
                         enrichment_data={"source": "tacoma_code_violations"})
     assert build_pending_row_payload(tacoma) is None
-    # King owner proof does not make a Tacoma row traceable; Pierce has no owner pass.
+    # King owner proof does not make a Tacoma row traceable; Tacoma needs its own
+    # pierce_atip proof (tests/test_pierce_cv_owner.py).
     tacoma_king_shaped = _cv_result(party_name="SMITH JOHN A", enrichment_data={
         **_exact_ed(owner_source="king_erealproperty", owner_pin="9138100481"),
         "source": "tacoma_code_violations"})

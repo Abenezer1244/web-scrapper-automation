@@ -50,6 +50,8 @@ app = Celery(
         "src.workers.cv_owner_recovery",
         # Deferred King property-address recovery: a BEAT task, same trap as above.
         "src.workers.property_recovery",
+        # Tacoma code-violation owner naming (Pierce ATIP): a BEAT task, same trap as above.
+        "src.workers.pierce_cv_owner_recovery",
     ],
 )
 

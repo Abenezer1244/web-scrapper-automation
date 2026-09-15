@@ -140,6 +140,14 @@ class BridgeScraper:
     The context manager handles browser lifecycle, including cleanup on error.
     """
 
+    # A stock headless Chromium session with NO anti-detection of any kind (no
+    # AutomationControlled flag, no webdriver/plugins/languages init script, no UA,
+    # viewport or locale override). The SSRF route guard still applies. Not a constructor
+    # option: only the Pierce ATIP owner lookup's dedicated subclass turns it on (owner
+    # decision 2026-09-15), and a test fails if any other subclass does. Every other
+    # scraper keeps the default behavior unchanged.
+    _plain_browser: bool = False
+
     def __init__(self) -> None:
         self._playwright: Playwright | None = None
         self._browser: Browser | None = None
@@ -177,13 +185,16 @@ class BridgeScraper:
         # Use headed mode if DISPLAY is set (Xvfb virtual display on Railway).
         # This fixes EagleWeb sites where headless mode breaks JS redirects.
         has_display = bool(os.environ.get("DISPLAY"))
-        use_headless = settings.PLAYWRIGHT_HEADLESS and not has_display
+        # A plain browser is always the stock headless session, whatever the deployment
+        # says (Codex r14).
+        use_headless = True if self._plain_browser else (
+            settings.PLAYWRIGHT_HEADLESS and not has_display)
 
         self._browser = await self._playwright.chromium.launch(
             headless=use_headless,
             args=[
                 "--no-sandbox",
-                "--disable-blink-features=AutomationControlled",
+                *([] if self._plain_browser else ["--disable-blink-features=AutomationControlled"]),
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
                 "--disable-extensions",
@@ -202,18 +213,21 @@ class BridgeScraper:
         # see src/scrapers/browser_identity.py for the rollout reasoning.
         # Never let an identity problem take scraping down: fall back to the
         # legacy string rather than raising out of browser startup.
-        try:
-            resolved_ua = resolve_playwright_user_agent(
-                self._browser.version,
-                mode=settings.SCRAPER_BROWSER_UA_MODE,
-                override=settings.SCRAPER_BROWSER_UA_OVERRIDE or None,
-            )
-        except ValueError as exc:
-            _logger.error(
-                "UA resolution failed (mode=%s, browser.version=%r): %s — using legacy UA",
-                settings.SCRAPER_BROWSER_UA_MODE, self._browser.version, exc,
-            )
-            resolved_ua = LEGACY_BROWSER_UA
+        if self._plain_browser:
+            resolved_ua = None  # the browser's own, unmodified user agent
+        else:
+            try:
+                resolved_ua = resolve_playwright_user_agent(
+                    self._browser.version,
+                    mode=settings.SCRAPER_BROWSER_UA_MODE,
+                    override=settings.SCRAPER_BROWSER_UA_OVERRIDE or None,
+                )
+            except ValueError as exc:
+                _logger.error(
+                    "UA resolution failed (mode=%s, browser.version=%r): %s — using legacy UA",
+                    settings.SCRAPER_BROWSER_UA_MODE, self._browser.version, exc,
+                )
+                resolved_ua = LEGACY_BROWSER_UA
 
         self._user_agent = resolved_ua
         await self._open_context()
@@ -222,7 +236,8 @@ class BridgeScraper:
         # when Playwright changes browser packaging again (1.57 moved Chromium
         # to Chrome for Testing) or when a portal starts behaving differently.
         _logger.info(
-            "Browser context started (headless=%s, DISPLAY=%s, chromium=%s, ua_mode=%s, ua=%r)",
+            "Browser context started (headless=%s, DISPLAY=%s, chromium=%s, ua_mode=%s, ua=%r, "
+            f"plain={self._plain_browser})",
             use_headless,
             os.environ.get("DISPLAY", "unset"),
             self._browser.version,
@@ -233,11 +248,11 @@ class BridgeScraper:
 
     async def _open_context(self) -> None:
         """Open a browser context and page with the resolved identity and SSRF guard."""
-        self._context = await self._browser.new_context(
-            user_agent=self._user_agent,
-            viewport={"width": 1280, "height": 800},
-            locale="en-US",
-        )
+        # A plain browser gets a stock context: no UA, viewport or locale override at all.
+        context_kwargs: dict = {} if self._plain_browser else {
+            "user_agent": self._user_agent, "viewport": {"width": 1280, "height": 800},
+            "locale": "en-US"}
+        self._context = await self._browser.new_context(**context_kwargs)
         # Per-hop SSRF enforcement: validate every DOCUMENT navigation
         # (initial load AND each redirect hop) BEFORE the request leaves the
         # browser. Without this, validate_scraping_target only sees the
@@ -248,19 +263,24 @@ class BridgeScraper:
 
         self.page = await self._context.new_page()
 
-        # Anti-headless-detection: override navigator.webdriver
-        await self.page.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3]});
-            Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
-            window.chrome = {runtime: {}};
-        """)
+        # Anti-headless-detection: override navigator.webdriver. Never for a plain
+        # browser, which must present itself exactly as automated Chromium is.
+        self.init_scripts_registered = 0
+        if not self._plain_browser:
+            await self.page.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3]});
+                Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+                window.chrome = {runtime: {}};
+            """)
+            self.init_scripts_registered = 1
 
     async def reset_context(self) -> None:
         """Replace the browser context (cookies, server session) with a fresh one.
 
         For portals whose server session carries state between searches. The browser,
-        identity and SSRF guard are the same as the context __aenter__ opened.
+        identity, plain-browser setting and SSRF guard are the same as the context
+        __aenter__ opened.
         """
         if self._browser is None:
             raise RuntimeError("BridgeScraper not started — use 'async with BridgeScraper()'")

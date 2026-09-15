@@ -442,6 +442,20 @@ def check_paging_budget(page: ResultsPage, deadline: float) -> None:
             f"run a shorter date range")
 
 
+async def wait_or_wall(page, waiting) -> None:
+    """Await a wait for page structure; when it fails, a wall on the page is the reason.
+
+    A login, captcha or terms page never shows the grid or case number, so the wait would
+    time out and be retried like a slow page. Checking the page when the wait fails
+    raises AccelaAccessWallError instead, which is never retried.
+    """
+    try:
+        await waiting
+    except Exception:
+        ensure_no_wall(PageSnapshot(url=page.url, html=await page.content()))
+        raise
+
+
 # ── Browser ──────────────────────────────────────────────────────────────────
 
 class AccelaPortal(BridgeScraper):
@@ -504,8 +518,8 @@ class AccelaPortal(BridgeScraper):
 
         await self._postback(lambda: self.page.click(SEL_SEARCH))
         # One match skips the grid and lands on that case's detail page.
-        await self.page.wait_for_selector(f"{SEL_GRID}, {SEL_NO_RESULTS}, {SEL_DETAIL_CASE}",
-                                          timeout=timeout)
+        await wait_or_wall(self.page, self.page.wait_for_selector(
+            f"{SEL_GRID}, {SEL_NO_RESULTS}, {SEL_DETAIL_CASE}", timeout=timeout))
         pages = [await self._snapshot()]
         if is_detail_page(pages[0]):
             return pages
@@ -518,14 +532,14 @@ class AccelaPortal(BridgeScraper):
             # The postback settles before the grid is swapped in (verified live: a
             # snapshot taken at networkidle was still the previous page), so wait for
             # the "Showing" range to move past the page we already have.
-            await self.page.wait_for_function(
+            await wait_or_wall(self.page, self.page.wait_for_function(
                 """([grid, last]) => {
                     const g = document.querySelector(grid);
                     const m = g && g.innerText.match(/Showing\\s+(\\d+)\\s*-\\s*\\d+/);
                     return m !== null && Number(m[1]) > last;
                 }""",
                 arg=[SEL_GRID, current.showing[1] if current.showing else 0],
-                timeout=timeout)
+                timeout=timeout))
             pages.append(await self._snapshot())
         raise AccelaFormatError(f"{KINGCO_ACCELA}: hit the {MAX_PAGES}-page guard")
 
@@ -533,7 +547,7 @@ class AccelaPortal(BridgeScraper):
         timeout = settings.DEFAULT_TIMEOUT * 1000
         await self._pace()
         await self.safe_goto(detail_url(path), wait_until="domcontentloaded", timeout_ms=timeout)
-        await self.page.wait_for_selector(SEL_DETAIL_CASE, timeout=timeout)
+        await wait_or_wall(self.page, self.page.wait_for_selector(SEL_DETAIL_CASE, timeout=timeout))
         return await self._snapshot()
 
 

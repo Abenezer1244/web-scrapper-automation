@@ -408,6 +408,29 @@ def test_the_login_page_is_a_wall_and_the_normal_pages_are_not():
         ka.ensure_no_wall(_snap(LOGIN, "https://aca-prod.accela.com/KINGCO/Login.aspx?ReturnUrl=x"))
 
 
+class _LandedPage:
+    """The browser page after a navigation: where it landed and the markup it shows."""
+
+    def __init__(self, url: str, html: str):
+        self.url, self._html = url, html
+
+    async def content(self) -> str:
+        return self._html
+
+
+async def _timed_out():
+    raise TimeoutError("Timeout 30000ms exceeded waiting for selector")
+
+
+async def test_a_wait_that_times_out_on_a_wall_raises_the_wall_not_a_retryable_timeout():
+    login = _LandedPage("https://aca-prod.accela.com/KINGCO/Login.aspx", LOGIN)
+    with pytest.raises(ka.AccelaAccessWallError, match="login page"):
+        await ka.wait_or_wall(login, _timed_out())
+    # A slow normal page keeps its timeout, which the source retries.
+    with pytest.raises(TimeoutError):
+        await ka.wait_or_wall(_LandedPage(_SEARCH, NO_RESULTS), _timed_out())
+
+
 def test_a_captcha_or_terms_acceptance_control_is_a_wall():
     captcha = NO_RESULTS.replace("</form>", '<div class="g-recaptcha" data-sitekey="k"></div></form>', 1)
     assert ka.detect_wall(_snap(captcha)) == "captcha"

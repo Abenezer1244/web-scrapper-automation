@@ -75,7 +75,8 @@ _UNIT_RE = re.compile(
 _RANGE_RE = re.compile(r"^\s*\d+\s*(?:-|/|\s\d+/)")
 _MLK_RE = re.compile(r"\b(?:M\s*L\s*K(?:ING)?|MARTIN\s+L(?:UTHER)?\s+KING)(?:\s+JR)?\b")
 _ZIP_TAIL_RE = re.compile(r"\b(\d{5})(?:-\d{4})?\s*$")
-_STATE_TAIL_RE = re.compile(r"\s+(?:SEATTLE\s+)?WA(?:\s+(\d{5})(?:-\d{4})?)?\s*$")
+_ZIP_RE = re.compile(r"\d{5}(?:-?\d{4})?")
+_STATE_TAIL_RE =re.compile(r"\s+(?:SEATTLE\s+)?WA(?:\s+(\d{5})(?:-\d{4})?)?\s*$")
 _HOUSE_RE =re.compile(r"^(\d{1,6})(?:\s?([A-Z]))?\s+(\S.*)$")
 _COMPRESS_OK = re.compile(r"^[A-Z0-9]{1,80}$")
 
@@ -165,9 +166,12 @@ def _query(url: str, params: dict) -> dict | None:
         return None
     features = data.get("features")
     # A body without a well-formed feature list is a broken answer, not "no match"
-    # (Codex r2 P2): treating it as empty would stamp a terminal rejection.
+    # (Codex r2 P2): treating it as empty would stamp a terminal rejection. ArcGIS returns
+    # every requested field on every feature (null when empty), so a missing one is too.
+    required = [f for f in params.get("outFields", "").split(",") if f]
     if not isinstance(features, list) or not all(
-            isinstance(f, dict) and isinstance(f.get("attributes"), dict) for f in features):
+            isinstance(f, dict) and isinstance(f.get("attributes"), dict)
+            and all(k in f["attributes"] for k in required) for f in features):
         return None
     return data
 
@@ -215,10 +219,13 @@ def match_address_point(
     parsed = parse_lead_address(address)
     if parsed is None:
         return rejected("unit_address" if _UNIT_RE.search(address or "") else "unparseable_address")
-    column_zip = str(property_zip or "").strip()[:5]
-    lead_zips = {z for z in (parsed.zip5, column_zip) if z}
+    raw_zip = str(property_zip or "").strip()
+    column_zip = raw_zip[:5]
     ev.update({"normalized_address": parsed.normalized, "lead_zip": parsed.zip5,
-               "property_zip": column_zip or None})
+               "property_zip": raw_zip or None})
+    if raw_zip and not _ZIP_RE.fullmatch(raw_zip):
+        return rejected("invalid_property_zip")
+    lead_zips = {z for z in (parsed.zip5, column_zip) if z}
     if len(lead_zips) > 1:
         ev["zip_compare"] = "lead_zips_disagree"
         return rejected("zip_conflict")

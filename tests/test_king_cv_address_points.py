@@ -264,6 +264,9 @@ def test_the_zip_column_counts_as_the_leads_zip(monkeypatch):
     d = _decide("47.60", "-122.31", "209 12TH AVE S", point_parcels=(("9822000330", "C"),),
                 property_zip="98144")
     assert (d.outcome, d.evidence["zip_compare"]) == ("accepted", "equal")
+    d = _decide("47.60", "-122.31", "209 12TH AVE S", point_parcels=(("9822000330", "C"),),
+                property_zip="98144X")
+    assert (d.outcome, d.evidence["reason"]) == ("rejected", "invalid_property_zip")
 
 
 def test_a_lead_without_a_zip_is_compared_on_street_only(monkeypatch):
@@ -402,7 +405,9 @@ def test_a_state_written_without_a_comma_is_not_part_of_the_street():
 
 
 @pytest.mark.parametrize("body", [{}, {"features": None}, {"features": [None]},
-                                  {"features": [{"attributes": None}]}, {"features": "x"}])
+                                  {"features": [{"attributes": None}]}, {"features": "x"},
+                                  {"features": [{"attributes": {}}]},
+                                  {"features": [{"attributes": {"PIN": "7899800716"}}]}])
 def test_a_malformed_answer_is_transient_not_a_rejection(body, monkeypatch):
     monkeypatch.setattr(kap, "safe_get", lambda *a, **kw: _Resp(body))
     monkeypatch.setattr(kap.time, "sleep", lambda s: None)
@@ -713,7 +718,8 @@ async def test_address_point_repair_write_skips_a_row_changed_since_it_was_read(
                   "old_pin_status": "address_mismatch", "old_pin": None, "old_pin_match": None,
                   "old_pin_source": None, "old_parcel_address": None,
                   "old_address": "9043 A 18TH AVE SW, SEATTLE WA 98106", "old_zip": None,
-                  "old_lat": "47.52163912", "old_lon": "-122.35809767", **over}
+                  "old_lat": "47.52163912", "old_lon": "-122.35809767", "old_city": None,
+                  "old_state": None, **over}
         with system_sync_session() as sdb:
             res = sdb.execute(text(bko._AP_UPDATE_SQL), params)
             sdb.commit()
@@ -727,6 +733,7 @@ async def test_address_point_repair_write_skips_a_row_changed_since_it_was_read(
     assert await asyncio.to_thread(_write, old_address="9043 B 18TH AVE SW, SEATTLE WA 98106") == 0
     assert await asyncio.to_thread(_write, old_zip="98106") == 0
     assert await asyncio.to_thread(_write, old_lat="47.52158159") == 0
+    assert await asyncio.to_thread(_write, old_state="WA") == 0
     assert await asyncio.to_thread(_write) == 1
     # Decided once: a second decision for the same row is refused.
     assert await asyncio.to_thread(_write, old_pin_status="matched", old_pin="7899800716",

@@ -134,6 +134,10 @@ _AP_UPDATE_SQL = """
       AND parcel_id IS NULL
       AND property_address IS NOT DISTINCT FROM CAST(:old_address AS text)
       AND property_zip IS NOT DISTINCT FROM CAST(:old_zip AS text)
+      AND property_city IS NOT DISTINCT FROM CAST(:old_city AS text)
+      AND property_state IS NOT DISTINCT FROM CAST(:old_state AS text)
+      AND (CAST(:new_mail AS text) IS NULL
+           OR btrim(coalesce(enrichment_data::jsonb->>'mailing_source', '')) = '')
       AND enrichment_data::jsonb->>'latitude' IS NOT DISTINCT FROM CAST(:old_lat AS text)
       AND enrichment_data::jsonb->>'longitude' IS NOT DISTINCT FROM CAST(:old_lon AS text)
       AND mailing_address IS NOT DISTINCT FROM CAST(:old_mail AS text)
@@ -234,7 +238,9 @@ def run_address_points(db, *, apply_writes: bool, limit: int | None = None,
                 "old_parcel_address": r.ed.get("kc_parcel_address"),
                 # ...and for THESE inputs: an address or coordinate edited since is skipped.
                 "old_address": r.property_address, "old_zip": r.property_zip,
-                "old_lat": r.lat, "old_lon": r.lon})
+                "old_lat": r.lat, "old_lon": r.lon,
+                # The owner flags are computed from these, so they must still hold.
+                "old_city": r.property_city, "old_state": r.property_state})
             written += bool(res.rowcount)
             skipped += not res.rowcount
             if i % 200 == 0:

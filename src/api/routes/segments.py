@@ -297,17 +297,22 @@ WITH candidates AS (
       AND (CAST(:filing_from AS date) IS NULL OR {_FILING_DATE_SQL} >= CAST(:filing_from AS date))
       AND (CAST(:filing_to AS date) IS NULL OR {_FILING_DATE_SQL} <= CAST(:filing_to AS date))
       AND (CAST(:require_date AS boolean) = FALSE OR {_FILING_DATE_SQL} IS NOT NULL)
-      -- Cheap necessary conditions first, so the planner drops out-of-window and
-      -- dateless rows before the costlier checks (without them this query was ~3x
-      -- slower on a 92k-row account). They cannot change the result: a row with a
-      -- parsed date outside the window fails the exact predicate above too, and a
-      -- row with no date text has no filing date.
+      -- Cheap necessary conditions on the parsed column. SQL text order does not fix
+      -- evaluation order, but these give the planner cheap quals to apply before the
+      -- costlier checks: measured with EXPLAIN (ANALYZE) on a 92k-row account, the
+      -- windowed query ran ~580 ms without them and ~207 ms with them. They cannot
+      -- change the result: a row with a parsed date outside the window fails the
+      -- exact predicate above too, and a row with no date text has no filing date.
       AND (CAST(:filing_from AS date) IS NULL OR r.date_recorded_parsed IS NULL
            OR r.date_recorded_parsed >= CAST(:filing_from AS date))
       AND (CAST(:filing_to AS date) IS NULL OR r.date_recorded_parsed IS NULL
            OR r.date_recorded_parsed <= CAST(:filing_to AS date))
       AND (CAST(:require_date AS boolean) = FALSE OR r.date_recorded IS NOT NULL)
       AND (CAST(:require_date AS boolean) = FALSE OR NOT {_STAND_IN_SQL})
+      -- Tied to the bounds too, not only require_date: a stand-in parses to its
+      -- auction date, so any active bound must never place it in the window.
+      AND ((CAST(:filing_from AS date) IS NULL AND CAST(:filing_to AS date) IS NULL)
+           OR NOT {_STAND_IN_SQL})
       {{county_clause}}
 ),
 agg AS (

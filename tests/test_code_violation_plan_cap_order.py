@@ -79,6 +79,44 @@ async def test_tacoma_statuses_are_not_read_as_seattle_settled(db, business_user
     assert tacoma_completed_new not in capped
 
 
+@pytest.mark.parametrize("settled", ["Void", "No Violation Found", "Case Opened No Violation Ltr",
+                                     "No Further Action Required"])
+async def test_accela_voided_and_no_violation_cases_rank_last(db, business_user, settled):
+    job_id = await _job(db, business_user, "code_violation")
+    uid = str(business_user.id)
+    accela = "kingco_accela_code_enforcement"
+    settled_new = await _cv(db, business_user, job_id, date="09/12/2026", status=settled, source=accela)
+    open_old = await _cv(db, business_user, job_id, date="08/01/2026",
+                         status="Case Opened with Violation Ltr", source=accela)
+
+    capped = await asyncio.to_thread(_mark, job_id, uid, 1, "code_violation")
+
+    assert capped == [settled_new]
+    assert open_old not in capped
+
+
+async def test_closed_bellevue_burien_and_other_source_words_stay_ordinary_cases(db, business_user):
+    job_id = await _job(db, business_user, "code_violation")
+    uid = str(business_user.id)
+    # "Closed" is an ordinary case on every source, as SDCI's "Closed" always was.
+    bellevue_closed = await _cv(db, business_user, job_id, date="09/12/2026", status="Closed",
+                                source="bellevue_code_enforcement")
+    burien_closed = await _cv(db, business_user, job_id, date="09/11/2026", status="CLOSED",
+                              source="burien_code_enforcement")
+    # An Accela settled word on another source, and SDCI's on Accela, are not settled.
+    bellevue_void = await _cv(db, business_user, job_id, date="09/10/2026", status="Void",
+                              source="bellevue_code_enforcement")
+    accela_completed = await _cv(db, business_user, job_id, date="09/09/2026", status="Completed",
+                                 source="kingco_accela_code_enforcement")
+    accela_void_old = await _cv(db, business_user, job_id, date="07/01/2026", status="Void",
+                                source="kingco_accela_code_enforcement")
+
+    capped = await asyncio.to_thread(_mark, job_id, uid, 4, "code_violation")
+
+    assert capped == [accela_void_old]
+    assert {bellevue_closed, burien_closed, bellevue_void, accela_completed}.isdisjoint(capped)
+
+
 async def test_zero_remaining_marks_every_ranked_row(db, business_user):
     job_id = await _job(db, business_user, "code_violation")
     uid = str(business_user.id)

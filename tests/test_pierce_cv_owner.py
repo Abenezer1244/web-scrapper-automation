@@ -369,15 +369,29 @@ async def test_the_atip_owner_browser_is_plain_with_no_init_script(monkeypatch):
     monkeypatch.setattr(settings, "PLAYWRIGHT_HEADLESS", True)
     async with BridgeScraper() as default:                 # other scrapers: unchanged
         assert default.init_scripts_registered == 1
-        assert await default.page.evaluate("navigator.webdriver") is not True
+        # Measured on Chromium 151: the default scraper's launch flag reports false.
+        assert await default.page.evaluate("navigator.webdriver") is False
 
 
 def test_only_the_atip_owner_lookup_opts_into_the_plain_browser():
-    """The plain session is an owner decision for ATIP owner lookups, not a general option."""
-    src = Path(__file__).resolve().parents[1] / "src"
-    users = sorted(str(f.relative_to(src)).replace("\\", "/") for f in src.rglob("*.py")
-                   if "plain_browser=True" in f.read_text(encoding="utf-8"))
-    assert users == ["scrapers/enrichment/pierce_atip_owner.py"]
+    """The plain session is an owner decision for ATIP owner lookups, not a general option:
+    BridgeScraper has no constructor switch, and at runtime (every connector imported) the
+    only class that turns it on is the ATIP owner browser."""
+    import inspect
+
+    from src.scrapers import registry  # noqa: F401 -- imports every county connector
+    from src.scrapers.base_scraper import BridgeScraper
+
+    assert list(inspect.signature(BridgeScraper.__init__).parameters) == ["self"]
+    assert BridgeScraper._plain_browser is False
+
+    def _all(cls):
+        for sub in cls.__subclasses__():
+            yield sub
+            yield from _all(sub)
+
+    plain = {f"{c.__module__}.{c.__qualname__}" for c in _all(BridgeScraper) if c._plain_browser}
+    assert plain == {"src.scrapers.enrichment.pierce_atip_owner.AtipOwnerPlainBrowser"}
 
 
 def test_flag_off_makes_zero_requests(monkeypatch):

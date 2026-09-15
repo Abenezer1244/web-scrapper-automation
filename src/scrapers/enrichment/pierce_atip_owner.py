@@ -63,6 +63,7 @@ from dataclasses import dataclass
 from urllib.parse import urlparse
 
 from src.config import settings
+from src.scrapers.base_scraper import BridgeScraper
 from src.scrapers.enrichment.pierce_atip import (
     ATIP_HOST,
     ATIP_SUMMARY_API,
@@ -286,15 +287,18 @@ def _summary_is_for(url: str, parcel: str) -> bool:
             and u.query == f"iParcelNumber={parcel}")
 
 
+class AtipOwnerPlainBrowser(BridgeScraper):
+    """The ONLY plain browser in the codebase (owner decision 2026-09-15): NO anti-detection
+    toward ATIP. No stealth init script, no webdriver patching, no UA or fingerprint
+    override, no captcha solving. If the portal's reCAPTCHA refuses such a session, the
+    lookup stops as a source block (verification_rejected -> cooldown) and names nobody."""
+
+    _plain_browser = True
+
+
 def _new_session():
     """A plain headless Chromium session: SSRF-guarded BridgeScraper with no anti-detection."""
-    from src.scrapers.base_scraper import BridgeScraper
-
-    # Owner decision 2026-09-15: NO anti-detection toward ATIP. A plain Chromium session:
-    # no stealth init script, no webdriver patching, no UA or fingerprint override, no
-    # captcha solving. If the portal's reCAPTCHA refuses such a session, the lookup
-    # stops as a source block (verification_rejected -> cooldown) and names nobody.
-    return BridgeScraper(plain_browser=True)
+    return AtipOwnerPlainBrowser()
 
 
 def _account_is_for(url: str, parcel: str) -> bool:

@@ -135,13 +135,15 @@ class BridgeScraper:
     The context manager handles browser lifecycle, including cleanup on error.
     """
 
-    def __init__(self, *, plain_browser: bool = False) -> None:
-        # plain_browser (on): a stock Chromium session with NO anti-detection of any kind
-        # (no AutomationControlled flag, no webdriver/plugins/languages init script, no
-        # user-agent override). The SSRF route guard still applies. Used where the owner
-        # decided a portal must see an honest automated browser (Pierce ATIP owner lookups,
-        # 2026-09-15). Every other scraper keeps the default behavior unchanged.
-        self._plain_browser = plain_browser
+    # A stock headless Chromium session with NO anti-detection of any kind (no
+    # AutomationControlled flag, no webdriver/plugins/languages init script, no UA,
+    # viewport or locale override). The SSRF route guard still applies. Not a constructor
+    # option: only the Pierce ATIP owner lookup's dedicated subclass turns it on (owner
+    # decision 2026-09-15), and a test fails if any other subclass does. Every other
+    # scraper keeps the default behavior unchanged.
+    _plain_browser: bool = False
+
+    def __init__(self) -> None:
         self._playwright: Playwright | None = None
         self._browser: Browser | None = None
         self._context: BrowserContext | None = None

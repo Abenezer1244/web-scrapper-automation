@@ -19,6 +19,59 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-15 - King code violations: Bellevue, Burien, unincorporated King County, and the decisions after
+
+**Built / Shipped:**
+- **BE #319 `176ee64`:** Bellevue, Burien, and King County Accela sources behind the one King code_violation connector. Deployed.
+- **FE #141 `942cf13`:** the King coverage label now reads "Seattle, Bellevue, Burien, and unincorporated King County". The Violation / Case # columns are shown for the three new source tags (they were gated to Seattle/Tacoma, so new rows would have been blank). Batch chips join county notes with "; ".
+- **BE #324 `7ec3107`:** one source-scoped settled list, `king_cv_sources.SETTLED_STATUSES`, drives both the plan-cap rank and the paid skip-trace gate. Accela cases marked Void, No Violation Found, Case Opened No Violation Ltr, or No Further Action Required rank last and are never traced.
+- **BE #325 `e00d844`:** a per-source ops alert when one jurisdiction fails. The adapters' retry wrappers, Bellevue's service fallback, and the progress callback no longer turn a Celery soft time limit into a "failed source".
+- **BE #326 `ccfb1cb`:** `cv_owner_recovery` also names Bellevue, Burien, and Accela leads, keyed on the parcel_id they printed. Api + worker SUCCESS on `ccfb1cb`.
+
+**Tried / Decided:**
+- **Settled statuses:** owner said "complete all with codex", so Codex weighed each open decision.
+  - Codex wanted Bellevue/Burien "Closed" treated as settled. The owner's 2026-09-13 decision keeps SDCI "Closed" delivered and traced, so Closed stays an ordinary case everywhere (documented decision beats Codex).
+  - The old any-source skip-trace set (Completed/Open Duplicate) was removed after Codex showed it diverged from the plan cap. Production Tacoma only reports Open (44) and Closed (13), so no real row changed.
+- **Accela cap:** kept at 200 cases / 1,200 s. Codex's extra remaining-time guard was dropped: 1,200 s fits well inside the 1,800 s scrape timeout.
+- **Accela category:** stays None (the complaint text is PII).
+- **Alerts:** run on a daemon thread, not `asyncio.to_thread`. `asyncio.run` joins the default executor on exit, so a hung alert there held the job (proven by a mutation test). Capped at 4 live alert threads per process.
+- **Sweep keying:** one SQL expression selects, groups, and guards the write, so an SDCI row and a printed-PIN row on the same PIN share one lookup.
+- **Pierce flag:** `PIERCE_CV_OWNER_ENABLED` stays off. Codex NO-GO: ATIP-derived owners would become paid skip-trace inputs, while legal cleared owner naming only. Needs an owner/legal answer first.
+
+**Failed / Blocked:**
+- **Blind prod check:** my pre-merge "0 active jobs" check for #319 ran as the worker's `DATABASE_URL` role. Under RLS that role sees 0 rows, so the check proved nothing. Rechecked with `DATABASE_URL_MIGRATE` in a read-only session: nothing had been running.
+- **Leaked password:** a failed connect echoed that DSN, password included, into the local session transcript. Owner decides on rotation.
+- **Railway api build (`e00d844`):** FAILED at the builder's snapshot upload, before any code ran (the worker built the same commit fine). `railway redeploy` refuses a failed build. The #326 merge rebuilt the api, and production served `7ec3107` until then.
+- **FE #141 CI:** blocked on the api-types drift gate from BE #315 until FE #140 merged (sequenced with terminal 1's session).
+- **Verification run:** the only King CV config (`74db2d63`, the owner's admin account) is frequency=manual. The owner must click Run now: starting a job requires the owner's own login, and I would not forge a token for it.
+- **Worker time limits (not built):** a worker-wide fix for Celery time limits swallowed in `run_scrape_job` is deferred. Codex listed about 14 catch-alls that absorb them, including inline enrichment, which long King jobs do reach. Re-raising them would send an over-long job back to the watchdog to re-run from the start, possibly on every retry. That needs its own design session.
+
+**Caught & fixed (Codex, 3-4 rounds per PR):**
+- Skip trace vs plan-cap divergence on unscoped statuses.
+- A malformed-json `source` value that raised.
+- `settled_sql` splicing an unchecked expression.
+- A wrapped soft time limit counted as a source failure.
+- An unbounded wait on the alert.
+- Alert threads blocking `asyncio.run` shutdown.
+- A deadline wrapped by the progress callback.
+- Reference cycles when re-raising a wrapped deadline.
+- The sweep's Redis lock helpers swallowing time limits.
+- Stale "Seattle only" / "SDCI rows only" comments.
+
+**Pending / Handoff:**
+- Owner clicks Run now on the King CV scraper, then verify per-source counts, parcel/owner on Bellevue/Burien/Accela rows, and a 5-row source spot check.
+- Owner/legal: may ATIP owners feed paid skip trace? That decides `PIERCE_CV_OWNER_ENABLED`.
+- Owner adds `PIERCE_CV_OWNER_ENABLED=false` to `.env.example` (agents are denied `.env*`).
+- Password rotation decision.
+- Worker-wide Celery time-limit handling (Codex's line-by-line list is in this session's scratchpad).
+
+**Facts learned:**
+- `railway run --service worker` with `DATABASE_URL` is RLS-blind. Use `DATABASE_URL_MIGRATE` with `set_session(readonly=True)`, and never print a connect error's DSN.
+- `jobs` has `finished_at`, not `completed_at`.
+- Celery `SoftTimeLimitExceeded` is a plain `Exception`: every catch-all must re-raise it first.
+
+---
+
 ## 2026-09-15 - Notice Date: auction-date stand-ins are never shown, exported or sorted as a Date
 
 **Built / Shipped (branch `feat/notice-date`):** owner decision that auction leads show a real notice date or blank.

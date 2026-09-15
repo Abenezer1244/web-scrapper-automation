@@ -77,12 +77,8 @@ per-scraper switch); **read-only prod reads allowed** for format sampling + real
 Contract change, not new parsing: split columns already existed. Versioned layout keeps every existing customer's
 headers; new scrapers get crm_v1. The real win is correctness: source-aware names (213 corrected, 405 wrong ->
 blank on 163,261 prod rows) and no fabricated address parts. Two latent bugs fixed (scheduled situs drop, Pierce
-case id). One deploy-breaking bug avoided (DeliverUpdate extra=forbid). Accepted residual: double surnames.
-### Phase 3 - verification + docs + FE
-- [ ] Real CSVs from completed prod jobs (prefc, tax, CV, probate, trustee_sale) compared to DB values.
-- [ ] Playwright (Chromium, not Claude-in-Chrome): Results -> Download CSV -> parse the file.
-- [ ] FE toggle in bridgeleads-web; update BatchDialer guide for crm_v1.
-- [ ] Codex review of every phase diff; security Master Review; journal entry.
+case id). One deploy-breaking bug avoided (DeliverUpdate extra=forbid). Double surnames handled in the
+follow-up; residuals: rare surnames equal to org words blank, natural-order names leaked into recorder cells.
 
 # King property follow-ups (2026-09-15)
 
@@ -565,3 +561,39 @@ them after the route's commit is simpler. Dropped: masking emails in delivery.py
 - [ ] PR, CI, merge, deploy check.
 Trade accepted: at-most-once notification (a crash between commit and send loses one email, logged) instead of a
 duplicate email after a failed commit.
+
+## Results date sorting across all record types (2026-09-14, branch `fix/results-date-sort`, BE + FE)
+Report: completed-scrape Results rows not chronological (Sep 18, Feb 4, Sep 18, Sep 18). Root cause proven in prod
+(read-only): `get_results` ordered by `Result.created_at`, which every row of a job shares (one insert txn), so the
+page was heap order and OFFSET paging over the ties was unstable. Codex design consult: GATE PASS.
+- [x] Trace DB -> query -> API -> FE (FE never sorts; API order is rendered as-is)
+- [x] Canonical date audit per record type + prod format census (only 13 Snohomish prefc rows are "Month D, YYYY")
+- [x] `src/api/results_sort.py`: tax_delinquent -> `delinquent_bill_year`; others -> `date_recorded_parsed` with a
+      guarded month-name fallback; NULLS LAST both ways; `Result.id` tie-break; ordered before OFFSET/LIMIT
+- [x] Allowlisted `sort=date_desc|date_asc` (422 otherwise); openapi.json regenerated (additive only)
+- [x] FE: sortable first-column header (aria-sort + arrow), mobile toggle, sort in query key, page resets to 1
+- [x] Tests: 27 in `tests/test_results_date_sort.py` (25 of the first 26 verified red on the old code; the 26th is the scope test, green on both); full suite 3,383 passed
+- [x] Prod EXPLAIN: top-N heapsort, +~75ms warm on the largest (17k-row) job; no index added
+- [x] Local UI verification in Chromium on real prod date shapes (desktop + 390px)
+- [x] Codex diff review: GATE PASS, P3 (ascending pagination test) adopted
+- [x] Push + PRs (BE #313 `7a04a53`, FE #138 `30b2a6c`), merged, deployed (Railway SUCCESS, Vercel prod success)
+- [x] Prod UI check (2026-09-15, owner's account): King code violation job (1,057 rows) newest first Sep 11, toggle to
+      oldest first starts Aug 13 (range start), toggle back, page 1 ends Sep 10 / page 2 starts Sep 10; tax job header
+      "Oldest Tax Year", aria-sort flips, `sort=created_at` -> 422. Sort adds ~70ms warm of a ~1.7s page request.
+
+### Review
+Stored `date_recorded` text is deliberately untouched: it feeds `dedup_hash` and `source_fingerprint`, so normalizing
+it could re-deliver already-paid leads. Exports (party_name, date_recorded, id), Lists and batch combined leads keep
+their existing deterministic orders. Not changed, reported: trustee_sale and some Snohomish prefc rows store the future
+auction date in `date_recorded` (semantic, owner decision); scraper records page (`county_records`) orders by
+`scraped_at DESC` with no tie-breaker.
+
+### Follow-ups (2026-09-15, branch `fix/results-open-items`)
+- [x] Auction date stored as Date (trustee_sale, Snohomish prefc fallback): documented intentional design (trustee_sale
+      2026-09-03 forward window; Snohomish "closest recording-like date"). Codex consult: leave semantics, owner decision.
+      No code change: rewriting date_recorded changes dedup identity; relabeling Date would duplicate the Auction Date column.
+- [x] Cached records page (`GET /scrapers/{id}/records`): ORDER BY scraped_at DESC alone (Benton 2,574 rows share one
+      scraped_at). Now scraped_at DESC, parsed date DESC NULLS LAST, id ASC, as a Core select. First attempt compiled the
+      parser to a literal SQL string: literal_binds DOUBLED the regex backslashes (would match nothing); caught before tests.
+- [x] Parser refactor: shared exception-free `_valid_date` for numeric and month-name dates; 17 PostgreSQL-evaluated
+      totality cases incl. prod junk (instrument numbers, UI text). 3 of 4 endpoint tests red on the old query.

@@ -54,8 +54,8 @@ same scope `export_columns` / `exporter` / `object_key` always had.
 
 **Pending / Handoff:** CI green on 76b3524, then undraft. FE: layout toggle + types regen; BatchDialer guide for
 crm_v1; Playwright Results -> Download CSV on a crm_v1 scraper after deploy. Separate bugs: skip-trace
-`_parse_full_address` sends state CA/UN for foreign addresses; PhoneBurner `_split_name` is naive; Snohomish
-prefc `date_recorded` equals auction date.
+`_parse_full_address` sends state CA/UN for foreign addresses; PhoneBurner `_split_name` is naive. (Trustee-sale
+`date_recorded` holding the auction date is documented design, see the Results date-sort entry below.)
 
 **Follow-up (same day, double surnames):** the natural-order case ('Jessica M. Hernandez Olvera') was
 the ONLY one in prod; the real volume was recorder order ('GUZMAN CAMPOS MARIA F' -> first CAMPOS).
@@ -70,6 +70,31 @@ reviewed. Codex FAIL was a claimed regression that the committed version already
 notices (all trustee_sale, Snohomish pre_foreclosure) = FIRST LAST; Okanogan probate mixes both; Pierce CV
 party_name is "{case_type} - {address}". Recorder shape "LAST F MIDDLE" is indistinguishable from a leaked
 "FIRST M LAST". Real CSVs from 8 prod jobs (935 rows) matched DB values cell for cell.
+
+---
+
+## 2026-09-15 - Results date sort follow-ups: prod verified, cached records page ordered, auction-date question settled
+
+**Built / Shipped (branch `fix/results-open-items`):** `GET /scrapers/{id}/records` rows query is now a Core select
+ordered `scraped_at DESC, parsed date DESC NULLS LAST, id ASC` (`cached_records_order_by` in
+`src/api/results_sort.py`). The date parser is shared and exception-free for M/D/YYYY and Month D, YYYY.
+
+**Tried / Decided:** trustee_sale and Snohomish prefc `date_recorded` holding the auction date is documented design,
+not a bug; Codex agreed it stays an owner decision (rewriting it changes dedup identity). Kept scraped_at primary on
+the records page (its "new since you last looked" feed); date only orders rows inside a refresh batch.
+
+**Failed / Blocked:** compiling the parser to a literal SQL string for the raw text() query doubled every regex
+backslash (`'^\s*...'`), which under standard_conforming_strings matches nothing: a silent all-NULL sort. Replaced by a
+Core select with bound patterns. Prod UI check: Chromium "Target crashed" on a second job (box low on memory); one job
+per run worked. One prod page-2 API call returned a non-JSON body while the API log shows 200 for it; six repeats were
+all 200, cause not identified (edge side).
+
+**Pending / Handoff:** owner: whether auction leads should show a different Date label/value.
+
+**Facts learned:** SQLAlchemy `literal_binds` on the postgresql dialect escapes backslashes in string literals; never
+inline regex literals into raw SQL. Prod results page request is ~1.7s end to end; the sort is ~70ms of it.
+
+---
 
 ## 2026-09-15 - King tax property repair applied (3,006 rows), and the beat sweeps deploys were starving
 
@@ -112,6 +137,36 @@ city). Results page check of prefc job 85692303 needs the owner's session. The c
 next mark. On 2026-09-15 beat booted at 00:59, 01:12, 01:20, 01:29 UTC; the property sweep's first-ever tick
 was 01:49:32 (0 parcels, 6.6 s). Evidence: `C:/Users/Windows/kp_data/tax_apply/` (decisions, before, after,
 report).
+
+---
+
+## 2026-09-14 - Results page: dates sorted across the whole result set, not insertion order
+
+**Built / Shipped (branch `fix/results-date-sort` in both repos, NOT pushed):** `src/api/results_sort.py` orders
+GET /jobs/{id}/results by the first column's value before OFFSET/LIMIT: `delinquent_bill_year` for tax_delinquent
+(the "Oldest Tax Year" column), otherwise `date_recorded_parsed` with a guarded "Month D, YYYY" fallback; NULLS LAST
+in both directions; `Result.id` tie-break. New allowlisted `sort=date_desc|date_asc`. FE header toggle with aria-sort,
+mobile toggle, sort in the react-query key.
+
+**Tried / Decided:** normalizing the Snohomish month-name `date_recorded` at the scraper or UPDATE-ing the 13 rows was
+rejected: the text feeds `dedup_hash` and `source_fingerprint`, so a re-scrape could stop matching a delivered lead. A
+migration with a new IMMUTABLE parser was rejected for now (inline nested-CASE SQL needs no deploy ordering). party_name
+as tie-break rejected: owner recovery rewrites it, so rows would move. No index: warm cost +~75ms on a 17k-row job, and
+the actionable filter discards 96% of rows before the sort anyway.
+
+**Failed / Blocked:** first prod diagnostic returned zero rows: `DATABASE_URL` is the RLS-scoped app role; aggregates
+need `DATABASE_URL_MIGRATE` in a READ ONLY session. A backgrounded Codex review and both dev servers were killed for low
+memory (Codex had already finished). Playwright MCP failed to connect; used Playwright Python + Chromium directly.
+
+**Caught & fixed:** two tests passed on the OLD code because insertion order matched the expected order; fixtures
+reordered so they fail without the fix. The page-boundary fixture originally did not straddle the boundary.
+
+**Pending / Handoff:** push + PRs (backend first; FE CI regenerates types from backend main), merge, prod UI check.
+Owner decisions: trustee_sale / some Snohomish prefc `date_recorded` is the future auction date; scraper records page
+orders by `scraped_at DESC` with no tie-breaker (same bug class, different table).
+
+**Facts learned:** every row of a job shares `created_at` (prod: 18,214 rows / 19 distinct). Any ORDER BY on it needs a
+unique tie-break. Prod `date_recorded` formats: M/D/YYYY and MM/DD/YYYY everywhere, plus 13 Snohomish prefc month-name.
 
 ---
 

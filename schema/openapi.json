@@ -6600,6 +6600,20 @@
               ],
               "title": "Out Of State"
             }
+          },
+          {
+            "in": "query",
+            "name": "sort",
+            "required": false,
+            "schema": {
+              "default": "date_desc",
+              "enum": [
+                "date_desc",
+                "date_asc"
+              ],
+              "title": "Sort",
+              "type": "string"
+            }
           }
         ],
         "responses": {

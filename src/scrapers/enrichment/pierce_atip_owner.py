@@ -56,7 +56,7 @@ import re
 import time
 from collections import Counter
 from dataclasses import dataclass
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import urlparse
 
 from src.config import settings
 from src.scrapers.enrichment.pierce_atip import (
@@ -89,15 +89,21 @@ GAVE_UP = "gave_up"
 
 MIN_PACE_S = 2.0
 _PAGE_TIMEOUT_S = 45.0
+_FETCH_TIMEOUT_S = _PAGE_TIMEOUT_S + 5.0   # hard bound around the whole page view
 _SESSION_START_S = 30.0
+_SESSION_CLOSE_S = 15.0
 _TIME_LIMITS = ("SoftTimeLimitExceeded", "TimeLimitExceeded")
+
+
+class _LeaseLostError(Exception):
+    """The Pierce owner lease is no longer ours: stop before the next request."""
 _MAX_HARD_FAILURES = 3
 _LEASE_WAIT_S = 30.0
 _NAME_MAX = 512
 
 _PARCEL_RE = re.compile(r"^\d{10}$")
 _REAL_PROPERTY = "REAL PROPERTY"
-_REFERENCE = "REFERENCE"
+_REFERENCE_WORD_RE = re.compile(r"\bREFERENCE\b")
 # "633 TO 649 DIVISION AVE": a parcel carrying a range of house numbers.
 _RANGE_RE = re.compile(r"^(\d+)\s+TO\s+(\d+)\s+(.+)$")
 _NUMBER_RE = re.compile(r"^(\d+)\s+(.+)$")
@@ -177,6 +183,22 @@ def _clean(value: object) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()
 
 
+def _is_reference_record(row: dict) -> bool:
+    """A Pierce reference (condominium master) account, not a taxpayer of a unit.
+
+    Measured on the live summary (2000050082, "35 BROADWAY CONDOS"): the master account
+    carries the word REFERENCE in place of situs, mail and taxpayer, and use code
+    "0000-UNKNOWN". Matched as a WORD anywhere in those fields, not only as the whole
+    value, so a variant ("REFERENCE PARCEL", "REF ACCT - REFERENCE") also fails closed
+    (Codex r2 P1), and an unknown use code is never treated as proof of a real owner.
+    """
+    for key in ("situs", "mail", "mail2", "mail3", "name", "use_cd", "category"):
+        if _REFERENCE_WORD_RE.search(_clean(row.get(key)).upper()):
+            return True
+    use_code = _clean(row.get("use_cd")).upper()
+    return not use_code or use_code.startswith("0000")
+
+
 @dataclass(frozen=True)
 class OwnerDecision:
     status: str
@@ -205,8 +227,7 @@ def decide(parcel: str, rows: list[dict] | None, lead_address: str | None, *,
         return OwnerDecision(NOT_REAL_PROPERTY)
     name = _clean(row.get("name"))
     situs = _clean(row.get("situs"))
-    use_code = _clean(row.get("use_cd")).upper()
-    if _REFERENCE in (situs.upper(), name.upper()) or use_code.startswith("0000"):
+    if _is_reference_record(row):
         return OwnerDecision(REFERENCE_PARCEL)
     if not situs_agrees(lead_address, situs):
         return OwnerDecision(ADDRESS_MISMATCH)
@@ -229,7 +250,9 @@ def _summary_is_for(url: str, parcel: str) -> bool:
         return False
     return (u.scheme == "https" and u.hostname == _SUMMARY.hostname and port is None
             and u.path == _SUMMARY.path and not u.username and not u.password
-            and parse_qs(u.query) == {"iParcelNumber": [parcel]})
+            and not u.params and not u.fragment
+            # Raw query, byte for byte: parse_qs drops blank and merges repeated keys.
+            and u.query == f"iParcelNumber={parcel}")
 
 
 def _new_session():
@@ -275,17 +298,32 @@ async def _lookup(parcels: list[str], *, pace_s: float, deadline: float | None,
     consecutive_hard = 0
 
     def _affordable(*, new_session: bool, pace: bool) -> bool:
-        # Everything the next page view may cost must fit: the pause, a browser start
-        # when one is needed, and the full page timeout (Codex r1 P2).
+        # Everything the next page view may cost must fit, each part hard-bounded by
+        # its own timeout: the pause, a browser start when one is needed, the page, and
+        # closing the browser afterwards (Codex r1/r2 P2).
         if deadline is None:
             return True
-        cost = _PAGE_TIMEOUT_S + (pace_s if pace else 0.0) + (_SESSION_START_S if new_session else 0.0)
+        cost = (_FETCH_TIMEOUT_S + _SESSION_CLOSE_S + (pace_s if pace else 0.0)
+                + (_SESSION_START_S if new_session else 0.0))
         return time.monotonic() + cost < deadline
 
+    async def _start():
+        s = _new_session()
+        stats["sessions"] += 1
+        try:
+            return await asyncio.wait_for(s.__aenter__(), timeout=_SESSION_START_S)
+        except BaseException:
+            await _close(s)  # a half-started browser is still a process to reap
+            raise
+
     async def _one(pid: str) -> tuple[str, list | None]:
+        # Re-proven right before the navigation: the lease must still be ours after
+        # the pause and any browser start (Codex r2 P2).
+        if not admission.still_held():
+            raise _LeaseLostError
         try:
             status, body = await asyncio.wait_for(_fetch_summary(session, pid),
-                                                  timeout=_PAGE_TIMEOUT_S + 5)
+                                                  timeout=_FETCH_TIMEOUT_S)
             return classify_response(status, body)
         except BaseException as exc:
             if type(exc).__name__ in _TIME_LIMITS:
@@ -302,16 +340,16 @@ async def _lookup(parcels: list[str], *, pace_s: float, deadline: float | None,
             if not _affordable(new_session=session is None, pace=bool(i)):
                 stats["outcome"] = "budget_exhausted"
                 return
-            if not admission.still_held():
-                stats["outcome"] = "lease_lost"
-                return
             if session is None:
-                session = await _new_session().__aenter__()
-                stats["sessions"] += 1
+                session = await _start()
             if i:
                 await asyncio.sleep(pace_s)
+            try:
+                kind, rows = await _one(pid)
+            except _LeaseLostError:
+                stats["outcome"] = "lease_lost"
+                return
             stats["attempted"].append(pid)
-            kind, rows = await _one(pid)
             if kind == TOKEN_REJECTED and not restarted:
                 # The portal declined this session's verification. One fresh session
                 # for the whole batch (pierce_atip's re-solve-once rule), then stop.
@@ -322,12 +360,16 @@ async def _lookup(parcels: list[str], *, pace_s: float, deadline: float | None,
                     _audit(pid, "verification_rejected")
                     stats["outcome"] = "budget_exhausted"
                     return
-                await session.__aexit__(None, None, None)
-                session = None
-                session = await _new_session().__aenter__()
-                stats["sessions"] += 1
+                old, session = session, None
+                await _close(old)
+                session = await _start()
                 await asyncio.sleep(pace_s)
-                kind, rows = await _one(pid)
+                try:
+                    kind, rows = await _one(pid)
+                except _LeaseLostError:
+                    stats["transient"].append(pid)
+                    stats["outcome"] = "lease_lost"
+                    return
             if kind == TOKEN_REJECTED:
                 stats["token_rejected"] += 1
                 stats["transient"].append(pid)
@@ -357,10 +399,15 @@ async def _lookup(parcels: list[str], *, pace_s: float, deadline: float | None,
         stats["outcome"] = "complete"
     finally:
         if session is not None:
-            try:
-                await session.__aexit__(None, None, None)
-            except Exception as exc:  # noqa: BLE001 -- closing must not mask the result
-                _logger.warning("pierce_atip_owner session close failed: %s", type(exc).__name__)
+            await _close(session)
+
+
+async def _close(session) -> None:
+    """Close a browser session within its own bound; a failed close never masks the result."""
+    try:
+        await asyncio.wait_for(session.__aexit__(None, None, None), timeout=_SESSION_CLOSE_S)
+    except Exception as exc:  # noqa: BLE001
+        _logger.warning("pierce_atip_owner session close failed: %s", type(exc).__name__)
 
 
 def lookup_parcels(parcel_ids: list[str], *, pace_s: float = MIN_PACE_S,
@@ -440,7 +487,9 @@ def owner_lookup_parcels(rows) -> dict[str, list]:
         if not is_tacoma_code_violation(res) or (res.party_name or "").strip():
             continue
         ed = res.enrichment_data
-        if ed.get("owner_source") or ed.get("owner_status"):
+        # Key PRESENCE, as the SQL guard reads it: a null or empty owner key is still
+        # "decided", or the row would be looked up forever and never written (Codex r2).
+        if "owner_source" in ed or "owner_status" in ed:
             continue
         pid = normalize_parcel(res.parcel_id)
         if pid:
@@ -459,8 +508,8 @@ def owner_payload(parcel: str, decision: OwnerDecision, checked_at: str) -> dict
 def _still_needs_owner(res, pid: str) -> bool:
     return (is_tacoma_code_violation(res) and not (res.party_name or "").strip()
             and normalize_parcel(res.parcel_id) == pid
-            and not res.enrichment_data.get("owner_source")
-            and not res.enrichment_data.get("owner_status"))
+            and "owner_source" not in res.enrichment_data
+            and "owner_status" not in res.enrichment_data)
 
 
 def plan_owner_decisions(pin_map: dict[str, list], fetched: dict[str, Fetched]
@@ -489,9 +538,16 @@ def plan_owner_decisions(pin_map: dict[str, list], fetched: dict[str, Fetched]
 # Every owner write re-proves, in the UPDATE itself, what the decision was made on: the
 # same Tacoma code-violation row, parcel and address, still unnamed and undecided. A
 # row changed by anything else while the portal was being asked is left alone
-# (Codex r1 P1). Callers add their own scope (job status, delivery) on top.
+# (Codex r1 P1). It is also still in the same job, and that job is still a Pierce WA
+# code-violation job of the same user, so a re-parented or re-classified row is never
+# named (Codex r2 P1). Callers add their own scope (job status, delivery) on top.
 OWNER_ROW_GUARD = """
-      r.id = :rid AND r.user_id = :uid
+      r.id = :rid AND r.user_id = :uid AND r.job_id = :jid
+  AND EXISTS (
+    SELECT 1 FROM jobs gj JOIN scraper_configs gsc ON gsc.id = gj.scraper_config_id
+    WHERE gj.id = r.job_id AND gj.user_id = r.user_id
+      AND lower(gsc.county) = 'pierce' AND upper(gsc.state) = 'WA'
+      AND gsc.record_type = 'code_violation')
   AND btrim(r.parcel_id) = :pid
   AND r.property_address IS NOT DISTINCT FROM CAST(:address AS varchar)
   AND jsonb_typeof(r.enrichment_data::jsonb) = 'object'
@@ -520,7 +576,8 @@ def write_owner_decisions(db, plans: list[tuple], *, checked_at: str) -> Counter
     counts: Counter = Counter()
     for res, pid, d in plans:
         result = db.execute(sa_text(_WRITE_DECISION_SQL), {
-            "rid": res.id, "uid": res.user_id, "pid": pid, "address": res.property_address,
+            "rid": res.id, "uid": res.user_id, "jid": res.job_id, "pid": pid,
+            "address": res.property_address,
             "owner": d.name if d.status == MATCHED else None,
             "payload": json.dumps(owner_payload(pid, d, checked_at)),
         })

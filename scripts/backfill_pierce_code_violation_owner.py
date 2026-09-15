@@ -53,7 +53,7 @@ _BATCH = 100
 _CASENUMBER_RE = re.compile(r"^[0-9A-Za-z-]{1,32}$")
 
 _CANDIDATES_SQL = """
-    SELECT r.id, r.user_id, r.party_name, r.parcel_id, r.property_address,
+    SELECT r.id, r.user_id, r.job_id, r.party_name, r.parcel_id, r.property_address,
            r.legal_description, r.enrichment_data::jsonb AS ed
     FROM results r
     JOIN jobs j ON j.id = r.job_id
@@ -74,7 +74,7 @@ _UPDATE_SQL = """
     UPDATE results SET
       party_name = CAST(:new_party AS varchar),
       enrichment_data = (enrichment_data::jsonb || CAST(:payload AS jsonb))::json
-    WHERE id = :rid AND user_id = :uid
+    WHERE id = :rid AND user_id = :uid AND job_id = :jid
       AND party_name IS NOT DISTINCT FROM CAST(:old_party AS varchar)
       AND parcel_id IS NOT DISTINCT FROM CAST(:old_parcel AS varchar)
       AND property_address IS NOT DISTINCT FROM CAST(:old_address AS varchar)
@@ -85,7 +85,11 @@ _UPDATE_SQL = """
       AND NOT (enrichment_data::jsonb ? 'owner_source')
       AND (NOT CAST(:writes_owner_status AS boolean)
            OR NOT (enrichment_data::jsonb ? 'owner_status'))
-      AND EXISTS (SELECT 1 FROM jobs j WHERE j.id = results.job_id AND j.status = 'done')
+      AND EXISTS (
+        SELECT 1 FROM jobs j JOIN scraper_configs sc ON sc.id = j.scraper_config_id
+        WHERE j.id = results.job_id AND j.user_id = results.user_id AND j.status = 'done'
+          AND lower(sc.county) = 'pierce' AND upper(sc.state) = 'WA'
+          AND sc.record_type = 'code_violation')
 """
 
 
@@ -211,7 +215,7 @@ def run(db, *, apply_writes: bool, owners: bool, retry_owners: bool = False,
                 continue
             res = db.execute(text(_UPDATE_SQL), {
                 "new_party": new_party, "old_party": r.party_name, "old_parcel": r.parcel_id,
-                "old_address": r.property_address, "rid": r.id, "uid": r.user_id,
+                "old_address": r.property_address, "rid": r.id, "uid": r.user_id, "jid": r.job_id,
                 # The source row was fetched for THIS case; a row re-pointed since is skipped.
                 "old_legal": r.legal_description, "old_case": r.ed.get("case_number"),
                 "payload": json.dumps(payload), "source": _SOURCE,

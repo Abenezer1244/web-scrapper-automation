@@ -86,7 +86,7 @@ _CANDIDATE_PARCELS_SQL = f"""
 """  # noqa: S608 -- splices only module constants; every value is bound
 
 _CANDIDATE_ROWS_SQL = f"""
-    SELECT r.id, r.user_id, btrim(r.parcel_id) AS parcel_id, r.property_address,
+    SELECT r.id, r.user_id, r.job_id, btrim(r.parcel_id) AS parcel_id, r.property_address,
            r.enrichment_data::jsonb AS ed
     FROM results r
     JOIN jobs j ON j.id = r.job_id
@@ -187,7 +187,8 @@ def _tick(stats: dict) -> dict:
         stats["parcels"], stats["rows"] = len(parcels), len(rows)
 
         l_stats: dict = {}
-        fetched = lookup_parcels(parcels, budget_s=max(30.0, deadline - time.monotonic() - 15),
+        # Never floored: time already spent on the queries comes out of the tick budget.
+        fetched = lookup_parcels(parcels, budget_s=deadline - time.monotonic() - 15,
                                  stats=l_stats)
         stats["lookup_outcome"] = l_stats.get("outcome")
         transient = set(l_stats.get("transient", []))
@@ -230,7 +231,7 @@ def _write(db, row, payload: dict, owner: str | None, label: str) -> str:
     row changed since selection (nothing written), `errors` when the write failed."""
     try:
         result = db.execute(sa_text(_WRITE_SQL), {
-            "rid": row.id, "uid": row.user_id, "pid": row.parcel_id,
+            "rid": row.id, "uid": row.user_id, "jid": row.job_id, "pid": row.parcel_id,
             "address": row.property_address, "owner": owner,
             "payload": json.dumps(payload), "max_attempts": _MAX_ATTEMPTS,
         })
@@ -246,7 +247,10 @@ def _write(db, row, payload: dict, owner: str | None, label: str) -> str:
 try:  # pragma: no cover -- registration only
     from src.workers import app
 
-    @app.task(name="src.workers.pierce_cv_owner_recovery.recover_pierce_cv_owners_task")
+    # Limits above the 300 s tick budget (every lookup step is itself timeout-bounded),
+    # far below the app-wide 55 min, so a wedged browser cannot hold a worker for an hour.
+    @app.task(name="src.workers.pierce_cv_owner_recovery.recover_pierce_cv_owners_task",
+              soft_time_limit=540, time_limit=600)
     def recover_pierce_cv_owners_task() -> dict:
         """Beat entry point: see recover_pierce_cv_owners."""
         return recover_pierce_cv_owners()

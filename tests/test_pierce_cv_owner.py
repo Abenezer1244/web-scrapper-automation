@@ -201,6 +201,18 @@ def test_everything_else_names_nobody(parcel, body, address, status):
     assert (d.status, d.name) == (status, None)
 
 
+@pytest.mark.parametrize("variant", [
+    {"name": "REFERENCE PARCEL"},
+    {"mail": "REFERENCE"},
+    {"use_cd": "0000-UNKNOWN"},
+    {"use_cd": None},
+    {"category": "Reference"},
+], ids=["name_variant", "mail_marker", "unknown_use", "no_use_code", "category"])
+def test_a_reference_marker_anywhere_fails_closed_even_on_a_matching_situs(variant):
+    row = dict(_rows(ATIP_2117)[0], **variant)
+    assert _decide("2021110133", [row], "2117 AVE S") == pao.OwnerDecision("reference_parcel")
+
+
 def test_a_blank_taxpayer_name_is_not_an_owner():
     row = dict(_rows(ATIP_2117)[0], name="   ")
     assert _decide("2021110133", [row], "2117 AVE S").status == "no_name"
@@ -373,6 +385,30 @@ def test_a_rejected_decision_writes_a_status_and_no_owner_proof():
     decided = _cv_row(enrichment_data={"source": "tacoma_code_violations",
                                        "owner_status": "address_mismatch"})
     assert pao.owner_lookup_parcels([decided]) == {}       # never looked up again
+    # A present-but-empty owner key is decided too, exactly as the SQL guard reads it.
+    for ed in ({"owner_status": None}, {"owner_source": ""}):
+        row = _cv_row(enrichment_data={"source": "tacoma_code_violations", **ed})
+        assert pao.owner_lookup_parcels([row]) == {}
+        assert pao.plan_owner_decisions({"2021110133": [row]}, {
+            "2021110133": pao.Fetched("found", _rows(ATIP_2117))})[0] == []
+
+
+def test_a_lease_lost_between_pages_stops_before_the_next_request(monkeypatch, paces, clean_health,
+                                                                   redis_client):
+    portal = _Portal({"2021110133": [(200, ATIP_2117)], "2006120010": [(200, ATIP_602)]})
+    portal.install(monkeypatch)
+    real_fetch = pao._fetch_summary
+
+    async def _fetch_then_lose_the_lease(session, parcel):
+        answer = await real_fetch(session, parcel)
+        redis_client.delete("bl:source_admission:pierce_atip_owner")   # TTL expiry, say
+        return answer
+
+    monkeypatch.setattr(pao, "_fetch_summary", _fetch_then_lose_the_lease)
+    stats: dict = {}
+    got = pao.lookup_parcels(["2021110133", "2006120010"], stats=stats)
+    assert stats["outcome"] == "lease_lost"
+    assert portal.requests == ["2021110133"] and list(got) == ["2021110133"]
 
 
 def test_a_row_changed_since_selection_is_not_planned():
@@ -402,6 +438,10 @@ def test_only_the_exact_summary_endpoint_for_the_parcel_is_read():
         "https://atip.piercecountywa.gov.evil.test/api/pcAtipSummary?iParcelNumber=2021110133",
         "http://atip.piercecountywa.gov/api/pcAtipSummary?iParcelNumber=2021110133",
         "https://atip.piercecountywa.gov:8443/api/pcAtipSummary?iParcelNumber=2021110133",
+        "https://atip.piercecountywa.gov/api/pcAtipSummary?iParcelNumber=2021110133&iParcelNumber=",
+        "https://atip.piercecountywa.gov/api/pcAtipSummary?iParcelNumber=2021110133&",
+        "https://atip.piercecountywa.gov/api/pcAtipSummary?iParcelNumber=20211101%333",
+        "https://atip.piercecountywa.gov/api/pcAtipSummary?iParcelNumber=2021110133#x",
     ):
         assert not pao._summary_is_for(url, "2021110133"), url
 
@@ -569,7 +609,10 @@ async def test_a_row_changed_while_the_portal_answers_is_never_named(
     "UPDATE results SET parcel_id = '2021110134' WHERE id = :i",
     "UPDATE results SET property_address = '2119 AVE S' WHERE id = :i",
     "UPDATE results SET party_name = 'HAND ENTERED NAME' WHERE id = :i",
-])
+    # Re-classified: the job's config is no longer a code-violation config.
+    "UPDATE scraper_configs SET record_type = 'probate' WHERE id = "
+    "(SELECT j.scraper_config_id FROM jobs j JOIN results r ON r.job_id = j.id WHERE r.id = :i)",
+], ids=["parcel", "address", "party", "reclassified"])
 async def test_the_write_itself_rejects_a_row_changed_after_the_decision(
     db, business_user, redis_client, monkeypatch, paces, clean_health, change,
 ):
@@ -728,23 +771,38 @@ async def test_repair_write_guard_skips_a_row_whose_party_parcel_or_case_moved(d
     rid, _ = await _stored(db, business_user, job_id, party="Nuisance - 2117 AVE S")
     label = "Nuisance - 2117 AVE S"
 
+    other_job = await _pierce_job(db, business_user)
+
     def _write(old_party=label, old_parcel="2021110133", old_case="60000303996",
-               old_legal="60000303996"):
+               old_legal="60000303996", jid=job_id):
         from src.db.session import system_sync_session
 
         with system_sync_session() as sdb:
             res = sdb.execute(text(bpo._UPDATE_SQL), {
                 "new_party": "TACOMA TOWN CENTER PARCELS LLC", "old_party": old_party,
                 "old_parcel": old_parcel, "old_address": "2117 AVE S", "rid": rid,
-                "uid": business_user.id, "payload": "{}", "source": bpo._SOURCE,
+                "uid": business_user.id, "jid": jid, "payload": "{}", "source": bpo._SOURCE,
                 "writes_owner_status": True, "old_case": old_case, "old_legal": old_legal})
             sdb.commit()
             return res.rowcount
+
+    def _reclassify(record_type):
+        from src.db.session import system_sync_session
+
+        with system_sync_session() as sdb:
+            sdb.execute(text("UPDATE scraper_configs SET record_type = :t WHERE id = "
+                             "(SELECT scraper_config_id FROM jobs WHERE id = :j)"),
+                        {"t": record_type, "j": job_id})
+            sdb.commit()
 
     assert await asyncio.to_thread(_write, old_parcel="2021110134") == 0
     assert await asyncio.to_thread(_write, old_party="SOMEONE ELSE") == 0
     assert await asyncio.to_thread(_write, old_case="60000301838") == 0
     assert await asyncio.to_thread(_write, old_legal="60000301838") == 0
+    assert await asyncio.to_thread(_write, jid=other_job) == 0
+    await asyncio.to_thread(_reclassify, "probate")
+    assert await asyncio.to_thread(_write) == 0
+    await asyncio.to_thread(_reclassify, "code_violation")
     assert await asyncio.to_thread(_write) == 1
 
 

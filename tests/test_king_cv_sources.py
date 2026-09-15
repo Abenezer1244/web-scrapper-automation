@@ -662,6 +662,45 @@ async def test_a_deadline_inside_the_progress_callback_is_the_jobs_deadline(monk
     assert scraper.source_status == {} and source_alerts.sent == []
 
 
+def test_stuck_alerts_are_capped_and_the_scrape_still_ships(monkeypatch, no_backoff):
+    import threading
+
+    from src.workers import ops_alerts
+
+    release = threading.Event()
+    calls: list[str] = []
+
+    def _stuck(kind, key, *a):
+        calls.append(key)
+        release.wait(6)
+
+    monkeypatch.setattr(ops_alerts, "send_ops_alert", _stuck)
+    monkeypatch.setattr(kcv, "_ALERT_WAIT_S", 0.1)
+    monkeypatch.setattr(kcv, "_ALERT_THREADS", threading.BoundedSemaphore(2))
+    _connector(monkeypatch, fail={"bellevue", "burien", "accela"})
+    try:
+        recs = asyncio.run(kcv.KingWACodeViolationScraper().scrape("08/01/2026", "09/14/2026"))
+    finally:
+        release.set()
+    # Two alerts started and stuck; the third was refused, not queued behind them.
+    assert calls == ["bellevue_code_enforcement", "burien_code_enforcement"]
+    assert {r.enrichment_data["source"] for r in recs} == {"seattle_sdci_code_violations"}
+
+
+def test_a_deadline_on_either_branch_is_found_and_detached():
+    from celery.exceptions import SoftTimeLimitExceeded
+
+    deadline = SoftTimeLimitExceeded()
+    # The deadline hangs off the CONTEXT of a wrapper whose CAUSE is something else.
+    other = ValueError("unrelated cause")
+    wrapper = RuntimeError("fallback also failed")
+    wrapper.__cause__, wrapper.__context__ = other, deadline
+    assert base.celery_time_limit(wrapper) is deadline
+    with pytest.raises(SoftTimeLimitExceeded) as got:
+        base.raise_if_time_limit(wrapper)
+    assert got.value is deadline and wrapper.__context__ is None and wrapper.__cause__ is other
+
+
 def test_re_raising_a_wrapped_deadline_leaves_no_reference_cycle():
     from celery.exceptions import SoftTimeLimitExceeded
 

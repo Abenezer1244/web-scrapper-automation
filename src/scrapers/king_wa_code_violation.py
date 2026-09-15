@@ -87,6 +87,10 @@ SOURCE_FAILURE_ALERT_KIND = "king_cv_source_failed"
 # thread past this; neither the scrape nor the worker's asyncio.run shutdown waits on a
 # slow Redis, database or email provider.
 _ALERT_WAIT_S = 15.0
+# Alert threads alive at once in this process. A hung Redis, database or email provider
+# cannot be interrupted, so a long outage would otherwise add a stuck thread per failed
+# source per job. Past the cap the alert is logged at ERROR and not sent.
+_ALERT_THREADS = threading.BoundedSemaphore(4)
 
 
 def source_failure_alert(source: CodeViolationSource, exc: Exception,
@@ -133,12 +137,23 @@ async def _alert_source_failure(source: CodeViolationSource, exc: Exception,
         try:
             send_ops_alert(*alert)
         finally:
+            _ALERT_THREADS.release()
             try:
                 loop.call_soon_threadsafe(_notify)
             except RuntimeError:
                 pass  # the loop already closed: nobody is waiting any more
 
-    threading.Thread(target=_send, name=f"ops-alert-{source.key}", daemon=True).start()
+    if not _ALERT_THREADS.acquire(blocking=False):
+        _logger.error("ops alert NOT sent for King code violation source %s: earlier alerts are "
+                      "still stuck (Redis, database or email provider not answering)", source.key)
+        return
+    try:
+        threading.Thread(target=_send, name=f"ops-alert-{source.key}", daemon=True).start()
+    except RuntimeError as start_exc:  # the process cannot start another thread
+        _ALERT_THREADS.release()
+        _logger.error("ops alert NOT sent for King code violation source %s: %s",
+                      source.key, str(start_exc)[:160])
+        return
     try:
         await asyncio.wait_for(finished, timeout=_ALERT_WAIT_S)
     except TimeoutError:

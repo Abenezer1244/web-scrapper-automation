@@ -198,12 +198,13 @@ def _coordinates(lat: object, lon: object) -> tuple[float, float] | None:
 def match_address_point(
     lat: object, lon: object, address: str | None, *,
     point_parcels: tuple[tuple[str, str], ...] | None = None,
-    point_status: str | None = None, pace_s: float = 0.25,
+    point_status: str | None = None, pace_s: float = 0.25, property_zip: str | None = None,
 ) -> AddressPointDecision:
     """Resolve one lead through King's address points under the rule in the module doc.
 
     ``point_parcels`` are the (PIN, PROPTYPE) polygons the strict point rule already saw
-    under these coordinates, to avoid asking twice; None means ask.
+    under these coordinates, to avoid asking twice; None means ask. ``property_zip`` is
+    the lead's ZIP column: every ZIP the lead carries must agree and must equal King's.
     """
     ev: dict = {"point_status": point_status}
 
@@ -214,7 +215,14 @@ def match_address_point(
     parsed = parse_lead_address(address)
     if parsed is None:
         return rejected("unit_address" if _UNIT_RE.search(address or "") else "unparseable_address")
-    ev.update({"normalized_address": parsed.normalized, "lead_zip": parsed.zip5})
+    column_zip = str(property_zip or "").strip()[:5]
+    lead_zips = {z for z in (parsed.zip5, column_zip) if z}
+    ev.update({"normalized_address": parsed.normalized, "lead_zip": parsed.zip5,
+               "property_zip": column_zip or None})
+    if len(lead_zips) > 1:
+        ev["zip_compare"] = "lead_zips_disagree"
+        return rejected("zip_conflict")
+    lead_zip = next(iter(lead_zips), None)
     reads = readings(parsed)
     compresses = sorted({r.compress for r in reads})
     data = _query(ADDRESS_POINT_LAYER, {
@@ -253,9 +261,9 @@ def match_address_point(
     if len(pins) != 1:
         return rejected("multiple_pins")
     pin = next(iter(pins))
-    if parsed.zip5 is None:
+    if lead_zip is None:
         ev["zip_compare"] = "lead_has_no_zip"
-    elif all(str(p.get("ZIP5") or "").strip()[:5] == parsed.zip5 for _, p in hits):
+    elif all(str(p.get("ZIP5") or "").strip()[:5] == lead_zip for _, p in hits):
         ev["zip_compare"] = "equal"
     else:
         ev["zip_compare"] = "conflict"

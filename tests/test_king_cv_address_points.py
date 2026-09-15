@@ -253,6 +253,19 @@ def test_a_zip_conflict_is_rejected(monkeypatch):
         "rejected", "zip_conflict", "conflict")
 
 
+def test_the_zip_column_counts_as_the_leads_zip(monkeypatch):
+    _gis(monkeypatch, points=[AP_209_12TH])
+    d = _decide("47.60", "-122.31", "209 12TH AVE S", point_parcels=(("9822000330", "C"),),
+                property_zip="98104")
+    assert (d.outcome, d.evidence["reason"]) == ("rejected", "zip_conflict")
+    d = _decide("47.60", "-122.31", "209 12TH AVE S, SEATTLE WA 98144",
+                point_parcels=(("9822000330", "C"),), property_zip="98104")
+    assert (d.evidence["reason"], d.evidence["zip_compare"]) == ("zip_conflict", "lead_zips_disagree")
+    d = _decide("47.60", "-122.31", "209 12TH AVE S", point_parcels=(("9822000330", "C"),),
+                property_zip="98144")
+    assert (d.outcome, d.evidence["zip_compare"]) == ("accepted", "equal")
+
+
 def test_a_lead_without_a_zip_is_compared_on_street_only(monkeypatch):
     _gis(monkeypatch, points=[AP_209_12TH])
     d = _decide("47.60", "-122.31", "209 12TH AVE S", point_parcels=(("9822000330", "C"),))
@@ -356,6 +369,9 @@ def test_skip_trace_never_pays_for_an_address_point_owner():
                           property_city="SEATTLE", property_state="WA", property_zip="98106",
                           enrichment_data=ed)
     assert build_pending_row_payload(row) is None
+    # The tier is the only reason: the same row located exactly by the point rule is paid for.
+    row.enrichment_data = {**ed, "kc_pin_source": "king_gis_point_in_parcel", "kc_pin_match": "exact"}
+    assert build_pending_row_payload(row) is not None
 
 
 def test_api_and_export_label_a_county_address_match():
@@ -695,7 +711,9 @@ async def test_address_point_repair_write_skips_a_row_changed_since_it_was_read(
                   "payload": payload, "source": _SDCI, "f_property_state": None,
                   "f_owner_state": None, "f_absentee": None, "f_out_of_state": None,
                   "old_pin_status": "address_mismatch", "old_pin": None, "old_pin_match": None,
-                  "old_pin_source": None, "old_parcel_address": None, **over}
+                  "old_pin_source": None, "old_parcel_address": None,
+                  "old_address": "9043 A 18TH AVE SW, SEATTLE WA 98106", "old_zip": None,
+                  "old_lat": "47.52163912", "old_lon": "-122.35809767", **over}
         with system_sync_session() as sdb:
             res = sdb.execute(text(bko._AP_UPDATE_SQL), params)
             sdb.commit()
@@ -705,6 +723,10 @@ async def test_address_point_repair_write_skips_a_row_changed_since_it_was_read(
     assert await asyncio.to_thread(_write, old_mail="PO BOX 1, SEATTLE, WA 98111") == 0
     assert await asyncio.to_thread(_write, uid=str(uuid.uuid4())) == 0
     assert await asyncio.to_thread(_write, old_parcel_address="9043A 18TH AVE SW") == 0
+    # The decision was made for this address and point; an edited input is not ours.
+    assert await asyncio.to_thread(_write, old_address="9043 B 18TH AVE SW, SEATTLE WA 98106") == 0
+    assert await asyncio.to_thread(_write, old_zip="98106") == 0
+    assert await asyncio.to_thread(_write, old_lat="47.52158159") == 0
     assert await asyncio.to_thread(_write) == 1
     # Decided once: a second decision for the same row is refused.
     assert await asyncio.to_thread(_write, old_pin_status="matched", old_pin="7899800716",

@@ -58,6 +58,8 @@ _CONDO_PROPTYPE = "K"
 # Worst case for one address-point request (its timeout): the fallback only starts while
 # two of them still fit inside the caller's time budget.
 _ADDRESS_POINT_WORST_S = 15
+# Held back from the fallback for the Assessor extract scan that runs after the lookups.
+_EXTRACT_RESERVE_S = 30
 
 # A lead address naming a unit ("#6", "UNIT 6", "APT 6", "STE 6") cannot be proven by a
 # street comparison: the normalizer strips units, so two condo units on one base parcel
@@ -215,6 +217,7 @@ def apply_owner_names(pin_map: dict[str, list], owners: dict[str, str], *,
 def resolve_code_violation_mailing(
     items: list[tuple[str, object, object, str | None]], *,
     pace_s: float = 0.25, budget_s: float | None = None, address_points: bool = False,
+    property_zips: dict[str, str | None] | None = None,
 ) -> tuple[dict[str, dict], str | None]:
     """For each (key, lat, lon, address): locate the parcel, then its extract mailing.
 
@@ -231,16 +234,17 @@ def resolve_code_violation_mailing(
     from src.scrapers.enrichment.king_rpacct import resolve_pins
 
     deadline = time.monotonic() + budget_s if budget_s is not None else None
-    # One lookup per distinct point+address: a complaint often has several records.
+    zips = property_zips or {}
+    # One lookup per distinct point+address(+ZIP column): a complaint often has several records.
     by_point: dict[tuple, list[tuple[str, str | None]]] = {}
     for key, lat, lon, address in items:
-        by_point.setdefault((str(lat), str(lon), (address or "").strip().upper()),
-                            []).append((key, address))
+        by_point.setdefault((str(lat), str(lon), (address or "").strip().upper(),
+                             str(zips.get(key) or "").strip()), []).append((key, address))
     located = locate_many([(group[0][0], pt[0], pt[1], group[0][1])
                            for pt, group in by_point.items()], pace_s=pace_s, budget_s=budget_s)
     checked_at = datetime.now(UTC).isoformat()
     decisions: dict[str, dict] = {}
-    for (lat, lon, _), group in by_point.items():
+    for (lat, lon, _, prop_zip), group in by_point.items():
         first_key, first_address = group[0]
         loc = located.get(first_key)
         # Not reached, or a transient failure: no status, so a later run retries it.
@@ -251,12 +255,15 @@ def resolve_code_violation_mailing(
             d.update({"kc_pin": loc.pin, "kc_parcel_address": loc.parcel_address,
                       "kc_pin_match": loc.match, "kc_pin_source": SOURCE})
         elif (address_points and loc.status in kap.FALLBACK_STATUSES
-              # Room for both address-point requests to time out before the deadline.
+              # Room for both address-point requests to time out, and for the extract
+              # scan that follows, before the deadline.
               and (deadline is None
-                   or time.monotonic() + 2 * (_ADDRESS_POINT_WORST_S + pace_s) < deadline)):
+                   or time.monotonic() + 2 * (_ADDRESS_POINT_WORST_S + pace_s)
+                   + _EXTRACT_RESERVE_S < deadline)):
             ap = kap.match_address_point(lat, lon, first_address,
                                          point_parcels=loc.point_parcels,
-                                         point_status=loc.status, pace_s=pace_s)
+                                         point_status=loc.status, pace_s=pace_s,
+                                         property_zip=prop_zip or None)
             d.update(kap.decision_fields(ap, checked_at=checked_at))
             time.sleep(pace_s)
         for key, _address in group:

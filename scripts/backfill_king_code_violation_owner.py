@@ -99,7 +99,9 @@ _UPDATE_SQL = """
 
 _AP_CANDIDATES_SQL = """
     SELECT r.id, r.user_id, r.property_address, r.property_city, r.property_state,
-           r.property_zip, r.mailing_address, r.enrichment_data::jsonb AS ed
+           r.property_zip, r.mailing_address, r.enrichment_data::jsonb AS ed,
+           r.enrichment_data::jsonb->>'latitude' AS lat,
+           r.enrichment_data::jsonb->>'longitude' AS lon
     FROM results r
     JOIN jobs j ON j.id = r.job_id
     JOIN scraper_configs sc ON sc.id = j.scraper_config_id
@@ -130,6 +132,10 @@ _AP_UPDATE_SQL = """
       enrichment_data = (enrichment_data::jsonb || CAST(:payload AS jsonb))::json
     WHERE id = :rid AND user_id = :uid
       AND parcel_id IS NULL
+      AND property_address IS NOT DISTINCT FROM CAST(:old_address AS text)
+      AND property_zip IS NOT DISTINCT FROM CAST(:old_zip AS text)
+      AND enrichment_data::jsonb->>'latitude' IS NOT DISTINCT FROM CAST(:old_lat AS text)
+      AND enrichment_data::jsonb->>'longitude' IS NOT DISTINCT FROM CAST(:old_lon AS text)
       AND mailing_address IS NOT DISTINCT FROM CAST(:old_mail AS text)
       AND (CAST(:new_mail AS text) IS NULL OR coalesce(btrim(mailing_address), '') = '')
       AND jsonb_typeof(enrichment_data::jsonb) = 'object'
@@ -164,8 +170,9 @@ def run_address_points(db, *, apply_writes: bool, limit: int | None = None,
     for r in rows:
         ed = r.ed
         decision = kap.match_address_point(
-            ed.get("latitude"), ed.get("longitude"), r.property_address,
-            point_status=ed.get("kc_pin_status"), pace_s=gis_pace_s)
+            r.lat, r.lon, r.property_address,
+            point_status=ed.get("kc_pin_status"), pace_s=gis_pace_s,
+            property_zip=r.property_zip)
         time.sleep(gis_pace_s)
         fields = kap.decision_fields(decision, checked_at=now)
         if not fields:
@@ -224,7 +231,10 @@ def run_address_points(db, *, apply_writes: bool, limit: int | None = None,
                 "old_pin_status": r.ed.get("kc_pin_status"), "old_pin": r.ed.get("kc_pin"),
                 "old_pin_match": r.ed.get("kc_pin_match"),
                 "old_pin_source": r.ed.get("kc_pin_source"),
-                "old_parcel_address": r.ed.get("kc_parcel_address")})
+                "old_parcel_address": r.ed.get("kc_parcel_address"),
+                # ...and for THESE inputs: an address or coordinate edited since is skipped.
+                "old_address": r.property_address, "old_zip": r.property_zip,
+                "old_lat": r.lat, "old_lon": r.lon})
             written += bool(res.rowcount)
             skipped += not res.rowcount
             if i % 200 == 0:

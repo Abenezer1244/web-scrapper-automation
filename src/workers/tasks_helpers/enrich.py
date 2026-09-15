@@ -946,6 +946,7 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                     [(k, res.enrichment_data.get("latitude"), res.enrichment_data.get("longitude"),
                       res.property_address) for k, res in _cv_rows.items()],
                     budget_s=420, address_points=True,
+                    property_zips={k: res.property_zip for k, res in _cv_rows.items()},
                 )
             except Exception as exc:  # noqa: BLE001 -- enrichment is best-effort
                 if type(exc).__name__ in ("SoftTimeLimitExceeded", "TimeLimitExceeded"):

@@ -37,7 +37,6 @@ from src.config.constants import (
 from src.db import CountyConnector, Job, JobLog, Result, ScraperConfig, User
 from src.db import session as db_session
 from src.utils.logger import setup_logger
-from src.utils.source_dates import is_auction_date_fallback
 
 _logger = setup_logger("api.jobs")
 
@@ -469,12 +468,7 @@ async def get_results(
         .offset((page - 1) * page_size)
         .limit(page_size)
     )
-    items = [
-        ResultRow.model_validate(r).model_copy(
-            update={"date_is_auction_date": is_auction_date_fallback(r.date_recorded, r.enrichment_data)}
-        )
-        for r in rows_result.scalars().all()
-    ]
+    items = [ResultRow.model_validate(r) for r in rows_result.scalars().all()]
 
     # Count enriched records (have real property_address), excluding duplicates
     enriched_result = await db.execute(

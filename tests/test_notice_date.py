@@ -62,7 +62,26 @@ VECTORS = [
     ("2/29/2027", SNOHO("2/29/2027"), False),  # both impossible: no date, no stand-in
     ("2/29/2028", SNOHO("February 29, 2028"), True),
     ("9/18/2026 10:00", SNOHO("9/18/2026"), False),  # timestamps are not the grammar
+    # Scoped by provenance, never by a key name alone (Codex P1).
+    # A Snohomish trustee sale carries the tribune source AND nts_source: only the
+    # nts_source date counts, so a top-level auction_date cannot hide a notice date.
+    ("9/18/2026", {**SNOHO("9/18/2026"), **TRUSTEE("2026-10-09")}, False),
+    ("10/9/2026", {**SNOHO("9/18/2026"), **TRUSTEE("2026-10-09")}, True),
+    # Top-level auction_date from any other source is not a scraper stand-in.
+    ("9/18/2026", {"source": "pierce_arms", "auction_date": "9/18/2026"}, False),
+    ("9/18/2026", {"auction_date": "9/18/2026"}, False),
+    # nts_source that is not an object is no trustee contract; the tribune rule applies.
+    ("9/18/2026", {**SNOHO("9/18/2026"), "nts_source": None}, True),
+    ("9/18/2026", {**SNOHO("9/18/2026"), "nts_source": "2026-09-18"}, True),
+    ("9/18/2026", {"source": ["snohomish_tribune"], "auction_date": "9/18/2026"}, False),
 ]
+
+
+def test_snohomish_source_constant_matches_the_scraper():
+    from src.scrapers.snohomish_wa_pre_foreclosure import _SOURCE
+    from src.utils.source_dates import SNOHOMISH_TRIBUNE_SOURCE
+
+    assert SNOHOMISH_TRIBUNE_SOURCE == _SOURCE
 
 
 @pytest.mark.parametrize(("recorded", "enrichment", "expected"), VECTORS)

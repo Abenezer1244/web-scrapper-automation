@@ -66,16 +66,29 @@ def _parse_iso_date(value: Any) -> date | None:
     return _real_date(int(m[1]), int(m[2]), int(m[3]))
 
 
+# enrichment_data["source"] the Snohomish pre_foreclosure scraper stamps on its rows
+# (src/scrapers/snohomish_wa_pre_foreclosure._SOURCE; a test keeps them equal).
+SNOHOMISH_TRIBUNE_SOURCE = "snohomish_tribune"
+
+
 def origin_auction_date(enrichment_data: Any) -> date | None:
-    """The auction date the scraper itself recorded for this row, else None."""
+    """The auction date the scraper itself recorded for this row, else None.
+
+    Scoped by the provenance each scraper stamps, never by a key name alone (Codex):
+      - an ``nts_source`` object is the trustee_sale scraper's contract: only its ISO
+        auction_date counts. Snohomish trustee sales also carry the tribune ``source``
+        at the top level, so this is checked first;
+      - otherwise only a row stamped ``source == "snohomish_tribune"`` (the Snohomish
+        pre_foreclosure scraper) reads the top-level auction_date;
+      - anything else has no origin, so nothing can hide its date.
+    """
     if not isinstance(enrichment_data, dict):
         return None
-    top = parse_source_date(enrichment_data.get("auction_date"))
-    if top is not None:
-        return top
     nts_source = enrichment_data.get("nts_source")
     if isinstance(nts_source, dict):
         return _parse_iso_date(nts_source.get("auction_date"))
+    if enrichment_data.get("source") == SNOHOMISH_TRIBUNE_SOURCE:
+        return parse_source_date(enrichment_data.get("auction_date"))
     return None
 
 

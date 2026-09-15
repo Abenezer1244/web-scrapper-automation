@@ -1341,6 +1341,13 @@ class ResultRow(BaseModel):
         from datetime import UTC, datetime
 
         from src.utils.lead_signals import auction_reference_date, derive_signals
+        from src.utils.source_dates import is_auction_date_fallback
+        # Before the signals: freshness reads this flag, so it must never be set
+        # after them (Codex).
+        object.__setattr__(
+            self, "date_is_auction_date",
+            is_auction_date_fallback(self.date_recorded, self.enrichment_data),
+        )
         _now = datetime.now(UTC)
         # Two clocks on purpose: UTC for the tax signals (parity with the tax-filter
         # SQL), county-local for the auction countdown (a WA sale happens on the WA

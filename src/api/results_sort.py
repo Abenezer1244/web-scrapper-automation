@@ -34,6 +34,7 @@ from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects.postgresql import ARRAY
 
 from src.db.models import CountyRecord, Result
+from src.utils.source_dates import SNOHOMISH_TRIBUNE_SOURCE
 
 ResultsSort = Literal["date_desc", "date_asc"]
 DEFAULT_RESULTS_SORT: ResultsSort = "date_desc"
@@ -126,9 +127,18 @@ def _auction_date_fallback(date_recorded, enrichment_data):
     Same grammar as the Python rule: date_recorded is parsed here, not read from
     date_recorded_parsed, which only knows M/D/YYYY.
     """
-    origin = func.coalesce(
-        _text_date(enrichment_data["auction_date"].as_string()),
-        _iso_date(enrichment_data[("nts_source", "auction_date")].as_string()),
+    # Scoped by provenance exactly like source_dates.origin_auction_date: an
+    # nts_source OBJECT (trustee_sale) wins, else only a snohomish_tribune row.
+    origin = case(
+        (
+            func.json_typeof(enrichment_data["nts_source"]) == "object",
+            _iso_date(enrichment_data[("nts_source", "auction_date")].as_string()),
+        ),
+        (
+            enrichment_data["source"].as_string() == SNOHOMISH_TRIBUNE_SOURCE,
+            _text_date(enrichment_data["auction_date"].as_string()),
+        ),
+        else_=None,
     )
     # enrichment_data is json, not jsonb: every -> re-parses the whole document, and
     # the expression above reads it dozens of times. Both origin keys are named

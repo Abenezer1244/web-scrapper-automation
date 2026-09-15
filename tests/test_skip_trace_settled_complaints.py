@@ -1,7 +1,9 @@
 """Auto skip trace never pays for a code violation the city already settled.
 
 A complaint Seattle SDCI closed as "Completed", or filed as an "Open Duplicate" of
-another complaint, is not worth a paid Tracerfy lookup (owner decision 2026-09-13).
+another complaint, is not worth a paid Tracerfy lookup (owner decision 2026-09-13); nor
+is a King County Accela case voided or closed with no violation. The list is per source
+(src/scrapers/king_cv_sources.SETTLED_STATUSES), the same list the plan cap ranks by.
 Real DB and real Redis; nothing is sent to Tracerfy here, the enqueue only writes
 pending_skip_trace_rows.
 """
@@ -128,16 +130,17 @@ async def test_accela_voided_and_no_violation_cases_are_not_queued(db, business_
     bellevue_void = await _lead(db, business_user, job_id, "Void", "bellevue_code_enforcement")
     accela_completed = await _lead(db, business_user, job_id, "Completed", accela)
     burien_duplicate = await _lead(db, business_user, job_id, "Open Duplicate", "burien_code_enforcement")
-    # Any other source keeps the original any-source gate (Tacoma).
+    # Tacoma has no settled list (it reports "Open" / "Closed"): the plan cap ranks every
+    # Tacoma case as ordinary, so every Tacoma case is traced, whatever its status word.
     tacoma_completed = await _lead(db, business_user, job_id, "Completed", "tacoma_code_violations")
-    tacoma_open = await _lead(db, business_user, job_id, "Open", "tacoma_code_violations")
+    tacoma_closed = await _lead(db, business_user, job_id, "Closed", "tacoma_code_violations")
 
     _enqueue(job_id)
 
     queued = await _queued_for(db, job_id)
-    assert set(settled).isdisjoint(queued) and tacoma_completed not in queued
+    assert set(settled).isdisjoint(queued)
     assert {open_case, intake, bellevue_closed, burien_closed, bellevue_void, accela_completed,
-            burien_duplicate, tacoma_open} <= queued
+            burien_duplicate, tacoma_completed, tacoma_closed} <= queued
 
 
 def test_settled_check_never_raises_on_malformed_json():
@@ -147,7 +150,8 @@ def test_settled_check_never_raises_on_malformed_json():
     assert is_settled(["kingco_accela_code_enforcement"], "Void") is False
     assert is_settled("kingco_accela_code_enforcement", {"Void": 1}) is False
     assert _is_settled_complaint({"source": {"a": 1}, "status": "Void"}) is False
-    assert _is_settled_complaint({"source": ["x"], "status": "Completed"}) is True
+    assert _is_settled_complaint({"source": ["x"], "status": "Completed"}) is False
+    assert _is_settled_complaint({"source": "seattle_sdci_code_violations", "status": "Completed"}) is True
     assert _is_settled_complaint(["not", "a", "dict"]) is False
     with pytest.raises(ValueError):
         settled_sql("enrichment_data) OR (1=1")

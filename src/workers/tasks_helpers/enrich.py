@@ -31,22 +31,16 @@ _GIS_COMMIT_BATCH = 500
 # token inside the street (house numbers, road numbers).
 _TRAILING_ZIP_RE = re.compile(r"\b(\d{5})(?:-\d{4})?\s*$")
 
-# Code-violation statuses never sent to a paid skip trace on a source that is NOT a King
-# code-violation source (the original 2026-09-13 gate, which Tacoma rows still pass
-# through unchanged). A King source follows only its own list in
-# src/scrapers/king_cv_sources.SETTLED_STATUSES, the list the plan cap ranks by.
-SETTLED_COMPLAINT_STATUSES = frozenset({"Completed", "Open Duplicate"})
-
-
 def _is_settled_complaint(ed: object) -> bool:
-    from src.scrapers.king_cv_sources import SETTLED_STATUSES, is_settled
+    """A code-violation case its source settled: never sent to a paid skip trace.
 
-    if not isinstance(ed, dict) or not isinstance(ed.get("status"), str):
-        return False
-    source = ed.get("source")
-    if isinstance(source, str) and source in SETTLED_STATUSES:
-        return is_settled(source, ed["status"])
-    return ed["status"] in SETTLED_COMPLAINT_STATUSES
+    The one list is src/scrapers/king_cv_sources.SETTLED_STATUSES, the list the plan cap
+    ranks by, so a case the cap delivers as ordinary is traced like one. A source with no
+    list (Tacoma: "Open" / "Closed") has no settled cases.
+    """
+    from src.scrapers.king_cv_sources import is_settled
+
+    return isinstance(ed, dict) and is_settled(ed.get("source"), ed.get("status"))
 
 # King tax owner-name state, per lead, in enrichment_data. The owner name is the
 # field these leads lose most (eRealProperty is the only source, one page per

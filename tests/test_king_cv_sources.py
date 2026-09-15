@@ -507,6 +507,223 @@ async def test_every_source_failing_fails_the_scrape(monkeypatch, no_backoff):
     assert set(scraper.source_status.values()) == {"failed"}
 
 
+@pytest.fixture
+def source_alerts(db, monkeypatch):
+    """Every source-failure alert this test raised: the send_ops_alert calls (the real
+    function still runs) and the durable audit_events rows it wrote, removed afterwards."""
+    from src.workers import ops_alerts
+
+    since = datetime.now(UTC)
+    sent: list[tuple] = []
+    real = ops_alerts.send_ops_alert
+
+    def _send(*args):
+        sent.append(args)
+        return real(*args)
+
+    monkeypatch.setattr(ops_alerts, "send_ops_alert", _send)
+
+    async def rows() -> list[str]:
+        return list((await db.execute(text(
+            "SELECT path FROM audit_events WHERE event = 'ops_alert' AND path LIKE :p "
+            "AND created_at >= :since ORDER BY path"),
+            {"p": f"{kcv.SOURCE_FAILURE_ALERT_KIND}:%", "since": since})).scalars())
+
+    yield SimpleNamespace(sent=sent, rows=rows)
+    from src.db.session import system_sync_session
+
+    with system_sync_session() as s:
+        s.execute(text("DELETE FROM audit_events WHERE event = 'ops_alert' AND path LIKE :p "
+                       "AND created_at >= :since"),
+                  {"p": f"{kcv.SOURCE_FAILURE_ALERT_KIND}:%", "since": since})
+        s.commit()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_source_raises_one_ops_alert_naming_it_and_no_error_text(
+        monkeypatch, no_backoff, source_alerts):
+    _connector(monkeypatch, fail={"bellevue"})
+    await kcv.KingWACodeViolationScraper().scrape("08/01/2026", "09/14/2026")
+
+    assert len(source_alerts.sent) == 1
+    kind, key, subject, body = source_alerts.sent[0]
+    assert (kind, key, subject) == (kcv.SOURCE_FAILURE_ALERT_KIND, "bellevue_code_enforcement",
+                                    "King code violation source failed: Bellevue")
+    # The class, never the error text (the 503 retry message) or any scraped value.
+    assert "RuntimeError" in body and "08/01/2026 to 09/14/2026" in body
+    assert "503" not in body and "attempt" not in body
+    assert await source_alerts.rows() == [f"{kcv.SOURCE_FAILURE_ALERT_KIND}:bellevue_code_enforcement"]
+
+
+@pytest.mark.asyncio
+async def test_a_range_too_large_for_a_source_is_not_an_ops_alert(monkeypatch, no_backoff, source_alerts):
+    _connector(monkeypatch, fail={"accela_budget"})
+    await kcv.KingWACodeViolationScraper().scrape("08/01/2026", "09/14/2026")
+
+    assert source_alerts.sent == [] and await source_alerts.rows() == []
+
+
+@pytest.mark.asyncio
+async def test_every_failed_source_is_alerted_when_the_whole_scrape_fails(
+        monkeypatch, no_backoff, source_alerts):
+    _connector(monkeypatch, fail={"bellevue", "burien", "accela"}, sdci_fails=True)
+    with pytest.raises(RuntimeError, match="every source failed"):
+        await kcv.KingWACodeViolationScraper().scrape("08/01/2026", "09/14/2026")
+
+    keys = ["seattle_sdci_code_violations", "bellevue_code_enforcement", "burien_code_enforcement",
+            "kingco_accela_code_enforcement"]
+    assert [args[1] for args in source_alerts.sent] == keys
+    assert await source_alerts.rows() == sorted(f"{kcv.SOURCE_FAILURE_ALERT_KIND}:{k}" for k in keys)
+
+
+@pytest.mark.asyncio
+async def test_a_celery_time_limit_wrapped_by_a_retry_wrapper_is_the_jobs_deadline(
+        monkeypatch, no_backoff, source_alerts):
+    from celery.exceptions import SoftTimeLimitExceeded
+
+    _connector(monkeypatch)
+
+    def _deadline(*a, **kw):
+        raise SoftTimeLimitExceeded()
+
+    # base.arcgis_json catches it and re-raises "failed after N attempt(s)" as a RuntimeError.
+    monkeypatch.setattr(base, "safe_get", _deadline)
+    scraper = kcv.KingWACodeViolationScraper()
+    with pytest.raises(SoftTimeLimitExceeded):
+        await scraper.scrape("08/01/2026", "09/14/2026")
+
+    # Seattle finished; Bellevue hit the deadline, which is neither a failure nor an alert
+    # (its fallback to the other permit service must not absorb it either).
+    assert scraper.source_status == {"seattle_sdci_code_violations": "ok"}
+    assert source_alerts.sent == []
+
+    # The same for Seattle's own page-fetch retry loop.
+    monkeypatch.setattr(seattle_sdci, "safe_get", _deadline)
+    seattle_first = kcv.KingWACodeViolationScraper()
+    with pytest.raises(SoftTimeLimitExceeded):
+        await seattle_first.scrape("08/01/2026", "09/14/2026")
+    assert seattle_first.source_status == {} and source_alerts.sent == []
+
+
+def test_the_time_limit_is_found_anywhere_in_the_chain_without_looping():
+    from celery.exceptions import SoftTimeLimitExceeded, TimeLimitExceeded
+
+    deadline = SoftTimeLimitExceeded()
+    try:
+        try:
+            raise deadline
+        except SoftTimeLimitExceeded as inner:
+            raise RuntimeError("fetch failed after 3 attempt(s)") from inner
+    except RuntimeError as wrapped:
+        assert base.celery_time_limit(wrapped) is deadline
+    looped = RuntimeError("a")
+    other = ValueError("b")
+    looped.__cause__, other.__context__ = other, looped
+    assert base.celery_time_limit(looped) is None
+    assert base.celery_time_limit(TimeLimitExceeded()) is not None
+    assert base.celery_time_limit(RuntimeError("plain")) is None
+
+
+def test_a_slow_alert_holds_neither_the_scrape_nor_the_workers_asyncio_run(monkeypatch, no_backoff):
+    import threading
+    import time as _time
+
+    from src.workers import ops_alerts
+
+    release = threading.Event()
+    monkeypatch.setattr(ops_alerts, "send_ops_alert", lambda *a: release.wait(6))
+    monkeypatch.setattr(kcv, "_ALERT_WAIT_S", 0.2)
+    _connector(monkeypatch, fail={"bellevue"})
+    started = _time.monotonic()
+    try:
+        # The worker's shape (tasks.run_scrape_job): asyncio.run joins the default executor
+        # on exit, so an alert left running there would hold this call for the full 6 s.
+        recs = asyncio.run(kcv.KingWACodeViolationScraper().scrape("08/01/2026", "09/14/2026"))
+    finally:
+        release.set()
+    assert _time.monotonic() - started < 3
+    assert "bellevue_code_enforcement" not in {r.enrichment_data["source"] for r in recs}
+
+
+@pytest.mark.asyncio
+async def test_a_deadline_inside_the_progress_callback_is_the_jobs_deadline(monkeypatch, source_alerts):
+    from celery.exceptions import SoftTimeLimitExceeded
+
+    monkeypatch.setattr(burien, "_PAGE_SIZE", BUR_PAGED["page_size"])
+    monkeypatch.setattr(base, "safe_get", _ArcGIS(burien_pages=BUR_PAGED))
+    scraper = kcv.KingWACodeViolationScraper(sources=[burien.BurienSource()])
+
+    def _deadline(*_a):
+        raise SoftTimeLimitExceeded()
+
+    scraper.on_progress = _deadline
+    with pytest.raises(SoftTimeLimitExceeded):
+        await scraper.scrape("01/01/2026", "09/14/2026")
+    assert scraper.source_status == {} and source_alerts.sent == []
+
+
+def test_stuck_alerts_are_capped_and_the_scrape_still_ships(monkeypatch, no_backoff):
+    import threading
+
+    from src.workers import ops_alerts
+
+    release = threading.Event()
+    calls: list[str] = []
+
+    def _stuck(kind, key, *a):
+        calls.append(key)
+        release.wait(6)
+
+    monkeypatch.setattr(ops_alerts, "send_ops_alert", _stuck)
+    monkeypatch.setattr(kcv, "_ALERT_WAIT_S", 0.1)
+    monkeypatch.setattr(kcv, "_ALERT_THREADS", threading.BoundedSemaphore(2))
+    _connector(monkeypatch, fail={"bellevue", "burien", "accela"})
+    try:
+        recs = asyncio.run(kcv.KingWACodeViolationScraper().scrape("08/01/2026", "09/14/2026"))
+    finally:
+        release.set()
+    # Two alerts started and stuck; the third was refused, not queued behind them.
+    assert calls == ["bellevue_code_enforcement", "burien_code_enforcement"]
+    assert {r.enrichment_data["source"] for r in recs} == {"seattle_sdci_code_violations"}
+
+
+def test_a_deadline_on_either_branch_is_found_and_detached():
+    from celery.exceptions import SoftTimeLimitExceeded
+
+    deadline = SoftTimeLimitExceeded()
+    # The deadline hangs off the CONTEXT of a wrapper whose CAUSE is something else.
+    other = ValueError("unrelated cause")
+    wrapper = RuntimeError("fallback also failed")
+    wrapper.__cause__, wrapper.__context__ = other, deadline
+    assert base.celery_time_limit(wrapper) is deadline
+    with pytest.raises(SoftTimeLimitExceeded) as got:
+        base.raise_if_time_limit(wrapper)
+    assert got.value is deadline and wrapper.__context__ is None and wrapper.__cause__ is other
+
+
+def test_re_raising_a_wrapped_deadline_leaves_no_reference_cycle():
+    from celery.exceptions import SoftTimeLimitExceeded
+
+    deadline = SoftTimeLimitExceeded()
+    caught = None
+    try:
+        try:
+            try:
+                raise deadline
+            except SoftTimeLimitExceeded as inner:
+                raise RuntimeError("fetch failed after 3 attempt(s)") from inner
+        except RuntimeError as wrapped:
+            base.raise_if_time_limit(wrapped)
+    except SoftTimeLimitExceeded as got:
+        caught = got
+    assert caught is deadline
+    seen, node = set(), caught.__cause__ or caught.__context__
+    while node is not None:
+        assert node is not deadline and id(node) not in seen
+        seen.add(id(node))
+        node = node.__cause__ or node.__context__
+
+
 @pytest.mark.asyncio
 async def test_the_partial_failure_warning_reaches_the_job_log(
         db, business_user, redis_client, monkeypatch, no_backoff):
@@ -649,7 +866,7 @@ def test_owner_lookup_keys_parcel_sources_by_their_printed_pin():
     assert bur.party_name is None
 
 
-def test_printed_pin_parcels_are_asked_first_because_no_sweep_names_them_later():
+def test_printed_pin_parcels_the_ones_we_are_sure_of_are_asked_first():
     sdci = _parcel_row(parcel_id=None, enrichment_data={
         "source": "seattle_sdci_code_violations", "kc_pin": "9138100481", "kc_pin_status": "matched",
         "kc_pin_source": "king_gis_point_in_parcel", "kc_pin_match": "exact"})

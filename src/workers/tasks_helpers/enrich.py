@@ -31,8 +31,16 @@ _GIS_COMMIT_BATCH = 500
 # token inside the street (house numbers, road numbers).
 _TRAILING_ZIP_RE = re.compile(r"\b(\d{5})(?:-\d{4})?\s*$")
 
-# Seattle SDCI code-violation statuses that are never sent to a paid skip trace.
-SETTLED_COMPLAINT_STATUSES = frozenset({"Completed", "Open Duplicate"})
+def _is_settled_complaint(ed: object) -> bool:
+    """A code-violation case its source settled: never sent to a paid skip trace.
+
+    The one list is src/scrapers/king_cv_sources.SETTLED_STATUSES, the list the plan cap
+    ranks by, so a case the cap delivers as ordinary is traced like one. A source with no
+    list (Tacoma: "Open" / "Closed") has no settled cases.
+    """
+    from src.scrapers.king_cv_sources import is_settled
+
+    return isinstance(ed, dict) and is_settled(ed.get("source"), ed.get("status"))
 
 # King tax owner-name state, per lead, in enrichment_data. The owner name is the
 # field these leads lose most (eRealProperty is the only source, one page per
@@ -1034,9 +1042,9 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
         # names the owner through the same owner-only eRealProperty path King tax uses:
         # lease-guarded, paced, breaker-protected, and it drops any page the county served
         # for a different parcel. The tax-only owner pass below never runs for this job;
-        # this takes its 300 s slot in the budget sum. SDCI rows not reached keep no owner
-        # and are named later by the beat sweep src/workers/cv_owner_recovery.py, which
-        # selects SDCI rows only, so printed-PIN parcels are asked first.
+        # this takes its 300 s slot in the budget sum. Rows not reached keep no owner and
+        # are named later by the beat sweep src/workers/cv_owner_recovery.py; printed-PIN
+        # parcels, the ones we are sure of, are asked first.
         from src.scrapers.enrichment.king_parcel_locate import (
             apply_owner_names,
             owner_lookup_pins,
@@ -2000,21 +2008,17 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config) -> None:
 
     # A code-violation complaint the city already closed as Completed, or filed as a
     # duplicate of another complaint, is not a lead worth a paid lookup (owner decision
-    # 2026-09-13). Exact SDCI status values; "Closed" is deliberately still traced.
+    # 2026-09-13). Exact status values; "Closed" is deliberately still traced. A King County
+    # Accela case voided or closed with no violation is settled the same way.
     if config.record_type == "code_violation":
-        settled_rows = [
-            rec for rec in eligible
-            if isinstance(rec.enrichment_data, dict)
-            and isinstance(rec.enrichment_data.get("status"), str)
-            and rec.enrichment_data["status"] in SETTLED_COMPLAINT_STATUSES
-        ]
+        settled_rows = [rec for rec in eligible if _is_settled_complaint(rec.enrichment_data)]
         if settled_rows:
             _settled_ids = {rec.id for rec in settled_rows}
             eligible = [rec for rec in eligible if rec.id not in _settled_ids]
             _publish_log(
                 r, job_id, "info",
                 f"Skip trace skipped for {len(settled_rows)} code violation lead(s) whose "
-                "complaint is already completed or is a duplicate",
+                "case the city already settled (completed, duplicate, voided or no violation)",
                 db=db,
             )
 

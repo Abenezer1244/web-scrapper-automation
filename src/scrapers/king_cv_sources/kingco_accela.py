@@ -67,6 +67,7 @@ from src.scrapers.king_cv_sources.base import (
     CodeViolationSource,
     DateRangeTooLargeError,
     normalize_king_pin,
+    raise_if_time_limit,
 )
 from src.utils.logger import setup_logger
 
@@ -454,6 +455,7 @@ async def wait_or_wall(get_page, waiting):
     try:
         return await waiting
     except Exception as exc:
+        raise_if_time_limit(exc)
         page = get_page()
         try:
             snap = PageSnapshot(url=page.url, html=await page.content())
@@ -593,8 +595,7 @@ class KingCountyAccelaSource(CodeViolationSource):
             except _NOT_RETRYABLE:
                 raise
             except Exception as exc:
-                if type(exc).__name__ in ("SoftTimeLimitExceeded", "TimeLimitExceeded"):
-                    raise
+                raise_if_time_limit(exc)
                 last_exc = exc
                 if attempt >= settings.MAX_RETRIES:
                     break

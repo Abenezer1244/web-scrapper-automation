@@ -1,10 +1,11 @@
-"""Background owner names for King (Seattle SDCI) code-violation leads.
+"""Background owner names for King code-violation leads (Seattle, Bellevue, Burien, Accela).
 
-A King code-violation job names owners of located parcels inside a 240 s budget;
-rows it did not reach stayed unnamed forever. This sweep is the second look.
+A King code-violation job names owners inside a 240 s budget; rows it did not reach
+stayed unnamed forever. This sweep is the second look.
 
-Contract pinned here: delivered leads only, located at a SHOWN tier (exact or
-street_only, the same rule as src/utils/located_parcel.py), one lookup per parcel;
+Contract pinned here: delivered leads only, on a parcel we can prove (SDCI located at a
+SHOWN tier, the same rule as src/utils/located_parcel.py; Bellevue, Burien and King County
+Accela by the parcel_id they printed, never a kc_pin), one lookup per parcel;
 a name is filled only onto a row that is still blank, still on the same parcel and
 still delivered; parcel_id, dedup_hash, property_key, mailing, skip trace, billing
 and quota never move; an attempt is charged only when King was actually asked; the
@@ -255,26 +256,98 @@ async def test_leads_that_are_not_eligible_are_never_looked_up_or_written(
         assert (await _get(db, rid)).enrichment_data == before[rid]
 
 
-async def test_rows_from_sources_that_print_the_parcel_are_never_named_by_the_sweep(
+def _printed(source: str, case: str, **extra) -> dict:
+    return {"source": source, "case_number": case, "status": "Open", **extra}
+
+
+async def _printed_row(db, user: User, job_id: str, *, source: str, parcel_id: str | None,
+                       ed_extra: dict | None = None, party: str | None = None) -> str:
+    rid = await _row(db, user, job_id, pin=parcel_id or "0000000000", party=party,
+                     ed=_printed(source, f"CASE-{uuid.uuid4().hex[:6]}", **(ed_extra or {})))
+    await db.execute(text("UPDATE results SET parcel_id = :p WHERE id = :i"),
+                     {"p": parcel_id, "i": rid})
+    await db.commit()
+    return rid
+
+
+async def test_printed_pin_leads_are_named_for_their_parcel_id_and_nothing_else_moves(
     db, business_user, monkeypatch,
 ):
-    # Bellevue, Burien and King County Accela rows carry the printed PIN in parcel_id, and
-    # skip trace trusts their owner only when owner_pin equals that parcel_id. The sweep
-    # keys on kc_pin, so it must never write an owner onto them, even one whose kc_pin
-    # block looks located (e.g. a row that arrived without a parcel but with coordinates).
+    # Bellevue, Burien and King County Accela print the King PIN into parcel_id at scrape.
+    # Their owner is looked up for that parcel_id, and owner_pin is that parcel_id: the
+    # proof skip trace requires. A located kc_pin block on such a row is never read.
     from src.scrapers.king_cv_sources import PARCEL_AT_SCRAPE_SOURCES
 
     _lease(monkeypatch)
+    job_id = await _job(db, business_user)
+    rows = {}
+    answers = {}
+    for n, source in enumerate(sorted(PARCEL_AT_SCRAPE_SOURCES)):
+        pin, decoy = f"30000000{n:02d}", f"39000000{n:02d}"
+        rows[source] = (pin, await _printed_row(
+            db, business_user, job_id, source=source, parcel_id=pin,
+            ed_extra={"kc_pin": decoy, "kc_pin_status": "matched",
+                      "kc_pin_source": "king_gis_point_in_parcel", "kc_pin_match": "exact"}))
+        answers[pin] = _Resp(200, _page(pin, f"OWNER {n} LLC"))
+    asked = _county(monkeypatch, answers)
+    before = {rid: await _get(db, rid) for _, rid in rows.values()}
+
+    stats = await asyncio.to_thread(_tick)
+
+    assert sorted(asked) == sorted(answers) and stats["found"] == len(rows)
+    for n, source in enumerate(sorted(PARCEL_AT_SCRAPE_SOURCES)):
+        pin, rid = rows[source]
+        row = await _get(db, rid)
+        assert row.party_name == f"OWNER {n} LLC"
+        ed = row.enrichment_data
+        assert (ed["owner_source"], ed["owner_pin"]) == ("king_erealproperty", pin)
+        assert ed["cv_owner_recovery_outcome"] == "found"
+        old = before[rid]
+        assert (row.parcel_id, row.dedup_hash, row.property_key, row.mailing_address,
+                row.skip_trace_status, row.phone) == (
+            old.parcel_id, old.dedup_hash, old.property_key, old.mailing_address,
+            old.skip_trace_status, old.phone)
+
+
+async def test_the_named_printed_pin_lead_passes_the_skip_trace_owner_proof(db, business_user, monkeypatch):
+    from types import SimpleNamespace
+
+    from src.scrapers.enrichment.skip_trace import code_violation_owner_is_known
+
+    _lease(monkeypatch)
+    job_id = await _job(db, business_user)
+    rid = await _printed_row(db, business_user, job_id, source="burien_code_enforcement",
+                             parcel_id="7835800148")
+    _county(monkeypatch, {"7835800148": _Resp(200, _page("7835800148", "OVERLOOK AT BURIEN LLC"))})
+
+    await asyncio.to_thread(_tick)
+
+    row = await _get(db, rid)
+    assert code_violation_owner_is_known(SimpleNamespace(
+        party_name=row.party_name, parcel_id=row.parcel_id, enrichment_data=row.enrichment_data))
+
+
+async def test_printed_pin_leads_without_a_provable_parcel_are_never_looked_up(
+    db, business_user, monkeypatch,
+):
+    _lease(monkeypatch)
     asked = _county(monkeypatch, {})
     job_id = await _job(db, business_user)
-    ids = []
-    for n, source in enumerate(sorted(PARCEL_AT_SCRAPE_SOURCES)):
-        pin = f"20000000{n:02d}"
-        rid = await _row(db, business_user, job_id, pin=pin, ed={**_located(pin), "source": source})
-        await db.execute(text("UPDATE results SET parcel_id = :p WHERE id = :i"),
-                         {"p": pin, "i": rid})
-        ids.append(rid)
-    await db.commit()
+    bellevue = "bellevue_code_enforcement"
+    ids = [
+        await _printed_row(db, business_user, job_id, source=bellevue, parcel_id=None,
+                           ed_extra={"kc_pin": "4000000001", "kc_pin_status": "matched",
+                                     "kc_pin_source": "king_gis_point_in_parcel",
+                                     "kc_pin_match": "exact"}),
+        await _printed_row(db, business_user, job_id, source=bellevue, parcel_id="400000002"),
+        await _printed_row(db, business_user, job_id, source=bellevue, parcel_id="40000-00003"),
+        await _printed_row(db, business_user, job_id, source=bellevue, parcel_id="4000000004",
+                           ed_extra={"owner_pin": "4000000099"}),
+        await _printed_row(db, business_user, job_id, source=bellevue, parcel_id="4000000005",
+                           party="ALREADY NAMED"),
+        await _printed_row(db, business_user, job_id, source=bellevue, parcel_id="4000000006",
+                           ed_extra={"owner_source": "king_erealproperty"}),
+    ]
     before = {rid: tuple(await _get(db, rid)) for rid in ids}
 
     stats = await asyncio.to_thread(_tick)
@@ -282,6 +355,42 @@ async def test_rows_from_sources_that_print_the_parcel_are_never_named_by_the_sw
     assert asked == [] and stats["parcels"] == 0
     for rid in ids:
         assert tuple(await _get(db, rid)) == before[rid]
+
+
+async def test_a_printed_pin_lead_whose_parcel_changed_during_the_lookup_is_left_alone(
+    db, business_user, monkeypatch,
+):
+    from types import SimpleNamespace
+
+    from src.db.session import system_sync_session
+
+    _lease(monkeypatch)
+    job_id = await _job(db, business_user)
+    rid = await _printed_row(db, business_user, job_id, source="kingco_accela_code_enforcement",
+                             parcel_id="5000000001")
+
+    def _get_and_reparcel(url, **_k):
+        with system_sync_session() as sdb:
+            sdb.execute(text("UPDATE results SET parcel_id = '5000000099' WHERE id = :i"), {"i": rid})
+            sdb.commit()
+        return _Resp(200, _page(url.rsplit("=", 1)[-1], "STALE ANSWER"))
+
+    monkeypatch.setattr(kca, "safe_get", _get_and_reparcel)
+    stats = await asyncio.to_thread(_tick)
+
+    row = await _get(db, rid)
+    assert row.party_name is None and "owner_source" not in row.enrichment_data
+    assert stats["stale"] == 1 and stats["found"] == 0
+
+    # The Python rule refuses the same write on its own: the row's parcel_id is not the PIN.
+    stale = SimpleNamespace(id=rid, user_id=business_user.id, pin="5000000001",
+                            parcel_id="5000000099", enrichment_data=row.enrichment_data)
+
+    def _go():
+        with system_sync_session() as sdb:
+            return cvr._write(sdb, stale, "found", "SOMEONE")
+
+    assert await asyncio.to_thread(_go) == "stale"
 
 
 async def test_a_blank_party_name_is_treated_as_unnamed(db, business_user, monkeypatch):
@@ -518,6 +627,69 @@ async def test_two_cases_on_one_parcel_share_one_lookup_newest_first(
     assert (await _get(db, new_a)).party_name == "SHARED OWNER"
     assert (await _get(db, new_b)).party_name == "SHARED OWNER"
     assert (await _get(db, old)).party_name is None
+
+
+async def test_an_sdci_lead_and_a_printed_pin_lead_on_one_parcel_share_one_lookup(
+    db, business_user, monkeypatch,
+):
+    _lease(monkeypatch)
+    job_id = await _job(db, business_user)
+    sdci = await _row(db, business_user, job_id, pin="6000000001")
+    bellevue = await _printed_row(db, business_user, job_id, source="bellevue_code_enforcement",
+                                  parcel_id="6000000001")
+    asked = _county(monkeypatch, {"6000000001": _Resp(200, _page("6000000001", "ONE OWNER LLC"))})
+
+    stats = await asyncio.to_thread(_tick)
+
+    assert asked == ["6000000001"] and stats["parcels"] == 1 and stats["rows"] == 2
+    assert stats["found"] == 2
+    for rid in (sdci, bellevue):
+        row = await _get(db, rid)
+        assert row.party_name == "ONE OWNER LLC" and row.enrichment_data["owner_pin"] == "6000000001"
+    assert (await _get(db, sdci)).parcel_id is None
+    assert (await _get(db, bellevue)).parcel_id == "6000000001"
+
+
+async def test_a_padded_printed_parcel_is_not_provable_and_never_looked_up(
+    db, business_user, monkeypatch,
+):
+    # Adapters store the normalized PIN; a padded value (a hand edit, a future adapter bug)
+    # fails closed here exactly as skip trace's owner proof would.
+    _lease(monkeypatch)
+    asked = _county(monkeypatch, {})
+    job_id = await _job(db, business_user)
+    rid = await _printed_row(db, business_user, job_id, source="burien_code_enforcement",
+                             parcel_id=" 7000000001")
+    before = tuple(await _get(db, rid))
+
+    stats = await asyncio.to_thread(_tick)
+
+    assert asked == [] and stats["parcels"] == 0 and tuple(await _get(db, rid)) == before
+
+
+@pytest.mark.parametrize("step", ["acquire", "renew", "release"])
+async def test_a_celery_time_limit_in_the_lock_is_not_swallowed(monkeypatch, step):
+    from celery.exceptions import SoftTimeLimitExceeded
+
+    class _Client:
+        def set(self, *a, **k):
+            raise SoftTimeLimitExceeded()
+
+        def eval(self, *a, **k):
+            raise SoftTimeLimitExceeded()
+
+    if step == "acquire":
+        import redis as sync_redis
+
+        monkeypatch.setattr(sync_redis, "from_url", lambda *a, **k: _Client())
+        with pytest.raises(SoftTimeLimitExceeded):
+            cvr._acquire_lock()
+    elif step == "renew":
+        with pytest.raises(SoftTimeLimitExceeded):
+            cvr._renew_lock((_Client(), "token"))
+    else:
+        with pytest.raises(SoftTimeLimitExceeded):
+            cvr._release_lock((_Client(), "token"))
 
 
 async def test_the_kill_switch_the_lock_and_a_cooling_source_stop_it_before_any_request(

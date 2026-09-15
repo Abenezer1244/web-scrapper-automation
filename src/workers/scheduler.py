@@ -279,9 +279,9 @@ app.conf.beat_schedule = {
         "schedule": crontab(minute="5-59/15"),  # every 15 minutes from :05
     },
     "recover-code-violation-owners": {
-        # Names delivered King (Seattle SDCI) code-violation leads located on a
-        # shown parcel (exact or street-level) that the job's 240 s owner pass did
-        # not reach. Bounded (120 parcels, 300 s), gated on source health and
+        # Names delivered King code-violation leads the job's 240 s owner pass did
+        # not reach: Seattle SDCI leads located on a shown parcel, and Bellevue,
+        # Burien and King County Accela leads by the parcel_id they printed. Bounded (120 parcels, 300 s), gated on source health and
         # OWNER_RECOVERY_ENABLED, shares the King source lease with every other
         # eRealProperty pass. Never bills, never creates a job, never enqueues a
         # skip trace. At least 2 minutes from every other King sweep's start

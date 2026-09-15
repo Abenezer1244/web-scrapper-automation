@@ -47,6 +47,54 @@ LABEL_MAX = 120
 _PIN_SEPARATORS = re.compile(r"[\s\-]")
 
 
+_CELERY_TIME_LIMITS = ("SoftTimeLimitExceeded", "TimeLimitExceeded")
+
+
+def _chain(exc: BaseException) -> list[BaseException]:
+    """Every exception reachable from ``exc`` through __cause__ AND __context__, once each."""
+    seen: set[int] = set()
+    found: list[BaseException] = []
+    stack: list[BaseException] = [exc]
+    while stack:
+        node = stack.pop()
+        if id(node) in seen:
+            continue
+        seen.add(id(node))
+        found.append(node)
+        stack.extend(n for n in (node.__context__, node.__cause__) if n is not None)
+    return found
+
+
+def celery_time_limit(exc: BaseException) -> BaseException | None:
+    """The Celery time limit anywhere in ``exc``'s cause/context graph, else None.
+
+    Matched by class name so this package never imports Celery. A time limit is the job's
+    deadline, never a source failure, so no retry loop or fallback may absorb it.
+    """
+    return next((n for n in _chain(exc) if type(n).__name__ in _CELERY_TIME_LIMITS), None)
+
+
+def raise_if_time_limit(exc: BaseException) -> None:
+    """Re-raise the Celery time limit in ``exc``'s chain. Call first in every catch-all.
+
+    Every wrapper that links to the deadline is detached from it first: raising the deadline
+    inside the wrapper's handler makes the wrapper its __context__, and a wrapper still
+    pointing back at the deadline would close a reference cycle.
+    """
+    deadline = celery_time_limit(exc)
+    if deadline is None:
+        return
+    if deadline is not exc:
+        for node in _chain(exc):
+            if node is deadline:
+                continue
+            if node.__cause__ is deadline:
+                node.__cause__ = None
+            if node.__context__ is deadline:
+                node.__context__ = None
+    raise deadline
+
+
 class DateRangeTooLargeError(RuntimeError):
     """The date range holds more than one run of this source can collect.
 
@@ -117,6 +165,7 @@ def get_json_with_retries(url: str, params: dict, *, what: str, require_features
                     f"{what}: ArcGIS returned an error or malformed body: {err or str(data)[:160]}")
             return data
         except Exception as exc:
+            raise_if_time_limit(exc)
             last_exc = exc
             if attempt >= settings.MAX_RETRIES or not is_retryable(exc):
                 break

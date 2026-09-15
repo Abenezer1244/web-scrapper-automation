@@ -26,7 +26,8 @@ An OWNER-NAME FILL and nothing else, on the same boundary as owner_recovery.py:
 
 WHICH LEADS
 -----------
-Delivered leads only: non-duplicate rows the plan cap did not mark over quota.
+Delivered leads only: non-duplicate rows the plan cap did not mark over quota,
+with a usable property or mailing address (src/api/lead_actionability.py).
 One lookup per PARCEL (two cases on one parcel share it): fewest attempts first,
 then the longest since last tried, then the newest case.
 
@@ -47,6 +48,7 @@ from datetime import UTC, datetime
 
 from sqlalchemy import text as sa_text
 
+from src.api.lead_actionability import actionable_sql
 from src.config import settings
 from src.utils.located_parcel import located_parcel_id
 from src.utils.logger import setup_logger
@@ -93,7 +95,8 @@ _ELIGIBLE_ROW = """
   AND (CASE WHEN r.enrichment_data::jsonb->>'cv_owner_recovery_attempts' ~ '^[0-9]{1,6}$'
             THEN (r.enrichment_data::jsonb->>'cv_owner_recovery_attempts')::int ELSE 0 END)
       < :max_attempts
-"""
+""" + f"""  AND {actionable_sql("r")}
+"""  # a row with no usable address is not a lead: never shown, exported or billed
 
 _KING_CV_JOB = """
       j.status = 'done'

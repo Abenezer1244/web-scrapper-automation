@@ -574,6 +574,28 @@ async def test_a_row_whose_tenant_differs_from_its_job_is_never_touched(
     assert "cv_owner_recovery_last_at" not in (await _get(db, rid)).enrichment_data
 
 
+async def test_a_lead_with_no_usable_address_is_not_delivered_and_never_looked_up(
+    db, business_user, monkeypatch,
+):
+    _lease(monkeypatch)
+    asked = _county(monkeypatch, {})
+    job_id = await _job(db, business_user)
+    ids = []
+    for pin, prop in (("1000000141", None), ("1000000142", "  "),
+                      ("1000000143", "(enrichment unavailable)")):
+        rid = await _row(db, business_user, job_id, pin=pin)
+        await db.execute(text("UPDATE results SET property_address = :p, mailing_address = :p "
+                              "WHERE id = :i"), {"p": prop, "i": rid})
+        await db.commit()
+        ids.append(rid)
+
+    stats = await asyncio.to_thread(_tick)
+
+    assert asked == [] and stats["parcels"] == 0
+    for rid in ids:
+        assert "cv_owner_recovery_last_at" not in (await _get(db, rid)).enrichment_data
+
+
 async def test_a_whitespace_only_party_name_is_unnamed(db, business_user, monkeypatch):
     _lease(monkeypatch)
     job_id = await _job(db, business_user)

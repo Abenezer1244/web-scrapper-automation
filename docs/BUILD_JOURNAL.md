@@ -19,6 +19,50 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-15 - King tax property repair applied (3,006 rows), and the beat sweeps deploys were starving
+
+**Built / Shipped:** PR #310 `9f8f7cc` (merged): every beat entry of 10 min or slower is a wall-clock
+crontab (mailing `3-59/10`, owners `5-59/15`, property `7-59/20`, the 5 hourly entries at
+:17/:25/:39/:41/:57) plus `tests/test_beat_schedule.py` (replays the real boots with a controlled clock).
+Production repair for King tax_delinquent via `scripts/repair_king_property_situs.py` decisions, run through
+a local guarded harness: 12,306 candidates on 7 jobs, **3,006 written** (2,977 condo units, 29 GIS), 0
+refused by the write guard, 0 problems. Per job: 68d83263 1,868; b2c2cd68 1,014; b2f2ecd5 64; 960abfdf 43;
+33de90c8 15; 230a1d0f 2; f841a279 0. Re-run finds 0 fills. Billing (`billing_applied_at` all from the
+original runs), dedup, party names and skip trace untouched.
+
+**Tried / Decided:** Beat's schedule file is not on a volume, so each deploy restarts every interval entry
+from zero. Chose crontabs over celery-redbeat (new dependency; redis is pinned under kombu's cap) and over a
+Railway volume (infra, not code). Entries under 10 min stay intervals: a deploy costs one short period and
+aligned marks would bunch the paid and dispatch sweeps. The harness gated on the exact reviewed
+`{result_id: address}` map (not just a count), fsynced a before-image of all candidates, set
+lock_timeout 5 s / statement_timeout 30 s, and compared an after-image even on a crash.
+
+**Failed / Blocked:** the first production apply attempt was blocked by the permission classifier; run after
+the owner's explicit "proceed and complete". Local full suite: 2 `test_rls_isolation.py` failures
+(`permission denied for table results`) that also fail on untouched main after recreating the test DB (the
+restricted role's grants go with the dropped DB); CI passed them.
+
+**Caught & fixed:** Codex round 1 on the harness: a guarded no-op would exit 0, a mid-run crash skipped the
+after-image, a count-only gate, incomplete column checks, unasserted missing rows, no fsync. Round 2:
+duplicate ids could collapse the gate. All adopted. My own: the check compared city with Python truthiness
+while the SQL COALESCE keeps `''`. Codex diff review of #310: no P1/P2; P3 comment date fixed.
+Disproved with evidence: owner flags "overwriting truth" (every writer derives them from property + mailing
+via `compute_owner_flags`; these rows had an empty property); stale whole-column `enrichment_data` writers
+(owner/mailing sweeps and requeue scripts merge in SQL); two beat containers double-firing (Railway logs:
+the old beat stops 39-50 s before the new one starts).
+
+**Pending / Handoff:** 9,300 tax rows stay empty by design (7,366 no GIS street and not a condo unit, likely
+vacant land, unverified; 1,576 condo units with no site address in the extract; 358 without a confirmable
+city). Results page check of prefc job 85692303 needs the owner's session. The code-violation session adds
+`recover-code-violation-owners` at `18-59/20` and must add it to `_KING_SWEEPS`.
+
+**Facts learned:** Fresh Celery interval entries wait a full period (1200 s probe), crontabs fire at the
+next mark. On 2026-09-15 beat booted at 00:59, 01:12, 01:20, 01:29 UTC; the property sweep's first-ever tick
+was 01:49:32 (0 parcels, 6.6 s). Evidence: `C:/Users/Windows/kp_data/tax_apply/` (decisions, before, after,
+report).
+
+---
+
 ## 2026-09-14 - Results page: dates sorted across the whole result set, not insertion order
 
 **Built / Shipped (branch `fix/results-date-sort` in both repos, NOT pushed):** `src/api/results_sort.py` orders

@@ -14,9 +14,11 @@ tax_delinquent dry run (12,306 candidates / 7 jobs: fill_condo 2,977, fill_gis 2
 
 ## Plan
 - [x] A0 Codex consult on A + B (inline prompt, no repo access); reconcile (see Codex reconciliation)
-- [ ] A1 Tax repair apply via guarded harness `kp_data/tax_apply_guarded.py` (count gate, before/after
-      images, lock_timeout 5 s); peers told (no collision). `--dry` run: 12,306 / 3,006 fills, clean.
-- [ ] A2 Verify: re-run dry run writes 0 fills; per-job property counts before/after; billing untouched
+- [x] A1 Tax repair apply via guarded harness `kp_data/tax_apply_guarded.py` (exact reviewed-map gate,
+      fsynced before/after images, lock_timeout 5 s); peers told (no collision). Applied after the owner's
+      "proceed and complete": 3,006 written, 0 refused, 0 problems.
+- [x] A2 Verify: merged script re-run finds 0 fills (9,300 unresolved); repaired rows per job equal the
+      decisions; every job's billing_applied_at predates the repair
 - [x] B1 Beat: interval entries >= 10 min -> wall-clock crontab, staggered (mailing 3-59/10, owners
       5-59/15, property 7-59/20, min 2 min apart; hourly at :17/:25/:39/:41/:57); comments say why
 - [x] B2 `tests/test_beat_schedule.py` (14): no slow interval, fresh boot runs within its step, replay of
@@ -32,8 +34,17 @@ tax_delinquent dry run (12,306 candidates / 7 jobs: fill_condo 2,977, fill_gis 2
 - Not changed: lease oversubscription (rates unchanged, pre-existing; empty ticks exit fast); 300 s
   entries stay intervals (a deploy costs one short period; aligning marks bunches paid dispatch).
 - Prod: first-ever `recover_deferred_property` tick 01:49:32 UTC succeeded, 0 parcels.
-- [ ] B3 ruff + targeted tests + full suite; Codex diff review; PR
-- [ ] B4 After deploy: confirm a `recover_deferred_property` tick succeeds in worker logs
+
+## Plan (continued)
+- [x] B3 ruff clean; full suite 3,555 passed (2 RLS failures reproduce on untouched main after a test-DB
+      recreate; CI green); Codex diff review no P1/P2; PR #310 merged `9f8f7cc`
+- [x] B4 After the #310 deploy (beat boot 02:29:57 UTC): mailing sent 02:33 + 02:43, owners 02:35 + 02:50,
+      property 02:47; all succeeded in the worker (property 0 parcels; mailing 1 row unreached, rotated)
+
+## Review
+- Shipped #310 (beat crontabs) and applied the King tax property repair (3,006 rows). Harness gates
+  came from two Codex rounds; three Codex claims were disproved with code or log evidence.
+- Left by design: 9,300 tax rows with no permitted address source. Owner-session UI check still open.
 
 # King pre-foreclosure data quality: job 85692303 (2026-09-14)
 

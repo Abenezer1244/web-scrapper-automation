@@ -278,6 +278,17 @@ app.conf.beat_schedule = {
         "task": "src.workers.owner_recovery.recover_deferred_owners",
         "schedule": crontab(minute="5-59/15"),  # every 15 minutes from :05
     },
+    "recover-code-violation-owners": {
+        # Names delivered King (Seattle SDCI) code-violation leads located on a
+        # shown parcel (exact or street-level) that the job's 240 s owner pass did
+        # not reach. Bounded (120 parcels, 300 s), gated on source health and
+        # OWNER_RECOVERY_ENABLED, shares the King source lease with every other
+        # eRealProperty pass. Never bills, never creates a job, never enqueues a
+        # skip trace. At least 2 minutes from every other King sweep's start
+        # (tests/test_beat_schedule.py).
+        "task": "src.workers.cv_owner_recovery.recover_code_violation_owners_task",
+        "schedule": crontab(minute="18-59/20"),  # :18, :38, :58 every hour
+    },
     "recover-deferred-property": {
         # The reading half of `property_lookup_deferred`: fills King property
         # addresses a job could not look up (condo unit extract first, then the

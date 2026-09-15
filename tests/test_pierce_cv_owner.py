@@ -859,6 +859,11 @@ async def test_repair_replaces_only_the_old_label_and_converges(
     # The label matches its case, but the stored parcel is not the parcel the case names.
     moved, _ = await _stored(db, business_user, job_id, party="Nuisance - 2117 AVE S",
                              parcel="2021110134")
+    # Scrape-time provenance says another parcel: the source now agrees with parcel_id, but
+    # the row moved after scrape, so it is never named (Codex r10).
+    provenance, _ = await _stored(db, business_user, job_id, party="Nuisance - 2117 AVE S",
+                                  ed={"source": "tacoma_code_violations", "case_number": "60000303996",
+                                      "source_parcel": "2021110199"})
     # Already decided by the live pass: gets its category, is never re-asked.
     decided, _ = await _stored(db, business_user, job_id, party=None, address="2119 AVE S",
                                ed={"source": "tacoma_code_violations", "case_number": "60000303996",
@@ -887,16 +892,18 @@ async def test_repair_replaces_only_the_old_label_and_converges(
                            report=tmp_path / "ev.jsonl", source_pace_s=0)
 
     dry = await asyncio.to_thread(_run, False)
-    assert dry["candidates"] == 5 and "writes" not in dry and portal.requests == []
+    assert dry["candidates"] == 6 and "writes" not in dry and portal.requests == []
     assert "casenumber IN (" in layer_calls[0]
     stats = await asyncio.to_thread(_run, True)
-    assert stats["writes"] == {"written": 5, "skipped_by_write_guard": 0}
+    assert stats["writes"] == {"written": 6, "skipped_by_write_guard": 0}
     assert sorted(portal.requests) == ["2006120010", "2021110133"]   # never 2021110134
-    assert stats["named"] == 1 and stats["label_cleared_no_owner"] == 2
+    assert stats["named"] == 1 and stats["label_cleared_no_owner"] == 3
     assert stats["party_name_not_the_label_left_alone"] == 1
-    assert stats["parcel_differs_from_source_no_owner"] == 1
+    assert stats["parcel_differs_from_source_no_owner"] == 2
 
-    got = await _fetch_rows(db, [label, cleared, foreign, live, decided, moved])
+    got = await _fetch_rows(db, [label, cleared, foreign, live, decided, moved, provenance])
+    assert got[provenance].party_name is None
+    assert "owner_source" not in got[provenance].enrichment_data
     assert got[decided].enrichment_data["violation_category"] == "Nuisance"
     assert got[decided].enrichment_data["owner_status"] == "address_mismatch"
     assert got[decided].party_name is None

@@ -91,6 +91,9 @@ _UPDATE_SQL = """
       AND enrichment_data::jsonb->>'source' = :source
       AND NOT (enrichment_data::jsonb ? 'owner_source')
       AND (NOT CAST(:writes_owner_status AS boolean)
+           OR NOT (enrichment_data::jsonb ? 'source_parcel')
+           OR enrichment_data::jsonb->>'source_parcel' = btrim(parcel_id))
+      AND (NOT CAST(:writes_owner_status AS boolean)
            OR NOT (enrichment_data::jsonb ? 'owner_status'))
       AND EXISTS (
         SELECT 1 FROM jobs j JOIN scraper_configs sc ON sc.id = j.scraper_config_id
@@ -190,7 +193,10 @@ def run(db, *, apply_writes: bool, owners: bool, retry_owners: bool = False,
         parcel = normalize_parcel(r.parcel_id)
         # The owner is looked up only for the parcel the Tacoma case itself names: a row
         # whose stored parcel no longer matches its source case is never named (Codex r5).
-        same_parcel = parcel is not None and normalize_parcel(raw.get("parcelnumber")) == parcel
+        same_parcel = (parcel is not None and normalize_parcel(raw.get("parcelnumber")) == parcel
+                       # A row that recorded its scrape-time parcel must still be on it
+                       # (Codex r10); only legacy rows without the key rely on the source.
+                       and ("source_parcel" not in r.ed or r.ed.get("source_parcel") == parcel))
         if (is_label or unnamed) and not same_parcel:
             counts["parcel_differs_from_source_no_owner"] += 1
         # A row the live pass or sweep already decided (owner_status present) still gets

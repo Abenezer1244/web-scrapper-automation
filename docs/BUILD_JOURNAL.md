@@ -19,6 +19,36 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-14 - Results page: dates sorted across the whole result set, not insertion order
+
+**Built / Shipped (branch `fix/results-date-sort` in both repos, NOT pushed):** `src/api/results_sort.py` orders
+GET /jobs/{id}/results by the first column's value before OFFSET/LIMIT: `delinquent_bill_year` for tax_delinquent
+(the "Oldest Tax Year" column), otherwise `date_recorded_parsed` with a guarded "Month D, YYYY" fallback; NULLS LAST
+in both directions; `Result.id` tie-break. New allowlisted `sort=date_desc|date_asc`. FE header toggle with aria-sort,
+mobile toggle, sort in the react-query key.
+
+**Tried / Decided:** normalizing the Snohomish month-name `date_recorded` at the scraper or UPDATE-ing the 13 rows was
+rejected: the text feeds `dedup_hash` and `source_fingerprint`, so a re-scrape could stop matching a delivered lead. A
+migration with a new IMMUTABLE parser was rejected for now (inline nested-CASE SQL needs no deploy ordering). party_name
+as tie-break rejected: owner recovery rewrites it, so rows would move. No index: warm cost +~75ms on a 17k-row job, and
+the actionable filter discards 96% of rows before the sort anyway.
+
+**Failed / Blocked:** first prod diagnostic returned zero rows: `DATABASE_URL` is the RLS-scoped app role; aggregates
+need `DATABASE_URL_MIGRATE` in a READ ONLY session. A backgrounded Codex review and both dev servers were killed for low
+memory (Codex had already finished). Playwright MCP failed to connect; used Playwright Python + Chromium directly.
+
+**Caught & fixed:** two tests passed on the OLD code because insertion order matched the expected order; fixtures
+reordered so they fail without the fix. The page-boundary fixture originally did not straddle the boundary.
+
+**Pending / Handoff:** push + PRs (backend first; FE CI regenerates types from backend main), merge, prod UI check.
+Owner decisions: trustee_sale / some Snohomish prefc `date_recorded` is the future auction date; scraper records page
+orders by `scraped_at DESC` with no tie-breaker (same bug class, different table).
+
+**Facts learned:** every row of a job shares `created_at` (prod: 18,214 rows / 19 distinct). Any ORDER BY on it needs a
+unique tie-break. Prod `date_recorded` formats: M/D/YYYY and MM/DD/YYYY everywhere, plus 13 Snohomish prefc month-name.
+
+---
+
 ## 2026-09-14 - King pre-foreclosure: 69% property addresses, condo units, and 12-digit account numbers
 
 **Built / Shipped (PR #306 BE open, FE bridgeleads-web #136 open, NOT merged):** job enrichment fills King

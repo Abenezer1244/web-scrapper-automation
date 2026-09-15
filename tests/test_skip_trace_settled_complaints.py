@@ -36,18 +36,26 @@ async def _job(db, user: User, record_type: str) -> str:
     return job_id
 
 
-async def _lead(db, user: User, job_id: str, complaint_status: str | None) -> str:
+async def _lead(db, user: User, job_id: str, complaint_status: str | None,
+                source: str = "seattle_sdci_code_violations") -> str:
     rid = str(uuid.uuid4())
     # A code violation is traceable only once enrichment named its owner from the county
     # (owner_source); without it the row is refused before the status gate is reached.
     pin = f"{random.randint(1, 9_999_999_999):010d}"
-    ed = {"source": "seattle_sdci_code_violations", "record_number": f"{random.randint(1, 999999):06d}-26CP",
-          "kc_pin": pin, "kc_pin_status": "matched", "kc_pin_source": "king_gis_point_in_parcel",
-          "kc_pin_match": "exact", "owner_source": "king_erealproperty", "owner_pin": pin}
+    parcel_id = None
+    if source == "seattle_sdci_code_violations":
+        ed = {"source": source, "record_number": f"{random.randint(1, 999999):06d}-26CP",
+              "kc_pin": pin, "kc_pin_status": "matched", "kc_pin_source": "king_gis_point_in_parcel",
+              "kc_pin_match": "exact", "owner_source": "king_erealproperty", "owner_pin": pin}
+    else:
+        # Bellevue, Burien and King County Accela print the PIN into parcel_id at scrape.
+        parcel_id = pin
+        ed = {"source": source, "case_number": f"ENFCV{random.randint(1, 999999):06d}",
+              "owner_source": "king_erealproperty", "owner_pin": pin}
     if complaint_status is not None:
         ed["status"] = complaint_status
     db.add(Result(
-        id=rid, user_id=user.id, job_id=job_id, party_name="DOE JANE",
+        id=rid, user_id=user.id, job_id=job_id, party_name="DOE JANE", parcel_id=parcel_id,
         property_address=f"{random.randint(100, 99999)} MAIN ST, SEATTLE, WA 98101",
         enrichment_data=ed, skip_trace_status="not_attempted", is_duplicate=False,
     ))
@@ -98,6 +106,26 @@ async def test_completed_and_duplicate_complaints_are_not_queued(db, business_us
     status = (await db.execute(text("SELECT skip_trace_status FROM results WHERE id = ANY(:ids)"),
                                {"ids": [completed, duplicate]})).scalars().all()
     assert status == ["not_attempted", "not_attempted"]
+
+
+async def test_accela_voided_and_no_violation_cases_are_not_queued(db, business_user, skip_trace_on):
+    job_id = await _job(db, business_user, "code_violation")
+    accela = "kingco_accela_code_enforcement"
+    settled = [await _lead(db, business_user, job_id, s, accela)
+               for s in ("Void", "No Violation Found", "Case Opened No Violation Ltr",
+                         "No Further Action Required")]
+    open_case = await _lead(db, business_user, job_id, "Case Opened with Violation Ltr", accela)
+    intake = await _lead(db, business_user, job_id, "Intake Processing", accela)
+    bellevue_closed = await _lead(db, business_user, job_id, "Closed", "bellevue_code_enforcement")
+    burien_closed = await _lead(db, business_user, job_id, "CLOSED", "burien_code_enforcement")
+    # Accela's settled words are scoped to Accela.
+    bellevue_void = await _lead(db, business_user, job_id, "Void", "bellevue_code_enforcement")
+
+    _enqueue(job_id)
+
+    queued = await _queued_for(db, job_id)
+    assert set(settled).isdisjoint(queued)
+    assert {open_case, intake, bellevue_closed, burien_closed, bellevue_void} <= queued
 
 
 async def test_the_gate_is_scoped_to_code_violations(db, business_user, skip_trace_on):

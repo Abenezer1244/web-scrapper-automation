@@ -31,7 +31,10 @@ _GIS_COMMIT_BATCH = 500
 # token inside the street (house numbers, road numbers).
 _TRAILING_ZIP_RE = re.compile(r"\b(\d{5})(?:-\d{4})?\s*$")
 
-# Seattle SDCI code-violation statuses that are never sent to a paid skip trace.
+# Code-violation statuses never sent to a paid skip trace on ANY source (the original
+# 2026-09-13 gate, which Tacoma rows also pass through). Per-source settled statuses,
+# including King County Accela's voided and no-violation cases, are added by
+# src/scrapers/king_cv_sources.is_settled.
 SETTLED_COMPLAINT_STATUSES = frozenset({"Completed", "Open Duplicate"})
 
 # King tax owner-name state, per lead, in enrichment_data. The owner name is the
@@ -2000,13 +2003,17 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config) -> None:
 
     # A code-violation complaint the city already closed as Completed, or filed as a
     # duplicate of another complaint, is not a lead worth a paid lookup (owner decision
-    # 2026-09-13). Exact SDCI status values; "Closed" is deliberately still traced.
+    # 2026-09-13). Exact status values; "Closed" is deliberately still traced. A King County
+    # Accela case voided or closed with no violation is settled the same way.
     if config.record_type == "code_violation":
+        from src.scrapers.king_cv_sources import is_settled
+
         settled_rows = [
             rec for rec in eligible
             if isinstance(rec.enrichment_data, dict)
             and isinstance(rec.enrichment_data.get("status"), str)
-            and rec.enrichment_data["status"] in SETTLED_COMPLAINT_STATUSES
+            and (rec.enrichment_data["status"] in SETTLED_COMPLAINT_STATUSES
+                 or is_settled(rec.enrichment_data.get("source"), rec.enrichment_data["status"]))
         ]
         if settled_rows:
             _settled_ids = {rec.id for rec in settled_rows}
@@ -2014,7 +2021,7 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config) -> None:
             _publish_log(
                 r, job_id, "info",
                 f"Skip trace skipped for {len(settled_rows)} code violation lead(s) whose "
-                "complaint is already completed or is a duplicate",
+                "case the city already settled (completed, duplicate, voided or no violation)",
                 db=db,
             )
 

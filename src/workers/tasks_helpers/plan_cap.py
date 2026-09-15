@@ -10,6 +10,7 @@ from src.api.lead_actionability import (
     OVER_QUOTA,
     address_actionable_sql,
 )
+from src.scrapers.king_cv_sources import settled_sql
 
 # Every record type without its own order below ranks by who and when, which also keeps
 # an estate's records together.
@@ -31,13 +32,13 @@ _TAX_RANK_ORDER = (
 # first, then a stable key. King (Seattle SDCI) code violations carry no owner at
 # scrape time and get one only for exactly located parcels inside a time budget, so
 # ranking by party_name would let enrichment timing decide which leads are billed.
-# "Completed" / "Open Duplicate" are SDCI's settled statuses (the same set auto skip
-# trace skips); they rank last, they are not removed. Tacoma uses other status words,
-# so the settled bucket is scoped to the SDCI source. Every input is fixed at scrape
-# time, so a watchdog re-run ranks the same way.
+# Settled statuses (SDCI "Completed" / "Open Duplicate", King County Accela voided and
+# no-violation cases; the same set auto skip trace skips) rank last, they are not
+# removed. The bucket is scoped by source (src/scrapers/king_cv_sources SETTLED_STATUSES):
+# Tacoma uses other status words. Every input is fixed at scrape time, so a watchdog
+# re-run ranks the same way.
 _CODE_VIOLATION_RANK_ORDER = (
-    "CASE WHEN enrichment_data->>'source' = 'seattle_sdci_code_violations'"
-    " AND enrichment_data->>'status' IN ('Completed', 'Open Duplicate') THEN 1 ELSE 0 END,"
+    f"CASE WHEN {settled_sql('enrichment_data')} THEN 1 ELSE 0 END,"
     " date_recorded_parsed DESC NULLS LAST, id"
 )
 

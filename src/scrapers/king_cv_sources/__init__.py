@@ -24,3 +24,34 @@ KINGCO_ACCELA = "kingco_accela_code_enforcement"
 # PIN is located from coordinates after insert and lives in enrichment_data.kc_pin.
 # (King County Accela prints the PIN on the case detail page, read during the scrape.)
 PARCEL_AT_SCRAPE_SOURCES = frozenset({BELLEVUE, BURIEN, KINGCO_ACCELA})
+
+# Cases the jurisdiction settled as not needing anything from the owner: SDCI's completed
+# complaints and duplicates of another complaint (owner decision 2026-09-13), and King
+# County Accela cases voided or closed with no violation. They stay delivered, rank last
+# under the plan cap, and never get a paid skip trace. Exact status values, scoped by
+# source: "Closed" (SDCI, Bellevue) and Burien's "CLOSED" stay ordinary cases, as SDCI's
+# "Closed" always has, and an unknown status is never treated as settled.
+SETTLED_STATUSES: dict[str, frozenset[str]] = {
+    SEATTLE_SDCI: frozenset({"Completed", "Open Duplicate"}),
+    KINGCO_ACCELA: frozenset({"Void", "No Violation Found", "Case Opened No Violation Ltr",
+                              "No Further Action Required"}),
+}
+
+
+def is_settled(source: object, status: object) -> bool:
+    return isinstance(status, str) and status in SETTLED_STATUSES.get(source, frozenset())
+
+
+def settled_sql(ed: str) -> str:
+    """SQL twin of is_settled over the enrichment_data expression ``ed`` (a json column).
+
+    Splices only the module constants above, which contain no quote characters.
+    """
+    clauses = []
+    for source, statuses in sorted(SETTLED_STATUSES.items()):
+        values = sorted(statuses)
+        if "'" in source or any("'" in v for v in values):
+            raise ValueError(f"settled status for {source} cannot be spliced into SQL")
+        listed = ", ".join(f"'{v}'" for v in values)
+        clauses.append(f"({ed}->>'source' = '{source}' AND {ed}->>'status' IN ({listed}))")
+    return "(" + " OR ".join(clauses) + ")"

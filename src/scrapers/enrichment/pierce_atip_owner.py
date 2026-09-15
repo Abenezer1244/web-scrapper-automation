@@ -248,6 +248,11 @@ def decide(parcel: str, fetched: Fetched, lead_address: str | None, *,
     row = echoed[0]
     if _clean(row.get("acct_type")).upper() != _REAL_PROPERTY:
         return OwnerDecision(NOT_REAL_PROPERTY)
+    # For real property the appraisal account's parcelNb is the parcel itself (measured on
+    # every live sample). It differs only for personal-property accounts, where it is the
+    # land parcel underneath (mobile home 5000050810 -> 0419203047), already refused above.
+    if _clean(account.get("parcelNb")) != parcel:
+        return OwnerDecision(PARCEL_MISMATCH)
     name = _clean(row.get("name"))
     situs = _clean(row.get("situs"))
     if _clean(account.get("acctType")).upper() == _REFERENCE_ACCOUNT or _is_reference_record(row):

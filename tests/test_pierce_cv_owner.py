@@ -251,7 +251,7 @@ def test_both_answers_must_echo_the_asked_parcel():
     assert _decide("2021110133", [other_row], "2117 AVE S", account=account).status == \
         "parcel_mismatch"
     # Taxpayer answer for the asked parcel, appraisal account for another one.
-    for key in ("id", "accountNo"):
+    for key in ("id", "accountNo", "parcelNb"):
         foreign = dict(account, **{key: "2021110134"})
         assert _decide("2021110133", _rows(ATIP_2117), "2117 AVE S", account=foreign).status == \
             "parcel_mismatch"

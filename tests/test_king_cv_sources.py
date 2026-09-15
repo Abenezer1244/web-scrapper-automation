@@ -568,6 +568,23 @@ def test_burien_case_id_is_kept_only_when_it_is_a_whole_number():
         35072, 35072, None, None, None, None, None, None]
 
 
+@pytest.mark.asyncio
+async def test_a_failing_progress_callback_fails_the_scrape_not_the_jurisdiction(monkeypatch):
+    monkeypatch.setattr(burien, "_PAGE_SIZE", BUR_PAGED["page_size"])
+    monkeypatch.setattr(base, "safe_get", _ArcGIS(burien_pages=BUR_PAGED))
+    source = burien.BurienSource()
+    scraper = kcv.KingWACodeViolationScraper(sources=[source])
+
+    def _broken(*_a):
+        raise ConnectionError("Redis went away")
+
+    scraper.on_progress = _broken
+    with pytest.raises(kcv.ProgressCallbackError, match="Redis went away"):
+        await scraper.scrape("01/01/2026", "09/14/2026")
+    assert scraper.source_status == {} and scraper.scrape_warnings == []
+    assert source.on_progress is None
+
+
 def test_a_connector_without_sources_is_refused():
     with pytest.raises(ValueError, match="at least one source"):
         kcv.KingWACodeViolationScraper(sources=[])

@@ -40,6 +40,11 @@ SOURCE_OK = "ok"
 SOURCE_FAILED = "failed"
 
 
+class ProgressCallbackError(RuntimeError):
+    """The job's progress callback failed. Bookkeeping, not a source failure: it fails the
+    scrape instead of being counted against the jurisdiction whose fetch was reporting."""
+
+
 def _join_names(names: Sequence[str]) -> str:
     """"Seattle", "Seattle and Bellevue", "Seattle, Bellevue, and Burien"."""
     names = list(names)
@@ -69,6 +74,13 @@ def partial_failure_warning(failed: Sequence[str], succeeded: Sequence[str],
         msg += (f" This date range has more {_join_names(too_large)} cases than one run can "
                 f"collect, so use a shorter date range to include them.")
     return msg
+
+
+def _report_progress(callback, pages: int, total: int, count: int) -> None:
+    try:
+        callback(pages, total, count)
+    except Exception as exc:
+        raise ProgressCallbackError(f"progress callback failed: {str(exc)[:160]}") from exc
 
 
 class KingWACodeViolationScraper(BridgeScraper):
@@ -106,12 +118,14 @@ class KingWACodeViolationScraper(BridgeScraper):
             # The record count is cumulative across sources; pages are per source.
             source.on_progress = (
                 (lambda pages, total, count, _done=len(records), _cb=self.on_progress:
-                 _cb(pages, total, _done + count))
+                 _report_progress(_cb, pages, total, _done + count))
                 if self.on_progress is not None else None)
             try:
                 got = await source.fetch(date_from, date_to)
             except Exception as exc:
                 source.on_progress = None
+                if isinstance(exc, ProgressCallbackError):
+                    raise
                 # A Celery time limit is the job's deadline, not this source's failure.
                 if type(exc).__name__ in ("SoftTimeLimitExceeded", "TimeLimitExceeded"):
                     raise

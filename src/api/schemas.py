@@ -1004,6 +1004,8 @@ class BatchLeadRow(BaseModel):
     overlap_count: int = 1
     source_counties: list[str] = Field(default_factory=list)
     lead_subtype: str | None = None
+    # Same meaning as ResultRow.date_is_auction_date: show date_recorded as blank.
+    date_is_auction_date: bool = False
 
 
 class BatchLeadsPage(BaseModel):
@@ -1622,6 +1624,8 @@ class SegmentLeadRow(BaseModel):
     matched_record_types: list[str]
     overlap_count: int
     identity_strength: str = "strong"
+    # Same meaning as ResultRow.date_is_auction_date: show date_recorded as blank.
+    date_is_auction_date: bool = False
 
 
 class SegmentIntersectionResponse(BaseModel):

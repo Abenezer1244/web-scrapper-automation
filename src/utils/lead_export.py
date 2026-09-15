@@ -563,6 +563,9 @@ def build_lead_export_row(
             if _is_synthetic_tax_date(
                 _get(record, "date_recorded"), year, _get(record, "record_type")
             )
+            # A caller that computed the rule in SQL (Lists rows carry no enrichment_data)
+            # passes the flag; everyone else gets it from the record itself.
+            or _get(record, "date_is_auction_date") is True
             or is_auction_date_fallback(_get(record, "date_recorded"), enr)
             else sanitize_for_csv(_get(record, "date_recorded"))
         ),

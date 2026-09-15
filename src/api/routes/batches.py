@@ -8,6 +8,7 @@ by the dispatch worker (system-written), so this route only persists the parent
 + children, then kicks off the fan-out.
 """
 import io
+import json
 import uuid
 from datetime import UTC, datetime
 
@@ -60,6 +61,7 @@ from src.scrapers.probate import new_probate_config_tod_default
 from src.utils.crypto import decrypt_field
 from src.utils.lead_export import resolve_hidden_output_fields
 from src.utils.logger import setup_logger
+from src.utils.source_dates import is_auction_date_fallback
 
 _logger = setup_logger("api.batches")
 
@@ -972,6 +974,14 @@ async def _leads_page(
             data["mailing_address"] = None
         data["matched_record_types"] = list(data.get("matched_record_types") or [])
         data["source_counties"] = list(data.get("source_counties") or [])
+        # Raw text() SQL: a json column can arrive as its text rather than a dict.
+        enrichment = data.get("enrichment_data")
+        if isinstance(enrichment, str):
+            try:
+                enrichment = json.loads(enrichment)
+            except ValueError:
+                enrichment = None
+        data["date_is_auction_date"] = is_auction_date_fallback(data.get("date_recorded"), enrichment)
         leads.append(BatchLeadRow(**data))
 
     return BatchLeadsPage(

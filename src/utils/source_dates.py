@@ -27,9 +27,9 @@ from typing import Any
 
 # [0-9], never a digit class: the SQL twin must accept exactly the same text, and in
 # PostgreSQL a locale-widened digit class would reach an integer cast and raise.
-_NUMERIC = re.compile(r"^\s*([0-9]{1,2})/([0-9]{1,2})/([0-9]{4})\s*$", re.ASCII)
-_MONTH_NAME = re.compile(r"^\s*([A-Za-z]+)\.?\s+([0-9]{1,2}),?\s+([0-9]{4})\s*$", re.ASCII)
-_ISO = re.compile(r"^\s*([0-9]{4})-([0-9]{2})-([0-9]{2})\s*$", re.ASCII)
+_NUMERIC = re.compile(r"([0-9]{1,2})/([0-9]{1,2})/([0-9]{4})")
+_MONTH_NAME = re.compile(r"([A-Za-z]+)[.]? +([0-9]{1,2}),? +([0-9]{4})")
+_ISO = re.compile(r"([0-9]{4})-([0-9]{2})-([0-9]{2})")
 _MONTHS = (
     "january", "february", "march", "april", "may", "june",
     "july", "august", "september", "october", "november", "december",
@@ -52,15 +52,16 @@ def parse_source_date(value: Any) -> date | None:
     """A date from "M/D/YYYY" or "Month D, YYYY" text, else None. No lenient parsing."""
     if not isinstance(value, str):
         return None
-    if m := _NUMERIC.match(value):
+    value = value.strip(" ")  # PostgreSQL btrim: spaces only
+    if m := _NUMERIC.fullmatch(value):
         return _real_date(int(m[3]), int(m[1]), int(m[2]))
-    if m := _MONTH_NAME.match(value):
+    if m := _MONTH_NAME.fullmatch(value):
         return _real_date(int(m[3]), MONTH_NUMBERS.get(m[1].lower()), int(m[2]))
     return None
 
 
 def _parse_iso_date(value: Any) -> date | None:
-    if not isinstance(value, str) or not (m := _ISO.match(value)):
+    if not isinstance(value, str) or not (m := _ISO.fullmatch(value.strip(" "))):
         return None
     return _real_date(int(m[1]), int(m[2]), int(m[3]))
 

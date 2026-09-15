@@ -29,7 +29,8 @@ updated, so enrichment rewriting names or addresses cannot move a row.
 """
 from typing import Literal
 
-from sqlalchemy import Integer, Text, and_, case, cast, func
+from sqlalchemy import JSON, Integer, Text, and_, case, cast, func, literal_column, type_coerce
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects.postgresql import ARRAY
 
 from src.db.models import CountyRecord, Result
@@ -38,7 +39,7 @@ ResultsSort = Literal["date_desc", "date_asc"]
 DEFAULT_RESULTS_SORT: ResultsSort = "date_desc"
 
 # "September 18, 2026", "Sep 18 2026", "Sept. 18, 2026". Captures word, day, year.
-_MONTH_NAME_DATE = r"^\s*([A-Za-z]+)\.?\s+([0-9]{1,2}),?\s+([0-9]{4})\s*$"
+_MONTH_NAME_DATE = "^([A-Za-z]+)[.]? +([0-9]{1,2}),? +([0-9]{4})$"
 _MONTHS = (
     "january", "february", "march", "april", "may", "june",
     "july", "august", "september", "october", "november", "december",
@@ -51,7 +52,7 @@ _MONTH_NUMBERS = {
 
 
 # "3/20/2026", "03/13/2026". Captures month, day, year.
-_NUMERIC_DATE = r"^\s*([0-9]{1,2})/([0-9]{1,2})/([0-9]{4})\s*$"
+_NUMERIC_DATE = "^([0-9]{1,2})/([0-9]{1,2})/([0-9]{4})$"
 
 
 def _valid_date(year, month, day):
@@ -81,7 +82,7 @@ def _valid_date(year, month, day):
 
 def _month_name_date(column):
     """DATE from a "Month D, YYYY" string, or NULL. Never raises."""
-    parts = func.regexp_match(column, _MONTH_NAME_DATE, type_=ARRAY(Text))
+    parts = func.regexp_match(func.btrim(column), _MONTH_NAME_DATE, type_=ARRAY(Text))
     month = case(_MONTH_NUMBERS, value=func.lower(parts[1]), else_=None)
     return _valid_date(cast(parts[3], Integer), month, cast(parts[2], Integer))
 
@@ -92,7 +93,7 @@ def _numeric_date(column):
     Same text ``results.date_recorded_parsed`` accepts. Results keeps reading that
     stored column; this is for tables that have no parsed date.
     """
-    parts = func.regexp_match(column, _NUMERIC_DATE, type_=ARRAY(Text))
+    parts = func.regexp_match(func.btrim(column), _NUMERIC_DATE, type_=ARRAY(Text))
     return _valid_date(
         cast(parts[3], Integer), cast(parts[1], Integer), cast(parts[2], Integer)
     )
@@ -104,32 +105,66 @@ def _text_date(column):
 
 
 # "2026-09-18". Only the trustee_sale scraper's recorded auction date uses it.
-_ISO_DATE = r"^\s*([0-9]{4})-([0-9]{2})-([0-9]{2})\s*$"
+_ISO_DATE = "^([0-9]{4})-([0-9]{2})-([0-9]{2})$"
 
 
 def _iso_date(column):
     """DATE from a "YYYY-MM-DD" string, or NULL. Never raises."""
-    parts = func.regexp_match(column, _ISO_DATE, type_=ARRAY(Text))
+    parts = func.regexp_match(func.btrim(column), _ISO_DATE, type_=ARRAY(Text))
     return _valid_date(
         cast(parts[1], Integer), cast(parts[2], Integer), cast(parts[3], Integer)
     )
 
 
-def auction_date_fallback_condition():
+def _auction_date_fallback(date_recorded, enrichment_data):
     """SQL twin of ``src.utils.source_dates.is_auction_date_fallback``.
 
-    True when the row's date_recorded is the auction date its scraper stood in for a
-    missing notice date. Compared with the auction date the scraper RECORDED in
+    True when date_recorded is the auction date its scraper stood in for a missing
+    notice date. Compared with the auction date the scraper RECORDED in
     enrichment_data, never with results.auction_date, which the NTS matcher moves on a
     postponement. NULL (not a stand-in) whenever either side is missing or unreadable.
-    Same grammar as the Python rule: it parses date_recorded itself instead of reading
-    date_recorded_parsed, whose trimming differs.
+    Same grammar as the Python rule: date_recorded is parsed here, not read from
+    date_recorded_parsed, which only knows M/D/YYYY.
     """
     origin = func.coalesce(
-        _text_date(Result.enrichment_data["auction_date"].as_string()),
-        _iso_date(Result.enrichment_data[("nts_source", "auction_date")].as_string()),
+        _text_date(enrichment_data["auction_date"].as_string()),
+        _iso_date(enrichment_data[("nts_source", "auction_date")].as_string()),
     )
-    return _text_date(Result.date_recorded) == origin
+    # enrichment_data is json, not jsonb: every -> re-parses the whole document, and
+    # the expression above reads it dozens of times. Both origin keys are named
+    # auction_date, so a row whose stored text never mentions it cannot be a stand-in;
+    # json->text is the stored text, no parse. Measured on prod (read-only, 92k rows of
+    # one account): 13.4 s for the bare rule over every row, 148 ms with this check
+    # (58-348 ms with no rule at all), and the same 83 stand-ins either way.
+    mentions_auction_date = func.strpos(cast(enrichment_data, Text), "auction_date") > 0
+    return case((mentions_auction_date, _text_date(date_recorded) == origin), else_=None)
+
+
+def auction_date_fallback_condition():
+    """The stand-in rule on ``results`` for ORM queries (NULL means "not a stand-in")."""
+    return _auction_date_fallback(Result.date_recorded, Result.enrichment_data)
+
+
+def auction_date_fallback_sql(alias: str) -> str:
+    """The same rule as a raw SQL boolean on ``<alias>.date_recorded`` and
+    ``<alias>.enrichment_data``, for the hand-written text() queries (Lists).
+
+    Rendered from the expression above with every literal inlined, so there is one
+    definition. That is only safe because no pattern contains a backslash (inlining
+    doubles them) and nothing renders a colon (text() would read it as a bind), so
+    both are refused rather than assumed. The result may contain braces: a caller that
+    runs it through str.format must escape them.
+    """
+    if not alias.isidentifier():
+        raise ValueError(f"not a SQL alias: {alias!r}")
+    expr = _auction_date_fallback(
+        literal_column(f"{alias}.date_recorded"),
+        type_coerce(literal_column(f"{alias}.enrichment_data"), JSON),
+    )
+    sql = str(expr.compile(dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}))
+    if "\\" in sql or ":" in sql:
+        raise RuntimeError("stand-in SQL must not contain a backslash or a colon")
+    return f"COALESCE(({sql}), FALSE)"
 
 
 def results_order_by(record_type: str | None, sort: ResultsSort) -> list:

@@ -9,7 +9,7 @@ For every stored lead in a DONE job this script:
   2. For a parcel located before `kc_pin_match` existed, re-locates it and records the
      tier. Only a re-located PIN equal to the stored one can be "exact"; anything else
      is "unconfirmed". Mailing addresses are never touched.
-  3. For an EXACT located PIN, reads the owner (King Assessor eRealProperty, lease-guarded
+  3. For an exact or street-only located PIN, reads the owner (King Assessor eRealProperty, lease-guarded
      and paced) with --owners.
   4. Replaces party_name ONLY when it still equals the label the old scraper built from
      that same source row: with the owner when found, otherwise with NULL (the label
@@ -17,7 +17,7 @@ For every stored lead in a DONE job this script:
 
 Guarded single-row UPDATEs (same user, same party_name as read, job still done). No
 parcel_id, dedup, billing, quota, skip trace or delivery change. Idempotent: a repaired
-row carries `cv_semantics_repaired_at`; --retry-owners revisits exact rows still unnamed.
+row carries `cv_semantics_repaired_at`; --retry-owners revisits exact/street-only rows still unnamed.
 
     railway run --service worker python scripts/backfill_king_code_violation_owner.py              # dry-run
     railway run --service worker python scripts/backfill_king_code_violation_owner.py --owners --apply
@@ -64,7 +64,7 @@ _CANDIDATES_SQL = """
       AND r.enrichment_data::jsonb->>'source' = :source
       AND (NOT (r.enrichment_data::jsonb ? 'cv_semantics_repaired_at')
            OR (:retry_owners AND coalesce(btrim(r.party_name), '') = ''
-               AND r.enrichment_data::jsonb->>'kc_pin_match' = 'exact'
+               AND r.enrichment_data::jsonb->>'kc_pin_match' IN ('exact', 'street_only')
                AND NOT (r.enrichment_data::jsonb ? 'owner_source')))
     ORDER BY r.id
 """

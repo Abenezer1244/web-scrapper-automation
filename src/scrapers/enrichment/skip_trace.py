@@ -837,7 +837,8 @@ def code_violation_owner_is_known(result) -> bool:
         # The name must have been read for the parcel the row is CURRENTLY located on,
         # and that location must still be exact: stale owner metadata left behind by a
         # changed location would trace (and bill) the wrong person (Codex P1).
-        pin = located_parcel_id(ed)
+        # Exact only: a street-only owner is shown and named, never paid for (Codex P1).
+        pin = located_parcel_id(ed, exact_only=True)
         return (ed.get("owner_source") == OWNER_SOURCE
                 and pin is not None and ed.get("owner_pin") == pin)
     # Tacoma: no owner enrichment exists yet, so no row can pass. A future Pierce owner

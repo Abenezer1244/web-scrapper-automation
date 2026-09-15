@@ -96,6 +96,28 @@ The live Dashboard page carries the parcel cell. Prod has 0 rows with `parcel_lo
 
 ---
 
+## 2026-09-14 - King code violations: street-level parcel matches shown and named (141 prod rows)
+
+**Built / Shipped:** #308 `b78919a` (owner decision: a parcel matched on the same street where the SDCI
+row had no ZIP is shown and names the owner; `located_parcel_match` on the API; CSV `parcel_source` says
+"street only, no ZIP in source"; condo complexes still excluded; **skip trace stays exact-only**), FE #137
+`19ab463` (tooltip names the tier). Journal #305 merged. Railway api + worker SUCCESS at `b78919a`.
+
+**Applied to prod:** `--owners --retry-owners --apply`: dry run first without owner lookups (141
+candidates, all street_only, 119 PINs), then 119/119 owners, 141 written, 0 guard skips. Read-only after:
+shown parcel + owner 1,300 (760 of 1,060 non-duplicate leads, was 654), parcel_id still 0, mailing 1,298,
+skip trace untouched. 5/5 random street-level rows match eRealProperty name/site and the tax-bill mailing.
+
+**Tried / Decided:** Codex consult: street-level is fine for display and naming, not for a paid lookup, so
+`located_parcel_id(exact_only=True)` gates skip trace. Owner kept "Open Duplicate" delivered, ranked last.
+Codex r1 caught an unhashable malformed tier crashing the membership test (isinstance first).
+
+**Caught & fixed:** #308 was behind #306 (King condo/property recovery); merged and checked that recovery
+only updates rows by `parcel_id`, which code violations never have.
+
+**Facts learned:** county taxpayer names can be truncated mid-token ("DOHERTY TRACY &") or carry a role
+("ESTER W JOHN - MANAGER"); they are stored as the county shows them.
+
 ## 2026-09-14 - King code violations shipped: merged, deployed, 1,782 prod rows repaired
 
 **Built / Shipped:** #299 `89d3b0c` (semantics, located parcel, owner pass, skip trace gate, repair

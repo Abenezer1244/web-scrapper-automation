@@ -20,7 +20,7 @@ from src.api.middleware.security import add_scrape_domain
 from src.config import settings
 from src.scrapers.base_scraper import ScrapedRecord
 from src.scrapers.king_cv_sources import SEATTLE_SDCI
-from src.scrapers.king_cv_sources.base import CodeViolationSource
+from src.scrapers.king_cv_sources.base import CodeViolationSource, raise_if_time_limit
 from src.utils.logger import setup_logger
 from src.utils.safe_http import safe_get
 
@@ -92,6 +92,7 @@ class SeattleSDCISource(CodeViolationSource):
                     )
                 return data
             except Exception as exc:
+                raise_if_time_limit(exc)
                 last_exc = exc
                 if attempt >= settings.MAX_RETRIES or not _is_retryable(exc):
                     break
@@ -188,6 +189,7 @@ class SeattleSDCISource(CodeViolationSource):
                         dt = datetime.fromisoformat(head)
                         record.date_recorded = dt.strftime("%m/%d/%Y")
                     except Exception as exc:
+                        raise_if_time_limit(exc)
                         _logger.debug(
                             "Could not parse opendate=%r for %s: %s",
                             opendate, rec_num, exc,

@@ -100,6 +100,7 @@ _UPDATE_SQL = """
 _AP_CANDIDATES_SQL = """
     SELECT r.id, r.user_id, r.property_address, r.property_city, r.property_state,
            r.property_zip, r.mailing_address, r.enrichment_data::jsonb AS ed,
+           r.owner_state, r.absentee_owner, r.out_of_state_owner,
            r.enrichment_data::jsonb->>'latitude' AS lat,
            r.enrichment_data::jsonb->>'longitude' AS lon
     FROM results r
@@ -136,6 +137,9 @@ _AP_UPDATE_SQL = """
       AND property_zip IS NOT DISTINCT FROM CAST(:old_zip AS text)
       AND property_city IS NOT DISTINCT FROM CAST(:old_city AS text)
       AND property_state IS NOT DISTINCT FROM CAST(:old_state AS text)
+      AND owner_state IS NOT DISTINCT FROM CAST(:old_owner_state AS text)
+      AND absentee_owner IS NOT DISTINCT FROM CAST(:old_absentee AS boolean)
+      AND out_of_state_owner IS NOT DISTINCT FROM CAST(:old_out_of_state AS boolean)
       AND (CAST(:new_mail AS text) IS NULL
            OR btrim(coalesce(enrichment_data::jsonb->>'mailing_source', '')) = '')
       AND enrichment_data::jsonb->>'latitude' IS NOT DISTINCT FROM CAST(:old_lat AS text)
@@ -169,8 +173,8 @@ def run_address_points(db, *, apply_writes: bool, limit: int | None = None,
     rows = db.execute(text(_AP_CANDIDATES_SQL), {
         "source": _SOURCE, "statuses": sorted(kap.FALLBACK_STATUSES)}).all()
     db.rollback()
-    if limit:
-        rows = rows[:limit]
+    if limit is not None:  # --limit 0 means nothing, never everything
+        rows = rows[:max(limit, 0)]
     now = datetime.now(UTC).isoformat()
     counts: Counter = Counter()
     plans: list[tuple] = []
@@ -244,7 +248,8 @@ def run_address_points(db, *, apply_writes: bool, limit: int | None = None,
                 "old_lat": r.lat, "old_lon": r.lon,
                 # The owner flags are computed from these, so they must still hold.
                 "old_city": r.property_city, "old_state": r.property_state,
-                "old_ed": json.dumps(r.ed)})
+                "old_ed": json.dumps(r.ed), "old_owner_state": r.owner_state,
+                "old_absentee": r.absentee_owner, "old_out_of_state": r.out_of_state_owner})
             written += bool(res.rowcount)
             skipped += not res.rowcount
             if i % 200 == 0:

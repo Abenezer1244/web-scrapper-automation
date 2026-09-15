@@ -617,11 +617,11 @@ def _stored_ed(record, status, lat=None, lon=None):
             "latitude": lat, "longitude": lon}
 
 
-def _repair(apply_writes, tmp_path):
+def _repair(apply_writes, tmp_path, limit=None):
     from src.db.session import system_sync_session
 
     with system_sync_session() as sdb:
-        return bko.run_address_points(sdb, apply_writes=apply_writes,
+        return bko.run_address_points(sdb, apply_writes=apply_writes, limit=limit,
                                       report=tmp_path / "ap.jsonl", gis_pace_s=0)
 
 
@@ -668,6 +668,7 @@ async def test_address_point_repair_is_dry_by_default_guarded_and_converges(
     before = {str(r.id): (r.mailing_address, r.enrichment_data)
               for r in (await db.execute(select, {"ids": ids})).all()}
 
+    assert (await asyncio.to_thread(_repair, True, tmp_path, 0))["planned"] == 0  # --limit 0
     dry = await asyncio.to_thread(_repair, False, tmp_path)
     assert dry["candidates"] == 4 and "writes" not in dry
     db.expire_all()
@@ -720,7 +721,8 @@ async def test_address_point_repair_write_skips_a_row_changed_since_it_was_read(
                   "old_pin_source": None, "old_parcel_address": None,
                   "old_address": "9043 A 18TH AVE SW, SEATTLE WA 98106", "old_zip": None,
                   "old_lat": "47.52163912", "old_lon": "-122.35809767", "old_city": None,
-                  "old_state": None, "old_ed": json.dumps(stored), **over}
+                  "old_state": None, "old_ed": json.dumps(stored), "old_owner_state": None,
+                  "old_absentee": None, "old_out_of_state": None, **over}
         with system_sync_session() as sdb:
             res = sdb.execute(text(bko._AP_UPDATE_SQL), params)
             sdb.commit()
@@ -735,6 +737,8 @@ async def test_address_point_repair_write_skips_a_row_changed_since_it_was_read(
     assert await asyncio.to_thread(_write, old_zip="98106") == 0
     assert await asyncio.to_thread(_write, old_lat="47.52158159") == 0
     assert await asyncio.to_thread(_write, old_state="WA") == 0
+    assert await asyncio.to_thread(_write, old_absentee=True) == 0
+    assert await asyncio.to_thread(_write, old_owner_state="WA") == 0
     # Any other change to the object read (e.g. a kc_pin_checked_at stamped since) too.
     assert await asyncio.to_thread(
         _write, old_ed=json.dumps({**stored, "kc_pin_checked_at": "2026-09-13T00:00:00+00:00"})) == 0

@@ -1261,6 +1261,25 @@
         "title": "CountyCount",
         "type": "object"
       },
+      "CsvLayoutUpdate": {
+        "additionalProperties": false,
+        "description": "PUT /scrapers/{id}/csv-layout — switch ONE config's CSV export layout.\n\nA dedicated single-field write rather than a PATCH echo of GET's deliver dict:\nstored legacy deliver dicts can hold keys DeliverUpdate (extra=\"forbid\") rejects\n(e.g. a singular \"format\"), so echoing them would 422 old scrapers. This touches\nonly deliver.csv_layout and leaves every other stored key byte-identical.",
+        "properties": {
+          "csv_layout": {
+            "enum": [
+              "legacy_v1",
+              "crm_v1"
+            ],
+            "title": "Csv Layout",
+            "type": "string"
+          }
+        },
+        "required": [
+          "csv_layout"
+        ],
+        "title": "CsvLayoutUpdate",
+        "type": "object"
+      },
       "DeliverConfig": {
         "properties": {
           "csv_layout": {
@@ -7280,6 +7299,64 @@
           }
         ],
         "summary": "Update Scraper",
+        "tags": [
+          "scrapers"
+        ]
+      }
+    },
+    "/scrapers/{scraper_id}/csv-layout": {
+      "put": {
+        "description": "Switch one scraper's CSV export layout (legacy_v1 <-> crm_v1) atomically.\n\nWrites ONLY deliver.csv_layout; every other stored deliver key (secrets,\nemails, formats, webhooks, legacy keys PATCH would reject) stays untouched.\nSetting the value already stored is a no-op (no updated_at bump, no audit).",
+        "operationId": "set_scraper_csv_layout_scrapers__scraper_id__csv_layout_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scraper_id",
+            "required": true,
+            "schema": {
+              "title": "Scraper Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CsvLayoutUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScraperConfigResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Set Scraper Csv Layout",
         "tags": [
           "scrapers"
         ]

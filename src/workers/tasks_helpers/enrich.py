@@ -910,22 +910,30 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
 
     # Seattle SDCI code violations carry coordinates but no parcel, so the parcel-keyed
     # passes below can never give them a mailing address. Locate the parcel strictly (one
-    # polygon, same normalized street and ZIP) and take the mailing from the Assessor
-    # extract. The PIN is stored beside the lead, never in parcel_id (dedup/billing).
-    # Bellevue and Burien rows arrive with parcel_id set at scrape and take the ordinary
-    # parcel-keyed King passes below (GIS, Assessor extract, eRealProperty) instead.
+    # polygon, same normalized street and ZIP); when that fails, try King's own address
+    # points (src/scrapers/enrichment/king_address_points.py), and take the mailing from
+    # the Assessor extract for a tier that allows it. The PIN is stored beside the lead,
+    # never in parcel_id (dedup/billing). Rows without coordinates are included: they
+    # get the terminal no_coordinates status and can only reach the hidden address_only tier.
+    # Bellevue, Burien and King County Accela rows are never located here, even without a
+    # printed parcel: their owner and skip trace are keyed on the printed PIN only, and
+    # those with one take the ordinary parcel-keyed King passes below instead.
     if (config.county.lower() == "king" and config.state.upper() == "WA"
             and config.record_type == "code_violation"):
+        from src.scrapers.king_cv_sources import PARCEL_AT_SCRAPE_SOURCES
+
         _cv_rows = {
             str(res.id): res for res in all_results
             if not res.parcel_id and not res.mailing_address
             and isinstance(res.enrichment_data, dict)
-            and res.enrichment_data.get("latitude") and res.enrichment_data.get("longitude")
+            and res.enrichment_data.get("source") not in PARCEL_AT_SCRAPE_SOURCES
+            and ((res.enrichment_data.get("latitude") and res.enrichment_data.get("longitude"))
+                 or (res.property_address or "").strip())
             and not res.enrichment_data.get("kc_pin_status")
         }
         if _cv_rows:
-            from src.scrapers.enrichment.king_parcel_locate import (
-                SOURCE as _KC_PIN_SOURCE,
+            from src.scrapers.enrichment.king_address_points import (
+                EVIDENCE_KEY as _KC_AP_EVIDENCE,
             )
             from src.scrapers.enrichment.king_parcel_locate import (
                 resolve_code_violation_mailing,
@@ -937,14 +945,19 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
             # Budget covers the WHOLE step: 420 s of parcel lookups (15 s request
             # timeout, so the last call ends by ~435 s) + one extract scan (~15 s) +
             # commit. It is counted in the code_violation budget sum below, beside the
-            # owner pass and the (shorter) parcel-keyed King pass.
+            # owner pass and the (shorter) parcel-keyed King pass. The address-point
+            # fallback runs inside the same 420 s and only starts while both of its
+            # requests can still time out before the deadline.
             # Rows not reached keep no status and are picked up by
-            # scripts/backfill_king_code_violation_mailing.py.
+            # scripts/backfill_king_code_violation_mailing.py; rows whose fallback was not
+            # reached keep their point status and are picked up by
+            # scripts/backfill_king_code_violation_owner.py --address-points.
             try:
                 _cv_decisions, _cv_snapshot = resolve_code_violation_mailing(
-                    [(k, res.enrichment_data["latitude"], res.enrichment_data["longitude"],
+                    [(k, res.enrichment_data.get("latitude"), res.enrichment_data.get("longitude"),
                       res.property_address) for k, res in _cv_rows.items()],
-                    budget_s=420,
+                    budget_s=420, address_points=True,
+                    property_zips={k: res.property_zip for k, res in _cv_rows.items()},
                 )
             except Exception as exc:  # noqa: BLE001 -- enrichment is best-effort
                 if type(exc).__name__ in ("SoftTimeLimitExceeded", "TimeLimitExceeded"):
@@ -956,11 +969,13 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
             for k, d in _cv_decisions.items():
                 res = _cv_rows[k]
                 ed = dict(res.enrichment_data)
+                # kc_pin_source comes from the decision: the strict point rule and the
+                # address points stamp different sources, and each tier is only trusted
+                # with its own (src/utils/located_parcel.py).
                 ed.update({key: d[key] for key in ("kc_pin_status", "kc_pin", "kc_parcel_address",
-                                                   "kc_pin_match")
+                                                   "kc_pin_match", "kc_pin_source",
+                                                   _KC_AP_EVIDENCE)
                            if key in d})
-                if d.get("kc_pin"):
-                    ed["kc_pin_source"] = _KC_PIN_SOURCE
                 if d.get("mailing_address") and not res.mailing_address:
                     res.mailing_address = d["mailing_address"]
                     ed["mailing_source"] = "king_rpacct"
@@ -977,14 +992,14 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                                 job_id, str(exc)[:120])
 
         # No source names the owner, so party_name arrives empty. The PIN Bellevue,
-        # Burien or King County Accela printed (parcel_id), or an exact or street-level
-        # located SDCI PIN, names the owner through the same owner-only eRealProperty path
-        # King tax uses: lease-guarded, paced, breaker-protected, and it drops any page
-        # the county served for a different parcel. The tax-only owner pass below never
-        # runs for this job; this takes its 300 s slot in the budget sum. SDCI rows not
-        # reached keep no owner and are named later by the beat sweep
-        # src/workers/cv_owner_recovery.py, which selects SDCI rows only: a printed-PIN
-        # row this pass did not reach stays unnamed (and is never skip traced).
+        # Burien or King County Accela printed (parcel_id), or a shown located SDCI PIN
+        # (exact, street-level or address point; never address_only or a condo complex),
+        # names the owner through the same owner-only eRealProperty path King tax uses:
+        # lease-guarded, paced, breaker-protected, and it drops any page the county served
+        # for a different parcel. The tax-only owner pass below never runs for this job;
+        # this takes its 300 s slot in the budget sum. SDCI rows not reached keep no owner
+        # and are named later by the beat sweep src/workers/cv_owner_recovery.py, which
+        # selects SDCI rows only, so printed-PIN parcels are asked first.
         from src.scrapers.enrichment.king_parcel_locate import (
             apply_owner_names,
             owner_lookup_pins,

@@ -186,6 +186,33 @@ async def test_exact_and_street_level_leads_get_their_owner_and_nothing_else_mov
                              {"u": business_user.id})).scalar() == used_before
 
 
+async def test_a_county_address_match_is_named_and_an_address_only_candidate_never_is(
+    db, business_user, monkeypatch,
+):
+    """address_point is a shown tier (src/utils/located_parcel.py); address_only, a condo
+    complex and a tier stamped by the wrong rule are not, so they are never asked."""
+    _lease(monkeypatch)
+    job_id = await _job(db, business_user)
+    ap = {"kc_pin_source": "king_gis_address_point"}
+    shown = await _row(db, business_user, job_id, pin="7899800716", match="address_point", **ap)
+    hidden = await _row(db, business_user, job_id, pin="5318100580", match="address_only", **ap)
+    condo = await _row(db, business_user, job_id, pin="8562990000", match="condo_complex", **ap)
+    wrong_rule = await _row(db, business_user, job_id, pin="2770602445", match="address_point")
+    asked = _county(monkeypatch, {
+        "7899800716": _Resp(200, _page("7899800716", "NAMUE KATA & ISABELLA MONGI")),
+    })
+    before = {rid: await _get(db, rid) for rid in (hidden, condo, wrong_rule)}
+
+    stats = await asyncio.to_thread(_tick)
+
+    assert asked == ["7899800716"] and stats["found"] == 1
+    row = await _get(db, shown)
+    assert row.party_name == "NAMUE KATA & ISABELLA MONGI"
+    assert row.enrichment_data["owner_pin"] == "7899800716"
+    for rid, old in before.items():
+        assert tuple(await _get(db, rid)) == tuple(old)
+
+
 async def test_leads_that_are_not_eligible_are_never_looked_up_or_written(
     db, business_user, monkeypatch,
 ):

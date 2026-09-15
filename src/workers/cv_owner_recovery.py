@@ -284,13 +284,18 @@ def _tick(stats: dict, lock: tuple) -> dict:
             stats["skipped"] = f"{type(exc).__name__}: {str(exc)[:120]}"
             _logger.warning("Code violation owner recovery: lookup failed: %s", stats["skipped"])
 
-        for pin, outcome in _classify(pins, owners, o_stats).items():
-            if not _renew_lock(lock):
-                stats["skipped"] = "lock lost before writing"
-                _logger.warning("Code violation owner recovery: %s", stats["skipped"])
-                break
+        outcomes = _classify(pins, owners, o_stats)
+        # Ownership is proven before EVERY write, not once per parcel: a parcel can
+        # carry any number of rows, so no fixed write-phase length fits inside the TTL.
+        for pin, outcome in outcomes.items():
             for row in by_pin.get(pin, []):
+                if not _renew_lock(lock):
+                    stats["skipped"] = "lock lost before writing"
+                    _logger.warning("Code violation owner recovery: %s", stats["skipped"])
+                    break
                 stats[_write(db, row, outcome, owners.get(pin))] += 1
+            if stats["skipped"] == "lock lost before writing":
+                break
 
     _logger.info(
         "Code violation owner recovery: %d parcel(s) / %d lead(s); leads: %d found, "

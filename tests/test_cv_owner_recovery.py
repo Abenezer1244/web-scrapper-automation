@@ -638,6 +638,37 @@ async def test_a_tick_that_lost_its_lock_writes_nothing(db, business_user, monke
     assert stats["skipped"] == "lock lost before writing" and stats["found"] == 0
 
 
+async def test_a_lock_lost_between_two_rows_of_one_parcel_stops_the_second_write(
+    db, business_user, monkeypatch,
+):
+    import redis as sync_redis
+
+    from src.config import settings
+
+    _lease(monkeypatch)
+    job_id = await _job(db, business_user)
+    first = await _row(db, business_user, job_id, pin="1000000151")
+    second = await _row(db, business_user, job_id, pin="1000000151")
+    _county(monkeypatch, {"1000000151": _Resp(200, _page("1000000151", "SHARED OWNER"))})
+    real_write = cvr._write
+    client = sync_redis.from_url(settings.REDIS_URL, **settings.redis_kwargs())
+
+    def _write_then_lose_lock(*a, **k):
+        label = real_write(*a, **k)
+        client.set(cvr._LOCK_KEY, "a-newer-tick")
+        return label
+
+    monkeypatch.setattr(cvr, "_write", _write_then_lose_lock)
+    try:
+        stats = await asyncio.to_thread(_tick)
+    finally:
+        client.delete(cvr._LOCK_KEY)
+
+    named = [(await _get(db, rid)).party_name for rid in sorted((first, second))]
+    assert named == ["SHARED OWNER", None]
+    assert stats["found"] == 1 and stats["skipped"] == "lock lost before writing"
+
+
 def test_the_blank_owner_page_classifies_as_not_found():
     out = cvr._classify(["1000000101"], {"1000000101": "  "},
                         {"outcome": "complete", "attempted": ["1000000101"], "transient": [],

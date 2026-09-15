@@ -29,7 +29,7 @@ from src.utils.lead_formatting import (
     split_owner_for_display,
 )
 from src.utils.lead_signals import auction_reference_date, derive_signals
-from src.utils.located_parcel import PARCEL_SOURCE_LABEL, located_parcel_id
+from src.utils.located_parcel import located_parcel_id, parcel_source_label
 
 # Canonical column order. Existing reference/legacy columns first, dialer-import
 # split columns + enrichment passthrough appended at END (backward-compatible for
@@ -408,10 +408,7 @@ def build_lead_export_row(
         # A located parcel (exact map match, never stored as parcel_id) fills the
         # column only when the source gave none; parcel_source says where it came from.
         "parcel_id": sanitize_for_csv(_get(record, "parcel_id") or located_parcel_id(enr)),
-        "parcel_source": (
-            "" if _get(record, "parcel_id") or not located_parcel_id(enr)
-            else PARCEL_SOURCE_LABEL
-        ),
+        "parcel_source": "" if _get(record, "parcel_id") else parcel_source_label(enr),
         "property_address": sanitize_for_csv(_get(record, "property_address")),
         "mailing_address": sanitize_for_csv(_get(record, "mailing_address")),
         "legal_description": sanitize_for_csv(_get(record, "legal_description")),

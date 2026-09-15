@@ -2598,6 +2598,17 @@
             ],
             "title": "Located Parcel Id"
           },
+          "located_parcel_match": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Located Parcel Match"
+          },
           "mailing_address": {
             "anyOf": [
               {

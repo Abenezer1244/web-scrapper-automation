@@ -135,7 +135,6 @@ def test_a_condominium_complex_parcel_is_never_exact(monkeypatch):
 
 
 @pytest.mark.parametrize("ed", [
-    _exact_ed(kc_pin_match="street_only"),
     _exact_ed(kc_pin_match="condo_complex"),
     _exact_ed(kc_pin_match="unconfirmed"),
     {k: v for k, v in _exact_ed().items() if k != "kc_pin_match"},  # located before tiers
@@ -144,22 +143,33 @@ def test_a_condominium_complex_parcel_is_never_exact(monkeypatch):
     _exact_ed(pin="913810048"),
     None,
 ])
-def test_only_an_exact_location_is_a_parcel_id(ed):
+def test_only_exact_or_street_level_locations_are_a_parcel_id(ed):
     assert located_parcel_id(ed) is None
 
 
 def test_exact_location_is_a_parcel_id():
     assert located_parcel_id(_exact_ed()) == "9138100481"
+    assert located_parcel_id(_exact_ed(), exact_only=True) == "9138100481"
+
+
+def test_street_level_location_is_shown_but_not_exact():
+    # Owner decision 2026-09-14: the source gave no ZIP, the street matched one parcel.
+    street = _exact_ed(kc_pin_match="street_only")
+    assert located_parcel_id(street) == "9138100481"
+    assert located_parcel_id(street, exact_only=True) is None
 
 
 # ── Owner naming ───────────────────────────────────────────────────────────────
 
-def test_owner_is_named_only_for_exact_rows_with_no_party():
+def test_owner_is_named_only_for_shown_locations_with_no_party():
     exact = SimpleNamespace(party_name=None, enrichment_data=_exact_ed())
-    street = SimpleNamespace(party_name=None, enrichment_data=_exact_ed(kc_pin_match="street_only"))
+    street = SimpleNamespace(party_name=None, enrichment_data=_exact_ed(
+        pin="5249802770", kc_pin_match="street_only"))
+    condo = SimpleNamespace(party_name=None, enrichment_data=_exact_ed(
+        pin="9903000000", kc_pin_match="condo_complex"))
     named = SimpleNamespace(party_name="SOMEONE ELSE", enrichment_data=_exact_ed())
-    pin_map = kpl.owner_lookup_pins([exact, street, named])
-    assert pin_map == {"9138100481": [exact]}
+    pin_map = kpl.owner_lookup_pins([exact, street, condo, named])
+    assert pin_map == {"9138100481": [exact], "5249802770": [street]}
 
     n = kpl.apply_owner_names(pin_map, {"9138100481": "7011 ROOSEVELT WAY NE LLC 7"},
                               checked_at="2026-09-14T00:00:00+00:00")
@@ -167,7 +177,8 @@ def test_owner_is_named_only_for_exact_rows_with_no_party():
     assert exact.party_name == "7011 ROOSEVELT WAY NE LLC 7"
     assert exact.enrichment_data["owner_source"] == "king_erealproperty"
     assert exact.enrichment_data["owner_pin"] == "9138100481"
-    assert street.party_name is None and named.party_name == "SOMEONE ELSE"
+    assert street.party_name is None and condo.party_name is None
+    assert named.party_name == "SOMEONE ELSE"
 
 
 def test_an_owner_for_a_different_pin_is_never_applied():
@@ -267,9 +278,22 @@ def test_api_never_shows_a_located_parcel_over_a_real_one():
     assert (out.parcel_id, out.located_parcel_id) == ("1234567890", None)
 
 
-def test_api_hides_a_street_only_location():
-    ed = _exact_ed(kc_pin_match="street_only")
-    assert ResultRow(**_row(enrichment_data=ed)).located_parcel_id is None
+def test_api_shows_a_street_level_location_and_says_so():
+    out = ResultRow(**_row(enrichment_data=_exact_ed(kc_pin_match="street_only")))
+    assert (out.located_parcel_id, out.located_parcel_match) == ("9138100481", "street_only")
+    exact = ResultRow(**_row())
+    assert exact.located_parcel_match == "exact"
+
+
+def test_api_hides_a_condo_complex_location():
+    out = ResultRow(**_row(enrichment_data=_exact_ed(kc_pin_match="condo_complex")))
+    assert (out.located_parcel_id, out.located_parcel_match) == (None, None)
+
+
+def test_export_labels_a_street_level_parcel():
+    row = build_lead_export_row(_row(enrichment_data=_exact_ed(kc_pin_match="street_only")))
+    assert row["parcel_id"] == "9138100481"
+    assert row["parcel_source"] == "County parcel map match (street only, no ZIP in source)"
 
 
 def test_export_fills_parcel_and_says_where_it_came_from():
@@ -493,9 +517,68 @@ async def test_a_live_king_cv_job_locates_the_parcel_names_the_owner_and_keeps_p
     assert (e.parcel_id, e.dedup_hash) == (None, dedup)
     assert located_parcel_id(e.enrichment_data) == "9138100481"
     assert s.enrichment_data["kc_pin_match"] == "street_only"
-    assert s.party_name is None and s.parcel_id is None
-    assert located_parcel_id(s.enrichment_data) is None
-    assert len(owner_pages) == 1  # one page for the one exact PIN
+    # Street-level match: shown and named (owner decision), parcel_id still untouched.
+    assert s.party_name == "7011 ROOSEVELT WAY NE LLC 7" and s.parcel_id is None
+    assert located_parcel_id(s.enrichment_data) == "9138100481"
+    assert located_parcel_id(s.enrichment_data, exact_only=True) is None
+    assert len(owner_pages) == 1  # both rows sit on one PIN: one page
+
+
+@pytest.mark.asyncio
+async def test_retry_owners_names_street_level_rows_and_never_condo_complexes(
+    db, business_user, tmp_path, monkeypatch,
+):
+    repaired = {"cv_semantics_repaired_at": "2026-09-14T15:30:00+00:00",
+                "violation_category": None}
+    street, dedup = await _stored_row(
+        db, business_user, party=None, address="7011 ROOSEVELT WAY NE",
+        ed={**_exact_ed(kc_pin_match="street_only"), **repaired})
+    condo, _ = await _stored_row(
+        db, business_user, party=None, address="7011 ROOSEVELT WAY NE, SEATTLE WA 98115",
+        ed={**_exact_ed(pin="9903000000", kc_pin_match="condo_complex"), **repaired})
+    import src.utils.safe_http as safe_http
+    monkeypatch.setattr(safe_http, "safe_get", lambda *a, **kw: _Resp([SDCI_ROOSEVELT]))
+    monkeypatch.setattr(bko.time, "sleep", lambda s: None)
+    pages: list = []
+
+    def _erp(url, *a, **kw):
+        pages.append(url)
+        return _Resp(text_body=ROOSEVELT_PAGE)
+
+    monkeypatch.setattr(kca, "safe_get", _erp)
+
+    async def _no_wait(_s):
+        return None
+
+    monkeypatch.setattr(kca.asyncio, "sleep", _no_wait)
+
+    def _run(retry):
+        from src.db.session import system_sync_session
+
+        with system_sync_session() as sdb:
+            return bko.run(sdb, apply_writes=True, owners=True, retry_owners=retry,
+                           report=tmp_path / "r.jsonl", socrata_pace_s=0, gis_pace_s=0,
+                           owner_delay=0)
+
+    assert (await asyncio.to_thread(_run, False))["candidates"] == 0
+    stats = await asyncio.to_thread(_run, True)
+    assert stats["candidates"] == 1 and stats["named"] == 1
+    assert len(pages) == 1 and pages[0].endswith("9138100481")
+
+    got = {str(r.id): r for r in (await db.execute(text(
+        "SELECT id, party_name, parcel_id, dedup_hash, enrichment_data FROM results "
+        "WHERE id = ANY(:ids)"), {"ids": [street, condo]})).all()}
+    assert got[street].party_name == "7011 ROOSEVELT WAY NE LLC 7"
+    assert got[street].enrichment_data["owner_pin"] == "9138100481"
+    assert (got[street].parcel_id, got[street].dedup_hash) == (None, dedup)
+    assert got[condo].party_name is None and "owner_source" not in got[condo].enrichment_data
+    # A named street-level row is never paid for.
+    row = SimpleNamespace(party_name=got[street].party_name, enrichment_data=got[street].enrichment_data,
+                          property_address="7011 ROOSEVELT WAY NE", mailing_address=None,
+                          property_city="SEATTLE", property_state="WA", property_zip=None,
+                          id="x", job_id="y", user_id="z")
+    assert build_pending_row_payload(row) is None
+    assert (await asyncio.to_thread(_run, True))["candidates"] == 0
 
 
 def test_repair_refuses_owner_lookups_on_the_private_redis_host(monkeypatch):

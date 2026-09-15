@@ -841,9 +841,26 @@ def code_violation_owner_is_known(result) -> bool:
         pin = located_parcel_id(ed, exact_only=True)
         return (ed.get("owner_source") == OWNER_SOURCE
                 and pin is not None and ed.get("owner_pin") == pin)
-    # Tacoma: no owner enrichment exists yet, so no row can pass. A future Pierce owner
-    # pass defines its own proof here rather than borrowing King's (Codex r2 P1).
-    return False
+    # Tacoma: its own proof, never King's (Codex r2 P1). The name must have been read by
+    # the Pierce ATIP owner pass (pierce_atip_owner, owner decision 2026-09-14) for the
+    # parcel the row carries NOW and accepted there: an owner left behind by a changed
+    # parcel_id fails closed instead of tracing (and billing) the wrong person.
+    from src.scrapers.enrichment.pierce_atip_owner import (
+        MATCHED,
+        normalize_parcel,
+    )
+    from src.scrapers.enrichment.pierce_atip_owner import (
+        OWNER_SOURCE as PIERCE_OWNER_SOURCE,
+    )
+
+    parcel = normalize_parcel(getattr(result, "parcel_id", None))
+    # The blank-party check above already covers this branch; restated so the Tacoma
+    # proof reads complete on its own and survives a reordering (Codex r1).
+    return (ed.get("source") == "tacoma_code_violations"
+            and bool((getattr(result, "party_name", None) or "").strip())
+            and ed.get("owner_source") == PIERCE_OWNER_SOURCE
+            and ed.get("owner_status") == MATCHED
+            and parcel is not None and ed.get("owner_pin") == parcel)
 
 
 # ─── Helper: build a PendingSkipTraceRow payload from a Result ─────────────

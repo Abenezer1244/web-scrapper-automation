@@ -1334,7 +1334,11 @@ async def download_export(
             media_type="text/csv",
             headers={
                 "Content-Disposition": f'attachment; filename="bridgeleads_{job_id[:8]}.csv"',
-                "Cache-Control": "private, max-age=3600",
+                # no-store: the file is built LIVE (skip-trace phones, the scraper's
+                # CSV layout). A cached copy served a stale file for an hour, e.g. the
+                # old headers after a layout switch (local browser check, 2026-09-15),
+                # and owner PII should not sit in a shared browser cache anyway.
+                "Cache-Control": "no-store",
             },
             # Activation signal, recorded AFTER the bytes go out. As a background
             # task it cannot turn a bookkeeping failure into a failed download,

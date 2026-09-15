@@ -819,6 +819,20 @@ class DeliverUpdate(BaseModel):
     phoneburner_access_token_set: bool | None = Field(default=None, exclude=True)
 
 
+class CsvLayoutUpdate(BaseModel):
+    """PUT /scrapers/{id}/csv-layout — switch ONE config's CSV export layout.
+
+    A dedicated single-field write rather than a PATCH echo of GET's deliver dict:
+    stored legacy deliver dicts can hold keys DeliverUpdate (extra="forbid") rejects
+    (e.g. a singular "format"), so echoing them would 422 old scrapers. This touches
+    only deliver.csv_layout and leaves every other stored key byte-identical.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    csv_layout: Literal["legacy_v1", "crm_v1"]
+
+
 class ScraperConfigUpdate(BaseModel):
     """PATCH /scrapers/{id} — partial edit of an existing scraper config.
 

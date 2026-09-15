@@ -32,6 +32,7 @@ from src.api.schemas import (
     CachedResultsPage,
     ConnectorCreate,
     ConnectorResponse,
+    CsvLayoutUpdate,
     DeliverConfig,
     ScraperConfigCreate,
     ScraperConfigResponse,
@@ -823,6 +824,105 @@ async def update_scraper(
     await db.refresh(config)
 
     audit_log(request, "scraper_updated", current_user.id, audit_detail)
+    return ScraperConfigResponse.model_validate(config)
+
+
+@router.put("/{scraper_id}/csv-layout", response_model=ScraperConfigResponse)
+async def set_scraper_csv_layout(
+    scraper_id: str,
+    body: CsvLayoutUpdate,
+    request: Request,
+    current_user: CurrentUser,
+    db: AsyncSession = Depends(get_rls_db),
+) -> ScraperConfigResponse:
+    """Switch one scraper's CSV export layout (legacy_v1 <-> crm_v1) atomically.
+
+    Writes ONLY deliver.csv_layout; every other stored deliver key (secrets,
+    emails, formats, webhooks, legacy keys PATCH would reject) stays untouched.
+    Setting the value already stored is a no-op (no updated_at bump, no audit).
+    """
+    from src.db.models import Job
+
+    await rate_limit(request, zone="general", identifier=current_user.id)
+
+    # Same owned + active load as update_scraper; FOR UPDATE serializes this write
+    # against a concurrent edit or job insert (see update_scraper step 4).
+    config = (
+        await db.execute(
+            select(ScraperConfig)
+            .where(
+                ScraperConfig.id == scraper_id,
+                ScraperConfig.user_id == current_user.id,
+                ScraperConfig.active,
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if config is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scraper not found")
+
+    # A malformed stored deliver (not a JSON object) is refused WITHOUT writing: any
+    # rebuild would drop settings this endpoint promises never to touch (Codex P1).
+    if not isinstance(config.deliver, dict):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This scraper's delivery settings need to be saved again before the layout can change.",
+        )
+    old_layout = config.deliver.get("csv_layout")
+    # Asking for the layout it already has is a no-op, even for a batch child or
+    # while a job runs: nothing changes, so there is nothing to refuse (Codex P2).
+    if old_layout == body.csv_layout:
+        return ScraperConfigResponse.model_validate(config)
+
+    # A batch delivers ONE combined file built by the batch, which keeps the classic
+    # layout; a per-child layout would never reach the customer.
+    if config.batch_id is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "This scraper belongs to a batch. Batch scrapes deliver one combined "
+                "file and keep the classic CSV layout."
+            ),
+        )
+
+    # The worker re-reads the config at runtime: switching mid-job would make that
+    # job's initial and enriched exports carry different headers.
+    active_job = (
+        await db.execute(
+            select(Job.id)
+            .where(
+                Job.scraper_config_id == scraper_id,
+                Job.user_id == current_user.id,
+                Job.status.in_(ACTIVE_STATUSES),
+            )
+            .limit(1)
+        )
+    ).first()
+    if active_job is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "A job is running for this scraper. Try again when it finishes "
+                "so its files keep one consistent layout."
+            ),
+        )
+
+    new_deliver = dict(config.deliver)
+    new_deliver["csv_layout"] = body.csv_layout
+    # A NEW dict object so SQLAlchemy detects the JSON change (in-place mutation of
+    # a plain JSON column is not tracked); onupdate bumps updated_at on flush.
+    config.deliver = new_deliver
+    await db.flush()
+    await db.refresh(config)
+
+    # Log allowlisted layout values only, never the deliver dict (it carries secrets)
+    # and never an unexpected stored string (Codex P3).
+    old_label = old_layout if old_layout in ("legacy_v1", "crm_v1") else "unset"
+    audit_log(
+        request, "scraper_updated", current_user.id,
+        f"config_id={config.id} changed=deliver.csv_layout "
+        f"csv_layout={old_label}->{body.csv_layout}",
+    )
     return ScraperConfigResponse.model_validate(config)
 
 

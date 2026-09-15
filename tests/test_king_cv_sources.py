@@ -601,6 +601,16 @@ async def test_a_king_cv_job_names_and_mails_parcel_source_rows_without_touching
                       mailing_address=None, dedup_hash=dedup, skip_trace_status="not_attempted",
                       is_duplicate=False, enrichment_data={"source": source, "case_number": case}))
         rows[source] = (rid, pin, dedup)
+    # An Accela intake case with no parcel yet but a street and ZIP: never located from its
+    # address (the tripwire below), so it keeps no located PIN, owner or mailing.
+    no_parcel_id = str(uuid.uuid4())
+    db.add(Result(id=no_parcel_id, user_id=business_user.id, job_id=job_id, party_name=None,
+                  parcel_id=None, property_address="7016 S LAKERIDGE DR", property_zip="98178",
+                  legal_description="ENFR26-0933", mailing_address=None,
+                  dedup_hash=uuid.uuid4().hex,
+                  skip_trace_status="not_attempted", is_duplicate=False,
+                  enrichment_data={"source": "kingco_accela_code_enforcement",
+                                   "case_number": "ENFR26-0933"}))
     await db.commit()
 
     # Real Assessor extract rows for both parcels (snapshot 2026-09-05).
@@ -624,7 +634,11 @@ async def test_a_king_cv_job_names_and_mails_parcel_source_rows_without_touching
     monkeypatch.setattr("src.scrapers.enrichment.county_gis.batch_enrich_parcels_gis",
                         lambda *a, **kw: {})
 
+    locate_calls: list = []
+
     def _locate_must_not_run(*a, **kw):
+        # Recorded, because enrichment logs and swallows an exception from this step.
+        locate_calls.append(a)
         raise AssertionError("parcel-keyed rows are never located from coordinates")
 
     monkeypatch.setattr(kpl, "resolve_code_violation_mailing", _locate_must_not_run)
@@ -664,3 +678,8 @@ async def test_a_king_cv_job_names_and_mails_parcel_source_rows_without_touching
             mailing_address=row.mailing_address, property_city=None, property_state="WA",
             property_zip=None, enrichment_data=row.enrichment_data)) is not None
     assert any(url.endswith("2571200050") for url in erp_calls)
+    assert locate_calls == []
+    untouched = got[no_parcel_id]
+    assert (untouched.party_name, untouched.parcel_id, untouched.mailing_address) == (None, None, None)
+    assert untouched.enrichment_data == {"source": "kingco_accela_code_enforcement",
+                                         "case_number": "ENFR26-0933"}

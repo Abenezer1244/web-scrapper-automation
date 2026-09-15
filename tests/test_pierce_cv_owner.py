@@ -339,13 +339,28 @@ async def test_the_atip_owner_browser_is_plain_with_no_init_script():
     """Owner decision 2026-09-15: no anti-detection toward ATIP. A real Chromium session on
     about:blank (no network): no init script registered, navigator.webdriver left true,
     no plugins/UA spoofing, while the default scraper keeps its behavior."""
-    session = pao._new_session()
-    async with session as s:
-        assert s.init_scripts_registered == 0
-        assert await s.page.evaluate("navigator.webdriver") is True
-        assert await s.page.evaluate("Array.isArray(navigator.plugins)") is False
-        assert "HeadlessChrome" in await s.page.evaluate("navigator.userAgent")
+    from playwright.async_api import async_playwright
+
     from src.scrapers.base_scraper import BridgeScraper
+
+    identity = """() => ({ua: navigator.userAgent, webdriver: navigator.webdriver,
+        plugins: Array.from(navigator.plugins).map(p => p.name), pluginsIsArray:
+        Array.isArray(navigator.plugins), languages: navigator.languages,
+        language: navigator.language, chrome: typeof window.chrome,
+        chromeKeys: window.chrome ? Object.keys(window.chrome).sort() : null,
+        width: window.innerWidth, height: window.innerHeight,
+        tz: Intl.DateTimeFormat().resolvedOptions().timeZone})"""
+    # The reference: a stock Playwright headless Chromium context, nothing configured.
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        stock_page = await (await browser.new_context()).new_page()
+        stock = await stock_page.evaluate(identity)
+        await browser.close()
+
+    async with pao._new_session() as s:
+        assert s.init_scripts_registered == 0
+        assert await s.page.evaluate(identity) == stock    # indistinguishable from stock
+        assert stock["webdriver"] is True
 
     async with BridgeScraper() as default:                 # other scrapers: unchanged
         assert default.init_scripts_registered == 1

@@ -218,9 +218,10 @@ class BridgeScraper:
                 )
                 resolved_ua = LEGACY_BROWSER_UA
 
-        context_kwargs: dict = {"viewport": {"width": 1280, "height": 800}, "locale": "en-US"}
-        if resolved_ua is not None:
-            context_kwargs["user_agent"] = resolved_ua
+        # A plain browser gets a stock context: no UA, viewport or locale override at all.
+        context_kwargs: dict = {} if self._plain_browser else {
+            "user_agent": resolved_ua, "viewport": {"width": 1280, "height": 800},
+            "locale": "en-US"}
         self._context = await self._browser.new_context(**context_kwargs)
         # Per-hop SSRF enforcement: validate every DOCUMENT navigation
         # (initial load AND each redirect hop) BEFORE the request leaves the

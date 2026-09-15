@@ -51,8 +51,21 @@ per-scraper switch); **read-only prod reads allowed** for format sampling + real
       cells for ids/zips/phones, JSON snake_case) resolve the same layout + source context; scheduled
       projection now carries stored property_city/state/zip (drift bug fixed).
 - [x] `tests/test_csv_layout_delivery.py` (21, real endpoints + DB, mutation-checked: 10 fail when wiring removed).
-- [ ] Full suite (4 batches) ; OpenAPI regen ; Codex review of Phase 2 diff.
+- [x] Full suite: local runs killed for low memory; owner chose CI. PR #315 CI: 3652 passed, 1 failed (key-set
+      test copy, fixed in 76b3524). OpenAPI regen additive only (0 deletions), CI drift check passed.
+- [x] Codex Phase 2: 1 P1 + 2 P2, all verified NOT real against the code (unconditional export block; stored
+      deliver always a dict; invalid stored layout already normalized to None on edit).
 - Batch children + batch/Lists combined CSVs stay legacy this PR (report).
+### Phase 3 - verification + docs + FE
+- [x] Real CSVs, read-only, 8 prod jobs / 935 rows: 0 column mismatches vs DB values (local files deleted, PII).
+- [ ] Playwright Results -> Download CSV: needs deploy or local full stack (not done).
+- [ ] FE layout toggle; BatchDialer guide for crm_v1.
+
+## Review
+Contract change, not new parsing: split columns already existed. Versioned layout keeps every existing customer's
+headers; new scrapers get crm_v1. The real win is correctness: source-aware names (213 corrected, 405 wrong ->
+blank on 163,261 prod rows) and no fabricated address parts. Two latent bugs fixed (scheduled situs drop, Pierce
+case id). One deploy-breaking bug avoided (DeliverUpdate extra=forbid). Accepted residual: double surnames.
 ### Phase 3 - verification + docs + FE
 - [ ] Real CSVs from completed prod jobs (prefc, tax, CV, probate, trustee_sale) compared to DB values.
 - [ ] Playwright (Chromium, not Claude-in-Chrome): Results -> Download CSV -> parse the file.

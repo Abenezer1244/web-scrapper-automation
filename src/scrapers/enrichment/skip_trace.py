@@ -28,6 +28,7 @@ import requests
 
 from src.api.middleware.security import validate_scraping_target
 from src.config import settings
+from src.scrapers import king_cv_sources
 from src.utils.logger import setup_logger
 from src.utils.safe_http import safe_get_following
 
@@ -815,9 +816,11 @@ def legacy_cache_locality(result) -> tuple[str | None, str | None]:
     return parsed["city"], parsed["state"]
 
 
-# enrichment_data.source of the code-violation scrapers (king_wa_code_violation,
-# pierce_wa_code_violation).
-CODE_VIOLATION_SOURCES = frozenset({"seattle_sdci_code_violations", "tacoma_code_violations"})
+# enrichment_data.source of the code-violation scrapers (king_wa_code_violation and its
+# king_cv_sources adapters, pierce_wa_code_violation).
+_KING_CODE_VIOLATION_SOURCES = frozenset({king_cv_sources.SEATTLE_SDCI, king_cv_sources.BELLEVUE,
+                                          king_cv_sources.BURIEN})
+CODE_VIOLATION_SOURCES = _KING_CODE_VIOLATION_SOURCES | {"tacoma_code_violations"}
 
 
 def code_violation_owner_is_known(result) -> bool:
@@ -830,15 +833,15 @@ def code_violation_owner_is_known(result) -> bool:
         return True
     if not (getattr(result, "party_name", None) or "").strip():
         return False
-    if ed["source"] == "seattle_sdci_code_violations":
-        from src.scrapers.enrichment.king_parcel_locate import OWNER_SOURCE
-        from src.utils.located_parcel import located_parcel_id
+    if ed["source"] in _KING_CODE_VIOLATION_SOURCES:
+        from src.scrapers.enrichment.king_parcel_locate import OWNER_SOURCE, owner_parcel_id
 
-        # The name must have been read for the parcel the row is CURRENTLY located on,
-        # and that location must still be exact: stale owner metadata left behind by a
-        # changed location would trace (and bill) the wrong person (Codex P1).
-        # Exact only: a street-only owner is shown and named, never paid for (Codex P1).
-        pin = located_parcel_id(ed, exact_only=True)
+        # The name must have been read from King eRealProperty for the parcel the row is
+        # on NOW: the PIN the source printed (Bellevue, Burien: parcel_id) or the parcel
+        # SDCI is currently located on. Stale owner metadata left behind by a changed
+        # location would trace (and bill) the wrong person (Codex P1). A located PIN must
+        # be exact: a street-only owner is shown and named, never paid for (Codex P1).
+        pin = owner_parcel_id(result, exact_only=True)
         return (ed.get("owner_source") == OWNER_SOURCE
                 and pin is not None and ed.get("owner_pin") == pin)
     # Tacoma: no owner enrichment exists yet, so no row can pass. A future Pierce owner

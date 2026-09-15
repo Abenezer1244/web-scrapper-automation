@@ -1,288 +1,128 @@
-"""King County (WA) — Code Violations scraper via Seattle Open Data Socrata API.
+"""King County (WA) code violations: one connector over every jurisdiction we can collect.
 
-Source: City of Seattle SDCI — Code Complaints and Violations
-API: Socrata (data.seattle.gov), dataset ez4a-iug7
-Docs: https://data.seattle.gov/w/ez4a-iug7
+Each jurisdiction is a source adapter in src/scrapers/king_cv_sources/ (Seattle SDCI,
+Bellevue, Burien). This connector runs them in order and merges their records; every
+record keeps its own enrichment_data.source, case number and per-case raw_html_hash.
 
-Covers City of Seattle code enforcement (weeds, junk, building, noise, etc.)
-Properties facing code violations are motivated sellers — facing fines and
-repair orders. Easier to sell as-is.
+PARTIAL FAILURE. An adapter retries its own transient failures and raises when one
+survives them. A failed source does not fail the job while another source succeeded:
+the job ships the records it has, the failure is logged with the source key, and a
+customer-visible warning naming the missing jurisdiction(s) is published to the job log
+(`scrape_warnings`, published by the worker's _run_scraper). Per-source outcomes are in
+`source_status`. When EVERY source fails, the scrape raises as it always has.
 
-NOTE: Only covers City of Seattle, not all of King County (no other King jurisdiction
-is scraped for code violations).
-No parcel ID or owner in the API. Enrichment locates the King parcel from the
-coordinates (enrichment_data.kc_pin, never parcel_id) and reads the owner from it.
+Seattle rows carry no parcel or owner (enrichment locates the parcel from coordinates
+into enrichment_data.kc_pin). Bellevue and Burien print the King PIN, which is stored as
+parcel_id at scrape; their owner is read from King eRealProperty during enrichment.
 """
+from __future__ import annotations
 
-import hashlib
-import random
-import time
-from datetime import datetime
+from collections.abc import Sequence
 
-import requests
-
-from src.api.middleware.security import add_scrape_domain
-from src.config import settings
 from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord
+from src.scrapers.king_cv_sources.base import CodeViolationSource
+from src.scrapers.king_cv_sources.bellevue import BellevueSource
+from src.scrapers.king_cv_sources.burien import BurienSource
+from src.scrapers.king_cv_sources.seattle_sdci import SeattleSDCISource
+from src.scrapers.reliability import TransientScrapeError, is_transient_scrape_error
 from src.utils.logger import setup_logger
-from src.utils.safe_http import safe_get
 
 _logger = setup_logger("scraper.king_wa_code_violation")
 
-_API_URL = "https://data.seattle.gov/resource/ez4a-iug7.json"
-_HEADERS = {"User-Agent": "Mozilla/5.0 BridgeLeads/1.0"}
+# The registration list: every adapter the King code_violation connector runs, in order.
+SOURCES: tuple[type[CodeViolationSource], ...] = (SeattleSDCISource, BellevueSource, BurienSource)
 
-add_scrape_domain("data.seattle.gov")
-
-_PAGE_SIZE = 1000
-
-# Defensive cap so a misbehaving API that never returns a short final page can't
-# loop forever (1000 pages × _PAGE_SIZE = 1M rows, far beyond any real window).
-_MAX_PAGES = 1000
-
-# Cap the stored violation category so a runaway recordtypedesc can't bloat the row.
-_LABEL_MAX = 120
-
-# Per-page fetch retries for transient Socrata failures (read timeout / 429 /
-# 5xx). Backoff seconds, indexed by attempt; jittered to desync shared-IP retries.
-_RETRY_BACKOFF = (1, 3, 7)
-_RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
+SOURCE_OK = "ok"
+SOURCE_FAILED = "failed"
 
 
-def _is_retryable(exc: Exception) -> bool:
-    """True for transient HTTP failures worth re-attempting (read timeout /
-    connection drop / 429 / 5xx); False for SSRF (ValueError) and non-transient
-    4xx (bad query / forbidden), which a retry can't fix."""
-    if isinstance(exc, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)):
-        return True
-    if isinstance(exc, requests.exceptions.HTTPError) and exc.response is not None:
-        return exc.response.status_code in _RETRY_STATUS
-    return False
+def _join_names(names: Sequence[str]) -> str:
+    """"Seattle", "Seattle and Bellevue", "Seattle, Bellevue, and Burien"."""
+    names = list(names)
+    if len(names) <= 2:
+        return " and ".join(names)
+    return ", ".join(names[:-1]) + f", and {names[-1]}"
+
+
+def scope_note(sources: Sequence[type[CodeViolationSource]] = SOURCES) -> str:
+    return (f"Collected from the code enforcement records of "
+            f"{_join_names([s.jurisdiction for s in sources])}.")
+
+
+def partial_failure_warning(failed: Sequence[str], succeeded: Sequence[str]) -> str:
+    """Customer-facing job log line for a run that shipped without some jurisdictions."""
+    return (f"Code violation records from {_join_names(failed)} could not be collected this "
+            f"run, so these leads cover {_join_names(succeeded)} only. Run this scraper again "
+            f"later to include {_join_names(failed)}.")
 
 
 class KingWACodeViolationScraper(BridgeScraper):
-    """Scrapes code violation records from Seattle's Socrata open data API.
-
-    No browser automation needed — pure HTTP GET.
-    Returns records with property address, case info, and coordinates.
-    Parcel IDs are enriched via GIS from the address.
-    """
+    """King County code violations merged from every registered jurisdiction source."""
 
     @classmethod
     def collection_scope(cls, record_type: str):
-        """SHOW descriptor — King code violations come from a dataset, not docs."""
+        """SHOW descriptor: King code violations come from city datasets, not documents."""
         from src.scrapers.doc_scope import dataset
 
         if record_type != "code_violation":
             return None
-        return dataset(
-            "Collected from Seattle's SDCI code-violation open dataset; recorder "
-            "document-type filtering is not used."
-        )
+        return dataset(scope_note())
 
-    def __init__(self, record_type: str = "code_violation"):
+    def __init__(self, record_type: str = "code_violation", *,
+                 sources: Sequence[CodeViolationSource] | None = None):
         super().__init__()
-
-    def _fetch_page(self, params: dict, offset: int, page_num: int) -> list:
-        """Fetch one Socrata page with bounded retries on transient failures.
-
-        Retries read-timeout / 429 / 5xx with jittered backoff
-        (settings.MAX_RETRIES attempts). A failure that survives all retries — or
-        any non-transient error (SSRF ValueError, 4xx) — FAILS LOUD: a transient
-        error here would otherwise truncate the list and the worker would mark the
-        job DONE on a partial/empty result, so abort instead of shipping that.
-        """
-        last_exc: Exception | None = None
-        for attempt in range(1, settings.MAX_RETRIES + 1):
-            try:
-                # S4: safe_http (SSRF defense-in-depth) — re-validates the fixed
-                # HTTPS Socrata endpoint each attempt, disables ambient proxy,
-                # refuses redirect-to-internal.
-                resp = safe_get(_API_URL, params=params, headers=_HEADERS,
-                                timeout=settings.DEFAULT_TIMEOUT)
-                resp.raise_for_status()
-                data = resp.json()
-                # Socrata returns a JSON list of rows. A non-list (200 carrying an
-                # error object) means the query/source changed shape — fail loud.
-                if not isinstance(data, list):
-                    raise RuntimeError(
-                        f"King code violation: expected a JSON list at offset "
-                        f"{offset} (page {page_num + 1}) but got {type(data).__name__}"
-                    )
-                return data
-            except Exception as exc:
-                last_exc = exc
-                if attempt >= settings.MAX_RETRIES or not _is_retryable(exc):
-                    break
-                wait = _RETRY_BACKOFF[min(attempt - 1, len(_RETRY_BACKOFF) - 1)]
-                wait += random.uniform(0, 0.5)  # jitter to desync shared-IP retries
-                _logger.warning(
-                    "King code violation page fetch failed (offset=%d page=%d "
-                    "attempt=%d/%d): %s — retrying in %.1fs",
-                    offset, page_num + 1, attempt, settings.MAX_RETRIES,
-                    str(exc)[:120], wait,
-                )
-                time.sleep(wait)
-        raise RuntimeError(
-            f"King code violation: API page fetch failed at offset {offset} "
-            f"(page {page_num + 1}) after {settings.MAX_RETRIES} attempt(s) — "
-            f"aborting to avoid a truncated result: {str(last_exc)[:120]}"
-        ) from last_exc
+        self.sources: list[CodeViolationSource] = (
+            list(sources) if sources is not None else [cls() for cls in SOURCES])
+        #: {source key: "ok" | "failed"} for the last scrape.
+        self.source_status: dict[str, str] = {}
+        #: Customer-facing warnings from the last scrape, published to the job log.
+        self.scrape_warnings: list[str] = []
 
     async def scrape(self, date_from: str, date_to: str) -> list[ScrapedRecord]:
-        start = datetime.strptime(date_from, "%m/%d/%Y")
-        end = datetime.strptime(date_to, "%m/%d/%Y")
+        self.source_status = {}
+        self.scrape_warnings = []
+        records: list[ScrapedRecord] = []
+        failures: list[tuple[CodeViolationSource, Exception]] = []
 
-        where = (
-            f"opendate >= '{start.strftime('%Y-%m-%dT00:00:00')}' "
-            f"AND opendate <= '{end.strftime('%Y-%m-%dT23:59:59')}'"
-        )
+        for source in self.sources:
+            if self.on_progress is not None:
+                # The record count is cumulative across sources; pages are per source.
+                source.on_progress = (lambda pages, total, count, _done=len(records):
+                                      self.on_progress(pages, total, _done + count))
+            try:
+                got = await source.fetch(date_from, date_to)
+            except Exception as exc:
+                # A Celery time limit is the job's deadline, not this source's failure.
+                if type(exc).__name__ in ("SoftTimeLimitExceeded", "TimeLimitExceeded"):
+                    raise
+                self.source_status[source.key] = SOURCE_FAILED
+                failures.append((source, exc))
+                _logger.error("King code violation source %s failed for %s to %s: %s: %s",
+                              source.key, date_from, date_to, type(exc).__name__,
+                              str(exc)[:300])
+                continue
+            self.source_status[source.key] = SOURCE_OK
+            records.extend(got)
+            _logger.info("King code violation source %s: %d records", source.key, len(got))
 
-        _logger.info("King WA (Seattle) code violations — %s to %s", date_from, date_to)
+        if failures and len(failures) == len(self.sources):
+            names = ", ".join(s.key for s, _ in failures)
+            first = failures[0][1]
+            msg = f"King code violation: every source failed ({names}): {str(first)[:200]}"
+            # Keep the worker's retry decision: all-transient failures are retried.
+            if all(is_transient_scrape_error(e) for _, e in failures):
+                raise TransientScrapeError(msg) from first
+            raise RuntimeError(msg) from first
+        if failures:
+            failed = [s.jurisdiction for s, _ in failures]
+            succeeded = [s.jurisdiction for s in self.sources
+                         if self.source_status.get(s.key) == SOURCE_OK]
+            self.scrape_warnings.append(partial_failure_warning(failed, succeeded))
+            _logger.warning("King code violation partial scrape: source_status=%s", self.source_status)
 
-        all_records: list[ScrapedRecord] = []
-        seen: set[str] = set()
-        offset = 0
-        page_num = 0
-        total_fetched = 0  # raw rows seen across all pages (F6 structural canary)
-        skipped_no_date = 0
-
-        while True:
-            # Defensive max-page guard (checked before the fetch, matching Pierce):
-            # a misbehaving API that never returns a short page can't loop forever.
-            if page_num >= _MAX_PAGES:
-                raise RuntimeError(
-                    f"King code violation: hit max-page guard ({_MAX_PAGES} pages) "
-                    f"without a short final page — aborting to avoid an infinite loop"
-                )
-
-            params = {
-                "$where": where,
-                # Order by ``:id`` — the dataset's unique, indexed system row id.
-                # ``opendate`` is NON-unique, so ties reorder at page boundaries and
-                # ``$offset`` paging can skip or duplicate rows; ``:id`` is the only
-                # stable key for offset paging here (and avoids a server-side sort).
-                "$order": ":id",
-                "$limit": _PAGE_SIZE,
-                "$offset": offset,
-            }
-
-            # Raises (RuntimeError) on transient-after-retries, non-retryable, or
-            # non-list response — never silently truncates the result.
-            data = self._fetch_page(params, offset, page_num)
-            if not data:
-                break
-            total_fetched += len(data)
-
-            for item in data:
-                rec_num = item.get("recordnum", "")
-                if not rec_num or rec_num in seen:
-                    continue
-                seen.add(rec_num)
-
-                record = ScrapedRecord()
-
-                # Address
-                addr = (item.get("originaladdress1") or "").strip()
-                city = (item.get("originalcity") or "").strip()
-                state = (item.get("originalstate") or "").strip()
-                zipcode = (item.get("originalzip") or "").strip()
-                if addr:
-                    record.property_address = addr
-                    if city:
-                        record.property_address += f", {city}"
-                    if state:
-                        record.property_address += f" {state}"
-                    if zipcode:
-                        record.property_address += f" {zipcode}"
-
-                # Date — robust parse of the Socrata ISO timestamp. Strip a trailing
-                # Z, drop fractional seconds, then fromisoformat the YYYY-MM-DDTHH:MM:SS
-                # head. Unparseable dates are skipped but counted (F6 canary covers
-                # the case where many rows fetch but all date-skip).
-                opendate = item.get("opendate", "")
-                if opendate:
-                    try:
-                        head = opendate.rstrip("Z").split(".")[0]
-                        dt = datetime.fromisoformat(head)
-                        record.date_recorded = dt.strftime("%m/%d/%Y")
-                    except Exception as exc:
-                        _logger.debug(
-                            "Could not parse opendate=%r for %s: %s",
-                            opendate, rec_num, exc,
-                        )
-
-                # Party name is the property OWNER, and SDCI has none: it names the
-                # complaint, not who owns the building. The label used to be written
-                # here ("Complaint - 7011 ROOSEVELT WAY NE"), so the category read as an
-                # owner. The owner is filled from the county parcel record during
-                # enrichment (king_parcel_locate -> eRealProperty), or stays empty.
-                record.party_name = None
-
-                # Legal description — record number
-                record.legal_description = rec_num
-
-                # Per-case idempotency key for the job insert (Result.raw_html_hash,
-                # String(32)). Without it the key is a tuple that includes party_name,
-                # so a watchdog re-run straddling a party_name change would append the
-                # same cases again instead of conflicting (Codex P1).
-                record.raw_html_hash = hashlib.sha256(
-                    f"seattle_sdci|{rec_num}".encode()
-                ).hexdigest()[:32]
-
-                # Enrichment data — structured fields only (no `description`: it
-                # persists complainant PII). violation_category is SDCI's own category
-                # ("Weeds", "Vacant Building"); record_type is the case kind
-                # ("Complaint", "Notice of Violation", "Citation").
-                category = (item.get("recordtypedesc") or "").strip()[:_LABEL_MAX]
-                record.enrichment_data = {
-                    "source": "seattle_sdci_code_violations",
-                    "record_number": rec_num,
-                    "violation_category": category or None,
-                    "record_type": item.get("recordtype"),
-                    "status": item.get("statuscurrent"),
-                    "last_inspection": item.get("lastinspdate"),
-                    "last_result": item.get("lastinspresult"),
-                    "latitude": item.get("latitude"),
-                    "longitude": item.get("longitude"),
-                }
-
-                if record.date_recorded:
-                    all_records.append(record)
-                else:
-                    skipped_no_date += 1
-
-            page_num += 1
-            _logger.info(
-                "Fetched %d records (page=%d, offset=%d, total=%d)",
-                len(data), page_num, offset, len(all_records),
-            )
-
-            if self.on_progress:
-                self.on_progress(page_num, 0, len(all_records))
-
-            if len(data) < _PAGE_SIZE:
-                break
-            offset += _PAGE_SIZE
-
-        if skipped_no_date:
-            _logger.warning(
-                "King code violation: %d of %d fetched rows had an unparseable/"
-                "missing opendate and were dropped",
-                skipped_no_date, total_fetched,
-            )
-
-        # Structural canary: a sizeable scan (>=100 rows) that emits zero records
-        # means a parse/shape break (e.g. field rename, all dates unparseable), not
-        # a genuinely empty window — fail loud rather than ship empty.
-        if total_fetched >= 100 and not all_records:
-            raise RuntimeError(
-                f"King code violation scanned {total_fetched} rows but produced 0 "
-                f"records — likely a parse bug or source-format change"
-            )
-
-        _logger.info("King WA (Seattle) code violations complete — %d records", len(all_records))
-        return all_records
+        _logger.info("King WA code violations complete: %d records, source_status=%s",
+                     len(records), self.source_status)
+        return records
 
     async def __aenter__(self):
         return self

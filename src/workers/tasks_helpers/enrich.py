@@ -153,6 +153,11 @@ async def _run_scraper(
             scraper.on_progress = on_progress
         records = await scraper.scrape(date_from, date_to)
 
+        # A connector that merges several sources ships what succeeded when one source
+        # fails, and says so here (e.g. King code violations). Customer-facing copy.
+        for warning in getattr(scraper, "scrape_warnings", None) or ():
+            _publish_log(r, job_id, "warning", warning)
+
         # Log AI usage if this was an AI-powered scrape
         if hasattr(scraper, "ai_cost") and scraper.ai_cost > 0:
             tokens = scraper.ai_tokens
@@ -903,10 +908,12 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
     # the SAME production path for an already-delivered job.
     pierce_address_recovery(db, r, job_id, config, all_results)
 
-    # King code violations carry coordinates but no parcel, so the parcel-keyed passes
-    # below can never give them a mailing address. Locate the parcel strictly (one
+    # Seattle SDCI code violations carry coordinates but no parcel, so the parcel-keyed
+    # passes below can never give them a mailing address. Locate the parcel strictly (one
     # polygon, same normalized street and ZIP) and take the mailing from the Assessor
     # extract. The PIN is stored beside the lead, never in parcel_id (dedup/billing).
+    # Bellevue and Burien rows arrive with parcel_id set at scrape and take the ordinary
+    # parcel-keyed King passes below (GIS, Assessor extract, eRealProperty) instead.
     if (config.county.lower() == "king" and config.state.upper() == "WA"
             and config.record_type == "code_violation"):
         _cv_rows = {
@@ -929,8 +936,8 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                          db=db)
             # Budget covers the WHOLE step: 420 s of parcel lookups (15 s request
             # timeout, so the last call ends by ~435 s) + one extract scan (~15 s) +
-            # commit. A code_violation job runs no eRealProperty pass (no parcel_id),
-            # so this replaces rather than adds to the King budget in the sum below.
+            # commit. It is counted in the code_violation budget sum below, beside the
+            # owner pass and the (shorter) parcel-keyed King pass.
             # Rows not reached keep no status and are picked up by
             # scripts/backfill_king_code_violation_mailing.py.
             try:
@@ -969,13 +976,13 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                 _logger.warning("Job %s: code violation mailing commit failed: %s",
                                 job_id, str(exc)[:120])
 
-        # SDCI names the complaint, never the owner, so party_name arrives empty. An
-        # exact or street-level located PIN names the owner through the same owner-only eRealProperty
-        # path King tax uses: lease-guarded, paced, breaker-protected, and it drops any
-        # page the county served for a different parcel. This job has no parcel_id, so
-        # the parcel-keyed owner pass below never runs for it; this takes its 300 s
-        # slot in that budget sum. Rows not reached keep no owner and are picked up by
-        # scripts/backfill_king_code_violation_owner.py.
+        # No source names the owner, so party_name arrives empty. The PIN Bellevue or
+        # Burien printed (parcel_id), or an exact or street-level located SDCI PIN, names
+        # the owner through the same owner-only eRealProperty path King tax uses:
+        # lease-guarded, paced, breaker-protected, and it drops any page the county served
+        # for a different parcel. The tax-only owner pass below never runs for this job;
+        # this takes its 300 s slot in the budget sum. SDCI rows not reached keep no owner
+        # and are picked up by scripts/backfill_king_code_violation_owner.py.
         from src.scrapers.enrichment.king_parcel_locate import (
             apply_owner_names,
             owner_lookup_pins,
@@ -1226,9 +1233,13 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
             # This pass can run to _KING_TOTAL_BUDGET_S plus one chunk's wait_for
             # grace (+60s), so 600 + 60 = 660s worst case:
             #   1800 + 660 + 300 = 2760s, inside soft_time_limit=3600s with ~840s
-            # left for persistence, export, billing and delivery. Raise a budget
-            # only by re-doing that sum.
-            _KING_TOTAL_BUDGET_S = 600
+            # left for persistence, export, billing and delivery. A code_violation job
+            # also runs the SDCI parcel match (~450s) before its owner pass, so this
+            # pass gets 240s there: 1800 + 450 + 300 + (240 + 60) = 2850s, ~750s left.
+            # Its parcel rows (Bellevue, Burien) are about a hundred a month and the
+            # extract usually fills their mailing first. Raise a budget only by
+            # re-doing that sum.
+            _KING_TOTAL_BUDGET_S = 240 if config.record_type == "code_violation" else 600
             _king_deadline = _time.monotonic() + _KING_TOTAL_BUDGET_S
 
             def _king_left() -> float:

@@ -23,6 +23,7 @@ from src.scrapers import king_wa_code_violation as kcv
 from src.scrapers.enrichment import king_county_assessor as kca
 from src.scrapers.enrichment import king_parcel_locate as kpl
 from src.scrapers.enrichment.skip_trace import build_pending_row_payload
+from src.scrapers.king_cv_sources import seattle_sdci
 from src.utils.lead_export import build_lead_export_row, resolve_lead_export_columns
 from src.utils.located_parcel import located_parcel_id
 from src.workers.property_identity import legacy_strong_signature
@@ -78,8 +79,9 @@ def _exact_ed(pin="9138100481", **extra) -> dict:
 @pytest.mark.asyncio
 async def test_scraper_stores_no_label_as_party_and_keeps_the_category(monkeypatch):
     pages = [[SDCI_ROOSEVELT, SDCI_VACANT], []]
-    monkeypatch.setattr(kcv, "safe_get", lambda *a, **kw: _Resp(pages.pop(0)))
-    recs = await kcv.KingWACodeViolationScraper().scrape("08/01/2026", "08/31/2026")
+    monkeypatch.setattr(seattle_sdci, "safe_get", lambda *a, **kw: _Resp(pages.pop(0)))
+    recs = await kcv.KingWACodeViolationScraper(sources=[seattle_sdci.SeattleSDCISource()]).scrape(
+        "08/01/2026", "08/31/2026")
     by_case = {r.legal_description: r for r in recs}
 
     vacant = by_case["011576-26CP"]
@@ -99,8 +101,9 @@ async def test_scraper_stores_no_label_as_party_and_keeps_the_category(monkeypat
 async def test_scraper_idempotency_key_is_the_case_not_the_party(monkeypatch):
     async def _scrape():
         pages = [[SDCI_ROOSEVELT, SDCI_VACANT], []]
-        monkeypatch.setattr(kcv, "safe_get", lambda *a, **kw: _Resp(pages.pop(0)))
-        return await kcv.KingWACodeViolationScraper().scrape("08/01/2026", "08/31/2026")
+        monkeypatch.setattr(seattle_sdci, "safe_get", lambda *a, **kw: _Resp(pages.pop(0)))
+        return await kcv.KingWACodeViolationScraper(
+            sources=[seattle_sdci.SeattleSDCISource()]).scrape("08/01/2026", "08/31/2026")
 
     first, second = await _scrape(), await _scrape()
     keys = [r.raw_html_hash for r in first]

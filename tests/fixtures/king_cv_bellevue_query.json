@@ -1,0 +1,2525 @@
+{
+"_note": "Real ArcGIS response fetched 2026-09-14 (read-only, UA Mozilla/5.0 BridgeLeads/1.0); only unused keys (fields, spatialReference) and the OWNER attribute (the adapter does not request it) removed.",
+"where": "PERMITTYPE='EA' AND APPLIEDDATE >= TIMESTAMP '2026-07-14 00:00:00' AND APPLIEDDATE < TIMESTAMP '2026-09-16 00:00:00'",
+"response": {
+"objectIdFieldName": "ObjectId",
+"features": [
+{
+"attributes": {
+"ObjectId": 927294,
+"PERMITNUMBER": "26 116812 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "1218 143rd Ave SE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980075527",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "2207100200",
+"APPLIEDDATE": 1784012400000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Parking on Lawn. "
+}
+},
+{
+"attributes": {
+"ObjectId": 927295,
+"PERMITNUMBER": "26 116811 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "123 165th Ave NE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980084515",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "4038600090",
+"APPLIEDDATE": 1784012400000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Home Occupation. "
+}
+},
+{
+"attributes": {
+"ObjectId": 927384,
+"PERMITNUMBER": "26 116867 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "96 Cascade Ky",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980061",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "6072800110",
+"APPLIEDDATE": 1784098800000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Clearing & Grading. "
+}
+},
+{
+"attributes": {
+"ObjectId": 927405,
+"PERMITNUMBER": "26 116846 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "14753 NE 1st Pl",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980074965",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "3425059158",
+"APPLIEDDATE": 1784098800000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Uniform Housing. "
+}
+},
+{
+"attributes": {
+"ObjectId": 927440,
+"PERMITNUMBER": "26 116940 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "10202 SE 13th Pl",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980046727",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "2571200050",
+"APPLIEDDATE": 1784185200000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Clearing & Grading. "
+}
+},
+{
+"attributes": {
+"ObjectId": 927457,
+"PERMITNUMBER": "26 116923 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "12535 SE 53rd St",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98006",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "6071400560",
+"APPLIEDDATE": 1784185200000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Nuisance. "
+}
+},
+{
+"attributes": {
+"ObjectId": 927458,
+"PERMITNUMBER": "26 116922 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "16911 NE 26th Pl",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980082241",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "0686400840",
+"APPLIEDDATE": 1784185200000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Noise. "
+}
+},
+{
+"attributes": {
+"ObjectId": 927493,
+"PERMITNUMBER": "26 116996 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "1390 158th Pl NE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98008",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "2625059144",
+"APPLIEDDATE": 1784271600000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Bldg Existing. "
+}
+},
+{
+"attributes": {
+"ObjectId": 927494,
+"PERMITNUMBER": "26 116995 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "6602 129th Pl SE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98006",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "1951700480",
+"APPLIEDDATE": 1784271600000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Clearing & Grading. "
+}
+},
+{
+"attributes": {
+"ObjectId": 927583,
+"PERMITNUMBER": "26 117069 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "14418 SE 41st St",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98006-1504",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "2204500610",
+"APPLIEDDATE": 1784530800000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Nuisance. "
+}
+},
+{
+"attributes": {
+"ObjectId": 927585,
+"PERMITNUMBER": "26 117067 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "3156 108th Ave SE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98004741",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "2450000295",
+"APPLIEDDATE": 1784530800000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Bldg Existing. "
+}
+},
+{
+"attributes": {
+"ObjectId": 927587,
+"PERMITNUMBER": "26 117065 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "1643 172nd Ave NE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980082916",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "3298500460",
+"APPLIEDDATE": 1784530800000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Nuisance. "
+}
+},
+{
+"attributes": {
+"ObjectId": 927588,
+"PERMITNUMBER": "26 117064 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "16620 SE 16th St",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98008",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "7375300285",
+"APPLIEDDATE": 1784530800000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Nuisance. "
+}
+},
+{
+"attributes": {
+"ObjectId": 927593,
+"PERMITNUMBER": "26 117059 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "3560 W Lake Sammamish Pkwy SE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98008-5839",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "1224059008",
+"APPLIEDDATE": 1784530800000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Noise. "
+}
+},
+{
+"attributes": {
+"ObjectId": 927604,
+"PERMITNUMBER": "26 117048 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "70 102nd Ave NE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980045615",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "6899300040",
+"APPLIEDDATE": 1784530800000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Land Use. "
+}
+},
+{
+"attributes": {
+"ObjectId": 927605,
+"PERMITNUMBER": "26 117047 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "13570 NE Bellevue-Redmond Rd",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980052315",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "0672100176",
+"APPLIEDDATE": 1784530800000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Land Use. "
+}
+},
+{
+"attributes": {
+"ObjectId": 927608,
+"PERMITNUMBER": "26 117044 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "2670 118th Ave SE  - Unit 9-302",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98005",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "5452290690",
+"APPLIEDDATE": 1784530800000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Clearing & Grading. "
+}
+},
+{
+"attributes": {
+"ObjectId": 927646,
+"PERMITNUMBER": "26 117172 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "3541 122nd Ave SE  - Lot 2",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98006",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "5448300270",
+"APPLIEDDATE": 1784617200000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Nuisance. Parking on Lawn. "
+}
+},
+{
+"attributes": {
+"ObjectId": 927686,
+"PERMITNUMBER": "26 117132 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "2669 169th Ave SE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98008-5513",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "0627300050",
+"APPLIEDDATE": 1784617200000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Bldg Existing. "
+}
+},
+{
+"attributes": {
+"ObjectId": 927688,
+"PERMITNUMBER": "26 117130 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "6011 125th Ave SE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98006",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "6071700120",
+"APPLIEDDATE": 1784617200000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Parking on Lawn. "
+}
+},
+{
+"attributes": {
+"ObjectId": 927737,
+"PERMITNUMBER": "26 117244 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "505 106th Ave NE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980045033",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "1544100276",
+"APPLIEDDATE": 1784703600000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Noise. "
+}
+},
+{
+"attributes": {
+"ObjectId": 927739,
+"PERMITNUMBER": "26 117242 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "2207 135th Pl SE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98005",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "9538900110",
+"APPLIEDDATE": 1784703600000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Recreational Vehicles. "
+}
+},
+{
+"attributes": {
+"ObjectId": 927819,
+"PERMITNUMBER": "26 117301 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "555 108th Ave NE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980045505",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "1544100250",
+"APPLIEDDATE": 1784790000000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": null
+}
+},
+{
+"attributes": {
+"ObjectId": 927824,
+"PERMITNUMBER": "26 117296 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "10431 SE 19th St",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980047136",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "3860900040",
+"APPLIEDDATE": 1784790000000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Nuisance. "
+}
+},
+{
+"attributes": {
+"ObjectId": 927825,
+"PERMITNUMBER": "26 117295 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "5815 149th Ave SE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "9800646",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "2592210760",
+"APPLIEDDATE": 1784790000000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Clearing & Grading. "
+}
+},
+{
+"attributes": {
+"ObjectId": 927826,
+"PERMITNUMBER": "26 117294 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "2627 168th Ave NE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980082233",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "0686400060",
+"APPLIEDDATE": 1784790000000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Clearing & Grading. "
+}
+},
+{
+"attributes": {
+"ObjectId": 927827,
+"PERMITNUMBER": "26 117293 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "12234 SE 57th St  - Bldg D",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98006",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "6072740000",
+"APPLIEDDATE": 1784790000000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Nuisance. "
+}
+},
+{
+"attributes": {
+"ObjectId": 927828,
+"PERMITNUMBER": "26 117292 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "16672 NE 12th St",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980083714",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "3298201530",
+"APPLIEDDATE": 1784790000000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Nuisance. "
+}
+},
+{
+"attributes": {
+"ObjectId": 927863,
+"PERMITNUMBER": "26 117384 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "17050 Northup Way  - Unit 34",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98008-3060",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "2589400340",
+"APPLIEDDATE": 1784876400000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Bldg Existing. "
+}
+},
+{
+"attributes": {
+"ObjectId": 927864,
+"PERMITNUMBER": "26 117383 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "16625 SE 26th St",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98008553",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "7922800500",
+"APPLIEDDATE": 1784876400000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Junk/Inoperable Vehicles. "
+}
+},
+{
+"attributes": {
+"ObjectId": 927911,
+"PERMITNUMBER": "26 117336 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "2425 Killarney Way",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98004703",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "0824059243",
+"APPLIEDDATE": 1784876400000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Single Family Dwelling Rental. "
+}
+},
+{
+"attributes": {
+"ObjectId": 927945,
+"PERMITNUMBER": "26 117448 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "12003 NE 12th St  - Unit #62",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98005",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "1099100170",
+"APPLIEDDATE": 1785135600000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Noise. "
+}
+},
+{
+"attributes": {
+"ObjectId": 927955,
+"PERMITNUMBER": "26 117438 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "11319 NE 36th Pl",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980057659",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "2025059039",
+"APPLIEDDATE": 1785135600000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Uniform Housing. "
+}
+},
+{
+"attributes": {
+"ObjectId": 927956,
+"PERMITNUMBER": "26 117437 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "2523 124th Pl NE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980051567",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "6189200155",
+"APPLIEDDATE": 1785135600000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Uniform Housing. "
+}
+},
+{
+"attributes": {
+"ObjectId": 927961,
+"PERMITNUMBER": "26 117432 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "1037 163rd Ave SE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98008",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "4036800820",
+"APPLIEDDATE": 1785135600000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Land Use. "
+}
+},
+{
+"attributes": {
+"ObjectId": 927981,
+"PERMITNUMBER": "26 117412 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "13405 SE 43rd St",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98006211",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "7855600650",
+"APPLIEDDATE": 1785135600000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Nuisance. "
+}
+},
+{
+"attributes": {
+"ObjectId": 928010,
+"PERMITNUMBER": "26 117540 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "15515 SE 46th Way",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98006",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "9346920180",
+"APPLIEDDATE": 1785222000000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Junk/Inoperable Vehicles. "
+}
+},
+{
+"attributes": {
+"ObjectId": 928014,
+"PERMITNUMBER": "26 117536 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "442 168th Ave SE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98008",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "4037200055",
+"APPLIEDDATE": 1785222000000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Bldg Existing. "
+}
+},
+{
+"attributes": {
+"ObjectId": 928015,
+"PERMITNUMBER": "26 117535 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "16126 NE 15th St  - Unit C",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980082709",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "1854000270",
+"APPLIEDDATE": 1785222000000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Single Family Dwelling Rental. "
+}
+},
+{
+"attributes": {
+"ObjectId": 928020,
+"PERMITNUMBER": "26 117530 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "12857 SE 45th Pl",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98006",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "2723500010",
+"APPLIEDDATE": 1785222000000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Uniform Housing. "
+}
+},
+{
+"attributes": {
+"ObjectId": 928027,
+"PERMITNUMBER": "26 117523 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "3553 120th Ave SE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98006",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "5448300140",
+"APPLIEDDATE": 1785222000000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Home Occupation. "
+}
+},
+{
+"attributes": {
+"ObjectId": 928032,
+"PERMITNUMBER": "26 117518 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "16410 NE 12th St",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98008371",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "3298201420",
+"APPLIEDDATE": 1785222000000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Land Use. "
+}
+},
+{
+"attributes": {
+"ObjectId": 928100,
+"PERMITNUMBER": "26 117605 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "16720 SE 12th St",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98008",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "4037000950",
+"APPLIEDDATE": 1785308400000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Nuisance. "
+}
+},
+{
+"attributes": {
+"ObjectId": 928129,
+"PERMITNUMBER": "26 117576 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "14225 SE 6th St  - Bldg J",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980076715",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "3425059023",
+"APPLIEDDATE": 1785308400000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Uniform Housing. "
+}
+},
+{
+"attributes": {
+"ObjectId": 928164,
+"PERMITNUMBER": "26 117666 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "5227 116th Pl SE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98006",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "6071200555",
+"APPLIEDDATE": 1785394800000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Parking on Lawn. "
+}
+},
+{
+"attributes": {
+"ObjectId": 928224,
+"PERMITNUMBER": "26 117721 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "3001 164th Pl NE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980082022",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "2425059107",
+"APPLIEDDATE": 1785481200000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Clearing & Grading. "
+}
+},
+{
+"attributes": {
+"ObjectId": 928225,
+"PERMITNUMBER": "26 117720 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "290 106th Pl NE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98004",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "1544100310",
+"APPLIEDDATE": 1785481200000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Land Use. "
+}
+},
+{
+"attributes": {
+"ObjectId": 928231,
+"PERMITNUMBER": "26 117714 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "2615 162nd Ave NE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980082216",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "7751800120",
+"APPLIEDDATE": 1785481200000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Nuisance. "
+}
+},
+{
+"attributes": {
+"ObjectId": 928238,
+"PERMITNUMBER": "26 117707 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "16483 SE 58th Pl",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980061954",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "4139430120",
+"APPLIEDDATE": 1785481200000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Bldg Existing. "
+}
+},
+{
+"attributes": {
+"ObjectId": 928241,
+"PERMITNUMBER": "26 117704 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "9643 Vineyard Crst",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980044032",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "8964800555",
+"APPLIEDDATE": 1785481200000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Bldg Existing. "
+}
+},
+{
+"attributes": {
+"ObjectId": 928408,
+"PERMITNUMBER": "26 117846 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "10636 SE 22nd St",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98004",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "3860400220",
+"APPLIEDDATE": 1785826800000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Clearing & Grading. "
+}
+},
+{
+"attributes": {
+"ObjectId": 928411,
+"PERMITNUMBER": "26 117843 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "4010 120th Ave SE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98006",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "5448300350",
+"APPLIEDDATE": 1785826800000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Nuisance. "
+}
+},
+{
+"attributes": {
+"ObjectId": 928415,
+"PERMITNUMBER": "26 117839 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "906 109th Ave SE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98004682",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "3210600390",
+"APPLIEDDATE": 1785826800000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Nuisance. "
+}
+},
+{
+"attributes": {
+"ObjectId": 928422,
+"PERMITNUMBER": "26 117832 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "3072 106th Ave SE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98004-7467",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "2344300156",
+"APPLIEDDATE": 1785826800000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Bldg Existing. "
+}
+},
+{
+"attributes": {
+"ObjectId": 928425,
+"PERMITNUMBER": "26 117829 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "2130 140th Pl SE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980056235",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "8838900013",
+"APPLIEDDATE": 1785826800000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Clearing & Grading. "
+}
+},
+{
+"attributes": {
+"ObjectId": 928525,
+"PERMITNUMBER": "26 118038 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "5393 176th Pl SE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98006",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "4139450200",
+"APPLIEDDATE": 1785999600000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Clearing & Grading. "
+}
+},
+{
+"attributes": {
+"ObjectId": 928526,
+"PERMITNUMBER": "26 118037 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "11010 NE 8th St",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980044423",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "2925059208",
+"APPLIEDDATE": 1785999600000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": null
+}
+},
+{
+"attributes": {
+"ObjectId": 928527,
+"PERMITNUMBER": "26 118036 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "10410 NE 2nd St",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980045718",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "6389700030",
+"APPLIEDDATE": 1785999600000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": null
+}
+},
+{
+"attributes": {
+"ObjectId": 928529,
+"PERMITNUMBER": "26 118034 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "100 108th Ave NE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980045906",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "3225059091",
+"APPLIEDDATE": 1785999600000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": null
+}
+},
+{
+"attributes": {
+"ObjectId": 928544,
+"PERMITNUMBER": "26 118019 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "228 106th Pl NE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98004",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "1544100310",
+"APPLIEDDATE": 1785999600000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Land Use. "
+}
+},
+{
+"attributes": {
+"ObjectId": 928546,
+"PERMITNUMBER": "26 118017 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Multiple Code Violations",
+"SITEADDRESS": "8923 NE 1st St",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980044816",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "1872900010",
+"APPLIEDDATE": 1785999600000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Recreational Vehicles. Home Occupation. "
+}
+},
+{
+"attributes": {
+"ObjectId": 928547,
+"PERMITNUMBER": "26 118016 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "13717 Somerset Blvd SE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98006",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "7855200250",
+"APPLIEDDATE": 1785999600000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Clearing & Grading. "
+}
+},
+{
+"attributes": {
+"ObjectId": 928549,
+"PERMITNUMBER": "26 118014 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "11417 NE 21st St",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980043028",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "0645800140",
+"APPLIEDDATE": 1785999600000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Bldg Under Construction. "
+}
+},
+{
+"attributes": {
+"ObjectId": 928553,
+"PERMITNUMBER": "26 118010 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "17050 Northup Way  - Unit 35",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98008-3060",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "2589400350",
+"APPLIEDDATE": 1785999600000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Bldg Under Construction. "
+}
+},
+{
+"attributes": {
+"ObjectId": 928558,
+"PERMITNUMBER": "26 118005 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "860 164th Pl NE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980083721",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "3298200200",
+"APPLIEDDATE": 1785999600000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Home Occupation. "
+}
+},
+{
+"attributes": {
+"ObjectId": 928593,
+"PERMITNUMBER": "26 118091 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "4043 129th Ct SE  - Unit 24",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "9800613",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "6067620240",
+"APPLIEDDATE": 1786086000000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Nuisance. "
+}
+},
+{
+"attributes": {
+"ObjectId": 928603,
+"PERMITNUMBER": "26 118081 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "10620 NE 8th St",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98004433",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "1544600160",
+"APPLIEDDATE": 1786086000000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": null
+}
+},
+{
+"attributes": {
+"ObjectId": 928614,
+"PERMITNUMBER": "26 118070 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "15404 SE 53rd Pl",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98006",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "8081000330",
+"APPLIEDDATE": 1786086000000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Bldg Under Construction. "
+}
+},
+{
+"attributes": {
+"ObjectId": 928622,
+"PERMITNUMBER": "26 118062 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "5303 154th Ave SE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98006",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "8081000440",
+"APPLIEDDATE": 1786086000000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Bldg Under Construction. "
+}
+},
+{
+"attributes": {
+"ObjectId": 928652,
+"PERMITNUMBER": "26 118194 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "816 156th Ave SE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98008",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "4036800160",
+"APPLIEDDATE": 1786345200000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Recreational Vehicles. "
+}
+},
+{
+"attributes": {
+"ObjectId": 928656,
+"PERMITNUMBER": "26 118190 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "15543 SE 24th St",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98007631",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "6751100320",
+"APPLIEDDATE": 1786345200000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Recreational Vehicles. "
+}
+},
+{
+"attributes": {
+"ObjectId": 928658,
+"PERMITNUMBER": "26 118188 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "15512 SE 10th St",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98007",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "2207200780",
+"APPLIEDDATE": 1786345200000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Parking on Lawn. "
+}
+},
+{
+"attributes": {
+"ObjectId": 928659,
+"PERMITNUMBER": "26 118187 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "2227 112th Ave NE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980042953",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "0687000020",
+"APPLIEDDATE": 1786345200000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Nuisance. "
+}
+},
+{
+"attributes": {
+"ObjectId": 928669,
+"PERMITNUMBER": "26 118177 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "2454 137th Ave SE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98005405",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "0514500080",
+"APPLIEDDATE": 1786345200000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Nuisance. "
+}
+},
+{
+"attributes": {
+"ObjectId": 928691,
+"PERMITNUMBER": "26 118155 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "4531 133rd Ave SE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98006213",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "7855800780",
+"APPLIEDDATE": 1786345200000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Bldg Under Construction. "
+}
+},
+{
+"attributes": {
+"ObjectId": 928692,
+"PERMITNUMBER": "26 118154 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "15048 SE 44th St",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98006-2418",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "2203500455",
+"APPLIEDDATE": 1786345200000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Clearing & Grading. "
+}
+},
+{
+"attributes": {
+"ObjectId": 928699,
+"PERMITNUMBER": "26 118147 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "300 Bellevue Way NE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980045718",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "6389700010",
+"APPLIEDDATE": 1786345200000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Noise. "
+}
+},
+{
+"attributes": {
+"ObjectId": 928805,
+"PERMITNUMBER": "26 118361 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "5711 122nd Pl SE  - Unit 215-K",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98006",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "6072740490",
+"APPLIEDDATE": 1786518000000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Nuisance. "
+}
+},
+{
+"attributes": {
+"ObjectId": 928818,
+"PERMITNUMBER": "26 118348 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "17222 NE 8th St",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980084122",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "2525059120",
+"APPLIEDDATE": 1786518000000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Nuisance. "
+}
+},
+{
+"attributes": {
+"ObjectId": 928819,
+"PERMITNUMBER": "26 118347 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "522 W Lake Sammamish Pkwy SE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98008",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "7524900020",
+"APPLIEDDATE": 1786518000000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Bldg Under Construction. "
+}
+},
+{
+"attributes": {
+"ObjectId": 928820,
+"PERMITNUMBER": "26 118346 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "711 109th Ave SE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980046337",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "8146100215",
+"APPLIEDDATE": 1786518000000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Clearing & Grading. "
+}
+},
+{
+"attributes": {
+"ObjectId": 928826,
+"PERMITNUMBER": "26 118340 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "6240 123rd Ave SE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98006",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "6072000030",
+"APPLIEDDATE": 1786518000000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Nuisance. "
+}
+},
+{
+"attributes": {
+"ObjectId": 928829,
+"PERMITNUMBER": "26 118337 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "857 171st Pl NE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980083757",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "4039000030",
+"APPLIEDDATE": 1786518000000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Nuisance. "
+}
+},
+{
+"attributes": {
+"ObjectId": 928836,
+"PERMITNUMBER": "26 118330 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "801 132nd Ave NE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980052615",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "2825059252",
+"APPLIEDDATE": 1786518000000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Home Occupation. "
+}
+},
+{
+"attributes": {
+"ObjectId": 928841,
+"PERMITNUMBER": "26 118325 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "811 132nd Ave NE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980052615",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "2825059063",
+"APPLIEDDATE": 1786518000000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Parking on Lawn. "
+}
+},
+{
+"attributes": {
+"ObjectId": 928869,
+"PERMITNUMBER": "26 118297 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "16033 NE 27th St",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980082207",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "7751800100",
+"APPLIEDDATE": 1786518000000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Nuisance. Recreational Vehicles. "
+}
+},
+{
+"attributes": {
+"ObjectId": 928960,
+"PERMITNUMBER": "26 118380 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "208 106th Pl NE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980045723",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "1544100322",
+"APPLIEDDATE": 1786604400000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Land Use. "
+}
+},
+{
+"attributes": {
+"ObjectId": 928965,
+"PERMITNUMBER": "26 118375 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "13841 SE 1st St",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980053703",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "3425059122",
+"APPLIEDDATE": 1786604400000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Clearing & Grading. "
+}
+},
+{
+"attributes": {
+"ObjectId": 928987,
+"PERMITNUMBER": "26 118470 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "270 146th Pl NE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980074939",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "6918720200",
+"APPLIEDDATE": 1786690800000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Clearing & Grading. "
+}
+},
+{
+"attributes": {
+"ObjectId": 929003,
+"PERMITNUMBER": "26 118454 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "4632 132nd Ave SE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98006213",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "7855801500",
+"APPLIEDDATE": 1786690800000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Home Occupation. "
+}
+},
+{
+"attributes": {
+"ObjectId": 929052,
+"PERMITNUMBER": "26 118560 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "15538 SE 8th St",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980075905",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "2207200525",
+"APPLIEDDATE": 1786950000000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Bldg Existing. "
+}
+},
+{
+"attributes": {
+"ObjectId": 929067,
+"PERMITNUMBER": "26 118545 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Multiple Code Violations",
+"SITEADDRESS": "10445 SE 22nd St",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980047253",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "3860400150",
+"APPLIEDDATE": 1786950000000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Nuisance. Junk/Inoperable Vehicles. Land Use. "
+}
+},
+{
+"attributes": {
+"ObjectId": 929097,
+"PERMITNUMBER": "26 118515 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "518 130th Ave NE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980053332",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "1153000080",
+"APPLIEDDATE": 1786950000000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Home Occupation. "
+}
+},
+{
+"attributes": {
+"ObjectId": 929147,
+"PERMITNUMBER": "26 118662 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": null,
+"CITY": null,
+"STATE": null,
+"ZIPCODE": null,
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": null,
+"APPLIEDDATE": 1787036400000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Nuisance. "
+}
+},
+{
+"attributes": {
+"ObjectId": 929149,
+"PERMITNUMBER": "26 118660 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "14410 NE 35th St  - Bldg K",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980078504",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "2225059108",
+"APPLIEDDATE": 1787036400000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Nuisance. "
+}
+},
+{
+"attributes": {
+"ObjectId": 929175,
+"PERMITNUMBER": "26 118634 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "16530 SE 45th St",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98006",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "2211700140",
+"APPLIEDDATE": 1787036400000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": null
+}
+},
+{
+"attributes": {
+"ObjectId": 929224,
+"PERMITNUMBER": "26 118740 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "17103 NE 31st Pl",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980082004",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "5728000050",
+"APPLIEDDATE": 1787122800000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Bldg Under Construction. "
+}
+},
+{
+"attributes": {
+"ObjectId": 929253,
+"PERMITNUMBER": "26 118711 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "15929 SE 46th Way",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98006",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "9346920380",
+"APPLIEDDATE": 1787122800000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Nuisance. "
+}
+},
+{
+"attributes": {
+"ObjectId": 929263,
+"PERMITNUMBER": "26 118701 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Multiple Code Violations",
+"SITEADDRESS": "2018 154th Ave SE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98007",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "4157500140",
+"APPLIEDDATE": 1787122800000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Land Use. Bldg Under Construction. "
+}
+},
+{
+"attributes": {
+"ObjectId": 929264,
+"PERMITNUMBER": "26 118700 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "5570 176th Pl SE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98006",
+"PERMITSTATUS": "Closed",
+"PARCELNUMBER": "4139450090",
+"APPLIEDDATE": 1787122800000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Noise. "
+}
+},
+{
+"attributes": {
+"ObjectId": 929277,
+"PERMITNUMBER": "26 118687 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "12011 NE Bellevue-Redmond Rd",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980052409",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "1099100408",
+"APPLIEDDATE": 1787122800000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": null
+}
+},
+{
+"attributes": {
+"ObjectId": 929280,
+"PERMITNUMBER": "26 118684 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "16623 SE 59th St",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980061124",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "4139430400",
+"APPLIEDDATE": 1787122800000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Clearing & Grading. "
+}
+},
+{
+"attributes": {
+"ObjectId": 929282,
+"PERMITNUMBER": "26 118682 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "1021 Evergreen Dr",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98004402",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "8964800800",
+"APPLIEDDATE": 1787122800000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Noise. "
+}
+},
+{
+"attributes": {
+"ObjectId": 929298,
+"PERMITNUMBER": "26 118810 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "13637 SE 19th St",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98005",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "7811220260",
+"APPLIEDDATE": 1787209200000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Home Occupation. "
+}
+},
+{
+"attributes": {
+"ObjectId": 929362,
+"PERMITNUMBER": "26 120272 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "15334 SE 43rd Pl",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98006",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "3459430090",
+"APPLIEDDATE": 1787295600000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Junk/Inoperable Vehicles. "
+}
+},
+{
+"attributes": {
+"ObjectId": 929363,
+"PERMITNUMBER": "26 120271 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "14403 SE 46th St",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98006247",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "7856620110",
+"APPLIEDDATE": 1787295600000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Bldg Existing. "
+}
+},
+{
+"attributes": {
+"ObjectId": 929432,
+"PERMITNUMBER": "26 120353 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "5684 173rd Ave SE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98006",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "4139500140",
+"APPLIEDDATE": 1787554800000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Single Family Dwelling Rental. "
+}
+},
+{
+"attributes": {
+"ObjectId": 929434,
+"PERMITNUMBER": "26 120351 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "16042 SE 10th St",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98008",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "4036800950",
+"APPLIEDDATE": 1787554800000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Parking on Lawn. "
+}
+},
+{
+"attributes": {
+"ObjectId": 929437,
+"PERMITNUMBER": "26 120348 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "6507 121st Ave SE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98006",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "6072600300",
+"APPLIEDDATE": 1787554800000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Noise. "
+}
+},
+{
+"attributes": {
+"ObjectId": 929438,
+"PERMITNUMBER": "26 120347 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "14635 NE 32nd St",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": null,
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": null,
+"APPLIEDDATE": 1787554800000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Uniform Housing. "
+}
+},
+{
+"attributes": {
+"ObjectId": 929439,
+"PERMITNUMBER": "26 120346 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "13007 NE 28th St",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980051707",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "1089000040",
+"APPLIEDDATE": 1787554800000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Bldg Under Construction. "
+}
+},
+{
+"attributes": {
+"ObjectId": 929452,
+"PERMITNUMBER": "26 120333 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "13831 NE 8th St",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98005-3484",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "3425059059",
+"APPLIEDDATE": 1787554800000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Uniform Housing. "
+}
+},
+{
+"attributes": {
+"ObjectId": 929460,
+"PERMITNUMBER": "26 120325 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "11153 NE 11th St",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980044507",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "5291200005",
+"APPLIEDDATE": 1787554800000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": null
+}
+},
+{
+"attributes": {
+"ObjectId": 929463,
+"PERMITNUMBER": "26 120322 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "15516 SE 46th Way",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98006",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "9346980200",
+"APPLIEDDATE": 1787554800000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Nuisance. "
+}
+},
+{
+"attributes": {
+"ObjectId": 929465,
+"PERMITNUMBER": "26 120320 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "4255 120th Ave SE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98006",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "2911700065",
+"APPLIEDDATE": 1787554800000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Nuisance. "
+}
+},
+{
+"attributes": {
+"ObjectId": 929467,
+"PERMITNUMBER": "26 120318 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "919 109th Ave NE  - Unit site",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980044404",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "6600750000",
+"APPLIEDDATE": 1787554800000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": null
+}
+},
+{
+"attributes": {
+"ObjectId": 929468,
+"PERMITNUMBER": "26 120317 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "15911 SE 42nd Pl",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98006",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "1777500150",
+"APPLIEDDATE": 1787554800000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Single Family Dwelling Rental. "
+}
+},
+{
+"attributes": {
+"ObjectId": 929473,
+"PERMITNUMBER": "26 120312 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "14646 SE Allen Rd",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98006-1647",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "2204500070",
+"APPLIEDDATE": 1787554800000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Nuisance. "
+}
+},
+{
+"attributes": {
+"ObjectId": 929546,
+"PERMITNUMBER": "26 120382 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "2822 170th Ave SE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98008-5636",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "3999300150",
+"APPLIEDDATE": 1787641200000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Bldg Under Construction. "
+}
+},
+{
+"attributes": {
+"ObjectId": 929580,
+"PERMITNUMBER": "26 120480 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "10907 NE 18th St",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980042929",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "3391500045",
+"APPLIEDDATE": 1787727600000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Clearing & Grading. "
+}
+},
+{
+"attributes": {
+"ObjectId": 929600,
+"PERMITNUMBER": "26 120460 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "11 Skagit Ky",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98006102",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "6065301010",
+"APPLIEDDATE": 1787727600000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Clearing & Grading. "
+}
+},
+{
+"attributes": {
+"ObjectId": 929601,
+"PERMITNUMBER": "26 120459 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "1188 100th Ave NE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980044123",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "2925059154",
+"APPLIEDDATE": 1787727600000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Bldg Under Construction. "
+}
+},
+{
+"attributes": {
+"ObjectId": 929653,
+"PERMITNUMBER": "26 120549 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "10661 SE 25th St",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98004724",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "0824059068",
+"APPLIEDDATE": 1787814000000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": null
+}
+},
+{
+"attributes": {
+"ObjectId": 929655,
+"PERMITNUMBER": "26 120547 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "3345 115th Ave NE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98004",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "2025059160",
+"APPLIEDDATE": 1787814000000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Bldg Existing. "
+}
+},
+{
+"attributes": {
+"ObjectId": 929832,
+"PERMITNUMBER": "26 120671 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "15515 SE 46th Way",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98006",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "9346920180",
+"APPLIEDDATE": 1788159600000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Nuisance. "
+}
+},
+{
+"attributes": {
+"ObjectId": 929834,
+"PERMITNUMBER": "26 120669 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "4423 Somerset Dr SE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98006302",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "7855800350",
+"APPLIEDDATE": 1788159600000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Bldg Existing. "
+}
+},
+{
+"attributes": {
+"ObjectId": 929835,
+"PERMITNUMBER": "26 120668 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "785 116th Ave NE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980045207",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "3225059070",
+"APPLIEDDATE": 1788159600000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": null
+}
+},
+{
+"attributes": {
+"ObjectId": 929836,
+"PERMITNUMBER": "26 120667 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "333 108th Ave NE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980045708",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "1544100316",
+"APPLIEDDATE": 1788159600000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": null
+}
+},
+{
+"attributes": {
+"ObjectId": 929837,
+"PERMITNUMBER": "26 120666 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "13846 NE 12th St  - Bldg P",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980052916",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "2725059196",
+"APPLIEDDATE": 1788159600000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Uniform Housing. "
+}
+},
+{
+"attributes": {
+"ObjectId": 929839,
+"PERMITNUMBER": "26 120664 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "3459 122nd Pl NE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980051237",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "2125059086",
+"APPLIEDDATE": 1788159600000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Clearing & Grading. "
+}
+},
+{
+"attributes": {
+"ObjectId": 929841,
+"PERMITNUMBER": "26 120662 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Multiple Code Violations",
+"SITEADDRESS": "15436 SE 20th Pl",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98007",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "4157600030",
+"APPLIEDDATE": 1788159600000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Nuisance. Parking on Lawn. "
+}
+},
+{
+"attributes": {
+"ObjectId": 929913,
+"PERMITNUMBER": "26 120792 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "14700 NE 29th Pl  - Bldg A",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980073633",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "2225059364",
+"APPLIEDDATE": 1788246000000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Fair Housing. "
+}
+},
+{
+"attributes": {
+"ObjectId": 930002,
+"PERMITNUMBER": "26 120849 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "16236 SE 9th St",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98008",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "4036801075",
+"APPLIEDDATE": 1788332400000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Recreational Vehicles. "
+}
+},
+{
+"attributes": {
+"ObjectId": 930003,
+"PERMITNUMBER": "26 120848 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "16609 SE 43rd St",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98006",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "1324059054",
+"APPLIEDDATE": 1788332400000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Boarding House. "
+}
+},
+{
+"attributes": {
+"ObjectId": 930054,
+"PERMITNUMBER": "26 120941 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "169 108th Ave SE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980046211",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "3225059202",
+"APPLIEDDATE": 1788418800000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Nuisance. "
+}
+},
+{
+"attributes": {
+"ObjectId": 930073,
+"PERMITNUMBER": "26 120922 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "1218 143rd Ave SE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980075527",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "2207100200",
+"APPLIEDDATE": 1788418800000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Parking on Lawn. "
+}
+},
+{
+"attributes": {
+"ObjectId": 930136,
+"PERMITNUMBER": "26 121014 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "2719 162nd Ave SE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98008542",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "7923000110",
+"APPLIEDDATE": 1788505200000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Nuisance. "
+}
+},
+{
+"attributes": {
+"ObjectId": 930159,
+"PERMITNUMBER": "26 120991 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "1489 130th Ave NE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980052251",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "2825059054",
+"APPLIEDDATE": 1788505200000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Bldg Under Construction. "
+}
+},
+{
+"attributes": {
+"ObjectId": 930220,
+"PERMITNUMBER": "26 121141 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "15644 SE 42nd Ct",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98006",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "1777600160",
+"APPLIEDDATE": 1788850800000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Bldg Existing. "
+}
+},
+{
+"attributes": {
+"ObjectId": 930222,
+"PERMITNUMBER": "26 121139 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "595 106th Ave NE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980045007",
+"PERMITSTATUS": "Closed",
+"PARCELNUMBER": "1544100278",
+"APPLIEDDATE": 1788850800000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": null
+}
+},
+{
+"attributes": {
+"ObjectId": 930226,
+"PERMITNUMBER": "26 121135 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "14703 NE 35th St  - Unit D-33",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98007",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "2875000200",
+"APPLIEDDATE": 1788850800000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Noise. "
+}
+},
+{
+"attributes": {
+"ObjectId": 930237,
+"PERMITNUMBER": "26 121124 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "5723 122nd Ave SE  - Unit 152-O",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98006",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "6072740770",
+"APPLIEDDATE": 1788850800000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Bldg Existing. "
+}
+},
+{
+"attributes": {
+"ObjectId": 930239,
+"PERMITNUMBER": "26 121122 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "12215 SE 60th St",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98006",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "2124059039",
+"APPLIEDDATE": 1788850800000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Nuisance. "
+}
+},
+{
+"attributes": {
+"ObjectId": 930240,
+"PERMITNUMBER": "26 121121 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "12205 SE 60th St",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98006",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "2124059039",
+"APPLIEDDATE": 1788850800000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Nuisance. "
+}
+},
+{
+"attributes": {
+"ObjectId": 930359,
+"PERMITNUMBER": "26 121248 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "14203 SE 6th St  - Bldg H",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980076715",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "3425059023",
+"APPLIEDDATE": 1789023600000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Uniform Housing. "
+}
+},
+{
+"attributes": {
+"ObjectId": 930375,
+"PERMITNUMBER": "26 121232 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "2627 170th Ave SE",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "98008-5516",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "0627300115",
+"APPLIEDDATE": 1789023600000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": null
+}
+},
+{
+"attributes": {
+"ObjectId": 930378,
+"PERMITNUMBER": "26 121229 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "14102 SE 14th Pl",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980075576",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "0324059119",
+"APPLIEDDATE": 1789023600000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Nuisance. "
+}
+},
+{
+"attributes": {
+"ObjectId": 930379,
+"PERMITNUMBER": "26 121228 EA",
+"PERMITTYPE": "EA",
+"SUBTYPE": "Single Code Violation",
+"SITEADDRESS": "16808 NE 19th Pl",
+"CITY": "Bellevue",
+"STATE": "WA",
+"ZIPCODE": "980082659",
+"PERMITSTATUS": "Open",
+"PARCELNUMBER": "0686201160",
+"APPLIEDDATE": 1789023600000,
+"FINALEDDATE": null,
+"ENFORCEMENTACTIONS": "Nuisance. "
+}
+}
+]
+}
+}

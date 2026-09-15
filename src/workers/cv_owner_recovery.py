@@ -51,10 +51,6 @@ from src.config import settings
 from src.utils.located_parcel import located_parcel_id
 from src.utils.logger import setup_logger
 
-# One outcome per requested parcel from the lookup's ledger, shared with the King
-# tax sweep so both read `batch_extract_king_owners` the same way.
-from src.workers.owner_recovery import _classify as classify_owner_outcomes
-
 _logger = setup_logger("worker.cv_owner_recovery")
 
 SDCI_SOURCE = "seattle_sdci_code_violations"
@@ -264,7 +260,7 @@ def _tick(stats: dict) -> dict:
             stats["skipped"] = f"{type(exc).__name__}: {str(exc)[:120]}"
             _logger.warning("Code violation owner recovery: lookup failed: %s", stats["skipped"])
 
-        for pin, outcome in classify_owner_outcomes(pins, owners, o_stats).items():
+        for pin, outcome in _classify(pins, owners, o_stats).items():
             for row in by_pin.get(pin, []):
                 stats[_write(db, row, outcome, owners.get(pin))] += 1
 
@@ -279,6 +275,35 @@ def _tick(stats: dict) -> dict:
     return stats
 
 
+def _classify(pins: list[str], owners: dict, o_stats: dict) -> dict[str, str]:
+    """Exactly one outcome per requested parcel, charging only PROVEN requests.
+
+    A parcel counts as asked only when the lookup's ledger says its fetch settled
+    (`attempted` or `transient`, written after each fetch returns). Everything else,
+    including the parcel in flight when the lookup raised or was cancelled, and every
+    parcel when it failed before its first request, is `unreached`: rotated to the
+    back of the queue, never charged an attempt. (The King tax sweep charges the
+    in-flight parcel; here an unproven request must not walk a lead to gave_up.)
+    A page with a blank name is not a found owner.
+    """
+    no_owner = set(o_stats.get("no_owner_on_record", []))
+    mismatch = set(o_stats.get("parcel_mismatch", []))
+    reached = set(o_stats.get("attempted", [])) | set(o_stats.get("transient", []))
+    out: dict[str, str] = {}
+    for pin in pins:
+        if (owners.get(pin) or "").strip():
+            out[pin] = "found"
+        elif pin not in reached:
+            out[pin] = "unreached"
+        elif pin in no_owner:
+            out[pin] = "not_on_record"
+        elif pin in mismatch:
+            out[pin] = "parcel_mismatch"
+        else:
+            out[pin] = "transient"
+    return out
+
+
 def _write(db, row, outcome: str, owner: str | None) -> str:
     """One guarded UPDATE per row. Returns the stats key for what was written:
     the outcome, `gave_up`, `stale` (the row changed since selection, nothing
@@ -286,6 +311,8 @@ def _write(db, row, outcome: str, owner: str | None) -> str:
     ed = row.enrichment_data if isinstance(row.enrichment_data, dict) else {}
     if located_parcel_id(ed) != row.pin:
         return "stale"
+    if outcome == "found" and not (owner or "").strip():
+        outcome = "transient"                    # a blank name is not an owner
     try:
         attempts = int(ed.get(ATTEMPTS_KEY) or 0)
     except (TypeError, ValueError):
@@ -340,5 +367,7 @@ try:  # pragma: no cover -- registration only
         """Beat entry point: see recover_code_violation_owners."""
         return recover_code_violation_owners()
 except Exception as exc:  # pragma: no cover -- import-time safety only
-    # Loud: beat would keep publishing a task nobody runs.
-    _logger.error("Code violation owner recovery task NOT registered: %s", str(exc)[:120])
+    # Loud: beat would keep publishing a task nobody runs. Same swallow-and-log
+    # shape as owner_recovery.py, plus the traceback so the cause is visible.
+    _logger.error("Code violation owner recovery task NOT registered: %s", str(exc)[:120],
+                  exc_info=exc)

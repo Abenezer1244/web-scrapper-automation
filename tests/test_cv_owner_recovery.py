@@ -480,3 +480,120 @@ def test_the_sweep_is_registered_and_scheduled():
     assert entry["task"] == "src.workers.cv_owner_recovery.recover_code_violation_owners_task"
     assert entry["task"] in app.tasks
     assert entry["schedule"] == crontab(minute="18-59/20")
+
+
+async def test_a_lookup_that_fails_before_any_request_charges_nobody(
+    db, business_user, monkeypatch,
+):
+    class _BrokenLease:
+        def __init__(self, *a, **k):
+            pass
+
+        def __enter__(self):
+            raise ConnectionError("lease store unreachable")
+
+        def __exit__(self, *a):
+            return None
+
+    monkeypatch.setattr("src.scrapers.enrichment.source_admission.SourceAdmission", _BrokenLease)
+    asked = _county(monkeypatch, {})
+    job_id = await _job(db, business_user)
+    ids = [await _row(db, business_user, job_id, pin=p, cv_owner_recovery_attempts=2)
+           for p in ("1000000071", "1000000072")]
+
+    stats = await asyncio.to_thread(_tick)
+
+    assert asked == [] and stats["skipped"].startswith("ConnectionError")
+    assert stats["unreached"] == 2 and stats["transient"] == 0
+    for rid in ids:
+        ed = (await _get(db, rid)).enrichment_data
+        assert ed["cv_owner_recovery_attempts"] == 2
+        assert "cv_owner_recovery_outcome" not in ed and "cv_owner_recovery_last_at" in ed
+
+
+async def test_the_parcel_in_flight_when_the_lookup_crashed_is_not_charged(
+    db, business_user, monkeypatch,
+):
+    _lease(monkeypatch)
+    job_id = await _job(db, business_user)
+    first = await _row(db, business_user, job_id, pin="1000000081")
+    crashed = await _row(db, business_user, job_id, pin="1000000082")
+    never = await _row(db, business_user, job_id, pin="1000000083")
+
+    async def _fetch(pid, *, max_attempts=1, **_kw):
+        if pid == "1000000082":
+            raise RuntimeError("parser blew up")
+        return "FIRST OWNER", False
+
+    monkeypatch.setattr(kca, "_fetch_king_owner", _fetch)
+    stats = await asyncio.to_thread(_tick)
+
+    assert (await _get(db, first)).party_name == "FIRST OWNER"
+    for rid in (crashed, never):
+        row = await _get(db, rid)
+        assert row.party_name is None
+        assert "cv_owner_recovery_attempts" not in row.enrichment_data
+        assert "cv_owner_recovery_last_at" in row.enrichment_data
+    assert stats["found"] == 1 and stats["unreached"] == 2 and stats["transient"] == 0
+
+
+async def test_a_blank_owner_is_never_written_as_found(db, business_user):
+    from types import SimpleNamespace
+
+    from src.db.session import system_sync_session
+
+    job_id = await _job(db, business_user)
+    rid = await _row(db, business_user, job_id, pin="1000000091")
+    row = SimpleNamespace(id=rid, user_id=business_user.id, pin="1000000091",
+                          enrichment_data=_located("1000000091"))
+
+    def _go():
+        with system_sync_session() as sdb:
+            return cvr._write(sdb, row, "found", "   ")
+
+    label = await asyncio.to_thread(_go)
+
+    stored = await _get(db, rid)
+    assert label != "found" and stored.party_name is None
+    ed = stored.enrichment_data
+    assert "owner_source" not in ed and "owner_pin" not in ed
+    assert ed.get("cv_owner_recovery_outcome") != "found"
+
+
+def test_the_blank_owner_page_classifies_as_not_found():
+    out = cvr._classify(["1000000101"], {"1000000101": "  "},
+                        {"outcome": "complete", "attempted": ["1000000101"], "transient": [],
+                         "no_owner_on_record": [], "parcel_mismatch": []})
+    assert out == {"1000000101": "transient"}
+
+
+def test_a_registration_failure_is_logged_at_error_with_the_exception(monkeypatch):
+    import importlib
+    import logging
+
+    from src.workers import app
+
+    records: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    handler = _Capture(level=logging.DEBUG)
+    logger = logging.getLogger("worker.cv_owner_recovery")
+    logger.addHandler(handler)
+
+    def _broken_task(*_a, **_k):
+        raise RuntimeError("broker config rejected")
+
+    monkeypatch.setattr(app, "task", _broken_task)
+    try:
+        importlib.reload(cvr)
+    finally:
+        monkeypatch.undo()
+        logger.removeHandler(handler)
+        importlib.reload(cvr)
+
+    errors = [r for r in records if r.levelno == logging.ERROR and "NOT registered" in r.getMessage()]
+    assert errors and errors[0].exc_info is not None
+    assert "src.workers.cv_owner_recovery.recover_code_violation_owners_task" in app.tasks

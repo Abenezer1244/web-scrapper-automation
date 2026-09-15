@@ -453,6 +453,28 @@ def test_a_budget_too_small_for_one_page_makes_no_request(monkeypatch, paces, cl
     assert stats["outcome"] == "budget_exhausted" and portal.sessions == 0
 
 
+def test_a_browser_that_never_starts_charges_the_parcel_and_stops(monkeypatch, paces, clean_health,
+                                                                   caplog):
+    portal = _Portal({"2021110133": [(200, ATIP_2117)]}).install(monkeypatch)
+    closed: list = []
+
+    class _BrokenBrowser:
+        async def __aenter__(self):
+            # Playwright's own message when the Chromium build is missing on a host.
+            raise RuntimeError("BrowserType.launch: Executable doesn't exist")
+
+        async def __aexit__(self, *exc):
+            closed.append(True)
+
+    monkeypatch.setattr(pao, "_new_session", _BrokenBrowser)
+    stats: dict = {}
+    with caplog.at_level(logging.INFO, logger="scraper.enrichment.pierce_atip_owner"):
+        assert pao.lookup_parcels(["2021110133", "2006120010"], stats=stats) == {}
+    assert stats["outcome"] == "session_failed" and stats["transient"] == ["2021110133"]
+    assert portal.requests == [] and closed == [True]
+    assert "parcel=2021110133 outcome=session_start_failed" in caplog.text
+
+
 def test_a_task_time_limit_mid_lookup_is_audited_and_not_swallowed(monkeypatch, paces, clean_health,
                                                                     caplog):
     from billiard.exceptions import SoftTimeLimitExceeded

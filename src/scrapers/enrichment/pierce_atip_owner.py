@@ -297,24 +297,35 @@ async def _lookup(parcels: list[str], *, pace_s: float, deadline: float | None,
     restarted = False
     consecutive_hard = 0
 
-    def _affordable(*, new_session: bool, pace: bool) -> bool:
+    def _affordable(*, new_session: bool, pace: bool, closes: int = 1) -> bool:
         # Everything the next page view may cost must fit, each part hard-bounded by
         # its own timeout: the pause, a browser start when one is needed, the page, and
-        # closing the browser afterwards (Codex r1/r2 P2).
+        # every browser close it implies (Codex r1/r2/r4 P2).
         if deadline is None:
             return True
-        cost = (_FETCH_TIMEOUT_S + _SESSION_CLOSE_S + (pace_s if pace else 0.0)
+        cost = (_FETCH_TIMEOUT_S + closes * _SESSION_CLOSE_S + (pace_s if pace else 0.0)
                 + (_SESSION_START_S if new_session else 0.0))
         return time.monotonic() + cost < deadline
 
-    async def _start():
+    async def _start(pid: str):
+        """A started session, or None: the parcel is then charged as transient and audited
+        (Codex r4 P2), so a browser that never starts cannot retry a parcel for free."""
         s = _new_session()
         stats["sessions"] += 1
         try:
             return await asyncio.wait_for(s.__aenter__(), timeout=_SESSION_START_S)
-        except BaseException:
+        except BaseException as exc:
             await _close(s)  # a half-started browser is still a process to reap
-            raise
+            if type(exc).__name__ in _TIME_LIMITS:
+                _audit(pid, "time_limit")
+                raise
+            if not isinstance(exc, Exception):
+                raise
+            _logger.warning("pierce_atip_owner browser start failed: %s", type(exc).__name__)
+            stats["transient"].append(pid)
+            _audit(pid, "session_start_failed")
+            stats["outcome"] = "session_failed"
+            return None
 
     async def _one(pid: str) -> tuple[str, list | None]:
         # Re-proven right before the navigation: the lease must still be ours after
@@ -341,7 +352,9 @@ async def _lookup(parcels: list[str], *, pace_s: float, deadline: float | None,
                 stats["outcome"] = "budget_exhausted"
                 return
             if session is None:
-                session = await _start()
+                session = await _start(pid)
+                if session is None:
+                    return
             if i:
                 await asyncio.sleep(pace_s)
             try:
@@ -355,14 +368,17 @@ async def _lookup(parcels: list[str], *, pace_s: float, deadline: float | None,
                 # for the whole batch (pierce_atip's re-solve-once rule), then stop.
                 stats["token_rejected"] += 1
                 restarted = True
-                if not _affordable(new_session=True, pace=True):
+                # Restart work: close the old browser, start one, pause, page, final close.
+                if not _affordable(new_session=True, pace=True, closes=2):
                     stats["transient"].append(pid)
                     _audit(pid, "verification_rejected")
                     stats["outcome"] = "budget_exhausted"
                     return
                 old, session = session, None
                 await _close(old)
-                session = await _start()
+                session = await _start(pid)
+                if session is None:
+                    return
                 await asyncio.sleep(pace_s)
                 try:
                     kind, rows = await _one(pid)

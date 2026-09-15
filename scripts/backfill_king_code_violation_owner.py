@@ -138,6 +138,7 @@ _AP_UPDATE_SQL = """
       AND enrichment_data::jsonb->>'kc_pin' IS NOT DISTINCT FROM CAST(:old_pin AS text)
       AND enrichment_data::jsonb->>'kc_pin_match' IS NOT DISTINCT FROM CAST(:old_pin_match AS text)
       AND enrichment_data::jsonb->>'kc_pin_source' IS NOT DISTINCT FROM CAST(:old_pin_source AS text)
+      AND enrichment_data::jsonb->>'kc_parcel_address' IS NOT DISTINCT FROM CAST(:old_parcel_address AS text)
       AND NOT (enrichment_data::jsonb ? 'kc_address_point_evidence')
       AND NOT (enrichment_data::jsonb ? 'owner_source')
       AND EXISTS (SELECT 1 FROM jobs j WHERE j.id = results.job_id AND j.status = 'done')
@@ -222,7 +223,8 @@ def run_address_points(db, *, apply_writes: bool, limit: int | None = None,
                 # Decided for THIS point outcome; a row changed since it was read is skipped.
                 "old_pin_status": r.ed.get("kc_pin_status"), "old_pin": r.ed.get("kc_pin"),
                 "old_pin_match": r.ed.get("kc_pin_match"),
-                "old_pin_source": r.ed.get("kc_pin_source")})
+                "old_pin_source": r.ed.get("kc_pin_source"),
+                "old_parcel_address": r.ed.get("kc_parcel_address")})
             written += bool(res.rowcount)
             skipped += not res.rowcount
             if i % 200 == 0:

@@ -366,12 +366,75 @@ def test_api_and_export_label_a_county_address_match():
     assert exported["parcel_source"] == "County address match"
 
 
-def test_legacy_strict_matches_keep_their_mailing_eligibility():
-    legacy = {"kc_pin_status": "matched", "kc_pin": "0904000025"}
-    assert mailing_lookup_pin(legacy) == "0904000025"
-    assert mailing_lookup_pin({**legacy, "kc_pin_source": "king_gis_point_in_parcel",
-                               "kc_pin_match": "condo_complex"}) == "0904000025"
-    assert mailing_lookup_pin({**legacy, "kc_pin_source": "king_gis_address_point"}) is None
+def test_only_shown_tiers_may_carry_a_mailing_address():
+    strict = {"kc_pin_status": "matched", "kc_pin": "0904000025",
+              "kc_pin_source": "king_gis_point_in_parcel"}
+    assert mailing_lookup_pin({**strict, "kc_pin_match": "exact"}) == "0904000025"
+    assert mailing_lookup_pin({**strict, "kc_pin_match": "street_only"}) == "0904000025"
+    # A condo complex parcel's mailing belongs to no unit owner; an untiered legacy match
+    # may be one, so it waits for the tier repair.
+    assert mailing_lookup_pin({**strict, "kc_pin_match": "condo_complex"}) is None
+    assert mailing_lookup_pin(strict) is None
+    assert mailing_lookup_pin({"kc_pin_status": "matched", "kc_pin": "0904000025"}) is None
+
+
+def test_a_state_written_without_a_comma_is_not_part_of_the_street():
+    p = kap.parse_lead_address("7975 Martin Luther King Jr WAY S WA")
+    assert (p.street, p.zip5) == ("MARTIN LUTHER KING JR WAY S", None)
+    p = kap.parse_lead_address("1212 N ALLEN PL SEATTLE WA 98103")
+    assert (p.street, p.zip5, p.letter) == ("ALLEN PL", "98103", "N")
+
+
+def test_a_capped_answer_is_transient_not_a_rejection(monkeypatch):
+    monkeypatch.setattr(kap, "safe_get", lambda *a, **kw: _Resp(
+        {"features": [{"attributes": AP_9043A}], "exceededTransferLimit": True}))
+    monkeypatch.setattr(kap.time, "sleep", lambda s: None)
+    assert _decide("47.52", "-122.35", "9043 A 18TH AVE SW").outcome == "error"
+    gis = _Gis(points=[AP_3810_GALER], parcels=[PARCEL_5318100580])
+
+    def _capped_pin(url, params=None, **kw):
+        resp = gis(url, params, **kw)
+        if url == kap.PARCEL_LAYER:
+            resp._payload["exceededTransferLimit"] = True
+        return resp
+
+    monkeypatch.setattr(kap, "safe_get", _capped_pin)
+    assert _decide(None, None, "3810 E GALER ST, SEATTLE WA 98112").outcome == "error"
+
+
+@pytest.mark.asyncio
+async def test_a_transient_address_point_failure_keeps_the_point_outcome_for_the_repair(
+    db, business_user, tmp_path, monkeypatch,
+):
+    """Live path: the point outcome is a fact and is kept; no evidence is written, so the
+    --address-points repair (not the live job) is where the row is retried."""
+    _gis(monkeypatch, under_point=[PARCEL_9043A])
+
+    def _ap_down(url, params=None, **kw):
+        raise ConnectionError("reset")
+
+    monkeypatch.setattr(kap, "safe_get", _ap_down)
+    decisions, _ = kpl.resolve_code_violation_mailing(
+        [("a", "47.52163912", "-122.35809767", "9043 A 18TH AVE SW, SEATTLE WA 98106")],
+        pace_s=0, address_points=True)
+    assert decisions == {"a": {"kc_pin_status": "address_mismatch"}}
+
+    rid, _, _ = await _stored_row(
+        db, business_user, address="9043 A 18TH AVE SW, SEATTLE WA 98106",
+        ed={"source": _SDCI, "record_number": "013845-26CP", "latitude": "47.52163912",
+            "longitude": "-122.35809767", **decisions["a"]})
+    monkeypatch.setattr(bko.time, "sleep", lambda s: None)
+    stats = await asyncio.to_thread(_repair, False, tmp_path)
+    assert stats["candidates"] == 1 and stats["transient_error_left_for_retry"] == 1
+    _gis(monkeypatch, points=[AP_9043A, AP_9043B], under_point=[PARCEL_9043A])
+    import src.scrapers.enrichment.king_rpacct as kr
+
+    monkeypatch.setattr(kr, "resolve_pins", lambda pins: ({}, "2026-09-05"))
+    stats = await asyncio.to_thread(_repair, True, tmp_path)
+    assert stats["writes"] == {"written": 1, "skipped_by_write_guard": 0}
+    ed = (await db.execute(text("SELECT enrichment_data FROM results WHERE id = :i"),
+                           {"i": rid})).scalar()
+    assert located_parcel_match(ed) == "address_point"
 
 
 # ── Live enrichment ────────────────────────────────────────────────────────────
@@ -593,7 +656,7 @@ async def test_address_point_repair_write_skips_a_row_changed_since_it_was_read(
                   "payload": payload, "source": _SDCI, "f_property_state": None,
                   "f_owner_state": None, "f_absentee": None, "f_out_of_state": None,
                   "old_pin_status": "address_mismatch", "old_pin": None, "old_pin_match": None,
-                  "old_pin_source": None, **over}
+                  "old_pin_source": None, "old_parcel_address": None, **over}
         with system_sync_session() as sdb:
             res = sdb.execute(text(bko._AP_UPDATE_SQL), params)
             sdb.commit()
@@ -602,6 +665,7 @@ async def test_address_point_repair_write_skips_a_row_changed_since_it_was_read(
     assert await asyncio.to_thread(_write, old_pin_status="multiple") == 0
     assert await asyncio.to_thread(_write, old_mail="PO BOX 1, SEATTLE, WA 98111") == 0
     assert await asyncio.to_thread(_write, uid=str(uuid.uuid4())) == 0
+    assert await asyncio.to_thread(_write, old_parcel_address="9043A 18TH AVE SW") == 0
     assert await asyncio.to_thread(_write) == 1
     # Decided once: a second decision for the same row is refused.
     assert await asyncio.to_thread(_write, old_pin_status="matched", old_pin="7899800716",

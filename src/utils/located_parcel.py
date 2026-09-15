@@ -40,12 +40,6 @@ _SHOWN_MATCHES_BY_SOURCE = {
     KING_GIS_POINT_SOURCE: frozenset({MATCH_EXACT, MATCH_STREET_ONLY}),
     KING_GIS_ADDRESS_POINT_SOURCE: frozenset({MATCH_ADDRESS_POINT}),
 }
-# Tiers whose PIN may be used to look up a mailing address. Condo complexes located by
-# the strict point rule keep the pre-existing behavior; nothing internal-only qualifies.
-_MAILING_MATCHES_BY_SOURCE = {
-    KING_GIS_POINT_SOURCE: frozenset({MATCH_EXACT, MATCH_STREET_ONLY, MATCH_CONDO_COMPLEX}),
-    KING_GIS_ADDRESS_POINT_SOURCE: frozenset({MATCH_ADDRESS_POINT}),
-}
 _LABELS = {
     MATCH_EXACT: PARCEL_SOURCE_LABEL,
     MATCH_STREET_ONLY: PARCEL_SOURCE_LABEL_STREET_ONLY,
@@ -53,7 +47,8 @@ _LABELS = {
 }
 
 
-def _matched_tier(enrichment_data: Any, allowed: dict[str, frozenset]) -> str | None:
+def located_parcel_match(enrichment_data: Any) -> str | None:
+    """'exact', 'street_only' or 'address_point' for a showable located PIN, else None."""
     if not isinstance(enrichment_data, dict):
         return None
     pin = enrichment_data.get("kc_pin")
@@ -64,14 +59,9 @@ def _matched_tier(enrichment_data: Any, allowed: dict[str, frozenset]) -> str | 
     if (enrichment_data.get("kc_pin_status") != "matched"
             # isinstance first: a malformed list/object value is unhashable (Codex P2).
             or not isinstance(source, str) or not isinstance(match, str)
-            or match not in allowed.get(source, frozenset())):
+            or match not in _SHOWN_MATCHES_BY_SOURCE.get(source, frozenset())):
         return None
     return match
-
-
-def located_parcel_match(enrichment_data: Any) -> str | None:
-    """'exact', 'street_only' or 'address_point' for a showable located PIN, else None."""
-    return _matched_tier(enrichment_data, _SHOWN_MATCHES_BY_SOURCE)
 
 
 def located_parcel_id(enrichment_data: Any, *, exact_only: bool = False) -> str | None:
@@ -86,20 +76,14 @@ def located_parcel_id(enrichment_data: Any, *, exact_only: bool = False) -> str 
 
 
 def mailing_lookup_pin(enrichment_data: Any) -> str | None:
-    """The located King PIN whose extract or tax-bill mailing may be written, else None."""
-    if _matched_tier(enrichment_data, _MAILING_MATCHES_BY_SOURCE) is not None:
-        return enrichment_data["kc_pin"]
-    # A strict point match stored before tiers existed (no kc_pin_match, and a point or
-    # absent source) has always been eligible for mailing; only the address-point tiers
-    # are new, and they always carry both keys.
-    if (isinstance(enrichment_data, dict)
-            and enrichment_data.get("kc_pin_source", KING_GIS_POINT_SOURCE) == KING_GIS_POINT_SOURCE
-            and enrichment_data.get("kc_pin_status") == "matched"
-            and "kc_pin_match" not in enrichment_data):
-        pin = enrichment_data.get("kc_pin")
-        if isinstance(pin, str) and len(pin) == 10 and pin.isdigit():
-            return pin
-    return None
+    """The located King PIN whose extract or tax-bill mailing may be written, else None.
+
+    Exactly the shown tiers (Codex P1): a condo complex parcel's mailing belongs to no
+    unit owner, an address-only candidate proves nothing, and a match stored before tiers
+    existed may be a condo complex, so it waits for the tier repair
+    (scripts/backfill_king_code_violation_owner.py) like every other read.
+    """
+    return located_parcel_id(enrichment_data)
 
 
 def parcel_source_label(enrichment_data: Any) -> str:

@@ -75,7 +75,8 @@ _UNIT_RE = re.compile(
 _RANGE_RE = re.compile(r"^\s*\d+\s*(?:-|/|\s\d+/)")
 _MLK_RE = re.compile(r"\b(?:M\s*L\s*K(?:ING)?|MARTIN\s+L(?:UTHER)?\s+KING)(?:\s+JR)?\b")
 _ZIP_TAIL_RE = re.compile(r"\b(\d{5})(?:-\d{4})?\s*$")
-_HOUSE_RE = re.compile(r"^(\d{1,6})(?:\s?([A-Z]))?\s+(\S.*)$")
+_STATE_TAIL_RE = re.compile(r"\s+(?:SEATTLE\s+)?WA(?:\s+(\d{5})(?:-\d{4})?)?\s*$")
+_HOUSE_RE =re.compile(r"^(\d{1,6})(?:\s?([A-Z]))?\s+(\S.*)$")
 _COMPRESS_OK = re.compile(r"^[A-Z0-9]{1,80}$")
 
 
@@ -111,6 +112,11 @@ def parse_lead_address(address: str | None) -> ParsedAddress | None:
         return None
     head, _, tail = raw.partition(",")
     zip_m = _ZIP_TAIL_RE.search(tail) if tail else None
+    # SDCI sometimes appends the city/state without a comma ("... WAY S WA").
+    state_m = _STATE_TAIL_RE.search(head)
+    if state_m:
+        head = head[:state_m.start()]
+        zip_m = zip_m or (state_m if state_m.group(1) else None)
     street_part = _MLK_RE.sub("MARTIN LUTHER KING JR", head.replace(".", " "))
     normalized = _normalize_street(street_part)
     m = _HOUSE_RE.match(normalized)
@@ -213,7 +219,8 @@ def match_address_point(
     if data is None:
         return AddressPointDecision("error")
     if data.get("exceededTransferLimit"):
-        return rejected("address_points_capped")
+        # A capped page does not prove "exactly one PIN": not a definite answer, retry.
+        return AddressPointDecision("error")
     points = [f.get("attributes") or {} for f in data.get("features") or []]
     hits: list[tuple[Reading, dict]] = []
     lettered_only = False
@@ -256,22 +263,25 @@ def match_address_point(
             if point_parcels is None:
                 return AddressPointDecision("error")
         ev["coordinate_pins"] = sorted(p for p, _ in point_parcels)
-        proptypes = dict(point_parcels)
-        if pin not in proptypes:
+        pin_proptypes = {t for p, t in point_parcels if p == pin}
+        if not pin_proptypes:
             return rejected("not_under_coordinates")
-        tier, proptype = MATCH_ADDRESS_POINT, proptypes[pin]
+        tier = MATCH_ADDRESS_POINT
+        proptype = _CONDO_PROPTYPE if _CONDO_PROPTYPE in pin_proptypes else pin_proptypes.pop()
     else:
         ev["coordinate_pins"] = None
         time.sleep(pace_s)
         data = _query(PARCEL_LAYER, {"where": f"PIN='{pin}'", "outFields": "PIN,PROPTYPE"})
-        if data is None:
+        if data is None or data.get("exceededTransferLimit"):
             return AddressPointDecision("error")
         found = [f.get("attributes") or {} for f in data.get("features") or []
                  if _valid_pin((f.get("attributes") or {}).get("PIN")) == pin]
         if not found:
             return rejected("pin_not_in_parcel_layer")
         tier = MATCH_ADDRESS_ONLY
-        proptype = str(found[0].get("PROPTYPE") or "").strip().upper()
+        proptypes_found = {str(a.get("PROPTYPE") or "").strip().upper() for a in found}
+        # Any condo polygon for this PIN makes it a condo complex.
+        proptype = _CONDO_PROPTYPE if _CONDO_PROPTYPE in proptypes_found else proptypes_found.pop()
     parcel_address = str(hits[0][1].get("ADDR_FULL") or "").strip() or None
     if proptype == _CONDO_PROPTYPE or any(
             str(p.get("PRIM_ADDR_FILTER") or "").strip().upper() == _CONDO_FILTER for _, p in hits):

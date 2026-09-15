@@ -253,7 +253,7 @@ def resolve_code_violation_mailing(
         elif (address_points and loc.status in kap.FALLBACK_STATUSES
               # Room for both address-point requests to time out before the deadline.
               and (deadline is None
-                   or time.monotonic() + 2 * _ADDRESS_POINT_WORST_S + pace_s < deadline)):
+                   or time.monotonic() + 2 * (_ADDRESS_POINT_WORST_S + pace_s) < deadline)):
             ap = kap.match_address_point(lat, lon, first_address,
                                          point_parcels=loc.point_parcels,
                                          point_status=loc.status, pace_s=pace_s)

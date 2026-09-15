@@ -3,8 +3,11 @@
 Only the browser is substituted: `FixturePortal` answers the adapter's two portal calls
 (a date-range search, a case detail page) with the real pages saved from
 aca-prod.accela.com/KINGCO on 2026-09-14 (tests/fixtures/king_cv_accela_*.html, with the
-complainant and staff free text replaced by "[redacted]" and the opaque __VIEWSTATE /
-__EVENTVALIDATION blobs emptied). Parsing, paging checks, windowing, retries, walls,
+complainant and staff free text replaced by "[redacted]"). Each page is trimmed by deletion
+only to the captured elements the adapter reads (the record grid, the no-results message,
+the case number, type, status, parcel list and work location) plus their ancestor chain,
+as captured; scripts, styles, navigation and ViewState were removed and nothing was added.
+Parsing, paging checks, windowing, retries, walls,
 budgets, record building and the connector/skip-trace registration run for real.
 """
 from __future__ import annotations

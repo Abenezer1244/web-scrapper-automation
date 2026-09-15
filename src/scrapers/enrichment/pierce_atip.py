@@ -24,6 +24,12 @@ Delivery_Address — and NEVER the taxpayer ``name`` (deliberately dropped in
 = ``pierce_atip``, ``atip_account_type``) so downstream consumers can treat a
 mobile-home situs differently from fee-simple real property.
 
+SCOPED EXCEPTION (owner decision 2026-09-14): legal review cleared storing the ATIP
+taxpayer name FOR TACOMA CODE-VIOLATION OWNER NAMING ONLY. That use lives in its own
+module (pierce_atip_owner.py) behind PIERCE_CV_OWNER_ENABLED and reuses only this
+module's response classes. This module is unchanged by it: it serves every other Pierce
+record type and still never returns a name (tests/test_pierce_atip_name_boundary.py).
+
 SSRF: the host is registered via add_scrape_domain and the parcel is digits-only
 and passed as a query PARAM (never interpolated into host/path).
 """
@@ -98,7 +104,9 @@ def _clean(value: Any) -> str | None:
 
 # The ONLY fields this module is permitted to emit. RCW 42.56.070(8) forbids the
 # commercial use of LISTS OF INDIVIDUALS, so ATIP contributes addresses and nothing
-# else; the lead's party_name comes from the RECORDER (ARMS), never from here.
+# else; the lead's party_name comes from the RECORDER (ARMS), never from here. The
+# one cleared exception (Tacoma code-violation owners, 2026-09-14) is
+# pierce_atip_owner.py, never this function.
 _ALLOWED_OUT_KEYS = frozenset(
     {"property_address", "mailing_address", "atip_account_type", "atip_use_code"}
 )

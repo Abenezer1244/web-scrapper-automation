@@ -288,6 +288,17 @@ app.conf.beat_schedule = {
         "task": "src.workers.property_recovery.recover_deferred_property",
         "schedule": crontab(minute="7-59/20"),  # every 20 minutes from :07
     },
+    "recover-pierce-cv-owners": {
+        # Names delivered Tacoma code-violation leads the job's bounded owner pass did
+        # not reach (Pierce ATIP taxpayer record; owner decision 2026-09-14 scopes it to
+        # code violations). Bounded (20 parcels, 300 s), PIERCE_CV_OWNER_ENABLED
+        # (default off), its own Pierce lease and source cooldown; NOT on the King
+        # lease, so it is not one of the King sweeps. Never bills, never creates a
+        # job, never enqueues a skip trace. Minutes :10/:40 sit at least 2 min from
+        # every King mark.
+        "task": "src.workers.pierce_cv_owner_recovery.recover_pierce_cv_owners_task",
+        "schedule": crontab(minute="10-59/30"),  # every 30 minutes from :10
+    },
     "batch-completion-sweep": {
         # Piece 2: finalize batch_runs whose child jobs are ALL terminal — build
         # the one combined CSV + deliver. Claims each run via a reclaimable lease;

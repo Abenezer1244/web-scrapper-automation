@@ -1,11 +1,12 @@
-"""Background owner names for King (Seattle SDCI) code-violation leads.
+"""Background owner names for King code-violation leads (Seattle, Bellevue, Burien, Accela).
 
 WHY THIS EXISTS
 ---------------
-SDCI names the complaint, never the owner. A King code-violation job locates each
-case's parcel (`enrichment_data.kc_pin`) and names the owner of a shown location
-(exact or street-level, src/utils/located_parcel.py) from eRealProperty inside a
-240 s budget. At 1 request per second a large job runs out of budget, or loses the
+No King code-violation source names the owner. A King code-violation job names it from
+eRealProperty for the lead's parcel inside a 240 s budget: for Seattle SDCI the parcel it
+located (`enrichment_data.kc_pin`, at a shown tier of src/utils/located_parcel.py), for
+Bellevue, Burien and King County Accela the King PIN the source printed (`parcel_id`,
+set at scrape). At 1 request per second a large job runs out of budget, or loses the
 shared King lease, and every row it did not reach stays unnamed: nothing else ever
 looked at it again except a manual run of
 scripts/backfill_king_code_violation_owner.py. This sweep is that second look.
@@ -19,10 +20,11 @@ An OWNER-NAME FILL and nothing else, on the same boundary as owner_recovery.py:
   * It never changes `parcel_id`, `dedup_hash`, `property_key`, mailing or
     `skip_trace_status`, and never enqueues a skip trace.
   * It only fills a `party_name` that is still blank, on a row that is still
-    delivered, still located on the SAME parcel at a shown tier, with no owner
-    source yet, on a job that is still done. Each condition is re-checked in the
-    UPDATE itself, so a row a re-run named, re-located or the plan cap excluded
-    while the lookup was in flight is left alone.
+    delivered, still on the SAME parcel (the located PIN at a shown tier, or the
+    printed parcel_id), with no owner source yet, on a job that is still done. Each
+    condition is re-checked in the UPDATE itself, so a row a re-run named, re-located,
+    re-parceled or the plan cap excluded while the lookup was in flight is left alone.
+    A printed-PIN row's owner_pin is its parcel_id, which is what skip trace requires.
 
 WHICH LEADS
 -----------
@@ -51,6 +53,7 @@ from sqlalchemy import text as sa_text
 
 from src.api.lead_actionability import actionable_sql
 from src.config import settings
+from src.scrapers.king_cv_sources import PARCEL_AT_SCRAPE_SOURCES
 from src.utils.located_parcel import located_parcel_id, shown_tier_sql
 from src.utils.logger import setup_logger
 
@@ -80,23 +83,37 @@ _CELERY_TIME_LIMITS = (SoftTimeLimitExceeded, TimeLimitExceeded)
 _LOCK_KEY = "bl:cv_owner_recovery:lock"
 _LOCK_TTL_S = 1200
 
-# Delivered King code-violation leads still waiting for an owner, located at a
-# shown tier. Mirrors src/utils/located_parcel.py located_parcel_id (kc_pin a
-# 10-digit string, status matched, and a shown tier with the source allowed to
-# produce it: exact/street_only from the point rule, address_point from the address
-# points; never address_only or condo_complex). The tier predicate is generated from
-# located_parcel.py so SQL and Python cannot disagree; the Python rule is checked
-# again before a lookup. The same predicate guards every write.
+# Sources that print the King PIN into results.parcel_id at scrape, as a SQL list. The
+# keys are module constants with no quote characters.
+_PRINTED_SOURCES_SQL = ", ".join(f"'{k}'" for k in sorted(PARCEL_AT_SCRAPE_SOURCES))
+
+# The parcel a lead's owner is looked up for: the printed parcel_id for a printed-PIN
+# source, the located kc_pin for SDCI. The same expression selects, groups and guards.
+_PIN_SQL = (f"(CASE WHEN r.enrichment_data::jsonb->>'source' IN ({_PRINTED_SOURCES_SQL}) "
+            "THEN r.parcel_id ELSE r.enrichment_data::jsonb->>'kc_pin' END)")
+
+# Delivered King code-violation leads still waiting for an owner, on a parcel we can
+# prove. SDCI: mirrors src/utils/located_parcel.py located_parcel_id (kc_pin a 10-digit
+# string, status matched, and a shown tier with the source allowed to produce it:
+# exact/street_only from the point rule, address_point from the address points; never
+# address_only or condo_complex); the tier predicate is generated from located_parcel.py
+# so SQL and Python cannot disagree. Bellevue, Burien, King County Accela: parcel_id is
+# a 10-digit PIN and no owner_pin was ever written (a kc_pin block on such a row is never
+# read). The Python rule (_row_pin) is checked again before a lookup and before a write,
+# and the same predicate guards every write.
 _ELIGIBLE_ROW = """
       r.is_duplicate = false
   AND jsonb_typeof(r.enrichment_data::jsonb) = 'object'
   AND r.enrichment_data::jsonb->>'delivery_excluded_reason' IS NULL
   AND (r.party_name IS NULL OR r.party_name ~ '^[[:space:]]*$')
-  AND r.enrichment_data::jsonb->>'source' = 'seattle_sdci_code_violations'
-  AND r.enrichment_data::jsonb->>'kc_pin_status' = 'matched'
-""" + f"""  AND {shown_tier_sql("r.enrichment_data::jsonb")}
-""" + """  AND jsonb_typeof(r.enrichment_data::jsonb->'kc_pin') = 'string'
-  AND r.enrichment_data::jsonb->>'kc_pin' ~ '^[0-9]{10}$'
+  AND ((r.enrichment_data::jsonb->>'source' = 'seattle_sdci_code_violations'
+        AND r.enrichment_data::jsonb->>'kc_pin_status' = 'matched'
+""" + f"""        AND {shown_tier_sql("r.enrichment_data::jsonb")}
+""" + """        AND jsonb_typeof(r.enrichment_data::jsonb->'kc_pin') = 'string'
+        AND r.enrichment_data::jsonb->>'kc_pin' ~ '^[0-9]{10}$')
+""" + f"""    OR (r.enrichment_data::jsonb->>'source' IN ({_PRINTED_SOURCES_SQL})
+""" + """        AND r.parcel_id ~ '^[0-9]{10}$'
+        AND NOT (r.enrichment_data::jsonb ? 'owner_pin')))
   AND NOT (r.enrichment_data::jsonb ? 'owner_source')
   AND coalesce(r.enrichment_data::jsonb->>'cv_owner_recovery_outcome', '')
       NOT IN ('not_on_record', 'parcel_mismatch', 'gave_up')
@@ -114,9 +131,9 @@ _KING_CV_JOB = """
 """
 
 # Pick PARCELS, not rows: fewest attempts first, then the longest since last tried,
-# then the newest case.
+# then the newest case. A PIN shared by an SDCI row and a printed-PIN row is one lookup.
 _CANDIDATE_PARCELS_SQL = f"""
-    SELECT r.enrichment_data::jsonb->>'kc_pin' AS pin,
+    SELECT {_PIN_SQL} AS pin,
            min(CASE WHEN r.enrichment_data::jsonb->>'cv_owner_recovery_attempts' ~ '^[0-9]{{1,6}}$'
                     THEN (r.enrichment_data::jsonb->>'cv_owner_recovery_attempts')::int
                     ELSE 0 END) AS attempts,
@@ -127,19 +144,19 @@ _CANDIDATE_PARCELS_SQL = f"""
     JOIN scraper_configs sc ON sc.id = j.scraper_config_id
     WHERE {_KING_CV_JOB}
       AND {_ELIGIBLE_ROW}
-    GROUP BY r.enrichment_data::jsonb->>'kc_pin'
+    GROUP BY {_PIN_SQL}
     ORDER BY attempts ASC, last_at ASC, newest DESC NULLS LAST, pin ASC
     LIMIT :batch
 """  # noqa: S608 -- splices only module constants; every value is bound
 
 _CANDIDATE_ROWS_SQL = f"""
-    SELECT r.id, r.user_id, r.enrichment_data::jsonb->>'kc_pin' AS pin, r.enrichment_data
+    SELECT r.id, r.user_id, {_PIN_SQL} AS pin, r.parcel_id, r.enrichment_data
     FROM results r
     JOIN jobs j ON j.id = r.job_id
     JOIN scraper_configs sc ON sc.id = j.scraper_config_id
     WHERE {_KING_CV_JOB}
       AND {_ELIGIBLE_ROW}
-      AND r.enrichment_data::jsonb->>'kc_pin' = ANY(:pins)
+      AND {_PIN_SQL} = ANY(:pins)
     ORDER BY r.id
 """  # noqa: S608 -- splices only module constants; every value is bound
 
@@ -150,12 +167,25 @@ _WRITE_SQL = f"""
       party_name = COALESCE(CAST(:owner AS varchar), r.party_name),
       enrichment_data = (r.enrichment_data::jsonb || CAST(:payload AS jsonb))::json
     WHERE r.id = :rid AND r.user_id = :uid
-      AND r.enrichment_data::jsonb->>'kc_pin' = :pin
+      AND {_PIN_SQL} = :pin
       AND {_ELIGIBLE_ROW}
       AND EXISTS (
         SELECT 1 FROM jobs j JOIN scraper_configs sc ON sc.id = j.scraper_config_id
         WHERE j.id = r.job_id AND {_KING_CV_JOB})
 """  # noqa: S608 -- splices only module constants; every value is bound
+
+
+def _row_pin(row) -> str | None:
+    """The parcel this lead's owner may be named for, by the Python rule, else None.
+
+    Printed-PIN sources: the 10-digit parcel_id the source printed (never a kc_pin).
+    SDCI: the located PIN at a shown tier (located_parcel_id).
+    """
+    ed = row.enrichment_data if isinstance(row.enrichment_data, dict) else {}
+    if ed.get("source") in PARCEL_AT_SCRAPE_SOURCES:
+        pid = getattr(row, "parcel_id", None)
+        return pid if isinstance(pid, str) and len(pid) == 10 and pid.isdigit() else None
+    return located_parcel_id(ed)
 
 
 def _now_iso() -> str:
@@ -265,7 +295,7 @@ def _tick(stats: dict, lock: tuple) -> dict:
         for row in rows:
             # The read-side rule that shows this PIN as the lead's parcel must agree
             # before its owner is looked up; SQL alone is not trusted for a name.
-            if located_parcel_id(row.enrichment_data) == row.pin:
+            if _row_pin(row) == row.pin:
                 by_pin.setdefault(row.pin, []).append(row)
         # Ask King only about parcels that still have an eligible row after the
         # second read; one that lost its rows in between is not worth a request.
@@ -360,7 +390,7 @@ def _write(db, row, outcome: str, owner: str | None) -> str:
     the outcome, `gave_up`, `stale` (the row changed since selection, nothing
     written) or `errors`."""
     ed = row.enrichment_data if isinstance(row.enrichment_data, dict) else {}
-    if located_parcel_id(ed) != row.pin:
+    if _row_pin(row) != row.pin:
         return "stale"
     if outcome == "found" and not (owner or "").strip():
         outcome = "transient"                    # a blank name is not an owner

@@ -15,6 +15,7 @@ import uuid
 from datetime import UTC, date, datetime
 from pathlib import Path
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import pytest
 import requests
@@ -217,7 +218,8 @@ async def test_bellevue_window_is_the_pacific_day_and_both_edges_are_kept(monkey
     assert days[0] == "07/16/2026" and days[-1] == "07/20/2026"
     in_window = [f for f in BEL_QUERY["response"]["features"]
                  if "07/16/2026" <= datetime.fromtimestamp(
-                     f["attributes"]["APPLIEDDATE"] / 1000, UTC).strftime("%m/%d/%Y") <= "07/20/2026"]
+                     f["attributes"]["APPLIEDDATE"] / 1000, UTC).astimezone(
+                         ZoneInfo("America/Los_Angeles")).strftime("%m/%d/%Y") <= "07/20/2026"]
     assert len(recs) == len(in_window)
 
 
@@ -326,6 +328,18 @@ async def test_an_arcgis_error_body_is_a_failure_not_zero_cases(monkeypatch, no_
     monkeypatch.setattr(base, "safe_get", _ArcGIS(bellevue_query=lambda p: ARCGIS_ERROR))
     with pytest.raises(RuntimeError, match="Invalid query parameters"):
         await bellevue.BellevueSource().fetch("09/01/2026", "09/14/2026")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("features", [None, "none", [None], [["attributes"]]])
+async def test_a_query_answer_whose_features_are_not_a_list_of_objects_fails(
+    monkeypatch, no_backoff, features,
+):
+    # The real query answer with only its features value broken.
+    broken = {**BEL_QUERY["response"], "features": features}
+    monkeypatch.setattr(base, "safe_get", _ArcGIS(bellevue_query=lambda p: broken))
+    with pytest.raises(RuntimeError, match="malformed body"):
+        await bellevue.BellevueSource().fetch("07/16/2026", "07/20/2026")
 
 
 # ── One connector over every source ──────────────────────────────────────────
@@ -508,6 +522,15 @@ def test_owner_lookup_keys_parcel_sources_by_their_printed_pin():
     assert bel.enrichment_data["owner_source"] == "king_erealproperty"
     assert bel.enrichment_data["owner_pin"] == "2571200050" == bel.parcel_id
     assert bur.party_name is None
+
+
+def test_printed_pin_parcels_are_asked_first_because_no_sweep_names_them_later():
+    sdci = _parcel_row(parcel_id=None, enrichment_data={
+        "source": "seattle_sdci_code_violations", "kc_pin": "9138100481", "kc_pin_status": "matched",
+        "kc_pin_source": "king_gis_point_in_parcel", "kc_pin_match": "exact"})
+    bel = _parcel_row()
+    acc = _parcel_row(source="kingco_accela_code_enforcement", parcel_id="1626069072")
+    assert list(kpl.owner_lookup_pins([sdci, bel, acc])) == ["2571200050", "1626069072", "9138100481"]
 
 
 def test_an_owner_is_not_applied_to_a_row_whose_parcel_changed_since_selection():

@@ -179,14 +179,26 @@ def owner_lookup_pins(rows) -> dict[str, list]:
     src/utils/located_parcel.py), may name the owner: the county's taxpayer on a parcel
     we are not sure of would put a stranger's name on the lead. A row that already has a
     party_name is never offered for replacement.
+
+    Printed-PIN parcels come first in the returned order, which is the order the
+    time-budgeted owner pass asks King in: a printed-PIN row this pass does not reach is
+    never named later (the cv_owner_recovery sweep selects SDCI rows only), while an
+    unreached SDCI row is.
     """
-    out: dict[str, list] = {}
+    printed: dict[str, list] = {}
+    located: dict[str, list] = {}
     for res in rows:
         if res.party_name:
             continue
         pin = owner_parcel_id(res)
-        if pin:
-            out.setdefault(pin, []).append(res)
+        if not pin:
+            continue
+        ed = getattr(res, "enrichment_data", None)
+        is_printed = isinstance(ed, dict) and ed.get("source") in PARCEL_AT_SCRAPE_SOURCES
+        (printed if is_printed else located).setdefault(pin, []).append(res)
+    out = dict(printed)
+    for pin, pin_rows in located.items():
+        out.setdefault(pin, []).extend(pin_rows)
     return out
 
 

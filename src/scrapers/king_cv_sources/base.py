@@ -103,8 +103,12 @@ def get_json_with_retries(url: str, params: dict, *, what: str, require_features
                             require_allowlisted=True)
             resp.raise_for_status()
             data = resp.json()
+            # A query answer's features must be a list of feature objects: "features": null
+            # or a non-object entry is a malformed body, never "0 results".
             if (not isinstance(data, dict) or "error" in data
-                    or (require_features and "features" not in data)):
+                    or (require_features and not (
+                        isinstance(data.get("features"), list)
+                        and all(isinstance(f, dict) for f in data["features"])))):
                 err = ""
                 if isinstance(data, dict) and isinstance(data.get("error"), dict):
                     err = str(data["error"].get("message", data["error"]))[:160]
@@ -139,7 +143,7 @@ def arcgis_query_all(url: str, params: dict, *, page_size: int, what: str,
         data = get_json_with_retries(
             url, {**params, "resultRecordCount": page_size, "resultOffset": offset, "f": "json"},
             what=f"{what} page {page_num + 1} (offset {offset})", require_features=True)
-        features = data.get("features") or []
+        features = data["features"]
         rows.extend((f.get("attributes") or {}) for f in features)
         if on_page is not None:
             on_page(page_num + 1, len(rows))

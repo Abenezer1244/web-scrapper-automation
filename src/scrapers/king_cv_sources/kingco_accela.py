@@ -238,8 +238,9 @@ def parse_results_page(html: str) -> ResultsPage:
     """The grid rows, "Showing" counts and whether a Next page exists.
 
     Raises AccelaFormatError when the page has neither the grid nor the no-results
-    message, when the grid's expected headers are missing, or when grid rows exist but
-    none parse (the canary for a portal layout change).
+    message, when the grid's expected headers are missing, when any grid row does not
+    parse, or when the row count disagrees with the printed "Showing" range (the canaries
+    for a portal layout change; a partly read page must never pass as complete).
     """
     soup = BeautifulSoup(html, "lxml")
     grid = soup.select_one(SEL_GRID)
@@ -258,8 +259,12 @@ def parse_results_page(html: str) -> ResultsPage:
     if missing:
         raise AccelaFormatError(f"{KINGCO_ACCELA}: record grid headers changed (missing {missing})")
 
+    # Every odd/even grid row is one case (verified on every saved results page), so a
+    # row that does not parse is a layout change, never a row to skip: skipping it would
+    # ship this source as a success with cases missing.
     raw_rows = grid.select("tr.ACA_TabRow_Odd, tr.ACA_TabRow_Even")
     rows: list[GridRow] = []
+    unreadable = 0
     for tr in raw_rows:
         def cell(suffix: str, _tr=tr):
             return _tr.select_one(f"[id$='_{suffix}']")
@@ -269,10 +274,12 @@ def parse_results_page(html: str) -> ResultsPage:
         date_match = _DATE_RE.match(_text(cell("lblUpdatedTime")) or "")
         href = link.get("href") if link is not None else None
         if not case or not _CASE_RE.match(case) or not date_match or not href:
+            unreadable += 1
             continue
         try:
             opened = date(int(date_match.group(3)), int(date_match.group(1)), int(date_match.group(2)))
         except ValueError:
+            unreadable += 1
             continue
         street, zipcode = split_address(_text(cell("lblPermitAddress")))
         rows.append(GridRow(
@@ -284,14 +291,20 @@ def parse_results_page(html: str) -> ResultsPage:
             address=street,
             zip=zipcode,
         ))
-    if raw_rows and not rows:
+    if unreadable:
         raise AccelaFormatError(
-            f"{KINGCO_ACCELA}: {len(raw_rows)} grid rows but none had a case number and date")
+            f"{KINGCO_ACCELA}: {unreadable} of {len(raw_rows)} grid rows had no readable case "
+            f"number and date")
 
     showing = None
     m = _SHOWING_RE.search(grid.get_text(" ", strip=True))
     if m:
         showing = (int(m.group(1)), int(m.group(2)), int(m.group(3)), m.group(4) == "+")
+    if rows and (showing is None or len(rows) != showing[1] - showing[0] + 1):
+        raise AccelaFormatError(
+            f"{KINGCO_ACCELA}: the grid lists {len(rows)} rows but its range reads "
+            f"{'nothing' if showing is None else f'{showing[0]}-{showing[1]}'}; "
+            f"cannot prove the page is complete")
     has_next = any(
         (_text(a) or "").startswith("Next") and "__doPostBack" in (a.get("href") or "")
         for a in grid.select("tr.ACA_Table_Pages a"))
@@ -329,7 +342,13 @@ def detail_url(path: str) -> str:
     """Absolute detail URL on the portal host; anything pointing elsewhere is refused."""
     url = urljoin(SEARCH_URL, path)
     parts = urlsplit(url)
-    if parts.scheme != "https" or parts.hostname != _HOST or not parts.path.startswith("/KINGCO/Cap/CapDetail.aspx"):
+    try:
+        port = parts.port
+    except ValueError:
+        port = -1
+    if (parts.scheme != "https" or parts.hostname != _HOST or port not in (None, 443)
+            or parts.username is not None or parts.password is not None
+            or not parts.path.startswith("/KINGCO/Cap/CapDetail.aspx")):
         raise AccelaFormatError(f"{KINGCO_ACCELA}: unexpected case detail link {path[:120]!r}")
     return url
 
@@ -386,6 +405,26 @@ def build_record(row: GridRow, detail: CaseDetail) -> ScrapedRecord:
     return record
 
 
+def check_paging_budget(page: ResultsPage, deadline: float) -> None:
+    """Stop a search before its next page when the run cannot use what paging would read.
+
+    Checked inside one search, between pages, so a large or slow window cannot spend the
+    worker's scrape timeout (and with it the other jurisdictions) before control returns
+    to the source: a window already past MAX_DETAIL_PAGES rows, or one whose exact total
+    is over it, is too many cases for one run; past ``deadline`` the time budget is spent.
+    """
+    if page.showing is not None:
+        _first, last, total, lower_bound = page.showing
+        if last >= MAX_DETAIL_PAGES or (not lower_bound and total > MAX_DETAIL_PAGES):
+            raise AccelaBudgetError(
+                f"{KINGCO_ACCELA}: a search window lists {total}{'+' if lower_bound else ''} cases, "
+                f"more than the {MAX_DETAIL_PAGES} one run can look up; run a shorter date range")
+    if time.monotonic() >= deadline:
+        raise AccelaBudgetError(
+            f"{KINGCO_ACCELA}: stopped paging after the {TIME_BUDGET_SECONDS}s time budget; "
+            f"run a shorter date range")
+
+
 # ── Browser ──────────────────────────────────────────────────────────────────
 
 class AccelaPortal(BridgeScraper):
@@ -394,6 +433,8 @@ class AccelaPortal(BridgeScraper):
     def __init__(self) -> None:
         super().__init__()
         self._last_action = 0.0
+        #: time.monotonic() after which paging stops; the source sets its run deadline.
+        self.deadline = float("inf")
 
     async def _pace(self) -> None:
         wait = self._last_action + PACE_SECONDS - time.monotonic()
@@ -455,6 +496,7 @@ class AccelaPortal(BridgeScraper):
             current = parse_results_page(pages[-1].html)
             if not current.has_next:
                 return pages
+            check_paging_budget(current, self.deadline)
             await self._postback(lambda: self.page.locator(SEL_NEXT).first.click())
             # The postback settles before the grid is swapped in (verified live: a
             # snapshot taken at networkidle was still the previous page), so wait for
@@ -523,6 +565,7 @@ class KingCountyAccelaSource(CodeViolationSource):
         _logger.info("King County Accela code enforcement %s to %s", date_from, date_to)
         self._deadline = time.monotonic() + TIME_BUDGET_SECONDS
         async with self.portal_class() as portal:
+            portal.deadline = self._deadline
             rows = await self._list_cases(portal, start, end)
             records = []
             for n, row in enumerate(rows, start=1):

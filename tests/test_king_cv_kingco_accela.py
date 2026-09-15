@@ -179,10 +179,41 @@ def test_no_results_is_an_empty_page_but_a_page_without_grid_or_message_is_a_for
 def test_canary_a_renamed_grid_column_or_unreadable_rows_fail_loud():
     with pytest.raises(ka.AccelaFormatError, match="headers changed"):
         ka.parse_results_page(PAGE1.replace(">Record Number<", ">Case Number<"))
-    with pytest.raises(ka.AccelaFormatError, match="none had a case number and date"):
+    with pytest.raises(ka.AccelaFormatError, match="had no readable case number and date"):
         ka.parse_results_page(PAGE1.replace("09/14/2026<", "Sep 14 2026<").replace("09/13/2026<", "Sep 13<")
                               .replace("09/12/2026<", "Sep 12<").replace("09/11/2026<", "Sep 11<")
                               .replace("09/10/2026<", "Sep 10<"))
+
+
+def test_one_unreadable_row_or_a_row_count_off_the_printed_range_fails_the_page():
+    # Skipping a row would ship the source as a success with a case missing.
+    one_bad = PAGE1.replace(">ENFR26-0933<", ">not a case<", 1)
+    assert one_bad != PAGE1
+    with pytest.raises(ka.AccelaFormatError, match="1 of 10 grid rows"):
+        ka.parse_results_page(one_bad)
+    # Rows present but no "Showing" range, or a range that counts a different number.
+    no_range = PAGE1.replace("Showing 1-10 of 34", "")
+    assert no_range != PAGE1
+    with pytest.raises(ka.AccelaFormatError, match="cannot prove the page is complete"):
+        ka.parse_results_page(no_range)
+    with pytest.raises(ka.AccelaFormatError, match="cannot prove the page is complete"):
+        ka.parse_results_page(PAGE1.replace("Showing 1-10 of 34", "Showing 1-11 of 34"))
+
+
+def test_paging_stops_inside_a_search_at_the_case_limit_or_the_time_budget(monkeypatch):
+    far = ka.time.monotonic() + 3600
+    ka.check_paging_budget(ka.parse_results_page(PAGE1), far)
+    ka.check_paging_budget(ka.parse_results_page(PAGE_100PLUS), far)
+    with pytest.raises(ka.AccelaBudgetError, match="time budget"):
+        ka.check_paging_budget(ka.parse_results_page(PAGE1), ka.time.monotonic() - 1)
+    monkeypatch.setattr(ka, "MAX_DETAIL_PAGES", 30)
+    # "1-10 of 34" is an exact total over the limit: stop before reading page two.
+    with pytest.raises(ka.AccelaBudgetError, match="lists 34 cases"):
+        ka.check_paging_budget(ka.parse_results_page(PAGE1), far)
+    # "101-110 of 122" has already read past it.
+    monkeypatch.setattr(ka, "MAX_DETAIL_PAGES", 110)
+    with pytest.raises(ka.AccelaBudgetError, match="lists 122 cases"):
+        ka.check_paging_budget(ka.parse_results_page(PAGE_11_OF_122), far)
 
 
 @pytest.mark.parametrize(("raw", "parts"), [
@@ -312,7 +343,10 @@ def test_parcel_numbers_are_normalized_like_every_king_source():
 def test_detail_links_must_stay_on_the_portal():
     assert ka.detail_url(ka.parse_results_page(PAGE1).rows[0].detail_path).startswith(_DETAIL_PREFIX)
     for bad in ("https://evil.example/KINGCO/Cap/CapDetail.aspx?x=1", "//evil.example/KINGCO/Cap/CapDetail.aspx",
-                "/KINGCO/Login.aspx", "http://aca-prod.accela.com/KINGCO/Cap/CapDetail.aspx?x=1"):
+                "/KINGCO/Login.aspx", "http://aca-prod.accela.com/KINGCO/Cap/CapDetail.aspx?x=1",
+                "https://aca-prod.accela.com:8443/KINGCO/Cap/CapDetail.aspx?x=1",
+                "https://aca-prod.accela.com:x/KINGCO/Cap/CapDetail.aspx?x=1",
+                "https://u:p@aca-prod.accela.com/KINGCO/Cap/CapDetail.aspx?x=1"):
         with pytest.raises(ka.AccelaFormatError, match="unexpected case detail link"):
             ka.detail_url(bad)
 

@@ -114,9 +114,11 @@ def _no_king_extract_download(monkeypatch):
     silently change what an unrelated King test observes. A test of the extract itself
     re-patches `cached_extract` with a zip it builds in tmp_path (the later patch wins).
     """
-    from src.scrapers.enrichment import king_rpacct
+    from src.scrapers.enrichment import king_condo_units, king_rpacct
 
     monkeypatch.setattr(king_rpacct, "cached_extract", lambda *a, **kw: None)
+    # The condo unit extract (~7 MB) is consulted by the same King enrichment pass.
+    monkeypatch.setattr(king_condo_units, "cached_extract", lambda *a, **kw: None)
     yield
 
 

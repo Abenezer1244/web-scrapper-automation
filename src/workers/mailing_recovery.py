@@ -52,6 +52,7 @@ from sqlalchemy import text as sa_text
 
 from src.config import settings
 from src.utils.logger import setup_logger
+from src.workers.tasks_helpers.enrich import KING_ACCOUNT_RESOLVER
 
 _logger = setup_logger("worker.mailing_recovery")
 
@@ -145,8 +146,14 @@ def _release_single_flight(client) -> None:
 # deduplication, so 120 rows that happened to be four copies of each parcel
 # yielded only 30 lookups — and a phase-1 pass of 30 can never fill the 50-request
 # breaker window that is supposed to stop a developing outage (Codex).
-_CANDIDATE_PARCELS_SQL = """
-    SELECT DISTINCT ON (btrim(r.parcel_id)) btrim(r.parcel_id) AS parcel_id,
+# The PIN King is asked about: an exact account-number resolution (the recorder printed
+# the 12-digit tax account number), else the parcel as printed. A 12-digit value looked
+# up as printed can never match, and used to rotate through this sweep forever.
+_LOOKUP_PIN = f"""(CASE WHEN r.enrichment_data->>'resolved_by' = '{KING_ACCOUNT_RESOLVER}'
+                   THEN r.enrichment_data->>'resolved_parcel_id' ELSE btrim(r.parcel_id) END)"""
+
+_CANDIDATE_PARCELS_SQL = f"""
+    SELECT DISTINCT ON ({_LOOKUP_PIN}) {_LOOKUP_PIN} AS parcel_id,
            coalesce((r.enrichment_data->>'mailing_recovery_attempts')::int, 0) AS attempts,
            coalesce(r.enrichment_data->>'mailing_recovery_last_at', '') AS last_at
     FROM results r
@@ -160,14 +167,14 @@ _CANDIDATE_PARCELS_SQL = """
       AND j.status = 'done'
       AND lower(sc.county) = 'king'
       AND upper(sc.state) = 'WA'
-    ORDER BY btrim(r.parcel_id),
+    ORDER BY {_LOOKUP_PIN},
              coalesce((r.enrichment_data->>'mailing_recovery_attempts')::int, 0) ASC,
              coalesce(r.enrichment_data->>'mailing_recovery_last_at', '') ASC,
              r.id ASC
-"""
+"""  # noqa: S608 -- splices only the _LOOKUP_PIN constant; every value is bound
 
-_CANDIDATE_SQL = """
-    SELECT r.id, r.user_id, r.parcel_id, r.enrichment_data,
+_CANDIDATE_SQL = f"""
+    SELECT r.id, r.user_id, r.parcel_id, {_LOOKUP_PIN} AS lookup_pin, r.enrichment_data,
            r.property_address, r.property_city, r.property_state, r.property_zip
     FROM results r
     JOIN jobs j ON j.id = r.job_id
@@ -180,9 +187,9 @@ _CANDIDATE_SQL = """
       AND j.status = 'done'
       AND lower(sc.county) = 'king'
       AND upper(sc.state) = 'WA'
-      AND btrim(r.parcel_id) = ANY(:parcels)
+      AND {_LOOKUP_PIN} = ANY(:parcels)
     ORDER BY r.id ASC
-"""
+"""  # noqa: S608 -- splices only the _LOOKUP_PIN constant; every value is bound
 
 
 def recover_deferred_king_mailing() -> dict:
@@ -248,7 +255,7 @@ def _recover_impl(stats: dict, deadline: float | None = None) -> dict:
         # parcel share one mailing address, so fetching per row would pay twice.
         by_parcel: dict[str, list] = {}
         for row in rows:
-            by_parcel.setdefault(row.parcel_id.strip(), []).append(row)
+            by_parcel.setdefault(row.lookup_pin, []).append(row)
         stats["parcels"] = len(parcels)
 
         _logger.info(
@@ -338,7 +345,15 @@ def _recover_impl(stats: dict, deadline: float | None = None) -> dict:
         # without touching last_at the same thirty unresolvable parcels are the
         # first thirty candidates on every single tick and starve the entire
         # backlog behind them (Codex). Touching the timestamp rotates them.
-        _touch = [p for p in parcels if p not in set(attempted)]
+        # A page that named a DIFFERENT parcel is a settled answer, not a failure to
+        # reach one: the parcel as looked up does not exist on eRealProperty, so asking
+        # again cannot produce a mailing address. Charged and terminal, never rotated
+        # forever (a 12-digit value that is not a known account number did exactly that).
+        _mismatch = [p for p in parcels if p not in set(attempted)
+                     and (enriched.get(p) or {}).get("parcel_lookup") == "mismatch"]
+        if _mismatch:
+            _apply(db, by_parcel, _mismatch, enriched, stats)
+        _touch = [p for p in parcels if p not in set(attempted) and p not in set(_mismatch)]
         if _touch:
             _rotate(db, by_parcel, _touch, stats)
     return stats
@@ -384,7 +399,11 @@ def _apply(db, by_parcel: dict, parcels: list[str], enriched: dict, stats: dict)
         mailing = (data.get("mailing_address") or "").strip() or None
         lookup = data.get("mailing_lookup") or "error"
 
-        if mailing:
+        if data.get("parcel_lookup") == "mismatch":
+            # Checked FIRST: a page that names another parcel says nothing about this one,
+            # so no mailing address it carries may be taken.
+            outcome, mailing = "parcel_mismatch", None
+        elif mailing:
             outcome = "found"
         elif lookup == "none":
             outcome = "none"                 # source answered: no mailing address
@@ -403,13 +422,14 @@ def _apply(db, by_parcel: dict, parcels: list[str], enriched: dict, stats: dict)
             attempts += 1
             # Terminal when the source gave a real answer of "no mailing address",
             # or when we have asked enough times. Anything else stays eligible.
-            terminal = outcome in ("found", "none") or attempts >= _MAX_ATTEMPTS
+            terminal = outcome in ("found", "none", "parcel_mismatch") or attempts >= _MAX_ATTEMPTS
             _write_row(db, row, mailing, outcome, attempts, terminal, now_iso, stats,
                        source=data.get("source") if mailing else None,
                        snapshot=data.get("snapshot") if mailing else None)
 
-        stats[{"found": "found", "none": "none",
-               "identity_unverified": "unverified"}.get(outcome, "errors")] += 1
+        _key = {"found": "found", "none": "none", "parcel_mismatch": "parcel_mismatch",
+                "identity_unverified": "unverified"}.get(outcome, "errors")
+        stats[_key] = stats.get(_key, 0) + 1
 
 
 def _write_row(db, row, mailing, outcome, attempts, terminal, now_iso, stats,

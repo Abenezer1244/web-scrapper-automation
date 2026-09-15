@@ -35,6 +35,7 @@ import tempfile
 import time
 import uuid
 import zipfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -59,26 +60,32 @@ class Answer:
     mailing_address: str | None = None
 
 
-def download_extract(dest: Path, timeout: int = 300) -> str:
-    """Download the extract to ``dest``; return its Last-Modified date (YYYY-MM-DD).
+def download_zip(url: str, dest: Path, check: Callable[[zipfile.ZipFile], object],
+                 label: str, timeout: int = 300) -> str:
+    """Download a King Assessor extract zip to ``dest``; return its Last-Modified date.
 
-    Refuses anything that is not a zip holding the expected CSV: a moved file or an
-    error page must fail loudly, not look like "no parcel has a mailing address".
+    Shared by every Assessor extract. ``check`` must raise when the zip does not hold
+    the expected member: a moved file or an error page must fail loudly, not look like
+    "the county has no data for any parcel".
     """
-    resp = safe_get(RPACCT_URL, headers={"User-Agent": "Mozilla/5.0 BridgeLeads/1.0"},
-                    timeout=timeout)
+    resp = safe_get(url, headers={"User-Agent": "Mozilla/5.0 BridgeLeads/1.0"}, timeout=timeout)
     if resp.status_code != 200:
-        raise RuntimeError(f"King RPAcct download returned HTTP {resp.status_code}")
+        raise RuntimeError(f"{label} download returned HTTP {resp.status_code}")
     body = resp.content
     if not body.startswith(b"PK"):
-        raise RuntimeError("King RPAcct download is not a zip file")
+        raise RuntimeError(f"{label} download is not a zip file")
     dest.write_bytes(body)
     with zipfile.ZipFile(dest) as zf:
-        _csv_name(zf)
+        check(zf)
     modified = resp.headers.get("Last-Modified")
     snapshot = parsedate_to_datetime(modified).date().isoformat() if modified else "unknown"
-    _logger.info("King RPAcct extract downloaded: %d bytes, snapshot %s", len(body), snapshot)
+    _logger.info("%s extract downloaded: %d bytes, snapshot %s", label, len(body), snapshot)
     return snapshot
+
+
+def download_extract(dest: Path, timeout: int = 300) -> str:
+    """Download the RPAcct extract to ``dest``; return its Last-Modified date (YYYY-MM-DD)."""
+    return download_zip(RPACCT_URL, dest, _csv_name, "King RPAcct", timeout=timeout)
 
 
 # Worker-local cache. The file changes weekly, so one download a day per container is
@@ -104,8 +111,14 @@ def cached_extract(max_age_s: float = _CACHE_MAX_AGE_S) -> tuple[Path, str] | No
     per-parcel tax-bill pages exactly as before. A failed refresh keeps using the file
     already on disk (a days-old snapshot beats none), and says so in the log.
     """
-    zip_path = _CACHE_DIR / "rpacct.zip"
-    meta_path = _CACHE_DIR / "snapshot.json"
+    return cached_zip(_CACHE_DIR, "rpacct", download_extract, "King RPAcct", max_age_s=max_age_s)
+
+
+def cached_zip(cache_dir: Path, stem: str, download: Callable[[Path], str], label: str,
+               max_age_s: float = _CACHE_MAX_AGE_S) -> tuple[Path, str] | None:
+    """The worker-local cache behind every King Assessor extract (see cached_extract)."""
+    zip_path = cache_dir / f"{stem}.zip"
+    meta_path = cache_dir / "snapshot.json"
 
     def _age() -> float | None:
         try:
@@ -116,11 +129,11 @@ def cached_extract(max_age_s: float = _CACHE_MAX_AGE_S) -> tuple[Path, str] | No
     age = _age()
     if age is None or age >= max_age_s:
         # Unique per attempt (not per PID): threads in one process must not share it.
-        tmp = _CACHE_DIR / f"rpacct.{os.getpid()}.{uuid.uuid4().hex}.part"
+        tmp = cache_dir / f"{stem}.{os.getpid()}.{uuid.uuid4().hex}.part"
         meta_tmp = tmp.with_suffix(".json")
         try:
-            _CACHE_DIR.mkdir(parents=True, exist_ok=True)
-            snapshot = download_extract(tmp)
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            snapshot = download(tmp)
             # Metadata first, then the zip, each by atomic rename, so a reader never
             # sees a half-written file. A reader racing the pair can at worst label a
             # new zip with the previous date for one lookup, never a corrupt answer.
@@ -129,7 +142,7 @@ def cached_extract(max_age_s: float = _CACHE_MAX_AGE_S) -> tuple[Path, str] | No
             os.replace(tmp, zip_path)
         except Exception as exc:  # noqa: BLE001 -- enrichment falls back to the pages
             _reraise_time_limit(exc)
-            _logger.warning("King RPAcct refresh failed: %s", str(exc)[:160])
+            _logger.warning("%s refresh failed: %s", label, str(exc)[:160])
         finally:
             # Also on a re-raised time limit, so repeated timeouts leave no debris.
             for leftover in (tmp, meta_tmp):
@@ -161,6 +174,54 @@ def resolve_pins(pins: set[str]) -> tuple[dict[str, Answer], str] | None:
         _logger.warning("King RPAcct read failed: %s", str(exc)[:160])
         return None
     return {pin: resolve(accounts.get(pin)) for pin in pins}, snapshot
+
+
+_ACCOUNT_RE = re.compile(r"\d{12}")
+
+
+def resolve_account_pins(accounts: set[str]) -> tuple[dict[str, str], str] | None:
+    """{12-digit account number: 10-digit PIN} from the cached extract, or None without one.
+
+    King's recorder sometimes prints the parcel's 12-digit tax ACCOUNT number where the
+    10-digit PIN belongs ("PID: 012603938700"). An account the extract does not carry is
+    simply absent from the answer: this never guesses which digits to drop.
+    """
+    cached = cached_extract()
+    if cached is None or not accounts:
+        return None
+    zip_path, snapshot = cached
+    try:
+        return load_account_pins(zip_path, accounts), snapshot
+    except Exception as exc:  # noqa: BLE001 -- a bad file must not break enrichment
+        _reraise_time_limit(exc)
+        _logger.warning("King RPAcct account read failed: %s", str(exc)[:160])
+        return None
+
+
+def load_account_pins(zip_path: Path, accounts: set[str]) -> dict[str, str]:
+    """The PIN behind each requested account number, only when the extract is unanimous.
+
+    Measured 2026-09-14: all 739,983 rows carry a 12-digit AcctNbr whose first 10 digits
+    equal Major+Minor, and the 537 repeated accounts are one parcel split into a taxable
+    and an exempt row. A row that breaks either fact, or an account naming two PINs,
+    resolves to nothing rather than to a guess.
+    """
+    wanted = {a for a in accounts if _ACCOUNT_RE.fullmatch(a or "")}
+    seen: dict[str, set[str | None]] = {}
+    with zipfile.ZipFile(zip_path) as zf, zf.open(_csv_name(zf)) as fh:
+        reader = csv.DictReader(io.TextIOWrapper(fh, encoding="latin-1", newline=""))
+        missing = {"AcctNbr", "Major", "Minor"} - set(reader.fieldnames or [])
+        if missing:
+            raise RuntimeError(f"King RPAcct schema changed, missing columns: {sorted(missing)}")
+        for row in reader:
+            acct = (row["AcctNbr"] or "").strip()
+            if acct not in wanted:
+                continue
+            major, minor = (row["Major"] or "").strip(), (row["Minor"] or "").strip()
+            exact = len(major) == 6 and len(minor) == 4 and pin_of(major, minor) == acct[:10]
+            seen.setdefault(acct, set()).add(acct[:10] if exact else None)
+    return {acct: next(iter(pins)) for acct, pins in seen.items()
+            if len(pins) == 1 and None not in pins}
 
 
 def _csv_name(zf: zipfile.ZipFile) -> str:

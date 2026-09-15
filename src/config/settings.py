@@ -312,6 +312,10 @@ class Settings(BaseSettings):
     # (src/workers/owner_recovery.py). Kill switch: False stops it before any
     # eRealProperty request, e.g. while King is rate-limiting us.
     OWNER_RECOVERY_ENABLED: bool = True
+    # Background sweep that fills King property addresses a job could not look up
+    # (src/workers/property_recovery.py): condo extract first, then eRealProperty under the
+    # shared lease. Kill switch: False stops it before any request.
+    PROPERTY_RECOVERY_ENABLED: bool = True
 
     # ─── Skip Trace (Tracerfy, Sprint 4) ──────────────────────────────────────
     TRACERFY_API_TOKEN: str = ""

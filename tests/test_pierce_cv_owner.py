@@ -334,6 +334,24 @@ def clean_health():
     _clear_health()
 
 
+@pytest.mark.asyncio
+async def test_the_atip_owner_browser_is_plain_with_no_init_script():
+    """Owner decision 2026-09-15: no anti-detection toward ATIP. A real Chromium session on
+    about:blank (no network): no init script registered, navigator.webdriver left true,
+    no plugins/UA spoofing, while the default scraper keeps its behavior."""
+    session = pao._new_session()
+    async with session as s:
+        assert s.init_scripts_registered == 0
+        assert await s.page.evaluate("navigator.webdriver") is True
+        assert await s.page.evaluate("Array.isArray(navigator.plugins)") is False
+        assert "HeadlessChrome" in await s.page.evaluate("navigator.userAgent")
+    from src.scrapers.base_scraper import BridgeScraper
+
+    async with BridgeScraper() as default:                 # other scrapers: unchanged
+        assert default.init_scripts_registered == 1
+        assert await default.page.evaluate("navigator.webdriver") is not True
+
+
 def test_flag_off_makes_zero_requests(monkeypatch):
     portal = _Portal({"2021110133": [(200, ATIP_2117)]}).install(monkeypatch)
     monkeypatch.setattr(settings, "PIERCE_CV_OWNER_ENABLED", False)

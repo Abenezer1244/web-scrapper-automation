@@ -21,8 +21,8 @@ enrichment_data.source is the Tacoma code-violation source. The gate is
 
 HOW
 ---
-One normal headless browser page view per parcel: the ATIP property page loads and the
-portal's own code calls `/api/pcAtipSummary` (taxpayer) and `/api/apprAccount/<parcel>`
+One PLAIN headless Chromium page view per parcel (owner decision 2026-09-15: no
+anti-detection of any kind): the ATIP property page loads and the portal's own code calls `/api/pcAtipSummary` (taxpayer) and `/api/apprAccount/<parcel>`
 (the Assessor's appraisal account) with its own invisible reCAPTCHA. We read those two
 responses. No captcha solver, no direct token handling, and never any key the portal
 exposes. The response classes and the stop rules are pierce_atip's (an empty body is a
@@ -287,10 +287,14 @@ def _summary_is_for(url: str, parcel: str) -> bool:
 
 
 def _new_session():
-    """A normal headless browser session (the project's SSRF-guarded BridgeScraper)."""
+    """A plain headless Chromium session: SSRF-guarded BridgeScraper with no anti-detection."""
     from src.scrapers.base_scraper import BridgeScraper
 
-    return BridgeScraper()
+    # Owner decision 2026-09-15: NO anti-detection toward ATIP. A plain Chromium session:
+    # no stealth init script, no webdriver patching, no UA or fingerprint override, no
+    # captcha solving. If the portal's reCAPTCHA refuses such a session, the lookup
+    # stops as a source block (verification_rejected -> cooldown) and names nobody.
+    return BridgeScraper(plain_browser=True)
 
 
 def _account_is_for(url: str, parcel: str) -> bool:

@@ -49,6 +49,7 @@ _BATCH_PARCELS = 20
 # Rows past the cap stay eligible for the next tick.
 _MAX_ROWS = 400
 _TICK_BUDGET_S = 300.0
+_WRITE_GRACE_S = 120.0
 
 _LOCK_KEY = "bl:pierce_cv_owner_recovery:lock"
 _LOCK_TTL_S = 900
@@ -221,6 +222,12 @@ def _tick(stats: dict, lock: tuple) -> dict:
                     stats["skipped"] = "tick lock lost before writing"
                     _logger.warning("Pierce CV owner recovery: %s", stats["skipped"])
                     return stats
+                # Absolute bound on the write phase, well inside the task's 540 s soft
+                # limit; rows not written stay eligible for the next tick (Codex r6).
+                if time.monotonic() > deadline + _WRITE_GRACE_S:
+                    stats["skipped"] = "tick deadline reached while writing"
+                    _logger.warning("Pierce CV owner recovery: %s", stats["skipped"])
+                    return stats
                 if f is not None:
                     d = decide(pid, f, row.property_address, source=row.ed.get("source"))
                     payload = owner_payload(pid, d, checked_at)
@@ -264,6 +271,8 @@ def _write(db, row, payload: dict, owner: str | None, label: str) -> str:
         db.commit()
     except Exception as exc:  # noqa: BLE001
         db.rollback()
+        if type(exc).__name__ in ("SoftTimeLimitExceeded", "TimeLimitExceeded"):
+            raise  # the task is being killed: never counted as a row error
         _logger.warning("Pierce CV owner recovery: write failed for row %s (%s): %s",
                         str(row.id)[:8], label, type(exc).__name__)
         return "errors"

@@ -345,7 +345,8 @@ def test_lookup_is_paced_and_audited_without_names(monkeypatch, paces, clean_hea
                                  pace_s=0.1, stats=stats)
     assert portal.requests == ["2021110133", "2006120010", "9999999999"]   # invalid/dupes dropped
     assert portal.sessions == 1
-    assert paces == [pao.MIN_PACE_S, pao.MIN_PACE_S]                       # never below 2 s
+    # Never below 2 s, and before the FIRST page too, so back-to-back passes are spaced.
+    assert paces == [pao.MIN_PACE_S, pao.MIN_PACE_S, pao.MIN_PACE_S]
     assert got["2021110133"].kind == "found" and got["9999999999"].kind == "not_found"
     assert stats["outcome"] == "complete"
     log = caplog.text
@@ -552,6 +553,25 @@ def test_the_tacoma_proof_itself_requires_a_party_name():
     assert code_violation_owner_is_known(_cv_row(party_name="602 LLC", enrichment_data=_proven()))
     for blank in (None, "", "   "):
         assert not code_violation_owner_is_known(_cv_row(party_name=blank, enrichment_data=_proven()))
+    # pierce_atip proof on a SEATTLE code violation is not proof (the clearance is Tacoma).
+    assert not code_violation_owner_is_known(_cv_row(
+        party_name="602 LLC", enrichment_data=_proven(source="seattle_sdci_code_violations")))
+
+
+def test_a_task_time_limit_during_a_sweep_write_is_not_swallowed():
+    from billiard.exceptions import SoftTimeLimitExceeded
+
+    class _KilledSession:
+        def execute(self, *a, **kw):
+            raise SoftTimeLimitExceeded()
+
+        def rollback(self):
+            return None
+
+    row = SimpleNamespace(id="r", user_id="u", job_id="j", parcel_id="2021110133",
+                          property_address="2117 AVE S")
+    with pytest.raises(SoftTimeLimitExceeded):
+        rec._write(_KilledSession(), row, {}, None, "matched")
 
 
 # ── Skip trace: a Tacoma owner is paid for only with its own proof ─────────────

@@ -856,7 +856,8 @@ def code_violation_owner_is_known(result) -> bool:
     parcel = normalize_parcel(getattr(result, "parcel_id", None))
     # The blank-party check above already covers this branch; restated so the Tacoma
     # proof reads complete on its own and survives a reordering (Codex r1).
-    return (bool((getattr(result, "party_name", None) or "").strip())
+    return (ed.get("source") == "tacoma_code_violations"
+            and bool((getattr(result, "party_name", None) or "").strip())
             and ed.get("owner_source") == PIERCE_OWNER_SOURCE
             and ed.get("owner_status") == MATCHED
             and parcel is not None and ed.get("owner_pin") == parcel)

@@ -409,16 +409,18 @@ async def _lookup(parcels: list[str], *, pace_s: float, deadline: float | None,
         return kind, rows, account
 
     try:
-        for i, pid in enumerate(parcels):
-            if not _affordable(new_session=session is None, pace=bool(i)):
+        for pid in parcels:
+            if not _affordable(new_session=session is None, pace=True):
                 stats["outcome"] = "budget_exhausted"
                 return
             if session is None:
                 session = await _start(pid)
                 if session is None:
                     return
-            if i:
-                await asyncio.sleep(pace_s)
+            # Before EVERY page view, the first included: passes are serialized by the
+            # lease, so a pause at the start of a pass also spaces it from the previous
+            # pass's last request (repair chunks, back-to-back jobs) (Codex r6 P2).
+            await asyncio.sleep(pace_s)
             try:
                 kind, rows, account = await _one(pid)
             except _LeaseLostError:
@@ -485,6 +487,8 @@ async def _close(session) -> None:
     try:
         await asyncio.wait_for(session.__aexit__(None, None, None), timeout=_SESSION_CLOSE_S)
     except Exception as exc:  # noqa: BLE001
+        if type(exc).__name__ in _TIME_LIMITS:
+            raise  # the task is being killed: never swallowed as a close failure
         _logger.warning("pierce_atip_owner session close failed: %s", type(exc).__name__)
 
 

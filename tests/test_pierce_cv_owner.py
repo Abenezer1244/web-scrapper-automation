@@ -612,9 +612,13 @@ async def test_a_row_changed_while_the_portal_answers_is_never_named(
     # Re-classified: the job's config is no longer a code-violation config.
     "UPDATE scraper_configs SET record_type = 'probate' WHERE id = "
     "(SELECT j.scraper_config_id FROM jobs j JOIN results r ON r.job_id = j.id WHERE r.id = :i)",
-], ids=["parcel", "address", "party", "reclassified"])
+    # Re-parented: the config now belongs to another tenant.
+    "UPDATE scraper_configs SET user_id = (SELECT u.id FROM users u WHERE u.id <> "
+    "(SELECT user_id FROM results WHERE id = :i) LIMIT 1) WHERE id = "
+    "(SELECT j.scraper_config_id FROM jobs j JOIN results r ON r.job_id = j.id WHERE r.id = :i)",
+], ids=["parcel", "address", "party", "reclassified", "config_other_tenant"])
 async def test_the_write_itself_rejects_a_row_changed_after_the_decision(
-    db, business_user, redis_client, monkeypatch, paces, clean_health, change,
+    db, business_user, starter_user, redis_client, monkeypatch, paces, clean_health, change,
 ):
     """The in-memory check has passed; only the UPDATE's own guard stands in the way."""
     job_id = await _pierce_job(db, business_user, status="enriching")
@@ -720,6 +724,11 @@ async def test_repair_replaces_only_the_old_label_and_converges(
                                party="Derelict Building  - 2.01.060 (D) - 602 AVE S",
                                ed={"source": "tacoma_code_violations", "case_number": "60000301838"})
     foreign, _ = await _stored(db, business_user, job_id, party="HAND ENTERED NAME")
+    # Already decided by the live pass: gets its category, is never re-asked.
+    decided, _ = await _stored(db, business_user, job_id, party=None, parcel="2030120032",
+                               address="641 DIVISION AVE",
+                               ed={"source": "tacoma_code_violations", "case_number": "60000303996",
+                                   "owner_status": "address_mismatch"})
     live_job = await _pierce_job(db, business_user, status="enriching")
     live, _ = await _stored(db, business_user, live_job, party="Nuisance - 2117 AVE S")
 
@@ -744,14 +753,18 @@ async def test_repair_replaces_only_the_old_label_and_converges(
                            report=tmp_path / "ev.jsonl", source_pace_s=0)
 
     dry = await asyncio.to_thread(_run, False)
-    assert dry["candidates"] == 3 and "writes" not in dry and portal.requests == []
+    assert dry["candidates"] == 4 and "writes" not in dry and portal.requests == []
     assert "casenumber IN (" in layer_calls[0]
     stats = await asyncio.to_thread(_run, True)
-    assert stats["writes"] == {"written": 3, "skipped_by_write_guard": 0}
+    assert stats["writes"] == {"written": 4, "skipped_by_write_guard": 0}
+    assert "2030120032" not in portal.requests
     assert stats["named"] == 1 and stats["label_cleared_no_owner"] == 1
     assert stats["party_name_not_the_label_left_alone"] == 1
 
-    got = await _fetch_rows(db, [label, cleared, foreign, live])
+    got = await _fetch_rows(db, [label, cleared, foreign, live, decided])
+    assert got[decided].enrichment_data["violation_category"] == "Nuisance"
+    assert got[decided].enrichment_data["owner_status"] == "address_mismatch"
+    assert got[decided].party_name is None
     assert got[label].party_name == "TACOMA TOWN CENTER PARCELS LLC"
     assert got[label].enrichment_data["violation_category"] == "Nuisance"
     assert (got[label].parcel_id, got[label].dedup_hash) == ("2021110133", dedup)
@@ -766,7 +779,8 @@ async def test_repair_replaces_only_the_old_label_and_converges(
 
 
 @pytest.mark.asyncio
-async def test_repair_write_guard_skips_a_row_whose_party_parcel_or_case_moved(db, business_user):
+async def test_repair_write_guard_skips_a_row_whose_party_parcel_or_case_moved(db, business_user,
+                                                                               starter_user):
     job_id = await _pierce_job(db, business_user)
     rid, _ = await _stored(db, business_user, job_id, party="Nuisance - 2117 AVE S")
     label = "Nuisance - 2117 AVE S"
@@ -803,6 +817,19 @@ async def test_repair_write_guard_skips_a_row_whose_party_parcel_or_case_moved(d
     await asyncio.to_thread(_reclassify, "probate")
     assert await asyncio.to_thread(_write) == 0
     await asyncio.to_thread(_reclassify, "code_violation")
+
+    def _config_owner(user_id):
+        from src.db.session import system_sync_session
+
+        with system_sync_session() as sdb:
+            sdb.execute(text("UPDATE scraper_configs SET user_id = :u WHERE id = "
+                             "(SELECT scraper_config_id FROM jobs WHERE id = :j)"),
+                        {"u": user_id, "j": job_id})
+            sdb.commit()
+
+    await asyncio.to_thread(_config_owner, starter_user.id)   # config re-parented to another tenant
+    assert await asyncio.to_thread(_write) == 0
+    await asyncio.to_thread(_config_owner, business_user.id)
     assert await asyncio.to_thread(_write) == 1
 
 

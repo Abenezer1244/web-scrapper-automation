@@ -545,7 +545,7 @@ OWNER_ROW_GUARD = """
       r.id = :rid AND r.user_id = :uid AND r.job_id = :jid
   AND EXISTS (
     SELECT 1 FROM jobs gj JOIN scraper_configs gsc ON gsc.id = gj.scraper_config_id
-    WHERE gj.id = r.job_id AND gj.user_id = r.user_id
+    WHERE gj.id = r.job_id AND gj.user_id = r.user_id AND gsc.user_id = r.user_id
       AND lower(gsc.county) = 'pierce' AND upper(gsc.state) = 'WA'
       AND gsc.record_type = 'code_violation')
   AND btrim(r.parcel_id) = :pid

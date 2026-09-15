@@ -60,7 +60,7 @@ _CANDIDATES_SQL = """
     JOIN scraper_configs sc ON sc.id = j.scraper_config_id
     WHERE lower(sc.county) = 'pierce' AND upper(sc.state) = 'WA'
       AND sc.record_type = 'code_violation'
-      AND j.status = 'done'
+      AND j.status = 'done' AND j.user_id = r.user_id AND sc.user_id = r.user_id
       AND jsonb_typeof(r.enrichment_data::jsonb) = 'object'
       AND r.enrichment_data::jsonb->>'source' = :source
       AND NOT (r.enrichment_data::jsonb ? 'owner_source')
@@ -87,7 +87,8 @@ _UPDATE_SQL = """
            OR NOT (enrichment_data::jsonb ? 'owner_status'))
       AND EXISTS (
         SELECT 1 FROM jobs j JOIN scraper_configs sc ON sc.id = j.scraper_config_id
-        WHERE j.id = results.job_id AND j.user_id = results.user_id AND j.status = 'done'
+        WHERE j.id = results.job_id AND j.user_id = results.user_id
+          AND sc.user_id = results.user_id AND j.status = 'done'
           AND lower(sc.county) = 'pierce' AND upper(sc.state) = 'WA'
           AND sc.record_type = 'code_violation')
 """
@@ -173,11 +174,14 @@ def run(db, *, apply_writes: bool, owners: bool, retry_owners: bool = False,
         is_label = not unnamed and r.party_name == old_scraper_label(raw)
         if not is_label and not unnamed:
             counts["party_name_not_the_label_left_alone"] += 1
-        plans.append({"row": r, "is_label": is_label, "unnamed": unnamed,
+        # A row the live pass or sweep already decided (owner_status present) still gets
+        # its category, but is never re-asked: the write guard would refuse its answer.
+        wants_owner = (is_label or unnamed) and "owner_status" not in r.ed
+        plans.append({"row": r, "is_label": is_label, "wants_owner": wants_owner,
                       "parcel": normalize_parcel(r.parcel_id),
                       "payload": {"violation_category": (raw.get("casetype") or "").strip() or None}})
 
-    parcels = sorted({p["parcel"] for p in plans if p["parcel"] and (p["is_label"] or p["unnamed"])})
+    parcels = sorted({p["parcel"] for p in plans if p["parcel"] and p["wants_owner"]})
     counts["parcels_for_owner"] = len(parcels)
     fetched: dict = {}
     lookup_stats: dict = {}
@@ -193,7 +197,7 @@ def run(db, *, apply_writes: bool, owners: bool, retry_owners: bool = False,
             new_party = r.party_name
             f = fetched.get(p["parcel"]) if p["parcel"] else None
             writes_owner_status = False
-            if f is not None and (p["is_label"] or p["unnamed"]):
+            if f is not None and p["wants_owner"]:
                 d = decide(p["parcel"], f.rows, r.property_address, source=r.ed.get("source"))
                 payload.update(owner_payload(p["parcel"], d, now))
                 writes_owner_status = True

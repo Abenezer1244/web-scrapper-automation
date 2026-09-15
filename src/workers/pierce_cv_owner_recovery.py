@@ -65,7 +65,7 @@ _ELIGIBLE_ROW = """
 """
 
 _JOB_SCOPE = """
-      j.status = 'done'
+      j.status = 'done' AND j.user_id = r.user_id AND sc.user_id = r.user_id
   AND lower(sc.county) = 'pierce' AND upper(sc.state) = 'WA'
   AND sc.record_type = 'code_violation'
 """

@@ -22,6 +22,7 @@ Two layers, matching the existing tax-cap tests:
 Real DB + real predicates — no mocks.
 """
 import inspect
+import re
 import uuid
 from datetime import UTC, datetime
 
@@ -282,7 +283,16 @@ def test_segment_format_placeholders_survived_fstring():
     # And .format() still produces a bound, cap-carrying query.
     formatted = segments._INTERSECTION_SQL.format(county_clause="")
     assert f":{TAX_CAP_BIND}" in formatted
-    assert "{" not in formatted  # no stray unfilled placeholders
+    # No stray unfilled placeholders. Checked as {identifier} tokens rather than any
+    # brace: the auction-date stand-in fragment carries regex quantifiers ({1,2},
+    # {4}) that .format() correctly renders from their doubled braces.
+    for template, fields in (
+        (segments._INTERSECTION_SQL, {"county_clause": ""}),
+        (segments._UNION_SQL, {"county_clause": ""}),
+        (segments._INTERSECTION_DATED_SQL, {"county_clause": ""}),
+        (segments._EXCLUDED_NO_DATE_SQL, {"county_clause": "", "pk_clause": ""}),
+    ):
+        assert re.search(r"\{[A-Za-z_]\w*\}", template.format(**fields)) is None
 
 
 # ─── Source guards (no DB): every execute() site binds the cap param ─────────────

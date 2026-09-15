@@ -597,3 +597,20 @@ auction date in `date_recorded` (semantic, owner decision); scraper records page
       parser to a literal SQL string: literal_binds DOUBLED the regex backslashes (would match nothing); caught before tests.
 - [x] Parser refactor: shared exception-free `_valid_date` for numeric and month-name dates; 17 PostgreSQL-evaluated
       totality cases incl. prod junk (instrument numbers, UI text). 3 of 4 endpoint tests red on the old query.
+
+## Notice Date: an auction-date stand-in is never shown as a Date (2026-09-15, branch `feat/notice-date`)
+Owner decision: on auction leads (trustee_sale) and Snohomish pre_foreclosure, Date shows the real notice date, else
+blank; header "Notice Date" on trustee_sale jobs. Stored `date_recorded` unchanged (dedup_hash / source_fingerprint).
+- [x] Census (prod, read-only): 118 stand-ins; no other date exists on these rows; recorder prefc never affected
+- [x] Codex plan consult: FAIL (results.auction_date is moved by the NTS matcher on postponement) -> compare with the
+      scraper-recorded origin date instead -> PASS
+- [x] Phase 1 BE: `src/utils/source_dates.py` rule; SQL twin in results_sort (stand-ins sort undated);
+      ResultRow.date_is_auction_date; exports blank it (per-job, R2, batch combined, CRM, overlap filed_date)
+- [x] Phase 2 BE: BatchLeadRow + SegmentLeadRow flags; Lists filing windows never match a stand-in and count it as
+      no-date; Lists CSV blanks/sorts it undated; exporter honors a precomputed flag
+- [x] Freshness: a stand-in has no freshness_days (its future date clamped to 0 = "freshest")
+- [x] Perf: strpos(enrichment_data::text,'auction_date') pre-check (json re-parses per ->): prod 92k rows 13.4 s -> 148 ms
+- [x] Codex diff review: FAIL (rule not provenance-scoped; flag set after signals) -> fixed -> PASS; P2 (Lists windows
+      ignore month-name notice dates) not adopted: pre-existing, 0 such prod rows, would lose the filing-date index
+- [x] Full backend suite green (3,783) + guard test made precise ({identifier} tokens, all 4 Lists templates)
+- [ ] PR + CI + merge + deploy; then FE (ResultsTable, LeadCards, BatchLeadsTable, Lists, "Notice Date" header)

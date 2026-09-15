@@ -18,6 +18,8 @@ from datetime import UTC, date, datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from src.utils.source_dates import is_auction_date_fallback
+
 # WA RCW 84.64: a parcel becomes tax-foreclosure eligible once a tax year is a
 # full 3 years delinquent. Used by wa_foreclosure_eligible().
 _WA_TAX_FORECLOSURE_YEARS = 3
@@ -208,10 +210,16 @@ def derive_signals(
     if auction_today is None:
         auction_today = today
     bill_year = _get(record, "delinquent_bill_year")
+    # An auction date a scraper stood in for a missing notice date is not a filing
+    # date, so it has no freshness. Left in, its future date clamps to 0 days and the
+    # lead exports as the freshest one in the file.
+    stand_in = _get(record, "date_is_auction_date") is True or is_auction_date_fallback(
+        _get(record, "date_recorded"), _get(record, "enrichment_data")
+    )
     return {
         "months_delinquent": months_delinquent(bill_year, today),
         "wa_foreclosure_eligible": wa_foreclosure_eligible(bill_year, today),
-        "freshness_days": freshness_days(
+        "freshness_days": None if stand_in else freshness_days(
             _get(record, "date_recorded_parsed"), _get(record, "date_recorded"), today
         ),
         "contactability_score": contactability_score(

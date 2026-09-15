@@ -391,6 +391,11 @@
       "BatchLeadRow": {
         "description": "One combined-view lead — mirrors the combined CSV's columns.",
         "properties": {
+          "date_is_auction_date": {
+            "default": false,
+            "title": "Date Is Auction Date",
+            "type": "boolean"
+          },
           "date_recorded": {
             "anyOf": [
               {
@@ -2487,6 +2492,11 @@
             "title": "Created At",
             "type": "string"
           },
+          "date_is_auction_date": {
+            "default": false,
+            "title": "Date Is Auction Date",
+            "type": "boolean"
+          },
           "date_recorded": {
             "anyOf": [
               {
@@ -3555,6 +3565,11 @@
               }
             ],
             "title": "County"
+          },
+          "date_is_auction_date": {
+            "default": false,
+            "title": "Date Is Auction Date",
+            "type": "boolean"
           },
           "date_recorded": {
             "anyOf": [

@@ -19,6 +19,38 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-15 - Notice Date: auction-date stand-ins are never shown, exported or sorted as a Date
+
+**Built / Shipped (branch `feat/notice-date`):** owner decision that auction leads show a real notice date or blank.
+`src/utils/source_dates.py` (Python rule), its SQL twin in `src/api/results_sort.py` (ORM + rendered raw SQL for
+Lists), `date_is_auction_date` on ResultRow / BatchLeadRow / SegmentLeadRow, blank emitted date in every CSV built by
+`build_lead_export_row` (incl. CRM layout and overlap `filed_date`), Lists filing windows exclude stand-ins, and no
+freshness for a stand-in. Stored `date_recorded` untouched.
+
+**Tried / Decided:** comparing `date_recorded` with `results.auction_date` was rejected (Codex P1, verified): the NTS
+matcher rewrites that column on a postponement, which would re-expose an old stand-in as a notice date. The scraper's
+own recorded auction date is used instead, scoped by provenance (an `nts_source` object for trustee_sale; `source ==
+snohomish_tribune` for Snohomish prefc), after Codex showed key-name matching could hide a real date on a Snohomish
+trustee sale carrying both. A persisted flag + backfill was unnecessary once provenance was immutable. CSV column names
+unchanged (dialer integrations). Lists windows keep the indexed `date_recorded_parsed` (month-name real notice dates:
+0 in prod).
+
+**Failed / Blocked:** the first raw-SQL rendering for Lists was 18 KB and re-parsed json dozens of times per row:
+13.4 s over 92k rows; a strpos pre-check brought it to 148 ms with the same 83 stand-ins. Wall-clock prod timings were
+unusable during load (old query swung 1-11 s); server-side EXPLAIN minimums were needed. A red-check against
+`origin/main` files failed on an unrelated import after main moved; red-checks must use the branch base.
+
+**Caught & fixed:** stand-ins exported as freshness 0 (the freshest lead). A Lists guard test asserted "no `{`" in
+formatted SQL; regex quantifiers made it fail, so it now checks unfilled `{identifier}` tokens on all four templates.
+
+**Pending / Handoff:** frontend (N/A on the flag in Results, mobile cards, batch leads, Lists; "Notice Date" header on
+trustee_sale jobs).
+
+**Facts learned:** `enrichment_data` is `json`, not `jsonb`: every `->` re-parses the document. Rendering SQLAlchemy
+expressions into `text()` needs backslash-free, colon-free patterns and doubled braces for `str.format` templates.
+
+---
+
 ## 2026-09-15 - CRM/dialer-ready CSV layout (versioned), and the name split that was backwards for whole sources
 
 **Built / Shipped:** draft PR #315 (`feat/crm-ready-csv-columns`, not merged). `crm_v1` layout (First Name,

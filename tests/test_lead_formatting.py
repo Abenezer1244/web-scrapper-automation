@@ -1,8 +1,15 @@
 """Tests for dialer-CSV display formatting (src/utils/lead_formatting.py)."""
+import pytest
+
 from src.utils.lead_formatting import (
+    _COOWNER_JOIN_RE,
+    NAME_ORDER_COMMA_ONLY,
+    NAME_ORDER_NATURAL,
+    NAME_ORDER_RECORDER,
     classify_probate_title_status,
     normalize_phone_for_dialer,
     parse_property_for_display,
+    split_first_person,
     split_owner_for_display,
 )
 
@@ -268,3 +275,211 @@ class TestParsePropertyForDisplay:
         out = parse_property_for_display("123 MAIN ST SEATTLE WA 98101")
         assert out["street"] == "123 MAIN ST SEATTLE" and out["city"] is None
         assert out["state"] == "WA" and out["zip"] == "98101"
+
+
+class TestSplitFirstPerson:
+    """Source-aware First/Last for the export. Cases are real prod party_name shapes
+    (read-only sample 2026-09-14) plus the owner-supplied edge cases."""
+
+    @pytest.mark.parametrize("name, expected", [
+        ("SMITH JOHN", ("JOHN", "SMITH")),
+        ("SMITH JOHN J", ("JOHN", "SMITH")),                       # middle initial
+        ("HALL MARVIN WAYNE", ("MARVIN", "HALL")),                  # middle name
+        ("WEBB JR HAROLD", ("HAROLD", "WEBB")),                     # suffix is not a first name
+        ("LAMB GILBERT C III", ("GILBERT", "LAMB")),
+        ("JOHNSON WILLIAM EST OF", ("WILLIAM", "JOHNSON")),         # Pierce probate tail
+        ("HAVEN-JOHNSON ANDREA", ("ANDREA", "HAVEN-JOHNSON")),
+        ("DE LA CRUZ MARIA", ("MARIA", "DE LA CRUZ")),
+        ("CARPENTER, JOHN R", ("JOHN", "CARPENTER")),               # comma form
+        # Multiple owners: the FIRST-listed person, whatever the joiner.
+        ("PALMER DAVID M / PALMER CAROLYN M", ("DAVID", "PALMER")),
+        ("GOSS WESLEY+MARIE", ("WESLEY", "GOSS")),                  # King assessor '+'
+        ("CISSNA RICHARD C/KATHRYN A", ("RICHARD", "CISSNA")),      # Snohomish bare '/'
+        ("BERG JACQUELINE M & SCATES DARYN T", ("JACQUELINE", "BERG")),
+        ("BOYLE DAVID E / QUALITY LOAN SERVICE CORP", ("DAVID", "BOYLE")),
+        ("QUALITY LOAN SERVICE CORP / BOYLE DAVID E", ("DAVID", "BOYLE")),  # entity skipped
+        # Prod old-vs-new diff (2026-09-14, 163,261 rows) regressions, pinned:
+        ("MERCER JOANNE HEIRS OF", ("JOANNE", "MERCER")),           # trailing decedent marker
+        ("NEWBURY CLARECE HEIRS OF(+)", ("CLARECE", "NEWBURY")),    # Pierce '(+)' marker
+        ("KHURANA H S", (None, "KHURANA")),                         # initials only: surname kept
+        ("ESTATE OF SMITH, JOHN", ("JOHN", "SMITH")),  # recorder estate: comma form only
+        ("SHANNON JR ROBERT L", ("ROBERT", "SHANNON")),
+        ("RATSHIN ANDREW+FIELD,HILARY", ("ANDREW", "RATSHIN")),
+        ("LE KHANG & NGUYEN ANH", ("KHANG", "LE")),
+    ])
+    def test_recorder_order(self, name, expected):
+        assert split_first_person(name, NAME_ORDER_RECORDER) == expected
+
+    @pytest.mark.parametrize("name, expected", [
+        ("SHIRLEY A JOHNSON", ("SHIRLEY", "JOHNSON")),   # was first='A', last='SHIRLEY'
+        ("JOHN J SMITH", ("JOHN", "SMITH")),
+        ("MICHAEL P. BYRD", ("MICHAEL", "BYRD")),
+        ("JOHN SMITH JR", ("JOHN", "SMITH")),
+        ("MARY VAN DYKE", ("MARY", "VAN DYKE")),
+        ("Julie Anderson", ("Julie", "Anderson")),        # case preserved, never invented
+        ("MARCUS ALLEYNE AND KAELYN ALLEYNE", ("MARCUS", "ALLEYNE")),
+        ("THOMAS D. ROLFZEN, A SINGLE INDIVIDUAL", ("THOMAS", "ROLFZEN")),
+        ("TYLER D WARE, AN UNMARRIED INDIVIDUAL AND CHRISTINA N ZAWAIDEH, AN UNMARRIED "
+         "INDIVIDUAL", ("TYLER", "WARE")),
+        ("Robert B Snider, as a separate estate", ("Robert", "Snider")),
+        ("ESTATE OF JOHN SMITH", ("JOHN", "SMITH")),
+    ])
+    def test_natural_order(self, name, expected):
+        assert split_first_person(name, NAME_ORDER_NATURAL) == expected
+
+    @pytest.mark.parametrize("name, order", [
+        # Shared surname: 'JOHN' alone is not a full name -> never 'AND'/'JOHN'.
+        ("JOHN AND JANE SMITH", NAME_ORDER_NATURAL),
+        ("JOHN AND JANE SMITH, HUSBAND AND WIFE", NAME_ORDER_NATURAL),
+        ("JOHN SMITH AS TRUSTEE", NAME_ORDER_NATURAL),
+        ("SMITH JOHN AS TRUSTEE", NAME_ORDER_RECORDER),
+        ("UNKNOWN HEIRS OF SMITH JOHN", NAME_ORDER_RECORDER),
+        ("SMITH JOHN ET AL", NAME_ORDER_RECORDER),
+        ("ABC HOLDINGS LLC", NAME_ORDER_RECORDER),
+        ("ABC HOLDINGS LLC", NAME_ORDER_NATURAL),
+        ("JOHN SMITH REVOCABLE TRUST", NAME_ORDER_NATURAL),
+        ("Next Level 3 REI, LLC, a Washington limited liability company", NAME_ORDER_NATURAL),
+        # Natural-order comma is a list separator as often as 'LAST, FIRST'.
+        ("INGABIRE UQIMANA, JUDITH UMUTONI AND UWIDUHAYE NYIRAMUGISHA", NAME_ORDER_NATURAL),
+        ("Lee, Sang Ki and Lee, Hye Kyung", NAME_ORDER_NATURAL),
+        ("Nuisance - 3711 S D ST", NAME_ORDER_RECORDER),   # Pierce CV case label
+        # An entity inside ONE owner cell must not be cut into a fake person (prod).
+        ("WSDOT R/E SERVICES", NAME_ORDER_RECORDER),
+        ("HEARTWOOD SPE LLC C/O COMMU", NAME_ORDER_RECORDER),
+        ("GLACIER HOA C/O MAGUIRE C", NAME_ORDER_RECORDER),
+        ("NU DES & ENGG ROXHILL HOMES", NAME_ORDER_RECORDER),
+        ("YESLER TOWERS LLC/CHAN J", NAME_ORDER_RECORDER),
+        ("DEPT OF NATURAL RESOURCES", NAME_ORDER_RECORDER),
+        ("PETRAKOPOULOS/ALEX AND SHANNON", NAME_ORDER_RECORDER),
+        ("LUKINS & ANNIS", NAME_ORDER_RECORDER),
+        # Codex review (Phase 1): care-of line, vesting words without their comma.
+        ("FOUR M ALLIANCE CORPORATION", NAME_ORDER_RECORDER),
+        ("BENSON JR FOOTBALL ASSOC", NAME_ORDER_RECORDER),
+        ("MINADOKA L L C", NAME_ORDER_RECORDER),
+        ("SAN MARCO L.L.P.", NAME_ORDER_RECORDER),
+        # Recorder source writes both orders after 'ESTATE OF' (prod), so blank.
+        ("ESTATE OF KLUG DORIS ANN/FRASER DONALD R", NAME_ORDER_RECORDER),
+        ("ESTATE OF RICHARD TODD", NAME_ORDER_RECORDER),
+        ("LE MAI H", NAME_ORDER_RECORDER),                  # Vietnamese LE, not a particle
+        # Recorder 'LAST F MIDDLE' vs leaked natural 'FIRST M LAST': same shape, blank.
+        ("STEPHEN P MYERS / ROBBINS GEORGIA A", NAME_ORDER_RECORDER),
+        ("LAVENDER A LORENE", NAME_ORDER_RECORDER),
+        ("JOHN SMITH HUSBAND AND WIFE", NAME_ORDER_NATURAL),
+        ("SMITH JOHN AND JANE MARRIED", NAME_ORDER_RECORDER),
+        ("MADONNA", NAME_ORDER_RECORDER),                   # lone token
+        ("DAVID A BARTHOLOMEW", NAME_ORDER_COMMA_ONLY),     # mixed source, no comma
+        ("SMITH JOHN", None),                               # unknown source order
+        ("", NAME_ORDER_RECORDER),
+        (None, NAME_ORDER_RECORDER),
+    ])
+    def test_ambiguous_or_non_person_yields_blank(self, name, order):
+        assert split_first_person(name, order) == (None, None)
+
+    def test_care_of_is_not_a_co_owner(self):
+        assert split_first_person("JOHN SMITH C/O JANE DOE", NAME_ORDER_NATURAL) == ("JOHN", "SMITH")
+        assert split_first_person("SMITH JOHN CARE OF DOE JANE", NAME_ORDER_RECORDER) == (
+            "JOHN", "SMITH")
+
+    @pytest.mark.parametrize("name, order, expected", [
+        ("A JOHNSON", NAME_ORDER_NATURAL, (None, "JOHNSON")),
+        ("CHAN J", NAME_ORDER_RECORDER, (None, "CHAN")),
+        ("SMITH, A", NAME_ORDER_RECORDER, (None, "SMITH")),  # not a vesting clause (Codex)
+        ("JOHNSON, A B", NAME_ORDER_RECORDER, (None, None)),  # ', A ...' reads as vesting: blank
+    ])
+    def test_bare_initial_is_not_a_first_name(self, name, order, expected):
+        assert split_first_person(name, order) == expected
+
+    def test_unspaced_ampersand_splits_co_owners(self):
+        assert split_first_person("JOHN SMITH&JANE DOE", NAME_ORDER_NATURAL) == ("JOHN", "SMITH")
+
+    @pytest.mark.parametrize("text, parts", [
+        ("AT&T", ["AT&T"]),
+        ("B&B", ["B&B"]),
+        ("SMITH&JANE", ["SMITH", "JANE"]),
+        ("SMITH & JONES", ["SMITH", "JONES"]),
+    ])
+    def test_ampersand_joiner_skips_short_brand_names(self, text, parts):
+        assert _COOWNER_JOIN_RE.split(text) == parts
+
+    def test_comma_only_source_reads_comma_and_estate_forms(self):
+        assert split_first_person(
+            "CHASE, JUSTIN / ESTATE OF DAYLA JO CHASE", NAME_ORDER_COMMA_ONLY
+        ) == ("JUSTIN", "CHASE")
+        assert split_first_person(
+            "ESTATE OF GLENNA K JONES / JONES, GLENNA K", NAME_ORDER_COMMA_ONLY
+        ) == ("GLENNA", "JONES")
+
+
+class TestParseAddressNonUsAndPlaceholders:
+    def test_canadian_multiline_not_forced_into_us_schema(self):
+        addr = "716-42 WESTERN BATTERY RD\nTORONTO ON\nM6K3P1\nCANADA"
+        assert parse_property_for_display(addr) == {
+            "street": addr, "city": None, "state": None, "zip": None,
+        }
+
+    def test_canadian_comma_country_never_becomes_city(self):
+        out = parse_property_for_display("716-42 WESTERN BATTERY RD, TORONTO ON M6K3P1, CANADA")
+        assert out["city"] is None and out["state"] is None and out["zip"] is None
+        assert out["street"] == "716-42 WESTERN BATTERY RD, TORONTO ON M6K3P1, CANADA"
+
+    def test_canadian_postal_code_without_country_name(self):
+        out = parse_property_for_display("100 KING ST W, TORONTO, ON M5X 1A9")
+        assert out["city"] is None and out["zip"] is None and out["state"] is None
+
+    def test_uk_country_tail(self):
+        out = parse_property_for_display("10 DOWNING ST, LONDON, UNITED KINGDOM")
+        assert out["city"] is None and out["state"] is None
+
+    def test_trailing_usa_is_dropped_and_us_tail_parses(self):
+        assert parse_property_for_display("123 MAIN ST, SEATTLE, WA 98101, USA") == {
+            "street": "123 MAIN ST", "city": "SEATTLE", "state": "WA", "zip": "98101",
+        }
+
+    def test_placeholder_only_address_yields_nothing(self):
+        assert parse_property_for_display("UNKNOWN UNKNOWN, UNKNOWN WA") == {
+            "street": None, "city": None, "state": None, "zip": None,
+        }
+
+    def test_lowercase_placeholder_only_address_yields_nothing(self):
+        assert parse_property_for_display("unknown, wa")["street"] is None
+
+    def test_us_unit_shaped_like_canadian_postal_code_still_splits(self):
+        assert parse_property_for_display("10 PINE ST UNIT A1B 2C3, SEATTLE, WA 98101") == {
+            "street": "10 PINE ST UNIT A1B 2C3", "city": "SEATTLE", "state": "WA", "zip": "98101",
+        }
+
+    def test_single_chunk_ending_in_country_word_is_not_foreign(self):
+        out = parse_property_for_display("123 CANADA")
+        assert out["street"] == "123 CANADA"
+
+    def test_province_and_country_in_one_part(self):
+        out = parse_property_for_display("123 Main St, Toronto ON CANADA")
+        assert out["city"] is None and out["state"] is None
+
+    def test_placeholder_city_not_emitted(self):
+        out = parse_property_for_display("123 MAIN ST, UNKNOWN, WA 98101")
+        assert out["city"] is None and out["state"] == "WA" and out["zip"] == "98101"
+
+    def test_military_apo(self):
+        assert parse_property_for_display("PSC 123 BOX 4, APO, AE 09012") == {
+            "street": "PSC 123 BOX 4", "city": "APO", "state": "AE", "zip": "09012",
+        }
+
+    @pytest.mark.parametrize("addr, expected", [
+        ("126 SW 148TH ST #C100-1, BURIEN, WA 98166",
+         {"street": "126 SW 148TH ST #C100-1", "city": "BURIEN", "state": "WA", "zip": "98166"}),
+        ("123 MAIN ST APT 4, SEATTLE, WA 98101-1234",
+         {"street": "123 MAIN ST APT 4", "city": "SEATTLE", "state": "WA", "zip": "98101-1234"}),
+        ("3213 W. WHEELER ST PMB 131, SEATTLE, WA 98199",
+         {"street": "3213 W. WHEELER ST PMB 131", "city": "SEATTLE", "state": "WA", "zip": "98199"}),
+        ("PO BOX 500, BELLEVUE, WA 98004",
+         {"street": "PO BOX 500", "city": "BELLEVUE", "state": "WA", "zip": "98004"}),
+        ("1 ELM ST, HOLTSVILLE, NY 00501",
+         {"street": "1 ELM ST", "city": "HOLTSVILLE", "state": "NY", "zip": "00501"}),
+        ("4002 22ND ST SE, PUYALLUP, WA, 98374-4108",
+         {"street": "4002 22ND ST SE", "city": "PUYALLUP", "state": "WA", "zip": "98374-4108"}),
+        ("716-42 WESTERN BATTERY RD, SPOKANE, WA 99201",
+         {"street": "716-42 WESTERN BATTERY RD", "city": "SPOKANE", "state": "WA", "zip": "99201"}),
+    ])
+    def test_us_units_boxes_hyphens_zip4_leading_zero(self, addr, expected):
+        assert parse_property_for_display(addr) == expected

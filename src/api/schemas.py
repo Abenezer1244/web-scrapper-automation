@@ -1263,8 +1263,9 @@ class ResultRow(BaseModel):
     days_to_auction: int | None = None
     # The county parcel this lead was located on by map point when the source gave no
     # parcel number (King/Seattle code violations): shown as the Parcel ID, but it is
-    # NOT parcel_id, which stays the billing/dedup identity. Only an exact street + ZIP
-    # match is exposed (src/utils/located_parcel.py). None whenever parcel_id is set.
+    # NOT parcel_id, which stays the billing/dedup identity. Exact (street + ZIP) and
+    # street-only matches are exposed, condo complexes never (src/utils/located_parcel.py).
+    # None whenever parcel_id is set.
     located_parcel_id: str | None = None
     # How the located parcel matched: "exact" (street + ZIP) or "street_only" (the
     # source gave no ZIP). None whenever located_parcel_id is None.

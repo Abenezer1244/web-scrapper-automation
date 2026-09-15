@@ -37,7 +37,8 @@ def located_parcel_match(enrichment_data: Any) -> str | None:
     match = enrichment_data.get("kc_pin_match")
     if (enrichment_data.get("kc_pin_status") != "matched"
             or enrichment_data.get("kc_pin_source") != KING_GIS_POINT_SOURCE
-            or match not in _SHOWN_MATCHES):
+            # isinstance first: a malformed list/object value is unhashable (Codex P2).
+            or not isinstance(match, str) or match not in _SHOWN_MATCHES):
         return None
     return match
 

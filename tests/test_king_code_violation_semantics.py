@@ -141,6 +141,8 @@ def test_a_condominium_complex_parcel_is_never_exact(monkeypatch):
     _exact_ed(kc_pin_status="address_mismatch"),
     _exact_ed(kc_pin_source="something_else"),
     _exact_ed(pin="913810048"),
+    _exact_ed(kc_pin_match=["exact"]),  # malformed, unhashable
+    _exact_ed(kc_pin_match={"tier": "exact"}),
     None,
 ])
 def test_only_exact_or_street_level_locations_are_a_parcel_id(ed):

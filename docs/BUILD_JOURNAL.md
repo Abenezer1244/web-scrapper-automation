@@ -26,7 +26,7 @@ to understand *why* the code is the way it is and *what's been attempted before*
 - **FE #141 `942cf13`:** the King coverage label now reads "Seattle, Bellevue, Burien, and unincorporated King County". The Violation / Case # columns are shown for the three new source tags (they were gated to Seattle/Tacoma, so new rows would have been blank). Batch chips join county notes with "; ".
 - **BE #324 `7ec3107`:** one source-scoped settled list, `king_cv_sources.SETTLED_STATUSES`, drives both the plan-cap rank and the paid skip-trace gate. Accela cases marked Void, No Violation Found, Case Opened No Violation Ltr, or No Further Action Required rank last and are never traced.
 - **BE #325 `e00d844`:** a per-source ops alert when one jurisdiction fails. The adapters' retry wrappers, Bellevue's service fallback, and the progress callback no longer turn a Celery soft time limit into a "failed source".
-- **BE #326:** `cv_owner_recovery` also names Bellevue, Burien, and Accela leads, keyed on the parcel_id they printed.
+- **BE #326 `ccfb1cb`:** `cv_owner_recovery` also names Bellevue, Burien, and Accela leads, keyed on the parcel_id they printed. Api + worker SUCCESS on `ccfb1cb`.
 
 **Tried / Decided:**
 - **Settled statuses:** owner said "complete all with codex", so Codex weighed each open decision.
@@ -41,6 +41,7 @@ to understand *why* the code is the way it is and *what's been attempted before*
 **Failed / Blocked:**
 - **Blind prod check:** my pre-merge "0 active jobs" check for #319 ran as the worker's `DATABASE_URL` role. Under RLS that role sees 0 rows, so the check proved nothing. Rechecked with `DATABASE_URL_MIGRATE` in a read-only session: nothing had been running.
 - **Leaked password:** a failed connect echoed that DSN, password included, into the local session transcript. Owner decides on rotation.
+- **Railway api build (`e00d844`):** FAILED at the builder's snapshot upload, before any code ran (the worker built the same commit fine). `railway redeploy` refuses a failed build. The #326 merge rebuilt the api, and production served `7ec3107` until then.
 - **FE #141 CI:** blocked on the api-types drift gate from BE #315 until FE #140 merged (sequenced with terminal 1's session).
 - **Verification run:** the only King CV config (`74db2d63`, the owner's admin account) is frequency=manual. The owner must click Run now: starting a job requires the owner's own login, and I would not forge a token for it.
 - **Worker time limits (not built):** a worker-wide fix for Celery time limits swallowed in `run_scrape_job` is deferred. Codex listed about 14 catch-alls that absorb them, including inline enrichment, which long King jobs do reach. Re-raising them would send an over-long job back to the watchdog to re-run from the start, possibly on every retry. That needs its own design session.

@@ -903,6 +903,43 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
     # the SAME production path for an already-delivered job.
     pierce_address_recovery(db, r, job_id, config, all_results)
 
+    # Tacoma code violations name the case, never the owner, so party_name arrives
+    # empty. The parcel came from the source record itself; the owner is the Pierce
+    # taxpayer of record for it, accepted only under pierce_atip_owner's rules (echoed
+    # parcel, real property, not a reference parcel, same situs). Owner decision
+    # 2026-09-14 scopes this to code violations; no other Pierce record type is named
+    # from ATIP. Bounded here; rows not reached keep no owner_status and the
+    # background sweep (src/workers/pierce_cv_owner_recovery.py) retries them.
+    if (config.county.lower() == "pierce" and config.state.upper() == "WA"
+            and config.record_type == "code_violation" and settings.PIERCE_CV_OWNER_ENABLED):
+        from src.scrapers.enrichment.pierce_atip_owner import (
+            lookup_parcels,
+            owner_lookup_parcels,
+            plan_owner_decisions,
+            write_owner_decisions,
+        )
+
+        _pcv_map = owner_lookup_parcels(all_results)
+        if _pcv_map:
+            # _publish_log commits, so no transaction is held open across the lookups.
+            _publish_log(r, job_id, "info",
+                         f"Looking up property owners for {len(_pcv_map)} code violation "
+                         "parcels...", db=db)
+            _pcv_stats: dict = {}
+            _pcv_fetched = lookup_parcels(list(_pcv_map), source="tacoma_code_violations",
+                                          budget_s=240, stats=_pcv_stats)
+            try:
+                _pcv_plans, _ = plan_owner_decisions(_pcv_map, _pcv_fetched)
+                _pcv_counts = write_owner_decisions(db, _pcv_plans, checked_at=_now().isoformat())
+                _publish_log(r, job_id, "info",
+                             f"Found {_pcv_counts.get('matched', 0)} property owners for "
+                             "code violations.", db=db)
+            except Exception as exc:
+                db.rollback()
+                # Type only: a DB error string can carry the bound taxpayer name (Codex r11).
+                _logger.warning("Job %s: Pierce code violation owner write failed: %s",
+                                job_id, type(exc).__name__)
+
     # King code violations carry coordinates but no parcel, so the parcel-keyed passes
     # below can never give them a mailing address. Locate the parcel strictly (one
     # polygon, same normalized street and ZIP); when that fails, try King's own address

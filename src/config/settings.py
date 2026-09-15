@@ -316,6 +316,14 @@ class Settings(BaseSettings):
     # (src/workers/property_recovery.py): condo extract first, then eRealProperty under the
     # shared lease. Kill switch: False stops it before any request.
     PROPERTY_RECOVERY_ENABLED: bool = True
+    # Pierce (Tacoma) code-violation OWNER names from the Pierce Assessor-Treasurer
+    # portal (ATIP) taxpayer record, one headless page view per parcel
+    # (src/scrapers/enrichment/pierce_atip_owner.py). Owner decision 2026-09-14: legal
+    # review cleared storing ATIP taxpayer names FOR CODE-VIOLATION OWNER NAMING ONLY
+    # (RCW 42.56.070(8)); every other Pierce use stays address-only. OFF by default:
+    # False stops the live pass, the background sweep and the repair script before
+    # any request.
+    PIERCE_CV_OWNER_ENABLED: bool = False
 
     # ─── Skip Trace (Tracerfy, Sprint 4) ──────────────────────────────────────
     TRACERFY_API_TOKEN: str = ""

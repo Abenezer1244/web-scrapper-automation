@@ -39,6 +39,10 @@ _logger = setup_logger("enrichment.source_health")
 # Stable slugs. Add a constant here rather than passing raw strings around, so a
 # typo can't silently create a second health row for the same source.
 KING_EREALPROPERTY = "king_erealproperty"
+# Pierce Assessor-Treasurer portal, owner lookups for Tacoma code violations only
+# (pierce_atip_owner). No canary probe is registered for it, so a block clears
+# through is_source_available's backstop (cooldown + 6 h), never blind.
+PIERCE_ATIP_OWNER = "pierce_atip_owner"
 
 # 1h first, then 6h, 24h, 48h and 72h for every subsequent failed probe.
 # Index 0 is the FIRST block, before any probe has run, so it is the rung that

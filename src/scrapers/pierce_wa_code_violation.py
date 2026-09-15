@@ -13,6 +13,7 @@ Fields returned:
 - latitude, longitude, parcelinfo (ATIP link)
 """
 
+import hashlib
 import random
 import time
 from datetime import UTC, datetime, timedelta
@@ -234,22 +235,38 @@ class PierceWACodeViolationScraper(BridgeScraper):
                             open_ts, case_num, exc,
                         )
 
-                # Party name — case type + address from STRUCTURED fields only.
-                # There is no owner name in the API, and we deliberately do NOT use
-                # any free-text complaint field (it can carry complainant PII).
+                # Party name is the property OWNER, and Tacoma has none: the layer
+                # names the case, not who owns the parcel. The label used to be
+                # written here ("Nuisance - 1603 N ALDER ST"), so the case type read
+                # as an owner. The owner is filled from the Pierce Assessor-Treasurer
+                # record for this parcel during enrichment (pierce_atip_owner), or
+                # stays empty. We deliberately do NOT use any free-text complaint
+                # field (it can carry complainant PII).
                 case_type = (attr.get("casetype") or "").strip()
                 status = (attr.get("currentstatus") or "").strip()
-                # Plain hyphen: party_name is shown to customers, and a " - <number>"
-                # separator is what skip-trace eligibility reads as a case description.
-                record.party_name = f"{case_type} - {address}" if address else case_type
+                record.party_name = None
 
                 # Legal description — use case number
                 record.legal_description = case_num
 
-                # Store all metadata
+                # Per-case idempotency key for the job insert (Result.raw_html_hash,
+                # String(32)). Without it the key is a tuple that includes party_name,
+                # so a watchdog re-run straddling a party_name change would append the
+                # same cases again instead of conflicting (same fix as King SDCI).
+                record.raw_html_hash = hashlib.sha256(
+                    f"tacoma_cv|{case_num}".encode()
+                ).hexdigest()[:32]
+
+                # Store all metadata. violation_category is the field the export and
+                # API read for every code-violation source; case_type stays for rows
+                # and readers that predate it.
                 record.enrichment_data = {
                     "source": "tacoma_code_violations",
                     "case_number": case_num,
+                    "violation_category": case_type or None,
+                    # The parcel as the source case carried it: owner naming requires
+                    # parcel_id to still equal it (pierce_atip_owner).
+                    "source_parcel": record.parcel_id,
                     "case_type": case_type,
                     "status": status,
                     "inspector": attr.get("inspector"),

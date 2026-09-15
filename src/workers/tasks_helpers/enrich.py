@@ -986,8 +986,8 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
         # path King tax uses: lease-guarded, paced, breaker-protected, and it drops any
         # page the county served for a different parcel. This job has no parcel_id, so
         # the parcel-keyed owner pass below never runs for it; this takes its 300 s
-        # slot in that budget sum. Rows not reached keep no owner and are picked up by
-        # scripts/backfill_king_code_violation_owner.py.
+        # slot in that budget sum. Rows not reached keep no owner and are named later
+        # by the beat sweep src/workers/cv_owner_recovery.py.
         from src.scrapers.enrichment.king_parcel_locate import (
             apply_owner_names,
             owner_lookup_pins,

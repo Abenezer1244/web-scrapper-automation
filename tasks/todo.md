@@ -1,3 +1,51 @@
+# King property follow-ups (2026-09-15)
+
+Branch `fix/king-property-followups`. Owner said "run fix and work with codex on all" after the
+tax_delinquent dry run (12,306 candidates / 7 jobs: fill_condo 2,977, fill_gis 29, unresolved 9,300).
+
+## Proven
+- Beat starvation: beat + worker redeployed 00:58, 01:10, 01:19, 01:28 UTC (each < 20 min). Beat's
+  PersistentScheduler file is not on a volume, so every deploy resets interval entries to a full period
+  (celery 5.6.3 probe: fresh 1200 s interval -> next=1200; crontab(minute="11-59/20") -> next mark).
+  `recover-deferred-property` has never fired in prod. Hourly interval entries starve the same way on
+  busy merge days.
+- 0 prod rows carry `property_lookup_deferred` (no King job since the deploy).
+- owner_recovery.py never reads property_address or the owner-location flags (no overlap with the repair).
+
+## Plan
+- [x] A0 Codex consult on A + B (inline prompt, no repo access); reconcile (see Codex reconciliation)
+- [x] A1 Tax repair apply via guarded harness `kp_data/tax_apply_guarded.py` (exact reviewed-map gate,
+      fsynced before/after images, lock_timeout 5 s); peers told (no collision). Applied after the owner's
+      "proceed and complete": 3,006 written, 0 refused, 0 problems.
+- [x] A2 Verify: merged script re-run finds 0 fills (9,300 unresolved); repaired rows per job equal the
+      decisions; every job's billing_applied_at predates the repair
+- [x] B1 Beat: interval entries >= 10 min -> wall-clock crontab, staggered (mailing 3-59/10, owners
+      5-59/15, property 7-59/20, min 2 min apart; hourly at :17/:25/:39/:41/:57); comments say why
+- [x] B2 `tests/test_beat_schedule.py` (14): no slow interval, fresh boot runs within its step, replay of
+      the real 4 boots, old 1200 s starves, stagger, cadence, UTC. 5 mutations all fail a test.
+
+## Codex reconciliation (2026-09-15)
+- Adopted: count gate, durable before/after images, lock/statement timeouts, post-apply comparison;
+  offsets spread for the shared lease; P3 comment date (09-15 UTC, not 09-14).
+- Disproved: owner flags "overwrite truth" (all writers derive them via compute_owner_flags from
+  property+mailing; these rows were computed with an empty property); stale whole-column
+  enrichment_data writers (owner/mailing sweeps and the requeue script merge in SQL); two beat
+  instances double-firing (Railway logs: old beat stops 39-50 s before the new one starts).
+- Not changed: lease oversubscription (rates unchanged, pre-existing; empty ticks exit fast); 300 s
+  entries stay intervals (a deploy costs one short period; aligning marks bunches paid dispatch).
+- Prod: first-ever `recover_deferred_property` tick 01:49:32 UTC succeeded, 0 parcels.
+
+## Plan (continued)
+- [x] B3 ruff clean; full suite 3,555 passed (2 RLS failures reproduce on untouched main after a test-DB
+      recreate; CI green); Codex diff review no P1/P2; PR #310 merged `9f8f7cc`
+- [x] B4 After the #310 deploy (beat boot 02:29:57 UTC): mailing sent 02:33 + 02:43, owners 02:35 + 02:50,
+      property 02:47; all succeeded in the worker (property 0 parcels; mailing 1 row unreached, rotated)
+
+## Review
+- Shipped #310 (beat crontabs) and applied the King tax property repair (3,006 rows). Harness gates
+  came from two Codex rounds; three Codex claims were disproved with code or log evidence.
+- Left by design: 9,300 tax rows with no permitted address source. Owner-session UI check still open.
+
 # King pre-foreclosure data quality: job 85692303 (2026-09-14)
 
 Branch `investigate/king-prefc-dq` (worktree `C:/Users/Windows/bl-wt-kingprefc`).

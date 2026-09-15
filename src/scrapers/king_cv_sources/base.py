@@ -47,6 +47,32 @@ LABEL_MAX = 120
 _PIN_SEPARATORS = re.compile(r"[\s\-]")
 
 
+_CELERY_TIME_LIMITS = ("SoftTimeLimitExceeded", "TimeLimitExceeded")
+
+
+def celery_time_limit(exc: BaseException) -> BaseException | None:
+    """The Celery time limit anywhere in ``exc``'s cause/context chain, else None.
+
+    Matched by class name so this package never imports Celery. A time limit is the job's
+    deadline, never a source failure, so no retry loop or fallback may absorb it.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        if type(current).__name__ in _CELERY_TIME_LIMITS:
+            return current
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return None
+
+
+def raise_if_time_limit(exc: BaseException) -> None:
+    """Re-raise the Celery time limit in ``exc``'s chain. Call first in every catch-all."""
+    deadline = celery_time_limit(exc)
+    if deadline is not None:
+        raise deadline
+
+
 class DateRangeTooLargeError(RuntimeError):
     """The date range holds more than one run of this source can collect.
 
@@ -117,6 +143,7 @@ def get_json_with_retries(url: str, params: dict, *, what: str, require_features
                     f"{what}: ArcGIS returned an error or malformed body: {err or str(data)[:160]}")
             return data
         except Exception as exc:
+            raise_if_time_limit(exc)
             last_exc = exc
             if attempt >= settings.MAX_RETRIES or not is_retryable(exc):
                 break

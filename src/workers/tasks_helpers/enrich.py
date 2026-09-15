@@ -976,13 +976,15 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                 _logger.warning("Job %s: code violation mailing commit failed: %s",
                                 job_id, str(exc)[:120])
 
-        # No source names the owner, so party_name arrives empty. The PIN Bellevue or
-        # Burien printed (parcel_id), or an exact or street-level located SDCI PIN, names
-        # the owner through the same owner-only eRealProperty path King tax uses:
-        # lease-guarded, paced, breaker-protected, and it drops any page the county served
-        # for a different parcel. The tax-only owner pass below never runs for this job;
-        # this takes its 300 s slot in the budget sum. SDCI rows not reached keep no owner
-        # and are picked up by scripts/backfill_king_code_violation_owner.py.
+        # No source names the owner, so party_name arrives empty. The PIN Bellevue,
+        # Burien or King County Accela printed (parcel_id), or an exact or street-level
+        # located SDCI PIN, names the owner through the same owner-only eRealProperty path
+        # King tax uses: lease-guarded, paced, breaker-protected, and it drops any page
+        # the county served for a different parcel. The tax-only owner pass below never
+        # runs for this job; this takes its 300 s slot in the budget sum. SDCI rows not
+        # reached keep no owner and are named later by the beat sweep
+        # src/workers/cv_owner_recovery.py, which selects SDCI rows only: a printed-PIN
+        # row this pass did not reach stays unnamed (and is never skip traced).
         from src.scrapers.enrichment.king_parcel_locate import (
             apply_owner_names,
             owner_lookup_pins,

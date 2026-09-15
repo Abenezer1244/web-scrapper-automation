@@ -104,6 +104,10 @@ class _Resp:
         return None
 
 
+def _decide(parcel, rows, address):
+    return pao.decide(parcel, rows, address, source="tacoma_code_violations")
+
+
 # ── Scraper semantics ──────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
@@ -174,14 +178,14 @@ def test_tacoma_addresses_that_are_not(lead, situs):
 # ── Acceptance rules ───────────────────────────────────────────────────────────
 
 def test_a_real_property_taxpayer_on_the_same_situs_is_accepted():
-    d = pao.decide("2021110133", _rows(ATIP_2117), "2117 AVE S")
+    d = _decide("2021110133", _rows(ATIP_2117), "2117 AVE S")
     assert (d.status, d.name) == ("matched", "TACOMA TOWN CENTER PARCELS LLC")
-    d = pao.decide("2006120010", _rows(ATIP_602), "602 AVE S")
+    d = _decide("2006120010", _rows(ATIP_602), "602 AVE S")
     assert (d.status, d.name) == ("matched", "602 LLC")
 
 
 def test_care_of_is_never_the_owner():
-    d = pao.decide("2030120032", _rows(ATIP_DIVISION), "641 DIVISION AVE")
+    d = _decide("2030120032", _rows(ATIP_DIVISION), "641 DIVISION AVE")
     assert d.name == "B10 MOUNTAIN A WA LLC"
 
 
@@ -193,18 +197,18 @@ def test_care_of_is_never_the_owner():
     ("9999999999", ATIP_UNKNOWN_PARCEL, "1 A ST", "not_on_record"),
 ], ids=["other_parcel", "mobile_home", "condo_reference", "other_house", "unknown_parcel"])
 def test_everything_else_names_nobody(parcel, body, address, status):
-    d = pao.decide(parcel, _rows(body), address)
+    d = _decide(parcel, _rows(body), address)
     assert (d.status, d.name) == (status, None)
 
 
 def test_a_blank_taxpayer_name_is_not_an_owner():
     row = dict(_rows(ATIP_2117)[0], name="   ")
-    assert pao.decide("2021110133", [row], "2117 AVE S").status == "no_name"
+    assert _decide("2021110133", [row], "2117 AVE S").status == "no_name"
 
 
 def test_two_rows_for_the_asked_parcel_are_ambiguous():
     row = _rows(ATIP_2117)[0]
-    assert pao.decide("2021110133", [row, dict(row, name="OTHER LLC")], "2117 AVE S").status == \
+    assert _decide("2021110133", [row, dict(row, name="OTHER LLC")], "2117 AVE S").status == \
         "parcel_mismatch"
 
 
@@ -348,43 +352,89 @@ def _cv_row(**over):
     return SimpleNamespace(**base)
 
 
-def test_owner_is_written_with_its_proof_and_parcel_id_is_untouched():
+def test_a_planned_owner_carries_its_proof():
     row, label = _cv_row(), _cv_row(id="r2", party_name="Nuisance - 2117 AVE S")
     mapped = pao.owner_lookup_parcels([row, label])
     assert mapped == {"2021110133": [row]}                 # a party (even a label) is not replaced
-    counts = pao.apply_owner_decisions(
-        mapped, {"2021110133": pao.Fetched("found", _rows(ATIP_2117))}, checked_at="t")
-    assert counts["matched"] == 1
-    assert row.party_name == "TACOMA TOWN CENTER PARCELS LLC"
-    assert row.parcel_id == "2021110133"
-    assert {k: row.enrichment_data[k] for k in ("owner_source", "owner_pin", "owner_status")} == {
-        "owner_source": "pierce_atip", "owner_pin": "2021110133", "owner_status": "matched"}
+    plans, counts = pao.plan_owner_decisions(
+        mapped, {"2021110133": pao.Fetched("found", _rows(ATIP_2117))})
+    [(planned, pid, d)] = plans
+    assert planned is row and (pid, d.status, d.name) == (
+        "2021110133", "matched", "TACOMA TOWN CENTER PARCELS LLC")
+    assert pao.owner_payload(pid, d, "t") == {"owner_status": "matched", "owner_checked_at": "t",
+                                              "owner_source": "pierce_atip", "owner_pin": "2021110133"}
+    assert row.party_name is None                          # planning never mutates the row
 
 
-def test_a_rejected_row_gets_a_terminal_status_and_no_name():
-    row = _cv_row(property_address="2119 AVE S")
-    counts = pao.apply_owner_decisions(pao.owner_lookup_parcels([row]),
-                                       {"2021110133": pao.Fetched("found", _rows(ATIP_2117))},
-                                       checked_at="t")
-    assert counts["address_mismatch"] == 1 and row.party_name is None
-    assert row.enrichment_data["owner_status"] == "address_mismatch"
-    assert "owner_source" not in row.enrichment_data
-    assert pao.owner_lookup_parcels([row]) == {}           # never looked up again
+def test_a_rejected_decision_writes_a_status_and_no_owner_proof():
+    d = _decide("2021110133", _rows(ATIP_2117), "2119 AVE S")
+    assert pao.owner_payload("2021110133", d, "t") == {"owner_status": "address_mismatch",
+                                                       "owner_checked_at": "t"}
+    decided = _cv_row(enrichment_data={"source": "tacoma_code_violations",
+                                       "owner_status": "address_mismatch"})
+    assert pao.owner_lookup_parcels([decided]) == {}       # never looked up again
 
 
-def test_a_row_changed_since_selection_is_left_alone():
+def test_a_row_changed_since_selection_is_not_planned():
     row = _cv_row()
     mapped = pao.owner_lookup_parcels([row])
     row.parcel_id = "2021110134"
-    counts = pao.apply_owner_decisions(
-        mapped, {"2021110133": pao.Fetched("found", _rows(ATIP_2117))}, checked_at="t")
-    assert counts["stale"] == 1 and row.party_name is None
+    plans, counts = pao.plan_owner_decisions(
+        mapped, {"2021110133": pao.Fetched("found", _rows(ATIP_2117))})
+    assert plans == [] and counts["stale"] == 1
 
 
 @pytest.mark.parametrize("source", ["pierce_recorder", "pierce_arms", None, "seattle_sdci_code_violations"])
 def test_no_other_record_type_is_ever_offered_for_atip_naming(source):
     ed = {"source": source} if source else {}
     assert pao.owner_lookup_parcels([_cv_row(enrichment_data=ed)]) == {}
+    with pytest.raises(ValueError, match="Tacoma code-violation"):
+        pao.decide("2021110133", _rows(ATIP_2117), "2117 AVE S", source=source)
+
+
+def test_only_the_exact_summary_endpoint_for_the_parcel_is_read():
+    ok = "https://atip.piercecountywa.gov/api/pcAtipSummary?iParcelNumber=2021110133"
+    assert pao._summary_is_for(ok, "2021110133")
+    for url in (
+        "https://atip.piercecountywa.gov/api/pcAtipSummaryV2?iParcelNumber=2021110133",
+        "https://atip.piercecountywa.gov/api/pcAtipSummary?iParcelNumber=2021110134",
+        "https://atip.piercecountywa.gov/api/pcAtipSummary?iParcelNumber=2021110133&x=1",
+        "https://atip.piercecountywa.gov.evil.test/api/pcAtipSummary?iParcelNumber=2021110133",
+        "http://atip.piercecountywa.gov/api/pcAtipSummary?iParcelNumber=2021110133",
+        "https://atip.piercecountywa.gov:8443/api/pcAtipSummary?iParcelNumber=2021110133",
+    ):
+        assert not pao._summary_is_for(url, "2021110133"), url
+
+
+def test_a_budget_too_small_for_one_page_makes_no_request(monkeypatch, paces, clean_health):
+    portal = _Portal({"2021110133": [(200, ATIP_2117)]}).install(monkeypatch)
+    stats: dict = {}
+    assert pao.lookup_parcels(["2021110133"], budget_s=60, stats=stats) == {}
+    assert stats["outcome"] == "budget_exhausted" and portal.sessions == 0
+
+
+def test_a_task_time_limit_mid_lookup_is_audited_and_not_swallowed(monkeypatch, paces, clean_health,
+                                                                    caplog):
+    from billiard.exceptions import SoftTimeLimitExceeded
+
+    _Portal({}).install(monkeypatch)
+
+    async def _killed(session, parcel):
+        raise SoftTimeLimitExceeded()
+
+    monkeypatch.setattr(pao, "_fetch_summary", _killed)
+    with caplog.at_level(logging.INFO, logger="scraper.enrichment.pierce_atip_owner"), \
+            pytest.raises(SoftTimeLimitExceeded):
+        pao.lookup_parcels(["2021110133"])
+    assert "parcel=2021110133 outcome=time_limit" in caplog.text
+
+
+def test_the_tacoma_proof_itself_requires_a_party_name():
+    from src.scrapers.enrichment.skip_trace import code_violation_owner_is_known
+
+    assert code_violation_owner_is_known(_cv_row(party_name="602 LLC", enrichment_data=_proven()))
+    for blank in (None, "", "   "):
+        assert not code_violation_owner_is_known(_cv_row(party_name=blank, enrichment_data=_proven()))
 
 
 # ── Skip trace: a Tacoma owner is paid for only with its own proof ─────────────
@@ -484,6 +534,67 @@ async def test_a_live_pierce_cv_job_names_the_owner_and_keeps_parcel_and_dedup(
     assert n.enrichment_data["owner_pin"] == "2021110133"
     assert got[other].party_name == "602 LLC"
     assert sorted(portal.requests) == ["2006120010", "2021110133"]
+
+
+@pytest.mark.asyncio
+async def test_a_row_changed_while_the_portal_answers_is_never_named(
+    db, business_user, redis_client, monkeypatch, paces, clean_health,
+):
+    """Another writer moves the row to a different parcel mid-lookup (Codex r1 P1)."""
+    job_id = await _pierce_job(db, business_user, status="enriching")
+    rid, _ = await _stored(db, business_user, job_id, party=None)
+    _Portal({}).install(monkeypatch)
+
+    async def _answer_after_a_concurrent_change(session, parcel):
+        from src.db.session import system_sync_session
+
+        with system_sync_session() as other_writer:
+            other_writer.execute(text("UPDATE results SET parcel_id = '2021110134' WHERE id = :i"),
+                                 {"i": rid})
+            other_writer.commit()
+        return 200, ATIP_2117
+
+    monkeypatch.setattr(pao, "_fetch_summary", _answer_after_a_concurrent_change)
+    monkeypatch.setattr("src.scrapers.enrichment.county_gis.batch_enrich_parcels_gis",
+                        lambda *a, **kw: {})
+    await asyncio.to_thread(_inline, job_id, redis_client)
+    row = (await _fetch_rows(db, [rid]))[rid]
+    assert row.parcel_id == "2021110134"
+    assert row.party_name is None
+    assert "owner_source" not in row.enrichment_data and "owner_status" not in row.enrichment_data
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", [
+    "UPDATE results SET parcel_id = '2021110134' WHERE id = :i",
+    "UPDATE results SET property_address = '2119 AVE S' WHERE id = :i",
+    "UPDATE results SET party_name = 'HAND ENTERED NAME' WHERE id = :i",
+])
+async def test_the_write_itself_rejects_a_row_changed_after_the_decision(
+    db, business_user, redis_client, monkeypatch, paces, clean_health, change,
+):
+    """The in-memory check has passed; only the UPDATE's own guard stands in the way."""
+    job_id = await _pierce_job(db, business_user, status="enriching")
+    rid, _ = await _stored(db, business_user, job_id, party=None)
+    _Portal({"2021110133": [(200, ATIP_2117)]}).install(monkeypatch)
+    real_decide = pao.decide
+
+    def _decide_then_another_writer_lands(*a, **kw):
+        decision = real_decide(*a, **kw)
+        from src.db.session import system_sync_session
+
+        with system_sync_session() as other_writer:
+            other_writer.execute(text(change), {"i": rid})
+            other_writer.commit()
+        return decision
+
+    monkeypatch.setattr(pao, "decide", _decide_then_another_writer_lands)
+    monkeypatch.setattr("src.scrapers.enrichment.county_gis.batch_enrich_parcels_gis",
+                        lambda *a, **kw: {})
+    await asyncio.to_thread(_inline, job_id, redis_client)
+    row = (await _fetch_rows(db, [rid]))[rid]
+    assert row.party_name in (None, "HAND ENTERED NAME")
+    assert "owner_source" not in row.enrichment_data and "owner_status" not in row.enrichment_data
 
 
 @pytest.mark.asyncio
@@ -612,11 +723,13 @@ async def test_repair_replaces_only_the_old_label_and_converges(
 
 
 @pytest.mark.asyncio
-async def test_repair_write_guard_skips_a_row_whose_party_or_parcel_moved(db, business_user):
+async def test_repair_write_guard_skips_a_row_whose_party_parcel_or_case_moved(db, business_user):
     job_id = await _pierce_job(db, business_user)
     rid, _ = await _stored(db, business_user, job_id, party="Nuisance - 2117 AVE S")
+    label = "Nuisance - 2117 AVE S"
 
-    def _write(old_party, old_parcel):
+    def _write(old_party=label, old_parcel="2021110133", old_case="60000303996",
+               old_legal="60000303996"):
         from src.db.session import system_sync_session
 
         with system_sync_session() as sdb:
@@ -624,13 +737,26 @@ async def test_repair_write_guard_skips_a_row_whose_party_or_parcel_moved(db, bu
                 "new_party": "TACOMA TOWN CENTER PARCELS LLC", "old_party": old_party,
                 "old_parcel": old_parcel, "old_address": "2117 AVE S", "rid": rid,
                 "uid": business_user.id, "payload": "{}", "source": bpo._SOURCE,
-                "writes_owner_status": True})
+                "writes_owner_status": True, "old_case": old_case, "old_legal": old_legal})
             sdb.commit()
             return res.rowcount
 
-    assert await asyncio.to_thread(_write, "Nuisance - 2117 AVE S", "2021110134") == 0
-    assert await asyncio.to_thread(_write, "SOMEONE ELSE", "2021110133") == 0
-    assert await asyncio.to_thread(_write, "Nuisance - 2117 AVE S", "2021110133") == 1
+    assert await asyncio.to_thread(_write, old_parcel="2021110134") == 0
+    assert await asyncio.to_thread(_write, old_party="SOMEONE ELSE") == 0
+    assert await asyncio.to_thread(_write, old_case="60000301838") == 0
+    assert await asyncio.to_thread(_write, old_legal="60000301838") == 0
+    assert await asyncio.to_thread(_write) == 1
+
+
+def test_repair_leaves_a_case_the_source_answers_twice_differently(monkeypatch):
+    conflicting = dict(TACOMA_2117, casetype="Graffiti")
+    import src.utils.safe_http as safe_http
+    monkeypatch.setattr(safe_http, "safe_get", lambda *a, **kw: _Resp(
+        {"features": [{"attributes": TACOMA_2117}, {"attributes": conflicting},
+                      {"attributes": TACOMA_602}, {"attributes": dict(TACOMA_602)}]}))
+    got = bpo.fetch_source_rows(["60000303996", "60000301838"], pace_s=0)
+    assert "60000303996" not in got                         # ambiguous: untouched
+    assert got["60000301838"]["casetype"] == TACOMA_602["casetype"]   # identical repeat is fine
 
 
 def test_repair_owners_needs_the_flag_and_the_public_redis(monkeypatch):

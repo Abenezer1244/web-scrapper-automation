@@ -78,7 +78,9 @@ _UPDATE_SQL = """
       AND party_name IS NOT DISTINCT FROM CAST(:old_party AS varchar)
       AND parcel_id IS NOT DISTINCT FROM CAST(:old_parcel AS varchar)
       AND property_address IS NOT DISTINCT FROM CAST(:old_address AS varchar)
+      AND legal_description IS NOT DISTINCT FROM CAST(:old_legal AS varchar)
       AND jsonb_typeof(enrichment_data::jsonb) = 'object'
+      AND enrichment_data::jsonb->>'case_number' IS NOT DISTINCT FROM CAST(:old_case AS text)
       AND enrichment_data::jsonb->>'source' = :source
       AND NOT (enrichment_data::jsonb ? 'owner_source')
       AND (NOT CAST(:writes_owner_status AS boolean)
@@ -103,6 +105,7 @@ def fetch_source_rows(case_numbers: list[str], *, pace_s: float = 1.0) -> dict[s
     add_scrape_domain("services3.arcgis.com")
     wanted = sorted({n for n in case_numbers if n and _CASENUMBER_RE.match(n)})
     out: dict[str, dict] = {}
+    ambiguous: set[str] = set()
     for i in range(0, len(wanted), _BATCH):
         chunk = wanted[i:i + _BATCH]
         quoted = ",".join(f"'{n}'" for n in chunk)  # validated by _CASENUMBER_RE above
@@ -118,9 +121,17 @@ def fetch_source_rows(case_numbers: list[str], *, pace_s: float = 1.0) -> dict[s
         for feat in data["features"]:
             attrs = (feat or {}).get("attributes") or {}
             num = str(attrs.get("casenumber") or "")
-            if num in chunk:
-                out[num] = attrs
+            if num not in chunk:
+                continue
+            prev = out.get(num)
+            if prev is not None and old_scraper_label(prev) != old_scraper_label(attrs):
+                # Two different features for one case: the label cannot be rebuilt with
+                # certainty, so rows on this case are left untouched.
+                ambiguous.add(num)
+            out[num] = attrs
         time.sleep(pace_s)
+    for num in ambiguous:
+        del out[num]
     return out
 
 
@@ -179,7 +190,7 @@ def run(db, *, apply_writes: bool, owners: bool, retry_owners: bool = False,
             f = fetched.get(p["parcel"]) if p["parcel"] else None
             writes_owner_status = False
             if f is not None and (p["is_label"] or p["unnamed"]):
-                d = decide(p["parcel"], f.rows, r.property_address)
+                d = decide(p["parcel"], f.rows, r.property_address, source=r.ed.get("source"))
                 payload.update(owner_payload(p["parcel"], d, now))
                 writes_owner_status = True
                 counts[f"owner_{d.status}"] += 1
@@ -201,6 +212,8 @@ def run(db, *, apply_writes: bool, owners: bool, retry_owners: bool = False,
             res = db.execute(text(_UPDATE_SQL), {
                 "new_party": new_party, "old_party": r.party_name, "old_parcel": r.parcel_id,
                 "old_address": r.property_address, "rid": r.id, "uid": r.user_id,
+                # The source row was fetched for THIS case; a row re-pointed since is skipped.
+                "old_legal": r.legal_description, "old_case": r.ed.get("case_number"),
                 "payload": json.dumps(payload), "source": _SOURCE,
                 "writes_owner_status": writes_owner_status})
             written += bool(res.rowcount)

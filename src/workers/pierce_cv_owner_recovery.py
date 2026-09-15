@@ -32,6 +32,7 @@ from datetime import UTC, datetime
 from sqlalchemy import text as sa_text
 
 from src.config import settings
+from src.scrapers.enrichment.pierce_atip_owner import OWNER_ROW_GUARD
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("worker.pierce_cv_owner_recovery")
@@ -95,14 +96,13 @@ _CANDIDATE_ROWS_SQL = f"""
     ORDER BY r.id
 """  # noqa: S608 -- splices only module constants; every value is bound
 
-# The decision was made for THIS address; a row whose address changed since it was
-# read is left for the next tick rather than named against a stale comparison.
+# The shared owner guard (same row, parcel and address as the decision, still unnamed
+# and undecided) plus this sweep's own delivery and job scope, all re-checked at write.
 _WRITE_SQL = f"""
     UPDATE results r SET
       party_name = COALESCE(CAST(:owner AS varchar), r.party_name),
       enrichment_data = (r.enrichment_data::jsonb || CAST(:payload AS jsonb))::json
-    WHERE r.id = :rid AND r.user_id = :uid AND btrim(r.parcel_id) = :pid
-      AND r.property_address IS NOT DISTINCT FROM CAST(:address AS varchar)
+    WHERE {OWNER_ROW_GUARD}
       AND {_ELIGIBLE_ROW}
       AND EXISTS (
         SELECT 1 FROM jobs j JOIN scraper_configs sc ON sc.id = j.scraper_config_id
@@ -196,7 +196,7 @@ def _tick(stats: dict) -> dict:
             f = fetched.get(pid)
             for row in by_parcel[pid]:
                 if f is not None:
-                    d = decide(pid, f.rows, row.property_address)
+                    d = decide(pid, f.rows, row.property_address, source=row.ed.get("source"))
                     payload = owner_payload(pid, d, checked_at)
                     payload[LAST_AT_KEY] = checked_at
                     label = d.status

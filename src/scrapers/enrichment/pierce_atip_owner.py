@@ -89,6 +89,8 @@ GAVE_UP = "gave_up"
 
 MIN_PACE_S = 2.0
 _PAGE_TIMEOUT_S = 45.0
+_SESSION_START_S = 30.0
+_TIME_LIMITS = ("SoftTimeLimitExceeded", "TimeLimitExceeded")
 _MAX_HARD_FAILURES = 3
 _LEASE_WAIT_S = 30.0
 _NAME_MAX = 512
@@ -181,12 +183,17 @@ class OwnerDecision:
     name: str | None = None
 
 
-def decide(parcel: str, rows: list[dict] | None, lead_address: str | None) -> OwnerDecision:
+def decide(parcel: str, rows: list[dict] | None, lead_address: str | None, *,
+           source: object) -> OwnerDecision:
     """Apply every acceptance rule to one ATIP answer for one lead.
 
     `rows` is the classified summary body: [] (or None) when the parcel is not on
-    record. The name leaves this function only inside a MATCHED decision.
+    record. The name leaves this function only inside a MATCHED decision. `source` is
+    the lead's enrichment_data.source: the 2026-09-14 clearance covers Tacoma code
+    violations only, so any other lead is refused here, not just by the callers.
     """
+    if source != TACOMA_CV_SOURCE:
+        raise ValueError("ATIP taxpayer names are cleared for Tacoma code-violation leads only")
     if not rows:
         return OwnerDecision(NOT_ON_RECORD)
     echoed = [r for r in rows if _clean(r.get("parcel_number")) == parcel]
@@ -210,10 +217,19 @@ def decide(parcel: str, rows: list[dict] | None, lead_address: str | None) -> Ow
 
 # ── Fetch: one real page view per parcel ─────────────────────────────────────────
 
+_SUMMARY = urlparse(ATIP_SUMMARY_API)
+
+
 def _summary_is_for(url: str, parcel: str) -> bool:
-    if not url.startswith(ATIP_SUMMARY_API):
+    """Exactly https://atip.piercecountywa.gov/api/pcAtipSummary?iParcelNumber=<parcel>."""
+    try:
+        u = urlparse(url)
+        port = u.port
+    except ValueError:
         return False
-    return parse_qs(urlparse(url).query).get("iParcelNumber") == [parcel]
+    return (u.scheme == "https" and u.hostname == _SUMMARY.hostname and port is None
+            and u.path == _SUMMARY.path and not u.username and not u.password
+            and parse_qs(u.query) == {"iParcelNumber": [parcel]})
 
 
 def _new_session():
@@ -257,9 +273,33 @@ async def _lookup(parcels: list[str], *, pace_s: float, deadline: float | None,
     session = None
     restarted = False
     consecutive_hard = 0
+
+    def _affordable(*, new_session: bool, pace: bool) -> bool:
+        # Everything the next page view may cost must fit: the pause, a browser start
+        # when one is needed, and the full page timeout (Codex r1 P2).
+        if deadline is None:
+            return True
+        cost = _PAGE_TIMEOUT_S + (pace_s if pace else 0.0) + (_SESSION_START_S if new_session else 0.0)
+        return time.monotonic() + cost < deadline
+
+    async def _one(pid: str) -> tuple[str, list | None]:
+        try:
+            status, body = await asyncio.wait_for(_fetch_summary(session, pid),
+                                                  timeout=_PAGE_TIMEOUT_S + 5)
+            return classify_response(status, body)
+        except BaseException as exc:
+            if type(exc).__name__ in _TIME_LIMITS:
+                _audit(pid, "time_limit")  # the task is being killed mid-lookup
+                raise
+            if not isinstance(exc, Exception):
+                raise
+            _logger.warning("pierce_atip_owner page failed for parcel %s: %s",
+                            pid, type(exc).__name__)
+            return HARD_FAILURE, None
+
     try:
         for i, pid in enumerate(parcels):
-            if deadline is not None and time.monotonic() + _PAGE_TIMEOUT_S >= deadline:
+            if not _affordable(new_session=session is None, pace=bool(i)):
                 stats["outcome"] = "budget_exhausted"
                 return
             if not admission.still_held():
@@ -271,31 +311,23 @@ async def _lookup(parcels: list[str], *, pace_s: float, deadline: float | None,
             if i:
                 await asyncio.sleep(pace_s)
             stats["attempted"].append(pid)
-            try:
-                status, body = await _fetch_summary(session, pid)
-                kind, rows = classify_response(status, body)
-            except Exception as exc:  # noqa: BLE001 -- one failed page must not stop the pass
-                if type(exc).__name__ in ("SoftTimeLimitExceeded", "TimeLimitExceeded"):
-                    raise
-                _logger.warning("pierce_atip_owner page failed for parcel %s: %s",
-                                pid, type(exc).__name__)
-                kind, rows = HARD_FAILURE, None
+            kind, rows = await _one(pid)
             if kind == TOKEN_REJECTED and not restarted:
                 # The portal declined this session's verification. One fresh session
                 # for the whole batch (pierce_atip's re-solve-once rule), then stop.
                 stats["token_rejected"] += 1
                 restarted = True
+                if not _affordable(new_session=True, pace=True):
+                    stats["transient"].append(pid)
+                    _audit(pid, "verification_rejected")
+                    stats["outcome"] = "budget_exhausted"
+                    return
                 await session.__aexit__(None, None, None)
+                session = None
                 session = await _new_session().__aenter__()
                 stats["sessions"] += 1
                 await asyncio.sleep(pace_s)
-                try:
-                    status, body = await _fetch_summary(session, pid)
-                    kind, rows = classify_response(status, body)
-                except Exception as exc:  # noqa: BLE001
-                    if type(exc).__name__ in ("SoftTimeLimitExceeded", "TimeLimitExceeded"):
-                        raise
-                    kind, rows = HARD_FAILURE, None
+                kind, rows = await _one(pid)
             if kind == TOKEN_REJECTED:
                 stats["token_rejected"] += 1
                 stats["transient"].append(pid)
@@ -424,14 +456,21 @@ def owner_payload(parcel: str, decision: OwnerDecision, checked_at: str) -> dict
     return payload
 
 
-def apply_owner_decisions(pin_map: dict[str, list], fetched: dict[str, Fetched], *,
-                          checked_at: str) -> Counter:
-    """Decide and write each reached row in memory; returns a Counter of statuses.
+def _still_needs_owner(res, pid: str) -> bool:
+    return (is_tacoma_code_violation(res) and not (res.party_name or "").strip()
+            and normalize_parcel(res.parcel_id) == pid
+            and not res.enrichment_data.get("owner_source")
+            and not res.enrichment_data.get("owner_status"))
 
-    Re-checks the selection guards on the row itself, so a row that gained a party,
-    an owner or a different parcel since selection is left alone. Rows whose parcel
-    was not answered get nothing (a later pass retries them).
+
+def plan_owner_decisions(pin_map: dict[str, list], fetched: dict[str, Fetched]
+                         ) -> tuple[list[tuple], Counter]:
+    """([(row, parcel, decision)], counts) for every reached row that still needs an owner.
+
+    Rows whose parcel was not answered get nothing (a later pass retries them); a row
+    that no longer qualifies is counted `stale` and left alone.
     """
+    plans: list[tuple] = []
     counts: Counter = Counter()
     for pid, rows in pin_map.items():
         f = fetched.get(pid)
@@ -439,18 +478,56 @@ def apply_owner_decisions(pin_map: dict[str, list], fetched: dict[str, Fetched],
             counts["unreached"] += len(rows)
             continue
         for res in rows:
-            if (not is_tacoma_code_violation(res) or (res.party_name or "").strip()
-                    or normalize_parcel(res.parcel_id) != pid
-                    or res.enrichment_data.get("owner_source")
-                    or res.enrichment_data.get("owner_status")):
+            if not _still_needs_owner(res, pid):
                 counts["stale"] += 1
                 continue
-            d = decide(pid, f.rows, res.property_address)
-            ed = dict(res.enrichment_data)
-            ed.update(owner_payload(pid, d, checked_at))
-            res.enrichment_data = ed
-            if d.status == MATCHED:
-                res.party_name = d.name
-            counts[d.status] += 1
-            _logger.info("pierce_atip_owner decision parcel=%s status=%s", pid, d.status)
+            plans.append((res, pid, decide(pid, f.rows, res.property_address,
+                                           source=res.enrichment_data.get("source"))))
+    return plans, counts
+
+
+# Every owner write re-proves, in the UPDATE itself, what the decision was made on: the
+# same Tacoma code-violation row, parcel and address, still unnamed and undecided. A
+# row changed by anything else while the portal was being asked is left alone
+# (Codex r1 P1). Callers add their own scope (job status, delivery) on top.
+OWNER_ROW_GUARD = """
+      r.id = :rid AND r.user_id = :uid
+  AND btrim(r.parcel_id) = :pid
+  AND r.property_address IS NOT DISTINCT FROM CAST(:address AS varchar)
+  AND jsonb_typeof(r.enrichment_data::jsonb) = 'object'
+  AND r.enrichment_data::jsonb->>'source' = 'tacoma_code_violations'
+  AND (r.party_name IS NULL OR btrim(r.party_name) = '')
+  AND NOT (r.enrichment_data::jsonb ? 'owner_status')
+  AND NOT (r.enrichment_data::jsonb ? 'owner_source')
+"""
+
+_WRITE_DECISION_SQL = f"""
+    UPDATE results r SET
+      party_name = COALESCE(CAST(:owner AS varchar), r.party_name),
+      enrichment_data = (r.enrichment_data::jsonb || CAST(:payload AS jsonb))::json
+    WHERE {OWNER_ROW_GUARD}
+"""  # noqa: S608 -- splices only the OWNER_ROW_GUARD constant; every value is bound
+
+
+def write_owner_decisions(db, plans: list[tuple], *, checked_at: str) -> Counter:
+    """Guarded UPDATE per planned row (live job pass); commits; returns status counts.
+
+    The ORM objects are never mutated: each is expired after the commit so later
+    enrichment steps read what the database actually holds.
+    """
+    from sqlalchemy import text as sa_text
+
+    counts: Counter = Counter()
+    for res, pid, d in plans:
+        result = db.execute(sa_text(_WRITE_DECISION_SQL), {
+            "rid": res.id, "uid": res.user_id, "pid": pid, "address": res.property_address,
+            "owner": d.name if d.status == MATCHED else None,
+            "payload": json.dumps(owner_payload(pid, d, checked_at)),
+        })
+        key = d.status if result.rowcount else "stale"
+        counts[key] += 1
+        _logger.info("pierce_atip_owner decision parcel=%s status=%s", pid, key)
+    db.commit()
+    for res, _pid, _d in plans:
+        db.expire(res)
     return counts

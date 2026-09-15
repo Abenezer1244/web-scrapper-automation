@@ -913,28 +913,29 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
     if (config.county.lower() == "pierce" and config.state.upper() == "WA"
             and config.record_type == "code_violation" and settings.PIERCE_CV_OWNER_ENABLED):
         from src.scrapers.enrichment.pierce_atip_owner import (
-            apply_owner_decisions,
             lookup_parcels,
             owner_lookup_parcels,
+            plan_owner_decisions,
+            write_owner_decisions,
         )
 
         _pcv_map = owner_lookup_parcels(all_results)
         if _pcv_map:
+            # _publish_log commits, so no transaction is held open across the lookups.
             _publish_log(r, job_id, "info",
                          f"Looking up property owners for {len(_pcv_map)} code violation "
                          "parcels...", db=db)
             _pcv_stats: dict = {}
             _pcv_fetched = lookup_parcels(list(_pcv_map), budget_s=240, stats=_pcv_stats)
-            _pcv_counts = apply_owner_decisions(_pcv_map, _pcv_fetched,
-                                                checked_at=_now().isoformat())
             try:
-                db.commit()
+                _pcv_plans, _ = plan_owner_decisions(_pcv_map, _pcv_fetched)
+                _pcv_counts = write_owner_decisions(db, _pcv_plans, checked_at=_now().isoformat())
                 _publish_log(r, job_id, "info",
                              f"Found {_pcv_counts.get('matched', 0)} property owners for "
                              "code violations.", db=db)
             except Exception as exc:
                 db.rollback()
-                _logger.warning("Job %s: Pierce code violation owner commit failed: %s",
+                _logger.warning("Job %s: Pierce code violation owner write failed: %s",
                                 job_id, str(exc)[:120])
 
     # King code violations carry coordinates but no parcel, so the parcel-keyed passes

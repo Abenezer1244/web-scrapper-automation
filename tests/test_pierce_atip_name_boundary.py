@@ -234,11 +234,12 @@ def test_no_non_tacoma_code_violation_row_is_ever_offered_a_taxpayer_name(source
 def test_a_non_code_violation_row_is_never_named_even_when_handed_an_answer():
     row = _lead("pierce_recorder")
     rows = [dict(_ROW, parcel_number="5000050810", acct_type="Real Property", situs="1 A ST")]
-    counts = pierce_atip_owner.apply_owner_decisions(
-        {"5000050810": [row]}, {"5000050810": pierce_atip_owner.Fetched("found", rows)},
-        checked_at="t")
-    assert counts["stale"] == 1 and row.party_name is None
-    assert "owner_source" not in row.enrichment_data
+    plans, counts = pierce_atip_owner.plan_owner_decisions(
+        {"5000050810": [row]}, {"5000050810": pierce_atip_owner.Fetched("found", rows)})
+    assert plans == [] and counts["stale"] == 1 and row.party_name is None
+    # The name-producing rule itself refuses any lead outside the clearance.
+    with pytest.raises(ValueError, match="Tacoma code-violation"):
+        pierce_atip_owner.decide("5000050810", rows, "1 A ST", source="pierce_recorder")
 
 
 def test_the_address_fallback_still_drops_the_name_after_the_clearance():

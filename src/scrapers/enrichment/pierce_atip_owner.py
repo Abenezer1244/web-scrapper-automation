@@ -574,7 +574,8 @@ def owner_lookup_parcels(rows) -> dict[str, list]:
         if "owner_source" in ed or "owner_status" in ed:
             continue
         pid = normalize_parcel(res.parcel_id)
-        if pid:
+        # Only the parcel the Tacoma case itself carried at scrape (Codex r7 P1).
+        if pid and ed.get("source_parcel") == pid:
             out.setdefault(pid, []).append(res)
     return out
 
@@ -590,6 +591,7 @@ def owner_payload(parcel: str, decision: OwnerDecision, checked_at: str) -> dict
 def _still_needs_owner(res, pid: str) -> bool:
     return (is_tacoma_code_violation(res) and not (res.party_name or "").strip()
             and normalize_parcel(res.parcel_id) == pid
+            and res.enrichment_data.get("source_parcel") == pid
             and "owner_source" not in res.enrichment_data
             and "owner_status" not in res.enrichment_data)
 
@@ -622,15 +624,21 @@ def plan_owner_decisions(pin_map: dict[str, list], fetched: dict[str, Fetched]
 # row changed by anything else while the portal was being asked is left alone
 # (Codex r1 P1). It is also still in the same job, and that job is still a Pierce WA
 # code-violation job of the same user, so a re-parented or re-classified row is never
-# named (Codex r2 P1). Callers add their own scope (job status, delivery) on top.
+# named (Codex r2 P1), and the job is still in the status the caller decided under
+# (`enriching` for the live pass, `done` for the sweep), so a cancelled job is never
+# written (Codex r7). The parcel is compared byte for byte AND must be the parcel the
+# Tacoma case itself carried at scrape (enrichment_data.source_parcel), so a parcel_id
+# changed by anything after the scrape is never named (Codex r7 P1).
 OWNER_ROW_GUARD = """
       r.id = :rid AND r.user_id = :uid AND r.job_id = :jid
   AND EXISTS (
     SELECT 1 FROM jobs gj JOIN scraper_configs gsc ON gsc.id = gj.scraper_config_id
     WHERE gj.id = r.job_id AND gj.user_id = r.user_id AND gsc.user_id = r.user_id
+      AND gj.status = :job_status
       AND lower(gsc.county) = 'pierce' AND upper(gsc.state) = 'WA'
       AND gsc.record_type = 'code_violation')
-  AND btrim(r.parcel_id) = :pid
+  AND r.parcel_id = :raw_pid AND btrim(r.parcel_id) = :pid
+  AND r.enrichment_data::jsonb->>'source_parcel' = :pid
   AND r.property_address IS NOT DISTINCT FROM CAST(:address AS varchar)
   AND jsonb_typeof(r.enrichment_data::jsonb) = 'object'
   AND r.enrichment_data::jsonb->>'source' = 'tacoma_code_violations'
@@ -647,7 +655,8 @@ _WRITE_DECISION_SQL = f"""
 """  # noqa: S608 -- splices only the OWNER_ROW_GUARD constant; every value is bound
 
 
-def write_owner_decisions(db, plans: list[tuple], *, checked_at: str) -> Counter:
+def write_owner_decisions(db, plans: list[tuple], *, checked_at: str,
+                          job_status: str = "enriching") -> Counter:
     """Guarded UPDATE per planned row (live job pass); commits; returns status counts.
 
     The ORM objects are never mutated: each is expired after the commit so later
@@ -659,6 +668,7 @@ def write_owner_decisions(db, plans: list[tuple], *, checked_at: str) -> Counter
     for res, pid, d in plans:
         result = db.execute(sa_text(_WRITE_DECISION_SQL), {
             "rid": res.id, "uid": res.user_id, "jid": res.job_id, "pid": pid,
+            "raw_pid": res.parcel_id, "job_status": job_status,
             "address": res.property_address,
             "owner": d.name if d.status == MATCHED else None,
             "payload": json.dumps(owner_payload(pid, d, checked_at)),

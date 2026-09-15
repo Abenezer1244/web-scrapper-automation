@@ -221,7 +221,8 @@ def test_a_multi_token_name_sharing_the_street_line_is_still_excised():
 
 def _lead(source):
     return SimpleNamespace(party_name=None, parcel_id="5000050810", property_address="1 A ST",
-                           enrichment_data={"source": source} if source else {})
+                           enrichment_data={"source_parcel": "5000050810",
+                                            **({"source": source} if source else {})})
 
 
 @pytest.mark.parametrize("source", [None, "pierce_recorder", "pierce_arms", "pierce_probate",

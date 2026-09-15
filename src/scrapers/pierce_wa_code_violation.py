@@ -264,6 +264,9 @@ class PierceWACodeViolationScraper(BridgeScraper):
                     "source": "tacoma_code_violations",
                     "case_number": case_num,
                     "violation_category": case_type or None,
+                    # The parcel as the source case carried it: owner naming requires
+                    # parcel_id to still equal it (pierce_atip_owner).
+                    "source_parcel": record.parcel_id,
                     "case_type": case_type,
                     "status": status,
                     "inspector": attr.get("inspector"),

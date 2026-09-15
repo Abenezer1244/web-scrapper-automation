@@ -61,6 +61,7 @@ _ELIGIBLE_ROW = """
   AND r.enrichment_data::jsonb->>'source' = 'tacoma_code_violations'
   AND (r.party_name IS NULL OR btrim(r.party_name) = '')
   AND btrim(r.parcel_id) ~ '^[0-9]{10}$'
+  AND r.enrichment_data::jsonb->>'source_parcel' = btrim(r.parcel_id)
   AND NOT (r.enrichment_data::jsonb ? 'owner_status')
   AND NOT (r.enrichment_data::jsonb ? 'owner_source')
   AND (CASE WHEN r.enrichment_data::jsonb->>'owner_recovery_attempts' ~ '^[0-9]{1,6}$'
@@ -90,7 +91,8 @@ _CANDIDATE_PARCELS_SQL = f"""
 """  # noqa: S608 -- splices only module constants; every value is bound
 
 _CANDIDATE_ROWS_SQL = f"""
-    SELECT r.id, r.user_id, r.job_id, btrim(r.parcel_id) AS parcel_id, r.property_address,
+    SELECT r.id, r.user_id, r.job_id, btrim(r.parcel_id) AS parcel_id,
+           r.parcel_id AS raw_parcel_id, r.property_address,
            r.enrichment_data::jsonb AS ed
     FROM results r
     JOIN jobs j ON j.id = r.job_id
@@ -216,9 +218,9 @@ def _tick(stats: dict, lock: tuple) -> dict:
         for pid in parcels:
             f = fetched.get(pid)
             for row in by_parcel[pid]:
-                # Re-proven before the first write and every 50 after: an expired lock
-                # means another tick may be writing, so this one stops (Codex r5).
-                if writes % 50 == 0 and not _still_own_lock(lock):
+                # Re-proven before EVERY write: an expired lock means another tick may
+                # be writing, so this one stops (Codex r5/r7).
+                if not _still_own_lock(lock):
                     stats["skipped"] = "tick lock lost before writing"
                     _logger.warning("Pierce CV owner recovery: %s", stats["skipped"])
                     return stats
@@ -265,6 +267,7 @@ def _write(db, row, payload: dict, owner: str | None, label: str) -> str:
     try:
         result = db.execute(sa_text(_WRITE_SQL), {
             "rid": row.id, "uid": row.user_id, "jid": row.job_id, "pid": row.parcel_id,
+            "raw_pid": row.raw_parcel_id, "job_status": "done",
             "address": row.property_address, "owner": owner,
             "payload": json.dumps(payload), "max_attempts": _MAX_ATTEMPTS,
         })

@@ -139,6 +139,7 @@ async def test_scraper_stores_no_label_as_party_and_keeps_the_case_fields(monkey
     assert rec_602.party_name is None
     assert rec_602.parcel_id == "2006120010"          # the real source parcel, unchanged
     assert rec_602.property_address == "602 AVE S"
+    assert rec_602.enrichment_data["source_parcel"] == "2006120010"
     ed = rec_602.enrichment_data
     assert ed["violation_category"] == "Derelict Building  - 2.01.060 (D)"
     assert ed["case_type"] == "Derelict Building  - 2.01.060 (D)"
@@ -415,7 +416,8 @@ def _cv_row(**over):
             "parcel_id": "2021110133", "property_address": "2117 AVE S",
             "mailing_address": "1550 140TH AVE NE STE 201, BELLEVUE, WA, 98005-4500",
             "property_city": "TACOMA", "property_state": "WA", "property_zip": "98402",
-            "enrichment_data": {"source": "tacoma_code_violations", "case_number": "60000303996"}}
+            "enrichment_data": {"source": "tacoma_code_violations", "case_number": "60000303996",
+                                "source_parcel": "2021110133"}}
     base.update(over)
     return SimpleNamespace(**base)
 
@@ -438,15 +440,21 @@ def test_a_rejected_decision_writes_a_status_and_no_owner_proof():
     d = _decide("2021110133", _rows(ATIP_2117), "2119 AVE S")
     assert pao.owner_payload("2021110133", d, "t") == {"owner_status": "address_mismatch",
                                                        "owner_checked_at": "t"}
-    decided = _cv_row(enrichment_data={"source": "tacoma_code_violations",
-                                       "owner_status": "address_mismatch"})
+    base = {"source": "tacoma_code_violations", "source_parcel": "2021110133"}
+    decided = _cv_row(enrichment_data={**base, "owner_status": "address_mismatch"})
     assert pao.owner_lookup_parcels([decided]) == {}       # never looked up again
     # A present-but-empty owner key is decided too, exactly as the SQL guard reads it.
     for ed in ({"owner_status": None}, {"owner_source": ""}):
-        row = _cv_row(enrichment_data={"source": "tacoma_code_violations", **ed})
+        row = _cv_row(enrichment_data={**base, **ed})
         assert pao.owner_lookup_parcels([row]) == {}
         assert pao.plan_owner_decisions({"2021110133": [row]}, {
             "2021110133": _found("2021110133", ATIP_2117)})[0] == []
+
+
+def test_a_parcel_that_is_not_the_source_cases_parcel_is_never_offered():
+    moved = _cv_row(parcel_id="2021110134")                # source_parcel still 2021110133
+    legacy = _cv_row(enrichment_data={"source": "tacoma_code_violations"})   # no provenance
+    assert pao.owner_lookup_parcels([moved, legacy]) == {}
 
 
 def test_a_lease_lost_between_pages_stops_before_the_next_request(monkeypatch, paces, clean_health,
@@ -478,7 +486,7 @@ def test_a_row_changed_since_selection_is_not_planned():
 
 @pytest.mark.parametrize("source", ["pierce_recorder", "pierce_arms", None, "seattle_sdci_code_violations"])
 def test_no_other_record_type_is_ever_offered_for_atip_naming(source):
-    ed = {"source": source} if source else {}
+    ed = {"source_parcel": "2021110133", **({"source": source} if source else {})}
     assert pao.owner_lookup_parcels([_cv_row(enrichment_data=ed)]) == {}
     with pytest.raises(ValueError, match="Tacoma code-violation"):
         pao.decide("2021110133", _found("2021110133", ATIP_2117), "2117 AVE S", source=source)
@@ -569,7 +577,7 @@ def test_a_task_time_limit_during_a_sweep_write_is_not_swallowed():
             return None
 
     row = SimpleNamespace(id="r", user_id="u", job_id="j", parcel_id="2021110133",
-                          property_address="2117 AVE S")
+                          raw_parcel_id="2021110133", property_address="2117 AVE S")
     with pytest.raises(SoftTimeLimitExceeded):
         rec._write(_KilledSession(), row, {}, None, "matched")
 
@@ -627,7 +635,8 @@ async def _stored(db, user, job_id, *, party, parcel="2021110133", address="2117
                   mailing_address="1550 140TH AVE NE STE 201, BELLEVUE, WA, 98005-4500",
                   dedup_hash=dedup, skip_trace_status="not_attempted", is_duplicate=is_duplicate,
                   enrichment_data=ed if ed is not None else {
-                      "source": "tacoma_code_violations", "case_number": "60000303996"}))
+                      "source": "tacoma_code_violations", "case_number": "60000303996",
+                      "source_parcel": parcel}))
     await db.commit()
     return rid, dedup
 
@@ -713,7 +722,10 @@ async def test_a_row_changed_while_the_portal_answers_is_never_named(
     "UPDATE scraper_configs SET user_id = (SELECT u.id FROM users u WHERE u.id <> "
     "(SELECT user_id FROM results WHERE id = :i) LIMIT 1) WHERE id = "
     "(SELECT j.scraper_config_id FROM jobs j JOIN results r ON r.job_id = j.id WHERE r.id = :i)",
-], ids=["parcel", "address", "party", "reclassified", "config_other_tenant"])
+    "UPDATE jobs SET status = 'cancelled' WHERE id = (SELECT job_id FROM results WHERE id = :i)",
+    "UPDATE results SET parcel_id = '2021110133 ' WHERE id = :i",
+], ids=["parcel", "address", "party", "reclassified", "config_other_tenant", "job_cancelled",
+        "parcel_whitespace"])
 async def test_the_write_itself_rejects_a_row_changed_after_the_decision(
     db, business_user, starter_user, redis_client, monkeypatch, paces, clean_health, change,
 ):

@@ -19,6 +19,8 @@ import re
 from collections import deque
 from dataclasses import dataclass
 
+from celery.exceptions import SoftTimeLimitExceeded, TimeLimitExceeded
+
 from src.api.middleware.security import add_scrape_domain
 from src.config import settings
 from src.scrapers.base_scraper import BridgeScraper
@@ -296,6 +298,8 @@ async def _fetch_king_owner(
                     return None, False
                 else:
                     return _extract_owner_name(r.text), False  # genuine result (name or miss)
+        except (SoftTimeLimitExceeded, TimeLimitExceeded):
+            raise  # the Celery worker is ending the task; not a transient county failure
         except Exception as exc:
             _logger.debug(
                 "Owner fetch error parcel=%s attempt=%d: %s", pid, attempt + 1, str(exc)[:160]

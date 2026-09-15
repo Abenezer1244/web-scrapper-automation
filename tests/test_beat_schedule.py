@@ -16,7 +16,8 @@ from celery.schedules import crontab, schedule
 from src.workers.scheduler import app
 
 _SLOW_S = 600
-_KING_SWEEPS = ("recover-deferred-mailing", "recover-deferred-owners", "recover-deferred-property")
+_KING_SWEEPS = ("recover-deferred-mailing", "recover-deferred-owners", "recover-deferred-property",
+                "recover-code-violation-owners")
 # Beat container start times read from the Railway beat deployment logs.
 _BOOTS = [datetime(2026, 9, 15, 0, 59, 20, tzinfo=UTC), datetime(2026, 9, 15, 1, 11, 56, tzinfo=UTC),
           datetime(2026, 9, 15, 1, 19, 35, tzinfo=UTC), datetime(2026, 9, 15, 1, 29, 25, tzinfo=UTC)]
@@ -104,7 +105,7 @@ def test_king_recovery_sweeps_never_share_or_crowd_a_minute():
 def test_king_recovery_sweeps_keep_their_cadence():
     per_hour = {name: len(app.conf.beat_schedule[name]["schedule"].minute) for name in _KING_SWEEPS}
     assert per_hour == {"recover-deferred-mailing": 6, "recover-deferred-owners": 4,
-                        "recover-deferred-property": 3}
+                        "recover-deferred-property": 3, "recover-code-violation-owners": 3}
 
 
 def test_beat_runs_in_utc():

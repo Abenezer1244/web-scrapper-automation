@@ -284,7 +284,8 @@ app.conf.beat_schedule = {
         # not reach. Bounded (120 parcels, 300 s), gated on source health and
         # OWNER_RECOVERY_ENABLED, shares the King source lease with every other
         # eRealProperty pass. Never bills, never creates a job, never enqueues a
-        # skip trace. Off the quarter hours so it does not start with the tax sweep.
+        # skip trace. At least 2 minutes from every other King sweep's start
+        # (tests/test_beat_schedule.py).
         "task": "src.workers.cv_owner_recovery.recover_code_violation_owners_task",
         "schedule": crontab(minute="18-59/20"),  # :18, :38, :58 every hour
     },

@@ -148,6 +148,10 @@ def arcgis_query_all(url: str, params: dict, *, page_size: int, what: str,
         rows.extend(f["attributes"] for f in features)
         if on_page is not None:
             on_page(page_num + 1, len(rows))
+        if not features and data.get("exceededTransferLimit"):
+            raise RuntimeError(
+                f"{what}: ArcGIS returned an empty page at offset {offset} while flagging more "
+                f"rows; aborting this source rather than returning a truncated result")
         if not features or (not data.get("exceededTransferLimit") and len(features) < page_size):
             return rows
         # Advance by what the server actually returned: a server that caps a page below

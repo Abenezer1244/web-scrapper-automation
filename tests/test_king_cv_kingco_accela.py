@@ -292,6 +292,10 @@ def test_a_page_that_did_not_advance_or_a_search_not_read_to_the_end_fails():
     with pytest.raises(ka.AccelaFormatError, match="not read to the end"):
         ka.rows_from_search([_snap(PAGE_100PLUS)], date(2026, 8, 15), date(2026, 9, 14))
     assert ka.rows_from_search([_snap(NO_RESULTS)], date(2030, 1, 1), date(2030, 1, 2)) == []
+    # A no-results page after results pages is a broken paging state, not the end.
+    with pytest.raises(ka.AccelaFormatError, match="no results range after earlier"):
+        ka.rows_from_search([_snap(PAGE1), _snap(PAGE2), _snap(PAGE3), _snap(NO_RESULTS)],
+                            date(2026, 9, 7), date(2026, 9, 14))
 
 
 def test_a_one_case_search_lands_on_the_detail_page():

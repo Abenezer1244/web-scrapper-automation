@@ -650,8 +650,12 @@ def rows_from_search(pages: Iterable[PageSnapshot], start: date, end: date) -> l
     out: list[GridRow] = []
     expected_first = 1
     page = None
-    for snap in pages:
+    for index, snap in enumerate(pages):
         page = parse_results_page(snap.html)
+        if index > 0 and page.showing is None:
+            raise AccelaFormatError(
+                f"{KINGCO_ACCELA}: results page {index + 1} has no results range after earlier "
+                f"results pages; paging did not continue the search")
         if page.showing is not None:
             if page.showing[0] != expected_first:
                 raise AccelaFormatError(

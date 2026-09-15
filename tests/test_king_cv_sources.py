@@ -248,6 +248,21 @@ async def test_a_server_that_caps_pages_below_the_page_size_skips_nothing(monkey
 
 
 @pytest.mark.asyncio
+async def test_an_empty_page_that_flags_more_rows_fails_the_source(monkeypatch, no_backoff):
+    monkeypatch.setattr(bellevue, "_PAGE_SIZE", BEL_PAGED["page_size"])
+    pages = BEL_PAGED["pages"]
+
+    def _answer(p):
+        if p["resultOffset"] == 3:
+            return {**pages["3"], "features": [], "exceededTransferLimit": True}
+        return pages[str(p["resultOffset"])]
+
+    monkeypatch.setattr(base, "safe_get", _ArcGIS(bellevue_query=_answer))
+    with pytest.raises(RuntimeError, match="empty page at offset 3"):
+        await bellevue.BellevueSource().fetch("09/01/2026", "09/14/2026")
+
+
+@pytest.mark.asyncio
 async def test_bellevue_window_is_the_pacific_day_and_both_edges_are_kept(monkeypatch):
     monkeypatch.setattr(base, "safe_get", _ArcGIS(bellevue_query=_bellevue_full))
     recs = await bellevue.BellevueSource().fetch("07/16/2026", "07/20/2026")

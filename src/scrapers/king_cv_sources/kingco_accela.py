@@ -442,17 +442,24 @@ def check_paging_budget(page: ResultsPage, deadline: float) -> None:
             f"run a shorter date range")
 
 
-async def wait_or_wall(page, waiting) -> None:
-    """Await a wait for page structure; when it fails, a wall on the page is the reason.
+async def wait_or_wall(get_page, waiting):
+    """Await a portal step; when it fails, a wall on the page is the reason.
 
-    A login, captcha or terms page never shows the grid or case number, so the wait would
-    time out and be retried like a slow page. Checking the page when the wait fails
-    raises AccelaAccessWallError instead, which is never retried.
+    A login, captcha or terms page never shows the form, grid or case number, so any
+    step (a selector wait, a form fill, a postback) would fail like a slow page and be
+    retried. Checking the page when a step fails raises AccelaAccessWallError instead,
+    which is never retried. ``get_page`` is read at failure time (a search replaces the
+    browser context). When the page cannot be read, the step's own error stands.
     """
     try:
-        await waiting
-    except Exception:
-        ensure_no_wall(PageSnapshot(url=page.url, html=await page.content()))
+        return await waiting
+    except Exception as exc:
+        page = get_page()
+        try:
+            snap = PageSnapshot(url=page.url, html=await page.content())
+        except Exception:  # noqa: BLE001 -- no readable page: the step's error stands
+            raise exc from None
+        ensure_no_wall(snap)
         raise
 
 
@@ -490,6 +497,10 @@ class AccelaPortal(BridgeScraper):
         await self.page.wait_for_load_state("networkidle", timeout=timeout)
 
     async def search(self, start: date, end: date) -> list[PageSnapshot]:
+        """Every results page for cases opened start..end; a wall at any step raises it."""
+        return await wait_or_wall(lambda: self.page, self._search(start, end))
+
+    async def _search(self, start: date, end: date) -> list[PageSnapshot]:
         """Every results page for cases opened start..end, in a new server session."""
         timeout = settings.DEFAULT_TIMEOUT * 1000
         await self.reset_context()
@@ -518,8 +529,8 @@ class AccelaPortal(BridgeScraper):
 
         await self._postback(lambda: self.page.click(SEL_SEARCH))
         # One match skips the grid and lands on that case's detail page.
-        await wait_or_wall(self.page, self.page.wait_for_selector(
-            f"{SEL_GRID}, {SEL_NO_RESULTS}, {SEL_DETAIL_CASE}", timeout=timeout))
+        await self.page.wait_for_selector(
+            f"{SEL_GRID}, {SEL_NO_RESULTS}, {SEL_DETAIL_CASE}", timeout=timeout)
         pages = [await self._snapshot()]
         if is_detail_page(pages[0]):
             return pages
@@ -532,22 +543,25 @@ class AccelaPortal(BridgeScraper):
             # The postback settles before the grid is swapped in (verified live: a
             # snapshot taken at networkidle was still the previous page), so wait for
             # the "Showing" range to move past the page we already have.
-            await wait_or_wall(self.page, self.page.wait_for_function(
+            await self.page.wait_for_function(
                 """([grid, last]) => {
                     const g = document.querySelector(grid);
                     const m = g && g.innerText.match(/Showing\\s+(\\d+)\\s*-\\s*\\d+/);
                     return m !== null && Number(m[1]) > last;
                 }""",
                 arg=[SEL_GRID, current.showing[1] if current.showing else 0],
-                timeout=timeout))
+                timeout=timeout)
             pages.append(await self._snapshot())
         raise AccelaFormatError(f"{KINGCO_ACCELA}: hit the {MAX_PAGES}-page guard")
 
     async def case_detail(self, path: str) -> PageSnapshot:
+        return await wait_or_wall(lambda: self.page, self._case_detail(path))
+
+    async def _case_detail(self, path: str) -> PageSnapshot:
         timeout = settings.DEFAULT_TIMEOUT * 1000
         await self._pace()
         await self.safe_goto(detail_url(path), wait_until="domcontentloaded", timeout_ms=timeout)
-        await wait_or_wall(self.page, self.page.wait_for_selector(SEL_DETAIL_CASE, timeout=timeout))
+        await self.page.wait_for_selector(SEL_DETAIL_CASE, timeout=timeout)
         return await self._snapshot()
 
 

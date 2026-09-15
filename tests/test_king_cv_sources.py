@@ -562,6 +562,12 @@ def test_stored_upstream_labels_are_collapsed_and_capped():
         assert label(3389900395) == "3389900395"
 
 
+def test_burien_case_id_is_kept_only_when_it_is_a_whole_number():
+    assert [burien._integral(v) for v in (35072, 35072.0, 35072.5, float("nan"), float("inf"),
+                                          "35072", True, None)] == [
+        35072, 35072, None, None, None, None, None, None]
+
+
 def test_a_connector_without_sources_is_refused():
     with pytest.raises(ValueError, match="at least one source"):
         kcv.KingWACodeViolationScraper(sources=[])

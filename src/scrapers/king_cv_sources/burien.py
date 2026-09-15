@@ -19,6 +19,7 @@ Quirks verified live on 2026-09-14:
 from __future__ import annotations
 
 import hashlib
+import math
 import re
 from datetime import date, datetime
 
@@ -51,6 +52,17 @@ def label(value: object) -> str | None:
     """An upstream label as stored: whitespace collapsed, capped at LABEL_MAX, or None."""
     text = " ".join(str(value).split())[:LABEL_MAX] if value is not None else ""
     return text or None
+
+
+def _integral(value: object) -> int | None:
+    """A whole-number id, or None for anything else (fractions, NaN, infinity, text)."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and math.isfinite(value) and value.is_integer():
+        return int(value)
+    return None
 
 
 def _parse_date(value: object) -> date | None:
@@ -118,7 +130,7 @@ class BurienSource(CodeViolationSource):
                 "source": self.key,
                 "case_number": case,
                 # Cityworks' numeric id, for looking the case up with the city.
-                "case_id": int(case_id) if isinstance(case_id, (int, float)) else None,
+                "case_id": _integral(case_id),
                 "status": label(attrs.get("CaseStatus")),
                 # Burien publishes no violation category.
                 "violation_category": None,

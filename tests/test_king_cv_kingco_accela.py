@@ -425,10 +425,23 @@ async def _timed_out():
 async def test_a_wait_that_times_out_on_a_wall_raises_the_wall_not_a_retryable_timeout():
     login = _LandedPage("https://aca-prod.accela.com/KINGCO/Login.aspx", LOGIN)
     with pytest.raises(ka.AccelaAccessWallError, match="login page"):
-        await ka.wait_or_wall(login, _timed_out())
+        await ka.wait_or_wall(lambda: login, _timed_out())
     # A slow normal page keeps its timeout, which the source retries.
     with pytest.raises(TimeoutError):
-        await ka.wait_or_wall(_LandedPage(_SEARCH, NO_RESULTS), _timed_out())
+        await ka.wait_or_wall(lambda: _LandedPage(_SEARCH, NO_RESULTS), _timed_out())
+
+    # Any portal step (a form fill, a postback) is covered, and an unreadable page keeps
+    # the step's own error.
+    class _Gone:
+        url = _SEARCH
+
+        async def content(self):
+            raise RuntimeError("Target page, context or browser has been closed")
+
+    with pytest.raises(TimeoutError):
+        await ka.wait_or_wall(lambda: _Gone(), _timed_out())
+    assert ka.AccelaPortal.search is not ka.AccelaPortal._search
+    assert ka.AccelaPortal.case_detail is not ka.AccelaPortal._case_detail
 
 
 def test_a_captcha_or_terms_acceptance_control_is_a_wall():

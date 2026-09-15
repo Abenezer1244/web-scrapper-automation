@@ -31,11 +31,22 @@ _GIS_COMMIT_BATCH = 500
 # token inside the street (house numbers, road numbers).
 _TRAILING_ZIP_RE = re.compile(r"\b(\d{5})(?:-\d{4})?\s*$")
 
-# Code-violation statuses never sent to a paid skip trace on ANY source (the original
-# 2026-09-13 gate, which Tacoma rows also pass through). Per-source settled statuses,
-# including King County Accela's voided and no-violation cases, are added by
-# src/scrapers/king_cv_sources.is_settled.
+# Code-violation statuses never sent to a paid skip trace on a source that is NOT a King
+# code-violation source (the original 2026-09-13 gate, which Tacoma rows still pass
+# through unchanged). A King source follows only its own list in
+# src/scrapers/king_cv_sources.SETTLED_STATUSES, the list the plan cap ranks by.
 SETTLED_COMPLAINT_STATUSES = frozenset({"Completed", "Open Duplicate"})
+
+
+def _is_settled_complaint(ed: object) -> bool:
+    from src.scrapers.king_cv_sources import SETTLED_STATUSES, is_settled
+
+    if not isinstance(ed, dict) or not isinstance(ed.get("status"), str):
+        return False
+    source = ed.get("source")
+    if isinstance(source, str) and source in SETTLED_STATUSES:
+        return is_settled(source, ed["status"])
+    return ed["status"] in SETTLED_COMPLAINT_STATUSES
 
 # King tax owner-name state, per lead, in enrichment_data. The owner name is the
 # field these leads lose most (eRealProperty is the only source, one page per
@@ -2006,15 +2017,7 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config) -> None:
     # 2026-09-13). Exact status values; "Closed" is deliberately still traced. A King County
     # Accela case voided or closed with no violation is settled the same way.
     if config.record_type == "code_violation":
-        from src.scrapers.king_cv_sources import is_settled
-
-        settled_rows = [
-            rec for rec in eligible
-            if isinstance(rec.enrichment_data, dict)
-            and isinstance(rec.enrichment_data.get("status"), str)
-            and (rec.enrichment_data["status"] in SETTLED_COMPLAINT_STATUSES
-                 or is_settled(rec.enrichment_data.get("source"), rec.enrichment_data["status"]))
-        ]
+        settled_rows = [rec for rec in eligible if _is_settled_complaint(rec.enrichment_data)]
         if settled_rows:
             _settled_ids = {rec.id for rec in settled_rows}
             eligible = [rec for rec in eligible if rec.id not in _settled_ids]

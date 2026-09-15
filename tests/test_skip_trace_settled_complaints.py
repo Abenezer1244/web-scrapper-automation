@@ -47,6 +47,11 @@ async def _lead(db, user: User, job_id: str, complaint_status: str | None,
         ed = {"source": source, "record_number": f"{random.randint(1, 999999):06d}-26CP",
               "kc_pin": pin, "kc_pin_status": "matched", "kc_pin_source": "king_gis_point_in_parcel",
               "kc_pin_match": "exact", "owner_source": "king_erealproperty", "owner_pin": pin}
+    elif source == "tacoma_code_violations":
+        # Tacoma's owner proof is the Pierce ATIP pass, matched on the row's parcel_id.
+        parcel_id = pin
+        ed = {"source": source, "case_number": f"CV{random.randint(1, 999999):06d}",
+              "owner_source": "pierce_atip", "owner_status": "matched", "owner_pin": pin}
     else:
         # Bellevue, Burien and King County Accela print the PIN into parcel_id at scrape.
         parcel_id = pin
@@ -118,14 +123,34 @@ async def test_accela_voided_and_no_violation_cases_are_not_queued(db, business_
     intake = await _lead(db, business_user, job_id, "Intake Processing", accela)
     bellevue_closed = await _lead(db, business_user, job_id, "Closed", "bellevue_code_enforcement")
     burien_closed = await _lead(db, business_user, job_id, "CLOSED", "burien_code_enforcement")
-    # Accela's settled words are scoped to Accela.
+    # Settled words are scoped by source: Accela's on Bellevue, SDCI's on Accela and Burien
+    # (the plan cap ranks these as ordinary cases, so they must be traced like one).
     bellevue_void = await _lead(db, business_user, job_id, "Void", "bellevue_code_enforcement")
+    accela_completed = await _lead(db, business_user, job_id, "Completed", accela)
+    burien_duplicate = await _lead(db, business_user, job_id, "Open Duplicate", "burien_code_enforcement")
+    # Any other source keeps the original any-source gate (Tacoma).
+    tacoma_completed = await _lead(db, business_user, job_id, "Completed", "tacoma_code_violations")
+    tacoma_open = await _lead(db, business_user, job_id, "Open", "tacoma_code_violations")
 
     _enqueue(job_id)
 
     queued = await _queued_for(db, job_id)
-    assert set(settled).isdisjoint(queued)
-    assert {open_case, intake, bellevue_closed, burien_closed, bellevue_void} <= queued
+    assert set(settled).isdisjoint(queued) and tacoma_completed not in queued
+    assert {open_case, intake, bellevue_closed, burien_closed, bellevue_void, accela_completed,
+            burien_duplicate, tacoma_open} <= queued
+
+
+def test_settled_check_never_raises_on_malformed_json():
+    from src.scrapers.king_cv_sources import is_settled, settled_sql
+    from src.workers.tasks_helpers.enrich import _is_settled_complaint
+
+    assert is_settled(["kingco_accela_code_enforcement"], "Void") is False
+    assert is_settled("kingco_accela_code_enforcement", {"Void": 1}) is False
+    assert _is_settled_complaint({"source": {"a": 1}, "status": "Void"}) is False
+    assert _is_settled_complaint({"source": ["x"], "status": "Completed"}) is True
+    assert _is_settled_complaint(["not", "a", "dict"]) is False
+    with pytest.raises(ValueError):
+        settled_sql("enrichment_data) OR (1=1")
 
 
 async def test_the_gate_is_scoped_to_code_violations(db, business_user, skip_trace_on):

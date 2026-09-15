@@ -228,6 +228,35 @@ async def test_leads_that_are_not_eligible_are_never_looked_up_or_written(
         assert (await _get(db, rid)).enrichment_data == before[rid]
 
 
+async def test_rows_from_sources_that_print_the_parcel_are_never_named_by_the_sweep(
+    db, business_user, monkeypatch,
+):
+    # Bellevue, Burien and King County Accela rows carry the printed PIN in parcel_id, and
+    # skip trace trusts their owner only when owner_pin equals that parcel_id. The sweep
+    # keys on kc_pin, so it must never write an owner onto them, even one whose kc_pin
+    # block looks located (e.g. a row that arrived without a parcel but with coordinates).
+    from src.scrapers.king_cv_sources import PARCEL_AT_SCRAPE_SOURCES
+
+    _lease(monkeypatch)
+    asked = _county(monkeypatch, {})
+    job_id = await _job(db, business_user)
+    ids = []
+    for n, source in enumerate(sorted(PARCEL_AT_SCRAPE_SOURCES)):
+        pin = f"20000000{n:02d}"
+        rid = await _row(db, business_user, job_id, pin=pin, ed={**_located(pin), "source": source})
+        await db.execute(text("UPDATE results SET parcel_id = :p WHERE id = :i"),
+                         {"p": pin, "i": rid})
+        ids.append(rid)
+    await db.commit()
+    before = {rid: tuple(await _get(db, rid)) for rid in ids}
+
+    stats = await asyncio.to_thread(_tick)
+
+    assert asked == [] and stats["parcels"] == 0
+    for rid in ids:
+        assert tuple(await _get(db, rid)) == before[rid]
+
+
 async def test_a_blank_party_name_is_treated_as_unnamed(db, business_user, monkeypatch):
     _lease(monkeypatch)
     job_id = await _job(db, business_user)

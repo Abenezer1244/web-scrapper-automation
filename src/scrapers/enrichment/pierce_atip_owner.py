@@ -22,18 +22,22 @@ enrichment_data.source is the Tacoma code-violation source. The gate is
 HOW
 ---
 One normal headless browser page view per parcel: the ATIP property page loads and the
-portal's own code calls `/api/pcAtipSummary` with its own invisible reCAPTCHA. We read
-that response. No captcha solver, no direct token handling, and never any key the
-portal exposes. The response classes and the stop rules are pierce_atip's (an empty
-body is a rejected verification; restart the session ONCE, then stop; three hard
-failures in a row stop the batch and put the source in cooldown).
+portal's own code calls `/api/pcAtipSummary` (taxpayer) and `/api/apprAccount/<parcel>`
+(the Assessor's appraisal account) with its own invisible reCAPTCHA. We read those two
+responses. No captcha solver, no direct token handling, and never any key the portal
+exposes. The response classes and the stop rules are pierce_atip's (an empty body is a
+rejected verification; restart the session ONCE, then stop; three hard failures in a
+row stop the batch and put the source in cooldown). A taxpayer answer whose appraisal
+account did not arrive is a hard failure (retried), never a guess.
 
 A name is accepted only when ALL hold (anything else stores a terminal status and names
 nobody):
-  * the row echoes the parcel we asked for;
-  * the account is Real Property (not Personal Property, not a mobile home);
-  * it is not a reference record (a condominium master parcel, whose "taxpayer" is the
-    placeholder REFERENCE, not the unit owner);
+  * both answers echo the parcel we asked for;
+  * the taxpayer account is Real Property (not Personal Property, not a mobile home);
+  * it is not a reference record: the appraisal account type is authoritative
+    ("Reference" is the condominium master parcel, verified on 2000050082 "35 BROADWAY
+    CONDOS", whose "taxpayer" is the placeholder REFERENCE, not the unit owner), and a
+    REFERENCE marker or unknown use code in the taxpayer record also fails closed;
   * the ATIP situs is the lead's address after Tacoma normalization: Tacoma's layer
     drops the word TACOMA from street names ("2117 AVE S" is 2117 TACOMA AVE S), the
     county writes multi-address parcels as ranges ("602 TO 610 TACOMA AVE S") and
@@ -92,17 +96,24 @@ _PAGE_TIMEOUT_S = 45.0
 _FETCH_TIMEOUT_S = _PAGE_TIMEOUT_S + 5.0   # hard bound around the whole page view
 _SESSION_START_S = 30.0
 _SESSION_CLOSE_S = 15.0
+# The appraisal account call follows the summary within the same page load (measured
+# live: same second); this is how long we wait for it after the summary arrived.
+_ACCOUNT_WAIT_S = 10.0
 _TIME_LIMITS = ("SoftTimeLimitExceeded", "TimeLimitExceeded")
-
-
-class _LeaseLostError(Exception):
-    """The Pierce owner lease is no longer ours: stop before the next request."""
 _MAX_HARD_FAILURES = 3
 _LEASE_WAIT_S = 30.0
 _NAME_MAX = 512
 
+
+class _LeaseLostError(Exception):
+    """The Pierce owner lease is no longer ours: stop before the next request."""
+
+
+
 _PARCEL_RE = re.compile(r"^\d{10}$")
 _REAL_PROPERTY = "REAL PROPERTY"
+_REFERENCE_ACCOUNT = "REFERENCE"      # apprAccount.acctType of a condominium master parcel
+_ACCOUNT_PATH = "/api/apprAccount"
 _REFERENCE_WORD_RE = re.compile(r"\bREFERENCE\b")
 # "633 TO 649 DIVISION AVE": a parcel carrying a range of house numbers.
 _RANGE_RE = re.compile(r"^(\d+)\s+TO\s+(\d+)\s+(.+)$")
@@ -205,29 +216,41 @@ class OwnerDecision:
     name: str | None = None
 
 
-def decide(parcel: str, rows: list[dict] | None, lead_address: str | None, *,
+@dataclass
+class Fetched:
+    kind: str                         # FOUND | NOT_FOUND
+    rows: list[dict] | None           # the pcAtipSummary body
+    account: dict | None = None       # the apprAccount body (FOUND answers only)
+
+
+def decide(parcel: str, fetched: Fetched, lead_address: str | None, *,
            source: object) -> OwnerDecision:
     """Apply every acceptance rule to one ATIP answer for one lead.
 
-    `rows` is the classified summary body: [] (or None) when the parcel is not on
-    record. The name leaves this function only inside a MATCHED decision. `source` is
-    the lead's enrichment_data.source: the 2026-09-14 clearance covers Tacoma code
-    violations only, so any other lead is refused here, not just by the callers.
+    `fetched.rows` is the classified summary body ([] or None when the parcel is not on
+    record) and `fetched.account` the appraisal account. The name leaves this function
+    only inside a MATCHED decision. `source` is the lead's enrichment_data.source: the
+    2026-09-14 clearance covers Tacoma code violations only, so any other lead is
+    refused here, not just by the callers.
     """
     if source != TACOMA_CV_SOURCE:
         raise ValueError("ATIP taxpayer names are cleared for Tacoma code-violation leads only")
+    rows = fetched.rows
     if not rows:
         return OwnerDecision(NOT_ON_RECORD)
     echoed = [r for r in rows if _clean(r.get("parcel_number")) == parcel]
-    if len(echoed) != 1:
-        # Nothing for the parcel we asked for, or an ambiguous answer: never guess.
+    account = fetched.account if isinstance(fetched.account, dict) else {}
+    if (len(echoed) != 1 or _clean(account.get("id")) != parcel
+            or _clean(account.get("accountNo")) != parcel):
+        # Nothing for the parcel we asked for, an ambiguous answer, or no appraisal
+        # account proving what kind of parcel this is: never guess.
         return OwnerDecision(PARCEL_MISMATCH)
     row = echoed[0]
     if _clean(row.get("acct_type")).upper() != _REAL_PROPERTY:
         return OwnerDecision(NOT_REAL_PROPERTY)
     name = _clean(row.get("name"))
     situs = _clean(row.get("situs"))
-    if _is_reference_record(row):
+    if _clean(account.get("acctType")).upper() == _REFERENCE_ACCOUNT or _is_reference_record(row):
         return OwnerDecision(REFERENCE_PARCEL)
     if not situs_agrees(lead_address, situs):
         return OwnerDecision(ADDRESS_MISMATCH)
@@ -262,21 +285,54 @@ def _new_session():
     return BridgeScraper()
 
 
-async def _fetch_summary(session, parcel: str) -> tuple[int, str]:
-    """(HTTP status, body) of the summary call the ATIP page itself makes for `parcel`."""
-    page_url = f"https://{ATIP_HOST}/app/v2/propertyDetail/{parcel}/summary"
-    async with session.page.expect_response(
-        lambda resp: _summary_is_for(resp.url, parcel), timeout=_PAGE_TIMEOUT_S * 1000,
-    ) as info:
-        await session.safe_goto(page_url, timeout_ms=int(_PAGE_TIMEOUT_S * 1000))
-    resp = await info.value
-    return resp.status, await resp.text()
+def _account_is_for(url: str, parcel: str) -> bool:
+    """Exactly https://atip.piercecountywa.gov/api/apprAccount/<parcel>, no query."""
+    try:
+        u = urlparse(url)
+        port = u.port
+    except ValueError:
+        return False
+    return (u.scheme == "https" and u.hostname == _SUMMARY.hostname and port is None
+            and u.path == f"{_ACCOUNT_PATH}/{parcel}" and not u.query and not u.params
+            and not u.fragment and not u.username and not u.password)
 
 
-@dataclass
-class Fetched:
-    kind: str                 # FOUND | NOT_FOUND
-    rows: list[dict] | None
+async def _fetch_summary(session, parcel: str) -> tuple[tuple[int, str], tuple[int, str] | None]:
+    """((status, body) of the summary call, (status, body) of the appraisal-account call or
+    None) that the ATIP property page itself makes for `parcel`."""
+    page = session.page
+    account_resp: asyncio.Future = asyncio.get_running_loop().create_future()
+
+    def _on_response(resp) -> None:
+        if not account_resp.done() and _account_is_for(resp.url, parcel):
+            account_resp.set_result(resp)
+
+    page.on("response", _on_response)  # registered BEFORE navigation: nothing is missed
+    try:
+        page_url = f"https://{ATIP_HOST}/app/v2/propertyDetail/{parcel}/summary"
+        async with page.expect_response(
+            lambda resp: _summary_is_for(resp.url, parcel), timeout=_PAGE_TIMEOUT_S * 1000,
+        ) as info:
+            await session.safe_goto(page_url, timeout_ms=int(_PAGE_TIMEOUT_S * 1000))
+        resp = await info.value
+        summary = (resp.status, await resp.text())
+        try:
+            acct = await asyncio.wait_for(asyncio.shield(account_resp), timeout=_ACCOUNT_WAIT_S)
+        except TimeoutError:
+            return summary, None
+        return summary, (acct.status, await acct.text())
+    finally:
+        page.remove_listener("response", _on_response)
+
+
+def _parse_account(answer: tuple[int, str] | None) -> dict | None:
+    if answer is None or answer[0] != 200:
+        return None
+    try:
+        data = json.loads(answer[1])
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def _new_stats() -> dict:
@@ -327,15 +383,14 @@ async def _lookup(parcels: list[str], *, pace_s: float, deadline: float | None,
             stats["outcome"] = "session_failed"
             return None
 
-    async def _one(pid: str) -> tuple[str, list | None]:
+    async def _one(pid: str) -> tuple[str, list | None, dict | None]:
         # Re-proven right before the navigation: the lease must still be ours after
         # the pause and any browser start (Codex r2 P2).
         if not admission.still_held():
             raise _LeaseLostError
         try:
-            status, body = await asyncio.wait_for(_fetch_summary(session, pid),
-                                                  timeout=_FETCH_TIMEOUT_S)
-            return classify_response(status, body)
+            (status, body), account_answer = await asyncio.wait_for(
+                _fetch_summary(session, pid), timeout=_FETCH_TIMEOUT_S)
         except BaseException as exc:
             if type(exc).__name__ in _TIME_LIMITS:
                 _audit(pid, "time_limit")  # the task is being killed mid-lookup
@@ -344,7 +399,14 @@ async def _lookup(parcels: list[str], *, pace_s: float, deadline: float | None,
                 raise
             _logger.warning("pierce_atip_owner page failed for parcel %s: %s",
                             pid, type(exc).__name__)
-            return HARD_FAILURE, None
+            return HARD_FAILURE, None, None
+        kind, rows = classify_response(status, body)
+        account = _parse_account(account_answer)
+        if kind == FOUND and account is None:
+            # A taxpayer answer without the appraisal account cannot prove the parcel is
+            # not a condominium master: retried, never decided (Codex r5 P1).
+            return HARD_FAILURE, None, None
+        return kind, rows, account
 
     try:
         for i, pid in enumerate(parcels):
@@ -358,7 +420,7 @@ async def _lookup(parcels: list[str], *, pace_s: float, deadline: float | None,
             if i:
                 await asyncio.sleep(pace_s)
             try:
-                kind, rows = await _one(pid)
+                kind, rows, account = await _one(pid)
             except _LeaseLostError:
                 stats["outcome"] = "lease_lost"
                 return
@@ -381,7 +443,7 @@ async def _lookup(parcels: list[str], *, pace_s: float, deadline: float | None,
                     return
                 await asyncio.sleep(pace_s)
                 try:
-                    kind, rows = await _one(pid)
+                    kind, rows, account = await _one(pid)
                 except _LeaseLostError:
                     stats["transient"].append(pid)
                     stats["outcome"] = "lease_lost"
@@ -409,7 +471,7 @@ async def _lookup(parcels: list[str], *, pace_s: float, deadline: float | None,
                 stats["not_on_record"].append(pid)
                 _audit(pid, "not_on_record")
             elif kind == FOUND:
-                out[pid] = Fetched(FOUND, rows)
+                out[pid] = Fetched(FOUND, rows, account)
                 stats["found"].append(pid)
                 _audit(pid, "found")
         stats["outcome"] = "complete"
@@ -546,7 +608,7 @@ def plan_owner_decisions(pin_map: dict[str, list], fetched: dict[str, Fetched]
             if not _still_needs_owner(res, pid):
                 counts["stale"] += 1
                 continue
-            plans.append((res, pid, decide(pid, f.rows, res.property_address,
+            plans.append((res, pid, decide(pid, f, res.property_address,
                                            source=res.enrichment_data.get("source"))))
     return plans, counts
 

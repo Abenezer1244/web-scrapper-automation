@@ -88,6 +88,16 @@ ATIP_MOBILE_HOME = ('[{"parcel_number":"5000050810","acct_type":"Mobile Home","s
 ATIP_UNKNOWN_PARCEL = "[]"          # 9999999999
 ATIP_VERIFICATION_REJECTED = ""    # the portal's answer to an unverified session
 
+# ── Real ATIP /api/apprAccount/<parcel> bodies from the same page loads ─────────
+ACCOUNTS = {
+    "2021110133": '{"id":"2021110133","appraiser":"JIP","landNetAcres":0,"utlElectric":"POWER INSTALLED","viewQual":"View Lim","landGrossFf":0,"landGrossAcres":3,"acctType":"Commercial","certCode":"1","landNetSf":14625,"parcelNb":"2021110133","landWidth":null,"wfType":null,"latitude":47,"groupAccountNo":"829690359","bldgs":0,"appraisalDate":"2023-01-20T21:58:52Z","landDepth":0,"landGrossSf":147940,"longitude":-122,"utlWater":"WATER INSTALLED","zoning":"TAC - WR","lea":"2074","approach":"Cost","specialUse":null,"businessName":null,"floodFringe":null,"streetType":"PAVED","utlSewer":"SEWER/SEPTIC INSTALLED","landVacant":1,"valueArea":"PI4","accountNo":"2021110133"}',  # noqa: E501
+    "2006120010": '{"id":"2006120010","appraiser":"JNP","landNetAcres":0,"utlElectric":"POWER AVAILABLE","viewQual":"View Avg","landGrossFf":125,"landGrossAcres":0,"acctType":"Commercial","certCode":"7","landNetSf":16250,"parcelNb":"2006120010","landWidth":0,"wfType":null,"latitude":47,"groupAccountNo":null,"bldgs":1,"appraisalDate":"2026-03-18T18:27:00Z","landDepth":0,"landGrossSf":16250,"longitude":-122,"utlWater":"WATER AVAILABLE","zoning":"TAC - DR","lea":"2071","approach":"Cost","specialUse":null,"businessName":null,"floodFringe":null,"streetType":"PAVED","utlSewer":"SEWER AVAILABLE","landVacant":0,"valueArea":"PI1","accountNo":"2006120010"}',  # noqa: E501
+    "2030120032": '{"id":"2030120032","appraiser":"JNP","landNetAcres":0,"utlElectric":"POWER INSTALLED","viewQual":null,"landGrossFf":0,"landGrossAcres":0,"acctType":"Commercial","certCode":"1","landNetSf":29728,"parcelNb":"2030120032","landWidth":0,"wfType":null,"latitude":47,"groupAccountNo":"874576375","bldgs":1,"appraisalDate":"2024-05-10T19:23:19Z","landDepth":0,"landGrossSf":43178,"longitude":-122,"utlWater":"WATER INSTALLED","zoning":"TAC - NCX","lea":"2045","approach":"Market","specialUse":null,"businessName":"STADIUM THRIFTWAY","floodFringe":0,"streetType":"PAVED","utlSewer":"SEWER/SEPTIC INSTALLED","landVacant":0,"valueArea":"PI5","accountNo":"2030120032"}',  # noqa: E501
+    "0320011115": '{"id":"0320011115","appraiser":"WJN","landNetAcres":10,"utlElectric":"POWER AVAILABLE","viewQual":null,"landGrossFf":0,"landGrossAcres":80,"acctType":"Industrial","certCode":"4","landNetSf":470052,"parcelNb":"0320011115","landWidth":null,"wfType":null,"latitude":47,"groupAccountNo":"842468953","bldgs":0,"appraisalDate":"2023-07-18T07:00:00Z","landDepth":0,"landGrossSf":3517866,"longitude":-122,"utlWater":"WATER AVAILABLE","zoning":"TAC - M2","lea":"4084","approach":"Cost","specialUse":null,"businessName":null,"floodFringe":null,"streetType":"PAVED","utlSewer":"SEWER AVAILABLE","landVacant":0,"valueArea":"PI4","accountNo":"0320011115"}',  # noqa: E501
+    "2000050082": '{"id":"2000050082","appraiser":"HDP","landNetAcres":null,"utlElectric":null,"viewQual":null,"landGrossFf":0,"landGrossAcres":0,"acctType":"Reference","certCode":"6","landNetSf":null,"parcelNb":"2000050082","landWidth":0,"wfType":null,"latitude":47,"groupAccountNo":"25483","bldgs":0,"appraisalDate":"2022-09-01T07:00:00Z","landDepth":0,"landGrossSf":0,"longitude":-122,"utlWater":null,"zoning":"TAC - DR","lea":"2074","approach":"Market","specialUse":null,"businessName":"35 BROADWAY CONDOS","floodFringe":null,"streetType":null,"utlSewer":null,"landVacant":0,"valueArea":"PI4","accountNo":"2000050082"}',  # noqa: E501
+    "5000050810": '{"id":"5000050810","appraiser":"HDP ","landNetAcres":null,"utlElectric":"POWER INSTALLED","viewQual":null,"landGrossFf":0,"landGrossAcres":0,"acctType":"Mobile Home","certCode":"7","landNetSf":null,"parcelNb":"0419203047","landWidth":0,"wfType":null,"latitude":47,"groupAccountNo":null,"bldgs":1,"appraisalDate":"2020-12-29T19:54:36Z","landDepth":0,"landGrossSf":0,"longitude":-122,"utlWater":"WATER INSTALLED","zoning":null,"lea":"071304","approach":"Cost","specialUse":null,"businessName":"HIDDEN GLEN ESTATES","floodFringe":null,"streetType":"PAVED","utlSewer":"SEWER/SEPTIC INSTALLED","landVacant":0,"valueArea":"PI2","accountNo":"5000050810"}',  # noqa: E501
+}
+
 
 def _rows(body: str) -> list[dict]:
     return json.loads(body)
@@ -104,8 +114,17 @@ class _Resp:
         return None
 
 
-def _decide(parcel, rows, address):
-    return pao.decide(parcel, rows, address, source="tacoma_code_violations")
+def _found(parcel, body, account_parcel=None):
+    """The Fetched a real page load produces: summary rows plus that parcel's account."""
+    acct = ACCOUNTS.get(account_parcel or parcel)
+    return pao.Fetched("found", _rows(body), json.loads(acct) if acct else None)
+
+
+def _decide(parcel, rows, address, account=None):
+    acct = account if account is not None else (
+        json.loads(ACCOUNTS[parcel]) if parcel in ACCOUNTS else None)
+    return pao.decide(parcel, pao.Fetched("found", rows, acct), address,
+                      source="tacoma_code_violations")
 
 
 # ── Scraper semantics ──────────────────────────────────────────────────────────
@@ -224,6 +243,29 @@ def test_two_rows_for_the_asked_parcel_are_ambiguous():
         "parcel_mismatch"
 
 
+def test_both_answers_must_echo_the_asked_parcel():
+    account = json.loads(ACCOUNTS["2021110133"])
+    # Taxpayer answer for another parcel, appraisal account for the asked one.
+    other_row = dict(_rows(ATIP_2117)[0], parcel_number="2021110134")
+    assert _decide("2021110133", [other_row], "2117 AVE S", account=account).status == \
+        "parcel_mismatch"
+    # Taxpayer answer for the asked parcel, appraisal account for another one.
+    for key in ("id", "accountNo"):
+        foreign = dict(account, **{key: "2021110134"})
+        assert _decide("2021110133", _rows(ATIP_2117), "2117 AVE S", account=foreign).status == \
+            "parcel_mismatch"
+    # No appraisal account at all proves nothing.
+    assert pao.decide("2021110133", pao.Fetched("found", _rows(ATIP_2117), None), "2117 AVE S",
+                      source="tacoma_code_violations").status == "parcel_mismatch"
+
+
+def test_the_appraisal_account_type_is_authoritative_for_a_condo_master():
+    """A master parcel whose taxpayer record carries no REFERENCE marker is still refused."""
+    normal_looking = dict(_rows(ATIP_2117)[0], parcel_number="2000050082")
+    d = _decide("2000050082", [normal_looking], "2117 AVE S")   # real 2000050082 account: Reference
+    assert d == pao.OwnerDecision("reference_parcel")
+
+
 # ── The lookup: one page view per parcel, paced, leased, gated ────────────────
 
 class _Portal:
@@ -233,6 +275,7 @@ class _Portal:
         self.answers = answers
         self.sessions = 0
         self.requests: list[str] = []
+        self.no_account: set[str] = set()   # parcels whose apprAccount call never arrives
 
     def install(self, monkeypatch):
         portal = self
@@ -247,7 +290,9 @@ class _Portal:
 
         async def _fetch(session, parcel):
             portal.requests.append(parcel)
-            return portal.answers[parcel].pop(0)
+            answer = portal.answers[parcel].pop(0)
+            acct = ACCOUNTS.get(parcel)
+            return answer, ((200, acct) if acct and parcel not in portal.no_account else None)
 
         monkeypatch.setattr(pao, "_new_session", _Session)
         monkeypatch.setattr(pao, "_fetch_summary", _fetch)
@@ -325,6 +370,16 @@ def test_a_rejected_verification_restarts_once_then_stops_and_cools_down(monkeyp
     assert again["outcome"] == "source_unavailable" and portal.requests.count("9999999999") == 0
 
 
+def test_a_taxpayer_answer_without_its_appraisal_account_is_retried_not_decided(monkeypatch, paces,
+                                                                                 clean_health):
+    portal = _Portal({"2021110133": [(200, ATIP_2117)], "2006120010": [(200, ATIP_602)]})
+    portal.install(monkeypatch).no_account.add("2021110133")
+    stats: dict = {}
+    got = pao.lookup_parcels(["2021110133", "2006120010"], stats=stats)
+    assert list(got) == ["2006120010"] and got["2006120010"].account["acctType"] == "Commercial"
+    assert stats["transient"] == ["2021110133"] and stats["outcome"] == "complete"
+
+
 def test_three_hard_failures_stop_the_batch(monkeypatch, paces, clean_health):
     portal = _Portal({p: [(503, "Service Unavailable")] for p in
                       ("2021110133", "2006120010", "2030120032", "0320011115")}).install(monkeypatch)
@@ -369,7 +424,7 @@ def test_a_planned_owner_carries_its_proof():
     mapped = pao.owner_lookup_parcels([row, label])
     assert mapped == {"2021110133": [row]}                 # a party (even a label) is not replaced
     plans, counts = pao.plan_owner_decisions(
-        mapped, {"2021110133": pao.Fetched("found", _rows(ATIP_2117))})
+        mapped, {"2021110133": _found("2021110133", ATIP_2117)})
     [(planned, pid, d)] = plans
     assert planned is row and (pid, d.status, d.name) == (
         "2021110133", "matched", "TACOMA TOWN CENTER PARCELS LLC")
@@ -390,7 +445,7 @@ def test_a_rejected_decision_writes_a_status_and_no_owner_proof():
         row = _cv_row(enrichment_data={"source": "tacoma_code_violations", **ed})
         assert pao.owner_lookup_parcels([row]) == {}
         assert pao.plan_owner_decisions({"2021110133": [row]}, {
-            "2021110133": pao.Fetched("found", _rows(ATIP_2117))})[0] == []
+            "2021110133": _found("2021110133", ATIP_2117)})[0] == []
 
 
 def test_a_lease_lost_between_pages_stops_before_the_next_request(monkeypatch, paces, clean_health,
@@ -416,7 +471,7 @@ def test_a_row_changed_since_selection_is_not_planned():
     mapped = pao.owner_lookup_parcels([row])
     row.parcel_id = "2021110134"
     plans, counts = pao.plan_owner_decisions(
-        mapped, {"2021110133": pao.Fetched("found", _rows(ATIP_2117))})
+        mapped, {"2021110133": _found("2021110133", ATIP_2117)})
     assert plans == [] and counts["stale"] == 1
 
 
@@ -425,7 +480,7 @@ def test_no_other_record_type_is_ever_offered_for_atip_naming(source):
     ed = {"source": source} if source else {}
     assert pao.owner_lookup_parcels([_cv_row(enrichment_data=ed)]) == {}
     with pytest.raises(ValueError, match="Tacoma code-violation"):
-        pao.decide("2021110133", _rows(ATIP_2117), "2117 AVE S", source=source)
+        pao.decide("2021110133", _found("2021110133", ATIP_2117), "2117 AVE S", source=source)
 
 
 def test_only_the_exact_summary_endpoint_for_the_parcel_is_read():
@@ -614,7 +669,7 @@ async def test_a_row_changed_while_the_portal_answers_is_never_named(
             other_writer.execute(text("UPDATE results SET parcel_id = '2021110134' WHERE id = :i"),
                                  {"i": rid})
             other_writer.commit()
-        return 200, ATIP_2117
+        return (200, ATIP_2117), (200, ACCOUNTS["2021110133"])
 
     monkeypatch.setattr(pao, "_fetch_summary", _answer_after_a_concurrent_change)
     monkeypatch.setattr("src.scrapers.enrichment.county_gis.batch_enrich_parcels_gis",
@@ -715,6 +770,25 @@ async def test_the_sweep_names_delivered_rows_only_and_charges_transients(
 
 
 @pytest.mark.asyncio
+async def test_the_sweep_writes_nothing_once_its_tick_lock_is_gone(
+    db, business_user, monkeypatch, paces, clean_health, redis_client,
+):
+    job_id = await _pierce_job(db, business_user)
+    rid, _ = await _stored(db, business_user, job_id, party=None)
+    portal = _Portal({"2021110133": [(200, ATIP_2117)]}).install(monkeypatch)
+    real_fetch = pao._fetch_summary
+
+    async def _fetch_while_the_tick_lock_expires(session, parcel):
+        redis_client.delete(rec._LOCK_KEY)
+        return await real_fetch(session, parcel)
+
+    monkeypatch.setattr(pao, "_fetch_summary", _fetch_while_the_tick_lock_expires)
+    stats = await asyncio.to_thread(rec.recover_pierce_cv_owners)
+    assert stats["skipped"] == "tick lock lost before writing" and portal.requests == ["2021110133"]
+    assert (await _fetch_rows(db, [rid]))[rid].party_name is None
+
+
+@pytest.mark.asyncio
 async def test_the_sweep_does_nothing_with_the_flag_off(db, business_user, monkeypatch):
     job_id = await _pierce_job(db, business_user)
     await _stored(db, business_user, job_id, party=None)
@@ -734,6 +808,7 @@ def test_the_sweep_is_a_crontab_off_the_king_lease():
     assert isinstance(entry["schedule"], crontab)
     assert sorted(entry["schedule"].minute) == [10, 40]
     assert "src.workers.pierce_cv_owner_recovery" in app.conf.include
+    assert entry["task"] in app.tasks                      # registered, not swallowed
 
 
 @pytest.mark.asyncio
@@ -746,9 +821,11 @@ async def test_repair_replaces_only_the_old_label_and_converges(
                                party="Derelict Building  - 2.01.060 (D) - 602 AVE S",
                                ed={"source": "tacoma_code_violations", "case_number": "60000301838"})
     foreign, _ = await _stored(db, business_user, job_id, party="HAND ENTERED NAME")
+    # The label matches its case, but the stored parcel is not the parcel the case names.
+    moved, _ = await _stored(db, business_user, job_id, party="Nuisance - 2117 AVE S",
+                             parcel="2021110134")
     # Already decided by the live pass: gets its category, is never re-asked.
-    decided, _ = await _stored(db, business_user, job_id, party=None, parcel="2030120032",
-                               address="641 DIVISION AVE",
+    decided, _ = await _stored(db, business_user, job_id, party=None, address="2119 AVE S",
                                ed={"source": "tacoma_code_violations", "case_number": "60000303996",
                                    "owner_status": "address_mismatch"})
     live_job = await _pierce_job(db, business_user, status="enriching")
@@ -775,18 +852,20 @@ async def test_repair_replaces_only_the_old_label_and_converges(
                            report=tmp_path / "ev.jsonl", source_pace_s=0)
 
     dry = await asyncio.to_thread(_run, False)
-    assert dry["candidates"] == 4 and "writes" not in dry and portal.requests == []
+    assert dry["candidates"] == 5 and "writes" not in dry and portal.requests == []
     assert "casenumber IN (" in layer_calls[0]
     stats = await asyncio.to_thread(_run, True)
-    assert stats["writes"] == {"written": 4, "skipped_by_write_guard": 0}
-    assert "2030120032" not in portal.requests
-    assert stats["named"] == 1 and stats["label_cleared_no_owner"] == 1
+    assert stats["writes"] == {"written": 5, "skipped_by_write_guard": 0}
+    assert sorted(portal.requests) == ["2006120010", "2021110133"]   # never 2021110134
+    assert stats["named"] == 1 and stats["label_cleared_no_owner"] == 2
     assert stats["party_name_not_the_label_left_alone"] == 1
+    assert stats["parcel_differs_from_source_no_owner"] == 1
 
-    got = await _fetch_rows(db, [label, cleared, foreign, live, decided])
+    got = await _fetch_rows(db, [label, cleared, foreign, live, decided, moved])
     assert got[decided].enrichment_data["violation_category"] == "Nuisance"
     assert got[decided].enrichment_data["owner_status"] == "address_mismatch"
     assert got[decided].party_name is None
+    assert got[moved].party_name is None and "owner_source" not in got[moved].enrichment_data
     assert got[label].party_name == "TACOMA TOWN CENTER PARCELS LLC"
     assert got[label].enrichment_data["violation_category"] == "Nuisance"
     assert (got[label].parcel_id, got[label].dedup_hash) == ("2021110133", dedup)
@@ -856,12 +935,21 @@ async def test_repair_write_guard_skips_a_row_whose_party_parcel_or_case_moved(d
 
 
 def test_repair_leaves_a_case_the_source_answers_twice_differently(monkeypatch):
-    conflicting = dict(TACOMA_2117, casetype="Graffiti")
+    """The conflicting duplicate arrives on a SECOND page: paging must reach it."""
+    conflicting = dict(TACOMA_2117, parcelnumber="2021110134")
+    pages = {0: {"features": [{"attributes": TACOMA_2117}, {"attributes": TACOMA_602}],
+                 "exceededTransferLimit": True},
+             2: {"features": [{"attributes": conflicting}, {"attributes": dict(TACOMA_602)}]}}
+    offsets: list = []
+
+    def _layer(url, params=None, **kw):
+        offsets.append(params["resultOffset"])
+        return _Resp(pages[params["resultOffset"]])
+
     import src.utils.safe_http as safe_http
-    monkeypatch.setattr(safe_http, "safe_get", lambda *a, **kw: _Resp(
-        {"features": [{"attributes": TACOMA_2117}, {"attributes": conflicting},
-                      {"attributes": TACOMA_602}, {"attributes": dict(TACOMA_602)}]}))
+    monkeypatch.setattr(safe_http, "safe_get", _layer)
     got = bpo.fetch_source_rows(["60000303996", "60000301838"], pace_s=0)
+    assert offsets == [0, 2]
     assert "60000303996" not in got                         # ambiguous: untouched
     assert got["60000301838"]["casetype"] == TACOMA_602["casetype"]   # identical repeat is fine
 

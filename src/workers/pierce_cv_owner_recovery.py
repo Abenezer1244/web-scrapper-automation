@@ -45,6 +45,9 @@ LAST_AT_KEY = "owner_recovery_last_at"
 _MAX_ATTEMPTS = 5
 # Parcels per tick: a page view is ~10 s plus 2 s pacing, so 20 parcels fit the budget.
 _BATCH_PARCELS = 20
+# Rows written per tick, so the writes after the lookups stay far inside the lock TTL.
+# Rows past the cap stay eligible for the next tick.
+_MAX_ROWS = 400
 _TICK_BUDGET_S = 300.0
 
 _LOCK_KEY = "bl:pierce_cv_owner_recovery:lock"
@@ -94,6 +97,7 @@ _CANDIDATE_ROWS_SQL = f"""
     WHERE {_JOB_SCOPE} AND {_ELIGIBLE_ROW}
       AND btrim(r.parcel_id) = ANY(:parcels)
     ORDER BY r.id
+    LIMIT :max_rows
 """  # noqa: S608 -- splices only module constants; every value is bound
 
 # The shared owner guard (same row, parcel and address as the decision, still unnamed
@@ -111,6 +115,10 @@ _WRITE_SQL = f"""
 
 _RELEASE_IF_OWNER = """
 if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) end
+return 0
+"""
+_RENEW_IF_OWNER = """
+if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('expire', KEYS[1], ARGV[2]) end
 return 0
 """
 
@@ -155,12 +163,21 @@ def recover_pierce_cv_owners() -> dict:
         stats["skipped"] = lock
         return stats
     try:
-        return _tick(stats)
+        return _tick(stats, lock)
     finally:
         _release_lock(lock)
 
 
-def _tick(stats: dict) -> dict:
+def _still_own_lock(lock: tuple) -> bool:
+    """Renew the tick lock if this tick still owns it; False (stop writing) otherwise."""
+    client, token = lock
+    try:
+        return bool(client.eval(_RENEW_IF_OWNER, 1, _LOCK_KEY, token, _LOCK_TTL_S))
+    except Exception:  # noqa: BLE001 -- unconfirmable ownership: stop, like a lost lock
+        return False
+
+
+def _tick(stats: dict, lock: tuple) -> dict:
     from src.db.session import system_sync_session
     from src.scrapers.enrichment.pierce_atip_owner import (
         decide,
@@ -176,7 +193,8 @@ def _tick(stats: dict) -> dict:
         if not parcels:
             db.rollback()
             return stats
-        rows = db.execute(sa_text(_CANDIDATE_ROWS_SQL), {**params, "parcels": parcels}).all()
+        rows = db.execute(sa_text(_CANDIDATE_ROWS_SQL),
+                          {**params, "parcels": parcels, "max_rows": _MAX_ROWS}).all()
         db.rollback()  # release the read snapshot before any network I/O
         by_parcel: dict[str, list] = {}
         for row in rows:
@@ -193,11 +211,18 @@ def _tick(stats: dict) -> dict:
         stats["lookup_outcome"] = l_stats.get("outcome")
         transient = set(l_stats.get("transient", []))
         checked_at = _now_iso()
+        writes = 0
         for pid in parcels:
             f = fetched.get(pid)
             for row in by_parcel[pid]:
+                # Re-proven before the first write and every 50 after: an expired lock
+                # means another tick may be writing, so this one stops (Codex r5).
+                if writes % 50 == 0 and not _still_own_lock(lock):
+                    stats["skipped"] = "tick lock lost before writing"
+                    _logger.warning("Pierce CV owner recovery: %s", stats["skipped"])
+                    return stats
                 if f is not None:
-                    d = decide(pid, f.rows, row.property_address, source=row.ed.get("source"))
+                    d = decide(pid, f, row.property_address, source=row.ed.get("source"))
                     payload = owner_payload(pid, d, checked_at)
                     payload[LAST_AT_KEY] = checked_at
                     label = d.status
@@ -214,6 +239,7 @@ def _tick(stats: dict) -> dict:
                     stats["unreached"] += 1  # not asked: rotate, charge nothing
                     continue
                 key = _write(db, row, payload, owner, label)
+                writes += 1
                 stats[key] = stats.get(key, 0) + 1
     _logger.info("Pierce CV owner recovery: %s", json.dumps(stats))
     return stats
@@ -244,16 +270,15 @@ def _write(db, row, payload: dict, owner: str | None, label: str) -> str:
     return label if result.rowcount else "stale"
 
 
-try:  # pragma: no cover -- registration only
-    from src.workers import app
+# Registered unconditionally: a failure here must fail the worker's import loudly, not
+# leave beat publishing a task nobody runs (Codex r5).
+from src.workers import app  # noqa: E402
 
-    # Limits above the 300 s tick budget (every lookup step is itself timeout-bounded),
-    # far below the app-wide 55 min, so a wedged browser cannot hold a worker for an hour.
-    @app.task(name="src.workers.pierce_cv_owner_recovery.recover_pierce_cv_owners_task",
-              soft_time_limit=540, time_limit=600)
-    def recover_pierce_cv_owners_task() -> dict:
-        """Beat entry point: see recover_pierce_cv_owners."""
-        return recover_pierce_cv_owners()
-except Exception as exc:  # pragma: no cover -- import-time safety only
-    # Loud: beat would keep publishing a task nobody runs.
-    _logger.error("Pierce CV owner recovery task NOT registered: %s", str(exc)[:120])
+
+# Limits above the 300 s tick budget (every lookup step is itself timeout-bounded), far
+# below the app-wide 55 min, so a wedged browser cannot hold a worker for an hour.
+@app.task(name="src.workers.pierce_cv_owner_recovery.recover_pierce_cv_owners_task",
+          soft_time_limit=540, time_limit=600)
+def recover_pierce_cv_owners_task() -> dict:
+    """Beat entry point: see recover_pierce_cv_owners."""
+    return recover_pierce_cv_owners()

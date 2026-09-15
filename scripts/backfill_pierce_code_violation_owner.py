@@ -50,6 +50,10 @@ _FEATURE_URL = (
     "/Code%20Violations/FeatureServer/0/query"
 )
 _BATCH = 100
+_MAX_SOURCE_PAGES = 50
+# Parcels per owner-lookup chunk: each chunk takes and releases the Pierce owner lease
+# and commits its rows, so the live pass and the sweep are never locked out for long.
+_OWNER_CHUNK = 20
 _CASENUMBER_RE = re.compile(r"^[0-9A-Za-z-]{1,32}$")
 
 _CANDIDATES_SQL = """
@@ -114,27 +118,39 @@ def fetch_source_rows(case_numbers: list[str], *, pace_s: float = 1.0) -> dict[s
     for i in range(0, len(wanted), _BATCH):
         chunk = wanted[i:i + _BATCH]
         quoted = ",".join(f"'{n}'" for n in chunk)  # validated by _CASENUMBER_RE above
-        resp = safe_get(_FEATURE_URL, params={
-            "where": f"casenumber IN ({quoted})", "outFields": "casenumber,casetype,address",
-            "resultRecordCount": len(chunk) * 2, "f": "json"},
-            headers={"User-Agent": "Mozilla/5.0 BridgeLeads/1.0"},
-            timeout=settings.DEFAULT_TIMEOUT)
-        resp.raise_for_status()  # a failed batch aborts the run; nothing half-applied
-        data = resp.json()
-        if not isinstance(data, dict) or "error" in data or "features" not in data:
-            raise RuntimeError(f"Tacoma layer returned an error body: {str(data)[:160]}")
-        for feat in data["features"]:
-            attrs = (feat or {}).get("attributes") or {}
-            num = str(attrs.get("casenumber") or "")
-            if num not in chunk:
-                continue
-            prev = out.get(num)
-            if prev is not None and old_scraper_label(prev) != old_scraper_label(attrs):
-                # Two different features for one case: the label cannot be rebuilt with
-                # certainty, so rows on this case are left untouched.
-                ambiguous.add(num)
-            out[num] = attrs
-        time.sleep(pace_s)
+        offset = 0
+        for _page in range(_MAX_SOURCE_PAGES):
+            resp = safe_get(_FEATURE_URL, params={
+                "where": f"casenumber IN ({quoted})",
+                "outFields": "objectid,casenumber,casetype,address,parcelnumber",
+                "orderByFields": "objectid ASC", "resultOffset": offset,
+                "resultRecordCount": _BATCH, "f": "json"},
+                headers={"User-Agent": "Mozilla/5.0 BridgeLeads/1.0"},
+                timeout=settings.DEFAULT_TIMEOUT)
+            resp.raise_for_status()  # a failed batch aborts the run; nothing half-applied
+            data = resp.json()
+            if not isinstance(data, dict) or "error" in data or "features" not in data:
+                raise RuntimeError(f"Tacoma layer returned an error body: {str(data)[:160]}")
+            features = data["features"]
+            for feat in features:
+                attrs = (feat or {}).get("attributes") or {}
+                num = str(attrs.get("casenumber") or "")
+                if num not in chunk:
+                    continue
+                prev = out.get(num)
+                if prev is not None and (old_scraper_label(prev) != old_scraper_label(attrs)
+                                         or prev.get("parcelnumber") != attrs.get("parcelnumber")):
+                    # Two different features for one case: neither the label nor the
+                    # parcel can be rebuilt with certainty, so its rows are left untouched.
+                    ambiguous.add(num)
+                out[num] = attrs
+            time.sleep(pace_s)
+            # Every page of every chunk, so a duplicate on a later page is still seen.
+            if not data.get("exceededTransferLimit") and len(features) < _BATCH:
+                break
+            offset += len(features) or _BATCH
+        else:
+            raise RuntimeError("Tacoma layer kept paging past the page guard; aborting")
     for num in ambiguous:
         del out[num]
     return out
@@ -147,13 +163,7 @@ def _case_number(row) -> str:
 def run(db, *, apply_writes: bool, owners: bool, retry_owners: bool = False,
         limit: int | None = None, report: Path | None = None,
         source_pace_s: float = 1.0) -> dict:
-    from src.scrapers.enrichment.pierce_atip_owner import (
-        MATCHED,
-        decide,
-        lookup_parcels,
-        normalize_parcel,
-        owner_payload,
-    )
+    from src.scrapers.enrichment.pierce_atip_owner import lookup_parcels, normalize_parcel
 
     rows = db.execute(text(_CANDIDATES_SQL),
                       {"source": _SOURCE, "retry_owners": retry_owners}).all()
@@ -174,62 +184,41 @@ def run(db, *, apply_writes: bool, owners: bool, retry_owners: bool = False,
         is_label = not unnamed and r.party_name == old_scraper_label(raw)
         if not is_label and not unnamed:
             counts["party_name_not_the_label_left_alone"] += 1
+        parcel = normalize_parcel(r.parcel_id)
+        # The owner is looked up only for the parcel the Tacoma case itself names: a row
+        # whose stored parcel no longer matches its source case is never named (Codex r5).
+        same_parcel = parcel is not None and normalize_parcel(raw.get("parcelnumber")) == parcel
+        if (is_label or unnamed) and not same_parcel:
+            counts["parcel_differs_from_source_no_owner"] += 1
         # A row the live pass or sweep already decided (owner_status present) still gets
         # its category, but is never re-asked: the write guard would refuse its answer.
-        wants_owner = (is_label or unnamed) and "owner_status" not in r.ed
+        wants_owner = (is_label or unnamed) and same_parcel and "owner_status" not in r.ed
         plans.append({"row": r, "is_label": is_label, "wants_owner": wants_owner,
-                      "parcel": normalize_parcel(r.parcel_id),
+                      "parcel": parcel,
                       "payload": {"violation_category": (raw.get("casetype") or "").strip() or None}})
 
-    parcels = sorted({p["parcel"] for p in plans if p["parcel"] and p["wants_owner"]})
+    parcels = sorted({p["parcel"] for p in plans if p["wants_owner"]})
     counts["parcels_for_owner"] = len(parcels)
-    fetched: dict = {}
-    lookup_stats: dict = {}
-    if owners and parcels:
-        fetched = lookup_parcels(parcels, stats=lookup_stats)
-        counts["lookup_outcome_" + str(lookup_stats.get("outcome"))] += 1
+    # Chunks of parcels; rows that need no lookup go in the first chunk's writes.
+    chunks = [parcels[i:i + _OWNER_CHUNK] for i in range(0, len(parcels), _OWNER_CHUNK)] or [[]]
+    by_chunk: dict[int, list] = {}
+    chunk_of = {pid: n for n, chunk in enumerate(chunks) for pid in chunk}
+    for p in plans:
+        by_chunk.setdefault(chunk_of.get(p["parcel"], 0) if p["wants_owner"] else 0, []).append(p)
 
     written = skipped = 0
     fh = report.open("w", encoding="utf-8") if report is not None else None
     try:
-        for i, p in enumerate(plans, 1):
-            r, payload = p["row"], dict(p["payload"])
-            new_party = r.party_name
-            f = fetched.get(p["parcel"]) if p["parcel"] else None
-            writes_owner_status = False
-            if f is not None and p["wants_owner"]:
-                d = decide(p["parcel"], f.rows, r.property_address, source=r.ed.get("source"))
-                payload.update(owner_payload(p["parcel"], d, now))
-                writes_owner_status = True
-                counts[f"owner_{d.status}"] += 1
-                if d.status == MATCHED:
-                    new_party = d.name
-                    counts["named"] += 1
-            if new_party == r.party_name and p["is_label"]:
-                new_party = None
-                counts["label_cleared_no_owner"] += 1
-            payload["cv_semantics_repaired_at"] = now
-            if fh is not None:
-                # Evidence file: the decision, never the taxpayer name.
-                fh.write(json.dumps({"result_id": str(r.id), "parcel_id": r.parcel_id,
-                                     "was_label": p["is_label"],
-                                     "named": new_party is not None and new_party != r.party_name,
-                                     **payload}) + "\n")
-            if not apply_writes:
-                continue
-            res = db.execute(text(_UPDATE_SQL), {
-                "new_party": new_party, "old_party": r.party_name, "old_parcel": r.parcel_id,
-                "old_address": r.property_address, "rid": r.id, "uid": r.user_id, "jid": r.job_id,
-                # The source row was fetched for THIS case; a row re-pointed since is skipped.
-                "old_legal": r.legal_description, "old_case": r.ed.get("case_number"),
-                "payload": json.dumps(payload), "source": _SOURCE,
-                "writes_owner_status": writes_owner_status})
-            written += bool(res.rowcount)
-            skipped += not res.rowcount
-            if i % 200 == 0:
-                db.commit()
-        if apply_writes:
-            db.commit()
+        for n, chunk in enumerate(chunks):
+            fetched: dict = {}
+            if owners and chunk:
+                lookup_stats: dict = {}
+                fetched = lookup_parcels(chunk, stats=lookup_stats)
+                counts["lookup_outcome_" + str(lookup_stats.get("outcome"))] += 1
+            w, s = _write_plans(db, by_chunk.get(n, []), fetched, counts, fh,
+                                apply_writes=apply_writes, now=now)
+            written += w
+            skipped += s
     finally:
         if fh is not None:
             fh.close()
@@ -238,6 +227,51 @@ def run(db, *, apply_writes: bool, owners: bool, retry_owners: bool = False,
     if apply_writes:
         stats["writes"] = {"written": written, "skipped_by_write_guard": skipped}
     return stats
+
+
+def _write_plans(db, plans: list[dict], fetched: dict, counts: Counter, fh, *,
+                 apply_writes: bool, now: str) -> tuple[int, int]:
+    """Decide and write one chunk's rows; commits the chunk. Returns (written, skipped)."""
+    from src.scrapers.enrichment.pierce_atip_owner import MATCHED, decide, owner_payload
+
+    written = skipped = 0
+    for p in plans:
+        r, payload = p["row"], dict(p["payload"])
+        new_party = r.party_name
+        f = fetched.get(p["parcel"]) if p["parcel"] else None
+        writes_owner_status = False
+        if f is not None and p["wants_owner"]:
+            d = decide(p["parcel"], f, r.property_address, source=r.ed.get("source"))
+            payload.update(owner_payload(p["parcel"], d, now))
+            writes_owner_status = True
+            counts[f"owner_{d.status}"] += 1
+            if d.status == MATCHED:
+                new_party = d.name
+                counts["named"] += 1
+        if new_party == r.party_name and p["is_label"]:
+            new_party = None
+            counts["label_cleared_no_owner"] += 1
+        payload["cv_semantics_repaired_at"] = now
+        if fh is not None:
+            # Evidence file: the decision, never the taxpayer name.
+            fh.write(json.dumps({"result_id": str(r.id), "parcel_id": r.parcel_id,
+                                 "was_label": p["is_label"],
+                                 "named": new_party is not None and new_party != r.party_name,
+                                 **payload}) + "\n")
+        if not apply_writes:
+            continue
+        res = db.execute(text(_UPDATE_SQL), {
+            "new_party": new_party, "old_party": r.party_name, "old_parcel": r.parcel_id,
+            "old_address": r.property_address, "rid": r.id, "uid": r.user_id, "jid": r.job_id,
+            # The source row was fetched for THIS case; a row re-pointed since is skipped.
+            "old_legal": r.legal_description, "old_case": r.ed.get("case_number"),
+            "payload": json.dumps(payload), "source": _SOURCE,
+            "writes_owner_status": writes_owner_status})
+        written += bool(res.rowcount)
+        skipped += not res.rowcount
+    if apply_writes:
+        db.commit()
+    return written, skipped
 
 
 def _refuse_private_redis() -> None:

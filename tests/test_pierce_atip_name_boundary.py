@@ -239,7 +239,8 @@ def test_a_non_code_violation_row_is_never_named_even_when_handed_an_answer():
     assert plans == [] and counts["stale"] == 1 and row.party_name is None
     # The name-producing rule itself refuses any lead outside the clearance.
     with pytest.raises(ValueError, match="Tacoma code-violation"):
-        pierce_atip_owner.decide("5000050810", rows, "1 A ST", source="pierce_recorder")
+        pierce_atip_owner.decide("5000050810", pierce_atip_owner.Fetched("found", rows), "1 A ST",
+                                source="pierce_recorder")
 
 
 def test_the_address_fallback_still_drops_the_name_after_the_clearance():

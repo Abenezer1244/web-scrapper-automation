@@ -1,8 +1,9 @@
 """King County (WA) code violations: one connector over every jurisdiction we can collect.
 
 Each jurisdiction is a source adapter in src/scrapers/king_cv_sources/ (Seattle SDCI,
-Bellevue, Burien). This connector runs them in order and merges their records; every
-record keeps its own enrichment_data.source, case number and per-case raw_html_hash.
+Bellevue, Burien, and unincorporated King County through the county's Accela portal).
+This connector runs them in order and merges their records; every record keeps its own
+enrichment_data.source, case number and per-case raw_html_hash.
 
 PARTIAL FAILURE. An adapter retries its own transient failures and raises when one
 survives them. A failed source does not fail the job while another source succeeded:
@@ -12,8 +13,9 @@ customer-visible warning naming the missing jurisdiction(s) is published to the 
 `source_status`. When EVERY source fails, the scrape raises as it always has.
 
 Seattle rows carry no parcel or owner (enrichment locates the parcel from coordinates
-into enrichment_data.kc_pin). Bellevue and Burien print the King PIN, which is stored as
-parcel_id at scrape; their owner is read from King eRealProperty during enrichment.
+into enrichment_data.kc_pin). Bellevue, Burien and King County Accela print the King
+PIN, which is stored as parcel_id at scrape; their owner is read from King eRealProperty
+during enrichment. Accela runs last: it is the slowest source (a paced browser).
 """
 from __future__ import annotations
 
@@ -23,6 +25,7 @@ from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord
 from src.scrapers.king_cv_sources.base import CodeViolationSource
 from src.scrapers.king_cv_sources.bellevue import BellevueSource
 from src.scrapers.king_cv_sources.burien import BurienSource
+from src.scrapers.king_cv_sources.kingco_accela import KingCountyAccelaSource
 from src.scrapers.king_cv_sources.seattle_sdci import SeattleSDCISource
 from src.scrapers.reliability import TransientScrapeError, is_transient_scrape_error
 from src.utils.logger import setup_logger
@@ -30,7 +33,8 @@ from src.utils.logger import setup_logger
 _logger = setup_logger("scraper.king_wa_code_violation")
 
 # The registration list: every adapter the King code_violation connector runs, in order.
-SOURCES: tuple[type[CodeViolationSource], ...] = (SeattleSDCISource, BellevueSource, BurienSource)
+SOURCES: tuple[type[CodeViolationSource], ...] = (
+    SeattleSDCISource, BellevueSource, BurienSource, KingCountyAccelaSource)
 
 SOURCE_OK = "ok"
 SOURCE_FAILED = "failed"

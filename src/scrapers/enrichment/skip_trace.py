@@ -819,7 +819,7 @@ def legacy_cache_locality(result) -> tuple[str | None, str | None]:
 # enrichment_data.source of the code-violation scrapers (king_wa_code_violation and its
 # king_cv_sources adapters, pierce_wa_code_violation).
 _KING_CODE_VIOLATION_SOURCES = frozenset({king_cv_sources.SEATTLE_SDCI, king_cv_sources.BELLEVUE,
-                                          king_cv_sources.BURIEN})
+                                          king_cv_sources.BURIEN, king_cv_sources.KINGCO_ACCELA})
 CODE_VIOLATION_SOURCES = _KING_CODE_VIOLATION_SOURCES | {"tacoma_code_violations"}
 
 

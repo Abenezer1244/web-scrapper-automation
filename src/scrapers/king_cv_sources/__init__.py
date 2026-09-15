@@ -16,9 +16,11 @@ from the registered adapters' jurisdiction labels, so it follows automatically.
 SEATTLE_SDCI = "seattle_sdci_code_violations"
 BELLEVUE = "bellevue_code_enforcement"
 BURIEN = "burien_code_enforcement"
+KINGCO_ACCELA = "kingco_accela_code_enforcement"
 
 # Sources whose case record carries the real 10-digit King County PIN, stored as
 # results.parcel_id AT SCRAPE (before insert, so billing identity never changes later).
 # Their owner is read from King eRealProperty for that PIN. SDCI is not one of them: its
 # PIN is located from coordinates after insert and lives in enrichment_data.kc_pin.
-PARCEL_AT_SCRAPE_SOURCES = frozenset({BELLEVUE, BURIEN})
+# (King County Accela prints the PIN on the case detail page, read during the scrape.)
+PARCEL_AT_SCRAPE_SOURCES = frozenset({BELLEVUE, BURIEN, KINGCO_ACCELA})

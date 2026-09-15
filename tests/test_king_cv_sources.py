@@ -1,4 +1,4 @@
-"""King code violations from Seattle, Bellevue and Burien behind one connector.
+"""King code violations from Seattle, Bellevue, Burien and King County Accela behind one connector.
 
 Only external HTTP answers are substituted: ArcGIS payloads are the real responses saved
 under tests/fixtures/king_cv_*.json (fetched 2026-09-14), the eRealProperty rows and the
@@ -12,7 +12,7 @@ import functools
 import hashlib
 import json
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -26,7 +26,7 @@ from src.scrapers import king_wa_code_violation as kcv
 from src.scrapers.enrichment import king_county_assessor as kca
 from src.scrapers.enrichment import king_parcel_locate as kpl
 from src.scrapers.enrichment.skip_trace import build_pending_row_payload
-from src.scrapers.king_cv_sources import base, bellevue, burien, seattle_sdci
+from src.scrapers.king_cv_sources import base, bellevue, burien, kingco_accela, seattle_sdci
 from src.workers.property_identity import legacy_strong_signature
 
 _FIX = Path(__file__).resolve().parent / "fixtures"
@@ -331,6 +331,19 @@ async def test_an_arcgis_error_body_is_a_failure_not_zero_cases(monkeypatch, no_
 # ── One connector over every source ──────────────────────────────────────────
 
 def _connector(monkeypatch, *, fail=(), sdci_fails=False):
+    from tests.test_king_cv_kingco_accela import (
+        SINGLE_RESULT,
+        SINGLE_RESULT_URL,
+        _snap,
+        use_fixture_portal,
+    )
+
+    # King County Accela answers from its real saved pages: the one-case detail page for
+    # the last window (and its 09/13 day), the real no-results page for every other one.
+    one_case = [_snap(SINGLE_RESULT, SINGLE_RESULT_URL)]
+    accela_fail = [kingco_accela.AccelaAccessWallError("login page")] if "accela" in fail else []
+    use_fixture_portal(monkeypatch, fail=accela_fail, searches={
+        (date(2026, 9, 12), date(2026, 9, 14)): one_case, (date(2026, 9, 13), date(2026, 9, 13)): one_case})
     monkeypatch.setattr(burien, "_PAGE_SIZE", BUR_PAGED["page_size"])
     monkeypatch.setattr(base, "safe_get", _ArcGIS(
         bellevue_query=_bellevue_full, burien_pages=BUR_PAGED, fail=fail))
@@ -341,13 +354,14 @@ def _connector(monkeypatch, *, fail=(), sdci_fails=False):
 def test_scope_note_lists_every_registered_jurisdiction():
     scope = kcv.KingWACodeViolationScraper.collection_scope("code_violation")
     assert scope.kind == "dataset"
-    assert scope.note == "Collected from the code enforcement records of Seattle, Bellevue, and Burien."
+    assert scope.note == ("Collected from the code enforcement records of Seattle, Bellevue, Burien, "
+                          "and unincorporated King County.")
     assert "—" not in scope.note
     assert kcv.KingWACodeViolationScraper.collection_scope("probate") is None
-    later = SimpleNamespace(jurisdiction="unincorporated King County")
-    assert kcv.scope_note([*kcv.SOURCES, later]) == (
-        "Collected from the code enforcement records of Seattle, Bellevue, Burien, "
-        "and unincorporated King County.")
+    assert kcv.scope_note(kcv.SOURCES[:3]) == (
+        "Collected from the code enforcement records of Seattle, Bellevue, and Burien.")
+    assert kcv.scope_note([SimpleNamespace(jurisdiction="Seattle")]) == (
+        "Collected from the code enforcement records of Seattle.")
 
 
 @pytest.mark.asyncio
@@ -358,7 +372,7 @@ async def test_all_sources_ship_together_each_keeping_its_identity(monkeypatch):
 
     sources = {r.enrichment_data["source"] for r in recs}
     assert sources == {"seattle_sdci_code_violations", "bellevue_code_enforcement",
-                       "burien_code_enforcement"}
+                       "burien_code_enforcement", "kingco_accela_code_enforcement"}
     assert scraper.source_status == dict.fromkeys(sources, "ok")
     assert scraper.scrape_warnings == []
     sdci = next(r for r in recs if r.enrichment_data["source"] == "seattle_sdci_code_violations")
@@ -377,23 +391,27 @@ async def test_one_failed_source_ships_the_rest_with_a_warning_naming_it(monkeyp
     recs = await scraper.scrape("08/01/2026", "09/14/2026")
 
     assert {r.enrichment_data["source"] for r in recs} == {"seattle_sdci_code_violations",
-                                                           "burien_code_enforcement"}
+                                                           "burien_code_enforcement",
+                                                           "kingco_accela_code_enforcement"}
     assert scraper.source_status == {"seattle_sdci_code_violations": "ok",
                                      "bellevue_code_enforcement": "failed",
-                                     "burien_code_enforcement": "ok"}
+                                     "burien_code_enforcement": "ok",
+                                     "kingco_accela_code_enforcement": "ok"}
     assert scraper.scrape_warnings == [
         "Code violation records from Bellevue could not be collected this run, so these leads "
-        "cover Seattle and Burien only. Run this scraper again later to include Bellevue."]
+        "cover Seattle, Burien, and unincorporated King County only. Run this scraper again "
+        "later to include Bellevue."]
     assert "—" not in scraper.scrape_warnings[0]
 
 
 @pytest.mark.asyncio
 async def test_every_source_failing_fails_the_scrape(monkeypatch, no_backoff):
-    _connector(monkeypatch, fail={"bellevue", "burien"}, sdci_fails=True)
+    _connector(monkeypatch, fail={"bellevue", "burien", "accela"}, sdci_fails=True)
     scraper = kcv.KingWACodeViolationScraper()
     with pytest.raises(RuntimeError, match="every source failed") as err:
         await scraper.scrape("08/01/2026", "09/14/2026")
-    for key in ("seattle_sdci_code_violations", "bellevue_code_enforcement", "burien_code_enforcement"):
+    for key in ("seattle_sdci_code_violations", "bellevue_code_enforcement", "burien_code_enforcement",
+                "kingco_accela_code_enforcement"):
         assert key in str(err.value)
     assert set(scraper.source_status.values()) == {"failed"}
 
@@ -413,13 +431,15 @@ async def test_the_partial_failure_warning_reaches_the_job_log(
                               redis_client, job_id, record_type="code_violation")
 
     assert {r.enrichment_data["source"] for r in recs} == {"seattle_sdci_code_violations",
-                                                           "bellevue_code_enforcement"}
+                                                           "bellevue_code_enforcement",
+                                                           "kingco_accela_code_enforcement"}
     logs = (await db.execute(text("SELECT level, message FROM job_logs WHERE job_id = :j"),
                              {"j": job_id})).all()
     assert [(row.level, row.message) for row in logs] == [(
         "warning",
         "Code violation records from Burien could not be collected this run, so these leads "
-        "cover Seattle and Bellevue only. Run this scraper again later to include Burien.")]
+        "cover Seattle, Bellevue, and unincorporated King County only. Run this scraper again "
+        "later to include Burien.")]
     published = pubsub.get_message(timeout=2)
     assert published and json.loads(published["data"])["level"] == "warning"
     pubsub.close()

@@ -47,6 +47,14 @@ LABEL_MAX = 120
 _PIN_SEPARATORS = re.compile(r"[\s\-]")
 
 
+class DateRangeTooLargeError(RuntimeError):
+    """The date range holds more than one run of this source can collect.
+
+    Running again later would fail the same way, so the connector tells the customer to
+    use a shorter date range instead.
+    """
+
+
 def normalize_king_pin(raw: object) -> str | None:
     """A King County PIN as the 10-digit string the Assessor uses, else None.
 

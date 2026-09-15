@@ -22,7 +22,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord
-from src.scrapers.king_cv_sources.base import CodeViolationSource
+from src.scrapers.king_cv_sources.base import CodeViolationSource, DateRangeTooLargeError
 from src.scrapers.king_cv_sources.bellevue import BellevueSource
 from src.scrapers.king_cv_sources.burien import BurienSource
 from src.scrapers.king_cv_sources.kingco_accela import KingCountyAccelaSource
@@ -53,11 +53,22 @@ def scope_note(sources: Sequence[type[CodeViolationSource]] = SOURCES) -> str:
             f"{_join_names([s.jurisdiction for s in sources])}.")
 
 
-def partial_failure_warning(failed: Sequence[str], succeeded: Sequence[str]) -> str:
-    """Customer-facing job log line for a run that shipped without some jurisdictions."""
-    return (f"Code violation records from {_join_names(failed)} could not be collected this "
-            f"run, so these leads cover {_join_names(succeeded)} only. Run this scraper again "
-            f"later to include {_join_names(failed)}.")
+def partial_failure_warning(failed: Sequence[str], succeeded: Sequence[str],
+                            too_large: Sequence[str] = ()) -> str:
+    """Customer-facing job log line for a run that shipped without some jurisdictions.
+
+    ``failed`` are jurisdictions that may work on a later run; ``too_large`` had more
+    cases in the date range than one run can collect, which a later run would not fix.
+    """
+    missing = [*failed, *too_large]
+    msg = (f"Code violation records from {_join_names(missing)} could not be collected this "
+           f"run, so these leads cover {_join_names(succeeded)} only.")
+    if failed:
+        msg += f" Run this scraper again later to include {_join_names(failed)}."
+    if too_large:
+        msg += (f" This date range has more {_join_names(too_large)} cases than one run can "
+                f"collect, so use a shorter date range to include them.")
+    return msg
 
 
 class KingWACodeViolationScraper(BridgeScraper):
@@ -118,10 +129,11 @@ class KingWACodeViolationScraper(BridgeScraper):
                 raise TransientScrapeError(msg) from first
             raise RuntimeError(msg) from first
         if failures:
-            failed = [s.jurisdiction for s, _ in failures]
+            failed = [s.jurisdiction for s, e in failures if not isinstance(e, DateRangeTooLargeError)]
+            too_large = [s.jurisdiction for s, e in failures if isinstance(e, DateRangeTooLargeError)]
             succeeded = [s.jurisdiction for s in self.sources
                          if self.source_status.get(s.key) == SOURCE_OK]
-            self.scrape_warnings.append(partial_failure_warning(failed, succeeded))
+            self.scrape_warnings.append(partial_failure_warning(failed, succeeded, too_large))
             _logger.warning("King code violation partial scrape: source_status=%s", self.source_status)
 
         _logger.info("King WA code violations complete: %d records, source_status=%s",

@@ -970,7 +970,7 @@ def run_scrape_job(self, job_id: str) -> None:
                     # Tier 0 (057): owner-location flags (mostly recomputed post-enrich).
                     "property_state": _owner["property_state"],
                     "property_city": _trunc(_situs.get("city"), 128),
-                    "property_zip": _trunc(_situs.get("zip"), 10),
+                    "property_zip": _trunc(_situs.get("zip") or rec.property_zip, 10),
                     "owner_state": _owner["owner_state"],
                     "absentee_owner": _owner["absentee_owner"],
                     "out_of_state_owner": _owner["out_of_state_owner"],

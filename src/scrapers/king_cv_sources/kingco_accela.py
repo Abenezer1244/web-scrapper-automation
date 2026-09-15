@@ -18,7 +18,10 @@ Portal behavior verified live on 2026-09-14:
   * Results list 10 rows a page. "Showing 1-10 of 100+" is only a display cap (paging on
     reaches "101-110 of 122"), but windows are kept to WINDOW_DAYS days anyway.
   * The grid carries the opened date, case number, record type, status and a street+ZIP
-    address. The King PIN is only on the case detail page (Parcel Information). Cases still
+    address with no city ("7016 S LAKERIDGE DR, 98178"). The street is stored as
+    property_address and the ZIP as the record's property_zip; the city is left to the
+    parcel enrichment (a "STREET ZIP" line would reach skip trace with the ZIP parsed
+    into the street). The King PIN is only on the case detail page (Parcel Information). Cases still
     in "Intake Processing" often have no parcel yet: they are kept with parcel_id None.
     A case listing more than one distinct parcel is also kept with parcel_id None (the
     PINs are recorded) because no single parcel's owner is provably the right one.
@@ -62,6 +65,7 @@ from src.scrapers.king_cv_sources.base import (
     LABEL_MAX,
     MAX_PAGES,
     CodeViolationSource,
+    DateRangeTooLargeError,
     normalize_king_pin,
 )
 from src.utils.logger import setup_logger
@@ -119,7 +123,7 @@ class AccelaFormatError(RuntimeError):
     """A page did not have the structure this adapter reads (canary)."""
 
 
-class AccelaBudgetError(RuntimeError):
+class AccelaBudgetError(DateRangeTooLargeError):
     """The date range holds more cases than one run may look up. Not retried."""
 
 
@@ -135,7 +139,9 @@ class GridRow:
     detail_path: str
     record_type: str | None
     status: str | None
+    #: The street line only; its ZIP is in ``zip``.
     address: str | None
+    zip: str | None
 
 
 @dataclass(frozen=True)
@@ -151,6 +157,7 @@ class CaseDetail:
     case_number: str
     parcel_numbers: list[str]
     address: str | None
+    zip: str | None
 
 
 @dataclass(frozen=True)
@@ -209,8 +216,8 @@ def _text(el) -> str | None:
     return value or None
 
 
-def normalize_address(raw: str | None) -> str | None:
-    """"STREET ZIP" in the King Assessor site-address shape, else None.
+def split_address(raw: str | None) -> tuple[str | None, str | None]:
+    """(street, ZIP) from a portal address, or (None, None) when it has no street.
 
     The grid prints "7016 S LAKERIDGE DR, 98178", sometimes "..., WA 98024" or
     "..., 98051 United States", and "United States" alone when no address was entered.
@@ -218,13 +225,13 @@ def normalize_address(raw: str | None) -> str | None:
     """
     value = " ".join((raw or "").split())
     if not value:
-        return None
+        return None, None
     m = _ZIP_TAIL_RE.search(value)
     street = value[:m.start()].strip(" ,") if m else value
     zipcode = m.group(1) if m else None
     if not street or street.lower() == "united states" or not any(c.isdigit() for c in street):
-        return None
-    return f"{street} {zipcode}" if zipcode else street
+        return None, None
+    return street, zipcode
 
 
 def parse_results_page(html: str) -> ResultsPage:
@@ -267,13 +274,15 @@ def parse_results_page(html: str) -> ResultsPage:
             opened = date(int(date_match.group(3)), int(date_match.group(1)), int(date_match.group(2)))
         except ValueError:
             continue
+        street, zipcode = split_address(_text(cell("lblPermitAddress")))
         rows.append(GridRow(
             opened=opened,
             case_number=case,
             detail_path=href,
             record_type=(_text(cell("lblType")) or "")[:LABEL_MAX] or None,
             status=(_text(cell("lblStatus")) or "")[:LABEL_MAX] or None,
-            address=normalize_address(_text(cell("lblPermitAddress"))),
+            address=street,
+            zip=zipcode,
         ))
     if raw_rows and not rows:
         raise AccelaFormatError(
@@ -308,12 +317,12 @@ def parse_case_detail(html: str, expected_case: str) -> CaseDetail:
             pin = normalize_king_pin(raw)
             if pin and pin not in pins:
                 pins.append(pin)
-    address = None
+    street = zipcode = None
     location = soup.select_one("#divWorkLocationInfo")
     if location is not None:
         parts = [p for p in (" ".join(s.split()) for s in location.stripped_strings) if p and p != "*"]
-        address = normalize_address(", ".join(parts))
-    return CaseDetail(case_number=case, parcel_numbers=pins, address=address)
+        street, zipcode = split_address(", ".join(parts))
+    return CaseDetail(case_number=case, parcel_numbers=pins, address=street, zip=zipcode)
 
 
 def detail_url(path: str) -> str:
@@ -348,17 +357,21 @@ def single_result_row(snapshot: PageSnapshot, day: date) -> GridRow:
         record_type=(_text(soup.select_one("#ctl00_PlaceHolderMain_lblPermitType")) or "")[:LABEL_MAX] or None,
         status=(_text(soup.select_one("#ctl00_PlaceHolderMain_lblRecordStatus")) or "")[:LABEL_MAX] or None,
         address=detail.address,
+        zip=detail.zip,
     )
 
 
 def build_record(row: GridRow, detail: CaseDetail) -> ScrapedRecord:
     parcel_id = detail.parcel_numbers[0] if len(detail.parcel_numbers) == 1 else None
+    # Street and ZIP come from the same printed address, never one from each page.
+    street, zipcode = (row.address, row.zip) if row.address else (detail.address, detail.zip)
     record = ScrapedRecord(
         date_recorded=row.opened.strftime("%m/%d/%Y"),
         party_name=None,
         legal_description=row.case_number,
         parcel_id=parcel_id,
-        property_address=row.address or detail.address,
+        property_address=street,
+        property_zip=zipcode,
         raw_html_hash=hashlib.sha256(f"{KINGCO_ACCELA}|{row.case_number}".encode()).hexdigest()[:32],
     )
     record.enrichment_data = {

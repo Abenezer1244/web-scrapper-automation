@@ -148,10 +148,10 @@ def test_a_results_page_parses_every_row_without_its_description():
         detail_path="/KINGCO/Cap/CapDetail.aspx?Module=Enforce&TabName=Enforce&capID1=26ENF"
                     "&capID2=00000&capID3=00933&agencyCode=KINGCO&IsToShowInspection=",
         record_type="Code Enforcement Case", status="Intake Processing",
-        address="7016 S LAKERIDGE DR 98178")
+        address="7016 S LAKERIDGE DR", zip="98178")
     # The grid row type has no field for the complainant's text or the staff notes.
     assert {f.name for f in fields(ka.GridRow)} == {
-        "opened", "case_number", "detail_path", "record_type", "status", "address"}
+        "opened", "case_number", "detail_path", "record_type", "status", "address", "zip"}
     assert not any(_REDACTED in str(v) for r in page.rows for v in vars(r).values())
 
 
@@ -182,18 +182,40 @@ def test_canary_a_renamed_grid_column_or_unreadable_rows_fail_loud():
                               .replace("09/10/2026<", "Sep 10<"))
 
 
-@pytest.mark.parametrize(("raw", "address"), [
-    ("7016 S LAKERIDGE DR, 98178", "7016 S LAKERIDGE DR 98178"),
-    ("4407 332ND AVE SE, WA 98024", "4407 332ND AVE SE 98024"),
-    ("30028 SE LAKE RETREAT S DR, 98051 United States", "30028 SE LAKE RETREAT S DR 98051"),
-    ("21617 NE 159TH ST, 98077", "21617 NE 159TH ST 98077"),
-    ("13007 12th Ave SW", "13007 12th Ave SW"),
-    ("United States", None),
-    ("", None),
-    (None, None),
+@pytest.mark.parametrize(("raw", "parts"), [
+    ("7016 S LAKERIDGE DR, 98178", ("7016 S LAKERIDGE DR", "98178")),
+    ("4407 332ND AVE SE, WA 98024", ("4407 332ND AVE SE", "98024")),
+    ("30028 SE LAKE RETREAT S DR, 98051 United States", ("30028 SE LAKE RETREAT S DR", "98051")),
+    ("21617 NE 159TH ST, 98077-1234", ("21617 NE 159TH ST", "98077")),
+    ("13007 12th Ave SW", ("13007 12th Ave SW", None)),
+    ("United States", (None, None)),
+    (", 98178", (None, None)),
+    ("", (None, None)),
+    (None, (None, None)),
 ])
-def test_address_shapes(raw, address):
-    assert ka.normalize_address(raw) == address
+def test_address_shapes(raw, parts):
+    assert ka.split_address(raw) == parts
+
+
+def test_the_street_and_zip_are_stored_apart_so_skip_trace_never_reads_the_zip_as_street():
+    # The shared skip-trace parser reads a comma-less "STREET ZIP" line as all street:
+    # this is why the adapter stores the ZIP in the record's property_zip instead.
+    assert skip_trace._parse_full_address("21617 NE 159TH ST 98077")["street"] == "21617 NE 159TH ST 98077"
+
+    row = next(r for r in ka.parse_results_page(PAGE1).rows if r.case_number == "ENFR26-0938")
+    record = ka.build_record(row, ka.parse_case_detail(DETAIL_1626069072, "ENFR26-0938"))
+    assert (record.property_address, record.property_zip) == ("21617 NE 159TH ST", "98077")
+    # property_zip stays out of to_dict(), which other scrapers hash into their identity.
+    assert "property_zip" not in record.to_dict()
+
+    # After parcel enrichment names the owner and the city, the traced street is the street.
+    owned = {"source": "kingco_accela_code_enforcement", "owner_source": "king_erealproperty",
+             "owner_pin": "1626069072"}
+    payload = build_pending_row_payload(_accela_row(
+        party_name="OWNER LLC", property_address=record.property_address, property_city="WOODINVILLE",
+        property_zip=record.property_zip, enrichment_data=owned))
+    assert (payload["property_address"], payload["city"], payload["state"], payload["zip"]) == (
+        "21617 NE 159TH ST", "WOODINVILLE", "WA", "98077")
 
 
 def test_one_searchs_pages_give_the_windows_rows_once_each():
@@ -224,7 +246,7 @@ def test_a_one_case_search_lands_on_the_detail_page():
         detail_path="/KINGCO/Cap/CapDetail.aspx?Module=Enforce&TabName=Enforce&capID1=26ENF"
                     "&capID2=00000&capID3=00931&agencyCode=KINGCO&IsToShowInspection=",
         record_type="Code Enforcement Case", status="No Further Action Required",
-        address="8506 S 116TH ST 98178")]
+        address="8506 S 116TH ST", zip="98178")]
     # The detail page has no opened date, so a longer window cannot date the case.
     assert ka.rows_from_search([snap], date(2026, 9, 12), date(2026, 9, 13)) is None
 
@@ -233,11 +255,12 @@ def test_a_one_case_search_lands_on_the_detail_page():
 
 def test_detail_pages_give_the_parcel_when_there_is_one():
     assert ka.parse_case_detail(DETAIL_1626069072, "ENFR26-0938") == ka.CaseDetail(
-        case_number="ENFR26-0938", parcel_numbers=["1626069072"], address="21617 NE 159TH ST 98077")
+        case_number="ENFR26-0938", parcel_numbers=["1626069072"], address="21617 NE 159TH ST",
+        zip="98077")
     assert ka.parse_case_detail(DETAIL_3421049053, "ENFR26-0936").parcel_numbers == ["3421049053"]
     # Intake cases often have no parcel or work location yet.
     assert ka.parse_case_detail(DETAIL_NO_PARCEL, "ENFR26-0933") == ka.CaseDetail(
-        case_number="ENFR26-0933", parcel_numbers=[], address=None)
+        case_number="ENFR26-0933", parcel_numbers=[], address=None, zip=None)
     with pytest.raises(ka.AccelaFormatError, match="expected 'ENFR26-0933'"):
         ka.parse_case_detail(DETAIL_1626069072, "ENFR26-0933")
 
@@ -249,7 +272,7 @@ def test_records_carry_the_case_identity_and_the_printed_pin_and_no_free_text():
     assert with_pin.raw_html_hash == _hash("ENFR26-0938")
     assert (with_pin.date_recorded, with_pin.legal_description, with_pin.party_name) == (
         "09/14/2026", "ENFR26-0938", None)
-    assert with_pin.property_address == "21617 NE 159TH ST 98077"
+    assert (with_pin.property_address, with_pin.property_zip) == ("21617 NE 159TH ST", "98077")
     assert with_pin.enrichment_data == {
         "source": "kingco_accela_code_enforcement", "case_number": "ENFR26-0938",
         "status": "Intake Processing", "violation_category": None,
@@ -258,7 +281,7 @@ def test_records_carry_the_case_identity_and_the_printed_pin_and_no_free_text():
 
     no_pin = ka.build_record(rows["ENFR26-0933"], ka.parse_case_detail(DETAIL_NO_PARCEL, "ENFR26-0933"))
     assert no_pin.parcel_id is None and no_pin.enrichment_data["source_parcel_numbers"] == []
-    assert no_pin.property_address == "7016 S LAKERIDGE DR 98178"
+    assert (no_pin.property_address, no_pin.property_zip) == ("7016 S LAKERIDGE DR", "98178")
 
     for record in (with_pin, no_pin):
         # The fixtures' description and notes cells read "[redacted]": a record that
@@ -270,7 +293,7 @@ def test_records_carry_the_case_identity_and_the_printed_pin_and_no_free_text():
 def test_a_case_on_several_parcels_keeps_them_all_but_names_no_single_parcel():
     row = ka.parse_results_page(PAGE1).rows[1]
     detail = ka.CaseDetail(case_number=row.case_number, parcel_numbers=["1626069072", "0121029085"],
-                           address=None)
+                           address=None, zip=None)
     record = ka.build_record(row, detail)
     assert record.parcel_id is None
     assert record.enrichment_data["source_parcel_numbers"] == ["1626069072", "0121029085"]
@@ -390,7 +413,7 @@ def test_the_source_is_registered_everywhere_a_king_source_must_be():
 
 def _accela_row(**over):
     row = {"id": "r1", "job_id": "j1", "user_id": "u1", "party_name": None,
-           "parcel_id": "1626069072", "property_address": "21617 NE 159TH ST 98077",
+           "parcel_id": "1626069072", "property_address": "21617 NE 159TH ST",
            "mailing_address": "21617 NE 159TH ST, WOODINVILLE, WA 98077",
            "property_city": None, "property_state": "WA", "property_zip": "98077",
            "enrichment_data": {"source": "kingco_accela_code_enforcement", "case_number": "ENFR26-0938"}}

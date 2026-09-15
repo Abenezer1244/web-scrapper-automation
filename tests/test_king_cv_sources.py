@@ -341,7 +341,9 @@ def _connector(monkeypatch, *, fail=(), sdci_fails=False):
     # King County Accela answers from its real saved pages: the one-case detail page for
     # the last window (and its 09/13 day), the real no-results page for every other one.
     one_case = [_snap(SINGLE_RESULT, SINGLE_RESULT_URL)]
-    accela_fail = [kingco_accela.AccelaAccessWallError("login page")] if "accela" in fail else []
+    accela_fail = ([kingco_accela.AccelaAccessWallError("login page")] if "accela" in fail
+                   else [kingco_accela.AccelaBudgetError("more than 200 cases")] if "accela_budget" in fail
+                   else [])
     use_fixture_portal(monkeypatch, fail=accela_fail, searches={
         (date(2026, 9, 12), date(2026, 9, 14)): one_case, (date(2026, 9, 13), date(2026, 9, 13)): one_case})
     monkeypatch.setattr(burien, "_PAGE_SIZE", BUR_PAGED["page_size"])
@@ -402,6 +404,28 @@ async def test_one_failed_source_ships_the_rest_with_a_warning_naming_it(monkeyp
         "cover Seattle, Burien, and unincorporated King County only. Run this scraper again "
         "later to include Bellevue."]
     assert "—" not in scraper.scrape_warnings[0]
+
+
+@pytest.mark.asyncio
+async def test_a_source_over_its_case_limit_is_told_to_use_a_shorter_range_not_to_retry(
+        monkeypatch, no_backoff):
+    _connector(monkeypatch, fail={"accela_budget"})
+    scraper = kcv.KingWACodeViolationScraper()
+    await scraper.scrape("08/01/2026", "09/14/2026")
+    assert scraper.source_status["kingco_accela_code_enforcement"] == "failed"
+    assert scraper.scrape_warnings == [
+        "Code violation records from unincorporated King County could not be collected this run, "
+        "so these leads cover Seattle, Bellevue, and Burien only. This date range has more "
+        "unincorporated King County cases than one run can collect, so use a shorter date range "
+        "to include them."]
+    assert "later" not in scraper.scrape_warnings[0] and "—" not in scraper.scrape_warnings[0]
+
+    both = kcv.partial_failure_warning(["Bellevue"], ["Seattle"], ["unincorporated King County"])
+    assert both == (
+        "Code violation records from Bellevue and unincorporated King County could not be "
+        "collected this run, so these leads cover Seattle only. Run this scraper again later to "
+        "include Bellevue. This date range has more unincorporated King County cases than one run "
+        "can collect, so use a shorter date range to include them.")
 
 
 @pytest.mark.asyncio

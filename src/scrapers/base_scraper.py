@@ -107,6 +107,11 @@ class ScrapedRecord:
     mailing_address: str | None = None
     enrichment_data: dict[str, Any] = field(default_factory=dict)
     raw_html_hash: str | None = None
+    #: The situs ZIP when the source prints it apart from a street-only property_address
+    #: (results.property_zip; a ZIP parsed from property_address wins). Deliberately NOT
+    #: in to_dict(): scrapers hash to_dict() into raw_html_hash, and adding a key would
+    #: change every existing record's identity.
+    property_zip: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {

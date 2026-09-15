@@ -67,10 +67,27 @@ def celery_time_limit(exc: BaseException) -> BaseException | None:
 
 
 def raise_if_time_limit(exc: BaseException) -> None:
-    """Re-raise the Celery time limit in ``exc``'s chain. Call first in every catch-all."""
+    """Re-raise the Celery time limit in ``exc``'s chain. Call first in every catch-all.
+
+    A wrapper that chains to the deadline is detached from it first: raising the deadline
+    inside the wrapper's handler makes the wrapper its __context__, and a wrapper still
+    pointing back at the deadline would close a reference cycle.
+    """
     deadline = celery_time_limit(exc)
-    if deadline is not None:
-        raise deadline
+    if deadline is None:
+        return
+    if deadline is not exc:
+        seen: set[int] = set()
+        node: BaseException | None = exc
+        while node is not None and node is not deadline and id(node) not in seen:
+            seen.add(id(node))
+            nxt = node.__cause__ or node.__context__
+            if node.__cause__ is deadline:
+                node.__cause__ = None
+            if node.__context__ is deadline:
+                node.__context__ = None
+            node = nxt
+    raise deadline
 
 
 class DateRangeTooLargeError(RuntimeError):

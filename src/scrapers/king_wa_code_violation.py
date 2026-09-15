@@ -20,13 +20,14 @@ during enrichment. Accela runs last: it is the slowest source (a paced browser).
 from __future__ import annotations
 
 import asyncio
+import threading
 from collections.abc import Sequence
 
 from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord
 from src.scrapers.king_cv_sources.base import (
     CodeViolationSource,
     DateRangeTooLargeError,
-    celery_time_limit,
+    raise_if_time_limit,
 )
 from src.scrapers.king_cv_sources.bellevue import BellevueSource
 from src.scrapers.king_cv_sources.burien import BurienSource
@@ -82,9 +83,11 @@ def partial_failure_warning(failed: Sequence[str], succeeded: Sequence[str],
 
 
 SOURCE_FAILURE_ALERT_KIND = "king_cv_source_failed"
-# How long a source failure waits for its alert. The alert keeps running in its thread
-# past this; the scrape does not wait on a slow Redis, database or email provider.
+# How long a source failure waits for its alert. The alert keeps running in its own daemon
+# thread past this; neither the scrape nor the worker's asyncio.run shutdown waits on a
+# slow Redis, database or email provider.
 _ALERT_WAIT_S = 15.0
+
 
 def source_failure_alert(source: CodeViolationSource, exc: Exception,
                          date_from: str, date_to: str) -> tuple[str, str, str, str]:
@@ -108,17 +111,36 @@ async def _alert_source_failure(source: CodeViolationSource, exc: Exception,
     and a partial failure still ships a done job, so without this a jurisdiction could stay
     down for weeks behind a job-log warning. Never for DateRangeTooLargeError: that is the
     customer's range, not an outage. send_ops_alert never raises and always leaves an
-    audit_events row (one per failed source per run: bounded by job runs). It runs in a
-    thread, and the scrape waits for it at most _ALERT_WAIT_S.
+    audit_events row (one per failed source per run: bounded by job runs).
+
+    It runs in a daemon thread, not the loop's default executor: asyncio.run joins that
+    executor on exit, so a hung alert there would hold the job after the scrape returned.
+    The scrape waits for it at most _ALERT_WAIT_S.
     """
     if isinstance(exc, DateRangeTooLargeError):
         return
     from src.workers.ops_alerts import send_ops_alert
 
+    loop = asyncio.get_running_loop()
+    finished = loop.create_future()
+    alert = source_failure_alert(source, exc, date_from, date_to)
+
+    def _notify() -> None:
+        if not finished.done():
+            finished.set_result(None)
+
+    def _send() -> None:
+        try:
+            send_ops_alert(*alert)
+        finally:
+            try:
+                loop.call_soon_threadsafe(_notify)
+            except RuntimeError:
+                pass  # the loop already closed: nobody is waiting any more
+
+    threading.Thread(target=_send, name=f"ops-alert-{source.key}", daemon=True).start()
     try:
-        await asyncio.wait_for(
-            asyncio.to_thread(send_ops_alert, *source_failure_alert(source, exc, date_from, date_to)),
-            timeout=_ALERT_WAIT_S)
+        await asyncio.wait_for(finished, timeout=_ALERT_WAIT_S)
     except TimeoutError:
         _logger.warning("ops alert for King code violation source %s still running after %.0fs; "
                         "the scrape continues", source.key, _ALERT_WAIT_S)
@@ -128,6 +150,7 @@ def _report_progress(callback, pages: int, total: int, count: int) -> None:
     try:
         callback(pages, total, count)
     except Exception as exc:
+        raise_if_time_limit(exc)  # the job's deadline, never a callback failure
         raise ProgressCallbackError(f"progress callback failed: {str(exc)[:160]}") from exc
 
 
@@ -172,16 +195,12 @@ class KingWACodeViolationScraper(BridgeScraper):
                 got = await source.fetch(date_from, date_to)
             except Exception as exc:
                 source.on_progress = None
+                # A Celery time limit is the job's deadline, not this source's failure. The
+                # adapters re-raise it from every catch-all; the chain is checked here too,
+                # before anything else can treat it as a callback or source failure.
+                raise_if_time_limit(exc)
                 if isinstance(exc, ProgressCallbackError):
                     raise
-                # A Celery time limit is the job's deadline, not this source's failure. The
-                # adapters re-raise it from every catch-all; the chain is checked here too.
-                time_limit = celery_time_limit(exc)
-                if time_limit is exc:
-                    raise
-                if time_limit is not None:
-                    # from None: exc already chains to time_limit; never build a cycle.
-                    raise time_limit from None
                 self.source_status[source.key] = SOURCE_FAILED
                 failures.append((source, exc))
                 _logger.error("King code violation source %s failed for %s to %s: %s: %s",

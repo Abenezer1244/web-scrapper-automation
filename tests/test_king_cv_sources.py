@@ -624,23 +624,65 @@ def test_the_time_limit_is_found_anywhere_in_the_chain_without_looping():
     assert base.celery_time_limit(RuntimeError("plain")) is None
 
 
-@pytest.mark.asyncio
-async def test_a_slow_alert_never_holds_the_scrape(monkeypatch, no_backoff):
+def test_a_slow_alert_holds_neither_the_scrape_nor_the_workers_asyncio_run(monkeypatch, no_backoff):
     import threading
+    import time as _time
 
     from src.workers import ops_alerts
 
     release = threading.Event()
-    monkeypatch.setattr(ops_alerts, "send_ops_alert", lambda *a: release.wait(5))
+    monkeypatch.setattr(ops_alerts, "send_ops_alert", lambda *a: release.wait(6))
     monkeypatch.setattr(kcv, "_ALERT_WAIT_S", 0.2)
     _connector(monkeypatch, fail={"bellevue"})
-    started = asyncio.get_running_loop().time()
+    started = _time.monotonic()
     try:
-        recs = await kcv.KingWACodeViolationScraper().scrape("08/01/2026", "09/14/2026")
+        # The worker's shape (tasks.run_scrape_job): asyncio.run joins the default executor
+        # on exit, so an alert left running there would hold this call for the full 6 s.
+        recs = asyncio.run(kcv.KingWACodeViolationScraper().scrape("08/01/2026", "09/14/2026"))
     finally:
         release.set()
-    assert asyncio.get_running_loop().time() - started < 3
+    assert _time.monotonic() - started < 3
     assert "bellevue_code_enforcement" not in {r.enrichment_data["source"] for r in recs}
+
+
+@pytest.mark.asyncio
+async def test_a_deadline_inside_the_progress_callback_is_the_jobs_deadline(monkeypatch, source_alerts):
+    from celery.exceptions import SoftTimeLimitExceeded
+
+    monkeypatch.setattr(burien, "_PAGE_SIZE", BUR_PAGED["page_size"])
+    monkeypatch.setattr(base, "safe_get", _ArcGIS(burien_pages=BUR_PAGED))
+    scraper = kcv.KingWACodeViolationScraper(sources=[burien.BurienSource()])
+
+    def _deadline(*_a):
+        raise SoftTimeLimitExceeded()
+
+    scraper.on_progress = _deadline
+    with pytest.raises(SoftTimeLimitExceeded):
+        await scraper.scrape("01/01/2026", "09/14/2026")
+    assert scraper.source_status == {} and source_alerts.sent == []
+
+
+def test_re_raising_a_wrapped_deadline_leaves_no_reference_cycle():
+    from celery.exceptions import SoftTimeLimitExceeded
+
+    deadline = SoftTimeLimitExceeded()
+    caught = None
+    try:
+        try:
+            try:
+                raise deadline
+            except SoftTimeLimitExceeded as inner:
+                raise RuntimeError("fetch failed after 3 attempt(s)") from inner
+        except RuntimeError as wrapped:
+            base.raise_if_time_limit(wrapped)
+    except SoftTimeLimitExceeded as got:
+        caught = got
+    assert caught is deadline
+    seen, node = set(), caught.__cause__ or caught.__context__
+    while node is not None:
+        assert node is not deadline and id(node) not in seen
+        seen.add(id(node))
+        node = node.__cause__ or node.__context__
 
 
 @pytest.mark.asyncio

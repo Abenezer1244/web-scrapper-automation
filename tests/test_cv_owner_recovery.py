@@ -420,18 +420,20 @@ async def test_the_write_phase_stops_at_its_budget(db, business_user, monkeypatc
     assert stats["skipped"] == "write budget exhausted" and stats["found"] == 0
 
 
-async def test_a_celery_time_limit_is_not_swallowed(db, business_user, monkeypatch):
-    from celery.exceptions import SoftTimeLimitExceeded
+@pytest.mark.parametrize("limit", ["soft", "hard"])
+async def test_a_celery_time_limit_is_not_swallowed(db, business_user, monkeypatch, limit):
+    from celery.exceptions import SoftTimeLimitExceeded, TimeLimitExceeded
 
+    exc_type = SoftTimeLimitExceeded if limit == "soft" else TimeLimitExceeded
     _lease(monkeypatch)
     job_id = await _job(db, business_user)
     rid = await _row(db, business_user, job_id, pin="1000000044")
 
-    async def _fetch(pid, *, max_attempts=1, **_kw):
-        raise SoftTimeLimitExceeded()
+    def _limit_hits_during_http(*_a, **_k):   # where the worker's signal lands
+        raise exc_type()
 
-    monkeypatch.setattr(kca, "_fetch_king_owner", _fetch)
-    with pytest.raises(SoftTimeLimitExceeded):
+    monkeypatch.setattr(kca, "safe_get", _limit_hits_during_http)
+    with pytest.raises(exc_type):
         await asyncio.to_thread(_tick)
 
     assert "cv_owner_recovery_last_at" not in (await _get(db, rid)).enrichment_data

@@ -3,10 +3,19 @@
 Product decision 2026-09-03: the Pierce ATIP fallback stays, and the "never the
 taxpayer name" boundary gets a hard guard so a later edit cannot quietly widen it.
 Before this, the boundary held only because nothing happened to read row["name"].
+
+Owner decision 2026-09-14: legal review cleared storing the ATIP taxpayer name FOR
+TACOMA CODE-VIOLATION OWNER NAMING ONLY (src/scrapers/enrichment/pierce_atip_owner.py,
+behind PIERCE_CV_OWNER_ENABLED). The boundary below still holds for every other Pierce
+record type and product: this module stays address-only, and the owner module refuses
+any row that is not a Tacoma code violation. The last section pins that scope.
 """
+
+from types import SimpleNamespace
 
 import pytest
 
+from src.scrapers.enrichment import pierce_atip_owner
 from src.scrapers.enrichment.pierce_atip import (
     _ALLOWED_OUT_KEYS,
     _assert_address_only,
@@ -205,3 +214,39 @@ def test_a_multi_token_name_sharing_the_street_line_is_still_excised():
     out = parse_summary(row)
     assert "BOICOURT" not in (out["mailing_address"] or "").upper()
     assert "10608 63RD ST E" in out["mailing_address"]
+
+
+# ── Scope of the 2026-09-14 clearance: code violations only ────────────────────
+
+
+def _lead(source):
+    return SimpleNamespace(party_name=None, parcel_id="5000050810", property_address="1 A ST",
+                           enrichment_data={"source_parcel": "5000050810",
+                                            **({"source": source} if source else {})})
+
+
+@pytest.mark.parametrize("source", [None, "pierce_recorder", "pierce_arms", "pierce_probate",
+                                    "pierce_pre_foreclosure", "pierce_tax", "trustee_sale",
+                                    "seattle_sdci_code_violations"])
+def test_no_non_tacoma_code_violation_row_is_ever_offered_a_taxpayer_name(source):
+    assert pierce_atip_owner.owner_lookup_parcels([_lead(source)]) == {}
+
+
+def test_a_non_code_violation_row_is_never_named_even_when_handed_an_answer():
+    row = _lead("pierce_recorder")
+    rows = [dict(_ROW, parcel_number="5000050810", acct_type="Real Property", situs="1 A ST")]
+    plans, counts = pierce_atip_owner.plan_owner_decisions(
+        {"5000050810": [row]}, {"5000050810": pierce_atip_owner.Fetched("found", rows)})
+    assert plans == [] and counts["stale"] == 1 and row.party_name is None
+    # The name-producing rule itself refuses any lead outside the clearance.
+    with pytest.raises(ValueError, match="Tacoma code-violation"):
+        pierce_atip_owner.decide("5000050810", pierce_atip_owner.Fetched("found", rows), "1 A ST",
+                                source="pierce_recorder")
+
+
+def test_the_address_fallback_still_drops_the_name_after_the_clearance():
+    # The owner module reuses only this module's response classes; parse_summary is
+    # unchanged and still the path every non-code-violation Pierce job takes.
+    out = parse_summary(dict(_ROW, acct_type="Real Property"))
+    assert set(out) <= _ALLOWED_OUT_KEYS
+    assert "BOICOURT" not in " ".join(str(v) for v in out.values() if v)

@@ -31,6 +31,7 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
+from src.scrapers.king_cv_sources import PARCEL_AT_SCRAPE_SOURCES
 from src.utils.address_intel import _normalize_street, parse_property_for_display
 from src.utils.located_parcel import (
     KING_GIS_POINT_SOURCE,
@@ -171,21 +172,49 @@ def locate_many(items: list[tuple[str, object, object, str | None]], *,
     return out
 
 
-def owner_lookup_pins(rows) -> dict[str, list]:
-    """{shown located PIN: [rows]} for code-violation rows that still have no owner.
+def owner_parcel_id(res, *, exact_only: bool = False) -> str | None:
+    """The King PIN whose Assessor taxpayer may name this code-violation row's owner.
 
-    Only a shown location (exact, street-level or address point, see
-    src/utils/located_parcel.py) may name the owner: the
-    county's taxpayer on a parcel we are not sure of would put a stranger's name on the
-    lead. A row that already has a party_name is never offered for replacement.
+    A source that prints the PIN (Bellevue, Burien, King County Accela) stored it as
+    parcel_id at scrape, so that PIN is the parcel, provided it is the 10-digit form the
+    scraper wrote. Every other row (Seattle SDCI) has only a located PIN, and only a shown
+    location counts (exact, street-level or address point, see src/utils/located_parcel.py);
+    ``exact_only`` narrows that to what the located-parcel rule allows to spend money.
     """
-    out: dict[str, list] = {}
+    ed = getattr(res, "enrichment_data", None)
+    if isinstance(ed, dict) and ed.get("source") in PARCEL_AT_SCRAPE_SOURCES:
+        pin = getattr(res, "parcel_id", None)
+        return pin if isinstance(pin, str) and len(pin) == 10 and pin.isdigit() else None
+    return located_parcel_id(ed, exact_only=exact_only)
+
+
+def owner_lookup_pins(rows) -> dict[str, list]:
+    """{owner PIN: [rows]} for code-violation rows that still have no owner.
+
+    Only a PIN the source printed, or a shown location (exact, street-level or address point, see
+    src/utils/located_parcel.py), may name the owner: the county's taxpayer on a parcel
+    we are not sure of would put a stranger's name on the lead. A row that already has a
+    party_name is never offered for replacement.
+
+    Printed-PIN parcels come first in the returned order, which is the order the
+    time-budgeted owner pass asks King in: a printed-PIN row this pass does not reach is
+    never named later (the cv_owner_recovery sweep selects SDCI rows only), while an
+    unreached SDCI row is.
+    """
+    printed: dict[str, list] = {}
+    located: dict[str, list] = {}
     for res in rows:
         if res.party_name:
             continue
-        pin = located_parcel_id(res.enrichment_data)
-        if pin:
-            out.setdefault(pin, []).append(res)
+        pin = owner_parcel_id(res)
+        if not pin:
+            continue
+        ed = getattr(res, "enrichment_data", None)
+        is_printed = isinstance(ed, dict) and ed.get("source") in PARCEL_AT_SCRAPE_SOURCES
+        (printed if is_printed else located).setdefault(pin, []).append(res)
+    out = dict(printed)
+    for pin, pin_rows in located.items():
+        out.setdefault(pin, []).extend(pin_rows)
     return out
 
 
@@ -203,7 +232,7 @@ def apply_owner_names(pin_map: dict[str, list], owners: dict[str, str], *,
         if not name:
             continue
         for res in pin_map.get(pin, []):
-            if res.party_name or located_parcel_id(res.enrichment_data) != pin:
+            if res.party_name or owner_parcel_id(res) != pin:
                 continue
             res.party_name = name
             ed = dict(res.enrichment_data)

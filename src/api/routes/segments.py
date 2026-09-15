@@ -42,6 +42,7 @@ from src.api.entitlements import (
 )
 from src.api.lead_actionability import actionable_sql
 from src.api.middleware import rate_limit
+from src.api.results_sort import auction_date_fallback_sql, filing_date_sql
 from src.api.schemas import (
     SegmentIntersectionRequest,
     SegmentIntersectionResponse,
@@ -125,7 +126,7 @@ def _segment_csv_response(rows: list, filename_slug: str, user_id: str) -> Respo
         key=lambda r: (
             -(r.overlap_count or 0),
             0 if (r.phone or r.email) else 1,
-            _filing_sort_key(r.date_recorded),
+            _filing_sort_key(None if r.date_is_auction_date else r.date_recorded),
         ),
     )
     pairs = [
@@ -158,6 +159,22 @@ def _segment_csv_response(rows: list, filename_slug: str, user_id: str) -> Respo
         ),
     )
 
+# An auction date a scraper stood in for a missing notice date (trustee_sale,
+# Snohomish pre_foreclosure) is not a filing date (owner decision 2026-09-15): rows
+# carry it as date_is_auction_date, and a filing-date window never matches it. The
+# rule is results_sort's, rendered once. Only those two record types' scrapers write
+# the origin keys it reads, so the CASE skips the (large) expression for every other
+# row. Braces are doubled because the templates below go through str.format.
+_STAND_IN_SQL = (
+    "(CASE WHEN sc.record_type IN ('trustee_sale', 'pre_foreclosure') THEN "
+    + auction_date_fallback_sql("r")
+    + " ELSE FALSE END)"
+).replace("{", "{{").replace("}", "}}")
+
+# The filing date a window filters on: the same date the Results page sorts on, so a
+# real "Month D, YYYY" notice date is placed in time instead of skipped as undated.
+_FILING_DATE_SQL = filing_date_sql("r").replace("{", "{{").replace("}", "}}")
+
 # Representative rows returned in the JSON preview. The CSV export returns the
 # full set up to EXPORT_CAP (defensive bound — intersections are inherently
 # small, but never stream an unbounded result into memory).
@@ -184,7 +201,8 @@ WITH candidates AS (
            r.phone, r.phone_type, r.email,
            r.phones, r.emails, r.property_key,
            r.enrichment_data->>'lead_subtype' AS lead_subtype,
-           sc.record_type, sc.county, sc.state, j.created_at AS job_created_at
+           sc.record_type, sc.county, sc.state, j.created_at AS job_created_at,
+           {_STAND_IN_SQL} AS date_is_auction_date
     FROM results r
     JOIN jobs j ON j.id = r.job_id AND j.user_id = :uid AND j.status = 'done'
     JOIN scraper_configs sc ON sc.id = j.scraper_config_id AND sc.user_id = :uid
@@ -225,7 +243,7 @@ ranked AS (
 SELECT rk.id, rk.date_recorded, rk.party_name, rk.parcel_id, rk.property_address,
        rk.mailing_address, rk.property_city, rk.property_state, rk.property_zip,
        rk.county, rk.state, rk.phone, rk.phone_type, rk.email,
-       rk.phones, rk.emails,
+       rk.phones, rk.emails, rk.date_is_auction_date,
        a.matched_record_types, a.overlap_count, a.lead_subtype
 FROM ranked rk
 JOIN agg a ON a.property_key = rk.property_key
@@ -262,6 +280,7 @@ WITH candidates AS (
            r.property_key, r.is_duplicate,
            r.enrichment_data->>'lead_subtype' AS lead_subtype,
            sc.record_type, sc.county, sc.state, j.created_at AS job_created_at,
+           {_STAND_IN_SQL} AS date_is_auction_date,
            COALESCE(r.property_key, r.dedup_hash, 'id:' || r.id::text) AS bucket
     FROM results r
     JOIN jobs j ON j.id = r.job_id AND j.user_id = :uid AND j.status = 'done'
@@ -275,9 +294,25 @@ WITH candidates AS (
       -- three predicates pass and behavior is identical to the all-time query.
       -- When a window IS active, NULL filing dates are excluded (can't be placed
       -- in time) and reported separately via excluded_no_date_count.
-      AND (CAST(:filing_from AS date) IS NULL OR r.date_recorded_parsed >= CAST(:filing_from AS date))
-      AND (CAST(:filing_to AS date) IS NULL OR r.date_recorded_parsed <= CAST(:filing_to AS date))
-      AND (CAST(:require_date AS boolean) = FALSE OR r.date_recorded_parsed IS NOT NULL)
+      AND (CAST(:filing_from AS date) IS NULL OR {_FILING_DATE_SQL} >= CAST(:filing_from AS date))
+      AND (CAST(:filing_to AS date) IS NULL OR {_FILING_DATE_SQL} <= CAST(:filing_to AS date))
+      AND (CAST(:require_date AS boolean) = FALSE OR {_FILING_DATE_SQL} IS NOT NULL)
+      -- Cheap necessary conditions on the parsed column. SQL text order does not fix
+      -- evaluation order, but these give the planner cheap quals to apply before the
+      -- costlier checks: measured with EXPLAIN (ANALYZE) on a 92k-row account, the
+      -- windowed query ran ~580 ms without them and ~207 ms with them. They cannot
+      -- change the result: a row with a parsed date outside the window fails the
+      -- exact predicate above too, and a row with no date text has no filing date.
+      AND (CAST(:filing_from AS date) IS NULL OR r.date_recorded_parsed IS NULL
+           OR r.date_recorded_parsed >= CAST(:filing_from AS date))
+      AND (CAST(:filing_to AS date) IS NULL OR r.date_recorded_parsed IS NULL
+           OR r.date_recorded_parsed <= CAST(:filing_to AS date))
+      AND (CAST(:require_date AS boolean) = FALSE OR r.date_recorded IS NOT NULL)
+      AND (CAST(:require_date AS boolean) = FALSE OR NOT {_STAND_IN_SQL})
+      -- Tied to the bounds too, not only require_date: a stand-in parses to its
+      -- auction date, so any active bound must never place it in the window.
+      AND ((CAST(:filing_from AS date) IS NULL AND CAST(:filing_to AS date) IS NULL)
+           OR NOT {_STAND_IN_SQL})
       {{county_clause}}
 ),
 agg AS (
@@ -310,7 +345,7 @@ ranked AS (
 SELECT rk.id, rk.date_recorded, rk.party_name, rk.parcel_id, rk.property_address,
        rk.mailing_address, rk.property_city, rk.property_state, rk.property_zip,
        rk.county, rk.state, rk.phone, rk.phone_type, rk.email,
-       rk.phones, rk.emails,
+       rk.phones, rk.emails, rk.date_is_auction_date,
        a.matched_record_types, a.overlap_count, a.identity_strength, a.lead_subtype
 FROM ranked rk
 JOIN agg a ON a.bucket = rk.bucket
@@ -332,18 +367,20 @@ WITH candidates AS (
            r.phone, r.phone_type, r.email,
            r.phones, r.emails, r.property_key,
            r.enrichment_data->>'lead_subtype' AS lead_subtype,
-           sc.record_type, sc.county, sc.state, j.created_at AS job_created_at
+           sc.record_type, sc.county, sc.state, j.created_at AS job_created_at,
+           {_STAND_IN_SQL} AS date_is_auction_date
     FROM results r
     JOIN jobs j ON j.id = r.job_id AND j.user_id = :uid AND j.status = 'done'
     JOIN scraper_configs sc ON sc.id = j.scraper_config_id AND sc.user_id = :uid
     WHERE r.user_id = :uid
       AND r.property_key IS NOT NULL
-      AND r.date_recorded_parsed IS NOT NULL
+      AND {_FILING_DATE_SQL} IS NOT NULL
+      AND NOT {_STAND_IN_SQL}
       AND sc.record_type = ANY(:types)
       -- Hard 18-month tax-delinquent cap (self-scoping: NULL bill_year rows pass).
       AND {tax_cap_sql('r')} AND {actionable_sql('r')}
-      AND (CAST(:filing_from AS date) IS NULL OR r.date_recorded_parsed >= CAST(:filing_from AS date))
-      AND (CAST(:filing_to AS date) IS NULL OR r.date_recorded_parsed <= CAST(:filing_to AS date))
+      AND (CAST(:filing_from AS date) IS NULL OR {_FILING_DATE_SQL} >= CAST(:filing_from AS date))
+      AND (CAST(:filing_to AS date) IS NULL OR {_FILING_DATE_SQL} <= CAST(:filing_to AS date))
       {{county_clause}}
 ),
 agg AS (
@@ -369,7 +406,7 @@ ranked AS (
 SELECT rk.id, rk.date_recorded, rk.party_name, rk.parcel_id, rk.property_address,
        rk.mailing_address, rk.property_city, rk.property_state, rk.property_zip,
        rk.county, rk.state, rk.phone, rk.phone_type, rk.email,
-       rk.phones, rk.emails,
+       rk.phones, rk.emails, rk.date_is_auction_date,
        a.matched_record_types, a.overlap_count, a.lead_subtype
 FROM ranked rk
 JOIN agg a ON a.property_key = rk.property_key
@@ -405,7 +442,8 @@ JOIN jobs j ON j.id = r.job_id AND j.user_id = :uid AND j.status = 'done'
 JOIN scraper_configs sc ON sc.id = j.scraper_config_id AND sc.user_id = :uid
 WHERE r.user_id = :uid
   AND sc.record_type = ANY(:types)
-  AND r.date_recorded_parsed IS NULL
+  -- A stand-in auction date is no filing date either.
+  AND ({_FILING_DATE_SQL} IS NULL OR {_STAND_IN_SQL})
   -- Hard 18-month tax-delinquent cap (self-scoping: NULL bill_year rows pass), so
   -- this "skipped (no filing date)" count matches the capped candidate scope.
   AND {tax_cap_sql('r')} AND {actionable_sql('r')}
@@ -579,6 +617,7 @@ async def intersection_preview(
                 email=r.email,
                 matched_record_types=list(r.matched_record_types or []),
                 overlap_count=r.overlap_count,
+                date_is_auction_date=bool(r.date_is_auction_date),
             )
             for r in rows
         ],
@@ -677,6 +716,7 @@ def _union_rows(rows: list) -> list[SegmentLeadRow]:
             email=r.email,
             matched_record_types=list(r.matched_record_types or []),
             overlap_count=r.overlap_count,
+            date_is_auction_date=bool(r.date_is_auction_date),
             identity_strength=r.identity_strength,
         )
         for r in rows

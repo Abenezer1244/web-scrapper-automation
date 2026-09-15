@@ -104,6 +104,25 @@ async def test_get_job(
     assert resp.json()["status"] == "pending"
 
 
+async def test_get_job_carries_its_config_fields_like_the_list(
+    client: AsyncClient,
+    starter_token: str,
+    pending_job: Job,
+    scraper_config,
+):
+    """The Results page reads record_type from GET /jobs/{id} to label an auction-lead
+    job's first column "Notice Date"; it came back null there while the list had it."""
+    headers = {"Authorization": f"Bearer {starter_token}"}
+    single = (await client.get(f"/jobs/{pending_job.id}", headers=headers)).json()
+    listed = [j for j in (await client.get("/jobs", headers=headers)).json() if j["id"] == pending_job.id][0]
+
+    fields = ("record_type", "county", "state", "scraper_name", "batch_id")
+    assert {f: single[f] for f in fields} == {f: listed[f] for f in fields}
+    assert single["record_type"] == scraper_config.record_type
+    assert single["county"] == scraper_config.county
+    assert single["scraper_name"] == scraper_config.name
+
+
 async def test_get_job_not_found(client: AsyncClient, starter_token: str):
     resp = await client.get(
         f"/jobs/{uuid.uuid4()}",

@@ -48,14 +48,112 @@ job status (NOT NULL). Prod dry run: 2 candidates, 1001->0 and 104->0, window [t
       trial user untouched; other accounts' counters unchanged.
 - [x] Fix false premise in `_expire_trials_impl` docstring.
 - [x] Full suite (isolated test DB) + ruff; Codex review + challenge on the diff.
-- [ ] Prod: dry run (expect 2), then with approval commit; verify `/billing/usage` 0/50 + reset date,
-      ledger untouched, drift 0.
-### Phase 2 (needs approval, BE + FE)
-- [ ] Add window-aware usage to `/auth/me` as a new field (keep raw), regen OpenAPI; FE dashboard card,
-      sidebar and banner read the one window-aware value. Percent card stays clamped for the bar, but show
-      real numbers ("1,001 / 50") so the overshoot is not hidden.
-- [ ] Playwright (Chromium) verification of a controlled Starter account.
+- [x] Prod: dry run (expect 2), then with approval commit; verify `/billing/usage` 0/50 + reset date,
+      ledger untouched, drift 0. APPLIED 2026-09-15: 1001->0, 104->0, window [09-09, 10-01); re-run 0
+      candidates; counter == ledger-in-window for all 7 users. PR #320.
+### Phase 2 (FE PR bridgeleads-web #144)
+- [x] Decided SIMPLER than planned: no BE field. `/billing/usage` already is the window-aware object (billing
+      tab + records page used it), so the dashboard card, banner and sidebar now read it via `hooks/use-usage.ts`.
+      No API contract change (sidesteps Codex's /auth/me semantics concern). Over limit reads "over plan
+      limit"/"Over"; exactly at limit says "reached"; loading shows "..."; usage re-read when finished jobs change.
+- [x] Playwright (Chromium), local API on #320 + isolated DB: legacy 1001/50 reproduced then 0/50 after the
+      repair script; stale window /auth/me=40 but UI 0/50; 50/50 "reached"; Pro 100/1,000; reload + new tab +
+      fresh login stable; job finish 10->15 in 2-3s with no reload, and 10 for 20s with the invalidation removed.
+- [x] Codex FE gate: R1 FAIL (1 P1 + 4 P2 fixed; cross-account cache disproved), R2 P1 disproved (banner
+      returns null for -1) + P2 fixed, R3 PASS.
 
+## Review
+- Root cause: migration 088 backfill ignored `trial_ends_at` for users mid-trial at deploy, so Pro-trial usage
+  survived the Starter downgrade. Not a tenant leak, not counter corruption, not concurrency. 2 accounts, closed
+  population, repaired in prod with a locked, guarded one-shot script.
+- Separate FE defect fixed: quota displays read the raw `/auth/me` counter; they now share `/billing/usage`.
+- Failures along the way: first fix design (permanent hourly reconcile step) failed the Codex gate on races;
+  the first browser run was killed for low memory, and the orphaned dev server then 500'd on EPIPE until
+  relaunched detached with file logs; PowerShell `bash` resolved to the WSL stub, not Git Bash.
+- Left: Codex P3s (empty ring while loading, `isOverLimit` name, banner comment says per-session for
+  localStorage). Isolated DB `bridgeleads_quota1001_test` holds qa-* seed rows; drop it when done.
+
+# CRM/dialer-ready CSV layout (2026-09-14)
+
+Branch `feat/crm-ready-csv-columns` (worktree `C:/Users/Windows/bl-wt-crmcsv`, off origin/main 47698a8).
+Owner decisions: **versioned layout** (existing scrapers keep `legacy_v1`, new scrapers get `crm_v1`,
+per-scraper switch); **read-only prod reads allowed** for format sampling + real CSV verification.
+
+## Proven (investigation)
+- ONE canonical builder already: `src/utils/lead_export.py` `build_lead_export_row` / `write_lead_csv`.
+  Manual download (`GET /jobs/{id}/download`) and scheduled per-job export (`DataExporter` csv/excel/json)
+  both use it with lean per-record-type columns. Batch + Lists use `OVERLAP_LEAD_COLUMNS` (same values).
+  FE never builds CSV. Webhook/Zapier/PhoneBurner/Tracerfy each have their OWN field mapping.
+- Split columns ALREADY exist (snake_case, appended): first_name, last_name, property_street/city/state/zip,
+  mailing_street/city/state/zip, phone/phone_2/phone_3, email/email_2/email_3. Headers are pinned by an
+  append-only compat contract + `docs/batchdialer-import-guide.md` tells customers to SAVE mappings on them.
+- Stored structured: property_city/state/zip (mig 085), phones[]/emails[] (phone == phones[0] by
+  construction). NOT stored: first/last name, mailing city/state/zip, county/state/record_type on Result
+  (they live on ScraperConfig).
+- Prod sample (read-only): name ORDER depends on source. Recorder `LAST FIRST M` = King/Pierce/Clark/
+  Cowlitz probate+prefc, Snohomish tax, King CV. NATURAL `FIRST M LAST` = trustee_sale (all counties),
+  Snohomish prefc. Okanogan probate mixed. Pierce CV party_name is a case label, not a person.
+- Current CSV corrupts names today: natural-order sources reversed (`SHIRLEY A JOHNSON` -> first `A`),
+  `JOHN AND JANE SMITH` -> `AND`/`JOHN`, `..., HUSBAND AND WIFE` -> `HUSBAND`, `WEBB JR HAROLD` -> `JR`.
+- Address parser: good on real US data; bugs: trailing country becomes city (`..., CANADA` -> city CANADA),
+  placeholder `UNKNOWN UNKNOWN, UNKNOWN WA` -> city UNKNOWN.
+- Drift bug: scheduled export projection `_RESULT_EXPORT_COLUMNS` (tasks.py:214) omits stored
+  property_city/state/zip, so scheduled files can blank city/zip that the manual download fills.
+- Separate (NOT fixed here, report): skip-trace `_parse_full_address` sends state `CA` for Canada, `UN` for
+  United Kingdom to Tracerfy; PhoneBurner `_split_name` is naive; batch/Lists CSVs keep legacy layout.
+
+## Plan
+### Phase 1 - parsing correctness + layout spec (backend, 2 src files + tests)
+- [x] `lead_formatting.py`: `split_first_person(party_name, name_order)` (recorder / natural / comma_only /
+      None -> blank). Two-level joiners, entity-in-cell blanks, roles + uncommaed vesting blank, C/O cut,
+      trailing EST OF / HEIRS OF(+) stripped, initials never a First, ambiguous recorder shapes blank.
+- [x] `lead_formatting.py`: address - foreign country / tail Canadian postal code -> no split; trailing USA
+      dropped; UNKNOWN placeholders; USPS AA/AE/AP.
+- [x] `lead_export.py`: `name_order_for` map + (county, type) overrides; `crm_v1` (key, label) spec;
+      `resolve_export_layout`; row `context` + new keys county / county_state / record_type / case_id;
+      `write_lead_csv(labels=, context=)`, labels sanitized.
+- [x] Tests: `test_lead_formatting.py` (+ prod regressions), new `test_lead_export_crm_layout.py`.
+      370 passed. Mutation check caught flips. `test_data_exporter::test_csv_has_dialer_split_columns`
+      fails until Phase 2 passes context (expected; same PR).
+- [x] Prod READ-ONLY old-vs-new diff, 163,261 rows, 5 iterations: every changed name hand-reviewed.
+      Codex P1 pass 1 = FAIL (5 P1); 3 real fixed, 1 defense adopted, 1 not real (tested).
+- Residual (accepted): double surnames 'Jessica M. Hernandez Olvera' -> last 'Olvera'.
+### Phase 2 - wiring (<=5 src files)
+- [x] `schemas.py`: `DeliverConfig.csv_layout: Literal["legacy_v1","crm_v1"] | None`; response reports the
+      EFFECTIVE layout; `DeliverUpdate.csv_layout` declared (extra="forbid" + GET echo would 422 every edit).
+- [x] `scrapers.py`: create stamps `crm_v1`; `_merge_deliver` keeps a valid stored layout when omitted.
+- [x] `jobs.py` download + `tasks.py` scheduled export + `data_exporter.py` (csv/excel labels, xlsx '@' text
+      cells for ids/zips/phones, JSON snake_case) resolve the same layout + source context; scheduled
+      projection now carries stored property_city/state/zip (drift bug fixed).
+- [x] `tests/test_csv_layout_delivery.py` (21, real endpoints + DB, mutation-checked: 10 fail when wiring removed).
+- [x] Full suite: local runs killed for low memory; owner chose CI. PR #315 CI: 3652 passed, 1 failed (key-set
+      test copy, fixed in 76b3524). OpenAPI regen additive only (0 deletions), CI drift check passed.
+- [x] Codex Phase 2: 1 P1 + 2 P2, all verified NOT real against the code (unconditional export block; stored
+      deliver always a dict; invalid stored layout already normalized to None on edit).
+- Batch children + batch/Lists combined CSVs stay legacy this PR (report).
+### Phase 3 - verification + docs + FE
+- [x] Real CSVs, read-only, 8 prod jobs / 935 rows: 0 column mismatches vs DB values (local files deleted, PII).
+- [ ] Playwright Results -> Download CSV: needs deploy or local full stack (not done).
+- [ ] FE layout toggle; BatchDialer guide for crm_v1.
+
+### Follow-up - double surnames (owner request 2026-09-15)
+- [x] Read-only scan of every 4+-word prod name (573 non-blank splits read): double surnames were mostly
+      RECORDER order ('ALATORRE HERNANDEZ JOSE LUIS' -> first HERNANDEZ), plus missed organizations,
+      role abbreviations (TTEE/EXEC/PER REP) and scrambled Vietnamese cells.
+- [x] Codex design consult before code; reconciled (adopted: role strip, phrase-only org words, list
+      safeguards, particle pairs, LE blank; kept with evidence: backslash joiner, MRS blank, OF/FOR).
+- [x] Implemented in `lead_formatting.py` (export-only helpers; title-status parser untouched).
+- [x] Prod diff vs committed branch, 163,261 rows, 2 runs: 39 changed (all correct), 2 filled (correct),
+      457 now blank (orgs / VN scrambles / double surname + initial). 12 over-blanks from run 1 fixed.
+- [x] Tests: 485 pass; mutation check (24 fail with rules disabled). Codex review FAIL -> P1 disproven
+      with HEAD comparison -> GATE PASS. Residual: rare surnames equal to org words (CITY, STATE) blank.
+
+## Review
+Contract change, not new parsing: split columns already existed. Versioned layout keeps every existing customer's
+headers; new scrapers get crm_v1. The real win is correctness: source-aware names (213 corrected, 405 wrong ->
+blank on 163,261 prod rows) and no fabricated address parts. Two latent bugs fixed (scheduled situs drop, Pierce
+case id). One deploy-breaking bug avoided (DeliverUpdate extra=forbid). Double surnames handled in the
+follow-up; residuals: rare surnames equal to org words blank, natural-order names leaked into recorder cells.
 # King property follow-ups (2026-09-15)
 
 Branch `fix/king-property-followups`. Owner said "run fix and work with codex on all" after the
@@ -573,3 +671,20 @@ auction date in `date_recorded` (semantic, owner decision); scraper records page
       parser to a literal SQL string: literal_binds DOUBLED the regex backslashes (would match nothing); caught before tests.
 - [x] Parser refactor: shared exception-free `_valid_date` for numeric and month-name dates; 17 PostgreSQL-evaluated
       totality cases incl. prod junk (instrument numbers, UI text). 3 of 4 endpoint tests red on the old query.
+
+## Notice Date: an auction-date stand-in is never shown as a Date (2026-09-15, branch `feat/notice-date`)
+Owner decision: on auction leads (trustee_sale) and Snohomish pre_foreclosure, Date shows the real notice date, else
+blank; header "Notice Date" on trustee_sale jobs. Stored `date_recorded` unchanged (dedup_hash / source_fingerprint).
+- [x] Census (prod, read-only): 118 stand-ins; no other date exists on these rows; recorder prefc never affected
+- [x] Codex plan consult: FAIL (results.auction_date is moved by the NTS matcher on postponement) -> compare with the
+      scraper-recorded origin date instead -> PASS
+- [x] Phase 1 BE: `src/utils/source_dates.py` rule; SQL twin in results_sort (stand-ins sort undated);
+      ResultRow.date_is_auction_date; exports blank it (per-job, R2, batch combined, CRM, overlap filed_date)
+- [x] Phase 2 BE: BatchLeadRow + SegmentLeadRow flags; Lists filing windows never match a stand-in and count it as
+      no-date; Lists CSV blanks/sorts it undated; exporter honors a precomputed flag
+- [x] Freshness: a stand-in has no freshness_days (its future date clamped to 0 = "freshest")
+- [x] Perf: strpos(enrichment_data::text,'auction_date') pre-check (json re-parses per ->): prod 92k rows 13.4 s -> 148 ms
+- [x] Codex diff review: FAIL (rule not provenance-scoped; flag set after signals) -> fixed -> PASS; P2 (Lists windows
+      ignore month-name notice dates) not adopted: pre-existing, 0 such prod rows, would lose the filing-date index
+- [x] Full backend suite green (3,783) + guard test made precise ({identifier} tokens, all 4 Lists templates)
+- [ ] PR + CI + merge + deploy; then FE (ResultsTable, LeadCards, BatchLeadsTable, Lists, "Notice Date" header)

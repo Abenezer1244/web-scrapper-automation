@@ -153,6 +153,11 @@ async def _run_scraper(
             scraper.on_progress = on_progress
         records = await scraper.scrape(date_from, date_to)
 
+        # A connector that merges several sources ships what succeeded when one source
+        # fails, and says so here (e.g. King code violations). Customer-facing copy.
+        for warning in getattr(scraper, "scrape_warnings", None) or ():
+            _publish_log(r, job_id, "warning", warning)
+
         # Log AI usage if this was an AI-powered scrape
         if hasattr(scraper, "ai_cost") and scraper.ai_cost > 0:
             tokens = scraper.ai_tokens
@@ -903,19 +908,62 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
     # the SAME production path for an already-delivered job.
     pierce_address_recovery(db, r, job_id, config, all_results)
 
-    # King code violations carry coordinates but no parcel, so the parcel-keyed passes
-    # below can never give them a mailing address. Locate the parcel strictly (one
+    # Tacoma code violations name the case, never the owner, so party_name arrives
+    # empty. The parcel came from the source record itself; the owner is the Pierce
+    # taxpayer of record for it, accepted only under pierce_atip_owner's rules (echoed
+    # parcel, real property, not a reference parcel, same situs). Owner decision
+    # 2026-09-14 scopes this to code violations; no other Pierce record type is named
+    # from ATIP. Bounded here; rows not reached keep no owner_status and the
+    # background sweep (src/workers/pierce_cv_owner_recovery.py) retries them.
+    if (config.county.lower() == "pierce" and config.state.upper() == "WA"
+            and config.record_type == "code_violation" and settings.PIERCE_CV_OWNER_ENABLED):
+        from src.scrapers.enrichment.pierce_atip_owner import (
+            lookup_parcels,
+            owner_lookup_parcels,
+            plan_owner_decisions,
+            write_owner_decisions,
+        )
+
+        _pcv_map = owner_lookup_parcels(all_results)
+        if _pcv_map:
+            # _publish_log commits, so no transaction is held open across the lookups.
+            _publish_log(r, job_id, "info",
+                         f"Looking up property owners for {len(_pcv_map)} code violation "
+                         "parcels...", db=db)
+            _pcv_stats: dict = {}
+            _pcv_fetched = lookup_parcels(list(_pcv_map), source="tacoma_code_violations",
+                                          budget_s=240, stats=_pcv_stats)
+            try:
+                _pcv_plans, _ = plan_owner_decisions(_pcv_map, _pcv_fetched)
+                _pcv_counts = write_owner_decisions(db, _pcv_plans, checked_at=_now().isoformat())
+                _publish_log(r, job_id, "info",
+                             f"Found {_pcv_counts.get('matched', 0)} property owners for "
+                             "code violations.", db=db)
+            except Exception as exc:
+                db.rollback()
+                # Type only: a DB error string can carry the bound taxpayer name (Codex r11).
+                _logger.warning("Job %s: Pierce code violation owner write failed: %s",
+                                job_id, type(exc).__name__)
+
+    # Seattle SDCI code violations carry coordinates but no parcel, so the parcel-keyed
+    # passes below can never give them a mailing address. Locate the parcel strictly (one
     # polygon, same normalized street and ZIP); when that fails, try King's own address
     # points (src/scrapers/enrichment/king_address_points.py), and take the mailing from
     # the Assessor extract for a tier that allows it. The PIN is stored beside the lead,
     # never in parcel_id (dedup/billing). Rows without coordinates are included: they
     # get the terminal no_coordinates status and can only reach the hidden address_only tier.
+    # Bellevue, Burien and King County Accela rows are never located here, even without a
+    # printed parcel: their owner and skip trace are keyed on the printed PIN only, and
+    # those with one take the ordinary parcel-keyed King passes below instead.
     if (config.county.lower() == "king" and config.state.upper() == "WA"
             and config.record_type == "code_violation"):
+        from src.scrapers.king_cv_sources import PARCEL_AT_SCRAPE_SOURCES
+
         _cv_rows = {
             str(res.id): res for res in all_results
             if not res.parcel_id and not res.mailing_address
             and isinstance(res.enrichment_data, dict)
+            and res.enrichment_data.get("source") not in PARCEL_AT_SCRAPE_SOURCES
             and ((res.enrichment_data.get("latitude") and res.enrichment_data.get("longitude"))
                  or (res.property_address or "").strip())
             and not res.enrichment_data.get("kc_pin_status")
@@ -933,10 +981,10 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                          db=db)
             # Budget covers the WHOLE step: 420 s of parcel lookups (15 s request
             # timeout, so the last call ends by ~435 s) + one extract scan (~15 s) +
-            # commit. A code_violation job runs no eRealProperty pass (no parcel_id),
-            # so this replaces rather than adds to the King budget in the sum below.
-            # The address-point fallback runs inside the same 420 s and only starts while
-            # both of its requests can still time out before the deadline.
+            # commit. It is counted in the code_violation budget sum below, beside the
+            # owner pass and the (shorter) parcel-keyed King pass. The address-point
+            # fallback runs inside the same 420 s and only starts while both of its
+            # requests can still time out before the deadline.
             # Rows not reached keep no status and are picked up by
             # scripts/backfill_king_code_violation_mailing.py; rows whose fallback was not
             # reached keep their point status and are picked up by
@@ -980,14 +1028,15 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                 _logger.warning("Job %s: code violation mailing commit failed: %s",
                                 job_id, str(exc)[:120])
 
-        # SDCI names the complaint, never the owner, so party_name arrives empty. A
-        # shown located PIN (exact, street-level or address point; never address_only or
-        # a condo complex) names the owner through the same owner-only eRealProperty
-        # path King tax uses: lease-guarded, paced, breaker-protected, and it drops any
-        # page the county served for a different parcel. This job has no parcel_id, so
-        # the parcel-keyed owner pass below never runs for it; this takes its 300 s
-        # slot in that budget sum. Rows not reached keep no owner and are named later
-        # by the beat sweep src/workers/cv_owner_recovery.py.
+        # No source names the owner, so party_name arrives empty. The PIN Bellevue,
+        # Burien or King County Accela printed (parcel_id), or a shown located SDCI PIN
+        # (exact, street-level or address point; never address_only or a condo complex),
+        # names the owner through the same owner-only eRealProperty path King tax uses:
+        # lease-guarded, paced, breaker-protected, and it drops any page the county served
+        # for a different parcel. The tax-only owner pass below never runs for this job;
+        # this takes its 300 s slot in the budget sum. SDCI rows not reached keep no owner
+        # and are named later by the beat sweep src/workers/cv_owner_recovery.py, which
+        # selects SDCI rows only, so printed-PIN parcels are asked first.
         from src.scrapers.enrichment.king_parcel_locate import (
             apply_owner_names,
             owner_lookup_pins,
@@ -1238,9 +1287,13 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
             # This pass can run to _KING_TOTAL_BUDGET_S plus one chunk's wait_for
             # grace (+60s), so 600 + 60 = 660s worst case:
             #   1800 + 660 + 300 = 2760s, inside soft_time_limit=3600s with ~840s
-            # left for persistence, export, billing and delivery. Raise a budget
-            # only by re-doing that sum.
-            _KING_TOTAL_BUDGET_S = 600
+            # left for persistence, export, billing and delivery. A code_violation job
+            # also runs the SDCI parcel match (~450s) before its owner pass, so this
+            # pass gets 240s there: 1800 + 450 + 300 + (240 + 60) = 2850s, ~750s left.
+            # Its parcel rows (Bellevue, Burien) are about a hundred a month and the
+            # extract usually fills their mailing first. Raise a budget only by
+            # re-doing that sum.
+            _KING_TOTAL_BUDGET_S = 240 if config.record_type == "code_violation" else 600
             _king_deadline = _time.monotonic() + _KING_TOTAL_BUDGET_S
 
             def _king_left() -> float:

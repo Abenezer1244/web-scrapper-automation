@@ -19,6 +19,128 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-15 - Notice Date: auction-date stand-ins are never shown, exported or sorted as a Date
+
+**Built / Shipped (branch `feat/notice-date`):** owner decision that auction leads show a real notice date or blank.
+`src/utils/source_dates.py` (Python rule), its SQL twin in `src/api/results_sort.py` (ORM + rendered raw SQL for
+Lists), `date_is_auction_date` on ResultRow / BatchLeadRow / SegmentLeadRow, blank emitted date in every CSV built by
+`build_lead_export_row` (incl. CRM layout and overlap `filed_date`), Lists filing windows exclude stand-ins, and no
+freshness for a stand-in. Stored `date_recorded` untouched.
+
+**Tried / Decided:** comparing `date_recorded` with `results.auction_date` was rejected (Codex P1, verified): the NTS
+matcher rewrites that column on a postponement, which would re-expose an old stand-in as a notice date. The scraper's
+own recorded auction date is used instead, scoped by provenance (an `nts_source` object for trustee_sale; `source ==
+snohomish_tribune` for Snohomish prefc), after Codex showed key-name matching could hide a real date on a Snohomish
+trustee sale carrying both. A persisted flag + backfill was unnecessary once provenance was immutable. CSV column names
+unchanged (dialer integrations). Lists windows keep the indexed `date_recorded_parsed` (month-name real notice dates:
+0 in prod).
+
+**Failed / Blocked:** the first raw-SQL rendering for Lists was 18 KB and re-parsed json dozens of times per row:
+13.4 s over 92k rows; a strpos pre-check brought it to 148 ms with the same 83 stand-ins. Wall-clock prod timings were
+unusable during load (old query swung 1-11 s); server-side EXPLAIN minimums were needed. A red-check against
+`origin/main` files failed on an unrelated import after main moved; red-checks must use the branch base.
+
+**Caught & fixed:** stand-ins exported as freshness 0 (the freshest lead). A Lists guard test asserted "no `{`" in
+formatted SQL; regex quantifiers made it fail, so it now checks unfilled `{identifier}` tokens on all four templates.
+
+**Pending / Handoff:** frontend (N/A on the flag in Results, mobile cards, batch leads, Lists; "Notice Date" header on
+trustee_sale jobs).
+
+**Facts learned:** `enrichment_data` is `json`, not `jsonb`: every `->` re-parses the document. Rendering SQLAlchemy
+expressions into `text()` needs backslash-free, colon-free patterns and doubled braces for `str.format` templates.
+
+---
+
+## 2026-09-15 - CRM/dialer-ready CSV layout (versioned), and the name split that was backwards for whole sources
+
+**Built / Shipped:** draft PR #315 (`feat/crm-ready-csv-columns`, not merged). `crm_v1` layout (First Name,
+Last Name, Party Name, Property Address/City/State/Zip, Mailing Address/City/State/Zip, Phone 1-3, Email 1-3,
+Parcel ID, County, County State, Record Type, Date Recorded, record-type block, reference block) selected per
+scraper by `deliver.csv_layout`. New scrapers get crm_v1; existing ones keep `legacy_v1` headers byte for byte.
+Source-aware `split_first_person` (recorder / natural / comma_only / unknown -> blank) in
+`src/utils/lead_formatting.py`; address guards (foreign tail, Canadian postal tail, USA tail, UNKNOWN
+placeholders, AA/AE/AP). Manual download, scheduled CSV/Excel/JSON use one layout + source context.
+Fixed on the way: scheduled export dropped stored property_city/state/zip; Pierce CV `case_number` never exported.
+
+**Tried / Decided:** investigation found the split columns ALREADY existed (snake_case, appended), so this was a
+contract change, not new parsing. Owner chose a versioned layout over a hard switch because the BatchDialer guide
+tells customers to save mappings on the old headers. First/Last name the FIRST-listed individual only when its
+full name reads unambiguously in the source's declared order. Labels: `County State` (not `State`, which would
+collide with Property/Mailing State) and `Date Recorded` (not `Date`, vs Auction Date). `default_amount` is
+principal owing, so `Principal Owing`, not "Default Owed". Batch children and batch/Lists combined CSVs stay legacy.
+
+**Failed / Blocked:** local full pytest killed 3 times for low memory (other sessions' suites; 480 MB free), plus
+one Codex run; used the draft PR's CI instead (3652 passed / 1 failed, the failure was a copy of a key-set test I
+had updated elsewhere; fixed). First CI run failed at pip install (PyPI `sqlalchemy` fetch), re-run. Production
+reads were blocked by the permission classifier until the owner allowed read-only. Playwright UI download check
+and the FE layout toggle not done (FE repo, and needs a deploy or a local full stack).
+
+**Caught & fixed:** my own first split cut entities apart ('WSDOT R/E SERVICES' -> first 'R'), forced natural
+order after 'ESTATE OF' in recorder data, and read 'V' as a suffix; a read-only prod old-vs-new diff (163,261
+rows, 6 runs) caught each, now pinned as tests. Codex P1s: C/O as co-owner, bare initials as First, uncommaed
+vesting words, unspaced '&'. `DeliverUpdate` is `extra="forbid"` and the FE echoes GET: without declaring
+`csv_layout` there, EVERY scraper edit would have 422'd after deploy. `_merge_deliver` replaces non-secret
+fields, so an omitted layout would have silently flipped a config; now sticky.
+Codex Phase 2 P1 (NameError in re-export) rejected with evidence: the first export block is unconditional, the
+same scope `export_columns` / `exporter` / `object_key` always had.
+
+**Pending / Handoff:** CI green on 76b3524, then undraft. FE: layout toggle + types regen; BatchDialer guide for
+crm_v1; Playwright Results -> Download CSV on a crm_v1 scraper after deploy. Separate bugs: skip-trace
+`_parse_full_address` sends state CA/UN for foreign addresses; PhoneBurner `_split_name` is naive. (Trustee-sale
+`date_recorded` holding the auction date is documented design, see the Results date-sort entry below.)
+
+**Follow-up (same day, double surnames):** the natural-order case ('Jessica M. Hernandez Olvera') was
+the ONLY one in prod; the real volume was recorder order ('GUZMAN CAMPOS MARIA F' -> first CAMPOS).
+Added a curated Hispanic surname list (given-name-like surnames excluded) as evidence a word is not a
+first name, particle pairs (DE LOS, VAN DER), trailing-role strip (TTEE, EXEC, PER REP, ADMN), AKA cut,
+phrase-safe organization words, and a Vietnamese given-name-slot check. First prod diff over-blanked 12
+correct names ('DANG CATHY TRAN', 'BAEK JONG HO', 'PHAM ANH THE') and exposed a glued role
+('RITA HSIU-HUI KAO-TRUSTEE'); narrowed and re-diffed to 39 corrected / 2 filled / 457 blank, all
+reviewed. Codex FAIL was a claimed regression that the committed version already had; withdrawn -> PASS.
+
+**Facts learned:** party_name order is per SOURCE: WA recorder + assessor/treasurer = LAST FIRST; trustee's-sale
+notices (all trustee_sale, Snohomish pre_foreclosure) = FIRST LAST; Okanogan probate mixes both; Pierce CV
+party_name is "{case_type} - {address}". Recorder shape "LAST F MIDDLE" is indistinguishable from a leaked
+"FIRST M LAST". Real CSVs from 8 prod jobs (935 rows) matched DB values cell for cell.
+
+---
+
+## 2026-09-15 - Starter account read 1,001 / 50: migration 088 stretched trial windows past the trial end
+
+**Built / Shipped:** BE PR #320 `scripts/repair_trial_window_backfill.py` (+16 tests) and a corrected
+`_expire_trials_impl` docstring. Repair APPLIED in prod: 2 accounts, 1001 -> 0 and 104 -> 0, window
+[trial end, 2026-10-01). FE PR bridgeleads-web #144: dashboard card, quota banner and sidebar badge read the one
+window-aware `/billing/usage` (new `hooks/use-usage.ts`), usage re-read when jobs finish, "over plan limit" instead
+of a clamped 100%, "reached" at exactly the limit, no fabricated 0 while loading.
+
+**Tried / Decided:** Proven from prod before any change: the 1,001 was the account's own ledger (16 jobs, all billed
+inside its Pro trial, 0 after), counter == ledger for all 7 users, 0 cross-owner jobs or results rows, 0 stranded
+reservations. Cause: 088 `BACKFILL_WINDOWS` put users mid-trial on a calendar window running to Oct 1, while
+post-088 registration ends a trial's window at `trial_ends_at` (and `expire_trials` relies on that). Owner approved
+the outcome (0/50 from trial end, same as any post-088 signup). Chose a one-shot locked repair over a standing
+reconcile step because only registration and paid conversion write `trial_ends_at`, so the population is closed.
+FE: dropped the planned new `/auth/me` field; `/billing/usage` already was the authoritative object.
+
+**Failed / Blocked:** My first fix (an hourly reconcile step) FAILED the Codex gate: no `trial_ends_at <= now`,
+guard read before the row lock, in-flight reservations, frozen accounts, conversion race. First Chromium run: dev
+server + API killed "for low memory"; the orphaned `next dev` then 500'd `/api/auth/session` on `write EPIPE` (its
+stdout pipe died with the wrapper) until relaunched detached with file logs. PowerShell `bash` resolved to the WSL
+stub (`C:\windows\system32ash.exe`); use `C:\Program Files\Gitinash.exe`.
+
+**Caught & fixed:** Codex BE challenge PASS; adopted malformed-ledger guard (billed_count with NULL
+billing_applied_at), SQLSTATE 55P03 lock detection, explicit success set; disproved NULL job status. A mutation run
+showed a value guard under the row lock was unreachable, so it was removed rather than kept untested. Codex FE: first
+jobs snapshot never invalidated usage (P1, fixed), lossy finished-jobs signature, loading shown as 0, limit 0 (fixed);
+"unlimited shows banner" P1 disproved (banner returns null for -1 first). The at-limit banner said "over" (fixed).
+
+**Pending / Handoff:** merge #320 then #144 (Vercel deploys on merge). Codex P3s left. Drop local DB
+`bridgeleads_quota1001_test` (qa-* seed rows). The trial -> paid anchor path is still unexercised by a real payer.
+
+**Facts learned:** `/auth/me.records_used` is the RAW counter; only `/billing/usage` is window-aware. A migration
+backfill that re-derives quota windows must respect `trial_ends_at`, or trial usage survives the downgrade. The
+worker only reserves/settles jobs whose non-terminal status it has already committed (`_set_status` CAS), so a
+repair can read jobs unlocked and lock only the users row without inverting the jobs -> users lock order.
+
 ## 2026-09-15 - Results date sort follow-ups: prod verified, cached records page ordered, auction-date question settled
 
 **Built / Shipped (branch `fix/results-open-items`):** `GET /scrapers/{id}/records` rows query is now a Core select

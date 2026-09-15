@@ -10,7 +10,10 @@ The sort key is the value the table's first column actually shows:
   - tax_delinquent jobs show the oldest delinquent tax YEAR (county tax data has no
     per-record event date; any ``date_recorded`` there is a synthetic 01/01/YYYY the
     UI hides), so they sort by ``delinquent_bill_year``;
-  - every other record type shows ``date_recorded``.
+  - every other record type shows ``date_recorded``, except where it is the auction
+    date a scraper stood in for a missing notice date (trustee_sale, Snohomish
+    pre_foreclosure). The page shows that as blank, so it sorts with the undated rows
+    (``auction_date_fallback_condition``, owner decision 2026-09-15).
 
 ``date_recorded`` is free text and is NOT rewritten here: it feeds ``dedup_hash`` and
 ``source_fingerprint``, so normalizing stored values would stop a re-scraped lead
@@ -26,16 +29,18 @@ updated, so enrichment rewriting names or addresses cannot move a row.
 """
 from typing import Literal
 
-from sqlalchemy import Integer, Text, and_, case, cast, func
+from sqlalchemy import JSON, Integer, Text, and_, case, cast, func, literal_column, type_coerce
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects.postgresql import ARRAY
 
 from src.db.models import CountyRecord, Result
+from src.utils.source_dates import SNOHOMISH_TRIBUNE_SOURCE
 
 ResultsSort = Literal["date_desc", "date_asc"]
 DEFAULT_RESULTS_SORT: ResultsSort = "date_desc"
 
 # "September 18, 2026", "Sep 18 2026", "Sept. 18, 2026". Captures word, day, year.
-_MONTH_NAME_DATE = r"^\s*([A-Za-z]+)\.?\s+(\d{1,2}),?\s+(\d{4})\s*$"
+_MONTH_NAME_DATE = "^([A-Za-z]+)[.]? +([0-9]{1,2}),? +([0-9]{4})$"
 _MONTHS = (
     "january", "february", "march", "april", "may", "june",
     "july", "august", "september", "october", "november", "december",
@@ -48,7 +53,7 @@ _MONTH_NUMBERS = {
 
 
 # "3/20/2026", "03/13/2026". Captures month, day, year.
-_NUMERIC_DATE = r"^\s*(\d{1,2})/(\d{1,2})/(\d{4})\s*$"
+_NUMERIC_DATE = "^([0-9]{1,2})/([0-9]{1,2})/([0-9]{4})$"
 
 
 def _valid_date(year, month, day):
@@ -78,7 +83,7 @@ def _valid_date(year, month, day):
 
 def _month_name_date(column):
     """DATE from a "Month D, YYYY" string, or NULL. Never raises."""
-    parts = func.regexp_match(column, _MONTH_NAME_DATE, type_=ARRAY(Text))
+    parts = func.regexp_match(func.btrim(column), _MONTH_NAME_DATE, type_=ARRAY(Text))
     month = case(_MONTH_NUMBERS, value=func.lower(parts[1]), else_=None)
     return _valid_date(cast(parts[3], Integer), month, cast(parts[2], Integer))
 
@@ -89,7 +94,7 @@ def _numeric_date(column):
     Same text ``results.date_recorded_parsed`` accepts. Results keeps reading that
     stored column; this is for tables that have no parsed date.
     """
-    parts = func.regexp_match(column, _NUMERIC_DATE, type_=ARRAY(Text))
+    parts = func.regexp_match(func.btrim(column), _NUMERIC_DATE, type_=ARRAY(Text))
     return _valid_date(
         cast(parts[3], Integer), cast(parts[1], Integer), cast(parts[2], Integer)
     )
@@ -100,12 +105,113 @@ def _text_date(column):
     return func.coalesce(_numeric_date(column), _month_name_date(column))
 
 
+# "2026-09-18". Only the trustee_sale scraper's recorded auction date uses it.
+_ISO_DATE = "^([0-9]{4})-([0-9]{2})-([0-9]{2})$"
+
+
+def _iso_date(column):
+    """DATE from a "YYYY-MM-DD" string, or NULL. Never raises."""
+    parts = func.regexp_match(func.btrim(column), _ISO_DATE, type_=ARRAY(Text))
+    return _valid_date(
+        cast(parts[1], Integer), cast(parts[2], Integer), cast(parts[3], Integer)
+    )
+
+
+def _auction_date_fallback(date_recorded, enrichment_data):
+    """SQL twin of ``src.utils.source_dates.is_auction_date_fallback``.
+
+    True when date_recorded is the auction date its scraper stood in for a missing
+    notice date. Compared with the auction date the scraper RECORDED in
+    enrichment_data, never with results.auction_date, which the NTS matcher moves on a
+    postponement. NULL (not a stand-in) whenever either side is missing or unreadable.
+    Same grammar as the Python rule: date_recorded is parsed here, not read from
+    date_recorded_parsed, which only knows M/D/YYYY.
+    """
+    # Scoped by provenance exactly like source_dates.origin_auction_date: an
+    # nts_source OBJECT (trustee_sale) wins, else only a snohomish_tribune row.
+    origin = case(
+        (
+            func.json_typeof(enrichment_data["nts_source"]) == "object",
+            _iso_date(enrichment_data[("nts_source", "auction_date")].as_string()),
+        ),
+        (
+            enrichment_data["source"].as_string() == SNOHOMISH_TRIBUNE_SOURCE,
+            _text_date(enrichment_data["auction_date"].as_string()),
+        ),
+        else_=None,
+    )
+    # enrichment_data is json, not jsonb: every -> re-parses the whole document, and
+    # the expression above reads it dozens of times. Both origin keys are named
+    # auction_date, so a row whose stored text never mentions it cannot be a stand-in;
+    # json->text is the stored text, no parse. Measured on prod (read-only, 92k rows of
+    # one account): 13.4 s for the bare rule over every row, 148 ms with this check
+    # (58-348 ms with no rule at all), and the same 83 stand-ins either way.
+    mentions_auction_date = func.strpos(cast(enrichment_data, Text), "auction_date") > 0
+    return case((mentions_auction_date, _text_date(date_recorded) == origin), else_=None)
+
+
+def auction_date_fallback_condition():
+    """The stand-in rule on ``results`` for ORM queries (NULL means "not a stand-in")."""
+    return _auction_date_fallback(Result.date_recorded, Result.enrichment_data)
+
+
+def auction_date_fallback_sql(alias: str) -> str:
+    """The same rule as a raw SQL boolean on ``<alias>.date_recorded`` and
+    ``<alias>.enrichment_data``, for the hand-written text() queries (Lists).
+
+    Rendered from the expression above with every literal inlined, so there is one
+    definition. That is only safe because no pattern contains a backslash (inlining
+    doubles them) and nothing renders a colon (text() would read it as a bind), so
+    both are refused rather than assumed. The result may contain braces: a caller that
+    runs it through str.format must escape them.
+    """
+    if not alias.isidentifier():
+        raise ValueError(f"not a SQL alias: {alias!r}")
+    expr = _auction_date_fallback(
+        literal_column(f"{alias}.date_recorded"),
+        type_coerce(literal_column(f"{alias}.enrichment_data"), JSON),
+    )
+    return f"COALESCE(({_render_inline(expr)}), FALSE)"
+
+
+def _render_inline(expr) -> str:
+    """Render an expression for text() SQL, refusing the two characters inlining breaks."""
+    sql = str(expr.compile(dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}))
+    if "\\" in sql or ":" in sql:
+        raise RuntimeError("inlined SQL must not contain a backslash or a colon")
+    return sql
+
+
+def filing_date_sql(alias: str) -> str:
+    """The filing DATE of ``<alias>`` as raw SQL: the one the Results page sorts on.
+
+    ``date_recorded_parsed`` (M/D/YYYY, DB-generated) and, when that is NULL, the
+    "Month D, YYYY" form. Only text that starts with a letter is parsed, so the cost
+    stays on the few rows that can be month-name dates. An auction-date stand-in still
+    parses to its auction date here; callers exclude it with auction_date_fallback_sql.
+    Braces may be present: a caller running it through str.format must escape them.
+    """
+    if not alias.isidentifier():
+        raise ValueError(f"not a SQL alias: {alias!r}")
+    month_name = _render_inline(_month_name_date(literal_column(f"{alias}.date_recorded")))
+    return (
+        f"COALESCE({alias}.date_recorded_parsed, CASE WHEN {alias}.date_recorded ~ '^ *[A-Za-z]' "
+        f"THEN ({month_name}) END)"
+    )
+
+
 def results_order_by(record_type: str | None, sort: ResultsSort) -> list:
     """ORDER BY clauses for the Results page, given the job's record type."""
     if record_type == "tax_delinquent":
         key = Result.delinquent_bill_year
     else:
-        key = func.coalesce(Result.date_recorded_parsed, _month_name_date(Result.date_recorded))
+        # An auction-date stand-in is not a notice date: it sorts with the undated rows.
+        key = case(
+            (auction_date_fallback_condition(), None),
+            else_=func.coalesce(
+                Result.date_recorded_parsed, _month_name_date(Result.date_recorded)
+            ),
+        )
     ordered = key.asc() if sort == "date_asc" else key.desc()
     # Explicit in both directions: Postgres puts NULLs FIRST on DESC by default,
     # which would open the page with the undated rows.

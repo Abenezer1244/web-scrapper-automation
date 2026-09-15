@@ -508,6 +508,11 @@ class DeliverConfig(BaseModel):
     # responses (redacted in ScraperConfigResponse, like the HMAC secrets).
     phoneburner_access_token: str | None = None
     phoneburner_owner_id: str | None = None
+    # Lead CSV/Excel header layout (src/utils/lead_export.py LAYOUT_*). None = "not
+    # sent": a create stamps crm_v1 and an edit KEEPS the stored value, so saving an
+    # existing scraper from a client that doesn't know this field can never switch
+    # the headers a customer's importer is mapped to. A stored None reads legacy_v1.
+    csv_layout: Literal["legacy_v1", "crm_v1"] | None = None
 
     @field_validator("dialer_type")
     @classmethod
@@ -645,6 +650,7 @@ class DeliverConfigDict(TypedDict, total=False):
     dialer_type: str | None              # Thread 3: dialer connector id (None = generic)
     phoneburner_access_token: str | None  # Thread 3: PhoneBurner OAuth token (write-only)
     phoneburner_owner_id: str | None
+    csv_layout: str | None               # legacy_v1 | crm_v1 (missing/None = legacy_v1)
 
 
 class ScraperConfigCreate(BaseModel):
@@ -728,6 +734,12 @@ class ScraperConfigResponse(BaseModel):
         self.deliver.setdefault("formats", ["csv"])
         self.deliver.setdefault("emails", [])
         self.deliver.setdefault("webhook_url", None)
+        # The EFFECTIVE export layout, resolved exactly like the exporter does
+        # (anything but crm_v1 exports legacy headers), so the UI never shows a
+        # layout the file doesn't have.
+        self.deliver["csv_layout"] = (
+            "crm_v1" if self.deliver.get("csv_layout") == "crm_v1" else "legacy_v1"
+        )
         # Security (Codex): HMAC secrets are WRITE-ONLY — never return them. A
         # stolen frontend token / XSS could otherwise read them and forge signed
         # webhook/dialer payloads. Expose only presence flags so the UI can show
@@ -794,6 +806,10 @@ class DeliverUpdate(BaseModel):
     dialer_type: str | None = None
     phoneburner_access_token: str | None = None
     phoneburner_owner_id: str | None = None
+    # Declared because GET now returns the effective layout and a verbatim form echo
+    # would otherwise 422 under extra="forbid" (breaking EVERY scraper edit). None =
+    # keep stored (_merge_deliver); the merged DeliverConfig validates the value.
+    csv_layout: str | None = None
 
     # Write-only readback flags emitted by GET. Accepted (so a verbatim form echo
     # doesn't 422) but excluded from model_dump — they are not real deliver fields
@@ -801,6 +817,20 @@ class DeliverUpdate(BaseModel):
     webhook_secret_set: bool | None = Field(default=None, exclude=True)
     dialer_webhook_secret_set: bool | None = Field(default=None, exclude=True)
     phoneburner_access_token_set: bool | None = Field(default=None, exclude=True)
+
+
+class CsvLayoutUpdate(BaseModel):
+    """PUT /scrapers/{id}/csv-layout — switch ONE config's CSV export layout.
+
+    A dedicated single-field write rather than a PATCH echo of GET's deliver dict:
+    stored legacy deliver dicts can hold keys DeliverUpdate (extra="forbid") rejects
+    (e.g. a singular "format"), so echoing them would 422 old scrapers. This touches
+    only deliver.csv_layout and leaves every other stored key byte-identical.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    csv_layout: Literal["legacy_v1", "crm_v1"]
 
 
 class ScraperConfigUpdate(BaseModel):
@@ -988,6 +1018,8 @@ class BatchLeadRow(BaseModel):
     overlap_count: int = 1
     source_counties: list[str] = Field(default_factory=list)
     lead_subtype: str | None = None
+    # Same meaning as ResultRow.date_is_auction_date: show date_recorded as blank.
+    date_is_auction_date: bool = False
 
 
 class BatchLeadsPage(BaseModel):
@@ -1252,6 +1284,10 @@ class ResultRow(BaseModel):
     auction_date: date | None = None
     default_amount: float | None = None
     nts_match_confidence: float | None = None
+    # True when date_recorded is the auction date a scraper stood in for a missing
+    # notice date (trustee_sale, Snohomish pre_foreclosure). Not a notice date: show and
+    # export it as blank. date_recorded itself is left as stored (it feeds dedup).
+    date_is_auction_date: bool = False
     created_at: datetime
     # Derived signals (Tier 0, src/utils/lead_signals.py): computed at serialize
     # time, never stored. Populated in model_post_init from the fields above.
@@ -1319,6 +1355,13 @@ class ResultRow(BaseModel):
         from datetime import UTC, datetime
 
         from src.utils.lead_signals import auction_reference_date, derive_signals
+        from src.utils.source_dates import is_auction_date_fallback
+        # Before the signals: freshness reads this flag, so it must never be set
+        # after them (Codex).
+        object.__setattr__(
+            self, "date_is_auction_date",
+            is_auction_date_fallback(self.date_recorded, self.enrichment_data),
+        )
         _now = datetime.now(UTC)
         # Two clocks on purpose: UTC for the tax signals (parity with the tax-filter
         # SQL), county-local for the auction countdown (a WA sale happens on the WA
@@ -1602,6 +1645,8 @@ class SegmentLeadRow(BaseModel):
     matched_record_types: list[str]
     overlap_count: int
     identity_strength: str = "strong"
+    # Same meaning as ResultRow.date_is_auction_date: show date_recorded as blank.
+    date_is_auction_date: bool = False
 
 
 class SegmentIntersectionResponse(BaseModel):

@@ -52,6 +52,23 @@ _SSE_HEADERS = {
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 
 
+def _job_response(job: Job, config: ScraperConfig | None) -> JobResponse:
+    """A JobResponse with the fields that live on the job's scraper config.
+
+    The one place both the list and the single-job endpoints fill them. GET
+    /jobs/{id} used to skip this, so record_type came back null there and the
+    Results page could not tell an auction-lead job (its "Notice Date" header).
+    """
+    resp = JobResponse.model_validate(job)
+    if config is not None:
+        resp.scraper_name = config.name
+        resp.county = config.county
+        resp.state = config.state
+        resp.record_type = config.record_type
+        resp.batch_id = config.batch_id  # None for standalone; set for batch children
+    return resp
+
+
 @router.get("", response_model=list[JobResponse])
 async def list_jobs(
     current_user: CurrentUser,
@@ -96,15 +113,9 @@ async def list_jobs(
 
     responses = []
     for j in jobs:
-        resp = JobResponse.model_validate(j)
-        sc = config_map.get(str(j.scraper_config_id))
-        if sc:
-            resp.scraper_name = sc.name
-            resp.county = sc.county
-            resp.state = sc.state
-            resp.record_type = sc.record_type
-            resp.batch_id = sc.batch_id  # None for standalone; set for batch children
-        responses.append(resp)
+        responses.append(
+            _job_response(j, config_map.get(str(j.scraper_config_id)))
+        )
     return responses
 
 
@@ -302,7 +313,13 @@ async def get_job(
     job = result.scalar_one_or_none()
     if job is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
-    return JobResponse.model_validate(job)
+    config = (await db.execute(
+        select(ScraperConfig).where(
+            ScraperConfig.id == job.scraper_config_id,
+            ScraperConfig.user_id == current_user.id,  # defense-in-depth owner filter
+        )
+    )).scalar_one_or_none()
+    return _job_response(job, config)
 
 
 @router.delete("/{job_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -1284,8 +1301,8 @@ async def download_export(
         # config_id is NOT NULL, so the guard's None branch is defensive only. (The
         # batch COMBINED export is a separate path — see batch_export.py.)
         from src.utils.lead_export import (
+            resolve_export_layout,
             resolve_hidden_output_fields,
-            resolve_lead_export_columns,
             write_lead_csv,
         )
         hidden_fields: set[str] = set()
@@ -1294,9 +1311,17 @@ async def download_export(
         # combined batch export is a separate superset path (batch_export.py). None
         # scraper_config_id (defensive; Job.scraper_config_id is NOT NULL) -> full.
         columns: list[str] | None = None
+        labels: dict[str, str] | None = None
+        # Source county/state/record_type for the rows: a Result carries none of
+        # them, and without a record type the party-name order is unknown (blank
+        # First/Last). Read from the SAME owner-scoped config row as the layout.
+        context: dict[str, str] | None = None
         if job.scraper_config_id:
             cfg_row = await db.execute(
-                select(ScraperConfig.fields, ScraperConfig.record_type).where(
+                select(
+                    ScraperConfig.fields, ScraperConfig.record_type, ScraperConfig.deliver,
+                    ScraperConfig.county, ScraperConfig.state,
+                ).where(
                     ScraperConfig.id == job.scraper_config_id,
                     ScraperConfig.user_id == user.id,
                 )
@@ -1304,8 +1329,15 @@ async def download_export(
             cfg = cfg_row.one_or_none()
             if cfg is not None:
                 hidden_fields = resolve_hidden_output_fields(cfg.fields)
-                columns = resolve_lead_export_columns(cfg.record_type)
-        write_lead_csv(records, output, hidden_fields=hidden_fields, columns=columns)
+                layout = cfg.deliver.get("csv_layout") if isinstance(cfg.deliver, dict) else None
+                columns, labels = resolve_export_layout(layout, cfg.record_type)
+                context = {
+                    "county": cfg.county, "state": cfg.state, "record_type": cfg.record_type,
+                }
+        write_lead_csv(
+            records, output, hidden_fields=hidden_fields, columns=columns,
+            labels=labels, context=context,
+        )
 
         csv_bytes = output.getvalue().encode("utf-8")
 
@@ -1319,7 +1351,11 @@ async def download_export(
             media_type="text/csv",
             headers={
                 "Content-Disposition": f'attachment; filename="bridgeleads_{job_id[:8]}.csv"',
-                "Cache-Control": "private, max-age=3600",
+                # no-store: the file is built LIVE (skip-trace phones, the scraper's
+                # CSV layout). A cached copy served a stale file for an hour, e.g. the
+                # old headers after a layout switch (local browser check, 2026-09-15),
+                # and owner PII should not sit in a shared browser cache anyway.
+                "Cache-Control": "no-store",
             },
             # Activation signal, recorded AFTER the bytes go out. As a background
             # task it cannot turn a bookkeeping failure into a failed download,

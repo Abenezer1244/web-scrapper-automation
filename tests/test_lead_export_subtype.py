@@ -56,10 +56,11 @@ def test_top_level_scalar_subtype_from_combined_export():
     assert out["lead_subtype"] == "tod_living_owner_estate_planning"
 
 
-def test_row_keys_exactly_match_columns():
-    # csv.DictWriter requires the row dict keys to match the declared fieldnames.
+def test_row_keys_cover_every_legacy_column():
+    # csv.DictWriter (extrasaction="ignore") needs every declared fieldname present;
+    # the row also carries the crm_v1-only keys (county, record_type, case_id, ...).
     out = build_lead_export_row(_record({"lead_subtype": "probate_death_inheritance"}))
-    assert set(out.keys()) == set(LEAD_CSV_COLUMNS)
+    assert set(LEAD_CSV_COLUMNS) <= set(out.keys())
 
 
 def test_overlap_export_carries_lead_subtype():

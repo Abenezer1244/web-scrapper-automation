@@ -1,0 +1,25 @@
+{
+ "_note": "Real layer metadata fetched 2026-09-14; only name, objectIdField, maxRecordCount, editingInfo kept.",
+ "layers": {
+  "Bellevue_Permits": {
+   "name": "Bellevue_Permit_Data",
+   "objectIdField": "ObjectId",
+   "maxRecordCount": 2000,
+   "editingInfo": {
+    "lastEditDate": 1789389027083,
+    "schemaLastEditDate": 1789389027083,
+    "dataLastEditDate": 1789389027083
+   }
+  },
+  "Bellevue_Permit": {
+   "name": "Bellevue_Permit_Data_GISDBA",
+   "objectIdField": "ObjectId",
+   "maxRecordCount": 2000,
+   "editingInfo": {
+    "lastEditDate": 1788903834661,
+    "schemaLastEditDate": 1788903834661,
+    "dataLastEditDate": 1788903834661
+   }
+  }
+ }
+}

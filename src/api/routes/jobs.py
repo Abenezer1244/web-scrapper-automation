@@ -1284,8 +1284,8 @@ async def download_export(
         # config_id is NOT NULL, so the guard's None branch is defensive only. (The
         # batch COMBINED export is a separate path — see batch_export.py.)
         from src.utils.lead_export import (
+            resolve_export_layout,
             resolve_hidden_output_fields,
-            resolve_lead_export_columns,
             write_lead_csv,
         )
         hidden_fields: set[str] = set()
@@ -1294,9 +1294,17 @@ async def download_export(
         # combined batch export is a separate superset path (batch_export.py). None
         # scraper_config_id (defensive; Job.scraper_config_id is NOT NULL) -> full.
         columns: list[str] | None = None
+        labels: dict[str, str] | None = None
+        # Source county/state/record_type for the rows: a Result carries none of
+        # them, and without a record type the party-name order is unknown (blank
+        # First/Last). Read from the SAME owner-scoped config row as the layout.
+        context: dict[str, str] | None = None
         if job.scraper_config_id:
             cfg_row = await db.execute(
-                select(ScraperConfig.fields, ScraperConfig.record_type).where(
+                select(
+                    ScraperConfig.fields, ScraperConfig.record_type, ScraperConfig.deliver,
+                    ScraperConfig.county, ScraperConfig.state,
+                ).where(
                     ScraperConfig.id == job.scraper_config_id,
                     ScraperConfig.user_id == user.id,
                 )
@@ -1304,8 +1312,15 @@ async def download_export(
             cfg = cfg_row.one_or_none()
             if cfg is not None:
                 hidden_fields = resolve_hidden_output_fields(cfg.fields)
-                columns = resolve_lead_export_columns(cfg.record_type)
-        write_lead_csv(records, output, hidden_fields=hidden_fields, columns=columns)
+                layout = cfg.deliver.get("csv_layout") if isinstance(cfg.deliver, dict) else None
+                columns, labels = resolve_export_layout(layout, cfg.record_type)
+                context = {
+                    "county": cfg.county, "state": cfg.state, "record_type": cfg.record_type,
+                }
+        write_lead_csv(
+            records, output, hidden_fields=hidden_fields, columns=columns,
+            labels=labels, context=context,
+        )
 
         csv_bytes = output.getvalue().encode("utf-8")
 

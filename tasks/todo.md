@@ -1,3 +1,61 @@
+# Starter account shows 1,001 / 50 (2026-09-15)
+
+Branch `fix/starter-quota-1001`, worktree `C:/Users/Windows/bl-wt-quota1001` (off origin/main 792bf2d).
+
+## Proven (read-only prod queries)
+- Account `01dc9396`: starter / limit 50 / records_used 1001; trial_ends_at 09-09 04:16; first_paid_at NULL;
+  no Stripe subscription (status canceled, never paid); window `[09-01, 10-01)`, anchor 09-01.
+- Ledger: 16 jobs, ALL owned by this user, SUM(billed_count) = 1001, all billed 09-02..09-05 (inside the
+  Pro trial, limit 1000). 0 billed after trial end. Stored counter == ledger for all 7 prod users.
+- No tenant leak: 0 jobs on this user's configs owned by another user; 0 `results` rows whose owner differs
+  from their job's owner. 0 stranded reservations.
+- ROOT CAUSE: migration 088 `BACKFILL_WINDOWS` set every existing user to `[records_period_start, +1 month)`,
+  ignoring `trial_ends_at`. Post-088 registration sets `quota_period_end = trial_ends_at`, and
+  `expire_trials` relies on that ("a trial user's window ENDS at trial_ends_at"). For users mid-trial at the
+  09-06 deploy the window instead runs to 10-01, so when the trial expired (09-09) and the plan dropped to
+  Starter/50, the Pro-trial usage stayed in the live window.
+- Blast radius: exactly 2 users have a trial that ended inside their stored window: `01dc9396` (1001/50)
+  and `129fde36` (104/50, both jobs billed during trial). Population is CLOSED: the only writers of
+  `trial_ends_at` are registration (end = trial end) and paid conversion (clears it); every pre-088 trial
+  has ended.
+- Separate latent display defect: `/auth/me` returns RAW `records_used`; dashboard card + sidebar prefer it
+  over window-aware `/billing/usage`. Not the cause here (window really has not ended), but after any real
+  window end the UI shows stale usage until the next charge / hourly rollover.
+
+## Codex reconciliation
+- Agrees on root cause; tenant leak, counter corruption, retries, concurrency ruled out for the 1001/50.
+- GATE FAIL on my first fix (permanent hourly reconcile step): no `trial_ends_at <= at`, no row lock before
+  the guard, active reservations, frozen / entitlement_ends_at rules, conversion race. Adopted: replace with
+  a one-shot, locked, dry-run-default repair since the population is closed. /auth/me: Codex prefers ADDING
+  a field over changing `records_used` semantics (Codex wins; doc silent).
+
+## Plan (Phase 1 + 2 approved 2026-09-15; prod --commit NOT yet approved)
+### Phase 1 (backend, <= 5 files)
+Status: script + 16 tests done, 8/9 mutants killed (the survivor was an unreachable value guard under
+the row lock, removed). Full suite 3511 passed / 2 skipped; ruff clean. Codex challenge GATE: PASS;
+adopted malformed-ledger guard, SQLSTATE 55P03 lock detection, explicit success set; disproved NULL
+job status (NOT NULL). Prod dry run: 2 candidates, 1001->0 and 104->0, window [trial_end, 10-01),
+0 refused; re-read after: prod unchanged.
+- [x] `scripts/repair_trial_window_backfill.py`: dry-run default, `--commit --i-understand`. Per candidate:
+      `SELECT ... FOR UPDATE NOWAIT` on the user, re-check under lock: trial_ends_at <= at, first_paid_at
+      NULL, trial_ends_at in (period_start, period_end), not frozen / no entitlement_ends_at (same rules as
+      quota_should_roll), no active reservation, no billed units at/after trial_ends_at. Then set
+      period_end = trial_ends_at and roll through the SHARED `window_cte_sql`/`window_set_sql` (anchor
+      unchanged), row lock held through the write. Refuse + report anything that fails a guard.
+- [x] `tests/test_repair_trial_window_backfill.py`: legacy shape repaired to 0/50 with window
+      [trial_ends_at, next boundary); still-active trial untouched; paid user untouched; frozen untouched;
+      post-trial billed usage refused; active reservation refused; idempotent second run; normal post-088
+      trial user untouched; other accounts' counters unchanged.
+- [x] Fix false premise in `_expire_trials_impl` docstring.
+- [x] Full suite (isolated test DB) + ruff; Codex review + challenge on the diff.
+- [ ] Prod: dry run (expect 2), then with approval commit; verify `/billing/usage` 0/50 + reset date,
+      ledger untouched, drift 0.
+### Phase 2 (needs approval, BE + FE)
+- [ ] Add window-aware usage to `/auth/me` as a new field (keep raw), regen OpenAPI; FE dashboard card,
+      sidebar and banner read the one window-aware value. Percent card stays clamped for the bar, but show
+      real numbers ("1,001 / 50") so the overshoot is not hidden.
+- [ ] Playwright (Chromium) verification of a controlled Starter account.
+
 # King property follow-ups (2026-09-15)
 
 Branch `fix/king-property-followups`. Owner said "run fix and work with codex on all" after the

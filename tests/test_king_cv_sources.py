@@ -368,7 +368,8 @@ async def test_an_arcgis_error_body_is_a_failure_not_zero_cases(monkeypatch, no_
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("features", [None, "none", [None], [["attributes"]]])
+@pytest.mark.parametrize("features", [None, "none", [None], [["attributes"]], [{"attributes": None}],
+                                      [{"attributes": []}], [{"geometry": {}}]])
 async def test_a_query_answer_whose_features_are_not_a_list_of_objects_fails(
     monkeypatch, no_backoff, features,
 ):
@@ -518,6 +519,22 @@ async def test_the_partial_failure_warning_reaches_the_job_log(
     published = pubsub.get_message(timeout=2)
     assert published and json.loads(published["data"])["level"] == "warning"
     pubsub.close()
+
+
+@pytest.mark.asyncio
+async def test_seattle_requests_require_the_scrape_allowlist(monkeypatch):
+    from src.api.middleware.security import validate_scraping_target
+
+    calls: list = []
+
+    def _get(url, **kw):
+        calls.append((url, kw))
+        return _Resp([SDCI_ROW])
+
+    monkeypatch.setattr(seattle_sdci, "safe_get", _get)
+    await seattle_sdci.SeattleSDCISource().fetch("09/01/2026", "09/14/2026")
+    assert calls and all(kw.get("require_allowlisted") is True for _, kw in calls)
+    validate_scraping_target(calls[0][0], require_allowlisted=True, resolve=False)
 
 
 def test_a_connector_without_sources_is_refused():

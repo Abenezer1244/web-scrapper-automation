@@ -80,7 +80,7 @@ class SeattleSDCISource(CodeViolationSource):
                 # HTTPS Socrata endpoint each attempt, disables ambient proxy,
                 # refuses redirect-to-internal.
                 resp = safe_get(_API_URL, params=params, headers=_HEADERS,
-                                timeout=settings.DEFAULT_TIMEOUT)
+                                timeout=settings.DEFAULT_TIMEOUT, require_allowlisted=True)
                 resp.raise_for_status()
                 data = resp.json()
                 # Socrata returns a JSON list of rows. A non-list (200 carrying an

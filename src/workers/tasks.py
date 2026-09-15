@@ -220,6 +220,10 @@ _RESULT_EXPORT_COLUMNS: tuple[str, ...] = (
     "enrichment_data", "date_recorded_parsed",
     "phone", "phone_type", "email", "skip_trace_status",
     "phones", "emails",
+    # Stored structured situs (migration 085). Missing here, the scheduled file fell
+    # back to parsing a street-only property_address and blanked the city/state/zip
+    # the in-app download showed for the same rows.
+    "property_city", "property_state", "property_zip",
 )
 
 
@@ -403,8 +407,8 @@ def run_scrape_job(self, job_id: str) -> None:
     from src.scrapers.registry import UnsupportedCountyError, get_scraper_class
     from src.utils.data_exporter import DataExporter
     from src.utils.lead_export import (
+        resolve_export_layout,
         resolve_hidden_output_fields,
-        resolve_lead_export_columns,
     )
     from src.workers.delivery import deliver_job_email
 
@@ -1296,11 +1300,20 @@ def run_scrape_job(self, job_id: str) -> None:
         # no tax/code-violation/auction columns). Same subset for the enriched
         # re-export below, keeping the R2 file and the in-app download identical. The
         # batch COMBINED export is a separate superset path (batch_export.py).
-        export_columns = resolve_lead_export_columns(config.record_type)
+        # Same layout + source context as the in-app download (jobs.py), so the
+        # delivered file and the downloaded file have identical headers and values.
+        export_layout = (
+            config.deliver.get("csv_layout") if isinstance(config.deliver, dict) else None
+        )
+        export_columns, export_labels = resolve_export_layout(export_layout, config.record_type)
+        export_context = {
+            "county": config.county, "state": config.state, "record_type": config.record_type,
+        }
         exporter = DataExporter()
         local_file = exporter.export(
             record_dicts, filename=f"job_{job_id[:8]}", fmt=fmt,
             hidden_fields=hidden_fields, columns=export_columns,
+            labels=export_labels, context=export_context,
         )
 
         object_key = f"exports/{job.user_id}/{job_id}/leads.{local_file.suffix.lstrip('.')}"
@@ -1865,6 +1878,7 @@ def run_scrape_job(self, job_id: str) -> None:
                     record_dicts, filename=f"job_{job_id[:8]}", fmt=fmt,
                     hidden_fields=resolve_hidden_output_fields(config.fields),
                     columns=export_columns,
+                    labels=export_labels, context=export_context,
                 )
                 if object_key:
                     upload_ok, upload_exc = _upload_export_with_retry(

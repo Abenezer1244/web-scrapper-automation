@@ -209,7 +209,7 @@ def _tick(stats: dict, lock: tuple) -> dict:
 
         l_stats: dict = {}
         # Never floored: time already spent on the queries comes out of the tick budget.
-        fetched = lookup_parcels(parcels, budget_s=deadline - time.monotonic() - 15,
+        fetched = lookup_parcels(parcels, source="tacoma_code_violations", budget_s=deadline - time.monotonic() - 15,
                                  stats=l_stats)
         stats["lookup_outcome"] = l_stats.get("outcome")
         transient = set(l_stats.get("transient", []))

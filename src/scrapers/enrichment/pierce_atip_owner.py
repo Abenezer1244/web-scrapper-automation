@@ -93,12 +93,14 @@ GAVE_UP = "gave_up"
 
 MIN_PACE_S = 2.0
 _PAGE_TIMEOUT_S = 45.0
-_FETCH_TIMEOUT_S = _PAGE_TIMEOUT_S + 5.0   # hard bound around the whole page view
-_SESSION_START_S = 30.0
-_SESSION_CLOSE_S = 15.0
 # The appraisal account call follows the summary within the same page load (measured
 # live: same second); this is how long we wait for it after the summary arrived.
 _ACCOUNT_WAIT_S = 10.0
+# Hard bound around the whole page view: the summary wait, then the account wait, plus
+# margin (Codex r9), and what _affordable reserves per page.
+_FETCH_TIMEOUT_S = _PAGE_TIMEOUT_S + _ACCOUNT_WAIT_S + 5.0
+_SESSION_START_S = 30.0
+_SESSION_CLOSE_S = 15.0
 _TIME_LIMITS = ("SoftTimeLimitExceeded", "TimeLimitExceeded")
 _MAX_HARD_FAILURES = 3
 _LEASE_WAIT_S = 30.0
@@ -497,7 +499,7 @@ async def _close(session) -> None:
         _logger.warning("pierce_atip_owner session close failed: %s", type(exc).__name__)
 
 
-def lookup_parcels(parcel_ids: list[str], *, pace_s: float = MIN_PACE_S,
+def lookup_parcels(parcel_ids: list[str], *, source: object, pace_s: float = MIN_PACE_S,
                    budget_s: float | None = None, stats: dict | None = None
                    ) -> dict[str, Fetched]:
     """ATIP answers for Tacoma code-violation parcels, keyed by the 10-digit parcel.
@@ -515,6 +517,10 @@ def lookup_parcels(parcel_ids: list[str], *, pace_s: float = MIN_PACE_S,
         check_source_or_raise,
     )
 
+    # The answers carry taxpayer names: the 2026-09-14 clearance is Tacoma code violations
+    # only, so any other caller is refused before a single request (Codex r9 P1).
+    if source != TACOMA_CV_SOURCE:
+        raise ValueError("ATIP taxpayer lookups are cleared for Tacoma code-violation leads only")
     st = stats if stats is not None else {}
     st.update(_new_stats())
     out: dict[str, Fetched] = {}

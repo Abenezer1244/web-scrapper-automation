@@ -84,7 +84,10 @@ _UPDATE_SQL = """
       AND property_address IS NOT DISTINCT FROM CAST(:old_address AS varchar)
       AND legal_description IS NOT DISTINCT FROM CAST(:old_legal AS varchar)
       AND jsonb_typeof(enrichment_data::jsonb) = 'object'
-      AND enrichment_data::jsonb->>'case_number' IS NOT DISTINCT FROM CAST(:old_case AS text)
+      -- The same case key the source row was fetched by (_case_number: enrichment
+      -- case_number, else legal_description), so a legacy row is not silently skipped.
+      AND COALESCE(NULLIF(btrim(enrichment_data::jsonb->>'case_number'), ''),
+                   btrim(legal_description)) = CAST(:old_case AS text)
       AND enrichment_data::jsonb->>'source' = :source
       AND NOT (enrichment_data::jsonb ? 'owner_source')
       AND (NOT CAST(:writes_owner_status AS boolean)
@@ -213,7 +216,7 @@ def run(db, *, apply_writes: bool, owners: bool, retry_owners: bool = False,
             fetched: dict = {}
             if owners and chunk:
                 lookup_stats: dict = {}
-                fetched = lookup_parcels(chunk, stats=lookup_stats)
+                fetched = lookup_parcels(chunk, source=_SOURCE, stats=lookup_stats)
                 counts["lookup_outcome_" + str(lookup_stats.get("outcome"))] += 1
             w, s = _write_plans(db, by_chunk.get(n, []), fetched, counts, fh,
                                 apply_writes=apply_writes, now=now)
@@ -264,7 +267,7 @@ def _write_plans(db, plans: list[dict], fetched: dict, counts: Counter, fh, *,
             "new_party": new_party, "old_party": r.party_name, "old_parcel": r.parcel_id,
             "old_address": r.property_address, "rid": r.id, "uid": r.user_id, "jid": r.job_id,
             # The source row was fetched for THIS case; a row re-pointed since is skipped.
-            "old_legal": r.legal_description, "old_case": r.ed.get("case_number"),
+            "old_legal": r.legal_description, "old_case": _case_number(r),
             "payload": json.dumps(payload), "source": _SOURCE,
             "writes_owner_status": writes_owner_status})
         written += bool(res.rowcount)

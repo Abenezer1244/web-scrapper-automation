@@ -120,6 +120,9 @@ def _found(parcel, body, account_parcel=None):
     return pao.Fetched("found", _rows(body), json.loads(acct) if acct else None)
 
 
+_TACOMA = "tacoma_code_violations"
+
+
 def _decide(parcel, rows, address, account=None):
     acct = account if account is not None else (
         json.loads(ACCOUNTS[parcel]) if parcel in ACCOUNTS else None)
@@ -332,7 +335,7 @@ def test_flag_off_makes_zero_requests(monkeypatch):
     portal = _Portal({"2021110133": [(200, ATIP_2117)]}).install(monkeypatch)
     monkeypatch.setattr(settings, "PIERCE_CV_OWNER_ENABLED", False)
     stats: dict = {}
-    assert pao.lookup_parcels(["2021110133"], stats=stats) == {}
+    assert pao.lookup_parcels(source=_TACOMA, parcel_ids=["2021110133"], stats=stats) == {}
     assert stats["outcome"] == "disabled"
     assert portal.sessions == 0 and portal.requests == []
 
@@ -342,7 +345,7 @@ def test_lookup_is_paced_and_audited_without_names(monkeypatch, paces, clean_hea
                       "9999999999": [(200, ATIP_UNKNOWN_PARCEL)]}).install(monkeypatch)
     stats: dict = {}
     with caplog.at_level(logging.INFO, logger="scraper.enrichment.pierce_atip_owner"):
-        got = pao.lookup_parcels(["2021110133", " 2006120010 ", "2021110133", "12345", "9999999999"],
+        got = pao.lookup_parcels(source=_TACOMA, parcel_ids=["2021110133", " 2006120010 ", "2021110133", "12345", "9999999999"],
                                  pace_s=0.1, stats=stats)
     assert portal.requests == ["2021110133", "2006120010", "9999999999"]   # invalid/dupes dropped
     assert portal.sessions == 1
@@ -361,14 +364,14 @@ def test_a_rejected_verification_restarts_once_then_stops_and_cools_down(monkeyp
                                      (200, ATIP_VERIFICATION_REJECTED)],
                       "9999999999": [(200, ATIP_UNKNOWN_PARCEL)]}).install(monkeypatch)
     stats: dict = {}
-    got = pao.lookup_parcels(["2021110133", "2006120010", "9999999999"], stats=stats)
+    got = pao.lookup_parcels(source=_TACOMA, parcel_ids=["2021110133", "2006120010", "9999999999"], stats=stats)
     assert got["2021110133"].kind == "found"            # the fresh session answered
     assert stats["outcome"] == "verification_rejected"
     assert portal.sessions == 2 and "9999999999" not in portal.requests
     assert stats["transient"] == ["2006120010"]
     # The whole portal now cools down: the next pass makes no request at all.
     again: dict = {}
-    assert pao.lookup_parcels(["9999999999"], stats=again) == {}
+    assert pao.lookup_parcels(source=_TACOMA, parcel_ids=["9999999999"], stats=again) == {}
     assert again["outcome"] == "source_unavailable" and portal.requests.count("9999999999") == 0
 
 
@@ -377,7 +380,7 @@ def test_a_taxpayer_answer_without_its_appraisal_account_is_retried_not_decided(
     portal = _Portal({"2021110133": [(200, ATIP_2117)], "2006120010": [(200, ATIP_602)]})
     portal.install(monkeypatch).no_account.add("2021110133")
     stats: dict = {}
-    got = pao.lookup_parcels(["2021110133", "2006120010"], stats=stats)
+    got = pao.lookup_parcels(source=_TACOMA, parcel_ids=["2021110133", "2006120010"], stats=stats)
     assert list(got) == ["2006120010"] and got["2006120010"].account["acctType"] == "Commercial"
     assert stats["transient"] == ["2021110133"] and stats["outcome"] == "complete"
 
@@ -386,7 +389,7 @@ def test_three_hard_failures_stop_the_batch(monkeypatch, paces, clean_health):
     portal = _Portal({p: [(503, "Service Unavailable")] for p in
                       ("2021110133", "2006120010", "2030120032", "0320011115")}).install(monkeypatch)
     stats: dict = {}
-    assert pao.lookup_parcels(["2021110133", "2006120010", "2030120032", "0320011115"],
+    assert pao.lookup_parcels(source=_TACOMA, parcel_ids=["2021110133", "2006120010", "2030120032", "0320011115"],
                               stats=stats) == {}
     assert stats["outcome"] == "source_failing"
     assert portal.requests == ["2021110133", "2006120010", "2030120032"]
@@ -397,7 +400,7 @@ def test_a_held_lease_means_no_second_browser(monkeypatch, paces, clean_health, 
     redis_client.set("bl:source_admission:pierce_atip_owner", "another-pass", ex=60)
     monkeypatch.setattr(pao, "_LEASE_WAIT_S", 0.0)
     stats: dict = {}
-    assert pao.lookup_parcels(["2021110133"], stats=stats) == {}
+    assert pao.lookup_parcels(source=_TACOMA, parcel_ids=["2021110133"], stats=stats) == {}
     assert stats["outcome"] == "not_admitted" and portal.sessions == 0
 
 
@@ -405,7 +408,7 @@ def test_an_unconfirmable_lease_fails_closed(monkeypatch, paces, clean_health):
     portal = _Portal({"2021110133": [(200, ATIP_2117)]}).install(monkeypatch)
     monkeypatch.setattr(settings, "REDIS_URL", "redis://127.0.0.1:1/0")   # nothing listens
     stats: dict = {}
-    assert pao.lookup_parcels(["2021110133"], stats=stats) == {}
+    assert pao.lookup_parcels(source=_TACOMA, parcel_ids=["2021110133"], stats=stats) == {}
     assert stats["outcome"] == "not_admitted" and portal.sessions == 0
 
 
@@ -470,7 +473,7 @@ def test_a_lease_lost_between_pages_stops_before_the_next_request(monkeypatch, p
 
     monkeypatch.setattr(pao, "_fetch_summary", _fetch_then_lose_the_lease)
     stats: dict = {}
-    got = pao.lookup_parcels(["2021110133", "2006120010"], stats=stats)
+    got = pao.lookup_parcels(source=_TACOMA, parcel_ids=["2021110133", "2006120010"], stats=stats)
     assert stats["outcome"] == "lease_lost"
     assert portal.requests == ["2021110133"] and list(got) == ["2021110133"]
 
@@ -513,7 +516,7 @@ def test_only_the_exact_summary_endpoint_for_the_parcel_is_read():
 def test_a_budget_too_small_for_one_page_makes_no_request(monkeypatch, paces, clean_health):
     portal = _Portal({"2021110133": [(200, ATIP_2117)]}).install(monkeypatch)
     stats: dict = {}
-    assert pao.lookup_parcels(["2021110133"], budget_s=60, stats=stats) == {}
+    assert pao.lookup_parcels(source=_TACOMA, parcel_ids=["2021110133"], budget_s=60, stats=stats) == {}
     assert stats["outcome"] == "budget_exhausted" and portal.sessions == 0
 
 
@@ -533,7 +536,7 @@ def test_a_browser_that_never_starts_charges_the_parcel_and_stops(monkeypatch, p
     monkeypatch.setattr(pao, "_new_session", _BrokenBrowser)
     stats: dict = {}
     with caplog.at_level(logging.INFO, logger="scraper.enrichment.pierce_atip_owner"):
-        assert pao.lookup_parcels(["2021110133", "2006120010"], stats=stats) == {}
+        assert pao.lookup_parcels(source=_TACOMA, parcel_ids=["2021110133", "2006120010"], stats=stats) == {}
     assert stats["outcome"] == "session_failed" and stats["transient"] == ["2021110133"]
     assert portal.requests == [] and closed == [True]
     assert "parcel=2021110133 outcome=session_start_failed" in caplog.text
@@ -551,7 +554,7 @@ def test_a_task_time_limit_mid_lookup_is_audited_and_not_swallowed(monkeypatch, 
     monkeypatch.setattr(pao, "_fetch_summary", _killed)
     with caplog.at_level(logging.INFO, logger="scraper.enrichment.pierce_atip_owner"), \
             pytest.raises(SoftTimeLimitExceeded):
-        pao.lookup_parcels(["2021110133"])
+        pao.lookup_parcels(source=_TACOMA, parcel_ids=["2021110133"])
     assert "parcel=2021110133 outcome=time_limit" in caplog.text
 
 
@@ -964,6 +967,40 @@ async def test_repair_write_guard_skips_a_row_whose_party_parcel_or_case_moved(d
     assert await asyncio.to_thread(_write) == 0
     await asyncio.to_thread(_config_owner, business_user.id)
     assert await asyncio.to_thread(_write) == 1
+
+
+@pytest.mark.asyncio
+async def test_repair_writes_a_legacy_row_keyed_only_by_legal_description(db, business_user):
+    job_id = await _pierce_job(db, business_user)
+    rid, _ = await _stored(db, business_user, job_id, party="Nuisance - 2117 AVE S",
+                           ed={"source": "tacoma_code_violations"})   # no case_number
+
+    def _write():
+        from src.db.session import system_sync_session
+
+        with system_sync_session() as sdb:
+            row = sdb.execute(text("SELECT id, user_id, job_id, party_name, parcel_id, "
+                                   "property_address, legal_description, "
+                                   "enrichment_data::jsonb AS ed FROM results WHERE id = :i"),
+                              {"i": rid}).one()
+            res = sdb.execute(text(bpo._UPDATE_SQL), {
+                "new_party": None, "old_party": row.party_name, "old_parcel": row.parcel_id,
+                "old_address": row.property_address, "rid": row.id, "uid": row.user_id,
+                "jid": row.job_id, "old_legal": row.legal_description,
+                "old_case": bpo._case_number(row), "payload": "{}", "source": bpo._SOURCE,
+                "writes_owner_status": False})
+            sdb.commit()
+            return res.rowcount
+
+    assert await asyncio.to_thread(_write) == 1
+
+
+def test_a_lookup_for_anything_but_tacoma_code_violations_makes_no_request(monkeypatch, paces):
+    portal = _Portal({"2021110133": [(200, ATIP_2117)]}).install(monkeypatch)
+    for source in ("pierce_recorder", None, "seattle_sdci_code_violations"):
+        with pytest.raises(ValueError, match="Tacoma code-violation"):
+            pao.lookup_parcels(["2021110133"], source=source)
+    assert portal.sessions == 0 and portal.requests == []
 
 
 def test_repair_leaves_a_case_the_source_answers_twice_differently(monkeypatch):

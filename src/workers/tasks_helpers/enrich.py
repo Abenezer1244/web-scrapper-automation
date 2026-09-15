@@ -926,7 +926,8 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                          f"Looking up property owners for {len(_pcv_map)} code violation "
                          "parcels...", db=db)
             _pcv_stats: dict = {}
-            _pcv_fetched = lookup_parcels(list(_pcv_map), budget_s=240, stats=_pcv_stats)
+            _pcv_fetched = lookup_parcels(list(_pcv_map), source="tacoma_code_violations",
+                                          budget_s=240, stats=_pcv_stats)
             try:
                 _pcv_plans, _ = plan_owner_decisions(_pcv_map, _pcv_fetched)
                 _pcv_counts = write_owner_decisions(db, _pcv_plans, checked_at=_now().isoformat())

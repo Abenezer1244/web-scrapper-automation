@@ -136,7 +136,7 @@ class BridgeScraper:
     """
 
     def __init__(self, *, plain_browser: bool = False) -> None:
-        # plain_browser=True: a stock Chromium session with NO anti-detection of any kind
+        # plain_browser (on): a stock Chromium session with NO anti-detection of any kind
         # (no AutomationControlled flag, no webdriver/plugins/languages init script, no
         # user-agent override). The SSRF route guard still applies. Used where the owner
         # decided a portal must see an honest automated browser (Pierce ATIP owner lookups,
@@ -177,7 +177,10 @@ class BridgeScraper:
         # Use headed mode if DISPLAY is set (Xvfb virtual display on Railway).
         # This fixes EagleWeb sites where headless mode breaks JS redirects.
         has_display = bool(os.environ.get("DISPLAY"))
-        use_headless = settings.PLAYWRIGHT_HEADLESS and not has_display
+        # A plain browser is always the stock headless session, whatever the deployment
+        # says (Codex r14).
+        use_headless = True if self._plain_browser else (
+            settings.PLAYWRIGHT_HEADLESS and not has_display)
 
         self._browser = await self._playwright.chromium.launch(
             headless=use_headless,

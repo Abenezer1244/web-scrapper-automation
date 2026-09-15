@@ -335,7 +335,7 @@ def clean_health():
 
 
 @pytest.mark.asyncio
-async def test_the_atip_owner_browser_is_plain_with_no_init_script():
+async def test_the_atip_owner_browser_is_plain_with_no_init_script(monkeypatch):
     """Owner decision 2026-09-15: no anti-detection toward ATIP. A real Chromium session on
     about:blank (no network): no init script registered, navigator.webdriver left true,
     no plugins/UA spoofing, while the default scraper keeps its behavior."""
@@ -357,14 +357,27 @@ async def test_the_atip_owner_browser_is_plain_with_no_init_script():
         stock = await stock_page.evaluate(identity)
         await browser.close()
 
+    # Even where the deployment asks for a headed browser, the ATIP session stays stock headless.
+    monkeypatch.setattr(settings, "PLAYWRIGHT_HEADLESS", False)
+    monkeypatch.setenv("DISPLAY", ":99")
     async with pao._new_session() as s:
         assert s.init_scripts_registered == 0
         assert await s.page.evaluate(identity) == stock    # indistinguishable from stock
         assert stock["webdriver"] is True
 
+    monkeypatch.delenv("DISPLAY")
+    monkeypatch.setattr(settings, "PLAYWRIGHT_HEADLESS", True)
     async with BridgeScraper() as default:                 # other scrapers: unchanged
         assert default.init_scripts_registered == 1
         assert await default.page.evaluate("navigator.webdriver") is not True
+
+
+def test_only_the_atip_owner_lookup_opts_into_the_plain_browser():
+    """The plain session is an owner decision for ATIP owner lookups, not a general option."""
+    src = Path(__file__).resolve().parents[1] / "src"
+    users = sorted(str(f.relative_to(src)).replace("\\", "/") for f in src.rglob("*.py")
+                   if "plain_browser=True" in f.read_text(encoding="utf-8"))
+    assert users == ["scrapers/enrichment/pierce_atip_owner.py"]
 
 
 def test_flag_off_makes_zero_requests(monkeypatch):

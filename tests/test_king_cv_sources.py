@@ -507,6 +507,48 @@ async def test_every_source_failing_fails_the_scrape(monkeypatch, no_backoff):
     assert set(scraper.source_status.values()) == {"failed"}
 
 
+async def _source_alerts(db, since: datetime) -> list[tuple[str, str]]:
+    rows = (await db.execute(text(
+        "SELECT path, detail FROM audit_events WHERE event = 'ops_alert' AND path LIKE :p "
+        "AND created_at >= :since ORDER BY path"),
+        {"p": f"{kcv.SOURCE_FAILURE_ALERT_KIND}:%", "since": since})).all()
+    return [(r.path, r.detail) for r in rows]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_source_leaves_one_ops_alert_naming_it_and_no_error_text(
+        db, monkeypatch, no_backoff):
+    since = datetime.now(UTC)
+    _connector(monkeypatch, fail={"bellevue"})
+    await kcv.KingWACodeViolationScraper().scrape("08/01/2026", "09/14/2026")
+
+    alerts = await _source_alerts(db, since)
+    assert [path for path, _ in alerts] == [f"{kcv.SOURCE_FAILURE_ALERT_KIND}:bellevue_code_enforcement"]
+    assert alerts[0][1].endswith("King code violation source failed: Bellevue")
+
+
+@pytest.mark.asyncio
+async def test_a_range_too_large_for_a_source_is_not_an_ops_alert(db, monkeypatch, no_backoff):
+    since = datetime.now(UTC)
+    _connector(monkeypatch, fail={"accela_budget"})
+    await kcv.KingWACodeViolationScraper().scrape("08/01/2026", "09/14/2026")
+
+    assert await _source_alerts(db, since) == []
+
+
+@pytest.mark.asyncio
+async def test_every_failed_source_is_alerted_when_the_whole_scrape_fails(db, monkeypatch, no_backoff):
+    since = datetime.now(UTC)
+    _connector(monkeypatch, fail={"bellevue", "burien", "accela"}, sdci_fails=True)
+    with pytest.raises(RuntimeError, match="every source failed"):
+        await kcv.KingWACodeViolationScraper().scrape("08/01/2026", "09/14/2026")
+
+    assert [path for path, _ in await _source_alerts(db, since)] == [
+        f"{kcv.SOURCE_FAILURE_ALERT_KIND}:{key}" for key in sorted(
+            ("seattle_sdci_code_violations", "bellevue_code_enforcement", "burien_code_enforcement",
+             "kingco_accela_code_enforcement"))]
+
+
 @pytest.mark.asyncio
 async def test_the_partial_failure_warning_reaches_the_job_log(
         db, business_user, redis_client, monkeypatch, no_backoff):

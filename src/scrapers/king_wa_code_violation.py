@@ -19,6 +19,7 @@ during enrichment. Accela runs last: it is the slowest source (a paced browser).
 """
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Sequence
 
 from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord
@@ -74,6 +75,32 @@ def partial_failure_warning(failed: Sequence[str], succeeded: Sequence[str],
         msg += (f" This date range has more {_join_names(too_large)} cases than one run can "
                 f"collect, so use a shorter date range to include them.")
     return msg
+
+
+SOURCE_FAILURE_ALERT_KIND = "king_cv_source_failed"
+
+
+async def _alert_source_failure(source: CodeViolationSource, exc: Exception,
+                                date_from: str, date_to: str) -> None:
+    """Ops alert for one jurisdiction that failed, cooldown-bucketed per source.
+
+    The county canary (county_connectors.health_status) sees only the connector as a whole,
+    and a partial failure still ships a done job, so without this a jurisdiction could stay
+    down for weeks behind a job-log warning. Never for DateRangeTooLargeError: that is the
+    customer's range, not an outage. Carries the exception class only, never its text or
+    scraped content. send_ops_alert never raises and always leaves an audit_events row; it
+    runs in a thread so its email and database write never block this event loop.
+    """
+    if isinstance(exc, DateRangeTooLargeError):
+        return
+    from src.workers.ops_alerts import send_ops_alert
+
+    await asyncio.to_thread(
+        send_ops_alert, SOURCE_FAILURE_ALERT_KIND, source.key,
+        f"King code violation source failed: {source.jurisdiction}",
+        f"Source {source.key} ({source.jurisdiction}) failed for {date_from} to {date_to} with "
+        f"{type(exc).__name__}. The job shipped the other jurisdictions if any succeeded. "
+        f"Worker logs carry the full error (search 'King code violation source {source.key}').")
 
 
 def _report_progress(callback, pages: int, total: int, count: int) -> None:
@@ -134,6 +161,7 @@ class KingWACodeViolationScraper(BridgeScraper):
                 _logger.error("King code violation source %s failed for %s to %s: %s: %s",
                               source.key, date_from, date_to, type(exc).__name__,
                               str(exc)[:300])
+                await _alert_source_failure(source, exc, date_from, date_to)
                 continue
             source.on_progress = None  # never outlives this source's fetch
             self.source_status[source.key] = SOURCE_OK

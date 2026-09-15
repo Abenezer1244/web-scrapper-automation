@@ -19,10 +19,16 @@ during enrichment. Accela runs last: it is the slowest source (a paced browser).
 """
 from __future__ import annotations
 
+import asyncio
+import threading
 from collections.abc import Sequence
 
 from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord
-from src.scrapers.king_cv_sources.base import CodeViolationSource, DateRangeTooLargeError
+from src.scrapers.king_cv_sources.base import (
+    CodeViolationSource,
+    DateRangeTooLargeError,
+    raise_if_time_limit,
+)
 from src.scrapers.king_cv_sources.bellevue import BellevueSource
 from src.scrapers.king_cv_sources.burien import BurienSource
 from src.scrapers.king_cv_sources.kingco_accela import KingCountyAccelaSource
@@ -76,10 +82,91 @@ def partial_failure_warning(failed: Sequence[str], succeeded: Sequence[str],
     return msg
 
 
+SOURCE_FAILURE_ALERT_KIND = "king_cv_source_failed"
+# How long a source failure waits for its alert. The alert keeps running in its own daemon
+# thread past this; neither the scrape nor the worker's asyncio.run shutdown waits on a
+# slow Redis, database or email provider.
+_ALERT_WAIT_S = 15.0
+# Alert threads alive at once in this process. A hung Redis, database or email provider
+# cannot be interrupted, so a long outage would otherwise add a stuck thread per failed
+# source per job. Past the cap the alert is logged at ERROR and not sent.
+_ALERT_THREADS = threading.BoundedSemaphore(4)
+
+
+def source_failure_alert(source: CodeViolationSource, exc: Exception,
+                         date_from: str, date_to: str) -> tuple[str, str, str, str]:
+    """(kind, key, subject, body) of the ops alert for one failed jurisdiction.
+
+    Carries the exception class only, never its text or scraped content.
+    """
+    return (
+        SOURCE_FAILURE_ALERT_KIND, source.key,
+        f"King code violation source failed: {source.jurisdiction}",
+        f"Source {source.key} ({source.jurisdiction}) failed for {date_from} to {date_to} with "
+        f"{type(exc).__name__}. The job shipped the other jurisdictions if any succeeded. "
+        f"Worker logs carry the full error (search 'King code violation source {source.key}').")
+
+
+async def _alert_source_failure(source: CodeViolationSource, exc: Exception,
+                                date_from: str, date_to: str) -> None:
+    """Ops alert for one jurisdiction that failed, cooldown-bucketed per source.
+
+    The county canary (county_connectors.health_status) sees only the connector as a whole,
+    and a partial failure still ships a done job, so without this a jurisdiction could stay
+    down for weeks behind a job-log warning. Never for DateRangeTooLargeError: that is the
+    customer's range, not an outage. send_ops_alert never raises and always leaves an
+    audit_events row (one per failed source per run: bounded by job runs).
+
+    It runs in a daemon thread, not the loop's default executor: asyncio.run joins that
+    executor on exit, so a hung alert there would hold the job after the scrape returned.
+    The scrape waits for it at most _ALERT_WAIT_S.
+    """
+    if isinstance(exc, DateRangeTooLargeError):
+        return
+    from src.workers.ops_alerts import send_ops_alert
+
+    loop = asyncio.get_running_loop()
+    finished = loop.create_future()
+    alert = source_failure_alert(source, exc, date_from, date_to)
+    slots = _ALERT_THREADS  # released on the object acquired, even if the name is rebound
+
+    def _notify() -> None:
+        if not finished.done():
+            finished.set_result(None)
+
+    def _send() -> None:
+        try:
+            send_ops_alert(*alert)
+        finally:
+            slots.release()
+            try:
+                loop.call_soon_threadsafe(_notify)
+            except RuntimeError:
+                pass  # the loop already closed: nobody is waiting any more
+
+    if not slots.acquire(blocking=False):
+        _logger.error("ops alert NOT sent for King code violation source %s: earlier alerts are "
+                      "still stuck (Redis, database or email provider not answering)", source.key)
+        return
+    try:
+        threading.Thread(target=_send, name=f"ops-alert-{source.key}", daemon=True).start()
+    except RuntimeError as start_exc:  # the process cannot start another thread
+        slots.release()
+        _logger.error("ops alert NOT sent for King code violation source %s: %s",
+                      source.key, str(start_exc)[:160])
+        return
+    try:
+        await asyncio.wait_for(finished, timeout=_ALERT_WAIT_S)
+    except TimeoutError:
+        _logger.warning("ops alert for King code violation source %s still running after %.0fs; "
+                        "the scrape continues", source.key, _ALERT_WAIT_S)
+
+
 def _report_progress(callback, pages: int, total: int, count: int) -> None:
     try:
         callback(pages, total, count)
     except Exception as exc:
+        raise_if_time_limit(exc)  # the job's deadline, never a callback failure
         raise ProgressCallbackError(f"progress callback failed: {str(exc)[:160]}") from exc
 
 
@@ -124,16 +211,18 @@ class KingWACodeViolationScraper(BridgeScraper):
                 got = await source.fetch(date_from, date_to)
             except Exception as exc:
                 source.on_progress = None
+                # A Celery time limit is the job's deadline, not this source's failure. The
+                # adapters re-raise it from every catch-all; the chain is checked here too,
+                # before anything else can treat it as a callback or source failure.
+                raise_if_time_limit(exc)
                 if isinstance(exc, ProgressCallbackError):
-                    raise
-                # A Celery time limit is the job's deadline, not this source's failure.
-                if type(exc).__name__ in ("SoftTimeLimitExceeded", "TimeLimitExceeded"):
                     raise
                 self.source_status[source.key] = SOURCE_FAILED
                 failures.append((source, exc))
                 _logger.error("King code violation source %s failed for %s to %s: %s: %s",
                               source.key, date_from, date_to, type(exc).__name__,
                               str(exc)[:300])
+                await _alert_source_failure(source, exc, date_from, date_to)
                 continue
             source.on_progress = None  # never outlives this source's fetch
             self.source_status[source.key] = SOURCE_OK

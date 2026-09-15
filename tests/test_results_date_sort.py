@@ -214,6 +214,34 @@ async def test_pages_are_slices_of_one_global_order(
     assert pages[0]["items"][-1]["id"] < pages[1]["items"][0]["id"]
 
 
+async def test_oldest_first_pages_are_slices_of_one_global_order(
+    client: AsyncClient, starter_user: User, starter_token: str,
+):
+    job_id = await _job(starter_user)
+    # 60 rows sharing 3/1/2024 (the oldest date) straddle the page 1/2 boundary.
+    # 45 newer rows are inserted before them, and 15 Dec 2025 rows after them that
+    # a text sort would wrongly put first ("12/..." < "3/1/2024" as strings).
+    specs = [{"date": f"9/{(i % 28) + 1}/2026"} for i in range(45)]
+    specs += [{"date": "3/1/2024"}] * 60
+    specs += [{"date": f"12/{(i % 28) + 1}/2025"} for i in range(15)]
+    ids = await _rows(job_id, starter_user.id, specs)
+
+    pages = [
+        await _get(client, job_id, starter_token, page=p, page_size=50, sort="date_asc")
+        for p in (1, 2, 3)
+    ]
+    items = [row for body in pages for row in body["items"]]
+
+    assert [len(body["items"]) for body in pages] == [50, 50, 20]
+    assert sorted(row["id"] for row in items) == sorted(ids)
+    keys = [(_as_date(row["date_recorded"]), row["id"]) for row in items]
+    assert keys == sorted(keys)
+    # Page 1 holds only the globally oldest date; 10 more of it open page 2.
+    assert {row["date_recorded"] for row in pages[0]["items"]} == {"3/1/2024"}
+    assert [row["date_recorded"] for row in pages[1]["items"][:10]] == ["3/1/2024"] * 10
+    assert pages[1]["items"][10]["date_recorded"].startswith("12/")
+
+
 # ─── F / G: search and filters narrow first, then the narrowed set is sorted ────
 
 async def test_search_results_are_sorted_and_paginated_server_side(

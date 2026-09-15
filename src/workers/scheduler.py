@@ -61,6 +61,20 @@ from src.workers.scheduler_helpers.registration import (
 _logger = setup_logger("worker.scheduler")
 
 # ─── Beat schedule ────────────────────────────────────────────────────────────
+#
+# Anything every 10 minutes or slower is a wall-clock crontab, not an interval.
+# Beat's schedule file is not on a volume, so every deploy starts every entry
+# fresh, and a fresh interval entry waits one FULL period before its first run.
+# On 2026-09-15 (UTC) beat containers started at 00:59, 01:12, 01:20 and 01:29,
+# and the 20-minute recover-deferred-property sweep never fired once. A crontab fires at
+# the next mark after boot however often deploys land. Beat runs in UTC
+# (src/workers/__init__.py). Entries under 10 minutes stay intervals: a deploy
+# costs them at most one short period, and aligning them to shared marks would
+# only bunch the paid and dispatch sweeps together.
+#
+# The three King recovery sweeps share one eRealProperty lease, so their marks
+# are staggered at least 2 minutes apart: mailing :03 +10, owners :05 +15,
+# property :07 +20. tests/test_beat_schedule.py pins both rules.
 
 app.conf.beat_schedule = {
     "dispatch-scheduled-jobs": {
@@ -87,7 +101,7 @@ app.conf.beat_schedule = {
     },
     "canary-check": {
         "task": "src.workers.scheduler.canary_check",
-        "schedule": 3600.0,  # every 1 hour
+        "schedule": crontab(minute=17),  # hourly at :17
     },
     "enrichment-source-canary": {
         # The recovery half of external_source_health, which shipped without one:
@@ -115,7 +129,7 @@ app.conf.beat_schedule = {
         # rather than daily, and being late costs at most an hour of a stale
         # /billing/usage reading, never a wrong charge.
         "task": "src.workers.scheduler.reconcile_quota_periods",
-        "schedule": 3600.0,  # every 1 hour
+        "schedule": crontab(minute=41),  # hourly at :41
     },
     "reset-skip-trace-usage": {
         # Formerly "reset-monthly-usage". The RECORDS half of that task was
@@ -142,13 +156,13 @@ app.conf.beat_schedule = {
     },
     "expire-trials": {
         "task": "src.workers.scheduler.expire_trials",
-        "schedule": 3600.0,  # every 1 hour
+        "schedule": crontab(minute=25),  # hourly at :25
     },
     "purge-expired-pending-registrations": {
         # Email-verification flow: delete pending_registrations rows whose verify
         # window lapsed so the table can't grow from abandoned/sprayed signups.
         "task": "src.workers.scheduler.purge_expired_pending_registrations",
-        "schedule": 3600.0,  # every 1 hour
+        "schedule": crontab(minute=39),  # hourly at :39
     },
     "dispatch-pending-verification-emails": {
         # Email-verification OUTBOX: send the verification email for each due
@@ -193,7 +207,7 @@ app.conf.beat_schedule = {
         # live-querying tenant tables (results/jobs/scraper_configs). Hourly is
         # plenty — the landing page tolerates stale-by-an-hour sample rows.
         "task": "src.workers.scheduler.refresh_public_sample_cache",
-        "schedule": 3600.0,  # every 1 hour
+        "schedule": crontab(minute=57),  # hourly at :57
     },
     "crawl-nts-tacoma-index": {
         # NTS Tier 1: harvest Pierce trustee-sale auction data (auction date /
@@ -253,7 +267,7 @@ app.conf.beat_schedule = {
         # indexed query and exits, and a tick while King is in cooldown makes no
         # request at all.
         "task": "src.workers.mailing_recovery.recover_deferred_mailing",
-        "schedule": 600.0,  # every 10 minutes
+        "schedule": crontab(minute="3-59/10"),  # every 10 minutes from :03
     },
     "recover-deferred-owners": {
         # The reading half of `owner_lookup_deferred`: names delivered King tax
@@ -262,7 +276,7 @@ app.conf.beat_schedule = {
         # King source lease with every other eRealProperty pass. Never bills,
         # never creates a job, never enqueues a skip trace.
         "task": "src.workers.owner_recovery.recover_deferred_owners",
-        "schedule": 900.0,  # every 15 minutes
+        "schedule": crontab(minute="5-59/15"),  # every 15 minutes from :05
     },
     "recover-deferred-property": {
         # The reading half of `property_lookup_deferred`: fills King property
@@ -272,7 +286,7 @@ app.conf.beat_schedule = {
         # PROPERTY_RECOVERY_ENABLED. Never bills, never creates a job, never
         # enqueues a skip trace, never copies mailing into property.
         "task": "src.workers.property_recovery.recover_deferred_property",
-        "schedule": 1200.0,  # every 20 minutes
+        "schedule": crontab(minute="7-59/20"),  # every 20 minutes from :07
     },
     "batch-completion-sweep": {
         # Piece 2: finalize batch_runs whose child jobs are ALL terminal — build

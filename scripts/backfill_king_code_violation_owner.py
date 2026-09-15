@@ -143,6 +143,9 @@ _AP_UPDATE_SQL = """
       AND mailing_address IS NOT DISTINCT FROM CAST(:old_mail AS text)
       AND (CAST(:new_mail AS text) IS NULL OR coalesce(btrim(mailing_address), '') = '')
       AND jsonb_typeof(enrichment_data::jsonb) = 'object'
+      -- Optimistic concurrency on the whole object read (Codex r5): any change since, to
+      -- any kc_* key or anything else, skips the row. The key pins below state intent.
+      AND enrichment_data::jsonb = CAST(:old_ed AS jsonb)
       AND enrichment_data::jsonb->>'source' = :source
       AND enrichment_data::jsonb->>'kc_pin_status' = CAST(:old_pin_status AS text)
       AND enrichment_data::jsonb->>'kc_pin' IS NOT DISTINCT FROM CAST(:old_pin AS text)
@@ -240,7 +243,8 @@ def run_address_points(db, *, apply_writes: bool, limit: int | None = None,
                 "old_address": r.property_address, "old_zip": r.property_zip,
                 "old_lat": r.lat, "old_lon": r.lon,
                 # The owner flags are computed from these, so they must still hold.
-                "old_city": r.property_city, "old_state": r.property_state})
+                "old_city": r.property_city, "old_state": r.property_state,
+                "old_ed": json.dumps(r.ed)})
             written += bool(res.rowcount)
             skipped += not res.rowcount
             if i % 200 == 0:

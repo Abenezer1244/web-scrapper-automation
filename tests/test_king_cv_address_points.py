@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import json
 import re
 import uuid
 from pathlib import Path
@@ -702,9 +703,9 @@ async def test_address_point_repair_is_dry_by_default_guarded_and_converges(
 
 @pytest.mark.asyncio
 async def test_address_point_repair_write_skips_a_row_changed_since_it_was_read(db, business_user):
+    stored = _stored_ed("013845-26CP", "address_mismatch", "47.52163912", "-122.35809767")
     rid, _, _ = await _stored_row(
-        db, business_user, address="9043 A 18TH AVE SW, SEATTLE WA 98106",
-        ed=_stored_ed("013845-26CP", "address_mismatch", "47.52163912", "-122.35809767"))
+        db, business_user, address="9043 A 18TH AVE SW, SEATTLE WA 98106", ed=stored)
     payload = ('{"kc_pin_status": "matched", "kc_pin": "7899800716", '
                '"kc_pin_match": "address_point", "kc_pin_source": "king_gis_address_point", '
                '"kc_address_point_evidence": {"outcome": "accepted"}}')
@@ -719,7 +720,7 @@ async def test_address_point_repair_write_skips_a_row_changed_since_it_was_read(
                   "old_pin_source": None, "old_parcel_address": None,
                   "old_address": "9043 A 18TH AVE SW, SEATTLE WA 98106", "old_zip": None,
                   "old_lat": "47.52163912", "old_lon": "-122.35809767", "old_city": None,
-                  "old_state": None, **over}
+                  "old_state": None, "old_ed": json.dumps(stored), **over}
         with system_sync_session() as sdb:
             res = sdb.execute(text(bko._AP_UPDATE_SQL), params)
             sdb.commit()
@@ -734,6 +735,9 @@ async def test_address_point_repair_write_skips_a_row_changed_since_it_was_read(
     assert await asyncio.to_thread(_write, old_zip="98106") == 0
     assert await asyncio.to_thread(_write, old_lat="47.52158159") == 0
     assert await asyncio.to_thread(_write, old_state="WA") == 0
+    # Any other change to the object read (e.g. a kc_pin_checked_at stamped since) too.
+    assert await asyncio.to_thread(
+        _write, old_ed=json.dumps({**stored, "kc_pin_checked_at": "2026-09-13T00:00:00+00:00"})) == 0
     assert await asyncio.to_thread(_write) == 1
     # Decided once: a second decision for the same row is refused.
     assert await asyncio.to_thread(_write, old_pin_status="matched", old_pin="7899800716",

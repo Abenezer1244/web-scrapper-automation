@@ -209,7 +209,8 @@ def _is_reference_record(row: dict) -> bool:
         if _REFERENCE_WORD_RE.search(_clean(row.get(key)).upper()):
             return True
     use_code = _clean(row.get("use_cd")).upper()
-    return not use_code or use_code.startswith("0000")
+    # Any unknown use code (absent, "0000-...", "UNKNOWN", "9999-UNKNOWN") proves nothing.
+    return not use_code or use_code.startswith("0000") or "UNKNOWN" in use_code
 
 
 @dataclass(frozen=True)

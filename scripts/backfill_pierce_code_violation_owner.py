@@ -261,23 +261,25 @@ def _write_plans(db, plans: list[dict], fetched: dict, counts: Counter, fh, *,
             new_party = None
             counts["label_cleared_no_owner"] += 1
         payload["cv_semantics_repaired_at"] = now
+        applied = None                      # dry-run: nothing was attempted
+        if apply_writes:
+            res = db.execute(text(_UPDATE_SQL), {
+                "new_party": new_party, "old_party": r.party_name, "old_parcel": r.parcel_id,
+                "old_address": r.property_address, "rid": r.id, "uid": r.user_id, "jid": r.job_id,
+                # The source row was fetched for THIS case; a row re-pointed since is skipped.
+                "old_legal": r.legal_description, "old_case": _case_number(r),
+                "payload": json.dumps(payload), "source": _SOURCE,
+                "writes_owner_status": writes_owner_status})
+            applied = bool(res.rowcount)
+            written += applied
+            skipped += not applied
         if fh is not None:
-            # Evidence file: the decision, never the taxpayer name.
+            # Evidence file, written AFTER the guarded UPDATE so it records what actually
+            # happened (Codex r11): the decision and write_applied, never the name.
             fh.write(json.dumps({"result_id": str(r.id), "parcel_id": r.parcel_id,
                                  "was_label": p["is_label"],
-                                 "named": new_party is not None and new_party != r.party_name,
-                                 **payload}) + "\n")
-        if not apply_writes:
-            continue
-        res = db.execute(text(_UPDATE_SQL), {
-            "new_party": new_party, "old_party": r.party_name, "old_parcel": r.parcel_id,
-            "old_address": r.property_address, "rid": r.id, "uid": r.user_id, "jid": r.job_id,
-            # The source row was fetched for THIS case; a row re-pointed since is skipped.
-            "old_legal": r.legal_description, "old_case": _case_number(r),
-            "payload": json.dumps(payload), "source": _SOURCE,
-            "writes_owner_status": writes_owner_status})
-        written += bool(res.rowcount)
-        skipped += not res.rowcount
+                                 "planned_name": new_party is not None and new_party != r.party_name,
+                                 "write_applied": applied, **payload}) + "\n")
     if apply_writes:
         db.commit()
     return written, skipped

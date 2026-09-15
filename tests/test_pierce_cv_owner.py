@@ -229,8 +229,11 @@ def test_everything_else_names_nobody(parcel, body, address, status):
     {"mail": "REFERENCE"},
     {"use_cd": "0000-UNKNOWN"},
     {"use_cd": None},
+    {"use_cd": "UNKNOWN"},
+    {"use_cd": "9999-UNKNOWN"},
     {"category": "Reference"},
-], ids=["name_variant", "mail_marker", "unknown_use", "no_use_code", "category"])
+], ids=["name_variant", "mail_marker", "unknown_use", "no_use_code", "bare_unknown", "9999_unknown",
+        "category"])
 def test_a_reference_marker_anywhere_fails_closed_even_on_a_matching_situs(variant):
     row = dict(_rows(ATIP_2117)[0], **variant)
     assert _decide("2021110133", [row], "2117 AVE S") == pao.OwnerDecision("reference_parcel")
@@ -916,7 +919,9 @@ async def test_repair_replaces_only_the_old_label_and_converges(
     assert got[cleared].enrichment_data["owner_status"] == "not_on_record"
     assert got[foreign].party_name == "HAND ENTERED NAME"
     assert got[live].party_name == "Nuisance - 2117 AVE S"
-    assert "TACOMA TOWN CENTER" not in (tmp_path / "ev.jsonl").read_text()
+    evidence = (tmp_path / "ev.jsonl").read_text()
+    assert "TACOMA TOWN CENTER" not in evidence
+    assert all(json.loads(line)["write_applied"] is True for line in evidence.splitlines())
 
     assert (await asyncio.to_thread(_run, True))["candidates"] == 0
 

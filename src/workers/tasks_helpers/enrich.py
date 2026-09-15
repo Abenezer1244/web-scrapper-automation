@@ -936,8 +936,9 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                              "code violations.", db=db)
             except Exception as exc:
                 db.rollback()
+                # Type only: a DB error string can carry the bound taxpayer name (Codex r11).
                 _logger.warning("Job %s: Pierce code violation owner write failed: %s",
-                                job_id, str(exc)[:120])
+                                job_id, type(exc).__name__)
 
     # King code violations carry coordinates but no parcel, so the parcel-keyed passes
     # below can never give them a mailing address. Locate the parcel strictly (one

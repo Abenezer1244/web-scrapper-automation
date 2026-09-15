@@ -19,6 +19,11 @@ Guarded single-row UPDATEs (same user, same party_name as read, job still done).
 parcel_id, dedup, billing, quota, skip trace or delivery change. Idempotent: a repaired
 row carries `cv_semantics_repaired_at`; --retry-owners revisits exact/street-only rows still unnamed.
 
+Routine owner naming no longer needs this script: the beat sweep
+src/workers/cv_owner_recovery.py (`recover-code-violation-owners`, every 20 minutes,
+gated on OWNER_RECOVERY_ENABLED) names delivered exact/street-only leads a job's owner
+pass did not reach. This script remains for the historical label repair above.
+
     railway run --service worker python scripts/backfill_king_code_violation_owner.py              # dry-run
     railway run --service worker python scripts/backfill_king_code_violation_owner.py --owners --apply
 

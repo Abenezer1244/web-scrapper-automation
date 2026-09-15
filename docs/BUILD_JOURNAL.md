@@ -57,6 +57,15 @@ crm_v1; Playwright Results -> Download CSV on a crm_v1 scraper after deploy. Sep
 `_parse_full_address` sends state CA/UN for foreign addresses; PhoneBurner `_split_name` is naive; Snohomish
 prefc `date_recorded` equals auction date.
 
+**Follow-up (same day, double surnames):** the natural-order case ('Jessica M. Hernandez Olvera') was
+the ONLY one in prod; the real volume was recorder order ('GUZMAN CAMPOS MARIA F' -> first CAMPOS).
+Added a curated Hispanic surname list (given-name-like surnames excluded) as evidence a word is not a
+first name, particle pairs (DE LOS, VAN DER), trailing-role strip (TTEE, EXEC, PER REP, ADMN), AKA cut,
+phrase-safe organization words, and a Vietnamese given-name-slot check. First prod diff over-blanked 12
+correct names ('DANG CATHY TRAN', 'BAEK JONG HO', 'PHAM ANH THE') and exposed a glued role
+('RITA HSIU-HUI KAO-TRUSTEE'); narrowed and re-diffed to 39 corrected / 2 filled / 457 blank, all
+reviewed. Codex FAIL was a claimed regression that the committed version already had; withdrawn -> PASS.
+
 **Facts learned:** party_name order is per SOURCE: WA recorder + assessor/treasurer = LAST FIRST; trustee's-sale
 notices (all trustee_sale, Snohomish pre_foreclosure) = FIRST LAST; Okanogan probate mixes both; Pierce CV
 party_name is "{case_type} - {address}". Recorder shape "LAST F MIDDLE" is indistinguishable from a leaked

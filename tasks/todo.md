@@ -61,6 +61,18 @@ per-scraper switch); **read-only prod reads allowed** for format sampling + real
 - [ ] Playwright Results -> Download CSV: needs deploy or local full stack (not done).
 - [ ] FE layout toggle; BatchDialer guide for crm_v1.
 
+### Follow-up - double surnames (owner request 2026-09-15)
+- [x] Read-only scan of every 4+-word prod name (573 non-blank splits read): double surnames were mostly
+      RECORDER order ('ALATORRE HERNANDEZ JOSE LUIS' -> first HERNANDEZ), plus missed organizations,
+      role abbreviations (TTEE/EXEC/PER REP) and scrambled Vietnamese cells.
+- [x] Codex design consult before code; reconciled (adopted: role strip, phrase-only org words, list
+      safeguards, particle pairs, LE blank; kept with evidence: backslash joiner, MRS blank, OF/FOR).
+- [x] Implemented in `lead_formatting.py` (export-only helpers; title-status parser untouched).
+- [x] Prod diff vs committed branch, 163,261 rows, 2 runs: 39 changed (all correct), 2 filled (correct),
+      457 now blank (orgs / VN scrambles / double surname + initial). 12 over-blanks from run 1 fixed.
+- [x] Tests: 485 pass; mutation check (24 fail with rules disabled). Codex review FAIL -> P1 disproven
+      with HEAD comparison -> GATE PASS. Residual: rare surnames equal to org words (CITY, STATE) blank.
+
 ## Review
 Contract change, not new parsing: split columns already existed. Versioned layout keeps every existing customer's
 headers; new scrapers get crm_v1. The real win is correctness: source-aware names (213 corrected, 405 wrong ->

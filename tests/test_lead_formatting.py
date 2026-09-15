@@ -331,8 +331,6 @@ class TestSplitFirstPerson:
         # Shared surname: 'JOHN' alone is not a full name -> never 'AND'/'JOHN'.
         ("JOHN AND JANE SMITH", NAME_ORDER_NATURAL),
         ("JOHN AND JANE SMITH, HUSBAND AND WIFE", NAME_ORDER_NATURAL),
-        ("JOHN SMITH AS TRUSTEE", NAME_ORDER_NATURAL),
-        ("SMITH JOHN AS TRUSTEE", NAME_ORDER_RECORDER),
         ("UNKNOWN HEIRS OF SMITH JOHN", NAME_ORDER_RECORDER),
         ("SMITH JOHN ET AL", NAME_ORDER_RECORDER),
         ("ABC HOLDINGS LLC", NAME_ORDER_RECORDER),
@@ -374,6 +372,83 @@ class TestSplitFirstPerson:
     ])
     def test_ambiguous_or_non_person_yields_blank(self, name, order):
         assert split_first_person(name, order) == (None, None)
+
+    # ── 2026-09-15: double surnames, roles, organizations, Vietnamese order ──────
+    # Every case below is a real prod party_name from a read-only scan of all 4+-word
+    # names (or a Codex adversarial case). Pinned outputs were hand-reviewed.
+
+    @pytest.mark.parametrize("name, expected", [
+        ("ALATORRE HERNANDEZ JOSE LUIS", ("JOSE", "ALATORRE HERNANDEZ")),
+        ("GUZMAN CAMPOS MARIA F", ("MARIA", "GUZMAN CAMPOS")),
+        ("ORELLANA PADILLA ROXANA YOHELI", ("ROXANA", "ORELLANA PADILLA")),
+        ("MORALES MONDRAGON JUAN RENE", ("JUAN", "MORALES MONDRAGON")),
+        ("GARCIA RAMOS DAVID", ("DAVID", "GARCIA RAMOS")),
+        ("DELA CRUZ PEREZ BRANDON A", ("BRANDON", "DELA CRUZ PEREZ")),
+        ("RIVERA SANDOVAL ERICK G/BOLAINES CRUZ CI", ("ERICK", "RIVERA SANDOVAL")),
+        ("DE LOS SANTOS MARTIN", ("MARTIN", "DE LOS SANTOS")),   # DE LOS binds as a pair
+        ("EL SHARAWY KASSAB", ("KASSAB", "EL SHARAWY")),
+        ("VASQUEZ LUIS ALBERTO SANTOS", ("LUIS", "VASQUEZ")),    # given name after surname
+        ("MARTINEZ LAURA Y JOSE", ("LAURA", "MARTINEZ")),
+        ("NGUYEN DIANNA QUYNH THANH", ("DIANNA", "NGUYEN")),     # VN surname in surname slot
+        ("DANG CATHY TRAN", ("CATHY", "DANG")),                  # VN surname in 3rd word ok
+        ("PHAM DANG", ("DANG", "PHAM")),                          # DANG is a given name too
+        ("PHAM ANH THE AND DANG THUY", ("ANH", "PHAM")),         # THE is a VN given name
+        ("BAEK JONG HO & KANG EUNJU", ("JONG", "BAEK")),          # Korean HO is not VN
+        ("PARK JI HOON", ("JI", "PARK")),                         # PARK surname is not an org
+        ("TEMPLE JOHN", ("JOHN", "TEMPLE")),
+        ("MEADOWS SARAH K", ("SARAH", "MEADOWS")),
+        # Trailing roles are stripped and the person kept (Codex).
+        ("ALDRIDGE FAYE MARIE TTEE", ("FAYE", "ALDRIDGE")),
+        ("CHINN HING W -TTEE", ("HING", "CHINN")),
+        ("BROOKS GENE STEPHEN (TTE)", ("GENE", "BROOKS")),
+        ("MEDEIROS ERROL JEREMY (TTEE", ("ERROL", "MEDEIROS")),
+        ("ENGLER DAVID M EXEC", ("DAVID", "ENGLER")),
+        ("CHIAROLLA DENNIS M SR EXEC(+)", ("DENNIS", "CHIAROLLA")),
+        ("GRAY JUDSON PER REP", ("JUDSON", "GRAY")),
+        ("GUTSCHMIDT PENNY LEE (ADMN)", ("PENNY", "GUTSCHMIDT")),
+        ("NORRIS MARTHA TRUSTEE", ("MARTHA", "NORRIS")),
+        ("SMITH JOHN AS TRUSTEE", ("JOHN", "SMITH")),
+        ("MENDOZA JOSE M GUILLEN AKA", ("JOSE", "MENDOZA")),       # alias clause cut
+        ("BRIGGS JESSE T\\JESSICA RAE", ("JESSE", "BRIGGS")),     # backslash co-owner
+    ])
+    def test_recorder_surname_runs_and_roles(self, name, expected):
+        assert split_first_person(name, NAME_ORDER_RECORDER) == expected
+
+    @pytest.mark.parametrize("name, expected", [
+        ("Jessica M. Hernandez Olvera", ("Jessica", "Hernandez Olvera")),
+        ("MARIA GARCIA Y LOPEZ", ("MARIA", "GARCIA Y LOPEZ")),
+        # A single list word before a non-list surname stays a middle name (Codex).
+        ("JOHN RAMOS SMITH", ("JOHN", "SMITH")),
+        # Given-name-like surnames are excluded from the list (Codex adversarial).
+        ("MARIA LUNA GARCIA", ("MARIA", "GARCIA")),
+        ("JOSE SANTIAGO MARTIN", ("JOSE", "MARTIN")),
+        ("CARLOS CRUZ LOPEZ", ("CARLOS", "LOPEZ")),
+        ("JOHN SMITH AS TRUSTEE", ("JOHN", "SMITH")),
+    ])
+    def test_natural_double_surnames_and_roles(self, name, expected):
+        assert split_first_person(name, NAME_ORDER_NATURAL) == expected
+
+    @pytest.mark.parametrize("name", [
+        # Organizations the entity tokens missed (King assessor cells cut at ~27 chars).
+        "STATE OF WASHINGTON DNR", "ISLAMIC CENTER OF KENT", "RENTON CHAMBER OF COMMERCE",
+        "HEIDEH EFTEHARI LIVING TRUS", "ALKI BEACH REAL ESTATE DEVE",
+        "AMERICAN DREAM HOME INVESTM", "PETERSON REAL ESTATE HOLDIN",
+        "GRACE POINT NORTHWEST COMMU", "SHILOH MISSIONARY BAPT CH", "UNITED STATES",
+        "VIRGINIA ST JOINT VENTURE", "THE MEADOWS AT ROCK CREEK", "HABITAT FOR HUMANITY EKC",
+        "RYAN WILLIAM F III REVOCABLE LIVING TRUS", "CHIN FAMILY",
+        # Scrambled Vietnamese order: a VN surname in the given-name slot.
+        "VU NGUYEN SONG KHANH", "BICH BUI THI NGOC", "DAVID TRAN+NHUNG TRAN",
+        # LE opens both French and Vietnamese cells: no way to tell, so blank.
+        "LE HOAI NU MINH", "LE THANG HUYNH MINH TRANG", "LE BAUGH CHRISTOPHER MAX",
+        # Three surname-looking words, or a double surname followed only by an initial.
+        "BULFRANO RAMOS BAEZ MARTINE", "HOLLAND RODRIGUEZ J",
+        # 'Mrs. Carl Lange': the given name is not this person's.
+        "LANGE CARL R MRS",
+        # A role glued to the name is not stripped, so it still blanks.
+        "RITA HSIU-HUI KAO-TRUSTEE",
+    ])
+    def test_organizations_scrambles_and_ambiguous_blank(self, name):
+        assert split_first_person(name, NAME_ORDER_RECORDER) == (None, None)
 
     def test_care_of_is_not_a_co_owner(self):
         assert split_first_person("JOHN SMITH C/O JANE DOE", NAME_ORDER_NATURAL) == ("JOHN", "SMITH")

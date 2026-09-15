@@ -163,7 +163,7 @@ def _is_entity(name: str) -> bool:
     if any(ch.isdigit() for ch in upper) or _SPACED_ENTITY_RE.search(upper):
         return True
     # Joiners count as token breaks, or 'YESLER TOWERS LLC/CHAN J' hides its LLC.
-    tokens = {re.sub(r"[^A-Z]", "", t) for t in re.split(r"[\s/+&;,]+", upper)}
+    tokens = {re.sub(r"[^A-Z]", "", t) for t in re.split(r"[\s/\\+&;,]+", upper)}
     return bool(tokens & _ENTITY_TOKENS)
 
 
@@ -251,8 +251,10 @@ NAME_ORDER_COMMA_ONLY = "comma_only"  # mixed source: only 'LAST, FIRST' is read
 # an entity anywhere in the cell now blanks the whole cell.
 _PARTY_SEP_RE = re.compile(r"\s+/\s+|\s*;\s*")
 # An unspaced '&' joins only word-length names ('SMITH&JANE'), never 'AT&T' / 'B&B'.
+# Snohomish also joins co-owners with a backslash ('BRIGGS JESSE T\JESSICA RAE').
 _COOWNER_JOIN_RE = re.compile(
-    r"\s*/\s*|\s*\+\s*|\s+&\s+|(?<=[A-Za-z]{2})&(?=[A-Za-z]{2})|\s+AND\s+", re.IGNORECASE
+    r"\s*/\s*|\s*\\\s*|\s*\+\s*|\s+&\s+|(?<=[A-Za-z]{2})&(?=[A-Za-z]{2})|\s+AND\s+",
+    re.IGNORECASE,
 )
 # A comma followed by a vesting/capacity clause ends the name: "JOANN SIMON, AN
 # UNMARRIED INDIVIDUAL", "JOHN AND JANE SMITH, HUSBAND AND WIFE". Cut BEFORE the
@@ -286,6 +288,147 @@ _TRAILING_ESTATE_RE = re.compile(
 # than a generational suffix ('KATE V CHEFER').
 _NAME_SUFFIXES = frozenset({"JR", "SR", "II", "III", "IV"})
 
+# ── Rules added 2026-09-15 from a read-only scan of every 4+-word prod party name ──
+# A trailing ROLE names a real person acting for the owner ('ALDRIDGE FAYE MARIE
+# TTEE', 'ENGLER DAVID M EXEC', 'GRAY JUDSON PER REP'). The role is stripped and the
+# person kept (Codex): the name itself is not corrupted by the role.
+# The role must be its own word ('CHINN HING W -TTEE'); one glued to the name
+# ('RITA HSIU-HUI KAO-TRUSTEE') is left alone, so it still blanks as a capacity.
+_ROLE_TAIL_RE = re.compile(
+    r"\s+[-(]?(?:AS\s+)?(?:TTEE|TTE|TRUSTEE|TRUSTE|EXEC|EXECUTOR|EXECUTRIX|ADMN|ADMIN|"
+    r"ADMINISTRATOR|ADMINISTRATRIX|PERS?\s+REP|ESQ)\)?\.?\s*(?:\(\+\))?\s*$",
+    re.IGNORECASE,
+)
+# An alias clause ('MENDOZA JOSE M GUILLEN AKA ...') is not part of the primary name.
+_ALIAS_TAIL_RE = re.compile(r"\s+(?:AKA|FKA|NKA)\b.*$", re.IGNORECASE)
+# 'LANGE CARL R MRS' is Mrs. Carl Lange: the given name is not this person's, so blank.
+_HONORIFIC_RE = re.compile(r"\bMRS\b", re.IGNORECASE)
+
+# Words no person name carries, from organization cells the entity tokens missed
+# ('ISLAMIC CENTER OF KENT', 'HEIDEH EFTEHARI LIVING TRUS'). Deliberately WITHOUT
+# words that are also real surnames (PARK, PARKS, TEMPLE, BIBLE, MEADOWS, HOME, REAL):
+# those only count inside a phrase such as REAL ESTATE (Codex).
+_ORG_WORDS = frozenset({
+    "CENTER", "CENTRE", "CTR", "CITY", "STATE", "STATES", "HOUSING", "HOMEOWNERS",
+    "HOMEOWNER", "ESTATES", "FAMILY", "REVOCABLE", "REVOCABL", "IRREVOCABLE", "LIVING",
+    "TESTAMENTARY", "TESTMENTARY", "DECEDENTS", "BAPTIST", "BAPT", "CATHOLIC", "CATH",
+    "LUTHERAN", "METHODIST", "PRESBYTERIAN", "EPISCOPAL", "MISSIONARY", "PENTECOSTAL",
+    "GOSPEL", "ISLAMIC", "BUDDHIST", "SPIRITUAL", "CONGREGATION", "COMMUNITY",
+    "COMMUNITIES", "DEVELOPMENT", "DEVELOPMENTS", "DEVELOPEMENT", "INVESTORS", "INVEST",
+    "BUILDERS", "BUILD", "CONSTRUCTION", "CHAMBER", "COMMERCE", "MEDICAL", "TOWNHOMES",
+    "APARTMENT", "TRANSIT", "AGENCY", "JOINT", "VENTURE", "DST", "LLLP", "SVC", "SVCS",
+    "SHOPPING", "METROPOLITAN", "REGIONAL", "EDUCATION", "RETREAT", "NEIGHBORS",
+    "REGENCY", "MARINAS", "COORDINATING", "CULTURAL", "SPORTS", "ACQUIS", "WSDOT", "DNR",
+    "USA", "AMERICA", "VACANT", "PHASE", "VILLAGE", "TRAILS", "MOBILE", "ALLIANCE",
+    "RESERVE", "WATER", "ORG", "WOMENS", "THOUSAND",
+})
+# A cut-off final word of an assessor cell ('...HOLDIN', '...ASSOCIAT') is an
+# organization word only at the cell's truncation length and only at 5+ letters.
+_TRUNCATED_CELL_LEN = 26
+# OF/FOR anywhere; THE only as the FIRST word ('THE MEADOWS AT ROCK CREEK'), because
+# 'THE' is also a Vietnamese given name ('PHAM ANH THE').
+_FUNCTION_WORDS = frozenset({"OF", "FOR"})
+
+# Common US Hispanic surnames, EXCLUDING ones that are also common given names
+# (CRUZ, SANTIAGO, ROSARIO, LUNA, LARA, MIRANDA, LEON, SANTOS, PAZ, BAUTISTA ...), so
+# membership is evidence a word is NOT the first name. Used only to recognise a
+# SECOND surname ('ALATORRE HERNANDEZ JOSE LUIS', 'Jessica M. Hernandez Olvera').
+_HISPANIC_SURNAMES = frozenset({
+    "GARCIA", "RODRIGUEZ", "MARTINEZ", "HERNANDEZ", "LOPEZ", "GONZALEZ", "PEREZ",
+    "SANCHEZ", "RAMIREZ", "TORRES", "FLORES", "RIVERA", "GOMEZ", "DIAZ", "REYES",
+    "MORALES", "ORTIZ", "GUTIERREZ", "CHAVEZ", "RAMOS", "RUIZ", "ALVAREZ", "MENDOZA",
+    "VASQUEZ", "VAZQUEZ", "CASTILLO", "JIMENEZ", "MORENO", "ROMERO", "HERRERA", "MEDINA",
+    "AGUILAR", "GARZA", "CASTRO", "VARGAS", "FERNANDEZ", "GUZMAN", "MUNOZ", "MENDEZ",
+    "SALAZAR", "SOTO", "DELGADO", "PENA", "RIOS", "ALVARADO", "SANDOVAL", "CONTRERAS",
+    "VALDEZ", "GUERRERO", "ORTEGA", "ESTRADA", "NUNEZ", "MALDONADO", "VEGA", "DOMINGUEZ",
+    "ESPINOZA", "ESPINOSA", "SILVA", "PADILLA", "MARQUEZ", "CORTEZ", "CORTES", "ROJAS",
+    "ACOSTA", "FIGUEROA", "JUAREZ", "NAVARRO", "CAMPOS", "MOLINA", "AVILA", "AYALA",
+    "MEJIA", "CARRILLO", "DURAN", "CABALLERO", "ROBLES", "SOLIS", "PACHECO", "SERRANO",
+    "VELASQUEZ", "VELAZQUEZ", "FUENTES", "CABRERA", "CERVANTES", "ROSALES", "IBARRA",
+    "VILLARREAL", "MONTOYA", "CALDERON", "ZAMORA", "TREVINO", "GALVAN", "CAMACHO",
+    "BARRERA", "OLVERA", "MACIAS", "RANGEL", "SOSA", "ZUNIGA", "ARELLANO", "CARDENAS",
+    "OCHOA", "BELTRAN", "QUINTERO", "OROZCO", "SALINAS", "ESPARZA", "MORA", "LARIOS",
+    "GODINEZ", "GARIBAY", "MONDRAGON", "ESCOBAR", "ORELLANA", "OLIVA", "BAEZ", "GUILLEN",
+    "VILLALOBOS", "VILLANUEVA", "ARIAS", "LEAL", "CORONA", "GALLARDO", "MONTES", "SALAS",
+    "AGUIRRE", "LOZANO", "BARRAGAN", "BECERRA", "BRAVO", "CISNEROS", "ENRIQUEZ", "GAMEZ",
+    "LUCERO", "MACHADO", "MERCADO", "NARANJO", "PALACIOS", "PANTOJA", "QUIROGA", "QUIROZ",
+    "RENTERIA", "SAUCEDO", "TAPIA", "URIBE", "VALADEZ", "VALENZUELA", "VERDUGO",
+    "ZAVALA", "ALATORRE", "AMBROCIO", "PELAYO", "MONTEMAYOR", "SABALZA",
+})
+# Vietnamese surnames that are rarely given names. One sitting where a recorder/
+# assessor cell puts the GIVEN name ('VU NGUYEN SONG KHANH', 'BICH BUI THI NGOC')
+# means that cell's word order is untrustworthy, so the split is blanked (Codex).
+# Left out on purpose (prod diff 2026-09-15): DANG/DUONG/HOANG are common given
+# names ('PHAM DANG'), and DO/HO/LY are Korean and Chinese given syllables.
+_VIETNAMESE_SURNAMES = frozenset({
+    "NGUYEN", "TRAN", "LE", "PHAM", "HUYNH", "PHAN", "BUI", "NGO", "VO", "VU",
+})
+# Export-only surname particles. Two-word sequences (DE LOS, VAN DER) bind only as a
+# pair: LOS/LAS/DER/DEN alone are ordinary words (Codex). LE is absent on purpose; a
+# recorder cell starting with LE is French ('LE BAUGH CHRISTOPHER MAX') or Vietnamese
+# ('LE HOAI NU MINH') and the two cannot be told apart.
+_EXPORT_PARTICLES = frozenset({
+    "VAN", "VON", "DE", "DEL", "DELA", "LA", "DI", "DA", "DU", "DOS", "MC", "MAC", "O",
+    "ST", "SAINT", "SANTA", "SAN", "AL", "EL",
+})
+_PARTICLE_PAIRS = frozenset({("DE", "LOS"), ("DE", "LAS"), ("VAN", "DER"), ("VAN", "DEN")})
+
+
+def _looks_like_organization(party: str, cell_len: int) -> bool:
+    """Organization evidence the entity tokens miss: an org word, a REAL ESTATE
+    phrase, a function word (OF/THE/FOR never appear in a person's name once estate
+    and heirs markers are stripped), or a truncated org word ending the cell."""
+    upper = _ESTATE_PREFIX_RE.sub("", party.upper())
+    words = [re.sub(r"[^A-Z]", "", w) for w in re.split(r"[\s/+&;,\-()]+", upper)]
+    words = [w for w in words if w]
+    if not words:
+        return False
+    if (
+        set(words) & (_ORG_WORDS | _FUNCTION_WORDS)
+        or words[0] == "THE"
+        or re.search(r"\bREAL\s+ESTATE\b", upper)
+    ):
+        return True
+    last = words[-1]
+    return cell_len >= _TRUNCATED_CELL_LEN and len(last) >= 5 and any(
+        w != last and w.startswith(last) for w in (_ORG_WORDS | _ENTITY_TOKENS)
+    )
+
+
+def _recorder_first_last(toks: list[str]) -> tuple[str | None, str | None]:
+    """'LAST [LAST2] FIRST [MIDDLE]' for a recorder/assessor cell, or blanks."""
+    up = [t.upper() for t in toks]
+    if len(toks) >= 3 and len(toks[1]) == 1 and len(toks[-1]) > 1:
+        # 'LAVENDER A LORENE' (LAST F MIDDLE) and a natural-order name that leaked
+        # into a recorder field ('STEPHEN P MYERS') have the SAME shape; no rule
+        # tells them apart, so neither half is exported (prod diff 2026-09-14).
+        return None, None
+    if len(toks) >= 3 and up[0] == "LE":
+        return None, None
+    end = 0  # index of the last surname word
+    if len(toks) >= 3:
+        while end < len(toks) - 2:
+            if (up[end], up[end + 1]) in _PARTICLE_PAIRS:
+                end += 2
+            elif up[end] in _EXPORT_PARTICLES:
+                end += 1
+            else:
+                break
+    nxt = end + 1
+    if nxt + 1 < len(toks) and up[nxt] in _HISPANIC_SURNAMES:
+        if up[nxt + 1] in _HISPANIC_SURNAMES:
+            return None, None  # three surname-looking words: no reliable boundary
+        end = nxt  # second surname ('GUZMAN CAMPOS MARIA F')
+    if end + 1 >= len(toks):
+        return None, None
+    if up[end + 1] in _VIETNAMESE_SURNAMES:
+        return None, None
+    first, last = toks[end + 1], " ".join(toks[: end + 1])
+    if " " in last and not _drop_initial(first):
+        # A multi-word surname followed only by an initial is a misread ('LE MAI H').
+        return None, None
+    return _drop_initial(first), last
+
 
 def _first_person_tokens(cand: str, name_order: str) -> tuple[str | None, str | None]:
     """(first, last) of ONE candidate party in the declared order, or blanks."""
@@ -307,21 +450,18 @@ def _first_person_tokens(cand: str, name_order: str) -> tuple[str | None, str | 
     if len(toks) < 2:
         return None, None  # a lone token ('JOHN' of 'JOHN AND JANE SMITH') is not a name
     if name_order == NAME_ORDER_RECORDER:
-        if len(toks) >= 3 and len(toks[1]) == 1 and len(toks[-1]) > 1:
-            # 'LAVENDER A LORENE' (LAST F MIDDLE) and a natural-order name that leaked
-            # into a recorder field ('STEPHEN P MYERS') have the SAME shape; no rule
-            # tells them apart, so neither half is exported (prod diff 2026-09-14).
-            return None, None
-        first, last = _person_first_last(" ".join(toks), recorder_order=True)
-        if last and " " in last and not _drop_initial(first):
-            # A particle-bound surname followed only by an initial is a misread
-            # ('LE MAI H': Vietnamese surname LE, given name MAI), so blank both.
-            return None, None
-        return _drop_initial(first), last
+        return _recorder_first_last(toks)
     # Natural order: last token is the surname, with any particles bound to it
     # ('MARY VAN DYKE' -> VAN DYKE).
+    up = [t.upper() for t in toks]
     j = len(toks) - 1
-    while j > 1 and toks[j - 1].upper() in _SURNAME_PARTICLES:
+    if len(toks) >= 4 and up[-2] == "Y" and up[-3] in _HISPANIC_SURNAMES:
+        j = len(toks) - 3  # 'MARIA GARCIA Y LOPEZ'
+    elif len(toks) >= 3 and up[-2] in _HISPANIC_SURNAMES and up[-1] in _HISPANIC_SURNAMES:
+        # Both final words are surnames ('Jessica M. Hernandez Olvera'); a single
+        # list word before a non-list surname stays a middle name.
+        j = len(toks) - 2
+    while j > 1 and up[j - 1] in _SURNAME_PARTICLES:
         j -= 1
     return _drop_initial(toks[0]), " ".join(toks[j:])
 
@@ -350,13 +490,14 @@ def split_first_person(
         return None, None
     text_ = _VESTING_TAIL_RE.sub("", party_name.strip())
     for raw in _PARTY_SEP_RE.split(text_):
-        owner_cell = _CARE_OF_RE.sub("", raw).strip()
+        owner_cell = _ALIAS_TAIL_RE.sub("", _CARE_OF_RE.sub("", raw)).strip()
         party = _TRAILING_ESTATE_RE.sub("", owner_cell).strip()
+        party = _TRAILING_ESTATE_RE.sub("", _ROLE_TAIL_RE.sub("", party)).strip()
         if not party:
             continue
-        if _is_entity(party):
+        if _is_entity(party) or _looks_like_organization(party, len(raw.strip())):
             continue
-        if _CAPACITY_RE.search(party):
+        if _CAPACITY_RE.search(party) or _HONORIFIC_RE.search(party):
             return None, None
         cand = _COOWNER_JOIN_RE.split(party)[0].strip()
         order = name_order

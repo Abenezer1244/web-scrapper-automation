@@ -216,6 +216,8 @@ def _acquire_lock() -> tuple | str:
         if client.set(_LOCK_KEY, token, nx=True, ex=_LOCK_TTL_S):
             return client, token
         return "another tick is running"
+    except _CELERY_TIME_LIMITS:
+        raise                                    # the worker is ending this task
     except Exception as exc:  # noqa: BLE001
         return f"lock unavailable: {type(exc).__name__}"
 
@@ -236,6 +238,8 @@ def _renew_lock(lock: tuple) -> bool:
     client, token = lock
     try:
         return bool(client.eval(_RENEW_IF_OWNER, 1, _LOCK_KEY, token, _LOCK_TTL_S))
+    except _CELERY_TIME_LIMITS:
+        raise
     except Exception:  # noqa: BLE001 -- fail closed: no proof of ownership, no write
         return False
 
@@ -244,6 +248,8 @@ def _release_lock(lock: tuple) -> None:
     client, token = lock
     try:
         client.eval(_RELEASE_IF_OWNER, 1, _LOCK_KEY, token)
+    except _CELERY_TIME_LIMITS:
+        raise
     except Exception:  # noqa: BLE001, S110 -- the TTL releases it anyway
         pass
 

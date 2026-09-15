@@ -629,6 +629,69 @@ async def test_two_cases_on_one_parcel_share_one_lookup_newest_first(
     assert (await _get(db, old)).party_name is None
 
 
+async def test_an_sdci_lead_and_a_printed_pin_lead_on_one_parcel_share_one_lookup(
+    db, business_user, monkeypatch,
+):
+    _lease(monkeypatch)
+    job_id = await _job(db, business_user)
+    sdci = await _row(db, business_user, job_id, pin="6000000001")
+    bellevue = await _printed_row(db, business_user, job_id, source="bellevue_code_enforcement",
+                                  parcel_id="6000000001")
+    asked = _county(monkeypatch, {"6000000001": _Resp(200, _page("6000000001", "ONE OWNER LLC"))})
+
+    stats = await asyncio.to_thread(_tick)
+
+    assert asked == ["6000000001"] and stats["parcels"] == 1 and stats["rows"] == 2
+    assert stats["found"] == 2
+    for rid in (sdci, bellevue):
+        row = await _get(db, rid)
+        assert row.party_name == "ONE OWNER LLC" and row.enrichment_data["owner_pin"] == "6000000001"
+    assert (await _get(db, sdci)).parcel_id is None
+    assert (await _get(db, bellevue)).parcel_id == "6000000001"
+
+
+async def test_a_padded_printed_parcel_is_not_provable_and_never_looked_up(
+    db, business_user, monkeypatch,
+):
+    # Adapters store the normalized PIN; a padded value (a hand edit, a future adapter bug)
+    # fails closed here exactly as skip trace's owner proof would.
+    _lease(monkeypatch)
+    asked = _county(monkeypatch, {})
+    job_id = await _job(db, business_user)
+    rid = await _printed_row(db, business_user, job_id, source="burien_code_enforcement",
+                             parcel_id=" 7000000001")
+    before = tuple(await _get(db, rid))
+
+    stats = await asyncio.to_thread(_tick)
+
+    assert asked == [] and stats["parcels"] == 0 and tuple(await _get(db, rid)) == before
+
+
+@pytest.mark.parametrize("step", ["acquire", "renew", "release"])
+async def test_a_celery_time_limit_in_the_lock_is_not_swallowed(monkeypatch, step):
+    from celery.exceptions import SoftTimeLimitExceeded
+
+    class _Client:
+        def set(self, *a, **k):
+            raise SoftTimeLimitExceeded()
+
+        def eval(self, *a, **k):
+            raise SoftTimeLimitExceeded()
+
+    if step == "acquire":
+        import redis as sync_redis
+
+        monkeypatch.setattr(sync_redis, "from_url", lambda *a, **k: _Client())
+        with pytest.raises(SoftTimeLimitExceeded):
+            cvr._acquire_lock()
+    elif step == "renew":
+        with pytest.raises(SoftTimeLimitExceeded):
+            cvr._renew_lock((_Client(), "token"))
+    else:
+        with pytest.raises(SoftTimeLimitExceeded):
+            cvr._release_lock((_Client(), "token"))
+
+
 async def test_the_kill_switch_the_lock_and_a_cooling_source_stop_it_before_any_request(
     db, business_user, monkeypatch,
 ):

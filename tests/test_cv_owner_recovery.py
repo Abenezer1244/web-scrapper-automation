@@ -560,6 +560,62 @@ async def test_a_blank_owner_is_never_written_as_found(db, business_user):
     assert ed.get("cv_owner_recovery_outcome") != "found"
 
 
+async def test_a_row_whose_tenant_differs_from_its_job_is_never_touched(
+    db, business_user, starter_user, monkeypatch,
+):
+    _lease(monkeypatch)
+    asked = _county(monkeypatch, {})
+    foreign_job = await _job(db, starter_user)
+    rid = await _row(db, business_user, foreign_job, pin="1000000111")
+
+    stats = await asyncio.to_thread(_tick)
+
+    assert asked == [] and stats["parcels"] == 0
+    assert "cv_owner_recovery_last_at" not in (await _get(db, rid)).enrichment_data
+
+
+async def test_a_whitespace_only_party_name_is_unnamed(db, business_user, monkeypatch):
+    _lease(monkeypatch)
+    job_id = await _job(db, business_user)
+    rid = await _row(db, business_user, job_id, pin="1000000121", party="\t\n")
+    _county(monkeypatch, {"1000000121": _Resp(200, _page("1000000121", "TAB OWNER"))})
+
+    await asyncio.to_thread(_tick)
+
+    assert (await _get(db, rid)).party_name == "TAB OWNER"
+
+
+async def test_a_tick_that_lost_its_lock_writes_nothing(db, business_user, monkeypatch):
+    _lease(monkeypatch)
+    job_id = await _job(db, business_user)
+    rid = await _row(db, business_user, job_id, pin="1000000131")
+
+    def _get_and_lose_lock(url, **_k):
+        import redis as sync_redis
+
+        from src.config import settings
+
+        client = sync_redis.from_url(settings.REDIS_URL, **settings.redis_kwargs())
+        client.set(cvr._LOCK_KEY, "a-newer-tick")   # our TTL expired, another tick took over
+        return _Resp(200, _page(url.rsplit("=", 1)[-1], "LATE ANSWER"))
+
+    monkeypatch.setattr(kca, "safe_get", _get_and_lose_lock)
+    try:
+        stats = await asyncio.to_thread(_tick)
+        holder = cvr._acquire_lock()
+        assert holder == "another tick is running"   # the newer tick's lock survives
+    finally:
+        import redis as sync_redis
+
+        from src.config import settings
+
+        sync_redis.from_url(settings.REDIS_URL, **settings.redis_kwargs()).delete(cvr._LOCK_KEY)
+
+    row = await _get(db, rid)
+    assert row.party_name is None and "cv_owner_recovery_last_at" not in row.enrichment_data
+    assert stats["skipped"] == "lock lost before writing" and stats["found"] == 0
+
+
 def test_the_blank_owner_page_classifies_as_not_found():
     out = cvr._classify(["1000000101"], {"1000000101": "  "},
                         {"outcome": "complete", "attempted": ["1000000101"], "transient": [],

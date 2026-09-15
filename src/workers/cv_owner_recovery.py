@@ -80,7 +80,7 @@ _ELIGIBLE_ROW = """
       r.is_duplicate = false
   AND jsonb_typeof(r.enrichment_data::jsonb) = 'object'
   AND r.enrichment_data::jsonb->>'delivery_excluded_reason' IS NULL
-  AND (r.party_name IS NULL OR btrim(r.party_name) = '')
+  AND (r.party_name IS NULL OR r.party_name ~ '^[[:space:]]*$')
   AND r.enrichment_data::jsonb->>'source' = 'seattle_sdci_code_violations'
   AND r.enrichment_data::jsonb->>'kc_pin_status' = 'matched'
   AND r.enrichment_data::jsonb->>'kc_pin_source' = 'king_gis_point_in_parcel'
@@ -97,6 +97,7 @@ _ELIGIBLE_ROW = """
 
 _KING_CV_JOB = """
       j.status = 'done'
+  AND j.user_id = r.user_id AND sc.user_id = j.user_id
   AND lower(sc.county) = 'king' AND upper(sc.state) = 'WA'
   AND sc.record_type = 'code_violation'
 """
@@ -178,6 +179,26 @@ def _acquire_lock() -> tuple | str:
         return f"lock unavailable: {type(exc).__name__}"
 
 
+# Extend the lock only if this tick still owns it.
+_RENEW_IF_OWNER = """
+if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('expire', KEYS[1], ARGV[2]) end
+return 0
+"""
+
+
+def _renew_lock(lock: tuple) -> bool:
+    """True while this tick still owns the lock (and its TTL is reset).
+
+    Checked before every parcel's writes: a tick that outlived its TTL, or lost
+    Redis, must not write alongside a newer tick that re-selected the same rows.
+    """
+    client, token = lock
+    try:
+        return bool(client.eval(_RENEW_IF_OWNER, 1, _LOCK_KEY, token, _LOCK_TTL_S))
+    except Exception:  # noqa: BLE001 -- fail closed: no proof of ownership, no write
+        return False
+
+
 def _release_lock(lock: tuple) -> None:
     client, token = lock
     try:
@@ -199,12 +220,12 @@ def recover_code_violation_owners() -> dict:
         stats["skipped"] = lock
         return stats
     try:
-        return _tick(stats)
+        return _tick(stats, lock)
     finally:
         _release_lock(lock)
 
 
-def _tick(stats: dict) -> dict:
+def _tick(stats: dict, lock: tuple) -> dict:
     from src.db.session import system_sync_session
     from src.scrapers.enrichment.king_county_assessor import (
         KingOwnerLookupBlockedError,
@@ -261,6 +282,10 @@ def _tick(stats: dict) -> dict:
             _logger.warning("Code violation owner recovery: lookup failed: %s", stats["skipped"])
 
         for pin, outcome in _classify(pins, owners, o_stats).items():
+            if not _renew_lock(lock):
+                stats["skipped"] = "lock lost before writing"
+                _logger.warning("Code violation owner recovery: %s", stats["skipped"])
+                break
             for row in by_pin.get(pin, []):
                 stats[_write(db, row, outcome, owners.get(pin))] += 1
 

@@ -25,6 +25,7 @@ from src.api.entitlements import (
 )
 from src.api.middleware.rate_limit import rate_limit
 from src.api.middleware.security import audit_log
+from src.api.results_sort import cached_records_order_by
 from src.api.schemas import (
     DELIVER_SECRET_FIELDS,
     CachedRecordRow,
@@ -42,7 +43,7 @@ from src.config.constants import (
     SKIP_TRACE_ADDON_PLANS,
     normalize_plan,
 )
-from src.db import CountyConnector, ScraperConfig, get_db
+from src.db import CountyConnector, CountyRecord, ScraperConfig, get_db
 from src.scrapers.probate import (
     effective_tod_on_update,
     new_probate_config_tod_default,
@@ -972,6 +973,8 @@ async def create_connector(
 # It is a placeholder, not an address — the API must return null for it so the
 # UI renders "—" rather than a fake value (the same rule the results page has).
 _CACHE_ADDRESS_PLACEHOLDER = "(enrichment unavailable)"
+# A first-ever view has no last_viewed_at: every cached row counts as new.
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
 
 def _cache_address_or_none(value: str | None) -> str | None:
@@ -1111,21 +1114,25 @@ async def get_cached_records(
     new_count = count_row.new_count if count_row else 0
 
     # 6. Fetch paginated records
+    # A Core select rather than a SQL string: the date ORDER BY carries regex
+    # patterns, and inlining them as literals doubles their backslashes. The
+    # doc_type/search clauses stay the same parameterized text, bound below.
     offset = (page - 1) * page_size
-    records_sql = text(
-        "SELECT *,"
-        "  CASE WHEN scraped_at > COALESCE(:prev_viewed, '1970-01-01'::timestamptz) THEN true ELSE false END AS is_new"
-        " FROM county_records"
-        " WHERE LOWER(county) = :county AND UPPER(state) = :state"
-        + extra_where
-        + " ORDER BY scraped_at DESC"
-        " LIMIT :limit OFFSET :offset"
+    records_stmt = (
+        select(
+            *CountyRecord.__table__.c,
+            (CountyRecord.scraped_at > (previous_viewed or _EPOCH)).label("is_new"),
+        )
+        .where(
+            func.lower(CountyRecord.county) == county,
+            func.upper(CountyRecord.state) == state,
+            *[text(clause) for clause in type_clauses],
+        )
+        .order_by(*cached_records_order_by())
+        .limit(page_size)
+        .offset(offset)
     )
-    result = await db.execute(
-        records_sql,
-        {"county": county, "state": state, "prev_viewed": previous_viewed,
-         "limit": page_size, "offset": offset, **query_params},
-    )
+    result = await db.execute(records_stmt, query_params)
     rows = result.fetchall()
 
     # 7. Cache age

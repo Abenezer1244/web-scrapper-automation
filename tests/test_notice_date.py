@@ -197,6 +197,33 @@ def _record(recorded, enrichment) -> dict:
             "property_address": "1 MAIN ST, EVERETT, WA 98201"}
 
 
+def test_a_stand_in_has_no_freshness():
+    """Its future date would otherwise clamp to 0 days: the freshest lead in the file."""
+    today = date(2026, 9, 15)
+    stand_in = build_lead_export_row(_record("10/9/2026", TRUSTEE("2026-10-09")), today)
+    real = build_lead_export_row(_record("6/30/2026", TRUSTEE("2026-10-09")), today)
+    flagged = build_lead_export_row({**_record("9/18/2026", None), "date_is_auction_date": True}, today)
+    assert stand_in["freshness_days"] == ""
+    assert flagged["freshness_days"] == ""
+    assert real["freshness_days"] == "77"
+
+
+async def test_results_api_reports_no_freshness_for_a_stand_in(
+    client: AsyncClient, starter_user: User, starter_token: str,
+):
+    job_id = await _job(starter_user, "trustee_sale", county="pierce")
+    await _rows(job_id, starter_user.id, [
+        {"date": "10/9/2026", "enrichment": TRUSTEE("2026-10-09"), "party": "STAND IN"},
+        {"date": "6/30/2026", "enrichment": TRUSTEE("2026-10-09"), "party": "REAL"},
+    ])
+
+    items = (await _results(client, job_id, starter_token))["items"]
+
+    fresh = {r["party_name"]: r["freshness_days"] for r in items}
+    assert fresh["STAND IN"] is None
+    assert isinstance(fresh["REAL"], int)
+
+
 def test_export_blanks_the_stand_in_and_keeps_a_real_notice_date():
     assert build_lead_export_row(_record("9/18/2026", SNOHO("9/18/2026")))["date_recorded"] == ""
     assert build_lead_export_row(_record("10/9/2026", TRUSTEE("2026-10-09")))["date_recorded"] == ""

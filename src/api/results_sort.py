@@ -171,10 +171,33 @@ def auction_date_fallback_sql(alias: str) -> str:
         literal_column(f"{alias}.date_recorded"),
         type_coerce(literal_column(f"{alias}.enrichment_data"), JSON),
     )
+    return f"COALESCE(({_render_inline(expr)}), FALSE)"
+
+
+def _render_inline(expr) -> str:
+    """Render an expression for text() SQL, refusing the two characters inlining breaks."""
     sql = str(expr.compile(dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}))
     if "\\" in sql or ":" in sql:
-        raise RuntimeError("stand-in SQL must not contain a backslash or a colon")
-    return f"COALESCE(({sql}), FALSE)"
+        raise RuntimeError("inlined SQL must not contain a backslash or a colon")
+    return sql
+
+
+def filing_date_sql(alias: str) -> str:
+    """The filing DATE of ``<alias>`` as raw SQL: the one the Results page sorts on.
+
+    ``date_recorded_parsed`` (M/D/YYYY, DB-generated) and, when that is NULL, the
+    "Month D, YYYY" form. Only text that starts with a letter is parsed, so the cost
+    stays on the few rows that can be month-name dates. An auction-date stand-in still
+    parses to its auction date here; callers exclude it with auction_date_fallback_sql.
+    Braces may be present: a caller running it through str.format must escape them.
+    """
+    if not alias.isidentifier():
+        raise ValueError(f"not a SQL alias: {alias!r}")
+    month_name = _render_inline(_month_name_date(literal_column(f"{alias}.date_recorded")))
+    return (
+        f"COALESCE({alias}.date_recorded_parsed, CASE WHEN {alias}.date_recorded ~ '^ *[A-Za-z]' "
+        f"THEN ({month_name}) END)"
+    )
 
 
 def results_order_by(record_type: str | None, sort: ResultsSort) -> list:

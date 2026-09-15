@@ -179,3 +179,123 @@ async def test_lists_csv_blanks_the_stand_in(client, business_token, lists_rows)
     rows = list(csv.DictReader(io.StringIO(resp.text)))
     dates = {r["party_name"]: r["filed_date"] for r in rows}
     assert dates == {"STAND IN": "", "REAL NOTICE": "6/30/2026"}
+
+
+# ─── Lists windows place real "Month D, YYYY" filing dates in time ───────────────
+
+async def test_filing_date_sql_matches_the_results_sort_date(db, starter_user):
+    """filing_date_sql is the date Results sorts on: M/D/YYYY or Month D, YYYY."""
+    from datetime import date
+
+    from src.api.results_sort import filing_date_sql
+    job = await _config_and_job(db, starter_user, "probate")
+    cases = {
+        "3/20/2026": date(2026, 3, 20), " September 18, 2026": date(2026, 9, 18),
+        "Sept. 5 2026": date(2026, 9, 5), "February 30, 2026": None,
+        "View": None, "200005310610": None, "": None,
+    }
+    ids = {}
+    for text_value in cases:
+        row = _result(starter_user, job, f"F{len(ids)}", text_value, None)
+        db.add(row)
+        ids[row.id] = text_value
+    await db.commit()
+    async with _db_session.AsyncSessionLocal() as s:
+        rows = (await s.execute(
+            text(f"SELECT r.id, {filing_date_sql('r')} FROM results r WHERE r.job_id = :job"),
+            {"job": job.id},
+        )).all()
+    assert {ids[str(rid)]: value for rid, value in rows} == cases
+
+
+@pytest_asyncio.fixture
+async def month_name_rows(db, business_user):
+    probate = await _config_and_job(db, business_user, "probate")
+    auctions = await _config_and_job(db, business_user, "trustee_sale")
+    db.add_all([
+        _result(business_user, probate, "MONTH NAME IN", "June 12, 2026", None, "WA|pierce|21"),
+        _result(business_user, probate, "MONTH NAME OUT", "January 3, 2026", None, "WA|pierce|22"),
+        _result(business_user, probate, "NUMERIC IN", "7/1/2026", None, "WA|pierce|23"),
+        # A month-name auction stand-in is still no filing date.
+        _result(business_user, auctions, "STAND IN MONTH", "October 9, 2026",
+                {"source": "snohomish_tribune", "auction_date": "October 9, 2026"}, "WA|pierce|24"),
+    ])
+    await db.commit()
+
+
+async def test_a_window_places_a_real_month_name_date(client, business_token, month_name_rows):
+    resp = await client.post(
+        "/segments/union",
+        json={"record_types": ["probate", "trustee_sale"], "filing_from": "2026-06-01", "filing_to": "2026-12-31"},
+        headers=_auth(business_token),
+    )
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert {r["party_name"] for r in body["rows"]} == {"MONTH NAME IN", "NUMERIC IN"}
+    # Only the stand-in has no filing date; the out-of-window month-name row is dated.
+    assert body["excluded_no_date_count"] == 1
+
+
+async def test_a_windowed_intersection_places_a_real_month_name_date(
+    client, db, business_user, business_token,
+):
+    probate = await _config_and_job(db, business_user, "probate")
+    prefc = await _config_and_job(db, business_user, "pre_foreclosure")
+    db.add_all([
+        _result(business_user, probate, "PROBATE MONTH", "June 12, 2026", None, "WA|pierce|31"),
+        _result(business_user, prefc, "PREFC NUMERIC", "6/20/2026", None, "WA|pierce|31"),
+    ])
+    await db.commit()
+
+    resp = await client.post(
+        "/segments/intersection",
+        json={"record_types": ["probate", "pre_foreclosure"], "filing_from": "2026-06-01"},
+        headers=_auth(business_token),
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert len(resp.json()["rows"]) == 1
+
+
+async def test_filing_date_sql_equals_the_results_sort_key(db, starter_user):
+    """Lists windows and the Results sort must place every row on the same date."""
+    from sqlalchemy import func, select
+
+    from src.api.results_sort import _month_name_date, filing_date_sql
+    job = await _config_and_job(db, starter_user, "probate")
+    texts = ["3/20/2026", " 3/20/2026 ", "03/13/2026", "September 18, 2026", "  Sep 18 2026  ",
+             "sept. 5, 2026", "February 30, 2026", "Smarch 3, 2026", "12 June 2026", "View", "", None]
+    for i, t in enumerate(texts):
+        db.add(_result(starter_user, job, f"K{i}", t, None))
+    await db.commit()
+    async with _db_session.AsyncSessionLocal() as s:
+        lists = dict((await s.execute(
+            text(f"SELECT r.id, {filing_date_sql('r')} FROM results r WHERE r.job_id = :job"),
+            {"job": job.id},
+        )).all())
+        results_key = dict((await s.execute(
+            select(Result.id, func.coalesce(Result.date_recorded_parsed, _month_name_date(Result.date_recorded)))
+            .where(Result.job_id == job.id)
+        )).all())
+    assert len(lists) == len(texts)
+    assert {str(k): v for k, v in lists.items()} == {str(k): v for k, v in results_key.items()}
+
+
+async def test_bounds_alone_keep_a_stand_in_out_of_the_window(db, business_user):
+    """Even if a caller ever sent a bound with require_date false, a stand-in whose
+    auction date falls inside the window must not match it."""
+    from datetime import date
+
+    from src.api.routes import segments
+    from src.api.tax_filters import TAX_CAP_BIND, tax_cap_min_year
+    auctions = await _config_and_job(db, business_user, "trustee_sale")
+    db.add(_result(business_user, auctions, "STAND IN", "10/9/2026", TRUSTEE("2026-10-09"), "WA|pierce|41"))
+    await db.commit()
+    async with _db_session.AsyncSessionLocal() as s:
+        rows = (await s.execute(text(segments._UNION_SQL.format(county_clause="")), {
+            "uid": business_user.id, "types": ["trustee_sale"], "limit": 100,
+            "filing_from": date(2026, 1, 1), "filing_to": date(2026, 12, 31), "require_date": False,
+            TAX_CAP_BIND: tax_cap_min_year(date.today()),
+        })).all()
+    assert rows == []

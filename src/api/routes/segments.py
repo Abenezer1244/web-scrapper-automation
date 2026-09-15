@@ -42,7 +42,7 @@ from src.api.entitlements import (
 )
 from src.api.lead_actionability import actionable_sql
 from src.api.middleware import rate_limit
-from src.api.results_sort import auction_date_fallback_sql
+from src.api.results_sort import auction_date_fallback_sql, filing_date_sql
 from src.api.schemas import (
     SegmentIntersectionRequest,
     SegmentIntersectionResponse,
@@ -171,6 +171,10 @@ _STAND_IN_SQL = (
     + " ELSE FALSE END)"
 ).replace("{", "{{").replace("}", "}}")
 
+# The filing date a window filters on: the same date the Results page sorts on, so a
+# real "Month D, YYYY" notice date is placed in time instead of skipped as undated.
+_FILING_DATE_SQL = filing_date_sql("r").replace("{", "{{").replace("}", "}}")
+
 # Representative rows returned in the JSON preview. The CSV export returns the
 # full set up to EXPORT_CAP (defensive bound — intersections are inherently
 # small, but never stream an unbounded result into memory).
@@ -290,10 +294,25 @@ WITH candidates AS (
       -- three predicates pass and behavior is identical to the all-time query.
       -- When a window IS active, NULL filing dates are excluded (can't be placed
       -- in time) and reported separately via excluded_no_date_count.
-      AND (CAST(:filing_from AS date) IS NULL OR r.date_recorded_parsed >= CAST(:filing_from AS date))
-      AND (CAST(:filing_to AS date) IS NULL OR r.date_recorded_parsed <= CAST(:filing_to AS date))
-      AND (CAST(:require_date AS boolean) = FALSE OR r.date_recorded_parsed IS NOT NULL)
+      AND (CAST(:filing_from AS date) IS NULL OR {_FILING_DATE_SQL} >= CAST(:filing_from AS date))
+      AND (CAST(:filing_to AS date) IS NULL OR {_FILING_DATE_SQL} <= CAST(:filing_to AS date))
+      AND (CAST(:require_date AS boolean) = FALSE OR {_FILING_DATE_SQL} IS NOT NULL)
+      -- Cheap necessary conditions on the parsed column. SQL text order does not fix
+      -- evaluation order, but these give the planner cheap quals to apply before the
+      -- costlier checks: measured with EXPLAIN (ANALYZE) on a 92k-row account, the
+      -- windowed query ran ~580 ms without them and ~207 ms with them. They cannot
+      -- change the result: a row with a parsed date outside the window fails the
+      -- exact predicate above too, and a row with no date text has no filing date.
+      AND (CAST(:filing_from AS date) IS NULL OR r.date_recorded_parsed IS NULL
+           OR r.date_recorded_parsed >= CAST(:filing_from AS date))
+      AND (CAST(:filing_to AS date) IS NULL OR r.date_recorded_parsed IS NULL
+           OR r.date_recorded_parsed <= CAST(:filing_to AS date))
+      AND (CAST(:require_date AS boolean) = FALSE OR r.date_recorded IS NOT NULL)
       AND (CAST(:require_date AS boolean) = FALSE OR NOT {_STAND_IN_SQL})
+      -- Tied to the bounds too, not only require_date: a stand-in parses to its
+      -- auction date, so any active bound must never place it in the window.
+      AND ((CAST(:filing_from AS date) IS NULL AND CAST(:filing_to AS date) IS NULL)
+           OR NOT {_STAND_IN_SQL})
       {{county_clause}}
 ),
 agg AS (
@@ -355,13 +374,13 @@ WITH candidates AS (
     JOIN scraper_configs sc ON sc.id = j.scraper_config_id AND sc.user_id = :uid
     WHERE r.user_id = :uid
       AND r.property_key IS NOT NULL
-      AND r.date_recorded_parsed IS NOT NULL
+      AND {_FILING_DATE_SQL} IS NOT NULL
       AND NOT {_STAND_IN_SQL}
       AND sc.record_type = ANY(:types)
       -- Hard 18-month tax-delinquent cap (self-scoping: NULL bill_year rows pass).
       AND {tax_cap_sql('r')} AND {actionable_sql('r')}
-      AND (CAST(:filing_from AS date) IS NULL OR r.date_recorded_parsed >= CAST(:filing_from AS date))
-      AND (CAST(:filing_to AS date) IS NULL OR r.date_recorded_parsed <= CAST(:filing_to AS date))
+      AND (CAST(:filing_from AS date) IS NULL OR {_FILING_DATE_SQL} >= CAST(:filing_from AS date))
+      AND (CAST(:filing_to AS date) IS NULL OR {_FILING_DATE_SQL} <= CAST(:filing_to AS date))
       {{county_clause}}
 ),
 agg AS (
@@ -424,7 +443,7 @@ JOIN scraper_configs sc ON sc.id = j.scraper_config_id AND sc.user_id = :uid
 WHERE r.user_id = :uid
   AND sc.record_type = ANY(:types)
   -- A stand-in auction date is no filing date either.
-  AND (r.date_recorded_parsed IS NULL OR {_STAND_IN_SQL})
+  AND ({_FILING_DATE_SQL} IS NULL OR {_STAND_IN_SQL})
   -- Hard 18-month tax-delinquent cap (self-scoping: NULL bill_year rows pass), so
   -- this "skipped (no filing date)" count matches the capped candidate scope.
   AND {tax_cap_sql('r')} AND {actionable_sql('r')}

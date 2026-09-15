@@ -10,6 +10,7 @@ from datetime import UTC, date, datetime, timedelta
 import pytest
 from pydantic import ValidationError
 
+from src.api.results_sort import filing_date_sql
 from src.api.routes.segments import (
     _EXCLUDED_NO_DATE_SQL,
     _INTERSECTION_DATED_SQL,
@@ -78,21 +79,26 @@ class TestWindowRequestValidation:
 class TestWindowedSqlAssembly:
     def test_union_has_optional_date_predicates(self):
         sql = _UNION_SQL.format(county_clause="")
+        # The window filters on the Results filing date (M/D/YYYY or Month D, YYYY)...
+        filed = filing_date_sql("r")
+        assert f"{filed} >= CAST(:filing_from AS date)" in sql
+        assert f"{filed} <= CAST(:filing_to AS date)" in sql
+        assert f"CAST(:require_date AS boolean) = FALSE OR {filed} IS NOT NULL" in sql
+        # ...behind the cheap parsed-column guards the planner can apply first.
         assert "r.date_recorded_parsed >= CAST(:filing_from AS date)" in sql
         assert "r.date_recorded_parsed <= CAST(:filing_to AS date)" in sql
-        assert "CAST(:require_date AS boolean) = FALSE OR r.date_recorded_parsed IS NOT NULL" in sql
 
     def test_dated_intersection_is_results_based_not_membership(self):
         sql = _INTERSECTION_DATED_SQL.format(county_clause="")
         # Computes from results, NOT the membership rollup (which lacks filing date).
         assert "property_list_membership" not in sql
-        assert "r.date_recorded_parsed IS NOT NULL" in sql
+        assert f"{filing_date_sql('r')} IS NOT NULL" in sql
         assert "r.property_key IS NOT NULL" in sql
         assert "HAVING count(DISTINCT record_type) = :n" in sql
 
     def test_excluded_count_sql_filters_null_filing_date(self):
         sql = _EXCLUDED_NO_DATE_SQL.format(pk_clause="", county_clause="")
-        assert "r.date_recorded_parsed IS NULL" in sql
+        assert f"{filing_date_sql('r')} IS NULL" in sql
         # property_key clause is injected only for intersection
         pk_sql = _EXCLUDED_NO_DATE_SQL.format(
             pk_clause="AND r.property_key IS NOT NULL", county_clause=""

@@ -878,6 +878,27 @@ def code_violation_owner_is_known(result) -> bool:
 
 # ─── Helper: build a PendingSkipTraceRow payload from a Result ─────────────
 
+def code_violation_skip_trace_allowed(result) -> bool:
+    """False for a code-violation lead whose owner name may not be spent on.
+
+    Only Tacoma names read from Pierce ATIP: the 2026-09-14 legal review cleared storing
+    that taxpayer name FOR OWNER NAMING ONLY (RCW 42.56.070(8)), and a paid Tracerfy
+    lookup keyed on it is a further use. PIERCE_CV_OWNER_SKIP_TRACE_ENABLED (default
+    off) is the switch, kept apart from PIERCE_CV_OWNER_ENABLED, which only decides
+    whether the name is read at all. Every other row returns True (this gate does not
+    apply to it), King code violations included: their owner comes from King
+    eRealProperty, which carries no such restriction.
+    """
+    ed = getattr(result, "enrichment_data", None)
+    if not isinstance(ed, dict) or ed.get("source") != "tacoma_code_violations":
+        return True
+    from src.scrapers.enrichment.pierce_atip_owner import OWNER_SOURCE as PIERCE_OWNER_SOURCE
+
+    if ed.get("owner_source") != PIERCE_OWNER_SOURCE:
+        return True
+    return bool(settings.PIERCE_CV_OWNER_SKIP_TRACE_ENABLED)
+
+
 def build_pending_row_payload(result) -> dict | None:
     """Convert a Result row into the PendingSkipTraceRow kwargs dict.
 
@@ -912,6 +933,13 @@ def build_pending_row_payload(result) -> dict | None:
     # party_name, and a blank party_name would otherwise fall through to a paid
     # address-only trace (owner decision 2026-09-14: keep these excluded).
     if not code_violation_owner_is_known(result):
+        return None
+
+    # Separate from the provenance check above: this one is policy, not fact. A Tacoma
+    # owner read from Pierce ATIP may be shown, exported and delivered, but not spent
+    # on. Checked HERE, before the caller's cache lookup, so a cached phone cannot be
+    # copied onto the row either (Codex).
+    if not code_violation_skip_trace_allowed(result):
         return None
 
     # Post-M9 audit gate: reject records whose party_name is a

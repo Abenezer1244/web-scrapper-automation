@@ -273,14 +273,14 @@ def _reuse_enrichment_for_duplicates(db, job, job_id: str) -> int:
             mailing_address      = COALESCE(rn.mailing_address, ro.mailing_address),
             delinquent_amount    = COALESCE(rn.delinquent_amount, ro.delinquent_amount),
             delinquent_bill_year = COALESCE(rn.delinquent_bill_year, ro.delinquent_bill_year),
-            phone = CASE WHEN ro.skip_trace_status IN ('hit','miss') AND ro.skip_trace_attempted_at IS NOT NULL AND ro.skip_trace_attempted_at >= NOW() - make_interval(days => :ttl) AND rn.skip_trace_status = 'not_attempted' THEN ro.phone ELSE rn.phone END,
-            phone_type = CASE WHEN ro.skip_trace_status IN ('hit','miss') AND ro.skip_trace_attempted_at IS NOT NULL AND ro.skip_trace_attempted_at >= NOW() - make_interval(days => :ttl) AND rn.skip_trace_status = 'not_attempted' THEN ro.phone_type ELSE rn.phone_type END,
-            phone_dnc_flag = CASE WHEN ro.skip_trace_status IN ('hit','miss') AND ro.skip_trace_attempted_at IS NOT NULL AND ro.skip_trace_attempted_at >= NOW() - make_interval(days => :ttl) AND rn.skip_trace_status = 'not_attempted' THEN ro.phone_dnc_flag ELSE rn.phone_dnc_flag END,
-            email = CASE WHEN ro.skip_trace_status IN ('hit','miss') AND ro.skip_trace_attempted_at IS NOT NULL AND ro.skip_trace_attempted_at >= NOW() - make_interval(days => :ttl) AND rn.skip_trace_status = 'not_attempted' THEN ro.email ELSE rn.email END,
-            skip_trace_status = CASE WHEN ro.skip_trace_status IN ('hit','miss') AND ro.skip_trace_attempted_at IS NOT NULL AND ro.skip_trace_attempted_at >= NOW() - make_interval(days => :ttl) AND rn.skip_trace_status = 'not_attempted' THEN ro.skip_trace_status ELSE rn.skip_trace_status END,
-            skip_trace_attempted_at = CASE WHEN ro.skip_trace_status IN ('hit','miss') AND ro.skip_trace_attempted_at IS NOT NULL AND ro.skip_trace_attempted_at >= NOW() - make_interval(days => :ttl) AND rn.skip_trace_status = 'not_attempted' THEN ro.skip_trace_attempted_at ELSE rn.skip_trace_attempted_at END,
-            phones = CASE WHEN ro.skip_trace_status IN ('hit','miss') AND ro.skip_trace_attempted_at IS NOT NULL AND ro.skip_trace_attempted_at >= NOW() - make_interval(days => :ttl) AND rn.skip_trace_status = 'not_attempted' THEN ro.phones ELSE rn.phones END,
-            emails = CASE WHEN ro.skip_trace_status IN ('hit','miss') AND ro.skip_trace_attempted_at IS NOT NULL AND ro.skip_trace_attempted_at >= NOW() - make_interval(days => :ttl) AND rn.skip_trace_status = 'not_attempted' THEN ro.emails ELSE rn.emails END
+            phone = CASE WHEN ro.skip_trace_status IN ('hit','miss') AND ro.skip_trace_attempted_at IS NOT NULL AND ro.skip_trace_attempted_at >= NOW() - make_interval(days => :ttl) AND rn.skip_trace_status = 'not_attempted' AND NOT (CAST(:atip_blocked AS boolean) AND rn.enrichment_data->>'source' = 'tacoma_code_violations' AND rn.enrichment_data->>'owner_source' = :atip_source) THEN ro.phone ELSE rn.phone END,
+            phone_type = CASE WHEN ro.skip_trace_status IN ('hit','miss') AND ro.skip_trace_attempted_at IS NOT NULL AND ro.skip_trace_attempted_at >= NOW() - make_interval(days => :ttl) AND rn.skip_trace_status = 'not_attempted' AND NOT (CAST(:atip_blocked AS boolean) AND rn.enrichment_data->>'source' = 'tacoma_code_violations' AND rn.enrichment_data->>'owner_source' = :atip_source) THEN ro.phone_type ELSE rn.phone_type END,
+            phone_dnc_flag = CASE WHEN ro.skip_trace_status IN ('hit','miss') AND ro.skip_trace_attempted_at IS NOT NULL AND ro.skip_trace_attempted_at >= NOW() - make_interval(days => :ttl) AND rn.skip_trace_status = 'not_attempted' AND NOT (CAST(:atip_blocked AS boolean) AND rn.enrichment_data->>'source' = 'tacoma_code_violations' AND rn.enrichment_data->>'owner_source' = :atip_source) THEN ro.phone_dnc_flag ELSE rn.phone_dnc_flag END,
+            email = CASE WHEN ro.skip_trace_status IN ('hit','miss') AND ro.skip_trace_attempted_at IS NOT NULL AND ro.skip_trace_attempted_at >= NOW() - make_interval(days => :ttl) AND rn.skip_trace_status = 'not_attempted' AND NOT (CAST(:atip_blocked AS boolean) AND rn.enrichment_data->>'source' = 'tacoma_code_violations' AND rn.enrichment_data->>'owner_source' = :atip_source) THEN ro.email ELSE rn.email END,
+            skip_trace_status = CASE WHEN ro.skip_trace_status IN ('hit','miss') AND ro.skip_trace_attempted_at IS NOT NULL AND ro.skip_trace_attempted_at >= NOW() - make_interval(days => :ttl) AND rn.skip_trace_status = 'not_attempted' AND NOT (CAST(:atip_blocked AS boolean) AND rn.enrichment_data->>'source' = 'tacoma_code_violations' AND rn.enrichment_data->>'owner_source' = :atip_source) THEN ro.skip_trace_status ELSE rn.skip_trace_status END,
+            skip_trace_attempted_at = CASE WHEN ro.skip_trace_status IN ('hit','miss') AND ro.skip_trace_attempted_at IS NOT NULL AND ro.skip_trace_attempted_at >= NOW() - make_interval(days => :ttl) AND rn.skip_trace_status = 'not_attempted' AND NOT (CAST(:atip_blocked AS boolean) AND rn.enrichment_data->>'source' = 'tacoma_code_violations' AND rn.enrichment_data->>'owner_source' = :atip_source) THEN ro.skip_trace_attempted_at ELSE rn.skip_trace_attempted_at END,
+            phones = CASE WHEN ro.skip_trace_status IN ('hit','miss') AND ro.skip_trace_attempted_at IS NOT NULL AND ro.skip_trace_attempted_at >= NOW() - make_interval(days => :ttl) AND rn.skip_trace_status = 'not_attempted' AND NOT (CAST(:atip_blocked AS boolean) AND rn.enrichment_data->>'source' = 'tacoma_code_violations' AND rn.enrichment_data->>'owner_source' = :atip_source) THEN ro.phones ELSE rn.phones END,
+            emails = CASE WHEN ro.skip_trace_status IN ('hit','miss') AND ro.skip_trace_attempted_at IS NOT NULL AND ro.skip_trace_attempted_at >= NOW() - make_interval(days => :ttl) AND rn.skip_trace_status = 'not_attempted' AND NOT (CAST(:atip_blocked AS boolean) AND rn.enrichment_data->>'source' = 'tacoma_code_violations' AND rn.enrichment_data->>'owner_source' = :atip_source) THEN ro.emails ELSE rn.emails END
         FROM delivered_records dr
         JOIN results ro
           ON ro.id = dr.first_result_id
@@ -291,7 +291,16 @@ def _reuse_enrichment_for_duplicates(db, job, job_id: str) -> int:
           AND dr.dedup_hash = rn.dedup_hash
           AND rn.id <> dr.first_result_id
     """
-    result = db.execute(_sa_text(sql), {"ids": strong_ids, "uid": uid, "ttl": ttl})
+    # An ATIP-named Tacoma lead never receives contact data while the paid switch is off:
+    # the duplicate-reuse copy spends no new credit but would still attach phones and
+    # emails to a name legal cleared for NAMING only (Codex). Addresses still copy.
+    from src.scrapers.enrichment.pierce_atip_owner import OWNER_SOURCE as _PIERCE_OWNER_SOURCE
+
+    result = db.execute(_sa_text(sql), {
+        "ids": strong_ids, "uid": uid, "ttl": ttl,
+        "atip_blocked": not settings.PIERCE_CV_OWNER_SKIP_TRACE_ENABLED,
+        "atip_source": _PIERCE_OWNER_SOURCE,
+    })
     db.commit()
     return result.rowcount or 0
 
@@ -1938,6 +1947,7 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config) -> None:
     from src.scrapers.enrichment.skip_trace import (
         address_cache_key,
         build_pending_row_payload,
+        code_violation_skip_trace_allowed,
         legacy_cache_locality,
     )
     from src.utils.address_intel import street_is_placeholder
@@ -2031,7 +2041,14 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config) -> None:
     enqueued_advanced = 0
 
     skipped_ineligible = 0
+    skipped_atip_policy = 0
     for rec in eligible:
+        # An ATIP-named Tacoma owner may be shown, not spent on: counted and reported on
+        # its own line, never as "no traceable owner name", which would send whoever
+        # reads the job log looking for missing data instead of a switch (Codex).
+        if not code_violation_skip_trace_allowed(rec):
+            skipped_atip_policy += 1
+            continue
         # Parse the combined address to get canonical city/state for the cache key
         payload = build_pending_row_payload(rec)
         if payload is None:
@@ -2138,6 +2155,15 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config) -> None:
     except Exception:
         db.rollback()
         db.commit()
+
+    if skipped_atip_policy:
+        _publish_log(
+            r, job_id, "info",
+            f"Skip trace skipped for {skipped_atip_policy} Tacoma code violation lead(s): "
+            "their owner name comes from the county's property record, which we may show "
+            "but not use for a paid contact lookup. The leads keep their owner name.",
+            db=db,
+        )
 
     if skipped_ineligible:
         _publish_log(

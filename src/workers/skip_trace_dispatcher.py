@@ -69,7 +69,16 @@ def dispatch_pending_skip_trace() -> dict:
         # Never pay for a lead that will not be delivered: cancel queued rows whose
         # job failed or was cancelled, or whose lead is over quota, a duplicate,
         # or no longer waiting on a trace.
-        _cancel_undeliverable_queued(db)
+        swept = _cancel_undeliverable_queued(db)
+        # The sweep is best-effort for the deliverability rules (a failed tick retries in
+        # five minutes), but it is also where a Tacoma row enqueued before the paid switch
+        # was turned off is withdrawn. While that switch is off, a failed sweep must stop
+        # the tick rather than fall through to the submit loop (Codex P1). The loop's own
+        # query excludes those rows too; this is the second lock on the same door.
+        if swept is None and not settings.PIERCE_CV_OWNER_SKIP_TRACE_ENABLED:
+            _logger.error("Dispatcher: compliance sweep failed; skipping this tick so no "
+                          "ATIP-named Tacoma row can be submitted")
+            return _tick_result(0, 0, ["compliance sweep failed"], deferred="sweep_failed")
 
         for _ in range(max_batches):
             # Pick a trace_type to drain this pass. Prefer 'normal' first
@@ -113,6 +122,9 @@ def dispatch_pending_skip_trace() -> dict:
                                 func.coalesce(
                                     Result.enrichment_data.op("->>")(DELIVERY_EXCLUDED_KEY), ""
                                 ) != OVER_QUOTA,
+                                # An ATIP-named Tacoma lead is never submitted while the
+                                # paid switch is off, whatever the sweep above did.
+                                _atip_paid_allowed_sql(),
                             )
                         )
                         .order_by(PendingSkipTraceRow.enqueued_at)
@@ -360,8 +372,30 @@ def _job_undelivered_sql(alias: str) -> str:
     )
 
 
-def _cancel_undeliverable_queued(db) -> int:
-    """Cancel queued rows that must never be paid for. Returns rows cancelled.
+def _atip_paid_allowed_sql():
+    """SQL predicate: True unless this is an ATIP-named Tacoma lead with the paid switch off.
+
+    The Python twin is skip_trace.code_violation_skip_trace_allowed; legal cleared NAMING
+    that owner, not buying contact data keyed on the name.
+    """
+    from sqlalchemy import func
+    from sqlalchemy import or_ as _or
+    from sqlalchemy import true as _true
+
+    from src.db.models import Result
+    from src.scrapers.enrichment.pierce_atip_owner import OWNER_SOURCE as PIERCE_OWNER_SOURCE
+
+    if settings.PIERCE_CV_OWNER_SKIP_TRACE_ENABLED:
+        return _true()
+    return _or(
+        func.coalesce(Result.enrichment_data.op("->>")("source"), "") != "tacoma_code_violations",
+        func.coalesce(Result.enrichment_data.op("->>")("owner_source"), "") != PIERCE_OWNER_SOURCE,
+    )
+
+
+def _cancel_undeliverable_queued(db) -> int | None:
+    """Cancel queued rows that must never be paid for. Returns rows cancelled, or None
+    when the sweep itself failed (the caller decides what that means for the tick).
 
     A queued row is cancelled when its job ended failed/cancelled without billing
     (and after billing was stamped, see _job_undelivered_sql), or its lead is
@@ -378,6 +412,7 @@ def _cancel_undeliverable_queued(db) -> int:
     from sqlalchemy import text
 
     from src.api.lead_actionability import DELIVERY_EXCLUDED_KEY, OVER_QUOTA
+    from src.scrapers.enrichment.pierce_atip_owner import OWNER_SOURCE as PIERCE_OWNER_SOURCE
     from src.workers.tasks_helpers.dedup import BILLING_STAMP_RELIABLE_SINCE
 
     try:
@@ -391,11 +426,21 @@ def _cancel_undeliverable_queued(db) -> int:
                 f"  AND ({_job_undelivered_sql('j')} "
                 "       OR r.is_duplicate IS TRUE "
                 "       OR r.skip_trace_status <> 'queued' "
-                "       OR COALESCE(r.enrichment_data->>:key, '') = :over_quota) "
+                "       OR COALESCE(r.enrichment_data->>:key, '') = :over_quota "
+                # An ATIP-named Tacoma lead while PIERCE_CV_OWNER_SKIP_TRACE_ENABLED is
+                # off: the name may be shown, not spent on. A row enqueued before the
+                # switch was turned off is withdrawn here, before the submit loop that
+                # follows. Only 'queued' rows are touched; 'submitting'/'submitted' are
+                # already at Tracerfy and belong to the reconciler (Codex).
+                "       OR (CAST(:atip_blocked AS boolean) "
+                "           AND r.enrichment_data->>'source' = 'tacoma_code_violations' "
+                "           AND r.enrichment_data->>'owner_source' = :atip_source)) "
                 "RETURNING p.result_id, p.user_id"
             ),
             {"key": DELIVERY_EXCLUDED_KEY, "over_quota": OVER_QUOTA,
-             "since": BILLING_STAMP_RELIABLE_SINCE},
+             "since": BILLING_STAMP_RELIABLE_SINCE,
+             "atip_blocked": not settings.PIERCE_CV_OWNER_SKIP_TRACE_ENABLED,
+             "atip_source": PIERCE_OWNER_SOURCE},
         ).fetchall()
         if cancelled:
             db.execute(
@@ -419,7 +464,7 @@ def _cancel_undeliverable_queued(db) -> int:
     except Exception as exc:  # noqa: BLE001 - never break the submit loop
         db.rollback()
         _logger.warning("Dispatcher: cancel sweep failed: %s", str(exc)[:160])
-        return 0
+        return None
 
 
 def _tick_result(batches: int, rows: int, errors: list[str], deferred: str | None = None) -> dict:

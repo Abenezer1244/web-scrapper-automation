@@ -93,6 +93,10 @@ def skip_trace_on(monkeypatch):
 
     monkeypatch.setattr(settings, "SKIP_TRACE_ENABLED", True)
     monkeypatch.setattr(settings, "TRACERFY_API_TOKEN", "test-token-not-real")
+    # This file pins the STATUS gate. Tacoma rows here are named by Pierce ATIP, which
+    # its own default-off switch keeps out of a paid lookup (test_pierce_cv_owner.py);
+    # with it off every Tacoma assertion below would pass for that unrelated reason.
+    monkeypatch.setattr(settings, "PIERCE_CV_OWNER_SKIP_TRACE_ENABLED", True)
 
 
 async def test_completed_and_duplicate_complaints_are_not_queued(db, business_user, skip_trace_on):

@@ -325,6 +325,13 @@ class Settings(BaseSettings):
     # any request.
     PIERCE_CV_OWNER_ENABLED: bool = False
 
+    # May an ATIP-named Tacoma code-violation lead be sent to a PAID skip trace?
+    # OFF by default and deliberately separate from PIERCE_CV_OWNER_ENABLED: the legal
+    # review cleared NAMING the owner, and buying phone/email data keyed on that name is
+    # a further use nobody has cleared. With this off the lead still shows, exports and
+    # delivers with its owner name; only the paid lookup is refused.
+    PIERCE_CV_OWNER_SKIP_TRACE_ENABLED: bool = False
+
     # ─── Skip Trace (Tracerfy, Sprint 4) ──────────────────────────────────────
     TRACERFY_API_TOKEN: str = ""
     TRACERFY_API_BASE_URL: str = "https://tracerfy.com"

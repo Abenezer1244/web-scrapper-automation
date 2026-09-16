@@ -37,7 +37,7 @@ _US_STATES = US_STATES  # legacy private alias (this module's own references)
 # address column too). Before this, '..., TORONTO ON M6K3P1, CANADA' emitted
 # city='CANADA'. Deliberately a short list of countries seen on owner mailing
 # addresses; the Canadian postal-code check below catches Canada without the name.
-_FOREIGN_COUNTRIES = frozenset({
+FOREIGN_COUNTRIES = frozenset({
     "CANADA", "MEXICO", "UNITED KINGDOM", "UK", "GREAT BRITAIN", "ENGLAND", "SCOTLAND",
     "WALES", "IRELAND", "AUSTRALIA", "NEW ZEALAND", "JAPAN", "CHINA", "HONG KONG",
     "TAIWAN", "KOREA", "SOUTH KOREA", "REPUBLIC OF KOREA", "PHILIPPINES", "VIETNAM",
@@ -47,6 +47,7 @@ _FOREIGN_COUNTRIES = frozenset({
     "BRAZIL", "ARGENTINA", "CHILE", "COLOMBIA", "PERU", "SOUTH AFRICA", "NIGERIA",
     "KENYA", "ETHIOPIA", "EGYPT", "UNITED ARAB EMIRATES", "UAE", "SAUDI ARABIA",
 })
+_FOREIGN_COUNTRIES = FOREIGN_COUNTRIES  # legacy private alias (this module's references)
 _US_COUNTRY_TAILS = frozenset({"USA", "US", "U S A", "UNITED STATES", "UNITED STATES OF AMERICA"})
 # Canadian postal code at the END of the final line/part ('VANCOUVER BC V5Z-1V5').
 # Tail-anchored so a US unit that happens to look like one ('UNIT A1B 2C3,

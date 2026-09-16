@@ -29,7 +29,12 @@ import requests
 from src.api.middleware.security import validate_scraping_target
 from src.config import settings
 from src.scrapers import king_cv_sources
-from src.utils.lead_formatting import US_STATES, is_foreign_address, strip_us_country_tail
+from src.utils.lead_formatting import (
+    FOREIGN_COUNTRIES,
+    US_STATES,
+    is_foreign_address,
+    strip_us_country_tail,
+)
 from src.utils.logger import setup_logger
 from src.utils.safe_http import safe_get_following
 
@@ -1021,6 +1026,28 @@ def build_pending_row_payload(result) -> dict | None:
     }
 
 
+def _looks_foreign_for_trace(addr: str | None) -> bool:
+    """`is_foreign_address`, widened for the PAID path only.
+
+    The shared CSV rule reads the last comma chunk as a whole, so a country glued to
+    the city ('..., LONDON UNITED KINGDOM') or a comma-less line
+    ('10 DOWNING ST LONDON UNITED KINGDOM') slips past it (Codex P1). For a CSV that
+    only means an unsplit address column; here it would let the stored situs lend a
+    FOREIGN property a US locality and buy a trace of the wrong place. So this side
+    also matches a country name at the END of the address, whatever the punctuation.
+
+    Deliberately not shared back: the CSV parser stays permissive by design, and
+    widening it would blank columns that render correctly today.
+    """
+    if not addr or not addr.strip():
+        return False
+    if is_foreign_address(addr):
+        return True
+    tail = re.sub(r"[^A-Z ]", " ", addr.upper())
+    tail = re.sub(r"\s+", " ", tail).strip()
+    return any(tail == c or tail.endswith(" " + c) for c in FOREIGN_COUNTRIES)
+
+
 _ADDRESS_RE = re.compile(
     r"^(?P<street>.+?)(?:,\s*(?P<city>[^,]+?))?(?:,\s*(?P<state>[A-Z]{2})\s*(?P<zip>\d{5}(?:-\d{4})?)?)?$",
     re.IGNORECASE,
@@ -1060,7 +1087,7 @@ def _parse_full_address(addr: str, *, legacy: bool = False) -> dict:
         return result
 
     if not legacy:
-        if is_foreign_address(addr):
+        if _looks_foreign_for_trace(addr):
             # Not a US-shaped address: keep it whole rather than mint parts from it.
             result["street"] = addr.strip().rstrip(",").strip() or None
             return result
@@ -1089,6 +1116,11 @@ def _parse_full_address(addr: str, *, legacy: bool = False) -> dict:
         if m and _state(m.group(2)):
             result["city"] = m.group(1).strip() or None
             result["state"] = _state(m.group(2))
+            result["zip"] = m.group(3)
+        elif m and not legacy:
+            # Right shape, unreal state ('OSAGE CITY KA 66523'): the city and the
+            # ZIP are still good, only the state token is not (Codex P2).
+            result["city"] = m.group(1).strip() or None
             result["zip"] = m.group(3)
         else:
             result["city"] = second or None

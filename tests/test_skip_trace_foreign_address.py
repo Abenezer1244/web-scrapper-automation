@@ -68,12 +68,27 @@ class TestParseFullAddressStates:
     def test_a_fabricated_state_is_never_emitted(self, addr):
         assert _parse_full_address(addr)["state"] is None
 
-    def test_a_rejected_state_still_yields_the_zip(self):
+    @pytest.mark.parametrize("addr", [
+        "10 DOWNING ST, LONDON UNITED KINGDOM",   # country glued to the city chunk
+        "10 DOWNING ST LONDON UNITED KINGDOM",    # no comma at all
+        "1 REFORMA MEXICO CITY, MEXICO",
+    ])
+    def test_a_country_tail_the_csv_rule_misses_is_still_refused_a_trace(self, addr):
+        # _looks_foreign_for_trace is wider than the shared CSV rule on the paid path.
+        parsed = _parse_full_address(addr)
+        assert (parsed["city"], parsed["state"], parsed["zip"]) == (None, None, None)
+
+    @pytest.mark.parametrize("addr", [
+        "1 A ST, OSAGE CITY, KA 66523",   # 3-part
+        "1 A ST, OSAGE CITY KA 66523",    # 2-part (Codex P2)
+    ])
+    def test_a_rejected_state_still_yields_the_zip(self, addr):
         # The ZIP is real even when the state token is not — dropping both would
         # strand a row that a later locality backfill could still rescue.
-        parsed = _parse_full_address("1 A ST, OSAGE CITY, KA 66523")
+        parsed = _parse_full_address(addr)
         assert parsed["zip"] == "66523"
         assert parsed["city"] == "OSAGE CITY"
+        assert parsed["state"] is None
 
     @pytest.mark.parametrize("addr,expected", [
         ("123 MAIN ST, SEATTLE, WA 98101", ("SEATTLE", "WA", "98101")),
@@ -112,9 +127,97 @@ class TestParseFullAddressStates:
         assert _parse_full_address("") == {"street": None, "city": None, "state": None, "zip": None}
 
 
+def _parse_full_address_as_of_origin_main(addr: str) -> dict:
+    """The parser exactly as it stood before this fix (origin/main 30c5e43).
+
+    Frozen here so `legacy=True` is proved equal to the real old behaviour rather
+    than to a description of it: the cache keys of already-PAID traces depend on it.
+    """
+    import re
+
+    result = {"street": None, "city": None, "state": None, "zip": None}
+    if not addr:
+        return result
+    clean = addr.strip().rstrip(",")
+    parts = [p.strip() for p in clean.split(",")]
+    if len(parts) >= 1:
+        result["street"] = parts[0] or None
+    if len(parts) == 2:
+        second = parts[1].strip()
+        m = re.match(r"^(.+?)\s+([A-Z]{2})\s+(\d{5}(?:-\d{4})?)$", second)
+        if m:
+            result["city"] = m.group(1).strip() or None
+            result["state"] = m.group(2)
+            result["zip"] = m.group(3)
+        else:
+            result["city"] = second or None
+    elif len(parts) == 3:
+        result["city"] = parts[1] or None
+        last = parts[2]
+        m = re.match(r"([A-Z]{2})\s*(\d{5}(?:-\d{4})?)?", last.upper())
+        if m:
+            result["state"] = m.group(1)
+            result["zip"] = m.group(2) or None
+        else:
+            m2 = re.match(r"(\d{5}(?:-\d{4})?)", last)
+            if m2:
+                result["zip"] = m2.group(1)
+    elif len(parts) >= 4:
+        result["city"] = parts[1] or None
+        state_part = parts[2].strip().upper()
+        zip_part = parts[3].strip()
+        m_state = re.match(r"^([A-Z]{2})$", state_part)
+        if m_state:
+            result["state"] = m_state.group(1)
+        m_zip = re.match(r"(\d{5}(?:-\d{4})?)", zip_part)
+        if m_zip:
+            result["zip"] = m_zip.group(1)
+    return result
+
+
+_LEGACY_CORPUS = [
+    "",
+    "123 MAIN ST",
+    "123 MAIN ST,",
+    "  123 MAIN ST , SEATTLE  ",
+    "123 MAIN ST, SEATTLE",
+    "123 MAIN ST, SEATTLE WA 98101",
+    "123 main st, seattle wa 98101",          # lowercase: legacy 2-part regex misses
+    "123 MAIN ST, SEATTLE WA 98101-1234",
+    "123 MAIN ST, SEATTLE, WA 98101",
+    "123 MAIN ST, SEATTLE, WA98101",
+    "123 MAIN ST, SEATTLE, WA",
+    "123 MAIN ST, SEATTLE, 98101",            # 3-part, no state token
+    "C/O ACME LLC, 123 MAIN ST #500, SEATTLE WA 98101",
+    "456 OAK AVE, LAKE FOREST, PK 98155",
+    "789 PINE ST, FEDERAL WAY, WS 98003",
+    "1 A ST, OSAGE CITY, KA 66523",
+    "1 A ST, OSAGE CITY KA 66523",
+    "123 MAIN ST, TACOMA, WA, 98422-1824",
+    "123 MAIN ST, TACOMA, WASH, 98422",       # 4-part, non-2-letter state
+    "123 MAIN ST, TACOMA, WA, NOT-A-ZIP",
+    "123 MAIN ST, SEATTLE, WA 98101, USA",
+    "2402 W 33RD AVE, VANCOUVER BC V6M 1C3, CANADA",
+    "1201-838 W HASTINGS ST VANCOUVER BC V6C 0A6, CANADA",
+    "232 MILLVIEW PL SW CALGARY AB, CANADA",
+    "10 DOWNING ST, LONDON, UNITED KINGDOM",
+    "271 JOO CHIAT PL, SINGAPORE 427952",
+]
+
+
 class TestLegacyModeIsByteForByte:
     """`legacy=True` must keep reproducing the OLD (wrong) parse — an already-PAID
     trace is cached under that key, and a corrected key would buy the row twice."""
+
+    @pytest.mark.parametrize("addr", _LEGACY_CORPUS)
+    def test_legacy_equals_the_frozen_old_parser_field_for_field(self, addr):
+        assert _parse_full_address(addr, legacy=True) == _parse_full_address_as_of_origin_main(addr)
+
+    def test_the_corpus_actually_exercises_the_difference(self):
+        # Guards the test above from proving nothing if the two modes ever converge.
+        differing = [a for a in _LEGACY_CORPUS
+                     if _parse_full_address(a) != _parse_full_address(a, legacy=True)]
+        assert len(differing) >= 8
 
     @pytest.mark.parametrize("addr,old_state", [
         ("C/O ACME LLC, 123 MAIN ST #500, SEATTLE WA 98101", "SE"),

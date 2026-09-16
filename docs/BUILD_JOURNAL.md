@@ -19,6 +19,96 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-16 - A design audit of the live app, and seven findings that did not survive checking
+
+> **Scope:** every code change landed in the **frontend** repo `bridgeleads-web`. **No backend
+> change was made.** Logged here because this is the cross-repo record.
+>
+> **Provenance:** the numbers below were measured against live production with a headless
+> Chromium, not read off source. The retractions are the load-bearing part: four of my own
+> findings and three of Codex's were wrong, and are recorded as wrong.
+
+**Built / Shipped:**
+- **FE #145 `6eddbc3` (MERGED + DEPLOYED)** — 10 commits. Result row expansion was mouse-only
+  and is the *only* path to heirs, legal description, doc type, assessor owner and assessed
+  value: all 50 rows measured `tabIndex -1`, no `role`, no `aria-expanded`. Now a real button
+  with `aria-expanded`. Two muted greys failed AA on dark (`--color-text-muted` **2.803:1**,
+  `--muted-foreground` **4.488:1**), raised to 4.655 and 4.794. `scope="col"` on all 9 result
+  headers, which had none. `rounded-2xl` was *smaller* than `rounded-xl` because `--radius-2xl`
+  was never overridden, so every dashboard panel reaching for the rounder tier was 0.8px squarer.
+  The live job log overrode `font-mono` with `--font-dm-mono`, a variable defined nowhere, and
+  rendered in Consolas. Seven settings inputs used `focus:` rather than `focus-visible:` with the
+  success green, so clicking a password field made it read as validated. Geist was loaded on
+  every page and consumed by nothing.
+- **FE #146 (OPEN)** — `--primary-text`. The brand teal as *text* measured 3.29:1 on raised
+  surfaces, while the teal *fills* were always fine (white on teal is 4.81:1). New token is
+  `color-mix(--primary 60%, --foreground)` = `#2d9a9a` at 4.70:1, swept across 40 inline `color:`
+  sites and scoped so light mode and `.marketing-monopo` alias back to the plain brand teal.
+  Plus mobile lead-card field labels, the date-sort touch target, a `glass` prop on SurfaceCard,
+  and the dashboard KPI fill made conditional on quota state instead of always-on.
+
+**Tried / Decided:**
+- **Auth by session handoff, never by credential.** A production password was pasted into chat
+  and I was twice asked to log in with it. Declined both times and used `browse handoff`: a
+  visible window opens, the human signs in, control returns with the session live. **That
+  password should be rotated.**
+- **Rejected: collapsing all-`N/A` auction columns per page.** `results/[id]/page.tsx:214-216`
+  documents the job-level latch as deliberate anti-flicker behaviour for sparse NTS matches.
+  The 287px of empty columns I flagged is that design working as intended.
+- **Rejected: removing `.glass` from SurfaceCard.** A subagent called it accidental. It is not:
+  `globals.css:857` documents the unlayered cascade on purpose. Made it a prop instead, default
+  unchanged, so a surface can opt out without anyone tripping over the cascade.
+- **Deferred: moving password change to the Security tab.** `SecurityTab` early-returns on
+  loading, error, backup-code and MFA states, so a naive insert makes password change vanish in
+  those states. Needs the form extracted plus a security review, not a design commit.
+
+**Failed / Blocked:**
+- **Playwright MCP was down all session** (`CONNECT_TIMEOUT`); the Playwright CLI is also broken,
+  pointing at the removed anaconda python. Used gstack's headless Chromium throughout.
+- **Vercel preview deployments sit behind SSO**, so post-fix verification was impossible until
+  #145 merged to production.
+- **`npm ci` was required** — the shared `bridgeleads-web/node_modules` is empty (0 packages).
+
+**Caught & fixed:**
+- **Codex found three regressions in my own commits.** The county badge rendered `pierce, WA`
+  (counties are `toLowerCase`'d at `admin/connectors/page.tsx:101`); `aria-controls` pointed at an
+  element AnimatePresence unmounts while collapsed; the new disclosure was a 12px touch target.
+- **My own AA fix was insufficient and I nearly shipped it believing otherwise.** `PhoneCell` and
+  `EmailCell` painted `--color-text-muted` and then multiplied it by `opacity: 0.6`, compositing
+  to roughly 2.5:1, *below where the token started*. Those cells were most of the 98 failing nodes.
+
+**Retracted - claims that did not survive checking:**
+- ~~"44 contrast failures"~~ → **5**. `lab()` computed colours were being parsed as RGB.
+- ~~"`_sections/` is 16 files of dead marketing code"~~ → already deleted on `origin/master`.
+- ~~"Party Name has no clamp, add one"~~ → `components/ui/party-name.tsx` already clamps to two
+  lines with a labelled popover. I had measured `line-clamp` on the `<td>`; it lives on an inner span.
+- ~~"Results forces 805px of horizontal scroll at 375px"~~ → the desktop table is `display:none`
+  below 640px and a card view renders. Mobile Results is the best surface in the product.
+- **Codex, refuted:** a nested `<tbody>` already fixed upstream with an explanatory comment; a
+  `SpotlightCard` component that does not exist on `origin/master`; and `tailwind.config.ts`
+  "emitting" a Geist fallback when that file is **dead code** (Tailwind v4, no `@config` directive).
+
+**Pending / Handoff:**
+- FE #146 awaiting merge. 185 Tailwind `text-primary` class sites still need a registered
+  `text-primary-text` utility and per-site classification before they can be swept.
+- **Consolidation, unstarted and large:** five table implementations (three with no mobile
+  fallback), two button systems 12px apart, two input systems, 12+ badge shells across four radii.
+- **Unverified:** the dashboard may render API failures as zeros (`dashboard/page.tsx:36-72`).
+  Could not be confirmed without forcing a production failure. Given the 1,001/50 quota history,
+  worth checking first.
+
+**Facts learned:**
+- `getComputedStyle().color` returns `lab()`/`oklch()`, and canvas `fillStyle` readback returns it
+  unchanged. Contrast maths must rasterize (`fillRect` + `getImageData`) or it fabricates failures.
+- **Opacity compounds over colour tokens.** After any token contrast fix, grep the consumers for
+  `opacity` or the fix silently under-delivers on exactly the nodes that were worst.
+- A local frontend checkout can sit **96 commits behind `origin/master`**. Codex reviewing that
+  checkout produced three false findings. Branch implementation from `origin/master` and
+  re-verify every source claim with `git cat-file -e origin/master:<path>`.
+- Production design score moved **B− → B**; the AI-slop score is **A** for the app, which
+  genuinely has none of those patterns. Regression baseline for the next run:
+  `~/.gstack/projects/Abenezer1244-web-scrapper-automation/designs/design-audit-20260916/design-baseline.json`.
+
 ## 2026-09-16 - The Pierce ATIP name may be shown, not spent on
 
 **Built / Shipped:** BE #329 `16e9039`. `PIERCE_CV_OWNER_SKIP_TRACE_ENABLED` (default off), separate from

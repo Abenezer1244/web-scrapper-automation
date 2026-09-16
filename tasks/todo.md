@@ -27,7 +27,7 @@ after #324-#327). #324 did not touch `_parse_full_address`.
 - P2 `US_STATES` includes territories/military: keep for property state only if Tracerfy is US-only anyway (report it).
 
 ### Plan (Phase 1: max 5 files)
-- [ ] 1. Read-only prod measurement (railway run, READ ONLY txn): for all Results that are skip-trace candidates,
+- [x] 1. Read-only prod measurement (railway run, READ ONLY txn): for all Results that are skip-trace candidates,
       old vs new `build_pending_row_payload` + current/legacy cache key; count rows that change or become
       ineligible, hand-review the changed set. Count `pending_skip_trace_rows` still `queued` with a foreign
       mailing/property line. Report before any code.
@@ -47,6 +47,22 @@ after #324-#327). #324 did not touch `_parse_full_address`.
 - [ ] 5. Codex diff review until no P1; security Master Review (§14) pass; PR, CI green, merge (Railway deploys).
 - [ ] 6. If step 1 finds queued foreign rows: separate owner-approved step (mark them `not_attempted`-equivalent
       before the dispatcher uploads them). Nothing written to prod without approval.
+
+### Review (PR #328, steps 1-5 done; step 6 moot)
+- The reported foreign-address bug was a SYMPTOM. Root cause: the parser took the first 2 letters of the last
+  comma chunk as the state unchecked, so a CITY became one ('SE' off SEATTLE, 18 rows) as often as a country did.
+- Prod (163,261 results, read-only, elevated role): 153 of 111,599 mailing rows parsed to a fabricated state,
+  145 foreign; 323 rows parse differently now; 1 of 93,505 property addresses changes; 22 rows lose eligibility,
+  ALL `not_attempted` so nothing was spent on them; the pending queue has zero open rows, so step 6 is moot.
+- Shipped: validated states, anchored 3-part tail, ZIP kept when the state is rejected, foreign never split,
+  foreign mailing sends no `mail_*` and lends no locality, foreign property declined, `legacy=True` for the
+  paid-trace cache key. Helpers now live in `lead_formatting` so CSV and skip trace cannot drift.
+- Codex: 4 rounds. It caught a country glued to a city chunk, BOTH payload guards still on the narrow rule, the
+  lost ZIP in the 2-part branch, and a comma-less Canadian postal line. Final round GATE: PASS, no findings.
+- Tests: 343 in the three closest suites, 1,121 in the wider batch. One `test_cv_owner_recovery` failure was
+  shared-rig interference: it passed alone, the whole file passed, and the batch re-run was 1,121 green.
+- Follow-up filed: rescue the 22 rows by reading a trailing '<city> <state> <zip>' chunk (needs an explicit
+  street-selection rule, since the real street is then the middle chunk).
 # Starter account shows 1,001 / 50 (2026-09-15)
 
 Branch `fix/starter-quota-1001`, worktree `C:/Users/Windows/bl-wt-quota1001` (off origin/main 792bf2d).

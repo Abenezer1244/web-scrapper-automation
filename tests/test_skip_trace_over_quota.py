@@ -160,25 +160,27 @@ class TestCancelSweep:
         assert await _status(db, "results", lead) == "queued"
 
 
+@pytest.fixture
+def tracerfy(monkeypatch):
+    """Records what WOULD be sent to Tracerfy; nothing leaves the process."""
+    from src.config import settings
+    from src.scrapers.enrichment import skip_trace
+
+    monkeypatch.setattr(settings, "SKIP_TRACE_ENABLED", True)
+    monkeypatch.setattr(settings, "TRACERFY_API_TOKEN", "test-token-not-real")
+    monkeypatch.setattr(settings, "SKIP_TRACE_MAX_BATCHES_PER_TICK", 1)
+    sent: list[str] = []
+
+    def _submit(rows, trace_type="normal", api_token=None):
+        sent.extend(str(r.get("result_id") or r.get("id")) for r in rows)
+        return {"queue_id": random.randint(10**8, 2 * 10**9), "rows_uploaded": len(rows),
+                "credits_deducted": 0}
+
+    monkeypatch.setattr(skip_trace, "submit_batch", _submit)
+    return sent
+
+
 class TestDispatcherPaysOnlyForDeliverableLeads:
-    @pytest.fixture
-    def tracerfy(self, monkeypatch):
-        from src.config import settings
-        from src.scrapers.enrichment import skip_trace
-
-        monkeypatch.setattr(settings, "SKIP_TRACE_ENABLED", True)
-        monkeypatch.setattr(settings, "TRACERFY_API_TOKEN", "test-token-not-real")
-        monkeypatch.setattr(settings, "SKIP_TRACE_MAX_BATCHES_PER_TICK", 1)
-        sent: list[str] = []
-
-        def _submit(rows, trace_type="normal", api_token=None):
-            sent.extend(str(r.get("result_id") or r.get("id")) for r in rows)
-            return {"queue_id": random.randint(10**8, 2 * 10**9), "rows_uploaded": len(rows),
-                    "credits_deducted": 0}
-
-        monkeypatch.setattr(skip_trace, "submit_batch", _submit)
-        return sent
-
     async def test_only_the_deliverable_lead_of_a_done_job_is_submitted(self, db, business_user, tracerfy):
         done = await _job(db, business_user, "done")
         running = await _job(db, business_user, "enriching")
@@ -197,6 +199,61 @@ class TestDispatcherPaysOnlyForDeliverableLeads:
         assert await _status(db, "pending_skip_trace_rows", dead) == "cancelled"
         # A running job's row waits for DONE instead of going out mid-job.
         assert await _status(db, "pending_skip_trace_rows", waiting) == "queued"
+
+
+async def _atip_lead(db, user: User, job_id: str) -> str:
+    rid = await _lead(db, user, job_id)
+    await db.execute(text("UPDATE results SET enrichment_data = CAST(:ed AS json) WHERE id = :i"),
+                     {"ed": '{"source": "tacoma_code_violations", "owner_source": "pierce_atip"}',
+                      "i": rid})
+    await db.commit()
+    return rid
+
+
+class TestAtipPaidUseFailsClosed:
+    """Legal cleared NAMING a Tacoma owner from Pierce ATIP, not buying contact data keyed
+    on that name. Neither half of the dispatcher may submit such a row while
+    PIERCE_CV_OWNER_SKIP_TRACE_ENABLED is off — including when the cancel sweep fails."""
+
+    async def test_the_submit_query_skips_an_atip_row_the_sweep_did_not_cancel(
+        self, db, business_user, tracerfy, monkeypatch,
+    ):
+        monkeypatch.setattr(dispatcher, "_cancel_undeliverable_queued", lambda _db: 0)
+        done = await _job(db, business_user, "done")
+        atip = await _pending(db, business_user, done, await _atip_lead(db, business_user, done))
+        ok = await _pending(db, business_user, done, await _lead(db, business_user, done))
+
+        dispatcher.dispatch_pending_skip_trace()
+
+        assert await _status(db, "pending_skip_trace_rows", atip) == "queued"
+        assert await _status(db, "pending_skip_trace_rows", ok) == "submitted"
+        assert len(tracerfy) == 1
+
+    async def test_a_failed_sweep_stops_the_tick_instead_of_submitting(
+        self, db, business_user, tracerfy, monkeypatch,
+    ):
+        monkeypatch.setattr(dispatcher, "_cancel_undeliverable_queued", lambda _db: None)
+        done = await _job(db, business_user, "done")
+        ok = await _pending(db, business_user, done, await _lead(db, business_user, done))
+
+        out = dispatcher.dispatch_pending_skip_trace()
+
+        assert out.get("deferred") == "sweep_failed" and tracerfy == []
+        assert await _status(db, "pending_skip_trace_rows", ok) == "queued"
+
+    async def test_with_the_paid_switch_on_a_failed_sweep_does_not_stop_the_tick(
+        self, db, business_user, tracerfy, monkeypatch,
+    ):
+        from src.config import settings
+
+        monkeypatch.setattr(settings, "PIERCE_CV_OWNER_SKIP_TRACE_ENABLED", True)
+        monkeypatch.setattr(dispatcher, "_cancel_undeliverable_queued", lambda _db: None)
+        done = await _job(db, business_user, "done")
+        atip = await _pending(db, business_user, done, await _atip_lead(db, business_user, done))
+
+        dispatcher.dispatch_pending_skip_trace()
+
+        assert await _status(db, "pending_skip_trace_rows", atip) == "submitted"
 
 
 class TestEnqueueHappensAfterTheCap:

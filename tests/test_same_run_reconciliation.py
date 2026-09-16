@@ -433,3 +433,55 @@ async def test_reconciliation_keeps_the_soonest_auction_survivor(
     assert await _reconcile(db, job_id, starter_user.id, "trustee_sale") == 0
     assert (await _fresh(db, soonest)).is_duplicate is False
     assert (await _fresh(db, later)).is_duplicate is True
+
+
+# ── the ATIP paid-use line (legal cleared NAMING only) ───────────────────────
+
+
+async def _reuse(db, job_id, user_id) -> int:
+    from src.db.models import Job as _Job
+    from src.workers.tasks_helpers.enrich import _reuse_enrichment_for_duplicates
+
+    def _go(sync_session):
+        job = sync_session.get(_Job, job_id)
+        return _reuse_enrichment_for_duplicates(sync_session, job, job_id)
+
+    n = await db.run_sync(_go)
+    await db.commit()
+    return n
+
+
+async def test_a_duplicate_reuse_never_copies_contacts_onto_an_atip_named_tacoma_lead(
+    db, starter_user: User, scraper_config: ScraperConfig, monkeypatch,
+):
+    """No new credit is spent here, but copying a settled phone/email onto a lead named
+    from Pierce ATIP would still take that name past "owner naming only"."""
+    from datetime import UTC, datetime
+
+    from src.config import settings
+
+    atip = {"source": "tacoma_code_violations", "owner_source": "pierce_atip",
+            "owner_pin": "2021110133", "owner_status": "matched"}
+    first_job = await _job(db, starter_user, scraper_config)
+    rerun = await _job(db, starter_user, scraper_config)
+    h = _strong("2021110133", "2117 AVE S")
+    traced = await _row(db, first_job, starter_user.id, h, parcel_id="2021110133",
+                        property_address="2117 AVE S", party_name="TACOMA TOWN CENTER LLC",
+                        enrichment_data=atip, phone="2535550100", email="a@b.test",
+                        skip_trace_status="hit", skip_trace_attempted_at=datetime.now(UTC))
+    duplicate = await _row(db, rerun, starter_user.id, h, parcel_id="2021110133",
+                           property_address="2117 AVE S", party_name="TACOMA TOWN CENTER LLC",
+                           enrichment_data=atip, skip_trace_status="not_attempted",
+                           is_duplicate=True)
+    await _claim(db, starter_user.id, h, traced, first_job)
+
+    assert await _reuse(db, rerun, starter_user.id) == 1
+    row = await _fresh(db, duplicate)
+    assert (row.phone, row.email) == (None, None)
+    assert row.skip_trace_status == "not_attempted"
+
+    # With the paid switch on, the same copy is allowed (no new credit either way).
+    monkeypatch.setattr(settings, "PIERCE_CV_OWNER_SKIP_TRACE_ENABLED", True)
+    assert await _reuse(db, rerun, starter_user.id) == 1
+    row = await _fresh(db, duplicate)
+    assert (row.phone, row.email, row.skip_trace_status) == ("2535550100", "a@b.test", "hit")

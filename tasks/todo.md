@@ -1,3 +1,53 @@
+# CRM CSV follow-ups, one by one (2026-09-15)
+
+Source: `docs/HANDOFF-crm-csv-layout-2026-09-15.md` "Open follow-ups". Owner: do all, one at a time, with Codex.
+Order: #3 skip-trace foreign state -> #5 prod UI check -> #2 PhoneBurner names -> #1 batch/Lists layout
+(needs owner decision) -> #4 name residuals -> #6 housekeeping.
+
+## #3 Skip trace sends a fake US state for foreign mailing addresses
+
+Branch `fix/skip-trace-foreign-mailing` (worktree `C:/Users/Windows/bl-wt-skiptrace-foreign`, off origin/main 30c5e43,
+after #324-#327). #324 did not touch `_parse_full_address`.
+
+### Proven (code, origin/main)
+- `skip_trace._parse_full_address` takes the first 2 letters of the last comma part as the state, unvalidated:
+  `..., VANCOUVER BC V5Z 1V5, CANADA` -> state `CA`; `..., LONDON, UNITED KINGDOM` -> `UN`.
+- The mailing parse feeds Tracerfy `mail_*` columns AND the atomic locality fallback (used when the property has
+  no city), so a foreign owner can put `VANCOUVER / CA` on the PROPERTY row we pay to trace.
+- `lead_formatting.parse_property_for_display` (CSV) already detects foreign tails and US country tails correctly.
+- Webhook ingest matches on the address/city/state Tracerfy echoes from the STORED queued row; it never reparses,
+  so already-queued/paid rows keep matching (Codex P1 #4: verified OK, no change needed).
+
+### Codex consult (2026-09-15, VERDICT: REVISE) folded in
+- P1 `..., WA 98101, USA` must not regress: share the US-country-tail strip.
+- P1 foreign PROPERTY address + stored situs could still be traced: decline it explicitly.
+- P1 queued-but-not-uploaded rows with a bad state: count on prod, and handle if any exist (decision below).
+- P2 uppercase state before validating; anchor the 3-part `ST ZIP` match (`WA98101`/`WA 98101` ok,
+  `SEATTLE WA 98101` rejected); legacy key lookup must reproduce the OLD parse exactly (Option A).
+- P2 `US_STATES` includes territories/military: keep for property state only if Tracerfy is US-only anyway (report it).
+
+### Plan (Phase 1: max 5 files)
+- [ ] 1. Read-only prod measurement (railway run, READ ONLY txn): for all Results that are skip-trace candidates,
+      old vs new `build_pending_row_payload` + current/legacy cache key; count rows that change or become
+      ineligible, hand-review the changed set. Count `pending_skip_trace_rows` still `queued` with a foreign
+      mailing/property line. Report before any code.
+- [ ] 2. `src/utils/lead_formatting.py`: extract public pure helpers `is_foreign_address(addr)` and
+      `strip_us_country_tail(addr)` (+ public `US_STATES`, `_US_STATES` alias). `parse_property_for_display`
+      calls them; no behavior change.
+- [ ] 3. `src/scrapers/enrichment/skip_trace.py`:
+      - `_parse_full_address(addr, *, legacy=False)`: new mode = foreign -> street only; strip US tail;
+        uppercase + validate state in US_STATES; anchor 3-part `ST ZIP`. `legacy=True` = today's code, byte for byte.
+      - `build_pending_row_payload`: foreign property address -> None (declined); foreign mailing -> all `mail_*`
+        None and no locality fallback.
+      - `legacy_cache_locality` uses `legacy=True`.
+- [ ] 4. Tests, no mocks, pure functions: `tests/test_skip_trace_foreign_address.py` (Canada/UK/Mexico/postal-only
+      mail; foreign property; USA/US/UNITED STATES tails; lowercase state; `WA98101`; `SEATTLE WA 98101` 3-part;
+      legacy key unchanged for a foreign-mail row) + run `tests/test_skip_trace_eligibility.py` and
+      `tests/test_lead_formatting.py` on the guarded `_test` DB env.
+- [ ] 5. Codex diff review until no P1; security Master Review (§14) pass; PR, CI green, merge (Railway deploys).
+- [ ] 6. If step 1 finds queued foreign rows: separate owner-approved step (mark them `not_attempted`-equivalent
+      before the dispatcher uploads them). Nothing written to prod without approval.
+
 # CRM/dialer-ready CSV layout (2026-09-14)
 
 Branch `feat/crm-ready-csv-columns` (worktree `C:/Users/Windows/bl-wt-crmcsv`, off origin/main 47698a8).

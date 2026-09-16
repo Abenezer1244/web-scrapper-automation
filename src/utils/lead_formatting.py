@@ -20,7 +20,9 @@ import re
 
 # US state/territory 2-letter codes — gate for splitting out a `state` column so
 # a token like a street-type abbreviation can't be mistaken for a state.
-_US_STATES = frozenset({
+# PUBLIC: skip_trace validates against the same vocabulary, so a paid trace can
+# never be sent a fabricated state ('SE' off SEATTLE, 'PK', a 'WS' source typo).
+US_STATES = frozenset({
     "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA", "HI", "ID", "IL",
     "IN", "IA", "KS", "KY", "LA", "ME", "MD", "MA", "MI", "MN", "MS", "MO", "MT",
     "NE", "NV", "NH", "NJ", "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI",
@@ -28,6 +30,7 @@ _US_STATES = frozenset({
     "DC", "PR", "VI", "GU", "AS", "MP",
     "AA", "AE", "AP",  # USPS military (APO/FPO/DPO) "states"
 })
+_US_STATES = US_STATES  # legacy private alias (this module's own references)
 
 # A trailing country marks a NON-US address. Its parts are not in a US shape, so
 # nothing is split out: the whole text stays in street (the caller keeps the full
@@ -51,6 +54,42 @@ _US_COUNTRY_TAILS = frozenset({"USA", "US", "U S A", "UNITED STATES", "UNITED ST
 _CA_POSTAL_TAIL_RE = re.compile(r"\b[A-Z]\d[A-Z][\s-]?\d[A-Z]\d$", re.IGNORECASE)
 # County data uses literal UNKNOWN placeholders ('UNKNOWN UNKNOWN, UNKNOWN WA').
 _PLACEHOLDER_RE = re.compile(r"\bUNKNOWN\b", re.IGNORECASE)
+
+
+def is_foreign_address(addr: str | None) -> bool:
+    """True when a trailing country (or a Canadian postal code) marks a NON-US address.
+
+    PUBLIC because skip_trace needs the same verdict: a foreign address split by US
+    rules yields a fabricated state ('CANADA' -> 'CA' = California), and that state is
+    what a PAID Tracerfy trace is keyed on. Case-insensitive; a single-chunk string is
+    never foreign (there is no tail to read).
+    """
+    if not addr or not addr.strip():
+        return False
+    chunks = [c.strip() for c in re.split(r"[,\n]", addr.strip().rstrip(",").strip()) if c.strip()]
+    if len(chunks) <= 1:
+        return False
+    tail_key = re.sub(r"[^A-Z ]", "", chunks[-1].upper()).strip()
+    return (
+        tail_key in _FOREIGN_COUNTRIES
+        or tail_key.endswith(" CANADA")  # 'Toronto ON CANADA' in one part
+        or bool(_CA_POSTAL_TAIL_RE.search(chunks[-1]))
+    )
+
+
+def strip_us_country_tail(addr: str) -> str:
+    """Drop a trailing 'USA' / 'US' / 'UNITED STATES' chunk so the US tail parses normally.
+
+    Only a WHOLE final comma/newline chunk is removed — ordinary street text that merely
+    contains those letters is untouched. Returns the address stripped of a trailing comma.
+    """
+    clean = addr.strip().rstrip(",").strip()
+    chunks = [c.strip() for c in re.split(r"[,\n]", clean) if c.strip()]
+    if len(chunks) > 1:
+        tail_key = re.sub(r"[^A-Z ]", "", chunks[-1].upper()).strip()
+        if tail_key in _US_COUNTRY_TAILS:
+            return clean[: clean.upper().rfind(chunks[-1].upper())].rstrip(" ,\n")
+    return clean
 
 # Tokens that mark a party_name as a NON-person (entity). If any appears we emit
 # no first/last (the full party_name column still carries it).
@@ -590,19 +629,11 @@ def parse_property_for_display(addr: str | None) -> dict:
         r"[\s,]|\b[A-Za-z]{2}\b", "", _PLACEHOLDER_RE.sub("", clean)
     ):
         return out
-    chunks = [c.strip() for c in re.split(r"[,\n]", clean) if c.strip()]
-    tail_key = re.sub(r"[^A-Z ]", "", chunks[-1].upper()).strip() if chunks else ""
-    is_foreign = len(chunks) > 1 and (
-        tail_key in _FOREIGN_COUNTRIES
-        or tail_key.endswith(" CANADA")  # 'Toronto ON CANADA' in one part
-        or bool(_CA_POSTAL_TAIL_RE.search(chunks[-1]))
-    )
-    if is_foreign:
+    if is_foreign_address(clean):
         out["street"] = clean
         return out
-    if tail_key in _US_COUNTRY_TAILS and len(chunks) > 1:
-        # '..., WA 98101, USA' — drop the country so the US tail parses normally.
-        clean = clean[: clean.upper().rfind(chunks[-1].upper())].rstrip(" ,\n")
+    # '..., WA 98101, USA' — drop the country so the US tail parses normally.
+    clean = strip_us_country_tail(clean)
 
     if "," not in clean:
         m = _NO_COMMA_TAIL_RE.match(clean)

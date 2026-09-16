@@ -29,6 +29,7 @@ import requests
 from src.api.middleware.security import validate_scraping_target
 from src.config import settings
 from src.scrapers import king_cv_sources
+from src.utils.lead_formatting import US_STATES, is_foreign_address, strip_us_country_tail
 from src.utils.logger import setup_logger
 from src.utils.safe_http import safe_get_following
 
@@ -808,9 +809,12 @@ def legacy_cache_locality(result) -> tuple[str | None, str | None]:
     Kept beside build_pending_row_payload, and using the same parser, so the two
     spellings of the rule cannot drift apart.
     """
-    parsed = _parse_full_address(result.property_address)
+    # legacy=True on purpose: this key must stay byte-identical to the one the
+    # already-PAID row was cached under, including the states the old parser
+    # invented. Parsing it correctly here would miss that row and re-buy it.
+    parsed = _parse_full_address(result.property_address, legacy=True)
     if not parsed["city"] and result.mailing_address:
-        mail = _parse_full_address(result.mailing_address)
+        mail = _parse_full_address(result.mailing_address, legacy=True)
         if mail["city"]:
             return mail["city"], mail["state"]
     return parsed["city"], parsed["state"]
@@ -887,6 +891,14 @@ def build_pending_row_payload(result) -> dict | None:
     if not prop or prop == "(enrichment unavailable)":
         return None
 
+    # A foreign property address has no US city/state to trace on, and the situs
+    # columns below must not lend it one: filling a Canadian property's locality
+    # from a stored WA situs would buy a trace of a US address that is not this
+    # property. Decline instead (same 'not_attempted' terminal state as a row
+    # whose locality never resolves).
+    if is_foreign_address(prop):
+        return None
+
     # A code-violation case names a complaint, not a person. It is traceable only once
     # enrichment has named the property's owner from a county record (owner_source).
     # Keyed on the STORED source, not on what party_name happens to look like: the
@@ -958,7 +970,16 @@ def build_pending_row_payload(result) -> dict | None:
     # Olympia property) — the same fabricate-an-address class of bug #188 was
     # fixing. Only when we still have NO city at all is the owner's mail worth
     # guessing from, and then it is used whole.
-    mail_parsed = _parse_full_address(result.mailing_address) if result.mailing_address else None
+    #
+    # A FOREIGN mailing line is dropped whole (mail_* all None, no fallback). Its
+    # parts are not US-shaped, so the only honest reading is "no usable mailing
+    # address"; passing the raw foreign text as mail_address with a blank
+    # mail_city/mail_state would just hand Tracerfy a half-row it cannot match.
+    mail_parsed = (
+        _parse_full_address(result.mailing_address)
+        if result.mailing_address and not is_foreign_address(result.mailing_address)
+        else None
+    )
     if not parsed["city"] and mail_parsed and mail_parsed["city"]:
         parsed["city"] = mail_parsed["city"]
         parsed["state"] = mail_parsed["state"]
@@ -1006,7 +1027,7 @@ _ADDRESS_RE = re.compile(
 )
 
 
-def _parse_full_address(addr: str) -> dict:
+def _parse_full_address(addr: str, *, legacy: bool = False) -> dict:
     """Split a combined street address into street / city / state / zip.
 
     Handles common formats:
@@ -1018,13 +1039,42 @@ def _parse_full_address(addr: str) -> dict:
 
     Returns a dict with keys street, city, state, zip — any of which may
     be None if not parseable. Always returns at least `street`.
+
+    A `state` is emitted ONLY when it is a real US code (`US_STATES`). The old
+    parser took the first two letters of the last chunk unchecked, which invented
+    a state out of a city or a country — a prod read over 163,261 rows found 153
+    rows doing exactly that ('..., 123 MAIN ST #500, SEATTLE WA 98101' -> 'SE',
+    '..., VANCOUVER BC V6C 0A6, CANADA' -> city 'CANADA'). Tracerfy is keyed on
+    (address, city, state), so each one is a PAID trace of a place that does not
+    exist. A foreign address is never split at all: its parts are not in a US
+    shape, so the whole string stays in `street` (`is_foreign_address`). A
+    rejected state never costs the ZIP — the ZIP is lifted independently.
+
+    `legacy=True` reproduces the pre-fix behaviour BYTE FOR BYTE. It exists only
+    for `legacy_cache_locality`: an already-PAID trace is cached under the key the
+    old parse produced, and re-parsing it correctly would miss that row and buy it
+    a second time. Never use it on a new payload.
     """
     result = {"street": None, "city": None, "state": None, "zip": None}
     if not addr:
         return result
 
-    clean = addr.strip().rstrip(",")
+    if not legacy:
+        if is_foreign_address(addr):
+            # Not a US-shaped address: keep it whole rather than mint parts from it.
+            result["street"] = addr.strip().rstrip(",").strip() or None
+            return result
+        clean = strip_us_country_tail(addr)
+    else:
+        clean = addr.strip().rstrip(",")
     parts = [p.strip() for p in clean.split(",")]
+
+    def _state(token: str) -> str | None:
+        """A 2-letter token, but only when it is a real US state/territory code."""
+        token = token.strip().upper()
+        if legacy:
+            return token or None
+        return token if token in US_STATES else None
 
     if len(parts) >= 1:
         result["street"] = parts[0] or None
@@ -1033,23 +1083,32 @@ def _parse_full_address(addr: str) -> dict:
         # "STREET, CITY" or "STREET, CITY STATE ZIP" (King County GIS format)
         # Try to split "SEATTLE WA 98146" into city/state/zip
         second = parts[1].strip()
-        m = re.match(r"^(.+?)\s+([A-Z]{2})\s+(\d{5}(?:-\d{4})?)$", second)
-        if m:
+        m = re.match(r"^(.+?)\s+([A-Za-z]{2})\s+(\d{5}(?:-\d{4})?)$", second)
+        if legacy:
+            m = re.match(r"^(.+?)\s+([A-Z]{2})\s+(\d{5}(?:-\d{4})?)$", second)
+        if m and _state(m.group(2)):
             result["city"] = m.group(1).strip() or None
-            result["state"] = m.group(2)
+            result["state"] = _state(m.group(2))
             result["zip"] = m.group(3)
         else:
             result["city"] = second or None
     elif len(parts) == 3:
         # "STREET, CITY, ST 98101" — state+zip combined in last part
         result["city"] = parts[1] or None
-        last = parts[2]
-        m = re.match(r"([A-Z]{2})\s*(\d{5}(?:-\d{4})?)?", last.upper())
-        if m:
-            result["state"] = m.group(1)
+        last = parts[2].strip().upper()
+        # Anchored: 'WA 98101' and 'WA98101' are a state+zip, 'SEATTLE WA 98101'
+        # is a city line and yields NO state (the old unanchored match read 'SE').
+        m = re.match(r"^([A-Z]{2})\s*(\d{5}(?:-\d{4})?)?$", last)
+        if legacy:
+            m = re.match(r"([A-Z]{2})\s*(\d{5}(?:-\d{4})?)?", last)
+        if m and _state(m.group(1)):
+            result["state"] = _state(m.group(1))
             result["zip"] = m.group(2) or None
         else:
-            m2 = re.match(r"(\d{5}(?:-\d{4})?)", last)
+            # The state was unreadable or not real; a trailing ZIP still is.
+            m2 = re.search(r"(\d{5}(?:-\d{4})?)$", last) if not legacy else re.match(
+                r"(\d{5}(?:-\d{4})?)", parts[2]
+            )
             if m2:
                 result["zip"] = m2.group(1)
     elif len(parts) >= 4:
@@ -1061,7 +1120,7 @@ def _parse_full_address(addr: str) -> dict:
         # Validate state is 2 uppercase letters
         m_state = re.match(r"^([A-Z]{2})$", state_part)
         if m_state:
-            result["state"] = m_state.group(1)
+            result["state"] = _state(m_state.group(1))
         # Validate zip is 5 or 9 digits (with optional dash)
         m_zip = re.match(r"(\d{5}(?:-\d{4})?)", zip_part)
         if m_zip:

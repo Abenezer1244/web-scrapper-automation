@@ -52,7 +52,8 @@ _US_COUNTRY_TAILS = frozenset({"USA", "US", "U S A", "UNITED STATES", "UNITED ST
 # Canadian postal code at the END of the final line/part ('VANCOUVER BC V5Z-1V5').
 # Tail-anchored so a US unit that happens to look like one ('UNIT A1B 2C3,
 # SEATTLE, WA 98101') never disables the US split.
-_CA_POSTAL_TAIL_RE = re.compile(r"\b[A-Z]\d[A-Z][\s-]?\d[A-Z]\d$", re.IGNORECASE)
+CA_POSTAL_TAIL_RE = re.compile(r"\b[A-Z]\d[A-Z][\s-]?\d[A-Z]\d$", re.IGNORECASE)
+_CA_POSTAL_TAIL_RE = CA_POSTAL_TAIL_RE  # legacy private alias
 # County data uses literal UNKNOWN placeholders ('UNKNOWN UNKNOWN, UNKNOWN WA').
 _PLACEHOLDER_RE = re.compile(r"\bUNKNOWN\b", re.IGNORECASE)
 

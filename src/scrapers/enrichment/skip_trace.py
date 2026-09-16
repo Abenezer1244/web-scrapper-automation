@@ -30,6 +30,7 @@ from src.api.middleware.security import validate_scraping_target
 from src.config import settings
 from src.scrapers import king_cv_sources
 from src.utils.lead_formatting import (
+    CA_POSTAL_TAIL_RE,
     FOREIGN_COUNTRIES,
     US_STATES,
     is_foreign_address,
@@ -1030,11 +1031,13 @@ def _looks_foreign_for_trace(addr: str | None) -> bool:
     """`is_foreign_address`, widened for the PAID path only.
 
     The shared CSV rule reads the last comma chunk as a whole, so a country glued to
-    the city ('..., LONDON UNITED KINGDOM') or a comma-less line
-    ('10 DOWNING ST LONDON UNITED KINGDOM') slips past it (Codex P1). For a CSV that
-    only means an unsplit address column; here it would let the stored situs lend a
-    FOREIGN property a US locality and buy a trace of the wrong place. So this side
-    also matches a country name at the END of the address, whatever the punctuation.
+    the city ('..., LONDON UNITED KINGDOM'), a comma-less line
+    ('10 DOWNING ST LONDON UNITED KINGDOM') or a comma-less Canadian line known only
+    by its postal code ('1201-838 W HASTINGS ST VANCOUVER BC V6C 0A6') slips past it
+    (Codex). For a CSV that only means an unsplit address column; here it would let
+    the stored situs lend a FOREIGN property a US locality and buy a trace of the
+    wrong place. So this side also matches a country name at the END of the address
+    whatever the punctuation, and a trailing Canadian postal code anywhere.
 
     Deliberately not shared back: the CSV parser stays permissive by design, and
     widening it would blank columns that render correctly today.
@@ -1042,6 +1045,8 @@ def _looks_foreign_for_trace(addr: str | None) -> bool:
     if not addr or not addr.strip():
         return False
     if is_foreign_address(addr):
+        return True
+    if CA_POSTAL_TAIL_RE.search(addr.strip().rstrip(",").strip()):
         return True
     tail = re.sub(r"[^A-Z ]", " ", addr.upper())
     tail = re.sub(r"\s+", " ", tail).strip()

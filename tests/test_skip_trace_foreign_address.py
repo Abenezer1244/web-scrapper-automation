@@ -72,6 +72,7 @@ class TestParseFullAddressStates:
         "10 DOWNING ST, LONDON UNITED KINGDOM",   # country glued to the city chunk
         "10 DOWNING ST LONDON UNITED KINGDOM",    # no comma at all
         "1 REFORMA MEXICO CITY, MEXICO",
+        "1201-838 W HASTINGS ST VANCOUVER BC V6C 0A6",  # comma-less, postal code only
     ])
     def test_a_country_tail_the_csv_rule_misses_is_still_refused_a_trace(self, addr):
         # _looks_foreign_for_trace is wider than the shared CSV rule on the paid path.
@@ -284,6 +285,7 @@ class TestPayloadWithForeignAddresses:
     @pytest.mark.parametrize("prop", [
         "10 DOWNING ST LONDON UNITED KINGDOM",     # comma-less
         "10 DOWNING ST, LONDON UNITED KINGDOM",    # country glued to the city chunk
+        "1201-838 W HASTINGS ST VANCOUVER BC V6C 0A6",  # comma-less, postal code only
     ])
     def test_a_glued_country_tail_never_borrows_a_us_situs(self, prop):
         # The payload guard must use the WIDENED rule, or a stored SEATTLE/WA situs

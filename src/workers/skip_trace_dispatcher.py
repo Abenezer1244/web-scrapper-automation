@@ -378,6 +378,7 @@ def _cancel_undeliverable_queued(db) -> int:
     from sqlalchemy import text
 
     from src.api.lead_actionability import DELIVERY_EXCLUDED_KEY, OVER_QUOTA
+    from src.scrapers.enrichment.pierce_atip_owner import OWNER_SOURCE as PIERCE_OWNER_SOURCE
     from src.workers.tasks_helpers.dedup import BILLING_STAMP_RELIABLE_SINCE
 
     try:
@@ -391,11 +392,21 @@ def _cancel_undeliverable_queued(db) -> int:
                 f"  AND ({_job_undelivered_sql('j')} "
                 "       OR r.is_duplicate IS TRUE "
                 "       OR r.skip_trace_status <> 'queued' "
-                "       OR COALESCE(r.enrichment_data->>:key, '') = :over_quota) "
+                "       OR COALESCE(r.enrichment_data->>:key, '') = :over_quota "
+                # An ATIP-named Tacoma lead while PIERCE_CV_OWNER_SKIP_TRACE_ENABLED is
+                # off: the name may be shown, not spent on. A row enqueued before the
+                # switch was turned off is withdrawn here, before the submit loop that
+                # follows. Only 'queued' rows are touched; 'submitting'/'submitted' are
+                # already at Tracerfy and belong to the reconciler (Codex).
+                "       OR (CAST(:atip_blocked AS boolean) "
+                "           AND r.enrichment_data->>'source' = 'tacoma_code_violations' "
+                "           AND r.enrichment_data->>'owner_source' = :atip_source)) "
                 "RETURNING p.result_id, p.user_id"
             ),
             {"key": DELIVERY_EXCLUDED_KEY, "over_quota": OVER_QUOTA,
-             "since": BILLING_STAMP_RELIABLE_SINCE},
+             "since": BILLING_STAMP_RELIABLE_SINCE,
+             "atip_blocked": not settings.PIERCE_CV_OWNER_SKIP_TRACE_ENABLED,
+             "atip_source": PIERCE_OWNER_SOURCE},
         ).fetchall()
         if cancelled:
             db.execute(

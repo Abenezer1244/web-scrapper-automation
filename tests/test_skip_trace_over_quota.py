@@ -106,6 +106,42 @@ class TestCancelSweep:
         assert await _status(db, "pending_skip_trace_rows", ok) == "queued"
         assert await _status(db, "pending_skip_trace_rows", waiting) == "queued"
 
+    async def test_an_atip_named_tacoma_lead_is_withdrawn_while_the_paid_switch_is_off(
+        self, db, business_user, monkeypatch,
+    ):
+        """Legal cleared NAMING a Tacoma owner from Pierce ATIP, not buying data keyed on
+        that name. A row enqueued before PIERCE_CV_OWNER_SKIP_TRACE_ENABLED was turned off
+        is withdrawn here, before the submit loop."""
+        from src.config import settings
+
+        job = await _job(db, business_user, "done")
+        atip = await _lead(db, business_user, job)
+        other = await _lead(db, business_user, job)
+        await db.execute(text(
+            "UPDATE results SET enrichment_data = CAST(:ed AS json) WHERE id = :i"),
+            {"ed": '{"source": "tacoma_code_violations", "owner_source": "pierce_atip"}', "i": atip})
+        await db.commit()
+        atip_row = await _pending(db, business_user, job, atip)
+        other_row = await _pending(db, business_user, job, other)
+
+        _sweep()
+
+        assert await _status(db, "pending_skip_trace_rows", atip_row) == "cancelled"
+        assert await _status(db, "results", atip) == "not_attempted"
+        assert await _status(db, "pending_skip_trace_rows", other_row) == "queued"
+
+        # With the switch on, the same row is left queued for Tracerfy.
+        monkeypatch.setattr(settings, "PIERCE_CV_OWNER_SKIP_TRACE_ENABLED", True)
+        await db.execute(text(
+            "UPDATE pending_skip_trace_rows SET status = 'queued' WHERE id = :i"), {"i": atip_row})
+        await db.execute(text(
+            "UPDATE results SET skip_trace_status = 'queued' WHERE id = :i"), {"i": atip})
+        await db.commit()
+
+        _sweep()
+
+        assert await _status(db, "pending_skip_trace_rows", atip_row) == "queued"
+
     async def test_a_row_already_at_tracerfy_is_never_touched(self, db, business_user):
         job = await _job(db, business_user, "failed")
         lead = await _lead(db, business_user, job, status="submitted")

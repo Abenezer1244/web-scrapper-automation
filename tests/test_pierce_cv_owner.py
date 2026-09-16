@@ -632,6 +632,44 @@ def test_the_tacoma_proof_itself_requires_a_party_name():
         party_name="602 LLC", enrichment_data=_proven(source="seattle_sdci_code_violations")))
 
 
+def test_an_atip_named_lead_is_never_spent_on_while_the_paid_switch_is_off(monkeypatch):
+    """The 2026-09-14 clearance covers NAMING the Tacoma owner, not buying phone data
+    keyed on that name. PIERCE_CV_OWNER_SKIP_TRACE_ENABLED (default off) is that line."""
+    from src.scrapers.enrichment.skip_trace import (
+        build_pending_row_payload,
+        code_violation_owner_is_known,
+        code_violation_skip_trace_allowed,
+    )
+
+    assert settings.PIERCE_CV_OWNER_SKIP_TRACE_ENABLED is False       # default off
+    named = _cv_row(party_name="TACOMA TOWN CENTER PARCELS LLC", enrichment_data=_proven())
+    # The name is proven and shown; only the paid lookup is refused.
+    assert code_violation_owner_is_known(named) is True
+    assert code_violation_skip_trace_allowed(named) is False
+    assert build_pending_row_payload(named) is None
+
+    monkeypatch.setattr(settings, "PIERCE_CV_OWNER_SKIP_TRACE_ENABLED", True)
+    assert code_violation_skip_trace_allowed(named) is True
+    assert build_pending_row_payload(named) is not None
+
+
+def test_the_paid_switch_only_touches_atip_named_tacoma_rows(monkeypatch):
+    from src.scrapers.enrichment.skip_trace import code_violation_skip_trace_allowed
+
+    # A King code violation: its owner comes from King eRealProperty, no restriction.
+    king = _cv_row(party_name="DVD SE 13TH PL LLC", parcel_id="2571200050",
+                   enrichment_data={"source": "bellevue_code_enforcement",
+                                    "owner_source": "king_erealproperty",
+                                    "owner_pin": "2571200050"})
+    assert code_violation_skip_trace_allowed(king) is True
+    # A Tacoma row named by something other than ATIP, and a non-code-violation row.
+    assert code_violation_skip_trace_allowed(
+        _cv_row(enrichment_data=_proven(owner_source="pierce_assessor_other"))) is True
+    assert code_violation_skip_trace_allowed(
+        _cv_row(enrichment_data={"source": "pierce_probate"})) is True
+    assert code_violation_skip_trace_allowed(_cv_row(enrichment_data=None)) is True
+
+
 def test_a_task_time_limit_during_a_sweep_write_is_not_swallowed():
     from billiard.exceptions import SoftTimeLimitExceeded
 
@@ -657,8 +695,13 @@ def _proven(**over):
     return ed
 
 
-def test_a_proven_tacoma_owner_is_traceable():
-    payload = build_pending_row_payload(_cv_row(party_name="SMITH JOHN A", enrichment_data=_proven()))
+def test_a_proven_tacoma_owner_is_traceable_only_once_the_paid_switch_is_on(monkeypatch):
+    """The proof is necessary but no longer sufficient: PIERCE_CV_OWNER_SKIP_TRACE_ENABLED
+    (default off) keeps an ATIP name out of a PAID lookup, the use legal did not clear."""
+    row = _cv_row(party_name="SMITH JOHN A", enrichment_data=_proven())
+    assert build_pending_row_payload(row) is None
+    monkeypatch.setattr(settings, "PIERCE_CV_OWNER_SKIP_TRACE_ENABLED", True)
+    payload = build_pending_row_payload(row)
     assert payload is not None and payload["property_address"] == "2117 AVE S"
 
 
@@ -672,7 +715,9 @@ def test_a_proven_tacoma_owner_is_traceable():
     (None, "2021110133", _proven()),
     ("Nuisance - 2117 AVE S", "2021110133", {"source": "tacoma_code_violations"}),
 ])
-def test_anything_short_of_that_proof_is_not_traced(party, parcel, ed):
+def test_anything_short_of_that_proof_is_not_traced(party, parcel, ed, monkeypatch):
+    # Switch ON, so each case fails on its own missing proof, not on the paid switch.
+    monkeypatch.setattr(settings, "PIERCE_CV_OWNER_SKIP_TRACE_ENABLED", True)
     assert build_pending_row_payload(_cv_row(party_name=party, parcel_id=parcel, enrichment_data=ed)) is None
 
 

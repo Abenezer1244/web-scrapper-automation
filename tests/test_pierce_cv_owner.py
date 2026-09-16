@@ -653,6 +653,49 @@ def test_an_atip_named_lead_is_never_spent_on_while_the_paid_switch_is_off(monke
     assert build_pending_row_payload(named) is not None
 
 
+@pytest.mark.asyncio
+async def test_the_job_log_says_the_switch_refused_it_not_that_data_is_missing(
+    db, business_user, monkeypatch, redis_client,
+):
+    """"no traceable owner name" would send an operator hunting for missing data."""
+    from src.db.session import SyncSessionLocal
+    from src.workers.tasks_helpers.enrich import _enqueue_skip_trace_rows
+
+    monkeypatch.setattr(settings, "SKIP_TRACE_ENABLED", True)
+    monkeypatch.setattr(settings, "TRACERFY_API_TOKEN", "test-token-not-real")
+    config = ScraperConfig(
+        id=str(uuid.uuid4()), user_id=business_user.id, name="tacoma cv",
+        county="pierce", state="WA", record_type="code_violation",
+        fields=["party_name"], enrichment=[], schedule={"frequency": "manual"},
+        deliver={"format": "csv", "emails": []}, skip_trace_enabled=True)
+    db.add(config)
+    await db.commit()
+    job_id = str(uuid.uuid4())
+    db.add(Job(id=job_id, user_id=business_user.id, scraper_config_id=config.id,
+               status="enriching", trigger="manual"))
+    await db.commit()
+    db.add(Result(id=str(uuid.uuid4()), user_id=business_user.id, job_id=job_id,
+                  party_name="TACOMA TOWN CENTER PARCELS LLC", parcel_id="2021110133",
+                  property_address="2117 AVE S, TACOMA, WA 98402",
+                  enrichment_data=_proven(), skip_trace_status="not_attempted",
+                  is_duplicate=False))
+    await db.commit()
+
+    def _enqueue():
+        with SyncSessionLocal() as sdb:
+            job = sdb.get(Job, job_id)
+            _enqueue_skip_trace_rows(sdb, job, redis_client, job_id,
+                                     sdb.get(ScraperConfig, config.id))
+
+    await asyncio.to_thread(_enqueue)
+
+    messages = [m for (m,) in (await db.execute(
+        text("SELECT message FROM job_logs WHERE job_id = :j"), {"j": job_id})).all()]
+    policy = [m for m in messages if "paid contact lookup" in m]
+    assert len(policy) == 1 and "Tacoma code violation lead(s)" in policy[0]
+    assert not [m for m in messages if "no traceable owner name" in m]
+
+
 def test_the_paid_switch_only_touches_atip_named_tacoma_rows(monkeypatch):
     from src.scrapers.enrichment.skip_trace import code_violation_skip_trace_allowed
 

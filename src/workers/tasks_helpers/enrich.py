@@ -1947,6 +1947,7 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config) -> None:
     from src.scrapers.enrichment.skip_trace import (
         address_cache_key,
         build_pending_row_payload,
+        code_violation_skip_trace_allowed,
         legacy_cache_locality,
     )
     from src.utils.address_intel import street_is_placeholder
@@ -2040,7 +2041,14 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config) -> None:
     enqueued_advanced = 0
 
     skipped_ineligible = 0
+    skipped_atip_policy = 0
     for rec in eligible:
+        # An ATIP-named Tacoma owner may be shown, not spent on: counted and reported on
+        # its own line, never as "no traceable owner name", which would send whoever
+        # reads the job log looking for missing data instead of a switch (Codex).
+        if not code_violation_skip_trace_allowed(rec):
+            skipped_atip_policy += 1
+            continue
         # Parse the combined address to get canonical city/state for the cache key
         payload = build_pending_row_payload(rec)
         if payload is None:
@@ -2147,6 +2155,15 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config) -> None:
     except Exception:
         db.rollback()
         db.commit()
+
+    if skipped_atip_policy:
+        _publish_log(
+            r, job_id, "info",
+            f"Skip trace skipped for {skipped_atip_policy} Tacoma code violation lead(s): "
+            "their owner name comes from the county's property record, which we may show "
+            "but not use for a paid contact lookup. The leads keep their owner name.",
+            db=db,
+        )
 
     if skipped_ineligible:
         _publish_log(

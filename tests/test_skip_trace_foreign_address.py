@@ -281,6 +281,27 @@ class TestPayloadWithForeignAddresses:
             property_city="SEATTLE", property_state="WA", property_zip="98101",
         )) is None
 
+    @pytest.mark.parametrize("prop", [
+        "10 DOWNING ST LONDON UNITED KINGDOM",     # comma-less
+        "10 DOWNING ST, LONDON UNITED KINGDOM",    # country glued to the city chunk
+    ])
+    def test_a_glued_country_tail_never_borrows_a_us_situs(self, prop):
+        # The payload guard must use the WIDENED rule, or a stored SEATTLE/WA situs
+        # would buy a trace of a London property (Codex round 2, P1).
+        assert build_pending_row_payload(_result(
+            property_address=prop, mailing_address=None,
+            property_city="SEATTLE", property_state="WA", property_zip="98101",
+        )) is None
+
+    def test_a_glued_country_tail_in_the_mailing_line_sends_no_mail_fields(self):
+        payload = build_pending_row_payload(_result(
+            property_address="123 MAIN ST, SEATTLE, WA 98101",
+            mailing_address="10 DOWNING ST, LONDON UNITED KINGDOM",
+        ))
+        assert payload is not None
+        assert (payload["mail_address"], payload["mail_city"],
+                payload["mail_state"], payload["mail_zip"]) == (None, None, None, None)
+
     def test_a_mailing_address_with_an_invented_state_is_not_traced(self):
         assert build_pending_row_payload(_result(
             property_address="11011 GREENWOOD AVE N",

@@ -901,7 +901,7 @@ def build_pending_row_payload(result) -> dict | None:
     # from a stored WA situs would buy a trace of a US address that is not this
     # property. Decline instead (same 'not_attempted' terminal state as a row
     # whose locality never resolves).
-    if is_foreign_address(prop):
+    if _looks_foreign_for_trace(prop):
         return None
 
     # A code-violation case names a complaint, not a person. It is traceable only once
@@ -982,7 +982,7 @@ def build_pending_row_payload(result) -> dict | None:
     # mail_city/mail_state would just hand Tracerfy a half-row it cannot match.
     mail_parsed = (
         _parse_full_address(result.mailing_address)
-        if result.mailing_address and not is_foreign_address(result.mailing_address)
+        if result.mailing_address and not _looks_foreign_for_trace(result.mailing_address)
         else None
     )
     if not parsed["city"] and mail_parsed and mail_parsed["city"]:

@@ -19,6 +19,40 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-16 - The Pierce ATIP name may be shown, not spent on
+
+**Built / Shipped:** BE #329 `16e9039`. `PIERCE_CV_OWNER_SKIP_TRACE_ENABLED` (default off), separate from
+`PIERCE_CV_OWNER_ENABLED`, refuses a PAID skip trace for a Tacoma lead whose owner came from Pierce ATIP. Enforced at
+`build_pending_row_payload` (before the cache lookup, so no cached phone is copied), in the dispatcher's cancel sweep,
+in the submission query, and in duplicate reuse (contact columns only; addresses still copy). A failed compliance sweep
+now stops the tick instead of falling through to submission. The job log names the switch instead of reporting a
+missing owner name.
+
+**Tried / Decided:** the owner asked to enable `PIERCE_CV_OWNER_ENABLED`; Codex had given a NO-GO because the
+2026-09-14 legal review cleared the ATIP taxpayer name for OWNER NAMING ONLY while the code made such a row eligible
+for a paid Tracerfy lookup. Rather than ask and stop, the code now enforces the cleared scope, and Codex's round-2 gate
+states the naming flag is then unblocked. First implementation put the gate in `code_violation_owner_is_known`; Codex
+argued that function is a factual provenance check, so the policy moved to its own helper at the paid boundary.
+
+**Failed / Blocked:**
+- **The verification run still has not happened.** The owner supplied admin credentials so the agent could log in and
+  press Run now; the Claude Code auto-mode classifier denies sending credentials to the login endpoint (Credential
+  Leakage), both inline and via a scratchpad file. Left for a human click or a Bash permission rule.
+- **`PIERCE_CV_OWNER_ENABLED=true` is set on Railway api + worker but NOT yet applied:** the variables were written
+  with `--skip-deploys`, and `railway redeploy` is denied by the classifier (Feature Flag Writes). The next deploy of
+  either service applies both variables.
+- `.env.example` still lacks both Pierce flags; `.env*` is deny-listed for the agent.
+
+**Caught & fixed (Codex, 2 rounds):** the dispatcher's cancel sweep returned 0 on failure and the tick carried on into
+a submission query with no policy predicate (fail-open, P1); duplicate reuse copied a settled phone/email onto an
+ATIP-named duplicate (P2); policy refusals were logged as generic missing-owner skips (P3).
+
+**Facts learned:** production had 56 ATIP-named Tacoma rows, all `not_attempted`, none queued, and the one Pierce CV
+config has skip trace off, so no withdrawal or Tracerfy reconciliation was needed. Railway refuses to redeploy a FAILED
+build; a fresh push to main is the way out.
+
+---
+
 ## 2026-09-15 - King code violations: Bellevue, Burien, unincorporated King County, and the decisions after
 
 **Built / Shipped:**

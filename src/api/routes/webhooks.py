@@ -176,8 +176,37 @@ async def tracerfy_webhook_legacy(provided_secret: str, request: Request) -> dic
     Header-first (Codex): if the header is present it is authoritative — a wrong
     header is rejected even if the path secret is right. Current Tracerfy traffic
     sends no header, so this branch is inert until migration.
+
+    KILL SWITCH. `TRACERFY_LEGACY_PATH_ENABLED` defaults True so nothing changes on
+    deploy. Set it false once Tracerfy posts to the header route: this then 410s
+    BEFORE the secret compare and before any ingestion, which retires the path
+    exposure reversibly — flip it back if a delivery fails, rather than discovering
+    the mistake after an irreversible route deletion.
+
+    Migration sequence: point Tracerfy at the header route -> set this false ->
+    rotate TRACERFY_WEBHOOK_SECRET -> confirm no `tracerfy_legacy_route_used` lines
+    for a full delivery cycle -> delete this route.
     """
     await rate_limit(request, zone="webhook")
+
+    # Secret-free by design. NEVER add the path (or `provided_secret`) to this log or
+    # to audit_log(): audit_log persists `request.url.path` into the append-only
+    # `audit_events` table (src/api/middleware/security.py:585,596 -> :551), which
+    # the app role cannot even read back to scrub. A fixed event name is enough to
+    # answer the only question that matters — is anything still using this route.
+    _logger.warning(
+        "tracerfy_legacy_route_used enabled=%s — migrate Tracerfy to the "
+        "X-Tracerfy-Webhook-Secret header; this route is deprecated",
+        settings.TRACERFY_LEGACY_PATH_ENABLED,
+    )
+
+    if not settings.TRACERFY_LEGACY_PATH_ENABLED:
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="This webhook path is retired. POST to /webhooks/tracerfy with the "
+            "X-Tracerfy-Webhook-Secret header.",
+        )
+
     header_secret = request.headers.get(_SECRET_HEADER)
     _verify_tracerfy_secret(header_secret if header_secret is not None else provided_secret)
     return await _process_tracerfy_webhook(request)

@@ -10,13 +10,20 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.auth import hash_password, verify_password
-from src.api.middleware import audit_log, rate_limit
+from src.api.middleware import audit_log, once_per, rate_limit
 from src.api.schemas import ForgotPasswordRequest, PasswordChange, ResetPasswordRequest
 from src.config import settings
 from src.db import User
 from src.utils.crypto import blind_index
 
 from .tokens import _decode_reset_token, _mint_reset_token
+
+# One password-reset email per address per 5 minutes. Chosen to cap an email bomb
+# at ~12/hour per inbox instead of unlimited, while staying usable for someone who
+# genuinely deleted the mail and retries. Longer would start punishing real users;
+# the reset TOKEN itself lives 30 minutes, so a resend inside this window would
+# not have invalidated the link they already have.
+_RESET_EMAIL_MIN_INTERVAL = 300
 
 
 async def change_user_password(
@@ -113,7 +120,32 @@ async def forgot_user_password(
     )
     user = result.scalar_one_or_none()
 
-    if user is not None:
+    # Email-bomb guard. The per-IP limiter on line 106 is NOT load-bearing right
+    # now: Railway's mesh moved to 100.64.0.0/10 (CGNAT), which is absent from
+    # _TRUSTED_PROXY_NETWORKS, so client_ip() returns a peer address that rotates
+    # per request and every call mints a fresh bucket. Until the origin is closed
+    # to non-Cloudflare traffic we cannot trust ANY IP-derived key — the Railway
+    # origin is currently reachable directly, so X-Forwarded-For is forgeable and
+    # "fixing" the IP key would hand an attacker unlimited forged keys.
+    #
+    # once_per keys on the address instead, which an attacker cannot rotate, and
+    # fails CLOSED on a Redis outage (suppressing a reset email beats letting a
+    # bomb through). Without this, anyone could drive unlimited reset mail at a
+    # known user's inbox and burn Resend quota and sender reputation.
+    #
+    # It gates the SEND ONLY. The response below is the same generic 200 either
+    # way, with no distinguishing timing, so this leaks nothing about existence
+    # and gives an attacker no signal that the bucket is full. Deliberately NOT a
+    # 429: a visible per-address rejection would both leak existence and let
+    # someone lock a real user out of password reset. (Codex)
+    # `user` is deliberately NOT reassigned here — audit_log below must still
+    # record the real user id for a suppressed attempt, otherwise a bombing run
+    # becomes invisible to ops at exactly the moment it matters.
+    may_send = user is not None and await once_per(
+        f"pwreset:{blind_index(body.email)}", _RESET_EMAIL_MIN_INTERVAL
+    )
+
+    if may_send:
         token = _mint_reset_token(user.id)
         # Token in the URL FRAGMENT (#), not the query (?): a fragment is never
         # sent to a server (RFC 3986 §3.5), so this bearer reset token can't leak

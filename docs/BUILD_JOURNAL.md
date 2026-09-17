@@ -19,6 +19,88 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-17 — The OpenAPI gate was never about the schema, and a retention purge built blind
+
+> Continues the earlier 2026-09-17 entry, which sits at the BOTTOM of this file rather
+> than the top. All work on `fix/openapi-drift-from-docstring` (BE #336).
+
+**Built / Shipped:**
+- `11c7cc8` — merged `origin/main` in and resolved `webhooks.py` to the branch's short
+  docstring. This is the whole CI fix. **No schema regeneration was needed or made.**
+- `5c58b5f` — committed the phase 1 compliance audit (1,713 lines across 4 files) which
+  `git log --all` found on **no ref at all**; it was untracked in the shared OneDrive
+  checkout, and the handoff points the next session at three of those files by name.
+- `32e8407` / `84d4422` / `d318f36` / `5bdc18b` — the §7 retention purge, all five phases:
+  settings, migration `096`, `scheduler_helpers/retention.py`, daily Beat entry,
+  `SkipTraceStatus.PURGED`, the `DELETE ON skip_trace_cache` grant in all three
+  drift-guarded files, and `DataExporter.delete_from_r2()` plus the aged-export sweep.
+- `df56ccd`, `f2cf0a6` — review fixes (below).
+
+**Tried / Decided:**
+- Owner chose retention option **(c)**: keep lead rows (county public record), purge only
+  vendor-sourced contact PII. And **both** belt and suspenders for R2.
+- Cache ages off the **90-day reuse window, not 365**. `enrich.py`'s TTL check is read-time
+  only and never deletes, so a row past it can never be used again; keeping an unusable row
+  full of `raw_response` for another 275 days buys nothing.
+- **Daily, not weekly.** Weekly leaves PII in place up to ~7 days past the boundary we
+  publish, and "365 days" should not quietly mean 372.
+- Ships **OFF** (`RETENTION_PURGE_ENABLED=false`, `RETENTION_PURGE_DRY_RUN=true`) because the
+  deletion is irreversible and the clock question is still with counsel.
+
+**Failed / Blocked:**
+- **The handoff's root cause was wrong, and so was its fix.** It said the docstring theory was
+  disproven and the cause unidentified. The theory was right; the *branch base* was wrong.
+- **GitHub Actions is billing-blocked** since ~10:24 UTC — every job fails in ~1s without
+  starting. Nothing in this session is test-verified. Owner action.
+- **Handoff Step 2 is impossible as written.** Private repo on a free plan: branch protection
+  AND rulesets both `403 Upgrade to GitHub Pro`. `Test` cannot be made required.
+- Codex's first, broad implementation review was **killed for low memory**. A narrower rerun
+  with the file inlined completed. Its partial trace still earned its keep (see below).
+
+**Caught & fixed:**
+- **An in-flight race (mine, phase 4 audit).** A row traced long ago and since re-queued
+  carries old, past-retention PII while in `queued`/`submitted`. Purging it flips its status,
+  and `tracerfy_ingest.py:780` only accepts a result for a row still in those states — so a
+  Tracerfy lookup we **paid for** would be silently discarded.
+- **Codex HIGH — the export sweep could clobber a fresh key.** A commit and a network round
+  trip sit between selecting an aged export and clearing its key; a job re-exported in that gap
+  would have its NEW key nulled while the file stayed in R2. Both clears are now conditional on
+  the key actually deleted.
+- **Codex MEDIUM — the drain stopped on a SHORT batch**, but `FOR UPDATE SKIP LOCKED` returns
+  short whenever another transaction holds rows, so a few locked rows would abandon everything
+  behind them. Stops only on an empty batch now.
+- **A latent bug, incidentally.** `scripts/purge_skip_trace_cache.py` issues
+  `DELETE FROM skip_trace_cache` as `bridgeleads_system`, which held no DELETE on that table
+  until phase 3. It would have failed with `InsufficientPrivilege` since the RLS cutover.
+
+**Pending / Handoff:**
+- **Owner:** clear the Actions billing block; enable in two steps (dry run first, read the
+  counts, then enforce); add the R2 lifecycle rule; add six settings to `.env.example`
+  (deny-ruled here). Runbook §5a-5f.
+- **Counsel:** D1 (what the clock runs from) and D4 (below), answered together. Plus §7 still
+  promises deletion of "lead records" while we delete the data inside them.
+- Nothing here has executed against a real database. The SQL is reviewed, not proven.
+
+**Facts learned:**
+- **CI builds `refs/pull/N/merge`, not your branch.** A squash-merged upstream PR leaves its
+  content on a follow-up branch without ancestry, so git reads your removal and their addition
+  as unrelated edits and merges **both**. Reproduce with
+  `git merge origin/main --no-commit --no-ff` before believing a PR fix failed.
+- **A 1s CI failure with no steps is a billing block, not a code defect.** `gh pr checks`
+  renders it identically to a test failure; only the duration and the run annotation differ.
+- **`skip_trace_attempted_at` means "last ATTEMPT", not "when we obtained this data"** — and
+  three sites (`skip_trace_dispatcher.py:569`, `:880`, `tracerfy_ingest.py:782`) stamp it to
+  now() on the `errored` transition while acquiring nothing. So 400-day-old PII on a re-traced
+  row that errors gets a fresh full window. Re-queueing alone does NOT stamp it
+  (`enrich.py:2146`), which is what makes the in-flight guard safe. Logged as D4; the real fix
+  is a dedicated "PII obtained at" column, deliberately not attempted blind on the paid ingest
+  path with no test able to run.
+- `skip_trace_status` is a plain `str`, not an enum, and its value list lives in a Python
+  comment that never reaches OpenAPI — adding `purged` changes no API contract and needs no
+  frontend PR.
+
+---
+
 ## 2026-09-16 - A design audit of the live app, and seven findings that did not survive checking
 
 > **Scope:** every code change landed in the **frontend** repo `bridgeleads-web`. **No backend

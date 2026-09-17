@@ -1267,7 +1267,11 @@ class ResultRow(BaseModel):
     # (= phones[0]/emails[0]); these surface the extras for display.
     phones: list[PhoneContact] | None = None
     emails: list[str] | None = None
-    skip_trace_status: str = "not_attempted"  # not_attempted|queued|submitted|hit|miss|errored
+    # not_attempted|queued|submitted|hit|miss|errored|purged
+    # 'purged' is terminal: this row WAS a hit, and its contact PII has since been
+    # deleted for age under the Privacy Policy §7 retention sweep. Treat it as
+    # "no contact data", not as "never traced" — the trace happened and was paid for.
+    skip_trace_status: str = "not_attempted"
     skip_trace_attempted_at: datetime | None = None
     is_duplicate: bool = False
     # Phase 4: structured tax-delinquency fields (King tax_delinquent only; NULL

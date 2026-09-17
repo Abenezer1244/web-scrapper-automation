@@ -65,9 +65,19 @@ _PII_COLUMNS = (
 # no PII ever returned) are never touched at all. Without them the task would
 # re-UPDATE already-NULL rows every single day, generating dead tuples forever
 # for no reason.
+#
+# IN-FLIGHT ROWS ARE EXCLUDED, and this one is not theoretical. A row that was
+# traced long ago and has since been RE-QUEUED carries old PII (past retention)
+# while sitting in queued/submitted. Purging it would flip its status to 'purged',
+# and tracerfy_ingest.py:780 only accepts a provider result for a row still
+# IN ('queued','submitted') -- so the callback would match nothing and a lookup we
+# PAID for would be silently discarded. Retention must never race the dispatcher.
+# These rows purge on a later run, once the trace lands and the clock still says
+# they are due.
 _ELIGIBLE = (
     "skip_trace_attempted_at < :cutoff "
     "AND skip_trace_status <> :purged "
+    "AND skip_trace_status NOT IN ('queued', 'submitted') "
     "AND (phone IS NOT NULL OR email IS NOT NULL "
     "     OR phones IS NOT NULL OR emails IS NOT NULL)"
 )

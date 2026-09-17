@@ -297,6 +297,39 @@ class DataExporter:
         _logger.info("Uploaded to R2: %s", object_key)
         return object_key
 
+    def delete_from_r2(self, object_key: str) -> bool:
+        """Delete an R2 object. Returns True if it is gone (deleted or absent).
+
+        Added for the Privacy Policy §7 retention sweep. Until this existed the
+        exporter could put lead exports into R2 and hand out download URLs, but
+        had no way to remove one — so every delivered CSV, phone numbers and all,
+        was retained forever regardless of what the policy promised.
+
+        Treats 404 as success: the goal is "this object is not in R2", and an
+        already-absent key satisfies it. That keeps the sweep idempotent, which
+        matters because it re-runs daily and may retry after a partial failure.
+
+        NOTE: if the bucket has object versioning enabled, deleting the current
+        object may leave prior versions readable. Versioning is a bucket-level
+        setting outside this code path; the R2 lifecycle rule is what covers it.
+        """
+        if ".." in object_key or object_key.startswith("/"):
+            raise ValueError(f"Invalid object key: {object_key}")
+
+        resp = _requests.delete(
+            f"{_r2_api_base()}/objects/{object_key}", headers=_r2_headers(), timeout=60
+        )
+        if resp.status_code in (200, 204, 404):
+            _logger.info("Deleted from R2: %s (status %s)", object_key, resp.status_code)
+            return True
+        # Do not raise: one unreachable object must not abort a retention sweep
+        # that still has thousands to clear. The caller counts failures and the
+        # key is left in place so the next run retries it.
+        _logger.error(
+            "R2 delete failed for %s (%s): %s", object_key, resp.status_code, resp.text[:200]
+        )
+        return False
+
     def get_download_url(self, object_key: str, expires_in: int = 3600) -> str:
         """Generate a temporary download URL for an R2 object.
 

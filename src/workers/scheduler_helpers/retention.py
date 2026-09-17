@@ -110,6 +110,29 @@ _PURGE_CACHE = text(
 
 _COUNT_CACHE = text("SELECT count(*) FROM skip_trace_cache WHERE fetched_at < :cutoff")
 
+# Delivered exports. These are the copies that matter most and are easiest to
+# forget: a CSV in R2 holds the same phone numbers as the row, is reachable by
+# anyone with a signed link, and NOTHING has ever deleted one. Both key columns
+# are swept; a job's own export and a batch run's combined CSV are equally a copy.
+# We age off finished_at (when the file was produced), falling back to created_at
+# for a job that never recorded a finish.
+_AGED_EXPORTS = text(
+    "SELECT id, export_key FROM jobs "
+    "WHERE export_key IS NOT NULL "
+    "  AND COALESCE(finished_at, created_at) < :cutoff "
+    "ORDER BY COALESCE(finished_at, created_at) LIMIT :batch"
+)
+_CLEAR_EXPORT = text("UPDATE jobs SET export_key = NULL WHERE id = :id")
+
+_AGED_BATCH_EXPORTS = text(
+    "SELECT id, combined_export_key FROM batch_runs "
+    "WHERE combined_export_key IS NOT NULL AND created_at < :cutoff "
+    "ORDER BY created_at LIMIT :batch"
+)
+_CLEAR_BATCH_EXPORT = text(
+    "UPDATE batch_runs SET combined_export_key = NULL WHERE id = :id"
+)
+
 
 def _cutoff(days: int) -> datetime:
     return datetime.now(UTC) - timedelta(days=days)
@@ -141,6 +164,39 @@ def _drain(db, stmt, params: dict, batch: int) -> tuple[int, bool]:
     return total, True
 
 
+def _sweep_exports(db, stmt, clear_stmt, cutoff: datetime, batch: int) -> tuple[int, int]:
+    """Delete aged R2 export objects, clearing the key only once the object is gone.
+
+    Order matters and is deliberate: delete the object FIRST, and NULL the column
+    only on success. The reverse would lose the key while the file stayed in R2,
+    leaving an orphaned copy of someone's phone number that nothing can ever find
+    again. A failed delete keeps the key so the next run retries it.
+
+    Returns (objects deleted, delete failures).
+    """
+    from src.utils.data_exporter import DataExporter
+
+    exporter = DataExporter()
+    deleted = failed = 0
+    _apply_timeouts(db)
+    rows = db.execute(stmt, {"cutoff": cutoff, "batch": batch}).all()
+    db.commit()
+    for row_id, key in rows:
+        try:
+            ok = exporter.delete_from_r2(key)
+        except Exception:
+            _logger.exception("retention: R2 delete raised for key on row %s", row_id)
+            ok = False
+        if not ok:
+            failed += 1
+            continue
+        _apply_timeouts(db)
+        db.execute(clear_stmt, {"id": row_id})
+        db.commit()
+        deleted += 1
+    return deleted, failed
+
+
 def _purge_skip_trace_pii_impl() -> None:
     """Purge aged skip-trace PII from `results` and `skip_trace_cache`. Daily."""
     if not settings.RETENTION_PURGE_ENABLED:
@@ -150,6 +206,7 @@ def _purge_skip_trace_pii_impl() -> None:
     purged = SkipTraceStatus.PURGED.value
     results_cutoff = _cutoff(settings.SKIP_TRACE_PII_RETENTION_DAYS)
     cache_cutoff = _cutoff(settings.SKIP_TRACE_CACHE_RETENTION_DAYS)
+    export_cutoff = _cutoff(settings.EXPORT_RETENTION_DAYS)
     started = datetime.now(UTC)
 
     # Cross-tenant by design: retention is an obligation we owe regardless of
@@ -164,12 +221,28 @@ def _purge_skip_trace_pii_impl() -> None:
             cache_eligible = db.execute(
                 _COUNT_CACHE, {"cutoff": cache_cutoff}
             ).scalar_one()
+            exports = db.execute(
+                text(
+                    "SELECT count(*) FROM jobs WHERE export_key IS NOT NULL "
+                    "AND COALESCE(finished_at, created_at) < :cutoff"
+                ),
+                {"cutoff": export_cutoff},
+            ).scalar_one()
+            batch_exports = db.execute(
+                text(
+                    "SELECT count(*) FROM batch_runs WHERE combined_export_key IS NOT NULL "
+                    "AND created_at < :cutoff"
+                ),
+                {"cutoff": export_cutoff},
+            ).scalar_one()
             db.commit()
             _logger.warning(
                 "retention purge DRY RUN (nothing written): would clear PII on %d "
-                "results rows attempted before %s, and delete %d skip_trace_cache "
-                "rows fetched before %s. Set RETENTION_PURGE_DRY_RUN=false to enforce.",
+                "results rows attempted before %s, delete %d skip_trace_cache rows "
+                "fetched before %s, and delete %d job + %d batch export objects from "
+                "R2 older than %s. Set RETENTION_PURGE_DRY_RUN=false to enforce.",
                 eligible, results_cutoff.date(), cache_eligible, cache_cutoff.date(),
+                exports, batch_exports, export_cutoff.date(),
             )
             return
 
@@ -178,6 +251,12 @@ def _purge_skip_trace_pii_impl() -> None:
         )
         cache_rows, cache_capped = _drain(
             db, _PURGE_CACHE, {"cutoff": cache_cutoff}, batch
+        )
+        exports_deleted, export_failures = _sweep_exports(
+            db, _AGED_EXPORTS, _CLEAR_EXPORT, export_cutoff, batch
+        )
+        batch_deleted, batch_failures = _sweep_exports(
+            db, _AGED_BATCH_EXPORTS, _CLEAR_BATCH_EXPORT, export_cutoff, batch
         )
 
         # What is LEFT is the number that matters for a compliance promise. A
@@ -195,9 +274,16 @@ def _purge_skip_trace_pii_impl() -> None:
     elapsed = (datetime.now(UTC) - started).total_seconds()
     _logger.info(
         "retention purge: cleared PII on %d results rows, deleted %d "
-        "skip_trace_cache rows in %.1fs",
-        rows, cache_rows, elapsed,
+        "skip_trace_cache rows, deleted %d job + %d batch export objects in %.1fs",
+        rows, cache_rows, exports_deleted, batch_deleted, elapsed,
     )
+    if export_failures or batch_failures:
+        _logger.error(
+            "retention purge: %d job + %d batch export objects could NOT be deleted "
+            "from R2. Their keys were left in place so the next run retries them, but "
+            "until then those files still hold contact PII past its retention window.",
+            export_failures, batch_failures,
+        )
     if remaining:
         _logger.error(
             "retention purge INCOMPLETE: %d results rows are past retention and "

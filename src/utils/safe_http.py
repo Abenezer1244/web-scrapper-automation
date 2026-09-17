@@ -48,6 +48,55 @@ def same_origin(url: str, ref: str) -> bool:
     )
 
 
+# Byte budget for an in-memory response body. County portals and GIS endpoints
+# return HTML/JSON measured in KB to low MB; this bounds a hostile or malformed
+# source streaming an endless body, or a decompression bomb, into worker memory.
+# Deliberately NOT applied to bulk county files — those go through
+# safe_download_to_file(), which already streams to disk under its own cap
+# (_stream_capped). Overridable per call for a known-large endpoint.
+_MAX_RESPONSE_BYTES = 16 * 1024 * 1024
+
+
+def _read_capped(resp: requests.Response, max_bytes: int) -> requests.Response:
+    """Materialize a streamed response under a byte budget.
+
+    Reads via iter_content and stores the result on the Response, so callers
+    keep using .text / .json() / .content exactly as before — the cap is
+    invisible until it trips, at which point the connection is closed and a
+    ValueError is raised rather than letting the body exhaust memory.
+
+    Checks the advertised Content-Length first as a cheap reject, but does NOT
+    trust it: a hostile server can understate or omit it, so the streamed read
+    is the authoritative limit.
+    """
+    declared = resp.headers.get("Content-Length")
+    if declared and declared.isdigit() and int(declared) > max_bytes:
+        resp.close()
+        raise ValueError(
+            f"Response body too large: Content-Length {declared} exceeds {max_bytes}"
+        )
+
+    chunks: list[bytes] = []
+    total = 0
+    try:
+        for chunk in resp.iter_content(chunk_size=64 * 1024):
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError(
+                    f"Response body exceeded {max_bytes} bytes while streaming"
+                )
+            chunks.append(chunk)
+    finally:
+        if total > max_bytes:
+            resp.close()
+
+    resp._content = b"".join(chunks)  # noqa: SLF001 — the supported way to back .text/.json()
+    resp._content_consumed = True  # noqa: SLF001
+    return resp
+
+
 def safe_get(
     url: str,
     *,
@@ -57,6 +106,7 @@ def safe_get(
     cookies: dict | None = None,
     headers: dict | None = None,
     timeout: int = 10,
+    max_bytes: int = _MAX_RESPONSE_BYTES,
 ) -> requests.Response:
     """SSRF-guarded ``requests.get``. Raises ``ValueError`` if not permitted.
 
@@ -72,14 +122,16 @@ def safe_get(
     validate_scraping_target(url, require_allowlisted=require_allowlisted, resolve=True)
     if same_origin_as is not None and not same_origin(url, same_origin_as):
         raise ValueError("Refusing to send request to a different origin")
-    return _SESSION.get(
+    resp = _SESSION.get(
         url,
         params=params,
         cookies=cookies,
         headers=headers,
         timeout=timeout,
         allow_redirects=False,  # a 3xx must not bounce us to an internal host
+        stream=True,  # so _read_capped can abort before the body exhausts memory
     )
+    return _read_capped(resp, max_bytes)
 
 
 _REDIRECT_CODES = (301, 302, 303, 307, 308)
@@ -93,6 +145,7 @@ def safe_get_following(
     headers: dict | None = None,
     timeout: int = 10,
     max_redirects: int = 5,
+    max_bytes: int = _MAX_RESPONSE_BYTES,
 ) -> requests.Response:
     """Like ``safe_get`` but follows redirects, re-validating EVERY hop.
 
@@ -111,14 +164,20 @@ def safe_get_following(
         if require_https and urlparse(current).scheme != "https":
             raise ValueError("HTTPS required for this fetch")
         validate_scraping_target(current, require_allowlisted=require_allowlisted, resolve=True)
-        resp = _SESSION.get(current, headers=headers, timeout=timeout, allow_redirects=False)
+        resp = _SESSION.get(
+            current, headers=headers, timeout=timeout, allow_redirects=False, stream=True
+        )
         if resp.status_code in _REDIRECT_CODES:
             location = resp.headers.get("Location")
             if not location:
-                return resp
+                return _read_capped(resp, max_bytes)
+            # A redirect body is never used — close it rather than reading, so a
+            # hostile 302 with a huge body cannot be used to burn worker memory
+            # across every hop of the redirect chain.
+            resp.close()
             current = urljoin(current, location)  # resolve relative Location
             continue
-        return resp
+        return _read_capped(resp, max_bytes)
     raise ValueError("Too many redirects")
 
 

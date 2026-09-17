@@ -354,6 +354,15 @@ class Settings(BaseSettings):
     # 5 min). Each batch can hold thousands of rows, so throughput is fine;
     # the constraint is burst count, not total rows.
     SKIP_TRACE_MAX_BATCHES_PER_TICK: int = 2
+    # Rolling-24h ceiling on rows submitted to Tracerfy across ALL tenants.
+    # 0 = disabled (the default, so deploying the breaker changes nothing until
+    # an operator chooses a number). Every lookup costs real money and the only
+    # other ceiling is the prepaid balance returning 402 — i.e. "until the money
+    # runs out". Checked at the top of the dispatcher tick, before any claim, so
+    # tripping it can only decline to start work: queued rows are untouched and
+    # resume once the window clears. Set this to a comfortable multiple of your
+    # busiest legitimate day, not to your average.
+    SKIP_TRACE_DAILY_ROW_CAP: int = 0
 
     @field_validator("TRACERFY_WEBHOOK_SECRET")
     @classmethod

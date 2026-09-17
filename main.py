@@ -108,20 +108,45 @@ async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSON
     return JSONResponse(status_code=500, content={"detail": "Internal error", "ref": ref})
 
 
-# ─── Logging: strip tokens from access logs ──────────────────────────────────
+# ─── Logging: strip secrets from access logs ─────────────────────────────────
 
 import re  # noqa: E402 — section-local; kept beside the filter it exists for
 
 _TOKEN_RE = re.compile(r"token=[A-Za-z0-9_\-\.]+")
 
+# The legacy `POST /webhooks/tracerfy/{provided_secret}` route carries the shared
+# secret in the URL PATH, so uvicorn's access line logs a live credential in
+# cleartext on every delivery — and Tracerfy currently sends no header, so that is
+# the route in active use. `_TOKEN_RE` does not cover it (it only matches a
+# `token=` query param) and logger.py has no URL-path rule.
+#
+# MITIGATION, NOT REMEDIATION. This stops new access-log lines from carrying the
+# secret. It does NOT undo the exposure: the secret is already in historical logs,
+# and any proxy in front of the app (Railway's edge) logs the URL independently of
+# this filter. The fix is to migrate Tracerfy to the `X-Tracerfy-Webhook-Secret`
+# header (already authoritative when present), rotate TRACERFY_WEBHOOK_SECRET, then
+# delete the legacy route in src/api/routes/webhooks.py.
+_PATH_SECRET_RE = re.compile(r"(/webhooks/tracerfy/)[^/\s?\"']+")
+
+_ACCESS_LOG_REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (_TOKEN_RE, "token=REDACTED"),
+    (_PATH_SECRET_RE, r"\1[REDACTED]"),
+)
+
+
+def _scrub_access_log_value(value: str) -> str:
+    for pattern, replacement in _ACCESS_LOG_REDACTIONS:
+        value = pattern.sub(replacement, value)
+    return value
+
 
 class _StripTokenFilter(logging.Filter):
-    """Redact download tokens from uvicorn access log lines."""
+    """Redact download tokens and path-borne secrets from uvicorn access lines."""
 
     def filter(self, record: logging.LogRecord) -> bool:
         if hasattr(record, "args") and record.args:
             record.args = tuple(
-                _TOKEN_RE.sub("token=REDACTED", str(a)) if isinstance(a, str) else a
+                _scrub_access_log_value(str(a)) if isinstance(a, str) else a
                 for a in record.args
             )
         return True

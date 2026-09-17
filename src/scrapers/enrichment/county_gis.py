@@ -309,14 +309,19 @@ def enrich_parcel_gis(
     ):
         result = _query_gis_by_name(owner_name, gis_config, county_key)
         if result.get("property_address"):
-            _logger.info("GIS name-based fallback succeeded for %s", owner_name)
+            # PII: never log owner_name — these are third parties who never signed
+            # up, and the log file has no rotation or retention. county_key keeps the
+            # operational signal ("the name fallback worked here") without the person.
+            # Same reasoning as tasks_helpers/enrich.py's skip-trace logging.
+            _logger.info("GIS name-based fallback succeeded for %s", county_key)
             return result
 
     # WA statewide name-based fallback when parcel_id is None
     if state.upper() == "WA" and not parcel_id and owner_name:
         result = _query_wa_statewide_by_name(owner_name, county)
         if result.get("property_address"):
-            _logger.info("WA statewide name search succeeded for %s", owner_name)
+            # PII: county, not owner_name (see the note on the fallback above).
+            _logger.info("WA statewide name search succeeded for %s", county)
             return result
 
     # Nothing located the property. The county's mailing address is still a real
@@ -412,7 +417,8 @@ def _query_gis_by_name(owner_name: str, gis_config: dict, county_key: str) -> di
         return _parse_gis_response(data, gis_config)
 
     except Exception as exc:
-        _logger.warning("GIS name search error for %s: %s", owner_name, str(exc)[:60])
+        # PII: county_key, not owner_name — the exception text carries the diagnosis.
+        _logger.warning("GIS name search error for %s: %s", county_key, str(exc)[:60])
         return _empty()
 
 

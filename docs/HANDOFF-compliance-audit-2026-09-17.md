@@ -38,7 +38,18 @@ not a required status check** on `web-scrapper-automation` and `gh pr merge --au
 only gates on required checks. Do not repeat this: always `gh pr checks <n>` and wait,
 or get `Test` made required.
 
-**The unblock is one command, but not in this environment.** See §6.
+**ROOT CAUSE FOUND AND FIXED 2026-09-17 (next session).** It was never a stale
+committed schema. `schema/openapi.json` was correct the whole time; regenerating it
+in a pinned env produces a byte-identical file. What was stale was the CI *merge*
+commit. See the correction in §5.2 and §6 Step 1.
+
+**NEW BLOCKER (owner): GitHub Actions is billing-blocked.** Since ~10:24 UTC every
+job fails in ~1s, never starting, with: *"The job was not started because recent
+account payments have failed or your spending limit needs to be increased."* This is
+an account-level block, not a code problem. **No CI run can go green until the owner
+clears it** (GitHub -> Settings -> Billing & plans). Runs before 10:24 executed
+normally, so a 1s failure means billing, not a real test failure - always check
+`gh run view <id>` annotations before reading a red X as a code defect.
 
 ---
 
@@ -80,14 +91,23 @@ FE #152 was verified by fetching the deployed HTML: `Skip to content`, `id="main
 ## 5. Failed attempts — read this so you do not repeat them
 
 1. **Merged a red build.** As in §2. `--auto` does not gate on non-required checks.
-2. **The docstring theory for the OpenAPI drift was WRONG.** I assumed FastAPI
-   publishing the route docstring as its OpenAPI `description` caused the staleness
-   (I had expanded that docstring in #335). #336 restores it **byte-for-byte**
-   (verified by diff against `4d2b926`) and **CI still failed**. So the docstring is
-   not the cause and **the root cause is still unidentified**. #336 is still worth
-   landing on its own merits — runbook detail does not belong in a public API
-   description the frontend type generator consumes — but it is
-   **necessary-but-insufficient**.
+2. ~~**The docstring theory for the OpenAPI drift was WRONG.**~~ **CORRECTED
+   2026-09-17: the docstring theory was RIGHT. The *branch base* was wrong.**
+   The original reasoning (FastAPI publishes a route docstring as its OpenAPI
+   `description`, so expanding it in #335 made the schema stale) was correct.
+   Restoring it byte-for-byte on the #336 branch did not turn CI green for a
+   reason that has nothing to do with the theory: **CI does not build the branch,
+   it builds the branch merged with `main`.** #335 was *squash-merged*, so its
+   content was already on the #336 branch but its commit was **not an ancestor**.
+   Git therefore read main's long docstring as a new addition and #336's
+   docstring->comment move as an unrelated edit, and textually auto-merged
+   **both** - the merge tree carried the long docstring *and* the comment block
+   saying not to put it there. That merge tree generated the long `description`,
+   and the gate correctly said STALE.
+   **Lesson:** when a fix "does not work" on a PR, reproduce what CI actually
+   builds (`git merge origin/main --no-commit --no-ff`), not what you committed.
+   A squash-merged upstream PR makes every follow-up branch a silent-conflict
+   candidate - see the `auto_merge_is_only_textual` landmine.
 3. **I could not regenerate the schema.** `.venv-schema/Scripts/python` points at a
    removed anaconda install (`No Python at 'C:\Users\Windows\anaconda3\python.exe'`),
    the `py` launcher is broken too (`Failed to import encodings module`), and
@@ -139,16 +159,31 @@ FE #152 was verified by fetching the deployed HTML: `Skip to content`, `id="main
 
 ## 6. Next steps, in order
 
-**Step 1 — unstick CI (do this first).**
-In an environment with a working Python and the app deps:
+**Step 1 - unstick CI. DONE in code (`11c7cc8`), blocked on billing.**
+No schema regeneration was needed or made: the committed `schema/openapi.json` was
+already correct. The fix was to merge `origin/main` into the branch and **resolve
+`webhooks.py` to the branch's version** (short docstring + comments), which is what
+the textual auto-merge got wrong. Verified it loses nothing: against `origin/main`
+the branch differs only in two docs files and that docstring move; `settings.py` and
+the kill-switch code are byte-identical on both sides.
+
+Verified locally in a faithful env before pushing - python 3.12 + `requirements.txt`,
+with the installed package versions **diffed against the CI run's own pip output**
+(identical except ruff/uvloop/colorama, none schema-affecting):
 ```
-python scripts/export_openapi.py      # regenerates schema/openapi.json
-git add schema/openapi.json && git commit && git push
+export_openapi.py --check  =>  OK: schema/openapi.json is up to date.
+ruff check src/ tests/     =>  All checks passed!
 ```
-Do it on the `fix/openapi-drift-from-docstring` branch so **#336 goes green and lands
-the fix together with the regenerated schema**. If it still fails, the root cause is
-genuinely unknown — bisect by diffing a freshly generated schema against the committed
-one and inspecting what actually changed. **Do not guess again.**
+Rebuild that env with:
+```
+uv venv --python 3.12 /c/Users/Windows/bl-schema
+uv pip install --python /c/Users/Windows/bl-schema/Scripts/python.exe -r requirements.txt
+```
+then run with CI-equivalent env vars (copy them out of `.github/workflows/ci-cd.yml`;
+never point `DATABASE_URL` at prod).
+
+**#336 cannot report green until the Actions billing block above is cleared.** The
+code is verified; the runner is not being allowed to start.
 
 **Step 2 — make `Test` a required status check** on `web-scrapper-automation`
 (owner, repo settings). It has now let one red build onto `main`.

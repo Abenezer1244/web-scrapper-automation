@@ -177,11 +177,30 @@ _CLEAR_BATCH_EXPORT = text(
 #
 # `download_url IS NOT NULL` keeps it idempotent. No new grant: the system role's
 # blanket UPDATE already covers this.
+# Both branches name their status explicitly (Codex, High). The long-window branch
+# was previously unconstrained, so it applied to EVERY status, including any added
+# later -- a future in-flight state would have had its link cleared by a rule that
+# never mentioned it. This table's statuses are pending|completed|errored
+# (models.py:1201); anything else is new and should not be silently swept.
+#
+# The completed branch keys off completed_at ALONE, not COALESCE. Falling back to
+# submitted_at would clear a completed row early whenever completed_at is missing,
+# and "deleted sooner than the rule says" is still the wrong answer even when the
+# direction is safe. A completed row with no completed_at is a data-integrity
+# anomaly; it is counted and reported rather than guessed at.
 _LINK_ELIGIBLE = (
     "download_url IS NOT NULL "
-    "AND ( (status = 'completed' "
-    "       AND COALESCE(completed_at, submitted_at) < :link_cutoff) "
-    "   OR COALESCE(completed_at, submitted_at) < :pii_cutoff )"
+    "AND ( (status = 'completed' AND completed_at < :link_cutoff) "
+    "   OR (status IN ('pending', 'errored') "
+    "       AND COALESCE(completed_at, submitted_at) < :pii_cutoff) )"
+)
+
+# A completed queue whose completed_at never got written. It cannot age out of the
+# short window, so its no-auth CDN link would sit there until the PII window, or
+# forever if the status set ever changes. Surfaced, never silently swept.
+_COUNT_LINK_ANOMALIES = text(
+    "SELECT count(*) FROM skip_trace_queues "
+    "WHERE download_url IS NOT NULL AND status = 'completed' AND completed_at IS NULL"
 )
 
 _PURGE_LINKS = text(
@@ -353,6 +372,7 @@ def _purge_skip_trace_pii_impl() -> None:
             _OLDEST_RESULT, {"cutoff": results_cutoff, "purged": purged}
         ).scalar()
         inflight = db.execute(_COUNT_INFLIGHT, {"cutoff": results_cutoff}).scalar_one()
+        link_anomalies = db.execute(_COUNT_LINK_ANOMALIES).scalar_one()
         db.commit()
 
     elapsed = (datetime.now(UTC) - started).total_seconds()
@@ -369,6 +389,14 @@ def _purge_skip_trace_pii_impl() -> None:
             "Expected to clear on a later run. If this count does NOT fall, the "
             "dispatcher is not settling claims and that PII is exempt indefinitely.",
             inflight,
+        )
+    if link_anomalies:
+        _logger.error(
+            "retention purge: %d skip_trace_queues rows are 'completed' with NO "
+            "completed_at and still hold a provider download link. They cannot age "
+            "out of the short window, and that link needs no auth to fetch a CSV of "
+            "traced numbers. Investigate rather than widening the predicate.",
+            link_anomalies,
         )
     if export_failures or batch_failures:
         _logger.error(

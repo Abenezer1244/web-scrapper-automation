@@ -214,51 +214,85 @@ Plan and phase detail: `tasks/todo-retention-purge.md`.
 
 ### 5g. The exact commands, in the only order that works
 
-**These are ordered deliberately. Steps 2-4 are no-ops until the code is
-deployed, because none of these settings exist in production yet.**
+**Reordered after a Codex review OF THIS RUNBOOK. Three steps below were missing
+or in the wrong place, and each would have produced a silent failure.**
 
 **1. Clear the Actions billing block.** github.com -> Settings -> Billing and
-plans. Nothing else on this list can be verified until CI can run.
+plans. Nothing else here can be verified until CI can run.
 
-**2. Get BE #336 green and merged.** `gh pr checks 336` must pass on its own; do
-NOT use `gh pr merge --auto`, which only gates on REQUIRED checks and this repo
-has none (see 5h). Merging `main` deploys.
+**2. Get counsel's answer FIRST.** Send
+`docs/legal/COUNSEL-BRIEF-retention-2026-09-17.md`. It asks three questions and
+drafts no policy text. Irreversible deletion should not begin before the reading
+it implements is confirmed, and the answer can change the predicate.
 
-**3. Turn it on in dry run.** Writes nothing; logs what it WOULD delete.
-```
-railway link                      # this worktree is not linked
-railway variables --service worker --set RETENTION_PURGE_ENABLED=true
-railway variables --service worker --set RETENTION_PURGE_DRY_RUN=true
-```
-The task runs daily at 04:10 UTC. Read the line beginning
-`retention purge DRY RUN (nothing written)`. To see it immediately rather than
-waiting for the beat:
-```
-railway run --service worker python -c "from src.workers.scheduler import purge_skip_trace_pii; purge_skip_trace_pii()"
-```
+**3. Get BE #336 green and merge it.** `gh pr checks 336` must pass on its own. Do
+NOT use `gh pr merge --auto`: it gates only on REQUIRED checks and this repo has
+none (see 5h). Merging `main` deploys.
 
-**4. Read the counts, then enforce.** Only when the numbers look right:
-```
-railway variables --service worker --set RETENTION_PURGE_DRY_RUN=false
-```
-There is no undo.
+**4. RE-RUN THE GRANTS. Nothing does this on deploy.** (Codex, High - this step
+was missing entirely.) The sweep DELETEs `skip_trace_cache`, and that grant is new
+in this change. Deploy runs `alembic upgrade head` and nothing else, so without
+this the sweep fails with `InsufficientPrivilege` - which is exactly how this repo
+stranded 16,761 dedup claims on `delivered_records`, silently.
 
-**5. The R2 lifecycle rule** (do this whether or not you do step 4 -- it is the
-only thing that catches an export uploaded moments after a purge):
-```
-railway run --service worker python scripts/set_r2_lifecycle.py           # show
-railway run --service worker python scripts/set_r2_lifecycle.py --apply   # write
-```
-Idempotent. Expires current AND noncurrent versions (with versioning on,
-expiring only the current object leaves the old one fetchable) and aborts stale
-multipart uploads. Credentials stay in Railway; they are never printed.
+    railway run --service worker bash -c "PYTHONPATH=. python scripts/_cutover_step2_grants_policies.py"
 
-**6. Counsel.** Send `docs/legal/COUNSEL-BRIEF-retention-2026-09-17.md`. It asks
-three questions (what the clock runs from, whether retention must run from
-acquisition rather than last attempt, and whether §7's "lead records" wording
-matches what we now do) and contains no drafted policy text.
+**5. Run the preflight. One command, and it gates everything above.**
 
----
+    railway run --service worker python scripts/verify_retention_ready.py
+
+Read-only, changes nothing, exits non-zero if anything is wrong. It checks the
+four things a deploy does NOT do for you and that all fail silently: migration
+096's index exists AND is valid (`CREATE INDEX CONCURRENTLY` can fail partway and
+leave an INVALID index, and the sweep will happily run without it), the
+`skip_trace_cache` DELETE grant, the `results` UPDATE grant, the beat entry being
+registered in the deployed worker, and the R2 lifecycle rule. It also prints how
+many rows are actually waiting, so step 7's dry-run number has something to be
+checked against.
+
+Do not proceed while it says `NOT READY`.
+
+**6. Apply the R2 lifecycle rule BEFORE enabling the purge.** (Codex, High - it
+used to be last.) The rule is the only thing that catches an export uploaded
+moments after a purge commits, so enabling deletion first leaves that race open
+for the whole interval between the two steps.
+
+    railway run --service worker python scripts/set_r2_lifecycle.py
+    railway run --service worker python scripts/set_r2_lifecycle.py --apply --yes-bucket bridgeleads-exports
+
+It MERGES with any existing rules rather than replacing them, prints before and
+after, and refuses unless `--yes-bucket` matches the configured bucket. A success
+means the rule is STORED, not that anything is deleted: R2 applies lifecycle
+asynchronously and existing objects can take over 24h.
+
+**7. Dry run. Writes nothing.**
+
+    railway link                      # this worktree is not linked
+    railway variables --service worker --set RETENTION_PURGE_ENABLED=true
+    railway variables --service worker --set RETENTION_PURGE_DRY_RUN=true
+
+The task runs daily at 04:10 UTC; to see it now rather than waiting:
+
+    railway run --service worker python -c "from src.workers.scheduler import purge_skip_trace_pii; purge_skip_trace_pii()"
+
+Read the line beginning `retention purge DRY RUN (nothing written)`. It reports
+every leg: results rows, cache rows, provider links, and export objects.
+
+**8. Read the counts, then enforce.** Sanity-check them against what you expect the
+business to hold. Only then:
+
+    railway variables --service worker --set RETENTION_PURGE_DRY_RUN=false
+
+**9. Know the kill switch before you need it.** `RETENTION_PURGE_ENABLED=false`
+stops the sweep at the next tick. It does NOT bring anything back - the database
+purge, the link nulling and the R2 expiry are all irreversible. Watch the first
+enforced run for `retention purge INCOMPLETE`, the `past retention but sat in
+queued/submitted` line, and the `completed with NO completed_at` anomaly line.
+
+**Codex's standing objection, recorded rather than argued away:** it rates
+unsupervised owner execution of this - no CI, no test ever run - as Critical, and
+recommends a second reviewer and a verified database backup before step 8. That
+judgement is the owner's to make, but it should be made knowingly.
 
 ### 5h. `Test` CANNOT be made a required check
 

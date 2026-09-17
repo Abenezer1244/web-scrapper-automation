@@ -43,6 +43,7 @@ REQUIRED_DELETE_TABLES = (
     "mfa_backup_codes",
     "mfa_break_glass_codes",
     "pending_registrations",
+    "skip_trace_cache",
 )
 ROLE = "bridgeleads_system"
 

@@ -252,6 +252,12 @@ GRANT DELETE ON mfa_backup_codes, mfa_break_glass_codes TO bridgeleads_system;
 -- (outbox send) and the hourly purge DELETEs expired rows. SELECT/UPDATE come
 -- from the ALL TABLES grant above; DELETE is granted explicitly here.
 GRANT DELETE ON pending_registrations TO bridgeleads_system;
+-- skip_trace_cache: the daily Privacy Policy §7 retention sweep
+-- (scheduler_helpers/retention.py) DELETEs rows past the reuse window, which hold
+-- raw_response (the full Tracerfy payload). NULLing the PII columns on `results`
+-- needs nothing new -- the ALL TABLES UPDATE above already covers it -- so this is
+-- the only privilege the retention task adds.
+GRANT DELETE ON skip_trace_cache TO bridgeleads_system;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO bridgeleads_system;
 
 -- ── Role 3: owner / migration role ──────────────────────────────────────────

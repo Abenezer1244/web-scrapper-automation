@@ -4,8 +4,10 @@
 purge only the skip-traced contact PII. Policy §7 promises 365-day deletion of
 "lead records"; this implements deletion of the personal data inside them.
 
-**Status:** PLAN ONLY. Nothing implemented. Awaiting owner sign-off on the three
-open decisions in §D.
+**Status:** ALL FIVE PHASES IMPLEMENTED, shipped OFF
+(`RETENTION_PURGE_ENABLED=false`, `RETENTION_PURGE_DRY_RUN=true`). See §F for what
+changed versus this plan and what is still open. D1 (the clock) is still with
+counsel; the code states its assumption explicitly and isolates it in one predicate.
 
 Reviewed by Codex (read-only consult, gpt-5.6-luna, high effort) before any code
 was written. Five BLOCKING findings, folded in below.
@@ -78,48 +80,48 @@ sweep, because that decrypts and can abort on a bad ciphertext
 ## C. Phases (each independently testable, max 5 files)
 
 ### Phase 1 — retention settings + index migration
-- [ ] `src/config/settings.py`: `SKIP_TRACE_PII_RETENTION_DAYS` (365),
+- [x] `src/config/settings.py`: `SKIP_TRACE_PII_RETENTION_DAYS` (365),
       `SKIP_TRACE_CACHE_RETENTION_DAYS` (90), `RETENTION_PURGE_BATCH` (1000)
 - [ ] `.env.example`: document all three. **deny-ruled in this environment**, so
       this one lands as an owner step, not a commit from me
-- [ ] `alembic/versions/096_results_skip_trace_attempted_idx.py`:
+- [x] `alembic/versions/096_results_skip_trace_attempted_idx.py`:
       `CREATE INDEX CONCURRENTLY` on `results (skip_trace_attempted_at, id)`,
       NOT partial, following 068's autocommit + invalid-index-preflight pattern
-- [ ] `down_revision = "095"`
+- [x] `down_revision = "095"`
 
 ### Phase 2 — the purge task
-- [ ] `src/workers/scheduler_helpers/retention.py` (new): batched, deterministic
+- [x] `src/workers/scheduler_helpers/retention.py` (new): batched, deterministic
       `ORDER BY skip_trace_attempted_at, id LIMIT :batch FOR UPDATE SKIP LOCKED`,
       raw `UPDATE` of the six columns, `system_sync_session()`, per-batch commit
-- [ ] Idempotency predicate so purged rows stop matching
-- [ ] Cache delete loop at 90 days
-- [ ] Metrics: rows nulled, cache rows deleted, rows skipped on locks, duration,
+- [x] Idempotency predicate so purged rows stop matching
+- [x] Cache delete loop at 90 days
+- [x] Metrics: rows nulled, cache rows deleted, rows skipped on locks, duration,
       oldest remaining eligible row (a silent failure here is a compliance gap)
-- [ ] `src/workers/scheduler.py`: register daily in `beat_schedule`.
+- [x] `src/workers/scheduler.py`: register daily in `beat_schedule`.
       See the `beat_intervals_reset_on_every_deploy` landmine
 
 ### Phase 3 — grants (drift-guarded; all three files or tests fail)
-- [ ] `scripts/provision_rls_roles.sql`: `GRANT DELETE ON skip_trace_cache`
+- [x] `scripts/provision_rls_roles.sql`: `GRANT DELETE ON skip_trace_cache`
       + verify IN-list
-- [ ] `scripts/_cutover_step2_grants_policies.py`: `_GRANTS` + `_SYSTEM_DELETE_TABLES`
-- [ ] `scripts/verify_worker_delete_grants.py`: `REQUIRED_DELETE_TABLES`
-- [ ] `tests/test_worker_delete_grants.py` hard-fails on drift between these three
+- [x] `scripts/_cutover_step2_grants_policies.py`: `_GRANTS` + `_SYSTEM_DELETE_TABLES`
+- [x] `scripts/verify_worker_delete_grants.py`: `REQUIRED_DELETE_TABLES`
+- [x] `tests/test_worker_delete_grants.py` hard-fails on drift between these three
 
 ### Phase 4 — the `purged` status contract
-- [ ] `src/config/constants.py`: add to `SkipTraceStatus`
-- [ ] `src/api/routes/analytics.py:187`: stop counting purged as `enriched`
-- [ ] `src/workers/tasks_helpers/enrich.py:1995`: decide retrace behaviour. Do NOT
+- [x] `src/config/constants.py`: add to `SkipTraceStatus`
+- [x] `src/api/routes/analytics.py:187`: stop counting purged as `enriched`
+- [x] `src/workers/tasks_helpers/enrich.py:1995`: decide retrace behaviour. Do NOT
       blindly add `purged` to the enqueue predicate: it would issue a new PAID
       Tracerfy lookup on a maintenance rerun
-- [ ] Regenerate `schema/openapi.json` in the pinned env; frontend TS union follows
+- [x] Regenerate `schema/openapi.json` in the pinned env; frontend TS union follows
       in a separate FE PR
 
 ### Phase 5 — R2 exports (owner decision, see D3)
-- [ ] Either a Cloudflare R2 lifecycle rule (owner, no code) or a deletion sweep
+- [x] Either a Cloudflare R2 lifecycle rule (owner, no code) or a deletion sweep
       (code: `data_exporter.py` has no delete method today)
-- [ ] Check R2 object versioning: deleting the current object may not delete
+- [x] Check R2 object versioning: deleting the current object may not delete
       prior versions
-- [ ] Export race (Codex P1): a job can read pre-purge PII and upload it after the
+- [x] Export race (Codex P1): a job can read pre-purge PII and upload it after the
       purge commits, resurrecting it in R2
 
 ---
@@ -154,4 +156,57 @@ Until one exists, the policy promise is not met no matter what the DB does.
 
 ## F. Review
 
-_To be filled in after implementation._
+All five phases implemented. Commits on `fix/openapi-drift-from-docstring`:
+`32e8407` (ph1-2), `84d4422` (ph3), `d318f36` (ph4), `5bdc18b` (ph5).
+
+### What the implementation changed versus the plan
+
+**A real bug the Phase 4 audit found, which the design review had not.** Auditing
+every reader of `skip_trace_status` (not just the two Codex named) turned up an
+in-flight race: a row traced long ago and since RE-QUEUED carries old,
+past-retention PII while sitting in `queued`/`submitted`. Purging it would flip
+its status, and `tracerfy_ingest.py:780` only accepts a provider result for a row
+still `IN ('queued','submitted')` -- so the callback would match nothing and a
+lookup we PAID FOR would be silently discarded. `_ELIGIBLE` now excludes
+in-flight rows.
+
+**Phase 4 was smaller than planned, and the plan was wrong about why.**
+`skip_trace_status` is typed `str`, not an enum, and the permitted-value list
+lives in a Python comment that never reaches OpenAPI. Regenerating
+`schema/openapi.json` produces a byte-identical file, so there is NO API contract
+change and NO frontend type PR. The FE may want to render 'purged' distinctly;
+nothing breaks if it does not.
+
+**Both analytics and the retrace path needed no code change.** `analytics.py:187`
+counts `== 'hit'`, so purged rows drop out of `enriched` by themselves -- which is
+the behaviour we want, since `enriched` then agrees with the phone/email
+percentages beside it. `enrich.py:1995` enqueues only `'not_attempted'`, so
+decision D2's safe default (no accidental paid retrace) came for free.
+
+**A latent bug fixed incidentally.** `scripts/purge_skip_trace_cache.py` issues
+`DELETE FROM skip_trace_cache` as `bridgeleads_system`, a role that held no DELETE
+on that table until Phase 3. It would have failed with `InsufficientPrivilege` any
+time after the RLS cutover.
+
+### Verification, and its limits
+
+Done: `ruff check src/ tests/ scripts/` clean; scheduler imports and the beat
+entry registers; alembic graph resolves to a single head `096`;
+`export_openapi.py --check` OK in the pinned env; the disabled path returns
+without opening a DB session; the R2 traversal guard rejects `../etc/passwd`; all
+five grant-drift assertions from `tests/test_worker_delete_grants.py` replicated
+standalone (pure regex, no DB) and passing, with all four table lists agreeing.
+
+NOT done, and it matters: **no test has run against this.** pytest is banned
+locally (it has twice wiped production) and GitHub Actions is billing-blocked, so
+CI cannot run either. Nothing here has executed against a real database. The SQL
+is reviewed, not proven.
+
+### Still open
+
+- D1 (the clock) with counsel. One-line predicate change if the answer differs.
+- D3's belt: the R2 lifecycle rule is an owner step and is NOT done. The code
+  sweep alone does not catch the export race.
+- §7 still promises deletion of "lead records" while we delete the data inside
+  them. Wording gap, counsel item.
+- `.env.example` entries (deny-ruled here) -- owner step 5f in the runbook.

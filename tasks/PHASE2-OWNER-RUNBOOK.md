@@ -166,7 +166,49 @@ Facts, re-verified on current `origin/main`:
   (phone/email) past 365 days. Preserves the product's value while retiring the most
   sensitive data. My recommendation if you want to keep the promise.
 
-I have deliberately built none of these. Tell me which and I will.
+**DECIDED 2026-09-17: (c).** Built, and shipped OFF. What you still have to do:
+
+**5a. Clear the GitHub Actions billing block.** Settings -> Billing & plans. Every
+CI job since ~10:24 UTC on 2026-09-17 fails in ~1s without starting, so NONE of
+this is test-verified. It is lint-clean and import-verified locally only.
+
+**5b. Turn it on in two steps, not one.** In Railway, set
+`RETENTION_PURGE_ENABLED=true` and LEAVE `RETENTION_PURGE_DRY_RUN=true`. The daily
+04:10 UTC task then logs exactly what it WOULD delete and writes nothing. Read
+those counts. Only then set `RETENTION_PURGE_DRY_RUN=false`. The deletion is
+irreversible; there is no undo.
+
+**5c. Add the R2 lifecycle rule** (Cloudflare dashboard, minutes). You chose belt
+AND suspenders. The code sweep is the suspenders; the lifecycle rule is the belt,
+and it is the ONLY thing that catches the export race -- a job that read the
+contact data just before the purge committed and uploads the file just after.
+Check whether the bucket has object VERSIONING on: if it does, deleting the
+current object leaves prior versions readable, and no code can fix that.
+
+**5d. Counsel question (D1), still open.** The clock runs from
+`skip_trace_attempted_at` -- "retain each newly obtained copy 365 days". A
+re-traced row resets its own clock and can stay populated indefinitely. That is
+right under that reading and WRONG if §7 means "365 days after the lead was
+created". Ask counsel which. Changing it later is a one-line predicate change.
+
+**5e. §7 wording.** §7 promises deletion of "lead records". We now delete the
+personal data inside them and keep the row. That is a gap between the text and
+the behaviour even after this ships. Counsel item, not a code item.
+
+**5f. Add the four new settings to `.env.example`** (deny-ruled in my environment,
+so I could not): `RETENTION_PURGE_ENABLED`, `RETENTION_PURGE_DRY_RUN`,
+`SKIP_TRACE_PII_RETENTION_DAYS`, `SKIP_TRACE_CACHE_RETENTION_DAYS`,
+`EXPORT_RETENTION_DAYS`, `RETENTION_PURGE_BATCH`.
+
+**Correction to the evidence cited above.** `scripts/purge_skip_trace_cache.py` is
+a ONE-TIME script from the 2026-06-10 per-tenant cutover that does an unfiltered
+`DELETE FROM skip_trace_cache`, not a retention mechanism. It also could not have
+run since the RLS cutover: `bridgeleads_system` held no DELETE on that table until
+the grant added here. Nothing has ever deleted a cache row on a schedule, and rows
+past the 90-day reuse window -- including `raw_response`, the full Tracerfy payload
+-- have been accumulating since the table was created.
+
+Plan and phase detail: `tasks/todo-retention-purge.md`.
 
 ---
 

@@ -141,9 +141,15 @@ async def forgot_user_password(
     # `user` is deliberately NOT reassigned here — audit_log below must still
     # record the real user id for a suppressed attempt, otherwise a bombing run
     # becomes invisible to ops at exactly the moment it matters.
-    may_send = user is not None and await once_per(
-        f"pwreset:{blind_index(body.email)}", _RESET_EMAIL_MIN_INTERVAL
-    )
+    #
+    # once_per is called UNCONDITIONALLY, before the `user is not None` test, so
+    # that both branches pay the same Redis round-trip. Short-circuiting on
+    # `user is not None and await once_per(...)` would have made the round-trip
+    # happen only for addresses that exist — a timing oracle that answers the
+    # exact question the generic 200 is here to hide. (Codex caught this.)
+    reset_key = f"pwreset:{blind_index(body.email)}"
+    fresh = await once_per(reset_key, _RESET_EMAIL_MIN_INTERVAL)
+    may_send = user is not None and fresh
 
     if may_send:
         token = _mint_reset_token(user.id)
@@ -159,6 +165,14 @@ async def forgot_user_password(
         # surfaces or disturbs the enumeration-safe 200.
         from src.workers.delivery import send_password_reset_email
         background_tasks.add_task(send_password_reset_email, body.email, reset_link)
+        # NOT released on delivery failure, unlike the duplicate-signup notice in
+        # registration.py. That is a considered difference, not an oversight:
+        # send_password_reset_email returns None and swallows failures BY DESIGN
+        # (so a Resend outage cannot leak account existence), so the caller cannot
+        # detect one without changing that contract. The release matters there
+        # because that gate is 86400s — a full day of denial. Here it is 300s, so
+        # the worst case is a user whose mail failed waiting five minutes. Not
+        # worth reworking a deliberately-silent sender for. (Codex raised it.)
 
     # audit_log records the attempt without leaking existence to the client.
     audit_log(request, "password_reset_requested", user.id if user else None)

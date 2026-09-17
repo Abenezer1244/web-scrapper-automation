@@ -340,6 +340,38 @@ def check_rls_role_status() -> dict:
     import logging
 
     log = logging.getLogger("security.rls")
+
+    # CONFIG-DRIFT ALARM. Everything below only enforces when RLS_ENFORCE is on,
+    # and that flag lives in the Railway environment, not in this repo — so an
+    # accidental unset would silently downgrade production to advisory mode with
+    # no signal at all. The boot would look completely normal. Make it loud.
+    #
+    # Deliberately an ALARM and NOT a hard failure: RLS_ENFORCE=false in
+    # production is the documented ROLLBACK path (see docs/BUILD_JOURNAL.md —
+    # "rollback = repoint + RLS_ENFORCE=false + NO FORCE"). Refusing to boot here
+    # would block the very procedure you would be running during an incident.
+    # (Codex flagged the drift; the non-blocking shape is because of the rollback.)
+    if settings.ENVIRONMENT.strip().lower() == "production" and not settings.RLS_ENFORCE:
+        log.error(
+            "RLS_ENFORCE is OFF in production — RLS is advisory only and the "
+            "per-query user_id filter is the sole tenant boundary. This is correct "
+            "ONLY during a deliberate RLS rollback; otherwise it is config drift."
+        )
+        try:
+            from src.workers.ops_alerts import send_ops_alert
+
+            send_ops_alert(
+                "rls_enforce_off", "boot",
+                "RLS_ENFORCE is off in production",
+                "The API/worker booted with ENVIRONMENT=production and "
+                "RLS_ENFORCE unset or false. Row-level security is NOT enforced; "
+                "a single missing user_id filter would leak across tenants. If "
+                "this is not an intentional rollback, set RLS_ENFORCE=true on "
+                "every api+worker service and redeploy.",
+            )
+        except Exception:  # noqa: BLE001 — an alert failure must not block boot
+            log.exception("RLS_ENFORCE drift alert failed to send")
+
     try:
         sync_info = _role_status(sync_engine)
         if sync_info is None:

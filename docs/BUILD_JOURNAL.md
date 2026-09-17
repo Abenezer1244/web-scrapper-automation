@@ -7609,3 +7609,54 @@ connection errors) — not logic regressions.
 - Download route path is `/jobs/{id}/download` (no `/api/v1` prefix); API domain is
   `https://api.bridgeleads.io` (Railway service `api`, project `bridgeleads-production`).
 - Codex CLI works here (`codex exec resume <session> -`); SSH push doesn't (use `gh`/HTTPS).
+
+---
+
+## 2026-09-17 — Compliance audit phase 2: two log leaks shipped, one CI gate I broke
+
+**Built.** BE #334 (`4d2b926`): a uvicorn access-log rule scrubbing the
+`/webhooks/tracerfy/{provided_secret}` path, and `owner_name` removed from four
+scraper log statements (`county_gis.py` x3, `pacs.py`), logging `county_key`/`county`
+instead. FE #152: `<main>` + skip link on the landing page, and a footer `Sign in`
+link. BE #335 (`6a82748`): `TRACERFY_LEGACY_PATH_ENABLED`, a reversible kill switch
+that 410s the legacy route before the secret compare, plus secret-free
+`tracerfy_legacy_route_used` telemetry.
+
+**Failed, and worth recording.**
+
+*I merged a red build.* #335's `Test` job failed and it merged anyway, because `Test`
+is **not a required status check** and I used `gh pr merge --auto`, which gates only on
+required checks. I had spotted and flagged that exact gap on #334 an hour earlier, then
+relied on the mechanism anyway. main's CI is red on the **OpenAPI drift gate**
+("STALE: schema/openapi.json is out of date"). Prod is healthy; the failure is schema
+freshness, not function.
+
+*My first fix was wrong.* I assumed the cause was FastAPI publishing the route
+docstring as its OpenAPI `description` — I had expanded it. #336 restores that
+docstring byte-for-byte (diffed against `4d2b926`) and moves the notes to comments.
+CI still failed, so the docstring was not the cause. #336 is still worth landing —
+runbook detail does not belong in a public API description the FE type generator
+consumes — but it is **necessary-but-insufficient**. Cause still unidentified.
+
+*I could not regenerate the schema.* `.venv-schema/Scripts/python` points at the
+removed anaconda install, and this repo's own note says the regen environment matters,
+so improvising one risks committing a wrong schema. Handed off:
+`python scripts/export_openapi.py`, commit `schema/openapi.json`.
+
+**Succeeded.** Codex caught a trap I would otherwise have built: `audit_log()`
+persists `request.url.path` into the append-only `audit_events` table
+(`security.py:585,596` -> `:551`), which the app role cannot read or delete. I verified
+it has 27 callers and none in `webhooks.py`, so it is latent, not live — and the
+telemetry in #335 therefore logs a fixed event name and never the path. Dropping a
+finding also counted as a win: "install_global_redaction() missing in the worker"
+would have been theatre, since both PII modules use `setup_logger()`, which already
+attaches the filter, and an import-time call would be a no-op under Celery.
+
+**Decisions for the owner:** eight items in `tasks/PHASE2-OWNER-RUNBOOK.md`. The
+mailbox is first and is worse than the audit said — `bridgeleads.io` has no MX, so
+`Reply-To: support@bridgeleads.io` bounces on every email sent, and there is no SPF or
+DMARC while Resend DKIM is present.
+
+**Follow-ups:** make `Test` required; add `TRACERFY_LEGACY_PATH_ENABLED` to
+`.env.example` (deny-ruled in my environment, not worked around); regenerate the
+schema; pick a retention option (a/b/c).

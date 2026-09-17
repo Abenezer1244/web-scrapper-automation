@@ -152,7 +152,9 @@ _AGED_EXPORTS = text(
     "  AND COALESCE(finished_at, created_at) < :cutoff "
     "ORDER BY COALESCE(finished_at, created_at) LIMIT :batch"
 )
-_CLEAR_EXPORT = text("UPDATE jobs SET export_key = NULL WHERE id = :id")
+_CLEAR_EXPORT = text(
+    "UPDATE jobs SET export_key = NULL WHERE id = :id AND export_key = :key"
+)
 
 _AGED_BATCH_EXPORTS = text(
     "SELECT id, combined_export_key FROM batch_runs "
@@ -160,7 +162,8 @@ _AGED_BATCH_EXPORTS = text(
     "ORDER BY created_at LIMIT :batch"
 )
 _CLEAR_BATCH_EXPORT = text(
-    "UPDATE batch_runs SET combined_export_key = NULL WHERE id = :id"
+    "UPDATE batch_runs SET combined_export_key = NULL "
+    "WHERE id = :id AND combined_export_key = :key"
 )
 
 
@@ -177,10 +180,15 @@ def _apply_timeouts(db) -> None:
 def _drain(db, stmt, params: dict, batch: int) -> tuple[int, bool]:
     """Run `stmt` in bounded batches until it stops matching rows.
 
-    Returns (rows affected, hit_cap). A short batch does NOT reliably mean
-    "finished": FOR UPDATE SKIP LOCKED also returns short when another
-    transaction holds the rows, so the caller re-counts what is left rather than
-    trusting this loop to have drained everything.
+    Returns (rows affected, hit_cap).
+
+    Stops on an EMPTY batch, not a short one (Codex, Medium). FOR UPDATE SKIP
+    LOCKED returns short whenever another transaction holds some of the rows, so
+    treating "short" as "finished" would abandon eligible rows the moment the
+    dispatcher touched a few of them -- and on a compliance sweep, quietly
+    stopping early is the worst available behaviour. A zero batch still does not
+    prove completion (everything remaining could be locked), which is why the
+    caller re-counts afterwards instead of trusting this loop.
     """
     total = 0
     for _ in range(_MAX_BATCHES):
@@ -189,7 +197,7 @@ def _drain(db, stmt, params: dict, batch: int) -> tuple[int, bool]:
         db.commit()
         count = result.rowcount or 0
         total += count
-        if count < batch:
+        if count == 0:
             return total, False
     return total, True
 
@@ -201,6 +209,14 @@ def _sweep_exports(db, stmt, clear_stmt, cutoff: datetime, batch: int) -> tuple[
     only on success. The reverse would lose the key while the file stayed in R2,
     leaving an orphaned copy of someone's phone number that nothing can ever find
     again. A failed delete keeps the key so the next run retries it.
+
+    The clear is CONDITIONAL on the key we actually deleted (Codex, High). There is
+    a commit and a network round trip between selecting a row and clearing it, and
+    a job can be re-exported in that gap. An unconditional `SET export_key = NULL
+    WHERE id = :id` would then wipe the NEW key while its file sat in R2 -- the
+    exact orphan this ordering exists to prevent, reintroduced by the last line.
+    A zero rowcount means the key moved on and this row is simply left for the
+    next run.
 
     Returns (objects deleted, delete failures).
     """
@@ -221,8 +237,13 @@ def _sweep_exports(db, stmt, clear_stmt, cutoff: datetime, batch: int) -> tuple[
             failed += 1
             continue
         _apply_timeouts(db)
-        db.execute(clear_stmt, {"id": row_id})
+        cleared = db.execute(clear_stmt, {"id": row_id, "key": key})
         db.commit()
+        if not (cleared.rowcount or 0):
+            _logger.info(
+                "retention: export key on row %s changed while we were deleting it; "
+                "the object is gone, leaving the new key for a later run", row_id,
+            )
         deleted += 1
     return deleted, failed
 

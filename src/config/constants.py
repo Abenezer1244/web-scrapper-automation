@@ -425,6 +425,14 @@ class SkipTraceStatus(str, Enum):
     HIT = "hit"
     MISS = "miss"
     ERRORED = "errored"
+    # Terminal, set by the retention sweep: this row WAS a hit, and its contact
+    # PII has since been deleted for age (Privacy Policy §7). Distinct from MISS
+    # (we asked and got nothing) because the difference is auditable history, and
+    # distinct from HIT so analytics stop counting it as enriched and the
+    # enqueue path does not treat it as still-contactable. Deliberately NOT in
+    # the ordinary re-enqueue predicate: retracing a purged row is a new PAID
+    # vendor lookup and must be an explicit act, never a maintenance rerun.
+    PURGED = "purged"
 
 
 # DNC/TCPA compliance disclaimer surfaced to users on lead exports. It lives in

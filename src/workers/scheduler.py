@@ -57,6 +57,7 @@ from src.workers.scheduler_helpers.registration import (
     _dispatch_pending_verification_emails_impl,
     _purge_expired_pending_registrations_impl,
 )
+from src.workers.scheduler_helpers.retention import _purge_skip_trace_pii_impl
 
 _logger = setup_logger("worker.scheduler")
 
@@ -157,6 +158,15 @@ app.conf.beat_schedule = {
     "expire-trials": {
         "task": "src.workers.scheduler.expire_trials",
         "schedule": crontab(minute=25),  # hourly at :25
+    },
+    "purge-skip-trace-pii": {
+        # Privacy Policy §7 retention: clear aged vendor-sourced contact PII off
+        # `results` and delete aged `skip_trace_cache` rows. DAILY, not weekly:
+        # a weekly sweep would leave PII in place for up to ~7 days past the
+        # retention boundary we publish, and "365 days" should not quietly mean
+        # 372. Runs behind RETENTION_PURGE_ENABLED / _DRY_RUN.
+        "task": "src.workers.scheduler.purge_skip_trace_pii",
+        "schedule": crontab(hour=4, minute=10),  # daily, off-peak, after the 3am weekly
     },
     "purge-expired-pending-registrations": {
         # Email-verification flow: delete pending_registrations rows whose verify
@@ -486,6 +496,18 @@ def purge_expired_pending_registrations() -> None:
     unbounded from abandoned or sprayed signups.
     """
     return _purge_expired_pending_registrations_impl()
+
+
+@app.task(name="src.workers.scheduler.purge_skip_trace_pii")
+def purge_skip_trace_pii() -> None:
+    """Purge aged skip-trace PII (Privacy Policy §7 retention).
+
+    Daily. NULLs vendor-sourced contact fields on `results` rows past the
+    retention window and deletes aged `skip_trace_cache` rows, keeping the lead
+    row itself (county public record) intact. No-ops unless
+    RETENTION_PURGE_ENABLED; logs without writing while RETENTION_PURGE_DRY_RUN.
+    """
+    return _purge_skip_trace_pii_impl()
 
 
 @app.task(name="src.workers.scheduler.dispatch_pending_verification_emails")

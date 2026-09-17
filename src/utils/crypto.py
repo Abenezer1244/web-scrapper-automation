@@ -192,6 +192,30 @@ def _derive_blind_index_key() -> bytes:
     configured = (settings.BLIND_INDEX_KEY or "").strip()
     if configured:
         return configured.encode("utf-8")
+
+    # Fail CLOSED in production, mirroring _build_fernet() above. Without this the
+    # blind index silently derives from SECRET_KEY — and SECRET_KEY is the JWT
+    # signing key, so rotating it (a routine, expected security operation) would
+    # silently change every email_hmac. Consequences: login-by-email stops
+    # matching existing rows, and because UNIQUE(email_hmac) is the race-safe
+    # authority for "this account already exists", duplicate-registration
+    # detection fails OPEN and the same person can register twice.
+    #
+    # This is the same shape as the 2026-06 incident that stranded 61 users.email
+    # as undecryptable under a SECRET_KEY-derived fallback — except a blind-index
+    # drift is worse in one way: nothing throws. The rows are still readable, they
+    # simply stop matching, so it surfaces as "login is broken for old users"
+    # rather than as an error.
+    #
+    # Verified safe to enforce: BLIND_INDEX_KEY is set on both the api and worker
+    # Railway services (2026-09-17), so this cannot strand a boot today.
+    if settings.PII_ENCRYPTION_STRICT or settings.ENVIRONMENT.strip().lower() == "production":
+        raise RuntimeError(
+            "BLIND_INDEX_KEY is not set in production / strict mode. Refusing to fall "
+            "back to the SECRET_KEY-derived blind index — a later SECRET_KEY rotation "
+            "would silently orphan every email_hmac, breaking login-by-email and "
+            "duplicate-account detection. Set BLIND_INDEX_KEY on every api+worker."
+        )
     return HKDF(
         algorithm=hashes.SHA256(),
         length=32,

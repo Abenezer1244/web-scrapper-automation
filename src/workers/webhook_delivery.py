@@ -249,6 +249,34 @@ def deliver_job_webhook(self, job_id: str, webhook_url: str, payload: dict) -> d
     # config-save is still caught. A blocked target is a permanent config
     # problem — return WITHOUT raising so Celery does not retry it. Never
     # log the full URL (it may carry query-string secrets); host only.
+    #
+    # KNOWN RESIDUAL: DNS-rebinding TOCTOU. This validates a resolved IP and the
+    # POST below re-resolves, so a TTL=0 record can in principle answer public
+    # here and private there. The validated IP is NOT pinned for the connection.
+    #
+    # ACCEPTED, DELIBERATELY, and only because ALL of the following hold. If you
+    # break any one of them, this decision is void and pinning becomes required:
+    #   1. BLIND — the response body is never surfaced to the user, so a
+    #      successful rebind leaks nothing back to the attacker.
+    #   2. NO REDIRECTS — allow_redirects=False below and on every other
+    #      outbound call, so an allowed host cannot 30x us to an internal one.
+    #   3. Re-validation happens HERE, milliseconds before the POST, not at
+    #      config-save time.
+    #   4. The blocklist covers loopback, RFC1918, CGNAT, link-local and cloud
+    #      metadata in both v4 and v6, including IPv4-mapped forms.
+    # The residual is therefore a BLIND POST of our own signed JSON to an
+    # internal address — which requires an internal service that performs a
+    # meaningful unauthenticated POST action to be worth anything.
+    #
+    # Rejected the fix on cost/benefit (Codex-reviewed): pinning in `requests`
+    # means a custom HTTPAdapter/urllib3 connection class that overrides the
+    # socket destination while preserving SNI and assert_hostname, plus
+    # multi-A-record and dual-stack fallback handling — substantial transport,
+    # TLS, DNS and retry complexity for limited incremental protection. There is
+    # no clean hook between TCP connect and body transmission in requests/urllib3
+    # that would give a cheaper version.
+    #
+    # tests/test_webhook_ssrf.py pins invariants 1 and 2 so this stays true.
     try:
         validate_outbound_webhook(webhook_url)
     except ValueError as exc:

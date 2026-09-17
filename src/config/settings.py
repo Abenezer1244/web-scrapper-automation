@@ -336,6 +336,13 @@ class Settings(BaseSettings):
     TRACERFY_API_TOKEN: str = ""
     TRACERFY_API_BASE_URL: str = "https://tracerfy.com"
     TRACERFY_WEBHOOK_SECRET: str = ""
+    # Kill switch for the deprecated `POST /webhooks/tracerfy/{provided_secret}`
+    # route, which carries the secret in the URL path. True keeps it working (no
+    # behaviour change on deploy). Set false once Tracerfy posts to
+    # `/webhooks/tracerfy` with the X-Tracerfy-Webhook-Secret header: the legacy
+    # route then 410s before the secret compare, retiring the path exposure
+    # REVERSIBLY, ahead of deleting the route for good.
+    TRACERFY_LEGACY_PATH_ENABLED: bool = True
     SKIP_TRACE_ENABLED: bool = False
     # County GIS owner/taxpayer mailing from layers whose license restricts commercial
     # use of lists of individuals (Snohomish, Cowlitz). OFF until counsel clears it;

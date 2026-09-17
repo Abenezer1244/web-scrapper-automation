@@ -212,6 +212,98 @@ Plan and phase detail: `tasks/todo-retention-purge.md`.
 
 ---
 
+### 5g. The exact commands, in the only order that works
+
+**These are ordered deliberately. Steps 2-4 are no-ops until the code is
+deployed, because none of these settings exist in production yet.**
+
+**1. Clear the Actions billing block.** github.com -> Settings -> Billing and
+plans. Nothing else on this list can be verified until CI can run.
+
+**2. Get BE #336 green and merged.** `gh pr checks 336` must pass on its own; do
+NOT use `gh pr merge --auto`, which only gates on REQUIRED checks and this repo
+has none (see 5h). Merging `main` deploys.
+
+**3. Turn it on in dry run.** Writes nothing; logs what it WOULD delete.
+```
+railway link                      # this worktree is not linked
+railway variables --service worker --set RETENTION_PURGE_ENABLED=true
+railway variables --service worker --set RETENTION_PURGE_DRY_RUN=true
+```
+The task runs daily at 04:10 UTC. Read the line beginning
+`retention purge DRY RUN (nothing written)`. To see it immediately rather than
+waiting for the beat:
+```
+railway run --service worker python -c "from src.workers.scheduler import purge_skip_trace_pii; purge_skip_trace_pii()"
+```
+
+**4. Read the counts, then enforce.** Only when the numbers look right:
+```
+railway variables --service worker --set RETENTION_PURGE_DRY_RUN=false
+```
+There is no undo.
+
+**5. The R2 lifecycle rule** (do this whether or not you do step 4 -- it is the
+only thing that catches an export uploaded moments after a purge):
+```
+railway run --service worker python scripts/set_r2_lifecycle.py           # show
+railway run --service worker python scripts/set_r2_lifecycle.py --apply   # write
+```
+Idempotent. Expires current AND noncurrent versions (with versioning on,
+expiring only the current object leaves the old one fetchable) and aborts stale
+multipart uploads. Credentials stay in Railway; they are never printed.
+
+**6. Counsel.** Send `docs/legal/COUNSEL-BRIEF-retention-2026-09-17.md`. It asks
+three questions (what the clock runs from, whether retention must run from
+acquisition rather than last attempt, and whether §7's "lead records" wording
+matches what we now do) and contains no drafted policy text.
+
+---
+
+### 5h. `Test` CANNOT be made a required check
+
+Runbook item 2 and the handoff both say to make `Test` required. **It is not
+possible on this account.** `web-scrapper-automation` is a PRIVATE repo on a free
+personal plan, and both the branch-protection and rulesets APIs return:
+
+> `403 Upgrade to GitHub Pro or make this repository public to enable this feature.`
+
+So the guardrail whose absence let a red build onto `main` cannot be switched on.
+Either upgrade to GitHub Pro, or accept that the only defence is procedural:
+always `gh pr checks <n>` and wait, never `--auto`.
+
+---
+
+### 5i. `.env.example` additions (blocked for the agent, 30 seconds for you)
+
+`.env.example` is covered by a tooling deny rule in the agent environment, so
+this block was NOT written by the agent and must be pasted by hand. Append:
+
+```
+# ─── Skip-trace PII retention (Privacy Policy §7) ───────────────────────────
+# Ships OFF. Deletion is irreversible; roll out as ENABLED=true + DRY_RUN=true,
+# read the logged counts, then DRY_RUN=false. See tasks/todo-retention-purge.md.
+RETENTION_PURGE_ENABLED=false
+RETENTION_PURGE_DRY_RUN=true
+# Days before skip-traced contact PII is cleared off a lead row (the lead itself
+# is kept). Clock runs from skip_trace_attempted_at -- see decision D1/D4.
+SKIP_TRACE_PII_RETENTION_DAYS=365
+# Cache rows are unusable past the reuse window and hold the full vendor payload,
+# so they are deleted at the reuse window rather than at 365 days.
+SKIP_TRACE_CACHE_RETENTION_DAYS=90
+# Tracerfy CDN links need no auth. A completed queue drops its link after this
+# many days; pending/errored keep theirs until the PII window, since a paid batch
+# that was never applied is recovered by hand from it.
+SKIP_TRACE_LINK_RETENTION_DAYS=30
+# Max age of delivered export objects in R2. Must match the lifecycle rule set by
+# scripts/set_r2_lifecycle.py.
+EXPORT_RETENTION_DAYS=365
+# Rows per batch in the retention sweep.
+RETENTION_PURGE_BATCH=1000
+```
+
+---
+
 ## 6. Annual billing disclosure
 
 Stripe charges annual plans **upfront for 12 months**: Pro **$1,910**, Business

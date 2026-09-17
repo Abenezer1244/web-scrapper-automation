@@ -222,6 +222,33 @@ locally (it has twice wiped production) and GitHub Actions is billing-blocked, s
 CI cannot run either. Nothing here has executed against a real database. The SQL
 is reviewed, not proven.
 
+### Added after the review passes
+
+**Phase 6 - provider download links (`d051acc`).** Closes the scope Codex found
+that neither the audit nor I had. `skip_trace_queues.download_url` is not a copy
+of the PII, it is a live ACCESS PATH: the Tracerfy CDN needs no auth, so the URL
+alone fetches a CSV of traced phone numbers. Encrypted at rest, retained forever
+(migration 054 cleaned it once in 2026; nothing since). Two windows, because the
+link is kept for a reason - a paid-but-unapplied batch is recovered by hand from
+it: `completed` queues drop theirs at 30 days (already ingested, nothing to
+recover), `pending`/`errored` keep theirs until the PII window, past which there
+is nothing left to recover into. Deliberately generous to errored, because those
+raise an ops alert and `OPS_ALERT_EMAIL` has been empty in production before,
+making that alert a silent no-op. No new grant needed.
+
+**Tests (`3de0547`).** `tests/test_retention.py`, real DB, no mocks. The negative
+cases carry the weight: in-flight rows (parametrized queued/submitted) keep status
+AND PII; a 'miss' is never relabelled 'purged'; never-traced and in-window rows
+untouched; the lead itself survives; a second pass is a no-op; cache inside the
+reuse window survives. Plus two that need no network - the export-key conditional
+clear asserted at SQL level (the Codex High), and a `has_table_privilege` check on
+the cache DELETE grant. `EXPORT_RETENTION_DAYS` is pinned high in enforce-mode
+tests so the R2 leg cannot send a shared test DB out to the internet.
+
+**They have not been run.** pytest is banned locally; CI is billing-blocked. They
+are verified only as far as ruff, compilation, and every imported symbol and model
+attribute resolving.
+
 ### Still open
 
 - D1 (the clock) with counsel. One-line predicate change if the answer differs.

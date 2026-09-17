@@ -173,7 +173,11 @@ def lookup_pacs_by_name(pacs_url: str, owner_name: str) -> dict | None:
 
         return parse_pacs_result_html(r.text)
     except Exception as exc:
-        _logger.warning("PACS name lookup failed for %r: %s", owner_name[:30], str(exc)[:80])
+        # PII: owner_name is a third party who never signed up, and the log file has
+        # no rotation or retention, so it is dropped. Only pacs_url and owner_name are
+        # in scope here and there is no non-identifying record id to correlate on, so
+        # the exception text is the diagnostic handle.
+        _logger.warning("PACS name lookup failed: %s", str(exc)[:80])
         return None
 
 

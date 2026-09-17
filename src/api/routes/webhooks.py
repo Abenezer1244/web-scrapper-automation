@@ -176,17 +176,22 @@ async def tracerfy_webhook_legacy(provided_secret: str, request: Request) -> dic
     Header-first (Codex): if the header is present it is authoritative — a wrong
     header is rejected even if the path secret is right. Current Tracerfy traffic
     sends no header, so this branch is inert until migration.
-
-    KILL SWITCH. `TRACERFY_LEGACY_PATH_ENABLED` defaults True so nothing changes on
-    deploy. Set it false once Tracerfy posts to the header route: this then 410s
-    BEFORE the secret compare and before any ingestion, which retires the path
-    exposure reversibly — flip it back if a delivery fails, rather than discovering
-    the mistake after an irreversible route deletion.
-
-    Migration sequence: point Tracerfy at the header route -> set this false ->
-    rotate TRACERFY_WEBHOOK_SECRET -> confirm no `tracerfy_legacy_route_used` lines
-    for a full delivery cycle -> delete this route.
     """
+    # NOTE: keep the operational detail below in COMMENTS, not in the docstring.
+    # FastAPI publishes a route's docstring as its OpenAPI `description`, so
+    # editing it makes schema/openapi.json stale (CI's drift gate catches this)
+    # and pushes migration notes into a public schema the frontend type generator
+    # consumes. Behaviour belongs here; the contract belongs in the docstring.
+    #
+    # KILL SWITCH. `TRACERFY_LEGACY_PATH_ENABLED` defaults True so nothing changes
+    # on deploy. Set it false once Tracerfy posts to the header route: this then
+    # 410s BEFORE the secret compare and before any ingestion, retiring the path
+    # exposure reversibly — flip it back if a delivery fails, rather than finding
+    # out after an irreversible route deletion.
+    #
+    # Migration sequence: point Tracerfy at the header route -> set this false ->
+    # rotate TRACERFY_WEBHOOK_SECRET -> confirm no `tracerfy_legacy_route_used`
+    # lines for a full delivery cycle -> delete this route.
     await rate_limit(request, zone="webhook")
 
     # Secret-free by design. NEVER add the path (or `provided_secret`) to this log or

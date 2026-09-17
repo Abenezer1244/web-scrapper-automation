@@ -166,6 +166,33 @@ _CLEAR_BATCH_EXPORT = text(
     "WHERE id = :id AND combined_export_key = :key"
 )
 
+# Tracerfy completion links. Not a copy of the PII, but a live ACCESS PATH to it:
+# the CDN needs no auth, so the URL alone fetches a CSV of traced phone numbers.
+# Two windows, because the link is retained for a reason. A 'completed' queue was
+# already ingested and has nothing left to recover, so its link goes at the short
+# window. A 'pending'/'errored' queue may still be recovered by hand
+# (tracerfy_ingest.py:350) -- but that recovery is only meaningful while the data
+# is still retainable, so those go at the PII window. Beyond it there is nothing
+# legitimate left to do with a link to data we are simultaneously deleting.
+#
+# `download_url IS NOT NULL` keeps it idempotent. No new grant: the system role's
+# blanket UPDATE already covers this.
+_LINK_ELIGIBLE = (
+    "download_url IS NOT NULL "
+    "AND ( (status = 'completed' "
+    "       AND COALESCE(completed_at, submitted_at) < :link_cutoff) "
+    "   OR COALESCE(completed_at, submitted_at) < :pii_cutoff )"
+)
+
+_PURGE_LINKS = text(
+    f"UPDATE skip_trace_queues SET download_url = NULL WHERE id IN ("
+    f"  SELECT id FROM skip_trace_queues WHERE {_LINK_ELIGIBLE} "
+    "  ORDER BY COALESCE(completed_at, submitted_at) "
+    "  LIMIT :batch FOR UPDATE SKIP LOCKED)"
+)
+
+_COUNT_LINKS = text(f"SELECT count(*) FROM skip_trace_queues WHERE {_LINK_ELIGIBLE}")
+
 
 def _cutoff(days: int) -> datetime:
     return datetime.now(UTC) - timedelta(days=days)
@@ -258,6 +285,8 @@ def _purge_skip_trace_pii_impl() -> None:
     results_cutoff = _cutoff(settings.SKIP_TRACE_PII_RETENTION_DAYS)
     cache_cutoff = _cutoff(settings.SKIP_TRACE_CACHE_RETENTION_DAYS)
     export_cutoff = _cutoff(settings.EXPORT_RETENTION_DAYS)
+    link_cutoff = _cutoff(settings.SKIP_TRACE_LINK_RETENTION_DAYS)
+    link_params = {"link_cutoff": link_cutoff, "pii_cutoff": results_cutoff}
     started = datetime.now(UTC)
 
     # Cross-tenant by design: retention is an obligation we owe regardless of
@@ -286,14 +315,16 @@ def _purge_skip_trace_pii_impl() -> None:
                 ),
                 {"cutoff": export_cutoff},
             ).scalar_one()
+            links = db.execute(_COUNT_LINKS, link_params).scalar_one()
             db.commit()
             _logger.warning(
                 "retention purge DRY RUN (nothing written): would clear PII on %d "
                 "results rows attempted before %s, delete %d skip_trace_cache rows "
-                "fetched before %s, and delete %d job + %d batch export objects from "
-                "R2 older than %s. Set RETENTION_PURGE_DRY_RUN=false to enforce.",
+                "fetched before %s, clear %d provider download links, and delete %d "
+                "job + %d batch export objects from R2 older than %s. "
+                "Set RETENTION_PURGE_DRY_RUN=false to enforce.",
                 eligible, results_cutoff.date(), cache_eligible, cache_cutoff.date(),
-                exports, batch_exports, export_cutoff.date(),
+                links, exports, batch_exports, export_cutoff.date(),
             )
             return
 
@@ -303,6 +334,7 @@ def _purge_skip_trace_pii_impl() -> None:
         cache_rows, cache_capped = _drain(
             db, _PURGE_CACHE, {"cutoff": cache_cutoff}, batch
         )
+        link_rows, _ = _drain(db, _PURGE_LINKS, link_params, batch)
         exports_deleted, export_failures = _sweep_exports(
             db, _AGED_EXPORTS, _CLEAR_EXPORT, export_cutoff, batch
         )
@@ -326,8 +358,9 @@ def _purge_skip_trace_pii_impl() -> None:
     elapsed = (datetime.now(UTC) - started).total_seconds()
     _logger.info(
         "retention purge: cleared PII on %d results rows, deleted %d "
-        "skip_trace_cache rows, deleted %d job + %d batch export objects in %.1fs",
-        rows, cache_rows, exports_deleted, batch_deleted, elapsed,
+        "skip_trace_cache rows, cleared %d provider download links, deleted %d job "
+        "+ %d batch export objects in %.1fs",
+        rows, cache_rows, link_rows, exports_deleted, batch_deleted, elapsed,
     )
     if inflight:
         _logger.warning(

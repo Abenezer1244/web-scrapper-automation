@@ -413,6 +413,15 @@ class Settings(BaseSettings):
     # only thing that reaps an object uploaded by a job that read the PII just
     # before the purge committed). Suspenders: the sweep in the retention task.
     EXPORT_RETENTION_DAYS: int = 365
+    # `skip_trace_queues.download_url` is a Tracerfy CDN link to the completion
+    # CSV. It is encrypted at rest, but the CDN itself needs NO auth: anyone
+    # holding the URL can fetch a file of traced phone numbers. It is kept on
+    # purpose, because a batch that was paid for but never applied is recovered by
+    # hand from it (tracerfy_ingest.py:350). That recovery only matters while the
+    # data is still retainable, so a COMPLETED queue (already ingested, nothing to
+    # recover) drops its link after this window, and pending/errored queues keep
+    # theirs until the PII retention window itself expires.
+    SKIP_TRACE_LINK_RETENTION_DAYS: int = 30
     RETENTION_PURGE_BATCH: int = 1000
 
     # ─── Logging ──────────────────────────────────────────────────────────────

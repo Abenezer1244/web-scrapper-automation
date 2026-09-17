@@ -21,6 +21,22 @@ too) resets its own clock and can stay populated indefinitely. That is correct
 under the first reading and wrong under the second. It is with counsel; if the
 answer is the second reading, change `_ELIGIBLE` to key off `created_at`.
 
+KNOWN GAP, NOT FIXED HERE (raised by Codex, then found to be worse than raised).
+`skip_trace_attempted_at` means "last ATTEMPT", not "when we obtained this data",
+and three sites stamp it to now() while acquiring NOTHING:
+skip_trace_dispatcher.py:569, :880 and tracerfy_ingest.py:782, all on the
+'errored' transition. So a row holding 400-day-old contact data that is re-traced
+and errors has its retention clock reset to today, and that old PII gets a fresh
+full window. Re-queueing itself does not stamp the column (enrich.py:2146), which
+is why the in-flight guard above is safe -- but the error path does.
+
+The honest fix is a dedicated "PII obtained at" column that only the write paths
+that actually store contact data set, with the purge aging off that. That is a
+migration plus edits to the PAID ingest path, and it is deliberately NOT done
+blind: nothing in this change has run against a real database (pytest is banned
+locally, CI is billing-blocked). It also overlaps decision D1, which is already
+with counsel. Tracked in tasks/todo-retention-purge.md §D.
+
 Ships behind RETENTION_PURGE_ENABLED (off) and RETENTION_PURGE_DRY_RUN (on)
 because the deletion is IRREVERSIBLE and the clock question is open. Dry run
 logs exactly what it would purge and writes nothing.
@@ -109,6 +125,20 @@ _PURGE_CACHE = text(
 )
 
 _COUNT_CACHE = text("SELECT count(*) FROM skip_trace_cache WHERE fetched_at < :cutoff")
+
+# In-flight rows that are ALREADY past retention. Excluding them from the sweep is
+# correct (see _ELIGIBLE), but "correct" must not mean "invisible": if the
+# dispatcher never settles a claim, the row's old PII sits here exempt, and a
+# silent permanent exemption in a retention task is exactly the failure this whole
+# job exists to prevent. Counted every run and logged when non-zero. A number that
+# does not fall between runs means the dispatcher is stuck, not that we are done.
+_COUNT_INFLIGHT = text(
+    "SELECT count(*) FROM results "
+    "WHERE skip_trace_attempted_at < :cutoff "
+    "  AND skip_trace_status IN ('queued', 'submitted') "
+    "  AND (phone IS NOT NULL OR email IS NOT NULL "
+    "       OR phones IS NOT NULL OR emails IS NOT NULL)"
+)
 
 # Delivered exports. These are the copies that matter most and are easiest to
 # forget: a CSV in R2 holds the same phone numbers as the row, is reachable by
@@ -269,6 +299,7 @@ def _purge_skip_trace_pii_impl() -> None:
         oldest = db.execute(
             _OLDEST_RESULT, {"cutoff": results_cutoff, "purged": purged}
         ).scalar()
+        inflight = db.execute(_COUNT_INFLIGHT, {"cutoff": results_cutoff}).scalar_one()
         db.commit()
 
     elapsed = (datetime.now(UTC) - started).total_seconds()
@@ -277,6 +308,14 @@ def _purge_skip_trace_pii_impl() -> None:
         "skip_trace_cache rows, deleted %d job + %d batch export objects in %.1fs",
         rows, cache_rows, exports_deleted, batch_deleted, elapsed,
     )
+    if inflight:
+        _logger.warning(
+            "retention purge: %d results rows are past retention but sat in "
+            "queued/submitted and were skipped to avoid discarding a paid trace. "
+            "Expected to clear on a later run. If this count does NOT fall, the "
+            "dispatcher is not settling claims and that PII is exempt indefinitely.",
+            inflight,
+        )
     if export_failures or batch_failures:
         _logger.error(
             "retention purge: %d job + %d batch export objects could NOT be deleted "

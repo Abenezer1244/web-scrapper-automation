@@ -138,6 +138,26 @@ This is a policy reading, not an engineering call. **Counsel question.**
 billable vendor lookup? (Codex: legitimately new and billable, but it must be
 explicit, never an accident of a maintenance rerun.)
 
+**D4. The error path resets the retention clock. NEW, found post-implementation.**
+Raised by Codex ("the guard can leave old PII permanently protected when a
+provider claim never settles"), and on investigation it is worse than raised.
+`skip_trace_attempted_at` means "last ATTEMPT", not "when we obtained this data",
+and THREE sites stamp it to now() while acquiring nothing --
+`skip_trace_dispatcher.py:569`, `:880` and `tracerfy_ingest.py:782`, all on the
+'errored' transition. A row holding 400-day-old contact data that is re-traced and
+errors therefore gets its clock reset to today, and that old PII gets a fresh full
+365-day window. Re-queueing alone does NOT stamp the column
+(`enrich.py:2146`), which is what makes the in-flight guard safe; the error path
+is the problem.
+
+Mitigated, not fixed: the sweep now counts in-flight past-retention rows every run
+and logs a warning, so a permanently-exempt row is loud instead of silent.
+
+The real fix is a dedicated "PII obtained at" column that only the paths actually
+storing contact data set, with the purge aging off it. That is a migration plus
+edits to the PAID ingest path. Deliberately not done blind, with no test able to
+run. It also overlaps D1, so both should be answered together.
+
 **D3. R2 exports.** Lifecycle rule (owner, minutes in Cloudflare) or code sweep?
 Until one exists, the policy promise is not met no matter what the DB does.
 

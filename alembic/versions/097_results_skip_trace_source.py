@@ -47,7 +47,15 @@ def upgrade() -> None:
         "CHECK (skip_trace_source IN ('lookup', 'reused')) NOT VALID"
     ))
     with op.get_context().autocommit_block():
-        op.get_bind().execute(text(f"ALTER TABLE results VALIDATE CONSTRAINT {_CHECK}"))
+        conn = op.get_bind()
+        # SET LOCAL above ended with its transaction; this block runs outside one, so
+        # the timeout is set (and reset) here, or VALIDATE could wait indefinitely
+        # behind conflicting DDL (Codex).
+        conn.execute(text("SET lock_timeout = '5s'"))
+        try:
+            conn.execute(text(f"ALTER TABLE results VALIDATE CONSTRAINT {_CHECK}"))
+        finally:
+            conn.execute(text("RESET lock_timeout"))
 
 
 def downgrade() -> None:

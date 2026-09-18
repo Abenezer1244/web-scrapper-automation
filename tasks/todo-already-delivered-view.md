@@ -111,8 +111,9 @@ Phase 1 (backend, <= 5 files): jobs.py, schemas.py, new tests file, openapi.json
 - [x] ruff, targeted + full suite (isolated DB), OpenAPI regen (zero deletions)
 - [x] Codex review + security §14; fix; STOP for owner approval
 Phase 2 (frontend): api types regen, api.ts, page.tsx, ResultsTable.tsx (+ small tabs component)
-- [ ] implement, tsc + eslint, Playwright CLI Chromium at 320/375/390/430/768/1024/1440
-- [ ] Codex review; journal entry; PRs (BE first, FE after BE merges)
+- [x] implement, tsc + eslint, Playwright CLI Chromium at 320/375/390/430/768/1024/1440
+- [x] Codex review; journal entry
+- [ ] PRs (BE first, FE after BE merges): waiting on owner approval to push
 
 ## Review
 
@@ -137,3 +138,18 @@ Phase 2 (frontend): api types regen, api.ts, page.tsx, ResultsTable.tsx (+ small
   no new secret, no raw error text; CSV through the existing sanitizing writer; read path
   writes nothing (snapshot test); token replay across runs 403; cross-tenant 404.
 
+### Phase 2 (frontend), 2026-09-18, FE commit ef4ec72
+- 8 files (1 generated): lib/api-types.generated.ts (+18/-0, from this branch's schema),
+  lib/types.ts, lib/api.ts, results/[id]/page.tsx, ResultsTable.tsx, LeadCards.tsx, and new
+  DeliveryProvenance.tsx + ResultsViewTabs.tsx. Over the 5-file phase guideline: one feature,
+  one generated file, and table + cards must change together or phones lose the provenance.
+- Also fixed in passing: a row whose only detail was a recording number could not expand
+  (instrument_number rendered in the panel but was missing from the expand gate).
+- Playwright Chromium, local API + seeded isolated test DB: 61/61 checks (header button,
+  tabs, URL state, Back/Forward, refresh, keyboard, paging, search, all four provenance
+  states, original-run link, fallback, cross-account refusal, CSV scope + filename, 8 widths
+  from 320 to 1920 with no page overflow and one-line tabs, phone card provenance).
+- Codex FE: r1 FAIL (history via replace, stale page fetch, overclaim, filename, fallback
+  replace, encode id): adopted all but the filename (already fixed) and the tab term.
+  r2 FAIL (tooltip + explainer overclaim): adopted. r3 GATE: PASS (badge says "Delivered",
+  not "Already delivered": kept, it is the compact twin of "New").

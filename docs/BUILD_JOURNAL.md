@@ -19,6 +19,77 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-18 — "227 already delivered" becomes a set you can open, and the header was counting rows no view shows
+
+> Owner report: a Pierce pre_foreclosure run read "3 new · 227 already delivered" and the 227
+> were a bare number. Branches `feat/already-delivered-view` in BOTH repos (BE worktree
+> `C:/Users/Windows/bl-wt-delivered`, FE `C:/Users/Windows/bl-wt-delivered-fe`). Local commits
+> only; nothing pushed at the time of writing. This is step 7 of
+> `docs/HANDOFF-results-categories-2026-09-13.md`, which designed it and never built it.
+
+**Built / Shipped (local):**
+- BE `ac8d6d7` + `2312321`: `src/api/results_category.py` (one predicate for list, count and
+  CSV); `GET /jobs/{id}/results?category=new|already_delivered`; `already_delivered_count`;
+  per-row provenance (`duplicate_source_job_id/_at`, `duplicate_source_available`,
+  `duplicate_original_visible`, at most 3 batched queries per page); `category` on
+  `/export-url` + `/download` (`*_already_delivered.csv`); 13 tests in
+  `tests/test_results_already_delivered.py`; `schema/openapi.json` +103/-0.
+- FE `ef4ec72`: header count is a button; New / Already delivered tablist; `?view=delivered`
+  (push per switch, replace for the automatic fallback); NEW / DELIVERED badge;
+  `DeliveryProvenance` shared by table row and phone card; download label + filename follow
+  the view.
+
+**Tried / Decided:**
+- "Already delivered" = an earlier run of THE SAME ACCOUNT holds the dedup claim on the frozen
+  `sha256(parcel|address)` key (else NAME|DATE). Per account, any county, any record type, no
+  expiry. Verified tenant-safe in prod (read-only): of the screenshot run's 227, all 227 carry
+  their own account's claim; 210 of the keys are ALSO held by other accounts and influenced
+  nothing.
+- Counted per RECORD, not per property (227 records = 225 properties). Codex argued for
+  distinct-per-property; kept per record because the owner spec requires count == the records
+  you can open, and collapsing would hide a filing that is listed.
+- Copy climbs only as far as the evidence: "Delivered by your run on X" only when that run
+  still LISTS the lead as new; otherwise "Matched". Codex raised overclaiming three times; the
+  first two were adopted (evidence flag, tooltip + explainer reworded), the third asked the
+  tab to stop saying "Already delivered", which is the owner's term.
+- No Combined tab. A combined row is another filing of a property this same run lists as new.
+  Recommendation for later: "Combined from N filings" in the survivor's expanded row.
+
+**Failed / Blocked:**
+- First full-suite batch 2 died with 126 errors: the SHARED local Postgres PANICked
+  ("could not truncate file ... Permission denied", Windows file lock) and went into recovery
+  mid-run. Not code; re-run clean.
+- 9 Stripe tests failed locally until CI's `STRIPE_PRICE_*` vars were exported (my `pt.sh`
+  did not set them). Known noise, now proven to be env only.
+- `codex exec "<33 KB prompt>"` failed with "Argument list too long" (Windows ~32 KB command
+  line). Pipe it instead: `codex exec ... - < prompt.txt`.
+
+**Caught & fixed:**
+- The old header number (`duplicate_count - same_run`) also counted duplicate TAX rows past
+  the 18-month cap, which no view lists. `already_delivered_count` applies the cap; a test
+  pins the difference.
+- Browser pass 1 (51/55): the tabs unmounted during a view switch (the results query is
+  undefined while the other set loads), dropping keyboard focus. Counts are now latched per
+  job id. And the delivered CSV saved as `export_<id>.csv`, same as the new one:
+  `Content-Disposition` is not readable cross-origin, so the client fallback now carries the
+  view (pre-existing: the API's filename never reached the browser).
+- Codex FE r1: `replace` made Back leave the page, and a switch fetched page N of the other
+  set before resetting. Now push per switch and a view-keyed page number.
+
+**Pending / Handoff:**
+- Owner approval to push both branches and open PRs. Merge BE first: the FE types were
+  generated from this branch's schema, and FE CI regenerates from BE `main`.
+- CI: BE #337-#339 ran green on 2026-09-18, so Actions should verify both PRs again. Check
+  the run annotations if a job fails in ~1s (that shape was the earlier billing block).
+
+**Facts learned:**
+- On the screenshot run, 25 of 227 point at runs purged by retention: the date survives on the
+  row, the run does not. Expect that share to grow as retention ages runs out.
+- The download endpoint's own filename never reaches the in-app download (cross-origin
+  header). Any per-file naming must also live in the client fallback.
+
+---
+
 ## 2026-09-17 — The OpenAPI gate was never about the schema, and a retention purge built blind
 
 > Continues the earlier 2026-09-17 entry, which sits at the BOTTOM of this file rather

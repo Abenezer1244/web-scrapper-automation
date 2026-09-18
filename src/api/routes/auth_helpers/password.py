@@ -10,13 +10,20 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.auth import hash_password, verify_password
-from src.api.middleware import audit_log, rate_limit
+from src.api.middleware import audit_log, once_per, rate_limit
 from src.api.schemas import ForgotPasswordRequest, PasswordChange, ResetPasswordRequest
 from src.config import settings
 from src.db import User
 from src.utils.crypto import blind_index
 
 from .tokens import _decode_reset_token, _mint_reset_token
+
+# One password-reset email per address per 5 minutes. Chosen to cap an email bomb
+# at ~12/hour per inbox instead of unlimited, while staying usable for someone who
+# genuinely deleted the mail and retries. Longer would start punishing real users;
+# the reset TOKEN itself lives 30 minutes, so a resend inside this window would
+# not have invalidated the link they already have.
+_RESET_EMAIL_MIN_INTERVAL = 300
 
 
 async def change_user_password(
@@ -113,7 +120,38 @@ async def forgot_user_password(
     )
     user = result.scalar_one_or_none()
 
-    if user is not None:
+    # Email-bomb guard. The per-IP limiter on line 106 is NOT load-bearing right
+    # now: Railway's mesh moved to 100.64.0.0/10 (CGNAT), which is absent from
+    # _TRUSTED_PROXY_NETWORKS, so client_ip() returns a peer address that rotates
+    # per request and every call mints a fresh bucket. Until the origin is closed
+    # to non-Cloudflare traffic we cannot trust ANY IP-derived key — the Railway
+    # origin is currently reachable directly, so X-Forwarded-For is forgeable and
+    # "fixing" the IP key would hand an attacker unlimited forged keys.
+    #
+    # once_per keys on the address instead, which an attacker cannot rotate, and
+    # fails CLOSED on a Redis outage (suppressing a reset email beats letting a
+    # bomb through). Without this, anyone could drive unlimited reset mail at a
+    # known user's inbox and burn Resend quota and sender reputation.
+    #
+    # It gates the SEND ONLY. The response below is the same generic 200 either
+    # way, with no distinguishing timing, so this leaks nothing about existence
+    # and gives an attacker no signal that the bucket is full. Deliberately NOT a
+    # 429: a visible per-address rejection would both leak existence and let
+    # someone lock a real user out of password reset. (Codex)
+    # `user` is deliberately NOT reassigned here — audit_log below must still
+    # record the real user id for a suppressed attempt, otherwise a bombing run
+    # becomes invisible to ops at exactly the moment it matters.
+    #
+    # once_per is called UNCONDITIONALLY, before the `user is not None` test, so
+    # that both branches pay the same Redis round-trip. Short-circuiting on
+    # `user is not None and await once_per(...)` would have made the round-trip
+    # happen only for addresses that exist — a timing oracle that answers the
+    # exact question the generic 200 is here to hide. (Codex caught this.)
+    reset_key = f"pwreset:{blind_index(body.email)}"
+    fresh = await once_per(reset_key, _RESET_EMAIL_MIN_INTERVAL)
+    may_send = user is not None and fresh
+
+    if may_send:
         token = _mint_reset_token(user.id)
         # Token in the URL FRAGMENT (#), not the query (?): a fragment is never
         # sent to a server (RFC 3986 §3.5), so this bearer reset token can't leak
@@ -127,6 +165,14 @@ async def forgot_user_password(
         # surfaces or disturbs the enumeration-safe 200.
         from src.workers.delivery import send_password_reset_email
         background_tasks.add_task(send_password_reset_email, body.email, reset_link)
+        # NOT released on delivery failure, unlike the duplicate-signup notice in
+        # registration.py. That is a considered difference, not an oversight:
+        # send_password_reset_email returns None and swallows failures BY DESIGN
+        # (so a Resend outage cannot leak account existence), so the caller cannot
+        # detect one without changing that contract. The release matters there
+        # because that gate is 86400s — a full day of denial. Here it is 300s, so
+        # the worst case is a user whose mail failed waiting five minutes. Not
+        # worth reworking a deliberately-silent sender for. (Codex raised it.)
 
     # audit_log records the attempt without leaking existence to the client.
     audit_log(request, "password_reset_requested", user.id if user else None)

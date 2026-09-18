@@ -318,21 +318,60 @@ def check_rls_role_status() -> dict:
     decorative — the app's application-level WHERE user_id filters
     are the only tenant boundary.
 
-    REDTEAM HIGH T2 (docs/security/REDTEAM-2026-06-01.md): in
-    production this is no longer advisory. If the runtime role
-    bypasses RLS (BYPASSRLS or superuser), the WITH CHECK write
-    policies added in migration 025 are silently skipped and the
-    per-query user_id filter becomes the *only* tenant boundary —
-    one missing WHERE clause leaks across tenants. So when
-    ENVIRONMENT == "production" and the role carries an implicit
-    bypass, this function raises RuntimeError to refuse boot. Outside
-    production it stays advisory (logs only) so local/dev databases —
-    where the connecting role is often the superuser/owner — still
-    start. C2 from the full-SaaS review.
+    REDTEAM HIGH T2 (docs/security/REDTEAM-2026-06-01.md): if the
+    runtime role bypasses RLS (BYPASSRLS or superuser), the WITH CHECK
+    write policies added in migration 025 are silently skipped and the
+    per-query user_id filter becomes the *only* tenant boundary — one
+    missing WHERE clause leaks across tenants.
+
+    The gate is ``settings.RLS_ENFORCE``, NOT ``ENVIRONMENT ==
+    "production"`` — read the code below, this docstring used to say the
+    latter and disagreed with the implementation. When RLS_ENFORCE is on
+    and a checked role carries an implicit bypass, this function raises
+    RuntimeError and refuses to boot. With it off it stays advisory
+    (logs only) so local/dev databases — where the connecting role is
+    often the superuser/owner — still start.
+
+    Production runs RLS_ENFORCE=true on both the api and worker services
+    (verified 2026-09-17), so a serving API is itself evidence that this
+    gate passed and the roles do not bypass RLS. C2 from the full-SaaS
+    review.
     """
     import logging
 
     log = logging.getLogger("security.rls")
+
+    # CONFIG-DRIFT ALARM. Everything below only enforces when RLS_ENFORCE is on,
+    # and that flag lives in the Railway environment, not in this repo — so an
+    # accidental unset would silently downgrade production to advisory mode with
+    # no signal at all. The boot would look completely normal. Make it loud.
+    #
+    # Deliberately an ALARM and NOT a hard failure: RLS_ENFORCE=false in
+    # production is the documented ROLLBACK path (see docs/BUILD_JOURNAL.md —
+    # "rollback = repoint + RLS_ENFORCE=false + NO FORCE"). Refusing to boot here
+    # would block the very procedure you would be running during an incident.
+    # (Codex flagged the drift; the non-blocking shape is because of the rollback.)
+    if settings.ENVIRONMENT.strip().lower() == "production" and not settings.RLS_ENFORCE:
+        log.error(
+            "RLS_ENFORCE is OFF in production — RLS is advisory only and the "
+            "per-query user_id filter is the sole tenant boundary. This is correct "
+            "ONLY during a deliberate RLS rollback; otherwise it is config drift."
+        )
+        try:
+            from src.workers.ops_alerts import send_ops_alert
+
+            send_ops_alert(
+                "rls_enforce_off", "boot",
+                "RLS_ENFORCE is off in production",
+                "The API/worker booted with ENVIRONMENT=production and "
+                "RLS_ENFORCE unset or false. Row-level security is NOT enforced; "
+                "a single missing user_id filter would leak across tenants. If "
+                "this is not an intentional rollback, set RLS_ENFORCE=true on "
+                "every api+worker service and redeploy.",
+            )
+        except Exception:  # noqa: BLE001 — an alert failure must not block boot
+            log.exception("RLS_ENFORCE drift alert failed to send")
+
     try:
         sync_info = _role_status(sync_engine)
         if sync_info is None:
@@ -381,15 +420,21 @@ def check_rls_role_status() -> dict:
             # WITH CHECK write policies (and all RLS) inert, leaving the tenant
             # boundary to the application WHERE filters alone.
             #
-            # Enforcement is GATED behind RLS_ENFORCE (default False = advisory
-            # log, today's behavior). We can only HARD-FAIL once the full RLS
-            # cutover is in place — and it is NOT yet: the current prod role HAS
-            # BYPASSRLS and worker paths depend on it (rls_sync_session() sets
-            # app.current_user_id via SET LOCAL, cleared on the mid-task commit
-            # in run_scrape_job; system_sync_session() sets no GUC for legitimate
-            # cross-tenant ingest). Flip RLS_ENFORCE on only after the staged
-            # cutover (role downgrade + per-transaction GUC reapply + a system
-            # RLS policy) — the deferred HIGH-2 work on branch security/high-2-rls.
+            # Enforcement is GATED behind RLS_ENFORCE, whose CODE DEFAULT is
+            # False. That default is NOT the production value: the H1 cutover
+            # landed 2026-06-12 (see docs/BUILD_JOURNAL.md), and
+            # `railway variables -s api|worker` shows RLS_ENFORCE=true on BOTH
+            # services (re-verified 2026-09-17). Production roles do NOT bypass
+            # RLS, the 47 role-targeted policies are live, and 23 tables carry
+            # FORCE ROW LEVEL SECURITY. Reaching this branch in production would
+            # mean a role regression, and the RuntimeError below is correct.
+            #
+            # This comment previously claimed "the current prod role HAS
+            # BYPASSRLS". That was true pre-cutover and false ever since, and it
+            # cost two independent security reviewers real time: one nearly filed
+            # a P1 that all RLS is decorative, the other derived a conditional P0
+            # from it. If you change the production posture, change this comment
+            # in the same commit.
             detail = ", ".join(
                 f"{label}={info['role']}(bypassrls={info['bypassrls']},"
                 f"super={info['is_superuser']})"

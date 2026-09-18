@@ -367,3 +367,43 @@ async def test_dispatcher_noop_when_flag_off(client: AsyncClient, db, monkeypatc
     rows = await _pending_for(db, email)
     assert rows[0].email_dispatch_state == "pending"  # untouched
     await _clear_pending(db, email)
+
+
+async def test_forgot_password_is_rate_limited_per_address_without_leaking(
+    client: AsyncClient, db, monkeypatch
+):
+    """A second reset request for the same address inside the window sends NO
+    second email, while the HTTP response stays byte-identical.
+
+    Both halves matter. Suppressing the send is the email-bomb fix (the per-IP
+    limiter cannot do this job: Railway's CGNAT mesh makes client_ip() rotate per
+    request, and the origin is directly reachable so X-Forwarded-For is forgeable).
+    Keeping the response identical is what stops the fix from becoming two NEW
+    bugs: a visible per-address 429 would leak that the account exists, and would
+    let anyone lock a real user out of password reset.
+    """
+    import src.workers.delivery as delivery
+
+    monkeypatch.setattr(settings, "EMAIL_VERIFICATION_ENABLED", False)
+    sent: list[str] = []
+    monkeypatch.setattr(
+        delivery, "send_password_reset_email", lambda email, link: sent.append(link)
+    )
+    email = _email()
+    assert (await client.post("/auth/register", json=_legacy_body(email))).status_code == 201
+
+    first = await client.post("/auth/forgot-password", json={"email": email})
+    second = await client.post("/auth/forgot-password", json={"email": email})
+
+    # Exactly one email, despite two requests.
+    assert len(sent) == 1, f"expected 1 reset email, got {len(sent)}"
+
+    # ...and the caller cannot tell which request was suppressed.
+    assert first.status_code == second.status_code == 200
+    assert first.json() == second.json()
+
+    # An address with no account is indistinguishable from both of the above.
+    unknown = await client.post("/auth/forgot-password", json={"email": _email()})
+    assert unknown.status_code == 200
+    assert unknown.json() == first.json()
+    assert len(sent) == 1, "a nonexistent address must not trigger a send"

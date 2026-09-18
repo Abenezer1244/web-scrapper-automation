@@ -94,3 +94,46 @@ def test_worker_blocks_ssrf_webhook_without_posting():
     )
     assert result.successful()
     assert result.get()["status"] == "blocked"
+
+
+def test_no_outbound_call_follows_redirects():
+    """Pins the compensating control that makes the DNS-rebinding TOCTOU an
+    ACCEPTED risk rather than a live one (see the block comment at the SSRF guard
+    in webhook_delivery.py).
+
+    Without pinning the validated IP, "we never follow a redirect" is what stops
+    an allowed host from 30x-ing us into the private network. If someone ever
+    flips one of these to True, the accepted-risk reasoning is void and IP
+    pinning becomes required -- so fail here rather than let it pass silently.
+    """
+    import re
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parents[1] / "src"
+    offenders: list[str] = []
+    for path in src.rglob("*.py"):
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for m in re.finditer(r"allow_redirects\s*=\s*(\w+)", text):
+            if m.group(1) != "False":
+                line = text[: m.start()].count("\n") + 1
+                offenders.append(f"{path.relative_to(src)}:{line} -> {m.group(0)}")
+    assert not offenders, (
+        "outbound HTTP must never follow redirects while the SSRF guard does not "
+        "pin the validated IP:\n  " + "\n  ".join(offenders)
+    )
+
+
+def test_dialer_webhook_response_body_is_not_surfaced():
+    """Pins the OTHER compensating control: the SSRF is blind.
+
+    If a response body ever reaches the user, a rebind stops being a blind POST
+    and becomes full-read SSRF against the internal network.
+    """
+    from pathlib import Path
+
+    wd = (Path(__file__).resolve().parents[1] / "src/workers/webhook_delivery.py").read_text(
+        encoding="utf-8", errors="replace"
+    )
+    assert "_redact_response" in wd, (
+        "the dialer response-redaction guard disappeared; blind-SSRF assumption broken"
+    )

@@ -78,22 +78,29 @@ class PhoneBurnerConnector(DialerConnector):
         for ld in leads:
             first_name, last_name = _split_name(ld.get("party_name"))
             dnc_status = self.map_dnc_status(ld.get("phone_dnc_flag"))
+            # Spreadsheet-safe because PhoneBurner contacts get exported to
+            # CSV/Excel by customers as a matter of routine, and party_name /
+            # property_address / mailing_address are county-derived untrusted
+            # text. See DialerConnector.spreadsheet_safe for why this is applied
+            # HERE and deliberately not on the generic webhook, and why
+            # phone_number and email_address are left alone.
+            safe = self.spreadsheet_safe
             body = {
                 "owner_id": owner_id,
-                "first_name": first_name,
-                "last_name": last_name,
+                "first_name": safe(first_name),
+                "last_name": safe(last_name),
                 "phone_number": ld.get("phone"),
                 "email_address": ld.get("email"),
-                "address": ld.get("property_address"),
+                "address": safe(ld.get("property_address")),
                 # PhoneBurner-side dedup backstop (NOT our replay model). Confirm
                 # exact param names against the live API on first smoke.
                 "duplicate_checks": "phone",
                 "on_duplicate": "skip",
                 "custom_fields": {
                     "bridgeleads_external_id": f"bridgeleads:result:{ld.get('id')}",
-                    "owner_name": ld.get("party_name"),
+                    "owner_name": safe(ld.get("party_name")),
                     "dnc_status": dnc_status,
-                    "mailing_address": ld.get("mailing_address"),
+                    "mailing_address": safe(ld.get("mailing_address")),
                     "record_type": job_meta.get("record_type"),
                     "county": job_meta.get("county"),
                     "state": job_meta.get("state"),

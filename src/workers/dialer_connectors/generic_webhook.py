@@ -24,6 +24,20 @@ class GenericWebhookConnector(DialerConnector):
         is consumed here and not surfaced as a request field. The URL itself is a
         user-provided catch-hook secret → the transport re-reads it from the DB at
         send time rather than from a Celery task arg.
+
+        DELIBERATELY NOT spreadsheet-sanitized, unlike the PhoneBurner connector.
+        This is a decision, not an oversight — do not "fix" it by adding
+        DialerConnector.spreadsheet_safe() here.
+
+        JSON is not an injection context. A county value like `=HYPERLINK(...)`
+        is inert in a JSON body, and apostrophe-prefixing it would corrupt the
+        canonical value for EVERY consumer of this webhook forever, including the
+        majority that pipe it into a CRM or database and never open a
+        spreadsheet. PhoneBurner is sanitized because its predictable downstream
+        use IS a CSV/Excel export; an arbitrary customer webhook has no such
+        known destination, so the neutralization belongs at whatever point that
+        consumer generates a spreadsheet — which is the same rule we apply to
+        ourselves in the file-export path. (Codex-reviewed.)
         """
         payload = build_dialer_push_payload(
             job_id=job_meta["job_id"],

@@ -33,9 +33,12 @@ async def lifespan(app: FastAPI):
     # Phase 3 audit in docs/compliance/connector-audit-2026-04-10.md
     from src.api.middleware import register_connector_domains_from_db
     register_connector_domains_from_db()
-    # Advisory check: report whether the DB role bypasses RLS. If it
-    # does, tenant isolation relies entirely on the application-level
-    # WHERE filters. C2 from the full-SaaS code review — see
+    # FAIL-CLOSED boot gate (not merely advisory, as this comment used to
+    # say): with RLS_ENFORCE on — which production sets on both api and
+    # worker — this REFUSES TO START if the DB role bypasses RLS, because
+    # a bypassing role makes all 47 policies inert and leaves tenant
+    # isolation to the application WHERE filters alone. With RLS_ENFORCE
+    # off it only logs. C2 from the full-SaaS code review — see
     # docs/compliance/connector-audit-2026-04-10.md follow-ups.
     from src.db.session import check_rls_role_status
     check_rls_role_status()

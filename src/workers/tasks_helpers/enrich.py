@@ -278,6 +278,7 @@ def _reuse_enrichment_for_duplicates(db, job, job_id: str) -> int:
             phone_dnc_flag = CASE WHEN ro.skip_trace_status IN ('hit','miss') AND ro.skip_trace_attempted_at IS NOT NULL AND ro.skip_trace_attempted_at >= NOW() - make_interval(days => :ttl) AND rn.skip_trace_status = 'not_attempted' AND NOT (CAST(:atip_blocked AS boolean) AND COALESCE(rn.enrichment_data->>'source', '') = 'tacoma_code_violations' AND COALESCE(rn.enrichment_data->>'owner_source', '') = :atip_source) THEN ro.phone_dnc_flag ELSE rn.phone_dnc_flag END,
             email = CASE WHEN ro.skip_trace_status IN ('hit','miss') AND ro.skip_trace_attempted_at IS NOT NULL AND ro.skip_trace_attempted_at >= NOW() - make_interval(days => :ttl) AND rn.skip_trace_status = 'not_attempted' AND NOT (CAST(:atip_blocked AS boolean) AND COALESCE(rn.enrichment_data->>'source', '') = 'tacoma_code_violations' AND COALESCE(rn.enrichment_data->>'owner_source', '') = :atip_source) THEN ro.email ELSE rn.email END,
             skip_trace_status = CASE WHEN ro.skip_trace_status IN ('hit','miss') AND ro.skip_trace_attempted_at IS NOT NULL AND ro.skip_trace_attempted_at >= NOW() - make_interval(days => :ttl) AND rn.skip_trace_status = 'not_attempted' AND NOT (CAST(:atip_blocked AS boolean) AND COALESCE(rn.enrichment_data->>'source', '') = 'tacoma_code_violations' AND COALESCE(rn.enrichment_data->>'owner_source', '') = :atip_source) THEN ro.skip_trace_status ELSE rn.skip_trace_status END,
+            skip_trace_source = CASE WHEN ro.skip_trace_status IN ('hit','miss') AND ro.skip_trace_attempted_at IS NOT NULL AND ro.skip_trace_attempted_at >= NOW() - make_interval(days => :ttl) AND rn.skip_trace_status = 'not_attempted' AND NOT (CAST(:atip_blocked AS boolean) AND COALESCE(rn.enrichment_data->>'source', '') = 'tacoma_code_violations' AND COALESCE(rn.enrichment_data->>'owner_source', '') = :atip_source) THEN 'reused' ELSE rn.skip_trace_source END,
             skip_trace_attempted_at = CASE WHEN ro.skip_trace_status IN ('hit','miss') AND ro.skip_trace_attempted_at IS NOT NULL AND ro.skip_trace_attempted_at >= NOW() - make_interval(days => :ttl) AND rn.skip_trace_status = 'not_attempted' AND NOT (CAST(:atip_blocked AS boolean) AND COALESCE(rn.enrichment_data->>'source', '') = 'tacoma_code_violations' AND COALESCE(rn.enrichment_data->>'owner_source', '') = :atip_source) THEN ro.skip_trace_attempted_at ELSE rn.skip_trace_attempted_at END,
             phones = CASE WHEN ro.skip_trace_status IN ('hit','miss') AND ro.skip_trace_attempted_at IS NOT NULL AND ro.skip_trace_attempted_at >= NOW() - make_interval(days => :ttl) AND rn.skip_trace_status = 'not_attempted' AND NOT (CAST(:atip_blocked AS boolean) AND COALESCE(rn.enrichment_data->>'source', '') = 'tacoma_code_violations' AND COALESCE(rn.enrichment_data->>'owner_source', '') = :atip_source) THEN ro.phones ELSE rn.phones END,
             emails = CASE WHEN ro.skip_trace_status IN ('hit','miss') AND ro.skip_trace_attempted_at IS NOT NULL AND ro.skip_trace_attempted_at >= NOW() - make_interval(days => :ttl) AND rn.skip_trace_status = 'not_attempted' AND NOT (CAST(:atip_blocked AS boolean) AND COALESCE(rn.enrichment_data->>'source', '') = 'tacoma_code_violations' AND COALESCE(rn.enrichment_data->>'owner_source', '') = :atip_source) THEN ro.emails ELSE rn.emails END
@@ -321,7 +322,8 @@ def _reuse_enrichment_for_duplicates(db, job, job_id: str) -> int:
             phone_dnc_flag = src.phone_dnc_flag, email = src.email,
             phones = src.phones, emails = src.emails,
             skip_trace_status = src.skip_trace_status,
-            skip_trace_attempted_at = src.skip_trace_attempted_at
+            skip_trace_attempted_at = src.skip_trace_attempted_at,
+            skip_trace_source = 'reused'
         FROM (
             SELECT DISTINCT ON (ro.dedup_hash)
                    ro.dedup_hash, ro.phone, ro.phone_type, ro.phone_dnc_flag, ro.email,
@@ -2192,6 +2194,7 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config) -> None:
             rec.emails = cached.emails
             rec.skip_trace_status = "hit" if (cached.phone or cached.email) else "miss"
             rec.skip_trace_attempted_at = _now()
+            rec.skip_trace_source = "reused"  # no lookup bought for this row
             cache_hits += 1
         else:
             # Enqueue for the dispatcher. Truncate string fields to fit

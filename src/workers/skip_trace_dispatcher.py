@@ -668,6 +668,7 @@ def _settle_queued_from_known_answers(db) -> int | None:
                     "phones": answer.phones, "emails": answer.emails,
                     "skip_trace_status": "hit" if (answer.phone or answer.email) else "miss",
                     "skip_trace_attempted_at": now,
+                    "skip_trace_source": "reused",  # no lookup bought for this row
                 }
             else:
                 values = {"skip_trace_status": "errored", "skip_trace_attempted_at": now}

@@ -28,6 +28,11 @@
             "default": 0,
             "title": "Not Looked Up",
             "type": "integer"
+          },
+          "reused": {
+            "default": 0,
+            "title": "Reused",
+            "type": "integer"
           }
         },
         "title": "AlreadyDeliveredContacts",
@@ -2945,7 +2950,8 @@
               "found": 0,
               "looking": 0,
               "none_found": 0,
-              "not_looked_up": 0
+              "not_looked_up": 0,
+              "reused": 0
             }
           },
           "already_delivered_count": {

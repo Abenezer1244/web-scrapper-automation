@@ -73,7 +73,7 @@ def _run(user_id: str, *, skip_on: bool, status: str = "enriching") -> str:
 def _lead(
     user_id: str, job_id: str, n: int, *, dup: bool = False, reason: str | None = None,
     status: str = "not_attempted", traced_days_ago: float | None = None,
-    phone: str | None = None, email: str | None = None,
+    phone: str | None = None, email: str | None = None, source: str | None = None,
 ) -> str:
     """A lead row. A non-duplicate claims its property for the account, exactly as the
     worker's dedup claim does; a duplicate is flagged against an earlier claim."""
@@ -88,6 +88,7 @@ def _lead(
             dedup_hash=_hash(n), is_duplicate=dup,
             duplicate_reason=(reason or "prior_run") if dup else None,
             skip_trace_status=status, skip_trace_attempted_at=attempted,
+            skip_trace_source=source,
             phone=phone, email=email,
             phones=[{"number": phone, "type": "Mobile"}] if phone else None,
             emails=[email] if email else None,
@@ -224,6 +225,7 @@ async def test_a_prior_hit_is_copied_not_bought_again(
     assert row.skip_trace_status == "hit"
     assert row.phone == "2065550100"
     assert row.email == "owner@example.com"
+    assert row.skip_trace_source == "reused"  # reuse statement 1
 
 
 async def test_a_trace_bought_on_a_later_run_is_reused_by_the_next_one(
@@ -246,6 +248,7 @@ async def test_a_trace_bought_on_a_later_run_is_reused_by_the_next_one(
     row = _row(dup)
     assert row.skip_trace_status == "hit"
     assert row.phone == "2065550111"
+    assert row.skip_trace_source == "reused"  # reuse statement 2
 
 
 async def test_a_prior_no_contacts_answer_is_not_asked_again(
@@ -309,6 +312,7 @@ async def test_the_tenant_cache_answers_an_already_delivered_lead(
     row = _row(dup)
     assert row.skip_trace_status == "hit"
     assert row.phone == "2065550133"
+    assert row.skip_trace_source == "reused"  # enqueue cache hit
 
 
 # ── 6: failures ──────────────────────────────────────────────────────────────
@@ -599,6 +603,7 @@ async def test_a_held_twin_takes_the_answer_when_it_lands_and_is_not_billed(
     assert (row.skip_trace_status, row.phone, row.email) == (
         "hit", "2065550144", "landed@example.com")
     assert row.is_duplicate is True
+    assert row.skip_trace_source == "reused"  # dispatcher known-answer sweep
 
 
 async def test_a_twin_whose_lookup_was_charged_without_a_match_is_not_bought_again(
@@ -743,6 +748,7 @@ async def test_an_answer_for_an_already_delivered_lead_bills_one_lookup_and_no_r
     assert (row.skip_trace_status, row.phone, row.email) == (
         "hit", "2065550166", "owner@example.com")
     assert (row.is_duplicate, row.duplicate_reason) == (True, "prior_run")
+    assert row.skip_trace_source == "lookup"  # Tracerfy answered this row
     lookups_after, records_after = usage()
     assert lookups_after - lookups_before == 1, "skip-trace usage must move by the one lookup"
     assert records_after == records_before, "an already-delivered lead was billed as a record"
@@ -765,6 +771,7 @@ async def test_an_answer_for_an_already_delivered_lead_bills_one_lookup_and_no_r
         _enqueue_skip_trace_rows(s, job, redis_client, third, cfg)
     assert _pending(third_dup) == 0
     assert _row(third_dup).phone == "2065550166"
+    assert _row(third_dup).skip_trace_source == "reused"
     assert usage() == (lookups_after, records_after)
 
 
@@ -784,10 +791,11 @@ async def test_the_results_page_reports_the_lookup_state_of_already_delivered_le
     _lead(business_user.id, run, 0)  # new
     _lead(business_user.id, run, 0, dup=True, reason="same_run")  # combined, not counted
     _lead(business_user.id, run, 1, dup=True, status="hit", traced_days_ago=0,
-          phone="2065550188", email="found@example.com")
+          phone="2065550188", email="found@example.com", source="lookup")
     _lead(business_user.id, run, 2, dup=True, status="hit", traced_days_ago=0,
-          phone="2065550199")
-    _lead(business_user.id, run, 3, dup=True, status="miss", traced_days_ago=0)
+          phone="2065550199", source="reused")
+    _lead(business_user.id, run, 3, dup=True, status="miss", traced_days_ago=0,
+          source="reused")
     _lead(business_user.id, run, 4, dup=True, status="queued")
     _lead(business_user.id, run, 5, dup=True, status="errored", traced_days_ago=0)
     _lead(business_user.id, run, 6, dup=True)
@@ -798,10 +806,15 @@ async def test_the_results_page_reports_the_lookup_state_of_already_delivered_le
     assert resp.status_code == 200
     page = resp.json()
     assert page["already_delivered_count"] == 6
-    assert page["already_delivered_contacts"] == {
+    contacts = page["already_delivered_contacts"]
+    assert contacts == {
         "found": 2, "none_found": 1, "looking": 1, "failed": 1, "not_looked_up": 1,
+        # Of the 3 answered, 2 were copied from an earlier answer (one hit, one miss).
+        "reused": 2,
     }
-    assert sum(page["already_delivered_contacts"].values()) == page["already_delivered_count"]
+    buckets = ("found", "none_found", "looking", "failed", "not_looked_up")
+    assert sum(contacts[b] for b in buckets) == page["already_delivered_count"]
+    assert contacts["reused"] <= contacts["found"] + contacts["none_found"]
     # The rows the tab lists carry the contacts themselves.
     phones = {i["phone"] for i in page["items"] if i["phone"]}
     assert phones == {"2065550188", "2065550199"}
@@ -923,3 +936,55 @@ async def test_the_sweep_stands_aside_while_another_tick_is_claiming(
         other_tick.rollback()
 
     assert _pending_status(pid) == "queued"
+
+
+# ── provenance is written only where an answer is actually copied ────────────
+
+
+async def test_no_answer_copied_means_no_provenance(business_user, redis_client, _skip_trace_on):
+    """The first reuse statement also fills addresses for rows it copies no answer onto.
+    Those rows must not be marked 'reused'."""
+    first = _run(business_user.id, skip_on=False)
+    _lead(business_user.id, first, 1)  # original never traced: nothing to copy
+    again = _run(business_user.id, skip_on=False)
+    dup = _lead(business_user.id, again, 1, dup=True)
+
+    _enqueue(again, redis_client)
+
+    row = _row(dup)
+    assert (row.skip_trace_status, row.skip_trace_source) == ("not_attempted", None)
+
+
+async def test_a_lead_that_may_not_be_contacted_gets_no_answer_and_no_provenance(
+    business_user, redis_client, _skip_trace_on, monkeypatch,
+):
+    from src.scrapers.enrichment.pierce_atip_owner import OWNER_SOURCE
+
+    monkeypatch.setattr(settings, "PIERCE_CV_OWNER_SKIP_TRACE_ENABLED", False)
+    first = _run(business_user.id, skip_on=True)
+    _lead(business_user.id, first, 1, status="hit", traced_days_ago=1, phone="2065550210")
+    again = _run(business_user.id, skip_on=False)
+    dup = _lead(business_user.id, again, 1, dup=True)
+    with system_sync_session() as db:
+        db.execute(text("UPDATE results SET enrichment_data = CAST(:ed AS json) WHERE id = :r"),
+                   {"ed": json.dumps({"source": "tacoma_code_violations",
+                                      "owner_source": OWNER_SOURCE}), "r": dup})
+        db.commit()
+
+    _enqueue(again, redis_client)
+
+    row = _row(dup)
+    assert (row.phone, row.skip_trace_status, row.skip_trace_source) == (
+        None, "not_attempted", None)
+
+
+async def test_the_database_refuses_an_unknown_provenance(business_user):
+    import sqlalchemy.exc
+
+    job = _run(business_user.id, skip_on=False)
+    rid = _lead(business_user.id, job, 1)
+    with system_sync_session() as db:
+        with pytest.raises(sqlalchemy.exc.IntegrityError):
+            db.execute(text("UPDATE results SET skip_trace_source = 'free' WHERE id = :r"),
+                       {"r": rid})
+            db.commit()

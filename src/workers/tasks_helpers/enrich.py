@@ -2193,7 +2193,9 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config) -> None:
             rec.phones = cached.phones
             rec.emails = cached.emails
             rec.skip_trace_status = "hit" if (cached.phone or cached.email) else "miss"
-            rec.skip_trace_attempted_at = _now()
+            # When the data was obtained (the cache entry), not now: attempted_at is the
+            # 365-day PII retention clock, and a copy must not restart it.
+            rec.skip_trace_attempted_at = cached.fetched_at
             rec.skip_trace_source = "reused"  # no lookup bought for this row
             cache_hits += 1
         else:

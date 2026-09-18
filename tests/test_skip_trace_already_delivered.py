@@ -313,6 +313,9 @@ async def test_the_tenant_cache_answers_an_already_delivered_lead(
     assert row.skip_trace_status == "hit"
     assert row.phone == "2065550133"
     assert row.skip_trace_source == "reused"  # enqueue cache hit
+    # The retention clock is when the data was obtained (2 days ago), not now.
+    age = datetime.now(UTC) - row.skip_trace_attempted_at
+    assert timedelta(days=1, hours=23) < age < timedelta(days=2, hours=1)
 
 
 # ── 6: failures ──────────────────────────────────────────────────────────────
@@ -591,7 +594,7 @@ async def test_a_held_twin_takes_the_answer_when_it_lands_and_is_not_billed(
             address_hash=address_cache_key(business_user.id, _address(1), "VANCOUVER", "WA"),
             phone="2065550144", phone_type="Mobile", email="landed@example.com",
             phones=[{"number": "2065550144", "type": "Mobile"}], emails=["landed@example.com"],
-            fetched_at=datetime.now(UTC),
+            fetched_at=datetime.now(UTC) - timedelta(days=3),
         ))
         db.commit()
 
@@ -604,6 +607,8 @@ async def test_a_held_twin_takes_the_answer_when_it_lands_and_is_not_billed(
         "hit", "2065550144", "landed@example.com")
     assert row.is_duplicate is True
     assert row.skip_trace_source == "reused"  # dispatcher known-answer sweep
+    age = datetime.now(UTC) - row.skip_trace_attempted_at  # retention clock kept
+    assert timedelta(days=2, hours=23) < age < timedelta(days=3, hours=1)
 
 
 async def test_a_twin_whose_lookup_was_charged_without_a_match_is_not_bought_again(

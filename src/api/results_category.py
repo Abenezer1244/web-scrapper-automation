@@ -57,7 +57,9 @@ def skip_trace_eligible_condition():
     rows stay out: another row of this run is the same property, and it is the one
     traced. Whether a lookup is actually BOUGHT is decided after this, against reuse
     and the tenant cache."""
-    return or_(Result.is_duplicate.is_(False), already_delivered_condition())
+    # IS NOT TRUE, the same spelling as skip_trace_eligible_sql (the column is NOT NULL,
+    # but the two forms must not be able to disagree).
+    return or_(Result.is_duplicate.is_not(True), already_delivered_condition())
 
 
 def skip_trace_eligible_sql(alias: str) -> str:

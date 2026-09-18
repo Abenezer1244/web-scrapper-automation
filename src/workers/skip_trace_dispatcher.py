@@ -565,10 +565,6 @@ def _cancel_undeliverable_queued(db) -> int | None:
 # in-flight check cannot race another tick's uncommitted claim. Arbitrary constant.
 _CLAIM_LOCK_KEY = 7_220_915_018
 
-# A batch settles within hours. A row still 'submitted' after this is stuck, belongs to
-# the reconciler, and must not hold its twins back forever.
-_IN_FLIGHT_HOLD = timedelta(days=2)
-
 
 def _answer_key(row) -> str:
     """The per-tenant identity of the answer a pending row would buy: the exact key
@@ -689,23 +685,25 @@ def _hold_answers_in_flight(db, rows: list) -> tuple[list, int]:
     from the answer once it lands, or they go out then if it failed without a charge.
 
     Called under _CLAIM_LOCK_KEY, so a concurrent tick's claim is either committed (and
-    seen here as 'submitting') or not yet started."""
+    seen here as 'submitting') or not yet started.
+
+    No time limit on the hold (Codex P1): a twin stuck 'submitting'/'submitted' may
+    already be charged, and the system never auto-buys past an unknown outcome. The
+    stuck row is paged (_alert_stale_claims) and resolved by the reconciler; the held
+    twin follows it, settled from the answer or bought once the original is terminal
+    without one."""
     if not rows:
         return rows, 0
-    from sqlalchemy import func, select
+    from sqlalchemy import select
 
     from src.db.models import PendingSkipTraceRow
 
-    since = datetime.now(UTC) - _IN_FLIGHT_HOLD
     in_flight = {
         _answer_key(p)
         for p in db.execute(
             select(PendingSkipTraceRow).where(
                 PendingSkipTraceRow.user_id.in_({r.user_id for r in rows}),
                 PendingSkipTraceRow.status.in_(("submitting", "submitted")),
-                func.coalesce(
-                    PendingSkipTraceRow.submitted_at, PendingSkipTraceRow.enqueued_at
-                ) >= since,
             )
         ).scalars()
     }

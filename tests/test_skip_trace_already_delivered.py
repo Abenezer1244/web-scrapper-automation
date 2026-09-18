@@ -808,3 +808,27 @@ async def test_the_results_page_reports_the_lookup_state_of_already_delivered_le
     other = await client.get(f"/jobs/{run}/results", params={"category": "already_delivered"},
                              headers={"Authorization": f"Bearer {starter_token}"})
     assert other.status_code == 404
+
+
+async def test_a_twin_stuck_at_an_unknown_outcome_holds_for_as_long_as_it_takes(
+    business_user, _dispatcher_on,
+):
+    """Codex P1: a lookup left 'submitting' by an unknown outcome may already be charged,
+    and the system never buys past one. However old it is, its twin waits for the
+    reconciler instead of being bought a second time."""
+    first = _run(business_user.id, skip_on=True, status="done")
+    original = _lead(business_user.id, first, 1, status="submitted")
+    stuck = _queue(business_user.id, first, original, 1, status="submitting",
+                   submitted_days_ago=3)
+    again = _run(business_user.id, skip_on=True, status="done")
+    twin = _queue(business_user.id, again, _lead(business_user.id, again, 1, dup=True), 1)
+
+    from src.workers.skip_trace_dispatcher import _hold_answers_in_flight
+
+    with system_sync_session() as db:
+        head = db.execute(select(PendingSkipTraceRow).where(
+            PendingSkipTraceRow.id == twin)).scalars().all()
+        kept, held = _hold_answers_in_flight(db, head)
+    assert (kept, held) == ([], 1)
+    assert _pending_status(twin) == "queued"
+    assert _pending_status(stuck) == "submitting"

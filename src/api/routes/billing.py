@@ -2106,20 +2106,30 @@ async def _handle_subscription_updated(
                 )
             )
         except Exception as exc:  # noqa: BLE001 — never 500 a webhook
-            if require_entitled:
-                # A creation is only ever acted on when Stripe confirms it is
-                # entitled NOW. The event body can be stale (created active,
-                # cancelled since), so failing to ask is a retry, not a grant.
-                _logger.error(
-                    "customer.subscription.created: could not re-read %s from "
-                    "Stripe (%s); retrying later", subscription_id, str(exc)[:200],
-                )
-                raise
-            _logger.warning(
-                "customer.subscription.updated: could not re-read %s from Stripe "
-                "(%s) — applying the event payload, which may be out of order",
+            # BOTH paths now fail closed. A creation was already only acted on
+            # when Stripe confirms it is entitled NOW, because the event body
+            # can be stale (created active, cancelled since).
+            #
+            # `updated` used to fall through and APPLY the event payload here.
+            # That was the gap: the payload is a snapshot from when the event was
+            # emitted, and Stripe delivers out of order and retries for days. So
+            # during a Stripe API outage a validly-signed OLDER event could
+            # overwrite newer state — reinstating a plan the customer cancelled,
+            # or clearing dunning by writing a stale `active`. The row lock above
+            # does not help: it serializes writers, it does not order them.
+            #
+            # Raising instead hands the problem back to Stripe's retry, which is
+            # strictly safer than committing an unverifiable snapshot. The
+            # subscription state we already hold stays untouched until we can
+            # actually read the authoritative value. (Codex-reviewed.)
+            _logger.error(
+                "customer.subscription.%s: could not re-read %s from Stripe "
+                "(%s); refusing to apply the possibly-stale event body — "
+                "retrying later",
+                "created" if require_entitled else "updated",
                 subscription_id, str(exc)[:200],
             )
+            raise
 
     if require_entitled and data.get("status") not in _ENTITLED_CHECKOUT_STATUSES:
         _logger.info(

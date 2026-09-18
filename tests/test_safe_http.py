@@ -130,3 +130,56 @@ def test_stream_capped_empty_iterable_returns_zero(tmp_path):
     dest = tmp_path / "out.bin"
     assert _stream_capped([], str(dest), max_bytes=100) == 0
     assert dest.read_bytes() == b""
+
+
+# ── Response-size cap ────────────────────────────────────────────────────────
+# A hostile or malformed county source can stream an endless body or a
+# decompression bomb into a worker. safe_get/safe_get_following now materialize
+# under a byte budget; bulk files stay on safe_download_to_file's disk-capped
+# path.
+
+class _FakeResp:
+    """Minimal stand-in for requests.Response covering what _read_capped uses."""
+
+    def __init__(self, chunks, headers=None):
+        self._chunks = chunks
+        self.headers = headers or {}
+        self.closed = False
+        self._content = None
+        self._content_consumed = False
+
+    def iter_content(self, chunk_size=None):
+        yield from self._chunks
+
+    def close(self):
+        self.closed = True
+
+
+def test_read_capped_rejects_an_oversized_content_length_without_reading():
+    from src.utils.safe_http import _read_capped
+
+    resp = _FakeResp([b"x"], headers={"Content-Length": str(50 * 1024 * 1024)})
+    with pytest.raises(ValueError, match="too large"):
+        _read_capped(resp, 1024)
+    assert resp.closed is True
+
+
+def test_read_capped_aborts_a_body_that_lies_about_its_length():
+    """Content-Length is a hint, not a limit -- a hostile server can omit or
+    understate it, so the streamed read has to be the authoritative bound."""
+    from src.utils.safe_http import _read_capped
+
+    resp = _FakeResp([b"a" * 512] * 10)  # 5120 bytes, no Content-Length header
+    with pytest.raises(ValueError, match="exceeded"):
+        _read_capped(resp, 1024)
+    assert resp.closed is True
+
+
+def test_read_capped_passes_a_normal_body_through_intact():
+    from src.utils.safe_http import _read_capped
+
+    resp = _FakeResp([b"hello ", b"world"])
+    out = _read_capped(resp, 1024)
+    assert out._content == b"hello world"
+    assert out._content_consumed is True
+    assert resp.closed is False

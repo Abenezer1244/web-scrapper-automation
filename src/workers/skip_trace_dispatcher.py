@@ -52,6 +52,64 @@ def dispatch_pending_skip_trace() -> dict:
     from src.scrapers.enrichment.skip_trace import TracerfyError, submit_batch
     from src.workers.tasks_helpers.dedup import BILLING_STAMP_RELIABLE_SINCE
 
+    # SPEND CIRCUIT BREAKER. Every Tracerfy lookup costs the operator real money,
+    # and until now the only ceiling was the prepaid balance returning 402 — i.e.
+    # the spend limit was "until the money runs out". This trips BEFORE any claim
+    # or provider call.
+    #
+    # Placed here, at the top of the tick beside SKIP_TRACE_ENABLED, ON PURPOSE:
+    # it only ever STOPS work and never touches the queued -> submitting state
+    # machine below. That machine has careful unknown-outcome handling (a
+    # mis-step double-pays or strands paid rows), and this path already stalled
+    # every tenant for 7+ hours once. A breaker that can only decline to start a
+    # tick cannot cause that class of failure.
+    #
+    # Defaults to 0 = DISABLED, so deploying this changes nothing until an
+    # operator picks a number. Rows are not lost when it trips — they stay
+    # queued and flow on the next tick under the cap.
+    daily_cap = max(0, settings.SKIP_TRACE_DAILY_ROW_CAP)
+    if daily_cap:
+        # NOTE: do NOT import datetime/timedelta here. They are already imported
+        # at module scope (line 22) and used later in this same function; a
+        # function-local `from datetime import ...` rebinds the name as LOCAL for
+        # the whole function body, so every later `datetime.now(UTC)` raises
+        # UnboundLocalError on the path where this branch does not run. That
+        # broke dispatch outright and the skip-trace suite caught it.
+        from sqlalchemy import func as _func
+        from sqlalchemy import select as _select
+
+        from src.db.models import PendingSkipTraceRow as _Row
+        from src.db.session import system_sync_session as _sess
+
+        since = datetime.now(UTC) - timedelta(days=1)
+        with _sess() as _db:
+            spent_today = _db.execute(
+                _select(_func.count()).select_from(_Row).where(
+                    _Row.submitted_at.is_not(None), _Row.submitted_at >= since
+                )
+            ).scalar_one()
+        if spent_today >= daily_cap:
+            _logger.error(
+                "Skip-trace DAILY CAP reached: %d rows submitted in the last 24h "
+                "(cap %d). Holding this tick; queued rows are untouched and will "
+                "resume when the rolling window clears or the cap is raised.",
+                spent_today, daily_cap,
+            )
+            try:
+                from src.workers.ops_alerts import send_ops_alert
+
+                send_ops_alert(
+                    "skip_trace_daily_cap", "dispatcher",
+                    "Skip-trace daily spend cap reached",
+                    f"{spent_today} rows were submitted to Tracerfy in the last "
+                    f"24h, at or above SKIP_TRACE_DAILY_ROW_CAP={daily_cap}. "
+                    f"Dispatch is paused. Raise the cap or investigate whether "
+                    f"an account is driving unexpected volume.",
+                )
+            except Exception:  # noqa: BLE001 — an alert failure must not change the decision
+                _logger.exception("skip-trace daily-cap alert failed to send")
+            return {"skipped": "daily_cap", "spent_today": spent_today, "cap": daily_cap}
+
     max_batches = max(1, settings.SKIP_TRACE_MAX_BATCHES_PER_TICK)
     submitted_batches = 0
     submitted_rows = 0

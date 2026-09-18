@@ -115,16 +115,60 @@ def client_ip(request: Request) -> str:
 # attempts during an incident. Other zones still fail fully open (availability
 # over abuse-resistance is the right trade for non-security paths).
 _FALLBACK_ZONES = frozenset({"auth", "webhook", "stripe"})
+# Insertion-ordered (dict preserves order), so the oldest keys are the cheapest
+# to find when we need to reclaim space.
 _fallback_hits: dict[str, list[float]] = {}
+_FALLBACK_MAX_KEYS = 10_000
 
 
 def _fallback_allow(key: str, max_requests: int, window_seconds: int, now: float) -> bool:
+    """Per-process limiter used only while Redis is unavailable.
+
+    Memory is bounded by EXPIRY-ONLY eviction, never by clearing. The previous
+    `_fallback_hits.clear()` at the bound was a bypass: during a Redis outage
+    this is the ONLY limiter for the auth/webhook/stripe zones, so an attacker
+    could mint 10k throwaway keys and wipe every real counter — including the
+    brute-force ladder on an account they were attacking. Reclaiming space must
+    never discard an ACTIVE counter.
+
+    If every slot is genuinely live, admission fails CLOSED (deny the new key)
+    rather than evicting someone else's. During an outage a new client seeing a
+    429 is the correct trade against silently disarming the limiter for all
+    existing ones. (Codex.)
+    """
     cutoff = now - window_seconds
     bucket = _fallback_hits.setdefault(key, [])
     bucket[:] = [t for t in bucket if t > cutoff]
+
+    if len(_fallback_hits) > _FALLBACK_MAX_KEYS:
+        # Drop only EXPIRED buckets, oldest-first. A bucket's stale timestamps
+        # are normally pruned only when ITS OWN key is next seen, so a candidate
+        # must be re-filtered here before deciding it is empty — otherwise
+        # nothing is ever reclaimable and one historical flood denies every new
+        # caller forever. (Caught by
+        # test_expired_buckets_are_reclaimed_so_normal_traffic_is_not_denied.)
+        #
+        # Using this call's cutoff is sound because every _FALLBACK_ZONES zone
+        # shares the same 60s window. Adding a fallback zone with a LONGER window
+        # would make this prune another zone's entries early — widen the cutoff
+        # here if that ever happens.
+        for k in list(_fallback_hits):
+            if len(_fallback_hits) <= _FALLBACK_MAX_KEYS:
+                break
+            if k == key:
+                continue
+            other = _fallback_hits[k]
+            if other and other[-1] > cutoff:
+                continue  # still live, leave it alone
+            del _fallback_hits[k]
+        if len(_fallback_hits) > _FALLBACK_MAX_KEYS:
+            # Still full of live counters → refuse the newcomer instead of
+            # evicting an active one. Do not leave an empty bucket behind.
+            if not bucket:
+                _fallback_hits.pop(key, None)
+            return False
+
     bucket.append(now)
-    if len(_fallback_hits) > 10_000:  # crude memory bound for the fallback path
-        _fallback_hits.clear()
     return len(bucket) <= max_requests
 
 

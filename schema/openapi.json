@@ -1,6 +1,38 @@
 {
   "components": {
     "schemas": {
+      "AlreadyDeliveredContacts": {
+        "description": "Where the skip trace stands for this run's already-delivered leads.\n\nDelivered and traced are separate facts: a lead an earlier run delivered can still\nbe looked up when this run has skip trace on. The buckets partition\n``already_delivered_count`` exactly (same statement, same predicate), so they\nalways add up to the tab's number. Read from ``results`` alone: the queue tables\nare worker-only, so whether an answer was bought now or reused is not reported.",
+        "properties": {
+          "failed": {
+            "default": 0,
+            "title": "Failed",
+            "type": "integer"
+          },
+          "found": {
+            "default": 0,
+            "title": "Found",
+            "type": "integer"
+          },
+          "looking": {
+            "default": 0,
+            "title": "Looking",
+            "type": "integer"
+          },
+          "none_found": {
+            "default": 0,
+            "title": "None Found",
+            "type": "integer"
+          },
+          "not_looked_up": {
+            "default": 0,
+            "title": "Not Looked Up",
+            "type": "integer"
+          }
+        },
+        "title": "AlreadyDeliveredContacts",
+        "type": "object"
+      },
       "AnalyticsSummary": {
         "properties": {
           "by_county": {
@@ -2906,6 +2938,16 @@
       },
       "ResultsPage": {
         "properties": {
+          "already_delivered_contacts": {
+            "$ref": "#/components/schemas/AlreadyDeliveredContacts",
+            "default": {
+              "failed": 0,
+              "found": 0,
+              "looking": 0,
+              "none_found": 0,
+              "not_looked_up": 0
+            }
+          },
           "already_delivered_count": {
             "default": 0,
             "title": "Already Delivered Count",

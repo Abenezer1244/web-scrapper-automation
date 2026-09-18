@@ -765,3 +765,46 @@ async def test_an_answer_for_an_already_delivered_lead_bills_one_lookup_and_no_r
     assert _pending(third_dup) == 0
     assert _row(third_dup).phone == "2065550166"
     assert usage() == (lookups_after, records_after)
+
+
+# ── the Already delivered tab says where the lookups stand ───────────────────
+
+
+async def test_the_results_page_reports_the_lookup_state_of_already_delivered_leads(
+    business_user, client, business_token, starter_token,
+):
+    """The tab's number is partitioned into found / none found / looking / failed / not
+    looked up, from the same statement and predicate, so the parts always add up. A
+    same-run sibling is in neither, and another account gets nothing."""
+    earlier = _run(business_user.id, skip_on=False, status="done")
+    for n in range(1, 7):
+        _lead(business_user.id, earlier, n)
+    run = _run(business_user.id, skip_on=True, status="done")
+    _lead(business_user.id, run, 0)  # new
+    _lead(business_user.id, run, 0, dup=True, reason="same_run")  # combined, not counted
+    _lead(business_user.id, run, 1, dup=True, status="hit", traced_days_ago=0,
+          phone="2065550188", email="found@example.com")
+    _lead(business_user.id, run, 2, dup=True, status="hit", traced_days_ago=0,
+          phone="2065550199")
+    _lead(business_user.id, run, 3, dup=True, status="miss", traced_days_ago=0)
+    _lead(business_user.id, run, 4, dup=True, status="queued")
+    _lead(business_user.id, run, 5, dup=True, status="errored", traced_days_ago=0)
+    _lead(business_user.id, run, 6, dup=True)
+
+    resp = await client.get(f"/jobs/{run}/results", params={"category": "already_delivered"},
+                            headers={"Authorization": f"Bearer {business_token}"})
+
+    assert resp.status_code == 200
+    page = resp.json()
+    assert page["already_delivered_count"] == 6
+    assert page["already_delivered_contacts"] == {
+        "found": 2, "none_found": 1, "looking": 1, "failed": 1, "not_looked_up": 1,
+    }
+    assert sum(page["already_delivered_contacts"].values()) == page["already_delivered_count"]
+    # The rows the tab lists carry the contacts themselves.
+    phones = {i["phone"] for i in page["items"] if i["phone"]}
+    assert phones == {"2065550188", "2065550199"}
+
+    other = await client.get(f"/jobs/{run}/results", params={"category": "already_delivered"},
+                             headers={"Authorization": f"Bearer {starter_token}"})
+    assert other.status_code == 404

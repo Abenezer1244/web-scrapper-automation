@@ -26,6 +26,7 @@ from src.api.results_category import (
 )
 from src.api.results_sort import DEFAULT_RESULTS_SORT, ResultsSort, results_order_by
 from src.api.schemas import (
+    AlreadyDeliveredContacts,
     DuplicateSource,
     JobCreate,
     JobResponse,
@@ -599,6 +600,18 @@ async def get_results(
             func.count()
             .filter(already_delivered_condition(), tax_cap_condition(today))
             .label("already_delivered"),
+            # Skip-trace state of exactly those rows (AlreadyDeliveredContacts). A lead
+            # already delivered can still be looked up later, and the tab says so.
+            *(
+                func.count()
+                .filter(already_delivered_condition(), tax_cap_condition(today),
+                        Result.skip_trace_status.in_(statuses))
+                .label(f"delivered_{bucket}")
+                for bucket, statuses in (
+                    ("found", ("hit",)), ("none_found", ("miss",)),
+                    ("looking", ("queued", "submitted")), ("failed", ("errored",)),
+                )
+            ),
         ).where(
             Result.job_id == job_id,
             Result.user_id == current_user.id,
@@ -611,6 +624,14 @@ async def get_results(
     new_count = counts_row.new_leads
     same_run_duplicate_count = counts_row.same_run
     already_delivered_count = counts_row.already_delivered
+    delivered_buckets = {
+        bucket: getattr(counts_row, f"delivered_{bucket}")
+        for bucket in ("found", "none_found", "looking", "failed")
+    }
+    already_delivered_contacts = AlreadyDeliveredContacts(
+        **delivered_buckets,
+        not_looked_up=already_delivered_count - sum(delivered_buckets.values()),
+    )
 
     # ── Where this job's duplicates came from (migration 089) ───────────────
     # Read off results.duplicate_source_* — stamped by the worker at the moment
@@ -795,6 +816,7 @@ async def get_results(
         unattributed_duplicate_count=unattributed_duplicate_count,
         same_run_duplicate_count=same_run_duplicate_count,
         already_delivered_count=already_delivered_count,
+        already_delivered_contacts=already_delivered_contacts,
         has_auction_data=has_auction_data,
     )
 

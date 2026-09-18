@@ -130,6 +130,48 @@ class TestMapperReportsDegraded:
             {"00437860401300": ["00437860401300"]},
         ) == {}
 
+    def test_king_vacant_parcel_is_NOT_degraded(self):
+        # King declares mailing_fields=[] and skip_statewide_fallback. ~1/3 of its
+        # delinquent parcels are vacant/raw land with a null ADDR_FULL and no
+        # locality. Classifying those as degraded would DROP the feature instead of
+        # returning matched + vacant_no_situs, losing the vacant marker the worker
+        # persists and letting property recovery buy lookups for land with no
+        # address to find (Codex). King must be untouched by this change.
+        king = _KNOWN_GIS_ENDPOINTS["king_WA"]
+        degraded: list[str] = []
+        attrs = {
+            "PIN": "3879900805", "ADDR_FULL": None,
+            "POSTALCTYNAME": None, "STATE_ABBR": None, "ZIP5": None,
+        }
+        out = _map_county_features(
+            [{"attributes": attrs}], king, {"3879900805": ["3879900805"]},
+            degraded=degraded,
+        )
+        assert degraded == []
+        assert out["3879900805"]["vacant_no_situs"] is True
+        assert out["3879900805"]["matched"] is True
+
+    def test_a_populated_sibling_feature_beats_an_empty_one(self):
+        # One parcel can carry SEVERAL features (condo units). If an empty sibling
+        # left the id in `degraded` it would land in county_unreached, and
+        # mailing_recovery EXCLUDES every unreached parcel, discarding the real
+        # mailing address and rotating the row forever without consuming an attempt
+        # (Codex High). A real answer always wins, in either feature order.
+        for feats in (
+            [{"attributes": _STRIPPED}, {"attributes": _POPULATED}],
+            [{"attributes": _POPULATED}, {"attributes": _STRIPPED}],
+        ):
+            degraded: list[str] = []
+            out = _map_county_features(
+                feats, SNOHOMISH, {"00437860401300": ["00437860401300"]},
+                degraded=degraded,
+            )
+            # The mapper itself may report both; the caller reconciles. Assert the
+            # reconciliation rule the caller applies.
+            reconciled = [pid for pid in degraded if pid not in out]
+            assert reconciled == []
+            assert out["00437860401300"]["mailing_address"]
+
     def test_pierce_empty_feature_is_degraded_too(self):
         # Not Snohomish-specific: any configured county layer that answers with no
         # payload is degraded. Pierce reads Delivery_Address/City_State/Zipcode.

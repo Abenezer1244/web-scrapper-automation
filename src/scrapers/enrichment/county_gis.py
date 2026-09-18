@@ -833,6 +833,22 @@ def _configured_payload_fields(gis_config: dict) -> list[str]:
     return fields
 
 
+def _config_has_mailing_source(gis_config: dict) -> bool:
+    """Does this (EFFECTIVE) config actually read a mailing address anywhere?
+
+    The degraded marker exists to send a row to mailing recovery, so it is only
+    meaningful where a mailing source exists. Gating on it keeps King out: King
+    declares ``mailing_fields: []`` and ``skip_statewide_fallback``, and ~1/3 of its
+    delinquent parcels are vacant/raw land that legitimately return NO situs at all.
+    Classifying those as degraded would drop the feature instead of returning
+    matched + vacant_no_situs, losing the vacant marker the worker persists and
+    letting property recovery queue lookups for land that has no address to find
+    (Codex High/Medium). A license-gated config whose mailing fields have been
+    stripped also lands here and correctly keeps its pre-existing behaviour.
+    """
+    return bool(gis_config.get("mailing_fields") or gis_config.get("mailing_street_fields"))
+
+
 def _feature_payload_is_empty(attrs: dict, gis_config: dict) -> bool:
     """The layer matched this parcel but answered with NO data at all.
 
@@ -895,7 +911,7 @@ def _map_county_features(
         pid = attrs.get(parcel_field)
         if not pid:
             continue
-        if _feature_payload_is_empty(attrs, gis_config):
+        if _config_has_mailing_source(gis_config) and _feature_payload_is_empty(attrs, gis_config):
             # Matched, but the layer returned an identifier and nothing else. Do not
             # let this reach _parse_gis_response: for a county with its own
             # authoritative layer that would come back matched + vacant_no_situs and
@@ -1199,6 +1215,13 @@ def _batch_query_county(
                 degraded=degraded,
             )
             results.update(found)
+            # One parcel can carry SEVERAL features (condo units), so an empty
+            # sibling can sit beside a populated one. A real answer always wins:
+            # leaving the id in `degraded` would put it in county_unreached, and
+            # mailing_recovery EXCLUDES every unreached parcel from `attempted`, so
+            # its actual mailing address would be discarded and the row would rotate
+            # forever without ever consuming an attempt (Codex High).
+            degraded = [pid for pid in degraded if pid not in found]
             if degraded:
                 # The layer answered about these parcels with no data at all. That is
                 # not "no mailing address" — it is the source not serving us. Same

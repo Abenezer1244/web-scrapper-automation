@@ -1274,6 +1274,22 @@ class ResultRow(BaseModel):
     skip_trace_status: str = "not_attempted"
     skip_trace_attempted_at: datetime | None = None
     is_duplicate: bool = False
+    # Provenance of an already-delivered row (NULL on new rows), stamped by the
+    # worker when it classified the row: the earlier run of this account that held
+    # the dedup claim, and when that run took it. CLAIM time, not proof of
+    # delivery; the two flags below are what the page may claim beyond that.
+    duplicate_reason: str | None = None
+    duplicate_source_job_id: str | None = None
+    duplicate_source_at: datetime | None = None
+    # Set only in the already_delivered view, per page, never stored.
+    # available: the source run still exists, belongs to this account and finished,
+    #   so "View original run" can open it.
+    # original_visible: that run still LISTS this property as one of its new leads
+    #   (same account, same key, not a duplicate, actionable, in the tax cap), which
+    #   is what makes "delivered by your run" a checkable statement rather than a
+    #   claim-ledger inference.
+    duplicate_source_available: bool | None = None
+    duplicate_original_visible: bool | None = None
     # Phase 4: structured tax-delinquency fields (King tax_delinquent only; NULL
     # elsewhere). Surfaced so the results view can show + filter by them.
     delinquent_amount: float | None = None
@@ -1453,6 +1469,12 @@ class ResultsPage(BaseModel):
     # one property) and were never previously delivered to anyone. Counted in
     # duplicate_count, but the copy for them is different.
     same_run_duplicate_count: int = 0
+    # The already-delivered set, counted with EXACTLY the predicate the
+    # ?category=already_delivered list pages through before any view filter
+    # (job + user, actionable, tax cap, results_category), in the same statement
+    # as the counts above. So the number on the tab is the `total` that view
+    # returns unfiltered, and the CSV it downloads holds the same rows.
+    already_delivered_count: int = 0
     # NTS Tier 1: True if the JOB has ANY auction-matched lead (independent of the
     # current page/filter). The frontend gates the Auction Date / Default Owed
     # columns on this so they don't flicker by page when auction matches are sparse.

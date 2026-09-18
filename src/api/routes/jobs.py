@@ -18,6 +18,12 @@ from src.api.dialer_filters import dialer_ready_conditions
 from src.api.lead_actionability import actionable_condition, has_address_condition
 from src.api.middleware import audit_log, rate_limit, sanitize_search
 from src.api.owner_filters import build_owner_conditions
+from src.api.results_category import (
+    DEFAULT_RESULTS_CATEGORY,
+    ResultsCategory,
+    already_delivered_condition,
+    category_condition,
+)
 from src.api.results_sort import DEFAULT_RESULTS_SORT, ResultsSort, results_order_by
 from src.api.schemas import (
     DuplicateSource,
@@ -385,6 +391,9 @@ async def get_results(
     # Allowlisted order of the first column (Date, or Oldest Tax Year on tax jobs).
     # Anything else is a 422, so no caller-supplied column ever reaches ORDER BY.
     sort: ResultsSort = Query(DEFAULT_RESULTS_SORT),
+    # Which bucket to list: the run's new leads (default) or the rows an earlier
+    # run of this account already delivered. Allowlisted; anything else is a 422.
+    category: ResultsCategory = Query(DEFAULT_RESULTS_CATEGORY),
 ) -> ResultsPage:
     # Rate-limit before the (expensive, multi-query) read to prevent DB-amplification DoS.
     await rate_limit(request, zone="general", identifier=current_user.id)
@@ -424,10 +433,17 @@ async def get_results(
     # Per-job delivery ONLY. Lists/segments (src/api/routes/segments.py) and the batch
     # combined export deliberately KEEP duplicates: there, a lead whose only
     # contactable row happens to be a duplicate must not disappear.
+    #
+    # Owner, 2026-09-17: "227 already delivered" was a number nobody could check.
+    # The default view is unchanged (new leads only, never mixed with duplicates);
+    # ?category=already_delivered lists the prior-run duplicates on their OWN, with
+    # every other rule below (actionable, tax cap, search, filters, sort, paging)
+    # applied identically. Reading them is a plain SELECT: nothing here bills,
+    # counts against quota or queues a skip trace.
     base_query = select(Result).where(
         Result.job_id == job_id,
         Result.user_id == current_user.id,
-        Result.is_duplicate.is_(False),
+        category_condition(category),
     )
     if safe_q:
         pattern = f"%{safe_q}%"
@@ -486,6 +502,8 @@ async def get_results(
         .limit(page_size)
     )
     items = [ResultRow.model_validate(r) for r in rows_result.scalars().all()]
+    if category == "already_delivered" and items:
+        await _attach_delivery_provenance(db, current_user.id, items, today)
 
     # Count enriched records (have real property_address), excluding duplicates
     enriched_result = await db.execute(
@@ -575,6 +593,12 @@ async def get_results(
                 Result.duplicate_reason == "same_run",
             )
             .label("same_run"),
+            # The tab number. Same predicate as the already_delivered list's base
+            # query before view filters, INCLUDING the tax cap that the list applies
+            # and new_leads (a billing mirror) deliberately does not.
+            func.count()
+            .filter(already_delivered_condition(), tax_cap_condition(today))
+            .label("already_delivered"),
         ).where(
             Result.job_id == job_id,
             Result.user_id == current_user.id,
@@ -586,6 +610,7 @@ async def get_results(
     duplicate_count = counts_row.duplicates
     new_count = counts_row.new_leads
     same_run_duplicate_count = counts_row.same_run
+    already_delivered_count = counts_row.already_delivered
 
     # ── Where this job's duplicates came from (migration 089) ───────────────
     # Read off results.duplicate_source_* — stamped by the worker at the moment
@@ -669,6 +694,9 @@ async def get_results(
     # so suggesting it would be misleading (Codex).
     if (
         total == 0
+        # Only the new-leads view explains an empty page this way. An empty
+        # already-delivered view just means this run re-found nothing old.
+        and category == "new"
         and config
         and not tax_conditions
         and not dialer_ready
@@ -766,8 +794,78 @@ async def get_results(
         duplicate_sources=duplicate_sources,
         unattributed_duplicate_count=unattributed_duplicate_count,
         same_run_duplicate_count=same_run_duplicate_count,
+        already_delivered_count=already_delivered_count,
         has_auction_data=has_auction_data,
     )
+
+
+async def _attach_delivery_provenance(
+    db: AsyncSession, user_id: str, items: list[ResultRow], today
+) -> None:
+    """Say, per already-delivered row on THIS page, what can be checked about it.
+
+    At most three batched queries for the whole page, never one per row:
+      1. which source runs still exist, belong to this account and finished. A
+         source id is stamped with no foreign key, so a purged run is expected;
+         `done` matters because a claim is written before its run completes.
+      2. the page rows' dedup keys (not part of ResultRow), only if any run is left.
+      3. which of those runs still LIST the same property as a new lead (same key,
+         not a duplicate, actionable, inside the tax cap), i.e. the original the
+         user can actually open and see.
+    Both are scoped to `user_id` explicitly as well as by RLS, so a source id that
+    somehow named another account's run reads as unavailable and never confirms
+    that run exists.
+    """
+    source_ids = {r.duplicate_source_job_id for r in items if r.duplicate_source_job_id}
+    available: set[str] = set()
+    if source_ids:
+        found = await db.execute(
+            select(Job.id).where(
+                Job.id.in_(source_ids),
+                Job.user_id == user_id,
+                Job.status == "done",
+            )
+        )
+        available = {str(j) for j in found.scalars().all()}
+
+    hashes: dict[str, str | None] = {}
+    visible: set[tuple[str, str]] = set()
+    if available:
+        # dedup_hash is not on ResultRow (an internal key), so read it for the
+        # page's ids in the same round trip as the originals it is matched against.
+        page_hashes = await db.execute(
+            select(Result.id, Result.dedup_hash).where(
+                Result.id.in_([r.id for r in items]),
+                Result.user_id == user_id,
+            )
+        )
+        hashes = {str(row.id): row.dedup_hash for row in page_hashes}
+        wanted = {h for h in hashes.values() if h}
+        if wanted:
+            originals = await db.execute(
+                select(Result.job_id, Result.dedup_hash).where(
+                    Result.user_id == user_id,
+                    Result.job_id.in_(available),
+                    Result.dedup_hash.in_(wanted),
+                    Result.is_duplicate.is_(False),
+                    actionable_condition(),
+                    tax_cap_condition(today),
+                ).distinct()
+            )
+            visible = {(str(o.job_id), o.dedup_hash) for o in originals}
+
+    for r in items:
+        src = r.duplicate_source_job_id
+        r.duplicate_source_available = src in available if src else False
+        r.duplicate_original_visible = bool(
+            src and src in available and (src, hashes.get(r.id)) in visible
+        )
+        # Echo a run id only when this account can open it. A purged run's id is
+        # useless to the page, and an id that ever named another account's run
+        # (0 in production, 2026-09-17) must not be handed back at all. The claim
+        # date stays: it is this row's own history.
+        if not r.duplicate_source_available:
+            r.duplicate_source_job_id = None
 
 
 @router.get("/{job_id}/logs")
@@ -975,6 +1073,9 @@ async def get_export_url(
     dialer_ready: bool = Query(False),  # Phase 5: carry dialer filter through too
     absentee: bool | None = Query(None),       # Tier 0 (057): owner-location filters
     out_of_state: bool | None = Query(None),
+    # Which Results view the file is for (see results_category). Carried through
+    # like the view filters: the token stays bound to this user and this job.
+    category: ResultsCategory = Query(DEFAULT_RESULTS_CATEGORY),
 ) -> dict:
     """Return a short-lived download URL for the job's CSV export.
 
@@ -1022,6 +1123,8 @@ async def get_export_url(
         query["absentee"] = "true" if absentee else "false"
     if out_of_state is not None:
         query["out_of_state"] = "true" if out_of_state else "false"
+    if category != DEFAULT_RESULTS_CATEGORY:
+        query["category"] = category
     return {"url": f"/jobs/{job_id}/download?{urlencode(query)}"}
 
 
@@ -1043,6 +1146,9 @@ async def download_export(
     dialer_ready: bool = Query(False),
     absentee: bool | None = Query(None),       # Tier 0 (057): owner-location filters
     out_of_state: bool | None = Query(None),
+    # new (default, the delivered file) or already_delivered (the rows an earlier
+    # run of this account already delivered, for the Results view of the same name).
+    category: ResultsCategory = Query(DEFAULT_RESULTS_CATEGORY),
 ):
     """Build and stream the lead CSV LIVE from the DB (not from R2).
 
@@ -1228,7 +1334,9 @@ async def download_export(
         # they are product rules, which is why the empty-result branch below probes
         # for rows using only the quarantine rules and asks nothing about them.
         dl_query = dl_query.where(actionable_condition())
-        dl_query = dl_query.where(Result.is_duplicate.is_(False))
+        # Default: new leads only, exactly as before. The already_delivered file is
+        # the same set that view lists; a download bills nothing either way.
+        dl_query = dl_query.where(category_condition(category))
         # Phase 5: dialer-ready filter (not known-DNC; matches get_results +
         # the push — strict IS-FALSE would hide skip-traced phones whose DNC is
         # NULL; the dialer scrubs DNC).
@@ -1340,6 +1448,12 @@ async def download_export(
         )
 
         csv_bytes = output.getvalue().encode("utf-8")
+        # The two files must not be confused once they sit in a downloads folder.
+        filename = (
+            f"bridgeleads_{job_id[:8]}_already_delivered.csv"
+            if category == "already_delivered"
+            else f"bridgeleads_{job_id[:8]}.csv"
+        )
 
         from starlette.background import BackgroundTask
         from starlette.responses import Response
@@ -1350,7 +1464,7 @@ async def download_export(
             content=csv_bytes,
             media_type="text/csv",
             headers={
-                "Content-Disposition": f'attachment; filename="bridgeleads_{job_id[:8]}.csv"',
+                "Content-Disposition": f'attachment; filename="{filename}"',
                 # no-store: the file is built LIVE (skip-trace phones, the scraper's
                 # CSV layout). A cached copy served a stale file for an hour, e.g. the
                 # old headers after a layout switch (local browser check, 2026-09-15),

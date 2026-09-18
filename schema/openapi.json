@@ -2563,6 +2563,62 @@
             ],
             "title": "Doc Type"
           },
+          "duplicate_original_visible": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Duplicate Original Visible"
+          },
+          "duplicate_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Duplicate Reason"
+          },
+          "duplicate_source_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Duplicate Source At"
+          },
+          "duplicate_source_available": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Duplicate Source Available"
+          },
+          "duplicate_source_job_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Duplicate Source Job Id"
+          },
           "email": {
             "anyOf": [
               {
@@ -2850,6 +2906,11 @@
       },
       "ResultsPage": {
         "properties": {
+          "already_delivered_count": {
+            "default": 0,
+            "title": "Already Delivered Count",
+            "type": "integer"
+          },
           "date_range_mode": {
             "default": "",
             "title": "Date Range Mode",
@@ -6228,6 +6289,20 @@
               ],
               "title": "Out Of State"
             }
+          },
+          {
+            "in": "query",
+            "name": "category",
+            "required": false,
+            "schema": {
+              "default": "new",
+              "enum": [
+                "new",
+                "already_delivered"
+              ],
+              "title": "Category",
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -6383,6 +6458,20 @@
                 }
               ],
               "title": "Out Of State"
+            }
+          },
+          {
+            "in": "query",
+            "name": "category",
+            "required": false,
+            "schema": {
+              "default": "new",
+              "enum": [
+                "new",
+                "already_delivered"
+              ],
+              "title": "Category",
+              "type": "string"
             }
           }
         ],
@@ -6646,6 +6735,20 @@
                 "date_asc"
               ],
               "title": "Sort",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "category",
+            "required": false,
+            "schema": {
+              "default": "new",
+              "enum": [
+                "new",
+                "already_delivered"
+              ],
+              "title": "Category",
               "type": "string"
             }
           }

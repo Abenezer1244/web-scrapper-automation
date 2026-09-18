@@ -577,6 +577,30 @@ def _answer_key(row) -> str:
     )
 
 
+def _fresh_answers(db, keys) -> dict:
+    """The tenant cache entries for these answer keys that are still fresh (inside
+    SKIP_TRACE_CACHE_DAYS, and not future-dated beyond clock skew). One definition for
+    the sweep and the hold, so the two cannot disagree about "already answered"."""
+    if not keys:
+        return {}
+    from sqlalchemy import select
+
+    from src.db.models import SkipTraceCache
+
+    now = datetime.now(UTC)
+    return {
+        c.address_hash: c
+        for c in db.execute(
+            select(SkipTraceCache).where(
+                SkipTraceCache.address_hash.in_(set(keys)),
+                SkipTraceCache.fetched_at
+                >= now - timedelta(days=int(settings.SKIP_TRACE_CACHE_DAYS)),
+                SkipTraceCache.fetched_at <= now + timedelta(minutes=5),
+            )
+        ).scalars()
+    }
+
+
 def _settle_queued_from_known_answers(db) -> int | None:
     """Settle queued rows this account already has an answer for. Never buys anything.
 
@@ -588,17 +612,27 @@ def _settle_queued_from_known_answers(db) -> int | None:
       window: the lead is settled 'errored' and the pending row 'cancelled' rather than
       buying the same failure again (Codex).
 
-    Every write is conditional on the row still being 'queued', and a tick claiming it
-    holds FOR UPDATE on it, so a row is never both settled here and submitted. Commits;
-    best-effort like the cancel sweep: a failure leaves rows queued for the next tick.
+    Runs under _CLAIM_LOCK_KEY, so no tick can claim a row this is settling. The lead is
+    written only while it is still 'queued' and still eligible (delivered now or earlier,
+    not over quota, not an ATIP-named lead while the paid switch is off: Codex round 2);
+    a row that fails that is left queued for the cancel sweep. Commits (releasing the
+    lock); best-effort like the cancel sweep: a failure leaves rows queued, and the hold
+    in the claim path still refuses to buy an answer the cache already has.
     """
-    from sqlalchemy import func, select, update
+    from sqlalchemy import func, select, text, update
 
-    from src.db.models import PendingSkipTraceRow, Result, SkipTraceCache
+    from src.api.lead_actionability import DELIVERY_EXCLUDED_KEY, OVER_QUOTA
+    from src.api.results_category import skip_trace_eligible_condition
+    from src.db.models import PendingSkipTraceRow, Result
 
     now = datetime.now(UTC)
     window = timedelta(days=int(settings.SKIP_TRACE_CACHE_DAYS))
     try:
+        if not db.execute(
+            text("SELECT pg_try_advisory_xact_lock(:k)"), {"k": _CLAIM_LOCK_KEY}
+        ).scalar():
+            db.rollback()
+            return None
         queued = db.execute(
             select(PendingSkipTraceRow)
             .where(PendingSkipTraceRow.status == "queued")
@@ -609,16 +643,7 @@ def _settle_queued_from_known_answers(db) -> int | None:
             db.rollback()
             return 0
         keys = {p.id: _answer_key(p) for p in queued}
-        cached = {
-            c.address_hash: c
-            for c in db.execute(
-                select(SkipTraceCache).where(
-                    SkipTraceCache.address_hash.in_(set(keys.values())),
-                    SkipTraceCache.fetched_at >= now - window,
-                    SkipTraceCache.fetched_at <= now + timedelta(minutes=5),
-                )
-            ).scalars()
-        }
+        cached = _fresh_answers(db, keys.values())
         charged_unanswered = {
             _answer_key(p)
             for p in db.execute(
@@ -636,14 +661,6 @@ def _settle_queued_from_known_answers(db) -> int | None:
             answer = cached.get(keys[p.id])
             if answer is None and keys[p.id] not in charged_unanswered:
                 continue
-            settled_as = "reused" if answer is not None else "cancelled"
-            took = db.execute(
-                update(PendingSkipTraceRow)
-                .where(PendingSkipTraceRow.id == p.id, PendingSkipTraceRow.status == "queued")
-                .values(status=settled_as)
-            ).rowcount
-            if not took:
-                continue
             if answer is not None:
                 values = {
                     "phone": answer.phone, "phone_type": answer.phone_type,
@@ -652,19 +669,33 @@ def _settle_queued_from_known_answers(db) -> int | None:
                     "skip_trace_status": "hit" if (answer.phone or answer.email) else "miss",
                     "skip_trace_attempted_at": now,
                 }
-                reused += 1
             else:
                 values = {"skip_trace_status": "errored", "skip_trace_attempted_at": now}
-                failed += 1
-            db.execute(
+            took = db.execute(
                 update(Result)
                 .where(
                     Result.id == p.result_id,
                     Result.user_id == p.user_id,  # tenant-pinned: system session
                     Result.skip_trace_status == "queued",
+                    skip_trace_eligible_condition(),
+                    func.coalesce(
+                        Result.enrichment_data.op("->>")(DELIVERY_EXCLUDED_KEY), ""
+                    ) != OVER_QUOTA,
+                    _atip_paid_allowed_sql(),
                 )
                 .values(**values)
+            ).rowcount
+            if not took:
+                continue  # no longer eligible: the cancel sweep withdraws it
+            db.execute(
+                update(PendingSkipTraceRow)
+                .where(PendingSkipTraceRow.id == p.id, PendingSkipTraceRow.status == "queued")
+                .values(status="reused" if answer is not None else "cancelled")
             )
+            if answer is not None:
+                reused += 1
+            else:
+                failed += 1
         db.commit()
         if reused or failed:
             _logger.info(
@@ -681,8 +712,9 @@ def _settle_queued_from_known_answers(db) -> int | None:
 
 def _hold_answers_in_flight(db, rows: list) -> tuple[list, int]:
     """Keep one row per (account, address) in a batch, and none whose answer is already
-    at Tracerfy. The rest stay 'queued': the next tick's known-answer sweep settles them
-    from the answer once it lands, or they go out then if it failed without a charge.
+    at Tracerfy or already in the tenant cache. The rest stay 'queued': the next tick's
+    known-answer sweep settles them from the answer, or they go out then if the original
+    failed without a charge.
 
     Called under _CLAIM_LOCK_KEY, so a concurrent tick's claim is either committed (and
     seen here as 'submitting') or not yet started.
@@ -707,11 +739,16 @@ def _hold_answers_in_flight(db, rows: list) -> tuple[list, int]:
             )
         ).scalars()
     }
+    # AFTER the in-flight read (Codex round 2): a twin's answer landing between the two
+    # reads is caught by one of them, since ingest writes the cache and settles the twin
+    # in one transaction. The known-answer sweep ran earlier, in its own transaction, so
+    # without this a cache entry written since then would be bought a second time.
+    answered = _fresh_answers(db, {_answer_key(r) for r in rows})
     keep: list = []
     seen: set[str] = set()
     for row in rows:
         key = _answer_key(row)
-        if key in in_flight or key in seen:
+        if key in in_flight or key in answered or key in seen:
             continue
         seen.add(key)
         keep.append(row)

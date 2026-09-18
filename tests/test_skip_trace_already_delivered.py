@@ -18,6 +18,7 @@ Rules pinned here (tasks/todo-enrich-already-delivered.md):
 
 Real DB (conftest). Tracerfy is never reached: these stop at the queue.
 """
+import json
 import uuid
 from datetime import UTC, datetime, timedelta
 
@@ -832,3 +833,93 @@ async def test_a_twin_stuck_at_an_unknown_outcome_holds_for_as_long_as_it_takes(
     assert (kept, held) == ([], 1)
     assert _pending_status(twin) == "queued"
     assert _pending_status(stuck) == "submitting"
+
+
+def _cache(user_id: str, n: int, phone: str) -> None:
+    from src.db.models import SkipTraceCache
+    from src.scrapers.enrichment.skip_trace import address_cache_key
+
+    with system_sync_session() as db:
+        db.add(SkipTraceCache(
+            address_hash=address_cache_key(user_id, _address(n), "VANCOUVER", "WA"),
+            phone=phone, phone_type="Mobile", email=None,
+            phones=[{"number": phone, "type": "Mobile"}], emails=None,
+            fetched_at=datetime.now(UTC),
+        ))
+        db.commit()
+
+
+async def test_an_answer_that_lands_after_the_sweep_is_still_not_bought_again(
+    business_user, _dispatcher_on,
+):
+    """Codex round 2 P1: the twin's answer lands after this tick's known-answer sweep ran,
+    so its original is 'completed' (no longer in flight) and the sweep never saw the
+    cache. The claim path itself must refuse to buy it."""
+    from src.workers.skip_trace_dispatcher import _hold_answers_in_flight
+
+    first = _run(business_user.id, skip_on=True, status="done")
+    original = _lead(business_user.id, first, 1, status="hit", traced_days_ago=0,
+                     phone="2065550201")
+    _queue(business_user.id, first, original, 1, status="completed", submitted_days_ago=0.01)
+    _cache(business_user.id, 1, "2065550201")
+    again = _run(business_user.id, skip_on=True, status="done")
+    twin = _queue(business_user.id, again, _lead(business_user.id, again, 1, dup=True), 1)
+
+    with system_sync_session() as db:
+        head = db.execute(select(PendingSkipTraceRow).where(
+            PendingSkipTraceRow.id == twin)).scalars().all()
+        kept, held = _hold_answers_in_flight(db, head)
+    assert (kept, held) == ([], 1)
+
+
+async def test_the_sweep_never_hands_contacts_to_a_lead_it_may_not_contact(
+    business_user, _dispatcher_on, monkeypatch,
+):
+    """Codex round 2 P2: an ATIP-named Tacoma lead may be named, not contacted, while the
+    paid switch is off. A fresh cache answer for its address is NOT copied onto it; the
+    row is left for the cancel sweep."""
+    from src.scrapers.enrichment.pierce_atip_owner import OWNER_SOURCE
+    from src.workers.skip_trace_dispatcher import _settle_queued_from_known_answers
+
+    monkeypatch.setattr(settings, "PIERCE_CV_OWNER_SKIP_TRACE_ENABLED", False)
+    first = _run(business_user.id, skip_on=False, status="done")
+    _lead(business_user.id, first, 1)
+    again = _run(business_user.id, skip_on=True, status="done")
+    dup = _lead(business_user.id, again, 1, dup=True)
+    with system_sync_session() as db:
+        db.execute(text("UPDATE results SET enrichment_data = CAST(:ed AS json) WHERE id = :r"),
+                   {"ed": json.dumps({"source": "tacoma_code_violations",
+                                      "owner_source": OWNER_SOURCE}), "r": dup})
+        db.commit()
+    pid = _queue(business_user.id, again, dup, 1)
+    _cache(business_user.id, 1, "2065550202")
+
+    with system_sync_session() as db:
+        _settle_queued_from_known_answers(db)
+
+    assert _pending_status(pid) == "queued"
+    row = _row(dup)
+    assert row.phone is None and row.skip_trace_status == "queued"
+
+
+async def test_the_sweep_stands_aside_while_another_tick_is_claiming(
+    business_user, _dispatcher_on,
+):
+    from src.workers.skip_trace_dispatcher import (
+        _CLAIM_LOCK_KEY,
+        _settle_queued_from_known_answers,
+    )
+
+    first = _run(business_user.id, skip_on=False, status="done")
+    _lead(business_user.id, first, 1)
+    again = _run(business_user.id, skip_on=True, status="done")
+    pid = _queue(business_user.id, again, _lead(business_user.id, again, 1, dup=True), 1)
+    _cache(business_user.id, 1, "2065550203")
+
+    with system_sync_session() as other_tick:
+        other_tick.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": _CLAIM_LOCK_KEY})
+        with system_sync_session() as db:
+            assert _settle_queued_from_known_answers(db) is None
+        other_tick.rollback()
+
+    assert _pending_status(pid) == "queued"

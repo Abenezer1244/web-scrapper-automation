@@ -23,7 +23,7 @@ file contains.
 """
 from typing import Literal
 
-from sqlalchemy import and_, func
+from sqlalchemy import and_, func, or_
 
 from src.db.models import Result
 
@@ -37,6 +37,34 @@ def already_delivered_condition():
         Result.is_duplicate.is_(True),
         func.coalesce(Result.duplicate_reason, "prior_run") == "prior_run",
     )
+
+
+def already_delivered_sql(alias: str) -> str:
+    """``already_delivered_condition`` for raw SQL over ``results`` aliased ``alias``.
+    Kept beside the ORM form so the two spellings cannot drift. ``alias`` is always a
+    code literal, never input."""
+    return (f"({alias}.is_duplicate IS TRUE "
+            f"AND COALESCE({alias}.duplicate_reason, 'prior_run') = 'prior_run')")
+
+
+def skip_trace_eligible_condition():
+    """Rows a run with skip trace on may look up: the ones it delivers now, and the ones
+    an earlier run of this account already delivered.
+
+    Delivered and traced are separate facts. Dedup stops a lead being delivered and
+    billed twice; it does not stop the account getting that lead's phone and email when
+    it turns skip trace on later (owner, 2026-09-18). Same-run siblings and superseded
+    rows stay out: another row of this run is the same property, and it is the one
+    traced. Whether a lookup is actually BOUGHT is decided after this, against reuse
+    and the tenant cache."""
+    # IS NOT TRUE, the same spelling as skip_trace_eligible_sql (the column is NOT NULL,
+    # but the two forms must not be able to disagree).
+    return or_(Result.is_duplicate.is_not(True), already_delivered_condition())
+
+
+def skip_trace_eligible_sql(alias: str) -> str:
+    """``skip_trace_eligible_condition`` for raw SQL (see ``already_delivered_sql``)."""
+    return f"({alias}.is_duplicate IS NOT TRUE OR {already_delivered_sql(alias)})"
 
 
 def category_condition(category: ResultsCategory):

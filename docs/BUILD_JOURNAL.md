@@ -19,6 +19,93 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-18 — Already delivered is not already traced: skip trace for leads a run already owns
+
+> Owner report: run 1 (skip trace OFF) delivered 38 leads; the same range run again with skip
+> trace ON said "38 already delivered" and traced none of them. BE `fix/enrich-already-delivered`
+> (worktree `C:/Users/Windows/bl-wt-enrich`), FE same branch (`C:/Users/Windows/bl-wt-enrich-fe`).
+> Plan + Codex dispositions: `tasks/todo-enrich-already-delivered.md`.
+
+**Root cause:** dedup was deciding enrichment. `_enqueue_skip_trace_rows` selected
+`is_duplicate = false` only (added in #296 D1/D5: "a duplicate is never delivered or billed, so
+paying Tracerfy for it is pure waste"), and the dispatcher dropped every duplicate three more
+times (submit query, cancel sweep, claim-time partition). Reuse copied a trace only from
+`delivered_records.first_result_id`, which run 1 never traced. So a lead delivered with skip
+trace off could never get a phone or email again.
+
+**Built:**
+- BE `74faf7d`: `skip_trace_eligible_condition()` / `_sql()` in `results_category.py` (delivered
+  now OR `already_delivered_condition()`; same-run siblings and superseded stay out) used by the
+  enqueue and all three dispatcher gates. Reuse also takes the newest settled hit/miss of any
+  other run of the account for the same strong key inside the 90-day window. A charged
+  `unmatched` lookup is not re-bought each run; a transport failure still retries. Dispatcher:
+  known-answer sweep (fresh tenant cache -> pending `reused`, never billed), per-(account,
+  address) hold of in-flight twins and in-batch repeats, `pg_try_advisory_xact_lock` around
+  select -> claim.
+- BE `6e225ee`: `ResultsPage.already_delivered_contacts` (found / none_found / looking / failed /
+  not_looked_up) counted in the tab count's own statement, so the parts add up.
+- BE `a3bbbed`, `095b2e5`: Codex review fixes (below).
+- FE `d11c8d7`, `0ae8b38`, `c0daf05`: "Contact lookup: ..." line on the Already delivered tab;
+  polling continues while the run-wide `looking` count is non-zero and while the job is running,
+  and the results are read once more when the run finishes.
+- 28 new tests in `tests/test_skip_trace_already_delivered.py`; 3 fixtures retargeted to
+  `duplicate_reason='same_run'` (what a survivor re-election writes). Every Phase 2+ test was
+  mutation-checked: it fails with its mechanism removed.
+
+**Tried / Decided:**
+- No new skip-trace state: `results.skip_trace_status` already separates never asked
+  (`not_attempted`), asked-nothing-found (`miss`), failed (`errored`), found (`hit`).
+- Freshness = the existing `SKIP_TRACE_CACHE_DAYS` (90); owner confirmed. Past it, a lead is
+  bought again like any other.
+- "Reused vs bought now" is NOT reported. `pending_skip_trace_rows` has no grant for the API
+  role (`apply_rls_cutover_policies.sql`), so a query on it would pass locally and 500 in prod.
+  It needs a provenance column on `results`.
+- Kept, against Codex round 2: no time limit on holding a twin behind an unknown outcome.
+  Stuck claims are paged and reconciled; expiring the hold pays twice.
+
+**Caught & fixed (before shipping):**
+- The ATIP reuse clause was NULL, not TRUE, for rows with no `source` key, so a NULL CASE
+  condition silently skipped reuse for them. Made NULL-safe (would have turned free copies
+  into paid lookups once duplicates became traceable).
+- Codex round 1 P1: the in-flight hold expired after 2 days, which could buy a twin of a
+  possibly-charged unknown outcome. Codex round 2 P1: the cache check ran in the sweep, before
+  and outside the claim transaction, so an answer landing in between was bought again. Round 2
+  P2: the sweep could copy contacts onto an ATIP-named lead while the paid switch was off.
+- Codex P2 (rounds 1 and 3): the results page could stop polling before the enqueue and keep
+  showing N/A. Proven fixed in Chromium: a tab opened mid-run switched to "2 still being
+  looked up" without a reload once the run finished.
+- Codex: round 1 FAIL, round 2 FAIL, round 3 **GATE: PASS** (all 11 owner questions answered
+  the right way). Remaining P2 (operator path for an abandoned stuck claim) is covered by the
+  existing `scripts/repair_stuck_skip_trace_claims.py`; P3 provenance is the follow-up below.
+
+**Failed / dead ends:**
+- My first full-suite run read 193 tests instead of 314: the glob expanded in the OneDrive
+  checkout (the shell cwd resets there), not the worktree. Always `cd` to the worktree first.
+- Bash heredocs truncated twice (a `'''`-heavy Python patch); patch scripts now go through Write.
+- 9 Stripe tests (`test_plan_entitlement_audit`, `test_promo_access`) fail in the local rig;
+  they fail identically on untouched `main` (env), not this change.
+
+**Verification:** full backend suite 4165 passed (+ the 9 env failures above); skip-trace set
+328 passed; ruff 0.15.6 clean; `export_openapi.py --check` OK (+42/-0); FE tsc + eslint clean.
+Playwright (headless Chromium, not Claude in Chrome) against a local API + isolated DB: run 1
+off -> N/A; run 2 on -> "3 still being looked up"; after Tracerfy's answer (real ingest, only
+the provider CSV download stubbed, no real credits) the open tab updated WITHOUT a reload to
+"2 with a phone or email · 1 no contacts found", skip-trace usage 0 -> 5 for 5 lookups, and
+"Download delivered CSV" carried phone/phone_2/email/email_2.
+
+**Pending / Handoff:**
+- Merge BE before FE (FE CI regenerates types from BE main).
+- Follow-ups: provenance column for "reused, no charge"; overlong address cache-key drift;
+  check-then-insert cache race in ingest; `db.add` try/except in enqueue (all pre-existing).
+
+**Facts learned:**
+- Worker-only tables (`delivered_records`, `pending_skip_trace_rows`, `skip_trace_queues`,
+  `skip_trace_cache`) are unreadable by the API role: never read them from a route.
+- Tracerfy ingest settles the result, the pending row and the cache in ONE commit, which is what
+  makes "in-flight read, then cache read" race-free.
+
+---
+
 ## 2026-09-18 — "227 already delivered" becomes a set you can open, and the header was counting rows no view shows
 
 > Owner report: a Pierce pre_foreclosure run read "3 new · 227 already delivered" and the 227

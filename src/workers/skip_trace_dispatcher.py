@@ -47,6 +47,7 @@ def dispatch_pending_skip_trace() -> dict:
     from sqlalchemy import and_, func, select, text, update
 
     from src.api.lead_actionability import DELIVERY_EXCLUDED_KEY, OVER_QUOTA
+    from src.api.results_category import skip_trace_eligible_condition
     from src.db.models import Job, PendingSkipTraceRow, Result
     from src.db.session import system_sync_session
     from src.scrapers.enrichment.skip_trace import TracerfyError, submit_batch
@@ -125,7 +126,7 @@ def dispatch_pending_skip_trace() -> dict:
         # goes out in this same tick instead of waiting another five minutes.
         reconciled = _reconcile_stale_claims(db)
         # Never pay for a lead that will not be delivered: cancel queued rows whose
-        # job failed or was cancelled, or whose lead is over quota, a duplicate,
+        # job failed or was cancelled, or whose lead is over quota, a same-run sibling,
         # or no longer waiting on a trace.
         swept = _cancel_undeliverable_queued(db)
         # The sweep is best-effort for the deliverability rules (a failed tick retries in
@@ -137,6 +138,10 @@ def dispatch_pending_skip_trace() -> dict:
             _logger.error("Dispatcher: compliance sweep failed; skipping this tick so no "
                           "ATIP-named Tacoma row can be submitted")
             return _tick_result(0, 0, ["compliance sweep failed"], deferred="sweep_failed")
+        # Settle what this account already has an answer for (a twin's lookup landed, a
+        # fresh cache entry) before anything is bought. Best-effort: on failure the rows
+        # stay queued, and the in-flight hold below still stops a second purchase.
+        _settle_queued_from_known_answers(db)
 
         for _ in range(max_batches):
             # Pick a trace_type to drain this pass. Prefer 'normal' first
@@ -144,6 +149,16 @@ def dispatch_pending_skip_trace() -> dict:
             # one trace_type only because Tracerfy takes trace_type as a
             # top-level field on the POST.
             for trace_type in ("normal", "advanced"):
+                # One tick at a time from here to the claim commit, which releases it
+                # (transaction-scoped). Without it, two overlapping ticks could each see
+                # the other's twin as not yet claimed and buy one answer twice.
+                if not db.execute(
+                    text("SELECT pg_try_advisory_xact_lock(:k)"), {"k": _CLAIM_LOCK_KEY}
+                ).scalar():
+                    db.rollback()
+                    _logger.info("Dispatcher: another tick is claiming; deferring to the next tick")
+                    return _tick_result(submitted_batches, submitted_rows, errors,
+                                        deferred="claim_locked")
                 rows = (
                     db.execute(
                         select(PendingSkipTraceRow)
@@ -176,7 +191,9 @@ def dispatch_pending_skip_trace() -> dict:
                                 text(_job_delivered_sql("jobs")).bindparams(
                                     since=BILLING_STAMP_RELIABLE_SINCE),
                                 Result.skip_trace_status == "queued",
-                                Result.is_duplicate.is_not(True),
+                                # Delivered now, or by an earlier run of this account:
+                                # same-run siblings and superseded rows are never bought.
+                                skip_trace_eligible_condition(),
                                 func.coalesce(
                                     Result.enrichment_data.op("->>")(DELIVERY_EXCLUDED_KEY), ""
                                 ) != OVER_QUOTA,
@@ -205,7 +222,7 @@ def dispatch_pending_skip_trace() -> dict:
                     _cancel_undeliverable(db, withdrawn)
                     _logger.info(
                         "Dispatcher: %d %s row(s) withdrawn before submit: the job did "
-                        "not deliver, or the lead is now a duplicate or over the plan "
+                        "not deliver, or the lead is now a same-run sibling or over the plan "
                         "limit", len(withdrawn), trace_type,
                     )
                 if left_queued:
@@ -232,6 +249,14 @@ def dispatch_pending_skip_trace() -> dict:
                     )
                     errors.append(msg)
                     _logger.warning("Dispatcher: %s", msg)
+                # One answer, bought once: no second row for an (account, address) whose
+                # lookup is at Tracerfy now or earlier in this same batch.
+                rows, held = _hold_answers_in_flight(db, rows)
+                if held:
+                    _logger.info(
+                        "Dispatcher: %d %s row(s) held: the same account's lookup for "
+                        "that address is already under way", held, trace_type,
+                    )
                 if not rows:
                     # Nothing to claim: commit the failures and withdrawals on their
                     # own (no claim follows to carry them), and in every case end the
@@ -457,7 +482,8 @@ def _cancel_undeliverable_queued(db) -> int | None:
 
     A queued row is cancelled when its job ended failed/cancelled without billing
     (and after billing was stamped, see _job_undelivered_sql), or its lead is
-    over quota, a duplicate, or no longer 'queued' (for example a trace was copied
+    over quota, a same-run sibling or superseded row (an already-delivered lead is
+    still traceable), or no longer 'queued' (for example a trace was copied
     onto it after it was enqueued). Only 'queued' rows are touched: 'submitting'
     and 'submitted' are already at Tracerfy and belong to the reconciler.
 
@@ -470,6 +496,7 @@ def _cancel_undeliverable_queued(db) -> int | None:
     from sqlalchemy import text
 
     from src.api.lead_actionability import DELIVERY_EXCLUDED_KEY, OVER_QUOTA
+    from src.api.results_category import skip_trace_eligible_sql
     from src.scrapers.enrichment.pierce_atip_owner import OWNER_SOURCE as PIERCE_OWNER_SOURCE
     from src.workers.tasks_helpers.dedup import BILLING_STAMP_RELIABLE_SINCE
 
@@ -482,7 +509,7 @@ def _cancel_undeliverable_queued(db) -> int | None:
                 "  AND j.id = p.job_id AND j.user_id = p.user_id "
                 "  AND r.id = p.result_id AND r.user_id = p.user_id "
                 f"  AND ({_job_undelivered_sql('j')} "
-                "       OR r.is_duplicate IS TRUE "
+                f"       OR NOT {skip_trace_eligible_sql('r')} "
                 "       OR r.skip_trace_status <> 'queued' "
                 "       OR COALESCE(r.enrichment_data->>:key, '') = :over_quota "
                 # An ATIP-named Tacoma lead while PIERCE_CV_OWNER_SKIP_TRACE_ENABLED is
@@ -523,6 +550,209 @@ def _cancel_undeliverable_queued(db) -> int | None:
         db.rollback()
         _logger.warning("Dispatcher: cancel sweep failed: %s", str(exc)[:160])
         return None
+
+
+# ─── One answer, bought once ──────────────────────────────────────────────────
+#
+# Already-delivered leads are traceable (2026-09-18), so the same property of one
+# account can now be queued by two runs: run 1's lookup still at Tracerfy when run 2
+# queues its already-delivered row, or two runs on one date range at once. Each paid
+# row is one credit, so everything below makes one (account, address) answer be
+# bought once. The key is the per-tenant cache key the ingest writes the answer under,
+# so nothing is ever held for, or copied from, another account.
+
+# pg_try_advisory_xact_lock key: one tick at a time runs select -> claim commit, so the
+# in-flight check cannot race another tick's uncommitted claim. Arbitrary constant.
+_CLAIM_LOCK_KEY = 7_220_915_018
+
+
+def _answer_key(row) -> str:
+    """The per-tenant identity of the answer a pending row would buy: the exact key
+    tracerfy_ingest writes it under (address_cache_key over the pending row's own
+    address, city and state). Two rows with one key buy one answer."""
+    from src.scrapers.enrichment.skip_trace import address_cache_key
+
+    return address_cache_key(
+        row.user_id, row.property_address or "", row.city or "", row.state or "",
+    )
+
+
+def _fresh_answers(db, keys) -> dict:
+    """The tenant cache entries for these answer keys that are still fresh (inside
+    SKIP_TRACE_CACHE_DAYS, and not future-dated beyond clock skew). One definition for
+    the sweep and the hold, so the two cannot disagree about "already answered"."""
+    if not keys:
+        return {}
+    from sqlalchemy import select
+
+    from src.db.models import SkipTraceCache
+
+    now = datetime.now(UTC)
+    return {
+        c.address_hash: c
+        for c in db.execute(
+            select(SkipTraceCache).where(
+                SkipTraceCache.address_hash.in_(set(keys)),
+                SkipTraceCache.fetched_at
+                >= now - timedelta(days=int(settings.SKIP_TRACE_CACHE_DAYS)),
+                SkipTraceCache.fetched_at <= now + timedelta(minutes=5),
+            )
+        ).scalars()
+    }
+
+
+def _settle_queued_from_known_answers(db) -> int | None:
+    """Settle queued rows this account already has an answer for. Never buys anything.
+
+    - A fresh tenant cache entry (inside SKIP_TRACE_CACHE_DAYS): the answer is copied onto
+      the lead, and the pending row becomes 'reused', a terminal state billing never
+      counts (it bills 'completed' and 'unmatched' only). This is how a row held behind
+      an in-flight twin gets that twin's answer once it lands.
+    - The same address was charged but could not be attributed ('unmatched') inside the
+      window: the lead is settled 'errored' and the pending row 'cancelled' rather than
+      buying the same failure again (Codex).
+
+    Runs under _CLAIM_LOCK_KEY, so no tick can claim a row this is settling. The lead is
+    written only while it is still 'queued' and still eligible (delivered now or earlier,
+    not over quota, not an ATIP-named lead while the paid switch is off: Codex round 2);
+    a row that fails that is left queued for the cancel sweep. Commits (releasing the
+    lock); best-effort like the cancel sweep: a failure leaves rows queued, and the hold
+    in the claim path still refuses to buy an answer the cache already has.
+    """
+    from sqlalchemy import func, select, text, update
+
+    from src.api.lead_actionability import DELIVERY_EXCLUDED_KEY, OVER_QUOTA
+    from src.api.results_category import skip_trace_eligible_condition
+    from src.db.models import PendingSkipTraceRow, Result
+
+    now = datetime.now(UTC)
+    window = timedelta(days=int(settings.SKIP_TRACE_CACHE_DAYS))
+    try:
+        if not db.execute(
+            text("SELECT pg_try_advisory_xact_lock(:k)"), {"k": _CLAIM_LOCK_KEY}
+        ).scalar():
+            db.rollback()
+            return None
+        queued = db.execute(
+            select(PendingSkipTraceRow)
+            .where(PendingSkipTraceRow.status == "queued")
+            .order_by(PendingSkipTraceRow.enqueued_at)
+            .limit(5000)
+        ).scalars().all()
+        if not queued:
+            db.rollback()
+            return 0
+        keys = {p.id: _answer_key(p) for p in queued}
+        cached = _fresh_answers(db, keys.values())
+        charged_unanswered = {
+            _answer_key(p)
+            for p in db.execute(
+                select(PendingSkipTraceRow).where(
+                    PendingSkipTraceRow.user_id.in_({p.user_id for p in queued}),
+                    PendingSkipTraceRow.status == "unmatched",
+                    func.coalesce(
+                        PendingSkipTraceRow.submitted_at, PendingSkipTraceRow.enqueued_at
+                    ) >= now - window,
+                )
+            ).scalars()
+        }
+        reused = failed = 0
+        for p in queued:
+            answer = cached.get(keys[p.id])
+            if answer is None and keys[p.id] not in charged_unanswered:
+                continue
+            if answer is not None:
+                values = {
+                    "phone": answer.phone, "phone_type": answer.phone_type,
+                    "phone_dnc_flag": answer.phone_dnc_flag, "email": answer.email,
+                    "phones": answer.phones, "emails": answer.emails,
+                    "skip_trace_status": "hit" if (answer.phone or answer.email) else "miss",
+                    "skip_trace_attempted_at": now,
+                }
+            else:
+                values = {"skip_trace_status": "errored", "skip_trace_attempted_at": now}
+            took = db.execute(
+                update(Result)
+                .where(
+                    Result.id == p.result_id,
+                    Result.user_id == p.user_id,  # tenant-pinned: system session
+                    Result.skip_trace_status == "queued",
+                    skip_trace_eligible_condition(),
+                    func.coalesce(
+                        Result.enrichment_data.op("->>")(DELIVERY_EXCLUDED_KEY), ""
+                    ) != OVER_QUOTA,
+                    _atip_paid_allowed_sql(),
+                )
+                .values(**values)
+            ).rowcount
+            if not took:
+                continue  # no longer eligible: the cancel sweep withdraws it
+            db.execute(
+                update(PendingSkipTraceRow)
+                .where(PendingSkipTraceRow.id == p.id, PendingSkipTraceRow.status == "queued")
+                .values(status="reused" if answer is not None else "cancelled")
+            )
+            if answer is not None:
+                reused += 1
+            else:
+                failed += 1
+        db.commit()
+        if reused or failed:
+            _logger.info(
+                "Dispatcher: settled %d queued row(s) from this account's earlier answers "
+                "and %d whose address was already charged without a match; none bought",
+                reused, failed,
+            )
+        return reused + failed
+    except Exception as exc:  # noqa: BLE001 - never break the submit loop
+        db.rollback()
+        _logger.warning("Dispatcher: known-answer sweep failed: %s", str(exc)[:160])
+        return None
+
+
+def _hold_answers_in_flight(db, rows: list) -> tuple[list, int]:
+    """Keep one row per (account, address) in a batch, and none whose answer is already
+    at Tracerfy or already in the tenant cache. The rest stay 'queued': the next tick's
+    known-answer sweep settles them from the answer, or they go out then if the original
+    failed without a charge.
+
+    Called under _CLAIM_LOCK_KEY, so a concurrent tick's claim is either committed (and
+    seen here as 'submitting') or not yet started.
+
+    No time limit on the hold (Codex P1): a twin stuck 'submitting'/'submitted' may
+    already be charged, and the system never auto-buys past an unknown outcome. The
+    stuck row is paged (_alert_stale_claims) and resolved by the reconciler; the held
+    twin follows it, settled from the answer or bought once the original is terminal
+    without one."""
+    if not rows:
+        return rows, 0
+    from sqlalchemy import select
+
+    from src.db.models import PendingSkipTraceRow
+
+    in_flight = {
+        _answer_key(p)
+        for p in db.execute(
+            select(PendingSkipTraceRow).where(
+                PendingSkipTraceRow.user_id.in_({r.user_id for r in rows}),
+                PendingSkipTraceRow.status.in_(("submitting", "submitted")),
+            )
+        ).scalars()
+    }
+    # AFTER the in-flight read (Codex round 2): a twin's answer landing between the two
+    # reads is caught by one of them, since ingest writes the cache and settles the twin
+    # in one transaction. The known-answer sweep ran earlier, in its own transaction, so
+    # without this a cache entry written since then would be bought a second time.
+    answered = _fresh_answers(db, {_answer_key(r) for r in rows})
+    keep: list = []
+    seen: set[str] = set()
+    for row in rows:
+        key = _answer_key(row)
+        if key in in_flight or key in answered or key in seen:
+            continue
+        seen.add(key)
+        keep.append(row)
+    return keep, len(rows) - len(keep)
 
 
 def _tick_result(batches: int, rows: int, errors: list[str], deferred: str | None = None) -> dict:
@@ -632,7 +862,7 @@ def _partition_still_deliverable(db, rows: list) -> tuple[list, list, int]:
     """Split the FIFO head into (buy now, withdraw) and a count left for later.
 
     A lookup is bought only for a lead that was actually delivered: its Result is
-    not a duplicate, not excluded by the plan cap, and its job billed or reached
+    delivered by this run or an earlier one of the account, not excluded by the plan cap, and its job billed or reached
     'done'. Billing and the done-CAS commit together, so a billed job delivered
     its file whatever status was written over it later (Codex review round 6);
     'done' alone still counts for jobs that predate the billing stamp, and so
@@ -643,10 +873,10 @@ def _partition_still_deliverable(db, rows: list) -> tuple[list, list, int]:
     flags can still change (a watchdog re-run repeats the survivor election and
     the cap). Paying Tracerfy for any of those buys contact data nobody receives.
 
-    - buy now: billed, done, or pre-stamp terminal job; non-duplicate, not over
+    - buy now: billed, done, or pre-stamp terminal job; delivered now or earlier, not over
       quota.
     - withdraw: the job failed or was cancelled without billing after billing
-      was stamped, or the lead is a duplicate or over quota. Never charged.
+      was stamped, or the lead is a same-run sibling or over quota. Never charged.
     - left for later (neither list): the job is still running, the Result row is
       locked by a writer right now, or it no longer exists (its pending row is
       CASCADE-deleted with it). Nothing is decided on a value that is changing.
@@ -665,20 +895,22 @@ def _partition_still_deliverable(db, rows: list) -> tuple[list, list, int]:
     """
     if not rows:
         return [], [], 0
-    from sqlalchemy import func, select, tuple_
+    from sqlalchemy import func, not_, select, tuple_
 
     from src.api.lead_actionability import DELIVERY_EXCLUDED_KEY, OVER_QUOTA
+    from src.api.results_category import skip_trace_eligible_condition
     from src.db.models import Job, Result
     from src.workers.tasks_helpers.dedup import BILLING_STAMP_RELIABLE_SINCE
 
     # Tenant-paired like every other write from this cross-tenant head.
     state = {
-        (str(rid), str(uid)): (is_dup, excluded, status, billed, stamped)
-        for rid, uid, is_dup, excluded, status, billed, stamped in db.execute(
+        (str(rid), str(uid)): (ineligible, excluded, status, billed, stamped)
+        for rid, uid, ineligible, excluded, status, billed, stamped in db.execute(
             select(
                 Result.id,
                 Result.user_id,
-                Result.is_duplicate,
+                # A same-run sibling or superseded row; an already-delivered one stays.
+                not_(skip_trace_eligible_condition()),
                 # Same spelling as lead_actionability.actionable_condition; a NULL
                 # blob yields NULL from ->>, which the COALESCE turns into ''.
                 func.coalesce(
@@ -705,9 +937,9 @@ def _partition_still_deliverable(db, rows: list) -> tuple[list, list, int]:
         if seen is None:
             later += 1
             continue
-        is_dup, excluded, status, billed, stamped = seen
+        ineligible, excluded, status, billed, stamped = seen
         terminal = status in ("failed", "cancelled")
-        if is_dup or excluded or (terminal and not billed and stamped):
+        if ineligible or excluded or (terminal and not billed and stamped):
             drop.append(r)
         elif billed or status == "done" or terminal:
             keep.append(r)

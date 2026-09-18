@@ -1420,6 +1420,23 @@ class DuplicateSource(BaseModel):
     job_available: bool = False
 
 
+class AlreadyDeliveredContacts(BaseModel):
+    """Where the skip trace stands for this run's already-delivered leads.
+
+    Delivered and traced are separate facts: a lead an earlier run delivered can still
+    be looked up when this run has skip trace on. The buckets partition
+    ``already_delivered_count`` exactly (same statement, same predicate), so they
+    always add up to the tab's number. Read from ``results`` alone: the queue tables
+    are worker-only, so whether an answer was bought now or reused is not reported.
+    """
+
+    found: int = 0          # skip_trace_status 'hit': at least one phone or email
+    none_found: int = 0     # 'miss': the provider answered and had no contact
+    looking: int = 0        # 'queued' / 'submitted': a lookup is on its way
+    failed: int = 0         # 'errored': the lookup did not complete
+    not_looked_up: int = 0  # never asked (skip trace off, nothing traceable) or purged
+
+
 class ResultsPage(BaseModel):
     job_id: str
     total: int
@@ -1475,6 +1492,8 @@ class ResultsPage(BaseModel):
     # as the counts above. So the number on the tab is the `total` that view
     # returns unfiltered, and the CSV it downloads holds the same rows.
     already_delivered_count: int = 0
+    # Skip-trace state of those same rows (see AlreadyDeliveredContacts).
+    already_delivered_contacts: AlreadyDeliveredContacts = AlreadyDeliveredContacts()
     # NTS Tier 1: True if the JOB has ANY auction-matched lead (independent of the
     # current page/filter). The frontend gates the Auction Date / Default Owed
     # columns on this so they don't flicker by page when auction matches are sparse.

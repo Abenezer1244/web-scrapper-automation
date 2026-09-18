@@ -273,14 +273,14 @@ def _reuse_enrichment_for_duplicates(db, job, job_id: str) -> int:
             mailing_address      = COALESCE(rn.mailing_address, ro.mailing_address),
             delinquent_amount    = COALESCE(rn.delinquent_amount, ro.delinquent_amount),
             delinquent_bill_year = COALESCE(rn.delinquent_bill_year, ro.delinquent_bill_year),
-            phone = CASE WHEN ro.skip_trace_status IN ('hit','miss') AND ro.skip_trace_attempted_at IS NOT NULL AND ro.skip_trace_attempted_at >= NOW() - make_interval(days => :ttl) AND rn.skip_trace_status = 'not_attempted' AND NOT (CAST(:atip_blocked AS boolean) AND rn.enrichment_data->>'source' = 'tacoma_code_violations' AND rn.enrichment_data->>'owner_source' = :atip_source) THEN ro.phone ELSE rn.phone END,
-            phone_type = CASE WHEN ro.skip_trace_status IN ('hit','miss') AND ro.skip_trace_attempted_at IS NOT NULL AND ro.skip_trace_attempted_at >= NOW() - make_interval(days => :ttl) AND rn.skip_trace_status = 'not_attempted' AND NOT (CAST(:atip_blocked AS boolean) AND rn.enrichment_data->>'source' = 'tacoma_code_violations' AND rn.enrichment_data->>'owner_source' = :atip_source) THEN ro.phone_type ELSE rn.phone_type END,
-            phone_dnc_flag = CASE WHEN ro.skip_trace_status IN ('hit','miss') AND ro.skip_trace_attempted_at IS NOT NULL AND ro.skip_trace_attempted_at >= NOW() - make_interval(days => :ttl) AND rn.skip_trace_status = 'not_attempted' AND NOT (CAST(:atip_blocked AS boolean) AND rn.enrichment_data->>'source' = 'tacoma_code_violations' AND rn.enrichment_data->>'owner_source' = :atip_source) THEN ro.phone_dnc_flag ELSE rn.phone_dnc_flag END,
-            email = CASE WHEN ro.skip_trace_status IN ('hit','miss') AND ro.skip_trace_attempted_at IS NOT NULL AND ro.skip_trace_attempted_at >= NOW() - make_interval(days => :ttl) AND rn.skip_trace_status = 'not_attempted' AND NOT (CAST(:atip_blocked AS boolean) AND rn.enrichment_data->>'source' = 'tacoma_code_violations' AND rn.enrichment_data->>'owner_source' = :atip_source) THEN ro.email ELSE rn.email END,
-            skip_trace_status = CASE WHEN ro.skip_trace_status IN ('hit','miss') AND ro.skip_trace_attempted_at IS NOT NULL AND ro.skip_trace_attempted_at >= NOW() - make_interval(days => :ttl) AND rn.skip_trace_status = 'not_attempted' AND NOT (CAST(:atip_blocked AS boolean) AND rn.enrichment_data->>'source' = 'tacoma_code_violations' AND rn.enrichment_data->>'owner_source' = :atip_source) THEN ro.skip_trace_status ELSE rn.skip_trace_status END,
-            skip_trace_attempted_at = CASE WHEN ro.skip_trace_status IN ('hit','miss') AND ro.skip_trace_attempted_at IS NOT NULL AND ro.skip_trace_attempted_at >= NOW() - make_interval(days => :ttl) AND rn.skip_trace_status = 'not_attempted' AND NOT (CAST(:atip_blocked AS boolean) AND rn.enrichment_data->>'source' = 'tacoma_code_violations' AND rn.enrichment_data->>'owner_source' = :atip_source) THEN ro.skip_trace_attempted_at ELSE rn.skip_trace_attempted_at END,
-            phones = CASE WHEN ro.skip_trace_status IN ('hit','miss') AND ro.skip_trace_attempted_at IS NOT NULL AND ro.skip_trace_attempted_at >= NOW() - make_interval(days => :ttl) AND rn.skip_trace_status = 'not_attempted' AND NOT (CAST(:atip_blocked AS boolean) AND rn.enrichment_data->>'source' = 'tacoma_code_violations' AND rn.enrichment_data->>'owner_source' = :atip_source) THEN ro.phones ELSE rn.phones END,
-            emails = CASE WHEN ro.skip_trace_status IN ('hit','miss') AND ro.skip_trace_attempted_at IS NOT NULL AND ro.skip_trace_attempted_at >= NOW() - make_interval(days => :ttl) AND rn.skip_trace_status = 'not_attempted' AND NOT (CAST(:atip_blocked AS boolean) AND rn.enrichment_data->>'source' = 'tacoma_code_violations' AND rn.enrichment_data->>'owner_source' = :atip_source) THEN ro.emails ELSE rn.emails END
+            phone = CASE WHEN ro.skip_trace_status IN ('hit','miss') AND ro.skip_trace_attempted_at IS NOT NULL AND ro.skip_trace_attempted_at >= NOW() - make_interval(days => :ttl) AND rn.skip_trace_status = 'not_attempted' AND NOT (CAST(:atip_blocked AS boolean) AND COALESCE(rn.enrichment_data->>'source', '') = 'tacoma_code_violations' AND COALESCE(rn.enrichment_data->>'owner_source', '') = :atip_source) THEN ro.phone ELSE rn.phone END,
+            phone_type = CASE WHEN ro.skip_trace_status IN ('hit','miss') AND ro.skip_trace_attempted_at IS NOT NULL AND ro.skip_trace_attempted_at >= NOW() - make_interval(days => :ttl) AND rn.skip_trace_status = 'not_attempted' AND NOT (CAST(:atip_blocked AS boolean) AND COALESCE(rn.enrichment_data->>'source', '') = 'tacoma_code_violations' AND COALESCE(rn.enrichment_data->>'owner_source', '') = :atip_source) THEN ro.phone_type ELSE rn.phone_type END,
+            phone_dnc_flag = CASE WHEN ro.skip_trace_status IN ('hit','miss') AND ro.skip_trace_attempted_at IS NOT NULL AND ro.skip_trace_attempted_at >= NOW() - make_interval(days => :ttl) AND rn.skip_trace_status = 'not_attempted' AND NOT (CAST(:atip_blocked AS boolean) AND COALESCE(rn.enrichment_data->>'source', '') = 'tacoma_code_violations' AND COALESCE(rn.enrichment_data->>'owner_source', '') = :atip_source) THEN ro.phone_dnc_flag ELSE rn.phone_dnc_flag END,
+            email = CASE WHEN ro.skip_trace_status IN ('hit','miss') AND ro.skip_trace_attempted_at IS NOT NULL AND ro.skip_trace_attempted_at >= NOW() - make_interval(days => :ttl) AND rn.skip_trace_status = 'not_attempted' AND NOT (CAST(:atip_blocked AS boolean) AND COALESCE(rn.enrichment_data->>'source', '') = 'tacoma_code_violations' AND COALESCE(rn.enrichment_data->>'owner_source', '') = :atip_source) THEN ro.email ELSE rn.email END,
+            skip_trace_status = CASE WHEN ro.skip_trace_status IN ('hit','miss') AND ro.skip_trace_attempted_at IS NOT NULL AND ro.skip_trace_attempted_at >= NOW() - make_interval(days => :ttl) AND rn.skip_trace_status = 'not_attempted' AND NOT (CAST(:atip_blocked AS boolean) AND COALESCE(rn.enrichment_data->>'source', '') = 'tacoma_code_violations' AND COALESCE(rn.enrichment_data->>'owner_source', '') = :atip_source) THEN ro.skip_trace_status ELSE rn.skip_trace_status END,
+            skip_trace_attempted_at = CASE WHEN ro.skip_trace_status IN ('hit','miss') AND ro.skip_trace_attempted_at IS NOT NULL AND ro.skip_trace_attempted_at >= NOW() - make_interval(days => :ttl) AND rn.skip_trace_status = 'not_attempted' AND NOT (CAST(:atip_blocked AS boolean) AND COALESCE(rn.enrichment_data->>'source', '') = 'tacoma_code_violations' AND COALESCE(rn.enrichment_data->>'owner_source', '') = :atip_source) THEN ro.skip_trace_attempted_at ELSE rn.skip_trace_attempted_at END,
+            phones = CASE WHEN ro.skip_trace_status IN ('hit','miss') AND ro.skip_trace_attempted_at IS NOT NULL AND ro.skip_trace_attempted_at >= NOW() - make_interval(days => :ttl) AND rn.skip_trace_status = 'not_attempted' AND NOT (CAST(:atip_blocked AS boolean) AND COALESCE(rn.enrichment_data->>'source', '') = 'tacoma_code_violations' AND COALESCE(rn.enrichment_data->>'owner_source', '') = :atip_source) THEN ro.phones ELSE rn.phones END,
+            emails = CASE WHEN ro.skip_trace_status IN ('hit','miss') AND ro.skip_trace_attempted_at IS NOT NULL AND ro.skip_trace_attempted_at >= NOW() - make_interval(days => :ttl) AND rn.skip_trace_status = 'not_attempted' AND NOT (CAST(:atip_blocked AS boolean) AND COALESCE(rn.enrichment_data->>'source', '') = 'tacoma_code_violations' AND COALESCE(rn.enrichment_data->>'owner_source', '') = :atip_source) THEN ro.emails ELSE rn.emails END
         FROM delivered_records dr
         JOIN results ro
           ON ro.id = dr.first_result_id
@@ -290,19 +290,67 @@ def _reuse_enrichment_for_duplicates(db, job, job_id: str) -> int:
           AND dr.user_id = CAST(:uid AS uuid)
           AND dr.dedup_hash = rn.dedup_hash
           AND rn.id <> dr.first_result_id
+        RETURNING rn.id
     """
     # An ATIP-named Tacoma lead never receives contact data while the paid switch is off:
     # the duplicate-reuse copy spends no new credit but would still attach phones and
     # emails to a name legal cleared for NAMING only (Codex). Addresses still copy.
+    # COALESCE: a row with no `source` key made this clause NULL, and a NULL CASE
+    # condition takes the ELSE, so such a duplicate silently never received reuse.
     from src.scrapers.enrichment.pierce_atip_owner import OWNER_SOURCE as _PIERCE_OWNER_SOURCE
 
-    result = db.execute(_sa_text(sql), {
+    params = {
         "ids": strong_ids, "uid": uid, "ttl": ttl,
         "atip_blocked": not settings.PIERCE_CV_OWNER_SKIP_TRACE_ENABLED,
         "atip_source": _PIERCE_OWNER_SOURCE,
-    })
+    }
+    touched = {str(i) for i in db.execute(_sa_text(sql), params).scalars()}
+
+    # The first delivery is not the only place a trace can live. Run 1 delivered the
+    # lead with skip trace off, run 2 traced ITS already-delivered row, and run 3 must
+    # reuse run 2's answer: reading first_result_id alone would buy it again. So an
+    # already-delivered row still untouched takes the NEWEST settled answer of any
+    # other run of this account for the same strong key, inside the same TTL. Targets
+    # are already-delivered rows only (never a same-run sibling); the source excludes
+    # this job; both legs are pinned to this account. Static SQL, bound params only.
+    from src.api.results_category import already_delivered_sql
+
+    later_sql = f"""
+        UPDATE results AS rn SET
+            phone = src.phone, phone_type = src.phone_type,
+            phone_dnc_flag = src.phone_dnc_flag, email = src.email,
+            phones = src.phones, emails = src.emails,
+            skip_trace_status = src.skip_trace_status,
+            skip_trace_attempted_at = src.skip_trace_attempted_at
+        FROM (
+            SELECT DISTINCT ON (ro.dedup_hash)
+                   ro.dedup_hash, ro.phone, ro.phone_type, ro.phone_dnc_flag, ro.email,
+                   ro.phones, ro.emails, ro.skip_trace_status, ro.skip_trace_attempted_at
+              FROM results ro
+             WHERE ro.user_id = CAST(:uid AS uuid)
+               AND ro.job_id <> CAST(:jid AS uuid)
+               AND ro.dedup_hash IN (SELECT dedup_hash FROM results
+                                      WHERE id = ANY(CAST(:ids AS uuid[]))
+                                        AND user_id = CAST(:uid AS uuid))
+               AND ro.skip_trace_status IN ('hit', 'miss')
+               AND ro.skip_trace_attempted_at >= NOW() - make_interval(days => :ttl)
+               AND ro.skip_trace_attempted_at <= NOW() + interval '5 minutes'
+             ORDER BY ro.dedup_hash, ro.skip_trace_attempted_at DESC, ro.id
+        ) AS src
+        WHERE rn.id = ANY(CAST(:ids AS uuid[]))
+          AND rn.user_id = CAST(:uid AS uuid)
+          AND rn.dedup_hash = src.dedup_hash
+          AND rn.skip_trace_status = 'not_attempted'
+          AND {already_delivered_sql("rn")}
+          AND NOT (CAST(:atip_blocked AS boolean)
+                   AND COALESCE(rn.enrichment_data->>'source', '') = 'tacoma_code_violations'
+                   AND COALESCE(rn.enrichment_data->>'owner_source', '') = :atip_source)
+        RETURNING rn.id
+    """
+    touched |= {str(i) for i in db.execute(
+        _sa_text(later_sql), {**params, "jid": job_id}).scalars()}
     db.commit()
-    return result.rowcount or 0
+    return len(touched)
 
 
 def _fill_king_mailing_from_extract(pid_map: dict[str, list], job_id: str) -> int:
@@ -1975,13 +2023,20 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config) -> None:
         )
         return
 
-    # Reload the surviving results after the unactionable drop. Exclude is_duplicate
-    # rows: a duplicate is never delivered or billed as a lead, so paying Tracerfy for
-    # it is pure waste. _reuse_enrichment_for_duplicates (run first) already copies a
-    # SETTLED prior trace onto cross-job dupes that have one; the remainder — including
-    # the same-job siblings the trustee_sale collapse marks, which have no prior row to
-    # copy from — must NOT be enqueued for a fresh paid lookup (Codex).
+    # Reload the surviving results after the unactionable drop. Eligible: the rows this
+    # run delivers, AND the rows an earlier run of this account already delivered.
+    # Delivered and traced are separate facts: a lead delivered with skip trace off
+    # still gets its first lookup when a later run turns skip trace on (owner,
+    # 2026-09-18; this line used to drop every duplicate, so it never could).
+    # _reuse_enrichment_for_duplicates (run first) has already copied any settled trace
+    # of this account inside the TTL, so a row reaching here still 'not_attempted' has
+    # nothing reusable; the cache check below is the second chance before paying.
+    # Same-run siblings (e.g. the trustee_sale collapse) stay out: another row of this
+    # run is the same property and is the one traced (Codex).
+    from sqlalchemy import text as _sa_text
+
     from src.api.lead_actionability import actionable_condition
+    from src.api.results_category import skip_trace_eligible_condition
 
     eligible = db.execute(
         sa_select(Result).where(
@@ -1993,9 +2048,45 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config) -> None:
             # never pay Tracerfy for it (Codex).
             actionable_condition(),
             Result.skip_trace_status == "not_attempted",
-            Result.is_duplicate.is_(False),
+            skip_trace_eligible_condition(),
         )
     ).scalars().all()
+
+    # A lookup Tracerfy already CHARGED for and we could not attribute ('unmatched')
+    # is not retried on every run: the same address would most likely fail the same
+    # way, and each retry is billed. Inside the freshness window such an
+    # already-delivered lead is settled as 'errored' (what its earlier row already
+    # shows); past it, it is asked again like any stale lead. A transport failure or a
+    # pre-submit rejection leaves no 'unmatched' row, so it IS retried (Codex).
+    delivered_before = [rec for rec in eligible if rec.is_duplicate and rec.dedup_hash]
+    if delivered_before:
+        charged_unanswered = set(db.execute(
+            _sa_text(
+                "SELECT DISTINCT r.dedup_hash FROM pending_skip_trace_rows p "
+                "JOIN results r ON r.id = p.result_id AND r.user_id = p.user_id "
+                "WHERE p.user_id = CAST(:uid AS uuid) AND p.status = 'unmatched' "
+                "  AND r.dedup_hash = ANY(CAST(:hashes AS text[])) "
+                "  AND COALESCE(p.submitted_at, p.enqueued_at) "
+                "      >= NOW() - make_interval(days => :ttl)"
+            ),
+            {"uid": str(job.user_id), "ttl": int(settings.SKIP_TRACE_CACHE_DAYS),
+             "hashes": sorted({rec.dedup_hash for rec in delivered_before})},
+        ).scalars())
+        if charged_unanswered:
+            settled = [rec for rec in delivered_before if rec.dedup_hash in charged_unanswered]
+            for rec in settled:
+                rec.skip_trace_status = "errored"
+                rec.skip_trace_attempted_at = _now()
+            settled_ids = {rec.id for rec in settled}
+            eligible = [rec for rec in eligible if rec.id not in settled_ids]
+            # Committed here: `if not eligible: return` below would otherwise drop it.
+            db.commit()
+            _publish_log(
+                r, job_id, "info",
+                f"Skip trace not repeated for {len(settled)} already delivered lead(s): an "
+                "earlier lookup was charged but could not be matched to the lead",
+                db=db,
+            )
 
     # A PLACEHOLDER street is not an address, and skip trace bills per lookup.
     # Worse than the money: address_cache_key() hashes the ADDRESS, so every row

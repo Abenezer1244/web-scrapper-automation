@@ -194,6 +194,29 @@ executable spreadsheet contexts". **PhoneBurner is exactly such an integration**
 root fix is to move sanitization from *export time* to the *data boundary* — one chokepoint
 instead of five call sites.
 
+### F-28 [P2] Cloudflare is bypassable — the Railway origin answers directly
+**CONFIRMED VULNERABILITY (discovered 2026-09-17 while designing the F-01 fix).**
+
+`curl --resolve api.bridgeleads.io:443:<railway-origin-ip>` returns the **real
+application**: `{"status":"ok","service":"bridgeleads-api"}` on `/health`, `401` on `/jobs`,
+`Server: railway-hikari`, and **no `cf-ray`**. The origin IP is discoverable from a public DNS
+lookup of the project's `*.up.railway.app` hostname.
+
+**Two consequences, and the second is the important one:**
+1. Every protection configured at the Cloudflare edge — WAF rules, DDoS and bot management,
+   edge rate limiting — can simply be skipped. Anything relied on there provides no guarantee.
+2. **It makes the obvious F-01 fix actively harmful.** Trusting `X-Forwarded-For` only works if
+   a trusted proxy is the *only* way in. With the origin reachable, an attacker controls the
+   entire XFF chain, so the parsed client IP becomes attacker-chosen: unlimited forged
+   rate-limit keys, **and forged values written into `audit_events.ip`**, poisoning the very
+   evidence I used to diagnose F-01. That is worse than today, where the key is useless but at
+   least not forgeable. Codex independently reached the same conclusion.
+
+**Therefore F-01 is now a two-step fix with a hard ordering**, and step 1 is infrastructure:
+close or authenticate the origin (Cloudflare Tunnel / Authenticated Origin Pulls / origin
+firewall, and confirm the public `*.up.railway.app` hostname is no longer usable) **before**
+any XFF-trusting code change lands.
+
 ### F-03 [P1] SSRF guard resolves DNS twice and never pins the validated IP (DNS rebinding)
 **CONFIRMED VULNERABILITY.** Flagged by sec-ssrf (P1) **and** Codex ("remaining concern is DNS
 check/connect TOCTOU"). Per the cross-check doctrine — both reviewers flagged it, take the higher

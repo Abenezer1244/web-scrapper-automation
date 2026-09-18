@@ -50,6 +50,9 @@ async def _lead(db, user: User, job_id: str, *, status: str = "queued",
         property_address=f"{random.randint(100, 99999)} MAIN ST, EVERETT, WA 98201",
         enrichment_data={DELIVERY_EXCLUDED_KEY: OVER_QUOTA} if over_quota else {},
         skip_trace_status=status, is_duplicate=duplicate,
+        # A re-election demoting the survivor writes 'same_run'. An already-delivered
+        # ('prior_run') lead stays traceable: test_skip_trace_already_delivered.py.
+        duplicate_reason="same_run" if duplicate else None,
     ))
     await db.commit()
     return rid

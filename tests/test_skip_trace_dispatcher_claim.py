@@ -20,7 +20,8 @@ from src.workers.skip_trace_dispatcher import dispatch_pending_skip_trace
 
 def _seed_pending(
     user_id: str, *, status: str = "queued", submitted_at=None,
-    is_duplicate: bool = False, enrichment_data: str = "{}", job_status: str = "done",
+    is_duplicate: bool = False, duplicate_reason: str | None = None,
+    enrichment_data: str = "{}", job_status: str = "done",
     billed: bool = False, created_at=None,
 ) -> tuple[str, str]:
     """scraper_config → job → result (skip_trace_status='queued') → pending row."""
@@ -51,14 +52,15 @@ def _seed_pending(
         )
         db.execute(
             text("""
-                INSERT INTO results (id, job_id, user_id, is_duplicate, skip_trace_status,
-                                     party_name, property_address, enrichment_data, created_at)
-                VALUES (:rid, :job_id, :user_id, :dup, 'queued',
+                INSERT INTO results (id, job_id, user_id, is_duplicate, duplicate_reason,
+                                     skip_trace_status, party_name, property_address,
+                                     enrichment_data, created_at)
+                VALUES (:rid, :job_id, :user_id, :dup, :reason, 'queued',
                         'SAARENAS AVELINO G', '5128 BEVERLY AVE NE',
                         CAST(:ed AS json), now())
             """),
             {"rid": result_id, "job_id": job_id, "user_id": user_id,
-             "dup": is_duplicate, "ed": enrichment_data},
+             "dup": is_duplicate, "reason": duplicate_reason, "ed": enrichment_data},
         )
         db.execute(
             text("""
@@ -201,7 +203,7 @@ async def test_a_row_whose_lead_became_a_duplicate_is_withdrawn_not_submitted(
     """Queued while it was the survivor, flagged duplicate before the tick (a
     watchdog re-run repeating the survivor election). Nothing is claimed or
     POSTed: the non-HTTPS endpoint would have produced an error if it had been."""
-    pending_id, result_id = _seed_pending(starter_user.id, is_duplicate=True)
+    pending_id, result_id = _seed_pending(starter_user.id, is_duplicate=True, duplicate_reason="same_run")
 
     out = dispatch_pending_skip_trace()
 
@@ -235,7 +237,7 @@ async def test_withdrawal_does_not_hold_back_the_deliverable_rows_beside_it(
     """One FIFO head, one withdrawn row and one live row. The live row still goes
     through the claim path (and is released as errored by the fake endpoint's
     definite rejection); the withdrawn one is cancelled in the same tick."""
-    dup_pending, dup_result = _seed_pending(starter_user.id, is_duplicate=True)
+    dup_pending, dup_result = _seed_pending(starter_user.id, is_duplicate=True, duplicate_reason="same_run")
     live_pending, live_result = _seed_pending(starter_user.id)
 
     out = dispatch_pending_skip_trace()
@@ -260,7 +262,8 @@ async def test_a_lead_being_updated_right_now_is_left_for_the_next_tick(
 
     with system_sync_session() as writer:
         writer.execute(
-            text("UPDATE results SET is_duplicate = true WHERE id = :id"), {"id": result_id}
+            text("UPDATE results SET is_duplicate = true, duplicate_reason = 'same_run' "
+                 "WHERE id = :id"), {"id": result_id}
         )  # uncommitted: holds the row lock
 
         out = dispatch_pending_skip_trace()

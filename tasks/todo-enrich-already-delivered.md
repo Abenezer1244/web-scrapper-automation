@@ -37,7 +37,8 @@ separate facts; dedup must stop re-delivery, not stop enrichment.
   unknown outcome -> held `submitting` for the reconciler. A later run makes a fresh
   `not_attempted` row, so an `errored` lead is retried by the next run with skip trace on.
 - CSV (`jobs.py` download, `category=already_delivered`) is built LIVE from this job's rows with
-  the configured layout (Phone 1..3 / Email 1..3). Enriching the rows fixes the CSV; no change.
+  the configured layout (legacy_v1: phone/phone_2/phone_3, email/email_2/email_3; crm_v1:
+  Phone 1..3 / Email 1..3). Enriching the rows fixes the CSV; no change.
 - FE results page polls every 30s while any row on the tab is queued/submitted; query key
   includes the category. The tab refreshes itself as lookups land.
 
@@ -75,15 +76,15 @@ delivered tab shows one line under its explainer when skip trace touched any of 
 counts only, no em dash.
 
 ## Phases (<=5 files each, verify + owner OK between phases)
-- [ ] P1 eligibility: enrich.py enqueue predicate + widened reuse; dispatcher 3 gates use the
+- [x] P1 eligibility: enrich.py enqueue predicate + widened reuse; dispatcher 3 gates use the
       same predicate; retarget the 3 existing "duplicate is withdrawn" fixtures to `same_run`
       (their real intent: a survivor demoted by re-election); new test file for the matrix.
-- [ ] P2 idempotency: dispatcher cache-settle sweep, in-flight hold, in-batch coalescing,
+- [x] P2 idempotency: dispatcher cache-settle sweep, in-flight hold, in-batch coalescing,
       advisory lock; tests incl. two jobs + one lead -> one paid row.
-- [ ] P3 API: summary field on ResultsPage (schemas.py, jobs.py, openapi.json) + test.
-- [ ] P4 FE: summary line on the Already delivered tab; regenerate api types; Playwright
+- [x] P3 API: summary field on ResultsPage (schemas.py, jobs.py, openapi.json) + test.
+- [x] P4 FE: summary line on the Already delivered tab; regenerate api types; Playwright
       (Chromium, not Claude in Chrome) against a local API: run 1 off, run 2 on, tab + CSV.
-- [ ] P5 Codex review (11 owner questions) + security Master Review §14, journal, PRs.
+- [x] P5 Codex review (11 owner questions) + security Master Review §14, journal, PRs.
 
 ## Test matrix (real DB, tests/test_skip_trace_already_delivered.py)
 1 new + OFF -> delivered, no trace · 2 dup + OFF -> no trace · 3 dup + ON never traced -> queued ·
@@ -130,4 +131,11 @@ REJECTED (with evidence)
   folded in (NULL reason = pre-089 rows, documented as prior_run by design).
 
 ## Review
-(filled in at the end)
+- BE: 74faf7d (eligibility, reuse, idempotency), 6e225ee (API summary), a3bbbed + 095b2e5
+  (Codex rounds 1-2). FE: d11c8d7, 0ae8b38, c0daf05. 28 new tests, each concurrency/idempotency
+  test mutation-checked. Full BE suite 4165 passed (9 Stripe env failures reproduce on main).
+- Codex: round 1 FAIL (hold expiry P1), round 2 FAIL (cache/claim race P1, sweep eligibility
+  P2), round 3 GATE: PASS. Its round-3 P2 (terminal polling) fixed in c0daf05.
+- Deviation from plan: the UI summary does not report "reused, no charge". The API role has
+  no grant on the queue tables; it needs a provenance column (follow-up).
+- Playwright E2E (local stack, provider CSV stubbed, no real credits): see BUILD_JOURNAL.

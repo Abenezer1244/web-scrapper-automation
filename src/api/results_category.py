@@ -12,7 +12,10 @@ A run's actionable rows fall into buckets the Results page names in its header:
   - ``same_run`` ("combined") and ``superseded`` are deliberately in neither
     category. A combined row is another filing of a property that IS listed as new
     in this same run; a superseded row was never delivered and a later run took its
-    claim. Neither is something this run already gave the user.
+    claim. Neither is something this run already gave the user. Both are always
+    written with ``is_duplicate = true`` (dedup.py sets the two together, and
+    ``_promote_elected`` clears the reason whenever it un-flags a row), so the
+    ``new`` predicate, unchanged from before this module existed, cannot reach them.
 
 The predicate lives here once so the list, the header count and the CSV cannot
 drift apart: the tab reading "227" must be the set the table pages through and the

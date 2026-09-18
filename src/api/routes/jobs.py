@@ -860,6 +860,12 @@ async def _attach_delivery_provenance(
         r.duplicate_original_visible = bool(
             src and src in available and (src, hashes.get(r.id)) in visible
         )
+        # Echo a run id only when this account can open it. A purged run's id is
+        # useless to the page, and an id that ever named another account's run
+        # (0 in production, 2026-09-17) must not be handed back at all. The claim
+        # date stays: it is this row's own history.
+        if not r.duplicate_source_available:
+            r.duplicate_source_job_id = None
 
 
 @router.get("/{job_id}/logs")

@@ -340,6 +340,10 @@ async def test_provenance_distinguishes_proven_matched_gone_and_unrecorded(
     }
     assert by_id[rid["proven"]]["duplicate_source_job_id"] == source
     assert by_id[rid["proven"]]["duplicate_source_at"] is not None
+    # A run the account cannot open is never named, only dated.
+    for k in ("purged", "unfinished", "foreign"):
+        assert by_id[rid[k]]["duplicate_source_job_id"] is None, k
+        assert by_id[rid[k]]["duplicate_source_at"] is not None, k
     assert by_id[rid["unrecorded"]]["duplicate_source_at"] is None
 
     # The new view carries no provenance claims at all.

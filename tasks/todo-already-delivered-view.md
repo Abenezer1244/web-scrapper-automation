@@ -102,17 +102,38 @@ Frontend (`bridgeleads-web`):
 
 Phase 1 (backend, <= 5 files): jobs.py, schemas.py, new tests file, openapi.json
 - [x] Codex pressure-test of this plan; fold in findings
-- [ ] category param + predicate helper on results/export-url/download
-- [ ] already_delivered_count + per-row provenance (batched)
-- [ ] tests: new-only, mixed, delivered-only, zero, exact count, tenant A/B (worker dedup + API),
+- [x] category param + predicate helper on results/export-url/download
+- [x] already_delivered_count + per-row provenance (batched)
+- [x] tests: new-only, mixed, delivered-only, zero, exact count, tenant A/B (worker dedup + API),
       direct cross-tenant 404, invalid category 422, search/sort/paging in category, provenance
       available / purged / foreign source id, previously enriched row, no quota/skip-trace mutation,
       CSV scope per category
-- [ ] ruff, targeted + full suite (isolated DB), OpenAPI regen (zero deletions)
-- [ ] Codex review + security §14; fix; STOP for owner approval
+- [x] ruff, targeted + full suite (isolated DB), OpenAPI regen (zero deletions)
+- [x] Codex review + security §14; fix; STOP for owner approval
 Phase 2 (frontend): api types regen, api.ts, page.tsx, ResultsTable.tsx (+ small tabs component)
 - [ ] implement, tsc + eslint, Playwright CLI Chromium at 320/375/390/430/768/1024/1440
 - [ ] Codex review; journal entry; PRs (BE first, FE after BE merges)
 
 ## Review
-(filled at the end)
+
+### Phase 1 (backend), 2026-09-18, commits ac8d6d7 + follow-up
+- Files: src/api/results_category.py (new), src/api/routes/jobs.py, src/api/schemas.py,
+  tests/test_results_already_delivered.py (13 tests), schema/openapi.json (+103/-0).
+- Found while testing: the old header arithmetic (duplicate_count - same_run) counts duplicate
+  tax rows past the 18-month cap that no view lists, so it could exceed what a user can open.
+  already_delivered_count applies the cap; the FE must read it instead of deriving.
+- Mutation-proven: combined leaking into delivered, provenance without the user filter, and a
+  download ignoring category each fail the new tests.
+- Full suite in 4 batches: 841 + 1302 + 1108 + 900 passed, 0 failed (CI env vars). One batch
+  first died on a local Postgres PANIC (Windows file lock while truncating `results`), re-run clean.
+- Codex diff review, 3 passes. Adopted: explicit ValueError for unknown category, docstring query
+  count, never echo an unopenable source run id. Refuted with evidence: count lacks actionability
+  (jobs.py WHERE has it), UUID/str binds (as_uuid=False), superseded not excluded (jobs.py:606;
+  and superseded/same_run always carry is_duplicate=true). Per-record vs per-property counting:
+  kept per record because the owner spec requires count == accessible records (227 records =
+  225 properties on the screenshot run). Final gate: PASS. Accepted P3: the claim date is still
+  shown when the run cannot be named (it is this account's own claim time).
+- Security §14 (translated): every query user_id-filtered + RLS; Literal-validated input (422);
+  no new secret, no raw error text; CSV through the existing sanitizing writer; read path
+  writes nothing (snapshot test); token replay across runs 403; cross-tenant 404.
+

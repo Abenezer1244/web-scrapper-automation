@@ -804,10 +804,77 @@ def _callers_for(pid: object, clean_to_originals: dict[str, list[str]]) -> list[
     return []
 
 
+# Config keys naming the RAW attribute columns a layer publishes data in. Used to
+# decide whether a returned feature carries any payload at all. Deliberately EXCLUDES
+# parcel_field (an id, always present on a match), geometry, dates and
+# situs_state_literal (a constant we supply, not something the county answered).
+_PAYLOAD_FIELD_KEYS = (
+    "address_field",
+    "address_suffix_fields",
+    "address_part_fields",
+    "situs_part_fields",
+    "mailing_fields",
+    "mailing_street_fields",
+    "mailing_locality_fields",
+)
+
+
+def _configured_payload_fields(gis_config: dict) -> list[str]:
+    """Every raw column this config reads data (not identity) out of."""
+    fields: list[str] = []
+    for key in _PAYLOAD_FIELD_KEYS:
+        value = gis_config.get(key)
+        if isinstance(value, str):
+            fields.append(value)
+        elif isinstance(value, (list, tuple)):
+            # situs_part_fields uses None as a positional placeholder (Cowlitz has
+            # no SITUS_STATE column); those positions name no column to read.
+            fields.extend([f for f in value if isinstance(f, str) and f])
+    return fields
+
+
+def _feature_payload_is_empty(attrs: dict, gis_config: dict) -> bool:
+    """The layer matched this parcel but answered with NO data at all.
+
+    Snohomish stripped every attribute off its public parcel layer between
+    2026-09-14 and 2026-09-18: 0 of 319,733 rows kept a non-null situsline1,
+    ownername, taxprname, mkttl or usecode, while the service still returned HTTP
+    200 and still matched on parcel_id. Nothing upstream could tell that apart from
+    "this parcel genuinely has no mailing address", so every Snohomish lead was
+    finalised with mailing_address NULL and nothing ever asked again — a source that
+    went from 94% coverage to 0% produced no signal whatsoever.
+
+    An identifier-only feature is INDETERMINATE, not an authoritative negative: it
+    is routed to ``county_unreached`` so the row defers to background recovery the
+    same way a timeout does. It is deliberately NOT a source-wide verdict — one
+    parcel proves nothing about a county, and a genuinely data-less parcel is
+    observationally identical (Codex). Declaring the whole layer down is the
+    canary's job, not this predicate's.
+
+    A vacant/raw-land parcel that really has no situs but DOES carry a taxpayer
+    mailing address fails this predicate (its mailing column is populated) and is
+    still treated as a real answer.
+    """
+    fields = _configured_payload_fields(gis_config)
+    if not fields:
+        # A config that reads no data columns (identity-only) can never be judged
+        # empty — there is nothing it was supposed to return.
+        return False
+    return all(not str(attrs.get(f) or "").strip() for f in fields)
+
+
 def _map_county_features(
-    features: list[dict], gis_config: dict, clean_to_originals: dict[str, list[str]]
+    features: list[dict],
+    gis_config: dict,
+    clean_to_originals: dict[str, list[str]],
+    degraded: list[str] | None = None,
 ) -> dict[str, dict[str, str | None]]:
     """Map county-GIS features onto the CALLER's parcel ids.
+
+    ``degraded`` (optional out-param): caller parcel ids whose feature came back
+    carrying no attribute payload at all. The caller folds these into
+    ``county_unreached`` so they defer to recovery instead of reading as an
+    authoritative "this parcel has no mailing address".
 
     The query strips dashes ("602543-087-0" -> "6025430870") and the server echoes
     the canonical form back, but the worker applies results by the lead's RAW
@@ -827,6 +894,18 @@ def _map_county_features(
         attrs = feature.get("attributes") or {}
         pid = attrs.get(parcel_field)
         if not pid:
+            continue
+        if _feature_payload_is_empty(attrs, gis_config):
+            # Matched, but the layer returned an identifier and nothing else. Do not
+            # let this reach _parse_gis_response: for a county with its own
+            # authoritative layer that would come back matched + vacant_no_situs and
+            # be PERSISTED as raw land (Codex), and for a fallback county it would be
+            # dropped here and read as a settled negative. Record it as unreached and
+            # leave the parcel to the statewide layer for its property address.
+            if degraded is not None:
+                for caller_pid in _callers_for(pid, clean_to_originals):
+                    if caller_pid not in degraded:
+                        degraded.append(caller_pid)
             continue
         parsed = _parse_gis_response({"features": [feature]}, gis_config)
         if (not parsed.get("property_address")
@@ -1114,10 +1193,21 @@ def _batch_query_county(
                 # An error body is not an answer about these parcels.
                 _note_unreached(unreached, clean_to_originals)
                 continue
+            degraded: list[str] = []
             found = _map_county_features(
-                data.get("features") or [], gis_config, clean_to_originals
+                data.get("features") or [], gis_config, clean_to_originals,
+                degraded=degraded,
             )
             results.update(found)
+            if degraded:
+                # The layer answered about these parcels with no data at all. That is
+                # not "no mailing address" — it is the source not serving us. Same
+                # contract as a timeout: deferable, never a settled negative.
+                _logger.warning(
+                    "County GIS returned %d attribute-empty feature(s) — source "
+                    "degraded, deferring their mailing lookup", len(degraded),
+                )
+                _note_unreached(unreached, {pid: [pid] for pid in degraded})
             if data.get("exceededTransferLimit"):
                 # A capped page is not an answer about the parcels it left out (one
                 # parcel can carry several features, e.g. condo units). Those were

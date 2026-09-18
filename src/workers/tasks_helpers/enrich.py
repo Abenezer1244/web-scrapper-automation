@@ -67,9 +67,18 @@ def enrichment_completion_log(summary: dict) -> tuple[str, str]:
     """
     mail = int(summary.get("mailing_deferred") or 0)
     owner = int(summary.get("owner_deferred") or 0)
-    if not mail and not owner:
+    # A count of rows that still have NO mailing address after the sweep, whether or
+    # not this run deferred them. Without it the line reported plain success for a
+    # job that obtained 0 mailing addresses: deferral was the ONLY thing it measured,
+    # so a county answering "nothing" without erroring (Snohomish, 2026-09-18) read
+    # as fully enriched. Reports what is missing, not what this pass happened to mark.
+    missing_mail = int(summary.get("mailing_missing") or 0)
+    if not mail and not owner and not missing_mail:
         return "success", "Enrichment complete: addresses added"
     parts = ["Address enrichment partly complete."]
+    if missing_mail and not mail:
+        noun = "lead has" if missing_mail == 1 else "leads have"
+        parts.append(f"{missing_mail:,} {noun} no mailing address available.")
     if mail:
         verb = "lookup is" if mail == 1 else "lookups are"
         parts.append(f"{mail:,} mailing address {verb} still pending.")
@@ -873,6 +882,16 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                 summary["mailing_deferred"] = (
                     int(summary.get("mailing_deferred") or 0) + gis_mailing_deferred
                 )
+        if summary is not None and gis_mailing_source:
+            # Truth for the completion line: rows this county SHOULD have been able to
+            # give a mailing address for and still has none. Counted from the rows
+            # themselves, not from what this pass marked, so a repeat run cannot
+            # announce success while the same leads are still empty (Codex).
+            summary["mailing_missing"] = len([
+                res for res in all_results
+                if not res.is_duplicate and not res.mailing_address
+                and res.parcel_id and len(res.parcel_id.strip()) >= 6
+            ])
         if commit_failures:
             _logger.warning(
                 "Job %s: GIS sweep finished with %d batch commit failure(s) — some "

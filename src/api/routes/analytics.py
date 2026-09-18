@@ -180,6 +180,11 @@ async def analytics_summary(
     # empty string), so IS NOT NULL is a true presence test.
     # enriched = skip_trace_status='hit' (the real terminal status for a found
     # contact); 'done' is never written by the pipeline.
+    # A row purged by the §7 retention sweep moves to 'purged' and so drops out of
+    # `enriched` — deliberately. `enriched` here means "has contact data now",
+    # which is what the phone/email percentages below already measure. Counting a
+    # row whose phone we deleted would make this the one number on the dashboard
+    # that disagrees with the other three.
     st = (
         await db.execute(
             select(

@@ -19,6 +19,88 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-17 — The OpenAPI gate was never about the schema, and a retention purge built blind
+
+> Continues the earlier 2026-09-17 entry, which sits at the BOTTOM of this file rather
+> than the top. All work on `fix/openapi-drift-from-docstring` (BE #336).
+
+**Built / Shipped:**
+- `11c7cc8` — merged `origin/main` in and resolved `webhooks.py` to the branch's short
+  docstring. This is the whole CI fix. **No schema regeneration was needed or made.**
+- `5c58b5f` — committed the phase 1 compliance audit (1,713 lines across 4 files) which
+  `git log --all` found on **no ref at all**; it was untracked in the shared OneDrive
+  checkout, and the handoff points the next session at three of those files by name.
+- `32e8407` / `84d4422` / `d318f36` / `5bdc18b` — the §7 retention purge, all five phases:
+  settings, migration `096`, `scheduler_helpers/retention.py`, daily Beat entry,
+  `SkipTraceStatus.PURGED`, the `DELETE ON skip_trace_cache` grant in all three
+  drift-guarded files, and `DataExporter.delete_from_r2()` plus the aged-export sweep.
+- `df56ccd`, `f2cf0a6` — review fixes (below).
+
+**Tried / Decided:**
+- Owner chose retention option **(c)**: keep lead rows (county public record), purge only
+  vendor-sourced contact PII. And **both** belt and suspenders for R2.
+- Cache ages off the **90-day reuse window, not 365**. `enrich.py`'s TTL check is read-time
+  only and never deletes, so a row past it can never be used again; keeping an unusable row
+  full of `raw_response` for another 275 days buys nothing.
+- **Daily, not weekly.** Weekly leaves PII in place up to ~7 days past the boundary we
+  publish, and "365 days" should not quietly mean 372.
+- Ships **OFF** (`RETENTION_PURGE_ENABLED=false`, `RETENTION_PURGE_DRY_RUN=true`) because the
+  deletion is irreversible and the clock question is still with counsel.
+
+**Failed / Blocked:**
+- **The handoff's root cause was wrong, and so was its fix.** It said the docstring theory was
+  disproven and the cause unidentified. The theory was right; the *branch base* was wrong.
+- **GitHub Actions is billing-blocked** since ~10:24 UTC — every job fails in ~1s without
+  starting. Nothing in this session is test-verified. Owner action.
+- **Handoff Step 2 is impossible as written.** Private repo on a free plan: branch protection
+  AND rulesets both `403 Upgrade to GitHub Pro`. `Test` cannot be made required.
+- Codex's first, broad implementation review was **killed for low memory**. A narrower rerun
+  with the file inlined completed. Its partial trace still earned its keep (see below).
+
+**Caught & fixed:**
+- **An in-flight race (mine, phase 4 audit).** A row traced long ago and since re-queued
+  carries old, past-retention PII while in `queued`/`submitted`. Purging it flips its status,
+  and `tracerfy_ingest.py:780` only accepts a result for a row still in those states — so a
+  Tracerfy lookup we **paid for** would be silently discarded.
+- **Codex HIGH — the export sweep could clobber a fresh key.** A commit and a network round
+  trip sit between selecting an aged export and clearing its key; a job re-exported in that gap
+  would have its NEW key nulled while the file stayed in R2. Both clears are now conditional on
+  the key actually deleted.
+- **Codex MEDIUM — the drain stopped on a SHORT batch**, but `FOR UPDATE SKIP LOCKED` returns
+  short whenever another transaction holds rows, so a few locked rows would abandon everything
+  behind them. Stops only on an empty batch now.
+- **A latent bug, incidentally.** `scripts/purge_skip_trace_cache.py` issues
+  `DELETE FROM skip_trace_cache` as `bridgeleads_system`, which held no DELETE on that table
+  until phase 3. It would have failed with `InsufficientPrivilege` since the RLS cutover.
+
+**Pending / Handoff:**
+- **Owner:** clear the Actions billing block; enable in two steps (dry run first, read the
+  counts, then enforce); add the R2 lifecycle rule; add six settings to `.env.example`
+  (deny-ruled here). Runbook §5a-5f.
+- **Counsel:** D1 (what the clock runs from) and D4 (below), answered together. Plus §7 still
+  promises deletion of "lead records" while we delete the data inside them.
+- Nothing here has executed against a real database. The SQL is reviewed, not proven.
+
+**Facts learned:**
+- **CI builds `refs/pull/N/merge`, not your branch.** A squash-merged upstream PR leaves its
+  content on a follow-up branch without ancestry, so git reads your removal and their addition
+  as unrelated edits and merges **both**. Reproduce with
+  `git merge origin/main --no-commit --no-ff` before believing a PR fix failed.
+- **A 1s CI failure with no steps is a billing block, not a code defect.** `gh pr checks`
+  renders it identically to a test failure; only the duration and the run annotation differ.
+- **`skip_trace_attempted_at` means "last ATTEMPT", not "when we obtained this data"** — and
+  three sites (`skip_trace_dispatcher.py:569`, `:880`, `tracerfy_ingest.py:782`) stamp it to
+  now() on the `errored` transition while acquiring nothing. So 400-day-old PII on a re-traced
+  row that errors gets a fresh full window. Re-queueing alone does NOT stamp it
+  (`enrich.py:2146`), which is what makes the in-flight guard safe. Logged as D4; the real fix
+  is a dedicated "PII obtained at" column, deliberately not attempted blind on the paid ingest
+  path with no test able to run.
+- `skip_trace_status` is a plain `str`, not an enum, and its value list lives in a Python
+  comment that never reaches OpenAPI — adding `purged` changes no API contract and needs no
+  frontend PR.
+
+---
+
 ## 2026-09-16 - A design audit of the live app, and seven findings that did not survive checking
 
 > **Scope:** every code change landed in the **frontend** repo `bridgeleads-web`. **No backend
@@ -7609,3 +7691,54 @@ connection errors) — not logic regressions.
 - Download route path is `/jobs/{id}/download` (no `/api/v1` prefix); API domain is
   `https://api.bridgeleads.io` (Railway service `api`, project `bridgeleads-production`).
 - Codex CLI works here (`codex exec resume <session> -`); SSH push doesn't (use `gh`/HTTPS).
+
+---
+
+## 2026-09-17 — Compliance audit phase 2: two log leaks shipped, one CI gate I broke
+
+**Built.** BE #334 (`4d2b926`): a uvicorn access-log rule scrubbing the
+`/webhooks/tracerfy/{provided_secret}` path, and `owner_name` removed from four
+scraper log statements (`county_gis.py` x3, `pacs.py`), logging `county_key`/`county`
+instead. FE #152: `<main>` + skip link on the landing page, and a footer `Sign in`
+link. BE #335 (`6a82748`): `TRACERFY_LEGACY_PATH_ENABLED`, a reversible kill switch
+that 410s the legacy route before the secret compare, plus secret-free
+`tracerfy_legacy_route_used` telemetry.
+
+**Failed, and worth recording.**
+
+*I merged a red build.* #335's `Test` job failed and it merged anyway, because `Test`
+is **not a required status check** and I used `gh pr merge --auto`, which gates only on
+required checks. I had spotted and flagged that exact gap on #334 an hour earlier, then
+relied on the mechanism anyway. main's CI is red on the **OpenAPI drift gate**
+("STALE: schema/openapi.json is out of date"). Prod is healthy; the failure is schema
+freshness, not function.
+
+*My first fix was wrong.* I assumed the cause was FastAPI publishing the route
+docstring as its OpenAPI `description` — I had expanded it. #336 restores that
+docstring byte-for-byte (diffed against `4d2b926`) and moves the notes to comments.
+CI still failed, so the docstring was not the cause. #336 is still worth landing —
+runbook detail does not belong in a public API description the FE type generator
+consumes — but it is **necessary-but-insufficient**. Cause still unidentified.
+
+*I could not regenerate the schema.* `.venv-schema/Scripts/python` points at the
+removed anaconda install, and this repo's own note says the regen environment matters,
+so improvising one risks committing a wrong schema. Handed off:
+`python scripts/export_openapi.py`, commit `schema/openapi.json`.
+
+**Succeeded.** Codex caught a trap I would otherwise have built: `audit_log()`
+persists `request.url.path` into the append-only `audit_events` table
+(`security.py:585,596` -> `:551`), which the app role cannot read or delete. I verified
+it has 27 callers and none in `webhooks.py`, so it is latent, not live — and the
+telemetry in #335 therefore logs a fixed event name and never the path. Dropping a
+finding also counted as a win: "install_global_redaction() missing in the worker"
+would have been theatre, since both PII modules use `setup_logger()`, which already
+attaches the filter, and an import-time call would be a no-op under Celery.
+
+**Decisions for the owner:** eight items in `tasks/PHASE2-OWNER-RUNBOOK.md`. The
+mailbox is first and is worse than the audit said — `bridgeleads.io` has no MX, so
+`Reply-To: support@bridgeleads.io` bounces on every email sent, and there is no SPF or
+DMARC while Resend DKIM is present.
+
+**Follow-ups:** make `Test` required; add `TRACERFY_LEGACY_PATH_ENABLED` to
+`.env.example` (deny-ruled in my environment, not worked around); regenerate the
+schema; pick a retention option (a/b/c).

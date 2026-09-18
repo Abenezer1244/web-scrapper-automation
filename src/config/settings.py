@@ -385,6 +385,45 @@ class Settings(BaseSettings):
     ENABLE_DAILY_SCRAPE: bool = False
     RECORD_RETENTION_DAYS: int = 365
 
+    # ─── Skip-trace PII retention (Privacy Policy §7) ─────────────────────────
+    # Policy §7 promises 365-day deletion of lead records. We keep the lead row
+    # (county public-record data) and purge the vendor-sourced contact PII inside
+    # it. See tasks/todo-retention-purge.md.
+    #
+    # SHIPS OFF ON PURPOSE. This deletion is IRREVERSIBLE, and the question of
+    # what the 365-day clock runs from is still with counsel: the clock below is
+    # `results.skip_trace_attempted_at`, i.e. "retain each newly obtained copy for
+    # 365 days" (matching the existing TTL precedent in tasks_helpers/enrich.py),
+    # NOT "delete 365 days after the lead was created". Those differ for any row
+    # that was re-traced. Rollout is: ENABLED=true + DRY_RUN=true (logs what it
+    # WOULD purge, writes nothing) -> read the counts -> DRY_RUN=false.
+    # Leaving this off leaves a KNOWN compliance gap; it is tracked as an owner
+    # step in tasks/PHASE2-OWNER-RUNBOOK.md, not forgotten here.
+    RETENTION_PURGE_ENABLED: bool = False
+    RETENTION_PURGE_DRY_RUN: bool = True
+    SKIP_TRACE_PII_RETENTION_DAYS: int = 365
+    # Cache rows are already unusable past SKIP_TRACE_CACHE_DAYS (the TTL check in
+    # enrich.py is read-time only and never deletes), and the cache feeds no
+    # billing, metering, delivery or customer-visible audit. Holding raw vendor
+    # payloads beyond the reuse window buys nothing, so this tracks the reuse
+    # window rather than the 365-day figure.
+    SKIP_TRACE_CACHE_RETENTION_DAYS: int = 90
+    # Delivered exports in R2 still contain the phone/email, so DB purging alone
+    # does not satisfy §7. Belt: an R2 lifecycle rule (owner-configured, and the
+    # only thing that reaps an object uploaded by a job that read the PII just
+    # before the purge committed). Suspenders: the sweep in the retention task.
+    EXPORT_RETENTION_DAYS: int = 365
+    # `skip_trace_queues.download_url` is a Tracerfy CDN link to the completion
+    # CSV. It is encrypted at rest, but the CDN itself needs NO auth: anyone
+    # holding the URL can fetch a file of traced phone numbers. It is kept on
+    # purpose, because a batch that was paid for but never applied is recovered by
+    # hand from it (tracerfy_ingest.py:350). That recovery only matters while the
+    # data is still retainable, so a COMPLETED queue (already ingested, nothing to
+    # recover) drops its link after this window, and pending/errored queues keep
+    # theirs until the PII retention window itself expires.
+    SKIP_TRACE_LINK_RETENTION_DAYS: int = 30
+    RETENTION_PURGE_BATCH: int = 1000
+
     # ─── Logging ──────────────────────────────────────────────────────────────
     LOG_LEVEL: str = "INFO"
 

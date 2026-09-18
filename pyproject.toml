@@ -58,6 +58,14 @@ ignore = [
 # to remove.
 "src/workers/scheduler_helpers/billing.py" = ["S608"]
 "src/workers/tasks_helpers/enrich.py" = ["S608"]  # duplicate-reuse SQL builder moved here from tasks.py
+# Same shape again: the retention sweep splices _ELIGIBLE and _PII_COLUMNS,
+# module-level constants made of literal column names. Both cutoffs are computed
+# in-process from settings, every value is bound (:cutoff, :purged, :batch), and
+# nothing reachable from a request touches this module. _ELIGIBLE is spliced into
+# the purge, the count and the oldest-remaining probe precisely so they CANNOT
+# drift: a count that disagrees with the purge predicate would under-report an
+# open compliance gap, which is the one failure this task exists to detect.
+"src/workers/scheduler_helpers/retention.py" = ["S608"]
 "src/api/routes/scrapers.py" = ["S608"]
 "src/api/routes/segments.py" = ["S608"]   # segment SQL interpolates only generated tax_cap_sql/{county_clause} placeholders; values bound via params
 "src/workers/batch_export.py" = ["S608"]  # combined-export SQL interpolates only the tax_cap_sql placeholder; values bound via params

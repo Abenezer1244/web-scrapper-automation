@@ -71,6 +71,10 @@ _GRANTS = [
     "GRANT DELETE ON mfa_backup_codes, mfa_break_glass_codes TO bridgeleads_system",
     # pending_registrations (074): worker dispatch SELECT/UPDATE (ALL TABLES) + purge DELETE
     "GRANT DELETE ON pending_registrations TO bridgeleads_system",
+    # skip_trace_cache: the §7 retention sweep deletes aged rows. NULLing the PII
+    # on `results` needs no new grant (the ALL TABLES UPDATE above covers it);
+    # this is the only new privilege the retention task requires.
+    "GRANT DELETE ON skip_trace_cache TO bridgeleads_system",
     "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO bridgeleads_system",
 ]
 
@@ -111,6 +115,7 @@ _VERIFY_APP_GRANTS = """
 #   mfa_backup_codes         scripts/reset_user_mfa.py
 #   mfa_break_glass_codes    scripts/reset_user_mfa.py
 #   pending_registrations    hourly expired-row purge
+#   skip_trace_cache         daily §7 retention purge (scheduler_helpers/retention.py)
 _SYSTEM_DELETE_TABLES = (
     "delivered_records",
     "county_records",
@@ -118,6 +123,7 @@ _SYSTEM_DELETE_TABLES = (
     "mfa_backup_codes",
     "mfa_break_glass_codes",
     "pending_registrations",
+    "skip_trace_cache",
 )
 
 _VERIFY_SYSTEM_GRANTS = """

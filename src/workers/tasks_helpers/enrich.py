@@ -683,6 +683,24 @@ def _apply_bulk_mailing(db, fills: list[tuple], job_id: str) -> tuple[int, list]
     """
     written = 0
     failed: list = []
+    # Settle everything this sweep already dirtied ONCE, at batch scope, before any
+    # savepoint. _guarded_update flushes as its first statement, so leaving pending
+    # ORM state would push that flush INSIDE a per-row savepoint: one bad row would
+    # roll back the property addresses every other row just earned, and a flush
+    # failure there escapes before the caller can mark anything deferred (Codex).
+    try:
+        db.flush()
+    except Exception as exc:  # noqa: BLE001
+        # The transaction cannot be committed now. Recover the session and hand back
+        # every row so the caller still marks them retryable; the property fills in
+        # this batch are lost with the rollback, but those rows stay in
+        # results_need_addr and a re-run refills them.
+        db.rollback()
+        _logger.warning(
+            "Job %s: pre-write flush failed, %d bulk fill(s) deferred: %s",
+            job_id, len(fills), str(exc)[:120],
+        )
+        return 0, [res for res, _ in fills]
     for res, gis_data in fills:
         patch = {
             "mailing_source": gis_data.get("mailing_source"),
@@ -702,6 +720,17 @@ def _apply_bulk_mailing(db, fills: list[tuple], job_id: str) -> tuple[int, list]
                 )
             if ok:
                 written += 1
+            else:
+                # The guard refused. USUALLY that means a mailing address already
+                # landed, which is the fill-only rule working. But it also refuses a
+                # row whose enrichment_data is not a JSON object, and that row can
+                # still be NULL — unresolved, not settled, so it stays retryable
+                # (Codex). _guarded_update has already reloaded or expunged it.
+                try:
+                    if getattr(res, "mailing_address", None) is None:
+                        failed.append(res)
+                except Exception:  # noqa: BLE001, S110 -- expunged row: nothing to mark
+                    pass
         except Exception as exc:  # noqa: BLE001 -- enrichment is best-effort
             failed.append(res)
             _logger.warning(

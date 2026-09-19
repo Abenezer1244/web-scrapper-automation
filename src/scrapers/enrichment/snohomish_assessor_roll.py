@@ -385,10 +385,16 @@ def _ensure_index() -> Path | None:
     # A warm index answers WITHOUT asking the county anything. Fetching the item
     # metadata on every lookup put a network round trip in front of every batch,
     # and a rejected new revision would re-download on each one (Codex).
-    if prior and prior.exists():
-        age = time.time() - float(published.get("checked_at") or published.get("built_at") or 0)
-        if age < _REFRESH_AFTER_S:
-            return prior
+    since_check = time.time() - float(
+        published.get("checked_at") or published.get("built_at") or 0
+    )
+    if prior and prior.exists() and since_check < _REFRESH_AFTER_S:
+        return prior
+    if not prior and since_check < _REFRESH_AFTER_S:
+        # COLD and recently tried. The backoff has to gate the no-index case too, or
+        # a county outage means a fresh 33 MB download attempt on every single batch
+        # (Codex). source_unavailable is deferrable, so nothing is lost by waiting.
+        return None
 
     revision = _remote_revision()
     _touch_checked_at(published)

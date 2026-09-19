@@ -30,6 +30,12 @@ from src.scrapers.enrichment.snohomish_assessor_roll import (
     normalize_parcel_key,
 )
 
+# conftest stubs _ensure_index for every test so nothing reaches the live county
+# file. Captured HERE, at import, before that autouse patch applies, so the tests
+# that are ABOUT _ensure_index can put the real one back (and are not silently
+# asserting against the stub).
+_REAL_ENSURE_INDEX = roll._ensure_index
+
 HEADER = [
     "ID", "PropId", "parcel_number", "Role", "PartyName",
     "line_1", "line_2", "line_3", "city", "State", "zip_postal_code",
@@ -281,7 +287,34 @@ class TestSourceAgeCeiling:
                             lambda: {"revision": ancient, "built_at": time.time(),
                                      "checked_at": time.time()})
         monkeypatch.setattr(roll, "_remote_revision", lambda: ancient)
+        monkeypatch.setattr(roll, "_ensure_index", _REAL_ENSURE_INDEX)
         assert roll._ensure_index() is None
+
+    def test_a_cold_failure_backs_off_instead_of_redownloading_every_batch(
+        self, tmp_path, monkeypatch
+    ):
+        # No index at all, and we tried moments ago. Without this gate a county
+        # outage meant a fresh 33 MB download attempt on EVERY batch (Codex).
+        monkeypatch.setattr(roll, "_CACHE_DIR", tmp_path)
+        monkeypatch.setattr(roll, "_published_meta", lambda: {"checked_at": time.time()})
+
+        def _must_not_be_called():
+            raise AssertionError("asked the county inside the backoff window")
+
+        monkeypatch.setattr(roll, "_remote_revision", _must_not_be_called)
+        monkeypatch.setattr(roll, "_ensure_index", _REAL_ENSURE_INDEX)
+        assert roll._ensure_index() is None
+
+    def test_after_the_backoff_window_a_cold_start_tries_again(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(roll, "_CACHE_DIR", tmp_path)
+        monkeypatch.setattr(roll, "_published_meta",
+                            lambda: {"checked_at": time.time() - 2 * roll._REFRESH_AFTER_S})
+        asked = []
+        monkeypatch.setattr(roll, "_remote_revision",
+                            lambda: asked.append(1) or None)
+        monkeypatch.setattr(roll, "_ensure_index", _REAL_ENSURE_INDEX)
+        roll._ensure_index()
+        assert asked, "should have re-asked the county after the window"
 
     def test_a_cold_start_still_records_that_we_asked(self, tmp_path, monkeypatch):
         # _touch_checked_at({}) used to be a no-op, so a cold failure re-downloaded

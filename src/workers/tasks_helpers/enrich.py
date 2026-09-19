@@ -67,9 +67,18 @@ def enrichment_completion_log(summary: dict) -> tuple[str, str]:
     """
     mail = int(summary.get("mailing_deferred") or 0)
     owner = int(summary.get("owner_deferred") or 0)
-    if not mail and not owner:
+    # A count of rows that still have NO mailing address after the sweep, whether or
+    # not this run deferred them. Without it the line reported plain success for a
+    # job that obtained 0 mailing addresses: deferral was the ONLY thing it measured,
+    # so a county answering "nothing" without erroring (Snohomish, 2026-09-18) read
+    # as fully enriched. Reports what is missing, not what this pass happened to mark.
+    missing_mail = int(summary.get("mailing_missing") or 0)
+    if not mail and not owner and not missing_mail:
         return "success", "Enrichment complete: addresses added"
     parts = ["Address enrichment partly complete."]
+    if missing_mail and not mail:
+        noun = "lead has" if missing_mail == 1 else "leads have"
+        parts.append(f"{missing_mail:,} {noun} no mailing address available.")
     if mail:
         verb = "lookup is" if mail == 1 else "lookups are"
         parts.append(f"{mail:,} mailing address {verb} still pending.")
@@ -1805,6 +1814,26 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
             job_id, len(unactionable), len(fresh),
             no_parcel_no_legal, has_parcel, legal_no_parcel,
         )
+
+    # Truth for the completion line: rows this county SHOULD have been able to give a
+    # mailing address for and still has none. Counted from the rows themselves rather
+    # than from what a pass happened to MARK, so a re-run cannot announce success while
+    # the same leads are still empty. Measured HERE, at the very end, because the PACS
+    # and Pierce-legal passes above can still fill a mailing address — counting it
+    # beside the GIS sweep reported addresses missing that were recovered moments later
+    # (Codex Medium).
+    if summary is not None:
+        try:
+            from src.scrapers.enrichment.county_gis import has_gis_mailing_source
+
+            if has_gis_mailing_source(config.county, config.state):
+                summary["mailing_missing"] = len([
+                    res for res in all_results
+                    if not res.is_duplicate and not res.mailing_address
+                    and res.parcel_id and len(res.parcel_id.strip()) >= 6
+                ])
+        except Exception as exc:  # noqa: BLE001 -- a report must never fail the job
+            _logger.warning("mailing_missing count skipped: %s", str(exc)[:120])
 
     # Skip trace is deliberately NOT enqueued here. Which rows are delivered is
     # still undecided at this point: the same-run survivor re-election, the claim

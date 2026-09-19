@@ -762,7 +762,24 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
             for pid, gis_data in gis_results.items():
                 prop = gis_data.get("property_address")
                 mail = gis_data.get("mailing_address")
+                # A bulk county export is a MONTHLY snapshot. A row can reach this
+                # sweep because its PROPERTY address was missing while already
+                # holding a good, fresher mailing address, and the live-layer
+                # branches below overwrite mailing whenever they have one. Letting a
+                # snapshot replace a better value that way is a silent downgrade, so
+                # a bulk answer is fill-only (Codex).
+                bulk_source = gis_data.get("mailing_source")
                 for res in parcel_map.get(pid, []):
+                    # Per ROW, never reassigning the parcel-level `mail`: one lead on
+                    # a parcel already having a mailing address must not suppress the
+                    # fill for its siblings that do not.
+                    row_mail = None if (bulk_source and res.mailing_address) else mail
+                    if row_mail and bulk_source:
+                        ed = dict(res.enrichment_data) if isinstance(res.enrichment_data, dict) else {}
+                        ed["mailing_source"] = bulk_source
+                        ed["mailing_source_role"] = gis_data.get("mailing_role")
+                        ed["mailing_source_revision"] = gis_data.get("mailing_revision")
+                        res.enrichment_data = ed
                     # Migration 085 (#188) — capture the REAL situs parts BEFORE the
                     # assessor's street-only line replaces the scraper's fuller one.
                     # Runs for every branch below, including vacant land, so a parcel
@@ -773,14 +790,14 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                         # Only a REAL mailing overwrites (King never echoes the
                         # property into mailing — Codex): never clobber an existing
                         # value with None.
-                        if mail:
-                            res.mailing_address = mail
+                        if row_mail:
+                            res.mailing_address = row_mail
                         batch_updated += 1
-                    elif mail:
+                    elif row_mail:
                         # No street, but a real mailing (e.g. a Pierce parcel with a
                         # Delivery_Address but null Site_Address) — keep it rather
                         # than drop it into the vacant branch (Codex P2).
-                        res.mailing_address = mail
+                        res.mailing_address = row_mail
                         batch_updated += 1
                     elif gis_data.get("vacant_no_situs"):
                         # Matched but no street (vacant/raw land, ~1/3 of King

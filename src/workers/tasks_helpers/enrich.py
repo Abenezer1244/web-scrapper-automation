@@ -920,6 +920,10 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                     if _ed.get("mailing_lookup_deferred") is not True:
                         _ed["mailing_lookup_deferred"] = True
                         _res.enrichment_data = _ed
+                        # Count it, or the completion line reports fewer pending
+                        # recoveries than there are (Codex).
+                        if _res.parcel_id:
+                            batch_deferred.add(_res.parcel_id.strip())
             if gis_mailing_source:
                 # The county request for these parcels failed (HTTP error, timeout,
                 # ArcGIS error body), so their mailing lookup never happened. Without a

@@ -283,10 +283,27 @@ class TestSourceAgeCeiling:
         monkeypatch.setattr(roll, "_MIN_TAXPAYER_ROWS", 3)
         z = _make_zip(tmp_path / "s.zip", _bulk(4))
         roll._build_index(z, roll._index_path(ancient), ancient)
+        # checked_at must be OUTSIDE the backoff window or the cold/warm gate
+        # returns first and this never reaches the branch it is named for (Codex).
         monkeypatch.setattr(roll, "_published_meta",
                             lambda: {"revision": ancient, "built_at": time.time(),
-                                     "checked_at": time.time()})
+                                     "checked_at": time.time() - 2 * roll._REFRESH_AFTER_S})
         monkeypatch.setattr(roll, "_remote_revision", lambda: ancient)
+        monkeypatch.setattr(roll, "_ensure_index", _REAL_ENSURE_INDEX)
+        assert roll._ensure_index() is None
+
+    def test_a_manifest_whose_index_file_is_gone_still_backs_off(self, tmp_path, monkeypatch):
+        # A manifest revision makes a truthy Path even when the SQLite file is gone.
+        # Both backoff branches used to miss it, so a failed build meant hitting the
+        # county on EVERY batch despite a recent checked_at (Codex).
+        monkeypatch.setattr(roll, "_CACHE_DIR", tmp_path)
+        monkeypatch.setattr(roll, "_published_meta",
+                            lambda: {"revision": "gone", "checked_at": time.time()})
+
+        def _must_not_be_called():
+            raise AssertionError("asked the county inside the backoff window")
+
+        monkeypatch.setattr(roll, "_remote_revision", _must_not_be_called)
         monkeypatch.setattr(roll, "_ensure_index", _REAL_ENSURE_INDEX)
         assert roll._ensure_index() is None
 

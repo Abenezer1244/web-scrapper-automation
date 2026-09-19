@@ -375,7 +375,13 @@ def _ensure_index() -> Path | None:
     published = _published_meta()
     prior_rev = published.get("revision")
     prior = _index_path(str(prior_rev)) if prior_rev else None
-    if prior and prior.exists() and _source_is_too_old(str(prior_rev)):
+    if prior is not None and not prior.exists():
+        # A manifest revision makes a truthy Path even when its SQLite file is gone
+        # (a failed build, a wiped temp dir). Both backoff branches below then miss
+        # it - `prior.exists()` is False but so is `not prior` - and the county gets
+        # hit on every single batch despite a recent checked_at (Codex).
+        prior = None
+    if prior and _source_is_too_old(str(prior_rev)):
         _logger.warning(
             "Snohomish roll: revision %s is past the %d-day source-age ceiling; "
             "refusing to serve it", prior_rev, _MAX_INDEX_AGE_S // 86400,
@@ -388,7 +394,7 @@ def _ensure_index() -> Path | None:
     since_check = time.time() - float(
         published.get("checked_at") or published.get("built_at") or 0
     )
-    if prior and prior.exists() and since_check < _REFRESH_AFTER_S:
+    if prior and since_check < _REFRESH_AFTER_S:
         return prior
     if not prior and since_check < _REFRESH_AFTER_S:
         # COLD and recently tried. The backoff has to gate the no-index case too, or

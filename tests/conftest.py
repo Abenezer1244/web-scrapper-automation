@@ -122,6 +122,29 @@ def _no_king_extract_download(monkeypatch):
     yield
 
 
+# ─── Snohomish Assessor Roll: off unless a test opts in ──────────────────────
+
+@pytest.fixture(autouse=True)
+def _no_snohomish_roll_download(monkeypatch):
+    """Snohomish mailing now consults a 33 MB county export before answering.
+
+    Same contract as the King extract above: no test may reach the network for it,
+    and a cached index left by another run must not silently change what an
+    unrelated Snohomish test observes. This bit for real — the county-GIS unreached
+    tests patch `county_gis.safe_get`, but the roll resolver has its OWN http calls,
+    so those tests quietly began resolving against a live 316k-row file.
+
+    With no index the resolver reports `source_unavailable` for every parcel, which
+    is the conservative answer: it is never treated as "this parcel has no mailing
+    address". A test of the roll itself re-patches `_ensure_index` (the later patch
+    wins).
+    """
+    from src.scrapers.enrichment import snohomish_assessor_roll
+
+    monkeypatch.setattr(snohomish_assessor_roll, "_ensure_index", lambda: None)
+    yield
+
+
 # ─── Database fixture ─────────────────────────────────────────────────────────
 
 @pytest_asyncio.fixture

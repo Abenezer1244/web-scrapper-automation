@@ -648,6 +648,44 @@ def _empty() -> dict[str, str | None]:
     return {"property_address": None, "mailing_address": None}
 
 
+# Counties whose owner mailing comes from a BULK county export rather than a live
+# per-parcel layer. Registered explicitly, NOT inferred from the GIS config: the
+# Snohomish GIS mailing fields are dead weight now, and deleting them must not also
+# delete Snohomish from mailing recovery (Codex).
+_BULK_MAILING_COUNTIES: frozenset[str] = frozenset({"snohomish_WA"})
+
+# Bulk exports carrying the SAME RCW 42.56.070(8) restriction on lists of
+# individuals as the county's live layer. The Snohomish Assessor Roll is literally
+# the same taxpayer block behind the same clause, so it MUST answer to the same
+# kill switch: gating only the live layer would mean turning the switch off for a
+# legal reason silently stopped nothing.
+_BULK_MAILING_LICENSE_RESTRICTED: frozenset[str] = frozenset({"snohomish_WA"})
+
+
+def has_bulk_mailing_source(county: str, state: str) -> bool:
+    """True when a county publishes owner mailing as a bulk file we can resolve."""
+    key = f"{(county or '').lower()}_{(state or '').upper()}"
+    if key not in _BULK_MAILING_COUNTIES:
+        return False
+    if (key in _BULK_MAILING_LICENSE_RESTRICTED
+            and not settings.COUNTY_GIS_RESTRICTED_MAILING_ENABLED):
+        return False
+    return True
+
+
+def _resolve_bulk_mailing(county_key: str, parcel_ids: list[str]) -> dict:
+    """Bulk-source answers for these parcels, keyed by caller id. Never raises."""
+    if county_key != "snohomish_WA":
+        return {}
+    try:
+        from src.scrapers.enrichment.snohomish_assessor_roll import resolve_mailing
+
+        return resolve_mailing(parcel_ids)
+    except Exception as exc:  # noqa: BLE001 -- enrichment is best-effort
+        _logger.warning("Bulk mailing source failed for %s: %s", county_key, str(exc)[:160])
+        return {}
+
+
 def has_gis_mailing_source(county: str, state: str) -> bool:
     """True when this county's own GIS layer publishes the owner's mailing address.
 
@@ -659,11 +697,18 @@ def has_gis_mailing_source(county: str, state: str) -> bool:
 
 
 def gis_mailing_source_counties(state: str = "WA") -> list[str]:
-    """Lower-case county names whose GIS layer carries a mailing address."""
+    """Lower-case county names with ANY mailing source — live layer or bulk export.
+
+    Background recovery selects its candidates from this list, so a county served
+    only by a bulk file has to appear here or its deferred rows are never retried.
+    """
     suffix = f"_{state.upper()}"
+    keys = set(_KNOWN_GIS_ENDPOINTS) | _BULK_MAILING_COUNTIES
     return sorted(
-        key[: -len(suffix)] for key in _KNOWN_GIS_ENDPOINTS
-        if key.endswith(suffix) and has_gis_mailing_source(key[: -len(suffix)], state)
+        key[: -len(suffix)] for key in keys
+        if key.endswith(suffix)
+        and (has_gis_mailing_source(key[: -len(suffix)], state)
+             or has_bulk_mailing_source(key[: -len(suffix)], state))
     )
 
 
@@ -741,6 +786,69 @@ def batch_enrich_parcels_gis(
 
     for row in results.values():
         row.pop("needs_situs_fallback", None)
+
+    # ─── Bulk mailing source ────────────────────────────────────────────────
+    # Runs LAST, after the statewide fallback has settled every property address,
+    # so filling a mailing-only answer can never remove a parcel from the situs
+    # `missing` set and cost it its property address (Codex High).
+    #
+    # Eligibility is "still has no mailing", NOT "was reported unreached": an empty
+    # FEATURE SET, or a future revision that keeps situs and drops only the taxpayer
+    # block, leaves a parcel with no mailing and no unreached marker, and those are
+    # exactly the parcels this source exists to answer (Codex).
+    if has_bulk_mailing_source(county, state):
+        needs_mail = [
+            pid for pid in dict.fromkeys(parcel_ids)
+            if pid and not (results.get(pid) or {}).get("mailing_address")
+        ]
+        if needs_mail:
+            answers = _resolve_bulk_mailing(county_key, needs_mail)
+            filled_pids: set[str] = set()
+            for pid, answer in answers.items():
+                if not getattr(answer, "is_found", False):
+                    # NOT an answer about this parcel. Leaving it unmarked is what
+                    # made this a NO-GO: with the county layer dead, a parcel whose
+                    # feature set came back EMPTY carries no unreached marker either,
+                    # so recovery would read the pair as "attempted, no mailing
+                    # address", write a terminal `none` and clear the deferral
+                    # permanently — on a momentary download failure (Codex High).
+                    # Every non-found outcome therefore stays deferrable:
+                    #   source_unavailable — we never got to ask
+                    #   ambiguous          — two taxpayer rows disagree; a later
+                    #                        revision may settle it
+                    #   absent_in_snapshot — no association in THIS revision, which
+                    #                        is not the same as "has no mailing
+                    #                        address" (Codex)
+                    # _rotate charges no attempt, so these cycle rather than burn
+                    # the ceiling. A revision-scoped terminal state would let the
+                    # genuinely-absent ones settle; that is deliberate future work,
+                    # noted because the queue for this county is small (tens of rows).
+                    continue
+                row = dict(results.get(pid) or _empty())
+                row["mailing_address"] = answer.mailing_address
+                row["mailing_source"] = "snohomish_assessor_roll"
+                row["mailing_role"] = answer.role
+                row["mailing_revision"] = answer.revision
+                results[pid] = row
+                filled_pids.add(pid)
+                # It has been answered, so it must not also be reported as a parcel
+                # we failed to reach — that would defer a row we just filled.
+                if stats is not None and pid in stats.get("county_unreached", []):
+                    stats["county_unreached"].remove(pid)
+
+            # Derived from what was ASKED, not from what came BACK. _resolve_bulk_mailing
+            # swallows its exceptions and returns {}, so iterating the response left
+            # every parcel unmarked on exactly the failure the deferral exists for,
+            # reopening the High it was meant to close (Codex).
+            unresolved = [pid for pid in needs_mail if pid not in filled_pids]
+            if unresolved and stats is not None:
+                _note_unreached(stats["county_unreached"],
+                                {pid: [pid] for pid in unresolved})
+            if filled_pids or unresolved:
+                _logger.info(
+                    "Bulk mailing source: filled %d, deferred %d of %d %s parcels",
+                    len(filled_pids), len(unresolved), len(needs_mail), county.lower(),
+                )
 
     return results
 

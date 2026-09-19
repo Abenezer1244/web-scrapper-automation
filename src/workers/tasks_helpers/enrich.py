@@ -656,6 +656,90 @@ def _fill_king_condo_unit_situs(db, rows: list, job_id: str) -> int:
     return filled
 
 
+_SQL_BULK_MAILING = f"""
+    UPDATE results
+       SET mailing_address = :mail, enrichment_data = {ED_MERGE_SQL}
+     WHERE id = :rid AND user_id = :uid AND {ED_MERGEABLE_SQL}
+       AND mailing_address IS NULL
+ RETURNING mailing_address, enrichment_data
+"""
+
+
+def _apply_bulk_mailing(db, fills: list[tuple], job_id: str) -> tuple[int, list]:
+    """Write bulk-export mailing addresses fill-only, guarded in the DATABASE.
+
+    A bulk answer comes from a MONTHLY snapshot, so it must never replace a fresher
+    value. Testing the ORM object is not enough: it was loaded before the lookup,
+    and the recovery sweep can fill the same row while that network call is in
+    flight, leaving this object holding NULL and overwriting the newer address
+    (Codex High). ``mailing_address IS NULL`` in the WHERE clause is the real guard.
+
+    Returns (written, failed). A row whose write RAISED is returned in ``failed``:
+    the resolver already removed its parcel from county_unreached, so without a
+    deferral marker the batch would commit a NULL mailing that nothing ever revisits
+    — the silent permanent gap this whole change exists to remove (Codex High). A
+    row the guard merely REFUSED is not a failure: the database already holds a
+    mailing address, which is the fill-only rule working.
+    """
+    written = 0
+    failed: list = []
+    # Settle everything this sweep already dirtied ONCE, at batch scope, before any
+    # savepoint. _guarded_update flushes as its first statement, so leaving pending
+    # ORM state would push that flush INSIDE a per-row savepoint: one bad row would
+    # roll back the property addresses every other row just earned, and a flush
+    # failure there escapes before the caller can mark anything deferred (Codex).
+    try:
+        db.flush()
+    except Exception as exc:  # noqa: BLE001
+        # The transaction cannot be committed now. Recover the session and hand back
+        # every row so the caller still marks them retryable; the property fills in
+        # this batch are lost with the rollback, but those rows stay in
+        # results_need_addr and a re-run refills them.
+        db.rollback()
+        _logger.warning(
+            "Job %s: pre-write flush failed, %d bulk fill(s) deferred: %s",
+            job_id, len(fills), str(exc)[:120],
+        )
+        return 0, [res for res, _ in fills]
+    for res, gis_data in fills:
+        patch = {
+            "mailing_source": gis_data.get("mailing_source"),
+            "mailing_source_role": gis_data.get("mailing_role"),
+            "mailing_source_revision": gis_data.get("mailing_revision"),
+        }
+        try:
+            # SAVEPOINT per row: a failed statement poisons the enclosing
+            # transaction until rolled back, so swallowing one without a savepoint
+            # would take down the whole batch commit, including the property
+            # addresses this sweep just filled.
+            with db.begin_nested():
+                ok = _guarded_update(
+                    db, res, _SQL_BULK_MAILING,
+                    {"patch": patch, "mail": gis_data.get("mailing_address")},
+                    ("mailing_address", "enrichment_data"),
+                )
+            if ok:
+                written += 1
+            else:
+                # The guard refused. USUALLY that means a mailing address already
+                # landed, which is the fill-only rule working. But it also refuses a
+                # row whose enrichment_data is not a JSON object, and that row can
+                # still be NULL — unresolved, not settled, so it stays retryable
+                # (Codex). _guarded_update has already reloaded or expunged it.
+                try:
+                    if getattr(res, "mailing_address", None) is None:
+                        failed.append(res)
+                except Exception:  # noqa: BLE001, S110 -- expunged row: nothing to mark
+                    pass
+        except Exception as exc:  # noqa: BLE001 -- enrichment is best-effort
+            failed.append(res)
+            _logger.warning(
+                "Job %s: bulk mailing write failed for row %s: %s",
+                job_id, str(res.id)[:8], str(exc)[:120],
+            )
+    return written, failed
+
+
 def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None = None) -> None:
     """Run GIS + King County enrichment inline (before job marks done).
 
@@ -759,10 +843,30 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
             # Parcels, not rows: one lookup serves every lead on a parcel, and the
             # King summary counts parcels too (Codex P2).
             batch_deferred: set[str] = set()
+            # (row, gis_data) pairs whose mailing came from a BULK county export.
+            # Written below through a guarded UPDATE instead of the ORM.
+            _bulk_fills: list[tuple] = []
             for pid, gis_data in gis_results.items():
                 prop = gis_data.get("property_address")
                 mail = gis_data.get("mailing_address")
+                # A bulk county export is a MONTHLY snapshot. A row can reach this
+                # sweep because its PROPERTY address was missing while already
+                # holding a good, fresher mailing address, and the live-layer
+                # branches below overwrite mailing whenever they have one. Letting a
+                # snapshot replace a better value that way is a silent downgrade, so
+                # a bulk answer is fill-only (Codex).
+                bulk_source = gis_data.get("mailing_source")
                 for res in parcel_map.get(pid, []):
+                    # A bulk answer is fill-only, and the check has to happen in the
+                    # DATABASE, not against ORM state loaded before the lookup: the
+                    # network round trip is long enough for the recovery sweep to
+                    # fill the same row, and this object would still hold NULL and
+                    # overwrite the newer address (Codex High). The guarded UPDATE
+                    # below mirrors mailing_recovery's writer; `row_mail` keeps the
+                    # ORM branches from writing it a second time.
+                    row_mail = None if bulk_source else mail
+                    if mail and bulk_source:
+                        _bulk_fills.append((res, gis_data))
                     # Migration 085 (#188) — capture the REAL situs parts BEFORE the
                     # assessor's street-only line replaces the scraper's fuller one.
                     # Runs for every branch below, including vacant land, so a parcel
@@ -773,14 +877,14 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                         # Only a REAL mailing overwrites (King never echoes the
                         # property into mailing — Codex): never clobber an existing
                         # value with None.
-                        if mail:
-                            res.mailing_address = mail
+                        if row_mail:
+                            res.mailing_address = row_mail
                         batch_updated += 1
-                    elif mail:
+                    elif row_mail:
                         # No street, but a real mailing (e.g. a Pierce parcel with a
                         # Delivery_Address but null Site_Address) — keep it rather
                         # than drop it into the vacant branch (Codex P2).
-                        res.mailing_address = mail
+                        res.mailing_address = row_mail
                         batch_updated += 1
                     elif gis_data.get("vacant_no_situs"):
                         # Matched but no street (vacant/raw land, ~1/3 of King
@@ -807,6 +911,19 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                             if _v and not getattr(res, _col, None):
                                 setattr(res, _col, str(_v).strip()[:_w])
                         batch_updated += 1
+            if _bulk_fills:
+                _n, _failed = _apply_bulk_mailing(db, _bulk_fills, job_id)
+                batch_updated += _n
+                for _res in _failed:
+                    # Its write did not land, so it must stay retryable.
+                    _ed = dict(_res.enrichment_data) if isinstance(_res.enrichment_data, dict) else {}
+                    if _ed.get("mailing_lookup_deferred") is not True:
+                        _ed["mailing_lookup_deferred"] = True
+                        _res.enrichment_data = _ed
+                        # Count it, or the completion line reports fewer pending
+                        # recoveries than there are (Codex).
+                        if _res.parcel_id:
+                            batch_deferred.add(_res.parcel_id.strip())
             if gis_mailing_source:
                 # The county request for these parcels failed (HTTP error, timeout,
                 # ArcGIS error body), so their mailing lookup never happened. Without a

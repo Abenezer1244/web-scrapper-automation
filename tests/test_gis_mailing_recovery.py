@@ -262,9 +262,36 @@ class TestCountyUnreachedIsReported:
         _, unreached = self._run(monkeypatch, _boom)
         assert unreached == ["00522400008900"]
 
-    def test_an_answer_with_no_feature_is_not_unreached(self, monkeypatch):
+    def test_an_empty_feature_set_stays_deferrable_while_the_bulk_source_is_silent(
+        self, monkeypatch
+    ):
+        """Contract CHANGED when Snohomish gained a bulk mailing source.
+
+        This used to assert `unreached == []`: an empty feature set was a settled
+        negative. That is now the hole Codex flagged NO-GO. Snohomish's live layer is
+        stripped, so an empty feature set carries no information, and if the bulk
+        export cannot answer either (the conftest guard makes it
+        `source_unavailable` here) then NOTHING has told us about this parcel. Left
+        unmarked, mailing_recovery reads the pair as "attempted, no mailing address",
+        writes a terminal `none` and clears the deferral permanently — on nothing
+        worse than a failed download.
+
+        A county with no bulk source keeps the old behaviour; see below.
+        """
         _, unreached = self._run(monkeypatch, lambda *a, **kw: self._Resp(200, {"features": []}))
-        assert unreached == []
+        assert unreached == ["00522400008900"]
+
+    def test_a_county_without_a_bulk_source_still_settles_an_empty_feature_set(
+        self, monkeypatch
+    ):
+        # Pierce's layer answers for real, so "no feature" there is a real negative
+        # and must not become a permanent retry.
+        monkeypatch.setattr(cg, "safe_get",
+                            lambda *a, **kw: self._Resp(200, {"features": []}))
+        monkeypatch.setattr(cg, "_batch_query_wa_statewide", lambda *a, **kw: {})
+        stats: dict = {}
+        cg.batch_enrich_parcels_gis(["0019012000"], "pierce", "WA", stats=stats)
+        assert stats["county_unreached"] == []
 
     def test_mailing_source_registry(self):
         assert cg.gis_mailing_source_counties("WA") == ["cowlitz", "pierce", "snohomish"]

@@ -12,6 +12,8 @@ only `county_unreached` rows are ever revisited by background recovery.
 These pin the contract: matched + no payload = INDETERMINATE -> deferred.
 Pure, no network.
 """
+import pytest
+
 from src.scrapers.enrichment.county_gis import (
     _KNOWN_GIS_ENDPOINTS,
     _configured_payload_fields,
@@ -186,6 +188,237 @@ class TestMapperReportsDegraded:
             degraded=degraded,
         )
         assert out == {} and degraded == ["0019012000"]
+
+
+class TestBulkMailingSeam:
+    """The bulk export fills what the dead county layer no longer can.
+
+    Ordering matters: the bulk step runs AFTER the statewide fallback has settled
+    property addresses. Filling a mailing-only answer earlier would put the parcel
+    in `results` and remove it from the statewide `missing` set, costing it its
+    property address entirely (Codex High).
+    """
+
+    @staticmethod
+    def _patch(monkeypatch, county_rows, statewide_rows, answers):
+        from src.config import settings
+        from src.scrapers.enrichment import county_gis as cg
+        from src.scrapers.enrichment.snohomish_assessor_roll import FOUND, MailingAnswer
+
+        # The code default is False; production runs this flag TRUE. These tests are
+        # about the bulk seam, not the licence gate, so state the production value.
+        monkeypatch.setattr(settings, "COUNTY_GIS_RESTRICTED_MAILING_ENABLED", True)
+
+        def _county(parcel_ids, cfg, unreached=None):
+            if unreached is not None:
+                unreached.extend(p for p in parcel_ids if p not in county_rows)
+            return dict(county_rows)
+
+        monkeypatch.setattr(cg, "_batch_query_county", _county)
+        monkeypatch.setattr(cg, "_batch_query_wa_statewide",
+                            lambda pids, county: dict(statewide_rows))
+        monkeypatch.setattr(cg, "_resolve_bulk_mailing", lambda key, pids: {
+            pid: (MailingAnswer(FOUND, mailing_address=a, role="Taxpayer", revision="r1")
+                  if a else MailingAnswer("absent_in_snapshot", revision="r1"))
+            for pid, a in answers.items() if pid in pids
+        })
+        return cg
+
+    def test_it_fills_mailing_and_keeps_the_statewide_property_address(self, monkeypatch):
+        cg = self._patch(
+            monkeypatch, county_rows={},
+            statewide_rows={"00437860401300": {
+                "property_address": "2407 EVERETT AVE", "mailing_address": None,
+            }},
+            answers={"00437860401300": "73 KNIGHT HILL RD, ZILLAH, WA 98953"},
+        )
+        stats: dict = {}
+        out = cg.batch_enrich_parcels_gis(["00437860401300"], "snohomish", "WA", stats=stats)
+        row = out["00437860401300"]
+        assert row["property_address"] == "2407 EVERETT AVE"
+        assert row["mailing_address"] == "73 KNIGHT HILL RD, ZILLAH, WA 98953"
+        assert row["mailing_source"] == "snohomish_assessor_roll"
+        assert row["mailing_role"] == "Taxpayer"
+        # Answered, so it must not ALSO be reported as a parcel we failed to reach.
+        assert stats["county_unreached"] == []
+
+    @pytest.mark.parametrize("outcome", ["source_unavailable", "ambiguous",
+                                         "absent_in_snapshot"])
+    def test_every_non_found_outcome_stays_deferrable(self, monkeypatch, outcome):
+        # THE no-go case. With the county layer dead, an EMPTY feature set leaves no
+        # unreached marker either. If the bulk source then fails to answer and we
+        # also leave it unmarked, mailing_recovery reads the pair as "attempted, no
+        # mailing address", writes a terminal `none` and clears the deferral
+        # PERMANENTLY — on a momentary download failure (Codex High).
+        from src.config import settings
+        from src.scrapers.enrichment import county_gis as cg
+        from src.scrapers.enrichment.snohomish_assessor_roll import MailingAnswer
+
+        monkeypatch.setattr(settings, "COUNTY_GIS_RESTRICTED_MAILING_ENABLED", True)
+        monkeypatch.setattr(cg, "_batch_query_county",
+                            lambda pids, cfg, unreached=None: {})
+        monkeypatch.setattr(cg, "_batch_query_wa_statewide", lambda pids, county: {
+            "00437860401300": {"property_address": "2407 EVERETT AVE",
+                               "mailing_address": None},
+        })
+        monkeypatch.setattr(cg, "_resolve_bulk_mailing", lambda key, pids: {
+            p: MailingAnswer(outcome) for p in pids
+        })
+        stats: dict = {}
+        out = cg.batch_enrich_parcels_gis(["00437860401300"], "snohomish", "WA",
+                                          stats=stats)
+        # The property address still lands; only the mailing stays open.
+        assert out["00437860401300"]["property_address"] == "2407 EVERETT AVE"
+        assert out["00437860401300"]["mailing_address"] is None
+        assert stats["county_unreached"] == ["00437860401300"]
+
+    def test_a_resolver_that_returns_nothing_still_defers(self, monkeypatch):
+        # _resolve_bulk_mailing swallows its exceptions and returns {}. Deriving the
+        # deferral list from the RESPONSE left every parcel unmarked on exactly the
+        # failure the deferral exists for, reopening the High it was meant to close
+        # (Codex). It is derived from what was ASKED.
+        from src.config import settings
+        from src.scrapers.enrichment import county_gis as cg
+
+        monkeypatch.setattr(settings, "COUNTY_GIS_RESTRICTED_MAILING_ENABLED", True)
+        monkeypatch.setattr(cg, "_batch_query_county",
+                            lambda pids, cfg, unreached=None: {})
+        monkeypatch.setattr(cg, "_batch_query_wa_statewide", lambda pids, county: {
+            "00437860401300": {"property_address": "2407 EVERETT AVE",
+                               "mailing_address": None},
+        })
+        monkeypatch.setattr(cg, "_resolve_bulk_mailing", lambda key, pids: {})
+        stats: dict = {}
+        cg.batch_enrich_parcels_gis(["00437860401300"], "snohomish", "WA", stats=stats)
+        assert stats["county_unreached"] == ["00437860401300"]
+
+    def test_a_raising_resolver_still_defers(self, monkeypatch):
+        # Same hole via the real wrapper: the module import or the lookup blows up.
+        from src.config import settings
+        from src.scrapers.enrichment import county_gis as cg
+        from src.scrapers.enrichment import snohomish_assessor_roll as roll
+
+        def _boom(_pids):
+            raise RuntimeError("disk full")
+
+        monkeypatch.setattr(settings, "COUNTY_GIS_RESTRICTED_MAILING_ENABLED", True)
+        monkeypatch.setattr(roll, "resolve_mailing", _boom)
+        monkeypatch.setattr(cg, "_batch_query_county",
+                            lambda pids, cfg, unreached=None: {})
+        monkeypatch.setattr(cg, "_batch_query_wa_statewide", lambda pids, county: {})
+        stats: dict = {}
+        cg.batch_enrich_parcels_gis(["00437860401300"], "snohomish", "WA", stats=stats)
+        assert stats["county_unreached"] == ["00437860401300"]
+
+    def test_a_non_found_answer_fills_nothing_and_leaves_the_row_deferred(self, monkeypatch):
+        cg = self._patch(
+            monkeypatch, county_rows={},
+            statewide_rows={"00437860401300": {
+                "property_address": "2407 EVERETT AVE", "mailing_address": None,
+            }},
+            answers={"00437860401300": None},   # absent_in_snapshot
+        )
+        stats: dict = {}
+        out = cg.batch_enrich_parcels_gis(["00437860401300"], "snohomish", "WA", stats=stats)
+        assert out["00437860401300"]["mailing_address"] is None
+        assert stats["county_unreached"] == ["00437860401300"]
+
+    def test_it_does_not_overwrite_a_mailing_the_county_layer_already_gave(self, monkeypatch):
+        cg = self._patch(
+            monkeypatch,
+            county_rows={"00437860401300": {
+                "property_address": "2407 EVERETT AVE",
+                "mailing_address": "LIVE LAYER ADDR",
+            }},
+            statewide_rows={},
+            answers={"00437860401300": "SNAPSHOT ADDR"},
+        )
+        out = cg.batch_enrich_parcels_gis(["00437860401300"], "snohomish", "WA")
+        assert out["00437860401300"]["mailing_address"] == "LIVE LAYER ADDR"
+
+    def test_it_runs_without_a_stats_out_param(self, monkeypatch):
+        # Source selection must not depend on the caller asking for telemetry (Codex).
+        cg = self._patch(
+            monkeypatch, county_rows={},
+            statewide_rows={"00437860401300": {
+                "property_address": "2407 EVERETT AVE", "mailing_address": None,
+            }},
+            answers={"00437860401300": "73 KNIGHT HILL RD, ZILLAH, WA 98953"},
+        )
+        out = cg.batch_enrich_parcels_gis(["00437860401300"], "snohomish", "WA")
+        assert out["00437860401300"]["mailing_address"].startswith("73 KNIGHT HILL RD")
+
+    def test_a_county_transport_failure_that_the_bulk_source_answers_is_settled(
+        self, monkeypatch
+    ):
+        # The county request itself failed (timeout), which is what county_unreached
+        # was built for. But the mailing lookup DID happen, via the bulk export, and
+        # it succeeded — so the row must not also be deferred for a lookup it already
+        # got. Pinned because the pre-bulk tests assert the opposite and would
+        # otherwise hide this change.
+        from src.scrapers.enrichment import county_gis as cg
+        from src.scrapers.enrichment.snohomish_assessor_roll import FOUND, MailingAnswer
+
+        def _boom(*a, **kw):
+            raise TimeoutError("read timed out")
+
+        from src.config import settings
+        monkeypatch.setattr(settings, "COUNTY_GIS_RESTRICTED_MAILING_ENABLED", True)
+        monkeypatch.setattr(cg, "safe_get", _boom)
+        monkeypatch.setattr(cg, "_batch_query_wa_statewide", lambda *a, **kw: {})
+        monkeypatch.setattr(cg, "_resolve_bulk_mailing", lambda key, pids: {
+            p: MailingAnswer(FOUND, mailing_address="1 REAL ST, EVERETT, WA 98201",
+                             role="Taxpayer", revision="r1") for p in pids
+        })
+        stats: dict = {}
+        out = cg.batch_enrich_parcels_gis(["00522400008900"], "snohomish", "WA", stats=stats)
+        assert out["00522400008900"]["mailing_address"] == "1 REAL ST, EVERETT, WA 98201"
+        assert stats["county_unreached"] == []
+
+    def test_a_county_with_no_bulk_source_is_untouched(self, monkeypatch):
+        cg = self._patch(
+            monkeypatch, county_rows={},
+            statewide_rows={"0019012000": {
+                "property_address": "9429 165TH AVENUE CT SW", "mailing_address": None,
+            }},
+            answers={"0019012000": "SHOULD NOT BE USED"},
+        )
+        out = cg.batch_enrich_parcels_gis(["0019012000"], "pierce", "WA")
+        assert out["0019012000"]["mailing_address"] is None
+
+
+class TestMailingSourceRegistry:
+    def test_snohomish_has_a_bulk_source(self, monkeypatch):
+        from src.config import settings
+        from src.scrapers.enrichment.county_gis import has_bulk_mailing_source
+
+        monkeypatch.setattr(settings, "COUNTY_GIS_RESTRICTED_MAILING_ENABLED", True)
+        assert has_bulk_mailing_source("snohomish", "WA") is True
+        assert has_bulk_mailing_source("pierce", "WA") is False
+        assert has_bulk_mailing_source("king", "WA") is False
+
+    def test_the_bulk_source_answers_to_the_licence_kill_switch(self, monkeypatch):
+        # The Assessor Roll is the SAME taxpayer block behind the SAME RCW
+        # 42.56.070(8) clause as the live layer. Gating only the live layer would
+        # mean turning the switch off for a legal reason stopped nothing.
+        from src.config import settings
+        from src.scrapers.enrichment.county_gis import (
+            gis_mailing_source_counties,
+            has_bulk_mailing_source,
+        )
+
+        monkeypatch.setattr(settings, "COUNTY_GIS_RESTRICTED_MAILING_ENABLED", False)
+        assert has_bulk_mailing_source("snohomish", "WA") is False
+        assert "snohomish" not in gis_mailing_source_counties("WA")
+
+    def test_recovery_still_selects_snohomish(self, monkeypatch):
+        # Recovery picks candidates from this list. A county served only by a bulk
+        # export has to appear or its deferred rows are never retried (Codex).
+        from src.config import settings
+        from src.scrapers.enrichment.county_gis import gis_mailing_source_counties
+
+        monkeypatch.setattr(settings, "COUNTY_GIS_RESTRICTED_MAILING_ENABLED", True)
+        assert "snohomish" in gis_mailing_source_counties("WA")
 
 
 class TestCompletionReporting:

@@ -7,8 +7,8 @@ The five items left from the "already delivered is not already traced" work:
 
 1. Owner's 38 leads are still untraced (the fix is forward-only) -> owner re-runs the range with
    skip trace on. Spends real Tracerfy credits: ASK the owner before triggering anything in prod.
-2. "Reused, no new charge" count on the Already delivered tab (not built: API role cannot read the
-   queue tables).
+2. "Reused, no new charge" count on the Already delivered tab. DONE on #344/#157 via
+   `results.skip_trace_source` (the API role cannot read the queue tables, so provenance lives on results).
 3. Verify the fix in production (done by item 1's run: header, tab, CSV, usage delta).
 4. Security: Pre-Launch prompt (§15) before the next prod deploy + Master Review (§14) until two
    clean passes.
@@ -40,11 +40,12 @@ The five items left from the "already delivered is not already traced" work:
 - FE: "... 2 came from an earlier lookup, at no new charge." only when reused > 0.
 
 ## Order
-- [ ] P1 BE: migration 097, model, 5 writers, API field, tests (writers + summary), openapi.
-- [ ] P2 BE: item-5 tests (cross-tenant run start, structural no-state-in-body guard).
-- [ ] P3 FE: summary copy, regenerated types, tsc/eslint, Playwright.
-- [ ] P4 Security: §14 Master Review x2 (until two clean), §15 Pre-Launch on the full change set.
-- [ ] P5 Codex diff review until GATE: PASS; PRs; owner go-ahead for merge + the prod re-run (1, 3).
+- [x] P1 BE: migration 097, model, 5 writers, API field, tests (writers + summary), openapi.
+- [x] P2 BE: item-5 tests (cross-tenant run start, structural no-state-in-body guard).
+- [x] P3 FE: summary copy, regenerated types, tsc/eslint, Playwright.
+- [x] P4 Security: §14 Master Review x2 (until two clean), §15 Pre-Launch on the full change set.
+- [x] P5a Codex diff review until GATE: PASS (r1 FAIL, r2 PASS 2026-09-19); PRs #344 / #157 open.
+- [ ] P5b Owner go-ahead for merge + the prod re-run (1, 3).
 
 ## Decisions / disagreements (Codex plan consult, 13 findings, checked against code)
 CORRECTION to my own audit above: the CSV host IS pinned. `tracerfy_ingest._host_is_tracerfy`
@@ -77,4 +78,9 @@ REJECTED (evidence)
 - Provider charge-ID ledger, P3 metrics: out of scope; logged as follow-ups.
 
 ## Review
-(at the end)
+- Codex r1: GATE FAIL (review status wording; unbounded VALIDATE). Both fixed.
+- Codex r2 (2026-09-19): GATE PASS, no P1/P2. Two P3 doc findings adopted: this checklist was
+  stale; the security review's §15 table now labels each inherited item as release-blocking or an
+  accepted carryover not introduced by this change.
+- Verified: full BE suite 4178 passed on an isolated DB (9 Stripe tests fail locally and on untouched
+  main: rig env); ruff, openapi --check, FE tsc + eslint clean; Chromium E2E shows the reused line.

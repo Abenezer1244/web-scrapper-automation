@@ -56,20 +56,24 @@ which found no P0. Items it can affect were re-checked.
 | 7 | Parameterized SQL | PASS |
 | 8 | CORS / origin | PASS (unchanged since 09-16) |
 | 9 | Auth cookies | PASS (unchanged since 09-16) |
-| 10 | Security headers | **FAIL (pre-existing)**: FE complete (HSTS, CSP, XFO); API responses carry no HSTS. Known since 09-16: `100.64/10` CGNAT is missing from `_TRUSTED_PROXY_NETWORKS`, which also disables the rate limiter. Fix order set on 09-16: close direct origin access first (Cloudflare is bypassable), then trust the proxy range. Owner step. |
-| 11 | Rate limiting | **FAIL (pre-existing)**: same root cause as #10. |
+| 10 | Security headers | **FAIL (pre-existing, RELEASE-BLOCKING)**: FE complete (HSTS, CSP, XFO); API responses carry no HSTS. Known since 09-16: `100.64/10` CGNAT is missing from `_TRUSTED_PROXY_NETWORKS`, which also disables the rate limiter. Fix order set on 09-16: close direct origin access first (Cloudflare is bypassable), then trust the proxy range. Owner step. |
+| 11 | Rate limiting | **FAIL (pre-existing, RELEASE-BLOCKING)**: same root cause as #10. |
 | 12 | HTTPS everywhere | PASS |
 | 13 | Uploads | PASS (none) |
 | 14 | Log sanitization | PASS (counts only) |
-| 15 | Dependencies | **FAIL (pre-existing, fixed on a branch)**: FE prod deps had 3 critical + 3 high advisories (`next` 16.1.7: unauthenticated RCE, middleware/proxy bypass; `next-auth` beta.30). Upgrade on `chore/security-deps-2026-09-18`. BE: pip-audit green in CI. |
+| 15 | Dependencies | **FAIL (pre-existing, RELEASE-BLOCKING, fix on a branch)**: FE prod deps had 3 critical + 3 high advisories (`next` 16.1.7: unauthenticated RCE, middleware/proxy bypass; `next-auth` beta.30). Upgrade on `chore/security-deps-2026-09-18`. BE: pip-audit green in CI. |
 | 16 | Admin routes 404 | PASS (unchanged since 09-16) |
 | 17 | No console.* in FE code | PASS (diff clean) |
 | 18 | No test data in prod | PASS: every verification ran on local databases; nothing seeded in prod. |
-| 19 | Spend caps | PASS for this change's cost driver: `SKIP_TRACE_DAILY_ROW_CAP=1000` set in prod (09-16). Other dashboards: owner. |
-| 20 | Privacy / terms | Open owner item from 09-16 (placeholders); not changed here. |
-| 21-23 | DNS, backups, error-log questions | Unchanged since 09-16; owner items. |
+| 19 | Spend caps | PASS for this change's cost driver: `SKIP_TRACE_DAILY_ROW_CAP=1000` set in prod (09-16). Other dashboards: owner (CARRYOVER, not introduced here). |
+| 20 | Privacy / terms | **OPEN (pre-existing, RELEASE-BLOCKING for a public launch)**: owner item from 09-16 (placeholders in prod Terms); not changed here. |
+| 21-23 | DNS, backups, error-log questions | Unchanged since 09-16; owner items (CARRYOVER, not introduced here). |
 | 24 | Codex review | See Codex rounds in `tasks/todo-skip-trace-followups.md`. |
 | 25 | Journal | Updated in this branch. |
+
+Legend: RELEASE-BLOCKING = must be closed before this counts as a production security
+clearance; CARRYOVER = accepted owner item, not introduced or worsened by this change set.
+This review clears the CHANGE SET only; it is not a full production security clearance.
 
 **Status: the change set is technically clean; the release is still BLOCKED by pre-existing
 §15 failures** (Codex, 2026-09-18):
@@ -82,3 +86,6 @@ Codex round 1 on this change set: GATE FAIL on the status wording above (fixed) 
 VALIDATE in migration 097 (fixed). Rejected with evidence: "batch routes may take foreign ids"
 (batch create takes counties/record types; the batches router has no id-bearing write route);
 "FE types not regenerated" (committed in `cae23cc`, +7/-1, tsc clean, omitted from the diff sent).
+
+Codex round 2 (2026-09-19): GATE PASS, no P1/P2. Its two P3s (stale follow-up checklist;
+this table not separating release blockers from carryovers) were adopted: see the legend above.

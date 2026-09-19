@@ -689,12 +689,18 @@ def _apply_bulk_mailing(db, fills: list[tuple], job_id: str) -> int:
             "mailing_source_revision": gis_data.get("mailing_revision"),
         })
         try:
-            result = db.execute(stmt, {
-                "mail": gis_data.get("mailing_address"),
-                "payload": payload,
-                "rid": res.id,
-                "uid": res.user_id,
-            })
+            # SAVEPOINT per row. A failed statement poisons the enclosing
+            # transaction until it is rolled back, so swallowing the error without
+            # one would take down the whole batch commit — including the property
+            # addresses this sweep just filled (Codex). A nested rollback undoes
+            # only this row.
+            with db.begin_nested():
+                result = db.execute(stmt, {
+                    "mail": gis_data.get("mailing_address"),
+                    "payload": payload,
+                    "rid": res.id,
+                    "uid": res.user_id,
+                })
             if result.rowcount:
                 written += 1
                 # Keep the in-session object consistent with what just landed, so

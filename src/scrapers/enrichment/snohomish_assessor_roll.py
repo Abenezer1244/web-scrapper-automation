@@ -96,6 +96,14 @@ _CACHE_DIR = Path(tempfile.gettempdir()) / "bridgeleads_snohomish_roll"
 # often we ASK, and the item's own `modified` timestamp is what dates the data.
 _REFRESH_AFTER_S = 24 * 3600
 
+# Hard ceiling on how old a served index may be. Keeping the last good revision
+# through a failed refresh is right; serving it FOREVER is not — if the county
+# stops publishing, or every new revision fails its canaries, addresses would go
+# quietly stale with nothing saying so (Codex). Past this the resolver reports
+# source_unavailable, which is deferrable and never a false negative. Generous
+# against a roughly monthly publish cadence.
+_MAX_INDEX_AGE_S = 90 * 24 * 3600
+
 # ─── Semantic canaries ───────────────────────────────────────────────────────
 # A truncated download, an error page served as a zip, or a future revision that
 # quietly empties the taxpayer block must all be REJECTED, not published. These
@@ -349,6 +357,14 @@ def _ensure_index() -> Path | None:
     published = _published_meta()
     prior_rev = published.get("revision")
     prior = _index_path(str(prior_rev)) if prior_rev else None
+    if prior and prior.exists():
+        built_at = float(published.get("built_at") or 0)
+        if built_at and (time.time() - built_at) > _MAX_INDEX_AGE_S:
+            _logger.warning(
+                "Snohomish roll: index %s is older than the %d-day ceiling; "
+                "refusing to serve it", prior_rev, _MAX_INDEX_AGE_S // 86400,
+            )
+            prior = None
 
     # A warm index answers WITHOUT asking the county anything. Fetching the item
     # metadata on every lookup put a network round trip in front of every batch,

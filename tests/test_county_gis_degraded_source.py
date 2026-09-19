@@ -272,6 +272,44 @@ class TestBulkMailingSeam:
         assert out["00437860401300"]["mailing_address"] is None
         assert stats["county_unreached"] == ["00437860401300"]
 
+    def test_a_resolver_that_returns_nothing_still_defers(self, monkeypatch):
+        # _resolve_bulk_mailing swallows its exceptions and returns {}. Deriving the
+        # deferral list from the RESPONSE left every parcel unmarked on exactly the
+        # failure the deferral exists for, reopening the High it was meant to close
+        # (Codex). It is derived from what was ASKED.
+        from src.config import settings
+        from src.scrapers.enrichment import county_gis as cg
+
+        monkeypatch.setattr(settings, "COUNTY_GIS_RESTRICTED_MAILING_ENABLED", True)
+        monkeypatch.setattr(cg, "_batch_query_county",
+                            lambda pids, cfg, unreached=None: {})
+        monkeypatch.setattr(cg, "_batch_query_wa_statewide", lambda pids, county: {
+            "00437860401300": {"property_address": "2407 EVERETT AVE",
+                               "mailing_address": None},
+        })
+        monkeypatch.setattr(cg, "_resolve_bulk_mailing", lambda key, pids: {})
+        stats: dict = {}
+        cg.batch_enrich_parcels_gis(["00437860401300"], "snohomish", "WA", stats=stats)
+        assert stats["county_unreached"] == ["00437860401300"]
+
+    def test_a_raising_resolver_still_defers(self, monkeypatch):
+        # Same hole via the real wrapper: the module import or the lookup blows up.
+        from src.config import settings
+        from src.scrapers.enrichment import county_gis as cg
+        from src.scrapers.enrichment import snohomish_assessor_roll as roll
+
+        def _boom(_pids):
+            raise RuntimeError("disk full")
+
+        monkeypatch.setattr(settings, "COUNTY_GIS_RESTRICTED_MAILING_ENABLED", True)
+        monkeypatch.setattr(roll, "resolve_mailing", _boom)
+        monkeypatch.setattr(cg, "_batch_query_county",
+                            lambda pids, cfg, unreached=None: {})
+        monkeypatch.setattr(cg, "_batch_query_wa_statewide", lambda pids, county: {})
+        stats: dict = {}
+        cg.batch_enrich_parcels_gis(["00437860401300"], "snohomish", "WA", stats=stats)
+        assert stats["county_unreached"] == ["00437860401300"]
+
     def test_a_non_found_answer_fills_nothing_and_leaves_the_row_deferred(self, monkeypatch):
         cg = self._patch(
             monkeypatch, county_rows={},

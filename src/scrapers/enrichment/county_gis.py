@@ -803,8 +803,7 @@ def batch_enrich_parcels_gis(
         ]
         if needs_mail:
             answers = _resolve_bulk_mailing(county_key, needs_mail)
-            filled = 0
-            unresolved: list[str] = []
+            filled_pids: set[str] = set()
             for pid, answer in answers.items():
                 if not getattr(answer, "is_found", False):
                     # NOT an answer about this parcel. Leaving it unmarked is what
@@ -824,7 +823,6 @@ def batch_enrich_parcels_gis(
                     # the ceiling. A revision-scoped terminal state would let the
                     # genuinely-absent ones settle; that is deliberate future work,
                     # noted because the queue for this county is small (tens of rows).
-                    unresolved.append(pid)
                     continue
                 row = dict(results.get(pid) or _empty())
                 row["mailing_address"] = answer.mailing_address
@@ -832,18 +830,24 @@ def batch_enrich_parcels_gis(
                 row["mailing_role"] = answer.role
                 row["mailing_revision"] = answer.revision
                 results[pid] = row
-                filled += 1
+                filled_pids.add(pid)
                 # It has been answered, so it must not also be reported as a parcel
                 # we failed to reach — that would defer a row we just filled.
                 if stats is not None and pid in stats.get("county_unreached", []):
                     stats["county_unreached"].remove(pid)
+
+            # Derived from what was ASKED, not from what came BACK. _resolve_bulk_mailing
+            # swallows its exceptions and returns {}, so iterating the response left
+            # every parcel unmarked on exactly the failure the deferral exists for,
+            # reopening the High it was meant to close (Codex).
+            unresolved = [pid for pid in needs_mail if pid not in filled_pids]
             if unresolved and stats is not None:
                 _note_unreached(stats["county_unreached"],
                                 {pid: [pid] for pid in unresolved})
-            if filled or unresolved:
+            if filled_pids or unresolved:
                 _logger.info(
                     "Bulk mailing source: filled %d, deferred %d of %d %s parcels",
-                    filled, len(unresolved), len(needs_mail), county.lower(),
+                    len(filled_pids), len(unresolved), len(needs_mail), county.lower(),
                 )
 
     return results

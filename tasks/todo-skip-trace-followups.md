@@ -45,7 +45,8 @@ The five items left from the "already delivered is not already traced" work:
 - [x] P3 FE: summary copy, regenerated types, tsc/eslint, Playwright.
 - [x] P4 Security: §14 Master Review x2 (until two clean), §15 Pre-Launch on the full change set.
 - [x] P5a Codex diff review until GATE: PASS (r1 FAIL, r2 PASS 2026-09-19); PRs #344 / #157 open.
-- [ ] P5b Owner go-ahead for merge + the prod re-run (1, 3).
+- [x] P5b Owner approved; #344 merged `5bd9c59`, #157 merged `6c435d0`, both deployed.
+- [ ] P6 Owner's custom-range run (Aug 18 to Sep 17, skip trace on), then compare to the frozen snapshot.
 
 ## Decisions / disagreements (Codex plan consult, 13 findings, checked against code)
 CORRECTION to my own audit above: the CSV host IS pinned. `tracerfy_ingest._host_is_tracerfy`

@@ -19,6 +19,69 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-19 — Skip-trace provenance shipped; the login "regression" was our own mount guard
+
+> Follow-ups to 2026-09-18. Handoff: `docs/HANDOFF-skip-trace-followups-2026-09-19.md`.
+> Plan: `tasks/todo-skip-trace-followups.md`. Security: `docs/security/REVIEW-2026-09-18-skip-trace.md`.
+
+**Built / Shipped:**
+- BE #344 merged `5bd9c59`; main CI/CD green (tests, image, Run Migrations) and both production
+  deployments success, `/health` 200; migration 097 verified live
+  read-only (`results.skip_trace_source` VARCHAR(16) NULL, `ck_results_skip_trace_source`
+  validated, all 171,460 existing rows NULL as designed).
+- FE #157 merged `6c435d0`, Vercel production deploy success: "N came from an earlier lookup,
+  so no new lookup was bought."
+- FE security upgrade, LOCAL ONLY on `chore/security-deps-2026-09-18` (not pushed, per owner):
+  next 16.3.5 + next-auth pinned to exactly 5.0.0-beta.32, plus the login fix `0c6eaea`.
+  Prod deps: 0 critical / 0 high (was 3 + 3).
+
+**Tried / Decided:**
+- Codex round 2 on #344/#157: GATE PASS. Two P3 doc findings adopted (stale checklist; §15 table
+  now labels each inherited item RELEASE-BLOCKING or CARRYOVER).
+- #344 was BEHIND main (#343). Shared file `enrich.py`, but disjoint hunks (#343: mailing-source
+  classifier + completion log; ours: skip-trace provenance). Updated the branch (protection
+  requires it; no `--admin`), CI re-ran green, then merged.
+- Owner's 38 untraced leads (run d3298b54): owner chose a new run with a custom range
+  (Aug 18 to Sep 17, skip trace on) over a backfill script. Owner triggers it; compare after
+  against the frozen snapshot.
+
+**Failed / Blocked:**
+- Last session's login diagnosis ("next 16.3 RSC navigation or proxy") was wrong, and the
+  earlier claim that the upgrade "breaks login" was only true under `next dev`.
+
+**Caught & fixed:**
+- Login stayed on /login after a successful sign-in (cookie set, no error, no /dashboard request
+  at all). Root cause: `isMountedRef` in `app/(auth)/login/page.tsx` was set false in the effect
+  cleanup and never re-armed in setup. When React runs setup, cleanup, setup on one instance
+  (StrictMode; Next 16.3 dev now does this for this Suspense-wrapped page), every post-await guard
+  returned silently. Isolation in Chromium: next 16.3.5 + beta.30 fails the same way (so `next`,
+  not next-auth); `next build && next start` on the ORIGINAL code logs in fine (prod would not
+  have broken, but any real remount would). Fix: set the ref true in setup. Verified: dev x2 and
+  `next start` land on /dashboard; wrong password still errors; auth pass 8/8 (logged-out
+  redirects, login, reload, protected route, sign out, route closed again, cookie cleared).
+  Codex consult + post-change review: GATE PASS both. Its P3 (beta range drift) fixed by the pin.
+
+**Pending / Handoff:**
+- Push + PR `chore/security-deps-2026-09-18` when the owner says so (must rebase onto master,
+  which now has #157). Still RELEASE-BLOCKING until live: §15 #15.
+- Owner: start the custom-range run; then compare statuses, `skip_trace_source`, usage delta.
+- Deferred Codex P2/P3s: `router.push` + `router.refresh` ordering (works today, no evidence to
+  change); rename `middleware.ts` to `proxy.ts` (Next 16.3 deprecation warning).
+- Dev-only audit findings (1 critical, 16 high: Remotion, openapi-typescript, shadcn CLI) are
+  pre-existing on master and not in the server bundle; clean up separately.
+- §15 #10/#11 (API HSTS, rate limiter / CGNAT proxy range) and #20 (Terms placeholders): owner.
+
+**Facts learned:**
+- A mount-guard ref must be re-armed in the effect body, not only cleared in cleanup; otherwise
+  any setup/cleanup/setup cycle leaves it dead. Grep: only the login page had this shape
+  (`hooks/use-log-stream.ts` already re-arms).
+- The FE drift gate reads BE `main` via raw.githubusercontent, which served the pre-merge schema
+  minutes after the merge; the uncached contents API showed the new field. The re-run passed.
+- The app DB role reads `alembic_version` as empty in prod; prove a migration by its objects
+  (column, constraint), not by that table.
+
+---
+
 ## 2026-09-18 — Already delivered is not already traced: skip trace for leads a run already owns
 
 > Owner report: run 1 (skip trace OFF) delivered 38 leads; the same range run again with skip

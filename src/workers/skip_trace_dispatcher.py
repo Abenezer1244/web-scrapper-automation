@@ -667,7 +667,11 @@ def _settle_queued_from_known_answers(db) -> int | None:
                     "phone_dnc_flag": answer.phone_dnc_flag, "email": answer.email,
                     "phones": answer.phones, "emails": answer.emails,
                     "skip_trace_status": "hit" if (answer.phone or answer.email) else "miss",
-                    "skip_trace_attempted_at": now,
+                    # When the data was OBTAINED, not now: this is the 365-day PII
+                    # retention clock (settings.RETENTION_*), and a copy must not
+                    # restart it (Master Review 2026-09-18).
+                    "skip_trace_attempted_at": answer.fetched_at,
+                    "skip_trace_source": "reused",  # no lookup bought for this row
                 }
             else:
                 values = {"skip_trace_status": "errored", "skip_trace_attempted_at": now}

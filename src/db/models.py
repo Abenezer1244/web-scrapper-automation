@@ -818,6 +818,10 @@ class Result(Base):
     emails = Column(EncryptedJSON, nullable=True)  # [str]
     skip_trace_status = Column(String(16), nullable=False, default="not_attempted")
     skip_trace_attempted_at = Column(DateTime(timezone=True), nullable=True)
+    # Where a settled (hit/miss) answer came from (migration 097): 'lookup' = Tracerfy
+    # answered for this row; 'reused' = copied from this account's earlier answer, no
+    # lookup bought. NULL = never settled, or settled before 097 (unknown).
+    skip_trace_source = Column(String(16), nullable=True)
     # Sprint 6.4: cross-job deduplication
     dedup_hash = Column(String(64), nullable=True, index=True)
     is_duplicate = Column(Boolean, nullable=False, default=False)

@@ -1435,6 +1435,10 @@ class AlreadyDeliveredContacts(BaseModel):
     looking: int = 0        # 'queued' / 'submitted': a lookup is on its way
     failed: int = 0         # 'errored': the lookup did not complete
     not_looked_up: int = 0  # never asked (skip trace off, nothing traceable) or purged
+    # NOT a bucket: how many of found + none_found were answered from this account's
+    # earlier answer, with no new lookup bought (results.skip_trace_source, 097). Rows
+    # settled before 097 carry no source and are not counted here.
+    reused: int = 0
 
 
 class ResultsPage(BaseModel):

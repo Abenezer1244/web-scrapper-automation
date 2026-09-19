@@ -612,6 +612,12 @@ async def get_results(
                     ("looking", ("queued", "submitted")), ("failed", ("errored",)),
                 )
             ),
+            # Of the answered ones, those copied from an earlier answer (no lookup bought).
+            func.count()
+            .filter(already_delivered_condition(), tax_cap_condition(today),
+                    Result.skip_trace_status.in_(("hit", "miss")),
+                    Result.skip_trace_source == "reused")
+            .label("delivered_reused"),
         ).where(
             Result.job_id == job_id,
             Result.user_id == current_user.id,
@@ -631,6 +637,7 @@ async def get_results(
     already_delivered_contacts = AlreadyDeliveredContacts(
         **delivered_buckets,
         not_looked_up=already_delivered_count - sum(delivered_buckets.values()),
+        reused=counts_row.delivered_reused,
     )
 
     # ── Where this job's duplicates came from (migration 089) ───────────────

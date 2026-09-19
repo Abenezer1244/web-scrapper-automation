@@ -726,6 +726,7 @@ def ingest_tracerfy_batch(
                         emails=emails,
                         skip_trace_status="hit" if is_hit else "miss",
                         skip_trace_attempted_at=now,
+                        skip_trace_source="lookup",  # Tracerfy answered this row
                     )
                 )
                 db.execute(

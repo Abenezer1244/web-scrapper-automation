@@ -656,6 +656,58 @@ def _fill_king_condo_unit_situs(db, rows: list, job_id: str) -> int:
     return filled
 
 
+_BULK_MAILING_SQL = (
+    "UPDATE results SET mailing_address = :mail, enrichment_data = "
+    "  ((CASE WHEN jsonb_typeof(enrichment_data::jsonb) = 'object' "
+    "         THEN enrichment_data::jsonb ELSE '{}'::jsonb END) "
+    "   || CAST(:payload AS jsonb))::json "
+    "WHERE id = :rid AND user_id = :uid AND mailing_address IS NULL"
+)
+
+
+def _apply_bulk_mailing(db, fills: list[tuple], job_id: str) -> int:
+    """Write bulk-export mailing addresses fill-only, in the DATABASE.
+
+    A bulk answer comes from a MONTHLY snapshot, so it must never replace a
+    fresher value. Testing the ORM object is not enough: it was loaded before the
+    lookup, and the recovery sweep can fill the same row while that network call is
+    in flight, leaving this object holding NULL and overwriting the newer address
+    (Codex High). ``mailing_address IS NULL`` in the WHERE clause is the real guard,
+    and the JSON merge keeps provenance written concurrently rather than replacing
+    the whole object. Tenant-scoped by ``user_id`` like every other write here.
+    """
+    import json
+
+    from sqlalchemy import text as _sa_text
+
+    stmt = _sa_text(_BULK_MAILING_SQL)
+    written = 0
+    for res, gis_data in fills:
+        payload = json.dumps({
+            "mailing_source": gis_data.get("mailing_source"),
+            "mailing_source_role": gis_data.get("mailing_role"),
+            "mailing_source_revision": gis_data.get("mailing_revision"),
+        })
+        try:
+            result = db.execute(stmt, {
+                "mail": gis_data.get("mailing_address"),
+                "payload": payload,
+                "rid": res.id,
+                "uid": res.user_id,
+            })
+            if result.rowcount:
+                written += 1
+                # Keep the in-session object consistent with what just landed, so
+                # later passes in this run see the address they should.
+                res.mailing_address = gis_data.get("mailing_address")
+        except Exception as exc:  # noqa: BLE001 -- enrichment is best-effort
+            _logger.warning(
+                "Job %s: bulk mailing write failed for row %s: %s",
+                job_id, str(res.id)[:8], str(exc)[:120],
+            )
+    return written
+
+
 def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None = None) -> None:
     """Run GIS + King County enrichment inline (before job marks done).
 
@@ -759,6 +811,9 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
             # Parcels, not rows: one lookup serves every lead on a parcel, and the
             # King summary counts parcels too (Codex P2).
             batch_deferred: set[str] = set()
+            # (row, gis_data) pairs whose mailing came from a BULK county export.
+            # Written below through a guarded UPDATE instead of the ORM.
+            _bulk_fills: list[tuple] = []
             for pid, gis_data in gis_results.items():
                 prop = gis_data.get("property_address")
                 mail = gis_data.get("mailing_address")
@@ -770,16 +825,16 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                 # a bulk answer is fill-only (Codex).
                 bulk_source = gis_data.get("mailing_source")
                 for res in parcel_map.get(pid, []):
-                    # Per ROW, never reassigning the parcel-level `mail`: one lead on
-                    # a parcel already having a mailing address must not suppress the
-                    # fill for its siblings that do not.
-                    row_mail = None if (bulk_source and res.mailing_address) else mail
-                    if row_mail and bulk_source:
-                        ed = dict(res.enrichment_data) if isinstance(res.enrichment_data, dict) else {}
-                        ed["mailing_source"] = bulk_source
-                        ed["mailing_source_role"] = gis_data.get("mailing_role")
-                        ed["mailing_source_revision"] = gis_data.get("mailing_revision")
-                        res.enrichment_data = ed
+                    # A bulk answer is fill-only, and the check has to happen in the
+                    # DATABASE, not against ORM state loaded before the lookup: the
+                    # network round trip is long enough for the recovery sweep to
+                    # fill the same row, and this object would still hold NULL and
+                    # overwrite the newer address (Codex High). The guarded UPDATE
+                    # below mirrors mailing_recovery's writer; `row_mail` keeps the
+                    # ORM branches from writing it a second time.
+                    row_mail = None if bulk_source else mail
+                    if mail and bulk_source:
+                        _bulk_fills.append((res, gis_data))
                     # Migration 085 (#188) — capture the REAL situs parts BEFORE the
                     # assessor's street-only line replaces the scraper's fuller one.
                     # Runs for every branch below, including vacant land, so a parcel
@@ -824,6 +879,8 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                             if _v and not getattr(res, _col, None):
                                 setattr(res, _col, str(_v).strip()[:_w])
                         batch_updated += 1
+            if _bulk_fills:
+                batch_updated += _apply_bulk_mailing(db, _bulk_fills, job_id)
             if gis_mailing_source:
                 # The county request for these parcels failed (HTTP error, timeout,
                 # ArcGIS error body), so their mailing lookup never happened. Without a

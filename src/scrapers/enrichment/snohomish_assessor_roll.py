@@ -199,6 +199,43 @@ def _published_meta() -> dict:
         return {}
 
 
+def _write_meta(meta: dict) -> None:
+    """Publish the manifest atomically.
+
+    Truncating the shared file in place let a concurrent reader see half a
+    document, and a crash mid-write destroyed the pointer to a perfectly good
+    index (Codex).
+    """
+    tmp = _CACHE_DIR / f"snapshot.{os.getpid()}.{uuid.uuid4().hex}.part"
+    try:
+        tmp.write_text(json.dumps(meta), encoding="utf-8")
+        os.replace(tmp, _CACHE_DIR / "snapshot.json")
+    except Exception as exc:  # noqa: BLE001 -- provenance must not break lookups
+        _logger.warning("Snohomish roll: manifest write failed: %s", str(exc)[:120])
+        tmp.unlink(missing_ok=True)
+
+
+def _touch_checked_at(published: dict) -> None:
+    """Record that we ASKED the county, whether or not a new revision followed.
+
+    Without it a rejected revision is re-downloaded on every single lookup.
+    """
+    if published:
+        _write_meta({**published, "checked_at": time.time()})
+
+
+def _revision_of(index: Path) -> str:
+    """The revision an index file actually holds, read off its own name.
+
+    Taking it from the manifest instead let an answer from revision B be labelled
+    A when a concurrent builder republished between the two reads (Codex).
+    """
+    stem = index.name
+    if stem.startswith("nameaddr.") and stem.endswith(".sqlite"):
+        return stem[len("nameaddr."):-len(".sqlite")]
+    return ""
+
+
 # ─── Index build ─────────────────────────────────────────────────────────────
 
 def _iter_taxpayer_rows(zip_path: Path):
@@ -294,7 +331,7 @@ def _build_index(zip_path: Path, dest: Path, revision: str) -> dict:
         "conflicts": conflicts,
         "built_at": time.time(),
     }
-    (_CACHE_DIR / "snapshot.json").write_text(json.dumps(stats), encoding="utf-8")
+    _write_meta({**stats, "checked_at": time.time()})
     _logger.info(
         "Snohomish roll: indexed revision %s — %d taxpayer rows, %d parcels, "
         "%d ambiguous", revision, rows, len(answers), conflicts,
@@ -309,18 +346,27 @@ def _ensure_index() -> Path | None:
     revision must never take a good one out of service.
     """
     _CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    revision = _remote_revision()
     published = _published_meta()
     prior_rev = published.get("revision")
     prior = _index_path(str(prior_rev)) if prior_rev else None
 
+    # A warm index answers WITHOUT asking the county anything. Fetching the item
+    # metadata on every lookup put a network round trip in front of every batch,
+    # and a rejected new revision would re-download on each one (Codex).
+    if prior and prior.exists():
+        age = time.time() - float(published.get("checked_at") or published.get("built_at") or 0)
+        if age < _REFRESH_AFTER_S:
+            return prior
+
+    revision = _remote_revision()
+    _touch_checked_at(published)
     if revision and _index_path(revision).exists():
         return _index_path(revision)
     if revision is None:
         # Could not date the source. Use what we already trust rather than
         # re-downloading blind.
         return prior if (prior and prior.exists()) else None
-    if prior and prior.exists() and (time.time() - float(published.get("built_at") or 0)) < _REFRESH_AFTER_S:
+    if prior and prior.exists() and revision == str(prior_rev):
         return prior
 
     zip_tmp = _CACHE_DIR / f"roll.{os.getpid()}.{uuid.uuid4().hex}.part"
@@ -361,7 +407,7 @@ def resolve_mailing(parcel_ids: list[str]) -> dict[str, MailingAnswer]:
     if index is None:
         return {pid: MailingAnswer(SOURCE_UNAVAILABLE) for pid in parcel_ids}
 
-    revision = str(_published_meta().get("revision") or "")
+    revision = _revision_of(index)
     out: dict[str, MailingAnswer] = {}
     # Caller ids can repeat and can spell one APN several ways; normalise once and
     # fan the answer back out to every original spelling.

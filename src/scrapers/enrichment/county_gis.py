@@ -804,11 +804,27 @@ def batch_enrich_parcels_gis(
         if needs_mail:
             answers = _resolve_bulk_mailing(county_key, needs_mail)
             filled = 0
+            unresolved: list[str] = []
             for pid, answer in answers.items():
                 if not getattr(answer, "is_found", False):
-                    # absent_in_snapshot / ambiguous / source_unavailable are all
-                    # left alone. None of them is an address, and only the caller
-                    # knows whether the row may be settled.
+                    # NOT an answer about this parcel. Leaving it unmarked is what
+                    # made this a NO-GO: with the county layer dead, a parcel whose
+                    # feature set came back EMPTY carries no unreached marker either,
+                    # so recovery would read the pair as "attempted, no mailing
+                    # address", write a terminal `none` and clear the deferral
+                    # permanently — on a momentary download failure (Codex High).
+                    # Every non-found outcome therefore stays deferrable:
+                    #   source_unavailable — we never got to ask
+                    #   ambiguous          — two taxpayer rows disagree; a later
+                    #                        revision may settle it
+                    #   absent_in_snapshot — no association in THIS revision, which
+                    #                        is not the same as "has no mailing
+                    #                        address" (Codex)
+                    # _rotate charges no attempt, so these cycle rather than burn
+                    # the ceiling. A revision-scoped terminal state would let the
+                    # genuinely-absent ones settle; that is deliberate future work,
+                    # noted because the queue for this county is small (tens of rows).
+                    unresolved.append(pid)
                     continue
                 row = dict(results.get(pid) or _empty())
                 row["mailing_address"] = answer.mailing_address
@@ -821,10 +837,13 @@ def batch_enrich_parcels_gis(
                 # we failed to reach — that would defer a row we just filled.
                 if stats is not None and pid in stats.get("county_unreached", []):
                     stats["county_unreached"].remove(pid)
-            if filled:
+            if unresolved and stats is not None:
+                _note_unreached(stats["county_unreached"],
+                                {pid: [pid] for pid in unresolved})
+            if filled or unresolved:
                 _logger.info(
-                    "Bulk mailing source filled %d/%d %s parcels",
-                    filled, len(needs_mail), county.lower(),
+                    "Bulk mailing source: filled %d, deferred %d of %d %s parcels",
+                    filled, len(unresolved), len(needs_mail), county.lower(),
                 )
 
     return results

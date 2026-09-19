@@ -12,6 +12,8 @@ only `county_unreached` rows are ever revisited by background recovery.
 These pin the contract: matched + no payload = INDETERMINATE -> deferred.
 Pure, no network.
 """
+import pytest
+
 from src.scrapers.enrichment.county_gis import (
     _KNOWN_GIS_ENDPOINTS,
     _configured_payload_fields,
@@ -239,6 +241,36 @@ class TestBulkMailingSeam:
         assert row["mailing_role"] == "Taxpayer"
         # Answered, so it must not ALSO be reported as a parcel we failed to reach.
         assert stats["county_unreached"] == []
+
+    @pytest.mark.parametrize("outcome", ["source_unavailable", "ambiguous",
+                                         "absent_in_snapshot"])
+    def test_every_non_found_outcome_stays_deferrable(self, monkeypatch, outcome):
+        # THE no-go case. With the county layer dead, an EMPTY feature set leaves no
+        # unreached marker either. If the bulk source then fails to answer and we
+        # also leave it unmarked, mailing_recovery reads the pair as "attempted, no
+        # mailing address", writes a terminal `none` and clears the deferral
+        # PERMANENTLY — on a momentary download failure (Codex High).
+        from src.config import settings
+        from src.scrapers.enrichment import county_gis as cg
+        from src.scrapers.enrichment.snohomish_assessor_roll import MailingAnswer
+
+        monkeypatch.setattr(settings, "COUNTY_GIS_RESTRICTED_MAILING_ENABLED", True)
+        monkeypatch.setattr(cg, "_batch_query_county",
+                            lambda pids, cfg, unreached=None: {})
+        monkeypatch.setattr(cg, "_batch_query_wa_statewide", lambda pids, county: {
+            "00437860401300": {"property_address": "2407 EVERETT AVE",
+                               "mailing_address": None},
+        })
+        monkeypatch.setattr(cg, "_resolve_bulk_mailing", lambda key, pids: {
+            p: MailingAnswer(outcome) for p in pids
+        })
+        stats: dict = {}
+        out = cg.batch_enrich_parcels_gis(["00437860401300"], "snohomish", "WA",
+                                          stats=stats)
+        # The property address still lands; only the mailing stays open.
+        assert out["00437860401300"]["property_address"] == "2407 EVERETT AVE"
+        assert out["00437860401300"]["mailing_address"] is None
+        assert stats["county_unreached"] == ["00437860401300"]
 
     def test_a_non_found_answer_fills_nothing_and_leaves_the_row_deferred(self, monkeypatch):
         cg = self._patch(

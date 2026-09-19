@@ -1,5 +1,13 @@
 # HANDOFF: skip trace for already-delivered leads, follow-ups (2026-09-19)
 
+> **STATUS UPDATE (2026-09-19, later session). Steps 1, 2 and 4 of §4 are DONE:**
+> Codex r2 GATE PASS; BE #344 merged `5bd9c59` (Railway deploy success, migration 097 verified
+> live); FE #157 merged `6c435d0` (Vercel deploy success). Login "regression" root-caused to our
+> own mount guard in `app/(auth)/login/page.tsx` (dev only), fixed `0c6eaea` + next-auth pinned
+> `8257e8d` on `chore/security-deps-2026-09-18`, still LOCAL ONLY, awaiting the owner's go to
+> push. Step 3: owner chose a new custom-range run (owner triggers it). See the 2026-09-19
+> journal entry for details.
+
 Read this top to bottom before acting. Everything here is verified unless marked otherwise.
 
 ## 1. The goal (owner's words, condensed)

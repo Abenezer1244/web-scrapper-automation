@@ -656,62 +656,59 @@ def _fill_king_condo_unit_situs(db, rows: list, job_id: str) -> int:
     return filled
 
 
-_BULK_MAILING_SQL = (
-    "UPDATE results SET mailing_address = :mail, enrichment_data = "
-    "  ((CASE WHEN jsonb_typeof(enrichment_data::jsonb) = 'object' "
-    "         THEN enrichment_data::jsonb ELSE '{}'::jsonb END) "
-    "   || CAST(:payload AS jsonb))::json "
-    "WHERE id = :rid AND user_id = :uid AND mailing_address IS NULL"
-)
+_SQL_BULK_MAILING = f"""
+    UPDATE results
+       SET mailing_address = :mail, enrichment_data = {ED_MERGE_SQL}
+     WHERE id = :rid AND user_id = :uid AND {ED_MERGEABLE_SQL}
+       AND mailing_address IS NULL
+ RETURNING mailing_address, enrichment_data
+"""
 
 
-def _apply_bulk_mailing(db, fills: list[tuple], job_id: str) -> int:
-    """Write bulk-export mailing addresses fill-only, in the DATABASE.
+def _apply_bulk_mailing(db, fills: list[tuple], job_id: str) -> tuple[int, list]:
+    """Write bulk-export mailing addresses fill-only, guarded in the DATABASE.
 
-    A bulk answer comes from a MONTHLY snapshot, so it must never replace a
-    fresher value. Testing the ORM object is not enough: it was loaded before the
-    lookup, and the recovery sweep can fill the same row while that network call is
-    in flight, leaving this object holding NULL and overwriting the newer address
-    (Codex High). ``mailing_address IS NULL`` in the WHERE clause is the real guard,
-    and the JSON merge keeps provenance written concurrently rather than replacing
-    the whole object. Tenant-scoped by ``user_id`` like every other write here.
+    A bulk answer comes from a MONTHLY snapshot, so it must never replace a fresher
+    value. Testing the ORM object is not enough: it was loaded before the lookup,
+    and the recovery sweep can fill the same row while that network call is in
+    flight, leaving this object holding NULL and overwriting the newer address
+    (Codex High). ``mailing_address IS NULL`` in the WHERE clause is the real guard.
+
+    Returns (written, failed). A row whose write RAISED is returned in ``failed``:
+    the resolver already removed its parcel from county_unreached, so without a
+    deferral marker the batch would commit a NULL mailing that nothing ever revisits
+    — the silent permanent gap this whole change exists to remove (Codex High). A
+    row the guard merely REFUSED is not a failure: the database already holds a
+    mailing address, which is the fill-only rule working.
     """
-    import json
-
-    from sqlalchemy import text as _sa_text
-
-    stmt = _sa_text(_BULK_MAILING_SQL)
     written = 0
+    failed: list = []
     for res, gis_data in fills:
-        payload = json.dumps({
+        patch = {
             "mailing_source": gis_data.get("mailing_source"),
             "mailing_source_role": gis_data.get("mailing_role"),
             "mailing_source_revision": gis_data.get("mailing_revision"),
-        })
+        }
         try:
-            # SAVEPOINT per row. A failed statement poisons the enclosing
-            # transaction until it is rolled back, so swallowing the error without
-            # one would take down the whole batch commit — including the property
-            # addresses this sweep just filled (Codex). A nested rollback undoes
-            # only this row.
+            # SAVEPOINT per row: a failed statement poisons the enclosing
+            # transaction until rolled back, so swallowing one without a savepoint
+            # would take down the whole batch commit, including the property
+            # addresses this sweep just filled.
             with db.begin_nested():
-                result = db.execute(stmt, {
-                    "mail": gis_data.get("mailing_address"),
-                    "payload": payload,
-                    "rid": res.id,
-                    "uid": res.user_id,
-                })
-            if result.rowcount:
+                ok = _guarded_update(
+                    db, res, _SQL_BULK_MAILING,
+                    {"patch": patch, "mail": gis_data.get("mailing_address")},
+                    ("mailing_address", "enrichment_data"),
+                )
+            if ok:
                 written += 1
-                # Keep the in-session object consistent with what just landed, so
-                # later passes in this run see the address they should.
-                res.mailing_address = gis_data.get("mailing_address")
         except Exception as exc:  # noqa: BLE001 -- enrichment is best-effort
+            failed.append(res)
             _logger.warning(
                 "Job %s: bulk mailing write failed for row %s: %s",
                 job_id, str(res.id)[:8], str(exc)[:120],
             )
-    return written
+    return written, failed
 
 
 def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None = None) -> None:
@@ -886,7 +883,14 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                                 setattr(res, _col, str(_v).strip()[:_w])
                         batch_updated += 1
             if _bulk_fills:
-                batch_updated += _apply_bulk_mailing(db, _bulk_fills, job_id)
+                _n, _failed = _apply_bulk_mailing(db, _bulk_fills, job_id)
+                batch_updated += _n
+                for _res in _failed:
+                    # Its write did not land, so it must stay retryable.
+                    _ed = dict(_res.enrichment_data) if isinstance(_res.enrichment_data, dict) else {}
+                    if _ed.get("mailing_lookup_deferred") is not True:
+                        _ed["mailing_lookup_deferred"] = True
+                        _res.enrichment_data = _ed
             if gis_mailing_source:
                 # The county request for these parcels failed (HTTP error, timeout,
                 # ArcGIS error body), so their mailing lookup never happened. Without a

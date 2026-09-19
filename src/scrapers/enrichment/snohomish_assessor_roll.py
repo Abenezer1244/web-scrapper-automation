@@ -226,10 +226,28 @@ def _write_meta(meta: dict) -> None:
 def _touch_checked_at(published: dict) -> None:
     """Record that we ASKED the county, whether or not a new revision followed.
 
-    Without it a rejected revision is re-downloaded on every single lookup.
+    Without it a rejected revision is re-downloaded on every single lookup. Written
+    even when the manifest is EMPTY, so a cold start that cannot build still backs
+    off instead of re-downloading on every batch (Codex).
     """
-    if published:
-        _write_meta({**published, "checked_at": time.time()})
+    _write_meta({**(published or {}), "checked_at": time.time()})
+
+
+def _source_is_too_old(revision: str | None) -> bool:
+    """Is the COUNTY's own publish date past the ceiling?
+
+    Ages the data, not our copy. Using the local build time meant re-downloading an
+    already-stale source bought it another 90 days (Codex). The ArcGIS `modified`
+    stamp is epoch milliseconds; an unparseable one is never treated as expired,
+    since that would take a working source out of service on a format change.
+    """
+    try:
+        published_at = float(revision) / 1000.0
+    except (TypeError, ValueError):
+        return False
+    if published_at <= 0:
+        return False
+    return (time.time() - published_at) > _MAX_INDEX_AGE_S
 
 
 def _revision_of(index: Path) -> str:
@@ -357,14 +375,12 @@ def _ensure_index() -> Path | None:
     published = _published_meta()
     prior_rev = published.get("revision")
     prior = _index_path(str(prior_rev)) if prior_rev else None
-    if prior and prior.exists():
-        built_at = float(published.get("built_at") or 0)
-        if built_at and (time.time() - built_at) > _MAX_INDEX_AGE_S:
-            _logger.warning(
-                "Snohomish roll: index %s is older than the %d-day ceiling; "
-                "refusing to serve it", prior_rev, _MAX_INDEX_AGE_S // 86400,
-            )
-            prior = None
+    if prior and prior.exists() and _source_is_too_old(str(prior_rev)):
+        _logger.warning(
+            "Snohomish roll: revision %s is past the %d-day source-age ceiling; "
+            "refusing to serve it", prior_rev, _MAX_INDEX_AGE_S // 86400,
+        )
+        prior = None
 
     # A warm index answers WITHOUT asking the county anything. Fetching the item
     # metadata on every lookup put a network round trip in front of every batch,
@@ -376,6 +392,13 @@ def _ensure_index() -> Path | None:
 
     revision = _remote_revision()
     _touch_checked_at(published)
+    if revision and _source_is_too_old(revision):
+        # The county itself has not republished inside the ceiling. Rebuilding would
+        # only re-date OUR copy, not the data, so the honest answer is "no source"
+        # — which is deferrable, never a false negative (Codex).
+        _logger.warning("Snohomish roll: published revision %s is past the ceiling",
+                        revision)
+        return None
     if revision and _index_path(revision).exists():
         return _index_path(revision)
     if revision is None:

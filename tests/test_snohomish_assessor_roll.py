@@ -15,6 +15,7 @@ import csv
 import io
 import json
 import sqlite3
+import time
 import zipfile
 
 import pytest
@@ -242,6 +243,52 @@ class TestSourceUnavailableIsNeverANegative:
 
     def test_empty_request_is_a_no_op(self):
         assert roll.resolve_mailing([]) == {}
+
+
+class TestSourceAgeCeiling:
+    """Keeping the last good revision through a failed refresh is right; serving it
+    forever is not. The clock is the COUNTY's publish date, not ours: ageing by our
+    own build time meant re-downloading an already-stale source bought it another
+    90 days (Codex)."""
+
+    def test_a_recent_revision_is_not_too_old(self):
+        recent = str(int((time.time() - 5 * 86400) * 1000))
+        assert roll._source_is_too_old(recent) is False
+
+    def test_a_revision_past_the_ceiling_is_too_old(self):
+        ancient = str(int((time.time() - 200 * 86400) * 1000))
+        assert roll._source_is_too_old(ancient) is True
+
+    @pytest.mark.parametrize("bad", [None, "", "not-a-number", "0", "-5"])
+    def test_an_unreadable_revision_is_never_called_too_old(self, bad):
+        # A format change must not take a working source out of service.
+        assert roll._source_is_too_old(bad) is False
+
+    def test_the_live_revision_is_inside_the_ceiling(self):
+        # Guards against the ceiling being set so tight it disables the source.
+        # 1787655906000 = 2026-08-25, the revision live when this was written.
+        assert roll._source_is_too_old("1787655906000") is False
+
+    def test_an_expired_index_is_not_served_by_the_revision_branch(self, tmp_path, monkeypatch):
+        # The ceiling used to reject `prior` and then hand back the very same file
+        # from the next branch, because prior_rev == revision (Codex).
+        ancient = str(int((time.time() - 200 * 86400) * 1000))
+        monkeypatch.setattr(roll, "_CACHE_DIR", tmp_path)
+        monkeypatch.setattr(roll, "_MIN_TAXPAYER_ROWS", 3)
+        z = _make_zip(tmp_path / "s.zip", _bulk(4))
+        roll._build_index(z, roll._index_path(ancient), ancient)
+        monkeypatch.setattr(roll, "_published_meta",
+                            lambda: {"revision": ancient, "built_at": time.time(),
+                                     "checked_at": time.time()})
+        monkeypatch.setattr(roll, "_remote_revision", lambda: ancient)
+        assert roll._ensure_index() is None
+
+    def test_a_cold_start_still_records_that_we_asked(self, tmp_path, monkeypatch):
+        # _touch_checked_at({}) used to be a no-op, so a cold failure re-downloaded
+        # on every single batch with no backoff (Codex).
+        monkeypatch.setattr(roll, "_CACHE_DIR", tmp_path)
+        roll._touch_checked_at({})
+        assert "checked_at" in json.loads((tmp_path / "snapshot.json").read_text())
 
 
 class TestMailingAnswer:

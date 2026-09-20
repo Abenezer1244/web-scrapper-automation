@@ -166,25 +166,114 @@ grantor agreement alone recovers **7 of 7**.
 
 ---
 
-## Open questions for the owner
+## Owner decisions (2026-09-20)
 
-1. **Bridge corroborator.** Grantor-only (recovers 7/7, my recommendation) or Codex's
-   address+grantor (recovers 1/7)? Codex wins by default under
-   `.claude/rules/codex-collaboration.md`, so this needs an explicit override.
-2. **Is Phase 1 worth it?** It moves King from 15 to 21 filled rows out of 1,114 (1.35% ->
-   1.9%). It is a real correctness fix and it unlocks two live auctions, but it does not
-   change what the reported job shows.
-3. **The bigger lever is product honesty, not code.** King will show Auction Date on roughly
-   1 lead in 100 and on ~0 in 100 for recordings inside the last ~60 days. Today that renders
-   as a bare "N/A" that reads as "we failed". Options: a note on the results header for
-   affected counties, scoping/pricing the offer around it, or licensing a commercial
-   foreclosure feed. That is a product call, not an engineering one.
+1. **Bridge corroborator: Codex's stricter rule** - a bridged parcel requires BOTH
+   address and surname agreement. Costs 6 of the 7 recoverable pairs (the King recorder
+   stores a street-only `property_address`, so its address key carries no ZIP to match
+   the notice's), and keeps the false-attach risk at its lowest. Measured effect: King
+   15 -> 16 filled.
+2. **Scope: all four phases**, including the backfill and the UI.
 
 ---
 
 ## Review
 
-(to be filled in after implementation)
+### What changed
+
+**Backend** (`investigate/king-nts-parcel-bridge`, 2 commits)
+
+`6c1d480` - the matcher fix + missing-reason classification
+- `src/scrapers/sources/nts_matcher.py`: parcel identity is now an explicit relation
+  (`parcel_relation` -> EXACT / BRIDGED / CONFLICT / UNKNOWN) shared by the scorer and
+  by `best_match_group._same_property`, plus `parcel_index_keys` for pool membership.
+- `src/workers/nts_matcher_task.py`: pool indexed/looked-up under both spellings;
+  `auction_missing_reason` + `_stamp_missing_reasons` record WHY a lead is blank.
+- 38 new tests.
+
+`0c59d81` - the honesty fix + the backfill
+- `src/api/schemas.py` + `src/api/routes/jobs.py`: `auction_coverage` on ResultsPage.
+- `src/config/constants.py`: `AUCTION_PUBLICATION_LAG_DAYS = 55`, one source of truth.
+- `scripts/backfill_nts_matches.py`: dry-run-by-default re-match over a wide window.
+- `schema/openapi.json` regenerated (32 insertions, 0 deletions).
+- 6 new tests.
+
+**Frontend** (`fix/auction-coverage-note`, sibling repo)
+- `lib/coverage.ts`: `auctionCoverageNote()`, a pure function over the API's numbers.
+- results page: one amber note above the table. Hidden while searching/tax-filtering
+  (the counts describe the whole run), and silent when every lead has its sale date.
+
+### Results
+
+- Reproduced before/after on the real King pair: TS WA07000188-22-3 goes 0.0 -> 0.95.
+  Controls unchanged (different property 0.0, two 12-digit accounts 0.0, exact 0.96).
+- Prod dry run, all four NTS counties, 3,442 candidates: pierce 0, snohomish 0,
+  clark 0, king +1. Surgical, no cross-county effect.
+- Missing-reason split for King: 585 SOURCE_NOT_PUBLISHED_YET, 513 SOURCE_HAS_NO_NOTICE.
+- Mutation check: forcing the county gate from `king` to `pierce` fails 16 tests,
+  including every county-gate assertion. The new tests are not vacuous.
+- Browser (Chromium, real page against a scratchpad stub API, 13 assertions): the note
+  renders and is correctly worded for reported / none-found / partly-matched, is ABSENT
+  when every lead is matched, is hidden while searching, sits above the table, and
+  does not overflow at 390px. `tsc --noEmit` and eslint clean.
+- CSV needs no change and is already covered: `tests/test_lead_export.py:318-336`
+  asserts a row carrying `auction_date` / `default_amount` emits both, and the export
+  reads those stored columns without knowing how they were filled, so the bridge flows
+  through automatically.
+- Codex: design consult GATE: FAIL (4 P1s, all adopted), Phase 1 diff review
+  GATE: PASS (no P1). ⏭️ The Phase 3/4 diff review did NOT run - Codex hit its usage
+  limit mid-review ("try again at 4:02 AM"). Per `.claude/rules/codex-collaboration.md`
+  that review is still owed before this lands.
+
+### Already-covered behaviour worth stating (the report asked about these)
+
+- **Superseded / postponed sales.** `_write_match`'s two claim rules already handle it:
+  a LIVE notice may replace an attached PAST date (so a postponed or re-noticed sale is
+  not frozen on the stale one), while a historical notice claims only a row that is
+  unset or holds a STRICTLY OLDER past sale. Inline postponements are parsed too:
+  `nts_tacoma_index` reads "SALE POSTPONED TO <date>" and moves the auction date.
+- **Discontinued / rescinded foreclosures** never become leads:
+  `preforeclosure.is_cancellation_or_admin` drops DISCONTINU / RESCISSION / CANCEL /
+  WITHDRAW / RECONVEY / SATISFACTION / SUBSTITUTION OF TRUSTEE before the row is built.
+- **"Principal Owing" semantics.** `nts_tacoma_index._principal_owing` anchors on the
+  RCW 61.24.040(1)(f) section IV "sum owing on the obligation" and PREFERS the figure
+  labelled `Principal`. On a matured/balloon notice carrying no "principal" label it
+  falls back to the first dollar figure inside section IV, which is the total sum owing,
+  not strictly principal. The label is therefore right for most rows and slightly
+  over-specific for that minority. `note_amount` (the original loan size) is stored
+  separately and is never used as Principal Owing.
+
+### Notes and follow-ups
+
+- The reported job (`18076769`) gains nothing from this and is *correct* as it stands:
+  its 51 leads were recorded 08/20-09/18, and their sales cannot be published until
+  roughly December. The new note is what that run needed, not more matching.
+- ⏭️ The backfill was NOT applied. Applying it before the code deploys would enrich prod
+  with unmerged logic, and once deployed the daily beat picks the same row up by itself
+  (every King lead is inside the 180-day window). Run it only to reach leads older than
+  180 days.
+- ⏭️ The FE PR must land AFTER the BE PR: `lib/api-types.generated.ts` is generated from
+  the BE's `main`, so `auction_coverage` does not exist in it until the BE merges.
+- 🛑 **Latent test-fixture bug, pre-existing, not fixed here.**
+  `tests/test_rls_isolation.py::_create_non_bypass_role_if_missing` creates the role and
+  grants it in the same `if not exists` branch. Postgres roles are CLUSTER-scoped while
+  table grants are DATABASE-scoped, so against any NEW test database the role already
+  exists, the GRANTs are skipped, and the test fails with `permission denied for table
+  results`. Proven: granting by hand made it pass. Anyone running the suite against a
+  fresh DB will hit this and may mistake it for their own diff.
+- ⏭️ Codex P2, pre-existing and out of scope: when NEITHER side carries a parcel,
+  `_same_property` groups on `addr_key`, which strips unit numbers, so one notice can
+  still attach to two distinct units. Contradicts the safety comment above it.
+- ⏭️ Clark's NTS source looks dead: 2 notices total, `last_created` 2026-07-28,
+  `last_fetched` 2026-08-03. Every Clark pre_foreclosure lead is unmatched. Worth a look
+  on its own; nothing in this change touches it.
+- ⏭️ Stale comment at `src/scrapers/king_wa_probate.py:913-916` says Amended Notices of
+  Trustee Sale are dropped. `_CANCELLATION_ADMIN` has no AMEND token, so they are not.
+  Prod shows zero such rows, so this is a doc bug rather than a behaviour bug.
+- 👤 The 1.35% ceiling itself is a commercial question, not an engineering one. All 22
+  court-approved King legal newspapers were checked in September and only one is usable;
+  the recorded document carries both values but LandmarkWeb's terms forbid bulk image
+  retrieval. Raising King coverage means licensing a foreclosure feed.
 
 ---
 

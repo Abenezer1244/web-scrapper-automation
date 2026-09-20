@@ -246,9 +246,18 @@ async def test_a_long_last_name_is_truncated_to_the_column_width(
     assert stored == "Z" * 128
 
 
-async def test_results_is_advanced_only_from_not_attempted(db, business_user: User):
-    """A lead that settled between the eligibility read and the claim keeps its
-    answer; the claim must not stamp 'queued' over a real result."""
+async def test_a_lead_that_settled_before_the_claim_is_not_claimed_at_all(
+    db, business_user: User,
+):
+    """A lead answered between the eligibility read and the claim must keep its
+    answer AND get no pending row.
+
+    Asserting only that 'hit' survives is not enough: the earlier version of this
+    helper inserted the active pending row first and then found the guarded
+    UPDATE matched nothing, leaving an active queued row that nothing would ever
+    settle while the lead read 'hit' -- stranded work, invisible. The insert now
+    joins through `results`, so the row is never created.
+    """
     cfg = await _config(db, business_user)
     job_id = await _job(db, business_user, cfg)
     rid = await _row(db, job_id, business_user.id)
@@ -258,23 +267,120 @@ async def test_results_is_advanced_only_from_not_attempted(db, business_user: Us
     settled.skip_trace_status = "hit"
     await db.commit()
 
-    assert await db.run_sync(lambda s: claim_skip_trace_rows(s, [payload])) == [rid]
+    assert await db.run_sync(lambda s: claim_skip_trace_rows(s, [payload])) == []
     await db.commit()
 
     assert await _status(db, rid) == "hit", "a settled answer was overwritten"
+    assert await _pending(db, rid) == 0, "a stranded active row was created"
+
+
+async def test_another_tenants_lead_is_never_claimed(
+    db, business_user: User, starter_user: User,
+):
+    """A payload naming another tenant's result must claim nothing.
+
+    If it inserted, the unique index would then block the RIGHTFUL owner from
+    ever claiming that lead, while the dispatcher's tenant-pinned joins ignored
+    the row forever. The claim's user_id is the one asserted; the insert joins
+    `results` on both id AND user_id.
+    """
+    cfg = await _config(db, business_user)
+    job_id = await _job(db, business_user, cfg)
+    victim = await _row(db, job_id, business_user.id)
+    payload = await _payload(db, victim)
+    # Same lead, claimed under the WRONG tenant.
+    stolen = dict(payload, user_id=starter_user.id)
+
+    assert await db.run_sync(lambda s: claim_skip_trace_rows(s, [stolen])) == []
+    await db.commit()
+
+    assert await _pending(db, victim) == 0
+    assert await _status(db, victim) == "not_attempted"
+    # And the real owner can still claim it.
+    assert await db.run_sync(lambda s: claim_skip_trace_rows(s, [payload])) == [victim]
+    await db.commit()
+    assert await _status(db, victim) == "queued"
+
+
+async def test_a_vanished_lead_does_not_kill_the_batch(db, business_user: User):
+    """A payload naming a result that no longer exists must cost only itself.
+
+    Without the join it is a foreign-key violation, which fails the whole
+    multi-row insert and takes every other lead in the batch with it -- the same
+    class of silent batch loss 15-1 was about.
+    """
+    cfg = await _config(db, business_user)
+    job_id = await _job(db, business_user, cfg)
+    alive = await _row(db, job_id, business_user.id, address="1 A ST")
+    payload = await _payload(db, alive)
+    ghost = dict(payload, result_id=str(uuid.uuid4()))
+
+    won = await db.run_sync(lambda s: claim_skip_trace_rows(s, [payload, ghost]))
+    await db.commit()
+
+    assert won == [alive]
+    assert await _status(db, alive) == "queued"
+
+
+async def test_an_oversized_state_is_refused_not_truncated(db, business_user: User):
+    """`state` is String(2) but lookup_subject_key hashes it at 128, so silently
+    cutting a longer value to two characters would STORE one value and HASH
+    another: the cache read could never match its own write and every repeat
+    trace would be re-paid. The payload is refused instead."""
+    cfg = await _config(db, business_user)
+    job_id = await _job(db, business_user, cfg)
+    rid = await _row(db, job_id, business_user.id)
+    payload = dict(await _payload(db, rid), state="WASHINGTON")
+
+    assert await db.run_sync(lambda s: claim_skip_trace_rows(s, [payload])) == []
+    await db.commit()
+    assert await _pending(db, rid) == 0
+
+
+async def test_the_claim_still_works_without_the_index(db, business_user: User):
+    """start.sh starts the WORKER even when migrations fail, and tasks.py only
+    logs an enqueue failure. So a targeted `ON CONFLICT (result_id) WHERE ...`
+    would turn a failed migration 099 into every skip-trace enqueue silently
+    ceasing. The bare conflict clause degrades to pre-099 behaviour instead, and
+    warn_if_unenforced says so out loud."""
+    from src.workers.skip_trace_claim import INDEX_NAME, warn_if_unenforced
+
+    cfg = await _config(db, business_user)
+    job_id = await _job(db, business_user, cfg)
+    rid = await _row(db, job_id, business_user.id)
+    payload = await _payload(db, rid)
+
+    await db.execute(text(f"DROP INDEX {INDEX_NAME}"))
+    try:
+        assert await db.run_sync(warn_if_unenforced) is False
+        # Still claims, rather than raising "no unique or exclusion constraint".
+        assert await db.run_sync(lambda s: claim_skip_trace_rows(s, [payload])) == [rid]
+    finally:
+        await db.rollback()
+
+    assert await db.run_sync(warn_if_unenforced) is True
 
 
 async def test_the_active_predicate_matches_the_index(db):
-    """The helper's ACTIVE_PENDING_STATUSES is the ON CONFLICT arbiter
-    predicate. If it and migration 099 drift, either a second claim slips
-    through (double charge) or a legitimate one is refused forever."""
-    from src.workers.skip_trace_claim import ACTIVE_PENDING_STATUSES
+    """ACTIVE_PENDING_STATUSES must equal migration 099's index predicate. If
+    they drift, either a second claim slips through (double charge) or a
+    legitimate one is refused forever. Checks the index is UNIQUE and VALID and
+    on the right column too: a non-unique or invalid index enforces nothing
+    while still matching on status strings alone."""
+    from src.workers.skip_trace_claim import ACTIVE_PENDING_STATUSES, INDEX_NAME
 
-    predicate = (await db.execute(text(
-        "SELECT pg_get_expr(i.indpred, i.indrelid) FROM pg_class c "
-        "JOIN pg_index i ON i.indexrelid = c.oid "
-        "WHERE c.relname = 'uq_pending_skip_trace_active_result'"
-    ))).scalar_one_or_none()
-    assert predicate is not None, "migration 099 did not create the index"
+    row = (await db.execute(text(
+        "SELECT i.indisunique, i.indisvalid, "
+        "       pg_get_expr(i.indpred, i.indrelid) AS predicate, "
+        "       pg_get_indexdef(i.indexrelid) AS definition "
+        "FROM pg_class c JOIN pg_index i ON i.indexrelid = c.oid "
+        "WHERE c.relname = :n"
+    ), {"n": INDEX_NAME})).first()
+    assert row is not None, "migration 099 did not create the index"
+    assert row.indisunique, "the index is not UNIQUE, so it enforces nothing"
+    assert row.indisvalid, "the index is INVALID, so the planner ignores it"
+    assert "(result_id)" in row.definition, "the index is not keyed on result_id"
     for status in ACTIVE_PENDING_STATUSES:
-        assert f"'{status}'" in predicate, f"{status} missing from the index predicate"
+        assert f"'{status}'" in row.predicate, f"{status} missing from the predicate"
+    # And nothing EXTRA: a widened predicate would refuse legitimate re-claims.
+    assert row.predicate.count("::character varying") == len(ACTIVE_PENDING_STATUSES)

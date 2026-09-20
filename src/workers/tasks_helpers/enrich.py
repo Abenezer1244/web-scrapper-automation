@@ -2496,8 +2496,13 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config, *, on_begin=None) 
     # is what lets the action worker later write its dispositions in the same one.
     claimed_ids: list[str] = []
     if to_claim:
-        from src.workers.skip_trace_claim import claim_skip_trace_rows
+        from src.workers.skip_trace_claim import claim_skip_trace_rows, warn_if_unenforced
 
+        # The claim degrades to pre-099 behaviour when the index is missing
+        # rather than failing every enqueue (start.sh starts the worker even
+        # when migrations fail). That degradation must never be silent: without
+        # the index nothing stops a lead being claimed, and charged for, twice.
+        warn_if_unenforced(db)
         claimed_ids = claim_skip_trace_rows(db, to_claim)
         claimed = set(claimed_ids)
         for payload in to_claim:

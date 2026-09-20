@@ -164,6 +164,50 @@ class TestCancelSweep:
         assert await _status(db, "pending_skip_trace_rows", row) == "submitting"
         assert await _status(db, "results", lead) == "submitted"
 
+    async def test_the_sweep_does_not_commit_its_own_work(self, db, business_user):
+        """Transaction ownership, proved rather than asserted.
+
+        `_cancel_undeliverable_queued` used to commit internally, which would
+        make it impossible for Phase 1b-2 to write the contact-lookup-action
+        disposition and the audit event in the SAME transaction as the
+        cancellation -- a crash between the two would leave an action reading
+        "still looking" forever while the queue row was already gone. This test
+        fails if the internal commit ever comes back.
+        """
+        from src.db.session import system_sync_session
+
+        job = await _job(db, business_user, "failed")
+        lead = await _lead(db, business_user, job)
+        row = await _pending(db, business_user, job, lead)
+
+        with system_sync_session() as s:
+            assert dispatcher._cancel_undeliverable_queued(s) == 1
+            s.rollback()
+
+        assert await _status(db, "pending_skip_trace_rows", row) == "queued"
+        assert await _status(db, "results", lead) == "queued"
+
+    async def test_a_failing_sweep_is_reported_as_None_to_the_compliance_gate(
+        self, db, business_user, monkeypatch,
+    ):
+        """The tick skips entirely when the sweep fails while the ATIP paid
+        switch is off, so `swept is None` has to survive the move of the
+        try/except from the helper to its caller."""
+        from src.config import settings
+
+        # The tick returns {'skipped': 'disabled'} before it ever reaches the
+        # sweep unless skip trace is on, which would make this assertion vacuous.
+        monkeypatch.setattr(settings, "SKIP_TRACE_ENABLED", True)
+        monkeypatch.setattr(settings, "TRACERFY_API_TOKEN", "test-token-not-real")
+        monkeypatch.setattr(settings, "PIERCE_CV_OWNER_SKIP_TRACE_ENABLED", False)
+
+        def _boom(_db):
+            raise RuntimeError("sweep exploded")
+
+        monkeypatch.setattr(dispatcher, "_cancel_undeliverable_queued", _boom)
+        result = dispatcher.dispatch_pending_skip_trace()
+        assert result.get("deferred") == "sweep_failed"
+
     async def test_a_lead_can_no_longer_have_two_active_rows(self, db, business_user):
         """This replaces `test_a_lead_another_active_row_still_references_keeps_its_status`.
 

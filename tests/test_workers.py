@@ -238,6 +238,234 @@ def test_watchdog_requeues_job_with_stale_heartbeat():
         assert refreshed.retry_count == 1
 
 
+# ─── Watchdog: recovery writes are guarded against a moved row ────────────────
+#
+# The watchdog decides in Python from a SELECT and then writes. Everything here
+# covers the window between the two: the row can be cancelled, finished,
+# re-claimed by a newer attempt, or already recovered by a concurrent tick. Each
+# test moves the row from a SECOND session, exactly as another process would,
+# while the first session still holds the ORM object the decision was made on
+# (SyncSessionLocal sets expire_on_commit=False, so it keeps the observed values).
+
+
+def _observed_stuck_job(db: Session) -> Job:
+    """A stuck job, committed, and returned as the ORM object a SELECT would yield."""
+    user = _create_sync_user(db)
+    config = _create_sync_config(db, user.id)
+    job = _create_stuck_job(db, user.id, config.id, minutes_ago=75)
+    db.commit()
+    return job
+
+
+def test_recovery_cas_refuses_a_job_cancelled_since_it_was_selected():
+    """THE bug this guard exists for. A cancel that lands between the watchdog's
+    SELECT and its write used to be overwritten: the row went cancelled -> pending,
+    the watchdog enqueued it, and the worker's pending-only claim CAS — whose whole
+    job is to stop a cancelled row being picked up — saw a legitimately pending job
+    and ran it. The cancelled run re-scraped, re-billed and re-delivered."""
+    from src.workers.scheduler_helpers.health import _recovery_cas
+
+    with SyncSessionLocal() as observer:
+        job = _observed_stuck_job(observer)
+
+        # The user cancels, from their own request's session.
+        with SyncSessionLocal() as canceller:
+            canceller.execute(
+                sa_text("UPDATE jobs SET status='cancelled', finished_at=now() WHERE id=:j"),
+                {"j": job.id},
+            )
+            canceller.commit()
+
+        fired = _recovery_cas(
+            observer, job,
+            retry_count=job.retry_count + 1,
+            status="pending",
+            started_at=None,
+            last_heartbeat_at=None,
+            page_current=0,
+            page_total=0,
+            record_count=0,
+        )
+
+    assert fired is False, "a cancelled job must not be re-queued"
+    with SyncSessionLocal() as db:
+        refreshed = db.get(Job, job.id)
+        assert refreshed.status == "cancelled"
+        assert refreshed.retry_count == 0  # no retry burned either
+
+
+def test_recovery_cas_refuses_a_job_that_finished_since_it_was_selected():
+    """The mirror case on the permanent-fail branch: stamping 'failed' over a 'done'
+    the worker had just committed would tell a customer their run failed while they
+    hold the export they were charged for."""
+    from src.workers.scheduler_helpers.health import _recovery_cas
+
+    with SyncSessionLocal() as observer:
+        job = _observed_stuck_job(observer)
+        observer.execute(
+            sa_text("UPDATE jobs SET retry_count=3 WHERE id=:j"), {"j": job.id}
+        )
+        observer.commit()
+        job.retry_count = 3  # what the watchdog's SELECT would have read
+
+        with SyncSessionLocal() as worker:
+            worker.execute(
+                sa_text(
+                    "UPDATE jobs SET status='done', finished_at=now(), record_count=57 "
+                    "WHERE id=:j"
+                ),
+                {"j": job.id},
+            )
+            worker.commit()
+
+        fired = _recovery_cas(
+            observer, job,
+            status="failed",
+            finished_at=datetime.now(UTC),
+            error_message="This scraper run did not complete in time.",
+        )
+
+    assert fired is False, "a completed job must not be marked failed"
+    with SyncSessionLocal() as db:
+        refreshed = db.get(Job, job.id)
+        assert refreshed.status == "done"
+        assert refreshed.record_count == 57
+        assert refreshed.error_message is None
+
+
+def test_recovery_cas_refuses_a_job_reclaimed_by_a_newer_attempt():
+    """started_at is the attempt token. A decision taken against a dead attempt must
+    not land on the live attempt that has since re-claimed the row — that would null
+    the new attempt's started_at and counters out from under a running worker."""
+    from src.workers.scheduler_helpers.health import _recovery_cas
+
+    with SyncSessionLocal() as observer:
+        job = _observed_stuck_job(observer)
+
+        with SyncSessionLocal() as newer:
+            newer.execute(
+                sa_text(
+                    "UPDATE jobs SET started_at=now(), last_heartbeat_at=now(), "
+                    "page_current=3, page_total=5 WHERE id=:j"
+                ),
+                {"j": job.id},
+            )
+            newer.commit()
+
+        fired = _recovery_cas(
+            observer, job,
+            retry_count=job.retry_count + 1,
+            status="pending",
+            started_at=None,
+            last_heartbeat_at=None,
+            page_current=0,
+            page_total=0,
+            record_count=0,
+        )
+
+    assert fired is False
+    with SyncSessionLocal() as db:
+        refreshed = db.get(Job, job.id)
+        assert refreshed.status == "scraping"
+        assert refreshed.started_at is not None
+        assert (refreshed.page_current, refreshed.page_total) == (3, 5)
+
+
+def test_recovery_cas_refuses_a_second_concurrent_tick():
+    """Two watchdog ticks overlapping must not both burn a retry, which would spend
+    the budget at twice the rate and fail a recoverable job early."""
+    from src.workers.scheduler_helpers.health import _recovery_cas
+
+    with SyncSessionLocal() as observer:
+        job = _observed_stuck_job(observer)
+
+        with SyncSessionLocal() as other_tick:
+            other_tick.execute(
+                sa_text(
+                    "UPDATE jobs SET status='pending', retry_count=1, started_at=NULL "
+                    "WHERE id=:j"
+                ),
+                {"j": job.id},
+            )
+            other_tick.commit()
+
+        fired = _recovery_cas(
+            observer, job,
+            retry_count=job.retry_count + 1,
+            status="pending",
+            started_at=None,
+            last_heartbeat_at=None,
+            page_current=0,
+            page_total=0,
+            record_count=0,
+        )
+
+    assert fired is False
+    with SyncSessionLocal() as db:
+        assert db.get(Job, job.id).retry_count == 1  # one tick's worth, not two
+
+
+def test_recovery_cas_applies_when_the_row_has_not_moved():
+    """Positive control: the guard must not be so tight that ordinary recovery stops
+    working. Without this, every test above would pass on a helper that never writes."""
+    from src.workers.scheduler_helpers.health import _recovery_cas
+
+    with SyncSessionLocal() as observer:
+        job = _observed_stuck_job(observer)
+        observer.execute(
+            sa_text(
+                "UPDATE jobs SET page_current=3, page_total=5, record_count=42, "
+                "last_heartbeat_at=now() WHERE id=:j"
+            ),
+            {"j": job.id},
+        )
+        observer.commit()
+
+        fired = _recovery_cas(
+            observer, job,
+            retry_count=job.retry_count + 1,
+            status="pending",
+            started_at=None,
+            last_heartbeat_at=None,
+            page_current=0,
+            page_total=0,
+            record_count=0,
+        )
+
+    assert fired is True
+    with SyncSessionLocal() as db:
+        refreshed = db.get(Job, job.id)
+        assert refreshed.status == "pending"
+        assert refreshed.retry_count == 1
+        assert refreshed.started_at is None
+        assert refreshed.last_heartbeat_at is None
+        # Stale progress is cleared so the UI can't read "Page 3 of 5" on a run
+        # that is about to start over from the beginning.
+        assert (refreshed.page_current, refreshed.page_total, refreshed.record_count) == (0, 0, 0)
+
+
+def test_watchdog_never_selects_a_cancelled_job():
+    """Belt to the CAS's suspenders: 'cancelled' is not in STUCK_CHECK_STATUSES, so a
+    cancelled job is not a recovery candidate in the first place, however old it is."""
+    from src.workers.scheduler import watchdog_stuck_jobs
+
+    with SyncSessionLocal() as db:
+        user = _create_sync_user(db)
+        config = _create_sync_config(db, user.id)
+        job = _create_stuck_job(db, user.id, config.id, minutes_ago=600)
+        job.status = "cancelled"
+        job.finished_at = datetime.now(UTC)
+        job_id = job.id
+        db.commit()
+
+    watchdog_stuck_jobs()
+
+    with SyncSessionLocal() as db:
+        refreshed = db.get(Job, job_id)
+        assert refreshed.status == "cancelled"
+        assert refreshed.retry_count == 0
+
+
 def test_heartbeat_write_is_attempt_scoped():
     """_write_heartbeat refreshes only the attempt that matches started_at. A
     thread left over from a superseded attempt (different started_at) updates 0

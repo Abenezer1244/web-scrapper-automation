@@ -209,11 +209,49 @@ Codex DID review the PLAN (before any code) and the #347 diff; both of those
 produced findings that were verified and folded in. It is only the two final diff
 reviews that are missing.
 
+### Security Master Review (§14) — RUN, two passes, clean
+
+Translated to this stack per `.claude/rules/security.md`. Checked against the diff,
+not asserted.
+
+| # | Category | Finding |
+|---|----------|---------|
+| 1 | Authorization | CLEAN. `JobCreate` accepts only `scraper_config_id` + `trigger`; **none of the 8 new columns is client-writable**. All job reads go through ownership-filtered queries (9 sites with `Job.user_id == current_user.id`). |
+| 2 | Secrets | CLEAN. None added. |
+| 3 | Input validation | CLEAN by construction: the new fields are output-only. `stage` / `progress_unit` are free text at the DB but only the worker writes them, from `JOB_STAGES` / `JOB_PROGRESS_UNITS`. |
+| 4 | Error handling | CLEAN. `_set_progress`'s except logs field NAMES only, never values, and returns False rather than surfacing anything. No new `HTTPException` detail. |
+| 5 | XSS | CLEAN. `stage_label` is composed server-side from fixed dicts plus integers; an unrecognised `stage` returns None and falls through to status wording, so even a poisoned column cannot emit arbitrary text. Rendered as a React text child. 0 `dangerouslySetInnerHTML`. |
+| 6 | SQL injection | CLEAN. `update().values(**kwargs)` is parameterized with keys constrained by a TypedDict; `make_interval(secs => :cd)` is a bound param, not interpolation. |
+| 7 | File uploads | N/A. |
+| 8 | Rate limiting | CLEAN. No new endpoint. The SSE keepalive adds ~13 bytes / 15s / stream, bounded by the existing 5-stream lease and 30-min cap. |
+| 9 | CSRF | CLEAN. No new routes. |
+| 10 | PII | CLEAN. Stage name, integer counts, timestamps. No PII. |
+| 11 | Configuration | CLEAN. No new table, so no new RLS policy; columns inherit `jobs`' RLS. Migration additive + nullable with `lock_timeout`. |
+| 12 | Dependencies | **FINDING — fixed.** See below. |
+| 13 | Logging | CLEAN. New warn paths log identifiers and field names, not values. 0 `console.log` added. |
+| 14 | Non-negotiables | CLEAN. No user_id filter dropped; no new navigation (SSRF untouched); none of the new fields reach an export path (CSV injection); no secrets; no error silenced as a fix (the two broad excepts are telemetry-only, logged, documented). |
+
+**Finding (cat. 12, Medium, FIXED):** the FE branch was cut from `master` @ `6c435d0`
+and master had since moved one commit ahead — **#159 `10d65d7`, "next 16.3.5 + pinned
+next-auth, 30 vulnerabilities to 0"**. `git diff master..HEAD` rendered that bump as a
+*reversion* on my branch, i.e. merging would have rolled back a security upgrade.
+Rebased onto it; the diff is now exactly the 4 intended files. Re-verified against the
+upgraded tree (`npm ci`, 849 packages): tsc, eslint and `next build` all clean.
+
+This is the finding that justifies the rule. Nothing in the feature work would have
+surfaced it; only running the review did.
+
+### Connector stage gap — CLOSED
+
+All 10 connectors now call `report_stage()` (was 3). `tests/test_scraper_progress_reporting.py`
+walks the registry's own module allowlist, so a connector added later is covered
+without anyone remembering the test. Verified non-vacuous: removing one call fails it
+by name. Targeted suite: 1332 passed, 1 skipped.
+
 ### Not done
 
-- **Security Master Review (§14) was not run.** No auth, billing, export or
-  scraper-target surface changed, but the rule says run it after every meaningful
-  feature and it has not been.
+- **Codex diff-review gate still OPEN.** Re-probed after the gap fix; still
+  rate-limited (`try again at 4:02 AM`). Neither PR is cleared.
 - Local full-suite run was reaped for low memory at 78%; CI covered it instead.
 
 ### Deploy order

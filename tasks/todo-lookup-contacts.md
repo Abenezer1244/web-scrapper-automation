@@ -790,6 +790,55 @@ pre-existing Stripe ones, proven identical at `origin/main`).
 **Before a PR:** rebase onto `origin/main`, which moved twice during the session (now
 `8ba7bf8`).
 
+### Phase 1b-0: done, NOT merged (2026-09-20)
+
+Hardening only. No API route, no schema, no new dependency, no frontend.
+
+| | |
+|---|---|
+| `d4bd021` | shared `ON CONFLICT` claim + migration 099 + the 15-1 regression test |
+| `5babf77` | Codex review 1: the claim stops trusting its payloads, or the index existing |
+| `fa20d60` | Codex review 2: enforcement per caller; `action_id` removed as dead code |
+| `4f05c08` | Codex review 3: the claim withdraws its own losers, so the race has no residue |
+| `4808441` | Codex review 4: the DB is the arbiter; job advisory lock stops the double enqueue |
+| `28afa5a` | Codex review 5: the backfill was the other writer; the lock was released early |
+| `5e70ecb` | Codex review 6: the backfill locks before it reads, and commits per job |
+| `d1a6011` | Security pass 1: fail closed on the money invariant; pin the lead to its job |
+
+**In one line:** one lead can hold only one active skip-trace claim, and a conflict now costs
+only itself instead of silently discarding a whole job's lookups.
+
+**What it cost to get right.** Codex returned NO-GO **six times** before PASS. The plan-level
+consult (round 15) found nine P1s before any code was written; the diff review then found nine
+more across six rounds, and the Security Master Review found a Critical on top of that. Every
+one of them was a way to charge a customer twice, strand paid work, or lose leads silently.
+
+**Three findings worth remembering beyond this phase:**
+1. **The fix's own ordering was the bug.** Creating the unique index BEFORE moving the enqueue
+   onto `ON CONFLICT` would have made one conflicting row roll back an entire job's enqueue and
+   commit an empty transaction, silently. The index and the refactor are one change, not two.
+2. **A second writer hides in `scripts/`.** 1a had already audited the ops scripts for the
+   subject key and fixed `backfill_skip_trace_jobs.py`. It was wrong again here for a different
+   invariant, because it built `PendingSkipTraceRow` itself. **A script that writes to a queue
+   is part of that queue's concurrency design.**
+3. **A reviewer's fix can be worse than the bug.** Codex's remedy for the unguarded cache-hit
+   write was a raw-SQL UPDATE. `phone`/`email`/`phones`/`emails` are `EncryptedString` /
+   `EncryptedJSON`, so that would have written PLAINTEXT PII. The intent was implemented with
+   the shared lock and ORM writes instead. **Check a suggested fix against the schema.**
+
+**Carried into 1b-2, do not lose:** the action worker MUST call `lock_job_for_claim()` before
+its own cache-and-claim pass (the cache-hit write is an ORM write and cannot see another
+writer's uncommitted pending row), and it inherits fail-closed enforcement automatically.
+
+**Verification.** 306 tests green on an isolated database across the skip-trace, enqueue,
+dispatcher, reconciliation and Phase 1a subject-key suites; ruff clean. Migration 099 applied
+and verified BY THE OBJECTS (unique, valid, correct predicate), never by `alembic_version`, and
+its rebuild path proved live by planting the exact wrong index and re-running it. The 15-1
+regression test is mutation-tested: with `ON CONFLICT` removed it fails with the IntegrityError
+the pre-099 code would have produced.
+
+**Not done:** a full-suite run (the local suite is killed for host memory; CI is the signal).
+
 ### Still open
 
 - **Phase 1b and 1c have not started** and must not until 1a merges.

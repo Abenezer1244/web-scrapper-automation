@@ -57,6 +57,16 @@ depends_on = None
 _INDEX = "uq_pending_skip_trace_active_result"
 _ACTIVE = "('queued','submitting','submitted')"
 
+# How Postgres renders the WHERE clause below back from the catalog. Duplicated
+# deliberately from src/workers/skip_trace_claim.py rather than imported: a
+# migration must keep working when the application code moves on, and the
+# runtime check there asserts the same thing independently, so a drift between
+# the two surfaces as a refusal to claim rather than as a silent no-op.
+_EXPECTED_PREDICATE = (
+    "((status)::text = ANY ((ARRAY['queued'::character varying, "
+    "'submitting'::character varying, 'submitted'::character varying])::text[]))"
+)
+
 
 def upgrade() -> None:
     conn = op.get_bind()
@@ -102,11 +112,38 @@ def upgrade() -> None:
             # in progress. (Outside a migration, indisvalid=false means BUILDING
             # *or* DEAD -- check pg_stat_progress_create_index before declaring
             # failure.)
-            is_invalid = conn.execute(text(
-                "SELECT 1 FROM pg_class c JOIN pg_index i ON i.indexrelid = c.oid "
-                "WHERE c.relname = :n AND NOT i.indisvalid"
+            #
+            # The check is by IDENTITY, not just validity. `CREATE ... IF NOT
+            # EXISTS` treats ANY same-named index as success, so a non-unique
+            # one, a composite one, one on another schema's table, or one with
+            # an extra predicate conjunct would leave 099 recorded as applied
+            # while the money-safety constraint it exists for is absent.
+            existing = conn.execute(text(
+                "SELECT i.indisvalid, i.indisunique, i.indnatts, "
+                "       pg_get_expr(i.indpred, i.indrelid) AS predicate, "
+                "       pg_get_indexdef(i.indexrelid) AS definition "
+                "FROM pg_class c "
+                "JOIN pg_namespace cn ON cn.oid = c.relnamespace "
+                "JOIN pg_index i ON i.indexrelid = c.oid "
+                "JOIN pg_class t ON t.oid = i.indrelid "
+                "JOIN pg_namespace tn ON tn.oid = t.relnamespace "
+                "WHERE c.relname = :n AND cn.nspname = 'public' "
+                "  AND t.relname = 'pending_skip_trace_rows' AND tn.nspname = 'public'"
+            ), {"n": _INDEX}).first()
+            wrong_shape = existing is not None and not (
+                existing.indisvalid
+                and existing.indisunique
+                and existing.indnatts == 1
+                and "(result_id)" in (existing.definition or "")
+                and " ".join((existing.predicate or "").split())
+                == " ".join(_EXPECTED_PREDICATE.split())
+            )
+            # An index with the right NAME but on some other table or schema is
+            # invisible to the query above; drop by name covers that too.
+            named_elsewhere = existing is None and conn.execute(text(
+                "SELECT 1 FROM pg_class WHERE relname = :n AND relkind = 'i'"
             ), {"n": _INDEX}).scalar()
-            if is_invalid:
+            if wrong_shape or named_elsewhere:
                 conn.execute(text(f"DROP INDEX CONCURRENTLY IF EXISTS {_INDEX}"))
             conn.execute(text(
                 f"CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS {_INDEX} "

@@ -375,21 +375,24 @@ async def test_a_bad_trace_type_is_refused_not_truncated(db, business_user: User
     assert await _pending(db, rid) == 0
 
 
-async def test_without_the_index_the_scrape_degrades_but_the_action_refuses(
+async def test_without_the_index_nothing_is_claimed_and_nothing_is_lost(
     db, business_user: User,
 ):
-    """What a failed migration 099 costs, and to whom.
+    """A failed migration 099 PAUSES lookups; it does not risk a double charge.
 
-    start.sh starts the WORKER even when migrations fail and tasks.py only logs
-    an enqueue failure, so a targeted `ON CONFLICT (result_id) WHERE ...` would
-    turn a failed 099 into every skip-trace enqueue silently ceasing. The bare
-    conflict clause degrades instead. But degrading is only safe for the SCRAPE,
-    which is the single writer; the Phase 1b-2 action is a second writer and
-    must refuse, because without the index two writers really can buy one lead
-    twice. The second claim below proves the protection is genuinely gone, which
-    is what makes `require_enforcement=True` load-bearing rather than decorative.
+    This replaces a version where the scrape deliberately degraded and claimed
+    anyway. The Security Master Review rejected that as a Critical, and the
+    premise behind it was wrong: refusing does not "strand every lookup in the
+    product". The lead stays 'not_attempted', so the next run claims it once the
+    migration lands, and meanwhile scrapes still run and leads are still
+    delivered. Only the paid add-on waits. Proceeding unenforced, by contrast,
+    risks charging a customer twice for one lead, which retrying cannot undo.
     """
-    from src.workers.skip_trace_claim import INDEX_NAME, ClaimUnenforcedError, warn_if_unenforced
+    from src.workers.skip_trace_claim import (
+        INDEX_NAME,
+        ClaimUnenforcedError,
+        warn_if_unenforced,
+    )
 
     cfg = await _config(db, business_user)
     job_id = await _job(db, business_user, cfg)
@@ -399,32 +402,42 @@ async def test_without_the_index_the_scrape_degrades_but_the_action_refuses(
     await db.execute(text(f"DROP INDEX {INDEX_NAME}"))
     try:
         assert await db.run_sync(warn_if_unenforced) is False
-
-        # The action worker refuses outright: nothing claimed, nothing charged.
-        # Two independent refusals guard this. The catalog pre-check raises
-        # ClaimUnenforcedError, and even if that check were wrong, the TARGETED
-        # `ON CONFLICT (result_id) WHERE ...` arbiter makes Postgres itself
-        # reject the statement, so there is no window between checking and
-        # inserting in which the index could go away.
         with pytest.raises(ClaimUnenforcedError):
             await db.run_sync(lambda s: claim_skip_trace_rows(s, [payload]))
-
-        # The scrape degrades, rather than raising "no unique or exclusion
-        # constraint matching the ON CONFLICT specification".
-        assert await db.run_sync(
-            lambda s: claim_skip_trace_rows(s, [payload], require_enforcement=False)
-        ) == [rid]
-        # And the protection really is absent: put the lead back and claim again.
-        await db.execute(text(
-            "UPDATE results SET skip_trace_status = 'not_attempted' WHERE id = :i"
-        ), {"i": rid})
-        assert await db.run_sync(
-            lambda s: claim_skip_trace_rows(s, [payload], require_enforcement=False)
-        ) == [rid], "without the index a duplicate active claim is possible"
     finally:
         await db.rollback()
 
     assert await db.run_sync(warn_if_unenforced) is True
+    # Nothing was claimed and nothing was consumed: the lead is still waiting.
+    assert await _pending(db, rid) == 0
+    assert await _status(db, rid) == "not_attempted"
+    # And once the index is back, the very same payload claims normally.
+    assert await db.run_sync(lambda s: claim_skip_trace_rows(s, [payload])) == [rid]
+    await db.commit()
+    assert await _status(db, rid) == "queued"
+
+
+async def test_a_payload_naming_the_wrong_job_claims_nothing(
+    db, business_user: User,
+):
+    """The claim pins the lead to its tenant AND to its job.
+
+    A malformed payload carrying another job's id would otherwise write a queue
+    row tied to a job the lead does not belong to. The dispatcher's tenant-pinned
+    joins would ignore that row forever, while the unique index blocked the
+    legitimate claim: a lead that could never be looked up again.
+    """
+    cfg = await _config(db, business_user)
+    job_a = await _job(db, business_user, cfg)
+    job_b = await _job(db, business_user, cfg)
+    rid = await _row(db, job_a, business_user.id)
+    wrong_job = dict(await _payload(db, rid), job_id=job_b)
+
+    assert await db.run_sync(lambda s: claim_skip_trace_rows(s, [wrong_job])) == []
+    await db.commit()
+
+    assert await _pending(db, rid) == 0
+    assert await _status(db, rid) == "not_attempted"
 
 
 async def test_enforcement_check_rejects_a_same_named_wrong_index(

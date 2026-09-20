@@ -97,7 +97,7 @@ def main() -> int:
                     help="actually enqueue (default is dry-run, no writes, no spend)")
     args = ap.parse_args()
 
-    from sqlalchemy import and_, select, text
+    from sqlalchemy import and_, select
 
     from src.config import settings
     from src.db.models import (
@@ -112,7 +112,10 @@ def main() -> int:
         build_pending_row_payload,
         payload_subject_key,
     )
-    from src.workers.skip_trace_claim import claim_skip_trace_rows
+    from src.workers.skip_trace_claim import (
+        claim_skip_trace_rows,
+        lock_job_for_claim,
+    )
 
     mode = "COMMIT (writes + enables Tracerfy spend via dispatcher)" if args.commit \
         else "DRY-RUN (no writes, no spend)"
@@ -169,10 +172,7 @@ def main() -> int:
             # ONE job lock is held at a time rather than one per job for the
             # length of the run.
             if args.commit:
-                db.execute(
-                    text("SELECT pg_advisory_xact_lock(hashtext(:k))"),
-                    {"k": f"skip_trace_enqueue:{jid}"},
-                )
+                lock_job_for_claim(db, jid)
 
             # result_ids already queued (any status) — never double-enqueue.
             pending_ids = set(db.execute(

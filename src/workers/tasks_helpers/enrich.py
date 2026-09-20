@@ -2445,10 +2445,9 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config, *, on_begin=None) 
     # there is no commit, so the lock genuinely spans the read-decide-claim.
     # Transaction-scoped, so both a commit and a rollback release it and a crash
     # cannot hold it. Keyed on the job, so jobs never wait on each other.
-    db.execute(
-        _sa_text("SELECT pg_advisory_xact_lock(hashtext(:k))"),
-        {"k": f"skip_trace_enqueue:{job_id}"},
-    )
+    from src.workers.skip_trace_claim import lock_job_for_claim
+
+    lock_job_for_claim(db, job_id)
     # Re-read the leads under the lock. The set read before it is stale by now:
     # a concurrent enqueue may have claimed some of them, and the claim's own
     # join would drop those anyway, but re-reading keeps the cache-hit path from
@@ -2560,19 +2559,15 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config, *, on_begin=None) 
     # is what lets the action worker later write its dispositions in the same one.
     claimed_ids: list[str] = []
     if to_claim:
-        from src.workers.skip_trace_claim import claim_skip_trace_rows, warn_if_unenforced
+        from src.workers.skip_trace_claim import claim_skip_trace_rows
 
-        # require_enforcement=False, deliberately, and ONLY here. The scrape is
-        # the single writer of this queue today, so a missing index leaves it
-        # exactly where it was before 099 existed and risks nothing that was not
-        # already true -- while refusing would strand every lookup in the
-        # product, since start.sh starts the worker even when migrations fail.
-        # The Phase 1b-2 action worker is the SECOND writer and takes the
-        # default (True): two writers without the index really can buy one lead
-        # twice, and refusing costs only that action. The degradation is never
-        # silent either way.
-        warn_if_unenforced(db)
-        claimed_ids = claim_skip_trace_rows(db, to_claim, require_enforcement=False)
+        # Fails closed if migration 099's index is absent: raises, which
+        # tasks.py catches and logs, so the job still completes and its leads
+        # are still delivered. The leads stay 'not_attempted' and are claimed by
+        # the next run once the migration lands. That is a pause; proceeding
+        # unenforced would risk charging a customer twice for one lead, which
+        # trying again later cannot undo.
+        claimed_ids = claim_skip_trace_rows(db, to_claim)
         claimed = set(claimed_ids)
         for payload in to_claim:
             if str(payload["result_id"]) not in claimed:

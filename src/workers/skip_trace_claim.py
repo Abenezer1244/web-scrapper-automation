@@ -223,12 +223,34 @@ def _is_writable(payload: dict) -> bool:
     return payload.get("trace_type") in _TRACE_TYPES
 
 
-def claim_skip_trace_rows(
-    db,
-    payloads: list[dict],
-    *,
-    require_enforcement: bool = True,
-) -> list[str]:
+def lock_job_for_claim(db, job_id: str) -> None:
+    """Serialize every claimer of ONE job's leads. Transaction-scoped.
+
+    MANDATORY for any caller that decides a lead is eligible and then acts on
+    that decision -- which includes the cache-hit path, not just the claim. The
+    claim's own SQL makes the INSERT atomic, but copying a cached answer onto a
+    Result is an ORM write (phone/email are EncryptedString, so they cannot be
+    written as raw SQL without storing plaintext PII), and nothing in that write
+    can see another writer's uncommitted pending row. Two claimers of one job
+    must therefore not overlap at all.
+
+    Today's callers: the scrape enqueue and the backfill script. **Phase 1b-2's
+    contact-lookup action worker MUST call this too**, before its own
+    cache-and-claim pass, or it can queue a lead between the scrape's cache-hit
+    read and its commit -- leaving an active queue row while the Result is
+    overwritten as settled, which the dispatcher may submit and pay for before
+    the cancellation sweep collects it.
+
+    Transaction-scoped, so a commit and a rollback both release it and a crash
+    cannot hold it. Keyed on the job, so unrelated jobs never wait on each other.
+    """
+    db.execute(
+        text("SELECT pg_advisory_xact_lock(hashtext(:k))"),
+        {"k": f"skip_trace_enqueue:{job_id}"},
+    )
+
+
+def claim_skip_trace_rows(db, payloads: list[dict]) -> list[str]:
     """Claim `payloads` into the queue. Returns the result ids actually won.
 
     `payloads` are ``build_pending_row_payload`` dicts. A payload whose lead no
@@ -236,32 +258,27 @@ def claim_skip_trace_rows(
     simply not claimed -- the insert filters it, so it can neither fail the batch
     nor strand an active row nobody will settle.
 
-    `require_enforcement` decides what happens when migration 099's index is
-    absent, and the right answer differs by caller (Codex round 15 diff review,
-    round 2). The database is what stops one lead being claimed, and charged
-    for, twice; an error log is observability, not enforcement.
-
-    * The SCRAPE enqueue passes False. It is the ONLY writer of this queue
-      today, which is exactly the situation before 099 existed, and in that
-      situation a missing index risks nothing that is not already true -- while
-      refusing to claim would strand every lookup in the product because
-      `start.sh` deliberately starts the worker when migrations fail.
-    * The ACTION worker (Phase 1b-2) passes True, the default. It is the SECOND
-      writer, so without the index two writers really can buy the same lead
-      twice. It must refuse rather than risk a customer's money, and refusing
-      costs only that one action, which reports a clean failure and charges
-      nothing.
+    FAILS CLOSED, for every caller, when migration 099's index is missing or is
+    not the expected index. An earlier version let the scrape proceed anyway, on
+    the grounds that refusing would "strand every lookup in the product". The
+    Security Analyst was right to reject that, and the premise was wrong: a lead
+    that is not claimed stays 'not_attempted' and is picked up by the next run
+    once the migration lands. Refusing is a PAUSE, not a loss -- scrapes still
+    run and leads are still delivered; only the paid add-on waits. Against that,
+    proceeding unenforced risks charging a customer twice for one lead, which is
+    not recoverable by trying again later.
 
     Does NOT commit. The caller owns the transaction.
     """
     if not payloads:
         return []
 
-    if require_enforcement and not claim_enforcement_ok(db):
+    if not claim_enforcement_ok(db):
         raise ClaimUnenforcedError(
             f"{INDEX_NAME} is missing, invalid or not the expected index; refusing "
             "to claim, because nothing would stop this lead being charged for "
-            "twice. Apply migration 099."
+            "twice. Leads stay 'not_attempted' and are claimed by the next run "
+            "once migration 099 is applied."
         )
 
     # One claim is one tenant's work: the single tenant-scoped UPDATE that
@@ -326,13 +343,9 @@ def claim_skip_trace_rows(
     # the database -- not this module's idea of how a predicate renders -- is
     # what decides whether the index really arbitrates.
     #
-    # The scrape's fail-open path keeps the bare form, which needs no index and
-    # so degrades to pre-099 behaviour instead of stopping every lookup in the
-    # product when a migration fails.
+    # Named for every caller, since every caller now fails closed.
     conflict_sql = (
         f"ON CONFLICT (result_id) WHERE status IN ({_ACTIVE_SQL}) DO NOTHING"
-        if require_enforcement else
-        "ON CONFLICT DO NOTHING"
     )
 
     # Inserted ALREADY 'queued' -- an ACTIVE status, so the partial unique index
@@ -350,7 +363,14 @@ def claim_skip_trace_rows(
             f"SELECT {select_list}, 'queued' "
             f"FROM (VALUES {', '.join(rows_sql)}) "
             f"     AS v({', '.join(columns)}) "
+            # r.job_id = v.job_id as well as the tenant: the payload carries a
+            # job_id that is written onto the queue row, and a malformed one
+            # would produce a row tied to a job the lead does not belong to.
+            # The dispatcher's tenant-pinned joins would then ignore that row
+            # forever while the unique index blocked the legitimate claim --
+            # a lead that can never be looked up again.
             f"JOIN results r ON r.id = v.result_id AND r.user_id = v.user_id "
+            f"                AND r.job_id = v.job_id "
             f"WHERE r.user_id = CAST(:uid AS uuid) "
             f"  AND r.skip_trace_status = :claimable "
             f"{conflict_sql} "

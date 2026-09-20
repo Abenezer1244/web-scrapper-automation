@@ -74,12 +74,27 @@ def _lead(
     user_id: str, job_id: str, n: int, *, dup: bool = False, reason: str | None = None,
     status: str = "not_attempted", traced_days_ago: float | None = None,
     phone: str | None = None, email: str | None = None, source: str | None = None,
+    traced_first: str = "AVELINO", traced_last: str = "SAARENAS",
+    subject_hash: str | None = None,
 ) -> str:
     """A lead row. A non-duplicate claims its property for the account, exactly as the
-    worker's dedup claim does; a duplicate is flagged against an earlier claim."""
+    worker's dedup claim does; a duplicate is flagged against an earlier claim.
+
+    A SETTLED lead (hit/miss) also carries `skip_trace_subject_hash`, because since
+    098 every settled row does: ingest, the known-answer sweep and the enqueue cache
+    hit all record whose answer it is. Without it the row is a pre-098 row, which
+    fails closed and donates nothing. `traced_first` / `traced_last` override the
+    owner that answer was bought for, which is how the contamination cases seed a
+    DIFFERENT owner's contacts at the same property.
+    """
     rid = str(uuid.uuid4())
     attempted = (datetime.now(UTC) - timedelta(days=traced_days_ago)
                  if traced_days_ago is not None else None)
+    if subject_hash is None and status in ("hit", "miss"):
+        from src.scrapers.enrichment.skip_trace import lookup_subject_key
+        subject_hash = lookup_subject_key(
+            user_id, _address(n), "VANCOUVER", "WA", "normal", traced_first, traced_last,
+        )
     with system_sync_session() as db:
         db.add(Result(
             id=rid, job_id=job_id, user_id=user_id, party_name=_PARTY,
@@ -88,7 +103,7 @@ def _lead(
             dedup_hash=_hash(n), is_duplicate=dup,
             duplicate_reason=(reason or "prior_run") if dup else None,
             skip_trace_status=status, skip_trace_attempted_at=attempted,
-            skip_trace_source=source,
+            skip_trace_source=source, skip_trace_subject_hash=subject_hash,
             phone=phone, email=email,
             phones=[{"number": phone, "type": "Mobile"}] if phone else None,
             emails=[email] if email else None,
@@ -291,13 +306,13 @@ async def test_the_tenant_cache_answers_an_already_delivered_lead(
     """The address cache ingest writes is the other reuse path; a fresh entry is copied
     onto the already-delivered row with no pending row."""
     from src.db.models import SkipTraceCache
-    from src.scrapers.enrichment.skip_trace import address_cache_key
+    from src.scrapers.enrichment.skip_trace import lookup_subject_key
 
     first = _run(business_user.id, skip_on=False)
     _lead(business_user.id, first, 1)
     with system_sync_session() as db:
         db.add(SkipTraceCache(
-            address_hash=address_cache_key(business_user.id, _address(1), "VANCOUVER", "WA"),
+            address_hash=lookup_subject_key(business_user.id, _address(1), "VANCOUVER", "WA", "normal", "AVELINO", "SAARENAS"),
             phone="2065550133", phone_type="Mobile", email="cache@example.com",
             phones=[{"number": "2065550133", "type": "Mobile"}], emails=["cache@example.com"],
             fetched_at=datetime.now(UTC) - timedelta(days=2),
@@ -423,7 +438,7 @@ async def test_another_accounts_trace_is_never_copied(
     same parcel must be looked up for A, never handed B's phone and email: reuse and
     cache are both keyed by the account."""
     from src.db.models import SkipTraceCache, User
-    from src.scrapers.enrichment.skip_trace import address_cache_key
+    from src.scrapers.enrichment.skip_trace import lookup_subject_key
 
     other = await db.get(User, starter_user.id)
     other.plan = "business"
@@ -434,7 +449,7 @@ async def test_another_accounts_trace_is_never_copied(
           phone="2065550199", email="b-only@example.com")
     with system_sync_session() as s:
         s.add(SkipTraceCache(
-            address_hash=address_cache_key(other.id, _address(1), "VANCOUVER", "WA"),
+            address_hash=lookup_subject_key(other.id, _address(1), "VANCOUVER", "WA", "normal", "AVELINO", "SAARENAS"),
             phone="2065550199", email="b-only@example.com",
             fetched_at=datetime.now(UTC) - timedelta(days=1),
         ))
@@ -582,7 +597,7 @@ async def test_a_held_twin_takes_the_answer_when_it_lands_and_is_not_billed(
     """The twin's lookup landed (ingest wrote the tenant cache). The held row is settled
     from it on the next tick: contacts copied, pending row 'reused', nothing submitted."""
     from src.db.models import SkipTraceCache
-    from src.scrapers.enrichment.skip_trace import address_cache_key
+    from src.scrapers.enrichment.skip_trace import lookup_subject_key
 
     first = _run(business_user.id, skip_on=False, status="done")
     _lead(business_user.id, first, 1)
@@ -591,7 +606,7 @@ async def test_a_held_twin_takes_the_answer_when_it_lands_and_is_not_billed(
     held = _queue(business_user.id, again, dup, 1)
     with system_sync_session() as db:
         db.add(SkipTraceCache(
-            address_hash=address_cache_key(business_user.id, _address(1), "VANCOUVER", "WA"),
+            address_hash=lookup_subject_key(business_user.id, _address(1), "VANCOUVER", "WA", "normal", "AVELINO", "SAARENAS"),
             phone="2065550144", phone_type="Mobile", email="landed@example.com",
             phones=[{"number": "2065550144", "type": "Mobile"}], emails=["landed@example.com"],
             fetched_at=datetime.now(UTC) - timedelta(days=3),
@@ -634,7 +649,7 @@ async def test_another_accounts_lookup_never_holds_or_answers_mine(
     """Account B's lookup for the same address is at Tracerfy and B has a fresh cache
     entry for it. Account A's row is neither held behind B's nor answered from B's."""
     from src.db.models import SkipTraceCache, User
-    from src.scrapers.enrichment.skip_trace import address_cache_key
+    from src.scrapers.enrichment.skip_trace import lookup_subject_key
 
     other = await db.get(User, starter_user.id)
     other.plan = "business"
@@ -644,7 +659,7 @@ async def test_another_accounts_lookup_never_holds_or_answers_mine(
     _queue(other.id, b_run, b_lead, 1, status="submitted", submitted_days_ago=0.01)
     with system_sync_session() as s:
         s.add(SkipTraceCache(
-            address_hash=address_cache_key(other.id, _address(1), "VANCOUVER", "WA"),
+            address_hash=lookup_subject_key(other.id, _address(1), "VANCOUVER", "WA", "normal", "AVELINO", "SAARENAS"),
             phone="2065550155", email="b-only@example.com", fetched_at=datetime.now(UTC),
         ))
         s.commit()
@@ -729,6 +744,12 @@ async def test_an_answer_for_an_already_delivered_lead_bills_one_lookup_and_no_r
         s.add(PendingSkipTraceRow(
             job_id=again, result_id=dup, user_id=business_user.id,
             property_address=_address(1), city="VANCOUVER", state="WA",
+            # The names the row was actually submitted with, matching the stubbed
+            # CSV below and what build_pending_row_payload derives from _PARTY. A
+            # 'normal' trace never has NULL names in production (that combination
+            # is routed to 'advanced'), and since 098 the names are part of the
+            # cache key, so omitting them here would key the answer to nobody.
+            first_name="AVELINO", last_name="SAARENAS",
             trace_type="normal", status="submitted", submitted_at=datetime.now(UTC),
             tracerfy_queue_id=queue_id,
         ))
@@ -853,7 +874,34 @@ async def test_a_twin_stuck_at_an_unknown_outcome_holds_for_as_long_as_it_takes(
     assert _pending_status(stuck) == "submitting"
 
 
-def _cache(user_id: str, n: int, phone: str) -> None:
+def _cache(user_id: str, n: int, phone: str, *, first="AVELINO", last="SAARENAS") -> None:
+    """An answer this account already paid for, under the v2 subject key (098).
+
+    The key carries the OWNER, not just the address, so the default names match
+    what `_queue` writes and what `_PARTY` splits to. Pass different names to seed
+    a DIFFERENT owner's answer at the same address, which must not be reused.
+    """
+    from src.db.models import SkipTraceCache
+    from src.scrapers.enrichment.skip_trace import lookup_subject_key
+
+    with system_sync_session() as db:
+        db.add(SkipTraceCache(
+            address_hash=lookup_subject_key(
+                user_id, _address(n), "VANCOUVER", "WA", "normal", first, last,
+            ),
+            phone=phone, phone_type="Mobile", email=None,
+            phones=[{"number": phone, "type": "Mobile"}], emails=None,
+            fetched_at=datetime.now(UTC),
+        ))
+        db.commit()
+
+
+def _legacy_cache(user_id: str, n: int, phone: str) -> None:
+    """An answer cached under the PRE-098 address-only key.
+
+    Such a row cannot say whose answer it holds, which is the whole reason for the
+    cutover. Seeded only to prove that nothing reads it any more.
+    """
     from src.db.models import SkipTraceCache
     from src.scrapers.enrichment.skip_trace import address_cache_key
 

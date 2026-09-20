@@ -822,6 +822,17 @@ class Result(Base):
     # answered for this row; 'reused' = copied from this account's earlier answer, no
     # lookup bought. NULL = never settled, or settled before 097 (unknown).
     skip_trace_source = Column(String(16), nullable=True)
+    # WHICH OWNER a settled answer was bought for (migration 098): the v2
+    # lookup_subject_key (account + address + trace type + exact names). The
+    # duplicate-reuse passes join on dedup_hash = sha256(parcel|address), which
+    # carries no owner name, so without this an heir's lead inherits the deceased
+    # owner's phone. Recomputing the subject from party_name does NOT substitute
+    # for this column: party_name is mutated by owner recovery after the fact, and
+    # a recomputed source subject then reads as the CURRENT owner while the stored
+    # phone still belongs to the previous one. Recorded when known, never
+    # reconstructed. NULL = settled before 098 or never settled, and NULL fails
+    # closed: it neither donates PII nor receives it.
+    skip_trace_subject_hash = Column(String(64), nullable=True)
     # Sprint 6.4: cross-job deduplication
     dedup_hash = Column(String(64), nullable=True, index=True)
     is_duplicate = Column(Boolean, nullable=False, default=False)
@@ -1141,12 +1152,17 @@ class SkipTraceCache(Base):
     cache. If there's a hit less than 90 days old, the phone/email are copied
     directly to the Result row — no Tracerfy credit consumed.
 
-    PER-TENANT, not global. The key is a SHA-256 hash of (user_id, normalized
-    property address, city, state) — see skip_trace.address_cache_key. One
-    tenant never reads skip-traced PII another tenant paid Tracerfy to source
-    (cross-tenant reuse decision, 2026-06-10); a tenant re-scraping its OWN
-    address still hits its own cache. Minor formatting variations (punctuation,
-    whitespace, casing) collapse to the same key within a tenant.
+    PER-TENANT AND PER-SUBJECT. Since migration 098 the key is a SHA-256 hash of
+    (user_id, property address, city, state, trace_type, first name, last name) —
+    see skip_trace.lookup_subject_key. It identifies WHOSE answer this is, not
+    just where: the address-only key it replaced let a lead inherit the previous
+    owner's phone inside the 90-day window, which probate made likely (the
+    deceased owner is traced, an heir is scraped later). One tenant never reads
+    PII another tenant paid Tracerfy to source (cross-tenant reuse decision,
+    2026-06-10); a tenant re-scraping its OWN lead, same owner, still hits its own
+    cache. Case and whitespace collapse; punctuation does NOT, so a unit number
+    stays part of the address. Rows written before 098 use the legacy key and are
+    inert: nothing reads them.
 
     This docstring previously described the key as address-only, which is how it
     was built originally. A duplicate-scope audit (2026-09-08) read it, believed

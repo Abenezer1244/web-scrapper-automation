@@ -20,7 +20,9 @@ See docs/vendor/tracerfy-api.md for the full API reference.
 import csv
 import hashlib
 import io
+import json
 import re
+import unicodedata
 from datetime import UTC, datetime
 from urllib.parse import urlsplit
 
@@ -128,7 +130,20 @@ def address_cache_key(
     A tenant re-scraping its OWN address still hits its own cache (cost-saving
     within a tenant preserved). Minor formatting variations (punctuation,
     whitespace, casing) still collapse to the same key for a given tenant.
+
+    LEGACY as of the Phase 1a cutover (migration 098). This key carries no owner
+    name, so it cannot say WHOSE answer it holds, which is how an heir's lead came
+    to inherit the deceased owner's phone. Nothing in the runtime path may call it
+    any more: use `lookup_subject_key` (or the `pending_row_subject_key` /
+    `payload_subject_key` wrappers). It survives only for forensic inspection of
+    pre-cutover rows, and it logs every call so an unexpected legacy read or write
+    is visible in production rather than assumed absent.
     """
+    _logger.warning(
+        "LEGACY address_cache_key called: this key has no owner name and must not "
+        "be used for reuse after the 098 cutover. Expected only from an explicitly "
+        "forensic tool."
+    )
     parts = [
         str(user_id),
         _normalize_address(property_address),
@@ -137,6 +152,173 @@ def address_cache_key(
     ]
     joined = "|".join(parts)
     return hashlib.sha256(joined.encode("utf-8")).hexdigest()
+
+
+# ─── Lookup subject key (v2) ──────────────────────────────────────────────────
+#
+# `address_cache_key` above is the LEGACY key. It hashes the address and no owner
+# name, so inside the 90-day window one address has exactly one answer — and a
+# lead can inherit the previous owner's phone. Probate makes that likely: the
+# deceased owner is traced first, an heir is scraped later, and the heir's lead
+# is served the dead owner's contacts.
+#
+# v2 hashes the SUBJECT that was actually sent to the provider: the account, the
+# address, the trace type and the exact names. It is a separate namespace, so a
+# legacy row can never be read as a v2 answer and the two can coexist while the
+# old rows age out. Nothing reads the legacy key after the cutover.
+#
+# What this key deliberately does NOT do is decide what goes out in one batch.
+# Provider attribution is address-only, and it refuses a whole group when two
+# answers come back for one address, so submission is serialized separately by
+# `submission_collision_key` below. Keeping those two jobs in one key is what
+# made the address-only design look sufficient.
+
+_LOOKUP_KEY_VERSION = 2
+
+# The pending row stores these values truncated to the column widths, and the
+# cache READ runs before that row exists. Hash what the insert WILL store, so the
+# read and the later write hash identical bytes. Without this a name or a city
+# longer than the column silently keys two different answers and the trace is
+# re-paid — the same bug the comment at tasks_helpers/enrich.py:2354 records for
+# the address column, now reachable through the names that v2 adds.
+_SUBJECT_ADDRESS_MAX = 512
+_SUBJECT_FIELD_MAX = 128
+
+
+def _normalize_subject_text(value: str | None, limit: int) -> str | None:
+    """Normalize one subject field. None stays None; '' stays '' (distinct values).
+
+    NFKC, collapse Unicode whitespace, trim, case-fold. Punctuation is PRESERVED
+    and no equivalence is invented: no middle-initial folding, no de-hyphenation,
+    no stripping of diacritics, and '#' is kept, so '123 Main #2' and '123 Main 2'
+    stay two different units rather than being quietly merged.
+
+    Truncation happens FIRST, against the raw value, because that is what the
+    pending-row insert truncates; normalizing first could change the length and
+    move the cut.
+    """
+    if value is None:
+        return None
+    raw = str(value)[:limit]
+    text = unicodedata.normalize("NFKC", raw)
+    text = " ".join(text.split())  # collapses every Unicode space, and trims
+    return text.casefold()
+
+
+def lookup_subject_key(
+    user_id: str,
+    property_address: str | None,
+    city: str | None,
+    state: str | None,
+    trace_type: str,
+    first_name: str | None = None,
+    last_name: str | None = None,
+) -> str:
+    """SHA-256 of the exact subject a lookup was (or would be) bought for.
+
+    Serialization is unambiguous rather than delimiter-joined: a JSON array over a
+    fixed field order, so no value can impersonate a field boundary by containing
+    the delimiter. A missing name is JSON null and an empty string is a distinct
+    value.
+
+    An ADVANCED trace sends no name at all, so its names are forced to null here
+    regardless of what the caller passed. That is what makes an advanced answer
+    reusable per address (owner decision D1, 2026-09-19: owner isolation does not
+    apply to it, because no name was ever sent) while never colliding with a
+    normal trace whose name merely happens to be missing — `trace_type` is in the
+    key, so normal never reuses advanced and advanced never reuses normal.
+
+    The account is the outermost identity: `user_id` is in the hash, so one
+    tenant never reads the PII another tenant paid for.
+    """
+    if trace_type not in ("normal", "advanced"):
+        raise ValueError(f"unknown trace_type {trace_type!r}")
+    if trace_type == "advanced":
+        # Not a caller convenience: the payload and `party_name` may both carry a
+        # name that was never sent, and hashing it would split one bought answer
+        # into two keys and re-pay for it.
+        first_name = last_name = None
+    parts = [
+        _LOOKUP_KEY_VERSION,
+        str(user_id),
+        _normalize_subject_text(property_address, _SUBJECT_ADDRESS_MAX),
+        _normalize_subject_text(city, _SUBJECT_FIELD_MAX),
+        _normalize_subject_text(state, _SUBJECT_FIELD_MAX),
+        trace_type,
+        _normalize_subject_text(first_name, _SUBJECT_FIELD_MAX),
+        _normalize_subject_text(last_name, _SUBJECT_FIELD_MAX),
+    ]
+    payload = json.dumps(parts, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def submission_collision_key(
+    property_address: str | None,
+    city: str | None,
+    state: str | None,
+    trace_type: str,
+) -> str:
+    """What may not go out twice in ONE provider batch. NOT a reuse key.
+
+    The provider echoes an address back and nothing else, so `tracerfy_ingest`
+    attributes answers on (address, city, state) and REFUSES the whole group when
+    more than one answer arrives for one address — there is no sound way to say
+    which answer belongs to which lead. Two subjects at one address in one batch
+    therefore come back as two CSV rows, get refused together, and are charged
+    with nothing to show for it.
+
+    So the dispatcher keeps one address per batch even though v2 now considers
+    those rows different subjects; the second goes out on a later tick, once the
+    first has settled and its answer is in the cache.
+
+    Deliberately GLOBAL, with no `user_id`: attribution carries no tenant
+    identifier either, so a cross-tenant pair at one address is refused exactly
+    the same way and must be serialized exactly the same way.
+    """
+    parts = [
+        "submission-v1",  # own namespace: can never equal a lookup_subject_key
+        _normalize_subject_text(property_address, _SUBJECT_ADDRESS_MAX),
+        _normalize_subject_text(city, _SUBJECT_FIELD_MAX),
+        _normalize_subject_text(state, _SUBJECT_FIELD_MAX),
+        trace_type,
+    ]
+    payload = json.dumps(parts, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def pending_row_subject_key(row) -> str:
+    """The v2 key for a pending row, from the row's OWN stored fields.
+
+    One definition for the dispatcher and the ingest, so the two can never
+    disagree about which answer a row is waiting for. Never recomputed from
+    `party_name`: the pending row records what was actually sent.
+    """
+    return lookup_subject_key(
+        row.user_id,
+        row.property_address,
+        row.city,
+        row.state,
+        row.trace_type,
+        row.first_name,
+        row.last_name,
+    )
+
+
+def payload_subject_key(user_id: str, payload: dict) -> str:
+    """The v2 key for a payload built by `build_pending_row_payload`.
+
+    Used by the enqueue cache read, which runs BEFORE the pending row exists.
+    Same fields, same truncation, so the read and the later ingest write agree.
+    """
+    return lookup_subject_key(
+        user_id,
+        payload["property_address"],
+        payload["city"],
+        payload["state"],
+        payload["trace_type"],
+        payload["first_name"],
+        payload["last_name"],
+    )
 
 
 # ─── Name splitter ────────────────────────────────────────────────────────────
@@ -796,36 +978,6 @@ def download_tracerfy_csv(download_url: str) -> str:
     return resp.text
 
 
-def legacy_cache_locality(result) -> tuple[str | None, str | None]:
-    """The (city, state) `build_pending_row_payload` produced BEFORE the
-    structured-situs fallback was added (2026-09-03).
-
-    `address_cache_key` hashes (user_id, street, city, state), so changing where
-    the locality comes from CHANGES THE KEY — and a missed key means re-paying
-    Tracerfy for an address already bought. The change is real for absentee
-    owners: the property sits in PUYALLUP while the owner's mail goes to
-    SEATTLE, so the old precedence keyed the row under the OWNER's city and the
-    new one keys it under the PROPERTY's. (The new precedence is the correct
-    one — Tracerfy traces by property address, so a Puyallup street under a
-    Seattle city was simply a wrong address — but the old rows are already paid
-    for.) This reproduces the OLD precedence so the enqueue path can look under
-    the old key before spending money. Deliberately ignores the structured
-    situs columns: that is exactly what made it "legacy".
-
-    Kept beside build_pending_row_payload, and using the same parser, so the two
-    spellings of the rule cannot drift apart.
-    """
-    # legacy=True on purpose: this key must stay byte-identical to the one the
-    # already-PAID row was cached under, including the states the old parser
-    # invented. Parsing it correctly here would miss that row and re-buy it.
-    parsed = _parse_full_address(result.property_address, legacy=True)
-    if not parsed["city"] and result.mailing_address:
-        mail = _parse_full_address(result.mailing_address, legacy=True)
-        if mail["city"]:
-            return mail["city"], mail["state"]
-    return parsed["city"], parsed["state"]
-
-
 # enrichment_data.source of the code-violation scrapers (king_wa_code_violation and its
 # king_cv_sources adapters, pierce_wa_code_violation).
 _KING_CODE_VIOLATION_SOURCES = frozenset({king_cv_sources.SEATTLE_SDCI, king_cv_sources.BELLEVUE,
@@ -1110,10 +1262,12 @@ def _parse_full_address(addr: str, *, legacy: bool = False) -> dict:
     shape, so the whole string stays in `street` (`is_foreign_address`). A
     rejected state never costs the ZIP — the ZIP is lifted independently.
 
-    `legacy=True` reproduces the pre-fix behaviour BYTE FOR BYTE. It exists only
-    for `legacy_cache_locality`: an already-PAID trace is cached under the key the
-    old parse produced, and re-parsing it correctly would miss that row and buy it
-    a second time. Never use it on a new payload.
+    `legacy=True` reproduces the pre-fix behaviour BYTE FOR BYTE. It has NO caller
+    left: its only consumer was `legacy_cache_locality`, which existed to look up
+    the pre-098 address-only cache key and was deleted with that read path, since
+    a key with no owner name cannot say whose answer it holds. The branch is kept
+    for now only so the old parse stays describable while pre-cutover rows age
+    out; it is dead code and should go with them. Never use it on a new payload.
     """
     result = {"street": None, "city": None, "state": None, "zip": None}
     if not addr:

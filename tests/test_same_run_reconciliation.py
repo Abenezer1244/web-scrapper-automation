@@ -459,22 +459,39 @@ async def test_a_duplicate_reuse_never_copies_contacts_onto_an_atip_named_tacoma
     from datetime import UTC, datetime
 
     from src.config import settings
+    from src.scrapers.enrichment.skip_trace import lookup_subject_key
 
     atip = {"source": "tacoma_code_violations", "owner_source": "pierce_atip",
             "owner_pin": "2021110133", "owner_status": "matched"}
     first_job = await _job(db, starter_user, scraper_config)
     rerun = await _job(db, starter_user, scraper_config)
     h = _strong("2021110133", "2117 AVE S")
+    # An entity name routes to an ADVANCED trace (no name is sent), and a row is
+    # only traceable at all with a resolvable city/state, so both rows carry one.
+    # Since 098 the source also carries the subject its answer was bought for:
+    # without it the source is a pre-098 row that donates to nobody, and this
+    # test would go green without ever reaching the ATIP policy.
+    subject = lookup_subject_key(
+        starter_user.id, "2117 AVE S", "TACOMA", "WA", "advanced", None, None,
+    )
     traced = await _row(db, first_job, starter_user.id, h, parcel_id="2021110133",
                         property_address="2117 AVE S", party_name="TACOMA TOWN CENTER LLC",
+                        property_city="TACOMA", property_state="WA",
                         enrichment_data=atip, phone="2535550100", email="a@b.test",
-                        skip_trace_status="hit", skip_trace_attempted_at=datetime.now(UTC))
+                        skip_trace_status="hit", skip_trace_attempted_at=datetime.now(UTC),
+                        skip_trace_subject_hash=subject)
     duplicate = await _row(db, rerun, starter_user.id, h, parcel_id="2021110133",
                            property_address="2117 AVE S", party_name="TACOMA TOWN CENTER LLC",
+                           property_city="TACOMA", property_state="WA",
                            enrichment_data=atip, skip_trace_status="not_attempted",
                            is_duplicate=True)
     await _claim(db, starter_user.id, h, traced, first_job)
 
+    # Two independent gates now refuse this while the switch is off: the SQL ATIP
+    # predicate, and the subject gate (code_violation_skip_trace_allowed makes
+    # build_pending_row_payload decline, so the target has no subject to match).
+    # The switch-on half below is what proves the copy is otherwise possible, so
+    # neither half passes for want of a reachable code path.
     assert await _reuse(db, rerun, starter_user.id) == 1
     row = await _fresh(db, duplicate)
     assert (row.phone, row.email) == (None, None)

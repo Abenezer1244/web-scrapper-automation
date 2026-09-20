@@ -94,7 +94,12 @@ def main():
             # We only have the combined property_address here, so we try the
             # full string first; if that misses we fall back to a broad scan by
             # matching phone digits against any cache raw_response.
-            key = address_cache_key(r.user_id, r.property_address, None, None)
+            # Post-098 the row records the exact key its answer was cached under,
+            # so use it. The legacy address-only key is the fallback for rows
+            # settled BEFORE 098, which is forensics on historical data and never
+            # a reuse decision: nothing is written here.
+            key = r.skip_trace_subject_hash or address_cache_key(
+                r.user_id, r.property_address, None, None)
             cache = db.get(SkipTraceCache, key)
 
             raw = cache.raw_response if cache else None

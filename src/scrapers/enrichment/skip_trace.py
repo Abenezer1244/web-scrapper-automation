@@ -130,7 +130,20 @@ def address_cache_key(
     A tenant re-scraping its OWN address still hits its own cache (cost-saving
     within a tenant preserved). Minor formatting variations (punctuation,
     whitespace, casing) still collapse to the same key for a given tenant.
+
+    LEGACY as of the Phase 1a cutover (migration 098). This key carries no owner
+    name, so it cannot say WHOSE answer it holds, which is how an heir's lead came
+    to inherit the deceased owner's phone. Nothing in the runtime path may call it
+    any more: use `lookup_subject_key` (or the `pending_row_subject_key` /
+    `payload_subject_key` wrappers). It survives only for forensic inspection of
+    pre-cutover rows, and it logs every call so an unexpected legacy read or write
+    is visible in production rather than assumed absent.
     """
+    _logger.warning(
+        "LEGACY address_cache_key called: this key has no owner name and must not "
+        "be used for reuse after the 098 cutover. Expected only from an explicitly "
+        "forensic tool."
+    )
     parts = [
         str(user_id),
         _normalize_address(property_address),

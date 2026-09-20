@@ -822,6 +822,17 @@ class Result(Base):
     # answered for this row; 'reused' = copied from this account's earlier answer, no
     # lookup bought. NULL = never settled, or settled before 097 (unknown).
     skip_trace_source = Column(String(16), nullable=True)
+    # WHICH OWNER a settled answer was bought for (migration 098): the v2
+    # lookup_subject_key (account + address + trace type + exact names). The
+    # duplicate-reuse passes join on dedup_hash = sha256(parcel|address), which
+    # carries no owner name, so without this an heir's lead inherits the deceased
+    # owner's phone. Recomputing the subject from party_name does NOT substitute
+    # for this column: party_name is mutated by owner recovery after the fact, and
+    # a recomputed source subject then reads as the CURRENT owner while the stored
+    # phone still belongs to the previous one. Recorded when known, never
+    # reconstructed. NULL = settled before 098 or never settled, and NULL fails
+    # closed: it neither donates PII nor receives it.
+    skip_trace_subject_hash = Column(String(64), nullable=True)
     # Sprint 6.4: cross-job deduplication
     dedup_hash = Column(String(64), nullable=True, index=True)
     is_duplicate = Column(Boolean, nullable=False, default=False)

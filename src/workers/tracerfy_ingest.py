@@ -298,10 +298,19 @@ def _attribution_is_safe(matches: list, n_csv_rows_for_key: int) -> bool:
 
     Names are normalised before comparison so case or padding differences cause
     neither a false refusal nor a false match.
+
+    Trace type is checked too (round 14). The dispatcher submits one trace_type
+    per batch, so a mixed group should be impossible; this fails CLOSED if that
+    ever stops holding (corrupt or hand-written queue rows), because a normal
+    answer and an advanced answer are different purchases and must not be merged
+    onto one another's leads. Under v2 they are also different cache keys, so
+    silently treating them as one group would write the wrong subject's answer.
     """
     if len(matches) <= 1:
         return True
     if n_csv_rows_for_key > 1:
+        return False
+    if len({(p.trace_type or "") for p in matches}) > 1:
         return False
     owners = {
         (
@@ -473,9 +482,9 @@ def ingest_tracerfy_batch(
     from src.db.session import system_sync_session
     from src.scrapers.enrichment.skip_trace import (
         TracerfyError,
-        address_cache_key,
         download_tracerfy_csv,
         ingest_webhook_csv,
+        pending_row_subject_key,
     )
 
     # REDTEAM T3: refuse to fetch a forged/body-supplied download_url that
@@ -662,31 +671,31 @@ def ingest_tracerfy_batch(
                 miss_count += 1
 
             # Cache the result for 90-day reuse (Sprint 4).
-            # Key off OUR canonical pending-row address (the same fields the READ
-            # path in tasks._enqueue_skip_trace_rows hashes), NOT Tracerfy's echoed
+            # Key off OUR canonical pending-row fields (the same ones the READ path
+            # in tasks._enqueue_skip_trace_rows hashes), NOT Tracerfy's echoed
             # csv_row address. Tracerfy may USPS-standardize the street (e.g.
-            # "St" -> "STREET"), which address_cache_key does NOT collapse, so a
-            # csv-keyed write would never match our GIS address on a later run ->
-            # 0 cache hits -> the same lead re-paid every scrape. pending_by_key
-            # groups by (address, city, state), so all `matches` share this key.
+            # "St" -> "STREET"), which the key does NOT collapse, so a csv-keyed
+            # write would never match our GIS address on a later run -> 0 cache
+            # hits -> the same lead re-paid every scrape.
             # PER-TENANT cache (cross-tenant reuse removed 2026-06-10): a Tracerfy
-            # batch can contain pending rows from MULTIPLE tenants for the same
-            # address, so write one cache row per distinct tenant — each keyed by
-            # its own user_id — so a tenant later reuses only ITS OWN result, never
-            # another tenant's. All `matches` share the address group, so the
-            # address fields come from matches[0]; only user_id varies.
-            _addr = matches[0]
-            _seen_users: set[str] = set()
+            # batch can contain pending rows from MULTIPLE tenants, and user_id is
+            # inside the key, so a tenant later reuses only ITS OWN result.
+            # v2 (migration 098): key each write on the SUBJECT of the row that
+            # bought it, from that row's OWN stored fields. Two changes from the
+            # address-only version, both required:
+            #   - dedup on the COMPUTED KEY, not on user_id. Under v2 one tenant
+            #     can legitimately have two subjects in this group, and deduping
+            #     by tenant would write only the first and silently drop the
+            #     second, re-paying for it on the next run (round 14).
+            #   - each row's own address fields, not matches[0]'s. v2 preserves
+            #     punctuation and field boundaries, so borrowing another row's
+            #     formatting no longer produces the same key.
+            _seen_keys: set[str] = set()
             for _pend in matches:
-                if _pend.user_id in _seen_users:
+                cache_key = pending_row_subject_key(_pend)
+                if cache_key in _seen_keys:
                     continue
-                _seen_users.add(_pend.user_id)
-                cache_key = address_cache_key(
-                    _pend.user_id,
-                    _addr.property_address or "",
-                    _addr.city or "",
-                    _addr.state or "",
-                )
+                _seen_keys.add(cache_key)
                 existing_cache = db.get(SkipTraceCache, cache_key)
                 if existing_cache:
                     existing_cache.phone = phone
@@ -727,6 +736,12 @@ def ingest_tracerfy_batch(
                         skip_trace_status="hit" if is_hit else "miss",
                         skip_trace_attempted_at=now,
                         skip_trace_source="lookup",  # Tracerfy answered this row
+                        # WHOSE answer this is (098), from the row that was
+                        # actually submitted. This is the only moment the subject
+                        # is known for certain: party_name on the lead may be
+                        # rewritten by owner recovery afterwards, at which point a
+                        # recomputed subject would name the wrong owner.
+                        skip_trace_subject_hash=pending_row_subject_key(p),
                     )
                 )
                 db.execute(

@@ -381,11 +381,17 @@ async def test_ambiguous_owner_attribution_is_refused_not_guessed(starter_user, 
 
 
 class _P:
-    """Minimal pending-row stand-in for the attribution guard."""
+    """Minimal pending-row stand-in for the attribution guard.
 
-    def __init__(self, first=None, last=None):
+    `trace_type` is part of the shape because the guard reads it: a normal answer
+    and an advanced answer are different purchases (and, since 098, different
+    cache keys), so a mixed group must not be treated as one.
+    """
+
+    def __init__(self, first=None, last=None, trace_type="normal"):
         self.first_name = first
         self.last_name = last
+        self.trace_type = trace_type
 
 
 class TestAttributionGuard:
@@ -416,6 +422,15 @@ class TestAttributionGuard:
 
     def test_null_and_named_owner_together_is_refused(self):
         assert _attribution_is_safe([_P(), _P("JANE", "DOE")], 1) is False
+
+    def test_mixed_trace_types_are_refused(self):
+        """Round 14. The dispatcher sends one trace_type per batch, so this group
+        should be impossible; the guard fails closed if that ever stops holding.
+        Same owner, so the name check alone would have waved it through, and the
+        two rows key to two different cache entries under 098."""
+        assert _attribution_is_safe(
+            [_P("JANE", "DOE", "normal"), _P("JANE", "DOE", "advanced")], 1
+        ) is False
 
 
 @pytest.mark.asyncio

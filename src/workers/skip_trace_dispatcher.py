@@ -568,12 +568,37 @@ _CLAIM_LOCK_KEY = 7_220_915_018
 
 def _answer_key(row) -> str:
     """The per-tenant identity of the answer a pending row would buy: the exact key
-    tracerfy_ingest writes it under (address_cache_key over the pending row's own
-    address, city and state). Two rows with one key buy one answer."""
-    from src.scrapers.enrichment.skip_trace import address_cache_key
+    tracerfy_ingest writes it under (v2 lookup_subject_key over the pending row's
+    OWN stored fields). Two rows with one key buy one answer.
 
-    return address_cache_key(
-        row.user_id, row.property_address or "", row.city or "", row.state or "",
+    v2 (migration 098): the subject, not the address alone. The row records what
+    was actually sent to the provider — address, trace type and the exact names —
+    so two owners at one address are two answers and neither can be served the
+    other's contacts.
+    """
+    from src.scrapers.enrichment.skip_trace import pending_row_subject_key
+
+    return pending_row_subject_key(row)
+
+
+def _submission_key(row) -> str:
+    """What may not go out twice in ONE batch. NOT the answer key (round 14, 14-A).
+
+    These are two different questions and the address-only design answered both
+    with one key, which is why splitting them is easy to get wrong. The provider
+    echoes back an address and nothing else, so `tracerfy_ingest` attributes on
+    (address, city, state) and REFUSES the whole group when two answers arrive for
+    one address. Under v2 two owners at one address are two subjects, so without
+    this they would go out together, come back as two CSV rows, be refused
+    together, and be charged with nothing to show for it.
+
+    Global, no tenant: attribution has no tenant identifier either, so a
+    cross-tenant pair at one address is refused exactly the same way.
+    """
+    from src.scrapers.enrichment.skip_trace import submission_collision_key
+
+    return submission_collision_key(
+        row.property_address, row.city, row.state, row.trace_type,
     )
 
 
@@ -672,6 +697,13 @@ def _settle_queued_from_known_answers(db) -> int | None:
                     # restart it (Master Review 2026-09-18).
                     "skip_trace_attempted_at": answer.fetched_at,
                     "skip_trace_source": "reused",  # no lookup bought for this row
+                    # WHOSE answer this is (098): the subject of the pending row
+                    # that is being settled, which is the key the answer was found
+                    # under. Recorded now because it cannot be recovered later —
+                    # party_name is rewritten by owner recovery, and a recomputed
+                    # subject would name the current owner while these contacts
+                    # belong to the previous one.
+                    "skip_trace_subject_hash": keys[p.id],
                 }
             else:
                 values = {"skip_trace_status": "errored", "skip_trace_attempted_at": now}
@@ -734,6 +766,17 @@ def _hold_answers_in_flight(db, rows: list) -> tuple[list, int]:
 
     from src.db.models import PendingSkipTraceRow
 
+    # The in-flight hold stays on the SUBJECT key and stays scoped to the tenants
+    # in this batch: it exists so an account does not buy an answer it is already
+    # buying, and one account's lookup must never hold (or answer) another's.
+    #
+    # It deliberately does NOT hold on the address. The attribution collision that
+    # `_submission_key` guards is scoped to ONE batch -- `tracerfy_ingest` selects
+    # its pending rows by `tracerfy_queue_id`, so rows in two different batches are
+    # never weighed against each other and cannot make each other unattributable.
+    # Holding across batches would buy nothing and would put one tenant behind
+    # another tenant's lookup, which is exactly what
+    # test_another_accounts_lookup_never_holds_or_answers_mine forbids.
     in_flight = {
         _answer_key(p)
         for p in db.execute(
@@ -750,11 +793,22 @@ def _hold_answers_in_flight(db, rows: list) -> tuple[list, int]:
     answered = _fresh_answers(db, {_answer_key(r) for r in rows})
     keep: list = []
     seen: set[str] = set()
+    seen_addresses: set[str] = set()
     for row in rows:
         key = _answer_key(row)
         if key in in_flight or key in answered or key in seen:
             continue
+        # Same address already going out IN THIS BATCH, even for a different owner
+        # and even for a different tenant: hold it. Two answers for one address
+        # make _attribution_is_safe refuse the whole group, so sending both would
+        # pay twice and answer nobody. This row stays 'queued' and goes out on a
+        # later tick — and if the first answer lands in the cache meanwhile, the
+        # known-answer sweep settles this one for free instead.
+        addr_key = _submission_key(row)
+        if addr_key in seen_addresses:
+            continue
         seen.add(key)
+        seen_addresses.add(addr_key)
         keep.append(row)
     return keep, len(rows) - len(keep)
 

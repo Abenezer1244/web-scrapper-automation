@@ -189,9 +189,11 @@ class PierceWAARMSScraper(BridgeScraper):
     async def scrape(self, date_from: str, date_to: str) -> list[ScrapedRecord]:
         _logger.info("Pierce WA %s — scraping %s to %s", self.DOC_TYPE_LABEL, date_from, date_to)
 
+        self.report_stage("connecting")
         await self._accept_disclaimer()
         await self.navigate(_ARMS_SEARCH)
         await self._fill_search_form(date_from, date_to)
+        self.report_stage("searching")
 
         all_records: list[ScrapedRecord] = []
         seen_hashes: set[str] = set()

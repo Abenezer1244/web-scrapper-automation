@@ -196,3 +196,47 @@ def test_an_empty_observation_writes_nothing():
     with SyncSessionLocal() as db:
         job = _job_row(db)
         assert _set_progress(db, job, expected_started_at=job.started_at) is False
+
+
+# ─── Every connector says what it is doing ───────────────────────────────────
+
+def test_every_live_connector_reports_a_stage():
+    """A connector that never calls report_stage() sits on the worker's coarse
+    "connecting" label for its entire run, however long that is.
+
+    That was the state of 7 of the 10 connectors after the first pass: honest, but
+    it meant a Snohomish run showed one label from start to finish. This is the
+    test that fails when a NEW connector is added without one, which is the only
+    way that gap comes back.
+
+    Walks the registry's module allowlist rather than a list written here, so a
+    connector added tomorrow is covered without anyone remembering this file.
+    """
+    import importlib
+    import inspect
+
+    from src.scrapers.base_scraper import BridgeScraper
+    from src.scrapers.registry import _ALLOWED_SCRAPER_MODULES
+
+    missing = []
+    checked = []
+    for mod_name in sorted(_ALLOWED_SCRAPER_MODULES):
+        if mod_name.endswith("base_scraper"):
+            continue  # the base defines report_stage; it does not scrape
+        mod = importlib.import_module(mod_name)
+        for _, cls in inspect.getmembers(mod, inspect.isclass):
+            if not issubclass(cls, BridgeScraper) or cls is BridgeScraper:
+                continue
+            if cls.__module__ != mod_name:
+                continue  # imported from elsewhere; checked with its own module
+            if "scrape" not in cls.__dict__:
+                continue  # inherits scrape(), so its parent's call covers it
+            checked.append(cls.__name__)
+            if "report_stage(" not in inspect.getsource(cls.__dict__["scrape"]):
+                missing.append(cls.__name__)
+
+    assert checked, "walked the allowlist and found no connectors — the walk is wrong"
+    assert not missing, (
+        "these connectors never report a stage, so the Live Run page shows one "
+        f"label for their whole run: {sorted(set(missing))}"
+    )

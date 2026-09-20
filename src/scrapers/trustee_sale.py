@@ -257,6 +257,7 @@ class _TrusteeSaleScraper(BridgeScraper):
         # window means "auctions in the next 90 days". date_recorded then always falls
         # inside the window the user asked for, instead of provably outside it. An
         # unparseable/absent window keeps the old behavior (every upcoming auction).
+        self.report_stage("searching")
         today = auction_reference_date()   # county-local, not UTC — see lead_signals
         span = _window_span_days(date_from, date_to)
         horizon = today + timedelta(days=span) if span is not None else None

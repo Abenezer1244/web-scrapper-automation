@@ -150,6 +150,7 @@ class PierceWACodeViolationScraper(BridgeScraper):
 
     async def scrape(self, date_from: str, date_to: str) -> list[ScrapedRecord]:
         """Fetch code violations from ArcGIS API for the given date range."""
+        self.report_stage("searching")
         # Parse dates (MM/DD/YYYY format from the job system)
         start = datetime.strptime(date_from, "%m/%d/%Y")
         end = datetime.strptime(date_to, "%m/%d/%Y")

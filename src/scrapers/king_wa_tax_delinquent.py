@@ -516,6 +516,7 @@ class KingWATaxDelinquentScraper(BridgeScraper):
             offset += _PAGE_SIZE
 
     async def scrape(self, date_from: str, date_to: str) -> list[ScrapedRecord]:
+        self.report_stage("searching")
         start_year = datetime.strptime(date_from, "%m/%d/%Y").year
         end_year = datetime.strptime(date_to, "%m/%d/%Y").year
 

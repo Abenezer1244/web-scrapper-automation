@@ -190,6 +190,7 @@ class SnohomishWAPreForeclosureScraper(BridgeScraper):
         # results-query / Lists layer (date_recorded_parsed), not at scrape-insert.
         del date_from, date_to
 
+        self.report_stage("searching")
         pdf_url = _discover_pdf_url()
         if not pdf_url:
             raise RuntimeError("Snohomish Tribune: no current legals PDF found (page layout/source change)")

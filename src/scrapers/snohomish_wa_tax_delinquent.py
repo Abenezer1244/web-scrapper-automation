@@ -840,6 +840,7 @@ class SnohomishWATaxDelinquentScraper(BridgeScraper):
         # is derived from the file's own tax-year vs as-of-year, not a date range.
         del date_from, date_to
 
+        self.report_stage("searching")
         landing = safe_get(
             _LANDING_URL,
             require_allowlisted=True,

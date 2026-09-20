@@ -1890,6 +1890,30 @@
             ],
             "title": "Last Heartbeat At"
           },
+          "last_progress_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Progress At"
+          },
+          "next_retry_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Retry At"
+          },
           "page_current": {
             "title": "Page Current",
             "type": "integer"
@@ -1925,6 +1949,17 @@
             "title": "Progress Stalled",
             "type": "boolean"
           },
+          "progress_unit": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Progress Unit"
+          },
           "record_count": {
             "title": "Record Count",
             "type": "integer"
@@ -1939,6 +1974,17 @@
               }
             ],
             "title": "Record Type"
+          },
+          "records_found": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Records Found"
           },
           "retry_count": {
             "title": "Retry Count",
@@ -1963,6 +2009,51 @@
               }
             ],
             "title": "Scraper Name"
+          },
+          "stage": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stage"
+          },
+          "stage_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stage Label"
+          },
+          "stage_seconds": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stage Seconds"
+          },
+          "stage_started_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stage Started At"
           },
           "started_at": {
             "anyOf": [
@@ -1993,6 +2084,28 @@
           "trigger": {
             "title": "Trigger",
             "type": "string"
+          },
+          "units_done": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Units Done"
+          },
+          "units_total": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Units Total"
           },
           "user_id": {
             "title": "User Id",

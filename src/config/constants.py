@@ -116,6 +116,45 @@ STUCK_STARTED_AT_FALLBACK_MINUTES: int = 70
 ZOMBIE_UNSTARTED_MINUTES: int = 10
 
 
+# ─── Job stages (migration 098) ───────────────────────────────────────────────
+# `status` is the state machine the watchdog, the billing CAS and the cancel
+# endpoint all arbitrate on, so it stays coarse and must not grow. `stage` is the
+# separate, purely descriptive answer to "what is the worker doing RIGHT NOW",
+# which `status` cannot give: `scraping` covered 401 silent seconds of the one run
+# we traced, and `enriching` covers saving, deduping, exporting, address lookup and
+# contact queueing all at once.
+#
+# These are REAL boundaries in run_scrape_job, not a designed pipeline. They do
+# NOT run in a fixed order and they REPEAT: the CSV export runs before enrichment
+# and the scrapers do their own parcel lookup mid-scrape. Nothing may infer
+# "step N of M" from this tuple.
+#
+# There is deliberately no `delivering`: email and webhook dispatch happen AFTER
+# the job is `done` and after the terminal SSE event, so a stage write there would
+# be refused by the terminal guard and would have no stream left to reach.
+#
+# Free text at the DB (like `trigger`) so adding one is a code change, not a
+# migration on a hot table. This tuple is what the app actually writes, and
+# src/api/schemas.py keys its user-facing copy off it — keep them in step.
+JOB_STAGES: tuple[str, ...] = (
+    "preparing",         # config, connector and entitlement resolution
+    "connecting",        # browser launch, disclaimer, captcha: the long silent one
+    "searching",         # query submitted, nothing counted back yet
+    "scraping",          # pulling result units, counters moving
+    "saving",            # persisting scraped rows
+    "deduping",          # duplicate check against prior deliveries
+    "exporting",         # building + uploading the CSV
+    "enriching",         # property and mailing address lookup
+    "queuing_contacts",  # skip-trace ENQUEUE only; the provider answers later
+    "finalizing",        # billing settle + terminal transition
+)
+
+# What one unit of `units_done` / `units_total` IS. The UI renders this word, so a
+# scraper that pages must not report its parcels as "pages" (Pierce did). NULL
+# unit = unknown work shape; the UI then stays indeterminate rather than guessing.
+JOB_PROGRESS_UNITS: tuple[str, ...] = ("page", "chunk", "parcel", "record")
+
+
 # Length of the free Pro trial granted at registration, in days. Single source
 # of truth: the registration handler stamps trial_ends_at from this, and the
 # welcome email quotes it. They previously each carried their own literal 7.

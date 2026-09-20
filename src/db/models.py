@@ -679,6 +679,12 @@ class Job(Base):
     # appeared on the dashboard). tests/test_scraper_single_start_run.py locks that
     # out; do not add a preview trigger without reading that test first.
     trigger = Column(String(32), nullable=False, default="manual")
+    # NOT NULL DEFAULT 0, which is why they cannot express UNKNOWN. Kept for the
+    # existing API contract and for every reader written against them; the
+    # migration-098 columns below are the ones that can say "not measured yet".
+    # record_count in particular is NOT a scrape total: the done-CAS overwrites it
+    # with the BILLED non-duplicate count (tasks.py), so a run that scraped 57 and
+    # billed 2 ends up reading 2. Use records_found for "how much did we find".
     page_current = Column(Integer, nullable=False, default=0)
     page_total = Column(Integer, nullable=False, default=0)
     record_count = Column(Integer, nullable=False, default=0)
@@ -697,6 +703,37 @@ class Job(Base):
     # re-queued. NULL = not yet beat / pre-deploy → watchdog falls back to the
     # conservative started_at cutoff.
     last_heartbeat_at = Column(DateTime(timezone=True), nullable=True)
+    # Migration 098: progress OBSERVATIONS. Every one is nullable and NULL means
+    # UNOBSERVED, independently of the others — the scrapers learn these facts at
+    # different moments, so one shared "reporting has begun" flag would lie. Nothing
+    # here may be coerced to 0 for display: 0 is a real, measured zero.
+    #
+    # stage is what the worker is doing right now, which `status` is too coarse to
+    # say (`scraping` covered 401 silent seconds of the one run we traced). It is
+    # free text like `trigger`; the set the app writes is JOB_STAGES in
+    # src/config/constants.py. Stages repeat and are NOT a linear pipeline — the CSV
+    # export runs before enrichment — so never derive "step N of M" from it.
+    stage = Column(String(32), nullable=True)
+    stage_started_at = Column(DateTime(timezone=True), nullable=True)
+    # Raw records the scrape returned, unlike record_count above which becomes the
+    # billed count. 0 = the county really returned nothing.
+    records_found = Column(Integer, nullable=True)
+    # Completed work units and the denominator, when one is known. units_total NULL
+    # is the common case (most counties never learn a total) and is precisely why a
+    # percentage must not be rendered for them. progress_unit names what a unit IS
+    # so the UI never calls chunks "pages" (JOB_PROGRESS_UNITS).
+    units_done = Column(Integer, nullable=True)
+    units_total = Column(Integer, nullable=True)
+    progress_unit = Column(String(16), nullable=True)
+    # When a counter last MOVED. Distinct from last_heartbeat_at, which only proves
+    # the worker process is alive: a wedged scrape beats happily while advancing
+    # nothing.
+    last_progress_at = Column(DateTime(timezone=True), nullable=True)
+    # Earliest a backed-off transient retry may run. A NOT-BEFORE target, never a
+    # promise — the watchdog's stranded-retry branch keys on created_at, so an old
+    # job can be re-delivered ahead of this. Never present it as a countdown to a
+    # guaranteed start.
+    next_retry_at = Column(DateTime(timezone=True), nullable=True)
     # Migration 063: idempotent billing. billing_applied_at is the CAS gate —
     # only the attempt that flips it from NULL increments users.records_used, so a
     # watchdog re-run can't double-bill. billed_count = what was charged (stored,

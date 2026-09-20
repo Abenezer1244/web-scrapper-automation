@@ -18,6 +18,8 @@ from src.workers.property_identity import legacy_strong_signature as _legacy_str
 from src.workers.tasks_helpers.status import _now, _publish_log
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from src.scrapers.base_scraper import ProgressCallback
 
 _logger = setup_logger("worker.task")
@@ -147,6 +149,7 @@ async def _run_scraper(
     on_progress: "ProgressCallback | None" = None,
     record_type: str | None = None,
     doc_types: list | None = None,
+    on_stage: "Callable[[str], None] | None" = None,
 ):
     """Run the async scraper and stream progress logs back to Redis."""
     # Pass record_type / doc_types ONLY to scrapers whose constructor accepts
@@ -165,9 +168,17 @@ async def _run_scraper(
         kwargs["record_type"] = record_type
     if doc_types is not None and "doc_types" in params:
         kwargs["doc_types"] = doc_types
-    async with scraper_class(**kwargs) as scraper:
-        if on_progress:
-            scraper.on_progress = on_progress
+    # Construct, wire the callbacks, THEN enter. The callbacks used to be attached
+    # inside the `async with`, i.e. after __aenter__ had already launched the browser
+    # — so anything a scraper reported during startup went nowhere. Startup is the
+    # slowest and least visible part of a county run, which makes it the part most
+    # worth hearing about.
+    scraper = scraper_class(**kwargs)
+    if on_progress:
+        scraper.on_progress = on_progress
+    if on_stage:
+        scraper.on_stage = on_stage
+    async with scraper:
         records = await scraper.scrape(date_from, date_to)
 
         # A connector that merges several sources ships what succeeded when one source

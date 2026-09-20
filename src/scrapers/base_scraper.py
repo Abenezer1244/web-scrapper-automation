@@ -6,6 +6,7 @@ import hashlib
 import html
 import json
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -90,6 +91,7 @@ class ProgressCallback(Protocol):
         page_total: int,
         record_count: int,
         phase: str = "scraping",
+        unit: str | None = None,
     ) -> None: ...
 
 
@@ -155,6 +157,36 @@ class BridgeScraper:
         self._user_agent: str | None = None
         self.page: Page | None = None
         self.on_progress: ProgressCallback | None = None
+        # Installed by the worker. Call it through report_stage(), never directly.
+        self.on_stage: Callable[[str], None] | None = None
+
+    # ─── Progress reporting ───────────────────────────────────────────────────
+
+    def report_stage(self, stage: str) -> None:
+        """Say which named activity this scraper has just entered.
+
+        Use it for the parts of a run that take real time but produce no countable
+        output — reaching the portal, solving a captcha, waiting on a search to come
+        back. Those are invisible to everything outside the scraper: the job's
+        ``status`` is already 'scraping' and stays there for the whole call, which on
+        one traced King probate run meant 401 seconds where the only honest thing the
+        UI could say was nothing at all.
+
+        ``stage`` must be one of JOB_STAGES (src/config/constants.py) — that tuple is
+        what the API turns into user-facing copy, so an unrecognised value would
+        reach a customer as a raw identifier. Stages may repeat; re-entering one
+        restarts its clock, which is what the "still connecting" wording wants.
+
+        Never raises. A connector must not fail because telemetry did, and a scraper
+        run with no stage reports is degraded, not broken: the UI falls back to an
+        indeterminate state, which is exactly what "we do not know" should look like.
+        """
+        if self.on_stage is None:
+            return
+        try:
+            self.on_stage(stage)
+        except Exception:  # noqa: BLE001 — telemetry must never fail a scrape
+            _logger.debug("stage report %r failed", stage, exc_info=True)
 
     # ─── Collection scope (SHOW — read-only transparency) ─────────────────────
 

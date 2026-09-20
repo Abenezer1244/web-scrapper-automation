@@ -61,7 +61,9 @@ def _job(**over) -> JobResponse:
 def test_fresh_heartbeat_is_not_stalled():
     j = _job()
     assert j.progress_stalled is False
-    assert j.progress_label == "Starting scrape..."
+    # No stage reported yet and no counters: the activity alone, no numbers.
+    assert j.progress_label == "Collecting records"
+    assert j.progress_pct is None
 
 
 def test_a_long_but_live_job_is_not_stalled():
@@ -76,13 +78,15 @@ def test_a_long_but_live_job_is_not_stalled():
         record_count=900,
     )
     assert j.progress_stalled is False
-    assert j.progress_label == "Page 40 of 120"
+    # Legacy counters, no progress_unit: the counts are shown, the NOUN is not
+    # guessed. This row was written by a worker that predates migration 098.
+    assert j.progress_label == "Collecting records: 40 of 120"
 
 
 def test_real_page_progress_survives_the_liveness_check():
     j = _job(page_current=3, page_total=5, record_count=30)
     assert j.progress_stalled is False
-    assert j.progress_label == "Page 3 of 5"
+    assert j.progress_label == "Collecting records: 3 of 5"
     assert j.progress_pct == 60
 
 
@@ -215,7 +219,7 @@ def test_pending_retry_reads_as_waiting_to_retry():
 def test_a_first_run_still_reads_as_waiting_to_start():
     j = _job(status="pending", retry_count=0, started_at=None, last_heartbeat_at=None)
     assert j.retry_pending is False
-    assert j.progress_label == "Waiting to start..."
+    assert j.progress_label == "Waiting to start"
 
 
 # ─── Terminal states are untouched by any of this ────────────────────────────

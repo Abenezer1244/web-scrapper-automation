@@ -207,6 +207,117 @@ def _set_status(
     return rowcount == 1
 
 
+class JobProgressFields(TypedDict, total=False):
+    """The migration-098 observation columns ``_set_progress`` may write.
+
+    Every one is nullable and NULL means UNOBSERVED, so writing a 0 here is a
+    positive statement that the answer really is zero. Never write 0 as a
+    placeholder — that is the exact bug these columns exist to end.
+    """
+
+    stage: str
+    stage_started_at: datetime
+    records_found: int
+    units_done: int
+    units_total: int
+    progress_unit: str
+    last_progress_at: datetime
+
+
+def _set_progress(
+    db,
+    job,
+    *,
+    expected_started_at,
+    commit: bool = True,
+    **kwargs: Unpack[JobProgressFields],
+) -> bool:
+    """Write progress observations for ONE attempt. Returns whether the write landed.
+
+    Progress is descriptive, never part of the state machine: this touches only the
+    migration-098 columns and NEVER ``status``. Use ``_set_status`` for that.
+
+    Guarded on two facts, both necessary:
+
+      * ``status NOT IN terminal`` — a cancelled, failed or done job must not keep
+        reporting that work is happening. Without this, a scraper that runs on for
+        another minute after a cancel would keep advancing the counters on a
+        terminal row and the Live Run page would show a cancelled run progressing.
+      * ``started_at == expected_started_at`` — the attempt token. The watchdog
+        re-queues a job whose worker is gone, and the replacement attempt stamps a
+        fresh ``started_at``. A late callback from the OLD attempt (a scraper that
+        was slow rather than dead, a thread that recovered) would otherwise
+        overwrite the live attempt's counters with values from a run nobody is
+        watching. Rowcount 0 means superseded: the caller must not publish either.
+
+    ``commit=False`` leaves the UPDATE pending in the caller's transaction, which is
+    the right mode at a stage boundary that is immediately followed by a
+    ``_publish_log(db=db)`` — that call commits, so the stage and its log line land
+    atomically and NO new commit point is introduced into the work session. That
+    matters: a commit inserted mid-transaction would also commit whatever else was
+    pending, and the billing writes are deliberately held uncommitted until they can
+    land together with the terminal CAS.
+
+    The mirror hazard is holding the write open too long. A pending UPDATE keeps a
+    row lock on ``jobs``, and the cancel endpoint writes that same row, so leaving
+    one uncommitted across a long operation (the scrape runs up to 30 minutes) would
+    block the user's Cancel Run for the duration. Only ever use ``commit=False``
+    where the commit is a few statements away.
+
+    Never raises. Progress is telemetry: a failed observation must not fail a scrape
+    that is otherwise working. A failure leaves the previous observation in place,
+    which reads as "nothing new has been reported" — true, and the honest answer.
+    """
+    from sqlalchemy import update as _sa_update
+
+    from src.db.models import Job
+
+    if not kwargs:
+        return False
+    try:
+        rowcount = db.execute(
+            _sa_update(Job)
+            .where(
+                Job.id == job.id,
+                Job.status.not_in(_TERMINAL_STATUSES),
+                Job.started_at == expected_started_at,
+            )
+            .values(**kwargs)
+        ).rowcount
+        if commit:
+            db.commit()
+    except Exception:  # noqa: BLE001 — telemetry must never fail the run
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        _logger.warning(
+            "Job %s: progress observation write failed (%s) — leaving the previous "
+            "observation in place", job.id, ", ".join(sorted(kwargs)),
+        )
+        return False
+    return rowcount == 1
+
+
+def _set_stage(db, job, stage: str, *, expected_started_at, commit: bool = True) -> bool:
+    """Record which activity the worker has just entered. Returns whether it landed.
+
+    Stamps ``stage_started_at`` with it, so "still connecting to King County" can be
+    answered from the row instead of re-derived from log timestamps.
+
+    Stages REPEAT and do not run in a fixed order, so this is not a step counter and
+    re-entering a stage is legitimate — it re-stamps the clock, which is what the
+    reassurance copy wants.
+    """
+    return _set_progress(
+        db, job,
+        expected_started_at=expected_started_at,
+        commit=commit,
+        stage=stage,
+        stage_started_at=_now(),
+    )
+
+
 def release_quota_reservation(db, job_id: str) -> int:
     """Hand back a quota grant this job claimed but never billed. Returns freed.
 
@@ -516,6 +627,12 @@ def claim_job_for_attempt(db, job_id: str):
     outright (Codex). Stamping at claim time makes an attempt immune to that
     regardless of what any re-queue path left behind.
 
+    ``next_retry_at`` is cleared for the same class of reason. It says when a
+    backed-off retry may START; once this attempt HAS started it is a past time
+    describing nothing, and anything rendering a countdown from it would keep
+    counting against a run that is already going. Claiming is exactly the moment it
+    stops being true.
+
     This lives here, rather than inline in ``run_scrape_job``, so the guarantee is
     testable against the code production actually runs. A test that re-types this
     UPDATE proves only that the test's own SQL works: deleting the heartbeat stamp
@@ -529,7 +646,12 @@ def claim_job_for_attempt(db, job_id: str):
     rowcount = db.execute(
         update(Job)
         .where(Job.id == job_id, Job.status == "pending")
-        .values(status="queued", started_at=claimed_at, last_heartbeat_at=claimed_at)
+        .values(
+            status="queued",
+            started_at=claimed_at,
+            last_heartbeat_at=claimed_at,
+            next_retry_at=None,
+        )
     ).rowcount
     db.commit()
     return claimed_at if rowcount else None
@@ -597,7 +719,17 @@ def _retry_scrape_job(
 
     Resets the progress + liveness columns too (``started_at``/``finished_at``/
     ``error_message``/page counters/``last_heartbeat_at``) so the retried attempt
-    starts clean and the watchdog sees a fresh un-started pending row.
+    starts clean and the watchdog sees a fresh un-started pending row. The
+    migration-098 observations are reset with them, back to NULL rather than to 0:
+    the next attempt has measured nothing yet, and 0 would assert that it had.
+
+    ``next_retry_at`` is stamped in the SAME statement, from the SAME countdown the
+    caller is about to schedule with — computed before the UPDATE precisely so the
+    stored time and the scheduled time cannot drift apart by a second of jitter.
+    Read it as NOT BEFORE, never as a guarantee: if the broker publish that follows
+    this commit fails, the row simply sits ``pending`` until the watchdog's stranded
+    retry branch picks it up, and that branch keys on ``created_at``, not on this
+    column. Anything showing a countdown must be worded accordingly (Codex).
     """
     from sqlalchemy import text as _text
 
@@ -605,26 +737,32 @@ def _retry_scrape_job(
     if attempt >= max_retries:
         return None
 
+    base = backoffs[min(attempt, len(backoffs) - 1)] if backoffs else 300
+    # Jitter (0-60s) so a fleet of jobs that all fail at the same instant (e.g. a
+    # portal-wide outage) don't re-hit the portal in lockstep.
+    countdown = base + random.randint(0, 60)
+
     rowcount = db.execute(
         _text(
             "UPDATE jobs SET status='pending', retry_count=retry_count+1, "
             "started_at=NULL, finished_at=NULL, error_message=NULL, "
-            "page_current=0, page_total=0, record_count=0, last_heartbeat_at=NULL "
+            "page_current=0, page_total=0, record_count=0, last_heartbeat_at=NULL, "
+            "stage=NULL, stage_started_at=NULL, records_found=NULL, "
+            "units_done=NULL, units_total=NULL, progress_unit=NULL, "
+            "last_progress_at=NULL, "
+            "next_retry_at = now() + make_interval(secs => :cd) "
             "WHERE id=:j AND started_at=:sa AND retry_count < :mx "
             "AND status NOT IN ('done','failed','cancelled') "
             "AND billing_applied_at IS NULL"
         ),
-        {"j": str(job_id), "sa": started_at, "mx": max_retries},
+        {"j": str(job_id), "sa": started_at, "mx": max_retries, "cd": countdown},
     ).rowcount
     db.commit()
     if rowcount != 1:
         return None
     db.refresh(job)
 
-    base = backoffs[min(attempt, len(backoffs) - 1)] if backoffs else 300
-    # Jitter (0-60s) so a fleet of jobs that all fail at the same instant (e.g. a
-    # portal-wide outage) don't re-hit the portal in lockstep.
-    return base + random.randint(0, 60)
+    return countdown
 
 
 # ── Liveness heartbeat (watchdog input) ──────────────────────────────────────

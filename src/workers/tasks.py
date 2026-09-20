@@ -77,6 +77,8 @@ from src.workers.tasks_helpers.status import (
     _publish_log,
     _redis,
     _retry_scrape_job,
+    _set_progress,
+    _set_stage,
     _set_status,
     claim_job_for_attempt,
     transient_retry_notice,
@@ -492,8 +494,8 @@ def run_scrape_job(self, job_id: str) -> None:
         # as started_at, so every attempt begins with a FRESH liveness observation
         # and can never be re-queued on the previous attempt's stale one. See that
         # helper for why the CAS lives there rather than inline here.
-        claimed = claim_job_for_attempt(db, job_id) is not None
-        if not claimed:
+        attempt_started_at = claim_job_for_attempt(db, job_id)
+        if attempt_started_at is None:
             _logger.info(
                 "Job %s not claimable (already in flight / not pending) — "
                 "skipping to avoid double-scrape",
@@ -501,11 +503,17 @@ def run_scrape_job(self, job_id: str) -> None:
             )
             return
         db.refresh(job)
+        # THIS attempt's token, held in a local rather than read off the ORM object
+        # each time. Every progress and stage write below is scoped to it, so a
+        # callback that arrives late — from an attempt the watchdog already replaced
+        # — updates nothing instead of overwriting the live attempt's observations.
+        # A local cannot drift: `job.started_at` is re-read by every db.refresh()
+        # and would silently start naming whichever attempt owns the row now.
         # Record THIS attempt's started_at on the Celery request so the on_failure hook
         # (_RunScrapeJobTask) can attempt-scope its crash cleanup — it must only fail the
         # row if started_at still matches, never a re-queued/re-claimed newer attempt.
         try:
-            self.request.scrape_started_at = job.started_at
+            self.request.scrape_started_at = attempt_started_at
         except Exception:  # request context unavailable (e.g. direct call) — non-fatal
             pass
 
@@ -546,7 +554,10 @@ def run_scrape_job(self, job_id: str) -> None:
         # (a deploy, an OOM, a hard timeout) sat visibly "running" for the full
         # 70-minute started_at fallback with nothing to show it was gone. That is
         # exactly what stranded job 9c8b7259 on 2026-09-09.
-        _hb.start(job.started_at)
+        _hb.start(attempt_started_at)
+        # Stage rides the commit that _publish_log already performs, so no new commit
+        # point is introduced into the work session (see _set_progress).
+        _set_stage(db, job, "preparing", expected_started_at=attempt_started_at, commit=False)
         _publish_log(r, job_id, "info", f"Job queued: {config.name} ({config.county}, {config.state})", db=db)
 
         # ── PROBING ───────────────────────────────────────────────────────────
@@ -618,8 +629,26 @@ def run_scrape_job(self, job_id: str) -> None:
 
         _last_phase = [None]  # mutable for closure
 
-        def _on_progress(page_current, page_total, record_count, phase="scraping"):
-            """Called by the scraper after each page — updates the DB in real time."""
+        def _on_progress(
+            page_current, page_total, record_count, phase="scraping", unit=None,
+        ):
+            """Called by the scraper as it works — updates the DB in real time.
+
+            Writes BOTH the legacy NOT NULL counters (page_current/page_total/
+            record_count, kept for every existing reader) and the migration-098
+            observations, which is the pair that can tell UNKNOWN from ZERO.
+
+            A ``page_total`` of 0 means "no denominator yet", not "zero pages", so it
+            is stored as units_total=NULL. That distinction is the whole reason the
+            Live Run page can stop rendering a fabricated 0%. ``records_found`` is
+            written straight through, including a real 0, because a county that
+            genuinely returned nothing is a legitimate answer and must look different
+            from one we have not asked yet.
+
+            ``unit`` names what a unit IS so the UI never calls chunks "pages". A
+            scraper that does not say is left NULL rather than defaulted to "page" —
+            the counters are still shown, the word for them just is not guessed.
+            """
             job.page_current = page_current
             job.page_total = page_total
             job.record_count = record_count
@@ -633,6 +662,18 @@ def run_scrape_job(self, job_id: str) -> None:
                 except Exception:
                     _logger.warning("Progress commit failed — will retry on next update")
 
+            observations: dict = {
+                "records_found": record_count,
+                "units_done": page_current,
+                "units_total": page_total if page_total > 0 else None,
+                "last_progress_at": _now(),
+            }
+            if unit:
+                observations["progress_unit"] = unit
+            _set_progress(
+                db, job, expected_started_at=attempt_started_at, **observations,
+            )
+
             # Log phase transitions so the frontend shows what's happening
             if phase != _last_phase[0]:
                 _last_phase[0] = phase
@@ -641,6 +682,20 @@ def run_scrape_job(self, job_id: str) -> None:
                 elif phase == "enriching":
                     _publish_log(r, job_id, "info", f"Looking up addresses for {page_total} parcels...", db=db)
 
+        def _on_stage(stage: str) -> None:
+            """Called by the scraper when it enters a named activity.
+
+            This is the signal that closes the dead zone. `status` goes to 'scraping'
+            and then says nothing more for the whole scrape — 401 seconds on the run
+            we traced — because everything from browser launch through captcha to the
+            first result page happens inside one call. The scraper knows which of
+            those it is in; nothing else does.
+            """
+            _set_stage(db, job, stage, expected_started_at=attempt_started_at)
+
+        _set_stage(
+            db, job, "connecting", expected_started_at=attempt_started_at, commit=False,
+        )
         _publish_log(r, job_id, "info", "Connecting to county portal...", db=db)
         # Flush the resolved date window to disk before entering the scraper, which
         # can run for up to _SCRAPE_TIMEOUT below. Until this commits, job.date_from
@@ -674,7 +729,7 @@ def run_scrape_job(self, job_id: str) -> None:
             _SCRAPE_TIMEOUT = 1800  # 30 minutes
             records = asyncio.run(
                 asyncio.wait_for(
-                    _run_scraper(scraper_class, date_from, date_to, r, job_id, _on_progress, record_type=matched_record_type, doc_types=config.doc_types),
+                    _run_scraper(scraper_class, date_from, date_to, r, job_id, _on_progress, record_type=matched_record_type, doc_types=config.doc_types, on_stage=_on_stage),
                     timeout=_SCRAPE_TIMEOUT,
                 )
             )
@@ -698,12 +753,14 @@ def run_scrape_job(self, job_id: str) -> None:
             return
         except Exception as exc:
             _logger.exception("Scraper error for job %s", job_id)
-            # Capture THIS attempt's started_at BEFORE the rollback — rollback
-            # expires ORM attributes, and a re-fetch could return a NEWER attempt's
-            # value. It attempt-scopes BOTH the retry CAS and the terminal fail
-            # below so a stale/superseded attempt never clobbers a live re-claimed
-            # one (Codex P1).
-            attempt_started_at = job.started_at
+            # attempt_started_at is the token the CLAIM returned, captured once at
+            # the top of this run and never re-read from the ORM. It attempt-scopes
+            # BOTH the retry CAS and the terminal fail below, so a stale/superseded
+            # attempt never clobbers a live re-claimed one (Codex P1). This used to
+            # re-read `job.started_at` here "before the rollback expires it", which
+            # was the right instinct aimed one step short: a refresh that had already
+            # happened would hand back the NEWER attempt's value, which is precisely
+            # the value that must not be used.
             # Reconnect DB session if it went stale during long scrape
             try:
                 db.rollback()
@@ -790,6 +847,20 @@ def run_scrape_job(self, job_id: str) -> None:
                 )
             return
 
+        # The authoritative raw scrape total, recorded on the row rather than left in
+        # the log. Most connectors never report a running count (several call
+        # on_progress once, at the very end), and `record_count` cannot be used for
+        # this: the done-CAS overwrites it with the BILLED non-duplicate count, so a
+        # run that found 57 and billed 2 reads 2 forever after. This is the number in
+        # the line below, which is the number the customer was just told.
+        # 0 is written as 0 on purpose — a county that returned nothing really did.
+        _set_progress(
+            db, job,
+            expected_started_at=attempt_started_at,
+            commit=False,
+            records_found=len(records),
+            last_progress_at=_now(),
+        )
         _publish_log(r, job_id, "success", f"Scrape complete: {len(records)} records found", db=db)
 
         # ── Phase 3: honest probate output ────────────────────────────────────
@@ -840,6 +911,7 @@ def run_scrape_job(self, job_id: str) -> None:
                 job_id, job.status,
             )
             return
+        _set_stage(db, job, "saving", expected_started_at=attempt_started_at, commit=False)
         _publish_log(r, job_id, "info", "Saving records to database...", db=db)
 
         # Bulk insert results (truncate fields to fit DB column limits)
@@ -1003,6 +1075,7 @@ def run_scrape_job(self, job_id: str) -> None:
         # NOTHING tells us which rows were successfully claimed (first
         # delivery) vs which conflicted (user has seen this lead before).
         # The conflicting rows get their Result flagged is_duplicate=true.
+        _set_stage(db, job, "deduping", expected_started_at=attempt_started_at, commit=False)
         _publish_log(r, job_id, "info", "Checking for duplicate leads...", db=db)
         _logger.info("Job %s: dedup step 1 — SELECT fresh rows", job_id)
 
@@ -1258,6 +1331,9 @@ def run_scrape_job(self, job_id: str) -> None:
             )
             fmt = DEFAULT_EXPORT_FORMAT
 
+        # Export runs BEFORE enrichment, which is why the stage list is not a
+        # pipeline and why nothing may read "step N of M" off it.
+        _set_stage(db, job, "exporting", expected_started_at=attempt_started_at, commit=False)
         _publish_log(r, job_id, "info", f"Building {fmt.upper()} export...", db=db)
 
         # Build the FIRST deliverable from the PERSISTED rows for every record type.
@@ -1401,6 +1477,7 @@ def run_scrape_job(self, job_id: str) -> None:
         # request's wait. If a hang slips through both, Celery hard-kills
         # the worker — which is what the previous thread guard was
         # actually relying on anyway.
+        _set_stage(db, job, "enriching", expected_started_at=attempt_started_at, commit=False)
         _publish_log(r, job_id, "info", "Looking up property and mailing addresses...", db=db)
         # Skip trace is enqueued only after a completed enrichment, and only after
         # the plan cap below (never for a row that will not be delivered).
@@ -1827,6 +1904,17 @@ def run_scrape_job(self, job_id: str) -> None:
         # a savepoint would not help, the enqueue commits internally.
         if _enrichment_ok:
             db.commit()
+            # ENQUEUE only. The provider answers minutes or hours later, through a
+            # webhook, long after this job is terminal — so the stage is named for
+            # what the job is actually doing ("queuing contact lookups"), not for the
+            # skip trace itself. A run that shows "finding contact information" and
+            # then finishes would be claiming work it never waited for.
+            # Commits on its own here, unlike the other boundaries: no _publish_log
+            # follows to carry it, and leaving the UPDATE pending would hold a lock
+            # on the jobs row for the whole enqueue — which is the row Cancel Run
+            # writes. The db.commit() immediately above means this commits nothing
+            # but itself.
+            _set_stage(db, job, "queuing_contacts", expected_started_at=attempt_started_at)
             try:
                 _enqueue_skip_trace_rows(db, job, r, job_id, config)
             except Exception as exc:
@@ -2006,6 +2094,15 @@ def run_scrape_job(self, job_id: str) -> None:
             )
             _release_claims_of_cancelled_job(db, job_id, _boot_user_id)
             return
+
+        # Last stage boundary. It goes HERE, before the billing reads open the
+        # transaction that the done-CAS commits with, and it commits on its own:
+        # everything below this line is deliberately held uncommitted so billing and
+        # the terminal transition land together, and a stage write inside that window
+        # — with commit=True, or with commit=False and someone else's commit arriving
+        # first — would split them, which is the crash that leaves a job billed but
+        # not done (Codex P1).
+        _set_stage(db, job, "finalizing", expected_started_at=attempt_started_at)
 
         # Atomic update of monthly record usage.
         # Sprint 6.4: duplicates delivered to this user in a prior scrape

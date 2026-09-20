@@ -209,11 +209,19 @@ def _set_status(
 
 
 class JobProgressFields(TypedDict, total=False):
-    """The migration-099 observation columns ``_set_progress`` may write.
+    """The progress columns ``_set_progress`` may write.
 
-    Every one is nullable and NULL means UNOBSERVED, so writing a 0 here is a
-    positive statement that the answer really is zero. Never write 0 as a
-    placeholder — that is the exact bug these columns exist to end.
+    The migration-099 observations are all nullable and NULL means UNOBSERVED, so
+    writing a 0 to one of them is a positive statement that the answer really is
+    zero. Never write 0 as a placeholder — that is the exact bug they exist to end.
+
+    The three legacy counters below are the older, NOT NULL pair of that story and
+    cannot say "unobserved" at all; they are here so that the one write which
+    updates them is the guarded one. Before this they were an ORM assignment
+    committed by primary key with no precondition, which let a re-queued attempt's
+    late callback overwrite a replacement run's counters, or the billed
+    ``record_count`` a terminal CAS had already stored (Codex round 4). Never write
+    a None to any of them.
     """
 
     stage: str
@@ -223,6 +231,10 @@ class JobProgressFields(TypedDict, total=False):
     units_total: int
     progress_unit: str
     last_progress_at: datetime
+    # Legacy, NOT NULL. Kept for every existing reader.
+    page_current: int
+    page_total: int
+    record_count: int
 
 
 def _set_progress(

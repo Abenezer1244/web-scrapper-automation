@@ -1151,6 +1151,13 @@ def _stage_label(
     return label
 
 
+# Stages during which the record count is still GROWING, and so the only ones where
+# extrapolating a total from it means anything. None is included for a row written by
+# a worker predating migration 099: it reports no stage at all, and its page counters
+# are scrape pages, so the extrapolation is the same one it has always made.
+_RECORD_PRODUCING_STAGES: frozenset[str | None] = frozenset({None, "searching", "scraping"})
+
+
 class JobResponse(BaseModel):
     id: str
     user_id: str
@@ -1423,7 +1430,21 @@ class JobResponse(BaseModel):
             # unit of a scrape carries all of the browser startup and captcha cost,
             # so a one-unit estimate is routinely wrong by minutes.
             if done >= 2:
-                if self.records_found:
+                # "How many records will this find in total?" is only answerable
+                # while records are still being found AND the unit being counted is
+                # one the record count grows with. Pierce reports its mid-scrape
+                # parcel lookup as `on_progress(found, len(inst_map), None,
+                # "parcel_lookup", unit="parcel")`: units are PARCELS while
+                # records_found still holds the already-final scrape total, so
+                # records_found / done * total multiplied a finished count by a
+                # parcel ratio and published the product as an estimate — 100
+                # records and 50 parcels giving 250 (Codex round 4). Unknown is the
+                # right answer there; the real total is already on screen beside it.
+                if (
+                    self.records_found
+                    and self.progress_unit != "parcel"
+                    and self.stage in _RECORD_PRODUCING_STAGES
+                ):
                     self.estimated_total_records = int(self.records_found / done * total)
                 # stage_seconds is NULL only for a worker that predates
                 # migration 099 and never reported a stage; for that row the

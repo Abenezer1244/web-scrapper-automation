@@ -662,28 +662,26 @@ def run_scrape_job(self, job_id: str) -> None:
             scraper that does not say is left NULL rather than defaulted to "page" —
             the counters are still shown, the word for them just is not guessed.
             """
-            job.page_current = page_current
-            job.page_total = page_total
-            if record_count is not None:
-                # NOT NULL column: a None here would raise. It stays at whatever was
-                # last observed, which is the honest reading of "no new count".
-                job.record_count = record_count
-            try:
-                db.commit()
-            except Exception:
-                # DB connection may have gone stale during long scrape — reconnect
-                try:
-                    db.rollback()
-                    db.commit()
-                except Exception:
-                    _logger.warning("Progress commit failed — will retry on next update")
-
             observations: dict = {
+                # The legacy NOT NULL counters, written in the SAME guarded
+                # statement as the observations rather than by an ORM assignment
+                # committed by primary key. They used to be their own unconditional
+                # write, which is the defect BE #347 fixed in the watchdog and
+                # missed here: after the watchdog re-queues a stranded attempt, a
+                # late callback from the OLD worker would still land these on a row
+                # that now belongs to a replacement run — or to a finished one,
+                # overwriting the billed record_count the terminal CAS just set
+                # (Codex round 4). One write, one precondition, one answer.
+                "page_current": page_current,
+                "page_total": page_total,
                 "units_done": page_current,
                 "units_total": page_total if page_total > 0 else None,
                 "last_progress_at": _now(),
             }
             if record_count is not None:
+                # record_count is NOT NULL: a None would raise. It stays at whatever
+                # was last observed, which is the honest reading of "no new count".
+                observations["record_count"] = record_count
                 observations["records_found"] = record_count
             if unit:
                 observations["progress_unit"] = unit
@@ -692,13 +690,27 @@ def run_scrape_job(self, job_id: str) -> None:
             # can never disagree, and the stage clock restarts exactly once per real
             # transition rather than on every callback.
             stage_for_phase = _PHASE_STAGES.get(phase)
-            if stage_for_phase and stage_for_phase != _last_stage[0]:
-                _last_stage[0] = stage_for_phase
+            advancing = bool(stage_for_phase and stage_for_phase != _last_stage[0])
+            if advancing:
                 observations["stage"] = stage_for_phase
                 observations["stage_started_at"] = _now()
-            _set_progress(
+            landed = _set_progress(
                 db, job, expected_started_at=attempt_started_at, **observations,
             )
+            if landed and advancing:
+                # The local mirror advances only when the row did. Moving it first
+                # would leave this worker believing it had announced a stage the
+                # database refused, and silently skipping the retry.
+                _last_stage[0] = stage_for_phase
+            if not landed:
+                # This attempt no longer owns the row: it was re-queued, cancelled
+                # or finished under us. The counters were correctly refused, and the
+                # phase log below must be refused with them — otherwise a dead
+                # worker still narrates "Looking up addresses for 48 parcels..." onto
+                # the replacement run's stream, where it reads as live (Codex round
+                # 4). _last_phase is deliberately left alone: there is no later
+                # callback from this attempt that could legitimately publish it.
+                return
 
             # Log phase transitions so the frontend shows what's happening
             if phase != _last_phase[0]:
@@ -717,8 +729,8 @@ def run_scrape_job(self, job_id: str) -> None:
             first result page happens inside one call. The scraper knows which of
             those it is in; nothing else does.
             """
-            _last_stage[0] = stage
-            _set_stage(db, job, stage, expected_started_at=attempt_started_at)
+            if _set_stage(db, job, stage, expected_started_at=attempt_started_at):
+                _last_stage[0] = stage
 
         _set_stage(
             db, job, "connecting", expected_started_at=attempt_started_at, commit=False,

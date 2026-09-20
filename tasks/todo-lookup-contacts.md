@@ -97,7 +97,7 @@ refused exactly the same way. (Codex notes that cross-tenant collision is theref
 possible in production today, since the current hold key is tenant-scoped while the attribution
 key is not. Pre-existing, not introduced here; logged under Deferred.) The second subject stays
 queued until the first settles, which is the existing and intended behavior for a held twin.
-- [ ] Separate `_submission_collision_key(row)` = `(address, city, state, trace_type)`, global,
+- [x] Separate `_submission_collision_key(row)` = `(address, city, state, trace_type)`, global,
       used ONLY by `_hold_answers_in_flight` to serialize submission. The cache read, the
       known-answer sweep and the ingest write all use the v2 subject key. The two keys are
       named so they cannot be confused, and a test asserts the hold dedups two different owners
@@ -113,31 +113,31 @@ passes and copies exactly the leak it was added to stop. Trace type is not persi
 `results` at all, `None` and `''` are not recoverable, and pre-cutover PII was produced under a
 legacy address-only key. **Owner decision 2026-09-19: add the durable evidence instead of
 guessing at it.**
-- [ ] **Migration 098** (this renumbers Phase 1b's migration to **099**): add
+- [x] **Migration 098** (this renumbers Phase 1b's migration to **099**): add
       `results.skip_trace_subject_hash TEXT NULL`. Additive and nullable, no backfill, no
       rewrite; historical rows stay NULL and therefore FAIL CLOSED, which is the same outcome
       as not copying and is the point. Written wherever a lookup's subject becomes known: the
       enqueue (from the payload actually built), the ingest settle, and the known-answer sweep.
-- [ ] Both `dedup_hash` passes copy skip-trace PII **only** on an exact
+- [x] Both `dedup_hash` passes copy skip-trace PII **only** on an exact
       `ro.skip_trace_subject_hash = <target's v2 subject>` match. Address and enrichment fields
       keep their existing COALESCE fill-missing behavior and are not gated by this. The
       `later_sql` pass becomes newest per `(dedup_hash, subject_hash)` rather than newest per
       `dedup_hash`; it stays one bounded query keyed off the target hash set, never an N+1.
-- [ ] `_reuse_enrichment_for_duplicates` is NOT gated by `SKIP_TRACE_ENABLED` (verified:
+- [x] `_reuse_enrichment_for_duplicates` is NOT gated by `SKIP_TRACE_ENABLED` (verified:
       called unconditionally at `enrich.py:768`, while the enqueue gate is at `:2151`). It
       therefore keeps copying PII straight through the cutover window. Under the subject-hash
       rule that is safe, because a pre-cutover row's hash is NULL and fails closed. Do not
       "fix" this by adding a kill-switch gate: the address and enrichment copy is wanted.
 
 **Round 14, the rest (P2, all verified in code before being accepted):**
-- [ ] Ingest dedups the cache write by `_seen_users` (`tracerfy_ingest.py:679-689`). Under v2
+- [x] Ingest dedups the cache write by `_seen_users` (`tracerfy_ingest.py:679-689`). Under v2
       that drops writes: two rows for ONE tenant with distinct subjects would write only the
       first. It becomes dedup by the COMPUTED CACHE KEY, and each row's key comes from its OWN
       address fields, not `matches[0]`, since v2 no longer collapses punctuation or field
       boundaries.
-- [ ] `_attribution_is_safe` compares names but never `trace_type`, assuming the queue is
+- [x] `_attribution_is_safe` compares names but never `trace_type`, assuming the queue is
       homogeneous. Add a fail-closed trace-type invariant to the safe-group check.
-- [ ] **Truncation divergence.** The pending insert truncates address/mail to 512 and city,
+- [x] **Truncation divergence.** The pending insert truncates address/mail to 512 and city,
       state and BOTH NAMES to 128 (`enrich.py:2352-2378`), while the enqueue cache read hashes
       the UNtruncated payload. v1 already had this for city; v2 adds both names, and the code's
       own comment at `:2354-2358` documents this exact class of bug ("a 128-truncated write key
@@ -145,7 +145,7 @@ guessing at it.**
       truncation the insert will apply, so read and write hash identical bytes by construction.
       A test asserts a >128-character last name still hits its own cache entry.
 
-- [ ] `lookup_subject_key(version=2, user_id, address, city, state, trace_type, first, last)`:
+- [x] `lookup_subject_key(version=2, user_id, address, city, state, trace_type, first, last)`:
       NFKC, collapse Unicode whitespace, trim, case-fold; punctuation preserved; no invented
       equivalence (middle initials, hyphenation, diacritics). Versioned namespace.
       Serialization is unambiguous, not delimiter-joined: `sha256(json.dumps([...], ensure_ascii=
@@ -154,12 +154,12 @@ guessing at it.**
       `trace_type="advanced"`, so it can never collide with a normal trace whose name is missing.
       "Address" in this key means the street line, city and state as three separate normalized
       fields (never one concatenated string), which is what the current helper already passes.
-- [ ] Switch all FIVE call paths together, enumerated so none can be left on the legacy key:
+- [x] Switch all FIVE call paths together, enumerated so none can be left on the legacy key:
       (1) the enqueue cache read, (2) the dispatcher's known-answer sweep, (3) the dispatcher's
       in-flight hold, (4) the ingest cache write, (5) the `dedup_hash` reuse passes plus the
       charged-unanswered check. The test matrix names all five explicitly. The subject always comes from the pending row (dispatcher,
       ingest) or the payload actually built (enqueue), never recomputed from `party_name`.
-- [ ] Stop reading legacy address-only keys (and the legacy locality fallback). Correctness comes
+- [x] Stop reading legacy address-only keys (and the legacy locality fallback). Correctness comes
       from the new code reading only v2 keys; the old rows are then inert. The cutover is enforced
       with the EXISTING global kill switch rather than a hopeful deploy note: set
       `SKIP_TRACE_ENABLED=false`, deploy API and worker, confirm both are on the new build, then turn
@@ -168,17 +168,17 @@ guessing at it.**
       PII hygiene (never as the correctness mechanism), with the deleted row count recorded. Cost:
       repeat addresses pay again for up to 90 days (cache retention is 90 days anyway, so it
       self-heals).
-- [ ] The charged-unanswered check (`skip_trace_dispatcher.py:647-658`) uses the same v2 helper
+- [x] The charged-unanswered check (`skip_trace_dispatcher.py:647-658`) uses the same v2 helper
       as the sweep, so two NULL names do not silently stop matching and two different owners
       never match. (The `dedup_hash` half of this bullet is SUPERSEDED by 14-B above: it is
       resolved by the durable `skip_trace_subject_hash`, not by comparing recomputed subjects,
       which Codex showed copies the leak it was meant to stop.)
-- [ ] Tests (isolated DB), matching the D1 matrix exactly: for NORMAL traces, a different owner at
+- [x] Tests (isolated DB), matching the D1 matrix exactly: for NORMAL traces, a different owner at
       the same address does NOT reuse, at each of the 5 sites; the same owner does; for ADVANCED
       traces, the same address DOES reuse regardless of owner, but never across accounts; normal
       never reuses advanced and the reverse; tenant isolation holds; normalization cases (case,
       Unicode/NFKC, whitespace, punctuation, missing first or last, unit numbers, state case).
-- [ ] Tests added by round 14, each pinned to the P1/P2 it defends:
+- [x] Tests added by round 14, each pinned to the P1/P2 it defends:
       **14-A** two different owners at one address go out in ONE batch and BOTH come back
       refused (the regression itself), then the same case with the serialization key in place:
       one submitted, one held, nothing double-charged, nothing stranded; the same across two
@@ -191,7 +191,7 @@ guessing at it.**
       `_seen_users` bug); a mixed-`trace_type` safe group is refused; a >128-character last
       name hits its own cache entry (truncation divergence).
 
-- [ ] Required at diff time (Codex round 13, condition of its PASS): a test that seeds a
+- [x] Required at diff time (Codex round 13, condition of its PASS): a test that seeds a
       legacy-only cache hit and proves NONE of the five paths reuses it (including the locality
       fallback); a test that an advanced trace hashes null names regardless of the payload or
       `party_name`; a test that pending rows created BEFORE the cutover are processed with the v2 key
@@ -200,7 +200,7 @@ guessing at it.**
       log line on any unexpected legacy-key access, so the cutover can be verified from production
       rather than assumed.
 
-- [ ] **Ops scripts (round 14, Q5): the "five call paths" was not the whole list.** Three
+- [x] **Ops scripts (round 14, Q5): the "five call paths" was not the whole list.** Three
       scripts call `address_cache_key` directly and would read or write LEGACY keys into a v2
       world. `scripts/backfill_skip_trace_jobs.py:181` and `scripts/sprint4_enqueue_existing.py:106`
       can both COPY THE WRONG OWNER'S PII from an old address-only row (P1 if either is ever run
@@ -212,7 +212,7 @@ guessing at it.**
       + v2. If legacy verification is ever wanted again it lives as an explicitly named forensic
       tool and is never part of normal reuse.
 
-- [ ] **Cutover is a DRAIN, not a flag (round 14, Q6).** The kill switch gates the enqueue
+- [x] **Cutover is a DRAIN, not a flag (round 14, Q6).** The kill switch gates the enqueue
       (`enrich.py:2151`) and the dispatcher (`skip_trace_dispatcher.py:39`). It does NOT gate
       ingest (`tracerfy_ingest.py:451`), the webhook that feeds it (`routes/webhooks.py:132`),
       or `_reuse_enrichment_for_duplicates` (`enrich.py:768`). **Ingest must keep running with

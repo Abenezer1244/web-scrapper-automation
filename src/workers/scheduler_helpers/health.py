@@ -313,6 +313,19 @@ def _watchdog_stuck_jobs_impl() -> None:
                     page_current=0,
                     page_total=0,
                     record_count=0,
+                    # The migration-099 observations go back to NULL, not to 0. The
+                    # next attempt has measured nothing yet, and 0 would assert that
+                    # it had measured and found none — which is the exact confusion
+                    # those columns exist to end. Resetting them here is what stops a
+                    # re-queued run inheriting the dead attempt's stage and reading
+                    # "Adding property and mailing details" while it waits to start.
+                    stage=None,
+                    stage_started_at=None,
+                    records_found=None,
+                    units_done=None,
+                    units_total=None,
+                    progress_unit=None,
+                    last_progress_at=None,
                 ):
                     continue
                 requeued_ids.append(job.id)

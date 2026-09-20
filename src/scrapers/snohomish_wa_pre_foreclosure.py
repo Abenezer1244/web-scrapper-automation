@@ -190,6 +190,7 @@ class SnohomishWAPreForeclosureScraper(BridgeScraper):
         # results-query / Lists layer (date_recorded_parsed), not at scrape-insert.
         del date_from, date_to
 
+        self.report_stage("searching")
         pdf_url = _discover_pdf_url()
         if not pdf_url:
             raise RuntimeError("Snohomish Tribune: no current legals PDF found (page layout/source change)")
@@ -229,7 +230,10 @@ class SnohomishWAPreForeclosureScraper(BridgeScraper):
             _logger.warning("Snohomish Tribune: partial coverage, %s (%s)", partial, pdf_url)
         _logger.info("Snohomish pre_foreclosure complete — %d blocks → %d leads", len(blocks), len(records))
         if self.on_progress:
-            self.on_progress(1, 1, len(records))
+            # No unit denominator: this connector does one search, so "1 of 1"
+            # would be a made-up 100% arriving the instant the run ends. The
+            # record count is real and is what the Records tile reads.
+            self.on_progress(0, 0, len(records))
         return records
 
     async def __aenter__(self) -> "SnohomishWAPreForeclosureScraper":

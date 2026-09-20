@@ -164,7 +164,7 @@ async def _alert_source_failure(source: CodeViolationSource, exc: Exception,
 
 def _report_progress(callback, pages: int, total: int, count: int) -> None:
     try:
-        callback(pages, total, count)
+        callback(pages, total, count, unit="page")
     except Exception as exc:
         raise_if_time_limit(exc)  # the job's deadline, never a callback failure
         raise ProgressCallbackError(f"progress callback failed: {str(exc)[:160]}") from exc
@@ -197,6 +197,9 @@ class KingWACodeViolationScraper(BridgeScraper):
     async def scrape(self, date_from: str, date_to: str) -> list[ScrapedRecord]:
         self.source_status = {}
         self.scrape_warnings = []
+        # Every jurisdiction source is queried below; from the customer's side
+        # that is one search, so it is reported once rather than per source.
+        self.report_stage("searching")
         records: list[ScrapedRecord] = []
         failures: list[tuple[CodeViolationSource, Exception]] = []
 

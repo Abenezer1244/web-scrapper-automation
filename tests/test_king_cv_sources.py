@@ -653,7 +653,7 @@ async def test_a_deadline_inside_the_progress_callback_is_the_jobs_deadline(monk
     monkeypatch.setattr(base, "safe_get", _ArcGIS(burien_pages=BUR_PAGED))
     scraper = kcv.KingWACodeViolationScraper(sources=[burien.BurienSource()])
 
-    def _deadline(*_a):
+    def _deadline(*_a, **_kw):
         raise SoftTimeLimitExceeded()
 
     scraper.on_progress = _deadline
@@ -792,7 +792,7 @@ async def test_a_failing_progress_callback_fails_the_scrape_not_the_jurisdiction
     source = burien.BurienSource()
     scraper = kcv.KingWACodeViolationScraper(sources=[source])
 
-    def _broken(*_a):
+    def _broken(*_a, **_kw):
         raise ConnectionError("Redis went away")
 
     scraper.on_progress = _broken
@@ -814,9 +814,12 @@ async def test_a_progress_callback_never_outlives_the_scrape_that_set_it(monkeyp
     source = burien.BurienSource()
     scraper = kcv.KingWACodeViolationScraper(sources=[source])
     seen: list = []
-    scraper.on_progress = lambda *a: seen.append(a)
+    scraper.on_progress = lambda *a, **kw: seen.append((a, kw))
     await scraper.scrape("01/01/2026", "09/14/2026")
     assert seen and source.on_progress is None
+    # The aggregator names the unit on behalf of every source, so the UI says
+    # "Page 2" instead of showing a bare number it has no noun for.
+    assert all(kw.get("unit") == "page" for _a, kw in seen)
     count = len(seen)
 
     scraper.on_progress = None

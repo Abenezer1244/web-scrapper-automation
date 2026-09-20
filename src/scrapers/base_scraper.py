@@ -6,7 +6,9 @@ import hashlib
 import html
 import json
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from typing import Any, Protocol
 
 from bs4 import BeautifulSoup
@@ -25,6 +27,7 @@ from src.scrapers.browser_identity import (
     resolve_playwright_user_agent,
 )
 from src.scrapers.doc_scope import CollectionScope
+from src.utils.celery_limits import reraise_time_limit
 from src.utils.logger import setup_logger
 from src.utils.safe_http import safe_get
 
@@ -76,20 +79,67 @@ def normalize_party_text(raw: str | None) -> str:
     return s.strip()
 
 
+def chunk_windows(
+    start: datetime, end: datetime, chunk_days: int
+) -> list[tuple[datetime, datetime]]:
+    """The (from, to) windows a chunked scrape will walk, in order.
+
+    Connectors that split a date range into fixed windows need the COUNT up front,
+    to tell the user how big the job is, and the windows themselves to iterate. They
+    used to compute those separately — `max(1, span // chunk_days + 1)` for the
+    count, a `while` loop for the windows — and the two disagreed at every exact
+    multiple of the chunk size. With the 90-day default that made `rolling_90`, the
+    most common configuration, report two chunks while running one: progress could
+    never pass 50%. A same-day range reported one and ran none.
+
+    Deriving both from this one function makes that class of bug unrepresentable
+    rather than merely fixed. A non-positive span walks nothing, which is the
+    honest answer for a range with no days in it.
+    """
+    windows: list[tuple[datetime, datetime]] = []
+    cursor = start
+    while cursor < end:
+        edge = min(cursor + timedelta(days=chunk_days), end)
+        windows.append((cursor, edge))
+        cursor = edge
+    return windows
+
+
 class ProgressCallback(Protocol):
     """Signature every BridgeScraper subclass invokes on its `on_progress` slot.
 
     workers/tasks.py installs a callable matching this shape; some
     scrapers also pass a 4th `phase` arg (e.g. "parcel_lookup",
     "enriching") which defaults to "scraping" when omitted.
+
+    ``page_total`` of 0 has always meant "no denominator yet", NOT "zero pages",
+    and the worker stores it as unknown accordingly.
+
+    ``record_count`` of None means "not counted yet", which is different from 0.
+    A connector that learns its denominator BEFORE it has looked at any records
+    (King announces its chunk count up front) must pass None rather than 0, or the
+    row would assert that the county was searched and came back empty. 0 is
+    reserved for a real, observed zero.
+
+    ``unit`` names what one unit IS — page, chunk, parcel, record — so the UI can
+    say "Part 2 of 5" instead of calling a 90-day window a page. Omit it rather
+    than guess; the counts are still shown, just without a noun.
+
+    ``phase=None`` reports COUNTS WITHOUT CLAIMING A STAGE. A chunked connector
+    knows its denominator before it has opened a browser; announcing it with the
+    default "scraping" would assert the scrape had begun, and announcing it before
+    the startup ``report_stage()`` calls is worse still — those clear the counters
+    on the way in, so the denominator was published and wiped one line later and
+    never reached the API at all (Codex round 6).
     """
 
     def __call__(
         self,
         page_current: int,
         page_total: int,
-        record_count: int,
-        phase: str = "scraping",
+        record_count: int | None,
+        phase: str | None = "scraping",
+        unit: str | None = None,
     ) -> None: ...
 
 
@@ -155,6 +205,41 @@ class BridgeScraper:
         self._user_agent: str | None = None
         self.page: Page | None = None
         self.on_progress: ProgressCallback | None = None
+        # Installed by the worker. Call it through report_stage(), never directly.
+        self.on_stage: Callable[[str], None] | None = None
+
+    # ─── Progress reporting ───────────────────────────────────────────────────
+
+    def report_stage(self, stage: str) -> None:
+        """Say which named activity this scraper has just entered.
+
+        Use it for the parts of a run that take real time but produce no countable
+        output — reaching the portal, solving a captcha, waiting on a search to come
+        back. Those are invisible to everything outside the scraper: the job's
+        ``status`` is already 'scraping' and stays there for the whole call, which on
+        one traced King probate run meant 401 seconds where the only honest thing the
+        UI could say was nothing at all.
+
+        ``stage`` must be one of JOB_STAGES (src/config/constants.py) — that tuple is
+        what the API turns into user-facing copy, so an unrecognised value would
+        reach a customer as a raw identifier. Stages may repeat; re-entering one
+        restarts its clock, which is what the "still connecting" wording wants.
+
+        Never raises. A connector must not fail because telemetry did, and a scraper
+        run with no stage reports is degraded, not broken: the UI falls back to an
+        indeterminate state, which is exactly what "we do not know" should look like.
+        """
+        if self.on_stage is None:
+            return
+        try:
+            self.on_stage(stage)
+        except Exception as exc:  # noqa: BLE001 — telemetry must never fail a scrape
+            # A Celery time limit is the one thing this must not absorb: it
+            # subclasses Exception and arrives on whatever line is executing,
+            # so eating it here would strand the scrape past its soft limit
+            # and leave the hard kill to end it.
+            reraise_time_limit(exc)
+            _logger.debug("stage report %r failed", stage, exc_info=True)
 
     # ─── Collection scope (SHOW — read-only transparency) ─────────────────────
 

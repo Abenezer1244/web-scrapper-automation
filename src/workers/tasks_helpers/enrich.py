@@ -18,6 +18,8 @@ from src.workers.property_identity import legacy_strong_signature as _legacy_str
 from src.workers.tasks_helpers.status import _now, _publish_log
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from src.scrapers.base_scraper import ProgressCallback
 
 _logger = setup_logger("worker.task")
@@ -147,6 +149,7 @@ async def _run_scraper(
     on_progress: "ProgressCallback | None" = None,
     record_type: str | None = None,
     doc_types: list | None = None,
+    on_stage: "Callable[[str], None] | None" = None,
 ):
     """Run the async scraper and stream progress logs back to Redis."""
     # Pass record_type / doc_types ONLY to scrapers whose constructor accepts
@@ -165,9 +168,17 @@ async def _run_scraper(
         kwargs["record_type"] = record_type
     if doc_types is not None and "doc_types" in params:
         kwargs["doc_types"] = doc_types
-    async with scraper_class(**kwargs) as scraper:
-        if on_progress:
-            scraper.on_progress = on_progress
+    # Construct, wire the callbacks, THEN enter. The callbacks used to be attached
+    # inside the `async with`, i.e. after __aenter__ had already launched the browser
+    # — so anything a scraper reported during startup went nowhere. Startup is the
+    # slowest and least visible part of a county run, which makes it the part most
+    # worth hearing about.
+    scraper = scraper_class(**kwargs)
+    if on_progress:
+        scraper.on_progress = on_progress
+    if on_stage:
+        scraper.on_stage = on_stage
+    async with scraper:
         records = await scraper.scrape(date_from, date_to)
 
         # A connector that merges several sources ships what succeeded when one source
@@ -2215,7 +2226,7 @@ def pierce_address_recovery(db, r, job_id: str, config, all_results) -> None:
             )
 
 
-def _enqueue_skip_trace_rows(db, job, r, job_id: str, config) -> None:
+def _enqueue_skip_trace_rows(db, job, r, job_id: str, config, *, on_begin=None) -> None:
     """Enqueue eligible Result rows into pending_skip_trace_rows.
 
     Called by run_scrape_job AFTER enrichment AND the plan cap, so the
@@ -2227,6 +2238,15 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config) -> None:
     skip_trace_enabled and the plan is not Starter. Cache hits are copied onto
     the row for free; misses are queued for the dispatcher, which makes the
     actual (paid) Tracerfy calls.
+
+    ``on_begin`` is called ONCE, after every one of those gates has passed and
+    there is at least one eligible row — that is, at the first moment it is true
+    that contact lookups are going to be queued. The caller uses it to enter the
+    `queuing_contacts` stage. It lives here rather than at the call site so the
+    gates are stated once: a copy of them next to the stage write would drift,
+    and the version that drifted announced the stage for every run whose plan,
+    config or eligible-row count meant nothing would be queued at all (Codex
+    round 7).
     """
     # Local imports — sa_select must be imported here because the module-
     # level import is scoped inside _run_inline_enrichment, not globally
@@ -2366,6 +2386,14 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config) -> None:
 
     if not eligible:
         return
+
+    # Contact lookups ARE going to be queued. Safe to commit on its own here for
+    # the same reason the caller's write was: everything before this point either
+    # committed itself or was read-only, so this commits nothing but the stage,
+    # and it must not stay pending — an open UPDATE holds a lock on the jobs row,
+    # which is the row Cancel Run writes.
+    if on_begin is not None:
+        on_begin()
 
     cache_hits = 0
     cache_misses = 0

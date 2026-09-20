@@ -51,6 +51,21 @@ _logger = setup_logger("api.jobs")
 _SSE_TERMINAL_STATUSES = frozenset({"done", "failed", "cancelled"})
 _SSE_MAX_DURATION_SECONDS = 1800
 _SSE_STATUS_CHECK_SECONDS = 60
+# How often the stream sends a comment line when the job is quiet.
+#
+# A scrape can produce nothing for minutes at a time — 401 consecutive seconds on
+# the run that prompted this work — and until now the connection sent no bytes
+# either. A dropped TCP connection is indistinguishable from a quiet one until
+# something is written, so the client's "LIVE" indicator could sit green on a
+# stream that had been dead for minutes, which is worse than showing nothing.
+#
+# A `:` comment is the SSE-native way to say "still here". It carries no event,
+# clients skip it by spec, and this one is deliberately about the TRANSPORT only:
+# it proves the stream is open, never that the worker is making progress. That
+# second question is answered by progress_stalled on the job itself, and the two
+# must not be conflated — a healthy connection to a dead worker is exactly the
+# state the whole Live Run rework exists to stop misreporting.
+_SSE_KEEPALIVE_SECONDS = 15
 _SSE_HEADERS = {
     "Cache-Control": "no-cache",
     "X-Accel-Buffering": "no",  # Disable nginx buffering for SSE
@@ -976,6 +991,7 @@ async def stream_logs(
 
             next_renew = opened + sse_leases.LEASE_HEARTBEAT_SECONDS
             next_status_check = opened  # first pass: catch a job that ended before we subscribed
+            next_keepalive = opened + _SSE_KEEPALIVE_SECONDS
             while True:
                 now = time.monotonic()
                 if now - opened > _SSE_MAX_DURATION_SECONDS:
@@ -1003,7 +1019,19 @@ async def stream_logs(
                             yield f"data: {{\"type\": \"{current}\"}}\n\n"
                         break
 
-                wait = max(0.0, min(next_renew, next_status_check) - time.monotonic())
+                if now >= next_keepalive:
+                    next_keepalive = now + _SSE_KEEPALIVE_SECONDS
+                    # A comment, not an event: no client sees a log line for it.
+                    yield ": keepalive\n\n"
+
+                # The keepalive deadline joins the others rather than replacing
+                # them: lease renewal and the terminal-status check must keep
+                # their own cadence, and the 30-minute expiry is still enforced
+                # at the top of the loop, so a quiet stream cannot outlive it.
+                wait = max(
+                    0.0,
+                    min(next_renew, next_status_check, next_keepalive) - time.monotonic(),
+                )
                 message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=wait)
                 if message and message.get("type") == "message":
                     yield f"data: {message['data']}\n\n"

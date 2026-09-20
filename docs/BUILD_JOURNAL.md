@@ -92,6 +92,110 @@ owner's word: `chore/security-deps-2026-09-18` fixes a critical `next` RCE that 
 - `codex exec` with a ~60KB prompt dies with "Argument list too long" on Windows; pipe it via
   stdin with `codex exec -` instead.
 
+## 2026-09-20 — The Live Run 0%: unknown was not representable, and nothing was reporting
+
+> Branches: BE `feat/live-run-progress` (PR #348, draft), FE `feat/live-run-progress`
+> (PR #158, draft). Watchdog fix split out and MERGED as BE #347 `8ba7bf8`.
+> Plan + findings: `tasks/todo.md`.
+
+**The complaint:** the Live Run page sits at a giant `0%` with `Records 0 / Pages 0`
+for 5+ minutes while the log stream clearly shows the job working.
+
+**Verified in production first, before changing anything.** Job `b80bd9a5` (King WA
+probate, manual, `status=done`, 57 records scraped, 2 billed) ran 8m42s:
+
+```
+21:54:39  Connecting to county portal...
+          <-- 401s: no log, no status change, page_current=0, page_total=0, record_count=0
+22:01:20  Scrape complete: 57 records found
+22:01:29  Looking up county records for 48 properties...
+          <-- another 97s
+22:03:07  Found 48/48 mailing addresses
+22:03:19  done.   heartbeat alive at 22:02:40
+```
+
+8m18s of an 8m42s run had nothing measurable. **The run was healthy, not stuck** —
+that was the question the user asked and the answer is unambiguous.
+
+**Two causes, both backend:**
+1. `jobs.page_current / page_total / record_count` are `Integer NOT NULL DEFAULT 0`, so
+   "not measured yet" and "measured, found nothing" are the same value.
+2. `status` goes to `scraping` and says nothing more for the whole scrape; `enriching`
+   then covers save, dedup, export, address lookup and contact queueing at once.
+
+The FE then made it visible: the ring was fed `progress ?? (isRunning ? 5 : 0)` while
+the NUMBER inside it was fed `progress ?? 0` — a 5% arc over a "0".
+
+**Built / Shipped:**
+- **BE #347 `8ba7bf8` (MERGED, deployed)** — watchdog recovery writes are now a guarded
+  CAS on (status, started_at, retry_count) as observed, via a frozen `_Candidate`.
+- BE #348 (draft): migration 099 (8 nullable observation columns), worker stage reporting
+  at 8 boundaries, `report_stage()` on BaseScraper, attempt-scoped `_set_progress`,
+  activity-scoped `progress_pct`, `chunk_windows()`, SSE keepalive. 35 new tests.
+- FE #158 (draft): indeterminate ring, unknown-vs-zero tiles, ELAPSED vs ETA, retry
+  countdown, stream silence watchdog, stage-only aria-live.
+
+**Tried / Decided:**
+- Codex reviewed the PLAN before any code and **rejected the first data model**: one
+  shared `last_progress_at` sentinel cannot express independently-known counters, and
+  `records_found` cannot alias `record_count` because the done-CAS overwrites it with the
+  BILLED count (57 scraped -> 2 stored, confirmed on the prod row). Rewrote the model.
+- **Cut on Codex's advice:** whole-run percentage, whole-run ETA, `delivering` as a stage,
+  and the assumption that stages are linear. The prod log proves the last one: the CSV
+  export runs BEFORE enrichment.
+- **No progress event on SSE.** The page already polls an authoritative, replayable
+  snapshot every 3s; a second non-replayable channel only adds an ordering hazard where a
+  late Pub/Sub message overwrites a fresher REST read on reconnect.
+- Stage writes ride commits that already exist (`_publish_log`), so no new commit point
+  enters the work session — the billing writes are deliberately held uncommitted until
+  they can land with the terminal CAS. The two boundaries with no log line after them
+  commit on their own rather than hold a lock on the row Cancel Run writes.
+
+**Caught & fixed (before shipping):**
+- **Codex found a hole in my own watchdog fix.** `_recovery_cas` rolls back on failure, and
+  a rollback EXPIRES every ORM object in the session — `expire_on_commit=False` governs
+  commit, not rollback. One failed row made the rest re-read themselves and compare against
+  their own current values, reintroducing cancel-resurrection through the error path.
+  **Reproduced it before believing it** (with a txn open, `db.rollback()` turned a loaded
+  `scraping` job into `cancelled` on next access), then switched to frozen column tuples.
+- **I nearly merged #347 without that fix.** The second commit was never pushed; the PR head
+  was still commit 1 and CI was green on it. Caught at the merge step by diffing local HEAD
+  against the PR head. Check the PR head SHA, not the local one.
+- The browser pass found **three defects in my own UI work**: failed and cancelled rendered
+  a giant `0%` (terminal-but-not-done fell through to `progress ?? 0`); the ring animated
+  while waiting to retry (motion asserting activity that was not happening); and
+  "Started N/A".
+- King probate's chunk denominator was `max(1, span // 90 + 1)` against a separate `while`
+  loop. Those disagree at **every exact multiple of 90 — and `rolling_90` is exactly 90**,
+  so the most common config could never show progress past 50%.
+
+**Failed / Blocked:**
+- Local full-suite run was **reaped for low memory** at 78%. Did not restart it; CI is the
+  authoritative gate and ran the full suite green on both PRs.
+- `.venv-schema` is broken (its python still points at the removed anaconda). Regenerated
+  `openapi.json` with the rescat venv instead; diff was 113 insertions / 0 deletions, purely
+  additive, so no version drift.
+- `ln -s` on Windows **deep-copies** and the process outlived `TaskStop`, locking a partial
+  `node_modules` in the FE worktree. Killed the `ln.exe` PID, then `mklink /J`.
+
+**Facts learned:**
+- `record_count` is NOT a scrape total. The done-CAS overwrites it with the billed
+  non-duplicate count. Use `records_found` for "how much did we find".
+- A `Session.rollback()` with a transaction open expires loaded ORM objects regardless of
+  `expire_on_commit=False`. Any guard comparing against a loaded object is void after one.
+- `isConnected` in `use-log-stream` was transport-only and proved ONCE, on `response.ok`.
+  `reader.read()` on a dropped connection waits forever, so a dead stream stayed "live".
+- The FE repo has **no test runner at all**. Browser verification is the only mechanism;
+  the stub-API + Playwright rig is the way (`reference_fe_playwright_stub_api_rig`).
+- `AnimatedCounter` renders a 0-9 digit reel, so any DOM probe that greps for "0" in leaf
+  text will false-positive on every counter on the page.
+
+**Pending / Handoff:**
+- Both PRs are DRAFT pending the Codex diff-review gate and owner review.
+- BE #348 must merge and deploy BEFORE FE #158: the page reads fields that ship there.
+- Migration 099 is additive and deploy-safe ahead of the worker; old workers leave the new
+  columns NULL, which reads as UNOBSERVED and is correct for a run they are not reporting.
+
 ---
 
 ## 2026-09-19 — Skip-trace provenance shipped; the login "regression" was our own mount guard

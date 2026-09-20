@@ -189,9 +189,11 @@ class PierceWAARMSScraper(BridgeScraper):
     async def scrape(self, date_from: str, date_to: str) -> list[ScrapedRecord]:
         _logger.info("Pierce WA %s — scraping %s to %s", self.DOC_TYPE_LABEL, date_from, date_to)
 
+        self.report_stage("connecting")
         await self._accept_disclaimer()
         await self.navigate(_ARMS_SEARCH)
         await self._fill_search_form(date_from, date_to)
+        self.report_stage("searching")
 
         all_records: list[ScrapedRecord] = []
         seen_hashes: set[str] = set()
@@ -218,7 +220,7 @@ class PierceWAARMSScraper(BridgeScraper):
             # Report progress to worker (updates DB for real-time API polling)
             page_total = getattr(self, "_page_total", 0)
             if self.on_progress:
-                self.on_progress(page_num, page_total, len(all_records))
+                self.on_progress(page_num, page_total, len(all_records), unit="page")
 
             # Don't click detail pages during pagination — it breaks page state
             # Parcel IDs will be extracted after all pages are collected
@@ -235,7 +237,7 @@ class PierceWAARMSScraper(BridgeScraper):
             _logger.info("Extracting parcel IDs for %d records via detail pages...", len(needs_parcel))
             # Report phase change so frontend shows "Looking up parcel IDs..."
             if self.on_progress:
-                self.on_progress(0, len(needs_parcel), len(all_records), "parcel_lookup")
+                self.on_progress(0, len(needs_parcel), len(all_records), "parcel_lookup", unit="parcel")
             try:
                 # Go to first page
                 first_btn = self.page.locator("#OptionsBar1_imgFirst")
@@ -255,7 +257,7 @@ class PierceWAARMSScraper(BridgeScraper):
         parcel_records = [r for r in all_records if r.parcel_id and len(r.parcel_id) >= 10]
         _logger.info("Batch GIS enriching %d records with parcel IDs", len(parcel_records))
         if self.on_progress:
-            self.on_progress(0, len(parcel_records), len(all_records), "enriching")
+            self.on_progress(0, len(parcel_records), len(all_records), "enriching", unit="parcel")
         if parcel_records:
             parcel_ids = [r.parcel_id for r in parcel_records]
             gis_results = batch_enrich_parcels_gis(parcel_ids, "pierce", "WA")
@@ -569,7 +571,7 @@ class PierceWAARMSScraper(BridgeScraper):
                             if found <= 3 or found % 10 == 0:
                                 _logger.info("  %s → parcel %s", opt["t"], target.parcel_id)
                             if self.on_progress:
-                                self.on_progress(found, len(inst_map), found, "parcel_lookup")
+                                self.on_progress(found, len(inst_map), None, "parcel_lookup", unit="parcel")
 
                 except Exception:
                     pass

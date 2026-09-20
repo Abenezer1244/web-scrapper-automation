@@ -42,10 +42,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _CREDITS = {"normal": 1, "advanced": 2}
 
 
-def _trunc(v, n):
-    return v[:n] if v and len(v) > n else v
-
-
 def _tracerfy_balance():
     """Best-effort read of the Tracerfy account credit balance. None on failure."""
     from src.config import settings
@@ -101,7 +97,7 @@ def main() -> int:
                     help="actually enqueue (default is dry-run, no writes, no spend)")
     args = ap.parse_args()
 
-    from sqlalchemy import and_, select
+    from sqlalchemy import and_, select, text
 
     from src.config import settings
     from src.db.models import (
@@ -116,6 +112,7 @@ def main() -> int:
         build_pending_row_payload,
         payload_subject_key,
     )
+    from src.workers.skip_trace_claim import claim_skip_trace_rows
 
     mode = "COMMIT (writes + enables Tracerfy spend via dispatcher)" if args.commit \
         else "DRY-RUN (no writes, no spend)"
@@ -168,6 +165,17 @@ def main() -> int:
 
             j = {"eligible": 0, "cache_hit": 0, "enqueue_normal": 0,
                  "enqueue_advanced": 0, "nonpersonal": 0, "already_pending": 0}
+            to_claim: list[dict] = []
+
+            # The same job-scoped advisory lock the scrape enqueue takes, so this
+            # script and a live scrape of the same job cannot interleave their
+            # read-decide-claim. Transaction-scoped: released by the commit or
+            # rollback at the end of this run.
+            if args.commit:
+                db.execute(
+                    text("SELECT pg_advisory_xact_lock(hashtext(:k))"),
+                    {"k": f"skip_trace_enqueue:{jid}"},
+                )
 
             for rec in rows:
                 if rec.id in pending_ids:
@@ -206,27 +214,31 @@ def main() -> int:
                         rec.skip_trace_source = "reused"
                         rec.skip_trace_subject_hash = key
                 else:
-                    tt = payload["trace_type"]
-                    j[f"enqueue_{tt}"] += 1
-                    if args.commit:
-                        db.add(PendingSkipTraceRow(
-                            job_id=payload["job_id"],
-                            result_id=payload["result_id"],
-                            user_id=payload["user_id"],
-                            property_address=_trunc(payload["property_address"], 512),
-                            city=_trunc(payload["city"], 128),
-                            state=_trunc(payload["state"], 128),
-                            zip=_trunc(payload["zip"], 128),
-                            first_name=_trunc(payload["first_name"], 128),
-                            last_name=_trunc(payload["last_name"], 128),
-                            mail_address=_trunc(payload["mail_address"], 512),
-                            mail_city=_trunc(payload["mail_city"], 128),
-                            mail_state=_trunc(payload["mail_state"], 128),
-                            mail_zip=_trunc(payload["mail_zip"], 128),
-                            trace_type=tt,
-                            status="queued",
-                        ))
-                        rec.skip_trace_status = "queued"
+                    # Collected, not inserted here. This script used to build
+                    # PendingSkipTraceRow itself, which made it a SECOND writer
+                    # of the queue that knew nothing about the scrape enqueue:
+                    # both could read one lead as 'not_attempted' and both insert,
+                    # and with migration 099 unapplied both rows could be
+                    # submitted and charged (Codex round 15 diff review, round 5).
+                    # It also truncated `state` to 128 into a String(2) column.
+                    # Routing through the shared claim fixes both, and the claim
+                    # requires 099 to be enforced before it will write anything.
+                    to_claim.append(payload)
+
+            # Claim through the shared helper, which re-checks each lead exists,
+            # belongs to this tenant and is still 'not_attempted' inside the one
+            # statement that inserts, and withdraws any row whose lead it did not
+            # win. Counts come from what it ACTUALLY claimed, not from what we
+            # hoped to claim. In a dry run nothing is claimed, so the counts are
+            # what WOULD be attempted.
+            if to_claim:
+                if args.commit:
+                    claimed = set(claim_skip_trace_rows(db, to_claim))
+                else:
+                    claimed = {str(p["result_id"]) for p in to_claim}
+                for payload in to_claim:
+                    if str(payload["result_id"]) in claimed:
+                        j[f"enqueue_{payload['trace_type']}"] += 1
 
             credits = (j["enqueue_normal"] * _CREDITS["normal"]
                        + j["enqueue_advanced"] * _CREDITS["advanced"])

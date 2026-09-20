@@ -2251,6 +2251,7 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config, *, on_begin=None) 
     # Local imports — sa_select must be imported here because the module-
     # level import is scoped inside _run_inline_enrichment, not globally
     from sqlalchemy import select as sa_select
+    from sqlalchemy import text as _sa_text
 
     from src.db.models import Result, SkipTraceCache
     from src.scrapers.enrichment.skip_trace import (
@@ -2300,12 +2301,12 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config, *, on_begin=None) 
     # claims nothing. Transaction-scoped: released by the commit below, and by a
     # rollback, so a crash cannot hold it. Keyed on the job, so jobs never wait
     # on each other.
-    from sqlalchemy import text as _sa_text
-
-    db.execute(
-        _sa_text("SELECT pg_advisory_xact_lock(hashtext(:k))"),
-        {"k": f"skip_trace_enqueue:{job_id}"},
-    )
+    #
+    # Taken BELOW rather than here, deliberately: the charged-unanswered branch
+    # commits mid-function, and a transaction-scoped lock taken before it would
+    # be released by that commit and cover nothing that matters. It is acquired
+    # immediately before the cache-and-claim loop, which runs to the final commit
+    # with no commit in between.
 
     # Reload the surviving results after the unactionable drop. Eligible: the rows this
     # run delivers, AND the rows an earlier run of this account already delivered.
@@ -2425,6 +2426,42 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config, *, on_begin=None) 
     # reading v2 keys, rather than assuming the deploy took. Pairs with the
     # warning `address_cache_key` now logs if anything still reads a legacy key.
     _v2_key_reads = 0
+
+    # ONE ENQUEUE PER JOB AT A TIME (Codex round 15 diff review, rounds 4-5).
+    #
+    # run_scrape_job's atomic claim stops a job being double-SCRAPED, but
+    # watchdog_stuck_jobs re-queues a job that merely looks stuck, and a slow but
+    # still-living worker can then be joined by a second one. Two concurrent
+    # enqueues of the same job read the same 'not_attempted' rows and both claim
+    # them. With migration 099 applied the index refuses the second; without it
+    # (the scrape's fail-open path) both rows can survive, and because owner
+    # recovery can rewrite party_name between the two reads they may carry
+    # DIFFERENT trace_types -- which the dispatcher's submission-collision key
+    # does not collapse, so both are submitted and the customer is charged twice.
+    #
+    # Acquired HERE, not at the top of the function: the charged-unanswered
+    # branch above commits, and a transaction-scoped lock taken before it would
+    # have been released by that commit. From this point to the final commit
+    # there is no commit, so the lock genuinely spans the read-decide-claim.
+    # Transaction-scoped, so both a commit and a rollback release it and a crash
+    # cannot hold it. Keyed on the job, so jobs never wait on each other.
+    db.execute(
+        _sa_text("SELECT pg_advisory_xact_lock(hashtext(:k))"),
+        {"k": f"skip_trace_enqueue:{job_id}"},
+    )
+    # Re-read the leads under the lock. The set read before it is stale by now:
+    # a concurrent enqueue may have claimed some of them, and the claim's own
+    # join would drop those anyway, but re-reading keeps the cache-hit path from
+    # copying an answer onto a row another writer already owns.
+    eligible = list(db.execute(
+        sa_select(Result).where(
+            Result.id.in_([rec.id for rec in eligible]),
+            Result.user_id == job.user_id,
+            Result.skip_trace_status == "not_attempted",
+        )
+    ).scalars().all())
+    if not eligible:
+        return
 
     skipped_ineligible = 0
     skipped_atip_policy = 0

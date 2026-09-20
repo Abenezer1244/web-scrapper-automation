@@ -160,14 +160,22 @@ class ClarkWAScraper(BridgeScraper):
         # span because the loop steps by chunk_days until it reaches `end`; a
         # chunk that throws is skipped below, and counting it as done would let
         # the bar finish while a whole date window of leads had been dropped.
-        # record_count is None here: nothing has been searched yet, and 0 would
-        # claim the county came back empty.
         _windows = chunk_windows(start, end, chunk_days)
         _total_chunks = len(_windows)
         _chunks_done = 0
-        if self.on_progress and _total_chunks:
-            self.on_progress(0, _total_chunks, None, unit="chunk")
         self.report_stage("searching")
+        # Say how big the job is before the long silent part, AFTER the startup
+        # stage transitions rather than before them: report_stage() clears the unit
+        # counters on the way in — deliberately, so a finished scrape's 5 of 5 cannot
+        # follow the run into enrichment — so announcing the denominator first
+        # published it and wiped it one line later, and it never reached the API at
+        # all (Codex round 6). phase=None keeps the stage where it is: the browser
+        # has opened and the search is in, but no chunk has been pulled, so claiming
+        # "scraping" here would be a stage ahead of the work. record_count is None,
+        # not 0: nothing has been searched yet, and 0 would claim the county came
+        # back empty.
+        if self.on_progress and _total_chunks:
+            self.on_progress(0, _total_chunks, None, phase=None, unit="chunk")
         for chunk_start, chunk_end in _windows:
             cf = chunk_start.strftime("%m/%d/%Y")
             ct = chunk_end.strftime("%m/%d/%Y")

@@ -185,14 +185,6 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
         seen: set[str] = set()
         chunk_num = 0
 
-        # Say how big the job is BEFORE the long silent part. The denominator is
-        # known here and was previously not reported until the first chunk had
-        # finished — which on the traced production run was 6m41s of a run that
-        # displayed "0%" throughout. record_count is None, not 0: nothing has been
-        # searched yet, and 0 would claim the county came back empty.
-        if self.on_progress and total_chunks:
-            self.on_progress(0, total_chunks, None, unit="chunk")
-
         # Navigate and accept disclaimer — retry up to 3 times on crash
         self.report_stage("connecting")
         search_url = f"{self._base_url}/search/index" if "/search/" not in self._base_url else self._base_url
@@ -220,6 +212,18 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
         # a 90-day window of leads had been silently dropped.
         chunks_done = 0
         self.report_stage("searching")
+        # Say how big the job is before the long silent part, AFTER the startup
+        # stage transitions rather than before them: report_stage() clears the unit
+        # counters on the way in — deliberately, so a finished scrape's 5 of 5 cannot
+        # follow the run into enrichment — so announcing the denominator first
+        # published it and wiped it one line later, and it never reached the API at
+        # all (Codex round 6). phase=None keeps the stage where it is: the browser
+        # has opened and the search is in, but no chunk has been pulled, so claiming
+        # "scraping" here would be a stage ahead of the work. record_count is None,
+        # not 0: nothing has been searched yet, and 0 would claim the county came
+        # back empty.
+        if self.on_progress and total_chunks:
+            self.on_progress(0, total_chunks, None, phase=None, unit="chunk")
         for chunk_start, chunk_end in windows:
             cf = chunk_start.strftime("%m/%d/%Y")
             ct = chunk_end.strftime("%m/%d/%Y")

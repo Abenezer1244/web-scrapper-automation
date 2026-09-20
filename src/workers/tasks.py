@@ -689,6 +689,11 @@ def run_scrape_job(self, job_id: str) -> None:
             # counters it belongs to — so the activity and the numbers describing it
             # can never disagree, and the stage clock restarts exactly once per real
             # transition rather than on every callback.
+            # phase=None is "counts, no stage claim": _PHASE_STAGES.get(None) is
+            # None, so `advancing` stays False and the stage the connector last
+            # reported survives. That is what lets a chunked scraper publish its
+            # denominator AFTER its startup transitions — which clear the counters
+            # — without also asserting that the scrape has begun (Codex round 6).
             stage_for_phase = _PHASE_STAGES.get(phase)
             advancing = bool(stage_for_phase and stage_for_phase != _last_stage[0])
             if advancing:

@@ -124,6 +124,13 @@ class ProgressCallback(Protocol):
     ``unit`` names what one unit IS — page, chunk, parcel, record — so the UI can
     say "Part 2 of 5" instead of calling a 90-day window a page. Omit it rather
     than guess; the counts are still shown, just without a noun.
+
+    ``phase=None`` reports COUNTS WITHOUT CLAIMING A STAGE. A chunked connector
+    knows its denominator before it has opened a browser; announcing it with the
+    default "scraping" would assert the scrape had begun, and announcing it before
+    the startup ``report_stage()`` calls is worse still — those clear the counters
+    on the way in, so the denominator was published and wiped one line later and
+    never reached the API at all (Codex round 6).
     """
 
     def __call__(
@@ -131,7 +138,7 @@ class ProgressCallback(Protocol):
         page_current: int,
         page_total: int,
         record_count: int | None,
-        phase: str = "scraping",
+        phase: str | None = "scraping",
         unit: str | None = None,
     ) -> None: ...
 

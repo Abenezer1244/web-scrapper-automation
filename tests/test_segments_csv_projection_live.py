@@ -110,29 +110,32 @@ async def _export_row(db: AsyncSession, user: User, rid: str) -> dict:
     return parsed[0]
 
 
-def test_every_row_backed_column_has_a_seeded_expectation():
-    """Closes the escape hatch in the sweep below.
+async def test_no_row_backed_column_renders_blank(
+    db: AsyncSession, starter_user: User
+):
+    """The guard with NO allowlist, so there is nothing to excuse a column into.
 
-    `allowed_blank` is a manual list, so on its own a future row-backed column could be
-    left out of the fixture, added to `allowed_blank`, and ship blank - the same
-    one-judgement weakness as classifying it "derived". This asserts the fixture
-    actually covers every row-backed column in the CSV contract, so adding one without
-    seeding and asserting it fails here rather than silently.
+    Every column the CSV contract sources from a `results` column is populated by
+    `_seed`, so every one of them must render non-blank. Add a row-backed column to
+    `OVERLAP_LEAD_COLUMNS` and this fails until it is both seeded and projected - there
+    is no set to add it to that makes the failure go away, which was the remaining
+    weakness (a fixture-completeness check and a `typed_elsewhere` exemption are both
+    just allowlists wearing different hats).
+
+    Exact VALUES are asserted by the typed tests; this one asserts arrival, which is
+    precisely what a dropped projection destroys.
     """
     from tests.test_segments_auction_columns import _CSV_COLUMN_TO_RESULT_COLUMN
 
-    # Seeded and asserted in the dedicated typed tests above rather than in SEEDED,
-    # because their CSV rendering is not a plain string echo (dates, Decimals).
-    typed_elsewhere = {
-        "auction_date", "default_amount",
-        "delinquent_amount", "delinquent_bill_year",
-        "filed_date",  # rendered from date_recorded
-    }
-    uncovered = set(_CSV_COLUMN_TO_RESULT_COLUMN) - set(SEEDED) - typed_elsewhere
-    assert not uncovered, (
-        f"row-backed CSV columns with no seeded expectation: {sorted(uncovered)}. "
-        "Seed each in SEEDED (plain echo) or assert it in a typed test; do not add it "
-        "to allowed_blank, which would let it ship empty."
+    rid = await _seed(db, starter_user)
+    row = await _export_row(db, starter_user, rid)
+    blank = sorted(
+        c for c in _CSV_COLUMN_TO_RESULT_COLUMN if not (row.get(c) or "").strip()
+    )
+    assert not blank, (
+        f"row-backed CSV columns rendered blank despite being seeded: {blank}. "
+        "A column missing from a segment SELECT arrives as None and renders as an "
+        "empty string, indistinguishable from a genuinely NULL value."
     )
 
 

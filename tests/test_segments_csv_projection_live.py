@@ -110,6 +110,32 @@ async def _export_row(db: AsyncSession, user: User, rid: str) -> dict:
     return parsed[0]
 
 
+def test_every_row_backed_column_has_a_seeded_expectation():
+    """Closes the escape hatch in the sweep below.
+
+    `allowed_blank` is a manual list, so on its own a future row-backed column could be
+    left out of the fixture, added to `allowed_blank`, and ship blank - the same
+    one-judgement weakness as classifying it "derived". This asserts the fixture
+    actually covers every row-backed column in the CSV contract, so adding one without
+    seeding and asserting it fails here rather than silently.
+    """
+    from tests.test_segments_auction_columns import _CSV_COLUMN_TO_RESULT_COLUMN
+
+    # Seeded and asserted in the dedicated typed tests above rather than in SEEDED,
+    # because their CSV rendering is not a plain string echo (dates, Decimals).
+    typed_elsewhere = {
+        "auction_date", "default_amount",
+        "delinquent_amount", "delinquent_bill_year",
+        "filed_date",  # rendered from date_recorded
+    }
+    uncovered = set(_CSV_COLUMN_TO_RESULT_COLUMN) - set(SEEDED) - typed_elsewhere
+    assert not uncovered, (
+        f"row-backed CSV columns with no seeded expectation: {sorted(uncovered)}. "
+        "Seed each in SEEDED (plain echo) or assert it in a typed test; do not add it "
+        "to allowed_blank, which would let it ship empty."
+    )
+
+
 @pytest.mark.parametrize("column", sorted(SEEDED))
 async def test_every_seeded_column_survives_to_the_csv(
     db: AsyncSession, starter_user: User, column: str

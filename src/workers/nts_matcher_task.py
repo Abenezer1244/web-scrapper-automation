@@ -25,6 +25,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
+from src.config.constants import AUCTION_PUBLICATION_LAG_DAYS
 from src.utils.logger import setup_logger
 from src.workers import app
 
@@ -76,13 +77,10 @@ NTS_MISSING_NOT_PUBLISHED = "SOURCE_NOT_PUBLISHED_YET"  # recorded too recently 
 NTS_MISSING_NO_NOTICE = "SOURCE_HAS_NO_NOTICE"      # past the window, source holds nothing
 NTS_MISSING_UNKNOWN = "UNKNOWN"                     # no usable recording date to reason from
 
-# Earliest a notice for a lead recorded today can appear in a newspaper. RCW 61.24.040(1)
-# records the notice of sale >= 90 days before the sale and 61.24.040(5) publishes it
-# between the 35th-28th and the 14th-7th day before the sale, so the FIRST publication
-# lands no sooner than ~55 days after recording. Below this age, a blank is not evidence
-# of anything — the notice cannot exist yet. (Prod 2026-09-19: King leads recorded in
-# Jul/Aug/Sep were 0/845 matched, entirely explained by this window.)
-_PUBLICATION_LAG_MIN_DAYS = 55
+# Earliest a notice for a lead recorded today can appear in a newspaper. Shared with
+# the results API (which reports the same split back to the user) so the two can never
+# drift — see the rationale on the constant itself.
+_PUBLICATION_LAG_MIN_DAYS = AUCTION_PUBLICATION_LAG_DAYS
 
 
 def auction_missing_reason(

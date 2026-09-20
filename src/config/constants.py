@@ -447,3 +447,21 @@ DNC_DISCLAIMER: str = (
     "Registry without prior express consent may result in statutory damages of "
     "$500-$1,500 per call under the TCPA."
 )
+
+
+# How long after a Notice of Trustee Sale is RECORDED before it can first appear in
+# a newspaper, and therefore in the nts_notices cache.
+#
+# RCW 61.24.040(1) records the notice of sale at least 90 days (120 with a 61.24.031
+# letter) before the sale, and 61.24.040(5) publishes it between the 35th-28th and the
+# 14th-7th day before the sale. First publication therefore lands no sooner than about
+# 55 days after recording. Below this age a blank Auction Date is not evidence the
+# source lacks the notice - the notice cannot legally exist in print yet.
+#
+# Measured against prod 2026-09-19: King leads recorded in Jul/Aug/Sep 2026 were 0/845
+# matched, entirely explained by this window.
+#
+# One constant because two places ask the same question and must not drift: the
+# matcher (src/workers/nts_matcher_task.auction_missing_reason) when it records WHY a
+# lead is blank, and the results API when it reports a run's auction coverage.
+AUCTION_PUBLICATION_LAG_DAYS: int = 55

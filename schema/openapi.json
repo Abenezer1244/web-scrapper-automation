@@ -97,6 +97,28 @@
         "title": "ApiKeyResponse",
         "type": "object"
       },
+      "AuctionCoverage": {
+        "description": "Why this run's Auction Date / Principal Owing columns look the way they do.\n\nAuction data does not come from the county recorder. The recorder index carries\nthe lead's identity only; the sale date and the sum owing exist in the published\nNotice of Trustee Sale, which RCW 61.24.040 puts in a newspaper 7-35 days before\nthe sale, i.e. roughly two months AFTER the notice is recorded. So a run over\nrecent recordings legitimately has nothing to show yet, and that is a completely\ndifferent thing from \"the source has nothing for this property\".\n\nComputed from each lead's own recording date, not from a stored marker, so it is\ncorrect for runs that predate the missing-reason stamping.",
+        "properties": {
+          "awaiting_publication": {
+            "default": 0,
+            "title": "Awaiting Publication",
+            "type": "integer"
+          },
+          "matched": {
+            "default": 0,
+            "title": "Matched",
+            "type": "integer"
+          },
+          "no_notice_found": {
+            "default": 0,
+            "title": "No Notice Found",
+            "type": "integer"
+          }
+        },
+        "title": "AuctionCoverage",
+        "type": "object"
+      },
       "BatchChildSummary": {
         "description": "One child scrape within a batch (county x record_type) and its job status.",
         "properties": {
@@ -2958,6 +2980,16 @@
             "default": 0,
             "title": "Already Delivered Count",
             "type": "integer"
+          },
+          "auction_coverage": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AuctionCoverage"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "date_range_mode": {
             "default": "",

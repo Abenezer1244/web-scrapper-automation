@@ -149,33 +149,48 @@ def main() -> int:
             cfg = db.get(ScraperConfig, job.scraper_config_id)
             label = f"{getattr(cfg,'county','?')}/{getattr(cfg,'record_type','?')}"
 
-            # result_ids already queued (any status) — never double-enqueue.
-            pending_ids = set(db.execute(
-                select(PendingSkipTraceRow.result_id)
-                .where(PendingSkipTraceRow.job_id == jid)
-            ).scalars().all())
-
-            rows = db.execute(
-                select(Result).where(and_(
-                    Result.job_id == jid,
-                    Result.skip_trace_status == "not_attempted",
-                    Result.property_address.isnot(None),
-                ))
-            ).scalars().all()
-
             j = {"eligible": 0, "cache_hit": 0, "enqueue_normal": 0,
                  "enqueue_advanced": 0, "nonpersonal": 0, "already_pending": 0}
             to_claim: list[dict] = []
 
             # The same job-scoped advisory lock the scrape enqueue takes, so this
             # script and a live scrape of the same job cannot interleave their
-            # read-decide-claim. Transaction-scoped: released by the commit or
-            # rollback at the end of this run.
+            # read-decide-claim.
+            #
+            # Taken BEFORE the reads below, which is the whole point (Codex round
+            # 15 diff review, round 6). Reading first and locking afterwards left
+            # a window where a live scrape could claim a lead and rewrite its
+            # owner in between: this script's ORM objects would then be stale
+            # (the session runs expire_on_commit=False), and a stale cache hit
+            # would write contacts and 'hit' straight over the scrape's queued
+            # row, whose pending row could still be submitted and paid for.
+            #
+            # Transaction-scoped, released by this job's commit below, so only
+            # ONE job lock is held at a time rather than one per job for the
+            # length of the run.
             if args.commit:
                 db.execute(
                     text("SELECT pg_advisory_xact_lock(hashtext(:k))"),
                     {"k": f"skip_trace_enqueue:{jid}"},
                 )
+
+            # result_ids already queued (any status) — never double-enqueue.
+            pending_ids = set(db.execute(
+                select(PendingSkipTraceRow.result_id)
+                .where(PendingSkipTraceRow.job_id == jid)
+            ).scalars().all())
+
+            # populate_existing: this session does not expire on commit, so a
+            # Result already in the identity map from an earlier job would be
+            # returned with its stale attributes. The rows are read under the
+            # lock and must reflect what is committed right now.
+            rows = db.execute(
+                select(Result).where(and_(
+                    Result.job_id == jid,
+                    Result.skip_trace_status == "not_attempted",
+                    Result.property_address.isnot(None),
+                )).execution_options(populate_existing=True)
+            ).scalars().all()
 
             for rec in rows:
                 if rec.id in pending_ids:
@@ -250,9 +265,15 @@ def main() -> int:
             for k in grand:
                 grand[k] += j[k]
 
-        if args.commit:
-            db.commit()
-        else:
+            # Commit PER JOB, which also releases this job's advisory lock
+            # before the next one is taken. Committing once at the end would
+            # hold every job's lock for the whole run, blocking live scrapes of
+            # unrelated jobs, and would make one late failure discard work
+            # already done for jobs that succeeded.
+            if args.commit:
+                db.commit()
+
+        if not args.commit:
             db.rollback()
 
     total_credits = (grand["enqueue_normal"] * _CREDITS["normal"]

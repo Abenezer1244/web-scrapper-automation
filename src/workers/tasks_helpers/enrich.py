@@ -2453,12 +2453,17 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config, *, on_begin=None) 
     # a concurrent enqueue may have claimed some of them, and the claim's own
     # join would drop those anyway, but re-reading keeps the cache-hit path from
     # copying an answer onto a row another writer already owns.
+    # populate_existing: these Result objects are already in the identity map
+    # from the read above, so without it SQLAlchemy returns the SAME instances
+    # with their stale attributes. The WHERE clause would still filter correctly
+    # (it runs in the database), but the cache-hit path below reads and writes
+    # these objects, and it must see what is committed right now.
     eligible = list(db.execute(
         sa_select(Result).where(
             Result.id.in_([rec.id for rec in eligible]),
             Result.user_id == job.user_id,
             Result.skip_trace_status == "not_attempted",
-        )
+        ).execution_options(populate_existing=True)
     ).scalars().all())
     if not eligible:
         return

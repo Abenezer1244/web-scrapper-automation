@@ -630,7 +630,7 @@ def run_scrape_job(self, job_id: str) -> None:
         _last_phase = [None]  # mutable for closure
 
         def _on_progress(
-            page_current, page_total, record_count, phase="scraping", unit=None,
+            page_current, page_total, record_count=None, phase="scraping", unit=None,
         ):
             """Called by the scraper as it works — updates the DB in real time.
 
@@ -651,7 +651,10 @@ def run_scrape_job(self, job_id: str) -> None:
             """
             job.page_current = page_current
             job.page_total = page_total
-            job.record_count = record_count
+            if record_count is not None:
+                # NOT NULL column: a None here would raise. It stays at whatever was
+                # last observed, which is the honest reading of "no new count".
+                job.record_count = record_count
             try:
                 db.commit()
             except Exception:
@@ -663,11 +666,12 @@ def run_scrape_job(self, job_id: str) -> None:
                     _logger.warning("Progress commit failed — will retry on next update")
 
             observations: dict = {
-                "records_found": record_count,
                 "units_done": page_current,
                 "units_total": page_total if page_total > 0 else None,
                 "last_progress_at": _now(),
             }
+            if record_count is not None:
+                observations["records_found"] = record_count
             if unit:
                 observations["progress_unit"] = unit
             _set_progress(

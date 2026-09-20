@@ -509,7 +509,7 @@ class KingWATaxDelinquentScraper(BridgeScraper):
             page_num += 1
             _logger.info("Fetched %d rows (page=%d, offset=%d)", len(data), page_num, offset)
             if self.on_progress:
-                self.on_progress(page_num, 0, 0)
+                self.on_progress(page_num, 0, None, unit="page")
 
             if len(data) < _PAGE_SIZE:
                 break
@@ -625,7 +625,10 @@ class KingWATaxDelinquentScraper(BridgeScraper):
             )
 
         if self.on_progress:
-            self.on_progress(1, 1, len(records))
+            # No unit denominator: this connector does one search, so "1 of 1"
+            # would be a made-up 100% arriving the instant the run ends. The
+            # record count is real and is what the Records tile reads.
+            self.on_progress(0, 0, len(records))
         return records
 
     async def __aenter__(self):

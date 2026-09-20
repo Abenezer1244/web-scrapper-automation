@@ -21,10 +21,15 @@ Supported record types (subclass and set DOC_TYPE_SEARCH_TEXTS):
 
 import asyncio
 import re
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from src.api.middleware.security import add_scrape_domain
-from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord, normalize_party_text
+from src.scrapers.base_scraper import (
+    BridgeScraper,
+    ScrapedRecord,
+    chunk_windows,
+    normalize_party_text,
+)
 from src.scrapers.preforeclosure import (
     is_cancellation_or_admin,
     orient_pre_foreclosure_party,
@@ -162,7 +167,14 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
         end = datetime.strptime(date_to, "%m/%d/%Y")
         chunk_days = 90  # ~120 results per chunk, 3 pages — fewer captcha solves
 
-        total_chunks = max(1, (end - start).days // chunk_days + 1)
+        # Derived from the windows the loop below ACTUALLY walks, not estimated.
+        # This was `max(1, days // chunk_days + 1)`, which is off at both ends:
+        # exactly 90 days reported 2 chunks while the loop ran 1 (so progress
+        # could never pass 50%), and a same-day range reported 1 while the loop
+        # ran 0. The loop steps by chunk_days until it reaches `end`, so the count
+        # is the ceiling of the span, and a non-positive span walks nothing.
+        windows = chunk_windows(start, end, chunk_days)
+        total_chunks = len(windows)
 
         _logger.info(
             "%s County %s — %s to %s (%d chunks of %d days)",
@@ -173,7 +185,16 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
         seen: set[str] = set()
         chunk_num = 0
 
+        # Say how big the job is BEFORE the long silent part. The denominator is
+        # known here and was previously not reported until the first chunk had
+        # finished — which on the traced production run was 6m41s of a run that
+        # displayed "0%" throughout. record_count is None, not 0: nothing has been
+        # searched yet, and 0 would claim the county came back empty.
+        if self.on_progress and total_chunks:
+            self.on_progress(0, total_chunks, None, unit="chunk")
+
         # Navigate and accept disclaimer — retry up to 3 times on crash
+        self.report_stage("connecting")
         search_url = f"{self._base_url}/search/index" if "/search/" not in self._base_url else self._base_url
         for attempt in range(1, 4):
             try:
@@ -193,9 +214,13 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
                     raise
                 await asyncio.sleep(5)
 
-        chunk_start = start
-        while chunk_start < end:
-            chunk_end = min(chunk_start + timedelta(days=chunk_days), end)
+        # ATTEMPTED (chunk_num) and COMPLETED (chunks_done) are tracked apart. A
+        # chunk that throws is skipped below, and counting it as done would report
+        # work that produced nothing — the progress bar would reach the end while
+        # a 90-day window of leads had been silently dropped.
+        chunks_done = 0
+        self.report_stage("searching")
+        for chunk_start, chunk_end in windows:
             cf = chunk_start.strftime("%m/%d/%Y")
             ct = chunk_end.strftime("%m/%d/%Y")
             chunk_num += 1
@@ -208,7 +233,6 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
                 raise  # block/captcha/error — fail the job, don't silently skip a window
             except Exception as exc:
                 _logger.warning("Chunk %d failed: %s — skipping", chunk_num, str(exc)[:120])
-                chunk_start = chunk_end
                 continue
 
             new_count = 0
@@ -225,10 +249,10 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
                 chunk_num, total_chunks, new_count, len(all_records),
             )
 
+            chunks_done += 1
             if self.on_progress:
-                self.on_progress(chunk_num, total_chunks, len(all_records))
+                self.on_progress(chunks_done, total_chunks, len(all_records), unit="chunk")
 
-            chunk_start = chunk_end
 
         _logger.info("King County %s complete — %d records with parcel IDs", self.DOC_TYPE_LABEL, len(all_records))
         return all_records

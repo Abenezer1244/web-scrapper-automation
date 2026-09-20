@@ -19,10 +19,10 @@ APN all inline — no HTTP detail fetch needed, unlike Thurston/Spokane.
 """
 
 import re
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from src.api.middleware.security import add_scrape_domain
-from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord
+from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord, chunk_windows
 from src.scrapers.divorce import is_divorce_doc, orient_divorce_party
 from src.scrapers.preforeclosure import (
     is_cancellation_or_admin,
@@ -108,10 +108,20 @@ class WhatcomWAScraper(BridgeScraper):
 
         all_records: list[ScrapedRecord] = []
         seen: set[str] = set()
-        chunk_start = start
-
-        while chunk_start < end:
-            chunk_end = min(chunk_start + timedelta(days=chunk_days), end)
+        # Announce the size of the job before the long silent part, and count only
+        # chunks that actually COMPLETED. The denominator is the ceiling of the
+        # span because the loop steps by chunk_days until it reaches `end`; a
+        # chunk that throws is skipped below, and counting it as done would let
+        # the bar finish while a whole date window of leads had been dropped.
+        # record_count is None here: nothing has been searched yet, and 0 would
+        # claim the county came back empty.
+        _windows = chunk_windows(start, end, chunk_days)
+        _total_chunks = len(_windows)
+        _chunks_done = 0
+        if self.on_progress and _total_chunks:
+            self.on_progress(0, _total_chunks, None, unit="chunk")
+        self.report_stage("searching")
+        for chunk_start, chunk_end in _windows:
             cf = chunk_start.strftime("%m/%d/%Y")
             ct = chunk_end.strftime("%m/%d/%Y")
 
@@ -123,7 +133,6 @@ class WhatcomWAScraper(BridgeScraper):
                 raise  # block/error signal — fail the job, don't skip to a false-0
             except Exception as exc:
                 _logger.warning("Chunk failed: %s — skipping", str(exc)[:80])
-                chunk_start = chunk_end
                 continue
 
             new_count = 0
@@ -136,10 +145,10 @@ class WhatcomWAScraper(BridgeScraper):
                     new_count += 1
 
             _logger.info("Chunk done: %d new (total %d)", new_count, len(all_records))
+            _chunks_done += 1
             if self.on_progress:
-                self.on_progress(0, 0, len(all_records))
+                self.on_progress(_chunks_done, _total_chunks, len(all_records), unit="chunk")
 
-            chunk_start = chunk_end
 
         _logger.info("Whatcom WA %s complete — %d records", self._record_type, len(all_records))
         return all_records

@@ -164,7 +164,7 @@ async def _alert_source_failure(source: CodeViolationSource, exc: Exception,
 
 def _report_progress(callback, pages: int, total: int, count: int) -> None:
     try:
-        callback(pages, total, count)
+        callback(pages, total, count, unit="page")
     except Exception as exc:
         raise_if_time_limit(exc)  # the job's deadline, never a callback failure
         raise ProgressCallbackError(f"progress callback failed: {str(exc)[:160]}") from exc

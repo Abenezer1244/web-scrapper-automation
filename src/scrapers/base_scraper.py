@@ -8,6 +8,7 @@ import json
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from typing import Any, Protocol
 
 from bs4 import BeautifulSoup
@@ -77,19 +78,58 @@ def normalize_party_text(raw: str | None) -> str:
     return s.strip()
 
 
+def chunk_windows(
+    start: datetime, end: datetime, chunk_days: int
+) -> list[tuple[datetime, datetime]]:
+    """The (from, to) windows a chunked scrape will walk, in order.
+
+    Connectors that split a date range into fixed windows need the COUNT up front,
+    to tell the user how big the job is, and the windows themselves to iterate. They
+    used to compute those separately — `max(1, span // chunk_days + 1)` for the
+    count, a `while` loop for the windows — and the two disagreed at every exact
+    multiple of the chunk size. With the 90-day default that made `rolling_90`, the
+    most common configuration, report two chunks while running one: progress could
+    never pass 50%. A same-day range reported one and ran none.
+
+    Deriving both from this one function makes that class of bug unrepresentable
+    rather than merely fixed. A non-positive span walks nothing, which is the
+    honest answer for a range with no days in it.
+    """
+    windows: list[tuple[datetime, datetime]] = []
+    cursor = start
+    while cursor < end:
+        edge = min(cursor + timedelta(days=chunk_days), end)
+        windows.append((cursor, edge))
+        cursor = edge
+    return windows
+
+
 class ProgressCallback(Protocol):
     """Signature every BridgeScraper subclass invokes on its `on_progress` slot.
 
     workers/tasks.py installs a callable matching this shape; some
     scrapers also pass a 4th `phase` arg (e.g. "parcel_lookup",
     "enriching") which defaults to "scraping" when omitted.
+
+    ``page_total`` of 0 has always meant "no denominator yet", NOT "zero pages",
+    and the worker stores it as unknown accordingly.
+
+    ``record_count`` of None means "not counted yet", which is different from 0.
+    A connector that learns its denominator BEFORE it has looked at any records
+    (King announces its chunk count up front) must pass None rather than 0, or the
+    row would assert that the county was searched and came back empty. 0 is
+    reserved for a real, observed zero.
+
+    ``unit`` names what one unit IS — page, chunk, parcel, record — so the UI can
+    say "Part 2 of 5" instead of calling a 90-day window a page. Omit it rather
+    than guess; the counts are still shown, just without a noun.
     """
 
     def __call__(
         self,
         page_current: int,
         page_total: int,
-        record_count: int,
+        record_count: int | None,
         phase: str = "scraping",
         unit: str | None = None,
     ) -> None: ...

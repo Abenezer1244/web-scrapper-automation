@@ -286,7 +286,7 @@ class PierceWACodeViolationScraper(BridgeScraper):
 
             page_num += 1
             if self.on_progress:
-                self.on_progress(page_num, 0, len(all_records))
+                self.on_progress(page_num, 0, len(all_records), unit="page")
 
             # Continue while ArcGIS signals more rows (exceededTransferLimit) OR a
             # full page came back; stop only when neither holds (server returned a

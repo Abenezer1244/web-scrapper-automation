@@ -1129,15 +1129,19 @@ def _stage_label(
         return None
 
     noun = _UNIT_NOUNS.get(progress_unit or "")
-    if units_done is not None and units_done > 0:
-        if units_total is not None and units_total > 0:
-            count = (
-                f"{noun} {units_done} of {units_total}" if noun
-                else f"{units_done} of {units_total}"
-            )
-        else:
-            count = f"{noun} {units_done}" if noun else str(units_done)
+    if units_done is not None and units_total is not None and units_total > 0:
+        # 0 of N is shown, not suppressed. A connector that learns its denominator
+        # before it has collected anything (King announces its chunk count up
+        # front) can then say how big the job is straight away, which is the most
+        # reassuring thing available during the long silent opening.
+        count = (
+            f"{noun} {units_done} of {units_total}" if noun
+            else f"{units_done} of {units_total}"
+        )
         return f"{label}: {count}"
+    if units_done is not None and units_done > 0:
+        # A count with no denominator. "Page 3", never "Page 3 of 0".
+        return f"{label}: {noun} {units_done}" if noun else f"{label}: {units_done}"
 
     # No unit count, but a record total was observed. 0 is worth saying out loud on
     # a stage past the scrape: it means the county answered and had nothing, which

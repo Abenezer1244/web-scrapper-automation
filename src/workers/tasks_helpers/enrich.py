@@ -2252,7 +2252,7 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config, *, on_begin=None) 
     # level import is scoped inside _run_inline_enrichment, not globally
     from sqlalchemy import select as sa_select
 
-    from src.db.models import PendingSkipTraceRow, Result, SkipTraceCache
+    from src.db.models import Result, SkipTraceCache
     from src.scrapers.enrichment.skip_trace import (
         build_pending_row_payload,
         code_violation_skip_trace_allowed,
@@ -2406,6 +2406,9 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config, *, on_begin=None) 
 
     skipped_ineligible = 0
     skipped_atip_policy = 0
+    # Payloads for leads with no usable cached answer, claimed in one statement
+    # after the loop rather than added row by row inside it.
+    to_claim: list[dict] = []
     for rec in eligible:
         # An ATIP-named Tacoma owner may be shown, not spent on: counted and reported on
         # its own line, never as "no traceable owner name", which would send whoever
@@ -2469,56 +2472,60 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config, *, on_begin=None) 
             rec.skip_trace_subject_hash = cache_key
             cache_hits += 1
         else:
-            # Enqueue for the dispatcher. Truncate string fields to fit
-            # VARCHAR(128) — code violation descriptions can be 250+ chars
-            # and crash the INSERT with StringDataRightTruncation, which
-            # poisons the session with PendingRollbackError and hangs the job.
-            def _trunc128(v: str | None) -> str | None:
-                return v[:128] if v and len(v) > 128 else v
+            # Collected, not inserted here. The claim is ONE set-based statement
+            # after the loop (see below) so that a conflict is a row-level
+            # no-op instead of a batch-level failure. Truncation to the column
+            # widths now lives in claim_skip_trace_rows, beside the insert it
+            # protects and beside the widths lookup_subject_key hashes against,
+            # so the cache read and the queue write cannot diverge.
+            to_claim.append(payload)
 
-            # property_address + mail_address columns are VARCHAR(512); truncating
-            # them to 128 (a) corrupts the skip-trace cache key (the read path in
-            # _enqueue hashes the FULL Result.property_address, so a 128-truncated
-            # write key would never match -> re-paid traces) and (b) drops real
-            # mailing data sent to Tracerfy. Truncate to the actual column width.
-            def _trunc512(v: str | None) -> str | None:
-                return v[:512] if v and len(v) > 512 else v
+    # THE CLAIM (Codex round 15, finding 15-1). This used to be db.add() per row
+    # plus `rec.skip_trace_status = 'queued'`, flushed at one commit() whose
+    # handler was `except Exception: db.rollback(); db.commit()`. Migration 099
+    # adds a partial unique index on pending_skip_trace_rows(result_id) for
+    # active rows, and under that index a single conflicting row -- which the
+    # Phase 1b "look up contacts" action can now cause by claiming the same lead
+    # concurrently -- would have raised IntegrityError at that commit, rolled
+    # back THE WHOLE JOB'S enqueue (every pending row and every results update)
+    # and then committed an empty transaction. Silent, total, unreported loss.
+    #
+    # The shared helper instead reports exactly which leads it won, and advances
+    # `results` for those and only those. A lost race claims nothing and strands
+    # nothing. It deliberately does not commit: the transaction stays ours, which
+    # is what lets the action worker later write its dispositions in the same one.
+    claimed_ids: list[str] = []
+    if to_claim:
+        from src.workers.skip_trace_claim import claim_skip_trace_rows
 
-            try:
-                pending = PendingSkipTraceRow(
-                    job_id=payload["job_id"],
-                    result_id=payload["result_id"],
-                    user_id=payload["user_id"],
-                    property_address=_trunc512(payload["property_address"]),
-                    city=_trunc128(payload["city"]),
-                    state=_trunc128(payload["state"]),
-                    zip=_trunc128(payload["zip"]),
-                    first_name=_trunc128(payload["first_name"]),
-                    last_name=_trunc128(payload["last_name"]),
-                    mail_address=_trunc512(payload["mail_address"]),
-                    mail_city=_trunc128(payload["mail_city"]),
-                    mail_state=_trunc128(payload["mail_state"]),
-                    mail_zip=_trunc128(payload["mail_zip"]),
-                    trace_type=payload["trace_type"],
-                    status="queued",
-                )
-                db.add(pending)
-            except Exception as exc:
-                # REDTEAM MED I3: log the non-PII Result id, never the
-                # homeowner's party_name, in application logs.
-                _logger.warning("Skip trace enqueue failed for result %s: %s", rec.id, str(exc)[:80])
-                db.rollback()
+        claimed_ids = claim_skip_trace_rows(db, to_claim)
+        claimed = set(claimed_ids)
+        for payload in to_claim:
+            if str(payload["result_id"]) not in claimed:
                 continue
-            rec.skip_trace_status = "queued"
             cache_misses += 1
             if payload["trace_type"] == "advanced":
                 enqueued_advanced += 1
             else:
                 enqueued_normal += 1
+        lost = len(to_claim) - len(claimed)
+        if lost:
+            # Not an error: the lead is already being looked up by whoever won.
+            # Logged because a persistent non-zero here means two writers are
+            # fighting over the same leads and one of them should not be.
+            _logger.info(
+                "Job %s skip trace: %d lead(s) already had an active claim, not re-queued",
+                job_id, lost,
+            )
 
     try:
         db.commit()
     except Exception:
+        # Deliberately still a rollback-and-continue rather than a raise: the
+        # cache-hit copies above are free work worth keeping and the job must not
+        # hang. But it is now LOUD, because under 099 a failure here is no longer
+        # the routine truncation it once was.
+        _logger.exception("Job %s skip trace enqueue commit failed; rolling back", job_id)
         db.rollback()
         db.commit()
 

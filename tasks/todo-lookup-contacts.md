@@ -233,6 +233,228 @@ guessing at it.**
       only, never the correctness mechanism, with the deleted count recorded.
 
 ## Phase 1b - the action, backend
+
+> **Codex round 15 (2026-09-20, consult BEFORE code) returned NO-GO with nine P1 blockers
+> against the 1b section as written below.** Same lesson as round 14: the earlier rounds
+> specified the action and never asked what the EXISTING writers do when the action's ledger
+> is bolted onto them, nor what the API can actually SEE when it has to answer "what happened
+> to my lookup". Prompt and full output: `<scratchpad>/codex_1b_consult.txt` /
+> `codex_1b_out.txt`. Every finding below was verified in code before being accepted; the four
+> marked VERIFIED were re-proved independently rather than taken on Codex's word.
+>
+> **Do not implement the bullets below without these corrections applied.**
+
+**15-1 (P1, VERIFIED) - the migration's own ordering breaks the existing scrape enqueue.**
+Step 2.5 creates the partial unique index; step 7 (share the `ON CONFLICT` claim path) is
+listed later as if it were a tidy-up. `_enqueue_skip_trace_rows` (`enrich.py:2460-2495`) does
+`db.add()` in a loop and flushes at ONE `db.commit()` whose handler is
+`except Exception: db.rollback(); db.commit()`. Once the index exists, a single conflicting
+row raises `IntegrityError` at that commit, the handler rolls back THE WHOLE JOB'S enqueue
+(every pending row AND every `rec.skip_trace_status='queued'` update) and commits an empty
+transaction. Silent, total, unreported loss of a job's lookups.
+- [ ] **Step 7 is a PREREQUISITE of step 2.5, not a follow-up.** Refactor the scrape path onto
+      the shared `INSERT ... ON CONFLICT DO NOTHING ... RETURNING` claim FIRST, update
+      `results` only for returned ids, and never swallow a uniqueness error except the
+      expected conflict. Only then create the index.
+
+**15-2 (P1, self-contradiction) - dispatch-failure terminalization strands the quoted set.**
+The plan says a failed publish marks the action `failed` (CAS on `status='dispatching'`) AND
+that a retry finding it `dispatching` re-dispatches. Both cannot hold: after the first failure
+it is `failed`, so the retry finds no path back and the durable quoted set sits under a
+terminal status with nothing to re-drive it. The house pattern (`enqueue_scrape_job`,
+`routes/jobs.py:266-279`) deliberately does the opposite on a broker publish failure.
+- [ ] Contract: validation failure BEFORE the action is durable -> 4xx/503, no action exists.
+      Action committed but publish uncertain -> leave `dispatching`, return **202 with the
+      action id** ("confirmed, waiting for dispatch"). A reconciler retries dispatch keyed on
+      `action_id`. ONLY a deadline expiry moves `dispatching -> expired` and abandons the
+      quoted rows. Once the worker reaches `running` the API must never terminalize.
+
+**15-3 (P1, VERIFIED) - `miss` and `errored` are not safely re-quotable, and `errored` is
+ambiguous in a way the API cannot resolve.** `tracerfy_ingest.py:749,763`: a `miss` settles the
+pending row `completed`, so it WAS billed - it is an answer, not a gap. Worse,
+`tracerfy_ingest.py:803-811`: when Tracerfy accepted and charged for a row we could not match
+(pending `unmatched`), `results.skip_trace_status` is set to **`errored`** - the SAME value a
+never-submitted pre-submit rejection carries. The distinguishing fact lives on the pending row,
+which `bridgeleads_app` has no grant to read. The scrape path already guards this with the
+charged-unanswered check (`enrich.py:2303`), but that is worker-only. Quoting `errored` would
+re-buy lookups the customer has already paid for.
+- [ ] Quotable is EXACTLY `skip_trace_status = 'not_attempted'`, matching the enqueue. `miss`
+      and `errored` are not quotable.
+- [ ] To make retry decidable later without a second charge, add a durable result-level
+      outcome (`results.last_trace_outcome`: `provider_rejected` | `provider_accepted_unmatched`
+      | ...) written atomically with the existing transitions. **This widens migration 099.**
+      Retry is permitted only for a PROVEN pre-submit rejection, never because `results` says
+      `errored`.
+
+**15-4 (P1) - the action-result vocabulary has no terminal values, so the status page cannot
+work.** `newly_queued` cannot express hit, miss, unmatched-but-billable, errored-before-
+submission, or released. The bite is structural: the API cannot read `pending_skip_trace_rows`,
+so if the disposition does not itself carry the final outcome, `GET /contact-lookups/{id}` can
+never show what happened. An action could reach Tracerfy and have no legal terminal verdict.
+- [ ] Extend the CHECK vocabulary with terminal values (`answered_hit`, `answered_miss`,
+      `unmatched_billable`, `errored_unsubmitted`, `reused`, `released`, `abandoned`), write
+      down the transition matrix, and state which dispositions are BILLABLE. Settlement derives
+      from those states.
+
+**15-5 (P1, VERIFIED) - the existing writers commit independently and cannot join the promised
+cross-table transaction.** `_persist_submission`, `_cancel_undeliverable_queued` (which commits
+internally, `skip_trace_dispatcher.py:545`), `_release_claim`, `tracerfy_ingest` and the
+stale-claim reconciliation all commit on their own today. Until that changes, an action stays
+`newly_queued` forever while billing proceeds elsewhere.
+- [ ] Every path that changes a pending row must update the action-result and its event in the
+      SAME transaction. Remove the internal commit from `_cancel_undeliverable_queued` and give
+      the caller the transaction.
+
+**15-6 (P1) - the claim does not re-check JOB deliverability.** It re-checks result eligibility
+only. A job can become failed, cancelled or undeliverable between quote and claim, and we would
+buy contacts for leads that will never be delivered.
+- [ ] Re-use the dispatcher's authoritative delivery predicate (`_job_delivered_sql` /
+      `_partition_still_deliverable`) inside the claim transaction.
+
+**15-7 (P1, VERIFIED) - the duplicate cleanup uses the wrong submission evidence.**
+`submitted_at` is stamped at `queued -> submitting` BEFORE Tracerfy is contacted
+(`skip_trace_dispatcher.py:280-289`), so it proves a local attempt, not vendor acceptance.
+Cancelling on age, or treating `submitted_at` as evidence, can cause a SECOND paid submission.
+- [ ] Evidence grades: `tracerfy_queue_id` = strong (vendor accepted); `status='submitting'`
+      with no queue id = UNKNOWN outcome; `submitted_at` alone = local attempt only. If a
+      duplicate group contains any unknown-outcome row, quarantine the WHOLE group and
+      reconcile against Tracerfy. Never pick a survivor by age.
+
+**15-8 (P1) - grants and policies are absent and will 500 on deploy day.** `RLS_ENFORCE` is
+true in production and the API is `NOBYPASSRLS`. "RLS like its siblings" is not a grant.
+- [ ] The migration carries the role-guarded block (the 095 pattern): `REVOKE ALL` from
+      PUBLIC/anon/authenticated, exact grants to `bridgeleads_app` and `bridgeleads_system`,
+      tenant-scoped `USING` + `WITH CHECK` policies for the API role, explicit system-role
+      policies, role-existence guards. `scripts/provision_rls_roles.sql` (whose verify DO block
+      RAISEs on stale grants) and `scripts/apply_rls_cutover_policies.sql` are updated in the
+      same change.
+- [ ] `contact_lookup_action_events`: `SELECT, INSERT` for BOTH roles, `UPDATE`/`DELETE` for
+      neither. A blanket `FOR ALL` system policy is the wrong shape here.
+- [ ] "The API may insert initial dispositions but never transition them" is NOT expressible in
+      grants. Enforce allowed INITIAL dispositions with a trigger (or route creation through a
+      controlled function).
+
+**15-9 (P1) - `results` needs `UNIQUE (id, user_id)` and the plan does not say how.** A plain
+`ALTER TABLE ... ADD UNIQUE` builds under ACCESS EXCLUSIVE and blocks all reads and writes on
+the hottest table in the product (171,657 rows). Codex judged the composite FK worth keeping:
+RLS and worker predicates are defense in depth, but only the FK makes cross-tenant attachment
+impossible at the database.
+- [ ] `CREATE UNIQUE INDEX CONCURRENTLY` (autocommit, outside Alembic's transaction), then
+      `ALTER TABLE ... ADD CONSTRAINT ... UNIQUE USING INDEX`, then the child FKs, `NOT VALID`
+      followed by a separate validation step if deploy timing requires it.
+
+**Round 15, the rest (P2, accepted):**
+- [ ] **15-10 daily-cap resume time.** The cap is a ROLLING 24h count and nothing computes a
+      resume time today; the API cannot compute one (no grant on the queue). Formula:
+      the `(spent_today - cap + 1)`-th oldest `submitted_at` in the window, + 24h, ordered
+      deterministically by `(submitted_at, tracerfy_queue_id, id)`, with a small margin for the
+      `>=` boundary. The dispatcher must write it. TTL is **derived from the effective beat
+      interval** (`max(2 * interval + grace, resume_at - now + grace)`), never hardcoded to
+      600s, because beat intervals reset on every deploy here. The Redis value is ADVISORY: if
+      beat stops, the UI must not present stale Redis state as authoritative.
+- [ ] **15-11 (VERIFIED) the global cap is SOFT, not a spend boundary.** The cap check
+      (`skip_trace_dispatcher.py:71-112`) runs in its own session BEFORE the claim's
+      `pg_try_advisory_xact_lock` (`:156/:657`), and one tick may submit several batches, so
+      concurrent ticks can both pass it. Either serialize the decision under the advisory lock
+      and limit the tick to the remaining rows, or document it as a soft alert cap. Do not
+      describe it to the user as a hard limit until it is one.
+- [ ] **15-12 lock order.** `ORDER BY id` in one UPDATE is not a global lock order, and
+      `INSERT ... ON CONFLICT` can take unique-index locks in a different order. Establish ONE
+      order - result rows ascending `(id, user_id)`, then pending rows, then action-result rows
+      - and make the scrape enqueue, the action claim, cancellation, release, the dispatcher
+      transitions and ingest all follow it. Audit every bulk SQL writer; ORM iteration order is
+      not a guarantee. Keep the 2000-row single transaction; do NOT chunk until lock ordering
+      is disciplined and transaction time is measured (chunking would also destroy the "one
+      commit, no crash window" invariant).
+- [ ] **15-13 the DB unique is the concurrency authority, not the Redis lease.** If Redis is
+      down or the key expires during a slow claim, two confirms both reach dispatch. Handle the
+      race explicitly: attempt the action INSERT; on `IntegrityError` roll back, re-fetch by
+      (`quote_id`, `user_id`, `job_id`) and return THAT action - never 500. After the action and
+      action-result rows commit, Redis is no longer required; reconstruct dispatch from the
+      durable rows. Only a quote evicted BEFORE action creation returns `quote_expired`. Add a
+      DB dispatch CAS separate from the worker fencing lease; keep Redis as an optimization.
+- [ ] **15-14 pin the planner's policy inputs.** `code_violation_skip_trace_allowed` reads
+      `settings.PIERCE_CV_OWNER_SKIP_TRACE_ENABLED` at call time, and API and worker are
+      separate services with separate env (this repo has a live incident where a code default
+      was not the production value). Pin the flag values into the quote/action snapshot, not
+      just `planner_version`. The worker may apply a STRICTER current policy but must never add
+      an id outside the durable quoted set.
+- [ ] **15-15 clear the worker lease at claim commit.** A 10-minute lease is right while the
+      worker executes; it is wrong afterwards. A `claimed` action may wait indefinitely behind
+      the daily cap or the kill switch BY DESIGN, so it must never be expired for lease elapse.
+      Only `running` needs fencing.
+- [ ] **15-16 the drift check needs an allowed-state matrix.** `pending='submitting'` with
+      `results='queued'` is an EXPECTED window in the current dispatcher, so a generic
+      "they disagree" check alerts during normal operation. Allowed pairs: `queued->queued`,
+      `submitting->queued`, `submitted->submitted`, `completed->hit|miss`, `errored->errored`,
+      `cancelled->not_attempted`. Only unexpected pairs count as drift.
+- [ ] **15-17 one canonical price.** `0.08` is duplicated in `routes/billing.py:327` and in plan
+      copy, with no constant. Create one canonical integer-cent source with a version mapping to
+      the real Stripe rate. Billing NEVER derives from the action snapshot; the snapshot exists
+      only to make quote-vs-invoice drift detectable.
+
+**Cut as over-engineering (Codex, accepted):** the Redis claim lease becomes optional (the DB
+action row + unique `quote_id` + a DB dispatch CAS are authoritative); no per-lead event for a
+static quote-time exclusion (the action-result row already records it - keep events for
+submission, billability, release, abandonment and settlement); the action's mutable counters are
+a CACHE only, with `contact_lookup_action_results` the source of truth and fully recomputable.
+
+**Codex gate: do not migrate or deploy until 15-1, 15-2, 15-3, 15-4, 15-5, 15-6, 15-7 and 15-8
+are corrected.**
+
+### Production pre-check RESULT (read-only, counts only, 2026-09-20)
+
+Plan step 1 was run against production before any code. `railway run --service worker`,
+inside `SET TRANSACTION READ ONLY`, no PII. Script: `<scratchpad>/prod_1b_precheck.py`.
+
+```
+pending_skip_trace_rows      941 total, 0 ACTIVE
+results                  171,657   not_attempted 170,350 | hit 1,024 | miss 272 | errored 11
+A) duplicate ACTIVE pending rows per result_id : 0 groups, 0 rows   -> index is creatable
+B) pending/results cross-tab outside the 15-16 allowed matrix : 0   -> quote classification sound
+   B2 results in-progress with no active pending row           : 0
+sizing  not_attempted WITH a property address       : 100,548
+        ... of those already-delivered (duplicate)  :  61,442
+099 prereqs  results(id,user_id) index: absent | new tables: absent | action_id: absent
+```
+
+**What this changes in the plan:**
+- **The duplicate cleanup / quarantine / JSON-backup / restore-rehearsal machinery in step 1 is
+  NOT needed.** There is nothing to repair. Do not build it. What survives is a **migration
+  guard** that ABORTS 099 with instructions if a duplicate is present at migration time (the
+  check above is point-in-time and the migration runs later), plus 15-7's evidence grading
+  written down for whoever has to act if the guard ever fires. Build the repair script then,
+  against real rows, not now against imagined ones.
+- **The status-drift repair is likewise not needed**, and the daily integrity check keeps the
+  15-16 allowed-state matrix so it does not alert on the normal `submitting -> queued` window.
+- **Scale note for 1c copy and for ops:** the addressable set is ~100.5k leads, 61.4k of them
+  already-delivered (exactly the case that drove this feature). At the 2000-id quote cap that is
+  50+ actions to cover; at `SKIP_TRACE_DAILY_ROW_CAP=1000` GLOBAL across all tenants, ONE
+  confirmed 2000-lead action consumes two full days of dispatch capacity for every tenant.
+  Waiting behind the cap is therefore the NORMAL case for a large action, not an edge case,
+  which is why 15-15 (a `claimed` action may wait indefinitely) and 15-10 (an honest resume
+  time) are load-bearing. **A per-account cap stops being safely deferrable the moment this
+  ships to more than one active tenant** - flag to the owner, do not silently absorb.
+
+### Agreed split (owner, 2026-09-20): 1b lands as THREE PRs, not one
+
+CLAUDE.md caps a phase at 5 files, and the reconciled 1b spans the live paid path.
+
+- **1b-0 hardening (no new feature, ships alone):** the shared
+  `INSERT ... ON CONFLICT DO NOTHING ... RETURNING` claim path with `_enqueue_skip_trace_rows`
+  refactored onto it (15-1), `_cancel_undeliverable_queued` de-committed (15-5), the partial
+  unique index + its abort guard, lock order established (15-12). Migration **099**.
+  `results.last_trace_outcome` (15-3) is deliberately NOT here: its only consumer is the quote,
+  so it lands at the head of 1b-1 as migration 100, keeping 1b-0 inside the 5-file rule and on
+  one subject - making the existing path safe for a unique index.
+- **1b-1 read path (touches no money):** `results.last_trace_outcome` (15-3),
+  `contact_lookup_actions` /
+  `contact_lookup_action_results` / `contact_lookup_action_events` with grants + policies +
+  both RLS scripts (15-8), `UNIQUE (id,user_id)` built concurrently (15-9), the disposition
+  vocabulary and transition matrix (15-4), `plan_contact_lookup`, and the quote endpoint.
+- **1b-2 write path:** confirm (15-2, 15-13), the worker claim (15-6, 15-14), ledger
+  integration into the five existing writers (15-5), the reconciler and settlement (15-15).
+
 - [ ] Read-only prod pre-check for (a) duplicate active pending rows per `result_id` and (b) rows
       where `results.skip_trace_status` and the active pending rows disagree, since the quote's
       in-progress classification assumes that invariant. Report both. The second becomes a daily integrity check owned by the same ops alert path as the

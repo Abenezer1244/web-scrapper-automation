@@ -1,0 +1,126 @@
+"""One active skip-trace claim per lead (099).
+
+Nothing stopped two pending_skip_trace_rows existing for one result_id in an
+active status. The scrape enqueue got away with it because it is the only writer
+and it filters on ``results.skip_trace_status = 'not_attempted'``. Phase 1b adds
+a SECOND writer -- the "look up contacts" action -- and the two race: the action
+and a scrape can both decide a lead is eligible, and both insert. The customer
+is then charged twice for one lead and the vendor is asked the same question
+twice.
+
+The partial unique index below is what makes that impossible in the database
+rather than in whoever remembers to check. It is the arbiter for the
+``INSERT ... ON CONFLICT (result_id) WHERE status IN (...) DO NOTHING``
+in src/workers/skip_trace_claim.py, so its predicate and ACTIVE_PENDING_STATUSES
+there must stay identical: widen one without the other and either a second claim
+slips through (double charge) or a legitimate claim is refused forever.
+
+PREREQUISITE, ENFORCED NOT ASSUMED (Codex round 15, finding 15-1). The existing
+scrape enqueue had to move onto that shared ON CONFLICT claim FIRST. It used to
+build rows with db.add() and flush them at one commit() guarded by
+``except Exception: db.rollback(); db.commit()``; with this index in place, a
+single conflict would have rolled back an entire job's enqueue -- every pending
+row and every results status update -- and committed an empty transaction, with
+nothing logged and the leads left silently un-traced.
+
+Verified read-only against production 2026-09-20 before writing this: 0 groups
+with more than one active row, 0 drift between pending status and
+results.skip_trace_status, so the index is creatable as-is and NO cleanup script
+is needed. That was a point-in-time read and this migration runs later, so the
+guard below re-checks and ABORTS with instructions rather than failing on a raw
+unique violation. If it ever fires, the duplicates must be graded by SUBMISSION
+EVIDENCE, not by age (15-7): a ``tracerfy_queue_id`` is proof the vendor accepted
+and charged; ``status='submitting'`` with no queue id is an UNKNOWN provider
+outcome; ``submitted_at`` alone proves only a local attempt, because the
+dispatcher stamps it at queued -> submitting BEFORE it contacts Tracerfy
+(skip_trace_dispatcher.py:280-289). Cancelling the wrong one buys a second paid
+submission, so any group containing an unknown-outcome row is quarantined whole
+and reconciled against Tracerfy by hand.
+
+Lock safety: the index is built CONCURRENTLY in an autocommit block, so it never
+blocks reads or writes on a table the dispatcher is draining. Every step is
+idempotent because the autocommit block leaves the revision unrecorded if the
+build times out (the 098 restart-safety pattern).
+
+Revision ID: 099
+Revises: 098
+Create Date: 2026-09-20
+"""
+from alembic import op
+from sqlalchemy import text
+
+revision = "099"
+down_revision = "098"
+branch_labels = None
+depends_on = None
+
+_INDEX = "uq_pending_skip_trace_active_result"
+_ACTIVE = "('queued','submitting','submitted')"
+
+
+def upgrade() -> None:
+    conn = op.get_bind()
+
+    # Guard BEFORE the build, so a duplicate produces this instruction rather
+    # than a bare "could not create unique index" with a tuple in it.
+    duplicates = conn.execute(text(
+        f"SELECT count(*) FROM (SELECT result_id FROM pending_skip_trace_rows "
+        f"WHERE status IN {_ACTIVE} GROUP BY result_id HAVING count(*) > 1) t"
+    )).scalar()
+    if duplicates:
+        detail = conn.execute(text(
+            f"SELECT count(*) FILTER (WHERE n_evidence > 0) AS with_evidence "
+            f"FROM (SELECT result_id, count(*) FILTER ("
+            f"        WHERE tracerfy_queue_id IS NOT NULL OR status = 'submitting'"
+            f"      ) AS n_evidence "
+            f"      FROM pending_skip_trace_rows WHERE status IN {_ACTIVE} "
+            f"      GROUP BY result_id HAVING count(*) > 1) t"
+        )).scalar()
+        raise RuntimeError(
+            f"Migration 099 ABORTED: {duplicates} result_id(s) already have more than "
+            f"one ACTIVE pending_skip_trace_row, {detail} of them containing a row "
+            f"that may have reached Tracerfy. Do NOT resolve these by age. Grade each "
+            f"group by submission evidence (tracerfy_queue_id = vendor accepted and "
+            f"charged; status='submitting' with no queue id = UNKNOWN outcome; "
+            f"submitted_at alone = local attempt only). Quarantine any group holding "
+            f"an unknown-outcome row and reconcile it against Tracerfy before retrying. "
+            f"See tasks/todo-lookup-contacts.md finding 15-7."
+        )
+
+    with op.get_context().autocommit_block():
+        conn = op.get_bind()
+        conn.execute(text("SET lock_timeout = '5s'"))
+        try:
+            # A failed CONCURRENTLY build leaves the index behind marked INVALID
+            # and it stays invalid forever: IF NOT EXISTS would see the name,
+            # skip the build, and the constraint would never actually hold while
+            # appearing to have been applied. Drop that corpse before rebuilding.
+            #
+            # Safe here, unlike in a live-ops context, because migrations are
+            # serialized by the advisory lock in scripts/migrate.py, so an
+            # invalid index at this point is a dead one and never a build still
+            # in progress. (Outside a migration, indisvalid=false means BUILDING
+            # *or* DEAD -- check pg_stat_progress_create_index before declaring
+            # failure.)
+            is_invalid = conn.execute(text(
+                "SELECT 1 FROM pg_class c JOIN pg_index i ON i.indexrelid = c.oid "
+                "WHERE c.relname = :n AND NOT i.indisvalid"
+            ), {"n": _INDEX}).scalar()
+            if is_invalid:
+                conn.execute(text(f"DROP INDEX CONCURRENTLY IF EXISTS {_INDEX}"))
+            conn.execute(text(
+                f"CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS {_INDEX} "
+                f"ON pending_skip_trace_rows (result_id) WHERE status IN {_ACTIVE}"
+            ))
+        finally:
+            conn.execute(text("RESET lock_timeout"))
+
+
+def downgrade() -> None:
+    with op.get_context().autocommit_block():
+        conn = op.get_bind()
+        conn.execute(text("SET lock_timeout = '5s'"))
+        try:
+            conn.execute(text(f"DROP INDEX CONCURRENTLY IF EXISTS {_INDEX}"))
+        finally:
+            conn.execute(text("RESET lock_timeout"))

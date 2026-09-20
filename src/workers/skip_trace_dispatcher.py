@@ -128,7 +128,21 @@ def dispatch_pending_skip_trace() -> dict:
         # Never pay for a lead that will not be delivered: cancel queued rows whose
         # job failed or was cancelled, or whose lead is over quota, a same-run sibling,
         # or no longer waiting on a trace.
-        swept = _cancel_undeliverable_queued(db)
+        # The sweep no longer commits or swallows its own failure (15-5): the
+        # transaction boundary lives here, at the caller, which is what lets
+        # Phase 1b-2 add the action-disposition and audit writes to this SAME
+        # transaction. `swept is None` keeps its existing meaning of "the sweep
+        # failed", which the compliance gate immediately below depends on.
+        swept: int | None
+        try:
+            swept = _cancel_undeliverable_queued(db)
+            db.commit()
+            if swept:
+                _logger.info("Dispatcher: cancelled %d undeliverable queued row(s)", swept)
+        except Exception as exc:  # noqa: BLE001 - never break the submit loop
+            db.rollback()
+            _logger.warning("Dispatcher: cancel sweep failed: %s", str(exc)[:160])
+            swept = None
         # The sweep is best-effort for the deliverability rules (a failed tick retries in
         # five minutes), but it is also where a Tacoma row enqueued before the paid switch
         # was turned off is withdrawn. While that switch is off, a failed sweep must stop
@@ -476,9 +490,17 @@ def _atip_paid_allowed_sql():
     )
 
 
-def _cancel_undeliverable_queued(db) -> int | None:
-    """Cancel queued rows that must never be paid for. Returns rows cancelled, or None
-    when the sweep itself failed (the caller decides what that means for the tick).
+def _cancel_undeliverable_queued(db) -> int:
+    """Cancel queued rows that must never be paid for. Returns rows cancelled.
+
+    DOES NOT COMMIT, and does not swallow its own failure: it raises, and the
+    caller owns both the transaction and what a failure means for the tick.
+    That is not tidiness (Codex round 15, finding 15-5). From Phase 1b-2 a
+    cancelled row must also move its contact-lookup-action disposition to
+    'released' and append its audit event IN THE SAME TRANSACTION -- otherwise a
+    crash between the two leaves an action reading "still looking" forever while
+    the queue row is already gone, or an audit that disagrees with the queue.
+    A helper that commits underneath its caller makes that atomicity impossible.
 
     A queued row is cancelled when its job ended failed/cancelled without billing
     (and after billing was stamped, see _job_undelivered_sql), or its lead is
@@ -491,7 +513,7 @@ def _cancel_undeliverable_queued(db) -> int | None:
     and no other active row still references it, so a later run can trace it if
     it becomes deliverable. Two statements, not one: a single statement's
     NOT EXISTS would still see the rows it is cancelling as 'queued'. Both are
-    tenant-pinned (system session). Commits; best-effort, never breaks the tick.
+    tenant-pinned (system session).
     """
     from sqlalchemy import text
 
@@ -500,56 +522,48 @@ def _cancel_undeliverable_queued(db) -> int | None:
     from src.scrapers.enrichment.pierce_atip_owner import OWNER_SOURCE as PIERCE_OWNER_SOURCE
     from src.workers.tasks_helpers.dedup import BILLING_STAMP_RELIABLE_SINCE
 
-    try:
-        cancelled = db.execute(
+    cancelled = db.execute(
+        text(
+            "UPDATE pending_skip_trace_rows p SET status = 'cancelled' "  # noqa: S608 — fixed literals + bound params only
+            "FROM jobs j, results r "
+            "WHERE p.status = 'queued' "
+            "  AND j.id = p.job_id AND j.user_id = p.user_id "
+            "  AND r.id = p.result_id AND r.user_id = p.user_id "
+            f"  AND ({_job_undelivered_sql('j')} "
+            f"       OR NOT {skip_trace_eligible_sql('r')} "
+            "       OR r.skip_trace_status <> 'queued' "
+            "       OR COALESCE(r.enrichment_data->>:key, '') = :over_quota "
+            # An ATIP-named Tacoma lead while PIERCE_CV_OWNER_SKIP_TRACE_ENABLED is
+            # off: the name may be shown, not spent on. A row enqueued before the
+            # switch was turned off is withdrawn here, before the submit loop that
+            # follows. Only 'queued' rows are touched; 'submitting'/'submitted' are
+            # already at Tracerfy and belong to the reconciler (Codex).
+            "       OR (CAST(:atip_blocked AS boolean) "
+            "           AND r.enrichment_data->>'source' = 'tacoma_code_violations' "
+            "           AND r.enrichment_data->>'owner_source' = :atip_source)) "
+            "RETURNING p.result_id, p.user_id"
+        ),
+        {"key": DELIVERY_EXCLUDED_KEY, "over_quota": OVER_QUOTA,
+         "since": BILLING_STAMP_RELIABLE_SINCE,
+         "atip_blocked": not settings.PIERCE_CV_OWNER_SKIP_TRACE_ENABLED,
+         "atip_source": PIERCE_OWNER_SOURCE},
+    ).fetchall()
+    if cancelled:
+        db.execute(
             text(
-                "UPDATE pending_skip_trace_rows p SET status = 'cancelled' "  # noqa: S608 — fixed literals + bound params only
-                "FROM jobs j, results r "
-                "WHERE p.status = 'queued' "
-                "  AND j.id = p.job_id AND j.user_id = p.user_id "
-                "  AND r.id = p.result_id AND r.user_id = p.user_id "
-                f"  AND ({_job_undelivered_sql('j')} "
-                f"       OR NOT {skip_trace_eligible_sql('r')} "
-                "       OR r.skip_trace_status <> 'queued' "
-                "       OR COALESCE(r.enrichment_data->>:key, '') = :over_quota "
-                # An ATIP-named Tacoma lead while PIERCE_CV_OWNER_SKIP_TRACE_ENABLED is
-                # off: the name may be shown, not spent on. A row enqueued before the
-                # switch was turned off is withdrawn here, before the submit loop that
-                # follows. Only 'queued' rows are touched; 'submitting'/'submitted' are
-                # already at Tracerfy and belong to the reconciler (Codex).
-                "       OR (CAST(:atip_blocked AS boolean) "
-                "           AND r.enrichment_data->>'source' = 'tacoma_code_violations' "
-                "           AND r.enrichment_data->>'owner_source' = :atip_source)) "
-                "RETURNING p.result_id, p.user_id"
+                "UPDATE results r SET skip_trace_status = 'not_attempted' "
+                "FROM unnest(CAST(:rids AS uuid[]), CAST(:uids AS uuid[])) "
+                "     AS x(result_id, user_id) "
+                "WHERE r.id = x.result_id AND r.user_id = x.user_id "
+                "  AND r.skip_trace_status = 'queued' "
+                "  AND NOT EXISTS (SELECT 1 FROM pending_skip_trace_rows o "
+                "    WHERE o.result_id = r.id AND o.user_id = r.user_id "
+                "      AND o.status IN ('queued', 'submitting', 'submitted'))"
             ),
-            {"key": DELIVERY_EXCLUDED_KEY, "over_quota": OVER_QUOTA,
-             "since": BILLING_STAMP_RELIABLE_SINCE,
-             "atip_blocked": not settings.PIERCE_CV_OWNER_SKIP_TRACE_ENABLED,
-             "atip_source": PIERCE_OWNER_SOURCE},
-        ).fetchall()
-        if cancelled:
-            db.execute(
-                text(
-                    "UPDATE results r SET skip_trace_status = 'not_attempted' "
-                    "FROM unnest(CAST(:rids AS uuid[]), CAST(:uids AS uuid[])) "
-                    "     AS x(result_id, user_id) "
-                    "WHERE r.id = x.result_id AND r.user_id = x.user_id "
-                    "  AND r.skip_trace_status = 'queued' "
-                    "  AND NOT EXISTS (SELECT 1 FROM pending_skip_trace_rows o "
-                    "    WHERE o.result_id = r.id AND o.user_id = r.user_id "
-                    "      AND o.status IN ('queued', 'submitting', 'submitted'))"
-                ),
-                {"rids": [str(c.result_id) for c in cancelled],
-                 "uids": [str(c.user_id) for c in cancelled]},
-            )
-        db.commit()
-        if cancelled:
-            _logger.info("Dispatcher: cancelled %d undeliverable queued row(s)", len(cancelled))
-        return len(cancelled)
-    except Exception as exc:  # noqa: BLE001 - never break the submit loop
-        db.rollback()
-        _logger.warning("Dispatcher: cancel sweep failed: %s", str(exc)[:160])
-        return None
+            {"rids": [str(c.result_id) for c in cancelled],
+             "uids": [str(c.user_id) for c in cancelled]},
+        )
+    return len(cancelled)
 
 
 # ─── One answer, bought once ──────────────────────────────────────────────────

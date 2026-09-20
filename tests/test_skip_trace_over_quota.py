@@ -17,6 +17,7 @@ import uuid
 import pytest
 import redis as sync_redis
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 
 from src.api.lead_actionability import DELIVERY_EXCLUDED_KEY, OVER_QUOTA
 from src.db.models import Job, PendingSkipTraceRow, Result, ScraperConfig, User
@@ -77,10 +78,20 @@ async def _status(db, table: str, row_id: str) -> str:
 
 
 def _sweep() -> int:
+    """Run the sweep the way the dispatcher tick now does.
+
+    `_cancel_undeliverable_queued` no longer commits (Codex round 15, finding
+    15-5): the caller owns the transaction, so that Phase 1b-2 can write the
+    contact-lookup-action disposition and its audit event in the SAME one. This
+    helper therefore commits, exactly like the real caller in
+    dispatch_pending_skip_trace.
+    """
     from src.db.session import system_sync_session
 
     with system_sync_session() as s:
-        return dispatcher._cancel_undeliverable_queued(s)
+        swept = dispatcher._cancel_undeliverable_queued(s)
+        s.commit()
+        return swept
 
 
 class TestCancelSweep:
@@ -153,14 +164,36 @@ class TestCancelSweep:
         assert await _status(db, "pending_skip_trace_rows", row) == "submitting"
         assert await _status(db, "results", lead) == "submitted"
 
-    async def test_a_lead_another_active_row_still_references_keeps_its_status(self, db, business_user):
+    async def test_a_lead_can_no_longer_have_two_active_rows(self, db, business_user):
+        """This replaces `test_a_lead_another_active_row_still_references_keeps_its_status`.
+
+        That test seeded one lead with BOTH a 'queued' and a 'submitting' pending
+        row and asserted the sweep left the lead alone, because the sweep's
+        second statement releases a lead only when no other ACTIVE row still
+        references it. Migration 099 makes that state impossible: a partial
+        unique index on pending_skip_trace_rows(result_id) for active rows now
+        refuses the second one outright, which is a stronger guarantee than
+        handling it afterwards. Production carried 0 such groups across 941
+        pending rows when this was verified, so nothing legitimate is being
+        forbidden -- the enqueue only ever picks up leads reading
+        'not_attempted', and it stamps 'queued' as it claims them.
+
+        The sweep's NOT EXISTS guard is deliberately KEPT as defence in depth;
+        it is simply no longer reachable by way of a duplicate active row.
+        """
         job = await _job(db, business_user, "failed")
         lead = await _lead(db, business_user, job)
         queued = await _pending(db, business_user, job, lead)
-        await _pending(db, business_user, job, lead, status="submitting")
+
+        with pytest.raises(IntegrityError):
+            await _pending(db, business_user, job, lead, status="submitting")
+        await db.rollback()
+
+        # And the ordinary path still holds: cancelling a lead's only active row
+        # releases the lead back to 'not_attempted' for a later run.
         _sweep()
         assert await _status(db, "pending_skip_trace_rows", queued) == "cancelled"
-        assert await _status(db, "results", lead) == "queued"
+        assert await _status(db, "results", lead) == "not_attempted"
 
 
 @pytest.fixture

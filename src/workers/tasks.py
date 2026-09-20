@@ -795,6 +795,24 @@ def run_scrape_job(self, job_id: str) -> None:
                     },
                 )
             return
+        except (SoftTimeLimitExceeded, TimeLimitExceeded):
+            # A Celery time limit must ESCAPE this handler, not be classified by it.
+            # `_RunScrapeJobTask.on_failure` already treats timeouts as RECOVERABLE
+            # and deliberately declines to terminalize them, so the watchdog can
+            # re-queue the attempt — but that only works if the exception reaches
+            # the task boundary. Caught here it is just another `Exception`:
+            # `is_transient_scrape_error` does not know Celery, so it reads as
+            # PERMANENT, `_fail_job` runs, the task then returns normally, and
+            # `on_failure` never fires. A recoverable timeout became a dead job.
+            #
+            # True for a timeout landing anywhere in the scrape, which predates this
+            # change; re-raising them out of the telemetry writes (so they cannot be
+            # swallowed there either) made a second route into the same handler,
+            # which is how it was noticed (Codex round 8).
+            #
+            # No rollback: the work session is held in a `with rls_sync_session(...)`
+            # block whose exit closes it and releases the jobs-row lock.
+            raise
         except Exception as exc:
             _logger.exception("Scraper error for job %s", job_id)
             # attempt_started_at is the token the CLAIM returned, captured once at

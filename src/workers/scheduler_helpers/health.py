@@ -1,6 +1,7 @@
 """Body logic for the health beat tasks: watchdog_stuck_jobs + canary_check."""
 
 from datetime import UTC, datetime, timedelta
+from typing import NamedTuple
 
 from src.config.constants import (
     HEARTBEAT_STALE_MINUTES,
@@ -45,6 +46,98 @@ _WATCHDOG_REDELIVER_LIMIT = 500
 _CANARY_HISTORICAL_WINDOWS = [(90, 83), (270, 240)]
 
 
+class _Candidate(NamedTuple):
+    """One stuck job AS THE WATCHDOG OBSERVED IT, frozen at SELECT time.
+
+    Deliberately not an ORM object. A Session expires every loaded instance on
+    rollback, so one failed recovery write would silently re-load the REST of the
+    batch from the database on next attribute access — and the guard below would
+    then be comparing a row against its own current values, which always match.
+    A job cancelled since the SELECT would pass and be resurrected: the exact bug
+    this guard exists to prevent, reachable through the error path (Codex).
+
+    Verified, not assumed: with a transaction open, `db.rollback()` turns a loaded
+    job whose status was 'scraping' into one reading 'cancelled' on next access.
+
+    A tuple of scalars cannot be expired, refreshed or lazily re-read.
+    """
+
+    id: str
+    status: str
+    retry_count: int
+    started_at: "datetime | None"
+    user_id: str
+    scraper_config_id: str
+
+
+def _recovery_cas(db, job: _Candidate, **values) -> bool:
+    """Apply one watchdog recovery write, ONLY if the row has not moved. Returns fired.
+
+    The watchdog SELECTs candidates and then decides what to do with them in
+    Python. Anything can happen to a row in that window — the user cancels it, the
+    worker finishes it, a concurrent tick re-queues it — so the write must not be a
+    blind UPDATE by primary key.
+
+    It used to be exactly that: the loop mutated ORM attributes and committed, so a
+    cancel that landed between the SELECT and the commit was overwritten. The row
+    went `cancelled` -> `pending`, the watchdog enqueued it, and the worker's
+    pending-only claim CAS — whose whole job is to stop a cancelled row being
+    picked up — saw a legitimately pending job and ran it. A cancelled run could
+    therefore re-scrape, re-bill and re-deliver. The terminal branch had the mirror
+    problem: it could stamp `failed` over a `done` the worker had just committed,
+    on a job the customer had already been charged for and could already download.
+
+    So every recovery write is now a conditional UPDATE guarded on the three facts
+    that identify the row AS OBSERVED:
+
+      * ``status``      — a terminal transition (cancel, done, fail) breaks it, and
+                          so does another tick having already re-queued the row.
+      * ``started_at``  — the attempt token. A row re-claimed by a newer attempt
+                          since the SELECT has a different (or NULL) value, so a
+                          stale decision can never land on the live attempt.
+      * ``retry_count`` — two watchdog ticks racing cannot both burn a retry.
+
+    ``job`` is a frozen ``_Candidate``, never an ORM instance — see that class for
+    why the difference is load-bearing rather than stylistic.
+
+    Commits per job, like ``release_quota_reservation``: one problem row can neither
+    block the rest nor leave the others uncommitted. A False return means the write
+    did not land — the caller must not enqueue, alert, or count the job.
+    """
+    from sqlalchemy import update as _sa_update
+
+    from src.db.models import Job
+
+    where = [
+        Job.id == job.id,
+        Job.status == job.status,
+        Job.retry_count == job.retry_count,
+        # IS NULL rather than `= NULL` for a zombie that never recorded an attempt.
+        Job.started_at.is_(None) if job.started_at is None
+        else Job.started_at == job.started_at,
+    ]
+    try:
+        rowcount = db.execute(_sa_update(Job).where(*where).values(**values)).rowcount
+        db.commit()
+    except Exception:  # noqa: BLE001 — one bad row must not abort the whole tick
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        _logger.warning(
+            "Watchdog: recovery write for job %s failed — leaving it for the next "
+            "cycle", job.id, exc_info=True,
+        )
+        return False
+    if rowcount != 1:
+        _logger.info(
+            "Watchdog: job %s changed since it was selected (was %s) — recovery "
+            "skipped", job.id, job.status,
+        )
+        return False
+    return True
+
+
 def _watchdog_stuck_jobs_impl() -> None:
     """Re-queue jobs that have been stuck in an ACTIVE state past the task budget.
 
@@ -64,6 +157,10 @@ def _watchdog_stuck_jobs_impl() -> None:
     cutoff (> the 65min Celery hard limit) so a live long job that predates the
     heartbeat is never falsely re-queued during the rolling deploy. New jobs beat
     within ~60s, so the heartbeat path governs them almost immediately.
+
+    Every write this function makes goes through ``_recovery_cas``, so a decision
+    taken from the SELECT can only land on a row that has not changed since. See
+    that helper for what the guard covers and the cancel-resurrection bug it closes.
     """
     from sqlalchemy import and_, or_, select
 
@@ -90,8 +187,14 @@ def _watchdog_stuck_jobs_impl() -> None:
     queued_cutoff = now - timedelta(minutes=ZOMBIE_UNSTARTED_MINUTES)
 
     with system_sync_session() as db:
-        stuck_jobs = db.execute(
-            select(Job).where(
+        # Columns, not entities. The result is a list of immutable Rows that no
+        # rollback can expire out from under the decisions made below.
+        stuck_jobs = [
+            _Candidate(*row) for row in db.execute(
+            select(
+                Job.id, Job.status, Job.retry_count, Job.started_at,
+                Job.user_id, Job.scraper_config_id,
+            ).where(
                 or_(
                     and_(
                         Job.status.in_(STUCK_CHECK_STATUSES),
@@ -149,10 +252,12 @@ def _watchdog_stuck_jobs_impl() -> None:
             )
             .order_by(Job.created_at.asc())
             .limit(_WATCHDOG_REDELIVER_LIMIT)
-        ).scalars().all()
+            ).all()
+        ]
 
         requeued_ids: list[str] = []
-        # M6: alert payloads queued here, dispatched only AFTER the commit below.
+        # M6: alert payloads queued here, dispatched only after the loop, and only
+        # for rows whose guarded write actually landed.
         pending_alerts: list[tuple[str, str, str, str]] = []
         for job in stuck_jobs:
             # A stranded retry (already 'pending' with retry_count>0, never started):
@@ -185,43 +290,53 @@ def _watchdog_stuck_jobs_impl() -> None:
                     int((datetime.now(UTC) - job.started_at).total_seconds() / 60)
                     if job.started_at else "?"
                 )
-                job.retry_count += 1
-                job.status = "pending"
-                job.started_at = None
-                # Clear the DEAD attempt's liveness stamp. A re-queued row is
-                # 'pending' and owned by nobody, so a leftover last_heartbeat_at
-                # is a lie about a worker that is gone. Leaving it set also let the
-                # next attempt inherit an already-stale value and be re-queued on
-                # the following tick, before its own heartbeat thread had written
-                # anything — a retry storm that burns the budget and fails a healthy
-                # job (Codex). run_scrape_job's claim CAS stamps a fresh
-                # last_heartbeat_at too; both layers are deliberate.
-                job.last_heartbeat_at = None
-                # M12 (full-SaaS review): also reset the progress
-                # counters so the UI doesn't show nonsense like
-                # "Page 3 of 5" after a job was re-queued from
-                # page 3. The retried scrape starts over from page 1.
-                job.page_current = 0
-                job.page_total = 0
-                job.record_count = 0
+                # Values are identical to the previous ORM assignments; only the
+                # WRITE is now conditional (see _recovery_cas).
+                #
+                # last_heartbeat_at is cleared because a re-queued row is 'pending'
+                # and owned by nobody, so a leftover stamp is a lie about a worker
+                # that is gone — and it would let the next attempt inherit an
+                # already-stale value and be re-queued on the following tick, before
+                # its own heartbeat thread had written anything (a retry storm that
+                # burns the budget and fails a healthy job — Codex). run_scrape_job's
+                # claim CAS stamps a fresh one too; both layers are deliberate.
+                #
+                # The page counters reset (M12, full-SaaS review) so the UI doesn't
+                # show nonsense like "Page 3 of 5" after a re-queue from page 3. The
+                # retried scrape starts over from page 1.
+                if not _recovery_cas(
+                    db, job,
+                    retry_count=job.retry_count + 1,
+                    status="pending",
+                    started_at=None,
+                    last_heartbeat_at=None,
+                    page_current=0,
+                    page_total=0,
+                    record_count=0,
+                ):
+                    continue
                 requeued_ids.append(job.id)
                 _logger.warning(
                     "Watchdog: re-queued stuck job %s (attempt %d/3, stuck for %s min)",
                     job.id,
-                    job.retry_count,
+                    job.retry_count + 1,
                     stuck_minutes,
                 )
             else:
-                job.status = "failed"
-                job.finished_at = datetime.now(UTC)
-                job.error_message = (
-                    "This scraper run did not complete in time. "
-                    "Our team has been notified and will investigate."
-                )
+                if not _recovery_cas(
+                    db, job,
+                    status="failed",
+                    finished_at=datetime.now(UTC),
+                    error_message=(
+                        "This scraper run did not complete in time. "
+                        "Our team has been notified and will investigate."
+                    ),
+                ):
+                    continue
                 _logger.error("Watchdog: permanently failed job %s after 3 retries", job.id)
-                # M6: queue the ops alert; sent AFTER commit (Codex P2 — an
-                # alert for state that then fails to commit would also burn
-                # the cooldown and suppress the later real alert).
+                # M6: queue the ops alert; sent AFTER the write durably landed
+                # (Codex P2 — an alert for state that then fails to commit would
+                # also burn the cooldown and suppress the later real alert).
                 pending_alerts.append((
                     "watchdog",
                     str(job.id),
@@ -230,17 +345,23 @@ def _watchdog_stuck_jobs_impl() -> None:
                     f"config_id={job.scraper_config_id}",
                 ))
 
-        db.commit()
-
-    # Enqueue AFTER the commit (commit-before-delay, like dispatch_scheduled_jobs
-    # and the batch fan-out): run_scrape_job now claims pending->queued with an
-    # atomic CAS, so a worker that consumes the retry before the 'pending' reset
-    # is committed would read the stale active status, get rowcount 0, and bail —
-    # stranding the job 'pending' with no message. Committing first guarantees the
-    # worker sees 'pending' and can claim it (Codex P2). A per-job try/except keeps
-    # one broker failure from aborting the rest; anything that fails here stays
-    # committed 'pending' with retry_count>0 and is re-picked by the next cycle's
-    # stranded-retry branch above.
+    # Enqueue AFTER the writes are committed (commit-before-delay, like
+    # dispatch_scheduled_jobs and the batch fan-out): run_scrape_job claims
+    # pending->queued with an atomic CAS, so a worker that consumes the retry before
+    # the 'pending' reset is committed would read the stale active status, get
+    # rowcount 0, and bail — stranding the job 'pending' with no message. Committing
+    # first guarantees the worker sees 'pending' and can claim it (Codex P2).
+    # _recovery_cas commits per job, so every id in this list is durably 'pending'.
+    #
+    # Ids only reach this list when their guarded write FIRED, so the watchdog can
+    # no longer enqueue a job it did not actually re-queue. The two re-deliver
+    # branches above add ids without writing at all; if such a job was cancelled
+    # between the SELECT and here, the pending-only claim CAS makes the delivery a
+    # no-op, which is the behaviour that branch has always relied on.
+    #
+    # A per-job try/except keeps one broker failure from aborting the rest; anything
+    # that fails here stays committed 'pending' with retry_count>0 and is re-picked
+    # by the next cycle's stranded-retry branch above.
     for jid in requeued_ids:
         try:
             run_scrape_job.delay(jid)
@@ -250,8 +371,9 @@ def _watchdog_stuck_jobs_impl() -> None:
                 jid, exc_info=True,
             )
 
-    # M6: dispatch alerts AFTER the commit (Codex P2) — never for state that
-    # didn't durably land, and never burning a cooldown on a rolled-back fail.
+    # M6: dispatch alerts only after the write durably landed (Codex P2) — never for
+    # state that didn't commit, and never burning a cooldown on a fail that the CAS
+    # refused because the job had meanwhile finished or been cancelled.
     from src.workers.ops_alerts import send_ops_alert
     for kind, key, subject, body in pending_alerts:
         send_ops_alert(kind, key, subject, body)

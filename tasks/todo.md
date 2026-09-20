@@ -257,6 +257,30 @@ against the real schema. The same omission also blanks `doc_type`, `delinquent_a
 `delinquent_bill_year`, `heirs`, `legal_description` and the owner flags there - left alone
 rather than widened into an unrelated change. ⏭️
 
+### Codex gate: PASS (2026-09-20, after a new login)
+
+Codex was rate-limited when the first report went out. On its return it reviewed
+everything it had not seen, across five rounds:
+
+- API + backfill: **GATE: PASS**, no P1.
+- Lists CSV + frontend: **GATE: FAIL** - P1, fixing 2 of 7 silently-blank columns in the
+  same SELECTs was arbitrary; P2, the all-three-buckets note dropped `no_notice_found`;
+  P2, hiding the note during search reintroduced the ambiguity it exists to remove.
+- After the fix: **GATE: FAIL** - P1, the contract-derived test trusted a human
+  classification; P3, the new branch said "the other 1".
+- After the live test: **GATE: FAIL** - P1, `typed_elsewhere` was just another allowlist.
+- Final: **GATE: PASS**, no P1.
+
+Two Codex findings were NOT adopted, with evidence:
+- It named the owner flags as missing from the Lists CSV. They are not in
+  `OVERLAP_LEAD_COLUMNS`, so that CSV never emits them.
+- It claimed `_seed()` fails to set `Result.record_type`. `Result` has no such column;
+  it lives on `ScraperConfig`, which `_seed()` does set. Codex retracted this.
+
+⏭️ Its open P2: the combined MIXED-record case (intersection across 2+ record types,
+membership-backed) is untested. Name order is a per-representative-row property so the
+behaviour should hold, but nothing proves it.
+
 ### Notes and follow-ups
 
 - The reported job (`18076769`) gains nothing from this and is *correct* as it stands:

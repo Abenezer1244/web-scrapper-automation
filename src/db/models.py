@@ -1152,12 +1152,17 @@ class SkipTraceCache(Base):
     cache. If there's a hit less than 90 days old, the phone/email are copied
     directly to the Result row — no Tracerfy credit consumed.
 
-    PER-TENANT, not global. The key is a SHA-256 hash of (user_id, normalized
-    property address, city, state) — see skip_trace.address_cache_key. One
-    tenant never reads skip-traced PII another tenant paid Tracerfy to source
-    (cross-tenant reuse decision, 2026-06-10); a tenant re-scraping its OWN
-    address still hits its own cache. Minor formatting variations (punctuation,
-    whitespace, casing) collapse to the same key within a tenant.
+    PER-TENANT AND PER-SUBJECT. Since migration 098 the key is a SHA-256 hash of
+    (user_id, property address, city, state, trace_type, first name, last name) —
+    see skip_trace.lookup_subject_key. It identifies WHOSE answer this is, not
+    just where: the address-only key it replaced let a lead inherit the previous
+    owner's phone inside the 90-day window, which probate made likely (the
+    deceased owner is traced, an heir is scraped later). One tenant never reads
+    PII another tenant paid Tracerfy to source (cross-tenant reuse decision,
+    2026-06-10); a tenant re-scraping its OWN lead, same owner, still hits its own
+    cache. Case and whitespace collapse; punctuation does NOT, so a unit number
+    stays part of the address. Rows written before 098 use the legacy key and are
+    inert: nothing reads them.
 
     This docstring previously described the key as address-only, which is how it
     was built originally. A duplicate-scope audit (2026-09-08) read it, believed

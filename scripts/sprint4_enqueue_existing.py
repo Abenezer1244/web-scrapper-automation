@@ -44,6 +44,25 @@ def _enc_pii(value):
 
 
 def main() -> int:
+    # DISABLED at the 098 cutover (Codex round 14, P1).
+    #
+    # This is a one-off Sprint 4 migration that already ran. It reads the LEGACY
+    # address-only cache key and writes whatever it finds straight onto the lead,
+    # so after the cutover it would copy whichever owner happened to be traced
+    # last at an address onto an unrelated owner's record — the exact leak 098
+    # exists to close. It is also not a faithful copy of the enqueue path: it
+    # builds a stub Result and substitutes the MAILING address for the property
+    # address, so even keying it to v2 would key some rows to the wrong subject.
+    #
+    # Left in the tree for its history, not for running. To revive it, rewrite it
+    # against the current enqueue path and the v2 subject key, then delete this.
+    print(
+        "DISABLED: this Sprint 4 one-off reads the pre-098 address-only cache key "
+        "and would copy another owner's contacts onto a lead. Rewrite it against "
+        "the current enqueue path and lookup_subject_key before running it."
+    )
+    return 1
+
     engine = create_engine(settings.DATABASE_URL.replace("+asyncpg", ""), echo=False)
 
     print("=== Enqueue existing Thurston/Kitsap/Whatcom records ===\n")

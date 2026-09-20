@@ -11,7 +11,8 @@ Tracerfy and spends credits. Cache hits are applied immediately and cost 0.
 
 Mirrors the production enqueue path (src/workers/tasks.py::_enqueue_skip_trace_rows):
   - ORM objects so EncryptedString/EncryptedJSON columns auto-encrypt (no raw-SQL PII).
-  - Per-tenant cache check (address_cache_key includes user_id) — free hits.
+  - Per-subject cache check (lookup_subject_key: account + address + trace type +
+    the exact names, migration 098) — free hits, and never another owner's answer.
   - build_pending_row_payload drops non-personal party names (code-violation
     descriptions) so they don't burn advanced-trace credits.
   - trace_type normal=1 credit, advanced=2 credits (cost estimate).
@@ -112,8 +113,8 @@ def main() -> int:
     )
     from src.db.session import system_sync_session
     from src.scrapers.enrichment.skip_trace import (
-        address_cache_key,
         build_pending_row_payload,
+        payload_subject_key,
     )
 
     mode = "COMMIT (writes + enables Tracerfy spend via dispatcher)" if args.commit \
@@ -178,10 +179,11 @@ def main() -> int:
                     continue
                 j["eligible"] += 1
 
-                key = address_cache_key(
-                    job.user_id, payload["property_address"],
-                    payload["city"], payload["state"],
-                )
+                # v2 subject key (migration 098). The legacy address-only key
+                # carries no owner name, so reading it here would copy whichever
+                # owner was traced last at this address onto this lead — and this
+                # script writes that PII straight onto the row.
+                key = payload_subject_key(job.user_id, payload)
                 cached = db.get(SkipTraceCache, key)
                 cache_valid = bool(
                     cached and (datetime.now(UTC) - cached.fetched_at).days
@@ -201,6 +203,8 @@ def main() -> int:
                             "hit" if (cached.phone or cached.email) else "miss"
                         )
                         rec.skip_trace_attempted_at = datetime.now(UTC)
+                        rec.skip_trace_source = "reused"
+                        rec.skip_trace_subject_hash = key
                 else:
                     tt = payload["trace_type"]
                     j[f"enqueue_{tt}"] += 1

@@ -459,7 +459,6 @@ async def test_a_duplicate_reuse_never_copies_contacts_onto_an_atip_named_tacoma
     from datetime import UTC, datetime
 
     from src.config import settings
-
     from src.scrapers.enrichment.skip_trace import lookup_subject_key
 
     atip = {"source": "tacoma_code_violations", "owner_source": "pierce_atip",

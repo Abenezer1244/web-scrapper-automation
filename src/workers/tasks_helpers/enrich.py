@@ -2329,8 +2329,9 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config) -> None:
             )
 
     # A PLACEHOLDER street is not an address, and skip trace bills per lookup.
-    # Worse than the money: address_cache_key() hashes the ADDRESS, so every row
-    # sharing one placeholder string collapses to ONE cache key — measured in
+    # Worse than the money: the cache key hashes the ADDRESS (along with the owner
+    # since 098), so every row sharing one placeholder string AND one owner name
+    # collapses to ONE cache key — measured in
     # production 2026-09-03, 'UNKNOWN UNKNOWN, UNKNOWN WA' is shared by 328
     # DISTINCT parcels. A single Tracerfy result would then be copied onto all 328
     # unrelated leads, stamping one person's phone/email across properties they have

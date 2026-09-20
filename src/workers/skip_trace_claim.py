@@ -116,6 +116,21 @@ _EXACT: dict[str, int] = {"state": 2, "mail_state": 2}
 _TRACE_TYPES = frozenset({"normal", "advanced"})
 
 
+# How Postgres renders migration 099's WHERE clause back from the catalog. Kept
+# beside ACTIVE_PENDING_STATUSES so the two cannot drift silently;
+# test_the_active_predicate_matches_the_index asserts the live index against it.
+_EXPECTED_PREDICATE = (
+    "((status)::text = ANY ((ARRAY["
+    + ", ".join(f"'{s}'::character varying" for s in ACTIVE_PENDING_STATUSES)
+    + "])::text[]))"
+)
+
+
+def _normalize_sql(expression: str | None) -> str:
+    """Whitespace-insensitive form, so formatting is not mistaken for meaning."""
+    return " ".join((expression or "").split())
+
+
 class ClaimUnenforcedError(RuntimeError):
     """Migration 099's index is absent, so a second active claim is possible.
 
@@ -137,26 +152,41 @@ def claim_enforcement_ok(db) -> bool:
     """
     row = db.execute(
         text(
-            "SELECT i.indisunique, i.indisvalid, "
+            "SELECT i.indisunique, i.indisvalid, i.indnatts, "
             "       pg_get_expr(i.indpred, i.indrelid) AS predicate, "
             "       pg_get_indexdef(i.indexrelid) AS definition "
             "FROM pg_class c "
+            "JOIN pg_namespace cn ON cn.oid = c.relnamespace "
             "JOIN pg_index i ON i.indexrelid = c.oid "
             "JOIN pg_class t ON t.oid = i.indrelid "
-            "WHERE c.relname = :n AND t.relname = 'pending_skip_trace_rows'"
+            "JOIN pg_namespace tn ON tn.oid = t.relnamespace "
+            # Schema-qualified on BOTH sides: a same-named index on another
+            # schema's pending_skip_trace_rows would otherwise satisfy this
+            # while the table the application actually writes stays unenforced.
+            "WHERE c.relname = :n AND cn.nspname = 'public' "
+            "  AND t.relname = 'pending_skip_trace_rows' AND tn.nspname = 'public'"
         ),
         {"n": INDEX_NAME},
     ).first()
     if row is None or not row.indisunique or not row.indisvalid:
         return False
-    if "(result_id)" not in (row.definition or ""):
+    # Exactly one indexed column, and it is result_id: a composite unique index
+    # on (result_id, something) permits duplicate active rows per lead.
+    if row.indnatts != 1 or "(result_id)" not in (row.definition or ""):
         return False
-    predicate = row.predicate or ""
-    if any(f"'{s}'" not in predicate for s in ACTIVE_PENDING_STATUSES):
-        return False
-    # Nothing EXTRA: a widened predicate would refuse legitimate re-claims of a
-    # lead whose earlier row is genuinely finished.
-    return predicate.count("::character varying") == len(ACTIVE_PENDING_STATUSES)
+    # The predicate is compared EXACTLY, not by counting casts. Counting was
+    # bypassable: a predicate of
+    #   status IN ('queued','submitting','submitted')
+    #     AND result_id <> '000...0'::uuid
+    # has the right table, uniqueness, validity, one column and exactly three
+    # ::character varying occurrences, yet permits a duplicate active row for
+    # that one lead. Any conjunct at all changes the rendered expression, so an
+    # exact match is the only check that cannot be widened past.
+    #
+    # Rendering is a Postgres implementation detail, so a mismatch is treated as
+    # NOT enforced. That errs toward the action refusing to claim, which costs
+    # availability and never money.
+    return _normalize_sql(row.predicate) == _normalize_sql(_EXPECTED_PREDICATE)
 
 
 def warn_if_unenforced(db) -> bool:
@@ -305,28 +335,54 @@ def claim_skip_trace_rows(
         ),
         params,
     ).scalars().all()
-    claimed_ids = [str(r) for r in claimed]
-    if not claimed_ids:
+    inserted_ids = [str(r) for r in claimed]
+    if not inserted_ids:
         return []
 
-    # Advance ONLY the rows the insert won. The status predicate is repeated
-    # because the insert's join and this update are separate statements.
-    #
-    # There is a narrow interleaving where a concurrent writer settles a lead
-    # BETWEEN the insert and this update, so the pending row is active while
-    # `results` reads 'hit'. It is deliberately not locked against, because it
-    # already self-heals and never reaches the vendor: the dispatcher's
-    # `_cancel_undeliverable_queued` cancels any queued row whose result is no
-    # longer 'queued' (the `r.skip_trace_status <> 'queued'` arm), on the next
-    # five-minute tick, before the submit loop. Locking `results` first to close
-    # it would invert this module's lock order against that same sweep.
-    db.execute(
+    # Advance the rows the insert won. The status predicate is repeated because
+    # the insert's join and this update are separate statements, and it is what
+    # arbitrates a concurrent claim: the loser's UPDATE waits on the winner's row
+    # lock, then re-evaluates against the committed 'queued' and matches nothing.
+    advanced = db.execute(
         text(
             "UPDATE results SET skip_trace_status = 'queued' "
             "WHERE id = ANY(CAST(:ids AS uuid[])) AND user_id = CAST(:uid AS uuid) "
-            "  AND skip_trace_status = :claimable"
+            "  AND skip_trace_status = :claimable "
+            "RETURNING id"
         ),
-        {"ids": sorted(claimed_ids), "uid": user_id,
+        {"ids": sorted(inserted_ids), "uid": user_id,
          "claimable": CLAIMABLE_RESULT_STATUS},
-    )
+    ).scalars().all()
+    claimed_ids = [str(r) for r in advanced]
+
+    # A row we inserted whose result we could NOT advance is one a concurrent
+    # writer settled or claimed in between. Withdraw it here, in this same
+    # uncommitted transaction, so it never exists for anyone else to see.
+    #
+    # This is what makes the claim genuinely atomic rather than
+    # eventually-consistent (Codex round 15 diff review, round 3). Leaving such a
+    # row and trusting the dispatcher's cancel sweep to collect it was not
+    # sufficient: the sweep runs ONCE per tick and BEFORE the submit loop, so a
+    # row stranded after the sweep and before the loop could still be submitted
+    # and charged for a lead that already had its answer. It also made
+    # `require_enforcement=False` genuinely unsafe, because two concurrent
+    # claims could both leave an active row behind with no index to stop them.
+    # Now the loser of any such race withdraws its own row, index or not.
+    stranded = sorted(set(inserted_ids) - set(claimed_ids))
+    if stranded:
+        db.execute(
+            text(
+                "DELETE FROM pending_skip_trace_rows "
+                "WHERE id = ANY(CAST(:ids AS uuid[]))"
+            ),
+            # By OUR primary keys, never by result_id: another writer's row for
+            # the same lead is its business, and deleting it would hand that
+            # lead back while its owner still believes it is claimed.
+            {"ids": [params[f"id_{i}"] for i, p in enumerate(ordered)
+                     if str(p["result_id"]) in set(stranded)]},
+        )
+        _logger.info(
+            "Skip-trace claim withdrew %d row(s) whose lead was settled or claimed "
+            "concurrently; result ids: %s", len(stranded), stranded[:20],
+        )
     return claimed_ids

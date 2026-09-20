@@ -21,6 +21,7 @@ the queue.
 """
 import uuid
 
+import psycopg2
 import pytest
 from sqlalchemy import func, select, text
 
@@ -445,10 +446,117 @@ async def test_enforcement_check_rejects_a_same_named_wrong_index(
             "WHERE status IN ('queued','submitting','submitted','cancelled')"
         ))
         assert await db.run_sync(claim_enforcement_ok) is False
+        await db.execute(text(f"DROP INDEX {INDEX_NAME}"))
+        # The bypass Codex constructed: right table, unique, valid, one column,
+        # and EXACTLY three ::character varying occurrences, so the old
+        # cast-counting check passed it -- yet the extra conjunct lets that one
+        # lead hold duplicate active rows.
+        await db.execute(text(
+            f"CREATE UNIQUE INDEX {INDEX_NAME} ON pending_skip_trace_rows (result_id) "
+            "WHERE status IN ('queued','submitting','submitted') "
+            "  AND result_id <> '00000000-0000-0000-0000-000000000000'::uuid"
+        ))
+        assert await db.run_sync(claim_enforcement_ok) is False, (
+            "an extra predicate conjunct must not pass as the expected index"
+        )
+        await db.execute(text(f"DROP INDEX {INDEX_NAME}"))
+        # A COMPOSITE unique index also permits duplicate active rows per lead.
+        await db.execute(text(
+            f"CREATE UNIQUE INDEX {INDEX_NAME} ON pending_skip_trace_rows "
+            "(result_id, status) "
+            "WHERE status IN ('queued','submitting','submitted')"
+        ))
+        assert await db.run_sync(claim_enforcement_ok) is False
     finally:
         await db.rollback()
 
     assert await db.run_sync(claim_enforcement_ok) is True
+
+
+async def test_enforcement_check_ignores_a_same_named_index_in_another_schema(db):
+    """The catalog query is schema-qualified on both the index and its table. A
+    same-named index on another schema's pending_skip_trace_rows would otherwise
+    satisfy the check while the table the application writes stays unenforced."""
+    from src.workers.skip_trace_claim import INDEX_NAME, claim_enforcement_ok
+
+    await db.execute(text(f"DROP INDEX {INDEX_NAME}"))
+    try:
+        await db.execute(text("CREATE SCHEMA IF NOT EXISTS decoy"))
+        await db.execute(text(
+            "CREATE TABLE decoy.pending_skip_trace_rows "
+            "(result_id uuid, status varchar(16))"
+        ))
+        await db.execute(text(
+            f"CREATE UNIQUE INDEX {INDEX_NAME} ON decoy.pending_skip_trace_rows "
+            "(result_id) WHERE status IN ('queued','submitting','submitted')"
+        ))
+        assert await db.run_sync(claim_enforcement_ok) is False
+    finally:
+        await db.rollback()
+
+    assert await db.run_sync(claim_enforcement_ok) is True
+
+
+async def test_a_lead_settled_between_insert_and_update_leaves_no_row_behind(
+    db, business_user: User,
+):
+    """The claim is atomic, not eventually-consistent.
+
+    A concurrent writer can settle a lead BETWEEN the claim's insert and its
+    results update, so the update matches nothing. Trusting the dispatcher's
+    cancel sweep to collect the leftover row was not enough: the sweep runs ONCE
+    per tick and BEFORE the submit loop, so a row stranded after the sweep could
+    still be submitted and charged for a lead that already had its answer. The
+    claim now withdraws its own row inside the same uncommitted transaction.
+
+    The settle is done through a SEPARATE committed connection, so it really is
+    concurrent rather than a same-session edit the claim could have seen.
+    """
+    cfg = await _config(db, business_user)
+    job_id = await _job(db, business_user, cfg)
+    rid = await _row(db, job_id, business_user.id)
+    payload = await _payload(db, rid)
+
+    def _settle_from_another_connection() -> None:
+        dsn = settings.DATABASE_URL_SYNC.replace("postgresql+psycopg2://", "postgresql://")
+        other = psycopg2.connect(dsn)
+        try:
+            cur = other.cursor()
+            cur.execute(
+                "UPDATE results SET skip_trace_status = 'hit' WHERE id = %s", (rid,)
+            )
+            other.commit()
+        finally:
+            other.close()
+
+    def _claim_with_a_settle_in_the_middle(s):
+        original = s.execute
+        state = {"done": False}
+
+        def _execute(statement, *args, **kwargs):
+            result = original(statement, *args, **kwargs)
+            if ("INSERT INTO pending_skip_trace_rows" in str(statement)
+                    and not state["done"]):
+                state["done"] = True
+                _settle_from_another_connection()
+            return result
+
+        s.execute = _execute
+        try:
+            won = claim_skip_trace_rows(s, [payload])
+        finally:
+            s.execute = original
+        # Without this the test would be vacuous: no settle means no race, and
+        # the claim would simply have succeeded.
+        assert state["done"], "the concurrent settle never fired"
+        return won
+
+    won = await db.run_sync(_claim_with_a_settle_in_the_middle)
+    await db.commit()
+
+    assert won == [], "a lead settled mid-claim must not be reported as claimed"
+    assert await _pending(db, rid) == 0, "the claim left a row behind"
+    assert await _status(db, rid) == "hit"
 
 
 async def test_the_active_predicate_matches_the_index(db):

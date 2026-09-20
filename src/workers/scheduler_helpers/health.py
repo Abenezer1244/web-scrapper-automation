@@ -1,6 +1,7 @@
 """Body logic for the health beat tasks: watchdog_stuck_jobs + canary_check."""
 
 from datetime import UTC, datetime, timedelta
+from typing import NamedTuple
 
 from src.config.constants import (
     HEARTBEAT_STALE_MINUTES,
@@ -45,7 +46,31 @@ _WATCHDOG_REDELIVER_LIMIT = 500
 _CANARY_HISTORICAL_WINDOWS = [(90, 83), (270, 240)]
 
 
-def _recovery_cas(db, job, **values) -> bool:
+class _Candidate(NamedTuple):
+    """One stuck job AS THE WATCHDOG OBSERVED IT, frozen at SELECT time.
+
+    Deliberately not an ORM object. A Session expires every loaded instance on
+    rollback, so one failed recovery write would silently re-load the REST of the
+    batch from the database on next attribute access — and the guard below would
+    then be comparing a row against its own current values, which always match.
+    A job cancelled since the SELECT would pass and be resurrected: the exact bug
+    this guard exists to prevent, reachable through the error path (Codex).
+
+    Verified, not assumed: with a transaction open, `db.rollback()` turns a loaded
+    job whose status was 'scraping' into one reading 'cancelled' on next access.
+
+    A tuple of scalars cannot be expired, refreshed or lazily re-read.
+    """
+
+    id: str
+    status: str
+    retry_count: int
+    started_at: "datetime | None"
+    user_id: str
+    scraper_config_id: str
+
+
+def _recovery_cas(db, job: _Candidate, **values) -> bool:
     """Apply one watchdog recovery write, ONLY if the row has not moved. Returns fired.
 
     The watchdog SELECTs candidates and then decides what to do with them in
@@ -72,9 +97,8 @@ def _recovery_cas(db, job, **values) -> bool:
                           stale decision can never land on the live attempt.
       * ``retry_count`` — two watchdog ticks racing cannot both burn a retry.
 
-    ``expire_on_commit=False`` on SyncSessionLocal is load-bearing here: the ORM
-    attributes still hold the values the SELECT read, so the guard compares against
-    the observation the decision was actually made on, with no extra query.
+    ``job`` is a frozen ``_Candidate``, never an ORM instance — see that class for
+    why the difference is load-bearing rather than stylistic.
 
     Commits per job, like ``release_quota_reservation``: one problem row can neither
     block the rest nor leave the others uncommitted. A False return means the write
@@ -163,8 +187,14 @@ def _watchdog_stuck_jobs_impl() -> None:
     queued_cutoff = now - timedelta(minutes=ZOMBIE_UNSTARTED_MINUTES)
 
     with system_sync_session() as db:
-        stuck_jobs = db.execute(
-            select(Job).where(
+        # Columns, not entities. The result is a list of immutable Rows that no
+        # rollback can expire out from under the decisions made below.
+        stuck_jobs = [
+            _Candidate(*row) for row in db.execute(
+            select(
+                Job.id, Job.status, Job.retry_count, Job.started_at,
+                Job.user_id, Job.scraper_config_id,
+            ).where(
                 or_(
                     and_(
                         Job.status.in_(STUCK_CHECK_STATUSES),
@@ -222,7 +252,8 @@ def _watchdog_stuck_jobs_impl() -> None:
             )
             .order_by(Job.created_at.asc())
             .limit(_WATCHDOG_REDELIVER_LIMIT)
-        ).scalars().all()
+            ).all()
+        ]
 
         requeued_ids: list[str] = []
         # M6: alert payloads queued here, dispatched only after the loop, and only

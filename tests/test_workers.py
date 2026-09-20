@@ -248,13 +248,28 @@ def test_watchdog_requeues_job_with_stale_heartbeat():
 # (SyncSessionLocal sets expire_on_commit=False, so it keeps the observed values).
 
 
-def _observed_stuck_job(db: Session) -> Job:
-    """A stuck job, committed, and returned as the ORM object a SELECT would yield."""
+def _observed_stuck_job(db: Session):
+    """A stuck job, committed, and returned EXACTLY as the watchdog observes one.
+
+    A frozen `_Candidate`, not an ORM instance — that is the production type, and
+    the difference is the whole point of `test_a_failed_write_does_not_unfreeze_
+    the_rest_of_the_batch` below. A test that passed an ORM object here would still
+    go green against a watchdog that had regressed to loading entities.
+    """
+    from sqlalchemy import select
+
+    from src.workers.scheduler_helpers.health import _Candidate
+
     user = _create_sync_user(db)
     config = _create_sync_config(db, user.id)
     job = _create_stuck_job(db, user.id, config.id, minutes_ago=75)
     db.commit()
-    return job
+    return _Candidate(*db.execute(
+        select(
+            Job.id, Job.status, Job.retry_count, Job.started_at,
+            Job.user_id, Job.scraper_config_id,
+        ).where(Job.id == job.id)
+    ).one())
 
 
 def test_recovery_cas_refuses_a_job_cancelled_since_it_was_selected():
@@ -306,7 +321,9 @@ def test_recovery_cas_refuses_a_job_that_finished_since_it_was_selected():
             sa_text("UPDATE jobs SET retry_count=3 WHERE id=:j"), {"j": job.id}
         )
         observer.commit()
-        job.retry_count = 3  # what the watchdog's SELECT would have read
+        # Re-observe, so the candidate carries what the watchdog's SELECT would
+        # have read on the tick that decided to permanently fail this job.
+        job = job._replace(retry_count=3)
 
         with SyncSessionLocal() as worker:
             worker.execute(
@@ -442,6 +459,62 @@ def test_recovery_cas_applies_when_the_row_has_not_moved():
         # Stale progress is cleared so the UI can't read "Page 3 of 5" on a run
         # that is about to start over from the beginning.
         assert (refreshed.page_current, refreshed.page_total, refreshed.record_count) == (0, 0, 0)
+
+
+def test_a_failed_write_does_not_unfreeze_the_rest_of_the_batch():
+    """The guard has to survive its own error path.
+
+    `_recovery_cas` rolls back when a write fails, and a rollback EXPIRES every ORM
+    instance loaded in that session — `expire_on_commit=False` governs commit, not
+    rollback. So if the watchdog held ORM objects, one failed row would make every
+    remaining candidate re-read itself from the database on next attribute access,
+    and the guard would then be comparing a row against its own current values,
+    which always match. A job cancelled since the SELECT would sail through and be
+    resurrected: the very bug this guard exists to stop, reached through the error
+    path instead of the happy one. (Codex, on the first version of this fix.)
+
+    Reproduced before fixing: with a transaction open, `db.rollback()` turned a
+    loaded job reading 'scraping' into one reading 'cancelled'.
+
+    The watchdog therefore selects COLUMNS into a frozen `_Candidate`. This test
+    puts a session through exactly that rollback and proves the decision still
+    refuses.
+    """
+    from src.workers.scheduler_helpers.health import _recovery_cas
+
+    with SyncSessionLocal() as observer:
+        job = _observed_stuck_job(observer)
+
+        with SyncSessionLocal() as canceller:
+            canceller.execute(
+                sa_text("UPDATE jobs SET status='cancelled', finished_at=now() WHERE id=:j"),
+                {"j": job.id},
+            )
+            canceller.commit()
+
+        # An EARLIER row in the same tick failed its write and rolled back. The
+        # rollback needs a live transaction to expire anything, which is the state
+        # a failed UPDATE leaves behind.
+        observer.execute(sa_text("SELECT 1"))
+        observer.rollback()
+
+        # The observation is a tuple of scalars, so nothing can have re-read it.
+        assert job.status == "scraping"
+
+        fired = _recovery_cas(
+            observer, job,
+            retry_count=job.retry_count + 1,
+            status="pending",
+            started_at=None,
+            last_heartbeat_at=None,
+            page_current=0,
+            page_total=0,
+            record_count=0,
+        )
+
+    assert fired is False, "a rollback earlier in the tick must not unfreeze the guard"
+    with SyncSessionLocal() as db:
+        assert db.get(Job, job.id).status == "cancelled"
 
 
 def test_watchdog_never_selects_a_cancelled_job():

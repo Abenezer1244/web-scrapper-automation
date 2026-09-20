@@ -2457,11 +2457,20 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config, *, on_begin=None) 
     # with their stale attributes. The WHERE clause would still filter correctly
     # (it runs in the database), but the cache-hit path below reads and writes
     # these objects, and it must see what is committed right now.
+    #
+    # It repeats EVERY predicate of the first read, not just the status. A lead
+    # can become over quota, undeliverable or a superseded duplicate between the
+    # two reads, and re-checking only 'not_attempted' would queue and pay for it
+    # anyway. Narrowing by id is not a substitute: those ids qualified when they
+    # were read, which is exactly the thing that may have changed.
     eligible = list(db.execute(
         sa_select(Result).where(
             Result.id.in_([rec.id for rec in eligible]),
             Result.user_id == job.user_id,
+            Result.property_address.isnot(None),
+            actionable_condition(),
             Result.skip_trace_status == "not_attempted",
+            skip_trace_eligible_condition(),
         ).execution_options(populate_existing=True)
     ).scalars().all())
     if not eligible:
@@ -2579,12 +2588,31 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config, *, on_begin=None) 
             claimed_ids = claim_skip_trace_rows(db, to_claim)
         except ClaimUnenforcedError as exc:
             _logger.error("Job %s skip trace claim refused: %s", job_id, exc)
+            # PAGE someone. Swallowing this keeps the job healthy, which is the
+            # point, but it also means the paid lookup pipeline can sit paused
+            # indefinitely while every worker looks fine. The alert is the only
+            # thing that makes the pause visible.
+            try:
+                from src.workers.ops_alerts import send_ops_alert
+
+                send_ops_alert(
+                    "skip_trace_claim_unenforced", "enqueue",
+                    "Skip-trace claims are refused: migration 099 is not in place",
+                    f"{len(to_claim)} lead(s) on job {job_id} were not queued "
+                    f"because the unique index that stops a lead being looked up "
+                    f"twice is missing, invalid or not the expected index. "
+                    f"Contact lookups are PAUSED and stay paused until it is "
+                    f"applied. Nothing was charged and no lead was lost. {exc}",
+                )
+            except Exception:  # noqa: BLE001 - an alert failure must not fail the job
+                _logger.exception("skip-trace unenforced-claim alert failed to send")
             _publish_log(
                 r, job_id, "warning",
-                f"Contact lookups are paused for {len(to_claim)} lead(s): the "
+                f"Contact lookups are paused for {len(to_claim)} lead(s): a "
                 "database safeguard that stops a lead being looked up twice is "
-                "not in place. These leads keep their place and are looked up "
-                "automatically once it is restored. Nothing was charged.",
+                "not in place. No new lookup was charged. These leads stay "
+                "pending and become eligible again on the next run once the "
+                "safeguard is restored.",
                 db=db,
             )
             to_claim = []

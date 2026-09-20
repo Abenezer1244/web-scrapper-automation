@@ -175,9 +175,15 @@ def main() -> int:
                 lock_job_for_claim(db, jid)
 
             # result_ids already queued (any status) — never double-enqueue.
+            # Tenant-pinned as well as job-pinned. The shared claim is
+            # tenant-safe, but the CACHE-HIT write above it is an ORM write that
+            # happens before the claim, so a job/result ownership inconsistency
+            # could copy one tenant's contacts onto another tenant's result.
             pending_ids = set(db.execute(
-                select(PendingSkipTraceRow.result_id)
-                .where(PendingSkipTraceRow.job_id == jid)
+                select(PendingSkipTraceRow.result_id).where(and_(
+                    PendingSkipTraceRow.job_id == jid,
+                    PendingSkipTraceRow.user_id == job.user_id,
+                ))
             ).scalars().all())
 
             # populate_existing: this session does not expire on commit, so a
@@ -187,6 +193,7 @@ def main() -> int:
             rows = db.execute(
                 select(Result).where(and_(
                     Result.job_id == jid,
+                    Result.user_id == job.user_id,
                     Result.skip_trace_status == "not_attempted",
                     Result.property_address.isnot(None),
                 )).execution_options(populate_existing=True)

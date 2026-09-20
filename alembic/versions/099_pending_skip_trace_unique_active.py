@@ -138,8 +138,12 @@ def upgrade() -> None:
             wrong_shape = existing is not None and not (
                 existing.indisvalid
                 and existing.indisunique
-                and existing.indnatts == 1
+                # indnkeyatts counts KEY columns; indnatts also counts INCLUDE
+                # payload columns. ON CONFLICT infers on the key alone, so an
+                # index with INCLUDE columns still arbitrates and must not be
+                # rebuilt out from under a database that has one.
                 and existing.indnkeyatts == 1
+                and existing.indnatts >= existing.indnkeyatts
                 and existing.plain_columns
                 and existing.attname == "result_id"
                 and " ".join((existing.predicate or "").split())
@@ -152,13 +156,18 @@ def upgrade() -> None:
                 # it would destroy an unrelated index that something else needs,
                 # and an unqualified CREATE could then resolve against whatever
                 # search_path points at. Refuse and let a human look.
+                # Restricted to the PUBLIC schema. Index names only need to be
+                # unique within their own schema, so a same-named index in some
+                # other schema is not a collision at all and aborting on it
+                # would block the deploy for no reason.
                 collision = conn.execute(text(
                     "SELECT tn.nspname || '.' || t.relname "
                     "FROM pg_class c "
+                    "JOIN pg_namespace cn ON cn.oid = c.relnamespace "
                     "JOIN pg_index i ON i.indexrelid = c.oid "
                     "JOIN pg_class t ON t.oid = i.indrelid "
                     "JOIN pg_namespace tn ON tn.oid = t.relnamespace "
-                    "WHERE c.relname = :n"
+                    "WHERE c.relname = :n AND cn.nspname = 'public'"
                 ), {"n": _INDEX}).scalar()
                 if collision:
                     raise RuntimeError(

@@ -24,17 +24,18 @@ claim (the unique index blocks them) while the dispatcher's tenant-pinned joins
 ignore it forever; and a lead that settled to 'hit' between the eligibility read
 and the claim gets an active queued row that nothing will ever settle.
 
-NO ARBITER ON THE CONFLICT CLAUSE, DELIBERATELY. ``ON CONFLICT (result_id)
-WHERE ...`` requires the partial index to exist and raises "no unique or
-exclusion constraint matching the ON CONFLICT specification" when it does not.
-`start.sh` deliberately starts the WORKER even when migrations fail (it fails
-open, on the documented grounds that doing so "leaves the worker exactly where it
-is today"), and `tasks.py` catches an enqueue failure and merely logs it. A
-targeted conflict clause would therefore turn a failed migration 099 into every
-skip-trace enqueue silently ceasing -- the one outcome that reasoning assumed
-could not happen. Bare ``ON CONFLICT DO NOTHING`` degrades to exactly today's
-behaviour when the index is absent and enforces when it is present.
-`warn_if_unenforced` is how that degradation gets said out loud.
+THE CONFLICT CLAUSE NAMES ITS ARBITER, AND THE CLAIM FAILS CLOSED. ``ON CONFLICT
+(result_id) WHERE status IN (...)`` makes Postgres resolve the partial index at
+planning time and raise if it is missing, so enforcement does not depend on this
+module's idea of how a predicate renders. `claim_enforcement_ok` checks the same
+thing first only to produce a readable error.
+
+An earlier version let the scrape proceed unenforced, reasoning that refusing
+would strand every lookup in the product because `start.sh` starts the worker
+even when migrations fail. The Security Master Review rejected that, and the
+premise was wrong: an unclaimed lead stays 'not_attempted' and is claimed by the
+next run once the migration lands, while scrapes still run and leads are still
+delivered. Refusing is a PAUSE; charging a customer twice is not undoable.
 
 LOCK ORDER. Pending rows first, then `results` -- the same order
 ``_cancel_undeliverable_queued`` uses (it UPDATEs pending rows, then UPDATEs
@@ -148,9 +149,9 @@ class ClaimLockNotHeldError(RuntimeError):
 class ClaimUnenforcedError(RuntimeError):
     """Migration 099's index is absent, so a second active claim is possible.
 
-    Raised only for callers that pass ``require_enforcement=True`` -- the ones
-    that would be a SECOND writer of the queue and so need the database to
-    arbitrate. See `claim_skip_trace_rows`.
+    Raised for EVERY caller: the database is what stops a lead being charged for
+    twice, and no amount of logging substitutes for it. See
+    `claim_skip_trace_rows` for why refusing is a pause rather than a loss.
     """
 
 
@@ -192,7 +193,12 @@ def claim_enforcement_ok(db) -> bool:
     # which cannot serve the named ON CONFLICT arbiter at all: every claim would
     # then fail closed while the index looked correct. Exactly one key column,
     # no expressions, and that column is result_id.
-    if (row.indnatts != 1 or row.indnkeyatts != 1
+    # indnkeyatts is the KEY column count; indnatts also counts INCLUDE payload
+    # columns. ON CONFLICT infers on the key alone, so a unique partial index
+    # with INCLUDE columns still arbitrates correctly and must not be rejected --
+    # rejecting it would fail every claim closed, an outage, over a difference
+    # that does not affect the guarantee.
+    if (row.indnkeyatts != 1 or row.indnatts < row.indnkeyatts
             or not row.plain_columns or row.attname != "result_id"):
         return False
     # The predicate is compared EXACTLY, not by counting casts. Counting was
@@ -265,7 +271,7 @@ def lock_job_for_claim(db, job_id: str) -> None:
     a caller that forgets it is refused rather than silently racing.
     """
     db.execute(
-        text("SELECT pg_advisory_xact_lock(hashtext(:k))"),
+        text("SELECT pg_advisory_xact_lock(hashtextextended(:k, 0))"),
         {"k": _lock_key(job_id)},
     )
 
@@ -279,13 +285,21 @@ def job_claim_lock_held(db, job_id: str) -> bool:
 
     pg_advisory_xact_lock(bigint) stores the key split across pg_locks.classid
     (high 32 bits) and objid (low 32 bits), with objsubid = 1 for the
-    single-argument form. hashtext() returns int4, so the shift is arithmetic on
-    a possibly negative value and both halves are masked back to their unsigned
-    oid representation before comparing.
+    single-argument form. The key is signed, so the shift is arithmetic on a
+    possibly negative value and both halves are masked back to their unsigned
+    oid representation before comparing. Roughly half of all job ids hash
+    negative, so that is the common case, not an edge one; it is exercised in
+    both signs by test_the_lock_check_detects_the_lock_for_negative_hashes_too.
+
+    hashtextEXTENDED, not hashtext: the latter is 32 bits, and a collision there
+    would let one job's lock satisfy another job's assertion -- which is worse
+    than the needless serialization it also causes, because it makes
+    ClaimLockNotHeldError pass for a job nothing is actually holding. 64 bits
+    makes that negligible rather than merely unlikely.
     """
     return bool(db.execute(
         text(
-            "WITH k AS (SELECT hashtext(:k)::bigint AS key) "
+            "WITH k AS (SELECT hashtextextended(:k, 0) AS key) "
             "SELECT 1 FROM pg_locks l, k "
             "WHERE l.locktype = 'advisory' AND l.pid = pg_backend_pid() "
             "  AND l.granted AND l.objsubid = 1 "

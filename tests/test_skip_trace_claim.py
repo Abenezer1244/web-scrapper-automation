@@ -455,6 +455,44 @@ async def test_claiming_without_the_job_lock_is_refused(db, business_user: User)
     await db.commit()
 
 
+async def test_the_lock_check_detects_the_lock_for_negative_hashes_too(db):
+    """The lock assertion reconstructs the advisory key from pg_locks.
+
+    pg_advisory_xact_lock(bigint) splits the key across classid (high 32 bits)
+    and objid (low 32), and hashtext() returns a SIGNED int4, so roughly half of
+    all job ids hash negative and the shift is arithmetic. Get that wrong in the
+    strict direction and every claim raises ClaimLockNotHeldError; get it wrong
+    in the loose direction and the assertion is worthless. Both signs are
+    exercised here, along with the two ways it could be wrong: matching before
+    the lock is taken, and matching another job's key.
+    """
+    from src.workers.skip_trace_claim import _lock_key, job_claim_lock_held
+
+    def _exercise(s):
+        seen_negative = seen_positive = 0
+        for _ in range(60):
+            job_id, other_id = str(uuid.uuid4()), str(uuid.uuid4())
+            h = s.execute(
+                text("SELECT hashtext(:k)::bigint"), {"k": _lock_key(job_id)}
+            ).scalar()
+            assert not job_claim_lock_held(s, job_id), "matched before locking"
+            lock_job_for_claim(s, job_id)
+            assert job_claim_lock_held(s, job_id), f"missed its own lock (hash {h})"
+            assert not job_claim_lock_held(s, other_id), "matched another job"
+            if h < 0:
+                seen_negative += 1
+            else:
+                seen_positive += 1
+        return seen_negative, seen_positive
+
+    negative, positive = await db.run_sync(_exercise)
+    await db.rollback()
+    # If a run drew only one sign the assertions above proved half as much.
+    assert negative > 0 and positive > 0, (
+        f"needed both signs to be meaningful (negative={negative}, positive={positive})"
+    )
+
+
 async def test_a_mixed_job_batch_is_refused(db, business_user: User):
     """One job per claim: a single job lock is meaningless over a mixed batch."""
     cfg = await _config(db, business_user)

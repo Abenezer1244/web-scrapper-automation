@@ -1083,7 +1083,7 @@ _STAGE_LABELS: dict[str, str] = {
 }
 
 # Fallback wording for a job whose row carries no stage: claimed by a worker from
-# before migration 098, or terminalized before it reported one. Coarser on
+# before migration 099, or terminalized before it reported one. Coarser on
 # purpose. `status` cannot be more specific than this — that is why `stage` exists.
 _STATUS_LABELS: dict[str, str] = {
     "pending": "Waiting to start",
@@ -1184,7 +1184,7 @@ class JobResponse(BaseModel):
     # suppressed at create time). NULL for a standalone scrape.
     batch_id: str | None = None
 
-    # ── Progress OBSERVATIONS (migration 098, straight passthrough) ───────────
+    # ── Progress OBSERVATIONS (migration 099, straight passthrough) ───────────
     # NULL means UNOBSERVED and must NEVER be rendered as 0. That distinction is
     # the entire point: `page_current`/`page_total`/`record_count` above are NOT
     # NULL DEFAULT 0, so a run that has measured nothing yet is indistinguishable
@@ -1371,7 +1371,7 @@ class JobResponse(BaseModel):
         # rounding it to 100 would announce a completion that has not happened.
         # Legacy fallback, and it is NOT a compatibility shim to delete later: the
         # rolling deploy alone guarantees rows written by a worker that predates
-        # migration 098, and every job already in flight when it lands is one. Without
+        # migration 099, and every job already in flight when it lands is one. Without
         # this the live page would go blank for them instead of improving.
         #
         # The translation is exact rather than approximate. on_progress has always
@@ -1382,7 +1382,7 @@ class JobResponse(BaseModel):
         # `done` it has been overwritten with the billed count, and the terminal
         # branch above has already returned by the time this runs.
         # Gated on a NULL stage, which is precisely "this row was written by a worker
-        # that predates migration 098". Without that gate the fallback fights the
+        # that predates migration 099". Without that gate the fallback fights the
         # fix above: a worker that HAS reported clears units_done/units_total when it
         # changes activity, and the legacy page counters — which the worker still
         # writes, and which still hold the finished scrape's 5/5 — would immediately

@@ -313,7 +313,7 @@ def _watchdog_stuck_jobs_impl() -> None:
                     page_current=0,
                     page_total=0,
                     record_count=0,
-                    # The migration-098 observations go back to NULL, not to 0. The
+                    # The migration-099 observations go back to NULL, not to 0. The
                     # next attempt has measured nothing yet, and 0 would assert that
                     # it had measured and found none — which is the exact confusion
                     # those columns exist to end. Resetting them here is what stops a

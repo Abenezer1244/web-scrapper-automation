@@ -129,7 +129,7 @@ the NUMBER inside it was fed `progress ?? 0` — a 5% arc over a "0".
 **Built / Shipped:**
 - **BE #347 `8ba7bf8` (MERGED, deployed)** — watchdog recovery writes are now a guarded
   CAS on (status, started_at, retry_count) as observed, via a frozen `_Candidate`.
-- BE #348 (draft): migration 098 (8 nullable observation columns), worker stage reporting
+- BE #348 (draft): migration 099 (8 nullable observation columns), worker stage reporting
   at 8 boundaries, `report_stage()` on BaseScraper, attempt-scoped `_set_progress`,
   activity-scoped `progress_pct`, `chunk_windows()`, SSE keepalive. 35 new tests.
 - FE #158 (draft): indeterminate ring, unknown-vs-zero tiles, ELAPSED vs ETA, retry
@@ -193,7 +193,7 @@ the NUMBER inside it was fed `progress ?? 0` — a 5% arc over a "0".
 **Pending / Handoff:**
 - Both PRs are DRAFT pending the Codex diff-review gate and owner review.
 - BE #348 must merge and deploy BEFORE FE #158: the page reads fields that ship there.
-- Migration 098 is additive and deploy-safe ahead of the worker; old workers leave the new
+- Migration 099 is additive and deploy-safe ahead of the worker; old workers leave the new
   columns NULL, which reads as UNOBSERVED and is correct for a run they are not reporting.
 
 ---

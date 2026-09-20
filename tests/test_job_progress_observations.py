@@ -9,7 +9,7 @@ perfectly, then jumped straight to done.
 The cause is in the data model, not the UI. jobs.page_current / page_total /
 record_count are `Integer NOT NULL DEFAULT 0`, so "nothing has been measured
 yet" and "we measured, and the answer is zero" are the same value, and no client
-can tell them apart. Migration 098 adds nullable observations where NULL means
+can tell them apart. Migration 099 adds nullable observations where NULL means
 UNOBSERVED, and these tests pin the one rule that makes them worth having: a
 fact nobody has measured is absent, never 0, and never a percentage.
 
@@ -292,7 +292,7 @@ def test_counters_do_not_leak_from_the_scrape_into_the_next_activity():
     assert j.stage_label == "Adding property and mailing details: 57 records found"
 
 
-def test_a_pre_098_worker_still_gets_its_page_counters_read():
+def test_a_pre_099_worker_still_gets_its_page_counters_read():
     """The legacy fallback is gated on a NULL stage, so it must still fire for a row
     a worker from before the migration wrote."""
     j = _job(stage=None, stage_started_at=None, page_current=3, page_total=4,

@@ -648,7 +648,7 @@ def run_scrape_job(self, job_id: str) -> None:
             """Called by the scraper as it works — updates the DB in real time.
 
             Writes BOTH the legacy NOT NULL counters (page_current/page_total/
-            record_count, kept for every existing reader) and the migration-098
+            record_count, kept for every existing reader) and the migration-099
             observations, which is the pair that can tell UNKNOWN from ZERO.
 
             A ``page_total`` of 0 means "no denominator yet", not "zero pages", so it

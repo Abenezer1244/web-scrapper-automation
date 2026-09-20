@@ -79,7 +79,7 @@ def test_a_long_but_live_job_is_not_stalled():
     )
     assert j.progress_stalled is False
     # Legacy counters, no progress_unit: the counts are shown, the NOUN is not
-    # guessed. This row was written by a worker that predates migration 098.
+    # guessed. This row was written by a worker that predates migration 099.
     assert j.progress_label == "Collecting records: 40 of 120"
 
 

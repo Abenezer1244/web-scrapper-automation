@@ -1,4 +1,4 @@
-"""jobs: durable progress OBSERVATIONS, so unknown stops rendering as zero (098).
+"""jobs: durable progress OBSERVATIONS, so unknown stops rendering as zero (099).
 
 `jobs.page_current / page_total / record_count` are `NOT NULL DEFAULT 0`, so the
 row cannot tell "nothing has been measured yet" apart from "we measured, and the
@@ -51,7 +51,7 @@ Deploy this BEFORE the worker that writes the columns. Old workers simply leave
 them NULL, which reads as UNOBSERVED and is exactly right for a run they are not
 reporting on.
 
-Revision ID: 098
+Revision ID: 099
 Revises: 097
 Create Date: 2026-09-19
 """
@@ -59,8 +59,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy import text
 
-revision = "098"
-down_revision = "097"
+revision = "099"
+down_revision = "098"
 branch_labels = None
 depends_on = None
 

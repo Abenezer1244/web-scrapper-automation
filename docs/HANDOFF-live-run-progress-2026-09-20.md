@@ -86,7 +86,7 @@ b7...   docs(todo): security Master Review results, and the dep bump it caught
 ## 5. Active files
 
 **Backend**
-- `alembic/versions/098_job_progress_observations.py` — NEW. 8 nullable columns on `jobs`:
+- `alembic/versions/099_job_progress_observations.py` — NEW. 8 nullable columns on `jobs`:
   `stage`, `stage_started_at`, `records_found`, `units_done`, `units_total`,
   `progress_unit`, `last_progress_at`, `next_retry_at`. NULL = UNOBSERVED. Additive,
   deploy-safe ahead of the worker.

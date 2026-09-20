@@ -116,7 +116,7 @@ STUCK_STARTED_AT_FALLBACK_MINUTES: int = 70
 ZOMBIE_UNSTARTED_MINUTES: int = 10
 
 
-# ─── Job stages (migration 098) ───────────────────────────────────────────────
+# ─── Job stages (migration 099) ───────────────────────────────────────────────
 # `status` is the state machine the watchdog, the billing CAS and the cancel
 # endpoint all arbitrate on, so it stays coarse and must not grow. `stage` is the
 # separate, purely descriptive answer to "what is the worker doing RIGHT NOW",

@@ -208,7 +208,7 @@ def _set_status(
 
 
 class JobProgressFields(TypedDict, total=False):
-    """The migration-098 observation columns ``_set_progress`` may write.
+    """The migration-099 observation columns ``_set_progress`` may write.
 
     Every one is nullable and NULL means UNOBSERVED, so writing a 0 here is a
     positive statement that the answer really is zero. Never write 0 as a
@@ -235,7 +235,7 @@ def _set_progress(
     """Write progress observations for ONE attempt. Returns whether the write landed.
 
     Progress is descriptive, never part of the state machine: this touches only the
-    migration-098 columns and NEVER ``status``. Use ``_set_status`` for that.
+    migration-099 columns and NEVER ``status``. Use ``_set_status`` for that.
 
     Guarded on two facts, both necessary:
 
@@ -739,7 +739,7 @@ def _retry_scrape_job(
     Resets the progress + liveness columns too (``started_at``/``finished_at``/
     ``error_message``/page counters/``last_heartbeat_at``) so the retried attempt
     starts clean and the watchdog sees a fresh un-started pending row. The
-    migration-098 observations are reset with them, back to NULL rather than to 0:
+    migration-099 observations are reset with them, back to NULL rather than to 0:
     the next attempt has measured nothing yet, and 0 would assert that it had.
 
     ``next_retry_at`` is stamped in the SAME statement, from the SAME countdown the

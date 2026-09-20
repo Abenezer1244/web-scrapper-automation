@@ -257,5 +257,5 @@ by name. Targeted suite: 1332 passed, 1 skipped.
 ### Deploy order
 
 **#348 must merge and deploy before #158.** The page reads fields that ship in the
-backend. Migration 098 is additive and safe to deploy ahead of the worker: old
+backend. Migration 099 is additive and safe to deploy ahead of the worker: old
 workers leave the new columns NULL, which reads as UNOBSERVED.

@@ -681,7 +681,7 @@ class Job(Base):
     trigger = Column(String(32), nullable=False, default="manual")
     # NOT NULL DEFAULT 0, which is why they cannot express UNKNOWN. Kept for the
     # existing API contract and for every reader written against them; the
-    # migration-098 columns below are the ones that can say "not measured yet".
+    # migration-099 columns below are the ones that can say "not measured yet".
     # record_count in particular is NOT a scrape total: the done-CAS overwrites it
     # with the BILLED non-duplicate count (tasks.py), so a run that scraped 57 and
     # billed 2 ends up reading 2. Use records_found for "how much did we find".
@@ -703,7 +703,7 @@ class Job(Base):
     # re-queued. NULL = not yet beat / pre-deploy → watchdog falls back to the
     # conservative started_at cutoff.
     last_heartbeat_at = Column(DateTime(timezone=True), nullable=True)
-    # Migration 098: progress OBSERVATIONS. Every one is nullable and NULL means
+    # Migration 099: progress OBSERVATIONS. Every one is nullable and NULL means
     # UNOBSERVED, independently of the others — the scrapers learn these facts at
     # different moments, so one shared "reporting has begun" flag would lie. Nothing
     # here may be coerced to 0 for display: 0 is a real, measured zero.

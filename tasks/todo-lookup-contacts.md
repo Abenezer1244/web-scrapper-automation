@@ -518,4 +518,60 @@ that key is deliberately not tenant-scoped. Worth a read-only prod count of how 
 fired (pending rows that ended `unmatched` sharing an address key within one queue id).
 
 ## Review
-(at the end)
+
+### Phase 1a: done, NOT merged (2026-09-20)
+
+Six commits on `feat/lookup-contacts-action`, off `origin/main`. Nothing pushed, no PR, no
+Tracerfy credits spent, production untouched.
+
+| | |
+|---|---|
+| `5ddf1cc` | `lookup_subject_key` + `submission_collision_key` + the two wrappers, 24 tests |
+| `01b5ba0` | all five call paths switched, migration 098, legacy read deleted |
+| `b3d5d00` | 14 integration tests, ops scripts, cutover runbook |
+| `c181059` | Codex diff-review fixes (attribution multiplicity P1, restart-safe migration) |
+| `5ba5381` | Security Master Review, dead legacy surface removed |
+| `3bd966e` | plan checkboxes + the pre-existing local Stripe failures |
+
+**What changed, in one line:** reuse is keyed on WHO an answer was bought for, not just where,
+so an heir's lead can no longer be served the deceased owner's phone.
+
+**What it costs.** Legacy cache rows go inert, so a repeat address may be paid for once more
+inside the remaining 90 days of its entry; that self-heals, since the TTL is 90 days anyway.
+Leads settled before 098 stop donating contacts to duplicate re-scrapes (NULL hash fails
+closed) and fall through to the v2 cache read, which is free whenever the same subject really
+was traced before.
+
+**The plan was wrong in two places**, both found by consulting Codex BEFORE writing code, and
+both recorded above as 14-A and 14-B. 14-A would have double-charged the customer and answered
+nobody. 14-B could not be fixed without a migration, which the plan had ruled out. Rounds 1-13
+missed both because they only ever examined the key itself, never the round trip.
+
+**Three things caught in review, two of them my own errors:**
+1. I applied the submission key across batches as well as within one. Attribution is scoped to
+   a single `tracerfy_queue_id`, so that bought nothing and put one tenant behind another
+   tenant's lookup. `test_another_accounts_lookup_never_holds_or_answers_mine` caught it.
+2. Codex returned NO-GO on a P1 my own fix had made worse: `_attribution_is_safe` short-circuited
+   before checking answer multiplicity, and the submission key turned that early return from a
+   corner into the normal path. An existing test had the bug pinned as correct behaviour.
+3. One of my tests passed both clean AND mutated, so it was exercising the wrong pass entirely;
+   rewritten. Another was vacuous and was deleted, not dressed up.
+
+**Verification.** 540 passed across the skip-trace/ingest/enrichment/reconciliation area; 191
+passed on a second isolated database after the security pass; ruff clean; migration applied and
+verified BY THE OBJECTS (column + index), never by `alembic_version`. Security Master Review:
+0 Critical, 0 High, GO, two consecutive clean passes. The mutation tests are the evidence that
+the important assertions are real. **Not yet done:** a clean full-suite pass on the final
+commit (the run was killed at ~76% for host memory; the only failures seen were the nine
+pre-existing Stripe ones, proven identical at `origin/main`).
+
+**Before a PR:** rebase onto `origin/main`, which moved twice during the session (now
+`8ba7bf8`).
+
+### Still open
+
+- **Phase 1b and 1c have not started** and must not until 1a merges.
+- The cutover is a DRAIN and a restart, not a flag flip: the kill switch does not gate ingest,
+  the webhook, or `_reuse_enrichment_for_duplicates`. See the runbook.
+- Deferred, logged above: the pre-existing cross-tenant collision (worth a read-only prod count
+  of how often it has fired), and the D2 credits-vs-billed-rows gap.

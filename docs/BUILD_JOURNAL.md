@@ -19,6 +19,81 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-20 — Reuse stops being keyed on the address, and consulting Codex first paid for itself
+
+**Built / Shipped:** Phase 1a of the contact-lookup work, on `feat/lookup-contacts-action`,
+NOT merged and not pushed. Skip-trace answer reuse is re-keyed from an address-only hash to a
+SUBJECT hash — account, address, trace type, and the exact names sent to the provider — so a
+lead can no longer inherit the previous owner's phone inside the 90-day window. Probate is the
+ordinary case for that, not the exotic one: the deceased owner is traced, an heir is scraped
+weeks later, and the heir's lead is served a dead person's contacts.
+Commits: `5ddf1cc` the key helpers, `01b5ba0` the five call paths + migration 098
+(`results.skip_trace_subject_hash`), `b3d5d00` tests + ops scripts + runbook, `c181059` the
+fixes from Codex's diff review, `5ba5381` the security review and dead-surface removal.
+Runbook: `docs/RUNBOOK-lookup-subject-key-cutover.md`.
+
+**Tried / Decided:** The owner answered the three open decisions, all recommendations taken:
+D1 advanced (address-only) traces reuse per address within an account and owner isolation
+explicitly does not apply, because no name was ever sent; D2 the quote shows customer-billed
+rows and the credits gap is logged as its own item rather than folded in; D3 the global daily
+cap gets surfaced end to end. Migration 098 was an owner decision too: the plan said Phase 1a
+would need no migration, and that turned out to be wrong (see 14-B below).
+
+**Failed / Blocked:** The plan had passed thirteen Codex rounds. Consulting Codex once more
+BEFORE writing code returned two P1s that all thirteen had missed, because rounds 1-13 only
+ever examined the key design and never asked what a subject-keyed batch does on the way BACK.
+- **14-A:** provider attribution is address-only and `_attribution_is_safe` refuses a whole
+  group when two answers arrive for one address. Today the in-flight hold dedups on that same
+  address key so it never fires. Give two owners at one address distinct subject keys and both
+  go out in one batch, both get refused, both get charged, nobody gets answered. Fixed by
+  splitting the key in two: the subject key governs reuse, a separate GLOBAL submission key
+  keeps one address per batch.
+- **14-B:** the `dedup_hash` reuse passes cannot be made owner-safe by recomputing the subject,
+  because `party_name` is rewritten by owner recovery AFTER a lookup settles. The recomputed
+  source subject then reads as the CURRENT owner while the phone stored beside it still belongs
+  to the previous one, so the comparison passes and copies exactly the leak it was added to
+  stop. Hence migration 098: record the subject when it is known, never reconstruct it.
+
+**Caught & fixed:** Three things caught before shipping, two of them my own errors.
+- I over-applied the submission key to in-flight rows as well as within the batch. Attribution
+  is scoped to one `tracerfy_queue_id`, so rows in different batches can never make each other
+  unattributable; the cross-batch hold bought nothing and put one tenant behind another
+  tenant's lookup. `test_another_accounts_lookup_never_holds_or_answers_mine` failed, which is
+  exactly its job.
+- Codex failed the diff (NO-GO) on a P1 I had made worse: `_attribution_is_safe` returned
+  "safe" as soon as only ONE row waited on an address, never checking how many answers came
+  back — and my submission key makes one waiting row the ORDINARY shape, so that early return
+  now fires every time. An existing test had the bug pinned as correct under the name
+  "single waiting row is always safe". Also: migration 098 was not restart-safe.
+- A test I wrote passed on first run AND while mutated, meaning it exercised the wrong code
+  path entirely (the first reuse pass, not `later_sql`). Rewritten so it fails when mutated.
+  A second test of mine was genuinely vacuous; Codex flagged it and I deleted it rather than
+  dress it up, after working out the case is unreachable past the attribution guard.
+
+**Pending / Handoff:** Nothing pushed, no PR, nothing merged, no Tracerfy credits spent,
+production untouched. `origin/main` moved twice during the session (now `8ba7bf8`), so a rebase
+is needed before a PR. Phases 1b and 1c are unstarted by instruction: they wait until 1a
+merges. The cutover is a drain-and-restart, not a flag flip, because the kill switch does not
+gate ingest, the webhook, or the duplicate-reuse pass. Separately and still waiting on the
+owner's word: `chore/security-deps-2026-09-18` fixes a critical `next` RCE that is live.
+
+**Facts learned:**
+- Provider attribution is scoped to ONE `tracerfy_queue_id`. Two batches can never make each
+  other unattributable, which is why the submission key is within-batch only.
+- The in-flight hold is tenant-scoped while attribution is global, so a cross-tenant pair at
+  one address can ALREADY be double-charged today. Pre-existing, logged under Deferred; the
+  new global submission key closes it as a side effect.
+- The pending-row insert truncates names to 128 chars while the enqueue read hashes the
+  untruncated payload, so the key helper must truncate the same way or a long name misses its
+  own cache entry. `enrich.py` already carried a comment about this for the address column.
+- Nine local failures in `test_plan_entitlement_audit` and `test_promo_access` are a missing
+  local `STRIPE_PRICE_*` config, NOT any diff: proven by an identical
+  `9 failed / 77 passed / 47 skipped` at `origin/main` in a throwaway worktree.
+- `codex exec` with a ~60KB prompt dies with "Argument list too long" on Windows; pipe it via
+  stdin with `codex exec -` instead.
+
+---
+
 ## 2026-09-19 — Skip-trace provenance shipped; the login "regression" was our own mount guard
 
 > Follow-ups to 2026-09-18. Handoff: `docs/HANDOFF-skip-trace-followups-2026-09-19.md`.

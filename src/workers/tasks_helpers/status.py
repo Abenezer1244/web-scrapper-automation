@@ -18,6 +18,7 @@ from sqlalchemy import text
 
 from src.api.quota_window import reservation_is_current_sql
 from src.config import settings
+from src.utils.celery_limits import reraise_time_limit
 from src.utils.logger import setup_logger
 from src.workers.tasks_helpers.dedup import BILLING_STAMP_RELIABLE_SINCE
 
@@ -286,11 +287,17 @@ def _set_progress(
         ).rowcount
         if commit:
             db.commit()
-    except Exception:  # noqa: BLE001 — telemetry must never fail the run
+    except Exception as exc:  # noqa: BLE001 — telemetry must never fail the run
+        # ...but a Celery time limit is not a telemetry failure. It subclasses
+        # Exception and lands on whatever line is running, so swallowing it here
+        # would cost the task its soft-limit cleanup and let it run to the hard
+        # kill. Same on the rollback: if the limit arrives during it, finishing
+        # the session is the task's problem, not this function's to hide.
+        reraise_time_limit(exc)
         try:
             db.rollback()
-        except Exception:
-            pass
+        except Exception as rollback_exc:
+            reraise_time_limit(rollback_exc)
         _logger.warning(
             "Job %s: progress observation write failed (%s) — leaving the previous "
             "observation in place", job.id, ", ".join(sorted(kwargs)),

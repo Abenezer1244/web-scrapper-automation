@@ -27,6 +27,7 @@ from src.scrapers.browser_identity import (
     resolve_playwright_user_agent,
 )
 from src.scrapers.doc_scope import CollectionScope
+from src.utils.celery_limits import reraise_time_limit
 from src.utils.logger import setup_logger
 from src.utils.safe_http import safe_get
 
@@ -225,7 +226,12 @@ class BridgeScraper:
             return
         try:
             self.on_stage(stage)
-        except Exception:  # noqa: BLE001 — telemetry must never fail a scrape
+        except Exception as exc:  # noqa: BLE001 — telemetry must never fail a scrape
+            # A Celery time limit is the one thing this must not absorb: it
+            # subclasses Exception and arrives on whatever line is executing,
+            # so eating it here would strand the scrape past its soft limit
+            # and leave the hard kill to end it.
+            reraise_time_limit(exc)
             _logger.debug("stage report %r failed", stage, exc_info=True)
 
     # ─── Collection scope (SHOW — read-only transparency) ─────────────────────

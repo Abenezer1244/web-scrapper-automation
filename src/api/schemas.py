@@ -1422,7 +1422,17 @@ class JobResponse(BaseModel):
             self.stage_seconds = max(0, int((now - entered).total_seconds()))
 
         done, total = self.units_done, self.units_total
-        if total is not None and total > 0 and done is not None and done > 0:
+        # `done >= 0`, not `> 0`. A connector that learns its denominator before it
+        # has finished anything — King announces its chunk count up front — has
+        # MEASURED that none of six chunks are done. That is a known zero, and
+        # _stage_label already publishes it as "Part 0 of 6"; refusing the matching
+        # 0% left the same observation described as measured by one field and
+        # unknown by another, and the client indeterminate while holding a real
+        # denominator (Codex round 5). This is the mirror of the bug this whole
+        # change exists to fix, and it is wrong for the same reason: unknown and
+        # zero are different, in BOTH directions. A run with no denominator still
+        # gets NULL and still renders indeterminate — that is the common case.
+        if total is not None and total > 0 and done is not None and done >= 0:
             self.progress_pct = min(99, int(done / total * 100))
 
             # Extrapolations, both from the SAME per-unit rate. Gated on two or more

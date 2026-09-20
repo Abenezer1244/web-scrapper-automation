@@ -139,6 +139,28 @@ def test_elapsed_time_is_never_turned_into_a_percentage():
     assert j.estimated_time_remaining is None
 
 
+def test_a_measured_zero_of_n_is_zero_percent_not_unknown():
+    """The mirror of the headline bug, and wrong for the same reason. King
+    announces its chunk count before it has finished one, so 0 of 6 is something
+    somebody MEASURED. _stage_label already says "Part 0 of 6"; refusing the
+    matching 0% had one field calling that observation measured and another
+    calling it unknown."""
+    j = _job(stage="scraping", units_done=0, units_total=6, progress_unit="chunk")
+    assert j.progress_pct == 0
+    assert j.stage_label == "Collecting records: Part 0 of 6"
+    # Still no estimate: a rate needs two COMPLETED units, and there are none.
+    assert j.estimated_seconds_remaining is None
+
+
+def test_no_denominator_is_still_unknown_and_never_zero():
+    """The other half of the pair, kept next to it on purpose. Without a
+    denominator there is nothing to be zero percent OF, and this is the state the
+    production run sat in for 401 seconds."""
+    assert _job(stage="scraping", units_done=0, units_total=None).progress_pct is None
+    # page_total=0 has always meant "no denominator", so a legacy row's 0 is
+    # unknown too, never a measured zero.
+    assert _job(stage=None, page_current=0, page_total=0).progress_pct is None
+
 # ─── Estimates need more than one observation ────────────────────────────────
 
 def test_one_completed_unit_is_not_enough_for_an_estimate():

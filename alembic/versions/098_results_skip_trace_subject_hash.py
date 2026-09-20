@@ -69,12 +69,15 @@ def upgrade() -> None:
             # INVALID, and it stays invalid forever: IF NOT EXISTS sees the name,
             # skips the build, and the planner never uses it. Drop that corpse
             # before rebuilding, or the retry silently "succeeds" with a dead index.
-            conn.execute(text(
-                f"DROP INDEX CONCURRENTLY IF EXISTS {_INDEX}"
-            ) if conn.execute(text(
-                "SELECT 1 FROM pg_class c JOIN pg_index i ON i.indexrelid = c.oid "
-                "WHERE c.relname = :n AND NOT i.indisvalid"
-            ), {"n": _INDEX}).scalar() else text("SELECT 1"))
+            is_invalid = conn.execute(
+                text(
+                    "SELECT 1 FROM pg_class c JOIN pg_index i ON i.indexrelid = c.oid "
+                    "WHERE c.relname = :n AND NOT i.indisvalid"
+                ),
+                {"n": _INDEX},
+            ).scalar()
+            if is_invalid:
+                conn.execute(text(f"DROP INDEX CONCURRENTLY IF EXISTS {_INDEX}"))
             # Partial: only settled rows carry a hash, and the reuse passes only
             # ever look those up. Keeps the index small on a table that is mostly
             # never-traced rows.

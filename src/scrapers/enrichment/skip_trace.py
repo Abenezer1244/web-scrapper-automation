@@ -978,36 +978,6 @@ def download_tracerfy_csv(download_url: str) -> str:
     return resp.text
 
 
-def legacy_cache_locality(result) -> tuple[str | None, str | None]:
-    """The (city, state) `build_pending_row_payload` produced BEFORE the
-    structured-situs fallback was added (2026-09-03).
-
-    `address_cache_key` hashes (user_id, street, city, state), so changing where
-    the locality comes from CHANGES THE KEY — and a missed key means re-paying
-    Tracerfy for an address already bought. The change is real for absentee
-    owners: the property sits in PUYALLUP while the owner's mail goes to
-    SEATTLE, so the old precedence keyed the row under the OWNER's city and the
-    new one keys it under the PROPERTY's. (The new precedence is the correct
-    one — Tracerfy traces by property address, so a Puyallup street under a
-    Seattle city was simply a wrong address — but the old rows are already paid
-    for.) This reproduces the OLD precedence so the enqueue path can look under
-    the old key before spending money. Deliberately ignores the structured
-    situs columns: that is exactly what made it "legacy".
-
-    Kept beside build_pending_row_payload, and using the same parser, so the two
-    spellings of the rule cannot drift apart.
-    """
-    # legacy=True on purpose: this key must stay byte-identical to the one the
-    # already-PAID row was cached under, including the states the old parser
-    # invented. Parsing it correctly here would miss that row and re-buy it.
-    parsed = _parse_full_address(result.property_address, legacy=True)
-    if not parsed["city"] and result.mailing_address:
-        mail = _parse_full_address(result.mailing_address, legacy=True)
-        if mail["city"]:
-            return mail["city"], mail["state"]
-    return parsed["city"], parsed["state"]
-
-
 # enrichment_data.source of the code-violation scrapers (king_wa_code_violation and its
 # king_cv_sources adapters, pierce_wa_code_violation).
 _KING_CODE_VIOLATION_SOURCES = frozenset({king_cv_sources.SEATTLE_SDCI, king_cv_sources.BELLEVUE,
@@ -1292,10 +1262,12 @@ def _parse_full_address(addr: str, *, legacy: bool = False) -> dict:
     shape, so the whole string stays in `street` (`is_foreign_address`). A
     rejected state never costs the ZIP — the ZIP is lifted independently.
 
-    `legacy=True` reproduces the pre-fix behaviour BYTE FOR BYTE. It exists only
-    for `legacy_cache_locality`: an already-PAID trace is cached under the key the
-    old parse produced, and re-parsing it correctly would miss that row and buy it
-    a second time. Never use it on a new payload.
+    `legacy=True` reproduces the pre-fix behaviour BYTE FOR BYTE. It has NO caller
+    left: its only consumer was `legacy_cache_locality`, which existed to look up
+    the pre-098 address-only cache key and was deleted with that read path, since
+    a key with no owner name cannot say whose answer it holds. The branch is kept
+    for now only so the old parse stays describable while pre-cutover rows age
+    out; it is dead code and should go with them. Never use it on a new payload.
     """
     result = {"street": None, "city": None, "state": None, "zip": None}
     if not addr:

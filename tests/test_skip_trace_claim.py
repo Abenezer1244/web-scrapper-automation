@@ -401,6 +401,11 @@ async def test_without_the_index_the_scrape_degrades_but_the_action_refuses(
         assert await db.run_sync(warn_if_unenforced) is False
 
         # The action worker refuses outright: nothing claimed, nothing charged.
+        # Two independent refusals guard this. The catalog pre-check raises
+        # ClaimUnenforcedError, and even if that check were wrong, the TARGETED
+        # `ON CONFLICT (result_id) WHERE ...` arbiter makes Postgres itself
+        # reject the statement, so there is no window between checking and
+        # inserting in which the index could go away.
         with pytest.raises(ClaimUnenforcedError):
             await db.run_sync(lambda s: claim_skip_trace_rows(s, [payload]))
 
@@ -471,6 +476,44 @@ async def test_enforcement_check_rejects_a_same_named_wrong_index(
         await db.rollback()
 
     assert await db.run_sync(claim_enforcement_ok) is True
+
+
+async def test_the_arbiter_itself_fails_closed_without_the_index(
+    db, business_user: User,
+):
+    """Enforcement does not rest on this module's idea of how a predicate renders.
+
+    With `require_enforcement=True` the statement names its arbiter, so Postgres
+    resolves it against a real index at planning time and raises "no unique or
+    exclusion constraint matching the ON CONFLICT specification" when 099 is
+    missing. This bypasses the catalog pre-check to prove the SQL alone fails
+    closed -- which is what removes the window between checking the index and
+    relying on it.
+    """
+    from sqlalchemy.exc import ProgrammingError
+
+    from src.workers.skip_trace_claim import INDEX_NAME
+
+    cfg = await _config(db, business_user)
+    job_id = await _job(db, business_user, cfg)
+    rid = await _row(db, job_id, business_user.id)
+    payload = await _payload(db, rid)
+
+    await db.execute(text(f"DROP INDEX {INDEX_NAME}"))
+    try:
+        def _claim_past_the_precheck(s):
+            import src.workers.skip_trace_claim as mod
+            real = mod.claim_enforcement_ok
+            mod.claim_enforcement_ok = lambda _db: True  # pretend the check passed
+            try:
+                return mod.claim_skip_trace_rows(s, [payload])
+            finally:
+                mod.claim_enforcement_ok = real
+
+        with pytest.raises(ProgrammingError):
+            await db.run_sync(_claim_past_the_precheck)
+    finally:
+        await db.rollback()
 
 
 async def test_enforcement_check_ignores_a_same_named_index_in_another_schema(db):

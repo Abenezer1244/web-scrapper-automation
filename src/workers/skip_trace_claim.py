@@ -68,6 +68,10 @@ ACTIVE_PENDING_STATUSES: tuple[str, ...] = ("queued", "submitting", "submitted")
 
 INDEX_NAME = "uq_pending_skip_trace_active_result"
 
+# The same list as a SQL literal, DERIVED rather than written out twice, so the
+# ON CONFLICT arbiter predicate and ACTIVE_PENDING_STATUSES cannot drift apart.
+_ACTIVE_SQL = ", ".join(f"'{s}'" for s in ACTIVE_PENDING_STATUSES)
+
 # Only a lead that has never been looked up may be claimed. The scrape enqueue
 # already filters on this; repeating it INSIDE the insert is what makes the
 # decision atomic rather than advisory.
@@ -312,6 +316,25 @@ def claim_skip_trace_rows(
 
     select_list = ", ".join(f"v.{c}" for c in columns)
 
+    # THE ARBITER IS THE ENFORCEMENT (Codex round 15 diff review, round 4).
+    #
+    # When enforcement is required, name the arbiter: Postgres then resolves it
+    # against a real index at planning time and raises "no unique or exclusion
+    # constraint matching the ON CONFLICT specification" if 099 is missing or
+    # does not match. That is strictly stronger than asking the catalog first,
+    # because it removes the window between checking and inserting, and because
+    # the database -- not this module's idea of how a predicate renders -- is
+    # what decides whether the index really arbitrates.
+    #
+    # The scrape's fail-open path keeps the bare form, which needs no index and
+    # so degrades to pre-099 behaviour instead of stopping every lookup in the
+    # product when a migration fails.
+    conflict_sql = (
+        f"ON CONFLICT (result_id) WHERE status IN ({_ACTIVE_SQL}) DO NOTHING"
+        if require_enforcement else
+        "ON CONFLICT DO NOTHING"
+    )
+
     # Inserted ALREADY 'queued' -- an ACTIVE status, so the partial unique index
     # applies at insert time. Inserting inactive first and activating later would
     # sit outside the index and let two rows collide afterwards, when no
@@ -330,7 +353,7 @@ def claim_skip_trace_rows(
             f"JOIN results r ON r.id = v.result_id AND r.user_id = v.user_id "
             f"WHERE r.user_id = CAST(:uid AS uuid) "
             f"  AND r.skip_trace_status = :claimable "
-            f"ON CONFLICT DO NOTHING "
+            f"{conflict_sql} "
             f"RETURNING result_id"
         ),
         params,

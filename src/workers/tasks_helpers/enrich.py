@@ -2283,6 +2283,30 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config, *, on_begin=None) 
         )
         return
 
+    # ONE ENQUEUE PER JOB AT A TIME (Codex round 15 diff review, round 4).
+    #
+    # run_scrape_job's atomic claim stops a job being double-SCRAPED, but
+    # watchdog_stuck_jobs re-queues a job that merely looks stuck, and a slow but
+    # still-living worker can then be joined by a second one. Two concurrent
+    # enqueues of the same job read the same 'not_attempted' rows and both claim
+    # them. With migration 099 applied the index refuses the second; without it
+    # (the fail-open path) both rows survive, and because owner recovery can
+    # rewrite party_name between the two reads they may carry DIFFERENT
+    # trace_types -- which the dispatcher's submission-collision key does not
+    # collapse, so both get submitted and the customer is charged twice.
+    #
+    # A transaction-scoped advisory lock on the job id serializes the whole
+    # read-decide-claim, so the second enqueue sees the rows already 'queued' and
+    # claims nothing. Transaction-scoped: released by the commit below, and by a
+    # rollback, so a crash cannot hold it. Keyed on the job, so jobs never wait
+    # on each other.
+    from sqlalchemy import text as _sa_text
+
+    db.execute(
+        _sa_text("SELECT pg_advisory_xact_lock(hashtext(:k))"),
+        {"k": f"skip_trace_enqueue:{job_id}"},
+    )
+
     # Reload the surviving results after the unactionable drop. Eligible: the rows this
     # run delivers, AND the rows an earlier run of this account already delivered.
     # Delivered and traced are separate facts: a lead delivered with skip trace off
@@ -2293,8 +2317,6 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config, *, on_begin=None) 
     # nothing reusable; the cache check below is the second chance before paying.
     # Same-run siblings (e.g. the trustee_sale collapse) stay out: another row of this
     # run is the same property and is the one traced (Codex).
-    from sqlalchemy import text as _sa_text
-
     from src.api.lead_actionability import actionable_condition
     from src.api.results_category import skip_trace_eligible_condition
 

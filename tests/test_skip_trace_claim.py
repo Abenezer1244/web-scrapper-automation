@@ -28,7 +28,7 @@ from sqlalchemy import func, select, text
 from src.config import settings
 from src.db.models import Job, PendingSkipTraceRow, Result, ScraperConfig, User
 from src.scrapers.enrichment.skip_trace import build_pending_row_payload
-from src.workers.skip_trace_claim import claim_skip_trace_rows
+from src.workers.skip_trace_claim import claim_skip_trace_rows, lock_job_for_claim
 from src.workers.tasks_helpers.enrich import _enqueue_skip_trace_rows
 
 # A traceable owner and a complete, parseable situs: exactly the row the claim
@@ -95,6 +95,17 @@ async def _status(db, result_id) -> str:
     return r.skip_trace_status
 
 
+def _locked_claim(s, payloads, **kw):
+    """Claim the way production does: hold the job lock first.
+
+    `claim_skip_trace_rows` ASSERTS the lock is held, so a test that skipped it
+    would be testing a path production never takes. `lock_job_for_claim` is
+    idempotent within a transaction, so calling it per claim is safe.
+    """
+    lock_job_for_claim(s, str(payloads[0]["job_id"]))
+    return claim_skip_trace_rows(s, payloads, **kw)
+
+
 def _sync_enqueue(job_id, cfg_id, redis_client):
     def _inner(s):
         _enqueue_skip_trace_rows(s, s.get(Job, job_id), redis_client, job_id,
@@ -112,7 +123,7 @@ async def test_claim_returns_the_ids_it_won_and_advances_only_those(
     untouched = await _row(db, job_id, business_user.id, address="3 C ST")
 
     payloads = [await _payload(db, a), await _payload(db, b)]
-    won = await db.run_sync(lambda s: claim_skip_trace_rows(s, payloads))
+    won = await db.run_sync(lambda s: _locked_claim(s, payloads))
     await db.commit()
 
     assert sorted(won) == sorted([a, b])
@@ -138,14 +149,14 @@ async def test_a_second_active_claim_for_one_lead_is_refused_by_the_index(
     rid = await _row(db, job_id, business_user.id)
     payload = await _payload(db, rid)
 
-    first = await db.run_sync(lambda s: claim_skip_trace_rows(s, [payload]))
+    first = await db.run_sync(lambda s: _locked_claim(s, [payload]))
     await db.commit()
     assert first == [rid]
 
     (await db.get(Result, rid)).skip_trace_status = "not_attempted"
     await db.commit()
 
-    second = await db.run_sync(lambda s: claim_skip_trace_rows(s, [payload]))
+    second = await db.run_sync(lambda s: _locked_claim(s, [payload]))
     await db.commit()
     assert second == [], "a lead with an active claim must not be claimed again"
     assert await _pending(db, rid, active_only=True) == 1
@@ -169,7 +180,7 @@ async def test_one_conflicting_lead_does_not_lose_the_rest_of_the_batch(
 
     # Someone else claims A first, exactly as the action worker would.
     payload_a = await _payload(db, a)
-    assert await db.run_sync(lambda s: claim_skip_trace_rows(s, [payload_a])) == [a]
+    assert await db.run_sync(lambda s: _locked_claim(s, [payload_a])) == [a]
     await db.commit()
     # Put A back to not_attempted so the enqueue still considers it eligible and
     # genuinely collides, rather than filtering it out before the insert.
@@ -197,7 +208,7 @@ async def test_a_duplicate_result_id_inside_one_batch_claims_once(
     rid = await _row(db, job_id, business_user.id)
     payload = await _payload(db, rid)
 
-    won = await db.run_sync(lambda s: claim_skip_trace_rows(s, [payload, dict(payload)]))
+    won = await db.run_sync(lambda s: _locked_claim(s, [payload, dict(payload)]))
     await db.commit()
 
     assert won == [rid]
@@ -214,7 +225,7 @@ async def test_the_claim_does_not_commit(db, business_user: User):
     payload = await _payload(db, rid)
 
     def _claim_then_abandon(s):
-        won = claim_skip_trace_rows(s, [payload])
+        won = _locked_claim(s, [payload])
         assert won == [rid]
         s.rollback()
 
@@ -234,7 +245,7 @@ async def test_a_mixed_tenant_batch_is_refused(db, business_user: User, starter_
     foreign = dict(payload, result_id=str(uuid.uuid4()), user_id=starter_user.id)
 
     with pytest.raises(ValueError, match="one user_id"):
-        await db.run_sync(lambda s: claim_skip_trace_rows(s, [payload, foreign]))
+        await db.run_sync(lambda s: _locked_claim(s, [payload, foreign]))
 
 
 async def test_a_long_last_name_is_truncated_to_the_column_width(
@@ -248,7 +259,7 @@ async def test_a_long_last_name_is_truncated_to_the_column_width(
     rid = await _row(db, job_id, business_user.id)
     payload = dict(await _payload(db, rid), first_name="A", last_name="Z" * 400)
 
-    assert await db.run_sync(lambda s: claim_skip_trace_rows(s, [payload])) == [rid]
+    assert await db.run_sync(lambda s: _locked_claim(s, [payload])) == [rid]
     await db.commit()
 
     stored = (await db.execute(
@@ -279,7 +290,7 @@ async def test_a_lead_that_settled_before_the_claim_is_not_claimed_at_all(
     settled.skip_trace_status = "hit"
     await db.commit()
 
-    assert await db.run_sync(lambda s: claim_skip_trace_rows(s, [payload])) == []
+    assert await db.run_sync(lambda s: _locked_claim(s, [payload])) == []
     await db.commit()
 
     assert await _status(db, rid) == "hit", "a settled answer was overwritten"
@@ -303,13 +314,13 @@ async def test_another_tenants_lead_is_never_claimed(
     # Same lead, claimed under the WRONG tenant.
     stolen = dict(payload, user_id=starter_user.id)
 
-    assert await db.run_sync(lambda s: claim_skip_trace_rows(s, [stolen])) == []
+    assert await db.run_sync(lambda s: _locked_claim(s, [stolen])) == []
     await db.commit()
 
     assert await _pending(db, victim) == 0
     assert await _status(db, victim) == "not_attempted"
     # And the real owner can still claim it.
-    assert await db.run_sync(lambda s: claim_skip_trace_rows(s, [payload])) == [victim]
+    assert await db.run_sync(lambda s: _locked_claim(s, [payload])) == [victim]
     await db.commit()
     assert await _status(db, victim) == "queued"
 
@@ -327,7 +338,7 @@ async def test_a_vanished_lead_does_not_kill_the_batch(db, business_user: User):
     payload = await _payload(db, alive)
     ghost = dict(payload, result_id=str(uuid.uuid4()))
 
-    won = await db.run_sync(lambda s: claim_skip_trace_rows(s, [payload, ghost]))
+    won = await db.run_sync(lambda s: _locked_claim(s, [payload, ghost]))
     await db.commit()
 
     assert won == [alive]
@@ -353,7 +364,7 @@ async def test_an_oversized_state_is_refused_not_truncated(
     bad = dict(await _payload(db, bad_id), **{field: "WASHINGTON"})
     good = await _payload(db, good_id)
 
-    won = await db.run_sync(lambda s: claim_skip_trace_rows(s, [bad, good]))
+    won = await db.run_sync(lambda s: _locked_claim(s, [bad, good]))
     await db.commit()
 
     assert won == [good_id], "the refusal must cost only the payload it names"
@@ -370,7 +381,7 @@ async def test_a_bad_trace_type_is_refused_not_truncated(db, business_user: User
     rid = await _row(db, job_id, business_user.id)
     payload = dict(await _payload(db, rid), trace_type="super-advanced-deluxe")
 
-    assert await db.run_sync(lambda s: claim_skip_trace_rows(s, [payload])) == []
+    assert await db.run_sync(lambda s: _locked_claim(s, [payload])) == []
     await db.commit()
     assert await _pending(db, rid) == 0
 
@@ -403,7 +414,7 @@ async def test_without_the_index_nothing_is_claimed_and_nothing_is_lost(
     try:
         assert await db.run_sync(warn_if_unenforced) is False
         with pytest.raises(ClaimUnenforcedError):
-            await db.run_sync(lambda s: claim_skip_trace_rows(s, [payload]))
+            await db.run_sync(lambda s: _locked_claim(s, [payload]))
     finally:
         await db.rollback()
 
@@ -412,9 +423,49 @@ async def test_without_the_index_nothing_is_claimed_and_nothing_is_lost(
     assert await _pending(db, rid) == 0
     assert await _status(db, rid) == "not_attempted"
     # And once the index is back, the very same payload claims normally.
-    assert await db.run_sync(lambda s: claim_skip_trace_rows(s, [payload])) == [rid]
+    assert await db.run_sync(lambda s: _locked_claim(s, [payload])) == [rid]
     await db.commit()
     assert await _status(db, rid) == "queued"
+
+
+async def test_claiming_without_the_job_lock_is_refused(db, business_user: User):
+    """The lock is a precondition, not a convention.
+
+    It is what serializes the cache-hit write -- an ORM write on encrypted
+    columns, which no SQL in the claim can substitute for and which cannot see
+    another writer's uncommitted pending row. A caller that forgets it would
+    silently reintroduce the race where a settled Result sits against an active
+    paid queue row, so the claim refuses instead of trusting the docstring.
+    """
+    from src.workers.skip_trace_claim import ClaimLockNotHeldError
+
+    cfg = await _config(db, business_user)
+    job_id = await _job(db, business_user, cfg)
+    rid = await _row(db, job_id, business_user.id)
+    payload = await _payload(db, rid)
+
+    with pytest.raises(ClaimLockNotHeldError):
+        await db.run_sync(lambda s: claim_skip_trace_rows(s, [payload]))
+    await db.rollback()
+    assert await _pending(db, rid) == 0
+
+    # The identical payload claims once the lock is taken, so the refusal is
+    # about the lock and not about the payload.
+    assert await db.run_sync(lambda s: _locked_claim(s, [payload])) == [rid]
+    await db.commit()
+
+
+async def test_a_mixed_job_batch_is_refused(db, business_user: User):
+    """One job per claim: a single job lock is meaningless over a mixed batch."""
+    cfg = await _config(db, business_user)
+    job_a = await _job(db, business_user, cfg)
+    job_b = await _job(db, business_user, cfg)
+    a = await _row(db, job_a, business_user.id, address="1 A ST")
+    b = await _row(db, job_b, business_user.id, address="2 B ST")
+
+    payloads = [await _payload(db, a), await _payload(db, b)]
+    with pytest.raises(ValueError, match="one job_id"):
+        await db.run_sync(lambda s: _locked_claim(s, payloads))
 
 
 async def test_a_payload_naming_the_wrong_job_claims_nothing(
@@ -433,7 +484,7 @@ async def test_a_payload_naming_the_wrong_job_claims_nothing(
     rid = await _row(db, job_a, business_user.id)
     wrong_job = dict(await _payload(db, rid), job_id=job_b)
 
-    assert await db.run_sync(lambda s: claim_skip_trace_rows(s, [wrong_job])) == []
+    assert await db.run_sync(lambda s: _locked_claim(s, [wrong_job])) == []
     await db.commit()
 
     assert await _pending(db, rid) == 0
@@ -518,6 +569,7 @@ async def test_the_arbiter_itself_fails_closed_without_the_index(
             import src.workers.skip_trace_claim as mod
             real = mod.claim_enforcement_ok
             mod.claim_enforcement_ok = lambda _db: True  # pretend the check passed
+            lock_job_for_claim(s, job_id)
             try:
                 return mod.claim_skip_trace_rows(s, [payload])
             finally:
@@ -597,6 +649,7 @@ async def test_a_lead_settled_between_insert_and_update_leaves_no_row_behind(
                 _settle_from_another_connection()
             return result
 
+        lock_job_for_claim(s, job_id)
         s.execute = _execute
         try:
             won = claim_skip_trace_rows(s, [payload])

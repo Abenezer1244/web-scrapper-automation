@@ -74,7 +74,7 @@ def upgrade() -> None:
     # Guard BEFORE the build, so a duplicate produces this instruction rather
     # than a bare "could not create unique index" with a tuple in it.
     duplicates = conn.execute(text(
-        f"SELECT count(*) FROM (SELECT result_id FROM pending_skip_trace_rows "
+        f"SELECT count(*) FROM (SELECT result_id FROM public.pending_skip_trace_rows "
         f"WHERE status IN {_ACTIVE} GROUP BY result_id HAVING count(*) > 1) t"
     )).scalar()
     if duplicates:
@@ -83,7 +83,7 @@ def upgrade() -> None:
             f"FROM (SELECT result_id, count(*) FILTER ("
             f"        WHERE tracerfy_queue_id IS NOT NULL OR status = 'submitting'"
             f"      ) AS n_evidence "
-            f"      FROM pending_skip_trace_rows WHERE status IN {_ACTIVE} "
+            f"      FROM public.pending_skip_trace_rows WHERE status IN {_ACTIVE} "
             f"      GROUP BY result_id HAVING count(*) > 1) t"
         )).scalar()
         raise RuntimeError(
@@ -119,35 +119,62 @@ def upgrade() -> None:
             # an extra predicate conjunct would leave 099 recorded as applied
             # while the money-safety constraint it exists for is absent.
             existing = conn.execute(text(
-                "SELECT i.indisvalid, i.indisunique, i.indnatts, "
-                "       pg_get_expr(i.indpred, i.indrelid) AS predicate, "
-                "       pg_get_indexdef(i.indexrelid) AS definition "
+                "SELECT i.indisvalid, i.indisunique, i.indnatts, i.indnkeyatts, "
+                "       i.indexprs IS NULL AS plain_columns, a.attname, "
+                "       pg_get_expr(i.indpred, i.indrelid) AS predicate "
                 "FROM pg_class c "
                 "JOIN pg_namespace cn ON cn.oid = c.relnamespace "
                 "JOIN pg_index i ON i.indexrelid = c.oid "
                 "JOIN pg_class t ON t.oid = i.indrelid "
                 "JOIN pg_namespace tn ON tn.oid = t.relnamespace "
+                "LEFT JOIN pg_attribute a "
+                "       ON a.attrelid = i.indrelid AND a.attnum = i.indkey[0] "
                 "WHERE c.relname = :n AND cn.nspname = 'public' "
                 "  AND t.relname = 'pending_skip_trace_rows' AND tn.nspname = 'public'"
             ), {"n": _INDEX}).first()
+            # Structural, not textual: matching "(result_id)" in the index
+            # definition would also accept an expression index, which cannot
+            # serve the named ON CONFLICT arbiter and would fail every claim.
             wrong_shape = existing is not None and not (
                 existing.indisvalid
                 and existing.indisunique
                 and existing.indnatts == 1
-                and "(result_id)" in (existing.definition or "")
+                and existing.indnkeyatts == 1
+                and existing.plain_columns
+                and existing.attname == "result_id"
                 and " ".join((existing.predicate or "").split())
                 == " ".join(_EXPECTED_PREDICATE.split())
             )
-            # An index with the right NAME but on some other table or schema is
-            # invisible to the query above; drop by name covers that too.
-            named_elsewhere = existing is None and conn.execute(text(
-                "SELECT 1 FROM pg_class WHERE relname = :n AND relkind = 'i'"
-            ), {"n": _INDEX}).scalar()
-            if wrong_shape or named_elsewhere:
-                conn.execute(text(f"DROP INDEX CONCURRENTLY IF EXISTS {_INDEX}"))
+            if wrong_shape:
+                conn.execute(text(f"DROP INDEX CONCURRENTLY IF EXISTS public.{_INDEX}"))
+            elif existing is None:
+                # Right name, but NOT on public.pending_skip_trace_rows. Dropping
+                # it would destroy an unrelated index that something else needs,
+                # and an unqualified CREATE could then resolve against whatever
+                # search_path points at. Refuse and let a human look.
+                collision = conn.execute(text(
+                    "SELECT tn.nspname || '.' || t.relname "
+                    "FROM pg_class c "
+                    "JOIN pg_index i ON i.indexrelid = c.oid "
+                    "JOIN pg_class t ON t.oid = i.indrelid "
+                    "JOIN pg_namespace tn ON tn.oid = t.relnamespace "
+                    "WHERE c.relname = :n"
+                ), {"n": _INDEX}).scalar()
+                if collision:
+                    raise RuntimeError(
+                        f"Migration 099 ABORTED: an index named {_INDEX} already "
+                        f"exists on {collision}, which is not "
+                        f"public.pending_skip_trace_rows. It is NOT dropped, "
+                        f"because it may be something else's. Rename or remove it "
+                        f"deliberately, then re-run."
+                    )
+            # Fully qualified: an unqualified name resolves against search_path,
+            # which could create the index on a shadow table and record 099 as
+            # applied while the real table stayed unenforced.
             conn.execute(text(
                 f"CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS {_INDEX} "
-                f"ON pending_skip_trace_rows (result_id) WHERE status IN {_ACTIVE}"
+                f"ON public.pending_skip_trace_rows (result_id) "
+                f"WHERE status IN {_ACTIVE}"
             ))
         finally:
             conn.execute(text("RESET lock_timeout"))
@@ -158,6 +185,6 @@ def downgrade() -> None:
         conn = op.get_bind()
         conn.execute(text("SET lock_timeout = '5s'"))
         try:
-            conn.execute(text(f"DROP INDEX CONCURRENTLY IF EXISTS {_INDEX}"))
+            conn.execute(text(f"DROP INDEX CONCURRENTLY IF EXISTS public.{_INDEX}"))
         finally:
             conn.execute(text("RESET lock_timeout"))

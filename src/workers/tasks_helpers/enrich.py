@@ -2559,15 +2559,35 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config, *, on_begin=None) 
     # is what lets the action worker later write its dispositions in the same one.
     claimed_ids: list[str] = []
     if to_claim:
-        from src.workers.skip_trace_claim import claim_skip_trace_rows
+        from src.workers.skip_trace_claim import (
+            ClaimUnenforcedError,
+            claim_skip_trace_rows,
+        )
 
-        # Fails closed if migration 099's index is absent: raises, which
-        # tasks.py catches and logs, so the job still completes and its leads
-        # are still delivered. The leads stay 'not_attempted' and are claimed by
-        # the next run once the migration lands. That is a pause; proceeding
-        # unenforced would risk charging a customer twice for one lead, which
-        # trying again later cannot undo.
-        claimed_ids = claim_skip_trace_rows(db, to_claim)
+        # Fails closed if migration 099's index is absent: the leads stay
+        # 'not_attempted' and are claimed by the next run once the migration
+        # lands. That is a pause; proceeding unenforced would risk charging a
+        # customer twice for one lead, which trying again later cannot undo.
+        #
+        # Caught HERE rather than left to tasks.py (Security Master Review pass
+        # 2). tasks.py rolls the whole enqueue transaction back, which would
+        # also discard the cache hits copied above -- contacts this account
+        # ALREADY PAID FOR, free to reuse, and silently missing from the
+        # delivered export. Swallowing the claim but keeping the hits means the
+        # paid work survives and only the unbought lookups wait.
+        try:
+            claimed_ids = claim_skip_trace_rows(db, to_claim)
+        except ClaimUnenforcedError as exc:
+            _logger.error("Job %s skip trace claim refused: %s", job_id, exc)
+            _publish_log(
+                r, job_id, "warning",
+                f"Contact lookups are paused for {len(to_claim)} lead(s): the "
+                "database safeguard that stops a lead being looked up twice is "
+                "not in place. These leads keep their place and are looked up "
+                "automatically once it is restored. Nothing was charged.",
+                db=db,
+            )
+            to_claim = []
         claimed = set(claimed_ids)
         for payload in to_claim:
             if str(payload["result_id"]) not in claimed:

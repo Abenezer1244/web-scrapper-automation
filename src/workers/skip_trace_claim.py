@@ -135,6 +135,16 @@ def _normalize_sql(expression: str | None) -> str:
     return " ".join((expression or "").split())
 
 
+class ClaimLockNotHeldError(RuntimeError):
+    """The caller did not take `lock_job_for_claim` first.
+
+    A programming error, not a runtime condition: the lock is what serializes
+    the cache-hit write against another claimer, and no SQL in the claim itself
+    can substitute for it (the cache-hit write is an ORM write on encrypted
+    columns, and it cannot see another writer's uncommitted pending row).
+    """
+
+
 class ClaimUnenforcedError(RuntimeError):
     """Migration 099's index is absent, so a second active claim is possible.
 
@@ -156,14 +166,17 @@ def claim_enforcement_ok(db) -> bool:
     """
     row = db.execute(
         text(
-            "SELECT i.indisunique, i.indisvalid, i.indnatts, "
-            "       pg_get_expr(i.indpred, i.indrelid) AS predicate, "
-            "       pg_get_indexdef(i.indexrelid) AS definition "
+            "SELECT i.indisunique, i.indisvalid, i.indnatts, i.indnkeyatts, "
+            "       i.indexprs IS NULL AS plain_columns, "
+            "       a.attname, "
+            "       pg_get_expr(i.indpred, i.indrelid) AS predicate "
             "FROM pg_class c "
             "JOIN pg_namespace cn ON cn.oid = c.relnamespace "
             "JOIN pg_index i ON i.indexrelid = c.oid "
             "JOIN pg_class t ON t.oid = i.indrelid "
             "JOIN pg_namespace tn ON tn.oid = t.relnamespace "
+            "LEFT JOIN pg_attribute a "
+            "       ON a.attrelid = i.indrelid AND a.attnum = i.indkey[0] "
             # Schema-qualified on BOTH sides: a same-named index on another
             # schema's pending_skip_trace_rows would otherwise satisfy this
             # while the table the application actually writes stays unenforced.
@@ -174,9 +187,13 @@ def claim_enforcement_ok(db) -> bool:
     ).first()
     if row is None or not row.indisunique or not row.indisvalid:
         return False
-    # Exactly one indexed column, and it is result_id: a composite unique index
-    # on (result_id, something) permits duplicate active rows per lead.
-    if row.indnatts != 1 or "(result_id)" not in (row.definition or ""):
+    # Structural, not textual. Matching "(result_id)" inside pg_get_indexdef
+    # would also accept an EXPRESSION index such as (lower(result_id::text)),
+    # which cannot serve the named ON CONFLICT arbiter at all: every claim would
+    # then fail closed while the index looked correct. Exactly one key column,
+    # no expressions, and that column is result_id.
+    if (row.indnatts != 1 or row.indnkeyatts != 1
+            or not row.plain_columns or row.attname != "result_id"):
         return False
     # The predicate is compared EXACTLY, not by counting casts. Counting was
     # bypassable: a predicate of
@@ -243,11 +260,40 @@ def lock_job_for_claim(db, job_id: str) -> None:
 
     Transaction-scoped, so a commit and a rollback both release it and a crash
     cannot hold it. Keyed on the job, so unrelated jobs never wait on each other.
+
+    Not merely documented: `claim_skip_trace_rows` ASSERTS the lock is held, so
+    a caller that forgets it is refused rather than silently racing.
     """
     db.execute(
         text("SELECT pg_advisory_xact_lock(hashtext(:k))"),
-        {"k": f"skip_trace_enqueue:{job_id}"},
+        {"k": _lock_key(job_id)},
     )
+
+
+def _lock_key(job_id: str) -> str:
+    return f"skip_trace_enqueue:{job_id}"
+
+
+def job_claim_lock_held(db, job_id: str) -> bool:
+    """True when THIS backend already holds `job_id`'s claim lock.
+
+    pg_advisory_xact_lock(bigint) stores the key split across pg_locks.classid
+    (high 32 bits) and objid (low 32 bits), with objsubid = 1 for the
+    single-argument form. hashtext() returns int4, so the shift is arithmetic on
+    a possibly negative value and both halves are masked back to their unsigned
+    oid representation before comparing.
+    """
+    return bool(db.execute(
+        text(
+            "WITH k AS (SELECT hashtext(:k)::bigint AS key) "
+            "SELECT 1 FROM pg_locks l, k "
+            "WHERE l.locktype = 'advisory' AND l.pid = pg_backend_pid() "
+            "  AND l.granted AND l.objsubid = 1 "
+            "  AND l.classid = ((k.key >> 32) & 4294967295)::oid "
+            "  AND l.objid = (k.key & 4294967295)::oid"
+        ),
+        {"k": _lock_key(job_id)},
+    ).scalar())
 
 
 def claim_skip_trace_rows(db, payloads: list[dict]) -> list[str]:
@@ -289,6 +335,24 @@ def claim_skip_trace_rows(db, payloads: list[dict]) -> list[str]:
             f"claim_skip_trace_rows: expected one user_id, got {len(user_ids)}"
         )
     user_id = next(iter(user_ids))
+
+    # ONE job per claim, and its lock must already be held. Both are asserted
+    # rather than documented (Security Master Review pass 2): a caller that
+    # forgets `lock_job_for_claim` reintroduces the race where a cache-hit write
+    # settles a Result while another claimer holds an uncommitted paid queue row
+    # for it. A mixed-job batch would make a single job lock meaningless.
+    job_ids = {str(p["job_id"]) for p in payloads}
+    if len(job_ids) != 1:
+        raise ValueError(
+            f"claim_skip_trace_rows: expected one job_id, got {len(job_ids)}"
+        )
+    job_id = next(iter(job_ids))
+    if not job_claim_lock_held(db, job_id):
+        raise ClaimLockNotHeldError(
+            f"lock_job_for_claim(db, {job_id!r}) must be called before claiming: "
+            "without it a cache-hit write can settle a lead another claimer has "
+            "already queued and paid for."
+        )
 
     # Refuse rather than mangle: a value whose column cannot hold it (_EXACT) or
     # a trace_type the dispatcher would never drain.
@@ -369,9 +433,14 @@ def claim_skip_trace_rows(db, payloads: list[dict]) -> list[str]:
             # The dispatcher's tenant-pinned joins would then ignore that row
             # forever while the unique index blocked the legitimate claim --
             # a lead that can never be looked up again.
-            f"JOIN results r ON r.id = v.result_id AND r.user_id = v.user_id "
-            f"                AND r.job_id = v.job_id "
-            f"WHERE r.user_id = CAST(:uid AS uuid) "
+            f"JOIN public.results r ON r.id = v.result_id AND r.user_id = v.user_id "
+            f"                       AND r.job_id = v.job_id "
+            # The JOB's owner too, not just the result's: the payload's job_id is
+            # written onto the queue row, and a row tied to another tenant's job
+            # would be ignored by the dispatcher's tenant-pinned joins forever
+            # while the unique index blocked the legitimate claim.
+            f"JOIN public.jobs j ON j.id = v.job_id AND j.user_id = v.user_id "
+            f"WHERE r.user_id = CAST(:uid AS uuid) AND j.user_id = CAST(:uid AS uuid) "
             f"  AND r.skip_trace_status = :claimable "
             f"{conflict_sql} "
             f"RETURNING result_id"

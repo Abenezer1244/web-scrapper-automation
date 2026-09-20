@@ -1,3 +1,193 @@
+# King County pre_foreclosure: Auction Date / Principal Owing = N/A
+
+Branch: `investigate/king-nts-parcel-bridge` · worktree `C:/Users/Windows/bl-wt-kingnts`
+Opened 2026-09-20. Reported from job `18076769` (51 rows, 0 with auction data).
+
+---
+
+## Findings (evidence, not hypothesis)
+
+All numbers read from production 2026-09-19/20 via `DATABASE_URL_SYNC` (read-only).
+
+### The record type is correct. This is not a misclassification bug.
+
+1,114 / 1,114 King `pre_foreclosure` results carry `doc_type = "NOTICE OF TRUSTEE SALE"`.
+No deeds, assignments, liens or transfers. `king_wa_probate.py:922-933` already runs
+`_is_preforeclosure_doc()` then `is_cancellation_or_admin()` (drops Discontinuance /
+Rescission / Withdrawal / Reconveyance / Substitution of Trustee), then
+`orient_pre_foreclosure_party()`. Every sample parcel from the screenshot is a real NTS
+with its recorder instrument number stored in `enrichment_data.instrument_number`.
+
+### BridgeLeads DOES stop at the recorder index, by design, and the index has no auction fields.
+
+`king_wa_probate.py:871-963` parses the LandmarkWeb `GetSearchResults` DataTables JSON.
+The payload carries grantor, grantee, record date, doc type, recording number, legal/PID.
+There is no document-detail fetch and no PDF/image path anywhere in the module. The sale
+date and the amount owing exist only in the body of the recorded notice (RCW 61.24.040(1)(f)).
+`docs/scoping-king-nts-coverage-2026-09-03.md` (+2 addenda) records why that route is closed:
+King's LandmarkWeb terms ban "high-volume, automated" access and "Data Mining (mass
+downloading) of images", and King has IP-rate-blocked this project before.
+
+### So auction data comes from newspapers, and King's supply is ~1%.
+
+Architecture: recorder -> `pre_foreclosure` lead; legal newspaper -> `nts_notices`;
+`nts_matcher_task` attaches. All 22 court-approved King legal newspapers were checked in
+Sept; only Queen Anne & Magnolia News is usable. Prod holds **38 King notices ever**
+against **1,114 King leads / 298 distinct parcels**.
+
+Fill rate by county, `pre_foreclosure`, all time:
+
+| county | results | auction_date | % |
+|---|---|---|---|
+| pierce | 2,426 | 260 | 10.7% |
+| king | 1,114 | 15 | **1.35%** |
+| snohomish | 76 | 76 | 100% |
+| clark | 27 | 0 | 0% |
+
+### Why THIS job is 0/51 and not 1/51: a timing window, not a failure.
+
+Recording -> auction lag on matched King leads: **57-137 days (avg 109)**. A notice is
+published 7-35 days before the sale (RCW 61.24.040(5)), i.e. ~2-4 months AFTER recording.
+Job `18076769` scraped recordings from **2026-08-20 to 2026-09-18**. Those sales fall in
+Dec 2026-Jan 2027 and have not been published anywhere yet. The newest King auction we hold
+is 2026-10-16.
+
+King leads by recording month vs auction data obtained:
+
+| recorded | leads | with auction |
+|---|---|---|
+| 2026-03 | 23 | 1 |
+| 2026-04 | 64 | 3 |
+| 2026-05 | 26 | 3 |
+| 2026-06 | 156 | 8 |
+| 2026-07 | 325 | 0 |
+| 2026-08 | 372 | 0 |
+| 2026-09 | 148 | 0 |
+
+The zeros for Jul/Aug/Sep are structurally correct. `nts_matcher_task` already keeps each
+lead a match candidate for 180 days (`_RECENT_DAYS = 180`) and re-runs daily, so these rows
+can still acquire auction data later. The beat is healthy: every exact-parcel pair that
+exists has already been attached (11 notices -> 15 results, fully converged).
+
+### The one real code bug: King's 12-digit account number vetoes the match.
+
+King publishes two identifiers. The recorder index emits the **10-digit PIN** (`2895650150`).
+Trustees print the **12-digit tax account number** on the notice (`289565-0150-04`).
+`nts_matcher._norm_parcel` strips punctuation but not the length difference, so the two read
+as a parcel CONFLICT and `score_match` returns `0.0` at line 88-89 -- a hard veto that even
+an agreeing street address and an agreeing surname cannot override.
+
+Reproduced (`scratchpad/repro_matcher.py`, pure function, no DB):
+
+| notice | result | score today |
+|---|---|---|
+| `289565-0150-04` | `2895650150` | **0.0** |
+| `421640022008` | `4216400220` | **0.0** |
+| `327692-0130-03` | `3276920130` | **0.0** |
+| `198920-1275` (control) | `1989201275` | 0.96 |
+| different property (control) | | 0.0 |
+
+Prod impact: 14 of 38 King notices normalize to 12 chars. Exact overlap today is 11 notices
+-> 15 results; on the 10-digit PIN it is 16 notices -> **21 results**. The 7 missed pairs all
+have an agreeing surname; two are LIVE upcoming auctions:
+
+- `WA07000188-22-3` 2026-09-25 $190,752.06 (SIMON JOANN, 11120 NE 68TH ST #B-206)
+- `WA08000108-25-1` 2026-10-09 $525,833.17 (KORKONDA/CHODIMELLA, 4206 S GREENBELT STATION DR) x3 tenant rows
+
+This is King-only: Pierce notices normalize to 10, Snohomish to 14, Clark to 9, and no PIN
+outside King appears in both forms.
+
+### API / UI / CSV are innocent.
+
+`schemas.py:1165-1166` passes `auction_date: date | None` / `default_amount: float | None`
+straight through; NULL serializes as JSON null. `lead_export.py:458-460` emits blank, not
+"N/A". The "N/A" in the screenshot is a frontend empty state. No backend coercion, no
+fabrication anywhere.
+
+### Field semantics: "Principal Owing" is right most of the time, over-specific sometimes.
+
+`nts_tacoma_index._principal_owing` anchors on the RCW 61.24.040(1)(f) section IV sentence
+("the sum owing on the obligation secured by the Deed of Trust"), PREFERS the figure labelled
+`Principal`, and only falls back to the first dollar figure in section IV when the notice
+carries no "principal" label (matured/balloon notices). In that fallback the number is the
+total sum owing, not strictly principal. `note_amount` (the original loan size) is stored
+separately and is never used as Principal Owing.
+
+---
+
+## Plan
+
+### Phase 1 - matcher fix (the only recoverable data)
+
+Codex consulted 2026-09-20, `GATE: FAIL` with 4 P1s. All four verified against the code and
+accepted:
+
+- [ ] P1-a: a bridged parcel must NOT inherit the unconditional `0.90` branch (that is exactly
+      `MATCH_THRESHOLD`, so an uncorroborated bridge would auto-attach).
+- [ ] P1-b: gate the bridge on county. `score_match` has no county argument today; thread one
+      through and fail closed when it is missing. A shape-only rule is a King encoding rule
+      wearing a generic costume.
+- [ ] P1-c: `best_match_group._same_property` (lines 173-185) compares `_norm_parcel` for
+      equality too. Patching only `score_match` makes a bridged sibling read as a DIFFERENT
+      property and bails the whole group to `[]` -- strictly worse than today. Model parcel
+      identity once as an explicit relation (`EXACT` / `KING_PIN_ACCOUNT` / `CONFLICT` /
+      `UNKNOWN`) and use it in both places.
+- [ ] P1-d: the relation is non-transitive (12A == PIN == 12B, 12A != 12B). Fail closed when
+      two distinct 12-digit accounts share one PIN. Verified: **zero** such cases in prod
+      today, in both `nts_notices` and `results`.
+- [ ] Regression tests per Codex's list, plus the 7 measured King pairs as fixtures.
+
+**One deliberate departure from Codex, needs a call (see Open question 1).** Codex wants the
+bridge to require BOTH address and grantor agreement. Address agreement is structurally
+unavailable on King recorder rows: `property_address` is the frozen street-only dedup key, so
+`address_match_key` yields `4206 S GREENBELT STATION DR` against the notice's
+`4206 S GREENBELT STATION DR|98118`. Requiring both recovers **1 of 7** pairs. Requiring
+grantor agreement alone recovers **7 of 7**.
+
+### Phase 2 - missing-reason classification (the user asked for this explicitly)
+
+- [ ] Record WHY auction data is absent, internally, without changing what the customer sees:
+      `SOURCE_NOT_PUBLISHED_YET` (recording too recent for the statutory publication window),
+      `NO_SOURCE_FOR_COUNTY`, `SOURCE_HAS_NO_NOTICE`, `SUPERSEDED`, `PARSE_FAILED`.
+      This is what makes the next King question answerable in one query instead of a session.
+
+### Phase 3 - backfill
+
+- [ ] Idempotent re-match of existing King rows. The daily beat already does this; the only
+      new rows are the 6-7 the bridge unlocks. No new leads, no quota touched, no delivery
+      re-marked, no skip trace. Uses the existing `_write_match` guard (claims only rows that
+      are unset or hold a past auction), so a re-run writes 0.
+
+### Phase 4 - verification
+
+- [ ] `pytest` on the local rig (NOT bare pytest -- see `.claude/rules/testing.md`).
+- [ ] Codex review of the diff.
+- [ ] Live UI check.
+
+---
+
+## Open questions for the owner
+
+1. **Bridge corroborator.** Grantor-only (recovers 7/7, my recommendation) or Codex's
+   address+grantor (recovers 1/7)? Codex wins by default under
+   `.claude/rules/codex-collaboration.md`, so this needs an explicit override.
+2. **Is Phase 1 worth it?** It moves King from 15 to 21 filled rows out of 1,114 (1.35% ->
+   1.9%). It is a real correctness fix and it unlocks two live auctions, but it does not
+   change what the reported job shows.
+3. **The bigger lever is product honesty, not code.** King will show Auction Date on roughly
+   1 lead in 100 and on ~0 in 100 for recordings inside the last ~60 days. Today that renders
+   as a bare "N/A" that reads as "we failed". Options: a note on the results header for
+   affected counties, scoping/pricing the offer around it, or licensing a commercial
+   foreclosure feed. That is a product call, not an engineering one.
+
+---
+
+## Review
+
+(to be filled in after implementation)
+
+---
+
 # CRM CSV follow-ups, one by one (2026-09-15)
 
 Source: `docs/HANDOFF-crm-csv-layout-2026-09-15.md` "Open follow-ups". Owner: do all, one at a time, with Codex.

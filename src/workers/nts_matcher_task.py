@@ -64,6 +64,39 @@ _PAST_AUCTION_DAYS = 180
 # pass filters on fetched_at against the same horizon instead.
 _CACHE_DAYS = 90
 
+# ── Why a lead has no auction data ────────────────────────────────────────────
+#
+# A blank Auction Date / Principal Owing has several very different causes, and they
+# are indistinguishable once the row is written. "King shows N/A on everything" cost a
+# full session to answer; stamping the reason makes it one query. Stored in
+# enrichment_data['nts_missing'] (no migration, queryable as
+# enrichment_data->>'nts_missing'); the customer-facing UI and CSV are unchanged.
+NTS_MISSING_NO_SOURCE = "NO_SOURCE_FOR_COUNTY"      # no legal-notice crawler for this county
+NTS_MISSING_NOT_PUBLISHED = "SOURCE_NOT_PUBLISHED_YET"  # recorded too recently to be published
+NTS_MISSING_NO_NOTICE = "SOURCE_HAS_NO_NOTICE"      # past the window, source holds nothing
+NTS_MISSING_UNKNOWN = "UNKNOWN"                     # no usable recording date to reason from
+
+# Earliest a notice for a lead recorded today can appear in a newspaper. RCW 61.24.040(1)
+# records the notice of sale >= 90 days before the sale and 61.24.040(5) publishes it
+# between the 35th-28th and the 14th-7th day before the sale, so the FIRST publication
+# lands no sooner than ~55 days after recording. Below this age, a blank is not evidence
+# of anything — the notice cannot exist yet. (Prod 2026-09-19: King leads recorded in
+# Jul/Aug/Sep were 0/845 matched, entirely explained by this window.)
+_PUBLICATION_LAG_MIN_DAYS = 55
+
+
+def auction_missing_reason(
+    *, county: str, date_recorded, today, has_source: bool
+) -> str:
+    """Why this lead carries no auction data. Pure — county/date in, reason out."""
+    if not has_source:
+        return NTS_MISSING_NO_SOURCE
+    if date_recorded is None:
+        return NTS_MISSING_UNKNOWN
+    if (today - date_recorded).days < _PUBLICATION_LAG_MIN_DAYS:
+        return NTS_MISSING_NOT_PUBLISHED
+    return NTS_MISSING_NO_NOTICE
+
 
 @app.task(name="src.workers.nts_matcher_task.match_nts_notices")
 def match_nts_notices() -> dict:
@@ -79,7 +112,8 @@ def match_nts_notices() -> dict:
             result_rows = db.execute(
                 _sa_text(
                     """
-                    SELECT r.id, r.parcel_id, r.property_address, r.party_name
+                    SELECT r.id, r.parcel_id, r.property_address, r.party_name,
+                           r.date_recorded_parsed
                     FROM results r JOIN jobs j ON j.id = r.job_id
                     JOIN scraper_configs sc ON sc.id = j.scraper_config_id
                     WHERE sc.record_type = 'pre_foreclosure'
@@ -137,7 +171,7 @@ def match_job_inline(db, job_id: str) -> int:
     rows = db.execute(
         _sa_text(
             """
-            SELECT id, parcel_id, property_address, party_name
+            SELECT id, parcel_id, property_address, party_name, date_recorded_parsed
             FROM results
             WHERE job_id = :jid
               AND user_id = (SELECT user_id FROM jobs WHERE id = :jid)
@@ -166,16 +200,21 @@ def _match_and_write(
         return 0
 
     # Build matcher candidates (precompute addr_key) + indexes by addr_key + parcel.
-    from src.scrapers.sources.nts_matcher import _norm_parcel
+    # The parcel index uses parcel_index_keys, not the bare normalized parcel: where a
+    # county publishes one property under two encodings (King's 10-digit PIN vs its
+    # 12-digit tax account), the two strings differ, so a bridged candidate indexed
+    # only under its own spelling would never enter the pool and the scorer would never
+    # get to judge it. Indexing (and looking up) under both spellings keeps pool
+    # construction independent of how the scorer is tuned.
+    from src.scrapers.sources.nts_matcher import parcel_index_keys
     cands = [result_match_candidate(r) for r in result_dicts]
     by_addr: dict[str, list[dict]] = {}
     by_parcel: dict[str, list[dict]] = {}
     for c in cands:
         if c["addr_key"]:
             by_addr.setdefault(c["addr_key"], []).append(c)
-        np_ = _norm_parcel(c["parcel"])
-        if np_:
-            by_parcel.setdefault(np_, []).append(c)
+        for key in parcel_index_keys(c["parcel"], county):
+            by_parcel.setdefault(key, []).append(c)
 
     today = datetime.now(UTC).date()
     _COLS = """
@@ -236,9 +275,8 @@ def _match_and_write(
         if nm.get("property_address_normalized"):
             for c in by_addr.get(nm["property_address_normalized"], []):
                 pool[c["id"]] = c
-        npn = _norm_parcel(nm.get("parcel"))
-        if npn:
-            for c in by_parcel.get(npn, []):
+        for key in parcel_index_keys(nm.get("parcel"), county):
+            for c in by_parcel.get(key, []):
                 pool[c["id"]] = c
         # Don't let one Result be claimed by two notices in the same pass.
         candidates = [c for c in pool.values() if c["id"] not in used_result_ids]
@@ -248,7 +286,7 @@ def _match_and_write(
         # multiple tenants can each track the same foreclosure, and they should
         # all get it (best_match's single-winner bail silently dropped that case).
         # best_match_group still returns [] on a different-property tie (ambiguous).
-        group = best_match_group(nm, candidates)
+        group = best_match_group(nm, candidates, county=county)
         is_live = nm["id"] in live_ids
         for rid, conf in group:
             used_result_ids.add(rid)
@@ -257,9 +295,68 @@ def _match_and_write(
             if _write_match(db, rid, nm, conf, live=is_live, today=today) == 1:
                 matched += 1
 
-    if commit and matched:
+    # Stamp WHY the rest are still blank. A blank Auction Date means several very
+    # different things (no source for the county / the notice cannot legally have been
+    # published yet / the source genuinely has nothing) and they are indistinguishable
+    # once written. Reasons are recomputed each pass but only WRITTEN when they change,
+    # so a lead costs ~2 writes over its 180-day candidacy, not one per beat.
+    unmatched = [r for r in result_dicts if r.get("id") not in used_result_ids]
+    stamped = _stamp_missing_reasons(db, unmatched, county=county, today=today)
+
+    if commit and (matched or stamped):
         db.commit()
     return matched
+
+
+def _stamp_missing_reasons(
+    db, unmatched: list[dict[str, Any]], *, county: str, today
+) -> int:
+    """Record enrichment_data['nts_missing'] on leads that got no auction data.
+
+    Grouped by reason so this is at most one UPDATE per distinct reason per county per
+    pass, never one per row. Only rows whose stored reason actually DIFFERS are touched,
+    and a row that already carries an auction_date is never stamped.
+    """
+    from collections import defaultdict
+
+    from sqlalchemy import text as _sa_text
+
+    if not unmatched:
+        return 0
+    has_source = county in NTS_MATCH_COUNTIES
+    by_reason: dict[str, list[Any]] = defaultdict(list)
+    for r in unmatched:
+        reason = auction_missing_reason(
+            county=county,
+            date_recorded=r.get("date_recorded_parsed"),
+            today=today,
+            has_source=has_source,
+        )
+        by_reason[reason].append(r.get("id"))
+
+    written = 0
+    for reason, ids in by_reason.items():
+        res = db.execute(
+            _sa_text(
+                """
+                UPDATE results SET
+                    enrichment_data = COALESCE(enrichment_data, '{}'::json)::jsonb
+                                      || jsonb_build_object('nts_missing', :reason)
+                WHERE id = ANY(CAST(:ids AS uuid[]))
+                  AND auction_date IS NULL
+                  AND COALESCE(enrichment_data->>'nts_missing', '') <> :reason
+                """
+            ),
+            {"reason": reason, "ids": [str(i) for i in ids]},
+        )
+        written += res.rowcount or 0
+    if written:
+        _logger.info(
+            "NTS missing-reason stamped %d %s leads: %s",
+            written, county,
+            ", ".join(f"{k}={len(v)}" for k, v in sorted(by_reason.items())),
+        )
+    return written
 
 
 def _write_match(

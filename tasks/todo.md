@@ -243,6 +243,20 @@ grantor agreement alone recovers **7 of 7**.
   over-specific for that minority. `note_amount` (the original loan size) is stored
   separately and is never used as Principal Owing.
 
+### Found while tracing, fixed here
+
+`45ed404` - **the Lists CSV was printing three auction headers over three permanently
+empty columns.** `OVERLAP_LEAD_COLUMNS` gained `auction_date` / `days_to_auction` /
+`default_amount` *because* a segment export lost them (`lead_export.py:775-781`), and
+`batch_export.py` was fixed alongside that comment while `segments.py` was not. All three
+segment queries omitted `r.auction_date` / `r.default_amount` from both the inner SELECT
+and the final projection; `build_overlap_export_row` reads with `getattr(row, name, None)`,
+so an absent column is indistinguishable from a NULL one. Surfaced by the field-trace
+subagent, verified independently, test written red-first, and each modified query EXPLAINs
+against the real schema. The same omission also blanks `doc_type`, `delinquent_amount`,
+`delinquent_bill_year`, `heirs`, `legal_description` and the owner flags there - left alone
+rather than widened into an unrelated change. ⏭️
+
 ### Notes and follow-ups
 
 - The reported job (`18076769`) gains nothing from this and is *correct* as it stands:

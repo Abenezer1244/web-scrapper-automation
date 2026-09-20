@@ -260,6 +260,13 @@ SELECT rk.id, rk.date_recorded, rk.party_name, rk.parcel_id, rk.property_address
        rk.phones, rk.emails, rk.date_is_auction_date,
        rk.auction_date, rk.default_amount,
        rk.doc_type, rk.heirs, rk.legal_description,
+       -- record_type is SELECTed into the CTE but was never projected, so the
+       -- exporter saw None and name_order_for() returned None, which makes
+       -- split_first_person yield blanks by contract. First Name / Last Name
+       -- are promised columns and were permanently empty in every Lists CSV.
+       -- `matched_record_types` stays the source for the `lists` column; this
+       -- is the representative row's own type, which is what name order needs.
+       rk.record_type,
        rk.delinquent_amount, rk.delinquent_bill_year,
        a.matched_record_types, a.overlap_count, a.lead_subtype
 FROM ranked rk
@@ -379,6 +386,13 @@ SELECT rk.id, rk.date_recorded, rk.party_name, rk.parcel_id, rk.property_address
        rk.phones, rk.emails, rk.date_is_auction_date,
        rk.auction_date, rk.default_amount,
        rk.doc_type, rk.heirs, rk.legal_description,
+       -- record_type is SELECTed into the CTE but was never projected, so the
+       -- exporter saw None and name_order_for() returned None, which makes
+       -- split_first_person yield blanks by contract. First Name / Last Name
+       -- are promised columns and were permanently empty in every Lists CSV.
+       -- `matched_record_types` stays the source for the `lists` column; this
+       -- is the representative row's own type, which is what name order needs.
+       rk.record_type,
        rk.delinquent_amount, rk.delinquent_bill_year,
        a.matched_record_types, a.overlap_count, a.identity_strength, a.lead_subtype
 FROM ranked rk
@@ -457,6 +471,13 @@ SELECT rk.id, rk.date_recorded, rk.party_name, rk.parcel_id, rk.property_address
        rk.phones, rk.emails, rk.date_is_auction_date,
        rk.auction_date, rk.default_amount,
        rk.doc_type, rk.heirs, rk.legal_description,
+       -- record_type is SELECTed into the CTE but was never projected, so the
+       -- exporter saw None and name_order_for() returned None, which makes
+       -- split_first_person yield blanks by contract. First Name / Last Name
+       -- are promised columns and were permanently empty in every Lists CSV.
+       -- `matched_record_types` stays the source for the `lists` column; this
+       -- is the representative row's own type, which is what name order needs.
+       rk.record_type,
        rk.delinquent_amount, rk.delinquent_bill_year,
        a.matched_record_types, a.overlap_count, a.lead_subtype
 FROM ranked rk

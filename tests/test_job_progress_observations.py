@@ -208,6 +208,27 @@ def test_a_legacy_row_with_no_stage_clock_still_gets_an_estimate():
     assert 540 <= j.estimated_seconds_remaining <= 660
 
 
+def test_a_terminal_run_advertises_no_next_attempt():
+    """A job can be CANCELLED while sitting out a transient-retry backoff, and
+    the cancel path does not clear the column. Left in the response, next_retry_at
+    is a deadline for an attempt that can never run."""
+    soon = datetime.now(UTC) + timedelta(minutes=5)
+    for status in ("cancelled", "failed", "done"):
+        j = _job(status=status, retry_count=1, next_retry_at=soon,
+                 finished_at=_ago(seconds=5))
+        assert j.next_retry_at is None, status
+
+
+def test_a_job_actually_waiting_to_retry_still_says_when():
+    """The other side of it: suppressing the deadline on a run that really is
+    going to retry would take away the only useful thing the page can say."""
+    j = _job(status="pending", retry_count=1, started_at=None,
+             last_heartbeat_at=None,
+             next_retry_at=datetime.now(UTC) + timedelta(minutes=5))
+    assert j.retry_pending is True
+    assert j.next_retry_at is not None
+    assert j.stage_label == "Waiting to retry"
+
 # ─── Stage reporting ─────────────────────────────────────────────────────────
 
 def test_every_stage_the_worker_writes_has_customer_copy():

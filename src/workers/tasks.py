@@ -1953,14 +1953,21 @@ def run_scrape_job(self, job_id: str) -> None:
             # what the job is actually doing ("queuing contact lookups"), not for the
             # skip trace itself. A run that shows "finding contact information" and
             # then finishes would be claiming work it never waited for.
-            # Commits on its own here, unlike the other boundaries: no _publish_log
-            # follows to carry it, and leaving the UPDATE pending would hold a lock
-            # on the jobs row for the whole enqueue — which is the row Cancel Run
-            # writes. The db.commit() immediately above means this commits nothing
-            # but itself.
-            _set_stage(db, job, "queuing_contacts", expected_started_at=attempt_started_at)
+            # Passed as a callback rather than written here: the stage is only true
+            # once the enqueue's own gates have passed (skip trace enabled, token
+            # present, config on, plan above Starter, at least one eligible row).
+            # Written unconditionally, it labelled a Starter run — or any run with
+            # nothing eligible — "Queuing contact lookups" while queuing nothing
+            # (Codex round 7). Restating those gates here would just give them a
+            # second place to drift.
             try:
-                _enqueue_skip_trace_rows(db, job, r, job_id, config)
+                _enqueue_skip_trace_rows(
+                    db, job, r, job_id, config,
+                    on_begin=lambda: _set_stage(
+                        db, job, "queuing_contacts",
+                        expected_started_at=attempt_started_at,
+                    ),
+                )
             except Exception as exc:
                 db.rollback()
                 _logger.warning(

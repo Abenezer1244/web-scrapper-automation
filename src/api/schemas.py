@@ -1293,6 +1293,16 @@ class JobResponse(BaseModel):
             # A finished run has no current activity, so a stage clock would only
             # count time since it stopped.
             self.stage_seconds = None
+            # Nor a next attempt. A job can be CANCELLED while it is sitting out a
+            # transient-retry backoff, and the cancel path does not clear the column,
+            # so the row keeps a `next_retry_at` that nothing will ever act on. Left
+            # in the response it is a deadline for an attempt that cannot happen
+            # (Codex round 7). Suppressed HERE rather than cleared in the cancel
+            # UPDATE on purpose: this covers every terminal path, and every row
+            # already in the table, without a backfill. The column itself is
+            # untouched, so the watchdog and any forensics still see what was
+            # scheduled.
+            self.next_retry_at = None
             return
 
         # ── Liveness, before any "in progress" label is chosen ────────────────

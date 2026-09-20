@@ -179,4 +179,45 @@ intent, but it is its own fix with its own blast radius.
 
 ## Review
 
-_(filled in at the end)_
+### Shipped
+
+| PR | State | Gate |
+|----|-------|------|
+| BE **#347** watchdog guarded recovery writes | **MERGED** `8ba7bf8`, deployed | CI full suite green; Codex reviewed and found a hole in the first version, fixed in commit 2 |
+| BE **#348** truthful progress | DRAFT | CI full suite + lint + OpenAPI drift green; **Codex gate INCOMPLETE** |
+| FE **#158** Live Run UI | DRAFT | tsc + eslint + next build clean; browser-verified; **Codex gate INCOMPLETE** |
+
+### The Codex gate did NOT complete
+
+`codex review` on both diffs was interrupted by an OpenAI usage limit before it
+produced any verdict:
+
+```
+ERROR: You've hit your usage limit ... try again at 4:02 AM.
+Review was interrupted. Please re-run /review and wait for it to complete.
+```
+
+Per `.claude/rules/codex-collaboration.md` a build is not cleared until Codex has
+reviewed the diff. **Neither #348 nor #158 has been.** Both stay DRAFT. Re-run:
+
+```
+cd C:/Users/Windows/bl-wt-liverun     && codex review --base main
+cd C:/Users/Windows/bl-wt-liverun-fe  && codex review --base master
+```
+
+Codex DID review the PLAN (before any code) and the #347 diff; both of those
+produced findings that were verified and folded in. It is only the two final diff
+reviews that are missing.
+
+### Not done
+
+- **Security Master Review (§14) was not run.** No auth, billing, export or
+  scraper-target surface changed, but the rule says run it after every meaningful
+  feature and it has not been.
+- Local full-suite run was reaped for low memory at 78%; CI covered it instead.
+
+### Deploy order
+
+**#348 must merge and deploy before #158.** The page reads fields that ship in the
+backend. Migration 098 is additive and safe to deploy ahead of the worker: old
+workers leave the new columns NULL, which reads as UNOBSERVED.

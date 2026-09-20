@@ -299,7 +299,10 @@ def _set_progress(
     return rowcount == 1
 
 
-def _set_stage(db, job, stage: str, *, expected_started_at, commit: bool = True) -> bool:
+def _set_stage(
+    db, job, stage: str, *, expected_started_at, commit: bool = True,
+    clear_counters: bool = True,
+) -> bool:
     """Record which activity the worker has just entered. Returns whether it landed.
 
     Stamps ``stage_started_at`` with it, so "still connecting to King County" can be
@@ -308,13 +311,29 @@ def _set_stage(db, job, stage: str, *, expected_started_at, commit: bool = True)
     Stages REPEAT and do not run in a fixed order, so this is not a step counter and
     re-entering a stage is legitimate — it re-stamps the clock, which is what the
     reassurance copy wants.
+
+    ``clear_counters`` (default True) wipes the unit counters on the way in, and that
+    default is the important part. The counters belong to the ACTIVITY that produced
+    them: a scrape that finished 5 of 5 chunks leaves units_done=5, units_total=5,
+    progress_unit='chunk' on the row, and without this the next stage inherits them.
+    Enrichment would then be labelled "Adding property and mailing details: Part 5 of
+    5" at 99% with a zero-second estimate, none of which anyone measured — a real
+    number describing the wrong work, which is the exact failure this whole change
+    set exists to remove (Codex).
+
+    ``records_found`` is deliberately NOT cleared: it is a run-level total, not a
+    per-activity one, and the Records tile should keep showing it after the scrape.
+
+    Pass False only when the caller writes its own counters in the same statement.
     """
+    values: dict = {"stage": stage, "stage_started_at": _now()}
+    if clear_counters:
+        values |= {"units_done": None, "units_total": None, "progress_unit": None}
     return _set_progress(
         db, job,
         expected_started_at=expected_started_at,
         commit=commit,
-        stage=stage,
-        stage_started_at=_now(),
+        **values,
     )
 
 

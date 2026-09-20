@@ -628,6 +628,19 @@ def run_scrape_job(self, job_id: str) -> None:
         _publish_log(r, job_id, "info", f"Date range: {date_from} → {date_to} (mode: {range_mode})", db=db)
 
         _last_phase = [None]  # mutable for closure
+        # The stage the worker last WROTE. The scraper reports a phase on every
+        # progress callback, but re-writing the same stage each time would restart
+        # its clock, and the "still working on this" copy is driven by that clock
+        # (Codex). So the stage moves only when the phase actually changes.
+        _last_stage = [None]
+        # Scraper phase -> customer-facing stage. A connector reports "searching"
+        # once, then starts collecting; without this the label stayed on
+        # "Searching county records" for the entire scrape.
+        _PHASE_STAGES = {
+            "scraping": "scraping",
+            "parcel_lookup": "enriching",
+            "enriching": "enriching",
+        }
 
         def _on_progress(
             page_current, page_total, record_count=None, phase="scraping", unit=None,
@@ -674,6 +687,15 @@ def run_scrape_job(self, job_id: str) -> None:
                 observations["records_found"] = record_count
             if unit:
                 observations["progress_unit"] = unit
+            # A phase change carries the stage with it, in the SAME statement as the
+            # counters it belongs to — so the activity and the numbers describing it
+            # can never disagree, and the stage clock restarts exactly once per real
+            # transition rather than on every callback.
+            stage_for_phase = _PHASE_STAGES.get(phase)
+            if stage_for_phase and stage_for_phase != _last_stage[0]:
+                _last_stage[0] = stage_for_phase
+                observations["stage"] = stage_for_phase
+                observations["stage_started_at"] = _now()
             _set_progress(
                 db, job, expected_started_at=attempt_started_at, **observations,
             )
@@ -695,6 +717,7 @@ def run_scrape_job(self, job_id: str) -> None:
             first result page happens inside one call. The scraper knows which of
             those it is in; nothing else does.
             """
+            _last_stage[0] = stage
             _set_stage(db, job, stage, expected_started_at=attempt_started_at)
 
         _set_stage(

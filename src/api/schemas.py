@@ -1381,10 +1381,21 @@ class JobResponse(BaseModel):
         # record_count backfills records_found only while the job is NOT terminal: at
         # `done` it has been overwritten with the billed count, and the terminal
         # branch above has already returned by the time this runs.
-        if self.units_done is None and self.page_current > 0:
-            self.units_done = self.page_current
-        if self.units_total is None and self.page_total > 0:
-            self.units_total = self.page_total
+        # Gated on a NULL stage, which is precisely "this row was written by a worker
+        # that predates migration 098". Without that gate the fallback fights the
+        # fix above: a worker that HAS reported clears units_done/units_total when it
+        # changes activity, and the legacy page counters — which the worker still
+        # writes, and which still hold the finished scrape's 5/5 — would immediately
+        # restore them onto enrichment (Codex).
+        legacy_worker = self.stage is None
+        if legacy_worker:
+            if self.units_done is None and self.page_current > 0:
+                self.units_done = self.page_current
+            if self.units_total is None and self.page_total > 0:
+                self.units_total = self.page_total
+        # records_found is run-level, not per-activity, so it is safe to backfill for
+        # any worker: at this point the job is non-terminal, so record_count has not
+        # yet been overwritten with the billed count.
         if self.records_found is None and self.record_count > 0:
             self.records_found = self.record_count
 

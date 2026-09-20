@@ -268,3 +268,34 @@ def test_a_cancelled_run_claims_no_progress():
     assert j.progress_pct is None
     assert j.progress_stalled is False
     assert j.stage_label == "Cancelled"
+
+
+# ─── A counter belongs to the activity that produced it ──────────────────────
+
+def test_counters_do_not_leak_from_the_scrape_into_the_next_activity():
+    """Codex, on the first version of the stage work.
+
+    A scrape that finished 5 of 5 chunks leaves units_done=5, units_total=5 on the
+    row. If the next stage inherits them, enrichment is labelled "Adding property
+    and mailing details: Part 5 of 5" at 99% with a zero-second estimate — a real
+    number describing work nobody measured, which is the whole failure this change
+    set exists to remove. The worker clears them on every stage change; this pins
+    the API half, that a cleared row stays cleared.
+    """
+    j = _job(stage="enriching", stage_started_at=_ago(seconds=10),
+             units_done=None, units_total=None, progress_unit=None,
+             records_found=57, record_count=57,
+             page_current=5, page_total=5)  # legacy counters still hold the scrape
+    assert j.progress_pct is None
+    assert j.units_done is None and j.units_total is None
+    assert j.estimated_time_remaining is None
+    assert j.stage_label == "Adding property and mailing details: 57 records found"
+
+
+def test_a_pre_098_worker_still_gets_its_page_counters_read():
+    """The legacy fallback is gated on a NULL stage, so it must still fire for a row
+    a worker from before the migration wrote."""
+    j = _job(stage=None, stage_started_at=None, page_current=3, page_total=4,
+             record_count=30)
+    assert (j.units_done, j.units_total) == (3, 4)
+    assert j.progress_pct == 75

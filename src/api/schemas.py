@@ -1399,6 +1399,21 @@ class JobResponse(BaseModel):
         if self.records_found is None and self.record_count > 0:
             self.records_found = self.record_count
 
+        # How long the CURRENT activity has been running. Computed here, above
+        # the extrapolations, because they divide by it: elapsed_seconds covers
+        # the WHOLE RUN, and the run that motivated all of this spent 401 of its
+        # 522 seconds connecting before the scrape reported a single unit. Feed
+        # that prelude into a per-unit rate for the stage that came after it and
+        # the ETA is inflated by minutes, which is the same lie as a fake
+        # percentage wearing a different hat. The counters are already cleared
+        # on every stage change, so both operands measure the same activity.
+        if self.stage_started_at is not None:
+            entered = (
+                self.stage_started_at if self.stage_started_at.tzinfo
+                else self.stage_started_at.replace(tzinfo=UTC)
+            )
+            self.stage_seconds = max(0, int((now - entered).total_seconds()))
+
         done, total = self.units_done, self.units_total
         if total is not None and total > 0 and done is not None and done > 0:
             self.progress_pct = min(99, int(done / total * 100))
@@ -1410,8 +1425,17 @@ class JobResponse(BaseModel):
             if done >= 2:
                 if self.records_found:
                     self.estimated_total_records = int(self.records_found / done * total)
-                if self.elapsed_seconds and self.elapsed_seconds > 0:
-                    secs_per_unit = self.elapsed_seconds / done
+                # stage_seconds is NULL only for a worker that predates
+                # migration 099 and never reported a stage; for that row the
+                # whole run IS the one unmeasured activity, so elapsed_seconds
+                # is the honest denominator rather than a downgrade.
+                rate_seconds = (
+                    self.stage_seconds
+                    if self.stage_seconds is not None
+                    else self.elapsed_seconds
+                )
+                if rate_seconds and rate_seconds > 0:
+                    secs_per_unit = rate_seconds / done
                     self.estimated_seconds_remaining = max(
                         0, int(secs_per_unit * (total - done))
                     )
@@ -1432,13 +1456,6 @@ class JobResponse(BaseModel):
             records_found=self.records_found,
         )
         self.progress_label = self.stage_label
-
-        if self.stage_started_at is not None:
-            entered = (
-                self.stage_started_at if self.stage_started_at.tzinfo
-                else self.stage_started_at.replace(tzinfo=UTC)
-            )
-            self.stage_seconds = max(0, int((now - entered).total_seconds()))
 
 
 class PhoneContact(BaseModel):

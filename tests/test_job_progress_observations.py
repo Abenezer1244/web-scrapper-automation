@@ -161,6 +161,31 @@ def test_two_completed_units_support_an_estimate():
     assert j.estimated_total_records == 60
 
 
+def test_the_estimate_rate_comes_from_the_stage_clock_not_the_run_clock():
+    """The production shape: 401 seconds connecting, THEN a scrape that is
+    moving briskly. The per-unit rate must be measured over the scrape alone.
+    Charging the connect prelude to the scrape inflates the ETA by minutes,
+    which is a fabricated number by a slower route than a fake percentage."""
+    j = _job(stage="scraping", stage_started_at=_ago(seconds=60),
+             started_at=_ago(seconds=460), last_heartbeat_at=_ago(seconds=5),
+             units_done=2, units_total=6, progress_unit="chunk")
+    # 2 chunks in 60s of SCRAPING is 30s each, so 4 left is about 120s. Billing
+    # the whole 460s to those 2 chunks would say about 920s instead.
+    assert j.elapsed_seconds >= 450
+    assert 100 <= j.estimated_seconds_remaining <= 140
+
+
+def test_a_legacy_row_with_no_stage_clock_still_gets_an_estimate():
+    """stage_started_at is NULL only for a worker predating migration 099. For
+    that row the whole run is the one unmeasured activity, so elapsed_seconds is
+    the honest denominator rather than a reason to say nothing."""
+    j = _job(stage=None, stage_started_at=None, started_at=_ago(seconds=200),
+             page_current=2, page_total=8, record_count=40)
+    assert j.stage_seconds is None
+    # 2 of 8 pages in 200s is 100s each, so the 6 remaining are about 600s.
+    assert 540 <= j.estimated_seconds_remaining <= 660
+
+
 # ─── Stage reporting ─────────────────────────────────────────────────────────
 
 def test_every_stage_the_worker_writes_has_customer_copy():

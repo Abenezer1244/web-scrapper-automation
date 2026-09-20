@@ -52,7 +52,7 @@ them NULL, which reads as UNOBSERVED and is exactly right for a run they are not
 reporting on.
 
 Revision ID: 099
-Revises: 097
+Revises: 098
 Create Date: 2026-09-19
 """
 import sqlalchemy as sa

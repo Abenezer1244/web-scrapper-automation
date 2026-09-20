@@ -164,6 +164,59 @@ class TestCancelSweep:
         assert await _status(db, "pending_skip_trace_rows", row) == "submitting"
         assert await _status(db, "results", lead) == "submitted"
 
+    async def test_the_sweep_keeps_a_lead_another_active_row_still_references(
+        self, db, business_user,
+    ):
+        """Direct coverage for the sweep's NOT EXISTS guard.
+
+        Migration 099 normally makes two active rows for one lead impossible, so
+        this reaches the guard by dropping the index for the duration. That is
+        worth doing rather than deleting the coverage: the claim deliberately
+        FAILS OPEN for the scrape path when 099 is missing, so in exactly the
+        situation where duplicates can occur, this guard is what stops a lead
+        being released back to 'not_attempted' while a row of it is still live.
+        """
+        from src.workers.skip_trace_claim import INDEX_NAME
+
+        job = await _job(db, business_user, "failed")
+        lead = await _lead(db, business_user, job)
+        queued = await _pending(db, business_user, job, lead)
+
+        # The sweep runs in its OWN session, so this DDL has to be committed for
+        # it to be visible -- which means it must be put back explicitly or every
+        # later test in this database silently runs unenforced.
+        await db.execute(text(f"DROP INDEX {INDEX_NAME}"))
+        await db.commit()
+        try:
+            await db.execute(text(
+                "INSERT INTO pending_skip_trace_rows "
+                "(id, job_id, result_id, user_id, property_address, city, state, zip, "
+                " first_name, last_name, trace_type, status) "
+                "VALUES (gen_random_uuid(), CAST(:j AS uuid), CAST(:r AS uuid), "
+                "        CAST(:u AS uuid), '1 MAIN ST', 'EVERETT', 'WA', '98201', "
+                "        'JANE', 'DOE', 'normal', 'submitting')"
+            ), {"j": job, "r": lead, "u": business_user.id})
+            await db.commit()
+
+            _sweep()
+
+            # The queued row is withdrawn, but the lead is NOT released: the
+            # 'submitting' row may already be at Tracerfy and charged for.
+            assert await _status(db, "pending_skip_trace_rows", queued) == "cancelled"
+            assert await _status(db, "results", lead) == "queued"
+        finally:
+            # Clear this lead's rows first: if an assertion above failed, two
+            # active rows may still exist and the unique index could not be
+            # rebuilt, which would leave every later test running unenforced.
+            await db.execute(text(
+                "DELETE FROM pending_skip_trace_rows WHERE result_id = CAST(:r AS uuid)"
+            ), {"r": lead})
+            await db.execute(text(
+                f"CREATE UNIQUE INDEX {INDEX_NAME} ON pending_skip_trace_rows "
+                "(result_id) WHERE status IN ('queued','submitting','submitted')"
+            ))
+            await db.commit()
+
     async def test_the_sweep_does_not_commit_its_own_work(self, db, business_user):
         """Transaction ownership, proved rather than asserted.
 

@@ -2498,12 +2498,17 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config, *, on_begin=None) 
     if to_claim:
         from src.workers.skip_trace_claim import claim_skip_trace_rows, warn_if_unenforced
 
-        # The claim degrades to pre-099 behaviour when the index is missing
-        # rather than failing every enqueue (start.sh starts the worker even
-        # when migrations fail). That degradation must never be silent: without
-        # the index nothing stops a lead being claimed, and charged for, twice.
+        # require_enforcement=False, deliberately, and ONLY here. The scrape is
+        # the single writer of this queue today, so a missing index leaves it
+        # exactly where it was before 099 existed and risks nothing that was not
+        # already true -- while refusing would strand every lookup in the
+        # product, since start.sh starts the worker even when migrations fail.
+        # The Phase 1b-2 action worker is the SECOND writer and takes the
+        # default (True): two writers without the index really can buy one lead
+        # twice, and refusing costs only that action. The degradation is never
+        # silent either way.
         warn_if_unenforced(db)
-        claimed_ids = claim_skip_trace_rows(db, to_claim)
+        claimed_ids = claim_skip_trace_rows(db, to_claim, require_enforcement=False)
         claimed = set(claimed_ids)
         for payload in to_claim:
             if str(payload["result_id"]) not in claimed:

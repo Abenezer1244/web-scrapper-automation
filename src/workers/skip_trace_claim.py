@@ -105,31 +105,68 @@ _WIDTHS: dict[str, int] = {
     "city": 128, "zip": 16,
     "first_name": 128, "last_name": 128,
     "mail_city": 128, "mail_zip": 16,
-    "trace_type": 16,
 }
 
 _EXACT: dict[str, int] = {"state": 2, "mail_state": 2}
 
+# `trace_type` is VALIDATED, never truncated. Truncating it to its 16-character
+# column could turn a bad value into a row the dispatcher never drains: it
+# batches strictly by 'normal' / 'advanced', so anything else sits queued
+# forever, counted as in progress and never submitted or settled.
+_TRACE_TYPES = frozenset({"normal", "advanced"})
 
-def warn_if_unenforced(db) -> bool:
-    """True when migration 099's unique index is present AND valid.
 
-    The claim degrades to pre-099 behaviour without it rather than failing every
-    enqueue (see the module docstring), so this is how that degradation gets said
-    out loud instead of being discovered by a double charge.
+class ClaimUnenforcedError(RuntimeError):
+    """Migration 099's index is absent, so a second active claim is possible.
+
+    Raised only for callers that pass ``require_enforcement=True`` -- the ones
+    that would be a SECOND writer of the queue and so need the database to
+    arbitrate. See `claim_skip_trace_rows`.
     """
-    enforced = bool(db.execute(
+
+
+def claim_enforcement_ok(db) -> bool:
+    """True when migration 099's index is present, valid, and the RIGHT index.
+
+    Checked by identity, not by name: `CREATE INDEX IF NOT EXISTS` would happily
+    accept a same-named index on another table or with a wider predicate, and
+    either one enforces something other than "one active claim per lead" while
+    looking applied. So this asserts the table, uniqueness, validity, the indexed
+    column, and that the predicate names exactly ACTIVE_PENDING_STATUSES and
+    nothing else.
+    """
+    row = db.execute(
         text(
-            "SELECT 1 FROM pg_class c JOIN pg_index i ON i.indexrelid = c.oid "
-            "WHERE c.relname = :n AND i.indisunique AND i.indisvalid"
+            "SELECT i.indisunique, i.indisvalid, "
+            "       pg_get_expr(i.indpred, i.indrelid) AS predicate, "
+            "       pg_get_indexdef(i.indexrelid) AS definition "
+            "FROM pg_class c "
+            "JOIN pg_index i ON i.indexrelid = c.oid "
+            "JOIN pg_class t ON t.oid = i.indrelid "
+            "WHERE c.relname = :n AND t.relname = 'pending_skip_trace_rows'"
         ),
         {"n": INDEX_NAME},
-    ).scalar())
+    ).first()
+    if row is None or not row.indisunique or not row.indisvalid:
+        return False
+    if "(result_id)" not in (row.definition or ""):
+        return False
+    predicate = row.predicate or ""
+    if any(f"'{s}'" not in predicate for s in ACTIVE_PENDING_STATUSES):
+        return False
+    # Nothing EXTRA: a widened predicate would refuse legitimate re-claims of a
+    # lead whose earlier row is genuinely finished.
+    return predicate.count("::character varying") == len(ACTIVE_PENDING_STATUSES)
+
+
+def warn_if_unenforced(db) -> bool:
+    """`claim_enforcement_ok`, but says so out loud when the answer is no."""
+    enforced = claim_enforcement_ok(db)
     if not enforced:
         _logger.error(
-            "Skip-trace claim is running UNENFORCED: %s is missing or invalid, so "
-            "nothing stops a second active claim for one lead and a lead can be "
-            "charged for twice. Apply migration 099.",
+            "Skip-trace claim is running UNENFORCED: %s is missing, invalid or not "
+            "the expected index, so nothing stops a second active claim for one "
+            "lead and a lead can be charged for twice. Apply migration 099.",
             INDEX_NAME,
         )
     return enforced
@@ -143,19 +180,20 @@ def _truncate(column: str, value: Any) -> Any:
     return text_value[:width] if len(text_value) > width else text_value
 
 
-def _fits_exact(payload: dict) -> bool:
+def _is_writable(payload: dict) -> bool:
+    """False for a payload that cannot be stored without changing its meaning."""
     for column, width in _EXACT.items():
         value = payload.get(column)
         if value is not None and len(str(value)) > width:
             return False
-    return True
+    return payload.get("trace_type") in _TRACE_TYPES
 
 
 def claim_skip_trace_rows(
     db,
     payloads: list[dict],
     *,
-    action_id: str | None = None,
+    require_enforcement: bool = True,
 ) -> list[str]:
     """Claim `payloads` into the queue. Returns the result ids actually won.
 
@@ -164,14 +202,33 @@ def claim_skip_trace_rows(
     simply not claimed -- the insert filters it, so it can neither fail the batch
     nor strand an active row nobody will settle.
 
-    `action_id` stamps the rows a "look up contacts" action claimed, so a
-    concurrent scrape is never counted as that action's work. The scrape path
-    leaves it NULL.
+    `require_enforcement` decides what happens when migration 099's index is
+    absent, and the right answer differs by caller (Codex round 15 diff review,
+    round 2). The database is what stops one lead being claimed, and charged
+    for, twice; an error log is observability, not enforcement.
+
+    * The SCRAPE enqueue passes False. It is the ONLY writer of this queue
+      today, which is exactly the situation before 099 existed, and in that
+      situation a missing index risks nothing that is not already true -- while
+      refusing to claim would strand every lookup in the product because
+      `start.sh` deliberately starts the worker when migrations fail.
+    * The ACTION worker (Phase 1b-2) passes True, the default. It is the SECOND
+      writer, so without the index two writers really can buy the same lead
+      twice. It must refuse rather than risk a customer's money, and refusing
+      costs only that one action, which reports a clean failure and charges
+      nothing.
 
     Does NOT commit. The caller owns the transaction.
     """
     if not payloads:
         return []
+
+    if require_enforcement and not claim_enforcement_ok(db):
+        raise ClaimUnenforcedError(
+            f"{INDEX_NAME} is missing, invalid or not the expected index; refusing "
+            "to claim, because nothing would stop this lead being charged for "
+            "twice. Apply migration 099."
+        )
 
     # One claim is one tenant's work: the single tenant-scoped UPDATE that
     # advances `results` would otherwise be too broad or silently partial.
@@ -182,15 +239,16 @@ def claim_skip_trace_rows(
         )
     user_id = next(iter(user_ids))
 
-    # Refuse rather than mangle a value whose column cannot hold it (see _EXACT).
+    # Refuse rather than mangle: a value whose column cannot hold it (_EXACT) or
+    # a trace_type the dispatcher would never drain.
     usable, refused = [], []
     for payload in payloads:
-        (usable if _fits_exact(payload) else refused).append(payload)
+        (usable if _is_writable(payload) else refused).append(payload)
     if refused:
         # Result ids only: never the homeowner's name or address in a log line.
         _logger.warning(
-            "Skip-trace claim refused %d payload(s) whose state field exceeds its "
-            "column; result ids: %s",
+            "Skip-trace claim refused %d payload(s) with an unusable state or "
+            "trace_type; result ids: %s",
             len(refused), [str(p.get("result_id")) for p in refused][:20],
         )
     if not usable:
@@ -223,10 +281,6 @@ def claim_skip_trace_rows(
         rows_sql.append(f"({', '.join(slots)})")
 
     select_list = ", ".join(f"v.{c}" for c in columns)
-    extra_cols, extra_vals = "", ""
-    if action_id is not None:
-        params["action_id"] = action_id
-        extra_cols, extra_vals = ", action_id", ", CAST(:action_id AS uuid)"
 
     # Inserted ALREADY 'queued' -- an ACTIVE status, so the partial unique index
     # applies at insert time. Inserting inactive first and activating later would
@@ -239,8 +293,8 @@ def claim_skip_trace_rows(
     # EVERY payload value travels in `params` as a bound parameter.
     claimed = db.execute(
         text(
-            f"INSERT INTO pending_skip_trace_rows ({', '.join(columns)}, status{extra_cols}) "  # noqa: S608
-            f"SELECT {select_list}, 'queued'{extra_vals} "
+            f"INSERT INTO pending_skip_trace_rows ({', '.join(columns)}, status) "  # noqa: S608
+            f"SELECT {select_list}, 'queued' "
             f"FROM (VALUES {', '.join(rows_sql)}) "
             f"     AS v({', '.join(columns)}) "
             f"JOIN results r ON r.id = v.result_id AND r.user_id = v.user_id "
@@ -257,6 +311,15 @@ def claim_skip_trace_rows(
 
     # Advance ONLY the rows the insert won. The status predicate is repeated
     # because the insert's join and this update are separate statements.
+    #
+    # There is a narrow interleaving where a concurrent writer settles a lead
+    # BETWEEN the insert and this update, so the pending row is active while
+    # `results` reads 'hit'. It is deliberately not locked against, because it
+    # already self-heals and never reaches the vendor: the dispatcher's
+    # `_cancel_undeliverable_queued` cancels any queued row whose result is no
+    # longer 'queued' (the `r.skip_trace_status <> 'queued'` arm), on the next
+    # five-minute tick, before the submit loop. Locking `results` first to close
+    # it would invert this module's lock order against that same sweep.
     db.execute(
         text(
             "UPDATE results SET skip_trace_status = 'queued' "

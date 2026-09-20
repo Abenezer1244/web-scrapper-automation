@@ -122,8 +122,16 @@ async def test_claim_returns_the_ids_it_won_and_advances_only_those(
     assert await _pending(db, untouched) == 0
 
 
-async def test_a_second_active_claim_for_one_lead_is_refused(db, business_user: User):
-    """The index doing its job: this is the double charge Phase 1b makes possible."""
+async def test_a_second_active_claim_for_one_lead_is_refused_by_the_index(
+    db, business_user: User,
+):
+    """The index doing its job: this is the double charge Phase 1b makes possible.
+
+    The result is put BACK to 'not_attempted' before the second attempt. Without
+    that the insert's own join filters the row out and the test passes whether or
+    not the index exists, proving nothing about database arbitration -- which is
+    the only thing standing between two writers and one lead charged twice.
+    """
     cfg = await _config(db, business_user)
     job_id = await _job(db, business_user, cfg)
     rid = await _row(db, job_id, business_user.id)
@@ -132,6 +140,9 @@ async def test_a_second_active_claim_for_one_lead_is_refused(db, business_user: 
     first = await db.run_sync(lambda s: claim_skip_trace_rows(s, [payload]))
     await db.commit()
     assert first == [rid]
+
+    (await db.get(Result, rid)).skip_trace_status = "not_attempted"
+    await db.commit()
 
     second = await db.run_sync(lambda s: claim_skip_trace_rows(s, [payload]))
     await db.commit()
@@ -322,28 +333,62 @@ async def test_a_vanished_lead_does_not_kill_the_batch(db, business_user: User):
     assert await _status(db, alive) == "queued"
 
 
-async def test_an_oversized_state_is_refused_not_truncated(db, business_user: User):
+@pytest.mark.parametrize("field", ["state", "mail_state"])
+async def test_an_oversized_state_is_refused_not_truncated(
+    db, business_user: User, field: str,
+):
     """`state` is String(2) but lookup_subject_key hashes it at 128, so silently
     cutting a longer value to two characters would STORE one value and HASH
     another: the cache read could never match its own write and every repeat
-    trace would be re-paid. The payload is refused instead."""
+    trace would be re-paid. The payload is refused instead.
+
+    Includes a POSITIVE CONTROL, because an implementation that refused every
+    payload would otherwise pass this.
+    """
+    cfg = await _config(db, business_user)
+    job_id = await _job(db, business_user, cfg)
+    bad_id = await _row(db, job_id, business_user.id, address="1 BAD ST")
+    good_id = await _row(db, job_id, business_user.id, address="2 GOOD ST")
+    bad = dict(await _payload(db, bad_id), **{field: "WASHINGTON"})
+    good = await _payload(db, good_id)
+
+    won = await db.run_sync(lambda s: claim_skip_trace_rows(s, [bad, good]))
+    await db.commit()
+
+    assert won == [good_id], "the refusal must cost only the payload it names"
+    assert await _pending(db, bad_id) == 0
+    assert await _pending(db, good_id) == 1
+
+
+async def test_a_bad_trace_type_is_refused_not_truncated(db, business_user: User):
+    """trace_type is validated, never truncated to its 16-char column. The
+    dispatcher batches strictly by 'normal'/'advanced', so any other value would
+    sit queued forever: counted as in progress, never submitted, never settled."""
     cfg = await _config(db, business_user)
     job_id = await _job(db, business_user, cfg)
     rid = await _row(db, job_id, business_user.id)
-    payload = dict(await _payload(db, rid), state="WASHINGTON")
+    payload = dict(await _payload(db, rid), trace_type="super-advanced-deluxe")
 
     assert await db.run_sync(lambda s: claim_skip_trace_rows(s, [payload])) == []
     await db.commit()
     assert await _pending(db, rid) == 0
 
 
-async def test_the_claim_still_works_without_the_index(db, business_user: User):
-    """start.sh starts the WORKER even when migrations fail, and tasks.py only
-    logs an enqueue failure. So a targeted `ON CONFLICT (result_id) WHERE ...`
-    would turn a failed migration 099 into every skip-trace enqueue silently
-    ceasing. The bare conflict clause degrades to pre-099 behaviour instead, and
-    warn_if_unenforced says so out loud."""
-    from src.workers.skip_trace_claim import INDEX_NAME, warn_if_unenforced
+async def test_without_the_index_the_scrape_degrades_but_the_action_refuses(
+    db, business_user: User,
+):
+    """What a failed migration 099 costs, and to whom.
+
+    start.sh starts the WORKER even when migrations fail and tasks.py only logs
+    an enqueue failure, so a targeted `ON CONFLICT (result_id) WHERE ...` would
+    turn a failed 099 into every skip-trace enqueue silently ceasing. The bare
+    conflict clause degrades instead. But degrading is only safe for the SCRAPE,
+    which is the single writer; the Phase 1b-2 action is a second writer and
+    must refuse, because without the index two writers really can buy one lead
+    twice. The second claim below proves the protection is genuinely gone, which
+    is what makes `require_enforcement=True` load-bearing rather than decorative.
+    """
+    from src.workers.skip_trace_claim import INDEX_NAME, ClaimUnenforcedError, warn_if_unenforced
 
     cfg = await _config(db, business_user)
     job_id = await _job(db, business_user, cfg)
@@ -353,12 +398,57 @@ async def test_the_claim_still_works_without_the_index(db, business_user: User):
     await db.execute(text(f"DROP INDEX {INDEX_NAME}"))
     try:
         assert await db.run_sync(warn_if_unenforced) is False
-        # Still claims, rather than raising "no unique or exclusion constraint".
-        assert await db.run_sync(lambda s: claim_skip_trace_rows(s, [payload])) == [rid]
+
+        # The action worker refuses outright: nothing claimed, nothing charged.
+        with pytest.raises(ClaimUnenforcedError):
+            await db.run_sync(lambda s: claim_skip_trace_rows(s, [payload]))
+
+        # The scrape degrades, rather than raising "no unique or exclusion
+        # constraint matching the ON CONFLICT specification".
+        assert await db.run_sync(
+            lambda s: claim_skip_trace_rows(s, [payload], require_enforcement=False)
+        ) == [rid]
+        # And the protection really is absent: put the lead back and claim again.
+        await db.execute(text(
+            "UPDATE results SET skip_trace_status = 'not_attempted' WHERE id = :i"
+        ), {"i": rid})
+        assert await db.run_sync(
+            lambda s: claim_skip_trace_rows(s, [payload], require_enforcement=False)
+        ) == [rid], "without the index a duplicate active claim is possible"
     finally:
         await db.rollback()
 
     assert await db.run_sync(warn_if_unenforced) is True
+
+
+async def test_enforcement_check_rejects_a_same_named_wrong_index(
+    db, business_user: User,
+):
+    """`CREATE INDEX IF NOT EXISTS` would accept a same-named index on the wrong
+    table or with a wider predicate, and either enforces something other than
+    "one active claim per lead" while looking applied. The check asserts
+    identity, not just the name."""
+    from src.workers.skip_trace_claim import INDEX_NAME, claim_enforcement_ok
+
+    await db.execute(text(f"DROP INDEX {INDEX_NAME}"))
+    try:
+        # Same name, but not unique.
+        await db.execute(text(
+            f"CREATE INDEX {INDEX_NAME} ON pending_skip_trace_rows (result_id) "
+            "WHERE status IN ('queued','submitting','submitted')"
+        ))
+        assert await db.run_sync(claim_enforcement_ok) is False
+        await db.execute(text(f"DROP INDEX {INDEX_NAME}"))
+        # Unique, but a WIDER predicate: would refuse a legitimate re-claim.
+        await db.execute(text(
+            f"CREATE UNIQUE INDEX {INDEX_NAME} ON pending_skip_trace_rows (result_id) "
+            "WHERE status IN ('queued','submitting','submitted','cancelled')"
+        ))
+        assert await db.run_sync(claim_enforcement_ok) is False
+    finally:
+        await db.rollback()
+
+    assert await db.run_sync(claim_enforcement_ok) is True
 
 
 async def test_the_active_predicate_matches_the_index(db):

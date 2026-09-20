@@ -489,26 +489,21 @@ async def test_the_later_pass_picks_the_newest_per_subject_not_per_property(
     )
 
 
-# ─── Round 14 P2: one tenant can hold two subjects in one ingest group ────────
-
-async def test_one_tenant_with_two_subjects_gets_two_cache_rows(business_user):
-    """The write used to dedup by user_id, which under 098 drops the second
-    subject for a tenant and re-pays for it on the next run."""
-    from src.scrapers.enrichment.skip_trace import pending_row_subject_key
-
-    class _Pend:
-        def __init__(self, first, last):
-            self.user_id = business_user.id
-            self.property_address = _address(14)
-            self.city, self.state = CITY, STATE
-            self.trace_type = "normal"
-            self.first_name, self.last_name = first, last
-
-    rows = [_Pend("AVELINO", "SAARENAS"), _Pend("ROBERT", "JONES")]
-    keys = {pending_row_subject_key(p) for p in rows}
-    assert len(keys) == 2, "one tenant's two subjects must be two cache rows"
-
-    seen: set[str] = set()
-    written = [k for k in (pending_row_subject_key(p) for p in rows)
-               if not (k in seen or seen.add(k))]
-    assert len(written) == 2
+# ─── Round 14 P2: the ingest write dedup ──────────────────────────────────────
+#
+# There is deliberately NO test here for "one tenant, two subjects, two cache
+# rows". The round-14 review asked for one, and an earlier version of this file
+# had it, but it asserted against a local dict rather than the ingest and would
+# have passed whether or not production still deduped by user_id. It was removed
+# instead of dressed up.
+#
+# The case it described is not reachable through `ingest_tracerfy_batch` today:
+# `_attribution_is_safe` only lets a multi-row group through when every waiting
+# row shares one owner name AND one trace_type, and rows reach one group only by
+# sharing an address, so a same-tenant group necessarily shares one v2 subject.
+# Keying the write on the computed key rather than on `user_id` is therefore
+# defense in depth (it keys on the thing actually being written), not a bug fix,
+# and it is what keeps the write correct if that guard is ever loosened.
+#
+# What IS reachable, and is tested, is the other half of that guard:
+# tests/test_tracerfy_ingest.py::test_two_answers_for_one_waiting_row_are_refused.

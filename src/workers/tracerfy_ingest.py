@@ -282,8 +282,8 @@ def _attribution_is_safe(matches: list, n_csv_rows_for_key: int) -> bool:
     Pure and list-based so it is unit-testable without a database.
 
     Safe when:
-      * only ONE of our rows waits on the key — there is a single target, so
-        nothing can be misassigned; or
+      * exactly ONE answer came back and only ONE of our rows waits on the key —
+        a single answer and a single target, so nothing can be misassigned; or
       * exactly ONE answer came back AND every waiting row names the same owner
         — one property, one owner, several of our rows describing it (the only
         collision shape production has ever produced).
@@ -306,10 +306,20 @@ def _attribution_is_safe(matches: list, n_csv_rows_for_key: int) -> bool:
     onto one another's leads. Under v2 they are also different cache keys, so
     silently treating them as one group would write the wrong subject's answer.
     """
-    if len(matches) <= 1:
-        return True
+    # MULTIPLICITY FIRST (Codex, round 14 diff review). This used to sit behind
+    # `len(matches) <= 1: return True`, so one waiting row plus SEVERAL answers for
+    # its address was accepted: the loop ran once per CSV row against the same
+    # lead and the last owner processed silently won. The submission key added in
+    # this phase keeps one pending row per address per batch, which makes
+    # len(matches) == 1 the ordinary case and this the ordinary path, so the
+    # ordering is not academic. We send a name on a normal trace but the parsed
+    # CSV drops the echoed names, so there is nothing to disambiguate with:
+    # refuse, let the row settle terminally and alert, rather than stamp an
+    # arbitrary owner's phone on the lead.
     if n_csv_rows_for_key > 1:
         return False
+    if len(matches) <= 1:
+        return True
     if len({(p.trace_type or "") for p in matches}) > 1:
         return False
     owners = {
@@ -683,10 +693,13 @@ def ingest_tracerfy_batch(
             # v2 (migration 098): key each write on the SUBJECT of the row that
             # bought it, from that row's OWN stored fields. Two changes from the
             # address-only version, both required:
-            #   - dedup on the COMPUTED KEY, not on user_id. Under v2 one tenant
-            #     can legitimately have two subjects in this group, and deduping
-            #     by tenant would write only the first and silently drop the
-            #     second, re-paying for it on the next run (round 14).
+            #   - dedup on the COMPUTED KEY, not on user_id, so the write is keyed
+            #     on the thing it actually writes. Today that is defense in depth
+            #     rather than a fix: `_attribution_is_safe` only admits a
+            #     multi-row group whose rows share one owner name and one
+            #     trace_type, and a group shares an address by construction, so a
+            #     same-tenant group already shares one subject. It is what keeps
+            #     this correct if that guard is ever loosened (round 14).
             #   - each row's own address fields, not matches[0]'s. v2 preserves
             #     punctuation and field boundaries, so borrowing another row's
             #     formatting no longer produces the same key.

@@ -176,6 +176,44 @@ async def test_hit_lands_on_the_correct_lead(starter_user, _stub_csv):
 
 
 @pytest.mark.asyncio
+async def test_two_answers_for_one_waiting_row_are_refused(starter_user, _stub_csv):
+    """Codex, round 14 diff review, P1.
+
+    The guard used to return safe as soon as only ONE of our rows waited on an
+    address, without ever looking at how many answers came back. Two CSV rows for
+    that address then both ran against the same lead and the last owner processed
+    won, stamping an arbitrary person's phone and email on it.
+
+    The submission key added in this phase keeps one pending row per address per
+    batch, which makes a single waiting row the ORDINARY case, so this path is
+    the ordinary path and not a corner. We send a name on a normal trace but the
+    parsed CSV drops the echoed names, so there is nothing to disambiguate with:
+    refuse, and let the row settle terminally.
+    """
+    qid = _next_queue_id()
+    seed = _seed(starter_user.id, qid, [("500 SPLIT ST", "TACOMA", "WA")])
+    _stub_csv(_csv(
+        "500 SPLIT ST,TACOMA,WA,JANE,DOE,2065550100,Mobile,2065550100,,,"
+        "jane@example.com,",
+        "500 SPLIT ST,TACOMA,WA,ROBERT,ROE,2065550999,Mobile,2065550999,,,"
+        "robert@example.com,",
+    ))
+
+    ingest_tracerfy_batch(
+        queue_id=qid,
+        download_url="https://tracerfy.nyc3.cdn.digitaloceanspaces.com/tracerfy/x.csv",
+        rows_uploaded=1, credits_deducted=1,
+    )
+
+    row = _result_row(seed["rows"][0]["result_id"])
+    assert (row.phone, row.email) == (None, None), (
+        "an arbitrary owner's contacts were stamped on the lead: two answers came "
+        "back for one address and the last one processed won"
+    )
+    assert row.skip_trace_status != "hit"
+
+
+@pytest.mark.asyncio
 async def test_no_match_is_a_miss_not_a_failure(starter_user, _stub_csv):
     """Tracerfy processed the row and found nothing. That is a valid answer,
     not a system failure — it must land on 'miss' and still settle the row."""
@@ -398,8 +436,15 @@ class TestAttributionGuard:
     """Codex round 2: the first version of this guard let two contamination
     shapes through. Both are pinned here."""
 
-    def test_single_waiting_row_is_always_safe(self):
-        assert _attribution_is_safe([_P("A", "ALPHA")], 3) is True
+    def test_single_waiting_row_with_one_answer_is_safe(self):
+        assert _attribution_is_safe([_P("A", "ALPHA")], 1) is True
+
+    def test_single_waiting_row_with_several_answers_is_refused(self):
+        """This assertion used to read `..., 3) is True` — "a single waiting row
+        is always safe". That was the P1: several answers for one address then
+        all ran against that one lead and the last owner processed won. One
+        target does not make several answers attributable."""
+        assert _attribution_is_safe([_P("A", "ALPHA")], 3) is False
 
     def test_one_answer_one_owner_many_rows_is_safe(self):
         # The only collision shape production has ever produced.

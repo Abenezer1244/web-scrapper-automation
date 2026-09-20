@@ -37,7 +37,6 @@ Revision ID: 098
 Revises: 097
 Create Date: 2026-09-19
 """
-import sqlalchemy as sa
 from alembic import op
 from sqlalchemy import text
 
@@ -50,16 +49,32 @@ _INDEX = "ix_results_skip_trace_subject_hash"
 
 
 def upgrade() -> None:
+    # RESTART-SAFE, deliberately (Codex, round 14 diff review). The autocommit
+    # block below commits the ADD COLUMN before the index build, so a build that
+    # times out leaves the column in place with the revision UNRECORDED. A plain
+    # `ADD COLUMN` would then fail on the retry with "column already exists" and
+    # the migration could never complete without hand surgery. Every step here is
+    # therefore idempotent.
     op.execute(text("SET LOCAL lock_timeout = '5s'"))
-    op.add_column(
-        "results", sa.Column("skip_trace_subject_hash", sa.String(64), nullable=True)
-    )
+    op.execute(text(
+        "ALTER TABLE results ADD COLUMN IF NOT EXISTS skip_trace_subject_hash VARCHAR(64)"
+    ))
     with op.get_context().autocommit_block():
         conn = op.get_bind()
         # SET LOCAL above ended with its transaction; this block runs outside one,
         # so the timeout is set (and reset) here (the 097 pattern, Codex).
         conn.execute(text("SET lock_timeout = '5s'"))
         try:
+            # A CONCURRENTLY build that fails leaves the index behind marked
+            # INVALID, and it stays invalid forever: IF NOT EXISTS sees the name,
+            # skips the build, and the planner never uses it. Drop that corpse
+            # before rebuilding, or the retry silently "succeeds" with a dead index.
+            conn.execute(text(
+                f"DROP INDEX CONCURRENTLY IF EXISTS {_INDEX}"
+            ) if conn.execute(text(
+                "SELECT 1 FROM pg_class c JOIN pg_index i ON i.indexrelid = c.oid "
+                "WHERE c.relname = :n AND NOT i.indisvalid"
+            ), {"n": _INDEX}).scalar() else text("SELECT 1"))
             # Partial: only settled rows carry a hash, and the reuse passes only
             # ever look those up. Keeps the index small on a table that is mostly
             # never-traced rows.

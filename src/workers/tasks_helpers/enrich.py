@@ -2473,6 +2473,19 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config, *, on_begin=None) 
             skip_trace_eligible_condition(),
         ).execution_options(populate_existing=True)
     ).scalars().all())
+    # The two PYTHON filters above ran on the pre-lock objects, so their verdicts
+    # are as stale as the rows were. Re-apply them to the refreshed ones: a lead
+    # whose address became a placeholder, or whose code-violation case the city
+    # settled, between the two reads would otherwise keep a verdict of "eligible"
+    # that is no longer true and be paid for. Re-running is free (both are pure
+    # functions of the row) and it cannot ADD anything, because `eligible` is
+    # already bounded by the ids that survived the first pass. No second log
+    # line: the counts were reported above and this only ever removes stragglers.
+    eligible = [rec for rec in eligible
+                if not street_is_placeholder(rec.property_address)]
+    if config.record_type == "code_violation":
+        eligible = [rec for rec in eligible
+                    if not _is_settled_complaint(rec.enrichment_data)]
     if not eligible:
         return
 

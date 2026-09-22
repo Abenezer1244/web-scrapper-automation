@@ -1679,6 +1679,27 @@ class DuplicateSource(BaseModel):
     job_available: bool = False
 
 
+class AuctionCoverage(BaseModel):
+    """Why this run's Auction Date / Principal Owing columns look the way they do.
+
+    Auction data does not come from the county recorder. The recorder index carries
+    the lead's identity only; the sale date and the sum owing exist in the published
+    Notice of Trustee Sale, which RCW 61.24.040 puts in a newspaper 7-35 days before
+    the sale, i.e. roughly two months AFTER the notice is recorded. So a run over
+    recent recordings legitimately has nothing to show yet, and that is a completely
+    different thing from "the source has nothing for this property".
+
+    Computed from each lead's own recording date, not from a stored marker, so it is
+    correct for runs that predate the missing-reason stamping.
+    """
+
+    matched: int = 0
+    # Recorded too recently for a notice to have been published yet. Not a failure.
+    awaiting_publication: int = 0
+    # Past the publication window and still nothing in the cache for this property.
+    no_notice_found: int = 0
+
+
 class AlreadyDeliveredContacts(BaseModel):
     """Where the skip trace stands for this run's already-delivered leads.
 
@@ -1761,6 +1782,13 @@ class ResultsPage(BaseModel):
     # current page/filter). The frontend gates the Auction Date / Default Owed
     # columns on this so they don't flicker by page when auction matches are sparse.
     has_auction_data: bool = False
+    # How many of this run's leads have auction data, and why the rest do not.
+    # None for record types where auction data never applies. The columns render for
+    # every pre_foreclosure run (the record type IS the rule, so they can't vanish on
+    # a run that matched zero), which means a run with no matches shows two full
+    # columns of blanks and no way to tell "we failed" from "the notice cannot have
+    # been published yet". This says which. See AuctionCoverage.
+    auction_coverage: AuctionCoverage | None = None
 
 
 # ─── Live run (SSE) ───────────────────────────────────────────────────────────

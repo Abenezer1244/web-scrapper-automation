@@ -8,7 +8,7 @@ from collections.abc import AsyncGenerator
 import redis.exceptions as _redis_exceptions
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
-from sqlalchemy import func, select, text, update
+from sqlalchemy import func, or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api import sse_leases
@@ -27,6 +27,7 @@ from src.api.results_category import (
 from src.api.results_sort import DEFAULT_RESULTS_SORT, ResultsSort, results_order_by
 from src.api.schemas import (
     AlreadyDeliveredContacts,
+    AuctionCoverage,
     DuplicateSource,
     JobCreate,
     JobResponse,
@@ -37,6 +38,7 @@ from src.api.schemas import (
 from src.api.tax_filters import build_tax_conditions, tax_cap_condition
 from src.config import settings
 from src.config.constants import (
+    AUCTION_PUBLICATION_LAG_DAYS,
     CANCELLABLE_STATUSES,
     normalize_plan,
     scrape_queue_for_plan,
@@ -473,7 +475,7 @@ async def get_results(
     # paginated view query so `total` + `items` reflect the filter; the job-level
     # scrape stats below (enriched/parcel/dedup counts) intentionally stay
     # unfiltered (they describe the scrape, not the current filter view).
-    from datetime import UTC, datetime
+    from datetime import UTC, datetime, timedelta
     today = datetime.now(UTC).date()
     tax_conditions = build_tax_conditions(
         min_amount, max_amount, min_months, max_months, today
@@ -826,6 +828,37 @@ async def get_results(
         )
         has_auction_data = auction_probe.scalar_one_or_none() is not None
 
+    # Why those columns look the way they do. Only meaningful for pre_foreclosure:
+    # trustee_sale rows are sourced FROM the notice cache so they always carry a sale
+    # date, and no other record type has auction data at all. Computed from each
+    # lead's own recording date rather than a stored marker, so a run that predates
+    # the missing-reason stamping still reports correctly.
+    auction_coverage = None
+    if config is not None and config.record_type == "pre_foreclosure":
+        pub_cutoff = today - timedelta(days=AUCTION_PUBLICATION_LAG_DAYS)
+        cov = (await db.execute(
+            select(
+                func.count().filter(Result.auction_date.isnot(None)).label("matched"),
+                func.count().filter(
+                    Result.auction_date.is_(None),
+                    Result.date_recorded_parsed.isnot(None),
+                    Result.date_recorded_parsed > pub_cutoff,
+                ).label("awaiting"),
+                func.count().filter(
+                    Result.auction_date.is_(None),
+                    or_(
+                        Result.date_recorded_parsed.is_(None),
+                        Result.date_recorded_parsed <= pub_cutoff,
+                    ),
+                ).label("no_notice"),
+            ).where(Result.job_id == job_id, Result.user_id == current_user.id)
+        )).first()
+        auction_coverage = AuctionCoverage(
+            matched=cov.matched or 0,
+            awaiting_publication=cov.awaiting or 0,
+            no_notice_found=cov.no_notice or 0,
+        )
+
     return ResultsPage(
         job_id=job_id, total=total, page=page, page_size=page_size,
         items=items, enriched_count=enriched_count, enriching=enriching,
@@ -840,6 +873,7 @@ async def get_results(
         already_delivered_count=already_delivered_count,
         already_delivered_contacts=already_delivered_contacts,
         has_auction_data=has_auction_data,
+        auction_coverage=auction_coverage,
     )
 
 

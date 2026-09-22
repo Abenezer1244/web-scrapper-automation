@@ -200,6 +200,20 @@ WITH candidates AS (
            r.mailing_address, r.property_city, r.property_state, r.property_zip,
            r.phone, r.phone_type, r.email,
            r.phones, r.emails, r.property_key,
+           -- Auction data (NTS Tier 1). OVERLAP_LEAD_COLUMNS promises
+           -- auction_date / days_to_auction / default_amount, and
+           -- build_overlap_export_row reads them off the row with getattr,
+           -- so omitting them here is indistinguishable from NULL: the Lists
+           -- CSV printed three auction headers over three permanently empty
+           -- columns. batch_export.py was fixed for this; segments was not.
+           r.auction_date, r.default_amount,
+           -- The rest of what OVERLAP_LEAD_COLUMNS promises. Same silent
+           -- failure as the auction pair: absent from the SELECT reads as
+           -- NULL through getattr, so these printed headers over empty
+           -- columns too. (Owner flags are deliberately NOT here - the
+           -- combined CSV does not promise them.)
+           r.doc_type, r.heirs, r.legal_description,
+           r.delinquent_amount, r.delinquent_bill_year,
            r.enrichment_data->>'lead_subtype' AS lead_subtype,
            sc.record_type, sc.county, sc.state, j.created_at AS job_created_at,
            {_STAND_IN_SQL} AS date_is_auction_date
@@ -244,6 +258,16 @@ SELECT rk.id, rk.date_recorded, rk.party_name, rk.parcel_id, rk.property_address
        rk.mailing_address, rk.property_city, rk.property_state, rk.property_zip,
        rk.county, rk.state, rk.phone, rk.phone_type, rk.email,
        rk.phones, rk.emails, rk.date_is_auction_date,
+       rk.auction_date, rk.default_amount,
+       rk.doc_type, rk.heirs, rk.legal_description,
+       -- record_type is SELECTed into the CTE but was never projected, so the
+       -- exporter saw None and name_order_for() returned None, which makes
+       -- split_first_person yield blanks by contract. First Name / Last Name
+       -- are promised columns and were permanently empty in every Lists CSV.
+       -- `matched_record_types` stays the source for the `lists` column; this
+       -- is the representative row's own type, which is what name order needs.
+       rk.record_type,
+       rk.delinquent_amount, rk.delinquent_bill_year,
        a.matched_record_types, a.overlap_count, a.lead_subtype
 FROM ranked rk
 JOIN agg a ON a.property_key = rk.property_key
@@ -278,6 +302,20 @@ WITH candidates AS (
            r.phone, r.phone_type, r.email,
            r.phones, r.emails,
            r.property_key, r.is_duplicate,
+           -- Auction data (NTS Tier 1). OVERLAP_LEAD_COLUMNS promises
+           -- auction_date / days_to_auction / default_amount, and
+           -- build_overlap_export_row reads them off the row with getattr,
+           -- so omitting them here is indistinguishable from NULL: the Lists
+           -- CSV printed three auction headers over three permanently empty
+           -- columns. batch_export.py was fixed for this; segments was not.
+           r.auction_date, r.default_amount,
+           -- The rest of what OVERLAP_LEAD_COLUMNS promises. Same silent
+           -- failure as the auction pair: absent from the SELECT reads as
+           -- NULL through getattr, so these printed headers over empty
+           -- columns too. (Owner flags are deliberately NOT here - the
+           -- combined CSV does not promise them.)
+           r.doc_type, r.heirs, r.legal_description,
+           r.delinquent_amount, r.delinquent_bill_year,
            r.enrichment_data->>'lead_subtype' AS lead_subtype,
            sc.record_type, sc.county, sc.state, j.created_at AS job_created_at,
            {_STAND_IN_SQL} AS date_is_auction_date,
@@ -346,6 +384,16 @@ SELECT rk.id, rk.date_recorded, rk.party_name, rk.parcel_id, rk.property_address
        rk.mailing_address, rk.property_city, rk.property_state, rk.property_zip,
        rk.county, rk.state, rk.phone, rk.phone_type, rk.email,
        rk.phones, rk.emails, rk.date_is_auction_date,
+       rk.auction_date, rk.default_amount,
+       rk.doc_type, rk.heirs, rk.legal_description,
+       -- record_type is SELECTed into the CTE but was never projected, so the
+       -- exporter saw None and name_order_for() returned None, which makes
+       -- split_first_person yield blanks by contract. First Name / Last Name
+       -- are promised columns and were permanently empty in every Lists CSV.
+       -- `matched_record_types` stays the source for the `lists` column; this
+       -- is the representative row's own type, which is what name order needs.
+       rk.record_type,
+       rk.delinquent_amount, rk.delinquent_bill_year,
        a.matched_record_types, a.overlap_count, a.identity_strength, a.lead_subtype
 FROM ranked rk
 JOIN agg a ON a.bucket = rk.bucket
@@ -366,6 +414,20 @@ WITH candidates AS (
            r.mailing_address, r.property_city, r.property_state, r.property_zip,
            r.phone, r.phone_type, r.email,
            r.phones, r.emails, r.property_key,
+           -- Auction data (NTS Tier 1). OVERLAP_LEAD_COLUMNS promises
+           -- auction_date / days_to_auction / default_amount, and
+           -- build_overlap_export_row reads them off the row with getattr,
+           -- so omitting them here is indistinguishable from NULL: the Lists
+           -- CSV printed three auction headers over three permanently empty
+           -- columns. batch_export.py was fixed for this; segments was not.
+           r.auction_date, r.default_amount,
+           -- The rest of what OVERLAP_LEAD_COLUMNS promises. Same silent
+           -- failure as the auction pair: absent from the SELECT reads as
+           -- NULL through getattr, so these printed headers over empty
+           -- columns too. (Owner flags are deliberately NOT here - the
+           -- combined CSV does not promise them.)
+           r.doc_type, r.heirs, r.legal_description,
+           r.delinquent_amount, r.delinquent_bill_year,
            r.enrichment_data->>'lead_subtype' AS lead_subtype,
            sc.record_type, sc.county, sc.state, j.created_at AS job_created_at,
            {_STAND_IN_SQL} AS date_is_auction_date
@@ -407,6 +469,16 @@ SELECT rk.id, rk.date_recorded, rk.party_name, rk.parcel_id, rk.property_address
        rk.mailing_address, rk.property_city, rk.property_state, rk.property_zip,
        rk.county, rk.state, rk.phone, rk.phone_type, rk.email,
        rk.phones, rk.emails, rk.date_is_auction_date,
+       rk.auction_date, rk.default_amount,
+       rk.doc_type, rk.heirs, rk.legal_description,
+       -- record_type is SELECTed into the CTE but was never projected, so the
+       -- exporter saw None and name_order_for() returned None, which makes
+       -- split_first_person yield blanks by contract. First Name / Last Name
+       -- are promised columns and were permanently empty in every Lists CSV.
+       -- `matched_record_types` stays the source for the `lists` column; this
+       -- is the representative row's own type, which is what name order needs.
+       rk.record_type,
+       rk.delinquent_amount, rk.delinquent_bill_year,
        a.matched_record_types, a.overlap_count, a.lead_subtype
 FROM ranked rk
 JOIN agg a ON a.property_key = rk.property_key

@@ -19,6 +19,79 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-20 — King "Auction Date = N/A": mostly correct, one real veto bug
+
+> Reported from job `18076769` (51 King pre_foreclosure rows, Auction Date and Principal
+> Owing blank on every one). Plan + review: `tasks/todo.md` (top section). Worktrees:
+> BE `C:/Users/Windows/bl-wt-kingnts` (`investigate/king-nts-parcel-bridge`),
+> FE `C:/Users/Windows/bl-fe-kingnts` (`fix/auction-coverage-note`). Nothing merged yet.
+
+**Built / Shipped:**
+- `6c1d480` parcel identity is now an explicit relation (EXACT / BRIDGED / CONFLICT /
+  UNKNOWN) in `nts_matcher`, shared by `score_match` AND
+  `best_match_group._same_property`, plus `parcel_index_keys` so pool membership does not
+  depend on how the scorer is tuned. `auction_missing_reason` stamps
+  `enrichment_data['nts_missing']`. 38 tests.
+- `0c59d81` `auction_coverage` (matched / awaiting_publication / no_notice_found) on
+  `GET /jobs/{id}/results`; `AUCTION_PUBLICATION_LAG_DAYS = 55` in `src/config/constants`
+  so the worker and the API cannot drift; `scripts/backfill_nts_matches.py`, dry run by
+  default. 6 tests. `schema/openapi.json` +32/-0.
+- FE `8c97a3c` `auctionCoverageNote()` + one amber line above the results table.
+
+**Tried / Decided:**
+- The obvious reading ("the scraper is broken") is wrong and was disproved with prod data
+  before any code was written. 1,114/1,114 King pre_foreclosure rows are doc_type
+  `NOTICE OF TRUSTEE SALE`, each with its recorder instrument number stored. The API, the
+  UI and the CSV all pass NULL through honestly; nothing fabricates.
+- Codex consulted on the design BEFORE coding (`GATE: FAIL`, four P1s, all four adopted).
+  The load-bearing one: patching only `score_match` would have been WORSE than the bug,
+  because `_same_property` would then read a bridged sibling as a different property and
+  bail the whole group to `[]`.
+- Owner chose Codex's STRICT corroborator rule (address AND surname) over the looser
+  surname-only rule. That is 1 recovered pair instead of 7, deliberately, because wrong
+  auction data on a lead is worse than missing auction data.
+- Did NOT re-verify leads against King's portal: the project has been IP-rate-blocked
+  there before. Coverage was measured in our own database instead.
+
+**Failed / Blocked:**
+- Codex review of the Phase 3/4 diff never ran: usage limit mid-review ("try again at
+  4:02 AM"). Per `.claude/rules/codex-collaboration.md` that review is still owed.
+- Playwright MCP failed to connect all session. Used the documented local rig instead
+  (scratchpad stub API + real `next dev` + Chromium).
+
+**Caught & fixed:**
+- Two copy bugs the unit check surfaced before anyone saw them: "3 leads of 43" and
+  "1 were recorded".
+- Nearly shipped a `tasks/todo.md` that deleted 898 lines of the existing plan; restored
+  and prepended instead.
+
+**Pending / Handoff:**
+- 👤 Merge order matters: BE first, then regenerate FE types from BE `main`, then FE.
+- ⏭️ Backfill deliberately NOT applied. Once deployed the daily beat picks the same row
+  up by itself; the script exists for leads older than 180 days and for the dry run.
+- ⏭️ Clark's NTS source looks dead (2 notices, `last_created` 2026-07-28).
+- ⏭️ Codex P2, pre-existing: with NEITHER side carrying a parcel, `_same_property` groups
+  on `addr_key`, which strips unit numbers, so one notice can still reach two units.
+
+**Facts learned:**
+- 🔑 **Auction data never comes from the recorder.** The LandmarkWeb index gives identity
+  only. The sale date and sum owing live in the PUBLISHED notice, which RCW 61.24.040 puts
+  in a newspaper 7-35 days before the sale, about **55+ days AFTER recording**
+  (prod-measured King lag 57-137d, avg 109). So a run over the freshest recordings is the
+  WORST case for auction coverage, not a broken one. King by recording month: Mar-Jun
+  15/269 matched, Jul 0/325, Aug 0/372, Sep 0/148.
+- 🔑 **King publishes one property two ways:** the recorder emits the 10-digit PIN, the
+  trustee prints the 12-digit tax ACCOUNT number. 14 of 38 King notices use the 12-digit
+  form, and `_norm_parcel` read them as a parcel CONFLICT, a hard 0.0 veto that address
+  and surname agreement could not override.
+- 🔑 King's address key cannot corroborate: `results.property_address` is the frozen
+  street-only dedup key, so it has no ZIP to match the notice's `street|zip`.
+- 🔑 Integrity spot-check, all clean: 0 rows anywhere carry auction data without a source
+  notice, all 15 matched rows equal their notice exactly, and 0 leads show a past auction
+  while a live notice exists.
+- 🛑 `tests/test_rls_isolation.py` fails on ANY new test database. Postgres roles are
+  cluster-scoped, table grants are database-scoped, and the fixture grants only in the
+  branch where it CREATES the role. Not our diff; see the memory landmine.
 ## 2026-09-20 — Reuse stops being keyed on the address, and consulting Codex first paid for itself
 
 **Built / Shipped:** Phase 1a of the contact-lookup work, on `feat/lookup-contacts-action`,

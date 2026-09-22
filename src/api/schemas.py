@@ -1059,6 +1059,105 @@ class JobCreate(BaseModel):
         return v
 
 
+# What each stage is called in front of a customer. The key set is JOB_STAGES
+# (src/config/constants.py); a stage with no entry here falls through to the
+# status wording rather than leaking an identifier onto the screen.
+#
+# The copy describes the ACTIVITY, not the implementation: nobody outside this
+# codebase needs to know about Playwright contexts, dedup hashes or R2. It also
+# never claims more than the worker is doing — "Queuing contact lookups" rather
+# than "Finding contact information", because the provider answers long after
+# this job is finished and a run that promised the latter would be lying about
+# work it never waited for.
+_STAGE_LABELS: dict[str, str] = {
+    "preparing": "Getting this run ready",
+    "connecting": "Connecting to the county records system",
+    "searching": "Searching county records",
+    "scraping": "Collecting records",
+    "saving": "Saving records",
+    "deduping": "Checking for leads you already have",
+    "exporting": "Preparing your file",
+    "enriching": "Adding property and mailing details",
+    "queuing_contacts": "Queuing contact lookups",
+    "finalizing": "Finishing up",
+}
+
+# Fallback wording for a job whose row carries no stage: claimed by a worker from
+# before migration 099, or terminalized before it reported one. Coarser on
+# purpose. `status` cannot be more specific than this — that is why `stage` exists.
+_STATUS_LABELS: dict[str, str] = {
+    "pending": "Waiting to start",
+    "queued": "Waiting to start",
+    "probing": "Connecting to the county records system",
+    "scraping": "Collecting records",
+    "enriching": "Adding property and mailing details",
+}
+
+# Singular nouns for `progress_unit`, so a connector that works in 90-day windows
+# is never described as being on "page 2". NULL unit = the shape of the work was
+# not reported, so the count is shown without a noun rather than with a guessed one.
+_UNIT_NOUNS: dict[str, str] = {
+    "page": "Page",
+    "chunk": "Part",
+    "parcel": "Property",
+    "record": "Record",
+}
+
+
+def _stage_label(
+    *,
+    stage: str | None,
+    status: str,
+    units_done: int | None,
+    units_total: int | None,
+    progress_unit: str | None,
+    records_found: int | None,
+) -> str | None:
+    """One line saying what this run is doing, with counts only where measured.
+
+    Counts are appended ONLY from observations that exist. A missing total yields
+    "Part 3", not "Part 3 of 0" and not "Part 3 of ?" — there is no denominator, so
+    none is implied. A missing count yields the activity alone, which is the honest
+    thing to show while a connector is working and has not reported yet.
+    """
+    # `status` arrives as a JobStatus, which is a `str, Enum`: str() on it yields
+    # "JobStatus.PENDING", not "pending". Going through .value keeps the lookup
+    # working whether the caller passes the enum or a plain string.
+    status_key = getattr(status, "value", status)
+    label = _STAGE_LABELS.get(stage or "") or _STATUS_LABELS.get(str(status_key))
+    if label is None:
+        return None
+
+    noun = _UNIT_NOUNS.get(progress_unit or "")
+    if units_done is not None and units_total is not None and units_total > 0:
+        # 0 of N is shown, not suppressed. A connector that learns its denominator
+        # before it has collected anything (King announces its chunk count up
+        # front) can then say how big the job is straight away, which is the most
+        # reassuring thing available during the long silent opening.
+        count = (
+            f"{noun} {units_done} of {units_total}" if noun
+            else f"{units_done} of {units_total}"
+        )
+        return f"{label}: {count}"
+    if units_done is not None and units_done > 0:
+        # A count with no denominator. "Page 3", never "Page 3 of 0".
+        return f"{label}: {noun} {units_done}" if noun else f"{label}: {units_done}"
+
+    # No unit count, but a record total was observed. 0 is worth saying out loud on
+    # a stage past the scrape: it means the county answered and had nothing, which
+    # is a result, not a missing reading.
+    if records_found is not None and stage not in (None, "preparing", "connecting", "searching"):
+        return f"{label}: {records_found} records found"
+    return label
+
+
+# Stages during which the record count is still GROWING, and so the only ones where
+# extrapolating a total from it means anything. None is included for a row written by
+# a worker predating migration 099: it reports no stage at all, and its page counters
+# are scrape pages, so the extrapolation is the same one it has always made.
+_RECORD_PRODUCING_STAGES: frozenset[str | None] = frozenset({None, "searching", "scraping"})
+
+
 class JobResponse(BaseModel):
     id: str
     user_id: str
@@ -1091,8 +1190,44 @@ class JobResponse(BaseModel):
     # (a batch delivers ONE combined row, not one row per child — child delivery is
     # suppressed at create time). NULL for a standalone scrape.
     batch_id: str | None = None
-    # Computed progress fields (not stored in DB)
+
+    # ── Progress OBSERVATIONS (migration 099, straight passthrough) ───────────
+    # NULL means UNOBSERVED and must NEVER be rendered as 0. That distinction is
+    # the entire point: `page_current`/`page_total`/`record_count` above are NOT
+    # NULL DEFAULT 0, so a run that has measured nothing yet is indistinguishable
+    # from one that measured and found nothing — which is how the Live Run page
+    # came to show a giant 0% for 401 consecutive seconds of a healthy run.
+    #
+    # Each is independently unknown, because the scrapers learn them at different
+    # moments: after a page loop reports (page_num, 0, n) the completed count is
+    # known and the total is not, while King announces its chunk total before it
+    # has found a single record.
+    stage: str | None = None
+    stage_started_at: datetime | None = None
+    records_found: int | None = None   # raw scrape total; 0 here is a REAL zero
+    units_done: int | None = None
+    units_total: int | None = None     # NULL = no denominator, so no percentage
+    progress_unit: str | None = None   # page | chunk | parcel | record
+    last_progress_at: datetime | None = None
+    # NOT BEFORE, never a promise (see the column comment): the watchdog's
+    # stranded-retry branch keys on created_at, so an old job can be re-delivered
+    # ahead of this. Any countdown built on it must be worded as an earliest time.
+    next_retry_at: datetime | None = None
+
+    # ── Computed (not stored) ─────────────────────────────────────────────────
+    # How far through the CURRENT ACTIVITY, or NULL. Deliberately not a whole-run
+    # figure: the only denominator any connector produces measures the scrape, and
+    # on the run we traced the scrape was 401 of 522 seconds, so presenting its
+    # 100% as "job complete" would be a fabricated number wearing a real one's
+    # clothes (Codex P1). Clients must render it beside `stage_label`, never alone.
     progress_pct: int | None = None
+    # How long the current activity has been running. Feeds "still connecting to
+    # King County" reassurance, which may only be shown while progress_stalled is
+    # false — otherwise it asserts a run is fine when nothing is reporting.
+    stage_seconds: int | None = None
+    # Human copy for `stage`. Lives here so one wording change can never leave the
+    # API and the UI disagreeing about what the worker is doing.
+    stage_label: str | None = None
     estimated_total_records: int | None = None
     estimated_seconds_remaining: int | None = None
     estimated_time_remaining: str | None = None  # "2m 30s", "45s", "Done"
@@ -1139,7 +1274,12 @@ class JobResponse(BaseModel):
             self.elapsed_seconds = max(0, int((end - started).total_seconds()))
             self.elapsed_time = self._fmt_time(self.elapsed_seconds)
 
-        # Terminal states: 100% done, no estimate needed
+        # Terminal states. 100 on DONE is not an extrapolation — the run finished —
+        # so it stays; everything else here is cleared because there is no activity
+        # left to describe. `record_count` is the right number in this one place: at
+        # DONE it holds the BILLED non-duplicate count, which is what the customer
+        # receives. `records_found` (what the scrape turned up, duplicates included)
+        # stays available beside it for anyone who needs the other number.
         if self.status in (JobStatus.DONE, JobStatus.FAILED, JobStatus.CANCELLED):
             self.progress_pct = 100 if self.status == JobStatus.DONE else None
             self.estimated_seconds_remaining = 0
@@ -1149,6 +1289,20 @@ class JobResponse(BaseModel):
                 if self.status == JobStatus.DONE
                 else self.status.value.title()
             )
+            self.stage_label = self.progress_label
+            # A finished run has no current activity, so a stage clock would only
+            # count time since it stopped.
+            self.stage_seconds = None
+            # Nor a next attempt. A job can be CANCELLED while it is sitting out a
+            # transient-retry backoff, and the cancel path does not clear the column,
+            # so the row keeps a `next_retry_at` that nothing will ever act on. Left
+            # in the response it is a deadline for an attempt that cannot happen
+            # (Codex round 7). Suppressed HERE rather than cleared in the cancel
+            # UPDATE on purpose: this covers every terminal path, and every row
+            # already in the table, without a backfill. The column itself is
+            # untouched, so the watchdog and any forensics still see what was
+            # scheduled.
+            self.next_retry_at = None
             return
 
         # ── Liveness, before any "in progress" label is chosen ────────────────
@@ -1201,6 +1355,7 @@ class JobResponse(BaseModel):
         if self.status == JobStatus.PENDING and self.retry_count > 0:
             self.retry_pending = True
             self.progress_label = "Waiting to retry"
+            self.stage_label = self.progress_label
             return
 
         if self.progress_stalled:
@@ -1211,33 +1366,137 @@ class JobResponse(BaseModel):
             # the jobs that most need honest wording (Codex). "Checking on this
             # run" is true in both cases.
             self.progress_label = "No recent progress reported. Checking on this run."
+            self.stage_label = self.progress_label
+            # Deliberately leaves stage/stage_seconds alone: the row still records
+            # which activity the run was in when it went quiet, and "stuck while
+            # connecting" is the most useful thing support can be told. What must
+            # NOT happen is the client pairing that stage with reassuring copy —
+            # progress_stalled is the field that settles which of the two it is.
             return
 
-        # Progress based on page_current / page_total
-        if self.page_total > 0 and self.page_current > 0:
-            self.progress_pct = min(99, int(self.page_current / self.page_total * 100))
-            self.progress_label = f"Page {self.page_current} of {self.page_total}"
+        # ── How far through the CURRENT ACTIVITY ──────────────────────────────
+        # Both operands must be REAL observations. units_total is NULL for most
+        # connectors — they never learn a denominator — and NULL is exactly why no
+        # percentage may be shown for them. Nothing here may fall back to elapsed
+        # time, to a fixed per-stage weight, or to any other stand-in: a number the
+        # user reads as measured progress must have been measured.
+        #
+        # The percentage can go DOWN, and that is correct. A chunked scraper can
+        # discover more work mid-run, and revising 60% to 40% with the new counts
+        # beside it is honest, where freezing or capping it is not (Codex). The only
+        # clamp is min(99): a stage that is 99.6% through is not finished, and
+        # rounding it to 100 would announce a completion that has not happened.
+        # Legacy fallback, and it is NOT a compatibility shim to delete later: the
+        # rolling deploy alone guarantees rows written by a worker that predates
+        # migration 099, and every job already in flight when it lands is one. Without
+        # this the live page would go blank for them instead of improving.
+        #
+        # The translation is exact rather than approximate. on_progress has always
+        # passed page_total=0 to mean "no denominator", so a legacy 0 becomes NULL
+        # (unknown) and never 0 (measured zero) — the ambiguity these columns exist to
+        # remove is resolved the conservative way, toward "we do not know".
+        # record_count backfills records_found only while the job is NOT terminal: at
+        # `done` it has been overwritten with the billed count, and the terminal
+        # branch above has already returned by the time this runs.
+        # Gated on a NULL stage, which is precisely "this row was written by a worker
+        # that predates migration 099". Without that gate the fallback fights the
+        # fix above: a worker that HAS reported clears units_done/units_total when it
+        # changes activity, and the legacy page counters — which the worker still
+        # writes, and which still hold the finished scrape's 5/5 — would immediately
+        # restore them onto enrichment (Codex).
+        legacy_worker = self.stage is None
+        if legacy_worker:
+            if self.units_done is None and self.page_current > 0:
+                self.units_done = self.page_current
+            if self.units_total is None and self.page_total > 0:
+                self.units_total = self.page_total
+        # records_found is run-level, not per-activity, so it is safe to backfill for
+        # any worker: at this point the job is non-terminal, so record_count has not
+        # yet been overwritten with the billed count.
+        if self.records_found is None and self.record_count > 0:
+            self.records_found = self.record_count
 
-            # Estimate total records: (records so far / pages done) * total pages
-            if self.record_count > 0:
-                self.estimated_total_records = int(
-                    self.record_count / self.page_current * self.page_total
+        # How long the CURRENT activity has been running. Computed here, above
+        # the extrapolations, because they divide by it: elapsed_seconds covers
+        # the WHOLE RUN, and the run that motivated all of this spent 401 of its
+        # 522 seconds connecting before the scrape reported a single unit. Feed
+        # that prelude into a per-unit rate for the stage that came after it and
+        # the ETA is inflated by minutes, which is the same lie as a fake
+        # percentage wearing a different hat. The counters are already cleared
+        # on every stage change, so both operands measure the same activity.
+        if self.stage_started_at is not None:
+            entered = (
+                self.stage_started_at if self.stage_started_at.tzinfo
+                else self.stage_started_at.replace(tzinfo=UTC)
+            )
+            self.stage_seconds = max(0, int((now - entered).total_seconds()))
+
+        done, total = self.units_done, self.units_total
+        # `done >= 0`, not `> 0`. A connector that learns its denominator before it
+        # has finished anything — King announces its chunk count up front — has
+        # MEASURED that none of six chunks are done. That is a known zero, and
+        # _stage_label already publishes it as "Part 0 of 6"; refusing the matching
+        # 0% left the same observation described as measured by one field and
+        # unknown by another, and the client indeterminate while holding a real
+        # denominator (Codex round 5). This is the mirror of the bug this whole
+        # change exists to fix, and it is wrong for the same reason: unknown and
+        # zero are different, in BOTH directions. A run with no denominator still
+        # gets NULL and still renders indeterminate — that is the common case.
+        if total is not None and total > 0 and done is not None and done >= 0:
+            self.progress_pct = min(99, int(done / total * 100))
+
+            # Extrapolations, both from the SAME per-unit rate. Gated on two or more
+            # completed units: with one, the rate is that unit alone, and the first
+            # unit of a scrape carries all of the browser startup and captcha cost,
+            # so a one-unit estimate is routinely wrong by minutes.
+            if done >= 2:
+                # "How many records will this find in total?" is only answerable
+                # while records are still being found AND the unit being counted is
+                # one the record count grows with. Pierce reports its mid-scrape
+                # parcel lookup as `on_progress(found, len(inst_map), None,
+                # "parcel_lookup", unit="parcel")`: units are PARCELS while
+                # records_found still holds the already-final scrape total, so
+                # records_found / done * total multiplied a finished count by a
+                # parcel ratio and published the product as an estimate — 100
+                # records and 50 parcels giving 250 (Codex round 4). Unknown is the
+                # right answer there; the real total is already on screen beside it.
+                if (
+                    self.records_found
+                    and self.progress_unit != "parcel"
+                    and self.stage in _RECORD_PRODUCING_STAGES
+                ):
+                    self.estimated_total_records = int(self.records_found / done * total)
+                # stage_seconds is NULL only for a worker that predates
+                # migration 099 and never reported a stage; for that row the
+                # whole run IS the one unmeasured activity, so elapsed_seconds
+                # is the honest denominator rather than a downgrade.
+                rate_seconds = (
+                    self.stage_seconds
+                    if self.stage_seconds is not None
+                    else self.elapsed_seconds
                 )
+                if rate_seconds and rate_seconds > 0:
+                    secs_per_unit = rate_seconds / done
+                    self.estimated_seconds_remaining = max(
+                        0, int(secs_per_unit * (total - done))
+                    )
+                    self.estimated_time_remaining = self._fmt_time(
+                        self.estimated_seconds_remaining
+                    )
 
-            # Estimate time remaining: (elapsed / pages done) * pages left
-            if self.elapsed_seconds and self.elapsed_seconds > 0:
-                secs_per_page = self.elapsed_seconds / self.page_current
-                pages_left = self.page_total - self.page_current
-                self.estimated_seconds_remaining = max(0, int(secs_per_page * pages_left))
-                self.estimated_time_remaining = self._fmt_time(self.estimated_seconds_remaining)
-        elif self.status == JobStatus.SCRAPING:
-            self.progress_label = "Starting scrape..."
-        elif self.status == JobStatus.ENRICHING:
-            self.progress_label = "Enriching addresses..."
-        elif self.status in (JobStatus.PENDING, JobStatus.QUEUED):
-            self.progress_label = "Waiting to start..."
-        elif self.status == JobStatus.PROBING:
-            self.progress_label = "Connecting to county portal..."
+        # ── What the worker is doing, in the customer's words ─────────────────
+        # `stage` is the specific answer and `status` is the fallback for a job
+        # claimed by a worker too old to report one (NULL stage). Counts are
+        # appended only when they were actually observed.
+        self.stage_label = _stage_label(
+            stage=self.stage,
+            status=self.status,
+            units_done=self.units_done,
+            units_total=self.units_total,
+            progress_unit=self.progress_unit,
+            records_found=self.records_found,
+        )
+        self.progress_label = self.stage_label
 
 
 class PhoneContact(BaseModel):

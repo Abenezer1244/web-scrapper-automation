@@ -1080,7 +1080,18 @@ def _renewal_invoice(**overrides) -> dict:
 
 
 def _stripe_now(monkeypatch, b, *, invoice_status: str, subscription_status: str):
-    """Stripe's CURRENT answer for the invoice and subscription; returns the reads."""
+    """Stripe's CURRENT answer for the invoice and subscription; returns the reads.
+
+    The price is resolved HERE, eagerly, and the return value is thrown away. That
+    looks pointless and is not: `_price()` skips the test when no STRIPE_PRICE_* is
+    configured, and `_subscription` below is called by the webhook handler INSIDE
+    the ASGI app. A `pytest.skip` raised there is not a skip at all -- it unwinds
+    through Starlette's task group and surfaces as
+    `BaseExceptionGroup: unhandled errors in a TaskGroup` / `RuntimeError: No
+    response returned.`, so the test FAILS on a machine that simply has no Stripe
+    prices set. Resolving it in the test's own frame makes the skip a skip.
+    """
+    _price("agency", "month")
     reads: list = []
 
     def _invoice(iid, **kw):

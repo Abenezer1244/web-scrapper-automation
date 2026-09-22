@@ -15,7 +15,6 @@ import pytest
 from src.scrapers.enrichment.skip_trace import (
     _parse_full_address,
     build_pending_row_payload,
-    legacy_cache_locality,
 )
 from src.utils.lead_formatting import US_STATES, is_foreign_address, strip_us_country_tail
 
@@ -232,13 +231,6 @@ class TestLegacyModeIsByteForByte:
         parsed = _parse_full_address("1201-838 W HASTINGS ST VANCOUVER BC V6C 0A6, CANADA",
                                      legacy=True)
         assert parsed["city"] == "CANADA"
-
-    def test_legacy_cache_key_for_a_foreign_mail_row_is_unchanged(self):
-        r = SimpleNamespace(
-            property_address="806 W ARGAND ST",
-            mailing_address="2402 W 33RD AVE VANCOUVER BC V6M 1C3, CANADA",
-        )
-        assert legacy_cache_locality(r) == ("CANADA", None)
 
 
 def _result(**overrides):

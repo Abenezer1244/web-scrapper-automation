@@ -1968,12 +1968,37 @@ def _metered_price(st):
     return sorted(ids)[0]
 
 
+def _require_stripe_prices(*, plan: bool = False, metered: bool = False) -> None:
+    """Skip when this environment has no Stripe prices configured.
+
+    Without it these tests do not fail because the rule under test is broken;
+    they fail because the code never REACHES that rule. With no metered price,
+    `assert_billable` short-circuits to 'no_metered_price_configured' before
+    evaluating the refusal reason being asserted. With no plan price, a
+    subscription carrying an unrecognised price id is refused up front with
+    `_UnrecognisedSubscriptionError: expected exactly one plan price, found 0`.
+
+    Both are environment facts, not defects, and CI (which has the STRIPE_PRICE_*
+    vars) exercises them properly. Skipping locally is what lets a developer read
+    a local full-suite run as pass/fail instead of diffing it against a baseline
+    run of origin/main to find out which failures were already there.
+    """
+    import src.api.billing.skip_trace_usage as st
+    import src.api.routes.billing as b
+
+    if metered and not st._configured_metered_price_ids():
+        pytest.skip("no metered skip-trace price configured in this environment")
+    if plan and not b._PRICE_TO_PLAN:
+        pytest.skip("no plan STRIPE_PRICE_* configured in this environment")
+
+
 def test_a_customer_id_alone_no_longer_authorises_billing(monkeypatch):
     """THE P1, stated as a test.
 
     A user who started checkout has a stripe_customer_id and no subscription.
     Under the old rule the sweep released their entire backlog on that alone.
     """
+    _require_stripe_prices(metered=True)
     import src.api.billing.skip_trace_usage as st
 
     _patch_subs(monkeypatch, st, [])
@@ -1993,6 +2018,7 @@ def test_a_subscription_without_the_metered_item_does_not_authorise_overage(
     accepted, a price per lookup. Billing overage against a plan-only
     subscription charges for something never quoted.
     """
+    _require_stripe_prices(metered=True)
     import src.api.billing.skip_trace_usage as st
 
     _patch_subs(monkeypatch, st, [_sub_with("price_plan_only_not_metered")])
@@ -2083,6 +2109,7 @@ def test_a_stripe_outage_is_not_an_answer(monkeypatch):
     an outage into a permanent decision. The raw exception propagates instead so
     the task's autoretry gets another go and the row stays pending.
     """
+    _require_stripe_prices(metered=True)
     import stripe as _stripe
 
     import src.api.billing.skip_trace_usage as st
@@ -2559,6 +2586,7 @@ def test_a_plan_change_moves_the_licensed_item_it_does_not_add_one():
     level down is adding a second licensed item beside the first. The array must
     carry the EXISTING item id with a new price.
     """
+    _require_stripe_prices(plan=True)
     b = _billing()
     pro_m = b.settings.STRIPE_PRICE_PRO
     biz_m = b.settings.STRIPE_PRICE_BUSINESS
@@ -2583,6 +2611,7 @@ def test_the_metered_item_is_replaced_not_repriced():
     the check silently passes. Delete plus add gives the new item a new
     `created`, so pre-switch usage goes to a human instead.
     """
+    _require_stripe_prices(plan=True)
     b = _billing()
     pro_m = b.settings.STRIPE_PRICE_PRO
     biz_m = b.settings.STRIPE_PRICE_BUSINESS
@@ -2612,6 +2641,7 @@ def test_a_monthly_to_annual_switch_moves_both_items_in_one_call():
     leaving a monthly metered price beside an annual plan price is rejected, and
     the customer is left mid-transition. One array, one modify.
     """
+    _require_stripe_prices(plan=True)
     b = _billing()
     pro_m = b.settings.STRIPE_PRICE_PRO
     pro_y = b.settings.STRIPE_PRICE_PRO_ANNUAL
@@ -2635,6 +2665,7 @@ def test_an_unprovisioned_metered_interval_removes_the_item_rather_than_mixing()
     to avoid, and it would also keep billing overage at a rate belonging to a
     plan the customer has left.
     """
+    _require_stripe_prices(plan=True)
     b = _billing()
     pro_m = b.settings.STRIPE_PRICE_PRO
     pro_y = b.settings.STRIPE_PRICE_PRO_ANNUAL

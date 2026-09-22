@@ -18,6 +18,8 @@ from src.workers.property_identity import legacy_strong_signature as _legacy_str
 from src.workers.tasks_helpers.status import _now, _publish_log
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from src.scrapers.base_scraper import ProgressCallback
 
 _logger = setup_logger("worker.task")
@@ -147,6 +149,7 @@ async def _run_scraper(
     on_progress: "ProgressCallback | None" = None,
     record_type: str | None = None,
     doc_types: list | None = None,
+    on_stage: "Callable[[str], None] | None" = None,
 ):
     """Run the async scraper and stream progress logs back to Redis."""
     # Pass record_type / doc_types ONLY to scrapers whose constructor accepts
@@ -165,9 +168,17 @@ async def _run_scraper(
         kwargs["record_type"] = record_type
     if doc_types is not None and "doc_types" in params:
         kwargs["doc_types"] = doc_types
-    async with scraper_class(**kwargs) as scraper:
-        if on_progress:
-            scraper.on_progress = on_progress
+    # Construct, wire the callbacks, THEN enter. The callbacks used to be attached
+    # inside the `async with`, i.e. after __aenter__ had already launched the browser
+    # — so anything a scraper reported during startup went nowhere. Startup is the
+    # slowest and least visible part of a county run, which makes it the part most
+    # worth hearing about.
+    scraper = scraper_class(**kwargs)
+    if on_progress:
+        scraper.on_progress = on_progress
+    if on_stage:
+        scraper.on_stage = on_stage
+    async with scraper:
         records = await scraper.scrape(date_from, date_to)
 
         # A connector that merges several sources ships what succeeded when one source
@@ -214,8 +225,12 @@ def _reuse_enrichment_for_duplicates(db, job, job_id: str) -> int:
     copied only from a SETTLED (hit/miss) prior trace within the 90-day cache
     TTL, onto a row that has not itself been attempted.
     """
+    import uuid as _uuid
+
+    from sqlalchemy import select as sa_select
     from sqlalchemy import text as _sa_text
 
+    from src.db.models import Result
     from src.workers.property_identity import normalize_address, normalize_parcel
 
     uid = str(job.user_id)
@@ -269,37 +284,110 @@ def _reuse_enrichment_for_duplicates(db, job, job_id: str) -> int:
     if not strong_ids:
         return 0
 
+    # WHOSE contacts may be copied (migration 098). dedup_hash is
+    # sha256(parcel|address) and carries NO owner name, so a match means "the same
+    # property", never "the same owner". Run 1 traces the owner, probate moves the
+    # property, run 3 re-scrapes it under the heir, the hashes agree, and the
+    # heir's lead inherits the dead owner's phone.
+    #
+    # The two sides are deliberately asymmetric, and that is the whole fix:
+    #   - the TARGET's subject is COMPUTED from its current state, because that is
+    #     what we would buy for it right now (the same payload the enqueue builds);
+    #   - the SOURCE's subject is READ from the durable column, never recomputed.
+    # Recomputing the source is what does not work: party_name is rewritten by
+    # owner recovery after the lookup, so a recomputed source subject reads as the
+    # CURRENT owner while the phone stored beside it still belongs to the previous
+    # one. The comparison would pass and copy exactly the leak it is here to stop.
+    #
+    # A target whose payload cannot be built (no address, not traceable) gets a
+    # NULL subject and therefore no PII, while still receiving the address and
+    # enrichment fill below. Pre-098 sources have a NULL hash and donate nothing.
+    # Both directions fail CLOSED.
+    from src.scrapers.enrichment.skip_trace import (
+        build_pending_row_payload,
+        payload_subject_key,
+    )
+
+    subject_by_id: dict[str, str | None] = {}
+    for _row in db.execute(
+        sa_select(Result).where(
+            Result.id.in_([_uuid.UUID(i) for i in strong_ids]),
+            Result.user_id == _uuid.UUID(uid),  # tenant-pinned: system session
+        )
+    ).scalars():
+        _payload = build_pending_row_payload(_row)
+        subject_by_id[str(_row.id)] = (
+            payload_subject_key(uid, _payload) if _payload else None
+        )
+    # One entry per strong id, so the unnest join below never drops a target that
+    # simply has no computable subject.
+    subj_ids = list(strong_ids)
+    subj_hashes = [subject_by_id.get(i) for i in subj_ids]
+
     ttl = int(getattr(settings, "SKIP_TRACE_CACHE_DAYS", 90))
-    # Fully-STATIC SQL — no string interpolation at all (the settled-reuse
-    # predicate is written out per skip-trace column) and every value is a bound
-    # parameter (:ids, :uid, :ttl), so there is no injection surface. Membership
-    # is restricted to the Python-verified strong_ids; skip-trace PII is copied
-    # only from a SETTLED (hit/miss) prior trace inside the TTL window, onto a
-    # row that has not itself been attempted.
-    sql = """
+    # The settled-reuse predicate, written ONCE. It used to be copy-pasted into
+    # all nine skip-trace columns below; adding the 098 subject gate to nine
+    # near-identical 400-character lines is how one of them silently keeps
+    # copying. This is a fixed module-local constant with no user data in it, so
+    # interpolating it changes nothing about the injection surface: every VALUE is
+    # still a bound parameter (:ids, :uid, :ttl, :subj_ids, :subj_hashes,
+    # :atip_blocked, :atip_source), and membership is still restricted to the
+    # Python-verified strong_ids.
+    #
+    # s.subject_hash is the TARGET's subject and ro.skip_trace_subject_hash is what
+    # the SOURCE's answer was actually bought for. Either being NULL makes the
+    # comparison NULL, the CASE takes its ELSE, and nothing is copied: a pre-098
+    # source and an untraceable target both fail closed.
+    _reuse_ok = (
+        "ro.skip_trace_status IN ('hit','miss') "
+        "AND ro.skip_trace_attempted_at IS NOT NULL "
+        "AND ro.skip_trace_attempted_at >= NOW() - make_interval(days => :ttl) "
+        "AND rn.skip_trace_status = 'not_attempted' "
+        "AND ro.skip_trace_subject_hash IS NOT NULL "
+        "AND ro.skip_trace_subject_hash = s.subject_hash "
+        "AND NOT (CAST(:atip_blocked AS boolean) "
+        "AND COALESCE(rn.enrichment_data->>'source', '') = 'tacoma_code_violations' "
+        "AND COALESCE(rn.enrichment_data->>'owner_source', '') = :atip_source)"
+    )
+
+    def _copy(col: str, value: str | None = None) -> str:
+        """`col = CASE WHEN <reuse ok> THEN <value> ELSE <current> END,`"""
+        return (
+            f"{col} = CASE WHEN {_reuse_ok} THEN {value or f'ro.{col}'} "
+            f"ELSE rn.{col} END"
+        )
+
+    # Address and enrichment fields are NOT gated by the subject: they describe the
+    # property, not its owner, and fill-missing (COALESCE current-first) never
+    # clobbers a fresh scrape or GIS value.
+    sql = f"""
         UPDATE results AS rn SET
             property_address     = COALESCE(rn.property_address, ro.property_address),
             mailing_address      = COALESCE(rn.mailing_address, ro.mailing_address),
             delinquent_amount    = COALESCE(rn.delinquent_amount, ro.delinquent_amount),
             delinquent_bill_year = COALESCE(rn.delinquent_bill_year, ro.delinquent_bill_year),
-            phone = CASE WHEN ro.skip_trace_status IN ('hit','miss') AND ro.skip_trace_attempted_at IS NOT NULL AND ro.skip_trace_attempted_at >= NOW() - make_interval(days => :ttl) AND rn.skip_trace_status = 'not_attempted' AND NOT (CAST(:atip_blocked AS boolean) AND COALESCE(rn.enrichment_data->>'source', '') = 'tacoma_code_violations' AND COALESCE(rn.enrichment_data->>'owner_source', '') = :atip_source) THEN ro.phone ELSE rn.phone END,
-            phone_type = CASE WHEN ro.skip_trace_status IN ('hit','miss') AND ro.skip_trace_attempted_at IS NOT NULL AND ro.skip_trace_attempted_at >= NOW() - make_interval(days => :ttl) AND rn.skip_trace_status = 'not_attempted' AND NOT (CAST(:atip_blocked AS boolean) AND COALESCE(rn.enrichment_data->>'source', '') = 'tacoma_code_violations' AND COALESCE(rn.enrichment_data->>'owner_source', '') = :atip_source) THEN ro.phone_type ELSE rn.phone_type END,
-            phone_dnc_flag = CASE WHEN ro.skip_trace_status IN ('hit','miss') AND ro.skip_trace_attempted_at IS NOT NULL AND ro.skip_trace_attempted_at >= NOW() - make_interval(days => :ttl) AND rn.skip_trace_status = 'not_attempted' AND NOT (CAST(:atip_blocked AS boolean) AND COALESCE(rn.enrichment_data->>'source', '') = 'tacoma_code_violations' AND COALESCE(rn.enrichment_data->>'owner_source', '') = :atip_source) THEN ro.phone_dnc_flag ELSE rn.phone_dnc_flag END,
-            email = CASE WHEN ro.skip_trace_status IN ('hit','miss') AND ro.skip_trace_attempted_at IS NOT NULL AND ro.skip_trace_attempted_at >= NOW() - make_interval(days => :ttl) AND rn.skip_trace_status = 'not_attempted' AND NOT (CAST(:atip_blocked AS boolean) AND COALESCE(rn.enrichment_data->>'source', '') = 'tacoma_code_violations' AND COALESCE(rn.enrichment_data->>'owner_source', '') = :atip_source) THEN ro.email ELSE rn.email END,
-            skip_trace_status = CASE WHEN ro.skip_trace_status IN ('hit','miss') AND ro.skip_trace_attempted_at IS NOT NULL AND ro.skip_trace_attempted_at >= NOW() - make_interval(days => :ttl) AND rn.skip_trace_status = 'not_attempted' AND NOT (CAST(:atip_blocked AS boolean) AND COALESCE(rn.enrichment_data->>'source', '') = 'tacoma_code_violations' AND COALESCE(rn.enrichment_data->>'owner_source', '') = :atip_source) THEN ro.skip_trace_status ELSE rn.skip_trace_status END,
-            skip_trace_source = CASE WHEN ro.skip_trace_status IN ('hit','miss') AND ro.skip_trace_attempted_at IS NOT NULL AND ro.skip_trace_attempted_at >= NOW() - make_interval(days => :ttl) AND rn.skip_trace_status = 'not_attempted' AND NOT (CAST(:atip_blocked AS boolean) AND COALESCE(rn.enrichment_data->>'source', '') = 'tacoma_code_violations' AND COALESCE(rn.enrichment_data->>'owner_source', '') = :atip_source) THEN 'reused' ELSE rn.skip_trace_source END,
-            skip_trace_attempted_at = CASE WHEN ro.skip_trace_status IN ('hit','miss') AND ro.skip_trace_attempted_at IS NOT NULL AND ro.skip_trace_attempted_at >= NOW() - make_interval(days => :ttl) AND rn.skip_trace_status = 'not_attempted' AND NOT (CAST(:atip_blocked AS boolean) AND COALESCE(rn.enrichment_data->>'source', '') = 'tacoma_code_violations' AND COALESCE(rn.enrichment_data->>'owner_source', '') = :atip_source) THEN ro.skip_trace_attempted_at ELSE rn.skip_trace_attempted_at END,
-            phones = CASE WHEN ro.skip_trace_status IN ('hit','miss') AND ro.skip_trace_attempted_at IS NOT NULL AND ro.skip_trace_attempted_at >= NOW() - make_interval(days => :ttl) AND rn.skip_trace_status = 'not_attempted' AND NOT (CAST(:atip_blocked AS boolean) AND COALESCE(rn.enrichment_data->>'source', '') = 'tacoma_code_violations' AND COALESCE(rn.enrichment_data->>'owner_source', '') = :atip_source) THEN ro.phones ELSE rn.phones END,
-            emails = CASE WHEN ro.skip_trace_status IN ('hit','miss') AND ro.skip_trace_attempted_at IS NOT NULL AND ro.skip_trace_attempted_at >= NOW() - make_interval(days => :ttl) AND rn.skip_trace_status = 'not_attempted' AND NOT (CAST(:atip_blocked AS boolean) AND COALESCE(rn.enrichment_data->>'source', '') = 'tacoma_code_violations' AND COALESCE(rn.enrichment_data->>'owner_source', '') = :atip_source) THEN ro.emails ELSE rn.emails END
+            {_copy("phone")},
+            {_copy("phone_type")},
+            {_copy("phone_dnc_flag")},
+            {_copy("email")},
+            {_copy("skip_trace_status")},
+            {_copy("skip_trace_source", "'reused'")},
+            {_copy("skip_trace_attempted_at")},
+            {_copy("skip_trace_subject_hash", "s.subject_hash")},
+            {_copy("phones")},
+            {_copy("emails")}
         FROM delivered_records dr
         JOIN results ro
           ON ro.id = dr.first_result_id
          AND ro.user_id = CAST(:uid AS uuid)
+        CROSS JOIN unnest(CAST(:subj_ids AS uuid[]), CAST(:subj_hashes AS text[]))
+              AS s(id, subject_hash)
         WHERE rn.id = ANY(CAST(:ids AS uuid[]))
           AND rn.user_id = CAST(:uid AS uuid)
           AND dr.user_id = CAST(:uid AS uuid)
           AND dr.dedup_hash = rn.dedup_hash
           AND rn.id <> dr.first_result_id
+          AND s.id = rn.id
         RETURNING rn.id
     """
     # An ATIP-named Tacoma lead never receives contact data while the paid switch is off:
@@ -311,6 +399,7 @@ def _reuse_enrichment_for_duplicates(db, job, job_id: str) -> int:
 
     params = {
         "ids": strong_ids, "uid": uid, "ttl": ttl,
+        "subj_ids": subj_ids, "subj_hashes": subj_hashes,
         "atip_blocked": not settings.PIERCE_CV_OWNER_SKIP_TRACE_ENABLED,
         "atip_source": _PIERCE_OWNER_SOURCE,
     }
@@ -332,10 +421,17 @@ def _reuse_enrichment_for_duplicates(db, job, job_id: str) -> int:
             phones = src.phones, emails = src.emails,
             skip_trace_status = src.skip_trace_status,
             skip_trace_attempted_at = src.skip_trace_attempted_at,
-            skip_trace_source = 'reused'
+            skip_trace_source = 'reused',
+            skip_trace_subject_hash = src.skip_trace_subject_hash
         FROM (
-            SELECT DISTINCT ON (ro.dedup_hash)
-                   ro.dedup_hash, ro.phone, ro.phone_type, ro.phone_dnc_flag, ro.email,
+            -- Newest per (dedup_hash, SUBJECT), not per dedup_hash (098). One
+            -- property can now hold several owners' answers, and picking the
+            -- newest by property alone would hand whichever owner was traced last
+            -- to every lead at that address. Still one bounded query: the source
+            -- set is restricted to the target hash set, so this is not a scan.
+            SELECT DISTINCT ON (ro.dedup_hash, ro.skip_trace_subject_hash)
+                   ro.dedup_hash, ro.skip_trace_subject_hash,
+                   ro.phone, ro.phone_type, ro.phone_dnc_flag, ro.email,
                    ro.phones, ro.emails, ro.skip_trace_status, ro.skip_trace_attempted_at
               FROM results ro
              WHERE ro.user_id = CAST(:uid AS uuid)
@@ -344,13 +440,21 @@ def _reuse_enrichment_for_duplicates(db, job, job_id: str) -> int:
                                       WHERE id = ANY(CAST(:ids AS uuid[]))
                                         AND user_id = CAST(:uid AS uuid))
                AND ro.skip_trace_status IN ('hit', 'miss')
+               -- A pre-098 answer cannot say whose it is, so it donates nothing.
+               AND ro.skip_trace_subject_hash IS NOT NULL
                AND ro.skip_trace_attempted_at >= NOW() - make_interval(days => :ttl)
                AND ro.skip_trace_attempted_at <= NOW() + interval '5 minutes'
-             ORDER BY ro.dedup_hash, ro.skip_trace_attempted_at DESC, ro.id
+             ORDER BY ro.dedup_hash, ro.skip_trace_subject_hash,
+                      ro.skip_trace_attempted_at DESC, ro.id
         ) AS src
+        CROSS JOIN unnest(CAST(:subj_ids AS uuid[]), CAST(:subj_hashes AS text[]))
+              AS s(id, subject_hash)
         WHERE rn.id = ANY(CAST(:ids AS uuid[]))
           AND rn.user_id = CAST(:uid AS uuid)
           AND rn.dedup_hash = src.dedup_hash
+          AND s.id = rn.id
+          -- The target's own subject must be the one that answer was bought for.
+          AND src.skip_trace_subject_hash = s.subject_hash
           AND rn.skip_trace_status = 'not_attempted'
           AND {already_delivered_sql("rn")}
           AND NOT (CAST(:atip_blocked AS boolean)
@@ -2122,7 +2226,7 @@ def pierce_address_recovery(db, r, job_id: str, config, all_results) -> None:
             )
 
 
-def _enqueue_skip_trace_rows(db, job, r, job_id: str, config) -> None:
+def _enqueue_skip_trace_rows(db, job, r, job_id: str, config, *, on_begin=None) -> None:
     """Enqueue eligible Result rows into pending_skip_trace_rows.
 
     Called by run_scrape_job AFTER enrichment AND the plan cap, so the
@@ -2134,6 +2238,15 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config) -> None:
     skip_trace_enabled and the plan is not Starter. Cache hits are copied onto
     the row for free; misses are queued for the dispatcher, which makes the
     actual (paid) Tracerfy calls.
+
+    ``on_begin`` is called ONCE, after every one of those gates has passed and
+    there is at least one eligible row — that is, at the first moment it is true
+    that contact lookups are going to be queued. The caller uses it to enter the
+    `queuing_contacts` stage. It lives here rather than at the call site so the
+    gates are stated once: a copy of them next to the stage write would drift,
+    and the version that drifted announced the stage for every run whose plan,
+    config or eligible-row count meant nothing would be queued at all (Codex
+    round 7).
     """
     # Local imports — sa_select must be imported here because the module-
     # level import is scoped inside _run_inline_enrichment, not globally
@@ -2141,10 +2254,9 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config) -> None:
 
     from src.db.models import PendingSkipTraceRow, Result, SkipTraceCache
     from src.scrapers.enrichment.skip_trace import (
-        address_cache_key,
         build_pending_row_payload,
         code_violation_skip_trace_allowed,
-        legacy_cache_locality,
+        payload_subject_key,
     )
     from src.utils.address_intel import street_is_placeholder
 
@@ -2237,8 +2349,9 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config) -> None:
             )
 
     # A PLACEHOLDER street is not an address, and skip trace bills per lookup.
-    # Worse than the money: address_cache_key() hashes the ADDRESS, so every row
-    # sharing one placeholder string collapses to ONE cache key — measured in
+    # Worse than the money: the cache key hashes the ADDRESS (along with the owner
+    # since 098), so every row sharing one placeholder string AND one owner name
+    # collapses to ONE cache key — measured in
     # production 2026-09-03, 'UNKNOWN UNKNOWN, UNKNOWN WA' is shared by 328
     # DISTINCT parcels. A single Tracerfy result would then be copied onto all 328
     # unrelated leads, stamping one person's phone/email across properties they have
@@ -2274,10 +2387,22 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config) -> None:
     if not eligible:
         return
 
+    # Contact lookups ARE going to be queued. Safe to commit on its own here for
+    # the same reason the caller's write was: everything before this point either
+    # committed itself or was read-only, so this commits nothing but the stage,
+    # and it must not stay pending — an open UPDATE holds a lock on the jobs row,
+    # which is the row Cancel Run writes.
+    if on_begin is not None:
+        on_begin()
+
     cache_hits = 0
     cache_misses = 0
     enqueued_normal = 0
     enqueued_advanced = 0
+    # Cutover observability (Phase 1a): proves from production that this path is
+    # reading v2 keys, rather than assuming the deploy took. Pairs with the
+    # warning `address_cache_key` now logs if anything still reads a legacy key.
+    _v2_key_reads = 0
 
     skipped_ineligible = 0
     skipped_atip_policy = 0
@@ -2300,29 +2425,22 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config) -> None:
             skipped_ineligible += 1
             continue
 
-        cache_key = address_cache_key(
-            job.user_id,  # per-tenant cache: no cross-tenant PII reuse
-            payload["property_address"],
-            payload["city"],
-            payload["state"],
-        )
+        # v2 (migration 098 cutover): the key is the SUBJECT this lookup would be
+        # bought for — account, address, trace type and the exact names in the
+        # payload — not the address alone. Two owners at one address are now two
+        # answers, so an heir's lead can no longer be served the deceased owner's
+        # phone. The subject comes from the payload actually built, never
+        # recomputed from party_name.
+        #
+        # The legacy address-only read (and its mailing-locality fallback) is GONE
+        # rather than kept as a fallback: a legacy row cannot tell us whose answer
+        # it holds, so reading one is the leak. Those rows are inert and age out
+        # with the 90-day retention; deleting them is a separate PII-hygiene step.
+        # Cost of the cutover: a repeat address may be paid for again inside that
+        # window.
+        cache_key = payload_subject_key(job.user_id, payload)
+        _v2_key_reads += 1
         cached = db.get(SkipTraceCache, cache_key)
-        if cached is None:
-            # Miss under the current key: this row may already be PAID FOR under
-            # the pre-2026-09-03 key, when the locality came from the owner's
-            # mailing address instead of the property's own situs. Those differ
-            # for every absentee owner, so without this second look we would buy
-            # the same address twice. Read-only convergence — no alias row is
-            # written, so no duplicate PII is stored (Codex: the dual-read
-            # belongs at enqueue, not in tracerfy_ingest).
-            _legacy_city, _legacy_state = legacy_cache_locality(rec)
-            if (_legacy_city, _legacy_state) != (payload["city"], payload["state"]):
-                cached = db.get(SkipTraceCache, address_cache_key(
-                    job.user_id,
-                    payload["property_address"],
-                    _legacy_city,
-                    _legacy_state,
-                ))
         cache_valid = False
         if cached:
             # 90-day TTL check
@@ -2343,6 +2461,12 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config) -> None:
             # 365-day PII retention clock, and a copy must not restart it.
             rec.skip_trace_attempted_at = cached.fetched_at
             rec.skip_trace_source = "reused"  # no lookup bought for this row
+            # WHOSE answer this is (098). Recorded now, while the subject is
+            # known, because it cannot be reconstructed later: party_name gets
+            # rewritten by owner recovery, and a recomputed subject would then
+            # name the current owner while these contacts belong to the previous
+            # one. The duplicate-reuse passes require an exact match on this.
+            rec.skip_trace_subject_hash = cache_key
             cache_hits += 1
         else:
             # Enqueue for the dispatcher. Truncate string fields to fit
@@ -2425,6 +2549,8 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config) -> None:
         db=db,
     )
     _logger.info(
-        "Job %s skip trace enqueue: cache_hits=%d queued=%d (normal=%d advanced=%d)",
+        "Job %s skip trace enqueue: cache_hits=%d queued=%d (normal=%d advanced=%d) "
+        "v2_key_reads=%d",
         job_id, cache_hits, cache_misses, enqueued_normal, enqueued_advanced,
+        _v2_key_reads,
     )

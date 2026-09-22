@@ -840,6 +840,7 @@ class SnohomishWATaxDelinquentScraper(BridgeScraper):
         # is derived from the file's own tax-year vs as-of-year, not a date range.
         del date_from, date_to
 
+        self.report_stage("searching")
         landing = safe_get(
             _LANDING_URL,
             require_allowlisted=True,
@@ -892,7 +893,10 @@ class SnohomishWATaxDelinquentScraper(BridgeScraper):
             stats["layout"],
         )
         if self.on_progress:
-            self.on_progress(1, 1, len(records))
+            # No unit denominator: this connector does one search, so "1 of 1"
+            # would be a made-up 100% arriving the instant the run ends. The
+            # record count is real and is what the Records tile reads.
+            self.on_progress(0, 0, len(records))
         return records
 
     async def __aenter__(self) -> "SnohomishWATaxDelinquentScraper":

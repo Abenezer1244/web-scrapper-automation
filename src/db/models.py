@@ -679,6 +679,12 @@ class Job(Base):
     # appeared on the dashboard). tests/test_scraper_single_start_run.py locks that
     # out; do not add a preview trigger without reading that test first.
     trigger = Column(String(32), nullable=False, default="manual")
+    # NOT NULL DEFAULT 0, which is why they cannot express UNKNOWN. Kept for the
+    # existing API contract and for every reader written against them; the
+    # migration-099 columns below are the ones that can say "not measured yet".
+    # record_count in particular is NOT a scrape total: the done-CAS overwrites it
+    # with the BILLED non-duplicate count (tasks.py), so a run that scraped 57 and
+    # billed 2 ends up reading 2. Use records_found for "how much did we find".
     page_current = Column(Integer, nullable=False, default=0)
     page_total = Column(Integer, nullable=False, default=0)
     record_count = Column(Integer, nullable=False, default=0)
@@ -697,6 +703,37 @@ class Job(Base):
     # re-queued. NULL = not yet beat / pre-deploy → watchdog falls back to the
     # conservative started_at cutoff.
     last_heartbeat_at = Column(DateTime(timezone=True), nullable=True)
+    # Migration 099: progress OBSERVATIONS. Every one is nullable and NULL means
+    # UNOBSERVED, independently of the others — the scrapers learn these facts at
+    # different moments, so one shared "reporting has begun" flag would lie. Nothing
+    # here may be coerced to 0 for display: 0 is a real, measured zero.
+    #
+    # stage is what the worker is doing right now, which `status` is too coarse to
+    # say (`scraping` covered 401 silent seconds of the one run we traced). It is
+    # free text like `trigger`; the set the app writes is JOB_STAGES in
+    # src/config/constants.py. Stages repeat and are NOT a linear pipeline — the CSV
+    # export runs before enrichment — so never derive "step N of M" from it.
+    stage = Column(String(32), nullable=True)
+    stage_started_at = Column(DateTime(timezone=True), nullable=True)
+    # Raw records the scrape returned, unlike record_count above which becomes the
+    # billed count. 0 = the county really returned nothing.
+    records_found = Column(Integer, nullable=True)
+    # Completed work units and the denominator, when one is known. units_total NULL
+    # is the common case (most counties never learn a total) and is precisely why a
+    # percentage must not be rendered for them. progress_unit names what a unit IS
+    # so the UI never calls chunks "pages" (JOB_PROGRESS_UNITS).
+    units_done = Column(Integer, nullable=True)
+    units_total = Column(Integer, nullable=True)
+    progress_unit = Column(String(16), nullable=True)
+    # When a counter last MOVED. Distinct from last_heartbeat_at, which only proves
+    # the worker process is alive: a wedged scrape beats happily while advancing
+    # nothing.
+    last_progress_at = Column(DateTime(timezone=True), nullable=True)
+    # Earliest a backed-off transient retry may run. A NOT-BEFORE target, never a
+    # promise — the watchdog's stranded-retry branch keys on created_at, so an old
+    # job can be re-delivered ahead of this. Never present it as a countdown to a
+    # guaranteed start.
+    next_retry_at = Column(DateTime(timezone=True), nullable=True)
     # Migration 063: idempotent billing. billing_applied_at is the CAS gate —
     # only the attempt that flips it from NULL increments users.records_used, so a
     # watchdog re-run can't double-bill. billed_count = what was charged (stored,
@@ -822,6 +859,17 @@ class Result(Base):
     # answered for this row; 'reused' = copied from this account's earlier answer, no
     # lookup bought. NULL = never settled, or settled before 097 (unknown).
     skip_trace_source = Column(String(16), nullable=True)
+    # WHICH OWNER a settled answer was bought for (migration 098): the v2
+    # lookup_subject_key (account + address + trace type + exact names). The
+    # duplicate-reuse passes join on dedup_hash = sha256(parcel|address), which
+    # carries no owner name, so without this an heir's lead inherits the deceased
+    # owner's phone. Recomputing the subject from party_name does NOT substitute
+    # for this column: party_name is mutated by owner recovery after the fact, and
+    # a recomputed source subject then reads as the CURRENT owner while the stored
+    # phone still belongs to the previous one. Recorded when known, never
+    # reconstructed. NULL = settled before 098 or never settled, and NULL fails
+    # closed: it neither donates PII nor receives it.
+    skip_trace_subject_hash = Column(String(64), nullable=True)
     # Sprint 6.4: cross-job deduplication
     dedup_hash = Column(String(64), nullable=True, index=True)
     is_duplicate = Column(Boolean, nullable=False, default=False)
@@ -1141,12 +1189,17 @@ class SkipTraceCache(Base):
     cache. If there's a hit less than 90 days old, the phone/email are copied
     directly to the Result row — no Tracerfy credit consumed.
 
-    PER-TENANT, not global. The key is a SHA-256 hash of (user_id, normalized
-    property address, city, state) — see skip_trace.address_cache_key. One
-    tenant never reads skip-traced PII another tenant paid Tracerfy to source
-    (cross-tenant reuse decision, 2026-06-10); a tenant re-scraping its OWN
-    address still hits its own cache. Minor formatting variations (punctuation,
-    whitespace, casing) collapse to the same key within a tenant.
+    PER-TENANT AND PER-SUBJECT. Since migration 098 the key is a SHA-256 hash of
+    (user_id, property address, city, state, trace_type, first name, last name) —
+    see skip_trace.lookup_subject_key. It identifies WHOSE answer this is, not
+    just where: the address-only key it replaced let a lead inherit the previous
+    owner's phone inside the 90-day window, which probate made likely (the
+    deceased owner is traced, an heir is scraped later). One tenant never reads
+    PII another tenant paid Tracerfy to source (cross-tenant reuse decision,
+    2026-06-10); a tenant re-scraping its OWN lead, same owner, still hits its own
+    cache. Case and whitespace collapse; punctuation does NOT, so a unit number
+    stays part of the address. Rows written before 098 use the legacy key and are
+    inert: nothing reads them.
 
     This docstring previously described the key as address-only, which is how it
     was built originally. A duplicate-scope audit (2026-09-08) read it, believed

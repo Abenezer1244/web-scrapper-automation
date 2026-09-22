@@ -428,6 +428,71 @@ async def test_without_the_index_nothing_is_claimed_and_nothing_is_lost(
     assert await _status(db, rid) == "queued"
 
 
+async def test_a_lead_charged_and_unmatched_mid_enqueue_is_not_bought_again(
+    db, business_user: User, redis_client, _skip_trace_on,
+):
+    """The charged-unanswered rule is re-checked under the job lock.
+
+    An 'unmatched' pending row means Tracerfy ACCEPTED that lookup and charged a
+    credit for it but we could not attribute the answer. Buying it again is a
+    second charge for a question the vendor already failed to answer. The first
+    check runs before the lock and has to commit (its log line commits), and the
+    dispatcher and ingest do not take that lock, so a lead can become 'unmatched'
+    in between. The race is injected exactly there, by having the lock
+    acquisition itself mark the lead from a SEPARATE committed connection.
+    """
+    from src.workers.tasks_helpers import enrich as enrich_mod
+
+    cfg = await _config(db, business_user)
+    job_id = await _job(db, business_user, cfg)
+    rid = await _row(db, job_id, business_user.id,
+                     is_duplicate=True, duplicate_reason="prior_run",
+                     dedup_hash="hash-charged-unanswered")
+
+    def _mark_unmatched_elsewhere() -> None:
+        dsn = settings.DATABASE_URL_SYNC.replace("postgresql+psycopg2://", "postgresql://")
+        other = psycopg2.connect(dsn)
+        try:
+            cur = other.cursor()
+            cur.execute(
+                "INSERT INTO pending_skip_trace_rows "
+                "(id, job_id, result_id, user_id, property_address, city, state, "
+                " trace_type, status, submitted_at) "
+                "VALUES (gen_random_uuid(), %s, %s, %s, '1400 MAIN ST', 'VANCOUVER', "
+                "        'WA', 'normal', 'unmatched', now())",
+                (job_id, rid, business_user.id),
+            )
+            other.commit()
+        finally:
+            other.close()
+
+    import src.workers.skip_trace_claim as claim_mod
+
+    # Captured BEFORE patching: resolving it inside the patch would resolve the
+    # patch itself and recurse forever.
+    original = claim_mod.lock_job_for_claim
+    fired = {"n": 0}
+
+    def _lock_then_race(s, jid):
+        original(s, jid)
+        if fired["n"] == 0:
+            fired["n"] = 1
+            _mark_unmatched_elsewhere()
+
+    claim_mod.lock_job_for_claim = _lock_then_race
+    try:
+        await db.run_sync(_sync_enqueue(job_id, cfg.id, redis_client))
+    finally:
+        claim_mod.lock_job_for_claim = original
+    assert enrich_mod is not None  # the enqueue under test imports the patched name
+
+    assert fired["n"] == 1, "the race never fired; the test proves nothing"
+    assert await _pending(db, rid, active_only=True) == 0, (
+        "a lead already charged and unmatched was queued again"
+    )
+    assert await _status(db, rid) == "errored"
+
+
 async def test_claiming_without_the_job_lock_is_refused(db, business_user: User):
     """The lock is a precondition, not a convention.
 

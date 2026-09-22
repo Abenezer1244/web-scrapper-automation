@@ -2341,8 +2341,18 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config, *, on_begin=None) 
     # already-delivered lead is settled as 'errored' (what its earlier row already
     # shows); past it, it is asked again like any stale lead. A transport failure or a
     # pre-submit rejection leaves no 'unmatched' row, so it IS retried (Codex).
-    delivered_before = [rec for rec in eligible if rec.is_duplicate and rec.dedup_hash]
-    if delivered_before:
+    def _settle_charged_unanswered(rows: list) -> tuple[list, int]:
+        """Drop and settle leads whose earlier lookup was charged but unmatched.
+
+        Factored out because it has to run TWICE (Security Master Review pass 4):
+        once here, and again under the job lock. The dispatcher and ingest do not
+        take that lock, so a row can become 'unmatched' -- charged, with no answer
+        -- between this pass and the claim, and buying it again is a second
+        charge for a question the vendor already failed to answer.
+        """
+        delivered_before = [rec for rec in rows if rec.is_duplicate and rec.dedup_hash]
+        if not delivered_before:
+            return rows, 0
         charged_unanswered = set(db.execute(
             _sa_text(
                 "SELECT DISTINCT r.dedup_hash FROM pending_skip_trace_rows p "
@@ -2355,21 +2365,25 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config, *, on_begin=None) 
             {"uid": str(job.user_id), "ttl": int(settings.SKIP_TRACE_CACHE_DAYS),
              "hashes": sorted({rec.dedup_hash for rec in delivered_before})},
         ).scalars())
-        if charged_unanswered:
-            settled = [rec for rec in delivered_before if rec.dedup_hash in charged_unanswered]
-            for rec in settled:
-                rec.skip_trace_status = "errored"
-                rec.skip_trace_attempted_at = _now()
-            settled_ids = {rec.id for rec in settled}
-            eligible = [rec for rec in eligible if rec.id not in settled_ids]
-            # Committed here: `if not eligible: return` below would otherwise drop it.
-            db.commit()
-            _publish_log(
-                r, job_id, "info",
-                f"Skip trace not repeated for {len(settled)} already delivered lead(s): an "
-                "earlier lookup was charged but could not be matched to the lead",
-                db=db,
-            )
+        if not charged_unanswered:
+            return rows, 0
+        settled = [rec for rec in delivered_before if rec.dedup_hash in charged_unanswered]
+        for rec in settled:
+            rec.skip_trace_status = "errored"
+            rec.skip_trace_attempted_at = _now()
+        settled_ids = {rec.id for rec in settled}
+        return [rec for rec in rows if rec.id not in settled_ids], len(settled)
+
+    eligible, _settled_n = _settle_charged_unanswered(eligible)
+    if _settled_n:
+        # Committed here: `if not eligible: return` below would otherwise drop it.
+        db.commit()
+        _publish_log(
+            r, job_id, "info",
+            f"Skip trace not repeated for {_settled_n} already delivered lead(s): an "
+            "earlier lookup was charged but could not be matched to the lead",
+            db=db,
+        )
 
     # A PLACEHOLDER street is not an address, and skip trace bills per lookup.
     # Worse than the money: the cache key hashes the ADDRESS (along with the owner
@@ -2486,7 +2500,16 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config, *, on_begin=None) 
     if config.record_type == "code_violation":
         eligible = [rec for rec in eligible
                     if not _is_settled_complaint(rec.enrichment_data)]
+    # And the charged-unanswered rule, again, for the same reason. The first pass
+    # ran before the lock and had to commit (its log line commits), so the
+    # dispatcher or ingest can have marked one of these leads 'unmatched' since:
+    # charged, unanswered, and about to be bought a second time. No log line
+    # here, because logging commits and that would release the lock; the count
+    # is reported after the final commit below.
+    eligible, _late_settled = _settle_charged_unanswered(eligible)
     if not eligible:
+        # The settles above are real writes and must not be dropped by returning.
+        db.commit()
         return
 
     skipped_ineligible = 0
@@ -2640,12 +2663,18 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config, *, on_begin=None) 
                 enqueued_normal += 1
         lost = len(to_claim) - len(claimed)
         if lost:
-            # Not an error: the lead is already being looked up by whoever won.
-            # Logged because a persistent non-zero here means two writers are
-            # fighting over the same leads and one of them should not be.
+            # Deliberately does NOT say "already claimed". The claim refuses a
+            # lead for several reasons -- an active claim elsewhere, a lead that
+            # settled or was deleted in between, a payload whose state or
+            # trace_type cannot be stored -- and this count cannot tell them
+            # apart. Naming one of them would send whoever reads this looking for
+            # a race that may not exist. The claim logs the unwritable ones by id
+            # separately. Not an error either way; a persistently large number
+            # here is the signal worth chasing.
             _logger.info(
-                "Job %s skip trace: %d lead(s) already had an active claim, not re-queued",
-                job_id, lost,
+                "Job %s skip trace: %d of %d lead(s) were not claimed (active claim "
+                "elsewhere, settled in between, or an unusable payload)",
+                job_id, lost, len(to_claim),
             )
 
     try:
@@ -2658,6 +2687,17 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config, *, on_begin=None) 
         _logger.exception("Job %s skip trace enqueue commit failed; rolling back", job_id)
         db.rollback()
         db.commit()
+
+    if _late_settled:
+        # Reported only now: this log commits, and until the line above it the
+        # job lock had to stay held.
+        _publish_log(
+            r, job_id, "info",
+            f"Skip trace not repeated for {_late_settled} further already delivered "
+            "lead(s): an earlier lookup was charged but could not be matched to the "
+            "lead",
+            db=db,
+        )
 
     if skipped_atip_policy:
         _publish_log(

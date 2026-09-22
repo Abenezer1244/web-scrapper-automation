@@ -115,6 +115,7 @@ def main() -> int:
     from src.workers.skip_trace_claim import (
         claim_skip_trace_rows,
         lock_job_for_claim,
+        payload_is_writable,
     )
 
     mode = "COMMIT (writes + enables Tracerfy spend via dispatcher)" if args.commit \
@@ -257,7 +258,11 @@ def main() -> int:
                 if args.commit:
                     claimed = set(claim_skip_trace_rows(db, to_claim))
                 else:
-                    claimed = {str(p["result_id"]) for p in to_claim}
+                    # A dry run applies the SAME writability rule the real claim
+                    # would, or the credit estimate promises spend on payloads
+                    # that --commit would refuse.
+                    claimed = {str(p["result_id"]) for p in to_claim
+                               if payload_is_writable(p)}
                 for payload in to_claim:
                     if str(payload["result_id"]) in claimed:
                         j[f"enqueue_{payload['trace_type']}"] += 1

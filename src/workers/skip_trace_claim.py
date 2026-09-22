@@ -237,8 +237,13 @@ def _truncate(column: str, value: Any) -> Any:
     return text_value[:width] if len(text_value) > width else text_value
 
 
-def _is_writable(payload: dict) -> bool:
-    """False for a payload that cannot be stored without changing its meaning."""
+def payload_is_writable(payload: dict) -> bool:
+    """False for a payload that cannot be stored without changing its meaning.
+
+    Public so a DRY RUN can apply the same rule the real claim would. Counting a
+    payload the claim would refuse makes a cost estimate promise spend that
+    never happens.
+    """
     for column, width in _EXACT.items():
         value = payload.get(column)
         if value is not None and len(str(value)) > width:
@@ -372,7 +377,7 @@ def claim_skip_trace_rows(db, payloads: list[dict]) -> list[str]:
     # a trace_type the dispatcher would never drain.
     usable, refused = [], []
     for payload in payloads:
-        (usable if _is_writable(payload) else refused).append(payload)
+        (usable if payload_is_writable(payload) else refused).append(payload)
     if refused:
         # Result ids only: never the homeowner's name or address in a log line.
         _logger.warning(

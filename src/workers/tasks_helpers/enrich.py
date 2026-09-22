@@ -2510,6 +2510,17 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config, *, on_begin=None) 
     if not eligible:
         # The settles above are real writes and must not be dropped by returning.
         db.commit()
+        if _late_settled:
+            # Reported HERE as well as at the end: this early return is the path
+            # where the late pass settled every remaining lead, and it is exactly
+            # the case worth telling the customer about.
+            _publish_log(
+                r, job_id, "info",
+                f"Skip trace not repeated for {_late_settled} further already "
+                "delivered lead(s): an earlier lookup was charged but could not be "
+                "matched to the lead",
+                db=db,
+            )
         return
 
     skipped_ineligible = 0
@@ -2680,13 +2691,21 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config, *, on_begin=None) 
     try:
         db.commit()
     except Exception:
-        # Deliberately still a rollback-and-continue rather than a raise: the
-        # cache-hit copies above are free work worth keeping and the job must not
-        # hang. But it is now LOUD, because under 099 a failure here is no longer
-        # the routine truncation it once was.
+        # RAISES, where the original swallowed. The old handler rolled back and
+        # then committed an empty transaction, so every count below still
+        # reported cache hits and queued leads that no longer existed: the job
+        # log told the customer their leads were queued while the rows were
+        # gone. Nothing here is safe to report as success unless the commit
+        # actually happened.
+        #
+        # Raising is safe. tasks.py catches this, logs it and lets the job
+        # finish, so leads are still delivered; and every lead whose claim did
+        # not commit is still 'not_attempted', so the next run picks it up. The
+        # cache-hit copies are lost with it, but they are free to redo -- unlike
+        # a queued row that was reported as bought and was not.
         _logger.exception("Job %s skip trace enqueue commit failed; rolling back", job_id)
         db.rollback()
-        db.commit()
+        raise
 
     if _late_settled:
         # Reported only now: this log commits, and until the line above it the

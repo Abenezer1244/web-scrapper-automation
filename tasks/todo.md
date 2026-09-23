@@ -559,9 +559,14 @@ upgraded tree (`npm ci`, 849 packages): tsc, eslint and `next build` all clean.
 This is the finding that justifies the rule. Nothing in the feature work would have
 surfaced it; only running the review did.
 
-### Connector stage gap — CLOSED
+### Connector stage gap — CLOSED for the hand-written connectors, OPEN for templates
 
-All 10 connectors now call `report_stage()` (was 3). `tests/test_scraper_progress_reporting.py`
+All 10 **hand-written** connectors now call `report_stage()` (was 3). Codex round 4 caught
+what that sentence originally hid: the eight **template** scrapers under
+`src/scrapers/templates/` (EagleWeb, Tyler SelfService, LandmarkWeb, AcclaimWeb, AVA/Fidlar,
+iDocMarket, Laserfiche, Skagit) do not, and `registry.get_scraper_class()` returns those for
+any `scraper_mode == 'ai'` county. Those runs still sit on `connecting` for the whole search.
+Owner decision: follow-up PR, deliberately not widened into #348 at the merge gate. `tests/test_scraper_progress_reporting.py`
 walks the registry's own module allowlist, so a connector added later is covered
 without anyone remembering the test. Verified non-vacuous: removing one call fails it
 by name. Targeted suite: 1332 passed, 1 skipped.
@@ -577,3 +582,67 @@ by name. Targeted suite: 1332 passed, 1 skipped.
 **#348 must merge and deploy before #158.** The page reads fields that ship in the
 backend. Migration 099 is additive and safe to deploy ahead of the worker: old
 workers leave the new columns NULL, which reads as UNOBSERVED.
+
+---
+
+## Close-out (2026-09-22)
+
+Everything under **Not done** above is now done. Both PRs are MERGED and live.
+
+### The Codex gate ran — eight rounds
+
+| Round | Backend | Frontend |
+|-------|---------|----------|
+| 3 | **P1** Celery time limit swallowed by the telemetry catch-alls; P2 ETA timed off the whole run | 3x P2: stale-label fallback, stalled runs saying "Searching", retry budget not reset |
+| 4 | **P1** legacy counters written unguarded beside the guarded write; P2 mixed-unit record estimate; P2 template connectors (deferred) | 2x P2: stalled/retry vs stage_label precedence, queued runs shown as working |
+| 5 | P2 measured `0 of N` returned null instead of 0% | 2x P2: activity cues on `isLive`, live region announcing the wrong string |
+| 6 | P2 chunk denominator published then wiped by the next `report_stage()` | 3x P2: client-promoted done over stale label, "Trying again now", aria-live noise |
+| 7 | P2 `queuing_contacts` above its own gates; P2 terminal job advertising `next_retry_at` | 2x P2: bar animating for stopped runs, Cancel leaving stale activity |
+| 8 | P2 time limit must reach the task boundary (completes the round-3 P1); templates again | P2 retry copy promising a schedule |
+
+No P1 after round 4. Two P1s total, both real, both verified against the tree before fixing.
+The round-8 backend finding is the interesting one: it showed the round-3 P1 fix was only half
+a fix, and that the other half was **pre-existing** — a `SoftTimeLimitExceeded` raised anywhere
+in the scrape was already being classified as a permanent error by `is_transient_scrape_error`,
+which bypassed `on_failure`'s deliberate "timeouts are RECOVERABLE" path and killed the job
+instead of letting the watchdog recover it.
+
+### One thing CI could not have caught
+
+`main` landed `098_results_skip_trace_subject_hash` while this branch was open, and this
+branch's migration was also `098`. Duplicate revision id, two alembic heads, and CI's
+*Run Migrations* step failing before pytest started — so the Test job read FAILURE with no
+change to this branch's code. Renumbered to **099** behind it (`097 -> 098 -> 099`); the two
+touch different tables, so ordering carries no risk.
+
+### Verified against a real run
+
+Job `89b92687`, King probate, 06/01-09/20, 2 chunks. Full trace in
+`docs/BUILD_JOURNAL.md` (2026-09-22). The three things the handoff asked for:
+
+- **5m18s of "Connecting to the county records system" with no percentage at all.** That is
+  the window that used to show a giant `0%`.
+- **"Searching county records: Part 0 of 2" at a measured 0%**, then **"Collecting records:
+  Part 1 of 2" at 50%.** Both fixes from rounds 5 and 6 are needed for that first line to
+  exist at all.
+- **Counters CLEARED at every stage change** — saving, exporting and enriching each show the
+  record total and no unit counts.
+
+Unplanned but the best evidence in the run: a worker deploy at 23:36:29 UTC killed the first
+attempt mid-enrichment. The page stopped claiming "Adding property and mailing details" and
+said **"No recent progress reported. Checking on this run."**; the watchdog re-queued it and
+reset every observation to **NULL, not 0**. That state had only ever been exercised against a
+stub API before.
+
+Found **125**, billed **0** — all duplicates. That one pair is the whole feature: the old model
+could only render `Records 0`.
+
+### Still open
+
+- [ ] `report_stage()` in the eight template connectors (owner: follow-up PR).
+- [ ] The terminal label reads `Complete: 0 records` off the BILLED count, moments after the
+      page said `125 records found`. Pre-existing wording; `records_found` now exists to fix it.
+- [ ] A 2-chunk scrape jumps `Part 1 of 2` straight to `saving`, so the last chunk's completion
+      is never shown and the percentage is never seen above 50.
+- [ ] **C4** (above) — the watchdog resurrecting a cancelled job — remains its own fix.
+- [ ] Test config `68ffc13e` is deactivated and renamed `[finished - safe to delete]`.

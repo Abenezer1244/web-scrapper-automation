@@ -19,6 +19,107 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-22 — Live Run progress: merged, deployed, and proven against a real King scrape
+
+> Continues the 2026-09-20 entry. BE **#348** `dcf1f74` and FE **#158** `7f101fb` are MERGED
+> and live; migration **099** is applied in production. Worktrees `C:/Users/Windows/bl-wt-liverun`
+> and `bl-wt-liverun-fe`.
+
+**Built / Shipped:**
+- The migration was renumbered **098 -> 099**. `main` landed `098_results_skip_trace_subject_hash`
+  while this branch was open and both declared revision `098`, so the merge produced a duplicate
+  id AND two alembic heads. CI's *Run Migrations* step died on "Multiple head revisions" before
+  pytest ever started, which is why the Test job flipped SUCCESS -> FAILURE without a line of
+  this branch's code changing. The subject-hash one is the applied one, so it kept 098.
+- Eight further Codex rounds, then merge. BE deployed first, migration ran, and FE's api-types
+  drift gate then went green on its own exactly as the previous handoff predicted.
+
+**Caught & fixed (Codex rounds 3-8; two P1s):**
+- **P1** A Celery `SoftTimeLimitExceeded` was swallowed by the new telemetry catch-alls, so the
+  task never learned its budget was gone and ran to the hard kill. Fixed — and round 8 then showed
+  the fix was only half of it: re-raised, it lands in the scrape's `except Exception`, where
+  `is_transient_scrape_error` reads it as PERMANENT and `_fail_job` runs, so the task returns
+  normally and `on_failure`'s deliberate "timeouts are RECOVERABLE" path never fires. **That half
+  was pre-existing** for any timeout raised anywhere in the scrape. Both escape to the task
+  boundary now.
+- **P1** The legacy counters were still written by an unguarded ORM assignment committed by
+  primary key, immediately beside the new guarded write. Same defect #347 fixed in the watchdog,
+  in a second place: a late callback from a superseded attempt could overwrite a replacement run's
+  counters, or the billed `record_count` the terminal CAS had just set. All six counters now go in
+  ONE statement behind one precondition, and a refused write no longer publishes its phase log.
+- **P2** The ETA divided by whole-run `elapsed_seconds` while the percentage beside it was
+  activity-scoped. On the traced shape that turned a real ~120s into ~920s. Timed from
+  `stage_started_at` now.
+- **P2** `estimated_total_records` multiplied an already-final record count by a PARCEL ratio
+  during Pierce's mid-scrape lookup (100 records, 50 parcels -> 250). Confined to the stages where
+  the record count is still growing.
+- **P2** A measured `0 of N` returned `progress_pct = null` while `_stage_label` published
+  "Part 0 of 6" — one field calling the observation measured and the other calling it unknown.
+- **P2** ...and the chunk denominator never reached the API anyway: all three chunked connectors
+  announced it one line BEFORE a `report_stage()`, which clears the counters. Published and wiped.
+- **P2** `queuing_contacts` was written above the five gates that decide whether anything gets
+  queued, so a Starter run was labelled "Queuing contact lookups" while queuing nothing.
+- **P2** A cancelled job kept advertising `next_retry_at` for an attempt that can never run.
+- **FE, eight P2s**: a queued run got the sweeping ring, the pulsing dots and "Searching" tiles
+  with no worker in existence; the bar kept animating for stalled runs; Cancel left its old
+  activity under the new badge; the live region announced a different activity than the screen,
+  and then announced every 3s counter change; the retry copy promised a schedule that a
+  not-before timestamp cannot give.
+
+**Proven against a real county run** — job `89b92687`, King probate, 06/01-09/20, 2 chunks.
+Every line below is the `JobResponse` the Live Run page renders:
+
+```
+23:15:08 pending    -           pct=None    Waiting to start
+23:27:29 connecting -           pct=None    Connecting to the county records system
+23:32:47 searching  0/2 chunk   pct=0       Searching county records: Part 0 of 2
+23:34:13 scraping   1/2 chunk   pct=50      Collecting records: Part 1 of 2
+23:35:37 saving     CLEARED     pct=None    Saving records: 125 records found
+23:35:40 exporting  CLEARED     pct=None    Preparing your file: 125 records found
+23:35:43 enriching  CLEARED     pct=None    Adding property and mailing details: 125 records found
+23:54:34 enriching  CLEARED     pct=None    No recent progress reported. Checking on this run.
+23:55:17 queued     all NULL    pct=None    Waiting to start          <- watchdog re-queue
+00:04:38 done       CLEARED     pct=100     Complete: 0 records
+```
+
+**5m18s of `connecting` carried no number at all** — that is precisely the window that used to
+render a giant `0%`. `Part 0 of 2` at a real 0% is the measured-zero fix and the
+denominator-survives-startup fix working together; without the second there is no `units_total`
+and that line cannot exist. CLEARED at every stage change is the counter-leak fix.
+
+**The stall at 23:54 was not planned and is the best evidence in the run.** A worker deploy at
+23:36:29 UTC killed the attempt mid-enrichment — a container stop raises no exception, so the row
+stays non-terminal with no error and no `finished_at`. The page stopped claiming "Adding property
+and mailing details" and said "No recent progress reported" instead, the watchdog re-queued it,
+and every observation went back to **NULL, not 0**. The previous session could only exercise that
+state against a stub API.
+
+**Facts learned:**
+- `records_found` vs `record_count` is the entire point, and production shows it plainly:
+  **125 found, 0 billed** (all duplicates). The old model could only say `Records 0`.
+- `public.alembic_version` has **RLS enabled with zero policies**, so `bridgeleads_system` reads
+  it as EMPTY. That is not a broken migration state — the owner role alembic connects as sees it
+  fine. Do not raise an alarm from that read.
+- `railway run` executes **locally** with prod env vars, so `redis.railway.internal` does not
+  resolve and `apply_async` cannot publish from a dev box. A job created that way sits durably
+  `pending` and the watchdog's orphaned-fresh-pending branch collects it ~10-13 min later.
+  Usable for verification, just not fast.
+- The Desktop checkout that `railway run` starts from is far behind `origin/main`, so an ops
+  script must `chdir` and `sys.path` into the worktree or it imports stale modules.
+
+**Pending / Handoff:**
+- The eight template connectors under `src/scrapers/templates/` (EagleWeb, Tyler SelfService,
+  LandmarkWeb, AcclaimWeb, AVA/Fidlar, iDocMarket, Laserfiche, Skagit) never call
+  `report_stage()`, so any county resolved through `_detect_template()` sits on `connecting` for
+  its entire search. Owner decision: **follow-up PR**, deliberately not widened into #348.
+- The terminal label reads `Complete: 0 records` off the BILLED count, moments after the page
+  said `125 records found`. Pre-existing wording; `records_found` now exists to improve it.
+- The scrape jumps `Part 1 of 2` straight to `saving` — the final chunk's completion is never
+  displayed, so the percentage is never seen above 50 on a 2-chunk run.
+- Test config `68ffc13e` is DEACTIVATED and renamed `[finished - safe to delete]`. Left in place
+  rather than deleted because three job rows and their results hang off it.
+---
+
 ## 2026-09-20 — King "Auction Date = N/A": mostly correct, one real veto bug
 
 > Reported from job `18076769` (51 King pre_foreclosure rows, Auction Date and Principal

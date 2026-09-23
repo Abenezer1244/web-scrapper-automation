@@ -808,10 +808,27 @@ Hardening only. No API route, no schema, no new dependency, no frontend.
 **In one line:** one lead can hold only one active skip-trace claim, and a conflict now costs
 only itself instead of silently discarding a whole job's lookups.
 
-**What it cost to get right.** Codex returned NO-GO **six times** before PASS. The plan-level
-consult (round 15) found nine P1s before any code was written; the diff review then found nine
-more across six rounds, and the Security Master Review found a Critical on top of that. Every
-one of them was a way to charge a customer twice, strand paid work, or lose leads silently.
+**What it cost to get right.** The plan-level consult (round 15) found nine P1s before a line
+was written. The diff review then returned NO-GO **six times** before PASS. The Security Master
+Review then ran **twelve passes**, finding a Critical, seven Highs and a long tail of Mediums.
+Every one was a way to charge a customer twice, strand paid work, or lose leads silently.
+
+**The three findings that only a CHANGE OF ANGLE could produce.** After pass 6 came back
+completely clean, the temptation was to stop. Passes 7, 8 and 10 each found something the
+previous ones structurally could not:
+1. **Pass 7 (hostile input / DoS):** Postgres caps a statement at 65,535 bind parameters and
+   the claim spent 15 per row, so it broke at **4,368 leads and enqueued nothing**. Production
+   holds 100,548 claimable leads. Six passes of correctness review had walked straight past it.
+2. **Pass 8:** the fix for that introduced the next bug -- the chunked insert rebuilt its bind
+   parameters per chunk while the withdrawal still indexed them by whole-batch position, so it
+   would delete the WRONG pending row.
+3. **Pass 10 (deploy day):** the dispatcher, which is the thing that actually SPENDS, never
+   checked the invariant. 099 aborts precisely when duplicates exist, `start.sh` boots the
+   worker anyway, and both rows of a duplicate pair would have been submitted and charged.
+   Reviewing the code could not find this, because the gap was not in the code under review.
+
+**The lesson worth carrying:** a clean pass is evidence about the questions asked, not about
+the code. Change the question.
 
 **Three findings worth remembering beyond this phase:**
 1. **The fix's own ordering was the bug.** Creating the unique index BEFORE moving the enqueue
@@ -826,11 +843,27 @@ one of them was a way to charge a customer twice, strand paid work, or lose lead
    `EncryptedJSON`, so that would have written PLAINTEXT PII. The intent was implemented with
    the shared lock and ORM writes instead. **Check a suggested fix against the schema.**
 
-**Carried into 1b-2, do not lose:** the action worker MUST call `lock_job_for_claim()` before
-its own cache-and-claim pass (the cache-hit write is an ORM write and cannot see another
-writer's uncommitted pending row), and it inherits fail-closed enforcement automatically.
+**Carried into 1b-2, do not lose:**
+- The action worker MUST call `lock_job_for_claim()` before its own cache-and-claim pass. The
+  cache-hit write is an ORM write (phone/email are `EncryptedString`, so it cannot be raw SQL)
+  and it cannot see another writer's uncommitted pending row. `claim_skip_trace_rows` ASSERTS
+  the lock is held, so forgetting raises rather than racing.
+- It inherits fail-closed enforcement and the one-job-per-claim rule automatically.
+- Codex's standing suggestion, not built: a shared claim-context API that takes the lock, does
+  the cache and claim work, and requires the action/audit writes before commit, so "caller owns
+  the transaction" stops being convention. Worth doing when 1b-2 needs it.
 
-**Verification.** 306 tests green on an isolated database across the skip-trace, enqueue,
+**Deploy notes for whoever ships this:**
+- Forward safe. **Not backward safe:** rolling back past this release with 099 applied is
+  unsafe while traffic flows, because the previous release's enqueue is not conflict-aware and
+  discards whole job batches silently. Downgrade 099 with it, or stop the worker first.
+- 099 aborts only if duplicate active rows exist. Production had **zero** when checked, so it
+  should not abort. If it ever does, the dispatcher holds those specific leads back and alerts
+  rather than paying for them twice, so an unquiesced deploy is SAFE -- but a quiesced one (the
+  1a pattern: kill switch off, workers to zero, migrate, restart) still avoids the mixed-version
+  window entirely and is the more conservative choice. Owner's call.
+
+**Verification.** 313 tests green on an isolated database across the skip-trace, enqueue,
 dispatcher, reconciliation and Phase 1a subject-key suites; ruff clean. Migration 099 applied
 and verified BY THE OBJECTS (unique, valid, correct predicate), never by `alembic_version`, and
 its rebuild path proved live by planting the exact wrong index and re-running it. The 15-1

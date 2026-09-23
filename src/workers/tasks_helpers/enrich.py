@@ -2241,7 +2241,7 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config, *, on_begin=None) 
 
     ``on_begin`` is called ONCE, after every one of those gates has passed, there
     is at least one eligible row, and at least one of those rows would actually
-    produce a lookup payload. The caller uses it to enter the `queuing_contacts`
+    produce a lookup payload as the row reads at that moment. The caller uses it to enter the `queuing_contacts`
     stage. It lives here rather than at the call site so the gates are stated
     once: a copy of them next to the stage write would drift, and the version
     that drifted announced the stage for every run whose plan, config or
@@ -2431,11 +2431,12 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config, *, on_begin=None) 
     if not eligible:
         return
 
-    # Contact lookups ARE going to be queued. Safe to commit on its own here for
-    # the same reason the caller's write was: everything before this point either
-    # committed itself or was read-only, so this commits nothing but the stage,
-    # and it must not stay pending — an open UPDATE holds a lock on the jobs row,
-    # which is the row Cancel Run writes.
+    # Contact lookups are about to be ATTEMPTED — not necessarily queued; the
+    # exceptions are listed at the end of this comment. Safe to commit on its own
+    # here for the same reason the caller's write was: everything before this
+    # point either committed itself or was read-only, so this commits nothing but
+    # the stage, and it must not stay pending — an open UPDATE holds a lock on
+    # the jobs row, which is the row Cancel Run writes.
     #
     # It fires HERE, before the lock below, and it has to: `_set_stage` COMMITS,
     # and a transaction-scoped advisory lock is released by any commit. Moving
@@ -2443,9 +2444,9 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config, *, on_begin=None) 
     # lock the claim depends on — a P2 traded for a P1.
     #
     # That places it before the per-row gates, so this pre-check stands in for
-    # them. The case it exists for is a code-violation run whose complaints have
-    # not been owner-enriched yet: every party_name is still a case description
-    # ("Weeds ? 1819 HARVARD AVE"), every payload is therefore None, and the run
+    # them. The case it exists for is a run whose every party_name is a case
+    # DESCRIPTION rather than a person ("Weeds ? 1819 HARVARD AVE", the shape
+    # code-violation scrapers write): every payload is then None, and the run
     # announces "queuing contact lookups" and queues nothing, every time. That
     # is the same false label Codex round 7 removed from the call site,
     # reintroduced from below instead of above.
@@ -2456,20 +2457,35 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config, *, on_begin=None) 
     # authority on what will not queue, which is why the check calls it rather
     # than re-deriving the rule — and it already applies the ATIP policy gate
     # internally, so naming that gate again here would only invite it to drift.
-    # It is a pure function of the row, so asking it early costs CPU and no
-    # query, and `any()` stops at the first lead that would produce a payload:
-    # the common case parses one row, and only an all-rejected run scans the
-    # set, which is exactly the run this exists to catch. The loop below stays
-    # authoritative — this can only ever SUPPRESS an announcement, never
-    # authorise a claim.
+    # It reads the row and process settings only: no query, no I/O and no
+    # mutation of the Result (it returns a fresh dict), so asking it early is
+    # safe, but it is NOT a pure function of the row alone — `code_violation_
+    # skip_trace_allowed` reads a global flag, and API and worker carry separate
+    # env (15-14). `any()` stops at the first lead that would produce a payload,
+    # so the common case parses one row and only an all-rejected run scans the
+    # set, which is exactly the run this exists to catch. The payloads are
+    # deliberately NOT carried into the loop below to save the second parse:
+    # that loop re-reads its rows under the lock with populate_existing, and
+    # reusing a payload computed from the pre-lock row would reintroduce the
+    # stale-subject class of bug that 14-B exists to prevent. Paying the parse
+    # twice is the cost of the loop staying authoritative. This check can only
+    # ever SUPPRESS an announcement, never authorise a claim.
     #
-    # Deliberately NOT predicted here, and the stage may still overstate in these
-    # cases: every lead turning out to be a cache hit (free reuse, not a queue,
-    # but knowing needs a DB read per lead), the post-lock re-read or
-    # `_settle_charged_unanswered` emptying the set concurrently, and the
-    # fail-closed `ClaimUnenforcedError` when migration 100 is absent. Each is
-    # either real work for the customer or a genuinely rare race, not a run that
-    # was never going to queue anything.
+    # Two ways it is still not the truth, both accepted, neither costing money:
+    #  * It can OVERSTATE. Every lead may turn out to be a cache hit (free
+    #    reuse, nothing queued, but knowing needs a DB read per lead); the
+    #    post-lock re-read or `_settle_charged_unanswered` may empty the set
+    #    concurrently; or the fail-closed `ClaimUnenforcedError` may fire when
+    #    migration 100 is absent. Each is either real work for the customer or a
+    #    genuinely rare race, not a run that was never going to queue anything.
+    #  * It can UNDERSTATE, and this one is a real race (Codex): owner recovery
+    #    rewrites `party_name` for these same rows, so a lead that had no
+    #    payload here can have one by the time the post-lock re-read refreshes
+    #    it, and the run then queues without ever announcing the stage. A
+    #    missing label is strictly better than the false one it replaces, and
+    #    the pending rows — never this callback — are the evidence of what was
+    #    queued. Fixing it properly means announcing after the claim, which the
+    #    commit rule above forbids.
     if on_begin is not None and any(
         build_pending_row_payload(rec) is not None for rec in eligible
     ):

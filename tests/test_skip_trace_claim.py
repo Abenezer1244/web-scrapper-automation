@@ -972,12 +972,19 @@ async def test_no_stage_announcement_when_no_lead_can_produce_a_payload(
 
     `on_begin` has to fire BEFORE the advisory lock, because the caller's
     `_set_stage` commits and a transaction-scoped lock does not survive a
-    commit. That puts it above the per-row gates, so without a pre-check a
-    code-violation run whose complaints are not owner-enriched yet -- every
-    party_name still a case description, which is exactly the fixture here --
+    commit. That puts it above the per-row gates, so without a pre-check a run
+    whose every party_name is a case DESCRIPTION rather than a person -- the
+    shape code-violation scrapers write, and exactly the fixture here --
     announces "queuing contact lookups" on every single run and queues
     nothing. That is the same false label Codex round 7 removed from the call
     site.
+
+    Precisely which gate rejects these rows, because the distinction was got
+    wrong twice while writing this: they are refused by the generic
+    `looks_like_non_personal_party_name` check inside
+    `build_pending_row_payload`, which applies to EVERY record type, not by
+    `code_violation_owner_is_known` -- the config here is `probate` and the
+    rows carry no code-violation source metadata, so that gate never runs.
 
     A lead with NO party_name is deliberately NOT used here: it still queues,
     as an address-only advanced trace. An earlier version of this test used

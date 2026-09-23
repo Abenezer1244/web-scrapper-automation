@@ -37,6 +37,24 @@ dispatcher stamps it at queued -> submitting BEFORE it contacts Tracerfy
 submission, so any group containing an unknown-outcome row is quarantined whole
 and reconciled against Tracerfy by hand.
 
+DEPLOY AND ROLLBACK (Security Master Review pass 10). This migration is forward
+safe but NOT backward safe, and the difference matters:
+
+  * Rolling FORWARD is fine. The index is built CONCURRENTLY, the new claim is
+    conflict-aware, and a claim that cannot be enforced refuses rather than
+    risking a double charge.
+  * Rolling BACK to a release before this one, with 099 still applied, is NOT
+    safe while any traffic flows. The previous release's enqueue is not
+    conflict-aware: it flushes at one commit whose handler rolls back and then
+    commits an EMPTY transaction, so a single conflict silently discards a whole
+    job's lookups while the scrape reports success. If a rollback past this
+    release is ever needed, downgrade 099 with it, or stop the worker first.
+  * If 099 ABORTS (it aborts precisely when duplicates already exist), start.sh
+    still boots the worker. Claims then refuse, which is correct, but the
+    dispatcher would otherwise keep draining the duplicates it found and charge
+    for the same lead twice. skip_trace_dispatcher now holds those specific
+    leads back and alerts; see the guard at the top of its tick.
+
 Lock safety: the index is built CONCURRENTLY in an autocommit block, so it never
 blocks reads or writes on a table the dispatcher is draining. Every step is
 idempotent because the autocommit block leaves the revision unrecorded if the

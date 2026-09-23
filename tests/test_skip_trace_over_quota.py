@@ -217,6 +217,60 @@ class TestCancelSweep:
             ))
             await db.commit()
 
+    async def test_a_duplicated_lead_is_not_submitted_while_099_is_unenforced(
+        self, db, business_user, tracerfy,
+    ):
+        """The dispatcher is what SPENDS money, so it gets its own guard.
+
+        Migration 099 stops a lead holding two active claims, and the claim path
+        refuses to write without it. But 099 ABORTS precisely when duplicates
+        already exist, and start.sh boots the worker anyway, so the dispatcher
+        would drain both rows of a duplicate pair and charge for one lead twice.
+        With the invariant off it holds those leads back instead, and submits
+        everything else rather than halting every tenant over a condition most
+        are not in.
+        """
+        from src.workers.skip_trace_claim import INDEX_NAME
+
+        job = await _job(db, business_user, "done")
+        dup_lead = await _lead(db, business_user, job)
+        ok_lead = await _lead(db, business_user, job)
+        ok_row = await _pending(db, business_user, job, ok_lead)
+
+        await db.execute(text(f"DROP INDEX {INDEX_NAME}"))
+        await db.commit()
+        try:
+            # Two ACTIVE rows for one lead: only possible with 099 absent.
+            dup_row = await _pending(db, business_user, job, dup_lead)
+            await _pending(db, business_user, job, dup_lead, status="submitted")
+            await db.commit()
+
+            dispatcher.dispatch_pending_skip_trace()
+
+            # Asserted on the QUEUE, not on what the stub recorded: the row
+            # leaving 'queued' is what commits us to paying for it, and the
+            # dispatcher stamps that before it ever contacts the vendor.
+            assert await _status(db, "pending_skip_trace_rows", dup_row) == "queued", (
+                "a lead with two active rows advanced toward submission and would "
+                "be charged twice"
+            )
+            # The unaffected lead must not be collateral: it is neither held back
+            # by name nor cancelled. That it SUBMITS normally is covered by the
+            # dispatcher's own suites, which run with the index in place; this
+            # test is about what happens when the invariant is off.
+            assert await _status(db, "pending_skip_trace_rows", ok_row) in (
+                "queued", "submitting", "submitted"
+            ), "an unrelated lead was cancelled by the duplicate guard"
+        finally:
+            await db.execute(text(
+                "DELETE FROM pending_skip_trace_rows WHERE result_id = CAST(:r AS uuid)"
+            ), {"r": dup_lead})
+            await db.execute(text(
+                f"CREATE UNIQUE INDEX {INDEX_NAME} ON pending_skip_trace_rows "
+                "(result_id) WHERE status IN ('queued','submitting','submitted')"
+            ))
+            await db.commit()
+
     async def test_the_sweep_does_not_commit_its_own_work(self, db, business_user):
         """Transaction ownership, proved rather than asserted.
 

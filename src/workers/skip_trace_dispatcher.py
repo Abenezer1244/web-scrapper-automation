@@ -45,6 +45,7 @@ def dispatch_pending_skip_trace() -> dict:
         return {"skipped": "no_token"}
 
     from sqlalchemy import and_, func, select, text, update
+    from sqlalchemy import true as sa_true
 
     from src.api.lead_actionability import DELIVERY_EXCLUDED_KEY, OVER_QUOTA
     from src.api.results_category import skip_trace_eligible_condition
@@ -121,6 +122,54 @@ def dispatch_pending_skip_trace() -> dict:
     # trace_type, not by user). This is a legitimate cross-tenant
     # system operation.
     with system_sync_session() as db:
+        # DEFENCE IN DEPTH FOR THE DOUBLE CHARGE (Security Master Review pass 10).
+        #
+        # Migration 099's unique index is what stops one lead holding two active
+        # claims, and the claim path refuses to write without it. But this
+        # dispatcher is what SPENDS money, and it drains rows that already exist.
+        # If 099 ever aborts -- which happens precisely when duplicates are
+        # already present -- start.sh still boots the worker, and the dispatcher
+        # would submit both rows of a duplicate pair and charge the customer
+        # twice for one lead.
+        #
+        # So when the invariant is unenforced, say so loudly and skip exactly the
+        # leads that are duplicated, rather than halting every tenant's lookups
+        # over a condition most of them are not in. When it IS enforced, which is
+        # the normal case, this costs one catalog read and nothing else.
+        _duplicated_result_ids: set[str] = set()
+        from src.workers.skip_trace_claim import warn_if_unenforced
+
+        if not warn_if_unenforced(db):
+            _duplicated_result_ids = {
+                str(r) for r in db.execute(text(
+                    "SELECT result_id FROM pending_skip_trace_rows "
+                    "WHERE status IN ('queued','submitting','submitted') "
+                    "GROUP BY result_id HAVING count(*) > 1"
+                )).scalars()
+            }
+            if _duplicated_result_ids:
+                _logger.error(
+                    "Dispatcher: %d lead(s) hold more than one ACTIVE pending row "
+                    "while migration 099 is not enforced. They are NOT being "
+                    "submitted, because doing so would charge for the same lead "
+                    "twice. Reconcile them and apply 099.",
+                    len(_duplicated_result_ids),
+                )
+                try:
+                    from src.workers.ops_alerts import send_ops_alert
+
+                    send_ops_alert(
+                        "skip_trace_duplicate_active_rows", "dispatcher",
+                        "Duplicate active skip-trace rows while 099 is unenforced",
+                        f"{len(_duplicated_result_ids)} lead(s) hold more than one "
+                        f"active pending row and migration 099's unique index is "
+                        f"missing or invalid. Those leads are held back rather than "
+                        f"submitted, so nothing is double charged, but they will not "
+                        f"be looked up until this is reconciled and 099 applied.",
+                    )
+                except Exception:  # noqa: BLE001 - an alert must not stop the tick
+                    _logger.exception("skip-trace duplicate-rows alert failed to send")
+
         # Resolve anything stuck mid-submission from a previous tick BEFORE
         # draining new work: a released claim rejoins the FIFO head below and
         # goes out in this same tick instead of waiting another five minutes.
@@ -202,6 +251,11 @@ def dispatch_pending_skip_trace() -> dict:
                             and_(
                                 PendingSkipTraceRow.status == "queued",
                                 PendingSkipTraceRow.trace_type == trace_type,
+                                # Empty in the normal case (099 enforced), so this
+                                # is a no-op unless the invariant is actually off.
+                                PendingSkipTraceRow.result_id.notin_(
+                                    _duplicated_result_ids
+                                ) if _duplicated_result_ids else sa_true(),
                                 text(_job_delivered_sql("jobs")).bindparams(
                                     since=BILLING_STAMP_RELIABLE_SINCE),
                                 Result.skip_trace_status == "queued",

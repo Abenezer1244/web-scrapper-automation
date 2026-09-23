@@ -60,8 +60,8 @@ inherit the previous owner's phone (probate makes this likely: deceased owner, t
   credits in the quote, which would disagree with the invoice; and repricing advanced to 2
   billed lookups, a live pricing change needing its own decision and comms.)
 - **D3 Daily cap. ANSWERED: surface it end to end.** As specified below. (Rejected: leaving it
-  silent; and making the cap per-account, which changes dispatch for every tenant and stays
-  deferred.) When the dispatcher pauses it writes
+  silent. Making the cap per-account was rejected HERE and has since been
+  REVERSED -- see the 2026-09-22 decision below.) When the dispatcher pauses it writes
   `skip_trace:daily_cap_paused` to Redis with the resume time and a TTL of two ticks (600s),
   **refreshed on every paused tick** so it survives a long pause, and **deleted explicitly on the
   first tick that resumes dispatch** rather than waiting for the TTL. Tested both ways: it stays
@@ -69,7 +69,19 @@ inherit the previous owner's phone (probate makes this likely: deceased owner, t
   rate limiting) reads it in the quote and in the job results summary; if Redis is unreachable the
   field is simply absent and nothing else breaks. The dialog warns before confirming, and after
   confirming the results page says lookups are paused and when they resume, instead of an endless
-  "looking". A per-account cap is deferred.
+  "looking".
+
+  **D3-b REVERSED 2026-09-22 (owner): the per-account daily cap is NO LONGER deferred and
+  moves into Phase 1b-1.** The reasoning that deferred it assumed the cap would rarely bind.
+  The production pre-check killed that assumption: 100,548 addressable leads against a GLOBAL
+  `SKIP_TRACE_DAILY_ROW_CAP` of 1000/day means ONE customer's 2000-lead action consumes two
+  full days of dispatch capacity for EVERY tenant. Waiting behind the cap is the normal case
+  for a large action, not an edge case. It lands in 1b-1 because 1b-1 touches no money, and
+  because once 1c puts the button in front of customers the first large action starves every
+  other tenant -- a support incident rather than a bug that can be fixed quietly. Note 15-11
+  when building it: the existing global cap is SOFT (checked outside the advisory lock, so
+  concurrent ticks can both pass it), so the per-account cap must not be described to the
+  user as a hard limit unless it is made one.
 
 ## Phase 1a - reuse correctness
 
@@ -434,7 +446,8 @@ sizing  not_attempted WITH a property address       : 100,548
   Waiting behind the cap is therefore the NORMAL case for a large action, not an edge case,
   which is why 15-15 (a `claimed` action may wait indefinitely) and 15-10 (an honest resume
   time) are load-bearing. **A per-account cap stops being safely deferrable the moment this
-  ships to more than one active tenant** - flag to the owner, do not silently absorb.
+  ships to more than one active tenant** - flagged to the owner 2026-09-22, who moved it into
+  Phase 1b-1 (D3-b above). Not silently absorbed.
 
 ### Agreed split (owner, 2026-09-20): 1b lands as THREE PRs, not one
 
@@ -447,7 +460,8 @@ CLAUDE.md caps a phase at 5 files, and the reconciled 1b spans the live paid pat
   `results.last_trace_outcome` (15-3) is deliberately NOT here: its only consumer is the quote,
   so it lands at the head of 1b-1 as migration 100, keeping 1b-0 inside the 5-file rule and on
   one subject - making the existing path safe for a unique index.
-- **1b-1 read path (touches no money):** `results.last_trace_outcome` (15-3),
+- **1b-1 read path (touches no money):** the **per-account daily cap** (D3-b, moved here by
+  owner decision 2026-09-22), `results.last_trace_outcome` (15-3),
   `contact_lookup_actions` /
   `contact_lookup_action_results` / `contact_lookup_action_events` with grants + policies +
   both RLS scripts (15-8), `UNIQUE (id,user_id)` built concurrently (15-9), the disposition
@@ -726,7 +740,7 @@ CLAUDE.md caps a phase at 5 files, and the reconciled 1b spans the live paid pat
       is a friendly 503 and nothing is queued.
 
 ## Deferred (logged, not in Phase 1)
-Lookup ledger (Phase 2), canonical leads (Phase 3), per-account daily cap, DNC flag is never set
+Lookup ledger (Phase 2), canonical leads (Phase 3), DNC flag is never set
 and exports suppress nothing, advanced = 2 credits vs 1 billed row (the D2 follow-up; the gap is
 recorded per action so it can be priced later), re-send email, stale R2 object and batch combined
 export, per-row checkboxes.

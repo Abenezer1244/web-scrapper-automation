@@ -17,6 +17,7 @@ import uuid
 import pytest
 import redis as sync_redis
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 
 from src.api.lead_actionability import DELIVERY_EXCLUDED_KEY, OVER_QUOTA
 from src.db.models import Job, PendingSkipTraceRow, Result, ScraperConfig, User
@@ -77,10 +78,20 @@ async def _status(db, table: str, row_id: str) -> str:
 
 
 def _sweep() -> int:
+    """Run the sweep the way the dispatcher tick now does.
+
+    `_cancel_undeliverable_queued` no longer commits (Codex round 15, finding
+    15-5): the caller owns the transaction, so that Phase 1b-2 can write the
+    contact-lookup-action disposition and its audit event in the SAME one. This
+    helper therefore commits, exactly like the real caller in
+    dispatch_pending_skip_trace.
+    """
     from src.db.session import system_sync_session
 
     with system_sync_session() as s:
-        return dispatcher._cancel_undeliverable_queued(s)
+        swept = dispatcher._cancel_undeliverable_queued(s)
+        s.commit()
+        return swept
 
 
 class TestCancelSweep:
@@ -153,14 +164,187 @@ class TestCancelSweep:
         assert await _status(db, "pending_skip_trace_rows", row) == "submitting"
         assert await _status(db, "results", lead) == "submitted"
 
-    async def test_a_lead_another_active_row_still_references_keeps_its_status(self, db, business_user):
+    async def test_the_sweep_keeps_a_lead_another_active_row_still_references(
+        self, db, business_user,
+    ):
+        """Direct coverage for the sweep's NOT EXISTS guard.
+
+        Migration 100 normally makes two active rows for one lead impossible, so
+        this reaches the guard by dropping the index for the duration. That is
+        worth doing rather than deleting the coverage: the claim deliberately
+        FAILS OPEN for the scrape path when 100 is missing, so in exactly the
+        situation where duplicates can occur, this guard is what stops a lead
+        being released back to 'not_attempted' while a row of it is still live.
+        """
+        from src.workers.skip_trace_claim import INDEX_NAME
+
         job = await _job(db, business_user, "failed")
         lead = await _lead(db, business_user, job)
         queued = await _pending(db, business_user, job, lead)
-        await _pending(db, business_user, job, lead, status="submitting")
+
+        # The sweep runs in its OWN session, so this DDL has to be committed for
+        # it to be visible -- which means it must be put back explicitly or every
+        # later test in this database silently runs unenforced.
+        await db.execute(text(f"DROP INDEX {INDEX_NAME}"))
+        await db.commit()
+        try:
+            await db.execute(text(
+                "INSERT INTO pending_skip_trace_rows "
+                "(id, job_id, result_id, user_id, property_address, city, state, zip, "
+                " first_name, last_name, trace_type, status) "
+                "VALUES (gen_random_uuid(), CAST(:j AS uuid), CAST(:r AS uuid), "
+                "        CAST(:u AS uuid), '1 MAIN ST', 'EVERETT', 'WA', '98201', "
+                "        'JANE', 'DOE', 'normal', 'submitting')"
+            ), {"j": job, "r": lead, "u": business_user.id})
+            await db.commit()
+
+            _sweep()
+
+            # The queued row is withdrawn, but the lead is NOT released: the
+            # 'submitting' row may already be at Tracerfy and charged for.
+            assert await _status(db, "pending_skip_trace_rows", queued) == "cancelled"
+            assert await _status(db, "results", lead) == "queued"
+        finally:
+            # Clear this lead's rows first: if an assertion above failed, two
+            # active rows may still exist and the unique index could not be
+            # rebuilt, which would leave every later test running unenforced.
+            await db.execute(text(
+                "DELETE FROM pending_skip_trace_rows WHERE result_id = CAST(:r AS uuid)"
+            ), {"r": lead})
+            await db.execute(text(
+                f"CREATE UNIQUE INDEX {INDEX_NAME} ON pending_skip_trace_rows "
+                "(result_id) WHERE status IN ('queued','submitting','submitted')"
+            ))
+            await db.commit()
+
+    async def test_a_duplicated_lead_is_not_submitted_while_100_is_unenforced(
+        self, db, business_user, tracerfy,
+    ):
+        """The dispatcher is what SPENDS money, so it gets its own guard.
+
+        Migration 100 stops a lead holding two active claims, and the claim path
+        refuses to write without it. But 100 ABORTS precisely when duplicates
+        already exist, and start.sh boots the worker anyway, so the dispatcher
+        would drain both rows of a duplicate pair and charge for one lead twice.
+        With the invariant off it holds those leads back instead, and submits
+        everything else rather than halting every tenant over a condition most
+        are not in.
+        """
+        from src.workers.skip_trace_claim import INDEX_NAME
+
+        job = await _job(db, business_user, "done")
+        dup_lead = await _lead(db, business_user, job)
+        ok_lead = await _lead(db, business_user, job)
+        ok_row = await _pending(db, business_user, job, ok_lead)
+
+        await db.execute(text(f"DROP INDEX {INDEX_NAME}"))
+        await db.commit()
+        try:
+            # Two ACTIVE rows for one lead: only possible with 100 absent.
+            dup_row = await _pending(db, business_user, job, dup_lead)
+            await _pending(db, business_user, job, dup_lead, status="submitted")
+            await db.commit()
+
+            dispatcher.dispatch_pending_skip_trace()
+
+            # Asserted on the QUEUE, not on what the stub recorded: the row
+            # leaving 'queued' is what commits us to paying for it, and the
+            # dispatcher stamps that before it ever contacts the vendor.
+            assert await _status(db, "pending_skip_trace_rows", dup_row) == "queued", (
+                "a lead with two active rows advanced toward submission and would "
+                "be charged twice"
+            )
+            # The unaffected lead must not be collateral: it is neither held back
+            # by name nor cancelled. That it SUBMITS normally is covered by the
+            # dispatcher's own suites, which run with the index in place; this
+            # test is about what happens when the invariant is off.
+            assert await _status(db, "pending_skip_trace_rows", ok_row) in (
+                "queued", "submitting", "submitted"
+            ), "an unrelated lead was cancelled by the duplicate guard"
+        finally:
+            await db.execute(text(
+                "DELETE FROM pending_skip_trace_rows WHERE result_id = CAST(:r AS uuid)"
+            ), {"r": dup_lead})
+            await db.execute(text(
+                f"CREATE UNIQUE INDEX {INDEX_NAME} ON pending_skip_trace_rows "
+                "(result_id) WHERE status IN ('queued','submitting','submitted')"
+            ))
+            await db.commit()
+
+    async def test_the_sweep_does_not_commit_its_own_work(self, db, business_user):
+        """Transaction ownership, proved rather than asserted.
+
+        `_cancel_undeliverable_queued` used to commit internally, which would
+        make it impossible for Phase 1b-2 to write the contact-lookup-action
+        disposition and the audit event in the SAME transaction as the
+        cancellation -- a crash between the two would leave an action reading
+        "still looking" forever while the queue row was already gone. This test
+        fails if the internal commit ever comes back.
+        """
+        from src.db.session import system_sync_session
+
+        job = await _job(db, business_user, "failed")
+        lead = await _lead(db, business_user, job)
+        row = await _pending(db, business_user, job, lead)
+
+        with system_sync_session() as s:
+            assert dispatcher._cancel_undeliverable_queued(s) == 1
+            s.rollback()
+
+        assert await _status(db, "pending_skip_trace_rows", row) == "queued"
+        assert await _status(db, "results", lead) == "queued"
+
+    async def test_a_failing_sweep_is_reported_as_None_to_the_compliance_gate(
+        self, db, business_user, monkeypatch,
+    ):
+        """The tick skips entirely when the sweep fails while the ATIP paid
+        switch is off, so `swept is None` has to survive the move of the
+        try/except from the helper to its caller."""
+        from src.config import settings
+
+        # The tick returns {'skipped': 'disabled'} before it ever reaches the
+        # sweep unless skip trace is on, which would make this assertion vacuous.
+        monkeypatch.setattr(settings, "SKIP_TRACE_ENABLED", True)
+        monkeypatch.setattr(settings, "TRACERFY_API_TOKEN", "test-token-not-real")
+        monkeypatch.setattr(settings, "PIERCE_CV_OWNER_SKIP_TRACE_ENABLED", False)
+
+        def _boom(_db):
+            raise RuntimeError("sweep exploded")
+
+        monkeypatch.setattr(dispatcher, "_cancel_undeliverable_queued", _boom)
+        result = dispatcher.dispatch_pending_skip_trace()
+        assert result.get("deferred") == "sweep_failed"
+
+    async def test_a_lead_can_no_longer_have_two_active_rows(self, db, business_user):
+        """This replaces `test_a_lead_another_active_row_still_references_keeps_its_status`.
+
+        That test seeded one lead with BOTH a 'queued' and a 'submitting' pending
+        row and asserted the sweep left the lead alone, because the sweep's
+        second statement releases a lead only when no other ACTIVE row still
+        references it. Migration 100 makes that state impossible: a partial
+        unique index on pending_skip_trace_rows(result_id) for active rows now
+        refuses the second one outright, which is a stronger guarantee than
+        handling it afterwards. Production carried 0 such groups across 941
+        pending rows when this was verified, so nothing legitimate is being
+        forbidden -- the enqueue only ever picks up leads reading
+        'not_attempted', and it stamps 'queued' as it claims them.
+
+        The sweep's NOT EXISTS guard is deliberately KEPT as defence in depth;
+        it is simply no longer reachable by way of a duplicate active row.
+        """
+        job = await _job(db, business_user, "failed")
+        lead = await _lead(db, business_user, job)
+        queued = await _pending(db, business_user, job, lead)
+
+        with pytest.raises(IntegrityError):
+            await _pending(db, business_user, job, lead, status="submitting")
+        await db.rollback()
+
+        # And the ordinary path still holds: cancelling a lead's only active row
+        # releases the lead back to 'not_attempted' for a later run.
         _sweep()
         assert await _status(db, "pending_skip_trace_rows", queued) == "cancelled"
-        assert await _status(db, "results", lead) == "queued"
+        assert await _status(db, "results", lead) == "not_attempted"
 
 
 @pytest.fixture

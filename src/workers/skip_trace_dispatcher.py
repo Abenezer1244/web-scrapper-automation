@@ -45,6 +45,7 @@ def dispatch_pending_skip_trace() -> dict:
         return {"skipped": "no_token"}
 
     from sqlalchemy import and_, func, select, text, update
+    from sqlalchemy import true as sa_true
 
     from src.api.lead_actionability import DELIVERY_EXCLUDED_KEY, OVER_QUOTA
     from src.api.results_category import skip_trace_eligible_condition
@@ -121,6 +122,54 @@ def dispatch_pending_skip_trace() -> dict:
     # trace_type, not by user). This is a legitimate cross-tenant
     # system operation.
     with system_sync_session() as db:
+        # DEFENCE IN DEPTH FOR THE DOUBLE CHARGE (Security Master Review pass 10).
+        #
+        # Migration 100's unique index is what stops one lead holding two active
+        # claims, and the claim path refuses to write without it. But this
+        # dispatcher is what SPENDS money, and it drains rows that already exist.
+        # If 100 ever aborts -- which happens precisely when duplicates are
+        # already present -- start.sh still boots the worker, and the dispatcher
+        # would submit both rows of a duplicate pair and charge the customer
+        # twice for one lead.
+        #
+        # So when the invariant is unenforced, say so loudly and skip exactly the
+        # leads that are duplicated, rather than halting every tenant's lookups
+        # over a condition most of them are not in. When it IS enforced, which is
+        # the normal case, this costs one catalog read and nothing else.
+        _duplicated_result_ids: set[str] = set()
+        from src.workers.skip_trace_claim import warn_if_unenforced
+
+        if not warn_if_unenforced(db):
+            _duplicated_result_ids = {
+                str(r) for r in db.execute(text(
+                    "SELECT result_id FROM pending_skip_trace_rows "
+                    "WHERE status IN ('queued','submitting','submitted') "
+                    "GROUP BY result_id HAVING count(*) > 1"
+                )).scalars()
+            }
+            if _duplicated_result_ids:
+                _logger.error(
+                    "Dispatcher: %d lead(s) hold more than one ACTIVE pending row "
+                    "while migration 100 is not enforced. They are NOT being "
+                    "submitted, because doing so would charge for the same lead "
+                    "twice. Reconcile them and apply 100.",
+                    len(_duplicated_result_ids),
+                )
+                try:
+                    from src.workers.ops_alerts import send_ops_alert
+
+                    send_ops_alert(
+                        "skip_trace_duplicate_active_rows", "dispatcher",
+                        "Duplicate active skip-trace rows while 100 is unenforced",
+                        f"{len(_duplicated_result_ids)} lead(s) hold more than one "
+                        f"active pending row and migration 100's unique index is "
+                        f"missing or invalid. Those leads are held back rather than "
+                        f"submitted, so nothing is double charged, but they will not "
+                        f"be looked up until this is reconciled and 100 applied.",
+                    )
+                except Exception:  # noqa: BLE001 - an alert must not stop the tick
+                    _logger.exception("skip-trace duplicate-rows alert failed to send")
+
         # Resolve anything stuck mid-submission from a previous tick BEFORE
         # draining new work: a released claim rejoins the FIFO head below and
         # goes out in this same tick instead of waiting another five minutes.
@@ -128,7 +177,21 @@ def dispatch_pending_skip_trace() -> dict:
         # Never pay for a lead that will not be delivered: cancel queued rows whose
         # job failed or was cancelled, or whose lead is over quota, a same-run sibling,
         # or no longer waiting on a trace.
-        swept = _cancel_undeliverable_queued(db)
+        # The sweep no longer commits or swallows its own failure (15-5): the
+        # transaction boundary lives here, at the caller, which is what lets
+        # Phase 1b-2 add the action-disposition and audit writes to this SAME
+        # transaction. `swept is None` keeps its existing meaning of "the sweep
+        # failed", which the compliance gate immediately below depends on.
+        swept: int | None
+        try:
+            swept = _cancel_undeliverable_queued(db)
+            db.commit()
+            if swept:
+                _logger.info("Dispatcher: cancelled %d undeliverable queued row(s)", swept)
+        except Exception as exc:  # noqa: BLE001 - never break the submit loop
+            db.rollback()
+            _logger.warning("Dispatcher: cancel sweep failed: %s", str(exc)[:160])
+            swept = None
         # The sweep is best-effort for the deliverability rules (a failed tick retries in
         # five minutes), but it is also where a Tacoma row enqueued before the paid switch
         # was turned off is withdrawn. While that switch is off, a failed sweep must stop
@@ -188,6 +251,11 @@ def dispatch_pending_skip_trace() -> dict:
                             and_(
                                 PendingSkipTraceRow.status == "queued",
                                 PendingSkipTraceRow.trace_type == trace_type,
+                                # Empty in the normal case (100 enforced), so this
+                                # is a no-op unless the invariant is actually off.
+                                PendingSkipTraceRow.result_id.notin_(
+                                    _duplicated_result_ids
+                                ) if _duplicated_result_ids else sa_true(),
                                 text(_job_delivered_sql("jobs")).bindparams(
                                     since=BILLING_STAMP_RELIABLE_SINCE),
                                 Result.skip_trace_status == "queued",
@@ -476,9 +544,17 @@ def _atip_paid_allowed_sql():
     )
 
 
-def _cancel_undeliverable_queued(db) -> int | None:
-    """Cancel queued rows that must never be paid for. Returns rows cancelled, or None
-    when the sweep itself failed (the caller decides what that means for the tick).
+def _cancel_undeliverable_queued(db) -> int:
+    """Cancel queued rows that must never be paid for. Returns rows cancelled.
+
+    DOES NOT COMMIT, and does not swallow its own failure: it raises, and the
+    caller owns both the transaction and what a failure means for the tick.
+    That is not tidiness (Codex round 15, finding 15-5). From Phase 1b-2 a
+    cancelled row must also move its contact-lookup-action disposition to
+    'released' and append its audit event IN THE SAME TRANSACTION -- otherwise a
+    crash between the two leaves an action reading "still looking" forever while
+    the queue row is already gone, or an audit that disagrees with the queue.
+    A helper that commits underneath its caller makes that atomicity impossible.
 
     A queued row is cancelled when its job ended failed/cancelled without billing
     (and after billing was stamped, see _job_undelivered_sql), or its lead is
@@ -491,7 +567,7 @@ def _cancel_undeliverable_queued(db) -> int | None:
     and no other active row still references it, so a later run can trace it if
     it becomes deliverable. Two statements, not one: a single statement's
     NOT EXISTS would still see the rows it is cancelling as 'queued'. Both are
-    tenant-pinned (system session). Commits; best-effort, never breaks the tick.
+    tenant-pinned (system session).
     """
     from sqlalchemy import text
 
@@ -500,56 +576,48 @@ def _cancel_undeliverable_queued(db) -> int | None:
     from src.scrapers.enrichment.pierce_atip_owner import OWNER_SOURCE as PIERCE_OWNER_SOURCE
     from src.workers.tasks_helpers.dedup import BILLING_STAMP_RELIABLE_SINCE
 
-    try:
-        cancelled = db.execute(
+    cancelled = db.execute(
+        text(
+            "UPDATE pending_skip_trace_rows p SET status = 'cancelled' "  # noqa: S608 — fixed literals + bound params only
+            "FROM jobs j, results r "
+            "WHERE p.status = 'queued' "
+            "  AND j.id = p.job_id AND j.user_id = p.user_id "
+            "  AND r.id = p.result_id AND r.user_id = p.user_id "
+            f"  AND ({_job_undelivered_sql('j')} "
+            f"       OR NOT {skip_trace_eligible_sql('r')} "
+            "       OR r.skip_trace_status <> 'queued' "
+            "       OR COALESCE(r.enrichment_data->>:key, '') = :over_quota "
+            # An ATIP-named Tacoma lead while PIERCE_CV_OWNER_SKIP_TRACE_ENABLED is
+            # off: the name may be shown, not spent on. A row enqueued before the
+            # switch was turned off is withdrawn here, before the submit loop that
+            # follows. Only 'queued' rows are touched; 'submitting'/'submitted' are
+            # already at Tracerfy and belong to the reconciler (Codex).
+            "       OR (CAST(:atip_blocked AS boolean) "
+            "           AND r.enrichment_data->>'source' = 'tacoma_code_violations' "
+            "           AND r.enrichment_data->>'owner_source' = :atip_source)) "
+            "RETURNING p.result_id, p.user_id"
+        ),
+        {"key": DELIVERY_EXCLUDED_KEY, "over_quota": OVER_QUOTA,
+         "since": BILLING_STAMP_RELIABLE_SINCE,
+         "atip_blocked": not settings.PIERCE_CV_OWNER_SKIP_TRACE_ENABLED,
+         "atip_source": PIERCE_OWNER_SOURCE},
+    ).fetchall()
+    if cancelled:
+        db.execute(
             text(
-                "UPDATE pending_skip_trace_rows p SET status = 'cancelled' "  # noqa: S608 — fixed literals + bound params only
-                "FROM jobs j, results r "
-                "WHERE p.status = 'queued' "
-                "  AND j.id = p.job_id AND j.user_id = p.user_id "
-                "  AND r.id = p.result_id AND r.user_id = p.user_id "
-                f"  AND ({_job_undelivered_sql('j')} "
-                f"       OR NOT {skip_trace_eligible_sql('r')} "
-                "       OR r.skip_trace_status <> 'queued' "
-                "       OR COALESCE(r.enrichment_data->>:key, '') = :over_quota "
-                # An ATIP-named Tacoma lead while PIERCE_CV_OWNER_SKIP_TRACE_ENABLED is
-                # off: the name may be shown, not spent on. A row enqueued before the
-                # switch was turned off is withdrawn here, before the submit loop that
-                # follows. Only 'queued' rows are touched; 'submitting'/'submitted' are
-                # already at Tracerfy and belong to the reconciler (Codex).
-                "       OR (CAST(:atip_blocked AS boolean) "
-                "           AND r.enrichment_data->>'source' = 'tacoma_code_violations' "
-                "           AND r.enrichment_data->>'owner_source' = :atip_source)) "
-                "RETURNING p.result_id, p.user_id"
+                "UPDATE results r SET skip_trace_status = 'not_attempted' "
+                "FROM unnest(CAST(:rids AS uuid[]), CAST(:uids AS uuid[])) "
+                "     AS x(result_id, user_id) "
+                "WHERE r.id = x.result_id AND r.user_id = x.user_id "
+                "  AND r.skip_trace_status = 'queued' "
+                "  AND NOT EXISTS (SELECT 1 FROM pending_skip_trace_rows o "
+                "    WHERE o.result_id = r.id AND o.user_id = r.user_id "
+                "      AND o.status IN ('queued', 'submitting', 'submitted'))"
             ),
-            {"key": DELIVERY_EXCLUDED_KEY, "over_quota": OVER_QUOTA,
-             "since": BILLING_STAMP_RELIABLE_SINCE,
-             "atip_blocked": not settings.PIERCE_CV_OWNER_SKIP_TRACE_ENABLED,
-             "atip_source": PIERCE_OWNER_SOURCE},
-        ).fetchall()
-        if cancelled:
-            db.execute(
-                text(
-                    "UPDATE results r SET skip_trace_status = 'not_attempted' "
-                    "FROM unnest(CAST(:rids AS uuid[]), CAST(:uids AS uuid[])) "
-                    "     AS x(result_id, user_id) "
-                    "WHERE r.id = x.result_id AND r.user_id = x.user_id "
-                    "  AND r.skip_trace_status = 'queued' "
-                    "  AND NOT EXISTS (SELECT 1 FROM pending_skip_trace_rows o "
-                    "    WHERE o.result_id = r.id AND o.user_id = r.user_id "
-                    "      AND o.status IN ('queued', 'submitting', 'submitted'))"
-                ),
-                {"rids": [str(c.result_id) for c in cancelled],
-                 "uids": [str(c.user_id) for c in cancelled]},
-            )
-        db.commit()
-        if cancelled:
-            _logger.info("Dispatcher: cancelled %d undeliverable queued row(s)", len(cancelled))
-        return len(cancelled)
-    except Exception as exc:  # noqa: BLE001 - never break the submit loop
-        db.rollback()
-        _logger.warning("Dispatcher: cancel sweep failed: %s", str(exc)[:160])
-        return None
+            {"rids": [str(c.result_id) for c in cancelled],
+             "uids": [str(c.user_id) for c in cancelled]},
+        )
+    return len(cancelled)
 
 
 # ─── One answer, bought once ──────────────────────────────────────────────────

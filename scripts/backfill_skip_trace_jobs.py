@@ -42,10 +42,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _CREDITS = {"normal": 1, "advanced": 2}
 
 
-def _trunc(v, n):
-    return v[:n] if v and len(v) > n else v
-
-
 def _tracerfy_balance():
     """Best-effort read of the Tracerfy account credit balance. None on failure."""
     from src.config import settings
@@ -116,6 +112,11 @@ def main() -> int:
         build_pending_row_payload,
         payload_subject_key,
     )
+    from src.workers.skip_trace_claim import (
+        claim_skip_trace_rows,
+        lock_job_for_claim,
+        payload_is_writable,
+    )
 
     mode = "COMMIT (writes + enables Tracerfy spend via dispatcher)" if args.commit \
         else "DRY-RUN (no writes, no spend)"
@@ -152,22 +153,52 @@ def main() -> int:
             cfg = db.get(ScraperConfig, job.scraper_config_id)
             label = f"{getattr(cfg,'county','?')}/{getattr(cfg,'record_type','?')}"
 
+            j = {"eligible": 0, "cache_hit": 0, "enqueue_normal": 0,
+                 "enqueue_advanced": 0, "nonpersonal": 0, "already_pending": 0}
+            to_claim: list[dict] = []
+
+            # The same job-scoped advisory lock the scrape enqueue takes, so this
+            # script and a live scrape of the same job cannot interleave their
+            # read-decide-claim.
+            #
+            # Taken BEFORE the reads below, which is the whole point (Codex round
+            # 15 diff review, round 6). Reading first and locking afterwards left
+            # a window where a live scrape could claim a lead and rewrite its
+            # owner in between: this script's ORM objects would then be stale
+            # (the session runs expire_on_commit=False), and a stale cache hit
+            # would write contacts and 'hit' straight over the scrape's queued
+            # row, whose pending row could still be submitted and paid for.
+            #
+            # Transaction-scoped, released by this job's commit below, so only
+            # ONE job lock is held at a time rather than one per job for the
+            # length of the run.
+            if args.commit:
+                lock_job_for_claim(db, jid)
+
             # result_ids already queued (any status) — never double-enqueue.
+            # Tenant-pinned as well as job-pinned. The shared claim is
+            # tenant-safe, but the CACHE-HIT write above it is an ORM write that
+            # happens before the claim, so a job/result ownership inconsistency
+            # could copy one tenant's contacts onto another tenant's result.
             pending_ids = set(db.execute(
-                select(PendingSkipTraceRow.result_id)
-                .where(PendingSkipTraceRow.job_id == jid)
+                select(PendingSkipTraceRow.result_id).where(and_(
+                    PendingSkipTraceRow.job_id == jid,
+                    PendingSkipTraceRow.user_id == job.user_id,
+                ))
             ).scalars().all())
 
+            # populate_existing: this session does not expire on commit, so a
+            # Result already in the identity map from an earlier job would be
+            # returned with its stale attributes. The rows are read under the
+            # lock and must reflect what is committed right now.
             rows = db.execute(
                 select(Result).where(and_(
                     Result.job_id == jid,
+                    Result.user_id == job.user_id,
                     Result.skip_trace_status == "not_attempted",
                     Result.property_address.isnot(None),
-                ))
+                )).execution_options(populate_existing=True)
             ).scalars().all()
-
-            j = {"eligible": 0, "cache_hit": 0, "enqueue_normal": 0,
-                 "enqueue_advanced": 0, "nonpersonal": 0, "already_pending": 0}
 
             for rec in rows:
                 if rec.id in pending_ids:
@@ -206,27 +237,35 @@ def main() -> int:
                         rec.skip_trace_source = "reused"
                         rec.skip_trace_subject_hash = key
                 else:
-                    tt = payload["trace_type"]
-                    j[f"enqueue_{tt}"] += 1
-                    if args.commit:
-                        db.add(PendingSkipTraceRow(
-                            job_id=payload["job_id"],
-                            result_id=payload["result_id"],
-                            user_id=payload["user_id"],
-                            property_address=_trunc(payload["property_address"], 512),
-                            city=_trunc(payload["city"], 128),
-                            state=_trunc(payload["state"], 128),
-                            zip=_trunc(payload["zip"], 128),
-                            first_name=_trunc(payload["first_name"], 128),
-                            last_name=_trunc(payload["last_name"], 128),
-                            mail_address=_trunc(payload["mail_address"], 512),
-                            mail_city=_trunc(payload["mail_city"], 128),
-                            mail_state=_trunc(payload["mail_state"], 128),
-                            mail_zip=_trunc(payload["mail_zip"], 128),
-                            trace_type=tt,
-                            status="queued",
-                        ))
-                        rec.skip_trace_status = "queued"
+                    # Collected, not inserted here. This script used to build
+                    # PendingSkipTraceRow itself, which made it a SECOND writer
+                    # of the queue that knew nothing about the scrape enqueue:
+                    # both could read one lead as 'not_attempted' and both insert,
+                    # and with migration 099 unapplied both rows could be
+                    # submitted and charged (Codex round 15 diff review, round 5).
+                    # It also truncated `state` to 128 into a String(2) column.
+                    # Routing through the shared claim fixes both, and the claim
+                    # requires 099 to be enforced before it will write anything.
+                    to_claim.append(payload)
+
+            # Claim through the shared helper, which re-checks each lead exists,
+            # belongs to this tenant and is still 'not_attempted' inside the one
+            # statement that inserts, and withdraws any row whose lead it did not
+            # win. Counts come from what it ACTUALLY claimed, not from what we
+            # hoped to claim. In a dry run nothing is claimed, so the counts are
+            # what WOULD be attempted.
+            if to_claim:
+                if args.commit:
+                    claimed = set(claim_skip_trace_rows(db, to_claim))
+                else:
+                    # A dry run applies the SAME writability rule the real claim
+                    # would, or the credit estimate promises spend on payloads
+                    # that --commit would refuse.
+                    claimed = {str(p["result_id"]) for p in to_claim
+                               if payload_is_writable(p)}
+                for payload in to_claim:
+                    if str(payload["result_id"]) in claimed:
+                        j[f"enqueue_{payload['trace_type']}"] += 1
 
             credits = (j["enqueue_normal"] * _CREDITS["normal"]
                        + j["enqueue_advanced"] * _CREDITS["advanced"])
@@ -238,9 +277,15 @@ def main() -> int:
             for k in grand:
                 grand[k] += j[k]
 
-        if args.commit:
-            db.commit()
-        else:
+            # Commit PER JOB, which also releases this job's advisory lock
+            # before the next one is taken. Committing once at the end would
+            # hold every job's lock for the whole run, blocking live scrapes of
+            # unrelated jobs, and would make one late failure discard work
+            # already done for jobs that succeeded.
+            if args.commit:
+                db.commit()
+
+        if not args.commit:
             db.rollback()
 
     total_credits = (grand["enqueue_normal"] * _CREDITS["normal"]

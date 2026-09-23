@@ -2239,20 +2239,28 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config, *, on_begin=None) 
     the row for free; misses are queued for the dispatcher, which makes the
     actual (paid) Tracerfy calls.
 
-    ``on_begin`` is called ONCE, after every one of those gates has passed and
-    there is at least one eligible row — that is, at the first moment it is true
-    that contact lookups are going to be queued. The caller uses it to enter the
-    `queuing_contacts` stage. It lives here rather than at the call site so the
-    gates are stated once: a copy of them next to the stage write would drift,
-    and the version that drifted announced the stage for every run whose plan,
-    config or eligible-row count meant nothing would be queued at all (Codex
-    round 7).
+    ``on_begin`` is called ONCE, after every one of those gates has passed, there
+    is at least one eligible row, and at least one of those rows would actually
+    produce a lookup payload as the row reads at that moment. The caller uses it to enter the `queuing_contacts`
+    stage. It lives here rather than at the call site so the gates are stated
+    once: a copy of them next to the stage write would drift, and the version
+    that drifted announced the stage for every run whose plan, config or
+    eligible-row count meant nothing would be queued at all (Codex round 7).
+
+    It is an ANNOUNCEMENT, not a guarantee, and the difference is load-bearing.
+    It must fire before the advisory lock is taken, because the caller's stage
+    write commits and a transaction-scoped lock does not survive a commit — so
+    it cannot wait for the claim to prove itself. The gates it cannot speak for
+    are enumerated at the call site below. It is therefore correct to read this
+    as "this run is about to try", and wrong to read it as "rows were queued":
+    the pending rows themselves are the only evidence of that.
     """
     # Local imports — sa_select must be imported here because the module-
     # level import is scoped inside _run_inline_enrichment, not globally
     from sqlalchemy import select as sa_select
+    from sqlalchemy import text as _sa_text
 
-    from src.db.models import PendingSkipTraceRow, Result, SkipTraceCache
+    from src.db.models import Result, SkipTraceCache
     from src.scrapers.enrichment.skip_trace import (
         build_pending_row_payload,
         code_violation_skip_trace_allowed,
@@ -2283,6 +2291,30 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config, *, on_begin=None) 
         )
         return
 
+    # ONE ENQUEUE PER JOB AT A TIME (Codex round 15 diff review, round 4).
+    #
+    # run_scrape_job's atomic claim stops a job being double-SCRAPED, but
+    # watchdog_stuck_jobs re-queues a job that merely looks stuck, and a slow but
+    # still-living worker can then be joined by a second one. Two concurrent
+    # enqueues of the same job read the same 'not_attempted' rows and both claim
+    # them. With migration 100 applied the index refuses the second; without it
+    # (the fail-open path) both rows survive, and because owner recovery can
+    # rewrite party_name between the two reads they may carry DIFFERENT
+    # trace_types -- which the dispatcher's submission-collision key does not
+    # collapse, so both get submitted and the customer is charged twice.
+    #
+    # A transaction-scoped advisory lock on the job id serializes the whole
+    # read-decide-claim, so the second enqueue sees the rows already 'queued' and
+    # claims nothing. Transaction-scoped: released by the commit below, and by a
+    # rollback, so a crash cannot hold it. Keyed on the job, so jobs never wait
+    # on each other.
+    #
+    # Taken BELOW rather than here, deliberately: the charged-unanswered branch
+    # commits mid-function, and a transaction-scoped lock taken before it would
+    # be released by that commit and cover nothing that matters. It is acquired
+    # immediately before the cache-and-claim loop, which runs to the final commit
+    # with no commit in between.
+
     # Reload the surviving results after the unactionable drop. Eligible: the rows this
     # run delivers, AND the rows an earlier run of this account already delivered.
     # Delivered and traced are separate facts: a lead delivered with skip trace off
@@ -2293,8 +2325,6 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config, *, on_begin=None) 
     # nothing reusable; the cache check below is the second chance before paying.
     # Same-run siblings (e.g. the trustee_sale collapse) stay out: another row of this
     # run is the same property and is the one traced (Codex).
-    from sqlalchemy import text as _sa_text
-
     from src.api.lead_actionability import actionable_condition
     from src.api.results_category import skip_trace_eligible_condition
 
@@ -2318,8 +2348,18 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config, *, on_begin=None) 
     # already-delivered lead is settled as 'errored' (what its earlier row already
     # shows); past it, it is asked again like any stale lead. A transport failure or a
     # pre-submit rejection leaves no 'unmatched' row, so it IS retried (Codex).
-    delivered_before = [rec for rec in eligible if rec.is_duplicate and rec.dedup_hash]
-    if delivered_before:
+    def _settle_charged_unanswered(rows: list) -> tuple[list, int]:
+        """Drop and settle leads whose earlier lookup was charged but unmatched.
+
+        Factored out because it has to run TWICE (Security Master Review pass 4):
+        once here, and again under the job lock. The dispatcher and ingest do not
+        take that lock, so a row can become 'unmatched' -- charged, with no answer
+        -- between this pass and the claim, and buying it again is a second
+        charge for a question the vendor already failed to answer.
+        """
+        delivered_before = [rec for rec in rows if rec.is_duplicate and rec.dedup_hash]
+        if not delivered_before:
+            return rows, 0
         charged_unanswered = set(db.execute(
             _sa_text(
                 "SELECT DISTINCT r.dedup_hash FROM pending_skip_trace_rows p "
@@ -2332,21 +2372,25 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config, *, on_begin=None) 
             {"uid": str(job.user_id), "ttl": int(settings.SKIP_TRACE_CACHE_DAYS),
              "hashes": sorted({rec.dedup_hash for rec in delivered_before})},
         ).scalars())
-        if charged_unanswered:
-            settled = [rec for rec in delivered_before if rec.dedup_hash in charged_unanswered]
-            for rec in settled:
-                rec.skip_trace_status = "errored"
-                rec.skip_trace_attempted_at = _now()
-            settled_ids = {rec.id for rec in settled}
-            eligible = [rec for rec in eligible if rec.id not in settled_ids]
-            # Committed here: `if not eligible: return` below would otherwise drop it.
-            db.commit()
-            _publish_log(
-                r, job_id, "info",
-                f"Skip trace not repeated for {len(settled)} already delivered lead(s): an "
-                "earlier lookup was charged but could not be matched to the lead",
-                db=db,
-            )
+        if not charged_unanswered:
+            return rows, 0
+        settled = [rec for rec in delivered_before if rec.dedup_hash in charged_unanswered]
+        for rec in settled:
+            rec.skip_trace_status = "errored"
+            rec.skip_trace_attempted_at = _now()
+        settled_ids = {rec.id for rec in settled}
+        return [rec for rec in rows if rec.id not in settled_ids], len(settled)
+
+    eligible, _settled_n = _settle_charged_unanswered(eligible)
+    if _settled_n:
+        # Committed here: `if not eligible: return` below would otherwise drop it.
+        db.commit()
+        _publish_log(
+            r, job_id, "info",
+            f"Skip trace not repeated for {_settled_n} already delivered lead(s): an "
+            "earlier lookup was charged but could not be matched to the lead",
+            db=db,
+        )
 
     # A PLACEHOLDER street is not an address, and skip trace bills per lookup.
     # Worse than the money: the cache key hashes the ADDRESS (along with the owner
@@ -2387,12 +2431,66 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config, *, on_begin=None) 
     if not eligible:
         return
 
-    # Contact lookups ARE going to be queued. Safe to commit on its own here for
-    # the same reason the caller's write was: everything before this point either
-    # committed itself or was read-only, so this commits nothing but the stage,
-    # and it must not stay pending — an open UPDATE holds a lock on the jobs row,
-    # which is the row Cancel Run writes.
-    if on_begin is not None:
+    # Contact lookups are about to be ATTEMPTED — not necessarily queued; the
+    # exceptions are listed at the end of this comment. Safe to commit on its own
+    # here for the same reason the caller's write was: everything before this
+    # point either committed itself or was read-only, so this commits nothing but
+    # the stage, and it must not stay pending — an open UPDATE holds a lock on
+    # the jobs row, which is the row Cancel Run writes.
+    #
+    # It fires HERE, before the lock below, and it has to: `_set_stage` COMMITS,
+    # and a transaction-scoped advisory lock is released by any commit. Moving
+    # this announcement below the lock to make it more accurate would release the
+    # lock the claim depends on — a P2 traded for a P1.
+    #
+    # That places it before the per-row gates, so this pre-check stands in for
+    # them. The case it exists for is a run whose every party_name is a case
+    # DESCRIPTION rather than a person ("Weeds ? 1819 HARVARD AVE", the shape
+    # code-violation scrapers write): every payload is then None, and the run
+    # announces "queuing contact lookups" and queues nothing, every time. That
+    # is the same false label Codex round 7 removed from the call site,
+    # reintroduced from below instead of above.
+    #
+    # NOTE, because the obvious guess is wrong: a lead with NO party_name is not
+    # this case. It still queues, as an address-only advanced trace, so a
+    # missing name announces truthfully. `build_pending_row_payload` is the
+    # authority on what will not queue, which is why the check calls it rather
+    # than re-deriving the rule — and it already applies the ATIP policy gate
+    # internally, so naming that gate again here would only invite it to drift.
+    # It reads the row and process settings only: no query, no I/O and no
+    # mutation of the Result (it returns a fresh dict), so asking it early is
+    # safe, but it is NOT a pure function of the row alone — `code_violation_
+    # skip_trace_allowed` reads a global flag, and API and worker carry separate
+    # env (15-14). `any()` stops at the first lead that would produce a payload,
+    # so the common case parses one row and only an all-rejected run scans the
+    # set, which is exactly the run this exists to catch. This check therefore
+    # PARSES A ROW TWICE — once here and once in the loop below — and that
+    # second parse is deliberate, not an oversight to be optimised away later.
+    # Carrying these payloads down into the loop would remove it, and must not:
+    # the loop re-reads its rows under the lock with populate_existing, so a
+    # payload computed from the pre-lock row would reintroduce the
+    # stale-subject class of bug that 14-B exists to prevent. Paying the parse
+    # twice is the cost of the loop staying authoritative. This check can only
+    # ever SUPPRESS an announcement, never authorise a claim.
+    #
+    # Two ways it is still not the truth, both accepted, neither costing money:
+    #  * It can OVERSTATE. Every lead may turn out to be a cache hit (free
+    #    reuse, nothing queued, but knowing needs a DB read per lead); the
+    #    post-lock re-read or `_settle_charged_unanswered` may empty the set
+    #    concurrently; or the fail-closed `ClaimUnenforcedError` may fire when
+    #    migration 100 is absent. Each is either real work for the customer or a
+    #    genuinely rare race, not a run that was never going to queue anything.
+    #  * It can UNDERSTATE, and this one is a real race (Codex): owner recovery
+    #    rewrites `party_name` for these same rows, so a lead that had no
+    #    payload here can have one by the time the post-lock re-read refreshes
+    #    it, and the run then queues without ever announcing the stage. A
+    #    missing label is strictly better than the false one it replaces, and
+    #    the pending rows — never this callback — are the evidence of what was
+    #    queued. Fixing it properly means announcing after the claim, which the
+    #    commit rule above forbids.
+    if on_begin is not None and any(
+        build_pending_row_payload(rec) is not None for rec in eligible
+    ):
         on_begin()
 
     cache_hits = 0
@@ -2404,8 +2502,93 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config, *, on_begin=None) 
     # warning `address_cache_key` now logs if anything still reads a legacy key.
     _v2_key_reads = 0
 
+    # ONE ENQUEUE PER JOB AT A TIME (Codex round 15 diff review, rounds 4-5).
+    #
+    # run_scrape_job's atomic claim stops a job being double-SCRAPED, but
+    # watchdog_stuck_jobs re-queues a job that merely looks stuck, and a slow but
+    # still-living worker can then be joined by a second one. Two concurrent
+    # enqueues of the same job read the same 'not_attempted' rows and both claim
+    # them. With migration 100 applied the index refuses the second; without it
+    # (the scrape's fail-open path) both rows can survive, and because owner
+    # recovery can rewrite party_name between the two reads they may carry
+    # DIFFERENT trace_types -- which the dispatcher's submission-collision key
+    # does not collapse, so both are submitted and the customer is charged twice.
+    #
+    # Acquired HERE, not at the top of the function: the charged-unanswered
+    # branch above commits, and a transaction-scoped lock taken before it would
+    # have been released by that commit. From this point to the final commit
+    # there is no commit, so the lock genuinely spans the read-decide-claim.
+    # Transaction-scoped, so both a commit and a rollback release it and a crash
+    # cannot hold it. Keyed on the job, so jobs never wait on each other.
+    from src.workers.skip_trace_claim import lock_job_for_claim
+
+    lock_job_for_claim(db, job_id)
+    # Re-read the leads under the lock. The set read before it is stale by now:
+    # a concurrent enqueue may have claimed some of them, and the claim's own
+    # join would drop those anyway, but re-reading keeps the cache-hit path from
+    # copying an answer onto a row another writer already owns.
+    # populate_existing: these Result objects are already in the identity map
+    # from the read above, so without it SQLAlchemy returns the SAME instances
+    # with their stale attributes. The WHERE clause would still filter correctly
+    # (it runs in the database), but the cache-hit path below reads and writes
+    # these objects, and it must see what is committed right now.
+    #
+    # It repeats EVERY predicate of the first read, not just the status. A lead
+    # can become over quota, undeliverable or a superseded duplicate between the
+    # two reads, and re-checking only 'not_attempted' would queue and pay for it
+    # anyway. Narrowing by id is not a substitute: those ids qualified when they
+    # were read, which is exactly the thing that may have changed.
+    eligible = list(db.execute(
+        sa_select(Result).where(
+            Result.id.in_([rec.id for rec in eligible]),
+            Result.user_id == job.user_id,
+            Result.property_address.isnot(None),
+            actionable_condition(),
+            Result.skip_trace_status == "not_attempted",
+            skip_trace_eligible_condition(),
+        ).execution_options(populate_existing=True)
+    ).scalars().all())
+    # The two PYTHON filters above ran on the pre-lock objects, so their verdicts
+    # are as stale as the rows were. Re-apply them to the refreshed ones: a lead
+    # whose address became a placeholder, or whose code-violation case the city
+    # settled, between the two reads would otherwise keep a verdict of "eligible"
+    # that is no longer true and be paid for. Re-running is free (both are pure
+    # functions of the row) and it cannot ADD anything, because `eligible` is
+    # already bounded by the ids that survived the first pass. No second log
+    # line: the counts were reported above and this only ever removes stragglers.
+    eligible = [rec for rec in eligible
+                if not street_is_placeholder(rec.property_address)]
+    if config.record_type == "code_violation":
+        eligible = [rec for rec in eligible
+                    if not _is_settled_complaint(rec.enrichment_data)]
+    # And the charged-unanswered rule, again, for the same reason. The first pass
+    # ran before the lock and had to commit (its log line commits), so the
+    # dispatcher or ingest can have marked one of these leads 'unmatched' since:
+    # charged, unanswered, and about to be bought a second time. No log line
+    # here, because logging commits and that would release the lock; the count
+    # is reported after the final commit below.
+    eligible, _late_settled = _settle_charged_unanswered(eligible)
+    if not eligible:
+        # The settles above are real writes and must not be dropped by returning.
+        db.commit()
+        if _late_settled:
+            # Reported HERE as well as at the end: this early return is the path
+            # where the late pass settled every remaining lead, and it is exactly
+            # the case worth telling the customer about.
+            _publish_log(
+                r, job_id, "info",
+                f"Skip trace not repeated for {_late_settled} further already "
+                "delivered lead(s): an earlier lookup was charged but could not be "
+                "matched to the lead",
+                db=db,
+            )
+        return
+
     skipped_ineligible = 0
     skipped_atip_policy = 0
+    # Payloads for leads with no usable cached answer, claimed in one statement
+    # after the loop rather than added row by row inside it.
+    to_claim: list[dict] = []
     for rec in eligible:
         # An ATIP-named Tacoma owner may be shown, not spent on: counted and reported on
         # its own line, never as "no traceable owner name", which would send whoever
@@ -2469,58 +2652,132 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config, *, on_begin=None) 
             rec.skip_trace_subject_hash = cache_key
             cache_hits += 1
         else:
-            # Enqueue for the dispatcher. Truncate string fields to fit
-            # VARCHAR(128) — code violation descriptions can be 250+ chars
-            # and crash the INSERT with StringDataRightTruncation, which
-            # poisons the session with PendingRollbackError and hangs the job.
-            def _trunc128(v: str | None) -> str | None:
-                return v[:128] if v and len(v) > 128 else v
+            # Collected, not inserted here. The claim is ONE set-based statement
+            # after the loop (see below) so that a conflict is a row-level
+            # no-op instead of a batch-level failure. Truncation to the column
+            # widths now lives in claim_skip_trace_rows, beside the insert it
+            # protects and beside the widths lookup_subject_key hashes against,
+            # so the cache read and the queue write cannot diverge.
+            to_claim.append(payload)
 
-            # property_address + mail_address columns are VARCHAR(512); truncating
-            # them to 128 (a) corrupts the skip-trace cache key (the read path in
-            # _enqueue hashes the FULL Result.property_address, so a 128-truncated
-            # write key would never match -> re-paid traces) and (b) drops real
-            # mailing data sent to Tracerfy. Truncate to the actual column width.
-            def _trunc512(v: str | None) -> str | None:
-                return v[:512] if v and len(v) > 512 else v
+    # THE CLAIM (Codex round 15, finding 15-1). This used to be db.add() per row
+    # plus `rec.skip_trace_status = 'queued'`, flushed at one commit() whose
+    # handler was `except Exception: db.rollback(); db.commit()`. Migration 100
+    # adds a partial unique index on pending_skip_trace_rows(result_id) for
+    # active rows, and under that index a single conflicting row -- which the
+    # Phase 1b "look up contacts" action can now cause by claiming the same lead
+    # concurrently -- would have raised IntegrityError at that commit, rolled
+    # back THE WHOLE JOB'S enqueue (every pending row and every results update)
+    # and then committed an empty transaction. Silent, total, unreported loss.
+    #
+    # The shared helper instead reports exactly which leads it won, and advances
+    # `results` for those and only those. A lost race claims nothing and strands
+    # nothing. It deliberately does not commit: the transaction stays ours, which
+    # is what lets the action worker later write its dispositions in the same one.
+    claimed_ids: list[str] = []
+    if to_claim:
+        from src.workers.skip_trace_claim import (
+            ClaimUnenforcedError,
+            claim_skip_trace_rows,
+        )
 
+        # Fails closed if migration 100's index is absent: the leads stay
+        # 'not_attempted' and are claimed by the next run once the migration
+        # lands. That is a pause; proceeding unenforced would risk charging a
+        # customer twice for one lead, which trying again later cannot undo.
+        #
+        # Caught HERE rather than left to tasks.py (Security Master Review pass
+        # 2). tasks.py rolls the whole enqueue transaction back, which would
+        # also discard the cache hits copied above -- contacts this account
+        # ALREADY PAID FOR, free to reuse, and silently missing from the
+        # delivered export. Swallowing the claim but keeping the hits means the
+        # paid work survives and only the unbought lookups wait.
+        try:
+            claimed_ids = claim_skip_trace_rows(db, to_claim)
+        except ClaimUnenforcedError as exc:
+            _logger.error("Job %s skip trace claim refused: %s", job_id, exc)
+            # PAGE someone. Swallowing this keeps the job healthy, which is the
+            # point, but it also means the paid lookup pipeline can sit paused
+            # indefinitely while every worker looks fine. The alert is the only
+            # thing that makes the pause visible.
             try:
-                pending = PendingSkipTraceRow(
-                    job_id=payload["job_id"],
-                    result_id=payload["result_id"],
-                    user_id=payload["user_id"],
-                    property_address=_trunc512(payload["property_address"]),
-                    city=_trunc128(payload["city"]),
-                    state=_trunc128(payload["state"]),
-                    zip=_trunc128(payload["zip"]),
-                    first_name=_trunc128(payload["first_name"]),
-                    last_name=_trunc128(payload["last_name"]),
-                    mail_address=_trunc512(payload["mail_address"]),
-                    mail_city=_trunc128(payload["mail_city"]),
-                    mail_state=_trunc128(payload["mail_state"]),
-                    mail_zip=_trunc128(payload["mail_zip"]),
-                    trace_type=payload["trace_type"],
-                    status="queued",
+                from src.workers.ops_alerts import send_ops_alert
+
+                send_ops_alert(
+                    "skip_trace_claim_unenforced", "enqueue",
+                    "Skip-trace claims are refused: migration 100 is not in place",
+                    f"{len(to_claim)} lead(s) on job {job_id} were not queued "
+                    f"because the unique index that stops a lead being looked up "
+                    f"twice is missing, invalid or not the expected index. "
+                    f"Contact lookups are PAUSED and stay paused until it is "
+                    f"applied. Nothing was charged and no lead was lost. {exc}",
                 )
-                db.add(pending)
-            except Exception as exc:
-                # REDTEAM MED I3: log the non-PII Result id, never the
-                # homeowner's party_name, in application logs.
-                _logger.warning("Skip trace enqueue failed for result %s: %s", rec.id, str(exc)[:80])
-                db.rollback()
+            except Exception:  # noqa: BLE001 - an alert failure must not fail the job
+                _logger.exception("skip-trace unenforced-claim alert failed to send")
+            _publish_log(
+                r, job_id, "warning",
+                f"Contact lookups are paused for {len(to_claim)} lead(s): a "
+                "database safeguard that stops a lead being looked up twice is "
+                "not in place. No new lookup was charged. These leads stay "
+                "pending and become eligible again on the next run once the "
+                "safeguard is restored.",
+                db=db,
+            )
+            to_claim = []
+        claimed = set(claimed_ids)
+        for payload in to_claim:
+            if str(payload["result_id"]) not in claimed:
                 continue
-            rec.skip_trace_status = "queued"
             cache_misses += 1
             if payload["trace_type"] == "advanced":
                 enqueued_advanced += 1
             else:
                 enqueued_normal += 1
+        lost = len(to_claim) - len(claimed)
+        if lost:
+            # Deliberately does NOT say "already claimed". The claim refuses a
+            # lead for several reasons -- an active claim elsewhere, a lead that
+            # settled or was deleted in between, a payload whose state or
+            # trace_type cannot be stored -- and this count cannot tell them
+            # apart. Naming one of them would send whoever reads this looking for
+            # a race that may not exist. The claim logs the unwritable ones by id
+            # separately. Not an error either way; a persistently large number
+            # here is the signal worth chasing.
+            _logger.info(
+                "Job %s skip trace: %d of %d lead(s) were not claimed (active claim "
+                "elsewhere, settled in between, or an unusable payload)",
+                job_id, lost, len(to_claim),
+            )
 
     try:
         db.commit()
     except Exception:
+        # RAISES, where the original swallowed. The old handler rolled back and
+        # then committed an empty transaction, so every count below still
+        # reported cache hits and queued leads that no longer existed: the job
+        # log told the customer their leads were queued while the rows were
+        # gone. Nothing here is safe to report as success unless the commit
+        # actually happened.
+        #
+        # Raising is safe. tasks.py catches this, logs it and lets the job
+        # finish, so leads are still delivered; and every lead whose claim did
+        # not commit is still 'not_attempted', so the next run picks it up. The
+        # cache-hit copies are lost with it, but they are free to redo -- unlike
+        # a queued row that was reported as bought and was not.
+        _logger.exception("Job %s skip trace enqueue commit failed; rolling back", job_id)
         db.rollback()
-        db.commit()
+        raise
+
+    if _late_settled:
+        # Reported only now: this log commits, and until the line above it the
+        # job lock had to stay held.
+        _publish_log(
+            r, job_id, "info",
+            f"Skip trace not repeated for {_late_settled} further already delivered "
+            "lead(s): an earlier lookup was charged but could not be matched to the "
+            "lead",
+            db=db,
+        )
 
     if skipped_atip_policy:
         _publish_log(

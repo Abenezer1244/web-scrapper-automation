@@ -150,33 +150,51 @@ not_attempted WITH a property address       : 100,548
    ... of those already-delivered duplicates:  61,442   <- the case that drove this feature
 ```
 
-## 8. OPEN DECISIONS FOR THE OWNER — ask, do not assume
+## 8. DECISIONS — ALL THREE ANSWERED BY THE OWNER 2026-09-22
 
-1. **Merge PR #354?** Not merged. Needs CI green first.
-2. **Deploy style.** The dispatcher guard makes an UNQUIESCED deploy safe (100 will not abort:
-   zero duplicates). A quiesced deploy — the 1a pattern: kill switch off, workers to zero,
-   migrate, restart — avoids the mixed-version window entirely. Owner's call.
-3. **Per-account daily cap, currently deferred.** `SKIP_TRACE_DAILY_ROW_CAP` is **1000/day
-   GLOBAL across all tenants**. With 100,548 addressable leads, ONE customer's 2000-lead action
-   consumes two full days of dispatch capacity for every tenant. This probably stops being
-   safely deferrable before 1c ships.
+1. **Merge PR #354? YES, merged** as `0074196` on `main`, on CI green + Codex PASS.
+2. **Deploy style: QUIESCED**, the 1a pattern — kill switch off, workers to zero, migrate,
+   restart. The dispatcher guard would have made an unquiesced deploy safe (100 will not
+   abort: zero duplicates), but quiescing avoids the mixed-version window entirely, and this
+   release is forward-safe and NOT backward-safe, which makes the conservative path worth its
+   cost. **Not yet deployed.**
+3. **Per-account daily cap: NO LONGER DEFERRED — it moves into Phase 1b-1.**
+   `SKIP_TRACE_DAILY_ROW_CAP` is **1000/day GLOBAL across all tenants**. With 100,548
+   addressable leads, ONE customer's 2000-lead action consumes two full days of dispatch
+   capacity for every tenant. It lands in 1b-1 (which touches no money) rather than waiting
+   for 1c to expose the button. Recorded as **D3-b** in `tasks/todo-lookup-contacts.md`.
 
 ## 9. NEXT STEP (exactly where to resume)
 
-1. **`gh pr checks 354`** — was GREEN at handoff (Test pass 14m20s). If it has gone red,
-   `main` has moved again; read `gh run view <run-id> --log-failed`. A migration-number
-   collision is the likeliest cause, and it is invisible locally (see §6).
-2. **Run ONE Codex pass on the POST-REBASE diff.** The 12 security passes reviewed the diff
-   BEFORE the rebase onto `origin/main`. The upstream change (`job_progress_observations`)
-   touches a different subsystem and interaction is not expected, but that has not been
-   verified. Short prompt, `-s read-only`, skills disabled.
-3. **Ask the owner the §8 questions.** Do not merge without an answer.
+**Steps 1-3 below are DONE (2026-09-22). Start at step 4.**
+
+1. ~~`gh pr checks 354`~~ — green, and green again on each follow-up commit.
+2. ~~Run ONE Codex pass on the POST-REBASE diff.~~ **DONE, and it was not a formality.**
+   It took FOUR rounds and found a real defect the twelve security passes structurally could
+   not: the rebase pulled in #348, which had changed the signature of
+   `_enqueue_skip_trace_rows` to take `on_begin` and had deliberately placed that callback
+   AFTER every gate so the `queuing_contacts` stage was always true (its own Codex round 7).
+   1b-0 then added four gates BELOW that point — the job lock, the re-read under it, the
+   re-applied filters and the per-row payload gates — so the callback silently stopped meaning
+   what its docstring still claimed. **Git merged it cleanly; the behavior drifted anyway.**
+   The fix could not simply move the announcement later: `_set_stage` COMMITS, and a
+   transaction-scoped advisory lock does not survive a commit, so announcing after the claim
+   would release the lock the claim depends on — a P2 traded for a P1. It is gated on a pure
+   pre-check instead (`66714d3`, `81e9534`, `d70b261`).
+   Rounds 2 and 3 then returned NO-GO on things that were NOT runtime defects: comments that
+   lied about the code. That matters here specifically because a wrong docstring is what hid
+   the original bug. Round 4 returned PASS on all four items.
+3. ~~Ask the owner the §8 questions.~~ All three answered — see §8.
 4. **Then Phase 1b-1** (read path, touches no money), per `tasks/todo-lookup-contacts.md`:
    `results.last_trace_outcome` (finding 15-3, migration **101**), the three action tables with
    GRANTS + RLS POLICIES (15-8 — `RLS_ENFORCE` is true in prod and the API is NOBYPASSRLS, so
    without them `GET /contact-lookups/{id}` 500s on deploy day), `results` UNIQUE (id, user_id)
    built CONCURRENTLY (15-9), the disposition vocabulary + transition matrix (15-4),
-   `plan_contact_lookup`, and the quote endpoint.
+   `plan_contact_lookup`, the quote endpoint, and the **per-account daily cap** (D3-b, moved
+   into 1b-1 by the owner 2026-09-22 — see §8.3; mind 15-11, the existing global cap is SOFT).
+   **CONSULT CODEX ON THE 1b-1 PLAN BEFORE WRITING CODE.** Not the same as reviewing the diff
+   afterwards: the pre-code consult on 1b found NINE P1s that six rounds of diff review would
+   never have reached.
 5. **1b-2 last** (confirm + worker claim + ledger + reconciler).
 
 ### Carried into 1b-2, do not lose
@@ -203,7 +221,8 @@ not_attempted WITH a property address       : 100,548
 
 ## 10. Other open items (unchanged from the previous handoff)
 
-- **PR #351** (the 2026-09-20 handoff doc) — status unknown, check.
+- ~~**PR #351** (the 2026-09-20 handoff doc)~~ — CLOSED 2026-09-22 as superseded: its only
+  file was already byte-identical on this branch and landed with #354.
 - Deleting the now-inert legacy skip-trace cache rows: PII hygiene only, separate ops step.
 - **The D2 gap:** an advanced trace costs 2 provider credits but bills 1 row. To be recorded per
   action in 1b-2 and priced separately later.

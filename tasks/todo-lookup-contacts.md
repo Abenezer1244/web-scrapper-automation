@@ -661,6 +661,142 @@ CLAUDE.md caps a phase at 5 files, and the reconciled 1b spans the live paid pat
       rows that became eligible after the quote are not added; quote counts == worker planner;
       audit row written with the pricing snapshot.
 
+## Phase 1b-1 — REVISED by Codex round 16 (2026-09-22, consult BEFORE code)
+
+> **Round 16 returned REVISE with seven P1s against the 1b-1 scope and ORDER as written
+> above.** Same lesson as rounds 14 and 15: the earlier split named the right pieces and never
+> asked what the schema actually supports or what the cap does to the component that spends.
+> Prompt and output: `<scratchpad>/codex_1b1_consult.txt` / `codex_1b1_consult_out.txt`.
+> Every finding below was re-verified in code before being accepted, and **one was rejected**.
+> **1b-0 is MERGED AND LIVE** (`0074196`, migration 100 applied and verified by the objects).
+
+**16-1 (P1, VERIFIED) — the tenant-carrying FK cannot be built as planned: `jobs` has no
+composite key.** The plan requires composite FKs so a child row can never point at another
+account's parent. Only `scraper_batches` has one today —
+`UniqueConstraint("id", "user_id", name="uq_scraper_batches_id_user")` (`src/db/models.py:482`).
+**`jobs` (`:659`, table_args `:790`) and `results` (`:811`, table_args `:962`) have NONE.**
+15-9 named `results` only, so an action FK on `(job_id, user_id)` would simply fail to create.
+- [ ] Composite `(id, user_id)` uniqueness for **`jobs`**, **`results`** AND
+      **`contact_lookup_actions`**, each built before the child table that references it.
+      `scraper_batches` is the precedent to copy.
+
+**16-2 (P1, VERIFIED) — `pending_skip_trace_rows.action_id` was dropped from the migration
+list, and settlement cannot work without it.** The plan requires it (step 3 of migration 100's
+original list) and 1b-0 removed it as dead code (`fa20d60`). It is not dead in 1b-2: a Tracerfy
+batch spans tenants and actions, `SkipTraceQueue` stores only the FIRST row's tenant/job
+metadata (`skip_trace_dispatcher.py:1149-1156`), and ingest reconstructs attribution from the
+pending rows. Without `action_id` on each row, a hit / miss / unmatched / reuse / release
+cannot be tied back to the action that bought it.
+- [ ] Nullable `pending_skip_trace_rows.action_id` + index, written by the action claim and
+      left NULL by the scrape path, added in the SCHEMA step — not left to 1b-2.
+
+**16-3 (P1, VERIFIED) — `last_trace_outcome` must ship as a column only; its writers are live
+paid code.** 15-3 wants it written atomically with the existing transitions. Those transitions
+are **eight** writers, not the "five" the plan says: the known-answer sweep and
+charged-unanswered settlement (`skip_trace_dispatcher.py:697-803`), pre-submit failures
+(`:947-983`), cancellation/withdrawal (`:1077-1107`), provider-acceptance bookkeeping
+(`:1113-1196`), claim release (`:1251-1298`), stale-claim reconciliation (`:1494-1663`), ingest
+hit/miss/unmatched settlement (`tracerfy_ingest.py:735-845`), and the scrape's
+charged-unanswered handling (`enrich.py:2345-2387`).
+- [ ] The column lands nullable with a CHECK and **no writer, no default, no NOT NULL and no
+      trigger**. It means UNKNOWN until 1b-2 integrates the writers.
+- [ ] **NULL must never be read as `provider_rejected`.** Retry is permitted only on proven
+      pre-submit rejection. Note `tracerfy_ingest.py:789-811` writes
+      `results.skip_trace_status='errored'` for provider-accepted-but-unmatched work, which is
+      BILLABLE and must never be retried like a rejection — the exact ambiguity 15-3 exists for.
+
+**16-4 (P1, VERIFIED) — a per-account cap placed beside the global one reproduces the soft-cap
+bug it is supposed to improve on.** The global cap counts in its OWN session
+(`skip_trace_dispatcher.py:72-92`, `with system_sync_session() as _db`) BEFORE the claim's
+`pg_try_advisory_xact_lock` (`:219`), and one tick may submit several batches. A per-account
+query in the same place inherits all of it: two ticks pass the same account's check, one batch
+exceeds the account's remaining budget, and the two caps can disagree.
+- [ ] **Reserve capacity inside the SAME transaction that moves rows `queued -> submitting`**,
+      not in a pre-check. The effective allowance is `min(global_remaining, account_remaining)`;
+      the transaction selects no more than that, commits the reservation, and only THEN calls
+      Tracerfy. **No database lock is held across the provider call.**
+- [ ] Count `submitting` rows of unknown provider outcome conservatively (as spent) until
+      reconciled — the 15-7 evidence grading, applied to the cap.
+
+**16-5 (P1, VERIFIED) — FIFO + an account filter starves tenants.** Selection is
+`ORDER BY PendingSkipTraceRow.enqueued_at LIMIT 5000` (`skip_trace_dispatcher.py:273-279`).
+If the oldest tenant sits at its cap, re-selecting that tenant's rows ahead of everyone else
+can keep later tenants out of every batch indefinitely. This repo already has this exact shape
+recorded as a landmine elsewhere.
+- [ ] Fair selection: deterministic round-robin over eligible `user_id`s, or a windowed query
+      allocating per account before the global limit. **Test:** one tenant with a large backlog
+      against several tenants with later rows; every tenant must make progress.
+
+**16-6 (P1) — grants and RLS cannot express the disposition state machine.** The API is
+`NOBYPASSRLS` (`scripts/provision_rls_roles.sql:55-59`) and has no grant on the worker tables
+(`:150-152`). RLS bounds the TENANT; it says nothing about which transition is legal. If the API
+can insert arbitrary dispositions it can write terminal verdicts or fabricated exclusions.
+- [ ] A `BEFORE INSERT/UPDATE` **trigger** enforces: API may create only the approved INITIAL
+      states; API may never perform a worker verdict transition; system transitions follow the
+      matrix; action status and event agree. A `SECURITY DEFINER` function is the alternative
+      and is only safe if it validates `app.current_user_id`, pins `search_path` and applies
+      the tenant predicate — otherwise it IS an RLS bypass.
+- [ ] Explicit per-operation policies, never a blanket `FOR ALL`: actions — app SELECT, INSERT
+      plus only the narrow update path; action_results — app SELECT, INSERT, system SELECT,
+      INSERT, UPDATE; events — both roles SELECT, INSERT and **neither** UPDATE or DELETE.
+      Shape follows `scripts/apply_rls_cutover_policies.sql:90-97,183-203`.
+
+**16-7 (P2) — append-only is not the same as trustworthy.** SELECT+INSERT stops mutation but
+still lets the API fabricate history. Restrict API event insertion to the initial action event
+through the same trigger/function.
+
+**16-8 (P2) — "the number can only go down" holds only if the quoted id set is IMMUTABLE.**
+The planner reads `results` only and can overstate under drift. It cannot overcharge, because
+the worker re-authorizes against the queue and the active-claim unique index refuses a second
+row. It becomes FALSE the moment confirmation re-runs the planner and adds newly eligible ids.
+- [ ] Confirmation may EXCLUDE ids, never ADD them; the durable quoted set bounds the worker.
+
+**16-9 (P2) — child-side FK indexes, absent from the plan:** `contact_lookup_actions(job_id,
+user_id)`, `contact_lookup_action_results(action_id, user_id)` and `(result_id, user_id)`,
+`contact_lookup_action_events(action_id, user_id)`, `pending_skip_trace_rows(action_id, user_id)`.
+Without them RLS reads, cascades and reconciliation degrade as actions accumulate.
+
+**16-10 (P1) — the writer inventory is incomplete, and a writer hides in `scripts/` again.**
+`scripts/repair_probate_party_and_bad_parcel.py` sets `skip_trace_status='queued'` (`:253`) and
+`'not_attempted'` (`:271`) directly. This is the THIRD phase in which an ops script turned out
+to be part of the concurrency design. Audit or disable every queue/status writer before 1b-2,
+not only `backfill_skip_trace_jobs.py`.
+
+### REJECTED from round 16, with reasoning
+
+**Codex asked that 101 consult `pg_stat_progress_create_index` before dropping an INVALID index,
+claiming 098 and 100 drop one blindly. They do not, and the check would be redundant.**
+Migration 100 already reasons about exactly this (`100_...py:122-138`): inside a migration an
+invalid index is dead and never mid-build, **because migrations are serialized by the advisory
+lock in `scripts/migrate.py`** — and `start.sh:41` really does boot through
+`python scripts/migrate.py`, not bare `alembic upgrade`. 100 also checks the index by IDENTITY
+(unique, key count, plain column, `result_id`, exact predicate), which is stronger than validity
+alone. 101 copies that pattern and **states the migrate.py dependency in a comment**, because
+the argument collapses if anything ever migrates with bare alembic. Outside a migration the
+opposite rule stands: an invalid index may simply be BUILDING.
+
+### Revised split and ORDER (supersedes the 1b-1 ordering in "Agreed split")
+
+1. **1b-1a SCHEMA** — migration 101: `results.last_trace_outcome` (column only),
+   `pending_skip_trace_rows.action_id`, composite `(id,user_id)` uniqueness for `jobs`,
+   `results` and `contact_lookup_actions` (CONCURRENTLY, then `ADD CONSTRAINT ... USING INDEX`
+   under its own `lock_timeout`), the three tables, child-side FK indexes, grants, RLS policies
+   and the disposition trigger, plus both RLS scripts. No endpoint, no writer semantics.
+2. **1b-1b HARD DISPATCH CAP** — atomic reservation, `min(global, account)`, fair selection,
+   per-account resume time as ONE window query published through a Redis pipeline.
+   **This MOVES AHEAD of the quote** (see below).
+3. **1b-1c PLANNER + QUOTE** — `plan_contact_lookup`, the immutable quoted set, upper-bound
+   wording, Redis-as-advisory, the quote endpoint.
+4. **1b-2 WRITERS** — confirm, the worker claim, `last_trace_outcome` writes, events,
+   all existing-writer integrations, reconciliation and settlement.
+
+**Why the cap moves ahead of the quote:** the quote is specified to show `paused_by_daily_cap`
+and a resume time. Shipping the quote first would have it promising a pause/resume state that
+the cap does not yet compute per account, so the first thing a customer sees would be the one
+number the system cannot yet honour. **The cap is therefore NOT a read-path feature** — it
+changes the component that spends — which is the part of D3-b that "1b-1 touches no money" got
+wrong.
+
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever
       the tab has leads that have never been looked up; when the quote comes back with
@@ -755,7 +891,7 @@ fired (pending rows that ended `unmatched` sharing an address key within one que
 
 ## Review
 
-### Phase 1a: done, NOT merged (2026-09-20)
+### Phase 1a: MERGED AND LIVE (done 2026-09-20, merged + cut over in production)
 
 Six commits on `feat/lookup-contacts-action`, off `origin/main`. Nothing pushed, no PR, no
 Tracerfy credits spent, production untouched.
@@ -804,7 +940,7 @@ pre-existing Stripe ones, proven identical at `origin/main`).
 **Before a PR:** rebase onto `origin/main`, which moved twice during the session (now
 `8ba7bf8`).
 
-### Phase 1b-0: done, NOT merged (2026-09-20)
+### Phase 1b-0: MERGED AND LIVE (done 2026-09-20; merged 2026-09-22 as `0074196`, migration 100 applied in production)
 
 Hardening only. No API route, no schema, no new dependency, no frontend.
 
@@ -888,7 +1024,14 @@ the pre-100 code would have produced.
 
 ### Still open
 
-- **Phase 1b and 1c have not started** and must not until 1a merges.
+- **Phase 1b-1 has NOT started.** 1a and 1b-0 are both merged and live, so the old
+  "must not start until 1a merges" gate is cleared. The next code is 1b-1a (SCHEMA), per the
+  revised order in the round-16 section above — NOT the quote endpoint.
+- 🛑 **In this repo a merge IS a deploy**: push to `main` redeploys Railway api + worker and
+  `start.sh` migrates on boot via `scripts/migrate.py`. Migration 100 was live ~2 seconds after
+  #354 merged, which silently overrode the owner's choice of a QUIESCED deploy. It was harmless
+  (0 duplicate rows, 0 active pending rows, 0 non-terminal jobs), but **quiescing has to happen
+  BEFORE the merge, because there is no step in between**. Applies to migration 101.
 - The cutover is a DRAIN and a restart, not a flag flip: the kill switch does not gate ingest,
   the webhook, or `_reuse_enrichment_for_duplicates`. See the runbook.
 - Deferred, logged above: the pre-existing cross-tenant collision (worth a read-only prod count

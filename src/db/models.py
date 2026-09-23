@@ -789,6 +789,13 @@ class Job(Base):
     # PERF (migration 033): list_jobs filters user_id and orders by created_at.
     __table_args__ = (
         Index("ix_jobs_user_created", "user_id", "created_at"),
+        # UNIQUE(id, user_id) is what lets contact_lookup_actions reference a job
+        # via a tenant-scoped COMPOSITE FK (migration 101, finding 16-1). id is
+        # already unique (PK); this exists solely to be the FK target. Unlike the
+        # index below it MUST be a constraint, because an FK cannot target a bare
+        # index — 101 builds it CONCURRENTLY and then attaches it with
+        # ADD CONSTRAINT ... USING INDEX so the exclusive lock is momentary.
+        UniqueConstraint("id", "user_id", name="uq_jobs_id_user"),
         # Migration 079: unique INDEX (not a table constraint) so prod can build
         # it CREATE UNIQUE INDEX CONCURRENTLY without an ACCESS EXCLUSIVE lock on
         # the hot jobs table. ON CONFLICT DO NOTHING arbitrates against a unique
@@ -870,6 +877,20 @@ class Result(Base):
     # reconstructed. NULL = settled before 098 or never settled, and NULL fails
     # closed: it neither donates PII nor receives it.
     skip_trace_subject_hash = Column(String(64), nullable=True)
+    # Migration 101 (finding 15-3): what actually happened to the last lookup
+    # bought for this lead. `skip_trace_status='errored'` is ambiguous on its own
+    # — tracerfy_ingest writes it BOTH for a never-submitted pre-submit rejection
+    # and for work Tracerfy accepted and CHARGED us for but could not match — and
+    # the distinguishing fact lives on the pending row, which the API role has no
+    # grant to read. Quoting `errored` without this column would re-buy lookups
+    # the customer has already paid for.
+    #
+    # 🛑 NOTHING WRITES THIS YET. The writers are eight live paid-state
+    # transitions and they land in 1b-2, in the same transactions as the existing
+    # state changes. Until then every row is NULL, and **NULL means UNKNOWN, never
+    # `provider_rejected`**: a retry path that reads NULL as "safe to retry" would
+    # buy a second lookup for work already charged.
+    last_trace_outcome = Column(String(32), nullable=True)
     # Sprint 6.4: cross-job deduplication
     dedup_hash = Column(String(64), nullable=True, index=True)
     is_duplicate = Column(Boolean, nullable=False, default=False)
@@ -960,6 +981,10 @@ class Result(Base):
     # (WHERE user_id = :uid AND property_key = ANY(:keys)); null keys never
     # queried, so the index excludes them.
     __table_args__ = (
+        # UNIQUE(id, user_id) so contact_lookup_action_results can reference a
+        # lead via a tenant-scoped COMPOSITE FK (migration 101, finding 16-1):
+        # a verdict row can then never point at another account's lead.
+        UniqueConstraint("id", "user_id", name="uq_results_id_user"),
         Index(
             "ix_results_job_user_dup_created",
             "job_id",
@@ -1331,6 +1356,16 @@ class PendingSkipTraceRow(Base):
     enqueued_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     submitted_at = Column(DateTime(timezone=True), nullable=True)
 
+    # Migration 101 (finding 16-2): which contact-lookup action bought this row.
+    # NULL for the scrape path, so a concurrent scrape is never counted as an
+    # action's work. Not decorative: a Tracerfy batch spans tenants and actions
+    # and SkipTraceQueue stores only the FIRST row's tenant/job metadata, so
+    # ingest rebuilds attribution from these rows. Without it a hit, miss,
+    # unmatched, reuse or release cannot be tied back to the action that paid.
+    # No inline ForeignKey: the composite FK onto (action_id, user_id) is added
+    # in 1b-2 once the action worker exists to write it.
+    action_id = Column(UUID(as_uuid=False), nullable=True)
+
     # PERF (migration 033): the skip-trace dispatcher drains the queue by
     # filtering status + trace_type and ordering by enqueued_at.
     __table_args__ = (
@@ -1340,6 +1375,7 @@ class PendingSkipTraceRow(Base):
             "trace_type",
             "enqueued_at",
         ),
+        Index("ix_pending_skip_trace_action", "action_id", "user_id"),
     )
 
 
@@ -1646,3 +1682,203 @@ class StripeWebhookEvent(Base):
     event_id = Column(String(255), primary_key=True)
     event_type = Column(String(100), nullable=False)
     processed_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+# ── Contact lookup action ledger (migration 101, Phase 1b-1a) ────────────────
+# The durable home for a "look up contacts" action. Nothing writes these tables
+# yet: the quote endpoint lands in 1b-1c and the writers in 1b-2.
+
+# Every verdict a quoted lead can hold. Canonical here; migration 101 keeps its
+# own copy (a migration must keep working when application code moves on, the
+# convention set by migration 100), and a test asserts the two have not drifted.
+CONTACT_LOOKUP_DISPOSITIONS = (
+    "quoted",
+    "newly_queued", "reused", "already_answered", "in_progress_elsewhere",
+    "ineligible", "released", "abandoned",
+    "excluded_no_address", "excluded_placeholder_address",
+    "excluded_settled_code_violation", "excluded_atip_policy",
+    "excluded_not_traceable",
+    "answered_hit", "answered_miss", "unmatched_billable", "errored_unsubmitted",
+)
+
+# What a user-scoped (API) session may create. Everything else is a worker
+# verdict or a terminal answer and is refused by the trigger below.
+CONTACT_LOOKUP_API_INITIAL_DISPOSITIONS = (
+    "quoted",
+    "excluded_no_address", "excluded_placeholder_address",
+    "excluded_settled_code_violation", "excluded_atip_policy",
+    "excluded_not_traceable",
+)
+
+CONTACT_LOOKUP_ACTION_STATUSES = (
+    "dispatching", "running", "claimed", "settled", "failed", "expired",
+)
+
+# What actually happened to the last lookup bought for a lead. NULL = UNKNOWN.
+# The split that matters: `provider_rejected` was never charged and may be
+# retried; `provider_accepted_unmatched` WAS charged and must never be.
+RESULT_TRACE_OUTCOMES = (
+    "provider_rejected",
+    "provider_accepted_unmatched",
+    "provider_answered_hit",
+    "provider_answered_miss",
+    "locally_cancelled",
+)
+
+
+def _sql_str_list(values) -> str:
+    return ", ".join(f"'{v}'" for v in values)
+
+
+class ContactLookupAction(Base):
+    """One "look up contacts" action: a confirmed, priced, durable request.
+
+    Created by the API at confirm time with status `dispatching`, so the worker
+    always has a durable home for its dispositions even if it never runs.
+    """
+
+    __tablename__ = "contact_lookup_actions"
+    __table_args__ = (
+        UniqueConstraint("quote_id", name="uq_contact_lookup_actions_quote"),
+        # Parent of both child tables below, via tenant-carrying composite FKs.
+        UniqueConstraint("id", "user_id", name="uq_contact_lookup_actions_id_user"),
+        ForeignKeyConstraint(
+            ["job_id", "user_id"], ["jobs.id", "jobs.user_id"],
+            ondelete="CASCADE", name="fk_contact_lookup_actions_job_tenant",
+        ),
+        CheckConstraint(
+            f"status IN ({_sql_str_list(CONTACT_LOOKUP_ACTION_STATUSES)})",
+            name="ck_contact_lookup_actions_status",
+        ),
+        Index("ix_contact_lookup_actions_user", "user_id"),
+        Index("ix_contact_lookup_actions_job_tenant", "job_id", "user_id"),
+    )
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    user_id = Column(
+        UUID(as_uuid=False), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    # No inline ForeignKey: the composite FK above owns this column.
+    job_id = Column(UUID(as_uuid=False), nullable=False)
+    category = Column(String(32), nullable=False)
+    # Unique, so a retried confirm resolves to the SAME action from the database
+    # rather than creating a second one (finding 15-13).
+    quote_id = Column(String(64), nullable=False)
+    status = Column(String(16), nullable=False, default="dispatching")
+    status_reason = Column(String(255), nullable=True)
+    status_changed_at = Column(DateTime(timezone=True), nullable=True)
+    # What the customer was SHOWN. Billing NEVER derives from this; storing both
+    # is what makes quote-vs-invoice drift detectable (finding 15-17).
+    unit_price_cents = Column(Integer, nullable=False)
+    currency = Column(String(3), nullable=False)
+    pricing_version = Column(String(32), nullable=False)
+    # A CACHE. contact_lookup_action_results is the source of truth and these are
+    # fully recomputable from it, so a late redelivery re-derives the same numbers
+    # instead of overwriting them with zeros.
+    quoted_count = Column(Integer, nullable=False, default=0)
+    claimed_count = Column(Integer, nullable=False, default=0)
+    reused_count = Column(Integer, nullable=False, default=0)
+    newly_queued_count = Column(Integer, nullable=False, default=0)
+    billable_rows = Column(Integer, nullable=False, default=0)
+    # An advanced trace costs 2 Tracerfy credits but bills 1 row; the gap is
+    # recorded per action so it can be priced later (decision D2).
+    tracerfy_credits = Column(Integer, nullable=False, default=0)
+    truncated = Column(Boolean, nullable=False, default=False)
+    # Fences a stalled worker that wakes up after the reconciler terminalized it.
+    lease_token = Column(String(64), nullable=True)
+    lease_expires_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    dispatched_at = Column(DateTime(timezone=True), nullable=True)
+    started_at = Column(DateTime(timezone=True), nullable=True)
+    claimed_at = Column(DateTime(timezone=True), nullable=True)
+    settled_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class ContactLookupActionResult(Base):
+    """One verdict per quoted lead per action — the source of truth.
+
+    Every quoted lead gets a row, not only the claimed ones: a reused answer and
+    a lead that became ineligible elsewhere both create NO pending row, so
+    pending rows alone could never tell them apart.
+    """
+
+    __tablename__ = "contact_lookup_action_results"
+    __table_args__ = (
+        UniqueConstraint(
+            "action_id", "result_id", name="uq_contact_lookup_action_results_pair"
+        ),
+        ForeignKeyConstraint(
+            ["action_id", "user_id"],
+            ["contact_lookup_actions.id", "contact_lookup_actions.user_id"],
+            ondelete="CASCADE", name="fk_contact_lookup_action_results_action_tenant",
+        ),
+        ForeignKeyConstraint(
+            ["result_id", "user_id"], ["results.id", "results.user_id"],
+            ondelete="CASCADE", name="fk_contact_lookup_action_results_result_tenant",
+        ),
+        CheckConstraint(
+            f"disposition IN ({_sql_str_list(CONTACT_LOOKUP_DISPOSITIONS)})",
+            name="ck_contact_lookup_action_results_disposition",
+        ),
+        Index("ix_contact_lookup_action_results_action_tenant", "action_id", "user_id"),
+        Index("ix_contact_lookup_action_results_result_tenant", "result_id", "user_id"),
+    )
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    action_id = Column(UUID(as_uuid=False), nullable=False)
+    user_id = Column(
+        UUID(as_uuid=False), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    result_id = Column(UUID(as_uuid=False), nullable=False)
+    disposition = Column(String(40), nullable=False)
+    decided_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class ContactLookupActionEvent(Base):
+    """Append-only history of an action, for a disputed charge.
+
+    A single pair of status columns can only ever show the latest hop; a dispute
+    needs the whole path. Append-only in the GRANTS for BOTH roles: history that
+    the thing which wrote it can edit is not evidence.
+    """
+
+    __tablename__ = "contact_lookup_action_events"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["action_id", "user_id"],
+            ["contact_lookup_actions.id", "contact_lookup_actions.user_id"],
+            ondelete="CASCADE", name="fk_contact_lookup_action_events_action_tenant",
+        ),
+        Index("ix_contact_lookup_action_events_action_tenant", "action_id", "user_id"),
+    )
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    action_id = Column(UUID(as_uuid=False), nullable=False)
+    user_id = Column(
+        UUID(as_uuid=False), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    # Set when the hop belongs to ONE lead (a release, an abandonment), so a
+    # partially claimed action reconstructs lead by lead, not only in aggregate.
+    result_id = Column(UUID(as_uuid=False), nullable=True)
+    from_status = Column(String(40), nullable=True)
+    to_status = Column(String(40), nullable=False)
+    reason = Column(String(255), nullable=True)
+    lease_token = Column(String(64), nullable=True)
+    at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+# The disposition guard (finding 16-6) lives ONLY in migration 101.
+#
+# It is deliberately NOT mirrored here as a create_all DDL, even though several
+# comments in this file and in migrations 049 and 089 say that mirroring is what
+# gives test databases their functions. That belief is stale: NOTHING in this
+# repository calls `create_all`. The local rig
+# (`C:/Users/Windows/bl-testenv/run-full-pytest.sh`) and CI
+# (`.github/workflows`, `alembic upgrade head`) both build the test schema from
+# MIGRATIONS, and `tests/conftest.py` mentions neither. So the trigger really is
+# present in every test database, and a mirror here would be dead code plus a
+# second copy to keep byte-identical for no benefit.
+#
+# Codex round 16 (16-12) argued the opposite and it was wrong on the premise,
+# which is worth recording: the claim sounded right BECAUSE the codebase keeps
+# asserting it about itself.

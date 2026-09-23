@@ -774,8 +774,23 @@ apply to the table OWNER, so a policy can look correct and still not constrain e
       lacks BYPASSRLS. That is a second reason to prefer the plain trigger below over a
       `SECURITY DEFINER` function for 16-6.
 
-**16-12 (P1, VERIFIED — the trigger would be untestable) — tests build the schema with
-`create_all`, not migrations.** A trigger created only inside migration 101 simply would not
+**16-12 — WITHDRAWN 2026-09-22. THE PREMISE WAS FALSE, and it is worth knowing why.**
+The claim below is wrong: **nothing in this repository calls `create_all`.** Both the local rig
+(`C:/Users/Windows/bl-testenv/run-full-pytest.sh`) and CI (`.github/workflows`, line 116) build
+the test database with **`alembic upgrade head`**, and `tests/conftest.py` mentions neither. So
+migration 101's trigger IS present in every test database and a mirror in `models.py` would be
+dead code plus a second copy to keep byte-identical for nothing. It was written, then removed
+after checking.
+
+The reason it was believable is the interesting part: `models.py`, `alembic/env.py` and
+migrations 049 and 089 all carry comments asserting that create_all is how test databases get
+their functions. **Four stale comments agreeing with each other read as documentation.** They
+misled the pattern extraction, the reviewer and me in turn. The `_RESULT_PARSE_FILING_DATE_FN`
+mirror at `models.py:39-71` appears to be dead for the same reason; left alone as pre-existing
+and out of scope, but it is not the precedent it looks like.
+
+~~ORIGINAL CLAIM (kept so the correction is legible): tests build the schema with
+`create_all`, not migrations.~~ A trigger created only inside migration 101 simply would not
 exist in the test database, so every test asserting "the API cannot write a terminal
 disposition" would pass **vacuously** — the exact failure this project has already hit twice
 (a stubbed fixture, and a test that copied its implementation).

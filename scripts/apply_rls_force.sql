@@ -45,7 +45,12 @@ DECLARE
         -- policies in apply_rls_cutover_policies.sql
         'pending_registrations',
         -- stripe_webhook_events (095): append-only webhook ledger, app SELECT/INSERT
-        'stripe_webhook_events'
+        'stripe_webhook_events',
+        -- contact_lookup_* (101): the action ledger. Without FORCE, RLS does not
+        -- apply to the table OWNER, so the policies would look correct while not
+        -- constraining every path.
+        'contact_lookup_actions', 'contact_lookup_action_results',
+        'contact_lookup_action_events'
     ];
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bridgeleads_app')
@@ -101,6 +106,8 @@ $guard$;
 --     'skip_trace_meter_events','public_sample_cache','property_list_membership',
 --     'mfa_backup_codes','mfa_break_glass_codes','dialer_deliveries',
 --     'scraper_batches','batch_runs','audit_events','nts_notices',
---     'notifications','pending_registrations','stripe_webhook_events']
+--     'notifications','pending_registrations','stripe_webhook_events',
+--     'contact_lookup_actions','contact_lookup_action_results',
+--     'contact_lookup_action_events']
 --   LOOP EXECUTE format('ALTER TABLE IF EXISTS public.%I NO FORCE ROW LEVEL SECURITY', t);
 --   END LOOP; END $$;

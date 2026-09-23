@@ -138,6 +138,18 @@ GRANT SELECT, INSERT, DELETE ON pending_registrations TO bridgeleads_app;
 -- Append-only: no UPDATE, no DELETE.
 GRANT SELECT, INSERT ON stripe_webhook_events TO bridgeleads_app;
 
+-- contact_lookup_* (migration 101): the "look up contacts" action ledger.
+-- The API creates an action and its quoted set at confirm time and reads the
+-- status page; it never transitions a verdict. UPDATE is granted on the ACTION
+-- only, for the API's own created -> dispatching hop. The verdict table gets
+-- SELECT + INSERT and no UPDATE, and the event log is append-only for BOTH
+-- roles -- history the writer can edit is not evidence in a billing dispute.
+-- A grant cannot express "insert only an INITIAL verdict"; migration 101's
+-- trigger does that.
+GRANT SELECT, INSERT, UPDATE ON contact_lookup_actions TO bridgeleads_app;
+GRANT SELECT, INSERT ON contact_lookup_action_results TO bridgeleads_app;
+GRANT SELECT, INSERT ON contact_lookup_action_events TO bridgeleads_app;
+
 -- Converge to least privilege regardless of any prior (over-)grant: GRANT does
 -- not remove privileges an earlier version of this script handed out, so
 -- explicitly REVOKE everything the app must NOT hold (Codex review). DELETE is
@@ -162,6 +174,10 @@ REVOKE INSERT, DELETE ON dialer_deliveries FROM bridgeleads_app;
 REVOKE INSERT, DELETE ON notifications FROM bridgeleads_app;
 -- stripe_webhook_events (095): append-only ledger.
 REVOKE UPDATE, DELETE ON stripe_webhook_events FROM bridgeleads_app;
+-- contact_lookup_* (101): no DELETE anywhere; no UPDATE on verdicts or events.
+REVOKE DELETE ON contact_lookup_actions FROM bridgeleads_app;
+REVOKE UPDATE, DELETE ON contact_lookup_action_results FROM bridgeleads_app;
+REVOKE UPDATE, DELETE ON contact_lookup_action_events FROM bridgeleads_app;
 
 -- Hard-fail if the app role still holds any DELETE (allowlisted exceptions:
 -- mfa_backup_codes — H1 grant block; pending_registrations — verify drops the
@@ -190,6 +206,12 @@ BEGIN
         OR (privilege_type = 'UPDATE'
             AND table_name IN ('scraper_batches', 'batch_runs', 'audit_events'))
         OR (privilege_type = 'SELECT' AND table_name = 'audit_events')
+        -- contact_lookup_* (101): the API may never transition a verdict or
+        -- rewrite history. UPDATE on contact_lookup_actions IS allowed (the
+        -- created -> dispatching hop) and is deliberately absent here.
+        OR (privilege_type = 'UPDATE'
+            AND table_name IN ('contact_lookup_action_results',
+                               'contact_lookup_action_events'))
       );
     IF bad > 0 THEN
         RAISE EXCEPTION 'provision_rls_roles: bridgeleads_app still holds % '

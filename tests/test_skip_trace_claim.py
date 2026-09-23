@@ -946,3 +946,86 @@ async def test_the_active_predicate_matches_the_index(db):
         assert f"'{status}'" in row.predicate, f"{status} missing from the predicate"
     # And nothing EXTRA: a widened predicate would refuse legitimate re-claims.
     assert row.predicate.count("::character varying") == len(ACTIVE_PENDING_STATUSES)
+
+
+def _sync_enqueue_recording(job_id, cfg_id, redis_client, calls: list):
+    """Enqueue exactly as production does, recording the stage announcement.
+
+    `on_begin` is #348's callback: the caller enters the `queuing_contacts`
+    stage from it. 1b-0 added gates AFTER the point where it fires (the job
+    lock, the re-read, the re-applied filters and the per-row payload gates),
+    so it stopped meaning what its docstring said.
+    """
+    def _inner(s):
+        _enqueue_skip_trace_rows(
+            s, s.get(Job, job_id), redis_client, job_id,
+            s.get(ScraperConfig, cfg_id),
+            on_begin=lambda: calls.append("queuing_contacts"),
+        )
+    return _inner
+
+
+async def test_no_stage_announcement_when_no_lead_can_produce_a_payload(
+    db, business_user: User, redis_client, _skip_trace_on,
+):
+    """A run that will queue nothing must not announce that it is queuing.
+
+    `on_begin` has to fire BEFORE the advisory lock, because the caller's
+    `_set_stage` commits and a transaction-scoped lock does not survive a
+    commit. That puts it above the per-row gates, so without a pre-check a
+    code-violation run whose complaints are not owner-enriched yet -- every
+    party_name still a case description, which is exactly the fixture here --
+    announces "queuing contact lookups" on every single run and queues
+    nothing. That is the same false label Codex round 7 removed from the call
+    site.
+
+    A lead with NO party_name is deliberately NOT used here: it still queues,
+    as an address-only advanced trace. An earlier version of this test used
+    one, and it queued two rows and failed, which is how that was learned.
+    """
+    cfg = await _config(db, business_user)
+    job_id = await _job(db, business_user, cfg)
+    a = await _row(db, job_id, business_user.id, address="1 A ST",
+                   party_name="Weeds ? 1819 HARVARD AVE")
+    b = await _row(db, job_id, business_user.id, address="2 B ST",
+                   party_name="LandLord/Tenant ? 419 21ST AVE")
+
+    # Not vacuous: these rows really are the payload-less case, and they really
+    # did reach the gate -- a fixture that failed an EARLIER gate would make the
+    # assertion below pass for the wrong reason.
+    assert build_pending_row_payload(await db.get(Result, a)) is None
+    assert build_pending_row_payload(await db.get(Result, b)) is None
+
+    calls: list = []
+    await db.run_sync(_sync_enqueue_recording(job_id, cfg.id, redis_client, calls))
+
+    assert calls == [], "announced the queuing stage for a run that queued nothing"
+    assert await _pending(db, a) == 0
+    assert await _pending(db, b) == 0
+    assert await _status(db, a) == "not_attempted"
+
+
+async def test_stage_is_announced_once_when_any_lead_would_be_queued(
+    db, business_user: User, redis_client, _skip_trace_on,
+):
+    """The pre-check may only ever SUPPRESS a false announcement.
+
+    One traceable lead among untraceable ones still has work to do, so the
+    stage must still be announced -- exactly once. This is the half that stops
+    the fix above from being a silent regression of #348.
+    """
+    cfg = await _config(db, business_user)
+    job_id = await _job(db, business_user, cfg)
+    untraceable = await _row(db, job_id, business_user.id, address="1 A ST",
+                             party_name="Weeds ? 1819 HARVARD AVE")
+    traceable = await _row(db, job_id, business_user.id, address="2 B ST")
+    assert build_pending_row_payload(await db.get(Result, traceable)) is not None
+
+    calls: list = []
+    await db.run_sync(_sync_enqueue_recording(job_id, cfg.id, redis_client, calls))
+
+    assert calls == ["queuing_contacts"], "the stage must be announced exactly once"
+    # And the announcement was truthful: the traceable lead really was queued.
+    assert await _pending(db, traceable, active_only=True) == 1
+    assert await _status(db, traceable) == "queued"
+    assert await _pending(db, untraceable) == 0

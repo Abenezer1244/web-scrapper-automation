@@ -2239,14 +2239,21 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config, *, on_begin=None) 
     the row for free; misses are queued for the dispatcher, which makes the
     actual (paid) Tracerfy calls.
 
-    ``on_begin`` is called ONCE, after every one of those gates has passed and
-    there is at least one eligible row — that is, at the first moment it is true
-    that contact lookups are going to be queued. The caller uses it to enter the
-    `queuing_contacts` stage. It lives here rather than at the call site so the
-    gates are stated once: a copy of them next to the stage write would drift,
-    and the version that drifted announced the stage for every run whose plan,
-    config or eligible-row count meant nothing would be queued at all (Codex
-    round 7).
+    ``on_begin`` is called ONCE, after every one of those gates has passed, there
+    is at least one eligible row, and at least one of those rows would actually
+    produce a lookup payload. The caller uses it to enter the `queuing_contacts`
+    stage. It lives here rather than at the call site so the gates are stated
+    once: a copy of them next to the stage write would drift, and the version
+    that drifted announced the stage for every run whose plan, config or
+    eligible-row count meant nothing would be queued at all (Codex round 7).
+
+    It is an ANNOUNCEMENT, not a guarantee, and the difference is load-bearing.
+    It must fire before the advisory lock is taken, because the caller's stage
+    write commits and a transaction-scoped lock does not survive a commit — so
+    it cannot wait for the claim to prove itself. The gates it cannot speak for
+    are enumerated at the call site below. It is therefore correct to read this
+    as "this run is about to try", and wrong to read it as "rows were queued":
+    the pending rows themselves are the only evidence of that.
     """
     # Local imports — sa_select must be imported here because the module-
     # level import is scoped inside _run_inline_enrichment, not globally
@@ -2429,7 +2436,43 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config, *, on_begin=None) 
     # committed itself or was read-only, so this commits nothing but the stage,
     # and it must not stay pending — an open UPDATE holds a lock on the jobs row,
     # which is the row Cancel Run writes.
-    if on_begin is not None:
+    #
+    # It fires HERE, before the lock below, and it has to: `_set_stage` COMMITS,
+    # and a transaction-scoped advisory lock is released by any commit. Moving
+    # this announcement below the lock to make it more accurate would release the
+    # lock the claim depends on — a P2 traded for a P1.
+    #
+    # That places it before the per-row gates, so this pre-check stands in for
+    # them. The case it exists for is a code-violation run whose complaints have
+    # not been owner-enriched yet: every party_name is still a case description
+    # ("Weeds ? 1819 HARVARD AVE"), every payload is therefore None, and the run
+    # announces "queuing contact lookups" and queues nothing, every time. That
+    # is the same false label Codex round 7 removed from the call site,
+    # reintroduced from below instead of above.
+    #
+    # NOTE, because the obvious guess is wrong: a lead with NO party_name is not
+    # this case. It still queues, as an address-only advanced trace, so a
+    # missing name announces truthfully. `build_pending_row_payload` is the
+    # authority on what will not queue, which is why the check calls it rather
+    # than re-deriving the rule — and it already applies the ATIP policy gate
+    # internally, so naming that gate again here would only invite it to drift.
+    # It is a pure function of the row, so asking it early costs CPU and no
+    # query, and `any()` stops at the first lead that would produce a payload:
+    # the common case parses one row, and only an all-rejected run scans the
+    # set, which is exactly the run this exists to catch. The loop below stays
+    # authoritative — this can only ever SUPPRESS an announcement, never
+    # authorise a claim.
+    #
+    # Deliberately NOT predicted here, and the stage may still overstate in these
+    # cases: every lead turning out to be a cache hit (free reuse, not a queue,
+    # but knowing needs a DB read per lead), the post-lock re-read or
+    # `_settle_charged_unanswered` emptying the set concurrently, and the
+    # fail-closed `ClaimUnenforcedError` when migration 100 is absent. Each is
+    # either real work for the customer or a genuinely rare race, not a run that
+    # was never going to queue anything.
+    if on_begin is not None and any(
+        build_pending_row_payload(rec) is not None for rec in eligible
+    ):
         on_begin()
 
     cache_hits = 0

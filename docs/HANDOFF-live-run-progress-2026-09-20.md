@@ -1,8 +1,12 @@
 # HANDOFF — Live Run progress: "0% for 8 minutes of a healthy run"
 
-**Date:** 2026-09-20
-**Status:** Both PRs open as DRAFT, CI green, Codex gate passed once and re-review pending.
-**Owner decision needed:** re-run the Codex gate on the corrected diff, then undraft and merge.
+**Date:** 2026-09-20, closed 2026-09-22
+**Status:** ✅ **CLOSED.** BE #348 `dcf1f74` and FE #158 `7f101fb` are MERGED and live,
+migration **099** is applied in production, and the behaviour is verified against a real King
+probate scrape (job `89b92687`). Section 11 below is DONE — kept for the record, not as work.
+**Still open:** the eight template connectors under `src/scrapers/templates/` do not call
+`report_stage()` (owner decision: follow-up PR). See `docs/BUILD_JOURNAL.md` 2026-09-22 for the
+full outcome, the eight Codex rounds, and the observed run.
 
 ---
 
@@ -209,7 +213,25 @@ and the prod row, plan rewritten.
 **Security Master Review (§14): run, two passes, clean on 13 of 14.** Category 12 caught
 that the FE branch predated the security dependency bump on master (see trap #2).
 
-## 11. NEXT STEP
+## 11. NEXT STEP — ALL DONE 2026-09-22
+
+> Every step below was completed. Outcomes, in order:
+>
+> 1. **Codex gate re-run — eight rounds, not one.** Rounds 3 and 4 each surfaced a P1 (a Celery
+>    time limit swallowed by the new telemetry catch-alls; the legacy counters still written
+>    unguarded beside the new guarded write). Rounds 5-8 returned no P1s. All findings fixed.
+> 2. **BE #348 merged** and deployed; migration 099 applied.
+> 3. **FE #158 merged.** Its `check` job went green on its own once the backend schema landed,
+>    exactly as predicted — the generated types were never touched.
+> 4. **Verified on a real King probate run.** 5m18s of "Connecting to the county records
+>    system" with NO number, then "Searching county records: Part 0 of 2" at a measured 0%,
+>    then "Collecting records: Part 1 of 2" at 50%, then saving/exporting/enriching with the
+>    counters CLEARED. A worker deploy stalled the first attempt mid-enrichment and the page
+>    said "No recent progress reported" rather than keep claiming work; the watchdog re-queued
+>    it and reset every observation to NULL. Found 125, billed 0.
+> 5. Pre-Launch §15 not run: this was a feature deploy on an already-live service, not a launch.
+
+### The original plan (kept for the record)
 
 1. **Re-run the Codex diff gate on the corrected diff.** Round 2 reviewed the code *before*
    the five fixes above. Both branches have moved since.

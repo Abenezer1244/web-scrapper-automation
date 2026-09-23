@@ -169,10 +169,10 @@ class TestCancelSweep:
     ):
         """Direct coverage for the sweep's NOT EXISTS guard.
 
-        Migration 099 normally makes two active rows for one lead impossible, so
+        Migration 100 normally makes two active rows for one lead impossible, so
         this reaches the guard by dropping the index for the duration. That is
         worth doing rather than deleting the coverage: the claim deliberately
-        FAILS OPEN for the scrape path when 099 is missing, so in exactly the
+        FAILS OPEN for the scrape path when 100 is missing, so in exactly the
         situation where duplicates can occur, this guard is what stops a lead
         being released back to 'not_attempted' while a row of it is still live.
         """
@@ -217,13 +217,13 @@ class TestCancelSweep:
             ))
             await db.commit()
 
-    async def test_a_duplicated_lead_is_not_submitted_while_099_is_unenforced(
+    async def test_a_duplicated_lead_is_not_submitted_while_100_is_unenforced(
         self, db, business_user, tracerfy,
     ):
         """The dispatcher is what SPENDS money, so it gets its own guard.
 
-        Migration 099 stops a lead holding two active claims, and the claim path
-        refuses to write without it. But 099 ABORTS precisely when duplicates
+        Migration 100 stops a lead holding two active claims, and the claim path
+        refuses to write without it. But 100 ABORTS precisely when duplicates
         already exist, and start.sh boots the worker anyway, so the dispatcher
         would drain both rows of a duplicate pair and charge for one lead twice.
         With the invariant off it holds those leads back instead, and submits
@@ -240,7 +240,7 @@ class TestCancelSweep:
         await db.execute(text(f"DROP INDEX {INDEX_NAME}"))
         await db.commit()
         try:
-            # Two ACTIVE rows for one lead: only possible with 099 absent.
+            # Two ACTIVE rows for one lead: only possible with 100 absent.
             dup_row = await _pending(db, business_user, job, dup_lead)
             await _pending(db, business_user, job, dup_lead, status="submitted")
             await db.commit()
@@ -321,7 +321,7 @@ class TestCancelSweep:
         That test seeded one lead with BOTH a 'queued' and a 'submitting' pending
         row and asserted the sweep left the lead alone, because the sweep's
         second statement releases a lead only when no other ACTIVE row still
-        references it. Migration 099 makes that state impossible: a partial
+        references it. Migration 100 makes that state impossible: a partial
         unique index on pending_skip_trace_rows(result_id) for active rows now
         refuses the second one outright, which is a stronger guarantee than
         handling it afterwards. Production carried 0 such groups across 941

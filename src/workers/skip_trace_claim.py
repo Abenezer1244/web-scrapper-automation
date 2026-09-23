@@ -4,7 +4,7 @@ Two callers use this: the scrape enqueue (`_enqueue_skip_trace_rows`) and, from
 Phase 1b-2, the "look up contacts" action worker. They MUST share it, or the two
 paths drift and the same lead is claimed -- and charged for -- twice.
 
-Why this exists (Codex round 15, finding 15-1). Migration 099 adds a PARTIAL
+Why this exists (Codex round 15, finding 15-1). Migration 100 adds a PARTIAL
 UNIQUE INDEX on ``pending_skip_trace_rows (result_id)`` WHERE status IN
 ('queued','submitting','submitted'). Before this module the scrape enqueue built
 rows with ``db.add()`` in a loop and flushed them all at ONE ``db.commit()``
@@ -62,7 +62,7 @@ from src.utils.logger import setup_logger
 _logger = setup_logger(__name__)
 
 # The pending statuses that mean "this lead is already being looked up". Must
-# stay identical to the predicate of the partial unique index in migration 099;
+# stay identical to the predicate of the partial unique index in migration 100;
 # a mismatch either lets a second claim through (double charge) or blocks a
 # legitimate one forever. test_the_active_predicate_matches_the_index pins it.
 ACTIVE_PENDING_STATUSES: tuple[str, ...] = ("queued", "submitting", "submitted")
@@ -136,7 +136,7 @@ _INSERT_CHUNK_ROWS = 1000
 _LOCK_WAIT_SECONDS = 30
 
 
-# How Postgres renders migration 099's WHERE clause back from the catalog. Kept
+# How Postgres renders migration 100's WHERE clause back from the catalog. Kept
 # beside ACTIVE_PENDING_STATUSES so the two cannot drift silently;
 # test_the_active_predicate_matches_the_index asserts the live index against it.
 _EXPECTED_PREDICATE = (
@@ -162,7 +162,7 @@ class ClaimLockNotHeldError(RuntimeError):
 
 
 class ClaimUnenforcedError(RuntimeError):
-    """Migration 099's index is absent, so a second active claim is possible.
+    """Migration 100's index is absent, so a second active claim is possible.
 
     Raised for EVERY caller: the database is what stops a lead being charged for
     twice, and no amount of logging substitutes for it. See
@@ -171,7 +171,7 @@ class ClaimUnenforcedError(RuntimeError):
 
 
 def claim_enforcement_ok(db) -> bool:
-    """True when migration 099's index is present, valid, and the RIGHT index.
+    """True when migration 100's index is present, valid, and the RIGHT index.
 
     Checked by identity, not by name: `CREATE INDEX IF NOT EXISTS` would happily
     accept a same-named index on another table or with a wider predicate, and
@@ -238,7 +238,7 @@ def warn_if_unenforced(db) -> bool:
         _logger.error(
             "Skip-trace claim is running UNENFORCED: %s is missing, invalid or not "
             "the expected index, so nothing stops a second active claim for one "
-            "lead and a lead can be charged for twice. Apply migration 099.",
+            "lead and a lead can be charged for twice. Apply migration 100.",
             INDEX_NAME,
         )
     return enforced
@@ -355,7 +355,7 @@ def claim_skip_trace_rows(db, payloads: list[dict]) -> list[str]:
     simply not claimed -- the insert filters it, so it can neither fail the batch
     nor strand an active row nobody will settle.
 
-    FAILS CLOSED, for every caller, when migration 099's index is missing or is
+    FAILS CLOSED, for every caller, when migration 100's index is missing or is
     not the expected index. An earlier version let the scrape proceed anyway, on
     the grounds that refusing would "strand every lookup in the product". The
     Security Analyst was right to reject that, and the premise was wrong: a lead
@@ -375,7 +375,7 @@ def claim_skip_trace_rows(db, payloads: list[dict]) -> list[str]:
             f"{INDEX_NAME} is missing, invalid or not the expected index; refusing "
             "to claim, because nothing would stop this lead being charged for "
             "twice. Leads stay 'not_attempted' and are claimed by the next run "
-            "once migration 099 is applied."
+            "once migration 100 is applied."
         )
 
     # One claim is one tenant's work: the single tenant-scoped UPDATE that
@@ -437,7 +437,7 @@ def claim_skip_trace_rows(db, payloads: list[dict]) -> list[str]:
     #
     # When enforcement is required, name the arbiter: Postgres then resolves it
     # against a real index at planning time and raises "no unique or exclusion
-    # constraint matching the ON CONFLICT specification" if 099 is missing or
+    # constraint matching the ON CONFLICT specification" if 100 is missing or
     # does not match. That is strictly stronger than asking the catalog first,
     # because it removes the window between checking and inserting, and because
     # the database -- not this module's idea of how a predicate renders -- is

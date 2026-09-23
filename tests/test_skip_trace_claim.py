@@ -1,6 +1,6 @@
 """One active skip-trace claim per lead, and a conflict that costs only itself.
 
-Migration 099 adds a partial unique index on pending_skip_trace_rows(result_id)
+Migration 100 adds a partial unique index on pending_skip_trace_rows(result_id)
 for active rows. Phase 1b's "look up contacts" action is a SECOND writer of that
 queue, so two writers can now decide the same lead is eligible at the same
 moment; without the index the customer is charged twice for one lead.
@@ -13,7 +13,7 @@ conflicting row would raise IntegrityError at that commit, roll back the WHOLE
 job's enqueue -- every pending row and every results status update -- and then
 commit an empty transaction, silently, with the leads left un-traced and nothing
 logged. `test_one_conflicting_lead_does_not_lose_the_rest_of_the_batch` is that
-regression: it fails against the pre-099 enqueue and passes against the shared
+regression: it fails against the pre-100 enqueue and passes against the shared
 claim.
 
 Real DB (conftest `db` fixture). Tracerfy is never reached: these tests stop at
@@ -168,7 +168,7 @@ async def test_one_conflicting_lead_does_not_lose_the_rest_of_the_batch(
     """THE 15-1 regression.
 
     Lead A already has an active claim (as the contact-lookup action would have
-    left it). The job's OTHER leads must still be queued. The pre-099 enqueue
+    left it). The job's OTHER leads must still be queued. The pre-100 enqueue
     would have raised IntegrityError at its single commit, rolled the whole
     batch back and committed an empty transaction -- losing B and C silently.
     """
@@ -389,7 +389,7 @@ async def test_a_bad_trace_type_is_refused_not_truncated(db, business_user: User
 async def test_without_the_index_nothing_is_claimed_and_nothing_is_lost(
     db, business_user: User,
 ):
-    """A failed migration 099 PAUSES lookups; it does not risk a double charge.
+    """A failed migration 100 PAUSES lookups; it does not risk a double charge.
 
     This replaces a version where the scrape deliberately degraded and claimed
     anyway. The Security Master Review rejected that as a Critical, and the
@@ -804,7 +804,7 @@ async def test_the_arbiter_itself_fails_closed_without_the_index(
 
     With `require_enforcement=True` the statement names its arbiter, so Postgres
     resolves it against a real index at planning time and raises "no unique or
-    exclusion constraint matching the ON CONFLICT specification" when 099 is
+    exclusion constraint matching the ON CONFLICT specification" when 100 is
     missing. This bypasses the catalog pre-check to prove the SQL alone fails
     closed -- which is what removes the window between checking the index and
     relying on it.
@@ -924,7 +924,7 @@ async def test_a_lead_settled_between_insert_and_update_leaves_no_row_behind(
 
 
 async def test_the_active_predicate_matches_the_index(db):
-    """ACTIVE_PENDING_STATUSES must equal migration 099's index predicate. If
+    """ACTIVE_PENDING_STATUSES must equal migration 100's index predicate. If
     they drift, either a second claim slips through (double charge) or a
     legitimate one is refused forever. Checks the index is UNIQUE and VALID and
     on the right column too: a non-unique or invalid index enforces nothing
@@ -938,7 +938,7 @@ async def test_the_active_predicate_matches_the_index(db):
         "FROM pg_class c JOIN pg_index i ON i.indexrelid = c.oid "
         "WHERE c.relname = :n"
     ), {"n": INDEX_NAME})).first()
-    assert row is not None, "migration 099 did not create the index"
+    assert row is not None, "migration 100 did not create the index"
     assert row.indisunique, "the index is not UNIQUE, so it enforces nothing"
     assert row.indisvalid, "the index is INVALID, so the planner ignores it"
     assert "(result_id)" in row.definition, "the index is not keyed on result_id"

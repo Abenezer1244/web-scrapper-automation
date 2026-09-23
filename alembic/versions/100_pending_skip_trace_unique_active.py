@@ -1,4 +1,4 @@
-"""One active skip-trace claim per lead (099).
+"""One active skip-trace claim per lead (100).
 
 Nothing stopped two pending_skip_trace_rows existing for one result_id in an
 active status. The scrape enqueue got away with it because it is the only writer
@@ -43,13 +43,13 @@ safe but NOT backward safe, and the difference matters:
   * Rolling FORWARD is fine. The index is built CONCURRENTLY, the new claim is
     conflict-aware, and a claim that cannot be enforced refuses rather than
     risking a double charge.
-  * Rolling BACK to a release before this one, with 099 still applied, is NOT
+  * Rolling BACK to a release before this one, with 100 still applied, is NOT
     safe while any traffic flows. The previous release's enqueue is not
     conflict-aware: it flushes at one commit whose handler rolls back and then
     commits an EMPTY transaction, so a single conflict silently discards a whole
     job's lookups while the scrape reports success. If a rollback past this
-    release is ever needed, downgrade 099 with it, or stop the worker first.
-  * If 099 ABORTS (it aborts precisely when duplicates already exist), start.sh
+    release is ever needed, downgrade 100 with it, or stop the worker first.
+  * If 100 ABORTS (it aborts precisely when duplicates already exist), start.sh
     still boots the worker. Claims then refuse, which is correct, but the
     dispatcher would otherwise keep draining the duplicates it found and charge
     for the same lead twice. skip_trace_dispatcher now holds those specific
@@ -60,15 +60,15 @@ blocks reads or writes on a table the dispatcher is draining. Every step is
 idempotent because the autocommit block leaves the revision unrecorded if the
 build times out (the 098 restart-safety pattern).
 
-Revision ID: 099
-Revises: 098
+Revision ID: 100
+Revises: 099
 Create Date: 2026-09-20
 """
 from alembic import op
 from sqlalchemy import text
 
-revision = "099"
-down_revision = "098"
+revision = "100"
+down_revision = "099"
 branch_labels = None
 depends_on = None
 
@@ -105,7 +105,7 @@ def upgrade() -> None:
             f"      GROUP BY result_id HAVING count(*) > 1) t"
         )).scalar()
         raise RuntimeError(
-            f"Migration 099 ABORTED: {duplicates} result_id(s) already have more than "
+            f"Migration 100 ABORTED: {duplicates} result_id(s) already have more than "
             f"one ACTIVE pending_skip_trace_row, {detail} of them containing a row "
             f"that may have reached Tracerfy. Do NOT resolve these by age. Grade each "
             f"group by submission evidence (tracerfy_queue_id = vendor accepted and "
@@ -134,7 +134,7 @@ def upgrade() -> None:
             # The check is by IDENTITY, not just validity. `CREATE ... IF NOT
             # EXISTS` treats ANY same-named index as success, so a non-unique
             # one, a composite one, one on another schema's table, or one with
-            # an extra predicate conjunct would leave 099 recorded as applied
+            # an extra predicate conjunct would leave 100 recorded as applied
             # while the money-safety constraint it exists for is absent.
             existing = conn.execute(text(
                 "SELECT i.indisvalid, i.indisunique, i.indnatts, i.indnkeyatts, "
@@ -189,14 +189,14 @@ def upgrade() -> None:
                 ), {"n": _INDEX}).scalar()
                 if collision:
                     raise RuntimeError(
-                        f"Migration 099 ABORTED: an index named {_INDEX} already "
+                        f"Migration 100 ABORTED: an index named {_INDEX} already "
                         f"exists on {collision}, which is not "
                         f"public.pending_skip_trace_rows. It is NOT dropped, "
                         f"because it may be something else's. Rename or remove it "
                         f"deliberately, then re-run."
                     )
             # Fully qualified: an unqualified name resolves against search_path,
-            # which could create the index on a shadow table and record 099 as
+            # which could create the index on a shadow table and record 100 as
             # applied while the real table stayed unenforced.
             conn.execute(text(
                 f"CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS {_INDEX} "

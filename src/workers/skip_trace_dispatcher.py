@@ -124,10 +124,10 @@ def dispatch_pending_skip_trace() -> dict:
     with system_sync_session() as db:
         # DEFENCE IN DEPTH FOR THE DOUBLE CHARGE (Security Master Review pass 10).
         #
-        # Migration 099's unique index is what stops one lead holding two active
+        # Migration 100's unique index is what stops one lead holding two active
         # claims, and the claim path refuses to write without it. But this
         # dispatcher is what SPENDS money, and it drains rows that already exist.
-        # If 099 ever aborts -- which happens precisely when duplicates are
+        # If 100 ever aborts -- which happens precisely when duplicates are
         # already present -- start.sh still boots the worker, and the dispatcher
         # would submit both rows of a duplicate pair and charge the customer
         # twice for one lead.
@@ -150,9 +150,9 @@ def dispatch_pending_skip_trace() -> dict:
             if _duplicated_result_ids:
                 _logger.error(
                     "Dispatcher: %d lead(s) hold more than one ACTIVE pending row "
-                    "while migration 099 is not enforced. They are NOT being "
+                    "while migration 100 is not enforced. They are NOT being "
                     "submitted, because doing so would charge for the same lead "
-                    "twice. Reconcile them and apply 099.",
+                    "twice. Reconcile them and apply 100.",
                     len(_duplicated_result_ids),
                 )
                 try:
@@ -160,12 +160,12 @@ def dispatch_pending_skip_trace() -> dict:
 
                     send_ops_alert(
                         "skip_trace_duplicate_active_rows", "dispatcher",
-                        "Duplicate active skip-trace rows while 099 is unenforced",
+                        "Duplicate active skip-trace rows while 100 is unenforced",
                         f"{len(_duplicated_result_ids)} lead(s) hold more than one "
-                        f"active pending row and migration 099's unique index is "
+                        f"active pending row and migration 100's unique index is "
                         f"missing or invalid. Those leads are held back rather than "
                         f"submitted, so nothing is double charged, but they will not "
-                        f"be looked up until this is reconciled and 099 applied.",
+                        f"be looked up until this is reconciled and 100 applied.",
                     )
                 except Exception:  # noqa: BLE001 - an alert must not stop the tick
                     _logger.exception("skip-trace duplicate-rows alert failed to send")
@@ -251,7 +251,7 @@ def dispatch_pending_skip_trace() -> dict:
                             and_(
                                 PendingSkipTraceRow.status == "queued",
                                 PendingSkipTraceRow.trace_type == trace_type,
-                                # Empty in the normal case (099 enforced), so this
+                                # Empty in the normal case (100 enforced), so this
                                 # is a no-op unless the invariant is actually off.
                                 PendingSkipTraceRow.result_id.notin_(
                                     _duplicated_result_ids

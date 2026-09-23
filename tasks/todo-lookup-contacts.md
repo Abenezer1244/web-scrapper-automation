@@ -113,7 +113,7 @@ passes and copies exactly the leak it was added to stop. Trace type is not persi
 `results` at all, `None` and `''` are not recoverable, and pre-cutover PII was produced under a
 legacy address-only key. **Owner decision 2026-09-19: add the durable evidence instead of
 guessing at it.**
-- [x] **Migration 098** (this renumbers Phase 1b's migration to **099**): add
+- [x] **Migration 098** (this renumbers Phase 1b's migration to **100**): add
       `results.skip_trace_subject_hash TEXT NULL`. Additive and nullable, no backfill, no
       rewrite; historical rows stay NULL and therefore FAIL CLOSED, which is the same outcome
       as not copying and is the point. Written wherever a lookup's subject becomes known: the
@@ -282,7 +282,7 @@ re-buy lookups the customer has already paid for.
       and `errored` are not quotable.
 - [ ] To make retry decidable later without a second charge, add a durable result-level
       outcome (`results.last_trace_outcome`: `provider_rejected` | `provider_accepted_unmatched`
-      | ...) written atomically with the existing transitions. **This widens migration 099.**
+      | ...) written atomically with the existing transitions. **This widens migration 100.**
       Retry is permitted only for a PROVEN pre-submit rejection, never because `results` says
       `errored`.
 
@@ -415,13 +415,13 @@ B) pending/results cross-tab outside the 15-16 allowed matrix : 0   -> quote cla
    B2 results in-progress with no active pending row           : 0
 sizing  not_attempted WITH a property address       : 100,548
         ... of those already-delivered (duplicate)  :  61,442
-099 prereqs  results(id,user_id) index: absent | new tables: absent | action_id: absent
+100 prereqs  results(id,user_id) index: absent | new tables: absent | action_id: absent
 ```
 
 **What this changes in the plan:**
 - **The duplicate cleanup / quarantine / JSON-backup / restore-rehearsal machinery in step 1 is
   NOT needed.** There is nothing to repair. Do not build it. What survives is a **migration
-  guard** that ABORTS 099 with instructions if a duplicate is present at migration time (the
+  guard** that ABORTS 100 with instructions if a duplicate is present at migration time (the
   check above is point-in-time and the migration runs later), plus 15-7's evidence grading
   written down for whoever has to act if the guard ever fires. Build the repair script then,
   against real rows, not now against imagined ones.
@@ -443,7 +443,7 @@ CLAUDE.md caps a phase at 5 files, and the reconciled 1b spans the live paid pat
 - **1b-0 hardening (no new feature, ships alone):** the shared
   `INSERT ... ON CONFLICT DO NOTHING ... RETURNING` claim path with `_enqueue_skip_trace_rows`
   refactored onto it (15-1), `_cancel_undeliverable_queued` de-committed (15-5), the partial
-  unique index + its abort guard, lock order established (15-12). Migration **099**.
+  unique index + its abort guard, lock order established (15-12). Migration **100**.
   `results.last_trace_outcome` (15-3) is deliberately NOT here: its only consumer is the quote,
   so it lands at the head of 1b-1 as migration 100, keeping 1b-0 inside the 5-file rule and on
   one subject - making the existing path safe for a unique index.
@@ -466,7 +466,7 @@ CLAUDE.md caps a phase at 5 files, and the reconciled 1b spans the live paid pat
       the worker does see the queue, classifies such a lead as `in_progress_elsewhere`, and the
       partial unique index refuses a second active pending row regardless. Drift therefore costs
       accuracy in the quote, never money, and the quote already says the number can only go down. If any
-      exist, the resolution path is explicit and owner-approved before migration 099: a script keeps the row with the
+      exist, the resolution path is explicit and owner-approved before migration 100: a script keeps the row with the
       strongest **submission evidence** (a `tracerfy_queue_id` or `submitted_at`, then status
       `submitted` > `submitting` > `queued`), using age only as a tie-break, because a NEWER row may
       be the one that actually reached Tracerfy and age alone would discard paid work. It cancels the
@@ -478,7 +478,7 @@ CLAUDE.md caps a phase at 5 files, and the reconciled 1b spans the live paid pat
       the ops scratch location, kept for 30 days, and the restore procedure is written down and
       tested on a copy before the real run. It reports the counts. The migration aborts with that
       instruction if duplicates are still present.
-- [ ] Migration 099 (renumbered from 098, which Phase 1a's subject-hash migration now takes),
+- [ ] Migration 100 (renumbered from 098, which Phase 1a's subject-hash migration now takes),
       run inside the SAME quiesced window as the 1a cutover (kill switch off, so the
       enqueue and the dispatcher are not writing to the queue at all; this closes the race where a
       live write inserts a new duplicate between the cleanup and the index):
@@ -796,7 +796,7 @@ Hardening only. No API route, no schema, no new dependency, no frontend.
 
 | | |
 |---|---|
-| `d4bd021` | shared `ON CONFLICT` claim + migration 099 + the 15-1 regression test |
+| `d4bd021` | shared `ON CONFLICT` claim + migration 100 + the 15-1 regression test |
 | `5babf77` | Codex review 1: the claim stops trusting its payloads, or the index existing |
 | `fa20d60` | Codex review 2: enforcement per caller; `action_id` removed as dead code |
 | `4f05c08` | Codex review 3: the claim withdraws its own losers, so the race has no residue |
@@ -823,7 +823,7 @@ previous ones structurally could not:
    parameters per chunk while the withdrawal still indexed them by whole-batch position, so it
    would delete the WRONG pending row.
 3. **Pass 10 (deploy day):** the dispatcher, which is the thing that actually SPENDS, never
-   checked the invariant. 099 aborts precisely when duplicates exist, `start.sh` boots the
+   checked the invariant. 100 aborts precisely when duplicates exist, `start.sh` boots the
    worker anyway, and both rows of a duplicate pair would have been submitted and charged.
    Reviewing the code could not find this, because the gap was not in the code under review.
 
@@ -854,21 +854,21 @@ the code. Change the question.
   the transaction" stops being convention. Worth doing when 1b-2 needs it.
 
 **Deploy notes for whoever ships this:**
-- Forward safe. **Not backward safe:** rolling back past this release with 099 applied is
+- Forward safe. **Not backward safe:** rolling back past this release with 100 applied is
   unsafe while traffic flows, because the previous release's enqueue is not conflict-aware and
-  discards whole job batches silently. Downgrade 099 with it, or stop the worker first.
-- 099 aborts only if duplicate active rows exist. Production had **zero** when checked, so it
+  discards whole job batches silently. Downgrade 100 with it, or stop the worker first.
+- 100 aborts only if duplicate active rows exist. Production had **zero** when checked, so it
   should not abort. If it ever does, the dispatcher holds those specific leads back and alerts
   rather than paying for them twice, so an unquiesced deploy is SAFE -- but a quiesced one (the
   1a pattern: kill switch off, workers to zero, migrate, restart) still avoids the mixed-version
   window entirely and is the more conservative choice. Owner's call.
 
 **Verification.** 313 tests green on an isolated database across the skip-trace, enqueue,
-dispatcher, reconciliation and Phase 1a subject-key suites; ruff clean. Migration 099 applied
+dispatcher, reconciliation and Phase 1a subject-key suites; ruff clean. Migration 100 applied
 and verified BY THE OBJECTS (unique, valid, correct predicate), never by `alembic_version`, and
 its rebuild path proved live by planting the exact wrong index and re-running it. The 15-1
 regression test is mutation-tested: with `ON CONFLICT` removed it fails with the IntegrityError
-the pre-099 code would have produced.
+the pre-100 code would have produced.
 
 **Not done:** a full-suite run (the local suite is killed for host memory; CI is the signal).
 

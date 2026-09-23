@@ -2290,7 +2290,7 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config, *, on_begin=None) 
     # watchdog_stuck_jobs re-queues a job that merely looks stuck, and a slow but
     # still-living worker can then be joined by a second one. Two concurrent
     # enqueues of the same job read the same 'not_attempted' rows and both claim
-    # them. With migration 099 applied the index refuses the second; without it
+    # them. With migration 100 applied the index refuses the second; without it
     # (the fail-open path) both rows survive, and because owner recovery can
     # rewrite party_name between the two reads they may carry DIFFERENT
     # trace_types -- which the dispatcher's submission-collision key does not
@@ -2447,7 +2447,7 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config, *, on_begin=None) 
     # watchdog_stuck_jobs re-queues a job that merely looks stuck, and a slow but
     # still-living worker can then be joined by a second one. Two concurrent
     # enqueues of the same job read the same 'not_attempted' rows and both claim
-    # them. With migration 099 applied the index refuses the second; without it
+    # them. With migration 100 applied the index refuses the second; without it
     # (the scrape's fail-open path) both rows can survive, and because owner
     # recovery can rewrite party_name between the two reads they may carry
     # DIFFERENT trace_types -- which the dispatcher's submission-collision key
@@ -2601,7 +2601,7 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config, *, on_begin=None) 
 
     # THE CLAIM (Codex round 15, finding 15-1). This used to be db.add() per row
     # plus `rec.skip_trace_status = 'queued'`, flushed at one commit() whose
-    # handler was `except Exception: db.rollback(); db.commit()`. Migration 099
+    # handler was `except Exception: db.rollback(); db.commit()`. Migration 100
     # adds a partial unique index on pending_skip_trace_rows(result_id) for
     # active rows, and under that index a single conflicting row -- which the
     # Phase 1b "look up contacts" action can now cause by claiming the same lead
@@ -2620,7 +2620,7 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config, *, on_begin=None) 
             claim_skip_trace_rows,
         )
 
-        # Fails closed if migration 099's index is absent: the leads stay
+        # Fails closed if migration 100's index is absent: the leads stay
         # 'not_attempted' and are claimed by the next run once the migration
         # lands. That is a pause; proceeding unenforced would risk charging a
         # customer twice for one lead, which trying again later cannot undo.
@@ -2644,7 +2644,7 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config, *, on_begin=None) 
 
                 send_ops_alert(
                     "skip_trace_claim_unenforced", "enqueue",
-                    "Skip-trace claims are refused: migration 099 is not in place",
+                    "Skip-trace claims are refused: migration 100 is not in place",
                     f"{len(to_claim)} lead(s) on job {job_id} were not queued "
                     f"because the unique index that stops a lead being looked up "
                     f"twice is missing, invalid or not the expected index. "

@@ -19,6 +19,84 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-22 — 1b-0 merged, and the rebase defect neither review could see
+
+> Phase 1b-0 hardening. BE **#354** merged as `0074196`; PR **#351** closed as superseded.
+> Worktree `C:/Users/Windows/bl-wt-lookup`. Migration **100**. NOT deployed yet.
+
+**Built / Shipped:**
+- One active skip-trace claim per lead: migration **100** (partial unique index on
+  `pending_skip_trace_rows(result_id)` for active rows) plus `src/workers/skip_trace_claim.py`,
+  with `_enqueue_skip_trace_rows` refactored onto a shared
+  `INSERT ... ON CONFLICT DO NOTHING ... RETURNING` claim. A conflict now costs only itself
+  instead of silently rolling back a whole job's enqueue. Two active claims on one lead means
+  the customer charged twice against a per-lookup vendor.
+- Three follow-up commits from the post-rebase review: `66714d3`, `81e9534`, `d70b261`.
+- The decision record: `4481e88b` on `docs/lookup-1b1-decisions`.
+
+**The finding worth carrying — a clean merge is not a clean integration.**
+The twelve security passes and seven Codex rounds all reviewed this diff BEFORE it was rebased
+onto `origin/main`, so a pass over the POST-rebase diff was the one question nobody had asked.
+It took four rounds and found this: the rebase pulled in #348, which had changed the signature
+of `_enqueue_skip_trace_rows` to take `on_begin` and had deliberately placed that callback
+AFTER every gate so the `queuing_contacts` stage was always true — that was its own Codex round
+7. 1b-0 then added four gates BELOW that point (the job lock, the re-read under it, the
+re-applied filters, the per-row payload gates). **Git merged it cleanly and the behavior drifted
+anyway.** Neither side's review could have caught it, because each side was reviewed alone.
+
+**Tried / Decided:**
+- **The obvious fix was a P1.** Moving the announcement below the lock to make it accurate
+  would release the lock: `_set_stage` COMMITS, and a transaction-scoped advisory lock does not
+  survive a commit. The announcement stays early, gated on a pure pre-check
+  (`any(build_pending_row_payload(rec) is not None ...)`) that can only ever SUPPRESS a false
+  announcement, never authorise a claim.
+- **An accepted residual race, documented rather than absorbed.** Owner recovery rewrites
+  `party_name`, so a lead with no payload at the pre-check can have one by the post-lock
+  re-read: the run queues and never announces. Cosmetic, cannot touch money or queue state,
+  and strictly better than the false positive it replaces. Codex confirmed the money/queue
+  analysis independently.
+- **Deploy QUIESCED** (owner, the 1a pattern), though the dispatcher guard would have made a
+  rolling deploy safe — this release is forward-safe and NOT backward-safe.
+- **The per-account daily cap is no longer deferred** (owner; D3-b, reversing D3). It moves
+  into 1b-1. The deferral assumed the cap would rarely bind; 100,548 addressable leads against
+  a GLOBAL 1000/day cap means one 2000-lead action eats two days of capacity for every tenant.
+
+**Failed / Blocked:**
+- **I got the same fact wrong three times, and only measurement stopped it.** First the test
+  fixture used leads with NO `party_name`, assuming those cannot be traced — they queue as
+  address-only ADVANCED traces, so the test queued two rows and failed. Then the docstring
+  named `code_violation_owner_is_known` as the rejecting gate; it is the generic
+  `looks_like_non_personal_party_name`. Then, holding the measured output that said so, the
+  docstring still claimed that gate "never runs" — it runs, returns True, and passes the rows
+  through. The corrected version records the measured values instead of describing them.
+- **Two Codex rounds returned NO-GO with no runtime defect at all** — only comments that lied
+  about the code. In this file that is the right severity: a wrong docstring is exactly what
+  hid the original bug.
+- A Codex run was reaped mid-review under host memory pressure (it had already emitted its
+  verdict). The local `python` shim is the dead anaconda install, so a patch script silently
+  no-opped while ruff reported "all checks passed" on the unpatched files.
+
+**Caught & fixed:** the `on_begin` false announcement (P2, the rebase defect); a comment
+claiming `build_pending_row_payload` is "a pure function of the row" when it reads a global
+flag and API/worker carry separate env (15-14); a sentence stating the double parse backwards;
+two test-docstring errors.
+
+**Pending / Handoff:**
+- **Deploy 100, quiesced.** Not done. Forward safe, NOT backward safe.
+- **Phase 1b-1 next**, and it now includes the per-account cap. **Consult Codex on the plan
+  BEFORE writing code** — the pre-code consult on 1b found nine P1s that six rounds of diff
+  review never reached.
+
+**Facts learned:**
+- A rebase that merges cleanly can still break a contract, when the incoming change and the
+  local change each depend on where a call sits relative to gates. Review the post-rebase diff
+  as its own artifact.
+- `_set_stage` commits by default, and any commit releases a transaction-scoped advisory lock.
+  That single fact constrains where progress telemetry may be written in the enqueue path.
+- A lead with no `party_name` is still billable: it becomes a 2-credit advanced trace.
+- Mutation-testing found nothing wrong this time, but writing the test found the fixture wrong,
+  which was worth more.
+
 ## 2026-09-22 — Live Run progress: merged, deployed, and proven against a real King scrape
 
 > Continues the 2026-09-20 entry. BE **#348** `dcf1f74` and FE **#158** `7f101fb` are MERGED

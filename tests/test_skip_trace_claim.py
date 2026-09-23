@@ -983,8 +983,11 @@ async def test_no_stage_announcement_when_no_lead_can_produce_a_payload(
     wrong twice while writing this: they are refused by the generic
     `looks_like_non_personal_party_name` check inside
     `build_pending_row_payload`, which applies to EVERY record type, not by
-    `code_violation_owner_is_known` -- the config here is `probate` and the
-    rows carry no code-violation source metadata, so that gate never runs.
+    `code_violation_owner_is_known`. That gate does RUN -- it is called for
+    every row -- but the config here is `probate` and the rows carry no
+    code-violation source metadata, so it returns True and passes them
+    straight through. Verified against both functions directly, not reasoned
+    about: owner_is_known True, non_personal True, payload None.
 
     A lead with NO party_name is deliberately NOT used here: it still queues,
     as an address-only advanced trace. An earlier version of this test used

@@ -2463,10 +2463,12 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config, *, on_begin=None) 
     # skip_trace_allowed` reads a global flag, and API and worker carry separate
     # env (15-14). `any()` stops at the first lead that would produce a payload,
     # so the common case parses one row and only an all-rejected run scans the
-    # set, which is exactly the run this exists to catch. The payloads are
-    # deliberately NOT carried into the loop below to save the second parse:
-    # that loop re-reads its rows under the lock with populate_existing, and
-    # reusing a payload computed from the pre-lock row would reintroduce the
+    # set, which is exactly the run this exists to catch. This check therefore
+    # PARSES A ROW TWICE — once here and once in the loop below — and that
+    # second parse is deliberate, not an oversight to be optimised away later.
+    # Carrying these payloads down into the loop would remove it, and must not:
+    # the loop re-reads its rows under the lock with populate_existing, so a
+    # payload computed from the pre-lock row would reintroduce the
     # stale-subject class of bug that 14-B exists to prevent. Paying the parse
     # twice is the cost of the loop staying authoritative. This check can only
     # ever SUPPRESS an announcement, never authorise a claim.

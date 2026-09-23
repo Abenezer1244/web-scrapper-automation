@@ -332,8 +332,7 @@ DECLARE
     guc text := 'user_id = NULLIF(current_setting(''app.current_user_id'', true), '''')::uuid';
 BEGIN
     FOREACH t IN ARRAY ARRAY[
-        'contact_lookup_actions', 'contact_lookup_action_results',
-        'contact_lookup_action_events'
+        'contact_lookup_actions', 'contact_lookup_action_results'
     ]
     LOOP
         -- Drop the untargeted policy migration 101 created inline.
@@ -353,6 +352,38 @@ BEGIN
     END LOOP;
 END
 $contact_lookup$;
+
+-- The event log is append-only for BOTH roles, so it gets per-verb policies
+-- rather than the system FOR ALL the loop above applies. A FOR ALL system policy
+-- would admit an UPDATE that the REVOKE in provision_rls_roles.sql refuses, and
+-- a policy and a grant disagreeing is how the next well-meaning change to either
+-- one silently re-opens the hole (Codex).
+DROP POLICY IF EXISTS contact_lookup_action_events_user_isolation
+    ON public.contact_lookup_action_events;
+DROP POLICY IF EXISTS contact_lookup_action_events_app_select
+    ON public.contact_lookup_action_events;
+CREATE POLICY contact_lookup_action_events_app_select
+    ON public.contact_lookup_action_events
+    FOR SELECT TO bridgeleads_app
+    USING (user_id = NULLIF(current_setting('app.current_user_id', true), '')::uuid);
+DROP POLICY IF EXISTS contact_lookup_action_events_app_insert
+    ON public.contact_lookup_action_events;
+CREATE POLICY contact_lookup_action_events_app_insert
+    ON public.contact_lookup_action_events
+    FOR INSERT TO bridgeleads_app
+    WITH CHECK (user_id = NULLIF(current_setting('app.current_user_id', true), '')::uuid);
+DROP POLICY IF EXISTS contact_lookup_action_events_system
+    ON public.contact_lookup_action_events;
+DROP POLICY IF EXISTS contact_lookup_action_events_system_select
+    ON public.contact_lookup_action_events;
+CREATE POLICY contact_lookup_action_events_system_select
+    ON public.contact_lookup_action_events
+    FOR SELECT TO bridgeleads_system USING (true);
+DROP POLICY IF EXISTS contact_lookup_action_events_system_insert
+    ON public.contact_lookup_action_events;
+CREATE POLICY contact_lookup_action_events_system_insert
+    ON public.contact_lookup_action_events
+    FOR INSERT TO bridgeleads_system WITH CHECK (true);
 
 -- The action alone also gets UPDATE, for the API's created -> dispatching hop.
 -- Deliberately NOT applied to the other two tables in the loop above.

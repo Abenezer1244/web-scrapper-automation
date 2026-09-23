@@ -84,11 +84,18 @@ THE DISPOSITION TRIGGER (finding 16-6)
   function would also have to be owned by a BYPASSRLS role or
   `scripts/apply_rls_force.sql:56-70` hard-fails the whole convergence script.
 
-  The function is MIRRORED as a `before_create` DDL in `src/db/models.py` and the
-  two copies must stay byte-identical, because the test suite builds its schema
-  with `create_all` and never runs this migration. Without that mirror every test
-  asserting the API cannot write a terminal disposition would pass VACUOUSLY
-  (finding 16-12).
+  It is NOT mirrored in `src/db/models.py`, and the round-16 finding that asked
+  for a mirror (16-12) was withdrawn after checking: NOTHING in this repository
+  calls `create_all`. The local rig and CI both build the test schema with
+  `alembic upgrade head`, so this trigger is present in every test database and a
+  mirror would be dead code. Several comments elsewhere (models.py,
+  alembic/env.py, migrations 049 and 089) still claim create_all is the test
+  path; they are stale, and agreeing with each other is what made them
+  persuasive.
+
+  A SECOND trigger, `contact_lookup_action_events_guard`, bounds what a
+  user-scoped session may APPEND to the event log. Append-only grants stop the
+  API editing history and cannot stop it writing a fictional entry.
 
 ALSO REQUIRED OUTSIDE THIS FILE
   `scripts/provision_rls_roles.sql` (grants + the `$verify$` allowlist),
@@ -206,6 +213,42 @@ END;
 $fn$ LANGUAGE plpgsql;
 """
 
+# The event log is the record a disputed charge is argued from, so "append-only"
+# has to mean the API cannot APPEND A LIE either. A grant can stop it editing
+# history and cannot stop it writing a fictional entry, so the same GUC test
+# bounds what a user-scoped session may append: the API's own
+# created -> dispatching hop and nothing else. Every later hop belongs to the
+# worker or the reconciler, and a per-lead hop (a release, an abandonment)
+# carries a result_id the API has no business asserting (Codex review).
+_EVENT_TRIGGER_FN = """
+CREATE OR REPLACE FUNCTION contact_lookup_action_events_guard()
+RETURNS trigger AS $fn$
+DECLARE uid TEXT;
+BEGIN
+    uid := COALESCE(NULLIF(current_setting('app.current_user_id', true), ''), '');
+    IF uid = '' THEN
+        RETURN COALESCE(NEW, OLD);
+    END IF;
+    IF TG_OP <> 'INSERT' THEN
+        RAISE EXCEPTION
+            'contact_lookup_action_events is append-only: a user-scoped session '
+            'may not % an event.', TG_OP
+            USING ERRCODE = 'insufficient_privilege';
+    END IF;
+    IF NEW.to_status <> 'dispatching' OR NEW.from_status IS NOT NULL
+       OR NEW.result_id IS NOT NULL THEN
+        RAISE EXCEPTION
+            'contact_lookup_action_events: a user-scoped session may only append '
+            'the initial dispatching event (got from=% to=% result_id=%). Every '
+            'later hop is written by the worker through system_sync_session().',
+            NEW.from_status, NEW.to_status, NEW.result_id
+            USING ERRCODE = 'insufficient_privilege';
+    END IF;
+    RETURN NEW;
+END;
+$fn$ LANGUAGE plpgsql;
+"""
+
 
 def _build_parent_unique(conn, table: str, index: str) -> None:
     """CREATE UNIQUE INDEX CONCURRENTLY (id, user_id), restart-safe.
@@ -282,17 +325,43 @@ def upgrade() -> None:
     # ── 1. Additive columns on live tables ──────────────────────────────────
     # Both nullable with no default, so neither rewrites its table and neither
     # can fail against existing rows.
-    op.add_column("results", sa.Column(
-        "last_trace_outcome", sa.String(32), nullable=True,
-    ))
-    op.create_check_constraint(
-        "ck_results_last_trace_outcome",
-        "results",
-        f"last_trace_outcome IS NULL OR last_trace_outcome IN ({_sql_list(_TRACE_OUTCOMES)})",
+    #
+    # IDEMPOTENT ON PURPOSE, and this is the subtle part (Codex review of this
+    # migration). `autocommit_block()` below COMMITS the transaction it is
+    # entered from, so everything in this section is durable BEFORE the index
+    # build runs — while `alembic_version` is not written until the very end. If
+    # the attach later times out, the next boot replays this migration from the
+    # top and a plain `ADD COLUMN` would abort on "column already exists",
+    # leaving the migration permanently stuck and needing a human.
+    #
+    # `op.add_column` has no IF NOT EXISTS, hence raw SQL. The CHECK gets the
+    # catalog guard rather than a bare ADD CONSTRAINT for the same reason.
+    op.execute(
+        "ALTER TABLE public.results "
+        "ADD COLUMN IF NOT EXISTS last_trace_outcome VARCHAR(32)"
     )
-    op.add_column("pending_skip_trace_rows", sa.Column(
-        "action_id", _UUID, nullable=True,
-    ))
+    op.execute(
+        f"""
+        DO $ck_lto$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conname = 'ck_results_last_trace_outcome'
+                  AND conrelid = 'public.results'::regclass
+            ) THEN
+                ALTER TABLE public.results
+                    ADD CONSTRAINT ck_results_last_trace_outcome
+                    CHECK (last_trace_outcome IS NULL
+                           OR last_trace_outcome IN ({_sql_list(_TRACE_OUTCOMES)}));
+            END IF;
+        END
+        $ck_lto$;
+        """
+    )
+    op.execute(
+        "ALTER TABLE public.pending_skip_trace_rows "
+        "ADD COLUMN IF NOT EXISTS action_id UUID"
+    )
 
     # ── 2. Parent composite uniqueness, CONCURRENTLY (16-1) ─────────────────
     # Outside the migration's transaction. If this block times out the revision
@@ -463,10 +532,21 @@ def upgrade() -> None:
                               public.contact_lookup_action_events FROM authenticated;
             END IF;
             IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bridgeleads_app') THEN
-                -- UPDATE on the action only, for the API's own
-                -- created -> dispatching hop. Never on verdicts or events.
-                GRANT SELECT, INSERT, UPDATE ON public.contact_lookup_actions
+                -- UPDATE on the action only, and only on the FOUR COLUMNS the
+                -- API's own created -> dispatching hop touches. A table-wide
+                -- UPDATE would let the API rewrite unit_price_cents, the
+                -- aggregated counts, billable_rows, the fencing lease or any
+                -- timestamp, and an RLS policy could not stop it: a policy
+                -- constrains WHICH ROWS, never WHICH COLUMNS (Codex review of
+                -- this migration). Column-level grants are the only mechanism
+                -- that expresses this, so the pricing the customer was quoted
+                -- and the counts a billing dispute rests on are unreachable
+                -- from the request path.
+                GRANT SELECT, INSERT ON public.contact_lookup_actions
                     TO bridgeleads_app;
+                GRANT UPDATE (status, status_reason, status_changed_at,
+                              dispatched_at)
+                    ON public.contact_lookup_actions TO bridgeleads_app;
                 GRANT SELECT, INSERT ON public.contact_lookup_action_results
                     TO bridgeleads_app;
                 GRANT SELECT, INSERT ON public.contact_lookup_action_events
@@ -499,12 +579,27 @@ def upgrade() -> None:
         "BEFORE INSERT OR UPDATE OR DELETE ON contact_lookup_action_results "
         "FOR EACH ROW EXECUTE FUNCTION contact_lookup_action_results_guard()"
     )
+    op.execute(_EVENT_TRIGGER_FN)
+    op.execute(
+        "DROP TRIGGER IF EXISTS contact_lookup_action_events_guard_trg "
+        "ON contact_lookup_action_events"
+    )
+    op.execute(
+        "CREATE TRIGGER contact_lookup_action_events_guard_trg "
+        "BEFORE INSERT OR UPDATE OR DELETE ON contact_lookup_action_events "
+        "FOR EACH ROW EXECUTE FUNCTION contact_lookup_action_events_guard()"
+    )
 
 
 def downgrade() -> None:
     conn = op.get_bind()
     conn.execute(text("SET LOCAL lock_timeout = '5s'"))
 
+    op.execute(
+        "DROP TRIGGER IF EXISTS contact_lookup_action_events_guard_trg "
+        "ON contact_lookup_action_events"
+    )
+    op.execute("DROP FUNCTION IF EXISTS contact_lookup_action_events_guard()")
     op.execute(
         "DROP TRIGGER IF EXISTS contact_lookup_action_results_guard_trg "
         "ON contact_lookup_action_results"

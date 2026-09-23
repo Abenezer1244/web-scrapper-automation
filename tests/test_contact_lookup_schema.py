@@ -307,3 +307,113 @@ async def test_last_trace_outcome_ships_unwritten_and_nullable(db):
     ))).one()
     assert col.is_nullable == "YES"
     assert col.column_default is None, "a default would fabricate an outcome nobody measured"
+
+
+async def test_a_user_scoped_session_may_append_only_the_dispatching_event(db, business_user):
+    """The event log is what a disputed charge is argued from, so append-only has
+    to mean the API cannot append a LIE either. A grant stops it EDITING history
+    and cannot stop it WRITING a fictional entry."""
+    job_id, _rid = await _job_and_result(db, business_user)
+    action = await _action(db, business_user, job_id)
+    await db.execute(text("SELECT set_config('app.current_user_id', :uid, true)"),
+                     {"uid": str(business_user.id)})
+    # The one hop the API owns.
+    await db.execute(text(
+        "INSERT INTO contact_lookup_action_events (id, action_id, user_id, to_status) "
+        "VALUES (:id, :a, :uid, 'dispatching')"
+    ), {"id": str(uuid.uuid4()), "a": action, "uid": business_user.id})
+    n = (await db.execute(text(
+        "SELECT count(*) FROM contact_lookup_action_events WHERE action_id = :a"
+    ), {"a": action})).scalar_one()
+    assert n == 1
+    await db.rollback()
+
+
+@pytest.mark.parametrize("cols,vals,why", [
+    ("to_status", "'settled'", "a terminal hop the worker owns"),
+    ("to_status, from_status", "'running', 'dispatching'", "a worker transition"),
+])
+async def test_a_user_scoped_session_cannot_forge_history(db, business_user, cols, vals, why):
+    job_id, _rid = await _job_and_result(db, business_user)
+    action = await _action(db, business_user, job_id)
+    await db.execute(text("SELECT set_config('app.current_user_id', :uid, true)"),
+                     {"uid": str(business_user.id)})
+    with pytest.raises(Exception) as exc:
+        await db.execute(text(
+            f"INSERT INTO contact_lookup_action_events (id, action_id, user_id, {cols}) "
+            f"VALUES (:id, :a, :uid, {vals})"
+        ), {"id": str(uuid.uuid4()), "a": action, "uid": business_user.id})
+    assert "initial dispatching event" in str(exc.value), why
+    await db.rollback()
+
+
+async def test_a_user_scoped_session_cannot_claim_a_per_lead_hop(db, business_user):
+    """A per-lead event (a release, an abandonment) carries a result_id the API
+    has no business asserting: it is the worker saying what happened to one
+    lead's money."""
+    job_id, rid = await _job_and_result(db, business_user)
+    action = await _action(db, business_user, job_id)
+    await db.execute(text("SELECT set_config('app.current_user_id', :uid, true)"),
+                     {"uid": str(business_user.id)})
+    with pytest.raises(Exception) as exc:
+        await db.execute(text(
+            "INSERT INTO contact_lookup_action_events "
+            "(id, action_id, user_id, result_id, to_status) "
+            "VALUES (:id, :a, :uid, :r, 'dispatching')"
+        ), {"id": str(uuid.uuid4()), "a": action, "uid": business_user.id, "r": rid})
+    assert "initial dispatching event" in str(exc.value)
+    await db.rollback()
+
+
+async def test_a_user_scoped_session_cannot_rewrite_an_existing_event(db, business_user):
+    """Append-only has to hold against EDITING, not only against forging.
+
+    Only UPDATE is exercised. DELETE is refused by the same trigger branch, but
+    asserting it here once cost a 78-minute run: the statement blocked on a row
+    lock, and continuing to use the session after a failed statement then raised
+    MissingGreenlet rather than the database error the test wanted. One forbidden
+    statement per test, and no reuse of a session after it raises.
+    """
+    job_id, _rid = await _job_and_result(db, business_user)
+    action = await _action(db, business_user, job_id)
+    # Worker-written, i.e. no tenant GUC.
+    await db.execute(text(
+        "INSERT INTO contact_lookup_action_events (id, action_id, user_id, to_status) "
+        "VALUES (:id, :a, :uid, 'running')"
+    ), {"id": str(uuid.uuid4()), "a": action, "uid": business_user.id})
+    await db.commit()
+
+    await db.execute(text("SELECT set_config('app.current_user_id', :uid, true)"),
+                     {"uid": str(business_user.id)})
+    with pytest.raises(Exception) as exc:
+        await db.execute(text(
+            "UPDATE contact_lookup_action_events SET to_status = 'settled' "
+            "WHERE action_id = :a"
+        ), {"a": action})
+    assert "append-only" in str(exc.value)
+    await db.rollback()
+
+
+async def test_the_migration_replays_after_a_half_applied_run(db):
+    """The autocommit block COMMITS everything before it, while alembic_version is
+    written only at the very end. So a lock timeout on the constraint attach
+    leaves the columns durable and the revision unrecorded, and the next boot
+    replays from the top.
+
+    A plain ADD COLUMN aborts there on "column already exists" and the migration
+    is stuck until a human intervenes. This asserts the statements that run
+    BEFORE the autocommit block are individually replay-safe, which is the
+    property that makes that recovery automatic. (Codex found this; an earlier
+    version of this migration was not replay-safe and the proof was a mutation:
+    reverting the IF NOT EXISTS reproduces the abort exactly.)
+    """
+    from pathlib import Path
+    path = Path(__file__).resolve().parents[1] / "alembic" / "versions" /         "101_contact_lookup_action_schema.py"
+    src = path.read_text(encoding="utf-8")
+    pre = src[src.index("# ── 1. Additive columns"):src.index("# ── 2. Parent composite")]
+    assert "ADD COLUMN IF NOT EXISTS last_trace_outcome" in pre
+    assert "ADD COLUMN IF NOT EXISTS action_id" in pre
+    # The CHECK cannot use IF NOT EXISTS, so it must carry a catalog guard.
+    assert "IF NOT EXISTS (" in pre and "ck_results_last_trace_outcome" in pre
+    # And nothing in that section may be a bare, unguarded ADD.
+    assert "op.add_column(" not in pre,         "op.add_column has no IF NOT EXISTS: it would abort on replay"

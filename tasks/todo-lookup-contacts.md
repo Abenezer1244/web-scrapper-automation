@@ -762,6 +762,37 @@ Without them RLS reads, cascades and reconciliation degrade as actions accumulat
 to be part of the concurrency design. Audit or disable every queue/status writer before 1b-2,
 not only `backfill_skip_trace_jobs.py`.
 
+**16-11 (P1, VERIFIED, found while extracting the patterns — NOT in 15-8) — there is a THIRD
+RLS script, and a table missing from it is never FORCEd.** 15-8 names
+`provision_rls_roles.sql` and `apply_rls_cutover_policies.sql`. It omits
+**`scripts/apply_rls_force.sql`**, whose `tbls text[]` array (`:31-49`) is the list the
+convergence loop iterates to apply `FORCE ROW LEVEL SECURITY`. Without FORCE, RLS does not
+apply to the table OWNER, so a policy can look correct and still not constrain every path.
+- [ ] Append all three new tables to that array **and to the commented rollback array
+      (`:96-106`)**, or FORCE silently never reaches them.
+- [ ] Note also `apply_rls_force.sql:56-70` HARD-FAILS if a `SECURITY DEFINER` function's owner
+      lacks BYPASSRLS. That is a second reason to prefer the plain trigger below over a
+      `SECURITY DEFINER` function for 16-6.
+
+**16-12 (P1, VERIFIED — the trigger would be untestable) — tests build the schema with
+`create_all`, not migrations.** A trigger created only inside migration 101 simply would not
+exist in the test database, so every test asserting "the API cannot write a terminal
+disposition" would pass **vacuously** — the exact failure this project has already hit twice
+(a stubbed fixture, and a test that copied its implementation).
+- [ ] Mirror the trigger as a `before_create` DDL on the metadata, the way
+      `_RESULT_PARSE_FILING_DATE_FN` is registered at `src/db/models.py:39-71`, and keep it
+      **byte-identical** to the migration's copy (that file's own comment demands exactly this
+      of migration 049's function).
+- [ ] The trigger follows the ONE trigger precedent in the repo
+      (`023_add_county_records.py:71-86`): plain `LANGUAGE plpgsql`, NOT `SECURITY DEFINER`,
+      reading `current_setting('app.current_user_id', true)`. That GUC is the discriminator the
+      whole design needs: the API always sets it (`src/api/deps.py:17-42`, transaction-scoped,
+      re-applied by the `after_begin` listener at `src/db/session.py:231-284`), while the worker
+      uses `system_sync_session()` and sets **no GUC at all**. So "is this the API or the
+      worker?" is `uid <> ''` — and, per 023's own rationale, a trigger fires regardless of role
+      privileges, including for BYPASSRLS and superuser, which is why it is the actual guarantee
+      where a grant is not.
+
 ### REJECTED from round 16, with reasoning
 
 **Codex asked that 101 consult `pg_stat_progress_create_index` before dropping an INVALID index,

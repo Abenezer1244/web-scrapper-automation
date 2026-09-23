@@ -552,6 +552,99 @@ async def test_a_batch_larger_than_the_parameter_limit_claims(
     assert queued == n
 
 
+async def test_a_stranded_lead_outside_the_final_chunk_withdraws_the_right_row(
+    db, business_user: User,
+):
+    """The withdrawal deletes OUR row for that lead, whichever chunk made it.
+
+    The chunked insert rebuilds its bind parameters per chunk, so a withdrawal
+    that indexed those parameters by a lead's position in the whole batch would
+    read the wrong chunk's id -- deleting a legitimately claimed row and leaving
+    its Result 'queued' with nothing behind it -- or KeyError past the last
+    chunk's length. The stranded lead here sits in the FIRST chunk while later
+    chunks follow, which is precisely the case that mis-mapped.
+    """
+    from src.workers.skip_trace_claim import _INSERT_CHUNK_ROWS
+
+    n = _INSERT_CHUNK_ROWS + 25
+    cfg = await _config(db, business_user)
+    job_id = await _job(db, business_user, cfg)
+    ids = [str(uuid.uuid4()) for _ in range(n)]
+    await db.execute(text(
+        "INSERT INTO results (id, job_id, user_id, party_name, property_address, "
+        " property_city, property_state, property_zip, is_duplicate, "
+        " skip_trace_status) "
+        "SELECT x.id, CAST(:j AS uuid), CAST(:u AS uuid), :party, "
+        "       x.n || ' CHUNK ST', 'VANCOUVER', 'WA', '98661', false, "
+        "       'not_attempted' "
+        "FROM unnest(CAST(:ids AS uuid[])) WITH ORDINALITY AS x(id, n)"
+    ), {"j": job_id, "u": business_user.id, "party": _PARTY, "ids": ids})
+    await db.commit()
+
+    # Pick a lead the claim will place in the FIRST chunk (the claim sorts by
+    # result_id), and settle it from another connection mid-claim so its UPDATE
+    # matches nothing and it becomes the stranded one.
+    victim = sorted(ids)[0]
+
+    def _settle_victim() -> None:
+        dsn = settings.DATABASE_URL_SYNC.replace("postgresql+psycopg2://", "postgresql://")
+        other = psycopg2.connect(dsn)
+        try:
+            cur = other.cursor()
+            cur.execute(
+                "UPDATE results SET skip_trace_status = 'hit' WHERE id = %s", (victim,)
+            )
+            other.commit()
+        finally:
+            other.close()
+
+    def _claim_with_a_settle_after_the_inserts(s):
+        rows = s.execute(select(Result).where(Result.job_id == job_id)).scalars().all()
+        built = [build_pending_row_payload(r) for r in rows]
+        lock_job_for_claim(s, job_id)
+        original = s.execute
+        state = {"inserts": 0, "fired": False}
+
+        def _execute(statement, *args, **kwargs):
+            # BEFORE the results UPDATE, not after: the victim must be inserted
+            # (so it is in inserted_ids) and only then settled, so its UPDATE
+            # matches nothing and it becomes the stranded row the withdrawal has
+            # to find. Settling any earlier and the INSERT's own join would
+            # exclude it, the withdrawal would never run, and this test would
+            # pass against a broken mapping.
+            if (state["inserts"] and not state["fired"]
+                    and "UPDATE results SET skip_trace_status" in str(statement)):
+                state["fired"] = True
+                _settle_victim()
+            result = original(statement, *args, **kwargs)
+            if "INSERT INTO pending_skip_trace_rows" in str(statement):
+                state["inserts"] += 1
+            return result
+
+        s.execute = _execute
+        try:
+            won = claim_skip_trace_rows(s, built)
+        finally:
+            s.execute = original
+        assert state["inserts"] > 1, "the batch did not actually chunk"
+        assert state["fired"], "the settle never fired; the test proves nothing"
+        return won
+
+    won = await db.run_sync(_claim_with_a_settle_after_the_inserts)
+    await db.commit()
+
+    assert victim not in won
+    assert len(won) == n - 1
+    # The victim's row is gone, and every OTHER lead kept its own queued row.
+    assert await _pending(db, victim) == 0
+    queued = (await db.execute(
+        select(func.count()).select_from(PendingSkipTraceRow)
+        .where(PendingSkipTraceRow.job_id == job_id,
+               PendingSkipTraceRow.status == "queued")
+    )).scalar_one()
+    assert queued == n - 1, "the withdrawal deleted the wrong row"
+
+
 async def test_claiming_without_the_job_lock_is_refused(db, business_user: User):
     """The lock is a precondition, not a convention.
 

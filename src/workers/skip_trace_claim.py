@@ -297,17 +297,20 @@ def lock_job_for_claim(db, job_id: str) -> None:
     # up to an hour. lock_timeout turns that into a prompt, retryable failure.
     # SET LOCAL, so it reverts with the transaction and never leaks onto the
     # session's other statements.
-    db.execute(text(f"SET LOCAL lock_timeout = '{_LOCK_WAIT_SECONDS}s'"))
-    try:
-        db.execute(
-            text("SELECT pg_advisory_xact_lock(hashtextextended(:k, 0))"),
-            {"k": _lock_key(job_id)},
-        )
-    finally:
-        # Back to the session default immediately: the claim's own statements
-        # must not inherit a short lock timeout, or a busy results row would
-        # fail the claim instead of waiting for it.
-        db.execute(text("SET LOCAL lock_timeout = DEFAULT"))
+    previous = db.execute(text("SHOW lock_timeout")).scalar()
+    db.execute(text("SELECT set_config('lock_timeout', :v, true)"),
+               {"v": f"{_LOCK_WAIT_SECONDS}s"})
+    db.execute(
+        text("SELECT pg_advisory_xact_lock(hashtextextended(:k, 0))"),
+        {"k": _lock_key(job_id)},
+    )
+    # Restored only on SUCCESS, and to the caller's OWN prior value rather than
+    # the server default. Deliberately not in a `finally`: a lock timeout aborts
+    # the transaction, and any statement issued on the way out would fail too,
+    # masking the real error with "current transaction is aborted". The caller
+    # sees the timeout and rolls back, which discards this setting anyway.
+    db.execute(text("SELECT set_config('lock_timeout', :v, true)"),
+               {"v": previous or "0"})
 
 
 def _lock_key(job_id: str) -> str:
@@ -489,6 +492,12 @@ def claim_skip_trace_rows(db, payloads: list[dict]) -> list[str]:
     # crash window" still holds: a failure part-way rolls back the lot and
     # nothing is half-claimed.
     inserted_ids: list[str] = []
+    # result_id -> the pending-row primary key WE generated for it. Kept across
+    # chunks because the withdrawal below deletes by our own ids, and `params`
+    # is rebuilt per chunk: indexing it by a position in `ordered` would read
+    # the wrong chunk's id, or KeyError past the last chunk's length, and a
+    # wrong delete would remove a legitimately claimed row.
+    pending_id_by_result: dict[str, str] = {}
     for start in range(0, len(ordered), _INSERT_CHUNK_ROWS):
         chunk = ordered[start:start + _INSERT_CHUNK_ROWS]
         rows_sql: list[str] = []
@@ -500,7 +509,9 @@ def claim_skip_trace_rows(db, payloads: list[dict]) -> list[str]:
             # PYTHON-side default (`default=_uuid`), not a server default, so a
             # raw INSERT that bypasses the ORM would write NULL and violate the
             # primary key.
-            params[f"id_{i}"] = str(uuid4())
+            pending_id = str(uuid4())
+            params[f"id_{i}"] = pending_id
+            pending_id_by_result[str(payload["result_id"])] = pending_id
             slots = [f"CAST(:id_{i} AS uuid)"]
             for column in _COLUMNS:
                 key = f"{column}_{i}"
@@ -554,8 +565,7 @@ def claim_skip_trace_rows(db, payloads: list[dict]) -> list[str]:
             # By OUR primary keys, never by result_id: another writer's row for
             # the same lead is its business, and deleting it would hand that
             # lead back while its owner still believes it is claimed.
-            {"ids": [params[f"id_{i}"] for i, p in enumerate(ordered)
-                     if str(p["result_id"]) in set(stranded)]},
+            {"ids": [pending_id_by_result[rid] for rid in stranded]},
         )
         _logger.info(
             "Skip-trace claim withdrew %d row(s) whose lead was settled or claimed "

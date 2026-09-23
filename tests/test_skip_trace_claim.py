@@ -493,6 +493,65 @@ async def test_a_lead_charged_and_unmatched_mid_enqueue_is_not_bought_again(
     assert await _status(db, rid) == "errored"
 
 
+async def test_a_batch_larger_than_the_parameter_limit_claims(
+    db, business_user: User,
+):
+    """A job bigger than one INSERT statement can hold must still claim.
+
+    Postgres caps a statement at 65535 bind parameters and each row costs
+    len(_COLUMNS) + 1, so a single VALUES list breaks at about 4,368 leads.
+    Production holds 100,548 claimable leads, so a job past that ceiling is
+    ordinary. Before chunking, such a job raised and enqueued NOTHING -- the
+    exact "one problem costs the whole batch" failure this module exists to
+    prevent, just with a different trigger.
+
+    Sized deliberately above the ceiling, not above the chunk size, so it keeps
+    testing the real limit if _INSERT_CHUNK_ROWS is ever tuned.
+    """
+    from src.workers.skip_trace_claim import _COLUMNS
+
+    ceiling = (65535 - 2) // (len(_COLUMNS) + 1)
+    n = ceiling + 50
+
+    cfg = await _config(db, business_user)
+    job_id = await _job(db, business_user, cfg)
+    # Built with one bulk INSERT: creating them one at a time is far too slow.
+    ids = [str(uuid.uuid4()) for _ in range(n)]
+    await db.execute(text(
+        "INSERT INTO results (id, job_id, user_id, party_name, property_address, "
+        " property_city, property_state, property_zip, is_duplicate, "
+        " skip_trace_status) "
+        "SELECT x.id, CAST(:j AS uuid), CAST(:u AS uuid), :party, "
+        "       x.n || ' BULK ST', 'VANCOUVER', 'WA', '98661', false, "
+        "       'not_attempted' "
+        "FROM unnest(CAST(:ids AS uuid[])) WITH ORDINALITY AS x(id, n)"
+    ), {"j": job_id, "u": business_user.id, "party": _PARTY, "ids": ids})
+    await db.commit()
+
+    payloads = [await _payload(db, rid) for rid in ids[:1]]  # prove one is valid
+    assert payloads[0] is not None
+
+    def _claim_all(s):
+        rows = s.execute(
+            select(Result).where(Result.job_id == job_id)
+        ).scalars().all()
+        built = [build_pending_row_payload(r) for r in rows]
+        assert all(b is not None for b in built), "fixture rows must be traceable"
+        lock_job_for_claim(s, job_id)
+        return claim_skip_trace_rows(s, built)
+
+    won = await db.run_sync(_claim_all)
+    await db.commit()
+
+    assert len(won) == n, f"expected all {n} leads claimed, got {len(won)}"
+    queued = (await db.execute(
+        select(func.count()).select_from(PendingSkipTraceRow)
+        .where(PendingSkipTraceRow.job_id == job_id,
+               PendingSkipTraceRow.status == "queued")
+    )).scalar_one()
+    assert queued == n
+
+
 async def test_claiming_without_the_job_lock_is_refused(db, business_user: User):
     """The lock is a precondition, not a convention.
 

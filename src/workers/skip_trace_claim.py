@@ -120,6 +120,21 @@ _EXACT: dict[str, int] = {"state": 2, "mail_state": 2}
 # forever, counted as in progress and never submitted or settled.
 _TRACE_TYPES = frozenset({"normal", "advanced"})
 
+# Rows per INSERT statement. Postgres caps a statement at 65535 bind parameters
+# and each row costs len(_COLUMNS) + 1 (currently 15), so the hard ceiling is
+# about 4,368 rows. 1,000 leaves room for the ceiling to survive a column being
+# added to _COLUMNS without anyone remembering this, and keeps each statement's
+# SQL text small. It bounds the STATEMENT only: every chunk runs inside the
+# caller's one transaction. test_a_batch_larger_than_the_parameter_limit_claims
+# pins it above the ceiling.
+_INSERT_CHUNK_ROWS = 1000
+
+# How long a second claimer of the SAME job waits before giving up. Long enough
+# that an ordinary enqueue never trips it, short enough that nobody waits on a
+# stuck worker: the loser raises, its caller logs and moves on, and the leads it
+# did not claim stay 'not_attempted' for the next run.
+_LOCK_WAIT_SECONDS = 30
+
 
 # How Postgres renders migration 099's WHERE clause back from the catalog. Kept
 # beside ACTIVE_PENDING_STATUSES so the two cannot drift silently;
@@ -275,10 +290,24 @@ def lock_job_for_claim(db, job_id: str) -> None:
     Not merely documented: `claim_skip_trace_rows` ASSERTS the lock is held, so
     a caller that forgets it is refused rather than silently racing.
     """
-    db.execute(
-        text("SELECT pg_advisory_xact_lock(hashtextextended(:k, 0))"),
-        {"k": _lock_key(job_id)},
-    )
+    # BOUNDED, not an indefinite wait. pg_advisory_xact_lock blocks forever by
+    # default, so a slow enqueue of a very large job could hold another claimer
+    # of the SAME job for as long as the worker's own timeout -- which for the
+    # Phase 1b-2 action means a customer's "look up contacts" sitting silent for
+    # up to an hour. lock_timeout turns that into a prompt, retryable failure.
+    # SET LOCAL, so it reverts with the transaction and never leaks onto the
+    # session's other statements.
+    db.execute(text(f"SET LOCAL lock_timeout = '{_LOCK_WAIT_SECONDS}s'"))
+    try:
+        db.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:k, 0))"),
+            {"k": _lock_key(job_id)},
+        )
+    finally:
+        # Back to the session default immediately: the claim's own statements
+        # must not inherit a short lock timeout, or a busy results row would
+        # fail the claim instead of waiting for it.
+        db.execute(text("SET LOCAL lock_timeout = DEFAULT"))
 
 
 def _lock_key(job_id: str) -> str:
@@ -399,21 +428,6 @@ def claim_skip_trace_rows(db, payloads: list[dict]) -> list[str]:
     ordered = [by_result[k] for k in sorted(by_result)]
 
     columns = ["id", *_COLUMNS]
-    rows_sql: list[str] = []
-    params: dict[str, Any] = {"uid": user_id, "claimable": CLAIMABLE_RESULT_STATUS}
-    for i, payload in enumerate(ordered):
-        # `id` is supplied explicitly: PendingSkipTraceRow.id carries a
-        # PYTHON-side default (`default=_uuid`), not a server default, so a raw
-        # INSERT that bypasses the ORM would write NULL and violate the key.
-        params[f"id_{i}"] = str(uuid4())
-        slots = [f"CAST(:id_{i} AS uuid)"]
-        for column in _COLUMNS:
-            key = f"{column}_{i}"
-            params[key] = _truncate(column, payload.get(column))
-            cast = "uuid" if column in _UUID_COLUMNS else "text"
-            slots.append(f"CAST(:{key} AS {cast})")
-        rows_sql.append(f"({', '.join(slots)})")
-
     select_list = ", ".join(f"v.{c}" for c in columns)
 
     # THE ARBITER IS THE ENFORCEMENT (Codex round 15 diff review, round 4).
@@ -437,36 +451,67 @@ def claim_skip_trace_rows(db, payloads: list[dict]) -> list[str]:
     # statement is left that could refuse one.
     #
     # noqa: S608 - nothing interpolated is input. `columns`/`select_list` come
-    # from the _COLUMNS literals, `rows_sql` holds only generated ":name" bind
-    # slots and their CAST types, and `extra_cols`/`extra_vals` are literals.
-    # EVERY payload value travels in `params` as a bound parameter.
-    claimed = db.execute(
-        text(
-            f"INSERT INTO pending_skip_trace_rows ({', '.join(columns)}, status) "  # noqa: S608
-            f"SELECT {select_list}, 'queued' "
-            f"FROM (VALUES {', '.join(rows_sql)}) "
-            f"     AS v({', '.join(columns)}) "
-            # r.job_id = v.job_id as well as the tenant: the payload carries a
-            # job_id that is written onto the queue row, and a malformed one
-            # would produce a row tied to a job the lead does not belong to.
-            # The dispatcher's tenant-pinned joins would then ignore that row
-            # forever while the unique index blocked the legitimate claim --
-            # a lead that can never be looked up again.
-            f"JOIN public.results r ON r.id = v.result_id AND r.user_id = v.user_id "
-            f"                       AND r.job_id = v.job_id "
-            # The JOB's owner too, not just the result's: the payload's job_id is
-            # written onto the queue row, and a row tied to another tenant's job
-            # would be ignored by the dispatcher's tenant-pinned joins forever
-            # while the unique index blocked the legitimate claim.
-            f"JOIN public.jobs j ON j.id = v.job_id AND j.user_id = v.user_id "
-            f"WHERE r.user_id = CAST(:uid AS uuid) AND j.user_id = CAST(:uid AS uuid) "
-            f"  AND r.skip_trace_status = :claimable "
-            f"{conflict_sql} "
-            f"RETURNING result_id"
-        ),
-        params,
-    ).scalars().all()
-    inserted_ids = [str(r) for r in claimed]
+    # from the _COLUMNS literals, and `rows_sql` holds only generated ":name"
+    # bind slots and their CAST types. EVERY payload value travels in `params`
+    # as a bound parameter.
+    insert_sql = (
+        f"INSERT INTO pending_skip_trace_rows ({', '.join(columns)}, status) "  # noqa: S608
+        f"SELECT {select_list}, 'queued' "
+        f"FROM (VALUES {{rows}}) "
+        f"     AS v({', '.join(columns)}) "
+        # r.job_id = v.job_id as well as the tenant: the payload carries a
+        # job_id that is written onto the queue row, and a malformed one
+        # would produce a row tied to a job the lead does not belong to.
+        # The dispatcher's tenant-pinned joins would then ignore that row
+        # forever while the unique index blocked the legitimate claim --
+        # a lead that can never be looked up again.
+        f"JOIN public.results r ON r.id = v.result_id AND r.user_id = v.user_id "
+        f"                       AND r.job_id = v.job_id "
+        # The JOB's owner too, not just the result's: a row tied to another
+        # tenant's job would be ignored by the dispatcher's tenant-pinned joins
+        # forever while the unique index blocked the legitimate claim.
+        f"JOIN public.jobs j ON j.id = v.job_id AND j.user_id = v.user_id "
+        f"WHERE r.user_id = CAST(:uid AS uuid) AND j.user_id = CAST(:uid AS uuid) "
+        f"  AND r.skip_trace_status = :claimable "
+        f"{conflict_sql} "
+        f"RETURNING result_id"
+    )
+
+    # CHUNKED, because Postgres caps a statement at 65535 bind parameters and
+    # each row here costs len(_COLUMNS) + 1. One VALUES list for a whole job
+    # therefore breaks at ~4,368 leads -- and production holds 100,548 claimable
+    # leads, so a job past that ceiling is ordinary, not hypothetical. The whole
+    # enqueue used to fail on such a job, which is the opposite of the "a
+    # conflict costs only itself" property this module exists for.
+    #
+    # Chunking the STATEMENT is not chunking the TRANSACTION. Every chunk runs
+    # in the caller's single transaction and commits with it, so "one commit, no
+    # crash window" still holds: a failure part-way rolls back the lot and
+    # nothing is half-claimed.
+    inserted_ids: list[str] = []
+    for start in range(0, len(ordered), _INSERT_CHUNK_ROWS):
+        chunk = ordered[start:start + _INSERT_CHUNK_ROWS]
+        rows_sql: list[str] = []
+        params: dict[str, Any] = {
+            "uid": user_id, "claimable": CLAIMABLE_RESULT_STATUS,
+        }
+        for i, payload in enumerate(chunk):
+            # `id` is supplied explicitly: PendingSkipTraceRow.id carries a
+            # PYTHON-side default (`default=_uuid`), not a server default, so a
+            # raw INSERT that bypasses the ORM would write NULL and violate the
+            # primary key.
+            params[f"id_{i}"] = str(uuid4())
+            slots = [f"CAST(:id_{i} AS uuid)"]
+            for column in _COLUMNS:
+                key = f"{column}_{i}"
+                params[key] = _truncate(column, payload.get(column))
+                cast = "uuid" if column in _UUID_COLUMNS else "text"
+                slots.append(f"CAST(:{key} AS {cast})")
+            rows_sql.append(f"({', '.join(slots)})")
+        won = db.execute(
+            text(insert_sql.format(rows=", ".join(rows_sql))), params,
+        ).scalars().all()
+        inserted_ids.extend(str(r) for r in won)
     if not inserted_ids:
         return []
 

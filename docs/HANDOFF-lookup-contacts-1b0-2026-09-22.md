@@ -163,7 +163,9 @@ not_attempted WITH a property address       : 100,548
 
 ## 9. NEXT STEP (exactly where to resume)
 
-1. **`gh pr checks 354`** — was GREEN at handoff. If it has gone red,  moved again; read .
+1. **`gh pr checks 354`** — was GREEN at handoff (Test pass 14m20s). If it has gone red,
+   `main` has moved again; read `gh run view <run-id> --log-failed`. A migration-number
+   collision is the likeliest cause, and it is invisible locally (see §6).
 2. **Run ONE Codex pass on the POST-REBASE diff.** The 12 security passes reviewed the diff
    BEFORE the rebase onto `origin/main`. The upstream change (`job_progress_observations`)
    touches a different subsystem and interaction is not expected, but that has not been

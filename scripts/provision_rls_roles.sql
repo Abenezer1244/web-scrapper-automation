@@ -146,6 +146,13 @@ GRANT SELECT, INSERT ON stripe_webhook_events TO bridgeleads_app;
 -- roles -- history the writer can edit is not evidence in a billing dispute.
 -- A grant cannot express "insert only an INITIAL verdict"; migration 101's
 -- trigger does that.
+-- MUST come before the column grant below. A table-level REVOKE also
+-- revokes the matching COLUMN privileges (verified against Postgres, not
+-- assumed), so running it later in this file would silently strip the
+-- four column grants and leave the API unable to dispatch at all. This is
+-- the convergence step for a database that received the earlier
+-- table-wide grant.
+REVOKE UPDATE ON contact_lookup_actions FROM bridgeleads_app;
 GRANT SELECT, INSERT ON contact_lookup_actions TO bridgeleads_app;
 -- Column-level, not table-wide. A policy constrains WHICH ROWS and never
 -- WHICH COLUMNS, so a table-wide UPDATE here would let the request path
@@ -182,11 +189,8 @@ REVOKE INSERT, DELETE ON notifications FROM bridgeleads_app;
 -- stripe_webhook_events (095): append-only ledger.
 REVOKE UPDATE, DELETE ON stripe_webhook_events FROM bridgeleads_app;
 -- contact_lookup_* (101): no DELETE anywhere; no UPDATE on verdicts or
--- events; and only COLUMN-level UPDATE on the action. The table-wide
--- REVOKE below is the convergence step for any database that received the
--- earlier table-wide grant -- it clears the table-level privilege and
--- leaves the four column grants above intact.
-REVOKE UPDATE ON contact_lookup_actions FROM bridgeleads_app;
+-- events. The action's table-wide UPDATE revoke is NOT here: it has to run
+-- before the column grant, so it lives with the grants above.
 REVOKE DELETE ON contact_lookup_actions FROM bridgeleads_app;
 REVOKE UPDATE, DELETE ON contact_lookup_action_results FROM bridgeleads_app;
 REVOKE UPDATE, DELETE ON contact_lookup_action_events FROM bridgeleads_app;

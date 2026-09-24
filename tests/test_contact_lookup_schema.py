@@ -417,3 +417,49 @@ async def test_the_migration_replays_after_a_half_applied_run(db):
     assert "IF NOT EXISTS (" in pre and "ck_results_last_trace_outcome" in pre
     # And nothing in that section may be a bare, unguarded ADD.
     assert "op.add_column(" not in pre,         "op.add_column has no IF NOT EXISTS: it would abort on replay"
+
+
+@pytest.mark.parametrize("status", ["running", "claimed", "settled", "failed"])
+async def test_the_api_cannot_backdate_an_event_onto_a_moved_action(db, business_user, status):
+    """Shape alone is not enough: the ACTION must still be at the hop the event
+    claims to record.
+
+    Otherwise a user-scoped session can append a fabricated "initial" event to an
+    action that is already running or settled -- history a billing dispute would
+    be argued from. A retry while the action is genuinely still `dispatching`
+    stays legal, which the test above covers.
+    """
+    job_id, _rid = await _job_and_result(db, business_user)
+    action = await _action(db, business_user, job_id)
+    # Move it on, the way the worker would (no tenant GUC).
+    await db.execute(text(
+        "UPDATE contact_lookup_actions SET status = :s WHERE id = :a"
+    ), {"s": status, "a": action})
+    await db.commit()
+
+    await db.execute(text("SELECT set_config('app.current_user_id', :uid, true)"),
+                     {"uid": str(business_user.id)})
+    with pytest.raises(Exception) as exc:
+        await db.execute(text(
+            "INSERT INTO contact_lookup_action_events (id, action_id, user_id, to_status) "
+            "VALUES (:id, :a, :uid, 'dispatching')"
+        ), {"id": str(uuid.uuid4()), "a": action, "uid": business_user.id})
+    assert "still dispatching" in str(exc.value)
+    await db.rollback()
+
+
+async def test_the_api_cannot_write_a_fencing_lease_into_history(db, business_user):
+    """`lease_token` fences a stalled worker against the reconciler. A value the
+    request path invented has no business appearing in the record of it."""
+    job_id, _rid = await _job_and_result(db, business_user)
+    action = await _action(db, business_user, job_id)
+    await db.execute(text("SELECT set_config('app.current_user_id', :uid, true)"),
+                     {"uid": str(business_user.id)})
+    with pytest.raises(Exception) as exc:
+        await db.execute(text(
+            "INSERT INTO contact_lookup_action_events "
+            "(id, action_id, user_id, to_status, lease_token) "
+            "VALUES (:id, :a, :uid, 'dispatching', 'forged-token')"
+        ), {"id": str(uuid.uuid4()), "a": action, "uid": business_user.id})
+    assert "lease" in str(exc.value).lower()
+    await db.rollback()

@@ -236,12 +236,30 @@ BEGIN
             USING ERRCODE = 'insufficient_privilege';
     END IF;
     IF NEW.to_status <> 'dispatching' OR NEW.from_status IS NOT NULL
-       OR NEW.result_id IS NOT NULL THEN
+       OR NEW.result_id IS NOT NULL OR NEW.lease_token IS NOT NULL THEN
         RAISE EXCEPTION
             'contact_lookup_action_events: a user-scoped session may only append '
-            'the initial dispatching event (got from=% to=% result_id=%). Every '
-            'later hop is written by the worker through system_sync_session().',
-            NEW.from_status, NEW.to_status, NEW.result_id
+            'the initial dispatching event (got from=% to=% result_id=% '
+            'lease_token=%). Every later hop is written by the worker through '
+            'system_sync_session(), and the fencing lease is the worker''s alone.',
+            NEW.from_status, NEW.to_status, NEW.result_id, NEW.lease_token
+            USING ERRCODE = 'insufficient_privilege';
+    END IF;
+    -- The shape being right is not enough: the ACTION must still be at the hop
+    -- this event claims to record. Without this an API session can append a
+    -- fabricated "initial" event to an action that is already running, settled
+    -- or failed, which is history a billing dispute would be argued from
+    -- (Codex). Repeated appends while the action is genuinely still
+    -- `dispatching` stay legal, because a dispatch retry is a real path.
+    IF NOT EXISTS (
+        SELECT 1 FROM contact_lookup_actions a
+         WHERE a.id = NEW.action_id
+           AND a.user_id = NEW.user_id
+           AND a.status = 'dispatching'
+    ) THEN
+        RAISE EXCEPTION
+            'contact_lookup_action_events: the initial event may only be appended '
+            'while its action is still dispatching. Action % is not.', NEW.action_id
             USING ERRCODE = 'insufficient_privilege';
     END IF;
     RETURN NEW;

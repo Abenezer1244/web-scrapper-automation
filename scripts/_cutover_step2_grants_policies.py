@@ -50,10 +50,28 @@ _GRANTS = [
     "REVOKE UPDATE, DELETE ON scraper_batches, batch_runs FROM bridgeleads_app",
     "REVOKE SELECT, UPDATE, DELETE ON audit_events FROM bridgeleads_app",
     "REVOKE INSERT, DELETE ON dialer_deliveries FROM bridgeleads_app",
+    # contact_lookup_* (migration 101). Mirrors provision_rls_roles.sql. The
+    # REVOKE must precede the column GRANT: a table-level REVOKE also clears
+    # column privileges, so the other order leaves the API with no UPDATE.
+    "REVOKE UPDATE ON contact_lookup_actions FROM bridgeleads_app",
+    "GRANT SELECT, INSERT ON contact_lookup_actions TO bridgeleads_app",
+    "GRANT UPDATE (status, status_reason, status_changed_at, dispatched_at) "
+    "ON contact_lookup_actions TO bridgeleads_app",
+    "GRANT SELECT, INSERT ON contact_lookup_action_results TO bridgeleads_app",
+    "GRANT SELECT, INSERT ON contact_lookup_action_events TO bridgeleads_app",
+    "REVOKE UPDATE, DELETE ON contact_lookup_action_results FROM bridgeleads_app",
+    "REVOKE UPDATE, DELETE ON contact_lookup_action_events FROM bridgeleads_app",
+    "REVOKE DELETE ON contact_lookup_actions FROM bridgeleads_app",
     "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO bridgeleads_app",
     # system role
     "GRANT USAGE ON SCHEMA public TO bridgeleads_system",
     "GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA public TO bridgeleads_system",
+    # ...which includes contact_lookup_action_events, so take it back. The
+    # event log is append-only for the WORKER TOO: history the writer can
+    # edit is not evidence in a billing dispute. MUST stay after the blanket
+    # grant above (Codex found this script; provision_rls_roles.sql alone was
+    # not the whole story).
+    "REVOKE UPDATE ON contact_lookup_action_events FROM bridgeleads_system",
     "GRANT DELETE ON county_records TO bridgeleads_system",
     "GRANT DELETE ON property_list_membership TO bridgeleads_system",
     # tasks.py releases a job's cross-job dedup claims on FIVE paths (trustee-sale

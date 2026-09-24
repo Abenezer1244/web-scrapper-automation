@@ -11,11 +11,71 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
+# Without this, every push to an open PR started ANOTHER full run and the
+# superseded ones ran to completion anyway. One PR with four review fixes cost
+# four complete 14-minute runs where one would have done, and this is a PRIVATE
+# repo, so every minute is metered ($0.008/min on Linux).
+#
+# cancel-in-progress is deliberately PR-ONLY. A push to main is a DEPLOY here:
+# Railway redeploys and start.sh runs scripts/migrate.py on boot, so cancelling
+# a main run mid-flight could interrupt a migration. PR runs are pure
+# verification and are safe to discard.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
+  # ─── Change detection ────────────────────────────────────────────────────────
+  # A documentation-only PR does not need the 14-minute suite. This CANNOT be
+  # done with `paths-ignore`: "Test" and "Dependency Audit" are REQUIRED status
+  # checks on main, and a workflow that never runs never reports them, so the PR
+  # would hang forever on "Expected — waiting for status". A job skipped by `if`
+  # does report, as "skipped", which branch protection accepts.
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: filter
+        shell: bash
+        run: |
+          set -uo pipefail
+          # FAILS OPEN on purpose: anything unexpected leaves code=true and runs
+          # the full suite. A false positive costs 14 minutes; a false negative
+          # merges untested code. Only ever narrowed for pull_request, because a
+          # push to main is the deploy path and must not be second-guessed here.
+          code=true
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base='${{ github.event.pull_request.base.sha }}'
+            head='${{ github.event.pull_request.head.sha }}'
+            if git cat-file -e "$base" 2>/dev/null && git cat-file -e "$head" 2>/dev/null; then
+              files=$(git diff --name-only "$base" "$head")
+              # "Docs" = anything under docs/ or tasks/, or any .md file.
+              # grep -v finds the first file that is NOT docs; if there is none,
+              # the change is docs-only.
+              if [ -n "$files" ] && ! printf '%s\n' "$files" | grep -qvE '^(docs/|tasks/)|\.md$'; then
+                code=false
+              fi
+              printf 'changed files:\n%s\n' "$files"
+            else
+              echo "base or head sha unavailable; assuming code changed"
+            fi
+          fi
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "run full suite: $code"
   # ─── Test ────────────────────────────────────────────────────────────────────
   test:
     name: Test
     runs-on: ubuntu-latest
+    needs: changes
+    # Skipped (not absent) on a docs-only PR, so the required check still
+    # reports. `needs.changes.outputs.code` is the string 'true'/'false'.
+    if: needs.changes.outputs.code == 'true'
 
     services:
       postgres:
@@ -148,6 +208,8 @@ jobs:
   dependency-audit:
     name: Dependency Audit (pip-audit + SBOM)
     runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     steps:
       - uses: actions/checkout@v4
 

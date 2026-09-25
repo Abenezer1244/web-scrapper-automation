@@ -331,10 +331,28 @@ async def test_a_failing_missing_queue_probe_does_not_stop_the_sweep(starter_use
     def _boom(db):
         db.execute(text("SELECT no_such_column FROM pending_skip_trace_rows"))
 
+    from sqlalchemy import event
+
+    from src.db.session import sync_engine
+
     monkeypatch.setattr(dialer, "_alert_rows_naming_missing_queues", _boom)
-    # The sweep's own query must still run on the rolled-back session. No dialer
-    # config exists, so a sweep that got past the probe simply finds no candidates.
-    dialer._dialer_push_sweep_impl()
+    # Observe the real SQL (no mock): the sweep's candidate query must run AFTER
+    # the probe failed, on the rolled-back session. Without this a sweep that
+    # caught the failure and then returned early would still pass.
+    statements: list[str] = []
+
+    def _record(conn, cursor, statement, *args):
+        statements.append(statement)
+
+    event.listen(sync_engine, "before_cursor_execute", _record)
+    try:
+        dialer._dialer_push_sweep_impl()
+    finally:
+        event.remove(sync_engine, "before_cursor_execute", _record)
+
+    probe = next(i for i, s in enumerate(statements) if "no_such_column" in s)
+    assert any("dialer_pushed_at" in s and "scraper_configs" in s
+               for s in statements[probe + 1:]), "the sweep stopped at the probe"
 
 
 @pytest.mark.parametrize(("row_age_h", "expect_unsettled"), [(1, True), (13, False)])

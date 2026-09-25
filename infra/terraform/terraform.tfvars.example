@@ -1,0 +1,8 @@
+# Copy to terraform.tfvars (gitignored) and fill in the identifiers.
+# The API token is NOT set here. Export it only in the shell that runs
+# terraform, so it never lands in a file that could be committed:
+#   export TF_VAR_cloudflare_api_token=...
+cloudflare_zone_id    = "your-zone-id"
+cloudflare_account_id = "your-account-id"
+railway_api_ip        = "your-railway-origin-ip"
+vercel_ip             = "cname.vercel-dns.com"

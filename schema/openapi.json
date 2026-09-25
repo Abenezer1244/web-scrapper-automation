@@ -7313,7 +7313,7 @@
     },
     "/scrapers/connectors": {
       "get": {
-        "description": "Return county connectors for the frontend county picker.\n\nPublic endpoint — no auth required so the county browser loads for\nanonymous visitors.\n\nBy default returns connectors whose canary health check has marked\nthem as either ``healthy`` or ``degraded``. Excludes only ``down``\n(scraper threw an exception on last probe) and ``unknown`` (never\ncanary-checked).\n\nThe ``degraded`` status means \"scraper ran cleanly, but last\nprobe returned zero records on a 7-day window\". For small counties\nwith sparse filings (e.g., rural WA counties that file <5 probates\nper week), this oscillates randomly based on which week the canary\nhappens to sample. Excluding them from the picker just because\nthe most recent 7-day sample was empty would remove most of our\ncoverage for smaller markets. Instead, we surface them as\navailable and the user sees 0 records only if the actual scrape\nwindow is empty — which is the correct honest outcome.\n\nPass ``?include_all=true`` to include ``down`` and ``unknown``\nconnectors for admin tooling and support investigation.",
+        "description": "Return county connectors for the frontend county picker.\n\nPublic endpoint — no auth required so the county browser loads for\nanonymous visitors.\n\nBy default returns connectors whose canary health check has marked\nthem as either ``healthy`` or ``degraded``. Excludes only ``down``\n(scraper threw an exception on last probe) and ``unknown`` (never\ncanary-checked).\n\nThe ``degraded`` status means \"scraper ran cleanly, but last\nprobe returned zero records on a 7-day window\". For small counties\nwith sparse filings (e.g., rural WA counties that file <5 probates\nper week), this oscillates randomly based on which week the canary\nhappens to sample. Excluding them from the picker just because\nthe most recent 7-day sample was empty would remove most of our\ncoverage for smaller markets. Instead, we surface them as\navailable and the user sees 0 records only if the actual scrape\nwindow is empty — which is the correct honest outcome.\n\nPass ``?include_all=true`` to include ``down`` and ``unknown``\nconnectors for admin tooling and support investigation. That view is\nADMIN-ONLY (audit 2026-09-25, C-1): it named every broken county to any\nanonymous caller. The default picker view stays public.",
         "operationId": "list_connectors_scrapers_connectors_get",
         "parameters": [
           {
@@ -7353,6 +7353,11 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
         "summary": "List Connectors",
         "tags": [
           "scrapers"

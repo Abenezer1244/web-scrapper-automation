@@ -918,6 +918,37 @@ above:
   that it was actually in the quote. The worker stays authoritative for eligibility and
   re-authorizes every id (already in the 1b worker bullet).
 
+- [x] Round-19 fixes implemented, `0cd956b9`. 58 tests; mutation-tested (trigger dropped: 28
+      fail; FOR SHARE removed: the two-connection race test fails; verifier checked in four
+      real grant states).
+
+### 1b-1a diff review round 20 (2026-09-25, on `0cd956b9`) — NO-GO, 2 P1 + 1 P2
+
+All five round-19 fixes confirmed correct, no new defect from them. Prompt and output:
+`<scratchpad 0f367d2a>/codex_r20_review{,_out}.txt`.
+
+- [x] **20-1 (P2, VERIFIED by building it)** the events guard read its parent unqualified, so a
+      session's own `pg_temp.contact_lookup_actions` saying `dispatching` could vouch for a real
+      action already `running`. Now `public.`-qualified, and all three guards pin
+      `SET search_path = pg_catalog, public, pg_temp`. `b7ad8949`; the test fails with DID NOT
+      RAISE against the old guard.
+- [x] **20-2 (P1) an empty GUC meant "the worker" whatever the ROLE.** Checked production
+      read-only (owner-run, 2026-09-25): worker `DATABASE_URL`=`bridgeleads_app`,
+      `DATABASE_URL_SYNC`=`bridgeleads_system`; api BOTH DSNs = `bridgeleads_app`; neither
+      superuser nor BYPASSRLS. So an API code path opening `system_sync_session()` would have
+      passed every guard as the worker. Owner chose to harden: an empty GUC is accepted only
+      for `bridgeleads_system` or a superuser/BYPASSRLS role (owner, migrations, ops); every
+      other role is refused. Tests run AS the real roles (`SET LOCAL ROLE`); reverting the
+      branch fails the three API-role tests and leaves the worker test green.
+      **Not closed, and pre-existing:** the GUC is still the tenant identity for every RLS
+      table in the product, so a session that can run arbitrary SQL as `bridgeleads_app` can
+      claim any tenant. It is set server-side from the verified JWT with a bound parameter
+      (`src/api/deps.py:36-40`), so reaching it needs SQL injection. Project-wide, out of this PR.
+- [ ] **20-3 (P1, future, 1b-2 gate)** the composite FK proves a quoted result is the tenant's,
+      not that it was in the quote. Same as the carried bullet above: the 1b-2 worker must
+      re-authorize every id against the action's job and its immutable quoted set before it
+      creates a pending row. No spend path exists in 1b-1a.
+
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever
       the tab has leads that have never been looked up; when the quote comes back with

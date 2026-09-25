@@ -624,6 +624,63 @@ async def test_the_worker_may_move_an_action_anywhere(db, business_user):
     await db.rollback()
 
 
+_NO_TENANT_INSERTS = {
+    "contact_lookup_actions": (
+        "INSERT INTO contact_lookup_actions "
+        "(id, user_id, job_id, category, quote_id, status, unit_price_cents, "
+        " currency, pricing_version) "
+        "VALUES (:id, :uid, :job, 'tab', :q, 'claimed', 8, 'usd', 'v1')"
+    ),
+    "contact_lookup_action_results": (
+        "INSERT INTO contact_lookup_action_results "
+        "(id, action_id, user_id, result_id, disposition) "
+        "VALUES (:id, :id, :uid, :id, 'newly_queued')"
+    ),
+    "contact_lookup_action_events": (
+        "INSERT INTO contact_lookup_action_events "
+        "(id, action_id, user_id, from_status, to_status) "
+        "VALUES (:id, :id, :uid, 'running', 'settled')"
+    ),
+}
+
+
+@pytest.mark.parametrize("table", sorted(_NO_TENANT_INSERTS))
+async def test_the_api_role_without_a_tenant_is_not_the_worker(db, business_user, table):
+    """Codex round 20: an empty GUC used to mean "the worker", whatever the role.
+    In production the API's sync DSN logs in as bridgeleads_app too, so an API
+    code path that opened a system session would have passed every guard as the
+    worker. Run as the real API role, with no tenant set, and write a worker
+    verdict: the guard itself must refuse it."""
+    job_id, _rid = await _job_and_result(db, business_user)
+    await db.execute(text("SET LOCAL ROLE bridgeleads_app"))
+    with pytest.raises(Exception) as exc:
+        await db.execute(text(_NO_TENANT_INSERTS[table]), {
+            "id": str(uuid.uuid4()), "q": f"q-{uuid.uuid4()}",
+            "uid": business_user.id, "job": job_id,
+        })
+    assert "not the worker role" in str(exc.value)
+    assert table in str(exc.value)
+    await db.rollback()
+
+
+async def test_the_worker_role_without_a_tenant_passes_the_guard(db, business_user):
+    """The other side: bridgeleads_system with no GUC is the worker, and the
+    guard lets it through. The test DB carries only the migration's tenant
+    policy (the role-targeted _system policies come from the cutover script),
+    so the row is then refused by RLS. That refusal is the proof the TRIGGER
+    passed it: the guard would have raised first, with its own message."""
+    job_id, _rid = await _job_and_result(db, business_user)
+    await db.execute(text("SET LOCAL ROLE bridgeleads_system"))
+    with pytest.raises(Exception) as exc:
+        await db.execute(text(_NO_TENANT_INSERTS["contact_lookup_actions"]), {
+            "id": str(uuid.uuid4()), "q": f"q-{uuid.uuid4()}",
+            "uid": business_user.id, "job": job_id,
+        })
+    assert "not the worker role" not in str(exc.value)
+    assert "row-level security" in str(exc.value)
+    await db.rollback()
+
+
 async def test_quoted_count_cannot_be_negative(db, business_user):
     job_id, _rid = await _job_and_result(db, business_user)
     with pytest.raises(Exception) as exc:

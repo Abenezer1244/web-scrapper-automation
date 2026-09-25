@@ -190,7 +190,24 @@ BEGIN
     -- always sets it. See src/api/deps.py and src/db/session.py.
     uid := COALESCE(NULLIF(current_setting('app.current_user_id', true), ''), '');
     IF uid = '' THEN
-        RETURN COALESCE(NEW, OLD);
+        -- No tenant context. That is the worker's system_sync_session(), but
+        -- only when it really is the worker's ROLE (Codex round 20): the API's
+        -- own sync DSN logs in as bridgeleads_app too (verified in production
+        -- 2026-09-25), so an API code path that ever opened a system session
+        -- would otherwise pass here as the worker. The owner / migration / ops
+        -- roles, which bypass RLS anyway, are the only other roles let through.
+        IF current_user = 'bridgeleads_system' OR EXISTS (
+            SELECT 1 FROM pg_catalog.pg_roles r
+             WHERE r.rolname = current_user AND (r.rolsuper OR r.rolbypassrls)
+        ) THEN
+            RETURN COALESCE(NEW, OLD);
+        END IF;
+        RAISE EXCEPTION
+            '%: no tenant context (app.current_user_id is empty) and role % is '
+            'not the worker role. Worker hops go through system_sync_session() '
+            'as bridgeleads_system; request paths set the tenant.',
+            TG_TABLE_NAME, current_user
+            USING ERRCODE = 'insufficient_privilege';
     END IF;
     IF TG_OP = 'INSERT' THEN
         IF NEW.disposition NOT IN ({_sql_list(_API_INITIAL_DISPOSITIONS)}) THEN
@@ -230,7 +247,24 @@ DECLARE uid TEXT;
 BEGIN
     uid := COALESCE(NULLIF(current_setting('app.current_user_id', true), ''), '');
     IF uid = '' THEN
-        RETURN COALESCE(NEW, OLD);
+        -- No tenant context. That is the worker's system_sync_session(), but
+        -- only when it really is the worker's ROLE (Codex round 20): the API's
+        -- own sync DSN logs in as bridgeleads_app too (verified in production
+        -- 2026-09-25), so an API code path that ever opened a system session
+        -- would otherwise pass here as the worker. The owner / migration / ops
+        -- roles, which bypass RLS anyway, are the only other roles let through.
+        IF current_user = 'bridgeleads_system' OR EXISTS (
+            SELECT 1 FROM pg_catalog.pg_roles r
+             WHERE r.rolname = current_user AND (r.rolsuper OR r.rolbypassrls)
+        ) THEN
+            RETURN COALESCE(NEW, OLD);
+        END IF;
+        RAISE EXCEPTION
+            '%: no tenant context (app.current_user_id is empty) and role % is '
+            'not the worker role. Worker hops go through system_sync_session() '
+            'as bridgeleads_system; request paths set the tenant.',
+            TG_TABLE_NAME, current_user
+            USING ERRCODE = 'insufficient_privilege';
     END IF;
     IF TG_OP <> 'INSERT' THEN
         RAISE EXCEPTION
@@ -308,7 +342,24 @@ DECLARE uid TEXT;
 BEGIN
     uid := COALESCE(NULLIF(current_setting('app.current_user_id', true), ''), '');
     IF uid = '' THEN
-        RETURN COALESCE(NEW, OLD);
+        -- No tenant context. That is the worker's system_sync_session(), but
+        -- only when it really is the worker's ROLE (Codex round 20): the API's
+        -- own sync DSN logs in as bridgeleads_app too (verified in production
+        -- 2026-09-25), so an API code path that ever opened a system session
+        -- would otherwise pass here as the worker. The owner / migration / ops
+        -- roles, which bypass RLS anyway, are the only other roles let through.
+        IF current_user = 'bridgeleads_system' OR EXISTS (
+            SELECT 1 FROM pg_catalog.pg_roles r
+             WHERE r.rolname = current_user AND (r.rolsuper OR r.rolbypassrls)
+        ) THEN
+            RETURN COALESCE(NEW, OLD);
+        END IF;
+        RAISE EXCEPTION
+            '%: no tenant context (app.current_user_id is empty) and role % is '
+            'not the worker role. Worker hops go through system_sync_session() '
+            'as bridgeleads_system; request paths set the tenant.',
+            TG_TABLE_NAME, current_user
+            USING ERRCODE = 'insufficient_privilege';
     END IF;
     IF TG_OP = 'INSERT' THEN
         IF NEW.status <> 'dispatching' OR NEW.status_reason IS NOT NULL

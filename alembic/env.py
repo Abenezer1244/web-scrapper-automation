@@ -40,6 +40,7 @@ target_metadata = Base.metadata
 # op.create_index. Exclude them: the scripts own these (Codex).
 CONCURRENT_INDEXES = {
     "ix_results_duplicate_source",   # scripts/create_result_duplicate_source_index.sql
+    "ix_pending_skip_trace_spent",   # migration 102, CONCURRENTLY
 }
 
 

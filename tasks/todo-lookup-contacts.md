@@ -1311,6 +1311,22 @@ per-pass cost is constant; the partial index shape fits. SUPERSEDES the matching
 2. **ii-a** migration 102 (index + CHECK + trigger) + `alembic/env.py` + tests; EXPLAIN gate.
 3. **ii-b** the cap: `skip_trace_capacity.py`, dispatcher, settings, `.env.example`, tests.
 
+**ii-0 BUILT** (PR #359): the five scripts retired; Codex REVISE -> GO.
+
+**ii-a BUILT (2026-09-25), before Codex diff review.** `alembic/versions/102_...`, `models.py`,
+`alembic/env.py`, `tests/test_pending_skip_trace_weight.py` (4 files).
+- 8 tests: unknown type refused; a spent row cannot be retyped (claimed, accepted, and the legacy
+  errored-with-queue-id shape); retyping while stamping the spend in ONE update refused; an unsent
+  row may still change type (the probate name refresh); the claim and bookkeeping updates are not
+  blocked; the index has the shape the cap reads.
+- Mutations, each caught: trigger dropped (4 fail), CHECK dropped, trigger checking only the OLD row.
+- Replay from four half-applied states (index only; index + NOT VALID check; a same-named index
+  of the wrong shape; one on the wrong key): every one converges to exactly the right objects.
+  Unknown-type abort: exits with the instruction and leaves NO index behind; clean after removal.
+- **EXPLAIN gate at 100,000 spent rows (1,666 in the window, 50 accounts):** with the index a
+  Bitmap Index Scan, **4.2 ms**; without it a Seq Scan, **38.8 ms**. The cost now follows the
+  window, not the table. Seeded and measured inside one transaction, rolled back.
+
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever
       the tab has leads that have never been looked up; when the quote comes back with

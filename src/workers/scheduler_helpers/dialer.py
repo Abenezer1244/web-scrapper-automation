@@ -41,6 +41,114 @@ def _materialize_dialer_outbox(db, job, config, vendor_id: str, leads: list[dict
     )
 
 
+_SUBMITTED_STALE_AFTER = timedelta(hours=12)
+
+
+def skip_trace_unsettled(now: datetime):
+    """EXISTS clause, correlated to Job: this job still has skip trace in flight.
+
+    Base "settled" on the pending QUEUE (the authoritative async-work tracker),
+    NOT Result.skip_trace_status: when Tracerfy submission errors, the dispatcher
+    marks the pending row 'errored' but leaves Result 'queued', so a Result-based
+    check would NEVER settle that job (Codex). queued/submitted = in-flight;
+    completed/errored = terminal.
+
+    Settlement nuance (Codex), queued vs submitted differ:
+     - 'queued' rows are local dispatcher backlog — the dispatcher WILL process
+       them even if it's down/backlogged for a while, so they ALWAYS block
+       settlement until they leave the queue. Aging them out would claim the
+       job before the phones exist, and it would never push again.
+     - 'submitted' rows are in-flight at Tracerfy and CAN get stuck if the
+       completed CSV omits them; those age out past the cutoff so a wedged row
+       can't block the push forever. Age by the BATCH's bookkeeping time
+       (skip_trace_queues.submitted_at): a pending row keeps its CLAIM time
+       (1b-1b-i, C1), which on the reconciler's adoption path can be days old,
+       and aging an adopted row by it would push the job before the adopted
+       batch's phones land. The row's own time is the fallback only for a row
+       with no queue id. A row that names a queue with no queue row keeps the
+       job unsettled: that batch may be paid and still coming, and a job is
+       only ever pushed once. (Not reachable through code, which records the
+       queue in the same transaction; only by hand.)
+    """
+    from sqlalchemy import and_, func, or_, select
+
+    from src.db.models import Job, PendingSkipTraceRow, SkipTraceQueue
+
+    stale_cutoff = now - _SUBMITTED_STALE_AFTER
+    queue_submitted_at = (
+        select(SkipTraceQueue.submitted_at)
+        .where(SkipTraceQueue.tracerfy_queue_id == PendingSkipTraceRow.tracerfy_queue_id)
+        .correlate(PendingSkipTraceRow)
+        .scalar_subquery()
+    )
+    queue_row_missing = and_(
+        PendingSkipTraceRow.tracerfy_queue_id.isnot(None),
+        ~select(SkipTraceQueue.id)
+        .where(SkipTraceQueue.tracerfy_queue_id == PendingSkipTraceRow.tracerfy_queue_id)
+        .correlate(PendingSkipTraceRow)
+        .exists(),
+    )
+    submitted_age = func.coalesce(
+        queue_submitted_at, PendingSkipTraceRow.submitted_at, PendingSkipTraceRow.enqueued_at
+    )
+    return (
+        select(PendingSkipTraceRow.id)
+        .where(
+            PendingSkipTraceRow.job_id == Job.id,
+            or_(
+                # 'submitting' = claimed by a dispatcher tick, Tracerfy POST in
+                # flight or outcome unknown (crash window) — still unsettled.
+                PendingSkipTraceRow.status.in_(("queued", "submitting")),
+                and_(
+                    PendingSkipTraceRow.status == "submitted",
+                    or_(queue_row_missing, submitted_age >= stale_cutoff),
+                ),
+            ),
+        )
+        .exists()
+    )
+
+
+def _alert_rows_naming_missing_queues(db) -> None:
+    """Page ops when a 'submitted' row names a queue with no queue row.
+
+    skip_trace_unsettled keeps such a job unsettled on purpose (the batch may be
+    paid and still coming, and a job is pushed once), which means its dialer
+    push never happens. That must not be silent (1b-1b-i diff review). Only a
+    hand edit or data loss reaches this state; the repair is to restore or
+    insert the skip_trace_queues row for that tracerfy_queue_id, or to settle
+    the rows once the batch is reconciled.
+    """
+    from sqlalchemy import text
+
+    n_rows, n_jobs = db.execute(text(
+        "SELECT count(*), count(DISTINCT p.job_id) FROM pending_skip_trace_rows p "
+        "WHERE p.status = 'submitted' AND p.tracerfy_queue_id IS NOT NULL "
+        "  AND NOT EXISTS (SELECT 1 FROM skip_trace_queues q "
+        "                  WHERE q.tracerfy_queue_id = p.tracerfy_queue_id)"
+    )).one()
+    if not n_rows:
+        return
+    _logger.error(
+        "Dialer: %d submitted skip-trace row(s) across %d job(s) name a Tracerfy queue "
+        "with no skip_trace_queues row; those jobs stay unsettled and are not pushed",
+        n_rows, n_jobs,
+    )
+    try:
+        from src.workers.ops_alerts import send_ops_alert
+
+        send_ops_alert(
+            "dialer", "missing_skip_trace_queue",
+            "Dialer pushes blocked: skip-trace rows name a missing queue",
+            f"{n_rows} pending_skip_trace_rows in status 'submitted' across {n_jobs} "
+            f"job(s) carry a tracerfy_queue_id that has no skip_trace_queues row. "
+            f"Those jobs are held unsettled, so their dialer push will not happen "
+            f"until the queue row is restored or the rows are reconciled.",
+        )
+    except Exception as exc:  # noqa: BLE001 — alerting is best-effort
+        _logger.warning("missing-queue dialer alert failed: %s", str(exc)[:120])
+
+
 def _dialer_push_sweep_impl() -> None:
     """Push dialer-ready leads for done jobs whose skip-trace has SETTLED.
 
@@ -59,52 +167,27 @@ def _dialer_push_sweep_impl() -> None:
     from src.api.lead_actionability import actionable_condition
     from src.api.tax_filters import tax_cap_condition
     from src.config.constants import BUSINESS_FEATURES_PLANS
-    from src.db.models import Job, PendingSkipTraceRow, Result, ScraperConfig, User
+    from src.db.models import Job, Result, ScraperConfig, User
     from src.db.session import system_sync_session
     from src.workers.dialer_connectors import get_connector
     from src.workers.dialer_outbox import process_dialer_outbox
     from src.workers.webhook_delivery import DIALER_PUSH_CAP, deliver_job_webhook
 
     _BATCH = 50
-    # Jobs still waiting on async skip-trace. Base "settled" on the pending QUEUE
-    # (the authoritative async-work tracker), NOT Result.skip_trace_status: when
-    # Tracerfy submission errors, the dispatcher marks the pending row 'errored'
-    # but leaves Result 'queued', so a Result-based check would NEVER settle that
-    # job (Codex). queued/submitted = in-flight; completed/errored = terminal.
-    #
-    # Settlement nuance (Codex), queued vs submitted differ:
-    #  - 'queued' rows are local dispatcher backlog — the dispatcher WILL process
-    #    them even if it's down/backlogged for a while, so they ALWAYS block
-    #    settlement until they leave the queue. Aging them out would claim the
-    #    job before the phones exist, and it would never push again.
-    #  - 'submitted' rows are in-flight at Tracerfy and CAN get stuck if the
-    #    completed CSV omits them; those age out past the cutoff so a wedged row
-    #    can't block the push forever. Age by submitted_at (COALESCE to
-    #    enqueued_at only as a defensive fallback for a NULL submitted_at).
+    # Jobs still waiting on async skip-trace: see skip_trace_unsettled.
     _now = datetime.now(UTC)
     _today = _now.date()  # frozen for the whole sweep so the 18-month tax cap can't drift
-    _stale_cutoff = _now - timedelta(hours=12)
-    _submitted_age = func.coalesce(
-        PendingSkipTraceRow.submitted_at, PendingSkipTraceRow.enqueued_at
-    )
-    unsettled = (
-        select(PendingSkipTraceRow.id)
-        .where(
-            PendingSkipTraceRow.job_id == Job.id,
-            or_(
-                # 'submitting' = claimed by a dispatcher tick, Tracerfy POST in
-                # flight or outcome unknown (crash window) — still unsettled.
-                PendingSkipTraceRow.status.in_(("queued", "submitting")),
-                and_(
-                    PendingSkipTraceRow.status == "submitted",
-                    _submitted_age >= _stale_cutoff,
-                ),
-            ),
-        )
-        .exists()
-    )
+    unsettled = skip_trace_unsettled(_now)
 
     with system_sync_session() as db:
+        # Monitoring only: it must never cost the sweep itself, which pushes every
+        # other customer's leads (Codex, 1b-1b-i review 2). A failure is logged at
+        # WARNING and the session is rolled back so the sweep's own queries run.
+        try:
+            _alert_rows_naming_missing_queues(db)
+        except Exception as exc:  # noqa: BLE001 — a probe must not stop the sweep
+            db.rollback()
+            _logger.warning("Dialer: missing-queue probe failed: %s", str(exc)[:200])
         candidates = db.execute(
             select(Job, ScraperConfig)
             # Owner-match in the join (Codex security, defense-in-depth): the DB

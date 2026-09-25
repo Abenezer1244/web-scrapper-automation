@@ -228,8 +228,7 @@ _REPOINT_PENDING = text(
         -- needs a surname splitter this module does not have — person_tokens() is
         -- explicitly not one, and using it made "VAN DYKE MARY" into
         -- last='VAN' first='DYKE' (Codex P1). Leaving them alone avoids both.
-        tracerfy_queue_id = NULL,
-        status = 'queued', submitted_at = NULL
+        status = 'queued'
     WHERE result_id = :id
       -- Reviving 'errored' is limited to the shape this repair created: something
       -- this statement repairs must still be off-target. A genuine provider
@@ -237,12 +236,18 @@ _REPOINT_PENDING = text(
       -- alone (Codex P2). Listing every repaired column (not just the street) also
       -- completes a row a PREVIOUS, narrower re-point left half-fixed (Codex P1).
       AND status IN ('queued', 'errored')
+      -- Never a row with SUBMISSION EVIDENCE (1b-1b-i, C4; the 15-7 grading). A
+      -- status alone is not proof a row was never sent: a queue id or a submit
+      -- time means Tracerfy may have received it and charged, and requeueing it
+      -- would buy the lookup again. Such a row is left untouched, and because the
+      -- callers only requeue the lead when this UPDATE matched, the lead is too.
+      AND tracerfy_queue_id IS NULL
+      AND submitted_at IS NULL
       AND (
            property_address IS DISTINCT FROM :property_address
         OR mail_address IS DISTINCT FROM :mail_address
         OR city IS NOT NULL OR state IS NOT NULL OR zip IS NOT NULL
         OR mail_city IS NOT NULL OR mail_state IS NOT NULL OR mail_zip IS NOT NULL
-        OR tracerfy_queue_id IS NOT NULL
       )
     """
 )
@@ -262,6 +267,11 @@ _CANCEL_PENDING = text(
     SET status = 'errored'
     WHERE result_id = :id
       AND status = 'queued'
+      -- No submission evidence (1b-1b-i diff review; same rule as the re-point):
+      -- otherwise the lead would be reset to 'not_attempted' below and bought again.
+      -- The caller resets the lead only when this matched.
+      AND tracerfy_queue_id IS NULL
+      AND submitted_at IS NULL
     """
 )
 

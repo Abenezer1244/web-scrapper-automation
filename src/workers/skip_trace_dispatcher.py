@@ -1135,8 +1135,16 @@ def _persist_submission(
     and `now` is the adoption clock. Billing overage against that would place
     usage inside a subscription period that had not begun when the lookups ran.
     See migration 093.
+
+    The pending rows KEEP their `submitted_at` (the claim time). It used to be
+    restamped to `now` here, which moved a batch adopted days later into today's
+    rolling window and made the daily spend cap count old spend as new (Codex,
+    1b-1b consult C1). Only the queue row takes the bookkeeping clock. The row
+    update is pinned to THIS claim (C2): `submitted_at = claim_time`, the batch's
+    trace_type, and no queue id yet, so a delayed retry can never stamp this
+    queue onto a row that was released and claimed again since.
     """
-    from sqlalchemy import update
+    from sqlalchemy import tuple_, update
     from sqlalchemy.dialects.postgresql import insert as pg_insert
 
     from src.db.models import PendingSkipTraceRow, Result, SkipTraceQueue
@@ -1172,28 +1180,45 @@ def _persist_submission(
         )
         .on_conflict_do_nothing(index_elements=["tracerfy_queue_id"])
     )
-    db.execute(
+    where = [
+        PendingSkipTraceRow.id.in_([c.id for c in claimed]),
+        PendingSkipTraceRow.status == "submitting",
+        PendingSkipTraceRow.trace_type == trace_type,
+        PendingSkipTraceRow.tracerfy_queue_id.is_(None),
+    ]
+    if claim_time is not None:
+        where.append(PendingSkipTraceRow.submitted_at == claim_time)
+    moved = db.execute(
         update(PendingSkipTraceRow)
-        .where(
-            PendingSkipTraceRow.id.in_([c.id for c in claimed]),
-            PendingSkipTraceRow.status == "submitting",
-        )
-        .values(status="submitted", tracerfy_queue_id=queue_id, submitted_at=now)
-    )
+        .where(*where)
+        .values(status="submitted", tracerfy_queue_id=queue_id)
+        .returning(PendingSkipTraceRow.id, PendingSkipTraceRow.result_id,
+                   PendingSkipTraceRow.user_id)
+    ).all()
     # Advance the matching Result rows 'queued' -> 'submitted' so the status
     # reflects "sent to Tracerfy, awaiting webhook" instead of sitting at
     # 'queued' (which reads as "not yet sent" — misleading for ops). The webhook
     # ingest matches by result_id (not status), so hit/miss reconciliation is
     # unaffected; the UI already renders 'submitted' the same as 'queued'.
-    db.execute(
-        update(Result)
-        .where(
-            Result.id.in_([c.result_id for c in claimed]),
-            Result.skip_trace_status == "queued",
+    # Only the rows this claim actually moved, tenant-paired.
+    if moved:
+        db.execute(
+            update(Result)
+            .where(
+                tuple_(Result.id, Result.user_id).in_(
+                    [(m.result_id, m.user_id) for m in moved]
+                ),
+                Result.skip_trace_status == "queued",
+            )
+            .values(skip_trace_status="submitted")
         )
-        .values(skip_trace_status="submitted")
-    )
+    # The queue row is committed even when some rows missed the pin. Tracerfy has
+    # already accepted and charged this batch; rolling the queue back would make
+    # ingest discard its results as 'unknown_queue' (1b-1b-i consult).
     db.commit()
+    if len(moved) < len(claimed):
+        missing = sorted({str(c.id) for c in claimed} - {str(m.id) for m in moved})
+        _alert_partial_bookkeeping(queue_id, trace_type, len(claimed), missing)
 
 
 def _persist_submission_retry(
@@ -1248,7 +1273,43 @@ def _alert_orphaned_queue(queue_id: int, trace_type: str, n_rows: int) -> None:
         _logger.warning("orphaned-queue ops alert failed: %s", str(exc)[:120])
 
 
-def _release_claim(db, claimed: list, to_status: str, claim_time=None) -> None:
+def _alert_partial_bookkeeping(
+    queue_id: int, trace_type: str, n_claimed: int, missing_ids: list[str],
+) -> None:
+    """Page ops: a PAID queue was recorded, but some of its rows no longer
+    belonged to the claim that sent them.
+
+    Those rows missed the pinned update because they were released (and maybe
+    claimed and sent again) after this batch went out. Tracerfy has their lookup
+    from this batch; any newer claim of the same rows is a second purchase. This
+    is detection, not prevention: nothing here can undo either charge.
+    """
+    _logger.error(
+        "Bookkeeping for Tracerfy queue %s matched %d of %d %s row(s); %d had left "
+        "this claim (possible double purchase): %s",
+        queue_id, n_claimed - len(missing_ids), n_claimed, trace_type,
+        len(missing_ids), ", ".join(missing_ids[:20]),
+    )
+    try:
+        from src.workers.ops_alerts import send_ops_alert
+
+        send_ops_alert(
+            "skip_trace", f"partial_bookkeeping_{queue_id}",
+            "Tracerfy batch recorded, but some rows had left their claim",
+            f"Tracerfy accepted (and charged for) queue_id={queue_id} ({trace_type}, "
+            f"{n_claimed} rows). The queue row IS recorded, so results will be "
+            f"ingested for the {n_claimed - len(missing_ids)} row(s) attached to it. "
+            f"The {len(missing_ids)} row(s) listed below are NOT attached: they were "
+            f"released, and possibly claimed and submitted again, before this batch's "
+            f"bookkeeping landed, so this batch's answer for them may be discarded and "
+            f"a newer claim may be a second charge. Reconcile each by hand.\n\n"
+            f"Row ids: {', '.join(missing_ids)}",
+        )
+    except Exception as exc:  # noqa: BLE001 — alerting is best-effort
+        _logger.warning("partial-bookkeeping ops alert failed: %s", str(exc)[:120])
+
+
+def _release_claim(db, claimed: list, to_status: str, claim_time=None) -> list:
     """Move claimed ('submitting') rows to `to_status`; no-op for an empty list.
 
     `claim_time` pins the release to ONE specific claim and is mandatory from the
@@ -1263,10 +1324,15 @@ def _release_claim(db, claimed: list, to_status: str, claim_time=None) -> None:
 
     The submit path may pass claim_time=None: it holds the rows from its own
     claim commit through to the release with no window in between.
+
+    Returns the rows ACTUALLY released, as (id, result_id, user_id). Anything
+    that follows up on `results` must use that list, never `claimed`: a row that
+    missed the pin belongs to a newer claim, and its lead is not ours to touch
+    (1b-1b-i consult; the Result update below had exactly that bug).
     """
     if not claimed:
-        return
-    from sqlalchemy import update
+        return []
+    from sqlalchemy import tuple_, update
 
     from src.db.models import PendingSkipTraceRow
 
@@ -1276,12 +1342,14 @@ def _release_claim(db, claimed: list, to_status: str, claim_time=None) -> None:
     ]
     if claim_time is not None:
         where.append(PendingSkipTraceRow.submitted_at == claim_time)
-    db.execute(
+    released = db.execute(
         update(PendingSkipTraceRow)
         .where(*where)
         .values(status=to_status, submitted_at=None)
-    )
-    if to_status == "errored":
+        .returning(PendingSkipTraceRow.id, PendingSkipTraceRow.result_id,
+                   PendingSkipTraceRow.user_id)
+    ).all()
+    if to_status == "errored" and released:
         # A definite rejection means these leads will never be traced; leaving
         # Result at 'queued' rendered "Processing" forever (Codex, 2026-09-02).
         # The UI already renders 'errored' as "Error".
@@ -1290,12 +1358,15 @@ def _release_claim(db, claimed: list, to_status: str, claim_time=None) -> None:
         db.execute(
             update(Result)
             .where(
-                Result.id.in_([c.result_id for c in claimed]),
+                tuple_(Result.id, Result.user_id).in_(
+                    [(r.result_id, r.user_id) for r in released]
+                ),
                 Result.skip_trace_status.in_(("queued", "submitted")),
             )
             .values(skip_trace_status="errored", skip_trace_attempted_at=datetime.now(UTC))
         )
     db.commit()
+    return released
 
 
 _STALE_CLAIM_AFTER = timedelta(minutes=30)
@@ -1491,6 +1562,40 @@ def candidate_queues(
     return hits, deferred
 
 
+def contested_queue_ids(db, remote: list[dict], known: set) -> set:
+    """Remote queue ids that could belong to MORE THAN ONE in-flight claim.
+
+    Computed over every 'submitting' claim, fresh ones included (see the
+    reconciler's comment). Shared by the live reconciler and
+    scripts/repair_stuck_skip_trace_claims.py so the two can never disagree about
+    which queues nobody may adopt.
+    """
+    from sqlalchemy import func, select
+
+    from src.db.models import PendingSkipTraceRow
+
+    all_claims = db.execute(
+        select(
+            PendingSkipTraceRow.submitted_at,
+            PendingSkipTraceRow.trace_type,
+            func.count().label("n"),
+        )
+        .where(
+            PendingSkipTraceRow.status == "submitting",
+            PendingSkipTraceRow.submitted_at.isnot(None),
+        )
+        .group_by(PendingSkipTraceRow.submitted_at, PendingSkipTraceRow.trace_type)
+    ).all()
+    contested: set = set()
+    seen_once: set = set()
+    for c_time, c_type, c_n in all_claims:
+        hits, deferred = candidate_queues(remote, c_time, c_type, c_n, known)
+        for q in hits + deferred:
+            qid = q.get("id")
+            (contested if qid in seen_once else seen_once).add(qid)
+    return contested
+
+
 def _reconcile_stale_claims(db) -> dict:
     """Resolve claims stuck mid-submission against Tracerfy's own queue list.
 
@@ -1573,26 +1678,7 @@ def _reconcile_stale_claims(db) -> dict:
         # FRESH claim's queue, attaching its results to the wrong leads and
         # billing the wrong tenants. Widening the scan to all 'submitting' rows
         # makes such a queue contested, and contested queues are adopted by nobody.
-        all_claims = db.execute(
-            select(
-                PendingSkipTraceRow.submitted_at,
-                PendingSkipTraceRow.trace_type,
-                func.count().label("n"),
-            )
-            .where(
-                PendingSkipTraceRow.status == "submitting",
-                PendingSkipTraceRow.submitted_at.isnot(None),
-            )
-            .group_by(PendingSkipTraceRow.submitted_at, PendingSkipTraceRow.trace_type)
-        ).all()
-
-        contested: set = set()
-        seen_once: set = set()
-        for c_time, c_type, c_n in all_claims:
-            hits, deferred = candidate_queues(remote, c_time, c_type, c_n, known)
-            for q in hits + deferred:
-                qid = q.get("id")
-                (contested if qid in seen_once else seen_once).add(qid)
+        contested = contested_queue_ids(db, remote, known)
 
         for claim_time, trace_type, n in groups:
             verdict, queue = match_remote_queue(
@@ -1660,7 +1746,12 @@ def _reconcile_stale_claims(db) -> dict:
                 # process dying right after this commit) would leave the queue
                 # recorded — and therefore excluded from every future
                 # reconciliation pass — with nothing ever ingesting it (Codex).
-                _persist_submission(db, queue_id, claimed, trace_type, queue, adopted=True)
+                # claim_time pins the adoption to exactly this claim (C2); billing
+                # is unaffected, provider_submitted_time ignores it when adopted.
+                _persist_submission(
+                    db, queue_id, claimed, trace_type, queue, adopted=True,
+                    claim_time=claim_time,
+                )
                 known.add(queue_id)
                 summary["adopted"] += len(claimed)
                 _redrive_completed_queue(queue)

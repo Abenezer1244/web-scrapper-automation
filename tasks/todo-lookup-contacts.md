@@ -965,6 +965,228 @@ pass-through test covered one table) fixed by parametrizing it over all three; 6
   production would settle it; if it does hold one, that is a privilege-boundary defect in its
   own right.
 
+## Phase 1b-1b — HARD per-account dispatch cap (PLAN, 2026-09-25, pre-Codex-consult)
+
+Branch `feat/lookup-1b1b-cap` off `fc38e620`. Required shape: findings 16-4, 16-5, 15-10,
+15-11. No migration.
+
+### Facts this plan stands on (read in code, `src/workers/skip_trace_dispatcher.py`)
+- The global cap (`:72-113`) counts `submitted_at >= now-24h` in its OWN session BEFORE the
+  claim's `pg_try_advisory_xact_lock` (`:218`). Two ticks can both pass it, and one tick may
+  claim several batches (`SKIP_TRACE_MAX_BATCHES_PER_TICK`, default 2) and up to 5000 rows per
+  batch after one check. It is SOFT (15-11).
+- Every claim pass takes the advisory lock, selects `queued` rows `ORDER BY enqueued_at LIMIT
+  5000 FOR UPDATE SKIP LOCKED` (`:225-283`), filters in Python (withdrawn / unsubmittable /
+  held in flight), then marks the survivors `submitting` with `submitted_at = claim_time` and
+  COMMITS (`:349-357`), which releases the lock. Only then does it POST to Tracerfy.
+- `submitted_at` is the right "spent" measure: set at claim, kept through `submitted` and
+  ingest (charged rows keep it), and cleared to NULL by `_release_claim` (`:1282`) on every
+  uncharged release (rate limit, 5xx, connection error, out-of-credits remainder, definite
+  rejection). A `submitting` row of UNKNOWN outcome keeps it, so it already counts as spent
+  (16-4). Beat interval is 300s (`scheduler.py:195`).
+
+### Design
+1. **One authoritative capacity read, INSIDE the claim transaction, after the advisory lock.**
+   A single query returns `global_spent` and `spent` per `user_id` over the rolling 24h
+   window. `global_remaining = cap - global_spent` (unbounded when the cap is 0 = disabled);
+   `account_remaining(u) = account_cap - spent(u)` (unbounded when 0). Because every claim
+   decision holds the same lock and every earlier claim is committed with its `submitted_at`,
+   a second tick, and the second batch of the same tick, see the first one's spend. The cap
+   becomes HARD. The pre-lock check at `:72-113` stays only as the cheap early exit and the
+   ops alert, and reads through the same helper so the two cannot disagree.
+2. **Fair selection in SQL, not Python.** Candidate ids come from a subquery: the eligible
+   `queued` rows (every predicate the current query has, unchanged) numbered
+   `ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY enqueued_at, id) AS rn`, kept only where
+   `rn <= account_remaining(user_id)`, ordered by `(rn, enqueued_at, id)` and limited to
+   `min(5000, global_remaining)`. Ordering by `rn` first is the round-robin: every eligible
+   account's oldest row, then every account's second, and so on, so one big backlog cannot
+   keep later tenants out of a batch. The outer query locks exactly those ids with
+   `FOR UPDATE OF pending_skip_trace_rows SKIP LOCKED` (Postgres forbids FOR UPDATE beside a
+   window function at the same level).
+3. **The Python filters after selection can only LOWER the count.** Withdrawn, unsubmittable
+   and in-flight-held rows drop out; nothing is added after the cap is applied. No change to
+   the claim, POST, release, or bookkeeping code.
+4. **Per-account resume time, ONE window query** (15-10) over the same 24h window: for each
+   account with `spent >= account_cap` and at least one eligible `queued` row, resume_at is
+   the `(spent - cap + 1)`-th oldest `submitted_at` + 24h, ordered deterministically by
+   `(submitted_at, id)`. The same for the global cap. Published as ONE Redis hash
+   (`skip_trace:cap_pause`: field `user_id` or `__global__` -> ISO resume_at) replaced whole
+   in a MULTI pipeline (`DEL` + `HSET` + `EXPIRE`) each tick, so an account that stops being
+   capped disappears on the next tick. TTL = `max(2*beat_interval + grace, resume_at - now +
+   grace)`. Redis is ADVISORY: a Redis failure is logged and never changes a dispatch decision.
+5. **Setting:** `SKIP_TRACE_ACCOUNT_DAILY_ROW_CAP` (int, 0 = disabled), in `settings.py` and
+   `.env.example`. The unit is ROWS, the same unit as the global cap and as billing (D2: an
+   advanced row costs 2 credits but bills 1 row).
+
+### Owner decisions needed BEFORE deploy (not before code)
+- The production value of `SKIP_TRACE_ACCOUNT_DAILY_ROW_CAP`, and whether it should vary by plan.
+  The code default is 0 (deploying changes nothing), and the code default is not the prod value
+  ([[code_default_is_not_the_production_value]]), so it must be SET on the worker.
+- Rows vs credits as the unit (above).
+
+### Files (5)
+`src/workers/skip_trace_dispatcher.py`, NEW `src/workers/skip_trace_capacity.py` (the capacity
+read, the fair-selection subquery, the resume-time query, the Redis publish),
+`src/config/settings.py`, `.env.example`, NEW `tests/test_skip_trace_account_cap.py`.
+
+### Tests (isolated DB; the concurrency ones with two real connections)
+- [ ] Account at its cap: none of its rows claimed; other accounts' rows are.
+- [ ] Account below its cap by k: exactly k of its rows claimed in one pass, even when 5000
+      are eligible.
+- [ ] Global cap hard: two ticks racing on two connections never claim more than
+      `global_remaining` together; same for two batches in one tick.
+- [ ] Unknown-outcome `submitting` rows count as spent; released rows (NULL `submitted_at`) do not.
+- [ ] Fairness: one tenant with a 6000-row backlog enqueued first, four tenants with later
+      rows; every tenant has rows in the first batch.
+- [ ] Rolling window: a row submitted 24h+1s ago no longer counts.
+- [ ] Resume time: exact value for a known spend history; deterministic on `submitted_at` ties.
+- [ ] Redis: the hash is written, replaced, and cleared when an account drops below its cap;
+      Redis down leaves dispatch unchanged.
+- [ ] Both caps 0: nothing is limited (up to 5000 eligible rows claimed, as today); only the
+      ORDER changes, to round-robin. Fairness applies whether or not a cap is set.
+- [ ] Mutation: remove the in-transaction read (keep only the pre-lock check) and the race
+      test must fail; remove `rn` from the ORDER BY and the fairness test must fail.
+
+### Pre-code consult on the 1b-1b plan (2026-09-25) — PLAN: REVISE, 7 P1 + 7 P2
+
+Prompt and output: `<scratchpad 0f367d2a>/codex_1b1b_consult{,_out}.txt`. #1-#3 re-verified in
+code before being accepted; they are PRE-EXISTING defects in live code, not in the plan.
+
+- **C1 (P1, VERIFIED, live)** `_persist_submission` writes `pending_skip_trace_rows.submitted_at
+  = now` at `submitted` (`skip_trace_dispatcher.py:1181`). The adoption path calls it with
+  `adopted=True` (`:1663`), possibly days after the claim, which drags an old paid batch into
+  today's window. The GLOBAL cap is live at 1000 in production, so this already over-counts
+  today. Fix: the pending row keeps `submitted_at == claim_time` through `submitted`, retry,
+  adoption and ingest; only `SkipTraceQueue.submitted_at` takes the bookkeeping time.
+- **C2 (P1, VERIFIED, live)** that UPDATE is pinned on `status='submitting'` only, not on the
+  claim generation. A delayed bookkeeping retry could stamp an old queue id onto a newer claim.
+  Fix: `WHERE status='submitting' AND submitted_at=:claim_time`, check the row count, route a
+  mismatch to the orphaned-queue alert. Never attach an old queue id to a newer claim.
+- **C3 (P1, VERIFIED, live, ops script)** `scripts/repair_stuck_skip_trace_claims.py:88-99`
+  selects, then updates by `id` only. Fix: one pinned conditional UPDATE ... RETURNING; touch
+  `results` only for rows actually released.
+- **C4 (P2)** `scripts/repair_probate_party_and_bad_parcel.py:214-245` may requeue an `errored`
+  row carrying submission evidence. Fix: require `tracerfy_queue_id IS NULL AND submitted_at IS
+  NULL`, else quarantine.
+- **C5 (P1)** post-selection filters (held in flight, unsubmittable) can drop an account's rn=1
+  row every tick, so its rn=2+ rows never go. **C6 (P1)** the outer SKIP LOCKED drops allocated
+  rows without replacement. Fix for both: a bounded REFILL loop inside the same locked
+  transaction: re-run the fair selection excluding ids already dropped, until the allowance is
+  used or nothing is left. Tests: a permanently held head, a locked head.
+- **C7 (P2)** perf: EXPLAIN (ANALYZE, BUFFERS) gate at production scale; an index on
+  `(user_id, submitted_at)` may need a migration (102).
+- **C8-C10 (P2)** Redis contract for 1b-1c: a `published_at` heartbeat so a stale or missing
+  publish reads as UNKNOWN, never "not paused"; publish EVERY account at or over its cap, with
+  or without queued rows (the quote comes before any row exists); the API reads only
+  `HGET <own user_id>`, never the whole hash; the key is namespaced; the TTL covers the latest
+  resume time and each value is compared with now.
+- **C11 (P1) unit.** A row cap lets 100 advanced rows spend ~200 credits. OWNER DECISION below.
+- **C12 (P1)** freeze the unknown-outcome state machine: test initial unknown, partial-resubmit
+  unknown, 429/5xx, definite rejection, full and partial 402, reconciler release, adoption,
+  ambiguous. Unknown `submitting` counts until reconciled.
+- **C13 (P2)** scope: beat interval to a setting that `scheduler.py` consumes; update
+  `tests/test_skip_trace_daily_cap.py`; the two scripts; maybe migration 102.
+- **C14 (P2)** `skip_trace_capacity.py` imports nothing from the task; ONE `_CLAIM_LOCK_KEY`.
+
+### OWNER DECISIONS (2026-09-25)
+- **Unit = CREDITS, weighted** (normal=1, advanced=2), per account AND globally; resume time uses
+  cumulative cost. The live global cap (`SKIP_TRACE_DAILY_ROW_CAP=1000`) changes meaning from
+  rows to credits, so its production value is re-read before 1b-1b-ii deploys (rename the
+  setting to say credits; keep the old name readable for one release).
+- **Three PRs, ledger first**, as below.
+
+### 1b-1b-i plan (branch `feat/lookup-1b1b-ledger`), pre-code
+Every reader of `pending_skip_trace_rows.submitted_at` was listed (`grep` over `src/`). Readers
+that only see `submitting` rows (reconciler, release, stale alert) are unaffected by C1. Three
+see `submitted`/`unmatched` rows:
+- `scheduler_helpers/dialer.py:84-89` ages a `submitted` row out after 12h by `submitted_at`.
+  Today adoption restamps it to now, which gives an adopted batch 12h for its phones to land.
+  **With C1, an adopted row from days ago ages out at once**, and the dialer can push the job
+  before the adopted batch's phones arrive (its own comment: it never pushes again). So C1
+  REQUIRES the dialer to age a `submitted` row by its batch's bookkeeping time
+  (`skip_trace_queues.submitted_at`, joined on `tracerfy_queue_id`), falling back to the row's.
+- `skip_trace_dispatcher.py:747` and `enrich.py:2369`: the 90-day charged-unanswered window.
+  The claim time is the truer purchase time; the difference is seconds (days only on adoption).
+  No change.
+
+Changes:
+- [x] C1 `_persist_submission`: pending rows keep `submitted_at`; only the queue row takes now.
+- [x] C2 same UPDATE pinned on `submitted_at = claim_time`; rowcount checked; a shortfall is
+      logged and alerted with the queue id (the adoption backstop still re-derives it).
+- [x] Dialer ages `submitted` rows by the batch's queue `submitted_at` (above).
+- [x] C3 `repair_stuck_skip_trace_claims.py`: one pinned conditional UPDATE ... RETURNING.
+- [x] C4 `repair_probate_party_and_bad_parcel.py`: requeue only rows with no queue id and no
+      `submitted_at`.
+- [x] C12 tests freezing the state machine, plus C1/C2/dialer regression tests, mutation-tested.
+Files: dispatcher, dialer, 2 scripts, 1 new test file = 5.
+
+**Pre-code consult on 1b-1b-i (2026-09-25): PLAN: REVISE, all accepted.** Output:
+`<scratchpad 0f367d2a>/codex_1b1bi_consult_out.txt`. Supersedes the matching bullets above:
+- Dialer: age by the queue's `submitted_at`; fall back to the row's only when
+  `tracerfy_queue_id` IS NULL. A non-null queue id with NO queue row keeps the job unsettled
+  and alerts; never a one-shot push of a possibly paid orphan.
+- Reader inventory also includes the live global cap (`dispatcher:90`), which C1 makes correct.
+- Adoption (`:1650-1666`) passes NO `claim_time` today: pass it, and pin the update on
+  `submitted_at = claim_time AND trace_type AND tracerfy_queue_id IS NULL`.
+- A pinned-update SHORTFALL never rolls back the queue insert (Tracerfy has charged; ingest
+  would discard the batch as `unknown_queue`). `UPDATE ... RETURNING`, commit the queue and the
+  matched rows, and send a DISTINCT partial-bookkeeping alert with the queue id and the
+  unmatched row ids. Rows that missed the pin already belong to a newer claim or were released,
+  so this is double-pay DETECTION, not prevention; flag at diff review.
+- `_release_claim` gets `RETURNING id, result_id, user_id` and updates `results` only for the
+  returned `(result_id, user_id)` pairs (today it updates the original set: a latent bug in the
+  live path too). The C3 script reuses it.
+- **New invariant:** `trace_type` never changes once `submitted_at` or `tracerfy_queue_id` is
+  set, or a weighted cap can be rewritten after the fact. Application-enforced here (C2/C4
+  predicates + tests); a DB trigger or a per-row credit snapshot is decided in 1b-1b-ii.
+- Invariant after C1, as an acceptance criterion: for every row attached to an accepted queue,
+  `pending.submitted_at == claim_time`; ingest preserves it.
+- C12 tests go in a NEW file with real DB sessions; only `submit_batch` and the queue-list
+  seam are monkeypatched. Existing coverage (not duplicated): `test_skip_trace_dispatcher_claim`,
+  `test_skip_trace_reconciliation`, `test_tracerfy_ingest`, `test_skip_trace_over_quota`,
+  `test_skip_trace_already_delivered`, `test_skip_trace_daily_cap`.
+
+**1b-1b-i BUILT (2026-09-25), before Codex diff review.** 17 tests in
+`tests/test_skip_trace_spend_ledger.py`; five mutations each caught by exactly their test (C1
+restamp, C2 pin, release-set, dialer by row, dialer missing-queue). 349 passed across every
+skip-trace/ingest suite; dialer, subject-key and script suites green. Found while building:
+- `repair_stuck_skip_trace_claims.py` also looked at claims of ANY age (a claim seconds old has
+  no Tracerfy queue yet because its POST is in flight) and skipped `_release_is_safe`; and it set
+  the Result to `not_attempted` while the pending row went back to `queued` (queue/results
+  drift). It now does exactly what the live reconciler does.
+- Two tests in `test_repair_probate_party_and_bad_parcel.py` PINNED the unsafe re-point (clear
+  the queue id; treat a queue id as a reason to re-point). Pre-2026-09-07 ingest wrote charged,
+  unmatched rows as `errored` WITH a queue id, so that re-point re-bought paid lookups. Tests
+  updated with the reasoning; this is the 6th file (over the 5-file rule, disclosed).
+- The dialer predicate moved into `skip_trace_unsettled(now)` so it is testable; unchanged logic.
+- Deviation from the consult: a 'submitted' row naming a missing queue keeps the job unsettled
+  but does not alert (the state is unreachable through code). Flag at diff review.
+
+**Diff review round 1 on `1d2154aa` (2026-09-25): NO-GO, no P1, 3 P2 + P3s.** C1, C2, the
+release fix and the dialer correlation confirmed; retention never deletes queue rows. Fixed:
+- P2 dialer: a job held by a row naming a missing queue now alerts (`_alert_rows_naming_missing_queues`,
+  ops-alert cooldown + durable row). My deviation above is withdrawn.
+- P2 the repair script lacked the live reconciler's CONTESTED-queue refusal. Extracted
+  `contested_queue_ids()` and both use it; a contested match prints REFUSE.
+- P2 `_CANCEL_PENDING` in the probate script lacked the evidence guard; it then reset the lead
+  to `not_attempted`. Guarded like the re-point.
+- P3 alert wording (only attached rows are ingested; the listed rows need reconciling).
+- P3 tests: the outcome test asserts the POST happened; new tests for the bookkeeping retry,
+  the reconciler's release, contested refusal, and the missing-queue alert.
+Eight mutations, each caught by its own test. 434 passed across every touched suite.
+**Deferred, recorded (not in this PR):** P3 the probate script's raw `results` updates are
+keyed by UUID and not tenant-paired (pre-existing, script-wide); P3 a DB-backed test of the
+probate script's caller behaviour (its SQL guards are tested; the callers are rowcount-gated).
+
+### Revised split (ACCEPTED by owner, 5-file rule)
+- **1b-1b-i SPENT-LEDGER HARDENING** (no feature; fixes live defects C1-C4 + C12 tests):
+  dispatcher, the two scripts, tests. Ships alone, like 1b-0. The cap cannot be correct on top
+  of a ledger that moves charged rows in time.
+- **1b-1b-ii THE CAP**: capacity module, fair selection + refill, in-lock read, settings,
+  `.env.example`, tests (+ migration 102 only if the EXPLAIN gate demands it).
+- **1b-1b-iii PAUSE STATE**: resume-time query, Redis publish with heartbeat, beat interval
+  setting, `scheduler.py`, tests.
+
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever
       the tab has leads that have never been looked up; when the quote comes back with

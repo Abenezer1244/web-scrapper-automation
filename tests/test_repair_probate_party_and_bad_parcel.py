@@ -160,10 +160,12 @@ def test_repoint_rebuilds_the_whole_pending_payload():
     # stranger's context. Everything not verified for the corrected parcel is NULL.
     sql = " ".join(str(_mod._REPOINT_PENDING).split())
     for col in ("city = NULL", "state = NULL", "zip = NULL",
-                "mail_city = NULL", "mail_state = NULL", "mail_zip = NULL",
-                "tracerfy_queue_id = NULL"):
+                "mail_city = NULL", "mail_state = NULL", "mail_zip = NULL"):
         assert col in sql, col
     assert "mail_address = :mail_address" in sql
+    # 1b-1b-i C4: a re-point never clears submission evidence, because it only
+    # ever touches a row that has none (see test_repoint_never_revives_a_submitted_row).
+    assert "tracerfy_queue_id = NULL" not in sql
     # Names are recomputed rather than nulled — see the dedicated test below.
     requeue = " ".join(str(_mod._REQUEUE_RESULT_TRACE).split())
     assert "SET skip_trace_status = 'queued'" in requeue
@@ -189,9 +191,25 @@ def test_repoint_also_completes_a_half_fixed_row():
     sql = " ".join(str(_mod._REPOINT_PENDING).split())
     for cond in ("mail_address IS DISTINCT FROM :mail_address",
                  "city IS NOT NULL", "state IS NOT NULL", "zip IS NOT NULL",
-                 "mail_city IS NOT NULL", "mail_state IS NOT NULL", "mail_zip IS NOT NULL",
-                 "tracerfy_queue_id IS NOT NULL"):
+                 "mail_city IS NOT NULL", "mail_state IS NOT NULL", "mail_zip IS NOT NULL"):
         assert cond in sql, cond
+
+
+def test_repoint_never_revives_a_submitted_row():
+    # 1b-1b-i C4 (supersedes the earlier "tracerfy_queue_id IS NOT NULL" trigger).
+    # Before 2026-09-07 ingest wrote charged-but-unmatched rows as 'errored' WITH a
+    # queue id (tracerfy_ingest.py, the 'unmatched' comment). Such a row is errored,
+    # carries a queue id, and was PAID FOR; re-pointing it to 'queued' buys the
+    # lookup again. Only a row with no submission evidence may be re-pointed, and
+    # the lead is requeued only when the re-point matched (rowcount-gated).
+    sql = _sql_without_comments(_mod._REPOINT_PENDING)
+    assert "AND tracerfy_queue_id IS NULL" in sql
+    assert "AND submitted_at IS NULL" in sql
+    assert "tracerfy_queue_id IS NOT NULL" not in sql
+    # The cancel path resets the lead to 'not_attempted' after it; same guard.
+    cancel = _sql_without_comments(_mod._CANCEL_PENDING)
+    assert "AND tracerfy_queue_id IS NULL" in cancel
+    assert "AND submitted_at IS NULL" in cancel
 
 
 def test_party_repair_refreshes_the_stale_trace_name():

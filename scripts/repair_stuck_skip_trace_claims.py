@@ -21,9 +21,18 @@ SAFETY
     list proves no queue was ever created for it, adopts only an unambiguous
     single match, and refuses anything else. It NEVER resubmits.
 
-    A released row returns to 'queued' and its Result to 'not_attempted', so the
-    next dispatcher tick sends it normally. Nothing is deleted, no contact data
-    is touched, and no usage counter is reset.
+    A released row returns to 'queued' (its Result stays 'queued'), so the next
+    dispatcher tick sends it normally. That is exactly what the live reconciler
+    does. Nothing is deleted, no contact data is touched, and no usage counter is
+    reset.
+
+    It releases through the dispatcher's own _release_claim, pinned on the claim
+    time, and only claims older than the live reconciler's cutoff that also pass
+    its _release_is_safe check (1b-1b-i, C3). The earlier version selected, then
+    updated by id alone, looked at claims of ANY age (a claim seconds old has no
+    Tracerfy queue yet because its POST is still in flight), and reset the Result
+    to 'not_attempted' while the pending row went back to 'queued', which is a
+    queue/results disagreement the quote would read as a quotable lead.
 
 Run:
     railway run --service worker python scripts/repair_stuck_skip_trace_claims.py
@@ -39,12 +48,20 @@ APPLY = "--apply" in sys.argv
 
 
 def main():
-    from sqlalchemy import func, select, text, update
+    from datetime import UTC, datetime
 
-    from src.db.models import PendingSkipTraceRow, Result, SkipTraceQueue
+    from sqlalchemy import func, select, text
+
+    from src.db.models import PendingSkipTraceRow, SkipTraceQueue
     from src.db.session import system_sync_session
     from src.scrapers.enrichment.skip_trace import fetch_queues
-    from src.workers.skip_trace_dispatcher import match_remote_queue
+    from src.workers.skip_trace_dispatcher import (
+        _STALE_CLAIM_AFTER,
+        _release_claim,
+        _release_is_safe,
+        contested_queue_ids,
+        match_remote_queue,
+    )
 
     mode = "APPLY" if APPLY else "DRY RUN"
     print(f"== Stuck skip-trace claim repair [{mode}] ==\n")
@@ -66,6 +83,8 @@ def main():
             .where(
                 PendingSkipTraceRow.status == "submitting",
                 PendingSkipTraceRow.submitted_at.isnot(None),
+                # A fresh claim may be mid-POST: "no queue yet" is not proof.
+                PendingSkipTraceRow.submitted_at < datetime.now(UTC) - _STALE_CLAIM_AFTER,
             )
             .group_by(PendingSkipTraceRow.submitted_at, PendingSkipTraceRow.trace_type)
             .order_by(PendingSkipTraceRow.submitted_at)
@@ -73,17 +92,25 @@ def main():
 
         if not groups:
             print("No claims stuck in 'submitting'. Nothing to repair.")
+        # Same contention rule as the live reconciler, over ALL in-flight claims:
+        # a queue that could belong to two claims is adopted by neither.
+        contested = contested_queue_ids(db, remote, known)
         total_released = total_adopted = total_refused = 0
 
         for claim_time, trace_type, n, users, jobs in groups:
             verdict, queue = match_remote_queue(remote, claim_time, trace_type, n, known)
+            if verdict == "one" and queue.get("id") in contested:
+                verdict, queue = "contested", None
             head = (
                 f"  claimed {claim_time}  {trace_type:<9} rows={n:<5} "
                 f"users={users} jobs={jobs}"
             )
-            if verdict == "none":
+            if verdict == "none" and not _release_is_safe(remote, claim_time, trace_type, known):
+                print(f"{head}  -> REFUSE (no exact queue, but an unrecorded {trace_type} "
+                      f"queue sits nearby: releasing could pay twice; needs a human)")
+                total_refused += n
+            elif verdict == "none":
                 print(f"{head}  -> RELEASE (no Tracerfy queue: never accepted, never charged)")
-                total_released += n
                 if APPLY:
                     rows = db.execute(
                         select(PendingSkipTraceRow).where(
@@ -92,23 +119,13 @@ def main():
                             PendingSkipTraceRow.trace_type == trace_type,
                         )
                     ).scalars().all()
-                    db.execute(
-                        update(PendingSkipTraceRow)
-                        .where(PendingSkipTraceRow.id.in_([r.id for r in rows]))
-                        .values(status="queued", submitted_at=None)
-                    )
-                    # Return the lead to 'not_attempted' so the enqueue path can
-                    # pick it up again. Guarded on the two in-flight states so a
-                    # lead that has since been traced by another job is untouched.
-                    db.execute(
-                        update(Result)
-                        .where(
-                            Result.id.in_([r.result_id for r in rows]),
-                            Result.skip_trace_status.in_(("queued", "submitted")),
-                        )
-                        .values(skip_trace_status="not_attempted")
-                    )
-                    db.commit()
+                    # Pinned on claim_time inside the UPDATE itself, and counted
+                    # from what it RETURNS, so a row released and re-claimed by the
+                    # dispatcher since the SELECT above is left alone.
+                    released = _release_claim(db, rows, "queued", claim_time=claim_time)
+                    total_released += len(released)
+                else:
+                    total_released += n
             elif verdict == "one":
                 print(
                     f"{head}  -> ADOPT queue {queue['id']} "
@@ -119,6 +136,10 @@ def main():
                 if APPLY:
                     print("       (adoption is left to the live reconciler — it also "
                           "re-drives ingest)")
+            elif verdict == "contested":
+                print(f"{head}  -> REFUSE (its queue fits more than one claim; the live "
+                      f"reconciler will not adopt it either; needs a human)")
+                total_refused += n
             else:
                 print(f"{head}  -> REFUSE (ambiguous: several queues fit; needs a human)")
                 total_refused += n

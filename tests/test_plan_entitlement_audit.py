@@ -2553,9 +2553,25 @@ def test_the_dispatcher_records_the_provider_time_it_computes():
         "the derived value must actually be written to the queue row"
     )
     # And the adoption call site must declare itself, or every adopted queue
-    # silently takes the dispatch branch and gets the adoption clock.
-    assert "trace_type, queue, adopted=True)" in inspect.getsource(d), (
+    # silently takes the dispatch branch and gets the adoption clock. It also
+    # passes its claim_time (1b-1b-i, C2), which pins the row update to the claim
+    # being adopted. Checked on the parsed CALL, not the source text, so a comment
+    # or a different call can never satisfy it (Codex).
+    import ast
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(d._reconcile_stale_claims)))
+    calls = [
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "_persist_submission"
+    ]
+    assert len(calls) == 1, "expected exactly one _persist_submission call in the reconciler"
+    kw = {k.arg: k.value for k in calls[0].keywords}
+    assert isinstance(kw.get("adopted"), ast.Constant) and kw["adopted"].value is True, (
         "the reconciler's adoption call must pass adopted=True"
+    )
+    assert isinstance(kw.get("claim_time"), ast.Name) and kw["claim_time"].id == "claim_time", (
+        "the reconciler's adoption call must pass its claim_time"
     )
 # ─── Plan switching: one subscription, moved, never a second one ─────────────
 

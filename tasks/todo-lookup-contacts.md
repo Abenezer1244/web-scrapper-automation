@@ -1221,13 +1221,15 @@ C5, C6, C7, C11, C12, C13, C14, plus 16-4, 16-5, 15-11.
 4. **Refill loop** (C5, C6): after the lock and the Python filters (withdrawn / unsubmittable /
    held in flight), if fewer rows survived than the allowance and some were dropped or skipped,
    re-run the fair select EXCLUDING every id already considered, with each account's and the
-   global allowance reduced by what already survived. Bounded (3 rounds). All in the same
+   global allowance reduced by what already survived, until the allowance is filled or no new
+   candidate exists (R3), with the in-flight hold run over ALL survivors so far (R2). All in the same
    locked transaction; nothing added after the cap is applied can exceed it, because each round
    is computed against the remaining allowance.
 5. **Settings**: `SKIP_TRACE_DAILY_CREDIT_CAP` (global) and `SKIP_TRACE_ACCOUNT_DAILY_CREDIT_CAP`,
-   int, 0 = disabled. The old `SKIP_TRACE_DAILY_ROW_CAP` stays readable for ONE release: if the
-   new global is unset and the old is set, the old value is used as credits and a WARNING is
-   logged every tick naming the change (1000 rows becomes 1000 credits = 500 advanced rows).
+   `int | None = None` (R9): `None` = unset, explicit `0` = disabled. The old
+   `SKIP_TRACE_DAILY_ROW_CAP` stays readable for ONE release: if the new global is `None` and the
+   old is set, the old value is used as credits and a WARNING is logged ONCE per process naming
+   the change (1000 rows becomes 1000 credits = 500 advanced rows).
    **Owner sets the production values before deploy.**
 6. **Migration 102** (its own PR, first): a partial index `(submitted_at) INCLUDE (user_id,
    trace_type) WHERE submitted_at IS NOT NULL`, built CONCURRENTLY, restart-safe like 100/101;
@@ -1238,12 +1240,12 @@ C5, C6, C7, C11, C12, C13, C14, plus 16-4, 16-5, 15-11.
    froze them, C12). The unknown-outcome state machine is unchanged.
 
 ### Split (5-file rule)
-- **1b-1b-ii-a**: migration 102 + models + tests (3 files). EXPLAIN (ANALYZE, BUFFERS) of the
+- **1b-1b-ii-a**: migration 102 + models + `alembic/env.py` + tests (4 files). EXPLAIN (ANALYZE, BUFFERS) of the
   spent query and the fair select on a seeded 100k-row test DB, before and after, as the gate.
 - **1b-1b-ii-b**: NEW `src/workers/skip_trace_capacity.py` (weights, the spent read, the fair
   select, the refill), `skip_trace_dispatcher.py`, `settings.py`, `.env.example`, NEW
-  `tests/test_skip_trace_credit_cap.py`; `tests/test_skip_trace_daily_cap.py` updated (6 —
-  disclose, or fold the old cap tests into the new file).
+  `tests/test_skip_trace_credit_cap.py`, with the legacy `tests/test_skip_trace_daily_cap.py`
+  tests folded in (R11): 5 files. `alembic/env.py` belongs to ii-a (R6), not here.
 
 ### Tests (ii-b)
 - [ ] Account at its cap: none of its rows claimed; others are. Below by k credits: exactly
@@ -1269,8 +1271,9 @@ per-pass cost is constant; the partial index shape fits. SUPERSEDES the matching
   `scripts/sprint4_all_counties.py`, `sprint4_phase3_advanced.py`, `sprint4_phase3_king_pf.py`,
   `sprint4_phase3_preforeclosure.py`, `sprint4_phase3_verify.py` call `submit_batch()` directly:
   no lock, no pending row, no cap. Sprint 4 experiments. **Hard-disable all five** (the 1a
-  precedent: `sprint4_enqueue_existing.py`), refusing at import with the reason. Own tiny PR,
-  first: it is the only thing that makes "hard cap" a true statement.
+  precedent: `sprint4_enqueue_existing.py`): body deleted, running it prints the reason and
+  exits 1. Own tiny PR, first: it is the only thing that makes "hard cap" a true statement.
+  **DONE in ii-0**; Codex confirmed the dispatcher is then the only code path that spends.
 - **R2 (P1) the in-flight hold must be CUMULATIVE across refill rounds.** `_hold_answers_in_flight`
   only sees the current list; a refill row can share an address with an earlier round's survivor
   and go out in the same batch (paid twice, answered by neither). Each round runs the hold

@@ -4,8 +4,9 @@ for its webhook to measure the phone/email hit rate.
 It spent real Tracerfy credits by calling `submit_batch()` DIRECTLY, and that is
 why its body is gone (Phase 1b-1b-ii-0, Codex pre-code consult R1). The
 dispatcher is the one place allowed to spend: it claims rows under
-`pg_try_advisory_xact_lock`, records them as pending rows, and (from 1b-1b-ii)
-reserves each account's and the global daily credit allowance inside that lock.
+`pg_try_advisory_xact_lock`, records them as pending rows, and checks the daily
+spend cap; Phase 1b-1b-ii moves that check inside the lock and adds a
+per-account credit allowance.
 A script calling the provider directly takes none of that, so while any such
 script existed the per-account and global caps could not honestly be called
 hard: one run would spend outside both, unrecorded, with nothing to reconcile.
@@ -32,7 +33,7 @@ import sys
 def main() -> int:
     print(
         "RETIRED: this Sprint 4 experiment called Tracerfy's submit_batch() directly, "
-        "outside the dispatcher's lock and daily credit caps. Its body was removed "
+        "outside the dispatcher's lock and daily spend cap. Its body was removed "
         "deliberately. Enqueue lookups for the dispatcher instead "
         "(scripts/backfill_skip_trace_jobs.py)."
     )

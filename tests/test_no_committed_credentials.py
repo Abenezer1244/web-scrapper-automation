@@ -26,9 +26,11 @@ _ASSIGNMENT = re.compile(
     r"\s*[:=]\s*[\"']?([A-Za-z0-9_\-+/]{24,})"
 )
 
-# A value counts as a placeholder only if it says so. Anything else that looks
-# like a credential fails the test: add the real fix (env var), not an entry here.
-_PLACEHOLDER_MARKERS = ("your", "change", "example", "placeholder", "fake", "dummy", "test", "ci-", "timing")
+# A value counts as a placeholder only if it OPENS by saying so. A prefix, not a
+# substring: a real random token can contain "test" by chance, but it does not
+# start with "your-". Anything else that looks like a credential fails the test:
+# add the real fix (env var), not an entry here.
+_PLACEHOLDER_PREFIXES = ("your", "change", "example", "placeholder", "fake", "dummy", "test", "ci-", "timing")
 
 # Names that are constants holding a header name, not a secret value.
 _NON_SECRET_NAMES = {"_SECRET_HEADER"}
@@ -50,7 +52,7 @@ def find_credential_assignments(text: str) -> list[tuple[str, str]]:
         name, value = m.group(1), m.group(2)
         if name in _NON_SECRET_NAMES:
             continue
-        if any(marker in value.lower() for marker in _PLACEHOLDER_MARKERS):
+        if value.lower().startswith(_PLACEHOLDER_PREFIXES):
             continue
         found.append((name, f"{value[:4]}...{value[-3:]}"))
     return found
@@ -60,6 +62,11 @@ def test_scanner_finds_a_bom_prefixed_lowercase_token():
     # Positive control: the exact shape that slipped past two audits.
     sample = '﻿cloudflare_api_token = "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789abcd"\n'
     assert find_credential_assignments(sample) == [("cloudflare_api_token", "AbCd...bcd")]
+
+
+def test_a_real_token_containing_a_marker_word_is_still_caught():
+    sample = 'api_token = "Xk9vTESTqL2mP8rW4nB7cY1zD5fH3jK6"\n'
+    assert find_credential_assignments(sample) == [("api_token", "Xk9v...jK6")]
 
 
 def test_scanner_ignores_declared_placeholders():

@@ -1,6 +1,7 @@
 """Auth hardening: token blacklist + brute-force protection (Redis-backed)."""
 
 import logging
+import time
 from datetime import datetime
 
 import redis.asyncio as aioredis
@@ -79,9 +80,51 @@ class TokenBlacklist:
         """
         r = _get_redis()
         key = f"{TokenBlacklist._KEY_PREFIX}{jti}"
-        # redis-py returns True when the key was set, None when NX failed.
-        result = await r.set(key, "1", nx=True, ex=expires_in_seconds)
+        # redis-py returns True when the key was set, None when NX failed. The
+        # value records WHEN it was consumed, so a later replay can tell a race
+        # (recent) from reuse (old) without trusting the replayer (A-5).
+        result = await r.set(key, f"c:{int(time.time())}", nx=True, ex=expires_in_seconds)
         return result is not None
+
+    @staticmethod
+    async def consumed_at(jti: str) -> int | None:
+        """When this jti was consumed, or None if unknown.
+
+        Unknown covers a jti blacklisted by logout ("1") and one consumed before
+        timestamps were recorded; neither may be read as proof of reuse.
+        """
+        r = _get_redis()
+        raw = await r.get(f"{TokenBlacklist._KEY_PREFIX}{jti}")
+        if isinstance(raw, bytes):
+            raw = raw.decode()
+        if isinstance(raw, str) and raw.startswith("c:") and raw[2:].isdigit():
+            return int(raw[2:])
+        return None
+
+    # ─── Session families (A-1 / A-5) ─────────────────────────────────────────
+    # Every login mints a family id carried through every rotation of its
+    # access/refresh pair. Revoking the family ends that one session everywhere
+    # it was copied, without touching the user's other sessions. Held for the
+    # longest refresh lifetime plus clock-skew margin, so no token of the
+    # family can outlive its revocation.
+    _FAMILY_PREFIX = "bl:fam_revoked:"
+    FAMILY_REVOCATION_TTL = 7 * 24 * 3600 + 3600
+
+    @staticmethod
+    async def revoke_family(fam: str) -> None:
+        """Raises on Redis error: the caller must not report a revocation it did not make."""
+        r = _get_redis()
+        await r.setex(
+            f"{TokenBlacklist._FAMILY_PREFIX}{fam}", TokenBlacklist.FAMILY_REVOCATION_TTL, "1"
+        )
+
+    @staticmethod
+    async def is_family_revoked(fam: str | None) -> bool:
+        """Fails CLOSED like is_blacklisted: a Redis error propagates (503)."""
+        if not fam:
+            return False
+        r = _get_redis()
+        return bool(await r.exists(f"{TokenBlacklist._FAMILY_PREFIX}{fam}"))
 
     # ─── Replay grace window (single-use rotation, concurrent clients) ────────
     # Single-use rotation is correct but brittle for a browser: one page load

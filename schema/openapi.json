@@ -2223,6 +2223,26 @@
         "title": "LoginResponse",
         "type": "object"
       },
+      "LogoutRequest": {
+        "additionalProperties": false,
+        "description": "Optional body for POST /auth/logout: the session's refresh token, so\nlogout still ends the session after its 1-hour access token has expired.",
+        "properties": {
+          "refresh_token": {
+            "anyOf": [
+              {
+                "maxLength": 4096,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Refresh Token"
+          }
+        },
+        "title": "LogoutRequest",
+        "type": "object"
+      },
       "MfaDisableRequest": {
         "description": "Disabling MFA requires the password AND a second factor (TOTP or a\nbackup code) — knowledge of the password alone must not remove MFA.",
         "properties": {
@@ -4782,17 +4802,40 @@
     },
     "/auth/logout": {
       "post": {
+        "description": "End THIS session: the access token (bearer), the refresh token (body), or both.\n\nAudit 2026-09-25, A-1: logout used to blacklist only the access token, so\nthe 7-day refresh token kept minting new ones. Each presented token now has\nits jti blacklisted AND its session family revoked, which ends every token\nthat session ever rotated into. The refresh token is accepted on its own so\nlogout still works once the 1-hour access token has expired. The user's\nother sessions are untouched (that is /auth/logout-all).",
         "operationId": "logout_auth_logout_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/LogoutRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Body"
+              }
+            }
+          }
+        },
         "responses": {
           "204": {
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
           }
         },
-        "security": [
-          {
-            "HTTPBearer": []
-          }
-        ],
         "summary": "Logout",
         "tags": [
           "auth"

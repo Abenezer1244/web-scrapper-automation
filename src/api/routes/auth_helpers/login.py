@@ -14,8 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.api.auth import (
     _coerce_auth_time,
     _sanitize_amr,
-    create_refresh_token,
-    create_secure_token,
+    create_token_pair,
     decode_refresh_token,
     verify_password,
 )
@@ -92,8 +91,7 @@ async def login_user(
 
     await BruteForceProtection.clear(ip, body.email)
     # Password-only session (no MFA on this account): amr=["pwd"].
-    token = create_secure_token(user.id, amr=["pwd"])
-    refresh = create_refresh_token(user.id, amr=["pwd"])
+    token, refresh = create_token_pair(user.id, amr=["pwd"])
     audit_log(request, "login_success", user.id)
     return LoginResponse(access_token=token, refresh_token=refresh)
 
@@ -196,8 +194,7 @@ async def login_mfa_redeem(
     # Full MFA-backed session (H2-P5): amr=["pwd","mfa"], auth_time=now (default)
     # — this is the only login path that mints an "mfa" session, the marker the
     # admin step-up dependency requires.
-    token = create_secure_token(user.id, amr=["pwd", "mfa"])
-    refresh = create_refresh_token(user.id, amr=["pwd", "mfa"])
+    token, refresh = create_token_pair(user.id, amr=["pwd", "mfa"])
     audit_log(request, "login_success", user.id)
     return LoginResponse(access_token=token, refresh_token=refresh)
 
@@ -376,8 +373,7 @@ async def login_break_glass_redeem(
     # Mint the DEGRADED recovery session. amr WITHOUT "mfa" -> can never satisfy
     # admin step-up; mfa_enabled is now False so require_admin routes the user to
     # re-enrollment.
-    token = create_secure_token(user.id, amr=["pwd", "break_glass"])
-    refresh = create_refresh_token(user.id, amr=["pwd", "break_glass"])
+    token, refresh = create_token_pair(user.id, amr=["pwd", "break_glass"])
     audit_log(request, "mfa_breakglass_used", user_id)
     return LoginResponse(access_token=token, refresh_token=refresh)
 
@@ -456,6 +452,7 @@ async def refresh_tokens(
 
     from src.api.middleware.auth_hardening import TokenBlacklist, revocation_unavailable_503
     jti = payload.get("jti", "")
+    fam: str | None = payload.get("fam") or None
     issued_at: int = payload.get("iat", 0)
     exp: int = payload.get("exp", 0)
     ttl = max(0, exp - int(time.time()))
@@ -463,6 +460,9 @@ async def refresh_tokens(
         raise HTTPException(status_code=401, detail="Invalid or expired refresh token")
     try:
         if await TokenBlacklist.is_revoked_by_user_logout_all(user_id, issued_at):
+            raise HTTPException(status_code=401, detail="Refresh token revoked")
+        # This session was logged out, or burned by an earlier replay (A-1/A-5).
+        if await TokenBlacklist.is_family_revoked(fam):
             raise HTTPException(status_code=401, detail="Refresh token revoked")
         if not await TokenBlacklist.consume_once(jti, ttl):
             # Already consumed. Inside the grace window this is almost always a
@@ -479,12 +479,29 @@ async def refresh_tokens(
             # cache and get the very 401 this window exists to prevent, which is
             # exactly the concurrent case we are fixing.
             replayed = await _await_rotation_result(jti)
-            if replayed:
+            # Re-checked here, not only above: a logout (or a burned family)
+            # landing during the wait must not be undone by handing back the
+            # cached pair (Codex).
+            if replayed and not await TokenBlacklist.is_family_revoked(fam):
                 cached = json.loads(replayed)
                 return TokenResponse(
                     access_token=cached["access_token"],
                     refresh_token=cached["refresh_token"],
                 )
+            # Reuse detection (A-5). A token consumed longer ago than the grace
+            # window is being presented again: either a thief or the victim
+            # holds a stale copy, and nothing distinguishes them, so the whole
+            # session family ends. Only when consumption is PROVEN old: a jti
+            # consumed moments ago whose winner crashed before publishing its
+            # pair, or one blacklisted by logout, is refused but burns nothing.
+            consumed = await TokenBlacklist.consumed_at(jti)
+            if (
+                fam
+                and consumed is not None
+                and int(time.time()) - consumed > TokenBlacklist.REPLAY_GRACE_SECONDS
+            ):
+                await TokenBlacklist.revoke_family(fam)
+                audit_log(request, "refresh_token_reuse", user_id, "session family revoked")
             raise HTTPException(status_code=401, detail="Refresh token already used")
     except _redis_exceptions.RedisError:
         raise revocation_unavailable_503()
@@ -509,11 +526,10 @@ async def refresh_tokens(
     propagated_auth_time = _coerce_auth_time(payload.get("auth_time"))
     if propagated_auth_time is None:
         propagated_auth_time = 0
-    new_access = create_secure_token(
-        user.id, amr=propagated_amr, auth_time=propagated_auth_time
-    )
-    new_refresh = create_refresh_token(
-        user.id, amr=propagated_amr, auth_time=propagated_auth_time
+    # The rotated pair stays in the presented token's session family; a legacy
+    # token minted before families existed starts one here.
+    new_access, new_refresh = create_token_pair(
+        user.id, amr=propagated_amr, auth_time=propagated_auth_time, fam=fam
     )
     # Record what this jti bought, so a replay racing inside the grace window
     # gets the same pair instead of a 401 that would end a healthy session.
@@ -527,4 +543,11 @@ async def refresh_tokens(
         )
     except _redis_exceptions.RedisError:
         pass
+    # A logout that landed while this pair was being minted revoked its family;
+    # answer that, rather than a 200 carrying tokens that are already dead.
+    try:
+        if await TokenBlacklist.is_family_revoked(fam):
+            raise HTTPException(status_code=401, detail="Refresh token revoked")
+    except _redis_exceptions.RedisError:
+        raise revocation_unavailable_503()
     return TokenResponse(access_token=new_access, refresh_token=new_refresh)

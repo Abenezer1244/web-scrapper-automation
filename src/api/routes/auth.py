@@ -17,6 +17,7 @@ import time
 from typing import Annotated
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response, status
+from jwt.exceptions import InvalidTokenError as JWTError
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -62,6 +63,7 @@ from src.api.schemas import (
     BreakGlassLoginRequest,
     ForgotPasswordRequest,
     LoginResponse,
+    LogoutRequest,
     MfaDisableRequest,
     MfaEnableRequest,
     MfaEnableResponse,
@@ -301,34 +303,55 @@ async def onboarding_status(
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
 async def logout(
     request: Request,
-    current_user: CurrentUser,
+    body: LogoutRequest | None = None,
 ) -> None:
-    # Extract raw token from Authorization header
-    auth_header = request.headers.get("Authorization", "")
-    token = auth_header.removeprefix("Bearer ").strip()
+    """End THIS session: the access token (bearer), the refresh token (body), or both.
 
-    # Logout MUST actually revoke the token. If Redis is unavailable
-    # we cannot complete revocation, so surface 503 — silently
-    # returning success here would tell the client the token is dead
-    # while leaving it usable, which defeats the entire purpose of
-    # the logout flow. Other decode errors (already-expired token,
-    # malformed token, etc.) are still benign and swallowed below.
+    Audit 2026-09-25, A-1: logout used to blacklist only the access token, so
+    the 7-day refresh token kept minting new ones. Each presented token now has
+    its jti blacklisted AND its session family revoked, which ends every token
+    that session ever rotated into. The refresh token is accepted on its own so
+    logout still works once the 1-hour access token has expired. The user's
+    other sessions are untouched (that is /auth/logout-all).
+    """
     import redis.exceptions as _redis_exceptions
 
+    from src.api.auth import decode_refresh_token
     from src.api.middleware.auth_hardening import TokenBlacklist, revocation_unavailable_503
+
+    auth_header = request.headers.get("Authorization", "")
+    access_token = auth_header.removeprefix("Bearer ").strip()
+    presented: list[dict] = []
+    if access_token:
+        try:
+            presented.append(decode_secure_token(access_token))
+        except JWTError:
+            pass  # expired or not a session token; the refresh token may still be given
+    if body and body.refresh_token:
+        try:
+            refresh_payload = decode_refresh_token(body.refresh_token)
+            if refresh_payload.get("purpose") == "refresh":
+                presented.append(refresh_payload)
+        except JWTError:
+            pass
+    if not presented:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
+
+    # Logout MUST actually revoke. If Redis is unavailable we cannot, so 503:
+    # reporting success would tell the client the session is dead while it
+    # is still usable.
     try:
-        payload = decode_secure_token(token)
-        jti = payload.get("jti", "")
-        exp = payload.get("exp", 0)
-        ttl = max(0, exp - int(time.time()))
-        if jti and ttl > 0:
-            await TokenBlacklist.add(jti, ttl)
+        for payload in presented:
+            jti = payload.get("jti", "")
+            ttl = max(0, int(payload.get("exp", 0)) - int(time.time()))
+            if jti and ttl > 0:
+                await TokenBlacklist.add(jti, ttl)
+            if payload.get("fam"):
+                await TokenBlacklist.revoke_family(payload["fam"])
     except _redis_exceptions.RedisError:
         raise revocation_unavailable_503()
-    except Exception:
-        pass  # Token already invalid — that's fine
 
-    audit_log(request, "logout", current_user.id)
+    audit_log(request, "logout", presented[0].get("sub"))
 
 
 @router.post("/logout-all", status_code=status.HTTP_204_NO_CONTENT)

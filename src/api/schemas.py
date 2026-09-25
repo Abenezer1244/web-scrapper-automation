@@ -379,6 +379,14 @@ class LoginResponse(BaseModel):
     mfa_token: str | None = None
 
 
+class LogoutRequest(BaseModel):
+    """Optional body for POST /auth/logout: the session's refresh token, so
+    logout still ends the session after its 1-hour access token has expired."""
+    model_config = {"extra": "forbid"}
+
+    refresh_token: str | None = Field(default=None, max_length=4096)
+
+
 class ReauthRequest(BaseModel):
     """The current password, re-proven before an action that mints a long-lived
     credential or changes how the account authenticates (audit 2026-09-25, A-2/A-4).

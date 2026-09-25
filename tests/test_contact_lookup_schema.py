@@ -652,6 +652,39 @@ async def test_the_api_event_carries_no_reason(db, business_user):
     await db.rollback()
 
 
+async def test_a_temp_table_cannot_stand_in_for_the_action(db, business_user):
+    """Codex round 20: the guard's parent read was unqualified, so a session's
+    own pg_temp.contact_lookup_actions, saying `dispatching`, could vouch for a
+    real action the worker had already moved on, and the API would write a
+    fabricated initial event into history after the fact."""
+    job_id, _rid = await _job_and_result(db, business_user)
+    action = await _action(db, business_user, job_id)
+    await db.execute(text(
+        "UPDATE contact_lookup_actions SET status = 'running' WHERE id = :a"
+    ), {"a": action})
+    await db.commit()
+
+    await _as_api(db, business_user)
+    await db.execute(text(
+        "CREATE TEMP TABLE contact_lookup_actions "
+        "(LIKE public.contact_lookup_actions) ON COMMIT DROP"
+    ))
+    await db.execute(text(
+        "INSERT INTO pg_temp.contact_lookup_actions "
+        "SELECT * FROM public.contact_lookup_actions WHERE id = :a"
+    ), {"a": action})
+    await db.execute(text(
+        "UPDATE pg_temp.contact_lookup_actions SET status = 'dispatching'"
+    ))
+    with pytest.raises(Exception) as exc:
+        await db.execute(text(
+            "INSERT INTO public.contact_lookup_action_events "
+            "(id, action_id, user_id, to_status) VALUES (:id, :a, :uid, 'dispatching')"
+        ), {"id": str(uuid.uuid4()), "a": action, "uid": business_user.id})
+    assert "still dispatching" in str(exc.value)
+    await db.rollback()
+
+
 async def test_api_written_history_carries_the_servers_clock(db, business_user):
     """Event `at` and verdict `decided_at` are what a billing dispute is dated by."""
     job_id, rid = await _job_and_result(db, business_user)

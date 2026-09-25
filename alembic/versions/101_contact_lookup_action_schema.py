@@ -213,7 +213,7 @@ BEGIN
         'system_sync_session().', OLD.disposition, COALESCE(NEW.disposition, '<deleted>')
         USING ERRCODE = 'insufficient_privilege';
 END;
-$fn$ LANGUAGE plpgsql;
+$fn$ LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp;
 """
 
 # The event log is the record a disputed charge is argued from, so "append-only"
@@ -266,7 +266,11 @@ BEGIN
     -- change is a non-key update and does not conflict with it. The API can
     -- take this lock because it holds UPDATE on a column of the table
     -- (dispatched_at) and a tenant UPDATE policy.
-    PERFORM 1 FROM contact_lookup_actions a
+    --
+    -- Schema-qualified (Codex round 20): unqualified, a session could create
+    -- pg_temp.contact_lookup_actions reporting `dispatching` and append an
+    -- initial event for a real action that is already running or settled.
+    PERFORM 1 FROM public.contact_lookup_actions a
      WHERE a.id = NEW.action_id
        AND a.user_id = NEW.user_id
        AND a.status = 'dispatching'
@@ -281,7 +285,7 @@ BEGIN
     NEW.at := now();
     RETURN NEW;
 END;
-$fn$ LANGUAGE plpgsql;
+$fn$ LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp;
 """
 
 # The action row itself (Codex round 19). The API owns exactly one hop (15-2):
@@ -346,7 +350,7 @@ BEGIN
         'contact_lookup_actions: a user-scoped session may not delete an action.'
         USING ERRCODE = 'insufficient_privilege';
 END;
-$fn$ LANGUAGE plpgsql;
+$fn$ LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp;
 """
 
 

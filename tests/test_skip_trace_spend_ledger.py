@@ -303,9 +303,15 @@ async def test_the_dialer_ages_a_submitted_row_by_its_batch(
     assert _unsettled(r["job"]) is expect_unsettled
 
 
-async def test_a_job_held_by_a_missing_queue_is_not_held_silently(starter_user, caplog):
+async def test_a_job_held_by_a_missing_queue_is_not_held_silently(
+    starter_user, caplog, monkeypatch,
+):
+    from src.workers import ops_alerts
     from src.workers.scheduler_helpers.dialer import _alert_rows_naming_missing_queues
 
+    # send_ops_alert is the email-vendor boundary (Resend): capture, never send.
+    sent: list[tuple] = []
+    monkeypatch.setattr(ops_alerts, "send_ops_alert", lambda *a: sent.append(a) or True)
     _seed(starter_user.id, status="submitted",
           submitted_at=datetime.now(UTC) - timedelta(hours=72), queue_id=_queue_id())
 
@@ -313,6 +319,22 @@ async def test_a_job_held_by_a_missing_queue_is_not_held_silently(starter_user, 
         _alert_rows_naming_missing_queues(db)
 
     assert "name a Tracerfy queue with no skip_trace_queues row" in caplog.text
+    assert len(sent) == 1
+    kind, key, subject, body = sent[0]
+    assert (kind, key) == ("dialer", "missing_skip_trace_queue")
+    assert "Dialer pushes blocked" in subject and "1 pending_skip_trace_rows" in body
+
+
+async def test_a_failing_missing_queue_probe_does_not_stop_the_sweep(starter_user, monkeypatch):
+    from src.workers.scheduler_helpers import dialer
+
+    def _boom(db):
+        db.execute(text("SELECT no_such_column FROM pending_skip_trace_rows"))
+
+    monkeypatch.setattr(dialer, "_alert_rows_naming_missing_queues", _boom)
+    # The sweep's own query must still run on the rolled-back session. No dialer
+    # config exists, so a sweep that got past the probe simply finds no candidates.
+    dialer._dialer_push_sweep_impl()
 
 
 @pytest.mark.parametrize(("row_age_h", "expect_unsettled"), [(1, True), (13, False)])

@@ -180,7 +180,14 @@ def _dialer_push_sweep_impl() -> None:
     unsettled = skip_trace_unsettled(_now)
 
     with system_sync_session() as db:
-        _alert_rows_naming_missing_queues(db)
+        # Monitoring only: it must never cost the sweep itself, which pushes every
+        # other customer's leads (Codex, 1b-1b-i review 2). A failure is logged at
+        # WARNING and the session is rolled back so the sweep's own queries run.
+        try:
+            _alert_rows_naming_missing_queues(db)
+        except Exception as exc:  # noqa: BLE001 — a probe must not stop the sweep
+            db.rollback()
+            _logger.warning("Dialer: missing-queue probe failed: %s", str(exc)[:200])
         candidates = db.execute(
             select(Job, ScraperConfig)
             # Owner-match in the join (Codex security, defense-in-depth): the DB

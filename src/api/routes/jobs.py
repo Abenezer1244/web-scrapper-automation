@@ -1402,7 +1402,9 @@ async def download_export(
     except HTTPException:
         raise
 
-    user_result = await db.execute(select(User).where(User.id == user_id))
+    # is_active (audit 2026-09-25, D-1): an emailed link lives 48h, and a
+    # deactivated account must not keep downloading through one.
+    user_result = await db.execute(select(User).where(User.id == user_id, User.is_active))
     user = user_result.scalar_one_or_none()
     if not user:
         raise HTTPException(status_code=401, detail="User not found")

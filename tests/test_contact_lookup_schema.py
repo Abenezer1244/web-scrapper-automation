@@ -624,6 +624,27 @@ async def test_the_worker_may_move_an_action_anywhere(db, business_user):
     await db.rollback()
 
 
+async def _become(db, role: str, table: str) -> None:
+    """Act as a real production role for the rest of this transaction.
+
+    CI's database has no provisioned roles (they are cluster-wide and only a
+    provisioned cluster carries them), and migration 101's grants are skipped
+    when a role is absent. So create the role if it is missing, grant it the
+    INSERT the migration would have granted, and SET LOCAL ROLE. All of it is
+    transactional: the test's rollback undoes it, in CI and on a local cluster
+    alike, leaving no role or grant behind. These tests are about the GUARD, not
+    the grants; the grant surface has its own tests and verifiers.
+    """
+    await db.execute(text(
+        f"DO $r$ BEGIN "
+        f"IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{role}') THEN "
+        f"CREATE ROLE {role} NOLOGIN NOBYPASSRLS; END IF; END $r$"
+    ))
+    await db.execute(text(f"GRANT USAGE ON SCHEMA public TO {role}"))
+    await db.execute(text(f"GRANT INSERT ON public.{table} TO {role}"))
+    await db.execute(text(f"SET LOCAL ROLE {role}"))
+
+
 _NO_TENANT_INSERTS = {
     "contact_lookup_actions": (
         "INSERT INTO contact_lookup_actions "
@@ -652,7 +673,7 @@ async def test_the_api_role_without_a_tenant_is_not_the_worker(db, business_user
     worker. Run as the real API role, with no tenant set, and write a worker
     verdict: the guard itself must refuse it."""
     job_id, _rid = await _job_and_result(db, business_user)
-    await db.execute(text("SET LOCAL ROLE bridgeleads_app"))
+    await _become(db, "bridgeleads_app", table)
     with pytest.raises(Exception) as exc:
         await db.execute(text(_NO_TENANT_INSERTS[table]), {
             "id": str(uuid.uuid4()), "q": f"q-{uuid.uuid4()}",
@@ -671,7 +692,7 @@ async def test_the_worker_role_without_a_tenant_passes_the_guard(db, business_us
     so the row is then refused by RLS. That refusal is the proof the TRIGGER
     passed it: the guard would have raised first, with its own message."""
     job_id, _rid = await _job_and_result(db, business_user)
-    await db.execute(text("SET LOCAL ROLE bridgeleads_system"))
+    await _become(db, "bridgeleads_system", table)
     with pytest.raises(Exception) as exc:
         await db.execute(text(_NO_TENANT_INSERTS[table]), {
             "id": str(uuid.uuid4()), "q": f"q-{uuid.uuid4()}",

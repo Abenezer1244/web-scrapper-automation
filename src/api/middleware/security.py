@@ -76,6 +76,9 @@ _BLOCKED_NETWORKS: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = [
     ipaddress.ip_network("203.0.113.0/24"),     # TEST-NET-3
     ipaddress.ip_network("224.0.0.0/4"),        # multicast
     ipaddress.ip_network("240.0.0.0/4"),        # reserved (incl. 255.255.255.255)
+    ipaddress.ip_network("192.88.99.0/24"),     # 6to4 relay anycast (RFC 7526)
+    ipaddress.ip_network("fec0::/10"),          # deprecated IPv6 site-local
+    ipaddress.ip_network("64:ff9b:1::/48"),     # NAT64 local-use (RFC 8215)
     ipaddress.ip_network("::/128"),             # IPv6 unspecified
     ipaddress.ip_network("2001:db8::/32"),      # IPv6 documentation
     ipaddress.ip_network("ff00::/8"),           # IPv6 multicast
@@ -98,16 +101,46 @@ _BLOCKED_HOSTNAMES: frozenset[str] = frozenset(
 )
 
 
-def _ip_is_blocked(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-    """True if addr (or the IPv4 it maps to) falls in any blocked network.
+# The RFC 6052 well-known NAT64 prefix: its low 32 bits carry an IPv4
+# destination. On a network that translates it, the packet goes to that IPv4
+# address, so it is judged as that address. (The RFC 8215 local-use prefix
+# 64:ff9b:1::/48 places the IPv4 by operator-chosen length, so it cannot be
+# decoded reliably; it is never a public destination and is blocked whole.)
+_NAT64_PREFIXES = (ipaddress.ip_network("64:ff9b::/96"),)
+# Prefixes whose low 32 bits are the IPv4 destination: the deprecated
+# IPv4-compatible block (::a.b.c.d; `::` and `::1` are in it too and have their
+# own entries) and the SIIT IPv4-translated block (::ffff:0:a.b.c.d, RFC 2765).
+_LOW32_IPV4_PREFIXES = (
+    ipaddress.ip_network("::/96"),
+    ipaddress.ip_network("::ffff:0:0:0/96"),
+)
 
-    IPv4-mapped IPv6 (e.g. ``::ffff:169.254.169.254``) is normalized back
-    to its IPv4 form so it can't dodge the IPv4 ranges.
+
+def _embedded_ipv4(addr: ipaddress.IPv6Address) -> list[ipaddress.IPv4Address]:
+    """Every IPv4 address an IPv6 address can deliver to (audit 2026-09-25, E-3)."""
+    found = []
+    if addr.ipv4_mapped is not None:
+        found.append(addr.ipv4_mapped)
+    if addr.sixtofour is not None:
+        found.append(addr.sixtofour)
+    if addr.teredo is not None:
+        found.extend(addr.teredo)  # (server, client)
+    if any(addr in net for net in (*_NAT64_PREFIXES, *_LOW32_IPV4_PREFIXES)):
+        found.append(ipaddress.IPv4Address(int(addr) & 0xFFFFFFFF))
+    return found
+
+
+def _ip_is_blocked(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """True if addr, or any IPv4 address it embeds, falls in a blocked network.
+
+    IPv4-mapped (``::ffff:169.254.169.254``), NAT64 (``64:ff9b::a9fe:a9fe``),
+    6to4 (``2002:a9fe:a9fe::``), Teredo and IPv4-compatible (``::a9fe:a9fe``)
+    forms are each unwrapped, so none can dodge the IPv4 ranges.
     """
-    mapped = getattr(addr, "ipv4_mapped", None)
-    if mapped is not None:
-        addr = mapped
-    return any(addr in network for network in _BLOCKED_NETWORKS)
+    candidates: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = [addr]
+    if isinstance(addr, ipaddress.IPv6Address):
+        candidates += _embedded_ipv4(addr)
+    return any(c in network for c in candidates for network in _BLOCKED_NETWORKS)
 
 
 def _idna_encodable(host: str) -> bool:

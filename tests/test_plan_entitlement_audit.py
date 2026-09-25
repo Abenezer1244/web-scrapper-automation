@@ -2553,9 +2553,13 @@ def test_the_dispatcher_records_the_provider_time_it_computes():
         "the derived value must actually be written to the queue row"
     )
     # And the adoption call site must declare itself, or every adopted queue
-    # silently takes the dispatch branch and gets the adoption clock.
-    assert "trace_type, queue, adopted=True)" in inspect.getsource(d), (
-        "the reconciler's adoption call must pass adopted=True"
+    # silently takes the dispatch branch and gets the adoption clock. It also
+    # passes its claim_time (1b-1b-i, C2), which pins the row update to the claim
+    # being adopted; whitespace-normalised, since the call spans lines.
+    reconcile = " ".join(inspect.getsource(d._reconcile_stale_claims).split())
+    assert ("_persist_submission( db, queue_id, claimed, trace_type, queue, adopted=True, "
+            "claim_time=claim_time,") in reconcile, (
+        "the reconciler's adoption call must pass adopted=True and its claim_time"
     )
 # ─── Plan switching: one subscription, moved, never a second one ─────────────
 

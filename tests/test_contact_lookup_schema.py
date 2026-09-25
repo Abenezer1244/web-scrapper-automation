@@ -24,6 +24,7 @@ repository calls `create_all`.
 """
 import re
 import uuid
+from datetime import UTC, datetime
 
 import pytest
 from sqlalchemy import text
@@ -463,3 +464,288 @@ async def test_the_api_cannot_write_a_fencing_lease_into_history(db, business_us
         ), {"id": str(uuid.uuid4()), "a": action, "uid": business_user.id})
     assert "lease" in str(exc.value).lower()
     await db.rollback()
+
+
+# ─── Codex round 19: the ACTION row itself, and the races ────────────────────
+# Until round 19 only verdicts and events were guarded. The API's INSERT on the
+# action is table-wide, so it could create an action already `claimed`, holding
+# a lease and invented counts; its UPDATE could resurrect a failed action. The
+# API owns one hop (15-2): create in `dispatching`, then stamp `dispatched_at`
+# once. These tests run as the table owner, which grants cannot restrain, so
+# every refusal below is the TRIGGER's.
+
+_FORGED = datetime(2099, 1, 1, tzinfo=UTC)
+
+
+async def _as_api(db, user: User) -> None:
+    await db.execute(text("SELECT set_config('app.current_user_id', :uid, true)"),
+                     {"uid": str(user.id)})
+
+
+async def test_the_api_may_create_an_action_and_the_server_owns_its_clock(db, business_user):
+    """The permitted half, and the timestamp half of the fix.
+
+    A server_default is skipped whenever the caller supplies a value, so an
+    API-written future `created_at` would keep a `dispatching` action from ever
+    expiring and strand its quoted rows. The trigger overwrites it."""
+    job_id, _rid = await _job_and_result(db, business_user)
+    await _as_api(db, business_user)
+    aid = str(uuid.uuid4())
+    await db.execute(text(
+        "INSERT INTO contact_lookup_actions "
+        "(id, user_id, job_id, category, quote_id, status, unit_price_cents, "
+        " currency, pricing_version, quoted_count, truncated, created_at, "
+        " status_changed_at) "
+        "VALUES (:id, :uid, :job, 'tab', :q, 'dispatching', 8, 'usd', 'v1', "
+        "        12, true, :f, :f)"
+    ), {"id": aid, "uid": business_user.id, "job": job_id, "q": f"q-{aid}", "f": _FORGED})
+    row = (await db.execute(text(
+        "SELECT quoted_count, truncated, created_at < '2090-01-01' AS created_ok, "
+        "       status_changed_at < '2090-01-01' AS changed_ok "
+        "FROM contact_lookup_actions WHERE id = :a"
+    ), {"a": aid})).one()
+    assert (row.quoted_count, row.truncated) == (12, True), "the API's own snapshot is kept"
+    assert row.created_ok, "created_at came from the request, not the server"
+    assert row.changed_ok, "status_changed_at came from the request, not the server"
+    await db.rollback()
+
+
+@pytest.mark.parametrize("col,val", [
+    ("status", "'claimed'"),
+    ("status", "'running'"),
+    ("lease_token", "'forged-lease'"),
+    ("lease_expires_at", "now()"),
+    ("started_at", "now()"),
+    ("claimed_at", "now()"),
+    ("settled_at", "now()"),
+    ("dispatched_at", "now()"),
+    ("status_reason", "'because I said so'"),
+    ("claimed_count", "3"),
+    ("reused_count", "3"),
+    ("newly_queued_count", "3"),
+    ("billable_rows", "3"),
+    ("tracerfy_credits", "3"),
+])
+async def test_the_api_cannot_create_an_action_past_its_first_hop(db, business_user, col, val):
+    """Each column here is a worker fact: a state it reached, a lease it holds,
+    or a count billing reconciliation will read. The API may not assert any of
+    them at creation."""
+    job_id, _rid = await _job_and_result(db, business_user)
+    await _as_api(db, business_user)
+    aid = str(uuid.uuid4())
+    # `status` is already in the base column list, so replace it rather than add it.
+    status = val if col == "status" else "'dispatching'"
+    extra_col = "" if col == "status" else f", {col}"
+    extra_val = "" if col == "status" else f", {val}"
+    with pytest.raises(Exception) as exc:
+        await db.execute(text(
+            "INSERT INTO contact_lookup_actions "
+            "(id, user_id, job_id, category, quote_id, status, unit_price_cents, "
+            f" currency, pricing_version{extra_col}) "
+            f"VALUES (:id, :uid, :job, 'tab', :q, {status}, 8, 'usd', 'v1'{extra_val})"
+        ), {"id": aid, "uid": business_user.id, "job": job_id, "q": f"q-{aid}"})
+    assert "initial dispatching state" in str(exc.value), col
+    await db.rollback()
+
+
+async def test_the_api_stamps_dispatched_at_once_with_the_servers_clock(db, business_user):
+    job_id, _rid = await _job_and_result(db, business_user)
+    action = await _action(db, business_user, job_id)
+    await _as_api(db, business_user)
+    await db.execute(text(
+        "UPDATE contact_lookup_actions SET dispatched_at = :f "
+        "WHERE id = :a"
+    ), {"f": _FORGED, "a": action})
+    ok = (await db.execute(text(
+        "SELECT dispatched_at < '2090-01-01' FROM contact_lookup_actions WHERE id = :a"
+    ), {"a": action})).scalar_one()
+    assert ok, "dispatched_at came from the request, not the server"
+    await db.rollback()
+
+
+@pytest.mark.parametrize("worker_set,api_set,why", [
+    ("status = 'dispatching'", "status = 'settled'", "settling a live action"),
+    ("status = 'failed'", "status = 'dispatching'", "resurrecting a failed action"),
+    ("status = 'expired'", "dispatched_at = now()", "reviving an expired one by dispatching it"),
+    ("status = 'running'", "dispatched_at = now()", "stamping an action the worker already owns"),
+    ("dispatched_at = now()", "dispatched_at = now()", "restamping the dispatch clock"),
+    ("status = 'dispatching'", "quoted_count = 9999", "rewriting the quoted snapshot"),
+    ("status = 'dispatching'", "billable_rows = 7", "inventing a charge"),
+    ("status = 'dispatching'", "dispatched_at = now(), status_reason = 'x'",
+     "smuggling a second column beside the permitted one"),
+    ("status = 'dispatching'", "dispatched_at = now(), quoted_count = 9999",
+     "rewriting the quoted snapshot under cover of a legitimate stamp"),
+    # A real change: billable_rows is 0 already, so "= 0" would be a no-op the
+    # guard rightly allows.
+    ("status = 'dispatching'", "dispatched_at = now(), billable_rows = 7",
+     "inventing a charge under cover of a legitimate stamp"),
+])
+async def test_the_api_cannot_move_an_action(db, business_user, worker_set, api_set, why):
+    job_id, _rid = await _job_and_result(db, business_user)
+    action = await _action(db, business_user, job_id)
+    # Arrange as the worker does: no tenant GUC.
+    await db.execute(text(f"UPDATE contact_lookup_actions SET {worker_set} WHERE id = :a"),
+                     {"a": action})
+    await db.commit()
+    await _as_api(db, business_user)
+    with pytest.raises(Exception) as exc:
+        await db.execute(text(f"UPDATE contact_lookup_actions SET {api_set} WHERE id = :a"),
+                         {"a": action})
+    assert "may only stamp dispatched_at" in str(exc.value), why
+    await db.rollback()
+
+
+async def test_the_api_cannot_delete_an_action(db, business_user):
+    """One forbidden statement, on a session nothing else holds a lock for (see
+    the 78-minute note on the event-rewrite test above)."""
+    job_id, _rid = await _job_and_result(db, business_user)
+    action = await _action(db, business_user, job_id)
+    await _as_api(db, business_user)
+    with pytest.raises(Exception) as exc:
+        await db.execute(text("DELETE FROM contact_lookup_actions WHERE id = :a"),
+                         {"a": action})
+    assert "may not delete an action" in str(exc.value)
+    await db.rollback()
+
+
+async def test_the_worker_may_move_an_action_anywhere(db, business_user):
+    """The guard keys on the tenant GUC. If this ever fails, the action worker is
+    using rls_sync_session() instead of system_sync_session()."""
+    job_id, _rid = await _job_and_result(db, business_user)
+    action = await _action(db, business_user, job_id)
+    await db.execute(text(
+        "UPDATE contact_lookup_actions SET status = 'claimed', lease_token = 't', "
+        "claimed_count = 5, billable_rows = 5 WHERE id = :a"
+    ), {"a": action})
+    got = (await db.execute(text(
+        "SELECT status FROM contact_lookup_actions WHERE id = :a"
+    ), {"a": action})).scalar_one()
+    assert got == "claimed"
+    await db.rollback()
+
+
+async def test_quoted_count_cannot_be_negative(db, business_user):
+    job_id, _rid = await _job_and_result(db, business_user)
+    with pytest.raises(Exception) as exc:
+        await db.execute(text(
+            "INSERT INTO contact_lookup_actions "
+            "(id, user_id, job_id, category, quote_id, status, unit_price_cents, "
+            " currency, pricing_version, quoted_count) "
+            "VALUES (:id, :uid, :job, 'tab', :q, 'dispatching', 8, 'usd', 'v1', -1)"
+        ), {"id": str(uuid.uuid4()), "uid": business_user.id, "job": job_id,
+            "q": f"q-{uuid.uuid4()}"})
+    assert "ck_contact_lookup_actions_quoted_count" in str(exc.value)
+    await db.rollback()
+
+
+async def test_the_api_event_carries_no_reason(db, business_user):
+    job_id, _rid = await _job_and_result(db, business_user)
+    action = await _action(db, business_user, job_id)
+    await _as_api(db, business_user)
+    with pytest.raises(Exception) as exc:
+        await db.execute(text(
+            "INSERT INTO contact_lookup_action_events "
+            "(id, action_id, user_id, to_status, reason) "
+            "VALUES (:id, :a, :uid, 'dispatching', 'worker said it was fine')"
+        ), {"id": str(uuid.uuid4()), "a": action, "uid": business_user.id})
+    assert "initial dispatching event" in str(exc.value)
+    await db.rollback()
+
+
+async def test_api_written_history_carries_the_servers_clock(db, business_user):
+    """Event `at` and verdict `decided_at` are what a billing dispute is dated by."""
+    job_id, rid = await _job_and_result(db, business_user)
+    action = await _action(db, business_user, job_id)
+    await _as_api(db, business_user)
+    ev, vd = str(uuid.uuid4()), str(uuid.uuid4())
+    await db.execute(text(
+        "INSERT INTO contact_lookup_action_events (id, action_id, user_id, to_status, at) "
+        "VALUES (:id, :a, :uid, 'dispatching', :f)"
+    ), {"id": ev, "a": action, "uid": business_user.id, "f": _FORGED})
+    await db.execute(text(
+        "INSERT INTO contact_lookup_action_results "
+        "(id, action_id, user_id, result_id, disposition, decided_at) "
+        "VALUES (:id, :a, :uid, :r, 'quoted', :f)"
+    ), {"id": vd, "a": action, "uid": business_user.id, "r": rid, "f": _FORGED})
+    at_ok = (await db.execute(text(
+        "SELECT at < '2090-01-01' FROM contact_lookup_action_events WHERE id = :i"
+    ), {"i": ev})).scalar_one()
+    decided_ok = (await db.execute(text(
+        "SELECT decided_at < '2090-01-01' FROM contact_lookup_action_results WHERE id = :i"
+    ), {"i": vd})).scalar_one()
+    assert at_ok, "event `at` came from the request"
+    assert decided_ok, "verdict `decided_at` came from the request"
+    await db.rollback()
+
+
+async def _race_against_the_worker(user: User, api_sql: str, params: dict):
+    """Hold the worker's `dispatching -> running` UPDATE open in one session,
+    fire the API statement from another, then commit the worker.
+
+    Returns (blocked, error): whether the API statement was still waiting while
+    the worker held its row lock, and what it raised once the worker committed.
+    Bounded twice (lock_timeout and wait_for) so a regression fails in seconds
+    instead of hanging the run.
+    """
+    import asyncio
+
+    from src.db import session as _db_session
+
+    worker = _db_session.AsyncSessionLocal()
+    api = _db_session.AsyncSessionLocal()
+    try:
+        await worker.execute(text(
+            "UPDATE contact_lookup_actions SET status = 'running' WHERE id = :a"
+        ), {"a": params["a"]})
+
+        async def fire():
+            await api.execute(text("SET LOCAL lock_timeout = '10s'"))
+            await _as_api(api, user)
+            await api.execute(text(api_sql), params)
+
+        task = asyncio.create_task(fire())
+        await asyncio.sleep(1.0)
+        blocked = not task.done()
+        await worker.commit()
+        error = None
+        try:
+            await asyncio.wait_for(task, timeout=15)
+        except Exception as e:  # the refusal under test
+            error = e
+        return blocked, error
+    finally:
+        await api.rollback()
+        await api.close()
+        await worker.rollback()
+        await worker.close()
+
+
+async def test_the_event_guard_waits_for_the_worker_and_then_refuses(db, business_user):
+    """19-2. Without FOR SHARE the API reads `dispatching`, the worker commits
+    `running`, and a `dispatching` event lands in history AFTER it. With it, the
+    API waits on the worker's row lock and re-reads the committed row."""
+    job_id, _rid = await _job_and_result(db, business_user)
+    action = await _action(db, business_user, job_id)
+    blocked, error = await _race_against_the_worker(
+        business_user,
+        "INSERT INTO contact_lookup_action_events (id, action_id, user_id, to_status) "
+        "VALUES (:id, :a, :uid, 'dispatching')",
+        {"id": str(uuid.uuid4()), "a": action, "uid": business_user.id},
+    )
+    assert blocked, "the API's event insert did not wait for the worker's row lock"
+    assert error is not None and "still dispatching" in str(error), error
+
+
+async def test_the_api_dispatch_stamp_re_reads_a_row_the_worker_moved(db, business_user):
+    """19-1's race. A BEFORE UPDATE trigger fires on the row version the UPDATE
+    locked, so the API's stamp is judged against `running`, not the stale
+    `dispatching` it first saw."""
+    job_id, _rid = await _job_and_result(db, business_user)
+    action = await _action(db, business_user, job_id)
+    blocked, error = await _race_against_the_worker(
+        business_user,
+        "UPDATE contact_lookup_actions SET dispatched_at = now() WHERE id = :a",
+        {"a": action},
+    )
+    assert blocked, "the API's update did not wait for the worker's row lock"
+    assert error is not None and "may only stamp dispatched_at" in str(error), error

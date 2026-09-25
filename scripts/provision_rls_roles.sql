@@ -149,18 +149,17 @@ GRANT SELECT, INSERT ON stripe_webhook_events TO bridgeleads_app;
 -- MUST come before the column grant below. A table-level REVOKE also
 -- revokes the matching COLUMN privileges (verified against Postgres, not
 -- assumed), so running it later in this file would silently strip the
--- four column grants and leave the API unable to dispatch at all. This is
--- the convergence step for a database that received the earlier
--- table-wide grant.
+-- column grant and leave the API unable to dispatch at all. This is also
+-- the convergence step for a database that received an earlier grant: it
+-- wipes the old table-wide UPDATE AND the old four-column grant alike.
 REVOKE UPDATE ON contact_lookup_actions FROM bridgeleads_app;
 GRANT SELECT, INSERT ON contact_lookup_actions TO bridgeleads_app;
 -- Column-level, not table-wide. A policy constrains WHICH ROWS and never
 -- WHICH COLUMNS, so a table-wide UPDATE here would let the request path
 -- rewrite unit_price_cents, the aggregated counts, billable_rows or the
--- fencing lease. These four are the API's own created -> dispatching hop
--- and nothing else (Codex).
-GRANT UPDATE (status, status_reason, status_changed_at, dispatched_at)
-    ON contact_lookup_actions TO bridgeleads_app;
+-- fencing lease. dispatched_at is the one column the API writes after
+-- creating the action; it never changes status (Codex rounds 17 and 19).
+GRANT UPDATE (dispatched_at) ON contact_lookup_actions TO bridgeleads_app;
 GRANT SELECT, INSERT ON contact_lookup_action_results TO bridgeleads_app;
 GRANT SELECT, INSERT ON contact_lookup_action_events TO bridgeleads_app;
 
@@ -235,6 +234,32 @@ BEGIN
     IF bad > 0 THEN
         RAISE EXCEPTION 'provision_rls_roles: bridgeleads_app still holds % '
             'disallowed privilege(s) — least-privilege convergence failed', bad;
+    END IF;
+
+    -- contact_lookup_actions: the check above cannot see column grants, so it
+    -- passed while the API held NO update at all (Codex round 19). Ask for
+    -- EFFECTIVE privilege instead: has_*_privilege takes the role explicitly
+    -- and folds in PUBLIC, inheritance and table-wide grants, where
+    -- information_schema.column_privileges is filtered by the CURRENT user's
+    -- role membership. Exactly dispatched_at, nothing wider, nothing missing.
+    IF has_table_privilege('bridgeleads_app', 'public.contact_lookup_actions', 'UPDATE') THEN
+        RAISE EXCEPTION 'provision_rls_roles: bridgeleads_app holds table-wide '
+            'UPDATE on contact_lookup_actions; it may update dispatched_at only';
+    END IF;
+    IF NOT has_column_privilege('bridgeleads_app', 'public.contact_lookup_actions',
+                                'dispatched_at', 'UPDATE') THEN
+        RAISE EXCEPTION 'provision_rls_roles: bridgeleads_app cannot UPDATE '
+            'contact_lookup_actions.dispatched_at; the API could not record a dispatch';
+    END IF;
+    SELECT COUNT(*) INTO bad FROM pg_attribute
+    WHERE attrelid = 'public.contact_lookup_actions'::regclass
+      AND attnum > 0 AND NOT attisdropped
+      AND attname <> 'dispatched_at'
+      AND has_column_privilege('bridgeleads_app', 'public.contact_lookup_actions',
+                               attname::text, 'UPDATE');
+    IF bad > 0 THEN
+        RAISE EXCEPTION 'provision_rls_roles: bridgeleads_app can UPDATE % '
+            'column(s) of contact_lookup_actions besides dispatched_at', bad;
     END IF;
 END
 $verify$;

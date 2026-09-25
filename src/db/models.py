@@ -1735,6 +1735,9 @@ class ContactLookupAction(Base):
 
     Created by the API at confirm time with status `dispatching`, so the worker
     always has a durable home for its dispositions even if it never runs.
+    Migration 101's `contact_lookup_actions_guard` trigger holds a user-scoped
+    session to exactly that: create in `dispatching`, then stamp `dispatched_at`
+    once. Every other hop is the worker's, through `system_sync_session()`.
     """
 
     __tablename__ = "contact_lookup_actions"
@@ -1750,6 +1753,8 @@ class ContactLookupAction(Base):
             f"status IN ({_sql_str_list(CONTACT_LOOKUP_ACTION_STATUSES)})",
             name="ck_contact_lookup_actions_status",
         ),
+        # The one count the API writes (at confirm, the quoted set's size).
+        CheckConstraint("quoted_count >= 0", name="ck_contact_lookup_actions_quoted_count"),
         Index("ix_contact_lookup_actions_user", "user_id"),
         Index("ix_contact_lookup_actions_job_tenant", "job_id", "user_id"),
     )

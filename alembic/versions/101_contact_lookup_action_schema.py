@@ -201,6 +201,9 @@ BEGIN
                 'system_sync_session().', NEW.disposition
                 USING ERRCODE = 'insufficient_privilege';
         END IF;
+        -- Server-owned, never taken from the request: a server_default is
+        -- skipped whenever the caller supplies a value (Codex round 19).
+        NEW.decided_at := now();
         RETURN NEW;
     END IF;
     -- UPDATE or DELETE from a user-scoped session: never.
@@ -236,13 +239,16 @@ BEGIN
             USING ERRCODE = 'insufficient_privilege';
     END IF;
     IF NEW.to_status <> 'dispatching' OR NEW.from_status IS NOT NULL
-       OR NEW.result_id IS NOT NULL OR NEW.lease_token IS NOT NULL THEN
+       OR NEW.result_id IS NOT NULL OR NEW.lease_token IS NOT NULL
+       OR NEW.reason IS NOT NULL THEN
         RAISE EXCEPTION
             'contact_lookup_action_events: a user-scoped session may only append '
             'the initial dispatching event (got from=% to=% result_id=% '
-            'lease_token=%). Every later hop is written by the worker through '
-            'system_sync_session(), and the fencing lease is the worker''s alone.',
-            NEW.from_status, NEW.to_status, NEW.result_id, NEW.lease_token
+            'lease_token=% reason=%). Every later hop is written by the worker '
+            'through system_sync_session(), the fencing lease is the worker''s '
+            'alone, and the API''s own hop carries no free-text reason.',
+            NEW.from_status, NEW.to_status, NEW.result_id, NEW.lease_token,
+            NEW.reason
             USING ERRCODE = 'insufficient_privilege';
     END IF;
     -- The shape being right is not enough: the ACTION must still be at the hop
@@ -251,18 +257,94 @@ BEGIN
     -- or failed, which is history a billing dispute would be argued from
     -- (Codex). Repeated appends while the action is genuinely still
     -- `dispatching` stay legal, because a dispatch retry is a real path.
-    IF NOT EXISTS (
-        SELECT 1 FROM contact_lookup_actions a
-         WHERE a.id = NEW.action_id
-           AND a.user_id = NEW.user_id
-           AND a.status = 'dispatching'
-    ) THEN
+    --
+    -- FOR SHARE, not a plain read (Codex round 19): at READ COMMITTED an
+    -- unlocked read could see `dispatching`, the worker could then commit
+    -- `running`, and this event would land in history AFTER it. FOR SHARE
+    -- conflicts with the worker's status UPDATE, so one waits for the other and
+    -- the loser re-reads the committed row. FOR KEY SHARE would not do: a status
+    -- change is a non-key update and does not conflict with it. The API can
+    -- take this lock because it holds UPDATE on a column of the table
+    -- (dispatched_at) and a tenant UPDATE policy.
+    PERFORM 1 FROM contact_lookup_actions a
+     WHERE a.id = NEW.action_id
+       AND a.user_id = NEW.user_id
+       AND a.status = 'dispatching'
+       FOR SHARE;
+    IF NOT FOUND THEN
         RAISE EXCEPTION
             'contact_lookup_action_events: the initial event may only be appended '
             'while its action is still dispatching. Action % is not.', NEW.action_id
             USING ERRCODE = 'insufficient_privilege';
     END IF;
+    -- Server-owned, never taken from the request (see decided_at above).
+    NEW.at := now();
     RETURN NEW;
+END;
+$fn$ LANGUAGE plpgsql;
+"""
+
+# The action row itself (Codex round 19). The API owns exactly one hop (15-2):
+# it CREATES the action in `dispatching`, and once a publish succeeds it stamps
+# `dispatched_at` a single time. It never changes `status`: a publish failure
+# leaves the action `dispatching` for the reconciler, and every later hop is
+# the worker's. Without this guard the API's table-wide INSERT could create an
+# action already `claimed`, holding a lease and invented counts, and its UPDATE
+# could resurrect a `failed` action or settle a live one.
+#
+# Timestamps are OVERWRITTEN with now(), not validated: a server_default is
+# skipped whenever the caller supplies a value, and an API-written future
+# `created_at` would keep a `dispatching` action from ever expiring, stranding
+# its quoted rows. `dispatched_at` is set once and never restamped, so a retry
+# cannot push back the apparent dispatch clock.
+_ACTION_TRIGGER_FN = """
+CREATE OR REPLACE FUNCTION contact_lookup_actions_guard()
+RETURNS trigger AS $fn$
+DECLARE uid TEXT;
+BEGIN
+    uid := COALESCE(NULLIF(current_setting('app.current_user_id', true), ''), '');
+    IF uid = '' THEN
+        RETURN COALESCE(NEW, OLD);
+    END IF;
+    IF TG_OP = 'INSERT' THEN
+        IF NEW.status <> 'dispatching' OR NEW.status_reason IS NOT NULL
+           OR NEW.dispatched_at IS NOT NULL OR NEW.started_at IS NOT NULL
+           OR NEW.claimed_at IS NOT NULL OR NEW.settled_at IS NOT NULL
+           OR NEW.lease_token IS NOT NULL OR NEW.lease_expires_at IS NOT NULL
+           OR NEW.claimed_count <> 0 OR NEW.reused_count <> 0
+           OR NEW.newly_queued_count <> 0 OR NEW.billable_rows <> 0
+           OR NEW.tracerfy_credits <> 0 THEN
+            RAISE EXCEPTION
+                'contact_lookup_actions: a user-scoped session may only create an '
+                'action in its initial dispatching state (got status=%), with no '
+                'reason, no lease, no worker timestamps and no worker counts.',
+                NEW.status
+                USING ERRCODE = 'insufficient_privilege';
+        END IF;
+        NEW.created_at := now();
+        NEW.status_changed_at := now();
+        RETURN NEW;
+    END IF;
+    IF TG_OP = 'UPDATE' THEN
+        -- Compared as whole rows minus the one column the API may set, so a
+        -- column added later is covered without anyone remembering this list.
+        IF OLD.status <> 'dispatching' OR OLD.dispatched_at IS NOT NULL
+           OR NEW.dispatched_at IS NULL
+           OR (to_jsonb(NEW) - 'dispatched_at')
+              IS DISTINCT FROM (to_jsonb(OLD) - 'dispatched_at') THEN
+            RAISE EXCEPTION
+                'contact_lookup_actions: a user-scoped session may only stamp '
+                'dispatched_at, once, while the action is still dispatching '
+                '(action % is %, dispatched_at %).', OLD.id, OLD.status,
+                OLD.dispatched_at
+                USING ERRCODE = 'insufficient_privilege';
+        END IF;
+        NEW.dispatched_at := now();
+        RETURN NEW;
+    END IF;
+    RAISE EXCEPTION
+        'contact_lookup_actions: a user-scoped session may not delete an action.'
+        USING ERRCODE = 'insufficient_privilege';
 END;
 $fn$ LANGUAGE plpgsql;
 """
@@ -443,6 +525,10 @@ def upgrade() -> None:
             f"status IN ({_sql_list(_ACTION_STATUSES)})",
             name="ck_contact_lookup_actions_status",
         ),
+        # The one count the API writes (at confirm, the quoted set's size).
+        sa.CheckConstraint(
+            "quoted_count >= 0", name="ck_contact_lookup_actions_quoted_count",
+        ),
     )
 
     op.create_table(
@@ -550,20 +636,18 @@ def upgrade() -> None:
                               public.contact_lookup_action_events FROM authenticated;
             END IF;
             IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bridgeleads_app') THEN
-                -- UPDATE on the action only, and only on the FOUR COLUMNS the
-                -- API's own created -> dispatching hop touches. A table-wide
-                -- UPDATE would let the API rewrite unit_price_cents, the
-                -- aggregated counts, billable_rows, the fencing lease or any
-                -- timestamp, and an RLS policy could not stop it: a policy
+                -- UPDATE on the action only, and only on dispatched_at: the one
+                -- column the API writes after creating the action (15-2). A
+                -- table-wide UPDATE would let the API rewrite unit_price_cents,
+                -- the aggregated counts, billable_rows, the fencing lease or
+                -- any timestamp, and an RLS policy could not stop it: a policy
                 -- constrains WHICH ROWS, never WHICH COLUMNS (Codex review of
-                -- this migration). Column-level grants are the only mechanism
-                -- that expresses this, so the pricing the customer was quoted
-                -- and the counts a billing dispute rests on are unreachable
-                -- from the request path.
+                -- this migration). The API never changes `status`, so it gets
+                -- no grant on it (Codex round 19); contact_lookup_actions_guard
+                -- enforces the same rule for every session, owner included.
                 GRANT SELECT, INSERT ON public.contact_lookup_actions
                     TO bridgeleads_app;
-                GRANT UPDATE (status, status_reason, status_changed_at,
-                              dispatched_at)
+                GRANT UPDATE (dispatched_at)
                     ON public.contact_lookup_actions TO bridgeleads_app;
                 GRANT SELECT, INSERT ON public.contact_lookup_action_results
                     TO bridgeleads_app;
@@ -607,11 +691,27 @@ def upgrade() -> None:
         "BEFORE INSERT OR UPDATE OR DELETE ON contact_lookup_action_events "
         "FOR EACH ROW EXECUTE FUNCTION contact_lookup_action_events_guard()"
     )
+    op.execute(_ACTION_TRIGGER_FN)
+    op.execute(
+        "DROP TRIGGER IF EXISTS contact_lookup_actions_guard_trg "
+        "ON contact_lookup_actions"
+    )
+    op.execute(
+        "CREATE TRIGGER contact_lookup_actions_guard_trg "
+        "BEFORE INSERT OR UPDATE OR DELETE ON contact_lookup_actions "
+        "FOR EACH ROW EXECUTE FUNCTION contact_lookup_actions_guard()"
+    )
 
 
 def downgrade() -> None:
     conn = op.get_bind()
     conn.execute(text("SET LOCAL lock_timeout = '5s'"))
+
+    op.execute(
+        "DROP TRIGGER IF EXISTS contact_lookup_actions_guard_trg "
+        "ON contact_lookup_actions"
+    )
+    op.execute("DROP FUNCTION IF EXISTS contact_lookup_actions_guard()")
 
     op.execute(
         "DROP TRIGGER IF EXISTS contact_lookup_action_events_guard_trg "

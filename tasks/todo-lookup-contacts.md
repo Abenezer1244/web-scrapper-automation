@@ -843,6 +843,81 @@ number the system cannot yet honour. **The cap is therefore NOT a read-path feat
 changes the component that spends — which is the part of D3-b that "1b-1 touches no money" got
 wrong.
 
+### 1b-1a diff review round 19 (2026-09-24, on `7bc1893a`) — NO-GO, 1 P1 + 2 P2
+
+Rounds 17 and 18 are recorded in the commit messages of `92bc48ab` and `7bc1893a`. Round 19
+found no fifth grant path (every GRANT/REVOKE/POLICY/FORCE site in the repo was listed and
+checked; no `ALTER DEFAULT PRIVILEGES` anywhere) and confirmed the round-18 ordering is right.
+All three findings below were re-verified in code before being accepted.
+
+**19-1 (P1, VERIFIED, and WIDER than reported) — `contact_lookup_actions` has no guard
+trigger.** Only results and events are guarded. Codex named the UPDATE path (the column grant
+lets the API do `failed -> dispatching`, `dispatching -> settled`). The INSERT is worse: it is
+table-wide, so a user-scoped session can CREATE an action already `claimed`/`running`, with a
+lease token, `started_at`, and invented counts. Per 15-2 the API owns exactly one hop: it
+creates the action in `dispatching` and may stamp `dispatched_at` on a retry. It never changes
+`status`.
+- [ ] Third trigger `contact_lookup_actions_guard` (same GUC discriminator, plain plpgsql, not
+      SECURITY DEFINER). User-scoped INSERT: `status='dispatching'`; `lease_token`,
+      `lease_expires_at`, `started_at`, `claimed_at`, `settled_at` NULL; `claimed_count`,
+      `reused_count`, `newly_queued_count`, `billable_rows`, `tracerfy_credits` = 0
+      (`quoted_count` and `truncated` are the API's to write). User-scoped UPDATE: only when
+      `OLD.status='dispatching'` AND `NEW.status = OLD.status`. DELETE: refused. A BEFORE
+      UPDATE trigger sees the row version it locked, so an API update racing the worker's
+      `-> running` is re-checked against `running` and refused (tested, two connections).
+- [ ] Tests: each forbidden INSERT shape, each forbidden transition, the permitted insert and
+      permitted `dispatched_at` stamp, the worker path unaffected. Mutation-test the guard.
+
+**19-2 (P2, VERIFIED) — the event guard's state check races.** The parent lookup takes no
+lock; at READ COMMITTED the API can see `dispatching`, the worker commits `running`, and the
+API's `dispatching` event commits after it.
+- [ ] Parent lookup takes `FOR SHARE` (FOR KEY SHARE is not enough: a status change is a non-key
+      update and does not conflict with it). The API role can do this: it has column UPDATE
+      privilege on the table and a tenant `_app_update` policy. Test with two connections.
+
+**19-3 (P2, VERIFIED) — both verify blocks are blind to column grants.**
+`provision_rls_roles.sql:205-236` and `_cutover_step2_grants_policies.py:99-118` read
+`information_schema.role_table_grants`, which does not list column privileges, so they pass
+while the API has ZERO UPDATE on actions — exactly the round-18 bug.
+- [ ] Both verifiers assert, via `information_schema.column_privileges`, that `bridgeleads_app`
+      holds UPDATE on exactly `{status, status_reason, status_changed_at, dispatched_at}` of
+      `contact_lookup_actions` and has no table-level UPDATE there.
+
+Files: migration 101, `provision_rls_roles.sql`, `_cutover_step2_grants_policies.py`,
+`tests/test_contact_lookup_schema.py` (4, inside the 5-file rule).
+
+**Pre-code consult on the plan above (2026-09-24): PLAN: REVISE. All accepted.** Prompt and
+output: `<scratchpad 803e30a3>/codex_r19_fixplan{,_out}.txt`. Confirmed sound: the
+BEFORE UPDATE race claim (EvalPlanQual re-reads the committed row before the trigger fires),
+and FOR SHARE (needs UPDATE on at least one column plus an UPDATE RLS policy, both present; no
+deadlock with the FK's FOR KEY SHARE). The revisions below SUPERSEDE the matching bullets
+above:
+- **(P1) Timestamps are server-owned, not API-supplied.** A `server_default` is skipped whenever
+  the caller passes a value, so an API-written future `created_at` could keep a `dispatching`
+  action from ever expiring and strand its quoted rows. For a user-scoped session the triggers
+  OVERWRITE `created_at` and `status_changed_at` (actions), `at` (events) and `decided_at`
+  (action_results) with `now()`.
+- **`dispatched_at` is NULL on insert and set once**, `NULL -> now()`, only while the action is
+  still `dispatching`. It is not restamped on retry: a restamp would let a retry push back the
+  apparent dispatch clock. This matches 15-2 ("still `dispatching` with no `dispatched_at` ->
+  dispatch again").
+- **(P2) Narrow the column grant to `(dispatched_at)`** at all three grant sites. `status` and
+  `status_changed_at` are dead under the trigger rule, and a grant that matches the real writes
+  is what makes the verifier mean something. Order stays: table-wide REVOKE, then the column
+  grant. The REVOKE also wipes the old four-column grant, so an existing database converges.
+- **(P2) The API writes no free-text reasons.** `status_reason` on the action and `reason` on its
+  event must be NULL from a user-scoped session: the API's hop needs no explanation, and
+  history is evidence.
+- **`quoted_count >= 0` CHECK** (API-set at confirm, immutable after: no grant and the trigger
+  refuses it). `truncated` stays API-set.
+- **(P2) The verifiers use `has_table_privilege` / `has_column_privilege`**, which take the target
+  role explicitly and report effective privilege. `information_schema.column_privileges` is
+  filtered by the current user's role membership, so it is not reliable here. Assert: no
+  table-level UPDATE; UPDATE on `dispatched_at`; no UPDATE on any other column.
+- **Carried into 1b-2, no code now:** the FK proves a quoted result belongs to the tenant, NOT
+  that it was actually in the quote. The worker stays authoritative for eligibility and
+  re-authorizes every id (already in the 1b worker bullet).
+
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever
       the tab has leads that have never been looked up; when the quote comes back with

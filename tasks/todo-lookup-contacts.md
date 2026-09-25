@@ -661,6 +661,310 @@ CLAUDE.md caps a phase at 5 files, and the reconciled 1b spans the live paid pat
       rows that became eligible after the quote are not added; quote counts == worker planner;
       audit row written with the pricing snapshot.
 
+## Phase 1b-1 — REVISED by Codex round 16 (2026-09-22, consult BEFORE code)
+
+> **Round 16 returned REVISE with seven P1s against the 1b-1 scope and ORDER as written
+> above.** Same lesson as rounds 14 and 15: the earlier split named the right pieces and never
+> asked what the schema actually supports or what the cap does to the component that spends.
+> Prompt and output: `<scratchpad>/codex_1b1_consult.txt` / `codex_1b1_consult_out.txt`.
+> Every finding below was re-verified in code before being accepted, and **one was rejected**.
+> **1b-0 is MERGED AND LIVE** (`0074196`, migration 100 applied and verified by the objects).
+
+**16-1 (P1, VERIFIED) — the tenant-carrying FK cannot be built as planned: `jobs` has no
+composite key.** The plan requires composite FKs so a child row can never point at another
+account's parent. Only `scraper_batches` has one today —
+`UniqueConstraint("id", "user_id", name="uq_scraper_batches_id_user")` (`src/db/models.py:482`).
+**`jobs` (`:659`, table_args `:790`) and `results` (`:811`, table_args `:962`) have NONE.**
+15-9 named `results` only, so an action FK on `(job_id, user_id)` would simply fail to create.
+- [ ] Composite `(id, user_id)` uniqueness for **`jobs`**, **`results`** AND
+      **`contact_lookup_actions`**, each built before the child table that references it.
+      `scraper_batches` is the precedent to copy.
+
+**16-2 (P1, VERIFIED) — `pending_skip_trace_rows.action_id` was dropped from the migration
+list, and settlement cannot work without it.** The plan requires it (step 3 of migration 100's
+original list) and 1b-0 removed it as dead code (`fa20d60`). It is not dead in 1b-2: a Tracerfy
+batch spans tenants and actions, `SkipTraceQueue` stores only the FIRST row's tenant/job
+metadata (`skip_trace_dispatcher.py:1149-1156`), and ingest reconstructs attribution from the
+pending rows. Without `action_id` on each row, a hit / miss / unmatched / reuse / release
+cannot be tied back to the action that bought it.
+- [ ] Nullable `pending_skip_trace_rows.action_id` + index, written by the action claim and
+      left NULL by the scrape path, added in the SCHEMA step — not left to 1b-2.
+
+**16-3 (P1, VERIFIED) — `last_trace_outcome` must ship as a column only; its writers are live
+paid code.** 15-3 wants it written atomically with the existing transitions. Those transitions
+are **eight** writers, not the "five" the plan says: the known-answer sweep and
+charged-unanswered settlement (`skip_trace_dispatcher.py:697-803`), pre-submit failures
+(`:947-983`), cancellation/withdrawal (`:1077-1107`), provider-acceptance bookkeeping
+(`:1113-1196`), claim release (`:1251-1298`), stale-claim reconciliation (`:1494-1663`), ingest
+hit/miss/unmatched settlement (`tracerfy_ingest.py:735-845`), and the scrape's
+charged-unanswered handling (`enrich.py:2345-2387`).
+- [ ] The column lands nullable with a CHECK and **no writer, no default, no NOT NULL and no
+      trigger**. It means UNKNOWN until 1b-2 integrates the writers.
+- [ ] **NULL must never be read as `provider_rejected`.** Retry is permitted only on proven
+      pre-submit rejection. Note `tracerfy_ingest.py:789-811` writes
+      `results.skip_trace_status='errored'` for provider-accepted-but-unmatched work, which is
+      BILLABLE and must never be retried like a rejection — the exact ambiguity 15-3 exists for.
+
+**16-4 (P1, VERIFIED) — a per-account cap placed beside the global one reproduces the soft-cap
+bug it is supposed to improve on.** The global cap counts in its OWN session
+(`skip_trace_dispatcher.py:72-92`, `with system_sync_session() as _db`) BEFORE the claim's
+`pg_try_advisory_xact_lock` (`:219`), and one tick may submit several batches. A per-account
+query in the same place inherits all of it: two ticks pass the same account's check, one batch
+exceeds the account's remaining budget, and the two caps can disagree.
+- [ ] **Reserve capacity inside the SAME transaction that moves rows `queued -> submitting`**,
+      not in a pre-check. The effective allowance is `min(global_remaining, account_remaining)`;
+      the transaction selects no more than that, commits the reservation, and only THEN calls
+      Tracerfy. **No database lock is held across the provider call.**
+- [ ] Count `submitting` rows of unknown provider outcome conservatively (as spent) until
+      reconciled — the 15-7 evidence grading, applied to the cap.
+
+**16-5 (P1, VERIFIED) — FIFO + an account filter starves tenants.** Selection is
+`ORDER BY PendingSkipTraceRow.enqueued_at LIMIT 5000` (`skip_trace_dispatcher.py:273-279`).
+If the oldest tenant sits at its cap, re-selecting that tenant's rows ahead of everyone else
+can keep later tenants out of every batch indefinitely. This repo already has this exact shape
+recorded as a landmine elsewhere.
+- [ ] Fair selection: deterministic round-robin over eligible `user_id`s, or a windowed query
+      allocating per account before the global limit. **Test:** one tenant with a large backlog
+      against several tenants with later rows; every tenant must make progress.
+
+**16-6 (P1) — grants and RLS cannot express the disposition state machine.** The API is
+`NOBYPASSRLS` (`scripts/provision_rls_roles.sql:55-59`) and has no grant on the worker tables
+(`:150-152`). RLS bounds the TENANT; it says nothing about which transition is legal. If the API
+can insert arbitrary dispositions it can write terminal verdicts or fabricated exclusions.
+- [ ] A `BEFORE INSERT/UPDATE` **trigger** enforces: API may create only the approved INITIAL
+      states; API may never perform a worker verdict transition; system transitions follow the
+      matrix; action status and event agree. A `SECURITY DEFINER` function is the alternative
+      and is only safe if it validates `app.current_user_id`, pins `search_path` and applies
+      the tenant predicate — otherwise it IS an RLS bypass.
+- [ ] Explicit per-operation policies, never a blanket `FOR ALL`: actions — app SELECT, INSERT
+      plus only the narrow update path; action_results — app SELECT, INSERT, system SELECT,
+      INSERT, UPDATE; events — both roles SELECT, INSERT and **neither** UPDATE or DELETE.
+      Shape follows `scripts/apply_rls_cutover_policies.sql:90-97,183-203`.
+
+**16-7 (P2) — append-only is not the same as trustworthy.** SELECT+INSERT stops mutation but
+still lets the API fabricate history. Restrict API event insertion to the initial action event
+through the same trigger/function.
+
+**16-8 (P2) — "the number can only go down" holds only if the quoted id set is IMMUTABLE.**
+The planner reads `results` only and can overstate under drift. It cannot overcharge, because
+the worker re-authorizes against the queue and the active-claim unique index refuses a second
+row. It becomes FALSE the moment confirmation re-runs the planner and adds newly eligible ids.
+- [ ] Confirmation may EXCLUDE ids, never ADD them; the durable quoted set bounds the worker.
+
+**16-9 (P2) — child-side FK indexes, absent from the plan:** `contact_lookup_actions(job_id,
+user_id)`, `contact_lookup_action_results(action_id, user_id)` and `(result_id, user_id)`,
+`contact_lookup_action_events(action_id, user_id)`, `pending_skip_trace_rows(action_id, user_id)`.
+Without them RLS reads, cascades and reconciliation degrade as actions accumulate.
+
+**16-10 (P1) — the writer inventory is incomplete, and a writer hides in `scripts/` again.**
+`scripts/repair_probate_party_and_bad_parcel.py` sets `skip_trace_status='queued'` (`:253`) and
+`'not_attempted'` (`:271`) directly. This is the THIRD phase in which an ops script turned out
+to be part of the concurrency design. Audit or disable every queue/status writer before 1b-2,
+not only `backfill_skip_trace_jobs.py`.
+
+**16-11 (P1, VERIFIED, found while extracting the patterns — NOT in 15-8) — there is a THIRD
+RLS script, and a table missing from it is never FORCEd.** 15-8 names
+`provision_rls_roles.sql` and `apply_rls_cutover_policies.sql`. It omits
+**`scripts/apply_rls_force.sql`**, whose `tbls text[]` array (`:31-49`) is the list the
+convergence loop iterates to apply `FORCE ROW LEVEL SECURITY`. Without FORCE, RLS does not
+apply to the table OWNER, so a policy can look correct and still not constrain every path.
+- [ ] Append all three new tables to that array **and to the commented rollback array
+      (`:96-106`)**, or FORCE silently never reaches them.
+- [ ] Note also `apply_rls_force.sql:56-70` HARD-FAILS if a `SECURITY DEFINER` function's owner
+      lacks BYPASSRLS. That is a second reason to prefer the plain trigger below over a
+      `SECURITY DEFINER` function for 16-6.
+
+**16-12 — WITHDRAWN 2026-09-22. THE PREMISE WAS FALSE, and it is worth knowing why.**
+The claim below is wrong: **nothing in this repository calls `create_all`.** Both the local rig
+(`C:/Users/Windows/bl-testenv/run-full-pytest.sh`) and CI (`.github/workflows`, line 116) build
+the test database with **`alembic upgrade head`**, and `tests/conftest.py` mentions neither. So
+migration 101's trigger IS present in every test database and a mirror in `models.py` would be
+dead code plus a second copy to keep byte-identical for nothing. It was written, then removed
+after checking.
+
+The reason it was believable is the interesting part: `models.py`, `alembic/env.py` and
+migrations 049 and 089 all carry comments asserting that create_all is how test databases get
+their functions. **Four stale comments agreeing with each other read as documentation.** They
+misled the pattern extraction, the reviewer and me in turn. The `_RESULT_PARSE_FILING_DATE_FN`
+mirror at `models.py:39-71` appears to be dead for the same reason; left alone as pre-existing
+and out of scope, but it is not the precedent it looks like.
+
+~~ORIGINAL CLAIM (kept so the correction is legible): tests build the schema with
+`create_all`, not migrations.~~ A trigger created only inside migration 101 simply would not
+exist in the test database, so every test asserting "the API cannot write a terminal
+disposition" would pass **vacuously** — the exact failure this project has already hit twice
+(a stubbed fixture, and a test that copied its implementation).
+- [ ] Mirror the trigger as a `before_create` DDL on the metadata, the way
+      `_RESULT_PARSE_FILING_DATE_FN` is registered at `src/db/models.py:39-71`, and keep it
+      **byte-identical** to the migration's copy (that file's own comment demands exactly this
+      of migration 049's function).
+- [ ] The trigger follows the ONE trigger precedent in the repo
+      (`023_add_county_records.py:71-86`): plain `LANGUAGE plpgsql`, NOT `SECURITY DEFINER`,
+      reading `current_setting('app.current_user_id', true)`. That GUC is the discriminator the
+      whole design needs: the API always sets it (`src/api/deps.py:17-42`, transaction-scoped,
+      re-applied by the `after_begin` listener at `src/db/session.py:231-284`), while the worker
+      uses `system_sync_session()` and sets **no GUC at all**. So "is this the API or the
+      worker?" is `uid <> ''` — and, per 023's own rationale, a trigger fires regardless of role
+      privileges, including for BYPASSRLS and superuser, which is why it is the actual guarantee
+      where a grant is not.
+
+### REJECTED from round 16, with reasoning
+
+**Codex asked that 101 consult `pg_stat_progress_create_index` before dropping an INVALID index,
+claiming 098 and 100 drop one blindly. They do not, and the check would be redundant.**
+Migration 100 already reasons about exactly this (`100_...py:122-138`): inside a migration an
+invalid index is dead and never mid-build, **because migrations are serialized by the advisory
+lock in `scripts/migrate.py`** — and `start.sh:41` really does boot through
+`python scripts/migrate.py`, not bare `alembic upgrade`. 100 also checks the index by IDENTITY
+(unique, key count, plain column, `result_id`, exact predicate), which is stronger than validity
+alone. 101 copies that pattern and **states the migrate.py dependency in a comment**, because
+the argument collapses if anything ever migrates with bare alembic. Outside a migration the
+opposite rule stands: an invalid index may simply be BUILDING.
+
+### Revised split and ORDER (supersedes the 1b-1 ordering in "Agreed split")
+
+1. **1b-1a SCHEMA** — migration 101: `results.last_trace_outcome` (column only),
+   `pending_skip_trace_rows.action_id`, composite `(id,user_id)` uniqueness for `jobs`,
+   `results` and `contact_lookup_actions` (CONCURRENTLY, then `ADD CONSTRAINT ... USING INDEX`
+   under its own `lock_timeout`), the three tables, child-side FK indexes, grants, RLS policies
+   and the disposition trigger, plus both RLS scripts. No endpoint, no writer semantics.
+2. **1b-1b HARD DISPATCH CAP** — atomic reservation, `min(global, account)`, fair selection,
+   per-account resume time as ONE window query published through a Redis pipeline.
+   **This MOVES AHEAD of the quote** (see below).
+3. **1b-1c PLANNER + QUOTE** — `plan_contact_lookup`, the immutable quoted set, upper-bound
+   wording, Redis-as-advisory, the quote endpoint.
+4. **1b-2 WRITERS** — confirm, the worker claim, `last_trace_outcome` writes, events,
+   all existing-writer integrations, reconciliation and settlement.
+
+**Why the cap moves ahead of the quote:** the quote is specified to show `paused_by_daily_cap`
+and a resume time. Shipping the quote first would have it promising a pause/resume state that
+the cap does not yet compute per account, so the first thing a customer sees would be the one
+number the system cannot yet honour. **The cap is therefore NOT a read-path feature** — it
+changes the component that spends — which is the part of D3-b that "1b-1 touches no money" got
+wrong.
+
+### 1b-1a diff review round 19 (2026-09-24, on `7bc1893a`) — NO-GO, 1 P1 + 2 P2
+
+Rounds 17 and 18 are recorded in the commit messages of `92bc48ab` and `7bc1893a`. Round 19
+found no fifth grant path (every GRANT/REVOKE/POLICY/FORCE site in the repo was listed and
+checked; no `ALTER DEFAULT PRIVILEGES` anywhere) and confirmed the round-18 ordering is right.
+All three findings below were re-verified in code before being accepted.
+
+**19-1 (P1, VERIFIED, and WIDER than reported) — `contact_lookup_actions` has no guard
+trigger.** Only results and events are guarded. Codex named the UPDATE path (the column grant
+lets the API do `failed -> dispatching`, `dispatching -> settled`). The INSERT is worse: it is
+table-wide, so a user-scoped session can CREATE an action already `claimed`/`running`, with a
+lease token, `started_at`, and invented counts. Per 15-2 the API owns exactly one hop: it
+creates the action in `dispatching` and may stamp `dispatched_at` on a retry. It never changes
+`status`.
+- [ ] Third trigger `contact_lookup_actions_guard` (same GUC discriminator, plain plpgsql, not
+      SECURITY DEFINER). User-scoped INSERT: `status='dispatching'`; `lease_token`,
+      `lease_expires_at`, `started_at`, `claimed_at`, `settled_at` NULL; `claimed_count`,
+      `reused_count`, `newly_queued_count`, `billable_rows`, `tracerfy_credits` = 0
+      (`quoted_count` and `truncated` are the API's to write). User-scoped UPDATE: only when
+      `OLD.status='dispatching'` AND `NEW.status = OLD.status`. DELETE: refused. A BEFORE
+      UPDATE trigger sees the row version it locked, so an API update racing the worker's
+      `-> running` is re-checked against `running` and refused (tested, two connections).
+- [ ] Tests: each forbidden INSERT shape, each forbidden transition, the permitted insert and
+      permitted `dispatched_at` stamp, the worker path unaffected. Mutation-test the guard.
+
+**19-2 (P2, VERIFIED) — the event guard's state check races.** The parent lookup takes no
+lock; at READ COMMITTED the API can see `dispatching`, the worker commits `running`, and the
+API's `dispatching` event commits after it.
+- [ ] Parent lookup takes `FOR SHARE` (FOR KEY SHARE is not enough: a status change is a non-key
+      update and does not conflict with it). The API role can do this: it has column UPDATE
+      privilege on the table and a tenant `_app_update` policy. Test with two connections.
+
+**19-3 (P2, VERIFIED) — both verify blocks are blind to column grants.**
+`provision_rls_roles.sql:205-236` and `_cutover_step2_grants_policies.py:99-118` read
+`information_schema.role_table_grants`, which does not list column privileges, so they pass
+while the API has ZERO UPDATE on actions — exactly the round-18 bug.
+- [ ] Both verifiers assert, via `information_schema.column_privileges`, that `bridgeleads_app`
+      holds UPDATE on exactly `{status, status_reason, status_changed_at, dispatched_at}` of
+      `contact_lookup_actions` and has no table-level UPDATE there.
+
+Files: migration 101, `provision_rls_roles.sql`, `_cutover_step2_grants_policies.py`,
+`tests/test_contact_lookup_schema.py` (4, inside the 5-file rule).
+
+**Pre-code consult on the plan above (2026-09-24): PLAN: REVISE. All accepted.** Prompt and
+output: `<scratchpad 803e30a3>/codex_r19_fixplan{,_out}.txt`. Confirmed sound: the
+BEFORE UPDATE race claim (EvalPlanQual re-reads the committed row before the trigger fires),
+and FOR SHARE (needs UPDATE on at least one column plus an UPDATE RLS policy, both present; no
+deadlock with the FK's FOR KEY SHARE). The revisions below SUPERSEDE the matching bullets
+above:
+- **(P1) Timestamps are server-owned, not API-supplied.** A `server_default` is skipped whenever
+  the caller passes a value, so an API-written future `created_at` could keep a `dispatching`
+  action from ever expiring and strand its quoted rows. For a user-scoped session the triggers
+  OVERWRITE `created_at` and `status_changed_at` (actions), `at` (events) and `decided_at`
+  (action_results) with `now()`.
+- **`dispatched_at` is NULL on insert and set once**, `NULL -> now()`, only while the action is
+  still `dispatching`. It is not restamped on retry: a restamp would let a retry push back the
+  apparent dispatch clock. This matches 15-2 ("still `dispatching` with no `dispatched_at` ->
+  dispatch again").
+- **(P2) Narrow the column grant to `(dispatched_at)`** at all three grant sites. `status` and
+  `status_changed_at` are dead under the trigger rule, and a grant that matches the real writes
+  is what makes the verifier mean something. Order stays: table-wide REVOKE, then the column
+  grant. The REVOKE also wipes the old four-column grant, so an existing database converges.
+- **(P2) The API writes no free-text reasons.** `status_reason` on the action and `reason` on its
+  event must be NULL from a user-scoped session: the API's hop needs no explanation, and
+  history is evidence.
+- **`quoted_count >= 0` CHECK** (API-set at confirm, immutable after: no grant and the trigger
+  refuses it). `truncated` stays API-set.
+- **(P2) The verifiers use `has_table_privilege` / `has_column_privilege`**, which take the target
+  role explicitly and report effective privilege. `information_schema.column_privileges` is
+  filtered by the current user's role membership, so it is not reliable here. Assert: no
+  table-level UPDATE; UPDATE on `dispatched_at`; no UPDATE on any other column.
+- **Carried into 1b-2, no code now:** the FK proves a quoted result belongs to the tenant, NOT
+  that it was actually in the quote. The worker stays authoritative for eligibility and
+  re-authorizes every id (already in the 1b worker bullet).
+
+- [x] Round-19 fixes implemented, `0cd956b9`. 58 tests; mutation-tested (trigger dropped: 28
+      fail; FOR SHARE removed: the two-connection race test fails; verifier checked in four
+      real grant states).
+
+### 1b-1a diff review round 20 (2026-09-25, on `0cd956b9`) — NO-GO, 2 P1 + 1 P2
+
+All five round-19 fixes confirmed correct, no new defect from them. Prompt and output:
+`<scratchpad 0f367d2a>/codex_r20_review{,_out}.txt`.
+
+- [x] **20-1 (P2, VERIFIED by building it)** the events guard read its parent unqualified, so a
+      session's own `pg_temp.contact_lookup_actions` saying `dispatching` could vouch for a real
+      action already `running`. Now `public.`-qualified, and all three guards pin
+      `SET search_path = pg_catalog, public, pg_temp`. `b7ad8949`; the test fails with DID NOT
+      RAISE against the old guard.
+- [x] **20-2 (P1) an empty GUC meant "the worker" whatever the ROLE.** Checked production
+      read-only (owner-run, 2026-09-25): worker `DATABASE_URL`=`bridgeleads_app`,
+      `DATABASE_URL_SYNC`=`bridgeleads_system`; api BOTH DSNs = `bridgeleads_app`; neither
+      superuser nor BYPASSRLS. So an API code path opening `system_sync_session()` would have
+      passed every guard as the worker. Owner chose to harden: an empty GUC is accepted only
+      for `bridgeleads_system` or a superuser/BYPASSRLS role (owner, migrations, ops); every
+      other role is refused. Tests run AS the real roles (`SET LOCAL ROLE`); reverting the
+      branch fails the three API-role tests and leaves the worker test green.
+      **Not closed, and pre-existing:** the GUC is still the tenant identity for every RLS
+      table in the product, so a session that can run arbitrary SQL as `bridgeleads_app` can
+      claim any tenant. It is set server-side from the verified JWT with a bound parameter
+      (`src/api/deps.py:36-40`), so reaching it needs SQL injection. Project-wide, out of this PR.
+- [ ] **20-3 (P1, future, 1b-2 gate)** the composite FK proves a quoted result is the tenant's,
+      not that it was in the quote. Same as the carried bullet above: the 1b-2 worker must
+      re-authorize every id against the action's job and its immutable quoted set before it
+      creates a pending row. No spend path exists in 1b-1a.
+
+### Round 21 (2026-09-25, on `422f1a42`) — **GO**
+
+Both round-20 fixes confirmed correct, no new defect; both new tests exercise the real path.
+Prompt and output: `<scratchpad 0f367d2a>/codex_r21_review{,_out}.txt`. One P3 (the worker-role
+pass-through test covered one table) fixed by parametrizing it over all three; 65 passed.
+**Two things to carry, neither blocking:**
+- **Hard deletes by a tenant now fail closed.** Every FK into these tables cascades, and every
+  guard refuses a user-scoped DELETE, so deleting a job, result or user from a request path
+  would fail once that user has an action. Nothing does that today (the API only soft-cancels
+  jobs, `routes/jobs.py:349-380`; retention runs as the system role). Whoever builds account
+  deletion / DSAR erasure must run it through `system_sync_session()`.
+- **UNVERIFIED:** whether `bridgeleads_app` holds membership in `bridgeleads_system` with SET,
+  which would let it `SET ROLE` past the guard. A read-only `pg_auth_members` check on
+  production would settle it; if it does hold one, that is a privilege-boundary defect in its
+  own right.
+
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever
       the tab has leads that have never been looked up; when the quote comes back with
@@ -755,7 +1059,7 @@ fired (pending rows that ended `unmatched` sharing an address key within one que
 
 ## Review
 
-### Phase 1a: done, NOT merged (2026-09-20)
+### Phase 1a: MERGED AND LIVE (done 2026-09-20, merged + cut over in production)
 
 Six commits on `feat/lookup-contacts-action`, off `origin/main`. Nothing pushed, no PR, no
 Tracerfy credits spent, production untouched.
@@ -804,7 +1108,7 @@ pre-existing Stripe ones, proven identical at `origin/main`).
 **Before a PR:** rebase onto `origin/main`, which moved twice during the session (now
 `8ba7bf8`).
 
-### Phase 1b-0: done, NOT merged (2026-09-20)
+### Phase 1b-0: MERGED AND LIVE (done 2026-09-20; merged 2026-09-22 as `0074196`, migration 100 applied in production)
 
 Hardening only. No API route, no schema, no new dependency, no frontend.
 
@@ -888,7 +1192,14 @@ the pre-100 code would have produced.
 
 ### Still open
 
-- **Phase 1b and 1c have not started** and must not until 1a merges.
+- **Phase 1b-1 has NOT started.** 1a and 1b-0 are both merged and live, so the old
+  "must not start until 1a merges" gate is cleared. The next code is 1b-1a (SCHEMA), per the
+  revised order in the round-16 section above — NOT the quote endpoint.
+- 🛑 **In this repo a merge IS a deploy**: push to `main` redeploys Railway api + worker and
+  `start.sh` migrates on boot via `scripts/migrate.py`. Migration 100 was live ~2 seconds after
+  #354 merged, which silently overrode the owner's choice of a QUIESCED deploy. It was harmless
+  (0 duplicate rows, 0 active pending rows, 0 non-terminal jobs), but **quiescing has to happen
+  BEFORE the merge, because there is no step in between**. Applies to migration 101.
 - The cutover is a DRAIN and a restart, not a flag flip: the kill switch does not gate ingest,
   the webhook, or `_reuse_enrichment_for_duplicates`. See the runbook.
 - Deferred, logged above: the pre-existing cross-tenant collision (worth a read-only prod count

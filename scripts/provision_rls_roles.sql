@@ -138,6 +138,31 @@ GRANT SELECT, INSERT, DELETE ON pending_registrations TO bridgeleads_app;
 -- Append-only: no UPDATE, no DELETE.
 GRANT SELECT, INSERT ON stripe_webhook_events TO bridgeleads_app;
 
+-- contact_lookup_* (migration 101): the "look up contacts" action ledger.
+-- The API creates an action and its quoted set at confirm time and reads the
+-- status page; it never transitions a verdict. UPDATE is granted on the ACTION
+-- only, for the API's own created -> dispatching hop. The verdict table gets
+-- SELECT + INSERT and no UPDATE, and the event log is append-only for BOTH
+-- roles -- history the writer can edit is not evidence in a billing dispute.
+-- A grant cannot express "insert only an INITIAL verdict"; migration 101's
+-- trigger does that.
+-- MUST come before the column grant below. A table-level REVOKE also
+-- revokes the matching COLUMN privileges (verified against Postgres, not
+-- assumed), so running it later in this file would silently strip the
+-- column grant and leave the API unable to dispatch at all. This is also
+-- the convergence step for a database that received an earlier grant: it
+-- wipes the old table-wide UPDATE AND the old four-column grant alike.
+REVOKE UPDATE ON contact_lookup_actions FROM bridgeleads_app;
+GRANT SELECT, INSERT ON contact_lookup_actions TO bridgeleads_app;
+-- Column-level, not table-wide. A policy constrains WHICH ROWS and never
+-- WHICH COLUMNS, so a table-wide UPDATE here would let the request path
+-- rewrite unit_price_cents, the aggregated counts, billable_rows or the
+-- fencing lease. dispatched_at is the one column the API writes after
+-- creating the action; it never changes status (Codex rounds 17 and 19).
+GRANT UPDATE (dispatched_at) ON contact_lookup_actions TO bridgeleads_app;
+GRANT SELECT, INSERT ON contact_lookup_action_results TO bridgeleads_app;
+GRANT SELECT, INSERT ON contact_lookup_action_events TO bridgeleads_app;
+
 -- Converge to least privilege regardless of any prior (over-)grant: GRANT does
 -- not remove privileges an earlier version of this script handed out, so
 -- explicitly REVOKE everything the app must NOT hold (Codex review). DELETE is
@@ -162,6 +187,12 @@ REVOKE INSERT, DELETE ON dialer_deliveries FROM bridgeleads_app;
 REVOKE INSERT, DELETE ON notifications FROM bridgeleads_app;
 -- stripe_webhook_events (095): append-only ledger.
 REVOKE UPDATE, DELETE ON stripe_webhook_events FROM bridgeleads_app;
+-- contact_lookup_* (101): no DELETE anywhere; no UPDATE on verdicts or
+-- events. The action's table-wide UPDATE revoke is NOT here: it has to run
+-- before the column grant, so it lives with the grants above.
+REVOKE DELETE ON contact_lookup_actions FROM bridgeleads_app;
+REVOKE UPDATE, DELETE ON contact_lookup_action_results FROM bridgeleads_app;
+REVOKE UPDATE, DELETE ON contact_lookup_action_events FROM bridgeleads_app;
 
 -- Hard-fail if the app role still holds any DELETE (allowlisted exceptions:
 -- mfa_backup_codes — H1 grant block; pending_registrations — verify drops the
@@ -190,10 +221,45 @@ BEGIN
         OR (privilege_type = 'UPDATE'
             AND table_name IN ('scraper_batches', 'batch_runs', 'audit_events'))
         OR (privilege_type = 'SELECT' AND table_name = 'audit_events')
+        -- contact_lookup_* (101): the API may never transition a verdict or
+        -- rewrite history. Its UPDATE on contact_lookup_actions is COLUMN
+        -- level, which information_schema.role_table_grants does not report
+        -- at all, so a table-level UPDATE appearing here means the narrow
+        -- grant was replaced by a table-wide one.
+        OR (privilege_type = 'UPDATE'
+            AND table_name IN ('contact_lookup_actions',
+                               'contact_lookup_action_results',
+                               'contact_lookup_action_events'))
       );
     IF bad > 0 THEN
         RAISE EXCEPTION 'provision_rls_roles: bridgeleads_app still holds % '
             'disallowed privilege(s) — least-privilege convergence failed', bad;
+    END IF;
+
+    -- contact_lookup_actions: the check above cannot see column grants, so it
+    -- passed while the API held NO update at all (Codex round 19). Ask for
+    -- EFFECTIVE privilege instead: has_*_privilege takes the role explicitly
+    -- and folds in PUBLIC, inheritance and table-wide grants, where
+    -- information_schema.column_privileges is filtered by the CURRENT user's
+    -- role membership. Exactly dispatched_at, nothing wider, nothing missing.
+    IF has_table_privilege('bridgeleads_app', 'public.contact_lookup_actions', 'UPDATE') THEN
+        RAISE EXCEPTION 'provision_rls_roles: bridgeleads_app holds table-wide '
+            'UPDATE on contact_lookup_actions; it may update dispatched_at only';
+    END IF;
+    IF NOT has_column_privilege('bridgeleads_app', 'public.contact_lookup_actions',
+                                'dispatched_at', 'UPDATE') THEN
+        RAISE EXCEPTION 'provision_rls_roles: bridgeleads_app cannot UPDATE '
+            'contact_lookup_actions.dispatched_at; the API could not record a dispatch';
+    END IF;
+    SELECT COUNT(*) INTO bad FROM pg_attribute
+    WHERE attrelid = 'public.contact_lookup_actions'::regclass
+      AND attnum > 0 AND NOT attisdropped
+      AND attname <> 'dispatched_at'
+      AND has_column_privilege('bridgeleads_app', 'public.contact_lookup_actions',
+                               attname::text, 'UPDATE');
+    IF bad > 0 THEN
+        RAISE EXCEPTION 'provision_rls_roles: bridgeleads_app can UPDATE % '
+            'column(s) of contact_lookup_actions besides dispatched_at', bad;
     END IF;
 END
 $verify$;
@@ -258,6 +324,13 @@ GRANT DELETE ON pending_registrations TO bridgeleads_system;
 -- needs nothing new -- the ALL TABLES UPDATE above already covers it -- so this is
 -- the only privilege the retention task adds.
 GRANT DELETE ON skip_trace_cache TO bridgeleads_system;
+-- contact_lookup_action_events (101): append-only for the WORKER TOO. The
+-- blanket GRANT ... ON ALL TABLES above hands bridgeleads_system UPDATE on
+-- every table, this one included, which would let the process that writes
+-- the billing-dispute history also rewrite it. History the writer can edit
+-- is not evidence (Codex). Must stay AFTER that grant to converge.
+REVOKE UPDATE ON contact_lookup_action_events FROM bridgeleads_system;
+
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO bridgeleads_system;
 
 -- ── Role 3: owner / migration role ──────────────────────────────────────────

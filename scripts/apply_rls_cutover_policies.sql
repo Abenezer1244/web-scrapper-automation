@@ -319,6 +319,80 @@ DROP POLICY IF EXISTS stripe_webhook_events_app_insert ON public.stripe_webhook_
 CREATE POLICY stripe_webhook_events_app_insert ON public.stripe_webhook_events
     FOR INSERT TO bridgeleads_app WITH CHECK (true);
 
+-- ── contact_lookup_* (101): the "look up contacts" action ledger ───────────
+--    Tenant tables the app reads and creates but never transitions. Explicit
+--    per-verb policies, never FOR ALL: the app's UPDATE right exists only on the
+--    ACTION (its own created -> dispatching hop), and granting FOR ALL would
+--    hand it UPDATE on verdicts and events as a side effect. What a policy still
+--    cannot say -- "insert only an INITIAL verdict" -- is enforced by migration
+--    101's trigger, which fires regardless of role privileges.
+DO $contact_lookup$
+DECLARE
+    t text;
+    guc text := 'user_id = NULLIF(current_setting(''app.current_user_id'', true), '''')::uuid';
+BEGIN
+    FOREACH t IN ARRAY ARRAY[
+        'contact_lookup_actions', 'contact_lookup_action_results'
+    ]
+    LOOP
+        -- Drop the untargeted policy migration 101 created inline.
+        EXECUTE format('DROP POLICY IF EXISTS %I ON public.%I', t || '_user_isolation', t);
+        EXECUTE format('DROP POLICY IF EXISTS %I ON public.%I', t || '_app_select', t);
+        EXECUTE format(
+            'CREATE POLICY %I ON public.%I FOR SELECT TO bridgeleads_app USING (%s)',
+            t || '_app_select', t, guc);
+        EXECUTE format('DROP POLICY IF EXISTS %I ON public.%I', t || '_app_insert', t);
+        EXECUTE format(
+            'CREATE POLICY %I ON public.%I FOR INSERT TO bridgeleads_app WITH CHECK (%s)',
+            t || '_app_insert', t, guc);
+        EXECUTE format('DROP POLICY IF EXISTS %I ON public.%I', t || '_system', t);
+        EXECUTE format(
+            'CREATE POLICY %I ON public.%I FOR ALL TO bridgeleads_system USING (true) WITH CHECK (true)',
+            t || '_system', t);
+    END LOOP;
+END
+$contact_lookup$;
+
+-- The event log is append-only for BOTH roles, so it gets per-verb policies
+-- rather than the system FOR ALL the loop above applies. A FOR ALL system policy
+-- would admit an UPDATE that the REVOKE in provision_rls_roles.sql refuses, and
+-- a policy and a grant disagreeing is how the next well-meaning change to either
+-- one silently re-opens the hole (Codex).
+DROP POLICY IF EXISTS contact_lookup_action_events_user_isolation
+    ON public.contact_lookup_action_events;
+DROP POLICY IF EXISTS contact_lookup_action_events_app_select
+    ON public.contact_lookup_action_events;
+CREATE POLICY contact_lookup_action_events_app_select
+    ON public.contact_lookup_action_events
+    FOR SELECT TO bridgeleads_app
+    USING (user_id = NULLIF(current_setting('app.current_user_id', true), '')::uuid);
+DROP POLICY IF EXISTS contact_lookup_action_events_app_insert
+    ON public.contact_lookup_action_events;
+CREATE POLICY contact_lookup_action_events_app_insert
+    ON public.contact_lookup_action_events
+    FOR INSERT TO bridgeleads_app
+    WITH CHECK (user_id = NULLIF(current_setting('app.current_user_id', true), '')::uuid);
+DROP POLICY IF EXISTS contact_lookup_action_events_system
+    ON public.contact_lookup_action_events;
+DROP POLICY IF EXISTS contact_lookup_action_events_system_select
+    ON public.contact_lookup_action_events;
+CREATE POLICY contact_lookup_action_events_system_select
+    ON public.contact_lookup_action_events
+    FOR SELECT TO bridgeleads_system USING (true);
+DROP POLICY IF EXISTS contact_lookup_action_events_system_insert
+    ON public.contact_lookup_action_events;
+CREATE POLICY contact_lookup_action_events_system_insert
+    ON public.contact_lookup_action_events
+    FOR INSERT TO bridgeleads_system WITH CHECK (true);
+
+-- The action alone also gets UPDATE, for the API's created -> dispatching hop.
+-- Deliberately NOT applied to the other two tables in the loop above.
+DROP POLICY IF EXISTS contact_lookup_actions_app_update ON public.contact_lookup_actions;
+CREATE POLICY contact_lookup_actions_app_update ON public.contact_lookup_actions
+    FOR UPDATE TO bridgeleads_app
+    USING (user_id = NULLIF(current_setting('app.current_user_id', true), '')::uuid)
+    WITH CHECK (user_id = NULLIF(current_setting('app.current_user_id', true), '')::uuid);
+
 COMMIT;
 
 -- ── Verification (informational) ────────────────────────────────────────────

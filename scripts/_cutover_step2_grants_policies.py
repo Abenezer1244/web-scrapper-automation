@@ -50,10 +50,28 @@ _GRANTS = [
     "REVOKE UPDATE, DELETE ON scraper_batches, batch_runs FROM bridgeleads_app",
     "REVOKE SELECT, UPDATE, DELETE ON audit_events FROM bridgeleads_app",
     "REVOKE INSERT, DELETE ON dialer_deliveries FROM bridgeleads_app",
+    # contact_lookup_* (migration 101). Mirrors provision_rls_roles.sql. The
+    # REVOKE must precede the column GRANT: a table-level REVOKE also clears
+    # column privileges, so the other order leaves the API with no UPDATE.
+    "REVOKE UPDATE ON contact_lookup_actions FROM bridgeleads_app",
+    "GRANT SELECT, INSERT ON contact_lookup_actions TO bridgeleads_app",
+    # dispatched_at only: the API never changes status (Codex round 19).
+    "GRANT UPDATE (dispatched_at) ON contact_lookup_actions TO bridgeleads_app",
+    "GRANT SELECT, INSERT ON contact_lookup_action_results TO bridgeleads_app",
+    "GRANT SELECT, INSERT ON contact_lookup_action_events TO bridgeleads_app",
+    "REVOKE UPDATE, DELETE ON contact_lookup_action_results FROM bridgeleads_app",
+    "REVOKE UPDATE, DELETE ON contact_lookup_action_events FROM bridgeleads_app",
+    "REVOKE DELETE ON contact_lookup_actions FROM bridgeleads_app",
     "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO bridgeleads_app",
     # system role
     "GRANT USAGE ON SCHEMA public TO bridgeleads_system",
     "GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA public TO bridgeleads_system",
+    # ...which includes contact_lookup_action_events, so take it back. The
+    # event log is append-only for the WORKER TOO: history the writer can
+    # edit is not evidence in a billing dispute. MUST stay after the blanket
+    # grant above (Codex found this script; provision_rls_roles.sql alone was
+    # not the whole story).
+    "REVOKE UPDATE ON contact_lookup_action_events FROM bridgeleads_system",
     "GRANT DELETE ON county_records TO bridgeleads_system",
     "GRANT DELETE ON property_list_membership TO bridgeleads_system",
     # tasks.py releases a job's cross-job dedup claims on FIVE paths (trustee-sale
@@ -96,7 +114,33 @@ _VERIFY_APP_GRANTS = """
         OR (privilege_type = 'UPDATE'
             AND table_name IN ('scraper_batches','batch_runs','audit_events'))
         OR (privilege_type = 'SELECT' AND table_name = 'audit_events')
+        -- contact_lookup_* (101), mirroring provision_rls_roles.sql.
+        OR (privilege_type = 'UPDATE'
+            AND table_name IN ('contact_lookup_actions',
+                               'contact_lookup_action_results',
+                               'contact_lookup_action_events'))
       )
+"""
+
+# role_table_grants cannot see COLUMN grants, so the check above passed while
+# the API held no UPDATE on contact_lookup_actions at all (Codex round 19).
+# has_*_privilege reports EFFECTIVE privilege for the named role, where
+# information_schema.column_privileges is filtered by the current user's role
+# membership. Returns one row per problem; an empty result means the API can
+# update exactly dispatched_at and nothing else.
+_VERIFY_APP_ACTION_COLUMNS = """
+    SELECT 'table-wide UPDATE'
+     WHERE has_table_privilege('bridgeleads_app', 'public.contact_lookup_actions', 'UPDATE')
+    UNION ALL
+    SELECT 'missing UPDATE (dispatched_at)'
+     WHERE NOT has_column_privilege('bridgeleads_app', 'public.contact_lookup_actions',
+                                    'dispatched_at', 'UPDATE')
+    UNION ALL
+    SELECT 'extra UPDATE (' || attname || ')' FROM pg_attribute
+     WHERE attrelid = 'public.contact_lookup_actions'::regclass
+       AND attnum > 0 AND NOT attisdropped AND attname <> 'dispatched_at'
+       AND has_column_privilege('bridgeleads_app', 'public.contact_lookup_actions',
+                                attname::text, 'UPDATE')
 """
 
 
@@ -169,6 +213,13 @@ def main() -> None:
             bad = cur.fetchone()[0]
             if bad:
                 raise SystemExit(f"app role holds {bad} disallowed privilege(s) — convergence failed")
+            cur.execute(_VERIFY_APP_ACTION_COLUMNS)
+            wrong = [r[0] for r in cur.fetchall()]
+            if wrong:
+                raise SystemExit(
+                    "app role's UPDATE on contact_lookup_actions is wrong: "
+                    + ", ".join(wrong) + " (expected exactly dispatched_at)"
+                )
             cur.execute(_VERIFY_SYSTEM_GRANTS, (list(_SYSTEM_DELETE_TABLES),))
             missing = [r[0] for r in cur.fetchall()]
             if missing:

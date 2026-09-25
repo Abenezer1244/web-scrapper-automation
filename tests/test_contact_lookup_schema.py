@@ -663,7 +663,8 @@ async def test_the_api_role_without_a_tenant_is_not_the_worker(db, business_user
     await db.rollback()
 
 
-async def test_the_worker_role_without_a_tenant_passes_the_guard(db, business_user):
+@pytest.mark.parametrize("table", sorted(_NO_TENANT_INSERTS))
+async def test_the_worker_role_without_a_tenant_passes_the_guard(db, business_user, table):
     """The other side: bridgeleads_system with no GUC is the worker, and the
     guard lets it through. The test DB carries only the migration's tenant
     policy (the role-targeted _system policies come from the cutover script),
@@ -672,7 +673,7 @@ async def test_the_worker_role_without_a_tenant_passes_the_guard(db, business_us
     job_id, _rid = await _job_and_result(db, business_user)
     await db.execute(text("SET LOCAL ROLE bridgeleads_system"))
     with pytest.raises(Exception) as exc:
-        await db.execute(text(_NO_TENANT_INSERTS["contact_lookup_actions"]), {
+        await db.execute(text(_NO_TENANT_INSERTS[table]), {
             "id": str(uuid.uuid4()), "q": f"q-{uuid.uuid4()}",
             "uid": business_user.id, "job": job_id,
         })

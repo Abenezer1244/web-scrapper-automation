@@ -949,6 +949,22 @@ All five round-19 fixes confirmed correct, no new defect from them. Prompt and o
       re-authorize every id against the action's job and its immutable quoted set before it
       creates a pending row. No spend path exists in 1b-1a.
 
+### Round 21 (2026-09-25, on `422f1a42`) — **GO**
+
+Both round-20 fixes confirmed correct, no new defect; both new tests exercise the real path.
+Prompt and output: `<scratchpad 0f367d2a>/codex_r21_review{,_out}.txt`. One P3 (the worker-role
+pass-through test covered one table) fixed by parametrizing it over all three; 65 passed.
+**Two things to carry, neither blocking:**
+- **Hard deletes by a tenant now fail closed.** Every FK into these tables cascades, and every
+  guard refuses a user-scoped DELETE, so deleting a job, result or user from a request path
+  would fail once that user has an action. Nothing does that today (the API only soft-cancels
+  jobs, `routes/jobs.py:349-380`; retention runs as the system role). Whoever builds account
+  deletion / DSAR erasure must run it through `system_sync_session()`.
+- **UNVERIFIED:** whether `bridgeleads_app` holds membership in `bridgeleads_system` with SET,
+  which would let it `SET ROLE` past the guard. A read-only `pg_auth_members` check on
+  production would settle it; if it does hold one, that is a privilege-boundary defect in its
+  own right.
+
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever
       the tab has leads that have never been looked up; when the quote comes back with

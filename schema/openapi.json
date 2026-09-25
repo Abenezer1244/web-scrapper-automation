@@ -2561,6 +2561,23 @@
         "title": "ReadAllResponse",
         "type": "object"
       },
+      "ReauthRequest": {
+        "additionalProperties": false,
+        "description": "The current password, re-proven before an action that mints a long-lived\ncredential or changes how the account authenticates (audit 2026-09-25, A-2/A-4).\nA stolen one-hour session must not be able to turn itself into a permanent key\nor a second factor the owner does not hold.",
+        "properties": {
+          "current_password": {
+            "maxLength": 72,
+            "minLength": 1,
+            "title": "Current Password",
+            "type": "string"
+          }
+        },
+        "required": [
+          "current_password"
+        ],
+        "title": "ReauthRequest",
+        "type": "object"
+      },
       "RecordTypeCount": {
         "properties": {
           "leads": {
@@ -4485,8 +4502,18 @@
     },
     "/auth/api-key": {
       "post": {
-        "description": "Generate a new API key. The raw key is shown exactly once.",
+        "description": "Generate a new API key. The raw key is shown exactly once.\n\nA key never expires, so minting one needs the password and a signed-in\nsession (audit 2026-09-25, A-2): a stolen one-hour token, or a leaked key,\nmust not be able to turn itself into a permanent credential.",
         "operationId": "create_api_key_auth_api_key_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReauthRequest"
+              }
+            }
+          },
+          "required": true
+        },
         "responses": {
           "201": {
             "content": {
@@ -4497,6 +4524,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
           }
         },
         "security": [
@@ -4896,8 +4933,18 @@
     },
     "/auth/mfa/setup": {
       "post": {
-        "description": "Generate a TOTP secret, store it encrypted (NOT yet enabled), and return\nthe secret + otpauth URI. Re-calling before enable rotates the pending secret.",
+        "description": "Generate a TOTP secret, store it encrypted (NOT yet enabled), and return\nthe secret + otpauth URI. Re-calling before enable rotates the pending secret.\n\nNeeds the password and a signed-in session (audit 2026-09-25, A-4): whoever\nenrolls the second factor controls the account, so a stolen session or a\nleaked API key must not be able to enroll one the owner does not hold.",
         "operationId": "mfa_setup_auth_mfa_setup_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReauthRequest"
+              }
+            }
+          },
+          "required": true
+        },
         "responses": {
           "200": {
             "content": {
@@ -4908,6 +4955,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
           }
         },
         "security": [

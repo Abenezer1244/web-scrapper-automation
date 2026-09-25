@@ -16,7 +16,7 @@ the wrappers keep working unchanged.
 import time
 from typing import Annotated
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Request, Response, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -26,9 +26,11 @@ from src.api.auth import (
     decode_secure_token,
     generate_api_key,
     require_plan,
+    require_session,
+    verify_password,
 )
 from src.api.deps import get_rls_db
-from src.api.middleware import audit_log
+from src.api.middleware import audit_log, rate_limit
 from src.api.routes.auth_helpers import login as _login_helpers
 from src.api.routes.auth_helpers import mfa as _mfa_helpers
 from src.api.routes.auth_helpers import password as _password_helpers
@@ -69,6 +71,7 @@ from src.api.schemas import (
     NotificationPrefsUpdate,
     PasswordChange,
     ProfileUpdate,
+    ReauthRequest,
     RegisterResponse,
     ResetPasswordRequest,
     TokenResponse,
@@ -81,6 +84,22 @@ from src.config import settings
 from src.db import User, get_db  # noqa: F401 (User used in Annotated type)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+
+async def _reauthenticate(request: Request, user: User, password: str) -> None:
+    """Re-prove the password before a credential-changing action (A-2/A-4).
+
+    Throttled per ACCOUNT, not per IP: IP keys are not load-bearing in
+    production (audit F-01), and a per-account key is what stops a stolen
+    session from guessing the password through this endpoint.
+    """
+    await rate_limit(request, zone="auth", identifier=f"reauth:{user.id}")
+    if not verify_password(password, user.password_hash):
+        audit_log(request, "reauth_failed", user.id)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Current password is incorrect.",
+        )
 
 
 @router.get("/config")
@@ -346,7 +365,9 @@ async def logout_all(
 async def change_password(
     body: PasswordChange,
     request: Request,
-    current_user: CurrentUser,
+    # A session, not an API key (A-4): a key holder has no business changing
+    # how the owner signs in, even one who also knows the password.
+    current_user: Annotated[User, Depends(require_session)],
     # get_rls_db (not get_db): the password-reuse check reads the tenant-scoped
     # password_history table. Without the GUC, under the cutover role that
     # SELECT returns ZERO rows and the "last 5 passwords" reuse block silently
@@ -374,12 +395,18 @@ async def mfa_status(current_user: CurrentUser) -> MfaStatusResponse:
 
 @router.post("/mfa/setup", response_model=MfaSetupResponse)
 async def mfa_setup(
+    body: ReauthRequest,
     request: Request,
-    current_user: CurrentUser,
+    current_user: Annotated[User, Depends(require_session)],
     db: AsyncSession = Depends(get_rls_db),
 ) -> MfaSetupResponse:
     """Generate a TOTP secret, store it encrypted (NOT yet enabled), and return
-    the secret + otpauth URI. Re-calling before enable rotates the pending secret."""
+    the secret + otpauth URI. Re-calling before enable rotates the pending secret.
+
+    Needs the password and a signed-in session (audit 2026-09-25, A-4): whoever
+    enrolls the second factor controls the account, so a stolen session or a
+    leaked API key must not be able to enroll one the owner does not hold."""
+    await _reauthenticate(request, current_user, body.current_password)
     return await _mfa_helpers.mfa_setup_secret(request, current_user, db)
 
 
@@ -387,7 +414,7 @@ async def mfa_setup(
 async def mfa_enable(
     body: MfaEnableRequest,
     request: Request,
-    current_user: CurrentUser,
+    current_user: Annotated[User, Depends(require_session)],
     db: AsyncSession = Depends(get_rls_db),
 ) -> MfaEnableResponse:
     """Verify a TOTP code against the pending secret, enable MFA, return backup
@@ -399,7 +426,7 @@ async def mfa_enable(
 async def mfa_disable(
     body: MfaDisableRequest,
     request: Request,
-    current_user: CurrentUser,
+    current_user: Annotated[User, Depends(require_session)],  # never an API key (A-4)
     db: AsyncSession = Depends(get_rls_db),
 ) -> None:
     """Disable MFA. Requires the password AND a valid second factor (TOTP or an
@@ -446,11 +473,19 @@ async def reset_password(
 
 @router.post("/api-key", response_model=ApiKeyResponse, status_code=status.HTTP_201_CREATED)
 async def create_api_key(
+    body: ReauthRequest,
     request: Request,
     current_user: Annotated[User, Depends(require_plan("business", "agency"))],
+    _session: Annotated[User, Depends(require_session)],
     db: AsyncSession = Depends(get_db),
 ) -> ApiKeyResponse:
-    """Generate a new API key. The raw key is shown exactly once."""
+    """Generate a new API key. The raw key is shown exactly once.
+
+    A key never expires, so minting one needs the password and a signed-in
+    session (audit 2026-09-25, A-2): a stolen one-hour token, or a leaked key,
+    must not be able to turn itself into a permanent credential.
+    """
+    await _reauthenticate(request, current_user, body.current_password)
     raw_key, key_hash = generate_api_key()
 
     result = await db.execute(select(User).where(User.id == current_user.id))

@@ -379,6 +379,23 @@ async def get_current_user(
     return ctx.user
 
 
+async def require_session(
+    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+) -> User:
+    """Only a signed-in session, never an API key (audit 2026-09-25, A-4).
+
+    For actions that change how the account authenticates. A leaked API key
+    must not be able to mint its own replacement or enroll a second factor the
+    owner does not hold, which would lock the owner out of their own account.
+    """
+    if ctx.auth_method != "jwt":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This action needs a signed-in session, not an API key.",
+        )
+    return ctx.user
+
+
 # ─── Plan enforcement ─────────────────────────────────────────────────────────
 
 def require_plan(*plans: str):

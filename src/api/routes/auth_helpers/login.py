@@ -18,7 +18,13 @@ from src.api.auth import (
     decode_refresh_token,
     verify_password,
 )
-from src.api.middleware import BruteForceProtection, audit_log, client_ip, rate_limit
+from src.api.middleware import (
+    BruteForceProtection,
+    MfaFailureGuard,
+    audit_log,
+    client_ip,
+    rate_limit,
+)
 from src.api.schemas import (
     BreakGlassLoginRequest,
     LoginResponse,
@@ -163,13 +169,18 @@ async def login_mfa_redeem(
             detail="Invalid or expired MFA challenge.",
         )
 
+    # A-3: checked BEFORE the factor is evaluated, so a locked account neither
+    # confirms a correct guess nor spends a backup code on one.
+    await MfaFailureGuard.ensure_not_locked(user.id)
     if not await _consume_second_factor(db, user, body.code):
         # Nothing was consumed (0 rows matched); the session rolls back on raise.
+        await MfaFailureGuard.record_failure(user.id)
         audit_log(request, "mfa_failure", user.id)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid authentication code.",
         )
+    await MfaFailureGuard.clear(user.id)
 
     # Replay gate (P2): burn the challenge jti exactly once so a stolen/phished
     # challenge + one valid code cannot mint repeated sessions within the window.

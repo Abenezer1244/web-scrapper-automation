@@ -440,9 +440,11 @@ async def test_bad_mfa_code_does_not_lock_password_bucket(client: AsyncClient, r
 
     challenge = await client.post("/auth/login", json={"email": email, "password": "SecurePass1!"})
     mfa_token = challenge.json()["mfa_token"]
-    for _ in range(6):  # > brute-force threshold of 5 password failures
+    for attempt in range(6):  # > brute-force threshold of 5 password failures
         bad = await client.post("/auth/login/mfa", json={"mfa_token": mfa_token, "code": "000000"})
-        assert bad.status_code == 401
+        # The 6th hits the MFA-only lockout (audit A-3): 5 wrong codes lock
+        # second-factor verification. It must still leave the PASSWORD path open.
+        assert bad.status_code == (401 if attempt < 5 else 429)
 
     # Password path must still be open: a challenge is issued, not a 429 lockout.
     again = await client.post("/auth/login", json={"email": email, "password": "SecurePass1!"})

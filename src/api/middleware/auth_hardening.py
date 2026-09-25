@@ -716,3 +716,83 @@ class BruteForceProtection:
                 "BruteForceProtection.clear skipped (Redis error) ip=%s email_fp=%s: %s",
                 ip, email_fingerprint(email), exc,
             )
+
+
+class MfaFailureGuard:
+    """Per-account lockout for second-factor guesses (audit 2026-09-25, A-3).
+
+    The minute-bucket rate limit alone let an attacker who already holds the
+    password guess ~14,000 TOTP codes a day with three valid at any moment,
+    about a 4% daily success rate, and never be locked out. Five failures
+    within an hour now lock verification for the account for 15 minutes, and
+    a locked account is refused even for a correct code. A success clears it.
+
+    Keyed by user id, never IP: IP keys are not load-bearing in production
+    (F-01). Fails OPEN on Redis errors, like BruteForceProtection above: it is
+    defence in depth, and the per-user rate limit still applies.
+    """
+
+    _FAIL_PREFIX = "mfa_fail:"
+    _LOCK_PREFIX = "mfa_lock:"
+    MAX_FAILURES = 5
+    FAILURE_WINDOW_SECONDS = 3600
+    LOCK_SECONDS = 900
+
+    @staticmethod
+    async def ensure_not_locked(user_id: str) -> None:
+        try:
+            ttl = await _get_redis().ttl(f"{MfaFailureGuard._LOCK_PREFIX}{user_id}")
+        except redis_exceptions.RedisError as exc:
+            _logger.warning("MfaFailureGuard.ensure_not_locked fail-open (Redis error): %s", exc)
+            return
+        if ttl and ttl > 0:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Too many incorrect codes. Try again later.",
+                headers={"Retry-After": str(ttl)},
+            )
+
+    # One atomic step: count the failure, keep the window sliding, and lock at
+    # the threshold. Separate calls could leave a counter with no expiry after a
+    # partial failure, locking an account on failures spread over days (Codex).
+    _RECORD_FAILURE_LUA = """
+    local n = redis.call('INCR', KEYS[1])
+    if n == 1 then
+        -- A fixed window from the FIRST failure: failures an hour apart must
+        -- not accumulate into a lock over several hours (Codex).
+        redis.call('EXPIRE', KEYS[1], tonumber(ARGV[1]))
+    end
+    if n >= tonumber(ARGV[2]) then
+        redis.call('SETEX', KEYS[2], tonumber(ARGV[3]), '1')
+        redis.call('DEL', KEYS[1])
+    end
+    return n
+    """
+
+    @staticmethod
+    async def record_failure(user_id: str) -> None:
+        try:
+            await _get_redis().eval(
+                MfaFailureGuard._RECORD_FAILURE_LUA,
+                2,
+                f"{MfaFailureGuard._FAIL_PREFIX}{user_id}",
+                f"{MfaFailureGuard._LOCK_PREFIX}{user_id}",
+                MfaFailureGuard.FAILURE_WINDOW_SECONDS,
+                MfaFailureGuard.MAX_FAILURES,
+                MfaFailureGuard.LOCK_SECONDS,
+            )
+        except redis_exceptions.RedisError as exc:
+            _logger.warning("MfaFailureGuard.record_failure skipped (Redis error): %s", exc)
+
+    @staticmethod
+    async def clear(user_id: str) -> None:
+        """After a verified factor. Drops the lock too: a concurrent wrong guess
+        may have created one after this request passed ensure_not_locked, and a
+        user who just proved the factor must not be left locked out (Codex)."""
+        try:
+            await _get_redis().delete(
+                f"{MfaFailureGuard._FAIL_PREFIX}{user_id}",
+                f"{MfaFailureGuard._LOCK_PREFIX}{user_id}",
+            )
+        except redis_exceptions.RedisError as exc:
+            _logger.warning("MfaFailureGuard.clear skipped (Redis error): %s", exc)

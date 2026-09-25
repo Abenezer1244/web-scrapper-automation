@@ -1,4 +1,4 @@
-from .auth_hardening import BruteForceProtection, TokenBlacklist
+from .auth_hardening import BruteForceProtection, MfaFailureGuard, TokenBlacklist
 from .rate_limit import client_ip, once_per, rate_limit, release_once
 from .security import (
     SecurityHeadersMiddleware,
@@ -18,6 +18,7 @@ __all__ = [
     "release_once",
     "TokenBlacklist",
     "BruteForceProtection",
+    "MfaFailureGuard",
     "SecurityHeadersMiddleware",
     "validate_scraping_target",
     "add_scrape_domain",

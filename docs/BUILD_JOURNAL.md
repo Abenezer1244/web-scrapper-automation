@@ -19,6 +19,41 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-25 — Security audit #2: a committed Cloudflare token, three new P1s, eight fixes
+
+> Worktrees `C:/Users/Windows/bl-wt-secaudit2` (BE, `chore/security-audit-2026-09-25`) and
+> `C:/Users/Windows/bl-web-secaudit2` (FE, `fix/reauth-sensitive-actions`). Report: `SECURITY-AUDIT.md`.
+> NOT merged. FE must merge before BE.
+
+**Built / Shipped (to branches):** N-01 untrack `terraform.tfvars` + `infra/` out of the image + a BOM-tolerant
+tracked-file credential test; N-02 change-plan proration by direction (upgrade paid before it applies, downgrade
+never credited); N-03 only `done` runs deliver rows (results, download, export-url); webhook body read raw and
+capped, URL secrets out of logs, IPv4-embedding IPv6 SSRF forms blocked; password + session to mint an API key or
+enroll MFA; session families (logout revokes, refresh reuse burns the family) and FE sign-out calls backend logout;
+MFA 5-failure lockout; include_all connectors admin-only; download token requires is_active. Full suite 4,681
+passed / 0 failed on the rebased branch.
+
+**Tried / Decided:** F-02r (generic webhook raw values) left as the documented product decision. B-3 (trial
+overage lookups) left to the in-flight 1b-1b per-account cap rather than colliding with it. Session revocation
+scoped to the family, not the user, so one stale tab cannot log a user out everywhere. A replay is only "reuse"
+when the consumed marker is provably older than the grace window, so a crashed rotation cannot burn a session.
+
+**Failed / Blocked:** the permission classifier blocked my read-only prod RLS catalog query (owner to run). F-01
+still dead in prod (14/14 un-throttled) and cannot be fixed before Cloudflare is the sole ingress. The first full
+suite run was killed for low memory; rerun in 8 foreground batches.
+
+**Caught & fixed:** Codex returned NO-GO four times (webhook excerpt still decoded stacked encodings; mfa/disable
+was a second TOTP-guessing path; other auth mutations still took API keys; a regenerated-schema miss I found myself
+after the rebase). Two 2026-09-03 tests pinned "a cancelled job still lists its rows", superseded by the 09-08 rule.
+
+**Pending / Handoff:** owner rotates the Cloudflare token and an exposed admin password; merge FE then BE; B-3 into
+1b-1b; F-01 after ingress; F-03 pinning; F-07 sandbox; S-2 owner DSN off runtime services.
+
+**Facts learned:** the prior audit's "history clean" missed a token because the file opens with a UTF-8 BOM. The
+pytest `db` fixture deletes every user, so Playwright seeding must follow the last pytest run on that DB.
+Playwright's sync API delivers events only during Playwright calls: `time.sleep` + `page.url` looks like a broken
+sign-out. The audit agent's detached checkout left my commits on a detached HEAD until the rebase.
+
 ## 2026-09-22 — 1b-0 merged, and the rebase defect neither review could see
 
 > Phase 1b-0 hardening. BE **#354** merged as `0074196`; PR **#351** closed as superseded.

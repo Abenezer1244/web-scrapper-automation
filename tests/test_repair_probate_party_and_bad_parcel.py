@@ -206,6 +206,10 @@ def test_repoint_never_revives_a_submitted_row():
     assert "AND tracerfy_queue_id IS NULL" in sql
     assert "AND submitted_at IS NULL" in sql
     assert "tracerfy_queue_id IS NOT NULL" not in sql
+    # The cancel path resets the lead to 'not_attempted' after it; same guard.
+    cancel = _sql_without_comments(_mod._CANCEL_PENDING)
+    assert "AND tracerfy_queue_id IS NULL" in cancel
+    assert "AND submitted_at IS NULL" in cancel
 
 
 def test_party_repair_refreshes_the_stale_trace_name():

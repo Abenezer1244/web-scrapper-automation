@@ -1297,11 +1297,13 @@ def _alert_partial_bookkeeping(
             "skip_trace", f"partial_bookkeeping_{queue_id}",
             "Tracerfy batch recorded, but some rows had left their claim",
             f"Tracerfy accepted (and charged for) queue_id={queue_id} ({trace_type}, "
-            f"{n_claimed} rows). The queue row IS recorded, so its results will be "
-            f"ingested, but {len(missing_ids)} pending row(s) were no longer in the "
-            f"claim that sent them: they were released, and possibly claimed and "
-            f"submitted again, before this batch's bookkeeping landed. Check each "
-            f"for a second paid submission.\n\nRow ids: {', '.join(missing_ids)}",
+            f"{n_claimed} rows). The queue row IS recorded, so results will be "
+            f"ingested for the {n_claimed - len(missing_ids)} row(s) attached to it. "
+            f"The {len(missing_ids)} row(s) listed below are NOT attached: they were "
+            f"released, and possibly claimed and submitted again, before this batch's "
+            f"bookkeeping landed, so this batch's answer for them may be discarded and "
+            f"a newer claim may be a second charge. Reconcile each by hand.\n\n"
+            f"Row ids: {', '.join(missing_ids)}",
         )
     except Exception as exc:  # noqa: BLE001 — alerting is best-effort
         _logger.warning("partial-bookkeeping ops alert failed: %s", str(exc)[:120])
@@ -1560,6 +1562,40 @@ def candidate_queues(
     return hits, deferred
 
 
+def contested_queue_ids(db, remote: list[dict], known: set) -> set:
+    """Remote queue ids that could belong to MORE THAN ONE in-flight claim.
+
+    Computed over every 'submitting' claim, fresh ones included (see the
+    reconciler's comment). Shared by the live reconciler and
+    scripts/repair_stuck_skip_trace_claims.py so the two can never disagree about
+    which queues nobody may adopt.
+    """
+    from sqlalchemy import func, select
+
+    from src.db.models import PendingSkipTraceRow
+
+    all_claims = db.execute(
+        select(
+            PendingSkipTraceRow.submitted_at,
+            PendingSkipTraceRow.trace_type,
+            func.count().label("n"),
+        )
+        .where(
+            PendingSkipTraceRow.status == "submitting",
+            PendingSkipTraceRow.submitted_at.isnot(None),
+        )
+        .group_by(PendingSkipTraceRow.submitted_at, PendingSkipTraceRow.trace_type)
+    ).all()
+    contested: set = set()
+    seen_once: set = set()
+    for c_time, c_type, c_n in all_claims:
+        hits, deferred = candidate_queues(remote, c_time, c_type, c_n, known)
+        for q in hits + deferred:
+            qid = q.get("id")
+            (contested if qid in seen_once else seen_once).add(qid)
+    return contested
+
+
 def _reconcile_stale_claims(db) -> dict:
     """Resolve claims stuck mid-submission against Tracerfy's own queue list.
 
@@ -1642,26 +1678,7 @@ def _reconcile_stale_claims(db) -> dict:
         # FRESH claim's queue, attaching its results to the wrong leads and
         # billing the wrong tenants. Widening the scan to all 'submitting' rows
         # makes such a queue contested, and contested queues are adopted by nobody.
-        all_claims = db.execute(
-            select(
-                PendingSkipTraceRow.submitted_at,
-                PendingSkipTraceRow.trace_type,
-                func.count().label("n"),
-            )
-            .where(
-                PendingSkipTraceRow.status == "submitting",
-                PendingSkipTraceRow.submitted_at.isnot(None),
-            )
-            .group_by(PendingSkipTraceRow.submitted_at, PendingSkipTraceRow.trace_type)
-        ).all()
-
-        contested: set = set()
-        seen_once: set = set()
-        for c_time, c_type, c_n in all_claims:
-            hits, deferred = candidate_queues(remote, c_time, c_type, c_n, known)
-            for q in hits + deferred:
-                qid = q.get("id")
-                (contested if qid in seen_once else seen_once).add(qid)
+        contested = contested_queue_ids(db, remote, known)
 
         for claim_time, trace_type, n in groups:
             verdict, queue = match_remote_queue(

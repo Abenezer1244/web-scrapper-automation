@@ -109,6 +109,46 @@ def skip_trace_unsettled(now: datetime):
     )
 
 
+def _alert_rows_naming_missing_queues(db) -> None:
+    """Page ops when a 'submitted' row names a queue with no queue row.
+
+    skip_trace_unsettled keeps such a job unsettled on purpose (the batch may be
+    paid and still coming, and a job is pushed once), which means its dialer
+    push never happens. That must not be silent (1b-1b-i diff review). Only a
+    hand edit or data loss reaches this state; the repair is to restore or
+    insert the skip_trace_queues row for that tracerfy_queue_id, or to settle
+    the rows once the batch is reconciled.
+    """
+    from sqlalchemy import text
+
+    n_rows, n_jobs = db.execute(text(
+        "SELECT count(*), count(DISTINCT p.job_id) FROM pending_skip_trace_rows p "
+        "WHERE p.status = 'submitted' AND p.tracerfy_queue_id IS NOT NULL "
+        "  AND NOT EXISTS (SELECT 1 FROM skip_trace_queues q "
+        "                  WHERE q.tracerfy_queue_id = p.tracerfy_queue_id)"
+    )).one()
+    if not n_rows:
+        return
+    _logger.error(
+        "Dialer: %d submitted skip-trace row(s) across %d job(s) name a Tracerfy queue "
+        "with no skip_trace_queues row; those jobs stay unsettled and are not pushed",
+        n_rows, n_jobs,
+    )
+    try:
+        from src.workers.ops_alerts import send_ops_alert
+
+        send_ops_alert(
+            "dialer", "missing_skip_trace_queue",
+            "Dialer pushes blocked: skip-trace rows name a missing queue",
+            f"{n_rows} pending_skip_trace_rows in status 'submitted' across {n_jobs} "
+            f"job(s) carry a tracerfy_queue_id that has no skip_trace_queues row. "
+            f"Those jobs are held unsettled, so their dialer push will not happen "
+            f"until the queue row is restored or the rows are reconciled.",
+        )
+    except Exception as exc:  # noqa: BLE001 — alerting is best-effort
+        _logger.warning("missing-queue dialer alert failed: %s", str(exc)[:120])
+
+
 def _dialer_push_sweep_impl() -> None:
     """Push dialer-ready leads for done jobs whose skip-trace has SETTLED.
 
@@ -140,6 +180,7 @@ def _dialer_push_sweep_impl() -> None:
     unsettled = skip_trace_unsettled(_now)
 
     with system_sync_session() as db:
+        _alert_rows_naming_missing_queues(db)
         candidates = db.execute(
             select(Job, ScraperConfig)
             # Owner-match in the join (Codex security, defense-in-depth): the DB

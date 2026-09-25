@@ -59,6 +59,7 @@ def main():
         _STALE_CLAIM_AFTER,
         _release_claim,
         _release_is_safe,
+        contested_queue_ids,
         match_remote_queue,
     )
 
@@ -91,10 +92,15 @@ def main():
 
         if not groups:
             print("No claims stuck in 'submitting'. Nothing to repair.")
+        # Same contention rule as the live reconciler, over ALL in-flight claims:
+        # a queue that could belong to two claims is adopted by neither.
+        contested = contested_queue_ids(db, remote, known)
         total_released = total_adopted = total_refused = 0
 
         for claim_time, trace_type, n, users, jobs in groups:
             verdict, queue = match_remote_queue(remote, claim_time, trace_type, n, known)
+            if verdict == "one" and queue.get("id") in contested:
+                verdict, queue = "contested", None
             head = (
                 f"  claimed {claim_time}  {trace_type:<9} rows={n:<5} "
                 f"users={users} jobs={jobs}"
@@ -130,6 +136,10 @@ def main():
                 if APPLY:
                     print("       (adoption is left to the live reconciler — it also "
                           "re-drives ingest)")
+            elif verdict == "contested":
+                print(f"{head}  -> REFUSE (its queue fits more than one claim; the live "
+                      f"reconciler will not adopt it either; needs a human)")
+                total_refused += n
             else:
                 print(f"{head}  -> REFUSE (ambiguous: several queues fit; needs a human)")
                 total_refused += n

@@ -167,6 +167,59 @@ async def test_adoption_keeps_a_claim_time_from_days_ago(starter_user, tracerfy,
     assert submitted_at == claimed_at
 
 
+async def test_the_bookkeeping_retry_keeps_the_claim_time(starter_user):
+    claimed_at = datetime.now(UTC) - timedelta(minutes=2)
+    (r,) = _seed(starter_user.id, status="submitting", submitted_at=claimed_at)
+    qid = _queue_id()
+
+    # The retry runs on its own fresh session, after the first commit failed.
+    assert dispatcher._persist_submission_retry(
+        qid, [_claim(r)], "advanced", {"queue_id": qid, "rows_uploaded": 1},
+        claim_time=claimed_at,
+    )
+
+    status, submitted_at, queue_id = _row(r["pending"])
+    assert (status, queue_id, submitted_at) == ("submitted", qid, claimed_at)
+
+
+def _stale_claim_queue(qid: int, claimed_at: datetime) -> dict:
+    return {"id": qid, "trace_type": "advanced", "queue_type": "api", "pending": False,
+            "created_at": (claimed_at + timedelta(seconds=5)).isoformat(),
+            "rows_uploaded": 1, "credits_deducted": 2, "download_url": None}
+
+
+async def test_the_reconciler_releases_a_claim_tracerfy_never_saw(starter_user, monkeypatch):
+    claimed_at = datetime.now(UTC) - timedelta(hours=2)
+    (r,) = _seed(starter_user.id, status="submitting", submitted_at=claimed_at)
+    monkeypatch.setattr(skip_trace, "fetch_queues", lambda *a, **k: [])
+
+    with system_sync_session() as db:
+        summary = dispatcher._reconcile_stale_claims(db)
+
+    assert summary["released"] == 1
+    # Never charged, so it stops counting and goes back in line.
+    assert _row(r["pending"])[:2] == ("queued", None)
+
+
+async def test_a_queue_two_claims_could_own_is_adopted_by_neither(starter_user, monkeypatch):
+    claimed_at = datetime.now(UTC) - timedelta(hours=2)
+    (first,) = _seed(starter_user.id, status="submitting", submitted_at=claimed_at)
+    (second,) = _seed(starter_user.id, status="submitting",
+                      submitted_at=claimed_at + timedelta(seconds=1))
+    qid = _queue_id()
+    monkeypatch.setattr(skip_trace, "fetch_queues",
+                        lambda *a, **k: [_stale_claim_queue(qid, claimed_at)])
+
+    with system_sync_session() as db:
+        assert dispatcher.contested_queue_ids(db, [_stale_claim_queue(qid, claimed_at)],
+                                              set()) == {qid}
+        summary = dispatcher._reconcile_stale_claims(db)
+
+    assert summary["adopted"] == 0
+    for r in (first, second):
+        assert _row(r["pending"])[0] == "submitting"
+
+
 # ── C2: bookkeeping and releases stay on their own claim ─────────────────────
 
 
@@ -250,6 +303,18 @@ async def test_the_dialer_ages_a_submitted_row_by_its_batch(
     assert _unsettled(r["job"]) is expect_unsettled
 
 
+async def test_a_job_held_by_a_missing_queue_is_not_held_silently(starter_user, caplog):
+    from src.workers.scheduler_helpers.dialer import _alert_rows_naming_missing_queues
+
+    _seed(starter_user.id, status="submitted",
+          submitted_at=datetime.now(UTC) - timedelta(hours=72), queue_id=_queue_id())
+
+    with system_sync_session() as db:
+        _alert_rows_naming_missing_queues(db)
+
+    assert "name a Tracerfy queue with no skip_trace_queues row" in caplog.text
+
+
 @pytest.mark.parametrize(("row_age_h", "expect_unsettled"), [(1, True), (13, False)])
 async def test_a_row_without_a_queue_id_ages_by_its_own_time(
     starter_user, row_age_h, expect_unsettled,
@@ -277,10 +342,12 @@ async def test_a_provider_outcome_leaves_the_ledger_right(
     starter_user, tracerfy, error, expect_status, expect_spent,
 ):
     (r,) = _seed(starter_user.id)
-    tracerfy(TracerfyError(error))
+    calls = tracerfy(TracerfyError(error))
 
     dispatcher.dispatch_pending_skip_trace()
 
+    # The POST really happened: a 'queued' row after a no-op tick would pass too.
+    assert len(calls) == 1
     status, submitted_at, _q = _row(r["pending"])
     assert status == expect_status
     assert (submitted_at is not None) is expect_spent

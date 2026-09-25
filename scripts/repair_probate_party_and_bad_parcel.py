@@ -267,6 +267,11 @@ _CANCEL_PENDING = text(
     SET status = 'errored'
     WHERE result_id = :id
       AND status = 'queued'
+      -- No submission evidence (1b-1b-i diff review; same rule as the re-point):
+      -- otherwise the lead would be reset to 'not_attempted' below and bought again.
+      -- The caller resets the lead only when this matched.
+      AND tracerfy_queue_id IS NULL
+      AND submitted_at IS NULL
     """
 )
 

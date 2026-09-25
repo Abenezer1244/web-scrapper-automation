@@ -1162,6 +1162,22 @@ skip-trace/ingest suite; dialer, subject-key and script suites green. Found whil
 - Deviation from the consult: a 'submitted' row naming a missing queue keeps the job unsettled
   but does not alert (the state is unreachable through code). Flag at diff review.
 
+**Diff review round 1 on `1d2154aa` (2026-09-25): NO-GO, no P1, 3 P2 + P3s.** C1, C2, the
+release fix and the dialer correlation confirmed; retention never deletes queue rows. Fixed:
+- P2 dialer: a job held by a row naming a missing queue now alerts (`_alert_rows_naming_missing_queues`,
+  ops-alert cooldown + durable row). My deviation above is withdrawn.
+- P2 the repair script lacked the live reconciler's CONTESTED-queue refusal. Extracted
+  `contested_queue_ids()` and both use it; a contested match prints REFUSE.
+- P2 `_CANCEL_PENDING` in the probate script lacked the evidence guard; it then reset the lead
+  to `not_attempted`. Guarded like the re-point.
+- P3 alert wording (only attached rows are ingested; the listed rows need reconciling).
+- P3 tests: the outcome test asserts the POST happened; new tests for the bookkeeping retry,
+  the reconciler's release, contested refusal, and the missing-queue alert.
+Eight mutations, each caught by its own test. 434 passed across every touched suite.
+**Deferred, recorded (not in this PR):** P3 the probate script's raw `results` updates are
+keyed by UUID and not tenant-paired (pre-existing, script-wide); P3 a DB-backed test of the
+probate script's caller behaviour (its SQL guards are tested; the callers are rowcount-gated).
+
 ### Revised split (ACCEPTED by owner, 5-file rule)
 - **1b-1b-i SPENT-LEDGER HARDENING** (no feature; fixes live defects C1-C4 + C12 tests):
   dispatcher, the two scripts, tests. Ships alone, like 1b-0. The cap cannot be correct on top

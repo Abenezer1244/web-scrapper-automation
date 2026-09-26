@@ -1350,6 +1350,21 @@ per-pass cost is constant; the partial index shape fits. SUPERSEDES the matching
 - Replay: downgrade 101, upgrade, upgrade again (no-op) leaves the exact index def, a validated
   CHECK and exactly one AFTER UPDATE trigger.
 
+**Codex ii-a re-review of d273c25b (2026-09-26): NO-GO.** It verified all four P2 fixes as correct
+(AFTER trigger aborts UPDATE, UPDATE FROM and ON CONFLICT; OR REPLACE swaps BEFORE for AFTER; the
+autocommit restructure is restart-safe and the version stamp lands after upgrade(); identity checks
+complete; downgrade scoped). Open:
+- P1 (unchanged): the prod trace_type preflight, owner-run. The preflight also prints
+  `server_version`: 102 needs PG14+ in production (CI and compose pin 16).
+- P2 test crash-safety: the DDL tests restored state only on exceptions. FIXED: an autouse fixture
+  first puts the schema back exactly as 102 leaves it. Proven from a planted crashed state (index
+  gone, impostor CHECK, leftover test trigger): 13 passed and nothing was left behind.
+- P2 owner-level bypass: DELETE+INSERT with the same id, TRUNCATE, or DISABLE TRIGGER still
+  rewrite effective weight. The runtime roles hold no DELETE/TRUNCATE/DDL on this table
+  (provision_rls_roles.sql), so only the table owner can. **OWNER DECISION: accept as out of
+  scope (the owner can drop any trigger anyway), or add a delete guard on spent rows (it must
+  not break account-deletion cascades or the retention purge).**
+
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever
       the tab has leads that have never been looked up; when the quote comes back with

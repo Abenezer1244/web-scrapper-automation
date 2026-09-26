@@ -25,11 +25,39 @@ from src.db.session import sync_engine, system_sync_session
 
 
 def _mig102():
-    path = Path(__file__).resolve().parents[1] / "alembic" / "versions" /         "102_pending_skip_trace_spend_weight.py"
+    path = (Path(__file__).resolve().parents[1] / "alembic" / "versions"
+            / "102_pending_skip_trace_spend_weight.py")
     spec = importlib.util.spec_from_file_location("_mig102", path)
     mig = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mig)
     return mig
+
+
+@pytest.fixture(autouse=True)
+def _schema_as_102_left_it():
+    """Three tests below replace real schema objects (the index, the CHECK) or add
+    one (a test trigger). `finally` restores them when a test fails, but not when
+    the process dies mid-test, and the database outlives the run. So every test
+    here first puts the schema back exactly as 102 leaves it, and an interrupted
+    run is healed by the next one instead of silently weakening every later run.
+    """
+    mig = _mig102()
+    with sync_engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+        conn.execute(text("DROP TRIGGER IF EXISTS zz_test_retype ON pending_skip_trace_rows"))
+        conn.execute(text("DROP FUNCTION IF EXISTS zz_test_retype_fn()"))
+        condef = conn.execute(text(
+            "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = :c "
+            "AND conrelid = 'public.pending_skip_trace_rows'::regclass"
+        ), {"c": mig._CHECK}).scalar()
+        if condef is not None and condef.removesuffix(" NOT VALID") != mig._CHECK_DEF:
+            conn.execute(text(
+                f"ALTER TABLE public.pending_skip_trace_rows DROP CONSTRAINT {mig._CHECK}"
+            ))
+        mig._ensure_trace_type_check(conn)
+        mig._build_spent_index(conn)
+        conn.execute(text(mig._GUARD_FN))
+        conn.execute(text(mig._TRIGGER_DDL))
+    yield
 
 
 def _pending(user_id: str, **row) -> str:

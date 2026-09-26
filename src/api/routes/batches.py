@@ -23,6 +23,7 @@ from src.api.deps import get_rls_db
 from src.api.download_tracking import mark_leads_downloaded
 from src.api.entitlements import (
     Violation,
+    current_batch_child_clause,
     disallowed_export_formats,
     enforce_entitlements,
     export_format_violation,
@@ -571,6 +572,7 @@ async def list_batches(
     ).scalars().all()
     run_by_batch = {r.batch_id: r for r in runs}
     # Child config (batch_id, record_type) rows → per-batch count + distinct types.
+    # Deleted children are excluded with the same clause the fan-out uses (F-043).
     cfg_rows = (
         await db.execute(
             select(
@@ -580,6 +582,7 @@ async def list_batches(
             ).where(
                 ScraperConfig.user_id == current_user.id,
                 ScraperConfig.batch_id.in_(batch_ids),
+                current_batch_child_clause(),
             )
         )
     ).all()
@@ -661,6 +664,9 @@ async def get_batch(
             .where(
                 ScraperConfig.batch_id == batch_id,
                 ScraperConfig.user_id == current_user.id,
+                # The current children, matching what the fan-out runs (F-043).
+                # Past Jobs of deleted children stay in run history.
+                current_batch_child_clause(),
             )
             .order_by(ScraperConfig.county, ScraperConfig.record_type)
         )

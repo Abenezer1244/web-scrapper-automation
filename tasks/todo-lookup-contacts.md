@@ -1439,6 +1439,37 @@ user-facing state until 1b-1b-iii).
 `SKIP_TRACE_ACCOUNT_DAILY_CREDIT_CAP`. Prod has `SKIP_TRACE_DAILY_ROW_CAP=1000` (09-16); left as
 is it becomes a 1000-CREDIT global cap (= 500 advanced lookups) with a warning.
 
+### Codex pre-code consult on the ii-b spec (2026-09-26): PLAN: REVISE, 2 P1 + 3 P2 + 1 P3, all accepted
+Output: `<scratchpad 0ade294c>/codex_iib_consult_out.txt`. Confirmed sound: in-lock allowance +
+committed `submitted_at` make overlapping claims unable to exceed the cap; 402 partial, unknown
+outcome, releases and adoption add no spend; the pre-lock global-only check can under-dispatch,
+never over-dispatch; the cumulative hold keeps earlier survivors (list order) and FOR SHARE locks
+last to the claim commit. SUPERSEDES the matching spec bullets above:
+- **S1 (P1) a locked ranked head was not really replaced.** `rn <= room` was applied before the
+  outer `FOR UPDATE SKIP LOCKED`, so an account with room 1 and a locked `rn=1` row had no `rn=2`
+  to fall back on, and excluding ids AFTER ranking left gaps that ended refill early. Fix:
+  `exclude_ids` is applied BEFORE `row_number()`; the helper returns every ALLOCATED id (pre-lock),
+  including those SKIP LOCKED skipped; all of them join `considered`; rooms are charged only by
+  SURVIVORS. The next round therefore ranks the next rows. Regressions: a locked `rn=1` with room
+  1; a held/withdrawn head spanning several rounds.
+- **S2 (P1) no allowance for zero-spend accounts or global-only mode.** Fix: no VALUES list of
+  capped accounts. The fair select LEFT JOINs a `spent` CTE (the same weighted sum) and a VALUES
+  list of rows already TAKEN this pass (survivors, per user), and computes per account
+  `room = CASE WHEN :account_cap = 0 THEN NULL ELSE greatest(0, (:account_cap -
+  coalesce(spent,0)) / :cost) - coalesce(taken,0) END`; keep `room IS NULL OR rn <= room`.
+  Tests: global cap only with several zero-spend accounts; account cap with no prior spend.
+- **S3 (P2) cost of re-ranking every round.** Gate: EXPLAIN (ANALYZE, BUFFERS) on a seeded DB with
+  100k+ eligible rows AND a worst-case multi-round refill (15k+ blocked heads), budget ≤ 250 ms
+  per round and ≤ 2 s per pass. If it fails, switch to a keyset frontier instead of re-ranking.
+- **S4 (P2) `affordable_row_count` kept `.get(trace_type, 1)`.** Fix: it calls `credits_for()`;
+  regression: an unknown type in the 402 path raises.
+- **S5 (P2) legacy "unset" vs "0" indistinguishable.** Fix: `SKIP_TRACE_DAILY_ROW_CAP: int | None
+  = None`. A new `SKIP_TRACE_DAILY_CREDIT_CAP=0` disables without touching the legacy value or
+  warning. `.env.example` documents the new names commented out (no empty integer assignment).
+- **S6 (P3) operator text says "rows".** Fix: the alert and log name credits, the effective cap
+  and its source setting. The 09-18 security review and the 1b-0 handoff are dated records and
+  stay as written; the ii-b PR description carries the change for operators.
+
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever
       the tab has leads that have never been looked up; when the quote comes back with

@@ -1496,6 +1496,29 @@ survivors can never exceed the account or global allowance in one pass. SUPERSED
   "<setting name>"}`. The old keys (`spent_today`, `cap`) have no reader outside the absorbed
   test, so they are not kept.
 
+### Codex consult round 3 (2026-09-26): PLAN: REVISE, 2 P2. T1(b), T2, T3 verified closed.
+Output: `<scratchpad 0ade294c>/codex_iib_consult3_out.txt`. Implementation conditions it set for
+T1(b), adopted: all allocated candidates go to the cumulative hold in exact rank order; account and
+global caps are applied AFTER the hold; pre-lock allocated ids are tracked as `considered`.
+- **U1 (P2) the watermark does not exclude a row inserted before it and committed after it**
+  (`enqueued_at` is the server `now()` at insert, `models.py:1356`). Codex's fix (a REPEATABLE READ
+  pass with the advisory lock as its first query) is **REJECTED, with reason**: in REPEATABLE READ
+  the snapshot is taken when that first statement STARTS, before the lock is acquired. A
+  concurrent tick can commit its claim and release the lock in between; this pass then takes the
+  lock but reads spend WITHOUT that claim, and overspends the cap. That trades a FIFO nuance for a
+  money bug. **Instead:** stay READ COMMITTED (the in-lock spend read sees every committed claim);
+  keep the watermark as a best-effort bound; the HARD bound on the pass is T1(c). The fairness
+  claim is reworded: FIFO and fairness hold among rows committed before the pass started; a row
+  committing mid-pass may be taken in its rank position. It is eligible either way, and it can
+  never exceed a cap. Regression: a row committed mid-pass is counted against the cap like any
+  other (never over it).
+- **U2 (P2) the 12-round cutoff is bounded starvation.** Accepted. R3's promise becomes BOUNDED
+  fairness: an account is passed over only while more than `room * (2**12 - 1)` of its ranked
+  rows are blocked at once (4,095 at room 1). `refill_truncated` telemetry kept (logged with
+  counts). Regression at the documented cutoff: truncation happens, survivors found so far are
+  claimed, nothing exceeds a cap. A durable keyset continuation frontier is the upgrade if the
+  telemetry ever fires in production.
+
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever
       the tab has leads that have never been looked up; when the quote comes back with

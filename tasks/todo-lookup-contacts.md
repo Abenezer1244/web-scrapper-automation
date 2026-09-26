@@ -1332,7 +1332,10 @@ per-pass cost is constant; the partial index shape fits. SUPERSEDES the matching
 **Codex ii-a diff review (2026-09-25): NO-GO.** One P1 and four P2s, all addressed 2026-09-26:
 - P1 UNVERIFIED precondition: the 941-row count never showed the trace_type distribution, and
   102 aborts on ANY unknown historical value. Fix: read-only prod `GROUP BY trace_type` preflight
-  BEFORE merge. **PENDING: the owner runs it (the auto-mode classifier blocks prod reads).**
+  BEFORE merge. **DONE 2026-09-26 (owner-run, worker role, read-only):** advanced 440 (435 with
+  submission evidence), normal 501 (499); UNKNOWN = 0; all 941 rows visible to the role. Server
+  PostgreSQL 17.6 (>= 14 for CREATE OR REPLACE TRIGGER). No 102 object present yet.
+  `alembic_version` is not readable by that role (returned no row), so it was not checked there.
 - P2 trigger bypass: `BEFORE UPDATE OF trace_type` misses a later BEFORE trigger rewriting
   NEW.trace_type, and any statement whose SET list omits the column. Fix: `AFTER UPDATE ... FOR
   EACH ROW WHEN (OLD.trace_type IS DISTINCT FROM NEW.trace_type)`. It sees the final row, and the

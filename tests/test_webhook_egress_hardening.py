@@ -22,7 +22,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
 
 from src.api.middleware.security import _ip_is_blocked
+from src.utils.pinned_http import pinned_session
 from src.workers import webhook_delivery as wd
+from tests.test_webhook_dns_pinning import _loopback_adapter
 
 _BOMB = gzip.compress(b"\0" * (64 * 1024 * 1024))  # ~64 KB on the wire, 64 MB decoded
 
@@ -57,10 +59,17 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 @pytest.fixture
-def local_endpoint(monkeypatch):
+def loopback_transport(monkeypatch):
+    """The production transport, widened to admit loopback so a local server
+    can stand in for a customer endpoint (the pinned session refuses it, F-03)."""
+    monkeypatch.setattr(wd, "validate_outbound_webhook", lambda url: None)
+    monkeypatch.setattr(wd, "_SESSION", pinned_session(_loopback_adapter()))
+
+
+@pytest.fixture
+def local_endpoint(loopback_transport):
     server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    monkeypatch.setattr(wd, "validate_outbound_webhook", lambda url: None)
     _Handler.sent = 0
     yield f"http://127.0.0.1:{server.server_address[1]}"
     server.shutdown()
@@ -85,8 +94,7 @@ def test_a_huge_error_body_is_not_read_in_full(local_endpoint):
     assert _Handler.sent < 8 * 1024 * 1024
 
 
-def test_a_network_error_never_logs_the_url_secret(monkeypatch, caplog):
-    monkeypatch.setattr(wd, "validate_outbound_webhook", lambda url: None)
+def test_a_network_error_never_logs_the_url_secret(loopback_transport, caplog):
     # Nothing listens on port 9 (discard) locally: connection refused.
     url = "http://127.0.0.1:9/hooks/catch?token=SUPERSECRETVALUE123"
     with caplog.at_level(logging.DEBUG):

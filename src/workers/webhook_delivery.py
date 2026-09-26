@@ -52,6 +52,7 @@ import urllib3
 
 from src.api.middleware.security import validate_outbound_webhook
 from src.utils.logger import setup_logger
+from src.utils.pinned_http import is_blocked_destination, pinned_session
 from src.workers import app
 
 _logger = setup_logger("worker.webhook_delivery")
@@ -130,11 +131,10 @@ def _read_excerpt(resp: requests.Response, webhook_url: str) -> str:
     text = raw[:_RESPONSE_EXCERPT_BYTES].decode("utf-8", errors="replace")
     return _redact_url_secrets(text, webhook_url)
 
-# Dedicated session with trust_env=False: an ambient HTTPS_PROXY/NO_PROXY in
-# the worker env could otherwise move DNS resolution off-box (to the proxy),
-# bypassing the SSRF guard's resolved-IP check. We resolve + connect locally.
-_SESSION = requests.Session()
-_SESSION.trust_env = False
+# The socket connects only to an address the SSRF policy approved, resolved in
+# the same step (DNS-rebinding fix, audit 2026-09-25 F-03). Proxies are refused,
+# including an ambient HTTPS_PROXY, since a proxy would resolve for us.
+_SESSION = pinned_session()
 
 
 def _sign_payload(payload: dict, secret: str | None) -> str:
@@ -276,6 +276,23 @@ def build_dialer_push_payload(
     return payload
 
 
+def _blocked(job_id: str, host: str, attempt: int) -> dict:
+    """Result for a destination the SSRF policy refuses: alert ops, never retry."""
+    from src.workers.ops_alerts import send_ops_alert
+    send_ops_alert(
+        "webhook_blocked", job_id,
+        "Webhook target blocked (SSRF guard)",
+        f"Completion webhook for job {job_id} was blocked: host {host} is "
+        f"not a permitted target. The user's configured webhook will never "
+        f"fire until they fix the URL.",
+    )
+    return {
+        "status": "blocked",
+        "reason": "webhook target not permitted",
+        "attempts": attempt,
+    }
+
+
 @app.task(
     name="src.workers.webhook_delivery.deliver_job_webhook",
     bind=True,
@@ -314,59 +331,24 @@ def deliver_job_webhook(self, job_id: str, webhook_url: str, payload: dict) -> d
     def _excerpt(text: str) -> str:
         return "<redacted: dialer push>" if _redact_response else text[:500]
 
-    # SSRF guard (authoritative): re-validate the destination immediately
-    # before the POST so a host that rebinds to a private/metadata IP after
-    # config-save is still caught. A blocked target is a permanent config
-    # problem — return WITHOUT raising so Celery does not retry it. Never
-    # log the full URL (it may carry query-string secrets); host only.
+    # SSRF guard: re-validate the destination immediately before the POST so a
+    # host that rebinds to a private/metadata IP after config-save is caught
+    # with a clear reason. A blocked target is a permanent config problem, so it
+    # returns WITHOUT raising and Celery does not retry it. Never log the full
+    # URL (it may carry query-string secrets); host only.
     #
-    # KNOWN RESIDUAL: DNS-rebinding TOCTOU. This validates a resolved IP and the
-    # POST below re-resolves, so a TTL=0 record can in principle answer public
-    # here and private there. The validated IP is NOT pinned for the connection.
-    #
-    # ACCEPTED, DELIBERATELY, and only because ALL of the following hold. If you
-    # break any one of them, this decision is void and pinning becomes required:
-    #   1. BLIND — the response body is never surfaced to the user, so a
-    #      successful rebind leaks nothing back to the attacker.
-    #   2. NO REDIRECTS — allow_redirects=False below and on every other
-    #      outbound call, so an allowed host cannot 30x us to an internal one.
-    #   3. Re-validation happens HERE, milliseconds before the POST, not at
-    #      config-save time.
-    #   4. The blocklist covers loopback, RFC1918, CGNAT, link-local and cloud
-    #      metadata in both v4 and v6, including IPv4-mapped forms.
-    # The residual is therefore a BLIND POST of our own signed JSON to an
-    # internal address — which requires an internal service that performs a
-    # meaningful unauthenticated POST action to be worth anything.
-    #
-    # Rejected the fix on cost/benefit (Codex-reviewed): pinning in `requests`
-    # means a custom HTTPAdapter/urllib3 connection class that overrides the
-    # socket destination while preserving SNI and assert_hostname, plus
-    # multi-A-record and dual-stack fallback handling — substantial transport,
-    # TLS, DNS and retry complexity for limited incremental protection. There is
-    # no clean hook between TCP connect and body transmission in requests/urllib3
-    # that would give a cheaper version.
-    #
-    # tests/test_webhook_ssrf.py pins invariants 1 and 2 so this stays true.
+    # This check alone cannot stop DNS rebinding: the POST resolves the host
+    # again. _SESSION closes that gap (F-03): its connections resolve, check and
+    # connect in one step, so a host that answers public here and private at
+    # connect time is refused there, and lands in _blocked() below too.
     try:
         validate_outbound_webhook(webhook_url)
     except ValueError as exc:
         _logger.warning(
             "Webhook %s blocked by SSRF guard (host=%s): %s",
-            job_id[:8], host, exc,
+            job_id[:8], host, _redact_url_secrets(str(exc), webhook_url),
         )
-        from src.workers.ops_alerts import send_ops_alert
-        send_ops_alert(
-            "webhook_blocked", job_id,
-            "Webhook target blocked (SSRF guard)",
-            f"Completion webhook for job {job_id} was blocked: host {host} is "
-            f"not a permitted target. The user's configured webhook will never "
-            f"fire until they fix the URL.",
-        )
-        return {
-            "status": "blocked",
-            "reason": "webhook target not permitted",
-            "attempts": attempt,
-        }
+        return _blocked(job_id, host, attempt)
 
     _logger.info(
         "Delivering webhook for job %s to host %s (attempt %d/%d)",
@@ -396,6 +378,11 @@ def deliver_job_webhook(self, job_id: str, webhook_url: str, payload: dict) -> d
             stream=True,  # the body is read under _RESPONSE_EXCERPT_BYTES below
         )
     except requests.RequestException as exc:
+        if is_blocked_destination(exc):
+            _logger.warning(
+                "Webhook %s blocked at connect by SSRF guard (host=%s)", job_id[:8], host,
+            )
+            return _blocked(job_id, host, attempt)
         # str(exc) from requests embeds the full URL, query-string secret and
         # all, and so would the re-raised exception in Celery's own task log and
         # result backend (audit 2026-09-25, E-2). Type and host only, and the

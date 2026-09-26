@@ -27,7 +27,9 @@ after; separate commit per step; NOTHING merged to main (merge = deploy) without
 - [ ] ~~S9~~ NOT DONE (belongs to the 1b-1b spend-cap work, see review) B-3: skip trace requires a paid subscription (`first_paid_at`), coordinated with the 1b-1b session (do not touch dispatcher files)
 - [x] S10 P3 quick wins: C-1 (`include_all` admin-only), D-1 (`is_active` on download token path)
 
-Deferred (need infra/owner first): F-01/F-01b (after Cloudflare sole ingress), F-03 pinning (larger), F-07 sandbox, S-2 owner DSN.
+- [x] S11 F-03 (owner approved 2026-09-26, same branch; `3df7fdfd`): pin the webhook connection to the IP that passed the SSRF check. New `src/utils/pinned_http.py`: a urllib3 connection mixin overrides `_new_conn()` to resolve, reject if ANY address is blocked (`_ip_is_blocked`), then connect to a validated address only. TLS stays on the hostname (urllib3 wraps with `server_hostname=self.host` after `_new_conn`), so SNI, cert verification and Host are unchanged. Proxies refused. `webhook_delivery` uses the pinned session; a connect-time block returns `blocked` (no retry) like the pre-check. Regression: a real local server on loopback receives NOTHING through the webhook session (fails on main, where the session connects); positive path over real HTTP and TLS keeps Host/SNI/cert on the hostname. `dialer_outbox` (hardcoded vendor hosts) left as is.
+
+Deferred (need infra/owner first): F-01/F-01b (after Cloudflare sole ingress), F-07 sandbox, S-2 owner DSN.
 
 ## Review
 

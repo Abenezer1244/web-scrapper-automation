@@ -32,7 +32,7 @@ positive owner controls. "Already delivered" and skip-trace reuse are tenant-key
 | **N-02** | **Plan-change arbitrage:** upgrade is granted immediately but charged on the next invoice; downgrade is credited by Stripe immediately but deferred in the app. Pro -> Agency -> Pro yields Agency at about the Pro price, repeatable monthly. | NEW. **FIXED** (`98473b46`) |
 | **N-03** | **Results readable before the plan cap applies:** rows are committed before enrichment and marked OVER_QUOTA only after it, and `GET /jobs/{id}/results` has no status gate. | NEW. Reproduced, **FIXED** (`67382e30`) |
 | F-01/F-01b | IP rate limiting is still dead in production (re-proven today: 14/14 forgot-password in <1 min, 10/min zone, 0 x 429). The escalating lockout still never fires. | OPEN |
-| F-03 | Webhook SSRF DNS-rebinding TOCTOU (resolve twice, never pin). Now risk-accepted in a code comment. | OPEN |
+| F-03 | Webhook SSRF DNS-rebinding TOCTOU (resolve twice, never pin). Was risk-accepted in a code comment. | **FIXED** (`3df7fdfd`, 2026-09-26) |
 | F-12 | No per-account Tracerfy spend ceiling. Worse than recorded: **trial accounts are `plan="pro"` and can buy ~1,000 unbillable lookups each**, draining the global cap for paying customers. | OPEN, widened (raised P2 -> P1: Codex and Claude both flag) |
 
 | Severity | Count |
@@ -153,11 +153,15 @@ bypass, client-trusted price/plan/quota, secret in the client bundle, browser-he
 - **Hard ordering (unchanged from 09-16):** close the Cloudflare bypass (F-28) first, then trust `CF-Connecting-IP`.
   Never `--forwarded-allow-ips=*`. Independently flagged by Codex (P1).
 
-### F-03 [P1] Webhook SSRF DNS-rebinding TOCTOU (OPEN, risk-accepted in code)
+### F-03 [P1] Webhook SSRF DNS-rebinding TOCTOU (FIXED 2026-09-26, `3df7fdfd`)
 - `security.py:146-170` validates resolution; `webhook_delivery.py:319` resolves again at connect. The code comment at
   `webhook_delivery.py:253-279` accepts the risk on four invariants; invariant 4 is weaker than stated (E-3 below).
 - Blind SSRF (response body never shown), redirects disabled. Codex independently P1.
 - Fix: resolve once, validate every A/AAAA, connect to the pinned IP with SNI/Host set.
+- **Fixed** (`3df7fdfd`): `src/utils/pinned_http.py` overrides urllib3 `_new_conn()` to resolve once, refuse the
+  host if any answer is blocked, and connect to the exact sockaddr it checked; TLS still verifies the hostname.
+  Reproduced on origin/main first: the webhook session POSTed into a local service and a rebind after the
+  pre-check was `delivered`.
 
 ### F-12 [P1] No per-account Tracerfy spend ceiling; trials can spend (OPEN, widened)
 - Only a global rolling-24h row cap (`skip_trace_dispatcher.py:72-113`), set to 1000 in prod but defaulting to 0
@@ -238,7 +242,7 @@ bypass, client-trusted price/plan/quota, secret in the client bundle, browser-he
 | F-01 | P1 | **OPEN** | live today: 14/14 x 200, 0 x 429; `rate_limit.py:54-60` |
 | F-01b | P1 | **OPEN** | `auth_hardening.py:484,491` |
 | F-02 | P1 | **PARTIAL** (PhoneBurner fixed; generic/job webhook raw -> F-02r P2) | `phoneburner.py:81-101`; `generic_webhook.py:20-43` |
-| F-03 | P1 | **OPEN** (risk-accepted in code) | `webhook_delivery.py:253-279,319` |
+| F-03 | P1 | **FIXED** (`3df7fdfd`, connect pinned to the checked address) | `webhook_delivery.py:253-279,319` |
 | F-04 | P2 | **OPEN** (same root as F-01) | `login.py:47` |
 | F-05 | P2 | **FIXED** (per-address once_per 5 min) | `password.py:150-152` |
 | F-06 | P2 | **OPEN**: `_dmarc.bridgeleads.io` NXDOMAIN (live DoH, today) | Cloudflare DNS |
@@ -418,7 +422,7 @@ corrupted nor a formula; numeric columns untouched. Push channels: PhoneBurner f
 ## 25. Webhook/SSRF findings
 
 HTTPS-only, redirects disabled or re-validated per hop, `trust_env=False`, blocks loopback/RFC1918/100.64/10/
-169.254/ULA/link-local/IPv4-mapped. Open: F-03 rebinding (P1), E-3 IPv4-embedding IPv6 forms (P3, verified), E-1
+169.254/ULA/link-local/IPv4-mapped. F-03 rebinding (P1) fixed (`3df7fdfd`). Also: E-3 IPv4-embedding IPv6 forms (P3, verified), E-1
 unbounded response (P2), E-2 URL in logs (P3). Delivery destinations still have no proof-of-control (product decision
 from 09-16, unchanged).
 
@@ -464,6 +468,7 @@ listed). Nothing is merged: merging to `main` deploys.
 | S7 | A-1, A-5 | P2 | session families: logout (access and/or refresh token) revokes the family; refresh reuse after the grace window burns the family; FE sign-out calls backend logout server-side | BE `60918c78`, FE `0790629` | design + review PASS |
 | S8 | A-3 | P2 | 5 wrong MFA codes lock second-factor verification 15 min (login MFA and mfa/disable), atomic Lua counter | `9ea64a09` | 1 NO-GO, then PASS |
 | S10 | C-1, D-1 | P3 | `include_all` connectors admin-only; download token path requires `is_active` | `a96aaf15` | PASS |
+| S11 | F-03 | P1 | webhook socket pinned to the SSRF-approved address (`src/utils/pinned_http.py`): one lookup, any blocked answer refuses the host, connect to the checked sockaddr, TLS/SNI/Host on the hostname, proxies refused; a connect-time block returns `blocked` without retry. Added 2026-09-26 at your request | `3df7fdfd` | design PASS, diff PASS (2 P2 adopted) |
 
 **Not fixed in this phase, deliberately:**
 - **S5 / F-02r** (generic + job webhook push raw county text): a documented, Codex-reviewed product decision
@@ -472,7 +477,7 @@ listed). Nothing is merged: merging to `main` deploys.
 - **S9 / B-3** (trial accounts' unbillable overage lookups): the fix ("no overage without an active paid
   subscription") belongs inside the per-account spend cap the lookup session is building right now
   (`feat/lookup-1b1b-ledger`); implementing it here would collide. Carried as a requirement for that work.
-- **F-01/F-01b** (needs Cloudflare sole ingress first), **F-03** pinning, **F-07** sandbox, **S-2** owner DSN on
+- **F-01/F-01b** (needs Cloudflare sole ingress first), **F-07** sandbox, **S-2** owner DSN on
   runtime services: infrastructure-dependent, unchanged.
 
 ## 30. Regression tests
@@ -489,13 +494,13 @@ Added (each proven failing on the pre-fix commit, in a separate throwaway worktr
 | `tests/test_session_family_revocation.py` | A-1/A-5: logout by refresh or access token, reuse burns the family only, crash-safe, grace race kept | 3 of 7 |
 | `tests/test_mfa_failure_lockout.py` | A-3: lock after 5 (login MFA and mfa/disable), success clears | 2 of 3 |
 | `tests/test_audit_p3_access_gates.py` | C-1, D-1 | 3 of 5 |
+| `tests/test_webhook_dns_pinning.py` | F-03: loopback/localhost refused at connect with nothing received, rebind after the pre-check is `blocked` not retried, proxies refused, one DNS lookup per connection (CPython audit events), Host/SNI/cert still bound to the hostname over real TLS | 10 of 10 (4 behavioural; 6 need the new module) |
 
 Updated to the new contract (with the reason in each diff): `test_results_new_count.py` (2 tests pinned a
 2026-09-03 behaviour superseded by the 2026-09-08 "not done delivers nothing" rule), `test_auth.py`,
 `test_break_glass_login.py`, `test_plan_entitlement_audit.py` (send `current_password`; the 6th bad MFA code is now 429).
 
-Still required, not written: F-01 proxy-trust with a forged XFF (after the ingress fix); F-03 pinned connect under a
-rebinding resolver; F-12/B-3 per-account and trial spend gate (lookup session); G-1 behavioural segments isolation.
+Still required, not written: F-01 proxy-trust with a forged XFF (after the ingress fix); F-12/B-3 per-account and trial spend gate (lookup session); G-1 behavioural segments isolation.
 
 Browser verification (Playwright against the real local API, isolated DB): API-key and MFA-setup password prompts
 (7/7 checks), UI sign-out issues `POST /auth/logout` 204 and revokes a session family, browser lands on `/login`.

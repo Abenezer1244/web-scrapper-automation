@@ -1519,6 +1519,34 @@ global caps are applied AFTER the hold; pre-lock allocated ids are tracked as `c
   claimed, nothing exceeds a cap. A durable keyset continuation frontier is the upgrade if the
   telemetry ever fires in production.
 
+### Codex consult round 4 (2026-09-26): U1 rejection CONFIRMED; wording/telemetry adopted
+Output: `<scratchpad 0ade294c>/codex_iib_consult4_out.txt`. Codex confirmed that REPEATABLE READ with
+the xact lock in the first statement takes its snapshot BEFORE the lock, so the spend read could be
+stale; the only safe RR design (session lock taken before BEGIN on a pinned connection) is "not
+worthwhile": READ COMMITTED + the xact lock preserves the money invariant. Its remaining items were
+wording and test specifications, adopted verbatim, so this closes the consult:
+- **V1** Fairness applies to eligible rows VISIBLE BEFORE THE FIRST CANDIDATE READ, subject to the
+  one-row-per-account / global-headroom rule (R5). Rows committing later are outside the FIFO
+  guarantee and may be taken by rank. The in-lock spend read happens AFTER the lock is acquired, in
+  the same transaction (READ COMMITTED).
+- **V2** The starvation bound is CONDITIONAL: with no earlier deadline truncation, the round limit
+  bounds inspection at `room * 4095`; the 2 s deadline may bound it lower.
+- **V3** `refill_truncated` logs: reason (`round_limit` | `deadline`), rounds completed, elapsed ms,
+  initial and remaining global room, considered / blocked / survivor counts, and the number of
+  accounts still with room.
+- **V4** Added regressions: a row committed mid-pass never takes spend past a cap; room 1 behind
+  4,095 blocked rows plus a later survivor (the documented cutoff); an early deadline claims the
+  survivors found so far without exceeding either cap.
+
+### ii-b TO BUILD (checklist; the spec = "ii-b implementation spec" as amended by S1-S6, T1-T3, U1-U2, V1-V4)
+- [ ] `src/workers/skip_trace_capacity.py`
+- [ ] dispatcher: pre-lock early exit via the helpers; in-lock allowance; refill loop; `affordable_row_count` via `credits_for`
+- [ ] `settings.py` (+ `.env.example`)
+- [ ] `tests/test_skip_trace_credit_cap.py` (absorbs `test_skip_trace_daily_cap.py`)
+- [ ] EXPLAIN gate (S3): 100k+ eligible, 15k+ blocked heads, ≤ 250 ms/round, ≤ 2 s/pass
+- [ ] mutations: read outside the lock; `rn` out of ORDER BY; refill removed; weight 2 -> 1; hold not cumulative
+- [ ] Codex diff review to GO; owner sets prod cap values before merge
+
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever
       the tab has leads that have never been looked up; when the quote comes back with

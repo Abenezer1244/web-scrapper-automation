@@ -19,6 +19,42 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-26 - Audit #2 re-verified under /unlazy, and F-03 fixed instead of risk-accepted
+
+> Same branch as below (`chore/security-audit-2026-09-25`, PR #360). Ledger (untracked):
+> `.unlazy/phase2/GATES.md` in the worktree.
+
+**Built / Shipped:** F-03 (webhook DNS-rebinding TOCTOU, P1) fixed in `3df7fdfd`: `src/utils/pinned_http.py`
+overrides urllib3 `_new_conn()` to resolve once, refuse the host if ANY answer is blocked, and connect to the exact
+sockaddr it checked. TLS still verifies the hostname (urllib3 wraps TLS after `_new_conn` with
+`server_hostname=self.host`). Proxies refused. A connect-time block returns `blocked`, no retry. Report + plan in
+`7ece6a83`. CI green on `7ece6a83` (Test 15m21s). Not merged.
+
+**Tried / Decided:** re-verified the audit session's Phase 2 claim ("each fix has a test that failed before it")
+by copying its 8 new test files onto origin/main in a throwaway worktree: every file has real failures there, not
+import errors. The old F-03 comment said requests/urllib3 had "no clean hook between connect and body"; `_new_conn`
+is that hook. Codex: design GATE PASS (folded in: connect the resolved sockaddr, walk `.reason`/`__context__` to
+classify, `max_retries=0`), diff GATE PASS (adopted: redact the block log line; prove one lookup per connection).
+
+**Failed / Blocked:** two full local suite runs never finished: one stopped by me (stale code), one killed by
+the harness for low machine memory (2.7 GB free, other sessions). CI's Test job is the full-suite evidence.
+The unlazy checker's 120s default timed out the 9-file base run and left two orphaned `regress.sh` processes
+(killed by hand); `--timeout 600` fixed it. Codex returned nothing when the 523-line diff went on the command
+line (Windows arg limit); `codex exec -` with the prompt on stdin works.
+
+**Caught & fixed:** the existing egress tests POST to a local 127.0.0.1 server, which the pinned session now
+refuses; they use a test adapter that admits loopback and nothing else (guarded by its own test).
+
+**Pending / Handoff:** owner: rotate the Cloudflare token (N-01), merge FE #161 before BE #360, decide S5/F-02r
+and S9/B-3. Still open P1s with external blockers: F-01 (Cloudflare sole ingress), F-12 (1b-1b cap). Scratch
+worktree `C:/Users/Windows/bl-wt-unlazy360-base` (origin/main + copied tests) can be removed.
+
+**Facts learned:** "no mocks" and "prove single resolution" are compatible: CPython raises `socket.getaddrinfo`
+and `socket.connect` audit events, so a test can count real lookups via `sys.addaudithook`. A positive control
+(check-then-reconnect-by-name transport) showed 2 lookups and fails that test.
+
+---
+
 ## 2026-09-25 — Security audit #2: a committed Cloudflare token, three new P1s, eight fixes
 
 > Worktrees `C:/Users/Windows/bl-wt-secaudit2` (BE, `chore/security-audit-2026-09-25`) and

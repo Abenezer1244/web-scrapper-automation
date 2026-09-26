@@ -1369,6 +1369,76 @@ complete; downgrade scoped). Open:
   drop any trigger anyway. No delete guard, so account-deletion cascades and the retention purge
   are untouched.
 
+**ii-a MERGED + LIVE 2026-09-26: PR #361 `4b963d1c`.** Merged after an all-zero quiet check;
+verified in prod by the objects (index, CHECK, trigger all present). PG 17.6.
+
+### ii-b implementation spec (2026-09-26, post-102, BEFORE Codex consult)
+Branch `feat/lookup-1b1b-ii-b-cap` off `4b963d1c`. Supersedes Design 1-5 above where they differ;
+R1-R11 still bind. Files (5): NEW `src/workers/skip_trace_capacity.py`,
+`src/workers/skip_trace_dispatcher.py`, `src/config/settings.py`, `.env.example`, NEW
+`tests/test_skip_trace_credit_cap.py` (absorbs `tests/test_skip_trace_daily_cap.py`, which is
+deleted: a 6th path, but a deletion, R11).
+
+What 102 now guarantees, and what ii-b may therefore rely on: every row's `trace_type` is
+'normal' or 'advanced' (CHECK); a spent row's type never changes (trigger); the spent query has
+its index. ii-b still RAISES on an unknown type in `credits_for` (R4): the CHECK is the database's
+promise, the raise is the code's, and neither should silently count 1.
+
+**`skip_trace_capacity.py` (pure where it can be, one query where it cannot):**
+- `CREDITS_PER_ROW = {"normal": 1, "advanced": 2}`, moved here from the dispatcher (which
+  imports it back for `affordable_row_count`, unchanged). `credits_for(trace_type)` raises
+  `ValueError` on anything else.
+- `resolve_caps() -> (global_cap, account_cap)`, `0` = disabled. Global:
+  `SKIP_TRACE_DAILY_CREDIT_CAP` if not None, else the legacy `SKIP_TRACE_DAILY_ROW_CAP` read as
+  credits with a WARNING once per process (R9). Account: `SKIP_TRACE_ACCOUNT_DAILY_CREDIT_CAP`
+  or 0. Both settings `int | None`, `ge=0`.
+- `spent_credits(db, since) -> (global_spent, {user_id: spent})`: ONE query,
+  `SELECT user_id, sum(CASE trace_type WHEN 'normal' THEN 1 WHEN 'advanced' THEN 2 END)
+  FROM pending_skip_trace_rows WHERE submitted_at >= :since GROUP BY user_id`, the CASE BUILT
+  from `CREDITS_PER_ROW` (one source of truth). Counts claimed, submitted, unknown-outcome and
+  terminal rows alike: `submitted_at` is set at claim and cleared only by a proven-uncharged
+  release (1b-1b-i). Rides `ix_pending_skip_trace_spent`.
+- `row_allowance(cap, spent, cost) -> int | None`: `None` when cap is 0 (unbounded), else
+  `max(0, (cap - spent) // cost)`. Pure.
+- `fair_candidates(db, eligibility_stmt, cost, *, global_rows, account_room, exclude_ids)`:
+  the dispatcher's eligibility select (every predicate unchanged) as a subquery with
+  `row_number() OVER (PARTITION BY user_id ORDER BY enqueued_at, id) AS rn`; keep
+  `rn <= account_rows(user_id)` (accounts with 0 room excluded in SQL, via a VALUES list of
+  (user_id, rows) for capped accounts); `id NOT IN exclude_ids`; order `(rn, enqueued_at, id)`;
+  limit `global_rows`. Outer `SELECT ... WHERE id = ANY(:ids) FOR UPDATE OF pending SKIP LOCKED`,
+  re-ordered in Python to the subquery's order (FOR UPDATE does not preserve it).
+
+**Dispatcher, inside each pass after `pg_try_advisory_xact_lock` (16-4, 15-11):**
+1. `spent_credits` -> global and per-account row allowances for this pass's cost `c`. Global
+   allowance 0 -> end the pass (rollback, `continue` to the next trace_type: advanced may be
+   out of room while normal is not).
+2. **Refill loop (R2, R3):** `survivors = []`, `considered = set()`, per-account remaining rows,
+   global remaining rows (≤ 5000). Each round: `fair_candidates` excluding `considered`, sized
+   to the global remaining; empty -> stop. Add all to `considered`. Run
+   `_partition_still_deliverable` (withdraw + cancel), `_partition_submittable` (fail),
+   then `_hold_answers_in_flight(db, survivors + new)` -- CUMULATIVE (R2); the result becomes
+   `survivors` (earlier survivors come first, so they keep their place). Recompute remaining
+   allowances from `survivors`. Stop when global remaining is 0 or every candidate account is
+   full. Terminates: each round excludes every id already seen.
+3. Claim `survivors` exactly as today (the claim UPDATE, the commit, the POST, releases,
+   bookkeeping, reconciliation all UNCHANGED, C12).
+4. The pre-lock check at the top of the tick stays as the cheap early exit + ops alert for the
+   GLOBAL cap only, computed by `spent_credits` + `resolve_caps` (same helpers); its message
+   names credits.
+
+**Why the cap is hard:** every earlier claim committed its `submitted_at` before the lock was
+released, so each pass, batch and tick reads spend that includes it. The partial-402 path only
+ever submits FEWER rows than claimed. Adoption does not create spend (it attaches rows already
+claimed). ii-0 removed the only other spenders.
+
+**Documented limits:** fairness holds whenever a batch can hold one row per eligible account
+(R5); below that, the earliest `rn = 1` rows win. An account over its cap simply waits (no
+user-facing state until 1b-1b-iii).
+
+**Owner, before merge:** production values for `SKIP_TRACE_DAILY_CREDIT_CAP` and
+`SKIP_TRACE_ACCOUNT_DAILY_CREDIT_CAP`. Prod has `SKIP_TRACE_DAILY_ROW_CAP=1000` (09-16); left as
+is it becomes a 1000-CREDIT global cap (= 500 advanced lookups) with a warning.
+
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever
       the tab has leads that have never been looked up; when the quote comes back with

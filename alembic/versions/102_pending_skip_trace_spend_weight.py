@@ -28,10 +28,13 @@ listed in alembic/env.py CONCURRENT_INDEXES so autogenerate never proposes a
 blocking plain build of it.
 
 RESTART SAFETY (the 101 lesson): autocommit_block() COMMITS the transaction it
-is entered from, so the index is built FIRST, before any transactional DDL, and
-every statement after it is idempotent (constraint by catalog lookup, function
-by CREATE OR REPLACE, trigger by DROP IF EXISTS + CREATE). A lock timeout at any
-step leaves a database this migration can simply run again. Dropping an INVALID
+is entered from, so after the read-only guard EVERYTHING runs in autocommit, one
+statement per transaction, and every statement is idempotent: the index and the
+constraint by identity (the server's own rendering, compared whole; a
+same-named impostor on the constraint aborts rather than being trusted), the
+function and trigger by CREATE OR REPLACE. No table lock outlives its own
+statement, and a lock timeout at any step leaves a database this migration can
+simply run again. Dropping an INVALID
 index corpse is safe only because migrations are serialized by the advisory
 lock in scripts/migrate.py, which start.sh boots through.
 
@@ -70,21 +73,41 @@ BEGIN
             OLD.id, OLD.trace_type, NEW.trace_type
             USING ERRCODE = 'check_violation';
     END IF;
-    RETURN NEW;
+    RETURN NULL;
 END;
 $fn$ LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp;
 """
+
+# AFTER, not BEFORE UPDATE OF trace_type (Codex ii-a review): an AFTER trigger
+# sees the row as finally written, so a BEFORE trigger that rewrites
+# NEW.trace_type, or a statement whose SET list omits the column, cannot slip
+# past it. The WHEN clause is evaluated on that final row before the event is
+# even queued, so the dispatcher's status updates still cost nothing.
+_TRIGGER_DDL = (
+    f"CREATE OR REPLACE TRIGGER {_TRIGGER} AFTER UPDATE "
+    f"ON public.pending_skip_trace_rows FOR EACH ROW "
+    f"WHEN (OLD.trace_type IS DISTINCT FROM NEW.trace_type) "
+    f"EXECUTE FUNCTION {_FN}()"
+)
+
+# Identity is the server's own rendering of the object, compared whole: it
+# carries the access method, key order, collation, operator class, INCLUDE list,
+# predicate and uniqueness, so a same-named object that differs in ANY of them
+# is caught (Codex ii-a review).
+_INDEX_DEF = (
+    f"CREATE INDEX {_INDEX} ON public.pending_skip_trace_rows USING btree "
+    f"(submitted_at) INCLUDE (user_id, trace_type) WHERE (submitted_at IS NOT NULL)"
+)
+_CHECK_DEF = (
+    "CHECK (((trace_type)::text = ANY ((ARRAY['normal'::character varying, "
+    "'advanced'::character varying])::text[])))"
+)
 
 
 def _build_spent_index(conn) -> None:
     """CREATE INDEX CONCURRENTLY, checked by identity (the 100 pattern)."""
     existing = conn.execute(text(
-        "SELECT i.indisvalid, i.indisunique, i.indnkeyatts, i.indnatts, "
-        "       i.indexprs IS NULL AS plain_columns, "
-        "       pg_get_expr(i.indpred, i.indrelid) AS predicate, "
-        "       ARRAY(SELECT a.attname::text FROM unnest(i.indkey) WITH ORDINALITY k(n, o) "
-        "             JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.n "
-        "             ORDER BY k.o) AS cols "
+        "SELECT i.indisvalid, pg_get_indexdef(i.indexrelid) AS indexdef "
         "FROM pg_class c "
         "JOIN pg_namespace cn ON cn.oid = c.relnamespace "
         "JOIN pg_index i ON i.indexrelid = c.oid "
@@ -93,15 +116,7 @@ def _build_spent_index(conn) -> None:
         "WHERE c.relname = :n AND cn.nspname = 'public' "
         "  AND t.relname = 'pending_skip_trace_rows' AND tn.nspname = 'public'"
     ), {"n": _INDEX}).first()
-    right_shape = existing is not None and (
-        existing.indisvalid
-        and not existing.indisunique
-        and existing.plain_columns
-        and existing.indnkeyatts == 1
-        and existing.indnatts == 3
-        and list(existing.cols) == ["submitted_at", "user_id", "trace_type"]
-        and " ".join((existing.predicate or "").split()) == "(submitted_at IS NOT NULL)"
-    )
+    right_shape = existing is not None and existing.indisvalid and existing.indexdef == _INDEX_DEF
     if existing is not None and not right_shape:
         # Dead (INVALID) or the wrong shape. Safe to drop here: migrations are
         # serialized by scripts/migrate.py's advisory lock, so this is never a
@@ -131,6 +146,42 @@ def _build_spent_index(conn) -> None:
         ))
 
 
+def _ensure_trace_type_check(conn) -> None:
+    """ADD the CHECK NOT VALID if missing, refuse a same-named impostor, VALIDATE.
+
+    Run in autocommit, so the ADD's ACCESS EXCLUSIVE lock is released as soon as
+    that one catalog-only statement commits, and VALIDATE's full scan holds only
+    SHARE UPDATE EXCLUSIVE, which does not block the dispatcher's writes
+    (Codex ii-a review: a lock_timeout bounds the WAIT, not how long a lock is
+    held once taken, so nothing may sit behind an open transaction here).
+    """
+    existing = conn.execute(text(
+        "SELECT contype, pg_get_constraintdef(oid) AS condef FROM pg_constraint "
+        "WHERE conname = :c AND conrelid = 'public.pending_skip_trace_rows'::regclass"
+    ), {"c": _CHECK}).first()
+    if existing is None:
+        conn.execute(text(
+            f"ALTER TABLE public.pending_skip_trace_rows ADD CONSTRAINT {_CHECK} "
+            f"CHECK (trace_type IN ('normal', 'advanced')) NOT VALID"
+        ))
+    else:
+        condef = existing.condef.removesuffix(" NOT VALID")
+        if existing.contype != "c" or condef != _CHECK_DEF:
+            # Not ours, or not what the cap relies on. Validating it would leave
+            # the invariant absent under the right name, so stop and say why.
+            raise RuntimeError(
+                f"Migration 102 ABORTED: pending_skip_trace_rows already has a "
+                f"constraint named {_CHECK} that is not the expected CHECK "
+                f"(found type {existing.contype!r}: {existing.condef}). It is NOT "
+                f"dropped, because it may be something else's. Remove or rename it "
+                f"deliberately, then re-run."
+            )
+    # A no-op once valid.
+    conn.execute(text(
+        f"ALTER TABLE public.pending_skip_trace_rows VALIDATE CONSTRAINT {_CHECK}"
+    ))
+
+
 def upgrade() -> None:
     conn = op.get_bind()
 
@@ -151,40 +202,20 @@ def upgrade() -> None:
             f"it before re-running; do not guess."
         )
 
-    # The index first: autocommit_block commits everything before it (101).
+    # Everything below runs one statement per transaction. autocommit_block
+    # commits the guard's transaction on entry (the 101 lesson), and every step
+    # is idempotent, so a lock timeout anywhere leaves a database this migration
+    # can simply run again.
     with op.get_context().autocommit_block():
         conn = op.get_bind()
         conn.execute(text("SET lock_timeout = '5s'"))
         try:
             _build_spent_index(conn)
+            _ensure_trace_type_check(conn)
+            conn.execute(text(_GUARD_FN))
+            conn.execute(text(_TRIGGER_DDL))
         finally:
             conn.execute(text("RESET lock_timeout"))
-
-    conn = op.get_bind()
-    conn.execute(text("SET LOCAL lock_timeout = '5s'"))
-    has_check = conn.execute(text(
-        "SELECT 1 FROM pg_constraint WHERE conname = :c "
-        "AND conrelid = 'public.pending_skip_trace_rows'::regclass"
-    ), {"c": _CHECK}).first()
-    if not has_check:
-        # NOT VALID: the ADD takes its brief lock without scanning the table.
-        conn.execute(text(
-            f"ALTER TABLE public.pending_skip_trace_rows ADD CONSTRAINT {_CHECK} "
-            f"CHECK (trace_type IN ('normal', 'advanced')) NOT VALID"
-        ))
-    # VALIDATE takes only SHARE UPDATE EXCLUSIVE, and is a no-op once valid.
-    conn.execute(text(
-        f"ALTER TABLE public.pending_skip_trace_rows VALIDATE CONSTRAINT {_CHECK}"
-    ))
-    conn.execute(text(_GUARD_FN))
-    conn.execute(text(
-        f"DROP TRIGGER IF EXISTS {_TRIGGER} ON public.pending_skip_trace_rows"
-    ))
-    # OF trace_type: the dispatcher's frequent status updates never pay for it.
-    conn.execute(text(
-        f"CREATE TRIGGER {_TRIGGER} BEFORE UPDATE OF trace_type "
-        f"ON public.pending_skip_trace_rows FOR EACH ROW EXECUTE FUNCTION {_FN}()"
-    ))
 
 
 def downgrade() -> None:
@@ -201,6 +232,14 @@ def downgrade() -> None:
         conn = op.get_bind()
         conn.execute(text("SET lock_timeout = '5s'"))
         try:
-            conn.execute(text(f"DROP INDEX CONCURRENTLY IF EXISTS public.{_INDEX}"))
+            # Only ours: a same-named index on another table is left alone.
+            ours = conn.execute(text(
+                "SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
+                "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                "WHERE c.relname = :n AND n.nspname = 'public' "
+                "  AND i.indrelid = 'public.pending_skip_trace_rows'::regclass"
+            ), {"n": _INDEX}).first()
+            if ours:
+                conn.execute(text(f"DROP INDEX CONCURRENTLY IF EXISTS public.{_INDEX}"))
         finally:
             conn.execute(text("RESET lock_timeout"))

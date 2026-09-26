@@ -13,13 +13,23 @@ Schema comes from `alembic upgrade head` (not create_all). Each forbidden
 statement gets its own test and the session is rolled back straight after the
 failure, never reused (the 78-minute lesson in the 1b-1a handoff).
 """
+import importlib.util
 import uuid
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 from sqlalchemy import text
 
-from src.db.session import system_sync_session
+from src.db.session import sync_engine, system_sync_session
+
+
+def _mig102():
+    path = Path(__file__).resolve().parents[1] / "alembic" / "versions" /         "102_pending_skip_trace_spend_weight.py"
+    spec = importlib.util.spec_from_file_location("_mig102", path)
+    mig = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mig)
+    return mig
 
 
 def _pending(user_id: str, **row) -> str:
@@ -120,7 +130,7 @@ async def test_an_unsent_row_may_still_change_type(starter_user):
 
 async def test_the_spend_itself_is_not_blocked(starter_user):
     # The dispatcher's claim and bookkeeping never touch trace_type, so the
-    # trigger (BEFORE UPDATE OF trace_type) must not fire for them.
+    # trigger's WHEN (trace_type changed) is false and it never runs for them.
     pid = _pending(starter_user.id, trace_type="advanced")
     with system_sync_session() as db:
         db.execute(text("UPDATE pending_skip_trace_rows SET status = 'submitting', "
@@ -129,6 +139,107 @@ async def test_the_spend_itself_is_not_blocked(starter_user):
                         "tracerfy_queue_id = 454545 WHERE id = :p"), {"p": pid})
         db.commit()
     assert _type_of(pid) == "advanced"
+
+
+async def test_an_upsert_cannot_retype_a_spent_row(starter_user):
+    # ON CONFLICT DO UPDATE takes the UPDATE path, so it must meet the same guard.
+    pid = _pending(starter_user.id, trace_type="advanced", status="submitting",
+                   submitted_at=datetime.now(UTC))
+    with system_sync_session() as db:
+        with pytest.raises(Exception) as exc:
+            db.execute(text(
+                "INSERT INTO pending_skip_trace_rows SELECT * FROM pending_skip_trace_rows "
+                "WHERE id = :p ON CONFLICT (id) DO UPDATE SET trace_type = 'normal'"
+            ), {"p": pid})
+        db.rollback()
+    assert "trace_type of a spent row cannot change" in str(exc.value)
+    assert _type_of(pid) == "advanced"
+
+
+async def test_writing_the_same_type_to_a_spent_row_is_not_a_change(starter_user):
+    pid = _pending(starter_user.id, trace_type="advanced", status="submitting",
+                   submitted_at=datetime.now(UTC))
+    _retype(pid, "advanced")
+    assert _type_of(pid) == "advanced"
+
+
+async def test_a_retype_made_by_another_before_trigger_is_still_refused(starter_user):
+    # A BEFORE trigger sees NEW only as far as the triggers ahead of it have
+    # built it, and a statement that never names trace_type skips a column
+    # trigger entirely. The guard is AFTER, on the row as finally written, so a
+    # later trigger (here one that rewrites the type on a city update) cannot
+    # smuggle a retype past it. This one exists only for the test's duration.
+    pid = _pending(starter_user.id, trace_type="advanced", status="submitting",
+                   submitted_at=datetime.now(UTC))
+    with system_sync_session() as db:
+        db.execute(text(
+            "CREATE FUNCTION zz_test_retype_fn() RETURNS trigger AS $f$ BEGIN "
+            "NEW.trace_type := 'normal'; RETURN NEW; END; $f$ LANGUAGE plpgsql"
+        ))
+        db.execute(text(
+            "CREATE TRIGGER zz_test_retype BEFORE UPDATE OF city ON pending_skip_trace_rows "
+            "FOR EACH ROW EXECUTE FUNCTION zz_test_retype_fn()"
+        ))
+        db.commit()
+    try:
+        with system_sync_session() as db:
+            with pytest.raises(Exception) as exc:
+                db.execute(text("UPDATE pending_skip_trace_rows SET city = 'SEATTLE' "
+                                "WHERE id = :p"), {"p": pid})
+            db.rollback()
+        assert "trace_type of a spent row cannot change" in str(exc.value)
+        assert _type_of(pid) == "advanced"
+    finally:
+        with system_sync_session() as db:
+            db.execute(text("DROP TRIGGER IF EXISTS zz_test_retype ON pending_skip_trace_rows"))
+            db.execute(text("DROP FUNCTION IF EXISTS zz_test_retype_fn()"))
+            db.commit()
+
+
+# ── The migration trusts objects by identity, not by name ────────────────────
+
+
+def test_a_same_named_index_of_another_shape_is_rebuilt():
+    # Descending order is invisible to a column-list check but not to the
+    # server's own rendering of the index.
+    mig = _mig102()
+    with sync_engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+        try:
+            conn.execute(text(f"DROP INDEX CONCURRENTLY IF EXISTS public.{mig._INDEX}"))
+            conn.execute(text(
+                f"CREATE INDEX CONCURRENTLY {mig._INDEX} ON public.pending_skip_trace_rows "
+                f"(submitted_at DESC) INCLUDE (user_id, trace_type) WHERE submitted_at IS NOT NULL"
+            ))
+            mig._build_spent_index(conn)
+            got = conn.execute(text(
+                f"SELECT pg_get_indexdef('public.{mig._INDEX}'::regclass)"
+            )).scalar_one()
+            assert got == mig._INDEX_DEF
+        finally:
+            mig._build_spent_index(conn)
+
+
+def test_a_same_named_check_that_says_something_else_aborts():
+    mig = _mig102()
+    with sync_engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+        try:
+            conn.execute(text(
+                f"ALTER TABLE public.pending_skip_trace_rows DROP CONSTRAINT {mig._CHECK}"
+            ))
+            conn.execute(text(
+                f"ALTER TABLE public.pending_skip_trace_rows ADD CONSTRAINT {mig._CHECK} "
+                f"CHECK (trace_type IN ('normal', 'advanced', 'premium')) NOT VALID"
+            ))
+            with pytest.raises(RuntimeError, match="Migration 102 ABORTED"):
+                mig._ensure_trace_type_check(conn)
+        finally:
+            conn.execute(text(
+                f"ALTER TABLE public.pending_skip_trace_rows DROP CONSTRAINT IF EXISTS {mig._CHECK}"
+            ))
+            mig._ensure_trace_type_check(conn)
+        assert conn.execute(text(
+            "SELECT convalidated FROM pg_constraint WHERE conname = :c"
+        ), {"c": mig._CHECK}).scalar_one()
 
 
 # ── The cap's spent query has its index ──────────────────────────────────────

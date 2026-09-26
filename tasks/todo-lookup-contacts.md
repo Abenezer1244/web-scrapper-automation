@@ -1470,6 +1470,32 @@ last to the claim commit. SUPERSEDES the matching spec bullets above:
   and its source setting. The 09-18 security review and the 1b-0 handoff are dated records and
   stay as written; the ii-b PR description carries the change for operators.
 
+### Codex consult round 2 (2026-09-26): PLAN: REVISE, 2 P2 + 1 P3, all accepted
+Output: `<scratchpad 0ade294c>/codex_iib_consult2_out.txt`. S1, S2, S4, S5 verified closed; S1 proven:
+survivors can never exceed the account or global allowance in one pass. SUPERSEDES where they differ:
+- **T1 (P2) refill unbounded under live enqueues; worst case one round per id.** Fix, three parts:
+  (a) **watermark**: the pass reads `clock_timestamp()` once, right after taking the lock, and every
+  refill round also requires `enqueued_at <= :watermark`, so rows arriving mid-pass wait for the
+  next pass. (b) **growing look-ahead** instead of one-row-per-room rounds: round `r` (0-based)
+  allocates, per account, up to `room_remaining * 2**r` ranked rows (and globally up to
+  `min(5000, global_remaining * 2**r)`); after the filters only `room_remaining` survivors per
+  account (and `global_remaining` overall) are TAKEN, in rank order, and the extra survivors are
+  simply not claimed (they stay 'queued'; their row locks end with the pass). So a head of k
+  blocked rows is passed in about log2(k) rounds, which is what keeps R3 (no starvation) true.
+  (c) **hard bound**: at most 12 rounds and a 2 s deadline per pass; when either is hit, the pass
+  claims the survivors it has and logs `refill_truncated` with the counts. Residual limit,
+  documented: an account starves only behind more than `room * 2**12` blocked rows at once.
+  The keyset frontier is NOT built now; it is the escape hatch only if the S3 EXPLAIN gate fails.
+- **T2 (P2) arithmetic and the 5000 bound.** Room is computed in SQL as
+  `GREATEST(0, FLOOR((:account_cap - COALESCE(spent, 0))::numeric / :cost)::bigint - COALESCE(taken, 0))`,
+  NULL when the account cap is 0. The global allowance is normalized in Python:
+  `None -> 5000`, else `min(5000, allowance)`; `LIMIT` is never NULL. Boundary tests: caps and
+  spend of 0, 1, 2, 3 against both costs (1 and 2), for the account and the global allowance.
+- **T3 (P3) config and task-result text.** `settings.py` comments say credits; the early-exit
+  result becomes `{"skipped": "daily_cap", "spent_credits": .., "cap_credits": .., "cap_source":
+  "<setting name>"}`. The old keys (`spent_today`, `cap`) have no reader outside the absorbed
+  test, so they are not kept.
+
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever
       the tab has leads that have never been looked up; when the quote comes back with

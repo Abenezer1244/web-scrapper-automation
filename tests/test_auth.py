@@ -229,7 +229,7 @@ async def test_brute_force_lockout_after_five_failures(client: AsyncClient, redi
 
 async def test_api_key_generation_business_user(client: AsyncClient, business_user: User, business_token: str):
     resp = await client.post(
-        "/auth/api-key",
+        "/auth/api-key", json={"current_password": "TestPass123!"},
         headers={"Authorization": f"Bearer {business_token}"},
     )
     assert resp.status_code == 201
@@ -240,7 +240,7 @@ async def test_api_key_generation_business_user(client: AsyncClient, business_us
 
 async def test_api_key_rejected_for_starter(client: AsyncClient, starter_user: User, starter_token: str):
     resp = await client.post(
-        "/auth/api-key",
+        "/auth/api-key", json={"current_password": "TestPass123!"},
         headers={"Authorization": f"Bearer {starter_token}"},
     )
     assert resp.status_code == 403
@@ -249,7 +249,7 @@ async def test_api_key_rejected_for_starter(client: AsyncClient, starter_user: U
 async def test_api_key_authenticates_requests(client: AsyncClient, business_user: User, business_token: str):
     # Generate API key
     key_resp = await client.post(
-        "/auth/api-key",
+        "/auth/api-key", json={"current_password": "TestPass123!"},
         headers={"Authorization": f"Bearer {business_token}"},
     )
     api_key = key_resp.json()["api_key"]
@@ -287,7 +287,7 @@ async def _register_and_enable_mfa(client: AsyncClient, redis_client, email: str
     assert reg.status_code == 201, reg.text
     headers = {"Authorization": f"Bearer {reg.json()['access_token']}"}
 
-    setup = await client.post("/auth/mfa/setup", headers=headers)
+    setup = await client.post("/auth/mfa/setup", headers=headers, json={"current_password": password})
     assert setup.status_code == 200, setup.text
     secret = setup.json()["secret"]
 
@@ -440,9 +440,11 @@ async def test_bad_mfa_code_does_not_lock_password_bucket(client: AsyncClient, r
 
     challenge = await client.post("/auth/login", json={"email": email, "password": "SecurePass1!"})
     mfa_token = challenge.json()["mfa_token"]
-    for _ in range(6):  # > brute-force threshold of 5 password failures
+    for attempt in range(6):  # > brute-force threshold of 5 password failures
         bad = await client.post("/auth/login/mfa", json={"mfa_token": mfa_token, "code": "000000"})
-        assert bad.status_code == 401
+        # The 6th hits the MFA-only lockout (audit A-3): 5 wrong codes lock
+        # second-factor verification. It must still leave the PASSWORD path open.
+        assert bad.status_code == (401 if attempt < 5 else 429)
 
     # Password path must still be open: a challenge is issued, not a 429 lockout.
     again = await client.post("/auth/login", json={"email": email, "password": "SecurePass1!"})
@@ -508,7 +510,7 @@ async def test_enrollment_totp_code_cannot_be_replayed_at_login(client: AsyncCli
     _clear_auth_limits(redis_client)
     reg = await client.post("/auth/register", json={"first_name": "Test", "last_name": "User", "email": email, "password": "SecurePass1!"})
     headers = {"Authorization": f"Bearer {reg.json()['access_token']}"}
-    secret = (await client.post("/auth/mfa/setup", headers=headers)).json()["secret"]
+    secret = (await client.post("/auth/mfa/setup", headers=headers, json={"current_password": "SecurePass1!"})).json()["secret"]
 
     enroll_counter = int(time.time()) // _TOTP_INTERVAL
     enroll_code = pyotp.TOTP(secret).at(enroll_counter * _TOTP_INTERVAL)

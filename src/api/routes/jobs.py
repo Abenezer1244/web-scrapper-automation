@@ -8,7 +8,7 @@ from collections.abc import AsyncGenerator
 import redis.exceptions as _redis_exceptions
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
-from sqlalchemy import func, or_, select, text, update
+from sqlalchemy import false, func, or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api import sse_leases
@@ -74,6 +74,27 @@ _SSE_HEADERS = {
 }
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
+
+
+def _run_delivered(job: Job) -> bool:
+    """Whether this run's rows may leave the building (audit 2026-09-25, N-03).
+
+    `done` is the only billed state: the quota reservation and the charge commit
+    with it, and a cancelled or failed run is never charged. Segments and the
+    batch combined export already apply the same rule (2026-09-08). `done` is
+    terminal (`_set_status` never moves a job out of it), so this cannot flip back.
+    """
+    return job.status == "done"
+
+
+def _undelivered_run_409() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={
+            "code": "run_not_finished",
+            "message": "This run has not finished, so there is nothing to download yet.",
+        },
+    )
 
 
 def _job_response(job: Job, config: ScraperConfig | None) -> JobResponse:
@@ -463,6 +484,12 @@ async def get_results(
         Result.user_id == current_user.id,
         category_condition(category),
     )
+    if not _run_delivered(job):
+        # N-03: rows exist from `saving` on, but the quota reservation marks the
+        # over-allowance ones only after enrichment, and billing happens only at
+        # `done`. Until then the run has delivered nothing, so it lists nothing.
+        # The scrape stats below still describe the run in progress.
+        base_query = base_query.where(false())
     if safe_q:
         pattern = f"%{safe_q}%"
         base_query = base_query.where(
@@ -1179,6 +1206,8 @@ async def get_export_url(
     job = result.scalar_one_or_none()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    if not _run_delivered(job):
+        raise _undelivered_run_409()
     if not job.export_key:
         raise HTTPException(status_code=404, detail="No export available yet")
 
@@ -1373,7 +1402,9 @@ async def download_export(
     except HTTPException:
         raise
 
-    user_result = await db.execute(select(User).where(User.id == user_id))
+    # is_active (audit 2026-09-25, D-1): an emailed link lives 48h, and a
+    # deactivated account must not keep downloading through one.
+    user_result = await db.execute(select(User).where(User.id == user_id, User.is_active))
     user = user_result.scalar_one_or_none()
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
@@ -1397,6 +1428,8 @@ async def download_export(
     job = result.scalar_one_or_none()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    if not _run_delivered(job):
+        raise _undelivered_run_409()
     if not job.export_key:
         raise HTTPException(status_code=404, detail="No export available yet")
 

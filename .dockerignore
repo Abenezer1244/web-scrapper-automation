@@ -40,8 +40,10 @@ venv
 .DS_Store
 Thumbs.db
 
-# Terraform
-infra/terraform/.terraform
+# Terraform. The whole infra tree stays out of the image: nothing in it is
+# needed at runtime, and terraform.tfvars once carried a live Cloudflare
+# token that `COPY . .` baked into every image (audit 2026-09-25, N-01).
+infra/
 
 # Docker
 docker-compose.yml

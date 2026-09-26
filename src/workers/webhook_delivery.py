@@ -45,12 +45,14 @@ import hashlib
 import hmac
 import json
 from datetime import UTC, datetime, timedelta
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, unquote, urlparse
 
 import requests
+import urllib3
 
 from src.api.middleware.security import validate_outbound_webhook
 from src.utils.logger import setup_logger
+from src.utils.pinned_http import is_blocked_destination, pinned_session
 from src.workers import app
 
 _logger = setup_logger("worker.webhook_delivery")
@@ -62,11 +64,77 @@ _BACKOFF_BASE = 5  # seconds — actual waits: 5s, 25s, 125s
 # Webhook target timeout — enough for slow Zapier/Make cold starts
 _HTTP_TIMEOUT = 15
 
-# Dedicated session with trust_env=False: an ambient HTTPS_PROXY/NO_PROXY in
-# the worker env could otherwise move DNS resolution off-box (to the proxy),
-# bypassing the SSRF guard's resolved-IP check. We resolve + connect locally.
-_SESSION = requests.Session()
-_SESSION.trust_env = False
+# The response body is only ever used for a log/result excerpt, so read no more
+# than that. The destination is customer-chosen: reading its whole body let a
+# gzip bomb or a 32 MB error page into the memory of a worker shared with every
+# tenant's scrapes (audit 2026-09-25, E-1). The body is read RAW and never
+# decoded, so no stack of Content-Encodings can expand it.
+_RESPONSE_EXCERPT_BYTES = 2048
+
+# A per-read timeout does not bound a server that drips a byte every 14s. The
+# task gets a wall-clock ceiling instead, far above any honest endpoint. Hitting
+# it fails the attempt without a retry, which is the intent for such a server.
+_TASK_SOFT_TIME_LIMIT = 60
+_TASK_TIME_LIMIT = 90
+
+
+def _url_secrets(webhook_url: str) -> list[str]:
+    """Every fragment of the URL that may be a credential, raw and decoded.
+
+    Catch-hook services put the secret in the PATH (/hooks/catch/123/abcdef),
+    others in the query or userinfo. Short fragments are skipped so that words
+    like "hooks" or "api" do not blank out the whole excerpt.
+    """
+    parts = urlparse(webhook_url)
+    found = [parts.password or ""]
+    found += [seg for seg in parts.path.split("/") if len(seg) >= 6]
+    found += [value for _, value in parse_qsl(parts.query, keep_blank_values=False) if len(value) >= 4]
+    # parse_qsl decodes, so keep the RAW values too: an echo of `ab%2Bcd` must match.
+    found += [p.partition("=")[2] for p in parts.query.split("&") if len(p.partition("=")[2]) >= 4]
+    found += [unquote(f) for f in found]
+    return sorted({f for f in found if f}, key=len, reverse=True)
+
+
+def _redact_url_secrets(text: str, webhook_url: str) -> str:
+    secrets = _url_secrets(webhook_url)
+    for secret in secrets:
+        text = text.replace(secret, "<redacted>")
+    # The excerpt may have been cut mid-secret: drop a trailing partial. A cut
+    # after fewer than 4 characters is left alone; that little is not a secret.
+    for secret in secrets:
+        for n in range(len(secret) - 1, 3, -1):
+            if text.endswith(secret[:n]):
+                return text[: -n] + "<redacted>"
+    return text
+
+
+def _read_excerpt(resp: requests.Response, webhook_url: str) -> str:
+    """Up to _RESPONSE_EXCERPT_BYTES of the RAW body, then close the socket.
+
+    Undecoded on purpose: the request asks for identity encoding, and a server
+    that compresses anyway gets a placeholder rather than a decompressor.
+    """
+    encoding = (resp.headers.get("Content-Encoding") or "identity").strip().lower()
+    raw = b""
+    try:
+        raw = resp.raw.read(_RESPONSE_EXCERPT_BYTES, decode_content=False) or b""
+    except (requests.RequestException, urllib3.exceptions.HTTPError, OSError) as exc:
+        # Deliberately NOT `Exception`: Celery's SoftTimeLimitExceeded subclasses
+        # it, and the wall-clock limit must end the task, not shorten an excerpt.
+        # The status line already arrived and decides the outcome; the body is
+        # only an excerpt, so a broken read shortens it rather than failing.
+        _logger.debug("webhook response excerpt cut short: %s", type(exc).__name__)
+    finally:
+        resp.close()
+    if encoding != "identity":
+        return f"<{encoding[:40]} body, not decoded>"
+    text = raw[:_RESPONSE_EXCERPT_BYTES].decode("utf-8", errors="replace")
+    return _redact_url_secrets(text, webhook_url)
+
+# The socket connects only to an address the SSRF policy approved, resolved in
+# the same step (DNS-rebinding fix, audit 2026-09-25 F-03). Proxies are refused,
+# including an ambient HTTPS_PROXY, since a proxy would resolve for us.
+_SESSION = pinned_session()
 
 
 def _sign_payload(payload: dict, secret: str | None) -> str:
@@ -208,6 +276,23 @@ def build_dialer_push_payload(
     return payload
 
 
+def _blocked(job_id: str, host: str, attempt: int) -> dict:
+    """Result for a destination the SSRF policy refuses: alert ops, never retry."""
+    from src.workers.ops_alerts import send_ops_alert
+    send_ops_alert(
+        "webhook_blocked", job_id,
+        "Webhook target blocked (SSRF guard)",
+        f"Completion webhook for job {job_id} was blocked: host {host} is "
+        f"not a permitted target. The user's configured webhook will never "
+        f"fire until they fix the URL.",
+    )
+    return {
+        "status": "blocked",
+        "reason": "webhook target not permitted",
+        "attempts": attempt,
+    }
+
+
 @app.task(
     name="src.workers.webhook_delivery.deliver_job_webhook",
     bind=True,
@@ -217,6 +302,8 @@ def build_dialer_push_payload(
     retry_backoff=True,
     retry_backoff_max=600,
     retry_jitter=True,
+    soft_time_limit=_TASK_SOFT_TIME_LIMIT,
+    time_limit=_TASK_TIME_LIMIT,
 )
 def deliver_job_webhook(self, job_id: str, webhook_url: str, payload: dict) -> dict:
     """POST a job-completion payload to the configured webhook URL.
@@ -244,59 +331,24 @@ def deliver_job_webhook(self, job_id: str, webhook_url: str, payload: dict) -> d
     def _excerpt(text: str) -> str:
         return "<redacted: dialer push>" if _redact_response else text[:500]
 
-    # SSRF guard (authoritative): re-validate the destination immediately
-    # before the POST so a host that rebinds to a private/metadata IP after
-    # config-save is still caught. A blocked target is a permanent config
-    # problem — return WITHOUT raising so Celery does not retry it. Never
-    # log the full URL (it may carry query-string secrets); host only.
+    # SSRF guard: re-validate the destination immediately before the POST so a
+    # host that rebinds to a private/metadata IP after config-save is caught
+    # with a clear reason. A blocked target is a permanent config problem, so it
+    # returns WITHOUT raising and Celery does not retry it. Never log the full
+    # URL (it may carry query-string secrets); host only.
     #
-    # KNOWN RESIDUAL: DNS-rebinding TOCTOU. This validates a resolved IP and the
-    # POST below re-resolves, so a TTL=0 record can in principle answer public
-    # here and private there. The validated IP is NOT pinned for the connection.
-    #
-    # ACCEPTED, DELIBERATELY, and only because ALL of the following hold. If you
-    # break any one of them, this decision is void and pinning becomes required:
-    #   1. BLIND — the response body is never surfaced to the user, so a
-    #      successful rebind leaks nothing back to the attacker.
-    #   2. NO REDIRECTS — allow_redirects=False below and on every other
-    #      outbound call, so an allowed host cannot 30x us to an internal one.
-    #   3. Re-validation happens HERE, milliseconds before the POST, not at
-    #      config-save time.
-    #   4. The blocklist covers loopback, RFC1918, CGNAT, link-local and cloud
-    #      metadata in both v4 and v6, including IPv4-mapped forms.
-    # The residual is therefore a BLIND POST of our own signed JSON to an
-    # internal address — which requires an internal service that performs a
-    # meaningful unauthenticated POST action to be worth anything.
-    #
-    # Rejected the fix on cost/benefit (Codex-reviewed): pinning in `requests`
-    # means a custom HTTPAdapter/urllib3 connection class that overrides the
-    # socket destination while preserving SNI and assert_hostname, plus
-    # multi-A-record and dual-stack fallback handling — substantial transport,
-    # TLS, DNS and retry complexity for limited incremental protection. There is
-    # no clean hook between TCP connect and body transmission in requests/urllib3
-    # that would give a cheaper version.
-    #
-    # tests/test_webhook_ssrf.py pins invariants 1 and 2 so this stays true.
+    # This check alone cannot stop DNS rebinding: the POST resolves the host
+    # again. _SESSION closes that gap (F-03): its connections resolve, check and
+    # connect in one step, so a host that answers public here and private at
+    # connect time is refused there, and lands in _blocked() below too.
     try:
         validate_outbound_webhook(webhook_url)
     except ValueError as exc:
         _logger.warning(
             "Webhook %s blocked by SSRF guard (host=%s): %s",
-            job_id[:8], host, exc,
+            job_id[:8], host, _redact_url_secrets(str(exc), webhook_url),
         )
-        from src.workers.ops_alerts import send_ops_alert
-        send_ops_alert(
-            "webhook_blocked", job_id,
-            "Webhook target blocked (SSRF guard)",
-            f"Completion webhook for job {job_id} was blocked: host {host} is "
-            f"not a permitted target. The user's configured webhook will never "
-            f"fire until they fix the URL.",
-        )
-        return {
-            "status": "blocked",
-            "reason": "webhook target not permitted",
-            "attempts": attempt,
-        }
+        return _blocked(job_id, host, attempt)
 
     _logger.info(
         "Delivering webhook for job %s to host %s (attempt %d/%d)",
@@ -306,6 +358,7 @@ def deliver_job_webhook(self, job_id: str, webhook_url: str, payload: dict) -> d
     headers = {
         "Content-Type": "application/json",
         "User-Agent": "BridgeLeads-Webhook/1.0",
+        "Accept-Encoding": "identity",  # the excerpt is never decompressed (E-1)
         "X-BridgeLeads-Event": payload.get("event", "job.completed"),
         "X-BridgeLeads-Job-Id": job_id,
         "X-BridgeLeads-Delivery": f"{job_id}:{attempt}",
@@ -322,13 +375,27 @@ def deliver_job_webhook(self, job_id: str, webhook_url: str, payload: dict) -> d
             headers=headers,
             timeout=_HTTP_TIMEOUT,
             allow_redirects=False,  # don't follow 30x to a (possibly internal) Location
+            stream=True,  # the body is read under _RESPONSE_EXCERPT_BYTES below
         )
     except requests.RequestException as exc:
+        if is_blocked_destination(exc):
+            _logger.warning(
+                "Webhook %s blocked at connect by SSRF guard (host=%s)", job_id[:8], host,
+            )
+            return _blocked(job_id, host, attempt)
+        # str(exc) from requests embeds the full URL, query-string secret and
+        # all, and so would the re-raised exception in Celery's own task log and
+        # result backend (audit 2026-09-25, E-2). Type and host only, and the
+        # original is not chained, so its message goes nowhere.
+        reason = type(exc).__name__
         _logger.warning(
-            "Webhook %s delivery network error (attempt %d): %s",
-            job_id[:8], attempt, str(exc)[:200],
+            "Webhook %s delivery network error (attempt %d): %s to host %s",
+            job_id[:8], attempt, reason, host,
         )
-        raise  # Celery autoretry_for catches this
+        raise requests.ConnectionError(
+            f"webhook delivery network error: {reason} (host {host})"
+        ) from None  # Celery autoretry_for catches this
+    body_text = _read_excerpt(resp, webhook_url)
 
     # Redirects are disabled, so a 3xx is a misconfigured endpoint, not a
     # success — and following the Location is exactly the SSRF vector we
@@ -352,7 +419,7 @@ def deliver_job_webhook(self, job_id: str, webhook_url: str, payload: dict) -> d
     if resp.status_code >= 400:
         _logger.warning(
             "Webhook %s delivery %d: %d %s",
-            job_id[:8], attempt, resp.status_code, _excerpt(resp.text),
+            job_id[:8], attempt, resp.status_code, _excerpt(body_text),
         )
         if attempt >= _MAX_RETRIES + 1:
             # Final failure — log + return without raising so the job
@@ -372,17 +439,14 @@ def deliver_job_webhook(self, job_id: str, webhook_url: str, payload: dict) -> d
             return {
                 "status": "failed",
                 "status_code": resp.status_code,
-                "response_excerpt": _excerpt(resp.text),
+                "response_excerpt": _excerpt(body_text),
                 "attempts": attempt,
             }
         # Retry via Celery's mechanism. The exc message reaches logs + the result
-        # backend, so keep the body out of it for dialer pushes.
-        retry_detail = (
-            f"HTTP {resp.status_code}" if _redact_response
-            else f"HTTP {resp.status_code}: {resp.text[:200]}"
-        )
+        # backend, so it carries the status only, for every event: the body is the
+        # customer endpoint's own text, already logged (bounded, redacted) above.
         raise self.retry(
-            exc=Exception(retry_detail),
+            exc=Exception(f"HTTP {resp.status_code}"),
             countdown=_BACKOFF_BASE * (5 ** self.request.retries),
         )
 
@@ -393,6 +457,6 @@ def deliver_job_webhook(self, job_id: str, webhook_url: str, payload: dict) -> d
     return {
         "status": "delivered",
         "status_code": resp.status_code,
-        "response_excerpt": _excerpt(resp.text),
+        "response_excerpt": _excerpt(body_text),
         "attempts": attempt,
     }

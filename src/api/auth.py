@@ -130,6 +130,7 @@ def create_secure_token(
     user_id: str,
     amr: list[str] | None = None,
     auth_time: int | None = None,
+    fam: str | None = None,
 ) -> str:
     """Create a signed access JWT (1 hour) with jti, iss, aud, amr, and exp.
 
@@ -156,6 +157,8 @@ def create_secure_token(
         "iat": now,
         "exp": now + _ACCESS_TOKEN_EXPIRE_SECONDS,
     }
+    if fam:
+        payload["fam"] = fam
     return jwt.encode(payload, settings.SECRET_KEY, algorithm=_ALGORITHM)
 
 
@@ -163,6 +166,7 @@ def create_refresh_token(
     user_id: str,
     amr: list[str] | None = None,
     auth_time: int | None = None,
+    fam: str | None = None,
 ) -> str:
     """Create a signed refresh JWT (7 days), usable ONLY at /auth/refresh.
 
@@ -191,7 +195,29 @@ def create_refresh_token(
         "iat": now,
         "exp": now + _REFRESH_TOKEN_EXPIRE_SECONDS,
     }
+    if fam:
+        payload["fam"] = fam
     return jwt.encode(payload, settings.SECRET_KEY, algorithm=_ALGORITHM)
+
+
+def create_token_pair(
+    user_id: str,
+    amr: list[str] | None = None,
+    auth_time: int | None = None,
+    fam: str | None = None,
+) -> tuple[str, str]:
+    """An access + refresh pair belonging to ONE session family (audit A-1/A-5).
+
+    A new login passes no ``fam`` and starts a family; /auth/refresh passes the
+    presented token's ``fam`` so the rotated pair stays in it. Revoking the
+    family (logout, or a replayed refresh token) ends every token of that one
+    session and leaves the user's other sessions alone.
+    """
+    fam = fam or secrets.token_hex(16)
+    return (
+        create_secure_token(user_id, amr=amr, auth_time=auth_time, fam=fam),
+        create_refresh_token(user_id, amr=amr, auth_time=auth_time, fam=fam),
+    )
 
 
 def decode_secure_token(token: str) -> dict:
@@ -351,6 +377,11 @@ async def get_auth_context(
 
         if await TokenBlacklist.is_revoked_by_user_logout_all(user_id, issued_at):
             raise _CREDENTIALS_EXCEPTION
+
+        # The session this token belongs to was logged out, or burned by a
+        # replayed refresh token (A-1/A-5).
+        if await TokenBlacklist.is_family_revoked(payload.get("fam")):
+            raise _CREDENTIALS_EXCEPTION
     except _redis_exceptions.RedisError:
         raise revocation_unavailable_503()
 
@@ -376,6 +407,23 @@ async def get_current_user(
 ) -> User:
     """Thin wrapper over get_auth_context — preserves every existing CurrentUser
     dependency unchanged while the request decodes the bearer exactly once."""
+    return ctx.user
+
+
+async def require_session(
+    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+) -> User:
+    """Only a signed-in session, never an API key (audit 2026-09-25, A-4).
+
+    For actions that change how the account authenticates. A leaked API key
+    must not be able to mint its own replacement or enroll a second factor the
+    owner does not hold, which would lock the owner out of their own account.
+    """
+    if ctx.auth_method != "jwt":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This action needs a signed-in session, not an API key.",
+        )
     return ctx.user
 
 

@@ -379,6 +379,24 @@ class LoginResponse(BaseModel):
     mfa_token: str | None = None
 
 
+class LogoutRequest(BaseModel):
+    """Optional body for POST /auth/logout: the session's refresh token, so
+    logout still ends the session after its 1-hour access token has expired."""
+    model_config = {"extra": "forbid"}
+
+    refresh_token: str | None = Field(default=None, max_length=4096)
+
+
+class ReauthRequest(BaseModel):
+    """The current password, re-proven before an action that mints a long-lived
+    credential or changes how the account authenticates (audit 2026-09-25, A-2/A-4).
+    A stolen one-hour session must not be able to turn itself into a permanent key
+    or a second factor the owner does not hold."""
+    model_config = {"extra": "forbid"}
+
+    current_password: str = Field(min_length=1, max_length=72)
+
+
 class ApiKeyResponse(BaseModel):
     api_key: str  # Raw key — shown once, then lost
 

@@ -297,7 +297,9 @@ async def test_new_count_may_exceed_a_watchdog_zeroed_record_count(
 
     body = await _results(client, job_id, starter_token)
     assert body["new_count"] == 3      # the rows really are there
-    assert body["total"] == 3
+    # ...but a re-queued run is not `done`, so it lists none of them until the
+    # retry finalizes and bills (audit 2026-09-25, N-03).
+    assert body["total"] == 0 and body["items"] == []
     job_resp = await client.get(
         f"/jobs/{job_id}", headers={"Authorization": f"Bearer {starter_token}"}
     )
@@ -309,7 +311,9 @@ async def test_cancelled_job_still_reports_its_persisted_rows(
     scraper_config: ScraperConfig,
 ):
     """A cancelled job can hold rows it never billed for. The results surface
-    describes what is persisted; it does not claim they were charged."""
+    describes what is persisted; it does not claim they were charged, and it does
+    not hand them over either (audit 2026-09-25, N-03: a run that is not `done`
+    delivered nothing, the rule segments adopted on 2026-09-08)."""
     job_id = await _done_job(starter_user, scraper_config, record_count=0)
     await _add_rows(job_id, starter_user.id, [{"duplicate": False}] * 2)
     async with _db_session.AsyncSessionLocal() as s:
@@ -319,7 +323,7 @@ async def test_cancelled_job_still_reports_its_persisted_rows(
 
     body = await _results(client, job_id, starter_token)
     assert body["new_count"] == 2
-    assert body["total"] == 2
+    assert body["total"] == 0 and body["items"] == []
 
 
 async def test_all_over_quota_job_downloads_a_header_only_csv_not_a_404(

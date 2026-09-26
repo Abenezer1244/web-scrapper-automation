@@ -1,6 +1,7 @@
 """Auth hardening: token blacklist + brute-force protection (Redis-backed)."""
 
 import logging
+import time
 from datetime import datetime
 
 import redis.asyncio as aioredis
@@ -79,9 +80,51 @@ class TokenBlacklist:
         """
         r = _get_redis()
         key = f"{TokenBlacklist._KEY_PREFIX}{jti}"
-        # redis-py returns True when the key was set, None when NX failed.
-        result = await r.set(key, "1", nx=True, ex=expires_in_seconds)
+        # redis-py returns True when the key was set, None when NX failed. The
+        # value records WHEN it was consumed, so a later replay can tell a race
+        # (recent) from reuse (old) without trusting the replayer (A-5).
+        result = await r.set(key, f"c:{int(time.time())}", nx=True, ex=expires_in_seconds)
         return result is not None
+
+    @staticmethod
+    async def consumed_at(jti: str) -> int | None:
+        """When this jti was consumed, or None if unknown.
+
+        Unknown covers a jti blacklisted by logout ("1") and one consumed before
+        timestamps were recorded; neither may be read as proof of reuse.
+        """
+        r = _get_redis()
+        raw = await r.get(f"{TokenBlacklist._KEY_PREFIX}{jti}")
+        if isinstance(raw, bytes):
+            raw = raw.decode()
+        if isinstance(raw, str) and raw.startswith("c:") and raw[2:].isdigit():
+            return int(raw[2:])
+        return None
+
+    # ─── Session families (A-1 / A-5) ─────────────────────────────────────────
+    # Every login mints a family id carried through every rotation of its
+    # access/refresh pair. Revoking the family ends that one session everywhere
+    # it was copied, without touching the user's other sessions. Held for the
+    # longest refresh lifetime plus clock-skew margin, so no token of the
+    # family can outlive its revocation.
+    _FAMILY_PREFIX = "bl:fam_revoked:"
+    FAMILY_REVOCATION_TTL = 7 * 24 * 3600 + 3600
+
+    @staticmethod
+    async def revoke_family(fam: str) -> None:
+        """Raises on Redis error: the caller must not report a revocation it did not make."""
+        r = _get_redis()
+        await r.setex(
+            f"{TokenBlacklist._FAMILY_PREFIX}{fam}", TokenBlacklist.FAMILY_REVOCATION_TTL, "1"
+        )
+
+    @staticmethod
+    async def is_family_revoked(fam: str | None) -> bool:
+        """Fails CLOSED like is_blacklisted: a Redis error propagates (503)."""
+        if not fam:
+            return False
+        r = _get_redis()
+        return bool(await r.exists(f"{TokenBlacklist._FAMILY_PREFIX}{fam}"))
 
     # ─── Replay grace window (single-use rotation, concurrent clients) ────────
     # Single-use rotation is correct but brittle for a browser: one page load
@@ -673,3 +716,83 @@ class BruteForceProtection:
                 "BruteForceProtection.clear skipped (Redis error) ip=%s email_fp=%s: %s",
                 ip, email_fingerprint(email), exc,
             )
+
+
+class MfaFailureGuard:
+    """Per-account lockout for second-factor guesses (audit 2026-09-25, A-3).
+
+    The minute-bucket rate limit alone let an attacker who already holds the
+    password guess ~14,000 TOTP codes a day with three valid at any moment,
+    about a 4% daily success rate, and never be locked out. Five failures
+    within an hour now lock verification for the account for 15 minutes, and
+    a locked account is refused even for a correct code. A success clears it.
+
+    Keyed by user id, never IP: IP keys are not load-bearing in production
+    (F-01). Fails OPEN on Redis errors, like BruteForceProtection above: it is
+    defence in depth, and the per-user rate limit still applies.
+    """
+
+    _FAIL_PREFIX = "mfa_fail:"
+    _LOCK_PREFIX = "mfa_lock:"
+    MAX_FAILURES = 5
+    FAILURE_WINDOW_SECONDS = 3600
+    LOCK_SECONDS = 900
+
+    @staticmethod
+    async def ensure_not_locked(user_id: str) -> None:
+        try:
+            ttl = await _get_redis().ttl(f"{MfaFailureGuard._LOCK_PREFIX}{user_id}")
+        except redis_exceptions.RedisError as exc:
+            _logger.warning("MfaFailureGuard.ensure_not_locked fail-open (Redis error): %s", exc)
+            return
+        if ttl and ttl > 0:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Too many incorrect codes. Try again later.",
+                headers={"Retry-After": str(ttl)},
+            )
+
+    # One atomic step: count the failure, keep the window sliding, and lock at
+    # the threshold. Separate calls could leave a counter with no expiry after a
+    # partial failure, locking an account on failures spread over days (Codex).
+    _RECORD_FAILURE_LUA = """
+    local n = redis.call('INCR', KEYS[1])
+    if n == 1 then
+        -- A fixed window from the FIRST failure: failures an hour apart must
+        -- not accumulate into a lock over several hours (Codex).
+        redis.call('EXPIRE', KEYS[1], tonumber(ARGV[1]))
+    end
+    if n >= tonumber(ARGV[2]) then
+        redis.call('SETEX', KEYS[2], tonumber(ARGV[3]), '1')
+        redis.call('DEL', KEYS[1])
+    end
+    return n
+    """
+
+    @staticmethod
+    async def record_failure(user_id: str) -> None:
+        try:
+            await _get_redis().eval(
+                MfaFailureGuard._RECORD_FAILURE_LUA,
+                2,
+                f"{MfaFailureGuard._FAIL_PREFIX}{user_id}",
+                f"{MfaFailureGuard._LOCK_PREFIX}{user_id}",
+                MfaFailureGuard.FAILURE_WINDOW_SECONDS,
+                MfaFailureGuard.MAX_FAILURES,
+                MfaFailureGuard.LOCK_SECONDS,
+            )
+        except redis_exceptions.RedisError as exc:
+            _logger.warning("MfaFailureGuard.record_failure skipped (Redis error): %s", exc)
+
+    @staticmethod
+    async def clear(user_id: str) -> None:
+        """After a verified factor. Drops the lock too: a concurrent wrong guess
+        may have created one after this request passed ensure_not_locked, and a
+        user who just proved the factor must not be left locked out (Codex)."""
+        try:
+            await _get_redis().delete(
+                f"{MfaFailureGuard._FAIL_PREFIX}{user_id}",
+                f"{MfaFailureGuard._LOCK_PREFIX}{user_id}",
+            )
+        except redis_exceptions.RedisError as exc:
+            _logger.warning("MfaFailureGuard.clear skipped (Redis error): %s", exc)

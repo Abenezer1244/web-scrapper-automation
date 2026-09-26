@@ -10,7 +10,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.auth import verify_password
-from src.api.middleware import audit_log, rate_limit
+from src.api.middleware import MfaFailureGuard, audit_log, rate_limit
 from src.api.schemas import (
     MfaDisableRequest,
     MfaEnableRequest,
@@ -145,6 +145,10 @@ async def mfa_disable_for_user(
     if not verify_password(body.password, user.password_hash):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Password is incorrect.")
 
+    # The same per-account second-factor lockout as the MFA login (A-3), or this
+    # endpoint would be a second place to guess TOTP codes against the account.
+    await MfaFailureGuard.ensure_not_locked(user.id)
+
     # Second factor: TOTP, else an unused backup code. The TOTP must be REPLAY-
     # FRESH (counter strictly newer than the last consumed) — disabling MFA is a
     # sensitive 2nd-factor check, so a TOTP already used at login can't be
@@ -168,7 +172,9 @@ async def mfa_disable_for_user(
         )).scalars().all()
         ok = any(verify_backup_code_hash(body.code, c.code_hash) for c in unused)
     if not ok:
+        await MfaFailureGuard.record_failure(user.id)
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid MFA code.")
+    await MfaFailureGuard.clear(user.id)
 
     user.mfa_enabled = False
     user.mfa_secret_encrypted = None

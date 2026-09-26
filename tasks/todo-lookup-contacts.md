@@ -1187,6 +1187,188 @@ probate script's caller behaviour (its SQL guards are tested; the callers are ro
 - **1b-1b-iii PAUSE STATE**: resume-time query, Redis publish with heartbeat, beat interval
   setting, `scheduler.py`, tests.
 
+## Phase 1b-1b-ii — the CREDIT-WEIGHTED hard cap (PLAN, 2026-09-25, pre-Codex-consult)
+
+Branch `feat/lookup-1b1b-cap` off `2275c2de` (1b-1b-i live). Owner decisions: unit = CREDITS
+(normal=1, advanced=2), per account AND global; three PRs. Codex findings it must satisfy:
+C5, C6, C7, C11, C12, C13, C14, plus 16-4, 16-5, 15-11.
+
+### Facts (post-1b-1b-i)
+- `pending.submitted_at` is the claim time for every row attached to an accepted queue, and
+  is cleared only by a proven-uncharged release (1b-1b-i). Unknown-outcome `submitting`
+  rows keep it, so they count as spent.
+- A claim pass handles ONE trace_type (`for trace_type in ("normal", "advanced")`), so inside
+  a pass every row costs the same `c` (1 or 2). Credit allowances become ROW limits by integer
+  division: `rows = floor(credits_remaining / c)`. No mixed-cost knapsack inside a pass.
+- `pending_skip_trace_rows` has no index on `submitted_at` (only `(status, trace_type,
+  enqueued_at)` and `(action_id, user_id)`). Prod held 941 rows on 2026-09-20; 1c actions add
+  up to 2000 each.
+
+### Design
+1. **Weight** `credits(trace_type)` = 2 for `advanced`, else 1 — the SAME map as
+   `_CREDITS_PER_ROW` (reused, not duplicated). Spent = `sum(weight)` over rows with
+   `submitted_at >= now() - 24h`, globally and per `user_id`, in ONE query.
+2. **In-lock read** (16-4, 15-11): inside each claim pass, after `pg_try_advisory_xact_lock`,
+   before selecting. `global_rows = min(5000, floor((G - global_spent) / c))` (unbounded side
+   when G = 0); per account `floor((A - spent_u) / c)` (unbounded when A = 0). Every earlier
+   claim is committed with its `submitted_at`, so the next pass, the next batch and the next
+   tick all see it. The pre-lock check at the top of the tick stays only as the cheap early
+   exit + ops alert, computed by the SAME helper.
+3. **Fair selection** (16-5): the existing eligibility select (every predicate unchanged)
+   becomes a subquery with `row_number() OVER (PARTITION BY user_id ORDER BY enqueued_at, id)
+   AS rn`; keep `rn <= account_rows(user_id)`; order `(rn, enqueued_at, id)`; limit
+   `global_rows`. Outer: `SELECT ... WHERE id = ANY(:ids) FOR UPDATE OF pending SKIP LOCKED`.
+4. **Refill loop** (C5, C6): after the lock and the Python filters (withdrawn / unsubmittable /
+   held in flight), if fewer rows survived than the allowance and some were dropped or skipped,
+   re-run the fair select EXCLUDING every id already considered, with each account's and the
+   global allowance reduced by what already survived, until the allowance is filled or no new
+   candidate exists (R3), with the in-flight hold run over ALL survivors so far (R2). All in the same
+   locked transaction; nothing added after the cap is applied can exceed it, because each round
+   is computed against the remaining allowance.
+5. **Settings**: `SKIP_TRACE_DAILY_CREDIT_CAP` (global) and `SKIP_TRACE_ACCOUNT_DAILY_CREDIT_CAP`,
+   `int | None = None` (R9): `None` = unset, explicit `0` = disabled. The old
+   `SKIP_TRACE_DAILY_ROW_CAP` stays readable for ONE release: if the new global is `None` and the
+   old is set, the old value is used as credits and a WARNING is logged ONCE per process naming
+   the change (1000 rows becomes 1000 credits = 500 advanced rows).
+   **Owner sets the production values before deploy.**
+6. **Migration 102** (its own PR, first): a partial index `(submitted_at) INCLUDE (user_id,
+   trace_type) WHERE submitted_at IS NOT NULL`, built CONCURRENTLY, restart-safe like 100/101;
+   plus a trigger forbidding a change of `trace_type` once `submitted_at` or
+   `tracerfy_queue_id` is set (the weight of spent money must not be rewritable; 1b-1b-i made
+   this an application invariant only).
+7. **Not touched**: the claim commit, the POST, releases, bookkeeping, reconciliation (1b-1b-i
+   froze them, C12). The unknown-outcome state machine is unchanged.
+
+### Split (5-file rule)
+- **1b-1b-ii-a**: migration 102 + models + `alembic/env.py` + tests (4 files). EXPLAIN (ANALYZE, BUFFERS) of the
+  spent query and the fair select on a seeded 100k-row test DB, before and after, as the gate.
+- **1b-1b-ii-b**: NEW `src/workers/skip_trace_capacity.py` (weights, the spent read, the fair
+  select, the refill), `skip_trace_dispatcher.py`, `settings.py`, `.env.example`, NEW
+  `tests/test_skip_trace_credit_cap.py`, with the legacy `tests/test_skip_trace_daily_cap.py`
+  tests folded in (R11): 5 files. `alembic/env.py` belongs to ii-a (R6), not here.
+
+### Tests (ii-b)
+- [ ] Account at its cap: none of its rows claimed; others are. Below by k credits: exactly
+      `floor(k/c)` rows.
+- [ ] Weighting: an account 1 credit below its cap gets 1 normal row and 0 advanced rows.
+- [ ] Global hard: two ticks on two connections never exceed `G` together; two batches in one
+      tick neither.
+- [ ] Unknown-outcome `submitting` counts; released (NULL) does not; 24h+1s no longer counts.
+- [ ] Fairness: one tenant with a 6000-row backlog enqueued first + four later tenants: all in
+      the first batch.
+- [ ] Refill: a tenant whose rn=1 row is permanently held still gets rows 2..k; a locked head
+      row is replaced.
+- [ ] Both caps 0: up to 5000 rows claimed as today; only the ORDER changes.
+- [ ] Deprecated-setting fallback + its warning.
+- [ ] Mutations: read moved back outside the lock (race test fails); `rn` removed from ORDER BY
+      (fairness fails); refill removed (held-head fails); weight 2 -> 1 (weighting fails).
+
+### Pre-code consult on 1b-1b-ii (2026-09-25): PLAN: REVISE, 3 P1 + 7 P2 + 1 P3, all accepted
+Output: `<scratchpad 0f367d2a>/codex_1b1bii_consult_out.txt`. Confirmed sound: the in-lock read
+makes the cap hard for DISPATCHER spend (overlapping ticks, batches, partial 402, adoption);
+per-pass cost is constant; the partial index shape fits. SUPERSEDES the matching bullets above:
+- **R1 (P1, VERIFIED, wider than reported) five scripts spend OUTSIDE the dispatcher.**
+  `scripts/sprint4_all_counties.py`, `sprint4_phase3_advanced.py`, `sprint4_phase3_king_pf.py`,
+  `sprint4_phase3_preforeclosure.py`, `sprint4_phase3_verify.py` call `submit_batch()` directly:
+  no lock, no pending row, no cap. Sprint 4 experiments. **Hard-disable all five** (the 1a
+  precedent: `sprint4_enqueue_existing.py`): body deleted, running it prints the reason and
+  exits 1. Own tiny PR, first: it is the only thing that makes "hard cap" a true statement.
+  **DONE in ii-0**; Codex confirmed the dispatcher is then the only code path that spends.
+- **R2 (P1) the in-flight hold must be CUMULATIVE across refill rounds.** `_hold_answers_in_flight`
+  only sees the current list; a refill row can share an address with an earlier round's survivor
+  and go out in the same batch (paid twice, answered by neither). Each round runs the hold
+  against (earlier survivors + new rows). Regression test: a duplicate that only appears in a
+  refill round.
+- **R3 (P1) refill runs until the allowance is filled or NO new candidate exists**, not 3 rounds:
+  15,001 blocked rows would otherwise starve the row behind them forever. Each round excludes
+  every id already considered, so it terminates. Test: more blocked rows than one round's limit
+  (the round size is a parameter so the test can make it small).
+- **R4 (P2)** unknown `trace_type` must not count as 1 credit: migration 102 adds
+  `CHECK (trace_type IN ('normal','advanced'))` (guarded: aborts if a row violates it), and the
+  weight lookup raises on an unknown type instead of defaulting.
+- **R5 (P2)** fairness is documented as "fair whenever a batch can hold one row per eligible
+  account"; with less global headroom than that the earliest `rn=1` rows win. Low-headroom test
+  pins the documented behaviour.
+- **R6 (P2)** the index lives in the migration AND in `alembic/env.py` `CONCURRENT_INDEXES`, so
+  autogenerate never proposes a blocking plain index.
+- **R7 (P2) DECISION: fixed weight map + trigger** (smallest correct). The trigger refuses a
+  `trace_type` change when the OLD or the NEW row carries `submitted_at` or `tracerfy_queue_id`
+  (covers a single UPDATE that sets both). A per-row credit snapshot is recorded as the upgrade
+  if the price map ever changes.
+- **R8 (P2)** 102 follows 100/101: identity-checked CONCURRENT index with invalid-corpse
+  cleanup under the migrate.py advisory lock, drop/create-idempotent trigger, CHECK added
+  `NOT VALID` then validated. Lands (and is verified by the objects) before the cap code.
+- **R9 (P2)** `SKIP_TRACE_DAILY_CREDIT_CAP: int | None = None`: `None` = fall back to the legacy
+  row setting, explicit `0` = disabled. Warn once per process, not every tick.
+- **R10 (P2, carried into iii)** resume time under weights = expiry of the oldest row at which
+  the CUMULATIVE weight frees enough credits, not the `(spent-cap+1)`-th row; mixed-weight tests.
+  The capacity helper exposes a pure `credits_for(trace_type)`; the API cannot reuse the worker's
+  query (no grant on the queue), so the quote stays advisory and re-read at confirm.
+- **R11 (P3)** the legacy cap tests fold into the new test file (ii-b stays at 5 files).
+
+### Revised order for 1b-1b-ii
+1. **ii-0** hard-disable the five spending scripts (5 files, no code path change).
+2. **ii-a** migration 102 (index + CHECK + trigger) + `alembic/env.py` + tests; EXPLAIN gate.
+3. **ii-b** the cap: `skip_trace_capacity.py`, dispatcher, settings, `.env.example`, tests.
+
+**ii-0 BUILT** (PR #359): the five scripts retired; Codex REVISE -> GO.
+
+**ii-a BUILT (2026-09-25), before Codex diff review.** `alembic/versions/102_...`, `models.py`,
+`alembic/env.py`, `tests/test_pending_skip_trace_weight.py` (4 files).
+- 8 tests: unknown type refused; a spent row cannot be retyped (claimed, accepted, and the legacy
+  errored-with-queue-id shape); retyping while stamping the spend in ONE update refused; an unsent
+  row may still change type (the probate name refresh); the claim and bookkeeping updates are not
+  blocked; the index has the shape the cap reads.
+- Mutations, each caught (run by hand, not checked in): trigger dropped (4 fail), CHECK dropped,
+  trigger checking only the OLD row.
+- Replay from four half-applied states (run by hand, not checked in: index only; index + NOT
+  VALID check; a same-named index of the wrong shape; one on the wrong key): every one converged
+  to exactly the right objects. Unknown-type abort: exits with the instruction and leaves NO index
+  behind; clean after removal.
+- **EXPLAIN gate at 100,000 spent rows (1,666 in the window, 50 accounts):** with the index a
+  Bitmap Index Scan, **4.2 ms**; without it a Seq Scan, **38.8 ms**. The cost now follows the
+  window, not the table. Seeded and measured inside one transaction, rolled back.
+
+**Codex ii-a diff review (2026-09-25): NO-GO.** One P1 and four P2s, all addressed 2026-09-26:
+- P1 UNVERIFIED precondition: the 941-row count never showed the trace_type distribution, and
+  102 aborts on ANY unknown historical value. Fix: read-only prod `GROUP BY trace_type` preflight
+  BEFORE merge. **DONE 2026-09-26 (owner-run, worker role, read-only):** advanced 440 (435 with
+  submission evidence), normal 501 (499); UNKNOWN = 0; all 941 rows visible to the role. Server
+  PostgreSQL 17.6 (>= 14 for CREATE OR REPLACE TRIGGER). No 102 object present yet.
+  `alembic_version` is not readable by that role (returned no row), so it was not checked there.
+- P2 trigger bypass: `BEFORE UPDATE OF trace_type` misses a later BEFORE trigger rewriting
+  NEW.trace_type, and any statement whose SET list omits the column. Fix: `AFTER UPDATE ... FOR
+  EACH ROW WHEN (OLD.trace_type IS DISTINCT FROM NEW.trace_type)`. It sees the final row, and the
+  WHEN keeps the dispatcher's status updates free. `CREATE OR REPLACE TRIGGER` (PG14+; local 16.14).
+- P2 index identity missed access method, order, collation and opclass. Fix: compare the whole
+  `pg_get_indexdef()` to `_INDEX_DEF`, plus indisvalid.
+- P2 CHECK idempotence was name-only. Fix: `contype = 'c'` and `pg_get_constraintdef()` must equal
+  `_CHECK_DEF`, else ABORT (never drop it: it may be something else's).
+- P2 lock held to commit. Fix: after the read-only guard everything runs in autocommit, one
+  statement per transaction. Downgrade drops the index only if it is on this table.
+- Checked-in tests added (13 total): upsert retype refused; same-value write allowed; retype by
+  another BEFORE trigger refused; same-named index of another shape rebuilt; same-named CHECK
+  that says something else aborts. Mutation: the pre-fix migration fails 3 of the 5 new tests
+  (the other 2 pin behaviour it already had); a name-only CHECK fails the CHECK test.
+- Replay: downgrade 101, upgrade, upgrade again (no-op) leaves the exact index def, a validated
+  CHECK and exactly one AFTER UPDATE trigger.
+
+**Codex ii-a re-review of d273c25b (2026-09-26): NO-GO.** It verified all four P2 fixes as correct
+(AFTER trigger aborts UPDATE, UPDATE FROM and ON CONFLICT; OR REPLACE swaps BEFORE for AFTER; the
+autocommit restructure is restart-safe and the version stamp lands after upgrade(); identity checks
+complete; downgrade scoped). Open:
+- P1 (unchanged): the prod trace_type preflight, owner-run. The preflight also prints
+  `server_version`: 102 needs PG14+ in production (CI and compose pin 16).
+- P2 test crash-safety: the DDL tests restored state only on exceptions. FIXED: an autouse fixture
+  first puts the schema back exactly as 102 leaves it. Proven from a planted crashed state (index
+  gone, impostor CHECK, leftover test trigger): 13 passed and nothing was left behind.
+- P2 owner-level bypass: DELETE+INSERT with the same id, TRUNCATE, or DISABLE TRIGGER still
+  rewrite effective weight. The runtime roles hold no DELETE/TRUNCATE/DDL on this table
+  (provision_rls_roles.sql), so only the table owner can. **OWNER DECISION (2026-09-26): OUT OF
+  SCOPE.** 102 guards against application and script bugs, not against the table owner, who can
+  drop any trigger anyway. No delete guard, so account-deletion cascades and the retention purge
+  are untouched.
+
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever
       the tab has leads that have never been looked up; when the quote comes back with

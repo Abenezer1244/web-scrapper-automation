@@ -1376,6 +1376,21 @@ class PendingSkipTraceRow(Base):
             "enqueued_at",
         ),
         Index("ix_pending_skip_trace_action", "action_id", "user_id"),
+        # Migration 102. The daily credit cap weighs a row by its type, so only
+        # known types may exist; a trigger there also refuses a type change on a
+        # SPENT row. The partial index serves the cap's rolling-window spent
+        # query, and is built CONCURRENTLY by 102 (listed in alembic/env.py
+        # CONCURRENT_INDEXES, so autogenerate never proposes a blocking build).
+        CheckConstraint(
+            "trace_type IN ('normal', 'advanced')",
+            name="ck_pending_skip_trace_rows_trace_type",
+        ),
+        Index(
+            "ix_pending_skip_trace_spent",
+            "submitted_at",
+            postgresql_include=["user_id", "trace_type"],
+            postgresql_where=text("submitted_at IS NOT NULL"),
+        ),
     )
 
 

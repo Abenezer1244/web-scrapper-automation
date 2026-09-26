@@ -1364,9 +1364,10 @@ complete; downgrade scoped). Open:
   gone, impostor CHECK, leftover test trigger): 13 passed and nothing was left behind.
 - P2 owner-level bypass: DELETE+INSERT with the same id, TRUNCATE, or DISABLE TRIGGER still
   rewrite effective weight. The runtime roles hold no DELETE/TRUNCATE/DDL on this table
-  (provision_rls_roles.sql), so only the table owner can. **OWNER DECISION: accept as out of
-  scope (the owner can drop any trigger anyway), or add a delete guard on spent rows (it must
-  not break account-deletion cascades or the retention purge).**
+  (provision_rls_roles.sql), so only the table owner can. **OWNER DECISION (2026-09-26): OUT OF
+  SCOPE.** 102 guards against application and script bugs, not against the table owner, who can
+  drop any trigger anyway. No delete guard, so account-deletion cascades and the retention purge
+  are untouched.
 
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever

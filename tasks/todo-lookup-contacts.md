@@ -1311,6 +1311,64 @@ per-pass cost is constant; the partial index shape fits. SUPERSEDES the matching
 2. **ii-a** migration 102 (index + CHECK + trigger) + `alembic/env.py` + tests; EXPLAIN gate.
 3. **ii-b** the cap: `skip_trace_capacity.py`, dispatcher, settings, `.env.example`, tests.
 
+**ii-0 BUILT** (PR #359): the five scripts retired; Codex REVISE -> GO.
+
+**ii-a BUILT (2026-09-25), before Codex diff review.** `alembic/versions/102_...`, `models.py`,
+`alembic/env.py`, `tests/test_pending_skip_trace_weight.py` (4 files).
+- 8 tests: unknown type refused; a spent row cannot be retyped (claimed, accepted, and the legacy
+  errored-with-queue-id shape); retyping while stamping the spend in ONE update refused; an unsent
+  row may still change type (the probate name refresh); the claim and bookkeeping updates are not
+  blocked; the index has the shape the cap reads.
+- Mutations, each caught (run by hand, not checked in): trigger dropped (4 fail), CHECK dropped,
+  trigger checking only the OLD row.
+- Replay from four half-applied states (run by hand, not checked in: index only; index + NOT
+  VALID check; a same-named index of the wrong shape; one on the wrong key): every one converged
+  to exactly the right objects. Unknown-type abort: exits with the instruction and leaves NO index
+  behind; clean after removal.
+- **EXPLAIN gate at 100,000 spent rows (1,666 in the window, 50 accounts):** with the index a
+  Bitmap Index Scan, **4.2 ms**; without it a Seq Scan, **38.8 ms**. The cost now follows the
+  window, not the table. Seeded and measured inside one transaction, rolled back.
+
+**Codex ii-a diff review (2026-09-25): NO-GO.** One P1 and four P2s, all addressed 2026-09-26:
+- P1 UNVERIFIED precondition: the 941-row count never showed the trace_type distribution, and
+  102 aborts on ANY unknown historical value. Fix: read-only prod `GROUP BY trace_type` preflight
+  BEFORE merge. **DONE 2026-09-26 (owner-run, worker role, read-only):** advanced 440 (435 with
+  submission evidence), normal 501 (499); UNKNOWN = 0; all 941 rows visible to the role. Server
+  PostgreSQL 17.6 (>= 14 for CREATE OR REPLACE TRIGGER). No 102 object present yet.
+  `alembic_version` is not readable by that role (returned no row), so it was not checked there.
+- P2 trigger bypass: `BEFORE UPDATE OF trace_type` misses a later BEFORE trigger rewriting
+  NEW.trace_type, and any statement whose SET list omits the column. Fix: `AFTER UPDATE ... FOR
+  EACH ROW WHEN (OLD.trace_type IS DISTINCT FROM NEW.trace_type)`. It sees the final row, and the
+  WHEN keeps the dispatcher's status updates free. `CREATE OR REPLACE TRIGGER` (PG14+; local 16.14).
+- P2 index identity missed access method, order, collation and opclass. Fix: compare the whole
+  `pg_get_indexdef()` to `_INDEX_DEF`, plus indisvalid.
+- P2 CHECK idempotence was name-only. Fix: `contype = 'c'` and `pg_get_constraintdef()` must equal
+  `_CHECK_DEF`, else ABORT (never drop it: it may be something else's).
+- P2 lock held to commit. Fix: after the read-only guard everything runs in autocommit, one
+  statement per transaction. Downgrade drops the index only if it is on this table.
+- Checked-in tests added (13 total): upsert retype refused; same-value write allowed; retype by
+  another BEFORE trigger refused; same-named index of another shape rebuilt; same-named CHECK
+  that says something else aborts. Mutation: the pre-fix migration fails 3 of the 5 new tests
+  (the other 2 pin behaviour it already had); a name-only CHECK fails the CHECK test.
+- Replay: downgrade 101, upgrade, upgrade again (no-op) leaves the exact index def, a validated
+  CHECK and exactly one AFTER UPDATE trigger.
+
+**Codex ii-a re-review of d273c25b (2026-09-26): NO-GO.** It verified all four P2 fixes as correct
+(AFTER trigger aborts UPDATE, UPDATE FROM and ON CONFLICT; OR REPLACE swaps BEFORE for AFTER; the
+autocommit restructure is restart-safe and the version stamp lands after upgrade(); identity checks
+complete; downgrade scoped). Open:
+- P1 (unchanged): the prod trace_type preflight, owner-run. The preflight also prints
+  `server_version`: 102 needs PG14+ in production (CI and compose pin 16).
+- P2 test crash-safety: the DDL tests restored state only on exceptions. FIXED: an autouse fixture
+  first puts the schema back exactly as 102 leaves it. Proven from a planted crashed state (index
+  gone, impostor CHECK, leftover test trigger): 13 passed and nothing was left behind.
+- P2 owner-level bypass: DELETE+INSERT with the same id, TRUNCATE, or DISABLE TRIGGER still
+  rewrite effective weight. The runtime roles hold no DELETE/TRUNCATE/DDL on this table
+  (provision_rls_roles.sql), so only the table owner can. **OWNER DECISION (2026-09-26): OUT OF
+  SCOPE.** 102 guards against application and script bugs, not against the table owner, who can
+  drop any trigger anyway. No delete guard, so account-deletion cascades and the retention purge
+  are untouched.
+
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever
       the tab has leads that have never been looked up; when the quote comes back with

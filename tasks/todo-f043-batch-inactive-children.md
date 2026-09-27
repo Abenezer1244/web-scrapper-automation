@@ -77,7 +77,7 @@ Worktree `C:/Users/Windows/bl-wt/f043`, branch `fix/f043-batch-inactive-children
     a Job, and run_scrape_job never re-checks config.active. OPEN. NO-GO for merge.
   - [P3] test gaps (concurrency, history of deleted children, cross-tenant, persisted reconcile).
 
-## Phase 1b (proposed, needs owner approval): execution-time guard
+## Phase 1b (approved 2026-09-26, DONE): execution-time guard
 - Rejected: SELECT ... FOR UPDATE on the children. Under RLS, FOR UPDATE returns only rows that
   also pass the UPDATE policy. This repo does not define the worker role's policy on
   scraper_configs, so it could silently drop every child in production (every batch "done" with
@@ -89,3 +89,19 @@ Worktree `C:/Users/Windows/bl-wt/f043`, branch `fix/f043-batch-inactive-children
   the preview path that did was removed in #128.
 - Tests: a pending Job whose config is deleted after dispatch is cancelled and never scraped; a
   paused config's Job is cancelled; an active config still runs.
+
+## Phase 1b review (2026-09-26)
+- Built: skip_reason_for_config() plus a check in run_scrape_job right after the claim. A job
+  whose scraper is deleted or plan-paused ends through _fail_job with a plain reason, before any
+  scrape. _fail_job releases any reserved quota; no job_failed notification is emitted (those are
+  emitted explicitly at other call sites, never by _fail_job).
+- Red then green: 4 new tests fail on the Phase 1a commit (the jobs ran on until connector
+  lookup, which only a no-connector test county stops) and pass here. The tests use a county with
+  no connector, so they can never reach a live county site on any branch.
+- Full suite in 4 batches: 4,651 passed, 2 skipped, 0 failed. ruff clean.
+- Codex: GATE: PASS, its P1 resolved. Remaining:
+  - [P2] a skipped batch child counts as failed, so the run can read "partial". Accepted for now;
+    the proper "skipped" status is the Phase 2 status-model change.
+  - [P2] misleading failure notification: does not apply, verified in code (see above).
+  - [P3] a delete that lands between this check and the scrape (milliseconds) can still run once.
+    Inherent to a lock-free check; the queued-job race it was built for is closed.

@@ -344,3 +344,101 @@ async def test_deleting_a_paused_scraper_clears_the_pause_so_upgrade_cannot_revi
         plan,
     )
     assert row.id not in revive_ids
+
+
+# ── F-043 Phase 1b: the job runner re-checks the scraper when the job starts ──
+# A delete or pause can land after a Job was created (Codex P1: between the
+# fan-out's read and its commit, or any job queued earlier). These jobs use a
+# county with NO connector on purpose: if the guard were missing, the run would
+# stop at connector lookup (UnsupportedCountyError) instead of scraping a live
+# county site, so the tests can never reach the network, on this branch or main.
+
+_NO_CONNECTOR_COUNTY = "f043-no-connector"
+_DELETED_MSG = "This scraper was deleted, so this run was skipped."
+_PAUSED_MSG = "This scraper is paused on your current plan, so this run was skipped."
+
+
+def test_skip_reason_for_config_decides_from_active_and_pause():
+    from src.workers.tasks import skip_reason_for_config
+
+    assert skip_reason_for_config(True, None) is None
+    assert skip_reason_for_config(False, None) == _DELETED_MSG
+    assert skip_reason_for_config(False, PAUSED_REASON_ENTITLEMENT) == _PAUSED_MSG
+    # A contradictory row (active, reason still set) is not run either.
+    assert skip_reason_for_config(True, PAUSED_REASON_ENTITLEMENT) == _PAUSED_MSG
+
+
+def _pending_job_for(db: Session, user_id: str, *, active: bool, paused_reason) -> str:
+    cfg = ScraperConfig(
+        id=str(uuid.uuid4()), user_id=user_id, name="runner guard",
+        county=_NO_CONNECTOR_COUNTY, state="WA", record_type="probate",
+        fields=[], enrichment=[], schedule={}, deliver={},
+        active=active, paused_reason=paused_reason,
+    )
+    db.add(cfg)
+    db.flush()
+    job = Job(
+        id=str(uuid.uuid4()), user_id=user_id, scraper_config_id=cfg.id,
+        status="pending", trigger="manual",
+    )
+    db.add(job)
+    db.commit()
+    return job.id
+
+
+def _run(job_id: str) -> Job:
+    from src.workers.tasks import run_scrape_job
+
+    run_scrape_job(job_id)
+    with SyncSessionLocal() as db:
+        return db.query(Job).filter(Job.id == job_id).one()
+
+
+def test_runner_skips_a_job_whose_scraper_was_deleted_after_it_was_queued():
+    with SyncSessionLocal() as db:
+        user = _user(db)
+        job_id = _pending_job_for(db, user.id, active=False, paused_reason=None)
+
+    job = _run(job_id)
+
+    assert job.status == "failed"
+    assert job.error_message == _DELETED_MSG
+    assert job.record_count == 0
+
+
+def test_runner_skips_a_job_whose_scraper_was_paused_after_it_was_queued():
+    with SyncSessionLocal() as db:
+        user = _user(db)
+        job_id = _pending_job_for(
+            db, user.id, active=False, paused_reason=PAUSED_REASON_ENTITLEMENT
+        )
+
+    job = _run(job_id)
+
+    assert job.status == "failed"
+    assert job.error_message == _PAUSED_MSG
+
+
+def test_batch_child_deleted_after_the_fan_out_is_not_scraped():
+    """The Codex P1 race end to end: the fan-out creates the child's Job, the
+    user deletes the child, then the worker picks the Job up."""
+    with SyncSessionLocal() as db:
+        user = _user(db)
+        batch_id = _batch_with_pending_run(db, user.id, n_children=1)
+        (child,) = _children(db, batch_id)
+        child.county = _NO_CONNECTOR_COUNTY
+        db.commit()
+
+    _dispatch(batch_id)
+    with SyncSessionLocal() as db:
+        run = db.query(BatchRun).filter(BatchRun.batch_id == batch_id).one()
+        assert run.status == "running"
+        (job_id,) = run.child_job_ids
+        (child,) = _children(db, batch_id)
+        _delete(child)
+        db.commit()
+
+    job = _run(job_id)
+
+    assert job.status == "failed"
+    assert job.error_message == _DELETED_MSG

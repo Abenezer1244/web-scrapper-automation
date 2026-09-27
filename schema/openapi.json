@@ -3251,6 +3251,59 @@
         "title": "ResultsPage",
         "type": "object"
       },
+      "RunEligibilityResponse": {
+        "description": "Whether the account may start billable work (``src.api.quota.run_eligibility``).\n\nAccount-level codes only. ``resumes_at`` is set only for an ``over_limit``\naccount whose quota will reset by itself; ``frozen`` and ``ended`` need\nthe customer to act, so they never carry one.",
+        "properties": {
+          "can_run": {
+            "title": "Can Run",
+            "type": "boolean"
+          },
+          "code": {
+            "anyOf": [
+              {
+                "enum": [
+                  "frozen",
+                  "ended",
+                  "over_limit"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Code"
+          },
+          "message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Message"
+          },
+          "resumes_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resumes At"
+          }
+        },
+        "required": [
+          "can_run"
+        ],
+        "title": "RunEligibilityResponse",
+        "type": "object"
+      },
       "ScheduleConfig": {
         "properties": {
           "date_from": {
@@ -4197,6 +4250,122 @@
           "leads"
         ],
         "title": "TrendPoint",
+        "type": "object"
+      },
+      "UsageResponse": {
+        "description": "``GET /billing/usage``: record quota over the EFFECTIVE entitlement window.\n\nEvery field is what the gate and the next charge will act on, not the\nstored columns a lazy rollover has not caught up with yet.",
+        "properties": {
+          "entitlement_ends_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Entitlement Ends At"
+          },
+          "next_reset_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Reset At"
+          },
+          "payment_state": {
+            "enum": [
+              "ok",
+              "frozen"
+            ],
+            "title": "Payment State",
+            "type": "string"
+          },
+          "pending_plan": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pending Plan"
+          },
+          "pending_records_limit": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pending Records Limit"
+          },
+          "percent_used": {
+            "title": "Percent Used",
+            "type": "number"
+          },
+          "period_basis": {
+            "const": "entitlement_month_utc",
+            "title": "Period Basis",
+            "type": "string"
+          },
+          "period_start": {
+            "format": "date-time",
+            "title": "Period Start",
+            "type": "string"
+          },
+          "plan": {
+            "title": "Plan",
+            "type": "string"
+          },
+          "records_limit": {
+            "title": "Records Limit",
+            "type": "integer"
+          },
+          "records_remaining": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Records Remaining"
+          },
+          "records_used": {
+            "title": "Records Used",
+            "type": "integer"
+          },
+          "run_eligibility": {
+            "$ref": "#/components/schemas/RunEligibilityResponse"
+          }
+        },
+        "required": [
+          "plan",
+          "records_used",
+          "records_limit",
+          "records_remaining",
+          "percent_used",
+          "period_start",
+          "next_reset_at",
+          "period_basis",
+          "pending_plan",
+          "pending_records_limit",
+          "payment_state",
+          "entitlement_ends_at",
+          "run_eligibility"
+        ],
+        "title": "UsageResponse",
         "type": "object"
       },
       "UserLogin": {
@@ -6167,16 +6336,14 @@
     },
     "/billing/usage": {
       "get": {
-        "description": "Return current plan, record usage, limit, and the ENTITLEMENT WINDOW.\n\nQuota no longer resets on the 1st. It resets on the user's own entitlement\nanniversary — the monthly grid anchored at ``users.quota_anchor_at`` — so a\nsubscriber who starts on the 20th is metered from the 20th and an annual\nsubscriber still gets a fresh month every month.\n\nThe window reported here is the EFFECTIVE one, not the stored pair. Rollover\nis lazy: it happens inside the statement that next charges the user, with an\nhourly reconciliation for people who never transact. Between a boundary and\nwhichever of those comes first, the stored window has legitimately expired,\nand echoing it would tell a user their quota resets on a date that has\nalready passed. ``records_used`` is window-aware for the same reason the\nenforcement gates are — reporting the raw column would show usage they no\nlonger owe.\n\n``payment_state`` is reported separately from usage on purpose: a customer\nfrozen for a failed payment is not \"over their limit\", and sending them to\nthe upgrade page would not fix anything.",
+        "description": "Return current plan, record usage, limit, and the ENTITLEMENT WINDOW.\n\nQuota no longer resets on the 1st. It resets on the user's own entitlement\nanniversary — the monthly grid anchored at ``users.quota_anchor_at`` — so a\nsubscriber who starts on the 20th is metered from the 20th and an annual\nsubscriber still gets a fresh month every month.\n\nThe window reported here is the EFFECTIVE one, not the stored pair. Rollover\nis lazy: it happens inside the statement that next charges the user, with an\nhourly reconciliation for people who never transact. Between a boundary and\nwhichever of those comes first, the stored window has legitimately expired,\nand echoing it would tell a user their quota resets on a date that has\nalready passed. ``records_used`` is window-aware for the same reason the\nenforcement gates are — reporting the raw column would show usage they no\nlonger owe.\n\n``payment_state`` is reported separately from usage on purpose: a customer\nfrozen for a failed payment is not \"over their limit\", and sending them to\nthe upgrade page would not fix anything.\n\n``run_eligibility`` is the same answer every enqueue gate gives\n(``src.api.quota.run_eligibility``), so the page never has to re-derive it\nfrom the fields above.",
         "operationId": "get_usage_billing_usage_get",
         "responses": {
           "200": {
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Get Usage Billing Usage Get",
-                  "type": "object"
+                  "$ref": "#/components/schemas/UsageResponse"
                 }
               }
             },

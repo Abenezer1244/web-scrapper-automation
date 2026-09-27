@@ -8,12 +8,13 @@ from collections.abc import AsyncGenerator
 import redis.exceptions as _redis_exceptions
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
+from fastapi.security import HTTPAuthorizationCredentials
 from sqlalchemy import false, func, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api import sse_leases
-from src.api.auth import CurrentUser
+from src.api.auth import CurrentUser, get_auth_context
 from src.api.deps import get_db, get_rls_db
 from src.api.dialer_filters import dialer_ready_conditions
 from src.api.lead_actionability import actionable_condition, has_address_condition
@@ -439,9 +440,11 @@ async def get_job(
 @router.delete("/{job_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def cancel_job(
     job_id: str,
+    request: Request,
     current_user: CurrentUser,
     db: AsyncSession = Depends(get_rls_db),
 ) -> None:
+    await rate_limit(request, zone="writes", identifier=current_user.id)  # audit #3 S3-09
     # One statement, so the status is checked against the row as it is when the
     # write lands. Checking in Python and then writing by primary key let a cancel
     # that read 'enriching' overwrite the worker's just-committed billed 'done':
@@ -1045,6 +1048,7 @@ async def _attach_delivery_provenance(
 @router.get("/{job_id}/logs")
 async def stream_logs(
     job_id: str,
+    request: Request,
     current_user: CurrentUser,
     db: AsyncSession = Depends(get_rls_db),
 ) -> StreamingResponse:
@@ -1068,6 +1072,9 @@ async def stream_logs(
     user_id = str(current_user.id)
 
     if job.status in _SSE_TERMINAL_STATUSES:
+        # No lease bounds a replay, so the request budget does (audit #3 S3-09):
+        # each call reads and ships every stored log line.
+        await rate_limit(request, zone="general", identifier=current_user.id)
         # A finished job streams nothing live, so it takes no slot. The query
         # filters on user_id itself (C7, see _job_logs_select), so swapping
         # get_rls_db for get_db here would not read across tenants.
@@ -1245,6 +1252,7 @@ async def _stream_stored_log_lines(job_id: str, user_id: str) -> list[str]:
 @router.get("/{job_id}/export-url", tags=["jobs"])
 async def get_export_url(
     job_id: str,
+    request: Request,
     user: CurrentUser,
     db: AsyncSession = Depends(get_rls_db),
     # Phase 4: carry the tax view-filters through so the in-app export flow
@@ -1269,6 +1277,7 @@ async def get_export_url(
     Generates a single-use token (60s) scoped to this job + user.
     The token is safe to put in a URL — it's not the full JWT.
     """
+    await rate_limit(request, zone="export", identifier=user.id)  # audit #3 S3-09
     result = await db.execute(
         select(Job).where(Job.id == job_id, Job.user_id == user.id)
     )
@@ -1317,6 +1326,64 @@ async def get_export_url(
     return {"url": f"/jobs/{job_id}/download?{urlencode(query)}"}
 
 
+async def _user_from_download_token(token: str, job_id: str, db: AsyncSession) -> User:
+    """Resolve the owner of a ``purpose=download`` token, or refuse.
+
+    Strict decode against the download audience only, so a session JWT (audience
+    ``bridgeleads-api``) never authenticates through the query string. Honors
+    both revocation paths a download token can have: its own jti, and the
+    owner's logout-all. Redis being unreachable is a 503, never a pass: without
+    it the token cannot be proven unrevoked.
+    """
+    import jwt as jose_jwt
+    from jwt.exceptions import InvalidTokenError as JWTError
+
+    from src.api.middleware.auth_hardening import TokenBlacklist, revocation_unavailable_503
+
+    try:
+        payload = jose_jwt.decode(
+            token,
+            settings.SECRET_KEY,
+            algorithms=["HS256"],
+            audience="bridgeleads-download",
+            issuer="bridgeleads",
+            options={"require": ["exp", "aud", "iss"]},
+        )
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid or expired download link")
+
+    user_id = payload.get("sub")
+    if payload.get("purpose") != "download" or not user_id:
+        raise HTTPException(status_code=401, detail="Invalid or expired download link")
+    if payload.get("job_id") != job_id:
+        raise HTTPException(status_code=403, detail="Token not valid for this job")
+
+    # A token minted before the iat claim existed: its lifetime is fixed at
+    # issue, so exp - 60 is its issue time (the 60 s /export-url token; the 48 h
+    # emailed links always carry iat).
+    issued_at = payload.get("iat")
+    if issued_at is None:
+        issued_at = max(0, int(payload["exp"]) - 60)
+
+    try:
+        jti = payload.get("jti", "")
+        if jti and await TokenBlacklist.is_blacklisted(jti):
+            raise HTTPException(status_code=401, detail="Token revoked")
+        if await TokenBlacklist.is_revoked_by_user_logout_all(user_id, issued_at):
+            raise HTTPException(status_code=401, detail="Token revoked")
+    except _redis_exceptions.RedisError:
+        raise revocation_unavailable_503()
+
+    # is_active (audit 2026-09-25, D-1): an emailed link lives 48h, and a
+    # deactivated account must not keep downloading through one.
+    user = (
+        await db.execute(select(User).where(User.id == user_id, User.is_active))
+    ).scalar_one_or_none()
+    if user is None:
+        raise HTTPException(status_code=401, detail="User not found")
+    return user
+
+
 @router.get("/{job_id}/download", tags=["jobs"])
 async def download_export(
     job_id: str,
@@ -1349,134 +1416,27 @@ async def download_export(
     Accepts a short-lived download token (from /export-url) OR an Authorization header.
     The download token is scoped to a specific job, expires in 60s, and is safe for URLs.
     """
-    import jwt as jose_jwt
-    from jwt.exceptions import InvalidTokenError as JWTError
-
-    from src.config import settings as app_settings
-
-    # Authenticate: prefer short-lived download token, fall back to Authorization header
-    auth_token = token
-    if not auth_token and request:
-        auth_header = request.headers.get("authorization", "")
-        if auth_header.startswith("Bearer "):
-            auth_token = auth_header[7:]
-
-    if not auth_token:
-        raise HTTPException(status_code=401, detail="Authentication required")
-
-    try:
-        # REDTEAM LOW T1: do not branch security decisions on a token
-        # whose audience/issuer were never verified. pyjwt cannot "try
-        # multiple audiences" in one call, so we first read the
-        # *unverified* claims (signature NOT trusted) only to learn which
-        # kind of token this is, then RE-DECODE with pyjwt natively
-        # enforcing the exact audience + issuer for that kind. A token
-        # that lies about its purpose to dodge the audience check fails
-        # the strict re-decode below.
-        unverified = jose_jwt.decode(
-            auth_token,
-            app_settings.SECRET_KEY,
-            algorithms=["HS256"],
-            options={"verify_exp": True, "verify_aud": False},
+    # Two ways in (audit #3, S3-07). ?token= carries ONLY a job-bound download token
+    # (purpose=download, audience bridgeleads-download), minted by /export-url (60 s)
+    # or by the worker for emailed links; a session JWT there is refused, since bearer
+    # credentials do not belong in URLs, history or access logs. The Authorization
+    # header goes through get_auth_context, the single decode point, so every
+    # revocation it enforces (token blacklist, logout-all, the session family) applies
+    # here too. This route used to re-implement the check, missed the session family,
+    # and kept serving signed-out sessions.
+    if token:
+        user = await _user_from_download_token(token, job_id, db)
+    else:
+        header = request.headers.get("authorization", "") if request else ""
+        scheme, _, credentials = header.partition(" ")
+        if scheme.lower() != "bearer" or not credentials.strip():
+            raise HTTPException(status_code=401, detail="Authentication required")
+        ctx = await get_auth_context(
+            HTTPAuthorizationCredentials(scheme="Bearer", credentials=credentials.strip()), db
         )
-        is_download_token = unverified.get("purpose") == "download"
-        expected_aud = "bridgeleads-download" if is_download_token else "bridgeleads-api"
-        # Strict decode: pyjwt enforces aud + iss (raises if absent/wrong).
-        payload = jose_jwt.decode(
-            auth_token,
-            app_settings.SECRET_KEY,
-            algorithms=["HS256"],
-            audience=expected_aud,
-            issuer="bridgeleads",
-            options={
-                "verify_exp": True,
-                "verify_aud": True,
-                "verify_iss": True,
-                "require": ["exp", "aud", "iss"],
-            },
-        )
-        user_id = payload.get("sub")
-        if not user_id:
-            raise HTTPException(status_code=401, detail="Invalid token")
+        user = ctx.user
 
-        from src.api.middleware.auth_hardening import TokenBlacklist, revocation_unavailable_503
-
-        # Both branches honor BOTH revocation paths:
-        #   1. is_blacklisted(jti) — this specific token was revoked
-        #   2. get_user_revoke_time(user_id) — user clicked "log out
-        #      everywhere"; any token issued before that must be
-        #      rejected, including download tokens. Without #2 a
-        #      user could /logout-all and an attacker holding a
-        #      pre-revocation download link would still be served.
-        #
-        # Reconstruct iat for older download tokens that were minted
-        # before the iat claim was added. We know download tokens have
-        # a fixed 60s lifetime (see download_token mint above), so
-        # `exp - 60` is the exact issuance time. Without this bridge,
-        # any in-flight download token at deploy time would default
-        # iat=0 and be falsely rejected by the user-revoke check
-        # whenever the user has done /logout-all in the last 8 days.
-        # Bridge is harmless after the 60s post-deploy window since
-        # all such legacy tokens have expired.
-        issued_at = payload.get("iat")
-        if issued_at is None:
-            if payload.get("purpose") == "download" and payload.get("exp"):
-                issued_at = max(0, int(payload["exp"]) - 60)
-            else:
-                issued_at = 0
-
-        if payload.get("purpose") == "download":
-            # H6 (full-SaaS review): download tokens must carry the
-            # bridgeleads-download audience + bridgeleads issuer so
-            # they cannot be confused with full session JWTs, and
-            # the jti must not appear in the blacklist (lets us
-            # revoke a specific download link within its 60s TTL
-            # if needed). The pre-H6 grace path that accepted tokens
-            # without aud/iss has been removed — those tokens had a
-            # 60-second lifetime and H6 has been deployed for many
-            # months, so no such tokens can exist anywhere.
-            if (
-                payload.get("aud") != "bridgeleads-download"
-                or payload.get("iss") != "bridgeleads"
-            ):
-                raise HTTPException(
-                    status_code=401, detail="Invalid download token claims"
-                )
-            if payload.get("job_id") != job_id:
-                raise HTTPException(status_code=403, detail="Token not valid for this job")
-            jti = payload.get("jti", "")
-            if jti and await TokenBlacklist.is_blacklisted(jti):
-                raise HTTPException(status_code=401, detail="Token revoked")
-            if await TokenBlacklist.is_revoked_by_user_logout_all(user_id, issued_at):
-                raise HTTPException(status_code=401, detail="Token revoked")
-        else:
-            # Full session JWT — check audience, issuer, blacklist
-            if payload.get("aud") != "bridgeleads-api" or payload.get("iss") != "bridgeleads":
-                raise HTTPException(status_code=401, detail="Invalid token claims")
-            jti = payload.get("jti", "")
-            if jti and await TokenBlacklist.is_blacklisted(jti):
-                raise HTTPException(status_code=401, detail="Token revoked")
-            if await TokenBlacklist.is_revoked_by_user_logout_all(user_id, issued_at):
-                raise HTTPException(status_code=401, detail="Token revoked")
-
-    except JWTError:
-        raise HTTPException(status_code=401, detail="Invalid or expired download link")
-    except _redis_exceptions.RedisError:
-        # Either is_blacklisted call above hit Redis — surface 503 so
-        # the client can retry instead of treating the failure as a
-        # 401-revoked. Same security boundary as the main JWT decoder
-        # in src/api/auth.py: failing open here would silently accept
-        # revoked download tokens.
-        raise revocation_unavailable_503()
-    except HTTPException:
-        raise
-
-    # is_active (audit 2026-09-25, D-1): an emailed link lives 48h, and a
-    # deactivated account must not keep downloading through one.
-    user_result = await db.execute(select(User).where(User.id == user_id, User.is_active))
-    user = user_result.scalar_one_or_none()
-    if not user:
-        raise HTTPException(status_code=401, detail="User not found")
+    await rate_limit(request, zone="export", identifier=user.id)  # audit #3 S3-09
 
     # Set RLS context BEFORE any tenant read so the Job/Result queries get the
     # RLS belt in addition to the explicit user_id filter. This route uses

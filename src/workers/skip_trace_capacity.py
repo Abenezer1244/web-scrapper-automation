@@ -34,11 +34,9 @@ from sqlalchemy import (
     bindparam,
     case,
     cast,
-    column,
     func,
     literal,
     select,
-    values,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, UUID
 
@@ -166,10 +164,17 @@ def allocate(
     if default_rows is None:
         room = None
     elif account_rows:
-        acct = values(
-            column("user_id", UUID(as_uuid=False)), column("rows", Integer),
-            name="acct_room",
-        ).data(list(account_rows.items()))
+        # Two array parameters zipped by unnest, not a VALUES list: the statement
+        # and its parameter count stay fixed however many accounts spent today
+        # (Codex ii-b review round 2).
+        users = list(account_rows)
+        rooms = [account_rows[u] for u in users]
+        acct = func.unnest(
+            cast(bindparam("room_users", users, type_=ARRAY(String)),
+                 ARRAY(UUID(as_uuid=False))),
+            cast(bindparam("room_rows", rooms, type_=ARRAY(Integer)),
+                 ARRAY(Integer)),
+        ).table_valued("user_id", "rows").render_derived(name="acct_room")
         source = eligible.outerjoin(acct, acct.c.user_id == eligible.c.user_id)
         room = func.coalesce(acct.c.rows, default_rows)
     else:

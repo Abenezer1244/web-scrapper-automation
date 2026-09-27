@@ -572,6 +572,38 @@ async def test_the_documented_cutoff_is_room_times_4095(
 # ── Review findings (Codex ii-b diff review) ──────────────────────────────────
 
 
+async def test_per_account_room_is_two_parameters_at_any_tenant_scale(make_account):
+    """Round 2: the room of every account that spent today reaches SQL as two
+    arrays, not one VALUES row per account, so the statement does not grow with
+    the tenant count. And it still decides correctly at that scale."""
+    from sqlalchemy import select as sa_select
+
+    from src.db.models import PendingSkipTraceRow as P
+
+    full, fresh = await make_account(), await make_account()
+    full_rows = [_seed(full) for _ in range(2)]
+    fresh_rows = [_seed(fresh) for _ in range(2)]
+    strangers = {str(uuid.uuid4()): 3 for _ in range(5000)}
+
+    def eligible():
+        return (sa_select(P.id, P.user_id, P.enqueued_at)
+                .where(P.status == "queued", P.id.in_(full_rows + fresh_rows))
+                .subquery("eligible"))
+
+    compiled_params = []
+    with system_sync_session() as db:
+        for rooms in ({full: 0}, {full: 0, **strangers}):
+            class _Capture:
+                def execute(self, stmt, *a, **k):
+                    compiled_params.append(len(stmt.compile().params))
+                    return db.execute(stmt, *a, **k)
+            got = cap.allocate(_Capture(), eligible(), account_rows=rooms, default_rows=1,
+                               lookahead=1, limit=5000)
+            assert set(got) == {fresh_rows[0]}, "room 0 excluded, the default room 1 served"
+
+    assert compiled_params[0] == compiled_params[1], compiled_params
+
+
 async def test_a_row_retyped_between_allocation_and_lock_is_not_claimed_at_the_wrong_price(
         make_account, dispatcher, monkeypatch):
     """P1: 102 lets an UNSENT row change type. One allocated as advanced and

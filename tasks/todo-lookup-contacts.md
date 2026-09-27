@@ -1556,7 +1556,7 @@ wording and test specifications, adopted verbatim, so this closes the consult:
       claims fewer rows, and says so (`refill_truncated`). What degrades is latency for an account
       behind thousands of blocked rows. Prod today: 941 rows in total.
       Fix per S3 = keyset frontier (per-account LATERAL scan from the last row considered), which
-      needs an index `(user_id, trace_type, enqueued_at, id) WHERE status = 'queued'` = migration
+      needs an index `(trace_type, user_id, enqueued_at, id) WHERE status = 'queued'` = migration
       103, plus reading the in-flight set once per pass. **OWNER DECISION (2026-09-26): SHIP ii-b NOW
       with the documented envelope (per-round budget holds to ~35k queued; deeper blocked runs are
       truncated and logged, never over-claimed). The keyset frontier + migration 103 + one in-flight
@@ -1566,7 +1566,148 @@ wording and test specifications, adopted verbatim, so this closes the consult:
 - [x] mutations, each caught: read outside the lock (1 fails); `rn` out of ORDER BY (1); refill
       removed (4); weight 2 -> 1 (5); hold not cumulative (1). Also found and fixed by the tests: an
       account cap with no prior spend crashed `allocate` (a Python int where SQL was needed).
-- [ ] Codex diff review to GO; owner sets prod cap values before merge
+- [x] Codex diff review to GO (3 rounds; P1 retype-between-allocate-and-lock fixed; P2 room VALUES
+      -> unnest); owner delegated the cap values: SKIP_TRACE_DAILY_CREDIT_CAP=2000,
+      SKIP_TRACE_ACCOUNT_DAILY_CREDIT_CAP=500 set on api + worker.
+
+**ii-b MERGED + LIVE 2026-09-27 04:11Z: PR #364 `19230e72`.** Merged after an all-zero quiet check;
+first dispatcher tick on the new code 04:17Z succeeded (1.05 s, no errors, no warnings).
+
+## Phase 1b-1b-ii-c — the keyset frontier (PLAN, 2026-09-27, BEFORE Codex consult)
+
+Why: ii-b's S3 gate fails at 117k queued / 15k held heads (~440 ms per `allocate` round, the pass
+truncated by the deadline after 2 rounds): every round re-ranks EVERY eligible row with a window
+sort that spills to disk, and every round's duplicate hold re-reads the account's in-flight rows.
+Owner: must land before Phase 1c can create large queues. Nothing about cap hardness changes.
+
+**Split (5-file rule), same shape as ii-a / ii-b:**
+- **ii-c-1** migration 103 + `models.py` + `alembic/env.py` + `tests/test_pending_skip_trace_frontier_index.py`.
+- **ii-c-2** `skip_trace_capacity.py` + `skip_trace_dispatcher.py` + `tests/test_skip_trace_credit_cap.py`.
+
+**ii-c-1: migration 103.** `ix_pending_skip_trace_queued_frontier ON pending_skip_trace_rows
+(trace_type, user_id, enqueued_at, id) WHERE status = 'queued'`, CREATE INDEX CONCURRENTLY in
+autocommit, exactly 102's discipline: identity by the whole `pg_get_indexdef()` plus
+`indisvalid`; an invalid or wrong-shaped same-named index on this table is dropped and rebuilt
+(safe only under migrate.py's advisory lock); a same-named index on ANOTHER table aborts. Listed in
+`CONCURRENT_INDEXES`; declared on the model. No CHECK, no trigger, no data change. Downgrade drops
+it only if it sits on this table. Tests: shape, a wrong-shape same-named index rebuilt, replay
+(downgrade 102 -> upgrade -> no-op upgrade), the autouse repair fixture pattern from 102's tests.
+
+**ii-c-2: the keyset `allocate`.** Replaces "re-rank everything minus `considered`" with a
+per-account FRONTIER:
+- Round 0 finds the accounts with queued rows of this type (a loose index scan on the new index:
+  recursive CTE, one probe per account), each with frontier = (-infinity).
+- Each round: `unnest(:users, :after_at, :after_id, :per_account_limit) AS a` CROSS JOIN LATERAL
+  (the dispatcher's eligibility select, unchanged predicates + watermark, `WHERE p.user_id =
+  a.user_id AND (p.enqueued_at, p.id) > (a.after_at, a.after_id) ORDER BY p.enqueued_at, p.id
+  LIMIT a.lim`), `row_number()` over each account's lateral output = rank; order `(rank,
+  enqueued_at, id)`; LIMIT = the round's global limit. Per-account limit = `room * 2**r` (NULL
+  room -> the global limit).
+- Because rank 1 of every account precedes rank 2 of any, the rows returned for an account are a
+  PREFIX of its candidates, so its frontier advances to its last RETURNED row (enqueued_at, id).
+  Rows cut by the global LIMIT are not returned and not passed. An account whose lateral returned
+  fewer than its limit is exhausted and leaves the account list.
+- `considered` (the id-exclusion array) and `_REFILL_MAX_CONSIDERED` are removed: the frontier IS
+  the exclusion and the statement no longer grows with the pass. The count stays in telemetry.
+- Everything else in the pass is ii-b unchanged: lock only if still queued and of this type, the
+  deliverability / submittable filters, the CUMULATIVE hold, `take_within_caps`, 12 rounds / 2 s,
+  the in-lock spend read, READ COMMITTED.
+- **In-flight read once per account per pass:** `_hold_answers_in_flight` takes an optional
+  per-pass cache of each account's in-flight answer keys and queries only accounts not yet in
+  it. Stale in the SAFE direction only: under the claim lock no other tick adds in-flight rows;
+  an ingest finishing mid-pass can only remove one, so a cached key can only hold a row that
+  could have gone (it goes next tick), never let a duplicate through. `_fresh_answers` is still
+  read every round (keyed, cheap).
+- **Gate:** the ii-b S3 script re-run at 117k queued / 15k held heads: every `allocate` round
+  ≤ 250 ms and the refill ≤ 2 s; and at 10k and 35k no worse than ii-b. All ii-b tests pass
+  unchanged except those that named `considered_limit`.
+
+**Risks to check in the consult:** keyset ties (enqueued_at equal: id breaks them; the tuple
+compare must match the ORDER BY exactly); a row whose `enqueued_at` changes mid-pass (VERIFIED
+none: it is set only by the server default at insert; every other use in src/ and scripts/ reads it); rows inserted mid-pass BEHIND a frontier (the watermark again, V1); LIMIT
+with an expression; accounts discovered only after round 0 (none: the watermark fixes the set).
+
+### Codex pre-code consult on ii-c (2026-09-27): PLAN: REVISE, 2 P1 + 3 P2 + 2 P3, all accepted
+Output: `<scratchpad 0ade294c>/codex_iic_consult_out.txt`. Confirmed: the prefix argument is correct
+under ORDER BY (rank, enqueued_at, id) + a global LIMIT; the frontier reproduces ii-b's
+`considered` exclusion; the in-flight cache is safe under current writers (new claims insert
+'queued', skip_trace_claim.py:451-463; only the dispatcher moves rows to submitting/submitted).
+SUPERSEDES the matching bullets above:
+- **F1 (P1)** `allocate()` returns `(id, user_id, enqueued_at)` in order, and each account's
+  frontier advances over EVERY returned row (SKIP LOCKED, withdrawn, unsubmittable, held alike),
+  never only over survivors. Sentinel is typed and never NULL: `'-infinity'::timestamptz` and the
+  all-zero uuid. The tuple compare is exactly `(p.enqueued_at, p.id) > (a.after_at, a.after_id)`,
+  matching `ORDER BY p.enqueued_at, p.id` ASC.
+- **F2 (P1)** Index column order is `(trace_type, user_id, enqueued_at, id) WHERE status =
+  'queued'`: discovery fixes trace_type first, then skips across user_id; the lateral fixes both
+  and walks (enqueued_at, id). The gate must SHOW the loose scan in EXPLAIN on the 117k workload.
+- **F3 (P2)** A short lateral result does NOT retire an account (READ COMMITTED: a job can turn
+  deliverable mid-pass). An account leaves the active set only when a later probe returns ZERO
+  rows. Short results are telemetry only.
+- **F4 (P2)** The `considered_limit` test is replaced by frontier tests: equal timestamps (id
+  tie-break), a global-LIMIT cut (the cut rows come back next round), held heads, locked heads,
+  post-allocation drops.
+- **F5 (P3)** The in-flight cache keeps an explicit "accounts already read" set, so a cached EMPTY
+  result is distinguishable from an unread account. Invariant, written into the code comment: any
+  future writer (the 1b-2 action path) inserts only 'queued' rows through the claim protocol.
+- **F6 (P2)** 103 keeps ALL of 102's discipline (CONCURRENTLY in autocommit, whole-indexdef
+  identity + indisvalid, wrong-shape repair, cross-table collision abort, CONCURRENT_INDEXES,
+  scoped downgrade). Deployment gate: ii-c-1 is merged, applied, and VERIFIED BY THE OBJECT in
+  production before ii-c-2 deploys. Build time: prod holds ~941 pending rows (09-26), so the
+  concurrent build is sub-second; lock_timeout bounds only the waits, as in 102.
+- **F7 (P3)** `ix_pending_skip_trace_dispatch` stays (residual queued scans, e.g. the reconciler
+  path at dispatcher.py:860-865). Dropping it would be its own measured migration.
+
+### Codex consult round 2 on ii-c (2026-09-27): PLAN: REVISE, 1 P1 + 1 P2 + 1 P3
+Output: `<scratchpad 0ade294c>/codex_iic_consult2_out.txt`. F1-F7 verified closed. Codex supplied the
+discovery query it expects to be index-driven (a recursive CTE: `ORDER BY user_id LIMIT 1`, then
+`user_id > u.user_id ... LIMIT 1` per step, with `status='queued' AND trace_type=:t AND
+enqueued_at <= :watermark`), adopted verbatim; the gate EXPLAINs it AND the lateral.
+- **H1 (P1) a row that turns eligible mid-pass can sit BEHIND the frontier.** Accepted as a
+  wording fix; Codex's remedy (materialize the joined eligible set once per pass) REJECTED, with
+  reason: the row is skipped for THIS PASS ONLY. Every pass restarts every frontier at
+  -infinity, so it goes out next tick, which is exactly the outcome Codex's own remedy specifies
+  ("rows becoming eligible after materialization wait for the next tick"). Materializing would
+  also re-introduce a full scan of the eligible set on every pass, the cost ii-c exists to
+  remove. F3 is reworded: a row that becomes eligible mid-pass is taken this pass if it is still
+  ahead of its account's frontier, otherwise next tick; nothing is skipped beyond one pass, and
+  nothing can exceed a cap.
+- **H2 (P2) per-account look-ahead x active accounts is unbounded before the global LIMIT.**
+  Accepted. Per-account lateral limit per round:
+  `L = min(room_left * 2**r  (or unbounded), share * 2**r, global_left)` where
+  `share = ceil(global_left / active_accounts)` and active_accounts counts only accounts with
+  room. So one round produces at most about `global_left * 2**r` candidates in total, whatever
+  the tenant count, and the lateral also stops early when an account runs out. Benchmark added to
+  the gate: 15,000 accounts with queued rows, bounded candidate production per round, and no
+  account starved (each with room gets its first row in round 0 when the batch can hold one per
+  account; R5 otherwise).
+- **H3 (P3) the in-flight cache relies on a comment about future writers.** Accepted as a 1b-2
+  REQUIREMENT, recorded here and carried into 1b-2's plan: the action worker inserts only through
+  `claim_skip_trace_rows` ('queued') under the shared claim protocol, and 1b-2 ships an
+  integration test that no writer can create an in-flight row while a dispatcher pass holds the
+  claim lock. ii-c's cache comment points at that requirement.
+
+### Codex consult round 3 on ii-c (2026-09-27): H1 CLOSED; H2/H3 fixes adopted verbatim -> consult closed
+Output: `<scratchpad 0ade294c>/codex_iic_consult3_out.txt`. Codex confirmed H1 (the one-pass skip is no
+money loss, no permanent starvation, no cap breach; materializing adds a scan and no benefit).
+Frontiers are PASS-LOCAL and never persisted (stated in the code).
+- **H2 corrected.** The last term was `global_left`, which at global_left = 1 inspects only 12 rows
+  per pass (a lead behind 13+ blocked rows could starve forever). Now, per round r:
+  `round_limit = min(BATCH_ROW_LIMIT, global_left * 2**r)` (also the outer LIMIT, as in ii-b) and
+  `L = min(room_left * 2**r (or unbounded), ceil(global_left / active_with_room) * 2**r, round_limit)`.
+  The room * 4095 cutoff (room 1, no earlier deadline) is preserved. Bounds, documented separately:
+  returned rows per round <= round_limit; lateral WORK is O((active_accounts + global_left) * 2**r).
+  Fairness (rank 1 of every account with room before rank 2 of any) holds subject to the
+  global-headroom rule (R5): when active accounts outnumber global_left the rank-1 layer is cut.
+- **H3 carried to 1b-2, exactly:** the action worker calls `lock_job_for_claim()` then
+  `claim_skip_trace_rows()`; no direct queue inserts, never a 'submitting'/'submitted' row; a
+  two-session integration test proves the action path cannot create an in-flight row while
+  `_CLAIM_LOCK_KEY` is held.
+
+### ii-c TO BUILD
+- [ ] ii-c-1: migration 103 + models + env.py + tests; replay; merge; VERIFY THE INDEX IN PROD
+- [ ] ii-c-2: keyset allocate + frontier + in-flight cache + tests; gate at 117k/15k and 15k accounts
+- [ ] Codex diff review each to GO; quiet check before each merge
 
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever
@@ -1647,6 +1788,14 @@ wording and test specifications, adopted verbatim, so this closes the consult:
       is a friendly 503 and nothing is queued.
 
 ## Deferred (logged, not in Phase 1)
+- 🛑 **SAFETY, own small PR, soon (found in the ii-c-1 review, 2026-09-27):** `alembic/env.py`
+  calls `load_dotenv()` and prefers `DATABASE_URL_MIGRATE` over `DATABASE_URL_SYNC`. The test-DB
+  guard (`tests/_db_safety.py`) pins only `DATABASE_URL`/`_SYNC`, so ANY test or script that
+  invokes Alembic through env.py on a machine whose `.env` names a production
+  `DATABASE_URL_MIGRATE` would migrate (or downgrade) PRODUCTION. Same class as the two prod wipes.
+  Fix: the guard also pins (or clears) `DATABASE_URL_MIGRATE`; env.py stops loading `.env`
+  implicitly for non-boot invocations. 103's tests avoid env.py for this reason.
+
 Lookup ledger (Phase 2), canonical leads (Phase 3), DNC flag is never set
 and exports suppress nothing, advanced = 2 credits vs 1 billed row (the D2 follow-up; the gap is
 recorded per action so it can be priced later), re-send email, stale R2 object and batch combined

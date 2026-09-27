@@ -1704,9 +1704,43 @@ Frontiers are PASS-LOCAL and never persisted (stated in the code).
   two-session integration test proves the action path cannot create an in-flight row while
   `_CLAIM_LOCK_KEY` is held.
 
+### ii-c-2 round 0: the watermark misled the planner (2026-09-27)
+Round 0 took 1,172 ms because the walk did NOT use 103. The real plan: an Index Scan of
+`ix_pending_skip_trace_dispatch (status, trace_type, enqueued_at)` with `user_id` as a FILTER,
+64,680 rows removed per account x 50. Cause: the frontier compare gives the planner a derived
+`enqueued_at >= acct.after_at` (unknown value); paired with the watermark `enqueued_at <= const`
+it is a range with one unknown end, priced at a flat 0.5% (~585 rows for the whole queue).
+Rounds >= 1 only looked fast because the old seed stored each account's rows contiguously in
+time. (Adding `user_id` to the lateral's ORDER BY changed nothing: inside the lateral the
+planner already drops it as fixed. Tried and reverted.)
+- **Fix:** the watermark moves OUT of the lateral into `allocate()` (before `row_number()`).
+  Post-watermark rows sort after every earlier row, so dropping them trims a TAIL of each
+  account's walk and the prefix / frontier / retirement argument is unchanged (Codex: PLAN GO).
+  `enable_bitmapscan=off` stays. Same dumped statement, same data: watermark inside 676 ms
+  (bitmaps off) / 1,020 ms (on); outside 286 ms (on) / **1.2 ms (off, Index Scan on 103)**.
+- **Also (profiling the 2 s refill):** `_in_flight_keys` read a blocked account's 15,000
+  in-flight rows as whole ORM rows: 1,331 ms of the refill. Now it selects only the 7 key
+  columns: 266-408 ms (Codex: safe, same keys).
+- **Codex consult r2 (REVISE, all adopted):** B's budget is 500 ms per round (tenant scale,
+  O(accounts) by design; A/C keep 250 ms); the loop checks for a full batch BEFORE the round
+  and deadline limits (a filled batch was logged `refill_truncated reason=deadline`); the
+  `allocate()` comment says psycopg2 still writes the arrays out element by element.
+- **Gate (every EXPLAINed round ASSERTED: 103, no dispatch index, no bitmap, watermark not an
+  index cond; each case contiguous AND interleaved):** worst allocate round / refill.
+  A 117k/50/15k held: 113 / 1.31 s and 131 / 1.33 s; with 500k filler results over 20k done
+  jobs: 118 ms / 1.45 s. C 35k/50/5k: 38 / 1.16 s and 36 / 0.99 s. B 15k accounts x 2: 382 and
+  463 ms (296-372 without EXPLAIN), fairness PASS (5,000 distinct accounts, exactly the
+  earliest first rows, R5). All refills within the deadline; A/C end at the documented 4,095
+  cutoff (round_limit), by design.
+- **Mutations (each caught):** frontier over survivors only; retire on a short result (new
+  test); cache without the `read` set (new test); round_limits last term = global_left;
+  watermark dropped (new test); full-batch check after the limits (new test).
+- **Regression:** credit cap 106 + 103's 19, then the two skip-trace batches and
+  plan_entitlement_audit: 818 passed, 0 failed.
+
 ### ii-c TO BUILD
-- [ ] ii-c-1: migration 103 + models + env.py + tests; replay; merge; VERIFY THE INDEX IN PROD
-- [ ] ii-c-2: keyset allocate + frontier + in-flight cache + tests; gate at 117k/15k and 15k accounts
+- [x] ii-c-1: migration 103 + models + env.py + tests; replay; merge; VERIFY THE INDEX IN PROD
+- [x] ii-c-2: keyset allocate + frontier + in-flight cache + tests; gate at 117k/15k and 15k accounts
 - [ ] Codex diff review each to GO; quiet check before each merge
 
 ## Phase 1c - the action, frontend

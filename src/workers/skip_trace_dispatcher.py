@@ -26,12 +26,15 @@ from src.config import settings
 from src.utils.logger import setup_logger
 from src.workers import app
 from src.workers.skip_trace_capacity import (
-    BATCH_ROW_LIMIT,
+    FRONTIER_START,
+    advance,
     allocate,
     batch_rows,
     credits_for,
+    discover_accounts,
     lock_allocated,
     resolve_caps,
+    round_limits,
     row_allowance,
     spent_credits,
     take_within_caps,
@@ -46,10 +49,6 @@ _SPEND_WINDOW = timedelta(days=1)
 # about log2(k) rounds. Past either bound the pass claims what it has found.
 _REFILL_MAX_ROUNDS = 12
 _REFILL_DEADLINE = timedelta(seconds=2)
-# Most row ids one pass may consider. They are excluded from each later round as ONE
-# array parameter, so the statement stays bounded (Codex ii-b review); past this the
-# pass claims what it has, like the other two bounds.
-_REFILL_MAX_CONSIDERED = 20_000
 
 
 @app.task(name="src.workers.skip_trace_dispatcher.dispatch_pending_skip_trace")
@@ -67,10 +66,8 @@ def dispatch_pending_skip_trace() -> dict:
         _logger.warning("TRACERFY_API_TOKEN missing — dispatcher tick skipped")
         return {"skipped": "no_token"}
 
-    from sqlalchemy import String, all_, and_, bindparam, cast, func, select, text, update
+    from sqlalchemy import and_, func, select, text, tuple_, update
     from sqlalchemy import true as sa_true
-    from sqlalchemy.dialects.postgresql import ARRAY
-    from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 
     from src.api.lead_actionability import DELIVERY_EXCLUDED_KEY, OVER_QUOTA
     from src.api.results_category import skip_trace_eligible_condition
@@ -268,15 +265,19 @@ def dispatch_pending_skip_trace() -> dict:
                 # the pass is the round limit and deadline below.
                 watermark = db.execute(text("SELECT clock_timestamp()")).scalar()
 
-                def _eligible(exclude: set[str], trace_type=trace_type, watermark=watermark):
-                    """Every row that may be bought now, as (id, user_id, enqueued_at).
+                def _candidates(acct, trace_type=trace_type):
+                    """One account's eligible rows after its frontier, as a LATERAL on
+                    `acct` (one row per account: user_id, after_at, after_id, lim).
+                    The watermark is NOT applied here: allocate() applies it after
+                    the walk, where it cannot mislead the planner.
                     Eligibility is decided HERE, in SQL, not after a LIMIT: filtering in
                     Python would let ineligible rows occupy the head and starve
                     everything behind them. A row goes out only once its job delivered
                     (done, or billed whatever status was written over it, or a terminal
                     job from before billing was stamped: _job_delivered_sql) and its
                     lead is still deliverable and still waiting. Tenant-pinned joins:
-                    this runs in a system session."""
+                    this runs in a system session. The walk follows migration 103's
+                    index: (trace_type, user_id) fixed, then (enqueued_at, id)."""
                     return (
                         select(
                             PendingSkipTraceRow.id,
@@ -301,14 +302,12 @@ def dispatch_pending_skip_trace() -> dict:
                             and_(
                                 PendingSkipTraceRow.status == "queued",
                                 PendingSkipTraceRow.trace_type == trace_type,
-                                PendingSkipTraceRow.enqueued_at <= watermark,
-                                # Already considered this pass: ranked out, so the
-                                # next round ranks what is LEFT (S1).
-                                PendingSkipTraceRow.id != all_(cast(
-                                    bindparam("considered_ids", list(exclude),
-                                              type_=ARRAY(String)),
-                                    ARRAY(PG_UUID(as_uuid=False))))
-                                if exclude else sa_true(),
+                                PendingSkipTraceRow.user_id == acct.c.user_id,
+                                # Strictly after the frontier, in exactly the ORDER BY's
+                                # terms, so nothing returned before comes back (F1).
+                                tuple_(PendingSkipTraceRow.enqueued_at,
+                                       PendingSkipTraceRow.id)
+                                > tuple_(acct.c.after_at, acct.c.after_id),
                                 # Empty in the normal case (100 enforced), so this
                                 # is a no-op unless the invariant is actually off.
                                 PendingSkipTraceRow.result_id.notin_(
@@ -328,39 +327,42 @@ def dispatch_pending_skip_trace() -> dict:
                                 _atip_paid_allowed_sql(),
                             )
                         )
-                        .subquery("eligible")
+                        .order_by(PendingSkipTraceRow.enqueued_at, PendingSkipTraceRow.id)
+                        .limit(acct.c.lim)
+                        .lateral("cand")
                     )
 
-                # REFILL (Codex R2, R3, S1, T1, U2). Rounds allocate fairly ranked
-                # candidates, lock them (SKIP LOCKED: another tick's rows are passed
-                # over), filter them, and hold duplicates CUMULATIVELY over everything
-                # found so far. Only rows that survive all of that are charged to an
-                # account's room or the batch, so a blocked head is replaced by the
-                # next row instead of costing its account a turn.
+                # REFILL (Codex R2, R3, S1, T1, U2; keyset since ii-c). Rounds walk each
+                # account's rows from its frontier, lock them (SKIP LOCKED: another
+                # tick's rows are passed over), filter them, and hold duplicates
+                # CUMULATIVELY over everything found so far. Only rows that survive
+                # all of that are charged to an account's room or the batch, so a
+                # blocked head is replaced by the next row instead of costing its
+                # account a turn.
                 rows: list = []
                 withdrawn: list = []
                 unsubmittable: list = []
-                considered: set[str] = set()
+                active = discover_accounts(db, trace_type, watermark)
+                frontier = dict.fromkeys(active, FRONTIER_START)
+                in_flight = _InFlightCache()
                 seen_users: set[str] = set()
-                left_queued = held = 0
+                considered = left_queued = held = 0
                 started = datetime.now(UTC)
                 truncated = None
                 rounds = 0
                 while True:
+                    # A full batch first: it ends the pass with nothing cut, so it must
+                    # not be logged as a truncation even when a limit is also reached.
+                    global_left = global_rows - len(rows)
+                    if global_left <= 0:
+                        break
                     if rounds >= _REFILL_MAX_ROUNDS:
                         truncated = "round_limit"
-                        break
-                    if len(considered) >= _REFILL_MAX_CONSIDERED:
-                        truncated = "considered_limit"
                         break
                     # Never before the first round: a pass always gets one allocation.
                     if rounds and datetime.now(UTC) - started >= _REFILL_DEADLINE:
                         truncated = "deadline"
                         break
-                    global_left = global_rows - len(rows)
-                    if global_left <= 0:
-                        break
-                    look = 2 ** rounds
                     room_left = None
                     if account_room is not None:
                         taken_by_user: dict[str, int] = {}
@@ -369,19 +371,28 @@ def dispatch_pending_skip_trace() -> dict:
                             taken_by_user[u] = taken_by_user.get(u, 0) + 1
                         room_left = {
                             u: max(0, account_room.get(u, default_rows) - taken_by_user.get(u, 0))
-                            for u in set(account_room) | set(taken_by_user)
+                            for u in active
                         }
-                    ids = allocate(
-                        db, _eligible(considered),
-                        account_rows=room_left or {}, default_rows=default_rows,
-                        lookahead=look,
-                        limit=min(BATCH_ROW_LIMIT, global_left * look,
-                                  _REFILL_MAX_CONSIDERED - len(considered)),
+                    limits, round_limit = round_limits(
+                        active, room_left=room_left, default_rows=default_rows,
+                        global_left=global_left, round_no=rounds,
                     )
-                    rounds += 1
-                    if not ids:
+                    if not limits:
                         break
-                    considered.update(ids)
+                    got = allocate(db, _candidates, frontier=frontier, limits=limits,
+                                   round_limit=round_limit, watermark=watermark)
+                    rounds += 1
+                    if not got:
+                        break
+                    considered += len(got)
+                    returned = advance(frontier, got)
+                    if len(got) < round_limit:
+                        # The round's LIMIT did not bind, so an account that returned
+                        # nothing has nothing left this pass. A SHORT positive result
+                        # does not retire it: under READ COMMITTED a job can turn
+                        # deliverable mid-pass (F3).
+                        active = [u for u in active if u not in limits or returned.get(u)]
+                    ids = [c.id for c in got]
                     # Locked only if STILL queued and still this pass's type: an unsent
                     # row may be retyped (102 allows it) between allocate and lock, and
                     # an advanced row sent as normal credits would break the cap (P1).
@@ -400,7 +411,7 @@ def dispatch_pending_skip_trace() -> dict:
                     # One answer, bought once: no second row for an (account, address)
                     # whose lookup is at Tracerfy now or earlier in this batch. Earlier
                     # survivors come first, so they keep their place (R2).
-                    kept, n_held = _hold_answers_in_flight(db, rows + new)
+                    kept, n_held = _hold_answers_in_flight(db, rows + new, cache=in_flight)
                     held += n_held
                     rows = take_within_caps(
                         kept, account_room=account_room, default_rows=default_rows,
@@ -422,8 +433,8 @@ def dispatch_pending_skip_trace() -> dict:
                         "blocked=%d survivors=%d accounts_with_room=%s",
                         truncated, trace_type, rounds,
                         (datetime.now(UTC) - started) / timedelta(milliseconds=1),
-                        global_rows, global_rows - len(rows), len(considered),
-                        len(considered) - len(rows), len(rows), with_room,
+                        global_rows, global_rows - len(rows), considered,
+                        considered - len(rows), len(rows), with_room,
                     )
                 if withdrawn:
                     _logger.info(
@@ -945,7 +956,51 @@ def _settle_queued_from_known_answers(db) -> int | None:
         return None
 
 
-def _hold_answers_in_flight(db, rows: list) -> tuple[list, int]:
+class _InFlightCache:
+    """One pass's reads of each account's in-flight answer keys (Codex ii-c consult).
+
+    The refill runs the hold every round; without this it re-read an account's whole
+    in-flight set each time (15,000 rows for a heavily blocked account). Now each
+    account is read once per pass. `read` is kept apart from `keys` so an account
+    whose read came back EMPTY is not mistaken for one never read (F5).
+
+    Stale only in the SAFE direction. The pass holds _CLAIM_LOCK_KEY, and only the
+    dispatcher moves rows to 'submitting'/'submitted' (new claims are inserted
+    'queued', skip_trace_claim.py), so no in-flight row can appear mid-pass; an
+    ingest finishing mid-pass can only REMOVE one, so a cached key can only hold a
+    row that could have gone (it goes next tick), never let a second purchase
+    through. This rests on that invariant: any new writer (the 1b-2 action path)
+    must go through lock_job_for_claim() + claim_skip_trace_rows() and never
+    create an in-flight row itself (H3, carried into 1b-2)."""
+
+    def __init__(self) -> None:
+        self.read: set[str] = set()
+        self.keys: set[str] = set()
+
+
+def _in_flight_keys(db, user_ids) -> set[str]:
+    """The answer keys these accounts have at Tracerfy now. Reads only the columns
+    the key is built from: a heavily blocked account has thousands of in-flight
+    rows, and loading them as whole ORM rows cost ~0.8 s of a 2 s refill."""
+    from sqlalchemy import select
+
+    from src.db.models import PendingSkipTraceRow as P
+
+    return {
+        _answer_key(p)
+        for p in db.execute(
+            select(P.user_id, P.property_address, P.city, P.state, P.trace_type,
+                   P.first_name, P.last_name).where(
+                P.user_id.in_(set(user_ids)),
+                P.status.in_(("submitting", "submitted")),
+            )
+        )
+    }
+
+
+def _hold_answers_in_flight(
+    db, rows: list, cache: _InFlightCache | None = None,
+) -> tuple[list, int]:
     """Keep one row per (account, address) in a batch, and none whose answer is already
     at Tracerfy or already in the tenant cache. The rest stay 'queued': the next tick's
     known-answer sweep settles them from the answer, or they go out then if the original
@@ -961,9 +1016,6 @@ def _hold_answers_in_flight(db, rows: list) -> tuple[list, int]:
     without one."""
     if not rows:
         return rows, 0
-    from sqlalchemy import select
-
-    from src.db.models import PendingSkipTraceRow
 
     # The in-flight hold stays on the SUBJECT key and stays scoped to the tenants
     # in this batch: it exists so an account does not buy an answer it is already
@@ -976,15 +1028,15 @@ def _hold_answers_in_flight(db, rows: list) -> tuple[list, int]:
     # Holding across batches would buy nothing and would put one tenant behind
     # another tenant's lookup, which is exactly what
     # test_another_accounts_lookup_never_holds_or_answers_mine forbids.
-    in_flight = {
-        _answer_key(p)
-        for p in db.execute(
-            select(PendingSkipTraceRow).where(
-                PendingSkipTraceRow.user_id.in_({r.user_id for r in rows}),
-                PendingSkipTraceRow.status.in_(("submitting", "submitted")),
-            )
-        ).scalars()
-    }
+    users = {str(r.user_id) for r in rows}
+    if cache is None:
+        in_flight = _in_flight_keys(db, users)
+    else:
+        unread = users - cache.read
+        if unread:
+            cache.keys |= _in_flight_keys(db, unread)
+            cache.read |= unread
+        in_flight = cache.keys
     # AFTER the in-flight read (Codex round 2): a twin's answer landing between the two
     # reads is caught by one of them, since ingest writes the cache and settles the twin
     # in one transaction. The known-answer sweep ran earlier, in its own transaction, so

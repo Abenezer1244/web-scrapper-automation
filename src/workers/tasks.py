@@ -254,6 +254,21 @@ def emit_payment_notification(self, user_id: str, attempt_count: int) -> None:
     )
 
 
+def skip_reason_for_config(active: bool, paused_reason: str | None) -> str | None:
+    """Why a job for this scraper must not run, in the user's words, or None.
+
+    A deleted scraper is active=False; a plan downgrade pause is active=False
+    with paused_reason='entitlement'. The pause is checked on its own, so a row
+    that contradicts itself (active=True, reason still set) is not run either."""
+    from src.api.entitlements import PAUSED_REASON_ENTITLEMENT
+
+    if paused_reason == PAUSED_REASON_ENTITLEMENT:
+        return "This scraper is paused on your current plan, so this run was skipped."
+    if not active:
+        return "This scraper was deleted, so this run was skipped."
+    return None
+
+
 def _fail_job_after_uncaught(job_id: str, reason: str, expected_started_at=None) -> None:
     """Last-resort terminal cleanup for a crashed run_scrape_job (see _RunScrapeJobTask).
 
@@ -516,6 +531,21 @@ def run_scrape_job(self, job_id: str) -> None:
             self.request.scrape_started_at = attempt_started_at
         except Exception:  # request context unavailable (e.g. direct call) — non-fatal
             pass
+
+        # A deleted or plan-paused scraper never runs, whoever queued the job.
+        # A delete or pause can land after the Job was created: a batch fan-out
+        # between its read and its commit, or any job queued earlier (UX audit
+        # F-043, Codex P1). This is the one check every path passes through.
+        # Re-read under this attempt's claim so the row is current. Not gated on
+        # ENTITLEMENT_ENFORCEMENT: this is the user's own delete, or a pause
+        # that already happened, not an entitlement decision.
+        db.refresh(config)
+        _skip_reason = skip_reason_for_config(config.active, config.paused_reason)
+        if _skip_reason is not None:
+            # _fail_job writes the job log line, emits the event and releases any
+            # reserved quota, so a skipped run reserves and bills nothing.
+            _fail_job(db, job, r, job_id, _skip_reason, expected_started_at=attempt_started_at)
+            return
 
         # Execution-time entitlement backstop (audit until ENTITLEMENT_ENFORCEMENT).
         # Catches API/scheduled/retry/watchdog paths that bypassed create-time checks.

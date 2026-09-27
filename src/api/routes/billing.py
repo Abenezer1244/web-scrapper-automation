@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.auth import CurrentUser, require_admin
 from src.api.billing_entitlement import (
+    _rank,
     activate_paid_plan,
     apply_plan_change,
     end_subscription,
@@ -1203,6 +1204,30 @@ class _UnrecognisedSubscriptionError(Exception):
     """The live subscription does not carry a price this deployment sells."""
 
 
+def _plan_change_billing(current_price: str | None, new_price: str) -> dict:
+    """How Stripe bills a plan change, decided by direction (audit 2026-09-25, N-02).
+
+    The app grants a bigger tier the moment Stripe says so and defers a smaller
+    one to the quota boundary (billing_entitlement.apply_plan_change). Billing has
+    to agree with both halves, or the gap between them is for sale:
+
+    - Upgrade, or a same-tier interval move: invoice the proration NOW and pay
+      it before the subscription changes. ``error_if_incomplete`` makes Stripe
+      refuse the whole update when the payment fails or needs authentication,
+      so an unpaid upgrade never reaches the webhook that grants it.
+    - Downgrade: no proration credit. The customer keeps the bigger tier until
+      the boundary, which they already paid for, and gets nothing back for time
+      the app still honours.
+    """
+    current = _PRICE_TO_PLAN.get(current_price or "")
+    new = _PRICE_TO_PLAN[new_price]
+    downgrade = current is not None and _rank(new[1]) < _rank(current[1])
+    return {
+        "proration_behavior": "none" if downgrade else "always_invoice",
+        "payment_behavior": "error_if_incomplete",
+    }
+
+
 def _plan_change_items(sub: dict, new_price: str, new_plan: str, new_interval: str) -> list[dict]:
     """The `items` array that turns `sub` into the requested plan. Pure.
 
@@ -1509,10 +1534,9 @@ async def change_plan(
 
         modify_kwargs: dict = {
             "items": items,
-            # Credit the unused remainder of what they already paid for and charge
-            # the new plan pro rata. The alternative makes an upgrade free until
-            # the next invoice and a downgrade a donation.
-            "proration_behavior": "create_prorations",
+            # Upgrades are paid before Stripe applies them; downgrades are not
+            # credited. See _plan_change_billing for why (N-02).
+            **_plan_change_billing(current_price, stripe_price_id),
             "metadata": {"user_id": str(user.id), "price_id": body.price_id},
         }
         if interval_changed:
@@ -1586,6 +1610,23 @@ async def change_plan(
 
         try:
             updated = stripe.Subscription.modify(sub["id"], **modify_kwargs)
+        except stripe.error.CardError as exc:
+            # error_if_incomplete: the payment failed or needs the customer to
+            # authenticate, and Stripe left the subscription exactly as it was.
+            _logger.info(
+                "change-plan: payment for %s -> %s not completed for user %s (%s)",
+                current_price, stripe_price_id, user.id, getattr(exc, "code", None),
+            )
+            raise HTTPException(
+                status_code=status.HTTP_402_PAYMENT_REQUIRED,
+                detail={
+                    "code": "plan_change_payment_failed",
+                    "message": (
+                        "Your plan was not changed because the payment did not go "
+                        "through. Update your card in Manage billing, then try again."
+                    ),
+                },
+            ) from exc
         except Exception as exc:  # noqa: BLE001 — surfaced, never swallowed
             _logger.exception(
                 "change-plan: Stripe refused to modify subscription %s for user %s "

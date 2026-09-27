@@ -8,10 +8,14 @@ set of jobs).
 """
 import uuid
 
+from httpx import AsyncClient
 from kombu.exceptions import OperationalError
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session
 
 from src.api.auth import hash_password
+from src.api.entitlements import PAUSED_REASON_ENTITLEMENT, ConfigRow, plan_reconciliation
 from src.db.models import BatchRun, Job, ScraperBatch, ScraperConfig, User
 from src.db.session import SyncSessionLocal
 from src.workers.batch_tasks import dispatch_batch_run
@@ -149,3 +153,292 @@ def test_dispatch_over_limit_run_fails_with_no_jobs():
         assert run.status == "failed"
         assert run.child_job_ids == []
         assert db.query(Job).filter(Job.user_id == user.id).count() == 0
+
+
+# ── F-043: children the user deleted must not be scraped or counted ───────────
+# DELETE /scrapers/{id} is a soft delete (active=False) that keeps batch_id. A
+# downgrade pause is active=False with paused_reason='entitlement'.
+
+
+def _children(db: Session, batch_id: str) -> list[ScraperConfig]:
+    return (
+        db.query(ScraperConfig)
+        .filter(ScraperConfig.batch_id == batch_id)
+        .order_by(ScraperConfig.name)
+        .all()
+    )
+
+
+def _delete(cfg: ScraperConfig) -> None:
+    cfg.active = False
+    cfg.paused_reason = None
+
+
+def _pause(cfg: ScraperConfig) -> None:
+    cfg.active = False
+    cfg.paused_reason = PAUSED_REASON_ENTITLEMENT
+
+
+def test_dispatch_skips_deleted_child_and_reports_paused_child():
+    """One active, one deleted, one downgrade-paused child: only the active one
+    gets a Job; the paused one is reported as a plan limit; the deleted one is
+    neither run nor reported."""
+    with SyncSessionLocal() as db:
+        user = _user(db)
+        batch_id = _batch_with_pending_run(db, user.id, n_children=3)
+        active, deleted, paused = _children(db, batch_id)
+        _delete(deleted)
+        _pause(paused)
+        db.commit()
+        active_id, deleted_id, paused_id = active.id, deleted.id, paused.id
+
+    _dispatch(batch_id)
+
+    with SyncSessionLocal() as db:
+        run = db.query(BatchRun).filter(BatchRun.batch_id == batch_id).one()
+        assert run.status == "running"
+        jobs = db.query(Job).filter(Job.user_id == user.id).all()
+        assert [j.scraper_config_id for j in jobs] == [active_id]
+        reported = {c["config_id"]: c["reason"] for c in run.failed_children}
+        assert reported == {paused_id: "plan limit"}
+        assert deleted_id not in reported
+
+
+def test_dispatch_paused_child_gets_no_job_even_without_a_violation():
+    """config_run_violation only counts ACTIVE configs, so for a lone paused
+    child it finds nothing wrong. The pause itself must still block the Job."""
+    with SyncSessionLocal() as db:
+        user = _user(db)
+        batch_id = _batch_with_pending_run(db, user.id, n_children=1)
+        (paused,) = _children(db, batch_id)
+        _pause(paused)
+        db.commit()
+        paused_id = paused.id
+
+    _dispatch(batch_id)
+
+    with SyncSessionLocal() as db:
+        run = db.query(BatchRun).filter(BatchRun.batch_id == batch_id).one()
+        assert run.status == "failed"
+        assert run.failed_children == [{
+            "config_id": paused_id, "county": "pierce",
+            "record_type": "probate", "reason": "plan limit",
+        }]
+        assert db.query(Job).filter(Job.user_id == user.id).count() == 0
+
+
+def test_dispatch_blocks_a_child_that_is_active_but_still_marked_paused():
+    """active=True with paused_reason='entitlement' should never exist (the
+    reconcile clears both together), but if it does, the pause wins: blocked
+    and reported, never scraped and billed."""
+    with SyncSessionLocal() as db:
+        user = _user(db)
+        batch_id = _batch_with_pending_run(db, user.id, n_children=1)
+        (odd,) = _children(db, batch_id)
+        odd.active = True
+        odd.paused_reason = PAUSED_REASON_ENTITLEMENT
+        db.commit()
+        odd_id = odd.id
+
+    _dispatch(batch_id)
+
+    with SyncSessionLocal() as db:
+        run = db.query(BatchRun).filter(BatchRun.batch_id == batch_id).one()
+        assert run.status == "failed"
+        assert [c["config_id"] for c in run.failed_children] == [odd_id]
+        assert db.query(Job).filter(Job.user_id == user.id).count() == 0
+
+
+def test_dispatch_all_deleted_batch_creates_no_job():
+    """Every child deleted: no Job, and the zero-children path (not the
+    all-blocked "failed" path), since nothing is left to run or block."""
+    with SyncSessionLocal() as db:
+        user = _user(db)
+        batch_id = _batch_with_pending_run(db, user.id, n_children=2)
+        for cfg in _children(db, batch_id):
+            _delete(cfg)
+        db.commit()
+
+    _dispatch(batch_id)
+
+    with SyncSessionLocal() as db:
+        run = db.query(BatchRun).filter(BatchRun.batch_id == batch_id).one()
+        assert run.status == "done"
+        assert run.child_job_ids == []
+        assert db.query(Job).filter(Job.user_id == user.id).count() == 0
+
+
+async def test_batch_list_and_detail_count_the_same_current_children(
+    client: AsyncClient, business_token: str, business_user: User, db: AsyncSession
+):
+    """List child_count, detail child_count and the detail children list all
+    exclude the deleted child and keep the paused one."""
+    batch = ScraperBatch(
+        id=str(uuid.uuid4()), user_id=business_user.id, name="F-043 counts",
+        state="WA", fields=[], enrichment=[], schedule={}, deliver={}, status="active",
+    )
+    db.add(batch)
+    await db.flush()
+    ids = []
+    for i, (active, reason) in enumerate(
+        [(True, None), (False, None), (False, PAUSED_REASON_ENTITLEMENT)]
+    ):
+        cfg = ScraperConfig(
+            id=str(uuid.uuid4()), user_id=business_user.id, batch_id=batch.id,
+            name=f"child {i}", county="pierce", state="WA", record_type="probate",
+            fields=[], enrichment=[], schedule={}, deliver={},
+            active=active, paused_reason=reason,
+        )
+        db.add(cfg)
+        ids.append(cfg.id)
+    await db.commit()
+    active_id, deleted_id, paused_id = ids
+    headers = {"Authorization": f"Bearer {business_token}"}
+
+    listed = await client.get("/batches", headers=headers)
+    assert listed.status_code == 200
+    (summary,) = [b for b in listed.json() if b["id"] == batch.id]
+
+    detail = await client.get(f"/batches/{batch.id}", headers=headers)
+    assert detail.status_code == 200
+    body = detail.json()
+
+    assert summary["child_count"] == 2
+    assert body["child_count"] == 2
+    assert {c["config_id"] for c in body["children"]} == {active_id, paused_id}
+    assert deleted_id not in {c["config_id"] for c in body["children"]}
+
+
+async def test_deleting_a_paused_scraper_clears_the_pause_so_upgrade_cannot_revive_it(
+    client: AsyncClient, business_token: str, business_user: User, db: AsyncSession
+):
+    """Before the fix a scraper deleted while downgrade-paused kept
+    paused_reason='entitlement', and plan_reconciliation revives exactly those
+    rows once the plan permits them: the deleted scraper came back and ran."""
+    cfg = ScraperConfig(
+        id=str(uuid.uuid4()), user_id=business_user.id, name="paused then deleted",
+        county="pierce", state="WA", record_type="probate",
+        fields=[], enrichment=[], schedule={}, deliver={},
+        active=False, paused_reason=PAUSED_REASON_ENTITLEMENT,
+    )
+    db.add(cfg)
+    await db.commit()
+    # Read before expire_all(): an expired attribute lazy-loads, which an async
+    # session cannot do implicitly.
+    cfg_id, plan = cfg.id, business_user.plan
+
+    resp = await client.delete(
+        f"/scrapers/{cfg_id}", headers={"Authorization": f"Bearer {business_token}"}
+    )
+    assert resp.status_code == 204
+
+    db.expire_all()
+    row = (
+        await db.execute(select(ScraperConfig).where(ScraperConfig.id == cfg_id))
+    ).scalar_one()
+    assert row.active is False
+    assert row.paused_reason is None
+    _, revive_ids = plan_reconciliation(
+        [ConfigRow(row.id, row.state, row.county, row.record_type, row.created_at,
+                   row.active, row.paused_reason)],
+        plan,
+    )
+    assert row.id not in revive_ids
+
+
+# ── F-043 Phase 1b: the job runner re-checks the scraper when the job starts ──
+# A delete or pause can land after a Job was created (Codex P1: between the
+# fan-out's read and its commit, or any job queued earlier). These jobs use a
+# county with NO connector on purpose: if the guard were missing, the run would
+# stop at connector lookup (UnsupportedCountyError) instead of scraping a live
+# county site, so the tests can never reach the network, on this branch or main.
+
+_NO_CONNECTOR_COUNTY = "f043-no-connector"
+_DELETED_MSG = "This scraper was deleted, so this run was skipped."
+_PAUSED_MSG = "This scraper is paused on your current plan, so this run was skipped."
+
+
+def test_skip_reason_for_config_decides_from_active_and_pause():
+    from src.workers.tasks import skip_reason_for_config
+
+    assert skip_reason_for_config(True, None) is None
+    assert skip_reason_for_config(False, None) == _DELETED_MSG
+    assert skip_reason_for_config(False, PAUSED_REASON_ENTITLEMENT) == _PAUSED_MSG
+    # A contradictory row (active, reason still set) is not run either.
+    assert skip_reason_for_config(True, PAUSED_REASON_ENTITLEMENT) == _PAUSED_MSG
+
+
+def _pending_job_for(db: Session, user_id: str, *, active: bool, paused_reason) -> str:
+    cfg = ScraperConfig(
+        id=str(uuid.uuid4()), user_id=user_id, name="runner guard",
+        county=_NO_CONNECTOR_COUNTY, state="WA", record_type="probate",
+        fields=[], enrichment=[], schedule={}, deliver={},
+        active=active, paused_reason=paused_reason,
+    )
+    db.add(cfg)
+    db.flush()
+    job = Job(
+        id=str(uuid.uuid4()), user_id=user_id, scraper_config_id=cfg.id,
+        status="pending", trigger="manual",
+    )
+    db.add(job)
+    db.commit()
+    return job.id
+
+
+def _run(job_id: str) -> Job:
+    from src.workers.tasks import run_scrape_job
+
+    run_scrape_job(job_id)
+    with SyncSessionLocal() as db:
+        return db.query(Job).filter(Job.id == job_id).one()
+
+
+def test_runner_skips_a_job_whose_scraper_was_deleted_after_it_was_queued():
+    with SyncSessionLocal() as db:
+        user = _user(db)
+        job_id = _pending_job_for(db, user.id, active=False, paused_reason=None)
+
+    job = _run(job_id)
+
+    assert job.status == "failed"
+    assert job.error_message == _DELETED_MSG
+    assert job.record_count == 0
+
+
+def test_runner_skips_a_job_whose_scraper_was_paused_after_it_was_queued():
+    with SyncSessionLocal() as db:
+        user = _user(db)
+        job_id = _pending_job_for(
+            db, user.id, active=False, paused_reason=PAUSED_REASON_ENTITLEMENT
+        )
+
+    job = _run(job_id)
+
+    assert job.status == "failed"
+    assert job.error_message == _PAUSED_MSG
+
+
+def test_batch_child_deleted_after_the_fan_out_is_not_scraped():
+    """The Codex P1 race end to end: the fan-out creates the child's Job, the
+    user deletes the child, then the worker picks the Job up."""
+    with SyncSessionLocal() as db:
+        user = _user(db)
+        batch_id = _batch_with_pending_run(db, user.id, n_children=1)
+        (child,) = _children(db, batch_id)
+        child.county = _NO_CONNECTOR_COUNTY
+        db.commit()
+
+    _dispatch(batch_id)
+    with SyncSessionLocal() as db:
+        run = db.query(BatchRun).filter(BatchRun.batch_id == batch_id).one()
+        assert run.status == "running"
+        (job_id,) = run.child_job_ids
+        (child,) = _children(db, batch_id)
+        _delete(child)
+        db.commit()
+
+    job = _run(job_id)
+
+    assert job.status == "failed"
+    assert job.error_message == _DELETED_MSG

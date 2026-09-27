@@ -143,11 +143,22 @@ def dispatch_batch_run(run_id: str) -> None:
                 run.completed_at = datetime.now(UTC)
                 db.commit()
             else:
+                from src.api.entitlements import (
+                    PAUSED_REASON_ENTITLEMENT,
+                    ConfigRow,
+                    config_run_violation,
+                    current_batch_child_clause,
+                    should_block_run,
+                )
                 configs = db.execute(
                     # Owner-scoped (defense-in-depth on top of the composite FK).
+                    # Children the user deleted are excluded HERE, in SQL, so an
+                    # all-deleted batch takes the zero-children path below rather
+                    # than the "all blocked" one (UX audit F-043).
                     select(ScraperConfig).where(
                         ScraperConfig.batch_id == batch.id,
                         ScraperConfig.user_id == batch.user_id,
+                        current_batch_child_clause(),
                     )
                 ).scalars().all()
                 if not configs:
@@ -155,13 +166,23 @@ def dispatch_batch_run(run_id: str) -> None:
                     run.completed_at = datetime.now(UTC)
                     db.commit()
                 else:
-                    from src.api.entitlements import (
-                        ConfigRow,
-                        config_run_violation,
-                        should_block_run,
-                    )
                     blocked_children = []
                     for c in configs:
+                        # A downgrade-paused child never runs. config_run_violation
+                        # only counts ACTIVE configs, so it can find nothing wrong
+                        # with a paused one, and should_block_run also depends on
+                        # the enforcement flag. Neither may decide this: report it
+                        # as a plan limit and give it no Job. Keyed on the reason
+                        # alone, so a row that contradicts itself (active=True
+                        # with the pause reason still set) is blocked, not billed.
+                        if c.paused_reason == PAUSED_REASON_ENTITLEMENT:
+                            blocked_children.append({
+                                "config_id": str(c.id),
+                                "county": c.county,
+                                "record_type": c.record_type,
+                                "reason": "plan limit",
+                            })
+                            continue
                         _active = db.execute(
                             select(
                                 ScraperConfig.id, ScraperConfig.state, ScraperConfig.county,

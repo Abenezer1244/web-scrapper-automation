@@ -6,10 +6,11 @@ from collections.abc import Iterable
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi.security import HTTPAuthorizationCredentials
 from sqlalchemy import case, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.auth import CurrentUser, require_admin_mfa
+from src.api.auth import CurrentUser, _bearer, get_auth_context, require_admin, require_admin_mfa
 from src.api.deps import get_rls_db
 from src.api.entitlements import (
     CODE_SKIP_TRACE,
@@ -367,6 +368,7 @@ async def create_scraper(
 @router.get("/connectors", response_model=list[ConnectorResponse])
 async def list_connectors(
     include_all: bool = False,
+    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
     db: AsyncSession = Depends(get_db),
 ) -> list[ConnectorResponse]:
     """Return county connectors for the frontend county picker.
@@ -390,8 +392,12 @@ async def list_connectors(
     window is empty — which is the correct honest outcome.
 
     Pass ``?include_all=true`` to include ``down`` and ``unknown``
-    connectors for admin tooling and support investigation.
+    connectors for admin tooling and support investigation. That view is
+    ADMIN-ONLY (audit 2026-09-25, C-1): it named every broken county to any
+    anonymous caller. The default picker view stays public.
     """
+    if include_all:
+        await require_admin(await get_auth_context(credentials, db))
     query = select(CountyConnector).where(CountyConnector.active)
     if not include_all:
         query = query.where(
@@ -466,6 +472,11 @@ async def delete_scraper(
     if config is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scraper not found")
     config.active = False  # Soft delete — preserves job history
+    # A downgrade pause is active=False with paused_reason='entitlement', and the
+    # plan reconcile revives exactly those rows on upgrade. Clearing the reason is
+    # what makes this a delete: without it, a scraper deleted while paused came
+    # back after the next upgrade and was scraped and billed (UX audit F-043).
+    config.paused_reason = None
     await db.flush()
     # M7: scraper-config changes were unaudited (audit checklist finding).
     audit_log(

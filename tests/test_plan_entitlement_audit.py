@@ -811,7 +811,7 @@ async def test_batch_scraping_is_pro_and_above(client, db, make_user, plan):
 @pytest.mark.parametrize("plan", PLANS)
 async def test_api_key_issuance_is_business_and_above(client, db, make_user, plan):
     _user, token = await make_user(plan)
-    r = await client.post("/auth/api-key", headers=_auth(token))
+    r = await client.post("/auth/api-key", headers=_auth(token), json={"current_password": "TestPass123!"})
     if plan in BUSINESS_FEATURES_PLANS:
         assert r.status_code == 201, r.text
     else:
@@ -826,7 +826,7 @@ async def test_a_key_minted_on_business_stops_working_after_a_downgrade(
     """The gate is on the auth path too, not only on issuance. Gating the mint
     alone would leave a downgraded account holding a live Business key."""
     user, token = await make_user("business")
-    minted = await client.post("/auth/api-key", headers=_auth(token))
+    minted = await client.post("/auth/api-key", headers=_auth(token), json={"current_password": "TestPass123!"})
     assert minted.status_code == 201, minted.text
     raw_key = minted.json()["api_key"]
 

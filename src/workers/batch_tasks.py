@@ -22,6 +22,7 @@ from datetime import UTC, datetime
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
+from src.config.constants import ACTIVE_STATUSES
 from src.db.models import BatchRun, Job, ScraperBatch, ScraperConfig, User
 from src.db.session import system_sync_session
 from src.utils.logger import setup_logger
@@ -31,6 +32,19 @@ from src.workers.tasks import run_scrape_job
 _logger = setup_logger("worker.batch")
 
 _ACTIVE_RUN_STATUSES = ("pending", "running")
+
+# Migration 104's partial unique index: one active job per scraper config.
+_ONE_ACTIVE_JOB_INDEX = "uq_jobs_one_active_per_config"
+
+
+def _is_one_active_job_violation(exc: IntegrityError) -> bool:
+    """True only for a unique violation on migration 104's index. psycopg2 (the
+    worker's driver) exposes SQLSTATE as .pgcode and the name on .diag."""
+    orig = getattr(exc, "orig", None)
+    if getattr(orig, "pgcode", None) != "23505":
+        return False
+    diag = getattr(orig, "diag", None)
+    return getattr(diag, "constraint_name", None) == _ONE_ACTIVE_JOB_INDEX
 
 
 def _pending_child_ids(db, run: "BatchRun") -> list[str]:
@@ -210,12 +224,60 @@ def dispatch_batch_run(run_id: str) -> None:
                             status="pending",
                             trigger="batch",
                         )
-                        db.add(job)
+                        # A child cancelled mid-run moments ago is still stopping:
+                        # the run-slot rule every start path shares (F-003). The
+                        # index below only covers ACTIVE runs.
+                        stopping = db.execute(
+                            select(Job.id).where(
+                                Job.scraper_config_id == c.id,
+                                Job.user_id == c.user_id,
+                                Job.status == "cancelled",
+                                Job.holds_run_slot(datetime.now(UTC)),
+                            ).limit(1)
+                        ).scalar()
+                        if stopping is not None:
+                            blocked_children.append({
+                                "config_id": str(c.id),
+                                "county": c.county,
+                                "record_type": c.record_type,
+                                "reason": "still stopping",
+                                "job_id": str(stopping),
+                            })
+                            continue
+                        # One active run per scraper (migration 104). A child that
+                        # is already running (e.g. its own "Run now") must not
+                        # abort the whole fan-out: insert each child in a SAVEPOINT
+                        # so a clash rolls back that child only, keeping the run
+                        # row's lock and every sibling. Flush first so the
+                        # savepoint holds nothing but this child.
                         db.flush()
+                        try:
+                            with db.begin_nested():
+                                db.add(job)
+                                db.flush()
+                        except IntegrityError as exc:
+                            if not _is_one_active_job_violation(exc):
+                                raise
+                            running = db.execute(
+                                select(Job.id).where(
+                                    Job.scraper_config_id == c.id,
+                                    Job.user_id == c.user_id,
+                                    Job.status.in_(ACTIVE_STATUSES),
+                                ).limit(1)
+                            ).scalar()
+                            blocked_children.append({
+                                "config_id": str(c.id),
+                                "county": c.county,
+                                "record_type": c.record_type,
+                                "reason": "already running",
+                                "job_id": str(running) if running else None,
+                            })
+                            continue
                         enqueued.append(str(job.id))
                     if not enqueued:
-                        # Every child config was blocked by tier-enforcement, so no
-                        # child jobs exist to fire the completion barrier. Terminalize
+                        # Every child config was blocked (plan limits, already
+                        # running, or still stopping), so no child jobs exist to
+                        # fire the completion barrier. Terminalize
                         # as failed (mirrors the monthly-record-limit branch above)
                         # instead of leaving the run "running" forever.
                         run.status = "failed"

@@ -814,6 +814,35 @@ class Job(Base):
     results = relationship("Result", back_populates="job", cascade="all, delete-orphan")
     logs = relationship("JobLog", back_populates="job", cascade="all, delete-orphan")
 
+    # A cancelled run whose worker had started keeps scraping until it notices the
+    # cancel, and the dedup claims it writes meanwhile would freeze a new run's
+    # leads as "already delivered". The heartbeat stops at the cancel (it skips
+    # cancelled rows), so liveness cannot be read; a new start waits this long.
+    RUN_SLOT_CANCEL_COOLDOWN_SECONDS = 300
+
+    @classmethod
+    def holds_run_slot(cls, now):
+        """SQL condition: this job still occupies its scraper's single run slot.
+
+        Active (migration 104's index enforces one), or cancelled after a worker
+        started it within the cooldown. EVERY start path uses this (POST /jobs,
+        the scheduler, the batch fan-out), so none can start a run the others
+        would refuse (UX audit F-003)."""
+        from datetime import timedelta
+
+        from sqlalchemy import and_, or_
+
+        from src.config.constants import ACTIVE_STATUSES
+
+        return or_(
+            cls.status.in_(ACTIVE_STATUSES),
+            and_(
+                cls.status == "cancelled",
+                cls.started_at.is_not(None),
+                cls.finished_at > now - timedelta(seconds=cls.RUN_SLOT_CANCEL_COOLDOWN_SECONDS),
+            ),
+        )
+
 
 class Result(Base):
     __tablename__ = "results"

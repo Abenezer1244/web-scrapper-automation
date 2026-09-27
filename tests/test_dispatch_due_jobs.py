@@ -195,16 +195,19 @@ def test_duplicate_occurrence_insert_is_noop():
 def test_null_occurrence_never_conflicts():
     # Manual / test / on-demand jobs (scheduled_for = NULL) are NULL-distinct, so
     # any number of them coexist — the occurrence index must not block them.
+    # Only ONE may be active at a time (migration 104's one-active-run index, a
+    # separate rule), so the earlier two are finished runs: this still proves the
+    # occurrence index lets three NULL-occurrence jobs of one config coexist.
     from sqlalchemy.dialects.postgresql import insert as pg_insert
 
     with SyncSessionLocal() as db:
         user = _user(db)
         config = _config(db, user.id, {"frequency": "manual"})
-        for _ in range(3):
+        for status in ("done", "failed", "pending"):
             db.execute(
                 pg_insert(Job.__table__).values(
                     id=str(uuid.uuid4()), user_id=user.id, scraper_config_id=config.id,
-                    status="pending", trigger="manual", page_current=0, page_total=0,
+                    status=status, trigger="manual", page_current=0, page_total=0,
                     record_count=0, retry_count=0, scheduled_for=None,
                 ).on_conflict_do_nothing()
             )

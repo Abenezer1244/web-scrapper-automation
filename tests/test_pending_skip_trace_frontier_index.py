@@ -214,9 +214,9 @@ def test_a_same_named_index_on_another_table_is_refused_not_dropped():
 # ── Replay through the migration's own upgrade() / downgrade() ────────────────
 #
 # Driven through an Alembic MigrationContext bound to the suite's GUARDED test
-# connection, never through alembic/env.py: env.py calls load_dotenv() and
-# prefers DATABASE_URL_MIGRATE, which the test-DB guard does not pin, so a replay
-# through it could reach whatever database a local .env names. The full revision
+# connection: the unit under test is the migration's own upgrade()/downgrade(),
+# not env.py. (env.py no longer reads a .env and refuses a non-test target under
+# ENVIRONMENT=test, #370; tests/test_db_safety.py covers it.) The full revision
 # chain is exercised by CI's `alembic upgrade head`.
 
 

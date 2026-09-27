@@ -1627,6 +1627,37 @@ compare must match the ORDER BY exactly); a row whose `enqueued_at` changes mid-
 none: it is set only by the server default at insert; every other use in src/ and scripts/ reads it); rows inserted mid-pass BEHIND a frontier (the watermark again, V1); LIMIT
 with an expression; accounts discovered only after round 0 (none: the watermark fixes the set).
 
+### Codex pre-code consult on ii-c (2026-09-27): PLAN: REVISE, 2 P1 + 3 P2 + 2 P3, all accepted
+Output: `<scratchpad 0ade294c>/codex_iic_consult_out.txt`. Confirmed: the prefix argument is correct
+under ORDER BY (rank, enqueued_at, id) + a global LIMIT; the frontier reproduces ii-b's
+`considered` exclusion; the in-flight cache is safe under current writers (new claims insert
+'queued', skip_trace_claim.py:451-463; only the dispatcher moves rows to submitting/submitted).
+SUPERSEDES the matching bullets above:
+- **F1 (P1)** `allocate()` returns `(id, user_id, enqueued_at)` in order, and each account's
+  frontier advances over EVERY returned row (SKIP LOCKED, withdrawn, unsubmittable, held alike),
+  never only over survivors. Sentinel is typed and never NULL: `'-infinity'::timestamptz` and the
+  all-zero uuid. The tuple compare is exactly `(p.enqueued_at, p.id) > (a.after_at, a.after_id)`,
+  matching `ORDER BY p.enqueued_at, p.id` ASC.
+- **F2 (P1)** Index column order is `(trace_type, user_id, enqueued_at, id) WHERE status =
+  'queued'`: discovery fixes trace_type first, then skips across user_id; the lateral fixes both
+  and walks (enqueued_at, id). The gate must SHOW the loose scan in EXPLAIN on the 117k workload.
+- **F3 (P2)** A short lateral result does NOT retire an account (READ COMMITTED: a job can turn
+  deliverable mid-pass). An account leaves the active set only when a later probe returns ZERO
+  rows. Short results are telemetry only.
+- **F4 (P2)** The `considered_limit` test is replaced by frontier tests: equal timestamps (id
+  tie-break), a global-LIMIT cut (the cut rows come back next round), held heads, locked heads,
+  post-allocation drops.
+- **F5 (P3)** The in-flight cache keeps an explicit "accounts already read" set, so a cached EMPTY
+  result is distinguishable from an unread account. Invariant, written into the code comment: any
+  future writer (the 1b-2 action path) inserts only 'queued' rows through the claim protocol.
+- **F6 (P2)** 103 keeps ALL of 102's discipline (CONCURRENTLY in autocommit, whole-indexdef
+  identity + indisvalid, wrong-shape repair, cross-table collision abort, CONCURRENT_INDEXES,
+  scoped downgrade). Deployment gate: ii-c-1 is merged, applied, and VERIFIED BY THE OBJECT in
+  production before ii-c-2 deploys. Build time: prod holds ~941 pending rows (09-26), so the
+  concurrent build is sub-second; lock_timeout bounds only the waits, as in 102.
+- **F7 (P3)** `ix_pending_skip_trace_dispatch` stays (residual queued scans, e.g. the reconciler
+  path at dispatcher.py:860-865). Dropping it would be its own measured migration.
+
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever
       the tab has leads that have never been looked up; when the quote comes back with

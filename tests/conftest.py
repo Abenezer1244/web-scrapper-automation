@@ -6,8 +6,10 @@ The suite connects ONLY to TEST_DATABASE_URL; the guard below makes a non-test
 touched even if a shared/synced .env's DATABASE_URL points at prod.
 """
 # ─── TEST DATABASE SAFETY GUARD (must run before ANY src.* / main import) ────
-# enforce_test_database() validates TEST_DATABASE_URL, pins DATABASE_URL and
-# DATABASE_URL_SYNC to it, and forces ENVIRONMENT="test" — BEFORE src.config.
+# (Its only src import is src.db_safety, which is dependency-free by design.)
+# enforce_test_database() validates TEST_DATABASE_URL, pins DATABASE_URL,
+# DATABASE_URL_SYNC and DATABASE_URL_MIGRATE to it, refuses the libpq variables
+# that reroute a DSN, and forces ENVIRONMENT="test" — BEFORE src.config.
 # settings (and therefore the DB engine in src.db.session) read the environment.
 # This is the root-cause fix for the 2026-06-29 production-data wipe: it makes it
 # impossible for the suite to connect to a non-test database no matter what a

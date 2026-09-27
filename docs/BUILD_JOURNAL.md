@@ -19,6 +19,98 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-27 — The spend cap's keyset refill (1b-1b-ii-c-2), and Alembic can no longer reach production from a test
+
+> Two merges, both live. BE **#366** `2e839076` (ii-c-2, no migration; 103 shipped in #365) and
+> BE **#370** `2b397c82` (the env.py safety fix, no migration). The contact-lookup spend cap
+> series (#358 ledger, #359, #361 mig 102, #364 the cap, #365 mig 103) has no entry of its own:
+> its full record, consult rounds and gates are in `tasks/todo-lookup-contacts.md` (Phase 1b-1b).
+
+**Built / Shipped:**
+- **#366, the keyset refill.** The dispatcher's refill no longer re-ranks every eligible queued
+  row each round (~440 ms a round at 117k queued). Each account keeps a pass-local frontier
+  (enqueued_at, id) and each round walks only its rows after it, over migration 103's index:
+  `discover_accounts` (loose index scan), `round_limits` (Codex H2 work bound), `allocate` (four
+  array params, a LATERAL walk per account, ranked outside it), `advance` (over EVERY returned
+  row). Cap hardness unchanged (in-lock spend read, `take_within_caps`, 12 rounds / 2 s).
+  Gate, every sampled round's plan ASSERTED to walk 103: worst round 113-138 ms at 117k queued
+  (also with 500k filler results), 36-38 ms at 35k, 382-463 ms at 15,000 accounts (tenant-scale
+  bound 500 ms, O(accounts) by design); refills 1.0-1.45 s. The first worker tick after deploy
+  completed OK, but on an empty queue: the keyset walk has not yet run on real production rows.
+- **#370, the safety fix.** `alembic/env.py` called `load_dotenv()`, which searches upward from
+  `alembic/` (not the cwd), so in a checkout whose `.env` names production (the OneDrive one
+  does) a bare `alembic` run or a test driving `alembic.command` got the production OWNER role;
+  the pytest guard pinned only `DATABASE_URL`/`_SYNC`. Now: `src/db_safety.py` is the one
+  test-DB classifier (plus: `service` query key refused, explicit port required, libpq rerouting
+  variables `PGHOSTADDR`/`PGSERVICE`/`PGSERVICEFILE`/`PGSYSCONFDIR` refused); the guard PINS
+  `DATABASE_URL_MIGRATE` and re-checks the libpq variables before the destructive teardown;
+  env.py never reads a `.env`, and under `ENVIRONMENT=test` refuses any target that is not the
+  validated test DB: before connecting on the bare-URL path, and before any migration runs on
+  the connection `scripts/migrate.py` hands in (which already exists by then). 42 tests (Alembic runs in a subprocess on a copy of the
+  real `alembic/` with a trap `.env`), 10 mutations each caught. Verified after deploy: worker
+  and api boot migrations, and CI's production "Run Migrations" job.
+
+**Tried / Decided:**
+- Round 0's 1,172 ms: I first added `user_id` to the lateral's ORDER BY, believing the planner
+  did not see it as fixed. Wrong: the plan already dropped it. The real cause was the watermark
+  (`enqueued_at <= const`) paired with the `enqueued_at >= after_at` the planner derives from the
+  frontier compare into a range with one unknown end, priced at a flat 0.5%, so it walked the
+  OLD `ix_pending_skip_trace_dispatch` and filtered out 64,680 other-account rows per account.
+  Moving the watermark out of the lateral (a tail of each walk, so the prefix argument holds):
+  1.2 ms. `enable_bitmapscan=off` is still needed (286 ms without it), now inside a savepoint.
+- `_in_flight_keys` loaded 15,000 whole ORM rows once per pass: 1,331 ms of a 2 s refill. It now
+  selects the 7 key columns (~300 ms).
+- Safety PR: pin `DATABASE_URL_MIGRATE`, never delete it (an absent key is what `load_dotenv`
+  and pydantic's `env_file` refill). No opt-in to `.env` loading in env.py (Codex: an opt-in
+  recreates the hazard). Not guarding `scripts/migrate.py`: before env.py refuses, it only
+  connects and takes a session advisory lock (Codex accepted twice).
+- The docker-compose finding (api/worker/beat/migrate all `env_file: .env`, so `docker compose
+  up` from the OneDrive checkout would run the whole local stack against production) went to the
+  owner and is its own PR, not folded in.
+
+**Failed / Blocked:**
+- The original gate seed stored each account's rows contiguously in time, which HID the bad plan
+  in rounds >= 1 (starting from the frontier landed inside the right account). The gate now also
+  seeds interleaved.
+- A gate run with 500k filler rows hit the statement timeout during seeding and leaked 50 users
+  into the local test DB (the cleanup `try` did not cover seeding; emails are field-encrypted so
+  my `gate_%` lookup missed them). Cleaned by creation time; the gate now cleans up at exit.
+- A bash heredoc mangled `\n` in a script edit (as the handoff warned); redone with the Edit tool.
+- My first merge call for #366 passed a malformed commit id: GitHub rejected it, nothing merged.
+- `main` moved under both PRs (#367, #368, #369, #371). Branch protection requires an up-to-date
+  branch, so each move meant a rebase and a ~17 min CI re-run.
+
+**Caught & fixed:**
+- ii-c-2, Codex diff r1 (GO, fixed anyway): a failing walk left the transaction aborted and the
+  `RESET` in `finally` then failed and hid the real error (now a savepoint); no test pinned the
+  per-account `round_limit` term. Two more mutations were SURVIVING before I added tests: an
+  account retired on a short result (F3), and the in-flight cache without its read set (F5).
+- Safety PR, Codex r1 NO-GO: `set_main_option()` is ConfigParser interpolation, so a
+  percent-encoded password crashed env.py before the belt (the old env.py had the same line;
+  production works only because its password has no `%`). Also: the allowlist test did real
+  DNS, ambient variables were tested on one env.py path only, and the migration AST scan was
+  bypassable (aliases, `getattr`, `from src.db import session`, concatenation).
+- Codex r2 flagged two "P1s" (download auth, rate limits) in files this branch never touched:
+  `origin/main` had moved (#368) and a two-dot diff showed it as reversions. Rebased; r3 GO.
+
+**Pending / Handoff:**
+- Local-env PR (owner-approved): docker-compose's `env_file: .env`; `run-audit-tests.sh` unsets
+  the four libpq variables the guard now refuses; CI's test job sets them empty; `bootstrap.sh`
+  wording.
+- `.env.example` wording about implicit dotenv loading: Claude's reads of it are denied; owner.
+- Then 1b-1b-iii (pause state), per the plan.
+- The keyset walk has not yet run on real queued rows in production (queue empty at deploy).
+
+**Facts learned:**
+- Inside a LATERAL, Postgres treats `col = outer.col` as fixing `col` for sort purposes; an ORDER
+  BY that names it changes nothing.
+- A one-sided-unknown range (`x >= $param AND x <= const`) is priced at DEFAULT_RANGE_INEQ_SEL
+  (0.5%), which can make a wrong index look ~100x cheaper than it is.
+- `load_dotenv()` with no path searches from the CALLING FILE's directory, not the cwd.
+- libpq's `PGHOSTADDR` (or a service file supplying `hostaddr`) reroutes a DSN whose host, port
+  and dbname are all explicit.
+- `SET LOCAL` survives `RELEASE SAVEPOINT` and is undone by `ROLLBACK TO SAVEPOINT`.
+
 ## 2026-09-27 — One run-eligibility rule for the gate and the page (Q6 2b-i), and a diff I sent from the wrong base
 
 > UX audit item 2b-i (Q6 / F-035). BE **#369** merged `cd755883` (api/worker/beat SUCCESS, no

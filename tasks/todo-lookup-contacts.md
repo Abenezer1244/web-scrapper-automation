@@ -1750,7 +1750,9 @@ planner already drops it as fixed. Tried and reverted.)
 ### ii-c TO BUILD
 - [x] ii-c-1: migration 103 + models + env.py + tests; replay; merge; VERIFY THE INDEX IN PROD
 - [x] ii-c-2: keyset allocate + frontier + in-flight cache + tests; gate at 117k/15k and 15k accounts
-- [ ] Codex diff review each to GO; quiet check before each merge
+- [x] Codex diff review each to GO; quiet check before each merge (ii-c-2: #366 merged
+      `2e839076` 2026-09-27 10:00Z after diff r1 GO + r2 GO + a rebase check GO; worker runs it,
+      first tick OK on an empty queue)
 
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever
@@ -1830,8 +1832,136 @@ planner already drops it as fixed. Tried and reverted.)
       re-quote (safe to retry, nothing was charged); an unknown category is 422; Redis unavailable
       is a friendly 503 and nothing is queued.
 
+## Safety PR: Alembic can never reach production from a test or a stray CLI run (PLAN, 2026-09-27)
+
+The Deferred bullet below, taken now. Same class as the two production wipes.
+
+**How a migration reached a database BEFORE #370 (the problem this section fixed):**
+- Boot: `start.sh` -> `scripts/migrate.py`, which reads `DATABASE_URL_MIGRATE or DATABASE_URL_SYNC`
+  from the process env (it never reads `.env`) and hands `env.py` its own connection, so env.py's
+  URL choice is unused there.
+- CI: bare `alembic upgrade head` twice (Test job on the test DB; the production "Run
+  Migrations" job with the `DATABASE_URL_SYNC` secret), always with explicit env vars, no `.env`.
+- Anything else (a developer's bare `alembic ...`, any test or script calling
+  `alembic.command.*` without a connection): `env.py` calls `load_dotenv()`, which searches
+  upward from `alembic/` (NOT the cwd), so in the OneDrive checkout it loads the PRODUCTION
+  `.env`, and then prefers `DATABASE_URL_MIGRATE` (the prod owner role). The test guard pins
+  only `DATABASE_URL`/`_SYNC`, so a test that ran Alembic would migrate or downgrade production.
+  No test does this today (103's replay deliberately avoids env.py); nothing stops the next one.
+
+**Codex pre-code consult (PLAN: REVISE, all adopted):** pin (not clear) and removing
+`load_dotenv()` with NO opt-in both confirmed [P1]; run the env.py tests in a SUBPROCESS [P2];
+a belt in env.py under `ENVIRONMENT=test` [P2]; migrations must never get a connection from
+`Settings` (053 reads settings for keys only; 027/028 mention DATABASE_URL in docstrings only)
+[P2]; stale comments [P3]. More than 5 files, so two phases.
+
+**Codex consult round 2 (REVISE, adopted):** the belt must CLASSIFY the target, not just match
+one env var (else `ENVIRONMENT=test` with both URLs on production passes) [P1]; compare database
+IDENTITY (host, effective port, database), rejecting routing overrides in the query [P1]; an AST
+check of the migrations, not a text scan [P2]; the missing-URL error before env.py imports the
+models [P2].
+
+**Phase A: code (5 files)**
+- [x] `src/db_safety.py` (NEW, dependency-free, `src/__init__.py` is empty): the classifier
+      moved out of `tests/_db_safety.py` unchanged (name suffix `_test`/`_testing`; explicit
+      host, local or `TEST_DB_HOST_ALLOWLIST`; routing query keys refused) plus
+      `db_identity(url) -> (host, port, database)` (port None when absent; `classify()`
+      separately requires an explicit port).
+- [x] `tests/_db_safety.py`: imports the classifier from there (behaviour unchanged);
+      `enforce_test_database()` also PINS `DATABASE_URL_MIGRATE` to the validated
+      `TEST_DATABASE_URL_SYNC`. Pin, never delete: an absent key is exactly what `load_dotenv()`
+      and pydantic's `env_file=".env"` refill from the file; a present one they leave alone.
+- [x] `alembic/env.py`: no `.env` load at all. A connection handed in (migrate.py) is used as
+      today. Otherwise the URL comes only from the process env (`DATABASE_URL_MIGRATE or
+      DATABASE_URL_SYNC`); neither set -> a clear error, raised before `src.db.models` is
+      imported. BELT, when `ENVIRONMENT=test`: the target (the URL, or the handed-in
+      connection's `engine.url`) must classify as a test database AND have the identity of
+      `TEST_DATABASE_URL_SYNC`, which must itself classify; else refuse: before connecting on
+      the bare-URL path, before `run_migrations()` on the handed-in connection.
+      CI's Test job passes (`ENVIRONMENT=test`, local `bridgeleads_test`); production never
+      sets ENVIRONMENT=test.
+- [x] `tests/test_db_safety.py` (new; there are no guard tests today):
+      (a) the guard pins `DATABASE_URL_MIGRATE` over a prod-looking value, and still refuses
+          what it refused before (pure, monkeypatched env);
+      (b) SUBPROCESS, cwd=tmp_path, PYTHONPATH=worktree, sanitized env: the REAL `alembic/`
+          copied to `tmp_path/alembic` with a trap `.env` in it naming
+          `DATABASE_URL_MIGRATE=...@dotenv-prod.invalid/...`, the variable absent from the
+          child's env, `alembic.command.current()` on a Config with no ini file: it reads the
+          TEST database. Today's env.py fails it (tries `dotenv-prod.invalid`);
+      (c) SUBPROCESS: no URL and no connection -> the clear error;
+      (d) SUBPROCESS: `ENVIRONMENT=test` and a target that is not a test DB (both
+          `DATABASE_URL_MIGRATE` and `TEST_DATABASE_URL_SYNC` on `prod.invalid/postgres`) ->
+          refused before connecting;
+      (e) AST over `alembic/versions/*.py`: no import or call of an engine factory
+          (`create_engine`, `create_async_engine`, `engine_from_config`, aliases included), no
+          `src.db.session` import, no executable read of `DATABASE_URL*` (docstrings and
+          comments ignored).
+- [x] `alembic.ini`: the stale comment (names only DATABASE_URL_SYNC).
+- Mutations: guard deletes instead of pinning; `load_dotenv()` restored; belt removed;
+  identity check removed. Each must fail a test.
+
+**Codex consult round 3 (REVISE):**
+- [P1] adopted: the classifier also refuses the `service` query key (pg_service.conf can
+  redirect) and REQUIRES an explicit port (else `PGPORT` can redirect; PGHOST/PGDATABASE are
+  already moot: host and database are required explicitly). CI and local test URLs name :5432.
+- [P2] adopted, tests: (f) both URLs classify as test DBs but differ in host / port / database
+  -> refused (so the identity check is proven, not just the classifier); (g) a handed-in
+  connection whose `engine.url` masks the password -> identity compares host/port/database
+  only; (h) an allowlisted remote host passes, `TEST_DB_HOST_ALLOWLIST` kept in the child env.
+- [P1] NOT adopted, reason sent back to Codex: "migrate.py connects before env.py inspects the
+  handed-in connection". Under `ENVIRONMENT=test` a wrong target is then only CONNECTED to and
+  advisory-LOCKED (session lock, released on close; no data read or written); env.py refuses
+  before `run_migrations()`, so no DDL can run. Guarding migrate.py too buys no data safety
+  and adds a sixth file. **Codex round 4: reason ACCEPTED.**
+
+**Codex consult round 4 (REVISE, adopted):** [P1] libpq still routes elsewhere with host, port
+and dbname all explicit when `PGHOSTADDR` is set, or a service file (`PGSERVICE`,
+`PGSERVICEFILE`, `PGSYSCONFDIR`) supplies `hostaddr`. `src/db_safety.py` gets
+`ambient_redirects()` (those four, when non-empty); BOTH the test guard (the suite's own engine
+has the same exposure) and env.py's belt refuse when it is non-empty. [P2] tests: (i) each of
+the four set -> env.py refuses before `run_migrations()`, on the bare-URL path AND on the
+handed-in-connection path; the guard refuses them too.
+
+**Codex consult round 5 (REVISE; rounds 1-4 confirmed closed):**
+- [P1] `docker-compose.yml`'s `migrate` service reads `env_file: .env`, so a production `.env`
+  reaches Alembic directly, whatever env.py does. WIDER than Codex framed it: `api`, `worker`
+  and `beat` read the same `env_file`, so `docker compose up` from a checkout whose `.env` is
+  production runs the WHOLE local stack (scrape, spend, migrate) against production. That is a
+  dev-stack design decision (what config the local stack reads), so it goes to the OWNER as its
+  own PR, not folded into this one.
+- [P2] `run-audit-tests.sh` should unset the four ambient variables before pytest (a developer
+  with legitimate libpq settings would otherwise be refused), and CI's test job can set them
+  empty. Phase B.
+
+**Phase A: MERGED AND LIVE, #370 `2b397c82` (2026-09-27 12:32Z).** All five items above done as
+written. Diff review r1 NO-GO, fixed: [P1] `set_main_option()` is ConfigParser interpolation, so
+a percent-encoded password crashed env.py before the belt (belt now first, `%` escaped); [P2]
+the allowlist test did real DNS (now 127.0.0.2:1 with connect_timeout); [P2] the libpq variables
+now tested on BOTH env.py paths; [P2] the AST scan hardened (aliases, getattr/import_module, any
+`src.db` import, concatenation, f-strings, real docstrings only) with probe tests; [P3] abort
+message. r2: two "P1s" in jobs.py / rate limits were `origin/main` having moved (#368) under a
+two-dot diff; rebased. r2 also: the teardown check re-tests the libpq variables, the scan refuses
+aliased dynamic imports. r2's migrate.py P2 not adopted (same reason Codex accepted in consult
+round 4; accepted again in r3). **r3: GO, no findings.** Rebased twice more (#369, #371; branch
+protection requires an up-to-date branch), CI green each time. 42 tests, 10 mutations caught.
+After deploy: worker and api boot migrations ran through the new env.py; CI's production "Run
+Migrations" (bare alembic, ENVIRONMENT unset) succeeded.
+
+**Phase B: docs (this PR):** this plan + review, `.claude/rules/testing.md`, the stale comments
+in `tests/conftest.py` and `tests/test_pending_skip_trace_frontier_index.py`,
+`docs/BUILD_JOURNAL.md` (ii-c-2 + #370).
+
+**Next, the local-env PR (owner-approved, its own plan + Codex consult):** docker-compose's
+`api`/`worker`/`beat`/`migrate` all read `env_file: .env`; `run-audit-tests.sh` unsets the four
+libpq variables the guard now refuses; CI's test job sets them empty; `scripts/bootstrap.sh`
+wording. `.env.example` wording needs the owner (Claude's reads of it are denied).
+- Out of scope, logged: pydantic `env_file=".env"` still loads other PRODUCTION secrets into a
+  test run started from the OneDrive checkout (landmine `bare_pytest_uses_prod_env`); four
+  manual ops scripts call `load_dotenv()` on purpose.
+
 ## Deferred (logged, not in Phase 1)
-- 🛑 **SAFETY, own small PR, soon (found in the ii-c-1 review, 2026-09-27):** `alembic/env.py`
+- ✅ **DONE: #370 `2b397c82` (2026-09-27), see "Safety PR" above.** Original note:
+  **SAFETY, own small PR, soon (found in the ii-c-1 review, 2026-09-27):** `alembic/env.py`
   calls `load_dotenv()` and prefers `DATABASE_URL_MIGRATE` over `DATABASE_URL_SYNC`. The test-DB
   guard (`tests/_db_safety.py`) pins only `DATABASE_URL`/`_SYNC`, so ANY test or script that
   invokes Alembic through env.py on a machine whose `.env` names a production

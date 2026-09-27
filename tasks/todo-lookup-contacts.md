@@ -1539,12 +1539,28 @@ wording and test specifications, adopted verbatim, so this closes the consult:
   survivors found so far without exceeding either cap.
 
 ### ii-b TO BUILD (checklist; the spec = "ii-b implementation spec" as amended by S1-S6, T1-T3, U1-U2, V1-V4)
-- [ ] `src/workers/skip_trace_capacity.py`
-- [ ] dispatcher: pre-lock early exit via the helpers; in-lock allowance; refill loop; `affordable_row_count` via `credits_for`
-- [ ] `settings.py` (+ `.env.example`)
-- [ ] `tests/test_skip_trace_credit_cap.py` (absorbs `test_skip_trace_daily_cap.py`)
-- [ ] EXPLAIN gate (S3): 100k+ eligible, 15k+ blocked heads, ≤ 250 ms/round, ≤ 2 s/pass
-- [ ] mutations: read outside the lock; `rn` out of ORDER BY; refill removed; weight 2 -> 1; hold not cumulative
+- [x] `src/workers/skip_trace_capacity.py`
+- [x] dispatcher: pre-lock early exit via the helpers; in-lock allowance; refill loop; `affordable_row_count` via `credits_for`
+- [x] `settings.py` (+ `.env.example`)
+- [x] `tests/test_skip_trace_credit_cap.py` (absorbs `test_skip_trace_daily_cap.py`): 90 pass. Existing
+      skip-trace / Tracerfy / lookup suites: 475 pass (4 batches, local lookup1b DB).
+- [ ] **EXPLAIN gate (S3): FAILS at 100k+, passes at 35k.** One real dispatcher pass, account cap 1
+      credit, account 0 behind N held heads (each with an in-flight twin), 50 accounts:
+      | queued | held heads | worst `allocate` round | refill |
+      | 10,000 | 1,500 | 49 ms | all passed in 11 rounds, no truncation |
+      | 35,000 | 5,000 | 166 ms | deadline after 6 rounds (2.1 s) |
+      | 117,000 | 15,000 | ~440 ms (FAIL) | deadline after 2 rounds |
+      The round-0 query alone: 12 ms / 39 ms / 167 ms (a window sort over every eligible row, which
+      spills to disk at 117k). Much of each round's remaining time is the duplicate hold re-reading
+      the account's in-flight rows every round. CAP HARDNESS IS UNAFFECTED: truncation only ever
+      claims fewer rows, and says so (`refill_truncated`). What degrades is latency for an account
+      behind thousands of blocked rows. Prod today: 941 rows in total.
+      Fix per S3 = keyset frontier (per-account LATERAL scan from the last row considered), which
+      needs an index `(user_id, trace_type, enqueued_at, id) WHERE status = 'queued'` = migration
+      103, plus reading the in-flight set once per pass. **OWNER DECISION pending.**
+- [x] mutations, each caught: read outside the lock (1 fails); `rn` out of ORDER BY (1); refill
+      removed (4); weight 2 -> 1 (5); hold not cumulative (1). Also found and fixed by the tests: an
+      account cap with no prior spend crashed `allocate` (a Python int where SQL was needed).
 - [ ] Codex diff review to GO; owner sets prod cap values before merge
 
 ## Phase 1c - the action, frontend

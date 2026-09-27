@@ -484,7 +484,175 @@ async def test_the_round_limit_claims_what_it_found_and_says_so(
         dispatch_pending_skip_trace()
 
     assert _claimed(heads + [beyond, served]) == {served}
-    assert any("refill_truncated reason=round_limit" in r.getMessage() for r in caplog.records)
+    lines = [r.getMessage() for r in caplog.records if "refill_truncated" in r.getMessage()]
+    assert len(lines) == 1 and "reason=round_limit" in lines[0]
+    # V3: the operator can see who is still waiting (the blocked account).
+    assert "accounts_with_room=1" in lines[0]
+    assert "rounds=2" in lines[0] and "survivors=1" in lines[0]
+
+
+async def test_the_considered_limit_bounds_the_statement_and_says_so(
+        make_account, dispatcher, monkeypatch, caplog):
+    u = await make_account()
+    dispatcher(account_cap=1)
+    monkeypatch.setattr(skip_trace_dispatcher, "_REFILL_MAX_CONSIDERED", 3)
+    base = datetime.now(UTC) - timedelta(hours=2)
+    heads = []
+    for i in range(4):
+        _in_flight_twin_of(u, f"{i} CONSIDERED RD")
+        heads.append(_seed(u, address=f"{i} CONSIDERED RD", enqueued_at=base + timedelta(seconds=i)))
+    good = _seed(u, enqueued_at=base + timedelta(minutes=5))
+
+    import logging
+    with caplog.at_level(logging.WARNING):
+        dispatch_pending_skip_trace()
+
+    assert _claimed(heads + [good]) == set()
+    assert any("refill_truncated reason=considered_limit" in r.getMessage()
+               for r in caplog.records)
+
+
+def _bulk_held_run(user_id: str, n_held: int, prefix: str) -> str:
+    """n_held queued rows for one account, each with an in-flight twin (so each is
+    held), followed by ONE good row. Seeded set-wise: the per-row helper is too slow
+    for thousands. Returns the good row's pending id."""
+    sc, job, twin_job = (str(uuid.uuid4()) for _ in range(3))
+    base = datetime.now(UTC) - timedelta(hours=3)
+    with system_sync_session() as db:
+        db.execute(text("""
+            INSERT INTO scraper_configs (id, user_id, name, county, state, record_type, fields,
+                enrichment, schedule, deliver, skip_trace_enabled, active)
+            VALUES (:sc, :u, 'cap bulk', 'pierce', 'WA', 'probate', '[]'::json, '[]'::json,
+                    '{"frequency":"manual"}'::json, '{"format":"csv","emails":[]}'::json, true, true)
+        """), {"sc": sc, "u": user_id})
+        for j in (job, twin_job):
+            db.execute(text("""
+                INSERT INTO jobs (id, user_id, scraper_config_id, status, trigger, page_current,
+                                  page_total, record_count, retry_count)
+                VALUES (:j, :u, :sc, 'done', 'manual', 0, 0, 0, 0)
+            """), {"j": j, "u": user_id, "sc": sc})
+        for job_id, status, rstatus in ((job, "queued", "queued"),
+                                        (twin_job, "submitted", "submitted")):
+            db.execute(text("""
+                WITH s AS (SELECT g, gen_random_uuid() AS rid FROM generate_series(1, :n) g),
+                r AS (INSERT INTO results (id, job_id, user_id, is_duplicate, skip_trace_status,
+                                           party_name, property_address, enrichment_data, created_at)
+                      SELECT rid, :j, :u, false, :rs, 'CAP TEST OWNER',
+                             :p || '-' || g || ' BULK ST', '{}'::json, now() FROM s RETURNING 1)
+                INSERT INTO pending_skip_trace_rows (id, job_id, result_id, user_id,
+                    property_address, city, state, trace_type, status, enqueued_at,
+                    submitted_at, tracerfy_queue_id)
+                SELECT gen_random_uuid(), :j, rid, :u, :p || '-' || g || ' BULK ST', 'TACOMA', 'WA',
+                       'normal', :st, CAST(:base AS timestamptz) + g * interval '1 ms',
+                       CASE WHEN :st = 'submitted' THEN now() - interval '3 days' END,
+                       CASE WHEN :st = 'submitted' THEN 900003 END
+                FROM s
+            """), {"n": n_held, "j": job_id, "u": user_id, "rs": rstatus, "st": status,
+                   "p": prefix, "base": base})
+        db.commit()
+    return _seed(user_id, enqueued_at=base + timedelta(minutes=30))
+
+
+@pytest.mark.parametrize(("n_held", "reached"), [(4094, True), (4095, False)])
+async def test_the_documented_cutoff_is_room_times_4095(
+        make_account, dispatcher, monkeypatch, n_held, reached):
+    """V2/V4 with the DEFAULT 12 rounds: at room 1 a pass inspects 1 + 2 + ... + 2**11
+    = 4095 rows. A good row behind 4094 held ones is reached; behind 4095 it is not.
+    The deadline is lifted so only the round limit decides."""
+    u = await make_account()
+    dispatcher(account_cap=1)
+    monkeypatch.setattr(skip_trace_dispatcher, "_REFILL_DEADLINE", timedelta(minutes=5))
+    good = _bulk_held_run(u, n_held, f"C{n_held}")
+
+    dispatch_pending_skip_trace()
+
+    assert (_claimed([good]) == {good}) is reached
+
+
+# ── Review findings (Codex ii-b diff review) ──────────────────────────────────
+
+
+async def test_a_row_retyped_between_allocation_and_lock_is_not_claimed_at_the_wrong_price(
+        make_account, dispatcher, monkeypatch):
+    """P1: 102 lets an UNSENT row change type. One allocated as advanced and
+    retyped to normal before the lock must not be sent in the advanced batch while
+    the ledger charges it 1 credit."""
+    u = await make_account()
+    dispatcher()
+    rows = [_seed(u, trace_type="advanced") for _ in range(3)]
+    real_allocate = skip_trace_dispatcher.allocate
+    retyped: list[str] = []
+
+    def allocate_then_retype(*a, **k):
+        ids = real_allocate(*a, **k)
+        if ids and not retyped:
+            retyped.append(ids[0])
+            with system_sync_session() as other:
+                other.execute(text("UPDATE pending_skip_trace_rows SET trace_type = 'normal' "
+                                   "WHERE id = :p"), {"p": ids[0]})
+                other.commit()
+        return ids
+    monkeypatch.setattr(skip_trace_dispatcher, "allocate", allocate_then_retype)
+
+    dispatch_pending_skip_trace()
+
+    assert retyped, "the advanced pass allocated nothing"
+    assert _claimed(rows) == set(rows) - set(retyped)
+    with system_sync_session() as db:
+        assert db.execute(text("SELECT status, trace_type FROM pending_skip_trace_rows "
+                               "WHERE id = :p"), {"p": retyped[0]}).one() == ("queued", "normal")
+
+
+async def test_a_full_account_is_not_even_allocated(make_account, dispatcher, monkeypatch):
+    """A zero-room account must reach allocate() as room 0, not fall back to the
+    default room, or the pass locks and inspects rows it can never claim."""
+    u = await make_account()
+    dispatcher(account_cap=2)
+    _spent(u, 2)
+    queued = [_seed(u) for _ in range(5)]
+    real_allocate = skip_trace_dispatcher.allocate
+    seen: list[tuple[dict, int]] = []
+
+    def recording_allocate(*a, **k):
+        ids = real_allocate(*a, **k)
+        seen.append((dict(k["account_rows"]), len(ids)))
+        return ids
+    monkeypatch.setattr(skip_trace_dispatcher, "allocate", recording_allocate)
+
+    dispatch_pending_skip_trace()
+
+    assert _claimed(queued) == set()
+    assert seen and all(n == 0 for _, n in seen), seen
+    assert seen[0][0] == {u: 0}
+
+
+async def test_a_second_claimer_is_shut_out_while_a_pass_holds_the_lock(
+        make_account, dispatcher, monkeypatch):
+    """Two dispatchers at once (a beat double-fire): while one pass holds the claim
+    lock, the other defers and claims nothing, so they cannot both spend the same
+    allowance. Real second session, real advisory lock, deterministic order."""
+    import threading
+
+    u = await make_account()
+    dispatcher(account_cap=3)
+    rows = [_seed(u) for _ in range(6)]
+    real_allocate = skip_trace_dispatcher.allocate
+    second: dict = {}
+
+    def allocate_while_another_tick_runs(*a, **k):
+        if not second:
+            t = threading.Thread(target=lambda: second.update(out=dispatch_pending_skip_trace()))
+            second["started"] = True
+            t.start()
+            t.join(timeout=60)
+        return real_allocate(*a, **k)
+    monkeypatch.setattr(skip_trace_dispatcher, "allocate", allocate_while_another_tick_runs)
+
+    dispatch_pending_skip_trace()
+
+    assert second["out"].get("deferred") == "claim_locked"
+    assert second["out"]["submitted_rows"] == 0
+    assert len(_claimed(rows)) == 3
 
 
 async def test_an_early_deadline_claims_the_survivors_found_so_far(

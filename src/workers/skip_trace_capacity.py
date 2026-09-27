@@ -27,8 +27,20 @@ from __future__ import annotations
 from datetime import datetime
 from typing import NamedTuple
 
-from sqlalchemy import Integer, case, column, func, literal, select, values
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy import (
+    Integer,
+    String,
+    any_,
+    bindparam,
+    case,
+    cast,
+    column,
+    func,
+    literal,
+    select,
+    values,
+)
+from sqlalchemy.dialects.postgresql import ARRAY, UUID
 
 from src.config import settings
 from src.utils.logger import setup_logger
@@ -172,9 +184,12 @@ def allocate(
     return [str(i) for i in db.execute(stmt).scalars()]
 
 
-def lock_allocated(db, ids: list[str]) -> list:
-    """Lock the allocated rows, skipping any another transaction holds, and
-    return the ones locked IN ALLOCATION ORDER (FOR UPDATE does not keep it)."""
+def lock_allocated(db, ids: list[str], trace_type: str) -> list:
+    """Lock the allocated rows that are STILL queued and still of this pass's type,
+    skipping any another transaction holds, and return them IN ALLOCATION ORDER
+    (FOR UPDATE does not keep it). The re-check matters: 102 lets an unsent row
+    change type, and a row allocated as advanced but claimed after becoming normal
+    would be sent at one price and counted at another."""
     if not ids:
         return []
     from src.db.models import PendingSkipTraceRow
@@ -183,7 +198,13 @@ def lock_allocated(db, ids: list[str]) -> list:
         str(r.id): r
         for r in db.execute(
             select(PendingSkipTraceRow)
-            .where(PendingSkipTraceRow.id.in_(ids))
+            .where(
+                PendingSkipTraceRow.id == any_(cast(
+                    bindparam("allocated_ids", list(ids), type_=ARRAY(String)),
+                    ARRAY(UUID(as_uuid=False)))),
+                PendingSkipTraceRow.status == "queued",
+                PendingSkipTraceRow.trace_type == trace_type,
+            )
             .with_for_update(skip_locked=True, of=PendingSkipTraceRow)
         ).scalars()
     }

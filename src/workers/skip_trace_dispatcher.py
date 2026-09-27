@@ -46,6 +46,10 @@ _SPEND_WINDOW = timedelta(days=1)
 # about log2(k) rounds. Past either bound the pass claims what it has found.
 _REFILL_MAX_ROUNDS = 12
 _REFILL_DEADLINE = timedelta(seconds=2)
+# Most row ids one pass may consider. They are excluded from each later round as ONE
+# array parameter, so the statement stays bounded (Codex ii-b review); past this the
+# pass claims what it has, like the other two bounds.
+_REFILL_MAX_CONSIDERED = 20_000
 
 
 @app.task(name="src.workers.skip_trace_dispatcher.dispatch_pending_skip_trace")
@@ -63,8 +67,10 @@ def dispatch_pending_skip_trace() -> dict:
         _logger.warning("TRACERFY_API_TOKEN missing — dispatcher tick skipped")
         return {"skipped": "no_token"}
 
-    from sqlalchemy import and_, func, select, text, update
+    from sqlalchemy import String, all_, and_, bindparam, cast, func, select, text, update
     from sqlalchemy import true as sa_true
+    from sqlalchemy.dialects.postgresql import ARRAY
+    from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 
     from src.api.lead_actionability import DELIVERY_EXCLUDED_KEY, OVER_QUOTA
     from src.api.results_category import skip_trace_eligible_condition
@@ -298,7 +304,10 @@ def dispatch_pending_skip_trace() -> dict:
                                 PendingSkipTraceRow.enqueued_at <= watermark,
                                 # Already considered this pass: ranked out, so the
                                 # next round ranks what is LEFT (S1).
-                                PendingSkipTraceRow.id.notin_(exclude)
+                                PendingSkipTraceRow.id != all_(cast(
+                                    bindparam("considered_ids", list(exclude),
+                                              type_=ARRAY(String)),
+                                    ARRAY(PG_UUID(as_uuid=False))))
                                 if exclude else sa_true(),
                                 # Empty in the normal case (100 enforced), so this
                                 # is a no-op unless the invariant is actually off.
@@ -332,6 +341,7 @@ def dispatch_pending_skip_trace() -> dict:
                 withdrawn: list = []
                 unsubmittable: list = []
                 considered: set[str] = set()
+                seen_users: set[str] = set()
                 left_queued = held = 0
                 started = datetime.now(UTC)
                 truncated = None
@@ -339,6 +349,9 @@ def dispatch_pending_skip_trace() -> dict:
                 while True:
                     if rounds >= _REFILL_MAX_ROUNDS:
                         truncated = "round_limit"
+                        break
+                    if len(considered) >= _REFILL_MAX_CONSIDERED:
+                        truncated = "considered_limit"
                         break
                     # Never before the first round: a pass always gets one allocation.
                     if rounds and datetime.now(UTC) - started >= _REFILL_DEADLINE:
@@ -361,13 +374,19 @@ def dispatch_pending_skip_trace() -> dict:
                     ids = allocate(
                         db, _eligible(considered),
                         account_rows=room_left or {}, default_rows=default_rows,
-                        lookahead=look, limit=min(BATCH_ROW_LIMIT, global_left * look),
+                        lookahead=look,
+                        limit=min(BATCH_ROW_LIMIT, global_left * look,
+                                  _REFILL_MAX_CONSIDERED - len(considered)),
                     )
                     rounds += 1
                     if not ids:
                         break
                     considered.update(ids)
-                    new = lock_allocated(db, ids)
+                    # Locked only if STILL queued and still this pass's type: an unsent
+                    # row may be retyped (102 allows it) between allocate and lock, and
+                    # an advanced row sent as normal credits would break the cap (P1).
+                    new = lock_allocated(db, ids, trace_type)
+                    seen_users.update(str(r.user_id) for r in new)
                     # Buy a lookup only for a lead that was actually delivered.
                     new, drop, later = _partition_still_deliverable(db, new)
                     if drop:
@@ -388,14 +407,23 @@ def dispatch_pending_skip_trace() -> dict:
                         global_rows=global_rows,
                     )
                 if truncated:
+                    if account_room is None:
+                        with_room = "unbounded"
+                    else:
+                        took: dict[str, int] = {}
+                        for r in rows:
+                            took[str(r.user_id)] = took.get(str(r.user_id), 0) + 1
+                        with_room = str(sum(
+                            1 for u in seen_users
+                            if account_room.get(u, default_rows) - took.get(u, 0) > 0))
                     _logger.warning(
                         "Dispatcher: refill_truncated reason=%s trace_type=%s rounds=%d "
                         "elapsed_ms=%d global_rows=%d global_left=%d considered=%d "
-                        "blocked=%d survivors=%d",
+                        "blocked=%d survivors=%d accounts_with_room=%s",
                         truncated, trace_type, rounds,
                         (datetime.now(UTC) - started) / timedelta(milliseconds=1),
                         global_rows, global_rows - len(rows), len(considered),
-                        len(considered) - len(rows), len(rows),
+                        len(considered) - len(rows), len(rows), with_room,
                     )
                 if withdrawn:
                     _logger.info(

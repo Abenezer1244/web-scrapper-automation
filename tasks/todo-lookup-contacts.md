@@ -1566,7 +1566,66 @@ wording and test specifications, adopted verbatim, so this closes the consult:
 - [x] mutations, each caught: read outside the lock (1 fails); `rn` out of ORDER BY (1); refill
       removed (4); weight 2 -> 1 (5); hold not cumulative (1). Also found and fixed by the tests: an
       account cap with no prior spend crashed `allocate` (a Python int where SQL was needed).
-- [ ] Codex diff review to GO; owner sets prod cap values before merge
+- [x] Codex diff review to GO (3 rounds; P1 retype-between-allocate-and-lock fixed; P2 room VALUES
+      -> unnest); owner delegated the cap values: SKIP_TRACE_DAILY_CREDIT_CAP=2000,
+      SKIP_TRACE_ACCOUNT_DAILY_CREDIT_CAP=500 set on api + worker.
+
+**ii-b MERGED + LIVE 2026-09-27 04:11Z: PR #364 `19230e72`.** Merged after an all-zero quiet check;
+first dispatcher tick on the new code 04:17Z succeeded (1.05 s, no errors, no warnings).
+
+## Phase 1b-1b-ii-c — the keyset frontier (PLAN, 2026-09-27, BEFORE Codex consult)
+
+Why: ii-b's S3 gate fails at 117k queued / 15k held heads (~440 ms per `allocate` round, the pass
+truncated by the deadline after 2 rounds): every round re-ranks EVERY eligible row with a window
+sort that spills to disk, and every round's duplicate hold re-reads the account's in-flight rows.
+Owner: must land before Phase 1c can create large queues. Nothing about cap hardness changes.
+
+**Split (5-file rule), same shape as ii-a / ii-b:**
+- **ii-c-1** migration 103 + `models.py` + `alembic/env.py` + `tests/test_pending_skip_trace_frontier_index.py`.
+- **ii-c-2** `skip_trace_capacity.py` + `skip_trace_dispatcher.py` + `tests/test_skip_trace_credit_cap.py`.
+
+**ii-c-1: migration 103.** `ix_pending_skip_trace_queued_frontier ON pending_skip_trace_rows
+(user_id, trace_type, enqueued_at, id) WHERE status = 'queued'`, CREATE INDEX CONCURRENTLY in
+autocommit, exactly 102's discipline: identity by the whole `pg_get_indexdef()` plus
+`indisvalid`; an invalid or wrong-shaped same-named index on this table is dropped and rebuilt
+(safe only under migrate.py's advisory lock); a same-named index on ANOTHER table aborts. Listed in
+`CONCURRENT_INDEXES`; declared on the model. No CHECK, no trigger, no data change. Downgrade drops
+it only if it sits on this table. Tests: shape, a wrong-shape same-named index rebuilt, replay
+(downgrade 102 -> upgrade -> no-op upgrade), the autouse repair fixture pattern from 102's tests.
+
+**ii-c-2: the keyset `allocate`.** Replaces "re-rank everything minus `considered`" with a
+per-account FRONTIER:
+- Round 0 finds the accounts with queued rows of this type (a loose index scan on the new index:
+  recursive CTE, one probe per account), each with frontier = (-infinity).
+- Each round: `unnest(:users, :after_at, :after_id, :per_account_limit) AS a` CROSS JOIN LATERAL
+  (the dispatcher's eligibility select, unchanged predicates + watermark, `WHERE p.user_id =
+  a.user_id AND (p.enqueued_at, p.id) > (a.after_at, a.after_id) ORDER BY p.enqueued_at, p.id
+  LIMIT a.lim`), `row_number()` over each account's lateral output = rank; order `(rank,
+  enqueued_at, id)`; LIMIT = the round's global limit. Per-account limit = `room * 2**r` (NULL
+  room -> the global limit).
+- Because rank 1 of every account precedes rank 2 of any, the rows returned for an account are a
+  PREFIX of its candidates, so its frontier advances to its last RETURNED row (enqueued_at, id).
+  Rows cut by the global LIMIT are not returned and not passed. An account whose lateral returned
+  fewer than its limit is exhausted and leaves the account list.
+- `considered` (the id-exclusion array) and `_REFILL_MAX_CONSIDERED` are removed: the frontier IS
+  the exclusion and the statement no longer grows with the pass. The count stays in telemetry.
+- Everything else in the pass is ii-b unchanged: lock only if still queued and of this type, the
+  deliverability / submittable filters, the CUMULATIVE hold, `take_within_caps`, 12 rounds / 2 s,
+  the in-lock spend read, READ COMMITTED.
+- **In-flight read once per account per pass:** `_hold_answers_in_flight` takes an optional
+  per-pass cache of each account's in-flight answer keys and queries only accounts not yet in
+  it. Stale in the SAFE direction only: under the claim lock no other tick adds in-flight rows;
+  an ingest finishing mid-pass can only remove one, so a cached key can only hold a row that
+  could have gone (it goes next tick), never let a duplicate through. `_fresh_answers` is still
+  read every round (keyed, cheap).
+- **Gate:** the ii-b S3 script re-run at 117k queued / 15k held heads: every `allocate` round
+  ≤ 250 ms and the refill ≤ 2 s; and at 10k and 35k no worse than ii-b. All ii-b tests pass
+  unchanged except those that named `considered_limit`.
+
+**Risks to check in the consult:** keyset ties (enqueued_at equal: id breaks them; the tuple
+compare must match the ORDER BY exactly); a row whose `enqueued_at` changes mid-pass (VERIFIED
+none: it is set only by the server default at insert; every other use in src/ and scripts/ reads it); rows inserted mid-pass BEHIND a frontier (the watermark again, V1); LIMIT
+with an expression; accounts discovered only after round 0 (none: the watermark fixes the set).
 
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever

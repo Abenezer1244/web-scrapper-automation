@@ -25,8 +25,31 @@ from typing import NamedTuple
 from src.config import settings
 from src.utils.logger import setup_logger
 from src.workers import app
+from src.workers.skip_trace_capacity import (
+    BATCH_ROW_LIMIT,
+    allocate,
+    batch_rows,
+    credits_for,
+    lock_allocated,
+    resolve_caps,
+    row_allowance,
+    spent_credits,
+    take_within_caps,
+)
 
 _logger = setup_logger("worker.skip_trace_dispatcher")
+
+# The rolling window both spend caps are measured over.
+_SPEND_WINDOW = timedelta(days=1)
+# Bounds on one pass's refill (Codex ii-b consult T1, U2): round r allocates up to
+# 2**r times each account's remaining room, so a run of k blocked rows is passed in
+# about log2(k) rounds. Past either bound the pass claims what it has found.
+_REFILL_MAX_ROUNDS = 12
+_REFILL_DEADLINE = timedelta(seconds=2)
+# Most row ids one pass may consider. They are excluded from each later round as ONE
+# array parameter, so the statement stays bounded (Codex ii-b review); past this the
+# pass claims what it has, like the other two bounds.
+_REFILL_MAX_CONSIDERED = 20_000
 
 
 @app.task(name="src.workers.skip_trace_dispatcher.dispatch_pending_skip_trace")
@@ -44,8 +67,10 @@ def dispatch_pending_skip_trace() -> dict:
         _logger.warning("TRACERFY_API_TOKEN missing — dispatcher tick skipped")
         return {"skipped": "no_token"}
 
-    from sqlalchemy import and_, func, select, text, update
+    from sqlalchemy import String, all_, and_, bindparam, cast, func, select, text, update
     from sqlalchemy import true as sa_true
+    from sqlalchemy.dialects.postgresql import ARRAY
+    from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 
     from src.api.lead_actionability import DELIVERY_EXCLUDED_KEY, OVER_QUOTA
     from src.api.results_category import skip_trace_eligible_condition
@@ -66,36 +91,28 @@ def dispatch_pending_skip_trace() -> dict:
     # every tenant for 7+ hours once. A breaker that can only decline to start a
     # tick cannot cause that class of failure.
     #
-    # Defaults to 0 = DISABLED, so deploying this changes nothing until an
-    # operator picks a number. Rows are not lost when it trips — they stay
-    # queued and flow on the next tick under the cap.
-    daily_cap = max(0, settings.SKIP_TRACE_DAILY_ROW_CAP)
-    if daily_cap:
-        # NOTE: do NOT import datetime/timedelta here. They are already imported
-        # at module scope (line 22) and used later in this same function; a
-        # function-local `from datetime import ...` rebinds the name as LOCAL for
-        # the whole function body, so every later `datetime.now(UTC)` raises
-        # UnboundLocalError on the path where this branch does not run. That
-        # broke dispatch outright and the skip-trace suite caught it.
-        from sqlalchemy import func as _func
-        from sqlalchemy import select as _select
-
-        from src.db.models import PendingSkipTraceRow as _Row
+    # Unset or 0 = DISABLED. Rows are not lost when it trips: they stay queued
+    # and flow on a later tick under the cap. This is only the cheap early exit
+    # (and the page) for the GLOBAL cap; the caps themselves are enforced inside
+    # the claim lock below, per pass, where they are hard.
+    #
+    # NOTE: do NOT import datetime/timedelta inside this function. They are
+    # imported at module scope and used later in it; a function-local
+    # `from datetime import ...` rebinds the name as LOCAL for the whole body, so
+    # every later `datetime.now(UTC)` raises UnboundLocalError on the path where
+    # the import did not run. That once broke dispatch outright.
+    caps = resolve_caps()
+    if caps.global_cap:
         from src.db.session import system_sync_session as _sess
 
-        since = datetime.now(UTC) - timedelta(days=1)
         with _sess() as _db:
-            spent_today = _db.execute(
-                _select(_func.count()).select_from(_Row).where(
-                    _Row.submitted_at.is_not(None), _Row.submitted_at >= since
-                )
-            ).scalar_one()
-        if spent_today >= daily_cap:
+            spent_now, _ = spent_credits(_db, datetime.now(UTC) - _SPEND_WINDOW)
+        if spent_now >= caps.global_cap:
             _logger.error(
-                "Skip-trace DAILY CAP reached: %d rows submitted in the last 24h "
-                "(cap %d). Holding this tick; queued rows are untouched and will "
+                "Skip-trace DAILY CAP reached: %d credits claimed in the last 24h "
+                "(cap %d, from %s). Holding this tick; queued rows are untouched and "
                 "resume when the rolling window clears or the cap is raised.",
-                spent_today, daily_cap,
+                spent_now, caps.global_cap, caps.global_source,
             )
             try:
                 from src.workers.ops_alerts import send_ops_alert
@@ -103,14 +120,15 @@ def dispatch_pending_skip_trace() -> dict:
                 send_ops_alert(
                     "skip_trace_daily_cap", "dispatcher",
                     "Skip-trace daily spend cap reached",
-                    f"{spent_today} rows were submitted to Tracerfy in the last "
-                    f"24h, at or above SKIP_TRACE_DAILY_ROW_CAP={daily_cap}. "
-                    f"Dispatch is paused. Raise the cap or investigate whether "
-                    f"an account is driving unexpected volume.",
+                    f"{spent_now} Tracerfy credits were claimed in the last 24h, at or "
+                    f"above {caps.global_source}={caps.global_cap} (a normal lookup costs "
+                    f"1 credit, an advanced one 2). Dispatch is paused. Raise the cap or "
+                    f"investigate whether an account is driving unexpected volume.",
                 )
             except Exception:  # noqa: BLE001 — an alert failure must not change the decision
                 _logger.exception("skip-trace daily-cap alert failed to send")
-            return {"skipped": "daily_cap", "spent_today": spent_today, "cap": daily_cap}
+            return {"skipped": "daily_cap", "spent_credits": spent_now,
+                    "cap_credits": caps.global_cap, "cap_source": caps.global_source}
 
     max_batches = max(1, settings.SKIP_TRACE_MAX_BATCHES_PER_TICK)
     submitted_batches = 0
@@ -222,17 +240,49 @@ def dispatch_pending_skip_trace() -> dict:
                     _logger.info("Dispatcher: another tick is claiming; deferring to the next tick")
                     return _tick_result(submitted_batches, submitted_rows, errors,
                                         deferred="claim_locked")
-                rows = (
-                    db.execute(
-                        select(PendingSkipTraceRow)
-                        # Eligibility is decided HERE, in SQL, not after the LIMIT:
-                        # filtering in Python would let ineligible rows occupy the
-                        # FIFO head and starve everything behind them. A row goes
-                        # out only once its job delivered (done, or billed whatever
-                        # status was written over it, or a terminal job from before
-                        # billing was stamped: _job_delivered_sql) and its lead is
-                        # still deliverable and still waiting.
-                        # Tenant-pinned joins: this runs in a system session.
+                # Everything from here to the claim commit runs under that lock, in
+                # READ COMMITTED: every earlier claim committed its submitted_at before
+                # releasing it, so the spend read below includes it, and no two
+                # passes can claim the same allowance (Codex ii-b consult U1).
+                cost = credits_for(trace_type)
+                caps = resolve_caps()
+                global_spent, spent_by_user = spent_credits(
+                    db, datetime.now(UTC) - _SPEND_WINDOW)
+                global_rows = batch_rows(caps.global_cap, global_spent, cost)
+                default_rows = row_allowance(caps.account_cap, 0, cost)
+                # Each account's room for this pass, for the accounts that already
+                # spent; any other account has default_rows (None = no account cap).
+                account_room = (
+                    None if default_rows is None else
+                    {u: row_allowance(caps.account_cap, s, cost)
+                     for u, s in spent_by_user.items()}
+                )
+                if global_rows == 0:
+                    db.rollback()
+                    _logger.info(
+                        "Dispatcher: no %s rows fit under the global cap (%d of %d "
+                        "credits claimed in 24h)", trace_type, global_spent, caps.global_cap,
+                    )
+                    continue
+                # Best-effort bound on rows arriving mid-pass (V1). The hard bound on
+                # the pass is the round limit and deadline below.
+                watermark = db.execute(text("SELECT clock_timestamp()")).scalar()
+
+                def _eligible(exclude: set[str], trace_type=trace_type, watermark=watermark):
+                    """Every row that may be bought now, as (id, user_id, enqueued_at).
+                    Eligibility is decided HERE, in SQL, not after a LIMIT: filtering in
+                    Python would let ineligible rows occupy the head and starve
+                    everything behind them. A row goes out only once its job delivered
+                    (done, or billed whatever status was written over it, or a terminal
+                    job from before billing was stamped: _job_delivered_sql) and its
+                    lead is still deliverable and still waiting. Tenant-pinned joins:
+                    this runs in a system session."""
+                    return (
+                        select(
+                            PendingSkipTraceRow.id,
+                            PendingSkipTraceRow.user_id,
+                            PendingSkipTraceRow.enqueued_at,
+                        )
                         .join(
                             Job,
                             and_(
@@ -251,6 +301,14 @@ def dispatch_pending_skip_trace() -> dict:
                             and_(
                                 PendingSkipTraceRow.status == "queued",
                                 PendingSkipTraceRow.trace_type == trace_type,
+                                PendingSkipTraceRow.enqueued_at <= watermark,
+                                # Already considered this pass: ranked out, so the
+                                # next round ranks what is LEFT (S1).
+                                PendingSkipTraceRow.id != all_(cast(
+                                    bindparam("considered_ids", list(exclude),
+                                              type_=ARRAY(String)),
+                                    ARRAY(PG_UUID(as_uuid=False))))
+                                if exclude else sa_true(),
                                 # Empty in the normal case (100 enforced), so this
                                 # is a no-op unless the invariant is actually off.
                                 PendingSkipTraceRow.result_id.notin_(
@@ -270,24 +328,104 @@ def dispatch_pending_skip_trace() -> dict:
                                 _atip_paid_allowed_sql(),
                             )
                         )
-                        .order_by(PendingSkipTraceRow.enqueued_at)
-                        .limit(5000)  # Tracerfy handles large batches; cap for safety
-                        # Lock the FIFO head so a concurrent tick (beat double-fire
-                        # across a redeploy, a tick outliving its interval) skips
-                        # these rows instead of reading the same 'queued' set. OF
-                        # the queue table only: jobs/results stay unlocked.
-                        .with_for_update(skip_locked=True, of=PendingSkipTraceRow)
+                        .subquery("eligible")
                     )
-                    .scalars()
-                    .all()
-                )
-                if not rows:
-                    continue
 
-                # Buy a lookup only for a lead that was actually delivered.
-                rows, withdrawn, left_queued = _partition_still_deliverable(db, rows)
+                # REFILL (Codex R2, R3, S1, T1, U2). Rounds allocate fairly ranked
+                # candidates, lock them (SKIP LOCKED: another tick's rows are passed
+                # over), filter them, and hold duplicates CUMULATIVELY over everything
+                # found so far. Only rows that survive all of that are charged to an
+                # account's room or the batch, so a blocked head is replaced by the
+                # next row instead of costing its account a turn.
+                rows: list = []
+                withdrawn: list = []
+                unsubmittable: list = []
+                considered: set[str] = set()
+                seen_users: set[str] = set()
+                left_queued = held = 0
+                started = datetime.now(UTC)
+                truncated = None
+                rounds = 0
+                while True:
+                    if rounds >= _REFILL_MAX_ROUNDS:
+                        truncated = "round_limit"
+                        break
+                    if len(considered) >= _REFILL_MAX_CONSIDERED:
+                        truncated = "considered_limit"
+                        break
+                    # Never before the first round: a pass always gets one allocation.
+                    if rounds and datetime.now(UTC) - started >= _REFILL_DEADLINE:
+                        truncated = "deadline"
+                        break
+                    global_left = global_rows - len(rows)
+                    if global_left <= 0:
+                        break
+                    look = 2 ** rounds
+                    room_left = None
+                    if account_room is not None:
+                        taken_by_user: dict[str, int] = {}
+                        for r in rows:
+                            u = str(r.user_id)
+                            taken_by_user[u] = taken_by_user.get(u, 0) + 1
+                        room_left = {
+                            u: max(0, account_room.get(u, default_rows) - taken_by_user.get(u, 0))
+                            for u in set(account_room) | set(taken_by_user)
+                        }
+                    ids = allocate(
+                        db, _eligible(considered),
+                        account_rows=room_left or {}, default_rows=default_rows,
+                        lookahead=look,
+                        limit=min(BATCH_ROW_LIMIT, global_left * look,
+                                  _REFILL_MAX_CONSIDERED - len(considered)),
+                    )
+                    rounds += 1
+                    if not ids:
+                        break
+                    considered.update(ids)
+                    # Locked only if STILL queued and still this pass's type: an unsent
+                    # row may be retyped (102 allows it) between allocate and lock, and
+                    # an advanced row sent as normal credits would break the cap (P1).
+                    new = lock_allocated(db, ids, trace_type)
+                    seen_users.update(str(r.user_id) for r in new)
+                    # Buy a lookup only for a lead that was actually delivered.
+                    new, drop, later = _partition_still_deliverable(db, new)
+                    if drop:
+                        _cancel_undeliverable(db, drop)
+                        withdrawn.extend(drop)
+                    left_queued += later
+                    new, bad = _partition_submittable(new)
+                    if bad:
+                        _fail_unsubmittable(db, bad)
+                        unsubmittable.extend(bad)
+                    # One answer, bought once: no second row for an (account, address)
+                    # whose lookup is at Tracerfy now or earlier in this batch. Earlier
+                    # survivors come first, so they keep their place (R2).
+                    kept, n_held = _hold_answers_in_flight(db, rows + new)
+                    held += n_held
+                    rows = take_within_caps(
+                        kept, account_room=account_room, default_rows=default_rows,
+                        global_rows=global_rows,
+                    )
+                if truncated:
+                    if account_room is None:
+                        with_room = "unbounded"
+                    else:
+                        took: dict[str, int] = {}
+                        for r in rows:
+                            took[str(r.user_id)] = took.get(str(r.user_id), 0) + 1
+                        with_room = str(sum(
+                            1 for u in seen_users
+                            if account_room.get(u, default_rows) - took.get(u, 0) > 0))
+                    _logger.warning(
+                        "Dispatcher: refill_truncated reason=%s trace_type=%s rounds=%d "
+                        "elapsed_ms=%d global_rows=%d global_left=%d considered=%d "
+                        "blocked=%d survivors=%d accounts_with_room=%s",
+                        truncated, trace_type, rounds,
+                        (datetime.now(UTC) - started) / timedelta(milliseconds=1),
+                        global_rows, global_rows - len(rows), len(considered),
+                        len(considered) - len(rows), len(rows), with_room,
+                    )
                 if withdrawn:
-                    _cancel_undeliverable(db, withdrawn)
                     _logger.info(
                         "Dispatcher: %d %s row(s) withdrawn before submit: the job did "
                         "not deliver, or the lead is now a same-run sibling or over the plan "
@@ -299,27 +437,20 @@ def dispatch_pending_skip_trace() -> dict:
                         "still running, or the lead is being updated)",
                         left_queued, trace_type,
                     )
-
                 # Tracerfy's batch endpoint REQUIRES address + city + state on
                 # every row, and a row missing one is not rejected loudly — it is
                 # dropped from the upload. Production queue 162456: we sent 4 rows,
                 # Tracerfy reported rows_uploaded=3. The dropped row then never
                 # appears in the result CSV, so the ingest never matches it, so it
                 # sits at 'submitted' forever and its lead reads "Processing" in the
-                # UI indefinitely. Fail it HERE — terminally and visibly — instead of
-                # shipping it to be silently discarded.
-                rows, unsubmittable = _partition_submittable(rows)
+                # UI indefinitely. Those rows were failed above, terminally and visibly.
                 if unsubmittable:
-                    _fail_unsubmittable(db, unsubmittable)
                     msg = (
                         f"{len(unsubmittable)} {trace_type} row(s) dropped before "
                         "submit: missing address/city/state"
                     )
                     errors.append(msg)
                     _logger.warning("Dispatcher: %s", msg)
-                # One answer, bought once: no second row for an (account, address) whose
-                # lookup is at Tracerfy now or earlier in this same batch.
-                rows, held = _hold_answers_in_flight(db, rows)
                 if held:
                     _logger.info(
                         "Dispatcher: %d %s row(s) held: the same account's lookup for "
@@ -1929,7 +2060,6 @@ def _alert_stale_claims(db) -> None:
         _logger.warning("stale-claim check failed: %s", str(exc)[:120])
 
 
-_CREDITS_PER_ROW = {"normal": 1, "advanced": 2}
 # Tracerfy 402 body (observed 2026-09-02): {"error":"Insufficient credits for
 # normal trace. You need 226 more credits to complete this request. ..."}
 _NEED_MORE_CREDITS_RE = re.compile(r"need\s+(\d+)\s+more\s+credits?", re.IGNORECASE)
@@ -1941,12 +2071,13 @@ def affordable_row_count(error_message: str, n_rows: int, trace_type: str) -> in
     not carry the shortfall (unknown → do not guess) or nothing is affordable.
 
     Pure so it is unit-testable; the dispatcher slices the FIFO head
-    `rows[:affordable]` and the matching payload together.
+    `rows[:affordable]` and the matching payload together. An unknown trace_type
+    raises (credits_for) rather than being priced at 1 credit (Codex ii-b S4).
     """
+    per_row = credits_for(trace_type)
     m = _NEED_MORE_CREDITS_RE.search(error_message or "")
     if not m or n_rows <= 0:
         return 0
-    per_row = _CREDITS_PER_ROW.get(trace_type, 1)
     shortfall = int(m.group(1))
     available = n_rows * per_row - shortfall
     if available <= 0:

@@ -1369,6 +1369,205 @@ complete; downgrade scoped). Open:
   drop any trigger anyway. No delete guard, so account-deletion cascades and the retention purge
   are untouched.
 
+**ii-a MERGED + LIVE 2026-09-26: PR #361 `4b963d1c`.** Merged after an all-zero quiet check;
+verified in prod by the objects (index, CHECK, trigger all present). PG 17.6.
+
+### ii-b implementation spec (2026-09-26, post-102, BEFORE Codex consult)
+Branch `feat/lookup-1b1b-ii-b-cap` off `4b963d1c`. Supersedes Design 1-5 above where they differ;
+R1-R11 still bind. Files (5): NEW `src/workers/skip_trace_capacity.py`,
+`src/workers/skip_trace_dispatcher.py`, `src/config/settings.py`, `.env.example`, NEW
+`tests/test_skip_trace_credit_cap.py` (absorbs `tests/test_skip_trace_daily_cap.py`, which is
+deleted: a 6th path, but a deletion, R11).
+
+What 102 now guarantees, and what ii-b may therefore rely on: every row's `trace_type` is
+'normal' or 'advanced' (CHECK); a spent row's type never changes (trigger); the spent query has
+its index. ii-b still RAISES on an unknown type in `credits_for` (R4): the CHECK is the database's
+promise, the raise is the code's, and neither should silently count 1.
+
+**`skip_trace_capacity.py` (pure where it can be, one query where it cannot):**
+- `CREDITS_PER_ROW = {"normal": 1, "advanced": 2}`, moved here from the dispatcher (which
+  imports it back for `affordable_row_count`, unchanged). `credits_for(trace_type)` raises
+  `ValueError` on anything else.
+- `resolve_caps() -> (global_cap, account_cap)`, `0` = disabled. Global:
+  `SKIP_TRACE_DAILY_CREDIT_CAP` if not None, else the legacy `SKIP_TRACE_DAILY_ROW_CAP` read as
+  credits with a WARNING once per process (R9). Account: `SKIP_TRACE_ACCOUNT_DAILY_CREDIT_CAP`
+  or 0. Both settings `int | None`, `ge=0`.
+- `spent_credits(db, since) -> (global_spent, {user_id: spent})`: ONE query,
+  `SELECT user_id, sum(CASE trace_type WHEN 'normal' THEN 1 WHEN 'advanced' THEN 2 END)
+  FROM pending_skip_trace_rows WHERE submitted_at >= :since GROUP BY user_id`, the CASE BUILT
+  from `CREDITS_PER_ROW` (one source of truth). Counts claimed, submitted, unknown-outcome and
+  terminal rows alike: `submitted_at` is set at claim and cleared only by a proven-uncharged
+  release (1b-1b-i). Rides `ix_pending_skip_trace_spent`.
+- `row_allowance(cap, spent, cost) -> int | None`: `None` when cap is 0 (unbounded), else
+  `max(0, (cap - spent) // cost)`. Pure.
+- `fair_candidates(db, eligibility_stmt, cost, *, global_rows, account_room, exclude_ids)`:
+  the dispatcher's eligibility select (every predicate unchanged) as a subquery with
+  `row_number() OVER (PARTITION BY user_id ORDER BY enqueued_at, id) AS rn`; keep
+  `rn <= account_rows(user_id)` (accounts with 0 room excluded in SQL, via a VALUES list of
+  (user_id, rows) for capped accounts); `id NOT IN exclude_ids`; order `(rn, enqueued_at, id)`;
+  limit `global_rows`. Outer `SELECT ... WHERE id = ANY(:ids) FOR UPDATE OF pending SKIP LOCKED`,
+  re-ordered in Python to the subquery's order (FOR UPDATE does not preserve it).
+
+**Dispatcher, inside each pass after `pg_try_advisory_xact_lock` (16-4, 15-11):**
+1. `spent_credits` -> global and per-account row allowances for this pass's cost `c`. Global
+   allowance 0 -> end the pass (rollback, `continue` to the next trace_type: advanced may be
+   out of room while normal is not).
+2. **Refill loop (R2, R3):** `survivors = []`, `considered = set()`, per-account remaining rows,
+   global remaining rows (≤ 5000). Each round: `fair_candidates` excluding `considered`, sized
+   to the global remaining; empty -> stop. Add all to `considered`. Run
+   `_partition_still_deliverable` (withdraw + cancel), `_partition_submittable` (fail),
+   then `_hold_answers_in_flight(db, survivors + new)` -- CUMULATIVE (R2); the result becomes
+   `survivors` (earlier survivors come first, so they keep their place). Recompute remaining
+   allowances from `survivors`. Stop when global remaining is 0 or every candidate account is
+   full. Terminates: each round excludes every id already seen.
+3. Claim `survivors` exactly as today (the claim UPDATE, the commit, the POST, releases,
+   bookkeeping, reconciliation all UNCHANGED, C12).
+4. The pre-lock check at the top of the tick stays as the cheap early exit + ops alert for the
+   GLOBAL cap only, computed by `spent_credits` + `resolve_caps` (same helpers); its message
+   names credits.
+
+**Why the cap is hard:** every earlier claim committed its `submitted_at` before the lock was
+released, so each pass, batch and tick reads spend that includes it. The partial-402 path only
+ever submits FEWER rows than claimed. Adoption does not create spend (it attaches rows already
+claimed). ii-0 removed the only other spenders.
+
+**Documented limits:** fairness holds whenever a batch can hold one row per eligible account
+(R5); below that, the earliest `rn = 1` rows win. An account over its cap simply waits (no
+user-facing state until 1b-1b-iii).
+
+**Owner, before merge:** production values for `SKIP_TRACE_DAILY_CREDIT_CAP` and
+`SKIP_TRACE_ACCOUNT_DAILY_CREDIT_CAP`. Prod has `SKIP_TRACE_DAILY_ROW_CAP=1000` (09-16); left as
+is it becomes a 1000-CREDIT global cap (= 500 advanced lookups) with a warning.
+
+### Codex pre-code consult on the ii-b spec (2026-09-26): PLAN: REVISE, 2 P1 + 3 P2 + 1 P3, all accepted
+Output: `<scratchpad 0ade294c>/codex_iib_consult_out.txt`. Confirmed sound: in-lock allowance +
+committed `submitted_at` make overlapping claims unable to exceed the cap; 402 partial, unknown
+outcome, releases and adoption add no spend; the pre-lock global-only check can under-dispatch,
+never over-dispatch; the cumulative hold keeps earlier survivors (list order) and FOR SHARE locks
+last to the claim commit. SUPERSEDES the matching spec bullets above:
+- **S1 (P1) a locked ranked head was not really replaced.** `rn <= room` was applied before the
+  outer `FOR UPDATE SKIP LOCKED`, so an account with room 1 and a locked `rn=1` row had no `rn=2`
+  to fall back on, and excluding ids AFTER ranking left gaps that ended refill early. Fix:
+  `exclude_ids` is applied BEFORE `row_number()`; the helper returns every ALLOCATED id (pre-lock),
+  including those SKIP LOCKED skipped; all of them join `considered`; rooms are charged only by
+  SURVIVORS. The next round therefore ranks the next rows. Regressions: a locked `rn=1` with room
+  1; a held/withdrawn head spanning several rounds.
+- **S2 (P1) no allowance for zero-spend accounts or global-only mode.** Fix: no VALUES list of
+  capped accounts. The fair select LEFT JOINs a `spent` CTE (the same weighted sum) and a VALUES
+  list of rows already TAKEN this pass (survivors, per user), and computes per account
+  `room = CASE WHEN :account_cap = 0 THEN NULL ELSE greatest(0, (:account_cap -
+  coalesce(spent,0)) / :cost) - coalesce(taken,0) END`; keep `room IS NULL OR rn <= room`.
+  Tests: global cap only with several zero-spend accounts; account cap with no prior spend.
+- **S3 (P2) cost of re-ranking every round.** Gate: EXPLAIN (ANALYZE, BUFFERS) on a seeded DB with
+  100k+ eligible rows AND a worst-case multi-round refill (15k+ blocked heads), budget ≤ 250 ms
+  per round and ≤ 2 s per pass. If it fails, switch to a keyset frontier instead of re-ranking.
+- **S4 (P2) `affordable_row_count` kept `.get(trace_type, 1)`.** Fix: it calls `credits_for()`;
+  regression: an unknown type in the 402 path raises.
+- **S5 (P2) legacy "unset" vs "0" indistinguishable.** Fix: `SKIP_TRACE_DAILY_ROW_CAP: int | None
+  = None`. A new `SKIP_TRACE_DAILY_CREDIT_CAP=0` disables without touching the legacy value or
+  warning. `.env.example` documents the new names commented out (no empty integer assignment).
+- **S6 (P3) operator text says "rows".** Fix: the alert and log name credits, the effective cap
+  and its source setting. The 09-18 security review and the 1b-0 handoff are dated records and
+  stay as written; the ii-b PR description carries the change for operators.
+
+### Codex consult round 2 (2026-09-26): PLAN: REVISE, 2 P2 + 1 P3, all accepted
+Output: `<scratchpad 0ade294c>/codex_iib_consult2_out.txt`. S1, S2, S4, S5 verified closed; S1 proven:
+survivors can never exceed the account or global allowance in one pass. SUPERSEDES where they differ:
+- **T1 (P2) refill unbounded under live enqueues; worst case one round per id.** Fix, three parts:
+  (a) **watermark**: the pass reads `clock_timestamp()` once, right after taking the lock, and every
+  refill round also requires `enqueued_at <= :watermark`, so rows arriving mid-pass wait for the
+  next pass. (b) **growing look-ahead** instead of one-row-per-room rounds: round `r` (0-based)
+  allocates, per account, up to `room_remaining * 2**r` ranked rows (and globally up to
+  `min(5000, global_remaining * 2**r)`); after the filters only `room_remaining` survivors per
+  account (and `global_remaining` overall) are TAKEN, in rank order, and the extra survivors are
+  simply not claimed (they stay 'queued'; their row locks end with the pass). So a head of k
+  blocked rows is passed in about log2(k) rounds, which is what keeps R3 (no starvation) true.
+  (c) **hard bound**: at most 12 rounds and a 2 s deadline per pass; when either is hit, the pass
+  claims the survivors it has and logs `refill_truncated` with the counts. Residual limit,
+  documented: an account starves only behind more than `room * 2**12` blocked rows at once.
+  The keyset frontier is NOT built now; it is the escape hatch only if the S3 EXPLAIN gate fails.
+- **T2 (P2) arithmetic and the 5000 bound.** Room is computed in SQL as
+  `GREATEST(0, FLOOR((:account_cap - COALESCE(spent, 0))::numeric / :cost)::bigint - COALESCE(taken, 0))`,
+  NULL when the account cap is 0. The global allowance is normalized in Python:
+  `None -> 5000`, else `min(5000, allowance)`; `LIMIT` is never NULL. Boundary tests: caps and
+  spend of 0, 1, 2, 3 against both costs (1 and 2), for the account and the global allowance.
+- **T3 (P3) config and task-result text.** `settings.py` comments say credits; the early-exit
+  result becomes `{"skipped": "daily_cap", "spent_credits": .., "cap_credits": .., "cap_source":
+  "<setting name>"}`. The old keys (`spent_today`, `cap`) have no reader outside the absorbed
+  test, so they are not kept.
+
+### Codex consult round 3 (2026-09-26): PLAN: REVISE, 2 P2. T1(b), T2, T3 verified closed.
+Output: `<scratchpad 0ade294c>/codex_iib_consult3_out.txt`. Implementation conditions it set for
+T1(b), adopted: all allocated candidates go to the cumulative hold in exact rank order; account and
+global caps are applied AFTER the hold; pre-lock allocated ids are tracked as `considered`.
+- **U1 (P2) the watermark does not exclude a row inserted before it and committed after it**
+  (`enqueued_at` is the server `now()` at insert, `models.py:1356`). Codex's fix (a REPEATABLE READ
+  pass with the advisory lock as its first query) is **REJECTED, with reason**: in REPEATABLE READ
+  the snapshot is taken when that first statement STARTS, before the lock is acquired. A
+  concurrent tick can commit its claim and release the lock in between; this pass then takes the
+  lock but reads spend WITHOUT that claim, and overspends the cap. That trades a FIFO nuance for a
+  money bug. **Instead:** stay READ COMMITTED (the in-lock spend read sees every committed claim);
+  keep the watermark as a best-effort bound; the HARD bound on the pass is T1(c). The fairness
+  claim is reworded: FIFO and fairness hold among rows committed before the pass started; a row
+  committing mid-pass may be taken in its rank position. It is eligible either way, and it can
+  never exceed a cap. Regression: a row committed mid-pass is counted against the cap like any
+  other (never over it).
+- **U2 (P2) the 12-round cutoff is bounded starvation.** Accepted. R3's promise becomes BOUNDED
+  fairness: an account is passed over only while more than `room * (2**12 - 1)` of its ranked
+  rows are blocked at once (4,095 at room 1). `refill_truncated` telemetry kept (logged with
+  counts). Regression at the documented cutoff: truncation happens, survivors found so far are
+  claimed, nothing exceeds a cap. A durable keyset continuation frontier is the upgrade if the
+  telemetry ever fires in production.
+
+### Codex consult round 4 (2026-09-26): U1 rejection CONFIRMED; wording/telemetry adopted
+Output: `<scratchpad 0ade294c>/codex_iib_consult4_out.txt`. Codex confirmed that REPEATABLE READ with
+the xact lock in the first statement takes its snapshot BEFORE the lock, so the spend read could be
+stale; the only safe RR design (session lock taken before BEGIN on a pinned connection) is "not
+worthwhile": READ COMMITTED + the xact lock preserves the money invariant. Its remaining items were
+wording and test specifications, adopted verbatim, so this closes the consult:
+- **V1** Fairness applies to eligible rows VISIBLE BEFORE THE FIRST CANDIDATE READ, subject to the
+  one-row-per-account / global-headroom rule (R5). Rows committing later are outside the FIFO
+  guarantee and may be taken by rank. The in-lock spend read happens AFTER the lock is acquired, in
+  the same transaction (READ COMMITTED).
+- **V2** The starvation bound is CONDITIONAL: with no earlier deadline truncation, the round limit
+  bounds inspection at `room * 4095`; the 2 s deadline may bound it lower.
+- **V3** `refill_truncated` logs: reason (`round_limit` | `deadline`), rounds completed, elapsed ms,
+  initial and remaining global room, considered / blocked / survivor counts, and the number of
+  accounts still with room.
+- **V4** Added regressions: a row committed mid-pass never takes spend past a cap; room 1 behind
+  4,095 blocked rows plus a later survivor (the documented cutoff); an early deadline claims the
+  survivors found so far without exceeding either cap.
+
+### ii-b TO BUILD (checklist; the spec = "ii-b implementation spec" as amended by S1-S6, T1-T3, U1-U2, V1-V4)
+- [x] `src/workers/skip_trace_capacity.py`
+- [x] dispatcher: pre-lock early exit via the helpers; in-lock allowance; refill loop; `affordable_row_count` via `credits_for`
+- [x] `settings.py` (+ `.env.example`)
+- [x] `tests/test_skip_trace_credit_cap.py` (absorbs `test_skip_trace_daily_cap.py`): 90 pass. Existing
+      skip-trace / Tracerfy / lookup suites: 475 pass (4 batches, local lookup1b DB).
+- [ ] **EXPLAIN gate (S3): FAILS at 100k+, passes at 35k.** One real dispatcher pass, account cap 1
+      credit, account 0 behind N held heads (each with an in-flight twin), 50 accounts:
+      | queued | held heads | worst `allocate` round | refill |
+      | 10,000 | 1,500 | 49 ms | all passed in 11 rounds, no truncation |
+      | 35,000 | 5,000 | 166 ms | deadline after 6 rounds (2.1 s) |
+      | 117,000 | 15,000 | ~440 ms (FAIL) | deadline after 2 rounds |
+      The round-0 query alone: 12 ms / 39 ms / 167 ms (a window sort over every eligible row, which
+      spills to disk at 117k). Much of each round's remaining time is the duplicate hold re-reading
+      the account's in-flight rows every round. CAP HARDNESS IS UNAFFECTED: truncation only ever
+      claims fewer rows, and says so (`refill_truncated`). What degrades is latency for an account
+      behind thousands of blocked rows. Prod today: 941 rows in total.
+      Fix per S3 = keyset frontier (per-account LATERAL scan from the last row considered), which
+      needs an index `(user_id, trace_type, enqueued_at, id) WHERE status = 'queued'` = migration
+      103, plus reading the in-flight set once per pass. **OWNER DECISION (2026-09-26): SHIP ii-b NOW
+      with the documented envelope (per-round budget holds to ~35k queued; deeper blocked runs are
+      truncated and logged, never over-claimed). The keyset frontier + migration 103 + one in-flight
+      read per pass become ii-c, which MUST land before Phase 1c can create large queues.**
+- [ ] **ii-c** (scheduled, before 1c): migration 103 index; per-account LATERAL keyset `allocate`;
+      in-flight set read once per pass; re-run this gate at 117k / 15k and pass it.
+- [x] mutations, each caught: read outside the lock (1 fails); `rn` out of ORDER BY (1); refill
+      removed (4); weight 2 -> 1 (5); hold not cumulative (1). Also found and fixed by the tests: an
+      account cap with no prior spend crashed `allocate` (a Python int where SQL was needed).
+- [ ] Codex diff review to GO; owner sets prod cap values before merge
+
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever
       the tab has leads that have never been looked up; when the quote comes back with

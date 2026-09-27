@@ -24,7 +24,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.auth import create_refresh_token, create_secure_token, hash_password
+from src.api.auth import create_token_pair, hash_password
 from src.api.middleware import audit_log, once_per, rate_limit, release_once
 from src.api.schemas import RegisterResponse, TokenResponse, UserRegister, VerifyEmailRequest
 from src.config import settings
@@ -298,8 +298,7 @@ async def _register_user_legacy(
 
     await db.commit()
     # Fresh password-only session (H2-P5): amr=["pwd"], auth_time=now (default).
-    token = create_secure_token(user.id, amr=["pwd"])
-    refresh = create_refresh_token(user.id, amr=["pwd"])
+    token, refresh = create_token_pair(user.id, amr=["pwd"])
     audit_log(request, "register", user.id)
 
     # Welcome email (non-blocking — failure must not break registration).
@@ -498,8 +497,7 @@ async def verify_user_email(
     )
     await db.commit()
 
-    token = create_secure_token(user.id, amr=["pwd"])
-    refresh = create_refresh_token(user.id, amr=["pwd"])
+    token, refresh = create_token_pair(user.id, amr=["pwd"])
     audit_log(request, "register_verified", user.id)
 
     # Welcome email (non-blocking — failure must not break verification).

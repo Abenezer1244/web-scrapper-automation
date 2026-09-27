@@ -6,10 +6,11 @@ from collections.abc import Iterable
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi.security import HTTPAuthorizationCredentials
 from sqlalchemy import case, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.auth import CurrentUser, require_admin_mfa
+from src.api.auth import CurrentUser, _bearer, get_auth_context, require_admin, require_admin_mfa
 from src.api.deps import get_rls_db
 from src.api.entitlements import (
     CODE_SKIP_TRACE,
@@ -367,6 +368,7 @@ async def create_scraper(
 @router.get("/connectors", response_model=list[ConnectorResponse])
 async def list_connectors(
     include_all: bool = False,
+    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
     db: AsyncSession = Depends(get_db),
 ) -> list[ConnectorResponse]:
     """Return county connectors for the frontend county picker.
@@ -390,8 +392,12 @@ async def list_connectors(
     window is empty — which is the correct honest outcome.
 
     Pass ``?include_all=true`` to include ``down`` and ``unknown``
-    connectors for admin tooling and support investigation.
+    connectors for admin tooling and support investigation. That view is
+    ADMIN-ONLY (audit 2026-09-25, C-1): it named every broken county to any
+    anonymous caller. The default picker view stays public.
     """
+    if include_all:
+        await require_admin(await get_auth_context(credentials, db))
     query = select(CountyConnector).where(CountyConnector.active)
     if not include_all:
         query = query.where(

@@ -2223,6 +2223,26 @@
         "title": "LoginResponse",
         "type": "object"
       },
+      "LogoutRequest": {
+        "additionalProperties": false,
+        "description": "Optional body for POST /auth/logout: the session's refresh token, so\nlogout still ends the session after its 1-hour access token has expired.",
+        "properties": {
+          "refresh_token": {
+            "anyOf": [
+              {
+                "maxLength": 4096,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Refresh Token"
+          }
+        },
+        "title": "LogoutRequest",
+        "type": "object"
+      },
       "MfaDisableRequest": {
         "description": "Disabling MFA requires the password AND a second factor (TOTP or a\nbackup code) — knowledge of the password alone must not remove MFA.",
         "properties": {
@@ -2559,6 +2579,23 @@
           "updated"
         ],
         "title": "ReadAllResponse",
+        "type": "object"
+      },
+      "ReauthRequest": {
+        "additionalProperties": false,
+        "description": "The current password, re-proven before an action that mints a long-lived\ncredential or changes how the account authenticates (audit 2026-09-25, A-2/A-4).\nA stolen one-hour session must not be able to turn itself into a permanent key\nor a second factor the owner does not hold.",
+        "properties": {
+          "current_password": {
+            "maxLength": 72,
+            "minLength": 1,
+            "title": "Current Password",
+            "type": "string"
+          }
+        },
+        "required": [
+          "current_password"
+        ],
+        "title": "ReauthRequest",
         "type": "object"
       },
       "RecordTypeCount": {
@@ -4485,8 +4522,18 @@
     },
     "/auth/api-key": {
       "post": {
-        "description": "Generate a new API key. The raw key is shown exactly once.",
+        "description": "Generate a new API key. The raw key is shown exactly once.\n\nA key never expires, so minting one needs the password and a signed-in\nsession (audit 2026-09-25, A-2): a stolen one-hour token, or a leaked key,\nmust not be able to turn itself into a permanent credential.",
         "operationId": "create_api_key_auth_api_key_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReauthRequest"
+              }
+            }
+          },
+          "required": true
+        },
         "responses": {
           "201": {
             "content": {
@@ -4497,6 +4544,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
           }
         },
         "security": [
@@ -4745,17 +4802,40 @@
     },
     "/auth/logout": {
       "post": {
+        "description": "End THIS session: the access token (bearer), the refresh token (body), or both.\n\nAudit 2026-09-25, A-1: logout used to blacklist only the access token, so\nthe 7-day refresh token kept minting new ones. Each presented token now has\nits jti blacklisted AND its session family revoked, which ends every token\nthat session ever rotated into. The refresh token is accepted on its own so\nlogout still works once the 1-hour access token has expired. The user's\nother sessions are untouched (that is /auth/logout-all).",
         "operationId": "logout_auth_logout_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/LogoutRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Body"
+              }
+            }
+          }
+        },
         "responses": {
           "204": {
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
           }
         },
-        "security": [
-          {
-            "HTTPBearer": []
-          }
-        ],
         "summary": "Logout",
         "tags": [
           "auth"
@@ -4896,8 +4976,18 @@
     },
     "/auth/mfa/setup": {
       "post": {
-        "description": "Generate a TOTP secret, store it encrypted (NOT yet enabled), and return\nthe secret + otpauth URI. Re-calling before enable rotates the pending secret.",
+        "description": "Generate a TOTP secret, store it encrypted (NOT yet enabled), and return\nthe secret + otpauth URI. Re-calling before enable rotates the pending secret.\n\nNeeds the password and a signed-in session (audit 2026-09-25, A-4): whoever\nenrolls the second factor controls the account, so a stolen session or a\nleaked API key must not be able to enroll one the owner does not hold.",
         "operationId": "mfa_setup_auth_mfa_setup_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReauthRequest"
+              }
+            }
+          },
+          "required": true
+        },
         "responses": {
           "200": {
             "content": {
@@ -4908,6 +4998,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
           }
         },
         "security": [
@@ -7213,7 +7313,7 @@
     },
     "/scrapers/connectors": {
       "get": {
-        "description": "Return county connectors for the frontend county picker.\n\nPublic endpoint — no auth required so the county browser loads for\nanonymous visitors.\n\nBy default returns connectors whose canary health check has marked\nthem as either ``healthy`` or ``degraded``. Excludes only ``down``\n(scraper threw an exception on last probe) and ``unknown`` (never\ncanary-checked).\n\nThe ``degraded`` status means \"scraper ran cleanly, but last\nprobe returned zero records on a 7-day window\". For small counties\nwith sparse filings (e.g., rural WA counties that file <5 probates\nper week), this oscillates randomly based on which week the canary\nhappens to sample. Excluding them from the picker just because\nthe most recent 7-day sample was empty would remove most of our\ncoverage for smaller markets. Instead, we surface them as\navailable and the user sees 0 records only if the actual scrape\nwindow is empty — which is the correct honest outcome.\n\nPass ``?include_all=true`` to include ``down`` and ``unknown``\nconnectors for admin tooling and support investigation.",
+        "description": "Return county connectors for the frontend county picker.\n\nPublic endpoint — no auth required so the county browser loads for\nanonymous visitors.\n\nBy default returns connectors whose canary health check has marked\nthem as either ``healthy`` or ``degraded``. Excludes only ``down``\n(scraper threw an exception on last probe) and ``unknown`` (never\ncanary-checked).\n\nThe ``degraded`` status means \"scraper ran cleanly, but last\nprobe returned zero records on a 7-day window\". For small counties\nwith sparse filings (e.g., rural WA counties that file <5 probates\nper week), this oscillates randomly based on which week the canary\nhappens to sample. Excluding them from the picker just because\nthe most recent 7-day sample was empty would remove most of our\ncoverage for smaller markets. Instead, we surface them as\navailable and the user sees 0 records only if the actual scrape\nwindow is empty — which is the correct honest outcome.\n\nPass ``?include_all=true`` to include ``down`` and ``unknown``\nconnectors for admin tooling and support investigation. That view is\nADMIN-ONLY (audit 2026-09-25, C-1): it named every broken county to any\nanonymous caller. The default picker view stays public.",
         "operationId": "list_connectors_scrapers_connectors_get",
         "parameters": [
           {
@@ -7253,6 +7353,11 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
         "summary": "List Connectors",
         "tags": [
           "scrapers"

@@ -1,6 +1,67 @@
-# BridgeLeads Security Audit #3, Phase 1 (2026-09-27)
+# BridgeLeads Security Audit #3, Phase 1 (2026-09-27), with the Audit #4 delta
 
 > Previous report (audit #2, 2026-09-25) is preserved at `docs/security/SECURITY-AUDIT-2026-09-25.md`.
+
+## Audit #4: delta since audit #3 (2026-09-27, later the same day)
+
+Scope, agreed with the owner: only the code changed between `786efcf0` (audit #3) and `ee601b55` (44 commits, 15
+backend source files, migrations 103 and 104, frontend `c7d78fb` and `d4ba581`), a re-check of audit #3's open P1s,
+and an independent Codex review of the same delta. Everything below this section is audit #3 and still stands except
+where this section says otherwise. Reports: `tasks/audit4/delta-claude.md` (Claude reviewer, every changed file
+listed with what was verified), `tasks/audit4/delta-codex.md` (Codex, run without our findings in a separate
+worktree). No production code was changed; no test, database or production request was made by either reviewer. The
+driver made two single live GETs (below).
+
+### New findings
+
+| ID | Severity | Category | Component | Evidence | Prereqs | Impact | Remediation | Regression test | Status |
+|---|---|---|---|---|---|---|---|---|---|
+| S4-01 | P1 | Billing / entitlement | Worker never re-checks account run eligibility (CXD-1). Pre-existing, not introduced by the delta; the delta made `run_eligibility` the one rule but only enqueue gates call it | src/workers/tasks.py:535-571 checks config and plan only; the reservation at tasks.py:1816-1840 grants remaining quota with no frozen/ended predicate; src/api/quota.py:187 | a job queued while eligible, then the account freezes (failed payment) or its paid term ends before the worker runs (queue delay, watchdog re-run, batch child) | scraping, record grant and paid skip-trace for an account that may no longer start billable work | After the claim, reload the user and refuse on `frozen`/`ended` before any external work; re-check before the skip-trace enqueue | queued job of a now-frozen / now-ended account fails with no scrape and no pending_skip_trace_rows | CONFIRMED (code trace). Driver would rate P2 (bounded to already-queued jobs); Codex severity adopted per the disagreement rule |
+| S4-02 | P2 | Concurrency / cost | Run slot released 300 s after cancel even if the worker is still running (CXD-3) | src/db/models.py:817-844 `RUN_SLOT_CANCEL_COOLDOWN_SECONDS`; migration 104 index covers active statuses only | the account's own cancel, then a restart after 5 min | two workers on one config: duplicate county scraping, dedup claims can mislabel the new run's leads "Already delivered" | Worker-owned slot lease: cancel requests, the worker acknowledges terminal state; stale-lease recovery by the watchdog | cancelled-but-running job keeps the slot until the worker acknowledges | CONFIRMED (code trace). Self-tenant only; driver would rate P3, Codex P2 adopted |
+| S4-03 | P2 | Rate limiting | The S3-09 `export` zone misses 4 routes that rebuild and decrypt full CSVs (D4-2 + CXD-4) | src/api/routes/batches.py:733,854 and src/api/routes/segments.py:709,835 use `general` (60/min, fails fully open when Redis is down); only jobs.py:1280,1439 use `export` | an account | CPU / DB / PII-decrypt amplification, starving other tenants | Move the 4 routes to the `export` zone | 21st export in a minute across job, batch and segment routes gets 429 | CONFIRMED (both reviewers; driver grep). Claude P3, Codex P2: higher adopted |
+| S4-04 | P3 | Billing / data | Scrapers deleted before the F-043 fix keep `paused_reason='entitlement'` and are re-activated by `plan_reconciliation` on the next upgrade (D4-1) | delete now clears `paused_reason`, no backfill for older rows | an account that deleted a downgrade-paused scraper before the fix, then upgrades | deleted scrapers run and bill again | Backfill from `scraper_deleted` audit events, or an explicit `deleted_at` | re-activation skips deleted configs | SUSPECTED: sizing needs a read-only production query (not run) |
+
+### Audit #3 items re-checked
+
+- **S3-03 (P1) still OPEN**, found again independently by Codex (CXD-2): `enrich.py:2285` still blocks only `starter`,
+  and a trial is `plan="pro"`. The #364 per-account credit cap bounds it only if production sets
+  `SKIP_TRACE_ACCOUNT_DAILY_CREDIT_CAP`, and it does not tell a trial from a paying account.
+- **S3-04 (P1) still OPEN**, and still blocked by **S3-06: re-reproduced live** (one GET to `/health` through Railway's
+  edge `69.46.46.123`: 200, `Server: railway-hikari`, no `CF-RAY`).
+- **S3-32 still OPEN:** live `api.bridgeleads.io/health` has no `Strict-Transport-Security`.
+- **S3-07 FIXED** (verified in code by the Claude reviewer): `?token=` accepts only job-bound download tokens; the
+  header path goes through `get_auth_context` including the session-family check.
+- **S3-09 mostly FIXED:** every route it named is limited; the remainder is S4-03.
+- **S3-12 FIXED IN CODE:** credit-weighted global and per-account caps, read and claimed under one advisory lock with
+  no commit in between (both reviewers traced it). Effective only if production sets both cap variables (not read).
+
+### Checked and clean in the delta
+
+Tenant isolation: every new or changed query in jobs, batches, billing usage, eligibility and the dispatcher carries
+`user_id` or an owned-parent join (both reviewers). Raw SQL in the dispatcher, capacity module, batch tasks and
+migrations 103/104 uses fixed fragments and bound values. No new table, so no new RLS or grant surface; the 104 index
+failing to build falls back to the API check, not open. `run_eligibility` gives the same verdict as the old
+`quota_block_reason` at all five enqueue gates. `/billing/usage` exposes only the caller's own state. Frontend
+`c7d78fb`/`d4ba581`: display only, no XSS sink, no client-only security decision.
+
+### Codex vs Claude
+
+| Codex | Claude | Outcome |
+|---|---|---|
+| CXD-1 worker eligibility (P1) | not found | Codex-only, driver verified in code: S4-01 at P1 |
+| CXD-2 trial skip trace (P1) | S3-03 re-check | same as S3-03, still open |
+| CXD-3 run slot cooldown (P2) | not found | Codex-only, driver verified in code: S4-02 at P2 |
+| CXD-4 batch export zone (P2) | D4-2 (P3, also the 2 segment exports) | S4-03 at P2 |
+| none | D4-1 (P3) | Claude-only: S4-04, suspected |
+
+No Codex finding was rejected.
+
+### Proposed fix order (one PR per phase, owner approval between phases)
+
+1. **4a: S3-03 + S4-01**: paid work only for accounts that may run it (needs the owner's trial decision).
+2. **4b: S4-03**: move the four export routes into the `export` zone.
+3. **Audit #3 queue: 2b** (S3-08 `safe_http` SSRF, S3-14 browser guard) and **2c** (S3-15, S3-16 Tracerfy webhook).
+4. **S4-02**: slot lease (needs a design pass first). **S4-04**: size with a read-only production query, then backfill.
 
 Code audited: backend `origin/main` `786efcf0` (production at audit start), frontend `origin/master` `e42d5d0`/`6030491`.
 Method: 8 parallel audit leaves (each report under `tasks/audit3/`), plus an independent Codex review run in an isolated

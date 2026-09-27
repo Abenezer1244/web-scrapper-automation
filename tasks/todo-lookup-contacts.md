@@ -1788,6 +1788,14 @@ Frontiers are PASS-LOCAL and never persisted (stated in the code).
       is a friendly 503 and nothing is queued.
 
 ## Deferred (logged, not in Phase 1)
+- 🛑 **SAFETY, own small PR, soon (found in the ii-c-1 review, 2026-09-27):** `alembic/env.py`
+  calls `load_dotenv()` and prefers `DATABASE_URL_MIGRATE` over `DATABASE_URL_SYNC`. The test-DB
+  guard (`tests/_db_safety.py`) pins only `DATABASE_URL`/`_SYNC`, so ANY test or script that
+  invokes Alembic through env.py on a machine whose `.env` names a production
+  `DATABASE_URL_MIGRATE` would migrate (or downgrade) PRODUCTION. Same class as the two prod wipes.
+  Fix: the guard also pins (or clears) `DATABASE_URL_MIGRATE`; env.py stops loading `.env`
+  implicitly for non-boot invocations. 103's tests avoid env.py for this reason.
+
 Lookup ledger (Phase 2), canonical leads (Phase 3), DNC flag is never set
 and exports suppress nothing, advanced = 2 credits vs 1 billed row (the D2 follow-up; the gap is
 recorded per action so it can be priced later), re-send email, stale R2 object and batch combined

@@ -106,20 +106,46 @@ def test_autogenerate_never_proposes_a_blocking_build():
     assert '"ix_pending_skip_trace_queued_frontier"' in block
 
 
-def test_a_same_named_index_of_another_shape_is_rebuilt():
-    # user_id leading would defeat per-type discovery; a name-only check would keep it.
+@pytest.mark.parametrize(("shape", "why"), [
+    ("(user_id, trace_type, enqueued_at, id) WHERE status = 'queued'",
+     "user_id leading defeats per-type discovery"),
+    ("(trace_type, user_id, enqueued_at DESC, id) WHERE status = 'queued'",
+     "a descending key walks the frontier backwards"),
+    ("(trace_type, user_id, enqueued_at, id) INCLUDE (city) WHERE status = 'queued'",
+     "an INCLUDE column is a different index"),
+    ("(trace_type, user_id, enqueued_at, id) WHERE status = 'submitted'",
+     "the wrong predicate covers the wrong rows"),
+    ("(trace_type, user_id, enqueued_at, id)",
+     "no predicate at all"),
+])
+def test_a_same_named_index_of_another_shape_is_rebuilt(shape, why):
+    """Identity is structural (catalogs), not a rendered string, and a name-only
+    check would keep every one of these."""
     mig = _mig103()
     with _autocommit() as conn:
         try:
             _drop_ours(conn, mig._INDEX)
             conn.execute(text(
                 f"CREATE INDEX CONCURRENTLY {mig._INDEX} ON public.pending_skip_trace_rows "
-                f"(user_id, trace_type, enqueued_at, id) WHERE status = 'queued'"
+                f"{shape}"
             ))
+            wrong = conn.execute(text(mig._SHAPE_SQL), {"n": mig._INDEX}).first()
+            assert not mig._is_right_shape(wrong), why
             mig._build_frontier_index(conn)
+            assert mig._is_right_shape(
+                conn.execute(text(mig._SHAPE_SQL), {"n": mig._INDEX}).first()), why
             assert _indexdef(conn, mig._INDEX) == (mig._INDEX_DEF, True)
         finally:
             mig._build_frontier_index(conn)
+
+
+@pytest.mark.parametrize("rendered", [
+    "((status)::text = 'queued'::text)",          # PostgreSQL 16 and 17
+    "(status = 'queued'::text)",                  # a server that drops the column cast
+    "((status)::character varying = 'queued')",   # or renders the other side's cast
+])
+def test_the_predicate_check_ignores_how_a_server_renders_casts(rendered):
+    assert _mig103()._normalized_predicate(rendered) == "status='queued'"
 
 
 def test_a_same_named_index_on_another_table_is_refused_not_dropped():
@@ -160,7 +186,9 @@ def _run(step: str) -> None:
     mig = _mig103()
     with sync_engine.connect() as conn:
         ctx = MigrationContext.configure(conn)
-        with Operations.context(ctx):
+        # As env.py runs it: inside Alembic's outer migration transaction, which
+        # autocommit_block() must commit on entry (Codex ii-c-1 re-review).
+        with Operations.context(ctx), ctx.begin_transaction():
             getattr(mig, step)()
         if conn.in_transaction():
             conn.commit()

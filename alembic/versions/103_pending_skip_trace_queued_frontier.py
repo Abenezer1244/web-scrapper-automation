@@ -11,21 +11,19 @@ user_id without walking the other type's rows (Codex ii-c consult F2):
 
     (trace_type, user_id, enqueued_at, id) WHERE status = 'queued'
 
-Built CONCURRENTLY with 102's discipline: identity is the server's own
-rendering of the index, compared whole, plus indisvalid; an invalid or
-wrong-shaped index of this name on THIS table is dropped and rebuilt (safe only
+Built CONCURRENTLY with 102's discipline, except that identity is structural
+(see below) plus indisvalid; an invalid or wrong-shaped index of this name on THIS table is dropped and rebuilt (safe only
 because migrations are serialized by scripts/migrate.py's advisory lock, which
 start.sh boots through); a same-named index on ANY OTHER table aborts and is
 never dropped. Listed in alembic/env.py CONCURRENT_INDEXES so autogenerate never
 proposes a blocking plain build.
 
-Why a rendered string is a safe identity here (Codex ii-c-1 review): production
-(PostgreSQL 17.6, read 2026-09-27) renders 102's live index AND its CHECK byte for
-byte as the constants captured on the local PG16, including the `(col)::text`
-cast form this predicate uses. Should a future major version render it
-differently, the consequence is one drop-and-rebuild inside this migration, never
-an abort and never a lost index; it cannot recur on later boots once 103 is
-stamped.
+Identity is STRUCTURAL, read from the catalogs (Codex ii-c-1 re-review): a
+whole-string match against one server's rendering would, on a server that renders
+it differently, never match again and rebuild on every run of this migration.
+Only the predicate needs a deparse, and it is compared with casts, parentheses
+and whitespace stripped. (For the record: production PostgreSQL 17.6, read
+2026-09-27, renders 102's objects byte for byte as the local PG16 does.)
 
 No data change, no constraint, no trigger. The existing
 ix_pending_skip_trace_dispatch stays: other queued-row scans still use it (F7).
@@ -48,28 +46,73 @@ branch_labels = None
 depends_on = None
 
 _INDEX = "ix_pending_skip_trace_queued_frontier"
-# pg_get_indexdef()'s rendering, compared whole: it carries the access method,
-# key order, collation, operator classes and the predicate, so a same-named
-# index that differs in ANY of them is caught.
+_KEY_COLUMNS = ["trace_type", "user_id", "enqueued_at", "id"]
+# How PostgreSQL 16 and 17 render it (for operators and tests). NOT the identity
+# check: that is structural, below (Codex ii-c-1 re-review).
 _INDEX_DEF = (
     f"CREATE INDEX {_INDEX} ON public.pending_skip_trace_rows USING btree "
     f"(trace_type, user_id, enqueued_at, id) WHERE ((status)::text = 'queued'::text)"
 )
 
+# Identity from the catalogs, not from one server's rendering of the DDL: a valid,
+# non-unique btree on exactly these key columns in this order, with no INCLUDE
+# columns, no expressions, ascending, the default operator class and each
+# column's own collation. The predicate is the one part only a deparse can show;
+# it is compared with casts, parentheses and whitespace stripped, so a
+# difference in how a server renders `status = 'queued'` cannot read as a
+# different index.
+_SHAPE_SQL = """
+SELECT i.indisvalid, i.indisunique, i.indnatts, i.indnkeyatts,
+       i.indexprs IS NULL AS no_exprs, am.amname,
+       ARRAY(SELECT a.attname::text
+             FROM unnest(i.indkey::int2[]) WITH ORDINALITY k(attnum, ord)
+             JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
+             ORDER BY k.ord) AS cols,
+       (SELECT bool_and(o = 0) FROM unnest(i.indoption::int2[]) o) AS all_asc,
+       (SELECT bool_and(oc.opcdefault)
+          FROM unnest(i.indclass::oid[]) cls(oid)
+          JOIN pg_opclass oc ON oc.oid = cls.oid) AS default_opclasses,
+       (SELECT bool_and(k.coll = a.attcollation)
+          FROM unnest(i.indcollation::oid[], i.indkey::int2[]) k(coll, attnum)
+          JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
+       ) AS column_collations,
+       pg_get_expr(i.indpred, i.indrelid) AS predicate
+FROM pg_class c
+JOIN pg_namespace cn ON cn.oid = c.relnamespace
+JOIN pg_index i ON i.indexrelid = c.oid
+JOIN pg_am am ON am.oid = c.relam
+JOIN pg_class t ON t.oid = i.indrelid
+JOIN pg_namespace tn ON tn.oid = t.relnamespace
+WHERE c.relname = :n AND cn.nspname = 'public'
+  AND t.relname = 'pending_skip_trace_rows' AND tn.nspname = 'public'
+"""
+
+
+def _normalized_predicate(predicate: str | None) -> str:
+    """`((status)::text = 'queued'::text)` -> `status='queued'`."""
+    s = (predicate or "").replace("::text", "").replace("::character varying", "")
+    return "".join(ch for ch in s if ch not in "() \t\n")
+
+
+def _is_right_shape(row) -> bool:
+    return bool(
+        row.indisvalid
+        and not row.indisunique
+        and row.amname == "btree"
+        and row.no_exprs
+        and row.indnatts == row.indnkeyatts == len(_KEY_COLUMNS)
+        and list(row.cols) == _KEY_COLUMNS
+        and row.all_asc
+        and row.default_opclasses
+        and row.column_collations
+        and _normalized_predicate(row.predicate) == "status='queued'"
+    )
+
 
 def _build_frontier_index(conn) -> None:
-    """CREATE INDEX CONCURRENTLY, checked by identity (the 100/102 pattern)."""
-    existing = conn.execute(text(
-        "SELECT i.indisvalid, pg_get_indexdef(i.indexrelid) AS indexdef "
-        "FROM pg_class c "
-        "JOIN pg_namespace cn ON cn.oid = c.relnamespace "
-        "JOIN pg_index i ON i.indexrelid = c.oid "
-        "JOIN pg_class t ON t.oid = i.indrelid "
-        "JOIN pg_namespace tn ON tn.oid = t.relnamespace "
-        "WHERE c.relname = :n AND cn.nspname = 'public' "
-        "  AND t.relname = 'pending_skip_trace_rows' AND tn.nspname = 'public'"
-    ), {"n": _INDEX}).first()
-    right_shape = existing is not None and existing.indisvalid and existing.indexdef == _INDEX_DEF
+    """CREATE INDEX CONCURRENTLY, checked by structural identity."""
+    existing = conn.execute(text(_SHAPE_SQL), {"n": _INDEX}).first()
+    right_shape = existing is not None and _is_right_shape(existing)
     if existing is not None and not right_shape:
         # Dead (INVALID) or the wrong shape. Safe to drop here: migrations are
         # serialized by scripts/migrate.py's advisory lock, so this is never a

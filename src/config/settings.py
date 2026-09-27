@@ -354,15 +354,32 @@ class Settings(BaseSettings):
     # 5 min). Each batch can hold thousands of rows, so throughput is fine;
     # the constraint is burst count, not total rows.
     SKIP_TRACE_MAX_BATCHES_PER_TICK: int = 2
-    # Rolling-24h ceiling on rows submitted to Tracerfy across ALL tenants.
-    # 0 = disabled (the default, so deploying the breaker changes nothing until
-    # an operator chooses a number). Every lookup costs real money and the only
-    # other ceiling is the prepaid balance returning 402 — i.e. "until the money
-    # runs out". Checked at the top of the dispatcher tick, before any claim, so
-    # tripping it can only decline to start work: queued rows are untouched and
-    # resume once the window clears. Set this to a comfortable multiple of your
-    # busiest legitimate day, not to your average.
-    SKIP_TRACE_DAILY_ROW_CAP: int = 0
+    # Rolling-24h ceilings on Tracerfy spend, in CREDITS (a normal lookup costs 1,
+    # an advanced one 2). Every lookup costs real money and the only other ceiling
+    # is the prepaid balance returning 402. Enforced inside the dispatcher's claim
+    # lock, so they are hard: no pass, batch or overlapping tick can claim past
+    # them. Rows over a cap stay queued and flow as the window clears.
+    #   SKIP_TRACE_DAILY_CREDIT_CAP          across ALL tenants.
+    #   SKIP_TRACE_ACCOUNT_DAILY_CREDIT_CAP  per account.
+    # Unset or 0 = disabled. Set each to a comfortable multiple of the busiest
+    # legitimate day, not to the average.
+    SKIP_TRACE_DAILY_CREDIT_CAP: int | None = None
+    SKIP_TRACE_ACCOUNT_DAILY_CREDIT_CAP: int | None = None
+    # DEPRECATED (one release): the old global cap. Used only while
+    # SKIP_TRACE_DAILY_CREDIT_CAP is unset, and then read AS CREDITS with a
+    # warning, so 1000 means 500 advanced lookups a day.
+    SKIP_TRACE_DAILY_ROW_CAP: int | None = None
+
+    @field_validator(
+        "SKIP_TRACE_DAILY_CREDIT_CAP", "SKIP_TRACE_ACCOUNT_DAILY_CREDIT_CAP",
+        "SKIP_TRACE_DAILY_ROW_CAP",
+    )
+    @classmethod
+    def spend_caps_are_not_negative(cls, v: int | None) -> int | None:
+        """A negative cap would be read by nothing sensible; refuse it at boot."""
+        if v is not None and v < 0:
+            raise ValueError("skip-trace spend caps must be 0 (disabled) or positive")
+        return v
 
     @field_validator("TRACERFY_WEBHOOK_SECRET")
     @classmethod

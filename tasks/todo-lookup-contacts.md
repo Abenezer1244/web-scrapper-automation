@@ -1658,6 +1658,35 @@ SUPERSEDES the matching bullets above:
 - **F7 (P3)** `ix_pending_skip_trace_dispatch` stays (residual queued scans, e.g. the reconciler
   path at dispatcher.py:860-865). Dropping it would be its own measured migration.
 
+### Codex consult round 2 on ii-c (2026-09-27): PLAN: REVISE, 1 P1 + 1 P2 + 1 P3
+Output: `<scratchpad 0ade294c>/codex_iic_consult2_out.txt`. F1-F7 verified closed. Codex supplied the
+discovery query it expects to be index-driven (a recursive CTE: `ORDER BY user_id LIMIT 1`, then
+`user_id > u.user_id ... LIMIT 1` per step, with `status='queued' AND trace_type=:t AND
+enqueued_at <= :watermark`), adopted verbatim; the gate EXPLAINs it AND the lateral.
+- **H1 (P1) a row that turns eligible mid-pass can sit BEHIND the frontier.** Accepted as a
+  wording fix; Codex's remedy (materialize the joined eligible set once per pass) REJECTED, with
+  reason: the row is skipped for THIS PASS ONLY. Every pass restarts every frontier at
+  -infinity, so it goes out next tick, which is exactly the outcome Codex's own remedy specifies
+  ("rows becoming eligible after materialization wait for the next tick"). Materializing would
+  also re-introduce a full scan of the eligible set on every pass, the cost ii-c exists to
+  remove. F3 is reworded: a row that becomes eligible mid-pass is taken this pass if it is still
+  ahead of its account's frontier, otherwise next tick; nothing is skipped beyond one pass, and
+  nothing can exceed a cap.
+- **H2 (P2) per-account look-ahead x active accounts is unbounded before the global LIMIT.**
+  Accepted. Per-account lateral limit per round:
+  `L = min(room_left * 2**r  (or unbounded), share * 2**r, global_left)` where
+  `share = ceil(global_left / active_accounts)` and active_accounts counts only accounts with
+  room. So one round produces at most about `global_left * 2**r` candidates in total, whatever
+  the tenant count, and the lateral also stops early when an account runs out. Benchmark added to
+  the gate: 15,000 accounts with queued rows, bounded candidate production per round, and no
+  account starved (each with room gets its first row in round 0 when the batch can hold one per
+  account; R5 otherwise).
+- **H3 (P3) the in-flight cache relies on a comment about future writers.** Accepted as a 1b-2
+  REQUIREMENT, recorded here and carried into 1b-2's plan: the action worker inserts only through
+  `claim_skip_trace_rows` ('queued') under the shared claim protocol, and 1b-2 ships an
+  integration test that no writer can create an in-flight row while a dispatcher pass holds the
+  claim lock. ii-c's cache comment points at that requirement.
+
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever
       the tab has leads that have never been looked up; when the quote comes back with

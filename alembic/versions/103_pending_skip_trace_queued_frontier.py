@@ -19,6 +19,14 @@ start.sh boots through); a same-named index on ANY OTHER table aborts and is
 never dropped. Listed in alembic/env.py CONCURRENT_INDEXES so autogenerate never
 proposes a blocking plain build.
 
+Why a rendered string is a safe identity here (Codex ii-c-1 review): production
+(PostgreSQL 17.6, read 2026-09-27) renders 102's live index AND its CHECK byte for
+byte as the constants captured on the local PG16, including the `(col)::text`
+cast form this predicate uses. Should a future major version render it
+differently, the consequence is one drop-and-rebuild inside this migration, never
+an abort and never a lost index; it cannot recur on later boots once 103 is
+stamped.
+
 No data change, no constraint, no trigger. The existing
 ix_pending_skip_trace_dispatch stays: other queued-row scans still use it (F7).
 Production held ~941 pending rows on 2026-09-26, so the build is sub-second;

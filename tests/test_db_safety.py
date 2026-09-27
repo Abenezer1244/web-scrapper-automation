@@ -25,7 +25,7 @@ import pytest
 from sqlalchemy.engine import make_url
 
 from src.db_safety import AMBIENT_REDIRECT_VARS
-from tests._db_safety import enforce_test_database
+from tests._db_safety import assert_engine_is_test, enforce_test_database
 
 REPO = Path(__file__).resolve().parents[1]
 TEST_SYNC = os.environ["TEST_DATABASE_URL_SYNC"]
@@ -100,6 +100,14 @@ def test_the_guard_refuses_a_dsn_that_is_not_certainly_the_test_database(guard_e
     guard_env.setenv("TEST_DATABASE_URL_SYNC", dsn)
     with pytest.raises(SystemExit):
         enforce_test_database()
+
+
+def test_the_teardown_check_refuses_libpq_variables_set_mid_run(guard_env):
+    """assert_engine_is_test runs right before the destructive teardown; a libpq
+    variable set since the guard ran would reroute the engine's next connection."""
+    guard_env.setenv("PGHOSTADDR", "127.0.0.1")
+    with pytest.raises(SystemExit, match="PGHOSTADDR"):
+        assert_engine_is_test(os.environ["TEST_DATABASE_URL"])
 
 
 # ── Alembic, in a subprocess ──────────────────────────────────────────────────
@@ -287,7 +295,9 @@ def _migration_offences(path: Path) -> list[str]:
             out += [f"{where} imports {a.name}" for a in node.names if _is_src_db(a.name)]
         elif isinstance(node, ast.ImportFrom):
             names = {a.name for a in node.names}
-            if _is_src_db(node.module or "") or names & _ENGINE_FACTORIES:
+            module = node.module or ""
+            if (_is_src_db(module) or names & (_ENGINE_FACTORIES | _DYNAMIC)
+                    or (module == "src" and "db" in names)):
                 out.append(f"{where} imports {sorted(names)} from {node.module}")
         elif isinstance(node, ast.Attribute) and (
                 node.attr in _ENGINE_FACTORIES | _DYNAMIC or "DATABASE_URL" in node.attr):
@@ -320,8 +330,12 @@ def test_no_migration_builds_an_engine_or_reads_a_database_url():
     "import importlib\nimportlib.import_module('x')\n",
     "x = getattr(object, 'y')\n",
     "def f():\n    pass\n    'DATABASE_URL'\n",  # a bare string that is not a docstring
+    "from importlib import import_module as im\n",
+    "from builtins import __import__ as imp\n",
+    "from src import db\n",
 ], ids=["alias", "attribute", "from-src-db", "import-session", "src-db-models",
-        "concatenated", "f-string", "import-module", "getattr", "not-a-docstring"])
+        "concatenated", "f-string", "import-module", "getattr", "not-a-docstring",
+        "aliased-import-module", "aliased-dunder-import", "from-src-import-db"])
 def test_the_migration_scan_catches_what_it_is_for(tmp_path, source):
     """The scan is only as good as what it can see: each of these must be flagged."""
     path = tmp_path / "999_probe.py"

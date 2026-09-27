@@ -105,3 +105,8 @@ def assert_engine_is_test(url: str) -> None:
     ok, why = _classify(url)
     if not ok:
         _abort(f"Live DB engine is NOT a test database: {why}.")
+    # Re-checked at the point of destruction: set mid-run, these would reroute
+    # the engine's next connection whatever its URL says (Codex safety-PR review).
+    redirects = ambient_redirects()
+    if redirects:
+        _abort(f"{redirects} set: libpq would route the test engine elsewhere.")

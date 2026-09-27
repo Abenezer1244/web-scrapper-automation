@@ -1082,6 +1082,85 @@
         "title": "CheckoutRequest",
         "type": "object"
       },
+      "ConfigRunEligibilityResponse": {
+        "description": "May this scraper start a run (``src.api.config_eligibility``).\n\nThe same evaluator decides POST /jobs, and the codes are listed in the order\nthat gate refuses, so the reason shown is the refusal the user would get.\n``config_inactive`` is the exception: it is reported only here, since POST\n/jobs answers an inactive scraper with a plain 404.",
+        "properties": {
+          "can_run": {
+            "title": "Can Run",
+            "type": "boolean"
+          },
+          "code": {
+            "anyOf": [
+              {
+                "enum": [
+                  "config_inactive",
+                  "run_in_flight",
+                  "not_entitled",
+                  "ai_limit",
+                  "frozen",
+                  "ended",
+                  "over_limit"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Code"
+          },
+          "job_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Job Id"
+          },
+          "message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Message"
+          },
+          "resumes_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resumes At"
+          },
+          "violation_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Violation Code"
+          }
+        },
+        "required": [
+          "can_run"
+        ],
+        "title": "ConfigRunEligibilityResponse",
+        "type": "object"
+      },
       "ConnectorCreate": {
         "properties": {
           "assessor_url": {
@@ -3576,6 +3655,16 @@
           "record_type": {
             "title": "Record Type",
             "type": "string"
+          },
+          "run_eligibility": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ConfigRunEligibilityResponse"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "schedule": {
             "anyOf": [

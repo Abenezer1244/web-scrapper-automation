@@ -19,6 +19,95 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-26 — UX audit: 49 findings, batch A verified on real data, and a check that could never match
+
+> Evidence-based UX audit of the authenticated product (2026-09-25 and 09-26, two sessions).
+> FE worktree `C:/Users/Windows/bl-wt/fe-ux-audit`, branch `ux/evidence-audit-2026-09-25`,
+> FE PR **#162** merged 2026-09-27 03:14Z (`e42d5d0`, Vercel SUCCESS). F-043 fix BE **#363** merged
+> 03:20Z (`e5b82187`, api/worker/beat SUCCESS, worker booted clean). Audit: `docs/ux-audit/UX-AUDIT.md` in the FE repo.
+
+**Built / Shipped:**
+- The audit: 149 settled, logged-in captures at 8 viewports (1440 to 320), 49 findings with
+  screen, viewport, evidence, principle, severity and a verification method, and a prioritized
+  Phase 3 plan. Gate ledgers `GATES.md` (8/8) and `GATES-batch-A.md` (11/11), with the checks
+  that verify them (`verify-audit.mjs`, `checks/batch-a.mjs`).
+- Batch A, five FE files (FE #162): the skip-trace price comes from `/billing/skip-trace-usage`
+  (F-004: the wizard's hardcoded "$0.08 / lookup" contradicted Agency's $0.05); Phone and Email
+  sit beside the party name, with one shared column list and a right-edge scroll fade (F-005);
+  a table still waiting for data shows the skeleton, never "No records found." (F-044); a
+  finished batch with no scrapers says so instead of "Spinning up scrapes…" (F-007).
+- One owner-approved live run of `testy` (job 4fe3d0f3, 3 new leads): Live Run progress stayed
+  truthful, indeterminate while the total was unknown and a percentage only with a real
+  denominator ("Property 0 of 3").
+
+**Tried / Decided:**
+- Browser-verified batch A against REAL data without deploying: `next build` of the branch with
+  `NEXT_PUBLIC_API_URL=https://api.bridgeleads.io`, served on :3100. Production's API refuses a
+  localhost origin (400 on preflight), so the test browser relays those calls itself
+  (Playwright `ctx.route`: fetch from Node, add CORS for :3100 only). Nothing about production
+  changes, and no stub data is involved. Rejected the stub-API rig, which would have meant
+  asserting on invented data.
+- The 41 MB of screenshots are NOT committed: they carry real owner names and addresses, and the
+  repo is the wrong place for lead PII even though it is private. Consequence: the screens and
+  findings checks pass only where `docs/ux-audit/screens/` exists.
+- A7's Starter half was closed on source and bundle proof, stated as such in the ledger. No
+  Starter account was created in production to test it.
+- A review agent's P1 (Results index on a phone shows only the run name) was re-graded to P2
+  (F-045): opening a run still works; count and status are hidden, not unreachable.
+
+**Failed / Blocked:**
+- The live-run script failed twice without clicking anything. First it checked the card before
+  the "Run now" button rendered. Then, even with a retry, its guard could NEVER match: it
+  climbed from the Edit link to the first ancestor holding "Run now" (the action row) and
+  required that row to contain "testy", but the name lives one level up in the card. A dry-run
+  mode (mark the button, print the card, exit) proved the fix before the real click.
+- Editing that script through `node -e` in bash silently corrupted a regex twice: `\s` became
+  `s` and `\b` became a literal backspace byte. `od -c` found it. Script edits now go through a
+  written file, not inline shell strings.
+- `TaskStop` on a backgrounded `npx next start` killed only the npx wrapper. The node server
+  kept port 3100 and served the OLD build (EADDRINUSE on restart). Check `Get-NetTCPConnection`
+  and stop the real PID after stopping a wrapper.
+- Memory pressure reaped the headed browser (and its MFA session) three times across the two
+  sessions; each cost a manual re-login.
+- The first production-run attempt was refused by the auto-mode permission check until the
+  owner re-authorized it directly.
+
+**Caught & fixed:**
+- Codex batch-A review: a code-moving script passed JSX through `String.replace`, where `$$`
+  means `$`, dropping the `$` from Tax Balance Owed and Principal Owing. Restored and guarded.
+- Codex re-review P3 (real): a batch run's `child_count` is 0 while pending, before the worker
+  creates children, so the new empty state would have said "no scrapers" and disabled Download
+  on a run that was starting. `hasNoScrapers` now also requires a terminal run. Its P2
+  (`child_count` null) did not apply: `int` in `schemas.py`.
+
+**Pending / Handoff:**
+- **F-043 (P1, backend): SHIPPED in #363.** The fan-out skipped no deleted children, so a
+  soft-deleted batch scraper was scraped and billed on every run. Also fixed: a scraper deleted
+  while downgrade-paused was revived by the next upgrade (delete now clears `paused_reason`), and
+  `run_scrape_job` now skips any job whose scraper is deleted or paused (the Codex P1 race).
+  `SELECT ... FOR UPDATE` was rejected: under RLS it returns only rows passing the UPDATE policy,
+  which the repo does not define for the worker role. Plan and review log:
+  `tasks/todo-f043-batch-inactive-children.md`. Open: zero-child runs still read "done" (Phase 2
+  status model); prod rows deleted while paused are still unidentified, but no longer run.
+- F-042 and F-041: every API call waits on a separate `/api/auth/session` request (4.6 s median
+  vs 0.67 s for the call itself), and a hard navigation during those can leave a permanent
+  spinner.
+- Phase 3.0 contracts before batch B (F-001 run counts, F-006 delivered breakdown, F-009 contact
+  failures), then batches B to E including F-045 to F-050; Phase 4 re-test (failure, retry and
+  stalled Live Run states were not exercised); `/design-review` and Codex's independent review.
+- Merging FE #162 hit the API-types drift gate: backend #360 had changed the schema, so every
+  FE PR (and master) would fail. Fixed in FE #163 (regenerated types only), then #162 merged.
+
+**Facts learned:**
+- An animated counter renders a digit strip, so text scraping read Records "0" and "9%" where
+  the screenshot showed 3 and 0%. Trust the image for animated numbers.
+- Chromium full-page screenshots repeat the page top past about 16,380 px, so the bottom of very
+  long pages (the 71-card scrapers list at 320) is not truly imaged.
+- `useQuery` with `enabled: false` reports not-loading, so "no data and no error" must be
+  treated as loading or the empty state lies (F-044).
+
+---
+
 ## 2026-09-26 - Audit #2 re-verified under /unlazy, and F-03 fixed instead of risk-accepted
 
 > Same branch as below (`chore/security-audit-2026-09-25`, PR #360). Ledger (untracked):

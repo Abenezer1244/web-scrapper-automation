@@ -175,9 +175,11 @@ web-scrapper-automation/
 ```bash
 pip install -r requirements.txt
 cp .env.example .env.local
-# Fill in TEST-MODE third-party keys only (Stripe test, a dev R2 bucket, Resend).
+# In .env.local: a LOCAL SECRET_KEY (the example's placeholder is refused), e.g.
+#   python -c "import secrets; print(secrets.token_hex(32))"
+# and TEST-MODE third-party keys only (Stripe test, a dev R2 bucket, Resend).
 # The local stack reads .env.local, NEVER .env, and pins its own database, Redis,
-# signing/encryption keys, CORS origins and every paid/destructive switch
+# encryption keys, CORS origins and the paid/destructive switches
 # (see docker-compose.yml's header).
 docker compose up
 ```

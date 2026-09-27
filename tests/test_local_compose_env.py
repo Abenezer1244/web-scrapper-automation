@@ -5,9 +5,8 @@ stack used to read it three ways: `env_file: .env`, a `.:/app` mount that let
 pydantic's `env_file=".env"` find it inside the container, and compose's own
 `${...}` interpolation. `docker compose up` there would have scraped, spent and
 migrated against production. Now it reads `.env.local`, and pins in
-`environment:` (which beats `env_file:`) everything that could reach production
-or spend money: database and Redis URLs, signing/encryption keys, paid and
-destructive switches. Docker is not installed where this was built, so the
+`environment:` (which beats `env_file:`) the database and Redis URLs, blank
+encryption keys, and the paid and destructive switches. Docker is not installed where this was built, so the
 compose file itself is what these tests read (Codex local-env consult).
 """
 from __future__ import annotations
@@ -37,7 +36,6 @@ PINNED = {
     "ALLOWED_ORIGINS": "http://localhost:3000,http://127.0.0.1:3000",
     "FRONTEND_URL": "http://localhost:3000",
     "API_BASE_URL": "http://localhost:8000",
-    "SECRET_KEY": "local-dev-only-secret-key-never-used-outside-docker-compose",
     "FIELD_ENCRYPTION_KEY": "",
     "BLIND_INDEX_KEY": "",
     "PII_ENCRYPTION_STRICT": "false",
@@ -107,7 +105,9 @@ def test_every_app_service_pins_everything_that_could_reach_production(name):
     assert {k: env.get(k) for k in PINNED} == PINNED
     for key in ("DATABASE_URL", "DATABASE_URL_SYNC", "DATABASE_URL_MIGRATE"):
         assert (urlparse(env[key]).hostname, urlparse(env[key]).port) == ("postgres", None)
-    assert len(env["SECRET_KEY"]) >= 32  # settings refuse a shorter one
+    # No signing key is committed (security rule: no secrets in code); the
+    # developer's own local SECRET_KEY comes from .env.local.
+    assert "SECRET_KEY" not in env
 
 
 @pytest.mark.parametrize("name", sorted(SERVICES))

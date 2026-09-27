@@ -2025,6 +2025,24 @@ third-party keys remain the developer's); [P2] the test now checks exact URLs, l
 mounts and ports, every health dependency, and rejects `network_mode`; [P2] docs: this plan's
 stale interpolation line, CLAUDE.md's Alembic wording and `docker compose`.
 
+**Codex diff review r2 (NO-GO), reconciled:**
+- [P1] adopted: NO committed signing key (`.claude/rules/security.md`: no secrets in code), so
+  r1's pinned throwaway `SECRET_KEY` is removed; CLAUDE.md's setup has the developer generate a
+  local one into `.env.local` (the example's placeholder is refused at boot, loudly); the test
+  asserts `SECRET_KEY` is NOT in `environment:`. The blank key pins stay (blank is not a secret).
+- [P1] wording adopted: the header now claims only what is pinned (production database/Redis
+  unreachable, the listed paid/destructive switches off), and says `.env.local`'s SECRET_KEY and
+  third-party keys are used as given.
+- [P1] "pin Stripe / R2 / Resend empty" NOT adopted: the same decision Codex ACCEPTED in consult
+  round 2 (a deliberately created `.env.local` with test-mode keys is how billing, exports and
+  email are developed locally; the accident this PR closes is the checkout's `.env`).
+- [P2] migration 053 refuses a blank blind-index key on a database holding pre-053 users: a new
+  local database has none; noted in the compose comment. [P3] blank Tracerfy webhook secret =
+  503 on the webhook routes, as skip trace is off: noted.
+- Logged, not here: `main.py` always also allows the production CORS origins (app code, not the
+  local stack); `GIS_ENRICHMENT_ENABLED` / `OWNER_RECOVERY_ENABLED` / `PROPERTY_RECOVERY_ENABLED`
+  for deterministic local runs (not a safety issue).
+
 **Logged, not here:** CI test job setting the four libpq variables empty (runner defense; GitHub
 runners set none); `scripts/bootstrap.sh`'s "Copy .env.example to .env" wording (a production
 setup script that reads no `.env`); `docker-compose.prod.yml` (dormant, already audit #3 S3-53

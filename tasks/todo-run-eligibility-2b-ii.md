@@ -183,4 +183,34 @@ the union of config and job jurisdictions, manual included. P2 adopted: in-fligh
 Round 4: **PLAN: GO**, no findings.
 
 ## Review
-(pending)
+Built on `feat/run-eligibility-2b-ii` (rebased onto main `c9954f9f` after #370/#372).
+- 34 real-DB tests (`tests/test_config_eligibility.py`). On unfixed code all RED; the AI-count
+  bug RED behaviourally on the OLD gate (a Pro user with 50 MANUAL probate runs refused an AI tax
+  run, 402 "50/50"). Mutation-proven: dropping `Job.user_id` from the in-flight query, dropping it
+  from the AI count, removing the connector ordering, skipping the cross-county connector load.
+- Full suite 4946 passed, 0 failed (pre-rebase; part 7 re-run after a LOCAL Postgres PANIC,
+  "could not truncate file ... Permission denied", a Windows file lock, not the code). After the
+  rebase: 213 related tests incl. the new `test_db_safety.py` green; CI runs the full suite.
+- Prod EXPLAIN (no ANALYZE) of both job queries: index scans (`ix_jobs_user_id`,
+  `ix_scraper_configs_user_county_state_type`) over 136 jobs.
+- OpenAPI structural diff: `ConfigRunEligibilityResponse` + one property, nothing else.
+- Security §14: no findings (owner-scoped job queries, auth unchanged, no new input/egress,
+  refusal bodies byte-identical by the parity test).
+
+Codex diff review:
+- Round 1: GATE FAIL, no P1. P2 AI-count tenancy untested -> added (mismatched-owner job; the
+  query also joins on the config's owner, so another tenant's own-config job is excluded twice);
+  P2 entitlement parity compared only code/message -> whole body. P3 worker test added; P3 query
+  bound documented (<= 6); inactive short-circuit not done (GET one config only).
+- Round 2: GATE FAIL, no P1. Two P2s NOT adopted because the owner-approved plan decides them
+  ("Phase A must not move a single refusal"), and both are pre-existing, identical in the old gate:
+  (a) a config whose county no longer has an active connector for its record type reads
+  can_run, and the worker fails it with UnsupportedCountyError; (b) past jobs are classified as AI
+  from TODAY's connectors, so a connector mode change re-counts the month (a true fix needs a
+  `was_ai` snapshot on `jobs`, a migration). Both queued below. P3s adopted: the worker test now
+  proves which connector ran (the ai one would raise "no template"), and the query-bound test
+  covers several counties plus a history-only county and asserts <= 6.
+
+Follow-ups (queued, not in this PR):
+- `connector_unavailable`: refuse (gate + page) a run no active connector can serve.
+- Snapshot AI-ness per job (`jobs.was_ai`, migration) so the monthly count is immutable.

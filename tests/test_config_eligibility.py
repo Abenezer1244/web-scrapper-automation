@@ -380,12 +380,23 @@ async def test_the_worker_runs_the_connector_eligibility_judged(db, connectors):
     from src.scrapers.base_scraper import BridgeScraper
     from src.scrapers.registry import get_scraper_class
 
-    county = _county()
+    from src.scrapers.registry import UnsupportedCountyError
+
     old = datetime(2026, 1, 1, tzinfo=UTC)
-    await connectors(county, ["probate"], "ai", created_at=old + timedelta(days=1))
-    await connectors(county, ["probate"], "manual", created_at=old)
-    factory, record_type = get_scraper_class(county, "WA", "probate")
+    # The two connectors are told apart by what the worker does with them: the
+    # manual one resolves to its class; the ai one would look for a recorder
+    # template matching its example.gov base_url, find none, and raise.
+    manual_older = _county()
+    await connectors(manual_older, ["probate"], "ai", created_at=old + timedelta(days=1))
+    await connectors(manual_older, ["probate"], "manual", created_at=old)
+    factory, record_type = get_scraper_class(manual_older, "WA", "probate")
     assert (factory, record_type) == (BridgeScraper, "probate")
+
+    ai_older = _county()
+    await connectors(ai_older, ["probate"], "manual", created_at=old + timedelta(days=1))
+    await connectors(ai_older, ["probate"], "ai", created_at=old)
+    with pytest.raises(UnsupportedCountyError, match="template"):
+        get_scraper_class(ai_older, "WA", "probate")
 
 
 async def test_duplicate_connectors_resolve_to_the_oldest(db, connectors):
@@ -410,10 +421,15 @@ async def test_duplicate_connectors_resolve_to_the_oldest(db, connectors):
 # ─── Batched: a fixed number of queries, and all-tenant slot math ─────────────
 
 async def test_the_query_count_does_not_grow_with_the_list(db, connectors):
-    county = _county()
-    await connectors(county, ["probate"], "ai")
+    """Worst case: AI scrapers in several counties, plus AI history in a county
+    only that history reaches (forcing the second connector load)."""
+    counties = [_county() for _ in range(3)]
+    history_only = _county()
+    for county in [*counties, history_only]:
+        await connectors(county, ["probate"], "ai")
     user = await _user(db)
-    configs = [await _config(db, user, county) for _ in range(6)]
+    configs = [await _config(db, user, counties[i % 3]) for i in range(6)]
+    await _job(db, user, await _config(db, user, history_only))
     statements: list[str] = []
 
     def _count(conn, cursor, statement, *args):
@@ -430,6 +446,7 @@ async def test_the_query_count_does_not_grow_with_the_list(db, connectors):
     finally:
         event.remove(engine, "before_cursor_execute", _count)
     assert six == one
+    assert six <= 6, statements
 
 
 @pytest.mark.usefixtures("enforce")

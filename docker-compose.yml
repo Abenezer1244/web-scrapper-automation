@@ -1,18 +1,21 @@
 # LOCAL DEVELOPMENT ONLY — production runs on Railway (no docker-compose).
 #
-# This stack can never run on production config (tests/test_local_compose_env.py
-# enforces every point):
+# This stack never consumes the checkout's `.env`, and whatever `.env.local` holds
+# it cannot reach a production database or Redis, use a production key, or turn
+# on anything paid or destructive (tests/test_local_compose_env.py enforces it):
 #   * App services read `.env.local` (cp .env.example .env.local), NEVER `.env`:
 #     a checkout's `.env` may name production (the synced OneDrive one does).
 #   * No ${...} interpolation anywhere: compose reads the project `.env` to fill it.
-#   * The database and Redis URLs are pinned below to THESE containers, and
-#     `environment:` beats `env_file:`, so `.env.local` cannot point them elsewhere.
+#   * Everything below is pinned in `environment:`, which beats `env_file:`:
+#     the database and Redis URLs point at THESE containers; the signing and
+#     encryption keys are local-only; paid and destructive switches are OFF.
 #   * Only ./src and ./main.py are mounted (hot reload): no host `.env` is visible
 #     in /app for pydantic's env_file to read, and the image excludes it
 #     (.dockerignore).
-#   * Paid and destructive switches are pinned OFF.
-# The container passwords below are throwaway local values; both containers
-# listen on 127.0.0.1 only.
+# What `.env.local` still supplies is the developer's own third-party keys (Stripe
+# test mode, a dev R2 bucket, Resend): use test-mode keys only.
+# Every password and key written below is a throwaway local value, public on
+# purpose; both containers listen on 127.0.0.1 only.
 
 x-app-env: &app-env
   # No port on the database URLs: src/db/session.py rewrites ":5432/" to ":6543/"
@@ -25,6 +28,16 @@ x-app-env: &app-env
   ENVIRONMENT: development
   FRONTEND_URL: http://localhost:3000
   API_BASE_URL: http://localhost:8000
+  ALLOWED_ORIGINS: http://localhost:3000,http://127.0.0.1:3000
+  # Local-only keys, so a production key pasted into .env.local is never used
+  # here (a JWT signed with production's SECRET_KEY would be accepted THERE).
+  # Blank encryption / blind-index keys fall back to one derived from SECRET_KEY
+  # outside production and strict mode.
+  SECRET_KEY: local-dev-only-secret-key-never-used-outside-docker-compose
+  FIELD_ENCRYPTION_KEY: ""
+  BLIND_INDEX_KEY: ""
+  PII_ENCRYPTION_STRICT: "false"
+  TRACERFY_WEBHOOK_SECRET: ""
   # Real money or irreversible deletes, whatever .env.local says.
   SKIP_TRACE_ENABLED: "false"
   TRACERFY_API_TOKEN: ""

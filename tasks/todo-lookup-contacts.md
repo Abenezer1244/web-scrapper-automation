@@ -1974,9 +1974,8 @@ the stack cannot have worked against its own Postgres anyway: `src/db/session.py
         `REDIS_URL` (Celery broker + backend); `ENVIRONMENT=development`;
       - `api`/`worker`/`beat` mount `./src` and `./main.py` only (hot reload), not `.:/app`, so
         no `.env` exists in the container for pydantic to find;
-      - postgres/redis passwords from `${LOCAL_POSTGRES_PASSWORD:-...}` /
-        `${LOCAL_REDIS_PASSWORD:-...}` (names a production `.env` does not carry; compose
-        auto-reads the project `.env` for interpolation only), ports bound to 127.0.0.1.
+      - postgres/redis passwords are literal throwaway local values (NO interpolation, per
+        consult round 1 below; this line first proposed `${LOCAL_*}`), ports bound to 127.0.0.1.
 - [x] `tests/test_local_compose_env.py` (new; Docker is not here to render the config, so the
       YAML is the thing tested): no service reads `.env` (env_file or a mount of `.`/`.env`);
       every service that runs app code pins all four endpoints to the compose hosts; the sync
@@ -2013,6 +2012,18 @@ the stack cannot have worked against its own Postgres anyway: `src/db/session.py
   Claude, live-billed) pinned `false`; [P1] `RETENTION_PURGE_ENABLED=false` +
   `RETENTION_PURGE_DRY_RUN=true` pinned (the purge irreversibly deletes DB and R2 PII). The test
   asserts every pinned switch on every app service.
+
+**Codex diff review r1 (NO-GO), fixed:** [P1] a fresh stack would not boot: `.env.example`'s
+placeholder `SECRET_KEY` is refused by settings and migration 053 imports settings. Now pinned:
+a throwaway local `SECRET_KEY` (which also stops a production key in `.env.local` from minting
+JWTs production would accept), blank `FIELD_ENCRYPTION_KEY` / `BLIND_INDEX_KEY` /
+`TRACERFY_WEBHOOK_SECRET` (blank falls back outside production), `PII_ENCRYPTION_STRICT=false`;
+[P2] `ALLOWED_ORIGINS` pinned to localhost (a local frontend was refused); [P2] the claim narrowed
+to what is true: the checkout's `.env` is never consumed, and `.env.local` cannot reach a
+production database/Redis, use a production key, or enable anything paid/destructive (its
+third-party keys remain the developer's); [P2] the test now checks exact URLs, long-syntax
+mounts and ports, every health dependency, and rejects `network_mode`; [P2] docs: this plan's
+stale interpolation line, CLAUDE.md's Alembic wording and `docker compose`.
 
 **Logged, not here:** CI test job setting the four libpq variables empty (runner defense; GitHub
 runners set none); `scripts/bootstrap.sh`'s "Copy .env.example to .env" wording (a production

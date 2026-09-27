@@ -175,14 +175,16 @@ web-scrapper-automation/
 ```bash
 pip install -r requirements.txt
 cp .env.example .env.local
-# Fill in TEST-MODE keys only (Stripe test, a dev R2 bucket, Resend). The local
-# stack reads .env.local, NEVER .env, and pins its own database, Redis, and every
-# paid/destructive switch (see docker-compose.yml's header).
-docker-compose up
+# Fill in TEST-MODE third-party keys only (Stripe test, a dev R2 bucket, Resend).
+# The local stack reads .env.local, NEVER .env, and pins its own database, Redis,
+# signing/encryption keys, CORS origins and every paid/destructive switch
+# (see docker-compose.yml's header).
+docker compose up
 ```
 
 Never point a local stack or a test run at a `.env` that names production: the
-synced checkout's `.env` does. Alembic never reads `.env` either (`alembic/env.py`).
+synced checkout's `.env` does. `alembic/env.py` never takes its database URL from a
+`.env` either.
 
 ## Running Tests
 

@@ -1557,7 +1557,12 @@ wording and test specifications, adopted verbatim, so this closes the consult:
       behind thousands of blocked rows. Prod today: 941 rows in total.
       Fix per S3 = keyset frontier (per-account LATERAL scan from the last row considered), which
       needs an index `(user_id, trace_type, enqueued_at, id) WHERE status = 'queued'` = migration
-      103, plus reading the in-flight set once per pass. **OWNER DECISION pending.**
+      103, plus reading the in-flight set once per pass. **OWNER DECISION (2026-09-26): SHIP ii-b NOW
+      with the documented envelope (per-round budget holds to ~35k queued; deeper blocked runs are
+      truncated and logged, never over-claimed). The keyset frontier + migration 103 + one in-flight
+      read per pass become ii-c, which MUST land before Phase 1c can create large queues.**
+- [ ] **ii-c** (scheduled, before 1c): migration 103 index; per-account LATERAL keyset `allocate`;
+      in-flight set read once per pass; re-run this gate at 117k / 15k and pass it.
 - [x] mutations, each caught: read outside the lock (1 fails); `rn` out of ORDER BY (1); refill
       removed (4); weight 2 -> 1 (5); hold not cumulative (1). Also found and fixed by the tests: an
       account cap with no prior spend crashed `allocate` (a Python int where SQL was needed).

@@ -22,78 +22,22 @@ Policy (all enforced; any failure aborts collection BEFORE a fixture can run):
     allowlisted via ``TEST_DB_HOST_ALLOWLIST``.
   * The validated URLs OVERRIDE ``DATABASE_URL`` / ``DATABASE_URL_SYNC`` in the
     environment, so whatever the shared ``.env`` held is discarded for the run.
+    ``DATABASE_URL_MIGRATE`` (the owner role Alembic prefers) is pinned to the
+    test sync URL too: PINNED, never deleted, because an absent key is exactly
+    what ``load_dotenv()`` and pydantic's ``env_file`` refill from a ``.env``.
+  * No libpq variable that reroutes an explicit DSN (``PGHOSTADDR``, a service
+    file) may be set.
   * ``ENVIRONMENT`` is forced to ``"test"``.
+
+What counts as a test database lives in ``src/db_safety.py``, shared with
+``alembic/env.py`` so the two can never disagree.
 """
 from __future__ import annotations
 
 import os
-from urllib.parse import parse_qsl, urlparse
 
-# A database is accepted as a test DB only if BOTH hold:
-#   1. its name ends with one of these suffixes, and
-#   2. its host is localhost OR explicitly allowlisted (TEST_DB_HOST_ALLOWLIST).
-TEST_DB_NAME_SUFFIXES: tuple[str, ...] = ("_test", "_testing")
-# An EXPLICIT local host is required. A hostless DSN (e.g.
-# ``postgresql+asyncpg:///bridgeleads_test``) is rejected, NOT treated as local:
-# PostgreSQL drivers fill a missing host from ``PGHOST``, which could point at a
-# remote/prod DB and silently bypass this allowlist. An explicit host below also
-# overrides any ``PGHOST``, so it is the only safe signal.
-_LOCAL_HOSTS: frozenset[str] = frozenset({"localhost", "127.0.0.1", "::1"})
-# libpq / asyncpg / psycopg2 honour these DSN query params and they OVERRIDE the
-# host/db parsed from the URL authority+path. A DSN like
-#   postgresql+asyncpg://localhost/bridgeleads_test?host=prod&dbname=postgres
-# would pass a naive authority/path check yet actually connect to prod. We refuse
-# any of them outright — a test DSN never needs to redirect host/db via query.
-_FORBIDDEN_QUERY_KEYS: frozenset[str] = frozenset(
-    {"host", "hostaddr", "port", "dbname", "database"}
-)
-
-
-def _host_allowlist() -> set[str]:
-    raw = os.environ.get("TEST_DB_HOST_ALLOWLIST", "")
-    return {h.strip().lower() for h in raw.split(",") if h.strip()}
-
-
-def _db_name(url: str) -> str:
-    path = urlparse(url).path or ""
-    return path.lstrip("/").split("?", 1)[0]
-
-
-def _host(url: str) -> str:
-    return (urlparse(url).hostname or "").lower()
-
-
-def _forbidden_query_keys(url: str) -> set[str]:
-    """Connection-overriding query keys present in the DSN (case-insensitive)."""
-    keys = {k.lower() for k, _ in parse_qsl(urlparse(url).query, keep_blank_values=True)}
-    return keys & _FORBIDDEN_QUERY_KEYS
-
-
-def _classify(url: str) -> tuple[bool, str]:
-    """Return ``(is_test_db, reason_if_not)``."""
-    bad_keys = _forbidden_query_keys(url)
-    if bad_keys:
-        return False, (
-            f"DSN query overrides the connection target via {sorted(bad_keys)} — "
-            "host/db redirection in a test DSN is refused"
-        )
-    name = _db_name(url)
-    host = _host(url)
-    if not any(name.endswith(s) for s in TEST_DB_NAME_SUFFIXES):
-        return False, (
-            f"database name {name!r} does not end with one of {TEST_DB_NAME_SUFFIXES}"
-        )
-    if not host:
-        return False, (
-            "DSN has no explicit host; a hostless DSN can resolve to a remote DB "
-            "via PGHOST — set an explicit local host (localhost/127.0.0.1)"
-        )
-    if host not in _LOCAL_HOSTS and host not in _host_allowlist():
-        return False, (
-            f"host {host!r} is not local and not in TEST_DB_HOST_ALLOWLIST "
-            f"({sorted(_host_allowlist())})"
-        )
-    return True, ""
+from src.db_safety import ambient_redirects
+from src.db_safety import classify as _classify
 
 
 def _abort(reason: str) -> None:
@@ -107,8 +51,9 @@ def _abort(reason: str) -> None:
         "dedicated test database (name ends with _test/_testing; host local or\n"
         "listed in TEST_DB_HOST_ALLOWLIST). This guard exists because an\n"
         "unguarded test teardown once wiped the PRODUCTION database.\n"
-        "Set TEST_DATABASE_URL (and optionally TEST_DATABASE_URL_SYNC) to a\n"
-        "local/test database. See tests/_db_safety.py.\n"
+        "Set TEST_DATABASE_URL and TEST_DATABASE_URL_SYNC (both required, explicit\n"
+        "host and port) to a local/test database, and leave PGHOSTADDR/PGSERVICE/\n"
+        "PGSERVICEFILE/PGSYSCONFDIR unset. See tests/_db_safety.py and src/db_safety.py.\n"
         "===================================================================\n"
     )
 
@@ -139,10 +84,16 @@ def enforce_test_database() -> str:
     if not ok_sync:
         _abort(f"TEST_DATABASE_URL_SYNC is not a recognised test database: {why_sync}.")
 
+    redirects = ambient_redirects()
+    if redirects:
+        _abort(f"{redirects} set: libpq would route even an explicit test DSN "
+               "elsewhere. Unset them for the test run.")
+
     # Discard whatever the shared .env held — the run uses ONLY the validated
     # test URLs from here on, so a DATABASE_URL pointing at prod is inert.
     os.environ["DATABASE_URL"] = test_url
     os.environ["DATABASE_URL_SYNC"] = test_sync
+    os.environ["DATABASE_URL_MIGRATE"] = test_sync
     os.environ["ENVIRONMENT"] = "test"
     return test_url
 
@@ -154,3 +105,8 @@ def assert_engine_is_test(url: str) -> None:
     ok, why = _classify(url)
     if not ok:
         _abort(f"Live DB engine is NOT a test database: {why}.")
+    # Re-checked at the point of destruction: set mid-run, these would reroute
+    # the engine's next connection whatever its URL says (Codex safety-PR review).
+    redirects = ambient_redirects()
+    if redirects:
+        _abort(f"{redirects} set: libpq would route the test engine elsewhere.")

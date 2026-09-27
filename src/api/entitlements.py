@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from fastapi import HTTPException, status
-from sqlalchemy import func, select, text
+from sqlalchemy import func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config.constants import (
@@ -394,6 +394,22 @@ async def enforce_entitlements(
 
 # ── Runtime (execution-time) entitlement helpers ─────────────────────────────
 PAUSED_REASON_ENTITLEMENT = "entitlement"
+
+
+def current_batch_child_clause():
+    """SQL filter for the batch children that still belong to their batch.
+
+    `DELETE /scrapers/{id}` is a soft delete (active=False) that keeps `batch_id`,
+    so a bare `batch_id` match also returns scrapers the user deleted: the fan-out
+    scraped and billed them on every batch run (UX audit F-043). A downgrade pause
+    is also active=False, but with `paused_reason='entitlement'`, and it stays in
+    so the fan-out can report it as a plan limit instead of dropping it silently.
+    The fan-out and both batch routes share this one clause so the run and the
+    counts the user sees cannot drift apart."""
+    return or_(
+        ScraperConfig.active,
+        ScraperConfig.paused_reason == PAUSED_REASON_ENTITLEMENT,
+    )
 
 
 @dataclass(frozen=True)

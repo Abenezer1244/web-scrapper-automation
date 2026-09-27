@@ -472,6 +472,11 @@ async def delete_scraper(
     if config is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scraper not found")
     config.active = False  # Soft delete — preserves job history
+    # A downgrade pause is active=False with paused_reason='entitlement', and the
+    # plan reconcile revives exactly those rows on upgrade. Clearing the reason is
+    # what makes this a delete: without it, a scraper deleted while paused came
+    # back after the next upgrade and was scraped and billed (UX audit F-043).
+    config.paused_reason = None
     await db.flush()
     # M7: scraper-config changes were unaudited (audit checklist finding).
     audit_log(

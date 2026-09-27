@@ -17,7 +17,9 @@ would actually get):
   frozen | ended | over_limit
                    the account rule, ``src.api.quota.run_eligibility``.
 
-Batched: a list costs a fixed number of queries, however many scrapers it has.
+Batched: a list costs a fixed number of queries, however many scrapers it has
+(at most six: run slots, active configs, connectors, this month's jobs, and one
+more connector load for counties only that history reaches).
 Every job query is scoped by ``Job.user_id`` AND the caller's own configs.
 """
 

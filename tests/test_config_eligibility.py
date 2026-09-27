@@ -357,6 +357,37 @@ async def test_ai_jobs_in_a_county_the_page_does_not_show_still_count(db, connec
     assert (await _eligibility(db, user, [visible]))[visible.id].code == "ai_limit"
 
 
+async def test_another_accounts_jobs_never_spend_this_accounts_ai_limit(db, connectors):
+    """The AI count is scoped by Job.user_id AND the config's owner. Only a job
+    whose owner does not match its config tells the two apart: it must count for
+    nobody. Another account's ordinary jobs never count either."""
+    county = _county()
+    await connectors(county, ["probate"], "ai")
+    user = await _user(db, plan="starter", records_limit=50)
+    other = await _user(db, plan="starter", records_limit=50)
+    config = await _config(db, user, county)
+    other_config = await _config(db, other, county)
+    for _ in range(settings.AI_JOB_LIMITS["starter"] - 1):
+        await _job(db, user, config)
+    await _job(db, other, config)          # mismatched owner: other's job, user's config
+    await _job(db, other, other_config)    # other's own AI run
+    assert (await _eligibility(db, user, [config]))[config.id].can_run is True
+
+
+async def test_the_worker_runs_the_connector_eligibility_judged(db, connectors):
+    """The registry (worker) and the evaluator share pick_connector: with two
+    active connectors for one record type, the worker resolves the oldest."""
+    from src.scrapers.base_scraper import BridgeScraper
+    from src.scrapers.registry import get_scraper_class
+
+    county = _county()
+    old = datetime(2026, 1, 1, tzinfo=UTC)
+    await connectors(county, ["probate"], "ai", created_at=old + timedelta(days=1))
+    await connectors(county, ["probate"], "manual", created_at=old)
+    factory, record_type = get_scraper_class(county, "WA", "probate")
+    assert (factory, record_type) == (BridgeScraper, "probate")
+
+
 async def test_duplicate_connectors_resolve_to_the_oldest(db, connectors):
     from src.scrapers.registry import pick_connector
 
@@ -456,7 +487,11 @@ async def _assert_parity(db, client, user, config):
         assert r.status_code == 409
         assert body == {"code": "run_in_flight", "job_id": e.job_id, "message": e.message}
     elif e.code == "not_entitled":
+        from src.api.entitlements import plan_limit_http
+
         assert r.status_code == 402
+        # The WHOLE body, title included, not just the fields the page shows.
+        assert body == plan_limit_http(e.violation).detail
         assert (body["code"], body["message"]) == (e.violation_code, e.message)
     else:
         assert (r.status_code, body) == (402, e.message)

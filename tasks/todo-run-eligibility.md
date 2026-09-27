@@ -106,16 +106,16 @@ Per-config codes (`not_entitled`, `config_inactive`, `ai_limit`, `run_in_flight`
 - [ ] route: `POST /jobs` 402 body for frozen, ended and over_limit users is today's prose.
 
 ## Steps
-- [ ] Create `bridgeleads_eligibility_test` + env script (new Redis db index), `alembic upgrade head`.
-- [ ] Write tests; run on unfixed code, record RED.
-- [ ] Implement quota.py; schemas + route.
-- [ ] Tests GREEN; ruff; full suite in 8 parts.
-- [ ] openapi regen in `.venv-schema`. Parse both JSONs and diff structurally vs
+- [x] Create `bridgeleads_eligibility_test` + env script (new Redis db index), `alembic upgrade head`.
+- [x] Write tests; run on unfixed code, record RED.
+- [x] Implement quota.py; schemas + route.
+- [x] Tests GREEN; ruff; full suite in 8 parts.
+- [x] openapi regen in `.venv-schema`. Parse both JSONs and diff structurally vs
       `origin/main`: the only changed path is `/billing/usage` GET 200, the only new
       components are `UsageResponse` and `RunEligibilityResponse`; nothing else added,
       modified or removed (Codex P3).
-- [ ] Security review (§14): read-only route, auth unchanged, own-row only, no new input.
-- [ ] Codex diff review until GATE: PASS.
+- [x] Security review (§14): read-only route, auth unchanged, own-row only, no new input.
+- [x] Codex diff review until GATE: PASS.
 - [ ] Quiesce check, merge. Prod verify (Codex P3): read-only query for which states exist
       in prod (frozen / ended / pending-downgrade / ok), then call `/billing/usage` as the
       owner and compare against `run_eligibility` computed from the same DB row; check
@@ -143,3 +143,9 @@ added POST /batches 402 tests; scheduler / batch dispatch / batch fire are alrea
 `test_dispatch_due_jobs:101`, `test_batch_dispatch:141`, `test_batch_2b_scheduled:150`.
 Deferred to the FE follow-up (not BE defects; BE must land first for the drift gate): the FE
 `next_reset_at` type and BillingTab reading `user.plan`.
+Round 2: GATE: FAIL, but every finding was MY artifact: I sent a two-dot diff against an
+`origin/main` that had moved (#366/#368 merged after the branch point), so main's new code
+read as reverts. Rebased onto `165c3257`; full suite re-run on the rebased branch: 4914 passed,
+0 failed. Codex ruled the FE sequencing acceptable. Lesson: always review `origin/main...HEAD`.
+Round 3 (correct three-dot diff): **GATE: PASS**, no P1/P2; rebase interaction safe. One P3
+left open on purpose: over-limit prose templates are still inline f-strings (cosmetic).

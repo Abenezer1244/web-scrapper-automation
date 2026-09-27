@@ -127,8 +127,8 @@ def tracerfy(monkeypatch):
 # ── C1: the claim time survives acceptance, and adoption days later ──────────
 
 
-async def test_an_accepted_batch_keeps_its_claim_time(starter_user, tracerfy, monkeypatch):
-    (r,) = _seed(starter_user.id)
+async def test_an_accepted_batch_keeps_its_claim_time(business_user, tracerfy, monkeypatch):
+    (r,) = _seed(business_user.id)
     seen_at_post = {}
 
     def _submit(rows, trace_type="normal", api_token=None):
@@ -147,9 +147,9 @@ async def test_an_accepted_batch_keeps_its_claim_time(starter_user, tracerfy, mo
     assert submitted_at == seen_at_post["row"].submitted_at
 
 
-async def test_adoption_keeps_a_claim_time_from_days_ago(starter_user, tracerfy, monkeypatch):
+async def test_adoption_keeps_a_claim_time_from_days_ago(business_user, tracerfy, monkeypatch):
     claimed_at = (datetime.now(UTC) - timedelta(days=3)).replace(microsecond=0)
-    (r,) = _seed(starter_user.id, status="submitting", submitted_at=claimed_at)
+    (r,) = _seed(business_user.id, status="submitting", submitted_at=claimed_at)
     qid = _queue_id()
     monkeypatch.setattr(skip_trace, "fetch_queues", lambda *a, **k: [{
         "id": qid, "trace_type": "advanced", "queue_type": "api", "pending": False,
@@ -167,9 +167,9 @@ async def test_adoption_keeps_a_claim_time_from_days_ago(starter_user, tracerfy,
     assert submitted_at == claimed_at
 
 
-async def test_the_bookkeeping_retry_keeps_the_claim_time(starter_user):
+async def test_the_bookkeeping_retry_keeps_the_claim_time(business_user):
     claimed_at = datetime.now(UTC) - timedelta(minutes=2)
-    (r,) = _seed(starter_user.id, status="submitting", submitted_at=claimed_at)
+    (r,) = _seed(business_user.id, status="submitting", submitted_at=claimed_at)
     qid = _queue_id()
 
     # The retry runs on its own fresh session, after the first commit failed.
@@ -188,9 +188,9 @@ def _stale_claim_queue(qid: int, claimed_at: datetime) -> dict:
             "rows_uploaded": 1, "credits_deducted": 2, "download_url": None}
 
 
-async def test_the_reconciler_releases_a_claim_tracerfy_never_saw(starter_user, monkeypatch):
+async def test_the_reconciler_releases_a_claim_tracerfy_never_saw(business_user, monkeypatch):
     claimed_at = datetime.now(UTC) - timedelta(hours=2)
-    (r,) = _seed(starter_user.id, status="submitting", submitted_at=claimed_at)
+    (r,) = _seed(business_user.id, status="submitting", submitted_at=claimed_at)
     monkeypatch.setattr(skip_trace, "fetch_queues", lambda *a, **k: [])
 
     with system_sync_session() as db:
@@ -201,10 +201,10 @@ async def test_the_reconciler_releases_a_claim_tracerfy_never_saw(starter_user, 
     assert _row(r["pending"])[:2] == ("queued", None)
 
 
-async def test_a_queue_two_claims_could_own_is_adopted_by_neither(starter_user, monkeypatch):
+async def test_a_queue_two_claims_could_own_is_adopted_by_neither(business_user, monkeypatch):
     claimed_at = datetime.now(UTC) - timedelta(hours=2)
-    (first,) = _seed(starter_user.id, status="submitting", submitted_at=claimed_at)
-    (second,) = _seed(starter_user.id, status="submitting",
+    (first,) = _seed(business_user.id, status="submitting", submitted_at=claimed_at)
+    (second,) = _seed(business_user.id, status="submitting",
                       submitted_at=claimed_at + timedelta(seconds=1))
     qid = _queue_id()
     monkeypatch.setattr(skip_trace, "fetch_queues",
@@ -223,11 +223,11 @@ async def test_a_queue_two_claims_could_own_is_adopted_by_neither(starter_user, 
 # ── C2: bookkeeping and releases stay on their own claim ─────────────────────
 
 
-async def test_bookkeeping_never_lands_on_a_newer_claim(starter_user, caplog):
+async def test_bookkeeping_never_lands_on_a_newer_claim(business_user, caplog):
     old_claim = datetime.now(UTC) - timedelta(minutes=40)
     new_claim = datetime.now(UTC) - timedelta(minutes=1)
     # The row was released after the old POST and has since been claimed again.
-    (r,) = _seed(starter_user.id, status="submitting", submitted_at=new_claim)
+    (r,) = _seed(business_user.id, status="submitting", submitted_at=new_claim)
     qid = _queue_id()
 
     with system_sync_session() as db:
@@ -247,9 +247,9 @@ async def test_bookkeeping_never_lands_on_a_newer_claim(starter_user, caplog):
     assert "possible double purchase" in caplog.text
 
 
-async def test_a_release_only_touches_the_leads_it_released(starter_user):
+async def test_a_release_only_touches_the_leads_it_released(business_user):
     claim = datetime.now(UTC) - timedelta(minutes=40)
-    mine, moved_on = _seed(starter_user.id, 2, status="submitting", submitted_at=claim)
+    mine, moved_on = _seed(business_user.id, 2, status="submitting", submitted_at=claim)
     with system_sync_session() as db:
         db.execute(text("UPDATE pending_skip_trace_rows SET submitted_at = now() "
                         "WHERE id = :i"), {"i": moved_on["pending"]})
@@ -292,19 +292,19 @@ def _unsettled(job_id: str) -> bool:
     (72, None, False, True),
 ])
 async def test_the_dialer_ages_a_submitted_row_by_its_batch(
-    starter_user, row_age_h, queue_age_h, has_queue_row, expect_unsettled,
+    business_user, row_age_h, queue_age_h, has_queue_row, expect_unsettled,
 ):
     now = datetime.now(UTC)
     qid = _queue_id()
-    (r,) = _seed(starter_user.id, status="submitted",
+    (r,) = _seed(business_user.id, status="submitted",
                  submitted_at=now - timedelta(hours=row_age_h), queue_id=qid)
     if has_queue_row:
-        _queue_row(starter_user.id, r["job"], qid, now - timedelta(hours=queue_age_h))
+        _queue_row(business_user.id, r["job"], qid, now - timedelta(hours=queue_age_h))
     assert _unsettled(r["job"]) is expect_unsettled
 
 
 async def test_a_job_held_by_a_missing_queue_is_not_held_silently(
-    starter_user, caplog, monkeypatch,
+    business_user, caplog, monkeypatch,
 ):
     from src.workers import ops_alerts
     from src.workers.scheduler_helpers.dialer import _alert_rows_naming_missing_queues
@@ -312,7 +312,7 @@ async def test_a_job_held_by_a_missing_queue_is_not_held_silently(
     # send_ops_alert is the email-vendor boundary (Resend): capture, never send.
     sent: list[tuple] = []
     monkeypatch.setattr(ops_alerts, "send_ops_alert", lambda *a: sent.append(a) or True)
-    _seed(starter_user.id, status="submitted",
+    _seed(business_user.id, status="submitted",
           submitted_at=datetime.now(UTC) - timedelta(hours=72), queue_id=_queue_id())
 
     with system_sync_session() as db:
@@ -325,7 +325,7 @@ async def test_a_job_held_by_a_missing_queue_is_not_held_silently(
     assert "Dialer pushes blocked" in subject and "1 pending_skip_trace_rows" in body
 
 
-async def test_a_failing_missing_queue_probe_does_not_stop_the_sweep(starter_user, monkeypatch):
+async def test_a_failing_missing_queue_probe_does_not_stop_the_sweep(business_user, monkeypatch):
     from src.workers.scheduler_helpers import dialer
 
     def _boom(db):
@@ -357,9 +357,9 @@ async def test_a_failing_missing_queue_probe_does_not_stop_the_sweep(starter_use
 
 @pytest.mark.parametrize(("row_age_h", "expect_unsettled"), [(1, True), (13, False)])
 async def test_a_row_without_a_queue_id_ages_by_its_own_time(
-    starter_user, row_age_h, expect_unsettled,
+    business_user, row_age_h, expect_unsettled,
 ):
-    (r,) = _seed(starter_user.id, status="submitted",
+    (r,) = _seed(business_user.id, status="submitted",
                  submitted_at=datetime.now(UTC) - timedelta(hours=row_age_h))
     assert _unsettled(r["job"]) is expect_unsettled
 
@@ -379,9 +379,9 @@ async def test_a_row_without_a_queue_id_ages_by_its_own_time(
     ("Tracerfy returned 400: bad batch", "errored", False),
 ])
 async def test_a_provider_outcome_leaves_the_ledger_right(
-    starter_user, tracerfy, error, expect_status, expect_spent,
+    business_user, tracerfy, error, expect_status, expect_spent,
 ):
-    (r,) = _seed(starter_user.id)
+    (r,) = _seed(business_user.id)
     calls = tracerfy(TracerfyError(error))
 
     dispatcher.dispatch_pending_skip_trace()
@@ -393,9 +393,9 @@ async def test_a_provider_outcome_leaves_the_ledger_right(
     assert (submitted_at is not None) is expect_spent
 
 
-async def test_a_partial_402_submits_the_affordable_head_under_its_claim(starter_user, tracerfy):
+async def test_a_partial_402_submits_the_affordable_head_under_its_claim(business_user, tracerfy):
     # Three advanced rows = 6 credits; "need 2 more" leaves 4 = two rows affordable.
-    a, b, c = _seed(starter_user.id, 3)
+    a, b, c = _seed(business_user.id, 3)
     calls = tracerfy(TracerfyError("Tracerfy returned 402: You need 2 more credits"), "accept")
 
     dispatcher.dispatch_pending_skip_trace()
@@ -408,8 +408,8 @@ async def test_a_partial_402_submits_the_affordable_head_under_its_claim(starter
     assert _row(c["pending"])[:2] == ("queued", None)
 
 
-async def test_an_unknown_partial_resubmit_keeps_its_claim(starter_user, tracerfy):
-    a, b, c = _seed(starter_user.id, 3)
+async def test_an_unknown_partial_resubmit_keeps_its_claim(business_user, tracerfy):
+    a, b, c = _seed(business_user.id, 3)
     tracerfy(TracerfyError("Tracerfy returned 402: You need 2 more credits"),
              TracerfyError("Network error: read timed out"))
 

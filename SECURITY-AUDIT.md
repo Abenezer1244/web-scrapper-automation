@@ -19,6 +19,8 @@ driver made two single live GETs (below).
 | S4-01 | P1 | Billing / entitlement | Worker never re-checks account run eligibility (CXD-1). Pre-existing, not introduced by the delta; the delta made `run_eligibility` the one rule but only enqueue gates call it | src/workers/tasks.py:535-571 checks config and plan only; the reservation at tasks.py:1816-1840 grants remaining quota with no frozen/ended predicate; src/api/quota.py:187 | a job queued while eligible, then the account freezes (failed payment) or its paid term ends before the worker runs (queue delay, watchdog re-run, batch child) | scraping, record grant and paid skip-trace for an account that may no longer start billable work | After the claim, reload the user and refuse on `frozen`/`ended` before any external work; re-check before the skip-trace enqueue | queued job of a now-frozen / now-ended account fails with no scrape and no pending_skip_trace_rows | CONFIRMED (code trace). Driver would rate P2 (bounded to already-queued jobs); Codex severity adopted per the disagreement rule |
 | S4-02 | P2 | Concurrency / cost | Run slot released 300 s after cancel even if the worker is still running (CXD-3) | src/db/models.py:817-844 `RUN_SLOT_CANCEL_COOLDOWN_SECONDS`; migration 104 index covers active statuses only | the account's own cancel, then a restart after 5 min | two workers on one config: duplicate county scraping, dedup claims can mislabel the new run's leads "Already delivered" | Worker-owned slot lease: cancel requests, the worker acknowledges terminal state; stale-lease recovery by the watchdog | cancelled-but-running job keeps the slot until the worker acknowledges | CONFIRMED (code trace). Self-tenant only; driver would rate P3, Codex P2 adopted |
 | S4-03 | P2 | Rate limiting | The S3-09 `export` zone misses 4 routes that rebuild and decrypt full CSVs (D4-2 + CXD-4) | src/api/routes/batches.py:733,854 and src/api/routes/segments.py:709,835 use `general` (60/min, fails fully open when Redis is down); only jobs.py:1280,1439 use `export` | an account | CPU / DB / PII-decrypt amplification, starving other tenants | Move the 4 routes to the `export` zone | 21st export in a minute across job, batch and segment routes gets 429 | CONFIRMED (both reviewers; driver grep). Claude P3, Codex P2: higher adopted |
+| S4-05 | P3 | Quota correctness | A finite account upgraded to an unlimited plan while its run scrapes is granted 0 records (found by Codex while reviewing the 4a fix; pre-existing) | src/workers/tasks.py reservation: the cap block is entered on the pre-scrape limit, and the grant SQL computes `GREATEST(0, -1 - base)` | an upgrade during a run | that run delivers nothing (customer-hurting, not a security bypass) | Treat `eff_limit = -1` in the grant as "grant what was asked" | upgrade mid-run still delivers | CONFIRMED (code trace), OPEN |
+| S4-06 | P2 | Quota correctness | The reservation's quota-window clock `_reserved_at` is read before the users row lock is taken (Codex, 4a review round 3; pre-existing) | src/workers/tasks.py reservation step 1 and the grant statement | a lock wait that crosses a quota-window boundary | one grant computed against the previous window's remaining quota | Read the window clock after the lock is held, keeping `jobs.reserved_at` consistent with it | reservation straddling a boundary uses the new window | CONFIRMED (code trace), OPEN. Codex P2 adopted; driver would rate P3 |
 | S4-04 | P3 | Billing / data | Scrapers deleted before the F-043 fix keep `paused_reason='entitlement'` and are re-activated by `plan_reconciliation` on the next upgrade (D4-1) | delete now clears `paused_reason`, no backfill for older rows | an account that deleted a downgrade-paused scraper before the fix, then upgrades | deleted scrapers run and bill again | Backfill from `scraper_deleted` audit events, or an explicit `deleted_at` | re-activation skips deleted configs | SUSPECTED: sizing needs a read-only production query (not run) |
 
 ### Audit #3 items re-checked
@@ -55,6 +57,34 @@ failing to build falls back to the API check, not open. `run_eligibility` gives 
 | none | D4-1 (P3) | Claude-only: S4-04, suspected |
 
 No Codex finding was rejected.
+
+### Phase 4a: S3-03 and S4-01 FIXED (this branch, not merged)
+
+Owner decision 2026-09-27: trials get a small lifetime allowance of contact lookups.
+
+- **One rule, `paid_lookup_access`** (`src/workers/skip_trace_claim.py`): Starter, frozen and ended accounts buy no
+  lookups; admins, active or in-grace subscribers, accounts paid through a cancelled term, and operator-granted
+  plans (no status, no trial date) buy freely (the credit caps still apply); every other state, including the
+  app trial, Stripe `trialing`, `canceled` and unknown statuses, gets `SKIP_TRACE_TRIAL_CREDIT_ALLOWANCE`
+  credits (default 25) over the account's lifetime.
+- **Enforced where every lookup enters the queue** (`claim_skip_trace_rows`, the only INSERT), under a
+  `FOR NO KEY UPDATE` lock on the user row, so two jobs of one trial cannot both spend the same room and a
+  billing write in flight is waited for.
+- **The dispatcher re-applies it** to rows queued earlier: an unlocked filter keeps blocked accounts out of the
+  batch, and the accounts about to be claimed are re-checked `FOR SHARE SKIP LOCKED` just before the claim
+  commit. A frozen account's rows are held; Starter and ended accounts' rows are withdrawn (lead back to
+  `not_attempted`, never charged).
+- **The worker** refuses a frozen or ended account right after claiming the job, and re-decides at the quota
+  reservation under the users row lock, with a clock read after the lock is held, granting 0 records; an
+  account blocked at the gate enters the cap block even on an unlimited plan.
+- Tests: `tests/test_audit4_paid_skip_trace_gate.py`, 43 tests on a real DB, no mocks (including two real
+  concurrency tests). Every guard was mutation-checked: disabling it fails its tests.
+- Codex: plan consult + 4 review rounds. Its findings were fixed (dispatcher recheck, user-row lock, cancelled-
+  but-paid-through status, per-account lock scope, unlimited-plan path, clock after lock) or logged as the
+  pre-existing S4-05/S4-06. Accepted residuals: lifetime counting uses queue rows, which only operator
+  cleanup scripts can delete (no customer route deletes jobs, results or the account); an unlimited account
+  that freezes after the gate read and before its export is delivered that run; the unlimited path has no
+  automated test (it needs a real scrape).
 
 ### Proposed fix order (one PR per phase, owner approval between phases)
 

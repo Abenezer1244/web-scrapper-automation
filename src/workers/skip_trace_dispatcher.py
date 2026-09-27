@@ -343,6 +343,53 @@ def dispatch_pending_skip_trace() -> dict:
                 withdrawn: list = []
                 unsubmittable: list = []
                 active = discover_accounts(db, trace_type, watermark)
+                # A row queued while its account could buy it is not sent after the
+                # account froze, its paid term ended or it dropped to Starter (S4-01,
+                # Codex 4a consult P1). FROZEN is usually temporary (dunning), so its
+                # rows stay queued, untouched, and go out once the payment clears.
+                # Starter and ended are not: their rows are WITHDRAWN like any other
+                # undeliverable row ('cancelled', lead back to 'not_attempted'), so a
+                # lead does not read "looking up" forever and a run after the
+                # customer subscribes again queues it afresh. Never charged either way.
+                # This read is a FILTER, unlocked, so a blocked account's rows never
+                # take a batch slot; the decision that counts is re-made under a lock
+                # for the selected accounts only, just before the claim
+                # (_drop_blocked_accounts). The same rule as the claim
+                # (paid_lookup_access), never a copy in SQL.
+                from src.workers.skip_trace_claim import (
+                    ACCESS_FROZEN,
+                    BLOCKED_ACCESS,
+                    paid_lookup_access,
+                    read_access_rows,
+                )
+
+                _accounts = read_access_rows(db, active, lock="")
+                _access = {
+                    u: (paid_lookup_access(_accounts[u]) if u in _accounts else None)
+                    for u in active
+                }
+                _blocked = {u for u, a in _access.items() if a is None or a in BLOCKED_ACCESS}
+                _withdraw_for = sorted(
+                    u for u in _blocked if _access[u] not in (None, ACCESS_FROZEN))
+                if _withdraw_for:
+                    _gone = db.execute(
+                        select(PendingSkipTraceRow)
+                        .where(
+                            PendingSkipTraceRow.user_id.in_(_withdraw_for),
+                            PendingSkipTraceRow.status == "queued",
+                            PendingSkipTraceRow.trace_type == trace_type,
+                        )
+                        .with_for_update(skip_locked=True, of=PendingSkipTraceRow)
+                    ).scalars().all()
+                    _cancel_undeliverable(db, _gone)
+                    withdrawn.extend(_gone)
+                if _blocked:
+                    _logger.info(
+                        "Dispatcher: %d account(s) with queued %s rows skipped (%d "
+                        "withdrawn: Starter or ended; the rest frozen, held)",
+                        len(_blocked), trace_type, len(_withdraw_for),
+                    )
+                    active = [u for u in active if u not in _blocked]
                 frontier = dict.fromkeys(active, FRONTIER_START)
                 in_flight = _InFlightCache()
                 seen_users: set[str] = set()
@@ -467,6 +514,7 @@ def dispatch_pending_skip_trace() -> dict:
                         "Dispatcher: %d %s row(s) held: the same account's lookup for "
                         "that address is already under way", held, trace_type,
                     )
+                rows = _drop_blocked_accounts(db, rows, trace_type)
                 if not rows:
                     # Nothing to claim: commit the failures and withdrawals on their
                     # own (no claim follows to carry them), and in every case end the
@@ -641,6 +689,40 @@ class _Claim(NamedTuple):
     result_id: str
     job_id: str
     user_id: str
+
+
+def _drop_blocked_accounts(db, rows: list, trace_type: str) -> list:
+    """The rows whose account may still buy lookups, decided under a lock (S4-01).
+
+    Locks ONLY the accounts about to be claimed, FOR SHARE and held to the claim
+    commit, so a freeze or a term end being written now waits for this pass
+    instead of landing between the decision and the claim. SKIP LOCKED: the
+    dispatcher never waits on a lock, so an account whose row is being written
+    right now is left out of this pass (fails closed). A dropped row is not
+    touched: it stays 'queued' (its FOR UPDATE lock ends with the transaction)
+    and goes out on a later tick if the account can still buy it."""
+    if not rows:
+        return rows
+    from src.workers.skip_trace_claim import (
+        BLOCKED_ACCESS,
+        paid_lookup_access,
+        read_access_rows,
+    )
+
+    accounts = read_access_rows(
+        db, {str(r.user_id) for r in rows}, lock="FOR SHARE SKIP LOCKED")
+    kept = [
+        r for r in rows
+        if str(r.user_id) in accounts
+        and paid_lookup_access(accounts[str(r.user_id)]) not in BLOCKED_ACCESS
+    ]
+    if len(kept) != len(rows):
+        _logger.info(
+            "Dispatcher: %d %s row(s) left queued: their account froze, ended, "
+            "dropped to Starter, or is being updated right now",
+            len(rows) - len(kept), trace_type,
+        )
+    return kept
 
 
 def _job_delivered_sql(alias: str) -> str:

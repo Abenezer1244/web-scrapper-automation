@@ -103,8 +103,8 @@ def _dispatcher_enabled(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_definite_rejection_releases_claim_to_errored(starter_user, _dispatcher_enabled):
-    pending_id, result_id = _seed_pending(starter_user.id)
+async def test_definite_rejection_releases_claim_to_errored(business_user, _dispatcher_enabled):
+    pending_id, result_id = _seed_pending(business_user.id)
 
     out = dispatch_pending_skip_trace()
 
@@ -121,9 +121,9 @@ async def test_definite_rejection_releases_claim_to_errored(starter_user, _dispa
 
 
 @pytest.mark.asyncio
-async def test_row_claimed_by_another_tick_is_not_resubmitted(starter_user, _dispatcher_enabled):
+async def test_row_claimed_by_another_tick_is_not_resubmitted(business_user, _dispatcher_enabled):
     stale = datetime.now(UTC) - timedelta(hours=2)
-    pending_id, result_id = _seed_pending(starter_user.id, status="submitting", submitted_at=stale)
+    pending_id, result_id = _seed_pending(business_user.id, status="submitting", submitted_at=stale)
 
     out = dispatch_pending_skip_trace()
 
@@ -139,7 +139,7 @@ async def test_row_claimed_by_another_tick_is_not_resubmitted(starter_user, _dis
 
 @pytest.mark.asyncio
 async def test_release_cannot_clobber_a_newer_claim_on_the_same_rows(
-    starter_user, _dispatcher_enabled
+    business_user, _dispatcher_enabled
 ):
     """The double-pay race Codex found (2026-09-07).
 
@@ -156,7 +156,7 @@ async def test_release_cannot_clobber_a_newer_claim_on_the_same_rows(
 
     stale = datetime.now(UTC) - timedelta(hours=2)
     pending_id, result_id = _seed_pending(
-        starter_user.id, status="submitting", submitted_at=stale)
+        business_user.id, status="submitting", submitted_at=stale)
 
     # A newer claim lands on the same row while the reconciler holds its snapshot.
     newer = datetime.now(UTC)
@@ -171,7 +171,7 @@ async def test_release_cannot_clobber_a_newer_claim_on_the_same_rows(
     with system_sync_session() as db:
         _release_claim(
             db,
-            [_Claim(pending_id, result_id, "j", starter_user.id)],
+            [_Claim(pending_id, result_id, "j", business_user.id)],
             "queued",
             claim_time=stale,
         )
@@ -185,7 +185,7 @@ async def test_release_cannot_clobber_a_newer_claim_on_the_same_rows(
     with system_sync_session() as db:
         _release_claim(
             db,
-            [_Claim(pending_id, result_id, "j", starter_user.id)],
+            [_Claim(pending_id, result_id, "j", business_user.id)],
             "queued",
             claim_time=newer,
         )
@@ -198,12 +198,12 @@ async def test_release_cannot_clobber_a_newer_claim_on_the_same_rows(
 
 @pytest.mark.asyncio
 async def test_a_row_whose_lead_became_a_duplicate_is_withdrawn_not_submitted(
-    starter_user, _dispatcher_enabled
+    business_user, _dispatcher_enabled
 ):
     """Queued while it was the survivor, flagged duplicate before the tick (a
     watchdog re-run repeating the survivor election). Nothing is claimed or
     POSTed: the non-HTTPS endpoint would have produced an error if it had been."""
-    pending_id, result_id = _seed_pending(starter_user.id, is_duplicate=True, duplicate_reason="same_run")
+    pending_id, result_id = _seed_pending(business_user.id, is_duplicate=True, duplicate_reason="same_run")
 
     out = dispatch_pending_skip_trace()
 
@@ -218,10 +218,10 @@ async def test_a_row_whose_lead_became_a_duplicate_is_withdrawn_not_submitted(
 
 @pytest.mark.asyncio
 async def test_a_row_the_plan_cap_excluded_is_withdrawn_not_submitted(
-    starter_user, _dispatcher_enabled
+    business_user, _dispatcher_enabled
 ):
     pending_id, result_id = _seed_pending(
-        starter_user.id, enrichment_data='{"delivery_excluded_reason": "over_quota"}')
+        business_user.id, enrichment_data='{"delivery_excluded_reason": "over_quota"}')
 
     out = dispatch_pending_skip_trace()
 
@@ -232,13 +232,13 @@ async def test_a_row_the_plan_cap_excluded_is_withdrawn_not_submitted(
 
 @pytest.mark.asyncio
 async def test_withdrawal_does_not_hold_back_the_deliverable_rows_beside_it(
-    starter_user, _dispatcher_enabled
+    business_user, _dispatcher_enabled
 ):
     """One FIFO head, one withdrawn row and one live row. The live row still goes
     through the claim path (and is released as errored by the fake endpoint's
     definite rejection); the withdrawn one is cancelled in the same tick."""
-    dup_pending, dup_result = _seed_pending(starter_user.id, is_duplicate=True, duplicate_reason="same_run")
-    live_pending, live_result = _seed_pending(starter_user.id)
+    dup_pending, dup_result = _seed_pending(business_user.id, is_duplicate=True, duplicate_reason="same_run")
+    live_pending, live_result = _seed_pending(business_user.id)
 
     out = dispatch_pending_skip_trace()
 
@@ -251,14 +251,14 @@ async def test_withdrawal_does_not_hold_back_the_deliverable_rows_beside_it(
 
 @pytest.mark.asyncio
 async def test_a_lead_being_updated_right_now_is_left_for_the_next_tick(
-    starter_user, _dispatcher_enabled
+    business_user, _dispatcher_enabled
 ):
     """The race Codex found in the diff review. A re-election is flagging the row
     duplicate in a transaction still open when the dispatcher reads it. The old
     committed value says "deliverable", so reading it would buy the lookup. The
     dispatcher skips the locked row instead (never waiting on it, which would
     invert lock order against a purge cascade) and decides on the next tick."""
-    pending_id, result_id = _seed_pending(starter_user.id)
+    pending_id, result_id = _seed_pending(business_user.id)
 
     with system_sync_session() as writer:
         writer.execute(
@@ -282,12 +282,12 @@ async def test_a_lead_being_updated_right_now_is_left_for_the_next_tick(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("job_status", ["failed", "cancelled"])
 async def test_a_job_that_delivered_nothing_never_buys_its_queued_lookups(
-    starter_user, _dispatcher_enabled, job_status
+    business_user, _dispatcher_enabled, job_status
 ):
     """Rows are queued just before the enriched re-export and billing. If the job
     then fails (an upload that never lands) the file was never delivered, so its
     queued lookups are withdrawn, not paid for."""
-    pending_id, result_id = _seed_pending(starter_user.id, job_status=job_status)
+    pending_id, result_id = _seed_pending(business_user.id, job_status=job_status)
 
     out = dispatch_pending_skip_trace()
 
@@ -299,14 +299,14 @@ async def test_a_job_that_delivered_nothing_never_buys_its_queued_lookups(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("job_status", ["failed", "cancelled"])
 async def test_a_job_that_billed_before_it_was_marked_terminal_still_buys_its_lookups(
-    starter_user, _dispatcher_enabled, job_status
+    business_user, _dispatcher_enabled, job_status
 ):
     """Billing and the done-CAS commit together, so a billed job delivered its file
     (the download is gated on export_key, not status) and the customer paid. A
     status written over 'done' afterwards (a cancel racing completion) must not
     withdraw what they bought (Codex review round 6). The row goes through the
     claim path; the fake endpoint's definite rejection marks it errored."""
-    pending_id, result_id = _seed_pending(starter_user.id, job_status=job_status, billed=True)
+    pending_id, result_id = _seed_pending(business_user.id, job_status=job_status, billed=True)
 
     out = dispatch_pending_skip_trace()
 
@@ -318,7 +318,7 @@ async def test_a_job_that_billed_before_it_was_marked_terminal_still_buys_its_lo
 @pytest.mark.asyncio
 @pytest.mark.parametrize("job_status", ["failed", "cancelled"])
 async def test_a_job_from_before_billing_was_stamped_still_buys_its_lookups(
-    starter_user, _dispatcher_enabled, job_status
+    business_user, _dispatcher_enabled, job_status
 ):
     """Before migration 063 a job could charge and deliver and still end failed or
     cancelled with no stamp, so NULL proves nothing: its lookups are bought, as
@@ -326,7 +326,7 @@ async def test_a_job_from_before_billing_was_stamped_still_buys_its_lookups(
     from src.workers.tasks_helpers.dedup import BILLING_STAMP_RELIABLE_SINCE
 
     pending_id, result_id = _seed_pending(
-        starter_user.id, job_status=job_status,
+        business_user.id, job_status=job_status,
         created_at=BILLING_STAMP_RELIABLE_SINCE - timedelta(days=1))
 
     out = dispatch_pending_skip_trace()
@@ -338,9 +338,9 @@ async def test_a_job_from_before_billing_was_stamped_still_buys_its_lookups(
 
 @pytest.mark.asyncio
 async def test_a_job_still_running_keeps_its_rows_queued_until_it_finishes(
-    starter_user, _dispatcher_enabled
+    business_user, _dispatcher_enabled
 ):
-    pending_id, result_id = _seed_pending(starter_user.id, job_status="enriching")
+    pending_id, result_id = _seed_pending(business_user.id, job_status="enriching")
 
     out = dispatch_pending_skip_trace()
 

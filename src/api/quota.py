@@ -154,7 +154,13 @@ def next_quota_reset(user, now: datetime | None = None) -> datetime | None:
     open a new window against — and the account becomes ``ended`` instead.
     Reporting the window end as a reset date would promise a quota that never
     comes back.
+
+    A FROZEN account gets None for the same reason: its window does not
+    advance while payment has failed, so the stored end may already be in the
+    past and no reset will happen until the customer pays. (Codex)
     """
+    if is_frozen(user, now):
+        return None
     _, end = effective_window(user, now)
     end = as_utc(end)
     ends_at = getattr(user, "entitlement_ends_at", None)

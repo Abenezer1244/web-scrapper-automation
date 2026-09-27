@@ -288,6 +288,20 @@ async def test_usage_view_never_advertises_a_reset_that_ends_access(db, ends_at,
     assert view["next_reset_at"] == expected_reset
 
 
+@pytest.mark.parametrize("stale", [False, True])
+async def test_usage_view_frozen_account_has_no_reset_date(db, stale):
+    """A frozen window does not advance, so its stored end may already be in
+    the past, and it will not reset at all until the customer pays."""
+    from src.api.routes.billing import usage_view
+
+    kw = {"subscription_status": "unpaid"}
+    user = await _user(db, **(_stale(**kw) if stale else kw))
+    view = usage_view(user, NOW)
+    assert view["next_reset_at"] is None
+    assert view["payment_state"] == "frozen"
+    assert view["run_eligibility"].code == "frozen"
+
+
 async def test_usage_view_applies_a_pending_downgrade_the_rollover_will_apply(db):
     """Business with a pending Pro downgrade, window ended, rollover not yet
     run. The gate and the next charge already treat them as Pro at 0/1000; the
@@ -371,7 +385,9 @@ async def test_usage_view_publishes_utc_instants_for_naive_rows(db):
     user.entitlement_ends_at = user.entitlement_ends_at.replace(tzinfo=None)
     view = usage_view(user, NOW)
     for key in ("period_start", "next_reset_at", "entitlement_ends_at"):
-        assert view[key].tzinfo is not None, key
+        assert view[key].utcoffset() == timedelta(0), key
+    # Exact instants: a naive value read as LOCAL time would shift them.
+    assert (view["period_start"], view["next_reset_at"]) == (LIVE_START, LIVE_END)
     assert view["entitlement_ends_at"] == LIVE_END + timedelta(days=40)
 
 
@@ -402,7 +418,8 @@ async def test_usage_route_reports_run_eligibility_for_each_state(client, db):
     ok = await _user(db, **_live_window())
     frozen = await _user(db, subscription_status="unpaid", **_live_window())
     ended = await _user(db, entitlement_ends_at=now - timedelta(hours=1), **_live_window())
-    over = await _user(db, records_used=1000, **_live_window())
+    over_window = _live_window()
+    over = await _user(db, records_used=1000, **over_window)
 
     assert (await _get_usage(client, ok))["run_eligibility"] == {
         "can_run": True, "code": None, "message": None, "resumes_at": None,
@@ -416,11 +433,10 @@ async def test_usage_route_reports_run_eligibility_for_each_state(client, db):
     body = await _get_usage(client, over)
     elig = body["run_eligibility"]
     assert (elig["can_run"], elig["code"]) == (False, "over_limit")
-    assert elig["resumes_at"] is not None
-    assert datetime.fromisoformat(elig["resumes_at"]) == datetime.fromisoformat(
-        body["next_reset_at"]
-    )
-    assert datetime.fromisoformat(elig["resumes_at"]).tzinfo is not None
+    # Parsed back to the exact window end, not merely to the route's own
+    # next_reset_at: both could be wrong together.
+    assert datetime.fromisoformat(elig["resumes_at"]) == over_window["quota_period_end"]
+    assert datetime.fromisoformat(body["next_reset_at"]) == over_window["quota_period_end"]
 
 
 async def test_usage_route_cancelled_term_has_no_reset_date(client, db):
@@ -504,4 +520,33 @@ async def test_post_jobs_402_on_a_cancelled_term_promises_no_reset(client, db, d
     r = await _post_job(client, db, user)
     assert r.status_code == 402
     assert r.json()["detail"].startswith("Record limit reached (1000/1000).")
+    assert "resets" not in r.json()["detail"]
+
+
+# ─── POST /batches: the same gate, the same answer ────────────────────────────
+
+async def _post_batch(client: AsyncClient, user: User):
+    # king/WA/probate is a real active connector seeded by migration 006.
+    return await client.post(
+        "/batches",
+        json={"state": "WA", "counties": ["king"], "record_types": ["probate"]},
+        headers={"Authorization": f"Bearer {create_secure_token(user.id)}"},
+    )
+
+
+async def test_post_batches_402_uses_run_eligibility(client, db):
+    window = _live_window()
+    over = await _user(db, plan="business", records_limit=5000, records_used=5000, **window)
+    r = await _post_batch(client, over)
+    assert (r.status_code, r.json()["detail"]) == (
+        402, _over_msg(5000, 5000, window["quota_period_end"]),
+    )
+
+    window = _live_window()
+    cancelled = await _user(
+        db, plan="business", records_limit=5000, records_used=5000,
+        entitlement_ends_at=window["quota_period_end"], **window,
+    )
+    r = await _post_batch(client, cancelled)
+    assert r.status_code == 402
     assert "resets" not in r.json()["detail"]

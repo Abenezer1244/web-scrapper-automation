@@ -120,7 +120,10 @@ Per-config codes (`not_entitled`, `config_inactive`, `ai_limit`, `run_in_flight`
       in prod (frozen / ended / pending-downgrade / ok), then call `/billing/usage` as the
       owner and compare against `run_eligibility` computed from the same DB row; check
       Railway logs for `/billing/usage` 5xx / response-validation errors after deploy.
-- [ ] FE follow-up PR: regen types, `UsageResponse.run_eligibility`.
+- [ ] FE follow-up PR (ships right after BE merges; the FE drift gate reads BE main):
+      regen types; `UsageResponse.run_eligibility`; `next_reset_at: string | null`
+      (Codex review P2: runtime already safe via `formatUtcDate(null)`); BillingTab shows
+      `usage?.plan ?? user?.plan` so the plan agrees with the effective limit (Codex review P2).
 
 ## Codex consult
 Round 1: NO-GO. P1 one clock in the route; P1 `next_reset_at` promises a reset on a
@@ -133,4 +136,10 @@ negative model tests; P3 structural OpenAPI diff, P3 `as_utc` on every instant. 
 Round 3: **PLAN: GO**, no findings.
 
 ## Review
-(pending)
+Codex diff review round 1: GATE: FAIL, no P1. Adopted: P2 `next_quota_reset` returns null
+while frozen (a frozen window does not advance, so its stored end can be in the past) — fixed,
+mutation-proven; P3 exact-instant assertions in the naive and HTTP tests; P3 gate coverage —
+added POST /batches 402 tests; scheduler / batch dispatch / batch fire are already covered by
+`test_dispatch_due_jobs:101`, `test_batch_dispatch:141`, `test_batch_2b_scheduled:150`.
+Deferred to the FE follow-up (not BE defects; BE must land first for the drift gate): the FE
+`next_reset_at` type and BillingTab reading `user.plan`.

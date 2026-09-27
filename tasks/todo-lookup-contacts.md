@@ -1556,7 +1556,7 @@ wording and test specifications, adopted verbatim, so this closes the consult:
       claims fewer rows, and says so (`refill_truncated`). What degrades is latency for an account
       behind thousands of blocked rows. Prod today: 941 rows in total.
       Fix per S3 = keyset frontier (per-account LATERAL scan from the last row considered), which
-      needs an index `(user_id, trace_type, enqueued_at, id) WHERE status = 'queued'` = migration
+      needs an index `(trace_type, user_id, enqueued_at, id) WHERE status = 'queued'` = migration
       103, plus reading the in-flight set once per pass. **OWNER DECISION (2026-09-26): SHIP ii-b NOW
       with the documented envelope (per-round budget holds to ~35k queued; deeper blocked runs are
       truncated and logged, never over-claimed). The keyset frontier + migration 103 + one in-flight
@@ -1585,7 +1585,7 @@ Owner: must land before Phase 1c can create large queues. Nothing about cap hard
 - **ii-c-2** `skip_trace_capacity.py` + `skip_trace_dispatcher.py` + `tests/test_skip_trace_credit_cap.py`.
 
 **ii-c-1: migration 103.** `ix_pending_skip_trace_queued_frontier ON pending_skip_trace_rows
-(user_id, trace_type, enqueued_at, id) WHERE status = 'queued'`, CREATE INDEX CONCURRENTLY in
+(trace_type, user_id, enqueued_at, id) WHERE status = 'queued'`, CREATE INDEX CONCURRENTLY in
 autocommit, exactly 102's discipline: identity by the whole `pg_get_indexdef()` plus
 `indisvalid`; an invalid or wrong-shaped same-named index on this table is dropped and rebuilt
 (safe only under migrate.py's advisory lock); a same-named index on ANOTHER table aborts. Listed in

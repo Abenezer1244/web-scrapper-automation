@@ -56,6 +56,10 @@ def _schema_as_103_left_it():
     puts the schema back exactly as 103 leaves it."""
     mig = _mig103()
     with _autocommit() as conn:
+        # A constraint of exactly this name on this table only ever comes from the
+        # exclusion test below, when the process died mid-test.
+        conn.execute(text(
+            f"ALTER TABLE public.pending_skip_trace_rows DROP CONSTRAINT IF EXISTS {mig._INDEX}"))
         for owner, indexdef in _same_named(conn, mig._INDEX):
             if owner == "public.pending_skip_trace_rows":
                 continue
@@ -146,6 +150,43 @@ def test_a_same_named_index_of_another_shape_is_rebuilt(shape, why):
 ])
 def test_the_predicate_check_ignores_how_a_server_renders_casts(rendered):
     assert _mig103()._normalized_predicate(rendered) == "status='queued'"
+
+
+@pytest.mark.parametrize("rendered", [
+    "((status)::text = 'queued::text'::text)",    # a different literal
+    "((status)::text = '(queued)'::text)",        # a different literal
+    "((status)::text = 'queued'::text) OR true",  # a wider predicate
+    "((status)::text <> 'queued'::text)",         # the opposite
+])
+def test_the_predicate_check_never_mistakes_a_different_predicate(rendered):
+    # Casts and parentheses are stripped only OUTSIDE quoted literals.
+    assert _mig103()._normalized_predicate(rendered) != "status='queued'"
+
+
+def test_an_exclusion_constraint_under_our_name_aborts_and_is_left_alone():
+    """An EXCLUDE constraint's index can match every column, order, opclass and the
+    predicate; it is still not our index, and it cannot be dropped as an index."""
+    mig = _mig103()
+    with _autocommit() as conn:
+        try:
+            _drop_ours(conn, mig._INDEX)
+            conn.execute(text(
+                f"ALTER TABLE public.pending_skip_trace_rows ADD CONSTRAINT {mig._INDEX} "
+                f"EXCLUDE USING btree (trace_type WITH =, user_id WITH =, enqueued_at WITH =, "
+                f"id WITH =) WHERE (status = 'queued')"
+            ))
+            row = conn.execute(text(mig._SHAPE_SQL), {"n": mig._INDEX}).first()
+            assert row.indisexclusion and row.backs_constraint
+            assert not mig._is_right_shape(row)
+            with pytest.raises(RuntimeError, match="backs a constraint"):
+                mig._build_frontier_index(conn)
+            assert conn.execute(text(
+                "SELECT count(*) FROM pg_constraint WHERE conname = :n"
+            ), {"n": mig._INDEX}).scalar() == 1, "the constraint must be left alone"
+        finally:
+            conn.execute(text(
+                f"ALTER TABLE public.pending_skip_trace_rows DROP CONSTRAINT IF EXISTS {mig._INDEX}"))
+            mig._build_frontier_index(conn)
 
 
 def test_a_same_named_index_on_another_table_is_refused_not_dropped():

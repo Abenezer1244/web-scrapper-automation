@@ -37,6 +37,8 @@ Revision ID: 103
 Revises: 102
 Create Date: 2026-09-27
 """
+import re
+
 from alembic import op
 from sqlalchemy import text
 
@@ -62,7 +64,8 @@ _INDEX_DEF = (
 # difference in how a server renders `status = 'queued'` cannot read as a
 # different index.
 _SHAPE_SQL = """
-SELECT i.indisvalid, i.indisunique, i.indnatts, i.indnkeyatts,
+SELECT i.indisvalid, i.indisunique, i.indisexclusion, i.indislive, i.indisready,
+       i.indnatts, i.indnkeyatts,
        i.indexprs IS NULL AS no_exprs, am.amname,
        ARRAY(SELECT a.attname::text
              FROM unnest(i.indkey::int2[]) WITH ORDINALITY k(attnum, ord)
@@ -76,7 +79,9 @@ SELECT i.indisvalid, i.indisunique, i.indnatts, i.indnkeyatts,
           FROM unnest(i.indcollation::oid[], i.indkey::int2[]) k(coll, attnum)
           JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
        ) AS column_collations,
-       pg_get_expr(i.indpred, i.indrelid) AS predicate
+       pg_get_expr(i.indpred, i.indrelid) AS predicate,
+       EXISTS (SELECT 1 FROM pg_constraint k WHERE k.conindid = i.indexrelid)
+           AS backs_constraint
 FROM pg_class c
 JOIN pg_namespace cn ON cn.oid = c.relnamespace
 JOIN pg_index i ON i.indexrelid = c.oid
@@ -88,16 +93,37 @@ WHERE c.relname = :n AND cn.nspname = 'public'
 """
 
 
+_QUOTED = re.compile(r"'(?:[^']|'')*'")
+# Only these casts, and only OUTSIDE quoted literals: `'queued::text'` is a
+# different literal and must stay different (Codex ii-c-1 round 3).
+_CAST = re.compile(r"::(?:text|character varying|varchar)\b")
+
+
 def _normalized_predicate(predicate: str | None) -> str:
-    """`((status)::text = 'queued'::text)` -> `status='queued'`."""
-    s = (predicate or "").replace("::text", "").replace("::character varying", "")
-    return "".join(ch for ch in s if ch not in "() \t\n")
+    """`((status)::text = 'queued'::text)` -> `status='queued'`. Casts, parentheses and
+    whitespace are stripped between literals; each quoted literal is kept verbatim."""
+    s = predicate or ""
+    out, pos = [], 0
+    for m in _QUOTED.finditer(s):
+        out.append(_strip_outside(s[pos:m.start()]))
+        out.append(m.group(0))
+        pos = m.end()
+    out.append(_strip_outside(s[pos:]))
+    return "".join(out)
+
+
+def _strip_outside(fragment: str) -> str:
+    fragment = _CAST.sub("", fragment)
+    return "".join(ch for ch in fragment if ch not in "() \t\n")
 
 
 def _is_right_shape(row) -> bool:
     return bool(
         row.indisvalid
+        and row.indislive
+        and row.indisready
         and not row.indisunique
+        and not row.indisexclusion
         and row.amname == "btree"
         and row.no_exprs
         and row.indnatts == row.indnkeyatts == len(_KEY_COLUMNS)
@@ -113,6 +139,15 @@ def _build_frontier_index(conn) -> None:
     """CREATE INDEX CONCURRENTLY, checked by structural identity."""
     existing = conn.execute(text(_SHAPE_SQL), {"n": _INDEX}).first()
     right_shape = existing is not None and _is_right_shape(existing)
+    if existing is not None and not right_shape and existing.backs_constraint:
+        # An index that enforces a constraint (an EXCLUDE, say) cannot be dropped
+        # as an index, and it is somebody's constraint: say so rather than fail
+        # on a raw error, and leave it.
+        raise RuntimeError(
+            f"Migration 103 ABORTED: {_INDEX} on public.pending_skip_trace_rows backs a "
+            f"constraint and is not the frontier index. It is NOT dropped. Drop or rename "
+            f"that constraint deliberately, then re-run."
+        )
     if existing is not None and not right_shape:
         # Dead (INVALID) or the wrong shape. Safe to drop here: migrations are
         # serialized by scripts/migrate.py's advisory lock, so this is never a

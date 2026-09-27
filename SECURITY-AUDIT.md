@@ -1,605 +1,219 @@
-# BridgeLeads Security Audit, Phase 1 (audit only)
+# BridgeLeads Security Audit #3, Phase 1 (2026-09-27)
 
-**Date:** 2026-09-25
-**Commit audited:** `fc38e620` (tip of `origin/main`, includes PR #356 / migration 101). Frontend: `origin/master` `8332673`.
-**Worktree:** `C:/Users/Windows/bl-wt-secaudit2`, branch `chore/security-audit-2026-09-25` (no commits yet).
-**Baseline:** the 2026-09-16 audit (`tasks/SECURITY-AUDIT-REPORT-2026-09-16.md`, 0 P0 / 4 P1 / 11 P2 / 13 P3). Every prior
-finding was re-checked on current code; 93 backend commits landed since.
-**Method:** 6 parallel domain audits (detail files `tasks/audit2-{tenant,billing,egress,auth,frontend,secrets}.md`),
-a live two-account IDOR harness on an isolated database (`tasks/audit2-idor-live.md`), low-volume read-only production
-probes, a production frontend build + bundle scan, `pip-audit` + `npm audit`, a full-history secret scan of both repos,
-and an **independent** Codex review that was not shown any of our findings.
-**No production code changed. No credential rotated or printed. No production data written.**
+> Previous report (audit #2, 2026-09-25) is preserved at `docs/security/SECURITY-AUDIT-2026-09-25.md`.
 
-Every secret below is redacted to first-4 + last-3 characters.
+Code audited: backend `origin/main` `786efcf0` (production at audit start), frontend `origin/master` `e42d5d0`/`6030491`.
+Method: 8 parallel audit leaves (each report under `tasks/audit3/`), plus an independent Codex review run in an isolated
+worktree without our findings (`tasks/audit3/codex.md`), then driver consolidation and re-verification.
+Ledger: `.unlazy/secaudit3/` (status log has every dispatch, return, and remediation event).
 
----
+This report does not claim BridgeLeads is safe. It states what was tested, what passed, what failed, what was fixed
+today, and what remains unverified.
 
-## 1. Executive security summary
+## Executive security summary
 
-Nothing found in this pass is a P0. No cross-tenant read or write, no authentication bypass, no admin escalation,
-no payment-signature bypass.
+- **Tenant isolation held in every test.** 2 accounts x 19 tenant-id routes x all methods (GET, PATCH, PUT, DELETE,
+  cancel, replay, download), in 4 directions plus anonymous, with the database connected as a role that bypasses RLS,
+  so the app-layer `user_id` predicate was tested on its own: every foreign call 404, every anonymous call 401.
+  Codex independently found no IDOR/BOLA.
+- **The "previously delivered" records the owner saw are not a cross-tenant leak.** Dedup is scoped to one account.
+  The likely cause is S3-19: the dedup key ignores county, so a King lead sharing a parcel number with a Pierce lead in
+  the same account is labelled "Already delivered".
+- **One P0, remediated today with the owner:** the Cloudflare API token leaked in git (audit #2 N-01) was also inside
+  publicly pullable GHCR images. The token was verified ACTIVE, then deleted (now `401 Invalid API Token`); the GHCR
+  package was made private (anonymous pull now 401/403). Cloudflare audit log since 2026-03-17 shows no suspicious writes.
+- **Two P1 remain open:** trial accounts can spend unbillable Tracerfy lookups (S3-03; main now has a per-account credit cap from #364, merged after this audit started, but it defaults off and trials are still not gated), and IP rate limiting does
+  nothing in production (S3-04), which cannot be fixed honestly until Cloudflare is the only ingress (S3-06).
+- **No production code was changed in Phase 1.**
 
-**Tenant isolation holds, and this time it was tested, not just read.** Two real accounts on the real app: 20 id-bearing
-routes x (foreign token, no token) produced 0 cross-tenant reads, 0 cross-tenant writes, 0 unauthenticated accesses, with
-positive owner controls. "Already delivered" and skip-trace reuse are tenant-keyed at the schema level.
-
-**Six P1s**, three of them new:
-
-| ID | P1 | Status |
+| Severity | Open | Fixed/remediated today |
 |---|---|---|
-| **N-01** | **A live-scoped Cloudflare API token is committed** in `infra/terraform/terraform.tfvars` (since 2026-03-17), and ships inside every Docker image. Missed by the prior audit. | NEW. Code side FIXED (`150421e5`); **ROTATION PENDING (you)** |
-| **N-02** | **Plan-change arbitrage:** upgrade is granted immediately but charged on the next invoice; downgrade is credited by Stripe immediately but deferred in the app. Pro -> Agency -> Pro yields Agency at about the Pro price, repeatable monthly. | NEW. **FIXED** (`98473b46`) |
-| **N-03** | **Results readable before the plan cap applies:** rows are committed before enrichment and marked OVER_QUOTA only after it, and `GET /jobs/{id}/results` has no status gate. | NEW. Reproduced, **FIXED** (`67382e30`) |
-| F-01/F-01b | IP rate limiting is still dead in production (re-proven today: 14/14 forgot-password in <1 min, 10/min zone, 0 x 429). The escalating lockout still never fires. | OPEN |
-| F-03 | Webhook SSRF DNS-rebinding TOCTOU (resolve twice, never pin). Was risk-accepted in a code comment. | **FIXED** (`3df7fdfd`, 2026-09-26) |
-| F-12 | No per-account Tracerfy spend ceiling. Worse than recorded: **trial accounts are `plan="pro"` and can buy ~1,000 unbillable lookups each**, draining the global cap for paying customers. | OPEN, widened (raised P2 -> P1: Codex and Claude both flag) |
+| P0 | 0 | 1 (S3-01) |
+| P1 | 2 | 1 (S3-02, closed by the rotation) |
+| P2 | 15 | 1 (S3-05) |
+| P3 | 34 (consolidated) | 0 |
 
-| Severity | Count |
+## Architecture reviewed
+
+Full per-layer table with evidence: `tasks/audit3/arch-secrets.md`. Summary:
+
+| Layer | Implementation (verified) |
 |---|---|
-| P0 | **0** |
-| P1 | **6** |
-| P2 | **16** (B-3 is counted inside the F-12 P1) |
-| P3 | **41** |
-
-**Fixed since 2026-09-16:** F-05 (reset email-bomb), F-10 (fallback limiter flush), F-11 (stale Stripe event),
-F-13 (BLIND_INDEX_KEY fail-closed, lazily), F-26 (Stripe return URLs), F-08 (inside `safe_http` only), F-02 (PhoneBurner only).
-
-**This report does not declare BridgeLeads secure.** Sections 33-35 list exactly what was not verified.
-
----
-
-## 2. Architecture reviewed
-
-| Layer | Actual (verified) |
-|---|---|
-| Frontend | Next.js 16.3.5 + Auth.js (next-auth 5.0.0-beta.32) on **Vercel**; `bridgeleads.io` and `app.bridgeleads.io` are one deployment |
-| API | FastAPI on **Railway**, behind **Cloudflare** (`api.bridgeleads.io`); origin also directly reachable (F-28) |
-| Auth | Backend JWT bearer (1 h access, rotating refresh) + hashed API keys; Auth.js cookie (7 d) holds the backend tokens server-side |
-| Authorization | `get_current_user` + `require_plan` + entitlement gate in `auth.py`; admin = `require_admin` (404) / `require_admin_mfa` |
-| Database | PostgreSQL (Supabase-hosted). RLS (belt) + mandatory `user_id` predicate (suspenders). Runtime roles `bridgeleads_app` / `bridgeleads_system`, neither superuser nor BYPASSRLS; migrations as owner |
-| Workers / queue | Celery + Redis (Upstash); beat for dispatch, watchdog, canary, skip-trace dispatcher |
-| Scrapers | Playwright headless Chromium (`--no-sandbox`) + BeautifulSoup; admin-only connector registration; SSRF route guard |
-| Object storage | Cloudflare R2; delivery via revocable download-token links (`API_BASE_URL` set in prod) |
-| Payments | Stripe (Checkout, subscription modify, portal, signed webhooks + mig-095 event ledger) |
-| Skip trace | Tracerfy (server-side key; webhook `/webhooks/tracerfy[/{secret}]`) |
-| Email | Resend |
-| Push delivery | Customer webhooks, generic dialer webhook, PhoneBurner |
-| CI/CD | GitHub Actions (private repo); push to `main` = Railway deploy + `alembic upgrade head` on boot; `master` = Vercel |
-| DNS/CDN | Cloudflare (Terraform-managed, see N-01) |
-
-**Data flow and trust boundaries**
-
-```
-Browser --(Auth.js cookie)--> Vercel/Next --(Bearer JWT)--> Cloudflare --> Railway API
-   [B1: untrusted client]                               [B2: origin reachable around CF, F-28]
-API --(RLS GUC + user_id filter)--> Postgres            [B3: tenant boundary]
-API --(Redis broker, ids only)--> Celery worker         [B4: worker re-derives owner from DB]
-Worker --(Playwright, SSRF route guard)--> county portals   [B5: UNTRUSTED input: HTML/text]
-Worker --> enrichment (county GIS / assessor via safe_http) [B5]
-Worker --> Tracerfy (paid)  <-- Tracerfy webhook (shared secret) [B6: spend + replay boundary]
-Worker --> results --> CSV/XLSX/JSON export (sanitized) --> R2 --> signed download link
-Worker --> customer webhook / dialer (SSRF-checked, egress) [B7: user-chosen destination]
-Stripe --(HMAC)--> /billing/webhook                          [B8]
-```
-
----
-
-## 3. P0 findings
-
-**None.** Explicitly checked and not found: cross-tenant read/write, auth bypass, admin escalation, Stripe signature
-bypass, client-trusted price/plan/quota, secret in the client bundle, browser-held DB credential.
-
----
-
-## 4. P1 findings
-
-### N-01 [P1] Cloudflare API token committed to the repository and baked into every image
-- **Category:** secret exposure. **Component:** `infra/terraform/terraform.tfvars` line 1.
-- **Evidence:** `cloudflare_api_token = "AwLQ...zyR"` (40 chars), added in `579dec50` (2026-03-17, "fix: resolve all ruff
-  lint errors"), still tracked at `fc38e620`, present on `origin/main` and many remote branches. `.gitignore:60` lists
-  the file but was added after it was tracked, so it never applied. `.dockerignore:44` excludes only
-  `infra/terraform/.terraform`, and `Dockerfile:62` is `COPY . .`, so the token is inside every Railway/GHCR image.
-  A UTF-8 BOM before the key (`\357\273\277cloudflare_api_token`) is why anchored regex scans, including the prior
-  audit's, missed it. `main.tf` scopes it to DNS + R2 + WAF.
-- **Prerequisites:** read access to the repo, any clone/worktree (incl. the college-managed OneDrive folder), any
-  built image, or any CI token with repo read (the frontend's `BACKEND_SCHEMA_TOKEN` PAT).
-- **Impact:** DNS takeover of `bridgeleads.io` (phishing/password-reset interception, MX injection), WAF disable,
-  read/write of R2 export buckets holding every tenant's lead CSVs.
-- **Mitigating:** repo is private, one collaborator. Validity was **not tested** (doing so would use the credential).
-- **Remediation:** (1) YOU roll the token in Cloudflare now; (2) review Cloudflare audit log back to 2026-03-17;
-  (3) `git rm --cached infra/terraform/terraform.tfvars`, add `infra/` to `.dockerignore`, supply the token via
-  `TF_VAR_cloudflare_api_token`; (4) history rewrite only with your approval (rotation makes it unnecessary);
-  (5) add a BOM-tolerant, case-insensitive secret scan (gitleaks) to CI.
-- **Regression test:** CI secret-scan step; test that `infra/terraform/terraform.tfvars` is not tracked.
-
-### N-02 [P1] Plan-change arbitrage: Agency entitlement at about the Pro price, repeatable
-- **Category:** billing / entitlement. **Component:** `src/api/routes/billing.py:1510-1516`, `src/api/billing_entitlement.py:288-303`.
-- **Evidence:** `change-plan` modifies the subscription with `proration_behavior="create_prorations"`: the upgrade
-  charge waits for the next invoice. `apply_subscription_state` grants an upgrade immediately (`user.plan = plan`)
-  but parks a downgrade in `pending_plan` until the quota boundary. Stripe credits the unused Agency time the moment
-  the downgrade is applied.
-- **Exploit:** Pro subscriber -> `POST /billing/change-plan` Agency -> wait for the webhook -> change back to Pro.
-  Stripe nets roughly the Pro price; the app keeps `plan=agency` (unlimited-tier records, Agency features) until the
-  period boundary. Repeat every period. Annual variant defers the upgrade charge up to a year.
-- **Remediation:** charge upgrades before granting (`proration_behavior="always_invoice"` + grant only on
-  `invoice.paid`), and apply downgrades in Stripe at period end (subscription schedule) so both systems agree.
-- **Regression test:** entitlement-state test: upgrade then downgrade in the same period ends on the paid tier, and
-  an upgrade with an unpaid proration invoice does not grant.
-- Needs Stripe test-mode confirmation of the annual `cancel_at_period_end` sub-variant (noted in `audit2-billing.md`).
-
-### N-03 [P1, CONFIRMED, FIXED in `67382e30`] Results readable before the plan cap marks the excess
-- **Category:** quota bypass. **Component:** `src/workers/tasks.py:976-1132` (insert + commit),
-  `:1542-1555` (inline enrichment, commits repeatedly), `:1753-1880` (reservation + OVER_QUOTA marking);
-  `src/api/routes/jobs.py:414-497` (`GET /jobs/{id}/results`, no job-status gate).
-- **Evidence:** rows commit at `tasks.py:1132`; enrichment then runs for minutes and commits; only afterwards does the
-  single-statement reservation mark rows beyond the plan's remaining quota `OVER_QUOTA`. The results route hides
-  `OVER_QUOTA` rows (`lead_actionability.py:86-89`) and requires an address, but does not gate on status, so during
-  `enriching` every addressed row is readable. Cancelling then refunds the reservation (`tasks.py:2384-2396`).
-- **Exploit:** Starter (50/period) runs a large tax-delinquent or pre-foreclosure scrape (addresses come from the
-  source), pages `/jobs/{id}/results` during `enriching`, then cancels.
-- **Mitigating:** record types whose address only arrives through enrichment expose fewer rows mid-run.
-- **Reproduced in Phase 2** on the isolated rig: `enriching`, `scraping`, `failed` and `cancelled` runs all listed
-  and downloaded their unbilled rows before the fix; none do after. `/download` and `/export-url` had the same hole.
-- **Remediation:** reserve before the rows become visible (move reservation ahead of the first commit), or gate
-  `/results` (and `/records`, segments, batch leads) to `status == done` or to rows inside the reserved grant.
-- **Regression test:** a job mid-`enriching` with rows beyond quota returns only the granted rows.
-
-### F-01 / F-01b [P1] IP rate limiting dead in production; escalating lockout never fires (OPEN)
-- Re-proven live today: 14 forgot-password requests in under a minute (zone `auth` = 10/min) -> 14 x 200, 0 x 429.
-- Code unchanged: `rate_limit.py:54-60` lacks `100.64.0.0/10`; `start.sh:97` has no `--proxy-headers`;
-  `auth_hardening.py:484,491` email counter TTL capped at 15 min so 4 guesses / 15 min never lock.
-- Affects: login, refresh, register, verify-email, reset, change-password, MFA setup, admin funnel, both webhooks.
-- **Hard ordering (unchanged from 09-16):** close the Cloudflare bypass (F-28) first, then trust `CF-Connecting-IP`.
-  Never `--forwarded-allow-ips=*`. Independently flagged by Codex (P1).
-
-### F-03 [P1] Webhook SSRF DNS-rebinding TOCTOU (FIXED 2026-09-26, `3df7fdfd`)
-- `security.py:146-170` validates resolution; `webhook_delivery.py:319` resolves again at connect. The code comment at
-  `webhook_delivery.py:253-279` accepts the risk on four invariants; invariant 4 is weaker than stated (E-3 below).
-- Blind SSRF (response body never shown), redirects disabled. Codex independently P1.
-- Fix: resolve once, validate every A/AAAA, connect to the pinned IP with SNI/Host set.
-- **Fixed** (`3df7fdfd`): `src/utils/pinned_http.py` overrides urllib3 `_new_conn()` to resolve once, refuse the
-  host if any answer is blocked, and connect to the exact sockaddr it checked; TLS still verifies the hostname.
-  Reproduced on origin/main first: the webhook session POSTed into a local service and a rebind after the
-  pre-check was `delivered`.
-
-### F-12 [P1] No per-account Tracerfy spend ceiling; trials can spend (OPEN, widened)
-- Only a global rolling-24h row cap (`skip_trace_dispatcher.py:72-113`), set to 1000 in prod but defaulting to 0
-  (off) in code (`settings.py:365`), checked once per tick while a tick may submit up to 2 x 5,000 rows; counts rows
-  not credits (advanced lookup = 2 credits); one tenant can consume all of it (B-4).
-- **B-3:** trials are created `plan="pro"` (`registration.py:188`); skip-trace gates exclude only Starter, and
-  billing requires an active subscription, so a trial can generate about 1,000 lookups that are never billed, and a
-  handful of throwaway trials can exhaust the global cap for paying customers.
-- Codex independently P1. The per-account cap is in flight (Phase 1b-1b, owned by another session); Phase 2 must
-  coordinate rather than collide.
-
----
-
-## 5. P2 findings
-
-| ID | Finding | Evidence | Fix |
-|---|---|---|---|
-| A-1 | Sign-out revokes nothing server-side; FE never calls `/auth/logout`, backend logout only blacklists the access token | FE `lib/api.ts:284-316`; `routes/auth.py` logout | Call `/auth/logout` from `signOutSafely`, revoke the refresh family |
-| A-2 | A 1 h session can mint a permanent API key with no re-auth and no owner email; access token is readable by page JS | `routes/auth.py:447`; FE `lib/auth.ts:233` | Require password / fresh MFA; email the owner; show key age |
-| A-3 | MFA verify: no failure lockout, only 10/min per user with 3 valid codes | `auth_hardening`, MFA routes | Escalating per-user MFA lockout |
-| A-4 | MFA enrollment needs no password and is reachable by API key (hostile enrollment locks owner out) | MFA setup/enable routes | Require password + JWT session |
-| A-5 | No refresh-token reuse detection (family revocation) | `login.py` refresh | Revoke the family on reuse |
-| B-3 | Trial accounts can buy unbillable Tracerfy lookups (folded into F-12 P1 above) | `registration.py:188` | Gate skip-trace on `first_paid_at` |
-| B-4 | Global cap: once per tick, rows not credits, one tenant can take all | `skip_trace_dispatcher.py:72-113` | Per-account credit budget |
-| B-5 | Tracerfy webhook `rows_uploaded` overwrites stored value and decides billing; download host check allows any DO region + `http` | `tracerfy_ingest.py:437-452,832-840`; `skip_trace_usage.py:611-622` | Trust stored value; pin host + https (needs webhook secret to exploit) |
-| E-1 | Customer webhook response read unbounded on the shared queue: gzip bomb OOM-kills the worker (other tenants' scrapes die), slow-drip holds a slot 60 min x 4 attempts | `webhook_delivery.py:319` | `_read_capped`, task time limit, dedicated queue |
-| F-02r | Generic dialer webhook + job webhook still push raw county text (Zapier -> Google Sheets evaluates formulas) | `generic_webhook.py:20-43`, `webhook_delivery.py` payload | Sanitize text fields at the payload builder |
-| F-07 | Chromium `--no-sandbox` on attacker-controlled county HTML; worker env holds owner DSN (S-2) | `base_scraper.py:281` | Enable sandbox (seccomp profile) or isolate renderer |
-| F-28 | Cloudflare bypassable: Railway origin answers directly (per team comment `password.py:123-129`; not re-probed today) | prior live probe | CF Tunnel / Authenticated Origin Pulls |
-| S-2 | Owner DSN (`DATABASE_URL_MIGRATE`, bypasses RLS, DDL) present on api, worker, beat because they migrate on boot | Railway service vars (names) | Run migrations in a one-shot release job only |
-| S-3 / F-14 | Repo-level `DATABASE_URL_SYNC` is a working prod DSN readable by PR test jobs; `RAILWAY_TOKEN_PRODUCTION` unused; no environment protection rules | `gh api` names only | Move to protected environment; delete unused token |
-| S-4 | CI runs bare `alembic upgrade head` without the advisory lock, racing Railway's locked `migrate.py` (dormant while Actions is blocked) | workflow file | Use `scripts/migrate.py` or remove |
-| S-5 | Production credentials on disk in the college-managed OneDrive folder (`.rls-cutover-secrets`; an admin login URL+password in `scripts/audit_out_ui/run3_thurston_whatcom.log`) | files not read beyond names/pattern | Move out of OneDrive, rotate the admin password |
-| S-2b | Frontend PAT `BACKEND_SCHEMA_TOKEN` has repo read, so FE PR jobs can read N-01 | secrets names | Scope to a read-only artifact |
-
----
-
-## 6. P3 findings
-
-- **T-1..T-4** worker-side writes by id only: config load without owner (`tasks.py:466-468`), dispatcher result
-  updates (`skip_trace_dispatcher.py:1189-1196,1290-1297`), NTS matcher (`nts_matcher_task.py:336-348,400-415`),
-  `dispatch_batch_run` owner check (`batch_tasks.py:50-80`). Not request-reachable.
-- **T-5** mig 101: `pending_skip_trace_rows.action_id` lacks a `(action_id, user_id)` composite FK (`101:516-519`).
-  **Must be fixed before any Phase 1b-2 writer ships.** T-6 `quote_id` globally unique (info).
-- **C-1** `GET /scrapers/connectors?include_all=true` is anonymous and returns the 6 `down` connectors plus public
-  county URLs, GIS endpoints, health (live: 24 default, 30 with the flag; no internal hosts). Codex P2 / frontend P3;
-  held at **P3** because only public county URLs and operational state are exposed.
-- **D-1** Emailed download token (48 h, `status.py:50`) path loads the user without `is_active`
-  (`jobs.py:1376`); logout-all revocation IS honoured; no code path sets `is_active=False`, so only an
-  out-of-band deactivation leaves links live. Also `?token=` accepts a full access token (A-8).
-- **E-2** webhook network errors log `str(exc)` incl. the full URL/query (`webhook_delivery.py:326-330`); URL is also a Celery arg in Redis.
-- **E-3** SSRF blocklist allows IPv4-embedding IPv6 forms. **Verified against the real `_ip_is_blocked`:** allowed
-  `64:ff9b::a9fe:a9fe` (NAT64 metadata), `2002:a9fe:a9fe::1` (6to4), `::a9fe:a9fe`, Teredo, `fec0::1`, `192.88.99.1`.
-  Exploitable only where the network translates them.
-- **E-4** browser SSRF guard: WebSockets and service workers not intercepted; guard fails open on unexpected errors (`base_scraper.py:458-460`).
-- **E-5** raw provider / customer-webhook error bodies logged (PII, log forging). **E-6** default 422 echoes input (incl. password > 72 chars).
-- **F-15** no HSTS on `api.bridgeleads.io` (live, today). **F-16** unhandled 500 bypasses CORS + security headers (`main.py:105`).
-- **F-22** Tracerfy path-secret route still enabled by default (`settings.py:345`); B-6/new path: global exception handler logs `request.url.path` with the secret (`main.py:103-110`).
-- **F-23 / F-27** redaction gaps: no traceback (`exc_info`) scrubbing (`logger.py:31-58`); access-log filter only on `uvicorn.access`, untested.
-- **F-25** `fc00::/7` not in trusted proxies (latent).
-- **A-6..A-11** no absolute session lifetime; change-password usable as a password oracle; download links not
-  single-use; unused password branch in Auth.js `authorize()` (lockout DoS on shared Vercel IPs once F-01 is fixed);
-  admin gate accepts API keys for non-MFA admin reads; CORS localhost prefix match.
-- **B-6..B-8** no dispute/refund webhook handling (tier kept after chargeback); `livemode` never checked; empty
-  `STRIPE_PRODUCT_*` collapses the product map; custom date range has no maximum span.
-- **W-1..W-6** FE admin nav gated on `plan === "agency"` not `is_admin` (backend enforces); route ids not
-  `encodeURIComponent`-ed; CSP `unsafe-inline`/`unsafe-eval` + unused origins; access token in page JS (see A-2);
-  Vercel `ACAO: *` on HTML (not exploitable); localhost `serverActions.allowedOrigins`.
-- **S-6..S-12** stale RLS comments (`settings.py:229-235`, `session.py:218-223`); blind-index check lazy not at boot;
-  Actions pinned by tag not SHA; ignore-file gaps; compose ports; `external_source_health` has no RLS in migrations;
-  pinning notes.
-- **G-1** no behavioural two-tenant test for `/segments/*` (only SQL-structure tests).
-
-### Status of every 2026-09-16 finding on `fc38e620`
-
-| ID | 09-16 sev | Now | Evidence |
-|---|---|---|---|
-| F-01 | P1 | **OPEN** | live today: 14/14 x 200, 0 x 429; `rate_limit.py:54-60` |
-| F-01b | P1 | **OPEN** | `auth_hardening.py:484,491` |
-| F-02 | P1 | **PARTIAL** (PhoneBurner fixed; generic/job webhook raw -> F-02r P2) | `phoneburner.py:81-101`; `generic_webhook.py:20-43` |
-| F-03 | P1 | **FIXED** (`3df7fdfd`, connect pinned to the checked address) | `webhook_delivery.py:253-279,319` |
-| F-04 | P2 | **OPEN** (same root as F-01) | `login.py:47` |
-| F-05 | P2 | **FIXED** (per-address once_per 5 min) | `password.py:150-152` |
-| F-06 | P2 | **OPEN**: `_dmarc.bridgeleads.io` NXDOMAIN (live DoH, today) | Cloudflare DNS |
-| F-07 | P2 | **OPEN** | `base_scraper.py:281` |
-| F-08 | P2 | **PARTIAL** (fixed in `safe_http`; 6 call sites still uncapped, incl. E-1) | `safe_http.py:52-96` |
-| F-09 | P2 | **OPEN**: `/jobs/{id}/download`, `/export-url`, batch downloads have no limiter | `audit2-auth.md` rate-limit matrix |
-| F-10 | P2 | **FIXED** | `rate_limit.py:124-172` |
-| F-11 | P2 | **FIXED** (re-raise instead of stale body) | `billing.py:2102-2132` |
-| F-12 | P2 | **OPEN, raised to P1** (B-3/B-4) | `skip_trace_dispatcher.py:72-113` |
-| F-13 | P2 | **FIXED** (fail-closed on first use, not at boot: S-7 P3) | `crypto.py` |
-| F-14 | P2 | **OPEN** (S-3) | `gh api` names |
-| F-15 | P3 | **OPEN** (live: no HSTS on api) | section 28 |
-| F-16 | P3 | **OPEN** | `main.py:105` |
-| F-17 | P3 | **OPEN**: `exports.bridgeleads.io` NXDOMAIN | live DoH |
-| F-18 | P3 | **PARTIAL** (stale text at `settings.py:229-235`, `session.py:218-223`) | S-6 |
-| F-19 | P3 | **OPEN**: no MX on `bridgeleads.io` | live DoH |
-| F-20 | P3 | **OPEN**: no apex TXT/SPF | live DoH |
-| F-21 | P3 | **OPEN**: grants still only inside the create-role branch | `test_rls_isolation.py:56-77` |
-| F-22 | P3 | **PARTIAL** (header route + access-log scrub added; path route on by default; new exception-log path) | `settings.py:345`, `main.py:103-110` |
-| F-23 | P3 | **OPEN** | `logger.py:31-58` |
-| F-24 | P3 | **PARTIAL** (`.env.check` untracked + expired; S-5 new) | S-5 |
-| F-25 | P3 | **OPEN** | `rate_limit.py:54-60` |
-| F-26 | P3 | **FIXED** (`redirectToStripe` host allowlist) | FE `lib/api.ts` |
-| F-27 | P2 | **PARTIAL** (also matches Tracerfy path now; only on `uvicorn.access`; untested) | `main.py:114-129` |
-| F-28 | P2 | **OPEN** per team comment `password.py:123-129`; not re-probed | section 34 |
-
----
-
-## 7. Exposed credential findings
-
-| Item | Location | Exposure | Status |
-|---|---|---|---|
-| Cloudflare API token `AwLQ...zyR` | `infra/terraform/terraform.tfvars:1` | repo (private), all branches, every Docker image, every clone | **LIVE-SCOPED, rotate** (N-01) |
-| Cloudflare zone/account ids, Railway IP | same file lines 2-4 | identifiers, not credentials | informational |
-| Prod DSN `DATABASE_URL_SYNC` | GitHub repo-level secret | PR test jobs can read | S-3 |
-| Owner DSN `DATABASE_URL_MIGRATE` | api/worker/beat env | any RCE in those services | S-2 |
-| Admin login URL + password | `scripts/audit_out_ui/run3_thurston_whatcom.log` (untracked, OneDrive; also local-only stash `568f67f3`) | local disk / OneDrive sync | S-5, rotate admin password |
-| Role passwords | `.rls-cutover-secrets` (untracked, not read) | OneDrive sync | S-5 |
-| `.env.check` Vercel OIDC | untracked, never committed, expired | none | closed |
-
-**Client bundle:** production build of `origin/master` + 20 live chunks: no `sk_`/`rk_`/`whsec_`/DSN/JWT/Resend/
-Tracerfy/`AUTH_SECRET`/Railway hosts; the only `NEXT_PUBLIC_*` is `NEXT_PUBLIC_API_URL` (intended public); no source
-maps served (20 x 404). **Database credentials are server-only.**
-
-**Public env files:** `.env`, `.env.local`, `.env.production`, `.env.development`, `.env.backup`, `.env.old`,
-`.env.bak`, `.env.example`, `.git/config`, `.git/HEAD` on all three hosts: api -> 404; Vercel hosts -> 307 to
-`/login` (auth gate), never the file. Vercel builds only `.next`; `.env*` are gitignored in the FE repo.
-
----
-
-## 8. Git secret-history findings
-
-- **Scope:** all refs + reflogs; backend 2,233 commits / 6,553 blobs, frontend 757 commits / 1,984 blobs; case-
-  insensitive, BOM-tolerant regexes (gitleaks/trufflehog not installed). Values redacted in all output.
-- **Found:** N-01 only (type Cloudflare API token, commit `579dec50`, path `infra/terraform/terraform.tfvars`,
-  validity not tested, remediation: rotate, then untrack). **Frontend history: clean.**
-- **The prior audit's "history clean" was wrong** for this token (upper-case / vendor-prefix patterns + BOM). No other
-  historical credential found. No history rewrite performed.
-
----
-
-## 9. Authentication findings
-
-JWT HS256 with pinned algorithm, `aud`/`iss` checked, 1 h access + single-use rotating refresh; bcrypt(12) direct;
-password-reset tokens distinct audience, single-use, revoke all sessions; logout-all revokes refresh tokens and the API
-key (the 7-day Auth.js cookie cannot re-mint after it). Auth.js cookies: `__Host-`/`__Secure-`, HttpOnly, Secure,
-SameSite=Lax. Weaknesses: A-1..A-5 (P2), A-6..A-9 (P3), F-01/F-01b (P1). Detail: `tasks/audit2-auth.md`.
-
-## 10. Authorization findings
-
-75 routes enumerated from the live app object (69 business + `/health`, `/ready` + 4 docs routes, the docs routes
-404 in prod). Full matrix: `tasks/audit2-tenant.md`. Every tenant route filters on `user_id`; 39 also use the RLS
-session, 30 do not (correction to the prior report's "69/69 RLS"), and none of the 30 leaks (self-service `users` rows
-filtered on `User.id == current_user.id`). No request schema accepts `user_id`, `plan`, `records_used` or quota
-(`extra="forbid"`). Plan gates are server-side in `auth.py` for JWT and API-key callers alike.
-
-## 11. Cross-account isolation results
-
-Live two-account harness (real app, isolated `bridgeleads_secaudit2_test`, **RLS bypassed** so the app-layer predicate
-is tested alone): 20 id-bearing routes incl. job view/results/logs/download/export-url/cancel, scraper
-get/patch/csv-layout/records/dialer-replay/delete, batch get/download/leads/runs/run-download/run-leads, notification
-read. **A -> B: all 404. Anon: all 401. Owner controls: 200.** B's rows unchanged after A's foreign PATCH/PUT/DELETE.
-9 list endpoints as A contained no B ids or data. Detail: `tasks/audit2-idor-live.md`.
-
-**Duplicate system:** dedup is **tenant-scoped** (`UniqueConstraint("user_id","dedup_hash")`, `models.py:1066`;
-`tasks.py:1205,1258-1273`); the results page names only runs the caller owns. Skip-trace reuse uses the v2 subject
-key with `user_id` inside the hash (`skip_trace.py:243`); all five reuse paths are pinned to the caller; mixed-tenant
-Tracerfy batches match answers only to the batch's own pending rows with `(id, user_id)` writes and refuse ambiguity.
-**No disclosure of another tenant's delivery, enrichment or lookup state was found.** One timing-only side channel
-(T-7, accepted): a global collision key can delay one tenant's lookup of the same address by a tick.
-
-## 12. Admin-route results
-
-`POST /scrapers/connectors` -> `require_admin_mfa` (admin + enrolled MFA + fresh MFA JWT, not API key); live
-non-admin: **404**. `GET /billing/activation-funnel` -> `require_admin`; live non-admin: **404**. No other admin
-route. Frontend admin gating is UI-only (W-1) and is not relied on. `GET /scrapers/connectors` is public by design (C-1).
-
-## 13. Database-security results
-
-PostgreSQL. Runtime roles `bridgeleads_app` (api) and `bridgeleads_app`/`bridgeleads_system` (worker): not superuser,
-not BYPASSRLS, `app` not a member of `system` (recorded prod read, 2026-09-25). `DATABASE_URL` role has no DELETE.
-RLS FORCE + role-targeted policies come from manually-run scripts, not migrations. Migration 101 reviewed: API may
-update only `dispatched_at`; event log append-only; `anon`/`authenticated` revoked; triggers not SECURITY DEFINER,
-schema-qualified, empty-GUC accepted only for `bridgeleads_system`/bypass roles. Open: S-2 (owner DSN on runtime
-services), T-5 (missing composite FK), S-11 (`external_source_health` no RLS in migrations), **and whether FORCE +
-policies are actually live on the three mig-101 tables in prod (not verified, see section 35).**
-
-## 14. Cloud/deployment findings
-
-N-01 (token in images), F-28 (origin bypass), S-2/S-3/S-4 (DSN placement, CI), F-15 (no API HSTS), R2 served only via
-signed/tokened links (`API_BASE_URL` set). Redis/queue/Flower/metrics: not exposed (`/flower`, `/metrics`, `/debug`
--> 404 on api). Container runs as non-root (`Dockerfile:49-50`). Provider billing caps, backup restore: unverified.
-
-## 15. Production debug/error findings
-
-Live: `/docs`, `/redoc`, `/openapi.json`, `/debug`, `/_debug`, `/metrics`, `/flower`, `/admin` -> 404 on api;
-`/health` -> 200 with `{"status","service"}` only. Unhandled errors return `{detail, ref}` with no trace (but without
-CORS/security headers, F-16). No Stripe/Tracerfy error text reaches clients. Default 422 echoes input (E-6).
-
-## 16. Logging findings
-
-Live Run messages are fixed, author-written strings with an allowlisted stage set; no exception text, SQL, paths or
-hosts reach users (Codex concurs). Server-side gaps: E-2 (webhook URL in logs), E-5 (raw provider/webhook bodies),
-F-22/B-6 (Tracerfy path secret via exception handler), F-23 (tracebacks unscrubbed). No auth headers, cookies, DSNs
-or reset tokens logged.
-
-## 17. Input-validation findings
-
-Pydantic `extra="forbid"` on request models, bounded lists/strings, enum record types, 422 before auth work on
-malformed email (live). Gaps: custom date range has no max span (B-8), 422 echoes input (E-6).
-
-## 18. SQL/NoSQL injection findings
-
-All raw `text()` SQL uses bound parameters; ORDER BY is allowlisted (`results_sort.py:160`, `scrapers.py:1210`); scraped
-text never reaches SQL construction. NoSQL: none in use; Redis keys are passed as values, not command fragments
-(`rate_limit.py:184`, `sse_leases.py:50`). **No injection finding.** No destructive injection test was run.
-
-## 19. XSS/CSRF/CORS findings
-
-**XSS:** only raw-HTML use is shadcn chart styles from hardcoded config; scraped fields render as text; email templates
-escape (`email_layout.py:203`). **CSRF:** backend has no cookie auth path (bearer only; SSE uses the header);
-Auth.js has its own CSRF token; no server actions. **CORS (live):** hostile origin gets no ACAO, hostile preflight
-400; allowed origin `https://app.bridgeleads.io` with credentials. A-11 (localhost prefix) P3.
-
-## 20. Stripe findings
-
-Sound: server-side price allowlist, one-subscription guard (per-user lock + Stripe re-check + session expiry), promo
-/ 100%-off handling via `first_paid_at`, customer id alone grants nothing, HMAC + 300 s tolerance + mig-095 ledger read
-before dispatch, out-of-order events, portal return URL, dunning/freeze, **F-11 fixed** (re-raises instead of
-applying a stale body, `billing.py:2102-2132`). Open: **N-02 (P1)**, B-7/B-8 (P3). Duplicate webhook delivery is
-idempotent by ledger (code + existing tests; not replayed against prod).
-
-## 21. Tracerfy findings
-
-Key server-side only; no user-controlled provider call; claim idempotency (PRs #349/#354: advisory lock, one active
-claim per lead, fail-closed money invariant) verified by reading; provider fields CSV-sanitized; errors not surfaced.
-Open: **F-12/B-3 (P1)**, B-4/B-5 (P2), F-22 (P3).
-
-## 22. Scraper/job security findings
-
-Start/view/stream/cancel/results/download/export tenant-bound (live, section 11). No retry endpoint exists. Workers
-re-derive the owner from the job row except T-1..T-4. Connector registration admin+MFA only; customers cannot set a
-scrape URL. F-07 renderer sandbox, E-4 browser guard gaps.
-
-## 23. Live stream security findings
-
-`/jobs/{id}/logs` (Live Run): owner check before admission and on reads, bearer header (no token in URL), leases keyed
-by user id (`sse_leases.py:50-82`), reconnect re-authorizes. Live: foreign 404, anon 401. Codex concurs.
-
-## 24. Export/CSV security findings
-
-Job/batch/run downloads bind object id + `user_id` (live: foreign 404). Emailed links are 48 h signed download tokens
-(revocable via logout-all; D-1 `is_active` gap). CSV/XLSX/JSON: every text column through `sanitize_for_csv`
-(leading `= + - @ \t \r` and whitespace variants); phone numbers normalised to 10 digits, so `+1 206...` is neither
-corrupted nor a formula; numeric columns untouched. Push channels: PhoneBurner fixed, generic/job webhook raw (F-02r).
-
-## 25. Webhook/SSRF findings
-
-HTTPS-only, redirects disabled or re-validated per hop, `trust_env=False`, blocks loopback/RFC1918/100.64/10/
-169.254/ULA/link-local/IPv4-mapped. F-03 rebinding (P1) fixed (`3df7fdfd`). Also: E-3 IPv4-embedding IPv6 forms (P3, verified), E-1
-unbounded response (P2), E-2 URL in logs (P3). Delivery destinations still have no proof-of-control (product decision
-from 09-16, unchanged).
-
-## 26. Rate-limit findings
-
-Full per-endpoint matrix: `tasks/audit2-auth.md`. IP-keyed (dead in prod, F-01): login, refresh, register,
-verify-email, reset, change-password, MFA setup, admin funnel, both webhooks. User-keyed (working): MFA verify /
-break-glass, jobs, results, batches, segments, analytics, Stripe calls. **No limiter at all:** scraper
-create/edit/delete, job cancel, download, export-url, api-key endpoints. Forgot-password per-address guard now works (F-05 fixed).
-
-## 27. Dependency findings
-
-`pip-audit -r requirements.txt`: **0 known vulnerabilities in 94 packages** (Windows run; Linux-only `uvloop` not
-audited). `npm audit` (prod and full): **0 advisories**. Next 16.3.5 is past the CVE-2025-29927 middleware-bypass
-class; 26 live bypass attempts against a local `next start` all rejected. Deliberate pins `stripe==11.4.0`,
-`redis==5.2.1` must not be bumped blindly. `next-auth` is a beta carrying production auth.
-
-## 28. Security headers
-
-| Header | api.bridgeleads.io (live) | bridgeleads.io (live) |
+| Frontend | Next.js 16.3.5 + Auth.js 5 beta on Vercel (`bridgeleads.io`, `app.bridgeleads.io`); no DB access, only `NEXT_PUBLIC_API_URL` public |
+| API | FastAPI on Railway behind Cloudflare (`api.bridgeleads.io`); origin also reachable directly via Railway edge (S3-06) |
+| Auth | Home-grown HS256 JWT (1 h access, rotating refresh with session families), SHA-256-hashed API keys, bcrypt, TOTP MFA; Auth.js cookie holds backend tokens |
+| Authorization | `get_current_user`, `require_plan`, entitlement gate, `require_admin` (404), `require_admin_mfa` |
+| Database | PostgreSQL on Supabase; RLS GUC per transaction (belt) + `user_id` predicate (suspenders); roles `bridgeleads_app`, `bridgeleads_system`, owner via `DATABASE_URL_MIGRATE` |
+| Workers / queue | Celery worker + beat on Railway; Redis is the Railway-internal `redis:8.2.9` service (not Upstash, as CLAUDE.md says; verified via `railway status`) |
+| Scrapers | Playwright Chromium (`--no-sandbox`) + BeautifulSoup, admin-only connector registry, `validate_scraping_target()` |
+| Storage / export | Cloudflare R2 (presigned), 60 s download tokens, 48 h emailed links, `sanitize_for_csv()` |
+| Payments / providers | Stripe (signed webhooks, event ledger), Tracerfy (server token, shared-secret webhook), Resend |
+| Push delivery | Customer job webhooks, generic dialer/Zapier webhook (HMAC), PhoneBurner (OAuth) |
+| CI/CD | GitHub Actions: tests, pip-audit, build + push to GHCR (now private), `deploy-production` migration job; `main` push = Railway deploy |
+| DNS/CDN | Cloudflare, Terraform-managed |
+
+Trust-boundary flow (enforcement point per hop in `tasks/audit3/arch-secrets.md`): Browser -> Vercel FE (UX gate only)
+-> Cloudflare/Railway API (CORS allowlist, headers, rate limit) -> Auth (JWT/API key, plan, admin) -> DB (RLS + user_id)
+-> Celery (ids only, owner re-read) -> county sources (untrusted HTML in Chromium, SSRF allowlist) -> enrichment
+(`safe_http`) -> Tracerfy (server token, webhook secret) -> results (Fernet PII) -> export/delivery (sanitized CSV,
+tokens, pinned webhook egress).
+
+## P0 findings
+
+**S3-01: Cloudflare API token publicly downloadable from GHCR (REMEDIATED 2026-09-27).** CI pushed every `main` build
+to `ghcr.io/abenezer1244/web-scrapper-automation`, which accepted anonymous pulls (anonymous tags/list 200, control 403).
+358 of 363 tagged images predate the untracking fix `150421e5`; image `main-c23523e` layer 10 carries
+`infra/terraform/terraform.tfvars`, hash-matching the leaked blob. Remediation performed with the owner:
+- Identified the token via Cloudflare's read-only verify endpoint (value never printed): id `f832ce04...`, "Edit zone
+  DNS", DNS Write on **all** zones in the account, issued 2026-03-18, status active, last used 2026-09-26 15:48 UTC (a read).
+- Cloudflare audit log 2026-03-17..2026-09-27: the only writes attributable to it are the 3 Terraform records on
+  2026-03-18 from `54.235.35.223`; no non-system change to bridgeleads.io after 2026-03-18; all other API DNS writes are
+  on the owner's other zones from the owner's residential/mobile IPs on dates matching the owner's other tokens.
+  Reads are not in the audit log, so read access by a third party cannot be excluded.
+- Token deleted; verify now returns `401 Invalid API Token`. GHCR package set private after confirming Railway api,
+  worker, and beat build from the GitHub repo (not GHCR); anonymous token/tags/manifest now 401/403; API health 200.
+- Deletion of the 1,075 pre-fix image versions (tagged + their untagged children) was started; see Manual actions.
+
+## P1 findings
+
+- **S3-02 (FIXED by rotation):** the same token remains in git history and at the tip of 226/231 branches (AS-3).
+  Harmless now that the token is dead; no history rewrite needed.
+- **S3-03 (OPEN): trial accounts can spend unbillable Tracerfy lookups** (AZ-2, audit #2 F-12/B-3). Trials are
+  `plan="pro"` (`registration.py:188`), the worker skip-trace gate blocks only Starter (`enrich.py:2284-2292`), trial
+  usage is held unbillable (`skip_trace_usage.py:290-352`), and the only cap is global and soft (S3-12).
+- **S3-04 (OPEN): IP rate limiting does nothing in production** (IE-1, audit #2 F-01). `rate_limit.py:54-60` does not
+  trust `100.64.0.0/10` and `start.sh:97` runs uvicorn without proxy headers; reproduced in-process: 30 password-spray
+  attempts from rotating CGNAT peers = 30x401, 0x429 (control from one peer = 25x429). Only the per-email lock works.
+  Because the origin is bypassable (S3-06), no IP key is both honest and unforgeable until Cloudflare is sole ingress.
+
+## P2 findings
+
+See the Findings table (S3-05 .. S3-20). Highlights: logged-out tokens still download lead CSVs (S3-07), SSRF via a
+URL-parser differential in `safe_http` (S3-08), no limiter on download/export/cancel/scraper writes (S3-09), production
+secrets in unprotected GitHub Actions environments (S3-10), the owner DSN on every runtime service (S3-11), Chromium
+`--no-sandbox` with all secrets in env (S3-13), a fail-open browser egress guard (S3-14), the Tracerfy webhook body
+trusted for billing (S3-15), the legacy Tracerfy path-secret route on by default (S3-16), and the production admin
+password in plaintext on OneDrive (S3-17).
+
+## P3 findings
+
+Consolidated in the Findings table (S3-21 .. S3-54). Per-leaf detail with full evidence is in each `tasks/audit3/*.md`.
+
+## Findings
+
+| ID | Severity | Category | Component | Evidence | Prereqs | Impact | Remediation | Regression test | Status |
+|---|---|---|---|---|---|---|---|---|---|
+| S3-01 | P0 | Secret exposure | GHCR images carrying the Cloudflare token (AS-1) | live: anonymous GHCR tags/list 200; image main-c23523e layer holds terraform.tfvars; Cloudflare verify active then 401 after deletion | none (anonymous pull) | DNS write on all account zones; source code disclosure | Token deleted, package private, pre-fix versions deleted | tests/test_no_committed_credentials.py already guards tracked files; add a CI step asserting the GHCR package is private | FIXED-VERIFIED |
+| S3-02 | P1 | Secret in VCS history | infra/terraform/terraform.tfvars in history and 226 branches (AS-3, N-01) | git:579dec50 | repo read access | superseded by S3-01 rotation | Token rotated (deleted); no rewrite needed | none (credential dead) | FIXED-VERIFIED |
+| S3-03 | P1 | Billing / quota | Trial skip-trace spend (AZ-2, F-12, B-3); on main since 786efcf0 (#364) a per-account credit cap exists but defaults OFF and trials are still not gated | src/api/routes/auth_helpers/registration.py:188; src/workers/tasks_helpers/enrich.py:2284-2292 | a free trial account | provider cost with no billing; drains the global cap for paying tenants | No paid skip trace without an active paid subscription; per-account credit cap (lookup 1b-1b work) | trial account enqueues 0 Tracerfy rows; per-account cap test | CONFIRMED |
+| S3-04 | P1 | Rate limiting | client_ip and every IP-keyed limiter (IE-1, F-01, F-01b) | src/api/middleware/rate_limit.py:54-60; start.sh:97; cmd:probe_spray.py | internet access | password spraying, signup/reset abuse unthrottled | Make Cloudflare sole ingress (S3-06), then trust CF-Connecting-IP only from Cloudflare; per-account limits meanwhile | forged XFF from a non-CF peer ignored; rotating-peer spray gets 429 | REPRODUCED |
+| S3-05 | P2 | Source disclosure | Public GHCR package (AS-2) | live: anonymous pull of latest | none | full private backend source public | Package made private 2026-09-27 | CI check that the package is private | FIXED-VERIFIED |
+| S3-06 | P2 | Edge bypass | Railway origin answers without Cloudflare (IO-1, F-28) | live: GET /health via Railway edge IP 69.46.46.123 = 200, no CF-RAY | know the Railway hostname | WAF and edge limits skippable; blocks S3-04 | Cloudflare Tunnel or Authenticated Origin Pulls; drop the public Railway domain | live probe returns non-200 via Railway edge | REPRODUCED |
+| S3-07 | P2 | Session revocation | GET /jobs/{id}/download session-JWT branch (LT-1, AN-1, AZ-5, LT-2) | src/api/routes/jobs.py:1383-1391; src/api/auth.py:381-384 | a stolen or logged-out access token | signed-out session exports full lead CSVs for up to 1 h, also via ?token= | Route the bearer branch through get_auth_context incl. session-family check; refuse full session tokens in ?token= | logout then download = 401 (header and query) | REPRODUCED |
+| S3-08 | P2 | SSRF | safe_http URL parser differential (IE-2, CX-3, IE-12) | src/api/middleware/security.py:234-242; cmd:probe_ssrf; http://127.0.0.1:PORT\@portal.test/ reached loopback | control of a scraped link, redirect Location, or Tracerfy download URL | internal service access; portal cookie sent to loopback | Route safe_http through pinned_session; reject backslash and userinfo; parse with the same library that connects | parser-differential URLs and rebinding refused with 0 listener hits | REPRODUCED |
+| S3-09 | P2 | Rate limiting | download, export-url, finished-job logs, cancel, scraper create/edit/delete (LT-4, IE-3, F-09) | live:150/150 x 200 on download; src/api/routes/jobs.py | an account | CPU/PII-decrypt amplification, scraping abuse | Per-user limits on each route | 429 after the configured budget | REPRODUCED |
+| S3-10 | P2 | CI secrets | GitHub Actions production env and repo secrets (IO-2, AS-4, S-3, F-14) | cmd:gh api environments (names only); .github/workflows/ci-cd.yml:311-337 | a workflow change merged or a compromised dependency at install | prod DSN and encryption keys exfiltrated | Protection rules + branch policy on production; move DSN to the environment; install deps in a step without secrets; delete unused RAILWAY_TOKEN_PRODUCTION | workflow lint asserting no secrets in install steps | CONFIRMED |
+| S3-11 | P2 | DB least privilege | Owner DSN on api, worker, beat (IO-4, AS-7, S-2) | start.sh:55,84,96 | RCE in any service | DDL and RLS bypass | One-shot release migration job; remove DATABASE_URL_MIGRATE from runtime services | startup refuses to run with an owner DSN outside the migrate job | CONFIRMED |
+| S3-12 | P2 | Spend control | Tracerfy global soft cap (BI-2, B-4); FIXED IN CODE on main by #364 (per-account + global credit caps read inside the claim lock) but both default OFF, so effective only if production sets SKIP_TRACE_ACCOUNT_DAILY_CREDIT_CAP | src/workers/skip_trace_dispatcher.py:72-113,274 | any skip-trace customer | one tenant can take the whole daily cap; cap counts rows not credits | Per-account credit budget, cap checked per batch | two tenants, one saturating, the other still served | CONFIRMED |
+| S3-13 | P2 | Sandbox | Chromium --no-sandbox in the worker (IO-5, CX-5, F-07) | src/scrapers/base_scraper.py:281 | a renderer exploit in county HTML | worker env holds every secret | Enable the sandbox (seccomp) or isolate rendering in a secretless container | launch args asserted without --no-sandbox | CONFIRMED |
+| S3-14 | P2 | SSRF | Playwright egress guard fails open; WebSocket/service worker not intercepted (CX-4, IE-10, E-4) | src/scrapers/base_scraper.py:339,414-460 | hostile page content | browser reaches internal addresses | Fail closed on guard errors; block service workers; intercept WebSocket | guard exception aborts the request; ws:// to loopback blocked | CONFIRMED |
+| S3-15 | P2 | Webhook trust | Tracerfy webhook body decides billing; download host check loose (BI-1, CX-1, B-5) | src/workers/tracerfy_ingest.py:436-455,831-841; src/api/billing/skip_trace_usage.py:611-624 | the Tracerfy webhook secret | billing manipulation, fetch from attacker bucket over http | Trust stored rows_uploaded; pin exact host and https | forged rows_uploaded ignored; http host refused | REPRODUCED |
+| S3-16 | P2 | Secret handling | Legacy Tracerfy path-secret route on by default; secret reaches logs (CX-2, BI-7, AS-9, F-22, IO-13 part) | src/config/settings.py:345; main.py:108,123-130 | log access | webhook secret disclosed, enabling S3-15 | Default the legacy route off; scrub path in every logger | secret path absent from all log records | REPRODUCED |
+| S3-17 | P2 | Credential on disk | Production admin password in plaintext on OneDrive and in a local stash and FE blob (AS-6, S-5) | git:568f67f3 (local stash); scripts/audit_out_ui log (untracked) | OneDrive or device access | admin account takeover | Rotate the admin password; delete the files, stash, and blob | none (owner action) | CONFIRMED |
+| S3-18 | P2 | CI deploy integrity | CI runs bare alembic upgrade head against production racing the locked migrate (AS-5, IO-3, S-4) | .github/workflows/ci-cd.yml:337 | every push to main | concurrent migrations, partial DDL | Remove the CI migration or use scripts/migrate.py | none (config) | CONFIRMED |
+| S3-19 | P3 | Dedup correctness | Billing dedup key has no county (LT-6); likely source of the owner's "previously delivered" report | cmd:lt_dedup.py same-account King vs Pierce collision | same account, two counties | new leads mislabelled Already delivered | Include county (fips) in the dedup key and fallback | cross-county same-parcel lead stays New | REPRODUCED |
+| S3-20 | P3 | Cross-tenant fragments | Anonymous /scrapers/sample shows first name, last initial, filing date, city (LT-7) | cmd:lt harness; src/api/routes/scrapers.py sample cache | none | small PII fragments of tenants' newest leads | Build the sample from synthetic or county-cache data only | sample never contains tenant-owned rows | REPRODUCED |
+| S3-21 | P3 | Plan entitlement | /scrapers/{id}/records reads the county cache without quota/payment/Starter-delay checks (AZ-1) | src/api/routes/scrapers.py:1147-1301 | Starter or past_due account | free reads of the shared cache (raise to P2 if the daily scrape is on) | Apply the same gates as POST /jobs | 402 for over-quota/past-due | REPRODUCED |
+| S3-22 | P3 | Subscription state | Expired/cancelled/unpaid accounts can mint API keys, create webhook/skip-trace scrapers, use segments (LT-9) | cmd:lt matrix | an ended subscription | paid features after lapse (scraping itself is blocked) | Gate these routes on active subscription | ended account gets 402 | REPRODUCED |
+| S3-23 | P3 | Admin step-up | require_admin accepts API keys and non-MFA sessions (AZ-3, AN-4, A-10) | src/api/auth.py:477-535 | an admin API key leak | admin reads without MFA | JWT-only admin reads with MFA session | admin API key gets 403 | REPRODUCED |
+| S3-24 | P3 | Plan entitlement | Dialer replay has no plan re-check (AZ-4) | src/api/routes/scrapers.py:1304-1355; src/workers/dialer_outbox.py:64-160 | a downgraded account | replay of a paid channel | Re-check plan in route and outbox | downgraded replay refused | CONFIRMED |
+| S3-25 | P3 | Quota race | AI-connector monthly job limit count-then-insert (AZ-6) | cmd:code trace | concurrent requests | a few jobs over limit | Lock or atomic counter | concurrent starts respect the limit | CONFIRMED |
+| S3-26 | P3 | Session lifetime | No absolute session lifetime (AN-2, A-6) | cmd:harness s7 (90-day-old family refreshed) | a stolen refresh token | indefinite session | Absolute family max age | refresh after max age = 401 | REPRODUCED |
+| S3-27 | P3 | Password oracle | change-password has no per-account throttle (AN-3, A-7) | cmd:harness s4 (15 x 400, no 429) | a stolen session | password guessing (while S3-04 open) | Per-account throttle | 429 after N failures | REPRODUCED |
+| S3-28 | P3 | MFA brute force | /auth/mfa/enable lacks the failure lockout (AN-8) | src/api/routes/auth_helpers/mfa.py:53-120 | stolen session + abandoned setup | MFA secret guessing | Apply the A-3 lockout | 6th bad code = 429 | CONFIRMED |
+| S3-29 | P3 | Live stream | Open SSE log stream continues after logout up to 30 min (LT-3) | cmd:lt harness | stolen session | log lines after revocation | Re-check session family per lease renewal | stream closes after logout | REPRODUCED |
+| S3-30 | P3 | Download tokens | Emailed 48 h links and 60 s tokens reusable (LT-10, AN-11) | src/api/download_tokens.py:21-35 | a leaked link | repeat downloads | Single-use jti or shorter TTL; fix docstring | second use = 401 | CONFIRMED |
+| S3-31 | P3 | Errors / headers | Unhandled 500 lacks CORS and security headers (AN-5, IO-12, F-16) | main.py:105-112 | any 500 | browser cannot read ref id; headers missing | Handle in middleware order | 500 carries headers | REPRODUCED |
+| S3-32 | P3 | Transport | No HSTS on api.bridgeleads.io (AN-6, IO-11, F-15) | live: api response headers | network attacker | downgrade on first visit | Add HSTS at app or Cloudflare | header present | REPRODUCED |
+| S3-33 | P3 | Verbose errors | 422 echoes input incl. passwords (IE-6, IO-14, CX-12, E-6) | main.py:100-111; live 422 | any caller | sensitive input reflected | Custom handler without input values | 422 body has no input | REPRODUCED |
+| S3-34 | P3 | Input validation | page 2^62 returns 500; non-UUID ids 500 and logged raw (IE-4, IE-5, LT-8) | cmd:ie18 probes | any caller | log noise, error paths | Bound page; UUID path types | 422 not 500 | REPRODUCED |
+| S3-35 | P3 | Input validation | No body-size cap (8 MiB JSON accepted); webhook parsers unbounded (IE-7, CX-6) | src/api/routes/webhooks.py:78; src/api/routes/billing.py:1753 | any caller | memory pressure | Body-size middleware; capped webhook reads | 413 over the cap | REPRODUCED |
+| S3-36 | P3 | Input validation | Custom date range has no maximum span (IE-8, B-8) | src/api/schemas.py:429-457 | an account | long scrapes, load | Max span validator | 422 over max | CONFIRMED |
+| S3-37 | P3 | Log redaction | Redaction absent on child loggers and worker; no traceback scrubbing; access_token/sig not matched (IO-13, F-23, F-27, CX-9, AS-14) | src/utils/logger.py:30-60; cmd:node regex test access_token= RAW | log access | secrets or PII in logs | Install filter on root and worker; scrub exc_info; add URL query redaction | secrets absent from every logger incl. worker | REPRODUCED |
+| S3-38 | P3 | Log hygiene | Raw provider and webhook response bodies logged (IE-11, E-5) | src/workers/webhook_delivery.py:420-423; src/workers/skip_trace.py:649-657 | provider or customer endpoint | PII, log forging | Log status and length only | body not in logs | CONFIRMED |
+| S3-39 | P3 | Provider double spend | Tracerfy 5xx or dropped connection re-sends the batch (BI-6) | src/workers/skip_trace.py:635-638; src/workers/skip_trace_dispatcher.py:891-913 | provider fault | operator charged twice | Idempotency key or treat as unknown and reconcile | 5xx after send does not resubmit | CONFIRMED |
+| S3-40 | P3 | Webhook trust | Subscription event without id skips the Stripe re-read (BI-4) | src/api/routes/billing.py:2141-2173 | Stripe signing secret | forged body applied (Starter to Agency) | Refuse events without an id | id-less event ignored | REPRODUCED |
+| S3-41 | P3 | Billing lifecycle | Disputes and refunds change nothing; livemode not checked; dup-sub alert misses usual order (BI-5, BI-8, BI-3, B-6, B-7) | src/api/routes/billing.py:2032-2052 | a chargeback | plan kept after chargeback | Handle dispute/refund; check livemode; alert on either order | dispute flags account | REPRODUCED |
+| S3-42 | P3 | RLS defense in depth | users_app policy USING true with table-wide UPDATE; system policies USING true; FORCE script aborts (IO-6, IO-7, IO-8) | cmd:local role test set tenant B is_admin as app role | an app-layer predicate bug | cross-tenant write incl. is_admin | Row policy on users by GUC; column grants; fix apply_rls_force.sql | app role cannot update another user row | REPRODUCED |
+| S3-43 | P3 | Supabase exposure | external_source_health without RLS or anon revoke (IO-9, S-11) | cmd:alembic upgrade head then pg_class relrowsecurity=false; alembic/versions/083_external_source_health.py | a Supabase anon key | operational data readable | Enable RLS, revoke anon | anon select denied | REPRODUCED |
+| S3-44 | P3 | Transport | DB TLS require without cert verification; migrate path not forcing TLS (IO-10) | src/db/session.py:27-44; alembic/env.py:22-24 | network position | MITM of DB traffic | verify-full with CA | connect fails with wrong CA | CONFIRMED |
+| S3-45 | P3 | Secrets at rest | PhoneBurner OAuth tokens and webhook HMAC secrets stored plain in deliver JSON (AS-8) | src/db/models.py:413,505 | DB read | third-party account access | Encrypt with the field key | stored value is ciphertext | CONFIRMED |
+| S3-46 | P3 | Worker integrity | Worker loads and writes by id without owner checks (CX-10, CX-11, T-1..T-4) | src/workers/tasks.py:481-483; src/workers/batch_tasks.py:50-114 | a forged task message | cross-tenant worker write | Re-derive and assert owner in tasks | mismatched owner task refused | CONFIRMED |
+| S3-47 | P3 | Frontend CSP | unsafe-inline, unsafe-eval, unused origins (FE-1, AN-10, CX-7, W-3) | next.config.ts:41,55-57,78,83 | an injection bug | weaker XSS containment | Nonce-based CSP, drop unused origins | header snapshot test | CONFIRMED |
+| S3-48 | P3 | Token exposure | Backend access token readable by page JS (FE-2, CX-8, W-4) | lib/auth.ts:88-96,265 | an XSS | 1 h token theft | Proxy API calls server-side | session JSON has no accessToken | REPRODUCED |
+| S3-49 | P3 | Header hygiene | Vercel ACAO * on HTML; localhost in serverActions and CORS prefix (FE-3, FE-4, AN-9, AN-13, W-5, W-6, A-11) | next.config.ts:4-14; main.py:68-82 | none today | future misuse | Remove localhost in prod; exact-match origins | config test | CONFIRMED |
+| S3-50 | P3 | Latent DoS | Auth.js password path reachable (AN-7, A-9) | lib/auth.ts:206-225 | after S3-04 fix | shared-IP lockout | Remove unused path | none | CONFIRMED |
+| S3-51 | P3 | CI supply chain | Actions not SHA-pinned, Railway CLI unpinned, no secret scan, deps unhashed; FE PAT reads BE history (AS-10, IO-16, IE-13, IO-18, S-2b) | .github/workflows/ci-cd.yml:198,303 | a compromised action or package | CI secret theft | Pin by SHA, hash-lock deps, scope the PAT, add secret scanning | none | CONFIRMED |
+| S3-52 | P3 | Fail-closed config | Blind-index key not checked at boot (AS-12) | main.py:49-50; src/workers/__init__.py:175 | missing env | lazy failure | Validate at startup | boot fails without key | CONFIRMED |
+| S3-53 | P3 | Artifact hygiene | .dockerignore denylist, compose ports, dormant prod compose publishes dashboards (AS-13, IO-19) | .dockerignore:46; docker-compose.prod.yml:113-164 | local use | accidental exposure | Allowlist-style dockerignore; delete dormant compose | none | CONFIRMED |
+| S3-54 | P3 | Push channel CSV | Generic dialer webhook sends raw county text (IE-9, F-02r, accepted by design) | src/workers/dialer_connectors/generic_webhook.py:20-43 | a Sheets/Zapier consumer | formula evaluation in the customer's sheet | Opt-in spreadsheet-safe setting (product decision) | none | CONFIRMED |
+| S3-55 | INFO | Docs | Stale BYPASSRLS comments; CLAUDE.md says Upstash (IO-17, AS-11) | src/db/session.py:221; src/config/settings.py:231 | none | misleads reviewers | Update comments | none | CONFIRMED |
+
+## Codex findings
+
+Codex (independent, no access to our findings, isolated worktree, read-only instructions honoured: only
+`tasks/audit3/codex.md` written) reported P0 0, P1 0, P2 4, P3 7, INFO 1 (CX-1..CX-12).
+
+| Codex | Ours | Outcome |
 |---|---|---|
-| CSP | `default-src 'none'; frame-ancestors 'none'` | `default-src 'self'; base-uri 'self'; object-src 'none'; form-action 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; ...` (W-3) |
-| HSTS | **missing** (F-15) | `max-age=31536000; includeSubDomains` |
-| X-Content-Type-Options | nosniff | nosniff |
-| X-Frame-Options | DENY | DENY |
-| Referrer-Policy | strict-origin-when-cross-origin | strict-origin-when-cross-origin |
-| Permissions-Policy | geolocation/microphone/camera=() | camera/microphone/geolocation=() |
-| COOP / CORP | same-origin / same-site | n/a |
+| CX-1 Tracerfy billing trust (P2) | BI-1 (P2) | Both: S3-15 at P2 |
+| CX-2 legacy path-secret route (P2) | BI-7, AS-9 (P3) | Both: higher severity adopted, S3-16 at P2 |
+| CX-3 safe_http rebinding (P2, suspected) | IE-2 reproduced a parser differential, IE-12 rebinding (P2/P3) | Both: S3-08 at P2, REPRODUCED |
+| CX-4 browser guard fail-open (P2) | IE-10, E-4 (P3) | Both: higher adopted, S3-14 at P2 |
+| CX-5 --no-sandbox (P3) | IO-5 (P2) | Both: S3-13 at P2 |
+| CX-6 webhook parsers unbounded (P3) | IE-7 (P3) | S3-35 |
+| CX-7, CX-8 CSP, token in JS (P3) | FE-1, FE-2 | S3-47, S3-48 |
+| CX-9 URL secrets in logs (P3, suspected) | none | Codex-only: driver verified the redaction gap (access_token=, sig=, X-Amz-Signature= pass unredacted; cmd test), found no secret-bearing scraper URL today; adopted at P3 in S3-37 |
+| CX-10, CX-11 worker by-id writes (P3) | audit #2 T-1..T-4 | S3-46 |
+| CX-12 verbose 422 (INFO) | IE-6, IO-14 (P3) | S3-33 at P3 |
 
-## 29. Fixes implemented
+Codex missed: the public GHCR token exposure (not visible in code), the download-route revocation bypass (S3-07), the
+CGNAT limiter reproduction (S3-04), and the origin bypass (S3-06). No Codex finding was rejected.
 
-Phase 2 was approved on 2026-09-25 ("proceed with the rest", manual items excepted). Every fix below has a
-regression test that was run FAILING on the pre-fix commit and PASSING after, and a Codex review (NO-GO rounds
-listed). Nothing is merged: merging to `main` deploys.
+## Independent verification
 
-| Step | Finding | Sev | Fix | Commit | Codex |
-|---|---|---|---|---|---|
-| S1 | N-01 | P1 | untrack `terraform.tfvars`, `infra/` out of the Docker context, `.tfvars.example`, BOM-tolerant tracked-file credential scan | `150421e5`, `c06a4a85` | P1 = rotation (yours); P2 fixed |
-| S2 | N-02 | P1 | change-plan: upgrade `always_invoice` + `error_if_incomplete` (paid before applied), downgrade `proration_behavior=none`; card decline -> 402 | `98473b46` | PASS |
-| S3 | N-03 | P1 | `/results`, `/download`, `/export-url` deliver rows only when `status == done`; **reproduced before the fix** (enriching/scraping/failed/cancelled runs all leaked rows) | `67382e30` | PASS |
-| S4 | E-1, E-2, E-3 | P2/P3 | webhook body read raw (never decoded) and capped at 2 KB, 60/90s task limit; URL never logged or in Celery trace/result, echoed URL secrets scrubbed; SSRF unwraps NAT64/SIIT/6to4/Teredo/IPv4-compatible, blocks `64:ff9b:1::/48`, `fec0::/10`, `192.88.99.0/24` | `adf443f6` | 2 NO-GO, then PASS |
-| S6 | A-2, A-4 | P2 | `/auth/api-key` and `/auth/mfa/setup` need `current_password` + a session; API keys refused on api-key, mfa setup/enable/disable, change-password; per-account reauth throttle | BE `66ec1b03`, FE `91256fb` + `9eed5cb` | 1 NO-GO, then PASS |
-| S7 | A-1, A-5 | P2 | session families: logout (access and/or refresh token) revokes the family; refresh reuse after the grace window burns the family; FE sign-out calls backend logout server-side | BE `60918c78`, FE `0790629` | design + review PASS |
-| S8 | A-3 | P2 | 5 wrong MFA codes lock second-factor verification 15 min (login MFA and mfa/disable), atomic Lua counter | `9ea64a09` | 1 NO-GO, then PASS |
-| S10 | C-1, D-1 | P3 | `include_all` connectors admin-only; download token path requires `is_active` | `a96aaf15` | PASS |
-| S11 | F-03 | P1 | webhook socket pinned to the SSRF-approved address (`src/utils/pinned_http.py`): one lookup, any blocked answer refuses the host, connect to the checked sockaddr, TLS/SNI/Host on the hostname, proxies refused; a connect-time block returns `blocked` without retry. Added 2026-09-26 at your request | `3df7fdfd` | design PASS, diff PASS (2 P2 adopted) |
+- Every leaf report re-checked by the driver with `report-check.mjs` (REPORT_OK for all 9 including Codex); each
+  report's own negative controls are listed in its sections.
+- Driver re-measured the P0 end to end: anonymous GHCR access (tags/list 200 vs nonexistent-repo control 403) before,
+  token status ACTIVE via Cloudflare verify (value never printed), then 401 after deletion; package 401/403 after
+  making it private; Railway service sources read to rule out a GHCR dependency; API health 200 after each change.
+- Driver verified the only Codex-only item (CX-9) in code and with a regex control.
+- Cross-leaf agreement: S3-07 found independently by 3 leaves (live, authn, authz); S3-08 by leaf 1.8 and Codex;
+  S3-13/S3-14 by leaf 1.5/1.8 and Codex.
+- Audit #2 fixes re-verified as still in place: N-02, N-03, A-1 (except S3-07), A-2..A-5, C-1, D-1, E-1..E-3, F-03, F-08.
 
-**Not fixed in this phase, deliberately:**
-- **S5 / F-02r** (generic + job webhook push raw county text): a documented, Codex-reviewed product decision
-  (JSON is not an injection context; apostrophe-prefixing corrupts every consumer's data). Reclassified
-  **accepted by design (P3)**; an opt-in "spreadsheet-safe" delivery setting is a product decision for you.
-- **S9 / B-3** (trial accounts' unbillable overage lookups): the fix ("no overage without an active paid
-  subscription") belongs inside the per-account spend cap the lookup session is building right now
-  (`feat/lookup-1b1b-ledger`); implementing it here would collide. Carried as a requirement for that work.
-- **F-01/F-01b** (needs Cloudflare sole ingress first), **F-07** sandbox, **S-2** owner DSN on
-  runtime services: infrastructure-dependent, unchanged.
+## Remaining risks
 
-## 30. Regression tests
+- S3-03 and S3-04 (P1) are open; S3-04 depends on S3-06 (infrastructure).
+- Reads with the leaked Cloudflare token before 2026-09-27 cannot be ruled out (Cloudflare does not log reads); its
+  scope was DNS only, and no DNS change by it after 2026-03-18 exists.
+- Production values not readable here: `ENTITLEMENT_ENFORCEMENT`, `ENABLE_DAILY_SCRAPE` (sizes S3-21),
+  `TRACERFY_LEGACY_PATH_ENABLED`, `SKIP_TRACE_DAILY_ROW_CAP`; production DB role attributes, grants, and FORCE RLS state.
+- No authenticated production testing was done (by rule); cross-tenant results come from the real app on isolated DBs.
 
-Added (each proven failing on the pre-fix commit, in a separate throwaway worktree, never via the shared stash):
+## Manual actions
 
-| File | Covers | Fails before fix |
-|---|---|---|
-| `tests/test_no_committed_credentials.py` | N-01: tracked-file credential scan (BOM, case, prefix-only placeholders), tfvars untracked | 2 of 5 |
-| `tests/test_plan_change_billing.py` | N-02: proration by direction; declined upgrade = 402 and plan unchanged | 5 of 5 |
-| `tests/test_undelivered_run_rows.py` | N-03: non-done runs list/download nothing; done run control | 4 of 5 |
-| `tests/test_webhook_egress_hardening.py` | E-1/E-2/E-3: gzip bomb, 32 MB body, URL secret in logs (query, path, echoed, truncated, percent-encoded), 9 IPv6 embedding forms + public controls | 11 of 14 (first version) |
-| `tests/test_reauth_sensitive_actions.py` | A-2/A-4: password + session for api-key and MFA setup; API keys refused on credential changes | 3 of 3 (first version) |
-| `tests/test_session_family_revocation.py` | A-1/A-5: logout by refresh or access token, reuse burns the family only, crash-safe, grace race kept | 3 of 7 |
-| `tests/test_mfa_failure_lockout.py` | A-3: lock after 5 (login MFA and mfa/disable), success clears | 2 of 3 |
-| `tests/test_audit_p3_access_gates.py` | C-1, D-1 | 3 of 5 |
-| `tests/test_webhook_dns_pinning.py` | F-03: loopback/localhost refused at connect with nothing received, rebind after the pre-check is `blocked` not retried, proxies refused, one DNS lookup per connection (CPython audit events), Host/SNI/cert still bound to the hostname over real TLS | 10 of 10 (4 behavioural; 6 need the new module) |
+1. Rotate the production admin password and delete the plaintext copies (S3-17).
+2. Make Cloudflare the only ingress (Tunnel or Authenticated Origin Pulls) so S3-04 can be fixed (S3-06).
+3. Add protection rules and branch policy to the GitHub `production` environment; delete `RAILWAY_TOKEN_PRODUCTION` (S3-10).
+4. Decide F-02r (opt-in spreadsheet-safe webhook payloads) (S3-54).
+5. Set `SKIP_TRACE_ACCOUNT_DAILY_CREDIT_CAP` (and `SKIP_TRACE_DAILY_CREDIT_CAP`) in Railway production; the #364 caps are off until set (S3-03, S3-12).
+6. Optional: confirm `ENABLE_DAILY_SCRAPE` in production so S3-21 can be sized.
 
-Updated to the new contract (with the reason in each diff): `test_results_new_count.py` (2 tests pinned a
-2026-09-03 behaviour superseded by the 2026-09-08 "not done delivers nothing" rule), `test_auth.py`,
-`test_break_glass_login.py`, `test_plan_entitlement_audit.py` (send `current_password`; the 6th bad MFA code is now 429).
+## Not verified
 
-Still required, not written: F-01 proxy-trust with a forged XFF (after the ingress fix); F-12/B-3 per-account and trial spend gate (lookup session); G-1 behavioural segments isolation.
-
-Browser verification (Playwright against the real local API, isolated DB): API-key and MFA-setup password prompts
-(7/7 checks), UI sign-out issues `POST /auth/logout` 204 and revokes a session family, browser lands on `/login`.
-
-## 31. Test results
-
-- Live IDOR harness: 20 routes, **0 failures** (section 11).
-- `pip-audit`: 0 vulns. `npm audit`: 0. Production frontend build: success (placeholder env only).
-- **Full backend suite, Phase 2 branch rebased onto `origin/main` `2275c2de`:** CI's target (`-m "not integration"`),
-  fresh DB `bridgeleads_secaudit3_test` at head 101, Redis db 10, 8 foreground batches:
-  **4,681 passed, 0 failed, 2 skipped.** `ruff check .` clean; `export_openapi.py --check` up to date.
-  Not run locally: the 145+ `integration` tests (need provisioned RLS roles; CI runs its own).
-- Frontend: `tsc --noEmit` and `eslint` clean on the changed files; production `next build` succeeds.
-
-## 32. Codex findings
-
-Codex ran independently (no findings shared), read-only, on `fc38e620`. It reported 3 P1 + 4 P2:
-
-| Codex claim | Our verification | Verdict |
-|---|---|---|
-| P1 rate limiting: 100.64/10 untrusted | Re-proven live today | **CONFIRMED P1** (F-01) |
-| P1 webhook DNS-rebinding TOCTOU | Code unchanged; risk-accepted comment | **CONFIRMED P1** (F-03) |
-| P1 no per-account Tracerfy ceiling | Confirmed + widened by B-3 (trials) | **CONFIRMED P1** (F-12; raised from P2 per cross-check doctrine) |
-| P2 `/scrapers/connectors?include_all=true` anonymous | Live: 6 down connectors + public county URLs, no internal hosts | **CONFIRMED, held at P3** (C-1): the doctrine says take the higher severity, but the measured impact is public county URLs only; your brief says not to inflate. Disagreement recorded. |
-| P2 Tracerfy secret in URL path | Confirmed, plus a new logging path (B-6) | **CONFIRMED**, P3 (F-22) |
-| P2 webhook `str(exc)` logs URL/secret | Confirmed at `webhook_delivery.py:326-330` | **CONFIRMED**, P3 (E-2): worker logs only, secret only if the customer put one in the URL |
-| P2 download token skips `is_active` | Confirmed; window is **48 h**, not the 60 s Codex assumed; logout-all revocation is honoured | **CONFIRMED**, P3 (D-1) |
-| Non-findings: IDOR, SSE, admin, Stripe core, Tracerfy idempotency, CSV, SQL, Redis keys, XSS, CSRF, CORS, errors | Match ours (and our live harness) | **CONCUR** |
-
-**What Codex missed and we found:** N-01 (committed Cloudflare token), N-02 (plan-change arbitrage), N-03 (results
-before cap), B-3 (trial spend), A-1..A-5 (session/API-key/MFA), E-1 (webhook DoS), S-2..S-5. Codex found nothing we
-did not also find except C-1 (found independently by the frontend agent too).
-
-## 33. Independent verification
-
-Verified first-hand by me, not taken from an agent or Codex: F-01 (live), F-15 HSTS (live), CORS (live), env/debug
-paths (live), C-1 (live), all IDOR results (live harness), N-01 (file, commit, BOM, Dockerfile, repo visibility,
-redacted), N-02 (code), N-03 (code path + commit ordering), E-3 (real `_ip_is_blocked`), D-1 (code + TTL),
-A-1/A-2 (FE + BE code), E-2 (code). Agent findings not individually re-verified by me are marked by their agent ID
-and detailed with file:line in the `tasks/audit2-*.md` files; Phase 2 re-verifies each before fixing.
-
-## 34. Remaining risks
-
-- **Not verified:** whether FORCE RLS + policies are live on the three mig-101 tables in prod (my read-only catalog
-  query was blocked by the permission classifier); N-03 end-to-end reproduction; N-02 annual variant in Stripe test
-  mode; F-28 re-probe; N-01 token validity; provider billing caps; backup restore (never tested); `uvloop` CVEs.
-- Security depends on three production flags whose code defaults are `False` (`RLS_ENFORCE`,
-  `ENTITLEMENT_ENFORCEMENT`, `EMAIL_VERIFICATION_ENABLED`), plus `SKIP_TRACE_DAILY_ROW_CAP`. Last confirmed 2026-09-17.
-- The per-account Tracerfy cap is being built by another session; until it ships, F-12 stays P1.
-- Chromium renderer runs unsandboxed next to an owner DSN (F-07 + S-2): a renderer exploit is a full-DB compromise.
-
-## 35. Manual actions required from you
-
-1. **Roll the Cloudflare API token now** (N-01) and review the Cloudflare audit log back to 2026-03-17. Then approve
-   untracking the file.
-2. **Rotate the admin account password** found in `scripts/audit_out_ui/run3_thurston_whatcom.log`; move
-   `.rls-cutover-secrets` and that log out of OneDrive (S-5).
-3. Run the read-only RLS catalog check I prepared (it prints no DSN):
-   `! railway run -s api -- C:/Users/Windows/bl-rescat-venv/Scripts/python.exe C:/Users/Windows/AppData/Local/Temp/claude/secaudit2/rls_catalog.py`
-4. Cloudflare: make it the sole ingress (Tunnel / Authenticated Origin Pulls). This unblocks F-01.
-5. GitHub: move `DATABASE_URL_SYNC` to a protected environment, delete `RAILWAY_TOKEN_PRODUCTION`, narrow `BACKEND_SCHEMA_TOKEN`.
-6. Decide: disable the legacy Tracerfy path-secret route and rotate that secret (F-22).
-7. Decide the Tracerfy per-account and trial spend policy (F-12/B-3).
-8. Still open from 09-16: DMARC, apex SPF, MX for `security@`, backup restore test, provider billing caps.
-
-**Proposed Phase 2 (needs your approval; max 5 files per step, each with a regression test, Codex review per build):**
-1. N-01 code side: untrack tfvars, `.dockerignore` `infra/`, CI secret scan (after you rotate).
-2. N-02 plan-change: `always_invoice` for upgrades, period-end downgrades.
-3. N-03 reproduce, then gate results to the granted rows.
-4. A-1 + A-5 (logout revokes the refresh family), then A-2/A-4 re-auth for API key and MFA enrollment, then A-3.
-5. E-1 webhook body cap + time limit; F-02r sanitize generic/job webhook; E-2/E-3 small fixes.
-6. B-3 trial skip-trace gate (coordinate with the 1b-1b session, do not touch its files).
-7. F-01 only after item 4 of the manual list. F-03 pinning. Remaining P3s.
-
-## 36. Files changed
-
-**Backend** (branch `chore/security-audit-2026-09-25`): `.dockerignore`, `infra/terraform/terraform.tfvars`
-(untracked), `infra/terraform/terraform.tfvars.example`, `src/api/auth.py`, `src/api/schemas.py`,
-`src/api/middleware/__init__.py`, `src/api/middleware/auth_hardening.py`, `src/api/middleware/security.py`,
-`src/api/routes/auth.py`, `src/api/routes/auth_helpers/{login,mfa,registration}.py`, `src/api/routes/billing.py`,
-`src/api/routes/jobs.py`, `src/api/routes/scrapers.py`, `src/workers/webhook_delivery.py`, `schema/openapi.json`;
-8 new test files (section 30) and 4 updated ones. Docs: this report, `tasks/audit2-*.md`,
-`tasks/todo-security-2026-09-25.md`, `docs/BUILD_JOURNAL.md`.
-**Frontend** (branch `fix/reauth-sensitive-actions`): `lib/api.ts`, `lib/auth.ts`,
-`components/settings/ApiKeysTab.tsx`, `components/settings/security-tab.tsx`.
-
-## 37. Commits
-
-Backend, on top of `origin/main` `2275c2de`: `150421e5` N-01, `c06a4a85` N-01 test, `98473b46` N-02, `67382e30` N-03,
-`adf443f6` E-1..3, `66ec1b03` A-2/A-4, `60918c78` A-1/A-5, `9ea64a09` A-3, `a96aaf15` C-1/D-1, `c1caf29e` OpenAPI,
-plus the docs commit. Frontend, on top of `origin/master` `8332673`: `91256fb`, `9eed5cb`, `0790629`.
-**Merge order: frontend first, then backend.** Nothing is merged (merging to `main` deploys).
-
-## 38. Git status
-
-Worktrees `C:/Users/Windows/bl-wt-secaudit2` (backend) and `C:/Users/Windows/bl-web-secaudit2` (frontend), each on its
-own branch, clean apart from the untracked `.unlazy/` ledger. A throwaway worktree
-`C:/Users/Windows/bl-wt-secaudit2-pre` was used only to prove tests fail on pre-fix commits. No other session's
-worktree or branch, and not the primary checkout, was modified. Production side effects:
-14 forgot-password requests for non-existent `@example.com` addresses (no account, no email, no row), 12 invalid ones
-(422), and about 70 read-only GETs/HEADs/OPTIONS. Isolated rig artifacts: DB `bridgeleads_secaudit2_test`, Redis db 11,
-one 6543 proxy process, and a frontend worktree `C:/Users/Windows/bl-web-secaudit2` (detached, clean).
+- Live authenticated production behaviour (no production credentials by rule).
+- Production DB role attributes, grants, FORCE RLS state, Railway variable values, R2 bucket CORS/public access.
+- Tracerfy's charging behaviour on 5xx (S3-39) and Stripe live portal/coupon configuration.
+- Linux-only dependency `uvloop` (pip-audit ran on Windows).
+- Whether anyone read data with the Cloudflare token before deletion.

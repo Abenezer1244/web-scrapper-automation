@@ -360,6 +360,7 @@ async def create_scraper(
     off the first run ("Start run"). The config is always active (visible on the
     dashboard); it only auto-runs if its schedule.frequency is recurring (the
     dispatcher skips frequency="manual")."""
+    await rate_limit(request, zone="writes", identifier=current_user.id)  # audit #3 S3-09
     config = await _build_scraper_config(db, current_user, body, request)
     _audit_config(request, "scraper_created", current_user.id, config)
     return ScraperConfigResponse.model_validate(config)
@@ -462,6 +463,7 @@ async def delete_scraper(
     current_user: CurrentUser,
     db: AsyncSession = Depends(get_rls_db),
 ) -> None:
+    await rate_limit(request, zone="writes", identifier=current_user.id)  # audit #3 S3-09
     result = await db.execute(
         select(ScraperConfig).where(
             ScraperConfig.id == scraper_id,
@@ -555,6 +557,7 @@ async def update_scraper(
     deep-merged — the edit wizard pre-fills the complete object); an OMITTED field
     is kept. Blank delivery secrets are kept (see _merge_deliver).
     """
+    await rate_limit(request, zone="writes", identifier=current_user.id)  # audit #3 S3-09
     from src.db.models import Job
 
     # 1. Identity is immutable. county/state/record_type exist on the model only so
@@ -854,7 +857,7 @@ async def set_scraper_csv_layout(
     """
     from src.db.models import Job
 
-    await rate_limit(request, zone="general", identifier=current_user.id)
+    await rate_limit(request, zone="writes", identifier=current_user.id)
 
     # Same owned + active load as update_scraper; FOR UPDATE serializes this write
     # against a concurrent edit or job insert (see update_scraper step 4).

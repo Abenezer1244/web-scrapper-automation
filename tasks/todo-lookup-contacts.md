@@ -1737,6 +1737,15 @@ planner already drops it as fixed. Tried and reverted.)
   watermark dropped (new test); full-batch check after the limits (new test).
 - **Regression:** credit cap 106 + 103's 19, then the two skip-trace batches and
   plan_entitlement_audit: 818 passed, 0 failed.
+- **Codex diff review r1: VERDICT GO, no P1.** Fixed anyway: [P2] the SET LOCAL / walk /
+  RESET now run in a SAVEPOINT (a failing walk in an aborted transaction made the RESET fail
+  and mask the real error; new test asserts the walk's own DataError and `enable_bitmapscan`
+  back on); [P2] a test pins the per-account `round_limit` term; [P3] module headers name
+  ii-c. Both new mutations caught (8 in all). Not added, with reason: a test for the
+  watermark's place relative to the LIMIT (post-watermark rows are a tail, so any placement
+  before the outer LIMIT gives the same prefix) and for the key columns (dropping one raises
+  AttributeError in every in-flight test). After the fix: 592 skip-trace tests pass, gate A
+  unchanged (113-138 ms, refill 1.1-1.35 s).
 
 ### ii-c TO BUILD
 - [x] ii-c-1: migration 103 + models + env.py + tests; replay; merge; VERIFY THE INDEX IN PROD

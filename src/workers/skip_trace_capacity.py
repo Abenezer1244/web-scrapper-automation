@@ -1,6 +1,7 @@
 """How much Tracerfy spend the dispatcher may still claim, and whose rows claim it.
 
-Phase 1b-1b-ii-b. The unit is the Tracerfy CREDIT: a normal lookup costs 1, an
+Phase 1b-1b-ii-b (the caps), ii-c (the keyset walk that finds the rows: see "The
+keyset frontier" below). The unit is the Tracerfy CREDIT: a normal lookup costs 1, an
 advanced one 2 (`CREDITS_PER_ROW`). Two caps, both over a rolling 24h window of
 `pending_skip_trace_rows.submitted_at`:
 
@@ -308,11 +309,13 @@ def allocate(
     # / 50 accounts (2026-09-27, the real statement, warm): watermark inside the
     # walk 676 ms with bitmaps off, 1,020 ms with them on; watermark outside 286 ms
     # with bitmaps on, and 1.2 ms with them off, the ordered walk of 103's index
-    # that stops at the LIMIT. SET LOCAL + RESET keeps it to this one statement.
-    db.execute(text("SET LOCAL enable_bitmapscan = off"))
-    try:
+    # that stops at the LIMIT. SET LOCAL + RESET keeps it to this one statement, and
+    # the savepoint keeps it there on failure too: rolling back to it undoes the SET
+    # and leaves the transaction usable, so the walk's own error is the one raised
+    # (a RESET in an aborted transaction would fail and mask it: Codex ii-c-2 review).
+    with db.begin_nested():
+        db.execute(text("SET LOCAL enable_bitmapscan = off"))
         got = db.execute(stmt).all()
-    finally:
         db.execute(text("RESET enable_bitmapscan"))
     return [Candidate(str(i), str(u), at) for i, u, at in got]
 

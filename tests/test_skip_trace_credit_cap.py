@@ -1,4 +1,5 @@
-"""The credit-weighted daily spend caps (Phase 1b-1b-ii-b).
+"""The credit-weighted daily spend caps (Phase 1b-1b-ii-b) and the keyset walk that
+fills them (ii-c).
 
 Every Tracerfy lookup costs the operator real money: a normal one 1 credit, an
 advanced one 2. Two caps over a rolling 24h window of `submitted_at`, one across
@@ -597,6 +598,11 @@ def test_round_limits_bound_a_rounds_work_whatever_the_tenant_count():
     limits, _ = cap.round_limits(
         many, room_left=None, default_rows=None, global_left=5000, round_no=3)
     assert sum(limits.values()) <= 15000 * 8           # O((accounts + left) * 2**r)
+    # One account, no caps: its share grows 5000 * 2**3, but no account is ever given
+    # more than the round can return (the last term, Codex ii-c-2 review).
+    limits, round_limit = cap.round_limits(
+        ["u"], room_left=None, default_rows=None, global_left=5000, round_no=3)
+    assert limits == {"u": round_limit} and round_limit == cap.BATCH_ROW_LIMIT
 
 
 def test_round_limits_leave_out_accounts_without_room():
@@ -725,6 +731,9 @@ async def test_the_account_list_is_four_parameters_at_any_tenant_scale(make_acco
                     if hasattr(stmt, "selected_columns"):  # the walk, not SET/RESET
                         compiled_params.append(len(stmt.compile().params))
                     return db.execute(stmt, *a, **k)
+
+                def begin_nested(self):
+                    return db.begin_nested()
             frontier = dict.fromkeys(limits, cap.FRONTIER_START)
             got = cap.allocate(_Capture(), candidates_for, frontier=frontier,
                                limits=limits, round_limit=5000,
@@ -732,6 +741,32 @@ async def test_the_account_list_is_four_parameters_at_any_tenant_scale(make_acco
             assert [c.id for c in got] == [fresh_rows[0]], "only the walked account, 1 row"
 
     assert compiled_params[0] == compiled_params[1], compiled_params
+
+
+async def test_a_failing_walk_raises_its_own_error_and_leaves_no_planner_setting(
+        make_account):
+    """The walk runs with bitmap scans off. If it fails, its OWN error must surface (a
+    RESET in the aborted transaction would fail and hide it), and the setting must
+    not outlive it in the caller's transaction (Codex ii-c-2 review)."""
+    from sqlalchemy import select as sa_select
+    from sqlalchemy.exc import DataError
+
+    from src.db.models import PendingSkipTraceRow as P
+
+    u = await make_account()
+    _seed(u)
+
+    def failing_candidates(acct):
+        return (sa_select(P.id, P.user_id, P.enqueued_at)
+                .where(P.user_id == acct.c.user_id, text("1 / (acct.lim - acct.lim) = 1"))
+                .limit(acct.c.lim).lateral("cand"))
+
+    with system_sync_session() as db:
+        with pytest.raises(DataError, match="division by zero"):
+            cap.allocate(db, failing_candidates, frontier={u: cap.FRONTIER_START},
+                         limits={u: 1}, round_limit=5, watermark=datetime.now(UTC))
+        assert db.execute(text("SHOW enable_bitmapscan")).scalar() == "on"
+        db.rollback()
 
 
 async def test_a_row_retyped_between_allocation_and_lock_is_not_claimed_at_the_wrong_price(

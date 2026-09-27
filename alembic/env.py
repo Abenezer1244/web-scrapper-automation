@@ -41,6 +41,7 @@ target_metadata = Base.metadata
 CONCURRENT_INDEXES = {
     "ix_results_duplicate_source",   # scripts/create_result_duplicate_source_index.sql
     "ix_pending_skip_trace_spent",   # migration 102, CONCURRENTLY
+    "ix_pending_skip_trace_queued_frontier",  # migration 103, CONCURRENTLY
 }
 
 

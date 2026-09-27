@@ -1391,6 +1391,18 @@ class PendingSkipTraceRow(Base):
             postgresql_include=["user_id", "trace_type"],
             postgresql_where=text("submitted_at IS NOT NULL"),
         ),
+        # Migration 103: the refill's per-account keyset frontier. trace_type
+        # leads so account discovery for one type skips across user_id; then
+        # each account's queued rows in (enqueued_at, id) order. Built
+        # CONCURRENTLY by 103 (and listed in CONCURRENT_INDEXES).
+        Index(
+            "ix_pending_skip_trace_queued_frontier",
+            "trace_type",
+            "user_id",
+            "enqueued_at",
+            "id",
+            postgresql_where=text("status = 'queued'"),
+        ),
     )
 
 

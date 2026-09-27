@@ -174,10 +174,19 @@ web-scrapper-automation/
 
 ```bash
 pip install -r requirements.txt
-cp .env.example .env
-# Fill in: DATABASE_URL, REDIS_URL, S3, JWT_SECRET, STRIPE_SECRET_KEY, RESEND_API_KEY
-docker-compose up
+cp .env.example .env.local
+# In .env.local: a LOCAL SECRET_KEY (the example's placeholder is refused), e.g.
+#   python -c "import secrets; print(secrets.token_hex(32))"
+# and TEST-MODE third-party keys only (Stripe test, a dev R2 bucket, Resend).
+# The local stack reads .env.local, NEVER .env, and pins its own database, Redis,
+# encryption keys, CORS origins and the paid/destructive switches
+# (see docker-compose.yml's header).
+docker compose up
 ```
+
+Never point a local stack or a test run at a `.env` that names production: the
+synced checkout's `.env` does. `alembic/env.py` never takes its database URL from a
+`.env` either.
 
 ## Running Tests
 

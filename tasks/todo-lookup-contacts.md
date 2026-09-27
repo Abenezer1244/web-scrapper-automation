@@ -1951,10 +1951,102 @@ Migrations" (bare alembic, ENVIRONMENT unset) succeeded.
 in `tests/conftest.py` and `tests/test_pending_skip_trace_frontier_index.py`,
 `docs/BUILD_JOURNAL.md` (ii-c-2 + #370).
 
-**Next, the local-env PR (owner-approved, its own plan + Codex consult):** docker-compose's
-`api`/`worker`/`beat`/`migrate` all read `env_file: .env`; `run-audit-tests.sh` unsets the four
-libpq variables the guard now refuses; CI's test job sets them empty; `scripts/bootstrap.sh`
-wording. `.env.example` wording needs the owner (Claude's reads of it are denied).
+## Local-env PR: the local stack can never run on production config (PLAN, 2026-09-27)
+
+Owner-approved as its own PR (Codex found it in the safety-PR consult, round 5).
+
+**How production config reaches the local stack today** (`docker-compose.yml`, "LOCAL
+DEVELOPMENT ONLY"): `api`, `worker`, `beat` and `migrate` all read `env_file: .env`, and `api`/
+`worker`/`beat` also mount `.:/app`, so pydantic's `env_file=".env"` reads the host `.env` inside
+the container even without `env_file:`. The OneDrive checkout's `.env` IS production, so
+`docker compose up` there would scrape, spend and migrate against production. (The image itself
+is clean: `.dockerignore` excludes `.env`.) Facts: Docker is not installed on this machine, and
+the stack cannot have worked against its own Postgres anyway: `src/db/session.py` rewrites
+`:5432/` -> `:6543/` on the sync URL unconditionally, so a `postgres:5432` DSN dials 6543.
+
+**Change (5 files):**
+- [x] `docker-compose.yml`:
+      - every app service reads `env_file: .env.local` (created from `.env.example`; `.env.*` is
+        gitignored), never `.env`;
+      - `environment:` PINS the four infrastructure endpoints to the compose containers
+        (`environment:` beats `env_file:`): `DATABASE_URL`, `DATABASE_URL_SYNC`,
+        `DATABASE_URL_MIGRATE` (port-less host `postgres`, so the 6543 rewrite cannot fire) and
+        `REDIS_URL` (Celery broker + backend); `ENVIRONMENT=development`;
+      - `api`/`worker`/`beat` mount `./src` and `./main.py` only (hot reload), not `.:/app`, so
+        no `.env` exists in the container for pydantic to find;
+      - postgres/redis passwords are literal throwaway local values (NO interpolation, per
+        consult round 1 below; this line first proposed `${LOCAL_*}`), ports bound to 127.0.0.1.
+- [x] `tests/test_local_compose_env.py` (new; Docker is not here to render the config, so the
+      YAML is the thing tested): no service reads `.env` (env_file or a mount of `.`/`.env`);
+      every service that runs app code pins all four endpoints to the compose hosts; the sync
+      URLs carry no `:5432/`; no interpolated variable a production `.env` defines
+      (`DATABASE_URL*`, `REDIS_URL`, secrets) is referenced; ports loopback-only.
+- [x] `run-audit-tests.sh`: `unset PGHOSTADDR PGSERVICE PGSERVICEFILE PGSYSCONFDIR` before pytest
+      (the guard now refuses them).
+- [x] `CLAUDE.md` Setup: `cp .env.example .env.local`; compose never reads `.env`.
+- [x] this plan + review.
+- Mutations: `env_file: .env` restored on one service; a `.:/app` mount restored; one pinned
+  URL removed; a `:5432/` sync URL. Each must fail the test.
+
+**Codex pre-code consult (PLAN: REVISE), reconciled:**
+- [P1] adopted: NO `${...}` interpolation anywhere in `docker-compose.yml` (compose reads the
+  project `.env` to interpolate): the local-only container passwords are literal throwaway
+  values (containers bound to 127.0.0.1); the test rejects any `${`.
+- [P1] already planned, now exact: all three DB URLs host `postgres`, NO port.
+- [P2] adopted: the test also asserts no null `environment:` entries (a null passes the host
+  value through), exact `env_file: .env.local` on app services, only the `./src` and
+  `./main.py` mounts, loopback-only ports, no build args/secrets, and `.dockerignore` excluding
+  `.env` / `.env.*` except `.env.example`.
+- [P2] adopted: `migrate` runs `python scripts/migrate.py` (as production boot does) and
+  `api`/`worker`/`beat` wait for it (`service_completed_successfully`).
+- [P1] "blank every third-party credential (R2, Stripe, Resend, Anthropic...) and disable paid
+  integrations" PARTLY adopted: compose pins the three paid switches OFF
+  (`SKIP_TRACE_ENABLED`, `CAPTCHA_ENABLED`, `REGRID_ENABLED`, all default off in settings), blanks
+  `TRACERFY_API_TOKEN`, and points `FRONTEND_URL` / `API_BASE_URL` at localhost; a
+  `.env.local` cannot override `environment:`. NOT blanking Stripe / R2 / Resend / Anthropic:
+  `.env.local` is a file the developer creates on purpose from `.env.example`, and local
+  billing / export / email work needs their test-mode keys; the ACCIDENT this PR closes is the
+  existing production `.env` being picked up by name. Reason sent back to Codex.
+- **Codex round 2: partial adoption ACCEPTED.** Two more switches, adopted: [P1]
+  `AI_ENRICHMENT_ENABLED` (DEFAULTS TO TRUE; with any `ANTHROPIC_API_KEY` parcel enrichment calls
+  Claude, live-billed) pinned `false`; [P1] `RETENTION_PURGE_ENABLED=false` +
+  `RETENTION_PURGE_DRY_RUN=true` pinned (the purge irreversibly deletes DB and R2 PII). The test
+  asserts every pinned switch on every app service.
+
+**Codex diff review r1 (NO-GO), fixed:** [P1] a fresh stack would not boot: `.env.example`'s
+placeholder `SECRET_KEY` is refused by settings and migration 053 imports settings. Now pinned:
+a throwaway local `SECRET_KEY` (which also stops a production key in `.env.local` from minting
+JWTs production would accept), blank `FIELD_ENCRYPTION_KEY` / `BLIND_INDEX_KEY` /
+`TRACERFY_WEBHOOK_SECRET` (blank falls back outside production), `PII_ENCRYPTION_STRICT=false`;
+[P2] `ALLOWED_ORIGINS` pinned to localhost (a local frontend was refused); [P2] the claim narrowed
+to what is true: the checkout's `.env` is never consumed, and `.env.local` cannot reach a
+production database/Redis, use a production key, or enable anything paid/destructive (its
+third-party keys remain the developer's); [P2] the test now checks exact URLs, long-syntax
+mounts and ports, every health dependency, and rejects `network_mode`; [P2] docs: this plan's
+stale interpolation line, CLAUDE.md's Alembic wording and `docker compose`.
+
+**Codex diff review r2 (NO-GO), reconciled:**
+- [P1] adopted: NO committed signing key (`.claude/rules/security.md`: no secrets in code), so
+  r1's pinned throwaway `SECRET_KEY` is removed; CLAUDE.md's setup has the developer generate a
+  local one into `.env.local` (the example's placeholder is refused at boot, loudly); the test
+  asserts `SECRET_KEY` is NOT in `environment:`. The blank key pins stay (blank is not a secret).
+- [P1] wording adopted: the header now claims only what is pinned (production database/Redis
+  unreachable, the listed paid/destructive switches off), and says `.env.local`'s SECRET_KEY and
+  third-party keys are used as given.
+- [P1] "pin Stripe / R2 / Resend empty" NOT adopted: the same decision Codex ACCEPTED in consult
+  round 2 (a deliberately created `.env.local` with test-mode keys is how billing, exports and
+  email are developed locally; the accident this PR closes is the checkout's `.env`).
+- [P2] migration 053 refuses a blank blind-index key on a database holding pre-053 users: a new
+  local database has none; noted in the compose comment. [P3] blank Tracerfy webhook secret =
+  503 on the webhook routes, as skip trace is off: noted.
+- Logged, not here: `main.py` always also allows the production CORS origins (app code, not the
+  local stack); `GIS_ENRICHMENT_ENABLED` / `OWNER_RECOVERY_ENABLED` / `PROPERTY_RECOVERY_ENABLED`
+  for deterministic local runs (not a safety issue).
+
+**Logged, not here:** CI test job setting the four libpq variables empty (runner defense; GitHub
+runners set none); `scripts/bootstrap.sh`'s "Copy .env.example to .env" wording (a production
+setup script that reads no `.env`); `docker-compose.prod.yml` (dormant, already audit #3 S3-53
+"delete dormant compose"); `.env.example`'s own comments (Claude's reads are denied: owner).
 - Out of scope, logged: pydantic `env_file=".env"` still loads other PRODUCTION secrets into a
   test run started from the OneDrive checkout (landmine `bare_pytest_uses_prod_env`); four
   manual ops scripts call `load_dotenv()` on purpose.

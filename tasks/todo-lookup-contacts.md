@@ -1687,6 +1687,28 @@ enqueued_at <= :watermark`), adopted verbatim; the gate EXPLAINs it AND the late
   integration test that no writer can create an in-flight row while a dispatcher pass holds the
   claim lock. ii-c's cache comment points at that requirement.
 
+### Codex consult round 3 on ii-c (2026-09-27): H1 CLOSED; H2/H3 fixes adopted verbatim -> consult closed
+Output: `<scratchpad 0ade294c>/codex_iic_consult3_out.txt`. Codex confirmed H1 (the one-pass skip is no
+money loss, no permanent starvation, no cap breach; materializing adds a scan and no benefit).
+Frontiers are PASS-LOCAL and never persisted (stated in the code).
+- **H2 corrected.** The last term was `global_left`, which at global_left = 1 inspects only 12 rows
+  per pass (a lead behind 13+ blocked rows could starve forever). Now, per round r:
+  `round_limit = min(BATCH_ROW_LIMIT, global_left * 2**r)` (also the outer LIMIT, as in ii-b) and
+  `L = min(room_left * 2**r (or unbounded), ceil(global_left / active_with_room) * 2**r, round_limit)`.
+  The room * 4095 cutoff (room 1, no earlier deadline) is preserved. Bounds, documented separately:
+  returned rows per round <= round_limit; lateral WORK is O((active_accounts + global_left) * 2**r).
+  Fairness (rank 1 of every account with room before rank 2 of any) holds subject to the
+  global-headroom rule (R5): when active accounts outnumber global_left the rank-1 layer is cut.
+- **H3 carried to 1b-2, exactly:** the action worker calls `lock_job_for_claim()` then
+  `claim_skip_trace_rows()`; no direct queue inserts, never a 'submitting'/'submitted' row; a
+  two-session integration test proves the action path cannot create an in-flight row while
+  `_CLAIM_LOCK_KEY` is held.
+
+### ii-c TO BUILD
+- [ ] ii-c-1: migration 103 + models + env.py + tests; replay; merge; VERIFY THE INDEX IN PROD
+- [ ] ii-c-2: keyset allocate + frontier + in-flight cache + tests; gate at 117k/15k and 15k accounts
+- [ ] Codex diff review each to GO; quiet check before each merge
+
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever
       the tab has leads that have never been looked up; when the quote comes back with

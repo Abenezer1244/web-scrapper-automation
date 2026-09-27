@@ -22,6 +22,7 @@ from src.api.billing_entitlement import (
 )
 from src.api.deps import get_rls_db
 from src.api.middleware import client_ip, rate_limit
+from src.api.schemas import RunEligibilityResponse, UsageResponse
 from src.config import frontend_routes, settings
 from src.config.constants import (
     ALL_RECORD_TYPES,
@@ -650,7 +651,65 @@ async def pricing_page() -> dict:
 
 # ─── Usage ────────────────────────────────────────────────────────────────────
 
-@router.get("/usage")
+def usage_view(user: User, now: datetime) -> dict:
+    """What ``/billing/usage`` reports for ``user`` at ``now``.
+
+    ONE clock: every helper is handed the same ``now``, so a request that
+    straddles a window boundary cannot report the old window's reset date next
+    to the new window's usage.
+
+    The plan and limit are the ones the gate and the next charge act on. When
+    the window has ended and the lazy rollover has not run yet, that rollover
+    will apply a pending downgrade — so this mirrors the rollover statement
+    (``quota_window.py``, the ``plan = CASE WHEN rolling AND pending_plan IS
+    NOT NULL`` assignment) exactly: the pending plan becomes the plan, and the
+    pending pair is cleared.
+    """
+    from src.api.quota import (
+        effective_records_limit,
+        effective_records_used,
+        effective_window,
+        is_frozen,
+        next_quota_reset,
+        run_eligibility,
+    )
+    from src.api.quota_window import as_utc, should_roll
+
+    rolling = should_roll(user, now)
+    limit = effective_records_limit(user, now)
+    used = effective_records_used(user, now)
+    period_start, _period_end = effective_window(user, now)
+    ends_at = user.entitlement_ends_at
+    return {
+        "plan": (
+            user.pending_plan
+            if rolling and user.pending_plan is not None
+            else user.plan
+        ),
+        "records_used": used,
+        "records_limit": limit,
+        "records_remaining": max(0, limit - used) if limit != -1 else None,
+        "percent_used": round((used / limit) * 100, 1) if limit and limit != -1 else 0,
+        "period_start": as_utc(period_start),
+        # The window END is the reset instant: the boundary belongs to the NEW
+        # window. None when paid access stops at or before it (cancel at period
+        # end): that boundary ends the subscription, it does not reset it.
+        "next_reset_at": next_quota_reset(user, now),
+        "period_basis": "entitlement_month_utc",
+        # A pending downgrade is visible but NOT yet applied — the customer keeps
+        # the cap they paid for until the boundary above. Once that boundary has
+        # passed it is no longer pending: see above.
+        "pending_plan": None if rolling else user.pending_plan,
+        "pending_records_limit": None if rolling else user.pending_records_limit,
+        "payment_state": "frozen" if is_frozen(user, now) else "ok",
+        "entitlement_ends_at": as_utc(ends_at) if ends_at else None,
+        "run_eligibility": RunEligibilityResponse.model_validate(
+            run_eligibility(user, now)
+        ),
+    }
+
+
+@router.get("/usage", response_model=UsageResponse)
 async def get_usage(request: Request, current_user: CurrentUser) -> dict:
     """Return current plan, record usage, limit, and the ENTITLEMENT WINDOW.
 
@@ -671,35 +730,13 @@ async def get_usage(request: Request, current_user: CurrentUser) -> dict:
     ``payment_state`` is reported separately from usage on purpose: a customer
     frozen for a failed payment is not "over their limit", and sending them to
     the upgrade page would not fix anything.
+
+    ``run_eligibility`` is the same answer every enqueue gate gives
+    (``src.api.quota.run_eligibility``), so the page never has to re-derive it
+    from the fields above.
     """
     await rate_limit(request, zone="general", identifier=current_user.id)
-    from src.api.quota import effective_records_used, effective_window, is_frozen
-
-    limit = current_user.records_limit
-    used = effective_records_used(current_user)
-    period_start, period_end = effective_window(current_user)
-    frozen = is_frozen(current_user)
-    return {
-        "plan": current_user.plan,
-        "records_used": used,
-        "records_limit": limit,
-        "records_remaining": max(0, limit - used) if limit != -1 else None,
-        "percent_used": round((used / limit) * 100, 1) if limit and limit != -1 else 0,
-        "period_start": period_start.isoformat(),
-        # The window END is the reset instant: the boundary belongs to the NEW
-        # window, so "resets at" and "current window ends" are the same moment.
-        "next_reset_at": period_end.isoformat(),
-        "period_basis": "entitlement_month_utc",
-        # A pending downgrade is visible but NOT yet applied — the customer keeps
-        # the cap they paid for until the boundary above.
-        "pending_plan": current_user.pending_plan,
-        "pending_records_limit": current_user.pending_records_limit,
-        "payment_state": "frozen" if frozen else "ok",
-        "entitlement_ends_at": (
-            current_user.entitlement_ends_at.isoformat()
-            if current_user.entitlement_ends_at else None
-        ),
-    }
+    return usage_view(current_user, datetime.now(UTC))
 
 
 # ─── Subscription status ──────────────────────────────────────────────────────

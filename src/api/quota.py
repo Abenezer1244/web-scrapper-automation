@@ -36,19 +36,36 @@ wrong remedy.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Literal
 
 from src.api.quota_window import as_utc, effective_window, is_frozen, should_roll
 
 __all__ = [
+    "RunEligibility",
     "current_period_start",
     "effective_records_limit",
     "effective_records_used",
     "effective_window",
     "is_frozen",
     "is_over_record_limit",
+    "next_quota_reset",
     "quota_block_reason",
+    "run_eligibility",
 ]
+
+# The prose every enqueue gate returns in its 402. Callers and the frontend
+# show it verbatim, so it changes only on purpose.
+FROZEN_MESSAGE = (
+    "Your subscription payment could not be completed, so new scrapes are "
+    "paused. Update your payment method to resume. Your data and past exports "
+    "are untouched."
+)
+ENDED_MESSAGE = (
+    "Your subscription has ended, so new scrapes are paused. Resubscribe to "
+    "continue. Your data and past exports are untouched."
+)
 
 
 def current_period_start(now: datetime | None = None) -> datetime:
@@ -127,19 +144,60 @@ def is_over_record_limit(user, now: datetime | None = None) -> bool:
     return effective_records_used(user, now) >= limit
 
 
-def quota_block_reason(user, now: datetime | None = None) -> str | None:
-    """Why this user may not start new billable work, or None if they may.
+def next_quota_reset(user, now: datetime | None = None) -> datetime | None:
+    """When this user's record quota next resets, or None if it will not.
 
-    Returns a caller-facing sentence, and distinguishes the two reasons on
-    purpose. "Over your limit" tells a delinquent subscriber to upgrade, which
-    does not fix a failed payment; "payment required" tells them the truth.
+    Normally the end of the effective window: the boundary instant belongs to
+    the NEW window. But when paid access stops at or before that end
+    (``entitlement_ends_at``, a cancel-at-period-end), the window does not
+    advance there — ``should_roll`` refuses, there is no entitlement left to
+    open a new window against — and the account becomes ``ended`` instead.
+    Reporting the window end as a reset date would promise a quota that never
+    comes back.
+
+    A FROZEN account gets None for the same reason: its window does not
+    advance while payment has failed, so the stored end may already be in the
+    past and no reset will happen until the customer pays. (Codex)
     """
     if is_frozen(user, now):
-        return (
-            "Your subscription payment could not be completed, so new scrapes "
-            "are paused. Update your payment method to resume. Your data and "
-            "past exports are untouched."
-        )
+        return None
+    _, end = effective_window(user, now)
+    end = as_utc(end)
+    ends_at = getattr(user, "entitlement_ends_at", None)
+    if ends_at is not None and as_utc(ends_at) <= end:
+        return None
+    return end
+
+
+@dataclass(frozen=True)
+class RunEligibility:
+    """Whether an account may start billable work, and if not, why.
+
+    ``resumes_at`` is set only when the block lifts by itself at a known
+    instant — an ``over_limit`` account whose quota will reset. ``frozen`` and
+    ``ended`` need the customer to act, so they never carry one.
+    """
+
+    can_run: bool
+    code: Literal["frozen", "ended", "over_limit"] | None = None
+    message: str | None = None
+    resumes_at: datetime | None = None
+
+
+def run_eligibility(user, now: datetime | None = None) -> RunEligibility:
+    """The account-level rule for starting billable work — the ONE statement of it.
+
+    Every enqueue gate (through ``quota_block_reason``) and ``/billing/usage``
+    read this, so the page cannot disagree with the gate. The order matters:
+    a frozen account is told "payment required" even when it is also over its
+    limit, because "upgrade" does not fix a failed payment.
+
+    ``now`` is read once and handed to every helper, so a call that straddles a
+    window boundary cannot mix the old window's usage with the new one's limit.
+    """
+    now = as_utc(now or datetime.now(UTC))
+    if is_frozen(user, now):
+        return RunEligibility(False, "frozen", FROZEN_MESSAGE)
     # Paid access that has ALREADY ENDED. The window stops advancing at
     # entitlement_ends_at, but the counter it leaves behind may still have room,
     # so without this check a cancelled customer could keep spending their final
@@ -149,22 +207,40 @@ def quota_block_reason(user, now: datetime | None = None) -> str | None:
     # inside that gap — and it is the gap that a lost webhook makes unbounded.
     # (Codex)
     ends_at = getattr(user, "entitlement_ends_at", None)
-    if ends_at is not None and as_utc(now or datetime.now(UTC)) >= as_utc(ends_at):
-        return (
-            "Your subscription has ended, so new scrapes are paused. Resubscribe "
-            "to continue. Your data and past exports are untouched."
-        )
+    if ends_at is not None and now >= as_utc(ends_at):
+        return RunEligibility(False, "ended", ENDED_MESSAGE)
     if is_over_record_limit(user, now):
-        _, end = effective_window(user, now)
-        # ISO date, not a locale-formatted one: %-d is not portable off glibc
+        reset = next_quota_reset(user, now)
+        # ISO dates, not locale-formatted ones: %-d is not portable off glibc
         # and this string is read by the API, the worker logs and the frontend
-        # alike. The window END is the reset moment — the boundary instant
-        # belongs to the NEW window.
-        return (
+        # alike.
+        usage = (
             f"Record limit reached "
             f"({effective_records_used(user, now)}/"
             f"{effective_records_limit(user, now)}). "
-            f"Your quota resets {as_utc(end).date().isoformat()} (UTC). "
-            "Upgrade your plan to continue now."
         )
-    return None
+        if reset is None:
+            # The term ends at or before the window would have reset, so there
+            # is no reset to wait for.
+            message = (
+                f"{usage}Your subscription ends "
+                f"{as_utc(ends_at).date().isoformat()} (UTC), so this quota will "
+                "not reset. Renew or upgrade your plan to continue."
+            )
+        else:
+            message = (
+                f"{usage}Your quota resets {reset.date().isoformat()} (UTC). "
+                "Upgrade your plan to continue now."
+            )
+        return RunEligibility(False, "over_limit", message, reset)
+    return RunEligibility(True)
+
+
+def quota_block_reason(user, now: datetime | None = None) -> str | None:
+    """Why this user may not start new billable work, or None if they may.
+
+    A thin reading of ``run_eligibility`` for the enqueue gates, which only
+    need the caller-facing sentence.
+    """
+    eligibility = run_eligibility(user, now)
+    return None if eligibility.can_run else eligibility.message

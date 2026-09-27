@@ -2096,6 +2096,63 @@ class ReadAllResponse(BaseModel):
     updated: int
 
 
+# ─── Billing usage / run eligibility ──────────────────────────────────────────
+
+class RunEligibilityResponse(BaseModel):
+    """Whether the account may start billable work (``src.api.quota.run_eligibility``).
+
+    Account-level codes only. ``resumes_at`` is set only for an ``over_limit``
+    account whose quota will reset by itself; ``frozen`` and ``ended`` need
+    the customer to act, so they never carry one.
+    """
+
+    can_run: bool
+    code: Literal["frozen", "ended", "over_limit"] | None = None
+    message: str | None = None
+    resumes_at: datetime | None = None
+    model_config = {"from_attributes": True}
+
+    @model_validator(mode="after")
+    def _consistent(self) -> "RunEligibilityResponse":
+        if self.can_run:
+            if self.code is not None or self.message is not None or self.resumes_at is not None:
+                raise ValueError("an eligible account carries no code, message or resumes_at")
+        else:
+            if self.code is None or not self.message:
+                raise ValueError("a refusal carries a code and a message")
+            if self.resumes_at is not None and self.code != "over_limit":
+                raise ValueError("only over_limit resumes by itself")
+        return self
+
+
+class UsageResponse(BaseModel):
+    """``GET /billing/usage``: record quota over the EFFECTIVE entitlement window.
+
+    Every field is what the gate and the next charge will act on, not the
+    stored columns a lazy rollover has not caught up with yet.
+    """
+
+    plan: str
+    records_used: int
+    # The limit the gate enforces. -1 = unlimited.
+    records_limit: int
+    # None when unlimited.
+    records_remaining: int | None
+    percent_used: float
+    period_start: datetime
+    # When the quota resets. None when paid access ends at or before the
+    # window end: that boundary ends the subscription, it does not reset it.
+    next_reset_at: datetime | None
+    period_basis: Literal["entitlement_month_utc"]
+    # A downgrade that takes effect at next_reset_at; the customer keeps the
+    # plan they paid for until then.
+    pending_plan: str | None
+    pending_records_limit: int | None
+    payment_state: Literal["ok", "frozen"]
+    entitlement_ends_at: datetime | None
+    run_eligibility: RunEligibilityResponse
+
+
 # ─── Analytics (Phase 3) ──────────────────────────────────────────────────────
 
 class TrendPoint(BaseModel):

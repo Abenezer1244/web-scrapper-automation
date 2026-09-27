@@ -714,7 +714,9 @@ async def test_a_mixed_job_batch_is_refused(db, business_user: User):
     """One job per claim: a single job lock is meaningless over a mixed batch."""
     cfg = await _config(db, business_user)
     job_a = await _job(db, business_user, cfg)
-    job_b = await _job(db, business_user, cfg)
+    # Its own scraper: two ACTIVE runs of one scraper are impossible since
+    # migration 104, and the claim rules under test are per job, not per scraper.
+    job_b = await _job(db, business_user, await _config(db, business_user))
     a = await _row(db, job_a, business_user.id, address="1 A ST")
     b = await _row(db, job_b, business_user.id, address="2 B ST")
 
@@ -735,7 +737,9 @@ async def test_a_payload_naming_the_wrong_job_claims_nothing(
     """
     cfg = await _config(db, business_user)
     job_a = await _job(db, business_user, cfg)
-    job_b = await _job(db, business_user, cfg)
+    # Its own scraper: two ACTIVE runs of one scraper are impossible since
+    # migration 104, and the claim rules under test are per job, not per scraper.
+    job_b = await _job(db, business_user, await _config(db, business_user))
     rid = await _row(db, job_a, business_user.id)
     wrong_job = dict(await _payload(db, rid), job_id=job_b)
 

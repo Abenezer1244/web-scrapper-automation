@@ -47,7 +47,9 @@ def _scheduled_dispatch_blocker_exists(db, config_id: str, now: datetime) -> boo
         .where(
             Job.scraper_config_id == config_id,
             or_(
-                Job.status.in_(ACTIVE_STATUSES),
+                # Active, or cancelled mid-run moments ago: the same run-slot rule
+                # POST /jobs and the batch fan-out apply (UX audit F-003).
+                Job.holds_run_slot(now),
                 and_(Job.trigger == "scheduled", Job.created_at >= cutoff),
             ),
         )
@@ -205,10 +207,30 @@ def _dispatch_due_jobs(db, now: datetime) -> list[str]:
                 config.name, job_id, occurrence.isoformat(),
             )
         else:
-            _logger.debug(
-                "Skipping %s — occurrence %s already dispatched (unique key)",
-                config.name, occurrence.isoformat(),
-            )
+            # ON CONFLICT DO NOTHING has no target, so two unique keys can land
+            # here: this occurrence already dispatched, or (migration 104) a run
+            # of this config already active. Say which, so the logs don't read an
+            # overlapping run as a duplicate occurrence.
+            from sqlalchemy import select as _select
+
+            from src.db.models import Job as _Job
+
+            active = db.execute(
+                _select(_Job.id).where(
+                    _Job.scraper_config_id == config.id,
+                    _Job.status.in_(ACTIVE_STATUSES),
+                ).limit(1)
+            ).scalar()
+            if active is not None:
+                _logger.info(
+                    "Skipping %s occurrence %s: a run is already active (job_id=%s)",
+                    config.name, occurrence.isoformat(), active,
+                )
+            else:
+                _logger.debug(
+                    "Skipping %s — occurrence %s already dispatched (unique key)",
+                    config.name, occurrence.isoformat(),
+                )
 
     if created or skipped_limit:
         _logger.info(

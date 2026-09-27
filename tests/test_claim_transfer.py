@@ -81,6 +81,20 @@ async def _found_again(db, user, config, dedup_hash, source_job, **kw) -> tuple[
     return job_id, rid
 
 
+async def _second_config(db, user: User, like: ScraperConfig) -> ScraperConfig:
+    """Another scraper of the same account, same county and record type. Two
+    ACTIVE runs of ONE scraper are impossible since migration 104, but claims are
+    account-wide, so two active runs of two scrapers can still meet over a lead."""
+    cfg = ScraperConfig(
+        id=str(uuid.uuid4()), user_id=user.id, name="second scraper",
+        county=like.county, state=like.state, record_type=like.record_type,
+        fields=[], enrichment=[], schedule={}, deliver={},
+    )
+    db.add(cfg)
+    await db.commit()
+    return cfg
+
+
 async def _transfer(db, job_id, user_id, record_type=None) -> int:
     n = await db.run_sync(lambda s: transfer_undelivered_claims(s, job_id, user_id, record_type))
     await db.commit()
@@ -316,7 +330,8 @@ async def test_a_run_still_in_flight_is_never_robbed(
     """Its row may still get an address from its own enrichment."""
     h, old_job, _, _ = await _setup_undelivered(
         db, starter_user, scraper_config, status="enriching", billed_at=None)
-    new_job, row = await _found_again(db, starter_user, scraper_config, h, old_job)
+    other = await _second_config(db, starter_user, scraper_config)
+    new_job, row = await _found_again(db, starter_user, other, h, old_job)
 
     assert await _transfer(db, new_job, starter_user.id) == 0
     assert (await _fresh(db, Result, row)).is_duplicate is True
@@ -522,7 +537,8 @@ async def test_two_runs_racing_for_one_claim_deliver_it_once(
     one row ships."""
     h, old_job, _, claim = await _setup_undelivered(db, starter_user, scraper_config)
     job_a, row_a = await _found_again(db, starter_user, scraper_config, h, old_job)
-    job_b, row_b = await _found_again(db, starter_user, scraper_config, h, old_job)
+    other = await _second_config(db, starter_user, scraper_config)
+    job_b, row_b = await _found_again(db, starter_user, other, h, old_job)
 
     barrier = threading.Barrier(2)
     results: dict[str, int] = {}

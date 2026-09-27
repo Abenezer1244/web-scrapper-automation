@@ -9,6 +9,7 @@ import redis.exceptions as _redis_exceptions
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import false, func, or_, select, text, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api import sse_leases
@@ -25,6 +26,7 @@ from src.api.results_category import (
     category_condition,
 )
 from src.api.results_sort import DEFAULT_RESULTS_SORT, ResultsSort, results_order_by
+from src.api.routes.auth_helpers.registration import _integrity_error_fields
 from src.api.schemas import (
     AlreadyDeliveredContacts,
     AuctionCoverage,
@@ -164,6 +166,44 @@ async def list_jobs(
     return responses
 
 
+# ─── One active run per scraper (UX audit F-003, migration 104) ──────────────
+# The partial unique index is the authority; the pre-check below only turns the
+# common case into a clear 409 before any other work.
+ONE_ACTIVE_JOB_INDEX = "uq_jobs_one_active_per_config"
+
+
+def _run_in_flight_http(job_id: str | None, *, stopping: bool) -> HTTPException:
+    message = (
+        "This scraper is still stopping. Try again in a few minutes."
+        if stopping
+        else "This scraper is already running."
+    )
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={"code": "run_in_flight", "job_id": job_id, "message": message},
+    )
+
+
+async def _run_in_flight(db: AsyncSession, user_id, config_id) -> tuple[str, bool] | None:
+    """The job holding this config's run slot, as (job_id, still_stopping), or None.
+    Owner-scoped, so the id returned is always the caller's own job."""
+    from datetime import UTC, datetime
+
+    row = (await db.execute(
+        select(Job.id, Job.status)
+        .where(
+            Job.scraper_config_id == config_id,
+            Job.user_id == user_id,
+            Job.holds_run_slot(datetime.now(UTC)),
+        )
+        .order_by(Job.created_at.desc())
+        .limit(1)
+    )).first()
+    if row is None:
+        return None
+    return str(row.id), row.status == "cancelled"
+
+
 async def enqueue_scrape_job(
     db: AsyncSession,
     current_user,
@@ -178,7 +218,14 @@ async def enqueue_scrape_job(
 
     The caller owns config lookup/creation; this helper never re-checks
     `config.active`.
+
+    One run per scraper: a config with an active job, or one cancelled mid-run
+    moments ago, gets 409 run_in_flight (see _run_in_flight).
     """
+    in_flight = await _run_in_flight(db, current_user.id, config.id)
+    if in_flight is not None:
+        raise _run_in_flight_http(in_flight[0], stopping=in_flight[1])
+
     # Execution-time entitlement guard (audit-mode until ENTITLEMENT_ENFORCEMENT).
     # An existing config can outlive a downgrade; re-validate against CURRENT plan.
     from datetime import UTC, datetime
@@ -280,8 +327,30 @@ async def enqueue_scrape_job(
         status="pending",
         trigger=trigger,
     )
+    # Plain values, read BEFORE the flush: a rollback below expires every ORM
+    # object in the session, and reading an expired attribute lazy-loads, which an
+    # async session cannot do (MissingGreenlet, a 500 instead of the 409).
+    user_id, config_id = current_user.id, config.id
     db.add(job)
-    await db.flush()
+    try:
+        await db.flush()
+    except IntegrityError as exc:
+        # Only the one-active-run index means "already running"; any other
+        # violation is a real error and must not be dressed up as a 409.
+        fields = _integrity_error_fields(exc)
+        if fields.get("sqlstate") != "23505" or ONE_ACTIVE_JOB_INDEX not in (
+            fields.get("constraint_name") or ""
+        ):
+            raise
+        # A concurrent request won the race between our pre-check and insert.
+        # Roll back first (the session is unusable until then; the RLS GUC is
+        # re-applied on the next transaction), then name the winner. It may
+        # already have finished, so the id can be None.
+        await db.rollback()
+        winner = await _run_in_flight(db, user_id, config_id)
+        raise _run_in_flight_http(
+            winner[0] if winner else None, stopping=bool(winner and winner[1])
+        ) from None
     # Commit BEFORE enqueuing so the row is durably 'pending' when the worker
     # consumes the message. The worker claims the job with an atomic CAS
     # (UPDATE ... WHERE status='pending'); if we enqueued first and a worker

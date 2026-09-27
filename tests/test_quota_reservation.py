@@ -210,9 +210,10 @@ def test_two_concurrent_jobs_cannot_both_take_the_same_remaining_quota():
     """
     with SyncSessionLocal() as db:
         user = _mk_user(db, used=900, limit=1000)      # 100 remaining
-        config = _mk_config(db, user.id)
-        job_a = _mk_job(db, user.id, config.id)
-        job_b = _mk_job(db, user.id, config.id)
+        # One active run per scraper (migration 104): the quota is per ACCOUNT, so
+        # concurrent jobs get their own scrapers, as they would in production.
+        job_a = _mk_job(db, user.id, _mk_config(db, user.id).id)
+        job_b = _mk_job(db, user.id, _mk_config(db, user.id).id)
         user_id, a_id, b_id = user.id, job_a.id, job_b.id
         db.commit()
 
@@ -233,8 +234,9 @@ def test_a_multi_county_batch_fanout_cannot_exceed_the_plan():
     """Five children each wanting 300 against a 1,000 cap must total 1,000."""
     with SyncSessionLocal() as db:
         user = _mk_user(db, used=0, limit=1000)
-        config = _mk_config(db, user.id)
-        job_ids = [_mk_job(db, user.id, config.id).id for _ in range(5)]
+        # One active run per scraper (migration 104): the quota is per ACCOUNT, so
+        # concurrent jobs get their own scrapers, as they would in production.
+        job_ids = [_mk_job(db, user.id, _mk_config(db, user.id).id).id for _ in range(5)]
         user_id = user.id
         db.commit()
 
@@ -513,8 +515,9 @@ def test_TRULY_concurrent_reservations_serialise_on_the_user_row():
 
     with SyncSessionLocal() as db:
         user = _mk_user(db, used=900, limit=1000)      # 100 remaining
-        config = _mk_config(db, user.id)
-        job_ids = [_mk_job(db, user.id, config.id).id for _ in range(2)]
+        # One active run per scraper (migration 104): the quota is per ACCOUNT, so
+        # concurrent jobs get their own scrapers, as they would in production.
+        job_ids = [_mk_job(db, user.id, _mk_config(db, user.id).id).id for _ in range(2)]
         user_id = user.id
         db.commit()
 
@@ -877,9 +880,10 @@ def test_two_workers_rolling_the_same_user_cannot_double_reset():
             db, used=900, limit=1000,
             period=boundary - timedelta(days=30), window_end=boundary,
         )
-        config = _mk_config(db, user.id)
-        job_a = _mk_job(db, user.id, config.id)
-        job_b = _mk_job(db, user.id, config.id)
+        # One active run per scraper (migration 104): the quota is per ACCOUNT, so
+        # concurrent jobs get their own scrapers, as they would in production.
+        job_a = _mk_job(db, user.id, _mk_config(db, user.id).id)
+        job_b = _mk_job(db, user.id, _mk_config(db, user.id).id)
         user_id, a_id, b_id = user.id, job_a.id, job_b.id
         db.commit()
 

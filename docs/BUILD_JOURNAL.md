@@ -23,7 +23,8 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 > Evidence-based UX audit of the authenticated product (2026-09-25 and 09-26, two sessions).
 > FE worktree `C:/Users/Windows/bl-wt/fe-ux-audit`, branch `ux/evidence-audit-2026-09-25`,
-> FE PR **#162** (open, CI green, NOT merged). Audit: `docs/ux-audit/UX-AUDIT.md` in the FE repo.
+> FE PR **#162** merged 2026-09-27 03:14Z (`e42d5d0`, Vercel SUCCESS). F-043 fix BE **#363** merged
+> 03:20Z (`e5b82187`, api/worker/beat SUCCESS, worker booted clean). Audit: `docs/ux-audit/UX-AUDIT.md` in the FE repo.
 
 **Built / Shipped:**
 - The audit: 149 settled, logged-in captures at 8 viewports (1440 to 320), 49 findings with
@@ -80,16 +81,22 @@ to understand *why* the code is the way it is and *what's been attempted before*
   (`child_count` null) did not apply: `int` in `schemas.py`.
 
 **Pending / Handoff:**
-- **F-043 (P1, backend), first in line:** batch fan-out selects children without an `active`
-  filter, so a soft-deleted batch scraper keeps being scraped and billed on every scheduled
-  run (`src/workers/batch_tasks.py:146-156`).
+- **F-043 (P1, backend): SHIPPED in #363.** The fan-out skipped no deleted children, so a
+  soft-deleted batch scraper was scraped and billed on every run. Also fixed: a scraper deleted
+  while downgrade-paused was revived by the next upgrade (delete now clears `paused_reason`), and
+  `run_scrape_job` now skips any job whose scraper is deleted or paused (the Codex P1 race).
+  `SELECT ... FOR UPDATE` was rejected: under RLS it returns only rows passing the UPDATE policy,
+  which the repo does not define for the worker role. Plan and review log:
+  `tasks/todo-f043-batch-inactive-children.md`. Open: zero-child runs still read "done" (Phase 2
+  status model); prod rows deleted while paused are still unidentified, but no longer run.
 - F-042 and F-041: every API call waits on a separate `/api/auth/session` request (4.6 s median
   vs 0.67 s for the call itself), and a hard navigation during those can leave a permanent
   spinner.
 - Phase 3.0 contracts before batch B (F-001 run counts, F-006 delivered breakdown, F-009 contact
   failures), then batches B to E including F-045 to F-050; Phase 4 re-test (failure, retry and
   stalled Live Run states were not exercised); `/design-review` and Codex's independent review.
-- FE #162 awaits owner review and merge (merge = production deploy).
+- Merging FE #162 hit the API-types drift gate: backend #360 had changed the schema, so every
+  FE PR (and master) would fail. Fixed in FE #163 (regenerated types only), then #162 merged.
 
 **Facts learned:**
 - An animated counter renders a digit strip, so text scraping read Records "0" and "9%" where

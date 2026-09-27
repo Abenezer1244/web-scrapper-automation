@@ -1,6 +1,7 @@
 """How much Tracerfy spend the dispatcher may still claim, and whose rows claim it.
 
-Phase 1b-1b-ii-b. The unit is the Tracerfy CREDIT: a normal lookup costs 1, an
+Phase 1b-1b-ii-b (the caps), ii-c (the keyset walk that finds the rows: see "The
+keyset frontier" below). The unit is the Tracerfy CREDIT: a normal lookup costs 1, an
 advanced one 2 (`CREDITS_PER_ROW`). Two caps, both over a rolling 24h window of
 `pending_skip_trace_rows.submitted_at`:
 
@@ -28,6 +29,7 @@ from datetime import datetime
 from typing import NamedTuple
 
 from sqlalchemy import (
+    TIMESTAMP,
     Integer,
     String,
     any_,
@@ -35,8 +37,9 @@ from sqlalchemy import (
     case,
     cast,
     func,
-    literal,
     select,
+    text,
+    true,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, UUID
 
@@ -133,60 +136,200 @@ def batch_rows(global_cap: int, global_spent: int, cost: int) -> int:
     return BATCH_ROW_LIMIT if allowed is None else min(BATCH_ROW_LIMIT, allowed)
 
 
+# ── The keyset frontier (Phase 1b-1b-ii-c) ────────────────────────────────────
+#
+# ii-b re-ranked every eligible row on every round. Now each account keeps a
+# FRONTIER, the (enqueued_at, id) of the last row a round returned for it, and the
+# next round walks that account's rows strictly after it, over migration 103's
+# index. Frontiers are PASS-LOCAL and never persisted: every pass starts every
+# account at the beginning, so a row that became eligible behind a frontier goes
+# out on the next pass (Codex ii-c consult H1).
+
+# The frontier every account starts from: before any real (enqueued_at, id). Typed
+# in SQL and never NULL, so the tuple comparison is always defined (F1).
+FRONTIER_START = ("-infinity", "00000000-0000-0000-0000-000000000000")
+
+
+class Candidate(NamedTuple):
+    id: str
+    user_id: str
+    enqueued_at: datetime
+
+
+def discover_accounts(db, trace_type: str, watermark: datetime) -> list[str]:
+    """Every account with a queued row of this type enqueued by `watermark`.
+
+    A loose index scan over ix_pending_skip_trace_queued_frontier (103): one
+    index probe per account, not a walk of every queued row (Codex ii-c consult
+    round 2 supplied this query). Eligibility beyond 'queued' is decided per row
+    by the candidate walk, so an account listed here may yet yield nothing."""
+    return [str(u) for u in db.execute(text("""
+        WITH RECURSIVE active_users(user_id) AS (
+            (
+                SELECT p.user_id
+                FROM public.pending_skip_trace_rows AS p
+                WHERE p.status = 'queued' AND p.trace_type = :trace_type
+                  AND p.enqueued_at <= :watermark
+                ORDER BY p.user_id
+                LIMIT 1
+            )
+            UNION ALL
+            SELECT nxt.user_id
+            FROM active_users AS u
+            CROSS JOIN LATERAL (
+                SELECT p.user_id
+                FROM public.pending_skip_trace_rows AS p
+                WHERE p.status = 'queued' AND p.trace_type = :trace_type
+                  AND p.user_id > u.user_id
+                  AND p.enqueued_at <= :watermark
+                ORDER BY p.user_id
+                LIMIT 1
+            ) AS nxt
+        )
+        SELECT user_id FROM active_users
+    """), {"trace_type": trace_type, "watermark": watermark}).scalars()]
+
+
+def round_limits(
+    active: list[str],
+    *,
+    room_left: dict[str, int] | None,
+    default_rows: int | None,
+    global_left: int,
+    round_no: int,
+) -> tuple[dict[str, int], int]:
+    """Per-account candidate limits for round `round_no`, and the round's limit.
+
+    round_limit = min(BATCH_ROW_LIMIT, global_left * 2**r) bounds what a round
+    RETURNS (and keeps the room * 4095 cutoff: at room 1 a pass inspects up to
+    1 + 2 + ... + 2**11 rows). Each account with room gets
+    min(room_left * 2**r, ceil(global_left / accounts_with_room) * 2**r,
+    round_limit), so a round's WORK stays O((accounts + global_left) * 2**r)
+    whatever the tenant count (Codex ii-c consult H2). Accounts without room are
+    left out; `room_left=None` means the account cap is off."""
+    grow = 2 ** round_no
+    round_limit = min(BATCH_ROW_LIMIT, global_left * grow)
+
+    def room(u: str) -> int | None:
+        if room_left is None:
+            return None
+        return room_left.get(u, default_rows)
+
+    with_room = [u for u in active if room(u) is None or room(u) > 0]
+    if not with_room or round_limit <= 0:
+        return {}, round_limit
+    share = -(-global_left // len(with_room))  # ceil
+    limits = {}
+    for u in with_room:
+        lim = min(share * grow, round_limit)
+        r = room(u)
+        if r is not None:
+            lim = min(lim, r * grow)
+        limits[u] = lim
+    return limits, round_limit
+
+
 def allocate(
     db,
-    eligible,
+    candidates_for,
     *,
-    account_rows: dict[str, int],
-    default_rows: int | None,
-    lookahead: int,
-    limit: int,
-) -> list[str]:
-    """Ids of the next candidates, fairly ordered. NO locks are taken here.
+    frontier: dict[str, tuple[str, str]],
+    limits: dict[str, int],
+    round_limit: int,
+    watermark: datetime,
+) -> list[Candidate]:
+    """The next candidates enqueued by `watermark`, fairly ordered. NO locks are
+    taken here.
 
-    `eligible` is a subquery with columns (id, user_id, enqueued_at), already
-    carrying every eligibility predicate, the pass watermark, and the exclusion
-    of ids already considered this pass, so row_number() ranks what is LEFT.
+    For each account in `limits`, `candidates_for(acct)` must return a LATERAL
+    subquery of that account's eligible rows strictly after its frontier
+    (`(enqueued_at, id) > (acct.after_at, acct.after_id)`), ordered by
+    (enqueued_at, id), limited to `acct.lim`, with columns (id, user_id,
+    enqueued_at), NO window function (ranking is done here, after the walk) and
+    NO bound on enqueued_at (the watermark is applied here, after the walk; see
+    below). The accounts reach SQL as four array parameters: a fixed statement
+    shape at any tenant count, though psycopg2 still writes each list out element
+    by element, so the text sent and the planning grow with the accounts (measured
+    at 15,000 accounts, 2026-09-27: round 0 296-372 ms, 121 ms of it planning;
+    the tenant-scale bound is 500 ms, Codex ii-c-2 consult). Order: rank, then
+    age; at most `round_limit` rows.
 
-    Per account, up to `rooms * lookahead` rows are allocated, where an account's
-    room is `account_rows[user]`, or `default_rows` for an account with no spend
-    and nothing taken yet; `default_rows=None` means the account cap is off (no
-    per-account bound). Order: rank, then age. At most `limit` rows.
-    """
-    ranked_cols = [
-        eligible.c.id, eligible.c.user_id, eligible.c.enqueued_at,
-        func.row_number().over(
-            partition_by=eligible.c.user_id,
-            order_by=(eligible.c.enqueued_at, eligible.c.id),
-        ).label("rn"),
-    ]
-    source = eligible
-    if default_rows is None:
-        room = None
-    elif account_rows:
-        # Two array parameters zipped by unnest, not a VALUES list: the statement
-        # and its parameter count stay fixed however many accounts spent today
-        # (Codex ii-b review round 2).
-        users = list(account_rows)
-        rooms = [account_rows[u] for u in users]
-        acct = func.unnest(
-            cast(bindparam("room_users", users, type_=ARRAY(String)),
-                 ARRAY(UUID(as_uuid=False))),
-            cast(bindparam("room_rows", rooms, type_=ARRAY(Integer)),
-                 ARRAY(Integer)),
-        ).table_valued("user_id", "rows").render_derived(name="acct_room")
-        source = eligible.outerjoin(acct, acct.c.user_id == eligible.c.user_id)
-        room = func.coalesce(acct.c.rows, default_rows)
-    else:
-        room = literal(default_rows, Integer)
-    if room is not None:
-        ranked_cols.append((room * lookahead).label("room"))
-    ranked = select(*ranked_cols).select_from(source).subquery("ranked")
-    stmt = select(ranked.c.id)
-    if room is not None:
-        stmt = stmt.where(ranked.c.rn <= ranked.c.room)
-    stmt = stmt.order_by(ranked.c.rn, ranked.c.enqueued_at, ranked.c.id).limit(limit)
-    return [str(i) for i in db.execute(stmt).scalars()]
+    Rows after the watermark sort after every row before it, so dropping them
+    trims only a TAIL of each account's walk. Because rank 1 of every account
+    precedes rank 2 of any, the rows returned for an account are then a PREFIX of
+    its candidates, so the caller may advance its frontier to the last row
+    returned for it (F1)."""
+    if not limits:
+        return []
+    users = list(limits)
+    acct = func.unnest(
+        cast(bindparam("acct_users", users, type_=ARRAY(String)),
+             ARRAY(UUID(as_uuid=False))),
+        cast(bindparam("acct_after_at", [frontier[u][0] for u in users], type_=ARRAY(String)),
+             ARRAY(TIMESTAMP(timezone=True))),
+        cast(bindparam("acct_after_id", [frontier[u][1] for u in users], type_=ARRAY(String)),
+             ARRAY(UUID(as_uuid=False))),
+        cast(bindparam("acct_lim", [limits[u] for u in users], type_=ARRAY(Integer)),
+             ARRAY(Integer)),
+    ).table_valued("user_id", "after_at", "after_id", "lim").render_derived(name="acct")
+    cand = candidates_for(acct)
+    # Rank OUTSIDE the lateral, over what it returned: a window function inside it
+    # would force every matching row to be sorted before its LIMIT, and the planner
+    # then abandons the ordered walk of 103's index for a full bitmap scan
+    # (measured: 1.4 s a round at 117k queued, against milliseconds without it).
+    walked = (
+        select(
+            cand.c.id, cand.c.user_id, cand.c.enqueued_at,
+            func.row_number().over(
+                partition_by=cand.c.user_id,
+                order_by=(cand.c.enqueued_at, cand.c.id),
+            ).label("rk"),
+        )
+        .select_from(acct)
+        .join(cand, true())
+        # The watermark OUTSIDE the walk (Postgres does not push a filter into a
+        # subquery with a LIMIT). Inside it, `enqueued_at <= watermark` paired with
+        # the `enqueued_at >= after_at` the planner derives from the frontier
+        # compare into a range with one unknown end, which it prices at a flat
+        # 0.5% of the table: ~585 rows for what is really the whole queue. It then
+        # walked ix_pending_skip_trace_dispatch (status, trace_type, enqueued_at)
+        # and filtered out every other account's rows, 64,680 per account.
+        .where(cand.c.enqueued_at <= watermark)
+        .subquery("walked")
+    )
+    stmt = (
+        select(walked.c.id, walked.c.user_id, walked.c.enqueued_at)
+        .order_by(walked.c.rk, walked.c.enqueued_at, walked.c.id)
+        .limit(round_limit)
+    )
+    # Bitmap scans off for THIS statement only. The walk's frontier and LIMIT are
+    # per-account parameters, so the planner cannot see that each account walks
+    # thousands of rows: it guesses ~16 per account and prefers a bitmap that
+    # reads every queued row of the type for every account. Round 0 at 117k queued
+    # / 50 accounts (2026-09-27, the real statement, warm): watermark inside the
+    # walk 676 ms with bitmaps off, 1,020 ms with them on; watermark outside 286 ms
+    # with bitmaps on, and 1.2 ms with them off, the ordered walk of 103's index
+    # that stops at the LIMIT. SET LOCAL + RESET keeps it to this one statement, and
+    # the savepoint keeps it there on failure too: rolling back to it undoes the SET
+    # and leaves the transaction usable, so the walk's own error is the one raised
+    # (a RESET in an aborted transaction would fail and mask it: Codex ii-c-2 review).
+    with db.begin_nested():
+        db.execute(text("SET LOCAL enable_bitmapscan = off"))
+        got = db.execute(stmt).all()
+        db.execute(text("RESET enable_bitmapscan"))
+    return [Candidate(str(i), str(u), at) for i, u, at in got]
+
+
+def advance(frontier: dict[str, tuple[str, str]], got: list[Candidate]) -> dict[str, int]:
+    """Move each account's frontier to the last row returned for it (returned rows
+    are in rank order, so the last one per account is its furthest). Advances over
+    EVERY returned row, whatever later becomes of it (F1). Returns the count per
+    account."""
+    counts: dict[str, int] = {}
+    for c in got:
+        frontier[c.user_id] = (c.enqueued_at.isoformat(), c.id)
+        counts[c.user_id] = counts.get(c.user_id, 0) + 1
+    return counts
 
 
 def lock_allocated(db, ids: list[str], trace_type: str) -> list:
@@ -243,7 +386,8 @@ def take_within_caps(
 
 
 __all__ = [
-    "BATCH_ROW_LIMIT", "CREDITS_PER_ROW", "Caps", "allocate", "batch_rows",
-    "credits_for", "lock_allocated", "resolve_caps", "row_allowance",
+    "BATCH_ROW_LIMIT", "CREDITS_PER_ROW", "FRONTIER_START", "Candidate", "Caps",
+    "advance", "allocate", "batch_rows", "credits_for", "discover_accounts",
+    "lock_allocated", "resolve_caps", "round_limits", "row_allowance",
     "spent_credits", "take_within_caps",
 ]

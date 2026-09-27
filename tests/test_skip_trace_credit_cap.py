@@ -1,4 +1,5 @@
-"""The credit-weighted daily spend caps (Phase 1b-1b-ii-b).
+"""The credit-weighted daily spend caps (Phase 1b-1b-ii-b) and the keyset walk that
+fills them (ii-c).
 
 Every Tracerfy lookup costs the operator real money: a normal one 1 credit, an
 advanced one 2. Two caps over a rolling 24h window of `submitted_at`, one across
@@ -491,25 +492,155 @@ async def test_the_round_limit_claims_what_it_found_and_says_so(
     assert "rounds=2" in lines[0] and "survivors=1" in lines[0]
 
 
-async def test_the_considered_limit_bounds_the_statement_and_says_so(
-        make_account, dispatcher, monkeypatch, caplog):
+async def test_equal_timestamps_are_ordered_by_id_and_none_is_skipped(
+        make_account, dispatcher):
+    """F4: the frontier is (enqueued_at, id). Two rows sharing enqueued_at must both
+    be reachable: the held one first by id, then its twin in the next round."""
     u = await make_account()
     dispatcher(account_cap=1)
-    monkeypatch.setattr(skip_trace_dispatcher, "_REFILL_MAX_CONSIDERED", 3)
+    same = datetime.now(UTC) - timedelta(hours=2)
+    a = _seed(u, address="1 TIE ST", enqueued_at=same)
+    b = _seed(u, address="2 TIE ST", enqueued_at=same)
+    first, second = sorted([a, b])
+    held_address = "1 TIE ST" if first == a else "2 TIE ST"
+    _in_flight_twin_of(u, held_address)
+
+    dispatch_pending_skip_trace()
+
+    assert _claimed([a, b]) == {second}
+
+
+async def test_an_account_cut_by_the_rounds_limit_comes_back_next_round(
+        make_account, dispatcher):
+    """F4: rows the round's global LIMIT cuts are not returned, not passed, and the
+    account is NOT retired: it is served in the next round."""
+    accts = [await make_account() for _ in range(4)]
+    dispatcher(global_cap=3, account_cap=1)
     base = datetime.now(UTC) - timedelta(hours=2)
-    heads = []
-    for i in range(4):
-        _in_flight_twin_of(u, f"{i} CONSIDERED RD")
-        heads.append(_seed(u, address=f"{i} CONSIDERED RD", enqueued_at=base + timedelta(seconds=i)))
-    good = _seed(u, enqueued_at=base + timedelta(minutes=5))
+    _in_flight_twin_of(accts[0], "0 CUT ST")
+    held = _seed(accts[0], address="0 CUT ST", enqueued_at=base)  # its only row
+    b = _seed(accts[1], enqueued_at=base + timedelta(seconds=1))
+    c = _seed(accts[2], enqueued_at=base + timedelta(seconds=2))
+    d = _seed(accts[3], enqueued_at=base + timedelta(seconds=3))    # cut in round 0
 
-    import logging
-    with caplog.at_level(logging.WARNING):
+    dispatch_pending_skip_trace()
+
+    assert _claimed([held, b, c, d]) == {b, c, d}
+
+
+async def test_a_short_result_does_not_retire_an_account(make_account, dispatcher, monkeypatch):
+    """F3: under READ COMMITTED a row can become available mid-pass AHEAD of its
+    account's frontier. An account whose walk came back short keeps its turn; only
+    a walk that returns nothing retires it."""
+    u = await make_account()
+    dispatcher(account_cap=2)
+    base = datetime.now(UTC) - timedelta(hours=2)
+    _in_flight_twin_of(u, "4 SHORT RD")
+    held = _seed(u, address="4 SHORT RD", enqueued_at=base)  # round 0: 1 row of 2, held
+    real_allocate = skip_trace_dispatcher.allocate
+    late: list[str] = []
+
+    def allocate_then_commit_a_row(*a, **k):
+        out = real_allocate(*a, **k)
+        if not late:
+            # Enqueued before the pass began and after the frontier; committed now.
+            late.append(_seed(u, enqueued_at=base + timedelta(minutes=1)))
+        return out
+    monkeypatch.setattr(skip_trace_dispatcher, "allocate", allocate_then_commit_a_row)
+
+    dispatch_pending_skip_trace()
+
+    assert _claimed([held, *late]) == set(late)
+
+
+async def test_an_account_first_held_in_a_later_round_is_still_read_for_in_flight_twins(
+        make_account, dispatcher):
+    """F5: the pass's in-flight cache records which accounts it READ, apart from the
+    keys. An account whose rows first reach the hold in a later round (its head was
+    locked by another tick) must still be read, though other accounts' keys are
+    already cached, or its twin of an in-flight lookup is bought twice."""
+    x, y = await make_account(), await make_account()
+    dispatcher(account_cap=1)
+    base = datetime.now(UTC) - timedelta(hours=2)
+    _in_flight_twin_of(x, "8 X TWIN RD")
+    _seed(x, address="8 X TWIN RD", enqueued_at=base)            # round 0: x read and cached
+    y_head = _seed(y, enqueued_at=base)                            # locked by another tick
+    _in_flight_twin_of(y, "8 Y TWIN RD")
+    y_twin = _seed(y, address="8 Y TWIN RD", enqueued_at=base + timedelta(minutes=1))
+
+    with sync_engine.connect() as other_tick:
+        other_tick.execute(text(
+            "SELECT 1 FROM pending_skip_trace_rows WHERE id = :p FOR UPDATE"), {"p": y_head})
         dispatch_pending_skip_trace()
+        other_tick.rollback()
 
-    assert _claimed(heads + [good]) == set()
-    assert any("refill_truncated reason=considered_limit" in r.getMessage()
-               for r in caplog.records)
+    assert _claimed([y_head, y_twin]) == set()
+
+
+def test_round_limits_keep_the_documented_cutoff_at_any_headroom():
+    """H2: at room 1 a pass inspects 1 + 2 + ... + 2**11 = 4095 rows of a blocked
+    account, even with ONE row of global headroom left."""
+    total = 0
+    for r in range(12):
+        limits, round_limit = cap.round_limits(
+            ["u"], room_left={"u": 1}, default_rows=1, global_left=1, round_no=r)
+        total += limits["u"]
+        assert round_limit == min(cap.BATCH_ROW_LIMIT, 2 ** r)
+    assert total == 4095
+
+
+def test_round_limits_bound_a_rounds_work_whatever_the_tenant_count():
+    many = [str(i) for i in range(15000)]
+    limits, round_limit = cap.round_limits(
+        many, room_left=None, default_rows=None, global_left=5000, round_no=0)
+    assert round_limit == 5000
+    assert set(limits.values()) == {1}                 # ceil(5000 / 15000)
+    limits, _ = cap.round_limits(
+        many, room_left=None, default_rows=None, global_left=5000, round_no=3)
+    assert sum(limits.values()) <= 15000 * 8           # O((accounts + left) * 2**r)
+    # One account, no caps: its share grows 5000 * 2**3, but no account is ever given
+    # more than the round can return (the last term, Codex ii-c-2 review).
+    limits, round_limit = cap.round_limits(
+        ["u"], room_left=None, default_rows=None, global_left=5000, round_no=3)
+    assert limits == {"u": round_limit} and round_limit == cap.BATCH_ROW_LIMIT
+
+
+def test_round_limits_leave_out_accounts_without_room():
+    limits, _ = cap.round_limits(
+        ["full", "fresh", "known"], room_left={"full": 0, "known": 2}, default_rows=1,
+        global_left=10, round_no=1)
+    assert "full" not in limits
+    assert limits["fresh"] == 2          # default room 1 * 2**1
+    assert limits["known"] == 4          # room 2 * 2**1
+
+
+async def test_discovery_lists_only_accounts_with_queued_rows_of_the_type(make_account):
+    a, b, c, d = [await make_account() for _ in range(4)]
+    now = datetime.now(UTC)
+    _seed(a)                                             # queued normal: found
+    _seed(b, trace_type="advanced")                      # other type
+    _seed(c, status="submitted", submitted_at=now, tracerfy_queue_id=1)  # not queued
+    _seed(d, enqueued_at=now + timedelta(hours=1))       # after the watermark
+    with system_sync_session() as db:
+        found = set(cap.discover_accounts(db, "normal", now))
+    assert a in found
+    assert not found & {b, c, d}
+
+
+async def test_a_row_enqueued_after_the_pass_began_is_not_claimed(make_account, dispatcher):
+    """V1's watermark, now applied by allocate() AFTER the walk (inside it, it misled
+    the planner). No cap at all, so only the watermark keeps the later row out."""
+    u = await make_account()
+    dispatcher()
+    old = _seed(u)
+    later = _seed(u, enqueued_at=datetime.now(UTC) + timedelta(hours=1))
+
+    dispatch_pending_skip_trace()
+
+    assert _claimed([old, later]) == {old}
+    with system_sync_session() as db:
+        assert db.execute(text("SELECT status FROM pending_skip_trace_rows WHERE id = :p"),
+                          {"p": later}).scalar() == "queued"
 
 
 def _bulk_held_run(user_id: str, n_held: int, prefix: str) -> str:
@@ -572,36 +703,70 @@ async def test_the_documented_cutoff_is_room_times_4095(
 # ── Review findings (Codex ii-b diff review) ──────────────────────────────────
 
 
-async def test_per_account_room_is_two_parameters_at_any_tenant_scale(make_account):
-    """Round 2: the room of every account that spent today reaches SQL as two
-    arrays, not one VALUES row per account, so the statement does not grow with
-    the tenant count. And it still decides correctly at that scale."""
+async def test_the_account_list_is_four_parameters_at_any_tenant_scale(make_account):
+    """The per-account frontier and limit reach SQL as four arrays, so the statement
+    does not grow with the tenant count; and the walk still decides correctly with
+    5,001 accounts in it (an account with no limit is not walked at all)."""
     from sqlalchemy import select as sa_select
+    from sqlalchemy import tuple_
 
     from src.db.models import PendingSkipTraceRow as P
 
     full, fresh = await make_account(), await make_account()
-    full_rows = [_seed(full) for _ in range(2)]
+    [_seed(full) for _ in range(2)]
     fresh_rows = [_seed(fresh) for _ in range(2)]
     strangers = {str(uuid.uuid4()): 3 for _ in range(5000)}
 
-    def eligible():
+    def candidates_for(acct):
         return (sa_select(P.id, P.user_id, P.enqueued_at)
-                .where(P.status == "queued", P.id.in_(full_rows + fresh_rows))
-                .subquery("eligible"))
+                .where(P.status == "queued", P.user_id == acct.c.user_id,
+                       tuple_(P.enqueued_at, P.id) > tuple_(acct.c.after_at, acct.c.after_id))
+                .order_by(P.enqueued_at, P.id).limit(acct.c.lim).lateral("cand"))
 
     compiled_params = []
     with system_sync_session() as db:
-        for rooms in ({full: 0}, {full: 0, **strangers}):
+        for limits in ({fresh: 1}, {fresh: 1, **strangers}):
             class _Capture:
                 def execute(self, stmt, *a, **k):
-                    compiled_params.append(len(stmt.compile().params))
+                    if hasattr(stmt, "selected_columns"):  # the walk, not SET/RESET
+                        compiled_params.append(len(stmt.compile().params))
                     return db.execute(stmt, *a, **k)
-            got = cap.allocate(_Capture(), eligible(), account_rows=rooms, default_rows=1,
-                               lookahead=1, limit=5000)
-            assert set(got) == {fresh_rows[0]}, "room 0 excluded, the default room 1 served"
+
+                def begin_nested(self):
+                    return db.begin_nested()
+            frontier = dict.fromkeys(limits, cap.FRONTIER_START)
+            got = cap.allocate(_Capture(), candidates_for, frontier=frontier,
+                               limits=limits, round_limit=5000,
+                               watermark=datetime.now(UTC))
+            assert [c.id for c in got] == [fresh_rows[0]], "only the walked account, 1 row"
 
     assert compiled_params[0] == compiled_params[1], compiled_params
+
+
+async def test_a_failing_walk_raises_its_own_error_and_leaves_no_planner_setting(
+        make_account):
+    """The walk runs with bitmap scans off. If it fails, its OWN error must surface (a
+    RESET in the aborted transaction would fail and hide it), and the setting must
+    not outlive it in the caller's transaction (Codex ii-c-2 review)."""
+    from sqlalchemy import select as sa_select
+    from sqlalchemy.exc import DataError
+
+    from src.db.models import PendingSkipTraceRow as P
+
+    u = await make_account()
+    _seed(u)
+
+    def failing_candidates(acct):
+        return (sa_select(P.id, P.user_id, P.enqueued_at)
+                .where(P.user_id == acct.c.user_id, text("1 / (acct.lim - acct.lim) = 1"))
+                .limit(acct.c.lim).lateral("cand"))
+
+    with system_sync_session() as db:
+        with pytest.raises(DataError, match="division by zero"):
+            cap.allocate(db, failing_candidates, frontier={u: cap.FRONTIER_START},
+                         limits={u: 1}, round_limit=5, watermark=datetime.now(UTC))
+        assert db.execute(text("SHOW enable_bitmapscan")).scalar() == "on"
+        db.rollback()
 
 
 async def test_a_row_retyped_between_allocation_and_lock_is_not_claimed_at_the_wrong_price(
@@ -616,14 +781,14 @@ async def test_a_row_retyped_between_allocation_and_lock_is_not_claimed_at_the_w
     retyped: list[str] = []
 
     def allocate_then_retype(*a, **k):
-        ids = real_allocate(*a, **k)
-        if ids and not retyped:
-            retyped.append(ids[0])
+        got = real_allocate(*a, **k)
+        if got and not retyped:
+            retyped.append(got[0].id)
             with system_sync_session() as other:
                 other.execute(text("UPDATE pending_skip_trace_rows SET trace_type = 'normal' "
-                                   "WHERE id = :p"), {"p": ids[0]})
+                                   "WHERE id = :p"), {"p": got[0].id})
                 other.commit()
-        return ids
+        return got
     monkeypatch.setattr(skip_trace_dispatcher, "allocate", allocate_then_retype)
 
     dispatch_pending_skip_trace()
@@ -636,26 +801,24 @@ async def test_a_row_retyped_between_allocation_and_lock_is_not_claimed_at_the_w
 
 
 async def test_a_full_account_is_not_even_allocated(make_account, dispatcher, monkeypatch):
-    """A zero-room account must reach allocate() as room 0, not fall back to the
-    default room, or the pass locks and inspects rows it can never claim."""
+    """A zero-room account is never walked: it gets no candidate limit, so the pass
+    never locks or inspects rows it could not claim."""
     u = await make_account()
     dispatcher(account_cap=2)
     _spent(u, 2)
     queued = [_seed(u) for _ in range(5)]
     real_allocate = skip_trace_dispatcher.allocate
-    seen: list[tuple[dict, int]] = []
+    seen: list[dict] = []
 
     def recording_allocate(*a, **k):
-        ids = real_allocate(*a, **k)
-        seen.append((dict(k["account_rows"]), len(ids)))
-        return ids
+        seen.append(dict(k["limits"]))
+        return real_allocate(*a, **k)
     monkeypatch.setattr(skip_trace_dispatcher, "allocate", recording_allocate)
 
     dispatch_pending_skip_trace()
 
     assert _claimed(queued) == set()
-    assert seen and all(n == 0 for _, n in seen), seen
-    assert seen[0][0] == {u: 0}
+    assert all(u not in limits for limits in seen), seen
 
 
 async def test_a_second_claimer_is_shut_out_while_a_pass_holds_the_lock(
@@ -704,6 +867,24 @@ async def test_an_early_deadline_claims_the_survivors_found_so_far(
 
     assert _claimed([head, second, served]) == {served}
     assert any("refill_truncated reason=deadline" in r.getMessage() for r in caplog.records)
+
+
+async def test_a_batch_that_fills_is_never_reported_as_truncated(
+        make_account, dispatcher, monkeypatch, caplog):
+    """The pass checks for a full batch BEFORE its limits, so a batch that fills on
+    its last allowed round is not logged as cut short (Codex ii-c-2 consult)."""
+    u = await make_account()
+    dispatcher(global_cap=2)
+    monkeypatch.setattr(skip_trace_dispatcher, "_REFILL_MAX_ROUNDS", 1)
+    monkeypatch.setattr(skip_trace_dispatcher, "_REFILL_DEADLINE", timedelta(0))
+    rows = [_seed(u) for _ in range(2)]
+
+    import logging
+    with caplog.at_level(logging.WARNING):
+        dispatch_pending_skip_trace()
+
+    assert _claimed(rows) == set(rows)
+    assert not [r for r in caplog.records if "refill_truncated" in r.getMessage()]
 
 
 # ── The early exit ────────────────────────────────────────────────────────────

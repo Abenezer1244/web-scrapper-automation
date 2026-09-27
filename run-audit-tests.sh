@@ -12,6 +12,10 @@
 # beside a non-integration one) delete each other's users and produce the same
 # scattered, different-every-time failures. Run them one at a time.
 set -u
+# The test guard (src/db_safety.py) refuses these: set, libpq routes even an
+# explicit test DSN elsewhere. Cleared here so a developer's own libpq settings
+# do not abort the run.
+unset PGHOSTADDR PGSERVICE PGSERVICEFILE PGSYSCONFDIR
 export TEST_DATABASE_URL="postgresql+asyncpg://bridgeleads:testpassword@127.0.0.1:5432/bridgeleads_entaudit_test"
 export TEST_DATABASE_URL_SYNC="postgresql+psycopg2://bridgeleads:testpassword@127.0.0.1:5432/bridgeleads_entaudit_test"
 export DATABASE_URL="$TEST_DATABASE_URL"

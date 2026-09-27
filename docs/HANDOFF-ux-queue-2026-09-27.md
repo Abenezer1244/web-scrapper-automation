@@ -1,4 +1,4 @@
-# HANDOFF: UX audit queue, resume at item 2b (2026-09-27)
+# HANDOFF: UX audit queue, resume at item 2b-ii (2026-09-27)
 
 ## Goal
 Owner's request (verbatim intent): continue the BridgeLeads UX audit follow-ups **one at a time**.
@@ -17,19 +17,20 @@ Project rules: `CLAUDE.md`, and `.claude/rules/*`, which are loaded automaticall
 
 ## Where you are
 - **Repo:** backend `web-scrapper-automation`.
-- **Worktree:** `C:/Users/Windows/bl-wt/eligibility`.
-- **Branch:** `feat/run-eligibility`, from `origin/main` `6194d73c`.
-- **Code written so far:** none. Only this handoff exists on the branch.
-- **Status of item 2b:** investigation started. Next step is to write the plan.
+- **Worktree:** `C:/Users/Windows/bl-wt/eligibility` (2b-i shipped from `feat/run-eligibility`).
+  Branch 2b-ii fresh from `origin/main`; that worktree's test DB is `bridgeleads_eligibility_test`
+  (env `C:/Users/Windows/bl-testenv/env-eligibility.sh`, Redis db 7), already at migration 104.
+- **Status:** 2b-i DONE and LIVE. Next is 2b-ii, from investigation.
 
 ## Queue
-Items 1 and 2a are DONE and LIVE. Resume at **2b**.
+Items 1, 2a and 2b-i are DONE and LIVE. Resume at **2b-ii**.
 
 | # | Item | Status |
 |---|---|---|
 | 1 | F-042/F-041: session-read storm and dashboard spinner | ✅ FE #164 `6030491`, verified in prod (idle session req/min 52 → 1) |
 | 2a | F-003 / Q5: one active run per scraper | ✅ BE #367 `6194d73c` (migration **104**, index valid in prod) + FE #165 `dfadf4d` |
-| **2b** | **Q6 run_eligibility, split in two** | **NEXT, see below** |
+| 2b-i | Q6 account-level `run_eligibility` on `/billing/usage` | ✅ BE #369 `cd755883` + FE #166 `8fb25a9` (plan + review: `tasks/todo-run-eligibility.md`) |
+| **2b-ii** | **Q6 per-config eligibility + structured 402 bodies** | **NEXT, see below** |
 | 2c | Q1: run-count breakdown so found = new + already delivered + … (needs a migration) | queued |
 | 2d | Q2: `already_delivered` on JobResponse | queued |
 | 2e | Q4: FE shows "Lookup failed" as distinct from "not available" | queued |
@@ -37,7 +38,14 @@ Items 1 and 2a are DONE and LIVE. Resume at **2b**.
 | 4 | F-043 Phase 2: zero-child runs recorded as `skipped` (not `done`), batch pause/delete endpoints, prod rows deleted while paused (use the `scraper_deleted` audit log) | queued |
 | 5 | Phase 4 re-test, Phase 5 `/design-review` and the Codex independent review | queued |
 
-### 2b plan outline (not yet written or Codex-consulted)
+### 2b-i as shipped (reference)
+`src/api/quota.py`: `run_eligibility`, `RunEligibility`, `next_quota_reset` (null while frozen or
+when `entitlement_ends_at <= window end`), `FROZEN_MESSAGE` / `ENDED_MESSAGE`.
+`src/api/routes/billing.py`: `usage_view(user, now)` + `response_model=UsageResponse`.
+Tests `tests/test_run_eligibility.py` (47). Prod verified read-only over all 7 users; no
+authenticated `/billing/usage` call was observed after the deploy yet.
+
+### Original 2b plan outline (2b-i part is done)
 Full spec: `phase-3.0-contracts.md` Q6, lines 223–265.
 
 **2b-i: the account-level rule.** Refactor `quota_block_reason(user, now)` (`src/api/quota.py:130-170`) into `run_eligibility(user, now)`, returning `{can_run, code, message, resumes_at}`:
@@ -99,5 +107,13 @@ Then:
 - **Browser verification rig** (FE changes against the prod API): memory `reference_prod_ux_capture_rig`. `headed2.mjs` and the saved `AUTH_SECRET` are in the old scratchpad and may be gone. Recreate them from that memory. The owner must log in with MFA on both tabs.
 
 ## Next step
-1. In `C:/Users/Windows/bl-wt/eligibility`, read `src/api/quota.py` (window helpers, `effective_records_limit`) and the `billing.py` usage route plus its schema.
-2. Write `tasks/todo-run-eligibility.md` for **2b-i**, consult Codex (stdin), then **stop for the owner's confirmation**.
+1. Read prod `ENTITLEMENT_ENFORCEMENT` first (read-only; code default is not the prod value).
+2. Investigate `jobs.py` per-run blockers (AI limit, config entitlement, config `active`) and the
+   Q5 409 body, then write `tasks/todo-run-eligibility-2b-ii.md`, consult Codex (stdin), and
+   **stop for the owner's confirmation**.
+3. 🛑 Codex diff review: always `git diff origin/main...HEAD` (THREE dots). A two-dot diff after
+   main moved produced a bogus GATE: FAIL in 2b-i.
+4. `.venv-schema` is dead; `bl-rescat-venv` pins the CI fastapi/pydantic, so regenerate
+   `openapi.json` with it and confirm with `--check` + a structural diff vs main. FE types:
+   `npx openapi-typescript <(git show origin/main:schema/openapi.json)` via a temp file
+   (`npm run gen:api-types` 404s on the private raw URL).

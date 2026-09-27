@@ -19,6 +19,67 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-27 — One run-eligibility rule for the gate and the page (Q6 2b-i), and a diff I sent from the wrong base
+
+> UX audit item 2b-i (Q6 / F-035). BE **#369** merged `cd755883` (api/worker/beat SUCCESS, no
+> migration), FE **#166** merged `8fb25a9` (Vercel SUCCESS). Plan + review record:
+> `tasks/todo-run-eligibility.md`. Catch-up for the same day: BE #363 (F-043) and BE #367
+> (migration 104, one active run per scraper) are recorded in the handoff
+> `docs/HANDOFF-ux-queue-2026-09-27.md` and the 09-26 entry below.
+
+**Built / Shipped:**
+- `run_eligibility(user, now)` in `src/api/quota.py`: `{can_run, code, message, resumes_at}`,
+  code `frozen | ended | over_limit`, one pinned clock. `quota_block_reason` is now a thin
+  wrapper, so the 5 enqueue gates are untouched and keep their exact 402 prose.
+- `GET /billing/usage` has a typed `UsageResponse` (was a bare dict) carrying `run_eligibility`,
+  built by a pure `usage_view(user, now)`. It reports the EFFECTIVE plan and limit: across an
+  ended window with a pending downgrade it mirrors the rollover SQL (`quota_window.py`,
+  `plan = CASE WHEN rolling AND pending_plan IS NOT NULL`) instead of echoing raw columns.
+- FE: types regenerated, `next_reset_at: string | null`, `run_eligibility` typed, BillingTab
+  takes the plan from usage.
+
+**Caught & fixed:**
+- A false promise, found while investigating: an over-limit account whose paid term ends at or
+  before the window end was told "Your quota resets <date>". That boundary ends access
+  (`should_roll` refuses), it never resets. `resumes_at` / `next_reset_at` are now null there and
+  the message says the quota will not reset.
+- Codex (diff review): a FROZEN account's window does not advance, so `next_reset_at` could be a
+  date in the past. Now null while frozen; mutation-proven (test RED without the guard, showing
+  2026-09-20 on a 09-27 clock).
+- Codex (plan review, 3 rounds): one clock across the whole route, nullable `next_reset_at`,
+  literal-prose tests instead of comparing a function with its own constant, schema invariants
+  (`RunEligibilityResponse` refuses impossible states), and the Starter downgrade spelled out by
+  reading the rollover SQL rather than guessing `pending_plan or plan`.
+
+**Failed / Blocked:**
+- I sent Codex round 2 a TWO-dot `git diff origin/main` after `origin/main` had moved (#366 and
+  #368 merged mid-session). Main's new skip-trace code read as reverts, and Codex returned GATE:
+  FAIL on three findings that were not in this PR. Fix: rebase, re-run the full suite on the
+  rebased branch (4914 passed), review `origin/main...HEAD` (three dots). Round 3: GATE: PASS.
+- `.venv-schema` is dead (anaconda gone). Regenerated with `bl-rescat-venv` only after checking
+  it pins the same fastapi 0.141.1 / pydantic 2.13.4 as `requirements.txt`; `--check` and a
+  structural JSON diff vs main (2 components added, 1 path schema changed, nothing else) agreed.
+- FE `npm run gen:api-types` 404s: it fetches a raw URL from a private repo. Generate from
+  `git show origin/main:schema/openapi.json` into a temp file, exactly what the FE CI job does via
+  the contents API.
+
+**Pending / Handoff:**
+- Authenticated prod call of `/billing/usage` not yet observed: no real user hit it after the
+  deploy. Read-only substitute done: the merged `usage_view` over all 7 prod users, 0 errors,
+  every row validates, gate and page agree everywhere. All 7 are `can_run`; no prod row is in an
+  edge state (frozen / ended / pending downgrade), so those branches are proven by tests only.
+- Open P3s: over-limit prose is still inline f-strings (BE); the generated type marks the
+  eligibility fields optional because they have defaults (FE).
+- Next: 2b-ii (per-config codes `not_entitled`, `config_inactive`, `ai_limit`, `run_in_flight`
+  on the scraper response, structured 402 bodies; first read prod `ENTITLEMENT_ENFORCEMENT`).
+
+**Facts learned:**
+- Review the three-dot diff. A branch cut earlier the same day was already behind by two PRs.
+- `/billing/usage` `plan` can now legitimately differ from `/auth/me` `plan` (only in the rollover
+  gap); the FE should prefer usage for anything shown next to the quota.
+
+---
+
 ## 2026-09-26 — UX audit: 49 findings, batch A verified on real data, and a check that could never match
 
 > Evidence-based UX audit of the authenticated product (2026-09-25 and 09-26, two sessions).

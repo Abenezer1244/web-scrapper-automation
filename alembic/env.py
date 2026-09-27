@@ -20,20 +20,6 @@ config = context.config
 # to DATABASE_URL_SYNC for environments where workers and Alembic share one role.
 # Do NOT point DATABASE_URL_SYNC at bridgeleads_system without also setting
 # DATABASE_URL_MIGRATE, or `alembic upgrade` would run as a non-DDL role.
-_handed = config.attributes.get("connection", None)
-if _handed is not None:
-    _target = _handed.engine.url.render_as_string(hide_password=True)
-else:
-    _target = os.getenv("DATABASE_URL_MIGRATE") or os.getenv("DATABASE_URL_SYNC")
-    if not _target:
-        raise RuntimeError(
-            "alembic/env.py: neither DATABASE_URL_MIGRATE nor DATABASE_URL_SYNC is set "
-            "in the environment. env.py never reads a .env file: export the variable "
-            "(or use `railway run`, or scripts/migrate.py)."
-        )
-    config.set_main_option("sqlalchemy.url", _target)
-
-
 def _refuse_unless_test_database(target: str) -> None:
     """Under ENVIRONMENT=test, migrate the validated test database or nothing: the
     target must classify as a test database AND be the database
@@ -63,9 +49,27 @@ def _refuse_unless_test_database(target: str) -> None:
         )
 
 
-# Before the models are imported and before anything connects.
+_handed = config.attributes.get("connection", None)
+if _handed is not None:
+    _target = _handed.engine.url.render_as_string(hide_password=True)
+else:
+    _target = os.getenv("DATABASE_URL_MIGRATE") or os.getenv("DATABASE_URL_SYNC")
+    if not _target:
+        raise RuntimeError(
+            "alembic/env.py: neither DATABASE_URL_MIGRATE nor DATABASE_URL_SYNC is set "
+            "in the environment. env.py never reads a .env file: export the variable "
+            "(or use `railway run`, or scripts/migrate.py)."
+        )
+
+# Before the URL reaches Alembic's config, the models are imported, or anything
+# connects.
 if os.getenv("ENVIRONMENT", "").strip().lower() == "test":
     _refuse_unless_test_database(_target)
+
+if _handed is None:
+    # Alembic's config is a ConfigParser: '%' starts an interpolation, so a
+    # percent-encoded password (%40 ...) must be escaped (Codex safety-PR review).
+    config.set_main_option("sqlalchemy.url", _target.replace("%", "%%"))
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)

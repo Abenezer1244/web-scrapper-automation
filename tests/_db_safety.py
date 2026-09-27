@@ -51,8 +51,9 @@ def _abort(reason: str) -> None:
         "dedicated test database (name ends with _test/_testing; host local or\n"
         "listed in TEST_DB_HOST_ALLOWLIST). This guard exists because an\n"
         "unguarded test teardown once wiped the PRODUCTION database.\n"
-        "Set TEST_DATABASE_URL (and optionally TEST_DATABASE_URL_SYNC) to a\n"
-        "local/test database. See tests/_db_safety.py.\n"
+        "Set TEST_DATABASE_URL and TEST_DATABASE_URL_SYNC (both required, explicit\n"
+        "host and port) to a local/test database, and leave PGHOSTADDR/PGSERVICE/\n"
+        "PGSERVICEFILE/PGSYSCONFDIR unset. See tests/_db_safety.py and src/db_safety.py.\n"
         "===================================================================\n"
     )
 

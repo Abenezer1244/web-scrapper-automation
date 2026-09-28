@@ -2147,6 +2147,31 @@
             ],
             "title": "Batch Id"
           },
+          "breakdown": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunBreakdown"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "breakdown_basis": {
+            "anyOf": [
+              {
+                "enum": [
+                  "snapshot",
+                  "live"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Breakdown Basis"
+          },
           "county": {
             "anyOf": [
               {
@@ -3533,6 +3558,31 @@
               }
             ]
           },
+          "breakdown": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RunBreakdown"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "breakdown_basis": {
+            "anyOf": [
+              {
+                "enum": [
+                  "snapshot",
+                  "live"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Breakdown Basis"
+          },
           "date_range_mode": {
             "default": "",
             "title": "Date Range Mode",
@@ -3641,6 +3691,51 @@
           "items"
         ],
         "title": "ResultsPage",
+        "type": "object"
+      },
+      "RunBreakdown": {
+        "description": "What happened to every record a finished run found (src/api/run_breakdown.py).\n\nrecords_found = dropped_before_save + no_address + same_run_merged\n              + already_delivered + over_quota + new\n\nMutually exclusive, first match wins per saved row: no usable address, then\ncombined into another row of this run, then already delivered by an earlier run\nof this account, then past the plan cap; `new` is what was delivered and billed\n(equal to record_count on a snapshot). RAW: no tax cap and no view filter, so on\na tax run `already_delivered` can exceed the tab's `already_delivered_count`.",
+        "properties": {
+          "already_delivered": {
+            "title": "Already Delivered",
+            "type": "integer"
+          },
+          "dropped_before_save": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dropped Before Save"
+          },
+          "new": {
+            "title": "New",
+            "type": "integer"
+          },
+          "no_address": {
+            "title": "No Address",
+            "type": "integer"
+          },
+          "over_quota": {
+            "title": "Over Quota",
+            "type": "integer"
+          },
+          "same_run_merged": {
+            "title": "Same Run Merged",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "no_address",
+          "same_run_merged",
+          "already_delivered",
+          "over_quota",
+          "new"
+        ],
+        "title": "RunBreakdown",
         "type": "object"
       },
       "RunEligibilityResponse": {

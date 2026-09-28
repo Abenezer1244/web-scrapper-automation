@@ -323,8 +323,13 @@ def test_a_finished_run_reports_completion_not_a_stage():
     j = _job(status="done", finished_at=_ago(seconds=5), record_count=2,
              records_found=57, stage="finalizing")
     assert j.progress_pct == 100
-    assert j.stage_label == "Complete: 2 records"
+    assert j.stage_label == "Complete: 2 new leads"
     assert j.stage_seconds is None
+    # record_count is the billed NEW-lead count, so the label says so (UX F-001:
+    # "2 records" beside records_found 57 read as two different record counts).
+    one = _job(status="done", finished_at=_ago(seconds=5), record_count=1,
+               records_found=57, stage="finalizing")
+    assert one.stage_label == "Complete: 1 new lead"
     # Both numbers survive: 2 is what was billed and delivered, 57 is what the
     # scrape turned up. Conflating them is what made the Records tile read "2".
     assert j.records_found == 57

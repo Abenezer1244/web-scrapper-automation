@@ -1,7 +1,8 @@
 """How much Tracerfy spend the dispatcher may still claim, and whose rows claim it.
 
 Phase 1b-1b-ii-b (the caps), ii-c (the keyset walk that finds the rows: see "The
-keyset frontier" below). The unit is the Tracerfy CREDIT: a normal lookup costs 1, an
+keyset frontier" below), iii (when a binding cap lets lookups run again:
+`resume_times`, published by the dispatcher as the pause state). The unit is the Tracerfy CREDIT: a normal lookup costs 1, an
 advanced one 2 (`CREDITS_PER_ROW`). Two caps, both over a rolling 24h window of
 `pending_skip_trace_rows.submitted_at`:
 
@@ -25,7 +26,7 @@ first rows win.
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import NamedTuple
 
 from sqlalchemy import (
@@ -37,20 +38,30 @@ from sqlalchemy import (
     case,
     cast,
     func,
+    literal,
     select,
     text,
     true,
+    union_all,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, UUID
 
 from src.config import settings
 from src.utils.logger import setup_logger
+from src.utils.skip_trace_pause_state import NEVER, NOT_BINDING, ScopeResume
 
 _logger = setup_logger("worker.skip_trace_capacity")
 
 # Tracerfy's price per row, in credits. The ONE copy: the dispatcher's 402 path
 # and the spent query below both read it.
 CREDITS_PER_ROW = {"normal": 1, "advanced": 2}
+
+# The rolling window both caps are measured over. A row counts while
+# `submitted_at >= now - SPEND_WINDOW`.
+SPEND_WINDOW = timedelta(days=1)
+# Past the window's `>=` boundary: at `submitted_at + SPEND_WINDOW` the row still
+# counts, one second later it does not (Codex 15-10).
+RESUME_MARGIN = timedelta(seconds=1)
 
 # The most rows one batch may carry, whatever the caps allow (Tracerfy handles
 # large batches; this has always been the safety bound).
@@ -134,6 +145,142 @@ def batch_rows(global_cap: int, global_spent: int, cost: int) -> int:
     batch bound, and never unbounded (a NULL LIMIT would drop the bound)."""
     allowed = row_allowance(global_cap, global_spent, cost)
     return BATCH_ROW_LIMIT if allowed is None else min(BATCH_ROW_LIMIT, allowed)
+
+
+# ── When a binding cap lets lookups run again (Phase 1b-1b-iii) ───────────────
+#
+# A scope with spend S under cap C admits a lookup of cost c once S - C + c
+# credits have left the window. Rows leave oldest first, so that is the moment
+# the row whose running credit sum first reaches S - C + c leaves: its
+# submitted_at + SPEND_WINDOW + RESUME_MARGIN. Only that row's submitted_at
+# reaches the answer, so rows tied on it give the same time in any order, and the
+# walk orders by submitted_at alone: the order of 102's and 105's indexes.
+#
+# The walk STOPS at the threshold (LIMIT 2 once the running sum reaches
+# S - C + 1): the caps are hard, so normally S <= C and the threshold is within a
+# scope's first two credits. A cap lowered over existing spend (S > C) walks
+# further, to wherever the threshold is. The per-account totals are one pass over
+# the window, as the live cap read already does; nothing else scans it (Codex
+# iii-b gate consult; migration 105 gives each account's walk its own index).
+
+
+class PauseSnapshot(NamedTuple):
+    global_scope: ScopeResume
+    account_default: ScopeResume  # any account without its own entry
+    accounts: dict[str, ScopeResume]  # accounts whose advanced lookup does not fit
+
+
+def scope_resume(cap: int, spent: int, first_at: dict[int, datetime | None]) -> ScopeResume:
+    """A scope's resume time per cost. `first_at[c]` is the submitted_at of the
+    row whose running sum first reaches `spent - cap + c` (None when no row
+    does, which only happens when the lookup already fits)."""
+    def one(c: int):
+        if not cap:
+            return None
+        if cap < c:
+            return NEVER  # a cap of 1 never admits an advanced lookup
+        if spent + c <= cap:
+            return None
+        at = first_at.get(c)
+        if at is None:
+            raise ValueError(f"no threshold row for spent={spent} cap={cap} cost={c}")
+        return at + SPEND_WINDOW + RESUME_MARGIN
+
+    return ScopeResume(one(1), one(2))
+
+
+def _threshold_walk(rows, since: datetime, need, *filters, correlate=None):
+    """A LATERAL of the first two rows, in submitted_at order, whose running
+    credit sum reaches `need`: the rows at which cost 1 and cost 2 fit again (each
+    row costs at least 1 credit, so the second such row reaches need + 1)."""
+    walk = select(
+        rows.submitted_at,
+        func.sum(_weight_sql(rows.trace_type)).over(
+            order_by=rows.submitted_at, rows=(None, 0)).label("run"),
+    ).where(rows.submitted_at >= since, *filters).order_by(rows.submitted_at)
+    if correlate is not None:
+        walk = walk.correlate(correlate)
+    walk = walk.subquery("walk")
+    lat = (select(walk.c.submitted_at, walk.c.run).where(walk.c.run >= need)
+           .order_by(walk.c.submitted_at).limit(2))
+    if correlate is not None:
+        lat = lat.correlate(correlate)
+    return lat.lateral()
+
+
+def _resume_statement(since: datetime, caps: Caps):
+    """ONE statement, so one snapshot (Codex K4): per-account totals; for every
+    account whose advanced lookup does not fit, its threshold walk over 105; the
+    global total, ALWAYS one row, with its walk over 102 joined LEFT, so a scope
+    with nothing to walk still reports its total (K2). Rows: (is_global, user_id,
+    spent, submitted_at, run), each scope's walk rows in order."""
+    from sqlalchemy.orm import aliased
+
+    from src.db.models import PendingSkipTraceRow
+
+    base = aliased(PendingSkipTraceRow)
+    totals = (select(base.user_id, func.sum(_weight_sql(base.trace_type)).label("spent"))
+              .where(base.submitted_at >= since).group_by(base.user_id).cte("totals"))
+    parts = []
+    if caps.account_cap:
+        cap = caps.account_cap
+        paused = select(totals.c.user_id, totals.c.spent).where(
+            totals.c.spent + 2 > cap).cte("paused")
+        acct = aliased(PendingSkipTraceRow)
+        x = _threshold_walk(acct, since, paused.c.spent - cap + 1,
+                            acct.user_id == paused.c.user_id, correlate=paused)
+        parts.append(
+            select(literal(False).label("is_global"), paused.c.user_id, paused.c.spent,
+                   x.c.submitted_at, x.c.run)
+            .select_from(paused.join(x, true())))
+    if caps.global_cap:
+        cap = caps.global_cap
+        g = select(func.coalesce(func.sum(totals.c.spent), 0).label("spent")).cte("g")
+        glob = aliased(PendingSkipTraceRow)
+        y = _threshold_walk(glob, since, g.c.spent - cap + 1, g.c.spent + 2 > cap,
+                            correlate=g)
+        parts.append(
+            select(literal(True).label("is_global"),
+                   cast(literal(None), UUID(as_uuid=False)).label("user_id"),
+                   g.c.spent, y.c.submitted_at, y.c.run)
+            .select_from(g.outerjoin(y, true())))
+    return parts[0] if len(parts) == 1 else union_all(*parts)
+
+
+def _firsts(spent: int, cap: int, walk: list[tuple[datetime, int]]) -> dict[int, datetime | None]:
+    """The walk's first row reaches need = spent - cap + 1 (cost 1); the first row
+    reaching need + 1 is cost 2's. Sorted here by the running sum, which strictly
+    increases along the walk (every row costs at least 1): SQL does not promise
+    that a UNION ALL returns each lateral's rows in its ORDER BY."""
+    walk = sorted(walk, key=lambda r: r[1])
+    need = spent - cap + 1
+    at2 = next((at for at, run in walk if run >= need + 1), None)
+    return {1: walk[0][0] if walk else None, 2: at2}
+
+
+def resume_times(db, now: datetime, caps: Caps) -> PauseSnapshot:
+    """Every scope's resume times at `now`, from ONE statement in the caller's
+    transaction (the caller takes its fence first). No read at all when both caps
+    are off."""
+    default = scope_resume(caps.account_cap, 0, {})
+    if not caps.global_cap and not caps.account_cap:
+        return PauseSnapshot(NOT_BINDING, default, {})
+    scopes: dict[str | None, tuple[int, list]] = {}
+    for is_global, user_id, spent, at, run in db.execute(
+            _resume_statement(now - SPEND_WINDOW, caps)):
+        key = None if is_global else str(user_id)
+        _, walk = scopes.setdefault(key, (int(spent), []))
+        if at is not None:
+            walk.append((at, int(run)))
+    accounts = {
+        u: scope_resume(caps.account_cap, spent, _firsts(spent, caps.account_cap, walk))
+        for u, (spent, walk) in scopes.items() if u is not None
+    }
+    global_scope = NOT_BINDING
+    if caps.global_cap:
+        spent, walk = scopes[None]
+        global_scope = scope_resume(caps.global_cap, spent, _firsts(spent, caps.global_cap, walk))
+    return PauseSnapshot(global_scope, default, accounts)
 
 
 # ── The keyset frontier (Phase 1b-1b-ii-c) ────────────────────────────────────
@@ -386,8 +533,9 @@ def take_within_caps(
 
 
 __all__ = [
-    "BATCH_ROW_LIMIT", "CREDITS_PER_ROW", "FRONTIER_START", "Candidate", "Caps",
-    "advance", "allocate", "batch_rows", "credits_for", "discover_accounts",
-    "lock_allocated", "resolve_caps", "round_limits", "row_allowance",
-    "spent_credits", "take_within_caps",
+    "BATCH_ROW_LIMIT", "CREDITS_PER_ROW", "FRONTIER_START", "RESUME_MARGIN",
+    "SPEND_WINDOW", "Candidate", "Caps", "PauseSnapshot", "advance", "allocate",
+    "batch_rows", "credits_for", "discover_accounts", "lock_allocated",
+    "resolve_caps", "resume_times", "round_limits", "row_allowance",
+    "scope_resume", "spent_credits", "take_within_caps",
 ]

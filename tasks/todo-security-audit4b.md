@@ -12,12 +12,12 @@ Completeness sweep: only `jobs.py`, `batches.py`, `segments.py` build CSVs. Jobs
 the four below are the rest. Frontend calls all four only from a button click (never polled).
 
 ### 4b-i: S4-03 export zone (branch from `origin/main`, independent of #374; 3 code files + 1 test)
-- [ ] `src/api/routes/batches.py`: `download_batch` (733), `download_batch_run` (854) -> `zone="export"`.
+- [x] `src/api/routes/batches.py`: `download_batch` (733), `download_batch_run` (854) -> `zone="export"`.
       The limit stays BEFORE the owner lookup, so a 404 still spends budget.
-- [ ] `src/api/routes/segments.py`: `intersection_export` (709), `union_export` (835) -> `zone="export"`.
-- [ ] `src/api/middleware/rate_limit.py`: comment only. Lists the 6 export routes and states the real
+- [x] `src/api/routes/segments.py`: `intersection_export` (709), `union_export` (835) -> `zone="export"`.
+- [x] `src/api/middleware/rate_limit.py`: comment only. Lists the 6 export routes and states the real
       ceiling: a job export is `/export-url` + `/download` = 2 tokens, so 10 job exports/min (Codex #2).
-- [ ] `tests/test_audit4_export_zone.py` (real DB + real Redis, no mocks). REGRESSION (fail on old code,
+- [x] `tests/test_audit4_export_zone.py` (real DB + real Redis, no mocks). REGRESSION (fail on old code,
       each mutation-checked):
       1. each of the 4 routes alone: 20 pass, the 21st in the minute is 429.
       2. shared budget: 20 exports mixed across job + batch + segment routes, then the 21st on each new route
@@ -65,3 +65,14 @@ the four below are the rest. Frontend calls all four only from a button click (n
 - [ ] OpenAPI: no schema change expected; confirm with a diff
 - [ ] Security Master Review (x2 clean), Codex review until GATE PASS, PR, STOP before merge
 
+
+## Review (4b-i, PR #378, NOT merged)
+
+- Four export routes moved to `export`; zone comment lists all six and the real job-flow ceiling.
+- `tests/test_audit4_export_zone.py`: 16 regression (all fail on old code, re-mutated after the clock change),
+  4 controls. Full suite 4,938 passed / 0 failed on a fresh `_test` DB (9 foreground batches).
+- Codex: plan consult (6 findings folded in), diff review r1 GATE FAIL (P2 flaky timing, P3 comment) fixed,
+  r2 GATE PASS; its async-`Retry` P3 fixed. Its other r2 P3 read the unpatched tree's old comment (no change).
+- Traps hit: another session's suite shares Redis db 13 and FLUSHDBs it (6 phantom rate-limit failures);
+  this env moved to Redis db 4. A wall-clock rate-limit test straddled the 60 s window on this machine.
+- Next: 4b-ii after #374 merges; then S4-07 (JSON views bulk-decrypt PII in `general`), own phase.

@@ -1,7 +1,8 @@
 """How much Tracerfy spend the dispatcher may still claim, and whose rows claim it.
 
 Phase 1b-1b-ii-b (the caps), ii-c (the keyset walk that finds the rows: see "The
-keyset frontier" below). The unit is the Tracerfy CREDIT: a normal lookup costs 1, an
+keyset frontier" below), iii (when a binding cap lets lookups run again:
+`resume_times`, published by the dispatcher as the pause state). The unit is the Tracerfy CREDIT: a normal lookup costs 1, an
 advanced one 2 (`CREDITS_PER_ROW`). Two caps, both over a rolling 24h window of
 `pending_skip_trace_rows.submitted_at`:
 
@@ -25,7 +26,7 @@ first rows win.
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import NamedTuple
 
 from sqlalchemy import (
@@ -45,12 +46,20 @@ from sqlalchemy.dialects.postgresql import ARRAY, UUID
 
 from src.config import settings
 from src.utils.logger import setup_logger
+from src.utils.skip_trace_pause_state import NEVER, NOT_BINDING, ScopeResume
 
 _logger = setup_logger("worker.skip_trace_capacity")
 
 # Tracerfy's price per row, in credits. The ONE copy: the dispatcher's 402 path
 # and the spent query below both read it.
 CREDITS_PER_ROW = {"normal": 1, "advanced": 2}
+
+# The rolling window both caps are measured over. A row counts while
+# `submitted_at >= now - SPEND_WINDOW`.
+SPEND_WINDOW = timedelta(days=1)
+# Past the window's `>=` boundary: at `submitted_at + SPEND_WINDOW` the row still
+# counts, one second later it does not (Codex 15-10).
+RESUME_MARGIN = timedelta(seconds=1)
 
 # The most rows one batch may carry, whatever the caps allow (Tracerfy handles
 # large batches; this has always been the safety bound).
@@ -134,6 +143,86 @@ def batch_rows(global_cap: int, global_spent: int, cost: int) -> int:
     batch bound, and never unbounded (a NULL LIMIT would drop the bound)."""
     allowed = row_allowance(global_cap, global_spent, cost)
     return BATCH_ROW_LIMIT if allowed is None else min(BATCH_ROW_LIMIT, allowed)
+
+
+# ── When a binding cap lets lookups run again (Phase 1b-1b-iii) ───────────────
+#
+# A scope with spend S under cap C admits a lookup of cost c once S - C + c
+# credits have left the window. Rows leave oldest first, so that is the moment
+# the row whose running credit sum first reaches S - C + c leaves: its
+# submitted_at + SPEND_WINDOW + RESUME_MARGIN. Rows are ordered deterministically
+# (submitted_at, tracerfy_queue_id, id); only the threshold row's submitted_at
+# reaches the answer, so rows tied on it give the same time whatever the order.
+
+def _resume_query(since: datetime, cap: int, *, per_account: bool):
+    """Per scope: its total, and the submitted_at of the first row whose running
+    credit sum reaches total - cap + 1 and total - cap + 2. Per account, only the
+    accounts whose ADVANCED lookup does not fit (total + 2 > cap) come back; every
+    other account reads account_default."""
+    from src.db.models import PendingSkipTraceRow as P
+
+    weight = _weight_sql(P.trace_type)
+    part = {"partition_by": P.user_id} if per_account else {}
+    rows = select(
+        P.user_id, P.submitted_at,
+        func.sum(weight).over(
+            order_by=(P.submitted_at, P.tracerfy_queue_id.asc().nulls_first(), P.id),
+            rows=(None, 0), **part,
+        ).label("run"),
+        func.sum(weight).over(**part).label("total"),
+    ).where(P.submitted_at >= since).subquery("s")
+    out = select(
+        func.max(rows.c.total),
+        func.min(rows.c.submitted_at).filter(rows.c.run >= rows.c.total - cap + 1),
+        func.min(rows.c.submitted_at).filter(rows.c.run >= rows.c.total - cap + 2),
+    )
+    if not per_account:
+        return out
+    return (out.add_columns(rows.c.user_id).where(rows.c.total + 2 > cap)
+            .group_by(rows.c.user_id))
+
+
+class PauseSnapshot(NamedTuple):
+    global_scope: ScopeResume
+    account_default: ScopeResume  # any account without its own entry
+    accounts: dict[str, ScopeResume]  # accounts whose advanced lookup does not fit
+
+
+def scope_resume(cap: int, spent: int, first_at: dict[int, datetime | None]) -> ScopeResume:
+    """A scope's resume time per cost. `first_at[c]` is the submitted_at of the
+    row whose running sum first reaches `spent - cap + c` (None when no row
+    does, which only happens when the lookup already fits)."""
+    def one(c: int):
+        if not cap:
+            return None
+        if cap < c:
+            return NEVER  # a cap of 1 never admits an advanced lookup
+        if spent + c <= cap:
+            return None
+        at = first_at.get(c)
+        if at is None:
+            raise ValueError(f"no threshold row for spent={spent} cap={cap} cost={c}")
+        return at + SPEND_WINDOW + RESUME_MARGIN
+
+    return ScopeResume(one(1), one(2))
+
+
+def resume_times(db, now: datetime, caps: Caps) -> PauseSnapshot:
+    """Every scope's resume times at `now`. No read at all when both caps are off.
+    Two statements, both in the caller's transaction: the caller takes its fence
+    BEFORE calling (READ COMMITTED gives each statement a later snapshot)."""
+    since = now - SPEND_WINDOW
+    global_scope = NOT_BINDING
+    if caps.global_cap:
+        total, at1, at2 = db.execute(
+            _resume_query(since, caps.global_cap, per_account=False)).one()
+        global_scope = scope_resume(caps.global_cap, int(total or 0), {1: at1, 2: at2})
+    accounts: dict[str, ScopeResume] = {}
+    if caps.account_cap:
+        for total, at1, at2, user_id in db.execute(
+                _resume_query(since, caps.account_cap, per_account=True)):
+            accounts[str(user_id)] = scope_resume(caps.account_cap, int(total), {1: at1, 2: at2})
+    return PauseSnapshot(global_scope, scope_resume(caps.account_cap, 0, {}), accounts)
 
 
 # ── The keyset frontier (Phase 1b-1b-ii-c) ────────────────────────────────────
@@ -386,8 +475,9 @@ def take_within_caps(
 
 
 __all__ = [
-    "BATCH_ROW_LIMIT", "CREDITS_PER_ROW", "FRONTIER_START", "Candidate", "Caps",
-    "advance", "allocate", "batch_rows", "credits_for", "discover_accounts",
-    "lock_allocated", "resolve_caps", "round_limits", "row_allowance",
-    "spent_credits", "take_within_caps",
+    "BATCH_ROW_LIMIT", "CREDITS_PER_ROW", "FRONTIER_START", "RESUME_MARGIN",
+    "SPEND_WINDOW", "Candidate", "Caps", "PauseSnapshot", "advance", "allocate",
+    "batch_rows", "credits_for", "discover_accounts", "lock_allocated",
+    "resolve_caps", "resume_times", "round_limits", "row_allowance",
+    "scope_resume", "spent_credits", "take_within_caps",
 ]

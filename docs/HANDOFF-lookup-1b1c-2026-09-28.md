@@ -1,5 +1,11 @@
 # HANDOFF — contact lookup, after 1b-1b-iii (the spend cap is DONE) -> Phase 1b-1c, 2026-09-28
 
+> **STATUS UPDATE (2026-09-28, later the same day):** the 1b-1c plan reached Codex `PLAN: GO`
+> and the owner approved it; **1b-1c-i (planner + pricing) is BUILT** and ships in the PR that
+> carries this file. **Next: 1b-1c-ii, the quote endpoint.** The plan file's "FINAL 1b-1c
+> contract and build list" and "1b-1c-i BUILT" sections supersede "Next step" below; the two
+> "Open items" are closed (the prod pause hash was read live; the journal entry is in this PR).
+
 Read this whole file before touching anything. Then read, in order:
 1. `tasks/todo-lookup-contacts.md`, these parts (search the quoted text):
    - **"### Revised split and ORDER"** (~line 827): 1b-1a -> 1b-1b -> **1b-1c PLANNER + QUOTE**

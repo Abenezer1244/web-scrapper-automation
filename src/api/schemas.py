@@ -750,6 +750,57 @@ class ConfigRunEligibilityResponse(BaseModel):
         return self
 
 
+# ─── 402 bodies (POST /jobs, POST /batches) ──────────────────────────────────
+# A route declares every 402 shape it can return, as an anyOf. A run refusal
+# also satisfies the plain shape (both have a string detail): tell them apart by
+# the presence of `code`. Kept anyOf on purpose; exclusivity would need
+# additionalProperties: false, which breaks a client the day a key is added.
+
+
+class RunRefusalResponse(BaseModel):
+    """A run refused by the AI monthly limit or the account rule
+    (``src.api.errors``). ``detail`` is the same sentence this 402 has always
+    carried; ``code`` and ``resumes_at`` were ADDED beside it, and more
+    top-level keys may be added, so ignore keys you do not know."""
+
+    detail: str
+    code: Literal["ai_limit", "frozen", "ended", "over_limit"]
+    # When the block lifts by itself: ai_limit (next UTC month start) and
+    # over_limit (the quota reset; null if the term ends first). Else null.
+    resumes_at: datetime | None
+
+
+class EntitlementRefusalDetail(BaseModel):
+    code: str
+    title: str
+    message: str
+
+
+class EntitlementRefusalResponse(BaseModel):
+    """The plan does not include what was asked for (``entitlements.plan_limit_http``)."""
+
+    detail: EntitlementRefusalDetail
+
+
+class PlainRefusalResponse(BaseModel):
+    """A 402 that carries only a sentence (e.g. the batch plan gate)."""
+
+    detail: str
+
+
+# The 402 declaration shared by the routes that start runs.
+RUN_START_402_RESPONSES: dict[int | str, dict[str, Any]] = {
+    402: {
+        "model": RunRefusalResponse | EntitlementRefusalResponse | PlainRefusalResponse,
+        "description": (
+            "Refused. A run refusal (AI limit, frozen, ended, over the record "
+            "limit) has a top-level `code`; a plan refusal has an object "
+            "`detail`; anything else is a sentence in `detail`."
+        ),
+    },
+}
+
+
 class ScraperConfigResponse(BaseModel):
     id: str
     user_id: str

@@ -17,6 +17,7 @@ from src.api import (
     segments_router,
     webhooks_router,
 )
+from src.api.errors import RunRefusedHTTPException, run_refused_handler
 from src.api.middleware import SecurityHeadersMiddleware
 from src.api.readiness import database_ready
 from src.config import settings
@@ -109,6 +110,11 @@ async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSON
         "Unhandled error ref=%s method=%s path=%s", ref, request.method, request.url.path
     )
     return JSONResponse(status_code=500, content={"detail": "Internal error", "ref": ref})
+
+
+# A refused run's 402 carries a machine code beside its unchanged sentence
+# (src/api/errors.py). Resolved by MRO, so it wins over the HTTPException default.
+app.add_exception_handler(RunRefusedHTTPException, run_refused_handler)
 
 
 # ─── Logging: strip secrets from access logs ─────────────────────────────────

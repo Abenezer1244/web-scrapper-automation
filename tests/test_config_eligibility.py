@@ -4,8 +4,8 @@
 why" for a whole list at once. ``POST /jobs`` makes its decision through it and
 ``GET /scrapers`` reports it, so the Run now button cannot disagree with the
 gate. Every row here is real, in the test database; connectors are created
-under throwaway county names and removed afterwards (the shared ``db`` teardown
-does not delete connectors).
+under throwaway county names through the conftest ``connectors`` fixture, which
+removes them afterwards (the shared ``db`` teardown does not).
 """
 
 from __future__ import annotations
@@ -16,12 +16,12 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from httpx import AsyncClient
 from pydantic import ValidationError
-from sqlalchemy import delete, event
+from sqlalchemy import event
 
 import src.db.session as _db_session
 from src.api.auth import create_secure_token, hash_password
 from src.config import settings
-from src.db.models import CountyConnector, Job, ScraperConfig, User
+from src.db.models import Job, ScraperConfig, User
 
 FROZEN_MSG = (
     "Your subscription payment could not be completed, so new scrapes are "
@@ -43,30 +43,6 @@ def _next_month_start(now: datetime) -> datetime:
 
 def _county() -> str:
     return f"elig{uuid.uuid4().hex[:8]}"
-
-
-@pytest.fixture
-async def connectors(db):
-    """Create connectors through this; every one is deleted at teardown."""
-    made: list[str] = []
-
-    async def make(county, record_types, mode, *, created_at=None, state="WA", active=True):
-        c = CountyConnector(
-            id=str(uuid.uuid4()), county=county, state=state, record_types=record_types,
-            scraper_class="src.scrapers.base_scraper.BridgeScraper",
-            scraper_mode=mode, base_url=f"https://{county}.example.gov",
-            health_status="healthy", active=active,
-        )
-        if created_at is not None:
-            c.created_at = created_at
-        db.add(c)
-        await db.commit()
-        made.append(c.id)
-        return c
-
-    yield make
-    await db.execute(delete(CountyConnector).where(CountyConnector.id.in_(made)))
-    await db.commit()
 
 
 async def _user(db, **kw) -> User:

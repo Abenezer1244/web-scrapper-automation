@@ -34,7 +34,15 @@ from sqlalchemy.pool import NullPool
 import src.db.session as _db_session
 from src.api.auth import create_secure_token, hash_password
 from src.config import settings
-from src.db.models import Job, JobLog, PropertyListMembership, Result, ScraperConfig, User
+from src.db.models import (
+    CountyConnector,
+    Job,
+    JobLog,
+    PropertyListMembership,
+    Result,
+    ScraperConfig,
+    User,
+)
 
 
 def pytest_configure(config):
@@ -308,3 +316,33 @@ async def pending_job(db: AsyncSession, starter_user: User, scraper_config: Scra
     await db.commit()
     await db.refresh(job)
     return job
+
+
+# ─── Connector factory ────────────────────────────────────────────────────────
+
+@pytest_asyncio.fixture
+async def connectors(db: AsyncSession):
+    """Create county connectors through this; every one is deleted at teardown.
+
+    The ``db`` teardown does not delete connectors (they are not per-user rows),
+    so a test that makes its own must clean them up. Use throwaway county names.
+    """
+    made: list[str] = []
+
+    async def make(county, record_types, mode, *, created_at=None, state="WA", active=True):
+        c = CountyConnector(
+            id=str(uuid.uuid4()), county=county, state=state, record_types=record_types,
+            scraper_class="src.scrapers.base_scraper.BridgeScraper",
+            scraper_mode=mode, base_url=f"https://{county}.example.gov",
+            health_status="healthy", active=active,
+        )
+        if created_at is not None:
+            c.created_at = created_at
+        db.add(c)
+        await db.commit()
+        made.append(c.id)
+        return c
+
+    yield make
+    await db.execute(delete(CountyConnector).where(CountyConnector.id.in_(made)))
+    await db.commit()

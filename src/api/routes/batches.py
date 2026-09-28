@@ -34,9 +34,11 @@ from src.api.entitlements import (
     schedule_frequency_violation,
     skip_trace_violation,
 )
+from src.api.errors import run_refusal_http
 from src.api.lead_actionability import actionable_condition
 from src.api.middleware.rate_limit import rate_limit
 from src.api.schemas import (
+    RUN_START_402_RESPONSES,
     BatchChildSummary,
     BatchCreateRequest,
     BatchCreateResponse,
@@ -171,7 +173,12 @@ def derive_batch_child_name(batch_name: str | None, county: str, record_type: st
     return f"{clean[:keep].rstrip()} - {suffix}"
 
 
-@router.post("", response_model=BatchCreateResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "",
+    response_model=BatchCreateResponse,
+    status_code=status.HTTP_201_CREATED,
+    responses=RUN_START_402_RESPONSES,
+)
 async def create_batch(
     body: BatchCreateRequest,
     request: Request,
@@ -270,15 +277,14 @@ async def create_batch(
     #    cap, or when the account is frozen for a failed payment.
     #    (Records-per-scrape isn't predictable; this honest check blocks a batch
     #    that would only error at the quota wall.) -1/None = unlimited, and
-    #    quota_block_reason already treats that as never over.
-    from src.api.quota import quota_block_reason
+    #    run_eligibility already treats that as never over. Its message is the
+    #    sentence quota_block_reason returned here before (it is that wrapper's
+    #    source); the code and resumes_at ride beside it (src/api/errors.py).
+    from src.api.quota import run_eligibility
 
-    _blocked = quota_block_reason(current_user)
-    if _blocked:
-        raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail=_blocked,
-        )
+    _account = run_eligibility(current_user, datetime.now(UTC))
+    if not _account.can_run:
+        raise run_refusal_http(_account.code, _account.message, _account.resumes_at)
 
     # 5. Validate EVERY (county, record_type) against the connector registry for
     #    this state. Reject the whole batch on any unsupported combo (predictable).

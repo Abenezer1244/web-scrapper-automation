@@ -238,6 +238,15 @@ def validate_scraping_target(
     if parsed.scheme not in ("https", "http"):
         raise ValueError("Only HTTP/HTTPS scraping targets are permitted")
 
+    # S3-08: the host checked here must be the host the fetch dials. urlparse and
+    # requests/urllib3 disagree on where the authority ends when it carries a
+    # backslash or userinfo: "http://evil.example\@portal.gov/" is portal.gov to
+    # urlparse but evil.example to requests. Refuse both forms; neither appears
+    # in a legitimate scraping target. (A backslash in the path or query is fine.)
+    authority = re.split(r"[/?#]", url.split("://", 1)[-1], maxsplit=1)[0]
+    if "\\" in authority or "@" in parsed.netloc:
+        raise ValueError("Scraping target URL must not carry userinfo or a backslash")
+
     raw_hostname = (parsed.hostname or "").strip().rstrip(".").lower().split("%", 1)[0]
     hostname = _normalize_hostname(parsed.hostname or "")
 

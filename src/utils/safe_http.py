@@ -20,14 +20,26 @@ from urllib.parse import urljoin, urlparse
 import requests
 
 from src.api.middleware.security import _normalize_hostname, validate_scraping_target
+from src.utils.pinned_http import is_blocked_destination, pinned_session
 
 _DEFAULT_PORTS = {"http": 80, "https": 443}
 
-# trust_env=False: an ambient HTTP(S)_PROXY/NO_PROXY could otherwise move DNS
-# resolution and the connection off-box (to the proxy), defeating the
-# resolve=True SSRF check we just ran. We resolve + connect locally.
-_SESSION = requests.Session()
-_SESSION.trust_env = False
+# Pinned (audit #5, S3-08): the socket goes only to an address the SSRF policy
+# approved, resolved in the same step, so a DNS answer that changes between
+# validate_scraping_target and the connect (rebinding) cannot reach an internal
+# host. No proxies, ambient or explicit: a proxy would resolve for us.
+_SESSION = pinned_session()
+
+
+def _get(url: str, **kwargs) -> requests.Response:
+    """``_SESSION.get``, with a connect-time SSRF refusal raised as the ValueError
+    every caller already handles for a refused target."""
+    try:
+        return _SESSION.get(url, **kwargs)
+    except requests.RequestException as exc:
+        if is_blocked_destination(exc):
+            raise ValueError("Scraping target not permitted") from None
+        raise
 
 
 def _port_of(parsed) -> int | None:
@@ -122,7 +134,7 @@ def safe_get(
     validate_scraping_target(url, require_allowlisted=require_allowlisted, resolve=True)
     if same_origin_as is not None and not same_origin(url, same_origin_as):
         raise ValueError("Refusing to send request to a different origin")
-    resp = _SESSION.get(
+    resp = _get(
         url,
         params=params,
         cookies=cookies,
@@ -164,7 +176,7 @@ def safe_get_following(
         if require_https and urlparse(current).scheme != "https":
             raise ValueError("HTTPS required for this fetch")
         validate_scraping_target(current, require_allowlisted=require_allowlisted, resolve=True)
-        resp = _SESSION.get(
+        resp = _get(
             current, headers=headers, timeout=timeout, allow_redirects=False, stream=True
         )
         if resp.status_code in _REDIRECT_CODES:
@@ -227,7 +239,7 @@ def safe_download_to_file(
         if require_https and urlparse(current).scheme != "https":
             raise ValueError("HTTPS required for this download")
         validate_scraping_target(current, require_allowlisted=require_allowlisted, resolve=True)
-        resp = _SESSION.get(
+        resp = _get(
             current,
             headers=headers,
             timeout=timeout,

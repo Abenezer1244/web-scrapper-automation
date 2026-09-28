@@ -70,6 +70,9 @@ inherit the previous owner's phone (probate makes this likely: deceased owner, t
   field is simply absent and nothing else breaks. The dialog warns before confirming, and after
   confirming the results page says lookups are paused and when they resume, instead of an endless
   "looking".
+  **(2026-09-27) The key name, TTL and read pattern here are SUPERSEDED by the v1 contract in
+  "Phase 1b-1b-iii" (consult r1 E2, E5): hash `bridgeleads:skip_trace:pause:v1`, fixed-field
+  `HMGET`, heartbeat, fenced writes.**
 
   **D3-b REVERSED 2026-09-22 (owner): the per-account daily cap is NO LONGER deferred and
   moves into Phase 1b-1.** The reasoning that deferred it assumed the cap would rarely bind.
@@ -1079,7 +1082,8 @@ code before being accepted; they are PRE-EXISTING defects in live code, not in t
   publish reads as UNKNOWN, never "not paused"; publish EVERY account at or over its cap, with
   or without queued rows (the quote comes before any row exists); the API reads only
   `HGET <own user_id>`, never the whole hash; the key is namespaced; the TTL covers the latest
-  resume time and each value is compared with now.
+  resume time and each value is compared with now. (2026-09-27: "HGET" became a fixed-field
+  `HMGET` of metadata + `global` + the own field: see "Phase 1b-1b-iii" consult r1 E5.)
 - **C11 (P1) unit.** A row cap lets 100 advanced rows spend ~200 credits. OWNER DECISION below.
 - **C12 (P1)** freeze the unknown-outcome state machine: test initial unknown, partial-resubmit
   unknown, 429/5xx, definite rejection, full and partial 402, reconciler release, adoption,
@@ -1753,6 +1757,334 @@ planner already drops it as fixed. Tried and reverted.)
 - [x] Codex diff review each to GO; quiet check before each merge (ii-c-2: #366 merged
       `2e839076` 2026-09-27 10:00Z after diff r1 GO + r2 GO + a rebase check GO; worker runs it,
       first tick OK on an empty queue)
+
+## Phase 1b-1b-iii — the PAUSE STATE (PLAN, 2026-09-27, BEFORE Codex consult)
+
+Branch `feat/lookup-1b1b-iii-pause-state` off `f80f79ce` (everything through #373 live).
+Binding inputs: D3, 15-10, C8-C10, C13, and the one-line scope in "Revised split".
+
+### Facts (read in code, 2026-09-27)
+- The early global check (`dispatch_pending_skip_trace`, top) returns
+  `{"skipped": "daily_cap"}` + ops alert. The in-lock pass `continue`s on `global_rows == 0`
+  and only logs. An account at its cap is simply given no room by `round_limits()`; nothing
+  records that it is paused. Nothing computes a resume time or writes Redis.
+- `spent_credits()` reads `submitted_at >= now - 24h` over 102's index
+  `(submitted_at) INCLUDE (user_id, trace_type)`. A row stops counting once
+  `now - 24h > submitted_at`. Rows in the window are bounded by the global cap (prod 2000
+  credits), so a per-tick read of them is cheap.
+- A pass may need 1 credit (normal) or 2 (advanced): an account 1 credit under its cap is
+  paused for advanced lookups but not for normal ones.
+- The dispatcher runs on the shared `celery` queue beside the other beat tasks, so a tick can
+  start late; the beat interval restarts in full on every deploy (39-50 s container gap).
+  `scheduler.py` imports no settings today; `tests/test_beat_schedule.py` fails any plain
+  interval >= 600 s.
+- Redis in workers: `redis.from_url(settings.REDIS_URL, **settings.redis_kwargs())`, as
+  `ops_alerts.py` does. Tests have a local Redis (`conftest.redis_client`, local-only FLUSHDB).
+
+### Design
+1. **Resume time (15-10), in `skip_trace_capacity.py`:** `resume_times(db, now, caps)`, ONE
+   read of the rows in the window ordered `(submitted_at, tracerfy_queue_id NULLS FIRST, id)`
+   with a running credit sum (`_weight_sql`), globally and per account. For a scope with spend
+   `S` and cap `C`, a lookup of cost `c` fits once `S - C + c` credits have left the window, so
+   `resume_at(c)` = `submitted_at` of the first row whose running sum reaches `S - C + c`,
+   + 24h + 1 s margin (the `>=` boundary). `None` when it fits now. Computed for `c = 1` and
+   `c = 2`. Reported only for scopes where the advanced lookup does not fit
+   (`S + 2 > C`, cap on).
+2. **Redis contract (C8-C10, D3), NEW `src/workers/skip_trace_pause_state.py`:**
+   - Key `bridgeleads:skip_trace:pause:v1`, one HASH. Fields: `published_at`, `fresh_until`
+     (ISO UTC), `global` and one per paused `<user_id>`, each a JSON
+     `{"normal_resume_at": iso|null, "advanced_resume_at": iso}`. No spend or cap numbers
+     (customers see only when they resume).
+   - Every account whose advanced lookup does not fit is published, with or without queued
+     rows (the quote comes before any row).
+   - Written EVERY tick (not only paused ones) as ONE `MULTI`: `DEL`, `HSET` all fields,
+     `EXPIRE ttl`. So the heartbeat is refreshed each tick, and a field is gone on the first
+     tick that no longer pauses it: no stale "paused" after resume. The empty-hash case still
+     carries `published_at`/`fresh_until`, so "not paused" is distinguishable from "unknown".
+   - `fresh_until = now + 2 * interval + GRACE` (GRACE 120 s: the deploy gap plus a slow tick
+     with two 30 s POSTs). TTL = `max(2 * interval + GRACE, latest resume_at - now + GRACE)`,
+     from the SETTING, never 600 hardcoded.
+   - A reader `read_pause_state(r, user_id, now)` defines the API side of the contract
+     (1c calls it): `HMGET key published_at fresh_until global <user_id>`, never `HGETALL`.
+     Missing key, missing or past `fresh_until`, malformed JSON, or Redis error → `UNKNOWN`.
+     Otherwise each resume time is compared with now (a past one reads as not paused).
+     Returns `PAUSED(normal_resume_at, advanced_resume_at)` combining account and global
+     (the later of the two per cost), `NOT_PAUSED`, or `UNKNOWN`.
+   - Redis unreachable on publish: WARNING logged, the tick's result is unchanged, nothing
+     raises. ADVISORY only: nothing reads it to decide spend (the in-lock DB read does).
+3. **Where it runs (dispatcher):** the tick body becomes `_dispatch_tick()`;
+   `dispatch_pending_skip_trace()` calls it, then `publish_pause_state()` in `finally`, in its
+   OWN system session (not under the claim lock, which is not needed for an advisory read).
+   So the early global-cap exit, `claim_locked`, every deferral and a raising tick all
+   publish. Not when `SKIP_TRACE_ENABLED` is off or the token is missing: then the heartbeat
+   goes stale and the API reads UNKNOWN, which is true.
+4. **Beat interval (C13):** `SKIP_TRACE_DISPATCH_INTERVAL_SECONDS: int = 300`, validator
+   `60 <= v < 600` (600+ must be a crontab: `landmine_beat_intervals_reset_on_every_deploy`).
+   `scheduler.py` reads it for the `dispatch-pending-skip-trace` entry; the publisher reads
+   the SAME setting for `fresh_until`/TTL. Default = today's 300, so deploying changes nothing.
+
+### Split (5-file rule; the plan file counts)
+- **iii-a (interval setting)**: `settings.py`, `.env.example` (reads of it are denied to
+  Claude: the owner adds the line, or an append-only write if allowed), `scheduler.py`,
+  `tests/test_beat_schedule.py`, this plan = 5.
+- **iii-b (pause state)**: `skip_trace_capacity.py`, NEW `skip_trace_pause_state.py`,
+  `skip_trace_dispatcher.py`, NEW `tests/test_skip_trace_pause_state.py`, this plan = 5.
+
+### Tests (real PG + local Redis; Tracerfy via the `http://` rejection trick only)
+- [ ] iii-a: the entry's interval equals the setting; the validator refuses 59 and 600;
+      default 300 (deploy changes nothing).
+- [ ] Resume math: normal-only; an advanced row straddling `S - C + c`; ties on
+      `submitted_at` ordered by queue id then id; released rows (NULL) and rows past 24h ignored;
+      INVARIANT against `spent_credits()` itself: at `resume_at(c)` the scope has room for `c`,
+      1 s before it (margin removed) it does not.
+- [ ] Per-account vs global: account paused with global free; global paused with the account
+      free; both (reader returns the later time per cost); cap 0 → never published.
+- [ ] Account at its cap with NO queued rows is published.
+- [ ] Both directions: tick 1 paused → field present with resume times; age the rows out →
+      tick 2: field gone, `published_at` newer.
+- [ ] Heartbeat: missing key, `fresh_until` past, malformed field → UNKNOWN; fresh + no field
+      → NOT_PAUSED; resume time already past → not paused.
+- [ ] TTL follows the setting (interval 120 → `2*120+120`), and covers a resume 20 h out.
+- [ ] Early global-cap exit and `claim_locked` both publish.
+- [ ] Redis down (REDIS_URL to a closed local port): tick result identical, no raise; reader
+      UNKNOWN.
+- [ ] Reader never calls HGETALL (the call recorded on a real client subclass).
+- [ ] Mutations: margin dropped; tie-break dropped; `DEL` dropped (stale field survives);
+      TTL hardcoded 600; publish moved out of `finally` (early exit test fails); advanced
+      threshold `+2` → `+1`.
+- [ ] Regression batches: the ii-c list (credit cap + 103 tests, both skip-trace batches,
+      plan_entitlement_audit) + `test_beat_schedule`.
+
+### Questions for the consult
+- Q1 publish every tick vs only when a scope is paused (chosen: every tick, for the heartbeat).
+- Q2 reader in the worker module now (only tests use it until 1c) vs in 1c.
+- Q3 GRACE 120 s on a shared `celery` queue: is a late tick better read as UNKNOWN (chosen)?
+- Q4 the resume time does not include "next tick after": the UI says "after X".
+
+### Codex pre-code consult r1 (2026-09-27): PLAN: REVISE, 2 P1 + 7 P2 + 2 P3
+Output: `<scratchpad 4fe51d38>/codex_iii_consult_out.txt`. Q1, Q3, Q4 confirmed as chosen.
+SUPERSEDES the matching bullets above:
+- **E1 (P1) a cap of 1 can never buy an advanced lookup**, so `advanced_resume_at` has no
+  value. ACCEPTED: the validator on `SKIP_TRACE_DAILY_CREDIT_CAP`,
+  `SKIP_TRACE_ACCOUNT_DAILY_CREDIT_CAP` and the legacy `SKIP_TRACE_DAILY_ROW_CAP` (read as
+  credits) refuses 1: `0` (off) or `>= 2`. Prod values are 2000 / 500 (safe). In iii-a.
+- **E2 (P1) publish race.** A `claim_locked` tick reads spend before the claiming tick commits,
+  then publishes AFTER it and restores a stale view. ACCEPTED: a monotonic fence. The snapshot
+  time is `clock_timestamp()` read in the publisher's session BEFORE the window query (READ
+  COMMITTED: the query's snapshot is later, so it sees every commit before that time). The
+  write is ONE Lua script (atomic): it replaces the hash only if the stored `snapshot_us` is
+  absent or older, else it is a no-op, logged at DEBUG. Test: publish a newer snapshot, then an
+  older one; the newer survives.
+- **E3 (P2) `finally`.** ACCEPTED: the publisher's DB session is CLOSED before any Redis I/O,
+  the whole publisher is best-effort (WARNING, never raises), and tests assert a tick's return
+  value AND a tick's exception both pass through unchanged.
+- **E4 (P2) integer TTL.** ACCEPTED: `ceil(...)`, minimum 1 s; `fresh_until` from the same
+  `now` the snapshot used.
+- **E5 (P2) the binding text conflicts.** ACCEPTED: this contract SUPERSEDES D3's key name
+  (`skip_trace:daily_cap_paused`) and C8-C10's "HGET <own user_id>": the API reads a FIXED
+  field list with `HMGET` (metadata, `global`, its own `<user_id>`), never the whole hash and
+  never another tenant's field. Noted at D3 and C8-C10.
+- **E6 (P2) disabled / no token leaves a fresh "paused".** ACCEPTED: those paths `DEL` the key
+  (best-effort) so the reader returns UNKNOWN at once. Test: paused, then disabled.
+- **E7 (P2) cost.** ACCEPTED, bounded by construction: no read at all when both caps are 0;
+  the running sums run only for the GLOBAL scope (rows bounded by the global cap) and for the
+  accounts `spent_credits()` already found at their threshold (each bounded by its cap), over
+  102's `submitted_at` index with `user_id = ANY(:paused)`. One `now` for every window
+  calculation. Gate: EXPLAIN (ANALYZE, BUFFERS) on a seeded window of 100k rows / 500 accounts
+  with the account cap alone; add an index only if it fails (a migration = its own PR).
+- **E8 (P2)** already the plan (iii-a).
+- **E9 (P2) missing tests.** ACCEPTED, added below.
+- **E10 (P3) import weight.** `src/workers/__init__.py` builds the Celery app, and the API
+  (1c) will import the reader. ACCEPTED: the contract module moves to
+  `src/utils/skip_trace_pause_state.py` and imports only the stdlib and settings: the
+  writer takes the resume times and a Redis client as arguments (the dispatcher computes them
+  with `skip_trace_capacity.resume_times()` and opens the client); the reader takes a client.
+- **E11 (P3) the conftest Redis fixture lacks `redis_kwargs()` and never closes.** NARROWED:
+  the new test file builds its own client with `settings.redis_kwargs()` and closes it;
+  changing `tests/conftest.py` would be a 6th file. Logged as a follow-up.
+
+**Revised iii-b files:** `skip_trace_capacity.py`, NEW `src/utils/skip_trace_pause_state.py`,
+`skip_trace_dispatcher.py`, NEW `tests/test_skip_trace_pause_state.py`, this plan = 5.
+**Tests added (E9):** overlapping-publish fence (older snapshot loses); cap 1 refused; paused
+then disabled → UNKNOWN; TTL of a fractional duration rounds UP; malformed
+`fresh_until` / `snapshot_us` / field JSON → UNKNOWN; the publisher's DB read failing → tick
+result unchanged, WARNING logged; the client is built with `redis_kwargs()`.
+**Mutations added:** fence compare flipped; `ceil` → `int`; disabled-path DEL dropped;
+session closed after (not before) the Redis write is not mutation-testable, asserted by a
+test that the session is closed when the client is called.
+
+### Codex pre-code consult r2 (2026-09-27): PLAN: REVISE, 2 P1 + 3 P2 + 1 P3
+Output: `<scratchpad 4fe51d38>/codex_iii_consult_r2_out.txt`. E3, E4, E8, E10, E11 confirmed.
+SUPERSEDES E1, E2, E5, E6, E7:
+- **G1 (P1) a clock is not a monotonic fence** (clock correction can move it back; equal
+  microseconds can occur). ADOPTED: the fence is `pg_current_xact_id()` (xid8: unique per
+  transaction, never reused, no migration), taken in the publisher's READ COMMITTED
+  transaction BEFORE the window query. Why that closes the race: the claiming tick's publisher
+  takes its xid after its claim committed; any publisher whose xid is larger took it after that
+  commit too, so its later snapshot includes the claim; any smaller one loses the compare. Stored
+  as a 20-digit zero-padded string, so the Lua compare is an exact string compare (no double
+  rounding). Tests: a newer fence then an older one (older is a no-op); an equal fence is a
+  no-op; two real publisher sessions interleaved around a committed claim.
+- **G2 (P1) a bare DEL lets an older in-flight publisher recreate "paused".** ADOPTED: the
+  disabled / no-token paths write a FENCED TOMBSTONE (the same Lua script, a hash with only
+  `fence` and `state=disabled`, no `fresh_until`, TTL `2 * interval + GRACE`), so the reader
+  returns UNKNOWN at once and an older publisher cannot overwrite it. Taking the fence costs
+  those paths one short system session. (A key that EXPIRES can still be recreated by a
+  publisher older than its TTL, i.e. one stalled for 2 intervals + grace between its DB read and
+  its Redis write: accepted, and the next tick's publish replaces it.)
+- **G3 (P2) E1 is WITHDRAWN**, not narrowed. Refusing a cap of 1 is a boot-breaking config
+  change, and ten live tests in `test_skip_trace_credit_cap.py` exercise `account_cap=1` at
+  runtime. Taken instead: r1's other option. When a scope's cap is below the cost of an
+  advanced lookup, `advanced_resume_at` is the literal `"never"`; the reader returns it as
+  `NEVER`; the TTL ignores it. Test: a cap of 1 publishes `"never"`. iii-a no longer touches the
+  cap validators.
+- **G4 (P2) cost claim narrowed.** `spent_credits()` groups the whole 24h window, and 102's
+  index leads on `submitted_at` only. With the global cap on (prod: 2000), the window holds at
+  most ~2000 rows. With ONLY an account cap, the publisher's read costs what the in-lock
+  `spent_credits()` read already costs every pass today (live since #364). The EXPLAIN gate
+  (100k-row window, 500 accounts, account cap only) is MANDATORY before the diff review; an
+  account-leading index, if it fails, is its own migration PR.
+- **G5 (P2) the field list is explicit:** `HMGET key published_at fresh_until fence global
+  <user_id>`. `fence` must parse as 20 digits and `fresh_until` as an ISO UTC time, or the
+  reader returns UNKNOWN.
+- **G6 (P3)** every test deletes the key and closes its client in a fixture finalizer.
+
+**iii-a files now:** `settings.py` (the interval setting only), `.env.example`, `scheduler.py`,
+`tests/test_beat_schedule.py`, this plan = 5. iii-b unchanged (5).
+
+### Codex pre-code consult r3 (2026-09-27): PLAN: REVISE, 1 P1 + 3 P2 + 2 P3, all adopted
+Output: `<scratchpad 4fe51d38>/codex_iii_consult_r3_out.txt`. The xid fence argument and the
+exact 20-digit string compare CONFIRMED; G2's residual accepted. Adopted: H1 the fence
+transaction is verified (below); H2 a tombstone-expiry test; H3 `NEVER` fully specified; H4 the
+gate runs the REAL resume query with thresholds; H5 Lua treats a malformed stored fence as
+absent; H6 one normative contract (below) replaces the scattered bullets.
+
+### FINAL contract and build list (normative; supersedes Design 1-3, E*, G* where they differ)
+**Resume time** — `skip_trace_capacity.resume_times(db, now, caps)`:
+- [ ] Scopes: `global` when the global cap is on; each account `spent_credits()` found with
+      `S + 2 > C` when the account cap is on. No read at all when both caps are 0.
+- [ ] Per scope and cost `c` in (1, 2): `None` when `S + c <= C` (fits now); the literal
+      `NEVER` when `1 <= C < c` (a cap of 1 never admits an advanced lookup); else the
+      `submitted_at` of the first row, ordered `(submitted_at, tracerfy_queue_id NULLS FIRST,
+      id)`, whose running credit sum reaches `S - C + c`, + 24h + 1 s.
+- [ ] One `now` for every window calculation in the tick's publish.
+
+**Fence transaction** (H1) — the publisher's own system session:
+- [ ] First statement `SET TRANSACTION ISOLATION LEVEL READ COMMITTED`; then ONE select of
+      `pg_current_xact_id()`, `pg_is_in_recovery()`, `current_setting('transaction_read_only')`.
+      In recovery or read-only → no publish, WARNING (best-effort; nothing else changes).
+- [ ] Then the window read; then the transaction is ended and the session CLOSED; only then
+      any Redis I/O.
+
+**Redis hash** `bridgeleads:skip_trace:pause:v1`, written by ONE Lua script:
+- [ ] Fields: `fence` (20-digit zero-padded xid), `published_at`, `fresh_until` (ISO UTC),
+      `global` and one per published `<user_id>`: JSON
+      `{"normal_resume_at": iso|null, "advanced_resume_at": iso|"never"|null}`. No spend or cap
+      numbers.
+- [ ] Script: if the stored `fence` is 20 ASCII digits and `>=` the incoming one → no-op
+      (DEBUG log); otherwise (absent, malformed, or older) → `DEL`, `HSET` all fields,
+      `EXPIRE ttl`. Atomic.
+- [ ] Every tick publishes (heartbeat), even with nothing paused.
+- [ ] `fresh_until = now + 2 * interval + GRACE` (GRACE = 120 s). TTL =
+      `ceil(max(2 * interval + GRACE, latest finite resume_at - now + GRACE))` seconds,
+      minimum 1; `NEVER` is excluded.
+- [ ] Disabled / no-token paths publish a TOMBSTONE through the same script: `fence` +
+      `state=disabled`, no `fresh_until`, TTL `2 * interval + GRACE`.
+
+**Reader** — `read_pause_state(r, user_id, now)` in `src/utils/skip_trace_pause_state.py`
+(stdlib + settings only; the API calls it in 1c):
+- [ ] `HMGET key published_at fresh_until fence global <user_id>`; never `HGETALL`, never
+      another tenant's field.
+- [ ] UNKNOWN when: Redis errors; the key or `fence` or `fresh_until` is missing; `fence` is
+      not 20 digits; `fresh_until` is not ISO UTC or is `<= now`; a field is malformed JSON.
+- [ ] Otherwise, per cost, combine account and global: `NEVER` dominates, else the later
+      finite time; a time `<= now` counts as `None`. Both costs `None` → `NOT_PAUSED`; else
+      `PAUSED(normal_resume_at, advanced_resume_at)`. UI meaning (1c): `NEVER` = "advanced
+      lookups are unavailable under the current limit", normal ones may still run.
+
+**Dispatcher:**
+- [ ] The tick body becomes `_dispatch_tick()`; `dispatch_pending_skip_trace()` returns its
+      result and, in `finally`, calls the best-effort publisher. A tick's return value and a
+      tick's exception pass through unchanged; a publisher failure is only a WARNING.
+
+**Beat interval (iii-a):**
+- [x] `SKIP_TRACE_DISPATCH_INTERVAL_SECONDS: int = 300`, validator `60 <= v < 600`;
+      `scheduler.py` uses it; the publisher uses the SAME setting.
+
+**Gate (H4, before the diff review):** EXPLAIN (ANALYZE, BUFFERS) of the real
+`resume_times()` query on a seeded window of 100k rows over 500 accounts, for: account cap
+only; global + account caps; all 500 accounts paused (worst case). Pass = under 100 ms
+execution, warm, each. A fail = an account-leading index in its own migration PR first.
+
+**Tests** (`tests/test_skip_trace_pause_state.py`, real PG + local Redis, a client built
+with `settings.redis_kwargs()`, key deleted and client closed in a finalizer):
+- [ ] Resume math: normal-only; an advanced row straddling `S - C + c`; ties by queue id
+      then id; NULL `submitted_at` and rows past 24h ignored; INVARIANT against
+      `spent_credits()` itself at `resume_at(c)` (room) and 1 s before it (no room).
+- [ ] Per-account vs global: each alone, both (the later time per cost), a cap of 1 on each
+      (`NEVER`, and `NEVER` + a finite time → `NEVER`), both caps 0 (no read, nothing paused).
+- [ ] An account at its cap with NO queued rows is published.
+- [ ] Both directions: paused tick → field present; rows aged out → next tick: field gone,
+      `published_at` newer.
+- [ ] Fence: newer then older (older no-ops); equal (no-op); malformed stored fence
+      (replaced); two real sessions interleaved around a committed claim (the post-claim view
+      survives); tombstone then an older publish (tombstone survives); tombstone EXPIRED then
+      the stale publish recreates, then the next fenced publish wins (H2).
+- [ ] Fence transaction: a read-only transaction → no publish, WARNING.
+- [ ] Heartbeat / reader: missing key, missing or malformed `fence` / `fresh_until`,
+      `fresh_until` past, malformed JSON → UNKNOWN; fresh + no own field → NOT_PAUSED; a past
+      resume time → not paused; HMGET only (a real client subclass records the calls).
+- [ ] TTL follows the setting (120 → 360 s), rounds a fractional duration UP, covers a resume
+      20 h out, ignores `NEVER`.
+- [ ] Dispatcher: the early global-cap exit, `claim_locked` and a normal tick all publish;
+      disabled and no-token write the tombstone; a tick's return and a raised exception pass
+      through; the publisher's DB read failing → tick result unchanged + WARNING; the DB
+      session is closed when the Redis client is first called; Redis on a closed local port →
+      tick unchanged, reader UNKNOWN.
+- [x] iii-a (`tests/test_beat_schedule.py`): the entry equals the setting; 59 and 600 refused;
+      default 300.
+- [ ] Mutations, each caught: margin dropped; tie-break dropped; `+ 2` threshold → `+ 1`;
+      `NEVER` branch dropped; fence compare flipped; malformed-fence-as-absent dropped;
+      tombstone dropped (plain DEL); `ceil` → `int`; TTL hardcoded 600; publish moved out of
+      `finally`; the read-only check dropped.
+- [ ] Regression: credit cap + 103 tests, both skip-trace batches, plan_entitlement_audit,
+      test_beat_schedule.
+
+### Codex pre-code consult r4 (2026-09-27): PLAN: REVISE, 1 P1 + 1 P2, both adopted
+Output: `<scratchpad 4fe51d38>/codex_iii_consult_r4_out.txt`. Amends the FINAL contract:
+- **I1 (P1) an account cap of 1 was invisible for an account with no spend** (it is not in
+  `spent_credits()`, so it had no field and read NOT_PAUSED, yet its advanced lookups can never
+  run). Fix: a new ALWAYS-published field `account_default`, the state of any account without
+  its own field: `{"normal_resume_at": null, "advanced_resume_at": "never"}` when
+  `1 <= account cap < 2`, else both `null`. The reader uses its own field if present, else
+  `account_default`. Test: a zero-spend account with no queued rows under an account cap of 1
+  reads `PAUSED(None, NEVER)`.
+- **I2 (P2) strict reader.** `global` and `account_default` are ALWAYS published (both `null`s
+  when that cap is off or not binding). HMGET list becomes `published_at fresh_until fence
+  global account_default <user_id>`. Each JSON value must be an object with EXACTLY the two
+  keys; `normal_resume_at` is `null` or an ISO UTC time; `advanced_resume_at` is `null`,
+  `"never"` or an ISO UTC time. Any violation, or a missing `global` / `account_default` →
+  UNKNOWN. Tests: missing `global`; missing `account_default`; extra key; wrong type; a
+  non-UTC or unparseable time; `"never"` in `normal_resume_at`. Mutation: shape validation
+  dropped.
+
+### Codex pre-code consult r5 (2026-09-27): PLAN: REVISE, 1 P2, adopted. I1, I2 CLOSED.
+- **J1 (P2)** `published_at` is required and validated like `fresh_until`: missing or not an
+  ISO UTC time → UNKNOWN. Tests: missing; malformed.
+
+### Codex pre-code consult r6 (2026-09-27): **PLAN: GO**. J1 closed, no new findings.
+Output: `<scratchpad 4fe51d38>/codex_iii_consult_r6_out.txt`. Next: the OWNER checks this plan
+before any code (iii-a first, then iii-b). **Owner approved the plan, the `.env.example`
+append and the 100 ms gate (2026-09-27).**
+
+### iii-a BUILT (2026-09-27), before the Codex diff review
+- `SKIP_TRACE_DISPATCH_INTERVAL_SECONDS` (default 300, validator 60..599) in `settings.py`; the
+  beat entry reads it; `.env.example` line appended (commented). 4 new tests in
+  `test_beat_schedule.py` (the entry rebuilt at 120 reads 120; default 300; 59/60/599/600).
+- Mutations, each caught by its own test: the entry hardcoded back to 300; the bound widened to
+  `<= 600`.
+- Regression: `test_beat_schedule` + all 27 test files importing the scheduler +
+  `test_skip_trace_credit_cap`: 904 passed, 0 failed. ruff clean.
 
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever

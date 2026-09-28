@@ -43,7 +43,7 @@ def _columns(conn) -> dict[str, tuple[str, str]]:
 
 def test_head_has_six_nullable_integer_breakdown_columns():
     with sync_engine.connect() as conn:
-        assert _columns(conn) == {c: ("integer", "YES") for c in BREAKDOWN_COLUMNS}
+        assert _columns(conn) == dict.fromkeys(BREAKDOWN_COLUMNS, ("integer", "YES"))
 
 
 def test_106_chains_on_105():
@@ -60,6 +60,6 @@ def test_106_downgrade_drops_and_upgrade_restores_them():
                 mig.downgrade()
                 assert _columns(conn) == {}
                 mig.upgrade()
-            assert _columns(conn) == {c: ("integer", "YES") for c in BREAKDOWN_COLUMNS}
+            assert _columns(conn) == dict.fromkeys(BREAKDOWN_COLUMNS, ("integer", "YES"))
         finally:
             trans.rollback()

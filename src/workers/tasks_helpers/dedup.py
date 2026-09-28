@@ -663,8 +663,9 @@ def collapse_same_run_siblings(db, job_id: str, user_id, record_type=None) -> in
     the results page says "combined" rather than "already delivered" -- they were
     never delivered before, they are being seen for the first time.
 
-    Returns the number NEWLY collapsed, for the caller's dup_count. Does NOT
-    commit; the caller's transaction owns the write.
+    Returns the number NEWLY collapsed (the caller logs it; billing and the
+    run-count breakdown count the same_run rows in the DB). Does NOT commit; the
+    caller's transaction owns the write.
 
     NOTE for the caller: a collapsed sibling leaves the plan cap's view, because
     the cap ranks non-duplicates only. If the SURVIVOR is later capped, its
@@ -748,7 +749,7 @@ def reconcile_same_run_survivors(db, job_id: str, user_id, record_type=None) -> 
 
     Returns the number of groups whose survivor actually changed. The per-group
     duplicate count is invariant by construction -- exactly one survivor before,
-    exactly one after -- so the caller's dup_count and the charge do not move.
+    exactly one after -- so the duplicate count and the charge do not move.
     """
     rows = db.execute(
         sa_text(

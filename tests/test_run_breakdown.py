@@ -85,8 +85,7 @@ async def test_every_row_state_lands_in_exactly_one_bucket(db, starter_user, scr
 
     got = await _partition(db, job_id, starter_user.id)
 
-    want = {b: 0 for b in ("no_address", "same_run_merged", "already_delivered",
-                           "over_quota", "new")}
+    want = dict.fromkeys(("no_address", "same_run_merged", "already_delivered", "over_quota", "new"), 0)
     for _, bucket in EVERY_STATE:
         want[bucket] += 1
     assert got == RowPartition(**want, unclassified=0)
@@ -140,17 +139,17 @@ async def test_empty_run_is_six_zeros_that_validate(db, starter_user, scraper_co
         records_found=0, retry_count=0, partition=partition,
     )
     assert reason is None
-    assert cols == {col: 0 for col in SNAPSHOT_COLUMNS.values()}
+    assert cols == dict.fromkeys(SNAPSHOT_COLUMNS.values(), 0)
 
     job = Job(records_found=0, record_count=0, billed_count=0, **cols)
-    assert breakdown_from_job(job) == ({f: 0 for f in SNAPSHOT_COLUMNS}, None)
+    assert breakdown_from_job(job) == (dict.fromkeys(SNAPSHOT_COLUMNS, 0), None)
 
 
 # ── the done-CAS decision: one test per branch ───────────────────────────────
 
 def _decide(base, **over):
-    kw = dict(billed_now=True, attempt_started_at=STARTED, row_started_at=STARTED,
-              records_found=base.persisted + 2, retry_count=0, partition=base)
+    kw = {"billed_now": True, "attempt_started_at": STARTED, "row_started_at": STARTED,
+          "records_found": base.persisted + 2, "retry_count": 0, "partition": base}
     kw.update(over)
     return snapshot_columns(**kw)
 
@@ -190,7 +189,7 @@ def test_lost_ownership_names_no_column():
 ])
 def test_owner_with_untrustworthy_numbers_writes_six_nulls(over):
     cols, reason = _decide(P, **over)
-    assert cols == {col: None for col in SNAPSHOT_COLUMNS.values()}
+    assert cols == dict.fromkeys(SNAPSHOT_COLUMNS.values())
     assert reason
 
 
@@ -205,17 +204,17 @@ async def test_retried_run_is_refused_even_when_the_difference_looks_valid(
     partition = await _partition(db, job_id, starter_user.id)
 
     cols, reason = _decide(partition, records_found=5, retry_count=1)
-    assert cols == {col: None for col in SNAPSHOT_COLUMNS.values()}
+    assert cols == dict.fromkeys(SNAPSHOT_COLUMNS.values())
     assert "retried" in reason
 
 
 # ── reading a stored snapshot ────────────────────────────────────────────────
 
 def _stored(**over):
-    base = dict(records_found=267, record_count=12, billed_count=12,
-                breakdown_dropped_before_save=2, breakdown_no_address=7,
-                breakdown_same_run_merged=0, breakdown_already_delivered=246,
-                breakdown_over_quota=0, breakdown_new=12)
+    base = {"records_found": 267, "record_count": 12, "billed_count": 12,
+            "breakdown_dropped_before_save": 2, "breakdown_no_address": 7,
+            "breakdown_same_run_merged": 0, "breakdown_already_delivered": 246,
+            "breakdown_over_quota": 0, "breakdown_new": 12}
     base.update(over)
     return Job(**base)
 
@@ -281,13 +280,13 @@ def test_completion_message_without_a_snapshot_states_only_the_charge():
 
 
 def test_completion_message_all_zero_has_no_parentheses_and_singular_lead():
-    zero = {f: 0 for f in SNAPSHOT_COLUMNS}
+    zero = dict.fromkeys(SNAPSHOT_COLUMNS, 0)
     assert completion_message(1, {**zero, "new": 1}) == "Job complete: 1 new lead"
     assert completion_message(0, zero) == "Job complete: 0 new leads"
 
 
 def test_completion_message_lists_only_non_zero_buckets_in_fixed_order():
-    one = {f: 0 for f in SNAPSHOT_COLUMNS} | {"new": 12, "no_address": 7}
+    one = dict.fromkeys(SNAPSHOT_COLUMNS, 0) | {"new": 12, "no_address": 7}
     assert completion_message(12, one) == "Job complete: 12 new leads (7 without an address)"
 
     every = {"dropped_before_save": 1, "no_address": 7, "same_run_merged": 3,

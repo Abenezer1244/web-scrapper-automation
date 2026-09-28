@@ -162,13 +162,38 @@ def snapshot_columns(
     elif partition.persisted > records_found:
         reason = f"{partition.persisted} saved but only {records_found} found"
     if reason is not None:
-        return {col: None for col in SNAPSHOT_COLUMNS.values()}, reason
+        return dict.fromkeys(SNAPSHOT_COLUMNS.values()), reason
 
     values = _full(partition, records_found - partition.persisted)
     problem = _invalid(values, records_found)
     if problem is not None:
-        return {col: None for col in SNAPSHOT_COLUMNS.values()}, problem
+        return dict.fromkeys(SNAPSHOT_COLUMNS.values()), problem
     return {SNAPSHOT_COLUMNS[f]: v for f, v in values.items()}, None
+
+
+_OWNER_SQL = text("SELECT started_at, records_found, retry_count FROM jobs WHERE id = :jid")
+
+
+def decide_snapshot(
+    db, *, job_id, billed_now: bool, attempt_started_at: datetime | None,
+    partition: RowPartition,
+) -> tuple[dict[str, int | None] | None, str | None]:
+    """``snapshot_columns`` fed from the ROW, as run_scrape_job calls it.
+
+    Must run inside the billing transaction, right after the billing CAS: when that
+    CAS fired it holds the jobs row lock, so the attempt token, records_found and
+    retry_count read here are the ones the done-CAS will commit against. When it did
+    not fire, nothing is read: the columns are not named either way.
+    """
+    owner = db.execute(_OWNER_SQL, {"jid": str(job_id)}).one() if billed_now else None
+    return snapshot_columns(
+        billed_now=bool(billed_now),
+        attempt_started_at=attempt_started_at,
+        row_started_at=owner.started_at if owner else None,
+        records_found=owner.records_found if owner else None,
+        retry_count=owner.retry_count if owner else None,
+        partition=partition,
+    )
 
 
 def _invalid(values: dict[str, int | None], records_found: int) -> str | None:

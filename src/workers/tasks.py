@@ -23,6 +23,7 @@ from src.api.quota_window import (
     window_cte_sql,
     window_set_sql,
 )
+from src.api.run_breakdown import completion_message
 from src.config.constants import (
     RUN_SCRAPE_SOFT_TIME_LIMIT_S,
     RUN_SCRAPE_TIME_LIMIT_S,
@@ -1331,8 +1332,6 @@ def run_scrape_job(self, job_id: str) -> None:
         ).fetchall()
 
         _logger.info("Job %s: dedup step 1 done — %d fresh rows", job_id, len(fresh_rows))
-        dup_count = 0
-        unique_count = 0
         if fresh_rows:
             _logger.info("Job %s: dedup step 2 — INSERT delivered_records", job_id)
             # Step 2: single batched upsert into delivered_records.
@@ -1414,8 +1413,6 @@ def run_scrape_job(self, job_id: str) -> None:
                 str(row.id) for row in fresh_rows
                 if row.dedup_hash not in claimed_hashes
             ]
-            unique_count = len(claimed_hashes)
-            dup_count = len(duplicate_result_ids)
 
             if duplicate_result_ids:
                 # Batch the UPDATE to avoid an IN clause explosion.
@@ -1453,9 +1450,15 @@ def run_scrape_job(self, job_id: str) -> None:
                     )
                 db.commit()
 
+        # No new/duplicate split here. This line used to say "N new leads, D
+        # duplicates" with D counting every row that lost its claim, address or not,
+        # which is how one run read 12 + 252 = 264 against 265 found (UX F-001).
+        # Which rows are leads is only known after enrichment and the plan cap; the
+        # completion line reports it from the done-time breakdown. `len(records)` is
+        # what was scraped, not what was saved: the insert can merge rows.
         _publish_log(
             r, job_id, "success",
-            f"{len(records)} records saved ({unique_count} new leads, {dup_count} duplicates)",
+            f"{len(records)} records scraped. Checking which are new...",
             db=db,
         )
 
@@ -1472,11 +1475,9 @@ def run_scrape_job(self, job_id: str) -> None:
         if config.record_type == "trustee_sale":
             from src.workers.trustee_sale_finalize import finalize_trustee_sale_job
             try:
-                # Fold the same-parcel collapse into dup_count so the user-facing
-                # record_count / completion log / notification / email reflect it
-                # (billing reads a fresh DB non-dup count and is already correct;
-                # display_count = len(records) - dup_count was not) (Codex).
-                dup_count += finalize_trustee_sale_job(db, job_id, job.user_id)
+                # The rows it collapses are marked same_run in the DB, which is
+                # where billing and the done-time breakdown count them.
+                finalize_trustee_sale_job(db, job_id, job.user_id)
             except Exception as exc:
                 _logger.error(
                     "Job %s: trustee_sale finalize FAILED — failing job (no blank "
@@ -1519,7 +1520,6 @@ def run_scrape_job(self, job_id: str) -> None:
                 db, job_id, job.user_id, config.record_type
             )
             if _collapsed:
-                dup_count += _collapsed
                 _publish_log(
                     r, job_id, "info",
                     f"Combined {_collapsed} record(s) already covered by another "
@@ -1792,7 +1792,6 @@ def run_scrape_job(self, job_id: str) -> None:
                 db, job_id, job.user_id, config.record_type
             )
             if _transferred:
-                dup_count -= _transferred
                 _logger.info(
                     "Job %s: took over %d claim(s) an earlier run held without "
                     "ever delivering the lead", job_id, _transferred,
@@ -2214,7 +2213,9 @@ def run_scrape_job(self, job_id: str) -> None:
         if user.records_limit != -1 and user.records_used > user.records_limit:
             overage = user.records_used - user.records_limit
             _publish_log(r, job_id, "warning", f"Plan limit exceeded by {overage} records. Upgrade to keep scraping.", db=db)
-        _publish_log(r, job_id, "success", f"Job complete: {display_count} new leads ({dup_count} duplicates filtered)", db=db)
+        # Built from the frozen breakdown so the log, the page and the bill say the
+        # same thing; with no snapshot it states only the charge.
+        _publish_log(r, job_id, "success", completion_message(display_count, _outcome.frozen), db=db)
         r.publish(f"job_logs:{job_id}", json.dumps({"type": "done", "record_count": display_count}))
 
         # ── IN-APP NOTIFICATION (best-effort; gated by CAS already confirmed above) ──

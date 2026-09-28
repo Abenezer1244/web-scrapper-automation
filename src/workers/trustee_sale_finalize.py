@@ -115,8 +115,8 @@ def _sibling_groups(rows: list[dict]) -> list:
 def finalize_trustee_sale_job(db, job_id: str, user_id: Any) -> int:
     """Populate auction columns on every trustee_sale Result of ``job_id``.
 
-    Returns the number of same-parcel siblings NEWLY collapsed to duplicates (so the
-    caller can fold it into the job's dup_count for correct user-facing counts). Raises
+    Returns the number of same-parcel siblings NEWLY collapsed to duplicates (marked
+    same_run in the DB, where billing and the run-count breakdown count them). Raises
     ``TrusteeSaleFinalizeError`` if a result is missing its ``nts_source`` contract, or
     if any result still lacks ``auction_date`` / ``nts_notice_id`` after the pass
     (fail-closed). Does NOT commit — the caller's transaction owns the write (committed
@@ -162,8 +162,7 @@ def finalize_trustee_sale_job(db, job_id: str, user_id: Any) -> int:
     # (parcel|address) — trustee_sale dedups EXACTLY like every other list, no more
     # aggressively (product decision 2026-07-03); cross-job dedup is already handled by
     # the shared delivered_records claim on the same key. Only rows still
-    # is_duplicate=false are candidates, so the count is NET-NEW and folds cleanly into
-    # the caller's dup_count. Runs before billing.
+    # is_duplicate=false are candidates, so the count is NET-NEW. Runs before billing.
     sib_rows = db.execute(
         _sa_text(
             f"SELECT {_GROUP_COLUMNS} FROM results "

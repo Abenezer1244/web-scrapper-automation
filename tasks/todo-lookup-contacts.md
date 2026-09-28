@@ -2675,9 +2675,9 @@ ACCEPTED; keyset `(created_at, id)` confirmed a total order, served by the exist
 
 ### FINAL 1b-1c contract and build list (normative; supersedes Design, N*, the redesign and r2 where they differ)
 **Planner** — NEW `src/api/contact_lookup_planner.py` (no `src.workers` import; 1b-2 imports it):
-- [ ] `PLANNER_VERSION = 1`; `PlannerPolicy(pierce_cv_owner_skip_trace_enabled)`;
+- [x] `PLANNER_VERSION = 1`; `PlannerPolicy(pierce_cv_owner_skip_trace_enabled)`;
       `policy_from_settings()` read ONCE per request.
-- [ ] `classify(row, policy) -> Verdict`, pure, first match wins:
+- [x] `classify(row, policy) -> Verdict`, pure, first match wins:
       1. status `queued`/`submitted` -> `in_progress`; `hit`/`miss` -> `already_answered`;
          any other status except `not_attempted` -> `previously_attempted` (incl. `errored`).
       2. `(property_address or "").strip()` empty -> `no_address`.
@@ -2689,22 +2689,22 @@ ACCEPTED; keyset `(created_at, id)` confirmed a total order, served by the exist
          `atip`.
       6. `build_pending_row_payload(row) is None` -> `not_traceable`.
       7. else `quotable(trace_type)`.
-- [ ] `plan_window(rows, policy, cap=2000) -> Window`: rows in `(created_at, id)` order;
+- [x] `plan_window(rows, policy, cap=2000) -> Window`: rows in `(created_at, id)` order;
       `quoted_ids` (first `cap` quotable), `advanced_count`, counts for `no_address`,
       `placeholder`, `settled_code_violation`, `atip`, `not_traceable`, `examined`,
       `window_end` (last key examined), `stopped` (`cap` | `scan_limit` | None).
-- [ ] Async DB helpers (API only): `tab_status_counts(db, job_id, user_id, category)` = ONE
+- [x] Async DB helpers (API only): `tab_status_counts(db, job_id, user_id, category)` = ONE
       `GROUP BY skip_trace_status` over the tab predicate (category + actionable + tax cap +
       skip-trace-eligible, exactly as `GET /results`); `iter_not_attempted(...)` = the same
       predicate + `skip_trace_status = 'not_attempted'`, keyset `(created_at, id)`, chunks of
       500, the columns `classify` needs only. Both under `SET LOCAL statement_timeout = '5s'`.
-- [ ] Ceiling 20,000 examined rows (`stopped = 'scan_limit'`, a safety bound).
+- [x] Ceiling 20,000 examined rows (`stopped = 'scan_limit'`, a safety bound).
 
 **Pricing** — NEW `src/config/lookup_pricing.py`:
-- [ ] `UNIT_PRICE_CENTS = {"pro": 8, "business": 8, "agency": 5}` (live Stripe, O2),
+- [x] `UNIT_PRICE_CENTS = {"pro": 8, "business": 8, "agency": 5}` (live Stripe, O2),
       `CURRENCY = "USD"`, `PRICING_VERSION = "2026-06"`; `unit_price_cents(plan)` via
       `normalize_plan`, None when not offered.
-- [ ] `included_lookups_remaining(user, now)`: `max(0, quota - used)`, with `used = 0` when
+- [x] `included_lookups_remaining(user, now)`: `max(0, quota - used)`, with `used = 0` when
       `skip_trace_period_start` is NULL or before `effective_window(user, now).start` (the
       `report_lookups_for_user` rule, `skip_trace_usage.py:140-152`).
 
@@ -2742,17 +2742,17 @@ quotable is never quoted (mutation-tested). Worker/confirm only ever REMOVE ids 
 
 **Tests** — i: `tests/test_contact_lookup_planner.py`; ii: `tests/test_contact_lookup_quote.py`
 (real PG + local Redis, a client with `redis_kwargs()`, keys deleted in a finalizer):
-- [ ] i `classify`: one row per branch and per `build_pending_row_payload` None reason; address
+- [x] i `classify`: one row per branch and per `build_pending_row_payload` None reason; address
       edge cases NULL, `''`, spaces, tab/newline, Unicode whitespace (NBSP), padded placeholder
       literal; status precedence over address; settled on a code-violation AND a non-CV source.
-- [ ] i PARITY with the real `_enqueue_skip_trace_rows`: EQUALITY of queued ids and each
+- [x] i PARITY with the real `_enqueue_skip_trace_rows`: EQUALITY of queued ids and each
       `trace_type` vs `quoted_ids` on a clean seed; SUBSET with a valid cache hit and a
       charged-unanswered row seeded; ATIP flag both ways; a policy disagreeing with the process
       flag only ever excludes MORE.
-- [ ] i window: 2,001 quotable -> 2,000 + `stopped='cap'`, the same ids on re-plan; shared
+- [x] i window: 2,001 quotable -> 2,000 + `stopped='cap'`, the same ids on re-plan; shared
       `created_at` across the batch pages correctly by `id`; bought rows at the front do not
       stop it; ceiling at exactly 20,000 / 20,001 examined.
-- [ ] i pricing: rates per plan incl. a dirty `" Pro "`; the drift guard (equal to
+- [x] i pricing: rates per plan incl. a dirty `" Pro "`; the drift guard (equal to
       `/skip-trace-usage` for clean plans); `included_lookups_remaining` under / over quota,
       rolled window, NULL period start, starter.
 - [ ] ii gates: foreign job 404 (no key written); not done 409; starter 402 shape; kill switch
@@ -2816,6 +2816,28 @@ quotable is never quoted (mutation-tested). Worker/confirm only ever REMOVE ids 
 disposition accepted, no findings: `PLAN: GO`.** Outputs `<scratchpad dea35045>/
 codex_1b1c_consult_r{4,5,6}_out.txt`. **OWNER APPROVED the plan (2026-09-28).** Build order:
 1b-1c-i, then 1b-1c-ii.
+
+### 1b-1c-i BUILT (2026-09-28), before the Codex diff review
+- NEW `src/api/contact_lookup_planner.py`, NEW `src/config/lookup_pricing.py`, NEW
+  `tests/test_contact_lookup_planner.py` (63 tests), `docs/BUILD_JOURNAL.md` (the 1b-1b-iii
+  entry). No endpoint, no write path, no migration.
+- **One bug found by the first run:** the keyset's `tuple_(created_at, id) > (…, …)` bound the
+  id as VARCHAR (`uuid > character varying` does not exist); each value is now bound with its
+  column's type. Found by `test_the_keyset_pages_a_shared_created_at_by_id`.
+- **Parity holds against the REAL enqueue** on a code-violation job carrying every gate (12
+  leads), with the ATIP flag both ways: equal ids and equal `trace_type`s. With a cache hit and
+  a charged-unanswered row seeded, the enqueue queues a strict SUBSET of the quote.
+- **Added beyond the plan:** a recording-proxy test that every attribute `classify` (and
+  `build_pending_row_payload` inside it) reads is a SELECTED column, because `getattr(row, x,
+  None)` on a Row lacking `x` returns None silently and would diverge from the enqueue.
+- **Mutations: 16/16 caught** (`<scratchpad dea35045>/mutate_1b1c_i.py`): errored and
+  in-progress branches, `.strip()`, placeholder, settled, ATIP from the process flag, cap and
+  ceiling off by one, the `id` tie-break, the window's status filter, the tab's category, the
+  remaining count's keyset, a dropped select column, the roll rule, `normalize_plan` in the
+  price, an agency price drift.
+- **Regression (foreground, 5 chunks, all 26 skip-trace / tracerfy / lookup / billing /
+  entitlement / beat files): 1,040 passed, 0 failed.** No type checker is configured in this
+  repo (no mypy/pyright in `pyproject.toml` or CI); ruff clean.
 
 **Files:** i = planner, `lookup_pricing.py`, planner tests, `docs/BUILD_JOURNAL.md`, this plan;
 ii = `routes/jobs.py`, `schemas.py`, `schema/openapi.json`, quote tests, this plan.

@@ -19,9 +19,12 @@ Audit source: FE repo `C:/Users/Windows/bl-wt/fe-ux-audit/docs/ux-audit/UX-AUDIT
   errors). **FE #167** `54bc200` merged, Vercel SUCCESS; prod verified in the owner's tab: 68/68
   rows valid under the full contract, DOM = the page's rule, 0 console errors.
   Journal entry: `docs/BUILD_JOURNAL.md` 2026-09-28.
-- **NEXT = Phase B** (below). Owner leaned ADDITIVE envelope; **confirm with the owner when Phase
-  B's plan is ready**. Work from a fresh branch off `origin/main` (worktree
-  `C:/Users/Windows/bl-wt/eligibility`, test DB `bridgeleads_eligibility_test`).
+- **2b-ii Phase B is LIVE too:** BE **#380** `405ba52c` (additive 402 code, owner chose A) and
+  FE **#168** `a5ed32a` (toast names the fix). Journal: `docs/BUILD_JOURNAL.md` 2026-09-28 "The
+  402 says why". **2b is DONE.**
+- **NEXT = 2c** (Q1 run-count breakdown, needs a migration). Start with investigation from a fresh
+  branch off `origin/main`; same workflow (plan, Codex until GO, owner confirmation). Test DB
+  `bridgeleads_eligibility_test` is at migration 105.
 
 ## Queue status
 | # | Item | Status |
@@ -31,16 +34,19 @@ Audit source: FE repo `C:/Users/Windows/bl-wt/fe-ux-audit/docs/ux-audit/UX-AUDIT
 | 2b-i | Q6 account-level `run_eligibility` on `/billing/usage` | ✅ LIVE: BE #369 `cd755883`, FE #166 `8fb25a9`, journal BE #371. Prod verified: all 7 users read-only, 0 errors; owner-authenticated `GET /billing/usage` 200s in api logs; Billing page renders "Agency 4,516 / ∞ · resets Oct 1" |
 | 2b-ii A | per-scraper `run_eligibility` on GET /scrapers + POST /jobs through one evaluator | ✅ LIVE BE #375 `ae351c4e` |
 | 2b-ii FE | Run now disabled with reason (+ list no longer blanks on a failed poll) | ✅ LIVE FE #167 `54bc200` |
-| **2b-ii B** | **structured 402 envelope for AI-limit + account 402s; FE frozen 402 → "Update payment"** | **NEXT: plan outline only (see below)** |
-| 2c | Q1 run-count breakdown (migration) | queued |
+| 2b-ii B | additive 402 `code` + `resumes_at`; FE toast "Update payment" / "Resubscribe" / "Upgrade plan" | ✅ LIVE BE #380 `405ba52c`, FE #168 `a5ed32a` |
+| **2c** | **Q1 run-count breakdown (migration)** | **NEXT** |
 | 2d | Q2 `already_delivered` on JobResponse | queued |
 | 2e | Q4 "Lookup failed" vs "not available" | queued |
 | 3–5 | batches B–E, F-043 Phase 2, Phase 4/5 | queued |
 
 ## Next step (in order)
-1. Phase B: investigate, write its own plan (outline below), Codex until PLAN: GO, **stop for the
-   owner** (confirm additive vs object `detail`). Then build, real-DB tests RED on unfixed code,
-   full suite (8 parts), §14, Codex diff GATE: PASS, quiesce, merge, prod verify, FE PR.
+1. 2c: investigate (FE `phase-3.0-contracts.md` Q1), write its plan in `tasks/`, Codex until
+   PLAN: GO, **stop for the owner**. Then build, real-DB tests RED on unfixed code, full suite (8
+   parts, each backgrounded and awaited one at a time), §14, Codex diff GATE: PASS, quiesce, merge
+   (migration: quiesce is mandatory), prod verify, FE PR. FE stubs for 2b-ii B: scratchpad
+   `refusal_stub.mjs` / `refusal_verify.mjs` (session 5ab04918); a stub `/auth/onboarding` MUST
+   include `next_action` or the dashboard crashes (stub gap, not a product bug).
 2. How the last merges were done (reuse): quiesce = `railway run --service worker <venv python>
    C:/Users/Windows/bl-checks/quiet.py` from the OneDrive repo (linked) plus a read-only check of
    `batch_runs` pending/running and `alembic_version`; merge with `--match-head-commit`; verify

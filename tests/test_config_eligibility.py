@@ -378,9 +378,7 @@ async def test_the_worker_runs_the_connector_eligibility_judged(db, connectors):
     """The registry (worker) and the evaluator share pick_connector: with two
     active connectors for one record type, the worker resolves the oldest."""
     from src.scrapers.base_scraper import BridgeScraper
-    from src.scrapers.registry import get_scraper_class
-
-    from src.scrapers.registry import UnsupportedCountyError
+    from src.scrapers.registry import UnsupportedCountyError, get_scraper_class
 
     old = datetime(2026, 1, 1, tzinfo=UTC)
     # The two connectors are told apart by what the worker does with them: the

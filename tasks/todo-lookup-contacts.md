@@ -2085,6 +2085,9 @@ append and the 100 ms gate (2026-09-27).**
   `<= 600`.
 - Regression: `test_beat_schedule` + all 27 test files importing the scheduler +
   `test_skip_trace_credit_cap`: 904 passed, 0 failed. ruff clean.
+- Rebased on `ae351c4e` (#375: no file overlap). **Codex diff review r1 (three-dot): VERDICT
+  GO, no findings** (`<scratchpad 4fe51d38>/codex_iiia_review_out.txt`). The PR also carries
+  the previous session's handoff doc (docs only): 6 files, disclosed.
 
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever

@@ -415,6 +415,14 @@ def _alert_unreconciled(
         _logger.warning("unreconciled-batch ops alert failed: %s", str(exc)[:120])
 
 
+# Tracerfy's result bucket: nyc3, through the CDN (every production download URL,
+# 33 of 33 on 2026-09-28) or the origin endpoint of the same bucket.
+_TRACERFY_BUCKET_HOSTS = frozenset({
+    "tracerfy.nyc3.cdn.digitaloceanspaces.com",
+    "tracerfy.nyc3.digitaloceanspaces.com",
+})
+
+
 def _host_is_tracerfy(download_url: str) -> bool:
     """REDTEAM B1/T3: confirm a webhook-supplied download_url points at a
     Tracerfy-owned host before we fetch it server-side.
@@ -428,16 +436,17 @@ def _host_is_tracerfy(download_url: str) -> bool:
     own domain and its DigitalOcean Spaces CDN bucket, so we additionally
     pin the host to those before trusting the URL.
 
-    Allowed:
+    Allowed, HTTPS only (the URL carries the CSV of customers' contacts):
       - the configured TRACERFY_API_BASE_URL host (and its subdomains)
-      - DigitalOcean Spaces CDN buckets owned by Tracerfy
-        (e.g. tracerfy.nyc3.cdn.digitaloceanspaces.com)
+      - Tracerfy's own DigitalOcean Spaces bucket, EXACTLY (_TRACERFY_BUCKET_HOSTS).
+        A Spaces bucket name is unique only per region, so "tracerfy" in some
+        other region may be anyone's bucket (audit #3/#5, S3-15).
     """
     try:
         parts = urlsplit(download_url)
     except ValueError:
         return False
-    if parts.scheme not in ("http", "https"):
+    if parts.scheme != "https":
         return False
     host = (parts.hostname or "").lower()
     if not host:
@@ -447,13 +456,7 @@ def _host_is_tracerfy(download_url: str) -> bool:
     if api_host and (host == api_host or host.endswith("." + api_host)):
         return True
 
-    # DigitalOcean Spaces CDN: bucket name is the leftmost label and must
-    # be Tracerfy's own bucket. Matches "<bucket>.<region>.cdn.digitalocean
-    # spaces.com" and "<bucket>.<region>.digitaloceanspaces.com".
-    if host.endswith(".digitaloceanspaces.com") and host.split(".", 1)[0] == "tracerfy":
-        return True
-
-    return False
+    return host in _TRACERFY_BUCKET_HOSTS
 
 
 @app.task(
@@ -481,7 +484,7 @@ def ingest_tracerfy_batch(
     SkipTraceQueue row (see the on_failure hook below) so ops can see what
     happened and the reconciler's redrive sweep stops re-enqueueing it.
     """
-    from sqlalchemy import select, tuple_, update
+    from sqlalchemy import func, select, tuple_, update
 
     from src.db.models import (
         PendingSkipTraceRow,
@@ -508,6 +511,13 @@ def ingest_tracerfy_batch(
             (urlsplit(download_url).hostname or "<none>"),
         )
         return {"queue_id": queue_id, "skipped": "untrusted_download_host"}
+
+    # Webhook-body counts are untrusted numbers: anything but a non-negative int
+    # is read as 0, which bills 'completed' rows only (erring toward the customer).
+    def _count(value) -> int:
+        return value if type(value) is int and value >= 0 else 0
+
+    rows_uploaded, credits_deducted = _count(rows_uploaded), _count(credits_deducted)
 
     # REDTEAM (Codex review): cheap pre-check BEFORE any network I/O. A replay
     # of an already completed/billed/errored batch — or an unknown/forged queue
@@ -835,7 +845,14 @@ def ingest_tracerfy_batch(
                 status="completed",
                 download_url=download_url,
                 completed_at=now,
-                rows_uploaded=rows_uploaded,
+                # Never raised by the webhook: it can only report rows Tracerfy
+                # dropped (fewer uploaded bills fewer rows, see
+                # skip_trace_usage), never claim more than the submission
+                # recorded. A body that says more would bill customers for
+                # lookups never made (audit #3/#5, S3-15).
+                rows_uploaded=func.least(
+                    func.coalesce(SkipTraceQueue.rows_uploaded, rows_uploaded), rows_uploaded
+                ),
                 credits_deducted=credits_deducted,
             )
         )

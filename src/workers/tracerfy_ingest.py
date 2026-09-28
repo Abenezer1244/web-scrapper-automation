@@ -448,6 +448,12 @@ def _host_is_tracerfy(download_url: str) -> bool:
         return False
     if parts.scheme != "https":
         return False
+    try:
+        port = parts.port
+    except ValueError:
+        return False
+    if port not in (None, 443) or parts.username is not None or "@" in parts.netloc:
+        return False
     host = (parts.hostname or "").lower()
     if not host:
         return False
@@ -457,6 +463,35 @@ def _host_is_tracerfy(download_url: str) -> bool:
         return True
 
     return host in _TRACERFY_BUCKET_HOSTS
+
+
+def _provider_queue_record(queue_id: int) -> dict | None:
+    """Tracerfy's own record of ``queue_id`` when it shows the queue complete, else
+    None (API unreachable, queue absent, still pending, or no download URL)."""
+    from src.scrapers.enrichment.skip_trace import TracerfyError, fetch_queues
+
+    try:
+        queues = fetch_queues()
+    except TracerfyError as exc:
+        _logger.warning(
+            "Tracerfy ingest queue %d: provider record unavailable (%s); using the "
+            "webhook's values, clamped", queue_id, str(exc)[:120],
+        )
+        return None
+    for queue in queues:
+        if (
+            isinstance(queue, dict)
+            and queue.get("id") == queue_id
+            and queue.get("pending") is False
+            and isinstance(queue.get("download_url"), str)
+            and queue["download_url"]
+        ):
+            return queue
+    _logger.warning(
+        "Tracerfy ingest queue %d: the provider does not show it complete; using the "
+        "webhook's values, clamped", queue_id,
+    )
+    return None
 
 
 @app.task(
@@ -544,6 +579,24 @@ def ingest_tracerfy_batch(
             queue_id, _pre[0],
         )
         return {"queue_id": queue_id, "skipped": f"already_{_pre[0]}"}
+
+    # The webhook is a TRIGGER, not a source of truth (audit #5, S3-15): when
+    # Tracerfy's own queue record shows this batch complete, its download URL and
+    # counts replace the body's. Only when that record is unavailable does the body
+    # decide, and then clamped (rows_uploaded can never exceed what was recorded at
+    # submission, see the queue update below) and host-pinned as before.
+    remote = _provider_queue_record(queue_id)
+    if remote is not None:
+        download_url = remote["download_url"]
+        rows_uploaded = _count(remote.get("rows_uploaded"))
+        credits_deducted = _count(remote.get("credits_deducted"))
+        if not _host_is_tracerfy(download_url):
+            _logger.error(
+                "Refusing Tracerfy ingest for queue %d: the provider's own download_url "
+                "is not on a pinned host (host=%s)",
+                queue_id, (urlsplit(download_url).hostname or "<none>"),
+            )
+            return {"queue_id": queue_id, "skipped": "untrusted_download_host"}
 
     try:
         csv_text = download_tracerfy_csv(download_url)

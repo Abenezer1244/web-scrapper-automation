@@ -24,9 +24,23 @@ from tests.test_tracerfy_ingest import (
 @pytest.fixture
 def stub_csv(monkeypatch):
     """Serve a canned result CSV instead of fetching one. No network."""
+    fetched: list[str] = []
+
     def _install(csv_text: str):
+        def _download(url):
+            fetched.append(url)
+            return csv_text
+        monkeypatch.setattr("src.scrapers.enrichment.skip_trace.download_tracerfy_csv", _download)
+        return fetched
+    return _install
+
+
+@pytest.fixture
+def provider_record(monkeypatch):
+    """Tracerfy's GET /v1/api/queues/ answer, served without network."""
+    def _install(*queues: dict):
         monkeypatch.setattr(
-            "src.scrapers.enrichment.skip_trace.download_tracerfy_csv", lambda url: csv_text
+            "src.scrapers.enrichment.skip_trace.fetch_queues", lambda *a, **k: list(queues)
         )
     return _install
 
@@ -100,9 +114,52 @@ async def test_a_malformed_count_bills_completed_rows_only(starter_user, stub_cs
     assert _usage(starter_user.id) - before == 1
 
 
+@pytest.mark.asyncio
+async def test_the_providers_record_decides_not_the_webhook_body(
+    starter_user, stub_csv, provider_record
+):
+    """With Tracerfy's own record showing the queue complete, a forged body can
+    neither lower the count (under-billing) nor choose the CSV that is fetched."""
+    qid = _next_queue_id()
+    _seed(starter_user.id, qid, _TWO_ADDRESSES)  # stored rows_uploaded = 2
+    fetched = stub_csv(_csv(_ONE_HIT))
+    provider_record({
+        "id": qid, "pending": False, "download_url": DOWNLOAD_URL,
+        "rows_uploaded": 2, "credits_deducted": 2,
+    })
+    before = _usage(starter_user.id)
+
+    ingest_tracerfy_batch(
+        queue_id=qid,
+        download_url="https://tracerfy.nyc3.cdn.digitaloceanspaces.com/tracerfy/forged.csv",
+        rows_uploaded=0, credits_deducted=0,
+    )
+
+    assert fetched == [DOWNLOAD_URL]
+    assert _stored_rows_uploaded(qid) == 2
+    assert _usage(starter_user.id) - before == 2  # the hit and the genuinely unmatched row
+
+
+@pytest.mark.asyncio
+async def test_a_queue_still_pending_at_the_provider_falls_back_to_the_clamped_body(
+    starter_user, stub_csv, provider_record
+):
+    qid = _next_queue_id()
+    _seed(starter_user.id, qid, _TWO_ADDRESSES)
+    fetched = stub_csv(_csv(_ONE_HIT))
+    provider_record({"id": qid, "pending": True, "download_url": None})
+
+    ingest_tracerfy_batch(queue_id=qid, download_url=DOWNLOAD_URL, rows_uploaded=999, credits_deducted=9)
+
+    assert fetched == [DOWNLOAD_URL]
+    assert _stored_rows_uploaded(qid) == 2
+
+
 @pytest.mark.parametrize("url", [
     "https://tracerfy.nyc3.cdn.digitaloceanspaces.com/tracerfy/x.csv",
     "https://tracerfy.nyc3.digitaloceanspaces.com/tracerfy/x.csv",
+    "https://TRACERFY.NYC3.CDN.DIGITALOCEANSPACES.COM/tracerfy/x.csv",
+    "https://tracerfy.nyc3.cdn.digitaloceanspaces.com:443/tracerfy/x.csv",
 ])
 def test_tracerfys_own_bucket_is_trusted(url):
     assert _host_is_tracerfy(url) is True
@@ -116,6 +173,11 @@ def test_tracerfys_own_bucket_is_trusted(url):
     "https://tracerfy.fra1.cdn.digitaloceanspaces.com/x.csv",
     "https://tracerfy.evil.digitaloceanspaces.com/x.csv",
     "https://evil.nyc3.cdn.digitaloceanspaces.com/x.csv",
+    # a port or credentials in the authority
+    "https://tracerfy.nyc3.cdn.digitaloceanspaces.com:8443/x.csv",
+    "https://user@tracerfy.nyc3.cdn.digitaloceanspaces.com/x.csv",
+    "https://tracerfy.nyc3.cdn.digitaloceanspaces.com./x.csv",
+    "not a url",
 ])
 def test_other_buckets_and_plaintext_are_refused(url):
     assert _host_is_tracerfy(url) is False

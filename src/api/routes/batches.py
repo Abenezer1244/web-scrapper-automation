@@ -729,8 +729,9 @@ async def download_batch(
     """
     # Each download rebuilds the CSV (a threadpool worker + sync DB connection +
     # full-CSV buffer), so rate-limit to keep concurrent downloads from starving
-    # API capacity (Codex).
-    await rate_limit(request, zone="general", identifier=current_user.id)
+    # API capacity (Codex). The `export` zone (audit #4 S4-03), shared with every
+    # other full-CSV export, and taken before the owner lookup so a miss spends it.
+    await rate_limit(request, zone="export", identifier=current_user.id)
     batch = await _owned_batch(db, batch_id, current_user.id)  # 404s if not the owner
     run = await _run_for(db, batch_id, current_user.id)
     return await _stream_run_csv(batch_id, run, batch.fields, batch.delivery_mode or "everything")
@@ -851,7 +852,7 @@ async def download_batch_run(
 ) -> StreamingResponse:
     """Run-scoped combined-CSV download (2B): history downloads must not drift to
     the latest run the way /download (latest-run semantics) does."""
-    await rate_limit(request, zone="general", identifier=current_user.id)
+    await rate_limit(request, zone="export", identifier=current_user.id)  # audit #4 S4-03
     batch = await _owned_batch(db, batch_id, current_user.id)  # 404s if not the owner
     run = (
         await db.execute(

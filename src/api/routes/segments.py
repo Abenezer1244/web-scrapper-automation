@@ -706,7 +706,7 @@ async def intersection_export(
     """CSV export of the intersection. One representative lead per property,
     with matched_record_types + overlap_count columns. CSV-injection sanitized.
     """
-    await rate_limit(request, zone="general", identifier=current_user.id)
+    await rate_limit(request, zone="export", identifier=current_user.id)  # audit #4 S4-03
 
     rows, _excluded = await _fetch_intersection(
         db, str(current_user.id), body.record_types, body.counties, EXPORT_CAP,
@@ -832,7 +832,7 @@ async def union_export(
 ) -> Response:
     """CSV export of the combined ('union') deduped lead set. Adds an
     identity_strength column (strong|weak). CSV-injection sanitized."""
-    await rate_limit(request, zone="general", identifier=current_user.id)
+    await rate_limit(request, zone="export", identifier=current_user.id)  # audit #4 S4-03
 
     rows, _excluded = await _fetch_union(
         db, str(current_user.id), body.record_types, body.counties, EXPORT_CAP,

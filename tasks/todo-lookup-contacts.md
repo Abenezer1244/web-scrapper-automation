@@ -2359,6 +2359,9 @@ conftest change only ADDS a `connectors` fixture): NO-GO, 2 P2, both fixed.**
   -> UNKNOWN; valid bytes -> NOT_PAUSED. Mutation (decode back outside the try): caught.
 - P3 naive and non-UTC `published_at` added to the malformed cases. Suite 61 passed.
 
+**Codex diff review r3 on iii-b (three-dot, rebased on `5689139d` #381, docs only): VERDICT GO,
+no findings.** (`<scratchpad 4fe51d38>/codex_iiib_review_r3_out.txt`)
+
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever
       the tab has leads that have never been looked up; when the quote comes back with

@@ -354,6 +354,13 @@ class Settings(BaseSettings):
     # 5 min). Each batch can hold thousands of rows, so throughput is fine;
     # the constraint is burst count, not total rows.
     SKIP_TRACE_MAX_BATCHES_PER_TICK: int = 2
+    # Seconds between dispatcher ticks (the beat entry). The pause-state publisher
+    # reads the SAME value to decide when its heartbeat is stale, so the two can
+    # never disagree. 60..599: a plain beat interval restarts in full on every
+    # deploy, so 600+ must be a crontab instead (tests/test_beat_schedule.py). Keep
+    # SKIP_TRACE_MAX_BATCHES_PER_TICK * (300 / this) within Tracerfy's 10 POSTs per
+    # 5 minutes; a 429 only defers the batch to the next tick.
+    SKIP_TRACE_DISPATCH_INTERVAL_SECONDS: int = 300
     # Rolling-24h ceilings on Tracerfy spend, in CREDITS (a normal lookup costs 1,
     # an advanced one 2). Every lookup costs real money and the only other ceiling
     # is the prepaid balance returning 402. Enforced inside the dispatcher's claim
@@ -379,6 +386,15 @@ class Settings(BaseSettings):
         """A negative cap would be read by nothing sensible; refuse it at boot."""
         if v is not None and v < 0:
             raise ValueError("skip-trace spend caps must be 0 (disabled) or positive")
+        return v
+
+    @field_validator("SKIP_TRACE_DISPATCH_INTERVAL_SECONDS")
+    @classmethod
+    def dispatch_interval_is_a_short_interval(cls, v: int) -> int:
+        """Refuse at boot what beat would mis-schedule: 600+ restarts a full period on
+        every deploy (a crontab is needed), and under 60 outpaces Tracerfy's limit."""
+        if not 60 <= v < 600:
+            raise ValueError("SKIP_TRACE_DISPATCH_INTERVAL_SECONDS must be 60..599")
         return v
 
     @field_validator("TRACERFY_WEBHOOK_SECRET")

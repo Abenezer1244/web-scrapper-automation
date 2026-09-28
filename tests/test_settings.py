@@ -118,3 +118,30 @@ def test_ensure_dirs_creates_directories(tmp_path, monkeypatch):
     settings.ensure_dirs()
     assert (tmp_path / "exports").exists()
     assert (tmp_path / "logs").exists()
+
+
+# ─── Entitlement enforcement fails closed in production (audit #5, D5-02) ─────
+
+def _minimal_env(monkeypatch, environment: str) -> None:
+    monkeypatch.setenv("SECRET_KEY", "x" * 40)
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://x:x@localhost/x")
+    monkeypatch.setenv("DATABASE_URL_SYNC", "postgresql+psycopg2://x:x@localhost/x")
+    monkeypatch.setenv("REDIS_URL", "redis://localhost:6379/0")
+    monkeypatch.setenv("ENVIRONMENT", environment)
+    monkeypatch.delenv("ENTITLEMENT_ENFORCEMENT", raising=False)
+
+
+def test_production_without_the_variable_enforces_entitlements(monkeypatch):
+    _minimal_env(monkeypatch, "production")
+    assert Settings(_env_file=None).ENTITLEMENT_ENFORCEMENT is True
+
+
+def test_production_can_still_turn_enforcement_off_explicitly(monkeypatch):
+    _minimal_env(monkeypatch, "production")
+    monkeypatch.setenv("ENTITLEMENT_ENFORCEMENT", "false")
+    assert Settings(_env_file=None).ENTITLEMENT_ENFORCEMENT is False
+
+
+def test_outside_production_the_default_is_unchanged(monkeypatch):
+    _minimal_env(monkeypatch, "development")
+    assert Settings(_env_file=None).ENTITLEMENT_ENFORCEMENT is False

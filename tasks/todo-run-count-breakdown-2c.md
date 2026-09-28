@@ -267,13 +267,13 @@ immediately), render the breakdown on the run and results pages.
 Then full suite in 8 parts (background, one at a time, real exit codes), ruff.
 
 ## Steps
-- [ ] 1. Codex PLAN review until PLAN: GO. **Then STOP for the owner's confirmation to
+- [x] 1. Codex PLAN review until PLAN: GO. **Then STOP for the owner's confirmation to
   build** (the owner's standing workflow). The two owner decisions below (schema gate vs
   runbook; 2c-bis order) gate MERGE/DEPLOY, not building.
-- [ ] 2. Migration 106 + model columns + `JobUpdateFields`; apply to test DB.
-- [ ] 3. W1 helper + T1-T4 (RED first: the module does not exist / wrong counts).
-- [ ] 4. W2-W4 in tasks.py + T5 (+ mutation check).
-- [ ] 5. A1-A5 + T6; OpenAPI regen + check.
+- [x] 2. Migration 106 + model columns + `JobUpdateFields`; apply to test DB.
+- [x] 3. W1 helper + T1-T4 (RED first: the module does not exist / wrong counts).
+- [x] 4. W2-W4 in tasks.py + T5 (+ mutation check).
+- [x] 5. A1-A5 + T6; OpenAPI regen + check.
 - [ ] 6. Full suite (8 parts) + ruff; security review x2 clean: the Master Security Review,
   `docs/security/SECURITY_PROMPT_PACK.md` §14, translated per `.claude/rules/security.md`
   (for 2c: every new query filters `user_id` AND `job_id` and runs on the RLS session in the

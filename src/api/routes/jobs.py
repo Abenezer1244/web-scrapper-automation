@@ -17,6 +17,7 @@ from src.api import sse_leases
 from src.api.auth import CurrentUser, get_auth_context
 from src.api.deps import get_db, get_rls_db
 from src.api.dialer_filters import dialer_ready_conditions
+from src.api.errors import run_refusal_http
 from src.api.lead_actionability import actionable_condition, has_address_condition
 from src.api.middleware import audit_log, rate_limit, sanitize_search
 from src.api.owner_filters import build_owner_conditions
@@ -29,6 +30,7 @@ from src.api.results_category import (
 from src.api.results_sort import DEFAULT_RESULTS_SORT, ResultsSort, results_order_by
 from src.api.routes.auth_helpers.registration import _integrity_error_fields
 from src.api.schemas import (
+    RUN_START_402_RESPONSES,
     AlreadyDeliveredContacts,
     AuctionCoverage,
     DuplicateSource,
@@ -254,11 +256,9 @@ async def enqueue_scrape_job(
     # Raises the structured 402 when enforcing; audit-logs otherwise.
     enforce_runnable_http(eligibility.violation, user=current_user, context="create_job")
     if not eligibility.can_run:
-        # ai_limit, or the account rule: prose 402s, byte-identical to before.
-        raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail=eligibility.message,
-        )
+        # ai_limit, or the account rule: the same sentence in `detail` as always,
+        # with the code and resumes_at added beside it (src/api/errors.py).
+        raise run_refusal_http(eligibility.code, eligibility.message, eligibility.resumes_at)
 
     job = Job(
         id=str(uuid.uuid4()),
@@ -329,7 +329,12 @@ async def enqueue_scrape_job(
     return job
 
 
-@router.post("", response_model=JobResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "",
+    response_model=JobResponse,
+    status_code=status.HTTP_201_CREATED,
+    responses=RUN_START_402_RESPONSES,
+)
 async def create_job(
     body: JobCreate,
     request: Request,

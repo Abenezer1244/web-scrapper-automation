@@ -8,13 +8,14 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 
 from src.api.lead_actionability import (
     ADDRESS_PLACEHOLDER,
     DELIVERY_EXCLUDED_KEY,
     OVER_QUOTA,
     actionable_condition,
+    actionable_sql,
 )
 from src.api.run_breakdown import (
     SNAPSHOT_COLUMNS,
@@ -102,8 +103,14 @@ async def test_new_is_exactly_the_billing_predicate(db, starter_user, scraper_co
         Result.job_id == job_id, Result.user_id == starter_user.id,
         Result.is_duplicate.is_(False), actionable_condition(),
     ))).scalar_one()
+    # The statement tasks.py billed with before this change, verbatim.
+    billed_raw = (await db.execute(text(
+        "SELECT count(*) FROM results "
+        "WHERE job_id = :jid AND user_id = CAST(:uid AS uuid) AND is_duplicate = false "
+        f"AND {actionable_sql('results')}"
+    ), {"jid": job_id, "uid": str(starter_user.id)})).scalar_one()
 
-    assert (await _partition(db, job_id, starter_user.id)).new == billed == 2
+    assert (await _partition(db, job_id, starter_user.id)).new == billed == billed_raw == 2
 
 
 @pytest.mark.asyncio
@@ -184,6 +191,7 @@ def test_lost_ownership_names_no_column():
     {"records_found": None},
     {"retry_count": 1},
     {"retry_count": None},
+    {"retry_count": -1},
     {"records_found": P.persisted - 1},
     {"partition": RowPartition(new=1, unclassified=1)},
 ])
@@ -256,7 +264,7 @@ def test_live_reconciles_for_a_clean_done_run():
     assert reason is None and got["dropped_before_save"] == 2 and got["new"] == 12
 
 
-@pytest.mark.parametrize("records_found, retry_count", [(None, 0), (267, 1)])
+@pytest.mark.parametrize("records_found, retry_count", [(None, 0), (267, 1), (267, -1)])
 def test_live_drop_count_is_unknown_without_records_found_or_after_a_retry(
     records_found, retry_count,
 ):

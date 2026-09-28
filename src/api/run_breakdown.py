@@ -34,7 +34,11 @@ from typing import Any
 
 from sqlalchemy import text
 
-from src.api.lead_actionability import address_actionable_sql, quota_excluded_sql
+from src.api.lead_actionability import (
+    actionable_sql,
+    address_actionable_sql,
+    quota_excluded_sql,
+)
 from src.api.results_category import already_delivered_sql
 
 # The customer-facing order, which is also the order of the frozen columns.
@@ -61,7 +65,10 @@ def partition_case(alias: str) -> str:
         f" WHEN {already_delivered_sql(alias)} THEN 'already_delivered'"
         f" WHEN {alias}.is_duplicate = false AND {quota_excluded_sql(alias)}"
         "  THEN 'over_quota'"
-        f" WHEN {alias}.is_duplicate = false THEN 'new'"
+        # `new` is the billing predicate verbatim, so a row the bill would not count
+        # can never land here: if actionability ever gains a condition the branches
+        # above do not spell, the row falls to unclassified and no snapshot is taken.
+        f" WHEN {alias}.is_duplicate = false AND {actionable_sql(alias)} THEN 'new'"
         f" ELSE '{UNCLASSIFIED}' END"
     )
 
@@ -152,7 +159,7 @@ def snapshot_columns(
     reason = None
     if records_found is None:
         reason = "records_found was not recorded"
-    elif retry_count is None or retry_count > 0:
+    elif retry_count != 0:
         # records_found is per attempt, the saved rows are per job: an earlier
         # attempt's rows survive the idempotent insert, so the difference is not
         # this attempt's drop count even when it is not negative.
@@ -171,11 +178,14 @@ def snapshot_columns(
     return {SNAPSHOT_COLUMNS[f]: v for f, v in values.items()}, None
 
 
-_OWNER_SQL = text("SELECT started_at, records_found, retry_count FROM jobs WHERE id = :jid")
+_OWNER_SQL = text(
+    "SELECT started_at, records_found, retry_count FROM jobs "
+    "WHERE id = :jid AND user_id = CAST(:uid AS uuid)"
+)
 
 
 def decide_snapshot(
-    db, *, job_id, billed_now: bool, attempt_started_at: datetime | None,
+    db, *, job_id, user_id, billed_now: bool, attempt_started_at: datetime | None,
     partition: RowPartition,
 ) -> tuple[dict[str, int | None] | None, str | None]:
     """``snapshot_columns`` fed from the ROW, as run_scrape_job calls it.
@@ -185,7 +195,10 @@ def decide_snapshot(
     retry_count read here are the ones the done-CAS will commit against. When it did
     not fire, nothing is read: the columns are not named either way.
     """
-    owner = db.execute(_OWNER_SQL, {"jid": str(job_id)}).one() if billed_now else None
+    owner = (
+        db.execute(_OWNER_SQL, _params(job_id, user_id)).one_or_none()
+        if billed_now else None
+    )
     return snapshot_columns(
         billed_now=bool(billed_now),
         attempt_started_at=attempt_started_at,
@@ -250,7 +263,7 @@ def live_breakdown(
         return None, "the run has not finished"
     if partition.unclassified:
         return None, f"{partition.unclassified} row(s) fit no bucket"
-    if records_found is None or retry_count is None or retry_count > 0:
+    if records_found is None or retry_count != 0:
         return _full(partition, None), None
     if partition.persisted > records_found:
         return None, f"{partition.persisted} saved but only {records_found} found"

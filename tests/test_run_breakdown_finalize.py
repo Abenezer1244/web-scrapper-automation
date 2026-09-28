@@ -16,6 +16,7 @@ from sqlalchemy import text
 from src.api.run_breakdown import SNAPSHOT_COLUMNS, decide_snapshot, read_partition
 from src.db.models import Job, Result
 from src.db.session import SyncSessionLocal
+from src.workers.scheduler_helpers.health import _Candidate, _recovery_cas
 from src.workers.tasks_helpers.status import _set_status, claim_job_for_attempt
 
 ADDR = "5006 61ST STREET CT E"
@@ -61,24 +62,25 @@ def finalizing_job(db, starter_user, scraper_config):
             s.add(Result(id=str(uuid.uuid4()), job_id=job_id, user_id=starter_user.id,
                          property_address=ADDR, is_duplicate=False))
         s.commit()
-    return job_id, starter_user.id
+    return job_id, starter_user.id, scraper_config.id
 
 
-def _requeue_then_claim(job_id) -> datetime | None:
-    """B: the watchdog's guarded re-queue of the attempt it observed (A, enriching),
-    then the production claim. Its own session and transaction."""
+def _requeue_then_claim(job_id, user_id, config_id) -> datetime | None:
+    """B: the watchdog's own guarded re-queue (_recovery_cas, on the row as it
+    observed it: attempt A, enriching), then the production claim. Its own session."""
     with SyncSessionLocal() as b:
-        b.execute(text(
-            "UPDATE jobs SET status = 'pending', started_at = NULL, records_found = NULL, "
-            "retry_count = retry_count + 1 "
-            "WHERE id = :jid AND status = 'enriching' AND started_at = :tok"
-        ), {"jid": job_id, "tok": A_TOKEN})
-        b.commit()
+        seen = _Candidate(id=job_id, status="enriching", retry_count=0,
+                          started_at=A_TOKEN, user_id=str(user_id),
+                          scraper_config_id=str(config_id))
+        _recovery_cas(b, seen, status="pending", started_at=None, records_found=None,
+                      retry_count=1)
         return claim_job_for_attempt(b, job_id)
 
 
 def _bill(a, job_id, n) -> int:
-    """A's billing CAS, the statement run_scrape_job runs (it takes the row lock)."""
+    """A's billing CAS: today's statement in run_scrape_job, which has no helper of
+    its own yet. 2c-bis moves it into finalize_billing_and_done; on the rebase onto
+    2c-bis this test drives that production helper instead."""
     return a.execute(text(
         "UPDATE jobs SET billed_count = :n, billing_applied_at = clock_timestamp() "
         "WHERE id = :jid AND billing_applied_at IS NULL"
@@ -86,14 +88,15 @@ def _bill(a, job_id, n) -> int:
 
 
 def test_b_reclaims_first_so_stale_a_freezes_nothing(finalizing_job):
-    job_id, user_id = finalizing_job
-    b_token = _requeue_then_claim(job_id)
+    job_id, user_id, config_id = finalizing_job
+    b_token = _requeue_then_claim(job_id, user_id, config_id)
     assert b_token is not None
 
     with SyncSessionLocal() as a:
         partition = read_partition(a, job_id, user_id)
         billed_now = _bill(a, job_id, partition.new)
-        cols, reason = decide_snapshot(a, job_id=job_id, billed_now=bool(billed_now),
+        cols, reason = decide_snapshot(a, job_id=job_id, user_id=user_id,
+                                       billed_now=bool(billed_now),
                                        attempt_started_at=A_TOKEN, partition=partition)
         a.rollback()
 
@@ -102,18 +105,19 @@ def test_b_reclaims_first_so_stale_a_freezes_nothing(finalizing_job):
 
 
 def test_a_holds_the_lock_first_so_a_finishes_and_b_does_nothing(finalizing_job):
-    job_id, user_id = finalizing_job
+    job_id, user_id, config_id = finalizing_job
     with SyncSessionLocal() as a:
         partition = read_partition(a, job_id, user_id)
         assert _bill(a, job_id, partition.new) == 1   # A now holds the jobs row lock
 
         b_result: list = []
-        b = threading.Thread(target=lambda: b_result.append(_requeue_then_claim(job_id)))
+        b = threading.Thread(target=lambda: b_result.append(
+            _requeue_then_claim(job_id, user_id, config_id)))
         b.start()
         b.join(timeout=2)
         assert b.is_alive(), "B's re-queue should be waiting on A's row lock"
 
-        cols, reason = decide_snapshot(a, job_id=job_id, billed_now=True,
+        cols, reason = decide_snapshot(a, job_id=job_id, user_id=user_id, billed_now=True,
                                        attempt_started_at=A_TOKEN, partition=partition)
         assert reason is None
         job = a.get(Job, job_id)
@@ -133,3 +137,51 @@ def test_a_holds_the_lock_first_so_a_finishes_and_b_does_nothing(finalizing_job)
             "breakdown_same_run_merged": 0, "breakdown_already_delivered": 0,
             "breakdown_over_quota": 0, "breakdown_new": 3,
         }
+
+
+def test_the_owner_read_is_scoped_to_the_tenant(finalizing_job, business_user):
+    """Another account's id against this job reads no row: not owned, no columns."""
+    job_id, user_id, _ = finalizing_job
+    with SyncSessionLocal() as a:
+        partition = read_partition(a, job_id, user_id)
+        cols, reason = decide_snapshot(a, job_id=job_id, user_id=business_user.id,
+                                       billed_now=True, attempt_started_at=A_TOKEN,
+                                       partition=partition)
+        a.rollback()
+    assert cols is None and "no longer owns" in reason
+
+
+def test_a_rerun_billed_earlier_keeps_the_existing_snapshot(finalizing_job):
+    """Branch 1 on real rows: the job was billed and frozen by an earlier attempt,
+    rows changed since (a backfill), and a re-run reaches finalization again. The
+    done-CAS must not name the columns, so the frozen values survive."""
+    job_id, user_id, _ = finalizing_job
+    frozen = {"breakdown_dropped_before_save": 0, "breakdown_no_address": 0,
+              "breakdown_same_run_merged": 0, "breakdown_already_delivered": 0,
+              "breakdown_over_quota": 0, "breakdown_new": 3}
+    with SyncSessionLocal() as s:
+        s.execute(text(
+            "UPDATE jobs SET billing_applied_at = clock_timestamp(), billed_count = 3, "
+            + ", ".join(f"{c} = {v}" for c, v in frozen.items())
+            + " WHERE id = :jid"), {"jid": job_id})
+        s.add(Result(id=str(uuid.uuid4()), job_id=job_id, user_id=user_id,
+                     property_address=ADDR, is_duplicate=False))
+        s.commit()
+
+    with SyncSessionLocal() as a:
+        partition = read_partition(a, job_id, user_id)
+        assert partition.new == 4                      # the live view moved
+        billed_now = _bill(a, job_id, partition.new)
+        assert billed_now == 0
+        cols, reason = decide_snapshot(a, job_id=job_id, user_id=user_id,
+                                       billed_now=False, attempt_started_at=A_TOKEN,
+                                       partition=partition)
+        assert cols is None and "earlier attempt" in reason
+        job = a.get(Job, job_id)
+        assert _set_status(a, job, "done", record_count=3, commit=False, **(cols or {}))
+        a.commit()
+
+    with SyncSessionLocal() as s:
+        row = s.get(Job, job_id)
+        assert row.status == "done"
+        assert {c: getattr(row, c) for c in frozen} == frozen

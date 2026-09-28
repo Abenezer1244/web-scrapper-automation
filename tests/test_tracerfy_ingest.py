@@ -138,9 +138,28 @@ def _usage(user_id: str) -> int:
         ).scalar_one()
 
 
+def _provider_queues() -> list[dict]:
+    """Tracerfy's queue list as the provider would report it: every seeded queue
+    complete, at DOWNLOAD_URL, with the row count recorded at submission."""
+    with system_sync_session() as db:
+        rows = db.execute(
+            text("SELECT tracerfy_queue_id, rows_uploaded FROM skip_trace_queues")
+        ).all()
+    return [
+        {"id": q, "pending": False, "download_url": DOWNLOAD_URL,
+         "rows_uploaded": n, "credits_deducted": n}
+        for q, n in rows
+    ]
+
+
 @pytest.fixture
 def _stub_csv(monkeypatch):
-    """Serve a canned result CSV instead of fetching one. No network."""
+    """Serve a canned result CSV instead of fetching one, and Tracerfy's queue
+    record (ingest reads its counts and URL from there, audit #5 S3-15). No network."""
+    monkeypatch.setattr(
+        "src.scrapers.enrichment.skip_trace.fetch_queues", lambda *a, **k: _provider_queues()
+    )
+
     def _install(csv_text: str):
         monkeypatch.setattr(
             "src.scrapers.enrichment.skip_trace.download_tracerfy_csv",

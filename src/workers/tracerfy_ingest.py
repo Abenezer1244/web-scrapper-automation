@@ -465,20 +465,25 @@ def _host_is_tracerfy(download_url: str) -> bool:
     return host in _TRACERFY_BUCKET_HOSTS
 
 
-def _provider_queue_record(queue_id: int) -> dict | None:
-    """Tracerfy's own record of ``queue_id`` when it shows the queue complete, else
-    None (API unreachable, queue absent, still pending, or no download URL)."""
-    from src.scrapers.enrichment.skip_trace import TracerfyError, fetch_queues
+_PROVIDER_RECHECKS = 5
+_PROVIDER_RECHECK_SECONDS = 120
 
+
+def _url_host(url) -> str:
+    """The host of ``url`` for a log line, never raising on a malformed value."""
     try:
-        queues = fetch_queues()
-    except TracerfyError as exc:
-        _logger.warning(
-            "Tracerfy ingest queue %d: provider record unavailable (%s); using the "
-            "webhook's values, clamped", queue_id, str(exc)[:120],
-        )
-        return None
-    for queue in queues:
+        return urlsplit(str(url)).hostname or "<none>"
+    except ValueError:
+        return "<unparseable>"
+
+
+def _provider_queue_record(queue_id: int) -> dict | None:
+    """Tracerfy's own record of ``queue_id`` when it shows the queue complete with a
+    download URL; None when the queue is absent or not complete there. Raises
+    TracerfyError when the provider cannot be asked (autoretry handles it)."""
+    from src.scrapers.enrichment.skip_trace import fetch_queues
+
+    for queue in fetch_queues():
         if (
             isinstance(queue, dict)
             and queue.get("id") == queue_id
@@ -487,11 +492,44 @@ def _provider_queue_record(queue_id: int) -> dict | None:
             and queue["download_url"]
         ):
             return queue
-    _logger.warning(
-        "Tracerfy ingest queue %d: the provider does not show it complete; using the "
-        "webhook's values, clamped", queue_id,
-    )
     return None
+
+
+def _defer_until_provider_complete(queue_id: int, download_url: str, rechecks: int) -> dict:
+    """Re-check a queue the provider does not yet show complete, a bounded number of
+    times, then page ops. Never marks the queue errored."""
+    if rechecks < _PROVIDER_RECHECKS:
+        try:
+            ingest_tracerfy_batch.apply_async(
+                kwargs={
+                    "queue_id": queue_id, "download_url": download_url,
+                    "provider_rechecks": rechecks + 1,
+                },
+                countdown=_PROVIDER_RECHECK_SECONDS,
+            )
+            _logger.warning(
+                "Tracerfy ingest queue %d: the provider does not show it complete; "
+                "re-checking in %ds (%d/%d)",
+                queue_id, _PROVIDER_RECHECK_SECONDS, rechecks + 1, _PROVIDER_RECHECKS,
+            )
+            return {"queue_id": queue_id, "deferred": "provider_not_complete"}
+        except Exception as exc:  # noqa: BLE001 — fall through to the alert
+            _logger.error(
+                "Tracerfy ingest queue %d: could not schedule a provider re-check: %s",
+                queue_id, str(exc)[:120],
+            )
+    from src.workers.ops_alerts import send_ops_alert
+
+    send_ops_alert(
+        "skip_trace", f"ingest_provider_incomplete_{queue_id}",
+        "Skip-trace webhook for a batch Tracerfy does not show complete",
+        f"A completion webhook arrived for Tracerfy queue {queue_id}, but Tracerfy's "
+        f"own queue list still does not show it complete with a download URL after "
+        f"{rechecks} re-check(s). Nothing was ingested or billed. If the batch is "
+        f"genuinely complete, re-run ingest for it once the provider record shows "
+        f"it; if not, the webhook was premature or forged.",
+    )
+    return {"queue_id": queue_id, "skipped": "provider_not_complete"}
 
 
 @app.task(
@@ -511,6 +549,7 @@ def ingest_tracerfy_batch(
     download_url: str,
     rows_uploaded: int = 0,
     credits_deducted: int = 0,
+    provider_rechecks: int = 0,
 ) -> dict:
     """Download a Tracerfy batch CSV and upsert phone/email into Results.
 
@@ -543,16 +582,15 @@ def ingest_tracerfy_batch(
             "Refusing Tracerfy ingest for queue %d: download_url host not "
             "Tracerfy-owned (host=%s)",
             queue_id,
-            (urlsplit(download_url).hostname or "<none>"),
+            _url_host(download_url),
         )
         return {"queue_id": queue_id, "skipped": "untrusted_download_host"}
 
-    # Webhook-body counts are untrusted numbers: anything but a non-negative int
-    # is read as 0, which bills 'completed' rows only (erring toward the customer).
+    # Counts are read from the provider's record below, never the webhook body.
+    # Anything but a non-negative int is read as 0, which bills 'completed' rows
+    # only (erring toward the customer).
     def _count(value) -> int:
         return value if type(value) is int and value >= 0 else 0
-
-    rows_uploaded, credits_deducted = _count(rows_uploaded), _count(credits_deducted)
 
     # REDTEAM (Codex review): cheap pre-check BEFORE any network I/O. A replay
     # of an already completed/billed/errored batch — or an unknown/forged queue
@@ -580,23 +618,27 @@ def ingest_tracerfy_batch(
         )
         return {"queue_id": queue_id, "skipped": f"already_{_pre[0]}"}
 
-    # The webhook is a TRIGGER, not a source of truth (audit #5, S3-15): when
-    # Tracerfy's own queue record shows this batch complete, its download URL and
-    # counts replace the body's. Only when that record is unavailable does the body
-    # decide, and then clamped (rows_uploaded can never exceed what was recorded at
-    # submission, see the queue update below) and host-pinned as before.
+    # The webhook is a TRIGGER, never a source of data (audit #5, S3-15). Its
+    # secret has leaked (S3-16), and host pinning proves only that a URL is on
+    # Tracerfy's bucket, not that it is THIS queue's CSV: any Tracerfy customer's
+    # result URL would pass. So the download URL and the counts come only from
+    # Tracerfy's own record of this queue. A TracerfyError (API unreachable)
+    # propagates to autoretry.
     remote = _provider_queue_record(queue_id)
-    if remote is not None:
-        download_url = remote["download_url"]
-        rows_uploaded = _count(remote.get("rows_uploaded"))
-        credits_deducted = _count(remote.get("credits_deducted"))
-        if not _host_is_tracerfy(download_url):
-            _logger.error(
-                "Refusing Tracerfy ingest for queue %d: the provider's own download_url "
-                "is not on a pinned host (host=%s)",
-                queue_id, (urlsplit(download_url).hostname or "<none>"),
-            )
-            return {"queue_id": queue_id, "skipped": "untrusted_download_host"}
+    if remote is None:
+        # Not complete at the provider: a premature or forged webhook. Never an
+        # error (a forged one must not burn a real batch's retries into 'errored');
+        # look again shortly, in case the record lags a genuine webhook.
+        return _defer_until_provider_complete(queue_id, download_url, provider_rechecks)
+    download_url = remote["download_url"]
+    rows_uploaded = _count(remote.get("rows_uploaded"))
+    credits_deducted = _count(remote.get("credits_deducted"))
+    if not _host_is_tracerfy(download_url):
+        _logger.error(
+            "Refusing Tracerfy ingest for queue %d: the provider's own download_url "
+            "is not on a pinned host (host=%s)", queue_id, _url_host(download_url),
+        )
+        return {"queue_id": queue_id, "skipped": "untrusted_download_host"}
 
     try:
         csv_text = download_tracerfy_csv(download_url)

@@ -1,158 +1,140 @@
-"""S3-15 (audit #3, re-confirmed audit #5): the Tracerfy webhook body cannot raise a
-customer's bill, and its download URL is fetched only from Tracerfy's own bucket,
-over HTTPS.
+"""S3-15 (audit #3, re-confirmed audit #5): the Tracerfy webhook is a trigger, never a
+source of data. Its secret has leaked (S3-16), and a URL on Tracerfy's bucket proves
+nothing about WHICH queue it belongs to (any Tracerfy customer's result CSV would pass
+a host check). So the CSV fetched and the counts billed come from Tracerfy's own
+queue record, and the download host is pinned to Tracerfy's bucket over HTTPS.
 
-The body is authenticated by a shared secret that audit #3 found in edge logs
-(S3-16), so it is treated as attacker-controllable here. DB-backed against real
-rows through the same harness as tests/test_tracerfy_ingest.py; only the CSV
-download is stubbed (no network, no credits).
+DB-backed against real rows through the harness of tests/test_tracerfy_ingest.py; only
+the provider calls (queue list, CSV download) are served locally (no network, no
+credits).
 """
 import pytest
 from sqlalchemy import text
 
 from src.db.session import system_sync_session
+from src.scrapers.enrichment.skip_trace import TracerfyError
 from src.workers.tracerfy_ingest import _host_is_tracerfy, ingest_tracerfy_batch
-from tests.test_tracerfy_ingest import (
-    DOWNLOAD_URL,
-    _csv,
-    _next_queue_id,
-    _seed,
-    _usage,
-)
+from tests.test_tracerfy_ingest import DOWNLOAD_URL, _csv, _next_queue_id, _seed, _usage
 
-
-@pytest.fixture
-def stub_csv(monkeypatch):
-    """Serve a canned result CSV instead of fetching one. No network."""
-    fetched: list[str] = []
-
-    def _install(csv_text: str):
-        def _download(url):
-            fetched.append(url)
-            return csv_text
-        monkeypatch.setattr("src.scrapers.enrichment.skip_trace.download_tracerfy_csv", _download)
-        return fetched
-    return _install
-
-
-@pytest.fixture
-def provider_record(monkeypatch):
-    """Tracerfy's GET /v1/api/queues/ answer, served without network."""
-    def _install(*queues: dict):
-        monkeypatch.setattr(
-            "src.scrapers.enrichment.skip_trace.fetch_queues", lambda *a, **k: list(queues)
-        )
-    return _install
-
-
-def _stored_rows_uploaded(queue_id: int) -> int:
-    with system_sync_session() as db:
-        return db.execute(
-            text("SELECT rows_uploaded FROM skip_trace_queues WHERE tracerfy_queue_id = :q"),
-            {"q": queue_id},
-        ).scalar_one()
-
-
-def _set_stored_rows_uploaded(queue_id: int, n: int) -> None:
-    with system_sync_session() as db:
-        db.execute(
-            text("UPDATE skip_trace_queues SET rows_uploaded = :n WHERE tracerfy_queue_id = :q"),
-            {"n": n, "q": queue_id},
-        )
-        db.commit()
-
-
+_OTHER_CUSTOMERS_CSV = "https://tracerfy.nyc3.cdn.digitaloceanspaces.com/tracerfy/someone-else.csv"
 _TWO_ADDRESSES = [("1 FIRST ST", "TACOMA", "WA"), ("2 SECOND ST", "TACOMA", "WA")]
 # Tracerfy answers the first address only; the second is 'unmatched'.
 _ONE_HIT = "1 FIRST ST,TACOMA,WA,JANE,DOE,2065550100,Mobile,2065550100,,,,"
 
 
+@pytest.fixture
+def provider(monkeypatch):
+    """Serve Tracerfy's queue list and result CSV locally; records every CSV URL
+    fetched, so a test can prove WHICH file was read."""
+    fetched: list[str] = []
+
+    def _install(csv_text: str, *queues: dict):
+        def _download(url):
+            fetched.append(url)
+            return csv_text
+        monkeypatch.setattr("src.scrapers.enrichment.skip_trace.download_tracerfy_csv", _download)
+        monkeypatch.setattr(
+            "src.scrapers.enrichment.skip_trace.fetch_queues", lambda *a, **k: list(queues)
+        )
+        return fetched
+    return _install
+
+
+def _complete(qid: int, rows: int) -> dict:
+    return {"id": qid, "pending": False, "download_url": DOWNLOAD_URL,
+            "rows_uploaded": rows, "credits_deducted": rows}
+
+
+def _queue(qid: int) -> tuple:
+    with system_sync_session() as db:
+        return tuple(db.execute(
+            text("SELECT status, rows_uploaded FROM skip_trace_queues WHERE tracerfy_queue_id = :q"),
+            {"q": qid},
+        ).one())
+
+
 @pytest.mark.asyncio
-async def test_a_webhook_cannot_raise_rows_uploaded_to_bill_a_dropped_row(starter_user, stub_csv):
-    """Tracerfy accepted 1 of the 2 rows we sent (it drops and de-duplicates), so the
-    unmatched row was never looked up and must not be billed. A forged body saying
-    999 used to overwrite that and bill it."""
+@pytest.mark.parametrize("body_rows", [999, 0, -5, "999", None])
+async def test_the_webhook_body_never_decides_the_count(starter_user, provider, body_rows):
+    """Tracerfy accepted 1 of the 2 rows sent (it drops and de-duplicates), so the
+    unmatched row was never looked up. A body saying 999 used to bill it; a body
+    saying 0 used to suppress billing. Only the provider's 1 counts."""
     qid = _next_queue_id()
     _seed(starter_user.id, qid, _TWO_ADDRESSES)
-    _set_stored_rows_uploaded(qid, 1)
-    stub_csv(_csv(_ONE_HIT))
+    provider(_csv(_ONE_HIT), _complete(qid, 1))
     before = _usage(starter_user.id)
 
     ingest_tracerfy_batch(
-        queue_id=qid, download_url=DOWNLOAD_URL, rows_uploaded=999, credits_deducted=999
+        queue_id=qid, download_url=DOWNLOAD_URL, rows_uploaded=body_rows, credits_deducted=body_rows
     )
 
-    assert _stored_rows_uploaded(qid) == 1
+    assert _queue(qid) == ("completed", 1)
     assert _usage(starter_user.id) - before == 1  # the hit only
 
 
 @pytest.mark.asyncio
-async def test_a_webhook_can_still_report_a_dropped_row(starter_user, stub_csv):
-    """Lowering is the real provider signal (and only ever bills less): honoured."""
-    qid = _next_queue_id()
-    _seed(starter_user.id, qid, _TWO_ADDRESSES)  # stored rows_uploaded = 2
-    stub_csv(_csv(_ONE_HIT))
-    before = _usage(starter_user.id)
-
-    ingest_tracerfy_batch(queue_id=qid, download_url=DOWNLOAD_URL, rows_uploaded=1, credits_deducted=1)
-
-    assert _stored_rows_uploaded(qid) == 1
-    assert _usage(starter_user.id) - before == 1
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("bad", [-5, "999", 3.5, None, True])
-async def test_a_malformed_count_bills_completed_rows_only(starter_user, stub_csv, bad):
+async def test_the_webhook_body_never_chooses_the_csv(starter_user, provider):
+    """A result URL on Tracerfy's own bucket passes the host pin whoever it belongs
+    to. The file read is the one Tracerfy's record names for THIS queue."""
     qid = _next_queue_id()
     _seed(starter_user.id, qid, _TWO_ADDRESSES)
-    stub_csv(_csv(_ONE_HIT))
-    before = _usage(starter_user.id)
+    fetched = provider(_csv(_ONE_HIT), _complete(qid, 2))
 
-    ingest_tracerfy_batch(queue_id=qid, download_url=DOWNLOAD_URL, rows_uploaded=bad, credits_deducted=bad)
+    ingest_tracerfy_batch(queue_id=qid, download_url=_OTHER_CUSTOMERS_CSV, rows_uploaded=2)
 
-    assert _stored_rows_uploaded(qid) == 0
-    assert _usage(starter_user.id) - before == 1
+    assert fetched == [DOWNLOAD_URL]
 
 
 @pytest.mark.asyncio
-async def test_the_providers_record_decides_not_the_webhook_body(
-    starter_user, stub_csv, provider_record
+@pytest.mark.parametrize("record", ["pending", "absent"])
+async def test_a_queue_not_complete_at_the_provider_is_deferred_not_ingested(
+    starter_user, provider, record
 ):
-    """With Tracerfy's own record showing the queue complete, a forged body can
-    neither lower the count (under-billing) nor choose the CSV that is fetched."""
+    """A premature or forged webhook: nothing fetched, nothing billed, and the queue
+    stays 'pending' (never 'errored', which would block the genuine webhook)."""
     qid = _next_queue_id()
-    _seed(starter_user.id, qid, _TWO_ADDRESSES)  # stored rows_uploaded = 2
-    fetched = stub_csv(_csv(_ONE_HIT))
-    provider_record({
-        "id": qid, "pending": False, "download_url": DOWNLOAD_URL,
-        "rows_uploaded": 2, "credits_deducted": 2,
-    })
+    _seed(starter_user.id, qid, _TWO_ADDRESSES)
+    queues = [{"id": qid, "pending": True, "download_url": None}] if record == "pending" else []
+    fetched = provider(_csv(_ONE_HIT), *queues)
     before = _usage(starter_user.id)
 
-    ingest_tracerfy_batch(
-        queue_id=qid,
-        download_url="https://tracerfy.nyc3.cdn.digitaloceanspaces.com/tracerfy/forged.csv",
-        rows_uploaded=0, credits_deducted=0,
+    out = ingest_tracerfy_batch(queue_id=qid, download_url=DOWNLOAD_URL, rows_uploaded=2)
+
+    assert out["deferred"] == "provider_not_complete"
+    assert fetched == []
+    assert _queue(qid) == ("pending", 2)
+    assert _usage(starter_user.id) == before
+
+
+@pytest.mark.asyncio
+async def test_after_the_last_recheck_it_pages_ops_and_still_does_not_error(starter_user, provider):
+    qid = _next_queue_id()
+    _seed(starter_user.id, qid, _TWO_ADDRESSES)
+    fetched = provider(_csv(_ONE_HIT))
+
+    out = ingest_tracerfy_batch(
+        queue_id=qid, download_url=DOWNLOAD_URL, rows_uploaded=2, provider_rechecks=5
     )
 
-    assert fetched == [DOWNLOAD_URL]
-    assert _stored_rows_uploaded(qid) == 2
-    assert _usage(starter_user.id) - before == 2  # the hit and the genuinely unmatched row
+    assert out["skipped"] == "provider_not_complete"
+    assert fetched == []
+    assert _queue(qid)[0] == "pending"
 
 
 @pytest.mark.asyncio
-async def test_a_queue_still_pending_at_the_provider_falls_back_to_the_clamped_body(
-    starter_user, stub_csv, provider_record
-):
+async def test_an_unreachable_provider_is_retried_not_trusted(starter_user, provider, monkeypatch):
     qid = _next_queue_id()
     _seed(starter_user.id, qid, _TWO_ADDRESSES)
-    fetched = stub_csv(_csv(_ONE_HIT))
-    provider_record({"id": qid, "pending": True, "download_url": None})
+    fetched = provider(_csv(_ONE_HIT))
 
-    ingest_tracerfy_batch(queue_id=qid, download_url=DOWNLOAD_URL, rows_uploaded=999, credits_deducted=9)
+    def _down(*a, **k):
+        raise TracerfyError("Tracerfy returned 503 for queue list")
 
-    assert fetched == [DOWNLOAD_URL]
-    assert _stored_rows_uploaded(qid) == 2
+    monkeypatch.setattr("src.scrapers.enrichment.skip_trace.fetch_queues", _down)
+    with pytest.raises(TracerfyError):
+        ingest_tracerfy_batch.run(queue_id=qid, download_url=DOWNLOAD_URL, rows_uploaded=2)
+    assert fetched == []
+    assert _queue(qid)[0] == "pending"
 
 
 @pytest.mark.parametrize("url", [
@@ -178,6 +160,7 @@ def test_tracerfys_own_bucket_is_trusted(url):
     "https://user@tracerfy.nyc3.cdn.digitaloceanspaces.com/x.csv",
     "https://tracerfy.nyc3.cdn.digitaloceanspaces.com./x.csv",
     "not a url",
+    "https://[::1/x.csv",
 ])
 def test_other_buckets_and_plaintext_are_refused(url):
     assert _host_is_tracerfy(url) is False

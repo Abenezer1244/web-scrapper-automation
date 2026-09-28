@@ -152,7 +152,7 @@ is re-run (shared CTA map). tsc, eslint, build, drift check.
 - [x] Owner confirms: **A, additive** (2026-09-28).
 - [x] BE: tests RED -> implement -> GREEN; ruff; full suite (8 parts); openapi regen + diff.
 - [x] Security §14.
-- [ ] Codex diff review (`origin/main...HEAD`) until GATE: PASS.
+- [x] Codex diff review (`origin/main...HEAD`) until GATE: PASS (round 1, no findings).
 - [ ] Quiesce, merge, verify prod. A live 402 cannot be produced read-only (it needs a refused
       account), and prod does not serve `/openapi.json` (`openapi_url` is off when `DEBUG` is
       false; round 3 P3). So: api/worker/beat on the merge SHA, clean boot, api logs free of
@@ -215,3 +215,6 @@ share it; ruff flagged importing a fixture across test modules).
   decide; only the response shape changed); the body is exactly three known fields built through
   a Pydantic model, so no stack trace / DB error can reach it (key-set assertions); CORS and
   security headers present on the 402 (test).
+
+Codex diff review (`origin/main...HEAD`, after the rebase onto `29afc82e`):
+- Round 1: **GATE: PASS**, no P1/P2/P3.

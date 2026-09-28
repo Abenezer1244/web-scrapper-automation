@@ -51,3 +51,16 @@ Notes (not findings):
 | S4-03 | FIXED on PR #378, NOT merged | |
 
 Both PRs still merge into current main without conflict (`git merge-tree`, gate G2).
+
+## Addendum: commits that landed on main during the audit (`29afc82e..c0b09b7a`)
+
+#380 and #382 merged while audit #5 ran; the audit branch now includes them, so they are
+covered here.
+
+| File | What changed | Security reading | Result |
+|---|---|---|---|
+| src/api/errors.py | NEW. `RunRefusedHTTPException` + handler: a machine code and `resumes_at` beside the unchanged 402 sentence | Body built through `RunRefusalResponse`, only the caller's own account code/message/time; codes outside `RUN_REFUSAL_CODES` fall back to the plain sentence | clean |
+| src/api/routes/jobs.py, src/api/routes/batches.py, src/api/schemas.py | 402s raised through `run_refusal_http`; OpenAPI response docs | Same gates, same order; `batches.py` now reads `run_eligibility` (quota_block_reason's source) | clean |
+| src/utils/skip_trace_pause_state.py | NEW. Redis hash of per-account lookup resume times, fenced Lua writes | Times only, no spend or cap numbers; NOT read by any route yet. Forward note: the Phase 1c reader must read only the caller's own `<user_id>` field plus `global`/`account_default` | clean |
+| src/workers/skip_trace_capacity.py | the resume-time walk | SQLAlchemy expressions; no user input | clean |
+| src/workers/skip_trace_dispatcher.py | publishes the pause state each tick | constant `text()` (isolation level, statement_timeout); refuses to publish from a read-only/recovering session; DB closed before Redis I/O | clean |

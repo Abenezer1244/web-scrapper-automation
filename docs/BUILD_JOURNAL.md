@@ -59,8 +59,8 @@ to understand *why* the code is the way it is and *what's been attempted before*
   count (r1: can still lower it), provider record with fallback (r2: any Tracerfy customer's CSV
   URL passes the host pin), retries (r3: an outage errors a genuine batch), body-URL precheck (r4:
   a JSON number raised TypeError and marked the REAL queue errored, pre-existing on main).
-- `.env.example` could not be read (permission rule): its two new lines are unverified, and the two
-  new settings (`SCRAPER_EGRESS_PROXY_ENABLED`, and nothing else new) are not in it yet.
+- `.env.example` could not be read (permission rule): its two new lines are unverified, and the one new setting,
+  `SCRAPER_EGRESS_PROXY_ENABLED`, is not in it yet.
 
 **Caught & fixed:**
 - A test reached the REAL Tracerfy API (401) once 5d added the queue-list call: one ingest test set

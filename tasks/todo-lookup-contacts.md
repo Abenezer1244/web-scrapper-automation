@@ -2291,6 +2291,10 @@ table's same-named index alone; INVALID corpses rebuilt. Test DB migrated 104 ->
   `pg_cancel_backend`s it; every wait bounded; cleanup unconditional. Mutation (invalid
   accepted): caught by it. Suite 29 passed, 3 more repeat runs 29/29.
 
+**Codex diff review r2 on 105 (three-dot, rebased on `9ee0fac9`): VERDICT GO, no findings.**
+(`<scratchpad 4fe51d38>/codex_105_review_r2_out.txt`; 60 s is below migrate.py's 900 s lock
+budget; the phase name is right on PG 16 and 17.)
+
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever
       the tab has leads that have never been looked up; when the quote comes back with

@@ -43,9 +43,10 @@ _ZONES: dict[str, tuple[int, int]] = {
     # rebuilds a full lead CSV (decrypting PII) from the DB: /jobs/{id}/download,
     # /batches/{id}/download, /batches/{id}/runs/{run}/download,
     # /segments/intersection/export and /segments/union/export. /jobs/{id}/export-url
-    # builds nothing, but it spends from the same bucket, and its URL is fetched
-    # from /download, which spends again: a job export costs 2, so the ceiling is
-    # 10 job exports a minute (20 for the other routes, which take one call each).
+    # builds nothing but spends from the same bucket, and the in-app flow then
+    # fetches its URL from /download, which spends again: that flow costs 2, so 10
+    # in-app job exports a minute. A direct or emailed /download (bearer or download
+    # token) costs 1 per call, as does each call to the other routes.
     "export": (20, 60),
     # Job cancel and the scraper write routes (create, edit, csv-layout, delete).
     # Own zone so a burst of edits cannot starve the user's reads in `general`.

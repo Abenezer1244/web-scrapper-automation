@@ -9,11 +9,15 @@ the two segment exports. These tests pin all six to one budget.
 from __future__ import annotations
 
 import importlib
+import time
+import types
 import uuid
 
 import pytest
 import redis.asyncio as aioredis
 from httpx import AsyncClient
+from redis.backoff import NoBackoff
+from redis.retry import Retry
 from sqlalchemy import update
 
 from src.db.models import BatchRun, Job, Result, ScraperBatch, ScraperConfig, User
@@ -21,6 +25,18 @@ from src.db.models import BatchRun, Job, Result, ScraperBatch, ScraperConfig, Us
 # The package re-exports the rate_limit FUNCTION under the module name, so a plain
 # `import ... as` would bind the function, not the module.
 rl = importlib.import_module("src.api.middleware.rate_limit")
+
+
+@pytest.fixture(autouse=True)
+def _limiter_clock(monkeypatch):
+    """The limiter's clock, and only the limiter's: it advances 1 ms per request
+    from the real time at test start, so 21 requests always fall inside one 60 s
+    window however slowly this machine builds the CSVs. A wall clock made these
+    tests flaky (a Redis-down run took 57-70 s and the window slid past its first
+    requests). The limiter, Redis and the fallback still run for real; this module
+    is the only reader of the replaced name (`rate_limit.py`, `time.time()`)."""
+    start, ticks = time.time(), iter(range(10**9))
+    monkeypatch.setattr(rl, "time", types.SimpleNamespace(time=lambda: start + next(ticks) / 1000))
 
 # Literal on purpose: on the unfixed code these tests must fail by getting no 429,
 # not by a missing constant.
@@ -144,20 +160,22 @@ async def test_a_batch_download_miss_still_spends_the_budget(client, db, route, 
 @pytest.mark.parametrize("route", _NEW_EXPORTS, ids=_route_id)
 async def test_export_routes_stay_throttled_when_redis_is_down(client, db, monkeypatch, route):
     """A real client pointed at a closed port, not a stub. `general` fails fully
-    open here; `export` falls back to a per-process limiter.
-
-    The short connect timeout keeps the whole loop inside the 60 s window: on
-    Windows a refused connect takes about 2 s, and 21 of them straddled the window,
-    so the first requests expired and the 21st was allowed (a flake, seen once)."""
+    open here; `export` falls back to a per-process limiter. Short timeouts and no
+    retries only keep the run fast; the window itself is held by `_limiter_clock`."""
     acct = await _account(client, db)
-    monkeypatch.setattr(rl, "_redis_client", aioredis.from_url(
-        "redis://127.0.0.1:1/0", socket_connect_timeout=0.05,
-    ))
+    dead = aioredis.from_url(
+        "redis://127.0.0.1:1/0", socket_connect_timeout=0.05, socket_timeout=0.05,
+        retry=Retry(NoBackoff(), 0), retry_on_error=[],
+    )
+    monkeypatch.setattr(rl, "_redis_client", dead)
     monkeypatch.setattr(rl, "_fallback_hits", {})
-    for i in range(EXPORT_BUDGET):
-        code = await _call(client, acct, route)
-        assert code == 200, f"request {i + 1} got {code}"
-    assert await _call(client, acct, route) == 429
+    try:
+        for i in range(EXPORT_BUDGET):
+            code = await _call(client, acct, route)
+            assert code == 200, f"request {i + 1} got {code}"
+        assert await _call(client, acct, route) == 429
+    finally:
+        await dead.aclose()
 
 
 # ─── Controls: pass before and after the fix ─────────────────────────────────

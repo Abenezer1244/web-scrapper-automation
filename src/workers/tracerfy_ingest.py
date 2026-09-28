@@ -507,15 +507,16 @@ def _redis():
     return sync_redis.from_url(settings.REDIS_URL, **settings.redis_kwargs())
 
 
-def _hold_recheck_chain(queue_id: int, rechecks: int) -> bool:
-    """Claim (a new trigger) or refresh (a chain member) this queue's one re-check
+def _hold_recheck_chain(queue_id: int, member: bool) -> bool:
+    """Claim (a new trigger) or refresh (a chain member: a re-check or a Celery
+    retry of one) this queue's one re-check
     chain. False only when another chain holds it. The claim lives two re-check
     intervals past its last refresh, so a chain whose message is lost frees the
     queue within minutes. Fails open: Redis trouble must not stop a genuine batch."""
     ttl = 2 * _PROVIDER_RECHECK_SECONDS + 60
     try:
         client = _redis()
-        if rechecks > 0:
+        if member:
             client.set(_recheck_chain_key(queue_id), "1", ex=ttl)
             return True
         return bool(client.set(_recheck_chain_key(queue_id), "1", nx=True, ex=ttl))
@@ -666,7 +667,9 @@ def ingest_tracerfy_batch(
     # One provider re-check chain per queue: a repeated (forged) trigger costs no
     # provider call. A chain member refreshes its claim; a new trigger that finds
     # one running returns, and the chain's next re-check ingests the batch.
-    if not _hold_recheck_chain(queue_id, provider_rechecks):
+    # A Celery retry (a transient CSV download failure below, say) continues this
+    # same chain: it must refresh the claim, not find it and give up.
+    if not _hold_recheck_chain(queue_id, provider_rechecks > 0 or self.request.retries > 0):
         _logger.info("Tracerfy ingest queue %d: a provider re-check chain is running", queue_id)
         return {"queue_id": queue_id, "deferred": "provider_recheck_running"}
     try:
@@ -691,6 +694,7 @@ def ingest_tracerfy_batch(
             "Refusing Tracerfy ingest for queue %d: the provider's own download_url "
             "is not on a pinned host (host=%s)", queue_id, _url_host(download_url),
         )
+        _release_recheck_chain(queue_id)
         return {"queue_id": queue_id, "skipped": "untrusted_download_host"}
 
     try:
@@ -1040,6 +1044,7 @@ def ingest_tracerfy_batch(
 
         # Single atomic commit: ingest + status flip + counter advances.
         db.commit()
+    _release_recheck_chain(queue_id)
 
     # REDTEAM (Codex convergence — meter outbox): the billable MeterEvents are
     # now durably persisted as skip_trace_meter_events outbox rows inside the

@@ -234,3 +234,34 @@ def test_tracerfys_own_bucket_is_trusted(url):
 ])
 def test_other_buckets_and_plaintext_are_refused(url):
     assert _host_is_tracerfy(url) is False
+
+
+@pytest.mark.asyncio
+async def test_a_celery_retry_after_a_download_failure_still_ingests(
+    starter_user, provider, monkeypatch
+):
+    """The first attempt takes the queue's re-check claim and then fails to download
+    the CSV. Its Celery retry is the same chain: it must ingest, not find its own
+    claim and give up (which left the queue pending with nothing to recover it)."""
+    qid = _next_queue_id()
+    _seed(starter_user.id, qid, _TWO_ADDRESSES)
+    provider(_csv(_ONE_HIT), _complete(qid, 2))
+    attempts: list[str] = []
+
+    def _flaky(url):
+        attempts.append(url)
+        if len(attempts) == 1:
+            raise TracerfyError("Tracerfy CSV download returned 503")
+        return _csv(_ONE_HIT)
+
+    monkeypatch.setattr("src.scrapers.enrichment.skip_trace.download_tracerfy_csv", _flaky)
+    with pytest.raises(TracerfyError):
+        ingest_tracerfy_batch.run(queue_id=qid, download_url=DOWNLOAD_URL)
+
+    out = ingest_tracerfy_batch.apply(
+        kwargs={"queue_id": qid, "download_url": DOWNLOAD_URL}, retries=1, throw=True
+    ).get()
+
+    assert out["hits"] == 1
+    assert len(attempts) == 2
+    assert _queue(qid)[0] == "completed"

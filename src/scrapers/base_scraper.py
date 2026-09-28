@@ -33,6 +33,19 @@ from src.utils.safe_http import safe_get
 
 _logger = setup_logger("scraper.base")
 
+# Chromium egress that no Playwright route ever sees, turned off at launch (audit #5,
+# S3-14): QUIC (and WebTransport, which rides on it) and WebRTC UDP. With no proxy
+# configured, disable_non_proxied_udp leaves WebRTC only TCP to TURN servers.
+# Both WebRTC switches are needed: headless honours the force- one, headed Chrome
+# (production runs headed under Xvfb) only the plain one.
+# Speculative preconnects and TURN-over-TCP still need a network egress firewall.
+UNROUTED_CHANNEL_ARGS: tuple[str, ...] = (
+    "--disable-quic",
+    "--webrtc-ip-handling-policy=disable_non_proxied_udp",
+    "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+)
+_ANY_URL = re.compile(r".*")
+
 
 # ─── Party-name normalization ────────────────────────────────────────────────
 # Recorder portals stack multiple parties (co-owners, or borrower + trustee)
@@ -289,6 +302,7 @@ class BridgeScraper:
                 "--disable-translate",
                 "--no-first-run",
                 "--js-flags=--max-old-space-size=512",
+                *UNROUTED_CHANNEL_ARGS,
             ],
         )
         # Resolve the identity we present to portals. Derived from the browser
@@ -337,7 +351,13 @@ class BridgeScraper:
         context_kwargs: dict = {} if self._plain_browser else {
             "user_agent": self._user_agent, "viewport": {"width": 1280, "height": 800},
             "locale": "en-US"}
-        self._context = await self._browser.new_context(**context_kwargs)
+        # Service workers are blocked for every context, plain included: a service
+        # worker's own fetches never pass through context.route, so a page that
+        # could install one would have an unguarded egress channel. This is not an
+        # identity override (no UA, viewport or locale changes).
+        self._context = await self._browser.new_context(
+            service_workers="block", **context_kwargs
+        )
         # Per-hop SSRF enforcement: validate every DOCUMENT navigation
         # (initial load AND each redirect hop) BEFORE the request leaves the
         # browser. Without this, validate_scraping_target only sees the
@@ -345,6 +365,9 @@ class BridgeScraper:
         # metadata host would already have made that request by the time we
         # re-check the landing URL. Aborting at the route layer closes that.
         await self._context.route("**/*", self._ssrf_route_guard)
+        # WebSockets never reach context.route: a page could otherwise open one to
+        # any internal address. Same verdict as a sub-resource request.
+        await self._context.route_web_socket(_ANY_URL, self._ssrf_ws_guard)
 
         self.page = await self._context.new_page()
 
@@ -427,10 +450,13 @@ class BridgeScraper:
         Non-HTTP(S) schemes (about:blank, data:, blob:) carry no host egress
         and pass through. getaddrinfo is sync, so it runs in the executor (no
         event-loop block; the OS resolver cache keeps repeat hosts cheap).
-        Never raises — on an internal error it allows (continue) so the guard
-        can't wedge a scrape. Shared by the context route guard AND any
-        page-level route (which takes precedence over the context route).
+        Never raises, and FAILS CLOSED: if the guard itself cannot decide (an
+        unreadable request, an executor failure), the request is refused. A DNS
+        failure is already a ValueError verdict (security.py). Shared by the
+        context route guard AND any page-level route (which takes precedence
+        over the context route).
         """
+        url = "<unreadable>"
         try:
             url = request.url
             scheme = url.split(":", 1)[0].lower()
@@ -441,7 +467,16 @@ class BridgeScraper:
             except Exception:
                 is_subframe = False
             require_allowlisted = request.resource_type == "document" and not is_subframe
-            loop = asyncio.get_event_loop()
+            return await self._ssrf_target_allowed(url, require_allowlisted=require_allowlisted)
+        except Exception as exc:  # the guard could not decide: refuse, never wave through
+            _logger.warning("SSRF: guard error, request refused (%s): %s", url[:80], exc)
+            return False
+
+    async def _ssrf_target_allowed(self, url: str, *, require_allowlisted: bool) -> bool:
+        """The SSRF verdict for one http(s) URL: False if validate_scraping_target
+        refuses it (blocked address, DNS failure, or off-allowlist when required)."""
+        loop = asyncio.get_event_loop()
+        try:
             await loop.run_in_executor(
                 None,
                 functools.partial(
@@ -451,13 +486,32 @@ class BridgeScraper:
                     resolve=True,
                 ),
             )
-            return True
         except ValueError:
-            _logger.error("SSRF: blocked navigation to disallowed target %s", request.url)
+            _logger.error("SSRF: blocked request to disallowed target %s", url)
             return False
-        except Exception as exc:  # never let the guard itself wedge navigation
-            _logger.debug("SSRF nav check passthrough (%s): %s", request.url[:80], exc)
-            return True
+        return True
+
+    async def _ssrf_ws_guard(self, ws) -> None:
+        """Context WebSocket guard: connect only to targets a sub-resource could
+        reach (ws/wss judged as http/https); close anything else with 1008."""
+        allowed = False
+        try:
+            url = ws.url
+            scheme, sep, rest = url.partition(":")
+            http_scheme = {"ws": "http", "wss": "https"}.get(scheme.lower())
+            if sep and http_scheme:
+                allowed = await self._ssrf_target_allowed(
+                    f"{http_scheme}:{rest}", require_allowlisted=False
+                )
+        except Exception as exc:  # the guard could not decide: refuse
+            _logger.warning("SSRF: WebSocket guard error, connection refused: %s", exc)
+        if allowed:
+            ws.connect_to_server()
+            return
+        try:
+            await ws.close(code=1008, reason="blocked")
+        except Exception:
+            pass
 
     async def _ssrf_route_guard(self, route) -> None:
         """Context route guard: abort disallowed document navigations pre-flight."""

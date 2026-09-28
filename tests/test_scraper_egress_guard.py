@@ -20,12 +20,7 @@ from playwright.async_api import async_playwright
 
 from src.config import settings
 from src.scrapers.base_scraper import UNROUTED_CHANNEL_ARGS, BridgeScraper
-
-
-class _PlainScraper(BridgeScraper):
-    """The stock-browser mode (Pierce ATIP owner lookup) must be guarded the same."""
-
-    _plain_browser = True
+from src.scrapers.enrichment.pierce_atip_owner import AtipOwnerPlainBrowser
 
 
 class _LoopbackAllowedScraper(BridgeScraper):
@@ -78,7 +73,7 @@ _OPEN_WS = """
 """
 
 
-@pytest.mark.parametrize("scraper_cls", [BridgeScraper, _PlainScraper])
+@pytest.mark.parametrize("scraper_cls", [BridgeScraper, AtipOwnerPlainBrowser])
 async def test_page_websocket_to_loopback_is_refused(loopback_ws, scraper_cls):
     port, hits = loopback_ws
     async with scraper_cls() as scraper:
@@ -111,7 +106,7 @@ async def test_allowed_websocket_passes_through_unchanged(loopback_ws):
     assert echoed == "ping"
 
 
-@pytest.mark.parametrize("scraper_cls", [BridgeScraper, _PlainScraper])
+@pytest.mark.parametrize("scraper_cls", [BridgeScraper, AtipOwnerPlainBrowser])
 async def test_service_worker_registration_is_blocked(scraper_cls):
     """A service worker's fetches bypass context.route entirely, so a page must not
     be able to install one."""
@@ -186,7 +181,7 @@ async () => {
 """
 
 
-@pytest.mark.parametrize("scraper_cls", [BridgeScraper, _PlainScraper])
+@pytest.mark.parametrize("scraper_cls", [BridgeScraper, AtipOwnerPlainBrowser])
 async def test_page_gathers_no_webrtc_udp_candidates(scraper_cls):
     """WebRTC UDP (STUN, direct peers) bypasses every route; with the policy flags
     the browser gathers no UDP candidate at all. The control launches the SAME

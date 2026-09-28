@@ -21,6 +21,7 @@ from src.api.middleware.security import _ip_is_blocked
 from src.config import settings
 from src.scrapers.base_scraper import BridgeScraper
 from src.scrapers.egress_proxy import ALLOWED_PORTS, EgressProxy
+from src.scrapers.enrichment.pierce_atip_owner import AtipOwnerPlainBrowser
 
 
 class _AnyPortProxy(EgressProxy):
@@ -188,11 +189,9 @@ async (port) => {
 """
 
 
-class _PlainScraper(BridgeScraper):
-    _plain_browser = True
 
 
-@pytest.mark.parametrize("scraper_cls", [BridgeScraper, _PlainScraper])
+@pytest.mark.parametrize("scraper_cls", [BridgeScraper, AtipOwnerPlainBrowser])
 async def test_a_turn_over_tcp_candidate_cannot_reach_an_internal_address(
     internal_echo, monkeypatch, scraper_cls
 ):

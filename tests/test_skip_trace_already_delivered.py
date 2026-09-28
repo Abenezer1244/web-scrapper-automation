@@ -762,6 +762,16 @@ async def test_an_answer_for_an_already_delivered_lead_bills_one_lookup_and_no_r
             {"id": str(uuid.uuid4()), "q": queue_id, "j": again, "u": business_user.id})
         s.commit()
     lookups_before, records_before = usage()
+    # Ingest reads the URL and counts from Tracerfy's own queue record (audit #5,
+    # S3-15); serve it locally, never the network.
+    monkeypatch.setattr(
+        "src.scrapers.enrichment.skip_trace.fetch_queues",
+        lambda *a, **k: [{
+            "id": queue_id, "pending": False,
+            "download_url": "https://tracerfy.nyc3.cdn.digitaloceanspaces.com/tracerfy/x.csv",
+            "rows_uploaded": 1, "credits_deducted": 1,
+        }],
+    )
 
     out = ingest_tracerfy_batch(
         queue_id=queue_id,

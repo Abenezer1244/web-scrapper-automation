@@ -31,6 +31,7 @@ from src.api.schemas import (
     DELIVER_SECRET_FIELDS,
     CachedRecordRow,
     CachedResultsPage,
+    ConfigRunEligibilityResponse,
     ConnectorCreate,
     ConnectorResponse,
     CsvLayoutUpdate,
@@ -124,7 +125,22 @@ async def list_scrapers(
     if exclude_batch_children:
         stmt = stmt.where(ScraperConfig.batch_id.is_(None))
     result = await db.execute(stmt.order_by(ScraperConfig.created_at.desc()))
-    return [ScraperConfigResponse.model_validate(s) for s in result.scalars().all()]
+    return await _with_run_eligibility(db, current_user, list(result.scalars().all()))
+
+
+async def _with_run_eligibility(db: AsyncSession, user, configs: list) -> list[ScraperConfigResponse]:
+    """Responses for ``configs`` carrying each one's run eligibility, from ONE
+    evaluator call (a fixed number of queries for the whole list). It is the
+    evaluator POST /jobs decides with, so Run now cannot disagree with it."""
+    from src.api.config_eligibility import config_run_eligibility
+
+    answers = await config_run_eligibility(db, user, configs, datetime.now(UTC))
+    responses = []
+    for config in configs:
+        response = ScraperConfigResponse.model_validate(config)
+        response.run_eligibility = ConfigRunEligibilityResponse.model_validate(answers[config.id])
+        responses.append(response)
+    return responses
 
 
 async def _validate_connector_supports(
@@ -453,7 +469,7 @@ async def get_scraper(
     config = result.scalar_one_or_none()
     if config is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scraper not found")
-    return ScraperConfigResponse.model_validate(config)
+    return (await _with_run_eligibility(db, current_user, [config]))[0]
 
 
 @router.delete("/{scraper_id}", status_code=status.HTTP_204_NO_CONTENT)

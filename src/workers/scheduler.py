@@ -13,6 +13,7 @@ Re-exports (kept importable from src.workers.scheduler for callers/tests):
 
 from celery.schedules import crontab
 
+from src.config import settings
 from src.utils.logger import setup_logger
 from src.workers import app
 
@@ -190,10 +191,11 @@ app.conf.beat_schedule = {
     "dispatch-pending-skip-trace": {
         # Sprint 4: drains pending_skip_trace_rows, submits Tracerfy batches.
         # Tracerfy rate-limits batch POSTs to 10 per 5 min, so we run every
-        # 5 min and submit at most SKIP_TRACE_MAX_BATCHES_PER_TICK (default 2)
-        # per tick. The task is a no-op if SKIP_TRACE_ENABLED=False.
+        # SKIP_TRACE_DISPATCH_INTERVAL_SECONDS (default 300) and submit at most
+        # SKIP_TRACE_MAX_BATCHES_PER_TICK (default 2) per tick. The pause-state
+        # heartbeat reads the same setting. No-op if SKIP_TRACE_ENABLED=False.
         "task": "src.workers.skip_trace_dispatcher.dispatch_pending_skip_trace",
-        "schedule": 300.0,  # every 5 minutes
+        "schedule": float(settings.SKIP_TRACE_DISPATCH_INTERVAL_SECONDS),
     },
     "flush-skip-trace-meter-outbox": {
         # REDTEAM (Codex convergence — meter outbox): recover skip-trace

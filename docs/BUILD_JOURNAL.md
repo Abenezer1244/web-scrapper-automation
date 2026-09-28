@@ -19,6 +19,205 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-28 — Security audit #5: a delta with nothing new, and an open queue that was not what it said
+
+> Owner-chosen DELTA of `ee601b55..29afc82e` (plus FE #165-#167) and remediation of the open
+> queue. Report: `SECURITY-AUDIT.md` (Audit #5 section at the END, so it merges beside #374's top
+> section). Plan `tasks/todo-security-audit5.md`, ledger `.unlazy/secaudit5/GATES.md`. Five fix
+> branches, NOTHING pushed or merged.
+
+**Built / Shipped (branches, not merged):**
+- **5a** `fix/security-audit5a-browser-egress`: the Playwright guard covers WebSockets
+  (`route_web_socket`), blocks service workers, turns off QUIC and WebRTC UDP, fails closed.
+- **5b** `fix/security-audit5b-pinned-egress`: `safe_http` and the dialer outbox dial through
+  `pinned_session()`; `validate_scraping_target` refuses userinfo and a backslash in the authority.
+- **5d** `fix/security-audit5d-tracerfy-webhook-trust`: the Tracerfy webhook is a trigger only;
+  URL and counts come from Tracerfy's own queue record; the download host is pinned to nyc3 over HTTPS.
+- **5e** `fix/security-audit5e-hardening`: `ENTITLEMENT_ENFORCEMENT` unset in production = on.
+- **5f** `fix/security-audit5f-egress-proxy` (on 5a): an in-worker SOCKS5 egress proxy for the
+  browser, behind `SCRAPER_EGRESS_PROXY_ENABLED` (default OFF).
+
+**Tried / Decided:**
+- The delta itself was clean (both reviewers): the three biggest changes were security
+  improvements (`alembic/env.py` no longer reads `.env`, `src/db_safety.py`, loopback-only compose).
+- **S4-07 re-rated P3 by consensus** after measuring it: `general` allows ~30k decrypted rows/min
+  per user, the separate `export` zone ~1M; moving the JSON views would cut the ceiling <3% and 429
+  interactive browsing. No code.
+- **D5-03 as SOCKS5, not an HTTP proxy.** Codex failed the HTTP-proxy design (request smuggling,
+  "TURN may bypass it"). SOCKS5 has no HTTP parsing, and a measurement settled the TURN question:
+  on Chromium 151 headed and headless, page loads, fetch, WebSockets and a TURN-over-TCP candidate
+  all reached the SOCKS proxy, none went direct.
+- Deferred with reasons: **S4-06** (the reservation SQL is inline in `run_scrape_job`, and the only
+  tests run a COPY of it, so a real test needs an extraction first) and **D5-01** (the AI-cap
+  evaluator is async/API-side; the mode it caps costs nothing).
+
+**Failed / Blocked:**
+- I told the owner S3-14 was P1 (Codex's rating), then found its premise false: a DNS failure
+  already fails closed (`security.py:189-193`). Re-rated P2 in the report with the evidence. The
+  live parts were the channels no route sees (WebSocket, service worker), both reproduced.
+- 5d took seven Codex rounds. Each "fix" moved the trust problem instead of removing it: clamp the
+  count (r1: can still lower it), provider record with fallback (r2: any Tracerfy customer's CSV
+  URL passes the host pin), retries (r3: an outage errors a genuine batch), body-URL precheck (r4:
+  a JSON number raised TypeError and marked the REAL queue errored, pre-existing on main).
+- `.env.example` could not be read (permission rule): its two new lines are unverified, and the one new setting,
+  `SCRAPER_EGRESS_PROXY_ENABLED`, is not in it yet.
+
+**Caught & fixed:**
+- A test reached the REAL Tracerfy API (401) once 5d added the queue-list call: one ingest test set
+  a fake token without stubbing it. Stubbed.
+- The first service-worker test passed on main: Playwright's "block" makes `register()` RESOLVE with
+  nothing installed, and the SW script is fetched through CONTEXT routes, not page routes.
+- Headed Chrome ignores `--force-webrtc-ip-handling-policy`; it needs the plain switch too
+  (production runs headed under Xvfb).
+
+**Pending / Handoff:**
+- Owner: merge #374 then #378 (S3-03 is LIVE until #374 merges); decide on pushing the five
+  branches; turn on `SCRAPER_EGRESS_PROXY_ENABLED` only after every template runs through it;
+  Tracerfy header migration then delete the legacy path-secret route (S3-16); Cloudflare sole
+  ingress (S3-04); confirm the `.env.example` lines.
+- Code: 5b-ii (pin the PACS / AcclaimWeb / Tracerfy-submit sessions, P3), S4-06 extraction, S4-02.
+- #382's pause state: when Phase 1c adds an API reader, it must read only the caller's own field.
+
+**Facts learned:**
+- All 33 production Tracerfy download URLs are `https://tracerfy.nyc3.cdn.digitaloceanspaces.com`
+  (read host-only; `download_url` is Fernet-encrypted at rest).
+- `WebSocketRoute.connect_to_server()` is synchronous in the Python async API; `close()` is not.
+- A Spaces bucket name is unique per REGION, so "tracerfy" in another region is not Tracerfy's.
+
+---
+
+## 2026-09-28 — The 402 says why (Q6 2b-ii Phase B), and a stub I blamed on the product
+
+> Two merges, both live. BE **#380** `405ba52c` (run-refusal 402 code, no migration) and FE
+> **#168** `a5ed32a` (the toast names the fix). Plan + Codex rounds + review:
+> `tasks/todo-run-eligibility-2b-ii-b.md` (BE), FE `tasks/todo-run-refusal-402-fe.md`.
+
+**Built / Shipped:**
+- **BE #380.** The run-refusal 402s (`POST /jobs` AI limit + account rule, `POST /batches`
+  account rule) keep `detail` as the same sentence, byte for byte, and add top-level `code`
+  (`ai_limit | frozen | ended | over_limit`) and `resumes_at` (`src/api/errors.py`:
+  `RunRefusedHTTPException`, a subclass of HTTPException, + a handler serializing through
+  `RunRefusalResponse`). Both routes declare every 402 shape (run, entitlement, plain) as an
+  `anyOf`. The `connectors` test fixture moved to `tests/conftest.py`. Merged after a quiet
+  check (all zeros, alembic 105); api/worker/beat on `405ba52c`, clean boot.
+- **FE #168.** `readErrorBody` keeps a top-level-code body as `kind: "run_refusal"`;
+  `toastUpgrade` routes it first: "Update payment" (frozen), "Resubscribe" (ended), "Upgrade plan"
+  (ai_limit / over_limit), unknown code -> neutral "Manage billing". Labels live in
+  `lib/billing-cta.ts`, shared with the Scrapers page; `satisfies Record<RunRefusalCode,string>`.
+
+**Tried / Decided:**
+- Owner chose the ADDITIVE shape (A) over an object `detail` (B). Verified, not assumed: 0 of 7
+  prod accounts hold an API key, so no external client could see either change today.
+- `anyOf`, not `oneOf`, on purpose: exclusivity needs `additionalProperties: false`, the
+  strictness that breaks a client the day a key is added.
+- Codex plan review took 4 rounds (P1s: raw datetime would 500 -> serialize via the model;
+  honest anyOf per route; FE provenance marker; one clock in batches). Diff reviews: BE GATE PASS
+  round 1 with no findings; FE GATE PASS round 1 (P2 "wizard/batch not clicked" answered with
+  call-site evidence: both call the identical `toastError` on the identical `apiFetch` error).
+
+**Failed / Blocked:**
+- Claude Code's permission classifier errored on every Bash/Edit call for a stretch (4 in a row;
+  10 ends the turn). Stopped with the build uncommitted but on disk, reported, resumed later.
+  While blocked, `main` moved (#379, migration 105): rebased, test DB upgraded to 105, related
+  tests re-run.
+- A foreground suite part over 600 s moved to the background and the next part started on the
+  same DB; both passed, then every later part ran backgrounded and awaited one at a time.
+
+**Caught & fixed:**
+- **Correction to the entry below:** its "Seen in passing" says the dashboard logs "Cannot read
+  properties of undefined (reading 'title')" when `/analytics/summary` fails. WRONG cause. It is
+  `next_action.title` in `components/onboarding-banner.tsx`, and it was MY STUB's
+  `/auth/onboarding` omitting `next_action`; the backend always sets it
+  (`auth_helpers/session.py`, every branch). Not a product bug. Lesson: find the failing
+  property in the bundle before naming a cause.
+- `test_rls_isolation` "permission denied for table results" again on the eligibility test DB
+  (the known roles-vs-grants landmine, see memory): `has_table_privilege` was false; granted,
+  green, whole part re-run.
+
+**Pending / Handoff:**
+- Queue next: 2c (Q1 run-count breakdown, migration), 2d (Q2 `already_delivered` on
+  JobResponse), 2e (Q4 "Lookup failed"), then batches B-E, F-043 Phase 2, Phase 4/5.
+- Still queued from Phase A: `connector_unavailable`; `jobs.was_ai` snapshot (migration).
+- `/scrapers` layout: a long record-type label squeezes one row so the record count overlaps
+  its metadata (~1300 px; pre-existing).
+- The `test_rls_isolation` role fixture should GRANT on every run, not only on role creation.
+
+**Facts learned:**
+- Starlette resolves exception handlers by MRO: a handler for an HTTPException SUBCLASS wins
+  over FastAPI's default and a catch-all `Exception` handler, and an unregistered subclass still
+  renders as a plain HTTPException. Endpoint-raised exceptions are handled inside
+  `ExceptionMiddleware`, so CORS + security headers still wrap the response (tested).
+- A live refused 402 cannot be observed read-only (it needs a refused account), and prod does
+  not serve `/openapi.json` (`openapi_url` is off unless DEBUG): prod verification of a
+  response-shape change is the deployed SHA + tests, stated as such.
+
+---
+
+## 2026-09-28 — Run now asks the gate (Q6 2b-ii), and a poll that could blank the page
+
+> Two merges, both live. BE **#375** `ae351c4e` (per-scraper `run_eligibility`, no migration)
+> and FE **#167** `54bc200` (Scrapers page reads it). Plans and full Codex records:
+> `tasks/todo-run-eligibility-2b-ii.md` (BE) and FE `tasks/todo-run-eligibility-2b-ii-fe.md`.
+
+**Built / Shipped:**
+- **BE #375.** `src/api/config_eligibility.py`: one evaluator, `config_run_eligibility`, decides
+  both `POST /jobs` and the new `run_eligibility` on `GET /scrapers` / `GET /scrapers/{id}`,
+  so the page and the gate cannot disagree. Codes in gate order: `run_in_flight`, `not_entitled`,
+  `ai_limit`, `frozen|ended|over_limit` (`config_inactive` page-only). Refusal bodies unchanged
+  byte for byte (parity tests). `pick_connector` in `registry.py` gives worker and evaluator ONE
+  deterministic connector choice. Merged after a read-only quiesce (0 in-flight jobs, 0 active
+  batch runs, 0 long transactions, alembic 104); api/worker/beat SUCCESS on `ae351c4e`.
+- **FE #167.** A blocked scraper shows Run now disabled with the backend's reason and the fix
+  that applies ("Update payment" for frozen, never "Upgrade"; "Resubscribe"; "Upgrade plan";
+  "Resets Oct 1 (UTC)."). Running job = Watch; null/absent = unknown = clickable. The list polls
+  every 5 s; a refused click refetches it. Types regenerated from `ae351c4e`, which also turned
+  the FE drift gate green again (#375's schema change had turned it red for every FE PR).
+
+**Tried / Decided:**
+- Refusal bodies deliberately NOT changed in Phase A: the owner-approved plan says "Phase A moves
+  no refusal". The structured 402 envelope is Phase B (additive: keep `detail` prose, add
+  top-level `code` + `resumes_at`, so API-key clients reading `detail` keep working).
+- The reset date is formatted with `formatUtcDate` and says "(UTC)": the AI limit lifts at
+  00:00 UTC on the 1st, which is the evening before in the Americas; `formatDate` would show a
+  day early in Pacific.
+- Codex P3 "pin the generator in CI" declined with evidence: CI runs `npm ci` before `npx`, and
+  npx resolves the lockfile-pinned local 7.13.0.
+
+**Failed / Blocked:**
+- The stub-rig console check failed once on an Auth.js "Failed to fetch" right after login. It
+  is NOT this change: an A/B over 5 identical runs gave branch 3/5, unmodified `origin/master`
+  1/5 (a session fetch aborted by the driver's immediate navigation). Recorded, not chased.
+- A Python patch script that inserted `"\\n"` into a JS file wrote a literal newline (a
+  SyntaxError in the rig driver). Edit JS through the Edit tool, not a Python string.
+
+**Caught & fixed:**
+- **A background poll failure blanked the Scrapers list (pre-existing, made worse by polling).**
+  The page rendered `isError ? <ErrorState>`; in TanStack Query v5 a failed BACKGROUND refetch
+  sets `isError` while cached rows remain. With the new 5 s poll, one failed poll would have
+  replaced every row with the error screen. Codex caught it at plan round 3. Now ErrorState only
+  without data; cached rows stay with a status line; eligibility counts as unknown meanwhile.
+- **A failed jobs poll hid every Run now / Watch** (`isSuccess` goes false on a refetch error).
+  Now "jobs loaded at least once".
+- BE latent bug (#375): AI usage was judged by an unordered `.first()` over a county-wide join,
+  so a manual run in a mixed county could count as AI (reproduced: 402 "50/50" on the old gate).
+  No prod county is mixed, so no live refusal moved.
+
+**Pending / Handoff:**
+- Phase B: structured 402 envelope (plan, Codex, owner decision), then FE `toastError` routes a
+  frozen 402 to "Update payment" (wizard / quick start still show the neutral "Manage billing").
+- Queued from Phase A: `connector_unavailable` refusal; `jobs.was_ai` snapshot (migration).
+- Seen in passing: with `/analytics/summary` failing (stub 404) the DASHBOARD logs "Cannot read
+  properties of undefined (reading 'title')"; and on `/scrapers` a long record-type label
+  ("Code violation (Seattle, Bellevue, ...)") squeezes the row so the record count overlaps
+  the metadata at ~1300 px (visible on prod before and after #167).
+
+**Facts learned:**
+- Prod verification without a server-side token: in the owner's tab, read the bearer from the
+  next-auth session JSON (as `lib/api.ts` does), call the API in-page and return only counts.
+  #167: 68/68 rows valid under the full wire contract, DOM matched the page's rule exactly.
+- `git diff origin/main...HEAD` (three dots) was used for every Codex diff round; `origin/main`
+  moved to `bca09eff` during FE work without a schema change (drift check still exit 0).
+
 ## 2026-09-27 — The spend cap's keyset refill (1b-1b-ii-c-2), and Alembic can no longer reach production from a test
 
 > Two merges, both live. BE **#366** `2e839076` (ii-c-2, no migration; 103 shipped in #365) and

@@ -1082,6 +1082,85 @@
         "title": "CheckoutRequest",
         "type": "object"
       },
+      "ConfigRunEligibilityResponse": {
+        "description": "May this scraper start a run (``src.api.config_eligibility``).\n\nThe same evaluator decides POST /jobs, and the codes are listed in the order\nthat gate refuses, so the reason shown is the refusal the user would get.\n``config_inactive`` is the exception: it is reported only here, since POST\n/jobs answers an inactive scraper with a plain 404.",
+        "properties": {
+          "can_run": {
+            "title": "Can Run",
+            "type": "boolean"
+          },
+          "code": {
+            "anyOf": [
+              {
+                "enum": [
+                  "config_inactive",
+                  "run_in_flight",
+                  "not_entitled",
+                  "ai_limit",
+                  "frozen",
+                  "ended",
+                  "over_limit"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Code"
+          },
+          "job_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Job Id"
+          },
+          "message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Message"
+          },
+          "resumes_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resumes At"
+          },
+          "violation_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Violation Code"
+          }
+        },
+        "required": [
+          "can_run"
+        ],
+        "title": "ConfigRunEligibilityResponse",
+        "type": "object"
+      },
       "ConnectorCreate": {
         "properties": {
           "assessor_url": {
@@ -1664,6 +1743,42 @@
           }
         },
         "title": "EnrichmentConfig",
+        "type": "object"
+      },
+      "EntitlementRefusalDetail": {
+        "properties": {
+          "code": {
+            "title": "Code",
+            "type": "string"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "title",
+          "message"
+        ],
+        "title": "EntitlementRefusalDetail",
+        "type": "object"
+      },
+      "EntitlementRefusalResponse": {
+        "description": "The plan does not include what was asked for (``entitlements.plan_limit_http``).",
+        "properties": {
+          "detail": {
+            "$ref": "#/components/schemas/EntitlementRefusalDetail"
+          }
+        },
+        "required": [
+          "detail"
+        ],
+        "title": "EntitlementRefusalResponse",
         "type": "object"
       },
       "FieldsConfig": {
@@ -2548,6 +2663,20 @@
         "title": "PhoneContact",
         "type": "object"
       },
+      "PlainRefusalResponse": {
+        "description": "A 402 that carries only a sentence (e.g. the batch plan gate).",
+        "properties": {
+          "detail": {
+            "title": "Detail",
+            "type": "string"
+          }
+        },
+        "required": [
+          "detail"
+        ],
+        "title": "PlainRefusalResponse",
+        "type": "object"
+      },
       "ProfileUpdate": {
         "additionalProperties": false,
         "description": "Editable profile fields — used by BOTH Settings>Account and the\nrequired-name gate. first_name + last_name are REQUIRED (non-empty after\nsanitization) so this endpoint is how an incomplete-profile user satisfies\nthe gate. Sanitized through the SAME validator as registration. extra='forbid'\nso a caller cannot smuggle other user columns (plan, records_limit,\nis_admin, ...) through the profile endpoint.",
@@ -3304,6 +3433,44 @@
         "title": "RunEligibilityResponse",
         "type": "object"
       },
+      "RunRefusalResponse": {
+        "description": "A run refused by the AI monthly limit or the account rule\n(``src.api.errors``). ``detail`` is the same sentence this 402 has always\ncarried; ``code`` and ``resumes_at`` were ADDED beside it, and more\ntop-level keys may be added, so ignore keys you do not know.",
+        "properties": {
+          "code": {
+            "enum": [
+              "ai_limit",
+              "frozen",
+              "ended",
+              "over_limit"
+            ],
+            "title": "Code",
+            "type": "string"
+          },
+          "detail": {
+            "title": "Detail",
+            "type": "string"
+          },
+          "resumes_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resumes At"
+          }
+        },
+        "required": [
+          "detail",
+          "code",
+          "resumes_at"
+        ],
+        "title": "RunRefusalResponse",
+        "type": "object"
+      },
       "ScheduleConfig": {
         "properties": {
           "date_from": {
@@ -3576,6 +3743,16 @@
           "record_type": {
             "title": "Record Type",
             "type": "string"
+          },
+          "run_eligibility": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ConfigRunEligibilityResponse"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "schedule": {
             "anyOf": [
@@ -5571,6 +5748,27 @@
             },
             "description": "Successful Response"
           },
+          "402": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/RunRefusalResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/EntitlementRefusalResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/PlainRefusalResponse"
+                    }
+                  ],
+                  "title": "Response 402 Create Batch Batches Post"
+                }
+              }
+            },
+            "description": "Refused. A run refusal (AI limit, frozen, ended, over the record limit) has a top-level `code`; a plan refusal has an object `detail`; anything else is a sentence in `detail`."
+          },
           "422": {
             "content": {
               "application/json": {
@@ -6504,6 +6702,27 @@
               }
             },
             "description": "Successful Response"
+          },
+          "402": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/RunRefusalResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/EntitlementRefusalResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/PlainRefusalResponse"
+                    }
+                  ],
+                  "title": "Response 402 Create Job Jobs Post"
+                }
+              }
+            },
+            "description": "Refused. A run refusal (AI limit, frozen, ended, over the record limit) has a top-level `code`; a plan refusal has an object `detail`; anything else is a sentence in `detail`."
           },
           "422": {
             "content": {

@@ -49,6 +49,23 @@ _ALLOWED_SCRAPER_MODULES = frozenset([
 ScraperFactory = Callable[..., "BridgeScraper"]
 
 
+def pick_connector(connectors, record_type: str):
+    """The connector a run of ``record_type`` uses, among one county's ACTIVE rows.
+
+    The first, oldest by ``(created_at, id)``, whose ``record_types`` lists the
+    record type (case-insensitive); None if none does. The ONE statement of the
+    rule: the worker resolves its scraper with it, and run eligibility uses it to
+    decide whether a run is AI usage, so the two cannot disagree. The order is
+    explicit because the lookup used to have none, which made a county with two
+    connectors for one record type resolve to whichever row Postgres returned.
+    """
+    rt = (record_type or "").lower()
+    for connector in sorted(connectors, key=lambda c: (c.created_at, str(c.id))):
+        if rt in [t.lower() for t in (connector.record_types or [])]:
+            return connector
+    return None
+
+
 def get_scraper_class(
     county: str, state: str, record_type: str
 ) -> tuple[ScraperFactory, str]:
@@ -75,7 +92,7 @@ def get_scraper_class(
                 func.lower(CountyConnector.county) == county.lower(),
                 func.lower(CountyConnector.state) == state.lower(),
                 CountyConnector.active,
-            )
+            ).order_by(CountyConnector.created_at, CountyConnector.id)
         )
         connectors = result.scalars().all()
 
@@ -84,16 +101,12 @@ def get_scraper_class(
             f"No active connector for {county.lower()}, {state.upper()}"
         )
 
-    # Find the connector that supports this specific record type
-    connector = None
-    all_types = []
-    for c in connectors:
-        all_types.extend(c.record_types)
-        if record_type.lower() in [rt.lower() for rt in c.record_types]:
-            connector = c
-            break
+    # The connector that supports this specific record type — the same rule
+    # run eligibility uses to decide whether this run is AI usage.
+    connector = pick_connector(connectors, record_type)
 
     if connector is None:
+        all_types = [t for c in connectors for t in (c.record_types or [])]
         raise UnsupportedCountyError(
             f"Record type '{record_type}' not supported for {county}, {state}. "
             f"Supported: {list(set(all_types))}"

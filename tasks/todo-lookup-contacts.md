@@ -2276,6 +2276,21 @@ table's same-named index alone; INVALID corpses rebuilt. Test DB migrated 104 ->
   checks (uuid and timestamptz have no alternative btree opclass in core PostgreSQL and are not
   collatable). They stay as defence.
 
+**Codex diff review r1 on 105 (2026-09-28): NO-GO, 2 P2, both fixed.**
+(`<scratchpad 4fe51d38>/codex_105_review_out.txt`)
+- P2 `lock_timeout` does not end a CONCURRENTLY build's wait for older transactions: one
+  stalled transaction on the table would hang the migration and the boot. Fixed:
+  `statement_timeout = 60s` around the build and the downgrade's drop (`_bounded()` /
+  `_unbounded()`); a timeout leaves an INVALID index that the next run rebuilds. New test: a held
+  REPEATABLE READ snapshot, the timeout shortened to 1 s; `upgrade()` ENDS with a statement
+  timeout (not a hang, bounded join), and the next run converges. Mutation (timeout not set):
+  caught. 102 and 103 have the same gap: logged as a follow-up (they are built and live).
+- P2 the INVALID-of-the-right-shape test depended on a 500 ms timer. Now deterministic: the
+  build runs on its own connection in a thread; the test polls `pg_stat_progress_create_index`
+  until that backend is `waiting for old snapshots` with the index ready and invalid, then
+  `pg_cancel_backend`s it; every wait bounded; cleanup unconditional. Mutation (invalid
+  accepted): caught by it. Suite 29 passed, 3 more repeat runs 29/29.
+
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever
       the tab has leads that have never been looked up; when the quote comes back with

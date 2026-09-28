@@ -252,11 +252,11 @@ def test_a_same_named_index_on_another_table_is_refused_not_dropped():
 # `alembic upgrade head`.
 
 
-def _run(step: str) -> None:
+def _run(step: str, mig=None) -> None:
     from alembic.operations import Operations
     from alembic.runtime.migration import MigrationContext
 
-    mig = _mig105()
+    mig = mig or _mig105()
     with sync_engine.connect() as conn:
         ctx = MigrationContext.configure(conn)
         # As env.py runs it: inside Alembic's outer migration transaction, which
@@ -304,31 +304,71 @@ def test_downgrade_leaves_a_same_named_index_on_another_table_alone():
         _run("upgrade")
 
 
+_CREATE_OURS = (
+    "CREATE INDEX CONCURRENTLY {n} ON public.pending_skip_trace_rows "
+    "(user_id, submitted_at) INCLUDE (trace_type) WHERE submitted_at IS NOT NULL")
+
+
+def _snapshot_holder():
+    """Another session holding a REPEATABLE READ snapshot: it conflicts with none of
+    a concurrent build's lock waits, but the build's last phase waits for it."""
+    holder = sync_engine.connect().execution_options(isolation_level="REPEATABLE READ")
+    holder.execute(text("SELECT 1"))
+    return holder
+
+
 def test_an_invalid_index_of_exactly_the_right_shape_is_rebuilt():
-    """The corpse below is also the wrong shape, so on its own it proves nothing
-    about indisvalid. Here the build is cancelled in its LAST wait, for older
-    snapshots, after it has marked the index ready: another session holds a
-    REPEATABLE READ snapshot, which conflicts with none of the build's lock waits
-    but is older than its reference snapshot. The cancel leaves an index that is
-    ready, of exactly our shape, and INVALID, so only indisvalid can reject it.
-    (An idle READ COMMITTED reader would not do: it keeps no snapshot between
-    statements. A ROW EXCLUSIVE holder would not either: the build stops earlier,
-    before the index is ready, and indisready alone would reject it.)"""
-    from sqlalchemy.exc import OperationalError
+    """The corpse in the next test is also the wrong shape, so on its own it proves
+    nothing about indisvalid. Here the build is cancelled in its LAST wait, for
+    older snapshots, after it has marked the index ready, which leaves an index that
+    is ready, of exactly our shape, and INVALID: only indisvalid can reject it.
+
+    Deterministic (Codex 105 review): the build runs on its own connection in a
+    thread; this test polls pg_stat_progress_create_index until that backend is
+    'waiting for old snapshots' with the index ready and invalid, and only then
+    cancels it. Every wait is bounded. (An idle READ COMMITTED reader keeps no
+    snapshot between statements, so the build would not wait for it; a ROW
+    EXCLUSIVE holder stops the build before the index is ready.)"""
+    import threading
+    import time
 
     mig = _mig105()
     with _autocommit() as conn:
         _drop_ours(conn, mig._INDEX)
-    holder = sync_engine.connect().execution_options(isolation_level="REPEATABLE READ")
+    holder = _snapshot_holder()
+    builder = sync_engine.connect().execution_options(isolation_level="AUTOCOMMIT")
+    pid = builder.execute(text("SELECT pg_backend_pid()")).scalar()
+    outcome = {}
+
+    def build():
+        try:
+            builder.execute(text(_CREATE_OURS.format(n=mig._INDEX)))
+            outcome["result"] = "finished"
+        except Exception as exc:  # noqa: BLE001 - the cancel is the expected outcome
+            outcome["result"] = type(exc).__name__ + ": " + str(exc).splitlines()[0]
+
+    worker = threading.Thread(target=build, daemon=True)
     try:
-        holder.execute(text("SELECT 1"))  # the transaction snapshot, held open
+        worker.start()
+        deadline = time.monotonic() + 20
+        reached = False
+        with _autocommit() as watch:
+            while time.monotonic() < deadline and worker.is_alive():
+                phase = watch.execute(text(
+                    "SELECT phase FROM pg_stat_progress_create_index WHERE pid = :p"),
+                    {"p": pid}).scalar()
+                row = _shape(watch, mig)
+                if (phase == "waiting for old snapshots" and row is not None
+                        and row.indisready and not row.indisvalid):
+                    reached = True
+                    break
+                time.sleep(0.05)
+            assert reached, f"the build never reached its last wait: {outcome}"
+            assert watch.execute(text("SELECT pg_cancel_backend(:p)"), {"p": pid}).scalar()
+        worker.join(20)
+        assert not worker.is_alive(), "the cancelled build did not return"
+        assert "canceling statement" in outcome["result"], outcome
         with _autocommit() as conn:
-            conn.execute(text("SET statement_timeout = '500ms'"))
-            with pytest.raises(OperationalError):
-                conn.execute(text(
-                    f"CREATE INDEX CONCURRENTLY {mig._INDEX} ON public.pending_skip_trace_rows "
-                    f"(user_id, submitted_at) INCLUDE (trace_type) WHERE submitted_at IS NOT NULL"))
-            conn.execute(text("RESET statement_timeout"))
             row = _shape(conn, mig)
             assert row is not None and not row.indisvalid, "expected an INVALID index"
             assert row.indisready and row.indislive, "cancelled in the last wait, not earlier"
@@ -342,8 +382,47 @@ def test_an_invalid_index_of_exactly_the_right_shape_is_rebuilt():
     finally:
         holder.rollback()
         holder.close()
+        if worker.is_alive():
+            with _autocommit() as conn:
+                conn.execute(text("SELECT pg_cancel_backend(:p)"), {"p": pid})
+            worker.join(20)
+        builder.close()
         with _autocommit() as conn:
             mig._build_account_spent_index(conn)
+
+
+def test_a_build_stalled_by_an_old_transaction_times_out_instead_of_hanging_the_boot():
+    """lock_timeout does not end a CONCURRENTLY build's wait for older transactions;
+    statement_timeout does (Codex 105 review). Shortened here so the test is quick;
+    the upgrade must END (with a timeout), and the next run must converge."""
+    import threading
+
+    mig = _mig105()
+    mig._BUILD_STATEMENT_TIMEOUT = "1s"
+    with _autocommit() as conn:
+        _drop_ours(conn, mig._INDEX)
+    holder = _snapshot_holder()
+    outcome = {}
+
+    def upgrade():
+        try:
+            _run("upgrade", mig)
+            outcome["result"] = "finished"
+        except Exception as exc:  # noqa: BLE001 - the timeout is the expected outcome
+            outcome["result"] = type(exc).__name__ + ": " + str(exc).splitlines()[0]
+
+    worker = threading.Thread(target=upgrade, daemon=True)
+    try:
+        worker.start()
+        worker.join(30)
+        assert not worker.is_alive(), "the migration hung on an old transaction"
+        assert "statement timeout" in outcome["result"], outcome
+    finally:
+        holder.rollback()
+        holder.close()
+        worker.join(30)
+    _run("upgrade")
+    assert _state()[1] == (mig._INDEX_DEF, True)
 
 
 def test_an_invalid_index_left_by_a_failed_build_is_rebuilt():

@@ -31,8 +31,10 @@ columns only. So the key list and the INCLUDE list are read separately, and the
 order, operator-class and collation checks apply to the keys.
 
 No data change, no constraint, no trigger. Production held ~1k pending rows in
-September 2026, so the build is sub-second; lock_timeout bounds only the waits
-for locks. Backward safe: nothing requires the index; the pause-state publisher
+September 2026, so the build is sub-second. lock_timeout (5 s) bounds the lock
+waits and statement_timeout (60 s) the whole build, including its waits for older
+transactions; a timeout leaves an INVALID index that the next run rebuilds.
+Backward safe: nothing requires the index; the pause-state publisher
 (iii-b) deploys only after this index is verified in production by
 `_is_right_shape()` itself (Codex iii-c consult L2).
 
@@ -189,22 +191,41 @@ def _build_account_spent_index(conn) -> None:
         ))
 
 
+# lock_timeout bounds only the waits for LOCKS. A CONCURRENTLY build (and drop)
+# also waits for every transaction older than its snapshots, which no lock_timeout
+# ends: one stalled transaction on this table would hang the migration, and the
+# boot with it. statement_timeout bounds the whole statement (Codex 105 review).
+# On timeout the build leaves an INVALID index behind, which the next run drops
+# and rebuilds (above), so a timeout is always safe to retry.
+_BUILD_STATEMENT_TIMEOUT = "60s"
+
+
+def _bounded(conn) -> None:
+    conn.execute(text("SET lock_timeout = '5s'"))
+    conn.execute(text(f"SET statement_timeout = '{_BUILD_STATEMENT_TIMEOUT}'"))
+
+
+def _unbounded(conn) -> None:
+    conn.execute(text("RESET statement_timeout"))
+    conn.execute(text("RESET lock_timeout"))
+
+
 def upgrade() -> None:
     # CONCURRENTLY cannot run in a transaction: autocommit_block commits the
     # migration transaction on entry (the 101 lesson), and this is the only step.
     with op.get_context().autocommit_block():
         conn = op.get_bind()
-        conn.execute(text("SET lock_timeout = '5s'"))
+        _bounded(conn)
         try:
             _build_account_spent_index(conn)
         finally:
-            conn.execute(text("RESET lock_timeout"))
+            _unbounded(conn)
 
 
 def downgrade() -> None:
     with op.get_context().autocommit_block():
         conn = op.get_bind()
-        conn.execute(text("SET lock_timeout = '5s'"))
+        _bounded(conn)
         try:
             # Only ours: a same-named index on another table is left alone.
             ours = conn.execute(text(
@@ -216,4 +237,4 @@ def downgrade() -> None:
             if ours:
                 conn.execute(text(f"DROP INDEX CONCURRENTLY IF EXISTS public.{_INDEX}"))
         finally:
-            conn.execute(text("RESET lock_timeout"))
+            _unbounded(conn)

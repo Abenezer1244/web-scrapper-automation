@@ -2362,6 +2362,492 @@ conftest change only ADDS a `connectors` fixture): NO-GO, 2 P2, both fixed.**
 **Codex diff review r3 on iii-b (three-dot, rebased on `5689139d` #381, docs only): VERDICT GO,
 no findings.** (`<scratchpad 4fe51d38>/codex_iiib_review_r3_out.txt`)
 
+## Phase 1b-1c — PLANNER + QUOTE (PLAN, 2026-09-28, BEFORE Codex consult)
+
+Branch `feat/lookup-1b1c-planner-quote` off `c0b09b7a` (all of 1b-1b live). Binding inputs:
+the 2026-09-20 planner/quote bullets (Phase 1b, "`plan_contact_lookup`" and "`POST
+/jobs/{job_id}/contact-lookups/quote`"), 15-3, 15-14, 15-17, 16-3, 16-8, D2, D3 + the FINAL
+pause contract, and "Revised split" item 3. **Touches no money and writes no database row:**
+the quote reads `results`/`jobs`/`users` and writes ONE Redis key.
+
+### Facts (read in code, 2026-09-28)
+- **The tab** = `GET /jobs/{id}/results` (`routes/jobs.py:498-539`): `job_id`, `user_id`,
+  `category_condition(category)` (`new` = `is_duplicate IS FALSE`; `already_delivered` =
+  prior-run duplicates), `tax_cap_condition(today)`, `actionable_condition()`, and nothing
+  unless `_run_delivered(job)` (`status == 'done'`, `:83`). View filters (search, tax,
+  owner-location, dialer) narrow the view; the quote ignores them and covers the TAB.
+  Both categories are inside `skip_trace_eligible_condition()` (`results_category.py:53`).
+- **The scrape enqueue's gates, in order** (`enrich.py:2271-2431`): kill switch, token,
+  per-config `skip_trace_enabled` (the SPEC, not this code, has the manual action bypass
+  ONLY this one: N1), plan != starter;
+  SQL: `property_address IS NOT NULL`, actionable, `skip_trace_status='not_attempted'`,
+  skip-trace-eligible; charged-unanswered (reads `pending_skip_trace_rows`: WORKER ONLY);
+  `street_is_placeholder`; settled complaint (only when `record_type='code_violation'`,
+  `king_cv_sources.is_settled`, source-keyed); then `build_pending_row_payload()`
+  (`skip_trace.py:1054`), the authority: None for no/placeholder-literal address, foreign
+  address, code-violation owner not proven, the ATIP policy
+  (`code_violation_skip_trace_allowed`, reads `settings.PIERCE_CV_OWNER_SKIP_TRACE_ENABLED`),
+  a non-personal party name, no city/state. Its `trace_type` is `normal` (1 credit) or
+  `advanced` (2). All of these import cleanly from the API (no `src.workers`).
+- `results.skip_trace_status` values: `not_attempted`, `queued`, `submitted`, `hit`, `miss`,
+  `errored`. Quotable is EXACTLY `not_attempted` (15-3). `errored` is ambiguous (pre-submit
+  rejection OR provider-accepted-unmatched, BILLED) and `last_trace_outcome` is NULL on every
+  row until 1b-2 (16-3), so `errored` is never quotable.
+- **API Redis clients are ASYNC** (`redis.asyncio`, `rate_limit.py:51-58`,
+  `auth_hardening.py:17-24`). `read_pause_state()` calls `r.hmget()` SYNCHRONOUSLY: handed an
+  async client, `vals` is a coroutine and the generator unpack raises `TypeError`, which is
+  OUTSIDE its `_MalformedError` handler = a 500. The quote must give it a sync client.
+- **The action row needs a price snapshot** (`unit_price_cents`, `currency`,
+  `pricing_version`, all NOT NULL, `models.py:1845-1847`) and **no canonical price exists**:
+  `routes/billing.py:323-329` hardcodes 0.05 (agency) / 0.08 (pro, business) (15-17).
+- **Included lookups left**: quota `settings.SKIP_TRACE_BUNDLED_QUOTAS[plan]` (pro 250,
+  business 1000, agency 2000); used `users.skip_trace_used_this_month`, which counts as 0
+  once the entitlement window has rolled (`skip_trace_usage.py:140-152`: `period_start` NULL
+  or `< effective_window().start`). `/billing/skip-trace-usage` does NOT apply that roll rule
+  (reports the stale counter until the daily rollover job runs).
+- **No API code reads `SKIP_TRACE_ENABLED` or `TRACERFY_API_TOKEN` today.** Whether the
+  Railway `api` service even carries them is unknown (API and worker env are separate: 15-14).
+- API-initial dispositions (the 101 trigger): `quoted` + the five `excluded_*`. `already_
+  answered` / `in_progress_elsewhere` are worker verdicts: the API can never write them.
+- `Result.created_at` exists (server default), `id` is a UUID: order `(created_at, id)`.
+- OpenAPI: `schema/openapi.json` is CI-checked (`export_openapi.py --check`); regen only in
+  `.venv-schema` (memory `reference_openapi_regen_env_matters`).
+
+### Design
+1. **Planner, NEW `src/api/contact_lookup_planner.py`** (imports no `src.workers`; the 1b-2
+   worker imports it):
+   - `PlannerPolicy(pierce_cv_owner_skip_trace_enabled: bool)` + `PLANNER_VERSION = 1`,
+     pinned into the quote (15-14). `policy_from_settings()` builds it once per request.
+   - `classify(row, record_type, policy) -> Verdict`, PURE (no DB, no I/O; the only settings
+     read is inside `build_pending_row_payload`, see caveat). First match wins, in the
+     enqueue's order:
+     1. status `queued`/`submitted` -> `in_progress`; `hit`/`miss` -> `already_answered`;
+        `errored` -> `previously_attempted`; any other value != `not_attempted` ->
+        `previously_attempted` (fail closed).
+     2. `property_address` NULL/blank -> `no_address` (`excluded_no_address`).
+     3. `street_is_placeholder` or the `(enrichment unavailable)` literal -> `placeholder`
+        (`excluded_placeholder_address`).
+     4. `record_type == 'code_violation'` and `is_settled(source, status)` ->
+        `settled_code_violation`.
+     5. Tacoma ATIP-sourced owner and `not policy.pierce_cv_owner_skip_trace_enabled` ->
+        `atip` (`excluded_atip_policy`), computed from the PINNED flag.
+     6. `build_pending_row_payload(row) is None` -> `not_traceable`.
+     7. Else `quotable`, with the payload's `trace_type`.
+     Caveat (stated in code): step 6 reads the PROCESS flag; if it is stricter than the pinned
+     one the row lands in `not_traceable`, never the reverse, so the planner can only exclude
+     more, never quote more.
+   - `plan_contact_lookup(rows, record_type, policy, cap=2000) -> Plan`: over rows already in
+     `(created_at, id)` order: `quoted_ids` (the first `cap` quotable), `advanced_count` (of
+     those), per-bucket counts over the COVERED window, `covered_count`, and `truncated`
+     (a quotable row exists beyond the cap). The covered window ends at the row that filled
+     the cap, so a re-quote covers the same leads, and leads bought by an earlier action fall
+     to `in_progress`/`already_answered` and the scan moves past them (no stuck window).
+   - `tab_rows(db, job, user_id, category, after, limit)`: the tab predicate above +
+     `skip_trace_eligible_condition()` (belt), keyset on `(created_at, id)`, loading only the
+     columns `classify` needs. The quote walks it in chunks of 500 and stops when the cap
+     fills, or at a hard **scan ceiling of 10,000 rows** (then `truncated` with the reason
+     `scan_limit`), so one request's work is bounded whatever the tab size.
+   - The 1b-2 worker reuses `classify` on the quoted ids (by id, not by tab) and adds only
+     what it alone can see (charged-unanswered, cache hits, the queue): it can only LOWER
+     the count (16-8).
+2. **Price + allowance, NEW `src/config/lookup_pricing.py`** (15-17): integer cents per plan
+   (`pro`/`business` 8, `agency` 5, others none), `CURRENCY = "usd"`,
+   `PRICING_VERSION = "2026-06"`; `included_lookups_remaining(user, now)` applying the SAME roll
+   rule as `report_lookups_for_user`. `routes/billing.py` `/skip-trace-usage` reads the price
+   from here (same numbers, one source). Its stale-`used` behaviour is logged, not changed.
+3. **Quote endpoint `POST /jobs/{job_id}/contact-lookups/quote`** {category}, in
+   `routes/jobs.py` (the route family it belongs to; keeps the PR inside 5 files). Order:
+   1. `rate_limit(zone="export")`: the quote decrypts nothing but walks up to 10k rows and
+      writes Redis; fail-closed zone, 20/min per user.
+   2. Job by `(id, user_id)` else 404. `status != 'done'` -> 409 `run_not_finished`.
+   3. `normalize_plan(user.plan) not in SKIP_TRACE_ADDON_PLANS` -> the structured 402
+      (`skip_trace_violation(plan)`, the batches shape).
+   4. `not SKIP_TRACE_ENABLED or not TRACERFY_API_TOKEN` -> 503
+      `{code: "contact_lookups_unavailable"}` (friendly copy, no detail).
+   5. Plan the tab (Design 1).
+   6. Pause state: `read_pause_state()` UNCHANGED, called through `run_in_threadpool` with a
+      module-level SYNC client, `redis.from_url(REDIS_URL, **redis_kwargs(),
+      socket_timeout=0.5, socket_connect_timeout=0.5)`. Any failure is already UNKNOWN.
+   7. Store the quote: key `bridgeleads:contact_lookup:quote:v1:<quote_id>`, `SET NX EX 600`,
+      JSON `{v:1, user_id, job_id, category, quoted_ids, advanced_count, max_new_lookups,
+      counts, covered_count, truncated, planner_version, policy, unit_price_cents, currency,
+      pricing_version, included_remaining_at_quote, created_at}`. `quote_id =
+      secrets.token_urlsafe(32)`. Only the quoted ids are stored (the immutable set, 16-8);
+      exclusions are counts. Redis failure -> 503, no quote returned (a quote nobody can
+      confirm must not be shown).
+   8. 200 `ContactLookupQuote`: `quote_id`, `expires_at`, `category`, `max_new_lookups`,
+      `advanced_count`, `covered_count`, `truncated` + `truncated_reason` (`cap` |
+      `scan_limit` | null), `excluded` {no_address, placeholder, settled_code_violation,
+      atip, not_traceable}, `already_answered`, `in_progress`, `previously_attempted`,
+      `included_lookups_remaining`, `unit_price_cents`, `currency`, `pause` {`status`
+      (`paused`|`not_paused`|`unknown`), `normal_resume_at`, `advanced_resume_at` (ISO |
+      `"never"` | null)}. No lead ids, names or addresses in the response.
+   The quote is **non-binding** and an UPPER bound: `max_new_lookups` can only go down at
+   confirm and in the worker (reuse, answers found meanwhile); the schema field docs say so.
+
+### Split (5-file rule; the plan file counts)
+- **1b-1c-i planner + pricing (no endpoint):** NEW `src/api/contact_lookup_planner.py`, NEW
+  `src/config/lookup_pricing.py`, `src/api/routes/billing.py`, NEW
+  `tests/test_contact_lookup_planner.py`, this plan = 5.
+- **1b-1c-ii quote endpoint:** `src/api/routes/jobs.py`, `src/api/schemas.py`,
+  `schema/openapi.json`, NEW `tests/test_contact_lookup_quote.py`, this plan = 5.
+
+### Tests (real PG + local Redis; no mocks)
+- [ ] i: `classify` table test, one row per branch, incl. each `build_pending_row_payload`
+      None reason (foreign, CV owner unproven, non-personal name, no locality) -> `not_traceable`.
+- [ ] i: **PARITY with the real scrape enqueue**: seed one job with every branch, run
+      `_enqueue_skip_trace_rows` (token set, `http://` Tracerfy never reached: it only
+      enqueues), assert the set of result ids it queued == the planner's `quoted_ids`, and
+      each pending row's `trace_type` == the planner's. Then flip the ATIP flag both ways.
+- [ ] i: order + cap: 2,001 quotable rows -> 2,000 quoted, `truncated`, the SAME ids on a
+      re-plan; rows already answered at the front do not stop the window moving.
+- [ ] i: `included_lookups_remaining`: under quota, over quota (0), rolled window (full
+      quota), NULL `period_start`, starter (0).
+- [ ] i: billing `/skip-trace-usage` returns the same rates as before (0.05 / 0.08 / None).
+- [ ] ii: foreign job 404 (and no Redis key written); not done 409; starter 402 (shape);
+      kill switch off 503; token missing 503.
+- [ ] ii: happy path: counts, advanced count, stored payload shape + TTL (<= 600), key
+      bound to user/job/category, no ids in the response body.
+- [ ] ii: pause via the REAL `publish()`: paused (account and global), `"never"`,
+      not paused, UNKNOWN (no key; tombstone; Redis on a closed port -> still 200).
+- [ ] ii: quote store failing (closed port for the store client) -> 503, nothing returned.
+- [ ] ii: the tab query runs AS `bridgeleads_app` (`_become`-style, provisioned in-
+      transaction, memory `landmine_ci_has_no_provisioned_roles`): no queue-table read.
+- [ ] ii: `in_progress`/`hit`/`miss`/`errored` rows are never in `quoted_ids`.
+- [ ] Mutations, each caught: the `errored` branch dropped; the placeholder branch dropped;
+      the settled branch dropped; ATIP computed from the process flag instead of the pinned
+      one; the cap off by one; the order tie-break dropped; `SET NX` -> plain SET; the
+      threadpool/sync-client swapped for the async client (500); the kill-switch check dropped.
+- [ ] Regression: both skip-trace batches, `test_contact_lookup_schema`,
+      `test_skip_trace_pause_state`, billing tests, `plan_entitlement_audit`.
+
+### Questions for the consult
+- Q1 store only `quoted_ids` (exclusions as counts) vs also the excluded ids so confirm can
+  write `excluded_*` verdicts (the 2026-09-20 text). Chosen: quoted only; the static
+  exclusions are not part of the purchase and storing them makes the payload unbounded.
+- Q2 cap semantics: 2,000 QUOTED ids with a covered window (chosen) vs 2,000 covered rows
+  (the literal 2026-09-20 text; it can freeze on a front of answered leads).
+- Q3 the sync client via `run_in_threadpool` (chosen, keeps `read_pause_state` the only
+  reader) vs an async twin of the reader.
+- Q4 the kill-switch/token gate needs the API service env: see owner item O1.
+- Q5 scan ceiling 10,000 and zone `export`: right bounds?
+
+### Owner items (asked before code)
+- **O1** Does the Railway `api` service carry `SKIP_TRACE_ENABLED` and `TRACERFY_API_TOKEN`?
+  If not, the quote 503s forever. Options: add them to `api` (presence check only), or the
+  quote reads the kill switch and trusts the pause state for the rest.
+- **O2** Confirm the live Stripe metered rates are 8¢ (pro, business) and 5¢ (agency), the
+  numbers `PRICING_VERSION = "2026-06"` names.
+- **O3** A read-only prod count (no PII): the largest tab (rows per job and category) and its
+  not-attempted-with-address count, to confirm the 10,000 scan ceiling.
+
+### Codex pre-code consult r1 (2026-09-28): PLAN: REVISE, 6 P1 + 10 P2 + 1 P3
+Prompt/output: `<scratchpad dea35045>/codex_1b1c_consult_r1{,_out}.txt`. Each finding was checked
+in code. SUPERSEDES the matching Design/Test bullets above:
+- **N1 (P1) REJECTED, wording fixed.** "Manual mode bypasses only the per-config toggle" is
+  NOT in the enqueue; it is the 2026-09-20 spec's DECISION (worker bullet, "manual mode
+  bypasses the per-scraper toggle `config.skip_trace_enabled` ONLY, because the user just
+  asked for these lookups explicitly"). The doc addresses it, so the doc wins. The Fact is
+  relabelled as spec, not code.
+- **N2 (P1) -> owner O4.** The quote covers the unfiltered tab while the page may show a
+  filtered view. Either the quote takes the view filters, or 1c's copy says "every lead on
+  this tab (filters do not apply)".
+- **N3 (P1) ADOPTED.** The enqueue's worker-only reads (charged-unanswered, the cache) can
+  drop a row the planner quotes: `quoted_ids` is an UPPER bound, stated in the schema docs and
+  the plan. Parity test: EQUALITY on a seed with an empty cache and no `unmatched` rows, then
+  SUBSET (queued ⊂ quoted) with a valid cache hit and a charged-unanswered row seeded.
+- **N4 (P2) ADOPTED.** The enqueue re-reads its rows under the job lock
+  (`enrich.py:2541-2570`); the quote is a snapshot. 1b-2 test: confirm/worker only ever
+  REMOVE ids (added to "Carried into 1b-2").
+- **N5 (P2) ADOPTED, simplified.** In the quote, the pinned policy IS the API process's flag
+  read once per request, so step 5 and step 6 agree there; a mismatch exists only in the
+  1b-2 worker, where 15-14 allows the stricter current policy. Test: `classify` with a policy
+  that disagrees with the process flag only ever excludes MORE, never quotes more.
+- **N6 (P1) ADOPTED (Q1 reversed; the 2026-09-20 spec agrees).** The payload stores the
+  excluded ids per static bucket (the five `excluded_*` reasons), bounded by the scan ceiling,
+  so the 1b-2 confirm can write their verdicts. See N10 for the size bound.
+- **N7 (P3)** Q2 confirmed (2,000 quoted ids, covered window).
+- **N8 (P2) ADOPTED.** Pause read: `asyncio.wait_for(run_in_threadpool(read_pause_state, ...),
+  1.0)`; a timeout, pool error or client-construction error -> UNKNOWN.
+- **N9 (P1) -> owner O1.** The spec requires the token gate at the quote (friendly 503);
+  Codex: provision both vars on `api`, fail closed if absent, never substitute the pause state.
+- **N10 (P2) ADOPTED.** New zone `lookup_quote` = 10/min per user (the `export` fallback is
+  per-process, not fail-closed as I wrote). The scan runs under `SET LOCAL statement_timeout =
+  '5s'`. Size bound: one LIVE quote per `(user, job, category)`: key
+  `bridgeleads:contact_lookup:quote:v1:<user_id>:<job_id>:<category>` holding the payload
+  incl. `quote_id`; a new quote REPLACES it (the old `quote_id` then reads `quote_expired`,
+  and the dialog re-quotes). Worst case per user = rate x TTL x ceiling x 37 B.
+- **N11 (P2) ADOPTED.** ONE module-level SYNC client (`socket_timeout` and
+  `socket_connect_timeout` 0.5 s) for both the pause read and the quote store, each call via
+  `run_in_threadpool` under `wait_for`. Store failure or timeout -> 503, no quote returned.
+- **N12 (P1) REJECTED.** `previously_attempted`, `in_progress` and `already_answered` are
+  REPORTED COUNTS, never written: 16-8 says a lead in progress at quote time "is not in the set
+  at all", and the API may only create the six API-initial dispositions. The durable set is
+  `quoted` + the five `excluded_*`. No migration.
+- **N13 (P2) ADOPTED.** The payload adds `expires_at`, `truncated_reason` and the excluded ids.
+  `record_type` is NOT needed: the settled check becomes source-keyed and unconditional
+  (`is_settled` returns False for any non-code-violation source, so this equals the enqueue on
+  a code-violation job and can only exclude MORE elsewhere), which also removes the planner's
+  dependency on a `ScraperConfig` that may have been deleted.
+- **N14 (P2) CARRIED to 1b-2:** confirm matches `user_id`, `job_id`, `category`, `v`, expiry and
+  `quote_id` from the stored payload, re-fetches the job by `(id, user_id)`, and never accepts a
+  client-supplied id.
+- **N15 (P2) ADOPTED.** Pricing and `/skip-trace-usage` both use `normalize_plan`; currency is
+  stored as ISO 4217 `"USD"`.
+- **N16 (P2) ADOPTED.** Tests added: mailing-only (property NULL) row; charged-unanswered and
+  cache-hit rows (N3); policy mismatch (N5); a superseded quote; expiry; pause and store
+  timeouts on a blackholed port; scan ceiling exactly 10,000 / 10,001 rows; one mutation per
+  enqueue predicate the planner mirrors.
+- **N17 (P2)** The split holds (N12: no migration).
+
+### OWNER DECISIONS (2026-09-28)
+- **O1:** the owner adds `SKIP_TRACE_ENABLED` and `TRACERFY_API_TOKEN` to the Railway `api`
+  service. The quote fails closed (503) when either is absent. Before the ii merge, verify
+  PRESENCE on `api` (booleans only, never values).
+- **O4:** the quote covers the WHOLE tab; view filters never apply. 1c copy says so.
+- **O2, O3 and the handoff's `railway ssh` HMGET check:** approved, read-only (results below).
+- **Journal:** the 1b-1b-iii `docs/BUILD_JOURNAL.md` entry lands in the 1b-1c-i PR.
+  **Revised i files:** NEW `src/api/contact_lookup_planner.py`, NEW
+  `src/config/lookup_pricing.py`, NEW `tests/test_contact_lookup_planner.py`,
+  `docs/BUILD_JOURNAL.md`, this plan = 5. `routes/billing.py` is NOT touched: switching
+  `/skip-trace-usage` to the canonical price (and its stale-`used` roll rule) is a logged
+  follow-up; until then a test asserts `lookup_pricing`'s rates equal what
+  `/skip-trace-usage` returns for every plan, so the two sources cannot drift silently.
+
+### Prod checks (read-only, 2026-09-28 ~11:16Z; scripts in `C:/Users/Windows/bl-checks/`)
+- **Pause hash LIVE** (`railway ssh --service worker`, one HMGET): `published_at`
+  11:11:38Z, `fresh_until` +720 s (= 2 x 300 + 120), fence `00000000000000161183`, `global`
+  and `account_default` both `{null, null}`, 5 fields (no paused account), no `state`, TTL 444 s.
+  Handoff open item 1 CLOSED.
+- **O1:** `api` AND `worker` both carry `SKIP_TRACE_ENABLED` (truthy) and `TRACERFY_API_TOKEN`
+  (set). No owner action; re-verify presence before the ii merge.
+- **O2 (`stripe_lookup_rates.py`, `railway run --service api`, live key, GET only):** every
+  `STRIPE_PRICE_SKIP_TRACE_*` is active, `usd`, `per_unit`, metered: Pro 8, Business overage 8,
+  Agency overage 5 (cents), monthly and annual alike. `PRICING_VERSION = "2026-06"` names
+  exactly these.
+- **O3 (`tab_sizing.py`, tax cap not applied = upper bounds):** `already_delivered`: 83 tabs,
+  max 16,965 rows (median 47), 3 over 10k, max not-attempted-with-address 9,571; `new`: 86
+  tabs, max 16,549 (median 13), 1 over 10k, max candidates 10,657.
+
+### Redesign from O3: the 10,000-row scan would STALL a large tab (P1, mine)
+A 10,000 ceiling over ALL tab rows breaks the covered-window promise on the largest tabs: after
+four 2,000-lead purchases, ~8,000 bought rows (now `in_progress`/`already_answered`) sit at the
+front of `(created_at, id)`, and each later quote spends its ceiling re-reading them until it
+finds nothing. Fix (supersedes Design 1's `tab_rows` walk, N6 and N10's size bound):
+- **Tab-wide counts in ONE SQL aggregate** over the tab: `in_progress`, `already_answered`,
+  `previously_attempted`, `no_address` (property NULL/blank/placeholder literal), and
+  `candidates` (= `not_attempted` with a property address). These buckets need no Python.
+- **The window walks CANDIDATES only** (SQL prefilter `skip_trace_status = 'not_attempted'`
+  AND property address present), keyset `(created_at, id)`, chunks of 500; Python classifies
+  placeholder / settled / atip / not_traceable / quotable; stops at 2,000 quotable or the
+  ceiling. Bought leads leave the candidate set, so the window always moves forward.
+- **Ceiling 20,000 candidates** (above the largest prod tab, 16,965 rows): a safety bound,
+  `truncated_reason = 'scan_limit'`, not a normal path. `SET LOCAL statement_timeout = '5s'`.
+- **Payload stays ~2,000 ids**: `quoted_ids` + `window_end` (the last `(created_at, id)`
+  classified) + counts, NOT the excluded ids. The 1b-2 confirm writes `excluded_*` verdicts by
+  RE-CLASSIFYING the window `(start, window_end]` at confirm time: exclusions are
+  informational, and a row excluded at quote but quotable at confirm simply gets no row
+  (confirm may exclude, never add: 16-8). `quoted_ids` alone is immutable. Worst-case payload
+  ~80 KB; with one live quote per `(user, job, category)` and 10/min, per-user Redis is
+  bounded by the number of distinct tabs quoted in 10 minutes.
+- `excluded_no_address` is reported as a tab-wide COUNT and written by nobody in 1b-1c.
+
+### Codex pre-code consult r2 (2026-09-28): PLAN: REVISE, 1 P1 + 4 P2 + 3 P3, all adopted
+Output: `<scratchpad dea35045>/codex_1b1c_consult_r2_out.txt`. N1 and N12 rejections
+ACCEPTED; keyset `(created_at, id)` confirmed a total order, served by the existing
+`(job_id, user_id, is_duplicate, created_at)` index; N13 confirmed. Adopted:
+- **P1 (#2) SQL address buckets are not `classify()`.** `btrim` is not Python `.strip()`
+  (tabs, newlines, Unicode whitespace), the padded `(enrichment unavailable)` literal is a
+  `placeholder` not `no_address`, and independent aggregates double-count past status
+  precedence. FIX (simpler than a proven-equivalent SQL trim): SQL splits on the EXACT
+  `skip_trace_status` string ONLY; every address decision stays in `classify()`. The window
+  walks ALL `not_attempted` rows, and the largest prod tab (16,965) fits the 20,000 ceiling,
+  so permanent no-address rows cannot stall a window today.
+- **#3** confirm-time invariant, stated and carried to 1b-2 (below). The audit contract for
+  exclusions is CONFIRM-TIME state; the quoted set is exactly what the customer saw.
+- **#6** one storage model: one live quote per `(user, job, category)`. Rate zone: the
+  existing `export` (20/min per user; on a Redis error a per-process limiter applies, it is
+  NOT globally fail-closed). A new `lookup_quote` zone would be a 6th file in ii; logged.
+- **#7** currency is `"USD"`. The quote uses `normalize_plan` exactly like the spend path's
+  gate (`enrich.py:2285`); `/skip-trace-usage`'s raw `.lower()` is pre-existing, display-only,
+  and joins the billing.py follow-up.
+- **#8** the tests are rewritten in the FINAL list below.
+
+### FINAL 1b-1c contract and build list (normative; supersedes Design, N*, the redesign and r2 where they differ)
+**Planner** — NEW `src/api/contact_lookup_planner.py` (no `src.workers` import; 1b-2 imports it):
+- [x] `PLANNER_VERSION = 1`; `PlannerPolicy(pierce_cv_owner_skip_trace_enabled)`;
+      `policy_from_settings()` read ONCE per request.
+- [x] `classify(row, policy) -> Verdict`, pure, first match wins:
+      1. status `queued`/`submitted` -> `in_progress`; `hit`/`miss` -> `already_answered`;
+         any other status except `not_attempted` -> `previously_attempted` (incl. `errored`).
+      2. `(property_address or "").strip()` empty -> `no_address`.
+      3. that stripped value == `(enrichment unavailable)` or `street_is_placeholder()` ->
+         `placeholder`.
+      4. `king_cv_sources.is_settled(ed.source, ed.status)` (unconditional, source-keyed) ->
+         `settled_code_violation`.
+      5. Tacoma ATIP-sourced owner and not `policy.pierce_cv_owner_skip_trace_enabled` ->
+         `atip`.
+      6. `build_pending_row_payload(row) is None` -> `not_traceable`.
+      7. else `quotable(trace_type)`.
+- [x] `plan_window(rows, policy, cap=2000) -> Window`: rows in `(created_at, id)` order;
+      `quoted_ids` (first `cap` quotable), `advanced_count`, counts for `no_address`,
+      `placeholder`, `settled_code_violation`, `atip`, `not_traceable`, `examined`,
+      `window_end` (last key examined), `stopped` (`cap` | `scan_limit` | None).
+- [x] Async DB helpers (API only): `tab_status_counts(db, job_id, user_id, category)` = ONE
+      `GROUP BY skip_trace_status` over the tab predicate (category + actionable + tax cap +
+      skip-trace-eligible, exactly as `GET /results`); `iter_not_attempted(...)` = the same
+      predicate + `skip_trace_status = 'not_attempted'`, keyset `(created_at, id)`, chunks of
+      500, the columns `classify` needs only. Both under `SET LOCAL statement_timeout = '5s'`.
+- [x] Ceiling 20,000 examined rows (`stopped = 'scan_limit'`, a safety bound).
+
+**Pricing** — NEW `src/config/lookup_pricing.py`:
+- [x] `UNIT_PRICE_CENTS = {"pro": 8, "business": 8, "agency": 5}` (live Stripe, O2),
+      `CURRENCY = "USD"`, `PRICING_VERSION = "2026-06"`; `unit_price_cents(plan)` via
+      `normalize_plan`, None when not offered.
+- [x] `included_lookups_remaining(user, now)`: `max(0, quota - used)`, with `used = 0` when
+      `skip_trace_period_start` is NULL or before `effective_window(user, now).start` (the
+      `report_lookups_for_user` rule, `skip_trace_usage.py:140-152`).
+
+**Quote endpoint** — `POST /jobs/{job_id}/contact-lookups/quote` {category} in `routes/jobs.py`:
+- [ ] `rate_limit(zone="export", identifier=user.id)`; job by `(id, user_id)` else 404;
+      `status != 'done'` -> 409 `run_not_finished`; plan not in `SKIP_TRACE_ADDON_PLANS`
+      (normalized) -> the structured 402; kill switch off or token empty -> 503
+      `contact_lookups_unavailable`.
+- [ ] Status counts, then the window, as above.
+- [ ] ONE module-level SYNC Redis client (`redis_kwargs()`, `socket_timeout` and
+      `socket_connect_timeout` 0.5 s); every call through `run_in_threadpool` under
+      `asyncio.wait_for(..., 1.0)`.
+- [ ] Pause: `read_pause_state()` unchanged; timeout / pool / client error -> UNKNOWN.
+- [ ] Store: key `bridgeleads:contact_lookup:quote:v1:<user_id>:<job_id>:<category>`, plain
+      `SET ... EX 600` (REPLACES the tab's previous quote), JSON `{v: 1, quote_id, user_id,
+      job_id, category, quoted_ids, advanced_count, counts, window_end, stopped,
+      planner_version, policy, unit_price_cents, currency, pricing_version,
+      included_remaining_at_quote, created_at, expires_at}`. `quote_id =
+      secrets.token_urlsafe(32)`. Failure or timeout -> 503, no quote returned.
+- [ ] 200 `ContactLookupQuote` (schemas.py): `quote_id`, `expires_at`, `category`,
+      `max_new_lookups`, `advanced_count`, `examined`, `truncated` + `truncated_reason`,
+      `excluded` {no_address, placeholder, settled_code_violation, atip, not_traceable},
+      `already_answered`, `in_progress`, `previously_attempted` (tab-wide), `remaining`
+      (not-attempted rows past `window_end`), `included_lookups_remaining`,
+      `unit_price_cents`, `currency`, `pause` {status, normal_resume_at, advanced_resume_at}.
+      Field docs: an UPPER bound, non-binding, the whole tab (filters never apply, O4). No
+      lead ids, names or addresses.
+
+**Carried into 1b-2 (from this consult):** confirm receives `quote_id` + category, loads the
+tab's key, compares `quote_id` (a superseded one is `quote_expired`), consumes it atomically,
+checks `user_id`/`job_id`/`v`/expiry, re-fetches the job by `(id, user_id)`, and never takes a
+client id. `quoted` rows come ONLY from `quoted_ids`; re-classifying `(start, window_end]`
+writes only `excluded_*` rows; a row inside the window that is newly inserted or newly
+quotable is never quoted (mutation-tested). Worker/confirm only ever REMOVE ids (N4).
+
+**Tests** — i: `tests/test_contact_lookup_planner.py`; ii: `tests/test_contact_lookup_quote.py`
+(real PG + local Redis, a client with `redis_kwargs()`, keys deleted in a finalizer):
+- [x] i `classify`: one row per branch and per `build_pending_row_payload` None reason; address
+      edge cases NULL, `''`, spaces, tab/newline, Unicode whitespace (NBSP), padded placeholder
+      literal; status precedence over address; settled on a code-violation AND a non-CV source.
+- [x] i PARITY with the real `_enqueue_skip_trace_rows`: EQUALITY of queued ids and each
+      `trace_type` vs `quoted_ids` on a clean seed; SUBSET with a valid cache hit and a
+      charged-unanswered row seeded; ATIP flag both ways; a policy disagreeing with the process
+      flag only ever excludes MORE.
+- [x] i window: 2,001 quotable -> 2,000 + `stopped='cap'`, the same ids on re-plan; shared
+      `created_at` across the batch pages correctly by `id`; bought rows at the front do not
+      stop it; ceiling at exactly 20,000 / 20,001 examined.
+- [x] i pricing: rates per plan incl. a dirty `" Pro "`; the drift guard (equal to
+      `/skip-trace-usage` for clean plans); `included_lookups_remaining` under / over quota,
+      rolled window, NULL period start, starter.
+- [ ] ii gates: foreign job 404 (no key written); not done 409; starter 402 shape; kill switch
+      503; empty token 503.
+- [ ] ii happy path: counts, advanced, `remaining`, the stored payload (shape, TTL <= 600,
+      scoped key), no ids in the body; a second quote REPLACES the first (new `quote_id`).
+- [ ] ii pause through the real `publish()`: paused (account, global), `"never"`, not paused,
+      UNKNOWN (no key, tombstone, a closed port, a blackholed port within the 1 s bound).
+- [ ] ii store failing (closed and blackholed port) -> 503, no quote in the body.
+- [ ] ii the tab queries run AS `bridgeleads_app` (provisioned in-transaction): no queue read.
+- [ ] Mutations, each caught: every `classify` branch dropped in turn; `.strip()` -> none;
+      ATIP from the process flag; cap off by one; the `id` tie-break dropped; status filter
+      dropped from the window query; the sync client swapped for the async one; `wait_for`
+      removed (blackholed test hangs past the bound); the kill-switch check dropped; the key
+      unscoped (another tab's quote overwritten).
+- [ ] Regression: both skip-trace batches, `test_contact_lookup_schema`,
+      `test_skip_trace_pause_state`, billing tests, `plan_entitlement_audit`, `test_beat_schedule`.
+
+**Amendments from consult r3 (2026-09-28: PLAN: REVISE, 1 P1 + 3 P2; r2 all closed).** Output
+`<scratchpad dea35045>/codex_1b1c_consult_r3_out.txt`. These amend the FINAL list above:
+- [ ] **R1 (P1) ADOPTED: entitlement gate.** After the plan gate, `run_eligibility(user, now)`
+      (`quota.py:187`, the one rule every billable start reads); code `frozen` or `ended` ->
+      `run_refusal_http(code, message, resumes_at)` (the batches shape, `batches.py:283-286`).
+      `over_limit` does NOT refuse: it is the RECORD allowance, and a lookup never counts as a
+      record (Phase 1b "No record-quota change"). Tests: frozen, past_due past grace, ended ->
+      refused; over the record limit -> quote still 200. Carried to 1b-2: re-checked at confirm
+      and under the claim.
+- **R2 (P2) REJECTED, doc wins (15-14).** `build_pending_row_payload` re-reads the process ATIP
+  flag. In the API the pinned policy IS that flag, read once in the same request, so they
+  cannot disagree; in the 1b-2 worker 15-14 explicitly allows "a STRICTER current policy"
+  but never an addition, and a process flag stricter than the pinned one only relabels an
+  ATIP row `not_traceable` (never quotes it). Changing `skip_trace.py` (the live paid path)
+  for a label is not worth the risk; the existing N5 test pins "only ever excludes MORE".
+- [ ] **R3 (P2) ADOPTED: `remaining` is not a subtraction.** It is its own COUNT of
+      not-attempted tab rows with `(created_at, id) > window_end` (0 when the window was not
+      cut), so it can never go negative. `today` (tax cap) and `now` are captured ONCE per
+      request and shared by every query. The status counts and the window are READ COMMITTED
+      statements: an ADVISORY snapshot, which the response already says (upper bound).
+- [ ] **R4 (P2) ADOPTED without a new zone: Redis is checked BEFORE the scan.** Order: gates ->
+      `PING` on the sync client (threadpool, 1 s bound) -> 503 when it fails -> only then the
+      DB scan. During a Redis outage the endpoint therefore does no DB work at all, whatever
+      the `export` zone's per-process fallback admits. Test: a closed/blackholed Redis -> 503
+      with zero `results` queries executed (a SQLAlchemy `before_cursor_execute` listener
+      counts them). Mutation: the PING moved after the scan -> the count test fails.
+- [ ] **R5 (P2, consult r4) ADOPTED.** `rate_limit()`'s async client has no socket timeout
+      (`rate_limit.py:54-58`), so a blackholed Redis hangs the request BEFORE the PING. The
+      quote wraps it: `asyncio.wait_for(rate_limit(...), 1.0)`; a timeout -> the same 503,
+      before any DB work. Test: blackholed Redis -> 503 within ~1-2 s, zero `results`
+      queries. Mutation: the `wait_for` removed -> the test exceeds its bound. (Pre-existing
+      for every route that calls `rate_limit`: logged follow-up, "async Redis clients carry
+      no socket timeouts".)
+- **R6 (P2, consult r5) ACCEPTED AS A FACT, NOT FIXED HERE.** `rate_limit()` applies its
+  MULTI before awaiting (`rate_limit.py:202-207`), so a `wait_for` timeout can refuse a request
+  whose hit Redis already counted (atomic: never half-applied). That over-counts, which is
+  the FAIL-CLOSED direction consult r3 #5 asked this limiter to take: a stalled Redis can
+  only make a caller wait sooner, never let one through. It needs Redis to stall past 1 s
+  AFTER applying the write, and costs at most one of 20 hits per minute. A compensating
+  removal is a shared-middleware change (a 6th file) and joins the follow-up above.
+
+**Consult r4 (R1, R3 closed; R2 rejection accepted), r5 (R5 -> R6), r6 (2026-09-28): R6
+disposition accepted, no findings: `PLAN: GO`.** Outputs `<scratchpad dea35045>/
+codex_1b1c_consult_r{4,5,6}_out.txt`. **OWNER APPROVED the plan (2026-09-28).** Build order:
+1b-1c-i, then 1b-1c-ii.
+
+### 1b-1c-i BUILT (2026-09-28), before the Codex diff review
+- NEW `src/api/contact_lookup_planner.py`, NEW `src/config/lookup_pricing.py`, NEW
+  `tests/test_contact_lookup_planner.py` (63 tests), `docs/BUILD_JOURNAL.md` (the 1b-1b-iii
+  entry). No endpoint, no write path, no migration.
+- **One bug found by the first run:** the keyset's `tuple_(created_at, id) > (…, …)` bound the
+  id as VARCHAR (`uuid > character varying` does not exist); each value is now bound with its
+  column's type. Found by `test_the_keyset_pages_a_shared_created_at_by_id`.
+- **Parity holds against the REAL enqueue** on a code-violation job carrying every gate (12
+  leads), with the ATIP flag both ways: equal ids and equal `trace_type`s. With a cache hit and
+  a charged-unanswered row seeded, the enqueue queues a strict SUBSET of the quote.
+- **Added beyond the plan:** a recording-proxy test that every attribute `classify` (and
+  `build_pending_row_payload` inside it) reads is a SELECTED column, because `getattr(row, x,
+  None)` on a Row lacking `x` returns None silently and would diverge from the enqueue.
+- **Mutations: 16/16 caught** (`<scratchpad dea35045>/mutate_1b1c_i.py`): errored and
+  in-progress branches, `.strip()`, placeholder, settled, ATIP from the process flag, cap and
+  ceiling off by one, the `id` tie-break, the window's status filter, the tab's category, the
+  remaining count's keyset, a dropped select column, the roll rule, `normalize_plan` in the
+  price, an agency price drift.
+- **Regression (foreground, 5 chunks, all 26 skip-trace / tracerfy / lookup / billing /
+  entitlement / beat files): 1,040 passed, 0 failed.** No type checker is configured in this
+  repo (no mypy/pyright in `pyproject.toml` or CI); ruff clean.
+- **Codex diff review (three-dot, on `c0b09b7a`):** r1 no code findings, one P3 (the handoff
+  still said nothing was built: a dated status note added); **r2 `VERDICT: GO`, no findings.**
+  Security pass: no endpoint or write path; every query carries `user_id` + `job_id`; no
+  contact/encrypted column is selected; no secret; no new dependency.
+
+**Files:** i = planner, `lookup_pricing.py`, planner tests, `docs/BUILD_JOURNAL.md`, this plan;
+ii = `routes/jobs.py`, `schemas.py`, `schema/openapi.json`, quote tests, this plan.
+**Logged follow-ups:** `/skip-trace-usage` onto `lookup_pricing` + `normalize_plan` + the roll
+rule; a dedicated `lookup_quote` rate zone; `(…, created_at, id)` index if windows grow.
+
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever
       the tab has leads that have never been looked up; when the quote comes back with
@@ -2817,9 +3303,12 @@ the pre-100 code would have produced.
 
 ### Still open
 
-- **Phase 1b-1 has NOT started.** 1a and 1b-0 are both merged and live, so the old
-  "must not start until 1a merges" gate is cleared. The next code is 1b-1a (SCHEMA), per the
-  revised order in the round-16 section above — NOT the quote endpoint.
+- **(2026-09-28) 1b-1a and all of 1b-1b are LIVE** (#356 ... #382, main `c0b09b7a`).
+  **Next: 1b-1c PLANNER + QUOTE** (section "Phase 1b-1c" above: two PRs, i planner +
+  pricing, ii the quote endpoint), then 1b-2 WRITERS, then 1c frontend.
+- Carried into 1b-2 (do not lose): H3 (`lock_job_for_claim()` + `claim_skip_trace_rows()`
+  only), 20-3 (re-authorize every id against the immutable quoted set), the round-21 notes
+  (tenant hard deletes fail closed; the unverified `pg_auth_members` check).
 - 🛑 **In this repo a merge IS a deploy**: push to `main` redeploys Railway api + worker and
   `start.sh` migrates on boot via `scripts/migrate.py`. Migration 100 was live ~2 seconds after
   #354 merged, which silently overrode the owner's choice of a QUIESCED deploy. It was harmless

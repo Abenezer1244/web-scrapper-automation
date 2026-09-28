@@ -86,6 +86,83 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-28 — The spend cap's pause state is visible (contact lookup 1b-1b-iii), and the gate I could not meet
+
+> Three merges, all live: BE **#376** `bca09eff` (iii-a interval setting), **#379** `29afc82e`
+> (migration 105), **#382** `c0b09b7a` (iii-b pause state). Plan, the Codex rounds and every
+> reconciliation: `tasks/todo-lookup-contacts.md`, "Phase 1b-1b-iii" and "Phase 1b-1b-iii-c".
+
+**Built / Shipped:**
+- **iii-a #376.** `SKIP_TRACE_DISPATCH_INTERVAL_SECONDS` (default 300, `60 <= v < 600`); the beat
+  entry and the pause publisher read the same setting. Verified live: beat sent the dispatch
+  task exactly boot + 300 s. Codex GO on the first review.
+- **Migration 105 #379.** `ix_pending_skip_trace_account_spent (user_id, submitted_at) INCLUDE
+  (trace_type) WHERE submitted_at IS NOT NULL`, built CONCURRENTLY with a `statement_timeout`,
+  checked by its own `_is_right_shape()`. Verified in prod by that function (covering 1,002
+  spent rows).
+- **iii-b #382.** Every dispatch tick publishes the pause state to the Redis hash
+  `bridgeleads:skip_trace:pause:v1` (`src/utils/skip_trace_pause_state.py`, stdlib only so the
+  API can import it): `fence` (the publisher's Postgres xid, 20 digits), `published_at`,
+  `fresh_until`, `global`, `account_default` and one field per paused account, each
+  `{normal_resume_at, advanced_resume_at}` with `"never"` for a cap below the lookup's cost. One
+  Lua script replaces the hash only for a NEWER fence; a switched-off dispatcher writes a fenced
+  tombstone. `read_pause_state()` HMGETs a fixed field list and returns UNKNOWN for anything
+  missing, stale, malformed or undecodable, never "not paused". Resume times come from ONE
+  statement (`resume_times()`), early-stop walks over 105 and 102. First prod tick 10:36:38Z,
+  zero "pause state not published" warnings; the hash itself was read in prod on the next
+  session (fresh, not binding).
+
+**Tried / Decided:**
+- **The first iii-b build failed its own performance gate.** The window-function resume query
+  sorted the whole 24 h window: 193-404 ms at 100k rows against an approved 100 ms. Query-only
+  variants could not get below ~200 ms. Codex recommended the plan's own fallback, an
+  account-leading index (105), which was prototyped on the test DB before any code: the walks
+  then cost ~12 ms and the rest is one pass of per-account totals, the same work the live
+  `spent_credits()` already pays every tick. **No design meets a flat 100 ms at 100k rows.**
+  The owner chose a RELATIVE gate: reachable p95 <= live `spent_credits()` p95 + 60 ms,
+  lowered-cap max <= 1 s, plans show 105/102 with no spill. Passed on uniform and skewed seeds
+  (36-100 ms vs budgets of 95-141 ms; lowered cap <= 368 ms).
+- The fence is `pg_current_xact_id()`, not a clock: a clock can go backwards, and equal
+  microseconds happen (Codex r2).
+- A cap of 1 publishes `"never"` for advanced lookups rather than being refused at boot:
+  refusing it would have broken ten live tests and a valid configuration (Codex r2 withdrew r1).
+
+**Failed / Blocked:**
+- The failed gate above, and a background regression run that was reaped for low memory.
+  Since then every big batch runs in the FOREGROUND in chunks of ~8 files (final iii-b
+  regression: 824 passed, 0 failed).
+- A wrong assumption of mine: I split the fence SELECT because I believed
+  `pg_current_xact_id()` raises in a read-only transaction. Tested: it does not. Codex's
+  one-SELECT form went in.
+
+**Caught & fixed:**
+- Codex diff review: `\d` accepts non-ASCII digits (now `[0-9]{20}`); undecodable Redis bytes
+  raised out of the reader instead of reading UNKNOWN. Each fix has a mutation proof.
+- Migration 103's INVALID-index test used a corpse that was also the WRONG SHAPE, so
+  `indisvalid` was never isolated and a mutation survived. For 105 the working recipe is a
+  REPEATABLE READ snapshot holder, the build on its own thread, polling
+  `pg_stat_progress_create_index` for "waiting for old snapshots" with the index ready and
+  invalid, then `pg_cancel_backend`. Codex also required `statement_timeout` on CONCURRENTLY
+  builds (`lock_timeout` does not end the wait for old transactions).
+
+**Pending / Handoff:**
+- Phase 1b-1c (planner + quote) is next; handoff `docs/HANDOFF-lookup-1b1c-2026-09-28.md`.
+- Logged, not done: migrations 102/103 lack 105's `statement_timeout`; 103's INVALID test still
+  does not isolate `indisvalid`; the conftest Redis fixture ignores `redis_kwargs()` and never
+  closes; `main.py` always allows the prod CORS origins.
+
+**Facts learned:**
+- A fresh perf seed without VACUUM has no visibility map, so an index-only scan heap-fetches
+  everything (a baseline read 347 ms instead of 60 ms). VACUUM ANALYZE every seed.
+- An EXPLAIN that reuses caps read BEFORE a concurrent-writer case puts the scope over its cap
+  and measures the wrong plan: re-read the caps at EXPLAIN time.
+- An idle READ COMMITTED session holds no snapshot, so it never makes a CONCURRENTLY build wait;
+  a ROW EXCLUSIVE holder stops the build before `indisready`.
+- Prod Redis is private (`redis.railway.internal`); `railway run` runs LOCALLY and cannot reach
+  it. Only `railway ssh --service worker -- <cmd>` can.
+
+---
+
 ## 2026-09-28 — The 402 says why (Q6 2b-ii Phase B), and a stub I blamed on the product
 
 > Two merges, both live. BE **#380** `405ba52c` (run-refusal 402 code, no migration) and FE

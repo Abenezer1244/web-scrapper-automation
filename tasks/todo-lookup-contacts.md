@@ -2088,6 +2088,193 @@ append and the 100 ms gate (2026-09-27).**
 - Rebased on `ae351c4e` (#375: no file overlap). **Codex diff review r1 (three-dot): VERDICT
   GO, no findings** (`<scratchpad 4fe51d38>/codex_iiia_review_out.txt`). The PR also carries
   the previous session's handoff doc (docs only): 6 files, disclosed.
+- **MERGED #376 `bca09eff`, LIVE 2026-09-28:** beat/worker/api on the commit; beat booted
+  06:34:29Z and sent `dispatch-pending-skip-trace` at 06:39:29Z (= +300 s); the tick succeeded.
+
+### iii-b first build (2026-09-28, branch `feat/lookup-1b1b-iii-b-pause-publish`, local WIP)
+Built to the FINAL contract: `src/utils/skip_trace_pause_state.py` (hash, Lua fence, tombstone,
+strict reader), `resume_times()` (window functions), the dispatcher wrapper
+(`_dispatch_tick` + `_publish_pause_state` in `finally`, `_pause_fence`), 52 tests, 15
+mutations each caught by its own test (tie-break not run: an EQUIVALENT mutant, since only the
+threshold row's `submitted_at` reaches the answer and tied rows share it). Found while
+building: `test_skip_trace_credit_cap`'s datetime-shadow guard inspects the task, whose body
+moved to `_dispatch_tick`; the new test file re-points it (no 6th file).
+
+**H4 GATE: FAIL** (`<scratchpad 4fe51d38>/gate_iiib.py`, 100,043 rows / 500 accounts): account
+cap only 193 ms; global + account 315 ms; worst 404 ms. Every statement sorts the whole window
+and spills at work_mem 4MB. Query-only variants (`gate_iiib_variants.py`, identical answers)
+at best 84 ms global + 112 ms account (64MB): still ~200 ms. **Codex (`codex_iiib_gate_out.txt`):
+RECOMMEND A, the plan's own route**:
+- The hard caps make steady state `S <= C`, so a paused scope's threshold is within its first
+  2 credits, but a cap enabled or LOWERED over existing spend gives `S > C`: the query must
+  walk to the dynamic threshold then, not assume 2 rows.
+- 102 cannot seek to an account (`user_id` is INCLUDE only): per-account walks need an
+  account-leading index. Hence **migration 105 first, its own PR**, then iii-b rebuilt on
+  EARLY-STOP queries: totals in one aggregate; per paused scope, walk rows in `submitted_at`
+  order only until the running sum reaches `S - C + c` (global over 102, accounts over 105).
+- Ordering by `submitted_at` alone is output-identical (ties), so 105 need not carry
+  `tracerfy_queue_id`/`id`.
+- READ COMMITTED staleness between the two statements is advisory-only (the dispatcher
+  re-checks spend under the claim lock); prefer ONE statement for totals + prefixes.
+
+**Prototype of the rebuilt query (`gate_iiib_v2.py`, candidate index created on the TEST DB and
+dropped; seed VACUUM ANALYZEd like production's autovacuum, 500 accounts x 200 rows = 100k, every
+account exactly at its cap; answers IDENTICAL to the window-function reference in every case):**
+
+| case (warm, best of 3) | without 105 | with 105 |
+|---|---|---|
+| reachable: all 500 accounts at cap + global at cap | 154 ms | 112 ms |
+| reachable: account cap only, all 500 at cap | 189 ms | 86 ms |
+| UNREACHABLE: caps lowered to 10 / 5000 over that spend | 5,790 ms | 322 ms |
+| (baseline) the LIVE in-lock `spent_credits()` at the same scale | 60 ms | |
+
+EXPLAIN with 105: the 500 per-account walks cost ~12 ms together (Index Only Scan on the
+candidate, 3 rows each), the global walk 0.3 ms (102). The rest is the per-account TOTALS, one
+pass over the window: the same work the live `spent_credits()` already does inside the claim lock
+on EVERY pass. (Without VACUUM the baseline read 347 ms: a fresh table has no visibility map.)
+So 105 is required (reachable 154-189 -> 86-112 ms; lowered caps 5.8 s -> 0.32 s), and the
+H4 bar of 100 ms is NOT reachable at a 100k window by any query that must total the window.
+A 100k window is itself only possible with the global cap off or >= 100k credits: while the
+global cap is on, the window holds at most ~G rows (prod G = 2000).
+
+## Phase 1b-1b-iii-c — migration 105 (PLAN, 2026-09-28, BEFORE Codex consult; lands BEFORE iii-b)
+
+**Why:** 102 cannot seek to an account (`user_id` is INCLUDE only); the rebuilt resume query
+walks each paused account's oldest rows and stops at its threshold. Measured above.
+
+**The index:** `ix_pending_skip_trace_account_spent` on `public.pending_skip_trace_rows
+(user_id, submitted_at) INCLUDE (trace_type) WHERE submitted_at IS NOT NULL`. Keys only
+(user_id, submitted_at): ties on submitted_at cannot change the answer (proved above), so
+`tracerfy_queue_id`/`id` are not carried. INCLUDE trace_type = the weight, index-only.
+
+**Migration 105**, 103's discipline exactly: CREATE INDEX CONCURRENTLY in an autocommit block,
+`lock_timeout 5s`, STRUCTURAL identity from the catalogs (valid/live/ready, non-unique,
+non-exclusion, btree, no expressions, key cols `[user_id, submitted_at]`, INCLUDE cols
+`[trace_type]` (indnatts 3, indnkeyatts 2), ascending, default opclasses, column collations,
+normalized predicate `submitted_atISNOTNULL`); an invalid or wrong-shaped index of the name on
+THIS table is dropped and rebuilt (serialized by `scripts/migrate.py`'s advisory lock); one on
+another table, or one backing a constraint, ABORTS and is never dropped. Downgrade drops only
+ours. No data change. Backward safe: nothing requires it; iii-b deploys only after it is verified
+in production by the object.
+
+**Files (5):** `alembic/versions/105_pending_skip_trace_account_spent.py`, `src/db/models.py`
+(the Index on the model), `alembic/env.py` (`CONCURRENT_INDEXES`), NEW
+`tests/test_pending_skip_trace_account_spent_index.py` (mirroring 103's: built, right shape,
+idempotent re-run, invalid rebuilt, wrong shape rebuilt, other-table collision aborts,
+constraint-backed aborts, downgrade drops only ours, predicate normalization), this plan.
+**Then:** merge (quiet check first: merge = deploy, migrates on boot), verify the index in prod
+by the object (`pgdef.py`-style read: indisvalid + shape).
+
+**iii-b rebuilt on 105 (after it is live):** `resume_times()` becomes ONE statement (one
+snapshot): per-account totals (CTE) -> paused accounts (`spent + 2 > A`) -> per account a LATERAL
+walk over 105 in `submitted_at` order with a running sum, `LIMIT 2` once `run >= spent - A + 1`;
+the global scope likewise over 102. Python applies `scope_resume()` (at1 = first row, at2 = first
+row with `run >= need + 1`). Covers `S > C` (a lowered cap) by walking to the dynamic threshold.
+Everything else in iii-b (contract module, fence, reader, dispatcher wiring, tests) is unchanged.
+
+**PROPOSED gate (replaces H4's 100 ms, needs the OWNER):** on the 100k / 500-account seed,
+VACUUM ANALYZEd: (1) every REACHABLE case (each scope at or under its cap) <= the live
+`spent_credits()` at the same scale + 60 ms (today: 60 + 60 = 120 ms; measured 86-112 ms);
+(2) the UNREACHABLE lowered-cap case <= 1 s (measured 322 ms), since it is transient and
+advisory, outside the lock, once per 300 s; (3) the EXPLAIN shows 105 for the account walks
+and 102 for the global walk. The publisher is never on the claim path, so its cost bounds only
+DB load, not dispatch.
+
+### Codex pre-code consult r1 on 105 + the rebuilt query (2026-09-28): PLAN: REVISE, 3 P1 + 5 P2, all adopted
+Output: `<scratchpad 4fe51d38>/codex_105_consult_out.txt`. Amends the 105 plan and "iii-b rebuilt":
+- **K1 (P1) INCLUDE breaks 103's shape check** (`indnatts == indnkeyatts == len(keys)` and all
+  of `indkey` compared with the keys). 105's check splits `indkey` by ordinal: keys
+  (`ord <= indnkeyatts`) must be `[user_id, submitted_at]`, INCLUDE (`ord > indnkeyatts`) must be
+  `[trace_type]`, `indnatts = 3`, `indnkeyatts = 2`; ascending / default-opclass / collation
+  checks apply to the KEY columns only (`indoption`, `indclass`, `indcollation` cover keys only).
+- **K2 (P1) the global row vanished when the walk returns nothing** (spent 0 under a cap of 1:
+  `CROSS JOIN LATERAL` emits nothing, so the scope reads unbound instead of `(None, NEVER)`).
+  The global total row is UNCONDITIONAL, joined `LEFT JOIN LATERAL`; the walk runs only when a
+  threshold exists (`cap >= 1`, `spent + 2 > cap`), and Python's `scope_resume()` handles
+  `need <= 0` and `cap < cost` without rows. Accounts need no change: an account with no spend
+  is not in the totals and reads `account_default`.
+- **K3 (P1) returned order is semantic**: `ORDER BY submitted_at` directly before `LIMIT 2` in
+  each lateral, and `run` returned. Tests: threshold exactly on a row; crossed by an advanced
+  row; `need <= 0`; `S > C` (lowered cap) with the threshold beyond the first two credits, for an
+  account AND for the global scope; cap 1 -> NEVER; tied timestamps; an empty scope.
+- **K4 (P2) one snapshot = one statement.** `resume_times()` executes exactly ONE statement
+  (totals, both scopes' walks); the fence precedes it; the publisher never calls
+  `spent_credits()`. Test: both caps on -> exactly one SELECT touching `pending_skip_trace_rows`.
+- **K5 (P2) a stronger gate** (replaces "PROPOSED gate" above, still needs the OWNER): 20 timed
+  runs per case, report p50/p95/max; the FIRST run after seeding reported separately as the
+  cold-ish figure (the OS cache cannot be dropped locally: said plainly); production `work_mem`
+  read from prod first (read-only `SHOW work_mem`) and SET LOCAL to it in the gate; cases: global
+  cap on and off, uniform and skewed account sizes, and a concurrent writer inserting claimed
+  rows during the runs. PASS: reachable p95 <= live `spent_credits()` p95 + 60 ms at the same
+  scale; lowered-cap max <= 1 s; the plan shows `Index Only Scan` on 105 for the account walks
+  and on 102 for the global walk, no temp spill, and each walk's actual rows <= 3.
+  PLUS an absolute ceiling in code: the publisher's transaction runs `SET LOCAL
+  statement_timeout = '5s'`, so it can never become a runaway load (a timeout is a WARNING,
+  like any publisher failure). Test: the timeout is set.
+- **K6 (P2)** 105 merges and is verified in production by catalog identity (valid, ready, live,
+  table, btree, key list, INCLUDE list, predicate) BEFORE iii-b merges.
+- **K7 (P2) 105 near-miss matrix**, each rebuilt (or aborted where 103 aborts): exact shape
+  accepted as-is (no rebuild on replay); missing INCLUDE; wrong INCLUDE column; an extra INCLUDE
+  column; keys reversed; a descending key; a non-default key opclass; a non-default key
+  collation; an expression index; a different predicate; INVALID; unique; other-table collision
+  (abort); constraint-backed (abort); downgrade drops only ours.
+- **K8 (P2)** the gate asserts 105 and 102 in the actual plans (K5), and the iii-b tests include
+  the lowered-cap walks (K3).
+
+### Codex consult r2 on 105 (2026-09-28): PLAN: REVISE, 2 P2, both adopted. K1-K4, K7, K8 closed.
+Output: `<scratchpad 4fe51d38>/codex_105_consult_r2_out.txt`.
+- **L1 (P2) the timeout's place:** `SET LOCAL statement_timeout = '5s'` runs immediately after
+  a SUCCESSFUL fence, in the same transaction, before the single resume statement (not before
+  the fence, not in a new transaction). Test: in the publisher's transaction, `SHOW
+  statement_timeout` reads `5s` when the resume statement runs, and the setting does not
+  outlive the transaction.
+- **L2 (P2) production verification = the WHOLE K1 predicate**, not a subset: the migration's
+  own `_is_right_shape()` (valid, ready, live, non-unique, non-exclusion, btree, no expressions,
+  keys `[user_id, submitted_at]`, INCLUDE `[trace_type]`, `indnatts = 3`, `indnkeyatts = 2`,
+  ascending keys, default key opclasses, key column collations, normalized predicate) run
+  read-only against production after the deploy, imported from the migration file so the check
+  and the build can never drift.
+
+### Codex consult r3 on 105 (2026-09-28): **PLAN: GO**, no findings (L1, L2 closed).
+Output: `<scratchpad 4fe51d38>/codex_105_consult_r3_out.txt`. Next: the OWNER decides the gate
+(K5 replaces H4's flat 100 ms), then 105 is built on its own branch from main.
+**OWNER DECISION (2026-09-28): the RELATIVE gate (K5) replaces H4's flat 100 ms.** 105 is built
+first on `feat/lookup-1b1b-iii-c-account-spent-index` (from `9ee0fac9`); iii-b then rebased
+onto it and rebuilt on the early-stop query.
+
+### 105 TO BUILD
+- [x] Migration 105 (K1 shape check split into keys / INCLUDE; 103's drop/abort rules; L2's
+      `_is_right_shape()` importable for the prod check)
+- [x] The Index on the model; `CONCURRENT_INDEXES` in `alembic/env.py`
+- [x] Tests: the K7 near-miss matrix, replay, downgrade
+- [ ] Codex diff review to GO; quiet check; merge; verify in prod by the whole K1 predicate (L2)
+
+**105 BUILT (2026-09-28), before the Codex diff review.** 28 tests in
+`tests/test_pending_skip_trace_account_spent_index.py`: shape + rendering; model and
+`CONCURRENT_INDEXES`; a replay keeps the same index (same oid, no rebuild); 11 near misses each
+rebuilt (no INCLUDE, wrong INCLUDE, extra INCLUDE, trace_type as a KEY, keys reversed, a
+descending key, an expression key, the opposite predicate, no predicate, unique, hash);
+predicate normalization both ways; EXCLUDE constraint under the name aborts and is left; other
+table's index refused, not dropped; upgrade/downgrade/replay converge; downgrade leaves another
+table's same-named index alone; INVALID corpses rebuilt. Test DB migrated 104 -> 105 through
+`scripts/migrate.py`; one head.
+- Found while building: 103's INVALID test uses a corpse that is ALSO the wrong shape, so it
+  never isolated `indisvalid` (a mutation dropping it survived here too). New test: the build is
+  cancelled in its LAST wait (a REPEATABLE READ snapshot held by another session), which leaves
+  an index that is READY, of exactly our shape, and INVALID. (Two dead ends first: an idle READ
+  COMMITTED reader holds no snapshot, so the build never waited; a ROW EXCLUSIVE holder stops the
+  build before `indisready`, so `indisready` alone rejected it and the mutation still survived.)
+  103's test has the same blind spot: logged as a follow-up, not fixed here (6th file).
+- Regression: 105 + 103 + 102 index suites, db_safety, credit cap, dispatcher claim, spend
+  ledger, claim, reconciliation: 317 passed, 0 failed. ruff clean.
+- Mutations (9): INCLUDE list unchecked, key/INCLUDE split dropped, descending accepted, unique
+  accepted, predicate unchecked, invalid accepted, constraint-backed dropped, other-table
+  collision not refused: each caught by its own test. `indnkeyatts` unchecked SURVIVES as an
+  equivalent mutant: the key list is read by `ord <= indnkeyatts`, so the key-list and
+  INCLUDE-list equalities already pin it; kept as a belt.
+- Not testable with these types, said plainly: the non-default operator class and collation
+  checks (uuid and timestamptz have no alternative btree opclass in core PostgreSQL and are not
+  collatable). They stay as defence.
 
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever

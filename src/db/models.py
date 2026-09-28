@@ -1432,6 +1432,18 @@ class PendingSkipTraceRow(Base):
             "id",
             postgresql_where=text("status = 'queued'"),
         ),
+        # Migration 105: when a binding cap lets an account look up again. Each
+        # paused account's oldest spent rows in submitted_at order, so the
+        # pause-state walk stops at its threshold instead of totalling the window
+        # per account (102 leads on submitted_at and cannot seek to an account).
+        # Built CONCURRENTLY by 105 (and listed in CONCURRENT_INDEXES).
+        Index(
+            "ix_pending_skip_trace_account_spent",
+            "user_id",
+            "submitted_at",
+            postgresql_include=["trace_type"],
+            postgresql_where=text("submitted_at IS NOT NULL"),
+        ),
     )
 
 

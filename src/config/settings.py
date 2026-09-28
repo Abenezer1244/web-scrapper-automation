@@ -1,7 +1,7 @@
 from pathlib import Path
 from typing import ClassVar, Literal
 
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -192,6 +192,10 @@ class Settings(BaseSettings):
     # locking out existing accounts. Flip per-service (api+worker) ONLY after the
     # pricing/UI/copy land and existing accounts are intentionally grandfathered.
     ENTITLEMENT_ENFORCEMENT: bool = False
+    # ...except in production, where UNSET means ON (audit #5, D5-02): a new service
+    # or environment that misses the variable must not silently fall back to
+    # audit-only gates. An explicit ENTITLEMENT_ENFORCEMENT=false still wins.
+    # See _entitlement_enforcement_fails_closed_in_production below.
 
     # ─── Email ────────────────────────────────────────────────────────────────
     RESEND_API_KEY: str = ""
@@ -260,6 +264,11 @@ class Settings(BaseSettings):
 
     # ─── Playwright ───────────────────────────────────────────────────────────
     PLAYWRIGHT_HEADLESS: bool = True
+    # Route every browser connection through the in-worker SOCKS5 egress proxy
+    # (src/scrapers/egress_proxy.py, audit #5 D5-03): one DNS answer per connection,
+    # checked, then dialled, and ports limited to 80/443/8080/8443. OFF by default
+    # so turning it on is a deliberate, verified step per environment.
+    SCRAPER_EGRESS_PROXY_ENABLED: bool = False
 
     # Which identity the browser presents to portals. See
     # src/scrapers/browser_identity.py for why this is flagged rather than
@@ -387,6 +396,16 @@ class Settings(BaseSettings):
         if v is not None and v < 0:
             raise ValueError("skip-trace spend caps must be 0 (disabled) or positive")
         return v
+
+    @model_validator(mode="after")
+    def _entitlement_enforcement_fails_closed_in_production(self) -> "Settings":
+        if (
+            self.ENVIRONMENT.strip().lower() == "production"
+            and "ENTITLEMENT_ENFORCEMENT" not in self.model_fields_set
+        ):
+            # object.__setattr__: no recursion even if validate_assignment is ever on.
+            object.__setattr__(self, "ENTITLEMENT_ENFORCEMENT", True)
+        return self
 
     @field_validator("SKIP_TRACE_DISPATCH_INTERVAL_SECONDS")
     @classmethod

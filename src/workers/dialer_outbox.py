@@ -28,6 +28,7 @@ import requests
 from src.api.lead_actionability import actionable_condition
 from src.api.middleware.security import validate_outbound_webhook
 from src.utils.logger import setup_logger
+from src.utils.pinned_http import is_blocked_destination, pinned_session
 from src.workers import app
 
 _logger = setup_logger("worker.dialer_outbox")
@@ -37,8 +38,11 @@ _logger = setup_logger("worker.dialer_outbox")
 _CHUNK = 50
 _HTTP_TIMEOUT = 15
 
-_SESSION = requests.Session()
-_SESSION.trust_env = False  # don't let an ambient proxy bypass the SSRF resolve check
+# Pinned (audit #5, S3-08): resolve once, refuse a blocked address, connect to the
+# address checked, so a DNS answer that changes after validate_outbound_webhook
+# cannot move the POST (and the contact PII in it) to an internal host. Proxies,
+# ambient or explicit, are refused: a proxy would resolve for us.
+_SESSION = pinned_session()
 
 
 def _extract_contact_id(resp: requests.Response) -> str | None:
@@ -260,6 +264,15 @@ def _deliver_one(connector, req: dict, row) -> None:
             allow_redirects=False,
         )
     except requests.RequestException as exc:
+        if is_blocked_destination(exc):
+            # The connect met a blocked address the pre-check did not (rebinding):
+            # the same outcome as the pre-check refusing it, and nothing was sent.
+            row.status = "failed"
+            row.last_error = "blocked by SSRF guard"
+            _logger.warning(
+                "dialer_outbox row %s: SSRF block at connect, host %s", str(row.id)[:8], host,
+            )
+            return
         # Network error → replay-eligible. Log the EXCEPTION TYPE only (str(exc)
         # can contain the URL incl. no secret here, but keep it terse + host-only).
         row.status = "failed"

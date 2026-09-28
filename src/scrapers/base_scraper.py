@@ -27,6 +27,7 @@ from src.scrapers.browser_identity import (
     resolve_playwright_user_agent,
 )
 from src.scrapers.doc_scope import CollectionScope
+from src.scrapers.egress_proxy import EgressProxy
 from src.utils.celery_limits import reraise_time_limit
 from src.utils.logger import setup_logger
 from src.utils.safe_http import safe_get
@@ -210,6 +211,9 @@ class BridgeScraper:
     # decision 2026-09-15), and a test fails if any other subclass does. Every other
     # scraper keeps the default behavior unchanged.
     _plain_browser: bool = False
+    # The egress proxy class (audit #5, D5-03). A test may substitute one that also
+    # admits loopback, to prove traffic really flows through it; nothing else does.
+    _egress_proxy_cls: type[EgressProxy] = EgressProxy
 
     def __init__(self) -> None:
         self._playwright: Playwright | None = None
@@ -220,6 +224,7 @@ class BridgeScraper:
         self.on_progress: ProgressCallback | None = None
         # Installed by the worker. Call it through report_stage(), never directly.
         self.on_stage: Callable[[str], None] | None = None
+        self._egress_proxy: EgressProxy | None = None
 
     # ─── Progress reporting ───────────────────────────────────────────────────
 
@@ -288,23 +293,38 @@ class BridgeScraper:
         use_headless = True if self._plain_browser else (
             settings.PLAYWRIGHT_HEADLESS and not has_display)
 
-        self._browser = await self._playwright.chromium.launch(
-            headless=use_headless,
-            args=[
-                "--no-sandbox",
-                *([] if self._plain_browser else ["--disable-blink-features=AutomationControlled"]),
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--disable-extensions",
-                "--disable-background-networking",
-                "--disable-default-apps",
-                "--disable-sync",
-                "--disable-translate",
-                "--no-first-run",
-                "--js-flags=--max-old-space-size=512",
-                *UNROUTED_CHANNEL_ARGS,
-            ],
-        )
+        # The egress proxy (audit #5, D5-03) starts before the browser, so no
+        # connection is ever made without it. "<-loopback>" removes Chromium's
+        # implicit loopback bypass: loopback targets reach the proxy and are refused.
+        launch_proxy: dict = {}
+        if settings.SCRAPER_EGRESS_PROXY_ENABLED:
+            self._egress_proxy = self._egress_proxy_cls()
+            proxy_port = await self._egress_proxy.start()
+            launch_proxy = {
+                "proxy": {"server": f"socks5://127.0.0.1:{proxy_port}", "bypass": "<-loopback>"}
+            }
+        try:
+            self._browser = await self._playwright.chromium.launch(
+                headless=use_headless,
+                **launch_proxy,
+                args=[
+                    "--no-sandbox",
+                    *([] if self._plain_browser else ["--disable-blink-features=AutomationControlled"]),
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--disable-extensions",
+                    "--disable-background-networking",
+                    "--disable-default-apps",
+                    "--disable-sync",
+                    "--disable-translate",
+                    "--no-first-run",
+                    "--js-flags=--max-old-space-size=512",
+                    *UNROUTED_CHANNEL_ARGS,
+                ],
+            )
+        except BaseException:
+            await self._stop_egress_proxy()
+            raise
         # Resolve the identity we present to portals. Derived from the browser
         # we are ACTUALLY running rather than a hardcoded string, which had
         # drifted to Chrome/120 while running Chromium 131 and then 148.
@@ -428,9 +448,19 @@ class BridgeScraper:
         except Exception as exc:
             _logger.warning("playwright.stop failed (leak risk): %s", str(exc)[:120])
         self._playwright = None
+        await self._stop_egress_proxy()
 
         self.page = None
         _logger.info("Browser context closed")
+
+    async def _stop_egress_proxy(self) -> None:
+        if self._egress_proxy is None:
+            return
+        try:
+            await self._egress_proxy.stop()
+        except Exception as exc:
+            _logger.warning("egress proxy stop failed: %s", str(exc)[:120])
+        self._egress_proxy = None
 
     # ─── Core navigation ──────────────────────────────────────────────────────
 

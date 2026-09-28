@@ -260,6 +260,11 @@ class Settings(BaseSettings):
 
     # ─── Playwright ───────────────────────────────────────────────────────────
     PLAYWRIGHT_HEADLESS: bool = True
+    # Route every browser connection through the in-worker SOCKS5 egress proxy
+    # (src/scrapers/egress_proxy.py, audit #5 D5-03): one DNS answer per connection,
+    # checked, then dialled, and ports limited to 80/443/8080/8443. OFF by default
+    # so turning it on is a deliberate, verified step per environment.
+    SCRAPER_EGRESS_PROXY_ENABLED: bool = False
 
     # Which identity the browser presents to portals. See
     # src/scrapers/browser_identity.py for why this is flagged rather than

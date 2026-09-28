@@ -16,8 +16,8 @@ import uuid
 import pytest
 import redis.asyncio as aioredis
 from httpx import AsyncClient
+from redis.asyncio.retry import Retry
 from redis.backoff import NoBackoff
-from redis.retry import Retry
 from sqlalchemy import update
 
 from src.db.models import BatchRun, Job, Result, ScraperBatch, ScraperConfig, User

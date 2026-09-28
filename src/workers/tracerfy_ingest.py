@@ -662,8 +662,8 @@ def ingest_tracerfy_batch(
     # secret has leaked (S3-16), and host pinning proves only that a URL is on
     # Tracerfy's bucket, not that it is THIS queue's CSV: any Tracerfy customer's
     # result URL would pass. So the download URL and the counts come only from
-    # Tracerfy's own record of this queue. A TracerfyError (API unreachable)
-    # propagates to autoretry.
+    # Tracerfy's own record of this queue. An unreachable provider defers like an
+    # incomplete record (below): an outage must not mark a genuine batch errored.
     # One provider re-check chain per queue: a repeated (forged) trigger costs no
     # provider call. A chain member refreshes its claim; a new trigger that finds
     # one running returns, and the chain's next re-check ingests the batch.

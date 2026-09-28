@@ -12,10 +12,13 @@ with a positive control proving it counts connections.
 from __future__ import annotations
 
 import asyncio
+import os
 
 import pytest
 import websockets
+from playwright.async_api import async_playwright
 
+from src.config import settings
 from src.scrapers.base_scraper import UNROUTED_CHANNEL_ARGS, BridgeScraper
 
 
@@ -25,6 +28,15 @@ class _PlainScraper(BridgeScraper):
     _plain_browser = True
 
 
+class _LoopbackAllowedScraper(BridgeScraper):
+    """Treats every target as allowed, so the WebSocket guard's CONNECT path can be
+    exercised against the loopback listener (a real public host is not reachable
+    from the test run). Only the verdict is replaced; the routing is the real one."""
+
+    async def _ssrf_target_allowed(self, url, *, require_allowlisted):
+        return True
+
+
 @pytest.fixture
 async def loopback_ws():
     """A real WebSocket server on 127.0.0.1 that counts handshakes."""
@@ -32,7 +44,8 @@ async def loopback_ws():
 
     async def handler(conn):
         hits.append(conn.request.path)
-        await conn.close()
+        async for message in conn:  # echo, so a pass-through can be proven
+            await conn.send(message)
 
     server = await websockets.serve(handler, "127.0.0.1", 0)
     port = server.sockets[0].getsockname()[1]
@@ -74,6 +87,28 @@ async def test_page_websocket_to_loopback_is_refused(loopback_ws, scraper_cls):
     await asyncio.sleep(0.2)
     assert hits == [], f"page reached the loopback WebSocket ({outcome})"
     assert outcome != "open"
+
+
+_ECHO_WS = """
+(url) => new Promise((resolve) => {
+  const ws = new WebSocket(url);
+  ws.onopen = () => ws.send("ping");
+  ws.onmessage = (e) => { resolve(e.data); ws.close(); };
+  ws.onerror = () => resolve("error");
+  setTimeout(() => resolve("timeout"), 5000);
+})
+"""
+
+
+async def test_allowed_websocket_passes_through_unchanged(loopback_ws):
+    """The guard's allow path really connects and relays frames both ways, so it
+    cannot silently stall a portal that legitimately uses a WebSocket."""
+    port, hits = loopback_ws
+    async with _LoopbackAllowedScraper() as scraper:
+        await scraper.page.set_content("<html></html>")
+        echoed = await scraper.page.evaluate(_ECHO_WS, f"ws://127.0.0.1:{port}/allowed")
+    assert hits == ["/allowed"]
+    assert echoed == "ping"
 
 
 @pytest.mark.parametrize("scraper_cls", [BridgeScraper, _PlainScraper])
@@ -129,6 +164,8 @@ def test_launch_disables_quic_and_non_proxied_webrtc_udp():
     browser launches with it off. Asserted on the argument list __aenter__ passes
     (no page API reveals it); WebRTC is proven by behaviour below."""
     assert "--disable-quic" in UNROUTED_CHANNEL_ARGS
+    assert "--webrtc-ip-handling-policy=disable_non_proxied_udp" in UNROUTED_CHANNEL_ARGS
+    assert "--force-webrtc-ip-handling-policy=disable_non_proxied_udp" in UNROUTED_CHANNEL_ARGS
 
 
 _GATHER_UDP_CANDIDATES = """
@@ -151,9 +188,29 @@ async () => {
 
 @pytest.mark.parametrize("scraper_cls", [BridgeScraper, _PlainScraper])
 async def test_page_gathers_no_webrtc_udp_candidates(scraper_cls):
-    """WebRTC UDP (STUN, direct peers) bypasses every route; with the policy flag
-    the browser gathers no UDP candidate at all."""
+    """WebRTC UDP (STUN, direct peers) bypasses every route; with the policy flags
+    the browser gathers no UDP candidate at all. The control launches the SAME
+    headless mode without the flags and must gather some, or a zero proves nothing
+    on this machine."""
+    async with async_playwright() as pw:
+        control = await pw.chromium.launch(headless=_control_headless(scraper_cls))
+        try:
+            page = await control.new_page()
+            await page.set_content("<html></html>")
+            control_udp = await page.evaluate(_GATHER_UDP_CANDIDATES)
+        finally:
+            await control.close()
+    if not control_udp:
+        pytest.skip("this machine gathers no WebRTC UDP candidates even unguarded")
     async with scraper_cls() as scraper:
         await scraper.page.set_content("<html></html>")
         udp = await scraper.page.evaluate(_GATHER_UDP_CANDIDATES)
     assert udp == []
+
+
+def _control_headless(scraper_cls) -> bool:
+    """The headless mode __aenter__ picks for this class (production runs headed
+    under Xvfb when DISPLAY is set, and the two honour different WebRTC switches)."""
+    if scraper_cls._plain_browser:
+        return True
+    return settings.PLAYWRIGHT_HEADLESS and not os.environ.get("DISPLAY")

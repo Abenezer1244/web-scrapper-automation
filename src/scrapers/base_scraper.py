@@ -469,7 +469,7 @@ class BridgeScraper:
             require_allowlisted = request.resource_type == "document" and not is_subframe
             return await self._ssrf_target_allowed(url, require_allowlisted=require_allowlisted)
         except Exception as exc:  # the guard could not decide: refuse, never wave through
-            _logger.warning("SSRF: guard error, request refused (%s): %s", url[:80], exc)
+            _logger.warning("SSRF: guard error, request refused (%s): %s", str(url)[:80], exc)
             return False
 
     async def _ssrf_target_allowed(self, url: str, *, require_allowlisted: bool) -> bool:

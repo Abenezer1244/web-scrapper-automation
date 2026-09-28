@@ -397,6 +397,8 @@ _LATER = "2999-01-01T00:00:00+00:00"
     ("fence of 20 non-ASCII digits", {"fence": "١" * 20}),  # Arabic-Indic one
     ("published_at missing", {"published_at": None}),
     ("published_at malformed", {"published_at": "yesterday"}),
+    ("published_at naive", {"published_at": "2026-01-01T00:00:00"}),
+    ("published_at not UTC", {"published_at": "2026-01-01T00:00:00+02:00"}),
     ("fresh_until missing", {"fresh_until": None}),
     ("fresh_until naive", {"fresh_until": "2999-01-01T00:00:00"}),
     ("fresh_until not UTC", {"fresh_until": "2999-01-01T00:00:00+02:00"}),
@@ -417,6 +419,22 @@ def test_anything_missing_stale_or_malformed_reads_unknown(r, case, over):
     now = datetime.now(UTC)
     r.hset(pause.KEY, mapping=_valid(now, **over))
     assert pause.read_pause_state(r, "me", now).status == UNKNOWN, case
+
+
+def test_bytes_that_are_not_utf8_read_unknown_not_an_exception():
+    """A client built without decode_responses returns bytes; a field that is not
+    UTF-8 must read UNKNOWN, never raise out of the reader (Codex iii-b review r2)."""
+    now = datetime.now(UTC)
+    raw = sync_redis.from_url(settings.REDIS_URL, **settings.redis_kwargs(decode_responses=False))
+    try:
+        raw.delete(pause.KEY)
+        raw.hset(pause.KEY, mapping={**_valid(now), "global": b"\xff\xfe not utf-8"})
+        assert pause.read_pause_state(raw, "me", now).status == UNKNOWN
+        raw.hset(pause.KEY, mapping=_valid(now))  # the same client, valid bytes
+        assert pause.read_pause_state(raw, "me", now).status == NOT_PAUSED
+    finally:
+        raw.delete(pause.KEY)
+        raw.close()
 
 
 def test_no_key_at_all_reads_unknown(r):

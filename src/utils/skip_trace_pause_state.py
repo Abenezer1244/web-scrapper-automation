@@ -169,9 +169,19 @@ class _MalformedError(Exception):
 
 
 def _text(v) -> str | None:
+    """A field as text. Bytes that are not UTF-8, or anything that is neither bytes
+    nor text, is malformed (so UNKNOWN), never an exception out of the reader
+    (Codex iii-b review r2): a client built without decode_responses returns bytes."""
     if v is None:
         return None
-    return v.decode("utf-8") if isinstance(v, bytes) else v
+    if isinstance(v, bytes):
+        try:
+            return v.decode("utf-8")
+        except UnicodeDecodeError:
+            raise _MalformedError from None
+    if not isinstance(v, str):
+        raise _MalformedError
+    return v
 
 
 def _parse_utc(s) -> datetime:
@@ -221,8 +231,8 @@ def read_pause_state(r, user_id: str, now: datetime) -> PauseState:
                              "account_default", str(user_id)])
     except Exception:  # noqa: BLE001 - the contract: Redis down reads as UNKNOWN
         return PauseState(UNKNOWN)
-    published_at, fresh_until, fence, glob, default, own = (_text(v) for v in vals)
     try:
+        published_at, fresh_until, fence, glob, default, own = (_text(v) for v in vals)
         if fence is None or not _FENCE_RE.fullmatch(fence):
             raise _MalformedError
         _parse_utc(published_at)

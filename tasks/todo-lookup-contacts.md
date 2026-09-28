@@ -2350,6 +2350,15 @@ conftest change only ADDS a `connectors` fixture): NO-GO, 2 P2, both fixed.**
   already). New reader case: 20 Arabic-Indic digits -> UNKNOWN.
 - Mutations: each fix reverted -> caught by its new test. Suite 58 passed.
 
+**Codex diff review r2 on iii-b: NO-GO, 1 P2 + 1 P3, both fixed; r1's two fixes VERIFIED.**
+(`<scratchpad 4fe51d38>/codex_iiib_review_r2_out.txt`)
+- P2 a client built without `decode_responses` returns bytes, and bytes that are not UTF-8
+  raised `UnicodeDecodeError` OUT of the reader instead of UNKNOWN. `_text()` now turns
+  undecodable bytes (and any non-bytes, non-text value) into `_MalformedError`, and the
+  decoding runs inside the reader's `try`. New test on a real bytes-mode client: invalid UTF-8
+  -> UNKNOWN; valid bytes -> NOT_PAUSED. Mutation (decode back outside the try): caught.
+- P3 naive and non-UTC `published_at` added to the malformed cases. Suite 61 passed.
+
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever
       the tab has leads that have never been looked up; when the quote comes back with

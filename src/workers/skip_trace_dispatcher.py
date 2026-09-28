@@ -100,7 +100,13 @@ def _pause_fence(db) -> str | None:
         _logger.warning("Dispatcher: pause state not published: the session is %s",
                         "on a standby" if in_recovery else "read-only")
         return None
-    return fence_str(db.execute(text("SELECT pg_current_xact_id()::text")).scalar())
+    fence = fence_str(db.execute(text("SELECT pg_current_xact_id()::text")).scalar())
+    # An absolute ceiling on the publisher's one resume statement (Codex K5, L1):
+    # set after a successful fence, in the same transaction, so it covers that
+    # statement and nothing after the transaction. A timeout is a WARNING, like any
+    # publisher failure; the next tick publishes again.
+    db.execute(text("SET LOCAL statement_timeout = '5s'"))
+    return fence
 
 
 def _publish_pause_state(*, tombstone: bool = False) -> None:

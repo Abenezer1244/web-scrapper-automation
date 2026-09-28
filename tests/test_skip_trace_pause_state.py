@@ -165,6 +165,65 @@ async def test_a_cap_of_one_never_admits_an_advanced_lookup(make_account):
     assert snap.account_default == (None, NEVER)  # an account that spent nothing
 
 
+async def test_a_lowered_cap_walks_past_the_first_two_credits(make_account):
+    """The caps are hard, so normally S <= C and the threshold is within a scope's
+    first two credits; a cap LOWERED over existing spend puts it further in, and
+    the walk must go there (Codex K3)."""
+    u = await make_account()
+    now = _now()
+    _spend(u, *[(now - (9 - i) * H, "normal") for i in range(6)])  # 9h..4h ago, 6 credits
+    snap = _resume(cap.Caps(2, 2, "t"), now)
+    # S=6, C=2: normal needs 5 credits out (the 5h row), advanced 6 (the 4h row).
+    expected = (now - 5 * H + DAY + MARGIN, now - 4 * H + DAY + MARGIN)
+    assert snap.accounts[u] == expected
+    assert snap.global_scope == expected
+
+
+def test_a_global_scope_with_nothing_spent_still_reports(monkeypatch):
+    """The global row is unconditional (LEFT JOIN), so an empty window still yields
+    the scope: fits under a cap of 5, and NEVER for advanced under a cap of 1 (K2)."""
+    far = datetime(2001, 1, 1, tzinfo=UTC)  # a window with no rows in it
+    assert _resume(cap.Caps(5, 0, "t"), far).global_scope == (None, None)
+    assert _resume(cap.Caps(1, 0, "t"), far).global_scope == (None, NEVER)
+
+
+async def test_resume_times_is_one_statement_so_one_snapshot(make_account):
+    """Totals and both scopes' walks come from ONE statement (Codex K4): a claim or
+    release between two statements could otherwise mix two views."""
+    u = await make_account()
+    now = _now()
+    _spend(u, (now - H, "normal"), (now - H, "normal"))
+    statements = []
+
+    def seen(conn, cursor, statement, *a):
+        statements.append(statement)
+    event.listen(sync_engine, "before_cursor_execute", seen)
+    try:
+        snap = _resume(cap.Caps(2, 2, "t"), now)
+    finally:
+        event.remove(sync_engine, "before_cursor_execute", seen)
+    assert u in snap.accounts and snap.global_scope != (None, None)
+    assert len([s for s in statements if "pending_skip_trace_rows" in s]) == 1
+
+
+def test_the_resume_statement_runs_under_a_5s_ceiling_that_ends_with_its_transaction(
+        monkeypatch, dispatcher):
+    """L1: statement_timeout is set after a successful fence, in the same
+    transaction, before the one resume statement, and is gone afterwards."""
+    dispatcher(account_cap=5)
+    seen = {}
+    real = skip_trace_dispatcher.resume_times
+
+    def recording(db, now, caps):
+        seen["inside"] = db.execute(text("SHOW statement_timeout")).scalar()
+        return real(db, now, caps)
+    monkeypatch.setattr(skip_trace_dispatcher, "resume_times", recording)
+    skip_trace_dispatcher._publish_pause_state()
+    assert seen["inside"] == "5s"
+    with system_sync_session() as db:
+        assert db.execute(text("SHOW statement_timeout")).scalar() != "5s"
+
+
 def test_both_caps_off_reads_nothing():
     statements = []
 

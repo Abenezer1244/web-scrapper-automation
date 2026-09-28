@@ -2294,6 +2294,48 @@ table's same-named index alone; INVALID corpses rebuilt. Test DB migrated 104 ->
 **Codex diff review r2 on 105 (three-dot, rebased on `9ee0fac9`): VERDICT GO, no findings.**
 (`<scratchpad 4fe51d38>/codex_105_review_r2_out.txt`; 60 s is below migrate.py's 900 s lock
 budget; the phase name is right on PG 16 and 17.)
+**MERGED #379 `29afc82e`, LIVE 2026-09-28.** api/worker/beat on the commit; migrate.py applied it
+(one replica waited on the lock); verified in production by the migration's OWN
+`_is_right_shape()` (`bl-checks/p105.py`): valid/ready/live, keys `[user_id, submitted_at]`,
+INCLUDE `[trace_type]`, 3/2 attributes, definition byte-identical to `_INDEX_DEF`, covering 1,002
+spent rows. (`alembic_version` reads EMPTY to the worker role: RLS on, no policy. Not a fault.)
+
+### iii-b REBUILT on 105 (2026-09-28, branch `feat/lookup-1b1b-iii-b-pause-publish` rebased on `29afc82e`)
+- `resume_times()` is ONE statement (K4): a `totals` CTE; `paused` accounts (`spent + 2 > A`),
+  each with a LATERAL walk over 105 in `submitted_at` order, `ORDER BY` then `LIMIT 2` once
+  `run >= spent - A + 1` (K3); the global total `g`, ALWAYS one row, `LEFT JOIN LATERAL` walk
+  over 102 (K2). Python sorts each walk by its running sum (strictly increasing; SQL does not
+  promise UNION ALL order) and applies `scope_resume()`. Built in Core on `_weight_sql()`: one
+  copy of the weights, no string SQL.
+- `_pause_fence()` sets `SET LOCAL statement_timeout = '5s'` after a successful fence (L1).
+- Tests: 56 (4 new: a lowered cap walks past the first two credits, account and global; an
+  empty global scope still reports, incl. cap 1 -> NEVER; one statement; the 5 s ceiling is in
+  force during the statement and gone after the transaction).
+- Mutations (20): 19 caught, each by its own test (new: LIMIT 2 -> 1; global walk inner-joined;
+  the walk newest-first; the 5 s ceiling unset; the +2 threshold in the `paused` CTE). The
+  Python sort SURVIVES as expected: PostgreSQL returns each lateral's rows in order here, but
+  SQL does not promise it, so the sort stays.
+- **K5 GATE: PASS** (`gate_iiib_k5.py`, production planner settings read 2026-09-28 and SET
+  LOCAL in every timed session: work_mem 2184kB, random_page_cost 1.1, effective_cache_size
+  384MB, jit off; prod is PG 17.6, local PG 16.14):
+
+  | seed | baseline `spent_credits()` p95 | budget | reachable p95 (global on / off / + writer) | lowered caps max |
+  |---|---|---|---|---|
+  | uniform: 500 x 266 credits, every account AT its cap | 80.6 ms | 140.6 ms | 94.2 / 79.4 / 99.7 ms | 367.7 ms |
+  | skewed: 133..400 credits | 34.8 ms | 94.8 ms | 44.4 / 35.7 / 47.2 ms | 332.4 ms |
+
+  Plan (both seeds): account walks = Index Only Scan on 105, 3 rows per loop, one loop per
+  paused account (500 / 3); global walk = Index Only Scan on 102, 3 rows; no temp spill. The
+  totals are one ordered pass over 105 (GroupAggregate, no hash). First runs (cold-ish) 38-144
+  ms. The writer case committed 200-328 claims during its runs.
+  A gate bug fixed on the way: the EXPLAIN reused caps read before the writer case added spend,
+  which put the global scope OVER its cap (239-893 rows walked: the lowered-cap state, not the
+  reachable one); caps are now re-read at EXPLAIN time. The walk-row check also counted the
+  totals' full pass over 105 as a walk; walks are now the looped scans.
+- **Regression** (foreground, 3 batches after a background run was reaped for low memory):
+  every `test_skip_trace_*` suite, `test_tracerfy_ingest`, the 102/103/105 index suites,
+  `test_beat_schedule`, `test_plan_entitlement_audit`: 285 + 148 + 391 = **824 passed, 0
+  failed**. ruff clean.
 
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever

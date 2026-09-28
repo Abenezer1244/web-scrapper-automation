@@ -398,7 +398,8 @@ class Settings(BaseSettings):
             self.ENVIRONMENT.strip().lower() == "production"
             and "ENTITLEMENT_ENFORCEMENT" not in self.model_fields_set
         ):
-            self.ENTITLEMENT_ENFORCEMENT = True
+            # object.__setattr__: no recursion even if validate_assignment is ever on.
+            object.__setattr__(self, "ENTITLEMENT_ENFORCEMENT", True)
         return self
 
     @field_validator("SKIP_TRACE_DISPATCH_INTERVAL_SECONDS")

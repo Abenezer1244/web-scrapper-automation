@@ -1,0 +1,441 @@
+"""2c-bis: finalization is fenced to the attempt that owns the job.
+
+A stalled attempt A that resumes after the watchdog re-queued its job must not bill,
+complete, fail or release anything that the replacement attempt B now owns. Real DB,
+real Redis, production helpers throughout (claim_attempt, the watchdog's own
+_recovery_cas, finalize_billing_and_done, _fail_job, release_quota_reservation). Where
+a race must land between two statements inside finalization, the test wraps the
+helper's OWN function so the real code runs and B acts at exactly that point.
+"""
+import inspect
+import threading
+import uuid
+from datetime import UTC, datetime
+
+import pytest
+from sqlalchemy import text
+
+from src.db.models import Job, Result, ScraperConfig, User
+from src.db.session import SyncSessionLocal
+from src.workers.scheduler_helpers.health import _Candidate, _recovery_cas
+from src.workers.tasks_helpers import finalize as fin
+from src.workers.tasks_helpers.finalize import FinalizeKind, finalize_billing_and_done
+from src.workers.tasks_helpers.status import (
+    _TERMINAL_STATUSES,
+    AttemptToken,
+    _fail_job,
+    _retry_scrape_job,
+    _set_progress,
+    _set_stage,
+    _set_status,
+    _write_heartbeat,
+    attempt_state,
+    claim_attempt,
+    finalize_exit,
+    release_quota_reservation,
+)
+
+ADDR = "5006 61ST STREET CT E"
+WINDOW = datetime(2026, 9, 1, tzinfo=UTC)
+
+
+# ── fixtures and helpers ─────────────────────────────────────────────────────
+
+@pytest.fixture
+def run(starter_user, scraper_config):
+    """A job attempt A has claimed and is finalizing: 2 new leads, a reservation of
+    2 already charged to the user by A's plan cap (as the cap does), a dedup claim."""
+    user_id, config_id = starter_user.id, scraper_config.id
+    job_id = str(uuid.uuid4())
+    with SyncSessionLocal() as s:
+        s.execute(text("UPDATE users SET records_used = 2, quota_period_start = :w "
+                       "WHERE id = :u"), {"w": WINDOW, "u": user_id})
+        s.add(Job(id=job_id, user_id=user_id, scraper_config_id=config_id,
+                  trigger="manual", status="pending", records_found=2,
+                  reserved_at=datetime.now(UTC), reserved_count=2,
+                  quota_period_start=WINDOW))
+        s.flush()
+        for _ in range(2):
+            s.add(Result(id=str(uuid.uuid4()), job_id=job_id, user_id=user_id,
+                         property_address=ADDR, is_duplicate=False,
+                         dedup_hash=uuid.uuid4().hex))
+        s.commit()
+        a = claim_attempt(s, job_id)
+        s.execute(text("UPDATE jobs SET status = 'enriching' WHERE id = :j"), {"j": job_id})
+        s.execute(text(
+            "INSERT INTO delivered_records (id, user_id, dedup_hash, first_result_id, "
+            "first_job_id, first_delivered_at) SELECT gen_random_uuid(), user_id, "
+            "dedup_hash, id, job_id, now() FROM results WHERE job_id = :j"), {"j": job_id})
+        s.commit()
+    return {"job_id": job_id, "user_id": user_id, "config_id": config_id, "a": a}
+
+
+def _requeue(run, observed: AttemptToken, observed_status="enriching") -> bool:
+    """The watchdog's own guarded re-queue of the attempt it observed."""
+    with SyncSessionLocal() as b:
+        seen = _Candidate(id=run["job_id"], status=observed_status,
+                          retry_count=observed.retry_count, started_at=observed.started_at,
+                          user_id=str(run["user_id"]), scraper_config_id=str(run["config_id"]))
+        return _recovery_cas(b, seen, status="pending", started_at=None,
+                             retry_count=observed.retry_count + 1, records_found=None,
+                             last_heartbeat_at=None)
+
+
+def _requeue_and_claim(run, observed: AttemptToken) -> AttemptToken | None:
+    if not _requeue(run, observed):
+        return None
+    with SyncSessionLocal() as b:
+        token = claim_attempt(b, run["job_id"])
+        b.execute(text("UPDATE jobs SET status = 'enriching' WHERE id = :j AND status = 'queued'"),
+                  {"j": run["job_id"]})
+        b.commit()
+        return token
+
+
+def _finalize(run, token, redis_client):
+    with SyncSessionLocal() as db:
+        job = db.get(Job, run["job_id"])
+        return finalize_billing_and_done(
+            db, redis_client, job=job, user=db.get(User, job.user_id),
+            config=db.get(ScraperConfig, job.scraper_config_id), job_id=run["job_id"],
+            attempt_token=token, object_key=f"exports/{job.user_id}/{run['job_id']}/leads.csv",
+            boot_user_id=str(job.user_id),
+        )
+
+
+def _snapshot(run) -> dict:
+    """Everything finalization could touch: the job row, the user's counter, the
+    reservation, the claims, notifications and job logs."""
+    with SyncSessionLocal() as s:
+        j = s.execute(text(
+            "SELECT status, started_at, retry_count, billing_applied_at, billed_count, "
+            "record_count, reserved_at, reserved_count, export_key, error_message "
+            "FROM jobs WHERE id = :j"), {"j": run["job_id"]}).one()
+        return {
+            "job": tuple(j),
+            "records_used": s.execute(text("SELECT records_used FROM users WHERE id = :u"),
+                                      {"u": run["user_id"]}).scalar_one(),
+            "claims": s.execute(text("SELECT count(*) FROM delivered_records "
+                                     "WHERE first_job_id = :j"), {"j": run["job_id"]}).scalar_one(),
+            "notifications": s.execute(text("SELECT count(*) FROM notifications "
+                                            "WHERE job_id = :j"), {"j": run["job_id"]}).scalar_one(),
+            "job_logs": s.execute(text("SELECT count(*) FROM job_logs WHERE job_id = :j"),
+                                  {"j": run["job_id"]}).scalar_one(),
+        }
+
+
+class _Channel:
+    """Everything published on the job's live-log channel while it is open."""
+
+    def __init__(self, redis_client, job_id):
+        self._ps = redis_client.pubsub(ignore_subscribe_messages=True)
+        self._ps.subscribe(f"job_logs:{job_id}")
+        self._ps.get_message(timeout=1)
+
+    def drain(self) -> list:
+        out = []
+        while (m := self._ps.get_message(timeout=0.5)) is not None:
+            out.append(m)
+        self._ps.close()
+        return out
+
+
+# ── B1 attempt_state / finalize_exit ─────────────────────────────────────────
+
+def test_attempt_state_owned_requeued_reclaimed(run):
+    job_id, uid, a = run["job_id"], run["user_id"], run["a"]
+    with SyncSessionLocal() as s:
+        assert finalize_exit(attempt_state(s, job_id, uid, a)) is None
+        s.rollback()
+    assert _requeue(run, a)
+    with SyncSessionLocal() as s:
+        assert finalize_exit(attempt_state(s, job_id, uid, a)) == "lost_ownership"
+        s.rollback()
+        b = claim_attempt(s, job_id)
+        assert finalize_exit(attempt_state(s, job_id, uid, a)) == "lost_ownership"
+        assert finalize_exit(attempt_state(s, job_id, uid, b)) is None
+        s.rollback()
+
+
+@pytest.mark.parametrize("terminal", _TERMINAL_STATUSES)
+def test_a_terminal_row_with_the_same_token_is_terminalized(run, terminal):
+    with SyncSessionLocal() as s:
+        s.execute(text("UPDATE jobs SET status = :t WHERE id = :j"),
+                  {"t": terminal, "j": run["job_id"]})
+        s.commit()
+        state = attempt_state(s, run["job_id"], run["user_id"], run["a"])
+        s.rollback()
+    assert (state.owned, finalize_exit(state)) == (False, "terminalized")
+
+
+def test_attempt_state_takes_a_row_lock(run):
+    with SyncSessionLocal() as holder:
+        attempt_state(holder, run["job_id"], run["user_id"], run["a"])
+        done = threading.Event()
+
+        def _write():
+            with SyncSessionLocal() as other:
+                other.execute(text("UPDATE jobs SET error_message = 'x' WHERE id = :j"),
+                              {"j": run["job_id"]})
+                other.commit()
+            done.set()
+
+        t = threading.Thread(target=_write)
+        t.start()
+        assert not done.wait(1.5), "attempt_state did not lock the row"
+        holder.rollback()
+        t.join(10)
+    assert done.is_set()
+
+
+def test_another_tenant_never_owns_the_job(run, business_user):
+    with SyncSessionLocal() as s:
+        state = attempt_state(s, run["job_id"], business_user.id, run["a"])
+        s.rollback()
+    assert state == (False, None)
+
+
+# ── B2 the token is unique per claim ─────────────────────────────────────────
+
+def test_every_re_pend_increments_retry_count_so_tokens_never_repeat(run):
+    a = run["a"]
+    b = _requeue_and_claim(run, a)
+    with SyncSessionLocal() as s:
+        job = s.get(Job, run["job_id"])
+        assert _retry_scrape_job(s, job, run["job_id"], b, max_retries=3, backoffs=(1,)) is not None
+        c = claim_attempt(s, run["job_id"])
+    assert len({a.retry_count, b.retry_count, c.retry_count}) == 3
+
+
+# ── B4 races: stale A vs replacement B ───────────────────────────────────────
+
+def _assert_a_did_nothing(before, after, published):
+    assert after == before, "the stale attempt wrote after it lost ownership"
+    assert published == [], "the stale attempt published on the live channel"
+
+
+def test_b_reclaims_before_a_stage_write(run, redis_client):
+    b = _requeue_and_claim(run, run["a"])
+    before, ch = _snapshot(run), _Channel(redis_client, run["job_id"])
+
+    outcome = _finalize(run, run["a"], redis_client)
+
+    assert outcome.kind is FinalizeKind.LOST_OWNERSHIP
+    _assert_a_did_nothing(before, _snapshot(run), ch.drain())
+    with SyncSessionLocal() as s:
+        assert s.get(Job, run["job_id"]).started_at == b.started_at
+
+
+def test_b_reclaims_between_stage_and_billing(run, redis_client, monkeypatch):
+    real_stage, state = fin._set_stage, {}
+
+    def stage_then_b_reclaims(*args, **kwargs):
+        landed = real_stage(*args, **kwargs)
+        state["b"] = _requeue_and_claim(run, run["a"])
+        state["before"] = _snapshot(run)
+        return landed
+
+    monkeypatch.setattr(fin, "_set_stage", stage_then_b_reclaims)
+    ch = _Channel(redis_client, run["job_id"])
+
+    outcome = _finalize(run, run["a"], redis_client)
+
+    assert state["b"] is not None
+    assert outcome.kind is FinalizeKind.LOST_OWNERSHIP
+    _assert_a_did_nothing(state["before"], _snapshot(run), ch.drain())
+
+
+def _race_b_against_a_billing_lock(run, monkeypatch):
+    """B's re-queue fires right after A's billing fence took the row lock."""
+    real, result = fin._fenced_exit, {}
+
+    def fence_then_b(db, job_id, uid, token, where):
+        stop = real(db, job_id, uid, token, where)
+        if where == "billing" and stop is None:
+            t = threading.Thread(target=lambda: result.setdefault(
+                "b", _requeue_and_claim(run, run["a"])))
+            t.start()
+            t.join(1.5)
+            result["waited"] = t.is_alive()
+            result["thread"] = t
+        return stop
+
+    monkeypatch.setattr(fin, "_fenced_exit", fence_then_b)
+    return result
+
+
+def test_a_holds_billing_lock_so_a_wins_and_b_requeue_noops(run, redis_client, monkeypatch):
+    race = _race_b_against_a_billing_lock(run, monkeypatch)
+
+    outcome = _finalize(run, run["a"], redis_client)
+    race["thread"].join(15)
+
+    assert race["waited"], "B's re-queue did not wait on A's billing lock"
+    assert (outcome.kind, outcome.display_count) == (FinalizeKind.DONE, 2)
+    assert race["b"] is None
+    snap = _snapshot(run)
+    status, started_at, retry, billed_at, billed, *_ = snap["job"]
+    assert (status, started_at, retry, billed) == ("done", run["a"].started_at, 0, 2)
+    assert billed_at is not None and snap["records_used"] == 2
+
+
+def test_b_cannot_get_between_a_billing_and_done_on_the_already_billed_path(
+    run, redis_client, monkeypatch,
+):
+    """Precondition: billed by an earlier attempt, so A's billing CAS does not fire.
+    The billing fence's row lock is taken on this path too, so B still waits."""
+    with SyncSessionLocal() as s:
+        s.execute(text("UPDATE jobs SET billing_applied_at = now() - interval '1 hour', "
+                       "billed_count = 2 WHERE id = :j"), {"j": run["job_id"]})
+        s.commit()
+    race = _race_b_against_a_billing_lock(run, monkeypatch)
+
+    outcome = _finalize(run, run["a"], redis_client)
+    race["thread"].join(15)
+
+    assert race["waited"] and race["b"] is None
+    assert (outcome.kind, outcome.display_count) == (FinalizeKind.DONE, 2)
+    assert _snapshot(run)["records_used"] == 2
+
+
+@pytest.mark.parametrize("terminal", _TERMINAL_STATUSES)
+def test_a_terminal_job_with_the_same_token_bills_nothing(run, redis_client, terminal):
+    with SyncSessionLocal() as s:
+        s.execute(text("UPDATE jobs SET status = :t WHERE id = :j"),
+                  {"t": terminal, "j": run["job_id"]})
+        s.commit()
+
+    outcome = _finalize(run, run["a"], redis_client)
+
+    assert outcome.kind is FinalizeKind.ALREADY_TERMINAL
+    snap = _snapshot(run)
+    assert snap["job"][3] is None and snap["records_used"] == 2   # not billed
+
+
+# ── B5 after A lost, the replacement settles or cleans up exactly once ───────
+
+def _a_loses(run, redis_client) -> AttemptToken:
+    b = _requeue_and_claim(run, run["a"])
+    assert _finalize(run, run["a"], redis_client).kind is FinalizeKind.LOST_OWNERSHIP
+    return b
+
+
+def test_after_a_lost_b_succeeds_billed_once(run, redis_client):
+    b = _a_loses(run, redis_client)
+
+    outcome = _finalize(run, b, redis_client)
+
+    assert (outcome.kind, outcome.display_count) == (FinalizeKind.DONE, 2)
+    snap = _snapshot(run)
+    status, started_at, _, billed_at, billed, *_ = snap["job"]
+    assert (status, started_at, billed) == ("done", b.started_at, 2)
+    # Charged once: the reservation A's cap took (2) is what B settles against.
+    assert billed_at is not None and snap["records_used"] == 2
+
+
+def test_after_a_lost_b_is_cancelled_releases_once(run, redis_client):
+    b = _a_loses(run, redis_client)
+    with SyncSessionLocal() as s:   # the user cancels B's run (status only, as the API does)
+        s.execute(text("UPDATE jobs SET status = 'cancelled' WHERE id = :j"), {"j": run["job_id"]})
+        s.commit()
+
+    assert _finalize(run, b, redis_client).kind is FinalizeKind.ALREADY_TERMINAL
+    with SyncSessionLocal() as s:   # the reservation's owner of last resort: the beat sweep
+        assert release_quota_reservation(s, run["job_id"]) == 2
+        assert release_quota_reservation(s, run["job_id"]) == 0
+    snap = _snapshot(run)
+    assert (snap["records_used"], snap["claims"]) == (0, 0)
+
+
+def test_after_a_lost_b_fails_releases_once(run, redis_client):
+    b = _a_loses(run, redis_client)
+    with SyncSessionLocal() as s:
+        job = s.get(Job, run["job_id"])
+        assert _fail_job(s, job, redis_client, run["job_id"], "boom", expected_started_at=b)
+        assert release_quota_reservation(s, run["job_id"]) == 0   # already given back
+    snap = _snapshot(run)
+    assert snap["job"][0] == "failed" and snap["records_used"] == 0
+
+
+# ── B6/B8 a forced timestamp collision: A's token matches B's started_at ──────
+
+@pytest.fixture
+def collided(run):
+    """B re-claimed with a higher retry_count but EXACTLY A's started_at."""
+    b = _requeue_and_claim(run, run["a"])
+    with SyncSessionLocal() as s:
+        s.execute(text("UPDATE jobs SET started_at = :sa WHERE id = :j"),
+                  {"sa": run["a"].started_at, "j": run["job_id"]})
+        s.commit()
+    return run, AttemptToken(run["a"].started_at, b.retry_count)
+
+
+def test_no_attempt_scoped_write_lands_for_a_colliding_stale_token(collided, redis_client):
+    run, b = collided
+    a, job_id = run["a"], run["job_id"]
+    before = _snapshot(run)
+    with SyncSessionLocal() as s:
+        job = s.get(Job, job_id)
+        assert _set_progress(s, job, expected_started_at=a, units_done=5) is False
+        assert _set_stage(s, job, "finalizing", expected_started_at=a) is False
+        assert _set_status(s, job, "done", expected_started_at=a) is False
+        assert _fail_job(s, job, redis_client, job_id, "stale", expected_started_at=a) is False
+        assert _retry_scrape_job(s, job, job_id, a, max_retries=9, backoffs=(1,)) is None
+        assert attempt_state(s, job_id, run["user_id"], a).owned is False
+        s.rollback()
+    assert _write_heartbeat(job_id, a) == 0
+    assert _finalize(run, a, redis_client).kind is FinalizeKind.LOST_OWNERSHIP
+    after = _snapshot(run)
+    assert after["records_used"] == before["records_used"] == 2   # B's reservation intact
+    assert after["job"][0] == "enriching" and after["job"][2] == b.retry_count
+
+
+def test_the_legacy_datetime_form_is_unchanged(collided):
+    """The bare-datetime token keeps today's timestamp-only behavior (legacy test
+    callers only; production passes AttemptToken): under a collision it DOES match."""
+    run, _b = collided
+    with SyncSessionLocal() as s:
+        job = s.get(Job, run["job_id"])
+        assert _set_progress(s, job, expected_started_at=run["a"].started_at, units_done=5)
+
+
+# ── B7 wiring (supplement) ───────────────────────────────────────────────────
+
+def _live(source: str) -> str:
+    return "\n".join(ln for ln in source.splitlines() if not ln.strip().startswith("#"))
+
+
+def test_run_scrape_job_passes_the_whole_token_everywhere():
+    from src.workers.tasks import run_scrape_job
+
+    body = _live(inspect.getsource(run_scrape_job.__wrapped__))
+    assert "attempt_token = claim_attempt(db, job_id)" in body
+    assert "claim_job_for_attempt(" not in body
+    assert "attempt_token.started_at" not in body and "attempt_started_at" not in body
+    assert "finalize_billing_and_done(" in body
+    assert "if _outcome.kind is not FinalizeKind.DONE:" in body
+    # Everything after DONE (email, webhook, dialer) is below that return.
+    tail = body[body.index("if _outcome.kind is not FinalizeKind.DONE:"):]
+    for effect in ("deliver_job_email", "create_notification", "r.publish("):
+        assert effect in tail
+
+
+def test_finalize_fences_every_money_write():
+    body = _live(inspect.getsource(finalize_billing_and_done))
+    assert "*_attempt_clauses(attempt_token)" in body              # billing CAS
+    assert "expected_started_at=attempt_token," in body           # done-CAS
+    assert "reason, expected_started_at=attempt_token" in body    # billing-failed _fail_job
+    assert body.count("_fenced_exit(") >= 4                       # stage, billing, failed, done
+    # the billing-failed branch asks before it fails or releases anything
+    failed = body[body.index("Billing failed: user record-usage"):]
+    assert failed.index("_fenced_exit(") < failed.index("_fail_job(")
+    # no terminal status literal of its own
+    assert "'cancelled'" not in body and '"cancelled"' not in body
+
+
+def test_retry_count_changes_only_on_the_two_re_pends():
+    """The uniqueness argument, pinned: the watchdog and _retry_scrape_job both bump it."""
+    src = inspect.getsource(_retry_scrape_job)
+    assert "retry_count=retry_count+1" in src
+    from src.workers.scheduler_helpers import health
+    assert "retry_count=job.retry_count + 1" in inspect.getsource(health)

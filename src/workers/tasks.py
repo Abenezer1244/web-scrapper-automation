@@ -75,6 +75,7 @@ from src.workers.tasks_helpers.status import (
     _TERMINAL_STATUSES,
     HeartbeatThread,
     JobUpdateFields,  # noqa: F401  (re-export)
+    _attempt_clauses,
     _delivery_download_url,
     _fail_job,
     _now,
@@ -84,7 +85,7 @@ from src.workers.tasks_helpers.status import (
     _set_progress,
     _set_stage,
     _set_status,
-    claim_job_for_attempt,
+    claim_attempt,
     transient_retry_notice,
 )
 
@@ -374,7 +375,7 @@ def _fail_job_after_uncaught(job_id: str, reason: str, expected_started_at=None)
                 update(Job)
                 .where(
                     Job.id == job_id,
-                    Job.started_at == expected_started_at,
+                    *_attempt_clauses(expected_started_at),
                     Job.status.notin_(_TERMINAL_STATUSES),
                     Job.billing_applied_at.is_(None),
                 )
@@ -570,8 +571,8 @@ def run_scrape_job(self, job_id: str) -> None:
         # as started_at, so every attempt begins with a FRESH liveness observation
         # and can never be re-queued on the previous attempt's stale one. See that
         # helper for why the CAS lives there rather than inline here.
-        attempt_started_at = claim_job_for_attempt(db, job_id)
-        if attempt_started_at is None:
+        attempt_token = claim_attempt(db, job_id)
+        if attempt_token is None:
             _logger.info(
                 "Job %s not claimable (already in flight / not pending) — "
                 "skipping to avoid double-scrape",
@@ -589,7 +590,7 @@ def run_scrape_job(self, job_id: str) -> None:
         # (_RunScrapeJobTask) can attempt-scope its crash cleanup — it must only fail the
         # row if started_at still matches, never a re-queued/re-claimed newer attempt.
         try:
-            self.request.scrape_started_at = attempt_started_at
+            self.request.scrape_started_at = attempt_token
         except Exception:  # request context unavailable (e.g. direct call) — non-fatal
             pass
 
@@ -605,7 +606,7 @@ def run_scrape_job(self, job_id: str) -> None:
         if _skip_reason is not None:
             # _fail_job writes the job log line, emits the event and releases any
             # reserved quota, so a skipped run reserves and bills nothing.
-            _fail_job(db, job, r, job_id, _skip_reason, expected_started_at=attempt_started_at)
+            _fail_job(db, job, r, job_id, _skip_reason, expected_started_at=attempt_token)
             return
 
         # The ACCOUNT may still start billable work (audit #4 S4-01). The enqueue
@@ -661,10 +662,10 @@ def run_scrape_job(self, job_id: str) -> None:
         # (a deploy, an OOM, a hard timeout) sat visibly "running" for the full
         # 70-minute started_at fallback with nothing to show it was gone. That is
         # exactly what stranded job 9c8b7259 on 2026-09-09.
-        _hb.start(attempt_started_at)
+        _hb.start(attempt_token)
         # Stage rides the commit that _publish_log already performs, so no new commit
         # point is introduced into the work session (see _set_progress).
-        _set_stage(db, job, "preparing", expected_started_at=attempt_started_at, commit=False)
+        _set_stage(db, job, "preparing", expected_started_at=attempt_token, commit=False)
         _publish_log(r, job_id, "info", f"Job queued: {config.name} ({config.county}, {config.state})", db=db)
 
         # ── PROBING ───────────────────────────────────────────────────────────
@@ -807,7 +808,7 @@ def run_scrape_job(self, job_id: str) -> None:
                 observations["stage"] = stage_for_phase
                 observations["stage_started_at"] = _now()
             landed = _set_progress(
-                db, job, expected_started_at=attempt_started_at, **observations,
+                db, job, expected_started_at=attempt_token, **observations,
             )
             if landed and advancing:
                 # The local mirror advances only when the row did. Moving it first
@@ -841,11 +842,11 @@ def run_scrape_job(self, job_id: str) -> None:
             first result page happens inside one call. The scraper knows which of
             those it is in; nothing else does.
             """
-            if _set_stage(db, job, stage, expected_started_at=attempt_started_at):
+            if _set_stage(db, job, stage, expected_started_at=attempt_token):
                 _last_stage[0] = stage
 
         _set_stage(
-            db, job, "connecting", expected_started_at=attempt_started_at, commit=False,
+            db, job, "connecting", expected_started_at=attempt_token, commit=False,
         )
         _publish_log(r, job_id, "info", "Connecting to county portal...", db=db)
         # Flush the resolved date window to disk before entering the scraper, which
@@ -922,7 +923,7 @@ def run_scrape_job(self, job_id: str) -> None:
             raise
         except Exception as exc:
             _logger.exception("Scraper error for job %s", job_id)
-            # attempt_started_at is the token the CLAIM returned, captured once at
+            # attempt_token is the token the CLAIM returned, captured once at
             # the top of this run and never re-read from the ORM. It attempt-scopes
             # BOTH the retry CAS and the terminal fail below, so a stale/superseded
             # attempt never clobbers a live re-claimed one (Codex P1). This used to
@@ -944,7 +945,7 @@ def run_scrape_job(self, job_id: str) -> None:
             from src.scrapers.reliability import is_transient_scrape_error
             if is_transient_scrape_error(exc):
                 countdown = _retry_scrape_job(
-                    db, job, job_id, attempt_started_at,
+                    db, job, job_id, attempt_token,
                     max_retries=SCRAPE_TRANSIENT_MAX_RETRIES,
                     backoffs=SCRAPE_TRANSIENT_BACKOFF_SECONDS,
                 )
@@ -1004,7 +1005,7 @@ def run_scrape_job(self, job_id: str) -> None:
             # (started_at unchanged). If a newer attempt re-claimed it — or the
             # retry CAS above no-oped on an ownership change — this no-ops instead
             # of terminalizing a live newer attempt (Codex P1).
-            if _fail_job(db, job, r, job_id, reason, expected_started_at=attempt_started_at):
+            if _fail_job(db, job, r, job_id, reason, expected_started_at=attempt_token):
                 from src.workers.notification_emit import create_notification
                 create_notification(
                     user_id=job.user_id, type="job_failed", job_id=job_id,
@@ -1025,7 +1026,7 @@ def run_scrape_job(self, job_id: str) -> None:
         # 0 is written as 0 on purpose — a county that returned nothing really did.
         _set_progress(
             db, job,
-            expected_started_at=attempt_started_at,
+            expected_started_at=attempt_token,
             commit=False,
             records_found=len(records),
             last_progress_at=_now(),
@@ -1080,7 +1081,7 @@ def run_scrape_job(self, job_id: str) -> None:
                 job_id, job.status,
             )
             return
-        _set_stage(db, job, "saving", expected_started_at=attempt_started_at, commit=False)
+        _set_stage(db, job, "saving", expected_started_at=attempt_token, commit=False)
         _publish_log(r, job_id, "info", "Saving records to database...", db=db)
 
         # Bulk insert results (truncate fields to fit DB column limits)
@@ -1244,7 +1245,7 @@ def run_scrape_job(self, job_id: str) -> None:
         # NOTHING tells us which rows were successfully claimed (first
         # delivery) vs which conflicted (user has seen this lead before).
         # The conflicting rows get their Result flagged is_duplicate=true.
-        _set_stage(db, job, "deduping", expected_started_at=attempt_started_at, commit=False)
+        _set_stage(db, job, "deduping", expected_started_at=attempt_token, commit=False)
         _publish_log(r, job_id, "info", "Checking for duplicate leads...", db=db)
         _logger.info("Job %s: dedup step 1 — SELECT fresh rows", job_id)
 
@@ -1502,7 +1503,7 @@ def run_scrape_job(self, job_id: str) -> None:
 
         # Export runs BEFORE enrichment, which is why the stage list is not a
         # pipeline and why nothing may read "step N of M" off it.
-        _set_stage(db, job, "exporting", expected_started_at=attempt_started_at, commit=False)
+        _set_stage(db, job, "exporting", expected_started_at=attempt_token, commit=False)
         _publish_log(r, job_id, "info", f"Building {fmt.upper()} export...", db=db)
 
         # Build the FIRST deliverable from the PERSISTED rows for every record type.
@@ -1646,7 +1647,7 @@ def run_scrape_job(self, job_id: str) -> None:
         # request's wait. If a hang slips through both, Celery hard-kills
         # the worker — which is what the previous thread guard was
         # actually relying on anyway.
-        _set_stage(db, job, "enriching", expected_started_at=attempt_started_at, commit=False)
+        _set_stage(db, job, "enriching", expected_started_at=attempt_token, commit=False)
         _publish_log(r, job_id, "info", "Looking up property and mailing addresses...", db=db)
         # Skip trace is enqueued only after a completed enrichment, and only after
         # the plan cap below (never for a row that will not be delivered).
@@ -2013,7 +2014,7 @@ def run_scrape_job(self, job_id: str) -> None:
                     db, job, r, job_id, config,
                     on_begin=lambda: _set_stage(
                         db, job, "queuing_contacts",
-                        expected_started_at=attempt_started_at,
+                        expected_started_at=attempt_token,
                     ),
                 )
             except Exception as exc:
@@ -2183,7 +2184,7 @@ def run_scrape_job(self, job_id: str) -> None:
         # src/workers/tasks_helpers/finalize.py so the tests run production code.
         _outcome = finalize_billing_and_done(
             db, r, job=job, user=user, config=config, job_id=job_id,
-            attempt_started_at=attempt_started_at, object_key=object_key,
+            attempt_token=attempt_token, object_key=object_key,
             boot_user_id=_boot_user_id,
         )
         if _outcome.kind is not FinalizeKind.DONE:

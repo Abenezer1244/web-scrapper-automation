@@ -40,7 +40,7 @@ def _finalize(job_id, redis_client, *, token=A_TOKEN):
         config = db.get(ScraperConfig, job.scraper_config_id)
         return finalize_billing_and_done(
             db, redis_client, job=job, user=user, config=config, job_id=job_id,
-            attempt_started_at=token, object_key=f"exports/{job.user_id}/{job_id}/leads.csv",
+            attempt_token=token, object_key=f"exports/{job.user_id}/{job_id}/leads.csv",
             boot_user_id=str(job.user_id),
         )
 

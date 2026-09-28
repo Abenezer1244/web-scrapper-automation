@@ -22,10 +22,13 @@ from src.db.models import Job
 from src.utils.logger import setup_logger
 from src.workers.tasks_helpers.status import (
     _TERMINAL_STATUSES,
+    _attempt_clauses,
     _fail_job,
     _now,
     _set_stage,
     _set_status,
+    attempt_state,
+    finalize_exit,
 )
 
 _logger = setup_logger("workers.tasks")
@@ -35,6 +38,7 @@ class FinalizeKind(str, Enum):
     DONE = "done"                          # billed (or already billed) and marked done
     ALREADY_TERMINAL = "already_terminal"  # cancelled/failed/done under us: nothing billed
     BILLING_FAILED = "billing_failed"      # the user counter did not move; job failed
+    LOST_OWNERSHIP = "lost_ownership"      # another attempt holds the job: did nothing
 
 
 @dataclass(frozen=True)
@@ -134,7 +138,7 @@ def _release_claims_of_cancelled_job(db, job_id: str, user_id) -> None:
 
 
 def finalize_billing_and_done(
-    db, r, *, job, user, config, job_id: str, attempt_started_at, object_key,
+    db, r, *, job, user, config, job_id: str, attempt_token, object_key,
     boot_user_id,
 ) -> FinalizeOutcome:
     """Bill the run and mark it done in ONE transaction, or say why not.
@@ -165,7 +169,26 @@ def finalize_billing_and_done(
     # — with commit=True, or with commit=False and someone else's commit arriving
     # first — would split them, which is the crash that leaves a job billed but
     # not done (Codex P1).
-    _set_stage(db, job, "finalizing", expected_started_at=attempt_started_at)
+    if not _set_stage(db, job, "finalizing", expected_started_at=attempt_token):
+        # False is a CAS miss OR a swallowed telemetry error (_set_progress never
+        # raises). Ask the row which: terminal -> today's force-finalize handling;
+        # another attempt -> stop; still ours -> it was telemetry, carry on.
+        stop = _fenced_exit(db, job_id, _boot_user_id, attempt_token, "stage")
+        if stop is not None:
+            if stop.kind is FinalizeKind.ALREADY_TERMINAL:
+                _release_claims_of_cancelled_job(db, job_id, _boot_user_id)
+            return stop
+        db.rollback()  # still ours: end the check's transaction, keep going
+
+    # The billing transaction opens HERE, with this attempt's ownership read under a
+    # row lock that is held through the billing reads, the billing CAS, the users
+    # settle and the done-CAS, which commit together. A re-queue or cancel issued in
+    # that window waits, then finds the job finished. Not ours -> nothing is billed.
+    stop = _fenced_exit(db, job_id, _boot_user_id, attempt_token, "billing")
+    if stop is not None:
+        if stop.kind is FinalizeKind.ALREADY_TERMINAL:
+            _release_claims_of_cancelled_job(db, job_id, _boot_user_id)
+        return stop
 
     # Atomic update of monthly record usage.
     # Sprint 6.4: duplicates delivered to this user in a prior scrape
@@ -213,7 +236,10 @@ def finalize_billing_and_done(
     _billed_at = db.execute(sa_text("SELECT clock_timestamp()")).scalar()
     billed_now = db.execute(
         sa_update(Job)
-        .where(Job.id == job_id, Job.billing_applied_at.is_(None))
+        .where(
+            Job.id == job_id, Job.billing_applied_at.is_(None),
+            *_attempt_clauses(attempt_token),
+        )
         .values(billed_count=billable_count, billing_applied_at=_billed_at)
     ).rowcount
     if billed_now:
@@ -334,7 +360,17 @@ def finalize_billing_and_done(
             # billed-without-charge — roll back and fail loudly (Codex).
             db.rollback()
             reason = "Billing failed: user record-usage counter could not be updated."
-            if _fail_job(db, job, r, job_id, reason):
+            # The rollback released the row lock, so ask again before failing it.
+            stop = _fenced_exit(db, job_id, _boot_user_id, attempt_token, "billing_failed")
+            if stop is not None:
+                if stop.kind is FinalizeKind.ALREADY_TERMINAL:
+                    from src.workers.tasks_helpers.status import release_quota_reservation
+
+                    release_quota_reservation(db, job_id)
+                    _release_claims_of_cancelled_job(db, job_id, _boot_user_id)
+                return stop
+            db.rollback()  # still ours: _fail_job runs its own transaction
+            if _fail_job(db, job, r, job_id, reason, expected_started_at=attempt_token):
                 from src.workers.notification_emit import create_notification
                 create_notification(
                     user_id=job.user_id, type="job_failed", job_id=job_id,
@@ -374,10 +410,19 @@ def finalize_billing_and_done(
         record_count=display_count,
         export_key=object_key,
         commit=False,
+        expected_started_at=attempt_token,
     ):
         # Cancelled (force-finalize) while enriching: the CAS kept the row
         # terminal — roll the pending billing back (a cancelled job is never
         # charged) and suppress the success log, email, and webhook.
+        db.rollback()
+        # Unless the job now belongs to another attempt: then NOTHING is released.
+        # release_quota_reservation is not attempt-aware and would refund the grant
+        # that attempt is reusing. (Unreachable while the billing lock is held; kept
+        # so the done-CAS never depends on where it is called from.)
+        stop = _fenced_exit(db, job_id, _boot_user_id, attempt_token, "done")
+        if stop is not None and stop.kind is FinalizeKind.LOST_OWNERSHIP:
+            return stop
         db.rollback()
         db.refresh(job)
         # The pending billing rolled back with that, but the plan cap's
@@ -397,3 +442,24 @@ def finalize_billing_and_done(
     db.refresh(job)
     db.refresh(user)
     return FinalizeOutcome(FinalizeKind.DONE, int(display_count))
+
+
+def _fenced_exit(db, job_id: str, boot_user_id, attempt_token, where: str) -> FinalizeOutcome | None:
+    """Read this attempt's ownership (row-locked) and decide whether finalization stops.
+
+    None: still ours; the lock stays held in the open transaction for the caller.
+    ALREADY_TERMINAL: the job is cancelled/failed/done; the caller runs its cleanup.
+    LOST_OWNERSHIP: another attempt holds the job; rolled back, nothing to release.
+    """
+    decision = finalize_exit(attempt_state(db, job_id, boot_user_id, attempt_token))
+    if decision is None:
+        return None
+    db.rollback()
+    if decision == "terminalized":
+        _logger.info("Job %s: terminal at %s; not billing", job_id, where)
+        return FinalizeOutcome(FinalizeKind.ALREADY_TERMINAL)
+    _logger.info(
+        "Job %s: the attempt token changed at %s; this attempt stops without billing, "
+        "completing or releasing anything", job_id, where,
+    )
+    return FinalizeOutcome(FinalizeKind.LOST_OWNERSHIP)

@@ -2337,6 +2337,19 @@ spent rows. (`alembic_version` reads EMPTY to the worker role: RLS on, no policy
   `test_beat_schedule`, `test_plan_entitlement_audit`: 285 + 148 + 391 = **824 passed, 0
   failed**. ruff clean.
 
+**Codex diff review r1 on iii-b (three-dot, rebased on `405ba52c` #380: no overlap; its
+conftest change only ADDS a `connectors` fixture): NO-GO, 2 P2, both fixed.**
+(`<scratchpad 4fe51d38>/codex_iiib_review_out.txt`)
+- P2 the fence and its checks were two SELECTs; H1 says one. I had split them believing
+  `pg_current_xact_id()` raises in a read-only transaction: TESTED, it does not (it returned an
+  id with `transaction_read_only = on`). Now one SELECT; the docstring no longer claims a
+  read-only transaction "cannot hold a usable id" (the real reason: the ordering argument holds
+  only on the primary, in the dispatcher's read-write path). New test: the fence's statements
+  are exactly SET TRANSACTION, ONE SELECT with all three, SET LOCAL statement_timeout.
+- P2 `\d{20}` accepts other scripts' digits. Now `[0-9]{20}` (Lua's `%d` is byte-wise ASCII
+  already). New reader case: 20 Arabic-Indic digits -> UNKNOWN.
+- Mutations: each fix reverted -> caught by its new test. Suite 58 passed.
+
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever
       the tab has leads that have never been looked up; when the quote comes back with

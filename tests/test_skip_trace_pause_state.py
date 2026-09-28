@@ -335,6 +335,29 @@ async def test_a_publisher_that_read_before_a_claim_cannot_undo_the_claims_publi
     assert pause.read_pause_state(r, u, datetime.now(UTC)).status == PAUSED
 
 
+def test_the_fence_and_its_checks_come_from_one_select():
+    """H1 as written: the transaction id and the standby / read-only checks are ONE
+    statement, after the isolation level and before the 5 s ceiling."""
+    statements = []
+
+    def seen(conn, cursor, statement, *a):
+        statements.append(" ".join(statement.split()))
+    with system_sync_session() as db:
+        db.connection()  # begin before listening: only the fence's own statements
+        event.listen(sync_engine, "before_cursor_execute", seen)
+        try:
+            assert skip_trace_dispatcher._pause_fence(db) is not None
+        finally:
+            event.remove(sync_engine, "before_cursor_execute", seen)
+        db.rollback()
+    assert statements[0] == "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"
+    selects = [s for s in statements if s.startswith("SELECT")]
+    assert len(selects) == 1
+    assert all(f in selects[0] for f in (
+        "pg_current_xact_id()", "pg_is_in_recovery()", "transaction_read_only"))
+    assert statements[-1] == "SET LOCAL statement_timeout = '5s'"
+
+
 def test_a_read_only_transaction_publishes_nothing(caplog):
     with system_sync_session() as db:
         db.execute(text("SET TRANSACTION READ ONLY"))
@@ -371,6 +394,7 @@ _LATER = "2999-01-01T00:00:00+00:00"
 @pytest.mark.parametrize("case,over", [
     ("fence missing", {"fence": None}),
     ("fence malformed", {"fence": "12"}),
+    ("fence of 20 non-ASCII digits", {"fence": "١" * 20}),  # Arabic-Indic one
     ("published_at missing", {"published_at": None}),
     ("published_at malformed", {"published_at": "yesterday"}),
     ("fresh_until missing", {"fresh_until": None}),

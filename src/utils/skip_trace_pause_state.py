@@ -43,7 +43,9 @@ PAUSED = "paused"
 NOT_PAUSED = "not_paused"
 UNKNOWN = "unknown"
 
-_FENCE_RE = re.compile(r"\d{20}")
+# ASCII digits only: `\d` would also accept other scripts' digits (Codex iii-b
+# review). The Lua side is ASCII already: `%d` tests single bytes.
+_FENCE_RE = re.compile(r"[0-9]{20}")
 _SCOPE_KEYS = {"normal_resume_at", "advanced_resume_at"}
 
 # KEYS[1] = the hash; ARGV[1] = incoming fence; ARGV[2] = TTL seconds; ARGV[3..] =

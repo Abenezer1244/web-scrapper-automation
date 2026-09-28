@@ -87,20 +87,24 @@ def _pause_fence(db) -> str | None:
 
     READ COMMITTED gives every later statement a snapshot taken after this id was
     assigned, so a publisher with a larger fence sees every claim committed before
-    a smaller one was taken (Codex iii consult G1, H1). A standby or read-only
-    transaction cannot hold a usable id: None, and nothing is published."""
+    a smaller one was taken (Codex iii consult G1, H1). That argument holds only on
+    the primary, in the dispatcher's own read-write path: on a standby the view can
+    predate a committed claim, and a read-only session is not that path. Either
+    one: None, and nothing is published. One statement (Codex iii-b review): the id
+    and the checks come from the same SELECT."""
     from sqlalchemy import text
 
     from src.utils.skip_trace_pause_state import fence_str
 
     db.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
-    in_recovery, read_only = db.execute(text(
-        "SELECT pg_is_in_recovery(), current_setting('transaction_read_only')")).one()
+    xid, in_recovery, read_only = db.execute(text(
+        "SELECT pg_current_xact_id()::text, pg_is_in_recovery(), "
+        "current_setting('transaction_read_only')")).one()
     if in_recovery or read_only != "off":
         _logger.warning("Dispatcher: pause state not published: the session is %s",
                         "on a standby" if in_recovery else "read-only")
         return None
-    fence = fence_str(db.execute(text("SELECT pg_current_xact_id()::text")).scalar())
+    fence = fence_str(xid)
     # An absolute ceiling on the publisher's one resume statement (Codex K5, L1):
     # set after a successful fence, in the same transaction, so it covers that
     # statement and nothing after the transaction. A timeout is a WARNING, like any

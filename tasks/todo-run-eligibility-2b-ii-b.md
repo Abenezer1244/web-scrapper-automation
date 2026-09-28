@@ -149,9 +149,10 @@ is re-run (shared CTA map). tsc, eslint, build, drift check.
 
 ## Steps
 - [x] Codex plan review until PLAN: GO (round 4).
-- [ ] Owner confirms (A vs B).
-- [ ] BE: tests RED -> implement -> GREEN; ruff; full suite (8 parts); openapi regen + diff.
-- [ ] Security §14; Codex diff review (`origin/main...HEAD`) until GATE: PASS.
+- [x] Owner confirms: **A, additive** (2026-09-28).
+- [x] BE: tests RED -> implement -> GREEN; ruff; full suite (8 parts); openapi regen + diff.
+- [x] Security §14.
+- [ ] Codex diff review (`origin/main...HEAD`) until GATE: PASS.
 - [ ] Quiesce, merge, verify prod. A live 402 cannot be produced read-only (it needs a refused
       account), and prod does not serve `/openapi.json` (`openapi_url` is off when `DEBUG` is
       false; round 3 P3). So: api/worker/beat on the merge SHA, clean boot, api logs free of
@@ -180,3 +181,37 @@ return it). P3 adopted: prod verification no longer claims a served OpenAPI (off
 Round 4: **PLAN: GO**, no findings.
 
 ## Review
+BE built as planned (owner chose A). Files: `src/api/errors.py` (new), `main.py`,
+`src/api/schemas.py`, `src/api/routes/jobs.py`, `src/api/routes/batches.py`,
+`schema/openapi.json`, `tests/test_run_refusal.py` (new, 17 tests), `tests/conftest.py` +
+`tests/test_config_eligibility.py` (the `connectors` fixture moved to conftest so both modules
+share it; ruff flagged importing a fixture across test modules).
+- RED on unfixed code: 14 of 17 fail for the right reasons (9 HTTP tests: body is only
+  `{'detail'}`; 2 OpenAPI: no declared 402; 3 unit: no module). The 3 that pass there are the
+  intended regression guards (409 / entitlement shapes unchanged, batch plan gate still a bare
+  sentence, CORS + security headers on a 402).
+- Mutation-proven: handler unregistered -> 9 fail; unknown codes given a machine code -> 1
+  fails; raw datetime in the body -> 4 fail. Files restored byte-identical (cmp).
+- The pre-existing 2b-i tests pin `detail` to today's exact sentence on both routes
+  (`test_post_jobs_402_carries_todays_prose`, `test_post_batches_402_uses_run_eligibility`)
+  and stay green: the byte-identical proof.
+- `Retry-After` preservation is proven at the handler (unit test with a header set); no real
+  route sets one on these 402s today. The CORS test asserts `Access-Control-Expose-Headers`
+  includes it on a real 402.
+- ruff exit 0. OpenAPI regen `--check` OK; structural diff vs main = 4 new components
+  (`RunRefusalResponse`, `EntitlementRefusalResponse`, `EntitlementRefusalDetail`,
+  `PlainRefusalResponse`) + the `402` response on `POST /jobs` and `POST /batches`, nothing else.
+- Full suite, 8 parts on `bridgeleads_eligibility_test` (pre-rebase, main `9ee0fac9`):
+  **5240 passed, 0 failed** (425 + 654 + 711 + 795 + 811 + 584 + 625 + 635). Part 6 first
+  showed 2 failures in `test_rls_isolation.py`, "permission denied for table results /
+  delivered_records": the known landmine (roles are cluster-scoped, grants per-DB; the fixture
+  grants only on role creation). Verified `has_table_privilege` = false on this DB, applied the
+  documented grant, both passed, and the whole of part 6 re-ran clean. Parts 2 and 3 overlapped
+  once (a foreground timeout moved part 2 to the background); both passed.
+- Rebased onto main `29afc82e` (#379, migration 105, no overlap with these files): test DB
+  upgraded to 105; 140 related tests green (incl. #379's new index test, RLS, batches, 2b-i,
+  Phase A); ruff exit 0; OpenAPI `--check` OK. CI runs the full suite on the PR merge.
+- Security §14: no new input or egress; tenancy unchanged (same evaluator and account rule
+  decide; only the response shape changed); the body is exactly three known fields built through
+  a Pydantic model, so no stack trace / DB error can reach it (key-set assertions); CORS and
+  security headers present on the 402 (test).

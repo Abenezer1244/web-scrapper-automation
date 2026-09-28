@@ -349,7 +349,13 @@ class BridgeScraper:
                 resolved_ua = LEGACY_BROWSER_UA
 
         self._user_agent = resolved_ua
-        await self._open_context()
+        try:
+            await self._open_context()
+        except BaseException:
+            # __aexit__ never runs when __aenter__ raises: close the browser,
+            # Playwright and the egress proxy here instead of leaking them.
+            await self.__aexit__(None, None, None)
+            raise
 
         # Log the resolved identity every startup: this is the evidence trail
         # when Playwright changes browser packaging again (1.57 moved Chromium
@@ -447,8 +453,11 @@ class BridgeScraper:
                 await self._playwright.stop()
         except Exception as exc:
             _logger.warning("playwright.stop failed (leak risk): %s", str(exc)[:120])
-        self._playwright = None
-        await self._stop_egress_proxy()
+        finally:
+            # Even when the stop above is cancelled: the proxy's listener must not
+            # outlive the browser it served.
+            self._playwright = None
+            await self._stop_egress_proxy()
 
         self.page = None
         _logger.info("Browser context closed")

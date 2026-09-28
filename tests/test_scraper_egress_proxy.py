@@ -42,19 +42,23 @@ class _LoopbackAdmittingProxy(_AnyPortProxy):
         return await super()._connect(host, port)
 
 
-async def _socks_connect(proxy_port: int, host: str, port: int, *, cmd: int = 1):
+async def _socks_connect(
+    proxy_port: int, host: str, port: int, *, cmd: int = 1, reserved: int = 0
+):
     """A minimal SOCKS5 client: returns (reply_code, reader, writer)."""
     reader, writer = await asyncio.open_connection("127.0.0.1", proxy_port)
     writer.write(b"\x05\x01\x00")
     await writer.drain()
     assert await reader.readexactly(2) == b"\x05\x00"
-    try:
-        packed = socket.inet_aton(host)
-        addr = b"\x01" + packed
-    except OSError:
-        name = host.encode()
-        addr = b"\x03" + bytes([len(name)]) + name
-    writer.write(b"\x05" + bytes([cmd]) + b"\x00" + addr + struct.pack(">H", port))
+    if ":" in host:
+        addr = b"\x04" + socket.inet_pton(socket.AF_INET6, host)
+    else:
+        try:
+            addr = b"\x01" + socket.inet_aton(host)
+        except OSError:
+            name = host.encode()
+            addr = b"\x03" + bytes([len(name)]) + name
+    writer.write(b"\x05" + bytes([cmd, reserved]) + addr + struct.pack(">H", port))
     await writer.drain()
     reply = await reader.readexactly(10)
     return reply[1], reader, writer
@@ -98,6 +102,34 @@ async def test_an_internal_destination_is_refused_before_any_packet(internal_ech
         await proxy.stop()
     assert code == 0x02  # connection not allowed by ruleset
     assert hits == []
+
+
+@pytest.mark.parametrize("literal", [
+    "::ffff:127.0.0.1",      # IPv4-mapped
+    "64:ff9b::7f00:1",       # NAT64
+    "::1",
+    "64:ff9b::a9fe:a9fe",    # NAT64 metadata
+])
+async def test_ipv6_forms_of_internal_addresses_are_refused(internal_echo, literal):
+    port, hits = internal_echo
+    proxy, proxy_port = await _started(_AnyPortProxy)
+    try:
+        code, _r, w = await _socks_connect(proxy_port, literal, port)
+        w.close()
+    finally:
+        await proxy.stop()
+    assert code == 0x02
+    assert hits == []
+
+
+async def test_a_malformed_request_is_refused():
+    proxy, proxy_port = await _started(EgressProxy)
+    try:
+        code, _r, w = await _socks_connect(proxy_port, "93.184.215.14", 443, reserved=1)
+        w.close()
+    finally:
+        await proxy.stop()
+    assert code == 0x01
 
 
 async def test_a_port_outside_the_allowlist_is_refused():

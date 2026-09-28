@@ -44,8 +44,9 @@ _logger = setup_logger("scraper.egress_proxy")
 ALLOWED_PORTS: frozenset[int] = frozenset({80, 443, 8080, 8443})
 
 _HANDSHAKE_TIMEOUT = 10.0
-_CONNECT_TIMEOUT = 15.0
-_IDLE_TIMEOUT = 120.0
+_CONNECT_TIMEOUT = 15.0  # resolve + connect, all answers together
+_IDLE_TIMEOUT = 120.0    # a read, or a write the peer will not drain
+_SLOT_TIMEOUT = 1.0      # a client waits this long for a free slot, then is closed
 _MAX_CONNECTIONS = 256
 _CHUNK = 64 * 1024
 
@@ -100,17 +101,21 @@ class EgressProxy:
         task = asyncio.current_task()
         if task is not None:
             self._tasks.add(task)
+        acquired = False
         try:
-            if self._slots.locked():
-                writer.close()
-                return
-            async with self._slots:
-                await self._serve(reader, writer)
+            try:
+                await asyncio.wait_for(self._slots.acquire(), _SLOT_TIMEOUT)
+                acquired = True
+            except TimeoutError:
+                return  # full: close rather than queue (a slow client cannot pile up)
+            await self._serve(reader, writer)
         except asyncio.CancelledError:
             pass
         except Exception as exc:  # noqa: BLE001 — one bad client must not take the proxy down
             _logger.debug("egress proxy client error: %s", str(exc)[:120])
         finally:
+            if acquired:
+                self._slots.release()
             writer.close()
             if task is not None:
                 self._tasks.discard(task)
@@ -149,14 +154,17 @@ class EgressProxy:
         writer.write(b"\x05\x00")
         await writer.drain()
 
-        version, cmd, _reserved, atyp = await reader.readexactly(4)
-        if version != 5:
-            raise ValueError("not SOCKS5")
+        version, cmd, reserved, atyp = await reader.readexactly(4)
+        if version != 5 or reserved != 0:
+            raise _RefusedError(_GENERAL_FAILURE, "malformed request")
         if atyp == 0x01:
             host = str(ipaddress.IPv4Address(await reader.readexactly(4)))
         elif atyp == 0x03:
             length = (await reader.readexactly(1))[0]
-            host = (await reader.readexactly(length)).decode("idna").rstrip(".").lower()
+            try:
+                host = (await reader.readexactly(length)).decode("idna").rstrip(".").lower()
+            except UnicodeError as exc:
+                raise _RefusedError(_GENERAL_FAILURE, "undecodable host") from exc
         elif atyp == 0x04:
             host = str(ipaddress.IPv6Address(await reader.readexactly(16)))
         else:
@@ -171,12 +179,16 @@ class EgressProxy:
     async def _connect(self, host: str, port: int):
         if port not in self._allowed_ports:
             raise _RefusedError(_NOT_ALLOWED, f"port {port} is not allowed")
+        try:
+            return await asyncio.wait_for(self._resolve_and_dial(host, port), _CONNECT_TIMEOUT)
+        except TimeoutError as exc:
+            raise _RefusedError(_HOST_UNREACHABLE, "resolve/connect timed out") from exc
+
+    async def _resolve_and_dial(self, host: str, port: int):
         loop = asyncio.get_running_loop()
         try:
-            infos = await asyncio.wait_for(
-                loop.getaddrinfo(host, port, type=socket.SOCK_STREAM), _CONNECT_TIMEOUT
-            )
-        except (OSError, TimeoutError) as exc:
+            infos = await loop.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        except OSError as exc:
             raise _RefusedError(_HOST_UNREACHABLE, "could not resolve") from exc
         if not infos:
             raise _RefusedError(_HOST_UNREACHABLE, "no address")
@@ -189,13 +201,16 @@ class EgressProxy:
                 raise _RefusedError(_NOT_ALLOWED, "resolves to a blocked address")
 
         last: Exception | None = None
-        for family, _type, _proto, _canon, sockaddr in infos:
+        for family, socktype, proto, _canon, sockaddr in infos:
+            # Our own socket, connected to the exact sockaddr checked above: nothing
+            # between the check and the connect can resolve the name again.
+            sock = socket.socket(family, socktype, proto)
+            sock.setblocking(False)
             try:
-                return await asyncio.wait_for(
-                    asyncio.open_connection(host=sockaddr[0], port=sockaddr[1], family=family),
-                    _CONNECT_TIMEOUT,
-                )
-            except (OSError, TimeoutError) as exc:
+                await loop.sock_connect(sock, sockaddr)
+                return await asyncio.open_connection(sock=sock)
+            except OSError as exc:
+                sock.close()
                 last = exc
         raise _RefusedError(_HOST_UNREACHABLE, f"connect failed: {type(last).__name__}")
 
@@ -215,7 +230,7 @@ class EgressProxy:
                 if not data:
                     break
                 writer.write(data)
-                await writer.drain()
+                await asyncio.wait_for(writer.drain(), _IDLE_TIMEOUT)
         except (TimeoutError, ConnectionError, OSError):
             pass
         finally:

@@ -265,3 +265,24 @@ async def test_a_celery_retry_after_a_download_failure_still_ingests(
     assert out["hits"] == 1
     assert len(attempts) == 2
     assert _queue(qid)[0] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_an_adopted_queue_recorded_at_zero_takes_the_providers_count(starter_user, provider):
+    """Reconciliation adopts a queue while Tracerfy still hides its count, so it is
+    stored as 0. The provider's full count must then bill the unmatched row."""
+    qid = _next_queue_id()
+    _seed(starter_user.id, qid, _TWO_ADDRESSES)
+    with system_sync_session() as db:
+        db.execute(
+            text("UPDATE skip_trace_queues SET rows_uploaded = 0 WHERE tracerfy_queue_id = :q"),
+            {"q": qid},
+        )
+        db.commit()
+    provider(_csv(_ONE_HIT), _complete(qid, 2))
+    before = _usage(starter_user.id)
+
+    ingest_tracerfy_batch(queue_id=qid, download_url=DOWNLOAD_URL)
+
+    assert _queue(qid) == ("completed", 2)
+    assert _usage(starter_user.id) - before == 2

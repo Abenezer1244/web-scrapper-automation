@@ -604,7 +604,7 @@ def ingest_tracerfy_batch(
     SkipTraceQueue row (see the on_failure hook below) so ops can see what
     happened and the reconciler's redrive sweep stops re-enqueueing it.
     """
-    from sqlalchemy import func, select, tuple_, update
+    from sqlalchemy import select, tuple_, update
 
     from src.db.models import (
         PendingSkipTraceRow,
@@ -997,14 +997,11 @@ def ingest_tracerfy_batch(
                 status="completed",
                 download_url=download_url,
                 completed_at=now,
-                # Never raised by the webhook: it can only report rows Tracerfy
-                # dropped (fewer uploaded bills fewer rows, see
-                # skip_trace_usage), never claim more than the submission
-                # recorded. A body that says more would bill customers for
-                # lookups never made (audit #3/#5, S3-15).
-                rows_uploaded=func.least(
-                    func.coalesce(SkipTraceQueue.rows_uploaded, rows_uploaded), rows_uploaded
-                ),
+                # Tracerfy's own record, never the webhook body (audit #5,
+                # S3-15). Written as given: an adopted queue was recorded while
+                # the provider still hid the count (0), so a clamp against the
+                # stored value would under-bill it.
+                rows_uploaded=rows_uploaded,
                 credits_deducted=credits_deducted,
             )
         )

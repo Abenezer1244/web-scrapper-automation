@@ -13,14 +13,15 @@ deploy (BE `main` → Railway api/worker/beat, FE `master` → Vercel). 9. Verif
 Audit source: FE repo `C:/Users/Windows/bl-wt/fe-ux-audit/docs/ux-audit/UX-AUDIT.md` (49 findings) and
 `phase-3.0-contracts.md` (Q1–Q6). Project rules: `CLAUDE.md` + `.claude/rules/*`.
 
-## Where you are
-- **Repo:** backend `web-scrapper-automation`. **Worktree:** `C:/Users/Windows/bl-wt/eligibility`.
-- **Branch:** `feat/run-eligibility-2b-ii`, rebased on `origin/main` `f80f79ce`, pushed, HEAD `e115cbec`
-  (plus this handoff commit).
-- **PR #375** open: https://github.com/Abenezer1244/web-scrapper-automation/pull/375 — CI not yet
-  checked, NOT merged. Codex: plan GO (round 4), diff GATE: PASS (round 3).
-- **Owner approved:** Phase A build ("Yess proceed"). Phase B: owner said proceed after I recommended
-  the ADDITIVE envelope; treat that as a lean, and **confirm with the owner when Phase B's plan is ready**.
+## Where you are (updated 2026-09-28)
+- **2b-ii Phase A is LIVE:** BE **#375** `ae351c4e` merged after a quiet check (api/worker/beat
+  SUCCESS; evaluator read-only over all 121 prod configs: 87 can_run + 34 config_inactive, 0
+  errors). **FE #167** `54bc200` merged, Vercel SUCCESS; prod verified in the owner's tab: 68/68
+  rows valid under the full contract, DOM = the page's rule, 0 console errors.
+  Journal entry: `docs/BUILD_JOURNAL.md` 2026-09-28.
+- **NEXT = Phase B** (below). Owner leaned ADDITIVE envelope; **confirm with the owner when Phase
+  B's plan is ready**. Work from a fresh branch off `origin/main` (worktree
+  `C:/Users/Windows/bl-wt/eligibility`, test DB `bridgeleads_eligibility_test`).
 
 ## Queue status
 | # | Item | Status |
@@ -28,36 +29,28 @@ Audit source: FE repo `C:/Users/Windows/bl-wt/fe-ux-audit/docs/ux-audit/UX-AUDIT
 | 1 | F-042/F-041 session reads | ✅ LIVE (FE #164) |
 | 2a | F-003/Q5 one active run per scraper | ✅ LIVE (BE #367 mig 104, FE #165) |
 | 2b-i | Q6 account-level `run_eligibility` on `/billing/usage` | ✅ LIVE: BE #369 `cd755883`, FE #166 `8fb25a9`, journal BE #371. Prod verified: all 7 users read-only, 0 errors; owner-authenticated `GET /billing/usage` 200s in api logs; Billing page renders "Agency 4,516 / ∞ · resets Oct 1" |
-| **2b-ii A** | **per-scraper `run_eligibility` on GET /scrapers + POST /jobs through one evaluator** | **PR #375 open** |
-| 2b-ii B | structured 402 envelope for AI-limit + account 402s | plan outline only (see below) |
-| 2b-ii FE | Run now disabled with reason; frozen 402 → "Update payment" | after BE #375 merges |
+| 2b-ii A | per-scraper `run_eligibility` on GET /scrapers + POST /jobs through one evaluator | ✅ LIVE BE #375 `ae351c4e` |
+| 2b-ii FE | Run now disabled with reason (+ list no longer blanks on a failed poll) | ✅ LIVE FE #167 `54bc200` |
+| **2b-ii B** | **structured 402 envelope for AI-limit + account 402s; FE frozen 402 → "Update payment"** | **NEXT: plan outline only (see below)** |
 | 2c | Q1 run-count breakdown (migration) | queued |
 | 2d | Q2 `already_delivered` on JobResponse | queued |
 | 2e | Q4 "Lookup failed" vs "not available" | queued |
 | 3–5 | batches B–E, F-043 Phase 2, Phase 4/5 | queued |
 
 ## Next step (in order)
-1. `gh pr checks 375` / `gh pr view 375 --json statusCheckRollup` until done (`gh pr checks` can show
-   "pending 0" — use the rollup). CI runs the FULL suite on the PR merge. If red: read the log, fix.
-2. `git fetch` — if `origin/main` moved, rebase, re-run the related tests, re-push. Reviews that predate
-   a rebase don't cover it.
-3. Quiesce (read-only), then merge #375: `railway run` from the MAIN repo dir (linked; this worktree is
-   not) with scratchpad script `inflight_check.py` (recreate: non-terminal `jobs`, `batch_runs` in
-   pending/running, `alembic_version`; `DATABASE_URL_MIGRATE`, `set_session(readonly=True)`). No
-   migration in #375. Merge only if quiet. Then `railway deployment list --service api|worker|beat`
-   until SUCCESS, `curl https://api.bridgeleads.io/health`.
-4. Prod verify: the owner logs in via Chrome (claude-in-chrome; never type credentials — ask them to
-   click Sign in + MFA), open `/scrapers`; check api logs for `GET /scrapers` 200 and no
-   ResponseValidationError; optionally run `config_run_eligibility` read-only over prod configs.
-5. FE follow-up PR in `C:/Users/Windows/bl-wt/fe-session` from `origin/master`: regen types from BE
-   main (`git show origin/main:schema/openapi.json > tmp; npx openapi-typescript tmp -o
-   lib/api-types.generated.ts` — `npm run gen:api-types` 404s, private repo), add
-   `run_eligibility` to the FE scraper type, disable Run now with `run_eligibility.message`
-   (run_in_flight → "View live run" to `/live/{job_id}`), `tsc --noEmit` + `eslint . --quiet`
-   (check the real exit codes), Codex review, merge, verify.
-6. Phase B: write its own plan (below), Codex until GO, **stop for the owner** (confirm additive vs
-   object `detail`).
-7. Append a `docs/BUILD_JOURNAL.md` entry for 2b-ii (newest on top, format at the file's head).
+1. Phase B: investigate, write its own plan (outline below), Codex until PLAN: GO, **stop for the
+   owner** (confirm additive vs object `detail`). Then build, real-DB tests RED on unfixed code,
+   full suite (8 parts), §14, Codex diff GATE: PASS, quiesce, merge, prod verify, FE PR.
+2. How the last merges were done (reuse): quiesce = `railway run --service worker <venv python>
+   C:/Users/Windows/bl-checks/quiet.py` from the OneDrive repo (linked) plus a read-only check of
+   `batch_runs` pending/running and `alembic_version`; merge with `--match-head-commit`; verify
+   `railway status --json` shows the merge SHA on api/worker/beat. FE types: `git -C <BE> show
+   <sha>:schema/openapi.json > tmp; npx --no-install openapi-typescript tmp -o
+   lib/api-types.generated.ts`. FE render proof: scratchpad stub `elig_stub.mjs` +
+   `elig_verify.mjs` (session 5ab04918 scratchpad), `.env.local` pointing at the stub, `next build`
+   + `next start -p 3111`; delete `.env.local` after.
+3. Prod FE verify without a server token: in the owner's tab, read the bearer from
+   `/api/auth/session` in-page (as `lib/api.ts` does), call the API in-page, return counts only.
 
 ## 2b-ii Phase A — what the PR contains
 Files (all on the branch):

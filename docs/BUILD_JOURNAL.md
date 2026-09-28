@@ -19,6 +19,71 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-28 — Run now asks the gate (Q6 2b-ii), and a poll that could blank the page
+
+> Two merges, both live. BE **#375** `ae351c4e` (per-scraper `run_eligibility`, no migration)
+> and FE **#167** `54bc200` (Scrapers page reads it). Plans and full Codex records:
+> `tasks/todo-run-eligibility-2b-ii.md` (BE) and FE `tasks/todo-run-eligibility-2b-ii-fe.md`.
+
+**Built / Shipped:**
+- **BE #375.** `src/api/config_eligibility.py`: one evaluator, `config_run_eligibility`, decides
+  both `POST /jobs` and the new `run_eligibility` on `GET /scrapers` / `GET /scrapers/{id}`,
+  so the page and the gate cannot disagree. Codes in gate order: `run_in_flight`, `not_entitled`,
+  `ai_limit`, `frozen|ended|over_limit` (`config_inactive` page-only). Refusal bodies unchanged
+  byte for byte (parity tests). `pick_connector` in `registry.py` gives worker and evaluator ONE
+  deterministic connector choice. Merged after a read-only quiesce (0 in-flight jobs, 0 active
+  batch runs, 0 long transactions, alembic 104); api/worker/beat SUCCESS on `ae351c4e`.
+- **FE #167.** A blocked scraper shows Run now disabled with the backend's reason and the fix
+  that applies ("Update payment" for frozen, never "Upgrade"; "Resubscribe"; "Upgrade plan";
+  "Resets Oct 1 (UTC)."). Running job = Watch; null/absent = unknown = clickable. The list polls
+  every 5 s; a refused click refetches it. Types regenerated from `ae351c4e`, which also turned
+  the FE drift gate green again (#375's schema change had turned it red for every FE PR).
+
+**Tried / Decided:**
+- Refusal bodies deliberately NOT changed in Phase A: the owner-approved plan says "Phase A moves
+  no refusal". The structured 402 envelope is Phase B (additive: keep `detail` prose, add
+  top-level `code` + `resumes_at`, so API-key clients reading `detail` keep working).
+- The reset date is formatted with `formatUtcDate` and says "(UTC)": the AI limit lifts at
+  00:00 UTC on the 1st, which is the evening before in the Americas; `formatDate` would show a
+  day early in Pacific.
+- Codex P3 "pin the generator in CI" declined with evidence: CI runs `npm ci` before `npx`, and
+  npx resolves the lockfile-pinned local 7.13.0.
+
+**Failed / Blocked:**
+- The stub-rig console check failed once on an Auth.js "Failed to fetch" right after login. It
+  is NOT this change: an A/B over 5 identical runs gave branch 3/5, unmodified `origin/master`
+  1/5 (a session fetch aborted by the driver's immediate navigation). Recorded, not chased.
+- A Python patch script that inserted `"\\n"` into a JS file wrote a literal newline (a
+  SyntaxError in the rig driver). Edit JS through the Edit tool, not a Python string.
+
+**Caught & fixed:**
+- **A background poll failure blanked the Scrapers list (pre-existing, made worse by polling).**
+  The page rendered `isError ? <ErrorState>`; in TanStack Query v5 a failed BACKGROUND refetch
+  sets `isError` while cached rows remain. With the new 5 s poll, one failed poll would have
+  replaced every row with the error screen. Codex caught it at plan round 3. Now ErrorState only
+  without data; cached rows stay with a status line; eligibility counts as unknown meanwhile.
+- **A failed jobs poll hid every Run now / Watch** (`isSuccess` goes false on a refetch error).
+  Now "jobs loaded at least once".
+- BE latent bug (#375): AI usage was judged by an unordered `.first()` over a county-wide join,
+  so a manual run in a mixed county could count as AI (reproduced: 402 "50/50" on the old gate).
+  No prod county is mixed, so no live refusal moved.
+
+**Pending / Handoff:**
+- Phase B: structured 402 envelope (plan, Codex, owner decision), then FE `toastError` routes a
+  frozen 402 to "Update payment" (wizard / quick start still show the neutral "Manage billing").
+- Queued from Phase A: `connector_unavailable` refusal; `jobs.was_ai` snapshot (migration).
+- Seen in passing: with `/analytics/summary` failing (stub 404) the DASHBOARD logs "Cannot read
+  properties of undefined (reading 'title')"; and on `/scrapers` a long record-type label
+  ("Code violation (Seattle, Bellevue, ...)") squeezes the row so the record count overlaps
+  the metadata at ~1300 px (visible on prod before and after #167).
+
+**Facts learned:**
+- Prod verification without a server-side token: in the owner's tab, read the bearer from the
+  next-auth session JSON (as `lib/api.ts` does), call the API in-page and return only counts.
+  #167: 68/68 rows valid under the full wire contract, DOM matched the page's rule exactly.
+- `git diff origin/main...HEAD` (three dots) was used for every Codex diff round; `origin/main`
+  moved to `bca09eff` during FE work without a schema change (drift check still exit 0).
+
 ## 2026-09-27 — The spend cap's keyset refill (1b-1b-ii-c-2), and Alembic can no longer reach production from a test
 
 > Two merges, both live. BE **#366** `2e839076` (ii-c-2, no migration; 103 shipped in #365) and

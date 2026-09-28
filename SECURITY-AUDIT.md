@@ -217,3 +217,64 @@ CGNAT limiter reproduction (S3-04), and the origin bypass (S3-06). No Codex find
 - Tracerfy's charging behaviour on 5xx (S3-39) and Stripe live portal/coupon configuration.
 - Linux-only dependency `uvloop` (pip-audit ran on Windows).
 - Whether anyone read data with the Cloudflare token before deletion.
+
+---
+
+# Audit #5 (2026-09-28): delta `ee601b55..29afc82e` + open-queue re-confirmation
+
+Scope chosen by the owner: every source change since audit #4 (backend: #373 local-env, #375 run
+eligibility, #376 dispatcher interval, #379 migration 105; frontend bridgeleads-web #165-#167), all
+18 checks applied to that delta, plus re-confirmation of every open finding at `29afc82e`. Claude and
+Codex reviewed independently (`tasks/audit5/delta-claude.md`, `tasks/audit5/delta-codex.md`). No
+production data was read or changed; the only production access was a boolean-only read of one flag.
+
+**Placement note:** this section is appended at the end so it merges cleanly with PR #374, which
+inserts the Audit #4 section at the top of this file.
+
+## Status of the unmerged audit #4 fixes
+
+- **PR #374** (S3-03 / S4-01, trial skip-trace gate): OPEN, NOT merged, still merges into current main
+  with no conflict. Until it merges, S3-03 (P1) is LIVE in production.
+- **PR #378** (S4-03, batch/segment CSV exports in the `export` zone): OPEN, NOT merged, merges cleanly.
+
+## New findings
+
+| ID | Sev | Category | Location | Evidence | Prereq | Impact | Remediation | Regression test | Status |
+|---|---|---|---|---|---|---|---|---|---|
+| D5-01 | P3 | Plan entitlement | src/workers/scheduler_helpers/dispatch.py:126,379; src/workers/batch_tasks.py:147; src/api/routes/batches.py:274 | `AI_JOB_LIMITS` read only in `config_eligibility.py`; scheduled and batch paths apply the account rule only | a Starter/Pro account with an ai-mode county | more "AI" runs than the plan lists; ai mode is template detection (no LLM spend), record quota still enforced | apply the AI monthly cap in the scheduler and batch dispatch through `config_run_eligibility` | scheduled/batch run over the AI cap is refused | CONFIRMED, pre-existing |
+| D5-02 | P3 | Fail-open default | src/config/settings.py:194 | `ENTITLEMENT_ENFORCEMENT: bool = False`; production api AND worker read `true` today (boolean-only read, 2026-09-28) | a new service or env that misses the variable | county/record-type gates audit-only there | default `True` when `ENVIRONMENT=production`, or refuse to boot in production without it set | production settings without the var enforce | CONFIRMED (hardening); Codex CX5-01 rated this P1 from the code default alone, rejected as a live P1 because production sets it |
+
+## Codex vs Claude
+
+| Codex | Claude | Outcome |
+|---|---|---|
+| CX5-01 P1 entitlement enforcement off by default | not flagged | Re-verified: production api and worker have it ON. Downgraded to D5-02 P3 (fail-open default), reasoning recorded above. This is the known repo-only-review blind spot (flag defaults are not production values). |
+| CX5-02 P2 dialer outbox + `safe_http` validate then fetch on an unpinned Requests session | S3-08 PRESENT | Agree. Read `src/workers/dialer_outbox.py:40,255` and `src/utils/safe_http.py:122-134`: validation resolves, then a separate `requests.Session` resolves again (DNS-rebinding TOCTOU). Generic webhook delivery now uses `pinned_session`. S3-08 narrowed to these two paths, P2. |
+| CX5-03 P1 Playwright guard fails open | S3-14 PRESENT (P2 in audit #3) | Agree it is present (`base_scraper.py:458-460` returns True on any non-ValueError, e.g. a DNS failure the attacker's resolver can induce before Chromium's own lookup). Docs are silent on severity, so Codex's higher rating wins: **S3-14 is now P1**. |
+| CX5-04 P2 legacy Tracerfy path-secret route | S3-16 PRESENT, mitigated | Agree. `main.py:132` scrubs uvicorn access lines only; Railway's edge still logs the path. Removal needs Tracerfy to send the header (external). |
+| CX5-05 P2 PII JSON views in `general` zone | S4-07 PRESENT | Agree. |
+| CX5-06 P2 reservation clock before lock | S4-06 PRESENT | Agree. |
+| S4-02 FIXED | S4-02 PRESENT | Codex is wrong: `models.py:817-844` is unchanged since audit #4 (only an index was added). A fixed 300 s cooldown IS the S4-02 finding (a cancelled worker can outlive it). Stays P2. |
+
+No confirmed IDOR/BOLA, admin-authz, SQL injection, migration-grant, secret, XSS, CSRF, or CORS issue in the delta (both reviewers).
+
+## Open queue at 29afc82e (after reconciliation)
+
+| ID | Sev | Status |
+|---|---|---|
+| S3-03 / S4-01 | P1 | FIXED on #374, NOT merged (live in prod) |
+| S3-14 | **P1** (raised) | PRESENT |
+| S3-04 | P1 | PRESENT (needs Cloudflare sole ingress, owner) |
+| S3-08 | P2 | PRESENT, narrowed to `safe_http` + `dialer_outbox` |
+| S3-15 | P2 | PRESENT (`tracerfy_ingest.py:440` accepts http) |
+| S3-16 | P2 | PRESENT, mitigated (external dependency) |
+| S4-02 | P2 | PRESENT |
+| S4-03 | P2 | FIXED on #378, NOT merged |
+| S4-06 | P2 | PRESENT |
+| S4-07 | P2 | PRESENT |
+| D5-01, D5-02 | P3 | NEW |
+
+## Unverified in audit #5
+
+- `.env.example` (2 changed lines): a permission rule blocks this session from reading it. It ships in the image (`.dockerignore:31`); the owner should confirm both lines are placeholders.
+- Everything listed as unverified in audit #3 (live authenticated prod behaviour, DB grants, R2 CORS) was not re-tested; the delta did not touch those surfaces.

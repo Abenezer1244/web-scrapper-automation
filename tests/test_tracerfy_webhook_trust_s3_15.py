@@ -122,7 +122,11 @@ async def test_after_the_last_recheck_it_pages_ops_and_still_does_not_error(star
 
 
 @pytest.mark.asyncio
-async def test_an_unreachable_provider_is_retried_not_trusted(starter_user, provider, monkeypatch):
+async def test_an_unreachable_provider_defers_and_never_trusts_the_body(
+    starter_user, provider, monkeypatch
+):
+    """An outage is neither a reason to fall back to the body nor to mark a genuine
+    batch errored: nothing fetched, nothing billed, still 'pending'."""
     qid = _next_queue_id()
     _seed(starter_user.id, qid, _TWO_ADDRESSES)
     fetched = provider(_csv(_ONE_HIT))
@@ -131,9 +135,45 @@ async def test_an_unreachable_provider_is_retried_not_trusted(starter_user, prov
         raise TracerfyError("Tracerfy returned 503 for queue list")
 
     monkeypatch.setattr("src.scrapers.enrichment.skip_trace.fetch_queues", _down)
-    with pytest.raises(TracerfyError):
-        ingest_tracerfy_batch.run(queue_id=qid, download_url=DOWNLOAD_URL, rows_uploaded=2)
+    out = ingest_tracerfy_batch(queue_id=qid, download_url=DOWNLOAD_URL, rows_uploaded=2)
+
+    assert out["deferred"] == "provider_not_complete"
     assert fetched == []
+    assert _queue(qid)[0] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_repeated_webhooks_share_one_recheck_chain(starter_user, provider, monkeypatch):
+    """Each forged webhook used to start its own chain of provider calls."""
+    qid = _next_queue_id()
+    _seed(starter_user.id, qid, _TWO_ADDRESSES)
+    provider(_csv(_ONE_HIT), {"id": qid, "pending": True, "download_url": None})
+    scheduled: list[dict] = []
+    monkeypatch.setattr(ingest_tracerfy_batch, "apply_async", lambda **kw: scheduled.append(kw))
+
+    for _ in range(3):
+        out = ingest_tracerfy_batch(queue_id=qid, download_url=DOWNLOAD_URL, rows_uploaded=2)
+        assert out["deferred"] == "provider_not_complete"
+
+    assert len(scheduled) == 1
+    assert scheduled[0]["kwargs"]["provider_rechecks"] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_failing_ops_alert_does_not_fail_the_task(starter_user, provider, monkeypatch):
+    qid = _next_queue_id()
+    _seed(starter_user.id, qid, _TWO_ADDRESSES)
+    provider(_csv(_ONE_HIT))
+
+    def _alert_down(*a, **k):
+        raise RuntimeError("mail provider down")
+
+    monkeypatch.setattr("src.workers.ops_alerts.send_ops_alert", _alert_down)
+    out = ingest_tracerfy_batch(
+        queue_id=qid, download_url=DOWNLOAD_URL, rows_uploaded=2, provider_rechecks=5
+    )
+
+    assert out["skipped"] == "provider_not_complete"
     assert _queue(qid)[0] == "pending"
 
 

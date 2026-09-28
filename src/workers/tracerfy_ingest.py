@@ -480,7 +480,7 @@ def _url_host(url) -> str:
 def _provider_queue_record(queue_id: int) -> dict | None:
     """Tracerfy's own record of ``queue_id`` when it shows the queue complete with a
     download URL; None when the queue is absent or not complete there. Raises
-    TracerfyError when the provider cannot be asked (autoretry handles it)."""
+    TracerfyError when the provider cannot be asked."""
     from src.scrapers.enrichment.skip_trace import fetch_queues
 
     for queue in fetch_queues():
@@ -495,9 +495,29 @@ def _provider_queue_record(queue_id: int) -> dict | None:
     return None
 
 
+def _claim_recheck_chain(queue_id: int) -> bool:
+    """One re-check chain per queue at a time, so repeated (forged) webhooks cannot
+    multiply provider API calls. True if this trigger may start one. Fails open: a
+    Redis problem must not stop a genuine batch from being re-checked."""
+    try:
+        import redis as sync_redis
+
+        client = sync_redis.from_url(settings.REDIS_URL, **settings.redis_kwargs())
+        ttl = (_PROVIDER_RECHECKS + 1) * _PROVIDER_RECHECK_SECONDS + 60
+        return bool(client.set(f"tracerfy:ingest-recheck:{queue_id}", "1", nx=True, ex=ttl))
+    except Exception as exc:  # noqa: BLE001 — availability over amplification
+        _logger.warning("recheck-chain claim failed for queue %d: %s", queue_id, str(exc)[:120])
+        return True
+
+
 def _defer_until_provider_complete(queue_id: int, download_url: str, rechecks: int) -> dict:
-    """Re-check a queue the provider does not yet show complete, a bounded number of
-    times, then page ops. Never marks the queue errored."""
+    """Re-check a queue the provider does not (yet) show complete, a bounded number of
+    times, then page ops. Never raises and never marks the queue errored."""
+    if rechecks == 0 and not _claim_recheck_chain(queue_id):
+        _logger.info(
+            "Tracerfy ingest queue %d: a provider re-check is already scheduled", queue_id
+        )
+        return {"queue_id": queue_id, "deferred": "provider_not_complete"}
     if rechecks < _PROVIDER_RECHECKS:
         try:
             ingest_tracerfy_batch.apply_async(
@@ -518,17 +538,24 @@ def _defer_until_provider_complete(queue_id: int, download_url: str, rechecks: i
                 "Tracerfy ingest queue %d: could not schedule a provider re-check: %s",
                 queue_id, str(exc)[:120],
             )
-    from src.workers.ops_alerts import send_ops_alert
+    try:
+        from src.workers.ops_alerts import send_ops_alert
 
-    send_ops_alert(
-        "skip_trace", f"ingest_provider_incomplete_{queue_id}",
-        "Skip-trace webhook for a batch Tracerfy does not show complete",
-        f"A completion webhook arrived for Tracerfy queue {queue_id}, but Tracerfy's "
-        f"own queue list still does not show it complete with a download URL after "
-        f"{rechecks} re-check(s). Nothing was ingested or billed. If the batch is "
-        f"genuinely complete, re-run ingest for it once the provider record shows "
-        f"it; if not, the webhook was premature or forged.",
-    )
+        send_ops_alert(
+            "skip_trace", f"ingest_provider_incomplete_{queue_id}",
+            "Skip-trace webhook for a batch Tracerfy does not show complete",
+            f"A completion webhook arrived for Tracerfy queue {queue_id}, but Tracerfy's "
+            f"own queue list did not show it complete with a download URL (or could not "
+            f"be reached) after {rechecks} re-check(s). Nothing was ingested or billed "
+            f"and the queue is still 'pending'. If the batch is genuinely complete, "
+            f"re-run ingest for it once the provider record shows it; if not, the "
+            f"webhook was premature or forged.",
+        )
+    except Exception as exc:  # noqa: BLE001 — never turn this into a task failure
+        _logger.error(
+            "Tracerfy ingest queue %d: provider never showed it complete, and the ops "
+            "alert failed: %s", queue_id, str(exc)[:120],
+        )
     return {"queue_id": queue_id, "skipped": "provider_not_complete"}
 
 
@@ -624,11 +651,19 @@ def ingest_tracerfy_batch(
     # result URL would pass. So the download URL and the counts come only from
     # Tracerfy's own record of this queue. A TracerfyError (API unreachable)
     # propagates to autoretry.
-    remote = _provider_queue_record(queue_id)
+    try:
+        remote = _provider_queue_record(queue_id)
+    except TracerfyError as exc:
+        # Unreachable is not a reason to trust the body, nor to mark a genuine batch
+        # errored: defer like an incomplete record, then page ops.
+        _logger.warning(
+            "Tracerfy ingest queue %d: provider record unavailable: %s", queue_id, str(exc)[:120]
+        )
+        remote = None
     if remote is None:
-        # Not complete at the provider: a premature or forged webhook. Never an
-        # error (a forged one must not burn a real batch's retries into 'errored');
-        # look again shortly, in case the record lags a genuine webhook.
+        # Not complete at the provider (or not reachable): a premature or forged
+        # webhook, or an outage. Never an error (a forged one must not burn a real
+        # batch's retries into 'errored'); look again shortly.
         return _defer_until_provider_complete(queue_id, download_url, provider_rechecks)
     download_url = remote["download_url"]
     rows_uploaded = _count(remote.get("rows_uploaded"))

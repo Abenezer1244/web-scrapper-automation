@@ -243,6 +243,7 @@ inserts the Audit #4 section at the top of this file.
 |---|---|---|---|---|---|---|---|---|---|
 | D5-01 | P3 | Plan entitlement | src/workers/scheduler_helpers/dispatch.py:126,379; src/workers/batch_tasks.py:147; src/api/routes/batches.py:274 | `AI_JOB_LIMITS` read only in `config_eligibility.py`; scheduled and batch paths apply the account rule only | a Starter/Pro account with an ai-mode county | more "AI" runs than the plan lists; ai mode is template detection (no LLM spend), record quota still enforced | apply the AI monthly cap in the scheduler and batch dispatch through `config_run_eligibility` | scheduled/batch run over the AI cap is refused | CONFIRMED, pre-existing |
 | D5-02 | P3 | Fail-open default | src/config/settings.py:194 | `ENTITLEMENT_ENFORCEMENT: bool = False`; production api AND worker read `true` today (boolean-only read, 2026-09-28) | a new service or env that misses the variable | county/record-type gates audit-only there | default `True` when `ENVIRONMENT=production`, or refuse to boot in production without it set | production settings without the var enforce | CONFIRMED (hardening); Codex CX5-01 rated this P1 from the code default alone, rejected as a live P1 because production sets it |
+| D5-03 | P1 (Codex rating, adopted) | Browser egress containment | src/scrapers/base_scraper.py (whole browser) | 5a Codex diff review r1: after 5a, TCP channels no Playwright route sees remain (WebRTC TURN-over-TCP/TLS, speculative preconnect), and every browser request is check-then-use: Python resolves, Chromium resolves again (DNS rebinding) | hostile county page content, or a rebinding DNS name on a scraped link | a request from the worker, which holds every secret, to an internal address | route Chromium through a local validating egress proxy (`--proxy-server` to an in-worker CONNECT proxy that resolves once, checks the IP, and dials that IP), or an egress firewall on the worker; relates to S3-13 | a rebinding name and a TURN-over-TCP candidate to loopback both refused at the proxy | CONFIRMED residual, pre-existing, needs a design decision |
 
 ## Codex vs Claude
 
@@ -250,31 +251,62 @@ inserts the Audit #4 section at the top of this file.
 |---|---|---|
 | CX5-01 P1 entitlement enforcement off by default | not flagged | Re-verified: production api and worker have it ON. Downgraded to D5-02 P3 (fail-open default), reasoning recorded above. This is the known repo-only-review blind spot (flag defaults are not production values). |
 | CX5-02 P2 dialer outbox + `safe_http` validate then fetch on an unpinned Requests session | S3-08 PRESENT | Agree. Read `src/workers/dialer_outbox.py:40,255` and `src/utils/safe_http.py:122-134`: validation resolves, then a separate `requests.Session` resolves again (DNS-rebinding TOCTOU). Generic webhook delivery now uses `pinned_session`. S3-08 narrowed to these two paths, P2. |
-| CX5-03 P1 Playwright guard fails open | S3-14 PRESENT (P2 in audit #3) | Agree it is present (`base_scraper.py:458-460` returns True on any non-ValueError, e.g. a DNS failure the attacker's resolver can induce before Chromium's own lookup). Docs are silent on severity, so Codex's higher rating wins: **S3-14 is now P1**. |
+| CX5-03 P1 Playwright guard fails open | S3-14 PRESENT (P2 in audit #3) | Present, but the P1 premise does not hold: a DNS failure already fails CLOSED (`security.py:189-193` turns the resolver OSError into ValueError), so the generic `except` is reached only by the guard's own internal errors, which no page controls. The live parts of S3-14 are the channels `context.route` never sees: WebSockets and service workers, both REPRODUCED in real Chromium on main during 5a (`tests/test_scraper_egress_guard.py`). **S3-14 stays P2**, with this reasoning. The residual Codex raised during 5a is split out as D5-03. |
 | CX5-04 P2 legacy Tracerfy path-secret route | S3-16 PRESENT, mitigated | Agree. `main.py:132` scrubs uvicorn access lines only; Railway's edge still logs the path. Removal needs Tracerfy to send the header (external). |
-| CX5-05 P2 PII JSON views in `general` zone | S4-07 PRESENT | Agree. |
+| CX5-05 P2 PII JSON views in `general` zone | S4-07 PRESENT | Present, **re-rated P3 by consensus** (Codex consult during 5c): every view returns only the caller's own rows (user_id filter + RLS); `general` is 60 req/min per user x at most 500 rows = ~30k decrypted rows/min, while the separate `export` zone already allows 20 x 50,000 = ~1M, so moving the views into `export` changes the per-user decrypt ceiling by under 3% and would 429 interactive browsing (the FE pages at 50). No code change. Optional hardening for the owner: a lower JSON `page_size` cap (a public-API contract change, `le=500` in OpenAPI) or a worker-wide concurrency cap on decrypt-heavy requests. |
 | CX5-06 P2 reservation clock before lock | S4-06 PRESENT | Agree. |
 | S4-02 FIXED | S4-02 PRESENT | Codex is wrong: `models.py:817-844` is unchanged since audit #4 (only an index was added). A fixed 300 s cooldown IS the S4-02 finding (a cancelled worker can outlive it). Stays P2. |
 
 No confirmed IDOR/BOLA, admin-authz, SQL injection, migration-grant, secret, XSS, CSRF, or CORS issue in the delta (both reviewers).
 
-## Open queue at 29afc82e (after reconciliation)
+## Open queue at 29afc82e (after reconciliation and the fix phases)
 
 | ID | Sev | Status |
 |---|---|---|
 | S3-03 / S4-01 | P1 | FIXED on #374, NOT merged (live in prod) |
-| S3-14 | **P1** (raised) | PRESENT |
 | S3-04 | P1 | PRESENT (needs Cloudflare sole ingress, owner) |
-| S3-08 | P2 | PRESENT, narrowed to `safe_http` + `dialer_outbox` |
-| S3-15 | P2 | PRESENT (`tracerfy_ingest.py:440` accepts http) |
-| S3-16 | P2 | PRESENT, mitigated (external dependency) |
-| S4-02 | P2 | PRESENT |
+| D5-03 | P1 (Codex rating) | FIXED on branch `fix/security-audit5f-egress-proxy` (5f), stacked on 5a, behind `SCRAPER_EGRESS_PROXY_ENABLED` (default OFF): not effective until turned on |
+| S3-14 | P2 | FIXED on `fix/security-audit5a-browser-egress` (5a) |
+| S3-08 | P2 | FIXED on `fix/security-audit5b-pinned-egress` (5b); PACS / AcclaimWeb / Tracerfy-submit sessions (operator-configured or fixed hosts) remain unpinned, tracked as 5b-ii (P3) |
+| S3-15 | P2 | FIXED on `fix/security-audit5d-tracerfy-webhook-trust` (5d) |
+| S3-16 | P2 | PRESENT, mitigated; its impact is now bounded by 5d (the webhook body is never read, so a forged webhook can only trigger a provider lookup) |
+| S4-02 | P2 | PRESENT (not in the approved phases) |
 | S4-03 | P2 | FIXED on #378, NOT merged |
-| S4-06 | P2 | PRESENT |
-| S4-07 | P2 | PRESENT |
-| D5-01, D5-02 | P3 | NEW |
+| S4-06 | P2 | PRESENT, DEFERRED: the reservation SQL is inline in `run_scrape_job` and the only tests exercise a copy of it, so a meaningful regression test needs the reservation extracted first (own refactor). Not attacker-reachable (needs a quota-window boundary during lock contention). |
+| S4-07 | P3 (re-rated) | PRESENT; no code change, remedy is an owner choice |
+| D5-01 | P3 | PRESENT, DEFERRED: the AI-cap evaluator is async/API-side, the scheduler and batch paths are sync; enforcing it there means duplicating the rule or porting the evaluator, for a mode that costs nothing (template detection). Product decision. |
+| D5-02 | P3 | FIXED on `fix/security-audit5e-hardening` (5e) |
+
+## Fix phases (Phase 2)
+
+Each phase: its own branch and worktree, regression test first and proven to FAIL on
+`origin/main`, Codex diff review until GATE: PASS (every round's findings recorded in the
+commit messages), full local suite on its own `_test` database. Nothing is pushed or merged.
+
+| Phase | Branch (head) | Finding | What changed | Regression proof | Codex |
+|---|---|---|---|---|---|
+| 5a | `fix/security-audit5a-browser-egress` (`8bb274b5`) | S3-14 | context `route_web_socket` guard; `service_workers="block"` on every context; `--disable-quic` + both WebRTC ip-handling switches (headed Chrome ignores the `force-` one); the guard fails closed | `tests/test_scraper_egress_guard.py`, real Chromium: 8/9 fail on main (the 9th is the listener's positive control); REPRODUCED on main: a page opened a WebSocket to a loopback listener and installed a service worker | r1 FAIL (its await P1 was wrong: `connect_to_server` is sync; test-honesty points fixed), r2 PASS |
+| 5b | `fix/security-audit5b-pinned-egress` (`b02f2b07`) | S3-08 | `validate_scraping_target` refuses userinfo and a backslash in the authority (REPRODUCED: `http://evil.example\@portal/` validated as portal, dialled evil.example); `safe_http` and the dialer outbox use `pinned_session()` | `tests/test_egress_pinning_s3_08.py`: 8/11 fail on main | r1 PASS (P2s checked: redirect bodies are already closed; mixed-answer refusal is pre-existing policy) |
+| 5c | none | S4-07 | no code: re-rated P3 by consensus (numbers above) | n/a | consult agreed P3 |
+| 5d | `fix/security-audit5d-tracerfy-webhook-trust` (`7d780354`) | S3-15 | the webhook is a trigger only: download URL and counts come from Tracerfy's own queue record (`GET /v1/api/queues/`); not complete there or unreachable = bounded re-check (5 x 120 s, one chain per queue, Redis claim) then an ops alert, never 'errored'; download host HTTPS-only and pinned to `tracerfy.nyc3` (CDN and origin: 33/33 production URLs, read host-only, 2026-09-28); a malformed body can no longer fail the task (it used to mark the REAL queue errored) | `tests/test_tracerfy_webhook_trust_s3_15.py` 16/22 fail on main at r2; 104 ingest-suite tests pass | r1 FAIL, r2 FAIL, r3 FAIL, r4 FAIL, r5 PASS (+P2 fixed), r6 PASS (+P2 fixed), r7 PASS |
+| 5e | `fix/security-audit5e-hardening` (`506f6f83`) | D5-02 | `ENTITLEMENT_ENFORCEMENT` unset + `ENVIRONMENT=production` = True; explicit false still wins | `tests/test_settings.py`: the production-unset test fails on main | r1 PASS (+P2 fixed) |
+| 5f | `fix/security-audit5f-egress-proxy` (`d4893dcc`) | D5-03 | `src/scrapers/egress_proxy.py`: in-worker SOCKS5, CONNECT only, ports 80/443/8080/8443, resolves once, refuses if any answer is blocked (incl. mapped/NAT64/6to4 forms), dials the checked sockaddr on its own socket; Chromium launched with it and `<-loopback>` | `tests/test_scraper_egress_proxy.py`: the control proves that WITHOUT the proxy a TURN-over-TCP candidate dials a loopback listener directly (the residual, reproduced); with it, refused. Live 2026-09-28: `atip.piercecountywa.gov` 200 through the proxy in plain and default mode (4 page loads total) | design consult FAIL (HTTP proxy; switched to SOCKS5 and measured TURN routing), r1 FAIL (P1s disproved with evidence, P2s fixed), r2 PASS (+P2s fixed) |
+
+## Commits that landed on main during this audit (`29afc82e..c0b09b7a`)
+
+#380 (machine-readable code on the run-refusal 402s) and #382 (skip-trace pause state,
+migration-free) merged while the audit ran. Reviewed: the 402 body carries only the
+caller's own account code, message and resume time, through `RunRefusalResponse`; the
+pause state is published to Redis and not yet read by any route. Forward note for its
+Phase 1c reader: it must read only the caller's own `<user_id>` field (plus `global` /
+`account_default`), never iterate the hash. No findings. All five fix branches still
+merge cleanly into the new main (`git merge-tree`).
 
 ## Unverified in audit #5
 
 - `.env.example` (2 changed lines): a permission rule blocks this session from reading it. It ships in the image (`.dockerignore:31`); the owner should confirm both lines are placeholders.
+- D5-03's proxy has run live against one county portal only; every other template must
+  be exercised with `SCRAPER_EGRESS_PROXY_ENABLED=true` (staging or a quiet window)
+  before it is turned on in production. Portals on a port outside 80/443/8080/8443
+  will be refused and logged.
 - Everything listed as unverified in audit #3 (live authenticated prod behaviour, DB grants, R2 CORS) was not re-tested; the delta did not touch those surfaces.

@@ -319,11 +319,23 @@ async def test_unknown_queue_id_is_refused(starter_user, _stub_csv):
 
 
 @pytest.mark.asyncio
-async def test_untrusted_download_host_is_refused(starter_user, _stub_csv):
-    """The webhook body is shared-secret authed, but a leaked secret must not
-    turn the worker into an SSRF fetcher for an attacker-chosen host."""
+async def test_an_attacker_chosen_download_host_is_never_fetched(starter_user, monkeypatch):
+    """The webhook body is shared-secret authed, but a leaked secret must not turn
+    the worker into an SSRF fetcher for an attacker-chosen host. The body's URL is
+    never read (audit #5, S3-15), and even the provider's own record is refused if
+    it names a host off Tracerfy's bucket."""
+    fetched: list[str] = []
+    monkeypatch.setattr(
+        "src.scrapers.enrichment.skip_trace.download_tracerfy_csv",
+        lambda url: fetched.append(url) or _csv("6 SSRF ST,TACOMA,WA,A,B,,,,,,,"),
+    )
     qid = _next_queue_id()
     _seed(starter_user.id, qid, [("6 SSRF ST", "TACOMA", "WA")])
+    monkeypatch.setattr(
+        "src.scrapers.enrichment.skip_trace.fetch_queues",
+        lambda *a, **k: [{"id": qid, "pending": False, "rows_uploaded": 1,
+                          "download_url": "https://evil.example.com/x.csv"}],
+    )
 
     out = ingest_tracerfy_batch(
         queue_id=qid, download_url="https://evil.example.com/x.csv",
@@ -331,6 +343,7 @@ async def test_untrusted_download_host_is_refused(starter_user, _stub_csv):
     )
 
     assert out["skipped"] == "untrusted_download_host"
+    assert fetched == []
 
 
 @pytest.mark.asyncio

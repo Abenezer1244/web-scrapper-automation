@@ -144,19 +144,49 @@ async def test_an_unreachable_provider_defers_and_never_trusts_the_body(
 
 @pytest.mark.asyncio
 async def test_repeated_webhooks_share_one_recheck_chain(starter_user, provider, monkeypatch):
-    """Each forged webhook used to start its own chain of provider calls."""
+    """Each forged webhook used to start its own chain of provider calls. A trigger
+    that finds a chain running makes no provider call at all."""
     qid = _next_queue_id()
     _seed(starter_user.id, qid, _TWO_ADDRESSES)
-    provider(_csv(_ONE_HIT), {"id": qid, "pending": True, "download_url": None})
+    provider(_csv(_ONE_HIT))
+    lookups: list[int] = []
+    monkeypatch.setattr(
+        "src.scrapers.enrichment.skip_trace.fetch_queues",
+        lambda *a, **k: lookups.append(1) or [{"id": qid, "pending": True, "download_url": None}],
+    )
     scheduled: list[dict] = []
     monkeypatch.setattr(ingest_tracerfy_batch, "apply_async", lambda **kw: scheduled.append(kw))
 
-    for _ in range(3):
-        out = ingest_tracerfy_batch(queue_id=qid, download_url=DOWNLOAD_URL, rows_uploaded=2)
-        assert out["deferred"] == "provider_not_complete"
+    first = ingest_tracerfy_batch(queue_id=qid, download_url=DOWNLOAD_URL)
+    later = [ingest_tracerfy_batch(queue_id=qid, download_url=DOWNLOAD_URL) for _ in range(3)]
 
-    assert len(scheduled) == 1
-    assert scheduled[0]["kwargs"]["provider_rechecks"] == 1
+    assert first["deferred"] == "provider_not_complete"
+    assert all(o["deferred"] == "provider_recheck_running" for o in later)
+    assert len(lookups) == 1
+    assert len(scheduled) == 1 and scheduled[0]["kwargs"]["provider_rechecks"] == 1
+
+    # The chain's own re-check still runs, and once it gives up the queue is free
+    # for the next genuine trigger.
+    ingest_tracerfy_batch(queue_id=qid, download_url="", provider_rechecks=5)
+    assert ingest_tracerfy_batch(queue_id=qid, download_url=DOWNLOAD_URL)["deferred"] == (
+        "provider_not_complete"
+    )
+    assert len(lookups) == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_url", [123, None, ["x"], "https://[::1/x.csv"])
+async def test_a_malformed_body_cannot_fail_the_task(starter_user, provider, bad_url):
+    """A malformed body value used to raise inside the host check, and autoretry's
+    exhaustion marks the REAL queue errored, so the genuine webhook then no-ops."""
+    qid = _next_queue_id()
+    _seed(starter_user.id, qid, _TWO_ADDRESSES)
+    fetched = provider(_csv(_ONE_HIT), _complete(qid, 2))
+
+    out = ingest_tracerfy_batch.run(queue_id=qid, download_url=bad_url, rows_uploaded=bad_url)
+
+    assert out["hits"] == 1
+    assert fetched == [DOWNLOAD_URL]
 
 
 @pytest.mark.asyncio

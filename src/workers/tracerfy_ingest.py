@@ -442,6 +442,8 @@ def _host_is_tracerfy(download_url: str) -> bool:
         A Spaces bucket name is unique only per region, so "tracerfy" in some
         other region may be anyone's bucket (audit #3/#5, S3-15).
     """
+    if not isinstance(download_url, str):
+        return False
     try:
         parts = urlsplit(download_url)
     except ValueError:
@@ -495,34 +497,49 @@ def _provider_queue_record(queue_id: int) -> dict | None:
     return None
 
 
-def _claim_recheck_chain(queue_id: int) -> bool:
-    """One re-check chain per queue at a time, so repeated (forged) webhooks cannot
-    multiply provider API calls. True if this trigger may start one. Fails open: a
-    Redis problem must not stop a genuine batch from being re-checked."""
-    try:
-        import redis as sync_redis
+def _recheck_chain_key(queue_id: int) -> str:
+    return f"tracerfy:ingest-recheck:{queue_id}"
 
-        client = sync_redis.from_url(settings.REDIS_URL, **settings.redis_kwargs())
-        ttl = (_PROVIDER_RECHECKS + 1) * _PROVIDER_RECHECK_SECONDS + 60
-        return bool(client.set(f"tracerfy:ingest-recheck:{queue_id}", "1", nx=True, ex=ttl))
+
+def _redis():
+    import redis as sync_redis
+
+    return sync_redis.from_url(settings.REDIS_URL, **settings.redis_kwargs())
+
+
+def _hold_recheck_chain(queue_id: int, rechecks: int) -> bool:
+    """Claim (a new trigger) or refresh (a chain member) this queue's one re-check
+    chain. False only when another chain holds it. The claim lives two re-check
+    intervals past its last refresh, so a chain whose message is lost frees the
+    queue within minutes. Fails open: Redis trouble must not stop a genuine batch."""
+    ttl = 2 * _PROVIDER_RECHECK_SECONDS + 60
+    try:
+        client = _redis()
+        if rechecks > 0:
+            client.set(_recheck_chain_key(queue_id), "1", ex=ttl)
+            return True
+        return bool(client.set(_recheck_chain_key(queue_id), "1", nx=True, ex=ttl))
     except Exception as exc:  # noqa: BLE001 — availability over amplification
         _logger.warning("recheck-chain claim failed for queue %d: %s", queue_id, str(exc)[:120])
         return True
 
 
-def _defer_until_provider_complete(queue_id: int, download_url: str, rechecks: int) -> dict:
+def _release_recheck_chain(queue_id: int) -> None:
+    try:
+        _redis().delete(_recheck_chain_key(queue_id))
+    except Exception as exc:  # noqa: BLE001 — the claim expires on its own
+        _logger.warning("recheck-chain release failed for queue %d: %s", queue_id, str(exc)[:120])
+
+
+def _defer_until_provider_complete(queue_id: int, rechecks: int) -> dict:
     """Re-check a queue the provider does not (yet) show complete, a bounded number of
-    times, then page ops. Never raises and never marks the queue errored."""
-    if rechecks == 0 and not _claim_recheck_chain(queue_id):
-        _logger.info(
-            "Tracerfy ingest queue %d: a provider re-check is already scheduled", queue_id
-        )
-        return {"queue_id": queue_id, "deferred": "provider_not_complete"}
+    times, then release the chain and page ops. Never raises and never marks the
+    queue errored."""
     if rechecks < _PROVIDER_RECHECKS:
         try:
             ingest_tracerfy_batch.apply_async(
                 kwargs={
-                    "queue_id": queue_id, "download_url": download_url,
+                    "queue_id": queue_id, "download_url": "",
                     "provider_rechecks": rechecks + 1,
                 },
                 countdown=_PROVIDER_RECHECK_SECONDS,
@@ -538,6 +555,7 @@ def _defer_until_provider_complete(queue_id: int, download_url: str, rechecks: i
                 "Tracerfy ingest queue %d: could not schedule a provider re-check: %s",
                 queue_id, str(exc)[:120],
             )
+    _release_recheck_chain(queue_id)
     try:
         from src.workers.ops_alerts import send_ops_alert
 
@@ -601,17 +619,11 @@ def ingest_tracerfy_batch(
         pending_row_subject_key,
     )
 
-    # REDTEAM T3: refuse to fetch a forged/body-supplied download_url that
-    # does not point at a Tracerfy-owned host. Reject BEFORE any DB work or
-    # network fetch so a forged webhook is a cheap, logged no-op.
-    if not _host_is_tracerfy(download_url):
-        _logger.error(
-            "Refusing Tracerfy ingest for queue %d: download_url host not "
-            "Tracerfy-owned (host=%s)",
-            queue_id,
-            _url_host(download_url),
-        )
-        return {"queue_id": queue_id, "skipped": "untrusted_download_host"}
+    # The body's download_url, rows_uploaded and credits_deducted are accepted for
+    # the callers' signature and NEVER read (audit #5, S3-15): see the provider
+    # record below. Not even validated, since a malformed value (a JSON number,
+    # say) must not be able to fail this task and mark a real queue errored.
+    del download_url, rows_uploaded, credits_deducted
 
     # Counts are read from the provider's record below, never the webhook body.
     # Anything but a non-negative int is read as 0, which bills 'completed' rows
@@ -651,6 +663,12 @@ def ingest_tracerfy_batch(
     # result URL would pass. So the download URL and the counts come only from
     # Tracerfy's own record of this queue. A TracerfyError (API unreachable)
     # propagates to autoretry.
+    # One provider re-check chain per queue: a repeated (forged) trigger costs no
+    # provider call. A chain member refreshes its claim; a new trigger that finds
+    # one running returns, and the chain's next re-check ingests the batch.
+    if not _hold_recheck_chain(queue_id, provider_rechecks):
+        _logger.info("Tracerfy ingest queue %d: a provider re-check chain is running", queue_id)
+        return {"queue_id": queue_id, "deferred": "provider_recheck_running"}
     try:
         remote = _provider_queue_record(queue_id)
     except TracerfyError as exc:
@@ -664,7 +682,7 @@ def ingest_tracerfy_batch(
         # Not complete at the provider (or not reachable): a premature or forged
         # webhook, or an outage. Never an error (a forged one must not burn a real
         # batch's retries into 'errored'); look again shortly.
-        return _defer_until_provider_complete(queue_id, download_url, provider_rechecks)
+        return _defer_until_provider_complete(queue_id, provider_rechecks)
     download_url = remote["download_url"]
     rows_uploaded = _count(remote.get("rows_uploaded"))
     credits_deducted = _count(remote.get("credits_deducted"))

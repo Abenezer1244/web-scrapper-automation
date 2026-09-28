@@ -415,6 +415,14 @@ def _alert_unreconciled(
         _logger.warning("unreconciled-batch ops alert failed: %s", str(exc)[:120])
 
 
+# Tracerfy's result bucket: nyc3, through the CDN (every production download URL,
+# 33 of 33 on 2026-09-28) or the origin endpoint of the same bucket.
+_TRACERFY_BUCKET_HOSTS = frozenset({
+    "tracerfy.nyc3.cdn.digitaloceanspaces.com",
+    "tracerfy.nyc3.digitaloceanspaces.com",
+})
+
+
 def _host_is_tracerfy(download_url: str) -> bool:
     """REDTEAM B1/T3: confirm a webhook-supplied download_url points at a
     Tracerfy-owned host before we fetch it server-side.
@@ -428,16 +436,25 @@ def _host_is_tracerfy(download_url: str) -> bool:
     own domain and its DigitalOcean Spaces CDN bucket, so we additionally
     pin the host to those before trusting the URL.
 
-    Allowed:
+    Allowed, HTTPS only (the URL carries the CSV of customers' contacts):
       - the configured TRACERFY_API_BASE_URL host (and its subdomains)
-      - DigitalOcean Spaces CDN buckets owned by Tracerfy
-        (e.g. tracerfy.nyc3.cdn.digitaloceanspaces.com)
+      - Tracerfy's own DigitalOcean Spaces bucket, EXACTLY (_TRACERFY_BUCKET_HOSTS).
+        A Spaces bucket name is unique only per region, so "tracerfy" in some
+        other region may be anyone's bucket (audit #3/#5, S3-15).
     """
+    if not isinstance(download_url, str):
+        return False
     try:
         parts = urlsplit(download_url)
     except ValueError:
         return False
-    if parts.scheme not in ("http", "https"):
+    if parts.scheme != "https":
+        return False
+    try:
+        port = parts.port
+    except ValueError:
+        return False
+    if port not in (None, 443) or parts.username is not None or "@" in parts.netloc:
         return False
     host = (parts.hostname or "").lower()
     if not host:
@@ -447,13 +464,118 @@ def _host_is_tracerfy(download_url: str) -> bool:
     if api_host and (host == api_host or host.endswith("." + api_host)):
         return True
 
-    # DigitalOcean Spaces CDN: bucket name is the leftmost label and must
-    # be Tracerfy's own bucket. Matches "<bucket>.<region>.cdn.digitalocean
-    # spaces.com" and "<bucket>.<region>.digitaloceanspaces.com".
-    if host.endswith(".digitaloceanspaces.com") and host.split(".", 1)[0] == "tracerfy":
+    return host in _TRACERFY_BUCKET_HOSTS
+
+
+_PROVIDER_RECHECKS = 5
+_PROVIDER_RECHECK_SECONDS = 120
+
+
+def _url_host(url) -> str:
+    """The host of ``url`` for a log line, never raising on a malformed value."""
+    try:
+        return urlsplit(str(url)).hostname or "<none>"
+    except ValueError:
+        return "<unparseable>"
+
+
+def _provider_queue_record(queue_id: int) -> dict | None:
+    """Tracerfy's own record of ``queue_id`` when it shows the queue complete with a
+    download URL; None when the queue is absent or not complete there. Raises
+    TracerfyError when the provider cannot be asked."""
+    from src.scrapers.enrichment.skip_trace import fetch_queues
+
+    for queue in fetch_queues():
+        if (
+            isinstance(queue, dict)
+            and queue.get("id") == queue_id
+            and queue.get("pending") is False
+            and isinstance(queue.get("download_url"), str)
+            and queue["download_url"]
+        ):
+            return queue
+    return None
+
+
+def _recheck_chain_key(queue_id: int) -> str:
+    return f"tracerfy:ingest-recheck:{queue_id}"
+
+
+def _redis():
+    import redis as sync_redis
+
+    return sync_redis.from_url(settings.REDIS_URL, **settings.redis_kwargs())
+
+
+def _hold_recheck_chain(queue_id: int, member: bool) -> bool:
+    """Claim (a new trigger) or refresh (a chain member: a re-check or a Celery
+    retry of one) this queue's one re-check
+    chain. False only when another chain holds it. The claim lives two re-check
+    intervals past its last refresh, so a chain whose message is lost frees the
+    queue within minutes. Fails open: Redis trouble must not stop a genuine batch."""
+    ttl = 2 * _PROVIDER_RECHECK_SECONDS + 60
+    try:
+        client = _redis()
+        if member:
+            client.set(_recheck_chain_key(queue_id), "1", ex=ttl)
+            return True
+        return bool(client.set(_recheck_chain_key(queue_id), "1", nx=True, ex=ttl))
+    except Exception as exc:  # noqa: BLE001 — availability over amplification
+        _logger.warning("recheck-chain claim failed for queue %d: %s", queue_id, str(exc)[:120])
         return True
 
-    return False
+
+def _release_recheck_chain(queue_id: int) -> None:
+    try:
+        _redis().delete(_recheck_chain_key(queue_id))
+    except Exception as exc:  # noqa: BLE001 — the claim expires on its own
+        _logger.warning("recheck-chain release failed for queue %d: %s", queue_id, str(exc)[:120])
+
+
+def _defer_until_provider_complete(queue_id: int, rechecks: int) -> dict:
+    """Re-check a queue the provider does not (yet) show complete, a bounded number of
+    times, then release the chain and page ops. Never raises and never marks the
+    queue errored."""
+    if rechecks < _PROVIDER_RECHECKS:
+        try:
+            ingest_tracerfy_batch.apply_async(
+                kwargs={
+                    "queue_id": queue_id, "download_url": "",
+                    "provider_rechecks": rechecks + 1,
+                },
+                countdown=_PROVIDER_RECHECK_SECONDS,
+            )
+            _logger.warning(
+                "Tracerfy ingest queue %d: the provider does not show it complete; "
+                "re-checking in %ds (%d/%d)",
+                queue_id, _PROVIDER_RECHECK_SECONDS, rechecks + 1, _PROVIDER_RECHECKS,
+            )
+            return {"queue_id": queue_id, "deferred": "provider_not_complete"}
+        except Exception as exc:  # noqa: BLE001 — fall through to the alert
+            _logger.error(
+                "Tracerfy ingest queue %d: could not schedule a provider re-check: %s",
+                queue_id, str(exc)[:120],
+            )
+    _release_recheck_chain(queue_id)
+    try:
+        from src.workers.ops_alerts import send_ops_alert
+
+        send_ops_alert(
+            "skip_trace", f"ingest_provider_incomplete_{queue_id}",
+            "Skip-trace webhook for a batch Tracerfy does not show complete",
+            f"A completion webhook arrived for Tracerfy queue {queue_id}, but Tracerfy's "
+            f"own queue list did not show it complete with a download URL (or could not "
+            f"be reached) after {rechecks} re-check(s). Nothing was ingested or billed "
+            f"and the queue is still 'pending'. If the batch is genuinely complete, "
+            f"re-run ingest for it once the provider record shows it; if not, the "
+            f"webhook was premature or forged.",
+        )
+    except Exception as exc:  # noqa: BLE001 — never turn this into a task failure
+        _logger.error(
+            "Tracerfy ingest queue %d: provider never showed it complete, and the ops "
+            "alert failed: %s", queue_id, str(exc)[:120],
+        )
+    return {"queue_id": queue_id, "skipped": "provider_not_complete"}
 
 
 @app.task(
@@ -473,6 +595,7 @@ def ingest_tracerfy_batch(
     download_url: str,
     rows_uploaded: int = 0,
     credits_deducted: int = 0,
+    provider_rechecks: int = 0,
 ) -> dict:
     """Download a Tracerfy batch CSV and upsert phone/email into Results.
 
@@ -497,17 +620,17 @@ def ingest_tracerfy_batch(
         pending_row_subject_key,
     )
 
-    # REDTEAM T3: refuse to fetch a forged/body-supplied download_url that
-    # does not point at a Tracerfy-owned host. Reject BEFORE any DB work or
-    # network fetch so a forged webhook is a cheap, logged no-op.
-    if not _host_is_tracerfy(download_url):
-        _logger.error(
-            "Refusing Tracerfy ingest for queue %d: download_url host not "
-            "Tracerfy-owned (host=%s)",
-            queue_id,
-            (urlsplit(download_url).hostname or "<none>"),
-        )
-        return {"queue_id": queue_id, "skipped": "untrusted_download_host"}
+    # The body's download_url, rows_uploaded and credits_deducted are accepted for
+    # the callers' signature and NEVER read (audit #5, S3-15): see the provider
+    # record below. Not even validated, since a malformed value (a JSON number,
+    # say) must not be able to fail this task and mark a real queue errored.
+    del download_url, rows_uploaded, credits_deducted
+
+    # Counts are read from the provider's record below, never the webhook body.
+    # Anything but a non-negative int is read as 0, which bills 'completed' rows
+    # only (erring toward the customer).
+    def _count(value) -> int:
+        return value if type(value) is int and value >= 0 else 0
 
     # REDTEAM (Codex review): cheap pre-check BEFORE any network I/O. A replay
     # of an already completed/billed/errored batch — or an unknown/forged queue
@@ -534,6 +657,45 @@ def ingest_tracerfy_batch(
             queue_id, _pre[0],
         )
         return {"queue_id": queue_id, "skipped": f"already_{_pre[0]}"}
+
+    # The webhook is a TRIGGER, never a source of data (audit #5, S3-15). Its
+    # secret has leaked (S3-16), and host pinning proves only that a URL is on
+    # Tracerfy's bucket, not that it is THIS queue's CSV: any Tracerfy customer's
+    # result URL would pass. So the download URL and the counts come only from
+    # Tracerfy's own record of this queue. An unreachable provider defers like an
+    # incomplete record (below): an outage must not mark a genuine batch errored.
+    # One provider re-check chain per queue: a repeated (forged) trigger costs no
+    # provider call. A chain member refreshes its claim; a new trigger that finds
+    # one running returns, and the chain's next re-check ingests the batch.
+    # A Celery retry (a transient CSV download failure below, say) continues this
+    # same chain: it must refresh the claim, not find it and give up.
+    if not _hold_recheck_chain(queue_id, provider_rechecks > 0 or self.request.retries > 0):
+        _logger.info("Tracerfy ingest queue %d: a provider re-check chain is running", queue_id)
+        return {"queue_id": queue_id, "deferred": "provider_recheck_running"}
+    try:
+        remote = _provider_queue_record(queue_id)
+    except TracerfyError as exc:
+        # Unreachable is not a reason to trust the body, nor to mark a genuine batch
+        # errored: defer like an incomplete record, then page ops.
+        _logger.warning(
+            "Tracerfy ingest queue %d: provider record unavailable: %s", queue_id, str(exc)[:120]
+        )
+        remote = None
+    if remote is None:
+        # Not complete at the provider (or not reachable): a premature or forged
+        # webhook, or an outage. Never an error (a forged one must not burn a real
+        # batch's retries into 'errored'); look again shortly.
+        return _defer_until_provider_complete(queue_id, provider_rechecks)
+    download_url = remote["download_url"]
+    rows_uploaded = _count(remote.get("rows_uploaded"))
+    credits_deducted = _count(remote.get("credits_deducted"))
+    if not _host_is_tracerfy(download_url):
+        _logger.error(
+            "Refusing Tracerfy ingest for queue %d: the provider's own download_url "
+            "is not on a pinned host (host=%s)", queue_id, _url_host(download_url),
+        )
+        _release_recheck_chain(queue_id)
+        return {"queue_id": queue_id, "skipped": "untrusted_download_host"}
 
     try:
         csv_text = download_tracerfy_csv(download_url)
@@ -835,6 +997,10 @@ def ingest_tracerfy_batch(
                 status="completed",
                 download_url=download_url,
                 completed_at=now,
+                # Tracerfy's own record, never the webhook body (audit #5,
+                # S3-15). Written as given: an adopted queue was recorded while
+                # the provider still hid the count (0), so a clamp against the
+                # stored value would under-bill it.
                 rows_uploaded=rows_uploaded,
                 credits_deducted=credits_deducted,
             )
@@ -875,6 +1041,7 @@ def ingest_tracerfy_batch(
 
         # Single atomic commit: ingest + status flip + counter advances.
         db.commit()
+    _release_recheck_chain(queue_id)
 
     # REDTEAM (Codex convergence — meter outbox): the billable MeterEvents are
     # now durably persisted as skip_trace_meter_events outbox rows inside the

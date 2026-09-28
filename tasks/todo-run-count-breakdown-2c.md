@@ -4,7 +4,11 @@ Branch `feat/run-count-breakdown-2c` (worktree `C:/Users/Windows/bl-wt/eligibili
 `origin/main` `c0b09b7a`; its head `c73a47da` is `c0b09b7a` + the handoff doc only (no code),
 so the line numbers below hold for both. Before building: `git fetch`, and if `origin/main`
 moved, rebase and re-verify the cited lines (Codex r7 P2). Spec: FE `docs/ux-audit/phase-3.0-contracts.md` "Q1 (F-001)".
-Status: **PLAN, not built. Codex PLAN: GO (round 8). Waiting on the owner's confirmation.**
+Status: **BUILDING. Codex PLAN: GO (round 8). Owner approved 2026-09-28, accepting every
+recommendation:** build 2c, then 2c-bis; 2c-bis deployed and verified before 2c merges; the
+deploy runbook (no separate schema gate); intake pause option A (owner scales Railway
+`worker` to 0 at merge); product questions 1-4 as proposed (snapshot headline, no
+superseded bucket, no dropped split, the wording in Q4).
 
 Codex plan log (read-only `codex exec`, prompts in the session scratchpad): r1 CHANGES
 (6 P1: attempt scoping, READ COMMITTED, partition, live unclassified, tax cap, deploy fact)

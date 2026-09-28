@@ -134,8 +134,8 @@ class EgressProxy:
             _logger.warning("egress proxy refused %s:%d (%s)", host, port, refused)
             await self._reply(writer, refused.code)
             return
-        await self._reply(writer, _OK)
         try:
+            await self._reply(writer, _OK)
             await asyncio.gather(
                 self._pipe(reader, upstream_writer), self._pipe(upstream_reader, writer)
             )
@@ -212,6 +212,9 @@ class EgressProxy:
             except OSError as exc:
                 sock.close()
                 last = exc
+            except BaseException:  # cancelled (stop() or the deadline): no leaked fd
+                sock.close()
+                raise
         raise _RefusedError(_HOST_UNREACHABLE, f"connect failed: {type(last).__name__}")
 
     @staticmethod

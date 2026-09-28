@@ -435,32 +435,33 @@ class BridgeScraper:
         # subsequent __aenter__ on the same instance can re-create
         # cleanly.
         try:
-            if self._context is not None:
-                await self._context.close()
-        except Exception as exc:
-            _logger.warning("context.close failed (leak risk): %s", str(exc)[:120])
-        self._context = None
+            try:
+                if self._context is not None:
+                    await self._context.close()
+            except Exception as exc:
+                _logger.warning("context.close failed (leak risk): %s", str(exc)[:120])
+            self._context = None
 
-        try:
-            if self._browser is not None:
-                await self._browser.close()
-        except Exception as exc:
-            _logger.warning("browser.close failed (leak risk): %s", str(exc)[:120])
-        self._browser = None
+            try:
+                if self._browser is not None:
+                    await self._browser.close()
+            except Exception as exc:
+                _logger.warning("browser.close failed (leak risk): %s", str(exc)[:120])
+            self._browser = None
 
-        try:
-            if self._playwright is not None:
-                await self._playwright.stop()
-        except Exception as exc:
-            _logger.warning("playwright.stop failed (leak risk): %s", str(exc)[:120])
-        finally:
-            # Even when the stop above is cancelled: the proxy's listener must not
-            # outlive the browser it served.
+            try:
+                if self._playwright is not None:
+                    await self._playwright.stop()
+            except Exception as exc:
+                _logger.warning("playwright.stop failed (leak risk): %s", str(exc)[:120])
             self._playwright = None
-            await self._stop_egress_proxy()
 
-        self.page = None
-        _logger.info("Browser context closed")
+            self.page = None
+            _logger.info("Browser context closed")
+        finally:
+            # However the cleanup above ends (even cancelled): the proxy's listener
+            # must not outlive the browser it served.
+            await self._stop_egress_proxy()
 
     async def _stop_egress_proxy(self) -> None:
         if self._egress_proxy is None:

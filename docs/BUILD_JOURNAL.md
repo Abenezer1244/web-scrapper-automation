@@ -19,6 +19,73 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-28 — The 402 says why (Q6 2b-ii Phase B), and a stub I blamed on the product
+
+> Two merges, both live. BE **#380** `405ba52c` (run-refusal 402 code, no migration) and FE
+> **#168** `a5ed32a` (the toast names the fix). Plan + Codex rounds + review:
+> `tasks/todo-run-eligibility-2b-ii-b.md` (BE), FE `tasks/todo-run-refusal-402-fe.md`.
+
+**Built / Shipped:**
+- **BE #380.** The run-refusal 402s (`POST /jobs` AI limit + account rule, `POST /batches`
+  account rule) keep `detail` as the same sentence, byte for byte, and add top-level `code`
+  (`ai_limit | frozen | ended | over_limit`) and `resumes_at` (`src/api/errors.py`:
+  `RunRefusedHTTPException`, a subclass of HTTPException, + a handler serializing through
+  `RunRefusalResponse`). Both routes declare every 402 shape (run, entitlement, plain) as an
+  `anyOf`. The `connectors` test fixture moved to `tests/conftest.py`. Merged after a quiet
+  check (all zeros, alembic 105); api/worker/beat on `405ba52c`, clean boot.
+- **FE #168.** `readErrorBody` keeps a top-level-code body as `kind: "run_refusal"`;
+  `toastUpgrade` routes it first: "Update payment" (frozen), "Resubscribe" (ended), "Upgrade plan"
+  (ai_limit / over_limit), unknown code -> neutral "Manage billing". Labels live in
+  `lib/billing-cta.ts`, shared with the Scrapers page; `satisfies Record<RunRefusalCode,string>`.
+
+**Tried / Decided:**
+- Owner chose the ADDITIVE shape (A) over an object `detail` (B). Verified, not assumed: 0 of 7
+  prod accounts hold an API key, so no external client could see either change today.
+- `anyOf`, not `oneOf`, on purpose: exclusivity needs `additionalProperties: false`, the
+  strictness that breaks a client the day a key is added.
+- Codex plan review took 4 rounds (P1s: raw datetime would 500 -> serialize via the model;
+  honest anyOf per route; FE provenance marker; one clock in batches). Diff reviews: BE GATE PASS
+  round 1 with no findings; FE GATE PASS round 1 (P2 "wizard/batch not clicked" answered with
+  call-site evidence: both call the identical `toastError` on the identical `apiFetch` error).
+
+**Failed / Blocked:**
+- Claude Code's permission classifier errored on every Bash/Edit call for a stretch (4 in a row;
+  10 ends the turn). Stopped with the build uncommitted but on disk, reported, resumed later.
+  While blocked, `main` moved (#379, migration 105): rebased, test DB upgraded to 105, related
+  tests re-run.
+- A foreground suite part over 600 s moved to the background and the next part started on the
+  same DB; both passed, then every later part ran backgrounded and awaited one at a time.
+
+**Caught & fixed:**
+- **Correction to the entry below:** its "Seen in passing" says the dashboard logs "Cannot read
+  properties of undefined (reading 'title')" when `/analytics/summary` fails. WRONG cause. It is
+  `next_action.title` in `components/onboarding-banner.tsx`, and it was MY STUB's
+  `/auth/onboarding` omitting `next_action`; the backend always sets it
+  (`auth_helpers/session.py`, every branch). Not a product bug. Lesson: find the failing
+  property in the bundle before naming a cause.
+- `test_rls_isolation` "permission denied for table results" again on the eligibility test DB
+  (the known roles-vs-grants landmine, see memory): `has_table_privilege` was false; granted,
+  green, whole part re-run.
+
+**Pending / Handoff:**
+- Queue next: 2c (Q1 run-count breakdown, migration), 2d (Q2 `already_delivered` on
+  JobResponse), 2e (Q4 "Lookup failed"), then batches B-E, F-043 Phase 2, Phase 4/5.
+- Still queued from Phase A: `connector_unavailable`; `jobs.was_ai` snapshot (migration).
+- `/scrapers` layout: a long record-type label squeezes one row so the record count overlaps
+  its metadata (~1300 px; pre-existing).
+- The `test_rls_isolation` role fixture should GRANT on every run, not only on role creation.
+
+**Facts learned:**
+- Starlette resolves exception handlers by MRO: a handler for an HTTPException SUBCLASS wins
+  over FastAPI's default and a catch-all `Exception` handler, and an unregistered subclass still
+  renders as a plain HTTPException. Endpoint-raised exceptions are handled inside
+  `ExceptionMiddleware`, so CORS + security headers still wrap the response (tested).
+- A live refused 402 cannot be observed read-only (it needs a refused account), and prod does
+  not serve `/openapi.json` (`openapi_url` is off unless DEBUG): prod verification of a
+  response-shape change is the deployed SHA + tests, stated as such.
+
+---
+
 ## 2026-09-28 — Run now asks the gate (Q6 2b-ii), and a poll that could blank the page
 
 > Two merges, both live. BE **#375** `ae351c4e` (per-scraper `run_eligibility`, no migration)

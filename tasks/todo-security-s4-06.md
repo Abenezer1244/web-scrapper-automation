@@ -29,18 +29,31 @@ worktree `C:/Users/Windows/bl-wt-s406`.
   account's live pre-read skips the locked re-check.
 
 ## Steps
-- [ ] 1. Extract the reservation (`_reserved_at` .. step 3) into
+- [x] 1. Extract the reservation (`_reserved_at` .. step 3) into
       `reserve_job_quota(db, *, job_id, user_id, want) -> int | None` in
       `src/workers/tasks.py`; `run_scrape_job` calls it. Behaviour unchanged.
-- [ ] 2. `tests/test_quota_reservation.py`: `_reserve()` calls it; drop `_RESERVE_SQL`;
+- [x] 2. `tests/test_quota_reservation.py`: `_reserve()` calls it; drop `_RESERVE_SQL`;
       rewrite the two `at=` tests; run the file green on the extraction.
-- [ ] 3. Boundary lock-wait test; prove it FAILS on the step-1 extraction.
-- [ ] 4. Fix: `account_charge_state()` returns `(block, now)` from one post-lock
+- [x] 3. Boundary lock-wait test; prove it FAILS on the step-1 extraction.
+- [x] 4. Fix: `account_charge_state()` returns `(block, now)` from one post-lock
       clock read; `account_charge_block` wraps it; the grant and `reserved_at` use
       that `now`. Test passes.
-- [ ] 5. Targeted suites (`test_quota_reservation`, `test_audit4_paid_skip_trace_gate`,
+- [x] 5. Targeted suites (`test_quota_reservation`, `test_audit4_paid_skip_trace_gate`,
       billing/settlement tests) + ruff on changed files.
-- [ ] 6. Codex diff review until GATE: PASS. No push without owner OK.
+- [x] 6. Codex diff review until GATE: PASS. No push without owner OK.
 
 ## Review
-(filled at the end)
+- `d387d021` extraction (behaviour unchanged; 26/26 on the real function).
+- Boundary test FAILED on `d387d021`: "granted 100: judged against the window that
+  had already ended", after its own guards passed (waiting in `pg_locks`, before the
+  boundary by the DB clock). Passes on the fix.
+- `474f9c0e` fix: `account_charge_state()` -> `(block, now)`, `now` read after the
+  lock; `account_charge_block()` wraps it unchanged; grant `:at` and
+  `jobs.reserved_at` use that `now`; the CAS writes `clock_timestamp()` as a marker.
+- Tests on the fix: reservation + S4-01 gate 70; plan-cap/billing/entitlement 108
+  (5 skipped); workers/batch/claim/delivery 147. ruff clean.
+- Codex diff review r1: GATE PASS; one P3 (5 s test margin could fail spuriously on
+  slow CI) adopted: 10 s.
+- Not in scope, unchanged: an UNLIMITED live account's pre-read skips the locked
+  re-check (S4-01 limitation documented in `run_scrape_job`).
+- Not pushed (owner OK needed).

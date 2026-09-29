@@ -917,8 +917,11 @@ def test_a_reservation_that_waits_on_the_user_lock_across_the_window_end_charges
     import time
 
     with SyncSessionLocal() as db:
+        # 10 s of headroom for fixture setup and thread start on a slow CI
+        # database (Codex review r1, P3): too little makes the "blocked BEFORE
+        # the window ends" guard fail spuriously, never pass falsely.
         boundary = db.execute(
-            text("SELECT clock_timestamp() + interval '5 seconds'")
+            text("SELECT clock_timestamp() + interval '10 seconds'")
         ).scalar()
         user = _mk_user(
             db, used=900, limit=1000,

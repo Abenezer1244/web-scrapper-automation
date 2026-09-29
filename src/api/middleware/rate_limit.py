@@ -39,9 +39,14 @@ _ZONES: dict[str, tuple[int, int]] = {
     # — even during a Redis outage — must stay throttled. 10/min per user is ample
     # for legitimate upgrade/manage flows (Codex security cross-check).
     "stripe": (10, 60),
-    # Audit #3 S3-09. Every /jobs/{id}/download and /export-url call rebuilds the
-    # full lead CSV (decrypting PII) from the DB; one bucket per user covers both,
-    # since export-url's URL is only ever fetched from /download.
+    # Audit #3 S3-09 and audit #4 S4-03. One bucket per user for every route that
+    # rebuilds a full lead CSV (decrypting PII) from the DB: /jobs/{id}/download,
+    # /batches/{id}/download, /batches/{id}/runs/{run}/download,
+    # /segments/intersection/export and /segments/union/export. /jobs/{id}/export-url
+    # builds nothing but spends from the same bucket, and the in-app flow then
+    # fetches its URL from /download, which spends again: that flow costs 2, so 10
+    # in-app job exports a minute. A direct or emailed /download (bearer or download
+    # token) costs 1 per call, as does each call to the other routes.
     "export": (20, 60),
     # Job cancel and the scraper write routes (create, edit, csv-layout, delete).
     # Own zone so a burst of edits cannot starve the user's reads in `general`.

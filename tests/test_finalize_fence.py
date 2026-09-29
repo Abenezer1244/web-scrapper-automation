@@ -596,7 +596,8 @@ def test_every_status_and_fail_write_in_run_scrape_job_carries_the_token():
     body = _live(inspect.getsource(run_scrape_job.__wrapped__))
     fails = _calls(body, "_fail_job")
     statuses = [c for c in _calls(body, "_set_status") if c.startswith('_set_status(db, job, "')]
-    assert len(fails) >= 8 and len(statuses) >= 3
+    # One _fail_job call (inside _fail_attempt, which every fail path uses: B10).
+    assert len(fails) == 1 and len(statuses) >= 3
     for call in fails + statuses:
         assert "expected_started_at=attempt_token" in call, call
     assert "DELETE FROM delivered_records" not in body
@@ -800,3 +801,99 @@ def test_run_scrape_job_fences_the_skip_trace_enqueue():
     fence = locked.index("attempt_state(db, job_id, job.user_id, attempt_token)")
     assert "_publish_log(" not in locked[:fence] and "commit()" not in locked[:fence]
     assert fence < locked.index("claim_skip_trace_rows(db, to_claim)")
+
+
+# ── B10 early returns: terminal is cleaned up, lost releases nothing (Codex diff r6 P2) ──
+
+@pytest.fixture
+def rerun(run):
+    """A watchdog re-run of `run`: back to pending with its reservation and claims
+    still held, its scraper since paused, so the run stops at its first early return
+    (a `_fail_job` that must land on this attempt's row)."""
+    with SyncSessionLocal() as s:
+        s.execute(text("UPDATE jobs SET status = 'pending', started_at = NULL, "
+                       "retry_count = retry_count + 1 WHERE id = :j"), {"j": run["job_id"]})
+        s.execute(text("UPDATE scraper_configs SET active = false WHERE id = :c"),
+                  {"c": run["config_id"]})
+        s.commit()
+    return run
+
+
+def _run_scrape_job_racing(rerun, monkeypatch, race):
+    """Run the real task; `race` lands between its claim and its first early return."""
+    from src.workers import tasks
+
+    real = tasks.skip_reason_for_config
+
+    def _race_then_decide(active, paused_reason):
+        race()
+        return real(active, paused_reason)
+
+    monkeypatch.setattr(tasks, "skip_reason_for_config", _race_then_decide)
+    tasks.run_scrape_job(rerun["job_id"])
+
+
+def _cancel(rerun):
+    with SyncSessionLocal() as s:
+        s.execute(text("UPDATE jobs SET status = 'cancelled' WHERE id = :j"), {"j": rerun["job_id"]})
+        s.commit()
+
+
+def _requeue_live_claim(rerun, box):
+    with SyncSessionLocal() as s:
+        row = s.execute(text("SELECT started_at, retry_count, status FROM jobs WHERE id = :j"),
+                        {"j": rerun["job_id"]}).one()
+    assert _requeue(rerun, AttemptToken(row.started_at, row.retry_count), row.status)
+    with SyncSessionLocal() as b:
+        box["b"] = claim_attempt(b, rerun["job_id"])
+        b.execute(text("UPDATE jobs SET status = 'enriching' WHERE id = :j"), {"j": rerun["job_id"]})
+        b.commit()
+
+
+def test_an_early_return_on_a_cancelled_job_hands_back_its_reservation_and_claims(
+    rerun, monkeypatch,
+):
+    _run_scrape_job_racing(rerun, monkeypatch, lambda: _cancel(rerun))
+
+    snap = _snapshot(rerun)
+    assert snap["job"][0] == "cancelled"
+    assert snap["records_used"] == 0 and snap["job"][6] is None  # reservation handed back
+    assert snap["claims"] == 0                                     # claims released
+    assert snap["notifications"] == 0
+
+
+def test_an_early_return_on_a_lost_job_releases_nothing(rerun, monkeypatch):
+    box = {}
+    _run_scrape_job_racing(rerun, monkeypatch, lambda: _requeue_live_claim(rerun, box))
+
+    assert box["b"] is not None
+    snap = _snapshot(rerun)
+    assert (snap["job"][0], snap["job"][1], snap["job"][2]) == (
+        "enriching", box["b"].started_at, box["b"].retry_count)    # B's run, untouched
+    assert snap["records_used"] == 2 and snap["job"][7] == 2       # B's reservation kept
+    assert snap["job"][6] is not None
+    assert snap["claims"] == 2 and snap["notifications"] == 0
+
+
+def test_every_early_return_in_run_scrape_job_tells_terminal_from_lost():
+    """One decision for every missed write: stage writes through _still_ours, fails
+    through _fail_attempt, status aborts through _after_missed_write."""
+    from src.workers.tasks import run_scrape_job
+
+    body = _live(inspect.getsource(run_scrape_job.__wrapped__))
+    decide = body[body.index("def _after_missed_write"):body.index("def _still_ours")]
+    assert "finalize_exit(attempt_state(db, job_id, _boot_user_id, attempt_token))" in decide
+    assert decide.index("db.rollback()") < decide.index("_terminal_cleanup(")
+    assert 'if decision == "terminalized":' in decide
+    assert "return landed or _after_missed_write()" in body
+    # _fail_job is called in exactly one place, which falls back to the decision.
+    (fail,) = _calls(body, "_fail_job")
+    wrapper = body[body.index("def _fail_attempt"):]
+    assert "if not _fail_job(" in wrapper and wrapper.index("_after_missed_write()") < \
+        wrapper.index("create_notification(")
+    assert len(_calls(body, "_fail_attempt")) >= 11   # def + 10 early returns
+    # every status abort asks too
+    for status in ('"probing"', '"scraping"', '"enriching"'):
+        at = body.index(f"_set_status(db, job, {status}")
+        tail = body[at:body.index("return", at)]
+        assert "_after_missed_write()" in tail, status

@@ -68,6 +68,7 @@ from src.workers.tasks_helpers.finalize import (  # noqa: F401  (re-export)
     FinalizeKind,
     _alert_dedup_release_failed,
     _release_claims_of_cancelled_job,
+    _terminal_cleanup,
     finalize_billing_and_done,
     release_run_claims_if_owned,
 )
@@ -88,6 +89,7 @@ from src.workers.tasks_helpers.status import (
     _set_status,
     attempt_state,
     claim_attempt,
+    finalize_exit,
     transient_retry_notice,
 )
 
@@ -583,26 +585,61 @@ def run_scrape_job(self, job_id: str) -> None:
             return
         db.refresh(job)
 
+        def _after_missed_write() -> bool:
+            """An attempt-scoped write did not land: does this attempt still own the job?
+
+            The row decides, under its lock, with the same rule finalization uses
+            (`finalize_exit`). Owned -> True: the miss was a swallowed telemetry error
+            (_set_progress never raises). Otherwise the attempt stops, and the two
+            reasons are NOT the same exit (Codex 2c-bis diff r6 P2): a TERMINAL job
+            (cancelled, failed, done) delivered nothing from this attempt, so its quota
+            reservation and dedup claims are handed back (`_terminal_cleanup`, whose
+            releases re-check their own guards, so at most once in effect); a job
+            another attempt now OWNS keeps everything, because it is that attempt's.
+            """
+            decision = finalize_exit(attempt_state(db, job_id, _boot_user_id, attempt_token))
+            db.rollback()
+            if decision is None:
+                return True
+            _logger.info(
+                "Job %s: the attempt token changed or the job is terminal (%s); "
+                "this attempt stops", job_id, decision,
+            )
+            if decision == "terminalized":
+                _terminal_cleanup(db, job_id, _boot_user_id)
+            return False
+
         def _still_ours(landed: bool) -> bool:
             """After a stage write: carry on, or stop this attempt.
 
-            Landed -> carry on. Not landed means the attempt token changed, the job went
-            terminal, or the write hit a swallowed telemetry error (_set_progress never
-            raises); the row decides which, under its lock. Only the last one carries
-            on. A stopped attempt publishes and commits nothing more (Codex 2c-bis
-            diff r4: a stale attempt used to keep narrating onto the replacement's log
-            and, at `connecting`, commit its own date window onto that row).
+            Landed -> carry on; otherwise `_after_missed_write` decides. A stopped
+            attempt publishes and commits nothing more of its own (Codex 2c-bis diff
+            r4: a stale attempt used to keep narrating onto the replacement's log and,
+            at `connecting`, commit its own date window onto that row).
             """
-            if landed:
-                return True
-            owned = attempt_state(db, job_id, _boot_user_id, attempt_token).owned
-            db.rollback()
-            if not owned:
-                _logger.info(
-                    "Job %s: the attempt token changed or the job is terminal; "
-                    "this attempt stops", job_id,
+            return landed or _after_missed_write()
+
+        def _fail_attempt(reason: str, *, notify: bool = True) -> None:
+            """Fail THIS attempt's run; the caller returns afterwards.
+
+            `_fail_job` is token-scoped and releases the reservation itself when it
+            lands. When it does not land the job is terminal or another attempt's,
+            and `_after_missed_write` tells the two apart. The failure notification
+            is sent only for a failure this attempt actually wrote.
+            """
+            if not _fail_job(db, job, r, job_id, reason, expected_started_at=attempt_token):
+                _after_missed_write()
+                return
+            if notify:
+                from src.workers.notification_emit import create_notification
+                create_notification(
+                    user_id=job.user_id, type="job_failed", job_id=job_id,
+                    detail={
+                        "scraper_name": getattr(config, "name", None),
+                        "county": getattr(config, "county", None),
+                        "error_summary": reason[:200],
+                    },
                 )
-            return owned
 
         # THIS attempt's token, held in a local rather than read off the ORM object
         # each time. Every progress and stage write below is scoped to it, so a
@@ -630,7 +667,7 @@ def run_scrape_job(self, job_id: str) -> None:
         if _skip_reason is not None:
             # _fail_job writes the job log line, emits the event and releases any
             # reserved quota, so a skipped run reserves and bills nothing.
-            _fail_job(db, job, r, job_id, _skip_reason, expected_started_at=attempt_token)
+            _fail_attempt(_skip_reason, notify=False)
             return
 
         # The ACCOUNT may still start billable work (audit #4 S4-01). The enqueue
@@ -645,8 +682,7 @@ def run_scrape_job(self, job_id: str) -> None:
         db.refresh(user)
         _eligibility = run_eligibility(user)
         if _eligibility.code in ("frozen", "ended"):
-            _fail_job(db, job, r, job_id, _eligibility.message,
-                      expected_started_at=attempt_token)
+            _fail_attempt(_eligibility.message, notify=False)
             return
 
         # Execution-time entitlement backstop (audit until ENTITLEMENT_ENFORCEMENT).
@@ -670,8 +706,7 @@ def run_scrape_job(self, job_id: str) -> None:
             # _violation is an entitlements.Violation; str() is its customer-facing
             # message. Both strings below reach the user (live log + job error).
             # _fail_job publishes the same line, and only once its CAS lands.
-            _fail_job(db, job, r, job_id, f"{_violation.title}. {_violation.message}",
-                      expected_started_at=attempt_token)
+            _fail_attempt(f"{_violation.title}. {_violation.message}", notify=False)
             return
 
         # Liveness heartbeat RE-ENABLED (2026-09-09) under the condition the
@@ -698,6 +733,7 @@ def run_scrape_job(self, job_id: str) -> None:
         # ── PROBING ───────────────────────────────────────────────────────────
         if not _set_status(db, job, "probing", expected_started_at=attempt_token):
             _logger.info("Job %s externally terminalized (%s) — aborting", job_id, job.status)
+            _after_missed_write()
             return
         _publish_log(r, job_id, "info", "Probing county portal...", db=db)
 
@@ -705,21 +741,13 @@ def run_scrape_job(self, job_id: str) -> None:
             scraper_class, matched_record_type = get_scraper_class(config.county, config.state, config.record_type)
         except UnsupportedCountyError as exc:
             reason = str(exc)
-            if _fail_job(db, job, r, job_id, reason, expected_started_at=attempt_token):
-                from src.workers.notification_emit import create_notification
-                create_notification(
-                    user_id=job.user_id, type="job_failed", job_id=job_id,
-                    detail={
-                        "scraper_name": getattr(config, "name", None),
-                        "county": getattr(config, "county", None),
-                        "error_summary": reason[:200],
-                    },
-                )
+            _fail_attempt(reason)
             return
 
         # ── SCRAPING ──────────────────────────────────────────────────────────
         if not _set_status(db, job, "scraping", expected_started_at=attempt_token):
             _logger.info("Job %s externally terminalized (%s) — aborting", job_id, job.status)
+            _after_missed_write()
             return
         record_label = config.record_type.replace("_", " ").title()
         _publish_log(r, job_id, "success", f"Starting scrape: {record_label} records", db=db)
@@ -937,16 +965,7 @@ def run_scrape_job(self, job_id: str) -> None:
             except Exception:
                 pass
             reason = f"Scraper timed out after {_SCRAPE_TIMEOUT // 60} minutes. Try a shorter date range."
-            if _fail_job(db, job, r, job_id, reason, expected_started_at=attempt_token):
-                from src.workers.notification_emit import create_notification
-                create_notification(
-                    user_id=job.user_id, type="job_failed", job_id=job_id,
-                    detail={
-                        "scraper_name": getattr(config, "name", None),
-                        "county": getattr(config, "county", None),
-                        "error_summary": reason[:200],
-                    },
-                )
+            _fail_attempt(reason)
             return
         except (SoftTimeLimitExceeded, TimeLimitExceeded):
             # A Celery time limit must ESCAPE this handler, not be classified by it.
@@ -1050,16 +1069,7 @@ def run_scrape_job(self, job_id: str) -> None:
             # (started_at unchanged). If a newer attempt re-claimed it — or the
             # retry CAS above no-oped on an ownership change — this no-ops instead
             # of terminalizing a live newer attempt (Codex P1).
-            if _fail_job(db, job, r, job_id, reason, expected_started_at=attempt_token):
-                from src.workers.notification_emit import create_notification
-                create_notification(
-                    user_id=job.user_id, type="job_failed", job_id=job_id,
-                    detail={
-                        "scraper_name": getattr(config, "name", None),
-                        "county": getattr(config, "county", None),
-                        "error_summary": reason[:200],
-                    },
-                )
+            _fail_attempt(reason)
             return
 
         # The authoritative raw scrape total, recorded on the row rather than left in
@@ -1126,6 +1136,7 @@ def run_scrape_job(self, job_id: str) -> None:
                 "Job %s externally terminalized (%s) mid-scrape — discarding without billing",
                 job_id, job.status,
             )
+            _after_missed_write()
             return
         if not _still_ours(_set_stage(db, job, "saving", expected_started_at=attempt_token,
                                       commit=False)):
@@ -1478,16 +1489,7 @@ def run_scrape_job(self, job_id: str) -> None:
                     "run was stopped and you were not charged. Please try again; "
                     "contact support if it keeps failing."
                 )
-                if _fail_job(db, job, r, job_id, reason, expected_started_at=attempt_token):
-                    from src.workers.notification_emit import create_notification
-                    create_notification(
-                        user_id=job.user_id, type="job_failed", job_id=job_id,
-                        detail={
-                            "scraper_name": getattr(config, "name", None),
-                            "county": getattr(config, "county", None),
-                            "error_summary": reason[:200],
-                        },
-                    )
+                _fail_attempt(reason)
                 return
         else:
             # Every OTHER record type collapses its same-run siblings here.
@@ -1659,16 +1661,7 @@ def run_scrape_job(self, job_id: str) -> None:
                 "No file was produced and you were not charged. Please run the "
                 "scraper again; contact support if it keeps failing."
             )
-            if _fail_job(db, job, r, job_id, reason, expected_started_at=attempt_token):
-                from src.workers.notification_emit import create_notification
-                create_notification(
-                    user_id=job.user_id, type="job_failed", job_id=job_id,
-                    detail={
-                        "scraper_name": getattr(config, "name", None),
-                        "county": getattr(config, "county", None),
-                        "error_summary": reason[:200],
-                    },
-                )
+            _fail_attempt(reason)
             return
 
         # ── INLINE ENRICHMENT (BEFORE marking done) ──────────────────────────
@@ -1995,16 +1988,7 @@ def run_scrape_job(self, job_id: str) -> None:
                 reason = (
                     'The lead list could not be re-read after enrichment, so your plan quota could not be applied. No file was delivered and you were not charged. Please run the scraper again; contact support if it keeps failing.' if refreshed is None else 'Your plan quota could not be applied to this run. No file was delivered and you were not charged. Please run the scraper again; contact support if it keeps failing.'
                 )
-                if _fail_job(db, job, r, job_id, reason, expected_started_at=attempt_token):
-                    from src.workers.notification_emit import create_notification
-                    create_notification(
-                        user_id=job.user_id, type="job_failed", job_id=job_id,
-                        detail={
-                            "scraper_name": getattr(config, "name", None),
-                            "county": getattr(config, "county", None),
-                            "error_summary": reason[:200],
-                        },
-                    )
+                _fail_attempt(reason)
                 return
 
             if _capped_ids:
@@ -2150,16 +2134,7 @@ def run_scrape_job(self, job_id: str) -> None:
                 "No file was delivered and you were not charged. Please run the "
                 "scraper again; contact support if it keeps failing."
             )
-            if _fail_job(db, job, r, job_id, reason, expected_started_at=attempt_token):
-                from src.workers.notification_emit import create_notification
-                create_notification(
-                    user_id=job.user_id, type="job_failed", job_id=job_id,
-                    detail={
-                        "scraper_name": getattr(config, "name", None),
-                        "county": getattr(config, "county", None),
-                        "error_summary": reason[:200],
-                    },
-                )
+            _fail_attempt(reason)
             return
 
         # ── PHASE 3: RESULT.property_key (combine/overlap join key) ──────────

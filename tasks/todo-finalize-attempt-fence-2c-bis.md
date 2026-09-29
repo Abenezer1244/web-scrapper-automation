@@ -230,3 +230,19 @@ instant between a telemetry write committing and its publish, or after _still_ou
 released the lock. Cosmetic (a stray log line on the replacement's live stream), no money,
 state or delivery effect. OWNER DECIDED 2026-09-28: (2)+(3) ACCEPTED as a documented follow-up (queued:
 "stale-attempt log-publish races"); proceed to merge. Then: full suite on abcd8f1f, Codex r6.
+
+### Codex diff r6 (on 5564-green code, owner-accepted P2s excluded): GATE FAIL
+- P1 OPEN: paid skip-trace enqueue is not attempt-fenced. `tasks.py` ~2030 (the
+  `_enqueue_skip_trace_rows(... on_begin=lambda: _set_stage(...queuing_contacts...))` call,
+  BEFORE finalization) and `tasks_helpers/enrich.py` ~2491-2753: a stale attempt can write
+  cache/claims and commit queued lookups for a job the replacement owns. Codex fix: after
+  `lock_job_for_claim` (advisory xact lock), `attempt_state(... FOR UPDATE)`; lost/terminal
+  -> rollback, enqueue nothing; hold the lock through the commit. 🛑 memory
+  `set_stage_commits_releases_advisory_lock`: NO commit and NO log line between the advisory
+  lock and the final commit; on_begin must stay BEFORE the lock. Needs its own RED test
+  (two sessions: B re-claims, A enqueues -> zero pending rows / no cache writes).
+- P2 OPEN: early returns on a lost/terminal stage or `_fail_job` miss (`_still_ours`,
+  tasks.py ~463-482 and the fail paths ~1427, 1514-1539, 1567, 1961-1974, 2113-2128) do not
+  distinguish TERMINAL (should run `_terminal_cleanup` after rollback) from LOST (release
+  nothing). Codex fix: one shared decision (reuse `finalize_exit`) at every early return.
+- main moved to fa658ccf: rebase first (then grep for stale names), full suite, Codex r7.

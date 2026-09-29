@@ -1458,6 +1458,14 @@
       "ContactLookupQuote": {
         "description": "What a \"look up contacts\" action on this tab would buy. NON-BINDING and an\nUPPER bound: `max_new_lookups` can only go down by the time the lookups run\n(an answer found meanwhile, or one the account already paid for, is reused at\nno charge), never up. The included allowance is re-read when lookups settle.",
         "properties": {
+          "access": {
+            "enum": [
+              "full",
+              "trial"
+            ],
+            "title": "Access",
+            "type": "string"
+          },
           "advanced_count": {
             "title": "Advanced Count",
             "type": "integer"
@@ -1502,6 +1510,11 @@
             "title": "Max New Lookups",
             "type": "integer"
           },
+          "over_trial_allowance": {
+            "default": 0,
+            "title": "Over Trial Allowance",
+            "type": "integer"
+          },
           "pause": {
             "$ref": "#/components/schemas/ContactLookupPause"
           },
@@ -1517,6 +1530,17 @@
             "title": "Remaining",
             "type": "integer"
           },
+          "trial_credit_allowance": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trial Credit Allowance"
+          },
           "truncated": {
             "title": "Truncated",
             "type": "boolean"
@@ -1526,6 +1550,7 @@
               {
                 "enum": [
                   "cap",
+                  "credit_cap",
                   "scan_limit"
                 ],
                 "type": "string"
@@ -1554,6 +1579,7 @@
           "in_progress",
           "previously_attempted",
           "remaining",
+          "access",
           "included_lookups_remaining",
           "unit_price_cents",
           "currency",

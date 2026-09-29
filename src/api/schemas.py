@@ -1957,7 +1957,9 @@ class ContactLookupQuote(BaseModel):
     # Not-yet-looked-up leads this quote examined.
     examined: int
     truncated: bool
-    truncated_reason: Literal["cap", "scan_limit"] | None = None
+    # cap: 2,000 leads; credit_cap: a free trial's lookup allowance; scan_limit: a
+    # safety bound on one request's work.
+    truncated_reason: Literal["cap", "credit_cap", "scan_limit"] | None = None
     excluded: ContactLookupExcluded
     # Tab-wide counts, from each lead's lookup status.
     already_answered: int
@@ -1965,6 +1967,13 @@ class ContactLookupQuote(BaseModel):
     previously_attempted: int
     # Not-yet-looked-up leads past this quote's window: a later quote covers them.
     remaining: int
+    # `trial`: a free trial, quoted up to its lifetime lookup allowance in CREDITS
+    # (a normal lookup is 1, an address-only one 2). Credits the trial already used
+    # lower it further when the lookups run; paid plans have no such cap.
+    access: Literal["full", "trial"]
+    trial_credit_allowance: int | None = None
+    # Leads examined that did not fit the trial allowance.
+    over_trial_allowance: int = 0
     included_lookups_remaining: int
     unit_price_cents: int
     currency: str

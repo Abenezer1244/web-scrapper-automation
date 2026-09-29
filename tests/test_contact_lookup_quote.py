@@ -122,7 +122,7 @@ def _stored(redis_client, user_id: str, job_id: str, category: str = "new") -> d
 
 
 def _quote_keys(redis_client) -> list[str]:
-    return list(redis_client.scan_iter("bridgeleads:contact_lookup:quote:v1:*"))
+    return list(redis_client.scan_iter("bridgeleads:contact_lookup:quote:*"))
 
 
 async def _set_user(db, user_id: str, **cols) -> None:
@@ -309,6 +309,8 @@ async def test_the_quote_counts_the_tab_and_stores_the_quoted_set(
                              "atip": 0, "not_traceable": 0}
     assert (q["in_progress"], q["already_answered"], q["previously_attempted"]) == (1, 1, 1)
     assert (q["truncated"], q["truncated_reason"], q["remaining"]) == (False, None, 0)
+    assert (q["access"], q["trial_credit_allowance"], q["over_trial_allowance"]) == \
+        ("full", None, 0)
     assert q["included_lookups_remaining"] == 1000
     assert (q["unit_price_cents"], q["currency"]) == (8, "USD")
     assert q["pause"]["status"] == "unknown"  # nothing published in this test
@@ -317,7 +319,10 @@ async def test_the_quote_counts_the_tab_and_stores_the_quoted_set(
         assert rid not in r.text
 
     stored = _stored(redis_client, business_user.id, job)
+    assert stored["v"] == 2
     assert stored["quote_id"] == q["quote_id"]
+    assert (stored["access"], stored["trial_credit_allowance"], stored["quoted_credits"]) == \
+        ("full", None, 5)
     assert (stored["user_id"], stored["job_id"], stored["category"]) == \
         (business_user.id, job, "new")
     assert set(stored["quoted_ids"]) == {*normal, advanced}
@@ -365,6 +370,43 @@ async def test_each_tab_quotes_only_its_own_leads(
     assert _stored(redis_client, business_user.id, job, "new")["quoted_ids"] == [new]
     assert set(_stored(redis_client, business_user.id, job,
                        "already_delivered")["quoted_ids"]) == set(delivered)
+
+
+async def test_a_free_trial_is_quoted_up_to_its_lifetime_allowance(
+    db, client, business_user, business_token, redis_client, _lookups_on, monkeypatch,
+):
+    """A trial (a paid plan name, no subscription) may buy at most its lifetime
+    allowance (audit S3-03/S4-01); the quote says so instead of offering the tab."""
+    monkeypatch.setattr(settings, "SKIP_TRACE_TRIAL_CREDIT_ALLOWANCE", 3)
+    await _set_user(db, business_user.id, plan="pro", subscription_status=None,
+                    trial_ends_at=datetime.now(UTC) + timedelta(days=7))
+    job = _job(business_user.id)
+    t0 = datetime(2026, 9, 1, tzinfo=UTC)
+    ids = _seed(business_user.id, job,
+                [{"created_at": t0 + timedelta(seconds=i)} for i in range(5)])
+    q = (await _quote(client, business_token, job)).json()
+    assert (q["access"], q["trial_credit_allowance"]) == ("trial", 3)
+    assert q["max_new_lookups"] == 3
+    assert (q["truncated"], q["truncated_reason"], q["remaining"]) == (True, "credit_cap", 2)
+    assert q["unit_price_cents"] == 8
+    stored = _stored(redis_client, business_user.id, job)
+    assert stored["quoted_ids"] == ids[:3]
+    assert (stored["access"], stored["trial_credit_allowance"], stored["quoted_credits"]) == \
+        ("trial", 3, 3)
+
+
+async def test_ten_quotes_a_minute_then_429(
+    db, client, business_user, business_token, _lookups_on,
+):
+    """The quote spends its OWN bucket (`lookup_quote`), never the download budget."""
+    job = _job(business_user.id)
+    for i in range(10):
+        r = await _quote(client, business_token, job)
+        assert r.status_code == 200, f"quote {i + 1}: {r.status_code}"
+    assert (await _quote(client, business_token, job)).status_code == 429
+    # The download budget (`export`) is untouched: any answer but 429.
+    r = await client.get(f"/jobs/{job}/export-url", headers=_auth(business_token))
+    assert r.status_code != 429, r.text
 
 
 async def test_a_tab_past_the_cap_is_truncated_with_what_is_left(

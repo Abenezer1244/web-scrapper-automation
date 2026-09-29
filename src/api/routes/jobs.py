@@ -1055,7 +1055,7 @@ async def _bounded(fn, *args, **kwargs):
 
 def _quote_key(user_id: str, job_id: str, category: str) -> str:
     """ONE live quote per tab: a new quote replaces the previous one."""
-    return f"bridgeleads:contact_lookup:quote:v1:{user_id}:{job_id}:{category}"
+    return f"bridgeleads:contact_lookup:quote:v2:{user_id}:{job_id}:{category}"
 
 
 def _lookups_unavailable() -> HTTPException:
@@ -1092,7 +1092,7 @@ async def quote_contact_lookups(
     # Redis refuses here instead of hanging the request (consult r4, R5).
     try:
         await asyncio.wait_for(
-            rate_limit(request, zone="export", identifier=current_user.id),
+            rate_limit(request, zone="lookup_quote", identifier=current_user.id),
             _LOOKUP_REDIS_CALL_BOUND_S,
         )
     except TimeoutError:
@@ -1122,6 +1122,18 @@ async def quote_contact_lookups(
         raise run_refusal_http(eligibility.code, eligibility.message, eligibility.resumes_at)
     if not settings.SKIP_TRACE_ENABLED or not settings.TRACERFY_API_TOKEN:
         raise _lookups_unavailable()
+    # WHO MAY BUY is the claim's own rule (audit S3-03/S4-01), read here without the
+    # claim's row lock: the quote is advisory, and the claim re-reads it locked. The
+    # gates above already refused Starter, frozen and ended accounts; a free trial
+    # is capped at its WHOLE lifetime allowance, since the credits it already used
+    # sit in a worker-only table. The claim's room is the allowance minus those, so
+    # this stays an upper bound (owner decision, 2026-09-28).
+    from src.workers.skip_trace_claim import ACCESS_FULL, ACCESS_TRIAL, paid_lookup_access
+
+    access = paid_lookup_access(current_user, now)
+    if access not in (ACCESS_FULL, ACCESS_TRIAL):
+        raise _lookups_unavailable()  # unreachable after the gates above; fail closed
+    credit_cap = settings.SKIP_TRACE_TRIAL_CREDIT_ALLOWANCE if access == ACCESS_TRIAL else None
 
     # Redis BEFORE the scan: a quote nobody can store is never computed (R4).
     try:
@@ -1133,7 +1145,8 @@ async def quote_contact_lookups(
     user_id = str(current_user.id)
     policy = policy_from_settings()
     buckets = status_buckets(await tab_status_counts(db, job_id, user_id, body.category, today))
-    window = await plan_tab_window(db, job_id, user_id, body.category, today, policy)
+    window = await plan_tab_window(db, job_id, user_id, body.category, today, policy,
+                                   credit_cap=credit_cap)
     remaining = await count_remaining(db, job_id, user_id, body.category, today, window)
     truncated = window.stopped is not None and remaining > 0
 
@@ -1149,13 +1162,17 @@ async def quote_contact_lookups(
     quote_id = secrets.token_urlsafe(32)
     expires_at = now + timedelta(seconds=_QUOTE_TTL_SECONDS)
     payload = {
-        "v": 1,
+        "v": 2,
         "quote_id": quote_id,
         "user_id": user_id,
         "job_id": job_id,
         "category": body.category,
         "quoted_ids": window.quoted_ids,
         "advanced_count": window.advanced_count,
+        "quoted_credits": window.quoted_credits,
+        "access": access,
+        "trial_credit_allowance": credit_cap,
+        "over_credit_cap": window.over_credit_cap,
         "counts": {**window.counts, **buckets},
         "examined": window.examined,
         "window_end": (None if window.window_end is None
@@ -1192,6 +1209,9 @@ async def quote_contact_lookups(
         in_progress=buckets[IN_PROGRESS],
         previously_attempted=buckets[PREVIOUSLY_ATTEMPTED],
         remaining=remaining,
+        access=access,
+        trial_credit_allowance=credit_cap,
+        over_trial_allowance=window.over_credit_cap,
         included_lookups_remaining=included,
         unit_price_cents=unit_cents,
         currency=LOOKUP_CURRENCY,

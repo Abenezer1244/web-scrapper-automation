@@ -228,5 +228,5 @@ Codex diff review: r1-r4 FAIL, all fixed; r5 FAIL on P2s only: (1) date window (
 abcd8f1f); (2)+(3) log-publish races: a stale attempt's log line can still slip out in the
 instant between a telemetry write committing and its publish, or after _still_ours
 released the lock. Cosmetic (a stray log line on the replacement's live stream), no money,
-state or delivery effect. OWNER DECISION: accept (2)+(3) as a documented follow-up and
-merge, or keep iterating. Then: full suite on abcd8f1f, Codex r6.
+state or delivery effect. OWNER DECIDED 2026-09-28: (2)+(3) ACCEPTED as a documented follow-up (queued:
+"stale-attempt log-publish races"); proceed to merge. Then: full suite on abcd8f1f, Codex r6.

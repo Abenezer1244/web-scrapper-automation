@@ -582,6 +582,28 @@ def run_scrape_job(self, job_id: str) -> None:
             )
             return
         db.refresh(job)
+
+        def _still_ours(landed: bool) -> bool:
+            """After a stage write: carry on, or stop this attempt.
+
+            Landed -> carry on. Not landed means the attempt token changed, the job went
+            terminal, or the write hit a swallowed telemetry error (_set_progress never
+            raises); the row decides which, under its lock. Only the last one carries
+            on. A stopped attempt publishes and commits nothing more (Codex 2c-bis
+            diff r4: a stale attempt used to keep narrating onto the replacement's log
+            and, at `connecting`, commit its own date window onto that row).
+            """
+            if landed:
+                return True
+            owned = attempt_state(db, job_id, _boot_user_id, attempt_token).owned
+            db.rollback()
+            if not owned:
+                _logger.info(
+                    "Job %s: the attempt token changed or the job is terminal; "
+                    "this attempt stops", job_id,
+                )
+            return owned
+
         # THIS attempt's token, held in a local rather than read off the ORM object
         # each time. Every progress and stage write below is scoped to it, so a
         # callback that arrives late — from an attempt the watchdog already replaced
@@ -668,7 +690,9 @@ def run_scrape_job(self, job_id: str) -> None:
         _hb.start(attempt_token)
         # Stage rides the commit that _publish_log already performs, so no new commit
         # point is introduced into the work session (see _set_progress).
-        _set_stage(db, job, "preparing", expected_started_at=attempt_token, commit=False)
+        if not _still_ours(_set_stage(db, job, "preparing", expected_started_at=attempt_token,
+                                      commit=False)):
+            return
         _publish_log(r, job_id, "info", f"Job queued: {config.name} ({config.county}, {config.state})", db=db)
 
         # ── PROBING ───────────────────────────────────────────────────────────
@@ -848,9 +872,10 @@ def run_scrape_job(self, job_id: str) -> None:
             if _set_stage(db, job, stage, expected_started_at=attempt_token):
                 _last_stage[0] = stage
 
-        _set_stage(
+        if not _still_ours(_set_stage(
             db, job, "connecting", expected_started_at=attempt_token, commit=False,
-        )
+        )):
+            return
         _publish_log(r, job_id, "info", "Connecting to county portal...", db=db)
         # Flush the resolved date window to disk before entering the scraper, which
         # can run for up to _SCRAPE_TIMEOUT below. Until this commits, job.date_from
@@ -1085,7 +1110,9 @@ def run_scrape_job(self, job_id: str) -> None:
                 job_id, job.status,
             )
             return
-        _set_stage(db, job, "saving", expected_started_at=attempt_token, commit=False)
+        if not _still_ours(_set_stage(db, job, "saving", expected_started_at=attempt_token,
+                                      commit=False)):
+            return
         _publish_log(r, job_id, "info", "Saving records to database...", db=db)
 
         # Bulk insert results (truncate fields to fit DB column limits)
@@ -1249,7 +1276,9 @@ def run_scrape_job(self, job_id: str) -> None:
         # NOTHING tells us which rows were successfully claimed (first
         # delivery) vs which conflicted (user has seen this lead before).
         # The conflicting rows get their Result flagged is_duplicate=true.
-        _set_stage(db, job, "deduping", expected_started_at=attempt_token, commit=False)
+        if not _still_ours(_set_stage(db, job, "deduping", expected_started_at=attempt_token,
+                                      commit=False)):
+            return
         _publish_log(r, job_id, "info", "Checking for duplicate leads...", db=db)
         _logger.info("Job %s: dedup step 1 — SELECT fresh rows", job_id)
 
@@ -1501,7 +1530,9 @@ def run_scrape_job(self, job_id: str) -> None:
 
         # Export runs BEFORE enrichment, which is why the stage list is not a
         # pipeline and why nothing may read "step N of M" off it.
-        _set_stage(db, job, "exporting", expected_started_at=attempt_token, commit=False)
+        if not _still_ours(_set_stage(db, job, "exporting", expected_started_at=attempt_token,
+                                      commit=False)):
+            return
         _publish_log(r, job_id, "info", f"Building {fmt.upper()} export...", db=db)
 
         # Build the FIRST deliverable from the PERSISTED rows for every record type.
@@ -1639,7 +1670,9 @@ def run_scrape_job(self, job_id: str) -> None:
         # request's wait. If a hang slips through both, Celery hard-kills
         # the worker — which is what the previous thread guard was
         # actually relying on anyway.
-        _set_stage(db, job, "enriching", expected_started_at=attempt_token, commit=False)
+        if not _still_ours(_set_stage(db, job, "enriching", expected_started_at=attempt_token,
+                                      commit=False)):
+            return
         _publish_log(r, job_id, "info", "Looking up property and mailing addresses...", db=db)
         # Skip trace is enqueued only after a completed enrichment, and only after
         # the plan cap below (never for a row that will not be delivered).

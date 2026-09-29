@@ -603,3 +603,34 @@ def test_every_status_and_fail_write_in_run_scrape_job_carries_the_token():
     assert body.count("release_run_claims_if_owned(db, job_id, _boot_user_id, attempt_token)") == 4
     cap = body[body.index("release_capped_dedup_claims(") - 400:body.index("release_capped_dedup_claims(")]
     assert "attempt_state(db, job_id, _boot_user_id, attempt_token).owned" in cap
+
+
+def test_an_unexplained_done_cas_miss_raises_and_releases_nothing(run, redis_client, monkeypatch):
+    """Codex diff r4 P2: the job is still ours and live, yet the done-CAS missed.
+    Terminal cleanup would refund a live job's reservation, so it must raise instead."""
+    monkeypatch.setattr(fin, "_set_status", lambda *a, **k: False)
+
+    with pytest.raises(RuntimeError, match="done transition did not land"):
+        _finalize(run, run["a"], redis_client)
+    snap = _snapshot(run)
+    assert (snap["records_used"], snap["job"][7], snap["claims"]) == (2, 2, 2)
+
+
+def test_every_stage_write_in_run_scrape_job_stops_a_lost_attempt():
+    """Codex diff r4 P2: a stage write that did not land means the attempt may have
+    lost the job; each one goes through _still_ours before anything is published."""
+    from src.workers.tasks import run_scrape_job
+
+    body = _live(inspect.getsource(run_scrape_job.__wrapped__))
+    stages = [c for c in _calls(body, "_set_stage") if c.startswith('_set_stage(db, job, "')
+              or c.startswith("_set_stage(\n")]
+    # The one exception: skip trace's on_begin callback. It only writes the stage
+    # (token-scoped, so a stale attempt's write does not land), publishes nothing,
+    # and runs after DONE, which only the owner reaches.
+    callback = [c for c in stages if '"queuing_contacts"' in c]
+    assert len(callback) == 1 and "expected_started_at=attempt_token" in callback[0]
+    direct = [c for c in stages if c not in callback]
+    assert len(direct) >= 6
+    for call in direct:
+        i = body.index(call)
+        assert body[max(0, i - 30):i].rstrip().endswith("_still_ours("), call

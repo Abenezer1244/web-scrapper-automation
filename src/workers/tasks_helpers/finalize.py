@@ -405,7 +405,13 @@ def finalize_billing_and_done(
         # that attempt is reusing. (Unreachable while the billing lock is held; kept
         # so the done-CAS never depends on where it is called from.)
         stop = _fenced_exit(db, job_id, _boot_user_id, attempt_token, "done")
-        if stop is not None and stop.kind is FinalizeKind.LOST_OWNERSHIP:
+        if stop is None:
+            # Still ours and not terminal, yet the done-CAS did not land: nothing
+            # explains it, so never guess. No cleanup (that would refund a live
+            # job's reservation); the uncaught-failure hook fails it attempt-scoped.
+            db.rollback()
+            raise RuntimeError(f"job {job_id}: the done transition did not land")
+        if stop.kind is FinalizeKind.LOST_OWNERSHIP:
             return stop
         db.rollback()
         db.refresh(job)

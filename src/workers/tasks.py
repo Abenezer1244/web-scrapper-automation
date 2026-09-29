@@ -742,6 +742,7 @@ def run_scrape_job(self, job_id: str) -> None:
             )
         ).scalars().first()
         max_days = connector.max_date_range_days if connector else None
+        _trim_notice = None
         if max_days:
             from datetime import timedelta as _td
             _df = datetime.strptime(date_from, "%m/%d/%Y")
@@ -751,15 +752,31 @@ def run_scrape_job(self, job_id: str) -> None:
                 # Trim date_from to respect the limit (keep the most recent data)
                 _df = _dt - _td(days=max_days)
                 date_from = _df.strftime("%m/%d/%Y")
-                _publish_log(
-                    r, job_id, "warning",
-                    f"{config.county.title()} County supports max {max_days} days. Range trimmed to {date_from} → {date_to}.",
-                    db=db,
+                _trim_notice = (
+                    f"{config.county.title()} County supports max {max_days} days. "
+                    f"Range trimmed to {date_from} → {date_to}."
                 )
 
-        job.date_from = date_from
-        job.date_to = date_to
-        db.flush()
+        # The resolved window is written ONLY onto this attempt's row: a token-scoped
+        # UPDATE, not an ORM assignment flushed by primary key, which a stale attempt
+        # would have committed onto the replacement's row (Codex 2c-bis diff r5). The
+        # ORM copy is updated without being marked dirty, so no later flush re-writes
+        # it unfenced. Nothing is published until the write has landed.
+        from sqlalchemy import update as _sa_update
+        from sqlalchemy.orm.attributes import set_committed_value
+
+        _dated = db.execute(
+            _sa_update(Job)
+            .where(Job.id == job_id, Job.status.not_in(_TERMINAL_STATUSES),
+                   *_attempt_clauses(attempt_token))
+            .values(date_from=date_from, date_to=date_to)
+        ).rowcount
+        if not _still_ours(_dated == 1):
+            return
+        set_committed_value(job, "date_from", date_from)
+        set_committed_value(job, "date_to", date_to)
+        if _trim_notice:
+            _publish_log(r, job_id, "warning", _trim_notice, db=db)
         _publish_log(r, job_id, "info", f"Date range: {date_from} → {date_to} (mode: {range_mode})", db=db)
 
         _last_phase = [None]  # mutable for closure

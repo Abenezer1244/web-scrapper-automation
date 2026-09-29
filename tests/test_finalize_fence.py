@@ -634,3 +634,15 @@ def test_every_stage_write_in_run_scrape_job_stops_a_lost_attempt():
     for call in direct:
         i = body.index(call)
         assert body[max(0, i - 30):i].rstrip().endswith("_still_ours("), call
+
+
+def test_the_date_window_is_written_only_onto_this_attempts_row():
+    """Codex diff r5 P2: the resolved window used to be an ORM assignment flushed by
+    primary key, so a stale attempt committed it onto the replacement's row."""
+    from src.workers.tasks import run_scrape_job
+
+    body = _live(inspect.getsource(run_scrape_job.__wrapped__))
+    assert "job.date_from = " not in body and "job.date_to = " not in body
+    write = body[body.index(".values(date_from=date_from, date_to=date_to)") - 300:]
+    assert "*_attempt_clauses(attempt_token)" in write[:300]
+    assert "if not _still_ours(_dated == 1):" in write

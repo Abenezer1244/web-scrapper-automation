@@ -2936,6 +2936,28 @@ trial-cap disposition/reason at the 1b-2 confirm.
   and the trial room under the user-row lock, refuses a payload whose `v` it does not know, and
   records the trial-held leads with an explicit reason.
 
+### Amendments BUILT (2026-09-28)
+- **Precursor PR #386** (`feat/lookup-quote-rate-zone`, 4 files): the `lookup_quote` zone
+  (10/min, fail-closed; 6 tests, 3/3 mutations) AND the planner's `credit_cap` (moved here so ii
+  stays at 5 files): `Window.credit_cap` / `quoted_credits` / `over_credit_cap`,
+  `stopped="credit_cap"`, applied exactly as `claim_skip_trace_rows` applies its room (in order,
+  skip a lead that does not fit, keep a cheaper later one), `CREDITS` pinned equal to the
+  worker's `CREDITS_PER_ROW`, `PLANNER_VERSION` 2. **Parity with the REAL claim in trial mode**
+  (what it keeps == what the planner quotes); 6/6 mutations. Codex r1 GO, r2 NO-GO (P2 the
+  window should carry its cap, P3 docstring) fixed, r3 GO, r4 GO after rebase onto `fa658ccf`.
+  **A flaky test caught before push:** rows sharing one `created_at` were ordered by random id,
+  so the trial test's credit total varied (it had passed once by luck). Each row now has its own.
+- **ii** (on top of #386): `paid_lookup_access()` decides access (lazy import); a trial is
+  capped via `credit_cap = SKIP_TRACE_TRIAL_CREDIT_ALLOWANCE`; response adds `access`,
+  `trial_credit_allowance`, `over_trial_allowance`, `truncated_reason` may be `credit_cap`;
+  zone `lookup_quote`; payload and key `v2`. 26 quote tests; **18/18 mutations** (4 new: trial
+  cap not applied, zone back to `export`, access by plan name only, payload v1); openapi +352,
+  0 deletions, `--check` OK. Regression on the full stack: **923+ passed, 0 failed**.
+- 🛑 **CI BLOCKED (2026-09-28): GitHub Actions billing.** #386's re-run on `acdcadcf` failed in 3 s
+  ("recent account payments have failed or your spending limit needs to be increased"). Its
+  previous head (`3a990e0e`) had passed CI, but `main` moved (#387, docs), so the gate needs a
+  new green run. Nothing merges until the owner fixes billing.
+
 **Files:** i = planner, `lookup_pricing.py`, planner tests, `docs/BUILD_JOURNAL.md`, this plan;
 ii = `routes/jobs.py`, `schemas.py`, `schema/openapi.json`, quote tests, this plan.
 **Logged follow-ups:** `/skip-trace-usage` onto `lookup_pricing` + `normalize_plan` + the roll

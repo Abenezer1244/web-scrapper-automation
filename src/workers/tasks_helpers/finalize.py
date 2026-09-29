@@ -159,7 +159,7 @@ def finalize_billing_and_done(
             "Job %s externally terminalized (%s) after export — skipping billing/delivery",
             job_id, job.status,
         )
-        _release_claims_of_cancelled_job(db, job_id, _boot_user_id)
+        _terminal_cleanup(db, job_id, _boot_user_id)
         return FinalizeOutcome(FinalizeKind.ALREADY_TERMINAL)
 
     # Last stage boundary. It goes HERE, before the billing reads open the
@@ -176,7 +176,7 @@ def finalize_billing_and_done(
         stop = _fenced_exit(db, job_id, _boot_user_id, attempt_token, "stage")
         if stop is not None:
             if stop.kind is FinalizeKind.ALREADY_TERMINAL:
-                _release_claims_of_cancelled_job(db, job_id, _boot_user_id)
+                _terminal_cleanup(db, job_id, _boot_user_id)
             return stop
         db.rollback()  # still ours: end the check's transaction, keep going
 
@@ -187,7 +187,7 @@ def finalize_billing_and_done(
     stop = _fenced_exit(db, job_id, _boot_user_id, attempt_token, "billing")
     if stop is not None:
         if stop.kind is FinalizeKind.ALREADY_TERMINAL:
-            _release_claims_of_cancelled_job(db, job_id, _boot_user_id)
+            _terminal_cleanup(db, job_id, _boot_user_id)
         return stop
 
     # Atomic update of monthly record usage.
@@ -303,41 +303,7 @@ def finalize_billing_and_done(
         # locked by the billing CAS above, and FOR UPDATE OF u takes only
         # the users row. Locking users first here would invert against a
         # concurrent watchdog re-run and deadlock.
-        _settle = db.execute(
-            sa_text(
-                "WITH cur AS ("
-                "  SELECT u.id, u.records_used, u.records_limit,"
-                "         u.quota_anchor_at, u.quota_period_start,"
-                "         u.quota_period_end, u.subscription_status,"
-                "         u.entitlement_grace_ends_at, u.entitlement_ends_at,"
-                "         u.pending_plan, u.pending_records_limit,"
-                "         u.records_period_start,"
-                "         j.quota_period_start AS job_window,"
-                "         j.reserved_at AS job_reserved_at,"
-                "         j.reserved_count AS job_reserved"
-                "  FROM users u JOIN jobs j ON j.user_id = u.id"
-                "  WHERE j.id = :jid FOR UPDATE OF u"
-                "), w AS ("
-                "  SELECT cur.*, " + window_cte_sql("", ":billed_at") + " FROM cur"
-                "), s AS ("
-                "  SELECT w.*, CASE WHEN "
-                + reservation_is_current_sql(
-                    job_window="job_window",
-                    job_reserved_at="job_reserved_at",
-                    user_window="quota_period_start",
-                    user_records_period_start="records_period_start",
-                )
-                + "    THEN job_reserved ELSE 0 END AS applied_reserved"
-                "  FROM w"
-                ") UPDATE users u SET"
-                "    records_used = GREATEST(0, s.base + (:billable - s.applied_reserved)),"
-                + window_set_sql("s")
-                + "  FROM s WHERE u.id = s.id"
-                "  RETURNING s.applied_reserved, s.job_reserved, s.rolling"
-            ),
-            {"jid": job_id, "billable": billable_count,
-             "billed_at": _billed_at},
-        ).fetchone()
+        _settle = _settle_user_charge(db, job_id, billable_count, _billed_at)
         user_billed = 0 if _settle is None else 1
         if _settle is not None:
             _reserved = int(_settle.job_reserved or 0)
@@ -364,10 +330,7 @@ def finalize_billing_and_done(
             stop = _fenced_exit(db, job_id, _boot_user_id, attempt_token, "billing_failed")
             if stop is not None:
                 if stop.kind is FinalizeKind.ALREADY_TERMINAL:
-                    from src.workers.tasks_helpers.status import release_quota_reservation
-
-                    release_quota_reservation(db, job_id)
-                    _release_claims_of_cancelled_job(db, job_id, _boot_user_id)
+                    _terminal_cleanup(db, job_id, _boot_user_id)
                 return stop
             db.rollback()  # still ours: _fail_job runs its own transaction
             if _fail_job(db, job, r, job_id, reason, expected_started_at=attempt_token):
@@ -382,6 +345,14 @@ def finalize_billing_and_done(
                 )
             return FinalizeOutcome(FinalizeKind.BILLING_FAILED)
     else:
+        # The CAS also misses when this attempt no longer owns the job, so the row
+        # decides (still under the billing lock): only an owner reaches the
+        # already-billed path.
+        stop = _fenced_exit(db, job_id, _boot_user_id, attempt_token, "billing_cas")
+        if stop is not None:
+            if stop.kind is FinalizeKind.ALREADY_TERMINAL:
+                _terminal_cleanup(db, job_id, _boot_user_id)
+            return stop
         _logger.info(
             "Job %s already billed (billing_applied_at set) — skipping "
             "records_used increment on this re-run", job_id,
@@ -429,10 +400,7 @@ def finalize_billing_and_done(
         # RESERVATION was committed earlier in its own transaction and is
         # still charged to the user. A cancelled job delivers nothing, so
         # hand it back rather than leaving a permanent phantom charge.
-        from src.workers.tasks_helpers.status import release_quota_reservation
-
-        release_quota_reservation(db, job_id)
-        _release_claims_of_cancelled_job(db, job_id, _boot_user_id)
+        _terminal_cleanup(db, job_id, _boot_user_id)
         _logger.info(
             "Job %s externally terminalized (%s) — suppressing completion delivery",
             job_id, job.status,
@@ -463,3 +431,58 @@ def _fenced_exit(db, job_id: str, boot_user_id, attempt_token, where: str) -> Fi
         "completing or releasing anything", job_id, where,
     )
     return FinalizeOutcome(FinalizeKind.LOST_OWNERSHIP)
+
+
+def _settle_user_charge(db, job_id: str, billable_count: int, _billed_at):
+    """Charge the user the delta between what was delivered and what the plan cap
+    reserved, in the entitlement window the charge belongs to. The statement moved
+    here verbatim from finalize_billing_and_done (see the comments above its call).
+    Returns the RETURNING row, or None when the user counter did not move, which the
+    caller treats as a billing failure."""
+    return db.execute(
+        sa_text(
+            "WITH cur AS ("
+            "  SELECT u.id, u.records_used, u.records_limit,"
+            "         u.quota_anchor_at, u.quota_period_start,"
+            "         u.quota_period_end, u.subscription_status,"
+            "         u.entitlement_grace_ends_at, u.entitlement_ends_at,"
+            "         u.pending_plan, u.pending_records_limit,"
+            "         u.records_period_start,"
+            "         j.quota_period_start AS job_window,"
+            "         j.reserved_at AS job_reserved_at,"
+            "         j.reserved_count AS job_reserved"
+            "  FROM users u JOIN jobs j ON j.user_id = u.id"
+            "  WHERE j.id = :jid FOR UPDATE OF u"
+            "), w AS ("
+            "  SELECT cur.*, " + window_cte_sql("", ":billed_at") + " FROM cur"
+            "), s AS ("
+            "  SELECT w.*, CASE WHEN "
+            + reservation_is_current_sql(
+                job_window="job_window",
+                job_reserved_at="job_reserved_at",
+                user_window="quota_period_start",
+                user_records_period_start="records_period_start",
+            )
+            + "    THEN job_reserved ELSE 0 END AS applied_reserved"
+            "  FROM w"
+            ") UPDATE users u SET"
+            "    records_used = GREATEST(0, s.base + (:billable - s.applied_reserved)),"
+            + window_set_sql("s")
+            + "  FROM s WHERE u.id = s.id"
+            "  RETURNING s.applied_reserved, s.job_reserved, s.rolling"
+        ),
+        {"jid": job_id, "billable": billable_count,
+         "billed_at": _billed_at},
+    ).fetchone()
+
+
+def _terminal_cleanup(db, job_id: str, boot_user_id) -> None:
+    """A job found terminal during finalization delivered nothing: hand back its quota
+    reservation and its dedup claims. Both re-check their own guards (the reservation
+    only while unbilled and still in its window; claims only for a cancelled, unbilled
+    job), so this is safe from every terminal exit and at most once in effect. Called
+    after the finalization transaction was rolled back."""
+    from src.workers.tasks_helpers.status import release_quota_reservation
+
+    release_quota_reservation(db, job_id)
+    _release_claims_of_cancelled_job(db, job_id, boot_user_id)

@@ -300,16 +300,23 @@ def test_b_cannot_get_between_a_billing_and_done_on_the_already_billed_path(
 
 @pytest.mark.parametrize("terminal", _TERMINAL_STATUSES)
 def test_a_terminal_job_with_the_same_token_bills_nothing(run, redis_client, terminal):
+    """Not billed, and the cleanup runs right away (Codex diff r1 P1): a cancelled or
+    failed run hands its reservation back; a done run (which billed) keeps its charge."""
+    billed = terminal == "done"
     with SyncSessionLocal() as s:
-        s.execute(text("UPDATE jobs SET status = :t WHERE id = :j"),
-                  {"t": terminal, "j": run["job_id"]})
+        s.execute(text("UPDATE jobs SET status = :t, billing_applied_at = "
+                       "CASE WHEN :b THEN now() END WHERE id = :j"),
+                  {"t": terminal, "b": billed, "j": run["job_id"]})
         s.commit()
+    billed_at_before = _snapshot(run)["job"][3]
 
     outcome = _finalize(run, run["a"], redis_client)
 
     assert outcome.kind is FinalizeKind.ALREADY_TERMINAL
     snap = _snapshot(run)
-    assert snap["job"][3] is None and snap["records_used"] == 2   # not billed
+    assert snap["job"][3] == billed_at_before                      # A billed nothing
+    assert snap["records_used"] == (2 if billed else 0)
+    assert snap["job"][7] == (2 if billed else 0)                  # reserved_count
 
 
 # ── B5 after A lost, the replacement settles or cleans up exactly once ───────
@@ -340,8 +347,7 @@ def test_after_a_lost_b_is_cancelled_releases_once(run, redis_client):
         s.commit()
 
     assert _finalize(run, b, redis_client).kind is FinalizeKind.ALREADY_TERMINAL
-    with SyncSessionLocal() as s:   # the reservation's owner of last resort: the beat sweep
-        assert release_quota_reservation(s, run["job_id"]) == 2
+    with SyncSessionLocal() as s:   # already handed back by B's terminal cleanup
         assert release_quota_reservation(s, run["job_id"]) == 0
     snap = _snapshot(run)
     assert (snap["records_used"], snap["claims"]) == (0, 0)
@@ -355,6 +361,76 @@ def test_after_a_lost_b_fails_releases_once(run, redis_client):
         assert release_quota_reservation(s, run["job_id"]) == 0   # already given back
     snap = _snapshot(run)
     assert snap["job"][0] == "failed" and snap["records_used"] == 0
+
+
+# ── B6 the billing-failed branch (the user counter did not move) ─────────────
+# That failure (a deleted user, an RLS scope) cannot be produced by real data, so
+# the settle statement is replaced by one that moved nothing. Everything else is the
+# production path, and B acts at the branch's own ownership check.
+
+def _counter_does_not_move(monkeypatch):
+    monkeypatch.setattr(fin, "_settle_user_charge", lambda *a, **k: None)
+
+
+def _before_billing_failed_check(monkeypatch, action):
+    real = fin._fenced_exit
+
+    def wrapped(db, job_id, uid, token, where):
+        if where == "billing_failed":
+            action()
+        return real(db, job_id, uid, token, where)
+
+    monkeypatch.setattr(fin, "_fenced_exit", wrapped)
+
+
+def test_billing_failed_owned_fails_the_job_once(run, redis_client, monkeypatch):
+    _counter_does_not_move(monkeypatch)
+
+    outcome = _finalize(run, run["a"], redis_client)
+
+    assert outcome.kind is FinalizeKind.BILLING_FAILED
+    snap = _snapshot(run)
+    assert snap["job"][0] == "failed" and snap["job"][3] is None   # failed, not billed
+    assert (snap["records_used"], snap["job"][7]) == (0, 0)       # reservation back
+    assert snap["notifications"] == 1
+
+
+def test_billing_failed_lost_does_nothing(run, redis_client, monkeypatch):
+    _counter_does_not_move(monkeypatch)
+    state = {}
+
+    def b_reclaims():
+        state["b"] = _requeue_and_claim(run, run["a"])
+        state["before"] = _snapshot(run)
+
+    _before_billing_failed_check(monkeypatch, b_reclaims)
+    ch = _Channel(redis_client, run["job_id"])
+
+    outcome = _finalize(run, run["a"], redis_client)
+
+    assert state["b"] is not None
+    assert outcome.kind is FinalizeKind.LOST_OWNERSHIP
+    _assert_a_did_nothing(state["before"], _snapshot(run), ch.drain())
+
+
+def test_billing_failed_terminal_cleans_up_once(run, redis_client, monkeypatch):
+    _counter_does_not_move(monkeypatch)
+
+    def cancelled():
+        with SyncSessionLocal() as s:
+            s.execute(text("UPDATE jobs SET status = 'cancelled' WHERE id = :j"),
+                      {"j": run["job_id"]})
+            s.commit()
+
+    _before_billing_failed_check(monkeypatch, cancelled)
+
+    outcome = _finalize(run, run["a"], redis_client)
+
+    assert outcome.kind is FinalizeKind.ALREADY_TERMINAL
+    snap = _snapshot(run)
+    assert (snap["job"][0], snap["job"][3]) == ("cancelled", None)
+    assert (snap["records_used"], snap["job"][7], snap["claims"]) == (0, 0, 0)
+    assert snap["notifications"] == 0
 
 
 # ── B6/B8 a forced timestamp collision: A's token matches B's started_at ──────

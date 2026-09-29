@@ -19,68 +19,64 @@ config eligibility (`config_eligibility.py:149`), the scheduler
 (`scheduler_helpers/dispatch.py:52`) and the batch fan-out (`batch_tasks.py:235`).
 Fixing the predicate therefore fixes every path.
 
-## Design (proposed, before the Codex consult)
+## Design (as built, after two Codex consults)
 
-Make liveness observable after a cancel, and release the slot on positive evidence
-that the worker has stopped:
+The design first proposed (keep beating cancelled rows; release on a stale beat)
+was rejected by Codex consult r1: heartbeat writes are best-effort, so a heartbeat
+outage would release the slot under a live worker. As built:
 
-1. **Keep beating a cancelled-but-running attempt.** `_HEARTBEAT_SQL` excludes only
-   `done`/`failed`. A cancelled row's `last_heartbeat_at` then keeps moving while the
-   worker process lives. The write stays attempt-scoped (`started_at = :sa`), so it
-   cannot touch another attempt.
-2. **Exit acknowledgement.** When the task body exits (`HeartbeatThread.stop()` from
-   `__exit__`, which covers return, exception and soft timeout), after the thread is
-   joined: `UPDATE jobs SET last_heartbeat_at = NULL WHERE id=:j AND started_at=:sa
-   AND status='cancelled'`. NULL on a started cancelled row means "the worker said it
-   stopped". Every claim stamps `last_heartbeat_at`, so a started row has NULL only
-   after this acknowledgement.
-3. **Predicate.** A cancelled job holds the slot while
-   `started_at IS NOT NULL AND last_heartbeat_at > now - HEARTBEAT_STALE_MINUTES`
-   (15 min, the constant the watchdog and the UI already share). A hard-killed worker
-   (deploy, OOM, hard limit) stops beating and releases the slot after at most 15
-   minutes of silence. A clean exit releases it immediately.
-   `RUN_SLOT_CANCEL_COOLDOWN_SECONDS` goes away.
+1. **Exit acknowledgement is authoritative.** `HeartbeatThread.__exit__` (the
+   outermost `with` of `run_scrape_job`, after the work session closed) runs
+   `_acknowledge_exit`: `UPDATE jobs SET last_heartbeat_at = NULL WHERE id AND
+   started_at = <this attempt> AND status = 'cancelled'`. It is attempt-scoped and
+   touches only cancelled rows. Errors are logged, never raised (Celery time limits
+   are re-raised per `reraise_time_limit`).
+2. **Otherwise the hard limit.** A cancelled, unacknowledged attempt holds the slot
+   until `started_at + RUN_SCRAPE_TIME_LIMIT_S + 120 s` (`Job.RUN_SLOT_RELEASE_AFTER_S`).
+   Prefork kills the child at the hard limit, and the claim runs inside the task.
+3. **One clock.** The claim stamps `started_at`/`last_heartbeat_at` with the DB's
+   `now()`, and `holds_run_slot()` judges age by the DB's `now()` (consult r2 P1,
+   clock skew). The `now` parameter is gone from all four call sites.
+4. **The heartbeat starts right after the claim**, before the gates that can
+   return, so every exit of a claimed attempt acknowledges.
+5. The task decorator reads `RUN_SCRAPE_(SOFT_)TIME_LIMIT_S` from constants.
+6. The heartbeat SQL is unchanged (it still never writes a cancelled row), so a
+   late beat cannot undo the acknowledgement.
 
-No migration. There are no pre-deploy stragglers: a deploy restarts the worker, and
-old cancelled rows carry their last beat, so they drop out within 15 minutes.
-
-### Alternatives considered
-
-- **New `worker_stopped_at` column (migration).** Cleaner semantics, but it needs a
-  migration (quiesce and deploy risk). Without liveness it also has to fall back to
-  the 65 min ceiling after a crash. Rejected unless Codex objects to the NULL overload.
-- **A longer fixed cooldown (65 min = the hard limit).** Correct but a bad UX: every
-  cancel blocks the scraper for an hour.
-- **Keep the 300 s floor AND the heartbeat.** Strictly no weaker than today even if
-  heartbeats fail; costs the fast release. Open question for Codex.
-
-## Open questions for Codex
-
-- Is overloading `last_heartbeat_at = NULL` as the acknowledgement safe? Does any
-  reader treat NULL on a cancelled row differently?
-- Should the window be 15 min (shared constant) or shorter for cancelled rows?
-- Race: `stop()` joins with a 2 s timeout. A heartbeat write in flight after the
-  acknowledgement re-stamps the row, so the slot is held up to 15 min (safe
-  direction). Acceptable?
-- Can anything keep writing claims after the task body exits (threads, pools)?
+Rejected (consult r2 P1): "the watchdog re-queue must be fenced". The watchdog
+selects only active statuses, and `_recovery_cas` already CASes status +
+started_at + retry_count.
 
 ## Steps
 
-- [ ] 1. Consult Codex on the design (inline, `codex exec -s read-only`); reconcile.
-- [ ] 2. Regression test (real `HeartbeatThread`, real SQL): claim a job, start the
-      heartbeat, cancel it, move `finished_at` back 301 s, and assert the slot is
-      still held while the thread is alive. **Prove it FAILS on main.**
-- [ ] 3. Tests: a clean exit releases the slot at once; a silent worker (stale beat)
-      releases it; a stale attempt's thread cannot refresh.
-- [ ] 4. Implement 1-3 (`status.py`, `models.py`, the comment in `routes/jobs.py`).
-      Update the existing cancelled-slot fixtures in `test_config_eligibility.py`
-      (they carry no heartbeat).
-- [ ] 5. Run related suites on a dedicated `_test` DB: `test_workers`,
-      `test_config_eligibility`, the jobs route tests, and the scheduler/batch
-      dispatch tests.
-- [ ] 6. Codex diff review until GATE: PASS. Record each round.
-- [ ] 7. Review section; no push/merge without the owner's OK.
+- [x] 1. Codex design consult: r1 FAIL (heartbeat-outage hole, adopted), r2 FAIL
+      (clock skew adopted; watchdog fencing rejected with evidence).
+- [x] 2. Regression test, proven to FAIL on main: 6 min after a cancel, with the
+      worker unacknowledged, `POST /jobs` returned 201 (a second run). The claim's
+      started_at was 1.5 s after its transaction's `now()` (Python clock).
+- [x] 3. Release tests: ack frees at once; hard-limit ceiling; never-claimed;
+      finished job untouched; superseded attempt cannot ack; ack failure never
+      masks the task's exception; DB-clock claim; the real task acknowledges on an
+      early-gate exit (FAILS with main's `tasks.py`).
+- [x] 4. Implemented (8 src files). Fixtures updated in `test_config_eligibility`
+      and `test_run_in_flight_guard` (their started cancelled rows had no claim stamp).
+- [x] 5. Suites on `bridgeleads_s402_test` (Redis 13): 240 passed (start paths,
+      workers, batches) + 607 passed / 36 skipped (billing, dedup, run_scrape_job
+      users; skips are missing local Stripe prices). ruff 0.15.6 clean. No
+      type-checker is configured.
+- [x] 6. Codex diff review: r1 FAIL (P1 legacy NULL-heartbeat rows: rejected with
+      evidence; P2 test honesty: adopted), r2 **GATE: PASS**.
+- [ ] 7. Push / PR / merge: waiting for the owner's OK.
 
 ## Review
 
-(pending)
+- **Behaviour change the owner should know:** a cancelled run now frees its scraper
+  the moment the worker stops (usually faster than the old 300 s). If the worker
+  dies without stopping cleanly (a deploy or OOM mid-cancel), the scraper stays
+  blocked for up to ~67 min after that run STARTED, not 5 min after the cancel.
+  The UI copy ("still stopping, try again in a few minutes") is unchanged.
+- **At deploy:** any run cancelled shortly before the deploy has no
+  acknowledgement, so its scraper stays blocked until its started_at + 67 min.
+  This is a one-time cost.
+- No migration. The claim now uses the DB clock, which also makes the watchdog's
+  staleness math consistent (heartbeats were already DB-clock).

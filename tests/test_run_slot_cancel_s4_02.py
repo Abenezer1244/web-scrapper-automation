@@ -23,7 +23,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from httpx import AsyncClient
-from sqlalchemy import text
+from sqlalchemy import select, text
 
 from src.api.auth import create_secure_token, hash_password
 from src.db.models import Job, ScraperConfig, User
@@ -192,6 +192,69 @@ async def test_a_run_cancelled_before_any_worker_claimed_it_holds_nothing(
 
     r = await _start(client, user, config)
     assert r.status_code == 201, r.text
+
+
+def test_the_real_task_acknowledges_even_when_it_leaves_through_an_early_gate(db):
+    """run_scrape_job, not the helper. The account froze after the job was queued,
+    so the task refuses it at the account gate, straight after the claim. The
+    customer's cancel lands in the same instant as the claim (a test-only trigger
+    rewrites the claim's 'queued' to 'cancelled', the only way to put a cancel
+    exactly there without a race). The task must still acknowledge on its way
+    out, or its scraper would stay blocked until the hard time limit: the
+    heartbeat thread has to be running before the first gate that can return."""
+    from src.workers.tasks import run_scrape_job
+
+    with SyncSessionLocal() as s:
+        user = User(
+            id=str(uuid.uuid4()), email=f"s402_{uuid.uuid4().hex[:8]}@test.bridgeleads.io",
+            password_hash=hash_password("TestPass123!"), plan="pro",
+            records_used=0, records_limit=500, subscription_status="unpaid",
+        )
+        s.add(user)
+        s.flush()
+        config = ScraperConfig(
+            id=str(uuid.uuid4()), user_id=user.id, name="s402 gate",
+            county="s402-no-connector", state="WA", record_type="probate",
+            fields=[], enrichment=[], schedule={}, deliver={}, active=True,
+        )
+        s.add(config)
+        s.flush()
+        job = Job(id=str(uuid.uuid4()), user_id=user.id, scraper_config_id=config.id,
+                  status="pending", trigger="manual")
+        s.add(job)
+        s.commit()
+        job_id = job.id
+
+    with SyncSessionLocal() as s:
+        s.execute(text("DROP TRIGGER IF EXISTS zz_test_s402_cancel ON jobs"))
+        s.execute(text("DROP FUNCTION IF EXISTS zz_test_s402_cancel_fn()"))
+        s.execute(text(
+            "CREATE FUNCTION zz_test_s402_cancel_fn() RETURNS trigger AS $f$ BEGIN "
+            "NEW.status := 'cancelled'; NEW.finished_at := now(); RETURN NEW; "
+            "END; $f$ LANGUAGE plpgsql"
+        ))
+        s.execute(text(
+            "CREATE TRIGGER zz_test_s402_cancel BEFORE UPDATE ON jobs FOR EACH ROW "
+            f"WHEN (NEW.id = '{job_id}'::uuid AND OLD.status = 'pending' "
+            "AND NEW.status = 'queued') EXECUTE FUNCTION zz_test_s402_cancel_fn()"
+        ))
+        s.commit()
+    try:
+        run_scrape_job(job_id)
+    finally:
+        with SyncSessionLocal() as s:
+            s.execute(text("DROP TRIGGER IF EXISTS zz_test_s402_cancel ON jobs"))
+            s.execute(text("DROP FUNCTION IF EXISTS zz_test_s402_cancel_fn()"))
+            s.commit()
+
+    row = _row(job_id)
+    assert row.status == "cancelled"
+    assert row.started_at is not None  # the task did claim it
+    assert row.last_heartbeat_at is None  # ... and acknowledged on the way out
+    with SyncSessionLocal() as s:
+        assert s.execute(
+            select(Job.id).where(Job.id == job_id, Job.holds_run_slot())
+        ).first() is None
 
 
 # ─── The acknowledgement is narrow ────────────────────────────────────────────

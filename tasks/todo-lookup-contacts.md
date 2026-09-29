@@ -2957,6 +2957,9 @@ trial-cap disposition/reason at the 1b-2 confirm.
   ("recent account payments have failed or your spending limit needs to be increased"). Its
   previous head (`3a990e0e`) had passed CI, but `main` moved (#387, docs), so the gate needs a
   new green run. Nothing merges until the owner fixes billing.
+- **Codex diff review of ii** (three-dot against the precursor branch): **`VERDICT: GO`, no
+  findings** (`<scratchpad dea35045>/codex_ii_review_r1_out.txt`). ii stays LOCAL (unpushed)
+  until #386 merges; then: rebase onto main, Codex re-check, push, PR, CI, merge gate.
 
 **Files:** i = planner, `lookup_pricing.py`, planner tests, `docs/BUILD_JOURNAL.md`, this plan;
 ii = `routes/jobs.py`, `schemas.py`, `schema/openapi.json`, quote tests, this plan.

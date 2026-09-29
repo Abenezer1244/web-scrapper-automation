@@ -625,8 +625,9 @@ def test_every_stage_write_in_run_scrape_job_stops_a_lost_attempt():
     stages = [c for c in _calls(body, "_set_stage") if c.startswith('_set_stage(db, job, "')
               or c.startswith("_set_stage(\n")]
     # The one exception: skip trace's on_begin callback. It only writes the stage
-    # (token-scoped, so a stale attempt's write does not land), publishes nothing,
-    # and runs after DONE, which only the owner reaches.
+    # (token-scoped, so a stale attempt's write does not land) and publishes
+    # nothing. It runs in enrichment, before finalization; what it announces is
+    # fenced inside the enqueue itself (B9 below).
     callback = [c for c in stages if '"queuing_contacts"' in c]
     assert len(callback) == 1 and "expected_started_at=attempt_token" in callback[0]
     direct = [c for c in stages if c not in callback]
@@ -646,3 +647,156 @@ def test_the_date_window_is_written_only_onto_this_attempts_row():
     write = body[body.index(".values(date_from=date_from, date_to=date_to)") - 300:]
     assert "*_attempt_clauses(attempt_token)" in write[:300]
     assert "if not _still_ours(_dated == 1):" in write
+
+
+# ── B9 paid skip-trace enqueue (Codex diff r6 P1) ────────────────────────────
+# The enqueue runs in enrichment, BEFORE finalization, and commits queued PAID
+# lookups plus cache-hit copies. Only the attempt that owns the job may do that.
+
+_PARTY = "SAARENAS AVELINO G"
+_SITUS = {"property_city": "VANCOUVER", "property_state": "WA", "property_zip": "98661"}
+
+
+@pytest.fixture
+def st_run(business_user, monkeypatch):
+    """Attempt A holds a skip-trace-enabled job with two traceable leads: one the
+    enqueue would buy a lookup for, one it would serve from a seeded cache entry."""
+    from src.config import settings
+    from src.db.models import SkipTraceCache
+    from src.scrapers.enrichment.skip_trace import build_pending_row_payload, payload_subject_key
+
+    monkeypatch.setattr(settings, "SKIP_TRACE_ENABLED", True)
+    monkeypatch.setattr(settings, "TRACERFY_API_TOKEN", "test-token-not-real")
+    user_id, job_id, config_id = business_user.id, str(uuid.uuid4()), str(uuid.uuid4())
+    buy, cached = str(uuid.uuid4()), str(uuid.uuid4())
+    with SyncSessionLocal() as s:
+        s.add(ScraperConfig(id=config_id, user_id=user_id, name="fence", county="clark",
+                            state="WA", record_type="probate", fields=[], enrichment=[],
+                            schedule={"frequency": "manual"},
+                            deliver={"formats": ["csv"], "emails": []},
+                            skip_trace_enabled=True))
+        s.flush()
+        s.add(Job(id=job_id, user_id=user_id, scraper_config_id=config_id,
+                  trigger="manual", status="pending"))
+        s.flush()
+        for rid, addr in ((buy, "1400 MAIN ST"), (cached, "1402 MAIN ST")):
+            s.add(Result(id=rid, job_id=job_id, user_id=user_id, property_address=addr,
+                         party_name=_PARTY, is_duplicate=False, **_SITUS))
+        s.flush()
+        payload = build_pending_row_payload(s.get(Result, cached))
+        assert payload is not None, "fixture lead must be traceable or the test is vacuous"
+        s.add(SkipTraceCache(address_hash=payload_subject_key(user_id, payload),
+                             phone="2065550100", phone_type="mobile"))
+        s.commit()
+        a = claim_attempt(s, job_id)
+        s.execute(text("UPDATE jobs SET status = 'enriching' WHERE id = :j"), {"j": job_id})
+        s.commit()
+    return {"job_id": job_id, "user_id": user_id, "config_id": config_id, "a": a,
+            "buy": buy, "cached": cached}
+
+
+def _enqueue(st_run, redis_client, token, on_begin=None):
+    from src.workers.tasks_helpers.enrich import _enqueue_skip_trace_rows
+
+    with SyncSessionLocal() as db:
+        job = db.get(Job, st_run["job_id"])
+        _enqueue_skip_trace_rows(db, job, redis_client, st_run["job_id"],
+                                 db.get(ScraperConfig, job.scraper_config_id),
+                                 on_begin=on_begin, attempt_token=token)
+
+
+def _lookups(st_run) -> dict:
+    with SyncSessionLocal() as s:
+        return {
+            "pending": s.execute(text("SELECT count(*) FROM pending_skip_trace_rows "
+                                      "WHERE job_id = :j"), {"j": st_run["job_id"]}).scalar_one(),
+            "statuses": {str(rid): status for rid, status in s.execute(text(
+                "SELECT id, skip_trace_status FROM results WHERE job_id = :j"),
+                {"j": st_run["job_id"]}).all()},
+            "cached_phone": s.get(Result, st_run["cached"]).phone,
+        }
+
+
+_UNTOUCHED = "not_attempted"
+
+
+def test_the_owner_queues_and_copies_as_before(st_run, redis_client):
+    _enqueue(st_run, redis_client, st_run["a"])
+
+    got = _lookups(st_run)
+    assert got["pending"] == 1
+    assert got["statuses"] == {st_run["buy"]: "queued", st_run["cached"]: "hit"}
+    assert got["cached_phone"] == "2065550100"
+
+
+def test_b_reclaims_just_before_a_takes_the_claim_lock(st_run, redis_client):
+    """The watchdog re-queues and B claims in the instant before A's lock: A has
+    already read its leads as eligible, and must now buy and copy nothing."""
+    b = {}
+    _enqueue(st_run, redis_client, st_run["a"],
+             on_begin=lambda: b.setdefault("token", _requeue_and_claim(st_run, st_run["a"])))
+    assert b["token"] is not None
+
+    got = _lookups(st_run)
+    assert got["pending"] == 0
+    assert set(got["statuses"].values()) == {_UNTOUCHED}
+    assert got["cached_phone"] is None
+    # Not vacuous: the owner B queues and copies exactly what A was refused.
+    _enqueue(st_run, redis_client, b["token"])
+    got = _lookups(st_run)
+    assert got["pending"] == 1 and got["cached_phone"] == "2065550100"
+
+
+@pytest.mark.parametrize("terminal", sorted(_TERMINAL_STATUSES))
+def test_a_terminal_job_queues_no_lookup(st_run, redis_client, terminal):
+    """Same token, but the job was cancelled, failed or finished: nothing is bought."""
+    with SyncSessionLocal() as s:
+        s.execute(text("UPDATE jobs SET status = :t WHERE id = :j"),
+                  {"t": terminal, "j": st_run["job_id"]})
+        s.commit()
+
+    _enqueue(st_run, redis_client, st_run["a"])
+
+    got = _lookups(st_run)
+    assert got["pending"] == 0 and set(got["statuses"].values()) == {_UNTOUCHED}
+
+
+def test_the_job_row_stays_locked_until_the_lookups_commit(st_run, redis_client, monkeypatch):
+    """The ownership answer must still hold when the claim commits: from the check to
+    the commit the jobs row is locked, so no re-queue can land in between."""
+    from src.workers import skip_trace_claim
+
+    real, seen = skip_trace_claim.claim_skip_trace_rows, {}
+
+    def _claim_while_b_tries_to_requeue(db, payloads, **kw):
+        with SyncSessionLocal() as b:
+            try:
+                b.execute(text("SELECT 1 FROM jobs WHERE id = :j FOR UPDATE NOWAIT"),
+                          {"j": st_run["job_id"]})
+                seen["locked"] = False
+            except Exception as exc:  # noqa: BLE001 - LockNotAvailable is the expected answer
+                seen["locked"] = "could not obtain lock" in str(exc)
+            b.rollback()
+        return real(db, payloads, **kw)
+
+    monkeypatch.setattr(skip_trace_claim, "claim_skip_trace_rows", _claim_while_b_tries_to_requeue)
+    _enqueue(st_run, redis_client, st_run["a"])
+
+    assert seen == {"locked": True}
+    assert _lookups(st_run)["pending"] == 1
+
+
+def test_run_scrape_job_fences_the_skip_trace_enqueue():
+    """Production passes the whole token, and the check sits between the claim lock
+    and the commit with nothing that commits (a log publish) in between."""
+    from src.workers.tasks import run_scrape_job
+    from src.workers.tasks_helpers.enrich import _enqueue_skip_trace_rows
+
+    body = _live(inspect.getsource(run_scrape_job.__wrapped__))
+    (call,) = _calls(body, "_enqueue_skip_trace_rows")
+    assert "attempt_token=attempt_token" in call
+    enq = _live(inspect.getsource(_enqueue_skip_trace_rows))
+    locked = enq[enq.index("lock_job_for_claim(db, job_id)"):]
+    fence = locked.index("attempt_state(db, job_id, job.user_id, attempt_token)")
+    assert "_publish_log(" not in locked[:fence] and "commit()" not in locked[:fence]
+    assert fence < locked.index("claim_skip_trace_rows(db, to_claim)")

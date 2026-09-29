@@ -2057,6 +2057,7 @@ def run_scrape_job(self, job_id: str) -> None:
                         db, job, "queuing_contacts",
                         expected_started_at=attempt_token,
                     ),
+                    attempt_token=attempt_token,
                 )
             except Exception as exc:
                 db.rollback()

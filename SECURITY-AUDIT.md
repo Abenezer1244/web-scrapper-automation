@@ -1,6 +1,97 @@
-# BridgeLeads Security Audit #3, Phase 1 (2026-09-27)
+# BridgeLeads Security Audit #3, Phase 1 (2026-09-27), with the Audit #4 delta
 
 > Previous report (audit #2, 2026-09-25) is preserved at `docs/security/SECURITY-AUDIT-2026-09-25.md`.
+
+## Audit #4: delta since audit #3 (2026-09-27, later the same day)
+
+Scope, agreed with the owner: only the code changed between `786efcf0` (audit #3) and `ee601b55` (44 commits, 15
+backend source files, migrations 103 and 104, frontend `c7d78fb` and `d4ba581`), a re-check of audit #3's open P1s,
+and an independent Codex review of the same delta. Everything below this section is audit #3 and still stands except
+where this section says otherwise. Reports: `tasks/audit4/delta-claude.md` (Claude reviewer, every changed file
+listed with what was verified), `tasks/audit4/delta-codex.md` (Codex, run without our findings in a separate
+worktree). No production code was changed; no test, database or production request was made by either reviewer. The
+driver made two single live GETs (below).
+
+### New findings
+
+| ID | Severity | Category | Component | Evidence | Prereqs | Impact | Remediation | Regression test | Status |
+|---|---|---|---|---|---|---|---|---|---|
+| S4-01 | P1 | Billing / entitlement | Worker never re-checks account run eligibility (CXD-1). Pre-existing, not introduced by the delta; the delta made `run_eligibility` the one rule but only enqueue gates call it | src/workers/tasks.py:535-571 checks config and plan only; the reservation at tasks.py:1816-1840 grants remaining quota with no frozen/ended predicate; src/api/quota.py:187 | a job queued while eligible, then the account freezes (failed payment) or its paid term ends before the worker runs (queue delay, watchdog re-run, batch child) | scraping, record grant and paid skip-trace for an account that may no longer start billable work | After the claim, reload the user and refuse on `frozen`/`ended` before any external work; re-check before the skip-trace enqueue | queued job of a now-frozen / now-ended account fails with no scrape and no pending_skip_trace_rows | CONFIRMED (code trace). Driver would rate P2 (bounded to already-queued jobs); Codex severity adopted per the disagreement rule |
+| S4-02 | P2 | Concurrency / cost | Run slot released 300 s after cancel even if the worker is still running (CXD-3) | src/db/models.py:817-844 `RUN_SLOT_CANCEL_COOLDOWN_SECONDS`; migration 104 index covers active statuses only | the account's own cancel, then a restart after 5 min | two workers on one config: duplicate county scraping, dedup claims can mislabel the new run's leads "Already delivered" | Worker-owned slot lease: cancel requests, the worker acknowledges terminal state; stale-lease recovery by the watchdog | cancelled-but-running job keeps the slot until the worker acknowledges | CONFIRMED (code trace). Self-tenant only; driver would rate P3, Codex P2 adopted |
+| S4-03 | P2 | Rate limiting | The S3-09 `export` zone misses 4 routes that rebuild and decrypt full CSVs (D4-2 + CXD-4) | src/api/routes/batches.py:733,854 and src/api/routes/segments.py:709,835 use `general` (60/min, fails fully open when Redis is down); only jobs.py:1280,1439 use `export` | an account | CPU / DB / PII-decrypt amplification, starving other tenants | Move the 4 routes to the `export` zone | 21st export in a minute across job, batch and segment routes gets 429 | CONFIRMED (both reviewers; driver grep). Claude P3, Codex P2: higher adopted |
+| S4-05 | P3 | Quota correctness | A finite account upgraded to an unlimited plan while its run scrapes is granted 0 records (found by Codex while reviewing the 4a fix; pre-existing) | src/workers/tasks.py reservation: the cap block is entered on the pre-scrape limit, and the grant SQL computes `GREATEST(0, -1 - base)` | an upgrade during a run | that run delivers nothing (customer-hurting, not a security bypass) | Treat `eff_limit = -1` in the grant as "grant what was asked" | upgrade mid-run still delivers | CONFIRMED (code trace), OPEN |
+| S4-06 | P2 | Quota correctness | The reservation's quota-window clock `_reserved_at` is read before the users row lock is taken (Codex, 4a review round 3; pre-existing) | src/workers/tasks.py reservation step 1 and the grant statement | a lock wait that crosses a quota-window boundary | one grant computed against the previous window's remaining quota | Read the window clock after the lock is held, keeping `jobs.reserved_at` consistent with it | reservation straddling a boundary uses the new window | CONFIRMED (code trace), OPEN. Codex P2 adopted; driver would rate P3 |
+| S4-04 | P3 | Billing / data | Scrapers deleted before the F-043 fix keep `paused_reason='entitlement'` and are re-activated by `plan_reconciliation` on the next upgrade (D4-1) | delete now clears `paused_reason`, no backfill for older rows | an account that deleted a downgrade-paused scraper before the fix, then upgrades | deleted scrapers run and bill again | Backfill from `scraper_deleted` audit events, or an explicit `deleted_at` | re-activation skips deleted configs | SUSPECTED: sizing needs a read-only production query (not run) |
+
+### Audit #3 items re-checked
+
+- **S3-03 (P1) still OPEN**, found again independently by Codex (CXD-2): `enrich.py:2285` still blocks only `starter`,
+  and a trial is `plan="pro"`. The #364 per-account credit cap bounds it only if production sets
+  `SKIP_TRACE_ACCOUNT_DAILY_CREDIT_CAP`, and it does not tell a trial from a paying account.
+- **S3-04 (P1) still OPEN**, and still blocked by **S3-06: re-reproduced live** (one GET to `/health` through Railway's
+  edge `69.46.46.123`: 200, `Server: railway-hikari`, no `CF-RAY`).
+- **S3-32 still OPEN:** live `api.bridgeleads.io/health` has no `Strict-Transport-Security`.
+- **S3-07 FIXED** (verified in code by the Claude reviewer): `?token=` accepts only job-bound download tokens; the
+  header path goes through `get_auth_context` including the session-family check.
+- **S3-09 mostly FIXED:** every route it named is limited; the remainder is S4-03.
+- **S3-12 FIXED IN CODE:** credit-weighted global and per-account caps, read and claimed under one advisory lock with
+  no commit in between (both reviewers traced it). Effective only if production sets both cap variables (not read).
+
+### Checked and clean in the delta
+
+Tenant isolation: every new or changed query in jobs, batches, billing usage, eligibility and the dispatcher carries
+`user_id` or an owned-parent join (both reviewers). Raw SQL in the dispatcher, capacity module, batch tasks and
+migrations 103/104 uses fixed fragments and bound values. No new table, so no new RLS or grant surface; the 104 index
+failing to build falls back to the API check, not open. `run_eligibility` gives the same verdict as the old
+`quota_block_reason` at all five enqueue gates. `/billing/usage` exposes only the caller's own state. Frontend
+`c7d78fb`/`d4ba581`: display only, no XSS sink, no client-only security decision.
+
+### Codex vs Claude
+
+| Codex | Claude | Outcome |
+|---|---|---|
+| CXD-1 worker eligibility (P1) | not found | Codex-only, driver verified in code: S4-01 at P1 |
+| CXD-2 trial skip trace (P1) | S3-03 re-check | same as S3-03, still open |
+| CXD-3 run slot cooldown (P2) | not found | Codex-only, driver verified in code: S4-02 at P2 |
+| CXD-4 batch export zone (P2) | D4-2 (P3, also the 2 segment exports) | S4-03 at P2 |
+| none | D4-1 (P3) | Claude-only: S4-04, suspected |
+
+No Codex finding was rejected.
+
+### Phase 4a: S3-03 and S4-01 FIXED (this branch, not merged)
+
+Owner decision 2026-09-27: trials get a small lifetime allowance of contact lookups.
+
+- **One rule, `paid_lookup_access`** (`src/workers/skip_trace_claim.py`): Starter, frozen and ended accounts buy no
+  lookups; admins, active or in-grace subscribers, accounts paid through a cancelled term, and operator-granted
+  plans (no status, no trial date) buy freely (the credit caps still apply); every other state, including the
+  app trial, Stripe `trialing`, `canceled` and unknown statuses, gets `SKIP_TRACE_TRIAL_CREDIT_ALLOWANCE`
+  credits (default 25) over the account's lifetime.
+- **Enforced where every lookup enters the queue** (`claim_skip_trace_rows`, the only INSERT), under a
+  `FOR NO KEY UPDATE` lock on the user row, so two jobs of one trial cannot both spend the same room and a
+  billing write in flight is waited for.
+- **The dispatcher re-applies it** to rows queued earlier: an unlocked filter keeps blocked accounts out of the
+  batch, and the accounts about to be claimed are re-checked `FOR SHARE SKIP LOCKED` just before the claim
+  commit. A frozen account's rows are held; Starter and ended accounts' rows are withdrawn (lead back to
+  `not_attempted`, never charged).
+- **The worker** refuses a frozen or ended account right after claiming the job, and re-decides at the quota
+  reservation under the users row lock, with a clock read after the lock is held, granting 0 records; an
+  account blocked at the gate enters the cap block even on an unlimited plan.
+- Tests: `tests/test_audit4_paid_skip_trace_gate.py`, 43 tests on a real DB, no mocks (including two real
+  concurrency tests). Every guard was mutation-checked: disabling it fails its tests.
+- Codex: plan consult + 4 review rounds. Its findings were fixed (dispatcher recheck, user-row lock, cancelled-
+  but-paid-through status, per-account lock scope, unlimited-plan path, clock after lock) or logged as the
+  pre-existing S4-05/S4-06. Accepted residuals: lifetime counting uses queue rows, which only operator
+  cleanup scripts can delete (no customer route deletes jobs, results or the account); an unlimited account
+  that freezes after the gate read and before its export is delivered that run; the unlimited path has no
+  automated test (it needs a real scrape).
+
+### Proposed fix order (one PR per phase, owner approval between phases)
+
+1. **4a: S3-03 + S4-01**: paid work only for accounts that may run it (needs the owner's trial decision).
+2. **4b: S4-03**: move the four export routes into the `export` zone.
+3. **Audit #3 queue: 2b** (S3-08 `safe_http` SSRF, S3-14 browser guard) and **2c** (S3-15, S3-16 Tracerfy webhook).
+4. **S4-02**: slot lease (needs a design pass first). **S4-04**: size with a read-only production query, then backfill.
 
 Code audited: backend `origin/main` `786efcf0` (production at audit start), frontend `origin/master` `e42d5d0`/`6030491`.
 Method: 8 parallel audit leaves (each report under `tasks/audit3/`), plus an independent Codex review run in an isolated
@@ -217,3 +308,96 @@ CGNAT limiter reproduction (S3-04), and the origin bypass (S3-06). No Codex find
 - Tracerfy's charging behaviour on 5xx (S3-39) and Stripe live portal/coupon configuration.
 - Linux-only dependency `uvloop` (pip-audit ran on Windows).
 - Whether anyone read data with the Cloudflare token before deletion.
+
+---
+
+# Audit #5 (2026-09-28): delta `ee601b55..29afc82e` + open-queue re-confirmation
+
+Scope chosen by the owner: every source change since audit #4 (backend: #373 local-env, #375 run
+eligibility, #376 dispatcher interval, #379 migration 105; frontend bridgeleads-web #165-#167), all
+18 checks applied to that delta, plus re-confirmation of every open finding at `29afc82e`. Claude and
+Codex reviewed independently (`tasks/audit5/delta-claude.md`, `tasks/audit5/delta-codex.md`). No
+production data was read or changed; the only production access was a boolean-only read of one flag.
+
+**Placement note:** this section is appended at the end so it merges cleanly with PR #374, which
+inserts the Audit #4 section at the top of this file.
+
+## Status of the unmerged audit #4 fixes
+
+- **PR #374** (S3-03 / S4-01, trial skip-trace gate): OPEN, NOT merged, still merges into current main
+  with no conflict. Until it merges, S3-03 (P1) is LIVE in production.
+- **PR #378** (S4-03, batch/segment CSV exports in the `export` zone): OPEN, NOT merged, merges cleanly.
+
+## New findings
+
+| ID | Sev | Category | Location | Evidence | Prereq | Impact | Remediation | Regression test | Status |
+|---|---|---|---|---|---|---|---|---|---|
+| D5-01 | P3 | Plan entitlement | src/workers/scheduler_helpers/dispatch.py:126,379; src/workers/batch_tasks.py:147; src/api/routes/batches.py:274 | `AI_JOB_LIMITS` read only in `config_eligibility.py`; scheduled and batch paths apply the account rule only | a Starter/Pro account with an ai-mode county | more "AI" runs than the plan lists; ai mode is template detection (no LLM spend), record quota still enforced | apply the AI monthly cap in the scheduler and batch dispatch through `config_run_eligibility` | scheduled/batch run over the AI cap is refused | CONFIRMED, pre-existing |
+| D5-02 | P3 | Fail-open default | src/config/settings.py:194 | `ENTITLEMENT_ENFORCEMENT: bool = False`; production api AND worker read `true` today (boolean-only read, 2026-09-28) | a new service or env that misses the variable | county/record-type gates audit-only there | default `True` when `ENVIRONMENT=production`, or refuse to boot in production without it set | production settings without the var enforce | CONFIRMED (hardening); Codex CX5-01 rated this P1 from the code default alone, rejected as a live P1 because production sets it |
+| D5-03 | P1 (Codex rating, adopted) | Browser egress containment | src/scrapers/base_scraper.py (whole browser) | 5a Codex diff review r1: after 5a, TCP channels no Playwright route sees remain (WebRTC TURN-over-TCP/TLS, speculative preconnect), and every browser request is check-then-use: Python resolves, Chromium resolves again (DNS rebinding) | hostile county page content, or a rebinding DNS name on a scraped link | a request from the worker, which holds every secret, to an internal address | route Chromium through a local validating egress proxy (`--proxy-server` to an in-worker CONNECT proxy that resolves once, checks the IP, and dials that IP), or an egress firewall on the worker; relates to S3-13 | a rebinding name and a TURN-over-TCP candidate to loopback both refused at the proxy | CONFIRMED residual, pre-existing, needs a design decision |
+
+## Codex vs Claude
+
+| Codex | Claude | Outcome |
+|---|---|---|
+| CX5-01 P1 entitlement enforcement off by default | not flagged | Re-verified: production api and worker have it ON. Downgraded to D5-02 P3 (fail-open default), reasoning recorded above. This is the known repo-only-review blind spot (flag defaults are not production values). |
+| CX5-02 P2 dialer outbox + `safe_http` validate then fetch on an unpinned Requests session | S3-08 PRESENT | Agree. Read `src/workers/dialer_outbox.py:40,255` and `src/utils/safe_http.py:122-134`: validation resolves, then a separate `requests.Session` resolves again (DNS-rebinding TOCTOU). Generic webhook delivery now uses `pinned_session`. S3-08 narrowed to these two paths, P2. |
+| CX5-03 P1 Playwright guard fails open | S3-14 PRESENT (P2 in audit #3) | Present, but the P1 premise does not hold: a DNS failure already fails CLOSED (`security.py:189-193` turns the resolver OSError into ValueError), so the generic `except` is reached only by the guard's own internal errors, which no page controls. The live parts of S3-14 are the channels `context.route` never sees: WebSockets and service workers, both REPRODUCED in real Chromium on main during 5a (`tests/test_scraper_egress_guard.py`). **S3-14 stays P2**, with this reasoning. The residual Codex raised during 5a is split out as D5-03. |
+| CX5-04 P2 legacy Tracerfy path-secret route | S3-16 PRESENT, mitigated | Agree. `main.py:132` scrubs uvicorn access lines only; Railway's edge still logs the path. Removal needs Tracerfy to send the header (external). |
+| CX5-05 P2 PII JSON views in `general` zone | S4-07 PRESENT | Present, **re-rated P3 by consensus** (Codex consult during 5c): every view returns only the caller's own rows (user_id filter + RLS); `general` is 60 req/min per user x at most 500 rows = ~30k decrypted rows/min, while the separate `export` zone already allows 20 x 50,000 = ~1M, so moving the views into `export` changes the per-user decrypt ceiling by under 3% and would 429 interactive browsing (the FE pages at 50). No code change. Optional hardening for the owner: a lower JSON `page_size` cap (a public-API contract change, `le=500` in OpenAPI) or a worker-wide concurrency cap on decrypt-heavy requests. |
+| CX5-06 P2 reservation clock before lock | S4-06 PRESENT | Agree. |
+| S4-02 FIXED | S4-02 PRESENT | Codex is wrong: `models.py:817-844` is unchanged since audit #4 (only an index was added). A fixed 300 s cooldown IS the S4-02 finding (a cancelled worker can outlive it). Stays P2. |
+
+No confirmed IDOR/BOLA, admin-authz, SQL injection, migration-grant, secret, XSS, CSRF, or CORS issue in the delta (both reviewers).
+
+## Open queue at 29afc82e (after reconciliation and the fix phases)
+
+| ID | Sev | Status |
+|---|---|---|
+| S3-03 / S4-01 | P1 | FIXED on #374, NOT merged (live in prod) |
+| S3-04 | P1 | PRESENT (needs Cloudflare sole ingress, owner) |
+| D5-03 | P1 (Codex rating) | FIXED on branch `fix/security-audit5f-egress-proxy` (5f), stacked on 5a, behind `SCRAPER_EGRESS_PROXY_ENABLED` (default OFF): not effective until turned on |
+| S3-14 | P2 | FIXED on `fix/security-audit5a-browser-egress` (5a) |
+| S3-08 | P2 | FIXED on `fix/security-audit5b-pinned-egress` (5b); PACS / AcclaimWeb / Tracerfy-submit sessions (operator-configured or fixed hosts) remain unpinned, tracked as 5b-ii (P3) |
+| S3-15 | P2 | FIXED on `fix/security-audit5d-tracerfy-webhook-trust` (5d) |
+| S3-16 | P2 | PRESENT, mitigated; its impact is now bounded by 5d (the webhook body is never read, so a forged webhook can only trigger a provider lookup) |
+| S4-02 | P2 | PRESENT (not in the approved phases) |
+| S4-03 | P2 | FIXED on #378, NOT merged |
+| S4-06 | P2 | PRESENT, DEFERRED: the reservation SQL is inline in `run_scrape_job` and the only tests exercise a copy of it, so a meaningful regression test needs the reservation extracted first (own refactor). Not attacker-reachable (needs a quota-window boundary during lock contention). |
+| S4-07 | P3 (re-rated) | PRESENT; no code change, remedy is an owner choice |
+| D5-01 | P3 | PRESENT, DEFERRED: the AI-cap evaluator is async/API-side, the scheduler and batch paths are sync; enforcing it there means duplicating the rule or porting the evaluator, for a mode that costs nothing (template detection). Product decision. |
+| D5-02 | P3 | FIXED on `fix/security-audit5e-hardening` (5e) |
+
+## Fix phases (Phase 2)
+
+Each phase: its own branch and worktree, regression test first and proven to FAIL on
+`origin/main`, Codex diff review until GATE: PASS (every round's findings recorded in the
+commit messages), full local suite on its own `_test` database. Nothing is pushed or merged.
+
+| Phase | Branch (head) | Finding | What changed | Regression proof | Codex |
+|---|---|---|---|---|---|
+| 5a | `fix/security-audit5a-browser-egress` (`8bb274b5`) | S3-14 | context `route_web_socket` guard; `service_workers="block"` on every context; `--disable-quic` + both WebRTC ip-handling switches (headed Chrome ignores the `force-` one); the guard fails closed | `tests/test_scraper_egress_guard.py`, real Chromium: 8/9 fail on main (the 9th is the listener's positive control); REPRODUCED on main: a page opened a WebSocket to a loopback listener and installed a service worker | r1 FAIL (its await P1 was wrong: `connect_to_server` is sync; test-honesty points fixed), r2 PASS |
+| 5b | `fix/security-audit5b-pinned-egress` (`b02f2b07`) | S3-08 | `validate_scraping_target` refuses userinfo and a backslash in the authority (REPRODUCED: `http://evil.example\@portal/` validated as portal, dialled evil.example); `safe_http` and the dialer outbox use `pinned_session()` | `tests/test_egress_pinning_s3_08.py`: 8/11 fail on main | r1 PASS (P2s checked: redirect bodies are already closed; mixed-answer refusal is pre-existing policy) |
+| 5c | none | S4-07 | no code: re-rated P3 by consensus (numbers above) | n/a | consult agreed P3 |
+| 5d | `fix/security-audit5d-tracerfy-webhook-trust` (`7d780354`) | S3-15 | the webhook is a trigger only: download URL and counts come from Tracerfy's own queue record (`GET /v1/api/queues/`); not complete there or unreachable = bounded re-check (5 x 120 s, one chain per queue, Redis claim) then an ops alert, never 'errored'; download host HTTPS-only and pinned to `tracerfy.nyc3` (CDN and origin: 33/33 production URLs, read host-only, 2026-09-28); a malformed body can no longer fail the task (it used to mark the REAL queue errored) | `tests/test_tracerfy_webhook_trust_s3_15.py` 16/22 fail on main at r2; 104 ingest-suite tests pass | r1 FAIL, r2 FAIL, r3 FAIL, r4 FAIL, r5 PASS (+P2 fixed), r6 PASS (+P2 fixed), r7 PASS |
+| 5e | `fix/security-audit5e-hardening` (`506f6f83`) | D5-02 | `ENTITLEMENT_ENFORCEMENT` unset + `ENVIRONMENT=production` = True; explicit false still wins | `tests/test_settings.py`: the production-unset test fails on main | r1 PASS (+P2 fixed) |
+| 5f | `fix/security-audit5f-egress-proxy` (`d4893dcc`) | D5-03 | `src/scrapers/egress_proxy.py`: in-worker SOCKS5, CONNECT only, ports 80/443/8080/8443, resolves once, refuses if any answer is blocked (incl. mapped/NAT64/6to4 forms), dials the checked sockaddr on its own socket; Chromium launched with it and `<-loopback>` | `tests/test_scraper_egress_proxy.py`: the control proves that WITHOUT the proxy a TURN-over-TCP candidate dials a loopback listener directly (the residual, reproduced); with it, refused. Live 2026-09-28: `atip.piercecountywa.gov` 200 through the proxy in plain and default mode (4 page loads total) | design consult FAIL (HTTP proxy; switched to SOCKS5 and measured TURN routing), r1 FAIL (P1s disproved with evidence, P2s fixed), r2 PASS (+P2s fixed) |
+
+## Commits that landed on main during this audit (`29afc82e..c0b09b7a`)
+
+#380 (machine-readable code on the run-refusal 402s) and #382 (skip-trace pause state,
+migration-free) merged while the audit ran. Reviewed: the 402 body carries only the
+caller's own account code, message and resume time, through `RunRefusalResponse`; the
+pause state is published to Redis and not yet read by any route. Forward note for its
+Phase 1c reader: it must read only the caller's own `<user_id>` field (plus `global` /
+`account_default`), never iterate the hash. No findings. All five fix branches still
+merge cleanly into the new main (`git merge-tree`).
+
+## Unverified in audit #5
+
+- `.env.example` (2 changed lines): a permission rule blocks this session from reading it. It ships in the image (`.dockerignore:31`); the owner should confirm both lines are placeholders.
+- D5-03's proxy has run live against one county portal only; every other template must
+  be exercised with `SCRAPER_EGRESS_PROXY_ENABLED=true` (staging or a quiet window)
+  before it is turned on in production. Portals on a port outside 80/443/8080/8443
+  will be refused and logged.
+- Everything listed as unverified in audit #3 (live authenticated prod behaviour, DB grants, R2 CORS) was not re-tested; the delta did not touch those surfaces.

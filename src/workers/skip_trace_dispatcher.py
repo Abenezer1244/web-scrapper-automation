@@ -27,6 +27,7 @@ from src.utils.logger import setup_logger
 from src.workers import app
 from src.workers.skip_trace_capacity import (
     FRONTIER_START,
+    SPEND_WINDOW,
     advance,
     allocate,
     batch_rows,
@@ -34,6 +35,7 @@ from src.workers.skip_trace_capacity import (
     discover_accounts,
     lock_allocated,
     resolve_caps,
+    resume_times,
     round_limits,
     row_allowance,
     spent_credits,
@@ -42,8 +44,8 @@ from src.workers.skip_trace_capacity import (
 
 _logger = setup_logger("worker.skip_trace_dispatcher")
 
-# The rolling window both spend caps are measured over.
-_SPEND_WINDOW = timedelta(days=1)
+# The rolling window both spend caps are measured over (one copy, in capacity).
+_SPEND_WINDOW = SPEND_WINDOW
 # Bounds on one pass's refill (Codex ii-b consult T1, U2): round r allocates up to
 # 2**r times each account's remaining room, so a run of k blocked rows is passed in
 # about log2(k) rounds. Past either bound the pass claims what it has found.
@@ -57,15 +59,105 @@ def dispatch_pending_skip_trace() -> dict:
 
     Returns a small dict summarizing the tick's activity (for log dumping
     and Flower inspection): {submitted_batches, submitted_rows, errors}.
+
+    Every tick that could dispatch then publishes the PAUSE STATE (Phase
+    1b-1b-iii), whatever the tick did: returned early at the cap, deferred, or
+    raised. A switched-off dispatcher publishes a tombstone instead, so the API
+    reads UNKNOWN rather than a stale 'paused'. Both are best-effort and never
+    change the tick's result.
     """
     if not settings.SKIP_TRACE_ENABLED:
         _logger.debug("SKIP_TRACE_ENABLED=False — dispatcher tick skipped")
+        _publish_pause_state(tombstone=True)
         return {"skipped": "disabled"}
 
     if not settings.TRACERFY_API_TOKEN:
         _logger.warning("TRACERFY_API_TOKEN missing — dispatcher tick skipped")
+        _publish_pause_state(tombstone=True)
         return {"skipped": "no_token"}
 
+    try:
+        return _dispatch_tick()
+    finally:
+        _publish_pause_state()
+
+
+def _pause_fence(db) -> str | None:
+    """The publish fence: this transaction's id, taken BEFORE the window read.
+
+    READ COMMITTED gives every later statement a snapshot taken after this id was
+    assigned, so a publisher with a larger fence sees every claim committed before
+    a smaller one was taken (Codex iii consult G1, H1). That argument holds only on
+    the primary, in the dispatcher's own read-write path: on a standby the view can
+    predate a committed claim, and a read-only session is not that path. Either
+    one: None, and nothing is published. One statement (Codex iii-b review): the id
+    and the checks come from the same SELECT."""
+    from sqlalchemy import text
+
+    from src.utils.skip_trace_pause_state import fence_str
+
+    db.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
+    xid, in_recovery, read_only = db.execute(text(
+        "SELECT pg_current_xact_id()::text, pg_is_in_recovery(), "
+        "current_setting('transaction_read_only')")).one()
+    if in_recovery or read_only != "off":
+        _logger.warning("Dispatcher: pause state not published: the session is %s",
+                        "on a standby" if in_recovery else "read-only")
+        return None
+    fence = fence_str(xid)
+    # An absolute ceiling on the publisher's one resume statement (Codex K5, L1):
+    # set after a successful fence, in the same transaction, so it covers that
+    # statement and nothing after the transaction. A timeout is a WARNING, like any
+    # publisher failure; the next tick publishes again.
+    db.execute(text("SET LOCAL statement_timeout = '5s'"))
+    return fence
+
+
+def _publish_pause_state(*, tombstone: bool = False) -> None:
+    """Publish when dispatch can resume (see src/utils/skip_trace_pause_state.py).
+
+    ADVISORY: a failure here is a WARNING and nothing else, by contract: the
+    tick's result stands, and the API reads a missing or stale state as UNKNOWN.
+    The database session is closed before any Redis I/O."""
+    try:
+        import redis as sync_redis
+
+        from src.db.session import system_sync_session
+        from src.utils import skip_trace_pause_state as pause
+
+        now = datetime.now(UTC)
+        caps = resolve_caps()
+        with system_sync_session() as db:
+            fence = _pause_fence(db)
+            snapshot = None
+            if fence is not None and not tombstone:
+                snapshot = resume_times(db, now, caps)
+            db.rollback()
+        if fence is None:
+            return
+        interval_s = settings.SKIP_TRACE_DISPATCH_INTERVAL_SECONDS
+        r = sync_redis.from_url(settings.REDIS_URL, **settings.redis_kwargs())
+        try:
+            if tombstone:
+                written = pause.publish_tombstone(r, fence=fence, interval_s=interval_s)
+            else:
+                written = pause.publish(
+                    r, fence=fence, now=now, interval_s=interval_s,
+                    global_scope=snapshot.global_scope,
+                    account_default=snapshot.account_default,
+                    accounts=snapshot.accounts,
+                )
+        finally:
+            r.close()
+        if not written:
+            _logger.debug("Dispatcher: pause state from fence %s superseded by a newer one", fence)
+    except Exception as exc:  # noqa: BLE001 - advisory by contract (plan iii, E3)
+        _logger.warning("Dispatcher: pause state not published: %s: %s",
+                        type(exc).__name__, str(exc)[:200])
+
+
+def _dispatch_tick() -> dict:
+    """One dispatcher tick; `dispatch_pending_skip_trace` publishes after it."""
     from sqlalchemy import and_, func, select, text, tuple_, update
     from sqlalchemy import true as sa_true
 
@@ -343,6 +435,53 @@ def dispatch_pending_skip_trace() -> dict:
                 withdrawn: list = []
                 unsubmittable: list = []
                 active = discover_accounts(db, trace_type, watermark)
+                # A row queued while its account could buy it is not sent after the
+                # account froze, its paid term ended or it dropped to Starter (S4-01,
+                # Codex 4a consult P1). FROZEN is usually temporary (dunning), so its
+                # rows stay queued, untouched, and go out once the payment clears.
+                # Starter and ended are not: their rows are WITHDRAWN like any other
+                # undeliverable row ('cancelled', lead back to 'not_attempted'), so a
+                # lead does not read "looking up" forever and a run after the
+                # customer subscribes again queues it afresh. Never charged either way.
+                # This read is a FILTER, unlocked, so a blocked account's rows never
+                # take a batch slot; the decision that counts is re-made under a lock
+                # for the selected accounts only, just before the claim
+                # (_drop_blocked_accounts). The same rule as the claim
+                # (paid_lookup_access), never a copy in SQL.
+                from src.workers.skip_trace_claim import (
+                    ACCESS_FROZEN,
+                    BLOCKED_ACCESS,
+                    paid_lookup_access,
+                    read_access_rows,
+                )
+
+                _accounts = read_access_rows(db, active, lock="")
+                _access = {
+                    u: (paid_lookup_access(_accounts[u]) if u in _accounts else None)
+                    for u in active
+                }
+                _blocked = {u for u, a in _access.items() if a is None or a in BLOCKED_ACCESS}
+                _withdraw_for = sorted(
+                    u for u in _blocked if _access[u] not in (None, ACCESS_FROZEN))
+                if _withdraw_for:
+                    _gone = db.execute(
+                        select(PendingSkipTraceRow)
+                        .where(
+                            PendingSkipTraceRow.user_id.in_(_withdraw_for),
+                            PendingSkipTraceRow.status == "queued",
+                            PendingSkipTraceRow.trace_type == trace_type,
+                        )
+                        .with_for_update(skip_locked=True, of=PendingSkipTraceRow)
+                    ).scalars().all()
+                    _cancel_undeliverable(db, _gone)
+                    withdrawn.extend(_gone)
+                if _blocked:
+                    _logger.info(
+                        "Dispatcher: %d account(s) with queued %s rows skipped (%d "
+                        "withdrawn: Starter or ended; the rest frozen, held)",
+                        len(_blocked), trace_type, len(_withdraw_for),
+                    )
+                    active = [u for u in active if u not in _blocked]
                 frontier = dict.fromkeys(active, FRONTIER_START)
                 in_flight = _InFlightCache()
                 seen_users: set[str] = set()
@@ -467,6 +606,7 @@ def dispatch_pending_skip_trace() -> dict:
                         "Dispatcher: %d %s row(s) held: the same account's lookup for "
                         "that address is already under way", held, trace_type,
                     )
+                rows = _drop_blocked_accounts(db, rows, trace_type)
                 if not rows:
                     # Nothing to claim: commit the failures and withdrawals on their
                     # own (no claim follows to carry them), and in every case end the
@@ -641,6 +781,40 @@ class _Claim(NamedTuple):
     result_id: str
     job_id: str
     user_id: str
+
+
+def _drop_blocked_accounts(db, rows: list, trace_type: str) -> list:
+    """The rows whose account may still buy lookups, decided under a lock (S4-01).
+
+    Locks ONLY the accounts about to be claimed, FOR SHARE and held to the claim
+    commit, so a freeze or a term end being written now waits for this pass
+    instead of landing between the decision and the claim. SKIP LOCKED: the
+    dispatcher never waits on a lock, so an account whose row is being written
+    right now is left out of this pass (fails closed). A dropped row is not
+    touched: it stays 'queued' (its FOR UPDATE lock ends with the transaction)
+    and goes out on a later tick if the account can still buy it."""
+    if not rows:
+        return rows
+    from src.workers.skip_trace_claim import (
+        BLOCKED_ACCESS,
+        paid_lookup_access,
+        read_access_rows,
+    )
+
+    accounts = read_access_rows(
+        db, {str(r.user_id) for r in rows}, lock="FOR SHARE SKIP LOCKED")
+    kept = [
+        r for r in rows
+        if str(r.user_id) in accounts
+        and paid_lookup_access(accounts[str(r.user_id)]) not in BLOCKED_ACCESS
+    ]
+    if len(kept) != len(rows):
+        _logger.info(
+            "Dispatcher: %d %s row(s) left queued: their account froze, ended, "
+            "dropped to Starter, or is being updated right now",
+            len(rows) - len(kept), trace_type,
+        )
+    return kept
 
 
 def _job_delivered_sql(alias: str) -> str:

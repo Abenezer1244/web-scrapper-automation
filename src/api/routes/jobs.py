@@ -17,6 +17,7 @@ from src.api import sse_leases
 from src.api.auth import CurrentUser, get_auth_context
 from src.api.deps import get_db, get_rls_db
 from src.api.dialer_filters import dialer_ready_conditions
+from src.api.errors import run_refusal_http
 from src.api.lead_actionability import actionable_condition, has_address_condition
 from src.api.middleware import audit_log, rate_limit, sanitize_search
 from src.api.owner_filters import build_owner_conditions
@@ -29,6 +30,7 @@ from src.api.results_category import (
 from src.api.results_sort import DEFAULT_RESULTS_SORT, ResultsSort, results_order_by
 from src.api.routes.auth_helpers.registration import _integrity_error_fields
 from src.api.schemas import (
+    RUN_START_402_RESPONSES,
     AlreadyDeliveredContacts,
     AuctionCoverage,
     DuplicateSource,
@@ -43,10 +45,9 @@ from src.config import settings
 from src.config.constants import (
     AUCTION_PUBLICATION_LAG_DAYS,
     CANCELLABLE_STATUSES,
-    normalize_plan,
     scrape_queue_for_plan,
 )
-from src.db import CountyConnector, Job, JobLog, Result, ScraperConfig, User
+from src.db import Job, JobLog, Result, ScraperConfig, User
 from src.db import session as db_session
 from src.utils.logger import setup_logger
 
@@ -174,14 +175,15 @@ ONE_ACTIVE_JOB_INDEX = "uq_jobs_one_active_per_config"
 
 
 def _run_in_flight_http(job_id: str | None, *, stopping: bool) -> HTTPException:
-    message = (
-        "This scraper is still stopping. Try again in a few minutes."
-        if stopping
-        else "This scraper is already running."
-    )
+    from src.api.config_eligibility import run_in_flight_message
+
     return HTTPException(
         status_code=status.HTTP_409_CONFLICT,
-        detail={"code": "run_in_flight", "job_id": job_id, "message": message},
+        detail={
+            "code": "run_in_flight",
+            "job_id": job_id,
+            "message": run_in_flight_message(stopping),
+        },
     )
 
 
@@ -212,114 +214,51 @@ async def enqueue_scrape_job(
     trigger: str,
     request: Request,
 ) -> "Job":
-    """Enforce AI/record-quota gates, create a pending Job for `config`, commit,
-    then enqueue the Celery scrape task. The single entry point for POST /jobs
-    (manual + scheduled runs) so the entitlement, quota, billing, and
-    commit-then-enqueue contract is enforced in exactly one place.
+    """Enforce the run gates, create a pending Job for `config`, commit, then
+    enqueue the Celery scrape task. POST /jobs is its only caller; the scheduler
+    and the batch fan-out start runs through their own dispatch paths.
 
     The caller owns config lookup/creation; this helper never re-checks
     `config.active`.
 
-    One run per scraper: a config with an active job, or one cancelled mid-run
-    moments ago, gets 409 run_in_flight (see _run_in_flight).
+    Every refusal comes from ``config_run_eligibility``, the same evaluator
+    GET /scrapers reports, so Run now cannot disagree with this gate. In order:
+      * 409 run_in_flight: a config with an active job, or one cancelled mid-run
+        moments ago (see Job.holds_run_slot);
+      * 402 entitlement (structured), when the plan does not include this
+        record type or county — audit-logged only while ENTITLEMENT_ENFORCEMENT
+        is off. An existing config can outlive a downgrade, so this re-validates
+        against the CURRENT plan;
+      * 402 monthly AI scrape limit, counted by the connector the worker would
+        actually run;
+      * 402 account rule (frozen / ended / over the record limit), which keeps
+        the two reasons apart on purpose: "over your limit" sends a customer
+        whose card failed to the upgrade page, which does not fix a payment.
     """
-    in_flight = await _run_in_flight(db, current_user.id, config.id)
-    if in_flight is not None:
-        raise _run_in_flight_http(in_flight[0], stopping=in_flight[1])
-
-    # Execution-time entitlement guard (audit-mode until ENTITLEMENT_ENFORCEMENT).
-    # An existing config can outlive a downgrade; re-validate against CURRENT plan.
     from datetime import UTC, datetime
 
-    from src.api.entitlements import ConfigRow, config_run_violation, enforce_runnable_http
-    active_rows = (await db.execute(
-        select(
-            ScraperConfig.id, ScraperConfig.state, ScraperConfig.county,
-            ScraperConfig.record_type, ScraperConfig.created_at,
-            ScraperConfig.active, ScraperConfig.paused_reason,
-        ).where(ScraperConfig.user_id == current_user.id, ScraperConfig.active)
-    )).all()
-    rows = [ConfigRow(*r) for r in active_rows]
-    # The config being run must count toward its OWN county claim. Defensive: if a
-    # visibility/replication gap left it out of active_rows, this still judges it
-    # inside the allowed set when the user is under their county cap. allowed_county_set
-    # dedupes by county, so this is a no-op on the normal path (the config is already
-    # active and present). created_at falls back to now if unset so slot ordering is sane.
-    rows.append(ConfigRow(
-        config.id, config.state, config.county, config.record_type,
-        config.created_at or datetime.now(UTC), True, None,
-    ))
-    enforce_runnable_http(
-        config_run_violation(current_user.plan, config.state, config.county, config.record_type, rows),
-        user=current_user, context="create_job",
-    )
-    # Check if this is an AI-powered connector and enforce AI job limits
-    connector_result = await db.execute(
-        select(CountyConnector).where(
-            CountyConnector.county == config.county,
-            func.lower(CountyConnector.state) == config.state.lower(),
-            CountyConnector.active,
-        )
-    )
-    connector = connector_result.scalars().first()
-    if connector and getattr(connector, "scraper_mode", "manual") == "ai":
-        ai_limit = settings.AI_JOB_LIMITS.get(
-            normalize_plan(current_user.plan), settings.AI_JOB_LIMITS["starter"]
-        )
-        if ai_limit != -1:
-            # Count AI jobs this month. H4 (full-SaaS review): the
-            # old query joined Job → ScraperConfig → CountyConnector
-            # on (county, state) with no uniqueness constraint on
-            # the connector side. Counties like Pierce have MULTIPLE
-            # connector rows (manual + AI for different record
-            # types), so the join produced duplicate rows per job
-            # and the count was inflated — users hit their AI job
-            # cap early. Fixed by counting DISTINCT Job.id and
-            # filtering ScraperConfig.user_id explicitly so the
-            # planner keeps the query tenant-scoped.
-            from datetime import UTC, datetime
-            month_start = datetime.now(UTC).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-            ai_job_count_result = await db.execute(
-                select(func.count(func.distinct(Job.id))).select_from(Job).join(
-                    ScraperConfig,
-                    (Job.scraper_config_id == ScraperConfig.id)
-                    & (ScraperConfig.user_id == current_user.id),
-                ).join(
-                    CountyConnector,
-                    (func.lower(ScraperConfig.county) == func.lower(CountyConnector.county))
-                    & (func.lower(ScraperConfig.state) == func.lower(CountyConnector.state))
-                    & (CountyConnector.scraper_mode == "ai"),
-                ).where(
-                    Job.user_id == current_user.id,
-                    Job.created_at >= month_start,
-                )
-            )
-            ai_jobs_used = ai_job_count_result.scalar_one()
-            if ai_jobs_used >= ai_limit:
-                raise HTTPException(
-                    status_code=status.HTTP_402_PAYMENT_REQUIRED,
-                    detail=(
-                        f"Monthly AI scrape limit reached ({ai_jobs_used}/{ai_limit}). "
-                        "Upgrade your plan for more AI-powered scrapes."
-                    ),
-                )
+    from src.api.config_eligibility import config_run_eligibility
+    from src.api.entitlements import enforce_runnable_http
 
-    # Enforce record limit — HTTP 402 when over quota or frozen for non-payment.
-    # WINDOW-AWARE: records_used only counts for the user's current ENTITLEMENT
-    # window. Reading it raw rejected users on the previous window's usage during
-    # the gap between a boundary and the lazy rollover catching up.
-    #
-    # quota_block_reason distinguishes the two reasons on purpose: telling a
-    # customer whose card failed that they are "over their limit" sends them to
-    # the upgrade page, which does not fix a failed payment.
-    from src.api.quota import quota_block_reason
+    # One clock for every gate below.
+    now = datetime.now(UTC)
+    eligibility = (await config_run_eligibility(db, current_user, [config], now))[config.id]
 
-    _blocked = quota_block_reason(current_user)
-    if _blocked:
+    if eligibility.code == "run_in_flight":
         raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail=_blocked,
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "run_in_flight",
+                "job_id": eligibility.job_id,
+                "message": eligibility.message,
+            },
         )
+    # Raises the structured 402 when enforcing; audit-logs otherwise.
+    enforce_runnable_http(eligibility.violation, user=current_user, context="create_job")
+    if not eligibility.can_run:
+        # ai_limit, or the account rule: the same sentence in `detail` as always,
+        # with the code and resumes_at added beside it (src/api/errors.py).
+        raise run_refusal_http(eligibility.code, eligibility.message, eligibility.resumes_at)
 
     job = Job(
         id=str(uuid.uuid4()),
@@ -390,7 +329,12 @@ async def enqueue_scrape_job(
     return job
 
 
-@router.post("", response_model=JobResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "",
+    response_model=JobResponse,
+    status_code=status.HTTP_201_CREATED,
+    responses=RUN_START_402_RESPONSES,
+)
 async def create_job(
     body: JobCreate,
     request: Request,

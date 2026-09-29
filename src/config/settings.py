@@ -1,7 +1,7 @@
 from pathlib import Path
 from typing import ClassVar, Literal
 
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -192,6 +192,10 @@ class Settings(BaseSettings):
     # locking out existing accounts. Flip per-service (api+worker) ONLY after the
     # pricing/UI/copy land and existing accounts are intentionally grandfathered.
     ENTITLEMENT_ENFORCEMENT: bool = False
+    # ...except in production, where UNSET means ON (audit #5, D5-02): a new service
+    # or environment that misses the variable must not silently fall back to
+    # audit-only gates. An explicit ENTITLEMENT_ENFORCEMENT=false still wins.
+    # See _entitlement_enforcement_fails_closed_in_production below.
 
     # ─── Email ────────────────────────────────────────────────────────────────
     RESEND_API_KEY: str = ""
@@ -260,6 +264,11 @@ class Settings(BaseSettings):
 
     # ─── Playwright ───────────────────────────────────────────────────────────
     PLAYWRIGHT_HEADLESS: bool = True
+    # Route every browser connection through the in-worker SOCKS5 egress proxy
+    # (src/scrapers/egress_proxy.py, audit #5 D5-03): one DNS answer per connection,
+    # checked, then dialled, and ports limited to 80/443/8080/8443. OFF by default
+    # so turning it on is a deliberate, verified step per environment.
+    SCRAPER_EGRESS_PROXY_ENABLED: bool = False
 
     # Which identity the browser presents to portals. See
     # src/scrapers/browser_identity.py for why this is flagged rather than
@@ -354,6 +363,13 @@ class Settings(BaseSettings):
     # 5 min). Each batch can hold thousands of rows, so throughput is fine;
     # the constraint is burst count, not total rows.
     SKIP_TRACE_MAX_BATCHES_PER_TICK: int = 2
+    # Seconds between dispatcher ticks (the beat entry). The pause-state publisher
+    # reads the SAME value to decide when its heartbeat is stale, so the two can
+    # never disagree. 60..599: a plain beat interval restarts in full on every
+    # deploy, so 600+ must be a crontab instead (tests/test_beat_schedule.py). Keep
+    # SKIP_TRACE_MAX_BATCHES_PER_TICK * (300 / this) within Tracerfy's 10 POSTs per
+    # 5 minutes; a 429 only defers the batch to the next tick.
+    SKIP_TRACE_DISPATCH_INTERVAL_SECONDS: int = 300
     # Rolling-24h ceilings on Tracerfy spend, in CREDITS (a normal lookup costs 1,
     # an advanced one 2). Every lookup costs real money and the only other ceiling
     # is the prepaid balance returning 402. Enforced inside the dispatcher's claim
@@ -369,16 +385,40 @@ class Settings(BaseSettings):
     # SKIP_TRACE_DAILY_CREDIT_CAP is unset, and then read AS CREDITS with a
     # warning, so 1000 means 500 advanced lookups a day.
     SKIP_TRACE_DAILY_ROW_CAP: int | None = None
+    # Contact lookups a free-trial account may queue over its WHOLE lifetime, in
+    # credits (audit #3 S3-03, owner decision 2026-09-27: a small allowance). A
+    # trial has no subscription to bill, so every lookup it buys is paid by us.
+    # Unlike the caps above, 0 is not "off": it means a trial gets no lookups.
+    SKIP_TRACE_TRIAL_CREDIT_ALLOWANCE: int = 25
 
     @field_validator(
         "SKIP_TRACE_DAILY_CREDIT_CAP", "SKIP_TRACE_ACCOUNT_DAILY_CREDIT_CAP",
-        "SKIP_TRACE_DAILY_ROW_CAP",
+        "SKIP_TRACE_DAILY_ROW_CAP", "SKIP_TRACE_TRIAL_CREDIT_ALLOWANCE",
     )
     @classmethod
     def spend_caps_are_not_negative(cls, v: int | None) -> int | None:
         """A negative cap would be read by nothing sensible; refuse it at boot."""
         if v is not None and v < 0:
-            raise ValueError("skip-trace spend caps must be 0 (disabled) or positive")
+            raise ValueError("skip-trace spend caps and allowances must not be negative")
+        return v
+
+    @model_validator(mode="after")
+    def _entitlement_enforcement_fails_closed_in_production(self) -> "Settings":
+        if (
+            self.ENVIRONMENT.strip().lower() == "production"
+            and "ENTITLEMENT_ENFORCEMENT" not in self.model_fields_set
+        ):
+            # object.__setattr__: no recursion even if validate_assignment is ever on.
+            object.__setattr__(self, "ENTITLEMENT_ENFORCEMENT", True)
+        return self
+
+    @field_validator("SKIP_TRACE_DISPATCH_INTERVAL_SECONDS")
+    @classmethod
+    def dispatch_interval_is_a_short_interval(cls, v: int) -> int:
+        """Refuse at boot what beat would mis-schedule: 600+ restarts a full period on
+        every deploy (a crontab is needed), and under 60 outpaces Tracerfy's limit."""
+        if not 60 <= v < 600:
+            raise ValueError("SKIP_TRACE_DISPATCH_INTERVAL_SECONDS must be 60..599")
         return v
 
     @field_validator("TRACERFY_WEBHOOK_SECRET")

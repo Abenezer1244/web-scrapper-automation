@@ -707,6 +707,100 @@ class ScraperConfigCreate(BaseModel):
         return v.lower().strip()
 
 
+class ConfigRunEligibilityResponse(BaseModel):
+    """May this scraper start a run (``src.api.config_eligibility``).
+
+    The same evaluator decides POST /jobs, and the codes are listed in the order
+    that gate refuses, so the reason shown is the refusal the user would get.
+    ``config_inactive`` is the exception: it is reported only here, since POST
+    /jobs answers an inactive scraper with a plain 404.
+    """
+
+    can_run: bool
+    code: Literal[
+        "config_inactive", "run_in_flight", "not_entitled", "ai_limit",
+        "frozen", "ended", "over_limit",
+    ] | None = None
+    message: str | None = None
+    # When the block lifts by itself: over_limit (null if the quota will not
+    # reset) and ai_limit (next UTC month). Null for every other code.
+    resumes_at: datetime | None = None
+    # The job holding the run slot (run_in_flight only; null if it just ended).
+    job_id: str | None = None
+    # The entitlement rule broken (not_entitled only); the same code the 402's
+    # ``detail.code`` carries, e.g. "record_type" or "county_limit".
+    violation_code: str | None = None
+    model_config = {"from_attributes": True}
+
+    @model_validator(mode="after")
+    def _consistent(self) -> "ConfigRunEligibilityResponse":
+        extras = (self.code, self.message, self.resumes_at, self.job_id, self.violation_code)
+        if self.can_run:
+            if any(v is not None for v in extras):
+                raise ValueError("a runnable scraper carries no reason")
+            return self
+        if self.code is None or not self.message:
+            raise ValueError("a refusal carries a code and a message")
+        if self.resumes_at is not None and self.code not in ("over_limit", "ai_limit"):
+            raise ValueError("only over_limit and ai_limit resume by themselves")
+        if self.job_id is not None and self.code != "run_in_flight":
+            raise ValueError("only run_in_flight names a job")
+        if (self.violation_code is not None) != (self.code == "not_entitled"):
+            raise ValueError("violation_code is set exactly when not_entitled")
+        return self
+
+
+# ─── 402 bodies (POST /jobs, POST /batches) ──────────────────────────────────
+# A route declares every 402 shape it can return, as an anyOf. A run refusal
+# also satisfies the plain shape (both have a string detail): tell them apart by
+# the presence of `code`. Kept anyOf on purpose; exclusivity would need
+# additionalProperties: false, which breaks a client the day a key is added.
+
+
+class RunRefusalResponse(BaseModel):
+    """A run refused by the AI monthly limit or the account rule
+    (``src.api.errors``). ``detail`` is the same sentence this 402 has always
+    carried; ``code`` and ``resumes_at`` were ADDED beside it, and more
+    top-level keys may be added, so ignore keys you do not know."""
+
+    detail: str
+    code: Literal["ai_limit", "frozen", "ended", "over_limit"]
+    # When the block lifts by itself: ai_limit (next UTC month start) and
+    # over_limit (the quota reset; null if the term ends first). Else null.
+    resumes_at: datetime | None
+
+
+class EntitlementRefusalDetail(BaseModel):
+    code: str
+    title: str
+    message: str
+
+
+class EntitlementRefusalResponse(BaseModel):
+    """The plan does not include what was asked for (``entitlements.plan_limit_http``)."""
+
+    detail: EntitlementRefusalDetail
+
+
+class PlainRefusalResponse(BaseModel):
+    """A 402 that carries only a sentence (e.g. the batch plan gate)."""
+
+    detail: str
+
+
+# The 402 declaration shared by the routes that start runs.
+RUN_START_402_RESPONSES: dict[int | str, dict[str, Any]] = {
+    402: {
+        "model": RunRefusalResponse | EntitlementRefusalResponse | PlainRefusalResponse,
+        "description": (
+            "Refused. A run refusal (AI limit, frozen, ended, over the record "
+            "limit) has a top-level `code`; a plan refusal has an object "
+            "`detail`; anything else is a sentence in `detail`."
+        ),
+    },
+}
+
+
 class ScraperConfigResponse(BaseModel):
     id: str
     user_id: str
@@ -733,6 +827,9 @@ class ScraperConfigResponse(BaseModel):
     active: bool
     created_at: datetime
     updated_at: datetime
+    # Filled by GET /scrapers and GET /scrapers/{id}. Null on every other route
+    # means "not computed", never "allowed".
+    run_eligibility: ConfigRunEligibilityResponse | None = None
 
     model_config = {"from_attributes": True}
 

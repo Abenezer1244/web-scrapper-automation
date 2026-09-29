@@ -254,6 +254,30 @@ def emit_payment_notification(self, user_id: str, attempt_count: int) -> None:
     )
 
 
+def account_charge_block(db, user_id, *, lock: str) -> str | None:
+    """'frozen' or 'ended' when this account may no longer be charged for records,
+    else None (audit #4 S4-01). The same rule the skip-trace claim applies
+    (`paid_lookup_access`), so the two cannot disagree.
+
+    The users row is read under `lock`, and the decision is made at a clock read
+    taken AFTER the lock is held: waiting for a billing write can carry the run
+    past a grace deadline or a term end, and a clock read before the wait would
+    still say the account was live (Codex 4a review round 2)."""
+    from src.workers.skip_trace_claim import (
+        ACCESS_ENDED,
+        ACCESS_FROZEN,
+        paid_lookup_access,
+        read_access_rows,
+    )
+
+    account = read_access_rows(db, [user_id], lock=lock).get(str(user_id))
+    if account is None:
+        return ACCESS_ENDED
+    now = db.execute(sa_text("SELECT clock_timestamp()")).scalar()
+    access = paid_lookup_access(account, now)
+    return access if access in (ACCESS_FROZEN, ACCESS_ENDED) else None
+
+
 def skip_reason_for_config(active: bool, paused_reason: str | None) -> str | None:
     """Why a job for this scraper must not run, in the user's words, or None.
 
@@ -545,6 +569,22 @@ def run_scrape_job(self, job_id: str) -> None:
             # _fail_job writes the job log line, emits the event and releases any
             # reserved quota, so a skipped run reserves and bills nothing.
             _fail_job(db, job, r, job_id, _skip_reason, expected_started_at=attempt_started_at)
+            return
+
+        # The ACCOUNT may still start billable work (audit #4 S4-01). The enqueue
+        # gates ask run_eligibility, but a job can sit queued, be re-run by the
+        # watchdog or fan out from a batch after its account froze for
+        # non-payment or its paid term ended. Re-read under this attempt's claim.
+        # over_limit is deliberately NOT re-checked: this job's own reservation
+        # counts toward usage, so a watchdog re-run would refuse itself, and the
+        # reservation below already grants only what is left.
+        from src.api.quota import run_eligibility
+
+        db.refresh(user)
+        _eligibility = run_eligibility(user)
+        if _eligibility.code in ("frozen", "ended"):
+            _fail_job(db, job, r, job_id, _eligibility.message,
+                      expected_started_at=attempt_started_at)
             return
 
         # Execution-time entitlement backstop (audit until ENTITLEMENT_ENFORCEMENT).
@@ -1749,7 +1789,15 @@ def run_scrape_job(self, job_id: str) -> None:
         # them at 5000/1000. (Codex)
         from src.api.quota import effective_records_limit as _eff_limit
 
-        if _eff_limit(user) != -1:
+        # An account that froze or ended during the run enters the cap block
+        # whatever its limit (S4-01, Codex 4a review round 2): an unlimited plan
+        # would otherwise skip it and deliver. Inside, the decision is re-made
+        # under the users row lock and grants 0 records. This first read is only
+        # the gate into the block; for an unlimited account that stays live it is
+        # the whole check, so a freeze committed after it and before delivery
+        # (the export that follows) is not caught here.
+        _charge_block = account_charge_block(db, job.user_id, lock="")
+        if _eff_limit(user) != -1 or _charge_block:
             _cap_error: Exception | None = None
             if refreshed is None:
                 _cap_error = RuntimeError("post-enrichment refetch failed")
@@ -1797,6 +1845,20 @@ def run_scrape_job(self, job_id: str) -> None:
                     ).rowcount
 
                     if _claimed:
+                        # 1b. The account may still be charged (S4-01, Codex 4a
+                        #    review). The pre-scrape check is a read, and a freeze
+                        #    or a term end can commit while the scrape runs. Decided
+                        #    HERE under the users row lock the grant below takes
+                        #    anyway (jobs, then users: the order above), so nothing
+                        #    can land between this decision and the grant. A
+                        #    frozen or ended account is granted nothing: every row
+                        #    is capped, so nothing is delivered, billed or traced.
+                        if account_charge_block(db, job.user_id, lock="FOR UPDATE"):
+                            _logger.warning(
+                                "Job %s: account %s froze or ended during the run; "
+                                "granting 0 records", job_id, job.user_id,
+                            )
+                            _want = 0
                         # 2. Compute the grant and consume it in ONE statement.
                         #    FOR UPDATE serialises concurrent reservations for
                         #    this user: the loser blocks, then re-reads the

@@ -2877,6 +2877,65 @@ Branch `feat/lookup-1b1c-ii-quote` off `9833a7b0`. `routes/jobs.py` (the endpoin
 - **Regression (5 chunks, every test file that calls `/jobs` + the lookup/billing set): 857
   passed, 0 failed.** ruff clean.
 
+### main moved under ii: #374 + #378 (security audits 4/4b) change two binding inputs (2026-09-28)
+Rebased cleanly onto `4f56a5e3`, but NOT reviewed or pushed: two facts the plan stood on changed.
+- **F1 WHO MAY BUY A LOOKUP is now decided by the claim** (`paid_lookup_access()`,
+  `src/workers/skip_trace_claim.py`, audit S3-03/S4-01): `starter` / `frozen` / `ended` are
+  blocked; `full` for admin, a paid term ending later, `active`, `past_due` in grace, or an
+  operator-granted plan; everything else (app trial, `trialing`, `canceled`, ...) is `trial`,
+  which may queue at most `SKIP_TRACE_TRIAL_CREDIT_ALLOWANCE` (25) credits over its WHOLE
+  LIFETIME. The rest is HELD (`not_attempted`). The room is `allowance -
+  lifetime_credits_queued()`, read from `pending_skip_trace_rows`: WORKER-ONLY, so the API
+  cannot compute a trial's remaining room. My quote gates on the plan NAME: a trial `pro`
+  account would be quoted up to 2,000 leads while the claim buys at most 25 credits.
+  Money-safe (the claim is the authority), customer-wrong. Frozen/ended: my R1 gate uses the
+  same predicates (`is_frozen`, `entitlement_ends_at <= now`), so it agrees.
+- **F2 the `export` zone is now the shared bucket of EVERY full-CSV route** (job, batch and
+  segment downloads, S4-03). A quote in that zone spends the customer's download budget.
+- The API already lazy-imports `src.workers.*` inside routes (`batches.py:411,765`,
+  `registration.py:105`), so the quote may call `paid_lookup_access()` itself (one rule, no
+  copy); `skip_trace_claim.py` imports only sqlalchemy and the logger at module level.
+
+**Proposed amendments (need Codex + OWNER):**
+- **A1 access by the claim's own rule.** Local import of `paid_lookup_access`; `starter` ->
+  the structured plan 402 (as now); `frozen`/`ended` -> the run-refusal 402 (R1, unchanged
+  predicates, `run_eligibility` still supplies the message); `full` -> as planned; `trial` ->
+  OWNER DECISION T:
+  - **T-a (recommended)** quote it, capped: walk the window as now but stop once the quoted
+    CREDITS (normal 1, advanced 2) would exceed the lifetime allowance, in the same window
+    order the claim keeps; the response adds `access` (`full` | `trial`) and
+    `trial_credit_allowance`, and says lookups already used on the trial lower it further
+    (the claim holds the rest). Stored `quoted_ids` capped the same way.
+  - **T-b** refuse trials at the quote with a structured 402 ("Paid plans include contact
+    lookups"), leaving their 25 credits to scrape-time lookups only.
+- **A2 a dedicated `lookup_quote` zone** (10/min per user, in `_FALLBACK_ZONES`), so quoting
+  never spends download budget. It is `rate_limit.py`, a 6th file in ii: OWNER DECISION Z:
+  - **Z-a** allow ii at 6 files (the zone line + its comment);
+  - **Z-b (recommended)** a tiny precursor PR (zone + a test + the plan), then ii;
+  - **Z-c** share the existing `writes` zone (30/min: cancel + scraper edits) instead.
+
+**Codex consult on A1/A2 (2026-09-28): PLAN: REVISE, 3 P1 + 1 P2 + 2 P3.** Output
+`<scratchpad dea35045>/codex_1b1c_ii_amend_r1_out.txt`. F1, F2 confirmed; nothing else in
+#374/#378 touches the planner or its parity. A1 sound for an advisory quote (pass the route's
+`now`, no row lock on the quote path). Codex preferred T-a with an EXACT API-visible lifetime
+counter (a migration); recommended Z-b; asked for payload/key **v2** and an explicit
+trial-cap disposition/reason at the 1b-2 confirm.
+
+**OWNER DECISIONS (2026-09-28):**
+- **T: cap at the FULL allowance** (no new schema). A trial's quote stops once its quoted
+  CREDITS would exceed `SKIP_TRACE_TRIAL_CREDIT_ALLOWANCE`, in window order (the order the claim
+  keeps). This is still a true UPPER bound: the claim's room is `allowance - used <=
+  allowance`, and the claim only lowers it. The response carries `access` (`full` | `trial`)
+  and `trial_credit_allowance`, and its docs say credits already used on the trial lower it
+  further. Rejected: the exact counter (a money-path migration phase ahead of ii for a number
+  the claim already enforces) and refusing trials (their allowance was meant to be usable).
+- **Z: precursor PR first.** `lookup_quote` zone, 10/min per user, in `_FALLBACK_ZONES`;
+  `rate_limit.py` + its test only (this plan records it in ii). Then ii rebases on it.
+- Adopted from Codex: payload `v: 2` with `access`, `trial_credit_allowance` and
+  `quoted_credits`, key namespace `...:quote:v2:...`; carried to 1b-2: confirm re-checks access
+  and the trial room under the user-row lock, refuses a payload whose `v` it does not know, and
+  records the trial-held leads with an explicit reason.
+
 **Files:** i = planner, `lookup_pricing.py`, planner tests, `docs/BUILD_JOURNAL.md`, this plan;
 ii = `routes/jobs.py`, `schemas.py`, `schema/openapi.json`, quote tests, this plan.
 **Logged follow-ups:** `/skip-trace-usage` onto `lookup_pricing` + `normalize_plan` + the roll

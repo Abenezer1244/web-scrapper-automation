@@ -899,3 +899,101 @@ def test_two_workers_rolling_the_same_user_cannot_double_reset():
     assert granted_b == 300
     assert fresh.records_used == 600
     assert fresh.quota_period_start >= boundary
+
+# ─── S4-06: the grant is judged at the moment the users row is HELD ───────────
+
+def test_a_reservation_that_waits_on_the_user_lock_across_the_window_end_charges_the_NEW_window():
+    """Audit S4-06. The reservation used to read its clock BEFORE the users-row
+    lock. Waiting on that lock (another job reserving, billing settling) across
+    ``quota_period_end`` then granted against the OLD window: the old counter,
+    the old limit, and the old window recorded on the job.
+
+    900 of 1,000 used in a window that ends a few seconds from now. The lock is
+    held until the database clock is past the end; the waiting reservation then
+    runs in the NEW window (counter rolled to 0) and is granted all 300, not the
+    100 the old window had left.
+    """
+    import threading
+    import time
+
+    with SyncSessionLocal() as db:
+        boundary = db.execute(
+            text("SELECT clock_timestamp() + interval '5 seconds'")
+        ).scalar()
+        user = _mk_user(
+            db, used=900, limit=1000,
+            period=boundary - timedelta(days=30), window_end=boundary,
+        )
+        job = _mk_job(db, user.id, _mk_config(db, user.id).id)
+        user_id, job_id = user.id, job.id
+        db.commit()
+
+    result: dict = {}
+    errors: list[Exception] = []
+
+    def reserver() -> None:
+        try:
+            with SyncSessionLocal() as db:
+                result["pid"] = db.execute(text("SELECT pg_backend_pid()")).scalar()
+                result["granted"] = _reserve(db, job_id, user_id, want=300)
+                db.commit()
+        except Exception as exc:            # noqa: BLE001 - surfaced below
+            errors.append(exc)
+
+    holder = SyncSessionLocal()
+    thread = threading.Thread(target=reserver)
+    try:
+        holder.execute(
+            text("SELECT 1 FROM users WHERE id = CAST(:u AS uuid) FOR UPDATE"),
+            {"u": user_id},
+        )
+        thread.start()
+
+        # The reservation must be WAITING on the users row before the window
+        # ends; otherwise a pass would prove nothing (it would simply have
+        # started in the new window).
+        with SyncSessionLocal() as probe:
+            deadline = time.monotonic() + 10
+            waiting = False
+            while time.monotonic() < deadline and not waiting:
+                pid = result.get("pid")
+                if pid is not None:
+                    waiting = bool(probe.execute(
+                        text(
+                            "SELECT count(*) FROM pg_locks "
+                            "WHERE pid = :p AND NOT granted"
+                        ),
+                        {"p": pid},
+                    ).scalar())
+                if not waiting:
+                    time.sleep(0.05)
+            assert waiting, "the reservation never blocked on the users row lock"
+            assert probe.execute(text("SELECT clock_timestamp()")).scalar() < boundary, (
+                "the reservation must be blocked BEFORE the window ends"
+            )
+            while probe.execute(text("SELECT clock_timestamp()")).scalar() <= boundary:
+                time.sleep(0.1)
+        holder.commit()
+    finally:
+        holder.rollback()
+        holder.close()
+        thread.join(timeout=30)
+
+    assert not errors, f"reservation raised: {errors}"
+    assert result["granted"] == 300, (
+        f"granted {result['granted']}: judged against the window that had already "
+        "ended (the clock was read before the lock was held)"
+    )
+    with SyncSessionLocal() as db:
+        fresh = db.get(User, user_id)
+        job_row = db.execute(
+            text("SELECT reserved_at, reserved_count, quota_period_start "
+                 "FROM jobs WHERE id = :j"),
+            {"j": job_id},
+        ).one()
+    assert fresh.records_used == 300, "the new window carries exactly this grant"
+    assert fresh.quota_period_start >= boundary, "and the window did roll"
+    assert job_row.quota_period_start is not None
+    assert job_row.quota_period_start >= boundary, "the job is charged to the NEW window"
+    assert job_row.reserved_at >= boundary, "reserved_at is the post-lock clock"
+    assert job_row.reserved_count == 300

@@ -254,15 +254,18 @@ def emit_payment_notification(self, user_id: str, attempt_count: int) -> None:
     )
 
 
-def account_charge_block(db, user_id, *, lock: str) -> str | None:
-    """'frozen' or 'ended' when this account may no longer be charged for records,
-    else None (audit #4 S4-01). The same rule the skip-trace claim applies
-    (`paid_lookup_access`), so the two cannot disagree.
+def account_charge_state(db, user_id, *, lock: str):
+    """(block, now): `block` is 'frozen' or 'ended' when this account may no
+    longer be charged for records, else None (audit #4 S4-01); `now` is the
+    database clock the decision was made at. The same rule the skip-trace claim
+    applies (`paid_lookup_access`), so the two cannot disagree.
 
-    The users row is read under `lock`, and the decision is made at a clock read
-    taken AFTER the lock is held: waiting for a billing write can carry the run
-    past a grace deadline or a term end, and a clock read before the wait would
-    still say the account was live (Codex 4a review round 2)."""
+    The users row is read under `lock`, and `now` is read AFTER the lock is held:
+    waiting for a billing write can carry the run past a grace deadline, a term
+    end or a quota window end, and a clock read before the wait would still judge
+    the moment the wait began (Codex 4a review round 2; audit S4-06). A caller
+    that charges under the same lock judges its window at this `now` too, so the
+    access decision and the charge cannot straddle a boundary."""
     from src.workers.skip_trace_claim import (
         ACCESS_ENDED,
         ACCESS_FROZEN,
@@ -271,11 +274,17 @@ def account_charge_block(db, user_id, *, lock: str) -> str | None:
     )
 
     account = read_access_rows(db, [user_id], lock=lock).get(str(user_id))
-    if account is None:
-        return ACCESS_ENDED
     now = db.execute(sa_text("SELECT clock_timestamp()")).scalar()
+    if account is None:
+        return ACCESS_ENDED, now
     access = paid_lookup_access(account, now)
-    return access if access in (ACCESS_FROZEN, ACCESS_ENDED) else None
+    return (access if access in (ACCESS_FROZEN, ACCESS_ENDED) else None), now
+
+
+def account_charge_block(db, user_id, *, lock: str) -> str | None:
+    """'frozen' or 'ended' when this account may no longer be charged for records,
+    else None. See `account_charge_state`."""
+    return account_charge_state(db, user_id, lock=lock)[0]
 
 
 def reserve_job_quota(db, *, job_id: str, user_id, want: int) -> int | None:
@@ -297,18 +306,23 @@ def reserve_job_quota(db, *, job_id: str, user_id, want: int) -> int | None:
     this) inverts against them and lets a watchdog re-run deadlock with an
     attempt already in billing: one holds users and wants jobs, the other holds
     jobs and wants users. (Codex)
-    """
-    reserved_at = db.execute(sa_text("SELECT clock_timestamp()")).scalar()
 
+    THE CLOCK IS READ ONCE THE USERS ROW IS HELD (audit S4-06). The grant
+    evaluates the entitlement window at that moment. A clock read before the lock
+    judged a reservation that waited across ``quota_period_end`` (another job
+    reserving, billing settling) against the window that had already ended: the
+    old counter, the old limit, and the old window recorded on the job.
+    """
     # 1. CAS-claim on the JOB. Only the attempt that flips reserved_at from NULL
     #    reserves, so a watchdog re-run of this same job reuses its grant instead
-    #    of taking a second one.
+    #    of taking a second one. The value written here is only the claim marker;
+    #    step 3 replaces it with the post-lock clock the grant was judged at.
     claimed = db.execute(
         sa_text(
-            "UPDATE jobs SET reserved_at = CAST(:at AS timestamptz) "
+            "UPDATE jobs SET reserved_at = clock_timestamp() "
             "WHERE id = :jid AND reserved_at IS NULL"
         ),
-        {"jid": job_id, "at": reserved_at},
+        {"jid": job_id},
     ).rowcount
     if not claimed:
         return None
@@ -319,8 +333,10 @@ def reserve_job_quota(db, *, job_id: str, user_id, want: int) -> int | None:
     #    takes anyway (jobs, then users: the order above), so nothing can land
     #    between this decision and the grant. A frozen or ended account is
     #    granted nothing: every row is capped, so nothing is delivered, billed or
-    #    traced.
-    if account_charge_block(db, user_id, lock="FOR UPDATE"):
+    #    traced. `reserved_at` is the clock read under that lock: the decision,
+    #    the window and the job's record all use this one instant.
+    block, reserved_at = account_charge_state(db, user_id, lock="FOR UPDATE")
+    if block:
         _logger.warning(
             "Job %s: account %s froze or ended during the run; granting 0 records",
             job_id, user_id,
@@ -367,14 +383,20 @@ def reserve_job_quota(db, *, job_id: str, user_id, want: int) -> int | None:
     #    was charged to has since rolled and been zeroed". Comparing calendar
     #    months (the previous test) is only accidentally right while every window
     #    starts on the 1st. Same job row, already locked by step 1 — no new lock
-    #    is taken.
+    #    is taken. `new_start` is never NULL (users.quota_anchor_at,
+    #    quota_period_start and quota_period_end are NOT NULL, and
+    #    public.quota_next_start is STRICT over them and a non-NULL `at`),
+    #    so reservation_is_current_sql never falls back to the pre-088 reading
+    #    of `reserved_at`, and replacing the claim marker here changes nothing
+    #    for settlement or release.
     db.execute(
         sa_text(
             "UPDATE jobs SET reserved_count = :n, "
-            "quota_period_start = CAST(:ws AS timestamptz) "
+            "quota_period_start = CAST(:ws AS timestamptz), "
+            "reserved_at = CAST(:at AS timestamptz) "
             "WHERE id = :jid"
         ),
-        {"n": granted, "jid": job_id, "ws": res_row.new_start},
+        {"n": granted, "jid": job_id, "ws": res_row.new_start, "at": reserved_at},
     )
     return granted
 

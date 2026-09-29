@@ -518,6 +518,8 @@ def test_a_credit_cap_stops_at_the_allowance():
     w = plan_window(rows, POLICY_OFF, credit_cap=25)
     assert w.quoted_ids == [r.id for r in rows[:25]]
     assert (w.quoted_credits, w.stopped, w.over_credit_cap) == (25, "credit_cap", 0)
+    assert w.credit_cap == 25
+    assert plan_window(rows, POLICY_OFF).credit_cap is None
 
 
 def test_a_lead_that_does_not_fit_is_skipped_and_a_cheaper_one_still_fits():
@@ -563,9 +565,13 @@ async def test_the_credit_cap_keeps_exactly_what_the_real_claim_keeps_for_a_tria
     await db.commit()
     job = _job(business_user.id)
     # Allowance 7: advanced (2), normal (3), advanced (5), advanced (7), then the room
-    # is 0, so the last advanced and the last normal are both held.
-    specs = [{"party_name": None}, {}, {"party_name": None}, {"party_name": None},
-             {"party_name": None}, {}]
+    # is 0, so the last advanced and the last normal are both held. Each row gets its
+    # own created_at: rows of one transaction share it, and the window would then
+    # order them by random id, making the sequence (and the credits) vary per run.
+    t0 = datetime(2026, 9, 1, tzinfo=UTC)
+    kinds = [None, _PARTY, None, None, None, _PARTY]
+    specs = [{"party_name": p, "created_at": t0 + timedelta(seconds=i)}
+             for i, p in enumerate(kinds)]
     _seed(business_user.id, job, specs)
 
     window = await plan_tab_window(db, job, business_user.id, "new", _today(), POLICY_OFF,

@@ -198,7 +198,8 @@ async def rate_limit(request: Request, zone: str = "general", identifier: str | 
     Args:
         request: The incoming FastAPI request.
         zone: A key of _ZONES ('auth', 'jobs', 'general', 'webhook', 'stripe',
-            'export', 'writes'). An unknown zone falls back to 'general'.
+            'export', 'writes', 'lookup_quote'). An unknown zone falls back to
+            'general'.
         identifier: Custom key (e.g. user_id). Falls back to client IP.
     """
     max_requests, window_seconds = _ZONES.get(zone, _ZONES["general"])

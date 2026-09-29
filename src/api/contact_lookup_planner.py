@@ -162,15 +162,16 @@ class Window:
     window_end: tuple[datetime, str] | None = None
     # "cap" | "credit_cap" | "scan_limit" | None (the rows ran out)
     stopped: str | None = None
+    # A trial account's LIFETIME allowance, or None (no credit budget).
+    credit_cap: int | None = None
     quoted_credits: int = 0
     # Quotable leads left out because they did not fit the credit budget.
     over_credit_cap: int = 0
 
-    def add(self, row, policy: PlannerPolicy, *, cap: int, ceiling: int,
-            credit_cap: int | None = None) -> bool:
+    def add(self, row, policy: PlannerPolicy, *, cap: int, ceiling: int) -> bool:
         """Classify one row; False once the window is full.
 
-        `credit_cap` is a trial account's LIFETIME allowance (`paid_lookup_access`
+        `self.credit_cap` is a trial account's LIFETIME allowance (`paid_lookup_access`
         == trial). It is applied exactly as `claim_skip_trace_rows` applies the room,
         in the order given: a lead whose cost does not fit is skipped and a later,
         cheaper one may still fit. The claim's room is the allowance MINUS what the
@@ -181,7 +182,7 @@ class Window:
         self.window_end = (row.created_at, str(row.id))
         if verdict.bucket == QUOTABLE:
             cost = CREDITS[verdict.trace_type]
-            if credit_cap is not None and self.quoted_credits + cost > credit_cap:
+            if self.credit_cap is not None and self.quoted_credits + cost > self.credit_cap:
                 self.over_credit_cap += 1
             else:
                 self.quoted_ids.append(str(row.id))
@@ -192,7 +193,8 @@ class Window:
             self.counts[verdict.bucket] = self.counts.get(verdict.bucket, 0) + 1
         if len(self.quoted_ids) >= cap:
             self.stopped = "cap"
-        elif credit_cap is not None and credit_cap - self.quoted_credits < min(CREDITS.values()):
+        elif (self.credit_cap is not None
+              and self.credit_cap - self.quoted_credits < min(CREDITS.values())):
             self.stopped = "credit_cap"  # nothing, not even the cheapest lookup, fits
         elif self.examined >= ceiling:
             self.stopped = "scan_limit"
@@ -204,9 +206,9 @@ def plan_window(
     ceiling: int = SCAN_CEILING, credit_cap: int | None = None,
 ) -> Window:
     """Plan over rows already in `(created_at, id)` order."""
-    window = Window()
+    window = Window(credit_cap=credit_cap)
     for row in rows:
-        if not window.add(row, policy, cap=cap, ceiling=ceiling, credit_cap=credit_cap):
+        if not window.add(row, policy, cap=cap, ceiling=ceiling):
             break
     return window
 
@@ -282,7 +284,7 @@ async def plan_tab_window(
     out. Rows an earlier action bought are no longer `not_attempted`, so the window
     always moves forward."""
     await _bound_statements(db)
-    window = Window()
+    window = Window(credit_cap=credit_cap)
     after: tuple[datetime, str] | None = None
     while True:
         stmt = select(*_ROW_COLUMNS).where(_not_attempted(job_id, user_id, category, today))
@@ -292,7 +294,7 @@ async def plan_tab_window(
             stmt.order_by(Result.created_at, Result.id).limit(chunk)
         )).all()
         for row in rows:
-            if not window.add(row, policy, cap=cap, ceiling=ceiling, credit_cap=credit_cap):
+            if not window.add(row, policy, cap=cap, ceiling=ceiling):
                 return window
         if len(rows) < chunk:
             return window

@@ -19,6 +19,70 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-28 — Audit #4 PRs merged, S4-06 fixed, and a merge gate that passed on a crash
+
+> Owner asked: merge #374 then #378, then fix S4-06 (deferred in audit #5). All three are
+> merged and live. Plan and review: `tasks/todo-security-s4-06.md`.
+
+**Built / Shipped:**
+- **#374** (S3-03/S4-01, trial skip-trace gate) merged as `bdbbc762`. S3-03 is no longer live.
+- **#378** (S4-03, batch/segment CSV exports in the `export` rate-limit zone) merged as `4f56a5e3`.
+- **#385** (S4-06) merged as `06f23df6`. The reservation is now `reserve_job_quota()`
+  (`src/workers/tasks.py`), and its clock is read after the users-row lock
+  (`account_charge_state()` returns `(block, now)`). That one instant drives the
+  frozen/ended decision, the grant's window and `jobs.reserved_at`.
+  `tests/test_quota_reservation.py` now calls the real function; the `_RESERVE_SQL`
+  copy is gone.
+
+**Tried / Decided:**
+- #374 and #378 were BEHIND main (branch protection is strict). I merged main into each
+  PR branch and re-ran their tests locally before pushing. #374 needed two rounds,
+  because another session merged #384 in between. #384's new modules have no importer
+  yet, so they could not interact with #374's gate.
+- #374 already added `users ... FOR UPDATE` inside the reservation. S4-06 was therefore
+  only the clock, which is why it was built on top of #374.
+- Codex consult: take ONE post-lock clock read, not two (the decision and the charge must
+  not straddle a boundary). Keep the test-only clock out of production: the two `at=`
+  tests now move the data back in time instead.
+
+**Failed / Blocked:**
+- **I merged #385 without a clean quiet check.** I scripted "merge unless a count is
+  non-zero". `quiet.py` crashed on a Supabase pool checkout timeout (`ECHECKOUTTIMEOUT`),
+  printed no counts, and the merge went ahead. The gate must require positive evidence
+  (exit 0 and every count present and 0). Memory: `landmine_quiet_gate_must_require_zeros`.
+- The CI watcher in the background was stopped by the low-memory reaper once. Afterwards
+  I polled in the foreground in 9-minute blocks.
+
+**Caught & fixed:**
+- The boundary test FAILED on the pure extraction: "granted 100", judged against the
+  ended window. It failed only after its own guards passed (the reservation was WAITING
+  in `pg_locks` before the boundary, by the DB clock), so the failure was real and not
+  timing. With the fix it grants 300 in the new window.
+- Codex diff review r1 P3: a 5 s margin could fail spuriously on slow CI. Now 10 s.
+
+**Pending / Handoff:**
+- Production DB stall ~01:28-01:45Z (2026-09-29 UTC). The quiet check was all zeros at
+  ~00:58 and the pool was timing out at ~01:30, BEFORE #385 merged. Every worker task was
+  slow at once (60-130 s); beat tasks failed with `SSL connection has been closed
+  unexpectedly`; a `pg_type` catalog query took 45 s; the API showed no 5xx. It recovered
+  by itself (tasks succeed from 01:46, `/health` 0.4 s). **Root cause unknown**: it looks
+  DB-wide (Supabase side), not one query. The owner should check the Supabase
+  usage/health dashboard for that window.
+- Still open from audit #5: D5-03 egress proxy rollout (flag OFF), `.env.example`
+  entries, 5b-ii (P3), D5-01 (product decision), S4-02 (P2), S3-16 (Tracerfy header),
+  owner infra (S3-04, S3-17). Also: unlimited live accounts skip the locked S4-01
+  re-check (documented in `run_scrape_job`).
+
+**Facts learned:**
+- `users.quota_anchor_at`, `quota_period_start` and `quota_period_end` are NOT NULL, and
+  `public.quota_next_start` is STRICT, so a reservation's `new_start` is never NULL.
+  `reservation_is_current_sql` reads `jobs.reserved_at` only when the job's window is
+  NULL (pre-088), so `reserved_at` is free to hold the post-lock clock.
+- A Git-checked-out `tasks.py` is CRLF in the working copy and LF in the blob. A
+  line-slicing edit script must split on CRLF.
+
+---
+
 ## 2026-09-28 — Security audit #5: a delta with nothing new, and an open queue that was not what it said
 
 > Owner-chosen DELTA of `ee601b55..29afc82e` (plus FE #165-#167) and remediation of the open

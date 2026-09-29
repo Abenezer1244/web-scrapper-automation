@@ -352,8 +352,11 @@ def finalize_billing_and_done(
                 if stop.kind is FinalizeKind.ALREADY_TERMINAL:
                     _terminal_cleanup(db, job_id, _boot_user_id)
                 return stop
+            # Still ours and still not failed: _fail_job swallowed an error. Never
+            # report a failure that did not happen; the task's uncaught-failure hook
+            # fails the job attempt-scoped and releases its reservation.
             db.rollback()
-            return FinalizeOutcome(FinalizeKind.BILLING_FAILED)
+            raise RuntimeError(f"job {job_id}: billing failed and the job could not be failed")
     else:
         # The CAS also misses when this attempt no longer owns the job, so the row
         # decides (still under the billing lock): only an owner reaches the
@@ -496,3 +499,25 @@ def _terminal_cleanup(db, job_id: str, boot_user_id) -> None:
 
     release_quota_reservation(db, job_id)
     _release_claims_of_cancelled_job(db, job_id, boot_user_id)
+
+
+def release_run_claims_if_owned(db, job_id: str, boot_user_id, attempt_token) -> bool:
+    """Delete this run's dedup claims on a failure path, but only while THIS attempt
+    still owns the job. Claims are keyed by job, which a replacement attempt shares,
+    so a stale attempt's cleanup would otherwise strip the replacement's claims. The
+    ownership read locks the jobs row, so the answer holds until the caller commits.
+    Returns whether the claims were deleted. Does not commit.
+    """
+    if not attempt_state(db, job_id, boot_user_id, attempt_token).owned:
+        _logger.info(
+            "Job %s: claim release skipped; the attempt token changed", job_id,
+        )
+        return False
+    db.execute(
+        sa_text(
+            "DELETE FROM delivered_records "
+            "WHERE first_job_id = :jid AND user_id = CAST(:uid AS uuid)"
+        ),
+        {"jid": job_id, "uid": str(boot_user_id)},
+    )
+    return True

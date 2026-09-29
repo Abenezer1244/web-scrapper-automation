@@ -69,6 +69,7 @@ from src.workers.tasks_helpers.finalize import (  # noqa: F401  (re-export)
     _alert_dedup_release_failed,
     _release_claims_of_cancelled_job,
     finalize_billing_and_done,
+    release_run_claims_if_owned,
 )
 from src.workers.tasks_helpers.status import (
     _DELIVERY_TOKEN_TTL,  # noqa: F401  (re-export)
@@ -85,6 +86,7 @@ from src.workers.tasks_helpers.status import (
     _set_progress,
     _set_stage,
     _set_status,
+    attempt_state,
     claim_attempt,
     transient_retry_notice,
 )
@@ -645,8 +647,9 @@ def run_scrape_job(self, job_id: str) -> None:
         if should_block_run(_violation, user_id=str(job.user_id), plan=(user.plan or "starter"), context="worker_run"):
             # _violation is an entitlements.Violation; str() is its customer-facing
             # message. Both strings below reach the user (live log + job error).
-            _publish_log(r, job_id, "error", f"{_violation.title}. {_violation.message}", db=db)
-            _fail_job(db, job, r, job_id, f"{_violation.title}. {_violation.message}")
+            # _fail_job publishes the same line, and only once its CAS lands.
+            _fail_job(db, job, r, job_id, f"{_violation.title}. {_violation.message}",
+                      expected_started_at=attempt_token)
             return
 
         # Liveness heartbeat RE-ENABLED (2026-09-09) under the condition the
@@ -669,7 +672,7 @@ def run_scrape_job(self, job_id: str) -> None:
         _publish_log(r, job_id, "info", f"Job queued: {config.name} ({config.county}, {config.state})", db=db)
 
         # ── PROBING ───────────────────────────────────────────────────────────
-        if not _set_status(db, job, "probing"):
+        if not _set_status(db, job, "probing", expected_started_at=attempt_token):
             _logger.info("Job %s externally terminalized (%s) — aborting", job_id, job.status)
             return
         _publish_log(r, job_id, "info", "Probing county portal...", db=db)
@@ -678,7 +681,7 @@ def run_scrape_job(self, job_id: str) -> None:
             scraper_class, matched_record_type = get_scraper_class(config.county, config.state, config.record_type)
         except UnsupportedCountyError as exc:
             reason = str(exc)
-            if _fail_job(db, job, r, job_id, reason):
+            if _fail_job(db, job, r, job_id, reason, expected_started_at=attempt_token):
                 from src.workers.notification_emit import create_notification
                 create_notification(
                     user_id=job.user_id, type="job_failed", job_id=job_id,
@@ -691,7 +694,7 @@ def run_scrape_job(self, job_id: str) -> None:
             return
 
         # ── SCRAPING ──────────────────────────────────────────────────────────
-        if not _set_status(db, job, "scraping"):
+        if not _set_status(db, job, "scraping", expected_started_at=attempt_token):
             _logger.info("Job %s externally terminalized (%s) — aborting", job_id, job.status)
             return
         record_label = config.record_type.replace("_", " ").title()
@@ -892,7 +895,7 @@ def run_scrape_job(self, job_id: str) -> None:
             except Exception:
                 pass
             reason = f"Scraper timed out after {_SCRAPE_TIMEOUT // 60} minutes. Try a shorter date range."
-            if _fail_job(db, job, r, job_id, reason):
+            if _fail_job(db, job, r, job_id, reason, expected_started_at=attempt_token):
                 from src.workers.notification_emit import create_notification
                 create_notification(
                     user_id=job.user_id, type="job_failed", job_id=job_id,
@@ -1075,7 +1078,8 @@ def run_scrape_job(self, job_id: str) -> None:
         # CAS no-op here means a batch force-finalize cancelled this child while
         # it was scraping (>90min stuck): discard the scrape without saving,
         # billing, or delivering — the batch already recorded it as timed out.
-        if not _set_status(db, job, "enriching", record_count=len(records)):
+        if not _set_status(db, job, "enriching", record_count=len(records),
+                           expected_started_at=attempt_token):
             _logger.info(
                 "Job %s externally terminalized (%s) mid-scrape — discarding without billing",
                 job_id, job.status,
@@ -1414,13 +1418,7 @@ def run_scrape_job(self, job_id: str) -> None:
                 )
                 try:
                     db.rollback()
-                    db.execute(
-                        sa_text(
-                            "DELETE FROM delivered_records "
-                            "WHERE first_job_id = :jid AND user_id = CAST(:uid AS uuid)"
-                        ),
-                        {"jid": job_id, "uid": str(job.user_id)},
-                    )
+                    release_run_claims_if_owned(db, job_id, _boot_user_id, attempt_token)
                     db.commit()
                 except Exception as cleanup_exc:
                     db.rollback()
@@ -1434,7 +1432,7 @@ def run_scrape_job(self, job_id: str) -> None:
                     "run was stopped and you were not charged. Please try again; "
                     "contact support if it keeps failing."
                 )
-                if _fail_job(db, job, r, job_id, reason):
+                if _fail_job(db, job, r, job_id, reason, expected_started_at=attempt_token):
                     from src.workers.notification_emit import create_notification
                     create_notification(
                         user_id=job.user_id, type="job_failed", job_id=job_id,
@@ -1595,13 +1593,7 @@ def run_scrape_job(self, job_id: str) -> None:
                 # delivered_records for the worker role; granted to
                 # bridgeleads_system in provision_rls_roles.sql. Works today (prod
                 # role still BYPASSRLS); the grant covers the RLS cutover.
-                db.execute(
-                    sa_text(
-                        "DELETE FROM delivered_records "
-                        "WHERE first_job_id = :jid AND user_id = CAST(:uid AS uuid)"
-                    ),
-                    {"jid": job_id, "uid": str(job.user_id)},
-                )
+                release_run_claims_if_owned(db, job_id, _boot_user_id, attempt_token)
                 db.commit()
             except Exception as cleanup_exc:
                 db.rollback()
@@ -1619,7 +1611,7 @@ def run_scrape_job(self, job_id: str) -> None:
                 "No file was produced and you were not charged. Please run the "
                 "scraper again; contact support if it keeps failing."
             )
-            if _fail_job(db, job, r, job_id, reason):
+            if _fail_job(db, job, r, job_id, reason, expected_started_at=attempt_token):
                 from src.workers.notification_emit import create_notification
                 create_notification(
                     user_id=job.user_id, type="job_failed", job_id=job_id,
@@ -1921,6 +1913,11 @@ def run_scrape_job(self, job_id: str) -> None:
                         from src.workers.tasks_helpers.dedup import (
                             release_capped_dedup_claims,
                         )
+                        # Only while this attempt still owns the job: the claims are
+                        # keyed by job, which a replacement attempt shares. A lost
+                        # attempt stops here through the cap's own error path.
+                        if not attempt_state(db, job_id, _boot_user_id, attempt_token).owned:
+                            raise RuntimeError("attempt token changed during the plan cap")
                         release_capped_dedup_claims(
                             db, str(job.user_id), job_id, _capped_ids
                         )
@@ -1936,13 +1933,7 @@ def run_scrape_job(self, job_id: str) -> None:
                 )
                 try:
                     db.rollback()
-                    db.execute(
-                        sa_text(
-                            "DELETE FROM delivered_records "
-                            "WHERE first_job_id = :jid AND user_id = CAST(:uid AS uuid)"
-                        ),
-                        {"jid": job_id, "uid": str(job.user_id)},
-                    )
+                    release_run_claims_if_owned(db, job_id, _boot_user_id, attempt_token)
                     db.commit()
                 except Exception as cleanup_exc:
                     db.rollback()
@@ -1954,7 +1945,7 @@ def run_scrape_job(self, job_id: str) -> None:
                 reason = (
                     'The lead list could not be re-read after enrichment, so your plan quota could not be applied. No file was delivered and you were not charged. Please run the scraper again; contact support if it keeps failing.' if refreshed is None else 'Your plan quota could not be applied to this run. No file was delivered and you were not charged. Please run the scraper again; contact support if it keeps failing.'
                 )
-                if _fail_job(db, job, r, job_id, reason):
+                if _fail_job(db, job, r, job_id, reason, expected_started_at=attempt_token):
                     from src.workers.notification_emit import create_notification
                     create_notification(
                         user_id=job.user_id, type="job_failed", job_id=job_id,
@@ -2094,13 +2085,7 @@ def run_scrape_job(self, job_id: str) -> None:
             )
             try:
                 db.rollback()
-                db.execute(
-                    sa_text(
-                        "DELETE FROM delivered_records "
-                        "WHERE first_job_id = :jid AND user_id = CAST(:uid AS uuid)"
-                    ),
-                    {"jid": job_id, "uid": str(job.user_id)},
-                )
+                release_run_claims_if_owned(db, job_id, _boot_user_id, attempt_token)
                 db.commit()
             except Exception as cleanup_exc:
                 db.rollback()
@@ -2114,7 +2099,7 @@ def run_scrape_job(self, job_id: str) -> None:
                 "No file was delivered and you were not charged. Please run the "
                 "scraper again; contact support if it keeps failing."
             )
-            if _fail_job(db, job, r, job_id, reason):
+            if _fail_job(db, job, r, job_id, reason, expected_started_at=attempt_token):
                 from src.workers.notification_emit import create_notification
                 create_notification(
                     user_id=job.user_id, type="job_failed", job_id=job_id,

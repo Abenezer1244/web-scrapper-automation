@@ -458,6 +458,35 @@ def test_billing_failed_cancel_between_check_and_fail_cleans_up(run, redis_clien
     assert snap["notifications"] == 0
 
 
+def test_billing_failed_that_cannot_fail_the_job_raises(run, redis_client, monkeypatch):
+    """Codex diff r3 P2: _fail_job returning False while the job is still ours means it
+    swallowed an error; never report BILLING_FAILED for a failure that did not happen."""
+    _counter_does_not_move(monkeypatch)
+    monkeypatch.setattr(fin, "_fail_job", lambda *a, **k: False)
+
+    with pytest.raises(RuntimeError, match="could not be failed"):
+        _finalize(run, run["a"], redis_client)
+
+
+def _claims(run) -> int:
+    return _snapshot(run)["claims"]
+
+
+def test_run_claims_are_released_only_by_the_owner(run):
+    """Codex diff r3 P1-2: the failure paths' claim release is keyed by job, which a
+    replacement shares, so a stale attempt must not strip them."""
+    assert _claims(run) == 2
+    b = _requeue_and_claim(run, run["a"])
+    with SyncSessionLocal() as s:
+        assert fin.release_run_claims_if_owned(s, run["job_id"], run["user_id"], run["a"]) is False
+        s.commit()
+    assert _claims(run) == 2                       # the stale attempt stripped nothing
+    with SyncSessionLocal() as s:
+        assert fin.release_run_claims_if_owned(s, run["job_id"], run["user_id"], b) is True
+        s.commit()
+    assert _claims(run) == 0                       # the owner can
+
+
 # ── B6/B8 a forced timestamp collision: A's token matches B's started_at ──────
 
 @pytest.fixture
@@ -540,3 +569,37 @@ def test_retry_count_changes_only_on_the_two_re_pends():
     assert "retry_count=retry_count+1" in src
     from src.workers.scheduler_helpers import health
     assert "retry_count=job.retry_count + 1" in inspect.getsource(health)
+
+
+def _calls(body: str, name: str) -> list[str]:
+    """The full argument text of every `name(` call, parentheses balanced."""
+    out, start = [], 0
+    while (i := body.find(name + "(", start)) != -1:
+        depth, j = 0, i + len(name)
+        while True:
+            ch = body[j]
+            depth += ch == "("
+            depth -= ch == ")"
+            j += 1
+            if depth == 0:
+                break
+        out.append(body[i:j])
+        start = j
+    return out
+
+
+def test_every_status_and_fail_write_in_run_scrape_job_carries_the_token():
+    """Codex diff r3 P1-1/P1-2: no status transition, fail or claim DELETE in
+    run_scrape_job may be status-only or job-keyed; each is pinned to the attempt."""
+    from src.workers.tasks import run_scrape_job
+
+    body = _live(inspect.getsource(run_scrape_job.__wrapped__))
+    fails = _calls(body, "_fail_job")
+    statuses = [c for c in _calls(body, "_set_status") if c.startswith('_set_status(db, job, "')]
+    assert len(fails) >= 8 and len(statuses) >= 3
+    for call in fails + statuses:
+        assert "expected_started_at=attempt_token" in call, call
+    assert "DELETE FROM delivered_records" not in body
+    assert body.count("release_run_claims_if_owned(db, job_id, _boot_user_id, attempt_token)") == 4
+    cap = body[body.index("release_capped_dedup_claims(") - 400:body.index("release_capped_dedup_claims(")]
+    assert "attempt_state(db, job_id, _boot_user_id, attempt_token).owned" in cap

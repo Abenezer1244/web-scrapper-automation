@@ -433,6 +433,31 @@ def test_billing_failed_terminal_cleans_up_once(run, redis_client, monkeypatch):
     assert snap["notifications"] == 0
 
 
+def test_billing_failed_cancel_between_check_and_fail_cleans_up(run, redis_client, monkeypatch):
+    """Codex diff r2 P1-2: the job is cancelled after the branch's ownership check but
+    before _fail_job's CAS, so the fail does not land. The reservation and claims must
+    still come back, and the outcome says the job is terminal."""
+    _counter_does_not_move(monkeypatch)
+    real_fail = fin._fail_job
+
+    def cancel_then_fail(*args, **kwargs):
+        with SyncSessionLocal() as s:
+            s.execute(text("UPDATE jobs SET status = 'cancelled' WHERE id = :j"),
+                      {"j": run["job_id"]})
+            s.commit()
+        return real_fail(*args, **kwargs)
+
+    monkeypatch.setattr(fin, "_fail_job", cancel_then_fail)
+
+    outcome = _finalize(run, run["a"], redis_client)
+
+    assert outcome.kind is FinalizeKind.ALREADY_TERMINAL
+    snap = _snapshot(run)
+    assert (snap["job"][0], snap["job"][3]) == ("cancelled", None)
+    assert (snap["records_used"], snap["job"][7], snap["claims"]) == (0, 0, 0)
+    assert snap["notifications"] == 0
+
+
 # ── B6/B8 a forced timestamp collision: A's token matches B's started_at ──────
 
 @pytest.fixture

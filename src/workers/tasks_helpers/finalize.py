@@ -343,6 +343,16 @@ def finalize_billing_and_done(
                         "error_summary": reason[:200],
                     },
                 )
+                return FinalizeOutcome(FinalizeKind.BILLING_FAILED)
+            # The fail did not land: between the check above and _fail_job's CAS
+            # the job was cancelled, or re-claimed. _fail_job released nothing in
+            # that case, so the row decides once more who cleans up.
+            stop = _fenced_exit(db, job_id, _boot_user_id, attempt_token, "fail_job")
+            if stop is not None:
+                if stop.kind is FinalizeKind.ALREADY_TERMINAL:
+                    _terminal_cleanup(db, job_id, _boot_user_id)
+                return stop
+            db.rollback()
             return FinalizeOutcome(FinalizeKind.BILLING_FAILED)
     else:
         # The CAS also misses when this attempt no longer owns the job, so the row

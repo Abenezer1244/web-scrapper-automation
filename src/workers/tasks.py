@@ -622,7 +622,7 @@ def run_scrape_job(self, job_id: str) -> None:
         _eligibility = run_eligibility(user)
         if _eligibility.code in ("frozen", "ended"):
             _fail_job(db, job, r, job_id, _eligibility.message,
-                      expected_started_at=attempt_started_at)
+                      expected_started_at=attempt_token)
             return
 
         # Execution-time entitlement backstop (audit until ENTITLEMENT_ENFORCEMENT).

@@ -2709,22 +2709,22 @@ ACCEPTED; keyset `(created_at, id)` confirmed a total order, served by the exist
       `report_lookups_for_user` rule, `skip_trace_usage.py:140-152`).
 
 **Quote endpoint** — `POST /jobs/{job_id}/contact-lookups/quote` {category} in `routes/jobs.py`:
-- [ ] `rate_limit(zone="export", identifier=user.id)`; job by `(id, user_id)` else 404;
+- [x] `rate_limit(zone="export", identifier=user.id)`; job by `(id, user_id)` else 404;
       `status != 'done'` -> 409 `run_not_finished`; plan not in `SKIP_TRACE_ADDON_PLANS`
       (normalized) -> the structured 402; kill switch off or token empty -> 503
       `contact_lookups_unavailable`.
-- [ ] Status counts, then the window, as above.
-- [ ] ONE module-level SYNC Redis client (`redis_kwargs()`, `socket_timeout` and
+- [x] Status counts, then the window, as above.
+- [x] ONE module-level SYNC Redis client (`redis_kwargs()`, `socket_timeout` and
       `socket_connect_timeout` 0.5 s); every call through `run_in_threadpool` under
       `asyncio.wait_for(..., 1.0)`.
-- [ ] Pause: `read_pause_state()` unchanged; timeout / pool / client error -> UNKNOWN.
-- [ ] Store: key `bridgeleads:contact_lookup:quote:v1:<user_id>:<job_id>:<category>`, plain
+- [x] Pause: `read_pause_state()` unchanged; timeout / pool / client error -> UNKNOWN.
+- [x] Store: key `bridgeleads:contact_lookup:quote:v1:<user_id>:<job_id>:<category>`, plain
       `SET ... EX 600` (REPLACES the tab's previous quote), JSON `{v: 1, quote_id, user_id,
       job_id, category, quoted_ids, advanced_count, counts, window_end, stopped,
       planner_version, policy, unit_price_cents, currency, pricing_version,
       included_remaining_at_quote, created_at, expires_at}`. `quote_id =
       secrets.token_urlsafe(32)`. Failure or timeout -> 503, no quote returned.
-- [ ] 200 `ContactLookupQuote` (schemas.py): `quote_id`, `expires_at`, `category`,
+- [x] 200 `ContactLookupQuote` (schemas.py): `quote_id`, `expires_at`, `category`,
       `max_new_lookups`, `advanced_count`, `examined`, `truncated` + `truncated_reason`,
       `excluded` {no_address, placeholder, settled_code_violation, atip, not_traceable},
       `already_answered`, `in_progress`, `previously_attempted` (tab-wide), `remaining`
@@ -2755,25 +2755,25 @@ quotable is never quoted (mutation-tested). Worker/confirm only ever REMOVE ids 
 - [x] i pricing: rates per plan incl. a dirty `" Pro "`; the drift guard (equal to
       `/skip-trace-usage` for clean plans); `included_lookups_remaining` under / over quota,
       rolled window, NULL period start, starter.
-- [ ] ii gates: foreign job 404 (no key written); not done 409; starter 402 shape; kill switch
+- [x] ii gates: foreign job 404 (no key written); not done 409; starter 402 shape; kill switch
       503; empty token 503.
-- [ ] ii happy path: counts, advanced, `remaining`, the stored payload (shape, TTL <= 600,
+- [x] ii happy path: counts, advanced, `remaining`, the stored payload (shape, TTL <= 600,
       scoped key), no ids in the body; a second quote REPLACES the first (new `quote_id`).
-- [ ] ii pause through the real `publish()`: paused (account, global), `"never"`, not paused,
+- [x] ii pause through the real `publish()`: paused (account, global), `"never"`, not paused,
       UNKNOWN (no key, tombstone, a closed port, a blackholed port within the 1 s bound).
-- [ ] ii store failing (closed and blackholed port) -> 503, no quote in the body.
-- [ ] ii the tab queries run AS `bridgeleads_app` (provisioned in-transaction): no queue read.
-- [ ] Mutations, each caught: every `classify` branch dropped in turn; `.strip()` -> none;
+- [x] ii store failing (closed and blackholed port) -> 503, no quote in the body.
+- [x] ii the tab queries run AS `bridgeleads_app` (provisioned in-transaction): no queue read.
+- [x] Mutations, each caught: every `classify` branch dropped in turn; `.strip()` -> none;
       ATIP from the process flag; cap off by one; the `id` tie-break dropped; status filter
       dropped from the window query; the sync client swapped for the async one; `wait_for`
       removed (blackholed test hangs past the bound); the kill-switch check dropped; the key
       unscoped (another tab's quote overwritten).
-- [ ] Regression: both skip-trace batches, `test_contact_lookup_schema`,
+- [x] Regression: both skip-trace batches, `test_contact_lookup_schema`,
       `test_skip_trace_pause_state`, billing tests, `plan_entitlement_audit`, `test_beat_schedule`.
 
 **Amendments from consult r3 (2026-09-28: PLAN: REVISE, 1 P1 + 3 P2; r2 all closed).** Output
 `<scratchpad dea35045>/codex_1b1c_consult_r3_out.txt`. These amend the FINAL list above:
-- [ ] **R1 (P1) ADOPTED: entitlement gate.** After the plan gate, `run_eligibility(user, now)`
+- [x] **R1 (P1) ADOPTED: entitlement gate.** After the plan gate, `run_eligibility(user, now)`
       (`quota.py:187`, the one rule every billable start reads); code `frozen` or `ended` ->
       `run_refusal_http(code, message, resumes_at)` (the batches shape, `batches.py:283-286`).
       `over_limit` does NOT refuse: it is the RECORD allowance, and a lookup never counts as a
@@ -2786,18 +2786,18 @@ quotable is never quoted (mutation-tested). Worker/confirm only ever REMOVE ids 
   but never an addition, and a process flag stricter than the pinned one only relabels an
   ATIP row `not_traceable` (never quotes it). Changing `skip_trace.py` (the live paid path)
   for a label is not worth the risk; the existing N5 test pins "only ever excludes MORE".
-- [ ] **R3 (P2) ADOPTED: `remaining` is not a subtraction.** It is its own COUNT of
+- [x] **R3 (P2) ADOPTED: `remaining` is not a subtraction.** It is its own COUNT of
       not-attempted tab rows with `(created_at, id) > window_end` (0 when the window was not
       cut), so it can never go negative. `today` (tax cap) and `now` are captured ONCE per
       request and shared by every query. The status counts and the window are READ COMMITTED
       statements: an ADVISORY snapshot, which the response already says (upper bound).
-- [ ] **R4 (P2) ADOPTED without a new zone: Redis is checked BEFORE the scan.** Order: gates ->
+- [x] **R4 (P2) ADOPTED without a new zone: Redis is checked BEFORE the scan.** Order: gates ->
       `PING` on the sync client (threadpool, 1 s bound) -> 503 when it fails -> only then the
       DB scan. During a Redis outage the endpoint therefore does no DB work at all, whatever
       the `export` zone's per-process fallback admits. Test: a closed/blackholed Redis -> 503
       with zero `results` queries executed (a SQLAlchemy `before_cursor_execute` listener
       counts them). Mutation: the PING moved after the scan -> the count test fails.
-- [ ] **R5 (P2, consult r4) ADOPTED.** `rate_limit()`'s async client has no socket timeout
+- [x] **R5 (P2, consult r4) ADOPTED.** `rate_limit()`'s async client has no socket timeout
       (`rate_limit.py:54-58`), so a blackholed Redis hangs the request BEFORE the PING. The
       quote wraps it: `asyncio.wait_for(rate_limit(...), 1.0)`; a timeout -> the same 503,
       before any DB work. Test: blackholed Redis -> 503 within ~1-2 s, zero `results`
@@ -2842,6 +2842,40 @@ codex_1b1c_consult_r{4,5,6}_out.txt`. **OWNER APPROVED the plan (2026-09-28).** 
   still said nothing was built: a dated status note added); **r2 `VERDICT: GO`, no findings.**
   Security pass: no endpoint or write path; every query carries `user_id` + `job_id`; no
   contact/encrypted column is selected; no secret; no new dependency.
+- **MERGED + LIVE: PR #384, merge `9833a7b0` (2026-09-28 14:50Z).** Rebased once over #383
+  (journal conflict, both entries kept); Codex r3 GO on the rebased three-dot diff; CI green on
+  the exact head; quiet all zeros; api/worker/beat on `9833a7b0`, clean boot.
+
+### 1b-1c-ii BUILT (2026-09-28), before the Codex diff review
+Branch `feat/lookup-1b1c-ii-quote` off `9833a7b0`. `routes/jobs.py` (the endpoint),
+`schemas.py` (`ContactLookupQuoteRequest`, `ContactLookupQuote`, `ContactLookupExcluded`,
+`ContactLookupPause`, `ContactLookupUnavailableResponse`), `schema/openapi.json`, NEW
+`tests/test_contact_lookup_quote.py` (24 tests), this plan = 5.
+- **Where the build differs from the plan text, and why:**
+  - "Pause UNKNOWN on a closed port -> still 200" cannot happen as written: R4 PINGs the same
+    client before the scan, so a dead Redis is a 503 first. UNKNOWN is proven through the real
+    publisher (no key, a stale heartbeat, a tombstone); the reader's own Redis-failure paths
+    are `test_skip_trace_pause_state`'s.
+  - "Store failing (closed and blackholed port)" would also stop at the PING. The store path
+    is proven against a PRIVATE real `redis-server` run with `maxmemory 1` + `noeviction`: it
+    answers PING and reads and refuses every write (OOM). Local Redis is 5.0 (no ACLs), and a
+    server-wide `CLIENT PAUSE` would have stalled another session's suite.
+  - The request body is `{"extra": "forbid"}` (house style), so a stray filter param is a 422
+    rather than silently ignored (O4: filters never apply).
+- **OpenAPI:** `.venv-schema` is BROKEN (its base was the removed Anaconda Python). A fresh
+  CI-equivalent venv at `C:/Users/Windows/bl-schema-venv` (uv CPython 3.12.12 = CI's 3.12,
+  `pip install -r requirements.txt`: fastapi 0.141.1, pydantic 2.13.4) regenerated it: +326,
+  **0 deletions** vs `origin/main`, every addition the quote's; `--check` OK.
+- **Mutations: 14/14 caught** (`<scratchpad dea35045>/mutate_1b1c_ii.py`): the limiter
+  unbounded (the request hangs: caught by the 150 s runner timeout), the PING dropped (the
+  closed-port test then sees `results` queries), kill switch, frozen/ended not refused,
+  over_limit refusing, plan gate, the job owner filter, run-not-done, the key unscoped by
+  category, `nx=True` (no replace), a swallowed store failure, the async client handed to the
+  sync calls, truncation without anything left, the category dropped from the planner call.
+  **The last one SURVIVED the first run** (no test quoted the `already_delivered` tab with
+  leads in it): `test_each_tab_quotes_only_its_own_leads` added, now caught.
+- **Regression (5 chunks, every test file that calls `/jobs` + the lookup/billing set): 857
+  passed, 0 failed.** ruff clean.
 
 **Files:** i = planner, `lookup_pricing.py`, planner tests, `docs/BUILD_JOURNAL.md`, this plan;
 ii = `routes/jobs.py`, `schemas.py`, `schema/openapi.json`, quote tests, this plan.

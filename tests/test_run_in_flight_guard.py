@@ -103,13 +103,15 @@ async def test_a_finished_run_allows_a_new_one(
     assert resp.status_code == 201, resp.text
 
 
-async def test_a_run_cancelled_mid_scrape_blocks_during_the_cooldown(
+async def test_a_run_cancelled_mid_scrape_blocks_until_its_worker_stops(
     client: AsyncClient, business_token: str, business_user: User, db: AsyncSession
 ):
+    """Claimed (the claim stamps last_heartbeat_at) and not yet acknowledged."""
     config_id = await _config(db, business_user)
     now = datetime.now(UTC)
     job_id = await _job(db, business_user, config_id, "cancelled",
-                        started_at=now - timedelta(minutes=2), finished_at=now)
+                        started_at=now - timedelta(minutes=2),
+                        last_heartbeat_at=now - timedelta(minutes=2), finished_at=now)
     resp = await client.post("/jobs", json={"scraper_config_id": config_id, "trigger": "manual"},
                              headers=_auth(business_token))
     assert resp.status_code == 409
@@ -123,9 +125,12 @@ async def test_a_run_cancelled_long_ago_or_before_it_started_does_not_block(
     client: AsyncClient, business_token: str, business_user: User, db: AsyncSession
 ):
     now = datetime.now(UTC)
+    # Never acknowledged, but claimed longer ago than the hard time limit allows
+    # any worker to live (Job.RUN_SLOT_RELEASE_AFTER_S).
+    long_ago = now - timedelta(seconds=Job.RUN_SLOT_RELEASE_AFTER_S + 60)
     old = await _config(db, business_user)
     await _job(db, business_user, old, "cancelled",
-               started_at=now - timedelta(minutes=30), finished_at=now - timedelta(minutes=20))
+               started_at=long_ago, last_heartbeat_at=long_ago, finished_at=long_ago)
     never_started = await _config(db, business_user)
     await _job(db, business_user, never_started, "cancelled", finished_at=now)
     for config_id in (old, never_started):
@@ -259,9 +264,10 @@ def test_batch_skips_a_child_that_is_already_running_and_runs_its_siblings():
         }]
 
 
-def test_scheduler_waits_out_the_cancel_cooldown_too():
+def test_scheduler_waits_for_a_cancelled_run_to_stop_too():
     """The run-slot rule is shared: the scheduler must not start a scraper whose
-    last run was cancelled mid-scrape moments ago, and may once that is old."""
+    last run was cancelled mid-scrape and has not stopped, and may once the hard
+    time limit has passed."""
     from src.workers.scheduler_helpers.dispatch import _scheduled_dispatch_blocker_exists
 
     now = datetime.now(UTC)
@@ -269,12 +275,14 @@ def test_scheduler_waits_out_the_cancel_cooldown_too():
         user = _user(db)
         batch_id = _batch_with_pending_run(db, user.id, n_children=2)
         recent, old = _children(db, batch_id)
+        long_ago = now - timedelta(seconds=Job.RUN_SLOT_RELEASE_AFTER_S + 60)
         db.add(Job(id=str(uuid.uuid4()), user_id=user.id, scraper_config_id=recent.id,
                    status="cancelled", trigger="manual",
-                   started_at=now - timedelta(minutes=2), finished_at=now))
+                   started_at=now - timedelta(minutes=2),
+                   last_heartbeat_at=now - timedelta(minutes=2), finished_at=now))
         db.add(Job(id=str(uuid.uuid4()), user_id=user.id, scraper_config_id=old.id,
                    status="cancelled", trigger="manual",
-                   started_at=now - timedelta(minutes=30), finished_at=now - timedelta(minutes=20)))
+                   started_at=long_ago, last_heartbeat_at=long_ago, finished_at=long_ago))
         db.commit()
         assert _scheduled_dispatch_blocker_exists(db, recent.id, now) is True
         assert _scheduled_dispatch_blocker_exists(db, old.id, now) is False
@@ -288,7 +296,8 @@ def test_batch_reports_a_child_that_is_still_stopping():
         stopping, free = _children(db, batch_id)
         cancelled = Job(id=str(uuid.uuid4()), user_id=user.id, scraper_config_id=stopping.id,
                         status="cancelled", trigger="manual",
-                        started_at=now - timedelta(minutes=1), finished_at=now)
+                        started_at=now - timedelta(minutes=1),
+                        last_heartbeat_at=now - timedelta(minutes=1), finished_at=now)
         db.add(cancelled)
         db.commit()
         stopping_id, free_id, cancelled_id = stopping.id, free.id, cancelled.id

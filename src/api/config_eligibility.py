@@ -131,8 +131,9 @@ async def config_run_eligibility(
 ) -> dict[str, ConfigRunEligibility]:
     """Eligibility for each of ``configs`` (the caller's own), keyed by config id.
 
-    ``now`` is the one clock for the whole answer: run slots, the AI month and
-    the account window are all judged at it.
+    ``now`` is the one clock for the AI month and the account window. Run slots
+    are the exception: Job.holds_run_slot judges a cancelled attempt's age by the
+    database's clock, because its started_at is a database-clock stamp.
     """
     configs = list(configs)
     if not configs:
@@ -146,7 +147,7 @@ async def config_run_eligibility(
         .where(
             Job.user_id == user.id,
             Job.scraper_config_id.in_(config_ids),
-            Job.holds_run_slot(now),
+            Job.holds_run_slot(),
         )
         .order_by(Job.created_at.desc())
     )).all()

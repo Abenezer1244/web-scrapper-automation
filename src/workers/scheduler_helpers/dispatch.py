@@ -47,9 +47,10 @@ def _scheduled_dispatch_blocker_exists(db, config_id: str, now: datetime) -> boo
         .where(
             Job.scraper_config_id == config_id,
             or_(
-                # Active, or cancelled mid-run moments ago: the same run-slot rule
-                # POST /jobs and the batch fan-out apply (UX audit F-003).
-                Job.holds_run_slot(now),
+                # Active, or cancelled mid-run and its worker not yet stopped: the
+                # same run-slot rule POST /jobs and the batch fan-out apply (UX
+                # audit F-003).
+                Job.holds_run_slot(),
                 and_(Job.trigger == "scheduled", Job.created_at >= cutoff),
             ),
         )

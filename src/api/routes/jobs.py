@@ -190,14 +190,12 @@ def _run_in_flight_http(job_id: str | None, *, stopping: bool) -> HTTPException:
 async def _run_in_flight(db: AsyncSession, user_id, config_id) -> tuple[str, bool] | None:
     """The job holding this config's run slot, as (job_id, still_stopping), or None.
     Owner-scoped, so the id returned is always the caller's own job."""
-    from datetime import UTC, datetime
-
     row = (await db.execute(
         select(Job.id, Job.status)
         .where(
             Job.scraper_config_id == config_id,
             Job.user_id == user_id,
-            Job.holds_run_slot(datetime.now(UTC)),
+            Job.holds_run_slot(),
         )
         .order_by(Job.created_at.desc())
         .limit(1)
@@ -224,7 +222,7 @@ async def enqueue_scrape_job(
     Every refusal comes from ``config_run_eligibility``, the same evaluator
     GET /scrapers reports, so Run now cannot disagree with this gate. In order:
       * 409 run_in_flight: a config with an active job, or one cancelled mid-run
-        moments ago (see Job.holds_run_slot);
+        whose worker has not stopped yet (see Job.holds_run_slot);
       * 402 entitlement (structured), when the plan does not include this
         record type or county — audit-logged only while ENTITLEMENT_ENFORCEMENT
         is off. An existing config can outlive a downgrade, so this re-validates

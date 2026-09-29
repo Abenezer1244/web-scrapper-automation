@@ -134,12 +134,16 @@ async def test_the_newest_slot_holder_wins_and_a_cancelled_one_is_still_stopping
     user = await _user(db)
     config = await _config(db, user, county)
     now = _now()
+    # Both workers claimed their run (the claim stamps last_heartbeat_at) and
+    # neither has acknowledged its exit yet, so both still hold the slot.
     await _job(
         db, user, config, status="cancelled", started_at=now - timedelta(minutes=3),
+        last_heartbeat_at=now - timedelta(minutes=3),
         finished_at=now - timedelta(minutes=2), created_at=now - timedelta(minutes=4),
     )
     newest = await _job(
         db, user, config, status="cancelled", started_at=now - timedelta(minutes=1),
+        last_heartbeat_at=now - timedelta(minutes=1),
         finished_at=now - timedelta(seconds=30), created_at=now - timedelta(minutes=1),
     )
     e = (await _eligibility(db, user, [config], now))[config.id]

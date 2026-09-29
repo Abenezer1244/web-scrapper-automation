@@ -99,6 +99,16 @@ STUCK_CHECK_STATUSES: frozenset[str] = frozenset({
 # (30s GIS chunk, 240s assessor cap) so a slow-but-alive step cannot trip it.
 HEARTBEAT_STALE_MINUTES: int = 15
 
+# run_scrape_job's Celery time limits. The hard one is also a PROOF, not just a
+# timeout: the prefork pool kills the child that long after the task started, and
+# the claim stamps started_at after the task starts, so no process can still be
+# running an attempt more than RUN_SCRAPE_TIME_LIMIT_S after its started_at.
+# Job.holds_run_slot leans on that to release a cancelled run whose worker died
+# without acknowledging (audit #4 S4-02). The task decorator reads these, so the
+# two cannot drift apart.
+RUN_SCRAPE_SOFT_TIME_LIMIT_S: int = 3600  # 60 min: scrape + enrichment in one job
+RUN_SCRAPE_TIME_LIMIT_S: int = 3900       # 65 min
+
 # Fallback for rows with NO heartbeat observation at all (claimed before the
 # heartbeat shipped / by an older worker image). Deliberately ABOVE the 65-min
 # Celery hard time limit so a genuinely long, genuinely live job is never

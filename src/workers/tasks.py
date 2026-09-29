@@ -278,6 +278,107 @@ def account_charge_block(db, user_id, *, lock: str) -> str | None:
     return access if access in (ACCESS_FROZEN, ACCESS_ENDED) else None
 
 
+def reserve_job_quota(db, *, job_id: str, user_id, want: int) -> int | None:
+    """RESERVE this job's share of the account's record quota, do not merely read it.
+
+    Returns the records granted, or None when this job already holds a
+    reservation (a watchdog re-run: the caller reuses ``jobs.reserved_count``).
+    Does NOT commit: the caller owns the transaction.
+
+    Reading remaining quota and only charging it later, after the export, left
+    the allowance unguarded in between: two concurrent jobs (or two children of
+    one batch) both read the same remaining N and both delivered N. The atomic
+    increment at billing made the totals SUM correctly, which faithfully records
+    the over-delivery rather than preventing it. A lock cannot span the gap
+    either, because the caller commits before the export runs.
+
+    LOCK ORDER: jobs, then users — the same order billing and
+    release_quota_reservation use. Locking users first (the obvious way to write
+    this) inverts against them and lets a watchdog re-run deadlock with an
+    attempt already in billing: one holds users and wants jobs, the other holds
+    jobs and wants users. (Codex)
+    """
+    reserved_at = db.execute(sa_text("SELECT clock_timestamp()")).scalar()
+
+    # 1. CAS-claim on the JOB. Only the attempt that flips reserved_at from NULL
+    #    reserves, so a watchdog re-run of this same job reuses its grant instead
+    #    of taking a second one.
+    claimed = db.execute(
+        sa_text(
+            "UPDATE jobs SET reserved_at = CAST(:at AS timestamptz) "
+            "WHERE id = :jid AND reserved_at IS NULL"
+        ),
+        {"jid": job_id, "at": reserved_at},
+    ).rowcount
+    if not claimed:
+        return None
+
+    # 1b. The account may still be charged (S4-01, Codex 4a review). The
+    #    pre-scrape check is a read, and a freeze or a term end can commit while
+    #    the scrape runs. Decided HERE under the users row lock the grant below
+    #    takes anyway (jobs, then users: the order above), so nothing can land
+    #    between this decision and the grant. A frozen or ended account is
+    #    granted nothing: every row is capped, so nothing is delivered, billed or
+    #    traced.
+    if account_charge_block(db, user_id, lock="FOR UPDATE"):
+        _logger.warning(
+            "Job %s: account %s froze or ended during the run; granting 0 records",
+            job_id, user_id,
+        )
+        want = 0
+    # 2. Compute the grant and consume it in ONE statement. FOR UPDATE serialises
+    #    concurrent reservations for this user: the loser blocks, then re-reads
+    #    the already-decremented remainder (READ COMMITTED re-evaluates a locked
+    #    row against the newer version) and is granted only what is truly left.
+    #    LAZY ROLLOVER lives in this same statement. The entitlement window is
+    #    advanced, the counter zeroed and any pending downgrade applied atomically
+    #    with the grant, so a boundary crossed between two concurrent reservations
+    #    cannot be seen half-applied — and the grant is computed against the
+    #    POST-rollover limit, so a boundary cannot leak one job's worth of the
+    #    outgoing cap into the new window. (window_cte_sql / WINDOW_SET_SQL in
+    #    src/api/quota_window.py — the ONE definition.)
+    res_row = db.execute(
+        sa_text(
+            "WITH cur AS ("
+            "  SELECT u.id, u.records_used, u.records_limit,"
+            "         u.quota_anchor_at, u.quota_period_start,"
+            "         u.quota_period_end, u.subscription_status,"
+            "         u.entitlement_grace_ends_at, u.entitlement_ends_at,"
+            "         u.pending_plan, u.pending_records_limit"
+            "  FROM users u WHERE u.id = CAST(:uid AS uuid) FOR UPDATE"
+            "), w AS ("
+            "  SELECT cur.*, " + window_cte_sql() + " FROM cur"
+            "), g AS ("
+            "  SELECT w.*,"
+            "         LEAST(:want, GREATEST(0, eff_limit - base))"
+            "           AS granted"
+            "  FROM w"
+            ") UPDATE users u SET"
+            "    records_used = g.base + g.granted,"
+            + window_set_sql("g")
+            + "  FROM g WHERE u.id = g.id"
+            "  RETURNING g.granted, g.new_start"
+        ),
+        {"want": want, "uid": str(user_id), "at": reserved_at},
+    ).one()
+    granted = int(res_row.granted or 0)
+    # 3. Record what was granted AND which entitlement window it was charged to,
+    #    so settlement and release can tell "still current" from "the window this
+    #    was charged to has since rolled and been zeroed". Comparing calendar
+    #    months (the previous test) is only accidentally right while every window
+    #    starts on the 1st. Same job row, already locked by step 1 — no new lock
+    #    is taken.
+    db.execute(
+        sa_text(
+            "UPDATE jobs SET reserved_count = :n, "
+            "quota_period_start = CAST(:ws AS timestamptz) "
+            "WHERE id = :jid"
+        ),
+        {"n": granted, "jid": job_id, "ws": res_row.new_start},
+    )
+    return granted
+
+
 def skip_reason_for_config(active: bool, paused_reason: str | None) -> str | None:
     """Why a job for this scraper must not run, in the user's words, or None.
 
@@ -1803,22 +1904,8 @@ def run_scrape_job(self, job_id: str) -> None:
                 _cap_error = RuntimeError("post-enrichment refetch failed")
             else:
                 try:
-                    # ── RESERVE the quota, do not merely read it ───────────
-                    # Reading remaining quota here and only charging it later,
-                    # after the export, left the allowance unguarded in between:
-                    # two concurrent jobs (or two children of one batch) both
-                    # read the same remaining N and both delivered N. The atomic
-                    # increment at billing made the totals SUM correctly, which
-                    # faithfully records the over-delivery rather than
-                    # preventing it. A lock cannot span the gap either, because
-                    # this block commits before the export runs.
-                    #
-                    # LOCK ORDER: jobs, then users — the same order billing and
-                    # release_quota_reservation use. Locking users first (the
-                    # obvious way to write this) inverts against them and lets a
-                    # watchdog re-run deadlock with an attempt already in
-                    # billing: one holds users and wants jobs, the other holds
-                    # jobs and wants users. (Codex)
+                    # RESERVE the quota before capping (reserve_job_quota: lock order,
+                    # window rollover and the watchdog re-run CAS are documented there).
                     _want = db.execute(
                         sa_text(
                             "SELECT count(*) FROM results "
@@ -1828,95 +1915,10 @@ def run_scrape_job(self, job_id: str) -> None:
                         {"jid": job_id, "uid": str(job.user_id)},
                     ).scalar() or 0
 
-                    _reserved_at = db.execute(
-                        sa_text("SELECT clock_timestamp()")
-                    ).scalar()
-
-                    # 1. CAS-claim on the JOB. Only the attempt that flips
-                    #    reserved_at from NULL reserves, so a watchdog re-run of
-                    #    this same job reuses its grant instead of taking a
-                    #    second one.
-                    _claimed = db.execute(
-                        sa_text(
-                            "UPDATE jobs SET reserved_at = CAST(:at AS timestamptz) "
-                            "WHERE id = :jid AND reserved_at IS NULL"
-                        ),
-                        {"jid": job_id, "at": _reserved_at},
-                    ).rowcount
-
-                    if _claimed:
-                        # 1b. The account may still be charged (S4-01, Codex 4a
-                        #    review). The pre-scrape check is a read, and a freeze
-                        #    or a term end can commit while the scrape runs. Decided
-                        #    HERE under the users row lock the grant below takes
-                        #    anyway (jobs, then users: the order above), so nothing
-                        #    can land between this decision and the grant. A
-                        #    frozen or ended account is granted nothing: every row
-                        #    is capped, so nothing is delivered, billed or traced.
-                        if account_charge_block(db, job.user_id, lock="FOR UPDATE"):
-                            _logger.warning(
-                                "Job %s: account %s froze or ended during the run; "
-                                "granting 0 records", job_id, job.user_id,
-                            )
-                            _want = 0
-                        # 2. Compute the grant and consume it in ONE statement.
-                        #    FOR UPDATE serialises concurrent reservations for
-                        #    this user: the loser blocks, then re-reads the
-                        #    already-decremented remainder (READ COMMITTED
-                        #    re-evaluates a locked row against the newer
-                        #    version) and is granted only what is truly left.
-                        #    LAZY ROLLOVER lives in this same statement. The
-                        #    entitlement window is advanced, the counter zeroed
-                        #    and any pending downgrade applied atomically with
-                        #    the grant, so a boundary crossed between two
-                        #    concurrent reservations cannot be seen half-applied
-                        #    — and the grant is computed against the POST-
-                        #    rollover limit, so a boundary cannot leak one job's
-                        #    worth of the outgoing cap into the new window.
-                        #    (window_cte_sql / WINDOW_SET_SQL in
-                        #    src/api/quota_window.py — the ONE definition.)
-                        _res_row = db.execute(
-                            sa_text(
-                                "WITH cur AS ("
-                                "  SELECT u.id, u.records_used, u.records_limit,"
-                                "         u.quota_anchor_at, u.quota_period_start,"
-                                "         u.quota_period_end, u.subscription_status,"
-                                "         u.entitlement_grace_ends_at, u.entitlement_ends_at,"
-                                "         u.pending_plan, u.pending_records_limit"
-                                "  FROM users u WHERE u.id = CAST(:uid AS uuid) FOR UPDATE"
-                                "), w AS ("
-                                "  SELECT cur.*, " + window_cte_sql() + " FROM cur"
-                                "), g AS ("
-                                "  SELECT w.*,"
-                                "         LEAST(:want, GREATEST(0, eff_limit - base))"
-                                "           AS granted"
-                                "  FROM w"
-                                ") UPDATE users u SET"
-                                "    records_used = g.base + g.granted,"
-                                + window_set_sql("g")
-                                + "  FROM g WHERE u.id = g.id"
-                                "  RETURNING g.granted, g.new_start"
-                            ),
-                            {"want": _want, "uid": str(user.id), "at": _reserved_at},
-                        ).one()
-                        _remaining = int(_res_row.granted or 0)
-                        # 3. Record what was granted AND which entitlement
-                        #    window it was charged to, so settlement and release
-                        #    can tell "still current" from "the window this was
-                        #    charged to has since rolled and been zeroed".
-                        #    Comparing calendar months (the previous test) is
-                        #    only accidentally right while every window starts
-                        #    on the 1st. Same job row, already locked by step 1
-                        #    — no new lock is taken.
-                        db.execute(
-                            sa_text(
-                                "UPDATE jobs SET reserved_count = :n, "
-                                "quota_period_start = CAST(:ws AS timestamptz) "
-                                "WHERE id = :jid"
-                            ),
-                            {"n": _remaining, "jid": job_id, "ws": _res_row.new_start},
-                        )
-                    else:
+                    _remaining = reserve_job_quota(
+                        db, job_id=job_id, user_id=job.user_id, want=_want,
+                    )
+                    if _remaining is None:
                         # Already reserved (watchdog re-run): reuse the grant.
                         db.refresh(job)
                         _remaining = int(job.reserved_count or 0)

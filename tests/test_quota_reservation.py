@@ -94,36 +94,13 @@ def _mk_job(db, user_id: str, config_id: str) -> Job:
     return job
 
 
-# The reserve and settle statements are assembled from the SAME shared builders
-# production uses (src/api/quota_window.py), not hand-copied. A test that carries
-# its own transcription of the rule proves only that the transcription is
-# self-consistent — which is exactly how seven copies of the old period rule came
-# to disagree, two of them wrongly, without a single failing test.
-
-_RESERVE_SQL = (
-    "WITH cur AS ("
-    "  SELECT u.id, u.records_used, u.records_limit, u.quota_anchor_at,"
-    "         u.quota_period_start, u.quota_period_end, u.subscription_status,"
-    "         u.entitlement_grace_ends_at, u.entitlement_ends_at,"
-    "         u.pending_plan, u.pending_records_limit"
-    "  FROM users u WHERE u.id = CAST(:uid AS uuid) FOR UPDATE"
-    "), w AS ("
-    "  SELECT cur.*, " + window_cte_sql("", ":at") + " FROM cur"
-    "), g AS ("
-    "  SELECT w.*, LEAST(:want, GREATEST(0, eff_limit - base)) AS granted FROM w"
-    "), claim AS ("
-    "  UPDATE jobs SET reserved_count = (SELECT granted FROM g),"
-    "                  reserved_at = CAST(:at AS timestamptz),"
-    "                  quota_period_start = (SELECT new_start FROM g)"
-    "  WHERE id = :jid AND reserved_at IS NULL"
-    "  RETURNING reserved_count"
-    "), charge AS ("
-    "  UPDATE users u SET"
-    "    records_used = g.base + COALESCE((SELECT reserved_count FROM claim), 0),"
-    + window_set_sql("g")
-    + "  FROM g WHERE u.id = g.id"
-    ") SELECT COALESCE((SELECT reserved_count FROM claim), -1)"
-)
+# The reservation is the production function itself (reserve_job_quota), not a
+# copy: a test that carries its own transcription of the rule proves only that
+# the transcription is self-consistent — which is exactly how seven copies of the
+# old period rule came to disagree, two of them wrongly, without a single failing
+# test (and how audit S4-06's early clock read went untestable). The settle
+# statement below is still assembled from the SAME shared builders production
+# uses (src/api/quota_window.py).
 
 _SETTLE_SQL = (
     "WITH cur AS ("
@@ -155,16 +132,40 @@ _SETTLE_SQL = (
 )
 
 
-def _reserve(db, job_id: str, user_id: str, want: int, at: datetime | None = None) -> int:
-    """The atomic reserve-and-charge the plan cap performs (workers/tasks.py).
+def _reserve(db, job_id: str, user_id: str, want: int) -> int | None:
+    """The reservation the plan cap performs (workers/tasks.py reserve_job_quota).
 
-    Returns the granted amount, or -1 when this job had already reserved.
+    Returns the granted amount, or None when this job had already reserved.
     """
-    at = at or db.execute(text("SELECT clock_timestamp()")).scalar()
-    return db.execute(
-        text(_RESERVE_SQL),
-        {"want": want, "uid": user_id, "jid": job_id, "at": at},
-    ).scalar()
+    from src.workers.tasks import reserve_job_quota
+
+    return reserve_job_quota(db, job_id=job_id, user_id=user_id, want=want)
+
+
+def _move_window_back(db, *, user_id: str, job_id: str, boundary: datetime) -> None:
+    """Put a reservation taken NOW into a window that ended at `boundary`.
+
+    The same end state as reserving a minute before the boundary: the user's
+    window becomes [boundary - 30 days, boundary) and the job records that window
+    as the one it was charged to. Moving the data, not the clock, keeps a
+    test-only time parameter out of the production reservation.
+    """
+    start = boundary - timedelta(days=30)
+    db.execute(
+        text(
+            "UPDATE users SET quota_anchor_at = :s, quota_period_start = :s, "
+            "quota_period_end = :e, records_period_start = :s, "
+            "skip_trace_period_start = :s WHERE id = CAST(:u AS uuid)"
+        ),
+        {"s": start, "e": boundary, "u": user_id},
+    )
+    db.execute(
+        text(
+            "UPDATE jobs SET quota_period_start = :s, reserved_at = :at "
+            "WHERE id = :j"
+        ),
+        {"s": start, "at": boundary - timedelta(minutes=1), "j": job_id},
+    )
 
 
 def _settle_job(db, job_id: str, billable: int, at: datetime | None = None) -> int:
@@ -283,7 +284,7 @@ def test_a_rerun_reuses_its_grant_instead_of_reserving_twice():
         assert _reserve(db, job_id, user_id, want=30) == 30
         db.commit()
     with SyncSessionLocal() as db:
-        assert _reserve(db, job_id, user_id, want=30) == -1, "already reserved"
+        assert _reserve(db, job_id, user_id, want=30) is None, "already reserved"
         db.commit()
 
     with SyncSessionLocal() as db:
@@ -692,19 +693,16 @@ def test_a_boundary_between_reserve_and_settle_charges_the_LIVE_window_in_full()
     """
     boundary = datetime.now(UTC) - timedelta(minutes=5)
     with SyncSessionLocal() as db:
-        # A window that ended five minutes ago; the reservation was taken inside it.
-        user = _mk_user(
-            db, used=0, limit=1000,
-            period=boundary - timedelta(days=30), window_end=boundary,
-        )
+        user = _mk_user(db, used=0, limit=1000)
         config = _mk_config(db, user.id)
         job = _mk_job(db, user.id, config.id)
         user_id, job_id = user.id, job.id
         db.commit()
 
     with SyncSessionLocal() as db:
-        granted = _reserve(db, job_id, user_id, want=200,
-                           at=boundary - timedelta(minutes=1))
+        granted = _reserve(db, job_id, user_id, want=200)
+        # A window that ended five minutes ago; the reservation was taken inside it.
+        _move_window_back(db, user_id=user_id, job_id=job_id, boundary=boundary)
         db.commit()
     assert granted == 200
 
@@ -770,17 +768,16 @@ def test_releasing_a_reservation_from_a_rolled_window_refunds_nothing():
 
     boundary = datetime.now(UTC) - timedelta(minutes=5)
     with SyncSessionLocal() as db:
-        user = _mk_user(
-            db, used=0, limit=1000,
-            period=boundary - timedelta(days=30), window_end=boundary,
-        )
+        user = _mk_user(db, used=0, limit=1000)
         config = _mk_config(db, user.id)
         job = _mk_job(db, user.id, config.id)
         user_id, job_id = user.id, job.id
         db.commit()
 
     with SyncSessionLocal() as db:
-        _reserve(db, job_id, user_id, want=200, at=boundary - timedelta(minutes=1))
+        _reserve(db, job_id, user_id, want=200)
+        # The reservation belongs to a window that ended five minutes ago.
+        _move_window_back(db, user_id=user_id, job_id=job_id, boundary=boundary)
         db.commit()
 
     # The window rolls (a beat pass, or another job), then this job fails.

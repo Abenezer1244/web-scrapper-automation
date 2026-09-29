@@ -385,16 +385,21 @@ class Settings(BaseSettings):
     # SKIP_TRACE_DAILY_CREDIT_CAP is unset, and then read AS CREDITS with a
     # warning, so 1000 means 500 advanced lookups a day.
     SKIP_TRACE_DAILY_ROW_CAP: int | None = None
+    # Contact lookups a free-trial account may queue over its WHOLE lifetime, in
+    # credits (audit #3 S3-03, owner decision 2026-09-27: a small allowance). A
+    # trial has no subscription to bill, so every lookup it buys is paid by us.
+    # Unlike the caps above, 0 is not "off": it means a trial gets no lookups.
+    SKIP_TRACE_TRIAL_CREDIT_ALLOWANCE: int = 25
 
     @field_validator(
         "SKIP_TRACE_DAILY_CREDIT_CAP", "SKIP_TRACE_ACCOUNT_DAILY_CREDIT_CAP",
-        "SKIP_TRACE_DAILY_ROW_CAP",
+        "SKIP_TRACE_DAILY_ROW_CAP", "SKIP_TRACE_TRIAL_CREDIT_ALLOWANCE",
     )
     @classmethod
     def spend_caps_are_not_negative(cls, v: int | None) -> int | None:
         """A negative cap would be read by nothing sensible; refuse it at boot."""
         if v is not None and v < 0:
-            raise ValueError("skip-trace spend caps must be 0 (disabled) or positive")
+            raise ValueError("skip-trace spend caps and allowances must not be negative")
         return v
 
     @model_validator(mode="after")

@@ -78,6 +78,123 @@ _ACTIVE_SQL = ", ".join(f"'{s}'" for s in ACTIVE_PENDING_STATUSES)
 # decision atomic rather than advisory.
 CLAIMABLE_RESULT_STATUS = "not_attempted"
 
+# ── WHO MAY BUY A LOOKUP (audit #3 S3-03, audit #4 S4-01) ─────────────────────
+#
+# Every lookup is a Tracerfy charge to us. It is recovered only from a live paid
+# subscription, so the account decides, not just the plan name: a free trial is
+# `plan='pro'` with no subscription, and the old gate ("not Starter") let it buy
+# as many lookups as a paying Pro account (owner decision 2026-09-27: trials get
+# a small lifetime allowance). The rule is decided HERE because this module is
+# the only writer of the queue; the dispatcher re-applies the blocking half to
+# rows queued before an account froze or ended.
+ACCESS_FULL = "full"
+ACCESS_TRIAL = "trial"
+# Blocked: nothing is queued, nothing already queued is sent.
+ACCESS_STARTER = "starter"
+ACCESS_FROZEN = "frozen"
+ACCESS_ENDED = "ended"
+BLOCKED_ACCESS = frozenset({ACCESS_STARTER, ACCESS_FROZEN, ACCESS_ENDED})
+
+# The users columns the rule reads. One list, so the claim and the dispatcher
+# cannot read different facts.
+ACCESS_COLUMNS = (
+    "id", "plan", "is_admin", "subscription_status", "trial_ends_at",
+    "entitlement_ends_at", "entitlement_grace_ends_at",
+)
+
+
+def paid_lookup_access(user, now=None) -> str:
+    """Which lookups this account may buy. First match wins:
+
+    | account                                                  | access  |
+    |----------------------------------------------------------|---------|
+    | Starter plan                                             | starter |
+    | frozen for non-payment (`is_frozen`)                     | frozen  |
+    | paid term already ended (`entitlement_ends_at <= now`)   | ended   |
+    | admin                                                    | full    |
+    | paid term ends LATER (`entitlement_ends_at > now`)       | full    |
+    | subscription `active`                                    | full    |
+    | `past_due` inside its grace (frozen once it expires)     | full    |
+    | no subscription status AND no trial date                 | full    |
+    | anything else (app trial, Stripe `trialing`, `canceled`, |         |
+    | `incomplete`, `past_due` with no grace, unknown)         | trial   |
+
+    "No status and no trial date" is an operator-granted plan: registration
+    always stamps `trial_ends_at`, and only a Stripe active/trialing
+    subscription clears it, which also records the status. Every state that
+    cannot show a live payment falls to the trial allowance, never to full.
+    """
+    from datetime import UTC, datetime
+
+    from src.api.quota_window import as_utc, is_frozen
+    from src.config.constants import normalize_plan
+
+    now = as_utc(now or datetime.now(UTC))
+    if normalize_plan(getattr(user, "plan", None)) == "starter":
+        return ACCESS_STARTER
+    if is_frozen(user, now):
+        return ACCESS_FROZEN
+    ends_at = getattr(user, "entitlement_ends_at", None)
+    if ends_at is not None and now >= as_utc(ends_at):
+        return ACCESS_ENDED
+    if getattr(user, "is_admin", False):
+        return ACCESS_FULL
+    if ends_at is not None:
+        # Paid access scheduled to stop LATER (a cancellation at period end):
+        # billing sets this only for a customer who paid for the term, whatever
+        # the status reads meanwhile ('canceled' included). Codex 4a review.
+        return ACCESS_FULL
+    status = (getattr(user, "subscription_status", None) or "").strip()
+    if status == "active":
+        return ACCESS_FULL
+    if status == "past_due" and getattr(user, "entitlement_grace_ends_at", None) is not None:
+        return ACCESS_FULL
+    if not status and getattr(user, "trial_ends_at", None) is None:
+        return ACCESS_FULL
+    return ACCESS_TRIAL
+
+
+def read_access_rows(db, user_ids, *, lock: str) -> dict:
+    """{user_id: row} of the ACCESS_COLUMNS, row-locked. `lock` is the row-lock
+    clause: the claim takes FOR NO KEY UPDATE (it serializes two claimers of one
+    trial and waits for a billing write in flight, while still letting other
+    transactions insert rows that reference the user); the quota reservation
+    takes FOR UPDATE (the lock its grant statement takes anyway); the dispatcher
+    takes FOR SHARE SKIP LOCKED (it never waits: an account whose row is being
+    written right now is missing from the result, which callers read as
+    blocked, and its rows go out on a later tick). An empty `lock` is a plain
+    read, for a filter that a locked read re-checks later."""
+    if lock not in ("", "FOR NO KEY UPDATE", "FOR UPDATE", "FOR SHARE SKIP LOCKED"):
+        raise ValueError(f"unsupported lock clause {lock!r}")
+    ids = sorted({str(u) for u in user_ids})
+    if not ids:
+        return {}
+    rows = db.execute(
+        text(
+            f"SELECT {', '.join(ACCESS_COLUMNS)} FROM public.users "  # noqa: S608 - fixed literals
+            f"WHERE id = ANY(CAST(:ids AS uuid[])) ORDER BY id {lock}"
+        ),
+        {"ids": ids},
+    ).all()
+    return {str(r.id): r for r in rows}
+
+
+def lifetime_credits_queued(db, user_id: str) -> int:
+    """Credits of every queue row this account has EVER had, whatever became of
+    it: cancelled, errored and released rows count too. Rows are removed only by
+    the claim withdrawing its own uncommitted insert and by operator cleanup
+    scripts, so no customer action can hand an allowance back."""
+    from src.workers.skip_trace_capacity import credits_for
+
+    counts = db.execute(
+        text(
+            "SELECT trace_type, count(*) FROM public.pending_skip_trace_rows "
+            "WHERE user_id = CAST(:uid AS uuid) GROUP BY trace_type"
+        ),
+        {"uid": str(user_id)},
+    ).all()
+    return sum(credits_for(t) * int(n) for t, n in counts)
+
 # The columns build_pending_row_payload produces, in insert order. Listed
 # explicitly rather than derived from the payload dict so a stray key can never
 # widen the INSERT.
@@ -347,7 +464,7 @@ def job_claim_lock_held(db, job_id: str) -> bool:
     ).scalar())
 
 
-def claim_skip_trace_rows(db, payloads: list[dict]) -> list[str]:
+def claim_skip_trace_rows(db, payloads: list[dict], *, report: dict | None = None) -> list[str]:
     """Claim `payloads` into the queue. Returns the result ids actually won.
 
     `payloads` are ``build_pending_row_payload`` dicts. A payload whose lead no
@@ -364,6 +481,12 @@ def claim_skip_trace_rows(db, payloads: list[dict]) -> list[str]:
     run and leads are still delivered; only the paid add-on waits. Against that,
     proceeding unenforced risks charging a customer twice for one lead, which is
     not recoverable by trying again later.
+
+    CLAIMS ONLY WHAT THE ACCOUNT MAY BUY (`paid_lookup_access`): nothing for a
+    Starter, frozen or ended account, and for a trial only what fits in the rest
+    of its lifetime allowance. A held lead stays 'not_attempted', so a run after
+    the customer subscribes looks it up. `report`, when given, receives
+    ``access`` and ``held`` (leads held by this rule, not by the insert).
 
     Does NOT commit. The caller owns the transaction.
     """
@@ -428,6 +551,44 @@ def claim_skip_trace_rows(db, payloads: list[dict]) -> list[str]:
     by_result: dict[str, dict] = {}
     for payload in usable:
         by_result.setdefault(str(payload["result_id"]), payload)
+
+    # THE ACCOUNT MAY BUY THIS (S3-03, S4-01). Read under a row lock on the
+    # user, held to the caller's commit: two jobs of one trial cannot both see
+    # the same room, and a freeze or cancellation being written right now is
+    # waited for rather than raced. Taken AFTER the job lock (the order every
+    # caller already follows), and nothing that locks the user first takes a
+    # job claim lock.
+    account = read_access_rows(db, [user_id], lock="FOR NO KEY UPDATE").get(user_id)
+    access = paid_lookup_access(account) if account is not None else ACCESS_ENDED
+    held = 0
+    if access in BLOCKED_ACCESS:
+        held = len(by_result)
+        by_result = {}
+    elif access == ACCESS_TRIAL:
+        from src.config import settings
+        from src.workers.skip_trace_capacity import credits_for
+
+        room = settings.SKIP_TRACE_TRIAL_CREDIT_ALLOWANCE - lifetime_credits_queued(db, user_id)
+        kept: dict[str, dict] = {}
+        # The caller's order, not result-id order, decides which leads fit.
+        for rid, payload in by_result.items():
+            cost = credits_for(payload["trace_type"])
+            if cost <= room:
+                kept[rid] = payload
+                room -= cost
+            else:
+                held += 1
+        by_result = kept
+    if report is not None:
+        report["access"] = access
+        report["held"] = held
+    if held:
+        # Result ids only, never the homeowner's name or address.
+        _logger.info(
+            "Skip-trace claim held %d lead(s) for user %s: access=%s", held, user_id, access,
+        )
+    if not by_result:
+        return []
     ordered = [by_result[k] for k in sorted(by_result)]
 
     columns = ["id", *_COLUMNS]

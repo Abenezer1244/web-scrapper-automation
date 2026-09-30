@@ -22,7 +22,7 @@ from fastapi.responses import JSONResponse
 # The codes a run refusal can carry: the evaluator's codes that end in a prose
 # 402. run_in_flight (409) and not_entitled (structured 402) have their own
 # bodies. RunRefusalResponse.code is tested equal to this.
-RUN_REFUSAL_CODES = ("ai_limit", "frozen", "ended", "over_limit")
+RUN_REFUSAL_CODES = ("frozen", "ended", "over_limit")
 
 
 class RunRefusedHTTPException(HTTPException):

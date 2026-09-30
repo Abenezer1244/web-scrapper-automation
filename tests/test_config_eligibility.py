@@ -34,13 +34,6 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
-def _next_month_start(now: datetime) -> datetime:
-    first = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    return first.replace(year=first.year + 1, month=1) if first.month == 12 else first.replace(
-        month=first.month + 1
-    )
-
-
 def _county() -> str:
     return f"elig{uuid.uuid4().hex[:8]}"
 
@@ -198,22 +191,6 @@ async def test_not_entitled_does_not_block_while_enforcement_is_off(db, connecto
     assert (await _eligibility(db, user, [config]))[config.id].can_run is True
 
 
-async def test_the_ai_monthly_limit_resumes_next_utc_month(db, connectors):
-    county = _county()
-    await connectors(county, ["probate"], "ai")
-    user = await _user(db, plan="starter", records_limit=50)
-    config = await _config(db, user, county)
-    for _ in range(settings.AI_JOB_LIMITS["starter"]):
-        await _job(db, user, config)
-    now = _now()
-    e = (await _eligibility(db, user, [config], now))[config.id]
-    assert (e.can_run, e.code, e.resumes_at) == (False, "ai_limit", _next_month_start(now))
-    assert e.message == (
-        "Monthly AI scrape limit reached (5/5). "
-        "Upgrade your plan for more AI-powered scrapes."
-    )
-
-
 async def test_the_account_rule_applies_to_every_scraper(db, connectors):
     county = _county()
     await connectors(county, ["probate"], "manual")
@@ -253,11 +230,9 @@ async def test_an_entitlement_paused_scraper_is_config_inactive(db, connectors):
 async def test_precedence_follows_the_gate(db, connectors):
     county = _county()
     await connectors(county, ["tax_delinquent"], "ai")
-    # frozen AND over its AI limit AND not entitled AND running.
+    # frozen AND not entitled AND running.
     user = await _user(db, plan="starter", records_limit=50, subscription_status="unpaid")
     config = await _config(db, user, county, record_type="tax_delinquent")
-    for _ in range(settings.AI_JOB_LIMITS["starter"]):
-        await _job(db, user, config)
     running = await _job(db, user, config, status="scraping", started_at=_now())
     assert (await _eligibility(db, user, [config]))[config.id].code == "run_in_flight"
 
@@ -265,94 +240,13 @@ async def test_precedence_follows_the_gate(db, connectors):
     await db.commit()
     assert (await _eligibility(db, user, [config]))[config.id].code == "not_entitled"
 
-    # Pro allows tax_delinquent; exhaust Pro's AI limit too. Still frozen.
+    # Pro allows tax_delinquent: only the account rule is left.
     user.plan = "pro"
-    await db.commit()
-    for _ in range(settings.AI_JOB_LIMITS["pro"] - settings.AI_JOB_LIMITS["starter"] - 1):
-        await _job(db, user, config)
-    # starter's 5 + the finished "running" job + the rest = exactly Pro's 50.
-    assert (await _eligibility(db, user, [config]))[config.id].code == "ai_limit"
-
-    # Room for one more AI run: only the account rule is left.
-    user.plan = "business"
     await db.commit()
     assert (await _eligibility(db, user, [config]))[config.id].code == "frozen"
 
 
-# ─── AI identity: the connector the worker would run ──────────────────────────
-
-async def test_a_mixed_county_classifies_each_record_type(db, connectors):
-    county = _county()
-    await connectors(county, ["probate"], "manual")
-    await connectors(county, ["tax_delinquent"], "ai")
-    user = await _user(db, plan="starter", records_limit=50)
-    probate = await _config(db, user, county)
-    for _ in range(settings.AI_JOB_LIMITS["starter"]):
-        await _job(db, user, probate)
-    # Five jobs, all on the MANUAL probate connector: no AI usage at all.
-    assert (await _eligibility(db, user, [probate]))[probate.id].can_run is True
-
-
-async def test_manual_jobs_do_not_count_against_the_ai_limit(db, connectors, client: AsyncClient):
-    """The old count joined on (state, county, mode='ai') only, so manual jobs
-    in a county that also has an AI connector counted as AI. The AI connector
-    is inserted FIRST, which is also the row an unordered ``.first()`` returns."""
-    county = _county()
-    await connectors(county, ["tax_delinquent"], "ai")
-    await connectors(county, ["probate"], "manual")
-    user = await _user(db, plan="pro", records_limit=1000)
-    probate = await _config(db, user, county)
-    tax = await _config(db, user, county, record_type="tax_delinquent")
-    for _ in range(settings.AI_JOB_LIMITS["pro"]):
-        await _job(db, user, probate)
-    r = await client.post(
-        "/jobs", json={"scraper_config_id": tax.id, "trigger": "manual"},
-        headers={"Authorization": f"Bearer {create_secure_token(user.id)}"},
-    )
-    # Needs nothing new from this change: it proves the OLD gate's bug directly.
-    assert r.status_code == 201, r.text
-
-
-async def test_the_evaluator_agrees_manual_jobs_are_not_ai_usage(db, connectors):
-    county = _county()
-    await connectors(county, ["tax_delinquent"], "ai")
-    await connectors(county, ["probate"], "manual")
-    user = await _user(db, plan="pro", records_limit=1000)
-    probate = await _config(db, user, county)
-    tax = await _config(db, user, county, record_type="tax_delinquent")
-    for _ in range(settings.AI_JOB_LIMITS["pro"]):
-        await _job(db, user, probate)
-    assert (await _eligibility(db, user, [tax]))[tax.id].can_run is True
-
-
-async def test_ai_jobs_in_a_county_the_page_does_not_show_still_count(db, connectors):
-    shown, elsewhere = _county(), _county()
-    await connectors(shown, ["probate"], "ai")
-    await connectors(elsewhere, ["probate"], "ai")
-    user = await _user(db, plan="pro", records_limit=1000)
-    visible = await _config(db, user, shown)
-    other = await _config(db, user, elsewhere)
-    for _ in range(settings.AI_JOB_LIMITS["pro"]):
-        await _job(db, user, other)
-    assert (await _eligibility(db, user, [visible]))[visible.id].code == "ai_limit"
-
-
-async def test_another_accounts_jobs_never_spend_this_accounts_ai_limit(db, connectors):
-    """The AI count is scoped by Job.user_id AND the config's owner. Only a job
-    whose owner does not match its config tells the two apart: it must count for
-    nobody. Another account's ordinary jobs never count either."""
-    county = _county()
-    await connectors(county, ["probate"], "ai")
-    user = await _user(db, plan="starter", records_limit=50)
-    other = await _user(db, plan="starter", records_limit=50)
-    config = await _config(db, user, county)
-    other_config = await _config(db, other, county)
-    for _ in range(settings.AI_JOB_LIMITS["starter"] - 1):
-        await _job(db, user, config)
-    await _job(db, other, config)          # mismatched owner: other's job, user's config
-    await _job(db, other, other_config)    # other's own AI run
-    assert (await _eligibility(db, user, [config]))[config.id].can_run is True
-
+# ─── Connector resolution: the connector the worker would run ─────────────────
 
 async def test_the_worker_runs_the_connector_eligibility_judged(db, connectors):
     """The registry (worker) and the evaluator share pick_connector: with two
@@ -388,19 +282,12 @@ async def test_duplicate_connectors_resolve_to_the_oldest(db, connectors):
     assert pick_connector([manual, ai], "probate") is manual
     assert pick_connector([manual, ai], "divorce") is None
 
-    user = await _user(db, plan="starter", records_limit=50)
-    config = await _config(db, user, county)
-    for _ in range(settings.AI_JOB_LIMITS["starter"]):
-        await _job(db, user, config)
-    # The worker runs the older MANUAL connector, so none of this is AI usage.
-    assert (await _eligibility(db, user, [config]))[config.id].can_run is True
-
 
 # ─── Batched: a fixed number of queries, and all-tenant slot math ─────────────
 
 async def test_the_query_count_does_not_grow_with_the_list(db, connectors):
-    """Worst case: AI scrapers in several counties, plus AI history in a county
-    only that history reaches (forcing the second connector load)."""
+    """Scrapers in several counties, plus history in a county only that history
+    reaches: the evaluator's query count does not depend on any of it."""
     counties = [_county() for _ in range(3)]
     history_only = _county()
     for county in [*counties, history_only]:
@@ -424,7 +311,7 @@ async def test_the_query_count_does_not_grow_with_the_list(db, connectors):
     finally:
         event.remove(engine, "before_cursor_execute", _count)
     assert six == one
-    assert six <= 6, statements
+    assert six <= 2, statements
 
 
 @pytest.mark.usefixtures("enforce")
@@ -509,11 +396,11 @@ async def test_post_jobs_parity_for_every_code(db, connectors, client: AsyncClie
     starter = await _user(db, plan="starter", records_limit=50)
     await _assert_parity(db, client, starter, await _config(db, starter, manual, "tax_delinquent"))
 
-    ai_user = await _user(db, plan="starter", records_limit=50)
-    ai_config = await _config(db, ai_user, ai)
-    for _ in range(settings.AI_JOB_LIMITS["starter"]):
-        await _job(db, ai_user, ai_config)
-    await _assert_parity(db, client, ai_user, ai_config)
+    template_user = await _user(db, plan="starter", records_limit=50)
+    template_config = await _config(db, template_user, ai)
+    for _ in range(6):  # past the removed monthly cap: still runs
+        await _job(db, template_user, template_config)
+    await _assert_parity(db, client, template_user, template_config)
 
     frozen = await _user(db, subscription_status="unpaid")
     await _assert_parity(db, client, frozen, await _config(db, frozen, manual))

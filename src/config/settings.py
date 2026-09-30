@@ -521,14 +521,6 @@ class Settings(BaseSettings):
     # Nothing is ever deleted by the frozen state — data and past exports stay.
     BILLING_PAST_DUE_GRACE_DAYS: int = 7
 
-    # ─── AI scrape job limits per month (-1 = unlimited) ─────────────────────
-    AI_JOB_LIMITS: ClassVar[dict[str, int]] = {
-        "starter": 5,
-        "pro": 50,
-        "business": 500,
-        "agency": -1,
-    }
-
     def get_allowed_origins(self) -> list[str]:
         # I4: CORS runs with allow_credentials=True, so a wildcard or plaintext
         # origin would let any site (or a MITM on http) make credentialed

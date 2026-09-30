@@ -81,18 +81,6 @@ async def _assert_run_refusal(client, user, config, code):
     return body
 
 
-async def test_ai_limit_402_names_its_code_and_next_month(db, connectors, client: AsyncClient):
-    county = _county()
-    await connectors(county, ["probate"], "ai")
-    user = await _user(db, plan="starter", records_limit=50)
-    config = await _config(db, user, county)
-    for _ in range(settings.AI_JOB_LIMITS["starter"]):
-        await _job(db, user, config)
-    body = await _assert_run_refusal(client, user, config, "ai_limit")
-    assert body["detail"].startswith("Monthly AI scrape limit reached")
-    assert body["resumes_at"] is not None
-
-
 @pytest.mark.parametrize(
     ("code", "fields"),
     [

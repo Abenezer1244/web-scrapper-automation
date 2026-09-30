@@ -267,8 +267,6 @@ async def enqueue_scrape_job(
         record type or county — audit-logged only while ENTITLEMENT_ENFORCEMENT
         is off. An existing config can outlive a downgrade, so this re-validates
         against the CURRENT plan;
-      * 402 monthly AI scrape limit, counted by the connector the worker would
-        actually run;
       * 402 account rule (frozen / ended / over the record limit), which keeps
         the two reasons apart on purpose: "over your limit" sends a customer
         whose card failed to the upgrade page, which does not fix a payment.
@@ -294,7 +292,7 @@ async def enqueue_scrape_job(
     # Raises the structured 402 when enforcing; audit-logs otherwise.
     enforce_runnable_http(eligibility.violation, user=current_user, context="create_job")
     if not eligibility.can_run:
-        # ai_limit, or the account rule: the same sentence in `detail` as always,
+        # The account rule: the same sentence in `detail` as always,
         # with the code and resumes_at added beside it (src/api/errors.py).
         raise run_refusal_http(eligibility.code, eligibility.message, eligibility.resumes_at)
 

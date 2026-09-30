@@ -64,12 +64,34 @@ from src.scrapers.enrichment.king_county_assessor import (  # noqa: E402
 )
 from src.scrapers.probate import orient_probate_party  # noqa: E402
 from src.utils.safe_http import safe_get  # noqa: E402
+from src.workers.skip_trace_claim import lock_job_for_claim  # noqa: E402
 
 _KING_PIN_DIGITS = 10
 
+# A lead a contact-lookup ACTION has bought or is about to buy belongs to that action
+# (Phase 1b-2, W2): its pending row carries the action's id, and a `quoted` /
+# `newly_queued` verdict means the action worker may still claim it or is waiting on
+# its answer. Rewriting such a lead's identity, address or queue row under the action
+# would buy (or settle) a lookup the customer did not confirm. The repair SKIPS it,
+# says so in the journal, and leaves the decision to a human.
+_ACTION_OPEN_VERDICTS = ("quoted", "newly_queued")
+
+_ACTION_LINKED = text(
+    """
+    SELECT EXISTS (
+               SELECT 1 FROM pending_skip_trace_rows
+               WHERE result_id = :id AND action_id IS NOT NULL
+           )
+        OR EXISTS (
+               SELECT 1 FROM contact_lookup_action_results
+               WHERE result_id = :id AND disposition = ANY(:open_verdicts)
+           )
+    """
+)
+
 _PARTY_CANDIDATES = text(
     """
-    SELECT r.id, r.party_name, r.heirs, r.doc_type, sc.county, sc.state
+    SELECT r.id, r.job_id, r.party_name, r.heirs, r.doc_type, sc.county, sc.state
     FROM results r
     JOIN jobs j ON j.id = r.job_id
     JOIN scraper_configs sc ON sc.id = j.scraper_config_id
@@ -132,7 +154,7 @@ _PENDING_NAME_REFRESH = text(
 
 _PARCEL_CANDIDATES = text(
     """
-    SELECT r.id, r.parcel_id, r.party_name, r.property_address, r.mailing_address,
+    SELECT r.id, r.job_id, r.parcel_id, r.party_name, r.property_address, r.mailing_address,
            r.property_city, r.property_state, r.property_zip, r.enrichment_data,
            r.skip_trace_status, sc.record_type,
            -- Read the JSON's exact stored text so the update can guard on it
@@ -293,6 +315,48 @@ def _journal(path: str, payload: dict) -> None:
         fh.write(json.dumps(payload, default=str) + "\n")
 
 
+def _guarded_write(db, row, *, apply: bool, repair: str, stats: dict, journal: str, write) -> bool:
+    """Run ONE row's writes in their own transaction, under its job's claim lock.
+
+    This script writes `results.skip_trace_status` and `pending_skip_trace_rows`, so it
+    is part of the skip-trace queue's concurrency design (16-10), not an outsider to it:
+    - `lock_job_for_claim` serialises it with the scrape enqueue and the contact-lookup
+      action worker, which claim a job's leads under the same lock;
+    - the action check runs UNDER that lock, so no action can claim the lead between
+      the check and the write;
+    - every UPDATE stays guarded on the values it read, which is the re-read.
+    One transaction per row, never one per run: a run also makes live county lookups,
+    and a claim lock must never be held across a network call.
+
+    A dry run takes no lock and writes nothing, but still reports a lead it would skip.
+    Returns True when `write` ran and committed.
+    """
+    if not apply:
+        linked = db.execute(_ACTION_LINKED, {"id": row["id"],
+                                             "open_verdicts": list(_ACTION_OPEN_VERDICTS)}).scalar()
+        db.rollback()
+        if linked:
+            stats["skipped_action_linked"] = stats.get("skipped_action_linked", 0) + 1
+            _journal(journal, {"repair": repair, "action": "would_skip_action_linked",
+                               "id": row["id"]})
+        return False
+    try:
+        lock_job_for_claim(db, row["job_id"])
+        if db.execute(_ACTION_LINKED, {"id": row["id"],
+                                       "open_verdicts": list(_ACTION_OPEN_VERDICTS)}).scalar():
+            db.rollback()
+            stats["skipped_action_linked"] = stats.get("skipped_action_linked", 0) + 1
+            _journal(journal, {"repair": repair, "action": "skipped_action_linked",
+                               "id": row["id"]})
+            return False
+        write()
+        db.commit()
+        return True
+    except BaseException:
+        db.rollback()
+        raise
+
+
 def _refresh_pending_name(db, result_id: str, new_party: str | None, *, journal: str) -> int:
     """Re-derive a queued trace's name payload from the REPAIRED party. Returns rows written.
 
@@ -325,6 +389,7 @@ def _refresh_pending_name(db, result_id: str, new_party: str | None, *, journal:
 
 def repair_party(db, *, apply: bool, journal: str) -> dict:
     rows = db.execute(_PARTY_CANDIDATES).mappings().all()
+    db.rollback()  # end the read: each write below is its own locked transaction
     stats = {"scanned": len(rows), "changed": 0, "party_fixed": 0, "heirs_fixed": 0,
              "no_party_left": 0, "written": 0}
     for row in rows:
@@ -349,7 +414,8 @@ def repair_party(db, *, apply: bool, journal: str) -> dict:
                            "id": row["id"], "county": row["county"],
                            "old_party": row["party_name"], "new_party": new_party,
                            "old_heirs": row["heirs"], "new_heirs": new_heirs})
-        if apply:
+
+        def _write(row=row, new_party=new_party, new_heirs=new_heirs):
             res = db.execute(_PARTY_UPDATE, {
                 "id": row["id"], "new_party": new_party, "new_heirs": new_heirs,
                 "old_party": row["party_name"], "old_heirs": row["heirs"],
@@ -359,8 +425,9 @@ def repair_party(db, *, apply: bool, journal: str) -> dict:
                 stats["pending_refreshed"] = stats.get("pending_refreshed", 0) + _refresh_pending_name(
                     db, row["id"], new_party, journal=journal
                 )
-    if apply:
-        db.commit()
+
+        _guarded_write(db, row, apply=apply, repair="party", stats=stats, journal=journal,
+                       write=_write)
     return stats
 
 
@@ -404,6 +471,7 @@ def _recover(pid: str, party_name: str | None, stats: dict):
 def repair_bad_parcel(db, *, apply: bool, journal: str,
                       record_types: tuple[str, ...] = _DEFAULT_RECORD_TYPES) -> dict:
     rows = db.execute(_PARCEL_CANDIDATES, {"pin_len": _KING_PIN_DIGITS}).mappings().all()
+    db.rollback()  # end the read: each write below is its own locked transaction
     stats = {"scanned": len(rows), "verified_ok": 0, "mismatched": 0, "cleared": 0,
              "traces_cancelled": 0, "lookup_failed": 0, "out_of_scope": 0}
     # One live lookup per DISTINCT parcel, not per row.
@@ -463,19 +531,15 @@ def repair_bad_parcel(db, *, apply: bool, journal: str,
                 # Fully at the intended end-state. A partial earlier recovery (stale
                 # mailing or situs) must NOT be skipped (Codex P2).
                 stats["already_recovered"] = stats.get("already_recovered", 0) + 1
-                if apply:
-                    # An EARLIER run may have cancelled this lead's trace before the
-                    # re-point existed, leaving it stranded behind an 'errored'
-                    # pending row holding the wrong address. The re-point is
-                    # idempotent (it no-ops once the address already matches), so
-                    # run it here too rather than only on a fresh recovery.
-                    repointed = db.execute(
-                        _REPOINT_PENDING,
-                        {"id": row["id"], "property_address": prop, "mail_address": mail}
-                    ).rowcount
-                    if repointed:
-                        db.execute(_REQUEUE_RESULT_TRACE, {"id": row["id"]})
-                    stats["traces_repointed"] = stats.get("traces_repointed", 0) + repointed
+                # An EARLIER run may have cancelled this lead's trace before the
+                # re-point existed, leaving it stranded behind an 'errored'
+                # pending row holding the wrong address. The re-point is
+                # idempotent (it no-ops once the address already matches), so
+                # run it here too rather than only on a fresh recovery.
+                _guarded_write(db, row, apply=apply, repair="parcel", stats=stats,
+                               journal=journal,
+                               write=lambda row=row, prop=prop, mail=mail:
+                                   _repoint_trace(db, row["id"], prop, mail, stats))
                 continue
             new_enrichment = {k: v for k, v in enrichment.items()
                               if k not in _ASSESSOR_DERIVED_KEYS and k != "parcel_echoed_by_county"}
@@ -495,7 +559,8 @@ def repair_bad_parcel(db, *, apply: bool, journal: str,
                                "new_mailing_address": mail,
                                "old_enrichment_data": row["enrichment_data"]})
             stats["recovered"] = stats.get("recovered", 0) + 1
-            if apply:
+
+            def _recover_write(row=row, prop=prop, mail=mail, new_enrichment=new_enrichment):
                 res = db.execute(_PARCEL_RECOVER, {
                     "id": row["id"], "parcel_id": row["parcel_id"],
                     "old_property": row["property_address"],
@@ -515,13 +580,10 @@ def repair_bad_parcel(db, *, apply: bool, journal: str,
                     # cancelling: the backfill excludes any result that already has a
                     # pending row whatever its status, so a cancel strands the lead
                     # forever (Codex P2).
-                    repointed = db.execute(
-                        _REPOINT_PENDING,
-                        {"id": row["id"], "property_address": prop, "mail_address": mail}
-                    ).rowcount
-                    if repointed:
-                        db.execute(_REQUEUE_RESULT_TRACE, {"id": row["id"]})
-                    stats["traces_repointed"] = stats.get("traces_repointed", 0) + repointed
+                    _repoint_trace(db, row["id"], prop, mail, stats)
+
+            _guarded_write(db, row, apply=apply, repair="parcel", stats=stats,
+                           journal=journal, write=_recover_write)
             continue
 
         if (
@@ -547,30 +609,46 @@ def repair_bad_parcel(db, *, apply: bool, journal: str,
                            "cleared_enrichment": removed,
                            "old_enrichment_data": row["enrichment_data"],
                            "skip_trace_status": row["skip_trace_status"]})
-        if apply:
-            res = db.execute(_PARCEL_UPDATE, {
-                "id": row["id"], "parcel_id": row["parcel_id"],
-                "old_property": row["property_address"],
-                "old_city": row["property_city"],
-                "old_state": row["property_state"],
-                "old_zip": row["property_zip"],
-                "old_enrichment_text": row["enrichment_text"],
-                "new_enrichment": json.dumps(enrichment),
-            })
-            stats["cleared"] += res.rowcount
-            if res.rowcount:
-                # ONLY when the guarded clear actually wrote (Codex P1). If the row
-                # changed under us the clear no-ops, and cancelling its trace would
-                # kill a queued lookup for an address this run did not remove.
-                cancelled = db.execute(_CANCEL_PENDING, {"id": row["id"]}).rowcount
-                if cancelled:
-                    db.execute(_RESET_RESULT_TRACE, {"id": row["id"]})
-                stats["traces_cancelled"] += cancelled
-            else:
-                stats["skipped_row_changed"] = stats.get("skipped_row_changed", 0) + 1
-    if apply:
-        db.commit()
+        _guarded_write(db, row, apply=apply, repair="parcel", stats=stats, journal=journal,
+                       write=lambda row=row, enrichment=enrichment:
+                           _clear_row(db, row, enrichment, stats))
     return stats
+
+
+def _repoint_trace(db, result_id: str, prop, mail, stats: dict) -> None:
+    """Re-point a lead's unsent trace at its recovered address, and re-queue the lead
+    only when the re-point matched. Runs inside `_guarded_write`'s transaction."""
+    repointed = db.execute(
+        _REPOINT_PENDING, {"id": result_id, "property_address": prop, "mail_address": mail}
+    ).rowcount
+    if repointed:
+        db.execute(_REQUEUE_RESULT_TRACE, {"id": result_id})
+    stats["traces_repointed"] = stats.get("traces_repointed", 0) + repointed
+
+
+def _clear_row(db, row, enrichment: dict, stats: dict) -> None:
+    """Clear a wrong parcel attribution and cancel the unsent trace it bought. Runs
+    inside `_guarded_write`'s transaction."""
+    res = db.execute(_PARCEL_UPDATE, {
+        "id": row["id"], "parcel_id": row["parcel_id"],
+        "old_property": row["property_address"],
+        "old_city": row["property_city"],
+        "old_state": row["property_state"],
+        "old_zip": row["property_zip"],
+        "old_enrichment_text": row["enrichment_text"],
+        "new_enrichment": json.dumps(enrichment),
+    })
+    stats["cleared"] += res.rowcount
+    if res.rowcount:
+        # ONLY when the guarded clear actually wrote (Codex P1). If the row
+        # changed under us the clear no-ops, and cancelling its trace would
+        # kill a queued lookup for an address this run did not remove.
+        cancelled = db.execute(_CANCEL_PENDING, {"id": row["id"]}).rowcount
+        if cancelled:
+            db.execute(_RESET_RESULT_TRACE, {"id": row["id"]})
+        stats["traces_cancelled"] += cancelled
+    else:
+        stats["skipped_row_changed"] = stats.get("skipped_row_changed", 0) + 1
 
 
 def main() -> None:

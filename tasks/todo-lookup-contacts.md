@@ -3358,6 +3358,10 @@ advisory lock + `SKIP LOCKED` row locks. Adopted:
 - 2-0 replaces the script's global scan-then-commit with a per-job lock -> re-read -> refuse -> write
   -> commit (`repair_probate_party_and_bad_parcel.py:404,571`).
 
+**Consult r4 (2026-09-30): REVISE** (O-C wording, the second stale dispatcher comment at `:284-290`,
+the 2-0 manifest; all fixed). **r5: `PLAN: GO`, no findings.** Outputs `<scratchpad 49da3c50>/
+codex_1b2_consult_r{4,5}_out.txt`. Awaiting OWNER approval before any code.
+
 ### Owner items (before code)
 - **O-C** (billing, pre-existing, found by the consult) Persist `skip_trace_queues.rows_sent`
   at submission and compare `rows_uploaded` against it in `accepted_all`. With a mismatch, or

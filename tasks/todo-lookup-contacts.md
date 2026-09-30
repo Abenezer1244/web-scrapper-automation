@@ -3287,7 +3287,8 @@ order. These AMEND the sections above:
   `failed→claimed`, a terminal verdict rewritten.
 
 **Revised order and files:**
-- **2-0** repair-script gate (3).
+- **2-0** writers contract: the repair-script gate + the dispatcher's two stale comments
+  (the script, its test, `skip_trace_dispatcher.py` comments only, this plan = 4).
 - **2a** migration 107: action FK + `unmatched_unbilled` + `quote_snapshot`; `models.py`; claim
   `action_id`; tests; plan (5).
 - **2b** worker (5).
@@ -3349,7 +3350,8 @@ advisory lock + `SKIP LOCKED` row locks. Adopted:
   docstring (`skip_trace_dispatcher.py:868-873`) promises that 1b-2 moves the action verdict to
   `released` in the same transaction. Under S1 cancellation stays pending-row-only and the
   reconciler derives `cancelled -> released`. The docstring is rewritten in **2-0** (the
-  writers-contract PR, 4 files), so no reviewer re-implements the old promise.
+  writers-contract PR), BOTH places: the comment at `:284-290` and the docstring at `:868-873`,
+  so no reviewer re-implements the old promise.
 - **X2 (P2) O-C is a HARD GATE before 2d**, with regression tests for `rows_sent != rows_uploaded`
   and a legacy `rows_sent IS NULL` (bill `completed` only).
 - **X3 (P3)** the 2c path is `src/workers/scheduler_helpers/contact_lookups.py`.
@@ -3360,8 +3362,9 @@ advisory lock + `SKIP LOCKED` row locks. Adopted:
 - **O-C** (billing, pre-existing, found by the consult) Persist `skip_trace_queues.rows_sent`
   at submission and compare `rows_uploaded` against it in `accepted_all`. With a mismatch, or
   with no `rows_sent` (old rows), bill `completed` only. It's a live billing change: a
-  migration, the dispatcher and billing, its own PR. **Recommend fixing it BEFORE 2d** (confirm
-  is what adds volume). Not blocking 2-0/2a/2b/2c.
+  migration, the dispatcher and billing, its own PR. **2d is BLOCKED until O-C has shipped**
+  (migration, dispatcher, billing, and the mismatch + `rows_sent IS NULL` regression tests):
+  confirm is what adds volume. It does not block 2-0/2a/2b/2c.
 - **O-A** Should the confirm endpoint (2d) go live before the frontend (1c) ships? It's
   reachable only by an authenticated paying account and gated like the quote. The alternative
   is a feature flag: `settings.py` + `.env.example`, over the 5-file rule, a split.

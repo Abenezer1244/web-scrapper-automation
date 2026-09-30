@@ -38,6 +38,7 @@ from src.scrapers.reliability import (
     detect_block,
 )
 from src.utils.logger import setup_logger
+from src.utils.pinned_http import pinned_session
 
 # Substrings an AcclaimWeb results page renders for a genuine zero-result window.
 _EMPTY_MARKERS = ("no results", "0 records", "no records", "no documents found")
@@ -1012,8 +1013,6 @@ class AcclaimWebScraper(BridgeScraper):
         from concurrent.futures import ThreadPoolExecutor
         from urllib.parse import urlparse
 
-        import requests as _requests
-
         pacs_url = self._PACS_URLS.get(self.county.lower())
         if not pacs_url:
             _logger.info("No PACS URL for %s — skipping address lookup", self.county)
@@ -1024,11 +1023,14 @@ class AcclaimWebScraper(BridgeScraper):
         # M8 SSRF hardening (mirrors src/scrapers/enrichment/pacs.py): pacs_url is a
         # static trusted constant, but validate defense-in-depth before any outbound
         # request — refuse non-HTTPS, and resolve=True rejects a host that resolves
-        # to a private/loopback/metadata IP. Every request below also sets
-        # trust_env=False (no ambient-proxy reroute) + allow_redirects=False (a
-        # poisoned 3xx can't bounce to an internal host; PACS posts back to the
-        # same URL, so there is no legitimate redirect). Validated once here because
-        # the same pacs_url is reused by the init session and every per-lookup session.
+        # to a private/loopback/metadata IP. Every request below goes through a
+        # pinned session (audit #5 5b-ii: resolved once, refused if any answer is
+        # blocked, connected to the checked address, so a rebinding answer after
+        # this validation cannot reach an internal host; no ambient proxy) with
+        # allow_redirects=False (a poisoned 3xx can't bounce to an internal host;
+        # PACS posts back to the same URL, so there is no legitimate redirect).
+        # Validated once here because the same pacs_url is reused by the init
+        # session and every per-lookup session.
         if urlparse(pacs_url).scheme != "https":
             _logger.warning("PACS lookup refused non-HTTPS URL for %s", self.county)
             return
@@ -1039,8 +1041,7 @@ class AcclaimWebScraper(BridgeScraper):
             return
 
         # Get initial page for VIEWSTATE
-        sess = _requests.Session()
-        sess.trust_env = False
+        sess = pinned_session()
         sess.headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0"
         try:
             init = sess.get(pacs_url, timeout=10, allow_redirects=False)
@@ -1062,10 +1063,9 @@ class AcclaimWebScraper(BridgeScraper):
             evidence — see parse_pacs_result_html / Codex point C)."""
             try:
                 # Each lookup needs its own session (shared sessions cause
-                # VIEWSTATE conflicts under concurrency). M8: trust_env=False +
-                # allow_redirects=False; pacs_url already SSRF-validated above.
-                _s = _requests.Session()
-                _s.trust_env = False
+                # VIEWSTATE conflicts under concurrency). Pinned + allow_redirects=
+                # False; pacs_url already SSRF-validated above.
+                _s = pinned_session()
                 _s.headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0"
                 r0 = _s.get(pacs_url, timeout=8, allow_redirects=False)
                 vs = re.search(r'__VIEWSTATE.*?value="([^"]+)"', r0.text)

@@ -23,6 +23,7 @@ import requests
 
 from src.api.middleware.security import validate_scraping_target
 from src.utils.logger import setup_logger
+from src.utils.pinned_http import pinned_session
 
 _logger = setup_logger("scraper.enrichment.pacs")
 
@@ -134,13 +135,15 @@ def lookup_pacs_by_name(pacs_url: str, owner_name: str) -> dict | None:
     _POST_TIMEOUT = 25
 
     def _do_request():
-        sess = requests.Session()
+        # N1 + audit #5 5b-ii: a pinned session resolves the host once, refuses it
+        # if any answer is a blocked address, and connects to the address it
+        # checked, so a DNS answer that changes after validate_scraping_target
+        # (rebinding) cannot reach an internal host. It also ignores ambient
+        # HTTP(S)_PROXY. allow_redirects=False on both hops so a poisoned 302
+        # can't bounce to an internal/metadata host; PACS posts back to the same
+        # URL, so there is no legitimate redirect.
+        sess = pinned_session()
         sess.headers.update(_HEADERS)
-        # N1: trust_env=False disables ambient HTTP(S)_PROXY so the request
-        # can't be rerouted off-box after the SSRF check; allow_redirects=False
-        # on both hops so a poisoned 302 can't bounce to an internal/metadata
-        # host. PACS posts back to the same URL — no legitimate redirect.
-        sess.trust_env = False
         r0 = sess.get(pacs_url, timeout=_GET_TIMEOUT, allow_redirects=False)
         if r0.status_code != 200:
             return None, None

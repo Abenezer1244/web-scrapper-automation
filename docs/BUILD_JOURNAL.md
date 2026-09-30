@@ -19,6 +19,78 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-28..30 — Contact lookup 1b-1c: the planner and the quote are live (and main moved five times under them)
+
+> Owner asked: build 1b-1c (a pure planner shared with the future worker, and the quote
+> endpoint), then ship it under the standing merge rule. Plan: `tasks/todo-lookup-contacts.md`,
+> "FINAL 1b-1c contract" through "Amendments BUILT".
+
+**Built / Shipped:**
+- **#384** `9833a7b0`: the planner (`src/api/contact_lookup_planner.py`: `classify`,
+  `plan_window`, keyset tab queries) and `src/config/lookup_pricing.py` (the live Stripe rates).
+  63 tests, including parity with the REAL `_enqueue_skip_trace_rows`.
+- **#386** `29172543`: the `lookup_quote` rate zone (10/min, fail-closed) and the planner's
+  trial `credit_cap`, with parity against the REAL `claim_skip_trace_rows` in trial mode.
+- **#393** `677a6a40`: `POST /jobs/{job_id}/contact-lookups/quote`. It gates in this order:
+  1. the limiter, bounded by `wait_for`;
+  2. the job, looked up by `(id, user_id)`;
+  3. `done` status;
+  4. the plan;
+  5. `run_eligibility`;
+  6. the kill switch;
+  7. `paid_lookup_access()`.
+
+  Redis is PINGed before any DB work, and a quote that can't be stored is never shown (503).
+  The stored payload is v2, one live quote per tab, with a 600 s TTL. The response carries no
+  lead ids. Prod probe: an unauthenticated POST returns 401.
+
+**Tried / Decided:**
+- Owner decision **T**: cap a trial account at its FULL lifetime credit allowance (still an
+  upper bound: the claim only lowers it). Rejected: an exact, API-readable counter (a migration
+  on the money path) and refusing trials outright.
+- Owner decision **Z**: the quote gets its own rate zone, shipped as a precursor PR. After #378
+  the `export` zone became every CSV download's shared budget.
+- R2 (re-reading the ATIP flag inside `skip_trace.py`) was rejected; the doc wins. It only ever
+  relabels a row, and it would touch the live paid path.
+
+**Failed / Blocked:**
+- GitHub Actions billing blocked all CI (3 s failures) until the owner fixed it.
+- The required Dependency Audit then failed every PR: 10 new PyJWT CVEs. The S4-02 session
+  shipped #391. I found its worktree already mid-edit and stood down instead of opening a
+  duplicate PR.
+- #393's first CI run failed 1 of 5,422: my store-failure test spawned a HARDCODED local
+  `redis-server.exe`, and CI's Redis is a `redis:7-alpine` container. Fixed with a throwaway
+  ACL user `-@write` (Redis >= 6), falling back to the private `maxmemory 1` server (Redis 5).
+  With neither available the test FAILS; it never skips.
+
+**Caught & fixed:**
+- A trial parity test seeded rows that shared one `created_at`, so window order came from
+  random UUIDs. It had passed once by luck. Each row now gets its own time.
+- The keyset bound the uuid as VARCHAR (`uuid > varchar`); each value is now bound with its
+  column's type.
+- The endpoint mutation "category dropped from the planner call" SURVIVED the first run, so a
+  per-tab test was added. Final: 18/18 caught.
+- The write-refusing probe accepted any `RedisError`, so a server that never started would have
+  "proved" the refusal. It now requires a server `ResponseError`.
+
+**Pending / Handoff:** 1b-2 (confirm, worker claim, ledger, settlement): plan + Codex consult
+next, with the owner's approval before code. Carried from 1b-1c:
+- confirm consumes the tab's quote atomically;
+- it refuses an unknown payload `v`;
+- it re-checks access and trial room under the user-row lock;
+- it writes only the stored `quoted_ids`.
+
+Then 1c (frontend).
+
+**Facts learned:**
+- main moved under #386 three times (#391, #390, #389). Each rebase was clean and
+  byte-identical (`git range-diff` all `=`), but #390 changed `_enqueue_skip_trace_rows` (an
+  optional `attempt_token` fence). A clean rebase is not a fact check. Asking the parallel
+  session to hold merges during a ~20 min CI window worked.
+- CI has no local binaries and no Redis 5: it runs a `redis:7-alpine` service with ACLs.
+- `from src.api.middleware import rate_limit` returns the FUNCTION (a package re-export); use
+  `importlib.import_module`.
+
 ## 2026-09-30 — S4-02 fixed (a cancelled run holds its slot until its worker stops), PyJWT 2.14.0, and a merge that silently broke the fix
 
 > Owner asked: continue the audit queue from the S4-06 handoff; push/merge the handoff;

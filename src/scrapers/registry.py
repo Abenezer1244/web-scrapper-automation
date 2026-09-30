@@ -49,6 +49,20 @@ _ALLOWED_SCRAPER_MODULES = frozenset([
 ScraperFactory = Callable[..., "BridgeScraper"]
 
 
+# The stored modes that mean "resolve the recorder-platform template from
+# base_url". 'ai' is the old name for it and is being retired (owner decision
+# 2026-09-30: remove AI mode; plan tasks/todo-remove-ai-mode.md, Phase 2).
+# Phase 2a: every reader accepts both names while every writer still stores 'ai',
+# so any mix of old and new api/worker/beat processes agrees on every row.
+# 2b switches writers to 'template' and migrates the rows; 2c drops 'ai'.
+TEMPLATE_MODES = frozenset({"template", "ai"})
+
+
+def is_template_mode(scraper_mode: str | None) -> bool:
+    """True when a connector's mode means "pick the template from base_url"."""
+    return scraper_mode in TEMPLATE_MODES
+
+
 def pick_connector(connectors, record_type: str):
     """The connector a run of ``record_type`` uses, among one county's ACTIVE rows.
 
@@ -100,8 +114,7 @@ def get_scraper_class(
             f"No active connector for {county.lower()}, {state.upper()}"
         )
 
-    # The connector that supports this specific record type — the same rule
-    # run eligibility uses to decide whether this run is AI usage.
+    # The connector that supports this specific record type.
     connector = pick_connector(connectors, record_type)
 
     if connector is None:
@@ -111,22 +124,19 @@ def get_scraper_class(
             f"Supported: {list(set(all_types))}"
         )
 
-    # AI-mode connector: resolve to the recorder-platform TEMPLATE that matches
-    # its base_url. "ai" mode means "detect the platform template from the URL" —
-    # NOT "run a generic LLM navigator". The old generic AIScraper fallback was
-    # removed: it produced low-quality unstructured output and every active
-    # ai-mode connector now maps to a concrete template. If no template matches,
-    # fail closed (UnsupportedCountyError) rather than silently degrade.
+    # Template-mode connector: resolve to the recorder-platform TEMPLATE that
+    # matches its base_url. No LLM is involved. If no template matches, fail
+    # closed (UnsupportedCountyError) rather than silently degrade.
     scraper_mode = getattr(connector, "scraper_mode", "manual")
-    if scraper_mode == "ai":
+    if is_template_mode(scraper_mode):
         from functools import partial
 
         template_class = _detect_template(connector.base_url)
         if template_class is None:
             raise UnsupportedCountyError(
                 f"No scraper template matches base_url {connector.base_url!r} for "
-                f"{county}, {state} (ai-mode connector with no recognized recorder "
-                "platform; the generic AI scraper has been removed)"
+                f"{county}, {state} (template-mode connector with no recognized "
+                "recorder platform)"
             )
         _logger.info(
             "Registry resolved %s/%s/%s → %s (template, base_url=%s)",
@@ -169,11 +179,11 @@ def connector_scraper_class(connector) -> type | None:
     DB lookup and without raising.
 
     For read-only metadata callers (e.g. the SHOW collection_scope display) that
-    already hold the connector row and just need to query a classmethod. ai-mode
-    resolves to the recorder-platform template; manual mode imports the allowlisted
-    class. Returns None when the connector cannot be resolved.
+    already hold the connector row and just need to query a classmethod. Template
+    mode resolves to the recorder-platform template; manual mode imports the
+    allowlisted class. Returns None when the connector cannot be resolved.
     """
-    if getattr(connector, "scraper_mode", "manual") == "ai":
+    if is_template_mode(getattr(connector, "scraper_mode", "manual")):
         return _detect_template(connector.base_url or "")
     scraper_class = getattr(connector, "scraper_class", None)
     if not scraper_class or "." not in scraper_class:

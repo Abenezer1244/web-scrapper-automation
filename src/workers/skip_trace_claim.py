@@ -488,7 +488,9 @@ def job_claim_lock_held(db, job_id: str) -> bool:
     ).scalar())
 
 
-def claim_skip_trace_rows(db, payloads: list[dict], *, report: dict | None = None) -> list[str]:
+def claim_skip_trace_rows(
+    db, payloads: list[dict], *, report: dict | None = None, action_id: str | None = None,
+) -> list[str]:
     """Claim `payloads` into the queue. Returns the result ids actually won.
 
     `payloads` are ``build_pending_row_payload`` dicts. A payload whose lead no
@@ -512,7 +514,16 @@ def claim_skip_trace_rows(db, payloads: list[dict], *, report: dict | None = Non
     re-queues it: enqueue is job-scoped, so it is looked up only if a later run
     delivers it again. `report`, when given, receives ``access`` and ``held``
     (leads held by this rule, not by the insert); the caller tells the customer
-    with `held_lookup_message`.
+    with `held_lookup_message`. It also receives ``held_ids``, those leads' result
+    ids in the caller's order, so the contact-lookup action worker can record a
+    verdict per held lead (Phase 1b-2, W5).
+
+    `action_id` (Phase 1b-2) is the contact-lookup action buying these leads. Every
+    inserted row carries it (the scrape path passes None and its SQL is unchanged),
+    and the insert JOINs that action on its id, the claim's tenant AND the claim's
+    job: an action of another job or tenant claims NOTHING, so one job's spend can
+    never be attributed to another's action (W6). Migration 107's composite FK is the
+    database's own backstop for the tenant half.
 
     Does NOT commit. The caller owns the transaction.
     """
@@ -586,9 +597,9 @@ def claim_skip_trace_rows(db, payloads: list[dict], *, report: dict | None = Non
     # job claim lock.
     account = read_access_rows(db, [user_id], lock="FOR NO KEY UPDATE").get(user_id)
     access = paid_lookup_access(account) if account is not None else ACCESS_ENDED
-    held = 0
+    held_ids: list[str] = []
     if access in BLOCKED_ACCESS:
-        held = len(by_result)
+        held_ids = list(by_result)
         by_result = {}
     elif access == ACCESS_TRIAL:
         from src.config import settings
@@ -603,11 +614,13 @@ def claim_skip_trace_rows(db, payloads: list[dict], *, report: dict | None = Non
                 kept[rid] = payload
                 room -= cost
             else:
-                held += 1
+                held_ids.append(rid)
         by_result = kept
+    held = len(held_ids)
     if report is not None:
         report["access"] = access
         report["held"] = held
+        report["held_ids"] = held_ids
     if held:
         # Result ids only, never the homeowner's name or address.
         _logger.info(
@@ -644,9 +657,21 @@ def claim_skip_trace_rows(db, payloads: list[dict], *, report: dict | None = Non
     # from the _COLUMNS literals, and `rows_sql` holds only generated ":name"
     # bind slots and their CAST types. EVERY payload value travels in `params`
     # as a bound parameter.
+    # The action, when there is one, is a constant bound parameter (never a VALUES
+    # column): one claim is one action. Its JOIN is the action<->job<->tenant proof.
+    # With action_id=None these three fragments are empty and the statement is
+    # byte-for-byte the scrape path's.
+    action_col = ", action_id" if action_id is not None else ""
+    action_val = ", CAST(:action_id AS uuid)" if action_id is not None else ""
+    action_join = (
+        "JOIN public.contact_lookup_actions a ON a.id = CAST(:action_id AS uuid) "
+        "                                    AND a.user_id = v.user_id "
+        "                                    AND a.job_id = v.job_id "
+        if action_id is not None else ""
+    )
     insert_sql = (
-        f"INSERT INTO pending_skip_trace_rows ({', '.join(columns)}, status) "  # noqa: S608
-        f"SELECT {select_list}, 'queued' "
+        f"INSERT INTO pending_skip_trace_rows ({', '.join(columns)}{action_col}, status) "  # noqa: S608
+        f"SELECT {select_list}{action_val}, 'queued' "
         f"FROM (VALUES {{rows}}) "
         f"     AS v({', '.join(columns)}) "
         # r.job_id = v.job_id as well as the tenant: the payload carries a
@@ -661,6 +686,7 @@ def claim_skip_trace_rows(db, payloads: list[dict], *, report: dict | None = Non
         # tenant's job would be ignored by the dispatcher's tenant-pinned joins
         # forever while the unique index blocked the legitimate claim.
         f"JOIN public.jobs j ON j.id = v.job_id AND j.user_id = v.user_id "
+        f"{action_join}"
         f"WHERE r.user_id = CAST(:uid AS uuid) AND j.user_id = CAST(:uid AS uuid) "
         f"  AND r.skip_trace_status = :claimable "
         f"{conflict_sql} "
@@ -691,6 +717,8 @@ def claim_skip_trace_rows(db, payloads: list[dict], *, report: dict | None = Non
         params: dict[str, Any] = {
             "uid": user_id, "claimable": CLAIMABLE_RESULT_STATUS,
         }
+        if action_id is not None:
+            params["action_id"] = str(action_id)
         for i, payload in enumerate(chunk):
             # `id` is supplied explicitly: PendingSkipTraceRow.id carries a
             # PYTHON-side default (`default=_uuid`), not a server default, so a

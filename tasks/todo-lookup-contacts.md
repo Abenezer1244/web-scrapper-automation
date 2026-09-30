@@ -3421,6 +3421,115 @@ O-C: its own billing PR, and it BLOCKS 2d.
   Now 30 passed; **mutations 8/8** (+ row locks dropped, + recovery party guard dropped).
 - Local test DB upgraded 105 → 106 (#394's `jobs.breakdown_*`) via `scripts/migrate.py`.
 
+### 2-0 MERGED + LIVE (2026-09-30): #400, merge `2b907bc1`
+- Codex r2 GO; CI green; quiet all zeros; api/worker/beat SUCCESS on `2b907bc1`, clean boot.
+- The #393 import-cycle hotfix shipped first as **#398** (`d68563ce`).
+
+### 2a SPLIT (2026-09-30): 2a-i schema, 2a-ii the claim
+- Migration 101's drift test pins its vocabulary tuple to `models.py`, so adding
+  `unmatched_unbilled` also changes `tests/test_contact_lookup_schema.py`. That makes a 6th
+  file.
+- The S4-02 session's #399 is also changing `skip_trace_claim.py` right now.
+- So 2a splits:
+  - **2a-i** = migration 107 + `models.py` + the schema tests + this plan (4);
+  - **2a-ii** (after #399 lands) = the claim's `action_id` / `held_ids` / action↔job join +
+    its test + this plan (3).
+
+### 2a-i BUILT (2026-09-30), before the Codex diff review
+- **Migration 107** (`107_contact_lookup_action_link.py`):
+  - `fk_pending_skip_trace_action_tenant` `(action_id, user_id)` →
+    `contact_lookup_actions(id, user_id)`, ON DELETE NO ACTION, NOT VALID then VALIDATE;
+  - the disposition CHECK re-added with `unmatched_unbilled` (NOT VALID, VALIDATE);
+  - `contact_lookup_actions.quote_snapshot JSONB NOT NULL DEFAULT '{}'`.
+  - Lock timeout 5 s, replay-safe. The downgrade refuses while `unmatched_unbilled` rows exist.
+  - Applied locally and verified BY THE OBJECTS (FK `confdeltype='a'` validated; CHECK
+    validated with the new value; column jsonb NOT NULL default `'{}'`).
+- `models.py`: the FK in `__table_args__`, `quote_snapshot`, and `unmatched_unbilled` in
+  `CONTACT_LOOKUP_DISPOSITIONS`.
+- Tests (`test_contact_lookup_schema.py`, 75 passed):
+  - the drift test pins 101 = models minus the new value, and 107 = models;
+  - a pending row may name its own action, and NULL is unchecked;
+  - another tenant's action and a missing action are REFUSED;
+  - deleting a job, and a user, with action-linked pending rows succeeds (NO ACTION at
+    statement end, V5);
+  - an action that owns pending rows cannot be deleted alone;
+  - `unmatched_unbilled` is refused to the API and allowed to the worker;
+  - the API writes `quote_snapshot` once and can never change it (V6);
+  - the snapshot defaults to `{}`.
+- **Migration mutations 4/4 caught.** Each cycle ran a downgrade to 106, the mutated 107, the
+  tests, then a restore (downgrade + replay exercised):
+  - CASCADE instead of NO ACTION;
+  - a non-composite FK;
+  - the new value left out of the CHECK;
+  - the snapshot nullable with no default.
+- **Codex diff review r1: NO-GO (2 P2 + 2 P3, no P1), all adopted.**
+  1. Replay object-verification: the FK is checked BY DEFINITION on
+     `public.pending_skip_trace_rows` (an impostor is rebuilt), and an existing
+     `quote_snapshot` must be jsonb NOT NULL DEFAULT '{}' or the migration aborts.
+  2. The downgrade refuses while ANY action row exists (dropping the snapshot would destroy
+     quote evidence).
+  3. The lock docs now name the real levels:
+     - ACCESS EXCLUSIVE for ADD COLUMN and the CHECK swap;
+     - SHARE ROW EXCLUSIVE on `pending_skip_trace_rows` for the FK, held to commit;
+     - `lock_timeout` bounds acquisition only.
+  4. A test asserts both constraints are validated and defined as intended.
+  - Verified locally against the real DB:
+    - REPLAY on an applied schema (`stamp 106` + migrate) succeeds;
+    - an IMPOSTOR FK (single-column, CASCADE) is rebuilt to the composite NO ACTION FK;
+    - a WRONG column (nullable) aborts at 106, and once fixed it migrates to 107.
+- **Codex r2: GO**, plus 2 P3s, both done:
+  - the constraint test is scoped by `conrelid`;
+  - real-DB replay tests run 107's REAL `upgrade()` through alembic `Operations` inside one
+    rolled-back transaction: a replay on the applied schema; an impostor FK rebuilt; a
+    malformed `quote_snapshot` refused.
+  Mutation: with the impostor check disabled, the replay test FAILS. 15 tests for 107.
+- **Codex r3: GO.** A P3 is accepted as a fact: the replay tests hold DDL locks inside their
+  rolled-back transaction, which a PARALLEL run sharing the DB could block on. The suite runs
+  serially (local rig and CI).
+- **Regression: 726 passed, 0 failed** (every test file that writes pending rows or the
+  ledger, 2 chunks). ruff clean. No type checker is configured.
+
+### 2a-i MERGED + LIVE (2026-09-30): #402, merge `e9397f0f`
+- Migration 107 was verified in PRODUCTION BY THE OBJECTS (read-only):
+  - the FK is validated, `confdeltype='a'`, with the exact composite definition;
+  - the CHECK is validated and includes `unmatched_unbilled`;
+  - `quote_snapshot` is jsonb NOT NULL default `'{}'`;
+  - 0 pending rows carry an `action_id`.
+- api and beat logged "migrations applied" and booted clean.
+- The worker's DSN reads an EMPTY `alembic_version`, so objects, not the version table, are
+  the proof.
+- Rebased once over #401 (AI-mode removal, no overlap); Codex r4 GO.
+
+### 2a-ii BUILT (2026-09-30), before the Codex diff review
+Branch `feat/lookup-1b2a-ii-claim-action` off `e9397f0f` (after #399's
+`held_lookup_message`).
+- `claim_skip_trace_rows(..., action_id=None)`:
+  - With an action, every inserted row carries it. The INSERT JOINs
+    `contact_lookup_actions a ON a.id = :action_id AND a.user_id = v.user_id AND a.job_id =
+    v.job_id` (W6): an action of another job, another tenant, or none claims NOTHING.
+  - With `None` the three SQL fragments are empty: the scrape path's statement is unchanged
+    (a test asserts it never mentions an action).
+  - `report["held_ids"]`: the held leads' result ids in the caller's order (W5), beside the
+    unchanged `held` count. For a blocked account, all of them.
+- Tests: NEW `tests/test_skip_trace_claim_action.py` (9, real PG). The 3 exact-dict
+  `report` assertions in `test_audit4_paid_skip_trace_gate.py` now include `held_ids` (the
+  contract changed on purpose). Files: claim, 2 tests, this plan = 4.
+- **Mutations 5/6 caught.** Caught: the join dropped; its job check dropped; the action not
+  written; trial held ids; blocked held ids. **The survivor is EQUIVALENT:** the join's
+  tenant check is implied by its job check (`a.job_id = v.job_id` with `j.user_id =
+  v.user_id`, and 101's FK `(job_id, user_id) -> jobs` makes an action's tenant its job's
+  tenant). It is kept as the explicit belt.
+- **Codex r1: GO**, plus a P3, done:
+  - the scrape path's INSERT is now pinned to a GOLDEN statement + param-key set, captured
+    from origin/main's UNMODIFIED claim and proven BYTE-IDENTICAL to this branch's with
+    `action_id=None` (a diff of the two driver-level captures);
+  - new: an action claim across insert chunks marks every row;
+  - new: a lead settled mid-claim is withdrawn by OUR pending id, across chunks, with an
+    action.
+  11 tests; mutations unchanged (5/6, the survivor equivalent).
+- **Regression: 825 passed, 0 failed** (all 27 files that touch the claim, pending rows or
+  the ledger, 2 chunks). The first run caught the 3 exact-dict asserts, fixed as above.
+
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever
       the tab has leads that have never been looked up; when the quote comes back with

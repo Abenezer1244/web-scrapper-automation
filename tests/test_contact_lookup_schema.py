@@ -282,7 +282,17 @@ async def test_the_migration_and_the_models_have_not_drifted(db):
     mig = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mig)
 
-    assert tuple(mig._DISPOSITIONS) == tuple(CONTACT_LOOKUP_DISPOSITIONS)
+    # 101 is frozen history; 107 added exactly one value, and 107's own copy is the
+    # one the database now enforces.
+    assert tuple(mig._DISPOSITIONS) == tuple(
+        d for d in CONTACT_LOOKUP_DISPOSITIONS if d != "unmatched_unbilled"
+    )
+    spec107 = importlib.util.spec_from_file_location(
+        "_mig107", path.parent / "107_contact_lookup_action_link.py"
+    )
+    mig107 = importlib.util.module_from_spec(spec107)
+    spec107.loader.exec_module(mig107)
+    assert tuple(mig107._DISPOSITIONS) == tuple(CONTACT_LOOKUP_DISPOSITIONS)
     assert tuple(mig._API_INITIAL_DISPOSITIONS) == tuple(CONTACT_LOOKUP_API_INITIAL_DISPOSITIONS)
     assert tuple(mig._ACTION_STATUSES) == tuple(CONTACT_LOOKUP_ACTION_STATUSES)
     assert tuple(mig._TRACE_OUTCOMES) == tuple(RESULT_TRACE_OUTCOMES)
@@ -861,3 +871,204 @@ async def test_the_api_dispatch_stamp_re_reads_a_row_the_worker_moved(db, busine
     )
     assert blocked, "the API's update did not wait for the worker's row lock"
     assert error is not None and "may only stamp dispatched_at" in str(error), error
+
+
+# ── migration 107: pending rows name their action; unbilled unmatched; the snapshot ─
+
+
+async def _pending(db, user: User, job_id: str, rid: str, action_id) -> None:
+    await db.execute(text(
+        "INSERT INTO pending_skip_trace_rows (id, job_id, result_id, user_id, "
+        "property_address, trace_type, status, action_id) "
+        "VALUES (:id, :job, :r, :uid, '1400 MAIN ST', 'advanced', 'queued', :a)"
+    ), {"id": str(uuid.uuid4()), "job": job_id, "r": rid, "uid": user.id, "a": action_id})
+
+
+async def test_107s_constraints_exist_as_defined_and_are_validated(db):
+    """NOT VALID then VALIDATE: an unvalidated constraint enforces new rows only."""
+    rows = {r.conname: r for r in (await db.execute(text(
+        "SELECT conname, convalidated, confdeltype::text AS confdeltype, "
+        "pg_get_constraintdef(oid) AS condef "
+        "FROM pg_constraint WHERE (conname, conrelid) IN ("
+        "('fk_pending_skip_trace_action_tenant', 'public.pending_skip_trace_rows'::regclass), "
+        "('ck_contact_lookup_action_results_disposition', "
+        "'public.contact_lookup_action_results'::regclass))"
+    ))).all()}
+    fk = rows["fk_pending_skip_trace_action_tenant"]
+    assert fk.convalidated and fk.confdeltype == "a", "must be validated, ON DELETE NO ACTION"
+    assert fk.condef == (
+        "FOREIGN KEY (action_id, user_id) REFERENCES contact_lookup_actions(id, user_id)")
+    ck = rows["ck_contact_lookup_action_results_disposition"]
+    assert ck.convalidated and "unmatched_unbilled" in ck.condef
+
+
+async def test_a_pending_row_may_name_its_own_accounts_action(db, business_user):
+    job_id, rid = await _job_and_result(db, business_user)
+    action = await _action(db, business_user, job_id)
+    await _pending(db, business_user, job_id, rid, action)
+    await db.commit()
+
+
+async def test_the_scrape_paths_null_action_is_not_checked(db, business_user):
+    job_id, rid = await _job_and_result(db, business_user)
+    await _pending(db, business_user, job_id, rid, None)
+    await db.commit()
+
+
+async def test_a_pending_row_cannot_name_another_accounts_action(db, business_user, starter_user):
+    """The composite key: an action id alone would match any tenant's action."""
+    job_id, rid = await _job_and_result(db, business_user)
+    other_job, _other_rid = await _job_and_result(db, starter_user)
+    foreign = await _action(db, starter_user, other_job)
+    with pytest.raises(Exception, match="fk_pending_skip_trace_action_tenant"):
+        await _pending(db, business_user, job_id, rid, foreign)
+    await db.rollback()
+
+
+async def test_a_pending_row_cannot_name_an_action_that_does_not_exist(db, business_user):
+    job_id, rid = await _job_and_result(db, business_user)
+    with pytest.raises(Exception, match="fk_pending_skip_trace_action_tenant"):
+        await _pending(db, business_user, job_id, rid, str(uuid.uuid4()))
+    await db.rollback()
+
+
+@pytest.mark.parametrize("parent", ["jobs", "users"])
+async def test_deleting_a_job_or_user_with_action_linked_pending_rows_succeeds(
+    db, business_user, parent,
+):
+    """ON DELETE NO ACTION is checked at the END of the statement, after the cascades
+    have removed both the action and its pending rows (consult r2, V5). Run as the
+    owning role, the way retention and account deletion run (never user-scoped)."""
+    job_id, rid = await _job_and_result(db, business_user)
+    action = await _action(db, business_user, job_id)
+    await _pending(db, business_user, job_id, rid, action)
+    await db.commit()
+    target = job_id if parent == "jobs" else business_user.id
+    await db.execute(text(f"DELETE FROM {parent} WHERE id = :id"), {"id": target})
+    left = (await db.execute(text(
+        "SELECT (SELECT count(*) FROM contact_lookup_actions WHERE id = :a), "
+        "       (SELECT count(*) FROM pending_skip_trace_rows WHERE action_id = :a)"
+    ), {"a": action})).one()
+    assert tuple(left) == (0, 0)
+    await db.commit()
+
+
+async def test_an_action_that_owns_pending_rows_cannot_be_deleted_alone(db, business_user):
+    """A pending row is billing evidence: removing its action must fail, not cascade."""
+    job_id, rid = await _job_and_result(db, business_user)
+    action = await _action(db, business_user, job_id)
+    await _pending(db, business_user, job_id, rid, action)
+    await db.commit()
+    with pytest.raises(Exception, match="fk_pending_skip_trace_action_tenant"):
+        await db.execute(text("DELETE FROM contact_lookup_actions WHERE id = :a"), {"a": action})
+    await db.rollback()
+
+
+async def test_unmatched_unbilled_is_a_worker_verdict_the_api_cannot_write(db, business_user):
+    job_id, rid = await _job_and_result(db, business_user)
+    action = await _action(db, business_user, job_id)
+    params = {"id": str(uuid.uuid4()), "a": action, "uid": business_user.id, "r": rid}
+    sql = ("INSERT INTO contact_lookup_action_results (id, action_id, user_id, result_id, "
+           "disposition) VALUES (:id, :a, :uid, :r, 'unmatched_unbilled')")
+    await _as_api(db, business_user)
+    with pytest.raises(Exception, match="disposition"):
+        await db.execute(text(sql), params)
+    await db.rollback()
+    await db.execute(text(sql), params)  # the worker's session: no tenant GUC
+    await db.commit()
+    assert "unmatched_unbilled" not in CONTACT_LOOKUP_API_INITIAL_DISPOSITIONS
+
+
+async def test_the_api_writes_the_quote_snapshot_once_and_can_never_change_it(db, business_user):
+    job_id, _rid = await _job_and_result(db, business_user)
+    await _as_api(db, business_user)
+    aid = str(uuid.uuid4())
+    await db.execute(text(
+        "INSERT INTO contact_lookup_actions (id, user_id, job_id, category, quote_id, "
+        "status, unit_price_cents, currency, pricing_version, quote_snapshot) VALUES "
+        "(:id, :uid, :job, 'new', :q, 'dispatching', 8, 'USD', '2026-06', "
+        " CAST(:snap AS jsonb))"
+    ), {"id": aid, "uid": business_user.id, "job": job_id, "q": f"q-{aid}",
+        "snap": '{"policy": {"pierce_cv_owner_skip_trace_enabled": false}, "examined": 4}'})
+    await db.commit()
+    await _as_api(db, business_user)
+    with pytest.raises(Exception, match="may only stamp dispatched_at"):
+        await db.execute(text(
+            "UPDATE contact_lookup_actions SET dispatched_at = now(), "
+            "quote_snapshot = '{\"examined\": 999}'::jsonb WHERE id = :a"
+        ), {"a": aid})
+    await db.rollback()
+    snap = (await db.execute(text(
+        "SELECT quote_snapshot FROM contact_lookup_actions WHERE id = :a"), {"a": aid})).scalar()
+    assert snap["examined"] == 4
+
+
+async def test_an_action_without_a_snapshot_defaults_to_an_empty_object(db, business_user):
+    job_id, _rid = await _job_and_result(db, business_user)
+    action = await _action(db, business_user, job_id)
+    snap = (await db.execute(text(
+        "SELECT quote_snapshot FROM contact_lookup_actions WHERE id = :a"), {"a": action})).scalar()
+    assert snap == {}
+
+
+def _run_107_upgrade_in(conn) -> None:
+    """Run migration 107's REAL upgrade() on `conn`, inside the caller's transaction,
+    through alembic's own Operations (the same binding a boot migration uses)."""
+    import importlib.util
+    from pathlib import Path
+
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+
+    path = Path(__file__).resolve().parents[1] / "alembic" / "versions" /         "107_contact_lookup_action_link.py"
+    spec = importlib.util.spec_from_file_location("_mig107_replay", path)
+    mig = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mig)
+    with Operations.context(MigrationContext.configure(conn)):
+        mig.upgrade()
+
+
+def _fk_row(conn):
+    return conn.execute(text(
+        "SELECT confdeltype::text, convalidated, pg_get_constraintdef(oid) FROM pg_constraint "
+        "WHERE conname = 'fk_pending_skip_trace_action_tenant' "
+        "AND conrelid = 'public.pending_skip_trace_rows'::regclass"
+    )).one()
+
+
+async def test_107_replays_on_an_applied_schema_and_rebuilds_an_impostor_fk():
+    """A re-run keeps the right FK, and a same-named WRONG one (single-column,
+    CASCADE) is rebuilt, not trusted. All in one transaction, rolled back."""
+    from src.db.session import sync_engine
+
+    with sync_engine.connect() as conn:
+        tx = conn.begin()
+        try:
+            _run_107_upgrade_in(conn)  # replay on the applied schema
+            assert tuple(_fk_row(conn))[0] == "a"
+            conn.execute(text(
+                "ALTER TABLE pending_skip_trace_rows DROP CONSTRAINT fk_pending_skip_trace_action_tenant"))
+            conn.execute(text(
+                "ALTER TABLE pending_skip_trace_rows ADD CONSTRAINT fk_pending_skip_trace_action_tenant "
+                "FOREIGN KEY (action_id) REFERENCES contact_lookup_actions(id) ON DELETE CASCADE"))
+            _run_107_upgrade_in(conn)
+            deltype, validated, condef = _fk_row(conn)
+            assert (deltype, validated) == ("a", True)
+            assert condef == ("FOREIGN KEY (action_id, user_id) "
+                              "REFERENCES contact_lookup_actions(id, user_id)")
+        finally:
+            tx.rollback()
+
+
+async def test_107_refuses_a_malformed_existing_quote_snapshot():
+    from src.db.session import sync_engine
+
+    with sync_engine.connect() as conn:
+        tx = conn.begin()
+        try:
+            conn.execute(text(
+                "ALTER TABLE contact_lookup_actions ALTER COLUMN quote_snapshot DROP NOT NULL"))
+            with pytest.raises(RuntimeError, match="quote_snapshot exists but is"):
+                _run_107_upgrade_in(conn)
+        finally:
+            tx.rollback()

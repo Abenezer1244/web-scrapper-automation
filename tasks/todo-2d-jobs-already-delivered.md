@@ -63,7 +63,7 @@ job's rows, not 100 jobs'); unchanged here and out of scope (Codex r2 P2).
 #### Phase A: completion notification (5 files)
 - [x] `src/workers/tasks_helpers/finalize.py` (beside the other completion code; module
       docstring updated, it says emission stays in tasks.py today, Codex r3 P3):
-      `emit_job_completed(job, config, display_count)` builds the detail (scraper_name, county,
+      `emit_job_completed(job, config, job_id, display_count)` builds the detail (scraper_name, county,
       record_count, and `already_delivered` from `breakdown_from_job(job)` when valid) and calls
       `create_notification`. `src/workers/tasks.py` replaces its inline block with this one
       call, so the tested function IS the production emission (no copied logic). Add

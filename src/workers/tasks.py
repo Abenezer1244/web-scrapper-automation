@@ -1454,13 +1454,11 @@ def run_scrape_job(self, job_id: str) -> None:
         # duplicates" with D counting every row that lost its claim, address or not,
         # which is how one run read 12 + 252 = 264 against 265 found (UX F-001).
         # Which rows are leads is only known after enrichment and the plan cap; the
-        # completion line reports it from the done-time breakdown. `len(records)` is
-        # what was scraped, not what was saved: the insert can merge rows.
-        _publish_log(
-            r, job_id, "success",
-            f"{len(records)} records scraped. Checking which are new...",
-            db=db,
-        )
+        # completion line reports it from the done-time breakdown. No count here
+        # either: the found total was logged at "Scrape complete" (= records_found),
+        # and by now `records` is past the living-TOD filter, so repeating
+        # len(records) would print a second, smaller "scraped" number (Codex 2c r3).
+        _publish_log(r, job_id, "success", "Checking which records are new...", db=db)
 
         # ── AUCTION LEADS (trustee_sale) FINALIZE ───────────────────────────────
         # An Auction Lead IS a known Notice-of-Trustee-Sale row; the scraper stamped

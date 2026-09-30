@@ -3408,6 +3408,17 @@ O-C: its own billing PR, and it BLOCKS 2d.
   `base_scraper` → `src.api` → the routers). The api and the worker survived by import order.
   #398 moves the import into the handler, and adds a fresh-interpreter import test over 10
   entry points + every Celery `include` module.
+- **Codex diff review r1: NO-GO, 3 P2, all adopted.**
+  1. Lock order: the script wrote results before pending rows, against the queue's order
+     (pending, then results), which could deadlock a dispatcher tick. `_guarded_write` now
+     locks the lead's pending rows (`FOR UPDATE`, by id), then the result, before any write.
+     New test: while another session holds the pending row, the blocked repair holds NOTHING
+     on the result (a `NOWAIT` lock succeeds).
+  2. The lock test now proves the wait happens INSIDE `lock_job_for_claim` (a pass-through
+     spy around the real function).
+  3. `_PARCEL_RECOVER` is also guarded on `party_name`, because the recovered parcel is chosen
+     from it.
+  Now 30 passed; **mutations 8/8** (+ row locks dropped, + recovery party guard dropped).
 - Local test DB upgraded 105 → 106 (#394's `jobs.breakdown_*`) via `scripts/migrate.py`.
 
 ## Phase 1c - the action, frontend

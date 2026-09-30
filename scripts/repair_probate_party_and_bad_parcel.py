@@ -89,6 +89,11 @@ _ACTION_LINKED = text(
     """
 )
 
+_LOCK_PENDING_THEN_RESULT = (
+    text("SELECT id FROM pending_skip_trace_rows WHERE result_id = :id ORDER BY id FOR UPDATE"),
+    text("SELECT id FROM results WHERE id = :id FOR UPDATE"),
+)
+
 _PARTY_CANDIDATES = text(
     """
     SELECT r.id, r.job_id, r.party_name, r.heirs, r.doc_type, sc.county, sc.state
@@ -226,6 +231,9 @@ _PARCEL_RECOVER = text(
       AND property_state IS NOT DISTINCT FROM :old_state
       AND property_zip IS NOT DISTINCT FROM :old_zip
       AND CAST(enrichment_data AS text) IS NOT DISTINCT FROM :old_enrichment_text
+      -- The recovered parcel was CHOSEN using this party (king_parcel_repair's owner
+      -- match), so a party corrected since the read makes the choice stale (Codex).
+      AND party_name IS NOT DISTINCT FROM :old_party
     """
 )
 
@@ -349,6 +357,11 @@ def _guarded_write(db, row, *, apply: bool, repair: str, stats: dict, journal: s
             _journal(journal, {"repair": repair, "action": "skipped_action_linked",
                                "id": row["id"]})
             return False
+        # The queue's lock order (skip_trace_claim.py): pending rows first, then the
+        # result. The writes below touch them the other way round, so take both
+        # locks up front, or this transaction and a dispatcher tick deadlock.
+        db.execute(_LOCK_PENDING_THEN_RESULT[0], {"id": row["id"]})
+        db.execute(_LOCK_PENDING_THEN_RESULT[1], {"id": row["id"]})
         write()
         db.commit()
         return True
@@ -569,6 +582,7 @@ def repair_bad_parcel(db, *, apply: bool, journal: str,
                     "old_state": row["property_state"],
                     "old_zip": row["property_zip"],
                     "old_enrichment_text": row["enrichment_text"],
+                    "old_party": row["party_name"],
                     "property_address": prop, "mailing_address": mail,
                     "new_enrichment": json.dumps(new_enrichment),
                 })

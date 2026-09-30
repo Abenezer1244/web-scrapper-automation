@@ -138,8 +138,10 @@ def test_recover_update_guards_every_value_it_overwrites():
                   "property_city IS NOT DISTINCT FROM :old_city",
                   "property_state IS NOT DISTINCT FROM :old_state",
                   "property_zip IS NOT DISTINCT FROM :old_zip",
-                  "CAST(enrichment_data AS text) IS NOT DISTINCT FROM :old_enrichment_text"):
-        assert guard in sql
+                  "CAST(enrichment_data AS text) IS NOT DISTINCT FROM :old_enrichment_text",
+                  # The recovered parcel was chosen using the party (owner match).
+                  "party_name IS NOT DISTINCT FROM :old_party"):
+        assert guard in _sql_without_comments(_mod._PARCEL_RECOVER), guard
     assert "SET parcel_id" not in sql
 
 
@@ -393,10 +395,21 @@ async def test_the_open_verdicts_are_real_dispositions():
     assert set(_mod._ACTION_OPEN_VERDICTS) == {"quoted", "newly_queued"}
 
 
-async def test_the_write_waits_for_the_jobs_claim_lock(db, business_user, tmp_path):
+async def test_the_write_waits_for_the_jobs_claim_lock(db, business_user, tmp_path, monkeypatch):
     """While the scrape enqueue (or the action worker) holds this job's claim lock,
-    the repair must wait, then act on what it finds under the lock."""
+    the repair must wait INSIDE lock_job_for_claim, then act on what it finds.
+
+    The script's lock call is wrapped in a pass-through spy (the REAL function runs)
+    so the test proves where the wait happens, not merely that the thread is slow."""
     job, rid = _seed_lead(business_user.id, pending=True)
+    entered, returned = threading.Event(), threading.Event()
+
+    def _spy(session, job_id):
+        entered.set()
+        lock_job_for_claim(session, job_id)
+        returned.set()
+
+    monkeypatch.setattr(_mod, "lock_job_for_claim", _spy)
     stats, done = _stats(), {}
     with system_sync_session() as holder:
         lock_job_for_claim(holder, job)
@@ -407,13 +420,55 @@ async def test_the_write_waits_for_the_jobs_claim_lock(db, business_user, tmp_pa
 
         t = threading.Thread(target=_run)
         t.start()
-        time.sleep(1.5)
-        assert t.is_alive(), "the repair wrote while another writer held the job's claim lock"
+        assert entered.wait(15), "the repair never reached the claim lock"
+        time.sleep(1.0)
+        assert not returned.is_set(), "the claim lock was granted while another writer held it"
+        res, _ = _state(rid)
+        assert res.property_address == "9 WRONG ST"
         holder.commit()  # releases the transaction-scoped advisory lock
+        assert returned.wait(15)
         t.join(30)
     assert done["wrote"] is True
     res, _ = _state(rid)
     assert res.property_address is None
+
+
+async def test_the_repair_locks_the_pending_row_before_the_result(
+    db, business_user, tmp_path, monkeypatch,
+):
+    """The queue's lock order is pending rows, then the result (the dispatcher and the
+    claim both follow it). The repair writes the result FIRST, so without taking both
+    locks up front it would hold the result while waiting on a pending row a dispatcher
+    tick holds: a deadlock. Proof: while another session holds the pending row, the
+    blocked repair must hold NOTHING on the result yet (a NOWAIT lock on it succeeds)."""
+    job, rid = _seed_lead(business_user.id, pending=True)
+    past_claim_lock = threading.Event()
+
+    def _spy(session, job_id):
+        lock_job_for_claim(session, job_id)
+        past_claim_lock.set()
+
+    monkeypatch.setattr(_mod, "lock_job_for_claim", _spy)
+    stats, done = _stats(), {}
+    with system_sync_session() as holder:
+        holder.execute(text("SELECT id FROM pending_skip_trace_rows WHERE result_id = :r FOR UPDATE"),
+                       {"r": rid})
+
+        def _run():
+            with system_sync_session() as s:
+                done["wrote"] = _clear(s, _candidate(s, rid), stats, str(tmp_path / "j.jsonl"))
+
+        t = threading.Thread(target=_run)
+        t.start()
+        assert past_claim_lock.wait(15)
+        time.sleep(1.0)  # the repair is now blocked on the pending row
+        assert t.is_alive()
+        with system_sync_session() as probe:
+            probe.execute(text("SELECT id FROM results WHERE id = :r FOR UPDATE NOWAIT"), {"r": rid})
+            probe.rollback()
+        holder.commit()
+        t.join(30)
+    assert done["wrote"] is True
 
 
 async def test_a_dry_run_reports_an_owned_lead_and_writes_nothing(db, business_user, tmp_path):

@@ -181,3 +181,16 @@ def test_no_line_when_nothing_was_held_or_access_is_full():
 
     assert held_lookup_message("trial", 0, 25) is None
     assert held_lookup_message("full", 3, 25) is None
+
+
+def test_the_held_line_is_published_after_the_enqueue_commit():
+    """_publish_log commits, and the job's claim lock must stay held until the
+    enqueue's own commit (see the fence in tests/test_finalize_fence.py). So the
+    held line must come after that commit, never inside the locked region."""
+    import inspect
+
+    src = inspect.getsource(_enqueue_skip_trace_rows)
+    claim = src.index("claim_skip_trace_rows(db, to_claim")
+    commit = src.index("db.commit()", claim)
+    publish = src.index('_publish_log(r, job_id, "info", _held_line')
+    assert claim < commit < publish

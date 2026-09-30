@@ -2706,6 +2706,7 @@ def _enqueue_skip_trace_rows(
     # What the claim held back because the account may not buy it (trial allowance
     # spent, Starter, frozen, ended). Told to the customer after the commit.
     claim_report: dict = {}
+    _held_line: str | None = None
     if to_claim:
         from src.workers.skip_trace_claim import (
             ClaimUnenforcedError,
@@ -2765,8 +2766,19 @@ def _enqueue_skip_trace_rows(
             else:
                 enqueued_normal += 1
         # Held leads were refused on purpose and are reported to the customer
-        # below; they are not part of this unexplained count.
-        lost = max(0, len(to_claim) - len(claimed) - claim_report.get("held", 0))
+        # below; they are not part of this unexplained count. Only when there IS
+        # a line to explain them: an access value with no message must still
+        # show up here, or the leads would vanish from both logs.
+        if claim_report.get("held"):
+            from src.config import settings as _settings
+            from src.workers.skip_trace_claim import held_lookup_message
+
+            _held_line = held_lookup_message(
+                claim_report.get("access", ""), claim_report["held"],
+                _settings.SKIP_TRACE_TRIAL_CREDIT_ALLOWANCE,
+            )
+        explained = claim_report["held"] if _held_line else 0
+        lost = max(0, len(to_claim) - len(claimed) - explained)
         if lost:
             # Deliberately does NOT say "already claimed". The claim refuses a
             # lead for several reasons -- an active claim elsewhere, a lead that
@@ -2801,16 +2813,9 @@ def _enqueue_skip_trace_rows(
         db.rollback()
         raise
 
-    if claim_report.get("held"):
-        from src.config import settings as _settings
-        from src.workers.skip_trace_claim import held_lookup_message
-
-        _held_line = held_lookup_message(
-            claim_report.get("access", ""), claim_report["held"],
-            _settings.SKIP_TRACE_TRIAL_CREDIT_ALLOWANCE,
-        )
-        if _held_line:
-            _publish_log(r, job_id, "info", _held_line, db=db)
+    if _held_line:
+        # After the commit: _publish_log commits, and the job lock had to stay held.
+        _publish_log(r, job_id, "info", _held_line, db=db)
 
     if _late_settled:
         # Reported only now: this log commits, and until the line above it the

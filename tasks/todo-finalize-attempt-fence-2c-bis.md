@@ -246,3 +246,25 @@ state or delivery effect. OWNER DECIDED 2026-09-28: (2)+(3) ACCEPTED as a docume
   distinguish TERMINAL (should run `_terminal_cleanup` after rollback) from LOST (release
   nothing). Codex fix: one shared decision (reuse `finalize_exit`) at every early return.
 - main moved to fa658ccf: rebase first (then grep for stale names), full suite, Codex r7.
+
+### r6 fixes (2026-09-28, rebased on main fa658ccf; main's only src change was the
+S4-06 `reserve_job_quota` extraction, which does not touch these paths; no stale
+`attempt_started_at`)
+- P1 FIXED `cae6174b`: `_enqueue_skip_trace_rows(..., attempt_token=)`; right after
+  `lock_job_for_claim`, `attempt_state(... FOR UPDATE)`; not owned (lost OR terminal) ->
+  rollback, engineering log only, queue and copy nothing. The row lock holds to the final
+  commit; nothing commits or publishes between the advisory lock and the check; on_begin
+  still fires before the lock. Lock order advisory -> jobs row is safe (no other claimer
+  of that lock touches jobs). `None` = legacy unfenced form (tests/scripts);
+  run_scrape_job passes its token (wiring test). Tests B9: B re-claims inside on_begin
+  (the instant before A's lock), every terminal status, row locked through the claim
+  (NOWAIT from a second session), owner unchanged, wiring. RED proven with the kwarg as
+  a no-op; mutations (fence disabled; commit before the check) caught.
+- P2 FIXED `21436ae4`: one decision `_after_missed_write` (finalize_exit + rollback +
+  `_terminal_cleanup` only when terminal). `_still_ours` delegates; `_fail_attempt`
+  wraps the single `_fail_job` call and all ten fail paths use it (7 duplicate
+  fail-and-notify blocks collapsed); the probing/scraping/enriching status aborts call
+  it. Tests B10 drive run_scrape_job itself with the race injected at its first early
+  return: cancelled -> reservation + claims handed back (RED on old code); lost ->
+  nothing released. Mutations (no cleanup; cleanup for lost too) caught.
+- Next: full suite 8 parts, security review x2, Codex diff r7.

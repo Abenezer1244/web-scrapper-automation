@@ -889,8 +889,10 @@ async def test_107s_constraints_exist_as_defined_and_are_validated(db):
     rows = {r.conname: r for r in (await db.execute(text(
         "SELECT conname, convalidated, confdeltype::text AS confdeltype, "
         "pg_get_constraintdef(oid) AS condef "
-        "FROM pg_constraint WHERE conname IN "
-        "('fk_pending_skip_trace_action_tenant', 'ck_contact_lookup_action_results_disposition')"
+        "FROM pg_constraint WHERE (conname, conrelid) IN ("
+        "('fk_pending_skip_trace_action_tenant', 'public.pending_skip_trace_rows'::regclass), "
+        "('ck_contact_lookup_action_results_disposition', "
+        "'public.contact_lookup_action_results'::regclass))"
     ))).all()}
     fk = rows["fk_pending_skip_trace_action_tenant"]
     assert fk.convalidated and fk.confdeltype == "a", "must be validated, ON DELETE NO ACTION"
@@ -1007,3 +1009,66 @@ async def test_an_action_without_a_snapshot_defaults_to_an_empty_object(db, busi
     snap = (await db.execute(text(
         "SELECT quote_snapshot FROM contact_lookup_actions WHERE id = :a"), {"a": action})).scalar()
     assert snap == {}
+
+
+def _run_107_upgrade_in(conn) -> None:
+    """Run migration 107's REAL upgrade() on `conn`, inside the caller's transaction,
+    through alembic's own Operations (the same binding a boot migration uses)."""
+    import importlib.util
+    from pathlib import Path
+
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+
+    path = Path(__file__).resolve().parents[1] / "alembic" / "versions" /         "107_contact_lookup_action_link.py"
+    spec = importlib.util.spec_from_file_location("_mig107_replay", path)
+    mig = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mig)
+    with Operations.context(MigrationContext.configure(conn)):
+        mig.upgrade()
+
+
+def _fk_row(conn):
+    return conn.execute(text(
+        "SELECT confdeltype::text, convalidated, pg_get_constraintdef(oid) FROM pg_constraint "
+        "WHERE conname = 'fk_pending_skip_trace_action_tenant' "
+        "AND conrelid = 'public.pending_skip_trace_rows'::regclass"
+    )).one()
+
+
+async def test_107_replays_on_an_applied_schema_and_rebuilds_an_impostor_fk():
+    """A re-run keeps the right FK, and a same-named WRONG one (single-column,
+    CASCADE) is rebuilt, not trusted. All in one transaction, rolled back."""
+    from src.db.session import sync_engine
+
+    with sync_engine.connect() as conn:
+        tx = conn.begin()
+        try:
+            _run_107_upgrade_in(conn)  # replay on the applied schema
+            assert tuple(_fk_row(conn))[0] == "a"
+            conn.execute(text(
+                "ALTER TABLE pending_skip_trace_rows DROP CONSTRAINT fk_pending_skip_trace_action_tenant"))
+            conn.execute(text(
+                "ALTER TABLE pending_skip_trace_rows ADD CONSTRAINT fk_pending_skip_trace_action_tenant "
+                "FOREIGN KEY (action_id) REFERENCES contact_lookup_actions(id) ON DELETE CASCADE"))
+            _run_107_upgrade_in(conn)
+            deltype, validated, condef = _fk_row(conn)
+            assert (deltype, validated) == ("a", True)
+            assert condef == ("FOREIGN KEY (action_id, user_id) "
+                              "REFERENCES contact_lookup_actions(id, user_id)")
+        finally:
+            tx.rollback()
+
+
+async def test_107_refuses_a_malformed_existing_quote_snapshot():
+    from src.db.session import sync_engine
+
+    with sync_engine.connect() as conn:
+        tx = conn.begin()
+        try:
+            conn.execute(text(
+                "ALTER TABLE contact_lookup_actions ALTER COLUMN quote_snapshot DROP NOT NULL"))
+            with pytest.raises(RuntimeError, match="quote_snapshot exists but is"):
+                _run_107_upgrade_in(conn)
+        finally:
+            tx.rollback()

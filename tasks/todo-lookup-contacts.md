@@ -3477,6 +3477,12 @@ O-C: its own billing PR, and it BLOCKS 2d.
     - REPLAY on an applied schema (`stamp 106` + migrate) succeeds;
     - an IMPOSTOR FK (single-column, CASCADE) is rebuilt to the composite NO ACTION FK;
     - a WRONG column (nullable) aborts at 106, and once fixed it migrates to 107.
+- **Codex r2: GO**, plus 2 P3s, both done:
+  - the constraint test is scoped by `conrelid`;
+  - real-DB replay tests run 107's REAL `upgrade()` through alembic `Operations` inside one
+    rolled-back transaction: a replay on the applied schema; an impostor FK rebuilt; a
+    malformed `quote_snapshot` refused.
+  Mutation: with the impostor check disabled, the replay test FAILS. 15 tests for 107.
 - **Regression: 726 passed, 0 failed** (every test file that writes pending rows or the
   ledger, 2 chunks). ruff clean. No type checker is configured.
 

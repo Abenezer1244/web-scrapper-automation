@@ -153,6 +153,26 @@ async def test_live_drop_count_is_unknown(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("bad", [
+    {"breakdown_over_quota": None},   # partial snapshot
+    {"breakdown_new": 3},             # does not add up / does not match the bill
+])
+async def test_results_shows_nothing_for_a_rejected_snapshot_not_the_live_rows(
+    client: AsyncClient, db, starter_user, starter_token, scraper_config, caplog, bad,
+):
+    """Codex 2c r4: a stored snapshot that fails validation is not 'absent'. The
+    live partition (here a backfill that reconciles on its own) must not stand in
+    for it: the page would show post-backfill numbers as the run's own."""
+    job_id = await _job(db, starter_user, scraper_config, **_snapshotted(**bad))
+    await _rows(db, job_id, starter_user.id, LIVE_ROWS)
+
+    with caplog.at_level(logging.WARNING):
+        body = await _results(client, job_id, starter_token)
+    assert (body["breakdown"], body["breakdown_basis"]) == (None, None)
+    assert any("breakdown rejected" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("job_kw", [
     {"status": "enriching", "records_found": 5},   # not finished
     {"records_found": 3},                          # 4 saved, only 3 found

@@ -135,17 +135,20 @@ def _undelivered_run_409() -> HTTPException:
     )
 
 
-def _snapshot_breakdown(job: Job) -> RunBreakdown | None:
-    """The run-count breakdown the worker froze on this row, if it validates.
+def _snapshot_breakdown(job: Job) -> tuple[RunBreakdown | None, bool]:
+    """The run-count breakdown the worker froze on this row, and whether a stored
+    one was REJECTED.
 
     A stored snapshot that does not add up cannot happen by construction; if one
     ever does, nothing is shown rather than numbers that contradict each other, and
-    the reason is logged (ids only, no row data).
+    the reason is logged (ids only, no row data). Rejected is not "absent": the
+    caller must not fall back to the live partition for it, which could show
+    post-backfill numbers in place of the run's own (fail closed, Codex 2c r4).
     """
     values, problem = breakdown_from_job(job)
     if problem is not None:
         _logger.warning("Job %s: stored run-count breakdown rejected (%s)", job.id, problem)
-    return RunBreakdown(**values) if values is not None else None
+    return (RunBreakdown(**values) if values is not None else None), problem is not None
 
 
 def _job_response(job: Job, config: ScraperConfig | None) -> JobResponse:
@@ -156,7 +159,7 @@ def _job_response(job: Job, config: ScraperConfig | None) -> JobResponse:
     Results page could not tell an auction-lead job (its "Notice Date" header).
     """
     resp = JobResponse.model_validate(job)
-    resp.breakdown = _snapshot_breakdown(job)
+    resp.breakdown, _rejected = _snapshot_breakdown(job)
     resp.breakdown_basis = "snapshot" if resp.breakdown is not None else None
     if config is not None:
         resp.scraper_name = config.name
@@ -953,9 +956,10 @@ async def get_results(
     # partition read now (one aggregate, scoped by job AND user on this RLS session).
     # Only for a finished run: before `done`, records_found is written ahead of the
     # filter and the saves, so rows still on their way would read as "not saved".
-    breakdown = _snapshot_breakdown(job)
+    # A REJECTED stored snapshot shows nothing: never the live partition in its place.
+    breakdown, rejected = _snapshot_breakdown(job)
     breakdown_basis = "snapshot" if breakdown is not None else None
-    if breakdown is None and job.status == "done":
+    if breakdown is None and not rejected and job.status == "done":
         live, _why = live_breakdown(
             await read_partition_async(db, job_id, current_user.id),
             status=job.status,

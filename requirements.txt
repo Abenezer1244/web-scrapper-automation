@@ -58,7 +58,6 @@ pypdf==6.16.1                # NTS Tier 1: extract text from Pacific Publishing 
 # and the response shape it reads back (Message.content/.usage, Usage.input_tokens /
 # .output_tokens, TextBlock.text). All present. NOTE: 1.x dropped `temperature` from
 # the create() signature (no **kwargs) — we never passed it, but adding it will fail.
-anthropic==1.3.0
 
 # CAPTCHA solving (2Captcha)
 2captcha-python==1.5.0

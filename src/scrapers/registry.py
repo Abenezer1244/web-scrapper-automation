@@ -54,8 +54,7 @@ def pick_connector(connectors, record_type: str):
 
     The first, oldest by ``(created_at, id)``, whose ``record_types`` lists the
     record type (case-insensitive); None if none does. The ONE statement of the
-    rule: the worker resolves its scraper with it, and run eligibility uses it to
-    decide whether a run is AI usage, so the two cannot disagree. The order is
+    rule the worker resolves its scraper with. The order is
     explicit because the lookup used to have none, which made a county with two
     connectors for one record type resolve to whichever row Postgres returned.
     """

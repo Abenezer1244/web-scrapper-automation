@@ -45,7 +45,6 @@ PINNED = {
     "TRACERFY_API_TOKEN": "",
     "CAPTCHA_ENABLED": "false",
     "REGRID_ENABLED": "false",
-    "AI_ENRICHMENT_ENABLED": "false",
     "RETENTION_PURGE_ENABLED": "false",
     "RETENTION_PURGE_DRY_RUN": "true",
 }

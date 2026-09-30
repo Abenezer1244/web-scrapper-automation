@@ -19,6 +19,76 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-30 — The audit queue closed, the egress proxy on, and AI mode on its way out
+
+> Owner: "complete the rest now". Decisions taken this session:
+> - remove AI mode completely;
+> - S4-07 stays as is;
+> - probe the egress proxy gently, then turn it on;
+> - rename 'ai' to 'template';
+> - lift the AI cap and update the legal pages.
+>
+> Handoff: `docs/HANDOFF-remaining-2026-09-30.md`.
+
+**Built / Shipped (all merged and live):**
+- **#397 (5b-ii):** the PACS, AcclaimWeb-PACS and Tracerfy sessions are pinned. The test reproduces
+  real DNS rebinding: the real validator sees a public answer, the connect sees loopback. On main
+  all 4 sites connected to the internal listener.
+- **#399 (4b-ii):** the customer is told when contact lookups were held (trial allowance, frozen,
+  ended), and held leads leave the ops "lost" count.
+- **D5-03:** `SCRAPER_EGRESS_PROXY_ENABLED=true` on the worker. Before that, one landing-page load
+  per portal host went through the real browser and proxy: 29 browser hosts plus 6 code-only hosts.
+  The proxy refused nothing but Chromium's own push channel (`mtalk.google.com:5228`).
+- **#401 + bridgeleads-web#170 (AI removal Phase 1):** the monthly AI run cap is gone.
+  `ai_limit` has left the contract, and the evaluator makes 2 queries instead of up to 6.
+- **#403 (Phase 2a):** readers accept scraper_mode 'template' and 'ai'. Writers are unchanged.
+- **#407:** PyJWT 2.15.0 (CVE-2026-101918). 2.15.1 was not taken: it re-accepts `=` padding.
+
+**Tried / Decided:**
+- "AI mode" is not an LLM. It is URL-matched recorder templates, used by 17 of the 30 live
+  connectors, so removing it means renaming the mode, not deleting counties. Production already had
+  `AI_ENRICHMENT_ENABLED=false`, so nothing called Claude.
+- The rename ships in three deploys (Codex consult r1 and r2 both FAILED the two-step version,
+  because of mixed-version workers): 2a read-both, then 2b switch writers and migrate, then 2c
+  retire 'ai' after the frontend stops sending it and 7 days of zero 'ai'.
+- The D5-03 failures were not the proxy:
+  - `classifieds.columbian.com` gave a transient Cloudflare 522 and then 200.
+  - `data.kingcounty.gov` is slow through the browser, but it is only fetched over HTTP.
+
+**Failed / Blocked:**
+- The auto-mode classifier blocked two merges until the owner re-authorized them.
+- `gh` lost its connection to api.github.com mid-poll once.
+- A quiet check died on a Railway "error decoding response body". Each time: no counts, no merge;
+  re-run.
+- Another session's merges forced three extra CI rounds (#399, #401, #403). A cross-session slot
+  protocol ("message before merge; first green merges") stopped the collisions.
+- **`.venv-schema` is broken** (built on the removed anaconda Python). `bl-rescat-venv` reproduces
+  main's OpenAPI exactly (`export_openapi --check` OK), so it served instead.
+- PyJWT struck twice in one day: 10 CVEs on 2.13.0 (#391), then one more on 2.14.0 (#407).
+
+**Caught & fixed:**
+- Codex 5b-ii r1 P1: the first tests used a literal loopback IP and proved nothing about rebinding.
+- A textual merge left `_held_line` defined only inside `if to_claim:`, so an empty claim would have
+  raised NameError. Caught while rewriting for Codex's P3.
+- Main-proofs that failed on the import of a new helper were not behaviour proofs. The imports were
+  moved inside the tests that need them, then the proofs were re-run.
+- The Phase 3 guard test caught my own docstring naming the deleted module.
+
+**Pending / Handoff:** see the handoff doc.
+- #404 (Phase 3, delete the LLM code) is open with Codex PASS; it merges after the other session's
+  #406.
+- Then 2b (migration number 108 or later: 107 is taken), Phase 4 frontend copy, 4L legal
+  (counsel OK), 2c after 7 days, and Phase 5 docs.
+- The Douglas PACS host `pacs.co.douglas.wa.us` no longer resolves.
+
+**Facts learned:**
+- The egress proxy works for every browser portal host we scrape.
+- `data.kingcounty.gov` and `data.seattle.gov` are HTTP-API sources, not browser ones.
+- Every PyJWT decode here is HS256 with the algorithm pinned, so the JWK-client CVEs do not reach
+  us. Tokens minted by one version verify under the next.
+
+---
+
 ## 2026-09-28..30 — UX 2c-bis + 2c: finalization fenced to the owning attempt, and a run's numbers now agree
 
 > Owner asked: finish 2c-bis (fence finalization to the attempt that owns the job), deploy and

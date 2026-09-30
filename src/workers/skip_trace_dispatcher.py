@@ -284,10 +284,12 @@ def _dispatch_tick() -> dict:
         # Never pay for a lead that will not be delivered: cancel queued rows whose
         # job failed or was cancelled, or whose lead is over quota, a same-run sibling,
         # or no longer waiting on a trace.
-        # The sweep no longer commits or swallows its own failure (15-5): the
-        # transaction boundary lives here, at the caller, which is what lets
-        # Phase 1b-2 add the action-disposition and audit writes to this SAME
-        # transaction. `swept is None` keeps its existing meaning of "the sweep
+        # The sweep does not commit or swallow its own failure (15-5): the
+        # transaction boundary lives here, at the caller. It changes ONLY queue and
+        # result rows. A contact-lookup action's verdict for a cancelled lead
+        # ('released') is DERIVED later by the action reconciler from the pending
+        # row, which carries the action_id (Phase 1b-2, S1); do not add action
+        # writes here. `swept is None` keeps its existing meaning of "the sweep
         # failed", which the compliance gate immediately below depends on.
         swept: int | None
         try:
@@ -864,13 +866,16 @@ def _cancel_undeliverable_queued(db) -> int:
     """Cancel queued rows that must never be paid for. Returns rows cancelled.
 
     DOES NOT COMMIT, and does not swallow its own failure: it raises, and the
-    caller owns both the transaction and what a failure means for the tick.
-    That is not tidiness (Codex round 15, finding 15-5). From Phase 1b-2 a
-    cancelled row must also move its contact-lookup-action disposition to
-    'released' and append its audit event IN THE SAME TRANSACTION -- otherwise a
-    crash between the two leaves an action reading "still looking" forever while
-    the queue row is already gone, or an audit that disagrees with the queue.
-    A helper that commits underneath its caller makes that atomicity impossible.
+    caller owns both the transaction and what a failure means for the tick
+    (Codex round 15, finding 15-5).
+
+    It writes queue and result rows ONLY. Phase 1b-2 settled on DERIVED
+    settlement (S1, Codex consult r1-r3): a cancelled pending row keeps its
+    `action_id`, and the contact-lookup action reconciler maps `cancelled` to
+    the action verdict 'released', with its event, in the reconciler's own
+    transaction. The pending row IS the per-lead truth, so nothing can
+    disagree. Adding action writes here would turn this live paid path into a
+    second writer of the action ledger; do not.
 
     A queued row is cancelled when its job ended failed/cancelled without billing
     (and after billing was stamped, see _job_undelivered_sql), or its lead is

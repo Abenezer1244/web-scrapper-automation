@@ -800,7 +800,7 @@ def test_run_scrape_job_fences_the_skip_trace_enqueue():
     locked = enq[enq.index("lock_job_for_claim(db, job_id)"):]
     fence = locked.index("attempt_state(db, job_id, job.user_id, attempt_token)")
     assert "_publish_log(" not in locked[:fence] and "commit()" not in locked[:fence]
-    assert fence < locked.index("claim_skip_trace_rows(db, to_claim)")
+    assert fence < locked.index("claim_skip_trace_rows(db, to_claim")  # args may follow
 
 
 # ── B10 early returns: terminal is cleaned up, lost releases nothing (Codex diff r6 P2) ──

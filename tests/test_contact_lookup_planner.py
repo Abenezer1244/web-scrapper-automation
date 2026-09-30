@@ -503,6 +503,100 @@ async def test_what_only_the_worker_can_see_makes_the_quote_an_upper_bound(
     assert queued <= quoted
 
 
+# ── The trial credit cap (audit S3-03 / S4-01: a trial's lifetime allowance) ─
+
+
+def test_the_planners_credit_table_is_the_workers():
+    """Restated in the planner because importing `src.workers` builds the Celery app."""
+    from src.workers.skip_trace_capacity import CREDITS_PER_ROW
+
+    assert planner.CREDITS == dict(CREDITS_PER_ROW)
+
+
+def test_a_credit_cap_stops_at_the_allowance():
+    rows = _ordered(30)
+    w = plan_window(rows, POLICY_OFF, credit_cap=25)
+    assert w.quoted_ids == [r.id for r in rows[:25]]
+    assert (w.quoted_credits, w.stopped, w.over_credit_cap) == (25, "credit_cap", 0)
+    assert w.credit_cap == 25
+    assert plan_window(rows, POLICY_OFF).credit_cap is None
+
+
+def test_a_lead_that_does_not_fit_is_skipped_and_a_cheaper_one_still_fits():
+    """The claim's rule: in order, keep a lead when its cost fits the room left."""
+    advanced = _ordered(13, party_name=None)  # 2 credits each
+    t = advanced[-1].created_at
+    normal = _row(created_at=t + timedelta(seconds=1))  # 1 credit
+    w = plan_window([*advanced, normal], POLICY_OFF, credit_cap=25)
+    assert w.quoted_ids == [r.id for r in advanced[:12]] + [normal.id]
+    assert (w.quoted_credits, w.advanced_count, w.over_credit_cap) == (25, 12, 1)
+    assert w.stopped == "credit_cap"
+
+
+def test_a_credit_cap_of_zero_quotes_nothing():
+    w = plan_window(_ordered(3), POLICY_OFF, credit_cap=0)
+    assert (w.quoted_ids, w.stopped, w.examined) == ([], "credit_cap", 1)
+
+
+def test_no_credit_cap_counts_credits_but_never_stops_on_them():
+    rows = _ordered(3) + _ordered(2, party_name=None)
+    w = plan_window(rows, POLICY_OFF)
+    assert (len(w.quoted_ids), w.quoted_credits, w.stopped) == (5, 7, None)
+
+
+async def test_the_credit_cap_keeps_exactly_what_the_real_claim_keeps_for_a_trial(
+    db, business_user, monkeypatch,
+):
+    """Give the REAL `claim_skip_trace_rows` every quotable lead of the window, in
+    window order (the order the 1b-2 worker will hand it), for a trial account with
+    nothing used yet: what it keeps is what the planner quotes under the allowance."""
+    from src.scrapers.enrichment.skip_trace import build_pending_row_payload
+    from src.workers.skip_trace_claim import (
+        ACCESS_TRIAL,
+        claim_skip_trace_rows,
+        lock_job_for_claim,
+        paid_lookup_access,
+    )
+
+    monkeypatch.setattr(settings, "SKIP_TRACE_TRIAL_CREDIT_ALLOWANCE", 7)
+    await db.execute(text(
+        "UPDATE users SET plan = 'pro', subscription_status = NULL, "
+        "trial_ends_at = now() + interval '7 days' WHERE id = :u"), {"u": business_user.id})
+    await db.commit()
+    job = _job(business_user.id)
+    # Allowance 7: advanced (2), normal (3), advanced (5), advanced (7), then the room
+    # is 0, so the last advanced and the last normal are both held. Each row gets its
+    # own created_at: rows of one transaction share it, and the window would then
+    # order them by random id, making the sequence (and the credits) vary per run.
+    t0 = datetime(2026, 9, 1, tzinfo=UTC)
+    kinds = [None, _PARTY, None, None, None, _PARTY]
+    specs = [{"party_name": p, "created_at": t0 + timedelta(seconds=i)}
+             for i, p in enumerate(kinds)]
+    _seed(business_user.id, job, specs)
+
+    window = await plan_tab_window(db, job, business_user.id, "new", _today(), POLICY_OFF,
+                                   credit_cap=settings.SKIP_TRACE_TRIAL_CREDIT_ALLOWANCE)
+
+    with system_sync_session() as s:
+        user = s.execute(text(
+            "SELECT id, plan, is_admin, subscription_status, trial_ends_at, "
+            "entitlement_ends_at, entitlement_grace_ends_at FROM users WHERE id = :u"
+        ), {"u": business_user.id}).one()
+        assert paid_lookup_access(user) == ACCESS_TRIAL  # the case is real
+        rows = s.execute(select(Result).where(Result.job_id == job)
+                         .order_by(Result.created_at, Result.id)).scalars().all()
+        lock_job_for_claim(s, job)
+        report: dict = {}
+        claimed = claim_skip_trace_rows(
+            s, [build_pending_row_payload(r) for r in rows], report=report)
+        s.rollback()  # nothing is kept: the claim is only the oracle here
+
+    assert report["access"] == ACCESS_TRIAL
+    assert sorted(claimed) == sorted(window.quoted_ids)
+    assert window.quoted_credits == 7
+    assert report["held"] == len(rows) - len(claimed)
+
+
 # ── Pricing ──────────────────────────────────────────────────────────────────
 
 

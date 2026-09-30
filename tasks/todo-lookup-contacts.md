@@ -3483,6 +3483,9 @@ O-C: its own billing PR, and it BLOCKS 2d.
     rolled-back transaction: a replay on the applied schema; an impostor FK rebuilt; a
     malformed `quote_snapshot` refused.
   Mutation: with the impostor check disabled, the replay test FAILS. 15 tests for 107.
+- **Codex r3: GO.** A P3 is accepted as a fact: the replay tests hold DDL locks inside their
+  rolled-back transaction, which a PARALLEL run sharing the DB could block on. The suite runs
+  serially (local rig and CI).
 - **Regression: 726 passed, 0 failed** (every test file that writes pending rows or the
   ledger, 2 chunks). ruff clean. No type checker is configured.
 

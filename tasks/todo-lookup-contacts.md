@@ -3296,7 +3296,57 @@ order. These AMEND the sections above:
 - **2d** confirm (5).
 - **2e** status (5).
 
+### Codex pre-code consult r2 (2026-09-30): PLAN: REVISE, 3 P1 + 4 P2; V5, V6 confirmed
+Output: `<scratchpad 49da3c50>/codex_1b2_consult_r2_out.txt`. Codex confirmed that a
+non-deferred `NO ACTION` is checked at END of statement, after cascades. It also confirmed that
+cascaded deletes fire the 101 BEFORE DELETE guards as the deleting role, so the V5 tests delete
+as the system/owner role. And it confirmed that `quote_snapshot` is insertable by the API and
+frozen on UPDATE. These AMEND V1-V8:
+- **W1 (P1) The lease is committed, and the claim is fenced by it.**
+  - T1: the start CAS `dispatching→running` (token, expiry, `started_at`, event) COMMITS alone,
+    so a crashed worker leaves a visible expiring lease for the reconciler.
+  - T2 (fresh transaction):
+    1. `SELECT ... FOR UPDATE` the action;
+    2. re-check `status='running' AND lease_token=:mine AND lease_expires_at > now()`;
+    3. `lock_job_for_claim`, then the claim and the verdicts, then `claimed` + the lease
+       cleared;
+    4. ONE commit.
+  - A lost fence means a no-op. Every fail / wait / abandon transition is its own committed
+    transaction. Test: kill the worker between T1 and T2; the reconciler recovers it.
+- **W2 (P1) The 2-0 repair-script gate, exactly.** Per job, in the transaction that writes:
+  `lock_job_for_claim(job)` → RE-READ the rows → refuse (skip + report) any pending row with
+  `action_id IS NOT NULL` and any result with a non-terminal action verdict → write → commit.
+  Tests on real rows: an action-linked row is never touched; an unlinked one is repaired.
+- **W3 (P1) Unmatched mirrors what billing DID, and billing's own rule has a latent gap.**
+  - The reconciler calls the SAME extracted `queue_accepted_all(db, queue_id)` as
+    `report_usage_from_webhook`, so the action page always agrees with what Stripe received.
+  - Codex found the gap, and I verified it: the rows actually SENT (`len(claimed)`,
+    `skip_trace_dispatcher.py:1510-1528`) are never persisted. `_persist_submission` allows
+    `moved < claimed` (alert only, `:1576-1578`). `accepted_all` compares `rows_uploaded` with
+    the rows STAMPED with the queue id. So in a partial-bookkeeping batch, unmatched rows can be
+    billed although a row was dropped.
+  - That is a PRE-EXISTING live billing edge case (rare: it needs the partial-bookkeeping alert
+    to have fired). It is NOT introduced here. → **Owner item O-C.**
+- **W4 (P2) V7 wording corrected.** The `writes` zone is a shared per-user 30/min limit with a
+  bounded per-process fallback when Redis fails (not a hard fail-closed). Confirm passes
+  `identifier=current_user.id`.
+- **W5 (P2) The claim reports WHICH leads it held.** `report["held_ids"]` (the result ids the
+  trial room held, in order) alongside `report["held"]` (the count, unchanged), so the worker
+  writes a per-lead `ineligible` + `trial_allowance` event. In 2a.
+- **W6 (P2) The claim proves action ↔ job.** With `action_id`, the insert JOINs
+  `contact_lookup_actions a ON a.id = :action_id AND a.user_id = v.user_id AND a.job_id =
+  v.job_id`: a pending row can never be attributed to another job's action. In 2a. Test: an
+  action of job A handed leads of job B claims nothing.
+- **W7 (P2) One state machine, both writers.** `ACTION_TRANSITIONS`, `VERDICT_TRANSITIONS` and
+  `_move()` live in the worker module (`contact_lookup_action.py`), and the 2c reconciler
+  IMPORTS them, so there is no second copy and no 6th file.
+
 ### Owner items (before code)
+- **O-C** (billing, pre-existing, found by the consult) Persist `skip_trace_queues.rows_sent`
+  at submission and compare `rows_uploaded` against it in `accepted_all`. With a mismatch, or
+  with no `rows_sent` (old rows), bill `completed` only. It's a live billing change: a
+  migration, the dispatcher and billing, its own PR. **Recommend fixing it BEFORE 2d** (confirm
+  is what adds volume). Not blocking 2-0/2a/2b/2c.
 - **O-A** Should the confirm endpoint (2d) go live before the frontend (1c) ships? It's
   reachable only by an authenticated paying account and gated like the quote. The alternative
   is a feature flag: `settings.py` + `.env.example`, over the 5-file rule, a split.

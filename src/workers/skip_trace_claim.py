@@ -95,6 +95,30 @@ ACCESS_FROZEN = "frozen"
 ACCESS_ENDED = "ended"
 BLOCKED_ACCESS = frozenset({ACCESS_STARTER, ACCESS_FROZEN, ACCESS_ENDED})
 
+
+def held_lookup_message(access: str, held: int, trial_allowance: int) -> str | None:
+    """The customer's job-log line for leads the claim HELD (audit #4 4b-ii), or None.
+
+    Says why, and nothing more. It must not promise a later lookup: nothing
+    re-queues a held lead, because enqueue is job-scoped, so a lead held here is
+    looked up only if a later run of a scraper delivers it again.
+    """
+    if held <= 0 or access not in (ACCESS_TRIAL, *BLOCKED_ACCESS):
+        return None
+    head = f"Contact lookups were not run for {held} lead(s): "
+    if access == ACCESS_TRIAL:
+        if trial_allowance <= 0:
+            return head + ("your free trial does not include contact lookups. "
+                           "Paid plans include contact lookups for new leads.")
+        return head + (f"your free trial includes up to {trial_allowance} lookup credits, "
+                       "and not enough remain for these leads. Paid plans include "
+                       "contact lookups for new leads.")
+    if access == ACCESS_FROZEN:
+        return head + "your account is frozen because a payment did not go through."
+    if access == ACCESS_ENDED:
+        return head + "your paid plan has ended."
+    return head + "your plan does not include contact lookups."
+
 # The users columns the rule reads. One list, so the claim and the dispatcher
 # cannot read different facts.
 ACCESS_COLUMNS = (
@@ -484,9 +508,11 @@ def claim_skip_trace_rows(db, payloads: list[dict], *, report: dict | None = Non
 
     CLAIMS ONLY WHAT THE ACCOUNT MAY BUY (`paid_lookup_access`): nothing for a
     Starter, frozen or ended account, and for a trial only what fits in the rest
-    of its lifetime allowance. A held lead stays 'not_attempted', so a run after
-    the customer subscribes looks it up. `report`, when given, receives
-    ``access`` and ``held`` (leads held by this rule, not by the insert).
+    of its lifetime allowance. A held lead stays 'not_attempted'. Nothing
+    re-queues it: enqueue is job-scoped, so it is looked up only if a later run
+    delivers it again. `report`, when given, receives ``access`` and ``held``
+    (leads held by this rule, not by the insert); the caller tells the customer
+    with `held_lookup_message`.
 
     Does NOT commit. The caller owns the transaction.
     """

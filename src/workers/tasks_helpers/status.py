@@ -11,7 +11,7 @@ import random
 import threading
 import time
 from datetime import UTC, datetime
-from typing import TypedDict, Unpack
+from typing import Literal, NamedTuple, TypedDict, Unpack
 
 import redis as sync_redis
 from sqlalchemy import text
@@ -23,6 +23,51 @@ from src.utils.logger import setup_logger
 from src.workers.tasks_helpers.dedup import BILLING_STAMP_RELIABLE_SINCE
 
 _logger = setup_logger("worker.task")
+
+
+class AttemptToken(NamedTuple):
+    """Which attempt of a job a worker is running: what its claim stamped.
+
+    ``started_at`` alone was the token everywhere, and it is a wall-clock value. The
+    pair is unique per claim by construction, with no clock argument: a claim needs
+    ``status='pending'``, and the only two writes that put a CLAIMED job back to
+    pending (the watchdog re-queue and ``_retry_scrape_job``) both increment
+    ``retry_count``. So two claims of one job never share a ``retry_count``, and a
+    stale attempt whose timestamp happens to match a newer one's is still refused.
+    ``retry_count`` never changes during an attempt: only those re-pends change it.
+    """
+
+    started_at: datetime
+    retry_count: int
+
+
+def _attempt_parts(expected) -> tuple:
+    """(started_at, retry_count or None). A bare datetime is the legacy token form,
+    kept for callers that predate AttemptToken; every production caller in
+    run_scrape_job passes the token."""
+    if isinstance(expected, AttemptToken):
+        return expected.started_at, expected.retry_count
+    return expected, None
+
+
+def _attempt_clauses(expected) -> list:
+    """ORM predicates pinning a write to one attempt (both halves of a token)."""
+    from src.db.models import Job
+
+    started_at, retry_count = _attempt_parts(expected)
+    clauses = [Job.started_at == started_at]
+    if retry_count is not None:
+        clauses.append(Job.retry_count == retry_count)
+    return clauses
+
+
+def _attempt_sql(expected) -> tuple[str, dict]:
+    """Raw-SQL twin of _attempt_clauses: a fragment over `jobs` and its binds."""
+    started_at, retry_count = _attempt_parts(expected)
+    if retry_count is None:
+        return "started_at = :att_sa", {"att_sa": started_at}
+    return ("started_at = :att_sa AND retry_count = :att_rc",
+            {"att_sa": started_at, "att_rc": retry_count})
 
 #: Is the grant this job is holding still sitting in the user's counter?
 #:
@@ -197,7 +242,7 @@ def _set_status(
 
     where = [Job.id == job.id, Job.status.not_in(_TERMINAL_STATUSES)]
     if expected_started_at is not None:
-        where.append(Job.started_at == expected_started_at)
+        where.extend(_attempt_clauses(expected_started_at))
     rowcount = db.execute(
         _sa_update(Job).where(*where).values(status=status, **kwargs)
     ).rowcount
@@ -293,7 +338,7 @@ def _set_progress(
             .where(
                 Job.id == job.id,
                 Job.status.not_in(_TERMINAL_STATUSES),
-                Job.started_at == expected_started_at,
+                *_attempt_clauses(expected_started_at),
             )
             .values(**kwargs)
         ).rowcount
@@ -624,15 +669,16 @@ def _fail_job(db, job, r, job_id: str, reason: str, expected_started_at=None) ->
             job_id, str(exc)[:200],
         )
     # Attempt-scoped no-op: when expected_started_at was supplied and the CAS did
-    # NOT fire, a NEWER attempt re-claimed this job (started_at moved). Suppress the
+    # NOT fire, the attempt token changed (a newer attempt re-claimed, or the job was
+    # re-queued for one). Suppress the
     # failure log + 'failed' SSE so a superseded attempt can't emit a false failure
     # against the live newer attempt (Codex P2). Unscoped callers are unchanged:
     # there cas_ok=False means the job was already terminal, where re-publishing the
     # failure is harmless/expected.
     if expected_started_at is not None and not cas_ok:
         _logger.info(
-            "Job %s: fail suppressed — attempt superseded by a newer one "
-            "(started_at moved); not emitting a failure event", job_id,
+            "Job %s: fail suppressed: the attempt token changed; not emitting a "
+            "failure event", job_id,
         )
         return cas_ok
     # Publish the failure log via a fresh session (db=None) so it
@@ -684,11 +730,24 @@ def claim_job_for_attempt(db, job_id: str):
     UPDATE proves only that the test's own SQL works: deleting the heartbeat stamp
     from the real claim would leave such a test green (Codex).
     """
+    token = claim_attempt(db, job_id)
+    return token.started_at if token is not None else None
+
+
+def claim_attempt(db, job_id: str) -> AttemptToken | None:
+    """The claim above, returning the whole attempt token (see AttemptToken).
+
+    ``started_at`` and ``retry_count`` both come from the claim UPDATE's own
+    RETURNING, so they are the values of the row this attempt won, never a separate
+    read that could see a later one. started_at is the database's now() (see
+    claim_job_for_attempt for why). run_scrape_job uses this;
+    ``claim_job_for_attempt`` stays for older callers.
+    """
     from sqlalchemy import func, update
 
     from src.db.models import Job
 
-    claimed_at = db.execute(
+    won = db.execute(
         update(Job)
         .where(Job.id == job_id, Job.status == "pending")
         .values(
@@ -697,10 +756,57 @@ def claim_job_for_attempt(db, job_id: str):
             last_heartbeat_at=func.now(),
             next_retry_at=None,
         )
-        .returning(Job.started_at)
-    ).scalar_one_or_none()
+        .returning(Job.started_at, Job.retry_count)
+    ).first()
     db.commit()
-    return claimed_at
+    return AttemptToken(won.started_at, int(won.retry_count)) if won is not None else None
+
+
+class AttemptState(NamedTuple):
+    owned: bool
+    status: str | None
+
+
+def attempt_state(db, job_id: str, user_id, token) -> AttemptState:
+    """Does ``token`` still own the job? Read from the ROW, locked.
+
+    ``FOR UPDATE`` so the answer and the row cannot move apart before the caller
+    acts on it: the caller holds the lock until it commits or rolls back. Owned =
+    the token matches AND the row is not terminal: a cancel keeps the token, so a
+    match alone is not ownership. A missing row (another tenant's id, or deleted)
+    is never owned.
+    """
+    row = db.execute(
+        text(
+            "SELECT started_at, retry_count, status FROM jobs "
+            "WHERE id = :j AND user_id = CAST(:u AS uuid) FOR UPDATE"
+        ),
+        {"j": str(job_id), "u": str(user_id)},
+    ).first()
+    if row is None:
+        return AttemptState(owned=False, status=None)
+    started_at, retry_count = _attempt_parts(token)
+    owned = (
+        row.started_at == started_at
+        and (retry_count is None or row.retry_count == retry_count)
+        and row.status not in _TERMINAL_STATUSES
+    )
+    return AttemptState(owned=owned, status=row.status)
+
+
+def finalize_exit(state: AttemptState) -> Literal["terminalized", "lost_ownership"] | None:
+    """What finalization does when a fenced write did not land.
+
+    Terminal wins over the token: a job cancelled, failed or finished under this
+    attempt gets today's terminal cleanup, whose releases re-check their own guards.
+    Owned -> None (carry on). Anything else -> another attempt holds, or will hold,
+    the job: this attempt must do nothing more.
+    """
+    if state.status in _TERMINAL_STATUSES:
+        return "terminalized"
+    if state.owned:
+        return None
+    return "lost_ownership"
 
 
 def transient_retry_notice(
@@ -788,6 +894,7 @@ def _retry_scrape_job(
     # portal-wide outage) don't re-hit the portal in lockstep.
     countdown = base + random.randint(0, 60)
 
+    attempt_sql, attempt_params = _attempt_sql(started_at)
     rowcount = db.execute(
         _text(
             "UPDATE jobs SET status='pending', retry_count=retry_count+1, "
@@ -797,11 +904,11 @@ def _retry_scrape_job(
             "units_done=NULL, units_total=NULL, progress_unit=NULL, "
             "last_progress_at=NULL, "
             "next_retry_at = now() + make_interval(secs => :cd) "
-            "WHERE id=:j AND started_at=:sa AND retry_count < :mx "
+            f"WHERE id=:j AND {attempt_sql} AND retry_count < :mx "
             "AND status NOT IN ('done','failed','cancelled') "
             "AND billing_applied_at IS NULL"
         ),
-        {"j": str(job_id), "sa": started_at, "mx": max_retries, "cd": countdown},
+        {"j": str(job_id), "mx": max_retries, "cd": countdown, **attempt_params},
     ).rowcount
     db.commit()
     if rowcount != 1:
@@ -824,11 +931,12 @@ def _retry_scrape_job(
 # and self-reaps — it can't refresh and mask a dead new attempt (Codex). The
 # terminal-status exclusion also means a heartbeat never resurrects a done/
 # failed/cancelled job.
-_HEARTBEAT_SQL = text(
-    "UPDATE jobs SET last_heartbeat_at = now() "
-    "WHERE id = :j AND started_at = :sa "
-    "AND status NOT IN ('done', 'failed', 'cancelled')"
-)
+def _heartbeat_sql(attempt_sql: str):
+    return text(
+        "UPDATE jobs SET last_heartbeat_at = now() "  # noqa: S608 -- splices only _attempt_sql's fixed fragment
+        f"WHERE id = :j AND {attempt_sql} "
+        "AND status NOT IN ('done', 'failed', 'cancelled')"
+    )
 
 # _write_heartbeat result codes.
 _HB_ALIVE = 1     # row updated — job still active and this attempt still owns it
@@ -855,8 +963,9 @@ def _write_heartbeat(job_id: str, started_at) -> int:
 
     try:
         with heartbeat_sync_session() as _db:
+            attempt_sql, attempt_params = _attempt_sql(started_at)
             rowcount = _db.execute(
-                _HEARTBEAT_SQL, {"j": str(job_id), "sa": started_at}
+                _heartbeat_sql(attempt_sql), {"j": str(job_id), **attempt_params}
             ).rowcount
             _db.commit()
             return _HB_ALIVE if rowcount == 1 else _HB_TERMINAL
@@ -984,18 +1093,20 @@ class HeartbeatThread:
 # (the watchdog's re-queue also NULLs it, but it NULLs started_at too, and only
 # for active rows). The heartbeat SQL never writes a cancelled row, so no late
 # beat can undo it. Only 'cancelled' is touched: a done or failed job holds no
-# slot, and its liveness is history worth keeping. Attempt-scoped like the
-# heartbeat, so a superseded worker cannot release the live attempt's slot.
+# slot, and its liveness is history worth keeping. Attempt-scoped with the SAME
+# predicate as the heartbeat (_attempt_sql: started_at AND retry_count), so a
+# superseded worker cannot release the live attempt's slot.
 # A worker that dies before this (deploy, OOM, hard limit) never acknowledges;
 # Job.holds_run_slot then releases the slot once the hard limit has provably
 # killed it.
-_ACK_EXIT_SQL = text(
-    "UPDATE jobs SET last_heartbeat_at = NULL "
-    "WHERE id = :j AND started_at = :sa AND status = 'cancelled'"
-)
+def _ack_exit_sql(attempt_sql: str):
+    return text(
+        "UPDATE jobs SET last_heartbeat_at = NULL "  # noqa: S608 -- splices only _attempt_sql's fixed fragment
+        f"WHERE id = :j AND {attempt_sql} AND status = 'cancelled'"
+    )
 
 
-def _acknowledge_exit(job_id: str, started_at) -> None:
+def _acknowledge_exit(job_id: str, token) -> None:
     """Release a cancelled attempt's run slot now that its worker has stopped.
 
     Never raises anything but a Celery time limit: it runs while the task may be
@@ -1008,7 +1119,8 @@ def _acknowledge_exit(job_id: str, started_at) -> None:
 
     try:
         with heartbeat_sync_session() as _db:
-            _db.execute(_ACK_EXIT_SQL, {"j": str(job_id), "sa": started_at})
+            attempt_sql, attempt_params = _attempt_sql(token)
+            _db.execute(_ack_exit_sql(attempt_sql), {"j": str(job_id), **attempt_params})
             _db.commit()
     except Exception as exc:  # noqa: BLE001 — see docstring
         reraise_time_limit(exc)

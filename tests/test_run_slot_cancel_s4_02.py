@@ -28,7 +28,12 @@ from sqlalchemy import select, text
 from src.api.auth import create_secure_token, hash_password
 from src.db.models import Job, ScraperConfig, User
 from src.db.session import SyncSessionLocal
-from src.workers.tasks_helpers.status import HeartbeatThread, claim_job_for_attempt
+from src.workers.tasks_helpers.status import (
+    AttemptToken,
+    HeartbeatThread,
+    claim_attempt,
+    claim_job_for_attempt,
+)
 
 STOPPING = "This scraper is still stopping. Try again in a few minutes."
 
@@ -76,11 +81,13 @@ def _auth(user) -> dict[str, str]:
 
 
 def _claim(job_id):
-    """The worker's claim, exactly as run_scrape_job makes it."""
+    """The worker's claim, exactly as run_scrape_job makes it: the whole attempt
+    token (started_at, retry_count), which is what run_scrape_job hands to its
+    HeartbeatThread and therefore what the exit acknowledgement is scoped by."""
     with SyncSessionLocal() as s:
-        started = claim_job_for_attempt(s, job_id)
-    assert started is not None
-    return started
+        token = claim_attempt(s, job_id)
+    assert token is not None
+    return token
 
 
 async def _cancel(client, user, job_id) -> None:
@@ -286,12 +293,12 @@ async def test_a_superseded_attempt_cannot_acknowledge_for_the_live_one(
     old_started = _claim(job_id)
     with HeartbeatThread(job_id, interval_s=0.05) as old_hb:
         old_hb.start(old_started)
-        # The watchdog's re-queue (health.py _recovery_cas): back to pending,
-        # attempt token and liveness cleared.
+        # The watchdog's re-queue (health.py _recovery_cas): back to pending, a
+        # retry burned, attempt token and liveness cleared.
         with SyncSessionLocal() as s:
             s.execute(text(
-                "UPDATE jobs SET status = 'pending', started_at = NULL, "
-                "last_heartbeat_at = NULL WHERE id = :j"
+                "UPDATE jobs SET status = 'pending', retry_count = retry_count + 1, "
+                "started_at = NULL, last_heartbeat_at = NULL WHERE id = :j"
             ), {"j": job_id})
             s.commit()
         new_started = _claim(job_id)
@@ -311,7 +318,7 @@ def test_a_failed_acknowledgement_never_masks_the_tasks_own_exception():
     hb = HeartbeatThread("not-a-uuid", interval_s=3600)
     with pytest.raises(RuntimeError, match="the task's own error"):
         with hb:
-            hb.start(datetime.now(UTC))
+            hb.start(AttemptToken(datetime.now(UTC), 0))
             raise RuntimeError("the task's own error")
 
 

@@ -2226,7 +2226,9 @@ def pierce_address_recovery(db, r, job_id: str, config, all_results) -> None:
             )
 
 
-def _enqueue_skip_trace_rows(db, job, r, job_id: str, config, *, on_begin=None) -> None:
+def _enqueue_skip_trace_rows(
+    db, job, r, job_id: str, config, *, on_begin=None, attempt_token=None,
+) -> None:
     """Enqueue eligible Result rows into pending_skip_trace_rows.
 
     Called by run_scrape_job AFTER enrichment AND the plan cap, so the
@@ -2254,6 +2256,9 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config, *, on_begin=None) 
     are enumerated at the call site below. It is therefore correct to read this
     as "this run is about to try", and wrong to read it as "rows were queued":
     the pending rows themselves are the only evidence of that.
+
+    ``attempt_token`` (run_scrape_job's `AttemptToken`) fences the claim to the
+    attempt that owns the job: see the check under the claim lock below.
     """
     # Local imports — sa_select must be imported here because the module-
     # level import is scoped inside _run_inline_enrichment, not globally
@@ -2523,6 +2528,29 @@ def _enqueue_skip_trace_rows(db, job, r, job_id: str, config, *, on_begin=None) 
     from src.workers.skip_trace_claim import lock_job_for_claim
 
     lock_job_for_claim(db, job_id)
+    # ONLY THE ATTEMPT THAT OWNS THE JOB BUYS LOOKUPS FOR IT (2c-bis, Codex diff
+    # r6 P1). The watchdog can re-queue a stalled run while this one is still
+    # alive, and a replacement then owns the job. A stale attempt reaching here
+    # would queue paid lookups and copy cache hits for leads it no longer owns.
+    # `attempt_state` locks the jobs row FOR UPDATE and that lock, like the
+    # advisory one above, holds to the final commit below, so a re-queue cannot
+    # land between this answer and the claim. A terminal job buys nothing either;
+    # its cleanup belongs to whoever finds it terminal. Lock order (advisory, then
+    # jobs row) is safe: no other claimer of this lock touches the jobs row.
+    # `None` is the legacy call form (tests and scripts), unfenced as before;
+    # run_scrape_job always passes its token.
+    if attempt_token is not None:
+        from src.workers.tasks_helpers.status import attempt_state
+
+        if not attempt_state(db, job_id, job.user_id, attempt_token).owned:
+            db.rollback()
+            # Engineering log only: after the rollback, so it cannot release the
+            # lock early, and never published onto the replacement's live stream.
+            _logger.info(
+                "Job %s: attempt token changed or job terminal; not queuing contact "
+                "lookups", job_id,
+            )
+            return
     # Re-read the leads under the lock. The set read before it is stale by now:
     # a concurrent enqueue may have claimed some of them, and the claim's own
     # join would drop those anyway, but re-reading keeps the cache-hit path from

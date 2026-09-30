@@ -44,6 +44,7 @@ ignore = [
 # heuristic can't see the binding. Scoped per-file so the rule stays active elsewhere.
 "src/workers/tasks.py" = ["S608"]
 "src/workers/tasks_helpers/dedup.py" = ["S608"]   # membership/property_key SQL builders moved here from tasks.py
+"src/workers/tasks_helpers/finalize.py" = ["S608"]  # billing/done-CAS moved verbatim from tasks.py: splices only actionable_sql and the quota_window builders (code constants); every value is bound
 "src/workers/trustee_sale_finalize.py" = ["S608"]  # sibling SELECT interpolates only the _GROUP_COLUMNS constant; values bound via params
 # The ONLY interpolation is _RESERVATION_STILL_HELD, a module-level constant that
 # src.api.quota_window builds from literal column names — no parameter, no caller

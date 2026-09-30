@@ -16,12 +16,10 @@ from sqlalchemy import text as sa_text
 from src.api.lead_actionability import (
     DELIVERY_EXCLUDED_KEY,
     OVER_QUOTA,
-    actionable_sql,
     address_actionable_sql,
     is_actionable,
 )
 from src.api.quota_window import (
-    reservation_is_current_sql,
     window_cte_sql,
     window_set_sql,
 )
@@ -68,11 +66,20 @@ from src.workers.tasks_helpers.enrich import (  # noqa: F401  (re-export)
     _run_scraper,
     enrichment_completion_log,
 )
+from src.workers.tasks_helpers.finalize import (  # noqa: F401  (re-export)
+    FinalizeKind,
+    _alert_dedup_release_failed,
+    _release_claims_of_cancelled_job,
+    _terminal_cleanup,
+    finalize_billing_and_done,
+    release_run_claims_if_owned,
+)
 from src.workers.tasks_helpers.status import (
     _DELIVERY_TOKEN_TTL,  # noqa: F401  (re-export)
     _TERMINAL_STATUSES,
     HeartbeatThread,
     JobUpdateFields,  # noqa: F401  (re-export)
+    _attempt_clauses,
     _delivery_download_url,
     _fail_job,
     _now,
@@ -82,7 +89,9 @@ from src.workers.tasks_helpers.status import (
     _set_progress,
     _set_stage,
     _set_status,
-    claim_job_for_attempt,
+    attempt_state,
+    claim_attempt,
+    finalize_exit,
     transient_retry_notice,
 )
 
@@ -93,96 +102,6 @@ _logger = setup_logger("worker.task")
 # times before failing the job rather than stranding a paying user.
 _R2_UPLOAD_ATTEMPTS = 3
 _R2_UPLOAD_BACKOFF = 2  # seconds, multiplied by attempt number (2s, 4s)
-
-
-def _alert_dedup_release_failed(job_id: str, user_id, context: str, exc: Exception) -> None:
-    """A dedup-claim release failed — escalate, never just log.
-
-    ``user_id`` MUST be a plain value (the cached ``_boot_user_id``), never an ORM
-    attribute: every call site runs after ``db.rollback()``, which expires ORM
-    instances, so reading ``job.user_id`` there would emit a refresh SELECT on the
-    session that just failed. If that raised, it would escape the except block and
-    skip the job's real failure handling — an alert must never replace it (Codex).
-
-    Releasing `delivered_records` is what keeps a lead that was NEVER delivered
-    and NEVER billed from being treated as an already-seen duplicate forever. If
-    the release fails, those leads become permanently unreachable for that user:
-    excluded from every future run's results and downloads, silently, while the
-    job tells them "no file was delivered and you were not charged".
-
-    That failure mode was invisible for exactly this reason — the call sites
-    caught the exception and logged it. In production the worker role was missing
-    DELETE on delivered_records, so all five release paths raised
-    InsufficientPrivilege, stranding 16,761 claims with nothing but a log line
-    that had already scrolled out of retention by the time anyone looked.
-
-    send_ops_alert persists a durable row even when OPS_ALERT_EMAIL is unset
-    (which it is in prod), so the incident survives log rotation.
-    """
-    _logger.error(
-        "Job %s: dedup-claim release FAILED (%s) — leads may be permanently "
-        "suppressed as duplicates: %s", job_id, context, str(exc)[:200],
-    )
-    try:
-        from src.workers.ops_alerts import send_ops_alert
-
-        send_ops_alert(
-            "dedup_release_failed",
-            f"{context}:{job_id}",
-            "Dedup-claim release failed. Leads may be permanently suppressed",
-            f"Job {job_id} (user {user_id}) could not release its delivered_records "
-            f"claims on the '{context}' path: {str(exc)[:400]}. "
-            "Those leads were not delivered and not billed, but they remain claimed, "
-            "so future runs will drop them as duplicates. Check that the worker role "
-            "still holds DELETE on delivered_records "
-            "(scripts/_cutover_step2_grants_policies.py), then release them with: "
-            "DELETE FROM delivered_records WHERE first_job_id = <job> AND user_id = <user>;",
-        )
-    except Exception as alert_exc:  # noqa: BLE001 — alerting must never mask the original
-        _logger.error("Job %s: dedup-release alert failed too: %s", job_id, str(alert_exc)[:160])
-
-
-def _release_claims_of_cancelled_job(db, job_id: str, user_id) -> None:
-    """Release every claim a job holds once it has been cancelled mid-run.
-
-    A cancelled run delivers nothing and bills nothing, yet the two paths that
-    notice a cancellation (the force-finalize guard before billing, and the
-    done-CAS losing to a cancel) returned with the job's claims still in place:
-    the ones its dedup step wrote and any it took over from an earlier run. Every
-    later run then hid those leads as "already delivered" with nothing ever
-    delivered. Same defect class as the post-crash cleanup fixed on 2026-09-08,
-    on the two exits that still had it (Codex).
-
-    ``user_id`` must be a plain value, for the reason in _alert_dedup_release_failed.
-
-    The job's state is re-checked INSIDE the delete, not trusted from the caller:
-    both callers only know the job is terminal, and 'done' is terminal too. A
-    stale attempt overlapping a watchdog retry that already completed and billed
-    would otherwise strip a finished job's claims, and the next run would deliver
-    and bill those properties again (Codex). Only a job that is cancelled and was
-    never billed gives its claims up, and only if it was created after billing
-    was stamped: a requeued older job's NULL stamp proves nothing (Codex review
-    round 7).
-    """
-    from src.workers.tasks_helpers.dedup import BILLING_STAMP_RELIABLE_SINCE
-
-    try:
-        db.execute(
-            sa_text(
-                "DELETE FROM delivered_records "
-                "WHERE first_job_id = :jid AND user_id = CAST(:uid AS uuid) "
-                "  AND EXISTS (SELECT 1 FROM jobs j "
-                "              WHERE j.id = :jid AND j.user_id = CAST(:uid AS uuid) "
-                "                AND j.status = 'cancelled' "
-                "                AND j.billing_applied_at IS NULL "
-                "                AND j.created_at >= :since)"
-            ),
-            {"jid": job_id, "uid": str(user_id), "since": BILLING_STAMP_RELIABLE_SINCE},
-        )
-        db.commit()
-    except Exception as exc:
-        db.rollback()
-        _alert_dedup_release_failed(job_id, user_id, "cancelled", exc)
 
 
 def _upload_export_with_retry(exporter, local_file, object_key) -> tuple[bool, Exception | None]:
@@ -462,7 +381,7 @@ def _fail_job_after_uncaught(job_id: str, reason: str, expected_started_at=None)
                 update(Job)
                 .where(
                     Job.id == job_id,
-                    Job.started_at == expected_started_at,
+                    *_attempt_clauses(expected_started_at),
                     Job.status.notin_(_TERMINAL_STATUSES),
                     Job.billing_applied_at.is_(None),
                 )
@@ -658,8 +577,8 @@ def run_scrape_job(self, job_id: str) -> None:
         # as started_at, so every attempt begins with a FRESH liveness observation
         # and can never be re-queued on the previous attempt's stale one. See that
         # helper for why the CAS lives there rather than inline here.
-        attempt_started_at = claim_job_for_attempt(db, job_id)
-        if attempt_started_at is None:
+        attempt_token = claim_attempt(db, job_id)
+        if attempt_token is None:
             _logger.info(
                 "Job %s not claimable (already in flight / not pending) — "
                 "skipping to avoid double-scrape",
@@ -667,6 +586,63 @@ def run_scrape_job(self, job_id: str) -> None:
             )
             return
         db.refresh(job)
+
+        def _after_missed_write() -> bool:
+            """An attempt-scoped write did not land: does this attempt still own the job?
+
+            The row decides, under its lock, with the same rule finalization uses
+            (`finalize_exit`). Owned -> True: the miss was a swallowed telemetry error
+            (_set_progress never raises). Otherwise the attempt stops, and the two
+            reasons are NOT the same exit (Codex 2c-bis diff r6 P2): a TERMINAL job
+            (cancelled, failed, done) delivered nothing from this attempt, so its quota
+            reservation and dedup claims are handed back (`_terminal_cleanup`, whose
+            releases re-check their own guards, so at most once in effect); a job
+            another attempt now OWNS keeps everything, because it is that attempt's.
+            """
+            decision = finalize_exit(attempt_state(db, job_id, _boot_user_id, attempt_token))
+            db.rollback()
+            if decision is None:
+                return True
+            _logger.info(
+                "Job %s: the attempt token changed or the job is terminal (%s); "
+                "this attempt stops", job_id, decision,
+            )
+            if decision == "terminalized":
+                _terminal_cleanup(db, job_id, _boot_user_id)
+            return False
+
+        def _still_ours(landed: bool) -> bool:
+            """After a stage write: carry on, or stop this attempt.
+
+            Landed -> carry on; otherwise `_after_missed_write` decides. A stopped
+            attempt publishes and commits nothing more of its own (Codex 2c-bis diff
+            r4: a stale attempt used to keep narrating onto the replacement's log and,
+            at `connecting`, commit its own date window onto that row).
+            """
+            return landed or _after_missed_write()
+
+        def _fail_attempt(reason: str, *, notify: bool = True) -> None:
+            """Fail THIS attempt's run; the caller returns afterwards.
+
+            `_fail_job` is token-scoped and releases the reservation itself when it
+            lands. When it does not land the job is terminal or another attempt's,
+            and `_after_missed_write` tells the two apart. The failure notification
+            is sent only for a failure this attempt actually wrote.
+            """
+            if not _fail_job(db, job, r, job_id, reason, expected_started_at=attempt_token):
+                _after_missed_write()
+                return
+            if notify:
+                from src.workers.notification_emit import create_notification
+                create_notification(
+                    user_id=job.user_id, type="job_failed", job_id=job_id,
+                    detail={
+                        "scraper_name": getattr(config, "name", None),
+                        "county": getattr(config, "county", None),
+                        "error_summary": reason[:200],
+                    },
+                )
+
         # THIS attempt's token, held in a local rather than read off the ORM object
         # each time. Every progress and stage write below is scoped to it, so a
         # callback that arrives late — from an attempt the watchdog already replaced
@@ -677,7 +653,7 @@ def run_scrape_job(self, job_id: str) -> None:
         # (_RunScrapeJobTask) can attempt-scope its crash cleanup — it must only fail the
         # row if started_at still matches, never a re-queued/re-claimed newer attempt.
         try:
-            self.request.scrape_started_at = attempt_started_at
+            self.request.scrape_started_at = attempt_token
         except Exception:  # request context unavailable (e.g. direct call) — non-fatal
             pass
 
@@ -700,7 +676,7 @@ def run_scrape_job(self, job_id: str) -> None:
         # what releases a cancelled run's slot at once (audit #4 S4-02). An
         # attempt that returned before start() would never acknowledge, and its
         # cancelled slot would stay held until the hard time limit.
-        _hb.start(attempt_started_at)
+        _hb.start(attempt_token)
 
         # A deleted or plan-paused scraper never runs, whoever queued the job.
         # A delete or pause can land after the Job was created: a batch fan-out
@@ -714,7 +690,7 @@ def run_scrape_job(self, job_id: str) -> None:
         if _skip_reason is not None:
             # _fail_job writes the job log line, emits the event and releases any
             # reserved quota, so a skipped run reserves and bills nothing.
-            _fail_job(db, job, r, job_id, _skip_reason, expected_started_at=attempt_started_at)
+            _fail_attempt(_skip_reason, notify=False)
             return
 
         # The ACCOUNT may still start billable work (audit #4 S4-01). The enqueue
@@ -729,8 +705,7 @@ def run_scrape_job(self, job_id: str) -> None:
         db.refresh(user)
         _eligibility = run_eligibility(user)
         if _eligibility.code in ("frozen", "ended"):
-            _fail_job(db, job, r, job_id, _eligibility.message,
-                      expected_started_at=attempt_started_at)
+            _fail_attempt(_eligibility.message, notify=False)
             return
 
         # Execution-time entitlement backstop (audit until ENTITLEMENT_ENFORCEMENT).
@@ -753,18 +728,21 @@ def run_scrape_job(self, job_id: str) -> None:
         if should_block_run(_violation, user_id=str(job.user_id), plan=(user.plan or "starter"), context="worker_run"):
             # _violation is an entitlements.Violation; str() is its customer-facing
             # message. Both strings below reach the user (live log + job error).
-            _publish_log(r, job_id, "error", f"{_violation.title}. {_violation.message}", db=db)
-            _fail_job(db, job, r, job_id, f"{_violation.title}. {_violation.message}")
+            # _fail_job publishes the same line, and only once its CAS lands.
+            _fail_attempt(f"{_violation.title}. {_violation.message}", notify=False)
             return
 
         # Stage rides the commit that _publish_log already performs, so no new commit
         # point is introduced into the work session (see _set_progress).
-        _set_stage(db, job, "preparing", expected_started_at=attempt_started_at, commit=False)
+        if not _still_ours(_set_stage(db, job, "preparing", expected_started_at=attempt_token,
+                                      commit=False)):
+            return
         _publish_log(r, job_id, "info", f"Job queued: {config.name} ({config.county}, {config.state})", db=db)
 
         # ── PROBING ───────────────────────────────────────────────────────────
-        if not _set_status(db, job, "probing"):
+        if not _set_status(db, job, "probing", expected_started_at=attempt_token):
             _logger.info("Job %s externally terminalized (%s) — aborting", job_id, job.status)
+            _after_missed_write()
             return
         _publish_log(r, job_id, "info", "Probing county portal...", db=db)
 
@@ -772,21 +750,13 @@ def run_scrape_job(self, job_id: str) -> None:
             scraper_class, matched_record_type = get_scraper_class(config.county, config.state, config.record_type)
         except UnsupportedCountyError as exc:
             reason = str(exc)
-            if _fail_job(db, job, r, job_id, reason):
-                from src.workers.notification_emit import create_notification
-                create_notification(
-                    user_id=job.user_id, type="job_failed", job_id=job_id,
-                    detail={
-                        "scraper_name": getattr(config, "name", None),
-                        "county": getattr(config, "county", None),
-                        "error_summary": reason[:200],
-                    },
-                )
+            _fail_attempt(reason)
             return
 
         # ── SCRAPING ──────────────────────────────────────────────────────────
-        if not _set_status(db, job, "scraping"):
+        if not _set_status(db, job, "scraping", expected_started_at=attempt_token):
             _logger.info("Job %s externally terminalized (%s) — aborting", job_id, job.status)
+            _after_missed_write()
             return
         record_label = config.record_type.replace("_", " ").title()
         _publish_log(r, job_id, "success", f"Starting scrape: {record_label} records", db=db)
@@ -809,6 +779,7 @@ def run_scrape_job(self, job_id: str) -> None:
             )
         ).scalars().first()
         max_days = connector.max_date_range_days if connector else None
+        _trim_notice = None
         if max_days:
             from datetime import timedelta as _td
             _df = datetime.strptime(date_from, "%m/%d/%Y")
@@ -818,15 +789,31 @@ def run_scrape_job(self, job_id: str) -> None:
                 # Trim date_from to respect the limit (keep the most recent data)
                 _df = _dt - _td(days=max_days)
                 date_from = _df.strftime("%m/%d/%Y")
-                _publish_log(
-                    r, job_id, "warning",
-                    f"{config.county.title()} County supports max {max_days} days. Range trimmed to {date_from} → {date_to}.",
-                    db=db,
+                _trim_notice = (
+                    f"{config.county.title()} County supports max {max_days} days. "
+                    f"Range trimmed to {date_from} → {date_to}."
                 )
 
-        job.date_from = date_from
-        job.date_to = date_to
-        db.flush()
+        # The resolved window is written ONLY onto this attempt's row: a token-scoped
+        # UPDATE, not an ORM assignment flushed by primary key, which a stale attempt
+        # would have committed onto the replacement's row (Codex 2c-bis diff r5). The
+        # ORM copy is updated without being marked dirty, so no later flush re-writes
+        # it unfenced. Nothing is published until the write has landed.
+        from sqlalchemy import update as _sa_update
+        from sqlalchemy.orm.attributes import set_committed_value
+
+        _dated = db.execute(
+            _sa_update(Job)
+            .where(Job.id == job_id, Job.status.not_in(_TERMINAL_STATUSES),
+                   *_attempt_clauses(attempt_token))
+            .values(date_from=date_from, date_to=date_to)
+        ).rowcount
+        if not _still_ours(_dated == 1):
+            return
+        set_committed_value(job, "date_from", date_from)
+        set_committed_value(job, "date_to", date_to)
+        if _trim_notice:
+            _publish_log(r, job_id, "warning", _trim_notice, db=db)
         _publish_log(r, job_id, "info", f"Date range: {date_from} → {date_to} (mode: {range_mode})", db=db)
 
         _last_phase = [None]  # mutable for closure
@@ -902,7 +889,7 @@ def run_scrape_job(self, job_id: str) -> None:
                 observations["stage"] = stage_for_phase
                 observations["stage_started_at"] = _now()
             landed = _set_progress(
-                db, job, expected_started_at=attempt_started_at, **observations,
+                db, job, expected_started_at=attempt_token, **observations,
             )
             if landed and advancing:
                 # The local mirror advances only when the row did. Moving it first
@@ -936,12 +923,13 @@ def run_scrape_job(self, job_id: str) -> None:
             first result page happens inside one call. The scraper knows which of
             those it is in; nothing else does.
             """
-            if _set_stage(db, job, stage, expected_started_at=attempt_started_at):
+            if _set_stage(db, job, stage, expected_started_at=attempt_token):
                 _last_stage[0] = stage
 
-        _set_stage(
-            db, job, "connecting", expected_started_at=attempt_started_at, commit=False,
-        )
+        if not _still_ours(_set_stage(
+            db, job, "connecting", expected_started_at=attempt_token, commit=False,
+        )):
+            return
         _publish_log(r, job_id, "info", "Connecting to county portal...", db=db)
         # Flush the resolved date window to disk before entering the scraper, which
         # can run for up to _SCRAPE_TIMEOUT below. Until this commits, job.date_from
@@ -986,16 +974,7 @@ def run_scrape_job(self, job_id: str) -> None:
             except Exception:
                 pass
             reason = f"Scraper timed out after {_SCRAPE_TIMEOUT // 60} minutes. Try a shorter date range."
-            if _fail_job(db, job, r, job_id, reason):
-                from src.workers.notification_emit import create_notification
-                create_notification(
-                    user_id=job.user_id, type="job_failed", job_id=job_id,
-                    detail={
-                        "scraper_name": getattr(config, "name", None),
-                        "county": getattr(config, "county", None),
-                        "error_summary": reason[:200],
-                    },
-                )
+            _fail_attempt(reason)
             return
         except (SoftTimeLimitExceeded, TimeLimitExceeded):
             # A Celery time limit must ESCAPE this handler, not be classified by it.
@@ -1017,7 +996,7 @@ def run_scrape_job(self, job_id: str) -> None:
             raise
         except Exception as exc:
             _logger.exception("Scraper error for job %s", job_id)
-            # attempt_started_at is the token the CLAIM returned, captured once at
+            # attempt_token is the token the CLAIM returned, captured once at
             # the top of this run and never re-read from the ORM. It attempt-scopes
             # BOTH the retry CAS and the terminal fail below, so a stale/superseded
             # attempt never clobbers a live re-claimed one (Codex P1). This used to
@@ -1039,7 +1018,7 @@ def run_scrape_job(self, job_id: str) -> None:
             from src.scrapers.reliability import is_transient_scrape_error
             if is_transient_scrape_error(exc):
                 countdown = _retry_scrape_job(
-                    db, job, job_id, attempt_started_at,
+                    db, job, job_id, attempt_token,
                     max_retries=SCRAPE_TRANSIENT_MAX_RETRIES,
                     backoffs=SCRAPE_TRANSIENT_BACKOFF_SECONDS,
                 )
@@ -1099,16 +1078,7 @@ def run_scrape_job(self, job_id: str) -> None:
             # (started_at unchanged). If a newer attempt re-claimed it — or the
             # retry CAS above no-oped on an ownership change — this no-ops instead
             # of terminalizing a live newer attempt (Codex P1).
-            if _fail_job(db, job, r, job_id, reason, expected_started_at=attempt_started_at):
-                from src.workers.notification_emit import create_notification
-                create_notification(
-                    user_id=job.user_id, type="job_failed", job_id=job_id,
-                    detail={
-                        "scraper_name": getattr(config, "name", None),
-                        "county": getattr(config, "county", None),
-                        "error_summary": reason[:200],
-                    },
-                )
+            _fail_attempt(reason)
             return
 
         # The authoritative raw scrape total, recorded on the row rather than left in
@@ -1120,7 +1090,7 @@ def run_scrape_job(self, job_id: str) -> None:
         # 0 is written as 0 on purpose — a county that returned nothing really did.
         _set_progress(
             db, job,
-            expected_started_at=attempt_started_at,
+            expected_started_at=attempt_token,
             commit=False,
             records_found=len(records),
             last_progress_at=_now(),
@@ -1169,13 +1139,17 @@ def run_scrape_job(self, job_id: str) -> None:
         # CAS no-op here means a batch force-finalize cancelled this child while
         # it was scraping (>90min stuck): discard the scrape without saving,
         # billing, or delivering — the batch already recorded it as timed out.
-        if not _set_status(db, job, "enriching", record_count=len(records)):
+        if not _set_status(db, job, "enriching", record_count=len(records),
+                           expected_started_at=attempt_token):
             _logger.info(
                 "Job %s externally terminalized (%s) mid-scrape — discarding without billing",
                 job_id, job.status,
             )
+            _after_missed_write()
             return
-        _set_stage(db, job, "saving", expected_started_at=attempt_started_at, commit=False)
+        if not _still_ours(_set_stage(db, job, "saving", expected_started_at=attempt_token,
+                                      commit=False)):
+            return
         _publish_log(r, job_id, "info", "Saving records to database...", db=db)
 
         # Bulk insert results (truncate fields to fit DB column limits)
@@ -1339,7 +1313,9 @@ def run_scrape_job(self, job_id: str) -> None:
         # NOTHING tells us which rows were successfully claimed (first
         # delivery) vs which conflicted (user has seen this lead before).
         # The conflicting rows get their Result flagged is_duplicate=true.
-        _set_stage(db, job, "deduping", expected_started_at=attempt_started_at, commit=False)
+        if not _still_ours(_set_stage(db, job, "deduping", expected_started_at=attempt_token,
+                                      commit=False)):
+            return
         _publish_log(r, job_id, "info", "Checking for duplicate leads...", db=db)
         _logger.info("Job %s: dedup step 1 — SELECT fresh rows", job_id)
 
@@ -1508,13 +1484,7 @@ def run_scrape_job(self, job_id: str) -> None:
                 )
                 try:
                     db.rollback()
-                    db.execute(
-                        sa_text(
-                            "DELETE FROM delivered_records "
-                            "WHERE first_job_id = :jid AND user_id = CAST(:uid AS uuid)"
-                        ),
-                        {"jid": job_id, "uid": str(job.user_id)},
-                    )
+                    release_run_claims_if_owned(db, job_id, _boot_user_id, attempt_token)
                     db.commit()
                 except Exception as cleanup_exc:
                     db.rollback()
@@ -1528,16 +1498,7 @@ def run_scrape_job(self, job_id: str) -> None:
                     "run was stopped and you were not charged. Please try again; "
                     "contact support if it keeps failing."
                 )
-                if _fail_job(db, job, r, job_id, reason):
-                    from src.workers.notification_emit import create_notification
-                    create_notification(
-                        user_id=job.user_id, type="job_failed", job_id=job_id,
-                        detail={
-                            "scraper_name": getattr(config, "name", None),
-                            "county": getattr(config, "county", None),
-                            "error_summary": reason[:200],
-                        },
-                    )
+                _fail_attempt(reason)
                 return
         else:
             # Every OTHER record type collapses its same-run siblings here.
@@ -1597,7 +1558,9 @@ def run_scrape_job(self, job_id: str) -> None:
 
         # Export runs BEFORE enrichment, which is why the stage list is not a
         # pipeline and why nothing may read "step N of M" off it.
-        _set_stage(db, job, "exporting", expected_started_at=attempt_started_at, commit=False)
+        if not _still_ours(_set_stage(db, job, "exporting", expected_started_at=attempt_token,
+                                      commit=False)):
+            return
         _publish_log(r, job_id, "info", f"Building {fmt.upper()} export...", db=db)
 
         # Build the FIRST deliverable from the PERSISTED rows for every record type.
@@ -1689,13 +1652,7 @@ def run_scrape_job(self, job_id: str) -> None:
                 # delivered_records for the worker role; granted to
                 # bridgeleads_system in provision_rls_roles.sql. Works today (prod
                 # role still BYPASSRLS); the grant covers the RLS cutover.
-                db.execute(
-                    sa_text(
-                        "DELETE FROM delivered_records "
-                        "WHERE first_job_id = :jid AND user_id = CAST(:uid AS uuid)"
-                    ),
-                    {"jid": job_id, "uid": str(job.user_id)},
-                )
+                release_run_claims_if_owned(db, job_id, _boot_user_id, attempt_token)
                 db.commit()
             except Exception as cleanup_exc:
                 db.rollback()
@@ -1713,16 +1670,7 @@ def run_scrape_job(self, job_id: str) -> None:
                 "No file was produced and you were not charged. Please run the "
                 "scraper again; contact support if it keeps failing."
             )
-            if _fail_job(db, job, r, job_id, reason):
-                from src.workers.notification_emit import create_notification
-                create_notification(
-                    user_id=job.user_id, type="job_failed", job_id=job_id,
-                    detail={
-                        "scraper_name": getattr(config, "name", None),
-                        "county": getattr(config, "county", None),
-                        "error_summary": reason[:200],
-                    },
-                )
+            _fail_attempt(reason)
             return
 
         # ── INLINE ENRICHMENT (BEFORE marking done) ──────────────────────────
@@ -1741,7 +1689,9 @@ def run_scrape_job(self, job_id: str) -> None:
         # request's wait. If a hang slips through both, Celery hard-kills
         # the worker — which is what the previous thread guard was
         # actually relying on anyway.
-        _set_stage(db, job, "enriching", expected_started_at=attempt_started_at, commit=False)
+        if not _still_ours(_set_stage(db, job, "enriching", expected_started_at=attempt_token,
+                                      commit=False)):
+            return
         _publish_log(r, job_id, "info", "Looking up property and mailing addresses...", db=db)
         # Skip trace is enqueued only after a completed enrichment, and only after
         # the plan cap below (never for a row that will not be delivered).
@@ -2015,6 +1965,11 @@ def run_scrape_job(self, job_id: str) -> None:
                         from src.workers.tasks_helpers.dedup import (
                             release_capped_dedup_claims,
                         )
+                        # Only while this attempt still owns the job: the claims are
+                        # keyed by job, which a replacement attempt shares. A lost
+                        # attempt stops here through the cap's own error path.
+                        if not attempt_state(db, job_id, _boot_user_id, attempt_token).owned:
+                            raise RuntimeError("attempt token changed during the plan cap")
                         release_capped_dedup_claims(
                             db, str(job.user_id), job_id, _capped_ids
                         )
@@ -2030,13 +1985,7 @@ def run_scrape_job(self, job_id: str) -> None:
                 )
                 try:
                     db.rollback()
-                    db.execute(
-                        sa_text(
-                            "DELETE FROM delivered_records "
-                            "WHERE first_job_id = :jid AND user_id = CAST(:uid AS uuid)"
-                        ),
-                        {"jid": job_id, "uid": str(job.user_id)},
-                    )
+                    release_run_claims_if_owned(db, job_id, _boot_user_id, attempt_token)
                     db.commit()
                 except Exception as cleanup_exc:
                     db.rollback()
@@ -2048,16 +1997,7 @@ def run_scrape_job(self, job_id: str) -> None:
                 reason = (
                     'The lead list could not be re-read after enrichment, so your plan quota could not be applied. No file was delivered and you were not charged. Please run the scraper again; contact support if it keeps failing.' if refreshed is None else 'Your plan quota could not be applied to this run. No file was delivered and you were not charged. Please run the scraper again; contact support if it keeps failing.'
                 )
-                if _fail_job(db, job, r, job_id, reason):
-                    from src.workers.notification_emit import create_notification
-                    create_notification(
-                        user_id=job.user_id, type="job_failed", job_id=job_id,
-                        detail={
-                            "scraper_name": getattr(config, "name", None),
-                            "county": getattr(config, "county", None),
-                            "error_summary": reason[:200],
-                        },
-                    )
+                _fail_attempt(reason)
                 return
 
             if _capped_ids:
@@ -2108,8 +2048,9 @@ def run_scrape_job(self, job_id: str) -> None:
                     db, job, r, job_id, config,
                     on_begin=lambda: _set_stage(
                         db, job, "queuing_contacts",
-                        expected_started_at=attempt_started_at,
+                        expected_started_at=attempt_token,
                     ),
+                    attempt_token=attempt_token,
                 )
             except Exception as exc:
                 db.rollback()
@@ -2188,13 +2129,7 @@ def run_scrape_job(self, job_id: str) -> None:
             )
             try:
                 db.rollback()
-                db.execute(
-                    sa_text(
-                        "DELETE FROM delivered_records "
-                        "WHERE first_job_id = :jid AND user_id = CAST(:uid AS uuid)"
-                    ),
-                    {"jid": job_id, "uid": str(job.user_id)},
-                )
+                release_run_claims_if_owned(db, job_id, _boot_user_id, attempt_token)
                 db.commit()
             except Exception as cleanup_exc:
                 db.rollback()
@@ -2208,16 +2143,7 @@ def run_scrape_job(self, job_id: str) -> None:
                 "No file was delivered and you were not charged. Please run the "
                 "scraper again; contact support if it keeps failing."
             )
-            if _fail_job(db, job, r, job_id, reason):
-                from src.workers.notification_emit import create_notification
-                create_notification(
-                    user_id=job.user_id, type="job_failed", job_id=job_id,
-                    detail={
-                        "scraper_name": getattr(config, "name", None),
-                        "county": getattr(config, "county", None),
-                        "error_summary": reason[:200],
-                    },
-                )
+            _fail_attempt(reason)
             return
 
         # ── PHASE 3: RESULT.property_key (combine/overlap join key) ──────────
@@ -2274,259 +2200,16 @@ def run_scrape_job(self, job_id: str) -> None:
                     job_id, str(exc)[:200],
                 )
 
-        # Force-finalize guard (Codex P2): a batch force-finalize may have
-        # cancelled this child while it was exporting. Re-check the live DB
-        # status before charging quota — never bill a job that is no longer
-        # ours to complete. (A cancel landing between this check and the final
-        # done-CAS still can't resurrect the job; at worst that sliver of a
-        # window bills records that were genuinely scraped.)
-        db.refresh(job)
-        if job.status in _TERMINAL_STATUSES:
-            _logger.info(
-                "Job %s externally terminalized (%s) after export — skipping billing/delivery",
-                job_id, job.status,
-            )
-            _release_claims_of_cancelled_job(db, job_id, _boot_user_id)
+        # Billing and the done transition, in one transaction: moved verbatim to
+        # src/workers/tasks_helpers/finalize.py so the tests run production code.
+        _outcome = finalize_billing_and_done(
+            db, r, job=job, user=user, config=config, job_id=job_id,
+            attempt_token=attempt_token, object_key=object_key,
+            boot_user_id=_boot_user_id,
+        )
+        if _outcome.kind is not FinalizeKind.DONE:
             return
-
-        # Last stage boundary. It goes HERE, before the billing reads open the
-        # transaction that the done-CAS commits with, and it commits on its own:
-        # everything below this line is deliberately held uncommitted so billing and
-        # the terminal transition land together, and a stage write inside that window
-        # — with commit=True, or with commit=False and someone else's commit arriving
-        # first — would split them, which is the crash that leaves a job billed but
-        # not done (Codex P1).
-        _set_stage(db, job, "finalizing", expected_started_at=attempt_started_at)
-
-        # Atomic update of monthly record usage.
-        # Sprint 6.4: duplicates delivered to this user in a prior scrape
-        # do NOT count against the monthly quota.
-        # 2026-09-02 (owner decision): rows with no property AND no mailing
-        # address are not leads and are NOT billed either — which is why this
-        # whole block now runs AFTER inline enrichment (addresses for many
-        # counties only exist post-enrichment) and right before the done-CAS.
-        # The force-finalize guard above moved with it (Codex).
-        #
-        # Bill the PERSISTED billable set, not len(records): with conflict-skipping
-        # inserts the in-memory scrape count can diverge from what actually landed
-        # (intra-run fingerprint collisions, a re-run over a changed source set), so
-        # the authoritative billable count is this job's non-duplicate result rows
-        # (no-dedup_hash rows have is_duplicate=false, so they're included). (Codex)
-        billable_count = db.execute(
-            sa_text(
-                "SELECT count(*) FROM results "
-                "WHERE job_id = :jid AND user_id = CAST(:uid AS uuid) AND is_duplicate = false "
-                f"AND {actionable_sql('results')}"
-            ),
-            {"jid": job_id, "uid": str(job.user_id)},
-        ).scalar() or 0
-        from sqlalchemy import update as sa_update
-        # Idempotent billing (migration 063): claim billing for THIS job via a CAS
-        # on billing_applied_at. Only the attempt that flips it from NULL bills the
-        # user, so a watchdog re-run (which re-reaches this point) never
-        # double-charges records_used. billed_count records the charged amount. The
-        # Job CAS + the User increment commit together (a crash between the two
-        # execute()s rolls both back — neither is committed until db.commit()).
-        # ONE database-clock reading, reused as the billing instant for BOTH the
-        # job anchor and the user's period decision below.
-        #
-        # Postgres NOW() is transaction_timestamp() — fixed when the transaction
-        # OPENED, which here is the billable-count SELECT above, potentially
-        # minutes earlier. A transaction that opens just before a UTC month
-        # boundary and reaches this point just after it would stamp
-        # billing_applied_at in the new month while NOW() still resolved to the
-        # old one, leaving records_period_start stale. The beat task would then
-        # read that user as stale and zero a charge that had just been applied
-        # inside the new period — the exact failure this whole change exists to
-        # prevent. clock_timestamp() reads the wall clock at statement time, and
-        # binding the single value into both statements makes the job anchor and
-        # the user period agree by construction rather than by luck. (Codex)
-        _billed_at = db.execute(sa_text("SELECT clock_timestamp()")).scalar()
-        billed_now = db.execute(
-            sa_update(Job)
-            .where(Job.id == job_id, Job.billing_applied_at.is_(None))
-            .values(billed_count=billable_count, billing_applied_at=_billed_at)
-        ).rowcount
-        if billed_now:
-            # PERIOD-AWARE increment. The counter is rolled forward in the SAME
-            # statement that charges it, so the month boundary is applied at the
-            # moment of billing rather than whenever the daily beat task next
-            # happens to run.
-            #
-            # This closes a real quota-loss hole: reset_monthly_usage runs daily
-            # at 00:05 UTC to survive Beat downtime on the 1st, but it used to
-            # zero records_used unconditionally — so a late catch-up run wiped
-            # usage that had ALREADY been billed inside the new period. In prod a
-            # user billed 67 records on Sep 2 and a Sep-3 catch-up run destroyed
-            # them.
-            #
-            # It also makes the daily task's zeroing provably safe rather than
-            # merely hopeful: because every bill advances records_period_start,
-            # a period_start that is still stale when the beat runs PROVES no job
-            # billed in the current period, so there is nothing of value to zero.
-            #
-            # One statement, evaluated atomically under the row lock Postgres
-            # already takes for an UPDATE, so a concurrent bill for the same user
-            # cannot interleave a read and a write (no lost update).
-            # SETTLE THE DELTA, not the whole amount. The plan cap already
-            # RESERVED this job's grant (migration 087) and charged it to
-            # records_used at that moment, which is what stops two concurrent
-            # jobs being allocated the same remaining quota. So the charge owed
-            # here is only the difference between what was actually delivered
-            # and what was held.
-            #
-            # For a job that delivered exactly its grant the delta is 0. For a
-            # job that never reserved — an unlimited-plan user, whose cap block
-            # is skipped entirely — reserved_count is 0 and the delta is the
-            # full billable_count, so this one expression covers both. In-flight
-            # jobs at deploy time also have reserved_count = 0 and bill exactly
-            # as they did before.
-            # Which period does this job's reservation belong to? A grant made
-            # in an EARLIER period was charged to that period's counter, and
-            # that counter has since rolled — so the charge is gone and the
-            # delta is meaningless. The leads are being delivered NOW, so the
-            # current period must carry them in full. Netting a stale grant off
-            # instead would deliver records nobody is charged for. (Codex)
-            # NULL-PERIOD RULE (must match src/api/quota.py::effective_records_used):
-            # a NULL records_period_start never zeroes the COUNTER. It is
-            # unreachable — migration 086 made the column NOT NULL with a
-            # server_default — but the two halves used to disagree, and they
-            # disagreed in the revenue-losing direction: the API gate preserved
-            # the counter on NULL while the worker discarded it, silently handing
-            # out a free period's quota. Only a genuinely STALE period zeroes.
-            # The period column itself is still stamped on NULL (adopted), which
-            # matches how the rollover treats it. (Codex)
-            # WHICH ENTITLEMENT WINDOW does the reservation belong to, and is
-            # that still the live one? Both questions are now answered INSIDE
-            # the charging statement, under the users row lock, rather than by a
-            # separate unlocked SELECT. That matters: the previous shape read
-            # "is it current?" first and charged second, so a rollover landing
-            # between the two would net a grant off a counter the rollover had
-            # already zeroed — under-charging by exactly the reserved amount.
-            #
-            # jobs -> users lock order is preserved: this job's row was already
-            # locked by the billing CAS above, and FOR UPDATE OF u takes only
-            # the users row. Locking users first here would invert against a
-            # concurrent watchdog re-run and deadlock.
-            _settle = db.execute(
-                sa_text(
-                    "WITH cur AS ("
-                    "  SELECT u.id, u.records_used, u.records_limit,"
-                    "         u.quota_anchor_at, u.quota_period_start,"
-                    "         u.quota_period_end, u.subscription_status,"
-                    "         u.entitlement_grace_ends_at, u.entitlement_ends_at,"
-                    "         u.pending_plan, u.pending_records_limit,"
-                    "         u.records_period_start,"
-                    "         j.quota_period_start AS job_window,"
-                    "         j.reserved_at AS job_reserved_at,"
-                    "         j.reserved_count AS job_reserved"
-                    "  FROM users u JOIN jobs j ON j.user_id = u.id"
-                    "  WHERE j.id = :jid FOR UPDATE OF u"
-                    "), w AS ("
-                    "  SELECT cur.*, " + window_cte_sql("", ":billed_at") + " FROM cur"
-                    "), s AS ("
-                    "  SELECT w.*, CASE WHEN "
-                    + reservation_is_current_sql(
-                        job_window="job_window",
-                        job_reserved_at="job_reserved_at",
-                        user_window="quota_period_start",
-                        user_records_period_start="records_period_start",
-                    )
-                    + "    THEN job_reserved ELSE 0 END AS applied_reserved"
-                    "  FROM w"
-                    ") UPDATE users u SET"
-                    "    records_used = GREATEST(0, s.base + (:billable - s.applied_reserved)),"
-                    + window_set_sql("s")
-                    + "  FROM s WHERE u.id = s.id"
-                    "  RETURNING s.applied_reserved, s.job_reserved, s.rolling"
-                ),
-                {"jid": job_id, "billable": billable_count,
-                 "billed_at": _billed_at},
-            ).fetchone()
-            user_billed = 0 if _settle is None else 1
-            if _settle is not None:
-                _reserved = int(_settle.job_reserved or 0)
-                if _reserved and not _settle.applied_reserved:
-                    # The grant was charged to a window that has since rolled and
-                    # been zeroed, so there is no charge left to net against. The
-                    # leads are being delivered NOW, so the live window carries
-                    # them in full rather than the customer receiving records
-                    # nobody is charged for.
-                    _logger.warning(
-                        "Job %s: reservation of %d belongs to an earlier "
-                        "entitlement window — charging the full delivered count "
-                        "to the current one instead of netting a charge that has "
-                        "already rolled",
-                        job_id, _reserved,
-                    )
-            if user_billed != 1:
-                # The job was CAS-marked billed but the user counter did NOT move
-                # (deleted user / bad id / RLS scope). Don't leave the job marked
-                # billed-without-charge — roll back and fail loudly (Codex).
-                db.rollback()
-                reason = "Billing failed: user record-usage counter could not be updated."
-                if _fail_job(db, job, r, job_id, reason):
-                    from src.workers.notification_emit import create_notification
-                    create_notification(
-                        user_id=job.user_id, type="job_failed", job_id=job_id,
-                        detail={
-                            "scraper_name": getattr(config, "name", None),
-                            "county": getattr(config, "county", None),
-                            "error_summary": reason[:200],
-                        },
-                    )
-                return
-        else:
-            _logger.info(
-                "Job %s already billed (billing_applied_at set) — skipping "
-                "records_used increment on this re-run", job_id,
-            )
-            # Re-run after a crash between the billing commit and the done-CAS:
-            # the headline/email/webhook must report what was actually CHARGED,
-            # not a fresh count that enrichment may have changed since (Codex).
-            db.refresh(job)
-            if job.billed_count is not None:
-                billable_count = int(job.billed_count)
-
-        # ── NOW mark done — in the SAME transaction as the billing writes ──────
-        # record_count reflects unique (non-duplicate) leads — what the user
-        # actually sees on the results page. The raw scrape total is in the
-        # log: "{N} records saved ({unique} new leads, {dup} duplicates)".
-        # Persisted non-duplicate ACTIONABLE rows — the same number that was just
-        # billed, so the headline, email, webhook and bill can never disagree.
-        # The billing CAS + records_used increment above are still UNCOMMITTED:
-        # they commit together with this done-CAS, so a crash can never leave a
-        # job billed-but-not-done (which a watchdog re-run would re-scrape and
-        # re-export against a stale bill) or done-but-not-billed (Codex).
-        display_count = int(billable_count)
-        if not _set_status(
-            db, job, "done",
-            finished_at=_now(),
-            record_count=display_count,
-            export_key=object_key,
-            commit=False,
-        ):
-            # Cancelled (force-finalize) while enriching: the CAS kept the row
-            # terminal — roll the pending billing back (a cancelled job is never
-            # charged) and suppress the success log, email, and webhook.
-            db.rollback()
-            db.refresh(job)
-            # The pending billing rolled back with that, but the plan cap's
-            # RESERVATION was committed earlier in its own transaction and is
-            # still charged to the user. A cancelled job delivers nothing, so
-            # hand it back rather than leaving a permanent phantom charge.
-            from src.workers.tasks_helpers.status import release_quota_reservation
-
-            release_quota_reservation(db, job_id)
-            _release_claims_of_cancelled_job(db, job_id, _boot_user_id)
-            _logger.info(
-                "Job %s externally terminalized (%s) — suppressing completion delivery",
-                job_id, job.status,
-            )
-            return
-        db.commit()
-        db.refresh(job)
-        db.refresh(user)
+        display_count = _outcome.display_count
 
         if user.records_limit != -1 and user.records_used > user.records_limit:
             overage = user.records_used - user.records_limit

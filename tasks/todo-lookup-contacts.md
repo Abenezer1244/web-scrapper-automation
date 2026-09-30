@@ -3171,7 +3171,7 @@ One task, idempotent under at-least-once delivery. Steps:
   Recompute counts. No active pending row left → `settled`, `settled_at`, event.
 - [ ] All in `system_sync_session()`, bounded per tick (LIMIT + oldest-first, with the
   starvation landmine in mind: a per-action cursor, not `ORDER BY oldest LIMIT` alone).
-- Files: `scheduler_helpers/contact_lookups.py` (impl), `scheduler.py` (entry), tests, this
+- Files: `src/workers/scheduler_helpers/contact_lookups.py` (impl), `scheduler.py` (entry), tests, this
   plan = 4.
 
 ### 1b-2d — `POST /jobs/{job_id}/contact-lookups` {quote_id, category} → 202
@@ -3291,7 +3291,7 @@ order. These AMEND the sections above:
 - **2a** migration 107: action FK + `unmatched_unbilled` + `quote_snapshot`; `models.py`; claim
   `action_id`; tests; plan (5).
 - **2b** worker (5).
-- **2c** reconciler + `queue_accepted_all` extraction (`scheduler_helpers/contact_lookups.py`,
+- **2c** reconciler + `queue_accepted_all` extraction (`src/workers/scheduler_helpers/contact_lookups.py`,
   `scheduler.py`, `skip_trace_usage.py`, tests, plan = 5).
 - **2d** confirm (5).
 - **2e** status (5).
@@ -3340,6 +3340,21 @@ frozen on UPDATE. These AMEND V1-V8:
 - **W7 (P2) One state machine, both writers.** `ACTION_TRANSITIONS`, `VERDICT_TRANSITIONS` and
   `_move()` live in the worker module (`contact_lookup_action.py`), and the 2c reconciler
   IMPORTS them, so there is no second copy and no 6th file.
+
+### Codex pre-code consult r3 (2026-09-30): PLAN: REVISE, 2 P2 + 1 P3; W1-W7 closed, no deadlock
+Output: `<scratchpad 49da3c50>/codex_1b2_consult_r3_out.txt`. Lock order verified against the
+dispatcher: W1's action -> job advisory -> user row does not conflict with the dispatcher's global
+advisory lock + `SKIP LOCKED` row locks. Adopted:
+- **X1 (P2) S1 stands; the stale dispatcher contract is corrected.** `_cancel_undeliverable_queued`'s
+  docstring (`skip_trace_dispatcher.py:868-873`) promises that 1b-2 moves the action verdict to
+  `released` in the same transaction. Under S1 cancellation stays pending-row-only and the
+  reconciler derives `cancelled -> released`. The docstring is rewritten in **2-0** (the
+  writers-contract PR, 4 files), so no reviewer re-implements the old promise.
+- **X2 (P2) O-C is a HARD GATE before 2d**, with regression tests for `rows_sent != rows_uploaded`
+  and a legacy `rows_sent IS NULL` (bill `completed` only).
+- **X3 (P3)** the 2c path is `src/workers/scheduler_helpers/contact_lookups.py`.
+- 2-0 replaces the script's global scan-then-commit with a per-job lock -> re-read -> refuse -> write
+  -> commit (`repair_probate_party_and_bad_parcel.py:404,571`).
 
 ### Owner items (before code)
 - **O-C** (billing, pre-existing, found by the consult) Persist `skip_trace_queues.rows_sent`

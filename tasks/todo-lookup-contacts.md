@@ -2983,6 +2983,444 @@ ii = `routes/jobs.py`, `schemas.py`, `schema/openapi.json`, quote tests, this pl
 **Logged follow-ups:** `/skip-trace-usage` onto `lookup_pricing` + `normalize_plan` + the roll
 rule; a dedicated `lookup_quote` rate zone; `(…, created_at, id)` index if windows grow.
 
+## Phase 1b-2 — the WRITE path: confirm, worker claim, reconcile, settle (PLAN, 2026-09-30, BEFORE Codex consult)
+
+1b-1c is LIVE (#384, #386, #393; main `3372cb82`). This is the first phase that SPENDS: a
+customer confirms a quote and leads enter the paid Tracerfy queue. It adds no new spend path of
+its own. Rows enter the queue ONLY through `lock_job_for_claim()` + `claim_skip_trace_rows()`
+(H3), and from there the existing dispatcher, caps, ingest and metered billing do all the rest.
+
+### Facts (read in code, 2026-09-30, main `3372cb82`; three research passes, spot-checked)
+- **Schema (101, untouched by 102-106).**
+  - Action statuses: `dispatching, running, claimed, settled, failed, expired`.
+  - Dispositions:
+    - the API-initial set: `quoted` + 5× `excluded_*`;
+    - worker verdicts: `newly_queued, reused, already_answered, in_progress_elsewhere,
+      ineligible, released, abandoned`;
+    - terminal: `answered_hit, answered_miss, unmatched_billable, errored_unsubmitted`.
+  - Events have no CHECK on from/to.
+  - **The guard triggers restrict ONLY user-scoped sessions.** An empty GUC as
+    `bridgeleads_system` (or super/BYPASSRLS) passes with no transition matrix. So the worker's
+    state machine is enforced by CODE, and must be pinned by tests.
+  - The API may:
+    - insert an action `dispatching` with zero counts (the server owns `created_at`);
+    - insert `quoted`/`excluded_*` results;
+    - insert ONE `-> dispatching` event (checked `FOR SHARE` against a `dispatching` parent);
+    - stamp `dispatched_at` once. Nothing else.
+  - Grants: app SELECT+INSERT on all three, `UPDATE(dispatched_at)` on actions. System
+    SELECT/INSERT/UPDATE on actions+results, SELECT/INSERT on events. DELETE for nobody.
+- **`pending_skip_trace_rows.action_id`** is nullable and indexed `(action_id, user_id)`, with
+  **NO FK** (audit2 T-5, P3 "latent"). **No code writes it**, or `results.last_trace_outcome`.
+- **The claim** (`skip_trace_claim.py`):
+  - The caller owns the transaction, nothing commits.
+  - It asserts one user, one job, `lock_job_for_claim` held, the unique index valid.
+  - It locks the user row `FOR NO KEY UPDATE` and applies `paid_lookup_access`.
+  - Trial room is `allowance - lifetime_credits_queued`, walked in the CALLER's order, skipping
+    a lead that doesn't fit.
+  - It inserts `queued` with `ON CONFLICT DO NOTHING RETURNING`, joined to results
+    (`user_id` + `job_id` + `not_attempted`), then advances results.
+  - The insert column list is fixed `_COLUMNS` and has **no `action_id`** (confirmed by grep).
+- **The scrape enqueue** (`enrich.py:2229-2840`):
+  - gates;
+  - charged-unanswered settle (`errored`);
+  - placeholder / settled-CV filters;
+  - lock + attempt fence;
+  - re-read under the lock;
+  - per-row ATIP skip, `build_pending_row_payload`, cache-hit ORM copy (encrypted columns: NO
+    raw SQL);
+  - claim, commit.
+- **Writers after the claim, and whether each commits itself** (the 16-3 inventory is now
+  exact):
+  - (G) `_cancel_undeliverable_queued`: caller commits.
+  - (H) `_settle_queued_from_known_answers`: SELF-commits.
+  - (I)/(J) cancel / pre-submit fail: caller commits.
+  - (K) queued→submitting: self.
+  - (L) `_persist_submission`: self.
+  - (M) `_release_claim`: self.
+  - (N) stale-claim reconcile: via L/M.
+  - (O)/(P) ingest completed / unmatched: self, once, under the queue-row lock.
+  - (Q) retention purge.
+  - (R)/(S) two scripts.
+- **Billing is by pending row at ingest** (`report_lookups_for_user` + the meter outbox), keyed
+  `(tracerfy_queue_id, user_id)`. **Nothing bills per action, and 1b-2 must not either.**
+  Settlement here is BOOKKEEPING: derive verdicts and counts, never call the meter.
+- **API→Celery house pattern** (`POST /jobs`, `POST /batches`):
+  - commit the durable row;
+  - `apply_async` in try/except;
+  - a publish failure warns and returns the committed row (no 500);
+  - a beat sweep re-drives stale `pending` rows after N minutes.
+
+  New task modules MUST be added to `src/workers/__init__.py` `include`. Beat entries of 10 min
+  or more must be crontab (`test_beat_schedule`).
+- The quote's Redis payload v2 (`jobs.py:1203-1230`) carries `quoted_ids` (≤2000, in window
+  order), `policy`, pricing, `access`, `trial_credit_allowance`, `window_end`, `expires_at`. It
+  holds counts only for exclusions, not their ids.
+
+### Design decisions to settle in the consult (my recommendation first)
+- **S1 Settlement is DERIVED, not written by the eight live writers (supersedes 15-5 as
+  written).** 15-5 wants every writer to update the action verdict in its own transaction. That
+  means refactoring H, K, L, M and O/P (live paid code, most self-committing) for a status page.
+  - Instead: pending rows carry `action_id` (written by the claim, atomically), and they ARE
+    the per-lead truth.
+  - A reconciler maps each claimed lead to its terminal verdict from `pending_skip_trace_rows`
+    (by `action_id`) + `results`:
+    - `completed` + hit → `answered_hit`;
+    - `completed` + miss → `answered_miss`;
+    - `unmatched` → `unmatched_billable`;
+    - pre-submit `errored` → `errored_unsubmitted`;
+    - `cancelled` → `released`;
+    - `reused` → `reused`.
+  - It recomputes the counts cache, and settles when no active row remains.
+  - Lag = one reconciler tick. The "Cut as over-engineering" note already made the counts a
+    recomputable cache. It never bills.
+- **S2 `last_trace_outcome` writers are OUT of 1b-2 (own phase, 1b-3).** Its only consumer is a
+  future retry-errored feature. Writing it touches every one of the eight writers. NULL stays
+  UNKNOWN (16-3).
+- **S3 Order = spend path last to become reachable.**
+  - **2a** schema + claim `action_id`;
+  - **2b** worker task (idle: nothing dispatches to it);
+  - **2c** reconciler (idle: no actions);
+  - **2d** the confirm endpoint (the switch that makes it live);
+  - **2e** `GET` action status.
+
+  Each is ≤5 files and each is a deploy.
+
+### 1b-2a — `action_id` FK + the claim writes it (migration 107)
+- [ ] Migration 107: composite FK `(action_id, user_id)` → `contact_lookup_actions(id, user_id)`.
+  - `NOT VALID` then `VALIDATE` (every existing row is NULL: trivially valid). Each step under
+    its own `lock_timeout`; object-verified; replay-safe (the 101 pattern).
+  - **ON DELETE: `NO ACTION`**, never CASCADE. A pending row is billing evidence, and deleting
+    an action must never delete it. Actions are only deleted by a user CASCADE, which also
+    reaches the pending rows through their own user FK. (Consult: confirm the cascade order
+    cannot trip NO ACTION.)
+- [ ] `models.py`: the FK on `PendingSkipTraceRow`.
+- [ ] `claim_skip_trace_rows(..., action_id=None)`:
+  - written on every inserted row;
+  - `None` = the scrape path, byte-for-byte as today.
+  - A non-None `action_id` must belong to the same user (the FK proves it at insert).
+- [ ] Tests: the FK refuses a foreign or other-tenant action; the claim writes `action_id`; the
+  scrape path still writes NULL; parity tests unchanged.
+- Files: migration, `models.py`, `skip_trace_claim.py`, `tests/test_skip_trace_claim_action.py`,
+  this plan = 5.
+
+### 1b-2b — the worker `lookup_contacts(action_id)`
+NEW `src/workers/contact_lookup_action.py`, registered in `include`, `system_sync_session()`.
+One task, idempotent under at-least-once delivery. Steps:
+1. **Start CAS:** `dispatching -> running` with `lease_token` / `lease_expires_at`
+   (now + 10 min) / `started_at` + event. Nothing updated means another delivery holds it, or
+   it's terminal: no-op.
+2. **Job gate:**
+   - job by `(id, user_id)`, `status='done'` and delivered (`_job_delivered_sql`, 15-6);
+   - else `failed` + every `quoted` → `abandoned` + events.
+3. **Access gate:**
+   - plan in `SKIP_TRACE_ADDON_PLANS` (fixes the enqueue's starter-only gate for this path);
+   - `paid_lookup_access` not blocked;
+   - else `failed` / `abandoned`.
+4. **Kill switch or token off: the action WAITS** (back to `dispatching`, lease cleared). The
+   reconciler re-drives it until the deadline, then `expired`. (Consult: vs failing fast.)
+5. `lock_job_for_claim(db, job_id)` (H3).
+6. **Read the quoted set (20-3, 16-8):**
+   - `results JOIN contact_lookup_action_results ON action_id AND disposition='quoted'`;
+   - `results.user_id = action.user_id AND results.job_id = action.job_id`;
+   - order `(created_at, id)`, the quote's window order.
+
+   The set can only SHRINK.
+7. Per lead, classified in this order:
+   - `classify(row, current policy)`: a stricter current policy only excludes (15-14). Not
+     quotable → its verdict (`already_answered` / `in_progress_elsewhere` / `excluded_*` /
+     `ineligible`).
+   - Charged-unanswered (the enqueue's `_settle_charged_unanswered` rule) → `already_answered`.
+   - Valid cache hit → ORM copy exactly as the enqueue does → `reused`.
+   - Else a claim payload.
+8. `claim_skip_trace_rows(db, payloads, action_id=..., report=...)`:
+   - returned → `newly_queued`;
+   - `report["held"]` (trial room) → `ineligible` + a per-lead event with reason
+     `trial_allowance`;
+   - lost race → verdict from the row's current status.
+9. **Same transaction:**
+   - every quoted lead gets exactly one verdict;
+   - counts are aggregated from the verdicts;
+   - status `claimed`, `claimed_at`, **lease cleared (15-15)**, event;
+   - ONE commit.
+- **Shared code, not a copy:** the cache-hit copy and the charged-unanswered rule are extracted
+  from `enrich.py` into helpers both paths call. (Consult: extraction touches the live enqueue.
+  The alternative is a copy plus a parity test, which the repo's history says drifts.)
+- Tests (real PG + Redis):
+  - redelivery / double delivery → one set of pending rows;
+  - the action races a scrape enqueue on the same lead → exactly one row, nothing stranded;
+  - a lead answered or queued after the quote → not bought;
+  - a non-quoted id / other-tenant id can never be bought;
+  - the trial cap holds and the held leads are recorded;
+  - kill switch → waits;
+  - job not done → abandoned;
+  - every verdict written;
+  - the lease is cleared at claim;
+  - parity: what the action claims == what the enqueue would claim for the same leads.
+  - Mutations.
+- Files: `contact_lookup_action.py`, `src/workers/__init__.py`, `enrich.py` (extraction), tests,
+  this plan = 5.
+
+### 1b-2c — the reconciler (beat, 120 s interval; under 10 min, so plain seconds is allowed)
+- [ ] `dispatching`:
+  - with `dispatched_at IS NULL` and older than 1 min, or `dispatched_at` older than 5 min →
+    re-publish;
+  - past the deadline (`created_at + 30 min`) → `expired`, quoted → `abandoned` + events.
+- [ ] `running` with `lease_expires_at < now` → back to `dispatching` (the claim is atomic, so
+  nothing is half-done) + event.
+- [ ] `claimed`: derive terminal verdicts from pending rows by `action_id` (S1) + `results`.
+  Recompute counts. No active pending row left → `settled`, `settled_at`, event.
+- [ ] All in `system_sync_session()`, bounded per tick (LIMIT + oldest-first, with the
+  starvation landmine in mind: a per-action cursor, not `ORDER BY oldest LIMIT` alone).
+- Files: `src/workers/scheduler_helpers/contact_lookups.py` (impl), `scheduler.py` (entry), tests, this
+  plan = 4.
+
+### 1b-2d — `POST /jobs/{job_id}/contact-lookups` {quote_id, category} → 202
+Gates:
+1. `wait_for(rate_limit(zone="lookup_quote"))`: shares the quote's bucket; a confirm follows a
+   quote.
+2. job `(id, user_id)`, else 404; not `done` → 409.
+3. plan → 402; frozen/ended → 402; kill switch / token → 503.
+4. `paid_lookup_access` not blocked. The TRIAL ROOM is not checkable by the API (worker-only
+   table): the claim enforces it and the action records the held leads.
+
+Idempotency (15-13):
+- Load the tab's Redis key.
+- Key missing → look up the action by `(quote_id, user_id)` in the DB → return it (200/202);
+  none → 410 `quote_expired`.
+- `quote_id` mismatch (superseded) → 410 `quote_expired`.
+- `v != 2` → 409 `quote_unsupported`.
+- user / job / category / expiry must match.
+
+In ONE API transaction (GUC set, so the guard triggers apply):
+- INSERT the action (`dispatching`, `quoted_count`, `truncated`, pricing snapshot);
+- one `quoted` result row per `quoted_ids`;
+- the `-> dispatching` event;
+- COMMIT. A unique `quote_id` `IntegrityError` → rollback, re-fetch, return that action.
+
+Then:
+- delete the Redis quote by compare-and-delete on `quote_id` (Lua);
+- `lookup_contacts.apply_async(args=[action_id])`;
+- success → `UPDATE dispatched_at` (once);
+- failure → warn and return 202 anyway; the reconciler re-drives.
+
+Response `ContactLookupAction {action_id, status, quoted_count}`.
+- **No exclusion rows at confirm** (the quote stored counts, not ids). The exclusion breakdown
+  stays the quote's. (Consult: vs re-classifying the window at confirm.)
+- Tests:
+  - every gate;
+  - replay → same action;
+  - two concurrent confirms → one action;
+  - superseded quote → 410;
+  - expired → 410 unless the action exists;
+  - publish failure → 202 + `dispatched_at` NULL;
+  - the API cannot write any other state (the triggers, as the real role);
+  - no lead ids in the body.
+- Files: `routes/jobs.py`, `schemas.py`, `schema/openapi.json`, tests, this plan = 5.
+
+### 1b-2e — `GET /jobs/{job_id}/contact-lookups/{action_id}`
+- Status, counts, and the pause state (the quote's reader), for the 1c page.
+- Files: route, schema, openapi, tests, plan.
+
+### Questions for the consult
+1. S1 derived settlement vs 15-5's in-writer updates: what breaks?
+2. The FK's ON DELETE and the cascade order.
+3. The worker's kill-switch behaviour: wait vs fail.
+4. Extracting the enqueue helpers vs copy + parity.
+5. The confirm writes no exclusion rows.
+6. The shared rate bucket.
+7. Anything in the claim/dispatcher that assumes `action_id IS NULL`.
+8. The 20-3 re-authorization: is a JOIN on the quoted set enough?
+9. Is there any path where an action buys a lead outside `quoted_ids`, or twice?
+
+### Codex pre-code consult r1 (2026-09-30): PLAN: REVISE, 3 P1 + 4 P2 + 1 P3, all adopted
+Output: `<scratchpad 49da3c50>/codex_1b2_consult_r1_out.txt`. Both design-changing P1s were
+re-verified in code (`skip_trace_usage.py:599-646`; `repair_probate_party_and_bad_parcel.py:111,
+216,258,266,281`). Codex agreed with S1 (derived settlement), the FK's `NO ACTION`, "wait" on
+the kill switch, helper extraction over a copy, no exclusion rows at confirm, and the 2a→2e
+order. These AMEND the sections above:
+- **V1 (P1) Confirm proves the quoted set.**
+  - Result rows go in with `INSERT ... SELECT` from `results`, constrained to
+    `id = ANY(:quoted_ids) AND user_id = :uid AND job_id = :job_id`.
+  - The inserted count must EQUAL the number of unique `quoted_ids`, else roll back and return
+    409 `quote_stale`.
+  - The worker fails the action closed (`failed`, all `abandoned`) if the durable `quoted` set
+    size ≠ `action.quoted_count`.
+  - The worker's read also re-checks the job-deliverability predicate under the lock (Q8).
+- **V2 (P1) Unmatched follows the BILLING rule.** Billing bills `unmatched` only when the
+  queue's `rows_uploaded >= COUNT(rows sent)` (`accepted_all`); otherwise only `completed`.
+  - Migration 107 adds the disposition **`unmatched_unbilled`** to the CHECK (+ the models
+    constant).
+  - The reconciler maps `unmatched` to `unmatched_billable` / `unmatched_unbilled` by the SAME
+    predicate: `queue_accepted_all(db, queue_id)`, extracted in `skip_trace_usage.py` and
+    called by both billing and the reconciler. One rule, two callers.
+- **V3 (P1) The repair script is gated before any spend path.** New PR **2-0**, first:
+  `scripts/repair_probate_party_and_bad_parcel.py`
+  - takes `lock_job_for_claim()` per job it touches;
+  - REFUSES (report and skip) any pending row with `action_id IS NOT NULL`, and any result
+    that has a non-terminal action verdict.
+
+  16-10 is closed as a gate, not a note. Files: the script, its test, this plan.
+- **V4 (P2) Settlement is atomic and never silent.**
+  - The reconciler writes every terminal verdict, the recomputed counts and `settled` in ONE
+    transaction.
+  - A lead stuck `submitted` with an unknown provider outcome (`skip_trace_dispatcher.py:
+    1621-1627`) keeps the action `claimed` with `status_reason='provider_reconciliation_required'`,
+    an ops alert once per action, and the reason visible in 2e.
+- **V5 (P2) FK delete behaviour.** Keep `NO ACTION` (checked at END of statement, after the
+  job/user cascades have removed both rows). Tests: delete a job, and a user, that own an action
+  with action-linked pending rows; both succeed. A direct action delete is still refused by the
+  guard / grants.
+- **V6 (P2) The quote snapshot is persisted.** Migration 107 adds `contact_lookup_actions.
+  quote_snapshot JSONB NOT NULL DEFAULT '{}'`. It holds the quote's counts, the exclusion
+  breakdown, `policy` (the 15-14 pin: it closes the "policy only in Redis" gap), `access`,
+  `trial_credit_allowance`, `planner_version`, `window_end`, `stopped`, `remaining`.
+  - The API writes it at INSERT. The guard already lets the API insert any non-listed column,
+    and its UPDATE rule freezes it (the `to_jsonb` diff).
+  - A test proves the API cannot change it after insert.
+- **V7 (P2) Confirm is limited in the `writes` zone** (30/min, already fail-closed), not the
+  quote's 10/min bucket. A retry after a broker failure is not starved by the quote scans, and
+  no 6th file (a new zone) is needed. The idempotent re-fetch still sits AFTER the limiter
+  (a limiter hit is a 429 the client retries).
+- **V8 (P3) One transition matrix in code.** `ACTION_TRANSITIONS` / `VERDICT_TRANSITIONS` in the
+  worker module. Every CAS goes through `_move(action, from, to, reason)`, which asserts the
+  matrix and writes the event in the same statement batch. Mutation tests: `settled→running`,
+  `failed→claimed`, a terminal verdict rewritten.
+
+**Revised order and files:**
+- **2-0** writers contract: the repair-script gate + the dispatcher's two stale comments
+  (the script, its test, `skip_trace_dispatcher.py` comments only, this plan = 4).
+- **2a** migration 107: action FK + `unmatched_unbilled` + `quote_snapshot`; `models.py`; claim
+  `action_id`; tests; plan (5).
+- **2b** worker (5).
+- **2c** reconciler + `queue_accepted_all` extraction (`src/workers/scheduler_helpers/contact_lookups.py`,
+  `scheduler.py`, `skip_trace_usage.py`, tests, plan = 5).
+- **2d** confirm (5).
+- **2e** status (5).
+
+### Codex pre-code consult r2 (2026-09-30): PLAN: REVISE, 3 P1 + 4 P2; V5, V6 confirmed
+Output: `<scratchpad 49da3c50>/codex_1b2_consult_r2_out.txt`. Codex confirmed that a
+non-deferred `NO ACTION` is checked at END of statement, after cascades. It also confirmed that
+cascaded deletes fire the 101 BEFORE DELETE guards as the deleting role, so the V5 tests delete
+as the system/owner role. And it confirmed that `quote_snapshot` is insertable by the API and
+frozen on UPDATE. These AMEND V1-V8:
+- **W1 (P1) The lease is committed, and the claim is fenced by it.**
+  - T1: the start CAS `dispatching→running` (token, expiry, `started_at`, event) COMMITS alone,
+    so a crashed worker leaves a visible expiring lease for the reconciler.
+  - T2 (fresh transaction):
+    1. `SELECT ... FOR UPDATE` the action;
+    2. re-check `status='running' AND lease_token=:mine AND lease_expires_at > now()`;
+    3. `lock_job_for_claim`, then the claim and the verdicts, then `claimed` + the lease
+       cleared;
+    4. ONE commit.
+  - A lost fence means a no-op. Every fail / wait / abandon transition is its own committed
+    transaction. Test: kill the worker between T1 and T2; the reconciler recovers it.
+- **W2 (P1) The 2-0 repair-script gate, exactly.** Per job, in the transaction that writes:
+  `lock_job_for_claim(job)` → RE-READ the rows → refuse (skip + report) any pending row with
+  `action_id IS NOT NULL` and any result with a non-terminal action verdict → write → commit.
+  Tests on real rows: an action-linked row is never touched; an unlinked one is repaired.
+- **W3 (P1) Unmatched mirrors what billing DID, and billing's own rule has a latent gap.**
+  - The reconciler calls the SAME extracted `queue_accepted_all(db, queue_id)` as
+    `report_usage_from_webhook`, so the action page always agrees with what Stripe received.
+  - Codex found the gap, and I verified it: the rows actually SENT (`len(claimed)`,
+    `skip_trace_dispatcher.py:1510-1528`) are never persisted. `_persist_submission` allows
+    `moved < claimed` (alert only, `:1576-1578`). `accepted_all` compares `rows_uploaded` with
+    the rows STAMPED with the queue id. So in a partial-bookkeeping batch, unmatched rows can be
+    billed although a row was dropped.
+  - That is a PRE-EXISTING live billing edge case (rare: it needs the partial-bookkeeping alert
+    to have fired). It is NOT introduced here. → **Owner item O-C.**
+- **W4 (P2) V7 wording corrected.** The `writes` zone is a shared per-user 30/min limit with a
+  bounded per-process fallback when Redis fails (not a hard fail-closed). Confirm passes
+  `identifier=current_user.id`.
+- **W5 (P2) The claim reports WHICH leads it held.** `report["held_ids"]` (the result ids the
+  trial room held, in order) alongside `report["held"]` (the count, unchanged), so the worker
+  writes a per-lead `ineligible` + `trial_allowance` event. In 2a.
+- **W6 (P2) The claim proves action ↔ job.** With `action_id`, the insert JOINs
+  `contact_lookup_actions a ON a.id = :action_id AND a.user_id = v.user_id AND a.job_id =
+  v.job_id`: a pending row can never be attributed to another job's action. In 2a. Test: an
+  action of job A handed leads of job B claims nothing.
+- **W7 (P2) One state machine, both writers.** `ACTION_TRANSITIONS`, `VERDICT_TRANSITIONS` and
+  `_move()` live in the worker module (`contact_lookup_action.py`), and the 2c reconciler
+  IMPORTS them, so there is no second copy and no 6th file.
+
+### Codex pre-code consult r3 (2026-09-30): PLAN: REVISE, 2 P2 + 1 P3; W1-W7 closed, no deadlock
+Output: `<scratchpad 49da3c50>/codex_1b2_consult_r3_out.txt`. Lock order verified against the
+dispatcher: W1's action -> job advisory -> user row does not conflict with the dispatcher's global
+advisory lock + `SKIP LOCKED` row locks. Adopted:
+- **X1 (P2) S1 stands; the stale dispatcher contract is corrected.** `_cancel_undeliverable_queued`'s
+  docstring (`skip_trace_dispatcher.py:868-873`) promises that 1b-2 moves the action verdict to
+  `released` in the same transaction. Under S1 cancellation stays pending-row-only and the
+  reconciler derives `cancelled -> released`. The docstring is rewritten in **2-0** (the
+  writers-contract PR), BOTH places: the comment at `:284-290` and the docstring at `:868-873`,
+  so no reviewer re-implements the old promise.
+- **X2 (P2) O-C is a HARD GATE before 2d**, with regression tests for `rows_sent != rows_uploaded`
+  and a legacy `rows_sent IS NULL` (bill `completed` only).
+- **X3 (P3)** the 2c path is `src/workers/scheduler_helpers/contact_lookups.py`.
+- 2-0 replaces the script's global scan-then-commit with a per-job lock -> re-read -> refuse -> write
+  -> commit (`repair_probate_party_and_bad_parcel.py:404,571`).
+
+**Consult r4 (2026-09-30): REVISE** (O-C wording, the second stale dispatcher comment at `:284-290`,
+the 2-0 manifest; all fixed). **r5: `PLAN: GO`, no findings.** Outputs `<scratchpad 49da3c50>/
+codex_1b2_consult_r{4,5}_out.txt`.
+
+**OWNER DECISIONS (2026-09-30): plan APPROVED, build from 2-0 in order.** O-A: confirm goes
+live with 2d (no flag). O-B: kill switch off -> the action WAITS until its deadline, then expires.
+O-C: its own billing PR, and it BLOCKS 2d.
+
+### Owner items (before code)
+- **O-C** (billing, pre-existing, found by the consult) Persist `skip_trace_queues.rows_sent`
+  at submission and compare `rows_uploaded` against it in `accepted_all`. With a mismatch, or
+  with no `rows_sent` (old rows), bill `completed` only. It's a live billing change: a
+  migration, the dispatcher and billing, its own PR. **2d is BLOCKED until O-C has shipped**
+  (migration, dispatcher, billing, and the mismatch + `rows_sent IS NULL` regression tests):
+  confirm is what adds volume. It does not block 2-0/2a/2b/2c.
+- **O-A** Should the confirm endpoint (2d) go live before the frontend (1c) ships? It's
+  reachable only by an authenticated paying account and gated like the quote. The alternative
+  is a feature flag: `settings.py` + `.env.example`, over the 5-file rule, a split.
+- **O-B** Kill switch off after a confirm: should the action wait (recommended), or fail?
+
+### 2-0 BUILT (2026-09-30), before the Codex diff review
+- `scripts/repair_probate_party_and_bad_parcel.py`:
+  - Every write is now `_guarded_write`: one transaction per row, `lock_job_for_claim(job)`,
+    then the action check UNDER the lock, then the existing guarded UPDATEs (they are the
+    re-read), then commit.
+  - A lead is SKIPPED (journal `skipped_action_linked`) when any of its pending rows has an
+    `action_id`, or it has an open verdict (`quoted`, `newly_queued`).
+  - A dry run takes no lock and writes nothing, but reports `would_skip_action_linked`.
+  - The run-wide single commit is gone, so the claim lock is never held across the script's
+    live county lookups.
+  - The candidate queries now select `job_id`.
+- `skip_trace_dispatcher.py`: comments only (`:284-290`, `_cancel_undeliverable_queued`'s
+  docstring). Cancellation writes queue and result rows only; `released` is derived (S1, X1).
+- Tests: 8 new REAL-DB tests in `tests/test_repair_probate_party_and_bad_parcel.py`:
+  - an unowned lead repaired;
+  - an action-owned trace untouched;
+  - a `quoted` lead untouched;
+  - a settled verdict doesn't block;
+  - the write WAITS on another session's claim lock (two connections);
+  - a dry run reports and writes nothing;
+  - end to end through `repair_party` (the stale placeholder-name trace re-derived on the free
+    lead, untouched on the owned one).
+  - 29 passed. **Mutations 6/6 caught** (lock dropped, action check dropped, open verdicts
+    narrowed, pending `action_id` ignored, dry-run check dropped, party write unguarded).
+- **Found while building it (P1, MINE, fixed separately as #398):** since #393, any process
+  whose FIRST import is `src.scrapers` (every ops script) dies with a circular ImportError:
+  `routes/jobs.py` imported the planner at module top (the planner → `pierce_atip_owner` →
+  `base_scraper` → `src.api` → the routers). The api and the worker survived by import order.
+  #398 moves the import into the handler, and adds a fresh-interpreter import test over 10
+  entry points + every Celery `include` module.
+- **Codex diff review r1: NO-GO, 3 P2, all adopted.**
+  1. Lock order: the script wrote results before pending rows, against the queue's order
+     (pending, then results), which could deadlock a dispatcher tick. `_guarded_write` now
+     locks the lead's pending rows (`FOR UPDATE`, by id), then the result, before any write.
+     New test: while another session holds the pending row, the blocked repair holds NOTHING
+     on the result (a `NOWAIT` lock succeeds).
+  2. The lock test now proves the wait happens INSIDE `lock_job_for_claim` (a pass-through
+     spy around the real function).
+  3. `_PARCEL_RECOVER` is also guarded on `party_name`, because the recovered parcel is chosen
+     from it.
+  Now 30 passed; **mutations 8/8** (+ row locks dropped, + recovery party guard dropped).
+- Local test DB upgraded 105 → 106 (#394's `jobs.breakdown_*`) via `scripts/migrate.py`.
+
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever
       the tab has leads that have never been looked up; when the quote comes back with

@@ -25,6 +25,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import DeclarativeBase, relationship, validates
 
+from src.config.constants import RUN_SCRAPE_TIME_LIMIT_S
 from src.db.encrypted_types import EncryptedJSON, EncryptedString
 
 # src.utils.crypto.blind_index is imported LAZILY inside the @validates hook below
@@ -816,18 +817,27 @@ class Job(Base):
 
     # A cancelled run whose worker had started keeps scraping until it notices the
     # cancel, and the dedup claims it writes meanwhile would freeze a new run's
-    # leads as "already delivered". The heartbeat stops at the cancel (it skips
-    # cancelled rows), so liveness cannot be read; a new start waits this long.
-    RUN_SLOT_CANCEL_COOLDOWN_SECONDS = 300
+    # leads as "already delivered". So the slot is held until the worker says it
+    # has stopped (the exit acknowledgement NULLs last_heartbeat_at, see
+    # _acknowledge_exit in src/workers/tasks_helpers/status.py) or until the
+    # Celery hard time limit has provably killed it: this long after its
+    # started_at. The slack covers the kill landing after the limit expires.
+    # A fixed cooldown after the cancel (300 s) was audit #4 S4-02: nothing bounds
+    # how long the worker takes to notice.
+    RUN_SLOT_RELEASE_AFTER_S = RUN_SCRAPE_TIME_LIMIT_S + 120
 
     @classmethod
-    def holds_run_slot(cls, now):
+    def holds_run_slot(cls):
         """SQL condition: this job still occupies its scraper's single run slot.
 
         Active (migration 104's index enforces one), or cancelled after a worker
-        started it within the cooldown. EVERY start path uses this (POST /jobs,
-        the scheduler, the batch fan-out), so none can start a run the others
-        would refuse (UX audit F-003)."""
+        claimed it and before that worker stopped. EVERY start path uses this
+        (POST /jobs, the scheduler, the batch fan-out), so none can start a run the
+        others would refuse (UX audit F-003).
+
+        The age is judged by the database's now(), never a caller's clock:
+        started_at is a database-clock stamp (claim_job_for_attempt), and comparing
+        it with an app clock that runs fast would release a live attempt early."""
         from datetime import timedelta
 
         from sqlalchemy import and_, or_
@@ -839,7 +849,8 @@ class Job(Base):
             and_(
                 cls.status == "cancelled",
                 cls.started_at.is_not(None),
-                cls.finished_at > now - timedelta(seconds=cls.RUN_SLOT_CANCEL_COOLDOWN_SECONDS),
+                cls.last_heartbeat_at.is_not(None),
+                cls.started_at > func.now() - timedelta(seconds=cls.RUN_SLOT_RELEASE_AFTER_S),
             ),
         )
 

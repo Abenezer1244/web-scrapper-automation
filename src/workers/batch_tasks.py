@@ -224,7 +224,7 @@ def dispatch_batch_run(run_id: str) -> None:
                             status="pending",
                             trigger="batch",
                         )
-                        # A child cancelled mid-run moments ago is still stopping:
+                        # A child cancelled mid-run whose worker has not stopped yet:
                         # the run-slot rule every start path shares (F-003). The
                         # index below only covers ACTIVE runs.
                         stopping = db.execute(
@@ -232,7 +232,7 @@ def dispatch_batch_run(run_id: str) -> None:
                                 Job.scraper_config_id == c.id,
                                 Job.user_id == c.user_id,
                                 Job.status == "cancelled",
-                                Job.holds_run_slot(datetime.now(UTC)),
+                                Job.holds_run_slot(),
                             ).limit(1)
                         ).scalar()
                         if stopping is not None:

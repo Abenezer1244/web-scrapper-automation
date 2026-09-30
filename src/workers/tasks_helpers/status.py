@@ -717,6 +717,14 @@ def claim_job_for_attempt(db, job_id: str):
     counting against a run that is already going. Claiming is exactly the moment it
     stops being true.
 
+    The stamp is the DATABASE clock (``now()``, the transaction's start, so both
+    columns get the identical value), never this worker's. ``Job.holds_run_slot``
+    releases a cancelled attempt that never acknowledged its exit once started_at
+    is older than the Celery hard limit by the database's now(). A worker clock
+    running slow would stamp an earlier started_at and release a live attempt
+    early (audit #4 S4-02, Codex). The transaction began inside the task, so the
+    stamp is still no earlier than the task's start.
+
     This lives here, rather than inline in ``run_scrape_job``, so the guarantee is
     testable against the code production actually runs. A test that re-types this
     UPDATE proves only that the test's own SQL works: deleting the heartbeat stamp
@@ -729,28 +737,29 @@ def claim_job_for_attempt(db, job_id: str):
 def claim_attempt(db, job_id: str) -> AttemptToken | None:
     """The claim above, returning the whole attempt token (see AttemptToken).
 
-    ``retry_count`` comes from the claim UPDATE's own RETURNING, so it is the value
-    of the row this attempt won, never a separate read that could see a later one.
-    run_scrape_job uses this; ``claim_job_for_attempt`` stays for older callers.
+    ``started_at`` and ``retry_count`` both come from the claim UPDATE's own
+    RETURNING, so they are the values of the row this attempt won, never a separate
+    read that could see a later one. started_at is the database's now() (see
+    claim_job_for_attempt for why). run_scrape_job uses this;
+    ``claim_job_for_attempt`` stays for older callers.
     """
-    from sqlalchemy import update
+    from sqlalchemy import func, update
 
     from src.db.models import Job
 
-    claimed_at = _now()
     won = db.execute(
         update(Job)
         .where(Job.id == job_id, Job.status == "pending")
         .values(
             status="queued",
-            started_at=claimed_at,
-            last_heartbeat_at=claimed_at,
+            started_at=func.now(),
+            last_heartbeat_at=func.now(),
             next_retry_at=None,
         )
-        .returning(Job.retry_count)
+        .returning(Job.started_at, Job.retry_count)
     ).first()
     db.commit()
-    return AttemptToken(claimed_at, int(won.retry_count)) if won is not None else None
+    return AttemptToken(won.started_at, int(won.retry_count)) if won is not None else None
 
 
 class AttemptState(NamedTuple):
@@ -1066,3 +1075,56 @@ class HeartbeatThread:
 
     def __exit__(self, *_exc) -> None:
         self.stop()
+        if self._started_at is not None:
+            _acknowledge_exit(self._job_id, self._started_at)
+
+
+# ── Exit acknowledgement (audit #4 S4-02) ────────────────────────────────────
+# A cancel only flips jobs.status; the worker keeps scraping until it reaches a
+# cancel check, and the dedup claims it writes meanwhile would make a new run of
+# the same scraper drop those leads as "already delivered". So a cancelled
+# attempt holds its scraper's run slot until its worker SAYS it has stopped, and
+# this is where it says so: HeartbeatThread.__exit__, which run_scrape_job's
+# outermost `with` fires after the work session has closed, on return, exception
+# and soft time limit alike. Nothing of the task runs after it.
+#
+# NULL last_heartbeat_at on a started cancelled row is that acknowledgement. The
+# claim stamps last_heartbeat_at, so a claimed row is NULL only after this runs
+# (the watchdog's re-queue also NULLs it, but it NULLs started_at too, and only
+# for active rows). The heartbeat SQL never writes a cancelled row, so no late
+# beat can undo it. Only 'cancelled' is touched: a done or failed job holds no
+# slot, and its liveness is history worth keeping. Attempt-scoped with the SAME
+# predicate as the heartbeat (_attempt_sql: started_at AND retry_count), so a
+# superseded worker cannot release the live attempt's slot.
+# A worker that dies before this (deploy, OOM, hard limit) never acknowledges;
+# Job.holds_run_slot then releases the slot once the hard limit has provably
+# killed it.
+def _ack_exit_sql(attempt_sql: str):
+    return text(
+        "UPDATE jobs SET last_heartbeat_at = NULL "  # noqa: S608 -- splices only _attempt_sql's fixed fragment
+        f"WHERE id = :j AND {attempt_sql} AND status = 'cancelled'"
+    )
+
+
+def _acknowledge_exit(job_id: str, token) -> None:
+    """Release a cancelled attempt's run slot now that its worker has stopped.
+
+    Never raises anything but a Celery time limit: it runs while the task may be
+    unwinding its own exception, and a failed acknowledgement only costs the
+    customer a wait (the hard-limit release still applies), whereas masking the
+    task's error would hide the real failure. Runs on the isolated heartbeat
+    engine for the reason in _write_heartbeat.
+    """
+    from src.db.session import heartbeat_sync_session
+
+    try:
+        with heartbeat_sync_session() as _db:
+            attempt_sql, attempt_params = _attempt_sql(token)
+            _db.execute(_ack_exit_sql(attempt_sql), {"j": str(job_id), **attempt_params})
+            _db.commit()
+    except Exception as exc:  # noqa: BLE001 — see docstring
+        reraise_time_limit(exc)
+        _logger.warning(
+            "Job %s: could not acknowledge the worker's exit; a cancelled run keeps "
+            "its scraper's slot until the hard time limit: %s", job_id, str(exc)[:200],
+        )

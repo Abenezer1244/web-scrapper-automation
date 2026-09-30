@@ -24,6 +24,8 @@ from src.api.quota_window import (
     window_set_sql,
 )
 from src.config.constants import (
+    RUN_SCRAPE_SOFT_TIME_LIMIT_S,
+    RUN_SCRAPE_TIME_LIMIT_S,
     SCRAPE_TRANSIENT_BACKOFF_SECONDS,
     SCRAPE_TRANSIENT_MAX_RETRIES,
     scrape_queue_for_plan,
@@ -477,8 +479,8 @@ class _RunScrapeJobTask(app.Task):
     max_retries=3,
     default_retry_delay=30,
     acks_late=True,
-    soft_time_limit=3600,  # 60 min (scrape + enrichment in one job)
-    time_limit=3900,       # 65 min
+    soft_time_limit=RUN_SCRAPE_SOFT_TIME_LIMIT_S,
+    time_limit=RUN_SCRAPE_TIME_LIMIT_S,
 )
 def run_scrape_job(self, job_id: str) -> None:
     """Execute a full scrape job lifecycle for the given job_id."""
@@ -655,6 +657,27 @@ def run_scrape_job(self, job_id: str) -> None:
         except Exception:  # request context unavailable (e.g. direct call) — non-fatal
             pass
 
+        # Liveness heartbeat RE-ENABLED (2026-09-09) under the condition the
+        # 2026-06-18 rollback set: the heartbeat now runs on `heartbeat_engine`, a
+        # DEDICATED NullPool engine (src/db/session.py), so it can never contend
+        # with the pool_size=2 work pool that the main session and _publish_log
+        # share. That contention is what deadlocked every scrape at the insert
+        # phase and got this disabled.
+        #
+        # It was disabled for long enough that last_heartbeat_at was NULL on every
+        # job in production, which quietly made the watchdog's 15-minute
+        # stale-heartbeat branch DEAD CODE: a job whose worker was killed mid-scrape
+        # (a deploy, an OOM, a hard timeout) sat visibly "running" for the full
+        # 70-minute started_at fallback with nothing to show it was gone. That is
+        # exactly what stranded job 9c8b7259 on 2026-09-09.
+        #
+        # Started straight after the claim, before any gate below can return: the
+        # thread's __exit__ is also this attempt's exit acknowledgement, which is
+        # what releases a cancelled run's slot at once (audit #4 S4-02). An
+        # attempt that returned before start() would never acknowledge, and its
+        # cancelled slot would stay held until the hard time limit.
+        _hb.start(attempt_token)
+
         # A deleted or plan-paused scraper never runs, whoever queued the job.
         # A delete or pause can land after the Job was created: a batch fan-out
         # between its read and its commit, or any job queued earlier (UX audit
@@ -709,20 +732,6 @@ def run_scrape_job(self, job_id: str) -> None:
             _fail_attempt(f"{_violation.title}. {_violation.message}", notify=False)
             return
 
-        # Liveness heartbeat RE-ENABLED (2026-09-09) under the condition the
-        # 2026-06-18 rollback set: the heartbeat now runs on `heartbeat_engine`, a
-        # DEDICATED NullPool engine (src/db/session.py), so it can never contend
-        # with the pool_size=2 work pool that the main session and _publish_log
-        # share. That contention is what deadlocked every scrape at the insert
-        # phase and got this disabled.
-        #
-        # It was disabled for long enough that last_heartbeat_at was NULL on every
-        # job in production, which quietly made the watchdog's 15-minute
-        # stale-heartbeat branch DEAD CODE: a job whose worker was killed mid-scrape
-        # (a deploy, an OOM, a hard timeout) sat visibly "running" for the full
-        # 70-minute started_at fallback with nothing to show it was gone. That is
-        # exactly what stranded job 9c8b7259 on 2026-09-09.
-        _hb.start(attempt_token)
         # Stage rides the commit that _publish_log already performs, so no new commit
         # point is introduced into the work session (see _set_progress).
         if not _still_ours(_set_stage(db, job, "preparing", expected_started_at=attempt_token,

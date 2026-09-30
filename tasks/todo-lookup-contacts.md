@@ -3462,6 +3462,21 @@ O-C: its own billing PR, and it BLOCKS 2d.
   - a non-composite FK;
   - the new value left out of the CHECK;
   - the snapshot nullable with no default.
+- **Codex diff review r1: NO-GO (2 P2 + 2 P3, no P1), all adopted.**
+  1. Replay object-verification: the FK is checked BY DEFINITION on
+     `public.pending_skip_trace_rows` (an impostor is rebuilt), and an existing
+     `quote_snapshot` must be jsonb NOT NULL DEFAULT '{}' or the migration aborts.
+  2. The downgrade refuses while ANY action row exists (dropping the snapshot would destroy
+     quote evidence).
+  3. The lock docs now name the real levels:
+     - ACCESS EXCLUSIVE for ADD COLUMN and the CHECK swap;
+     - SHARE ROW EXCLUSIVE on `pending_skip_trace_rows` for the FK, held to commit;
+     - `lock_timeout` bounds acquisition only.
+  4. A test asserts both constraints are validated and defined as intended.
+  - Verified locally against the real DB:
+    - REPLAY on an applied schema (`stamp 106` + migrate) succeeds;
+    - an IMPOSTOR FK (single-column, CASCADE) is rebuilt to the composite NO ACTION FK;
+    - a WRONG column (nullable) aborts at 106, and once fixed it migrates to 107.
 - **Regression: 726 passed, 0 failed** (every test file that writes pending rows or the
   ledger, 2 chunks). ruff clean. No type checker is configured.
 

@@ -884,6 +884,22 @@ async def _pending(db, user: User, job_id: str, rid: str, action_id) -> None:
     ), {"id": str(uuid.uuid4()), "job": job_id, "r": rid, "uid": user.id, "a": action_id})
 
 
+async def test_107s_constraints_exist_as_defined_and_are_validated(db):
+    """NOT VALID then VALIDATE: an unvalidated constraint enforces new rows only."""
+    rows = {r.conname: r for r in (await db.execute(text(
+        "SELECT conname, convalidated, confdeltype::text AS confdeltype, "
+        "pg_get_constraintdef(oid) AS condef "
+        "FROM pg_constraint WHERE conname IN "
+        "('fk_pending_skip_trace_action_tenant', 'ck_contact_lookup_action_results_disposition')"
+    ))).all()}
+    fk = rows["fk_pending_skip_trace_action_tenant"]
+    assert fk.convalidated and fk.confdeltype == "a", "must be validated, ON DELETE NO ACTION"
+    assert fk.condef == (
+        "FOREIGN KEY (action_id, user_id) REFERENCES contact_lookup_actions(id, user_id)")
+    ck = rows["ck_contact_lookup_action_results_disposition"]
+    assert ck.convalidated and "unmatched_unbilled" in ck.condef
+
+
 async def test_a_pending_row_may_name_its_own_accounts_action(db, business_user):
     job_id, rid = await _job_and_result(db, business_user)
     action = await _action(db, business_user, job_id)

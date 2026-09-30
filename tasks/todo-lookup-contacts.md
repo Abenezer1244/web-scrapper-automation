@@ -3489,6 +3489,39 @@ O-C: its own billing PR, and it BLOCKS 2d.
 - **Regression: 726 passed, 0 failed** (every test file that writes pending rows or the
   ledger, 2 chunks). ruff clean. No type checker is configured.
 
+### 2a-i MERGED + LIVE (2026-09-30): #402, merge `e9397f0f`
+- Migration 107 was verified in PRODUCTION BY THE OBJECTS (read-only):
+  - the FK is validated, `confdeltype='a'`, with the exact composite definition;
+  - the CHECK is validated and includes `unmatched_unbilled`;
+  - `quote_snapshot` is jsonb NOT NULL default `'{}'`;
+  - 0 pending rows carry an `action_id`.
+- api and beat logged "migrations applied" and booted clean.
+- The worker's DSN reads an EMPTY `alembic_version`, so objects, not the version table, are
+  the proof.
+- Rebased once over #401 (AI-mode removal, no overlap); Codex r4 GO.
+
+### 2a-ii BUILT (2026-09-30), before the Codex diff review
+Branch `feat/lookup-1b2a-ii-claim-action` off `e9397f0f` (after #399's
+`held_lookup_message`).
+- `claim_skip_trace_rows(..., action_id=None)`:
+  - With an action, every inserted row carries it. The INSERT JOINs
+    `contact_lookup_actions a ON a.id = :action_id AND a.user_id = v.user_id AND a.job_id =
+    v.job_id` (W6): an action of another job, another tenant, or none claims NOTHING.
+  - With `None` the three SQL fragments are empty: the scrape path's statement is unchanged
+    (a test asserts it never mentions an action).
+  - `report["held_ids"]`: the held leads' result ids in the caller's order (W5), beside the
+    unchanged `held` count. For a blocked account, all of them.
+- Tests: NEW `tests/test_skip_trace_claim_action.py` (9, real PG). The 3 exact-dict
+  `report` assertions in `test_audit4_paid_skip_trace_gate.py` now include `held_ids` (the
+  contract changed on purpose). Files: claim, 2 tests, this plan = 4.
+- **Mutations 5/6 caught.** Caught: the join dropped; its job check dropped; the action not
+  written; trial held ids; blocked held ids. **The survivor is EQUIVALENT:** the join's
+  tenant check is implied by its job check (`a.job_id = v.job_id` with `j.user_id =
+  v.user_id`, and 101's FK `(job_id, user_id) -> jobs` makes an action's tenant its job's
+  tenant). It is kept as the explicit belt.
+- **Regression: 825 passed, 0 failed** (all 27 files that touch the claim, pending rows or
+  the ledger, 2 chunks). The first run caught the 3 exact-dict asserts, fixed as above.
+
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever
       the tab has leads that have never been looked up; when the quote comes back with

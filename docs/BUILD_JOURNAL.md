@@ -19,7 +19,7 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
-## 2026-09-28..30 — Contact lookup 1b-1c: the planner and the quote are live (and main moved five times under them)
+## 2026-09-28..30 — Contact lookup 1b-1c: the planner and the quote are live
 
 > Owner asked: build 1b-1c (a pure planner shared with the future worker, and the quote
 > endpoint), then ship it under the standing merge rule. Plan: `tasks/todo-lookup-contacts.md`,
@@ -40,7 +40,8 @@ to understand *why* the code is the way it is and *what's been attempted before*
   6. the kill switch;
   7. `paid_lookup_access()`.
 
-  Redis is PINGed before any DB work, and a quote that can't be stored is never shown (503).
+  Redis is PINGed before the results/planner scan, and a quote that can't be stored is never
+  shown (503).
   The stored payload is v2, one live quote per tab, with a 600 s TTL. The response carries no
   lead ids. Prod probe: an unauthenticated POST returns 401.
 

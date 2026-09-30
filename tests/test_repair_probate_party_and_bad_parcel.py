@@ -243,3 +243,207 @@ def test_trace_name_uses_the_enqueues_own_derivation():
     # are named only in comments explaining why.
     # ...and the same normal/advanced rule the enqueue applies.
     assert '"normal" if (first and last) else "advanced"' in src
+
+
+# ── the contact-lookup action gate (Phase 1b-2, 2-0 / W2), on REAL rows ─────────
+#
+# The script writes skip-trace state, so it must serialise with the claim
+# (lock_job_for_claim) and must never rewrite a lead a contact-lookup action owns.
+# These run against the test database; no network (the parcel writes are driven
+# directly, past the live county lookups that decide them).
+
+import threading  # noqa: E402
+import time  # noqa: E402
+import uuid  # noqa: E402
+
+from sqlalchemy import text  # noqa: E402
+
+from src.db.session import system_sync_session  # noqa: E402
+from src.workers.skip_trace_claim import lock_job_for_claim  # noqa: E402
+
+_BAD_PIN = "12345"  # not a well-formed 10-digit King PIN: a parcel candidate
+
+
+def _seed_lead(user_id, *, pending=False, action_on_pending=False, verdict=None,
+               record_type="probate", party="SMITH JOHN", heirs=None,
+               trace=(None, None, "advanced")):
+    """A King lead with a malformed parcel. Optionally a queued pending row (itself
+    optionally owned by an action) and/or an action verdict on the lead."""
+    sc, job, rid = str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4())
+    with system_sync_session() as db:
+        db.execute(text(
+            "INSERT INTO scraper_configs (id, user_id, name, county, state, record_type, "
+            "fields, enrichment, schedule, deliver, skip_trace_enabled) VALUES "
+            "(:sc, :u, 'repair', 'king', 'WA', :rt, '[]', '[]', '{}', '{}', false)"
+        ), {"sc": sc, "u": user_id, "rt": record_type})
+        db.execute(text(
+            "INSERT INTO jobs (id, user_id, scraper_config_id, status, trigger) "
+            "VALUES (:j, :u, :sc, 'done', 'manual')"
+        ), {"j": job, "u": user_id, "sc": sc})
+        db.execute(text(
+            "INSERT INTO results (id, job_id, user_id, parcel_id, party_name, heirs, "
+            "property_address, property_city, property_state, property_zip, "
+            "skip_trace_status, is_duplicate, enrichment_data) VALUES "
+            "(:r, :j, :u, :pin, :party, :heirs, '9 WRONG ST', 'SEATTLE', 'WA', '98101', "
+            ":st, false, '{}')"
+        ), {"r": rid, "j": job, "u": user_id, "pin": _BAD_PIN, "party": party,
+            "heirs": heirs, "st": "queued" if pending else "not_attempted"})
+        action = None
+        if action_on_pending or verdict:
+            action = str(uuid.uuid4())
+            db.execute(text(
+                "INSERT INTO contact_lookup_actions (id, user_id, job_id, category, quote_id, "
+                "status, unit_price_cents, currency, pricing_version) VALUES "
+                "(:a, :u, :j, 'new', :q, 'claimed', 8, 'USD', '2026-06')"
+            ), {"a": action, "u": user_id, "j": job, "q": f"q-{action}"})
+        if pending:
+            db.execute(text(
+                "INSERT INTO pending_skip_trace_rows (id, job_id, result_id, user_id, "
+                "property_address, first_name, last_name, trace_type, status, action_id) "
+                "VALUES (:p, :j, :r, :u, '9 WRONG ST', :f, :l, :t, 'queued', :a)"
+            ), {"p": str(uuid.uuid4()), "j": job, "r": rid, "u": user_id,
+                "f": trace[0], "l": trace[1], "t": trace[2],
+                "a": action if action_on_pending else None})
+        if verdict:
+            db.execute(text(
+                "INSERT INTO contact_lookup_action_results (id, action_id, user_id, "
+                "result_id, disposition) VALUES (:id, :a, :u, :r, :d)"
+            ), {"id": str(uuid.uuid4()), "a": action, "u": user_id, "r": rid, "d": verdict})
+        db.commit()
+    return job, rid
+
+
+def _candidate(db, rid):
+    rows = db.execute(_mod._PARCEL_CANDIDATES, {"pin_len": _mod._KING_PIN_DIGITS}).mappings().all()
+    db.rollback()
+    return next(r for r in rows if str(r["id"]) == rid)  # raw SQL returns uuid.UUID
+
+
+def _state(rid):
+    with system_sync_session() as db:
+        res = db.execute(text(
+            "SELECT property_address, skip_trace_status, party_name FROM results WHERE id = :r"
+        ), {"r": rid}).one()
+        pend = db.execute(text(
+            "SELECT status, first_name, last_name, trace_type FROM pending_skip_trace_rows "
+            "WHERE result_id = :r"
+        ), {"r": rid}).all()
+    return res, pend
+
+
+def _clear(db, row, stats, journal, *, apply=True):
+    enrichment = {"parcel_lookup": "mismatch"}
+    return _mod._guarded_write(db, row, apply=apply, repair="parcel", stats=stats,
+                               journal=journal,
+                               write=lambda: _mod._clear_row(db, row, enrichment, stats))
+
+
+def _stats():
+    return {"cleared": 0, "traces_cancelled": 0}
+
+
+async def test_an_unowned_lead_is_repaired_and_its_trace_cancelled(db, business_user, tmp_path):
+    _job, rid = _seed_lead(business_user.id, pending=True)
+    stats, journal = _stats(), str(tmp_path / "j.jsonl")
+    with system_sync_session() as s:
+        assert _clear(s, _candidate(s, rid), stats, journal) is True
+    res, pend = _state(rid)
+    assert res.property_address is None and res.skip_trace_status == "not_attempted"
+    assert [p.status for p in pend] == ["errored"]
+    assert stats["cleared"] == 1 and stats["traces_cancelled"] == 1
+    assert "skipped_action_linked" not in stats
+
+
+async def test_a_lead_whose_queued_trace_an_action_owns_is_never_touched(db, business_user, tmp_path):
+    _job, rid = _seed_lead(business_user.id, pending=True, action_on_pending=True)
+    stats, journal = _stats(), tmp_path / "j.jsonl"
+    with system_sync_session() as s:
+        assert _clear(s, _candidate(s, rid), stats, str(journal)) is False
+    res, pend = _state(rid)
+    assert res.property_address == "9 WRONG ST" and res.skip_trace_status == "queued"
+    assert [p.status for p in pend] == ["queued"]
+    assert stats["skipped_action_linked"] == 1 and stats["cleared"] == 0
+    assert '"skipped_action_linked"' in journal.read_text(encoding="utf-8")
+
+
+async def test_a_lead_an_action_has_quoted_is_never_touched(db, business_user, tmp_path):
+    """No pending row yet: the action worker may still claim it."""
+    _job, rid = _seed_lead(business_user.id, verdict="quoted")
+    stats = _stats()
+    with system_sync_session() as s:
+        assert _clear(s, _candidate(s, rid), stats, str(tmp_path / "j.jsonl")) is False
+    res, _ = _state(rid)
+    assert res.property_address == "9 WRONG ST"
+    assert stats["skipped_action_linked"] == 1
+
+
+async def test_a_settled_verdict_does_not_block_a_repair(db, business_user, tmp_path):
+    """Only an OPEN verdict owns the lead; a finished action's verdict is history."""
+    _job, rid = _seed_lead(business_user.id, verdict="answered_hit")
+    stats = _stats()
+    with system_sync_session() as s:
+        assert _clear(s, _candidate(s, rid), stats, str(tmp_path / "j.jsonl")) is True
+    res, _ = _state(rid)
+    assert res.property_address is None
+
+
+async def test_the_open_verdicts_are_real_dispositions():
+    from src.db.models import CONTACT_LOOKUP_DISPOSITIONS
+    assert set(_mod._ACTION_OPEN_VERDICTS) <= set(CONTACT_LOOKUP_DISPOSITIONS)
+    assert set(_mod._ACTION_OPEN_VERDICTS) == {"quoted", "newly_queued"}
+
+
+async def test_the_write_waits_for_the_jobs_claim_lock(db, business_user, tmp_path):
+    """While the scrape enqueue (or the action worker) holds this job's claim lock,
+    the repair must wait, then act on what it finds under the lock."""
+    job, rid = _seed_lead(business_user.id, pending=True)
+    stats, done = _stats(), {}
+    with system_sync_session() as holder:
+        lock_job_for_claim(holder, job)
+
+        def _run():
+            with system_sync_session() as s:
+                done["wrote"] = _clear(s, _candidate(s, rid), stats, str(tmp_path / "j.jsonl"))
+
+        t = threading.Thread(target=_run)
+        t.start()
+        time.sleep(1.5)
+        assert t.is_alive(), "the repair wrote while another writer held the job's claim lock"
+        holder.commit()  # releases the transaction-scoped advisory lock
+        t.join(30)
+    assert done["wrote"] is True
+    res, _ = _state(rid)
+    assert res.property_address is None
+
+
+async def test_a_dry_run_reports_an_owned_lead_and_writes_nothing(db, business_user, tmp_path):
+    _job, rid = _seed_lead(business_user.id, pending=True, action_on_pending=True)
+    stats, journal = _stats(), tmp_path / "j.jsonl"
+    with system_sync_session() as s:
+        assert _clear(s, _candidate(s, rid), stats, str(journal), apply=False) is False
+    res, pend = _state(rid)
+    assert res.property_address == "9 WRONG ST" and [p.status for p in pend] == ["queued"]
+    assert stats["skipped_action_linked"] == 1
+    assert '"would_skip_action_linked"' in journal.read_text(encoding="utf-8")
+
+
+async def test_the_party_repair_skips_an_owned_lead_and_repairs_the_rest(db, business_user, tmp_path):
+    """End to end through repair_party: the recorder placeholder 'PUBLIC' is swapped
+    for the decedent on the free lead (and its queued trace re-derived), never on the
+    lead an action owns. Both traces were queued under the PLACEHOLDER's name."""
+    stale = ("STATE", "WASHINGTON", "normal")
+    _j1, free = _seed_lead(business_user.id, pending=True, party="PUBLIC",
+                           heirs="REINKE NORMAN LEONARD", trace=stale)
+    _j2, owned = _seed_lead(business_user.id, pending=True, action_on_pending=True,
+                            party="PUBLIC", heirs="REINKE NORMAN LEONARD", trace=stale)
+    with system_sync_session() as s:
+        stats = _mod.repair_party(s, apply=True, journal=str(tmp_path / "j.jsonl"))
+    free_res, free_pend = _state(free)
+    owned_res, owned_pend = _state(owned)
+    assert free_res.party_name == "REINKE NORMAN LEONARD"
+    # The enqueue's own rule for this name is an address-only (advanced) trace.
+    assert (free_pend[0].first_name, free_pend[0].last_name, free_pend[0].trace_type) == (
+        None, None, "advanced")
+    assert owned_res.party_name == "PUBLIC"
+    assert (owned_pend[0].first_name, owned_pend[0].last_name, owned_pend[0].trace_type) == stale
+    assert stats["skipped_action_linked"] == 1

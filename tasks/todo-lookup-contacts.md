@@ -3378,6 +3378,38 @@ O-C: its own billing PR, and it BLOCKS 2d.
   is a feature flag: `settings.py` + `.env.example`, over the 5-file rule, a split.
 - **O-B** Kill switch off after a confirm: should the action wait (recommended), or fail?
 
+### 2-0 BUILT (2026-09-30), before the Codex diff review
+- `scripts/repair_probate_party_and_bad_parcel.py`:
+  - Every write is now `_guarded_write`: one transaction per row, `lock_job_for_claim(job)`,
+    then the action check UNDER the lock, then the existing guarded UPDATEs (they are the
+    re-read), then commit.
+  - A lead is SKIPPED (journal `skipped_action_linked`) when any of its pending rows has an
+    `action_id`, or it has an open verdict (`quoted`, `newly_queued`).
+  - A dry run takes no lock and writes nothing, but reports `would_skip_action_linked`.
+  - The run-wide single commit is gone, so the claim lock is never held across the script's
+    live county lookups.
+  - The candidate queries now select `job_id`.
+- `skip_trace_dispatcher.py`: comments only (`:284-290`, `_cancel_undeliverable_queued`'s
+  docstring). Cancellation writes queue and result rows only; `released` is derived (S1, X1).
+- Tests: 8 new REAL-DB tests in `tests/test_repair_probate_party_and_bad_parcel.py`:
+  - an unowned lead repaired;
+  - an action-owned trace untouched;
+  - a `quoted` lead untouched;
+  - a settled verdict doesn't block;
+  - the write WAITS on another session's claim lock (two connections);
+  - a dry run reports and writes nothing;
+  - end to end through `repair_party` (the stale placeholder-name trace re-derived on the free
+    lead, untouched on the owned one).
+  - 29 passed. **Mutations 6/6 caught** (lock dropped, action check dropped, open verdicts
+    narrowed, pending `action_id` ignored, dry-run check dropped, party write unguarded).
+- **Found while building it (P1, MINE, fixed separately as #398):** since #393, any process
+  whose FIRST import is `src.scrapers` (every ops script) dies with a circular ImportError:
+  `routes/jobs.py` imported the planner at module top (the planner → `pierce_atip_owner` →
+  `base_scraper` → `src.api` → the routers). The api and the worker survived by import order.
+  #398 moves the import into the handler, and adds a fresh-interpreter import test over 10
+  entry points + every Celery `include` module.
+- Local test DB upgraded 105 → 106 (#394's `jobs.breakdown_*`) via `scripts/migrate.py`.
+
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever
       the tab has leads that have never been looked up; when the quote comes back with

@@ -735,6 +735,16 @@ class Job(Base):
     # job can be re-delivered ahead of this. Never present it as a countdown to a
     # guaranteed start.
     next_retry_at = Column(DateTime(timezone=True), nullable=True)
+    # Migration 106: the run-count breakdown, frozen by the worker in the done-CAS from
+    # the same statement that produces billed_count. The six partition records_found
+    # (src/api/run_breakdown.py holds the rule). All NULL = no snapshot; the API then
+    # reports the live breakdown. Never written after `done`.
+    breakdown_dropped_before_save = Column(Integer, nullable=True)
+    breakdown_no_address = Column(Integer, nullable=True)
+    breakdown_same_run_merged = Column(Integer, nullable=True)
+    breakdown_already_delivered = Column(Integer, nullable=True)
+    breakdown_over_quota = Column(Integer, nullable=True)
+    breakdown_new = Column(Integer, nullable=True)
     # Migration 063: idempotent billing. billing_applied_at is the CAS gate —
     # only the attempt that flips it from NULL increments users.records_used, so a
     # watchdog re-run can't double-bill. billed_count = what was charged (stored,

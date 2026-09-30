@@ -1273,6 +1273,36 @@ def _stage_label(
 _RECORD_PRODUCING_STAGES: frozenset[str | None] = frozenset({None, "searching", "scraping"})
 
 
+class RunBreakdown(BaseModel):
+    """What happened to every record a finished run found (src/api/run_breakdown.py).
+
+    records_found = dropped_before_save + no_address + same_run_merged
+                  + already_delivered + over_quota + new
+
+    Mutually exclusive, first match wins per saved row: no usable address, then
+    combined into another row of this run, then already delivered by an earlier run
+    of this account, then past the plan cap; `new` is what was delivered and billed
+    (equal to record_count on a snapshot). RAW: no tax cap and no view filter, so on
+    a tax run `already_delivered` can exceed the tab's `already_delivered_count`.
+    """
+
+    # Records found but never saved (the living-TOD filter and the save-time merge).
+    # None = unknown: a live reading of a run that never recorded records_found, or
+    # one that was retried (its saved rows span attempts).
+    dropped_before_save: int | None = None
+    no_address: int
+    same_run_merged: int
+    already_delivered: int
+    over_quota: int
+    new: int
+
+
+# "snapshot": frozen by the worker when the run finished, in the same transaction
+# as the bill. "live": the same partition read now, for a finished run with no
+# snapshot; post-completion backfills move it.
+BreakdownBasis = Literal["snapshot", "live"]
+
+
 class JobResponse(BaseModel):
     id: str
     user_id: str
@@ -1357,6 +1387,11 @@ class JobResponse(BaseModel):
     # about MISSING OBSERVATIONS, not proof the worker died — the watchdog re-queues
     # on the same threshold, so a stalled job is one the system is about to recover.
     progress_stalled: bool = False
+    # Migration 106: the run-count breakdown frozen when the run finished. SNAPSHOT
+    # ONLY here (no query per job): None for runs with no snapshot (older, retried,
+    # or not finished); the results page reports a live one for those.
+    breakdown: RunBreakdown | None = None
+    breakdown_basis: BreakdownBasis | None = None
     # True while a bounded transient retry is waiting out its backoff. The row is
     # 'pending' with retry_count > 0, which otherwise reads as "queued, waiting for
     # capacity" and looks frozen for the whole 5- or 20-minute delay.
@@ -1399,8 +1434,12 @@ class JobResponse(BaseModel):
             self.progress_pct = 100 if self.status == JobStatus.DONE else None
             self.estimated_seconds_remaining = 0
             self.estimated_time_remaining = "Done" if self.status == JobStatus.DONE else None
+            # "new leads", not "records": record_count is the billed new-lead count,
+            # and calling it "records" beside records_found was one of the four
+            # disagreeing numbers of UX F-001.
             self.progress_label = (
-                f"Complete: {self.record_count} records"
+                f"Complete: {self.record_count} new "
+                f"lead{'' if self.record_count == 1 else 's'}"
                 if self.status == JobStatus.DONE
                 else self.status.value.title()
             )
@@ -1844,7 +1883,11 @@ class ResultsPage(BaseModel):
     items: list[ResultRow]
     enriched_count: int = 0      # records with property_address filled
     enriching: bool = False       # True while background enrichment is running
-    total_scraped: int = 0       # all records before dedup
+    # NOT "all records before dedup", which it was documented as: it counts this
+    # run's ACTIONABLE rows (an address, not over quota), after the save-time merge,
+    # excluding superseded rows, read live, duplicates included. What the run found
+    # in total is records_found; the rows between the two are `breakdown`.
+    total_scraped: int = 0
     duplicate_count: int = 0     # records flagged as duplicate
     # The NEW-lead count: non-duplicate + actionable — the SAME PREDICATE
     # workers/tasks.py bills on and writes to jobs.record_count, so the results
@@ -1904,6 +1947,12 @@ class ResultsPage(BaseModel):
     # columns of blanks and no way to tell "we failed" from "the notice cannot have
     # been published yet". This says which. See AuctionCoverage.
     auction_coverage: AuctionCoverage | None = None
+    # The run-count breakdown (see RunBreakdown): the worker's snapshot when there is
+    # one, else the same partition read live for a DONE run. None when the run has
+    # not finished, or a live reading cannot reconcile. The counts above stay the
+    # live, view-shaped numbers the tabs show.
+    breakdown: RunBreakdown | None = None
+    breakdown_basis: BreakdownBasis | None = None
 
 
 # ─── Contact lookups: the quote (Phase 1b-1c) ────────────────────────────────

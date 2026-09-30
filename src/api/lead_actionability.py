@@ -49,10 +49,16 @@ DELIVERY_EXCLUDED_KEY = "delivery_excluded_reason"
 OVER_QUOTA = "over_quota"
 
 
-def _not_quota_excluded_sql(alias: str) -> str:
+def quota_excluded_sql(alias: str) -> str:
+    """The row was marked past the plan cap. The run-count breakdown names these;
+    everything else wants the negation inside actionable_sql."""
     return (
-        f"COALESCE({alias}.enrichment_data->>'{DELIVERY_EXCLUDED_KEY}', '') <> '{OVER_QUOTA}'"
+        f"COALESCE({alias}.enrichment_data->>'{DELIVERY_EXCLUDED_KEY}', '') = '{OVER_QUOTA}'"
     )
+
+
+def _not_quota_excluded_sql(alias: str) -> str:
+    return f"NOT ({quota_excluded_sql(alias)})"
 
 
 def address_actionable_sql(alias: str) -> str:

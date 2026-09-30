@@ -49,6 +49,7 @@ from src.api.results_category import (
 )
 from src.api.results_sort import DEFAULT_RESULTS_SORT, ResultsSort, results_order_by
 from src.api.routes.auth_helpers.registration import _integrity_error_fields
+from src.api.run_breakdown import breakdown_from_job, live_breakdown, read_partition_async
 from src.api.schemas import (
     RUN_START_402_RESPONSES,
     AlreadyDeliveredContacts,
@@ -64,6 +65,7 @@ from src.api.schemas import (
     LogLine,
     ResultRow,
     ResultsPage,
+    RunBreakdown,
 )
 from src.api.tax_filters import build_tax_conditions, tax_cap_condition
 from src.config import settings
@@ -133,6 +135,22 @@ def _undelivered_run_409() -> HTTPException:
     )
 
 
+def _snapshot_breakdown(job: Job) -> tuple[RunBreakdown | None, bool]:
+    """The run-count breakdown the worker froze on this row, and whether a stored
+    one was REJECTED.
+
+    A stored snapshot that does not add up cannot happen by construction; if one
+    ever does, nothing is shown rather than numbers that contradict each other, and
+    the reason is logged (ids only, no row data). Rejected is not "absent": the
+    caller must not fall back to the live partition for it, which could show
+    post-backfill numbers in place of the run's own (fail closed, Codex 2c r4).
+    """
+    values, problem = breakdown_from_job(job)
+    if problem is not None:
+        _logger.warning("Job %s: stored run-count breakdown rejected (%s)", job.id, problem)
+    return (RunBreakdown(**values) if values is not None else None), problem is not None
+
+
 def _job_response(job: Job, config: ScraperConfig | None) -> JobResponse:
     """A JobResponse with the fields that live on the job's scraper config.
 
@@ -141,6 +159,8 @@ def _job_response(job: Job, config: ScraperConfig | None) -> JobResponse:
     Results page could not tell an auction-lead job (its "Notice Date" header).
     """
     resp = JobResponse.model_validate(job)
+    resp.breakdown, _rejected = _snapshot_breakdown(job)
+    resp.breakdown_basis = "snapshot" if resp.breakdown is not None else None
     if config is not None:
         resp.scraper_name = config.name
         resp.county = config.county
@@ -387,7 +407,7 @@ async def create_job(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scraper not found")
 
     job = await enqueue_scrape_job(db, current_user, config, body.trigger, request)
-    return JobResponse.model_validate(job)
+    return _job_response(job, config)
 
 
 @router.get("/{job_id}", response_model=JobResponse)
@@ -932,6 +952,23 @@ async def get_results(
             no_notice_found=cov.no_notice or 0,
         )
 
+    # The run-count breakdown: the worker's done-time snapshot, else the same
+    # partition read now (one aggregate, scoped by job AND user on this RLS session).
+    # Only for a finished run: before `done`, records_found is written ahead of the
+    # filter and the saves, so rows still on their way would read as "not saved".
+    # A REJECTED stored snapshot shows nothing: never the live partition in its place.
+    breakdown, rejected = _snapshot_breakdown(job)
+    breakdown_basis = "snapshot" if breakdown is not None else None
+    if breakdown is None and not rejected and job.status == "done":
+        live, _why = live_breakdown(
+            await read_partition_async(db, job_id, current_user.id),
+            status=job.status,
+            records_found=job.records_found,
+            retry_count=job.retry_count,
+        )
+        if live is not None:
+            breakdown, breakdown_basis = RunBreakdown(**live), "live"
+
     return ResultsPage(
         job_id=job_id, total=total, page=page, page_size=page_size,
         items=items, enriched_count=enriched_count, enriching=enriching,
@@ -947,6 +984,8 @@ async def get_results(
         already_delivered_contacts=already_delivered_contacts,
         has_auction_data=has_auction_data,
         auction_coverage=auction_coverage,
+        breakdown=breakdown,
+        breakdown_basis=breakdown_basis,
     )
 
 

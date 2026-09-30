@@ -133,6 +133,14 @@ class JobUpdateFields(TypedDict, total=False):
     page_total: int
     error_message: str
     export_key: str
+    # Migration 106, written only by the done-CAS. None is a real value here: a
+    # refused snapshot writes all six NULL.
+    breakdown_dropped_before_save: int | None
+    breakdown_no_address: int | None
+    breakdown_same_run_merged: int | None
+    breakdown_already_delivered: int | None
+    breakdown_over_quota: int | None
+    breakdown_new: int | None
 
 
 def _now() -> datetime:

@@ -12,12 +12,12 @@ from enum import Enum
 
 from sqlalchemy import text as sa_text
 
-from src.api.lead_actionability import actionable_sql
 from src.api.quota_window import (
     reservation_is_current_sql,
     window_cte_sql,
     window_set_sql,
 )
+from src.api.run_breakdown import SNAPSHOT_COLUMNS, decide_snapshot, read_partition
 from src.db.models import Job
 from src.utils.logger import setup_logger
 from src.workers.tasks_helpers.status import (
@@ -45,6 +45,9 @@ class FinalizeKind(str, Enum):
 class FinalizeOutcome:
     kind: FinalizeKind
     display_count: int = 0
+    # The run-count breakdown this attempt froze in the done-CAS (field -> count),
+    # or None when it froze none; the completion log line is built from it.
+    frozen: dict[str, int | None] | None = None
 
 
 def _alert_dedup_release_failed(job_id: str, user_id, context: str, exc: Exception) -> None:
@@ -204,14 +207,13 @@ def finalize_billing_and_done(
     # (intra-run fingerprint collisions, a re-run over a changed source set), so
     # the authoritative billable count is this job's non-duplicate result rows
     # (no-dedup_hash rows have is_duplicate=false, so they're included). (Codex)
-    billable_count = db.execute(
-        sa_text(
-            "SELECT count(*) FROM results "
-            "WHERE job_id = :jid AND user_id = CAST(:uid AS uuid) AND is_duplicate = false "
-            f"AND {actionable_sql('results')}"
-        ),
-        {"jid": job_id, "uid": str(job.user_id)},
-    ).scalar() or 0
+    #
+    # Read as the `new` bucket of the run-count partition (UX F-001): ONE statement
+    # classifies every saved row, so the bill and the done-time breakdown below are
+    # the same reading and cannot disagree. `new` is exactly the old predicate:
+    # is_duplicate = false AND actionable.
+    _partition = read_partition(db, job_id, job.user_id)
+    billable_count = _partition.new
     from sqlalchemy import update as sa_update
     # Idempotent billing (migration 063): claim billing for THIS job via a CAS
     # on billing_applied_at. Only the attempt that flips it from NULL bills the
@@ -242,6 +244,21 @@ def finalize_billing_and_done(
         )
         .values(billed_count=billable_count, billing_applied_at=_billed_at)
     ).rowcount
+    # Whether this attempt may freeze the run-count breakdown (migration 106). Read
+    # from the ROW under the lock `attempt_state` took above and the billing CAS
+    # holds, never from the ORM object: records_found is per attempt and a retried
+    # run's rows are not this attempt's alone. Decides only the snapshot.
+    _snapshot, _snapshot_refused = decide_snapshot(
+        db, job_id=job_id, user_id=job.user_id, billed_now=bool(billed_now),
+        attempt_token=attempt_token, partition=_partition,
+    )
+    if _snapshot_refused:
+        # WARNING when this attempt owns a fresh bill but its numbers did not
+        # reconcile (the six are written NULL): worth a look. INFO when the columns
+        # are simply not this attempt's to write.
+        (_logger.warning if _snapshot is not None else _logger.info)(
+            "Job %s: no run-count breakdown frozen (%s)", job_id, _snapshot_refused,
+        )
     if billed_now:
         # PERIOD-AWARE increment. The counter is rolled forward in the SAME
         # statement that charges it, so the month boundary is applied at the
@@ -379,8 +396,12 @@ def finalize_billing_and_done(
 
     # ── NOW mark done — in the SAME transaction as the billing writes ──────
     # record_count reflects unique (non-duplicate) leads — what the user
-    # actually sees on the results page. The raw scrape total is in the
-    # log: "{N} records saved ({unique} new leads, {dup} duplicates)".
+    # actually sees on the results page. The raw scrape total is
+    # records_found; the rows between the two are the run-count breakdown
+    # (migration 106), frozen here in the same UPDATE when this attempt owns a
+    # fresh bill and its numbers reconcile (src/api/run_breakdown.py).
+    # `_snapshot` is None when the columns must not be named at all (billed by
+    # an earlier attempt), so an existing value survives.
     # Persisted non-duplicate ACTIONABLE rows — the same number that was just
     # billed, so the headline, email, webhook and bill can never disagree.
     # The billing CAS + records_used increment above are still UNCOMMITTED:
@@ -395,6 +416,7 @@ def finalize_billing_and_done(
         export_key=object_key,
         commit=False,
         expected_started_at=attempt_token,
+        **(_snapshot or {}),
     ):
         # Cancelled (force-finalize) while enriching: the CAS kept the row
         # terminal — roll the pending billing back (a cancelled job is never
@@ -428,7 +450,12 @@ def finalize_billing_and_done(
     db.commit()
     db.refresh(job)
     db.refresh(user)
-    return FinalizeOutcome(FinalizeKind.DONE, int(display_count))
+    frozen = (
+        {field: _snapshot[col] for field, col in SNAPSHOT_COLUMNS.items()}
+        if _snapshot and _snapshot_refused is None
+        else None
+    )
+    return FinalizeOutcome(FinalizeKind.DONE, int(display_count), frozen)
 
 
 def _fenced_exit(db, job_id: str, boot_user_id, attempt_token, where: str) -> FinalizeOutcome | None:

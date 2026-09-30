@@ -1096,7 +1096,6 @@
                   "config_inactive",
                   "run_in_flight",
                   "not_entitled",
-                  "ai_limit",
                   "frozen",
                   "ended",
                   "over_limit"
@@ -3792,11 +3791,10 @@
         "type": "object"
       },
       "RunRefusalResponse": {
-        "description": "A run refused by the AI monthly limit or the account rule\n(``src.api.errors``). ``detail`` is the same sentence this 402 has always\ncarried; ``code`` and ``resumes_at`` were ADDED beside it, and more\ntop-level keys may be added, so ignore keys you do not know.",
+        "description": "A run refused by the account rule\n(``src.api.errors``). ``detail`` is the same sentence this 402 has always\ncarried; ``code`` and ``resumes_at`` were ADDED beside it, and more\ntop-level keys may be added, so ignore keys you do not know.",
         "properties": {
           "code": {
             "enum": [
-              "ai_limit",
               "frozen",
               "ended",
               "over_limit"

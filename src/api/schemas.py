@@ -718,12 +718,12 @@ class ConfigRunEligibilityResponse(BaseModel):
 
     can_run: bool
     code: Literal[
-        "config_inactive", "run_in_flight", "not_entitled", "ai_limit",
+        "config_inactive", "run_in_flight", "not_entitled",
         "frozen", "ended", "over_limit",
     ] | None = None
     message: str | None = None
     # When the block lifts by itself: over_limit (null if the quota will not
-    # reset) and ai_limit (next UTC month). Null for every other code.
+    # reset). Null for every other code.
     resumes_at: datetime | None = None
     # The job holding the run slot (run_in_flight only; null if it just ended).
     job_id: str | None = None
@@ -741,8 +741,8 @@ class ConfigRunEligibilityResponse(BaseModel):
             return self
         if self.code is None or not self.message:
             raise ValueError("a refusal carries a code and a message")
-        if self.resumes_at is not None and self.code not in ("over_limit", "ai_limit"):
-            raise ValueError("only over_limit and ai_limit resume by themselves")
+        if self.resumes_at is not None and self.code != "over_limit":
+            raise ValueError("only over_limit resumes by itself")
         if self.job_id is not None and self.code != "run_in_flight":
             raise ValueError("only run_in_flight names a job")
         if (self.violation_code is not None) != (self.code == "not_entitled"):
@@ -758,15 +758,15 @@ class ConfigRunEligibilityResponse(BaseModel):
 
 
 class RunRefusalResponse(BaseModel):
-    """A run refused by the AI monthly limit or the account rule
+    """A run refused by the account rule
     (``src.api.errors``). ``detail`` is the same sentence this 402 has always
     carried; ``code`` and ``resumes_at`` were ADDED beside it, and more
     top-level keys may be added, so ignore keys you do not know."""
 
     detail: str
-    code: Literal["ai_limit", "frozen", "ended", "over_limit"]
-    # When the block lifts by itself: ai_limit (next UTC month start) and
-    # over_limit (the quota reset; null if the term ends first). Else null.
+    code: Literal["frozen", "ended", "over_limit"]
+    # When the block lifts by itself: over_limit (the quota reset; null if the
+    # term ends first). Else null.
     resumes_at: datetime | None
 
 

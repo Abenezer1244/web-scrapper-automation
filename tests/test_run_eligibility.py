@@ -239,7 +239,6 @@ async def test_quota_block_reason_on_a_cancelled_term_promises_no_reset(db):
         {"can_run": False, "code": "frozen", "message": None, "resumes_at": None},
         {"can_run": False, "code": "frozen", "message": "x", "resumes_at": LIVE_END},
         {"can_run": False, "code": "ended", "message": "x", "resumes_at": LIVE_END},
-        {"can_run": False, "code": "ai_limit", "message": "x", "resumes_at": None},
     ],
 )
 def test_run_eligibility_response_rejects_impossible_states(payload):

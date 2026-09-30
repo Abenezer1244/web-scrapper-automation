@@ -19,6 +19,87 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-30 — S4-02 fixed (a cancelled run holds its slot until its worker stops), PyJWT 2.14.0, and a merge that silently broke the fix
+
+> Owner asked: continue the audit queue from the S4-06 handoff; push/merge the handoff;
+> fix S4-02. Later: fix the PyJWT audit block; "merge both yourself". Plan and review:
+> `tasks/todo-security-s4-02.md`.
+
+**Built / Shipped:**
+- **#388** (handoff docs) `6675a60a`.
+- **#391** PyJWT 2.13.0 -> 2.14.0, merged as `0539de2b`. It clears 10 CVEs that failed the
+  required Dependency Audit on every PR.
+- **#389** S4-02, merged as `02664e60`. A cancelled run used to hold its scraper's run slot for
+  a fixed 300 s. Now:
+  - `HeartbeatThread.__exit__` acknowledges the worker's exit: it sets
+    `last_heartbeat_at = NULL` on its own cancelled attempt, scoped by `_attempt_sql(token)`.
+  - Otherwise the slot is held until `started_at + RUN_SCRAPE_TIME_LIMIT_S + 120 s`, the point
+    where the prefork hard limit has provably killed the worker.
+  - The claim stamps the DB clock, and `Job.holds_run_slot()` (its `now` parameter removed)
+    judges age by the DB's `now()`.
+  - The heartbeat starts right after the claim, before the gates that can return.
+- Worktrees `bl-wt-merge374` and `bl-wt-secaudit4` removed (folders only; branches kept).
+
+**Tried / Decided:**
+- **S4-02 design, first idea:** keep heartbeating cancelled rows and release on a stale beat.
+  Codex consult r1 FAILED it: heartbeat writes are best-effort, so an outage would release the
+  slot under a live worker. Switched to an authoritative ack plus the hard-limit ceiling.
+- **S4-02 design, r2:** the clock-skew P1 was adopted (DB clock on both sides). The
+  watchdog-fencing P1 was rejected: the watchdog selects only active rows, and `_recovery_cas`
+  already CASes status, started_at and retry_count.
+- **No migration.** A NULL heartbeat on a started cancelled row is the ack. Codex raised the
+  "legacy NULL-heartbeat rows" P1 twice (review r1 and r3). Both times it closed on evidence:
+  - every claim has stamped the heartbeat since #273 (2026-09-09);
+  - the only other writers that NULL it also NULL `started_at`;
+  - 113 deploys since #273 mean no older worker image is alive.
+- **PyJWT:** we stayed on 2.14.0 (the minimal fix), not 2.15.1. Exposure was low (HS256 only,
+  no PyJWK/JWKS client).
+
+**Failed / Blocked:**
+- #388's CI failed at once on an Actions billing block. The owner fixed billing.
+- The first merge attempt of #391 was denied by the auto-mode permission classifier
+  (production deploy) until the owner said "merge both yourself".
+- The first quiet check for #391 showed 1 long transaction. Held and re-polled until all four
+  counts were 0.
+- Railway `run` in a fresh worktree fails ("No linked project"). Run `quiet.py` from the main
+  checkout.
+- #389's merge was refused ("merge conflicts") because #390 landed between my quiet check and
+  the merge.
+
+**Caught & fixed:**
+- **The #390 merge silently broke S4-02.**
+  - #390 changed the attempt token to `AttemptToken(started_at, retry_count)`, and that token
+    is what `run_scrape_job` hands to `HeartbeatThread`.
+  - The ack still bound it as `started_at = :sa`. That UPDATE errors inside a best-effort
+    `except` that logs and swallows, so a cancel would never release early.
+  - Fixed by scoping the ack with `_attempt_sql(token)`. Proven: with the old bind put back,
+    the real-`run_scrape_job` early-gate test fails.
+  - Codex r3/r4 reviewed the resolution: PASS.
+- **Codex review r1 P2:** the tests drove the helpers, not the task. Added a test that runs
+  the real `run_scrape_job` out through the frozen-account gate, with a cancel landing at the
+  claim (a test-duration trigger). It fails with main's heartbeat placement.
+- **Proofs on main:**
+  - 6 min after a cancel, with the worker unacknowledged, `POST /jobs` returned 201 (a second
+    run).
+  - The claim's `started_at` was 1.5 s after its transaction's `now()`, i.e. the Python clock.
+
+**Pending / Handoff:**
+- Audit queue: 4b-ii (held-lead log), 5b-ii (P3 pinned sessions), D5-03 proxy rollout (flag
+  OFF), `.env.example` entries (owner), D5-01 (product), S3-16 (Tracerfy header), S4-07 (owner
+  choice), owner infra (S3-04, S3-17).
+- **Behaviour change:** a worker killed mid-cancel (deploy or OOM) blocks its scraper until
+  about 67 min after that run started. A clean cancel frees it immediately.
+- The Supabase DB stall of 2026-09-29 ~01:28-01:45Z is still unexplained (owner dashboard).
+
+**Facts learned:**
+- The prefork hard limit plus a claim inside the task gives a provable ceiling on how long a
+  worker for an attempt can live: `started_at + time_limit`.
+- A `NULL` written by a best-effort path needs a real-path test. A helper-level test fed a
+  bare datetime stayed green while production's token form failed.
+- `quiet.py` prints no detail about the long-transaction session. Re-poll; don't guess.
+
+---
+
 ## 2026-09-28 — Audit #4 PRs merged, S4-06 fixed, and a merge gate that passed on a crash
 
 > Owner asked: merge #374 then #378, then fix S4-06 (deferred in audit #5). All three are

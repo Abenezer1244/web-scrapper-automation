@@ -2960,6 +2960,14 @@ trial-cap disposition/reason at the 1b-2 confirm.
 - **Codex diff review of ii** (three-dot against the precursor branch): **`VERDICT: GO`, no
   findings** (`<scratchpad dea35045>/codex_ii_review_r1_out.txt`). ii stays LOCAL (unpushed)
   until #386 merges; then: rebase onto main, Codex re-check, push, PR, CI, merge gate.
+- **#386 MERGED + LIVE (2026-09-30): merge `29172543`.** Billing fixed by the owner. The first
+  green-able run then failed the required Dependency Audit on PyJWT 2.13.0 (10 new CVEs, not
+  this PR); the S4-02 session shipped the bump as #391 (`0539de2b`). main moved three times under
+  #386 (#391, #390 the 2c-bis attempt fence, #389 S4-02); each rebase was clean with a
+  byte-identical patch, and Codex r5-r8 each said GO. #390 gave `_enqueue_skip_trace_rows` an
+  optional `attempt_token` fence: it only ever queues LESS, so the quote stays an upper bound and
+  the parity test (called without a token) still pins selection, gates and trace types. CI green
+  on `4fc42a5d`, quiet all zeros; api/worker/beat SUCCESS on `29172543`, clean boot.
 
 **Files:** i = planner, `lookup_pricing.py`, planner tests, `docs/BUILD_JOURNAL.md`, this plan;
 ii = `routes/jobs.py`, `schemas.py`, `schema/openapi.json`, quote tests, this plan.

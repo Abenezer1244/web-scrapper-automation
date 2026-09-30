@@ -1,5 +1,10 @@
 # HANDOFF — contact lookup 1b-1c-ii (the QUOTE endpoint), 2026-09-28 (end of session)
 
+> **Status 2026-09-30:** the billing blocker below is FIXED, and **#386 is MERGED + LIVE**
+> (`29172543`). ii has been rebased onto it and shipped as its own PR. See
+> `tasks/todo-lookup-contacts.md`, "Amendments BUILT", for the record. The sections below
+> describe the state on 2026-09-28.
+
 Read this whole file first. Then read, in `tasks/todo-lookup-contacts.md` (search the headings):
 1. **"### FINAL 1b-1c contract and build list"** and its **"Amendments from consult r3"** (R1-R6):
    the normative contract for the planner and the quote endpoint.

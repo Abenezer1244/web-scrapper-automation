@@ -21,18 +21,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api import sse_leases
 from src.api.auth import CurrentUser, get_auth_context
-from src.api.contact_lookup_planner import (
-    ALREADY_ANSWERED,
-    EXCLUDED_BUCKETS,
-    IN_PROGRESS,
-    PLANNER_VERSION,
-    PREVIOUSLY_ATTEMPTED,
-    count_remaining,
-    plan_tab_window,
-    policy_from_settings,
-    status_buckets,
-    tab_status_counts,
-)
 from src.api.deps import get_db, get_rls_db
 from src.api.dialer_filters import dialer_ready_conditions
 from src.api.entitlements import raise_plan_features, skip_trace_violation
@@ -1125,6 +1113,24 @@ async def quote_contact_lookups(
     db: AsyncSession = Depends(get_rls_db),
 ) -> ContactLookupQuote:
     """Quote a "look up contacts" action for one results tab. Non-binding."""
+    # Imported HERE, not at module top: the planner imports scraper modules
+    # (pierce_atip_owner -> base_scraper), and base_scraper imports src.api, whose
+    # package __init__ imports this router. A module-level import closed that loop,
+    # so any process that imported `src.scrapers` before `src.api` (every ops script)
+    # died with a circular ImportError (#393). tests/test_import_cycles.py pins it.
+    from src.api.contact_lookup_planner import (
+        ALREADY_ANSWERED,
+        EXCLUDED_BUCKETS,
+        IN_PROGRESS,
+        PLANNER_VERSION,
+        PREVIOUSLY_ATTEMPTED,
+        count_remaining,
+        plan_tab_window,
+        policy_from_settings,
+        status_buckets,
+        tab_status_counts,
+    )
+
     now = datetime.now(UTC)
     today = now.date()  # one clock for every query below
     # The limiter's own async client has no socket timeout: bound it, so a stalled

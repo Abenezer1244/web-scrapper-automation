@@ -23,8 +23,13 @@ import pytest
 
 _REPO = Path(__file__).resolve().parent.parent
 
+from src.workers import app as _celery_app
+
 # The first module a real process imports. Scripts start from src.scrapers.* or
-# src.db / src.workers; the services start from main / src.workers.
+# src.db / src.workers; the services start from main / src.workers. Importing
+# `src.workers` only builds the Celery app; a worker then imports every module in
+# its `include` list, so those are entry points too (read from the app itself, so a
+# new task module is covered the day it is registered).
 _ENTRY_POINTS = (
     "src.scrapers",
     "src.scrapers.base_scraper",
@@ -36,7 +41,13 @@ _ENTRY_POINTS = (
     "src.workers",
     "src.workers.skip_trace_claim",
     "main",
+    *_celery_app.conf.include,
 )
+
+
+def test_every_celery_task_module_is_an_entry_point():
+    assert "src.workers.pierce_cv_owner_recovery" in _ENTRY_POINTS
+    assert len(_celery_app.conf.include) >= 10
 
 
 @pytest.mark.parametrize("module", _ENTRY_POINTS)

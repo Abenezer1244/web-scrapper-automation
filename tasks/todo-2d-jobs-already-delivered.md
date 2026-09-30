@@ -95,13 +95,16 @@ Phase A result: RED first on a pure extraction (5 failed: KeyError 'already_deli
 no rejection warning; 6 passed), then GREEN 10/10; related set (fence, finalize, breakdown
 finalize + mutations, notification emit) 78 passed; ruff clean (whole repo).
 #### Phase B: API docs + list test (2 files + generated openapi.json)
-- [ ] `src/api/schemas.py`: `JobResponse.breakdown` + `ResultsPage.breakdown` descriptions
+- [x] `src/api/schemas.py`: `JobResponse.breakdown` + `ResultsPage.breakdown` descriptions
       (account-wide, raw, snapshot vs live) via `Field(description=...)` (docs only).
-- [ ] `schema/openapi.json` regenerated (`export_openapi.py`, then `--check`).
-- [ ] `tests/test_run_breakdown_api.py`: add the explicit `GET /jobs` list case for a
+- [x] `schema/openapi.json` regenerated (`export_openapi.py`, then `--check`).
+- [x] `tests/test_run_breakdown_api.py`: add the explicit `GET /jobs` list case for a
       no-snapshot job: `breakdown` and `breakdown_basis` null, no results-partition query
       (statement counter) (Codex r2 P2: today only `GET /jobs/{id}` is asserted); and a
       REJECTED (partial) snapshot on `GET /jobs`: null breakdown, zero partition queries (r4 P2).
+Phase B result: 16/16 in test_run_breakdown_api; the two new list guards proven by
+mutants (a live fallback in list_jobs -> both fail on the breakdown; a silent partition
+query -> both fail on "no results read"); openapi --check OK (4 description lines).
 - [ ] Full suite 8 parts; security review x2; Codex diff review until GATE: PASS; quiet.py;
       merge; verify prod (worker deploy SUCCESS; read-only): select the first job FINISHED
       AFTER the worker deploy with a valid snapshot; THEN require its `job_completed`

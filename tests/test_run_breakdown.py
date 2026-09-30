@@ -27,6 +27,7 @@ from src.api.run_breakdown import (
     snapshot_columns,
 )
 from src.db.models import Job, Result, ScraperConfig, User
+from src.workers.tasks_helpers.status import AttemptToken
 
 ADDR = "5006 61ST STREET CT E"
 MAIL = "PO BOX 12, TACOMA WA 98401"
@@ -142,7 +143,7 @@ async def test_empty_run_is_six_zeros_that_validate(db, starter_user, scraper_co
     assert partition == RowPartition()
 
     cols, reason = snapshot_columns(
-        billed_now=True, attempt_started_at=STARTED, row_started_at=STARTED,
+        billed_now=True, attempt_token=AttemptToken(STARTED, 0), row_started_at=STARTED,
         records_found=0, retry_count=0, partition=partition,
     )
     assert reason is None
@@ -155,9 +156,12 @@ async def test_empty_run_is_six_zeros_that_validate(db, starter_user, scraper_co
 # ── the done-CAS decision: one test per branch ───────────────────────────────
 
 def _decide(base, **over):
-    kw = {"billed_now": True, "attempt_started_at": STARTED, "row_started_at": STARTED,
+    kw = {"billed_now": True, "row_started_at": STARTED,
           "records_found": base.persisted + 2, "retry_count": 0, "partition": base}
     kw.update(over)
+    # A fresh bill implies the row matches the token on BOTH parts: the billing CAS
+    # is fenced on them (2c-bis). So by default the token is the row's own pair.
+    kw.setdefault("attempt_token", AttemptToken(STARTED, kw["retry_count"]))
     return snapshot_columns(**kw)
 
 
@@ -185,6 +189,9 @@ def test_lost_ownership_names_no_column():
     assert cols is None and reason
     cols, reason = _decide(P, row_started_at=None)
     assert cols is None and reason
+    # Same started_at, but the row belongs to a later claim (higher retry_count).
+    cols, reason = _decide(P, attempt_token=AttemptToken(STARTED, 0), retry_count=1)
+    assert cols is None and "no longer owns" in reason
 
 
 @pytest.mark.parametrize("over", [

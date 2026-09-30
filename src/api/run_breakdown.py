@@ -133,7 +133,7 @@ def _full(partition: RowPartition, dropped: int | None) -> dict[str, int | None]
 def snapshot_columns(
     *,
     billed_now: bool,
-    attempt_started_at: datetime | None,
+    attempt_token: Any,
     row_started_at: datetime | None,
     records_found: int | None,
     retry_count: int | None,
@@ -148,12 +148,20 @@ def snapshot_columns(
     the numbers cannot be trusted, so the job reports its live breakdown.
     Returns ``(values, None)`` for a snapshot that reconciles.
 
+    ``attempt_token`` is the worker's ``AttemptToken`` (``started_at``,``retry_count``),
+    the same pair every attempt-scoped write is fenced on (2c-bis): a replacement
+    stamped with this attempt's exact ``started_at`` still differs in ``retry_count``.
     ``row_started_at``, ``records_found`` and ``retry_count`` must be read from the
     jobs row under the billing CAS's row lock, never from the ORM object.
     """
     if not billed_now:
         return None, "billed by an earlier attempt"
-    if attempt_started_at is None or row_started_at != attempt_started_at:
+    # A bare datetime is the legacy token form (started_at only), read the way
+    # status._attempt_parts reads it; production always passes the pair.
+    token_started = getattr(attempt_token, "started_at", attempt_token)
+    token_retry = getattr(attempt_token, "retry_count", None)
+    if (token_started is None or row_started_at != token_started
+            or (token_retry is not None and retry_count != token_retry)):
         return None, "this attempt no longer owns the job"
 
     reason = None
@@ -185,7 +193,7 @@ _OWNER_SQL = text(
 
 
 def decide_snapshot(
-    db, *, job_id, user_id, billed_now: bool, attempt_started_at: datetime | None,
+    db, *, job_id, user_id, billed_now: bool, attempt_token: Any,
     partition: RowPartition,
 ) -> tuple[dict[str, int | None] | None, str | None]:
     """``snapshot_columns`` fed from the ROW, as run_scrape_job calls it.
@@ -201,7 +209,7 @@ def decide_snapshot(
     )
     return snapshot_columns(
         billed_now=bool(billed_now),
-        attempt_started_at=attempt_started_at,
+        attempt_token=attempt_token,
         row_started_at=owner.started_at if owner else None,
         records_found=owner.records_found if owner else None,
         retry_count=owner.retry_count if owner else None,

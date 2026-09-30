@@ -3360,7 +3360,11 @@ advisory lock + `SKIP LOCKED` row locks. Adopted:
 
 **Consult r4 (2026-09-30): REVISE** (O-C wording, the second stale dispatcher comment at `:284-290`,
 the 2-0 manifest; all fixed). **r5: `PLAN: GO`, no findings.** Outputs `<scratchpad 49da3c50>/
-codex_1b2_consult_r{4,5}_out.txt`. Awaiting OWNER approval before any code.
+codex_1b2_consult_r{4,5}_out.txt`.
+
+**OWNER DECISIONS (2026-09-30): plan APPROVED, build from 2-0 in order.** O-A: confirm goes
+live with 2d (no flag). O-B: kill switch off -> the action WAITS until its deadline, then expires.
+O-C: its own billing PR, and it BLOCKS 2d.
 
 ### Owner items (before code)
 - **O-C** (billing, pre-existing, found by the consult) Persist `skip_trace_queues.rows_sent`

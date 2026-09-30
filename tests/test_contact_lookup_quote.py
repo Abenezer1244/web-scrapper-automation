@@ -5,21 +5,25 @@ r3 amendments (R1 entitlement gate, R3 `remaining`, R4 Redis before the scan, R5
 bounded limiter).
 
 Real PG and real Redis. Redis FAILURE is real too, never stubbed: a closed local port,
-a socket that accepts and never answers (blackholed), and a private redis-server run
-with `maxmemory 1` + `noeviction`, which answers PING and reads but refuses every
-write. Tracerfy is never reached: a quote spends nothing.
+a socket that accepts and never answers (blackholed), and a Redis that answers PING and
+reads but refuses every write: an ACL user without `@write` on Redis >= 6 (CI), else a
+private redis-server run with `maxmemory 1` + `noeviction` (Redis 5 has no ACLs).
+Tracerfy is never reached: a quote spends nothing.
 """
 from __future__ import annotations
 
 import importlib
 import json
+import os
+import secrets
+import shutil
 import socket
 import subprocess
 import time
 import uuid
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 import pytest
 import redis as sync_redis
@@ -42,7 +46,6 @@ from src.utils.skip_trace_pause_state import NEVER, ScopeResume, fence_str
 rate_limit_module = importlib.import_module("src.api.middleware.rate_limit")
 
 _PARTY = "SAARENAS AVELINO G"
-_REDIS_SERVER = Path("C:/Users/Windows/bl-testenv/redis/redis-server.exe")
 
 
 # ── fixtures ─────────────────────────────────────────────────────────────────
@@ -151,28 +154,73 @@ def _blackhole():
         s.close()
 
 
+def _assert_refuses_writes(url: str) -> None:
+    """PING and a read succeed and a write is REFUSED by the server (a ResponseError:
+    a connection error would also be a RedisError and prove nothing)."""
+    probe = sync_redis.from_url(url, socket_timeout=0.5)
+    try:
+        assert probe.ping()
+        probe.get("probe")
+        with pytest.raises(sync_redis.ResponseError):
+            probe.set("probe", "x")
+    finally:
+        probe.close()
+
+
 @contextmanager
 def _write_refusing_redis():
-    """A private real redis-server that serves PING and reads, and refuses writes."""
+    """A real Redis URL that serves PING and reads, and refuses writes.
+
+    Redis >= 6 (CI's service container): a throwaway ACL user on the test Redis with
+    every command but `@write`. Redis 5 has no ACLs (the local rig): a private
+    redis-server with `maxmemory 1` + `noeviction`, found via BL_TEST_REDIS_SERVER or
+    PATH. Neither -> the test FAILS; it never skips."""
+    base = settings.REDIS_URL
+    admin = sync_redis.from_url(base, **settings.redis_kwargs())
+    try:
+        admin.execute_command("ACL", "WHOAMI")
+        has_acl = True
+    except sync_redis.ResponseError:
+        has_acl = False
+    if has_acl:
+        user, password = f"bl_quote_ro_{uuid.uuid4().hex[:12]}", secrets.token_hex(16)
+        admin.execute_command("ACL", "SETUSER", user, "on", f">{password}", "~*",
+                              "+@all", "-@write")
+        try:
+            parts = urlsplit(base)
+            netloc = f"{user}:{password}@{parts.hostname}:{parts.port or 6379}"
+            url = urlunsplit((parts.scheme, netloc, parts.path, parts.query, ""))
+            _assert_refuses_writes(url)
+            yield url
+        finally:
+            admin.execute_command("ACL", "DELUSER", user)
+            admin.close()
+        return
+    admin.close()
+    binary = os.environ.get("BL_TEST_REDIS_SERVER") or shutil.which("redis-server")
+    if not binary:
+        pytest.fail("the test Redis has no ACLs and no redis-server binary was found: "
+                    "set BL_TEST_REDIS_SERVER to one")
     port = _free_port()
     proc = subprocess.Popen(
-        [str(_REDIS_SERVER), "--port", str(port), "--bind", "127.0.0.1",
+        [binary, "--port", str(port), "--bind", "127.0.0.1",
          "--maxmemory", "1", "--maxmemory-policy", "noeviction",
          "--save", "", "--appendonly", "no"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     try:
-        probe = sync_redis.Redis(port=port, socket_timeout=0.5)
+        url = f"redis://127.0.0.1:{port}/0"
+        probe = sync_redis.from_url(url, socket_timeout=0.5)
         for _ in range(50):
             try:
                 probe.ping()
                 break
-            except sync_redis.RedisError:
+            # Not listening yet: refused, or (Windows) a connect timeout.
+            except (sync_redis.ConnectionError, sync_redis.TimeoutError):
                 time.sleep(0.1)
-        with pytest.raises(sync_redis.RedisError):
-            probe.set("probe", "x")
         probe.close()
-        yield port
+        _assert_refuses_writes(url)
+        yield url
     finally:
         proc.terminate()
         proc.wait(10)
@@ -543,8 +591,8 @@ async def test_a_quote_redis_cannot_store_is_never_shown(
     """PING and reads work, the write is refused: no quote in the body."""
     job = _job(business_user.id)
     _seed(business_user.id, job, [{}])
-    with _write_refusing_redis() as port:
-        monkeypatch.setattr(settings, "REDIS_URL", f"redis://127.0.0.1:{port}/0")
+    with _write_refusing_redis() as url:
+        monkeypatch.setattr(settings, "REDIS_URL", url)
         r = await _quote(client, business_token, job)
     assert r.status_code == 503
     assert "quote_id" not in r.text

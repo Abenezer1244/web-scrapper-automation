@@ -2968,6 +2968,15 @@ trial-cap disposition/reason at the 1b-2 confirm.
   optional `attempt_token` fence: it only ever queues LESS, so the quote stays an upper bound and
   the parity test (called without a token) still pins selection, gates and trace types. CI green
   on `4fc42a5d`, quiet all zeros; api/worker/beat SUCCESS on `29172543`, clean boot.
+- **ii's first CI run FAILED (PR #393, 2026-09-30): 1 of 5,422.**
+  `test_a_quote_redis_cannot_store_is_never_shown` spawned a HARDCODED local Windows
+  `redis-server.exe`; CI's Redis is a `redis:7-alpine` service container with no binary on the
+  runner. A portability bug in the test, not in the endpoint. Fix: on Redis >= 6 (CI), a
+  throwaway ACL user `+@all -@write` on the test Redis (a real NOPERM on SET); on Redis 5 (the
+  local rig, no ACLs), the private `maxmemory 1` server via `BL_TEST_REDIS_SERVER` or PATH;
+  neither -> the test FAILS, never skips. The write probe now requires a server `ResponseError`
+  (a connection error is also a `RedisError` and proved nothing). The swallowed-store mutation
+  is still caught.
 
 **Files:** i = planner, `lookup_pricing.py`, planner tests, `docs/BUILD_JOURNAL.md`, this plan;
 ii = `routes/jobs.py`, `schemas.py`, `schema/openapi.json`, quote tests, this plan.

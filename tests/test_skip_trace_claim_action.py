@@ -69,15 +69,44 @@ async def test_the_scrape_path_still_writes_no_action(db):
     assert {r.action_id for r in rows} == {None}
 
 
-async def test_the_scrape_paths_statement_does_not_mention_an_action(db):
-    """No action -> the INSERT is the scrape path's own, not a variant of it."""
+# The scrape path's INSERT for one lead, whitespace-normalised, as the driver sees it.
+# Captured from origin/main's claim BEFORE 2a-ii and proven byte-identical to this
+# branch's (with action_id=None), so the paid path every scrape takes cannot drift.
+_SCRAPE_INSERT_ONE_ROW = (
+    "INSERT INTO pending_skip_trace_rows (id, job_id, result_id, user_id, property_addres"
+    "s, city, state, zip, first_name, last_name, mail_address, mail_city, mail_state, mai"
+    "l_zip, trace_type, status) SELECT v.id, v.job_id, v.result_id, v.user_id, v.property"
+    "_address, v.city, v.state, v.zip, v.first_name, v.last_name, v.mail_address, v.mail_"
+    "city, v.mail_state, v.mail_zip, v.trace_type, 'queued' FROM (VALUES (CAST(%(id_0)s A"
+    "S uuid), CAST(%(job_id_0)s AS uuid), CAST(%(result_id_0)s AS uuid), CAST(%(user_id_0"
+    ")s AS uuid), CAST(%(property_address_0)s AS text), CAST(%(city_0)s AS text), CAST(%("
+    "state_0)s AS text), CAST(%(zip_0)s AS text), CAST(%(first_name_0)s AS text), CAST(%("
+    "last_name_0)s AS text), CAST(%(mail_address_0)s AS text), CAST(%(mail_city_0)s AS te"
+    "xt), CAST(%(mail_state_0)s AS text), CAST(%(mail_zip_0)s AS text), CAST(%(trace_type"
+    "_0)s AS text))) AS v(id, job_id, result_id, user_id, property_address, city, state, "
+    "zip, first_name, last_name, mail_address, mail_city, mail_state, mail_zip, trace_typ"
+    "e) JOIN public.results r ON r.id = v.result_id AND r.user_id = v.user_id AND r.job_i"
+    "d = v.job_id JOIN public.jobs j ON j.id = v.job_id AND j.user_id = v.user_id WHERE r"
+    ".user_id = CAST(%(uid)s AS uuid) AND j.user_id = CAST(%(uid)s AS uuid) AND r.skip_tr"
+    "ace_status = %(claimable)s ON CONFLICT (result_id) WHERE status IN ('queued', 'submi"
+    "tting', 'submitted') DO NOTHING RETURNING result_id"
+)
+_SCRAPE_PARAM_KEYS = {
+    "uid", "claimable", "id_0", "job_id_0", "result_id_0", "user_id_0",
+    "property_address_0", "city_0", "state_0", "zip_0", "first_name_0", "last_name_0",
+    "mail_address_0", "mail_city_0", "mail_state_0", "mail_zip_0", "trace_type_0",
+}
+
+
+async def test_the_scrape_paths_statement_and_params_are_unchanged(db):
+    """No action -> EXACTLY the statement and bind parameters the scrape path always ran."""
     user = await _account(db)
     payloads = await _payloads(db, user, 1)
-    seen: list[str] = []
+    seen: list = []
 
     def _record(conn, cursor, statement, params, context, executemany):
         if "INSERT INTO pending_skip_trace_rows" in statement:
-            seen.append(statement)
+            seen.append((" ".join(statement.split()), set(params)))
 
     event.listen(db_session.sync_engine, "before_cursor_execute", _record)
     try:
@@ -85,7 +114,8 @@ async def test_the_scrape_paths_statement_does_not_mention_an_action(db):
     finally:
         event.remove(db_session.sync_engine, "before_cursor_execute", _record)
     assert len(seen) == 1
-    assert "action" not in seen[0]
+    assert seen[0][0] == _SCRAPE_INSERT_ONE_ROW
+    assert seen[0][1] == _SCRAPE_PARAM_KEYS
 
 
 async def test_an_action_of_another_job_claims_nothing(db):
@@ -151,3 +181,68 @@ async def test_a_full_account_reports_no_held_ids(db):
     report: dict = {}
     _claim(payloads, report=report)
     assert report["held"] == 0 and report["held_ids"] == []
+
+
+async def test_an_action_claim_across_insert_chunks_marks_every_row(db, monkeypatch):
+    """Chunking rebuilds the parameters per statement; the action must ride every chunk."""
+    import src.workers.skip_trace_claim as claim_mod
+
+    monkeypatch.setattr(claim_mod, "_INSERT_CHUNK_ROWS", 2)
+    user = await _account(db)
+    payloads = await _payloads(db, user, 5)
+    action = await _action_for(db, user.id, str(payloads[0]["job_id"]))
+    assert len(_claim(payloads, action_id=action)) == 5
+    rows = await _rows(db, [p["result_id"] for p in payloads])
+    assert {(r.action_id, r.skip_trace_status) for r in rows} == {(action, "queued")}
+
+
+async def test_an_action_claims_withdrawn_row_leaves_no_trace_of_the_action(db, monkeypatch):
+    """A lead settled by another writer between the INSERT and the results UPDATE is
+    withdrawn by OUR pending id, in the same transaction, across chunks, with an action."""
+    import psycopg2
+
+    import src.workers.skip_trace_claim as claim_mod
+    from src.workers.skip_trace_claim import claim_skip_trace_rows, lock_job_for_claim
+
+    monkeypatch.setattr(claim_mod, "_INSERT_CHUNK_ROWS", 2)
+    user = await _account(db)
+    payloads = await _payloads(db, user, 5)
+    job_id = str(payloads[0]["job_id"])
+    action = await _action_for(db, user.id, job_id)
+    victim = sorted(str(p["result_id"]) for p in payloads)[0]  # first chunk (sorted by id)
+
+    def _settle_victim() -> None:
+        other = psycopg2.connect(
+            settings.DATABASE_URL_SYNC.replace("postgresql+psycopg2://", "postgresql://"))
+        try:
+            other.cursor().execute(
+                "UPDATE results SET skip_trace_status = 'hit' WHERE id = %s", (victim,))
+            other.commit()
+        finally:
+            other.close()
+
+    with system_sync_session() as s:
+        lock_job_for_claim(s, job_id)
+        original, state = s.execute, {"inserts": 0, "fired": False}
+
+        def _execute(statement, *args, **kwargs):
+            if (state["inserts"] and not state["fired"]
+                    and "UPDATE results SET skip_trace_status" in str(statement)):
+                state["fired"] = True
+                _settle_victim()
+            result = original(statement, *args, **kwargs)
+            if "INSERT INTO pending_skip_trace_rows" in str(statement):
+                state["inserts"] += 1
+            return result
+
+        s.execute = _execute
+        try:
+            won = claim_skip_trace_rows(s, payloads, action_id=action)
+        finally:
+            s.execute = original
+        s.commit()
+    assert state["inserts"] > 1 and state["fired"]
+    assert victim not in won and len(won) == 4
+    rows = {r.rid: r for r in await _rows(db, [p["result_id"] for p in payloads]) if r.rid}
+    assert victim not in rows, "the withdrawn lead kept a pending row"
+    assert {(r.action_id, r.skip_trace_status) for r in rows.values()} == {(action, "queued")}

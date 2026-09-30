@@ -3519,6 +3519,14 @@ Branch `feat/lookup-1b2a-ii-claim-action` off `e9397f0f` (after #399's
   tenant check is implied by its job check (`a.job_id = v.job_id` with `j.user_id =
   v.user_id`, and 101's FK `(job_id, user_id) -> jobs` makes an action's tenant its job's
   tenant). It is kept as the explicit belt.
+- **Codex r1: GO**, plus a P3, done:
+  - the scrape path's INSERT is now pinned to a GOLDEN statement + param-key set, captured
+    from origin/main's UNMODIFIED claim and proven BYTE-IDENTICAL to this branch's with
+    `action_id=None` (a diff of the two driver-level captures);
+  - new: an action claim across insert chunks marks every row;
+  - new: a lead settled mid-claim is withdrawn by OUR pending id, across chunks, with an
+    action.
+  11 tests; mutations unchanged (5/6, the survivor equivalent).
 - **Regression: 825 passed, 0 failed** (all 27 files that touch the claim, pending rows or
   the ledger, 2 chunks). The first run caught the 3 exact-dict asserts, fixed as above.
 

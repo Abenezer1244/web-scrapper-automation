@@ -42,13 +42,18 @@ from src.scrapers.enrichment.pierce_atip_owner import OWNER_SOURCE as PIERCE_OWN
 from src.scrapers.enrichment.skip_trace import build_pending_row_payload
 from src.utils.address_intel import street_is_placeholder
 
-PLANNER_VERSION = 1
+# 2: the trial credit cap (audit S3-03/S4-01's lifetime allowance, applied as the claim does).
+PLANNER_VERSION = 2
 # Most new lookups one quote (and so one action) may carry.
 QUOTE_CAP = 2000
 # Most not-attempted rows one quote examines: a bound on one request's work, above the
 # largest tab in production (16,965 rows, 2026-09-28), so not a normal stopping point.
 SCAN_CEILING = 20_000
 _CHUNK = 500
+# Tracerfy credits per lookup: `CREDITS_PER_ROW` in src/workers/skip_trace_capacity.py,
+# restated because importing `src.workers` builds the Celery app. A test pins the two
+# equal. An unknown trace type raises there, and KeyErrors here.
+CREDITS = {"normal": 1, "advanced": 2}
 # The legacy placeholder property_address (src/api/lead_actionability.py).
 _ENRICHMENT_UNAVAILABLE = "(enrichment unavailable)"
 
@@ -155,21 +160,42 @@ class Window:
     # The last (created_at, id) examined: where a follow-up count of what is left, and
     # the 1b-2 confirm's re-classification of the window, stop.
     window_end: tuple[datetime, str] | None = None
-    stopped: str | None = None  # "cap" | "scan_limit" | None (the rows ran out)
+    # "cap" | "credit_cap" | "scan_limit" | None (the rows ran out)
+    stopped: str | None = None
+    # A trial account's LIFETIME allowance, or None (no credit budget).
+    credit_cap: int | None = None
+    quoted_credits: int = 0
+    # Quotable leads left out because they did not fit the credit budget.
+    over_credit_cap: int = 0
 
     def add(self, row, policy: PlannerPolicy, *, cap: int, ceiling: int) -> bool:
-        """Classify one row; False once the window is full."""
+        """Classify one row; False once the window is full.
+
+        `self.credit_cap` is a trial account's LIFETIME allowance (`paid_lookup_access`
+        == trial). It is applied exactly as `claim_skip_trace_rows` applies the room,
+        in the order given: a lead whose cost does not fit is skipped and a later,
+        cheaper one may still fit. The claim's room is the allowance MINUS what the
+        trial already used, so capping by the whole allowance stays an upper bound.
+        """
         verdict = classify(row, policy)
         self.examined += 1
         self.window_end = (row.created_at, str(row.id))
         if verdict.bucket == QUOTABLE:
-            self.quoted_ids.append(str(row.id))
-            if verdict.trace_type == "advanced":
-                self.advanced_count += 1
+            cost = CREDITS[verdict.trace_type]
+            if self.credit_cap is not None and self.quoted_credits + cost > self.credit_cap:
+                self.over_credit_cap += 1
+            else:
+                self.quoted_ids.append(str(row.id))
+                self.quoted_credits += cost
+                if verdict.trace_type == "advanced":
+                    self.advanced_count += 1
         else:
             self.counts[verdict.bucket] = self.counts.get(verdict.bucket, 0) + 1
         if len(self.quoted_ids) >= cap:
             self.stopped = "cap"
+        elif (self.credit_cap is not None
+              and self.credit_cap - self.quoted_credits < min(CREDITS.values())):
+            self.stopped = "credit_cap"  # nothing, not even the cheapest lookup, fits
         elif self.examined >= ceiling:
             self.stopped = "scan_limit"
         return self.stopped is None
@@ -177,10 +203,10 @@ class Window:
 
 def plan_window(
     rows: Iterable, policy: PlannerPolicy, *, cap: int = QUOTE_CAP,
-    ceiling: int = SCAN_CEILING,
+    ceiling: int = SCAN_CEILING, credit_cap: int | None = None,
 ) -> Window:
     """Plan over rows already in `(created_at, id)` order."""
-    window = Window()
+    window = Window(credit_cap=credit_cap)
     for row in rows:
         if not window.add(row, policy, cap=cap, ceiling=ceiling):
             break
@@ -251,13 +277,14 @@ def _after(key: tuple[datetime, str]):
 async def plan_tab_window(
     db, job_id: str, user_id: str, category: ResultsCategory, today: date,
     policy: PlannerPolicy, *, cap: int = QUOTE_CAP, ceiling: int = SCAN_CEILING,
-    chunk: int = _CHUNK,
+    chunk: int = _CHUNK, credit_cap: int | None = None,
 ) -> Window:
     """Walk the tab's `not_attempted` rows in `(created_at, id)` keyset chunks until
-    the cap fills, the ceiling is reached, or the rows run out. Rows an earlier action
-    bought are no longer `not_attempted`, so the window always moves forward."""
+    the cap (or a trial's `credit_cap`) fills, the ceiling is reached, or the rows run
+    out. Rows an earlier action bought are no longer `not_attempted`, so the window
+    always moves forward."""
     await _bound_statements(db)
-    window = Window()
+    window = Window(credit_cap=credit_cap)
     after: tuple[datetime, str] | None = None
     while True:
         stmt = select(*_ROW_COLUMNS).where(_not_attempted(job_id, user_id, category, today))
@@ -289,7 +316,7 @@ async def count_remaining(db, job_id: str, user_id: str, category: ResultsCatego
 
 
 __all__ = [
-    "ALREADY_ANSWERED", "ATIP", "EXCLUDED_BUCKETS", "EXCLUSION_DISPOSITIONS",
+    "ALREADY_ANSWERED", "ATIP", "CREDITS", "EXCLUDED_BUCKETS", "EXCLUSION_DISPOSITIONS",
     "IN_PROGRESS", "NOT_TRACEABLE", "NO_ADDRESS", "PLACEHOLDER", "PLANNER_VERSION",
     "PREVIOUSLY_ATTEMPTED", "QUOTABLE", "QUOTE_CAP", "SCAN_CEILING",
     "SETTLED_CODE_VIOLATION", "PlannerPolicy", "Verdict", "Window", "classify",

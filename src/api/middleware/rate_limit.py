@@ -51,6 +51,11 @@ _ZONES: dict[str, tuple[int, int]] = {
     # Job cancel and the scraper write routes (create, edit, csv-layout, delete).
     # Own zone so a burst of edits cannot starve the user's reads in `general`.
     "writes": (30, 60),
+    # POST /jobs/{id}/contact-lookups/quote (contact lookup 1b-1c). Each call walks up
+    # to 20,000 of a tab's leads and writes one Redis key. Its own bucket, so quoting
+    # never spends the customer's CSV download budget (`export`) and downloads never
+    # block a quote. 10/min per user is ample for a dialog that re-quotes on open.
+    "lookup_quote": (10, 60),
 }
 
 _redis_client: aioredis.Redis | None = None
@@ -127,8 +132,9 @@ def client_ip(request: Request) -> str:
 # attempts during an incident. Other zones still fail fully open (availability
 # over abuse-resistance is the right trade for non-security paths).
 # `export` and `writes` join them (audit #3 consult with Codex): an outage must not
-# open unlimited CSV rebuilds or scraper churn either.
-_FALLBACK_ZONES = frozenset({"auth", "webhook", "stripe", "export", "writes"})
+# open unlimited CSV rebuilds or scraper churn either; nor unlimited tab scans
+# (`lookup_quote`).
+_FALLBACK_ZONES = frozenset({"auth", "webhook", "stripe", "export", "writes", "lookup_quote"})
 # Insertion-ordered (dict preserves order), so the oldest keys are the cheapest
 # to find when we need to reclaim space.
 _fallback_hits: dict[str, list[float]] = {}
@@ -192,7 +198,8 @@ async def rate_limit(request: Request, zone: str = "general", identifier: str | 
     Args:
         request: The incoming FastAPI request.
         zone: A key of _ZONES ('auth', 'jobs', 'general', 'webhook', 'stripe',
-            'export', 'writes'). An unknown zone falls back to 'general'.
+            'export', 'writes', 'lookup_quote'). An unknown zone falls back to
+            'general'.
         identifier: Custom key (e.g. user_id). Falls back to client IP.
     """
     max_requests, window_seconds = _ZONES.get(zone, _ZONES["general"])

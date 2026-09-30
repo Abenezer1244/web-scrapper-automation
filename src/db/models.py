@@ -22,7 +22,7 @@ from sqlalchemy import (
     func,
     text,
 )
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, relationship, validates
 
 from src.config.constants import RUN_SCRAPE_TIME_LIMIT_S
@@ -1412,8 +1412,10 @@ class PendingSkipTraceRow(Base):
     # and SkipTraceQueue stores only the FIRST row's tenant/job metadata, so
     # ingest rebuilds attribution from these rows. Without it a hit, miss,
     # unmatched, reuse or release cannot be tied back to the action that paid.
-    # No inline ForeignKey: the composite FK onto (action_id, user_id) is added
-    # in 1b-2 once the action worker exists to write it.
+    # Migration 107 adds the composite FK (action_id, user_id) -> the action's
+    # (id, user_id), declared in __table_args__: a row can never name another
+    # tenant's action. ON DELETE NO ACTION: this row is billing evidence and must
+    # outlive nothing but its own job/user cascade.
     action_id = Column(UUID(as_uuid=False), nullable=True)
 
     # PERF (migration 033): the skip-trace dispatcher drains the queue by
@@ -1426,6 +1428,11 @@ class PendingSkipTraceRow(Base):
             "enqueued_at",
         ),
         Index("ix_pending_skip_trace_action", "action_id", "user_id"),
+        ForeignKeyConstraint(
+            ["action_id", "user_id"],
+            ["contact_lookup_actions.id", "contact_lookup_actions.user_id"],
+            name="fk_pending_skip_trace_action_tenant",
+        ),
         # Migration 102. The daily credit cap weighs a row by its type, so only
         # known types may exist; a trigger there also refuses a type change on a
         # SPENT row. The partial index serves the cap's rolling-window spent
@@ -1788,6 +1795,8 @@ CONTACT_LOOKUP_DISPOSITIONS = (
     "excluded_settled_code_violation", "excluded_atip_policy",
     "excluded_not_traceable",
     "answered_hit", "answered_miss", "unmatched_billable", "errored_unsubmitted",
+    # Migration 107: accepted by Tracerfy, unmatched, in a queue billing did NOT bill.
+    "unmatched_unbilled",
 )
 
 # What a user-scoped (API) session may create. Everything else is a worker
@@ -1878,6 +1887,10 @@ class ContactLookupAction(Base):
     # recorded per action so it can be priced later (decision D2).
     tracerfy_credits = Column(Integer, nullable=False, default=0)
     truncated = Column(Boolean, nullable=False, default=False)
+    # Migration 107 (consult r1 V6): the quote as the customer saw it -- counts,
+    # exclusions, the pinned planner policy (15-14), access, trial allowance,
+    # window. Written once by the API at INSERT; the guard freezes it after.
+    quote_snapshot = Column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
     # Fences a stalled worker that wakes up after the reconciler terminalized it.
     lease_token = Column(String(64), nullable=True)
     lease_expires_at = Column(DateTime(timezone=True), nullable=True)

@@ -282,7 +282,17 @@ async def test_the_migration_and_the_models_have_not_drifted(db):
     mig = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mig)
 
-    assert tuple(mig._DISPOSITIONS) == tuple(CONTACT_LOOKUP_DISPOSITIONS)
+    # 101 is frozen history; 107 added exactly one value, and 107's own copy is the
+    # one the database now enforces.
+    assert tuple(mig._DISPOSITIONS) == tuple(
+        d for d in CONTACT_LOOKUP_DISPOSITIONS if d != "unmatched_unbilled"
+    )
+    spec107 = importlib.util.spec_from_file_location(
+        "_mig107", path.parent / "107_contact_lookup_action_link.py"
+    )
+    mig107 = importlib.util.module_from_spec(spec107)
+    spec107.loader.exec_module(mig107)
+    assert tuple(mig107._DISPOSITIONS) == tuple(CONTACT_LOOKUP_DISPOSITIONS)
     assert tuple(mig._API_INITIAL_DISPOSITIONS) == tuple(CONTACT_LOOKUP_API_INITIAL_DISPOSITIONS)
     assert tuple(mig._ACTION_STATUSES) == tuple(CONTACT_LOOKUP_ACTION_STATUSES)
     assert tuple(mig._TRACE_OUTCOMES) == tuple(RESULT_TRACE_OUTCOMES)
@@ -861,3 +871,123 @@ async def test_the_api_dispatch_stamp_re_reads_a_row_the_worker_moved(db, busine
     )
     assert blocked, "the API's update did not wait for the worker's row lock"
     assert error is not None and "may only stamp dispatched_at" in str(error), error
+
+
+# ── migration 107: pending rows name their action; unbilled unmatched; the snapshot ─
+
+
+async def _pending(db, user: User, job_id: str, rid: str, action_id) -> None:
+    await db.execute(text(
+        "INSERT INTO pending_skip_trace_rows (id, job_id, result_id, user_id, "
+        "property_address, trace_type, status, action_id) "
+        "VALUES (:id, :job, :r, :uid, '1400 MAIN ST', 'advanced', 'queued', :a)"
+    ), {"id": str(uuid.uuid4()), "job": job_id, "r": rid, "uid": user.id, "a": action_id})
+
+
+async def test_a_pending_row_may_name_its_own_accounts_action(db, business_user):
+    job_id, rid = await _job_and_result(db, business_user)
+    action = await _action(db, business_user, job_id)
+    await _pending(db, business_user, job_id, rid, action)
+    await db.commit()
+
+
+async def test_the_scrape_paths_null_action_is_not_checked(db, business_user):
+    job_id, rid = await _job_and_result(db, business_user)
+    await _pending(db, business_user, job_id, rid, None)
+    await db.commit()
+
+
+async def test_a_pending_row_cannot_name_another_accounts_action(db, business_user, starter_user):
+    """The composite key: an action id alone would match any tenant's action."""
+    job_id, rid = await _job_and_result(db, business_user)
+    other_job, _other_rid = await _job_and_result(db, starter_user)
+    foreign = await _action(db, starter_user, other_job)
+    with pytest.raises(Exception, match="fk_pending_skip_trace_action_tenant"):
+        await _pending(db, business_user, job_id, rid, foreign)
+    await db.rollback()
+
+
+async def test_a_pending_row_cannot_name_an_action_that_does_not_exist(db, business_user):
+    job_id, rid = await _job_and_result(db, business_user)
+    with pytest.raises(Exception, match="fk_pending_skip_trace_action_tenant"):
+        await _pending(db, business_user, job_id, rid, str(uuid.uuid4()))
+    await db.rollback()
+
+
+@pytest.mark.parametrize("parent", ["jobs", "users"])
+async def test_deleting_a_job_or_user_with_action_linked_pending_rows_succeeds(
+    db, business_user, parent,
+):
+    """ON DELETE NO ACTION is checked at the END of the statement, after the cascades
+    have removed both the action and its pending rows (consult r2, V5). Run as the
+    owning role, the way retention and account deletion run (never user-scoped)."""
+    job_id, rid = await _job_and_result(db, business_user)
+    action = await _action(db, business_user, job_id)
+    await _pending(db, business_user, job_id, rid, action)
+    await db.commit()
+    target = job_id if parent == "jobs" else business_user.id
+    await db.execute(text(f"DELETE FROM {parent} WHERE id = :id"), {"id": target})
+    left = (await db.execute(text(
+        "SELECT (SELECT count(*) FROM contact_lookup_actions WHERE id = :a), "
+        "       (SELECT count(*) FROM pending_skip_trace_rows WHERE action_id = :a)"
+    ), {"a": action})).one()
+    assert tuple(left) == (0, 0)
+    await db.commit()
+
+
+async def test_an_action_that_owns_pending_rows_cannot_be_deleted_alone(db, business_user):
+    """A pending row is billing evidence: removing its action must fail, not cascade."""
+    job_id, rid = await _job_and_result(db, business_user)
+    action = await _action(db, business_user, job_id)
+    await _pending(db, business_user, job_id, rid, action)
+    await db.commit()
+    with pytest.raises(Exception, match="fk_pending_skip_trace_action_tenant"):
+        await db.execute(text("DELETE FROM contact_lookup_actions WHERE id = :a"), {"a": action})
+    await db.rollback()
+
+
+async def test_unmatched_unbilled_is_a_worker_verdict_the_api_cannot_write(db, business_user):
+    job_id, rid = await _job_and_result(db, business_user)
+    action = await _action(db, business_user, job_id)
+    params = {"id": str(uuid.uuid4()), "a": action, "uid": business_user.id, "r": rid}
+    sql = ("INSERT INTO contact_lookup_action_results (id, action_id, user_id, result_id, "
+           "disposition) VALUES (:id, :a, :uid, :r, 'unmatched_unbilled')")
+    await _as_api(db, business_user)
+    with pytest.raises(Exception, match="disposition"):
+        await db.execute(text(sql), params)
+    await db.rollback()
+    await db.execute(text(sql), params)  # the worker's session: no tenant GUC
+    await db.commit()
+    assert "unmatched_unbilled" not in CONTACT_LOOKUP_API_INITIAL_DISPOSITIONS
+
+
+async def test_the_api_writes_the_quote_snapshot_once_and_can_never_change_it(db, business_user):
+    job_id, _rid = await _job_and_result(db, business_user)
+    await _as_api(db, business_user)
+    aid = str(uuid.uuid4())
+    await db.execute(text(
+        "INSERT INTO contact_lookup_actions (id, user_id, job_id, category, quote_id, "
+        "status, unit_price_cents, currency, pricing_version, quote_snapshot) VALUES "
+        "(:id, :uid, :job, 'new', :q, 'dispatching', 8, 'USD', '2026-06', "
+        " CAST(:snap AS jsonb))"
+    ), {"id": aid, "uid": business_user.id, "job": job_id, "q": f"q-{aid}",
+        "snap": '{"policy": {"pierce_cv_owner_skip_trace_enabled": false}, "examined": 4}'})
+    await db.commit()
+    await _as_api(db, business_user)
+    with pytest.raises(Exception, match="may only stamp dispatched_at"):
+        await db.execute(text(
+            "UPDATE contact_lookup_actions SET dispatched_at = now(), "
+            "quote_snapshot = '{\"examined\": 999}'::jsonb WHERE id = :a"
+        ), {"a": aid})
+    await db.rollback()
+    snap = (await db.execute(text(
+        "SELECT quote_snapshot FROM contact_lookup_actions WHERE id = :a"), {"a": aid})).scalar()
+    assert snap["examined"] == 4
+
+
+async def test_an_action_without_a_snapshot_defaults_to_an_empty_object(db, business_user):
+    job_id, _rid = await _job_and_result(db, business_user)
+    action = await _action(db, business_user, job_id)
+    snap = (await db.execute(text(
+        "SELECT quote_snapshot FROM contact_lookup_actions WHERE id = :a"), {"a": action})).scalar()
+    assert snap == {}

@@ -3421,6 +3421,50 @@ O-C: its own billing PR, and it BLOCKS 2d.
   Now 30 passed; **mutations 8/8** (+ row locks dropped, + recovery party guard dropped).
 - Local test DB upgraded 105 → 106 (#394's `jobs.breakdown_*`) via `scripts/migrate.py`.
 
+### 2-0 MERGED + LIVE (2026-09-30): #400, merge `2b907bc1`
+- Codex r2 GO; CI green; quiet all zeros; api/worker/beat SUCCESS on `2b907bc1`, clean boot.
+- The #393 import-cycle hotfix shipped first as **#398** (`d68563ce`).
+
+### 2a SPLIT (2026-09-30): 2a-i schema, 2a-ii the claim
+- Migration 101's drift test pins its vocabulary tuple to `models.py`, so adding
+  `unmatched_unbilled` also changes `tests/test_contact_lookup_schema.py`. That makes a 6th
+  file.
+- The S4-02 session's #399 is also changing `skip_trace_claim.py` right now.
+- So 2a splits:
+  - **2a-i** = migration 107 + `models.py` + the schema tests + this plan (4);
+  - **2a-ii** (after #399 lands) = the claim's `action_id` / `held_ids` / action↔job join +
+    its test + this plan (3).
+
+### 2a-i BUILT (2026-09-30), before the Codex diff review
+- **Migration 107** (`107_contact_lookup_action_link.py`):
+  - `fk_pending_skip_trace_action_tenant` `(action_id, user_id)` →
+    `contact_lookup_actions(id, user_id)`, ON DELETE NO ACTION, NOT VALID then VALIDATE;
+  - the disposition CHECK re-added with `unmatched_unbilled` (NOT VALID, VALIDATE);
+  - `contact_lookup_actions.quote_snapshot JSONB NOT NULL DEFAULT '{}'`.
+  - Lock timeout 5 s, replay-safe. The downgrade refuses while `unmatched_unbilled` rows exist.
+  - Applied locally and verified BY THE OBJECTS (FK `confdeltype='a'` validated; CHECK
+    validated with the new value; column jsonb NOT NULL default `'{}'`).
+- `models.py`: the FK in `__table_args__`, `quote_snapshot`, and `unmatched_unbilled` in
+  `CONTACT_LOOKUP_DISPOSITIONS`.
+- Tests (`test_contact_lookup_schema.py`, 75 passed):
+  - the drift test pins 101 = models minus the new value, and 107 = models;
+  - a pending row may name its own action, and NULL is unchecked;
+  - another tenant's action and a missing action are REFUSED;
+  - deleting a job, and a user, with action-linked pending rows succeeds (NO ACTION at
+    statement end, V5);
+  - an action that owns pending rows cannot be deleted alone;
+  - `unmatched_unbilled` is refused to the API and allowed to the worker;
+  - the API writes `quote_snapshot` once and can never change it (V6);
+  - the snapshot defaults to `{}`.
+- **Migration mutations 4/4 caught.** Each cycle ran a downgrade to 106, the mutated 107, the
+  tests, then a restore (downgrade + replay exercised):
+  - CASCADE instead of NO ACTION;
+  - a non-composite FK;
+  - the new value left out of the CHECK;
+  - the snapshot nullable with no default.
+- **Regression: 726 passed, 0 failed** (every test file that writes pending rows or the
+  ledger, 2 chunks). ruff clean. No type checker is configured.
+
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever
       the tab has leads that have never been looked up; when the quote comes back with

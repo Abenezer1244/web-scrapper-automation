@@ -61,7 +61,7 @@ job's rows, not 100 jobs'); unchanged here and out of scope (Codex r2 P2).
 ## Phases
 ### 2d-i: BE (one PR, two phases of <= 5 files, owner checkpoint between; merged once)
 #### Phase A: completion notification (5 files)
-- [ ] `src/workers/tasks_helpers/finalize.py` (beside the other completion code; module
+- [x] `src/workers/tasks_helpers/finalize.py` (beside the other completion code; module
       docstring updated, it says emission stays in tasks.py today, Codex r3 P3):
       `emit_job_completed(job, config, display_count)` builds the detail (scraper_name, county,
       record_count, and `already_delivered` from `breakdown_from_job(job)` when valid) and calls
@@ -69,11 +69,11 @@ job's rows, not 100 jobs'); unchanged here and out of scope (Codex r2 P2).
       call, so the tested function IS the production emission (no copied logic). Add
       `emit_job_completed` to the `tasks.py` import list from `tasks_helpers.finalize`
       (`src/workers/tasks.py:70-77`), else NameError at the call (Codex r4 P1).
-- [ ] `docs/superpowers/specs/2026-06-18-notifications-design.md` (:36 detail contract and
+- [x] `docs/superpowers/specs/2026-06-18-notifications-design.md` (:36 detail contract and
       :77 call site): the `job_completed` detail gains optional `already_delivered` (present
       incl. 0 = valid snapshot; absent = unknown) and the call site is `emit_job_completed` in
       `tasks_helpers/finalize.py` (r4 P3, r6 P3).
-- [ ] `tests/test_completion_notification.py` (real test DB, real `notifications` rows, prefs
+- [x] `tests/test_completion_notification.py` (real test DB, real `notifications` rows, prefs
       enabled; each proven RED on unfixed code):
   - done job with a valid snapshot, already_delivered 123 -> row detail has 123;
   - valid snapshot with already_delivered 0 -> detail has 0 (present, not absent);
@@ -88,9 +88,12 @@ job's rows, not 100 jobs'); unchanged here and out of scope (Codex r2 P2).
     `frozen=None` and keeps the columns; `emit_job_completed` still writes 123;
   - source guard: `run_scrape_job` calls `emit_job_completed(` exactly once and no longer
     calls `create_notification(` with `type="job_completed"` itself.
-- [ ] `tests/test_finalize_fence.py:545-550`: the existing post-DONE-tail guard requires
+- [x] `tests/test_finalize_fence.py:545-550`: the existing post-DONE-tail guard requires
       `create_notification`; change it to require exactly one `emit_job_completed(` after the
       DONE check and forbid an inline `job_completed` emission (Codex r3 P1).
+Phase A result: RED first on a pure extraction (5 failed: KeyError 'already_delivered' x4 +
+no rejection warning; 6 passed), then GREEN 10/10; related set (fence, finalize, breakdown
+finalize + mutations, notification emit) 78 passed; ruff clean (whole repo).
 #### Phase B: API docs + list test (2 files + generated openapi.json)
 - [ ] `src/api/schemas.py`: `JobResponse.breakdown` + `ResultsPage.breakdown` descriptions
       (account-wide, raw, snapshot vs live) via `Field(description=...)` (docs only).

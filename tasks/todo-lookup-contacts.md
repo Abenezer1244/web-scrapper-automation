@@ -3232,6 +3232,70 @@ Response `ContactLookupAction {action_id, status, quoted_count}`.
 8. The 20-3 re-authorization: is a JOIN on the quoted set enough?
 9. Is there any path where an action buys a lead outside `quoted_ids`, or twice?
 
+### Codex pre-code consult r1 (2026-09-30): PLAN: REVISE, 3 P1 + 4 P2 + 1 P3, all adopted
+Output: `<scratchpad 49da3c50>/codex_1b2_consult_r1_out.txt`. Both design-changing P1s were
+re-verified in code (`skip_trace_usage.py:599-646`; `repair_probate_party_and_bad_parcel.py:111,
+216,258,266,281`). Codex agreed with S1 (derived settlement), the FK's `NO ACTION`, "wait" on
+the kill switch, helper extraction over a copy, no exclusion rows at confirm, and the 2a→2e
+order. These AMEND the sections above:
+- **V1 (P1) Confirm proves the quoted set.**
+  - Result rows go in with `INSERT ... SELECT` from `results`, constrained to
+    `id = ANY(:quoted_ids) AND user_id = :uid AND job_id = :job_id`.
+  - The inserted count must EQUAL the number of unique `quoted_ids`, else roll back and return
+    409 `quote_stale`.
+  - The worker fails the action closed (`failed`, all `abandoned`) if the durable `quoted` set
+    size ≠ `action.quoted_count`.
+  - The worker's read also re-checks the job-deliverability predicate under the lock (Q8).
+- **V2 (P1) Unmatched follows the BILLING rule.** Billing bills `unmatched` only when the
+  queue's `rows_uploaded >= COUNT(rows sent)` (`accepted_all`); otherwise only `completed`.
+  - Migration 107 adds the disposition **`unmatched_unbilled`** to the CHECK (+ the models
+    constant).
+  - The reconciler maps `unmatched` to `unmatched_billable` / `unmatched_unbilled` by the SAME
+    predicate: `queue_accepted_all(db, queue_id)`, extracted in `skip_trace_usage.py` and
+    called by both billing and the reconciler. One rule, two callers.
+- **V3 (P1) The repair script is gated before any spend path.** New PR **2-0**, first:
+  `scripts/repair_probate_party_and_bad_parcel.py`
+  - takes `lock_job_for_claim()` per job it touches;
+  - REFUSES (report and skip) any pending row with `action_id IS NOT NULL`, and any result
+    that has a non-terminal action verdict.
+
+  16-10 is closed as a gate, not a note. Files: the script, its test, this plan.
+- **V4 (P2) Settlement is atomic and never silent.**
+  - The reconciler writes every terminal verdict, the recomputed counts and `settled` in ONE
+    transaction.
+  - A lead stuck `submitted` with an unknown provider outcome (`skip_trace_dispatcher.py:
+    1621-1627`) keeps the action `claimed` with `status_reason='provider_reconciliation_required'`,
+    an ops alert once per action, and the reason visible in 2e.
+- **V5 (P2) FK delete behaviour.** Keep `NO ACTION` (checked at END of statement, after the
+  job/user cascades have removed both rows). Tests: delete a job, and a user, that own an action
+  with action-linked pending rows; both succeed. A direct action delete is still refused by the
+  guard / grants.
+- **V6 (P2) The quote snapshot is persisted.** Migration 107 adds `contact_lookup_actions.
+  quote_snapshot JSONB NOT NULL DEFAULT '{}'`. It holds the quote's counts, the exclusion
+  breakdown, `policy` (the 15-14 pin: it closes the "policy only in Redis" gap), `access`,
+  `trial_credit_allowance`, `planner_version`, `window_end`, `stopped`, `remaining`.
+  - The API writes it at INSERT. The guard already lets the API insert any non-listed column,
+    and its UPDATE rule freezes it (the `to_jsonb` diff).
+  - A test proves the API cannot change it after insert.
+- **V7 (P2) Confirm is limited in the `writes` zone** (30/min, already fail-closed), not the
+  quote's 10/min bucket. A retry after a broker failure is not starved by the quote scans, and
+  no 6th file (a new zone) is needed. The idempotent re-fetch still sits AFTER the limiter
+  (a limiter hit is a 429 the client retries).
+- **V8 (P3) One transition matrix in code.** `ACTION_TRANSITIONS` / `VERDICT_TRANSITIONS` in the
+  worker module. Every CAS goes through `_move(action, from, to, reason)`, which asserts the
+  matrix and writes the event in the same statement batch. Mutation tests: `settled→running`,
+  `failed→claimed`, a terminal verdict rewritten.
+
+**Revised order and files:**
+- **2-0** repair-script gate (3).
+- **2a** migration 107: action FK + `unmatched_unbilled` + `quote_snapshot`; `models.py`; claim
+  `action_id`; tests; plan (5).
+- **2b** worker (5).
+- **2c** reconciler + `queue_accepted_all` extraction (`scheduler_helpers/contact_lookups.py`,
+  `scheduler.py`, `skip_trace_usage.py`, tests, plan = 5).
+- **2d** confirm (5).
+- **2e** status (5).
+
 ### Owner items (before code)
 - **O-A** Should the confirm endpoint (2d) go live before the frontend (1c) ships? It's
   reachable only by an authenticated paying account and gated like the quote. The alternative

@@ -186,15 +186,6 @@ async def _run_scraper(
         for warning in getattr(scraper, "scrape_warnings", None) or ():
             _publish_log(r, job_id, "warning", warning)
 
-        # Log AI usage if this was an AI-powered scrape
-        if hasattr(scraper, "ai_cost") and scraper.ai_cost > 0:
-            tokens = scraper.ai_tokens
-            _publish_log(
-                r, job_id, "info",
-                f"AI usage: ${scraper.ai_cost:.4f} "
-                f"({tokens['input_tokens']} input + {tokens['output_tokens']} output tokens)",
-            )
-
     return records
 
 
@@ -1146,13 +1137,13 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
         )
     ).scalars().first()
     connector_assessor_url = getattr(_conn_row, "assessor_url", None) if _conn_row else None
-    # Fall back to the hardcoded _KNOWN_ASSESSOR_URLS map so PACS enrichment
+    # Fall back to the built-in KNOWN_ASSESSOR_URLS map so PACS enrichment
     # works even when the connector row's assessor_url is still NULL
     # (e.g. migration 022 not yet applied to this environment).
     if not connector_assessor_url:
-        from src.scrapers.enrichment.ai_assessor import _KNOWN_ASSESSOR_URLS
+        from src.scrapers.enrichment.assessor_urls import KNOWN_ASSESSOR_URLS
         key = f"{config.county.lower()}_{config.state.upper()}"
-        connector_assessor_url = _KNOWN_ASSESSOR_URLS.get(key)
+        connector_assessor_url = KNOWN_ASSESSOR_URLS.get(key)
     from src.scrapers.enrichment.pacs import batch_lookup_pacs_by_name, is_pacs_url
     if connector_assessor_url and is_pacs_url(connector_assessor_url):
         results_no_addr = [

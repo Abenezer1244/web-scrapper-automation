@@ -69,22 +69,7 @@ async def enrich_parcel(
 
             _logger.info("Regrid: no data for parcel %s", parcel_id)
 
-    # ── 3. AI assessor scraper (Claude API, ~$0.01/lookup) ───────────────────
-    if settings.AI_ENRICHMENT_ENABLED and settings.ANTHROPIC_API_KEY:
-        if not _source_down.get("ai_assessor"):
-            try:
-                from src.scrapers.enrichment.ai_assessor import enrich_parcel_ai
-
-                result = await enrich_parcel_ai(parcel_id, county, state)
-                if result.get("property_address"):
-                    _logger.info("AI assessor enrichment succeeded for parcel %s", parcel_id)
-                    return result
-
-                _logger.info("AI assessor: no data for parcel %s", parcel_id)
-            except Exception as exc:
-                _logger.warning("AI assessor error: %s", str(exc)[:60])
-
-    # ── 4. County-specific fallback (Pierce ATIP + CAPTCHA) ──────────────────
+    # ── 3. County-specific fallback (Pierce ATIP + CAPTCHA) ──────────────────
     county_key = f"{county.lower()}_{state.upper()}"
     if county_key == "pierce_WA" and not _source_down.get(county_key):
         if settings.CAPTCHA_ENABLED and settings.CAPTCHA_API_KEY:

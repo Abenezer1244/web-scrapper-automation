@@ -1906,6 +1906,91 @@ class ResultsPage(BaseModel):
     auction_coverage: AuctionCoverage | None = None
 
 
+# ─── Contact lookups: the quote (Phase 1b-1c) ────────────────────────────────
+
+
+class ContactLookupQuoteRequest(BaseModel):
+    """Quote contact lookups for one results tab. The WHOLE tab: the page's
+    search and view filters never apply to a quote."""
+
+    model_config = {"extra": "forbid"}
+
+    category: Literal["new", "already_delivered"] = "new"
+
+
+class ContactLookupExcluded(BaseModel):
+    """Leads examined and not offered, by reason (over the examined window)."""
+
+    no_address: int
+    placeholder: int
+    settled_code_violation: int
+    atip: int
+    not_traceable: int
+
+
+class ContactLookupPause(BaseModel):
+    """Whether the daily lookup limit is pausing lookups for this account.
+
+    `unknown` means the state could not be read right now, never "not paused".
+    `advanced_resume_at` is `"never"` when address-only (advanced) lookups cannot
+    run under the current limit at all; normal lookups may still run."""
+
+    status: Literal["paused", "not_paused", "unknown"]
+    normal_resume_at: datetime | None = None
+    advanced_resume_at: datetime | Literal["never"] | None = None
+
+
+class ContactLookupQuote(BaseModel):
+    """What a "look up contacts" action on this tab would buy. NON-BINDING and an
+    UPPER bound: `max_new_lookups` can only go down by the time the lookups run
+    (an answer found meanwhile, or one the account already paid for, is reused at
+    no charge), never up. The included allowance is re-read when lookups settle."""
+
+    quote_id: str
+    expires_at: datetime
+    category: Literal["new", "already_delivered"]
+    # Leads that would each start one new lookup (one billed lookup each, whether
+    # it lands in the included allowance or is overage).
+    max_new_lookups: int
+    # Of those, address-only lookups (no confident owner name).
+    advanced_count: int
+    # Not-yet-looked-up leads this quote examined.
+    examined: int
+    truncated: bool
+    # cap: 2,000 leads; credit_cap: a free trial's lookup allowance; scan_limit: a
+    # safety bound on one request's work.
+    truncated_reason: Literal["cap", "credit_cap", "scan_limit"] | None = None
+    excluded: ContactLookupExcluded
+    # Tab-wide counts, from each lead's lookup status.
+    already_answered: int
+    in_progress: int
+    previously_attempted: int
+    # Not-yet-looked-up leads past this quote's window: a later quote covers them.
+    remaining: int
+    # `trial`: a free trial, quoted up to its lifetime lookup allowance in CREDITS
+    # (a normal lookup is 1, an address-only one 2). Credits the trial already used
+    # lower it further when the lookups run; paid plans have no such cap.
+    access: Literal["full", "trial"]
+    trial_credit_allowance: int | None = None
+    # Leads examined that did not fit the trial allowance.
+    over_trial_allowance: int = 0
+    included_lookups_remaining: int
+    unit_price_cents: int
+    currency: str
+    pause: ContactLookupPause
+
+
+class ContactLookupUnavailableDetail(BaseModel):
+    code: Literal["contact_lookups_unavailable"]
+    message: str
+
+
+class ContactLookupUnavailableResponse(BaseModel):
+    """Lookups are switched off, or a dependency is unreachable. Nothing was quoted."""
+
+    detail: ContactLookupUnavailableDetail
+
+
 # ─── Live run (SSE) ───────────────────────────────────────────────────────────
 
 class LogLine(BaseModel):

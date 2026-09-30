@@ -1374,6 +1374,269 @@
         "title": "ConnectorResponse",
         "type": "object"
       },
+      "ContactLookupExcluded": {
+        "description": "Leads examined and not offered, by reason (over the examined window).",
+        "properties": {
+          "atip": {
+            "title": "Atip",
+            "type": "integer"
+          },
+          "no_address": {
+            "title": "No Address",
+            "type": "integer"
+          },
+          "not_traceable": {
+            "title": "Not Traceable",
+            "type": "integer"
+          },
+          "placeholder": {
+            "title": "Placeholder",
+            "type": "integer"
+          },
+          "settled_code_violation": {
+            "title": "Settled Code Violation",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "no_address",
+          "placeholder",
+          "settled_code_violation",
+          "atip",
+          "not_traceable"
+        ],
+        "title": "ContactLookupExcluded",
+        "type": "object"
+      },
+      "ContactLookupPause": {
+        "description": "Whether the daily lookup limit is pausing lookups for this account.\n\n`unknown` means the state could not be read right now, never \"not paused\".\n`advanced_resume_at` is `\"never\"` when address-only (advanced) lookups cannot\nrun under the current limit at all; normal lookups may still run.",
+        "properties": {
+          "advanced_resume_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "const": "never",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Advanced Resume At"
+          },
+          "normal_resume_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Normal Resume At"
+          },
+          "status": {
+            "enum": [
+              "paused",
+              "not_paused",
+              "unknown"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "title": "ContactLookupPause",
+        "type": "object"
+      },
+      "ContactLookupQuote": {
+        "description": "What a \"look up contacts\" action on this tab would buy. NON-BINDING and an\nUPPER bound: `max_new_lookups` can only go down by the time the lookups run\n(an answer found meanwhile, or one the account already paid for, is reused at\nno charge), never up. The included allowance is re-read when lookups settle.",
+        "properties": {
+          "access": {
+            "enum": [
+              "full",
+              "trial"
+            ],
+            "title": "Access",
+            "type": "string"
+          },
+          "advanced_count": {
+            "title": "Advanced Count",
+            "type": "integer"
+          },
+          "already_answered": {
+            "title": "Already Answered",
+            "type": "integer"
+          },
+          "category": {
+            "enum": [
+              "new",
+              "already_delivered"
+            ],
+            "title": "Category",
+            "type": "string"
+          },
+          "currency": {
+            "title": "Currency",
+            "type": "string"
+          },
+          "examined": {
+            "title": "Examined",
+            "type": "integer"
+          },
+          "excluded": {
+            "$ref": "#/components/schemas/ContactLookupExcluded"
+          },
+          "expires_at": {
+            "format": "date-time",
+            "title": "Expires At",
+            "type": "string"
+          },
+          "in_progress": {
+            "title": "In Progress",
+            "type": "integer"
+          },
+          "included_lookups_remaining": {
+            "title": "Included Lookups Remaining",
+            "type": "integer"
+          },
+          "max_new_lookups": {
+            "title": "Max New Lookups",
+            "type": "integer"
+          },
+          "over_trial_allowance": {
+            "default": 0,
+            "title": "Over Trial Allowance",
+            "type": "integer"
+          },
+          "pause": {
+            "$ref": "#/components/schemas/ContactLookupPause"
+          },
+          "previously_attempted": {
+            "title": "Previously Attempted",
+            "type": "integer"
+          },
+          "quote_id": {
+            "title": "Quote Id",
+            "type": "string"
+          },
+          "remaining": {
+            "title": "Remaining",
+            "type": "integer"
+          },
+          "trial_credit_allowance": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trial Credit Allowance"
+          },
+          "truncated": {
+            "title": "Truncated",
+            "type": "boolean"
+          },
+          "truncated_reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "cap",
+                  "credit_cap",
+                  "scan_limit"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Truncated Reason"
+          },
+          "unit_price_cents": {
+            "title": "Unit Price Cents",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "quote_id",
+          "expires_at",
+          "category",
+          "max_new_lookups",
+          "advanced_count",
+          "examined",
+          "truncated",
+          "excluded",
+          "already_answered",
+          "in_progress",
+          "previously_attempted",
+          "remaining",
+          "access",
+          "included_lookups_remaining",
+          "unit_price_cents",
+          "currency",
+          "pause"
+        ],
+        "title": "ContactLookupQuote",
+        "type": "object"
+      },
+      "ContactLookupQuoteRequest": {
+        "additionalProperties": false,
+        "description": "Quote contact lookups for one results tab. The WHOLE tab: the page's\nsearch and view filters never apply to a quote.",
+        "properties": {
+          "category": {
+            "default": "new",
+            "enum": [
+              "new",
+              "already_delivered"
+            ],
+            "title": "Category",
+            "type": "string"
+          }
+        },
+        "title": "ContactLookupQuoteRequest",
+        "type": "object"
+      },
+      "ContactLookupUnavailableDetail": {
+        "properties": {
+          "code": {
+            "const": "contact_lookups_unavailable",
+            "title": "Code",
+            "type": "string"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "title": "ContactLookupUnavailableDetail",
+        "type": "object"
+      },
+      "ContactLookupUnavailableResponse": {
+        "description": "Lookups are switched off, or a dependency is unreachable. Nothing was quoted.",
+        "properties": {
+          "detail": {
+            "$ref": "#/components/schemas/ContactLookupUnavailableDetail"
+          }
+        },
+        "required": [
+          "detail"
+        ],
+        "title": "ContactLookupUnavailableResponse",
+        "type": "object"
+      },
       "CountyCount": {
         "properties": {
           "county": {
@@ -6826,6 +7089,95 @@
           }
         ],
         "summary": "Get Job",
+        "tags": [
+          "jobs"
+        ]
+      }
+    },
+    "/jobs/{job_id}/contact-lookups/quote": {
+      "post": {
+        "description": "Quote a \"look up contacts\" action for one results tab. Non-binding.",
+        "operationId": "quote_contact_lookups_jobs__job_id__contact_lookups_quote_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "title": "Job Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ContactLookupQuoteRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ContactLookupQuote"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "402": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/RunRefusalResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/EntitlementRefusalResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/PlainRefusalResponse"
+                    }
+                  ],
+                  "title": "Response 402 Quote Contact Lookups Jobs  Job Id  Contact Lookups Quote Post"
+                }
+              }
+            },
+            "description": "Refused. A run refusal (AI limit, frozen, ended, over the record limit) has a top-level `code`; a plan refusal has an object `detail`; anything else is a sentence in `detail`."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ContactLookupUnavailableResponse"
+                }
+              }
+            },
+            "description": "Lookups are switched off or a dependency is unreachable."
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Quote Contact Lookups",
         "tags": [
           "jobs"
         ]

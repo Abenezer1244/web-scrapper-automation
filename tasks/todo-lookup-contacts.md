@@ -2709,22 +2709,22 @@ ACCEPTED; keyset `(created_at, id)` confirmed a total order, served by the exist
       `report_lookups_for_user` rule, `skip_trace_usage.py:140-152`).
 
 **Quote endpoint** — `POST /jobs/{job_id}/contact-lookups/quote` {category} in `routes/jobs.py`:
-- [ ] `rate_limit(zone="export", identifier=user.id)`; job by `(id, user_id)` else 404;
+- [x] `rate_limit(zone="export", identifier=user.id)`; job by `(id, user_id)` else 404;
       `status != 'done'` -> 409 `run_not_finished`; plan not in `SKIP_TRACE_ADDON_PLANS`
       (normalized) -> the structured 402; kill switch off or token empty -> 503
       `contact_lookups_unavailable`.
-- [ ] Status counts, then the window, as above.
-- [ ] ONE module-level SYNC Redis client (`redis_kwargs()`, `socket_timeout` and
+- [x] Status counts, then the window, as above.
+- [x] ONE module-level SYNC Redis client (`redis_kwargs()`, `socket_timeout` and
       `socket_connect_timeout` 0.5 s); every call through `run_in_threadpool` under
       `asyncio.wait_for(..., 1.0)`.
-- [ ] Pause: `read_pause_state()` unchanged; timeout / pool / client error -> UNKNOWN.
-- [ ] Store: key `bridgeleads:contact_lookup:quote:v1:<user_id>:<job_id>:<category>`, plain
+- [x] Pause: `read_pause_state()` unchanged; timeout / pool / client error -> UNKNOWN.
+- [x] Store: key `bridgeleads:contact_lookup:quote:v1:<user_id>:<job_id>:<category>`, plain
       `SET ... EX 600` (REPLACES the tab's previous quote), JSON `{v: 1, quote_id, user_id,
       job_id, category, quoted_ids, advanced_count, counts, window_end, stopped,
       planner_version, policy, unit_price_cents, currency, pricing_version,
       included_remaining_at_quote, created_at, expires_at}`. `quote_id =
       secrets.token_urlsafe(32)`. Failure or timeout -> 503, no quote returned.
-- [ ] 200 `ContactLookupQuote` (schemas.py): `quote_id`, `expires_at`, `category`,
+- [x] 200 `ContactLookupQuote` (schemas.py): `quote_id`, `expires_at`, `category`,
       `max_new_lookups`, `advanced_count`, `examined`, `truncated` + `truncated_reason`,
       `excluded` {no_address, placeholder, settled_code_violation, atip, not_traceable},
       `already_answered`, `in_progress`, `previously_attempted` (tab-wide), `remaining`
@@ -2755,25 +2755,25 @@ quotable is never quoted (mutation-tested). Worker/confirm only ever REMOVE ids 
 - [x] i pricing: rates per plan incl. a dirty `" Pro "`; the drift guard (equal to
       `/skip-trace-usage` for clean plans); `included_lookups_remaining` under / over quota,
       rolled window, NULL period start, starter.
-- [ ] ii gates: foreign job 404 (no key written); not done 409; starter 402 shape; kill switch
+- [x] ii gates: foreign job 404 (no key written); not done 409; starter 402 shape; kill switch
       503; empty token 503.
-- [ ] ii happy path: counts, advanced, `remaining`, the stored payload (shape, TTL <= 600,
+- [x] ii happy path: counts, advanced, `remaining`, the stored payload (shape, TTL <= 600,
       scoped key), no ids in the body; a second quote REPLACES the first (new `quote_id`).
-- [ ] ii pause through the real `publish()`: paused (account, global), `"never"`, not paused,
+- [x] ii pause through the real `publish()`: paused (account, global), `"never"`, not paused,
       UNKNOWN (no key, tombstone, a closed port, a blackholed port within the 1 s bound).
-- [ ] ii store failing (closed and blackholed port) -> 503, no quote in the body.
-- [ ] ii the tab queries run AS `bridgeleads_app` (provisioned in-transaction): no queue read.
-- [ ] Mutations, each caught: every `classify` branch dropped in turn; `.strip()` -> none;
+- [x] ii store failing (closed and blackholed port) -> 503, no quote in the body.
+- [x] ii the tab queries run AS `bridgeleads_app` (provisioned in-transaction): no queue read.
+- [x] Mutations, each caught: every `classify` branch dropped in turn; `.strip()` -> none;
       ATIP from the process flag; cap off by one; the `id` tie-break dropped; status filter
       dropped from the window query; the sync client swapped for the async one; `wait_for`
       removed (blackholed test hangs past the bound); the kill-switch check dropped; the key
       unscoped (another tab's quote overwritten).
-- [ ] Regression: both skip-trace batches, `test_contact_lookup_schema`,
+- [x] Regression: both skip-trace batches, `test_contact_lookup_schema`,
       `test_skip_trace_pause_state`, billing tests, `plan_entitlement_audit`, `test_beat_schedule`.
 
 **Amendments from consult r3 (2026-09-28: PLAN: REVISE, 1 P1 + 3 P2; r2 all closed).** Output
 `<scratchpad dea35045>/codex_1b1c_consult_r3_out.txt`. These amend the FINAL list above:
-- [ ] **R1 (P1) ADOPTED: entitlement gate.** After the plan gate, `run_eligibility(user, now)`
+- [x] **R1 (P1) ADOPTED: entitlement gate.** After the plan gate, `run_eligibility(user, now)`
       (`quota.py:187`, the one rule every billable start reads); code `frozen` or `ended` ->
       `run_refusal_http(code, message, resumes_at)` (the batches shape, `batches.py:283-286`).
       `over_limit` does NOT refuse: it is the RECORD allowance, and a lookup never counts as a
@@ -2786,18 +2786,18 @@ quotable is never quoted (mutation-tested). Worker/confirm only ever REMOVE ids 
   but never an addition, and a process flag stricter than the pinned one only relabels an
   ATIP row `not_traceable` (never quotes it). Changing `skip_trace.py` (the live paid path)
   for a label is not worth the risk; the existing N5 test pins "only ever excludes MORE".
-- [ ] **R3 (P2) ADOPTED: `remaining` is not a subtraction.** It is its own COUNT of
+- [x] **R3 (P2) ADOPTED: `remaining` is not a subtraction.** It is its own COUNT of
       not-attempted tab rows with `(created_at, id) > window_end` (0 when the window was not
       cut), so it can never go negative. `today` (tax cap) and `now` are captured ONCE per
       request and shared by every query. The status counts and the window are READ COMMITTED
       statements: an ADVISORY snapshot, which the response already says (upper bound).
-- [ ] **R4 (P2) ADOPTED without a new zone: Redis is checked BEFORE the scan.** Order: gates ->
+- [x] **R4 (P2) ADOPTED without a new zone: Redis is checked BEFORE the scan.** Order: gates ->
       `PING` on the sync client (threadpool, 1 s bound) -> 503 when it fails -> only then the
       DB scan. During a Redis outage the endpoint therefore does no DB work at all, whatever
       the `export` zone's per-process fallback admits. Test: a closed/blackholed Redis -> 503
       with zero `results` queries executed (a SQLAlchemy `before_cursor_execute` listener
       counts them). Mutation: the PING moved after the scan -> the count test fails.
-- [ ] **R5 (P2, consult r4) ADOPTED.** `rate_limit()`'s async client has no socket timeout
+- [x] **R5 (P2, consult r4) ADOPTED.** `rate_limit()`'s async client has no socket timeout
       (`rate_limit.py:54-58`), so a blackholed Redis hangs the request BEFORE the PING. The
       quote wraps it: `asyncio.wait_for(rate_limit(...), 1.0)`; a timeout -> the same 503,
       before any DB work. Test: blackholed Redis -> 503 within ~1-2 s, zero `results`
@@ -2842,6 +2842,141 @@ codex_1b1c_consult_r{4,5,6}_out.txt`. **OWNER APPROVED the plan (2026-09-28).** 
   still said nothing was built: a dated status note added); **r2 `VERDICT: GO`, no findings.**
   Security pass: no endpoint or write path; every query carries `user_id` + `job_id`; no
   contact/encrypted column is selected; no secret; no new dependency.
+- **MERGED + LIVE: PR #384, merge `9833a7b0` (2026-09-28 14:50Z).** Rebased once over #383
+  (journal conflict, both entries kept); Codex r3 GO on the rebased three-dot diff; CI green on
+  the exact head; quiet all zeros; api/worker/beat on `9833a7b0`, clean boot.
+
+### 1b-1c-ii BUILT (2026-09-28), before the Codex diff review
+Branch `feat/lookup-1b1c-ii-quote` off `9833a7b0`. `routes/jobs.py` (the endpoint),
+`schemas.py` (`ContactLookupQuoteRequest`, `ContactLookupQuote`, `ContactLookupExcluded`,
+`ContactLookupPause`, `ContactLookupUnavailableResponse`), `schema/openapi.json`, NEW
+`tests/test_contact_lookup_quote.py` (24 tests), this plan = 5.
+- **Where the build differs from the plan text, and why:**
+  - "Pause UNKNOWN on a closed port -> still 200" cannot happen as written: R4 PINGs the same
+    client before the scan, so a dead Redis is a 503 first. UNKNOWN is proven through the real
+    publisher (no key, a stale heartbeat, a tombstone); the reader's own Redis-failure paths
+    are `test_skip_trace_pause_state`'s.
+  - "Store failing (closed and blackholed port)" would also stop at the PING. The store path
+    is proven against a PRIVATE real `redis-server` run with `maxmemory 1` + `noeviction`: it
+    answers PING and reads and refuses every write (OOM). Local Redis is 5.0 (no ACLs), and a
+    server-wide `CLIENT PAUSE` would have stalled another session's suite.
+  - The request body is `{"extra": "forbid"}` (house style), so a stray filter param is a 422
+    rather than silently ignored (O4: filters never apply).
+- **OpenAPI:** `.venv-schema` is BROKEN (its base was the removed Anaconda Python). A fresh
+  CI-equivalent venv at `C:/Users/Windows/bl-schema-venv` (uv CPython 3.12.12 = CI's 3.12,
+  `pip install -r requirements.txt`: fastapi 0.141.1, pydantic 2.13.4) regenerated it: +326,
+  **0 deletions** vs `origin/main`, every addition the quote's; `--check` OK.
+- **Mutations: 14/14 caught** (`<scratchpad dea35045>/mutate_1b1c_ii.py`): the limiter
+  unbounded (the request hangs: caught by the 150 s runner timeout), the PING dropped (the
+  closed-port test then sees `results` queries), kill switch, frozen/ended not refused,
+  over_limit refusing, plan gate, the job owner filter, run-not-done, the key unscoped by
+  category, `nx=True` (no replace), a swallowed store failure, the async client handed to the
+  sync calls, truncation without anything left, the category dropped from the planner call.
+  **The last one SURVIVED the first run** (no test quoted the `already_delivered` tab with
+  leads in it): `test_each_tab_quotes_only_its_own_leads` added, now caught.
+- **Regression (5 chunks, every test file that calls `/jobs` + the lookup/billing set): 857
+  passed, 0 failed.** ruff clean.
+
+### main moved under ii: #374 + #378 (security audits 4/4b) change two binding inputs (2026-09-28)
+Rebased cleanly onto `4f56a5e3`, but NOT reviewed or pushed: two facts the plan stood on changed.
+- **F1 WHO MAY BUY A LOOKUP is now decided by the claim** (`paid_lookup_access()`,
+  `src/workers/skip_trace_claim.py`, audit S3-03/S4-01): `starter` / `frozen` / `ended` are
+  blocked; `full` for admin, a paid term ending later, `active`, `past_due` in grace, or an
+  operator-granted plan; everything else (app trial, `trialing`, `canceled`, ...) is `trial`,
+  which may queue at most `SKIP_TRACE_TRIAL_CREDIT_ALLOWANCE` (25) credits over its WHOLE
+  LIFETIME. The rest is HELD (`not_attempted`). The room is `allowance -
+  lifetime_credits_queued()`, read from `pending_skip_trace_rows`: WORKER-ONLY, so the API
+  cannot compute a trial's remaining room. My quote gates on the plan NAME: a trial `pro`
+  account would be quoted up to 2,000 leads while the claim buys at most 25 credits.
+  Money-safe (the claim is the authority), customer-wrong. Frozen/ended: my R1 gate uses the
+  same predicates (`is_frozen`, `entitlement_ends_at <= now`), so it agrees.
+- **F2 the `export` zone is now the shared bucket of EVERY full-CSV route** (job, batch and
+  segment downloads, S4-03). A quote in that zone spends the customer's download budget.
+- The API already lazy-imports `src.workers.*` inside routes (`batches.py:411,765`,
+  `registration.py:105`), so the quote may call `paid_lookup_access()` itself (one rule, no
+  copy); `skip_trace_claim.py` imports only sqlalchemy and the logger at module level.
+
+**Proposed amendments (need Codex + OWNER):**
+- **A1 access by the claim's own rule.** Local import of `paid_lookup_access`; `starter` ->
+  the structured plan 402 (as now); `frozen`/`ended` -> the run-refusal 402 (R1, unchanged
+  predicates, `run_eligibility` still supplies the message); `full` -> as planned; `trial` ->
+  OWNER DECISION T:
+  - **T-a (recommended)** quote it, capped: walk the window as now but stop once the quoted
+    CREDITS (normal 1, advanced 2) would exceed the lifetime allowance, in the same window
+    order the claim keeps; the response adds `access` (`full` | `trial`) and
+    `trial_credit_allowance`, and says lookups already used on the trial lower it further
+    (the claim holds the rest). Stored `quoted_ids` capped the same way.
+  - **T-b** refuse trials at the quote with a structured 402 ("Paid plans include contact
+    lookups"), leaving their 25 credits to scrape-time lookups only.
+- **A2 a dedicated `lookup_quote` zone** (10/min per user, in `_FALLBACK_ZONES`), so quoting
+  never spends download budget. It is `rate_limit.py`, a 6th file in ii: OWNER DECISION Z:
+  - **Z-a** allow ii at 6 files (the zone line + its comment);
+  - **Z-b (recommended)** a tiny precursor PR (zone + a test + the plan), then ii;
+  - **Z-c** share the existing `writes` zone (30/min: cancel + scraper edits) instead.
+
+**Codex consult on A1/A2 (2026-09-28): PLAN: REVISE, 3 P1 + 1 P2 + 2 P3.** Output
+`<scratchpad dea35045>/codex_1b1c_ii_amend_r1_out.txt`. F1, F2 confirmed; nothing else in
+#374/#378 touches the planner or its parity. A1 sound for an advisory quote (pass the route's
+`now`, no row lock on the quote path). Codex preferred T-a with an EXACT API-visible lifetime
+counter (a migration); recommended Z-b; asked for payload/key **v2** and an explicit
+trial-cap disposition/reason at the 1b-2 confirm.
+
+**OWNER DECISIONS (2026-09-28):**
+- **T: cap at the FULL allowance** (no new schema). A trial's quote stops once its quoted
+  CREDITS would exceed `SKIP_TRACE_TRIAL_CREDIT_ALLOWANCE`, in window order (the order the claim
+  keeps). This is still a true UPPER bound: the claim's room is `allowance - used <=
+  allowance`, and the claim only lowers it. The response carries `access` (`full` | `trial`)
+  and `trial_credit_allowance`, and its docs say credits already used on the trial lower it
+  further. Rejected: the exact counter (a money-path migration phase ahead of ii for a number
+  the claim already enforces) and refusing trials (their allowance was meant to be usable).
+- **Z: precursor PR first.** `lookup_quote` zone, 10/min per user, in `_FALLBACK_ZONES`;
+  `rate_limit.py` + its test only (this plan records it in ii). Then ii rebases on it.
+- Adopted from Codex: payload `v: 2` with `access`, `trial_credit_allowance` and
+  `quoted_credits`, key namespace `...:quote:v2:...`; carried to 1b-2: confirm re-checks access
+  and the trial room under the user-row lock, refuses a payload whose `v` it does not know, and
+  records the trial-held leads with an explicit reason.
+
+### Amendments BUILT (2026-09-28)
+- **Precursor PR #386** (`feat/lookup-quote-rate-zone`, 4 files): the `lookup_quote` zone
+  (10/min, fail-closed; 6 tests, 3/3 mutations) AND the planner's `credit_cap` (moved here so ii
+  stays at 5 files): `Window.credit_cap` / `quoted_credits` / `over_credit_cap`,
+  `stopped="credit_cap"`, applied exactly as `claim_skip_trace_rows` applies its room (in order,
+  skip a lead that does not fit, keep a cheaper later one), `CREDITS` pinned equal to the
+  worker's `CREDITS_PER_ROW`, `PLANNER_VERSION` 2. **Parity with the REAL claim in trial mode**
+  (what it keeps == what the planner quotes); 6/6 mutations. Codex r1 GO, r2 NO-GO (P2 the
+  window should carry its cap, P3 docstring) fixed, r3 GO, r4 GO after rebase onto `fa658ccf`.
+  **A flaky test caught before push:** rows sharing one `created_at` were ordered by random id,
+  so the trial test's credit total varied (it had passed once by luck). Each row now has its own.
+- **ii** (on top of #386): `paid_lookup_access()` decides access (lazy import); a trial is
+  capped via `credit_cap = SKIP_TRACE_TRIAL_CREDIT_ALLOWANCE`; response adds `access`,
+  `trial_credit_allowance`, `over_trial_allowance`, `truncated_reason` may be `credit_cap`;
+  zone `lookup_quote`; payload and key `v2`. 26 quote tests; **18/18 mutations** (4 new: trial
+  cap not applied, zone back to `export`, access by plan name only, payload v1); openapi +352,
+  0 deletions, `--check` OK. Regression on the full stack: **923+ passed, 0 failed**.
+- 🛑 **CI BLOCKED (2026-09-28): GitHub Actions billing.** #386's re-run on `acdcadcf` failed in 3 s
+  ("recent account payments have failed or your spending limit needs to be increased"). Its
+  previous head (`3a990e0e`) had passed CI, but `main` moved (#387, docs), so the gate needs a
+  new green run. Nothing merges until the owner fixes billing.
+- **Codex diff review of ii** (three-dot against the precursor branch): **`VERDICT: GO`, no
+  findings** (`<scratchpad dea35045>/codex_ii_review_r1_out.txt`). ii stays LOCAL (unpushed)
+  until #386 merges; then: rebase onto main, Codex re-check, push, PR, CI, merge gate.
+- **#386 MERGED + LIVE (2026-09-30): merge `29172543`.** Billing fixed by the owner. The first
+  green-able run then failed the required Dependency Audit on PyJWT 2.13.0 (10 new CVEs, not
+  this PR); the S4-02 session shipped the bump as #391 (`0539de2b`). main moved three times under
+  #386 (#391, #390 the 2c-bis attempt fence, #389 S4-02); each rebase was clean with a
+  byte-identical patch, and Codex r5-r8 each said GO. #390 gave `_enqueue_skip_trace_rows` an
+  optional `attempt_token` fence: it only ever queues LESS, so the quote stays an upper bound and
+  the parity test (called without a token) still pins selection, gates and trace types. CI green
+  on `4fc42a5d`, quiet all zeros; api/worker/beat SUCCESS on `29172543`, clean boot.
+- **ii's first CI run FAILED (PR #393, 2026-09-30): 1 of 5,422.**
+  `test_a_quote_redis_cannot_store_is_never_shown` spawned a HARDCODED local Windows
+  `redis-server.exe`; CI's Redis is a `redis:7-alpine` service container with no binary on the
+  runner. A portability bug in the test, not in the endpoint. Fix: on Redis >= 6 (CI), a
+  throwaway ACL user `+@all -@write` on the test Redis (a real NOPERM on SET); on Redis 5 (the
+  local rig, no ACLs), the private `maxmemory 1` server via `BL_TEST_REDIS_SERVER` or PATH;
+  neither -> the test FAILS, never skips. The write probe now requires a server `ResponseError`
+  (a connection error is also a `RedisError` and proved nothing). The swallowed-store mutation
+  is still caught.
 
 **Files:** i = planner, `lookup_pricing.py`, planner tests, `docs/BUILD_JOURNAL.md`, this plan;
 ii = `routes/jobs.py`, `schemas.py`, `schema/openapi.json`, quote tests, this plan.

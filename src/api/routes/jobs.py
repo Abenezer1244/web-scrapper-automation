@@ -1,12 +1,18 @@
 """Job routes: CRUD + SSE live log stream."""
 
+import asyncio
+import functools
 import json
+import secrets
 import time
 import uuid
 from collections.abc import AsyncGenerator
+from datetime import UTC, datetime, timedelta
 
+import redis as _sync_redis
 import redis.exceptions as _redis_exceptions
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials
 from sqlalchemy import false, func, or_, select, text, update
@@ -15,12 +21,26 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api import sse_leases
 from src.api.auth import CurrentUser, get_auth_context
+from src.api.contact_lookup_planner import (
+    ALREADY_ANSWERED,
+    EXCLUDED_BUCKETS,
+    IN_PROGRESS,
+    PLANNER_VERSION,
+    PREVIOUSLY_ATTEMPTED,
+    count_remaining,
+    plan_tab_window,
+    policy_from_settings,
+    status_buckets,
+    tab_status_counts,
+)
 from src.api.deps import get_db, get_rls_db
 from src.api.dialer_filters import dialer_ready_conditions
+from src.api.entitlements import raise_plan_features, skip_trace_violation
 from src.api.errors import run_refusal_http
 from src.api.lead_actionability import actionable_condition, has_address_condition
 from src.api.middleware import audit_log, rate_limit, sanitize_search
 from src.api.owner_filters import build_owner_conditions
+from src.api.quota import run_eligibility
 from src.api.results_category import (
     DEFAULT_RESULTS_CATEGORY,
     ResultsCategory,
@@ -33,6 +53,11 @@ from src.api.schemas import (
     RUN_START_402_RESPONSES,
     AlreadyDeliveredContacts,
     AuctionCoverage,
+    ContactLookupExcluded,
+    ContactLookupPause,
+    ContactLookupQuote,
+    ContactLookupQuoteRequest,
+    ContactLookupUnavailableResponse,
     DuplicateSource,
     JobCreate,
     JobResponse,
@@ -45,11 +70,18 @@ from src.config import settings
 from src.config.constants import (
     AUCTION_PUBLICATION_LAG_DAYS,
     CANCELLABLE_STATUSES,
+    SKIP_TRACE_ADDON_PLANS,
+    normalize_plan,
     scrape_queue_for_plan,
 )
+from src.config.lookup_pricing import CURRENCY as LOOKUP_CURRENCY
+from src.config.lookup_pricing import PRICING_VERSION as LOOKUP_PRICING_VERSION
+from src.config.lookup_pricing import included_lookups_remaining, unit_price_cents
 from src.db import Job, JobLog, Result, ScraperConfig, User
 from src.db import session as db_session
 from src.utils.logger import setup_logger
+from src.utils.skip_trace_pause_state import UNKNOWN as PAUSE_UNKNOWN
+from src.utils.skip_trace_pause_state import PauseState, read_pause_state
 
 _logger = setup_logger("api.jobs")
 
@@ -985,6 +1017,210 @@ async def _attach_delivery_provenance(
         # date stays: it is this row's own history.
         if not r.duplicate_source_available:
             r.duplicate_source_job_id = None
+
+
+# ─── Contact lookups: the quote (Phase 1b-1c) ────────────────────────────────
+#
+# Contract: tasks/todo-lookup-contacts.md, "FINAL 1b-1c contract and build list".
+# Spends nothing and writes no database row: it plans the tab with the shared
+# planner, reads the pause state, and stores ONE Redis key the confirm (1b-2) reads.
+
+_QUOTE_TTL_SECONDS = 600
+# Every Redis call here is bounded end to end: the socket timeouts stop a thread,
+# and the await is bounded again in case the pool itself stalls.
+_LOOKUP_REDIS_SOCKET_TIMEOUT_S = 0.5
+_LOOKUP_REDIS_CALL_BOUND_S = 1.0
+_lookup_redis_client: _sync_redis.Redis | None = None
+
+
+def _lookup_redis() -> _sync_redis.Redis:
+    """A SYNC client, called only through `_bounded`. `read_pause_state` calls
+    `hmget` synchronously, so the API's async clients cannot be handed to it."""
+    global _lookup_redis_client
+    if _lookup_redis_client is None:
+        _lookup_redis_client = _sync_redis.from_url(
+            settings.REDIS_URL, **settings.redis_kwargs(),
+            socket_timeout=_LOOKUP_REDIS_SOCKET_TIMEOUT_S,
+            socket_connect_timeout=_LOOKUP_REDIS_SOCKET_TIMEOUT_S,
+        )
+    return _lookup_redis_client
+
+
+async def _bounded(fn, *args, **kwargs):
+    return await asyncio.wait_for(
+        run_in_threadpool(functools.partial(fn, *args, **kwargs)),
+        _LOOKUP_REDIS_CALL_BOUND_S,
+    )
+
+
+def _quote_key(user_id: str, job_id: str, category: str) -> str:
+    """ONE live quote per tab: a new quote replaces the previous one."""
+    return f"bridgeleads:contact_lookup:quote:v2:{user_id}:{job_id}:{category}"
+
+
+def _lookups_unavailable() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail={
+            "code": "contact_lookups_unavailable",
+            "message": "Contact lookups are unavailable right now. Nothing was charged; "
+                       "please try again in a few minutes.",
+        },
+    )
+
+
+@router.post(
+    "/{job_id}/contact-lookups/quote",
+    response_model=ContactLookupQuote,
+    responses={
+        **RUN_START_402_RESPONSES,
+        503: {"model": ContactLookupUnavailableResponse,
+              "description": "Lookups are switched off or a dependency is unreachable."},
+    },
+)
+async def quote_contact_lookups(
+    job_id: str,
+    body: ContactLookupQuoteRequest,
+    current_user: CurrentUser,
+    request: Request,
+    db: AsyncSession = Depends(get_rls_db),
+) -> ContactLookupQuote:
+    """Quote a "look up contacts" action for one results tab. Non-binding."""
+    now = datetime.now(UTC)
+    today = now.date()  # one clock for every query below
+    # The limiter's own async client has no socket timeout: bound it, so a stalled
+    # Redis refuses here instead of hanging the request (consult r4, R5).
+    try:
+        await asyncio.wait_for(
+            rate_limit(request, zone="lookup_quote", identifier=current_user.id),
+            _LOOKUP_REDIS_CALL_BOUND_S,
+        )
+    except TimeoutError:
+        raise _lookups_unavailable() from None
+
+    job = (await db.execute(
+        select(Job).where(Job.id == job_id, Job.user_id == current_user.id)
+    )).scalar_one_or_none()
+    if job is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    if not _run_delivered(job):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "run_not_finished",
+                "message": "This run has not finished, so there are no leads to look up yet.",
+            },
+        )
+
+    plan = normalize_plan(current_user.plan)
+    if plan not in SKIP_TRACE_ADDON_PLANS:
+        raise_plan_features([skip_trace_violation(plan)])
+    # A frozen or ended account may not start billable work. `over_limit` is the
+    # RECORD allowance, and a lookup never counts as a record, so it does not refuse.
+    eligibility = run_eligibility(current_user, now)
+    if eligibility.code in ("frozen", "ended"):
+        raise run_refusal_http(eligibility.code, eligibility.message, eligibility.resumes_at)
+    if not settings.SKIP_TRACE_ENABLED or not settings.TRACERFY_API_TOKEN:
+        raise _lookups_unavailable()
+    # WHO MAY BUY is the claim's own rule (audit S3-03/S4-01), read here without the
+    # claim's row lock: the quote is advisory, and the claim re-reads it locked. The
+    # gates above already refused Starter, frozen and ended accounts; a free trial
+    # is capped at its WHOLE lifetime allowance, since the credits it already used
+    # sit in a worker-only table. The claim's room is the allowance minus those, so
+    # this stays an upper bound (owner decision, 2026-09-28).
+    from src.workers.skip_trace_claim import ACCESS_FULL, ACCESS_TRIAL, paid_lookup_access
+
+    access = paid_lookup_access(current_user, now)
+    if access not in (ACCESS_FULL, ACCESS_TRIAL):
+        raise _lookups_unavailable()  # unreachable after the gates above; fail closed
+    credit_cap = settings.SKIP_TRACE_TRIAL_CREDIT_ALLOWANCE if access == ACCESS_TRIAL else None
+
+    # Redis BEFORE the scan: a quote nobody can store is never computed (R4).
+    try:
+        r = _lookup_redis()
+        await _bounded(r.ping)
+    except Exception:  # noqa: BLE001 - any Redis failure is the same 503
+        raise _lookups_unavailable() from None
+
+    user_id = str(current_user.id)
+    policy = policy_from_settings()
+    buckets = status_buckets(await tab_status_counts(db, job_id, user_id, body.category, today))
+    window = await plan_tab_window(db, job_id, user_id, body.category, today, policy,
+                                   credit_cap=credit_cap)
+    remaining = await count_remaining(db, job_id, user_id, body.category, today, window)
+    truncated = window.stopped is not None and remaining > 0
+
+    try:
+        pause = await _bounded(read_pause_state, r, user_id, now)
+    except Exception:  # noqa: BLE001 - the contract: unreadable is UNKNOWN
+        pause = PauseState(PAUSE_UNKNOWN)
+
+    unit_cents = unit_price_cents(plan)
+    if unit_cents is None:  # every add-on plan has a price; never quote without one
+        raise _lookups_unavailable()
+    included = included_lookups_remaining(current_user, now)
+    quote_id = secrets.token_urlsafe(32)
+    expires_at = now + timedelta(seconds=_QUOTE_TTL_SECONDS)
+    payload = {
+        "v": 2,
+        "quote_id": quote_id,
+        "user_id": user_id,
+        "job_id": job_id,
+        "category": body.category,
+        "quoted_ids": window.quoted_ids,
+        "advanced_count": window.advanced_count,
+        "quoted_credits": window.quoted_credits,
+        "access": access,
+        "trial_credit_allowance": credit_cap,
+        "over_credit_cap": window.over_credit_cap,
+        "counts": {**window.counts, **buckets},
+        "examined": window.examined,
+        "window_end": (None if window.window_end is None
+                       else [window.window_end[0].isoformat(), window.window_end[1]]),
+        "stopped": window.stopped,
+        "remaining": remaining,
+        "planner_version": PLANNER_VERSION,
+        "policy": {"pierce_cv_owner_skip_trace_enabled":
+                   policy.pierce_cv_owner_skip_trace_enabled},
+        "unit_price_cents": unit_cents,
+        "currency": LOOKUP_CURRENCY,
+        "pricing_version": LOOKUP_PRICING_VERSION,
+        "included_remaining_at_quote": included,
+        "created_at": now.isoformat(),
+        "expires_at": expires_at.isoformat(),
+    }
+    try:
+        await _bounded(r.set, _quote_key(user_id, job_id, body.category),
+                       json.dumps(payload), ex=_QUOTE_TTL_SECONDS)
+    except Exception:  # noqa: BLE001 - a quote nobody can confirm is never shown
+        raise _lookups_unavailable() from None
+
+    return ContactLookupQuote(
+        quote_id=quote_id,
+        expires_at=expires_at,
+        category=body.category,
+        max_new_lookups=len(window.quoted_ids),
+        advanced_count=window.advanced_count,
+        examined=window.examined,
+        truncated=truncated,
+        truncated_reason=window.stopped if truncated else None,
+        excluded=ContactLookupExcluded(**{b: window.counts[b] for b in EXCLUDED_BUCKETS}),
+        already_answered=buckets[ALREADY_ANSWERED],
+        in_progress=buckets[IN_PROGRESS],
+        previously_attempted=buckets[PREVIOUSLY_ATTEMPTED],
+        remaining=remaining,
+        access=access,
+        trial_credit_allowance=credit_cap,
+        over_trial_allowance=window.over_credit_cap,
+        included_lookups_remaining=included,
+        unit_price_cents=unit_cents,
+        currency=LOOKUP_CURRENCY,
+        pause=ContactLookupPause(
+            status=pause.status,
+            normal_resume_at=pause.normal_resume_at,
+            advanced_resume_at=pause.advanced_resume_at,
+        ),
+    )
 
 
 @router.get("/{job_id}/logs")

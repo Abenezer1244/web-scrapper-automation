@@ -39,6 +39,7 @@ from src.utils.lead_formatting import (
     strip_us_country_tail,
 )
 from src.utils.logger import setup_logger
+from src.utils.pinned_http import is_blocked_destination, pinned_session
 from src.utils.safe_http import safe_get_following
 
 _logger = setup_logger("scraper.enrichment.skip_trace")
@@ -570,8 +571,8 @@ def submit_batch(
     # is operator config; validate it (resolve=True, DNS-rebinding aware) and
     # require HTTPS before sending the bearer token so a misconfigured/poisoned
     # base URL can't exfiltrate the token to an internal/metadata host. The
-    # POST below uses a trust_env=False session with allow_redirects=False
-    # (safe_http is GET-only; this mirrors its guarantees for the POST path).
+    # POST below uses a pinned session with allow_redirects=False (safe_http is
+    # GET-only; this mirrors its guarantees for the POST path).
     if not url.lower().startswith("https://"):
         raise TracerfyError("TRACERFY_API_BASE_URL must use HTTPS")
     try:
@@ -624,15 +625,22 @@ def submit_batch(
         # data=form_fields sends application/x-www-form-urlencoded.
         # Tracerfy's doc says multipart/form-data but urlencoded is the
         # standard fallback and works with the same field names.
-        # S4: trust_env=False (no ambient proxy reroute) + allow_redirects=False
-        # (a poisoned 302 can't bounce the token-bearing POST to an internal
-        # host). Validation above already ran resolve=True on this URL.
-        _sess = requests.Session()
-        _sess.trust_env = False
+        # S4 + audit #5 5b-ii: a pinned session connects only to an address the
+        # SSRF policy approved, resolved in the same step, so a DNS answer that
+        # changes after the validation above (rebinding) cannot receive the
+        # token; it also ignores ambient proxies. allow_redirects=False: a
+        # poisoned 302 can't bounce the token-bearing POST to an internal host.
+        _sess = pinned_session()
         resp = _sess.post(
             url, headers=headers, data=form_fields, timeout=30, allow_redirects=False
         )
     except requests.ConnectionError as exc:
+        # A refusal at connect time is the same verdict as the validation above,
+        # and gets the same message, so the dispatcher classifies it
+        # provider_error (rows errored), not connection_error (retried on every
+        # tick against a blocked host). No socket opened, so nothing was sent.
+        if is_blocked_destination(exc):
+            raise TracerfyError("Refusing unsafe Tracerfy endpoint: destination not permitted") from None
         # Never delivered (refused / DNS / reset before a response) — the
         # dispatcher may safely release the batch and retry next tick.
         raise TracerfyError(f"Connection error submitting batch: {exc}") from exc
@@ -699,8 +707,7 @@ def fetch_queues(api_token: str | None = None, timeout: int = 30) -> list[dict]:
         raise TracerfyError(f"Refusing unsafe Tracerfy endpoint: {ssrf_exc}") from ssrf_exc
 
     try:
-        _sess = requests.Session()
-        _sess.trust_env = False
+        _sess = pinned_session()  # audit #5 5b-ii, as submit_batch
         resp = _sess.get(
             url,
             headers={"Authorization": f"Bearer {token}"},
@@ -708,6 +715,8 @@ def fetch_queues(api_token: str | None = None, timeout: int = 30) -> list[dict]:
             allow_redirects=False,
         )
     except requests.RequestException as exc:
+        if is_blocked_destination(exc):
+            raise TracerfyError("Refusing unsafe Tracerfy endpoint: destination not permitted") from None
         raise TracerfyError(f"Network error fetching queues: {type(exc).__name__}") from None
 
     if resp.status_code >= 400:

@@ -171,9 +171,14 @@ def heartbeat_sync_session() -> Iterator[Session]:
     """Open a session on the isolated NullPool heartbeat engine.
 
     System-level (no RLS context) by design: it writes only ``jobs.last_heartbeat_at``
-    under a CAS that pins both the job id and the attempt's ``started_at``.
+    under a CAS that pins the job id and the attempt token (``started_at`` AND
+    ``retry_count``, via ``_attempt_sql``). Two writers use it, both in
+    ``src/workers/tasks_helpers/status.py``: the liveness heartbeat (sets it to
+    now()) and the worker's exit acknowledgement for a cancelled attempt (sets it
+    to NULL, audit #4 S4-02). The job id and token always come from the worker's
+    own claim, never from a request.
 
-    Use ONLY for the liveness heartbeat. Anything else belongs on
+    Use ONLY for those two. Anything else belongs on
     ``system_sync_session`` / ``rls_sync_session`` — see the engine comment above
     for why this pool is kept empty.
     """

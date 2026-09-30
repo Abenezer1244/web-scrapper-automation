@@ -66,7 +66,12 @@ started_at + retry_count.
       type-checker is configured.
 - [x] 6. Codex diff review: r1 FAIL (P1 legacy NULL-heartbeat rows: rejected with
       evidence; P2 test honesty: adopted), r2 **GATE: PASS**.
-- [ ] 7. Push / PR / merge: waiting for the owner's OK.
+- [x] 7. Merged as #389 `02664e60` (2026-09-30, owner OK), live on api/worker/beat.
+      Before that, main moved: #390 (attempt fence) retyped the attempt token, and the
+      merge resolution scoped the exit ack by `_attempt_sql(token)` (a textual merge had
+      left a bare `started_at` bind that failed silently). Codex r3/r4 PASS; CI green.
+- [x] 8. Master Security Review (§14): pass 1 found one Low (stale docstring on
+      `heartbeat_sync_session`, fixed in the journal PR); passes 2 and 3 clean. GO.
 
 ## Review
 

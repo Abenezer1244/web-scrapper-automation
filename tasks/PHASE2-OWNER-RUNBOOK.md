@@ -252,18 +252,28 @@ checked against.
 
 Do not proceed while it says `NOT READY`.
 
-**6. Apply the R2 lifecycle rule BEFORE enabling the purge.** (Codex, High - it
-used to be last.) The rule is the only thing that catches an export uploaded
-moments after a purge commits, so enabling deletion first leaves that race open
-for the whole interval between the two steps.
+**6. The R2 lifecycle rule. DONE 2026-09-18 - no action needed.**
 
-    railway run --service worker python scripts/set_r2_lifecycle.py
-    railway run --service worker python scripts/set_r2_lifecycle.py --apply --yes-bucket bridgeleads-exports
+    bridgeleads-exports: delete after 365d (2 rules; also Default Multipart Abort Rule)
 
-It MERGES with any existing rules rather than replacing them, prints before and
-after, and refuses unless `--yes-bucket` matches the configured bucket. A success
-means the rule is STORED, not that anything is deleted: R2 applies lifecycle
-asynchronously and existing objects can take over 24h.
+Applied and verified in production. Two things worth knowing, because both would
+have bitten:
+
+* **The bucket already had a rule** ("Default Multipart Abort Rule"). Writing a
+  lifecycle configuration REPLACES the whole thing, so a blind write would have
+  silently deleted it. The script merges by id and printed before/after; the
+  existing rule survived. This is no longer hypothetical.
+* **Nothing is deleted today.** The bucket was created 2026-03-17, so no object is
+  yet 365 days old. The rule is protective from here on, not retroactive.
+
+To re-check or change it later:
+
+    railway run --service worker -- python scripts/set_r2_lifecycle.py
+    railway run --service worker -- python scripts/set_r2_lifecycle.py --apply --yes-bucket bridgeleads-exports
+
+Note the bare `--` and that `railway run` executes LOCALLY: it injects production
+env into whatever `python` your PATH finds, and on this machine that is a removed
+anaconda install. Point it at a real interpreter.
 
 **7. Dry run. Writes nothing.**
 

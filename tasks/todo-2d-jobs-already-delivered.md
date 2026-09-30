@@ -140,3 +140,19 @@ query -> both fail on "no results read"); openapi --check OK (4 description line
 1. Accept snapshot-only for the list (recommended), or add option B (history backfill, mig 107)?
 2. Show the source scraper when the earlier delivery came from a DIFFERENT scraper (contract Q2
    open question)? Recommend NO for the list (one number); the run page lists sources.
+
+## Review (2026-09-30)
+- Built 2d-i Phase A (notification) and Phase B (API docs + list guards), owner-approved
+  between phases. RED first (5 failed on a pure extraction), then GREEN; list guards proven by
+  two mutants (live fallback; silent partition query).
+- Full suite 8 parts on the first rebase (2b907bc1): 5741 passed, 12 skipped, 1 failed =
+  `test_contact_lookup_quote::test_a_quote_redis_cannot_store_is_never_shown` (local Redis has
+  no ACLs; known env-only, green in CI). One reap for low memory; parts ac-ah rerun one per job.
+- Rebased again onto e9397f0f (#399, #401, #402 incl. migration 107): patch identical except
+  blob hashes / hunk offsets; test DB upgraded to 107; 13 affected files 296 passed; ruff clean;
+  openapi --check OK.
+- Security review x2: no findings (no new endpoint/input/SQL; one int from the user's own job
+  row; log carries ids and a code-constant reason only).
+- Codex: plan r1-r8 (PLAN: GO; r7 P1 on the FE headline rebutted with FE master evidence,
+  accepted r8); diff r1 GATE: PASS + 2 P3 docs (fixed), r2 GATE: PASS.
+- Step 1 of the handoff (first 2c snapshot) still PENDING: no job after 11:31Z as of 12:22Z.

@@ -125,8 +125,15 @@ _OPS = _ROOT / "scripts" / "verify_worker_delete_grants.py"
 
 
 def _sql_statements(sql: str) -> list[str]:
+    """`--` comments and psql meta-lines (`\\gset`, `\\echo`, ...) removed, split on `;`.
+
+    A `DO $$ ... $$` body is split too, into fragments. That is deliberate and safe in
+    both directions: a GRANT only counts as a complete statement (a fragment does not
+    match, so a grant hidden in a DO block FAILS the pin), and a REVOKE is searched for
+    INSIDE every fragment (so one hidden in a DO block is still seen)."""
     no_comments = re.sub(r"--[^\n]*", "", sql)
-    return [re.sub(r"\s+", " ", s).strip() for s in no_comments.split(";") if s.strip()]
+    no_meta = re.sub(r"(?m)^\s*\\.*$", "", no_comments)
+    return [re.sub(r"\s+", " ", s).strip() for s in no_meta.split(";") if s.strip()]
 
 
 def _py_value(path: Path, name: str):
@@ -182,8 +189,10 @@ def test_no_later_statement_revokes_any_system_delete_grant():
         for i, s in enumerate(stmts):
             for table in _granted([s]):
                 for later in stmts[i + 1:]:
-                    m = re.fullmatch(r"REVOKE (.+?) ON (.+?) FROM " + _ROLE, later,
-                                     re.IGNORECASE)
+                    # search, not fullmatch: a REVOKE inside a DO block's fragment
+                    # ("DO $$ BEGIN REVOKE ...") must still be seen (Codex O-D r2).
+                    m = re.search(r"REVOKE (.+?) ON (.+?) FROM " + _ROLE + r"\b", later,
+                                  re.IGNORECASE)
                     if not m:
                         continue
                     privs, on = m.group(1).upper(), m.group(2)

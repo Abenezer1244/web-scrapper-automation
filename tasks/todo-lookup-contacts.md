@@ -4790,6 +4790,18 @@ trusted-worker risk; the RLS hardening is the owner's call (and, if wanted, befo
       function; a second delete inside it.
 
     The docstring CONTROL passed.
+- **Codex diff review r2: GATE: NO-GO, 2 P2** (`codex_od_review_r2_out.txt`):
+  - **AM1 (P2) REJECTED with evidence: "a second delete in the approved function still
+    passes".** The premise is false. The hit set is keyed by (path, scope, LINE), and the
+    returned list keeps one `(path, scope)` entry PER line, so two deletes return two
+    entries. The mutant was caught, untruncated: `assert [(claim), (claim)] == [(claim)]`,
+    "Left contains one more item" (`od_second_delete_evidence.txt`).
+  - **AM2 (P2) adopted: a REVOKE hidden in a `DO $$` block, and psql meta-lines.** Meta
+    lines (`\gset`, `\echo`, ...) are stripped. A REVOKE is now SEARCHED inside every
+    statement fragment, so a DO body's `BEGIN REVOKE ... FROM bridgeleads_system` is seen.
+    A GRANT still counts only as a complete statement, so a grant hidden in a DO block
+    FAILS the pin (fail-safe). Two new mutants were both caught: a REVOKE inside a DO
+    block, and the grant only inside a DO block. **20/20 as expected**, hashes OK.
 
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever

@@ -1700,7 +1700,8 @@ class ResultRow(BaseModel):
     # 'purged' is terminal: this row was looked up, and its aged contact data has since
     # been deleted under the Privacy Policy §7 retention sweep (usually a former hit,
     # but a 'miss' with [] arrays is swept too, see SkipTraceStatus.PURGED). Treat it as
-    # "no contact data", not as "never traced" — the trace happened and was paid for.
+    # "no contact data", not as "never traced": the row was answered once (bought, or
+    # reused from an earlier answer); purging says nothing about a new charge.
     skip_trace_status: str = "not_attempted"
     skip_trace_attempted_at: datetime | None = None
     is_duplicate: bool = False

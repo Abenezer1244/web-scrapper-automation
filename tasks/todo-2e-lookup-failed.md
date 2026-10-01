@@ -1,8 +1,9 @@
 # 2e: Q4 (F-009) "Lookup failed"
 
 > **SHIPPED 2026-10-01** (BE #420 6d32c8e2, FE bridgeleads-web #182 4a4f5248 and #184
-> d0626274). Everything below the "Review (shipped)" section is the plan AS APPROVED and the
-> Codex rounds that shaped it: a historical record. Where it differs from what shipped (line
+> d0626274). Everything after this banner, up to the "Review (shipped)" section, is the plan
+> AS APPROVED; the "Reconciliation" sections after it record the Codex rounds that shaped it.
+> Both are a historical record. Where it differs from what shipped (line
 > ranges, the superseded `trim()` wording of the r4 reconciliation, present-tense "RED on
 > main"), the "Review (shipped)" section and the 2026-10-01 BUILD_JOURNAL entry are
 > authoritative.

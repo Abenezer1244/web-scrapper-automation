@@ -178,13 +178,13 @@ contracts doc. B is over the 5-file guideline only by the two type files and a d
    `purged` from scope.
 
 ## Verification
-- [ ] A: migrate the test DB 107 -> 108 first; new test RED on main, GREEN on branch; full
+- [x] A: migrate the test DB 107 -> 108 first; new test RED on main, GREEN on branch; full
       suite in 8 parts (one background job each, exit files); security review x2; Codex diff
       `origin/main...HEAD` GATE: PASS; quiet.py = 0; merge; Railway SUCCESS on the merge SHA,
       `/health` 200, worker logs clean.
-- [ ] B: `npx --no-install tsc --noEmit`, `npx --no-install eslint <changed files>`,
+- [x] B: `npx --no-install tsc --noEmit`, `npx --no-install eslint <changed files>`,
       `npm run build`; types drift gate regenerated from BE main.
-- [ ] B: stub API + Playwright (rig from session 81fad222 `fe2d/`): one run with a row per
+- [x] B: stub API + Playwright (rig from session 81fad222 `fe2d/`): one run with a row per
       state (7 statuses x values/empty; `miss` + `[]` + stale scalar; `hit` + `[]` + scalar;
       `hit` + NULL arrays + scalar; `not_attempted` + NULL arrays + scalar (legacy), phone-only
       and email-only; `not_attempted` with blank / whitespace-only scalars, one each of
@@ -197,9 +197,9 @@ contracts doc. B is over the 5-file guideline only by the two type files and a d
 - [ ] Real-row check (needs owner OK for a read-only prod query: counts by
       `skip_trace_status`, then one real `errored` row in the app). If none exists, say so and
       rely on the stub, labelled as such (UX-AUDIT F-009 verification clause).
-- [ ] B: Codex diff review on `origin/master...HEAD` until `GATE: PASS`; merge FE PR; Vercel
+- [x] B: Codex diff review on `origin/master...HEAD` until `GATE: PASS`; merge FE PR; Vercel
       status success for the merge SHA.
-- [ ] BUILD_JOURNAL entry (BE docs PR, merged when quiet).
+- [x] BUILD_JOURNAL entry (BE docs PR, merged when quiet).
 
 ## Todo
 - [x] Codex PLAN review until `PLAN: GO` (r1-r5 NO-GO, r6 GO)

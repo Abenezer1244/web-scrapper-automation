@@ -43,8 +43,8 @@ to understand *why* the code is the way it is and *what's been attempted before*
 **Tried / Decided:**
 - The contract said FE-only and listed six statuses. The backend defines seven
   (`SkipTraceStatus`): `purged` (retention sweep) read "None found" on both channels, the same
-  false claim. The column is an unconstrained `String(16)`, so any other string is bucketed as
-  `unknown` and rendered neutrally. That made a backend phase
+  false claim. The column is a `String(16)` with no CHECK, so any other value it can hold is
+  bucketed as `unknown` and rendered neutrally. That made a backend phase
   necessary, so the summary would not call a looked-up lead "not looked up".
 - Codex plan review took six rounds (r1-r5 NO-GO, r6 GO). Each round tightened the shared
   rule between the cells and the summary:
@@ -54,7 +54,7 @@ to understand *why* the code is the way it is and *what's been attempted before*
   - values render only in the values state, so stale contacts never show on an in-flight,
     failed or removed lead;
   - the scalar fallback applies only to answered rows. The cache copy derives `hit` from the
-    scalars (`enrich.py`), so an array-only rule (Codex r1) would have hidden a paid hit.
+    scalars (`src/workers/tasks_helpers/enrich.py`), so an array-only rule (Codex r1) would have hidden a paid hit.
 - The scalar `phone` / `email` columns the predicate reads are `EncryptedString` (the arrays
   are `EncryptedJSON` and are not read). The column is `type_coerce`d to plain `String` so
   the regex binds as a text parameter, never through the encrypting type. Blanks never reach
@@ -79,29 +79,33 @@ to understand *why* the code is the way it is and *what's been attempted before*
 - The BE endpoint test did not cover `submitted` (Codex gate r1 P3); added.
 
 **Proof:**
-- BE: the endpoint test is RED on main and GREEN on the branch. The mutant `[^ ]` (trim-like)
+- BE: the endpoint test was RED on pre-#420 main (1f7f7114) and GREEN on the branch. The mutant `[^ ]` (trim-like)
   fails it. Full suite in 8 parts; every local failure was explained (the Redis-ACL env test,
   one `0xC0000142` import-cycle subprocess that passes alone, Playwright "driver connection
   closed" after a reap, which passes alone). CI Test green on the merge head. Codex diff gate:
   PASS.
 - FE: tsc, eslint and build pass. A stub-API Playwright run checked 24 cases at 1440 and 390:
-  all pass on the branch; on origin/master the same assertions fail, including the F-009 pair.
+  all pass on the branch; on pre-#182 master (33278dc) the same assertions failed, including
+  the F-009 pair.
   Codex FE gate: PASS, no findings.
 
 **Pending / Handoff:**
 - `last_trace_outcome` writers (BE), then a retry for `not_submitted` only.
-- The "Removed" tooltip says "its contact details were deleted". The sweep can also purge a
-  `miss` row whose arrays are `[]` (see Facts), so the copy should be neutral ("its lookup data
-  was deleted"). Small FE follow-up.
+- DONE in this session: the "Removed" tooltip said "its contact details were deleted", but the
+  sweep can also purge a `miss` row whose arrays are `[]` (see Facts). bridgeleads-web #184
+  (squash d0626274, Vercel success) made it neutral: "its lookup data was deleted after the
+  retention period", with the summary label, type comment and contracts doc to match.
 - A real-row check of an `errored` lead in prod, if the owner approves a read.
 - Next queue item: item 3 (batches B-E + F-045..F-050).
 
 **Facts learned:**
 - `results.skip_trace_status` has seven defined values (`SkipTraceStatus`); the column itself
-  accepts any string. `purged` is terminal and means retention removed aged contact data. The
-  code comments describe it as a former hit, but the sweep (`retention.py` `_ELIGIBLE`) only
+  is a `String(16)` with no CHECK. `purged` is terminal and means retention removed aged lookup
+  data. The code comments describe it as a former hit, but the sweep
+  (`src/workers/scheduler_helpers/retention.py` `_ELIGIBLE`) only
   requires a contact column to be set, so a `miss` with `[]` arrays qualifies too.
-- Nothing retries an `errored` lead: only `not_attempted` is claimed (`skip_trace_claim.py`).
+- Nothing retries an `errored` lead: only `not_attempted` is claimed
+  (`src/workers/skip_trace_claim.py`).
 
 ## 2026-09-30 — Landing and marketing redesign (bridgeleads-web#176): contour field, measured numbers, five critique rounds
 

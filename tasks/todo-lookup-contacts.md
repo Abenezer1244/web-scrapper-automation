@@ -4167,6 +4167,21 @@ still holds: nothing reaches a customer before 2d, and 2d stays hard-gated on O-
 - **Codex diff review r2: GATE: GO, no findings** (AC1-AC4 closed; `SKIP LOCKED` skips before
   the LIMIT; one LATERAL current row everywhere). `codex_2cii_review_r2_out.txt`.
 
+### 2c-i MERGED + LIVE (2026-10-01): #416, merge `c517cef7`
+- Rebased twice under the PR (#413 migration 109, then #417). Each time the diff was
+  byte-identical and Codex re-checked it (r3, r4 GO).
+- CI green on `c424a41e`, quiet all zeros. api, worker and beat SUCCESS, 0 errors, `/health` 200.
+
+### 2c-ii MERGED + LIVE (2026-10-01): #419, merge `f2fe1573`
+- Rebased `--onto` main after #416, and again over #418 (`.env.example` only). Codex r3 GO.
+- CI green on `52e03034`, quiet all zeros. api, worker and beat SUCCESS. The worker registers
+  `reconcile_contact_lookups`.
+- **The first production beat run succeeded in 1.2 s with all zeros** (no actions exist until
+  2d).
+
+## NEXT: O-C (grown by AA2), then O-D, then 2d (ASK THE OWNER BEFORE 2d)
+See `docs/HANDOFF-lookup-1b2-oc-2026-10-01.md`.
+
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever
       the tab has leads that have never been looked up; when the quote comes back with

@@ -1880,11 +1880,16 @@ class AlreadyDeliveredContacts(BaseModel):
     are worker-only, so whether an answer was bought now or reused is not reported.
     """
 
-    found: int = 0          # skip_trace_status 'hit': at least one phone or email
+    # The buckets are disjoint and counted from their own predicates; only `unknown` is a
+    # remainder. The leads table renders each row by the same rules (FE ContactStatus),
+    # so a lead whose cell shows contacts is never counted as not looked up.
+    found: int = 0          # 'hit', or a legacy 'not_attempted' row that carries a contact
     none_found: int = 0     # 'miss': the provider answered and had no contact
     looking: int = 0        # 'queued' / 'submitted': a lookup is on its way
     failed: int = 0         # 'errored': the lookup did not complete
-    not_looked_up: int = 0  # never asked (skip trace off, nothing traceable) or purged
+    not_looked_up: int = 0  # 'not_attempted' with no contact: never asked
+    removed: int = 0        # 'purged': looked up, contacts later deleted for age (retention)
+    unknown: int = 0        # a status this API version does not know
     # NOT a bucket: how many of found + none_found were answered from this account's
     # earlier answer, with no new lookup bought (results.skip_trace_source, 097). Rows
     # settled before 097 carry no source and are not counted here.

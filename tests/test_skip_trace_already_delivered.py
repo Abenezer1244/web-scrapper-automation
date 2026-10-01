@@ -902,6 +902,7 @@ async def test_no_looked_up_lead_is_reported_as_not_looked_up(
     _raw_status(_lead(business_user.id, run, 12, dup=True), "not_a_status")
     _lead(business_user.id, run, 13, dup=True, status="hit", traced_days_ago=0,
           phone="2065550122", source="lookup")
+    _lead(business_user.id, run, 14, dup=True, status="submitted")  # at Tracerfy
 
     # Another account's emptied, untraced and unknown leads on its own run.
     theirs = _run(starter_user.id, skip_on=True, status="done")
@@ -916,11 +917,11 @@ async def test_no_looked_up_lead_is_reported_as_not_looked_up(
 
     assert resp.status_code == 200
     page = resp.json()
-    assert page["already_delivered_count"] == 13
+    assert page["already_delivered_count"] == 14
     contacts = page["already_delivered_contacts"]
     assert contacts == {
         "found": 3,            # the hit + the two legacy rows with a contact
-        "none_found": 0, "looking": 0, "failed": 0,
+        "none_found": 0, "looking": 1, "failed": 0,  # looking: the submitted row
         "not_looked_up": 8,    # the untraced row + one per blank value
         "removed": 1,          # purged
         "unknown": 1,          # a status this API does not know

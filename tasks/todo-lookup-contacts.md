@@ -4824,7 +4824,7 @@ trusted-worker risk; the RLS hardening is the owner's call (and, if wanted, befo
 - **Follow-up (not in O-D):** correct the two scripts' "DELETE=False on every table"
   docstrings.
 
-### O-D MERGED (2026-10-01): #425, merge `9bfc73b3`. NOT YET APPLIED IN PRODUCTION
+### O-D MERGED (2026-10-01): #425, merge `9bfc73b3`. APPLIED IN PRODUCTION THE SAME DAY (below)
 - CI green on `e1fac4d8`, quiet all zeros, main unchanged, `--match-head-commit`. api, worker
   and beat SUCCESS on `9bfc73b3`, `/health` 200. (Scripts + tests only: no runtime change.)
 - **Read-only prod report** (`verify_worker_delete_grants.py` from main, no `--apply`): **TWO**

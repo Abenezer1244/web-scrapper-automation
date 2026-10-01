@@ -40,8 +40,9 @@ to understand *why* the code is the way it is and *what's been attempted before*
     the new flag `billing_decision_unknown`, never guessed.
 - **#425** (`9bfc73b3`): `GRANT DELETE ON pending_skip_trace_rows TO bridgeleads_system` in all
   three grant sources. The tests read the sources as executed (a four-way equality plus
-  ordered-REVOKE checks), and an AST scan pins the claim withdrawal as the ONLY pending-row
-  delete in `src`.
+  ordered-REVOKE checks), and an AST scan finds the claim withdrawal as the only STATICALLY
+  visible pending-row delete in `src`. SQL built at runtime and `session.delete(instance)`
+  are out of a static scan's reach, and the test says so.
 - **Production:** `verify_worker_delete_grants.py --apply`, owner-approved, granted DELETE on
   `pending_skip_trace_rows` AND `skip_trace_cache`. Verified read-only afterwards: 8/8 tables,
   role NOSUPERUSER/NOBYPASSRLS, RLS forced, the app role with no pending-row privilege, 0

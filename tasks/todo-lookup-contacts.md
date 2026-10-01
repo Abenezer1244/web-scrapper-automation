@@ -4514,6 +4514,49 @@ mandatory: the post-deploy NULL proof, and owner-approved remediation for any NU
     `rows_sent = rows_uploaded` backfill): **10/10 caught**, file hash identical before
     and after the run.
 - **Codex diff review r2: GATE: GO, no findings** (`codex_oci_review_r2_out.txt`).
+- PR **#421**.
+
+### O-C-ii BUILT (2026-10-01, branch `feat/lookup-oc-ii-rows-sent`, stacked on O-C-i), before the Codex diff review
+- `models.py`: `SkipTraceQueue.rows_sent` (Integer) and `unmatched_billed` (Boolean), both
+  nullable, documented.
+- `skip_trace_dispatcher.py` `_persist_submission`: the queue INSERT writes
+  `rows_sent=len(claimed)`. That is the POST's rows on every path, recorded at the INSERT
+  rather than from the stamped rows. The ON CONFLICT keeps the first write. Nothing writes
+  `unmatched_billed` yet (O-C-iii).
+- Tests (`tests/test_skip_trace_queue_billing_decision.py`, +4, all on the REAL dispatcher;
+  seeding reuses `test_skip_trace_spend_ledger`'s helpers; only `fetch_queues` is replaced):
+  - an accepted batch, de-duplicated 3 → 2: `(rows_sent, rows_uploaded, decision) = (3, 2,
+    NULL)`;
+  - **partial bookkeeping** (one row re-claimed since, so 2 of 3 stamped): `rows_sent` 3;
+  - a second bookkeeping pass (the fresh-session retry with a smaller `claimed`) keeps 2;
+  - adoption through `_reconcile_stale_claims`: 2 claimed, Tracerfy says 1 uploaded →
+    `(2, 1, NULL)`, both rows stamped.
+- **Mutations: 7/7 caught** (runner v2 over two files, hashes identical after):
+  - `rows_sent` omitted, taken from the upload, or one short;
+  - an `ON CONFLICT DO UPDATE` overwrite;
+  - re-stamped from `len(moved)` after the fact;
+  - the decision pre-set at submission;
+  - the model column removed (caught as `pg_insert`'s compile error, the real effect).
+
+  **Trap caught in my own runner:** the first `len(moved)` mutant called `text`, which is
+  not imported in the dispatcher, so it "failed" with a NameError on the wrong test. The
+  mutant was fixed to import its own `text` and re-run alone. It is now caught by the
+  partial-bookkeeping test, the one it targets.
+- **Regression: 815 passed, 0 failed.** That is every test file importing the dispatcher or
+  naming `skip_trace_queues` / `SkipTraceQueue` (20 files, 3 chunks). ruff clean.
+- **Codex diff review r1 (O-C-ii alone, three-dot vs the O-C-i branch): GATE: GO, no
+  findings** (`codex_ocii_review_r1_out.txt`).
+
+### O-C-i MERGED + LIVE (2026-10-01): #421, merge `bf792931` (09:28:48Z)
+- CI green on `f5e09c19`. quiet all zeros, main unchanged, `--match-head-commit`. The other
+  sessions were told "merging" / "verified".
+- api, worker and beat SUCCESS on `bf792931`. Worker and beat logged "Migrations applied.",
+  the workers are ready, `/health` 200.
+- **The AE1 / AF3 prod gate PASSED:** `oc_schema_check.py` (worker service) shows
+  `rows_sent` (integer, YES), `unmatched_billed` (boolean, YES), `alembic_version =
+  ['110']`. O-C-ii may merge.
+- O-C-ii was rebased `--onto` main `bf792931`. Its three-dot diff is BYTE-IDENTICAL to the
+  reviewed one.
 
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever

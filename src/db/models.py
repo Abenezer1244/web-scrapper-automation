@@ -1339,6 +1339,17 @@ class SkipTraceQueue(Base):
     status = Column(String(16), nullable=False, default="pending", index=True)
     # pending | completed | errored
     rows_uploaded = Column(Integer, nullable=False, default=0)
+    # How many rows the batch's POST carried (migration 110), written with this row
+    # by _persist_submission. Billing bills `unmatched` rows only when the provider
+    # uploaded at least this many: comparing against the rows STAMPED with the queue
+    # id instead misses a row that was sent but never stamped (partial bookkeeping).
+    # NULL = recorded before 110; never backfilled, read as "not proven".
+    rows_sent = Column(Integer, nullable=True)
+    # The decision billing MADE for this queue's `unmatched` rows (migration 110),
+    # written once in the ingest transaction that bills. The contact-lookup
+    # reconciler reads it instead of recomputing the rule, so an action states what
+    # billing did. NULL = billing has not run on this queue, or ran before O-C.
+    unmatched_billed = Column(Boolean, nullable=True)
     credits_deducted = Column(Integer, nullable=False, default=0)
     # H3 residual (migration 054): the Tracerfy-signed CSV link targets traced
     # PII, so it is encrypted at rest. Migration 054 NULLs expired links and

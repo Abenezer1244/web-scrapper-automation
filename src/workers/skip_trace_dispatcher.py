@@ -1531,6 +1531,12 @@ def _persist_submission(
             # than len(claimed) (prod: 25 sent → 24 uploaded → all 25 rows
             # reconciled by the webhook). Informational only.
             rows_uploaded=response.get("rows_uploaded") or len(claimed),
+            # What the POST carried: on every path `claimed` is exactly the batch's
+            # rows (the out-of-credits resubmit slices it first; adoption rebuilds the
+            # stale claim). Recorded HERE, not from the rows stamped below, because
+            # fewer can move than were sent. Billing compares the upload with it
+            # (O-C). The ON CONFLICT keeps the first write on a retry or adoption.
+            rows_sent=len(claimed),
             credits_deducted=response.get("credits_deducted") or 0,
             # Normally filled in by the webhook receiver. On the RECONCILER's
             # adoption path the queue has often already completed, and carrying

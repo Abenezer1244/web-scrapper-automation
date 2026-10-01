@@ -3824,6 +3824,9 @@ O-D stays the pre-2d gate. Outputs: `<scratchpad 4ebfb689>/codex_2b_consult_r{1.
   test released the job lock without proving both writers were blocked on it, so it could pass
   as two sequential runs. It now polls `pg_locks` until BOTH are waiting on the holder's
   advisory key, and asserts it before releasing. 3/3 runs green.
+- **Codex diff review r2: GATE: GO, no findings** (the P3 is closed: the probe matches the
+  holder's granted key and needs two ungranted waiters). Outputs: `<scratchpad 4ebfb689>/
+  codex_2b_review_r{1,2}_out.txt`.
 
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever

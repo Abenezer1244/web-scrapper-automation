@@ -5038,6 +5038,46 @@ uuid[]))` as AO5 says; a test for a replay after the plan / kill switch changes 
 r4 reviewed an unfixed file: my fix script had aborted on a wrong anchor (I quoted the
 line as `  injection ...`; it reads `  fault injection ...`) before writing anything.
 
+### 2d BUILT (2026-10-01, branch `feat/lookup-1b2d-confirm`, stacked on #426), IN REVIEW. NOT MERGED
+- `jobs.py`: `POST /jobs/{job_id}/contact-lookups` exactly as specified (AO1-AO5):
+  - helpers `_action_for_quote`, `_replayed`, `_valid_quote_payload`,
+    `_publish_contact_lookup` (a dedicated 2-thread pool behind a non-blocking
+    `BoundedSemaphore(2)`, `retry=False`, a 3 s bound);
+  - the compare-and-delete Lua; the conditional `dispatched_at` stamp.
+- `schemas.py`: `ContactLookupConfirmRequest`, `ContactLookupAction`,
+  `ContactLookupConfirmError*`. `openapi.json` regenerated (0 deletions vs main; `--check` OK).
+  **`.venv-schema` is DEAD** (it was built on the gone Anaconda); the working venv pins
+  fastapi 0.141.1 / pydantic 2.13.4 exactly as `requirements.txt` does, the CI-equivalent.
+- `tests/test_contact_lookup_confirm.py`: **32 pass**. Real PG + Redis + the real worker; a
+  pass-through publish spy; labelled fault injections:
+  - a broker refusal;
+  - the worker winning the stamp race;
+  - a DB trigger refusing the stamp;
+  - a hung publish.
+- **A REAL BUG found by mutation and fixed:** the stamp's rollback expired the ORM
+  `current_user`, and the audit line read it → MissingGreenlet → a 500 after a committed
+  purchase. The audit now uses the plain `user_id`.
+- **Mutations: 18/18 caught** on the pre-review code (runner `mut_2d.py` in scratchpad
+  feececfd). **Not yet re-run after review r1's changes.**
+- **Codex diff review r1: NO-GO, 1 P1 + 3 P2 + 1 P3, all fixed in `c840ea45`:**
+  - the post-commit import + publish are guarded (P1);
+  - strict validation of the stored payload → 409 `quote_unsupported` (naive expiry,
+    non-list or non-UUID ids, bad price, currency or version);
+  - 404 / 429 documented in the OpenAPI;
+  - a FORCED race test (a barrier spy: two pre-checks then the loser's winner re-fetch);
+  - a hung-publish test (202 within the bound, the slot freed afterwards).
+- **NEXT:**
+  1. mutation re-run (add mutants for the new validation and the guarded import);
+  2. the full regression (60 files, 9 chunks: `2d_chunk_*` in scratchpad; chunk 00 passed
+     70 before the review fixes, then the run was stopped for the changes);
+  3. Codex review r2;
+  4. merge #426 FIRST (docs; it waits on `quiet.py` = all zeros, which was blocked by
+     another worker-role read holding shared locks), then rebase 2d onto main and prove
+     the diff byte-identical;
+  5. open the 2d PR → CI → merge under the standing rule → deploy verify.
+
+  **2d is the live switch: the first customer confirm becomes possible on deploy.**
+
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever
       the tab has leads that have never been looked up; when the quote comes back with

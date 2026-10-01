@@ -135,9 +135,12 @@ async def _queued_rows(db, user_id) -> int:
 async def test_a_trial_claims_up_to_its_allowance_and_holds_the_rest(db, allowance):
     trial = await _account(db, trial_ends_at=datetime.now(UTC) + timedelta(days=5))
     report: dict = {}
-    won = await _claim(db, await _payloads(db, trial, 5), report)
+    payloads = await _payloads(db, trial, 5)
+    won = await _claim(db, payloads, report)
     assert len(won) == 3
-    assert report == {"access": ACCESS_TRIAL, "held": 2}
+    # held_ids (1b-2 W5): the leads that did not fit, in the caller's order.
+    assert report == {"access": ACCESS_TRIAL, "held": 2,
+                      "held_ids": [str(p["result_id"]) for p in payloads[3:]]}
     assert await _queued_rows(db, trial.id) == 3
 
 
@@ -214,7 +217,7 @@ async def test_paying_accounts_are_not_limited_by_the_trial_allowance(db, allowa
     user = await _account(db, **kw)
     report: dict = {}
     assert len(await _claim(db, await _payloads(db, user, 5), report)) == 5
-    assert report == {"access": ACCESS_FULL, "held": 0}
+    assert report == {"access": ACCESS_FULL, "held": 0, "held_ids": []}
 
 
 @pytest.mark.parametrize(("kw", "access"), [
@@ -226,8 +229,10 @@ async def test_paying_accounts_are_not_limited_by_the_trial_allowance(db, allowa
 async def test_blocked_accounts_claim_nothing(db, allowance, kw, access):
     user = await _account(db, **kw)
     report: dict = {}
-    assert await _claim(db, await _payloads(db, user, 2), report) == []
-    assert report == {"access": access, "held": 2}
+    payloads = await _payloads(db, user, 2)
+    assert await _claim(db, payloads, report) == []
+    assert report == {"access": access, "held": 2,
+                      "held_ids": [str(p["result_id"]) for p in payloads]}
     assert await _queued_rows(db, user.id) == 0
 
 

@@ -299,13 +299,6 @@ class Settings(BaseSettings):
     # ~45 MB) with growth headroom. A response exceeding this aborts and raises.
     MAX_DOWNLOAD_BYTES: int = 104857600  # 100 * 1024 * 1024
 
-    # ─── AI Extraction (Claude API) ───────────────────────────────────────────
-    ANTHROPIC_API_KEY: str = ""
-    AI_MODEL: str = "claude-sonnet-4-6"
-    AI_MAX_TOKENS: int = 4096
-    AI_SCRAPER_ENABLED: bool = False
-    AI_COST_ALERT_THRESHOLD: float = 10.0  # USD per day
-
     # ─── CAPTCHA solving (2Captcha) ───────────────────────────────────────────
     CAPTCHA_API_KEY: str = ""
     CAPTCHA_ENABLED: bool = False
@@ -314,9 +307,8 @@ class Settings(BaseSettings):
     REGRID_API_TOKEN: str = ""
     REGRID_ENABLED: bool = False
 
-    # ─── Free Enrichment (County GIS + AI Assessor) ───────────────────────────
+    # ─── Free Enrichment (County GIS) ──────────────────────────────────────────
     GIS_ENRICHMENT_ENABLED: bool = True
-    AI_ENRICHMENT_ENABLED: bool = True
     # Background sweep that looks up King tax owner names a job deferred
     # (src/workers/owner_recovery.py). Kill switch: False stops it before any
     # eRealProperty request, e.g. while King is rate-limiting us.

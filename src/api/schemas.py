@@ -1389,9 +1389,25 @@ class JobResponse(BaseModel):
     progress_stalled: bool = False
     # Migration 106: the run-count breakdown frozen when the run finished. SNAPSHOT
     # ONLY here (no query per job): None for runs with no snapshot (older, retried,
-    # or not finished); the results page reports a live one for those.
-    breakdown: RunBreakdown | None = None
-    breakdown_basis: BreakdownBasis | None = None
+    # or not finished); the results page reports a live one for those. No live
+    # fallback on the list: the shell polls GET /jobs every 5 s, and the narrowest
+    # live count measured p95 ~10 s for the largest account (UX 2d, 2026-09-30).
+    breakdown: RunBreakdown | None = Field(
+        default=None,
+        description=(
+            "What happened to every record this run found, frozen when it finished "
+            "(snapshot only; null when the run has no valid snapshot: not finished, "
+            "finished before snapshots existed, retried, or rejected on read). "
+            "`already_delivered` is ACCOUNT-WIDE: a lead counts if any earlier run of "
+            "this account, by any scraper or record type, delivered it. RAW: no tax "
+            "cap and no view filter, so it can exceed the results tab's "
+            "`already_delivered_count` on a tax run."
+        ),
+    )
+    breakdown_basis: BreakdownBasis | None = Field(
+        default=None,
+        description="Always `snapshot` when `breakdown` is set here; null otherwise.",
+    )
     # True while a bounded transient retry is waiting out its backoff. The row is
     # 'pending' with retry_count > 0, which otherwise reads as "queued, waiting for
     # capacity" and looks frozen for the whole 5- or 20-minute delay.
@@ -1951,8 +1967,25 @@ class ResultsPage(BaseModel):
     # one, else the same partition read live for a DONE run. None when the run has
     # not finished, or a live reading cannot reconcile. The counts above stay the
     # live, view-shaped numbers the tabs show.
-    breakdown: RunBreakdown | None = None
-    breakdown_basis: BreakdownBasis | None = None
+    breakdown: RunBreakdown | None = Field(
+        default=None,
+        description=(
+            "What happened to every record this run found: the snapshot frozen when it "
+            "finished, else the same partition read now for a finished run (one job's "
+            "rows only). Null when the run has not finished, a live reading cannot "
+            "reconcile, or a stored snapshot is rejected (never replaced by a live one). "
+            "`already_delivered` is ACCOUNT-WIDE (any earlier run of this account, by "
+            "any scraper or record type) and RAW (no tax cap, no view filter), unlike "
+            "`already_delivered_count` above, which is the tab's number."
+        ),
+    )
+    breakdown_basis: BreakdownBasis | None = Field(
+        default=None,
+        description=(
+            "`snapshot`: frozen at completion. `live`: counted now from the run's saved "
+            "rows; later backfills move it. Null when `breakdown` is null."
+        ),
+    )
 
 
 # ─── Contact lookups: the quote (Phase 1b-1c) ────────────────────────────────

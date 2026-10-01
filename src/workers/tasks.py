@@ -72,6 +72,7 @@ from src.workers.tasks_helpers.finalize import (  # noqa: F401  (re-export)
     _alert_dedup_release_failed,
     _release_claims_of_cancelled_job,
     _terminal_cleanup,
+    emit_job_completed,
     finalize_billing_and_done,
     release_run_claims_if_owned,
 )
@@ -2217,15 +2218,7 @@ def run_scrape_job(self, job_id: str) -> None:
         r.publish(f"job_logs:{job_id}", json.dumps({"type": "done", "record_count": display_count}))
 
         # ── IN-APP NOTIFICATION (best-effort; gated by CAS already confirmed above) ──
-        from src.workers.notification_emit import create_notification
-        create_notification(
-            user_id=job.user_id, type="job_completed", job_id=job_id,
-            detail={
-                "scraper_name": config.name,
-                "county": config.county,
-                "record_count": display_count,
-            },
-        )
+        emit_job_completed(job, config, job_id, display_count)
 
         # ── EMAIL DELIVERY ─────────────────────────────────────────────────────
         # Build the tokenized 48h download link here (it needs the worker's

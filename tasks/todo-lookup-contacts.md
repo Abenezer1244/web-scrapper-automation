@@ -4513,6 +4513,7 @@ mandatory: the post-deploy NULL proof, and owner-approved remediation for any NU
   - Mutations re-run with three more (upgrade / downgrade without `lock_timeout`, a
     `rows_sent = rows_uploaded` backfill): **10/10 caught**, file hash identical before
     and after the run.
+- **Codex diff review r2: GATE: GO, no findings** (`codex_oci_review_r2_out.txt`).
 
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever

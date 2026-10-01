@@ -324,6 +324,14 @@ GRANT DELETE ON pending_registrations TO bridgeleads_system;
 -- needs nothing new -- the ALL TABLES UPDATE above already covers it -- so this is
 -- the only privilege the retention task adds.
 GRANT DELETE ON skip_trace_cache TO bridgeleads_system;
+-- pending_skip_trace_rows (O-D, owner 2026-10-01): the claim's lost-race withdrawal
+-- (src/workers/skip_trace_claim.py, claim_skip_trace_rows) DELETEs, by its own
+-- primary keys, rows it just INSERTed in the same uncommitted transaction whose
+-- lead a concurrent writer settled or claimed. Without DELETE that statement raises
+-- and rolls back the whole claim. It is the ONLY pending-row DELETE in src (pinned
+-- by tests/test_worker_delete_grants.py); the table is billing evidence, so a new
+-- delete site needs review, not just this grant.
+GRANT DELETE ON pending_skip_trace_rows TO bridgeleads_system;
 -- contact_lookup_action_events (101): append-only for the WORKER TOO. The
 -- blanket GRANT ... ON ALL TABLES above hands bridgeleads_system UPDATE on
 -- every table, this one included, which would let the process that writes

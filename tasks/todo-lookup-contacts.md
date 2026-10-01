@@ -4650,6 +4650,180 @@ mandatory: the post-deploy NULL proof, and owner-approved remediation for any NU
 - **Codex diff review r2: GATE: GO**, 1 P3 (this plan described the pre-AJ1 UPDATE; fixed)
   (`codex_ociii_review_r2_out.txt`).
 
+## Phase O-D — the worker may withdraw its own lost-race claim row (SPEC, 2026-10-01, BEFORE the Codex consult)
+Branch `feat/lookup-od-pending-delete-grant`, stacked on O-C-iii (#424). OWNER DECISION O-D
+(2026-10-01): GRANT. A HARD GATE before 2d.
+
+**Facts (read 2026-10-01):**
+- The ONLY `DELETE FROM pending_skip_trace_rows` in `src` is the claim's lost-race withdrawal
+  (`skip_trace_claim.py:777`): by OUR primary keys, rows this same uncommitted transaction
+  just inserted whose result a concurrent writer settled or claimed. Grepped; no ORM
+  `delete(PendingSkipTraceRow)`.
+- **Production (read-only, 10-01):** `bridgeleads_system` has SELECT, INSERT, UPDATE on
+  `pending_skip_trace_rows`, NO DELETE. RLS is enabled and forced; the only policy is
+  `pending_skip_trace_rows_system FOR ALL` (so it already admits DELETE once granted). So
+  today the withdrawal raises `InsufficientPrivilege` and rolls back the WHOLE claim, on
+  the live scrape enqueue too. That costs availability (the claim retries next time),
+  never money.
+- The three grant sources:
+  - `scripts/provision_rls_roles.sql` (`:305-334`);
+  - `scripts/_cutover_step2_grants_policies.py` (`_GRANTS` + `_SYSTEM_DELETE_TABLES`);
+  - `scripts/verify_worker_delete_grants.py` (`REQUIRED_DELETE_TABLES`).
+
+  `tests/test_worker_delete_grants.py` keeps them in step at text level. CI has no
+  provisioned roles (memory `ci_has_no_provisioned_roles`), so a `SET ROLE` test is
+  local-only and cannot be the proof.
+
+**Change (5 files):**
+1. `provision_rls_roles.sql`: `GRANT DELETE ON pending_skip_trace_rows TO
+   bridgeleads_system;` with the one-site rationale.
+2. `_cutover_step2_grants_policies.py`: the same in `_GRANTS`, plus the table in
+   `_SYSTEM_DELETE_TABLES` (the cutover's positive verify).
+3. `verify_worker_delete_grants.py`: the table in `REQUIRED_DELETE_TABLES` (the operator's
+   drift check, which also repairs with `--apply` and `DATABASE_URL_MIGRATE`).
+4. `tests/test_worker_delete_grants.py`: pin `pending_skip_trace_rows` in BOTH grant
+   files (as `delivered_records` is), and a source scan: every
+   `DELETE FROM pending_skip_trace_rows` in `src/` is the one documented withdrawal, so a
+   new delete site cannot ride in on this grant unreviewed.
+5. This plan.
+
+**Applying it in production (OWNER CONFIRMS FIRST):** after the PR merges,
+`railway run --service worker` with the elevated DSN:
+`scripts/verify_worker_delete_grants.py --apply` (needs `DATABASE_URL_MIGRATE`; it grants exactly the missing
+`REQUIRED_DELETE_TABLES` entries and re-verifies). Then `priv_check.py` (read-only) shows
+DELETE. No code depends on the grant beyond the existing withdrawal, so merge order vs
+apply order is free.
+
+**Questions for the consult:** is the worker holding DELETE on billing evidence acceptable
+given the one site (and the FK `NO ACTION` from actions); any other path (retention purge,
+scripts run via the worker service) that would newly gain the power to delete pending rows;
+is the source-scan pin sound; is `--apply` the right apply path.
+
+### Codex pre-code consult r1 on O-D (2026-10-01): PLAN: REVISE, 1 P1 + 3 P2 + 1 P3
+Output: `<scratchpad feececfd>/codex_od_consult_r1_out.txt`. Verified by Codex:
+- the withdrawal deletes only its own just-inserted ids;
+- no later statement revokes the new grant (the pending-row `REVOKE ALL` targets
+  `bridgeleads_app`);
+- retention never deletes pending rows; cascades need no grant;
+- `--apply` is the right minimal prod path, but only AFTER the list carries the table.
+- **AK1 (P1)** = the change itself (grant in both sources, both lists, a pin). Adopted.
+- **AK2 (P2) the grant is table-wide on billing evidence.** RLS for the system role is
+  `FOR ALL USING (true)`, and the FK `NO ACTION` does not constrain a direct delete. Today's
+  code is narrowly scoped. **Recorded as an ACCEPTED trusted-worker risk, and raised to the
+  owner as an option, not built here.** Codex's hardening is a DELETE-only RLS policy
+  `status='queued' AND submitted_at IS NULL` plus the same predicates in the withdrawal. It
+  is a prod RLS-policy change beyond the owner's GRANT decision, and a change to the live
+  paid claim (a 6th file).
+- **AK3 (P2) the source scan must not be a text grep.** It is now an AST scan of `src/**/*.py`:
+  - every string constant, with Python's implicit concatenation already merged by the
+    parser; docstrings and comments are excluded;
+  - normalized (case, whitespace, an optional `public.`), looking for `delete from
+    pending_skip_trace_rows`;
+  - plus ORM `delete(PendingSkipTraceRow)` calls;
+  - exactly ONE allowed site: `claim_skip_trace_rows` in `skip_trace_claim.py`.
+
+  Dynamic SQL built at runtime cannot be scanned. That is said in the test.
+- **AK4 (P2) three-way drift.** A test asserts EXACT equality of the system DELETE tables
+  parsed from `provision_rls_roles.sql`, from the cutover `_GRANTS`, its
+  `_SYSTEM_DELETE_TABLES`, and `REQUIRED_DELETE_TABLES`.
+- **AK5 (P3) apply + verify.** Read-only before `--apply`: the missing set is exactly
+  `{pending_skip_trace_rows}`. After: `has_table_privilege(... 'DELETE')` is true, the app
+  role has no pending-row privilege, RLS is enabled + forced with only the system policy
+  (`priv_check.py`), and the worker logs show no `InsufficientPrivilege`.
+
+**r2 (2026-10-01): `PLAN: GO`, no findings.** AK2 is accepted for this PR as a recorded
+trusted-worker risk; the RLS hardening is the owner's call (and, if wanted, before 2d).
+
+### O-C-iii MERGED + LIVE (2026-10-01): #424, merge `7a08c0a7` (13:38:37Z)
+- CI green on `0345ae93`. quiet all zeros, main unchanged, `--match-head-commit`, sessions
+  told "merging" / "verified".
+- **AF1 pre-merge:** `oc_post_deploy_check.py --pre` → **0** un-ingested queues with NULL
+  `rows_sent` (0 un-ingested at all), so no in-flight batch met the legacy rule.
+- api, worker and beat SUCCESS on `7a08c0a7`, `/health` 200. `reconcile_contact_lookups`
+  ran on the new code: all zeros, 0 errors.
+- **AF1 / AH4 post-deploy gate PASSED:** 0 queues completed since the merge, 0 without a
+  decision. **O-C is DONE.** 2d's O-C gate is met.
+
+### O-D BUILT (2026-10-01, branch `feat/lookup-od-pending-delete-grant`), before the Codex diff review
+- `GRANT DELETE ON pending_skip_trace_rows TO bridgeleads_system` in
+  `provision_rls_roles.sql` and the cutover `_GRANTS`. The table is added to
+  `_SYSTEM_DELETE_TABLES` and `REQUIRED_DELETE_TABLES`, with the one-site rationale.
+- `tests/test_worker_delete_grants.py` (+3):
+  - the pin in both grant files;
+  - four-way EXACT equality (AK4);
+  - the AST scan (AK3): exactly `src/workers/skip_trace_claim.py:claim_skip_trace_rows`.
+- **Mutations: 8/8 as expected** (runner v2, four files hash-verified):
+  - caught: SQL grant removed; cutover grant removed; cutover verify list missing it;
+    operator list missing it; an extra cutover-only grant; a second delete site written
+    as a split `public.`-qualified mixed-case string; an ORM `delete(PendingSkipTraceRow)`;
+  - the CONTROL (a docstring naming the delete) correctly PASSED.
+- **Regression: 362 passed, 0 failed, 10 skipped.** That is every test file naming the
+  three grant scripts or the claim (13 files). The 10 skips are
+  `test_rls_role_policies.py`'s "RLS cutover roles not provisioned" (environmental, as in
+  CI). ruff clean.
+- **Codex diff review r1: GATE: NO-GO, 5 P2 + 1 P3.** The test-rigor findings are all
+  fixed (`codex_od_review_r1_out.txt`):
+  - **AL1** the revoke-order check covered `delivered_records` only. It now covers EVERY
+    granted table in BOTH sources, in execution order (a later REVOKE of DELETE/ALL on
+    the table or ALL TABLES).
+  - **AL2** equality read raw text, so a grant surviving in a comment counted. Grant
+    sources are now read AS EXECUTED: SQL with `--` comments stripped, split into
+    statements; the Python lists by `ast.literal_eval`.
+  - **AL3** owner attribution by bare function name. It is now the full LEXICAL scope path
+    (functions, classes, lambdas), so only the module-level `claim_skip_trace_rows` is
+    approved. Hits are deduped by statement line, so a SECOND delete inside the approved
+    function is caught.
+  - **AL4** ORM import aliases are resolved, and `query(<model>)...delete()` chains are
+    caught.
+  - **AL5 (P3)** strings are constant-folded (`+`, f-string literal parts), and `public .`
+    with spaces and quoted identifiers are normalized.
+  - **AK2 re-raised at P2 (an RLS DELETE policy on billing evidence): NOT built; it goes to
+    the OWNER.** It is a production RLS-policy change beyond the GRANT the owner chose.
+  - **Mutations: 18/18 as expected** (runner v2, 5 files hash-verified; a hang now counts
+    as INCONCLUSIVE, never as caught). Caught:
+    - the SQL grant removed / only in a comment / revoked later;
+    - the cutover grant removed / only in a comment;
+    - either list missing it; an extra cutover-only grant;
+    - a split `public.` mixed-case delete; `+` composition; a spaced `public .`;
+    - an ORM delete, via an alias, and as a `query().delete()` chain;
+    - a nested function sharing the approved name; a lambda inside the approved
+      function; a second delete inside it.
+
+    The docstring CONTROL passed.
+- **Codex diff review r2: GATE: NO-GO, 2 P2** (`codex_od_review_r2_out.txt`):
+  - **AM1 (P2) REJECTED with evidence: "a second delete in the approved function still
+    passes".** The premise is false. The hit set is keyed by (path, scope, LINE), and the
+    returned list keeps one `(path, scope)` entry PER line, so two deletes return two
+    entries. The mutant was caught, untruncated: `assert [(claim), (claim)] == [(claim)]`,
+    "Left contains one more item" (`od_second_delete_evidence.txt`).
+  - **AM2 (P2) adopted: a REVOKE hidden in a `DO $$` block, and psql meta-lines.** Meta
+    lines (`\gset`, `\echo`, ...) are stripped. A REVOKE is now SEARCHED inside every
+    statement fragment, so a DO body's `BEGIN REVOKE ... FROM bridgeleads_system` is seen.
+    A GRANT still counts only as a complete statement, so a grant hidden in a DO block
+    FAILS the pin (fail-safe). Two new mutants were both caught: a REVOKE inside a DO
+    block, and the grant only inside a DO block. **20/20 as expected**, hashes OK.
+- **Codex diff review r3: GATE: NO-GO, 1 P2 + 1 P3. AM1's rejection CONFIRMED**, AM2 closed
+  (`codex_od_review_r3_out.txt`):
+  - **AN1 (P2)** the revoke guard missed `ON TABLE x` and `ON public.x`. `_tables()` now
+    canonicalizes every GRANT/REVOKE `ON` clause: an optional `TABLE`, `public.` and
+    identifier quotes are dropped.
+  - **AN2 (P3)** stale "the system role has no DELETE" text:
+    - the cutover's DELETE inventory comment now lists `pending_skip_trace_rows`;
+    - `scripts/deactivate_test_batch_configs.py:3-5` and
+      `scripts/purge_test_batch_configs.py:54-59` were ALREADY stale before O-D (the role
+      has held DELETE on 7 listed tables since 2026-06), though still true for the tables
+      those scripts touch. Fixing them would put this PR at 7 files.
+      **Logged as a follow-up**, not fixed here.
+  - Mutations: **23/23 as expected**, 5 files hash-verified. Added: a REVOKE `ON TABLE x`
+    (SQL) and `ON public.x` (cutover), both caught; CONTROL: the grant written `ON TABLE
+    public."x"` still counts, and passed.
+- **Codex diff review r4: GATE: GO**, no P1/P2 (`codex_od_review_r4_out.txt`). AN1 verified;
+  the AN2 deferral accepted as P3. **AK2 is RECORDED, NOT owner-accepted: asked of the owner.**
+  Merging changes no production privilege; the grant applies only via `--apply`, after the
+  owner's OK.
+- **Follow-up (not in O-D):** correct the two scripts' "DELETE=False on every table"
+  docstrings.
+
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever
       the tab has leads that have never been looked up; when the quote comes back with

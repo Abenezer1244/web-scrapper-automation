@@ -998,10 +998,12 @@ class AcclaimWebScraper(BridgeScraper):
         return records
 
     # County assessor (PACS) URLs for address lookup by owner name.
-    # Tyler PropertyAccess is used by many WA counties.
+    # Tyler PropertyAccess is used by many WA counties. Douglas is NOT one of them:
+    # pacs.co.douglas.wa.us does not resolve, and its assessor publishes TaxSifter
+    # (Aumentum, douglaswa-taxsifter.publicaccessnow.com), which this client cannot
+    # query. Douglas records skip this lookup (verified 2026-10-01).
     _PACS_URLS = {
         "chelan": "https://pacs.co.chelan.wa.us/PropertyAccess/?cid=90",
-        "douglas": "https://pacs.co.douglas.wa.us/PropertyAccess/?cid=50",
     }
 
     async def _lookup_pacs_addresses(self, records: list[ScrapedRecord]) -> None:

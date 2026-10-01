@@ -19,6 +19,109 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-10-01 — UX 2e (F-009 / Q4): "Lookup failed", one contact status for phone and email
+
+> UX audit queue item 2e. An errored lead showed Phone "Error" beside Email "None found", and
+> "None found" claims the lookup succeeded and found nothing. The owner confirmed the plan in
+> session ("start", recorded in the plan's Todo) with its defaults: no retry, "Removed" for
+> purged leads, "Not looked up" for never-traced leads, and do the backend phase. Plan + review: `tasks/todo-2e-lookup-failed.md` (also bridgeleads-web
+> `docs/ux-audit/todo-2e-lookup-failed.md`).
+
+**Built / Shipped:**
+- BE #420 (squash 6d32c8e2, merged 08:08:11Z; api/worker/beat SUCCESS on it, /health 200).
+  `AlreadyDeliveredContacts` is counted from disjoint predicates in one statement
+  (`src/api/routes/jobs.py` `_CONTACT_BUCKETS`). `not_looked_up` was the remainder, so it had
+  absorbed purged leads, unknown statuses and legacy `not_attempted` leads that carry contacts.
+  New `removed` (purged) and `unknown` (the only remainder) fields; no migration.
+- FE bridgeleads-web #182 (squash 4a4f5248, Vercel production success 08:20Z).
+  - `app/(dashboard)/results/[id]/_components/ContactStatus.tsx` is the one resolver behind PhoneCell and
+    EmailCell, used by the table and the mobile cards. States: Processing, Lookup failed,
+    Removed, the values, None found, Not looked up, or a neutral N/A.
+  - `DeliveredLookupSummary` names the new buckets; the batch page no longer promises contacts
+    "keep filling in". Contracts doc Q4 is marked SHIPPED.
+
+**Tried / Decided:**
+- The contract said FE-only and listed six statuses. The backend defines seven
+  (`SkipTraceStatus`): `purged` (retention sweep) read "None found" on both channels, the same
+  false claim. The column is a `String(16)` with no CHECK, so any other value it can hold is
+  bucketed as `unknown` in the summary; in the cells it shows its values if it has any, and a
+  neutral N/A otherwise. That made a backend phase
+  necessary, so the summary would not call a looked-up lead "not looked up".
+- Codex plan review took six rounds (r1-r5 NO-GO, r6 GO). Each round tightened the shared
+  rule between the cells and the summary:
+  - a legacy `not_attempted` row with a phone or email counts as answered on both sides;
+  - "has content" is the explicit class `[^ \t\n\r\f\v]` on both sides, because PostgreSQL
+    `trim()` strips spaces only while JS `String.trim()` also strips tabs and newlines;
+  - values render only in the values state, so stale contacts never show on an in-flight,
+    failed or removed lead;
+  - the scalar fallback applies only to answered rows. The cache copy derives `hit` from the
+    scalars (`src/workers/tasks_helpers/enrich.py`), so an array-only rule (Codex r1) would have hidden a paid hit.
+- The scalar `phone` / `email` columns the predicate reads are `EncryptedString` (the arrays
+  are `EncryptedJSON` and are not read). The column is `type_coerce`d to plain `String` so
+  the regex binds as a text parameter, never through the encrypting type. Blanks never reach
+  the ciphertext: the bind normalises with Python `str.strip()`, a superset of the class.
+- Rejected for 2e, recorded as follow-ups: page-local polling for new-lead lookups; Segments
+  desktop email `??`; any retry before `last_trace_outcome` is written.
+
+**Failed / Blocked:**
+- A read-only prod count of leads by `skip_trace_status` was refused in-session as a production
+  read. So there was no real-row check; the FE proof is a stub API, labelled as such.
+- The low-memory reaper killed background shells for Codex plan r2 and r5, suite parts 3 and 7,
+  the stub server and the FE gate. Each surviving child was found by its command line and waited
+  on, never restarted. The stub server was not restarted.
+- My first mutant never applied (a `sed` that did not match). Its "exit 0" proved nothing; it
+  was redone with the Edit tool.
+- `.venv-schema` is dead: its anaconda base is gone. `bl-rescat-venv` matches the pins (Python
+  3.12, fastapi 0.141.1, pydantic 2.13.4), and `export_openapi.py --check` agreed.
+
+**Caught & fixed:**
+- In my own resolver, a bare index into the status table would map a `"constructor"` status to
+  an inherited `Object` member. Fixed with `Object.hasOwn`; a stub case covers it.
+- The BE endpoint test did not cover `submitted` (Codex gate r1 P3); added.
+
+**Proof:**
+- BE: the endpoint test was RED on pre-#420 main (1f7f7114) and GREEN on the branch. The mutant `[^ ]` (trim-like)
+  fails it. Full suite in 8 parts; every local failure was explained (the Redis-ACL env test,
+  one `0xC0000142` import-cycle subprocess that passes alone, Playwright "driver connection
+  closed" after a reap, which passes alone). CI Test green on the merge head. Codex diff gate:
+  PASS.
+- FE: tsc, eslint and build pass. A stub-API Playwright run checked 24 cases at 1440 and 390:
+  all pass on the branch; on pre-#182 master (33278dc) the same assertions failed, including
+  the F-009 pair.
+  Codex FE gate: PASS, no findings.
+
+**Pending / Handoff:**
+- `last_trace_outcome` writers (BE), then a retry for `not_submitted` only.
+- DONE in this session, in two steps: the "Removed" tooltip first said "its contact details were
+  deleted", then (#184, d0626274) "This lead was looked up, and its lookup data was deleted";
+  neither is guaranteed, because the sweep purges an aged row whenever its status is neither
+  `purged`, `queued` nor `submitted` and at least one contact column is non-NULL (see Facts).
+  bridgeleads-web #185 (squash 02d1266e, Vercel success) makes it "Contact lookup data for this
+  lead was deleted after the retention period.", which makes no claim about the lookup outcome,
+  contacts or charge; it only states that aged lookup data was deleted. #186 (squash
+  5bc7a2e7) fixed the matching code comment in `DeliveredLookupSummary`.
+- A real-row check of an `errored` lead in prod, if the owner approves a read.
+- OWNER DECISION, retention (still open): `SkipTraceStatus.PURGED` is documented as distinct
+  from MISS "because the difference is auditable history", but `_ELIGIBLE` also sweeps a `miss`
+  whose arrays are `[]` (non-NULL), erasing that history. Asked of the owner, who replied
+  "Continue" without picking; Claude took the conservative option (accept the behaviour, make
+  all copy neutral, #185) and left narrowing `_ELIGIBLE` (for example to rows that actually hold
+  a phone or email) as the owner's call. Retention ships OFF in code; the prod setting was not
+  read. The comments in `constants.py`, `schemas.py` and `retention.py` now describe the actual
+  behaviour and point here.
+- Next queue item: item 3 (batches B-E + F-045..F-050).
+
+**Facts learned:**
+- `results.skip_trace_status` has seven defined values (`SkipTraceStatus`); the column itself
+  is a `String(16)` with no CHECK. `purged` is terminal and means retention deleted the row's aged
+  contact data; it establishes neither the lookup outcome nor a charge. The sweep
+  (`src/workers/scheduler_helpers/retention.py` `_ELIGIBLE`) takes an aged row whose status is
+  neither `purged`, `queued` nor `submitted`, with at least one of `phone`, `email`, `phones` or
+  `emails` non-NULL, so a `miss` with `[]` arrays, or an `errored` / unknown-status
+  row holding older data, qualifies too.
+- Nothing retries an `errored` lead: only `not_attempted` is claimed
+  (`src/workers/skip_trace_claim.py`).
+
 ## 2026-09-30 — Landing and marketing redesign (bridgeleads-web#176): contour field, measured numbers, five critique rounds
 
 > Owner asked for an animated background and a 9.5/10 page that doesn't read as AI-made. The owner chose

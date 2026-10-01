@@ -77,8 +77,12 @@ _PII_COLUMNS = (
 
 # Eligibility. Two guards make this idempotent, which matters because the sweep
 # runs daily forever: the status guard stops a purged row matching again, and the
-# "has any contact data" guard means rows that missed or errored (attempted, but
-# no PII ever returned) are never touched at all. Without them the task would
+# "has any contact data" guard skips rows whose four contact columns are all NULL.
+# Note it tests non-NULL, not non-empty: a 'miss' is stored with phones/emails = []
+# (an encrypted empty list, non-NULL), so an aged miss IS swept to 'purged', and so
+# is an 'errored' or unknown-status row still holding older data. Whether misses
+# should be swept is an open owner decision (BUILD_JOURNAL 2026-10-01, UX 2e).
+# Without the two guards the task would
 # re-UPDATE already-NULL rows every single day, generating dead tuples forever
 # for no reason.
 #

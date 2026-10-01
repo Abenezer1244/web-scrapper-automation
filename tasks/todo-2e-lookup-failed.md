@@ -1,5 +1,13 @@
 # 2e: Q4 (F-009) "Lookup failed"
 
+> **SHIPPED 2026-10-01** (BE #420 6d32c8e2, FE bridgeleads-web #182 4a4f5248 and #184
+> d0626274). Everything after this banner, up to the "Review (shipped)" section, is the plan
+> AS APPROVED; the "Reconciliation" sections after it record the Codex rounds that shaped it.
+> Both are a historical record. Where it differs from what shipped (line
+> ranges, the superseded `trim()` wording of the r4 reconciliation, present-tense "RED on
+> main"), the "Review (shipped)" section and the 2026-10-01 BUILD_JOURNAL entry are
+> authoritative.
+
 Two phases, both small:
 - **A (BE):** `AlreadyDeliveredContacts` gains a `removed` bucket for `purged` rows, which
   today land in `not_looked_up`. No migration.
@@ -21,14 +29,19 @@ succeeded and found nothing (F-009).
 Re-check 05:10Z: BE main moved only by docs (#415), and none of the cited source files changed
 (`git diff --stat 3d13939b aceeb2fa` over all of them = empty). FE master moved to 14089b2
 (#177, #178); none of the plan's FE files changed. Rebase FE onto it before building.
-- `results.skip_trace_status` has **7** values, not the contract's 6:
+- `SkipTraceStatus` defines **7** values, not the contract's 6 (the column is a `String(16)`
+  with no CHECK; any other stored value is classified as `unknown`):
   `not_attempted | queued | submitted | hit | miss | errored | purged`
   (`src/config/constants.py` `SkipTraceStatus`; writers: `skip_trace_claim.py:750`,
   `skip_trace_dispatcher.py:929/1083/1098/1345/1468/1575/1728`, `tracerfy_ingest.py:911/973`,
   `enrich.py:2267/2311`, `retention.py` (`purged`)).
-- `purged` = the row WAS a hit and the retention sweep deleted its contact PII
-  (`schemas.py:1700`: "treat it as no contact data, not as never traced"). Its lists are
-  NULL, so today BOTH cells say "None found": the same false claim as F-009. Retention ships
+- `purged` = the retention sweep deleted the row's aged lookup data (`schemas.py:1700`:
+  "treat it as no contact data, not as never traced"). It is NOT proof of a hit: the sweep
+  (`src/workers/scheduler_helpers/retention.py` `_ELIGIBLE`) takes any aged, non-`purged` row
+  with at least one of `phone`, `email`, `phones` or `emails` non-NULL, excluding `queued` /
+  `submitted`, so a `miss` with `[]` arrays qualifies too (corrected after ship). Before 2e,
+  retention nulled the lookup fields, so both cells showed "None found": the same false claim
+  as F-009. Retention ships
   OFF in code (`RETENTION_PURGE_ENABLED=False`); the prod value was not read (a prod read was
   refused in this session), so `purged` rows may or may not exist yet.
 - The BE summary computes `not_looked_up` as a REMAINDER
@@ -57,7 +70,7 @@ Re-check 05:10Z: BE main moved only by docs (#415), and none of the cited source
 
 ### Phase A (BE)
 - `src/api/schemas.py` `AlreadyDeliveredContacts`: add `removed: int = 0  # 'purged': looked
-  up, contacts later deleted for age`, with the field description; fix the `not_looked_up`
+  up, lookup data later deleted for age`, with the field description; fix the `not_looked_up`
   comment (drop "or purged").
 - `src/api/routes/jobs.py:705-735`: add a `removed` bucket (`purged`) and count
   `not_looked_up` explicitly (its exact filter is below) instead of as a remainder (Codex r2 P2: a remainder files any future status as
@@ -98,7 +111,8 @@ Re-check 05:10Z: BE main moved only by docs (#415), and none of the cited source
   - the seven buckets sum to `already_delivered_count`;
   - tenant isolation: another account's `purged` / `not_attempted` rows on its own job do not
     move this account's counts, and this account cannot read the other job (404).
-  - RED on unfixed main (fields absent; `purged` lands in `not_looked_up`).
+  - RED on unfixed main (fields absent; `purged` lands in `not_looked_up`). Done: RED on
+    pre-#420 main 1f7f7114, GREEN on the branch.
 
 ### Phase B (FE)
 `app/(dashboard)/results/[id]/_components/ContactStatus.tsx` (new):
@@ -137,16 +151,17 @@ Re-check 05:10Z: BE main moved only by docs (#415), and none of the cited source
   drift again. Titles (no em dashes):
   - failed: "The contact lookup for this lead did not complete. It is not retried
     automatically."
-  - removed: "This lead was looked up, and its contact details were deleted after the
-    retention period."
+  - removed (final, bridgeleads-web #185): "Contact lookup data for this lead was deleted
+    after the retention period." (#182 shipped "its contact details were deleted", #184
+    "This lead was looked up, and its lookup data was deleted"; both over-claimed.)
   - none_found: channel-specific, as today.
 - `PhoneCell` / `EmailCell`: call `channelValues` + `contactState`, render values or
   `<ContactStatus>`. Email "Pending" becomes "Processing" with the spinner (contract: one word
   for both channels). Phone "Error" becomes "Lookup failed".
 - `lib/types.ts`: replace the dead 6-value `SkipTraceStatus` with the 7-value union, used by
   the resolver (the API field stays `string`; unknown values hit the fallback).
-- `DeliveredLookupSummary.tsx`: render `removed` as "N contacts removed after the retention
-  period" and `unknown` as "N with an unrecognised lookup status" (neutral, no claim); include
+- `DeliveredLookupSummary.tsx`: render `removed` as "N with lookup data deleted after the
+  retention period" (wording as of #184) and `unknown` as "N with an unrecognised lookup status" (neutral, no claim); include
   both in the "anything to report" guard.
 - Types (Codex r2 P3): after phase A merges, take its merge SHA with `git rev-parse`, then
   `git -C <BE wt> show <SHA>:schema/openapi.json > tmp.json;
@@ -178,13 +193,14 @@ contracts doc. B is over the 5-file guideline only by the two type files and a d
    `purged` from scope.
 
 ## Verification
-- [ ] A: migrate the test DB 107 -> 108 first; new test RED on main, GREEN on branch; full
+- [x] A: migrate the test DB 107 -> 108 first (done as 107 -> 109: main had reached 109);
+      new test was RED on pre-#420 main 1f7f7114, GREEN on branch; full
       suite in 8 parts (one background job each, exit files); security review x2; Codex diff
       `origin/main...HEAD` GATE: PASS; quiet.py = 0; merge; Railway SUCCESS on the merge SHA,
       `/health` 200, worker logs clean.
-- [ ] B: `npx --no-install tsc --noEmit`, `npx --no-install eslint <changed files>`,
+- [x] B: `npx --no-install tsc --noEmit`, `npx --no-install eslint <changed files>`,
       `npm run build`; types drift gate regenerated from BE main.
-- [ ] B: stub API + Playwright (rig from session 81fad222 `fe2d/`): one run with a row per
+- [x] B: stub API + Playwright (rig from session 81fad222 `fe2d/`): one run with a row per
       state (7 statuses x values/empty; `miss` + `[]` + stale scalar; `hit` + `[]` + scalar;
       `hit` + NULL arrays + scalar; `not_attempted` + NULL arrays + scalar (legacy), phone-only
       and email-only; `not_attempted` with blank / whitespace-only scalars, one each of
@@ -194,22 +210,38 @@ contracts doc. B is over the 5-file guideline only by the two type files and a d
       phone AND email cell text and title; assert phone and email show the same state word on
       every non-value row; assert the summary line names `removed`. RED first: the same
       assertions against `origin/master` fail on the `errored` email and `purged` rows.
+      (Done: pre-#182 master 33278dc failed 128 assertions; the branch passed 178/178.)
 - [ ] Real-row check (needs owner OK for a read-only prod query: counts by
       `skip_trace_status`, then one real `errored` row in the app). If none exists, say so and
       rely on the stub, labelled as such (UX-AUDIT F-009 verification clause).
-- [ ] B: Codex diff review on `origin/master...HEAD` until `GATE: PASS`; merge FE PR; Vercel
+- [x] B: Codex diff review on `origin/master...HEAD` until `GATE: PASS`; merge FE PR; Vercel
       status success for the merge SHA.
-- [ ] BUILD_JOURNAL entry (BE docs PR, merged when quiet).
+- [x] BUILD_JOURNAL entry (BE docs PR, merged when quiet).
 
 ## Todo
 - [x] Codex PLAN review until `PLAN: GO` (r1-r5 NO-GO, r6 GO)
-- [ ] Owner confirms
-- [ ] A: BE bucket + test (RED, GREEN) + openapi, gates, merge, verify
-- [ ] B: `ContactStatus.tsx` + types; wire PhoneCell / EmailCell; summary; batches copy
-- [ ] B: contracts doc
-- [ ] B: gates + stub proof (RED on master, GREEN on branch)
-- [ ] B: Codex diff GATE: PASS, PR, merge, Vercel verify
-- [ ] Journal
+- [x] Owner confirms (2026-10-01, in session: "start", i.e. the four defaults above)
+- [x] A: BE bucket + test (RED, GREEN) + openapi, gates, merge, verify (#420, 6d32c8e2)
+- [x] B: `ContactStatus.tsx` + types; wire PhoneCell / EmailCell; summary; batches copy
+- [x] B: contracts doc
+- [x] B: gates + stub proof (RED on pre-#182 master 33278dc, GREEN on branch)
+- [x] B: Codex diff GATE: PASS, PR, merge, Vercel verify (bridgeleads-web #182, 4a4f5248)
+- [x] Journal (this PR)
+
+## Review (shipped)
+Full review: bridgeleads-web `docs/ux-audit/todo-2e-lookup-failed.md` "Review", and the
+2026-10-01 BUILD_JOURNAL entry. Verification items above: A done (the plan said migrate to
+108; main had reached 109 by then, so the test DB went 107 -> 109); B done; the real-row
+check was NOT done (a prod read was refused in-session); journal in this PR.
+
+Correction found by the journal fact-check: `purged` does NOT strictly mean "was a hit". The
+sweep (`retention.py` `_ELIGIBLE`) purges an aged row whose status is neither `purged`, `queued`
+nor `submitted`, with at least one of `phone`, `email`, `phones` or `emails` non-NULL, so a `miss` with `[]` arrays, or an `errored` / unknown-status row holding
+older data, can become `purged` too: it establishes neither the outcome nor a charge. The UI's
+"Removed" tooltip over-claimed twice (#182, then #184's "was looked up"); RESOLVED by
+bridgeleads-web #185: "Contact lookup data for this lead was deleted after the retention
+period." Whether the sweep SHOULD take such rows is an owner decision recorded in the
+BUILD_JOURNAL entry.
 
 ## Reconciliation with Codex plan r1 (NO-GO)
 - [P1] `purged` vs `not_looked_up` in the summary: ADOPTED, Codex's first option (phase A).

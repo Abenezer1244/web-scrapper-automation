@@ -22,7 +22,7 @@ Most investors either pay $200-500/month for stale list providers, or spend 10+ 
 
 ## The Solution
 
-BridgeLeads scrapes county records automatically using **AI-powered browser automation**. Add any county's public records URL, and Claude (our AI agent) figures out the forms, fields, and extraction — zero code needed.
+BridgeLeads scrapes county records automatically with **recorder-platform templates**. A county whose records portal runs on a supported platform (EagleWeb, AcclaimWeb, Tyler SelfService, LandmarkWeb, AVA Fidlar, Laserfiche WebLink, iDocMarket and Skagit) is added with its portal URL — zero code needed. Other portals get a hand-coded scraper.
 
 For every record found, BridgeLeads enriches it with **property and mailing addresses** via Regrid's national parcel API, covering every county in every US state.
 
@@ -52,9 +52,8 @@ The result: fresh leads delivered to your inbox before you wake up.
 
 ## Technical Edge
 
-- **AI scraper** — Claude analyzes any county website via screenshots, no per-county code
+- **Template scrapers** — one per recorder platform, picked from the portal URL, no per-county code
 - **National enrichment** — Regrid API covers all 3,100+ US counties in one integration
-- **Action caching** — first AI scrape costs ~$0.15, subsequent runs replay cached actions (free)
 - **CAPTCHA solving** — 2Captcha integration for sites that require it ($0.003/solve)
 - **Real-time streaming** — watch your scrape run live with SSE log streaming
 
@@ -81,7 +80,7 @@ Everything we build optimizes for this: fresher data, more counties, better enri
 
 | Feature | BridgeLeads | PropStream | BatchLeads |
 |---------|-------------|-----------|------------|
-| Automated scraping | AI-powered, any county | Manual search | Partial |
+| Automated scraping | Template-driven, any supported-platform county | Manual search | Partial |
 | County coverage | 3,100+ (national) | National (data reseller) | Limited |
 | Fresh data | Daily scrape, direct from source | Monthly updates | Weekly |
 | Price | $49-499/mo | $99/mo | $79/mo |

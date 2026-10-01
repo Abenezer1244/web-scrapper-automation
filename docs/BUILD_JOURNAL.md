@@ -19,6 +19,67 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-10-01 — AI mode renamed away: 'ai' is 'template' in production, the admin page and the docs
+
+**Built / Shipped:**
+- **#408:** the 2026-09-30 journal entry and handoff (docs).
+- **bridgeleads-web#171 (Phase 4, `7bf55cca`):**
+  - the admin connectors badge maps `template`/`ai` to Template, `manual` to Manual, and
+    anything else to "Unknown mode";
+  - creating a county no longer sends `scraper_mode` (the API default applies);
+  - no AI or Claude copy.
+- **#409 (Phase 2b, `d65a3b09`):** writers store `'template'`. Exactly `'ai'` is still accepted,
+  normalized and logged. **Migration 108** moves the rows and the server default.
+  Prod, verified by the objects:
+  - active template=17, manual=13, ai=0;
+  - the 21 INACTIVE `'ai'` rows moved too;
+  - the default is `'template'`;
+  - 30/30 active connectors resolve with the deployed registry.
+- **Phase 5 (this PR):** the product docs, the marketing context and the source comments.
+  It also updates `tasks/todo-remove-ai-mode.md`.
+
+**Tried / Decided:**
+- Codex consult on 2b: GATE FAIL with 3 P1s. All three were adopted:
+  - "rollback = redeploy 2a" is false (see Facts);
+  - 2c's gate needs zero `'ai'` ROWS for 7 days plus no pre-#409 API instance, not just a quiet log;
+  - the FE compared `=== "ai"`. So Phase 4 shipped BEFORE 2b, built to work on both backends
+    (it omits the field).
+- The Codex diff review of 2b passed. P2: an old writer can insert `'ai'` during the rolling
+  deploy. That is documented: the migration's verification fails the boot and the retry moves
+  the row; a later straggler is still read as template and 2c sweeps it.
+
+**Failed / Blocked:**
+- The Railway CLI session expired mid-run, so no quiet check was possible. The owner logged in again.
+- The first quiet check before #408 showed 1 transaction older than 30s, so no merge. The other
+  session's #405 merged in that window, and the next check was all zeros.
+- FE #171 CI first failed the API-types drift gate. That was not this change: BE #405 had
+  changed descriptions, so master was already out of sync. Regenerated from BE main.
+
+**Caught & fixed:**
+- My own Phase 4/5 comments said the run refusals include "run in flight". They do not:
+  `RUN_REFUSAL_CODES` is `frozen`, `ended`, `over_limit`, and `run_in_flight` is a 409 with
+  an object detail. The BE text was fixed before commit. The two FE comments shipped in #171
+  are fixed in a follow-up FE PR.
+- The `parcel.py` docstring still listed the AI-assessor step that Phase 3 deleted.
+
+**Pending / Handoff:**
+- **Phase 4L:** the legal pages PR is open as a draft and needs counsel sign-off.
+- **Phase 2c:** not before 2026-10-08; gate and steps in `tasks/todo-remove-ai-mode.md`.
+- **Owner:**
+  - delete the Railway `ANTHROPIC_API_KEY` / `AI_*` variables;
+  - the `.env.example` AI lines;
+  - the Douglas PACS URL.
+
+**Facts learned:**
+- **Rollback after a migration is never "redeploy the old image" here.** The old image lacks the
+  new revision file, so `alembic upgrade head` fails and start.sh refuses to start the API.
+  Roll back with a revert PR that keeps the migration.
+- Prod `alembic_version` reads EMPTY as the worker role (`bridgeleads_system`) because RLS hides
+  it. That is not a missing version.
+- A docs-only merge still redeploys api, worker and beat.
+
+---
+
 ## 2026-09-30 — The audit queue closed, the egress proxy on, and AI mode on its way out
 
 > Owner: "complete the rest now". Decisions taken this session:

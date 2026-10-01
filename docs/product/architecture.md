@@ -1,6 +1,6 @@
 # BridgeLeads — System Architecture (v2.0)
 
-*Updated: March 2026 — reflects AI scraper, national enrichment, multi-county scale*
+*Updated: March 2026 — national enrichment, multi-county scale. 2026-10-01: AI mode removed; scraping is recorder-platform templates + hand-coded scrapers.*
 
 ---
 
@@ -34,13 +34,13 @@
 
 ### Storage Layer
 - **PostgreSQL (Supabase)** — users, jobs, results, scraper configs, county connectors, job logs
-- **Redis (Upstash)** — Celery queue + Pub/Sub for SSE + CAPTCHA token cache + AI action cache
+- **Redis (Upstash)** — Celery queue + Pub/Sub for SSE + CAPTCHA token cache
 - **Cloudflare R2** — export files (CSV, Excel, JSON), served via signed URLs
 
 ### Worker Layer
 - **Celery worker pool** — consumes jobs from Redis, dispatches to correct scraper
 - **Manual scraper** — hand-coded per-county (Pierce County probate)
-- **AI scraper** — Claude API analyzes screenshots, navigates ANY county website
+- **Template scrapers** — one per recorder platform, picked by the connector's base_url
 - **Enrichment task** — separate Celery task, runs AFTER scraping completes
 
 ### Enrichment Layer (NEW)
@@ -71,22 +71,22 @@ User creates job via dashboard
 
 ---
 
-## AI Scraper Architecture
+## Template Scraper Architecture
 
 ```
-county_connectors DB row (base_url, record_types)
-  → AIScraper.__init__(base_url, county, state)
-  → Step 1: Navigate to county portal
-  → Step 2: Claude analyzes screenshot + DOM snapshot
-  → Step 3: Claude returns JSON actions (click, fill, evaluate, wait)
-  → Step 4: Playwright executes actions
-  → Step 5: Repeat steps 2-4 (multi-step navigation)
-  → Step 6: Claude extracts records from results page
-  → Step 7: Claude handles pagination
-  → Action cache: Redis (7-day TTL), replays on subsequent runs
+county_connectors DB row (scraper_mode='template', base_url, record_types)
+  → registry._detect_template(base_url): match the URL to a recorder platform
+       EagleWeb · AcclaimWeb · Tyler SelfService · LandmarkWeb · AVA Fidlar ·
+       Laserfiche WebLink · Skagit recording · iDocMarket
+  → that template's BridgeScraper subclass (Playwright, standardized selectors)
+  → no match = UnsupportedCountyError (and POST /scrapers/connectors refuses the URL)
+
+county_connectors DB row (scraper_mode='manual', scraper_class)
+  → the allowlisted hand-coded scraper class
 ```
 
-**Adding a new county = one DB row.** Zero Python code.
+**Adding a county on a supported platform = one DB row.** Zero Python code.
+(The mode was stored as 'ai' until migration 108, 2026-10-01; no LLM was involved.)
 
 ---
 
@@ -104,21 +104,16 @@ Parcel ID from any county
        Works for ALL 3,100+ US counties
        $0.01-0.05 per lookup
 
-  → 3. AI Assessor Scraper (Claude API — ~$0.01/lookup)
-       Claude navigates county assessor website via Playwright
-       Cached after first lookup (subsequent replays free)
+  → 3. County-specific fallback (ATIP for Pierce, etc.)
 
-  → 4. County-specific fallback (ATIP for Pierce, etc.)
-
-  → 5. "(enrichment unavailable)"
+  → 4. "(enrichment unavailable)"
 ```
 
 Fallback chain (cheapest first):
 1. County GIS REST API (free, fast, no auth)
 2. Regrid API (paid, if enabled)
-3. AI assessor scraper (Claude API, cached)
-4. County-specific API (ATIP for Pierce, etc.)
-5. "(enrichment unavailable)"
+3. County-specific API (ATIP for Pierce, etc.)
+4. "(enrichment unavailable)"
 
 ---
 
@@ -152,7 +147,7 @@ Cloudflare:
 | `county` | Lowercase slug (e.g. "pierce") |
 | `state` | 2-letter code (e.g. "WA") |
 | `record_types` | JSON array: ["probate", "pre_foreclosure", ...] |
-| `scraper_mode` | "ai" (Claude) or "manual" (hand-coded) |
+| `scraper_mode` | "template" (platform template from base_url) or "manual" (hand-coded) |
 | `base_url` | County portal URL |
 | `scraper_class` | Python class path (manual mode only) |
 | `health_status` | healthy / degraded / down / unknown |
@@ -171,4 +166,4 @@ Cloudflare:
 - **RLS**: PostgreSQL row-level security on all user-scoped tables
 - **Rate limiting**: Redis sliding window (auth: 10/min, jobs: 5/min, general: 60/min)
 - **Brute force**: progressive lockout (5→1min, 10→5min, 20→30min, 50→24hr)
-- **CAPTCHA detection**: AI scraper fails fast when site has reCAPTCHA
+- **CAPTCHA detection**: scrapers fail fast when a site has reCAPTCHA

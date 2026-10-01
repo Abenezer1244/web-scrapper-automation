@@ -15,7 +15,7 @@ The product launched March 2026 with Washington State coverage. In 3 weeks it ha
 
 **Core value proposition:** "Set it. Wake up to leads."
 
-**Unfair advantage:** AI-powered browser automation (Claude) scrapes ANY county portal without per-county code. This enables daily freshness at lower cost than bulk data resellers, and lets BridgeLeads add new counties in seconds rather than weeks of engineering.
+**Unfair advantage:** recorder-platform templates scrape every county portal on a supported platform (EagleWeb, AcclaimWeb, Tyler SelfService, LandmarkWeb, AVA Fidlar, Laserfiche WebLink, iDocMarket, Skagit) without per-county code. This enables daily freshness at lower cost than bulk data resellers, and a county on a supported platform is added with its portal URL instead of weeks of engineering.
 
 ---
 
@@ -52,7 +52,7 @@ Sources: Market Research Intellect RE Lead Gen report; CoreLogic Q3 2024 investo
 | **CRM / pipeline** | Planned | Basic | Basic | No | Basic | No |
 | **Dialer** | No | Click-to-dial (Pro+) | DialerAI ($89/mo add-on) | No | AI dialer | No |
 | **API access** | Business+ tier | No | Enterprise only | No | No | No |
-| **AI features** | AI county scraping | None | BatchRank AI (scoring) | None | Alma AI (analysis) | None |
+| **AI features** | None | None | BatchRank AI (scoring) | None | Alma AI (analysis) | None |
 | **Custom counties** | Any county in 30 seconds | Fixed catalog | Fixed catalog | Fixed catalog | N/A | Unknown |
 
 ### 2.3 User Pain Points (sourced from BiggerPockets, Trustpilot, BBB, G2)
@@ -68,7 +68,7 @@ Sources: Market Research Intellect RE Lead Gen report; CoreLogic Q3 2024 investo
 
 1. **Freshness beats bulk.** A probate filing from today is worth 10x one from 30 days ago. The first investor to reach the motivated seller gets the deal. BridgeLeads scrapes county portals daily. Competitors resell month-old data. Goliath Data charges $1,499/mo for this same freshness advantage.
 
-2. **AI scraping scales without engineering.** Adding a county to PropStream requires a data partnership negotiation. Adding a county to BridgeLeads requires pasting a URL. Claude navigates the portal, extracts records, and caches the navigation for subsequent runs.
+2. **Template scraping scales without engineering.** Adding a county to PropStream requires a data partnership negotiation. Adding a county to BridgeLeads on a supported recorder platform requires its portal URL: the matching template navigates the portal and extracts the records. Other portals get a hand-coded scraper.
 
 3. **Price-to-value ratio.** Free tier gets investors hooked on fresh data. Pro at $49/mo is half the price of PropStream with better data freshness. The value ladder is designed around how many counties and records an investor needs as they scale.
 
@@ -152,7 +152,7 @@ Note: The earlier 25%/17% enrichment stats reflected historical averages across 
 | Job queue (Celery + Redis) | Production | State machine, watchdog, scheduling |
 | Pierce County scraper | Production | 300+ records/run, ARMS portal |
 | King County scraper | Production | 93+ records/run, LandmarkWeb |
-| AI scraper (Claude) | Production | Works on any county, action caching |
+| Recorder-platform templates | Production | 8 platforms; 17 of 30 live connectors (2026-10-01) |
 | Enrichment pipeline | Production | GIS API + King County assessor |
 | Frontend (Next.js) | Production | Dashboard, wizard, results, settings |
 | Auth (JWT + API key) | Production | Refresh tokens, brute-force protection |
@@ -259,20 +259,20 @@ County Portal ──scrape──> Raw Records ──enrich──> Property Data 
      |                        |                       |                        |
   Playwright             party_name              parcel_id              Cloudflare R2
   headless               date_recorded           property_address       signed URLs
-  AI navigation          legal_description       mailing_address        Resend email
+  platform template      legal_description       mailing_address        Resend email
                          heirs                   enrichment_data        webhook POST
 ```
 
 **Scrape phase:**
 - Playwright headless Chromium navigates county portal
-- AI (Claude) or hand-coded scraper extracts records
+- A recorder-platform template or a hand-coded scraper extracts records
 - Pagination handled automatically (up to configurable page limit)
 - CAPTCHA detection: fail-fast or 2Captcha solve (configurable)
 
 **Enrich phase (multi-source fallback):**
 1. County GIS REST API (free, covers ~60-70% of US counties)
-2. County assessor website scraper (AI-powered, ~$0.01/lookup cached)
-3. Regrid API ($0.01-0.05/lookup, all 3,100+ counties)
+2. Regrid API ($0.01-0.05/lookup, all 3,100+ counties)
+3. County assessor PACS lookup by owner name (records with no parcel)
 4. Skip trace provider (phone/email, Business+ tier, pricing TBD)
 
 **Export phase:**
@@ -376,7 +376,7 @@ These features exist today and no competitor offers them:
 
 | Feature | What It Does | Why It's a Moat |
 |---------|-------------|-----------------|
-| **AI scraping (Claude)** | Add any county in 30 seconds by pasting a URL. No per-county code needed. | PropStream/BatchLeads buy bulk data and can't add counties on demand. Goliath Data claims direct scraping but charges $1,499/mo. |
+| **Template scraping** | Add a county on a supported recorder platform with its portal URL. No per-county code needed. | PropStream/BatchLeads buy bulk data and can't add counties on demand. Goliath Data claims direct scraping but charges $1,499/mo. |
 | **Same-day freshness** | Records available within hours of being filed. Daily automated scraping. | Competitors rely on aggregators with 7-30 day lag. Goliath Data offers hourly at $1,499/mo. BridgeLeads does daily at $49/mo. |
 | **Free tier with real data** | 50 real county records/month, not a demo or sample. | No competitor gives free real leads. PropStream offers a 7-day trial then $99/mo minimum. |
 | **Per-record-type selection** | Choose probate, pre-foreclosure, tax delinquent, etc. independently per county. | Competitors bundle everything into one "leads" database with filters. BridgeLeads scrapes the actual filing type from source. |
@@ -458,7 +458,7 @@ Follow these sprints in order. Each sprint builds on the previous one. Do not sk
 
 | # | Task | Detail | Done When |
 |---|------|--------|-----------|
-| 2.1 | Test Spokane County probate | AI scraper on Spokane recorder portal. Verify records + enrichment. | 50+ records with 95%+ property/mailing address |
+| 2.1 | Test Spokane County probate | Template scraper on Spokane recorder portal. Verify records + enrichment. | 50+ records with 95%+ property/mailing address |
 | 2.2 | Test Snohomish County probate | LandmarkWeb portal (same platform as King). Connector exists, needs verification. | 50+ records with 95%+ enrichment |
 | 2.3 | Test Clark County probate | LandmarkWeb portal. Connector exists, needs verification. | 50+ records with 95%+ enrichment |
 | 2.4 | Fix any enrichment gaps | If a county has low enrichment, debug GIS config or add county-specific assessor lookup | All 5 counties at 95%+ |
@@ -475,7 +475,7 @@ Follow these sprints in order. Each sprint builds on the previous one. Do not sk
 | 3.2 | Build Pierce pre-foreclosure scraper | Extend existing ARMS scraper or create new config | 20+ records scraped with enrichment |
 | 3.3 | Identify pre-foreclosure source for King | LandmarkWeb or separate county portal. Research how King publishes NODs. | Source confirmed |
 | 3.4 | Build King pre-foreclosure scraper | Same approach as probate but different document filter | 20+ records scraped |
-| 3.5 | Test on Spokane with AI scraper | Use Claude to navigate Spokane's recorder for pre-foreclosure docs | Records extracted |
+| 3.5 | Test on Spokane with the template scraper | Pull Spokane's pre-foreclosure docs through its recorder template | Records extracted |
 | 3.6 | Collect beta user feedback | "Do you want pre-foreclosure? What record type next?" | Clear signal on next priority |
 
 ### Sprint 4: Skip Tracing Integration (Week 4-5)
@@ -573,7 +573,7 @@ Follow these sprints in order. Each sprint builds on the previous one. Do not sk
 
 | # | Task | Done When |
 |---|------|-----------|
-| 9.1 | AI scraper coverage for all 3,100+ US counties | National coverage |
+| 9.1 | Template and connector coverage for all 3,100+ US counties | National coverage |
 | 9.2 | All 6 record types nationwide | Probate, pre-foreclosure, tax delinquent, divorce, code violation, eviction |
 | 9.3 | Lead scoring (AI, trained on deal outcomes) | Score on every record |
 | 9.4 | Team management (multi-user accounts) | Agency tier fully functional |
@@ -677,7 +677,6 @@ This metric captures the entire value chain: scraping works, enrichment is accur
 | Database | PostgreSQL (Supabase) | RLS, JSON columns, full-text search |
 | Migrations | Alembic | Versioned schema changes, rollback support |
 | Scraping | Playwright (headless Chromium) | JavaScript rendering, stealth, reliability |
-| AI | Claude API (Anthropic) | Screenshot analysis, form navigation, data extraction |
 | Object storage | Cloudflare R2 | S3-compatible, no egress fees |
 | Email | Resend | Transactional email, deliverability |
 | Billing | Stripe | Subscriptions, invoicing, webhooks |
@@ -699,11 +698,11 @@ This metric captures the entire value chain: scraping works, enrichment is accur
 
 | Risk | Likelihood | Impact | Mitigation |
 |------|-----------|--------|------------|
-| County portals change HTML/UI | High | Medium | Canary health checks hourly. AI scraper auto-adapts. Alert on failure spike. |
+| County portals change HTML/UI | High | Medium | Canary health checks hourly. A platform fix repairs every county on that template. Alert on failure spike. |
 | County blocks our IP | Medium | High | Rotate IPs via proxy pool. Rate-limit scraping to 1 req/3s. User-agent rotation. |
 | Regrid pricing doesn't scale | Medium | High | Negotiate volume deal. Build direct county assessor scrapers as fallback. |
 | reCAPTCHA on county portals | Medium | Medium | 2Captcha integration built. CAPTCHA-free portals prioritized. |
-| Competitor copies AI approach | Low | Medium | First-mover advantage. County coverage moat. Customer lock-in via schedules. |
+| Competitor copies the template approach | Low | Medium | First-mover advantage. County coverage moat. Customer lock-in via schedules. |
 | Legal challenge to scraping | Low | High | All data is public records. No login bypass. No ToS violation. Legal review completed. |
 | Data quality issues | Medium | High | Multi-source enrichment fallback. HTML sanitization. Dedup hashing. |
 

@@ -26,6 +26,27 @@ Branch `chore/remove-ai-mode` (this plan only). Each phase gets its own branch/P
   - the privacy/terms pages, which list Anthropic as a subprocessor;
   - product docs and marketing context.
 
+## Status (2026-10-01)
+
+- [x] Phase 1: AI run cap removed (#401, bridgeleads-web#170). LIVE.
+- [x] Phase 2a: readers accept 'template' and 'ai' (#403). LIVE.
+- [x] Phase 3: LLM code, `anthropic` and the `AI_*` settings deleted (#404). LIVE.
+- [x] Phase 4: admin connectors page (bridgeleads-web#171, `7bf55cca`). LIVE. Shipped BEFORE 2b:
+      the old badge compared `=== "ai"` and would have labelled all 17 template counties "Manual".
+- [x] Phase 2b: writers store 'template', `'ai'` input normalized + logged, migration **108**
+      (#409, `d65a3b09`). LIVE. Prod: active template=17, manual=13, ai=0 (21 inactive rows
+      moved too), default 'template', 30/30 active connectors resolve.
+- [x] Phase 5: product docs, marketing context, source comments (this PR).
+- [ ] Phase 4L: legal pages. Draft PR open; merges ONLY with recorded counsel sign-off.
+- [ ] Phase 2c: NOT before 2026-10-08. Gate (tightened by Codex consult 2b r1, P1): zero
+      `'ai'` ROWS in `county_connectors` checked daily for 7 days, zero
+      `connector_create: legacy scraper_mode 'ai' normalized` log lines, AND no API instance
+      older than #409 alive. A log alone misses an old writer.
+- 🛑 Rollback after 108 is NOT "redeploy the 2a image": 2a has no 108 file, so its API boot
+  refuses to start. Roll back with a revert PR that KEEPS `alembic/versions/108_*.py`.
+- Two comments remain in files another session is editing (`src/workers/__init__.py:142`,
+  `src/workers/tasks_helpers/enrich.py:156`); fold them into 2c.
+
 ## Target end state
 
 - No "AI" anywhere a customer, admin or reader sees it. The template path is simply "template".
@@ -72,7 +93,7 @@ Rules for every phase:
 - **2b: switch writes + migrate.** Only after 2a is SUCCESS on api, worker and beat.
   - Writers produce `'template'`, and incoming `'ai'` is normalized to `'template'` on
     write (an input alias, not advertised in OpenAPI).
-  - Migration 107: count by mode, then `UPDATE ... SET scraper_mode='template' WHERE
+  - Migration 108 (107 was taken): count by mode, then `UPDATE ... SET scraper_mode='template' WHERE
     scraper_mode='ai'`, server default `'template'`. Assert 0 `'ai'` rows and no unknown
     mode. One short transaction.
   - Rollback = redeploy 2a code, which reads both. No down-migration is needed.
@@ -81,7 +102,7 @@ Rules for every phase:
     but not advertised.
 - **2c: retire `'ai'`**, only after Phase 4 (the admin page no longer sends `'ai'`) is live,
   and after 7 days with zero `'ai'` inputs logged by 2b and zero `'ai'` rows.
-  - Migration 108 re-runs the idempotent UPDATE, which catches a straggler written by an old
+  - Migration 109+ re-runs the idempotent UPDATE, which catches a straggler written by an old
     API instance during 2b's rolling deploy.
   - It then adds `CHECK (scraper_mode IN ('template','manual'))`, so no `'ai'` or unknown mode
     can be stored again.

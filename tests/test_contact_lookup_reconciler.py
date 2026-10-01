@@ -480,3 +480,122 @@ async def test_one_action_with_many_rows_is_one_candidate(db, business_user, loo
         _row(big, rid, "errored")
     with system_sync_session() as s:
         assert rec._p4_candidates(s) == [big]
+
+
+# ── 2c-ii diff review r1 (AC1-AC4) ───────────────────────────────────────────
+
+
+async def test_a_locked_prefix_does_not_starve_the_actions_behind_it(
+    db, business_user, lookups_on, monkeypatch,
+):
+    """AC1: with LIMIT 1, the oldest candidate held by another transaction is skipped
+    BEFORE the limit applies, so the next one is still expired this tick."""
+    monkeypatch.setattr(rec, "_EXPIRE_LIMIT", 1)
+    job = _job(business_user.id)
+    first, second = _seed(business_user.id, job, [{}, {}])
+    held = _action(business_user.id, job, [first])
+    behind = _action(business_user.id, job, [second])
+    _age(held, cla.ACTION_DEADLINE_SECONDS + 120)    # the oldest: first in line
+    _age(behind, cla.ACTION_DEADLINE_SECONDS + 60)
+    with system_sync_session() as holder:
+        holder.execute(text("SELECT 1 FROM contact_lookup_actions WHERE id = :a FOR UPDATE"),
+                       {"a": held})
+        out: list = []
+        t = threading.Thread(target=lambda: out.append(_tick()), daemon=True)
+        t.start()
+        t.join(30)
+        holder.rollback()
+    assert out and out[0]["expired"] == 1
+    assert (_state(held).status, _state(behind).status) == ("dispatching", "expired")
+
+
+async def test_one_failing_action_does_not_stop_the_rest_of_its_pass(
+    db, business_user, lookups_on, monkeypatch,
+):
+    """AC2: fault injection on ONE action's abandon step; the other still expires, and
+    the failed one is rolled back whole (still dispatching, still quoted)."""
+    job = _job(business_user.id)
+    r1, r2 = _seed(business_user.id, job, [{}, {}])
+    bad = _action(business_user.id, job, [r1])
+    good = _action(business_user.id, job, [r2])
+    _age(bad, cla.ACTION_DEADLINE_SECONDS + 120)
+    _age(good, cla.ACTION_DEADLINE_SECONDS + 60)
+    real = cla._quoted_ids
+
+    def flaky(db_, aid, uid):
+        if aid == bad:
+            raise RuntimeError("injected")
+        return real(db_, aid, uid)
+
+    monkeypatch.setattr(cla, "_quoted_ids", flaky)
+    out = _tick()
+    assert out["errors"] == 1 and out["expired"] == 1
+    assert _state(good).status == "expired"
+    assert (_state(bad).status, _verdicts(bad)) == ("dispatching", {r1: "quoted"})
+
+
+async def test_a_lead_with_an_old_terminal_row_and_an_active_one_is_not_mappable(
+    db, business_user, lookups_on,
+):
+    """AC3: should a lead ever carry two rows, the ACTIVE one decides, in the selection
+    exactly as in the visit: the action is not a candidate and nothing settles."""
+    uid = business_user.id
+    aid, job, (rid,) = _claimed(uid, 1)  # its row is 'queued' (active)
+    with system_sync_session() as s:
+        # The active row made OLDER, and a terminal row for the same lead made NEWER:
+        # recency alone would pick the terminal one, so only active-first decides.
+        s.execute(text("UPDATE pending_skip_trace_rows SET enqueued_at = now() "
+                       "- interval '2 days' WHERE action_id = :a"), {"a": aid})
+        s.execute(text(
+            "INSERT INTO pending_skip_trace_rows (id, job_id, result_id, user_id, "
+            "  property_address, trace_type, status, enqueued_at, action_id) "
+            "VALUES (:i, :j, :r, :u, '1 OLD ST', 'normal', 'cancelled', now(), :a)"),
+            {"i": str(uuid.uuid4()), "j": job, "r": rid, "u": uid, "a": aid})
+        s.commit()
+    with system_sync_session() as s:
+        assert aid not in rec._p4_candidates(s)
+    _tick()
+    assert _verdicts(aid) == {rid: "newly_queued"} and _state(aid).status == "claimed"
+
+
+def test_the_reconciler_runs_every_two_minutes_on_beat():
+    import src.workers.scheduler  # noqa: F401 - registers the beat schedule and the task
+    from src.workers import app
+
+    entry = app.conf.beat_schedule["reconcile-contact-lookups"]
+    assert entry["task"] == "src.workers.scheduler.reconcile_contact_lookups"
+    assert entry["schedule"] == 120.0
+    assert entry["task"] in app.tasks
+
+
+async def test_an_action_locked_between_selection_and_visit_is_skipped_not_waited_on(
+    db, business_user, lookups_on, monkeypatch,
+):
+    """The selection skips held rows, so the visit's own SKIP LOCKED guards the gap
+    after it: a pass-through spy lets the real selection run, then another session
+    takes the row before the visit. The tick must skip it, not wait."""
+    job = _job(business_user.id)
+    [rid] = _seed(business_user.id, job, [{}])
+    aid = _action(business_user.id, job, [rid])
+    _age(aid, cla.ACTION_DEADLINE_SECONDS + 1)
+    holder = system_sync_session().__enter__()
+    real = rec._candidates
+
+    def select_then_lock(db_, predicate, order, limit, params):
+        ids = real(db_, predicate, order, limit, params)
+        if aid in ids:
+            holder.execute(text("SELECT 1 FROM contact_lookup_actions WHERE id = :a "
+                                "FOR UPDATE"), {"a": aid})
+        return ids
+
+    monkeypatch.setattr(rec, "_candidates", select_then_lock)
+    out: list = []
+    t = threading.Thread(target=lambda: out.append(_tick()), daemon=True)
+    t.start()
+    t.join(20)
+    finished = not t.is_alive()
+    holder.rollback()
+    holder.close()
+    t.join(30)
+    assert finished, "the visit waited on a row another session held"
+    assert out[0]["expired"] == 0 and _state(aid).status == "dispatching"

@@ -1,5 +1,12 @@
 # 2e: Q4 (F-009) "Lookup failed"
 
+> **SHIPPED 2026-10-01** (BE #420 6d32c8e2, FE bridgeleads-web #182 4a4f5248 and #184
+> d0626274). Everything below the "Review (shipped)" section is the plan AS APPROVED and the
+> Codex rounds that shaped it: a historical record. Where it differs from what shipped (line
+> ranges, the superseded `trim()` wording of the r4 reconciliation, present-tense "RED on
+> main"), the "Review (shipped)" section and the 2026-10-01 BUILD_JOURNAL entry are
+> authoritative.
+
 Two phases, both small:
 - **A (BE):** `AlreadyDeliveredContacts` gains a `removed` bucket for `purged` rows, which
   today land in `not_looked_up`. No migration.
@@ -185,7 +192,8 @@ contracts doc. B is over the 5-file guideline only by the two type files and a d
    `purged` from scope.
 
 ## Verification
-- [x] A: migrate the test DB 107 -> 108 first; new test RED on main, GREEN on branch; full
+- [x] A: migrate the test DB 107 -> 108 first (done as 107 -> 109: main had reached 109);
+      new test was RED on pre-#420 main 1f7f7114, GREEN on branch; full
       suite in 8 parts (one background job each, exit files); security review x2; Codex diff
       `origin/main...HEAD` GATE: PASS; quiet.py = 0; merge; Railway SUCCESS on the merge SHA,
       `/health` 200, worker logs clean.
@@ -228,9 +236,10 @@ check was NOT done (a prod read was refused in-session); journal in this PR.
 Correction found by the journal fact-check: `purged` does NOT strictly mean "was a hit". The
 sweep (`retention.py` `_ELIGIBLE`) purges any aged row with a contact column set, outside
 queued/submitted, so a `miss` with `[]` arrays can become `purged` too. The UI's "Removed"
-tooltip ("its contact details were deleted") is therefore over-specific for such a row.
-Follow-up: neutral copy, e.g. "This lead was looked up, and its lookup data was deleted after
-the retention period."
+tooltip ("its contact details were deleted") was therefore over-specific for such a row.
+RESOLVED by bridgeleads-web #184 (d0626274): "This lead was looked up, and its lookup data
+was deleted after the retention period." Whether the sweep SHOULD take such rows is an owner
+decision recorded in the BUILD_JOURNAL entry.
 
 ## Reconciliation with Codex plan r1 (NO-GO)
 - [P1] `purged` vs `not_looked_up` in the summary: ADOPTED, Codex's first option (phase A).

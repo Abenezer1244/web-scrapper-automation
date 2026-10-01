@@ -4571,9 +4571,10 @@ mandatory: the post-deploy NULL proof, and owner-approved remediation for any NU
   - **One deviation from the spec, toward the customer:** `rows_sent > 0` is added. A
     real batch never sends zero (`claimed[0]` is dereferenced), so a 0, like NULL, is
     "not proven". Without it, `0 >= 0` would read as accepted.
-  - `report_usage_from_webhook` writes `unmatched_billed = <decision>` `WHERE ... AND
-    unmatched_billed IS NULL`, in the caller's transaction, for every billed queue. The
-    warning text names the NULL case.
+  - `report_usage_from_webhook` sets `unmatched_billed = COALESCE(unmatched_billed,
+    <decision>) ... RETURNING unmatched_billed` in the caller's transaction, for every
+    billed queue, and bills by the RETURNED value (AJ1: what is recorded is what is
+    billed). The warning text names the NULL case.
 - `scheduler_helpers/contact_lookups.py`:
   - `unmatched` maps from `q.unmatched_billed`; `queue_accepted_all` is no longer
     imported.
@@ -4646,6 +4647,8 @@ mandatory: the post-deploy NULL proof, and owner-approved remediation for any NU
 - Rebased on main `aeeaccd6` (#423: journal, schemas/constants/retention comments; none of
   this PR's files). **Regression re-run after AJ1 + the rebase: 1161 passed, 0 failed**
   (the same 42 files). ruff clean on `src` and both test files.
+- **Codex diff review r2: GATE: GO**, 1 P3 (this plan described the pre-AJ1 UPDATE; fixed)
+  (`codex_ociii_review_r2_out.txt`).
 
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever

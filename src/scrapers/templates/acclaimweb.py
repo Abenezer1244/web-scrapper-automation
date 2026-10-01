@@ -999,9 +999,8 @@ class AcclaimWebScraper(BridgeScraper):
 
     # County assessor (PACS) URLs for address lookup by owner name.
     # Tyler PropertyAccess is used by many WA counties. Douglas is NOT one of them:
-    # pacs.co.douglas.wa.us does not resolve, and its assessor publishes TaxSifter
-    # (Aumentum, douglaswa-taxsifter.publicaccessnow.com), which this client cannot
-    # query. Douglas records skip this lookup (verified 2026-10-01).
+    # pacs.co.douglas.wa.us does not resolve, and its assessor runs TerraScan
+    # TaxSifter, looked up through src/scrapers/enrichment/taxsifter.py instead.
     _PACS_URLS = {
         "chelan": "https://pacs.co.chelan.wa.us/PropertyAccess/?cid=90",
     }
@@ -1017,6 +1016,10 @@ class AcclaimWebScraper(BridgeScraper):
 
         pacs_url = self._PACS_URLS.get(self.county.lower())
         if not pacs_url:
+            from src.scrapers.enrichment.taxsifter import TAXSIFTER_ORIGINS
+            if self.county.lower() in TAXSIFTER_ORIGINS:
+                await self._lookup_taxsifter_addresses(records)
+                return
             _logger.info("No PACS URL for %s — skipping address lookup", self.county)
             return
 
@@ -1124,6 +1127,44 @@ class AcclaimWebScraper(BridgeScraper):
                         found += 1
 
         _logger.info("PACS lookup: found addresses for %d/%d records", found, len(records))
+
+    async def _lookup_taxsifter_addresses(self, records: list[ScrapedRecord]) -> None:
+        """The PACS lookup's counterpart for a TerraScan TaxSifter county (Douglas).
+
+        Same contract: address, mailing and assessed value only, and only for a
+        unique owner match; parcel_id is never set from an owner-name lookup.
+        Lookups run serialized on one worker thread (one session, one disclaimer
+        acceptance, polite spacing), off the event loop.
+        """
+        from src.scrapers.enrichment.taxsifter import TaxSifterClient
+
+        loop = asyncio.get_running_loop()
+        try:
+            client = await loop.run_in_executor(None, TaxSifterClient, self.county)
+        except Exception as exc:
+            _logger.warning("TaxSifter unavailable for %s: %s", self.county, type(exc).__name__)
+            return
+
+        found = 0
+        for record in records:
+            try:
+                result = await loop.run_in_executor(None, client.lookup, record.party_name)
+            except Exception as exc:
+                # A broken session (disclaimer refused, network) ends the pass: the
+                # remaining lookups would fail the same way.
+                _logger.warning("TaxSifter lookup stopped for %s: %s", self.county, type(exc).__name__)
+                break
+            if not result:
+                continue
+            record.property_address = result["address"]
+            if result.get("mailing"):
+                record.mailing_address = result["mailing"]
+            if result.get("value"):
+                record.enrichment_data = record.enrichment_data or {}
+                record.enrichment_data["assessed_value"] = result["value"]
+            found += 1
+        _logger.info("TaxSifter lookup (%s): found addresses for %d/%d records",
+                     self.county, found, len(records))
 
     async def _go_next_page(self) -> bool:
         """Click the Next page button in the Kendo pager."""

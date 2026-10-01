@@ -845,10 +845,12 @@ async def test_the_results_page_reports_the_lookup_state_of_already_delivered_le
     contacts = page["already_delivered_contacts"]
     assert contacts == {
         "found": 2, "none_found": 1, "looking": 1, "failed": 1, "not_looked_up": 1,
+        "removed": 0, "unknown": 0,
         # Of the 3 answered, 2 were copied from an earlier answer (one hit, one miss).
         "reused": 2,
     }
-    buckets = ("found", "none_found", "looking", "failed", "not_looked_up")
+    buckets = ("found", "none_found", "looking", "failed", "not_looked_up", "removed",
+               "unknown")
     assert sum(contacts[b] for b in buckets) == page["already_delivered_count"]
     assert contacts["reused"] <= contacts["found"] + contacts["none_found"]
     # The rows the tab lists carry the contacts themselves.
@@ -858,6 +860,88 @@ async def test_the_results_page_reports_the_lookup_state_of_already_delivered_le
     other = await client.get(f"/jobs/{run}/results", params={"category": "already_delivered"},
                              headers={"Authorization": f"Bearer {starter_token}"})
     assert other.status_code == 404
+
+
+def _raw_contacts(result_id: str, *, phone: str | None, email: str | None) -> None:
+    """Write plaintext straight into the encrypted columns, bypassing the bind (which
+    turns blanks into NULL): the shape of a legacy row stored before encryption."""
+    with system_sync_session() as db:
+        db.execute(text("UPDATE results SET phone = :p, email = :e WHERE id = :id"),
+                   {"p": phone, "e": email, "id": result_id})
+        db.commit()
+
+
+def _raw_status(result_id: str, status: str) -> None:
+    with system_sync_session() as db:
+        db.execute(text("UPDATE results SET skip_trace_status = :s WHERE id = :id"),
+                   {"s": status, "id": result_id})
+        db.commit()
+
+
+async def test_no_looked_up_lead_is_reported_as_not_looked_up(
+    business_user, starter_user, client, business_token, starter_token,
+):
+    """2e (F-009): `not_looked_up` was whatever was left over, so a lead the retention
+    sweep emptied ('purged') and any status this API does not know were reported as
+    never looked up. Each now has its own bucket, `not_looked_up` is counted from its own
+    predicate, and a legacy lead that carries contacts while still marked not_attempted
+    counts as found, by the same rule the leads table uses to show those contacts. A
+    value made only of whitespace (space, tab, newline, CR, form feed, vertical tab) is
+    no contact, on both sides."""
+    earlier = _run(business_user.id, skip_on=False, status="done")
+    for n in range(1, 16):
+        _lead(business_user.id, earlier, n)
+    run = _run(business_user.id, skip_on=True, status="done")
+    _lead(business_user.id, run, 1, dup=True, status="purged", traced_days_ago=400)
+    _lead(business_user.id, run, 2, dup=True)  # never looked up
+    _lead(business_user.id, run, 3, dup=True, phone="2065550111")  # legacy, phone only
+    _lead(business_user.id, run, 4, dup=True, email="legacy@example.com")  # email only
+    blanks = ("", " ", "\t", "\n", "\r\n", "\f", "\v")
+    for i, blank in enumerate(blanks):
+        _raw_contacts(_lead(business_user.id, run, 5 + i, dup=True), phone=blank, email=blank)
+    _raw_status(_lead(business_user.id, run, 12, dup=True), "not_a_status")
+    _lead(business_user.id, run, 13, dup=True, status="hit", traced_days_ago=0,
+          phone="2065550122", source="lookup")
+
+    # Another account's emptied, untraced and unknown leads on its own run.
+    theirs = _run(starter_user.id, skip_on=True, status="done")
+    for n in range(1, 4):
+        _lead(starter_user.id, _run(starter_user.id, skip_on=False, status="done"), n)
+    _lead(starter_user.id, theirs, 1, dup=True, status="purged")
+    _lead(starter_user.id, theirs, 2, dup=True)
+    _raw_status(_lead(starter_user.id, theirs, 3, dup=True), "not_a_status")
+
+    resp = await client.get(f"/jobs/{run}/results", params={"category": "already_delivered"},
+                            headers={"Authorization": f"Bearer {business_token}"})
+
+    assert resp.status_code == 200
+    page = resp.json()
+    assert page["already_delivered_count"] == 13
+    contacts = page["already_delivered_contacts"]
+    assert contacts == {
+        "found": 3,            # the hit + the two legacy rows with a contact
+        "none_found": 0, "looking": 0, "failed": 0,
+        "not_looked_up": 8,    # the untraced row + one per blank value
+        "removed": 1,          # purged
+        "unknown": 1,          # a status this API does not know
+        "reused": 0,
+    }
+    buckets = ("found", "none_found", "looking", "failed", "not_looked_up", "removed",
+               "unknown")
+    assert sum(contacts[b] for b in buckets) == page["already_delivered_count"]
+
+    # Tenant isolation: the other account sees its own three, never ours.
+    mine_for_them = await client.get(
+        f"/jobs/{run}/results", params={"category": "already_delivered"},
+        headers={"Authorization": f"Bearer {starter_token}"})
+    assert mine_for_them.status_code == 404
+    theirs_page = (await client.get(
+        f"/jobs/{theirs}/results", params={"category": "already_delivered"},
+        headers={"Authorization": f"Bearer {starter_token}"})).json()
+    assert theirs_page["already_delivered_contacts"] == {
+        "found": 0, "none_found": 0, "looking": 0, "failed": 0,
+        "not_looked_up": 1, "removed": 1, "unknown": 1, "reused": 0,
+    }
 
 
 async def test_a_twin_stuck_at_an_unknown_outcome_holds_for_as_long_as_it_takes(

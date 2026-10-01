@@ -15,7 +15,19 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials
-from sqlalchemy import false, func, or_, select, text, update
+from sqlalchemy import (
+    ColumnElement,
+    String,
+    and_,
+    false,
+    func,
+    not_,
+    or_,
+    select,
+    text,
+    type_coerce,
+    update,
+)
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -100,6 +112,36 @@ _SSE_HEADERS = {
 }
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
+
+# A stored phone/email "has content" when it holds a character outside this class.
+# The leads table (FE `nonBlank`) tests the SAME class, so a row whose cell shows a
+# contact is never summarised as "not looked up". Not PostgreSQL trim(): it strips
+# only spaces, while JS String.trim() also strips tabs and newlines. Blanks are
+# normalised to NULL at bind; this catches legacy plaintext stored before that
+# (dialer_filters.py). A presence test only, never a match on the value. The column
+# is coerced to plain String so the pattern binds as text, not through the
+# encrypting type.
+_CONTENT_PATTERN = r"[^ \t\n\r\f\v]"
+
+
+def _has_content(column) -> ColumnElement[bool]:
+    return func.coalesce(type_coerce(column, String), "").regexp_match(_CONTENT_PATTERN)
+
+
+_HAS_CONTACT = or_(_has_content(Result.phone), _has_content(Result.email))
+_STATUS = Result.skip_trace_status
+
+# AlreadyDeliveredContacts buckets: disjoint predicates, counted in one statement.
+# A lead still marked not_attempted that carries a contact is a legacy answered row
+# (traced before the status existed): it counts as found, as the leads table shows it.
+_CONTACT_BUCKETS = (
+    ("found", or_(_STATUS == "hit", and_(_STATUS == "not_attempted", _HAS_CONTACT))),
+    ("none_found", _STATUS == "miss"),
+    ("looking", _STATUS.in_(("queued", "submitted"))),
+    ("failed", _STATUS == "errored"),
+    ("not_looked_up", and_(_STATUS == "not_attempted", not_(_HAS_CONTACT))),
+    ("removed", _STATUS == "purged"),
+)
 
 
 def _run_delivered(job: Job) -> bool:
@@ -698,15 +740,14 @@ async def get_results(
             .label("already_delivered"),
             # Skip-trace state of exactly those rows (AlreadyDeliveredContacts). A lead
             # already delivered can still be looked up later, and the tab says so.
+            # Every bucket is counted from its own predicate and they are disjoint;
+            # `unknown` is the only remainder, so a status this code does not know is
+            # never reported as "not looked up" (2e).
             *(
                 func.count()
-                .filter(already_delivered_condition(), tax_cap_condition(today),
-                        Result.skip_trace_status.in_(statuses))
+                .filter(already_delivered_condition(), tax_cap_condition(today), condition)
                 .label(f"delivered_{bucket}")
-                for bucket, statuses in (
-                    ("found", ("hit",)), ("none_found", ("miss",)),
-                    ("looking", ("queued", "submitted")), ("failed", ("errored",)),
-                )
+                for bucket, condition in _CONTACT_BUCKETS
             ),
             # Of the answered ones, those copied from an earlier answer (no lookup bought).
             func.count()
@@ -727,12 +768,11 @@ async def get_results(
     same_run_duplicate_count = counts_row.same_run
     already_delivered_count = counts_row.already_delivered
     delivered_buckets = {
-        bucket: getattr(counts_row, f"delivered_{bucket}")
-        for bucket in ("found", "none_found", "looking", "failed")
+        bucket: getattr(counts_row, f"delivered_{bucket}") for bucket, _ in _CONTACT_BUCKETS
     }
     already_delivered_contacts = AlreadyDeliveredContacts(
         **delivered_buckets,
-        not_looked_up=already_delivered_count - sum(delivered_buckets.values()),
+        unknown=already_delivered_count - sum(delivered_buckets.values()),
         reused=counts_row.delivered_reused,
     )
 

@@ -22,9 +22,9 @@ to understand *why* the code is the way it is and *what's been attempted before*
 ## 2026-10-01 — UX 2e (F-009 / Q4): "Lookup failed", one contact status for phone and email
 
 > UX audit queue item 2e. An errored lead showed Phone "Error" beside Email "None found", and
-> "None found" claims the lookup succeeded and found nothing. Owner confirmed the plan with the
-> defaults: no retry, "Removed" for purged leads, "Not looked up" for never-traced leads, and do
-> the backend phase. Plan + review: `tasks/todo-2e-lookup-failed.md` (also bridgeleads-web
+> "None found" claims the lookup succeeded and found nothing. The owner confirmed the plan in
+> session ("start", recorded in the plan's Todo) with its defaults: no retry, "Removed" for
+> purged leads, "Not looked up" for never-traced leads, and do the backend phase. Plan + review: `tasks/todo-2e-lookup-failed.md` (also bridgeleads-web
 > `docs/ux-audit/todo-2e-lookup-failed.md`).
 
 **Built / Shipped:**
@@ -34,15 +34,17 @@ to understand *why* the code is the way it is and *what's been attempted before*
   absorbed purged leads, unknown statuses and legacy `not_attempted` leads that carry contacts.
   New `removed` (purged) and `unknown` (the only remainder) fields; no migration.
 - FE bridgeleads-web #182 (squash 4a4f5248, Vercel production success 08:20Z).
-  - `results/[id]/_components/ContactStatus.tsx` is the one resolver behind PhoneCell and
+  - `app/(dashboard)/results/[id]/_components/ContactStatus.tsx` is the one resolver behind PhoneCell and
     EmailCell, used by the table and the mobile cards. States: Processing, Lookup failed,
     Removed, the values, None found, Not looked up, or a neutral N/A.
   - `DeliveredLookupSummary` names the new buckets; the batch page no longer promises contacts
     "keep filling in". Contracts doc Q4 is marked SHIPPED.
 
 **Tried / Decided:**
-- The contract said FE-only and listed six statuses. There are seven: `purged` (retention
-  sweep) read "None found" on both channels, the same false claim. That made a backend phase
+- The contract said FE-only and listed six statuses. The backend defines seven
+  (`SkipTraceStatus`): `purged` (retention sweep) read "None found" on both channels, the same
+  false claim. The column is an unconstrained `String(16)`, so any other string is bucketed as
+  `unknown` and rendered neutrally. That made a backend phase
   necessary, so the summary would not call a looked-up lead "not looked up".
 - Codex plan review took six rounds (r1-r5 NO-GO, r6 GO). Each round tightened the shared
   rule between the cells and the summary:
@@ -53,7 +55,8 @@ to understand *why* the code is the way it is and *what's been attempted before*
     failed or removed lead;
   - the scalar fallback applies only to answered rows. The cache copy derives `hit` from the
     scalars (`enrich.py`), so an array-only rule (Codex r1) would have hidden a paid hit.
-- The contact columns are `EncryptedString`. The column is `type_coerce`d to plain `String` so
+- The scalar `phone` / `email` columns the predicate reads are `EncryptedString` (the arrays
+  are `EncryptedJSON` and are not read). The column is `type_coerce`d to plain `String` so
   the regex binds as a text parameter, never through the encrypting type. Blanks never reach
   the ciphertext: the bind normalises with Python `str.strip()`, a superset of the class.
 - Rejected for 2e, recorded as follow-ups: page-local polling for new-lead lookups; Segments
@@ -87,11 +90,17 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 **Pending / Handoff:**
 - `last_trace_outcome` writers (BE), then a retry for `not_submitted` only.
+- The "Removed" tooltip says "its contact details were deleted". The sweep can also purge a
+  `miss` row whose arrays are `[]` (see Facts), so the copy should be neutral ("its lookup data
+  was deleted"). Small FE follow-up.
 - A real-row check of an `errored` lead in prod, if the owner approves a read.
 - Next queue item: item 3 (batches B-E + F-045..F-050).
 
 **Facts learned:**
-- `results.skip_trace_status` has seven values. `purged` is terminal and was a hit.
+- `results.skip_trace_status` has seven defined values (`SkipTraceStatus`); the column itself
+  accepts any string. `purged` is terminal and means retention removed aged contact data. The
+  code comments describe it as a former hit, but the sweep (`retention.py` `_ELIGIBLE`) only
+  requires a contact column to be set, so a `miss` with `[]` arrays qualifies too.
 - Nothing retries an `errored` lead: only `not_attempted` is claimed (`skip_trace_claim.py`).
 
 ## 2026-09-30 — Landing and marketing redesign (bridgeleads-web#176): contour field, measured numbers, five critique rounds

@@ -203,13 +203,26 @@ contracts doc. B is over the 5-file guideline only by the two type files and a d
 
 ## Todo
 - [x] Codex PLAN review until `PLAN: GO` (r1-r5 NO-GO, r6 GO)
-- [ ] Owner confirms
-- [ ] A: BE bucket + test (RED, GREEN) + openapi, gates, merge, verify
-- [ ] B: `ContactStatus.tsx` + types; wire PhoneCell / EmailCell; summary; batches copy
-- [ ] B: contracts doc
-- [ ] B: gates + stub proof (RED on master, GREEN on branch)
-- [ ] B: Codex diff GATE: PASS, PR, merge, Vercel verify
-- [ ] Journal
+- [x] Owner confirms (2026-10-01, in session: "start", i.e. the four defaults above)
+- [x] A: BE bucket + test (RED, GREEN) + openapi, gates, merge, verify (#420, 6d32c8e2)
+- [x] B: `ContactStatus.tsx` + types; wire PhoneCell / EmailCell; summary; batches copy
+- [x] B: contracts doc
+- [x] B: gates + stub proof (RED on master, GREEN on branch)
+- [x] B: Codex diff GATE: PASS, PR, merge, Vercel verify (bridgeleads-web #182, 4a4f5248)
+- [x] Journal (this PR)
+
+## Review (shipped)
+Full review: bridgeleads-web `docs/ux-audit/todo-2e-lookup-failed.md` "Review", and the
+2026-10-01 BUILD_JOURNAL entry. Verification items above: A done (the plan said migrate to
+108; main had reached 109 by then, so the test DB went 107 -> 109); B done; the real-row
+check was NOT done (a prod read was refused in-session); journal in this PR.
+
+Correction found by the journal fact-check: `purged` does NOT strictly mean "was a hit". The
+sweep (`retention.py` `_ELIGIBLE`) purges any aged row with a contact column set, outside
+queued/submitted, so a `miss` with `[]` arrays can become `purged` too. The UI's "Removed"
+tooltip ("its contact details were deleted") is therefore over-specific for such a row.
+Follow-up: neutral copy, e.g. "This lead was looked up, and its lookup data was deleted after
+the retention period."
 
 ## Reconciliation with Codex plan r1 (NO-GO)
 - [P1] `purged` vs `not_looked_up` in the summary: ADOPTED, Codex's first option (phase A).

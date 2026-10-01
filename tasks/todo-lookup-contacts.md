@@ -4144,6 +4144,26 @@ still holds: nothing reaches a customer before 2d, and 2d stays hard-gated on O-
   starvation test kept the other actions' leads in flight.
 - **Regression: 869 passed, 0 failed** (all 30 test files importing the scheduler, 4 chunks),
   plus 120 (import cycles, the 2b action suite, ingest). ruff clean.
+- **Codex diff review r1: GATE: NO-GO, 3 P2 + 1 P3, all fixed** (`codex_2cii_review_r1_out.txt`):
+  - **AC1 (P2) a locked prefix could starve.** Candidates were picked with LIMIT before
+    locking, so if the oldest N stayed held, later actions were never picked. Selection is now
+    `ORDER BY … LIMIT n FOR UPDATE OF a SKIP LOCKED`: Postgres skips held rows BEFORE the
+    limit, and the locks are released at once. Test: LIMIT 1, the oldest held, the next one
+    expires.
+  - **AC2 (P2) P1-P3 lacked per-action isolation.** Every pass now runs through `_each()`: one
+    transaction per action; a failure is rolled back, logged with its id and counted, and the
+    pass continues. Test: a fault on one action, the other expires, and the failed one is
+    untouched.
+  - **AC3 (P2) the selection and the visit could read different rows for a lead with two
+    pending rows.** ONE `LATERAL` "current row" (active first, then newest) is used by every
+    predicate AND the visit. Test: an older active row + a newer cancelled one → not a
+    candidate, nothing settles. A first version of that test made the active row the newest
+    too, so a mutant survived; fixed.
+  - **AC4 (P3)** a beat-entry test (120 s, task registered).
+  - **One more test from a mutant:** a row locked in the gap between selection and visit (a
+    pass-through spy on `_candidates`) is skipped, not waited on.
+- **Mutations (runner v2, every mutant asserted present, RED baseline refused): 24/24 caught.**
+- Rebased `--onto` main `c517cef7` (#416 merged): the diff is 2c-ii only, 4 files.
 
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever

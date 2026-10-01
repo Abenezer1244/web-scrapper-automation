@@ -534,6 +534,32 @@ def report_meter_event_to_stripe(
     return event.get("identifier") or event.get("id")
 
 
+def queue_accepted_all(db, queue_id: int) -> bool:
+    """True when Tracerfy demonstrably accepted EVERY row we sent in this batch, so
+    its 'unmatched' rows were genuinely performed and paid for (see
+    report_usage_from_webhook for the rule and why).
+
+    ONE rule, two callers (Phase 1b-2, V2/W3): billing decides with it, and the
+    contact-lookup reconciler maps an action's 'unmatched' leads to
+    'unmatched_billable' / 'unmatched_unbilled' with it, so the action page cannot
+    disagree with the rule billing applies. A read; it never bills.
+
+    False when the queue has no stamped rows at all (no row to compare), exactly as
+    billing has always read the empty result.
+    """
+    return bool(db.execute(
+        text("""
+            SELECT COALESCE(q.rows_uploaded, 0) >= COUNT(p.id)
+            FROM skip_trace_queues q
+            JOIN pending_skip_trace_rows p
+              ON p.tracerfy_queue_id = q.tracerfy_queue_id
+            WHERE q.tracerfy_queue_id = :qid
+            GROUP BY q.rows_uploaded
+        """),
+        {"qid": queue_id},
+    ).scalar())
+
+
 def report_usage_from_webhook(db, queue_id: int) -> dict:
     """Aggregate per-user usage for a completed batch, advance each user's
     counter, and persist the billable MeterEvents to the outbox — all WITHOUT
@@ -611,17 +637,7 @@ def report_usage_from_webhook(db, queue_id: int) -> dict:
     # rows_uploaded covers everything we submitted, no row was dropped or
     # deduped and every unmatched row was genuinely paid for. If it does not,
     # this batch bills 'completed' rows only -- erring toward the customer.
-    accepted_all = db.execute(
-        text("""
-            SELECT COALESCE(q.rows_uploaded, 0) >= COUNT(p.id)
-            FROM skip_trace_queues q
-            JOIN pending_skip_trace_rows p
-              ON p.tracerfy_queue_id = q.tracerfy_queue_id
-            WHERE q.tracerfy_queue_id = :qid
-            GROUP BY q.rows_uploaded
-        """),
-        {"qid": queue_id},
-    ).scalar()
+    accepted_all = queue_accepted_all(db, queue_id)
 
     billable_states = ("completed", "unmatched") if accepted_all else ("completed",)
     if not accepted_all:

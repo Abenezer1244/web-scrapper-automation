@@ -700,3 +700,75 @@ async def test_a_lead_over_quota_after_the_claim_is_withdrawn_before_any_submiss
         assert _cancel_undeliverable_queued(s) == 1
         s.commit()
     assert _pending(job)[rid] == (aid, "cancelled", "normal")
+
+
+# ── 2c-i: the deadline at T1 (AA1) and the flag (AA3) ────────────────────────
+
+
+def _age(aid: str, seconds: int) -> None:
+    """Backdate the confirm, as if it happened `seconds` ago."""
+    with system_sync_session() as s:
+        s.execute(text("UPDATE contact_lookup_actions SET created_at = now() "
+                       "- make_interval(secs => :s) WHERE id = :a"), {"s": seconds, "a": aid})
+        s.commit()
+
+
+@pytest.mark.parametrize(("age", "starts"), [
+    (cla.ACTION_DEADLINE_SECONDS - 60, True),
+    (cla.ACTION_DEADLINE_SECONDS + 1, False),
+])
+async def test_a_publish_delivered_after_the_deadline_buys_nothing(
+    db, business_user, lookups_on, age, starts,
+):
+    job = _job(business_user.id)
+    [rid] = _seed(business_user.id, job, [{}])
+    aid = _action(business_user.id, job, [rid])
+    _age(aid, age)
+    out = cla.run_action(aid)
+    if starts:
+        assert out["outcome"] == "claimed" and set(_pending(job)) == {rid}
+    else:
+        assert out == {"outcome": "not_dispatching"}
+        st = _state(aid)
+        assert (st.status, st.lease_token, st.started_at) == ("dispatching", None, None)
+        assert _pending(job) == {} and _verdicts(aid) == {rid: "quoted"}
+
+
+async def test_a_flag_changes_only_the_reason_and_reports_only_a_change(
+    db, business_user, lookups_on,
+):
+    job = _job(business_user.id)
+    [rid] = _seed(business_user.id, job, [{}])
+    aid = _action(business_user.id, job, [rid])
+    cla.run_action(aid)
+    with system_sync_session() as s:
+        assert cla._flag(s, aid, "claimed", "provider_reconciliation_required") is True
+        assert cla._flag(s, aid, "claimed", "provider_reconciliation_required") is False
+        s.commit()
+    st = _state(aid)
+    assert (st.status, st.status_reason) == ("claimed", "provider_reconciliation_required")
+    with system_sync_session() as s:
+        assert cla._flag(s, aid, "claimed", None) is True
+        assert cla._flag(s, aid, "claimed", None) is False
+        s.commit()
+    assert _state(aid).status_reason is None
+    assert _hops(aid)[-2:] == [("claimed", "claimed", "provider_reconciliation_required"),
+                               ("claimed", "claimed", "flag_cleared")]
+
+
+@pytest.mark.parametrize("status", ["dispatching", "running", "settled", "failed", "expired"])
+def test_a_flag_on_a_status_that_is_not_flaggable_raises_before_any_sql(status):
+    with pytest.raises(cla.IllegalTransitionError, match="no flag"):
+        cla._flag(None, str(uuid.uuid4()), status, "x")
+
+
+async def test_a_flag_on_an_action_in_another_status_changes_nothing(
+    db, business_user, lookups_on,
+):
+    job = _job(business_user.id)
+    [rid] = _seed(business_user.id, job, [{}])
+    aid = _action(business_user.id, job, [rid])  # dispatching
+    with system_sync_session() as s:
+        assert cla._flag(s, aid, "claimed", "x") is False
+        s.commit()
+    assert _state(aid).status_reason is None

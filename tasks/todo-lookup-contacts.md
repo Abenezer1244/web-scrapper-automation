@@ -4055,6 +4055,35 @@ The fixes:
 **Order: 2c-i → 2c-ii → O-C (grown by AA2) → O-D → 2d.** The owner approved 2c before O-C. That
 still holds: nothing reaches a customer before 2d, and 2d stays hard-gated on O-C and O-D.
 
+### 2c-i BUILT (2026-10-01, branch `feat/lookup-1b2c-i-deadline-flag`), before the Codex diff review
+- `contact_lookup_action.py`:
+  - `ACTION_DEADLINE_SECONDS = 1800`. Every move INTO `running` adds `AND created_at > now()
+    - deadline` to its CAS (AA1), so a late delivery is `not_dispatching` and buys nothing.
+  - `FLAGGABLE = {"claimed"}` + `_flag()`: it sets or clears `status_reason` while the status
+    stays put, writes an event (`claimed → claimed`, the reason or `flag_cleared`), and returns
+    True only on a CHANGE (AA3).
+- `skip_trace_usage.py`: `queue_accepted_all(db, queue_id) -> bool` is the extracted rule.
+  `report_usage_from_webhook` calls it; `bool(None)` is False, exactly as billing read the
+  empty result.
+- **Tests:**
+  - deadline −60 s claims; +1 s buys nothing and stays `dispatching`;
+  - flag set / no-change / clear / no-change, with the events;
+  - non-flaggable statuses raise; a flag on an action in another status changes nothing;
+  - `queue_accepted_all` for uploaded 3/4/2/0 against 3 stamped rows, and for an empty queue.
+    (`rows_uploaded` is NOT NULL, so a NULL case cannot exist.)
+- **Mutations: 9/9 caught:**
+  - the deadline dropped, and inverted;
+  - the flag: non-change reported, any status, no event, status ignored;
+  - `>` for `>=`;
+  - billing ignoring the rule;
+  - None read as accepted.
+- **A trap hit here (memory `killed_mutation_runner_leaves_the_mutant`):** the first runner was
+  killed by its outer timeout during the last mutant. Its `finally` never ran, so
+  `queue_accepted_all` was left INVERTED in the working tree. A diff `--stat` looked clean. A
+  content check caught it, it was fixed, and the mutant was re-run alone.
+- **Regression: 695 passed, 0 failed** (14 files touching billing, ingest, the action, the
+  ledger and the claim; 2 chunks). ruff clean.
+
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever
       the tab has leads that have never been looked up; when the quote comes back with

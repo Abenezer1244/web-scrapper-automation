@@ -19,10 +19,11 @@ never waited on), every move through the ONE state machine in
                  once nothing is left (V4). A lead whose outcome nobody can know yet
                  flags the action for a human instead (AA4, AA8), once (AA3).
 
-IT NEVER BILLS. Billing happens per pending row at ingest. The only billing call here
-is `queue_accepted_all`, a read, so an action's `unmatched` lead is called billable
-exactly when billing's rule says so (V2, W3). Until O-C persists the decision billing
-made, this recomputes the same rule (AA2); 2d is gated on O-C, so no customer sees it.
+IT NEVER BILLS. Billing happens per pending row at ingest, and it records on the queue
+the decision it made for `unmatched` rows (`skip_trace_queues.unmatched_billed`, O-C).
+An action's `unmatched` lead reads THAT decision, never a rule re-run later (AA2), so
+the action states what billing did. A lead whose queue carries no decision is not
+guessed: the action is flagged `billing_decision_unknown` for a human.
 
 FAIRNESS (AA5, AB2, AC1-AC3). Every selection is per action (EXISTS, never a join one
 action can fill), bounded, skips rows another transaction holds BEFORE its LIMIT (so a
@@ -56,8 +57,10 @@ _REPUBLISH_EVERY_S = 300
 # Why a claimed action waits for a human (`status_reason`), in reporting priority.
 FLAG_PENDING_ROW_MISSING = "pending_row_missing"
 FLAG_RESULT_STATE_UNEXPECTED = "result_state_unexpected"
+FLAG_BILLING_DECISION_UNKNOWN = "billing_decision_unknown"
 FLAG_PROVIDER_RECONCILIATION = "provider_reconciliation_required"
-FLAGS = (FLAG_PENDING_ROW_MISSING, FLAG_RESULT_STATE_UNEXPECTED, FLAG_PROVIDER_RECONCILIATION)
+FLAGS = (FLAG_PENDING_ROW_MISSING, FLAG_RESULT_STATE_UNEXPECTED,
+         FLAG_BILLING_DECISION_UNKNOWN, FLAG_PROVIDER_RECONCILIATION)
 
 _BILLABLE_VERDICTS = ("answered_hit", "answered_miss", "unmatched_billable")
 
@@ -83,7 +86,7 @@ _LEADS_OF_A = (
     "   AND c.disposition = 'newly_queued' "
 )
 
-# The four blockers (AB2): each an EXISTS over action `a`, mirroring the visit.
+# The blockers (AB2, O-C): each an EXISTS over action `a`, mirroring the visit.
 _STALE_SUBMITTING = (f"EXISTS ({_LEADS_OF_A} AND p.status = 'submitting' "
                      "AND p.submitted_at < now() - make_interval(secs => :stale_s))")
 _SUBMITTED_IN_ERRORED_QUEUE = (f"EXISTS ({_LEADS_OF_A} AND p.status = 'submitted' "
@@ -92,10 +95,16 @@ _ROW_MISSING = f"EXISTS ({_LEADS_OF_A} AND p.id IS NULL)"
 _RESULT_UNEXPECTED = (f"EXISTS ({_LEADS_OF_A} AND p.status = 'completed' "
                       "AND r.skip_trace_status IS DISTINCT FROM 'hit' "
                       "AND r.skip_trace_status IS DISTINCT FROM 'miss')")
+# An `unmatched` row whose queue holds no billing decision (or no queue row at all):
+# ingest writes both in one transaction, so this should never be seen; if it is, the
+# verdict is not guessed.
+_UNMATCHED_UNDECIDED = (f"EXISTS ({_LEADS_OF_A} AND p.status = 'unmatched' "
+                        "AND q.unmatched_billed IS NULL)")
 _ANY_BLOCKER = (f"({_STALE_SUBMITTING} OR {_SUBMITTED_IN_ERRORED_QUEUE} "
-                f"OR {_ROW_MISSING} OR {_RESULT_UNEXPECTED})")
+                f"OR {_ROW_MISSING} OR {_RESULT_UNEXPECTED} OR {_UNMATCHED_UNDECIDED})")
 # A lead the visit can map right now.
-_MAPPABLE = (f"EXISTS ({_LEADS_OF_A} AND (p.status IN ('unmatched', 'errored', 'cancelled') "
+_MAPPABLE = (f"EXISTS ({_LEADS_OF_A} AND (p.status IN ('errored', 'cancelled') "
+             "OR (p.status = 'unmatched' AND q.unmatched_billed IS NOT NULL) "
              "OR (p.status = 'completed' AND r.skip_trace_status IN ('hit', 'miss'))))")
 _NOTHING_ACTIVE = (f"NOT EXISTS ({_LEADS_OF_A} "
                    "AND p.status IN ('queued', 'submitting', 'submitted'))")
@@ -270,15 +279,14 @@ def _p4_candidates(db) -> list[str]:
 def _settle(db, aid: str, row, summary: dict) -> Callable | None:
     """One claimed action, one transaction (V4). Returns the post-commit alert, if a
     flag was newly raised."""
-    from src.api.billing.skip_trace_usage import queue_accepted_all
     from src.workers.contact_lookup_action import _flag, _move, _set_verdicts
 
     uid = row.user_id
     leads = db.execute(
         text("SELECT c.result_id::text AS rid, p.id AS pending_id, p.status, "  # noqa: S608
-             "       p.tracerfy_queue_id AS qid, "
              "       p.submitted_at < now() - make_interval(secs => :stale_s) AS stale, "
-             "       q.status AS queue_status, r.skip_trace_status AS result_status "
+             "       q.status AS queue_status, q.unmatched_billed AS billed, "
+             "       r.skip_trace_status AS result_status "
              "FROM contact_lookup_action_results c" + _CURRENT_ROW +
              "LEFT JOIN skip_trace_queues q ON q.tracerfy_queue_id = p.tracerfy_queue_id "
              "LEFT JOIN results r ON r.id = c.result_id AND r.user_id = c.user_id "
@@ -289,7 +297,6 @@ def _settle(db, aid: str, row, summary: dict) -> Callable | None:
 
     verdicts: dict[str, str] = {}
     blockers: set[str] = set()
-    accepted: dict[int, bool] = {}  # once per distinct queue (AA6)
     for lead in leads:
         status = lead.status
         if lead.pending_id is None:
@@ -302,11 +309,11 @@ def _settle(db, aid: str, row, summary: dict) -> Callable | None:
             else:  # purged, anything else: never guessed (AA4)
                 blockers.add(FLAG_RESULT_STATE_UNEXPECTED)
         elif status == "unmatched":
-            if lead.qid not in accepted:
-                accepted[lead.qid] = (lead.qid is not None
-                                      and queue_accepted_all(db, lead.qid))
-            verdicts[lead.rid] = ("unmatched_billable" if accepted[lead.qid]
-                                  else "unmatched_unbilled")
+            if lead.billed is None:  # no decision recorded: never guessed
+                blockers.add(FLAG_BILLING_DECISION_UNKNOWN)
+            else:  # what billing DID for this queue (O-C)
+                verdicts[lead.rid] = ("unmatched_billable" if lead.billed
+                                      else "unmatched_unbilled")
         elif status == "errored":
             verdicts[lead.rid] = "errored_unsubmitted"
         elif status == "cancelled":
@@ -353,6 +360,8 @@ def _alert(aid: str, flag: str) -> None:
             f"Contact lookup action {aid} cannot settle on its own ({flag}). "
             "pending_row_missing: a lead it bought has no queue row. "
             "result_state_unexpected: a completed lookup's lead is neither hit nor miss. "
+            "billing_decision_unknown: an unmatched lookup's batch has no recorded billing "
+            "decision (unmatched_billed), so whether it was billed is not stated. "
             "provider_reconciliation_required: a lookup is stuck mid-submission or its "
             "Tracerfy batch errored. Nothing is billed by this reconciler; the action "
             "stays 'claimed' until the cause is resolved.",

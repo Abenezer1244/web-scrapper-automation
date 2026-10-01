@@ -90,8 +90,8 @@ def _seed(user_id: str, queue_id: int, addresses: list[tuple[str, str, str]]) ->
             text("""
                 INSERT INTO skip_trace_queues
                     (id, tracerfy_queue_id, job_id, user_id, trace_type, status,
-                     rows_uploaded, credits_deducted, submitted_at)
-                VALUES (:id, :q, :j, :u, 'normal', 'pending', :n, 0, now())
+                     rows_uploaded, rows_sent, credits_deducted, submitted_at)
+                VALUES (:id, :q, :j, :u, 'normal', 'pending', :n, :n, 0, now())
             """),
             {"id": str(uuid.uuid4()), "q": queue_id, "j": job_id, "u": user_id,
              "n": len(addresses)},
@@ -784,39 +784,144 @@ async def test_unmatched_settlement_cannot_touch_another_tenants_lead(
         assert str(owner) == str(uid), "a lead was settled under the wrong tenant"
 
 
-# ── queue_accepted_all: ONE rule for billing and the contact-lookup reconciler ─
+# ── O-C: billing decides on what was SENT, and records the decision ──────────
 
 
-@pytest.mark.parametrize(("uploaded", "expected"), [
-    (3, True),     # every row we sent was accepted
-    (4, True),     # more than we sent still covers it
-    (2, False),    # dropped or de-duplicated: unmatched is NOT billed
-    (0, False),    # the provider hid the count (an adopted queue records 0)
+def _set_queue(qid: int, **cols) -> None:
+    sets = ", ".join(f"{k} = :{k}" for k in cols)
+    with system_sync_session() as db:
+        db.execute(text(f"UPDATE skip_trace_queues SET {sets} "  # noqa: S608 - test literals
+                        "WHERE tracerfy_queue_id = :q"), {**cols, "q": qid})
+        db.commit()
+
+
+def _decision(qid: int):
+    with system_sync_session() as db:
+        return db.execute(text("SELECT unmatched_billed FROM skip_trace_queues "
+                               "WHERE tracerfy_queue_id = :q"), {"q": qid}).scalar_one()
+
+
+@pytest.mark.parametrize(("sent", "uploaded", "expected"), [
+    (3, 3, True),      # every row we sent was accepted
+    (3, 4, True),      # more than we sent still covers it
+    (3, 2, False),     # dropped or de-duplicated: unmatched is NOT billed
+    (3, 0, False),     # the provider hid the count (an adopted queue records 0)
+    (None, 3, False),  # recorded before 110: the sent count is not proven (owner, O-C)
+    (0, 0, False),     # no real batch sends nothing: not proven either
 ])
-async def test_queue_accepted_all_compares_the_upload_with_the_stamped_rows(
-    starter_user, uploaded, expected,
+async def test_queue_accepted_all_compares_the_upload_with_what_was_sent(
+    starter_user, sent, uploaded, expected,
 ):
     from src.api.billing.skip_trace_usage import queue_accepted_all
 
     qid = _next_queue_id()
     _seed(starter_user.id, qid, [("1 A ST", "SEATTLE", "WA"), ("2 B ST", "SEATTLE", "WA"),
                                  ("3 C ST", "SEATTLE", "WA")])
+    _set_queue(qid, rows_sent=sent, rows_uploaded=uploaded)
     with system_sync_session() as db:
-        db.execute(text("UPDATE skip_trace_queues SET rows_uploaded = :n "
-                        "WHERE tracerfy_queue_id = :q"), {"n": uploaded, "q": qid})
-        db.commit()
         assert queue_accepted_all(db, qid) is expected
 
 
 async def test_queue_accepted_all_is_false_for_a_queue_with_no_rows(starter_user):
-    """A real queue with nothing stamped on it, and a queue id that does not exist:
-    no row to compare is never 'accepted every row'."""
+    """A real queue that sent nothing, and a queue id that does not exist: neither
+    'accepted every row'."""
     from src.api.billing.skip_trace_usage import queue_accepted_all
 
     qid = _next_queue_id()
-    _seed(starter_user.id, qid, [])  # the queue row exists, rows_uploaded 0, no rows
+    _seed(starter_user.id, qid, [])  # the queue row exists, sent 0, uploaded 0
     with system_sync_session() as db:
         assert db.execute(text("SELECT count(*) FROM skip_trace_queues "
                                 "WHERE tracerfy_queue_id = :q"), {"q": qid}).scalar_one() == 1
         assert queue_accepted_all(db, qid) is False
         assert queue_accepted_all(db, _next_queue_id()) is False
+
+
+@pytest.mark.asyncio
+async def test_a_row_sent_but_never_stamped_suppresses_unmatched_billing(
+    starter_user, _stub_csv,
+):
+    """THE W3 regression. The batch sent 4, but partial bookkeeping stamped only 3 with
+    the queue, and Tracerfy uploaded 3: a row was dropped. Comparing the upload with
+    the STAMPED rows (3 >= 3) billed the unmatched row; comparing with what was SENT
+    (3 < 4) bills reconciled rows only."""
+    qid = _next_queue_id()
+    seed = _seed(starter_user.id, qid, [
+        ("1 W3 ST", "TACOMA", "WA"), ("2 W3 ST", "TACOMA", "WA"), ("3 W3 ST", "TACOMA", "WA"),
+    ])
+    _set_queue(qid, rows_sent=4)
+    before = _usage(starter_user.id)
+    _stub_csv(_csv("1 W3 ST,TACOMA,WA,J,D,2065550501,Mobile,2065550501,,,,\n"
+                   "2 W3 ST,TACOMA,WA,J,D,2065550502,Mobile,2065550502,,,,"))
+
+    out = ingest_tracerfy_batch(queue_id=qid, download_url=DOWNLOAD_URL)
+
+    assert out["unmatched_rows"] == 1
+    assert _pending_status(seed["rows"][2]["pending_id"]) == "unmatched"
+    assert _usage(starter_user.id) == before + 2  # the two answered, not the third
+    assert _decision(qid) is False
+
+
+@pytest.mark.asyncio
+async def test_a_legacy_queue_without_a_sent_count_bills_completed_only(
+    starter_user, _stub_csv,
+):
+    """Owner, O-C: a queue recorded before 110 cannot prove what it sent, so its
+    unmatched rows are not billed, even though the upload covers the stamped rows."""
+    qid = _next_queue_id()
+    _seed(starter_user.id, qid, [("1 OLD ST", "TACOMA", "WA"), ("2 OLD ST", "TACOMA", "WA")])
+    _set_queue(qid, rows_sent=None)
+    before = _usage(starter_user.id)
+    _stub_csv(_csv("1 OLD ST,TACOMA,WA,J,D,2065550503,Mobile,2065550503,,,,"))
+
+    ingest_tracerfy_batch(queue_id=qid, download_url=DOWNLOAD_URL)
+
+    assert _usage(starter_user.id) == before + 1
+    assert _decision(qid) is False
+
+
+@pytest.mark.asyncio
+async def test_billing_records_its_decision_when_unmatched_rows_bill(starter_user, _stub_csv):
+    qid = _next_queue_id()
+    _seed(starter_user.id, qid, [("1 YES ST", "TACOMA", "WA"), ("2 YES ST", "TACOMA", "WA")])
+    assert _decision(qid) is None
+    before = _usage(starter_user.id)
+    _stub_csv(_csv("1 YES ST,TACOMA,WA,J,D,2065550504,Mobile,2065550504,,,,"))
+
+    ingest_tracerfy_batch(queue_id=qid, download_url=DOWNLOAD_URL)
+
+    assert _usage(starter_user.id) == before + 2
+    assert _decision(qid) is True
+
+
+@pytest.mark.parametrize(("sent", "decided"), [(2, True), (3, False)])
+@pytest.mark.asyncio
+async def test_the_decision_is_recorded_with_no_unmatched_row(
+    starter_user, _stub_csv, sent, decided,
+):
+    """Every billed queue records its decision, not only one with unmatched rows
+    (consult AH2): both leads answered; sent 2 of 2, or sent 3 with 2 uploaded."""
+    qid = _next_queue_id()
+    _seed(starter_user.id, qid, [("1 ALL ST", "TACOMA", "WA"), ("2 ALL ST", "TACOMA", "WA")])
+    _set_queue(qid, rows_sent=sent)
+    before = _usage(starter_user.id)
+    _stub_csv(_csv("1 ALL ST,TACOMA,WA,J,D,2065550505,Mobile,2065550505,,,,\n"
+                   "2 ALL ST,TACOMA,WA,J,D,2065550506,Mobile,2065550506,,,,"))
+
+    out = ingest_tracerfy_batch(queue_id=qid, download_url=DOWNLOAD_URL)
+
+    assert out["unmatched_rows"] == 0
+    assert _usage(starter_user.id) == before + 2
+    assert _decision(qid) is decided
+
+
+@pytest.mark.asyncio
+async def test_a_recorded_decision_is_never_rewritten(starter_user, _stub_csv):
+    """Written once (`unmatched_billed IS NULL`): a value already on the queue stays."""
+    qid = _next_queue_id()
+    _seed(starter_user.id, qid, [("1 ONCE ST", "TACOMA", "WA"), ("2 ONCE ST", "TACOMA", "WA")])
+    _set_queue(qid, unmatched_billed=False)
+    _stub_csv(_csv("1 ONCE ST,TACOMA,WA,J,D,2065550507,Mobile,2065550507,,,,"))
+
+    ingest_tracerfy_batch(queue_id=qid, download_url=DOWNLOAD_URL)
+
+    assert _decision(qid) is False

@@ -68,17 +68,29 @@ def _result(rid: str, status: str | None) -> None:
         s.commit()
 
 
-def _queue(user_id: str, job: str, *, uploaded: int, status: str = "completed") -> int:
+def _queue(user_id: str, job: str, *, uploaded: int, status: str = "completed",
+           sent: int | None = None, decision: bool | None = None) -> int:
+    """A Tracerfy queue row. `sent` is what the dispatcher records (`rows_sent`);
+    `decision` is what billing recorded for its unmatched rows (`unmatched_billed`),
+    NULL until billing runs."""
     qid = 7_000_000 + uuid.uuid4().int % 1_000_000_000
     with system_sync_session() as s:
         s.execute(text(
             "INSERT INTO skip_trace_queues (id, tracerfy_queue_id, job_id, user_id, "
-            "  trace_type, status, rows_uploaded, credits_deducted, submitted_at) "
-            "VALUES (:id, :q, :j, :u, 'normal', :st, :n, :n, now())"),
+            "  trace_type, status, rows_uploaded, rows_sent, unmatched_billed, "
+            "  credits_deducted, submitted_at) "
+            "VALUES (:id, :q, :j, :u, 'normal', :st, :n, :sent, :d, :n, now())"),
             {"id": str(uuid.uuid4()), "q": qid, "j": job, "u": user_id, "st": status,
-             "n": uploaded})
+             "n": uploaded, "sent": sent, "d": decision})
         s.commit()
     return qid
+
+
+def _decide(qid: int, decision: bool | None) -> None:
+    with system_sync_session() as s:
+        s.execute(text("UPDATE skip_trace_queues SET unmatched_billed = :d "
+                       "WHERE tracerfy_queue_id = :q"), {"d": decision, "q": qid})
+        s.commit()
 
 
 def _tick() -> dict:
@@ -109,8 +121,9 @@ async def test_every_pending_outcome_maps_to_its_verdict_and_the_action_settles(
 ):
     uid = business_user.id
     aid, job, (hit, miss, um_ok, um_short, err, cxl) = _claimed(uid, 6)
-    full = _queue(uid, job, uploaded=3)    # 3 rows stamped below, 3 uploaded
-    short = _queue(uid, job, uploaded=0)   # the upload shrank: unmatched not billed
+    # Billing billed this queue's unmatched rows, and did not bill that one's.
+    full = _queue(uid, job, uploaded=3, sent=3, decision=True)
+    short = _queue(uid, job, uploaded=0, sent=3, decision=False)
     _row(aid, hit, "completed", queue=full)
     _result(hit, "hit")
     _row(aid, miss, "completed", queue=full)
@@ -134,13 +147,16 @@ async def test_every_pending_outcome_maps_to_its_verdict_and_the_action_settles(
 async def test_the_billable_verdict_is_what_billing_charged_for_that_queue(
     db, business_user, lookups_on,
 ):
-    """Parity (V2, W3): per queue, billing's billed row count for this user equals the
-    action's billable verdicts in that queue."""
+    """Parity (V2, W3, AA2): per queue, billing's billed row count for this user equals
+    the action's billable verdicts in that queue. Billing runs for REAL and commits, as
+    ingest does, so the reconciler reads the decision billing recorded (AD3)."""
     from src.api.billing.skip_trace_usage import report_usage_from_webhook
 
     uid = business_user.id
     aid, job, (a1, a2, b1, b2) = _claimed(uid, 4)
-    full, short = _queue(uid, job, uploaded=2), _queue(uid, job, uploaded=1)
+    # Both batches sent 2; Tracerfy uploaded 2 of one and 1 of the other.
+    full = _queue(uid, job, uploaded=2, sent=2)
+    short = _queue(uid, job, uploaded=1, sent=2)
     for rid, q in ((a1, full), (a2, full), (b1, short), (b2, short)):
         _row(aid, rid, "unmatched", queue=q)
     _row(aid, b2, "completed")
@@ -151,7 +167,7 @@ async def test_the_billable_verdict_is_what_billing_charged_for_that_queue(
         for q in (full, short):
             users = report_usage_from_webhook(s, q)["users"]
             billed[q] = sum(u["n"] for u in users)
-        s.rollback()  # read billing's decision, apply none of its writes
+        s.commit()
     _tick()
     v = _verdicts(aid)
     billable = {"answered_hit", "answered_miss", "unmatched_billable"}
@@ -254,27 +270,62 @@ async def test_a_fresh_submitting_row_is_not_stuck(db, business_user, lookups_on
     assert (st.status, st.status_reason) == ("claimed", None) and alerts == []
 
 
-async def test_accepted_all_is_asked_once_per_distinct_queue(
-    db, business_user, lookups_on, monkeypatch,
+async def test_the_verdict_is_the_recorded_decision_not_a_recomputed_rule(
+    db, business_user, lookups_on,
 ):
-    from src.api.billing import skip_trace_usage
-
-    calls: list = []
-    real = skip_trace_usage.queue_accepted_all
-
-    def spy(db_, queue_id):
-        calls.append(queue_id)
-        return real(db_, queue_id)
-
-    monkeypatch.setattr(skip_trace_usage, "queue_accepted_all", spy)
+    """AA2 / AD5: each queue's counts are then rewritten the OPPOSITE way to its
+    recorded decision. The verdicts follow what billing did, never the rule re-run."""
     uid = business_user.id
     aid, job, (a, b, c) = _claimed(uid, 3)
-    one, two = _queue(uid, job, uploaded=2), _queue(uid, job, uploaded=1)
-    _row(aid, a, "unmatched", queue=one)
-    _row(aid, b, "unmatched", queue=one)
-    _row(aid, c, "unmatched", queue=two)
+    billed = _queue(uid, job, uploaded=0, sent=2, decision=True)     # rule now: False
+    unbilled = _queue(uid, job, uploaded=5, sent=1, decision=False)  # rule now: True
+    _row(aid, a, "unmatched", queue=billed)
+    _row(aid, b, "unmatched", queue=billed)
+    _row(aid, c, "unmatched", queue=unbilled)
+
     _tick()
-    assert sorted(calls) == sorted([one, two])
+
+    assert _verdicts(aid) == {a: "unmatched_billable", b: "unmatched_billable",
+                              c: "unmatched_unbilled"}
+    st = _state(aid)
+    assert (st.status, st.billable_rows) == ("settled", 2)
+
+
+@pytest.mark.parametrize("queue_row", ["undecided", "absent"])
+async def test_an_unmatched_lead_without_a_billing_decision_is_flagged_never_guessed(
+    db, business_user, lookups_on, alerts, queue_row,
+):
+    """No decision on its queue (NULL), or no queue row at all (AH3): the lead is not
+    mapped either way, the action is flagged ONCE, and nothing settles. When a
+    decision appears, the lead maps and the action settles.
+
+    The other lead stays IN FLIGHT while the flag is raised, so nothing is mappable
+    and nothing can settle: the blocker alone must select the action (group c)."""
+    uid = business_user.id
+    aid, job, (lead, other) = _claimed(uid, 2)
+    qid = (_queue(uid, job, uploaded=1, sent=1) if queue_row == "undecided"
+           else 7_000_000 + uuid.uuid4().int % 1_000_000_000)
+    _row(aid, lead, "unmatched", queue=qid)
+
+    _tick()
+    _tick()
+
+    assert _verdicts(aid)[lead] == "newly_queued"
+    st = _state(aid)
+    assert (st.status, st.status_reason) == ("claimed", rec.FLAG_BILLING_DECISION_UNKNOWN)
+    assert [a for a in alerts if rec.FLAG_BILLING_DECISION_UNKNOWN in a[1]] != []
+    assert len([a for a in alerts if aid in a[1]]) == 1
+
+    if queue_row == "absent":
+        qid = _queue(uid, job, uploaded=1, sent=1)
+        _row(aid, lead, "unmatched", queue=qid)
+    _decide(qid, False)
+    _row(aid, other, "cancelled")
+    _tick()
+
+    assert _verdicts(aid)[lead] == "unmatched_unbilled"
+    st = _state(aid)
+    assert (st.status, st.status_reason) == ("settled", None)
 
 
 # ── P1 expire, P2 lease, P3 re-publish ───────────────────────────────────────
@@ -456,6 +507,10 @@ async def test_a_permanently_blocked_action_never_starves_the_others(
     odd, _job_c, (odd_rid,) = _claimed(uid, 1)
     _row(odd, odd_rid, "completed")
     _result(odd_rid, "purged")
+    # And an `unmatched` lead whose queue holds no billing decision (O-C): it must not
+    # count as mappable either, or it would hold (a)'s slot on every tick.
+    undecided, job_u, (und_rid,) = _claimed(uid, 1)
+    _row(undecided, und_rid, "unmatched", queue=_queue(uid, job_u, uploaded=1, sent=1))
     # Each other action has one answered lead AND one still in flight, so the ONLY
     # group that can reach it is (a): a blocked action holding (a)'s slot would starve it.
     others = []
@@ -470,7 +525,8 @@ async def test_a_permanently_blocked_action_never_starves_the_others(
     assert [_verdicts(a)[w] for a, _r, w in others] == ["newly_queued"] * 3
     assert _state(blocked).status_reason == rec.FLAG_PENDING_ROW_MISSING
     assert _state(odd).status_reason == rec.FLAG_RESULT_STATE_UNEXPECTED
-    assert len(alerts) == 2
+    assert _state(undecided).status_reason == rec.FLAG_BILLING_DECISION_UNKNOWN
+    assert len(alerts) == 3
 
 
 async def test_one_action_with_many_rows_is_one_candidate(db, business_user, lookups_on):

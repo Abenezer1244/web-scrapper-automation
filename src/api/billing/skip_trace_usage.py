@@ -535,26 +535,25 @@ def report_meter_event_to_stripe(
 
 
 def queue_accepted_all(db, queue_id: int) -> bool:
-    """True when Tracerfy demonstrably accepted EVERY row we sent in this batch, so
+    """True when Tracerfy demonstrably accepted EVERY row we SENT in this batch, so
     its 'unmatched' rows were genuinely performed and paid for (see
-    report_usage_from_webhook for the rule and why).
+    report_usage_from_webhook for the rule and why). A read; it never bills.
 
-    ONE rule, two callers (Phase 1b-2, V2/W3): billing decides with it, and the
-    contact-lookup reconciler maps an action's 'unmatched' leads to
-    'unmatched_billable' / 'unmatched_unbilled' with it, so the action page cannot
-    disagree with the rule billing applies. A read; it never bills.
+    "Sent" is `rows_sent`, the POST's size recorded by the dispatcher with the queue
+    row (O-C, migration 110). It used to be the rows STAMPED with the queue id, which
+    misses a row that was sent but never stamped: _persist_submission only alerts
+    when fewer rows move than were claimed, so 4 sent / 3 stamped / 3 uploaded read
+    as "all accepted" although a row was dropped (Phase 1b-2, W3).
 
-    False when the queue has no stamped rows at all (no row to compare), exactly as
-    billing has always read the empty result.
+    False, so `completed` rows only, when the sent count is not proven: NULL (a queue
+    recorded before 110, owner's O-C rule) or 0 (no real batch sends nothing), and
+    for an unknown queue.
     """
     return bool(db.execute(
         text("""
-            SELECT COALESCE(q.rows_uploaded, 0) >= COUNT(p.id)
-            FROM skip_trace_queues q
-            JOIN pending_skip_trace_rows p
-              ON p.tracerfy_queue_id = q.tracerfy_queue_id
-            WHERE q.tracerfy_queue_id = :qid
-            GROUP BY q.rows_uploaded
+            SELECT rows_sent > 0 AND rows_uploaded >= rows_sent
+            FROM skip_trace_queues
+            WHERE tracerfy_queue_id = :qid
         """),
         {"qid": queue_id},
     ).scalar())
@@ -638,14 +637,25 @@ def report_usage_from_webhook(db, queue_id: int) -> dict:
     # deduped and every unmatched row was genuinely paid for. If it does not,
     # this batch bills 'completed' rows only -- erring toward the customer.
     accepted_all = queue_accepted_all(db, queue_id)
+    # Persist the decision, once, in the caller's transaction (O-C, AA2): it commits
+    # with the counters and the outbox or not at all. The contact-lookup reconciler
+    # reads THIS instead of re-running the rule later, so an action states what
+    # billing did. Written for every queue billed, unmatched rows or not.
+    db.execute(
+        text("""
+            UPDATE skip_trace_queues SET unmatched_billed = :decided
+            WHERE tracerfy_queue_id = :qid AND unmatched_billed IS NULL
+        """),
+        {"decided": accepted_all, "qid": queue_id},
+    )
 
     billable_states = ("completed", "unmatched") if accepted_all else ("completed",)
     if not accepted_all:
         _logger.warning(
             "Skip-trace billing queue %d: Tracerfy uploaded fewer rows than we "
-            "submitted (dropped or de-duplicated), so unmatched rows are NOT "
-            "billed for this batch — the customer is not charged for a lookup "
-            "the provider never ran.",
+            "sent (dropped or de-duplicated), or the sent count was never recorded, "
+            "so unmatched rows are NOT billed for this batch — the customer is not "
+            "charged for a lookup the provider may never have run.",
             queue_id,
         )
 

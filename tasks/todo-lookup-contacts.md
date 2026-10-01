@@ -4833,7 +4833,20 @@ trusted-worker risk; the RLS hardening is the owner's call (and, if wanted, befo
   - **`skip_trace_cache`: PRE-EXISTING DRIFT.** The section 7 retention purge's DELETE would
     fail with InsufficientPrivilege.
   `--apply` would grant BOTH. **Asked of the owner:** apply both, or only the O-D grant.
-- Still with the owner: AK2 (the RLS DELETE-policy hardening), and then 2d.
+- **OWNER DECISIONS (2026-10-01):** apply BOTH grants; **AK2 ACCEPTED** (the table-wide
+  worker DELETE is an owner-accepted trusted-worker risk; no RLS DELETE policy); **START 2d**;
+  a BUILD_JOURNAL entry: yes.
+- **APPLIED IN PRODUCTION (2026-10-01):** `verify_worker_delete_grants.py --apply` (main's copy,
+  byte-identical, `DATABASE_URL_MIGRATE`): "repaired: granted DELETE on skip_trace_cache,
+  pending_skip_trace_rows". Verified read-only afterwards (AK5):
+  - the report: DELETE held on all 8 required tables;
+  - `priv_check.py`: the role is NOSUPERUSER + NOBYPASSRLS; pending rows S/I/U/D; events
+    still S/I only; RLS enabled + forced; only the policy `pending_skip_trace_rows_system`
+    (ALL, system);
+  - `bridgeleads_app` holds NO privilege on `pending_skip_trace_rows`;
+  - worker logs: 0 `InsufficientPrivilege`.
+
+  **O-D is DONE. Both 2d gates (O-C, O-D) are met.** The skip_trace_cache drift is fixed with it.
 
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever

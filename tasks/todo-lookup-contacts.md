@@ -4083,6 +4083,15 @@ still holds: nothing reaches a customer before 2d, and 2d stays hard-gated on O-
   content check caught it, it was fixed, and the mutant was re-run alone.
 - **Regression: 695 passed, 0 failed** (14 files touching billing, ingest, the action, the
   ledger and the claim; 2 chunks). ruff clean.
+- **Codex diff review r1 (three-dot): GATE: GO, 2 P3.**
+  - **Empty queue: fixed.** The test now seeds a REAL queue with zero stamped rows (and still
+    checks an unknown id).
+  - **Exact-deadline `>` vs `>=`: accepted as EQUIVALENT at wall-clock resolution.** The CAS
+    compares with the database's own `now()` inside its transaction, and the clock advances
+    after the test's backdate, so the exact microsecond is not observable. A test asserting
+    the SQL text would copy the implementation (memory
+    `a_test_that_copies_its_impl_asserts_nothing`). The −60 s / +1 s cases pin the side of the
+    deadline.
 
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever

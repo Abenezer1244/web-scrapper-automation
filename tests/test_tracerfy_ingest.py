@@ -809,7 +809,14 @@ async def test_queue_accepted_all_compares_the_upload_with_the_stamped_rows(
 
 
 async def test_queue_accepted_all_is_false_for_a_queue_with_no_rows(starter_user):
+    """A real queue with nothing stamped on it, and a queue id that does not exist:
+    no row to compare is never 'accepted every row'."""
     from src.api.billing.skip_trace_usage import queue_accepted_all
 
+    qid = _next_queue_id()
+    _seed(starter_user.id, qid, [])  # the queue row exists, rows_uploaded 0, no rows
     with system_sync_session() as db:
-        assert queue_accepted_all(db, 999_999_001) is False
+        assert db.execute(text("SELECT count(*) FROM skip_trace_queues "
+                                "WHERE tracerfy_queue_id = :q"), {"q": qid}).scalar_one() == 1
+        assert queue_accepted_all(db, qid) is False
+        assert queue_accepted_all(db, _next_queue_id()) is False

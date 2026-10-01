@@ -1,15 +1,10 @@
-"""AI mode removal, Phase 2b: every writer stores scraper_mode 'template', and
-migration 108 moves the existing 'ai' rows.
-
-2a (live) taught every reader both names. 2b switches the writers and migrates
-the rows; an incoming 'ai' is still accepted (the admin page sends it until
-Phase 4) but is stored as 'template' and logged, so 2c can retire it once the
-logs and the table both show zero.
+"""Every writer stores scraper_mode 'template' (AI-mode removal 2b, migration 108),
+and the old name 'ai' is refused (2c): by the API, and by the database CHECK that
+migration 109 adds after sweeping any straggler.
 
 Real DB rows, the real admin step-up gate, and the real migration module.
 """
 import importlib.util
-import logging
 import uuid
 from pathlib import Path
 
@@ -83,36 +78,19 @@ async def test_a_connector_created_without_a_mode_is_stored_as_template(
     assert await _stored_mode(db, county) == "template"
 
 
-async def test_a_legacy_ai_input_is_stored_as_template_and_logged(
-    client: AsyncClient, db, admin_headers, counties, caplog,
+async def test_an_explicit_template_input_is_stored(
+    client: AsyncClient, db, admin_headers, counties,
 ):
-    """REGRESSION: main stored 'ai' and logged nothing. The admin page sends 'ai'
-    until Phase 4; 2c retires the alias only after this log line stays at zero."""
     county = counties()
-    with caplog.at_level(logging.INFO, logger="api.scrapers"):
-        r = await _create(client, admin_headers, county, scraper_mode="ai")
+    r = await _create(client, admin_headers, county, scraper_mode="template")
     assert r.status_code == 201, r.text
     assert await _stored_mode(db, county) == "template"
-    legacy = [rec for rec in caplog.records
-              if rec.name == "api.scrapers" and "legacy scraper_mode 'ai'" in rec.getMessage()]
-    assert len(legacy) == 1 and county in legacy[0].getMessage()
 
 
-async def test_an_explicit_template_input_is_stored_and_not_logged_as_legacy(
-    client: AsyncClient, db, admin_headers, counties, caplog,
-):
-    """REGRESSION: main refused 'template' with 400 (it accepted only 'ai')."""
-    county = counties()
-    with caplog.at_level(logging.INFO, logger="api.scrapers"):
-        r = await _create(client, admin_headers, county, scraper_mode="template")
-    assert r.status_code == 201, r.text
-    assert await _stored_mode(db, county) == "template"
-    assert not [rec for rec in caplog.records if "legacy scraper_mode" in rec.getMessage()]
-
-
-@pytest.mark.parametrize("mode", ["manual", "AI", " ai", "Template", "bogus"])
+@pytest.mark.parametrize("mode", ["ai", "manual", "AI", " ai", "Template", "bogus"])
 async def test_any_other_mode_is_refused(client: AsyncClient, db, admin_headers, counties, mode):
-    """CONTROL: the route creates template connectors only, and the alias is exactly 'ai'."""
+    """REGRESSION for 'ai' (2b normalized it to 'template' and stored the row); CONTROL
+    for the rest: the route creates template connectors only."""
     county = counties()
     r = await _create(client, admin_headers, county, scraper_mode=mode)
     assert r.status_code in (400, 422), r.text
@@ -155,15 +133,19 @@ async def test_a_raw_sql_insert_without_a_mode_defaults_to_template(db, counties
     assert await _stored_mode(db, county) == "template"
 
 
-# ─── migration 108 ────────────────────────────────────────────────────────────
+# ─── migrations 108 and 109 ───────────────────────────────────────────────────
 
-def _mig108():
+def _mig(rev: str):
     path = next((Path(__file__).resolve().parents[1] / "alembic" / "versions")
-                .glob("108_*.py"))
-    spec = importlib.util.spec_from_file_location("_mig108", path)
+                .glob(f"{rev}_*.py"))
+    spec = importlib.util.spec_from_file_location(f"_mig{rev}", path)
     mig = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mig)
     return mig
+
+
+def _mig108():
+    return _mig("108")
 
 
 def _column_default(conn) -> str:
@@ -205,6 +187,7 @@ def test_108_moves_ai_rows_to_template_and_leaves_manual_alone():
         trans = conn.begin()
         try:
             with Operations.context(MigrationContext.configure(conn)):
+                _mig("109").downgrade()  # drop 2c's CHECK so an 'ai' row can be seeded
                 mig.downgrade()  # back to the 2a schema: server default 'ai'
                 assert _column_default(conn) == "'ai'::character varying"
                 _seed(conn, ai_county, "ai")
@@ -228,6 +211,8 @@ def test_108_aborts_on_an_unknown_mode():
     with sync_engine.connect() as conn:
         trans = conn.begin()
         try:
+            with Operations.context(MigrationContext.configure(conn)):
+                _mig("109").downgrade()
             _seed(conn, f"m108x{uuid.uuid4().hex[:6]}", "bogus")
             with Operations.context(MigrationContext.configure(conn)), \
                     pytest.raises(RuntimeError, match="unknown scraper_mode"):
@@ -258,3 +243,99 @@ def test_after_108_every_template_url_shape_still_resolves():
     assert connector_scraper_class(
         row("https://okanogancountywa-web.tylerhost.net/Web")
     ) is TylerSelfServiceScraper
+
+# ─── 2c: 'ai' is refused by the database (migration 109) ──────────────────────
+
+def _check_state(conn):
+    return conn.execute(text(
+        "SELECT pg_get_constraintdef(oid), convalidated FROM pg_constraint "
+        "WHERE conname = 'ck_county_connectors_scraper_mode' "
+        "AND conrelid = 'public.county_connectors'::regclass"
+    )).one_or_none()
+
+
+def test_109_chains_on_108():
+    mig = _mig("109")
+    assert (mig.revision, mig.down_revision) == ("109", "108")
+
+
+@pytest.mark.parametrize("mode", ["ai", "bogus"])
+def test_the_database_refuses_a_mode_other_than_template_or_manual(mode):
+    """REGRESSION for 'ai': before 109 nothing below the API stopped a writer storing it."""
+    from sqlalchemy.exc import IntegrityError
+
+    with sync_engine.connect() as conn:
+        trans = conn.begin()
+        try:
+            with pytest.raises(IntegrityError, match="ck_county_connectors_scraper_mode"):
+                _seed(conn, f"m109r{uuid.uuid4().hex[:6]}", mode)
+        finally:
+            trans.rollback()
+
+
+def test_109_sweeps_a_straggler_then_validates_the_check():
+    """An 'ai' row an old 2a API wrote during 2b's rolling deploy becomes 'template'."""
+    mig = _mig("109")
+    straggler = f"m109s{uuid.uuid4().hex[:6]}"
+    with sync_engine.connect() as conn:
+        trans = conn.begin()
+        try:
+            with Operations.context(MigrationContext.configure(conn)):
+                mig.downgrade()
+                assert _check_state(conn) is None
+                _seed(conn, straggler, "ai")
+                mig.upgrade()
+            assert _modes(conn, [straggler]) == {straggler: "template"}
+            definition, validated = _check_state(conn)
+            assert definition == mig._CHECK_DEF and validated is True
+        finally:
+            trans.rollback()
+
+
+def test_109_is_replay_safe():
+    """Run again on a database that already has the right CHECK: a no-op."""
+    mig = _mig("109")
+    with sync_engine.connect() as conn:
+        trans = conn.begin()
+        try:
+            assert _check_state(conn) is not None  # head already has it
+            with Operations.context(MigrationContext.configure(conn)):
+                mig.upgrade()
+            definition, validated = _check_state(conn)
+            assert definition == mig._CHECK_DEF and validated is True
+        finally:
+            trans.rollback()
+
+
+def test_109_aborts_on_an_unknown_mode():
+    mig = _mig("109")
+    with sync_engine.connect() as conn:
+        trans = conn.begin()
+        try:
+            with Operations.context(MigrationContext.configure(conn)):
+                mig.downgrade()
+            _seed(conn, f"m109x{uuid.uuid4().hex[:6]}", "bogus")
+            with Operations.context(MigrationContext.configure(conn)), \
+                    pytest.raises(RuntimeError, match="unknown scraper_mode"):
+                mig.upgrade()
+        finally:
+            trans.rollback()
+
+
+def test_109_refuses_an_impostor_constraint_of_the_same_name():
+    """A same-named constraint with another definition is never silently replaced."""
+    mig = _mig("109")
+    with sync_engine.connect() as conn:
+        trans = conn.begin()
+        try:
+            with Operations.context(MigrationContext.configure(conn)):
+                mig.downgrade()
+            conn.execute(text(
+                "ALTER TABLE county_connectors ADD CONSTRAINT ck_county_connectors_scraper_mode "
+                "CHECK (scraper_mode <> '')"
+            ))
+            with Operations.context(MigrationContext.configure(conn)), \
+                    pytest.raises(RuntimeError, match="Inspect it by hand"):
+                mig.upgrade()
+        finally:
+            trans.rollback()

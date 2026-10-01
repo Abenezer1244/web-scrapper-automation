@@ -44,6 +44,7 @@ REQUIRED_DELETE_TABLES = (
     "mfa_break_glass_codes",
     "pending_registrations",
     "skip_trace_cache",
+    "pending_skip_trace_rows",  # O-D: the claim's lost-race withdrawal
 )
 ROLE = "bridgeleads_system"
 

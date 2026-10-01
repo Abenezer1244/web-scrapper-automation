@@ -112,3 +112,89 @@ def test_alert_helper_is_not_passed_an_orm_attribute():
         assert "job.user_id" not in call, (
             "pass the cached _boot_user_id, not the ORM attribute job.user_id: " + call
         )
+
+
+# ── O-D: pending_skip_trace_rows ─────────────────────────────────────────────
+
+
+def _quoted_tables(text_: str, name: str) -> set[str]:
+    block = re.search(name + r"\s*=\s*\((.*?)\)", text_, re.DOTALL)
+    assert block, f"{name} not found"
+    return set(re.findall(r'"([a-z_]+)"', block.group(1)))
+
+
+def test_pending_skip_trace_rows_delete_is_granted_in_both_files():
+    """Pinned like delivered_records: without it the claim's lost-race withdrawal
+    raises and rolls back the whole claim, live scrape enqueue included (O-D)."""
+    for path in (_SQL, _PY):
+        assert "pending_skip_trace_rows" in _delete_grants(path.read_text(encoding="utf-8")), (
+            f"{path.name} does not GRANT DELETE ON pending_skip_trace_rows TO {_ROLE}"
+        )
+
+
+def test_every_system_delete_list_is_the_same_set():
+    """EXACT equality, all four ways (Codex O-D AK4): the SQL block, the cutover's
+    grant statements, the cutover's positive verify, and the operator's drift check.
+    A subset test would let an extra grant in one file go unnoticed."""
+    py_text = _PY.read_text(encoding="utf-8")
+    ops = (_ROOT / "scripts" / "verify_worker_delete_grants.py").read_text(encoding="utf-8")
+    sql_grants = _delete_grants(_SQL.read_text(encoding="utf-8"))
+    assert sql_grants, "parsed no DELETE grants from provision_rls_roles.sql"
+    assert sql_grants == _delete_grants(py_text)
+    assert sql_grants == _quoted_tables(py_text, "_SYSTEM_DELETE_TABLES")
+    assert sql_grants == _quoted_tables(ops, "REQUIRED_DELETE_TABLES")
+
+
+def _pending_row_deletes() -> list[str]:
+    """Every pending_skip_trace_rows DELETE in src/, as "path:function".
+
+    An AST scan, not a grep (Codex O-D AK3): every string constant is read with
+    Python's implicit concatenation already merged by the parser, normalized for
+    case, whitespace and a `public.` prefix; docstrings and comments are never
+    looked at; ORM `delete(PendingSkipTraceRow)` calls are caught too. SQL built at
+    RUNTIME (f-strings with the table name interpolated, string joins) cannot be seen
+    by any static scan; that is what review is for.
+    """
+    import ast
+
+    found: list[str] = []
+    for path in sorted((_ROOT / "src").rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        docstrings = {
+            id(node.body[0].value)
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+            and node.body and isinstance(node.body[0], ast.Expr)
+            and isinstance(node.body[0].value, ast.Constant)
+        }
+        scopes = [(tree, "<module>")] + [
+            (n, n.name) for n in ast.walk(tree)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]
+        owner: dict[int, str] = {}
+        for scope, name in scopes:  # innermost function wins (walked later)
+            for node in ast.walk(scope):
+                owner[id(node)] = name
+        rel = path.relative_to(_ROOT).as_posix()
+        for node in ast.walk(tree):
+            hit = False
+            if (isinstance(node, ast.Constant) and isinstance(node.value, str)
+                    and id(node) not in docstrings):
+                sql = re.sub(r"\s+", " ", node.value.lower()).replace("public.", "")
+                hit = "delete from pending_skip_trace_rows" in sql
+            elif isinstance(node, ast.Call):
+                fn = node.func
+                fname = fn.id if isinstance(fn, ast.Name) else getattr(fn, "attr", "")
+                hit = fname == "delete" and any(
+                    isinstance(a, ast.Name) and a.id == "PendingSkipTraceRow" for a in node.args
+                )
+            if hit:
+                found.append(f"{rel}:{owner.get(id(node), '<module>')}")
+    return found
+
+
+def test_the_claim_withdrawal_is_the_only_pending_row_delete():
+    """The worker now holds DELETE on billing evidence (O-D). The one site it was
+    granted for is the claim's lost-race withdrawal, by its own just-inserted ids. A
+    new delete site must be reviewed, not ride in on this grant."""
+    assert _pending_row_deletes() == ["src/workers/skip_trace_claim.py:claim_skip_trace_rows"]

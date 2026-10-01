@@ -93,6 +93,10 @@ _GRANTS = [
     # on `results` needs no new grant (the ALL TABLES UPDATE above covers it);
     # this is the only new privilege the retention task requires.
     "GRANT DELETE ON skip_trace_cache TO bridgeleads_system",
+    # pending_skip_trace_rows (O-D): the claim's lost-race withdrawal deletes rows it
+    # just inserted in the same transaction (skip_trace_claim.py). The only
+    # pending-row DELETE in src, pinned by tests/test_worker_delete_grants.py.
+    "GRANT DELETE ON pending_skip_trace_rows TO bridgeleads_system",
     "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO bridgeleads_system",
 ]
 
@@ -168,6 +172,7 @@ _SYSTEM_DELETE_TABLES = (
     "mfa_break_glass_codes",
     "pending_registrations",
     "skip_trace_cache",
+    "pending_skip_trace_rows",
 )
 
 _VERIFY_SYSTEM_GRANTS = """

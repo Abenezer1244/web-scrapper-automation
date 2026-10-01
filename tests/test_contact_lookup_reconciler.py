@@ -446,22 +446,31 @@ async def test_a_permanently_blocked_action_never_starves_the_others(
     for name in ("_MAPPABLE_LIMIT", "_SETTLE_LIMIT", "_STUCK_LIMIT", "_UNFLAG_LIMIT"):
         monkeypatch.setattr(rec, name, 1)
     uid = business_user.id
-    blocked, _job_b, _ = _claimed(uid, 1)  # claimed FIRST: the oldest claimed_at
+    # Claimed FIRST (the oldest claimed_at), each blocked for good: a missing row, and a
+    # completed lookup whose lead is neither hit nor miss (never "mappable", AA4/AA5).
+    blocked, _job_b, _ = _claimed(uid, 1)
     with system_sync_session() as s:
         s.execute(text("DELETE FROM pending_skip_trace_rows WHERE action_id = :a"),
                   {"a": blocked})
         s.commit()
+    odd, _job_c, (odd_rid,) = _claimed(uid, 1)
+    _row(odd, odd_rid, "completed")
+    _result(odd_rid, "purged")
+    # Each other action has one answered lead AND one still in flight, so the ONLY
+    # group that can reach it is (a): a blocked action holding (a)'s slot would starve it.
     others = []
     for _ in range(3):
-        aid, _job_o, (rid,) = _claimed(uid, 1)
+        aid, _job_o, (rid, waiting) = _claimed(uid, 2)
         _row(aid, rid, "completed")
         _result(rid, "hit")
-        others.append(aid)
+        others.append((aid, rid, waiting))
     for _ in range(4):
         _tick()
-    assert [_state(a).status for a in others] == ["settled"] * 3
+    assert [_verdicts(a)[r] for a, r, _w in others] == ["answered_hit"] * 3
+    assert [_verdicts(a)[w] for a, _r, w in others] == ["newly_queued"] * 3
     assert _state(blocked).status_reason == rec.FLAG_PENDING_ROW_MISSING
-    assert len(alerts) == 1
+    assert _state(odd).status_reason == rec.FLAG_RESULT_STATE_UNEXPECTED
+    assert len(alerts) == 2
 
 
 async def test_one_action_with_many_rows_is_one_candidate(db, business_user, lookups_on):

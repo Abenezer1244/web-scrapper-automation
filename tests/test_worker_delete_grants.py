@@ -152,12 +152,24 @@ def _executed(path: Path) -> list[str]:
     return [re.sub(r"\s+", " ", s).strip() for s in _py_value(path, "_GRANTS")]
 
 
+def _tables(on: str) -> list[str]:
+    """The table names of a GRANT/REVOKE `ON` clause, canonical: an optional `TABLE`
+    keyword, a `public.` qualifier and identifier quotes are all dropped, so
+    `ON TABLE "public"."x"` and `ON x` name the same table (Codex O-D r3)."""
+    on = re.sub(r"^\s*TABLE\s+", "", on, flags=re.IGNORECASE)
+    out = []
+    for t in on.split(","):
+        t = t.replace('"', "").strip()
+        out.append(re.sub(r"^public\s*\.\s*", "", t, flags=re.IGNORECASE).lower())
+    return out
+
+
 def _granted(stmts: list[str]) -> set[str]:
     out: set[str] = set()
     for s in stmts:
         m = re.fullmatch(r"GRANT DELETE ON (.+?) TO " + _ROLE, s, re.IGNORECASE)
         if m:
-            out.update(t.strip() for t in m.group(1).split(","))
+            out.update(_tables(m.group(1)))
     return out
 
 
@@ -196,7 +208,7 @@ def test_no_later_statement_revokes_any_system_delete_grant():
                     if not m:
                         continue
                     privs, on = m.group(1).upper(), m.group(2)
-                    hits_table = (table in [t.strip() for t in on.split(",")]
+                    hits_table = (table in _tables(on)
                                   or "ALL TABLES" in on.upper())
                     assert not (hits_table and ("DELETE" in privs or "ALL" in privs)), (
                         f"{path.name}: `{later}` would strip DELETE on {table}"

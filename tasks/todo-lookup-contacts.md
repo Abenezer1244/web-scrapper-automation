@@ -4802,6 +4802,23 @@ trusted-worker risk; the RLS hardening is the owner's call (and, if wanted, befo
     A GRANT still counts only as a complete statement, so a grant hidden in a DO block
     FAILS the pin (fail-safe). Two new mutants were both caught: a REVOKE inside a DO
     block, and the grant only inside a DO block. **20/20 as expected**, hashes OK.
+- **Codex diff review r3: GATE: NO-GO, 1 P2 + 1 P3. AM1's rejection CONFIRMED**, AM2 closed
+  (`codex_od_review_r3_out.txt`):
+  - **AN1 (P2)** the revoke guard missed `ON TABLE x` and `ON public.x`. `_tables()` now
+    canonicalizes every GRANT/REVOKE `ON` clause: an optional `TABLE`, `public.` and
+    identifier quotes are dropped.
+  - **AN2 (P3)** stale "the system role has no DELETE" text:
+    - the cutover's DELETE inventory comment now lists `pending_skip_trace_rows`;
+    - `scripts/deactivate_test_batch_configs.py:3-5` and
+      `scripts/purge_test_batch_configs.py:54-59` were ALREADY stale before O-D (the role
+      has held DELETE on 7 listed tables since 2026-06), though still true for the tables
+      those scripts touch. Fixing them would put this PR at 7 files.
+      **Logged as a follow-up**, not fixed here.
+  - Mutations: **23/23 as expected**, 5 files hash-verified. Added: a REVOKE `ON TABLE x`
+    (SQL) and `ON public.x` (cutover), both caught; CONTROL: the grant written `ON TABLE
+    public."x"` still counts, and passed.
+- **Follow-up (not in O-D):** correct the two scripts' "DELETE=False on every table"
+  docstrings.
 
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever

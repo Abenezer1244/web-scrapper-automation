@@ -151,9 +151,9 @@ Re-check 05:10Z: BE main moved only by docs (#415), and none of the cited source
   drift again. Titles (no em dashes):
   - failed: "The contact lookup for this lead did not complete. It is not retried
     automatically."
-  - removed: "This lead was looked up, and its lookup data was deleted after the retention
-    period." (Shipped first in #182 as "its contact details were deleted"; made neutral in
-    bridgeleads-web #184.)
+  - removed (final, bridgeleads-web #185): "Contact lookup data for this lead was deleted
+    after the retention period." (#182 shipped "its contact details were deleted", #184
+    "This lead was looked up, and its lookup data was deleted"; both over-claimed.)
   - none_found: channel-specific, as today.
 - `PhoneCell` / `EmailCell`: call `channelValues` + `contactState`, render values or
   `<ContactStatus>`. Email "Pending" becomes "Processing" with the spinner (contract: one word
@@ -235,12 +235,13 @@ Full review: bridgeleads-web `docs/ux-audit/todo-2e-lookup-failed.md` "Review", 
 check was NOT done (a prod read was refused in-session); journal in this PR.
 
 Correction found by the journal fact-check: `purged` does NOT strictly mean "was a hit". The
-sweep (`retention.py` `_ELIGIBLE`) purges any aged row with a contact column set, outside
-queued/submitted, so a `miss` with `[]` arrays can become `purged` too. The UI's "Removed"
-tooltip ("its contact details were deleted") was therefore over-specific for such a row.
-RESOLVED by bridgeleads-web #184 (d0626274): "This lead was looked up, and its lookup data
-was deleted after the retention period." Whether the sweep SHOULD take such rows is an owner
-decision recorded in the BUILD_JOURNAL entry.
+sweep (`retention.py` `_ELIGIBLE`) purges any aged row with a non-NULL contact column outside
+queued/submitted, so a `miss` with `[]` arrays, or an `errored` / unknown-status row holding
+older data, can become `purged` too: it establishes neither the outcome nor a charge. The UI's
+"Removed" tooltip over-claimed twice (#182, then #184's "was looked up"); RESOLVED by
+bridgeleads-web #185: "Contact lookup data for this lead was deleted after the retention
+period." Whether the sweep SHOULD take such rows is an owner decision recorded in the
+BUILD_JOURNAL entry.
 
 ## Reconciliation with Codex plan r1 (NO-GO)
 - [P1] `purged` vs `not_looked_up` in the summary: ADOPTED, Codex's first option (phase A).

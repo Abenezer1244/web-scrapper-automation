@@ -474,11 +474,13 @@ class SkipTraceStatus(str, Enum):
     HIT = "hit"
     MISS = "miss"
     ERRORED = "errored"
-    # Terminal, set by the retention sweep: this row was looked up, and its aged
-    # contact data has been deleted (Privacy Policy §7). Intended for a former hit,
-    # but NOT proof of one: the sweep's _ELIGIBLE (scheduler_helpers/retention.py)
-    # also takes a MISS whose phones/emails are [] (non-NULL), which erases the
-    # MISS history this comment means to keep (follow-up, 2e). Distinct from MISS
+    # Terminal, set by the retention sweep: this row's aged contact data has been
+    # deleted (Privacy Policy §7). It establishes neither the lookup outcome nor a
+    # charge. Intended for a former hit, but the sweep's _ELIGIBLE
+    # (scheduler_helpers/retention.py) takes any aged row with a non-NULL contact
+    # column: a MISS with [] arrays, or an ERRORED / unknown row holding older data.
+    # That erases the MISS history this comment means to keep (owner decision, 2e
+    # BUILD_JOURNAL 2026-10-01). Distinct from MISS
     # (we asked and got nothing) because the difference is auditable history, and
     # distinct from HIT so analytics stop counting it as enriched and the
     # enqueue path does not treat it as still-contactable. Deliberately NOT in

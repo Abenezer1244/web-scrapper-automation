@@ -92,25 +92,29 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 **Pending / Handoff:**
 - `last_trace_outcome` writers (BE), then a retry for `not_submitted` only.
-- DONE in this session: the "Removed" tooltip said "its contact details were deleted", but the
-  sweep can also purge a `miss` row whose arrays are `[]` (see Facts). bridgeleads-web #184
-  (squash d0626274, Vercel success) made it neutral: "its lookup data was deleted after the
-  retention period", with the summary label, type comment and contracts doc to match.
+- DONE in this session, in two steps: the "Removed" tooltip first said "its contact details were
+  deleted", then (#184, d0626274) "This lead was looked up, and its lookup data was deleted";
+  neither is guaranteed, because the sweep clears any aged lead with a non-NULL contact field
+  (see Facts). bridgeleads-web #185 (squash 02d1266e, Vercel success) makes it "Contact lookup data for this lead was deleted
+  after the retention period.", which implies no outcome, contacts or charge.
 - A real-row check of an `errored` lead in prod, if the owner approves a read.
-- OWNER DECISION, retention: `SkipTraceStatus.PURGED` is documented as distinct from MISS
-  "because the difference is auditable history", but `_ELIGIBLE` also sweeps a `miss` whose
-  arrays are `[]` (non-NULL) and turns it into `purged`, erasing that history. Either narrow
-  `_ELIGIBLE` (for example to rows that actually hold a phone or email) or accept and
-  document it. Retention ships OFF in code; the prod setting was not read. The comments in
-  `constants.py` / `schemas.py` now describe the actual behaviour and point here.
+- OWNER DECISION, retention (still open): `SkipTraceStatus.PURGED` is documented as distinct
+  from MISS "because the difference is auditable history", but `_ELIGIBLE` also sweeps a `miss`
+  whose arrays are `[]` (non-NULL), erasing that history. Asked of the owner, who replied
+  "Continue" without picking; Claude took the conservative option (accept the behaviour, make
+  all copy neutral, #185) and left narrowing `_ELIGIBLE` (for example to rows that actually hold
+  a phone or email) as the owner's call. Retention ships OFF in code; the prod setting was not
+  read. The comments in `constants.py`, `schemas.py` and `retention.py` now describe the actual
+  behaviour and point here.
 - Next queue item: item 3 (batches B-E + F-045..F-050).
 
 **Facts learned:**
 - `results.skip_trace_status` has seven defined values (`SkipTraceStatus`); the column itself
-  is a `String(16)` with no CHECK. `purged` is terminal and means retention removed aged lookup
-  data. The code comments describe it as a former hit, but the sweep
-  (`src/workers/scheduler_helpers/retention.py` `_ELIGIBLE`) only
-  requires a contact column to be set, so a `miss` with `[]` arrays qualifies too.
+  is a `String(16)` with no CHECK. `purged` is terminal and means retention deleted the row's aged
+  contact data; it establishes neither the lookup outcome nor a charge. The sweep
+  (`src/workers/scheduler_helpers/retention.py` `_ELIGIBLE`) only requires a non-NULL contact
+  column outside queued/submitted, so a `miss` with `[]` arrays, or an `errored` / unknown-status
+  row holding older data, qualifies too.
 - Nothing retries an `errored` lead: only `not_attempted` is claimed
   (`src/workers/skip_trace_claim.py`).
 

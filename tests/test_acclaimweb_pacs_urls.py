@@ -18,7 +18,10 @@ async def test_douglas_skips_the_pacs_lookup_without_a_network_call(caplog):
         await scraper._lookup_pacs_addresses([])
     messages = [r.getMessage() for r in caplog.records if r.name == "scraper.template.acclaimweb"]
     assert "No PACS URL for douglas — skipping address lookup" in messages
-    assert not [m for m in messages if "SSRF" in m or "PACS init failed" in m]
+    # The early return precedes the "Looking up addresses ..." line, the SSRF validation
+    # (the DNS lookup) and every request, so none of them ran.
+    assert not [m for m in messages if m.startswith("Looking up addresses") or "SSRF" in m]
+    assert "douglas" not in AcclaimWebScraper._PACS_URLS
 
 
 def test_chelan_keeps_its_pacs_url():

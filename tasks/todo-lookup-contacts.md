@@ -4182,6 +4182,305 @@ still holds: nothing reaches a customer before 2d, and 2d stays hard-gated on O-
 ## NEXT: O-C (grown by AA2), then O-D, then 2d (ASK THE OWNER BEFORE 2d)
 See `docs/HANDOFF-lookup-1b2-oc-2026-10-01.md`.
 
+## Phase O-C — billing decides on what was SENT, and the decision is persisted (SPEC, 2026-10-01, BEFORE the Codex consult)
+Branch `feat/lookup-oc-billing-decision` off main `f2fe1573` (unchanged at `git fetch`,
+2026-10-01). Alembic head on main is **109**, so this is **migration 110**. The owner's O-C
+(2026-09-30) as grown by AA2 (2026-10-01). A LIVE billing change. It HARD-GATES 2d (X2).
+
+**Facts (read in code 2026-10-01, main `f2fe1573`):**
+- **Billing runs ONCE per queue.** Ingest (`tracerfy_ingest.py:~993-1024`) writes the
+  queue row `status='completed'`, `rows_uploaded` (Tracerfy's OWN record, `:690`, never the
+  webhook body), then calls `report_usage_from_webhook`, then ONE commit, under the
+  queue-row lock. A replay finds `completed` and no-ops before billing. It is the only
+  caller (`grep`: `src/api/billing/__init__.py` re-exports it; the reconciler test calls it
+  read-and-rollback).
+- **Today's rule** (`skip_trace_usage.py:537`, `queue_accepted_all`):
+  `COALESCE(rows_uploaded,0) >= COUNT(pending rows STAMPED with the queue id)`. False on
+  no stamped rows. Billing bills `('completed','unmatched')` when true, else `('completed',)`.
+- **The gap (W3).** `_persist_submission` (`skip_trace_dispatcher.py:1473-1583`) INSERTs
+  the queue row `ON CONFLICT DO NOTHING`, then stamps only the rows still pinned to THIS
+  claim (`moved`), commits, and only ALERTS when `moved < claimed`. The count actually sent,
+  `len(claimed)`, is persisted nowhere. With 4 sent, 3 stamped and 3 uploaded, today's rule
+  says "all accepted" and bills `unmatched` although a row was dropped.
+- **What `claimed` is at each `_persist_submission` call:**
+  - live dispatch (`:738`): exactly the rows in the POST. The out-of-credits partial
+    resubmit (`:680-690`) reassigns `claimed = claimed[:affordable]` BEFORE the resubmit,
+    and releases the rest, so it is still the POST's rows;
+  - the fresh-session retry (`:1599`): the same `claimed`; the row already exists → the
+    INSERT is a no-op, so the first write stands;
+  - adoption (`:2113`): the rows still `submitting` at that `claim_time` + `trace_type`,
+    i.e. the stale claim's batch.
+- **`rows_uploaded` is rewritten after submission:** adoption inserts it from the queue
+  list (often 0 while Tracerfy hides it), and ingest overwrites it with the provider's
+  record. Partial bookkeeping changes the stamped count. So a rule recomputed LATER can
+  disagree with what billing did (AA2).
+- `skip_trace_queues.rows_uploaded` is NOT NULL (no NULL case to test).
+- Deploy: worker and beat run the advisory-locked `scripts/migrate.py` on boot
+  (`start.sh:38-53`, fail-open for worker/beat, fail-closed for the API), so code that
+  names a new column ships in the same deploy as its migration (the 093 / 106 precedent).
+
+**Design:**
+1. **Migration 110** (`110_skip_trace_queue_billing_decision.py`): two nullable columns on
+   `skip_trace_queues`, no default, no backfill, no CHECK (the 099/106 convention), under
+   `SET LOCAL lock_timeout = '5s'` (catalog-only ADD COLUMN, brief ACCESS EXCLUSIVE):
+   - `rows_sent INTEGER NULL`: how many rows the batch's POST carried. NULL = recorded
+     before 110 (unknowable: never backfilled; a fabricated value would be billed against).
+   - `unmatched_billed BOOLEAN NULL`: the decision billing MADE for this queue's
+     `unmatched` rows, written once by `report_usage_from_webhook`. NULL = billing has not
+     run, or ran before O-C.
+   - downgrade drops both (test DBs; production is forward-only: old code ignores them).
+2. **Dispatcher** (`_persist_submission`): the INSERT adds `rows_sent=len(claimed)`. On
+   the retry and adoption paths the ON CONFLICT keeps the first write. Nothing else moves.
+3. **Billing** (`skip_trace_usage.py`):
+   - `queue_accepted_all(db, queue_id)` becomes: `rows_sent IS NOT NULL AND rows_uploaded
+     >= rows_sent`, read from the queue row alone. An unknown queue → False. The JOIN on
+     stamped rows goes: stamped ⊆ sent, so `uploaded >= sent` implies the old condition.
+   - Owner rule: a mismatch (`uploaded < sent`) OR a legacy NULL `rows_sent` → bill
+     `completed` only.
+   - `report_usage_from_webhook` persists it in the caller's transaction:
+     `UPDATE skip_trace_queues SET unmatched_billed = :d WHERE tracerfy_queue_id = :q AND
+     unmatched_billed IS NULL`. Written for EVERY queue billing runs on (true or false),
+     whether or not it has unmatched rows.
+4. **Reconciler** (`scheduler_helpers/contact_lookups.py`, P4): `unmatched` maps from
+   `q.unmatched_billed`, never from a recomputed rule:
+   - TRUE → `unmatched_billable`; FALSE → `unmatched_unbilled`;
+   - NULL (or no queue row) → NOT mapped; a NEW blocker
+     `billing_decision_unknown` (flag + one alert, AA3/AB3), never guessed (the AA4
+     philosophy).
+   - **Unreachable by construction**, confirm in the consult: ingest writes `unmatched` and
+     the decision in ONE transaction, and an action's rows exist only after 2d, which ships
+     after O-C. The blocker is the fail-closed answer if that ever stops holding.
+   - SQL: `_MAPPABLE`'s `unmatched` arm requires `q.unmatched_billed IS NOT NULL`; the new
+     `_UNMATCHED_UNDECIDED` EXISTS joins `_ANY_BLOCKER`; `FLAGS` gains it (after
+     `result_state_unexpected`); `_alert` text names it. The selection and the visit stay
+     ONE definition (AC3).
+   - `queue_accepted_all` is no longer imported by the reconciler. Billing is its one caller.
+
+**Live effect at deploy (quiesce):**
+- O-C-i: none on billing. New queues start carrying `rows_sent`.
+- O-C-ii: a queue SUBMITTED before O-C-i deployed (NULL `rows_sent`) and ingested after
+  O-C-ii bills `completed` only. That is the owner's legacy rule, and it errs toward the
+  customer. Shipping O-C-i first shrinks that window to the queues still in flight across
+  BOTH deploys. Before merging O-C-ii, count pending queues with NULL `rows_sent`
+  (read-only) and report the number.
+
+**Split (5-file rule; the plan counts):**
+- **O-C-i** = migration 110 + `models.py` (two columns) + `skip_trace_dispatcher.py`
+  (`rows_sent`) + NEW `tests/test_skip_trace_queue_billing_decision.py` + this plan = 5.
+- **O-C-ii** = `skip_trace_usage.py` + `scheduler_helpers/contact_lookups.py` +
+  `tests/test_tracerfy_ingest.py` + `tests/test_contact_lookup_reconciler.py` + this plan = 5.
+  Its `_seed` helper writes `rows_sent = len(addresses)` as the dispatcher now does, so
+  `test_tracerfy_webhook_trust_s3_15.py` (which imports `_seed`) stays valid UNCHANGED.
+
+**Tests (real PG + Redis, no mocks):**
+- O-C-i:
+  - head has both columns, nullable, typed; 110 chains on 109; down/up round trip in a
+    rolled-back transaction (the 106 pattern);
+  - the REAL `_persist_submission` writes `rows_sent = len(claimed)`:
+    - all moved;
+    - partial bookkeeping (`moved < claimed`: one row pre-stamped elsewhere) still
+      records the full sent count;
+    - the retry path (row already present) keeps the FIRST value;
+    - the adoption path (`adopted=True`) writes the stale claim's count;
+    - `unmatched_billed` stays NULL at submission.
+- O-C-ii:
+  - **the W3 regression**: sent 4, stamped 3, uploaded 3 → `unmatched` NOT billed (the old
+    rule billed it);
+  - `rows_sent != rows_uploaded` (sent 2, uploaded 1) → `completed` only, decision FALSE;
+  - legacy `rows_sent IS NULL` → `completed` only, decision FALSE;
+  - sent == uploaded → `unmatched` billed, decision TRUE;
+  - the decision is written exactly once: a pre-set value is not overwritten;
+  - the three existing pins (`test_unmatched_row_IS_billed`,
+    `test_provider_dropped_row_is_NOT_billed`,
+    `test_dedup_shrinking_the_upload_also_suppresses_unmatched_billing`) pass with `_seed`
+    writing `rows_sent`;
+  - `queue_accepted_all` direct cases rewritten for the new rule (NULL sent, less, equal,
+    more, unknown queue);
+  - reconciler: the verdict follows the PERSISTED decision even after `rows_uploaded` is
+    rewritten the other way (the AA9 "documents the pre-O-C gap" test flips to the fixed
+    behaviour); a NULL decision → not mapped, `billing_decision_unknown` flagged once,
+    cleared and mapped when the decision appears; billing parity (billed `n` == billable
+    verdicts) still holds;
+  - mutations: the rule (`>=`→`>`, NULL treated as accepted, sent ignored), the persist
+    (dropped, overwrite allowed), the reconciler (recompute instead of read, NULL mapped
+    either way, the blocker out of `_ANY_BLOCKER`).
+
+**Questions for the consult:**
+1. Is `len(claimed)` the right "sent" on all three paths, adoption especially?
+2. Dropping the stamped-row JOIN from the rule: is `uploaded >= sent` alone sufficient?
+3. Any reader of `skip_trace_queues` (ORM `select(SkipTraceQueue)`) that a rolling deploy
+   breaks before the boot migration runs, beyond the known fail-open window?
+4. NULL decision → a blocker: right, or should it map to `unmatched_unbilled`?
+5. Is writing the decision for every billed queue (even with no `unmatched` rows) right?
+6. The split order: O-C-i (schema + writer) live before O-C-ii (rule + reader)?
+
+### Codex pre-code consult r1 on O-C (2026-10-01): PLAN: REVISE, 2 P1 + 3 P2 + 1 P3
+Output: `<scratchpad feececfd>/codex_oc_consult_r1_out.txt`. Codex confirmed: `len(claimed)`
+is right on all three paths (Q1); `uploaded >= sent` alone is sufficient and an unknown queue
+is False (Q2); NULL decision → blocker (Q4); write the decision for every billed queue, once,
+guarded `IS NULL` (Q5); the split is valid and `test_tracerfy_webhook_trust_s3_15.py` stays
+unchanged (Q6). Each premise was re-checked in code before it was adopted:
+- **AD1 (P1 → P3 as written, its reasoning kept as a quiesce note) old workers during the
+  rolling deploy write NEW queues with NULL `rows_sent`.** True: the old INSERT omits the
+  column (`skip_trace_dispatcher.py:1519-1543`). But O-C-i does NOT change the billing rule,
+  so every queue created in that overlap is billed under TODAY's rule, normally long before
+  O-C-ii ships. Only a queue still un-ingested when O-C-ii deploys is affected, and then it
+  bills `completed` only (the owner's legacy rule, toward the customer, never an
+  over-charge). The O-C-ii pre-merge check below counts exactly those.
+- **AD2 (P1, adopted as a deploy gate) a new-code worker before 110 fails the ORM
+  `select(SkipTraceQueue)`** (`tracerfy_ingest.py:733-740`). Only if `migrate.py` fails at
+  boot: worker/beat fail OPEN (`start.sh:49-51`), but the API fails CLOSED, so a failed
+  migration is a visibly failed deploy, not a silent one. Same exposure as 093 (same table,
+  same reader). Ingest would raise → roll back → Celery retry (no money moves); the
+  dispatcher's bookkeeping would alert `orphaned_queue` and adoption recovers it once the
+  column exists. **Gate:** O-C-i is not called live until a read-only prod check shows
+  `alembic_version = 110` and both columns exist, AND all three services report SUCCESS on
+  the merge sha with "Migrations applied." in the worker and beat logs. Not adopted: making
+  worker/beat fail closed (a `start.sh` change with its own tradeoff, documented there;
+  out of scope).
+- **AD3 (P2) the reconciler's parity test rolls billing back** (`test_contact_lookup_
+  reconciler.py:150-155`), so after O-C the reconciler would see a NULL decision. Fix: the
+  parity helper COMMITS the real `report_usage_from_webhook` run (it is the real ingest's
+  billing step) before `_tick()`, then compares the billed `n` with the verdicts.
+- **AD4 (P2) reconciler fixtures lack `rows_sent`** (`:71-80`). `_queue` gains an explicit
+  `sent`, inserted as `rows_sent`, and an optional `decision` written to
+  `unmatched_billed` as billing would.
+- **AD5 (P2) the "once per distinct queue" spy test is obsolete** (`:257-277`): the
+  reconciler no longer calls `queue_accepted_all`. Replaced by: a committed decision of
+  TRUE on one queue and FALSE on another, with `rows_uploaded` then rewritten the opposite
+  way, and the verdicts follow the persisted decision.
+- **AD6 (P3) AA2's premise corrected.** Codex found no normal production path that rewrites
+  `rows_uploaded` or the stamped set AFTER billing commits: adoption runs before ingest,
+  partial bookkeeping at submission, and a replay no-ops. The persisted decision stays the
+  design for these reasons:
+  - the reconciler states what billing DID, not what a rule says now;
+  - it is robust to a retention purge or a manual / future rewrite of the inputs;
+  - it is an audit record.
+
+  The AA9 rewrite test stays, framed as "a later rewrite cannot change the verdict".
+
+### Codex pre-code consult r2 on O-C (2026-10-01): PLAN: REVISE, AD2 stays P1; AD1, AD3-AD6 CLOSED
+Output: `<scratchpad feececfd>/codex_oc_consult_r2_out.txt`. AD1 closed: no path over-charges
+(only provider-returned matches become `completed`, billing + counters + outbox commit
+atomically), legacy NULL under-bills toward the customer. **AD2 stays P1, and its chain is
+verified in code:**
+- a new-code worker against a stale schema fails ingest's full ORM read
+  (`tracerfy_ingest.py:733-740`);
+- after 3 retries `on_failure` marks the queue `errored` (`:337-381`);
+- later webhooks no-op on `errored` (`:654-659, 749-755`);
+- `_reconcile_stale_claims` scans only `submitting` (`skip_trace_dispatcher.py:1995-2006`).
+
+So a PAID `submitted` batch loses automatic ingest and billing. A post-boot check cannot
+prevent that.
+
+**AE1 (fix, replaces the AD2 gate) SCHEMA FIRST: no deployed code names a 110 column until
+production is VERIFIED at 110.** Applying 110 to prod out of band is ruled out: a DB ahead of
+the deployed code's alembic head fails the API boot (memory `migration_branch_mismatch`). So
+the schema ships ALONE, in its own deploy, and the readers ship in the next one. No CI test
+compares the models with the migrations (grepped: no `compare_metadata`/`produce_migrations`
+outside an index-name check), so a migration-only PR is valid. **Revised split (supersedes the
+2-PR split above):**
+- **O-C-i** (schema only) = migration 110 + NEW `tests/test_skip_trace_queue_billing_decision.py`
+  (head has both columns; chains on 109; down/up round trip) + this plan = 3. No model, no
+  writer, no reader: old and new code alike ignore the columns, so its rolling deploy has
+  no hazard. **Gate before O-C-ii:** a read-only prod check shows `alembic_version = '110'`
+  and both columns with the right type and nullability.
+- **O-C-ii** (writer) = `models.py` (two columns) + `skip_trace_dispatcher.py` (`rows_sent`)
+  + `tests/test_skip_trace_queue_billing_decision.py` (the `_persist_submission` cases) +
+  this plan = 4. The schema already exists, so the ORM reader and the INSERT are safe even
+  if a boot migration fails. Old workers in the overlap write NULL `rows_sent`; billing is
+  unchanged in this deploy, so that is harmless (AD1).
+- **O-C-iii** (rule + reader) = `skip_trace_usage.py` + `scheduler_helpers/contact_lookups.py`
+  + `tests/test_tracerfy_ingest.py` + `tests/test_contact_lookup_reconciler.py` + this
+  plan = 5. Pre-merge: count the un-ingested queues with NULL `rows_sent` (read-only) and
+  report the number (AD1).
+
+Each PR gets its own Codex diff gate, mutation runner (O-C-i: the migration test against a
+dropped/mistyped column) and regression run. O-C-ii's merge waits for the O-C-i prod gate.
+
+### Codex pre-code consult r3 on O-C (2026-10-01): PLAN: REVISE, 1 P1 + 2 P2; AD2 CLOSED by AE1
+Output: `<scratchpad feececfd>/codex_oc_consult_r3_out.txt`. Verified: there is no positional
+INSERT, `SELECT *` or exact-column-set test on `skip_trace_queues`, and the ORM ignores
+undeclared columns, so O-C-i is inert for 109 code. A DB ahead of the image's head fails the
+API boot (`scripts/migrate.py:173-177`).
+- **AF1 (P1 → mitigated by the existing gate + a post-deploy proof) during O-C-iii's
+  rollout an OLD worker can still bill under today's rule and leave `unmatched_billed`
+  NULL.** True, and it is today's behaviour persisting for the overlap minutes, not a new
+  charge path. Codex's fix (drain and stop every prod worker, then start only the new
+  image) is a heavy prod operation for a window the merge rule already empties:
+  - **Pre-merge:** the standing rule already requires `quiet.py` = all zeros, including 0
+    ACTIVE pending skip-trace rows and 0 non-terminal jobs. So at merge no batch is in
+    flight, and an old worker could bill a queue in the overlap only if a NEW job
+    enqueued, dispatched, completed at Tracerfy and was ingested inside the rollout
+    minutes, AND that batch hit the rare partial-bookkeeping alert (W3).
+  - **Post-deploy proof (new, read-only):** every `skip_trace_queues` row with
+    `completed_at >= <merge time>` has `unmatched_billed IS NOT NULL`. A NULL there means
+    an old worker billed it: it is then checked by hand (`rows_sent` vs stamped vs
+    uploaded, and the outbox) and refunded if W3 applied. Reported either way.
+- **AF2 (P2, a note: house-wide, not new)** after 110 is applied, a 109-image API replica
+  that RESTARTS fails its boot migration. That holds for every migration this repo ships
+  (107-109 had it too); Railway replaces old replicas with the new image. The O-C-i deploy
+  check is all three services SUCCESS on the merge sha and `/health` 200.
+- **AF3 (P2) the prod schema gate must see through RLS.** `alembic_version` has RLS
+  (027), and the worker role reads it empty. The gate is:
+  - `information_schema.columns` for `skip_trace_queues.rows_sent` (integer, YES) and
+    `unmatched_billed` (boolean, YES): visible to the worker role, which has privileges
+    on the table, and this is the fact O-C-ii depends on;
+  - plus `SELECT version_num FROM alembic_version` via `DATABASE_URL_MIGRATE` where the
+    service exposes it.
+
+  Read-only transaction, counts and names only. Script: `C:/Users/Windows/bl-checks/
+  oc_schema_check.py` (outside the repo).
+
+### Codex pre-code consult r4 on O-C (2026-10-01): PLAN: REVISE, 1 P2; AF1 (P1) and AF2 CLOSED
+Output: `<scratchpad feececfd>/codex_oc_consult_r4_out.txt`. Codex accepted AF1's mitigation:
+`quiet.py` zeros at merge, dispatch every 300 s with at most two batches per tick, ingest
+atomic, no action before 2d, and the post-deploy NULL proof with a refund path.
+- **AG1 (P2) the AF3 gate must exist and fail closed.** `C:/Users/Windows/bl-checks/
+  oc_schema_check.py` is now WRITTEN:
+  - it exits 1 unless `rows_sent` is (integer, YES) and `unmatched_billed` is
+    (boolean, YES);
+  - when `DATABASE_URL_MIGRATE` is set, it also requires `alembic_version = ['110']`;
+  - read-only sessions, names and types only.
+
+  Proven against the local DB at 109: both columns BAD, `SCHEMA GATE: FAIL`, exit 1.
+  `quiet.py` prints counts and does not set an exit code, so the merge procedure reads its
+  four counts and requires each to be 0 (the owner's standing rule says exactly that).
+  O-C-ii merges only after `oc_schema_check.py` exits 0 in production.
+
+### Codex pre-code consult r5 on O-C (2026-10-01): PLAN: REVISE, 4 P2, all adopted; AG1 CLOSED
+Output: `<scratchpad feececfd>/codex_oc_consult_r5_out.txt`. Codex verified: `len(claimed)` holds
+on all three paths, ingest bills atomically under the queue lock, and the reconciler is the
+only non-billing caller of `queue_accepted_all`.
+- **AH1** `oc_schema_check.py` exits 1 before connecting when `DATABASE_URL_SYNC` is empty
+  (no libpq-default database). Done.
+- **AH2 O-C-iii test:** a billed queue with NO `unmatched` rows still persists its decision,
+  both TRUE (sent == uploaded) and FALSE (sent > uploaded). Mutation: skip the decision
+  write when no `unmatched` row exists.
+- **AH3 O-C-iii test:** an `unmatched` lead whose queue row is ABSENT (the
+  `skip_trace_queues.job_id` FK is `ON DELETE CASCADE`, so deleting the first row's job
+  removes it) → not mapped, `billing_decision_unknown` flagged once; mapped when a queue row
+  with a decision appears.
+- **AH4 the AF1 post-deploy proof FAILS until every post-merge NULL decision is resolved.**
+  Each one is either refunded (W3 applied) or backfilled with the boolean billing actually
+  applied, reconstructed from that queue's outbox rows (`skip_trace_meter_events`) and its
+  counts, with the evidence recorded here. Both are PROD WRITES: **asked of the owner
+  first.** Script: `C:/Users/Windows/bl-checks/oc_post_deploy_check.py <merge-time>`
+  (read-only, exit 1 on any NULL), written with O-C-iii.
+
+**r6 (2026-10-01): `PLAN: GO`, no findings.** AH1-AH4 closed
+(`<scratchpad feececfd>/codex_oc_consult_r6_out.txt`). The O-C-iii release gates stay
+mandatory: the post-deploy NULL proof, and owner-approved remediation for any NULL.
+
+### O-C TO BUILD (in order; each merges under the standing rule, each deploy verified)
+- [ ] **O-C-i** schema only: migration 110 + `tests/test_skip_trace_queue_billing_decision.py`
+  + this plan. Then the prod gate `oc_schema_check.py` → exit 0.
+- [ ] **O-C-ii** writer: `models.py` + `skip_trace_dispatcher.py` (`rows_sent`) + the test
+  file + this plan. Merges only after the O-C-i gate passes.
+- [ ] **O-C-iii** rule + reader: `skip_trace_usage.py` + `contact_lookups.py` +
+  `test_tracerfy_ingest.py` + `test_contact_lookup_reconciler.py` + this plan. Pre-merge:
+  count the NULL-`rows_sent` un-ingested queues. Post-deploy: `oc_post_deploy_check.py` exits 0.
+
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever
       the tab has leads that have never been looked up; when the quote comes back with

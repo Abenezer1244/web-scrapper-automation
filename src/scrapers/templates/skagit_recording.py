@@ -101,7 +101,7 @@ _CANONICAL_REFINE_KEYWORDS: dict[str, list[str]] = {
 class SkagitRecordingScraper(BridgeScraper):
     """Template scraper for Skagit County Recording Search.
 
-    Custom ASP.NET portal — zero Claude AI cost, standardized selectors.
+    Custom ASP.NET portal — standardized selectors.
     Parcel IDs are available directly in search results.
     """
 

@@ -793,8 +793,8 @@ RUN_START_402_RESPONSES: dict[int | str, dict[str, Any]] = {
     402: {
         "model": RunRefusalResponse | EntitlementRefusalResponse | PlainRefusalResponse,
         "description": (
-            "Refused. A run refusal (AI limit, frozen, ended, over the record "
-            "limit) has a top-level `code`; a plan refusal has an object "
+            "Refused. A run refusal (frozen, ended, over the record limit) "
+            "has a top-level `code`; a plan refusal has an object "
             "`detail`; anything else is a sentence in `detail`."
         ),
     },

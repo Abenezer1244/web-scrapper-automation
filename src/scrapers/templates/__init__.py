@@ -1,7 +1,7 @@
 """Template scrapers for common county recorder platforms.
 
-Instead of burning Claude AI tokens on every county, template scrapers
-handle standardized platforms with zero AI cost.
+One template scraper per standardized recorder platform: a county on a supported
+platform needs only its portal URL, no county-specific code.
 
 Supported platforms:
 - EagleWeb (Tyler Technologies) — 16+ WA counties

@@ -1,7 +1,6 @@
 """Built-in county assessor URLs, for when a connector row's assessor_url is NULL.
 
-Moved out of the deleted Claude-based assessor fallback (AI mode removal,
-Phase 3); the PACS enrichment in tasks_helpers/enrich.py reads it.
+Moved out of a deleted assessor fallback (2026-09-30); the PACS enrichment in tasks_helpers/enrich.py reads it.
 """
 
 KNOWN_ASSESSOR_URLS: dict[str, str] = {

@@ -147,7 +147,7 @@ def _doc_type_matches(doc_type: str, keywords: list[str]) -> bool:
 class IDocMarketScraper(BridgeScraper):
     """Template scraper for all Tyler iDocMarket per-county search portals.
 
-    Zero Claude AI cost — standardized server-rendered form + result-card
+    Standardized server-rendered form + result-card
     extraction shared by every iDocMarket county.
     """
 

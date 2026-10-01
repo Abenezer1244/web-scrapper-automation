@@ -479,8 +479,8 @@ class BridgeScraper:
 
         S1: validates EVERY http(s) request, not just document loads. In-page
         fetch()/XHR, scripts and images are a first-class egress channel — JS
-        running in a loaded page (including anything the AI navigator is
-        prompt-injected into emitting via ``evaluate``) could otherwise reach
+        running in a loaded page (including anything a hostile page
+        injects into an ``evaluate`` call) could otherwise reach
         169.254.169.254 or any internal host completely outside this guard,
         because the route is registered for ``**/*`` and previously waved every
         non-document request straight through. Only the MAIN-FRAME DOCUMENT

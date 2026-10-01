@@ -118,8 +118,6 @@ omit = [
     "tests/*",
     "src/scrapers/enrichment/*",           # external parcel API — no live test environment
     "src/scrapers/pierce_wa_probate.py",   # Playwright scraper — requires live county portal
-    "src/scrapers/ai/*",                   # AI scraper — requires Claude API key
-    "src/scrapers/ai_scraper.py",          # AI scraper — requires Claude API key
     "src/workers/tasks.py",               # Celery task runner — requires Celery broker
     "src/workers/tasks_helpers/*",        # pipeline-phase helpers relocated from tasks.py — same task-runner code, same omit
 ]

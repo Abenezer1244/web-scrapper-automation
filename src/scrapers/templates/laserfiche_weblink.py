@@ -82,7 +82,7 @@ def _doc_type_matches(doc_type: str, keywords: list[str]) -> bool:
 class LaserficheWebLinkScraper(BridgeScraper):
     """Template scraper for Laserfiche WebLink recorder portals.
 
-    Zero Claude AI cost — uses standardized ASP.NET form selectors.
+    Uses standardized ASP.NET form selectors.
     Parcel IDs are available directly in search results.
     """
 

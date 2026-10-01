@@ -1,7 +1,7 @@
 """The run-refusal 402: a machine-readable code beside the unchanged sentence.
 
-``POST /jobs`` and ``POST /batches`` refuse a run for the AI monthly limit or the
-account rule (frozen, ended, over the record limit). ``detail`` stays the same
+``POST /jobs`` and ``POST /batches`` refuse a run for the account rule (frozen,
+ended, over the record limit). ``detail`` stays the same
 sentence it has always been, byte for byte, so a client that reads it as a
 string keeps working; ``code`` and ``resumes_at`` are added BESIDE it, which
 ``HTTPException`` cannot do, hence the subclass and its handler.

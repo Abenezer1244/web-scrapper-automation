@@ -4164,6 +4164,8 @@ still holds: nothing reaches a customer before 2d, and 2d stays hard-gated on O-
     pass-through spy on `_candidates`) is skipped, not waited on.
 - **Mutations (runner v2, every mutant asserted present, RED baseline refused): 24/24 caught.**
 - Rebased `--onto` main `c517cef7` (#416 merged): the diff is 2c-ii only, 4 files.
+- **Codex diff review r2: GATE: GO, no findings** (AC1-AC4 closed; `SKIP LOCKED` skips before
+  the LIMIT; one LATERAL current row everywhere). `codex_2cii_review_r2_out.txt`.
 
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever

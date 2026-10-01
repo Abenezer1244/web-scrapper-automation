@@ -477,8 +477,10 @@ class SkipTraceStatus(str, Enum):
     # Terminal, set by the retention sweep: this row's aged contact data has been
     # deleted (Privacy Policy §7). It establishes neither the lookup outcome nor a
     # charge. Intended for a former hit, but the sweep's _ELIGIBLE
-    # (scheduler_helpers/retention.py) takes any aged row with a non-NULL contact
-    # column: a MISS with [] arrays, or an ERRORED / unknown row holding older data.
+    # (scheduler_helpers/retention.py) takes any aged row whose status is not
+    # purged/queued/submitted and that has at least one of phone, email, phones or
+    # emails non-NULL: a MISS with [] arrays, or an ERRORED / unknown row holding
+    # older data.
     # That erases the MISS history this comment means to keep (owner decision, 2e
     # BUILD_JOURNAL 2026-10-01). Distinct from MISS
     # (we asked and got nothing) because the difference is auditable history, and

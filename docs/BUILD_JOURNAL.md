@@ -96,7 +96,8 @@ to understand *why* the code is the way it is and *what's been attempted before*
   deleted", then (#184, d0626274) "This lead was looked up, and its lookup data was deleted";
   neither is guaranteed, because the sweep clears any aged lead with a non-NULL contact field
   (see Facts). bridgeleads-web #185 (squash 02d1266e, Vercel success) makes it "Contact lookup data for this lead was deleted
-  after the retention period.", which implies no outcome, contacts or charge.
+  after the retention period.", which implies no outcome, contacts or charge. #186 (squash
+  5bc7a2e7) fixed the matching code comment in `DeliveredLookupSummary`.
 - A real-row check of an `errored` lead in prod, if the owner approves a read.
 - OWNER DECISION, retention (still open): `SkipTraceStatus.PURGED` is documented as distinct
   from MISS "because the difference is auditable history", but `_ELIGIBLE` also sweeps a `miss`
@@ -112,8 +113,9 @@ to understand *why* the code is the way it is and *what's been attempted before*
 - `results.skip_trace_status` has seven defined values (`SkipTraceStatus`); the column itself
   is a `String(16)` with no CHECK. `purged` is terminal and means retention deleted the row's aged
   contact data; it establishes neither the lookup outcome nor a charge. The sweep
-  (`src/workers/scheduler_helpers/retention.py` `_ELIGIBLE`) only requires a non-NULL contact
-  column outside queued/submitted, so a `miss` with `[]` arrays, or an `errored` / unknown-status
+  (`src/workers/scheduler_helpers/retention.py` `_ELIGIBLE`) takes an aged row whose status is
+  neither `purged`, `queued` nor `submitted`, with at least one of `phone`, `email`, `phones` or
+  `emails` non-NULL, so a `miss` with `[]` arrays, or an `errored` / unknown-status
   row holding older data, qualifies too.
 - Nothing retries an `errored` lead: only `not_attempted` is claimed
   (`src/workers/skip_trace_claim.py`).

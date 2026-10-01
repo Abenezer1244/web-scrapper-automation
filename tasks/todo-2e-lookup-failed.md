@@ -235,8 +235,8 @@ Full review: bridgeleads-web `docs/ux-audit/todo-2e-lookup-failed.md` "Review", 
 check was NOT done (a prod read was refused in-session); journal in this PR.
 
 Correction found by the journal fact-check: `purged` does NOT strictly mean "was a hit". The
-sweep (`retention.py` `_ELIGIBLE`) purges any aged row with a non-NULL contact column outside
-queued/submitted, so a `miss` with `[]` arrays, or an `errored` / unknown-status row holding
+sweep (`retention.py` `_ELIGIBLE`) purges an aged row whose status is neither `purged`, `queued`
+nor `submitted`, with at least one of `phone`, `email`, `phones` or `emails` non-NULL, so a `miss` with `[]` arrays, or an `errored` / unknown-status row holding
 older data, can become `purged` too: it establishes neither the outcome nor a charge. The UI's
 "Removed" tooltip over-claimed twice (#182, then #184's "was looked up"); RESOLVED by
 bridgeleads-web #185: "Contact lookup data for this lead was deleted after the retention

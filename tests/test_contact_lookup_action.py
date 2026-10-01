@@ -10,6 +10,7 @@ sweep. No Tracerfy: nothing here gets past the queue.
 from __future__ import annotations
 
 import threading
+import time
 import uuid
 from datetime import UTC, datetime, timedelta
 
@@ -608,8 +609,23 @@ async def test_the_action_racing_the_scrape_enqueue_leaves_one_row_per_lead(
                threading.Thread(target=run, args=(lambda: _enqueue(job, redis_client),))]
     for t in threads:
         t.start()
+    # Prove the RACE: both writers must be blocked on this job's claim lock before it
+    # is released, or the test would pass as two sequential runs (Codex 2b review P3).
+    waiting = 0
+    deadline = time.monotonic() + 20
+    with system_sync_session() as probe:
+        while waiting < 2 and time.monotonic() < deadline:
+            waiting = probe.execute(text(
+                "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted "
+                "AND (classid, objid) = (SELECT classid, objid FROM pg_locks "
+                "    WHERE locktype = 'advisory' AND granted AND pid = :holder)"
+            ), {"holder": holder.execute(text("SELECT pg_backend_pid()")).scalar_one()}
+            ).scalar_one()
+            probe.rollback()
+            time.sleep(0.05)
     holder.rollback()
     holder.close()
+    assert waiting == 2, "both writers were not blocked on the job's claim lock"
     for t in threads:
         t.join(90)
     assert errors == []

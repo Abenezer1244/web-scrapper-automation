@@ -3817,6 +3817,13 @@ O-D stays the pre-2d gate. Outputs: `<scratchpad 4ebfb689>/codex_2b_consult_r{1.
   the enqueue, 4 chunks), plus 67 in the 4 files that read Celery `include`, and 27 import
   cycles. The first 15-file chunk overran 590 s (killed; no stray pytest left), so the chunks
   are now 7-8 files. ruff clean. No type checker is configured.
+- Rebased onto `d65a3b09` (#408 docs, #405 notification, #409 migration 108). None of them
+  touches the claim, the enqueue, the dispatcher, the planner or the ledger, so the facts
+  stand. Local DB migrated to 108. 147 passed post-rebase (2b + the planner + import cycles).
+- **Codex diff review r1 (three-dot): GATE: GO, no P1/P2, 1 P3, fixed.** The enqueue race
+  test released the job lock without proving both writers were blocked on it, so it could pass
+  as two sequential runs. It now polls `pg_locks` until BOTH are waiting on the holder's
+  advisory key, and asserts it before releasing. 3/3 runs green.
 
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever

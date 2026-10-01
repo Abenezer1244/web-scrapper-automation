@@ -142,7 +142,7 @@ app.conf.update(
 # migration or scripts never pass through the API route that calls
 # validate_scraping_target(), so without this hook the scrape worker
 # would throw "Scraping target not in approved domain list" on the
-# first scrape of any un-template-matched AI connector. See Sprint
+# first scrape of any connector seeded outside the API. See Sprint
 # 6.3 Phase 3 audit in docs/compliance/connector-audit-2026-04-10.md
 from celery.signals import worker_ready  # noqa: E402
 

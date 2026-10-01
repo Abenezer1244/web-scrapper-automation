@@ -19,6 +19,84 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-10-01 — UX 2d (F-006): "already delivered" outside the run page, and the live fallback we measured and dropped
+
+> Owner: snapshot only (no history backfill), one number in the list (no source scraper).
+> Plan + review: `tasks/todo-2d-jobs-already-delivered.md`.
+
+**Built / Shipped (merged and live):**
+- **#405 `4c45ac06`:** the `job_completed` notification detail gains `already_delivered`, read
+  from the job row's validated breakdown snapshot (`breakdown_from_job`, the number `GET /jobs`
+  shows). It is present when 0 and absent when unknown. The emission moved into
+  `emit_job_completed` (`src/workers/tasks_helpers/finalize.py`), which `run_scrape_job` calls once
+  after DONE, so tests drive the production emitter on real `notifications` rows. Field
+  descriptions on `JobResponse.breakdown` / `ResultsPage.breakdown` say the count is account-wide
+  and raw. No migration.
+- **bridgeleads-web#172 `4c50eb8b`:** the Results index, dashboard scrapers table and the bell read
+  "0 new · 123 already delivered" when the snapshot knows it and it is above 0, and the count
+  alone otherwise (`components/run-lead-count.tsx`). The FE Q2 contract is marked SHIPPED.
+
+**Tried / Decided:**
+- **The handoff's live fallback for `GET /jobs` was measured on prod and dropped.** The shell polls
+  `GET /jobs` every 5 s. The full partition over the largest account's newest 100 jobs took
+  3.9-5.7 s. The narrowest count (owner-joined, already-delivered bucket only) measured p50 0.7 s,
+  p95 9.9 s, p99 12.1 s over 30 samples; small accounts took ~13 ms. Even opt-in on the Results
+  index, a statement timeout would have hidden the number from exactly the account with the most
+  history.
+- **Consequence, accepted by the owner:** runs that finished before 2026-09-30 11:31Z have no snapshot, so they
+  keep the count alone. F-006's own King probate example is history and stays "0".
+  A backfill (migration 107 at the time, then a nullable column + ops script) was offered and
+  declined.
+- **The notification reads the ROW, not `FinalizeOutcome.frozen`** (Codex plan r2 P1). A re-run
+  billed earlier keeps its snapshot but freezes nothing new. The path is practically unreachable,
+  because billing and done commit together, but the row read closes it for free.
+- **Codex plan r7 P1 rebutted:** it said the run page headline still used the tax-capped tab count.
+  FE master (#169) shows `breakdown.new` from the snapshot and hides the live link when a breakdown
+  exists. Codex accepted this in r8.
+
+**Failed / Blocked:**
+- The first Codex plan wait returned instantly. The loop matched "PLAN: GO" in the ECHOED PROMPT,
+  not Codex's verdict. Wait on the process exit, then read after the last `codex` line.
+- The full suite was reaped for low memory after 2 of 8 parts. On rerun I ran one part per
+  background job, so a reap loses one part, not the rest.
+- `main` turned red for every PR on 09-30 at 16:24Z when CVE-2026-101918 (pyjwt) was published.
+  Dependency Audit is a REQUIRED check. Another session had already fixed it (#407) by the time I
+  started a bump.
+- The Railway CLI session expired mid-merge ("Unauthorized"). The owner re-ran `railway login`.
+
+**Caught & fixed (before shipping):**
+- An existing source guard (`test_finalize_fence`) required `create_notification` after DONE; it
+  now requires one `emit_job_completed(` and no inline `job_completed` (Codex plan r3 P1).
+- The `tasks.py` import of the helper was missing from the first plan (NameError at the call;
+  Codex plan r4 P1).
+- FE: a wrapped "a · b" started its second line with "·" in narrow places (mobile card, Results
+  column). Those use a stacked two-line form now. FE Codex r1: guard `breakdown_basis ===
+  "snapshot"`, and stale "none implemented" text in the contracts doc.
+
+**Pending / Handoff:**
+- Prod checks wait for the first qualifying run (the plan's gate,
+  `tasks/todo-2d-jobs-already-delivered.md`):
+  - 2c (`first_snap.py`, still pending): the first run finished after 2026-09-30 11:31Z has six
+    `breakdown_*` summing to `records_found`, with `new == record_count == billed_count`.
+  - 2d: the first job CREATED and STARTED after the worker rollout (2026-10-01 01:23Z) with a valid
+    snapshot, whose owner has the `job_completed` pref on (skip to the next job otherwise). Its
+    notification's `already_delivered` must equal `breakdown_already_delivered`. A missing
+    notification 10 min after `finished_at` is a FAILURE. A post-rollout job without a snapshot
+    must have no key. PENDING only while no qualifying job exists.
+- Next queue item: 2e (Q4, "Lookup failed").
+
+**Facts learned:**
+- Before merging, quiet.py's "other sessions in a transaction > 30s" needs identifying, not
+  rounding to zero. This one was a worker idle in a transaction holding only AccessShareLock on
+  `county_connectors` (pg_stat_activity + pg_locks). That is harmless for a migration-free deploy.
+  Treat a crashed check as NOT quiet.
+- Several sessions merge to `main` within the hour. Coordinate the merge slot over SendMessage
+  and tell the others when a deploy is verified.
+- The FE types drift gate moves with every BE OpenAPI change, including description-only ones.
+  Whoever merges an FE PR second regenerates from BE main.
+
+---
+
 ## 2026-10-01 — AI mode renamed away: 'ai' is 'template' in production, the admin page and the docs
 
 **Built / Shipped:**

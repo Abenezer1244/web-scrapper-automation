@@ -2217,6 +2217,111 @@ def pierce_address_recovery(db, r, job_id: str, config, all_results) -> None:
             )
 
 
+# ── Shared by the scrape enqueue and the contact-lookup action worker ────────
+# Phase 1b-2 (consult r1 Q4): the action worker must decide "charged but unanswered"
+# and "already answered in the cache" EXACTLY as the enqueue does, or the two paths
+# drift and one of them pays for a lead the other would not. So both call these,
+# rather than the worker carrying a copy. Neither commits: each caller owns its
+# transaction and holds `lock_job_for_claim` around the cache write.
+
+
+def settle_charged_unanswered(db, user_id, rows: list) -> tuple[list, int]:
+    """Drop and settle leads whose earlier lookup was charged but unmatched.
+
+    A lookup Tracerfy already CHARGED for and we could not attribute ('unmatched')
+    is not retried on every run: the same address would most likely fail the same
+    way, and each retry is billed. Inside the freshness window such an
+    already-delivered lead is settled as 'errored' (what its earlier row already
+    shows); past it, it is asked again like any stale lead. A transport failure or a
+    pre-submit rejection leaves no 'unmatched' row, so it IS retried (Codex).
+
+    The enqueue runs this TWICE (Security Master Review pass 4): once before the
+    job lock, and again under it. The dispatcher and ingest do not take that lock,
+    so a row can become 'unmatched' -- charged, with no answer -- between the two
+    passes, and buying it again is a second charge for a question the vendor
+    already failed to answer.
+
+    Returns the rows still to decide and how many were settled. Does not commit.
+    """
+    from sqlalchemy import text as _sa_text
+
+    delivered_before = [rec for rec in rows if rec.is_duplicate and rec.dedup_hash]
+    if not delivered_before:
+        return rows, 0
+    charged_unanswered = set(db.execute(
+        _sa_text(
+            "SELECT DISTINCT r.dedup_hash FROM pending_skip_trace_rows p "
+            "JOIN results r ON r.id = p.result_id AND r.user_id = p.user_id "
+            "WHERE p.user_id = CAST(:uid AS uuid) AND p.status = 'unmatched' "
+            "  AND r.dedup_hash = ANY(CAST(:hashes AS text[])) "
+            "  AND COALESCE(p.submitted_at, p.enqueued_at) "
+            "      >= NOW() - make_interval(days => :ttl)"
+        ),
+        {"uid": str(user_id), "ttl": int(settings.SKIP_TRACE_CACHE_DAYS),
+         "hashes": sorted({rec.dedup_hash for rec in delivered_before})},
+    ).scalars())
+    if not charged_unanswered:
+        return rows, 0
+    settled = [rec for rec in delivered_before if rec.dedup_hash in charged_unanswered]
+    for rec in settled:
+        rec.skip_trace_status = "errored"
+        rec.skip_trace_attempted_at = _now()
+    settled_ids = {rec.id for rec in settled}
+    return [rec for rec in rows if rec.id not in settled_ids], len(settled)
+
+
+def copy_cached_answer(db, user_id, rec, payload: dict) -> bool:
+    """Copy a still-fresh cached answer for this exact lookup onto `rec`. True if it did.
+
+    v2 (migration 098 cutover): the key is the SUBJECT this lookup would be
+    bought for — account, address, trace type and the exact names in the
+    payload — not the address alone. Two owners at one address are now two
+    answers, so an heir's lead can no longer be served the deceased owner's
+    phone. The subject comes from the payload actually built, never
+    recomputed from party_name.
+
+    The legacy address-only read (and its mailing-locality fallback) is GONE
+    rather than kept as a fallback: a legacy row cannot tell us whose answer
+    it holds, so reading one is the leak. Those rows are inert and age out
+    with the 90-day retention; deleting them is a separate PII-hygiene step.
+    Cost of the cutover: a repeat address may be paid for again inside that
+    window.
+
+    An ORM write: phone/email are EncryptedString/EncryptedJSON, so this must never
+    become raw SQL (it would store plaintext PII). Does not commit.
+    """
+    from src.db.models import SkipTraceCache
+    from src.scrapers.enrichment.skip_trace import payload_subject_key
+
+    cache_key = payload_subject_key(user_id, payload)
+    cached = db.get(SkipTraceCache, cache_key)
+    if not cached:
+        return False
+    # 90-day TTL check
+    age = _now() - cached.fetched_at
+    if age.days >= settings.SKIP_TRACE_CACHE_DAYS:
+        return False
+    # Copy cached values directly to the Result — no Tracerfy call
+    rec.phone = cached.phone
+    rec.phone_type = cached.phone_type
+    rec.phone_dnc_flag = cached.phone_dnc_flag
+    rec.email = cached.email
+    rec.phones = cached.phones
+    rec.emails = cached.emails
+    rec.skip_trace_status = "hit" if (cached.phone or cached.email) else "miss"
+    # When the data was obtained (the cache entry), not now: attempted_at is the
+    # 365-day PII retention clock, and a copy must not restart it.
+    rec.skip_trace_attempted_at = cached.fetched_at
+    rec.skip_trace_source = "reused"  # no lookup bought for this row
+    # WHOSE answer this is (098). Recorded now, while the subject is
+    # known, because it cannot be reconstructed later: party_name gets
+    # rewritten by owner recovery, and a recomputed subject would then
+    # name the current owner while these contacts belong to the previous
+    # one. The duplicate-reuse passes require an exact match on this.
+    rec.skip_trace_subject_hash = cache_key
+    return True
+
+
 def _enqueue_skip_trace_rows(
     db, job, r, job_id: str, config, *, on_begin=None, attempt_token=None,
 ) -> None:
@@ -2254,13 +2359,11 @@ def _enqueue_skip_trace_rows(
     # Local imports — sa_select must be imported here because the module-
     # level import is scoped inside _run_inline_enrichment, not globally
     from sqlalchemy import select as sa_select
-    from sqlalchemy import text as _sa_text
 
-    from src.db.models import Result, SkipTraceCache
+    from src.db.models import Result
     from src.scrapers.enrichment.skip_trace import (
         build_pending_row_payload,
         code_violation_skip_trace_allowed,
-        payload_subject_key,
     )
     from src.utils.address_intel import street_is_placeholder
 
@@ -2338,46 +2441,9 @@ def _enqueue_skip_trace_rows(
         )
     ).scalars().all()
 
-    # A lookup Tracerfy already CHARGED for and we could not attribute ('unmatched')
-    # is not retried on every run: the same address would most likely fail the same
-    # way, and each retry is billed. Inside the freshness window such an
-    # already-delivered lead is settled as 'errored' (what its earlier row already
-    # shows); past it, it is asked again like any stale lead. A transport failure or a
-    # pre-submit rejection leaves no 'unmatched' row, so it IS retried (Codex).
-    def _settle_charged_unanswered(rows: list) -> tuple[list, int]:
-        """Drop and settle leads whose earlier lookup was charged but unmatched.
-
-        Factored out because it has to run TWICE (Security Master Review pass 4):
-        once here, and again under the job lock. The dispatcher and ingest do not
-        take that lock, so a row can become 'unmatched' -- charged, with no answer
-        -- between this pass and the claim, and buying it again is a second
-        charge for a question the vendor already failed to answer.
-        """
-        delivered_before = [rec for rec in rows if rec.is_duplicate and rec.dedup_hash]
-        if not delivered_before:
-            return rows, 0
-        charged_unanswered = set(db.execute(
-            _sa_text(
-                "SELECT DISTINCT r.dedup_hash FROM pending_skip_trace_rows p "
-                "JOIN results r ON r.id = p.result_id AND r.user_id = p.user_id "
-                "WHERE p.user_id = CAST(:uid AS uuid) AND p.status = 'unmatched' "
-                "  AND r.dedup_hash = ANY(CAST(:hashes AS text[])) "
-                "  AND COALESCE(p.submitted_at, p.enqueued_at) "
-                "      >= NOW() - make_interval(days => :ttl)"
-            ),
-            {"uid": str(job.user_id), "ttl": int(settings.SKIP_TRACE_CACHE_DAYS),
-             "hashes": sorted({rec.dedup_hash for rec in delivered_before})},
-        ).scalars())
-        if not charged_unanswered:
-            return rows, 0
-        settled = [rec for rec in delivered_before if rec.dedup_hash in charged_unanswered]
-        for rec in settled:
-            rec.skip_trace_status = "errored"
-            rec.skip_trace_attempted_at = _now()
-        settled_ids = {rec.id for rec in settled}
-        return [rec for rec in rows if rec.id not in settled_ids], len(settled)
-
-    eligible, _settled_n = _settle_charged_unanswered(eligible)
+    # Charged-but-unanswered leads are settled, not bought again: see
+    # settle_charged_unanswered (shared with the contact-lookup action worker).
+    eligible, _settled_n = settle_charged_unanswered(db, job.user_id, eligible)
     if _settled_n:
         # Committed here: `if not eligible: return` below would otherwise drop it.
         db.commit()
@@ -2586,7 +2652,7 @@ def _enqueue_skip_trace_rows(
     # charged, unanswered, and about to be bought a second time. No log line
     # here, because logging commits and that would release the lock; the count
     # is reported after the final commit below.
-    eligible, _late_settled = _settle_charged_unanswered(eligible)
+    eligible, _late_settled = settle_charged_unanswered(db, job.user_id, eligible)
     if not eligible:
         # The settles above are real writes and must not be dropped by returning.
         db.commit()
@@ -2627,48 +2693,10 @@ def _enqueue_skip_trace_rows(
             skipped_ineligible += 1
             continue
 
-        # v2 (migration 098 cutover): the key is the SUBJECT this lookup would be
-        # bought for — account, address, trace type and the exact names in the
-        # payload — not the address alone. Two owners at one address are now two
-        # answers, so an heir's lead can no longer be served the deceased owner's
-        # phone. The subject comes from the payload actually built, never
-        # recomputed from party_name.
-        #
-        # The legacy address-only read (and its mailing-locality fallback) is GONE
-        # rather than kept as a fallback: a legacy row cannot tell us whose answer
-        # it holds, so reading one is the leak. Those rows are inert and age out
-        # with the 90-day retention; deleting them is a separate PII-hygiene step.
-        # Cost of the cutover: a repeat address may be paid for again inside that
-        # window.
-        cache_key = payload_subject_key(job.user_id, payload)
+        # The v2 subject-keyed cache read and the ORM copy: copy_cached_answer
+        # (shared with the contact-lookup action worker).
         _v2_key_reads += 1
-        cached = db.get(SkipTraceCache, cache_key)
-        cache_valid = False
-        if cached:
-            # 90-day TTL check
-            age = _now() - cached.fetched_at
-            if age.days < settings.SKIP_TRACE_CACHE_DAYS:
-                cache_valid = True
-
-        if cache_valid:
-            # Copy cached values directly to the Result — no Tracerfy call
-            rec.phone = cached.phone
-            rec.phone_type = cached.phone_type
-            rec.phone_dnc_flag = cached.phone_dnc_flag
-            rec.email = cached.email
-            rec.phones = cached.phones
-            rec.emails = cached.emails
-            rec.skip_trace_status = "hit" if (cached.phone or cached.email) else "miss"
-            # When the data was obtained (the cache entry), not now: attempted_at is the
-            # 365-day PII retention clock, and a copy must not restart it.
-            rec.skip_trace_attempted_at = cached.fetched_at
-            rec.skip_trace_source = "reused"  # no lookup bought for this row
-            # WHOSE answer this is (098). Recorded now, while the subject is
-            # known, because it cannot be reconstructed later: party_name gets
-            # rewritten by owner recovery, and a recomputed subject would then
-            # name the current owner while these contacts belong to the previous
-            # one. The duplicate-reuse passes require an exact match on this.
-            rec.skip_trace_subject_hash = cache_key
+        if copy_cached_answer(db, job.user_id, rec, payload):
             cache_hits += 1
         else:
             # Collected, not inserted here. The claim is ONE set-based statement

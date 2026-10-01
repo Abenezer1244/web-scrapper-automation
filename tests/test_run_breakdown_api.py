@@ -10,9 +10,10 @@ import uuid
 
 import pytest
 from httpx import AsyncClient
-from sqlalchemy import text
+from sqlalchemy import event, text
 
 from src.api.run_breakdown import read_partition_async
+from src.db import session as _db_session
 from src.db.models import Job, Result, ScraperConfig, User
 
 ADDR = "5006 61ST STREET CT E"
@@ -101,6 +102,65 @@ async def test_a_partial_snapshot_is_not_shown_and_is_logged(
     with caplog.at_level(logging.WARNING):
         body = (await client.get(f"/jobs/{job_id}", headers=_auth(starter_token))).json()
     assert (body["breakdown"], body["breakdown_basis"]) == (None, None)
+    assert any("partial snapshot" in r.getMessage() for r in caplog.records)
+
+
+async def _list_capturing(client, token) -> tuple[list[dict], list[str]]:
+    """GET /jobs with every SQL statement the API's engine ran for it."""
+    statements: list[str] = []
+
+    def _seen(conn, cursor, statement, *args):
+        statements.append(statement)
+
+    engine = _db_session.async_engine.sync_engine
+    event.listen(engine, "before_cursor_execute", _seen)
+    try:
+        resp = await client.get("/jobs", headers=_auth(token))
+    finally:
+        event.remove(engine, "before_cursor_execute", _seen)
+    assert resp.status_code == 200
+    # The listener saw the list's own read, so an empty "results" check is not vacuous.
+    assert any("FROM jobs" in s for s in statements), statements
+    return resp.json(), statements
+
+
+def _reads_results(statements: list[str]) -> bool:
+    return any("FROM results" in s for s in statements)
+
+
+# UX 2d (Q2, F-006): the list is snapshot-only. It is polled every 5 s, and even the
+# narrowest live count measured p95 ~10 s for the largest account, so a run without a
+# valid snapshot shows no breakdown there and costs no results query.
+
+@pytest.mark.asyncio
+async def test_the_list_shows_no_breakdown_and_reads_no_results_without_a_snapshot(
+    client: AsyncClient, db, starter_user, starter_token, scraper_config,
+):
+    job_id = await _job(db, starter_user, scraper_config, records_found=4, record_count=2,
+                        billed_count=2)
+    await _rows(db, job_id, starter_user.id, LIVE_ROWS)
+
+    jobs, statements = await _list_capturing(client, starter_token)
+
+    listed = next(j for j in jobs if j["id"] == job_id)
+    assert (listed["breakdown"], listed["breakdown_basis"]) == (None, None)
+    assert not _reads_results(statements), statements
+
+
+@pytest.mark.asyncio
+async def test_the_list_hides_a_rejected_snapshot_and_reads_no_results(
+    client: AsyncClient, db, starter_user, starter_token, scraper_config, caplog,
+):
+    job_id = await _job(db, starter_user, scraper_config,
+                        **_snapshotted(breakdown_over_quota=None))
+    await _rows(db, job_id, starter_user.id, LIVE_ROWS)
+
+    with caplog.at_level(logging.WARNING):
+        jobs, statements = await _list_capturing(client, starter_token)
+
+    listed = next(j for j in jobs if j["id"] == job_id)
+    assert (listed["breakdown"], listed["breakdown_basis"]) == (None, None)
+    assert not _reads_results(statements), statements
     assert any("partial snapshot" in r.getMessage() for r in caplog.records)
 
 

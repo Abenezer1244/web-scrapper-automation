@@ -2155,7 +2155,8 @@
               {
                 "type": "null"
               }
-            ]
+            ],
+            "description": "What happened to every record this run found, frozen when it finished (snapshot only; null when the run has no valid snapshot: not finished, finished before snapshots existed, retried, or rejected on read). `already_delivered` is ACCOUNT-WIDE: a lead counts if any earlier run of this account, by any scraper or record type, delivered it. RAW: no tax cap and no view filter, so it can exceed the results tab's `already_delivered_count` on a tax run."
           },
           "breakdown_basis": {
             "anyOf": [
@@ -2170,6 +2171,7 @@
                 "type": "null"
               }
             ],
+            "description": "Always `snapshot` when `breakdown` is set here; null otherwise.",
             "title": "Breakdown Basis"
           },
           "county": {
@@ -3566,7 +3568,8 @@
               {
                 "type": "null"
               }
-            ]
+            ],
+            "description": "What happened to every record this run found: the snapshot frozen when it finished, else the same partition read now for a finished run (one job's rows only). Null when the run has not finished, a live reading cannot reconcile, or a stored snapshot is rejected (never replaced by a live one). `already_delivered` is ACCOUNT-WIDE (any earlier run of this account, by any scraper or record type) and RAW (no tax cap, no view filter), unlike `already_delivered_count` above, which is the tab's number."
           },
           "breakdown_basis": {
             "anyOf": [
@@ -3581,6 +3584,7 @@
                 "type": "null"
               }
             ],
+            "description": "`snapshot`: frozen at completion. `live`: counted now from the run's saved rows; later backfills move it. Null when `breakdown` is null.",
             "title": "Breakdown Basis"
           },
           "date_range_mode": {

@@ -4,8 +4,9 @@ Moved verbatim out of ``run_scrape_job`` (tasks.py) so the tests drive the code
 production runs: that function needs Redis and a browser, so its finalization could
 only be pinned by reading its source. Everything from the force-finalize guard to the
 done-CAS commit lives here; what run_scrape_job does after a completed run (logs, the
-done publish, notification, email, webhook, dialer) stays there and runs only on
-``FinalizeKind.DONE``.
+done publish, email, webhook, dialer) stays there and runs only on
+``FinalizeKind.DONE``. The in-app job_completed notification it sends there is built
+here, by ``emit_job_completed``, so its detail is tested on real rows (UX 2d).
 """
 from dataclasses import dataclass
 from enum import Enum
@@ -17,7 +18,12 @@ from src.api.quota_window import (
     window_cte_sql,
     window_set_sql,
 )
-from src.api.run_breakdown import SNAPSHOT_COLUMNS, decide_snapshot, read_partition
+from src.api.run_breakdown import (
+    SNAPSHOT_COLUMNS,
+    breakdown_from_job,
+    decide_snapshot,
+    read_partition,
+)
 from src.db.models import Job
 from src.utils.logger import setup_logger
 from src.workers.tasks_helpers.status import (
@@ -456,6 +462,30 @@ def finalize_billing_and_done(
         else None
     )
     return FinalizeOutcome(FinalizeKind.DONE, int(display_count), frozen)
+
+
+def emit_job_completed(job: Job, config, job_id: str, display_count: int) -> None:
+    """The in-app job_completed notification, best-effort (``create_notification``).
+
+    ``already_delivered`` (UX 2d, F-006) comes from the breakdown persisted on the job
+    row, validated the way GET /jobs validates it, so the notification names exactly
+    the number the jobs list shows. Read from the row, not ``FinalizeOutcome.frozen``:
+    a re-run billed earlier keeps its snapshot but freezes nothing new. Present when
+    it is 0 (a real zero), absent when the run has no valid snapshot: an unknown
+    count is never written as 0, and "0 new records" alone stays the old reading.
+    """
+    from src.workers.notification_emit import create_notification
+    detail = {
+        "scraper_name": config.name,
+        "county": config.county,
+        "record_count": display_count,
+    }
+    snapshot, problem = breakdown_from_job(job)
+    if problem is not None:
+        _logger.warning("Job %s: stored run-count breakdown rejected (%s)", job_id, problem)
+    if snapshot is not None:
+        detail["already_delivered"] = snapshot["already_delivered"]
+    create_notification(user_id=job.user_id, type="job_completed", job_id=job_id, detail=detail)
 
 
 def _fenced_exit(db, job_id: str, boot_user_id, attempt_token, where: str) -> FinalizeOutcome | None:

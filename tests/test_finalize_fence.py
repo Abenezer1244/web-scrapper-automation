@@ -546,8 +546,11 @@ def test_run_scrape_job_passes_the_whole_token_everywhere():
     assert "if _outcome.kind is not FinalizeKind.DONE:" in body
     # Everything after DONE (email, webhook, dialer) is below that return.
     tail = body[body.index("if _outcome.kind is not FinalizeKind.DONE:"):]
-    for effect in ("deliver_job_email", "create_notification", "r.publish("):
+    for effect in ("deliver_job_email", "emit_job_completed(", "r.publish("):
         assert effect in tail
+    # The completed notification goes out once, through the helper (UX 2d), never inline.
+    assert tail.count("emit_job_completed(") == 1
+    assert '"job_completed"' not in body and "'job_completed'" not in body
 
 
 def test_finalize_fences_every_money_write():

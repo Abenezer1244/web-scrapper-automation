@@ -4643,6 +4643,9 @@ mandatory: the post-deploy NULL proof, and owner-approved remediation for any NU
   GB). The owner freed space. Both files were restored (`git checkout` + AJ1 re-applied)
   and matched the pre-run SHA-256 exactly. The interrupted slice was re-run.
   **Mutations: 14/14 caught**, hashes OK.
+- Rebased on main `aeeaccd6` (#423: journal, schemas/constants/retention comments; none of
+  this PR's files). **Regression re-run after AJ1 + the rebase: 1161 passed, 0 failed**
+  (the same 42 files). ruff clean on `src` and both test files.
 
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever

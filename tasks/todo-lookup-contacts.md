@@ -3530,6 +3530,294 @@ Branch `feat/lookup-1b2a-ii-claim-action` off `e9397f0f` (after #399's
 - **Regression: 825 passed, 0 failed** (all 27 files that touch the claim, pending rows or
   the ledger, 2 chunks). The first run caught the 3 exact-dict asserts, fixed as above.
 
+### 2a-ii MERGED + LIVE (2026-09-30): #406, merge `8c9afb98`
+
+### 2b BUILD SPEC (2026-09-30, branch `feat/lookup-1b2b-worker` off `11069d6a`, BEFORE the Codex consult)
+The step "1b-2b" above, as amended by V1, V8/W7 and W1. This section only fills what the step
+leaves open; where it differs from the step, the amendments decide. Nothing dispatches to
+this task until 2d, so the merge changes nothing live EXCEPT the enrich extraction.
+
+**Module `src/workers/contact_lookup_action.py`** (Celery `include`; imports the planner and
+`enrich` INSIDE the task, the #393 lesson).
+- `ACTION_TRANSITIONS`:
+  - `dispatching → {running, expired}`;
+  - `running → {claimed, failed, dispatching}` (`dispatching` = wait, or the reconciler's
+    lease expiry);
+  - `claimed → {settled}`;
+  - `settled`, `failed`, `expired` → nothing.
+- `VERDICT_TRANSITIONS`:
+  - `quoted → {newly_queued, reused, already_answered, in_progress_elsewhere, ineligible,
+    abandoned, excluded_*}` (an `excluded_*` only from a stricter current policy);
+  - `newly_queued → {answered_hit, answered_miss, unmatched_billable, unmatched_unbilled,
+    errored_unsubmitted, released}` (2c's);
+  - every other disposition → nothing.
+- `_move(db, action_id, frm, to, reason, *, lease_token=None, sets=...)`:
+  - asserts the matrix (`IllegalTransition`, a programming error);
+  - CAS `UPDATE … WHERE id AND status = frm [AND lease_token = :mine] RETURNING`, stamping
+    `status_reason` and `status_changed_at`;
+  - inserts the event in the same transaction;
+  - returns False when the CAS matched nothing.
+- `_set_verdicts(db, action, frm, {result_id: to}, *, reasons=None)`:
+  - asserts every pair;
+  - one bulk `UPDATE … FROM (VALUES …) WHERE disposition = frm`, and asserts it updated EXACTLY
+    the given number of rows;
+  - per-lead events only where the plan wants them (held, abandoned).
+- **T1:** `_move(dispatching → running)` with a new token, `lease_expires_at = now() + 10
+  min`, and `started_at = COALESCE(started_at, now())`. COMMIT. Nothing matched → no-op.
+- **T2:**
+  1. `SELECT … FOR UPDATE` the action;
+  2. fence: `running` + my token + `lease_expires_at > now()`, else roll back, no-op;
+  3. kill switch / token off → `running → dispatching`, lease cleared, reason `kill_switch`,
+     COMMIT (O-B);
+  4. `lock_job_for_claim(job)`;
+  5. job gate: `status = 'done' AND _job_delivered_sql` (`:since` bound), by `(id,
+     user_id)`. Else `failed` (`job_not_delivered`) + all quoted → `abandoned`;
+  6. access gate: `normalize_plan(plan) ∈ SKIP_TRACE_ADDON_PLANS` AND
+     `paid_lookup_access(read_access_rows(lock=""))` not blocked. Else `failed`
+     (`plan_not_eligible` / `access_<value>`) + abandoned. The claim re-reads the user LOCKED;
+     a block found there is per-lead `ineligible`;
+  7. V1: `count(quoted rows of this action JOIN results ON id, user_id = action.user_id,
+     job_id = action.job_id)` must == `quoted_count`. Else `failed` (`quoted_set_mismatch`)
+     + abandoned;
+  8. read the quoted leads as `(Result, enqueue_eligible)` tuples (Z3: `populate_existing`,
+     same join, `ORDER BY created_at, id`);
+  9. classify each tuple in order with `_verdict_for(result, enqueue_eligible, policy)` (D1
+     below): the boolean is an ARGUMENT, and step 2 of D1 reads it;
+  10. claim the payloads with `action_id` + `report`;
+  11. write the verdicts and counts; `running → claimed`, `claimed_at`, the lease cleared;
+  12. ONE commit.
+- **Failure inside T2:** roll back, then in a NEW transaction `_move(running → dispatching)`,
+  fenced by the token, lease cleared:
+  - `ClaimUnenforcedError` → reason `claim_unenforced` + an ops alert;
+  - a `lock_timeout` → `claim_lock_busy`;
+  - anything else (incl. `SoftTimeLimitExceeded`) → `worker_error`, logged, then RE-RAISED.
+
+  The reconciler (2c) re-drives until the 30-min deadline, then `expired`.
+- **Task:** `lookup_contacts(action_id)`, a non-UUID → log, no-op. `soft_time_limit=240`,
+  `time_limit=300`: below the 10-min lease, so the task dies before its lease could be taken
+  over.
+
+**D1 classification, first match wins** (pinned policy = snapshot `policy` AND current settings;
+a missing key reads as False, i.e. the stricter one):
+
+| Check | Verdict |
+|---|---|
+| `classify` IN_PROGRESS | `in_progress_elsewhere` |
+| ALREADY_ANSWERED | `already_answered` |
+| PREVIOUSLY_ATTEMPTED (errored, unknown) | `ineligible` |
+| the enqueue's SQL predicates fail now (`property_address` NOT NULL, `actionable_condition`, `skip_trace_eligible_condition`): over quota, superseded, … (Y3/Z1: the `enqueue_eligible` column) | `ineligible` |
+| an excluded bucket | its `excluded_*` |
+| charged-unanswered (the SHARED helper; it settles the result `errored` exactly as the enqueue does) | `already_answered` |
+| valid cache hit (the SHARED helper, an ORM copy) | `reused` |
+| else a claim payload | — |
+| the claim WON it | `newly_queued` |
+| `held_ids` | `ineligible` + an event (`trial_allowance`, or `access_<value>`) |
+| refused (unwritable) or lost a race | a verdict from its current status: `queued`/`submitted` → `in_progress_elsewhere`, `hit`/`miss` → `already_answered`, else `ineligible` |
+
+Counts:
+- `newly_queued_count` / `reused_count` are the verdict counts;
+- `claimed_count` = newly_queued + reused (leads this action answered or bought);
+- `tracerfy_credits` = the credits of the newly queued rows' trace types;
+- `billable_rows` stays 0, for 2c.
+
+**The enrich extraction** (behaviour-preserving):
+- `settle_charged_unanswered(db, user_id, rows) -> (kept, settled_n)`: the enqueue's inner
+  closure, lifted verbatim to module level;
+- `copy_cached_answer(db, user_id, rec, payload) -> bool`: the cache read, the TTL check and
+  the ORM copy.
+
+The enqueue calls both in the same places with the same arguments. The planner parity tests,
+the enqueue tests and the 2a-ii golden INSERT pin it.
+
+**Tests** (`tests/test_contact_lookup_action.py`, real PG + Redis; actions seeded through SQL
+exactly as 2d will write them):
+- every row of D1;
+- the matrix;
+- T1/T2 fencing (a lost lease → no-op, nothing bought);
+- a kill between T1 and T2 leaves `running` + an expiring lease;
+- redelivery / double delivery → one set of rows;
+- the action racing the real scrape enqueue on one lead (two threads) → one row;
+- non-quoted, other-tenant and other-job ids never bought;
+- the trial cap with `held_ids` recorded;
+- kill switch → waits;
+- job not done → abandoned;
+- V1 mismatch → failed;
+- the lease cleared at claim;
+- parity with `_enqueue_skip_trace_rows` on the same seeds;
+- the failure paths;
+- counts.
+
+Mutation runner per the 2a pattern.
+
+**Pre-existing, found while reading (to verify in PRODUCTION before raising, read-only):**
+the claim's withdrawal path `DELETE`s its own uncommitted pending rows
+(`skip_trace_claim.py:775`), but no script or migration grants `DELETE ON
+pending_skip_trace_rows` to `bridgeleads_system` (`provision_rls_roles.sql:306` grants only
+`SELECT, INSERT, UPDATE` on all tables). If production matches, that race path raises
+`permission denied` and rolls back the WHOLE claim:
+- on the enqueue it is caught and re-raised as a failed enqueue; the leads stay
+  `not_attempted`;
+- on the action it is the `worker_error` wait path.
+
+So it costs availability, not money. The check (`has_table_privilege`) is ready in this
+session's scratchpad (`priv_check.py`) and is blocked on `railway login`.
+
+### Codex pre-code consult r1 on 2b (2026-09-30): PLAN: REVISE, 1 P1 + 3 P2, all adopted
+Output: `<scratchpad 4ebfb689>/codex_2b_consult_r1_out.txt`. Codex found these SOUND:
+- the tenant/job fencing;
+- the V1 check;
+- the snapshot-AND-current policy;
+- the extraction (as long as the helpers stay non-committing and the action uses
+  `populate_existing`);
+- the counts;
+- the matrices.
+
+It said to ACCEPT trace-type drift between quote and claim (billing is per row, and the cache
+key carries the current subject + trace type), and to test both directions. These AMEND the
+build spec:
+- **Y1 (P1, pre-existing, NOT 2b's code) the missing `DELETE` grant is CONFIRMED in the
+  repo.** `provision_rls_roles.sql:305-326` grants `bridgeleads_system` only `SELECT, INSERT,
+  UPDATE`, and `scripts/verify_worker_delete_grants.py:36-47` does not list the table. Nothing
+  double-buys, but the claim's lost-race withdrawal raises and rolls back the whole claim, for
+  the live enqueue and the action alike.
+  - It becomes **owner item O-D, a HARD GATE before 2d** (beside O-C). First verify production
+    read-only (`priv_check.py`); then either grant `DELETE ON pending_skip_trace_rows` to the
+    system role (provision script + verifier + an applied grant), or redesign the withdrawal.
+  - 2b ships idle, so it is not blocked. 2b's `worker_error` wait path is what the action does
+    meanwhile.
+- **Y2 (P2) hard-kill recovery is the LEASE, not redelivery.** `task_reject_on_worker_lost` is
+  not set (`src/workers/__init__.py:115-119`), and setting it would not help anyway: after T1
+  the action is `running`, so a redelivery no-ops by design. The recovery guarantee is 2c's
+  lease expiry (`running → dispatching`) + re-publish. This is written in the module docstring
+  and pinned by the kill-between-T1-and-T2 test. The global Celery config is NOT changed (it
+  would touch every live task).
+- **Y3 (P2) D1 has ONE precedence, and the enqueue's SQL predicates gate the payload:**
+  1. `classify`'s status buckets (IN_PROGRESS / ALREADY_ANSWERED / PREVIOUSLY_ATTEMPTED);
+  2. the enqueue's SQL predicates (`property_address` NOT NULL, `actionable_condition`,
+     `skip_trace_eligible_condition`), evaluated IN the quoted-set query → `ineligible`;
+  3. `classify`'s address/policy buckets → `excluded_*`;
+  4. charged-unanswered (it only ever sees `not_attempted` rows) → `already_answered`;
+  5. the cache → `reused`;
+  6. the claim.
+
+  No lead failing 1-3 reaches `claim_skip_trace_rows`. Each step is tested.
+- **Y4 (P2) the pinned policy is parsed strictly:** `snapshot["policy"][key] is True`, AND the
+  current settings. Missing, non-bool or `"true"` → False. Tests:
+  - a missing key;
+  - a string value;
+  - trace-type drift both ways;
+  - quote-set shrinkage (a quoted result deleted → the V1 mismatch);
+  - every `newly_queued` terminal disposition legal in the matrix.
+
+### Codex consult r2 on 2b (2026-09-30): PLAN: REVISE, 1 P1 + 1 P2, both adopted
+Y1, Y2 and Y4 are closed; gating 2d on O-D is accepted.
+- **Z1 (P1) a predicate is a COLUMN, never a filter.** The quoted-set query selects every
+  quoted lead (the V1 join, nothing else in its WHERE) plus `enqueue_eligible` = the three
+  enqueue predicates as ONE boolean expression in the select list. A lead failing it gets the
+  verdict `ineligible`. Filtering would leave it `quoted` with no verdict, against "every quoted
+  lead gets exactly one verdict".
+  - The worker asserts that its verdict map covers EXACTLY the quoted set before writing.
+  - `_set_verdicts` asserts the row count.
+- **Z2 (P2) O-D names every grant source.** The grant goes into ALL three, kept consistent:
+  - `scripts/provision_rls_roles.sql`;
+  - `scripts/verify_worker_delete_grants.py`;
+  - `scripts/_cutover_step2_grants_policies.py` (`_SYSTEM_DELETE_TABLES`, `:75-95,163-171`).
+
+**r3 (2026-09-30): REVISE, 1 P1 + 1 P2, both fixed IN PLACE:**
+- the D1 table now lists the predicate row BEFORE the `excluded_*` row (Y3's order);
+- **Z3** the query shape is
+  `select(Result, and_(Result.property_address.isnot(None), actionable_condition(),
+  skip_trace_eligible_condition()).label("enqueue_eligible"))`:
+  - `.join(ContactLookupActionResult …quoted…)`;
+  - `.where(Result.user_id == action.user_id, Result.job_id == action.job_id)`;
+  - `.order_by(Result.created_at, Result.id)`, `populate_existing`;
+  - rows are `(Result, enqueue_eligible)` tuples. A NULL from the expression counts as
+    not eligible (`is True`).
+
+  Tests: one lead per predicate failing (over quota, superseded duplicate, no property AND no
+  mailing, NULL `property_address`), each → `ineligible`, never claimed.
+
+**r4: REVISE, 1 P2** (T2 did not say the boolean is passed into classification): fixed in
+place (T2 steps 8-9, `_verdict_for(result, enqueue_eligible, policy)`). **r4's P2 is CLOSED.**
+
+**r5: REVISE, 1 P1: REJECTED, with reasoning.**
+- **The claim.** Codex: the predicates read at T2.8 are not re-checked atomically by the claim
+  INSERT (the 1b contract at `:616` says "the eligibility predicate"). A lead can go over
+  quota or superseded between T2.8 and the INSERT (writers exist: `dedup.py:1051`,
+  `trustee_sale_finalize.py:189`).
+- **Why it's rejected:**
+  - **The money boundary is SUBMISSION, and it already re-checks atomically.**
+    `_partition_still_deliverable` (`skip_trace_dispatcher.py:1349-1418`) reads the Results
+    `FOR SHARE SKIP LOCKED`, re-checks `skip_trace_eligible_condition` and over-quota, and
+    holds that lock until the `queued → submitting` claim commits. The pre-submit sweep
+    `_cancel_undeliverable_queued` (`:900-925`) cancels the same predicates.
+  - So a lead that turns ineligible after the claim is cancelled, never charged, and 2c
+    derives `released`.
+  - The live enqueue has the IDENTICAL claim-time window (`enrich.py:2560-2719`: re-read, then
+    claim) and depends on the same backstop. Parity is the contract.
+  - Adding predicates to the shared claim INSERT would change the scrape path's golden
+    statement (2a-ii) and make `skip_trace_claim.py` a 6th file, for a window that cannot
+    spend money.
+- **Test added to the 2b list:** an action-claimed lead made over quota after the claim is
+  cancelled by the real `_cancel_undeliverable_queued` before any submission.
+
+**r6 (2026-09-30): `PLAN: GO`, no new findings. The r5 rejection HOLDS** (Codex verified it in
+code):
+- eligibility, over-quota and job delivery are re-checked under lock at the submit boundary;
+- the address half is only ever FILLED after delivery, never emptied;
+- pre-submit validation rejects missing provider fields.
+
+O-D stays the pre-2d gate. Outputs: `<scratchpad 4ebfb689>/codex_2b_consult_r{1..6}_out.txt`.
+
+### 2b BUILT (2026-09-30), before the Codex diff review
+- **NEW `src/workers/contact_lookup_action.py`:**
+  - `ACTION_TRANSITIONS` / `VERDICT_TRANSITIONS`;
+  - `_move()`: matrix-checked CAS + event; the lease is set only on entering `running` and
+    cleared on every other move;
+  - `_set_verdicts()`: matrix-checked; exact row count, or it raises;
+  - `_claim()` (T2) and `run_action()` (T1, T2, the failure → wait path);
+  - the `lookup_contacts` task (soft 240 s / hard 300 s).
+  - **One change from the spec, found by mutation:** V1 is `total == in_job == quoted_count`
+    over ALL of the action's quoted rows. A job-scoped count alone passes when a quoted row
+    outside the job happens to keep the count equal, and that row would stay `quoted` forever
+    with no verdict. Tested.
+- `src/workers/__init__.py`: the module is in Celery `include`. `test_import_cycles` (27)
+  covers it in a fresh interpreter.
+- `src/workers/tasks_helpers/enrich.py`: `settle_charged_unanswered()` and
+  `copy_cached_answer()` lifted to module level, verbatim. The enqueue calls them where it
+  used to inline them. The now-unused local imports are dropped.
+- **Tests** (`tests/test_contact_lookup_action.py`, 51, real PG + Redis):
+  - every D1 row in one action, incl. cache entries on in-flight / errored leads (never
+    overwritten);
+  - PARITY with the real `_enqueue_skip_trace_rows`, ATIP both ways;
+  - the pinned policy: 6 cases, incl. a string `"true"` and missing keys;
+  - trace-type drift both ways;
+  - the kill switch, then the re-drive; an empty token;
+  - job not delivered (3 statuses); plan / frozen / ended;
+  - the trial cap with held events;
+  - V1: shrinkage, another job, and an outside row with a matching count;
+  - kill between T1 and T2 → recoverable; lost fence ×3;
+  - redelivery; two concurrent deliveries;
+  - the race with the real scrape enqueue (one row per lead);
+  - a lost race via a pass-through spy (×3 statuses);
+  - a busy claim lock → wait;
+  - an injected error → wait + re-raise, nothing written;
+  - over quota after the claim → cancelled by the real dispatcher sweep;
+  - the matrices.
+- **Mutations 25/26 caught.** The survivor is EQUIVALENT: dropping the job scope from the
+  quoted-set READ. V1 has just proven every quoted row is inside the job, in the same
+  transaction, under the action row lock. Kept as the belt.
+  - The first run caught 21/25. Of its 4 survivors:
+    - one exposed the V1 gap above;
+    - two showed the cache copy could overwrite an in-flight lead if `classify` were bypassed
+      (tests now seed cache entries on those leads);
+    - one was a matrix test passing for the wrong reason (the lease rule raised first; it now
+      matches the matrix message).
+- **Regression: 974 passed, 0 failed** (all 30 files touching pending rows / claim / ledger /
+  the enqueue, 4 chunks), plus 67 in the 4 files that read Celery `include`, and 27 import
+  cycles. The first 15-file chunk overran 590 s (killed; no stray pytest left), so the chunks
+  are now 7-8 files. ruff clean. No type checker is configured.
+
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever
       the tab has leads that have never been looked up; when the quote comes back with

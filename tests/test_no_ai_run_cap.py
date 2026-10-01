@@ -1,7 +1,7 @@
 """AI mode removal, Phase 1: there is no monthly "AI" run cap any more.
 
 Owner decision 2026-09-30: remove AI mode from the product. The template
-connectors (still stored as scraper_mode 'ai' until Phase 2) are ordinary
+connectors (scraper_mode 'template', formerly 'ai') are ordinary
 scrapers; running one no longer spends a per-plan monthly allowance. Runs stay
 bounded by the record quota and the entitlement rules, which are unchanged.
 """
@@ -18,7 +18,7 @@ async def test_a_template_scraper_keeps_running_past_the_old_monthly_cap(
     """REGRESSION: a Starter account with 6 runs this month on a template county.
     The old cap refused the 6th ("Monthly AI scrape limit reached (5/5)")."""
     county = _county()
-    await connectors(county, ["probate"], "ai")
+    await connectors(county, ["probate"], "template")
     user = await _user(db, plan="starter", records_limit=50)
     config = await _config(db, user, county)
     for _ in range(6):
@@ -34,7 +34,7 @@ async def test_the_record_quota_still_refuses_a_template_scraper(db, connectors,
     """The cap's removal lifts nothing else: an account over its record limit is
     still refused on a template county, with the account rule's code."""
     county = _county()
-    await connectors(county, ["probate"], "ai")
+    await connectors(county, ["probate"], "template")
     user = await _user(db, plan="starter", records_limit=50, records_used=50)
     config = await _config(db, user, county)
 

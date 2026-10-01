@@ -49,13 +49,11 @@ _ALLOWED_SCRAPER_MODULES = frozenset([
 ScraperFactory = Callable[..., "BridgeScraper"]
 
 
-# The stored modes that mean "resolve the recorder-platform template from
-# base_url". 'ai' is the old name for it and is being retired (owner decision
-# 2026-09-30: remove AI mode; plan tasks/todo-remove-ai-mode.md, Phase 2).
-# Phase 2a: every reader accepts both names while every writer still stores 'ai',
-# so any mix of old and new api/worker/beat processes agrees on every row.
-# 2b switches writers to 'template' and migrates the rows; 2c drops 'ai'.
-TEMPLATE_MODES = frozenset({"template", "ai"})
+# The stored mode that means "resolve the recorder-platform template from base_url".
+# Its old name 'ai' was retired in three deploys (owner decision 2026-09-30, remove AI
+# mode): 2a read both, 2b wrote 'template' and migrated the rows (108), 2c dropped 'ai'
+# and the database refuses it (ck_county_connectors_scraper_mode, migration 109).
+TEMPLATE_MODES = frozenset({"template"})
 
 
 def is_template_mode(scraper_mode: str | None) -> bool:

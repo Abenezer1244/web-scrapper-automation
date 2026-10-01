@@ -1,9 +1,11 @@
 """Job routes: CRUD + SSE live log stream."""
 
 import asyncio
+import concurrent.futures
 import functools
 import json
 import secrets
+import threading
 import time
 import uuid
 from collections.abc import AsyncGenerator
@@ -54,6 +56,9 @@ from src.api.schemas import (
     RUN_START_402_RESPONSES,
     AlreadyDeliveredContacts,
     AuctionCoverage,
+    ContactLookupAction,
+    ContactLookupConfirmErrorResponse,
+    ContactLookupConfirmRequest,
     ContactLookupExcluded,
     ContactLookupPause,
     ContactLookupQuote,
@@ -1305,6 +1310,289 @@ async def quote_contact_lookups(
             advanced_resume_at=pause.advanced_resume_at,
         ),
     )
+
+
+# ─── Contact lookups: the confirm (Phase 1b-2d) ──────────────────────────────
+#
+# Contract: tasks/todo-lookup-contacts.md, "## Phase 1b-2d — the confirm endpoint" as
+# amended by AO1-AO5. The switch that makes contact lookup purchasable, and it buys
+# nothing itself: it commits a durable `dispatching` action with one `quoted` row per
+# lead the quote offered, then publishes the worker (`lookup_contacts`, 2b), which
+# claims them through the one claim path. A lost publish is re-driven by the
+# reconciler (2c, P3); an action nobody starts expires at its 30-minute deadline.
+
+# A broker stall must hold neither the event loop nor the request threads (AO3): a
+# publish runs on its own two threads, behind a slot it takes WITHOUT waiting. With
+# both busy it is skipped, and the reconciler publishes the action instead.
+_PUBLISH_BOUND_S = 3.0
+_publish_slots = threading.BoundedSemaphore(2)
+_publish_pool = concurrent.futures.ThreadPoolExecutor(
+    max_workers=2, thread_name_prefix="contact-lookup-publish",
+)
+
+# Delete the tab's quote only if it is still the one just confirmed: a newer quote
+# written in between belongs to the customer's next action.
+_DELETE_IF_SAME_QUOTE = """
+local v = redis.call('GET', KEYS[1])
+if v and cjson.decode(v)['quote_id'] == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+end
+return 0
+"""
+
+
+def _confirm_refusal(status_code: int, code: str, message: str) -> HTTPException:
+    return HTTPException(status_code=status_code, detail={"code": code, "message": message})
+
+
+def _quote_expired() -> HTTPException:
+    return _confirm_refusal(
+        status.HTTP_410_GONE, "quote_expired",
+        "This quote has expired or was replaced by a newer one. Nothing was charged; "
+        "please get a new quote.",
+    )
+
+
+async def _action_for_quote(db: AsyncSession, quote_id: str, user_id: str):
+    """The action a quote already became, for THIS account only."""
+    return (await db.execute(
+        text("SELECT id::text AS id, job_id::text AS job_id, category, status, "
+             "       quoted_count, truncated "
+             "FROM contact_lookup_actions "
+             "WHERE quote_id = :q AND user_id = CAST(:u AS uuid)"),
+        {"q": quote_id, "u": user_id},
+    )).first()
+
+
+def _replayed(row, job_id: str, category: str) -> ContactLookupAction:
+    """A confirm already made answers with its action, whatever changed since (AO1)."""
+    if row.job_id != job_id or row.category != category:
+        raise _confirm_refusal(
+            status.HTTP_409_CONFLICT, "quote_mismatch",
+            "This quote was confirmed for a different results tab.",
+        )
+    return ContactLookupAction(action_id=row.id, status=row.status,
+                               quoted_count=row.quoted_count, truncated=row.truncated)
+
+
+def _publish_blocking(task, action_id: str) -> None:
+    try:
+        # retry=False: kombu's publish-retry loop would hold this thread (AO3).
+        task.apply_async(args=[action_id], retry=False)
+    finally:
+        _publish_slots.release()
+
+
+async def _publish_contact_lookup(task, action_id: str) -> bool:
+    """True when the worker's message was handed to the broker. Never raises."""
+    if not _publish_slots.acquire(blocking=False):
+        _logger.warning("contact lookup %s: publish skipped (broker busy); the "
+                        "reconciler will publish it", action_id)
+        return False
+    try:
+        future = _publish_pool.submit(_publish_blocking, task, action_id)
+    except Exception:  # noqa: BLE001 - the action is committed; P3 re-drives it
+        _publish_slots.release()
+        _logger.warning("contact lookup %s: publish not started", action_id, exc_info=True)
+        return False
+    try:
+        await asyncio.wait_for(asyncio.wrap_future(future), _PUBLISH_BOUND_S)
+        return True
+    except Exception:  # noqa: BLE001 - incl. the timeout; the thread frees its slot
+        _logger.warning("contact lookup %s: publish failed; the reconciler will "
+                        "publish it", action_id, exc_info=True)
+        return False
+
+
+@router.post(
+    "/{job_id}/contact-lookups",
+    response_model=ContactLookupAction,
+    status_code=status.HTTP_202_ACCEPTED,
+    responses={
+        **RUN_START_402_RESPONSES,
+        409: {"model": ContactLookupConfirmErrorResponse,
+              "description": "The quote is stale, empty, unsupported or for another tab, "
+                             "or the run has not finished."},
+        410: {"model": ContactLookupConfirmErrorResponse,
+              "description": "The quote expired or was replaced. Nothing was charged."},
+        503: {"model": ContactLookupUnavailableResponse,
+              "description": "Lookups are switched off or a dependency is unreachable."},
+    },
+)
+async def confirm_contact_lookups(
+    job_id: str,
+    body: ContactLookupConfirmRequest,
+    current_user: CurrentUser,
+    request: Request,
+    db: AsyncSession = Depends(get_rls_db),
+) -> ContactLookupAction:
+    """Buy the lookups a quote offered. Idempotent: the same quote returns the same
+    action. Accepted (202): the lookups are queued by a worker shortly after."""
+    now = datetime.now(UTC)
+    # The `writes` zone (V7/W4), 30/min. A Redis failure falls back to the
+    # per-process limiter; only a stalled limiter call is refused here (AO4).
+    try:
+        await asyncio.wait_for(
+            rate_limit(request, zone="writes", identifier=current_user.id),
+            _LOOKUP_REDIS_CALL_BOUND_S,
+        )
+    except TimeoutError:
+        raise _lookups_unavailable() from None
+
+    job = (await db.execute(
+        select(Job).where(Job.id == job_id, Job.user_id == current_user.id)
+    )).scalar_one_or_none()
+    if job is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    if not _run_delivered(job):
+        raise _confirm_refusal(
+            status.HTTP_409_CONFLICT, "run_not_finished",
+            "This run has not finished, so there are no leads to look up yet.",
+        )
+    user_id = str(current_user.id)
+
+    # A replay first, before anything that can change after a purchase (AO1).
+    existing = await _action_for_quote(db, body.quote_id, user_id)
+    if existing is not None:
+        return _replayed(existing, job_id, body.category)
+
+    # The same gates as the quote, now that this would create something.
+    plan = normalize_plan(current_user.plan)
+    if plan not in SKIP_TRACE_ADDON_PLANS:
+        raise_plan_features([skip_trace_violation(plan)])
+    eligibility = run_eligibility(current_user, now)
+    if eligibility.code in ("frozen", "ended"):
+        raise run_refusal_http(eligibility.code, eligibility.message, eligibility.resumes_at)
+    if not settings.SKIP_TRACE_ENABLED or not settings.TRACERFY_API_TOKEN:
+        raise _lookups_unavailable()
+    from src.workers.skip_trace_claim import ACCESS_FULL, ACCESS_TRIAL, paid_lookup_access
+
+    if paid_lookup_access(current_user, now) not in (ACCESS_FULL, ACCESS_TRIAL):
+        raise _lookups_unavailable()  # fail closed; the claim re-checks it locked
+
+    key = _quote_key(user_id, job_id, body.category)
+    try:
+        r = _lookup_redis()
+        raw = await _bounded(r.get, key)
+    except Exception:  # noqa: BLE001 - any Redis failure is the same 503
+        raise _lookups_unavailable() from None
+    if raw is None:
+        raise _quote_expired()
+    try:
+        quote = json.loads(raw)
+    except ValueError:
+        quote = {}
+    if quote.get("v") != 2:
+        raise _confirm_refusal(status.HTTP_409_CONFLICT, "quote_unsupported",
+                               "This quote cannot be confirmed. Please get a new quote.")
+    if (quote.get("quote_id") != body.quote_id or quote.get("user_id") != user_id
+            or quote.get("job_id") != job_id or quote.get("category") != body.category):
+        raise _quote_expired()  # superseded by a newer quote of this tab
+    try:
+        expires_at = datetime.fromisoformat(quote["expires_at"])
+    except (KeyError, TypeError, ValueError):
+        raise _quote_expired() from None
+    if expires_at <= now:
+        raise _quote_expired()
+    ids = list(dict.fromkeys(str(i) for i in quote.get("quoted_ids") or []))
+    if not ids:
+        raise _confirm_refusal(status.HTTP_409_CONFLICT, "nothing_to_look_up",
+                               "This quote offered no leads to look up.")
+
+    action_id = str(uuid.uuid4())
+    truncated = quote.get("stopped") is not None and (quote.get("remaining") or 0) > 0
+    snapshot = {  # what the quote showed, frozen with the action (V6)
+        k: quote.get(k) for k in (
+            "counts", "examined", "stopped", "remaining", "window_end", "policy",
+            "access", "trial_credit_allowance", "over_credit_cap", "planner_version",
+            "advanced_count", "quoted_credits", "included_remaining_at_quote",
+            "expires_at")
+    }
+    snapshot["quote_created_at"] = quote.get("created_at")
+    params = {"a": action_id, "u": user_id, "j": job_id}
+    try:
+        # ONE transaction, in the tenant session, so the 101 guards bind: a
+        # `dispatching` action, its `quoted` rows, and the one initial event.
+        await db.execute(
+            text("INSERT INTO contact_lookup_actions (id, user_id, job_id, category, "
+                 "  quote_id, status, unit_price_cents, currency, pricing_version, "
+                 "  quoted_count, truncated, quote_snapshot) "
+                 "VALUES (CAST(:a AS uuid), CAST(:u AS uuid), CAST(:j AS uuid), :c, :q, "
+                 "  'dispatching', :price, :cur, :pv, :n, :t, CAST(:snap AS jsonb))"),
+            {**params, "c": body.category, "q": body.quote_id,
+             "price": quote.get("unit_price_cents"), "cur": quote.get("currency"),
+             "pv": quote.get("pricing_version"), "n": len(ids), "t": truncated,
+             "snap": json.dumps(snapshot)},
+        )
+        # The quoted set is PROVEN against this tenant's run (V1): every quoted id
+        # must still be one of this account's leads in this run, or nothing is bought.
+        inserted = (await db.execute(
+            text("INSERT INTO contact_lookup_action_results (id, action_id, user_id, "
+                 "  result_id, disposition) "
+                 "SELECT gen_random_uuid(), CAST(:a AS uuid), CAST(:u AS uuid), r.id, "
+                 "       'quoted' "
+                 "FROM results r "
+                 "WHERE r.id = ANY(CAST(:ids AS uuid[])) "
+                 "  AND r.user_id = CAST(:u AS uuid) AND r.job_id = CAST(:j AS uuid)"),
+            {**params, "ids": ids},
+        )).rowcount
+        if inserted != len(ids):
+            await db.rollback()
+            raise _confirm_refusal(
+                status.HTTP_409_CONFLICT, "quote_stale",
+                "Some leads in this quote are no longer available. Nothing was charged; "
+                "please get a new quote.",
+            )
+        await db.execute(
+            text("INSERT INTO contact_lookup_action_events (id, action_id, user_id, "
+                 "  to_status) "
+                 "VALUES (gen_random_uuid(), CAST(:a AS uuid), CAST(:u AS uuid), "
+                 "  'dispatching')"),
+            params,
+        )
+        await db.commit()
+    except IntegrityError as exc:
+        # Only the one-action-per-quote constraint means "confirmed concurrently";
+        # anything else is a real error (AO5).
+        fields = _integrity_error_fields(exc)
+        if fields.get("sqlstate") != "23505" or "uq_contact_lookup_actions_quote" not in (
+            fields.get("constraint_name") or ""
+        ):
+            raise
+        await db.rollback()
+        winner = await _action_for_quote(db, body.quote_id, user_id)
+        if winner is None:
+            raise
+        return _replayed(winner, job_id, body.category)
+
+    # Committed: the purchase is durable. Nothing below may fail the request.
+    try:
+        await _bounded(r.eval, _DELETE_IF_SAME_QUOTE, 1, key, body.quote_id)
+    except Exception:  # noqa: BLE001 - the key expires; a replay is answered from the DB
+        _logger.warning("contact lookup %s: quote key not cleared", action_id)
+
+    from src.workers.contact_lookup_action import lookup_contacts
+
+    if await _publish_contact_lookup(lookup_contacts, action_id):
+        try:
+            # Zero rows is success: the worker already started it (AO2). The guard
+            # allows exactly this stamp, once, while the action is dispatching.
+            await db.execute(
+                text("UPDATE contact_lookup_actions SET dispatched_at = now() "
+                     "WHERE id = CAST(:a AS uuid) AND user_id = CAST(:u AS uuid) "
+                     "  AND status = 'dispatching' AND dispatched_at IS NULL"),
+                params,
+            )
+            await db.commit()
+        except Exception:  # noqa: BLE001 - only the publish clock; P3 tolerates NULL
+            await db.rollback()
+            _logger.warning("contact lookup %s: dispatched_at not stamped", action_id,
+                            exc_info=True)
+
+    audit_log(request, "contact_lookup_confirmed", current_user.id,
+              f"action_id={action_id} quoted_count={len(ids)}")
+    return ContactLookupAction(action_id=action_id, status="dispatching",
+                               quoted_count=len(ids), truncated=truncated)
 
 
 @router.get("/{job_id}/logs")

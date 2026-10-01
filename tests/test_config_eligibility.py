@@ -229,7 +229,7 @@ async def test_an_entitlement_paused_scraper_is_config_inactive(db, connectors):
 @pytest.mark.usefixtures("enforce")
 async def test_precedence_follows_the_gate(db, connectors):
     county = _county()
-    await connectors(county, ["tax_delinquent"], "ai")
+    await connectors(county, ["tax_delinquent"], "template")
     # frozen AND not entitled AND running.
     user = await _user(db, plan="starter", records_limit=50, subscription_status="unpaid")
     config = await _config(db, user, county, record_type="tax_delinquent")
@@ -256,19 +256,19 @@ async def test_the_worker_runs_the_connector_eligibility_judged(db, connectors):
 
     old = datetime(2026, 1, 1, tzinfo=UTC)
     # The two connectors are told apart by what the worker does with them: the
-    # manual one resolves to its class; the ai one would look for a recorder
+    # manual one resolves to its class; the template one would look for a recorder
     # template matching its example.gov base_url, find none, and raise.
     manual_older = _county()
-    await connectors(manual_older, ["probate"], "ai", created_at=old + timedelta(days=1))
+    await connectors(manual_older, ["probate"], "template", created_at=old + timedelta(days=1))
     await connectors(manual_older, ["probate"], "manual", created_at=old)
     factory, record_type = get_scraper_class(manual_older, "WA", "probate")
     assert (factory, record_type) == (BridgeScraper, "probate")
 
-    ai_older = _county()
-    await connectors(ai_older, ["probate"], "manual", created_at=old + timedelta(days=1))
-    await connectors(ai_older, ["probate"], "ai", created_at=old)
+    template_older = _county()
+    await connectors(template_older, ["probate"], "manual", created_at=old + timedelta(days=1))
+    await connectors(template_older, ["probate"], "template", created_at=old)
     with pytest.raises(UnsupportedCountyError, match="template"):
-        get_scraper_class(ai_older, "WA", "probate")
+        get_scraper_class(template_older, "WA", "probate")
 
 
 async def test_duplicate_connectors_resolve_to_the_oldest(db, connectors):
@@ -277,10 +277,10 @@ async def test_duplicate_connectors_resolve_to_the_oldest(db, connectors):
     county = _county()
     old = datetime(2026, 1, 1, tzinfo=UTC)
     manual = await connectors(county, ["probate"], "manual", created_at=old)
-    ai = await connectors(county, ["probate"], "ai", created_at=old + timedelta(days=1))
-    assert pick_connector([ai, manual], "PROBATE") is manual
-    assert pick_connector([manual, ai], "probate") is manual
-    assert pick_connector([manual, ai], "divorce") is None
+    tmpl = await connectors(county, ["probate"], "template", created_at=old + timedelta(days=1))
+    assert pick_connector([tmpl, manual], "PROBATE") is manual
+    assert pick_connector([manual, tmpl], "probate") is manual
+    assert pick_connector([manual, tmpl], "divorce") is None
 
 
 # ─── Batched: a fixed number of queries, and all-tenant slot math ─────────────
@@ -291,7 +291,7 @@ async def test_the_query_count_does_not_grow_with_the_list(db, connectors):
     counties = [_county() for _ in range(3)]
     history_only = _county()
     for county in [*counties, history_only]:
-        await connectors(county, ["probate"], "ai")
+        await connectors(county, ["probate"], "template")
     user = await _user(db)
     configs = [await _config(db, user, counties[i % 3]) for i in range(6)]
     await _job(db, user, await _config(db, user, history_only))
@@ -381,9 +381,9 @@ async def _assert_parity(db, client, user, config):
 
 @pytest.mark.usefixtures("enforce")
 async def test_post_jobs_parity_for_every_code(db, connectors, client: AsyncClient):
-    manual, ai = _county(), _county()
+    manual, tmpl = _county(), _county()
     await connectors(manual, ["probate", "tax_delinquent"], "manual")
-    await connectors(ai, ["probate"], "ai")
+    await connectors(tmpl, ["probate"], "template")
 
     ok = await _user(db)
     await _assert_parity(db, client, ok, await _config(db, ok, manual))
@@ -397,7 +397,7 @@ async def test_post_jobs_parity_for_every_code(db, connectors, client: AsyncClie
     await _assert_parity(db, client, starter, await _config(db, starter, manual, "tax_delinquent"))
 
     template_user = await _user(db, plan="starter", records_limit=50)
-    template_config = await _config(db, template_user, ai)
+    template_config = await _config(db, template_user, tmpl)
     for _ in range(6):  # past the removed monthly cap: still runs
         await _job(db, template_user, template_config)
     await _assert_parity(db, client, template_user, template_config)

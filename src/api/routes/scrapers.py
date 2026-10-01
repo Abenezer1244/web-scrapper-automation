@@ -51,10 +51,8 @@ from src.scrapers.probate import (
     effective_tod_on_update,
     new_probate_config_tod_default,
 )
-from src.utils.logger import setup_logger
 
 router = APIRouter(prefix="/scrapers", tags=["scrapers"])
-_logger = setup_logger("api.scrapers")
 
 # Phase 3: the living-owner TOD toggle is a probate-only product control.
 _TOD_TOGGLE_RECORD_TYPE = "probate"
@@ -1065,7 +1063,6 @@ async def create_connector(
     # Manual connectors are provisioned via migrations/seeds with an allowlisted
     # scraper_class. Reject manual mode here rather than persist an empty
     # scraper_class that would crash get_scraper_class() at scrape time.
-    # (ConnectorCreate has already normalized the legacy name 'ai' to 'template'.)
     from src.scrapers.registry import has_template, is_template_mode
     if not is_template_mode(body.scraper_mode):
         raise HTTPException(
@@ -1075,12 +1072,6 @@ async def create_connector(
                 "Manual-mode connectors require a code-backed scraper class and are "
                 "provisioned via a migration."
             ),
-        )
-    if body._legacy_ai_mode:
-        # AI-mode removal, Phase 2c retires the alias only after this stays at zero.
-        _logger.info(
-            "connector_create: legacy scraper_mode 'ai' normalized to 'template' "
-            "(county=%s state=%s user=%s)", body.county, body.state, current_user.id,
         )
 
     # Template-mode connectors resolve to a recorder-platform TEMPLATE by base_url.

@@ -8,14 +8,14 @@ a user can save a selection the scraper silently ignores and it scrapes EVERY do
 type.
 
 This guard resolves each selectable county through ``connector_scraper_class`` (the real
-resolver: manual mode imports the configured class; ai mode runs ``_detect_template`` on
+resolver: manual mode imports the configured class; template mode runs ``_detect_template`` on
 the base_url) using the county's REAL connector config, then asserts the resolved class
 accepts ``doc_types``. So CI fails if the configured ``scraper_class``/``scraper_mode``/
 ``base_url`` routes to a scraper that drops the selection — not merely if a hand map is
 stale.
 
 When you enable a county, add its REAL connector config to ``_CONNECTOR_CONFIG`` (county,
-state, scraper_mode, scraper_class for manual / base_url for ai), mirroring the prod
+state, scraper_mode, scraper_class for manual / base_url for template), mirroring the prod
 ``county_connectors`` row.
 
 Needs a synthetic env to import scraper modules (they pull settings). Run with throwaway
@@ -30,7 +30,7 @@ from src.scrapers.registry import connector_scraper_class
 # Real county_connectors config per selectable county. These mirror the ACTIVE prod
 # rows (verified live against bridgeleads-production 2026-06-23 — not the stale migration
 # 006 seed, which left a dead inactive clark row pointing at the old King subclass). For
-# manual mode, scraper_class is imported; for ai mode, base_url drives _detect_template.
+# manual mode, scraper_class is imported; for template mode, base_url drives _detect_template.
 _CONNECTOR_CONFIG: dict[tuple[str, str], dict] = {
     ("king", "wa"): {
         "scraper_mode": "manual",
@@ -48,32 +48,32 @@ _CONNECTOR_CONFIG: dict[tuple[str, str], dict] = {
         "base_url": "https://e-docs.clark.wa.gov/LandmarkWeb",
     },
     ("skagit", "wa"): {
-        "scraper_mode": "ai",  # resolves to SkagitRecordingScraper via _detect_template
+        "scraper_mode": "template",  # resolves to SkagitRecordingScraper via _detect_template
         "scraper_class": "",
         "base_url": "https://www.skagitcounty.net/Search/Recording/",
     },
-    # P3: EagleWeb family (ai-mode -> EagleWebScraper via _detect_template). base_urls
+    # P3: EagleWeb family (template mode -> EagleWebScraper via _detect_template). base_urls
     # from live /connectors 2026-06-23.
-    ("benton", "wa"): {"scraper_mode": "ai", "scraper_class": "", "base_url": "https://erecording.co.benton.wa.us/recorder/web/"},
-    ("clallam", "wa"): {"scraper_mode": "ai", "scraper_class": "", "base_url": "https://erecording.clallamcountywa.gov/recorder/web/"},
-    ("grant", "wa"): {"scraper_mode": "ai", "scraper_class": "", "base_url": "https://grantcountywa-recorder.tylerhost.net/grantrecorder/web/"},
-    ("island", "wa"): {"scraper_mode": "ai", "scraper_class": "", "base_url": "https://auditor.islandcountywa.gov/recorder/web/"},
-    ("jefferson", "wa"): {"scraper_mode": "ai", "scraper_class": "", "base_url": "https://er-web.co.jefferson.wa.us/recorder/web/"},
-    ("kitsap", "wa"): {"scraper_mode": "ai", "scraper_class": "", "base_url": "https://kcwaimg.kitsap.gov/recorder/web/"},
-    ("thurston", "wa"): {"scraper_mode": "ai", "scraper_class": "", "base_url": "https://eagleweb.co.thurston.wa.us/thurstonrecorder/web/"},
-    ("whitman", "wa"): {"scraper_mode": "ai", "scraper_class": "", "base_url": "https://whitmanwa.countygovernmentrecords.com/whitmanrecorder/web/"},
+    ("benton", "wa"): {"scraper_mode": "template", "scraper_class": "", "base_url": "https://erecording.co.benton.wa.us/recorder/web/"},
+    ("clallam", "wa"): {"scraper_mode": "template", "scraper_class": "", "base_url": "https://erecording.clallamcountywa.gov/recorder/web/"},
+    ("grant", "wa"): {"scraper_mode": "template", "scraper_class": "", "base_url": "https://grantcountywa-recorder.tylerhost.net/grantrecorder/web/"},
+    ("island", "wa"): {"scraper_mode": "template", "scraper_class": "", "base_url": "https://auditor.islandcountywa.gov/recorder/web/"},
+    ("jefferson", "wa"): {"scraper_mode": "template", "scraper_class": "", "base_url": "https://er-web.co.jefferson.wa.us/recorder/web/"},
+    ("kitsap", "wa"): {"scraper_mode": "template", "scraper_class": "", "base_url": "https://kcwaimg.kitsap.gov/recorder/web/"},
+    ("thurston", "wa"): {"scraper_mode": "template", "scraper_class": "", "base_url": "https://eagleweb.co.thurston.wa.us/thurstonrecorder/web/"},
+    ("whitman", "wa"): {"scraper_mode": "template", "scraper_class": "", "base_url": "https://whitmanwa.countygovernmentrecords.com/whitmanrecorder/web/"},
     # P4: one county per remaining keyword family (live /connectors 2026-06-23).
-    ("douglas", "wa"): {"scraper_mode": "ai", "scraper_class": "", "base_url": "https://edocs.douglascountywa.gov/AcclaimWeb"},
-    ("columbia", "wa"): {"scraper_mode": "ai", "scraper_class": "", "base_url": "https://www.idocmarket.com/COLWA1/Document/Search"},
-    ("cowlitz", "wa"): {"scraper_mode": "ai", "scraper_class": "", "base_url": "https://www.cowlitzinfo.net/WLAudPublic/welcome.aspx?dbid=0&repo=CCIMAGES"},
-    ("okanogan", "wa"): {"scraper_mode": "ai", "scraper_class": "", "base_url": "https://okanogancountywa-web.tylerhost.net/Web"},
+    ("douglas", "wa"): {"scraper_mode": "template", "scraper_class": "", "base_url": "https://edocs.douglascountywa.gov/AcclaimWeb"},
+    ("columbia", "wa"): {"scraper_mode": "template", "scraper_class": "", "base_url": "https://www.idocmarket.com/COLWA1/Document/Search"},
+    ("cowlitz", "wa"): {"scraper_mode": "template", "scraper_class": "", "base_url": "https://www.cowlitzinfo.net/WLAudPublic/welcome.aspx?dbid=0&repo=CCIMAGES"},
+    ("okanogan", "wa"): {"scraper_mode": "template", "scraper_class": "", "base_url": "https://okanogancountywa-web.tylerhost.net/Web"},
     ("whatcom", "wa"): {"scraper_mode": "manual", "scraper_class": "src.scrapers.whatcom_wa.WhatcomWAScraper", "base_url": "https://recording.whatcomcounty.us/"},
     # Pre-staged health=down counties (hidden in the picker until health recovers).
     # chelan=AcclaimWeb (like douglas); lewis/pacific/spokane=EagleWeb.
-    ("chelan", "wa"): {"scraper_mode": "ai", "scraper_class": "", "base_url": "https://acclaim.co.chelan.wa.us/acclaimweb"},
-    ("lewis", "wa"): {"scraper_mode": "ai", "scraper_class": "", "base_url": "https://quickdocs.lewiscountywa.gov/recorder/web/"},
-    ("pacific", "wa"): {"scraper_mode": "ai", "scraper_class": "", "base_url": "https://pacificwa.countygovernmentrecords.com/"},
-    ("spokane", "wa"): {"scraper_mode": "ai", "scraper_class": "", "base_url": "https://recording.spokanecounty.org/recorder/web/"},
+    ("chelan", "wa"): {"scraper_mode": "template", "scraper_class": "", "base_url": "https://acclaim.co.chelan.wa.us/acclaimweb"},
+    ("lewis", "wa"): {"scraper_mode": "template", "scraper_class": "", "base_url": "https://quickdocs.lewiscountywa.gov/recorder/web/"},
+    ("pacific", "wa"): {"scraper_mode": "template", "scraper_class": "", "base_url": "https://pacificwa.countygovernmentrecords.com/"},
+    ("spokane", "wa"): {"scraper_mode": "template", "scraper_class": "", "base_url": "https://recording.spokanecounty.org/recorder/web/"},
 }
 
 
@@ -89,7 +89,7 @@ def _selectable_counties() -> list[tuple[str, str]]:
 
 def _worker_factory(cfg: dict):
     """Build the SAME callable the worker inspects, mirroring registry.get_scraper_class:
-    ai-mode -> functools.partial(template, base_url/county/state/record_types) so
+    template mode -> functools.partial(template, base_url/county/state/record_types) so
     inspect.signature() sees the remaining (unbound) params; manual -> the class itself.
     _run_scraper does inspect.signature(factory) and passes doc_types only if present."""
     from functools import partial
@@ -97,7 +97,7 @@ def _worker_factory(cfg: dict):
     cls = connector_scraper_class(fake)
     if cls is None:
         return None
-    if cfg.get("scraper_mode") == "ai":
+    if cfg.get("scraper_mode") == "template":
         return partial(cls, base_url=cfg["base_url"], county="x", state="wa",
                        record_types=["pre_foreclosure"])
     return cls

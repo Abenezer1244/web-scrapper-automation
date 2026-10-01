@@ -153,7 +153,7 @@ async def _run_scraper(
 ):
     """Run the async scraper and stream progress logs back to Redis."""
     # Pass record_type / doc_types ONLY to scrapers whose constructor accepts
-    # them (template/AI/partial scrapers may not). doc_types=None means legacy
+    # them (template/partial scrapers may not). doc_types=None means legacy
     # behavior. An EXPLICIT selection (including the degenerate [] of a stale
     # config) must reach the constructor so it can fail closed — hence
     # `is not None`, not truthiness, so [] is passed through rather than silently

@@ -1698,9 +1698,9 @@ class ResultRow(BaseModel):
     emails: list[str] | None = None
     # not_attempted|queued|submitted|hit|miss|errored|purged
     # 'purged' is terminal: the Privacy Policy §7 retention sweep deleted this row's aged
-    # contact data. It establishes neither the lookup outcome nor a charge (usually a
-    # former hit, but see SkipTraceStatus.PURGED for what else is swept). Treat it as
-    # "no contact data".
+    # contact data. It establishes neither the lookup outcome nor a charge: the sweep
+    # can purge a former hit, miss, errored or unknown-status row (see
+    # SkipTraceStatus.PURGED). Treat it as "no contact data".
     skip_trace_status: str = "not_attempted"
     skip_trace_attempted_at: datetime | None = None
     is_duplicate: bool = False

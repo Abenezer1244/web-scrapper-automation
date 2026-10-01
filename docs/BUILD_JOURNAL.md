@@ -94,9 +94,11 @@ to understand *why* the code is the way it is and *what's been attempted before*
 - `last_trace_outcome` writers (BE), then a retry for `not_submitted` only.
 - DONE in this session, in two steps: the "Removed" tooltip first said "its contact details were
   deleted", then (#184, d0626274) "This lead was looked up, and its lookup data was deleted";
-  neither is guaranteed, because the sweep clears any aged lead with a non-NULL contact field
-  (see Facts). bridgeleads-web #185 (squash 02d1266e, Vercel success) makes it "Contact lookup data for this lead was deleted
-  after the retention period.", which implies no outcome, contacts or charge. #186 (squash
+  neither is guaranteed, because the sweep purges an aged row whenever its status is neither
+  `purged`, `queued` nor `submitted` and at least one contact column is non-NULL (see Facts).
+  bridgeleads-web #185 (squash 02d1266e, Vercel success) makes it "Contact lookup data for this
+  lead was deleted after the retention period.", which makes no claim about the lookup outcome,
+  contacts or charge; it only states that aged lookup data was deleted. #186 (squash
   5bc7a2e7) fixed the matching code comment in `DeliveredLookupSummary`.
 - A real-row check of an `errored` lead in prod, if the owner approves a read.
 - OWNER DECISION, retention (still open): `SkipTraceStatus.PURGED` is documented as distinct

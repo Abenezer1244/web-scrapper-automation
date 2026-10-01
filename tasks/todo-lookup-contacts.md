@@ -4481,6 +4481,28 @@ mandatory: the post-deploy NULL proof, and owner-approved remediation for any NU
   `test_tracerfy_ingest.py` + `test_contact_lookup_reconciler.py` + this plan. Pre-merge:
   count the NULL-`rows_sent` un-ingested queues. Post-deploy: `oc_post_deploy_check.py` exits 0.
 
+### O-C-i BUILT (2026-10-01, rebased on main `6d32c8e2`), before the Codex diff review
+- `alembic/versions/110_skip_trace_queue_billing_decision.py`: `rows_sent INTEGER NULL`,
+  `unmatched_billed BOOLEAN NULL`, under `SET LOCAL lock_timeout = '5s'`; downgrade drops
+  both. No model, writer or reader (AE1).
+- `tests/test_skip_trace_queue_billing_decision.py` (3): head has both columns with
+  (type, nullable, NO default); 110 chains on 109; the down/up round trip re-runs
+  `upgrade()` in a rolled-back transaction and checks the same triple. That way a default
+  added to the migration is caught on what the migration writes, not only on the DB it
+  already built.
+- Local test DB migrated 109 → 110 via `scripts/migrate.py`. `oc_schema_check.py` FAILs at
+  109 and PASSes at 110 (both directions proven).
+- **Mutations: 7/7 caught** (runner v2: baseline guard, every mutant asserted present and
+  applied, restore checked by content):
+  - `rows_sent` as BigInteger, or NOT NULL with a default 0;
+  - `unmatched_billed` defaulting to false, or typed Integer;
+  - upgrade forgetting `unmatched_billed`;
+  - downgrade leaving `rows_sent`;
+  - chained on 108.
+- **Regression: 710 passed, 0 failed.** That is every test file naming `skip_trace_queues`
+  / `SkipTraceQueue` or alembic (20 files, 3 chunks). ruff clean. No type checker is
+  configured.
+
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever
       the tab has leads that have never been looked up; when the quote comes back with

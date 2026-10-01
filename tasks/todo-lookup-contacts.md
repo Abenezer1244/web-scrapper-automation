@@ -3828,6 +3828,271 @@ O-D stays the pre-2d gate. Outputs: `<scratchpad 4ebfb689>/codex_2b_consult_r{1.
   holder's granted key and needs two ungranted waiters). Outputs: `<scratchpad 4ebfb689>/
   codex_2b_review_r{1,2}_out.txt`.
 
+### 2b MERGED + LIVE (2026-10-01): #411, merge `48f88663`
+- Rebased twice under the PR (#410 and #412: comments and docs only). Each time the three-dot
+  diff was byte-identical to the reviewed one, and Codex re-checked it (r3 and r4 GO).
+- CI green on `6005f353`. Held for the UX-2d session's prod scrape (job `4b092852`) until it
+  finished. quiet all zeros, main unchanged, `--match-head-commit`.
+- api, worker and beat SUCCESS on `48f88663`. The worker boot lists
+  `contact_lookup_action.lookup_contacts`, all workers are ready, 0 errors, `/health` 200.
+- **O-D CONFIRMED IN PRODUCTION** (read-only `has_table_privilege`, `priv_check.py`):
+  `bridgeleads_system` has `SELECT, INSERT, UPDATE` on `pending_skip_trace_rows`, NO `DELETE`.
+  RLS is enabled and forced, and the only policy is `pending_skip_trace_rows_system FOR ALL`.
+- **OWNER DECISION O-D (2026-10-01): GRANT**, on my recommendation.
+  - **Change:** `GRANT DELETE ON pending_skip_trace_rows TO bridgeleads_system` in all three
+    sources (Z2), applied in production. Its own PR.
+  - **Order:** 2c → O-C → O-D → 2d. O-D also fixes the live enqueue's race path.
+  - **Why not the redesign:** a withdrawn row must vanish (it would otherwise count against
+    a trial's lifetime allowance), and a "withdrawn" status means a migration plus a change
+    to the live paid claim.
+
+## Phase 1b-2c — the reconciler (SPEC, 2026-10-01, BEFORE the Codex consult)
+Branch `feat/lookup-1b2c-reconciler` off `48f88663`. The step "1b-2c" above, as amended by V2,
+V4, W3, W7, X3 and Y2. Idle until 2d (no actions exist).
+
+**Files (5):**
+- NEW `src/workers/scheduler_helpers/contact_lookups.py` (`_reconcile_contact_lookups_impl`);
+- `src/workers/scheduler.py` (the task + a 120 s beat entry);
+- `src/api/billing/skip_trace_usage.py` (extract `queue_accepted_all`);
+- NEW `tests/test_contact_lookup_reconciler.py`;
+- this plan.
+
+**Facts (read 2026-10-01):**
+- Pending statuses: `queued`, `submitting`, `submitted` (active); `completed`, `unmatched`,
+  `errored`, `cancelled` (terminal). Who writes the terminal ones:
+  - `completed` and `unmatched` are written by ingest in ONE transaction with
+    `report_usage_from_webhook` (`tracerfy_ingest.py:~897-990`). So billing has already run
+    for a row the reconciler sees terminal.
+  - `errored` = a definite pre-submit rejection, never charged
+    (`skip_trace_dispatcher.py:1333`, `_release_claim(to_status="errored")`).
+  - `cancelled` = withdrawn before submission (`_cancel_undeliverable_queued`).
+- `completed` sets `results.skip_trace_status` to `hit`/`miss` in the same statement batch.
+- `accepted_all` (`skip_trace_usage.py:614-624`): `COALESCE(rows_uploaded,0) >= COUNT(stamped
+  pending rows)`. O-C will change the rule. The extraction keeps one rule with two callers.
+- Unknown provider outcome:
+  - `submitting` past `_STALE_CLAIM_AFTER` (30 min), which the dispatcher's own reconciler
+    adopts or releases;
+  - and `submitted` rows whose queue went `errored` (ingest exhausted, rows left alone on
+    purpose, `tracerfy_ingest.py:~347`).
+
+**Passes, every tick** (`system_sync_session`; each action in its own transaction; the action
+row is locked `FOR UPDATE SKIP LOCKED`, so a running worker or another tick is never waited on):
+- **P1 expire.** `dispatching` AND `created_at < now() - 30 min`:
+  - `_move(dispatching → expired, "deadline")`;
+  - every `quoted` → `abandoned`, one event per lead (2b's `_quoted_ids` + `_set_verdicts`).
+  - LIMIT 100.
+- **P2 lease take-back (Y2).** `running` AND `lease_expires_at < now()`, re-checked under the
+  lock → `_move(running → dispatching, "lease_expired")`. LIMIT 100.
+- **P3 re-publish (15-2).** `dispatching`, not past the deadline, AND (`dispatched_at IS NULL
+  AND created_at < now() - 1 min`, OR `dispatched_at < now() - 5 min`):
+  - `lookup_contacts.apply_async([id])`, then stamp `dispatched_at = now()` (the system role
+    may; the guard binds only the API). A publish failure logs and leaves it for the next tick.
+  - `ORDER BY COALESCE(dispatched_at, created_at), id LIMIT 100`. The stamp rotates every
+    published action to the back, so none starves.
+  - A redundant publish is harmless: T1's CAS admits one.
+- **P4 settle claimed (S1, V2, V4, W3).** A claimed action is a candidate only when it has WORK:
+  - a `newly_queued` verdict whose pending row (`action_id`, `result_id`) is terminal;
+  - OR no `newly_queued` verdict whose row is active (→ settle);
+  - OR a stuck row with `status_reason` not yet flagged.
+
+  `ORDER BY claimed_at, id LIMIT 50`. Each pass consumes the work it selected, so a waiting
+  action never holds a slot (the `deterministic_order_plus_limit` landmine). Per action, ONE
+  transaction (V4):
+  - map each `newly_queued` lead from its pending row:
+
+    | Pending row | Verdict |
+    |---|---|
+    | `completed` + result `hit` | `answered_hit` |
+    | `completed` + result `miss` | `answered_miss` |
+    | `completed` + anything else (purged, NULL, …) | unchanged + flag `result_state_unexpected` (AA4) |
+    | `unmatched` | `unmatched_billable` if `queue_accepted_all(db, queue_id)`, else `unmatched_unbilled` |
+    | `errored` | `errored_unsubmitted` |
+    | `cancelled` | `released` |
+    | active | unchanged |
+
+  - `_set_verdicts` per from/to group;
+  - recompute `billable_rows = answered_hit + answered_miss + unmatched_billable`;
+  - no `newly_queued` left → `_move(claimed → settled)` with the counts;
+  - else, if a lead is stuck (as in the facts above) and `status_reason` is not yet
+    `provider_reconciliation_required`: set it, write an event (`claimed → claimed`), and send
+    ONE ops alert;
+  - else just the counts;
+  - COMMIT.
+- **Never bills.** No meter or usage call. `queue_accepted_all` is a read.
+- **A `newly_queued` verdict with NO pending row** (only an operator delete or a future
+  retention purge could cause it) → `status_reason='pending_row_missing'` + one alert, never
+  settled silently. (Consult Q.)
+
+**Tests** (`tests/test_contact_lookup_reconciler.py`, real PG + Redis; actions claimed by the
+REAL 2b worker; pending rows advanced as ingest / the dispatcher leave them):
+- each P1-P4 branch;
+- every mapping row;
+- `unmatched` both ways of `queue_accepted_all`;
+- the billing parity: the reconciler's billable verdict per row == billing's choice for that
+  queue;
+- settle only when nothing is active;
+- the stuck flag and alert once;
+- the missing row;
+- SKIP LOCKED: a locked action is skipped, not waited on;
+- starvation: a never-finishing claimed action plus more than LIMIT others all progress;
+- a lease expired, then re-published, then claimed end to end;
+- the deadline;
+- a redundant publish;
+- the beat entry (`test_beat_schedule` rules);
+- the `queue_accepted_all` extraction: `report_usage_from_webhook` unchanged;
+- mutations.
+
+### Codex pre-code consult r1 on 2c (2026-10-01): PLAN: REVISE, 3 P1 + 6 P2, adopted as AA1-AA9
+Output: `<scratchpad 4ebfb689>/codex_2c_consult_r1_out.txt`. Codex found these SOUND:
+- the system role stamping `dispatched_at` (101's guard binds only the API);
+- republish (T1's CAS admits one);
+- P1/P2 under `FOR UPDATE SKIP LOCKED` against a live T2;
+- no lock cycle with ingest or the dispatcher.
+
+- **AA1 (P1) The deadline is enforced at T1, not only at selection.** A publish delivered late
+  (a queued broker message, a re-publish at minute 29) could otherwise buy after the 30-min
+  deadline that O-B promises means "nothing bought".
+  - `ACTION_DEADLINE = 30 min` lives in `contact_lookup_action.py`.
+  - The `dispatching → running` CAS adds `AND created_at > now() - ACTION_DEADLINE`.
+  - The reconciler imports the constant.
+- **AA2 (P1, the premise corrected, the conclusion kept) billing parity needs a PERSISTED
+  decision.**
+  - **Wrong part:** Codex said billing evaluates `accepted_all` before ingest writes
+    `rows_uploaded`. That is false: ingest writes `rows_uploaded` (`tracerfy_ingest.py:1004`)
+    BEFORE it calls billing (`:1024`), in ONE transaction.
+  - **Right part:** the queue row and the stamped-row count can change AFTER billing ran
+    (adoption / redrive rewrite `rows_uploaded`: `skip_trace_dispatcher.py:2104,2157,2222`;
+    partial bookkeeping, `:1553-1583`). A reconciler that RECOMPUTES the rule later can derive
+    the opposite of what Stripe received.
+  - **Fix:** O-C persists the decision billing actually made, on the queue, written once at
+    ingest, and the reconciler reads THAT. Until O-C ships, 2c computes the live rule through
+    the shared `queue_accepted_all`.
+  - That is safe only because 2c is idle until 2d and O-C hard-gates 2d. **O-C's scope grows
+    to:** persist `rows_sent` AND the per-queue decision, and switch the reconciler to read the
+    decision.
+- **AA3 (P1) a flag is not a transition.** `claimed → claimed` is illegal in the matrix. A new
+  matrix-checked op `_flag(db, action_id, status, reason)` lives in `contact_lookup_action.py`:
+  - it sets or clears `status_reason` while `status` is unchanged;
+  - it is allowed only on `FLAGGABLE = {"claimed"}`;
+  - it writes an event `(status → status, reason)`;
+  - it returns whether the value CHANGED, so the alert fires once per change.
+- **AA4 (P2)** `completed` needs a result of EXACTLY `hit` or `miss`. Anything else (`purged`
+  by retention, NULL, …) keeps the lead `newly_queued` and flags `result_state_unexpected`.
+  Never guessed.
+- **AA5 (P2) selection is action-level `EXISTS`, in three bounded groups, and every group
+  consumes its own work:**
+  - (a) claimed actions with a `newly_queued` lead whose pending row is MAPPABLE now
+    (`completed` + hit/miss, `unmatched`, `errored`, `cancelled`), oldest `claimed_at` first,
+    LIMIT 50;
+  - (b) `status_reason IS NULL` and NO `newly_queued` lead with an active row (settle, or
+    discover a blocker), LIMIT 20;
+  - (c) `status_reason IS NULL` and a STUCK row (the facts' two cases), LIMIT 20.
+
+  Behaviour this gives:
+  - An already-flagged action with nothing new to map is in NO group. So it never re-alerts
+    and never holds a slot.
+  - When its stuck row resolves, it re-enters (a).
+  - Blockers are recomputed on every visit. When none remain, `_flag(None)` clears the reason
+    and (b) settles it.
+  - A row that is missing or has an unexpected result never resolves by itself: the action
+    stays flagged for a human, and never settles silently.
+- **AA6 (P2)** `queue_accepted_all` runs ONCE per distinct queue per action, inside the
+  action's transaction.
+- **AA7 (P2) P3 stamps `dispatched_at` on every publish ATTEMPT**, success or failure. So a dead
+  broker cannot pin the oldest 100 at the head; they rotate. (`dispatched_at` for the system
+  role means "last publish attempt"; the API's single stamp still means "published at
+  confirm".) The action row stays locked through publish + stamp + commit.
+- **AA8 (P2)** the "pending row missing" case is a flag (`pending_row_missing`), never a
+  verdict. AA5 suppresses re-alerting.
+- **AA9 (P2) more tests:**
+  - T1 at the deadline boundary;
+  - a crash after publish, before the stamp;
+  - kill switch → republish → expiry;
+  - the billing decision before and after a later `rows_uploaded` rewrite (documents the
+    pre-O-C gap);
+  - `completed` with a `purged` / NULL / `queued` / `errored` result;
+  - missing-row alert suppression;
+  - an illegal flag on a non-flaggable status;
+  - one action with many rows not starving the selection;
+  - a dispatcher stale-claim release (`submitting → queued`) staying active.
+
+**r2 (2026-10-01): REVISE, 2 P2 + 1 P3, all fixed IN PLACE.** Codex re-verified two things:
+- the AA2 reasoning is correct;
+- shipping 2c-ii before O-C is acceptable (idle until 2d; 2d is gated on O-C).
+
+The fixes:
+- **AB1 (P2)** the P4 mapping table is fixed: `completed` with anything but `hit` or `miss`
+  stays `newly_queued` and is flagged. (The table had contradicted AA4.)
+- **AB2 (P2) a flagged action whose blocker CLEARED is visited again.** Example: a stale
+  `submitting` row the dispatcher released back to `queued` is now active, not mappable.
+  - New group (d): claimed, `status_reason` is one of the reconciler's flags, and NO current
+    blocker. A blocker is any of:
+    - a stale `submitting` row;
+    - a `submitted` row in an `errored` queue;
+    - a `newly_queued` lead with no pending row;
+    - a `completed` row whose result is neither hit nor miss.
+  - Each blocker is an `EXISTS` in SQL, the same predicates the visit uses. The visit
+    recomputes and calls `_flag(None)`, after which (b) settles it when nothing is active.
+  - LIMIT 20. A permanently blocked action (missing row, unexpected result) is never in (d),
+    so it cannot hold a slot.
+- **AB3** the ops alert is sent AFTER the action's transaction commits, so "once per durable
+  change" holds even if the commit fails.
+- **AB4 (P3)** `queue_accepted_all` cardinality is tested with a pass-through spy: two rows in
+  one queue → 1 call; two queues → 2.
+
+**Revised split (5-file rule).** AA1 + AA3 touch the 2b module, so 2c is now two PRs:
+- **2c-i** = `contact_lookup_action.py` (AA1 deadline in T1, AA3 `_flag`, `ACTION_DEADLINE`) +
+  `skip_trace_usage.py` (`queue_accepted_all`, called by billing) + `tests/test_contact_lookup_action.py`
+  + `tests/test_tracerfy_ingest.py` + this plan = 5.
+  - `test_tracerfy_ingest.py` already pins the billing rule end to end
+    (`test_unmatched_row_IS_billed`, `test_provider_dropped_row_is_NOT_billed`,
+    `test_dedup_shrinking_the_upload_also_suppresses_unmatched_billing`). They must stay green
+    UNCHANGED.
+  - Direct `queue_accepted_all` tests are added beside them.
+- **2c-ii** = `scheduler_helpers/contact_lookups.py` + `scheduler.py` +
+  `tests/test_contact_lookup_reconciler.py` + this plan = 4.
+
+**Order: 2c-i → 2c-ii → O-C (grown by AA2) → O-D → 2d.** The owner approved 2c before O-C. That
+still holds: nothing reaches a customer before 2d, and 2d stays hard-gated on O-C and O-D.
+
+### 2c-i BUILT (2026-10-01, branch `feat/lookup-1b2c-i-deadline-flag`), before the Codex diff review
+- `contact_lookup_action.py`:
+  - `ACTION_DEADLINE_SECONDS = 1800`. Every move INTO `running` adds `AND created_at > now()
+    - deadline` to its CAS (AA1), so a late delivery is `not_dispatching` and buys nothing.
+  - `FLAGGABLE = {"claimed"}` + `_flag()`: it sets or clears `status_reason` while the status
+    stays put, writes an event (`claimed → claimed`, the reason or `flag_cleared`), and returns
+    True only on a CHANGE (AA3).
+- `skip_trace_usage.py`: `queue_accepted_all(db, queue_id) -> bool` is the extracted rule.
+  `report_usage_from_webhook` calls it; `bool(None)` is False, exactly as billing read the
+  empty result.
+- **Tests:**
+  - deadline −60 s claims; +1 s buys nothing and stays `dispatching`;
+  - flag set / no-change / clear / no-change, with the events;
+  - non-flaggable statuses raise; a flag on an action in another status changes nothing;
+  - `queue_accepted_all` for uploaded 3/4/2/0 against 3 stamped rows, and for an empty queue.
+    (`rows_uploaded` is NOT NULL, so a NULL case cannot exist.)
+- **Mutations: 9/9 caught:**
+  - the deadline dropped, and inverted;
+  - the flag: non-change reported, any status, no event, status ignored;
+  - `>` for `>=`;
+  - billing ignoring the rule;
+  - None read as accepted.
+- **A trap hit here (memory `killed_mutation_runner_leaves_the_mutant`):** the first runner was
+  killed by its outer timeout during the last mutant. Its `finally` never ran, so
+  `queue_accepted_all` was left INVERTED in the working tree. A diff `--stat` looked clean. A
+  content check caught it, it was fixed, and the mutant was re-run alone.
+- **Regression: 695 passed, 0 failed** (14 files touching billing, ingest, the action, the
+  ledger and the claim; 2 chunks). ruff clean.
+- **Codex diff review r1 (three-dot): GATE: GO, 2 P3.**
+  - **Empty queue: fixed.** The test now seeds a REAL queue with zero stamped rows (and still
+    checks an unknown id).
+  - **Exact-deadline `>` vs `>=`: accepted as EQUIVALENT at wall-clock resolution.** The CAS
+    compares with the database's own `now()` inside its transaction, and the clock advances
+    after the test's backdate, so the exact microsecond is not observable. A test asserting
+    the SQL text would copy the implementation (memory
+    `a_test_that_copies_its_impl_asserts_nothing`). The −60 s / +1 s cases pin the side of the
+    deadline.
+
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever
       the tab has leads that have never been looked up; when the quote comes back with

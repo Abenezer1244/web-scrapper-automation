@@ -782,3 +782,41 @@ async def test_unmatched_settlement_cannot_touch_another_tenants_lead(
                 text("SELECT user_id FROM results WHERE id = :r"), {"r": rid}
             ).scalar_one()
         assert str(owner) == str(uid), "a lead was settled under the wrong tenant"
+
+
+# ── queue_accepted_all: ONE rule for billing and the contact-lookup reconciler ─
+
+
+@pytest.mark.parametrize(("uploaded", "expected"), [
+    (3, True),     # every row we sent was accepted
+    (4, True),     # more than we sent still covers it
+    (2, False),    # dropped or de-duplicated: unmatched is NOT billed
+    (0, False),    # the provider hid the count (an adopted queue records 0)
+])
+async def test_queue_accepted_all_compares_the_upload_with_the_stamped_rows(
+    starter_user, uploaded, expected,
+):
+    from src.api.billing.skip_trace_usage import queue_accepted_all
+
+    qid = _next_queue_id()
+    _seed(starter_user.id, qid, [("1 A ST", "SEATTLE", "WA"), ("2 B ST", "SEATTLE", "WA"),
+                                 ("3 C ST", "SEATTLE", "WA")])
+    with system_sync_session() as db:
+        db.execute(text("UPDATE skip_trace_queues SET rows_uploaded = :n "
+                        "WHERE tracerfy_queue_id = :q"), {"n": uploaded, "q": qid})
+        db.commit()
+        assert queue_accepted_all(db, qid) is expected
+
+
+async def test_queue_accepted_all_is_false_for_a_queue_with_no_rows(starter_user):
+    """A real queue with nothing stamped on it, and a queue id that does not exist:
+    no row to compare is never 'accepted every row'."""
+    from src.api.billing.skip_trace_usage import queue_accepted_all
+
+    qid = _next_queue_id()
+    _seed(starter_user.id, qid, [])  # the queue row exists, rows_uploaded 0, no rows
+    with system_sync_session() as db:
+        assert db.execute(text("SELECT count(*) FROM skip_trace_queues "
+                                "WHERE tracerfy_queue_id = :q"), {"q": qid}).scalar_one() == 1
+        assert queue_accepted_all(db, qid) is False
+        assert queue_accepted_all(db, _next_queue_id()) is False

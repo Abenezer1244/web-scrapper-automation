@@ -1589,7 +1589,10 @@ async def confirm_contact_lookups(
             _logger.warning("contact lookup %s: dispatched_at not stamped", action_id,
                             exc_info=True)
 
-    audit_log(request, "contact_lookup_confirmed", current_user.id,
+    # `user_id`, never `current_user.id`: a rollback above (a failed stamp) expires the
+    # ORM user, and reading it would lazy-load on an async session (MissingGreenlet),
+    # turning a committed purchase into a 500.
+    audit_log(request, "contact_lookup_confirmed", user_id,
               f"action_id={action_id} quoted_count={len(ids)}")
     return ContactLookupAction(action_id=action_id, status="dispatching",
                                quoted_count=len(ids), truncated=truncated)

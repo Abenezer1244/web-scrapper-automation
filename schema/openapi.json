@@ -1384,6 +1384,109 @@
         "title": "ConnectorResponse",
         "type": "object"
       },
+      "ContactLookupAction": {
+        "description": "A confirmed \"look up contacts\" action. `dispatching` means it is accepted and\nwaiting for a worker; it moves on by itself. `quoted_count` is the most it can buy:\nleads answered or claimed elsewhere in the meantime are not bought again.",
+        "properties": {
+          "action_id": {
+            "title": "Action Id",
+            "type": "string"
+          },
+          "quoted_count": {
+            "title": "Quoted Count",
+            "type": "integer"
+          },
+          "status": {
+            "enum": [
+              "dispatching",
+              "running",
+              "claimed",
+              "settled",
+              "failed",
+              "expired"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "truncated": {
+            "title": "Truncated",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "action_id",
+          "status",
+          "quoted_count",
+          "truncated"
+        ],
+        "title": "ContactLookupAction",
+        "type": "object"
+      },
+      "ContactLookupConfirmErrorDetail": {
+        "properties": {
+          "code": {
+            "enum": [
+              "quote_expired",
+              "quote_unsupported",
+              "quote_stale",
+              "quote_mismatch",
+              "nothing_to_look_up",
+              "run_not_finished"
+            ],
+            "title": "Code",
+            "type": "string"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "title": "ContactLookupConfirmErrorDetail",
+        "type": "object"
+      },
+      "ContactLookupConfirmErrorResponse": {
+        "description": "The confirm could not buy anything. Nothing was charged.",
+        "properties": {
+          "detail": {
+            "$ref": "#/components/schemas/ContactLookupConfirmErrorDetail"
+          }
+        },
+        "required": [
+          "detail"
+        ],
+        "title": "ContactLookupConfirmErrorResponse",
+        "type": "object"
+      },
+      "ContactLookupConfirmRequest": {
+        "additionalProperties": false,
+        "description": "Buy the lookups a quote offered. Idempotent on `quote_id`: confirming the same\nquote again returns the same action and buys nothing more.",
+        "properties": {
+          "category": {
+            "default": "new",
+            "enum": [
+              "new",
+              "already_delivered"
+            ],
+            "title": "Category",
+            "type": "string"
+          },
+          "quote_id": {
+            "maxLength": 64,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9_-]+$",
+            "title": "Quote Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "quote_id"
+        ],
+        "title": "ContactLookupConfirmRequest",
+        "type": "object"
+      },
       "ContactLookupExcluded": {
         "description": "Leads examined and not offered, by reason (over the examined window).",
         "properties": {
@@ -7199,6 +7302,115 @@
           }
         ],
         "summary": "Get Job",
+        "tags": [
+          "jobs"
+        ]
+      }
+    },
+    "/jobs/{job_id}/contact-lookups": {
+      "post": {
+        "description": "Buy the lookups a quote offered. Idempotent: the same quote returns the same\naction. Accepted (202): the lookups are queued by a worker shortly after.",
+        "operationId": "confirm_contact_lookups_jobs__job_id__contact_lookups_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "title": "Job Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ContactLookupConfirmRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ContactLookupAction"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "402": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/RunRefusalResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/EntitlementRefusalResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/PlainRefusalResponse"
+                    }
+                  ],
+                  "title": "Response 402 Confirm Contact Lookups Jobs  Job Id  Contact Lookups Post"
+                }
+              }
+            },
+            "description": "Refused. A run refusal (frozen, ended, over the record limit) has a top-level `code`; a plan refusal has an object `detail`; anything else is a sentence in `detail`."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ContactLookupConfirmErrorResponse"
+                }
+              }
+            },
+            "description": "The quote is stale, empty, unsupported or for another tab, or the run has not finished."
+          },
+          "410": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ContactLookupConfirmErrorResponse"
+                }
+              }
+            },
+            "description": "The quote expired or was replaced. Nothing was charged."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ContactLookupUnavailableResponse"
+                }
+              }
+            },
+            "description": "Lookups are switched off or a dependency is unreachable."
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Confirm Contact Lookups",
         "tags": [
           "jobs"
         ]

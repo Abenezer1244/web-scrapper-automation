@@ -16,6 +16,7 @@ import asyncio
 import importlib
 import json
 import time
+import uuid
 
 import pytest
 import redis.asyncio as aioredis
@@ -449,7 +450,7 @@ async def test_a_failed_publish_still_accepts_and_the_reconciler_publishes_it(
 
 
 async def test_the_worker_winning_the_race_to_the_stamp_is_not_an_error(
-    db, client, business_user, business_token, _lookups_on, monkeypatch,
+    db, client, business_user, business_token, _lookups_on, monkeypatch, caplog,
 ):
     """AO2, FAULT INJECTION (labelled): the worker claims the action between the
     publish and the `dispatched_at` stamp. The stamp matches no row, and the confirm
@@ -471,6 +472,42 @@ async def test_the_worker_winning_the_race_to_the_stamp_is_not_an_error(
     assert ran == ["claimed"]
     a = _action(aid)
     assert (a.status, a.dispatched_at) == ("claimed", None)
+    # A normal race, not a failure: the stamp matched no row, nothing raised.
+    assert "dispatched_at not stamped" not in caplog.text
+
+
+async def test_a_stamp_the_database_refuses_still_accepts_the_purchase(
+    db, client, business_user, business_token, _lookups_on, published,
+):
+    """FAULT INJECTION (labelled): the `dispatched_at` stamp fails in the database
+    after the purchase committed. The confirm must still be a 202. Found by a mutant:
+    the stamp's rollback expired the ORM user, and the audit line read it, a 500."""
+    job = _job(business_user.id)
+    _seed(business_user.id, job, [{}])
+    qid = await _quoted(client, business_token, job)
+    fn, trig = f"t_refuse_stamp_{uuid.uuid4().hex[:8]}", f"trg_{uuid.uuid4().hex[:8]}"
+    with system_sync_session() as s:
+        s.execute(text(
+            f"CREATE FUNCTION {fn}() RETURNS trigger AS $f$ BEGIN "
+            f"IF NEW.quote_id = '{qid}' AND NEW.dispatched_at IS NOT NULL THEN "
+            "RAISE EXCEPTION 'injected: the stamp is refused'; END IF; RETURN NEW; END "
+            "$f$ LANGUAGE plpgsql"))
+        s.execute(text(f"CREATE TRIGGER {trig} BEFORE UPDATE ON contact_lookup_actions "
+                       f"FOR EACH ROW EXECUTE FUNCTION {fn}()"))
+        s.commit()
+    try:
+        r = await _confirm(client, business_token, job, qid)
+    finally:
+        with system_sync_session() as s:
+            s.execute(text(f"DROP TRIGGER {trig} ON contact_lookup_actions"))
+            s.execute(text(f"DROP FUNCTION {fn}()"))
+            s.commit()
+
+    assert r.status_code == 202, r.text
+    aid = r.json()["action_id"]
+    assert published == [aid]
+    a = _action(aid)
+    assert (a.status, a.dispatched_at) == ("dispatching", None)
 
 
 async def test_a_busy_publisher_is_skipped_and_never_waited_on(

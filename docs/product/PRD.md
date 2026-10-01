@@ -272,8 +272,12 @@ County Portal ──scrape──> Raw Records ──enrich──> Property Data 
 **Enrich phase (multi-source fallback):**
 1. County GIS REST API (free, covers ~60-70% of US counties)
 2. Regrid API ($0.01-0.05/lookup, all 3,100+ counties)
-3. County assessor PACS lookup by owner name (records with no parcel)
-4. Skip trace provider (phone/email, Business+ tier, pricing TBD)
+3. County-specific fallback (Pierce ATIP), else "(enrichment unavailable)"
+
+Separately, records with no parcel are looked up by owner name on the county assessor's PACS portal.
+
+**Contact phase:**
+1. Skip trace provider (phone/email, Business+ tier, pricing TBD)
 
 **Export phase:**
 - Formats: CSV, Excel (styled), JSON

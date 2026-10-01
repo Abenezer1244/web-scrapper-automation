@@ -38,7 +38,7 @@ BridgeLeads automates motivated seller lead generation for real estate investors
 | Business | $149/mo | 5,000 | $150 | $15 | **-11%** |
 | Agency | $499/mo | 50,000 | Volume ($500) | Volume | **TBD** |
 
-*The AI Cost column is historical: no LLM has been used since 2026-09-30 (AI mode removed), so it is $0 now and each margin is slightly better than shown.*
+*The AI Cost column is a legacy estimate for an LLM-driven scraper that is no longer part of the product (AI mode removed 2026-09-30). Current scraping has no per-record AI cost; the margins have not been recomputed.*
 
 **Action needed**: Negotiate Regrid volume pricing for Business+ tiers, or offer enrichment as add-on.
 

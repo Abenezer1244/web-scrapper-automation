@@ -96,7 +96,8 @@ Rules for every phase:
   - Migration 108 (107 was taken): count by mode, then `UPDATE ... SET scraper_mode='template' WHERE
     scraper_mode='ai'`, server default `'template'`. Assert 0 `'ai'` rows and no unknown
     mode. One short transaction.
-  - Rollback = redeploy 2a code, which reads both. No down-migration is needed.
+  - Rollback = a revert PR that restores the 2a code but KEEPS migration 108 (an old image
+    without the 108 file cannot boot: `alembic upgrade head` fails). 2a reads both values.
   - Run the 30-connector canary after deploy.
   - OpenAPI regenerated in 2b: advertises `'template'` (and `'manual'`); `'ai'` is accepted
     but not advertised.
@@ -108,7 +109,8 @@ Rules for every phase:
     can be stored again.
   - Drop the reader and input alias, regenerate OpenAPI, and rewrite the "Claude AI"
     docstrings.
-  - Rollback: redeploy 2b code. It reads both values, and the constraint only forbids writing
+  - Rollback: a revert PR that restores the 2b code but KEEPS 2c's migration file (never
+    redeploy the old image). It reads both values, and the constraint only forbids writing
     `'ai'`, which 2b never does.
 
 ### Phase 3: delete the LLM code (BE)

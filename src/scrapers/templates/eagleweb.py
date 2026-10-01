@@ -261,8 +261,8 @@ class EagleWebScraper(BridgeScraper):
                     dropped, before,
                 )
 
-        # Records are returned raw; the run_scrape_job worker enriches
-        # them inline (county_gis, then PACS) before saving Result rows.
+        # Records are returned raw; the run_scrape_job worker's enrichment pass
+        # (src/workers/tasks_helpers/enrich.py) adds the addresses.
         _logger.info("EagleWeb complete — %d records (enrichment runs after save)", len(all_records))
         return all_records
 

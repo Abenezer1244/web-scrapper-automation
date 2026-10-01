@@ -4544,6 +4544,19 @@ mandatory: the post-deploy NULL proof, and owner-approved remediation for any NU
   partial-bookkeeping test, the one it targets.
 - **Regression: 815 passed, 0 failed.** That is every test file importing the dispatcher or
   naming `skip_trace_queues` / `SkipTraceQueue` (20 files, 3 chunks). ruff clean.
+- **Codex diff review r1 (O-C-ii alone, three-dot vs the O-C-i branch): GATE: GO, no
+  findings** (`codex_ocii_review_r1_out.txt`).
+
+### O-C-i MERGED + LIVE (2026-10-01): #421, merge `bf792931` (09:28:48Z)
+- CI green on `f5e09c19`. quiet all zeros, main unchanged, `--match-head-commit`. The other
+  sessions were told "merging" / "verified".
+- api, worker and beat SUCCESS on `bf792931`. Worker and beat logged "Migrations applied.",
+  the workers are ready, `/health` 200.
+- **The AE1 / AF3 prod gate PASSED:** `oc_schema_check.py` (worker service) shows
+  `rows_sent` (integer, YES), `unmatched_billed` (boolean, YES), `alembic_version =
+  ['110']`. O-C-ii may merge.
+- O-C-ii was rebased `--onto` main `bf792931`. Its three-dot diff is BYTE-IDENTICAL to the
+  reviewed one.
 
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever

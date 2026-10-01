@@ -4761,6 +4761,35 @@ trusted-worker risk; the RLS hardening is the owner's call (and, if wanted, befo
   three grant scripts or the claim (13 files). The 10 skips are
   `test_rls_role_policies.py`'s "RLS cutover roles not provisioned" (environmental, as in
   CI). ruff clean.
+- **Codex diff review r1: GATE: NO-GO, 5 P2 + 1 P3.** The test-rigor findings are all
+  fixed (`codex_od_review_r1_out.txt`):
+  - **AL1** the revoke-order check covered `delivered_records` only. It now covers EVERY
+    granted table in BOTH sources, in execution order (a later REVOKE of DELETE/ALL on
+    the table or ALL TABLES).
+  - **AL2** equality read raw text, so a grant surviving in a comment counted. Grant
+    sources are now read AS EXECUTED: SQL with `--` comments stripped, split into
+    statements; the Python lists by `ast.literal_eval`.
+  - **AL3** owner attribution by bare function name. It is now the full LEXICAL scope path
+    (functions, classes, lambdas), so only the module-level `claim_skip_trace_rows` is
+    approved. Hits are deduped by statement line, so a SECOND delete inside the approved
+    function is caught.
+  - **AL4** ORM import aliases are resolved, and `query(<model>)...delete()` chains are
+    caught.
+  - **AL5 (P3)** strings are constant-folded (`+`, f-string literal parts), and `public .`
+    with spaces and quoted identifiers are normalized.
+  - **AK2 re-raised at P2 (an RLS DELETE policy on billing evidence): NOT built; it goes to
+    the OWNER.** It is a production RLS-policy change beyond the GRANT the owner chose.
+  - **Mutations: 18/18 as expected** (runner v2, 5 files hash-verified; a hang now counts
+    as INCONCLUSIVE, never as caught). Caught:
+    - the SQL grant removed / only in a comment / revoked later;
+    - the cutover grant removed / only in a comment;
+    - either list missing it; an extra cutover-only grant;
+    - a split `public.` mixed-case delete; `+` composition; a spaced `public .`;
+    - an ORM delete, via an alias, and as a `query().delete()` chain;
+    - a nested function sharing the approved name; a lambda inside the approved
+      function; a second delete inside it.
+
+    The docstring CONTROL passed.
 
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever

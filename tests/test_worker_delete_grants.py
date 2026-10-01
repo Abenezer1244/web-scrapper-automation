@@ -115,86 +115,177 @@ def test_alert_helper_is_not_passed_an_orm_attribute():
 
 
 # ── O-D: pending_skip_trace_rows ─────────────────────────────────────────────
+# Read the grant sources as EXECUTED, not as text (Codex O-D review r1): SQL with its
+# `--` comments removed, the Python lists by literal evaluation. A grant that survives
+# only in a comment must not count.
+
+import ast  # noqa: E402 - the O-D block's own helpers
+
+_OPS = _ROOT / "scripts" / "verify_worker_delete_grants.py"
 
 
-def _quoted_tables(text_: str, name: str) -> set[str]:
-    block = re.search(name + r"\s*=\s*\((.*?)\)", text_, re.DOTALL)
-    assert block, f"{name} not found"
-    return set(re.findall(r'"([a-z_]+)"', block.group(1)))
+def _sql_statements(sql: str) -> list[str]:
+    no_comments = re.sub(r"--[^\n]*", "", sql)
+    return [re.sub(r"\s+", " ", s).strip() for s in no_comments.split(";") if s.strip()]
+
+
+def _py_value(path: Path, name: str):
+    for node in ast.parse(path.read_text(encoding="utf-8")).body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == name for t in node.targets
+        ):
+            return ast.literal_eval(node.value)
+    raise AssertionError(f"{name} not found in {path.name}")
+
+
+def _executed(path: Path) -> list[str]:
+    """The statements a grant source runs, in order."""
+    if path.suffix == ".sql":
+        return _sql_statements(path.read_text(encoding="utf-8"))
+    return [re.sub(r"\s+", " ", s).strip() for s in _py_value(path, "_GRANTS")]
+
+
+def _granted(stmts: list[str]) -> set[str]:
+    out: set[str] = set()
+    for s in stmts:
+        m = re.fullmatch(r"GRANT DELETE ON (.+?) TO " + _ROLE, s, re.IGNORECASE)
+        if m:
+            out.update(t.strip() for t in m.group(1).split(","))
+    return out
 
 
 def test_pending_skip_trace_rows_delete_is_granted_in_both_files():
     """Pinned like delivered_records: without it the claim's lost-race withdrawal
     raises and rolls back the whole claim, live scrape enqueue included (O-D)."""
     for path in (_SQL, _PY):
-        assert "pending_skip_trace_rows" in _delete_grants(path.read_text(encoding="utf-8")), (
+        assert "pending_skip_trace_rows" in _granted(_executed(path)), (
             f"{path.name} does not GRANT DELETE ON pending_skip_trace_rows TO {_ROLE}"
         )
 
 
 def test_every_system_delete_list_is_the_same_set():
-    """EXACT equality, all four ways (Codex O-D AK4): the SQL block, the cutover's
-    grant statements, the cutover's positive verify, and the operator's drift check.
-    A subset test would let an extra grant in one file go unnoticed."""
-    py_text = _PY.read_text(encoding="utf-8")
-    ops = (_ROOT / "scripts" / "verify_worker_delete_grants.py").read_text(encoding="utf-8")
-    sql_grants = _delete_grants(_SQL.read_text(encoding="utf-8"))
+    """EXACT equality, all four ways (Codex O-D AK4), on executed statements: the SQL
+    block, the cutover's grants, its positive verify, and the operator's drift check."""
+    sql_grants = _granted(_executed(_SQL))
     assert sql_grants, "parsed no DELETE grants from provision_rls_roles.sql"
-    assert sql_grants == _delete_grants(py_text)
-    assert sql_grants == _quoted_tables(py_text, "_SYSTEM_DELETE_TABLES")
-    assert sql_grants == _quoted_tables(ops, "REQUIRED_DELETE_TABLES")
+    assert sql_grants == _granted(_executed(_PY))
+    assert sql_grants == set(_py_value(_PY, "_SYSTEM_DELETE_TABLES"))
+    assert sql_grants == set(_py_value(_OPS, "REQUIRED_DELETE_TABLES"))
 
 
-def _pending_row_deletes() -> list[str]:
-    """Every pending_skip_trace_rows DELETE in src/, as "path:function".
+def test_no_later_statement_revokes_any_system_delete_grant():
+    """Ordered execution, for EVERY granted table in BOTH sources: a later REVOKE of
+    DELETE (or ALL) on that table, or on ALL TABLES, from the system role would
+    silently undo the grant."""
+    for path in (_SQL, _PY):
+        stmts = _executed(path)
+        for i, s in enumerate(stmts):
+            for table in _granted([s]):
+                for later in stmts[i + 1:]:
+                    m = re.fullmatch(r"REVOKE (.+?) ON (.+?) FROM " + _ROLE, later,
+                                     re.IGNORECASE)
+                    if not m:
+                        continue
+                    privs, on = m.group(1).upper(), m.group(2)
+                    hits_table = (table in [t.strip() for t in on.split(",")]
+                                  or "ALL TABLES" in on.upper())
+                    assert not (hits_table and ("DELETE" in privs or "ALL" in privs)), (
+                        f"{path.name}: `{later}` would strip DELETE on {table}"
+                    )
 
-    An AST scan, not a grep (Codex O-D AK3): every string constant is read with
-    Python's implicit concatenation already merged by the parser, normalized for
-    case, whitespace and a `public.` prefix; docstrings and comments are never
-    looked at; ORM `delete(PendingSkipTraceRow)` calls are caught too. SQL built at
-    RUNTIME (f-strings with the table name interpolated, string joins) cannot be seen
-    by any static scan; that is what review is for.
+
+# The ONE pending-row DELETE the grant exists for, as a lexical scope path.
+_APPROVED_DELETE = ("src/workers/skip_trace_claim.py", "claim_skip_trace_rows")
+_MODEL = "PendingSkipTraceRow"
+
+
+def _fold(node) -> str | None:
+    """A string a static reader can know: a literal (implicit concatenation is merged
+    by the parser), `+` of known strings, or an f-string's literal parts with each
+    interpolation replaced by a placeholder."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left, right = _fold(node.left), _fold(node.right)
+        return None if left is None or right is None else left + right
+    if isinstance(node, ast.JoinedStr):
+        return "".join(v.value if isinstance(v, ast.Constant) else "\x00" for v in node.values)
+    return None
+
+
+def _is_pending_delete_sql(s: str) -> bool:
+    s = re.sub(r"\s+", " ", s.lower()).replace('"', "")
+    s = re.sub(r"public\s*\.\s*", "", s)
+    return re.search(r"delete from (only )?pending_skip_trace_rows\b", s) is not None
+
+
+def _pending_row_deletes() -> list[tuple[str, str]]:
+    """Every pending_skip_trace_rows DELETE in src/, as (path, scope path), one per
+    statement line.
+
+    An AST scan, not a grep (Codex O-D AK3 + review r1):
+    - foldable strings, with docstrings never looked at;
+    - ORM deletes: `delete(<model>)` / `<x>.delete(<model>)`, and
+      `query(<model>)...delete()`, with the model's import aliases resolved;
+    - each hit is attributed to its full LEXICAL scope (functions, classes and
+      lambdas), so only the module-level claim function itself is approved, never a
+      nested function, class or lambda that happens to share its name.
+
+    Not visible to any static scan: SQL assembled at runtime (the table name
+    interpolated, joined lists), and `session.delete(instance)` on a loaded row.
+    That is what review is for.
     """
-    import ast
-
-    found: list[str] = []
+    found: set[tuple[str, str, int]] = set()
     for path in sorted((_ROOT / "src").rglob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        docstrings = {
-            id(node.body[0].value)
-            for node in ast.walk(tree)
-            if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-            and node.body and isinstance(node.body[0], ast.Expr)
-            and isinstance(node.body[0].value, ast.Constant)
-        }
-        scopes = [(tree, "<module>")] + [
-            (n, n.name) for n in ast.walk(tree)
-            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-        ]
-        owner: dict[int, str] = {}
-        for scope, name in scopes:  # innermost function wins (walked later)
-            for node in ast.walk(scope):
-                owner[id(node)] = name
         rel = path.relative_to(_ROOT).as_posix()
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        parent = {id(c): p for p in ast.walk(tree) for c in ast.iter_child_nodes(p)}
+        docstrings = {
+            id(n.body[0].value) for n in ast.walk(tree)
+            if isinstance(n, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+            and n.body and isinstance(n.body[0], ast.Expr)
+            and isinstance(n.body[0].value, ast.Constant)
+        }
+        aliases = {_MODEL} | {
+            a.asname for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)
+            for a in n.names if a.name == _MODEL and a.asname
+        }
+
+        def names_model(node, aliases=aliases) -> bool:
+            return any((isinstance(x, ast.Name) and x.id in aliases)
+                       or (isinstance(x, ast.Attribute) and x.attr == _MODEL)
+                       for x in ast.walk(node))
+
+        def scope(node, parent=parent) -> str:
+            parts, cur = [], parent.get(id(node))
+            while cur is not None:
+                if isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    parts.append(cur.name)
+                elif isinstance(cur, ast.Lambda):
+                    parts.append("<lambda>")
+                cur = parent.get(id(cur))
+            return ".".join(reversed(parts)) or "<module>"
+
         for node in ast.walk(tree):
             hit = False
-            if (isinstance(node, ast.Constant) and isinstance(node.value, str)
-                    and id(node) not in docstrings):
-                sql = re.sub(r"\s+", " ", node.value.lower()).replace("public.", "")
-                hit = "delete from pending_skip_trace_rows" in sql
-            elif isinstance(node, ast.Call):
+            if id(node) not in docstrings:
+                folded = _fold(node)
+                hit = folded is not None and _is_pending_delete_sql(folded)
+            if not hit and isinstance(node, ast.Call):
                 fn = node.func
                 fname = fn.id if isinstance(fn, ast.Name) else getattr(fn, "attr", "")
-                hit = fname == "delete" and any(
-                    isinstance(a, ast.Name) and a.id == "PendingSkipTraceRow" for a in node.args
-                )
+                if fname == "delete":
+                    receiver = fn.value if isinstance(fn, ast.Attribute) else None
+                    hit = (any(names_model(a) for a in node.args)
+                           or (receiver is not None and names_model(receiver)))
             if hit:
-                found.append(f"{rel}:{owner.get(id(node), '<module>')}")
-    return found
+                found.add((rel, scope(node), node.lineno))
+    return sorted((p, s) for p, s, _line in found)
 
 
 def test_the_claim_withdrawal_is_the_only_pending_row_delete():
     """The worker now holds DELETE on billing evidence (O-D). The one site it was
     granted for is the claim's lost-race withdrawal, by its own just-inserted ids. A
-    new delete site must be reviewed, not ride in on this grant."""
-    assert _pending_row_deletes() == ["src/workers/skip_trace_claim.py:claim_skip_trace_rows"]
+    new delete site, including a second one inside the claim itself, must be
+    reviewed, not ride in on this grant."""
+    assert _pending_row_deletes() == [_APPROVED_DELETE]

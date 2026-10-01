@@ -4,7 +4,7 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Any, Literal, TypedDict
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
+from pydantic import BaseModel, EmailStr, Field, PrivateAttr, field_validator, model_validator
 
 from src.config.constants import (
     HEARTBEAT_STALE_MINUTES,
@@ -2091,9 +2091,31 @@ class ConnectorCreate(BaseModel):
     state: str = Field(max_length=16)
     record_types: list[str] = Field(max_length=20)
     base_url: str = Field(max_length=2000)
-    scraper_mode: str = Field(default="ai", max_length=16)  # ai | manual
+    scraper_mode: str = Field(
+        default="template", max_length=16,
+        description="'template', the only mode this endpoint creates: the scraper is "
+                    "picked from base_url's recorder platform.",
+    )
     gis_endpoint: str | None = Field(default=None, max_length=2000)  # Free ArcGIS REST API URL
-    assessor_url: str | None = Field(default=None, max_length=2000)  # County assessor website (AI fallback)
+    assessor_url: str | None = Field(default=None, max_length=2000)  # County assessor website
+
+    # True when the request sent the legacy name 'ai' (normalized to 'template').
+    # The route logs it: Phase 2c retires the alias only after it stays at zero.
+    _legacy_ai_mode: bool = PrivateAttr(default=False)
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def normalize_legacy_ai_mode(cls, data: Any, handler):
+        """Accept exactly 'ai' as the old name of 'template' (not advertised in
+        OpenAPI). Any other spelling falls through to the route, which refuses it.
+
+        Scoped to JSON request bodies (a dict), the only way this model is built."""
+        legacy = isinstance(data, dict) and data.get("scraper_mode") == "ai"
+        if legacy:
+            data = {**data, "scraper_mode": "template"}
+        model = handler(data)
+        model._legacy_ai_mode = legacy
+        return model
 
     @field_validator("state")
     @classmethod
@@ -2121,7 +2143,7 @@ class ConnectorResponse(BaseModel):
     county: str
     state: str
     record_types: list[str]
-    scraper_mode: str  # ai | manual
+    scraper_mode: str  # template | manual (a row written before migration 108 may read 'ai')
     render_mode: str
     base_url: str
     gis_endpoint: str | None = None

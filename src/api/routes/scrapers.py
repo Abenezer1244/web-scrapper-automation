@@ -51,8 +51,10 @@ from src.scrapers.probate import (
     effective_tod_on_update,
     new_probate_config_tod_default,
 )
+from src.utils.logger import setup_logger
 
 router = APIRouter(prefix="/scrapers", tags=["scrapers"])
+_logger = setup_logger("api.scrapers")
 
 # Phase 3: the living-owner TOD toggle is a probate-only product control.
 _TOD_TOGGLE_RECORD_TYPE = "probate"
@@ -980,7 +982,7 @@ async def create_connector(
     admin_mfa_step_up_required. The inline is_admin check is gone — central
     dependency so the gate can't drift per-endpoint (Codex HIGH).
 
-    For AI-mode connectors, no per-county Python scraper code is needed — the
+    For template-mode connectors, no per-county Python scraper code is needed — the
     registry detects the recorder-platform template from the portal URL. The URL
     must match a known platform (rejected with 400 otherwise).
     """
@@ -1058,32 +1060,39 @@ async def create_connector(
                 detail=f"Invalid assessor_url: {exc}",
             )
 
-    # This endpoint only creates AI/template-mode connectors — it has no
+    # This endpoint only creates template-mode connectors — it has no
     # scraper_class input, so it cannot configure a manual (code-backed) scraper.
     # Manual connectors are provisioned via migrations/seeds with an allowlisted
     # scraper_class. Reject manual mode here rather than persist an empty
     # scraper_class that would crash get_scraper_class() at scrape time.
-    if body.scraper_mode != "ai":
+    # (ConnectorCreate has already normalized the legacy name 'ai' to 'template'.)
+    from src.scrapers.registry import has_template, is_template_mode
+    if not is_template_mode(body.scraper_mode):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=(
-                "Only AI-mode (template-detected) connectors can be created via the API. "
+                "Only template-mode connectors can be created via the API. "
                 "Manual-mode connectors require a code-backed scraper class and are "
                 "provisioned via a migration."
             ),
         )
+    if body._legacy_ai_mode:
+        # AI-mode removal, Phase 2c retires the alias only after this stays at zero.
+        _logger.info(
+            "connector_create: legacy scraper_mode 'ai' normalized to 'template' "
+            "(county=%s state=%s user=%s)", body.county, body.state, current_user.id,
+        )
 
-    # AI-mode connectors resolve to a recorder-platform TEMPLATE by base_url
-    # (the generic AI scraper was removed). Reject at creation if the URL matches
-    # no known template — otherwise the connector would fail at scrape time with
-    # UnsupportedCountyError. scraper_class stays empty: ai-mode resolution uses
-    # base_url (the ai branch returns before any scraper_class import).
-    from src.scrapers.registry import has_template
+    # Template-mode connectors resolve to a recorder-platform TEMPLATE by base_url.
+    # Reject at creation if the URL matches no known template — otherwise the
+    # connector would fail at scrape time with UnsupportedCountyError.
+    # scraper_class stays empty: template resolution uses base_url (the template
+    # branch returns before any scraper_class import).
     if not has_template(body.base_url):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=(
-                "No scraper template matches this portal URL. AI-mode connectors "
+                "No scraper template matches this portal URL. Template-mode connectors "
                 "require a recognized recorder platform (EagleWeb, AcclaimWeb, Tyler "
                 "SelfService, LandmarkWeb, AVA Fidlar, Laserfiche, Skagit, iDocMarket)."
             ),
@@ -1095,7 +1104,7 @@ async def create_connector(
         state=body.state.upper(),
         record_types=body.record_types,
         scraper_class="",
-        scraper_mode=body.scraper_mode,
+        scraper_mode="template",
         base_url=body.base_url,
         # REDTEAM LOW N3: persist the validated enrichment endpoints so the
         # validation isn't dead — enrichment reads these off the connector row.

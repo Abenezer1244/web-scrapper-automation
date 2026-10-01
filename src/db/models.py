@@ -1185,7 +1185,10 @@ class CountyConnector(Base):
     state = Column(String(2), nullable=False, index=True)
     record_types = Column(JSON, nullable=False, default=list)
     scraper_class = Column(String(255), nullable=False)
-    scraper_mode = Column(String(16), nullable=False, default="ai")  # ai | manual
+    # template | manual. 'template' picks a recorder-platform template from base_url.
+    # The legacy name 'ai' is still READ as template (registry.TEMPLATE_MODES) until
+    # Phase 2c retires it; migration 108 moved the stored rows and the server default.
+    scraper_mode = Column(String(16), nullable=False, default="template", server_default="template")
     render_mode = Column(String(16), nullable=False, default="playwright")  # playwright | static
     base_url = Column(String(512), nullable=False)
     gis_endpoint = Column(Text, nullable=True)  # Free ArcGIS REST API URL

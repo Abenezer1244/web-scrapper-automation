@@ -4817,6 +4817,10 @@ trusted-worker risk; the RLS hardening is the owner's call (and, if wanted, befo
   - Mutations: **23/23 as expected**, 5 files hash-verified. Added: a REVOKE `ON TABLE x`
     (SQL) and `ON public.x` (cutover), both caught; CONTROL: the grant written `ON TABLE
     public."x"` still counts, and passed.
+- **Codex diff review r4: GATE: GO**, no P1/P2 (`codex_od_review_r4_out.txt`). AN1 verified;
+  the AN2 deferral accepted as P3. **AK2 is RECORDED, NOT owner-accepted: asked of the owner.**
+  Merging changes no production privilege; the grant applies only via `--apply`, after the
+  owner's OK.
 - **Follow-up (not in O-D):** correct the two scripts' "DELETE=False on every table"
   docstrings.
 

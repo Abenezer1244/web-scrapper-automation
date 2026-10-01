@@ -4558,6 +4558,98 @@ mandatory: the post-deploy NULL proof, and owner-approved remediation for any NU
 - O-C-ii was rebased `--onto` main `bf792931`. Its three-dot diff is BYTE-IDENTICAL to the
   reviewed one.
 
+### O-C-ii MERGED + LIVE (2026-10-01): #422, merge `1a4076d4` (10:03:41Z)
+- Codex re-check after the rebase: GO. CI green on `b1f8b05e`. quiet all zeros, main
+  unchanged, `--match-head-commit`. The other sessions were told "merging" / "verified".
+- api, worker and beat SUCCESS on `1a4076d4`, `/health` 200, the workers ready, no errors.
+  New queues now carry `rows_sent`. Billing is unchanged until O-C-iii.
+
+### O-C-iii BUILT (2026-10-01, branch `feat/lookup-oc-iii-billing-rule`, rebased on `1a4076d4`), before the Codex diff review
+- `skip_trace_usage.py`:
+  - `queue_accepted_all` = `rows_sent > 0 AND rows_uploaded >= rows_sent`, read from the
+    queue row alone.
+  - **One deviation from the spec, toward the customer:** `rows_sent > 0` is added. A
+    real batch never sends zero (`claimed[0]` is dereferenced), so a 0, like NULL, is
+    "not proven". Without it, `0 >= 0` would read as accepted.
+  - `report_usage_from_webhook` sets `unmatched_billed = COALESCE(unmatched_billed,
+    <decision>) ... RETURNING unmatched_billed` in the caller's transaction, for every
+    billed queue, and bills by the RETURNED value (AJ1: what is recorded is what is
+    billed). The warning text names the NULL case.
+- `scheduler_helpers/contact_lookups.py`:
+  - `unmatched` maps from `q.unmatched_billed`; `queue_accepted_all` is no longer
+    imported.
+  - NULL or no queue row → the new flag `billing_decision_unknown` (`FLAGS`, after
+    `result_state_unexpected`).
+  - `_UNMATCHED_UNDECIDED` joins `_ANY_BLOCKER`; `_MAPPABLE`'s `unmatched` arm requires a
+    decision.
+  - Docstring and alert text updated.
+- Tests:
+  - `test_tracerfy_ingest.py`: `_seed` writes `rows_sent = len(addresses)` as the
+    dispatcher does. The three old pins and `test_tracerfy_webhook_trust_s3_15.py` pass
+    UNCHANGED. New:
+    - `queue_accepted_all` (sent, uploaded) = (3,3)T (3,4)T (3,2)F (3,0)F (NULL,3)F (0,0)F,
+      plus unknown / empty queue F;
+    - **the W3 regression** (sent 4, 3 stamped, 3 uploaded → 2 billed, decision F);
+    - legacy NULL → completed only, decision F;
+    - decision T when unmatched bills;
+    - AH2: decision recorded with NO unmatched row (T and F);
+    - a recorded decision is never rewritten.
+  - `test_contact_lookup_reconciler.py`:
+    - `_queue(sent=, decision=)`;
+    - the mapping test carries decisions;
+    - **AD3:** the parity test COMMITS the real billing run, and the reconciler reads
+      its decision;
+    - **AD5:** the spy test is replaced by "the verdict is the recorded decision", with
+      the counts rewritten the opposite way;
+    - **AH3:** an undecided OR absent queue is flagged once and never mapped (the other
+      lead in flight, so ONLY the blocker selects the action); it maps and settles when
+      a decision appears;
+    - the starvation test gains an undecided action.
+- **Mutations: 13/13 caught** (runner v2, two source files, hashes verified after each
+  slice):
+  - the rule: `>`, NULL accepted, zero accepted, the old STAMPED rule;
+  - the decision: never persisted, overwritten, inverted; billing ignoring the rule;
+  - the reader: NULL mapped unbilled, NULL mapped billable, the verdict inverted, the
+    blocker missing from `_ANY_BLOCKER`, an undecided row counted as mappable.
+  - **One first-run SURVIVOR became a test:** "undecided counts as mappable" holds group
+    (a)'s slot forever (AA5). Now caught by the starvation test.
+  - **The W3 test ALONE catches the old stamped rule:** it billed 3 where 2 were
+    answered (`assert 3 == 2`), the live gap reproduced and closed.
+- **Regression: 1161 passed, 0 failed.** That is every test file naming billing, ingest,
+  the reconciler, the queue table, the meter events or the scheduler (42 files, 6 chunks
+  of 7). ruff clean. No type checker is configured.
+- **Codex diff review r1: GATE: NO-GO, 2 P2, both fixed** (`codex_ociii_review_r1_out.txt`):
+  - **AJ1 (P2) the recorded decision could differ from what billing billed.** The UPDATE
+    kept an existing value, but `billable_states` used the freshly computed rule, and my
+    own "never rewritten" test pinned exactly that state. Fix: one statement, `SET
+    unmatched_billed = COALESCE(unmatched_billed, :decided) ... RETURNING
+    unmatched_billed`, and billing bills by the RETURNED value (no row → False). The test
+    now also asserts usage follows the stored False (1 billed, not 2). New mutant: "billing
+    uses the fresh rule over the stored decision" → caught by that test.
+  - **AJ2 (P2) the AF1 / AH4 post-deploy gate did not exist.**
+    `C:/Users/Windows/bl-checks/oc_post_deploy_check.py` is now WRITTEN (read-only,
+    counts and queue ids only):
+    - `--pre` counts un-ingested queues with NULL `rows_sent`;
+    - `<merge-time>` exits 1 listing every queue completed since the merge with a NULL
+      decision.
+
+    Proven locally in both modes, including the FAIL path: one seeded completed,
+    undecided queue → exit 1 with its id, and the seed removed afterwards (0 left).
+    Codex's drain/quiesce ask stays as agreed in r4 (AF1): `quiet.py` zeros at merge,
+    no production worker shutdown.
+- **INCIDENT (2026-10-01): the C: drive filled to 0 bytes during the mutation re-run.** The
+  runner's restore write failed (`OSError: No space left on device`), leaving
+  `skip_trace_usage.py` and `contact_lookups.py` at **0 bytes** in the worktree (local only;
+  nothing pushed or deployed). The cause was outside this work (temp ~3 GB, test env ~1.8
+  GB). The owner freed space. Both files were restored (`git checkout` + AJ1 re-applied)
+  and matched the pre-run SHA-256 exactly. The interrupted slice was re-run.
+  **Mutations: 14/14 caught**, hashes OK.
+- Rebased on main `aeeaccd6` (#423: journal, schemas/constants/retention comments; none of
+  this PR's files). **Regression re-run after AJ1 + the rebase: 1161 passed, 0 failed**
+  (the same 42 files). ruff clean on `src` and both test files.
+- **Codex diff review r2: GATE: GO**, 1 P3 (this plan described the pre-AJ1 UPDATE; fixed)
+  (`codex_ociii_review_r2_out.txt`).
+
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever
       the tab has leads that have never been looked up; when the quote comes back with

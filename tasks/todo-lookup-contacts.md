@@ -4617,6 +4617,32 @@ mandatory: the post-deploy NULL proof, and owner-approved remediation for any NU
 - **Regression: 1161 passed, 0 failed.** That is every test file naming billing, ingest,
   the reconciler, the queue table, the meter events or the scheduler (42 files, 6 chunks
   of 7). ruff clean. No type checker is configured.
+- **Codex diff review r1: GATE: NO-GO, 2 P2, both fixed** (`codex_ociii_review_r1_out.txt`):
+  - **AJ1 (P2) the recorded decision could differ from what billing billed.** The UPDATE
+    kept an existing value, but `billable_states` used the freshly computed rule, and my
+    own "never rewritten" test pinned exactly that state. Fix: one statement, `SET
+    unmatched_billed = COALESCE(unmatched_billed, :decided) ... RETURNING
+    unmatched_billed`, and billing bills by the RETURNED value (no row → False). The test
+    now also asserts usage follows the stored False (1 billed, not 2). New mutant: "billing
+    uses the fresh rule over the stored decision" → caught by that test.
+  - **AJ2 (P2) the AF1 / AH4 post-deploy gate did not exist.**
+    `C:/Users/Windows/bl-checks/oc_post_deploy_check.py` is now WRITTEN (read-only,
+    counts and queue ids only):
+    - `--pre` counts un-ingested queues with NULL `rows_sent`;
+    - `<merge-time>` exits 1 listing every queue completed since the merge with a NULL
+      decision.
+
+    Proven locally in both modes, including the FAIL path: one seeded completed,
+    undecided queue → exit 1 with its id, and the seed removed afterwards (0 left).
+    Codex's drain/quiesce ask stays as agreed in r4 (AF1): `quiet.py` zeros at merge,
+    no production worker shutdown.
+- **INCIDENT (2026-10-01): the C: drive filled to 0 bytes during the mutation re-run.** The
+  runner's restore write failed (`OSError: No space left on device`), leaving
+  `skip_trace_usage.py` and `contact_lookups.py` at **0 bytes** in the worktree (local only;
+  nothing pushed or deployed). The cause was outside this work (temp ~3 GB, test env ~1.8
+  GB). The owner freed space. Both files were restored (`git checkout` + AJ1 re-applied)
+  and matched the pre-run SHA-256 exactly. The interrupted slice was re-run.
+  **Mutations: 14/14 caught**, hashes OK.
 
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever

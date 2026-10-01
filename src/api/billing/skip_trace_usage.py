@@ -636,18 +636,23 @@ def report_usage_from_webhook(db, queue_id: int) -> dict:
     # rows_uploaded covers everything we submitted, no row was dropped or
     # deduped and every unmatched row was genuinely paid for. If it does not,
     # this batch bills 'completed' rows only -- erring toward the customer.
-    accepted_all = queue_accepted_all(db, queue_id)
     # Persist the decision, once, in the caller's transaction (O-C, AA2): it commits
     # with the counters and the outbox or not at all. The contact-lookup reconciler
     # reads THIS instead of re-running the rule later, so an action states what
     # billing did. Written for every queue billed, unmatched rows or not.
-    db.execute(
+    #
+    # Billing then uses the value STORED, not the one just computed: a decision
+    # already on the queue is kept (COALESCE) and returned, so what is recorded and
+    # what is billed can never differ. No queue row → not accepted.
+    accepted_all = bool(db.execute(
         text("""
-            UPDATE skip_trace_queues SET unmatched_billed = :decided
-            WHERE tracerfy_queue_id = :qid AND unmatched_billed IS NULL
+            UPDATE skip_trace_queues
+               SET unmatched_billed = COALESCE(unmatched_billed, :decided)
+             WHERE tracerfy_queue_id = :qid
+            RETURNING unmatched_billed
         """),
-        {"decided": accepted_all, "qid": queue_id},
-    )
+        {"decided": queue_accepted_all(db, queue_id), "qid": queue_id},
+    ).scalar())
 
     billable_states = ("completed", "unmatched") if accepted_all else ("completed",)
     if not accepted_all:

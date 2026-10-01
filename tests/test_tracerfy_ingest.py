@@ -916,12 +916,17 @@ async def test_the_decision_is_recorded_with_no_unmatched_row(
 
 @pytest.mark.asyncio
 async def test_a_recorded_decision_is_never_rewritten(starter_user, _stub_csv):
-    """Written once (`unmatched_billed IS NULL`): a value already on the queue stays."""
+    """Written once: a value already on the queue stays, AND billing bills by it, so
+    the recorded decision and what was billed never differ (O-C-iii review r1). Here
+    the rule alone would bill the unmatched row (sent 2, uploaded 2); the stored
+    False wins, and only the answered row bills."""
     qid = _next_queue_id()
     _seed(starter_user.id, qid, [("1 ONCE ST", "TACOMA", "WA"), ("2 ONCE ST", "TACOMA", "WA")])
     _set_queue(qid, unmatched_billed=False)
+    before = _usage(starter_user.id)
     _stub_csv(_csv("1 ONCE ST,TACOMA,WA,J,D,2065550507,Mobile,2065550507,,,,"))
 
     ingest_tracerfy_batch(queue_id=qid, download_url=DOWNLOAD_URL)
 
     assert _decision(qid) is False
+    assert _usage(starter_user.id) == before + 1

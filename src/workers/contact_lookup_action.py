@@ -46,6 +46,10 @@ _logger = setup_logger(__name__)
 
 # How long T1's lease lasts. The task's own limits (below) are well under it.
 LEASE_SECONDS = 600
+# An action not started within this long of its confirm never starts: the reconciler
+# expires it and nothing is bought (O-B). Enforced IN T1's CAS, not only by the
+# reconciler, because a publish can be delivered late (2c consult AA1).
+ACTION_DEADLINE_SECONDS = 30 * 60
 _SOFT_TIME_LIMIT_S = 240
 _HARD_TIME_LIMIT_S = 300
 
@@ -152,6 +156,9 @@ def _move(db, action_id: str, frm: str, to: str, reason: str | None = None, *,
         sets.append(f"{column} = :c_{column}")
         params[f"c_{column}"] = int(value)
     where = "id = CAST(:id AS uuid) AND status = :frm"
+    if to == "running":
+        where += " AND created_at > now() - make_interval(secs => :deadline_s)"
+        params["deadline_s"] = ACTION_DEADLINE_SECONDS
     if fence_token is not None:
         where += " AND lease_token = :fence AND lease_expires_at > now()"
         params["fence"] = fence_token
@@ -163,6 +170,33 @@ def _move(db, action_id: str, frm: str, to: str, reason: str | None = None, *,
     if row is None:
         return False
     _event(db, action_id, row[0], frm, to, reason, lease_token=new_token or fence_token)
+    return True
+
+
+# Statuses whose `status_reason` may change while the status stays put: a claimed
+# action waiting on something only a human can resolve (2c consult AA3).
+FLAGGABLE = frozenset({"claimed"})
+
+
+def _flag(db, action_id: str, status: str, reason: str | None) -> bool:
+    """Set (or, with None, clear) `status_reason` on an action that stays in `status`,
+    with its event, in the caller's transaction. A flag is NOT a transition, so it is
+    not in ACTION_TRANSITIONS; it is checked against FLAGGABLE instead.
+
+    Returns True only when the value CHANGED, so a caller alerts once per change.
+    """
+    if status not in FLAGGABLE:
+        raise IllegalTransitionError(f"no flag on {status!r}")
+    row = db.execute(
+        text("UPDATE contact_lookup_actions SET status_reason = :reason "
+             "WHERE id = CAST(:id AS uuid) AND status = :status "
+             "  AND status_reason IS DISTINCT FROM :reason "
+             "RETURNING user_id::text"),
+        {"id": action_id, "status": status, "reason": reason},
+    ).first()
+    if row is None:
+        return False
+    _event(db, action_id, row[0], status, status, reason or "flag_cleared")
     return True
 
 

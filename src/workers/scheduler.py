@@ -30,6 +30,7 @@ from src.workers.scheduler_helpers.billing import (
     _reconcile_quota_periods_impl,
     _reset_skip_trace_usage_impl,
 )
+from src.workers.scheduler_helpers.contact_lookups import _reconcile_contact_lookups_impl
 from src.workers.scheduler_helpers.county import (
     _purge_old_records_impl,
     _run_single_county_scrape_impl,
@@ -204,6 +205,12 @@ app.conf.beat_schedule = {
         # reported_at IS NULL and re-enqueues report_skip_trace_meter_event.
         "task": "src.workers.scheduler.flush_skip_trace_meter_outbox",
         "schedule": 180.0,  # every 3 minutes
+    },
+    "reconcile-contact-lookups": {
+        # Phase 1b-2c: expire, take back, re-publish and settle "look up contacts"
+        # actions. Never bills. Under 10 minutes, so a plain interval is allowed.
+        "task": "src.workers.scheduler.reconcile_contact_lookups",
+        "schedule": 120.0,  # every 2 minutes
     },
     "dialer-push-sweep": {
         # Phase 5: push dialer-ready leads for jobs whose async skip-trace has
@@ -591,6 +598,17 @@ def flush_skip_trace_meter_outbox() -> None:
     re-enqueue can neither lose the event nor double-bill.
     """
     return _flush_skip_trace_meter_outbox_impl()
+
+
+# ─── Task: Reconcile contact-lookup actions (every 2 min) ────────────────────
+
+@app.task(name="src.workers.scheduler.reconcile_contact_lookups")
+def reconcile_contact_lookups() -> dict:
+    """Expire, take back, re-publish and settle contact-lookup actions (Phase 1b-2c).
+
+    See src/workers/scheduler_helpers/contact_lookups.py. It never bills.
+    """
+    return _reconcile_contact_lookups_impl()
 
 
 # ─── Task: Dialer push sweep (Phase 5) ───────────────────────────────────────

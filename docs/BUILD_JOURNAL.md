@@ -19,6 +19,75 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-09-30 — Landing and marketing redesign (bridgeleads-web#176): contour field, measured numbers, five critique rounds
+
+> Owner asked for an animated background and a 9.5/10 page that doesn't read as AI-made. The owner chose
+> abstract motion (not the proposed plat map), all phases in one run, and real production counts.
+> Plan + review: bridgeleads-web `tasks/todo-landing-redesign.md`.
+
+**Built / Shipped (PR open, NOT merged; merge = Vercel deploy):**
+- bridgeleads-web#176, branch `design/landing-redesign-2026-09-30`.
+  - Animated topographic contour field: marching squares over seeded noise, with one amber rise.
+    Adaptive grid; holds 60fps with no long tasks at 4x CPU throttle.
+  - Archivo + Public Sans, scoped to the marketing layout.
+  - New sections: seven record types; a step-by-step sample lead ending in the real `crm_v1` CSV
+    headers (`src/utils/lead_export.py`); features grouped by job; an honest dashboard replica; the
+    live county list.
+  - /pricing, /coverage, /privacy and /terms moved onto the same system; legal wording byte-identical.
+  - CI and the Vercel preview are green.
+- Gates: independent design critic 8.2 → 8.7 → 9.2 → 9.3 → 9.5. Codex FAIL → FAIL → FAIL → PASS
+  over four rounds (the full diff in three chunks, then deltas).
+
+**Tried / Decided:**
+- Proposed a plat-map background; the owner picked abstract motion. Contour lines keep a hint of
+  land without being literal.
+- Codex findings rejected, with evidence recorded in the commit messages:
+  - a `try/catch` that already existed;
+  - "FOUNDING25 doesn't stack with annual" (`billing.py`: general codes "work on monthly and annual");
+  - an `aria-hidden` that was already set.
+- Did not carry the chosen plan through `/register` into checkout. That's a product change, so the
+  buttons now say what actually happens instead.
+
+**Failed / Blocked:**
+- Turbopack dev in a worktree whose `node_modules` is a junction kept serving stale CSS. Switched to
+  `next dev --webpack` with `WATCHPACK_POLLING`.
+- The first junction (Git Bash `mklink`) was mangled, and `npx next` silently pulled next@16.3.8.
+- A 30-minute background dev server died mid-test; the results from that run were discarded.
+- My first "1.25x coverage headline" did nothing. The unlayered `.mk-h2` beats Tailwind utilities;
+  it was only caught by measuring the computed size.
+- @theme font tokens resolved on `:root`, where the next/font variables don't exist, so every
+  heading fell back to DM Sans until the tokens were redeclared on the wrapper.
+- Two critique rounds chased "misalignments" that were artifacts: element screenshots of sections
+  taller than the viewport misplace sticky columns. Live-scroll measurement showed them aligned.
+
+**Caught & fixed (several were live in production):**
+- The stats strip claimed **129K records enriched**. Production has **1,070**, measured read-only
+  as postgres. It also claimed 277K scraped; production has 174,566 result rows.
+- Counties were claimed as 19 and 20+; 17 are live. The landing now reads `/scrapers/connectors`.
+- /pricing said every plan reaches all counties, while the API answers 402 above the cap.
+- /pricing scrolled ~310px sideways on phones. The sr-only table labels escaped an unpositioned
+  scroller.
+- "Talk to sales" and "Choose Business" linked to `/register`, which carries no plan.
+- "Every day" freshness claims; runs follow each customer's schedule.
+- The 78% rate is among traced owners; the copy now says so.
+
+**Pending / Handoff:**
+- Owner review and merge of #176.
+- Wire the founding offer's `active` / `spots_remaining` (25 total) through the parked
+  `pricingApi.ts`.
+- `/register` plan and interval carry-through.
+- Legal `[Legal entity name]` placeholders.
+- **Correction:** the #176 phase-4 commit message says "limited spots" had no limit behind it. That
+  is wrong; `spots_total` is 25.
+
+**Facts learned:**
+- The 78% contact rate = `skip_trace_status='hit'` (at least one phone or email) / (`hit` + `miss`),
+  1,070 / 1,365 on 2026-09-30.
+- The live connector list lists Clark twice with different case; merge counties on a case-folded key.
+
+---
+
+
 ## 2026-10-01 — UX 2d (F-006): "already delivered" outside the run page, and the live fallback we measured and dropped
 
 > Owner: snapshot only (no history backfill), one number in the list (no source scraper).

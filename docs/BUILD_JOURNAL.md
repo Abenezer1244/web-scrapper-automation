@@ -44,7 +44,8 @@ to understand *why* the code is the way it is and *what's been attempted before*
 - The contract said FE-only and listed six statuses. The backend defines seven
   (`SkipTraceStatus`): `purged` (retention sweep) read "None found" on both channels, the same
   false claim. The column is a `String(16)` with no CHECK, so any other value it can hold is
-  bucketed as `unknown` and rendered neutrally. That made a backend phase
+  bucketed as `unknown` in the summary; in the cells it shows its values if it has any, and a
+  neutral N/A otherwise. That made a backend phase
   necessary, so the summary would not call a looked-up lead "not looked up".
 - Codex plan review took six rounds (r1-r5 NO-GO, r6 GO). Each round tightened the shared
   rule between the cells and the summary:
@@ -96,6 +97,12 @@ to understand *why* the code is the way it is and *what's been attempted before*
   (squash d0626274, Vercel success) made it neutral: "its lookup data was deleted after the
   retention period", with the summary label, type comment and contracts doc to match.
 - A real-row check of an `errored` lead in prod, if the owner approves a read.
+- OWNER DECISION, retention: `SkipTraceStatus.PURGED` is documented as distinct from MISS
+  "because the difference is auditable history", but `_ELIGIBLE` also sweeps a `miss` whose
+  arrays are `[]` (non-NULL) and turns it into `purged`, erasing that history. Either narrow
+  `_ELIGIBLE` (for example to rows that actually hold a phone or email) or accept and
+  document it. Retention ships OFF in code; the prod setting was not read. The comments in
+  `constants.py` / `schemas.py` now describe the actual behaviour and point here.
 - Next queue item: item 3 (batches B-E + F-045..F-050).
 
 **Facts learned:**

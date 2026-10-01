@@ -1697,8 +1697,9 @@ class ResultRow(BaseModel):
     phones: list[PhoneContact] | None = None
     emails: list[str] | None = None
     # not_attempted|queued|submitted|hit|miss|errored|purged
-    # 'purged' is terminal: this row WAS a hit, and its contact PII has since been
-    # deleted for age under the Privacy Policy §7 retention sweep. Treat it as
+    # 'purged' is terminal: this row was looked up, and its aged contact data has since
+    # been deleted under the Privacy Policy §7 retention sweep (usually a former hit,
+    # but a 'miss' with [] arrays is swept too, see SkipTraceStatus.PURGED). Treat it as
     # "no contact data", not as "never traced" — the trace happened and was paid for.
     skip_trace_status: str = "not_attempted"
     skip_trace_attempted_at: datetime | None = None
@@ -1888,7 +1889,7 @@ class AlreadyDeliveredContacts(BaseModel):
     looking: int = 0        # 'queued' / 'submitted': a lookup is on its way
     failed: int = 0         # 'errored': the lookup did not complete
     not_looked_up: int = 0  # 'not_attempted' with no contact: never asked
-    removed: int = 0        # 'purged': looked up, contacts later deleted for age (retention)
+    removed: int = 0        # 'purged': looked up, lookup data later deleted for age (retention)
     unknown: int = 0        # a status this API version does not know
     # NOT a bucket: how many of found + none_found were answered from this account's
     # earlier answer, with no new lookup bought (results.skip_trace_source, 097). Rows

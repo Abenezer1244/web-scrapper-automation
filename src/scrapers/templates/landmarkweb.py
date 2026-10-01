@@ -1,7 +1,7 @@
 """LandmarkWeb template scraper for Hyland LandmarkWeb recorder portals.
 
 Covers WA counties using the Hyland LandmarkWeb interface.
-No Claude AI needed — standardized navigation + extraction.
+Standardized navigation + extraction.
 
 LandmarkWeb sites share:
 - Disclaimer modal with "Accept" button (SetDisclaimer() JS function)
@@ -63,7 +63,7 @@ _DOC_TYPE_MAP = {
 class LandmarkWebScraper(BridgeScraper):
     """Template scraper for all Hyland LandmarkWeb recorder sites.
 
-    Zero Claude AI cost — uses standardized selectors for the
+    Uses standardized selectors for the
     shared LandmarkWeb interface.
     """
 

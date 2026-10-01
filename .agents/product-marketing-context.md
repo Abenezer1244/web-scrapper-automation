@@ -4,7 +4,7 @@
 
 ## Product Overview
 **One-liner:** "Set it. Wake up to leads." — Automated motivated seller lead generation from county public records.
-**What it does:** BridgeLeads scrapes county recorder websites daily using AI-powered browser automation, enriches each record with property and mailing addresses, and delivers clean CSV lead lists to real estate investors on a schedule.
+**What it does:** BridgeLeads scrapes county recorder websites daily using recorder-platform templates, enriches each record with property and mailing addresses, and delivers clean CSV lead lists to real estate investors on a schedule.
 **Product category:** Real estate lead generation software / PropTech data tool
 **Product type:** Multi-tenant SaaS (B2B)
 **Business model:** Freemium + tiered subscriptions
@@ -53,17 +53,16 @@
 ## Differentiation
 **Key differentiators:**
 - **Daily freshness from the source** — scrapes county portals directly, not resold bulk data
-- **AI-powered county onboarding** — paste a URL, Claude navigates the portal automatically. No per-county engineering.
+- **URL-based county onboarding** — a county on a supported recorder platform is added with its portal URL. No per-county engineering.
 - **Price-to-value ratio** — Pro at $49/mo is half PropStream with fresher data
-- **Action caching** — first AI scrape costs ~$0.15, subsequent runs replay cached actions (free)
-**How we do it differently:** AI browser automation (Claude) analyzes any county website via screenshots, fills forms, extracts records, and caches the navigation. Competitors either resell aggregated data or require weeks of custom engineering per county.
+**How we do it differently:** one scraper template per recorder platform (EagleWeb, AcclaimWeb, Tyler SelfService, LandmarkWeb, AVA Fidlar, Laserfiche WebLink, iDocMarket and Skagit) covers every county on that platform, straight from the official source. Competitors either resell aggregated data or require weeks of custom engineering per county.
 **Why that's better:** Investors get same-day leads instead of month-old data. Adding new counties takes seconds, not weeks.
 **Why customers choose us:** Fresher data at lower cost, with the ability to add any county in the US.
 
 ## Objections
 | Objection | Response |
 |-----------|----------|
-| "Only covers WA state right now" | We're expanding state by state — WA is live with 22 counties, and our AI can add any US county in 30 seconds. Request your county and we'll add it. |
+| "Only covers WA state right now" | We're expanding state by state — WA is live with 22 counties, and any county on a supported recorder platform is added from its portal URL. Request your county and we'll add it. |
 | "Does it include phone/email?" | Yes — skip tracing is built in. Every lead gets phone, phone type, and email via Tracerfy, delivered within 10-15 minutes of the scrape. |
 | "PropStream has more features" | PropStream is an all-in-one tool with month-old data. BridgeLeads is a focused lead source with daily-fresh data. Use us for leads, keep your other tools for workflow. |
 
@@ -71,7 +70,7 @@
 
 ## Switching Dynamics
 **Push:** Data staleness (30-90 day lag), price hikes (BatchLeads doubled prices), data deletion on cancel, PropStream acquisition uncertainty
-**Pull:** Daily-fresh data direct from county source, half the price, AI-powered county addition, free tier to try risk-free
+**Pull:** Daily-fresh data direct from county source, half the price, URL-based county addition, free tier to try risk-free
 **Habit:** Familiar with PropStream UI, existing saved lists and filters, team already trained on current tool
 **Anxiety:** "What if BridgeLeads shuts down?" (startup risk), "Will it cover my counties?" (coverage gaps), "No skip tracing yet" (feature gaps)
 
@@ -117,7 +116,7 @@
 | Theme | Proof |
 |-------|-------|
 | Freshness | Daily scrape from county source vs 30-90 day bulk data lag |
-| Coverage | 22 WA counties live, AI adds new counties in 30 seconds |
+| Coverage | 22 WA counties live, supported-platform counties added from a URL |
 | Value | Pro at $79/mo = 20% less than PropStream with fresher data |
 | Enrichment | Property + mailing address enrichment + skip trace (phone/email) |
 

@@ -1,7 +1,7 @@
 """EagleWeb template scraper for Tyler Technologies recorder portals.
 
 Covers 16+ WA counties that use the same EagleWeb interface.
-No Claude AI needed — standardized navigation + extraction.
+Standardized navigation + extraction.
 
 EagleWeb sites share:
 - Disclaimer page with "I Acknowledge" button
@@ -91,7 +91,7 @@ def _doc_type_matches(doc_upper: str, keywords: list[str]) -> bool:
 class EagleWebScraper(BridgeScraper):
     """Template scraper for all Tyler EagleWeb recorder sites.
 
-    Zero Claude AI cost — uses standardized selectors for the shared
+    Uses standardized selectors for the shared
     EagleWeb interface used by 16+ WA counties.
     """
 
@@ -261,8 +261,8 @@ class EagleWebScraper(BridgeScraper):
                     dropped, before,
                 )
 
-        # Records are returned raw; the run_scrape_job worker enriches
-        # them inline (county_gis + AI assessor) before saving Result rows.
+        # Records are returned raw; the run_scrape_job worker's enrichment pass
+        # (src/workers/tasks_helpers/enrich.py) adds the addresses.
         _logger.info("EagleWeb complete — %d records (enrichment runs after save)", len(all_records))
         return all_records
 

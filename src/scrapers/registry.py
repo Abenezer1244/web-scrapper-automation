@@ -202,8 +202,6 @@ def _detect_template(base_url: str):
     """Detect if a URL matches a known recorder platform template.
 
     Returns the template scraper class if matched, None otherwise.
-    This saves Claude AI tokens by using standardized navigation
-    for known platforms.
     """
     url_lower = base_url.lower()
 
@@ -274,7 +272,7 @@ def has_template(base_url: str) -> bool:
     """True if ``base_url`` maps to a known recorder-platform template.
 
     Public predicate for callers (e.g. the connector-create API) that need to
-    know, without importing the private detector, whether an ai-mode connector
+    know, without importing the private detector, whether a template-mode connector
     pointed at this URL would resolve to a template or fail closed.
     """
     return _detect_template(base_url or "") is not None

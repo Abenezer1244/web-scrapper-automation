@@ -1045,7 +1045,7 @@ async def create_connector(
                 detail=f"Invalid gis_endpoint: {exc}",
             )
 
-    # assessor_url is also fetched server-side (AI enrichment fallback), so
+    # assessor_url is also fetched server-side (PACS enrichment), so
     # it must clear the same SSRF firewall as gis_endpoint before we persist
     # it. REDTEAM LOW N3 flagged that gis_endpoint/assessor_url were validated
     # (gis) but never stored, and assessor_url was neither validated nor

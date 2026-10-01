@@ -99,7 +99,7 @@ _DOC_TYPE_MAP = {
 class TylerSelfServiceScraper(BridgeScraper):
     """Template scraper for Tyler SelfService Web recorder installations.
 
-    Zero Claude AI cost — uses standardized selectors for the shared
+    Uses standardized selectors for the shared
     Tyler SelfService interface.
 
     WARNING (2026-04-11): this version does NOT extract parcel_id — the

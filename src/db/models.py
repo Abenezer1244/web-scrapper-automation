@@ -1192,7 +1192,7 @@ class CountyConnector(Base):
     render_mode = Column(String(16), nullable=False, default="playwright")  # playwright | static
     base_url = Column(String(512), nullable=False)
     gis_endpoint = Column(Text, nullable=True)  # Free ArcGIS REST API URL
-    assessor_url = Column(Text, nullable=True)  # County assessor website (AI fallback)
+    assessor_url = Column(Text, nullable=True)  # County assessor website (PACS enrichment)
     health_status = Column(String(16), nullable=False, default="unknown")  # healthy | degraded | down | unknown
     max_date_range_days = Column(Integer, nullable=True)  # null = unlimited, 30 = single-date portals
     last_checked = Column(DateTime(timezone=True), nullable=True)

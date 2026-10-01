@@ -1,7 +1,7 @@
 """AVA Fidlar template scraper for Fidlar Technologies AVA recorder portals.
 
 Covers WA counties using the AVA (Angular SPA) interface.
-No Claude AI needed — standardized Angular Material navigation + extraction.
+Standardized Angular Material navigation + extraction.
 
 AVA sites share:
 - Angular SPA with hash routing (#/search)
@@ -63,7 +63,7 @@ _DOC_TYPE_MAP = {
 class AvaFidlarScraper(BridgeScraper):
     """Template scraper for Fidlar AVA Angular SPA recorder sites.
 
-    Zero Claude AI cost — uses standardized Angular Material selectors.
+    Uses standardized Angular Material selectors.
     Must wait for Angular to bootstrap before interacting.
     """
 

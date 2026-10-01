@@ -9,7 +9,7 @@
 
 BridgeLeads automates motivated seller lead generation for real estate investors. Scrapes county public records (probate, pre-foreclosure, tax delinquent), enriches with property/mailing addresses via Regrid national API, and delivers clean CSV lead lists on a schedule.
 
-**Key differentiator**: AI-powered scraping works on ANY county website. Add a URL → Claude handles the rest. No per-county code needed.
+**Key differentiator**: template scraping works on every county portal on a supported recorder platform. Add the URL → the matching template handles the rest. No per-county code needed.
 
 ---
 
@@ -18,7 +18,7 @@ BridgeLeads automates motivated seller lead generation for real estate investors
 | Component | Status | Details |
 |-----------|--------|---------|
 | Pierce County scraper | Production | 300 records, all pages, heirs, legal descriptions |
-| AI scraper (Claude) | Production | Any county, zero code, action caching |
+| Recorder-platform templates | Production | 8 platforms, zero per-county code |
 | Regrid enrichment | Built | National parcel → address API |
 | SaaS frontend | Production | Vercel, app.bridgeleads.io |
 | API backend | Production | Railway, api.bridgeleads.io |
@@ -38,6 +38,8 @@ BridgeLeads automates motivated seller lead generation for real estate investors
 | Business | $149/mo | 5,000 | $150 | $15 | **-11%** |
 | Agency | $499/mo | 50,000 | Volume ($500) | Volume | **TBD** |
 
+*The AI Cost column is a legacy estimate for an LLM-driven scraper that is no longer part of the product (AI mode removed 2026-09-30). Current scraping has no per-record AI cost; the margins have not been recomputed.*
+
 **Action needed**: Negotiate Regrid volume pricing for Business+ tiers, or offer enrichment as add-on.
 
 ---
@@ -55,7 +57,7 @@ BridgeLeads automates motivated seller lead generation for real estate investors
 
 ## Competitive Position
 
-**Only product that automates county-by-county scraping with AI.** Competitors require manual search or limited county coverage.
+**Automates county-by-county scraping from the source, with no per-county code on supported platforms.** Competitors require manual search or limited county coverage.
 
 ---
 
@@ -64,7 +66,7 @@ BridgeLeads automates motivated seller lead generation for real estate investors
 1. **County blocks scraping** → polite delays, rate limiting, user-agent rotation
 2. **Regrid pricing** → multi-source (ATTOM, CoreLogic alternatives)
 3. **Business plan margin** → volume pricing or enrichment add-on
-4. **AI scraper accuracy** → action cache, retry logic, canary checks
+4. **Scraper accuracy** → retry logic, canary checks, one fix per platform template
 
 ---
 
@@ -72,6 +74,6 @@ BridgeLeads automates motivated seller lead generation for real estate investors
 
 1. Regrid API trial → test enrichment
 2. WA county directory (39 URLs)
-3. Test AI scraper on 5+ WA counties
+3. Test the template scrapers on 5+ WA counties
 4. Pre-foreclosure record type
 5. TX/FL expansion

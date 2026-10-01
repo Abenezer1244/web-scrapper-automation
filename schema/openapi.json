@@ -6128,7 +6128,7 @@
                 }
               }
             },
-            "description": "Refused. A run refusal (AI limit, frozen, ended, over the record limit) has a top-level `code`; a plan refusal has an object `detail`; anything else is a sentence in `detail`."
+            "description": "Refused. A run refusal (frozen, ended, over the record limit) has a top-level `code`; a plan refusal has an object `detail`; anything else is a sentence in `detail`."
           },
           "422": {
             "content": {
@@ -7083,7 +7083,7 @@
                 }
               }
             },
-            "description": "Refused. A run refusal (AI limit, frozen, ended, over the record limit) has a top-level `code`; a plan refusal has an object `detail`; anything else is a sentence in `detail`."
+            "description": "Refused. A run refusal (frozen, ended, over the record limit) has a top-level `code`; a plan refusal has an object `detail`; anything else is a sentence in `detail`."
           },
           "422": {
             "content": {
@@ -7247,7 +7247,7 @@
                 }
               }
             },
-            "description": "Refused. A run refusal (AI limit, frozen, ended, over the record limit) has a top-level `code`; a plan refusal has an object `detail`; anything else is a sentence in `detail`."
+            "description": "Refused. A run refusal (frozen, ended, over the record limit) has a top-level `code`; a plan refusal has an object `detail`; anything else is a sentence in `detail`."
           },
           "422": {
             "content": {

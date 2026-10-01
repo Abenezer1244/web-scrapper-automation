@@ -1,7 +1,7 @@
 """AcclaimWeb template scraper for Tyler Technologies AcclaimWeb recorder portals.
 
 Covers WA counties using the AcclaimWeb/Harris Recording Solutions interface.
-No Claude AI needed — standardized Kendo UI navigation + extraction.
+Standardized Kendo UI navigation + extraction.
 
 AcclaimWeb sites share:
 - Disclaimer page with "Accept" link (public access, no login)
@@ -115,7 +115,7 @@ def _doc_type_matches(doc_type: str, keywords: list[str]) -> bool:
 class AcclaimWebScraper(BridgeScraper):
     """Template scraper for all Tyler AcclaimWeb recorder sites.
 
-    Zero Claude AI cost — uses standardized Kendo UI selectors for the
+    Uses standardized Kendo UI selectors for the
     shared AcclaimWeb interface.
     """
 

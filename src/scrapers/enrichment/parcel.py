@@ -3,9 +3,8 @@
 Priority order (cost-optimized):
 1. County GIS REST API (FREE — no API key, no CAPTCHA)
 2. Regrid national API (paid — $375/mo, disabled by default)
-3. AI assessor scraper (Claude API — ~$0.01/lookup, cached)
-4. County-specific fallback (Pierce County ATIP with CAPTCHA)
-5. Return "(enrichment unavailable)"
+3. County-specific fallback (Pierce County ATIP with CAPTCHA)
+4. Return "(enrichment unavailable)"
 """
 
 from src.utils.logger import setup_logger
@@ -30,8 +29,7 @@ async def enrich_parcel(
     Tries sources in order of cost (cheapest first):
     1. County GIS REST API (free) — by parcel ID, then by owner name
     2. Regrid national API (paid, if enabled)
-    3. AI assessor scraper (Claude API)
-    4. County-specific fallback (ATIP for Pierce)
+    3. County-specific fallback (ATIP for Pierce)
     """
     # Skip enrichment if no parcel ID or too short — real parcels are 10+ digits
     if not parcel_id or len(parcel_id.strip()) < 10:

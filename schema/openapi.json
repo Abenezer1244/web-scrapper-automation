@@ -7364,6 +7364,9 @@
             },
             "description": "Refused. A run refusal (frozen, ended, over the record limit) has a top-level `code`; a plan refusal has an object `detail`; anything else is a sentence in `detail`."
           },
+          "404": {
+            "description": "No such run for this account."
+          },
           "409": {
             "content": {
               "application/json": {
@@ -7393,6 +7396,9 @@
               }
             },
             "description": "Validation Error"
+          },
+          "429": {
+            "description": "Too many writes: 30 per minute per account."
           },
           "503": {
             "content": {

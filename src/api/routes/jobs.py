@@ -1341,6 +1341,28 @@ return 0
 """
 
 
+def _valid_quote_payload(quote: dict):
+    """(expires_at, unique quoted ids) when the stored quote is complete and well-formed,
+    else None. A corrupt payload is refused as unsupported, never a 500 (2d review r1)."""
+    try:
+        expires_at = datetime.fromisoformat(quote["expires_at"])
+        if expires_at.tzinfo is None:
+            return None
+        raw_ids = quote["quoted_ids"]
+        if not isinstance(raw_ids, list):
+            return None
+        ids = list(dict.fromkeys(str(uuid.UUID(str(i))) for i in raw_ids))
+        price, cur, pv = (quote["unit_price_cents"], quote["currency"],
+                          quote["pricing_version"])
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return None
+    if not (isinstance(price, int) and not isinstance(price, bool) and price > 0
+            and isinstance(cur, str) and len(cur) == 3
+            and isinstance(pv, str) and 0 < len(pv) <= 32):
+        return None
+    return expires_at, ids
+
+
 def _confirm_refusal(status_code: int, code: str, message: str) -> HTTPException:
     return HTTPException(status_code=status_code, detail={"code": code, "message": message})
 
@@ -1410,6 +1432,8 @@ async def _publish_contact_lookup(task, action_id: str) -> bool:
     status_code=status.HTTP_202_ACCEPTED,
     responses={
         **RUN_START_402_RESPONSES,
+        404: {"description": "No such run for this account."},
+        429: {"description": "Too many writes: 30 per minute per account."},
         409: {"model": ContactLookupConfirmErrorResponse,
               "description": "The quote is stale, empty, unsupported or for another tab, "
                              "or the run has not finished."},
@@ -1488,13 +1512,13 @@ async def confirm_contact_lookups(
     if (quote.get("quote_id") != body.quote_id or quote.get("user_id") != user_id
             or quote.get("job_id") != job_id or quote.get("category") != body.category):
         raise _quote_expired()  # superseded by a newer quote of this tab
-    try:
-        expires_at = datetime.fromisoformat(quote["expires_at"])
-    except (KeyError, TypeError, ValueError):
-        raise _quote_expired() from None
+    valid = _valid_quote_payload(quote)
+    if valid is None:
+        raise _confirm_refusal(status.HTTP_409_CONFLICT, "quote_unsupported",
+                               "This quote cannot be confirmed. Please get a new quote.")
+    expires_at, ids = valid
     if expires_at <= now:
         raise _quote_expired()
-    ids = list(dict.fromkeys(str(i) for i in quote.get("quoted_ids") or []))
     if not ids:
         raise _confirm_refusal(status.HTTP_409_CONFLICT, "nothing_to_look_up",
                                "This quote offered no leads to look up.")
@@ -1571,9 +1595,14 @@ async def confirm_contact_lookups(
     except Exception:  # noqa: BLE001 - the key expires; a replay is answered from the DB
         _logger.warning("contact lookup %s: quote key not cleared", action_id)
 
-    from src.workers.contact_lookup_action import lookup_contacts
+    try:
+        from src.workers.contact_lookup_action import lookup_contacts
 
-    if await _publish_contact_lookup(lookup_contacts, action_id):
+        published = await _publish_contact_lookup(lookup_contacts, action_id)
+    except Exception:  # noqa: BLE001 - committed; the reconciler publishes it
+        _logger.warning("contact lookup %s: publish not attempted", action_id, exc_info=True)
+        published = False
+    if published:
         try:
             # Zero rows is success: the worker already started it (AO2). The guard
             # allows exactly this stamp, once, while the action is dispatching.

@@ -534,6 +534,96 @@ async def test_a_busy_publisher_is_skipped_and_never_waited_on(
     assert elapsed < 3.0, elapsed
 
 
+@pytest.mark.parametrize("corrupt", [
+    {"expires_at": "2099-01-01T00:00:00"},          # naive: no timezone
+    {"quoted_ids": "not-a-list"},
+    {"quoted_ids": ["not-a-uuid"]},
+    {"unit_price_cents": None},
+    {"currency": "DOLLARS"},
+    {"pricing_version": ""},
+])
+async def test_a_corrupt_stored_quote_is_refused_never_a_500(
+    db, client, business_user, business_token, redis_client, _lookups_on, published, corrupt,
+):
+    job = _job(business_user.id)
+    _seed(business_user.id, job, [{}])
+    qid = await _quoted(client, business_token, job)
+    _set_quote(redis_client, business_user.id, job, **corrupt)
+
+    r = await _confirm(client, business_token, job, qid)
+
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "quote_unsupported"
+    assert _actions_of(business_user.id) == 0
+
+
+async def test_a_forced_race_takes_the_unique_constraint_path_and_returns_the_winner(
+    db, client, business_user, business_token, _lookups_on, published, monkeypatch,
+):
+    """Both confirms pass the replay check BEFORE either inserts (a barrier on a
+    PASS-THROUGH spy of the lookup), so the loser really hits
+    `uq_contact_lookup_actions_quote`, rolls back and re-fetches the winner."""
+    job = _job(business_user.id)
+    _seed(business_user.id, job, [{}, {}])
+    qid = await _quoted(client, business_token, job)
+    real = jobs_routes._action_for_quote
+    calls: list = []
+    both_checked = asyncio.Event()
+
+    async def barrier_spy(db_, quote_id, user_id):
+        row = await real(db_, quote_id, user_id)
+        calls.append(row)
+        if len(calls) == 2:
+            both_checked.set()
+        if len(calls) <= 2:
+            await asyncio.wait_for(both_checked.wait(), 10)
+        return row
+
+    monkeypatch.setattr(jobs_routes, "_action_for_quote", barrier_spy)
+    a, b = await asyncio.gather(_confirm(client, business_token, job, qid),
+                                _confirm(client, business_token, job, qid))
+
+    assert (a.status_code, b.status_code) == (202, 202), (a.text, b.text)
+    assert a.json()["action_id"] == b.json()["action_id"]
+    assert _actions_of(business_user.id) == 1
+    # Two pre-checks that both saw nothing, then the loser's re-fetch of the winner.
+    assert len(calls) == 3 and calls[0] is None and calls[1] is None
+    assert calls[2] is not None
+
+
+async def test_a_publish_that_hangs_is_bounded_and_frees_its_slot(
+    db, client, business_user, business_token, _lookups_on, monkeypatch,
+):
+    """FAULT INJECTION (labelled): the broker publish blocks. The confirm answers 202
+    within the bound, and once the publish returns its slot is free again."""
+    import threading
+
+    job = _job(business_user.id)
+    _seed(business_user.id, job, [{}])
+    qid = await _quoted(client, business_token, job)
+    release = threading.Event()
+
+    def hangs(*args, **kwargs):
+        release.wait(20)
+
+    monkeypatch.setattr(cla.lookup_contacts, "apply_async", hangs)
+    started = time.monotonic()
+    r = await _confirm(client, business_token, job, qid)
+    elapsed = time.monotonic() - started
+    release.set()
+
+    assert r.status_code == 202, r.text
+    assert elapsed < 6.0, elapsed
+    assert _action(r.json()["action_id"]).dispatched_at is None
+    for _ in range(50):  # the publish thread returns and releases its slot
+        if jobs_routes._publish_slots.acquire(blocking=False):
+            break
+        time.sleep(0.1)
+    else:
+        pytest.fail("the hung publish never released its slot")
+    jobs_routes._publish_slots.release()
+
+
 def test_the_api_never_imports_the_worker_module_at_load():
     """#393: a module-level import of a worker module from the API router closes an
     import loop. The confirm imports `lookup_contacts` inside the handler only."""

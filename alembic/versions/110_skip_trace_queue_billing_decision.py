@@ -55,5 +55,6 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    op.execute(text("SET LOCAL lock_timeout = '5s'"))
     op.drop_column("skip_trace_queues", "unmatched_billed")
     op.drop_column("skip_trace_queues", "rows_sent")

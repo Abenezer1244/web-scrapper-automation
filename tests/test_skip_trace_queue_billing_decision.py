@@ -7,8 +7,10 @@ type, nullability AND absence of a default are checked on what the migration wri
 not only on the database it already built.
 """
 import importlib.util
+import uuid
 from pathlib import Path
 
+import pytest
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
 from sqlalchemy import text
@@ -50,6 +52,52 @@ def test_head_has_both_columns_nullable_typed_and_without_a_default():
 def test_110_chains_on_109():
     mig = _mig110()
     assert (mig.revision, mig.down_revision) == ("110", "109")
+
+
+def test_110_takes_a_lock_timeout_in_both_directions():
+    """ADD/DROP COLUMN take ACCESS EXCLUSIVE on a table the dispatcher and ingest use:
+    fail fast rather than queue them. Each direction is checked on its own (the setting
+    is reset between them, since SET LOCAL lasts for the whole transaction)."""
+    mig = _mig110()
+    with sync_engine.connect() as conn:
+        trans = conn.begin()
+        try:
+            with Operations.context(MigrationContext.configure(conn)):
+                conn.execute(text("SET LOCAL lock_timeout = 0"))
+                mig.downgrade()
+                assert conn.execute(text("SHOW lock_timeout")).scalar() == "5s"
+                conn.execute(text("SET LOCAL lock_timeout = 0"))
+                mig.upgrade()
+                assert conn.execute(text("SHOW lock_timeout")).scalar() == "5s"
+        finally:
+            trans.rollback()
+
+
+@pytest.mark.asyncio
+async def test_110_backfills_nothing(starter_user):
+    """A queue recorded before 110 keeps NULL in both: its sent count is not
+    recoverable and billing has not decided on it under O-C. A fabricated value would
+    be billed against."""
+    mig = _mig110()
+    qid = int(uuid.uuid4().int % 10_000_000) + 910_000_000
+    with sync_engine.connect() as conn:
+        trans = conn.begin()
+        try:
+            with Operations.context(MigrationContext.configure(conn)):
+                mig.downgrade()
+                conn.execute(text(
+                    "INSERT INTO skip_trace_queues (id, tracerfy_queue_id, user_id, "
+                    "  trace_type, status, rows_uploaded, credits_deducted, submitted_at) "
+                    "VALUES (CAST(:id AS uuid), :q, CAST(:u AS uuid), 'normal', "
+                    "  'completed', 3, 3, now())"),
+                    {"id": str(uuid.uuid4()), "q": qid, "u": starter_user.id})
+                mig.upgrade()
+            row = conn.execute(text(
+                "SELECT rows_sent, unmatched_billed FROM skip_trace_queues "
+                "WHERE tracerfy_queue_id = :q"), {"q": qid}).one()
+            assert tuple(row) == (None, None)
+        finally:
+            trans.rollback()
 
 
 def test_110_downgrade_drops_and_upgrade_restores_them():

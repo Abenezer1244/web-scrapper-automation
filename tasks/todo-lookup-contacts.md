@@ -4502,6 +4502,17 @@ mandatory: the post-deploy NULL proof, and owner-approved remediation for any NU
 - **Regression: 710 passed, 0 failed.** That is every test file naming `skip_trace_queues`
   / `SkipTraceQueue` or alembic (20 files, 3 chunks). ruff clean. No type checker is
   configured.
+- **Codex diff review r1 (three-dot): GATE: NO-GO, 1 P2 + 2 P3, all fixed**
+  (`codex_oci_review_r1_out.txt`):
+  - **AI1 (P2)** `downgrade()` had no `lock_timeout` (106's does). Added.
+  - **AI2 (P3)** the tests could not see a backfill or a missing `lock_timeout`. Added:
+    - `lock_timeout` is `5s` after EACH direction, reset to 0 between them, because
+      SET LOCAL lasts for the transaction;
+    - a queue row written at 109 keeps `(NULL, NULL)` through upgrade.
+  - **AI3 (P3)** the handoff's 2-PR split is marked SUPERSEDED by AE1's three PRs.
+  - Mutations re-run with three more (upgrade / downgrade without `lock_timeout`, a
+    `rows_sent = rows_uploaded` backfill): **10/10 caught**, file hash identical before
+    and after the run.
 
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever

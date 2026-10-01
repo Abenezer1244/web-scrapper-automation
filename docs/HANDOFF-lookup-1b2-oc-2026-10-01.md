@@ -105,9 +105,11 @@ The queue row and the stamped count can change after billing ran (adoption / red
 1. read main's diff against the plan facts;
 2. write the O-C spec in the plan (a migration of **110**, after `git fetch` and a check of the
    alembic head; the dispatcher; billing; the reconciler; tests);
-3. split under the 5-file rule. It will be 2 PRs, e.g.:
-   - O-C-i: migration + `models.py` + its tests + the plan;
-   - O-C-ii: dispatcher + billing + reconciler + tests + the plan;
+3. split under the 5-file rule. **SUPERSEDED (consult r2, AE1): THREE PRs, schema first.**
+   O-C-i = migration 110 + its test + the plan (no model, no writer); O-C-ii = `models.py`
+   + dispatcher `rows_sent` + test + plan, merged only after `oc_schema_check.py` passes in
+   prod; O-C-iii = billing + reconciler + 2 test files + plan. See the plan's
+   "### O-C TO BUILD".
 4. **run a Codex pre-code consult until `PLAN: GO`**.
 
 This is a LIVE billing change, so quiesce thinking applies: a merge is a deploy, and the
@@ -210,7 +212,7 @@ FIRST read in full, in order:
 State: 2b (#411), 2c-i (#416), 2c-ii (#419) are LIVE and idle until 2d. Next: O-C as grown
 by AA2 (persist rows_sent AND billing's per-queue decision; billing bills unmatched only when
 rows_uploaded >= rows_sent; the reconciler reads the persisted decision instead of
-recomputing queue_accepted_all), migration 110, split into 2 PRs under the 5-file rule.
+recomputing queue_accepted_all), migration 110, split into 3 PRs, schema first (AE1).
 Then O-D (GRANT DELETE ON pending_skip_trace_rows TO bridgeleads_system in all 3 grant
 sources; confirm with me before applying in prod). Then ask me before 2d.
 

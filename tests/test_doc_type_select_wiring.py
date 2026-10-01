@@ -52,7 +52,7 @@ _CONNECTOR_CONFIG: dict[tuple[str, str], dict] = {
         "scraper_class": "",
         "base_url": "https://www.skagitcounty.net/Search/Recording/",
     },
-    # P3: EagleWeb family (ai-mode -> EagleWebScraper via _detect_template). base_urls
+    # P3: EagleWeb family (template mode -> EagleWebScraper via _detect_template). base_urls
     # from live /connectors 2026-06-23.
     ("benton", "wa"): {"scraper_mode": "template", "scraper_class": "", "base_url": "https://erecording.co.benton.wa.us/recorder/web/"},
     ("clallam", "wa"): {"scraper_mode": "template", "scraper_class": "", "base_url": "https://erecording.clallamcountywa.gov/recorder/web/"},
@@ -89,7 +89,7 @@ def _selectable_counties() -> list[tuple[str, str]]:
 
 def _worker_factory(cfg: dict):
     """Build the SAME callable the worker inspects, mirroring registry.get_scraper_class:
-    ai-mode -> functools.partial(template, base_url/county/state/record_types) so
+    template mode -> functools.partial(template, base_url/county/state/record_types) so
     inspect.signature() sees the remaining (unbound) params; manual -> the class itself.
     _run_scraper does inspect.signature(factory) and passes doc_types only if present."""
     from functools import partial

@@ -4093,6 +4093,80 @@ still holds: nothing reaches a customer before 2d, and 2d stays hard-gated on O-
     `a_test_that_copies_its_impl_asserts_nothing`). The −60 s / +1 s cases pin the side of the
     deadline.
 
+### 2c-ii BUILT (2026-10-01, branch `feat/lookup-1b2c-ii-reconciler`, stacked on 2c-i), before the Codex diff review
+- **NEW `src/workers/scheduler_helpers/contact_lookups.py`** (`_reconcile_contact_lookups_impl`):
+  - P1 expire, P2 lease take-back, P3 re-publish, P4 settle, exactly as specified (AA1-AA9,
+    AB1-AB4).
+  - Each action gets its own transaction under `FOR UPDATE SKIP LOCKED`, re-checking its
+    predicate under the lock.
+  - Every status move goes through 2b's `_move` / `_set_verdicts` / `_flag`.
+  - Each blocker is ONE SQL `EXISTS` fragment, shared by the selection and the visit.
+  - P3 does nothing while the kill switch is off (the worker would only bounce it); P1
+    expires the action at its deadline.
+  - Alerts are sent after the commit, once per flag change.
+  - **Never bills:** `queue_accepted_all` is a read.
+- `src/workers/scheduler.py`: the task `reconcile_contact_lookups` and the beat entry
+  `reconcile-contact-lookups` at 120 s. `test_beat_schedule` passes (22).
+- **Found by its own test, fixed:** group (c) selected only STUCK rows. So an unflagged action
+  whose only blocker was a missing row or an unexpected result, while another lead was still
+  in flight, was never visited and never flagged until the rest moved. (c) is now
+  "unflagged with ANY blocker" (`_ANY_BLOCKER`), mirroring (d).
+- **Tests** (`tests/test_contact_lookup_reconciler.py`, 22, real PG + Redis; actions claimed by
+  the REAL 2b worker; pending rows moved as ingest / the dispatcher leave them):
+  - every P4 mapping, and settling;
+  - BILLING PARITY: `report_usage_from_webhook`'s billed `n` per queue equals the billable
+    verdicts, read and rolled back;
+  - nothing settles while a lead is in flight;
+  - unexpected result ×4 statuses: flagged once, never guessed;
+  - a missing row: flagged once, revisited without a second alert;
+  - stuck ×2 (stale `submitting`, `submitted` in an `errored` queue), flagged then CLEARED when
+    the dispatcher releases it;
+  - a fresh `submitting` row is not stuck;
+  - `queue_accepted_all` once per distinct queue (pass-through spy);
+  - expiry, and not before the deadline;
+  - lease take-back → re-publish → the real worker claims;
+  - re-publish timing (1 min, then 5) and stamping;
+  - a failed publish is stamped;
+  - past the deadline, never republished even with P1's LIMIT at 0;
+  - kill switch → no publish → expiry;
+  - SKIP LOCKED (a held action is skipped within 30 s, expired on the next tick);
+  - starvation: two permanently blocked actions + three actions reachable ONLY through group
+    (a), all LIMITs 1;
+  - one action with many rows is one candidate.
+- **Mutations: 20/20 caught.** The runner now refuses a RED baseline: a broken test once made
+  every mutant "caught" for free, and those runs were discarded and redone. Three first-run
+  survivors became tests:
+  - publishing past the deadline;
+  - a fresh `submitting` row behind a mappable lead;
+  - a re-alert on a revisit.
+
+  The fourth (an unexpected result counted as mappable) was rescued by group (b) until the
+  starvation test kept the other actions' leads in flight.
+- **Regression: 869 passed, 0 failed** (all 30 test files importing the scheduler, 4 chunks),
+  plus 120 (import cycles, the 2b action suite, ingest). ruff clean.
+- **Codex diff review r1: GATE: NO-GO, 3 P2 + 1 P3, all fixed** (`codex_2cii_review_r1_out.txt`):
+  - **AC1 (P2) a locked prefix could starve.** Candidates were picked with LIMIT before
+    locking, so if the oldest N stayed held, later actions were never picked. Selection is now
+    `ORDER BY … LIMIT n FOR UPDATE OF a SKIP LOCKED`: Postgres skips held rows BEFORE the
+    limit, and the locks are released at once. Test: LIMIT 1, the oldest held, the next one
+    expires.
+  - **AC2 (P2) P1-P3 lacked per-action isolation.** Every pass now runs through `_each()`: one
+    transaction per action; a failure is rolled back, logged with its id and counted, and the
+    pass continues. Test: a fault on one action, the other expires, and the failed one is
+    untouched.
+  - **AC3 (P2) the selection and the visit could read different rows for a lead with two
+    pending rows.** ONE `LATERAL` "current row" (active first, then newest) is used by every
+    predicate AND the visit. Test: an older active row + a newer cancelled one → not a
+    candidate, nothing settles. A first version of that test made the active row the newest
+    too, so a mutant survived; fixed.
+  - **AC4 (P3)** a beat-entry test (120 s, task registered).
+  - **One more test from a mutant:** a row locked in the gap between selection and visit (a
+    pass-through spy on `_candidates`) is skipped, not waited on.
+- **Mutations (runner v2, every mutant asserted present, RED baseline refused): 24/24 caught.**
+- Rebased `--onto` main `c517cef7` (#416 merged): the diff is 2c-ii only, 4 files.
+- **Codex diff review r2: GATE: GO, no findings** (AC1-AC4 closed; `SKIP LOCKED` skips before
+  the LIMIT; one LATERAL current row everywhere). `codex_2cii_review_r2_out.txt`.
+
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever
       the tab has leads that have never been looked up; when the quote comes back with

@@ -25,7 +25,7 @@ from __future__ import annotations
 import re
 import time
 import unicodedata
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
@@ -50,7 +50,7 @@ _AGREE_FIELD = "ctl00$cphContent$btnAgree"
 _AGREED_PATHS = frozenset({"/default.aspx", _RESULTS_PATH.lower()})
 _SPACING_S = 1.0
 _USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0"
-_DIGITS = re.compile(r"\d{1,20}")
+_DIGITS = re.compile(r"[0-9]{1,20}")  # ASCII only, never Unicode digits
 _PERSON_TOKEN = re.compile(r"[A-Z][A-Z'\-]*")
 _ESTATE_PREFIX = re.compile(r"^(?:THE\s+)?(?:ESTATE|EST)\s+OF\s+")
 
@@ -96,8 +96,12 @@ def parse_taxsifter_results(html: str, query: str) -> tuple[str, str] | None:
     matched: dict[str, str] = {}
     for card in soup.select("div.result"):
         match_div = card.select_one("div.details div.match")
-        link = card.select_one('div.nav a[href*="Assessor.aspx"]')
-        if match_div is None or link is None:
+        links = [
+            urlparse(a.get("href", "")) for a in card.select("div.nav a[href]")
+        ]
+        links = [u for u in links if not u.scheme and not u.netloc
+                 and u.path.lower() == _ASSESSOR_PATH.lower()]
+        if match_div is None or len(links) != 1:
             continue
         label = _norm(match_div.get_text(" "))
         if not label.endswith("(PARCEL OWNER)"):
@@ -105,11 +109,11 @@ def parse_taxsifter_results(html: str, query: str) -> tuple[str, str] | None:
         owner = label[: -len("(PARCEL OWNER)")].strip()
         if owner != q and not owner.startswith(q + " &"):
             continue
-        params = dict(
-            pair.split("=", 1) for pair in urlparse(link.get("href", "")).query.split("&")
-            if "=" in pair
-        )
-        key, parcel = params.get("keyId", ""), params.get("parcelNumber", "")
+        params = parse_qs(links[0].query, keep_blank_values=True)
+        keys, parcels = params.get("keyId", []), params.get("parcelNumber", [])
+        if len(keys) != 1 or len(parcels) != 1:
+            continue
+        key, parcel = keys[0], parcels[0]
         if not (_DIGITS.fullmatch(key) and _DIGITS.fullmatch(parcel)):
             continue
         matched[parcel] = key
@@ -134,7 +138,7 @@ def parse_taxsifter_assessor(html: str) -> dict[str, str] | None:
 
     street = " ".join(p for p in (span("lbAddress"), span("lbAddress2")) if p)
     city, state = span("lbCity"), span("lbState")
-    zip5 = re.match(r"\d{5}", span("lbZip"))
+    zip5 = re.match(r"[0-9]{5}", span("lbZip"))
     if street and city and state:
         tail = f"{state} {zip5.group(0)}" if zip5 else state
         result["mailing"] = f"{street}, {city}, {tail}"
@@ -144,7 +148,7 @@ def parse_taxsifter_assessor(html: str) -> dict[str, str] | None:
         for row in table.find_all("tr"):
             cells = [" ".join(td.get_text(" ").split()) for td in row.find_all("td")]
             if len(cells) == 2 and cells[0].rstrip(":").upper() == "TOTAL" \
-                    and re.fullmatch(r"\$[\d,]+", cells[1]):
+                    and re.fullmatch(r"\$[0-9,]+", cells[1]):
                 result["value"] = cells[1]
                 break
     return result
@@ -214,18 +218,22 @@ class TaxSifterClient:
             return None
         if query in self._cache:
             return self._cache[query]
-        result = None
         if not self._accepted:
             self._accepted = self._accept_disclaimer()
             if not self._accepted:
                 raise RuntimeError("TaxSifter disclaimer was not accepted")
         resp = self._get(_RESULTS_PATH, q=query)
-        if self._html_ok(resp) and _AGREE_FIELD not in resp.text:
-            hit = parse_taxsifter_results(resp.text, query)
-            if hit is not None:
-                key, parcel = hit
-                page = self._get(_ASSESSOR_PATH, keyId=key, parcelNumber=parcel, typeID="1")
-                if self._html_ok(page):
-                    result = parse_taxsifter_assessor(page.text)
+        if not self._html_ok(resp) or _AGREE_FIELD in resp.text:
+            raise RuntimeError("TaxSifter results page was not served")
+        hit = parse_taxsifter_results(resp.text, query)
+        result = None
+        if hit is not None:
+            key, parcel = hit
+            page = self._get(_ASSESSOR_PATH, keyId=key, parcelNumber=parcel, typeID="1")
+            if not self._html_ok(page):
+                raise RuntimeError("TaxSifter assessor page was not served")
+            result = parse_taxsifter_assessor(page.text)
+        # Only a definite answer (found, or no unique owner match) is cached; a
+        # transport or page failure raised above, so that name can be retried.
         self._cache[query] = result
         return result

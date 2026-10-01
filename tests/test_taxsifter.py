@@ -125,6 +125,11 @@ def test_the_same_parcel_twice_is_still_one_parcel():
     _card("DOE, JANE Q", "101", "90000000001", role="Taxpayer"),
     _card("DOE, JANE Q", "101", "90000000001", href="/Assessor.aspx?keyId=1x&parcelNumber=2"),
     _card("DOE, JANE Q", "101", "90000000001", href="https://evil.example/Assessor.aspx?x=1"),
+    _card("DOE, JANE Q", "101", "90000000001",
+          href="/Assessor.aspx?keyId=101&keyId=999&parcelNumber=90000000001"),
+    _card("DOE, JANE Q", "101", "90000000001",
+          href="/AssessorX.aspx?keyId=101&parcelNumber=90000000001"),
+    _card("DOE, JANE Q", "١٠١", "90000000001"),  # Arabic-Indic digits
 ])
 def test_cards_that_do_not_qualify_are_ignored(card):
     assert parse_taxsifter_results(_results(card), "DOE, JANE Q") is None
@@ -159,6 +164,7 @@ def test_a_missing_mailing_city_leaves_mailing_out():
 class _Portal(BaseHTTPRequestHandler):
     """A local TaxSifter: disclaimer -> 302 -> results -> assessor."""
     redirect_to = "/default.aspx"
+    fail_results = 0
     results_html = _results(_card("DOE, JANE Q", "101", "90000000001"))
     hits: list[str] = []
 
@@ -180,6 +186,9 @@ class _Portal(BaseHTTPRequestHandler):
             self._send('<form method="post" action="https://evil.example/x" id="form1">'
                        '<input type="hidden" name="__VIEWSTATE" value="vs" />'
                        '<input type="submit" name="ctl00$cphContent$btnAgree" value="I Agree" /></form>')
+        elif url.path == "/Search/Results.aspx" and type(self).fail_results > 0:
+            type(self).fail_results -= 1
+            self._send("busy", status=503)
         elif url.path == "/Search/Results.aspx":
             assert self.headers.get("Cookie") == "agreed=1"
             assert parse_qs(url.query)["q"] == ["DOE, JANE Q"]
@@ -203,6 +212,7 @@ class _Portal(BaseHTTPRequestHandler):
 def portal():
     _Portal.hits = []
     _Portal.redirect_to = "/default.aspx"
+    _Portal.fail_results = 0
     server = ThreadingHTTPServer(("127.0.0.1", 0), _Portal)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -259,4 +269,15 @@ def test_requests_are_spaced(portal, monkeypatch):
 def test_the_douglas_origin_is_the_only_one_and_https():
     assert taxsifter.TAXSIFTER_ORIGINS == {
         "douglas": "https://douglaswa-taxsifter.publicaccessnow.com",
+    }
+
+
+def test_a_failed_results_page_is_not_cached_so_the_name_is_retried(portal, monkeypatch):
+    monkeypatch.setattr(taxsifter, "_SPACING_S", 0.0)
+    _Portal.fail_results = 1
+    client = _client(portal)
+    with pytest.raises(RuntimeError, match="results page"):
+        client.lookup("DOE JANE Q")
+    assert client.lookup("DOE JANE Q") == {
+        "address": "12 SAMPLE LN", "mailing": "PO BOX 77, SAMPLETON, WA 98800", "value": "$250,500",
     }

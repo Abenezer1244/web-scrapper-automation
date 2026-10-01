@@ -1145,15 +1145,19 @@ class AcclaimWebScraper(BridgeScraper):
             _logger.warning("TaxSifter unavailable for %s: %s", self.county, type(exc).__name__)
             return
 
-        found = 0
+        found = failures = 0
         for record in records:
             try:
                 result = await loop.run_in_executor(None, client.lookup, record.party_name)
+                failures = 0
             except Exception as exc:
-                # A broken session (disclaimer refused, network) ends the pass: the
-                # remaining lookups would fail the same way.
-                _logger.warning("TaxSifter lookup stopped for %s: %s", self.county, type(exc).__name__)
-                break
+                # One failed lookup is skipped. A refused disclaimer, or three
+                # failures in a row, ends the pass: the rest would fail the same way.
+                failures += 1
+                _logger.warning("TaxSifter lookup failed for %s: %s", self.county, type(exc).__name__)
+                if "disclaimer" in str(exc) or failures >= 3:
+                    break
+                continue
             if not result:
                 continue
             record.property_address = result["address"]

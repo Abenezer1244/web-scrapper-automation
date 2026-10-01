@@ -222,7 +222,8 @@ def test_108_moves_ai_rows_to_template_and_leaves_manual_alone():
 
 
 def test_108_aborts_on_an_unknown_mode():
-    """An unknown mode is data no reader understands: fail the boot, change nothing."""
+    """An unknown mode is data no reader understands: the migration raises, so the
+    API boot fails (start.sh) and Postgres rolls back its transactional DDL."""
     mig = _mig108()
     with sync_engine.connect() as conn:
         trans = conn.begin()
@@ -236,8 +237,9 @@ def test_108_aborts_on_an_unknown_mode():
 
 
 def test_after_108_every_template_url_shape_still_resolves():
-    """The 17 production template connectors keep their scraper after the rename:
-    one base_url per platform family they use, stored as 'template'."""
+    """Production base_url shapes stored as 'template' still resolve: EagleWeb on its
+    own host and on tylerhost.net, AcclaimWeb, and Tyler SelfService. (Every
+    production template connector's URL is pinned in test_doc_type_select_wiring.)"""
     from src.scrapers.registry import connector_scraper_class
     from src.scrapers.templates.acclaimweb import AcclaimWebScraper
     from src.scrapers.templates.eagleweb import EagleWebScraper

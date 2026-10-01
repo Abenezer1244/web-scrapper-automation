@@ -2074,7 +2074,9 @@ class ConnectorCreate(BaseModel):
     @classmethod
     def normalize_legacy_ai_mode(cls, data: Any, handler):
         """Accept exactly 'ai' as the old name of 'template' (not advertised in
-        OpenAPI). Any other spelling falls through to the route, which refuses it."""
+        OpenAPI). Any other spelling falls through to the route, which refuses it.
+
+        Scoped to JSON request bodies (a dict), the only way this model is built."""
         legacy = isinstance(data, dict) and data.get("scraper_mode") == "ai"
         if legacy:
             data = {**data, "scraper_mode": "template"}

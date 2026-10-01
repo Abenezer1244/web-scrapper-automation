@@ -25,6 +25,12 @@ behind it. Merge with the queue quiet, as always.
 
 Idempotent: a re-run updates nothing and re-sets the same default.
 
+Old writers during the rolling deploy: the only writer is the owner-only admin POST
+/scrapers/connectors. If a 2a API instance inserts 'ai' while this runs, the
+verification below aborts the boot and the retry moves the row; if it lands after
+the commit, every reader still reads it as template and 2c's straggler UPDATE sweeps
+it before its CHECK.
+
 Rollback: NOT "redeploy the 2a image". 2a's alembic/versions stops at 107, so its
 API boot (`alembic upgrade head`) cannot place a database at 108 and start.sh refuses
 to start the API. Roll back with a revert PR that KEEPS this file: the reverted code
@@ -93,7 +99,10 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    """Test databases only: restore 002's server default. Rows stay 'template'."""
+    """Test databases only: restore 002's server default. Rows stay 'template'.
+
+    That is the 2a state (2a code reads both names and writes 'ai'), so it is
+    consistent, not a half-rollback."""
     conn = op.get_bind()
     conn.execute(text(
         "ALTER TABLE public.county_connectors "

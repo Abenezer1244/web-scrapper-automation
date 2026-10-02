@@ -5675,6 +5675,17 @@ fine. The amendments (they supersede the BUILD SPEC where they differ):
   while quoting (AS1 copy visible).
 - Files unchanged (5). `page.tsx` now also carries AS4.
 
+### Codex consult r2 on 1c (2026-10-02): PLAN: REVISE, design CLOSED; 1 P1 + 1 consistency fix
+Output: `codex_1c_consult_r2_out.txt`. AS1-AS9 close r1 in the design (Codex listed each as "open in
+code" because no code exists yet: a pre-code consult). AS3 accepted as a bounded-risk decision for
+this PR, a P2 operational follow-up if real 429s appear.
+- **AT1 (P1)** the button and the quote flow are gated on `job.status === "done"`, the backend's
+  `_run_delivered` (jobs.py:158), NOT `!isRunning`: a failed or cancelled run would show a button
+  that can only ever 409.
+- **AT2** the plan is read through React Query `["me"]` (`getMe`, `staleTime: 0`,
+  `refetchOnMount: "always"`, fresh only once `dataUpdatedAt` passes mount time, else
+  `starter`), the scrapers/new pattern; never the session snapshot.
+
 ## Safety PR: Alembic can never reach production from a test or a stray CLI run (PLAN, 2026-09-27)
 
 The Deferred bullet below, taken now. Same class as the two production wipes.

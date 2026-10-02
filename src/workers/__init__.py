@@ -55,6 +55,8 @@ app = Celery(
         # Contact-lookup action worker (Phase 1b-2): lookup_contacts is published by
         # the confirm endpoint and re-published by the action reconciler. Same trap.
         "src.workers.contact_lookup_action",
+        # Database latency canary: a BEAT task, same trap as above.
+        "src.workers.db_canary",
     ],
 )
 

@@ -2,7 +2,7 @@ from collections.abc import AsyncGenerator, Iterator
 from contextlib import contextmanager
 from urllib.parse import parse_qs, urlsplit
 
-from sqlalchemy import create_engine, event, text
+from sqlalchemy import create_engine, event, make_url, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import NullPool
@@ -187,6 +187,52 @@ def heartbeat_sync_session() -> Iterator[Session]:
         yield session
     finally:
         session.close()
+
+
+# ─── Canary engine — database latency probe ONLY ─────────────────────────────
+# src/workers/db_canary.py times one fresh connection + SELECT 1 every 2 minutes.
+# It dials the API's path (DATABASE_URL, :5432 session mode) because on
+# 2026-10-01 the step that failed was the pooler login every API request makes:
+# "authentication did not complete within 15000ms". A pooled connection would
+# skip that step and report healthy through the outage, so NullPool. Its own
+# engine because the heartbeat engine is reserved for the heartbeat (above).
+# Short timeouts: a probe that cannot finish in a few seconds has its answer.
+
+
+def _libpq_url(asyncpg_url: str):
+    """The same database as an asyncpg URL, for psycopg2: asyncpg's ``ssl=`` is
+    libpq's ``sslmode=`` (same mode names). Every other parameter is kept, so a
+    stricter TLS mode or a pinned option reaches the probe exactly as the API
+    uses it. TLS is then forced for a non-local host by _ssl_connect_args, which
+    reads only the host and query (str() of a URL masks the password)."""
+    url = make_url(asyncpg_url)
+    query = dict(url.query)
+    ssl = query.pop("ssl", None)  # never left in: libpq rejects it outright
+    if ssl is not None and "sslmode" not in query:
+        query["sslmode"] = ssl
+    return url.set(drivername="postgresql+psycopg2", query=query)
+
+
+def _canary_options(url) -> str:
+    """The URL's own ``options`` (e.g. a search_path) plus the probe's statement
+    timeout, so the probe runs with the API's session settings."""
+    return f"{url.query.get('options', '')} -c statement_timeout=5000".strip()
+
+
+_canary_url = _libpq_url(_async_url)
+
+canary_engine = create_engine(
+    _canary_url,
+    poolclass=NullPool,
+    echo=False,
+    connect_args={
+        # Overrides any URL connect_timeout ON PURPOSE: a probe that has not
+        # connected in 5 s has its answer, whatever the API is willing to wait.
+        "connect_timeout": 5,
+        "options": _canary_options(_canary_url),
+        **_ssl_connect_args(str(_canary_url), async_driver=False),
+    },
+)
 
 
 def get_sync_db() -> Session:

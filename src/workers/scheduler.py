@@ -106,6 +106,16 @@ app.conf.beat_schedule = {
         "task": "src.workers.scheduler.canary_check",
         "schedule": crontab(minute=17),  # hourly at :17
     },
+    "db-latency-canary": {
+        # One fresh connection + SELECT 1 on the API's path; an ops alert after 3
+        # bad probes in a row (src/workers/db_canary.py). On 2026-10-01 the
+        # database was slow for ~6 hours before login broke, and nothing watched.
+        # expires: a probe that sat in the queue past the next tick measures the
+        # queue, not the database, so it is dropped rather than run late.
+        "task": "src.workers.db_canary.db_latency_canary",
+        "schedule": 120.0,  # every 2 minutes
+        "options": {"expires": 110},
+    },
     "enrichment-source-canary": {
         # The recovery half of external_source_health, which shipped without one:
         # probe each blocked enrichment source whose cooldown has expired and

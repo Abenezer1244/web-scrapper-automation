@@ -19,6 +19,83 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-10-01 — Prod DB starved, login "Something went wrong"; the 503 the browser can read
+
+> Second outage in two months found by a human failing to log in (first: 07-28, project
+> paused). This time the database was alive but resource-starved.
+
+**Built / Shipped:**
+- **#428** (merge `9a3080c7`, live + verified): `DatabaseUnavailableMiddleware` (`src/api/middleware/database_unavailable.py`)
+  + `is_database_unavailable()` (`src/api/errors.py`). When the database cannot be reached, any
+  route answers `503 {"detail":"Service temporarily unavailable","ref"}` + `Retry-After: 30` +
+  `Cache-Control: no-store`, with CORS and security headers. Everything else stays the 500.
+- **#429** (merge `84588fb8`, live + verified): pypdf 6.16.1 → 6.19.0 for PYSEC-2026-4153..4160
+  (crafted-PDF DoS). The REQUIRED pip-audit check was red on main; docs-only PRs skip it, which
+  is why #426/#427 merged and #428 could not. Extraction byte-identical on all 5 NTS fixtures.
+- **#433** (merge `8f05fe0c`, live + verified): DB latency canary. Every 2 min the worker opens one
+  fresh NullPool connection on the API's path and runs SELECT 1; ops alert after 3 bad (> 3 s or
+  failed) in a row, a recovery notice that re-arms the alert, no alert when Redis can't count.
+  Prod probes: 0.48-0.60 s. Codex designed it with me (option B); review r1 FAIL, r2 FAIL, r3 PASS.
+- **FE #202** (merge `c61cd4d4`, live, bundle grepped): login copy for 502/503/504 ("temporarily
+  unavailable"), no response ("couldn't connect"), 429 ("too many attempts"). Driven against a
+  stub API in the real page, password and MFA steps.
+
+**Tried / Decided:**
+- Incident fix was operational: the owner upgraded Supabase compute one size (back 18:20:54 UTC;
+  `/ready` 200, bad-password login 401 in 0.86 s).
+- First prevention plan put "contain the recovery sweeps" first (Codex's highest-leverage pick).
+  DROPPED after reading the code and pg_stat_statements: every sweep already has a Redis
+  single-flight lock, a 30–120 parcel batch and a wall-clock budget, and its writes cost ms.
+- 503 only for "could not reach the database". Statement timeout (57014) stays 500 (a slow
+  query is as likely a bug); Supavisor "tenant/user not found" stays 500 (a paused project is
+  not fixed by retrying in 30 s).
+- Codex's typed `DatabaseUnavailable` raised at engine connect is deferred to the
+  connection-model PR (it changes how the engine is built).
+
+**Failed / Blocked:**
+- I diagnosed "disk IO budget exhausted" with confidence from checkpoint `write=` timings.
+  Codex: `sync=0.002 s` was fast, which fits CPU steal / writeback throttling / memory pressure
+  as well. Root resource NEVER confirmed. Don't name the resource without the dashboard chart.
+- `railway run ... psql` prod read was denied by the auto-mode classifier; `supabase inspect db`
+  worked only once the DB was back. During the outage the owner's dashboard log CSV was the only
+  window in.
+
+**Caught & fixed:**
+- Starlette runs an `Exception` handler in ServerErrorMiddleware, OUTSIDE CORSMiddleware. The
+  catch-all's 500 (and a 503 from it) carries no CORS headers; the app calls the API
+  cross-origin from the browser, so it saw an opaque network error and could only ever say
+  "Something went wrong". Codex round 1 claimed the opposite; Starlette's
+  `build_middleware_stack` settled it.
+- Round 2 (FAIL): registering the handler by class missed wrapped DB errors and changed global
+  semantics for builtin `TimeoutError`/`ConnectionError`. Redesigned as an innermost middleware
+  that catches only when the classifier says so and re-raises everything else.
+- Round 3 (FAIL): a DB error inside a `TaskGroup` arrives as an `ExceptionGroup`; now traversed.
+- Connect failures are NOT wrapped by SQLAlchemy: a refused port is a bare
+  `ConnectionRefusedError`, a connect timeout a bare `TimeoutError`. They count only when raised
+  inside asyncpg (realpath-normalised package root), else an outbound-HTTP timeout would 503.
+
+**Pending / Handoff:**
+- 👤 External uptime monitor on `/ready` (latency, not just status) + synthetic bad-password
+  login + Supabase resource alerts. Still nothing polls `/ready` (open since 07-28).
+- FE: show "temporarily unavailable" on 503 / network error (needs this live).
+- API `NullPool` → pool: **DEFERRED (Claude + Codex agree)**. `pgbouncer.get_auth` ran 285,633 times — every request re-authenticates
+  through Supavisor, but that is 1.9% of DB time and the queries themselves took 12-43 s: a pool
+  would not have saved login. Revisit on p95 regression, rising get_auth share, or a pooled staging.
+- No full-table scans of `results` on prod for diagnostics: they were the heaviest statements.
+
+- **Second outage, 2026-10-02 01:33-~05:30 UTC: Cloudflare Bot Fight Mode.** After CF's "bot traffic
+  spike" email the owner enabled basic Bot Fight Mode; it challenged Vercel's server-side Auth.js
+  call to /auth/me, which never reached Railway ("Could not start your session"). Found by session
+  -76; owner turned it off and login recovered. Basic BFM cannot be skipped by WAF rules: use Super
+  BFM + a skip rule for api.bridgeleads.io if bot protection is wanted.
+
+**Facts learned:**
+- `(ENOTFOUND) tenant/user` = project paused (07-28). `authentication did not complete within
+  15000ms` + statement timeouts everywhere + control plane cannot connect = instance starved.
+- A 15-row seq scan taking 32 s means the instance, not the query.
+
+---
+
 ## 2026-10-01 — Landing: scroll story, a dark site and its revert, landing JS, and the sign-in link that ate clicks (bridgeleads-web #189–#197)
 
 > Frontend repo only (`bridgeleads-web`). Plan and review log: `tasks/todo-landing-scroll-story.md`

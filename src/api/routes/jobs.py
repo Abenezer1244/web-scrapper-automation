@@ -1349,8 +1349,15 @@ def _is_count(v) -> bool:
     return isinstance(v, int) and not isinstance(v, bool) and v >= 0
 
 
-def _no_json_constant(name: str):
-    raise ValueError(f"non-standard JSON constant {name}")
+def _snapshot_json(snapshot: dict) -> str | None:
+    """The snapshot as JSON PostgreSQL's jsonb accepts, else None (reviews r3, r4): no
+    non-finite number (NaN, Infinity, or an overflowing literal such as 1e9999) and no
+    NUL escape, either of which fails the cast as a 500 after the gates."""
+    try:
+        snap = json.dumps(snapshot, allow_nan=False)
+    except ValueError:
+        return None
+    return None if "\\u0000" in snap else snap
 
 
 def _valid_quote_payload(quote: dict):
@@ -1373,6 +1380,7 @@ def _valid_quote_payload(quote: dict):
     if not (_is_count(price) and 0 < price <= _PG_INT_MAX
             and isinstance(cur, str) and len(cur) == 3
             and isinstance(pv, str) and 0 < len(pv) <= 32
+            and "\x00" not in cur + pv  # a text column refuses a NUL byte
             and stopped in _QUOTE_STOPS and _is_count(remaining)):
         return None
     return expires_at, ids, stopped is not None and remaining > 0
@@ -1518,8 +1526,7 @@ async def confirm_contact_lookups(
     if raw is None:
         raise _quote_expired()
     try:
-        # NaN / Infinity would pass here and then fail the jsonb snapshot cast (r3).
-        quote = json.loads(raw, parse_constant=_no_json_constant)
+        quote = json.loads(raw)
     except ValueError:
         quote = {}
     if not isinstance(quote, dict):  # valid JSON, but not a quote object
@@ -1550,6 +1557,10 @@ async def confirm_contact_lookups(
             "expires_at")
     }
     snapshot["quote_created_at"] = quote.get("created_at")
+    snap = _snapshot_json(snapshot)
+    if snap is None:
+        raise _confirm_refusal(status.HTTP_409_CONFLICT, "quote_unsupported",
+                               "This quote cannot be confirmed. Please get a new quote.")
     params = {"a": action_id, "u": user_id, "j": job_id}
     try:
         # ONE transaction, in the tenant session, so the 101 guards bind: a
@@ -1563,7 +1574,7 @@ async def confirm_contact_lookups(
             {**params, "c": body.category, "q": body.quote_id,
              "price": quote.get("unit_price_cents"), "cur": quote.get("currency"),
              "pv": quote.get("pricing_version"), "n": len(ids), "t": truncated,
-             "snap": json.dumps(snapshot)},
+             "snap": snap},
         )
         # The quoted set is PROVEN against this tenant's run (V1): every quoted id
         # must still be one of this account's leads in this run, or nothing is bought.

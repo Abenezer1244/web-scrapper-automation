@@ -554,6 +554,9 @@ async def test_a_busy_publisher_is_skipped_and_never_waited_on(
     {"stopped": "not_a_planner_stop"},
     {"counts": float("nan")},                        # stored as NaN: not JSON for jsonb
     {"examined": float("inf")},
+    {"included_remaining_at_quote": "nul\x00byte"},  # jsonb refuses \u0000
+    {"currency": "U\x00D"},                          # a text column refuses NUL
+    {"pricing_version": "2026\x0006"},
 ])
 async def test_a_corrupt_stored_quote_is_refused_never_a_500(
     db, client, business_user, business_token, redis_client, _lookups_on, published, corrupt,
@@ -562,6 +565,29 @@ async def test_a_corrupt_stored_quote_is_refused_never_a_500(
     _seed(business_user.id, job, [{}])
     qid = await _quoted(client, business_token, job)
     _set_quote(redis_client, business_user.id, job, **corrupt)
+
+    r = await _confirm(client, business_token, job, qid)
+
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "quote_unsupported"
+    assert _actions_of(business_user.id) == 0
+
+
+@pytest.mark.parametrize("field", ["counts", "examined"])
+async def test_an_overflowing_number_in_a_stored_quote_is_refused_never_a_500(
+    db, client, business_user, business_token, redis_client, _lookups_on, published, field,
+):
+    """`1e9999` is a valid JSON number that Python reads as infinity (review r4): it
+    passes `json.loads` but fails the jsonb snapshot cast."""
+    job = _job(business_user.id)
+    _seed(business_user.id, job, [{}])
+    qid = await _quoted(client, business_token, job)
+    _set_quote(redis_client, business_user.id, job, **{field: "__BIG__"})
+    key = jobs_routes._quote_key(business_user.id, job, "new")
+    raw = redis_client.get(key)
+    raw = raw.decode() if isinstance(raw, bytes) else raw
+    assert raw.count('"__BIG__"') == 1
+    redis_client.set(key, raw.replace('"__BIG__"', "1e9999"), ex=600)
 
     r = await _confirm(client, business_token, job, qid)
 

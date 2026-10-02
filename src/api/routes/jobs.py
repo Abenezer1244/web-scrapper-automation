@@ -10,6 +10,7 @@ import time
 import uuid
 from collections.abc import AsyncGenerator
 from datetime import UTC, datetime, timedelta
+from typing import Literal
 
 import redis as _sync_redis
 import redis.exceptions as _redis_exceptions
@@ -30,6 +31,7 @@ from sqlalchemy import (
     type_coerce,
     update,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -60,9 +62,13 @@ from src.api.schemas import (
     ContactLookupConfirmErrorResponse,
     ContactLookupConfirmRequest,
     ContactLookupExcluded,
+    ContactLookupList,
+    ContactLookupOutcomes,
     ContactLookupPause,
     ContactLookupQuote,
     ContactLookupQuoteRequest,
+    ContactLookupStatus,
+    ContactLookupSummary,
     ContactLookupUnavailableResponse,
     DuplicateSource,
     JobCreate,
@@ -1692,6 +1698,237 @@ async def confirm_contact_lookups(
               f"action_id={action_id} quoted_count={len(ids)}")
     return ContactLookupAction(action_id=action_id, status="dispatching",
                                quoted_count=len(ids), truncated=truncated)
+
+
+
+# ─── Contact lookups: the status (Phase 1b-2e) ───────────────────────────────
+#
+# Contract: tasks/todo-lookup-contacts.md, "## Phase 1b-2e — the status endpoint" as
+# amended by AP1-AP4, AQ1-AQ3 and AR1. Reads only. What a confirmed action has bought,
+# derived from its verdict rows (the action's own counters are a cache that goes stale
+# by design), in the customer's vocabulary, never the ledger's. No gate a purchase can
+# outlive (a plan, a frozen account, the switch): a buyer always sees what they bought.
+
+# Every ledger verdict in exactly ONE customer bucket (AP4). `found` and `not_found`
+# hold exactly the reconciler's billable verdicts (`_BILLABLE_VERDICTS`; a test pins it).
+_OUTCOME_BUCKET = {
+    "quoted": "pending",
+    "newly_queued": "in_progress",
+    "answered_hit": "found",
+    "answered_miss": "not_found",
+    "unmatched_billable": "not_found",
+    "unmatched_unbilled": "not_found_no_charge",
+    "reused": "reused_no_charge",
+    "already_answered": "already_answered",
+    "in_progress_elsewhere": "already_in_progress",
+    "ineligible": "not_eligible",
+    "excluded_no_address": "not_eligible",
+    "excluded_placeholder_address": "not_eligible",
+    "excluded_settled_code_violation": "not_eligible",
+    "excluded_atip_policy": "not_eligible",
+    "excluded_not_traceable": "not_eligible",
+    "abandoned": "not_looked_up",
+    "errored_unsubmitted": "not_looked_up",
+    "released": "not_looked_up",
+}
+_BILLABLE_BUCKETS = ("found", "not_found")
+
+# The raw `status_reason` the worker and the reconciler write (some of it internal, e.g.
+# `claim_unenforced`) in the customer's words (Design 6). Only KNOWN values map; anything
+# else, a new claimed flag included, is `other` and never a 500 (AR1).
+_CUSTOMER_REASON = {
+    "kill_switch": "lookups_switched_off",
+    "claim_lock_busy": "retrying",
+    "claim_unenforced": "retrying",
+    "worker_error": "retrying",
+    "lease_expired": "retrying",
+    "plan_not_eligible": "plan_not_eligible",
+    "access_starter": "plan_not_eligible",
+    "access_frozen": "account_inactive",
+    "access_ended": "account_inactive",
+    "job_not_delivered": "run_unavailable",
+    "quoted_set_mismatch": "leads_changed",
+    "deadline": "not_started_in_time",
+    "pending_row_missing": "under_review",
+    "result_state_unexpected": "under_review",
+    "billing_decision_unknown": "under_review",
+    "provider_reconciliation_required": "under_review",
+}
+_LIST_LIMIT = 20
+
+
+class UnmappedDispositionError(RuntimeError):
+    """A verdict with no customer bucket. Never guessed into one, since a guess could say
+    "no charge" for a billed lookup: it surfaces as the house 500 with a ref (AP4)."""
+
+
+def _customer_reason(raw: str | None) -> str | None:
+    return None if raw is None else _CUSTOMER_REASON.get(raw, "other")
+
+
+def _outcomes(counts: dict) -> ContactLookupOutcomes:
+    """The verdict counts in buckets, every bucket present (AP1)."""
+    buckets = dict.fromkeys(ContactLookupOutcomes.model_fields, 0)
+    for disposition, n in counts.items():
+        bucket = _OUTCOME_BUCKET.get(disposition)
+        if bucket is None:
+            raise UnmappedDispositionError(f"no customer bucket for {disposition!r}")
+        buckets[bucket] += int(n)
+    return ContactLookupOutcomes(**buckets)
+
+
+def _lookup_not_found() -> HTTPException:
+    return HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                         detail="Contact lookup not found")
+
+
+def _canonical_lookup_id(value: str) -> str:
+    """A status-route path id as a canonical UUID. Malformed is the route's ONE 404
+    body, never "Job not found" and never a DataError 500 (2e review r1)."""
+    try:
+        return str(uuid.UUID(value))
+    except ValueError:
+        raise _lookup_not_found() from None
+
+
+async def _lookup_read_rate_limit(request: Request, user_id) -> None:
+    """The `general` bucket, as the results list. A stalled limiter call PROCEEDS: the
+    zone already fails open on a Redis error, a read buys nothing, and a polling page
+    must not flap to 503 on a slow limiter (consult Q1)."""
+    try:
+        await asyncio.wait_for(
+            rate_limit(request, zone="general", identifier=user_id),
+            _LOOKUP_REDIS_CALL_BOUND_S,
+        )
+    except TimeoutError:
+        _logger.warning("contact lookup read: rate limiter stalled; proceeding")
+
+
+async def _lookup_pause(user_id: str) -> ContactLookupPause:
+    """The quote's pause read: bounded, and anything unreadable is `unknown`."""
+    try:
+        pause = await _bounded(read_pause_state, _lookup_redis(), user_id, datetime.now(UTC))
+    except Exception:  # noqa: BLE001 - the contract: unreadable is UNKNOWN, never a 503
+        pause = PauseState(PAUSE_UNKNOWN)
+    return ContactLookupPause(status=pause.status, normal_resume_at=pause.normal_resume_at,
+                              advanced_resume_at=pause.advanced_resume_at)
+
+
+# ONE statement, so the status and the verdict counts are one snapshot: two statements
+# at READ COMMITTED could show `claimed` beside verdicts that have already settled.
+_ACTION_STATUS_SQL = text(
+    "SELECT a.category, a.status, a.status_reason, a.status_changed_at, a.quoted_count, "
+    "       a.truncated, a.unit_price_cents, a.currency, a.created_at, a.started_at, "
+    "       a.claimed_at, a.settled_at, "
+    "       (SELECT COALESCE(jsonb_object_agg(d.disposition, d.n), '{}'::jsonb) "
+    "          FROM (SELECT c.disposition, count(*) AS n "
+    "                  FROM contact_lookup_action_results c "
+    "                 WHERE c.action_id = a.id AND c.user_id = a.user_id "
+    "                 GROUP BY c.disposition) d) AS outcomes "
+    "FROM contact_lookup_actions a "
+    "WHERE a.id = CAST(:a AS uuid) AND a.user_id = CAST(:u AS uuid) "
+    "  AND a.job_id = CAST(:j AS uuid)"
+).columns(outcomes=JSONB)
+
+
+@router.get(
+    "/{job_id}/contact-lookups",
+    response_model=ContactLookupList,
+    responses={
+        404: {"description": "No such run for this account."},
+        429: {"description": "Too many requests: the account's general budget, 60 per "
+                             "minute."},
+    },
+)
+async def list_contact_lookups(
+    job_id: str,
+    current_user: CurrentUser,
+    request: Request,
+    category: Literal["new", "already_delivered"] | None = Query(None),
+    db: AsyncSession = Depends(get_rls_db),
+) -> ContactLookupList:
+    """A run's newest contact-lookup actions, so a reloaded page can find them again."""
+    await _lookup_read_rate_limit(request, current_user.id)
+    job_id = _canonical_job_id(job_id)
+    user_id = str(current_user.id)
+    # The run first: an empty list must not confirm or deny another account's run.
+    owned = (await db.execute(
+        select(Job.id).where(Job.id == job_id, Job.user_id == user_id)
+    )).scalar_one_or_none()
+    if owned is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    where = "user_id = CAST(:u AS uuid) AND job_id = CAST(:j AS uuid)"
+    params: dict = {"u": user_id, "j": job_id, "n": _LIST_LIMIT}
+    if category is not None:
+        where += " AND category = :c"
+        params["c"] = category
+    rows = (await db.execute(
+        text("SELECT id::text AS id, category, status, status_reason, quoted_count, "  # noqa: S608 - literals only
+             f"       truncated, created_at, settled_at FROM contact_lookup_actions WHERE {where} "
+             "ORDER BY created_at DESC, id DESC LIMIT :n"),
+        params,
+    )).all()
+    return ContactLookupList(actions=[
+        ContactLookupSummary(
+            action_id=r.id, category=r.category, status=r.status,
+            reason=_customer_reason(r.status_reason), quoted_count=r.quoted_count,
+            truncated=r.truncated, created_at=r.created_at, settled_at=r.settled_at,
+        )
+        for r in rows
+    ])
+
+
+@router.get(
+    "/{job_id}/contact-lookups/{action_id}",
+    response_model=ContactLookupStatus,
+    responses={
+        404: {"description": "No such contact lookup on this run for this account."},
+        429: {"description": "Too many requests: the account's general budget, 60 per "
+                             "minute. Poll every 5 seconds or slower."},
+    },
+)
+async def get_contact_lookup(
+    job_id: str,
+    action_id: str,
+    current_user: CurrentUser,
+    request: Request,
+    db: AsyncSession = Depends(get_rls_db),
+) -> ContactLookupStatus:
+    """What a confirmed contact-lookup action has bought so far. Final once `status` is
+    `settled`, `failed` or `expired`."""
+    await _lookup_read_rate_limit(request, current_user.id)
+    job_id = _canonical_lookup_id(job_id)
+    action_id = _canonical_lookup_id(action_id)
+    user_id = str(current_user.id)
+    # One 404 for another account's action, another run's, and none at all.
+    row = (await db.execute(
+        _ACTION_STATUS_SQL, {"a": action_id, "u": user_id, "j": job_id}
+    )).first()
+    if row is None:
+        raise _lookup_not_found()
+    outcomes = _outcomes(row.outcomes)
+    # Only while something can still wait on the daily limit (AP3).
+    waiting = row.status in ("dispatching", "running") or (
+        row.status == "claimed" and outcomes.in_progress > 0
+    )
+    return ContactLookupStatus(
+        action_id=action_id,
+        category=row.category,
+        status=row.status,
+        reason=_customer_reason(row.status_reason),
+        quoted_count=row.quoted_count,
+        truncated=row.truncated,
+        outcomes=outcomes,
+        billable=sum(getattr(outcomes, b) for b in _BILLABLE_BUCKETS),
+        unit_price_cents=row.unit_price_cents,
+        currency=row.currency,
+        created_at=row.created_at,
+        started_at=row.started_at,
+        claimed_at=row.claimed_at,
+        settled_at=row.settled_at,
+        status_changed_at=row.status_changed_at,
+        pause=await _lookup_pause(user_id) if waiting else None,
+    )
 
 
 @router.get("/{job_id}/logs")

@@ -19,6 +19,78 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-10-02 — Contact lookups go on sale (2d), and the page that shows what was bought (2e)
+
+> Phase 1b-2 of contact lookup. 2d is the switch that made lookups purchasable in production;
+> 2e is the read the 1c page needs. Both under the house loop: Codex consult to PLAN: GO,
+> mutation runner, Codex three-dot review to GATE: GO, regression in chunks; 2d merged under the
+> standing rule, 2e not yet.
+
+**Built / Shipped:**
+- **#432** (merge `bd17ef2d`, live + verified: api/worker/beat SUCCESS, unauth POST = 401):
+  `POST /jobs/{job_id}/contact-lookups`, the confirm. Replays answered from the DB BEFORE any
+  mutable gate (a buyer is never 402/503'd for something already bought); ONE transaction
+  writes a `dispatching` action, one `quoted` verdict per lead (proven against this tenant's
+  run) and the initial event; compare-and-delete of the quote key; a bounded publish on its own
+  2-thread pool behind a non-blocking semaphore (a broker stall holds no request thread); the
+  `dispatched_at` stamp may lose the race to the worker and that is success.
+- **2e: BUILT, PENDING PR / merge / deploy** (branch `feat/lookup-1b2e-status`): `GET /jobs/{job_id}/contact-lookups/{action_id}`
+  and `GET /jobs/{job_id}/contact-lookups` (the newest 20, so a reloaded page finds its
+  actions). Counts DERIVED from the verdict rows in one statement (the action's counters are a
+  cache that goes stale by design); a closed customer vocabulary for outcomes and reasons, never
+  the ledger's names; the pause state read only while something can still wait on it. No gate a
+  purchase can outlive. 28 tests; mutations 32/32; regression 61 files, 1,487 passed.
+
+**Tried / Decided:**
+- 2e's list route was NOT in the original stub. Codex r1 (P1): without it a reloaded page has no
+  way to find its action ids. Added in 2e, same files.
+- `billable` means "counts as a billable lookup" (the included allowance first, then overage),
+  never "charged": only the overage reaches Stripe (Codex r2).
+- An unmapped verdict is a 500 with a ref, never a guessed bucket: a guess could say "no
+  charge" for a billed lookup. An unmapped REASON is `other`: it states no money.
+- A stalled rate limiter on these reads PROCEEDS (the `general` zone fails open anyway; a
+  polling page must not flap to 503). The confirm, which buys, still refuses.
+
+**Failed / Blocked:**
+- 2d took seven Codex review rounds. r2-r5 were ONE class: a corrupt stored quote 500ing after
+  the gates (non-object JSON, an INTEGER-overflowing price, `NaN`, then `1e9999`, NUL, a lone
+  surrogate, nesting depth). My r3 reasoning ("refuse NaN at the parse and no non-finite float
+  can reach jsonb") was REFUTED: `1e9999` is a valid JSON number that parses to inf. Fixed at
+  the SINK (`json.dumps(allow_nan=False)` + encode + NUL + depth).
+- Host memory pressure killed a background mutation run mid-mutant and LEFT A LIVE MUTANT in
+  `jobs.py`; `git diff --stat` looked like a 2-line change. Caught by `sha256sum -c`. Since then:
+  foreground slices of at most 3 mutants, hash-checked after every slice.
+- I edited `jobs.py` while a 2d regression ran against it, twice; both runs were void. Rule now:
+  Codex GO first, then the regression.
+- In 2e a full-file mutant run showed five unrelated failures: another session had run a
+  FLUSHDB on the shared local Redis db 13 mid-run. Each catch was re-verified against its
+  expected test; noise can only add failures, never hide a survivor.
+
+**Caught & fixed:**
+- 2d, by mutation: the audit line read the ORM `current_user` after a rollback had expired it,
+  MissingGreenlet, a 500 AFTER a committed purchase. Now the plain `user_id`.
+- 2d, by the post-rebase check: a failed rollback after a failed stamp escaped, and #428's new
+  middleware turned it into a 503 for a COMMITTED purchase. Guarded.
+- 2e, by mutation: the route's own pause guard was reached by no test (`read_pause_state`
+  absorbs a failing call; building the client happens before it). Pinned with a real fault.
+- 2e, by Codex r1: a malformed run id answered "Job not found" on a route whose contract is one
+  uniform 404 body.
+
+**Pending / Handoff:**
+- 2e: PR, CI on the exact head, quiet, merge under the standing rule, deploy verify.
+- Then 1c, the frontend page (sibling repo).
+- Follow-up PRs: `GET/DELETE /jobs/{job_id}`, `/results`, `/logs`, `/export-url` and `/download`
+  still turn a malformed id into a 500 (with a ref); move them onto `_canonical_job_id`. Two scripts still say the system role has
+  "DELETE=False on every table".
+
+**Facts learned:**
+- READ COMMITTED gives each STATEMENT its own snapshot: a status plus its counts must be one
+  statement, or the page can show `claimed` beside verdicts that already settled.
+- asyncpg returns an untyped `jsonb` column from `text()` as a str; `.columns(x=JSONB)` makes it a dict.
+- This FastAPI mounts included routers lazily: `app.routes` does not list them; read the router.
+- `get_db` legitimately sits under `get_rls_db` and the auth chain: pin a route's own `db`
+  parameter, not the absence of `get_db` from its dependency tree.
+
 ## 2026-10-01 — Prod DB starved, login "Something went wrong"; the 503 the browser can read
 
 > Second outage in two months found by a human failing to log in (first: 07-28, project

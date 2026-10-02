@@ -221,6 +221,19 @@ class TestSweep:
         assert first["checked"] < second["checked"] + 1 and calls["n"] >= 2
         assert redis_client.get(dq._checked_key(job)) in (b"1", "1")
 
+    def test_the_judged_mark_never_overwrites_another_workers_live_claim(self, redis_client):
+        key = "bl:dq:checked:test-mark"
+        redis_client.set(key, "their-token", ex=60)
+        dq._mark_judged(redis_client, key, "my-token")
+        assert redis_client.get(key) in (b"their-token", "their-token")
+        redis_client.set(key, "my-token", ex=60)
+        dq._mark_judged(redis_client, key, "my-token")
+        assert redis_client.get(key) in (b"1", "1")
+        redis_client.delete(key)
+        dq._mark_judged(redis_client, key, "my-token")  # our claim expired mid-check
+        assert redis_client.get(key) in (b"1", "1")
+        redis_client.delete(key)
+
     async def test_the_sweep_is_registered_hourly_off_the_king_minutes(self):
         from src.workers.scheduler import app
 

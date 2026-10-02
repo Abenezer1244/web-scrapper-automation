@@ -70,7 +70,8 @@ SELECT count(*) AS n,
        count(r.default_amount) AS default_amount,
        count(*) FILTER (WHERE r.mailing_address IS NOT NULL AND r.property_address IS NOT NULL
                           AND upper(btrim(r.mailing_address)) = upper(btrim(r.property_address))) AS echo,
-       count(*) FILTER (WHERE r.enrichment_data::text LIKE '%%mailing_lookup_deferred%%') AS deferred
+       count(*) FILTER (WHERE jsonb_typeof(r.enrichment_data::jsonb) = 'object'
+                          AND r.enrichment_data::jsonb ->> 'mailing_lookup_deferred' = 'true') AS deferred
 FROM results r
 """
 
@@ -251,7 +252,7 @@ def run_data_quality_sweep(*, lookback_hours: int = SWEEP_LOOKBACK_HOURS,
                 db.rollback()
                 _release(client, key, token)
                 continue
-            _mark_judged(client, key)
+            _mark_judged(client, key, token)
             stats["checked"] += 1
             if report.get("warnings"):
                 stats["warned"] += 1
@@ -270,10 +271,17 @@ def _release(client, key: str, token: str) -> None:
         pass
 
 
-def _mark_judged(client, key: str) -> None:
+# Mark judged only over OUR claim, or over nothing (our claim expired mid-check, and
+# the check still succeeded). A newer worker's live claim is left to that worker.
+_MARK_LUA = ("local v = redis.call('get', KEYS[1]) "
+             "if v == ARGV[1] or not v then return redis.call('set', KEYS[1], '1', 'EX', ARGV[2]) end "
+             "return 0")
+
+
+def _mark_judged(client, key: str, token: str) -> None:
     try:
         if client is not None:
-            client.set(key, "1", ex=_CHECKED_TTL_S)
+            client.eval(_MARK_LUA, 1, key, token, _CHECKED_TTL_S)
     except Exception:  # noqa: BLE001
         pass
 

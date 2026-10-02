@@ -538,9 +538,14 @@ async def test_a_busy_publisher_is_skipped_and_never_waited_on(
     {"expires_at": "2099-01-01T00:00:00"},          # naive: no timezone
     {"quoted_ids": "not-a-list"},
     {"quoted_ids": ["not-a-uuid"]},
+    {"quoted_ids": {"not": "a list"}},
     {"unit_price_cents": None},
+    {"unit_price_cents": 0},
+    {"unit_price_cents": True},
+    {"unit_price_cents": "500"},
     {"currency": "DOLLARS"},
     {"pricing_version": ""},
+    {"pricing_version": "v" * 33},
 ])
 async def test_a_corrupt_stored_quote_is_refused_never_a_500(
     db, client, business_user, business_token, redis_client, _lookups_on, published, corrupt,
@@ -555,6 +560,153 @@ async def test_a_corrupt_stored_quote_is_refused_never_a_500(
     assert r.status_code == 409, r.text
     assert r.json()["detail"]["code"] == "quote_unsupported"
     assert _actions_of(business_user.id) == 0
+
+
+async def test_quoted_ids_held_in_a_mapping_are_refused_not_bought(
+    db, client, business_user, business_token, redis_client, _lookups_on, published,
+):
+    """A JSON object of real lead ids iterates like a list. It is still not a quote."""
+    job = _job(business_user.id)
+    _seed(business_user.id, job, [{}])
+    qid = await _quoted(client, business_token, job)
+    ids = _stored(redis_client, business_user.id, job)["quoted_ids"]
+    _set_quote(redis_client, business_user.id, job, quoted_ids=dict.fromkeys(ids, 1))
+
+    r = await _confirm(client, business_token, job, qid)
+
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "quote_unsupported"
+    assert _actions_of(business_user.id) == 0
+
+
+async def test_an_unreadable_stored_quote_is_refused_never_a_500(
+    db, client, business_user, business_token, redis_client, _lookups_on, published,
+):
+    job = _job(business_user.id)
+    _seed(business_user.id, job, [{}])
+    qid = await _quoted(client, business_token, job)
+    redis_client.set(jobs_routes._quote_key(business_user.id, job, "new"), "{not json", ex=600)
+
+    r = await _confirm(client, business_token, job, qid)
+
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "quote_unsupported"
+    assert _actions_of(business_user.id) == 0
+
+
+async def test_a_lead_quoted_twice_is_bought_once(
+    db, client, business_user, business_token, redis_client, _lookups_on, published,
+):
+    job = _job(business_user.id)
+    _seed(business_user.id, job, [{}])
+    qid = await _quoted(client, business_token, job)
+    ids = _stored(redis_client, business_user.id, job)["quoted_ids"]
+    _set_quote(redis_client, business_user.id, job, quoted_ids=ids + ids)
+
+    r = await _confirm(client, business_token, job, qid)
+
+    assert r.status_code == 202, r.text
+    assert r.json()["quoted_count"] == 1
+    assert _quoted_rows(r.json()["action_id"]) == set(ids)
+
+
+@pytest.mark.parametrize(("stopped", "remaining", "truncated"), [
+    ("credit_cap", 3, True),
+    ("credit_cap", 0, False),
+    (None, 3, False),
+])
+async def test_truncated_means_the_quote_stopped_with_leads_left(
+    db, client, business_user, business_token, redis_client, _lookups_on, published,
+    stopped, remaining, truncated,
+):
+    job = _job(business_user.id)
+    _seed(business_user.id, job, [{}])
+    qid = await _quoted(client, business_token, job)
+    _set_quote(redis_client, business_user.id, job, stopped=stopped, remaining=remaining)
+
+    r = await _confirm(client, business_token, job, qid)
+
+    assert r.status_code == 202, r.text
+    assert r.json()["truncated"] is truncated
+    assert _action(r.json()["action_id"]).truncated is truncated
+
+
+async def test_the_publish_never_retries_inside_the_request(
+    db, client, business_user, business_token, _lookups_on, monkeypatch,
+):
+    """AO3: kombu's publish-retry loop is off. PASS-THROUGH spy on the kwargs."""
+    job = _job(business_user.id)
+    _seed(business_user.id, job, [{}])
+    qid = await _quoted(client, business_token, job)
+    real = cla.lookup_contacts.apply_async
+    seen: list[dict] = []
+
+    def spy(*args, **kwargs):
+        seen.append(kwargs)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(cla.lookup_contacts, "apply_async", spy)
+    r = await _confirm(client, business_token, job, qid)
+
+    assert r.status_code == 202, r.text
+    assert [k.get("retry") for k in seen] == [False]
+
+
+async def test_a_worker_module_that_fails_to_import_still_accepts_the_purchase(
+    db, client, business_user, business_token, _lookups_on, monkeypatch,
+):
+    """FAULT INJECTION (labelled): the worker module cannot be imported after the
+    purchase committed (2d review r1, P1). 202, and `dispatched_at` stays NULL for P3."""
+    import sys
+
+    job = _job(business_user.id)
+    _seed(business_user.id, job, [{}])
+    qid = await _quoted(client, business_token, job)
+    monkeypatch.setitem(sys.modules, "src.workers.contact_lookup_action", None)
+
+    r = await _confirm(client, business_token, job, qid)
+
+    assert r.status_code == 202, r.text
+    a = _action(r.json()["action_id"])
+    assert (a.status, a.dispatched_at) == ("dispatching", None)
+
+
+def _all_slots_free() -> bool:
+    got = [jobs_routes._publish_slots.acquire(blocking=False) for _ in range(2)]
+    for ok in got:
+        if ok:
+            jobs_routes._publish_slots.release()
+    return all(got)
+
+
+async def test_the_publish_helper_never_raises_and_frees_its_slot(monkeypatch):
+    """FAULT INJECTION (labelled): the broker refuses. The helper itself answers False
+    (its contract, not only the route's guard) and its slot comes back."""
+    def refused(*args, **kwargs):
+        raise ConnectionError("injected: broker refused the publish")
+
+    monkeypatch.setattr(cla.lookup_contacts, "apply_async", refused)
+
+    assert await jobs_routes._publish_contact_lookup(cla.lookup_contacts,
+                                                     str(uuid.uuid4())) is False
+    for _ in range(50):
+        if _all_slots_free():
+            break
+        time.sleep(0.05)
+    else:
+        pytest.fail("a refused publish kept its slot")
+
+
+async def test_a_pool_that_will_not_start_the_publish_frees_the_slot(monkeypatch):
+    """FAULT INJECTION (labelled): the executor refuses the job (e.g. shut down)."""
+    def no_threads(*args, **kwargs):
+        raise RuntimeError("injected: cannot schedule new futures after shutdown")
+
+    monkeypatch.setattr(jobs_routes._publish_pool, "submit", no_threads)
+
+    assert await jobs_routes._publish_contact_lookup(cla.lookup_contacts,
+                                                     str(uuid.uuid4())) is False
+    assert _all_slots_free()
 
 
 async def test_a_forced_race_takes_the_unique_constraint_path_and_returns_the_winner(

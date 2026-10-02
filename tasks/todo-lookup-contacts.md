@@ -5079,6 +5079,23 @@ line as `  injection ...`; it reads `  fault injection ...`) before writing anyt
   - The first background run was KILLED by host memory pressure mid-mutant and left a
     LIVE mutant in `jobs.py` (the list check removed). Caught by `sha256sum -c`,
     restored by `git checkout`, re-verified by hash.
+- **Codex diff review r2 (2026-10-01, on `2f89556d`): NO-GO, 1 P2 + test-quality gaps**
+  (`codex_2d_review_r2_out.txt`, scratchpad c0ba9e9b). r1's P1 and the 404/429, forced-race
+  and hung-publish findings were confirmed CLOSED; the core purchase safety was re-verified
+  (AO1 order, V1, one transaction, the rollback path, the Lua, semaphore accounting on
+  every path). The AO5 survivor was judged EQUIVALENT under 101 (it needs a contrived
+  double fault); no test required. Fixed in `2d0280f5`:
+  - (P2) a stored quote could still 500: non-object JSON (`[]`, `null`, ...), a non-int
+    `remaining`, a price that overflows the INTEGER column. Now a non-dict is
+    unsupported; `stopped` must be one of `_QUOTE_STOPS` (None, cap, credit_cap,
+    scan_limit), `remaining` a non-negative int, `0 < price <= 2^31-1`; `truncated` is
+    derived from the validated fields. A source scan pins `_QUOTE_STOPS` to every
+    `.stopped =` the planner can record.
+  - (tests) five fault tests could pass with the publish path removed. Each now proves the
+    injected path ran: counters, the "publish skipped" / "publish not attempted" warnings,
+    the hung publish entered.
+  - 57 tests pass. Mutations on the changed lines: 12/12 caught (runner 42 mutants: 41
+    caught + the equivalent AO5).
 - **Codex diff review r1: NO-GO, 1 P1 + 3 P2 + 1 P3, all fixed in `c840ea45`:**
   - the post-commit import + publish are guarded (P1);
   - strict validation of the stored payload → 409 `quote_unsupported` (naive expiry,

@@ -8,6 +8,7 @@ own control plane could not connect). Fixed by the owner's compute upgrade. Root
 (CPU / memory / IO) NOT confirmed — needs the dashboard charts.
 
 ## Plan (agreed with Codex, revised by measurement)
+- [x] 1b. DB latency canary — **#433 `8f05fe0c` LIVE** (prod probes 0.48-0.60 s).
 - [ ] 1. 👤 Ops: external uptime monitor on `/ready` (latency + status), synthetic
       bad-password login expecting 401 < 3 s, Supabase resource alerts.
 - [x] 2. ~~Contain recovery sweeps~~ — DROPPED: they already have Redis single-flight locks,
@@ -16,9 +17,9 @@ own control plane could not connect). Fixed by the owner's compute upgrade. Root
       (EXPLAIN ANALYZE / count(*) / GROUP BY over `results`); `pgbouncer.get_auth` 285k calls.
 - [x] 4. DB unreachable → 503 + Retry-After the browser can read — **#428 `9a3080c7` LIVE**.
 - [x] 4b. pypdf 6.19.0 (required audit gate was red on main) — **#429 `84588fb8` LIVE**.
-- [ ] 5. FE: show "temporarily unavailable" on 503 / network error (needs #4 live).
-- [ ] 6. API connection model (NullPool → bounded pool / transaction mode) — Codex design
-      review + load test first.
+- [x] 5. FE: "temporarily unavailable" on 503 / network error — **FE #202 `c61cd4d4` LIVE**.
+- [x] 6. API connection model — **DEFERRED** (Claude + Codex): get_auth 1.9% of DB time; a pool
+      would not have saved login. Revisit on p95 regression / rising get_auth share / pooled staging.
 
 ## Review (#428)
 - New `DatabaseUnavailableMiddleware`, registered innermost so its 503 carries CORS and

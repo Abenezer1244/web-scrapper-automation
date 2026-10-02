@@ -19,6 +19,7 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+<<<<<<< HEAD
 ## 2026-10-02 — Contact lookups go on sale (2d), and the page that shows what was bought (2e)
 
 > Phase 1b-2 of contact lookup. 2d is the switch that made lookups purchasable in production;
@@ -90,6 +91,54 @@ to understand *why* the code is the way it is and *what's been attempted before*
 - This FastAPI mounts included routers lazily: `app.routes` does not list them; read the router.
 - `get_db` legitimately sits under `get_rls_db` and the auth chain: pin a route's own `db`
   parameter, not the absence of `get_db` from its dependency tree.
+=======
+## 2026-10-02 — Mailing addresses: 0% in every county without a source; the PACS situs echo; Okanogan's invented parcels
+
+> Owner report: Clark and Benton probate leads had no mailing address. Audited fleet-wide
+> before touching code. Branch `audit/mailing-address-2026-10-02`, stacked on session -76's
+> `fix/clark-probate-mailing` (Clark PIC). Not merged; not deployed; no prod writes.
+
+**Root cause (Codex-confirmed):** a shared-enrichment county-coverage gap, not a probate, scraper,
+persistence, dedup, UI, export or skip-trace bug. `county_gis` knew mailing sources for
+pierce/king/snohomish/cowlitz only; every other county fell to the WA statewide `Current_Parcels`
+layer, situs-only by design (`mailing_address: None`), got no deferral marker, was excluded from
+recovery, and its completion line said "Enrichment complete: addresses added" (Clark job
+`62404bd0`: 1,335 parcels, 1,292 property addresses, 0 mailing). Prod, done WA jobs: clark 0/1,634,
+benton 0/7, chelan 0/2, okanogan 0/13; king 85-100%, pierce 93-100%.
+
+**Built / Shipped (branch):** `pacs_parcel.py` (Benton, Clallam, Jefferson, Grant, Whatcom, Island,
+Chelan: Geo ID search, one grid row, detail page must echo the parcel; settled vs retryable
+outcomes; one paced stream per county; 403/429 cooldown) · `thurston_assessor.py` (A+ taxpayer
+block) · both wired into `_BULK_MAILING_SOURCES` (RCW-clause counties behind
+`COUNTY_GIS_RESTRICTED_MAILING_ENABLED`) · completion line counts missing mailing for every county ·
+`workers/data_quality.py` hourly sweep (coverage vs county x type 90-day baseline -> ops alert) +
+`scripts/data_quality_report.py` · `scripts/backfill_mailing_by_county.py` (dry-run default,
+fill-only, settled answers never re-asked).
+
+**Caught & fixed:** the PACS owner-NAME parser built `mailing` from the results grid's address cell,
+which is the SITUS (the grid has no mailing column; only `Property.aspx` has a labelled
+"Mailing Address:"): every such mailing was a copied property address. Okanogan's Tyler template
+searched TaxSifter by SURNAME and took the first 10-digit number on the page as `parcel_id`; parcel
+`1250110000` (owned by Okanogan County) was assigned to two different leads and keyed dedup/billing.
+Codex rounds 1-5: name-path detail identity, zero-kept portal queries, co-owner ambiguity,
+owner-cell match, DQ claim token, SSRF on the search redirect (now one same-origin 302/303 hop).
+
+**Verified live (E2E, isolated DB, real API + CSV row):** Benton 4/4 parcels MATCH an independent read
+of the county page (one absentee: Benton property, Port Orchard mailing). Thurston filled.
+
+**Failed / Blocked:** Clark PIC `?pid=&account=` served only the search shell during the E2E
+(adapter correctly `unparsed` -> deferred); reported to -76 with the `/gishome/propertyReports/?account=`
+alternative. Two background runs (Codex review, full pytest) were reaped for low memory; Codex ran
+inline instead (prompt on stdin: a 76 KB argv hits the Windows limit). Full suite not run.
+
+**Pending / Handoff:** -76's PR first, then this branch's PR. Backfill dry runs then owner approval per
+county (Benton 4, Snohomish tax 1,751, Clark 1,634 once its URL works). Okanogan: re-run jobs, do not
+backfill (their parcels are junk). Kitsap/Whitman/Douglas/Okanogan still have no parcel source.
+
+**Facts learned:** PACS results grid columns = Property ID, Geo ID, Type, Tax Area, Property Address,
+Legal, Owner, Value (no mailing). Chelan PACS detail 500s without a session. Island PACS was offline.
+Every PACS search is `propertySearchOptions$geoid` + a 302 to SearchResults.aspx.
+>>>>>>> 0c4db795 (docs: mailing audit journal entry and todo review)
 
 ## 2026-10-01 — Prod DB starved, login "Something went wrong"; the 503 the browser can read
 

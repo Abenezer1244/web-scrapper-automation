@@ -2079,6 +2079,42 @@ class ContactLookupUnavailableResponse(BaseModel):
     detail: ContactLookupUnavailableDetail
 
 
+# ─── Contact lookups: the confirm (Phase 1b-2d) ──────────────────────────────
+
+
+class ContactLookupConfirmRequest(BaseModel):
+    """Buy the lookups a quote offered. Idempotent on `quote_id`: confirming the same
+    quote again returns the same action and buys nothing more."""
+
+    model_config = {"extra": "forbid"}
+
+    quote_id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+    category: Literal["new", "already_delivered"] = "new"
+
+
+class ContactLookupAction(BaseModel):
+    """A confirmed "look up contacts" action. `dispatching` means it is accepted and
+    waiting for a worker; it moves on by itself. `quoted_count` is the most it can buy:
+    leads answered or claimed elsewhere in the meantime are not bought again."""
+
+    action_id: str
+    status: Literal["dispatching", "running", "claimed", "settled", "failed", "expired"]
+    quoted_count: int
+    truncated: bool
+
+
+class ContactLookupConfirmErrorDetail(BaseModel):
+    code: Literal["quote_expired", "quote_unsupported", "quote_stale", "quote_mismatch",
+                  "nothing_to_look_up", "run_not_finished"]
+    message: str
+
+
+class ContactLookupConfirmErrorResponse(BaseModel):
+    """The confirm could not buy anything. Nothing was charged."""
+
+    detail: ContactLookupConfirmErrorDetail
+
+
 # ─── Live run (SSE) ───────────────────────────────────────────────────────────
 
 class LogLine(BaseModel):

@@ -43,6 +43,9 @@ KING_EREALPROPERTY = "king_erealproperty"
 # (pierce_atip_owner). No canary probe is registered for it, so a block clears
 # through is_source_available's backstop (cooldown + 6 h), never blind.
 PIERCE_ATIP_OWNER = "pierce_atip_owner"
+# Clark Property Information Center, owner mailing pages (clark_pic). No canary probe
+# either: a 429/403 cools it down and the 6 h backstop lets traffic resume.
+CLARK_PIC = "clark_pic"
 
 # 1h first, then 6h, 24h, 48h and 72h for every subsequent failed probe.
 # Index 0 is the FIRST block, before any probe has run, so it is the rung that

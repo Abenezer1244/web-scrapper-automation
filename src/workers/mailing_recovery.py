@@ -405,8 +405,8 @@ def _apply(db, by_parcel: dict, parcels: list[str], enriched: dict, stats: dict)
             outcome, mailing = "parcel_mismatch", None
         elif mailing:
             outcome = "found"
-        elif lookup == "none":
-            outcome = "none"                 # source answered: no mailing address
+        elif lookup in ("none", "parcel_not_found"):
+            outcome = lookup                 # source answered: no mailing address
         elif lookup == "identity_unverified":
             outcome = "identity_unverified"  # page never named this parcel
         else:
@@ -422,12 +422,17 @@ def _apply(db, by_parcel: dict, parcels: list[str], enriched: dict, stats: dict)
             attempts += 1
             # Terminal when the source gave a real answer of "no mailing address",
             # or when we have asked enough times. Anything else stays eligible.
-            terminal = outcome in ("found", "none", "parcel_mismatch") or attempts >= _MAX_ATTEMPTS
+            terminal = (outcome in ("found", "none", "parcel_not_found", "parcel_mismatch")
+                        or attempts >= _MAX_ATTEMPTS)
             _write_row(db, row, mailing, outcome, attempts, terminal, now_iso, stats,
-                       source=data.get("source") if mailing else None,
+                       # Who answered: kept for a settled "no address" too, so it
+                       # stays provable which source said so.
+                       source=(data.get("source") if mailing or outcome in (
+                           "none", "parcel_not_found", "parcel_mismatch") else None),
                        snapshot=data.get("snapshot") if mailing else None)
 
-        _key = {"found": "found", "none": "none", "parcel_mismatch": "parcel_mismatch",
+        _key = {"found": "found", "none": "none", "parcel_not_found": "none",
+                "parcel_mismatch": "parcel_mismatch",
                 "identity_unverified": "unverified"}.get(outcome, "errors")
         stats[_key] = stats.get(_key, 0) + 1
 
@@ -645,16 +650,27 @@ def recover_deferred_gis_mailing() -> dict:
             # attempt count and only rotates to the back of the queue, exactly like an
             # un-attempted King parcel.
             unreached = {p for p in gis_stats.get("county_unreached", []) if p in by_parcel}
+            # Except a page that WAS fetched but could not be read (clark_pic
+            # "unparsed"): that spends an attempt, so it ends at the ceiling rather than
+            # being fetched again every tick forever (Codex P1).
+            unreached -= {p for p in unreached
+                          if (found.get(p) or {}).get("mailing_lookup") == "error"}
             attempted = [p for p in parcels if p in by_parcel and p not in unreached]
-            enriched = {
-                pid: {
-                    "mailing_address": (found.get(pid) or {}).get("mailing_address"),
+            enriched = {}
+            for pid in attempted:
+                row = found.get(pid) or {}
+                lookup = row.get("mailing_lookup")
+                enriched[pid] = {
+                    "mailing_address": row.get("mailing_address"),
                     # The county answered this request. No mailing address in that
-                    # answer, matched or not, is a real "none" from the source.
-                    "mailing_lookup": "none",
+                    # answer, matched or not, is a real "none" from the source, unless
+                    # the source said more precisely why (clark_pic).
+                    "mailing_lookup": (lookup if lookup in ("parcel_not_found", "error")
+                                       else "none"),
+                    # A page that named a different parcel says nothing about this one.
+                    "parcel_lookup": "mismatch" if lookup == "parcel_mismatch" else None,
+                    "source": row.get("mailing_source"),
                 }
-                for pid in attempted
-            }
             stats["parcels"] += len(attempted)
             _apply(db, by_parcel, attempted, enriched, stats)
             if unreached:

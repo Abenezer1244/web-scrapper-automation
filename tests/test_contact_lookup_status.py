@@ -347,8 +347,8 @@ async def test_one_404_for_anything_not_this_accounts_action_on_this_run(
     ):
         r = await _status(client, token, j, a)
         assert (r.status_code, r.json()) == (404, not_found), (j, a, r.text)
-    r = await _status(client, business_token, "not-a-uuid", aid)
-    assert r.status_code == 404
+    r = await _status(client, business_token, "not-a-uuid", aid)  # a malformed run too
+    assert (r.status_code, r.json()) == (404, not_found), r.text
 
 
 async def test_an_upper_case_id_is_the_same_action(
@@ -522,7 +522,22 @@ async def test_the_list_404s_a_run_that_is_not_this_accounts(
 # ── as the real API role ─────────────────────────────────────────────────────
 
 
-async def test_the_status_query_runs_as_the_api_role_under_rls(
+def test_both_routes_run_in_the_tenant_session():
+    """Each route's own `db` is `get_rls_db` (the tenant GUC; RLS is the belt). `get_db`
+    still appears below it (auth, and inside `get_rls_db`), so the PARAMETER is pinned.
+    Read from the jobs router: the app mounts included routers lazily."""
+    from src.api.deps import get_rls_db
+
+    routes = {r.path: r for r in jobs_routes.router.routes
+              if getattr(r, "methods", None) == {"GET"} and "contact-lookups" in r.path}
+    assert set(routes) == {"/jobs/{job_id}/contact-lookups",
+                           "/jobs/{job_id}/contact-lookups/{action_id}"}
+    for path, route in routes.items():
+        [db] = [d for d in route.dependant.dependencies if d.name == "db"]
+        assert db.call is get_rls_db, path
+
+
+async def test_the_status_sql_as_the_api_role_sees_only_its_tenant_under_rls(
     db, client, business_user, business_token, _lookups_on,
 ):
     """The route runs as `bridgeleads_app` under RLS with the tenant set: the query

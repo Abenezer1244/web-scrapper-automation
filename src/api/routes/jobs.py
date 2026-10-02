@@ -1782,10 +1782,11 @@ def _lookup_not_found() -> HTTPException:
                          detail="Contact lookup not found")
 
 
-def _canonical_action_id(action_id: str) -> str:
-    """As `_canonical_job_id`: a malformed id is 404, never a DataError 500."""
+def _canonical_lookup_id(value: str) -> str:
+    """A status-route path id as a canonical UUID. Malformed is the route's ONE 404
+    body, never "Job not found" and never a DataError 500 (2e review r1)."""
     try:
-        return str(uuid.UUID(action_id))
+        return str(uuid.UUID(value))
     except ValueError:
         raise _lookup_not_found() from None
 
@@ -1896,8 +1897,8 @@ async def get_contact_lookup(
     """What a confirmed contact-lookup action has bought so far. Final once `status` is
     `settled`, `failed` or `expired`."""
     await _lookup_read_rate_limit(request, current_user.id)
-    job_id = _canonical_job_id(job_id)
-    action_id = _canonical_action_id(action_id)
+    job_id = _canonical_lookup_id(job_id)
+    action_id = _canonical_lookup_id(action_id)
     user_id = str(current_user.id)
     # One 404 for another account's action, another run's, and none at all.
     row = (await db.execute(

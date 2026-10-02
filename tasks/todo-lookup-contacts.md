@@ -5111,6 +5111,24 @@ line as `  injection ...`; it reads `  fault injection ...`) before writing anyt
   `parse_constant` dropped as redundant. I also closed the same class proactively: a NUL
   byte in `currency` / `pricing_version` (text columns) is refused. 64 tests; the 4 new
   mutants are caught (runner: 45 mutants, 44 caught + the equivalent AO5).
+  - Before r5 I closed one more of the class myself (`f77181e3`, `48c8f25d`): a LONE
+    SURROGATE (`"\ud800"`, which `json.loads` accepts) fails UTF-8 encoding. The snapshot
+    must `.encode("utf-8")`, and `currency + pricing_version` must be `isprintable()`
+    (no NUL / control byte / surrogate).
+- **Codex r5 (on `48c8f25d`): NO-GO, 2 P2.** r4 and the surrogate fix CLOSED; the widths
+  match 101 (`currency` 3, `pricing_version` 32, `quote_id` 64, `category` 32). Fixed in
+  `ec05b651`:
+  - (P2) nesting: a quote nested past Python's stack raised `RecursionError` (now caught
+    → 409), and a depth Python survives can still overflow jsonb's stack. The snapshot
+    may nest at most 16 deep (a real one nests 3).
+  - (P2) the path `job_id` was cast by the database: a malformed one was a DataError (a
+    500). It is now parsed as a UUID before any DB access (→ 404), and the CANONICAL form
+    feeds the quote key, the replay match and the casts, so an upper-case path no longer
+    falsely conflicts on a replay.
+  - **FOLLOW-UP (not this PR):** every other `/jobs/{job_id}` route still takes a raw
+    `str`, so a malformed id there is the same DataError → 500 (with a ref; no stack is
+    leaked). Pre-existing, house-wide, so it belongs in its own PR.
+  - 70 tests pass. Runner: 52 mutants, 51 caught + the equivalent AO5.
 - **Codex diff review r1: NO-GO, 1 P1 + 3 P2 + 1 P3, all fixed in `c840ea45`:**
   - the post-commit import + publish are guarded (P1);
   - strict validation of the stored payload → 409 `quote_unsupported` (naive expiry,

@@ -4848,6 +4848,328 @@ trusted-worker risk; the RLS hardening is the owner's call (and, if wanted, befo
 
   **O-D is DONE. Both 2d gates (O-C, O-D) are met.** The skip_trace_cache drift is fixed with it.
 
+## Phase 1b-2d — the confirm endpoint (BUILD SPEC, 2026-10-01, BEFORE the Codex consult)
+Owner: **START 2d** (2026-10-01). O-A: it goes live with this PR, with no flag. Both gates are
+met: O-C (#421/#422/#424) and O-D (#425 + applied). Branch `feat/lookup-1b2d-confirm`, stacked
+on the docs PR #426. **This is the switch that makes contact lookup purchasable.** The step
+"1b-2d" above, as amended by V1, V6, V7, W4 and AA1.
+
+**Facts (read 2026-10-01, main `9bfc73b3`):**
+- The quote (`jobs.py:1137-1307`) stores ONE Redis key per tab,
+  `bridgeleads:contact_lookup:quote:v2:{user}:{job}:{category}`, with a TTL of 600 s. The JSON
+  payload holds:
+  - `v=2`, `quote_id`, `user_id`, `job_id`, `category`;
+  - `quoted_ids` (window order), `advanced_count`, `quoted_credits`;
+  - `access`, `trial_credit_allowance`, `over_credit_cap`;
+  - `counts`, `examined`, `window_end`, `stopped`, `remaining`;
+  - `planner_version`, `policy`, `unit_price_cents`, `currency`, `pricing_version`;
+  - `included_remaining_at_quote`, `created_at`, `expires_at`.
+
+  Redis calls are bounded (`_bounded`, a 1 s wait over 0.5 s socket timeouts). The limiter
+  call is bounded too.
+- The 101 guards (`app.current_user_id` set, i.e. the API's `get_rls_db`) allow exactly:
+  - INSERT of an action in `dispatching` with zero worker counts, no lease and no worker
+    timestamps (the server overwrites `created_at`);
+  - INSERT of `quoted` (or `excluded_*`) result rows;
+  - INSERT of ONE `→ dispatching` event with no from / result / lease / reason, only while
+    the action is `dispatching` (checked `FOR SHARE`);
+  - UPDATE of `dispatched_at` only, once, while `dispatching` (the server writes `now()`).
+
+  Everything else raises `insufficient_privilege`. `uq_contact_lookup_actions_quote` is
+  UNIQUE on `quote_id`.
+- The worker reads `quoted_count` (V1: fails closed on a size mismatch), `quote_snapshot.policy`
+  (15-14: only ever stricter), and its `quoted` rows. The task
+  `src.workers.contact_lookup_action.lookup_contacts` routes to the default `celery` queue,
+  exactly as the reconciler's P3 already publishes it.
+- The house publish (`POST /jobs`, `jobs.py:382-404`): commit, then `apply_async` in
+  try/except. A failure warns and returns the committed row; a sweep re-drives. Here the
+  re-drive is the reconciler's P3 (eligible 60 s after the confirm, then every 300 s since the
+  last attempt; each processed on the 120 s reconciler tick). The deadline is 30 min,
+  enforced in T1 (AA1).
+
+**Design:**
+- `POST /jobs/{job_id}/contact-lookups` with body `ContactLookupConfirmRequest {quote_id
+  (1-64 chars, URL-safe), category}` (extra forbidden). Response **202**
+  `ContactLookupAction {action_id, status, quoted_count, truncated}`; no lead ids in the body.
+1. `rate_limit(zone="writes", identifier=user)` (V7/W4), 30/min. An OUTER timeout of the
+   limiter call → 503; a Redis failure → the per-process fallback; fallback exhaustion → 429 (AO4).
+2. Job by `(id, user)` else 404; not delivered → 409 `run_not_finished`.
+3. **Idempotency, DB first, BEFORE any mutable gate (AO1):** an action with `(quote_id,
+   user_id)` exists → it must match `job_id` and `category` (else 409 `quote_mismatch`) →
+   return it (202, same body). A replay works whatever Redis holds, and is never refused
+   by a plan, frozen state or kill switch that changed after the purchase.
+4. Only when NO action exists: plan → 402; frozen / ended → the run refusal; kill switch or
+   no token → 503; `paid_lookup_access` not full/trial → 503 (fail closed).
+5. Redis GET (bounded; failure → 503):
+   - missing, or `quote_id` ≠ body (superseded), or `expires_at` ≤ now → **410
+     `quote_expired`**;
+   - `v` ≠ 2 → 409 `quote_unsupported`;
+   - `user_id` / `job_id` / `category` ≠ the request → 410 (defensive; the key derives them).
+6. Empty `quoted_ids` → 409 `nothing_to_look_up` (no empty action).
+7. **ONE transaction** (the RLS session, so the guards bind):
+   - INSERT the action: `dispatching`; `quoted_count = len(unique ids)`; `truncated =
+     stopped is not None and remaining > 0`; the price fields from the quote;
+     `quote_snapshot = {counts, examined, stopped, remaining, window_end, policy, access,
+     trial_credit_allowance, over_credit_cap, planner_version, advanced_count,
+     quoted_credits, included_remaining_at_quote, quote_created_at, expires_at}` (V6).
+   - V1: `INSERT INTO contact_lookup_action_results (...) SELECT ... FROM results r WHERE r.id
+     = ANY(CAST(:ids AS uuid[])) AND r.user_id = :uid AND r.job_id = :job`. The row count ≠ unique ids →
+     ROLLBACK, 409 `quote_stale`.
+   - INSERT the `→ dispatching` event. COMMIT.
+   - An `IntegrityError` on `uq_contact_lookup_actions_quote` (a concurrent confirm) →
+     rollback, re-fetch, return the winner.
+8. After the commit, **compare-and-delete** the quote key (a Lua script: delete only if the
+   stored JSON's `quote_id` = this one). Bounded; a failure only logs (the key expires, and a
+   replay is answered from the DB at step 3).
+9. **Publish, bounded** (AO3): a named `_publish_contact_lookup(aid)` helper.
+   - `threading.BoundedSemaphore(2)` acquired NON-blocking; saturated → skip.
+   - A module-level `ThreadPoolExecutor(max_workers=2)`.
+   - `lookup_contacts.apply_async(args=[aid], retry=False)`; the semaphore is released in
+     `finally`.
+   - The request awaits it with `asyncio.wait_for(asyncio.wrap_future(...), 3 s)`.
+
+   Never the shared AnyIO pool: a stalled broker must hold neither the event loop nor the
+   request threads.
+   - Success → `UPDATE contact_lookup_actions SET dispatched_at = now()` (guarded, once) in
+     its own transaction.
+   - Failure, timeout or skip → a warning, and `dispatched_at` stays NULL. The action is
+     eligible for P3 after 60 s and is published on the next 120 s reconciler tick.
+10. `audit_log(request, "contact_lookup_confirmed", current_user.id,
+    f"action_id={aid} quoted_count={n}")`. Return 202.
+- The worker / API import loop: `lookup_contacts` is imported INSIDE the handler (the #393
+  pattern; `tests/test_import_cycles.py`).
+
+**Files (5):** `src/api/routes/jobs.py`, `src/api/schemas.py`, `schema/openapi.json` (regenerated
+in `.venv-schema` only, diffed against `origin/main`, ZERO deletions),
+`tests/test_contact_lookup_confirm.py` (NEW), this plan.
+
+**Tests** (real PG + Redis through the API client; the worker's claim runs for real):
+- every gate (404 / 409 / 402 / frozen / 503 kill switch / 503 quote-store Redis down, bounded;
+  the limiter: 429 after 30, and an outer limiter timeout → 503);
+- the happy path:
+  - the action is `dispatching`, the quoted rows == `quoted_ids`, with one event;
+  - the snapshot fields; the quote key deleted; `dispatched_at` stamped;
+  - then `run_action(aid)` claims (end to end);
+- a replay → the same action, nothing new, even after the key is gone, AND after the account
+  lost its plan / the kill switch went off (AO1: a replay never gets 402/503);
+- two concurrent confirms → one action;
+- superseded / expired / missing → 410; `v=1` → 409;
+- `quote_stale` (a quoted lead deleted, or of another tenant) → 409, nothing written;
+- empty → 409;
+- a publish failure → 202, `dispatched_at` NULL, and the reconciler's P3 republishes;
+- AO2's race: the worker's T1 runs between the publish and the stamp → the confirm still
+  returns 202, the stamp is a zero-row no-op, and nothing raises;
+- a mismatch on replay (other job / category) → 409;
+- 31 writes in a minute → 429;
+- the body carries no lead ids.
+- Mutations per PR.
+
+**Questions for the consult:**
+1. DB-first idempotency before Redis: any hole (a stale replay across jobs, timing)?
+2. Bounding `apply_async` in a threadpool vs the house inline call: is there a Celery /
+   kombu thread-safety concern in the API process?
+3. Should a replay be subject to the kill switch / plan gates (it creates nothing)?
+4. `truncated` and the snapshot contents: is anything the 2e status page or a dispute needs
+   missing?
+5. How should tests observe the publish without a broker or a mock (`task_always_eager`? the
+   broker in the test env?)
+6. Any way a lead outside `quoted_ids`, or another tenant's, gets bought (V1 + W6)?
+7. The live switch: a deploy order or quiesce concern for the first customer confirm?
+
+### Codex pre-code consult r1 on 2d (2026-10-01): PLAN: REVISE, 2 P1 + 3 P2, all adopted
+Output: `<scratchpad feececfd>/codex_2d_consult_r1_out.txt`. Codex's answers:
+- the snapshot is sufficient (Q4);
+- tests: real PG / Redis via ASGITransport with no eager Celery, so observe the publish and
+  run `run_action` directly (Q5);
+- V1 + W6 + the unique `quote_id` make an unquoted, foreign or doubled purchase impossible
+  (Q6);
+- no quiesce is needed (107, 2b and 2c are live; P3 already runs every 2 min) (Q7).
+
+The amendments:
+- **AO1 (P1) a replay is answered BEFORE the mutable gates.** Order:
+  1. limiter;
+  2. job ownership (404) and the delivered check;
+  3. the existing action by `(quote_id, user_id)` → it must match `job_id` + `category`
+     (else 409 `quote_mismatch`) → return it (202);
+  4. ONLY when no action exists: plan / frozen / kill switch / access, then Redis.
+
+  A paid customer's own action never becomes a 402/503 because their account changed after
+  buying. (The "not delivered" 409 stays first: an action can only exist on a delivered run.)
+- **AO2 (P1) the `dispatched_at` stamp races the worker.** T1 can move the action to
+  `running` between the publish and the stamp, and the guard then RAISES. The stamp is
+  `UPDATE ... SET dispatched_at = now() WHERE id = :a AND user_id = :u AND status =
+  'dispatching' AND dispatched_at IS NULL`: zero rows is SUCCESS (the worker got there
+  first), and it never fails the confirm. Any stamp error is logged and swallowed, after
+  the purchase is durably committed. A test drives the race (the worker runs between the
+  publish and the stamp).
+- **AO3 (P2) `wait_for` cannot stop a stuck publish thread.**
+  - Publishes run on a dedicated module-level `ThreadPoolExecutor(max_workers=2)`, gated by
+    a non-blocking semaphore. When saturated (a broker stall in progress), the publish is
+    SKIPPED and P3 re-drives after 1 min. A stall can never exhaust the shared threadpool.
+  - `apply_async(..., retry=False)`, so kombu's publish-retry loop is off. The request-level
+    `wait_for(3 s)` stays as the second bound.
+  - No global Celery config change (that would be a 6th file and every task's behaviour).
+- **AO4 (P2) the limiter contract.** The `writes` zone is 30/min. A Redis failure falls back to
+  the per-process limiter; it is NOT a 503. Only an OUTER timeout of the limiter call is a
+  503. That is documented and tested as such.
+- **AO5 (P2)** `r.id = ANY(CAST(:ids AS uuid[]))`. Only an `IntegrityError` naming
+  `uq_contact_lookup_actions_quote` triggers the re-fetch; any other integrity error raises.
+- **Tests (Q5):** the publish is observed with a PASS-THROUGH spy on `apply_async` (records,
+  then calls the real one against the test broker). The publish-failure case uses LABELLED
+  fault injection (the spy raises), the one place it is unavoidable. The worker runs via
+  `run_action(aid)`.
+
+**r2 (2026-10-01): PLAN: REVISE, 3 P2 + 1 P3, all spec-text, fixed IN PLACE**
+(`codex_2d_consult_r2_out.txt`). AO1-AO5 PASS:
+- PG row triggers do not fire on a zero-row UPDATE;
+- kombu's producer pool is safe per call;
+- a replay is user-keyed.
+
+The fixes: step 9 names the dedicated helper; the `audit_log` signature; the limiter
+wording; P3 timing (eligible at 60 s, the next 120 s tick).
+
+**r6: PLAN: REVISE, 1 P3** (step 8 named step 4 for the replay; it is step 3), fixed.
+
+**r5: PLAN: REVISE, 1 P1 + 2 P2:** the numbered steps still showed the pre-AO1 order. Steps 2-4
+are rewritten in AO1's order; the Facts' P3 timing is corrected; the AO2 race test is added.
+
+**r3 / r4: PLAN: REVISE, 2 P2, fixed IN PLACE:** step 7's SQL now reads `ANY(CAST(:ids AS
+uuid[]))` as AO5 says; a test for a replay after the plan / kill switch changes (AO1).
+r4 reviewed an unfixed file: my fix script had aborted on a wrong anchor (I quoted the
+line as `  injection ...`; it reads `  fault injection ...`) before writing anything.
+
+### 2d BUILT (2026-10-01, branch `feat/lookup-1b2d-confirm`, stacked on #426), IN REVIEW. NOT MERGED
+- `jobs.py`: `POST /jobs/{job_id}/contact-lookups` exactly as specified (AO1-AO5):
+  - helpers `_action_for_quote`, `_replayed`, `_valid_quote_payload`,
+    `_publish_contact_lookup` (a dedicated 2-thread pool behind a non-blocking
+    `BoundedSemaphore(2)`, `retry=False`, a 3 s bound);
+  - the compare-and-delete Lua; the conditional `dispatched_at` stamp.
+- `schemas.py`: `ContactLookupConfirmRequest`, `ContactLookupAction`,
+  `ContactLookupConfirmError*`. `openapi.json` regenerated (0 deletions vs main; `--check` OK).
+  **`.venv-schema` is DEAD** (it was built on the gone Anaconda); the working venv pins
+  fastapi 0.141.1 / pydantic 2.13.4 exactly as `requirements.txt` does, the CI-equivalent.
+- `tests/test_contact_lookup_confirm.py`: **32 pass**. Real PG + Redis + the real worker; a
+  pass-through publish spy; labelled fault injections:
+  - a broker refusal;
+  - the worker winning the stamp race;
+  - a DB trigger refusing the stamp;
+  - a hung publish.
+- **A REAL BUG found by mutation and fixed:** the stamp's rollback expired the ORM
+  `current_user`, and the audit line read it → MissingGreenlet → a 500 after a committed
+  purchase. The audit now uses the plain `user_id`.
+- **Mutations: 18/18 caught** on the pre-review code (runner `mut_2d.py` in scratchpad
+  feececfd).
+- **Mutation re-run after r1 (2026-10-01, `1d67f8ff`): 36/37 caught**, 19 mutants added for
+  `_valid_quote_payload` (one per check), unparseable JSON, the guarded import, slot
+  release on submit failure and in the thread, `retry=False`, AO5 and `truncated`.
+  - The first pass found 1 survivor and several unreached checks. The outer post-commit
+    guard MASKED the helper's own "never raises" contract (the route still answered 202),
+    and no input reached the list / zero / bool / long-version / dedup checks. Pinned by
+    15 new tests (47 total): direct helper tests (a refused publish, a pool that will not
+    start it), an import failure after commit, a mapping of real ids, a doubled id bought
+    once, `truncated` semantics, `retry=False`.
+  - "unparseable JSON is a 500" timed out (INCONCLUSIVE) in the full-file run; run alone
+    against its target test it is CAUGHT in 15 s (the escaped 500 appears to hang a later
+    teardown, never a pass).
+  - **SURVIVED, judged equivalent in practice:** AO5 (`if False and (...)`, so ANY
+    IntegrityError re-fetches). It differs only when a non-quote integrity error fires
+    AND a winning action for the same quote already exists; then it returns that winner
+    (202) instead of raising. With no winner it still raises. Killing it needs a
+    contrived double fault; put to Codex r2.
+  - The first background run was KILLED by host memory pressure mid-mutant and left a
+    LIVE mutant in `jobs.py` (the list check removed). Caught by `sha256sum -c`,
+    restored by `git checkout`, re-verified by hash.
+- **Codex diff review r2 (2026-10-01, on `2f89556d`): NO-GO, 1 P2 + test-quality gaps**
+  (`codex_2d_review_r2_out.txt`, scratchpad c0ba9e9b). r1's P1 and the 404/429, forced-race
+  and hung-publish findings were confirmed CLOSED; the core purchase safety was re-verified
+  (AO1 order, V1, one transaction, the rollback path, the Lua, semaphore accounting on
+  every path). The AO5 survivor was judged EQUIVALENT under 101 (it needs a contrived
+  double fault); no test required. Fixed in `2d0280f5`:
+  - (P2) a stored quote could still 500: non-object JSON (`[]`, `null`, ...), a non-int
+    `remaining`, a price that overflows the INTEGER column. Now a non-dict is
+    unsupported; `stopped` must be one of `_QUOTE_STOPS` (None, cap, credit_cap,
+    scan_limit), `remaining` a non-negative int, `0 < price <= 2^31-1`; `truncated` is
+    derived from the validated fields. A source scan pins `_QUOTE_STOPS` to every
+    `.stopped =` the planner can record.
+  - (tests) five fault tests could pass with the publish path removed. Each now proves the
+    injected path ran: counters, the "publish skipped" / "publish not attempted" warnings,
+    the hung publish entered.
+  - 57 tests pass. Mutations on the changed lines: 12/12 caught (runner 42 mutants: 41
+    caught + the equivalent AO5).
+- **Codex r3 (on `82622fbe`): NO-GO, 1 P2 + 1 P3.** r2 CLOSED; Codex confirmed the real quote
+  route never writes a payload the stricter validation refuses (stops, int `remaining`,
+  5/8-cent prices, `USD`, `2026-06`), and that `caplog` sees the `api.jobs` logger.
+  - (P2) `json.loads` accepts `NaN` / `Infinity`, which then failed the jsonb cast (a 500).
+  - (P3) the stop scan missed `AnnAssign`.
+  - Fixed in `8e57fc65` (`parse_constant`; the scan covers Assign + AnnAssign and fails on
+    a computed stop).
+- **Codex r4 (on `8e57fc65`): NO-GO, 1 P2, and it REFUTED my reasoning.** I had argued that
+  no non-finite float could reach the snapshot once the constants were refused. Wrong:
+  `1e9999` is a valid JSON NUMBER that Python reads as `inf`. Fixed in `5fa54e83` at the
+  SINK, not the parse: `_snapshot_json` serializes once, before the transaction, with
+  `allow_nan=False` and no `\u0000` (jsonb refuses both) → 409 `quote_unsupported`;
+  `parse_constant` dropped as redundant. I also closed the same class proactively: a NUL
+  byte in `currency` / `pricing_version` (text columns) is refused. 64 tests; the 4 new
+  mutants are caught (runner: 45 mutants, 44 caught + the equivalent AO5).
+  - Before r5 I closed one more of the class myself (`f77181e3`, `48c8f25d`): a LONE
+    SURROGATE (`"\ud800"`, which `json.loads` accepts) fails UTF-8 encoding. The snapshot
+    must `.encode("utf-8")`, and `currency + pricing_version` must be `isprintable()`
+    (no NUL / control byte / surrogate).
+- **Codex r5 (on `48c8f25d`): NO-GO, 2 P2.** r4 and the surrogate fix CLOSED; the widths
+  match 101 (`currency` 3, `pricing_version` 32, `quote_id` 64, `category` 32). Fixed in
+  `ec05b651`:
+  - (P2) nesting: a quote nested past Python's stack raised `RecursionError` (now caught
+    → 409), and a depth Python survives can still overflow jsonb's stack. The snapshot
+    may nest at most 16 deep (a real one nests 3).
+  - (P2) the path `job_id` was cast by the database: a malformed one was a DataError (a
+    500). It is now parsed as a UUID before any DB access (→ 404), and the CANONICAL form
+    feeds the quote key, the replay match and the casts, so an upper-case path no longer
+    falsely conflicts on a replay.
+  - **FOLLOW-UP (not this PR):** every other `/jobs/{job_id}` route still takes a raw
+    `str`, so a malformed id there is the same DataError → 500 (with a ref; no stack is
+    leaked). Pre-existing, house-wide, so it belongs in its own PR.
+  - 70 tests pass. Runner: 52 mutants, 51 caught + the equivalent AO5.
+- **Codex r6 (on `6c98eb2d`): GATE: GO**, 1 non-blocking P3: the QUOTE route stored its key
+  from the raw path, so an upper-case quote was unconfirmable on the canonical confirm (a
+  safe 410, nothing bought). Codex also ruled the house-wide malformed-id follow-up
+  non-blocking. Applied anyway in `8d566267`: one helper, `_canonical_job_id`, for the
+  quote AND the confirm. This touches the LIVE quote route: a malformed id there is now
+  404 (was a DataError 500); a canonical id's response and payload are unchanged.
+- **Codex r7 (on `8d566267`): GATE: GO**, no findings: the P3 is closed and the quote is
+  byte-identical for canonical ids.
+- **Final state on `8d566267`:** 72 confirm tests + 26 quote tests pass. Mutation runner:
+  54 mutants, 53 caught + AO5 (equivalent: Codex r2). The **regression (60 files, 9
+  chunks): 1,457 passed, 0 failed**; source hashes verified after. ruff clean; no type
+  checker is configured for this repo. `openapi.json --check` OK (+218, 0 deletions).
+- **Rebased onto main `9a3080c7`** (#427 docs, #429 pypdf, #428 a DB-outage → 503
+  middleware). The 2d diff is byte-identical to the reviewed one (102,943 bytes). **Codex's
+  post-rebase check: NO-GO, 1 P2 + 1 P3, a real interaction with #428:** the stamp
+  handler's own `rollback()` could raise on a dead connection and escape, and #428 turns
+  that into a 503 for a purchase already committed (a retry replays safely, but a
+  committed purchase must answer 202). Fixed in `ba306b8b`: the rollback is guarded and
+  logged, pinned by a labelled double-fault test (a stamp trigger + a rollback that raises
+  once), and its mutant is caught. The 503 docs now name the service-wide `{detail, ref}`
+  body. **Re-check: GATE: GO**: nothing after the commit can fail the request.
+- **NEXT:** open the PR, CI on the exact head, quiet, merge, deploy verify.
+- **Codex diff review r1: NO-GO, 1 P1 + 3 P2 + 1 P3, all fixed in `c840ea45`:**
+  - the post-commit import + publish are guarded (P1);
+  - strict validation of the stored payload → 409 `quote_unsupported` (naive expiry,
+    non-list or non-UUID ids, bad price, currency or version);
+  - 404 / 429 documented in the OpenAPI;
+  - a FORCED race test (a barrier spy: two pre-checks then the loser's winner re-fetch);
+  - a hung-publish test (202 within the bound, the slot freed afterwards).
+- **NEXT:**
+  1. mutation re-run (add mutants for the new validation and the guarded import);
+  2. the full regression (60 files, 9 chunks: `2d_chunk_*` in scratchpad; chunk 00 passed
+     70 before the review fixes, then the run was stopped for the changes);
+  3. Codex review r2;
+  4. merge #426 FIRST (docs; it waits on `quiet.py` = all zeros, which was blocked by
+     another worker-role read holding shared locks), then rebase 2d onto main and prove
+     the diff byte-identical;
+  5. open the 2d PR → CI → merge under the standing rule → deploy verify.
+
+  **2d is the live switch: the first customer confirm becomes possible on deploy.**
+
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever
       the tab has leads that have never been looked up; when the quote comes back with

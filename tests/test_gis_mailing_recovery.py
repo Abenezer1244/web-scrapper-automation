@@ -168,9 +168,9 @@ class TestRecoverySweep:
     ):
         # King's mailing comes from eRealProperty (its own sweep); Thurston has no source.
         king = await _job(db, business_user, county="king")
-        thurston = await _job(db, business_user, county="thurston")
+        kitsap = await _job(db, business_user, county="kitsap")
         await _row(db, business_user, king, parcel="1234500001")
-        await _row(db, business_user, thurston, parcel="986012345")
+        await _row(db, business_user, kitsap, parcel="986012345")
         calls = _county_answers(monkeypatch, {"1234500001": TX_MAIL, "986012345": TX_MAIL})
 
         await asyncio.to_thread(mr.recover_deferred_gis_mailing)
@@ -294,7 +294,9 @@ class TestCountyUnreachedIsReported:
         assert stats["county_unreached"] == []
 
     def test_mailing_source_registry(self):
-        assert cg.gis_mailing_source_counties("WA") == ["clark", "cowlitz", "pierce", "snohomish"]
+        assert cg.gis_mailing_source_counties("WA") == [
+            "benton", "chelan", "clallam", "clark", "cowlitz", "grant", "island", "jefferson",
+            "pierce", "snohomish", "thurston", "whatcom"]
         assert cg.has_gis_mailing_source("king", "WA") is False
         # Clark has no GIS mailing layer; its source is the PIC page (clark_pic).
         assert cg.has_gis_mailing_source("clark", "WA") is False
@@ -368,7 +370,7 @@ class TestJobEnrichmentDefersUnreachedParcels:
             raise TimeoutError("statewide timed out")
 
         rid, summary = await self._enrich(db, business_user, redis_client, monkeypatch,
-                                          county="thurston", parcel="986012345",
+                                          county="kitsap", parcel="986012345",
                                           safe_get=_down)
         row = await _get(db, rid)
         assert "mailing_lookup_deferred" not in row.enrichment_data

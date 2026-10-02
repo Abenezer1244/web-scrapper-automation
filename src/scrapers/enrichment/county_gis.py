@@ -654,11 +654,23 @@ def _empty() -> dict[str, str | None]:
 # explicitly, NOT inferred from the GIS config: the Snohomish GIS mailing fields are
 # dead weight now, and deleting them must not also delete Snohomish from mailing
 # recovery (Codex).
+#
+# The PACS counties and Thurston (audit 2026-10-02: every one of them stored 0% mailing
+# because it had no source here) answer through pacs_parcel.py / thurston_assessor.py,
+# which close parcel identity on the county's own page before taking an address.
+_PACS_MAILING_COUNTIES = ("benton", "clallam", "jefferson", "grant", "whatcom", "island", "chelan")
 _BULK_MAILING_SOURCES: dict[str, str] = {
     "snohomish_WA": "snohomish_assessor_roll",
     "clark_WA": "clark_pic",
+    "thurston_WA": "thurston_assessor",
+    **{f"{c}_WA": f"pacs_{c}" for c in _PACS_MAILING_COUNTIES},
 }
 _BULK_MAILING_COUNTIES: frozenset[str] = frozenset(_BULK_MAILING_SOURCES)
+# Answered from a local snapshot, so asking again costs the county nothing and an
+# "ambiguous" may settle in a later revision. Every other source is a live page: an
+# ambiguous page was fetched and judged, so it spends a recovery attempt instead of
+# being fetched again every tick forever.
+_FREE_TO_REASK: frozenset[str] = frozenset({"snohomish_WA"})
 
 # Bulk-source outcomes that ARE an answer about the parcel, just not an address
 # (clark_pic). Every other non-found outcome means "we do not know" and defers.
@@ -669,8 +681,12 @@ _SETTLED_NO_MAILING: frozenset[str] = frozenset({"none", "parcel_not_found", "pa
 # block behind the same clause, and Clark's page footer cites the same statute, so
 # both MUST answer to the same kill switch: gating only the live layer would mean
 # turning the switch off for a legal reason silently stopped nothing. Clark was
-# cleared by the product owner on 2026-10-02.
-_BULK_MAILING_LICENSE_RESTRICTED: frozenset[str] = frozenset({"snohomish_WA", "clark_WA"})
+# cleared by the product owner on 2026-10-02, as were the PACS portals whose pages
+# cite RCW 42.56.070 (Grant, Whatcom, Island, Chelan). Benton, Clallam, Jefferson and
+# Thurston carry no such clause on their pages.
+_BULK_MAILING_LICENSE_RESTRICTED: frozenset[str] = frozenset({
+    "snohomish_WA", "clark_WA", "grant_WA", "whatcom_WA", "island_WA", "chelan_WA",
+})
 
 
 def has_bulk_mailing_source(county: str, state: str) -> bool:
@@ -697,10 +713,19 @@ def has_mailing_source(county: str, state: str) -> bool:
 def _resolve_bulk_mailing(county_key: str, parcel_ids: list[str]) -> dict:
     """Bulk-source answers for these parcels, keyed by caller id. Never raises."""
     try:
-        if county_key == "snohomish_WA":
+        source = _BULK_MAILING_SOURCES.get(county_key)
+        if source is None:
+            return {}
+        if source.startswith("pacs_"):
+            from src.scrapers.enrichment.pacs_parcel import resolve_mailing as _pacs
+
+            return _pacs(county_key[: -len("_WA")], parcel_ids)
+        if source == "snohomish_assessor_roll":
             from src.scrapers.enrichment.snohomish_assessor_roll import resolve_mailing
-        elif county_key == "clark_WA":
+        elif source == "clark_pic":
             from src.scrapers.enrichment.clark_pic import resolve_mailing
+        elif source == "thurston_assessor":
+            from src.scrapers.enrichment.thurston_assessor import resolve_mailing
         else:
             return {}
         return resolve_mailing(parcel_ids)
@@ -842,7 +867,8 @@ def batch_enrich_parcels_gis(
                     if stats is not None and pid in stats.get("county_unreached", []):
                         stats["county_unreached"].remove(pid)
                     continue
-                if outcome in ("unparsed", "request_failed"):
+                if outcome in ("unparsed", "request_failed") or (
+                        outcome == "ambiguous" and county_key not in _FREE_TO_REASK):
                     # A request WAS sent and the page was unreadable or the request failed.
                     # It still defers (below), but recovery charges it an attempt, so a
                     # parcel that never answers ends at the ceiling, not re-fetched forever.

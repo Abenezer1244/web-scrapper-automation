@@ -2040,23 +2040,25 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
             no_parcel_no_legal, has_parcel, legal_no_parcel,
         )
 
-    # Truth for the completion line: rows this county SHOULD have been able to give a
-    # mailing address for and still has none. Counted from the rows themselves rather
-    # than from what a pass happened to MARK, so a re-run cannot announce success while
-    # the same leads are still empty. Measured HERE, at the very end, because the PACS
-    # and Pierce-legal passes above can still fill a mailing address — counting it
-    # beside the GIS sweep reported addresses missing that were recovered moments later
-    # (Codex Medium).
+    # Truth for the completion line: parcel-bearing rows that still have no mailing
+    # address. Counted from the rows themselves rather than from what a pass happened
+    # to MARK, so a re-run cannot announce success while the same leads are still
+    # empty. Measured HERE, at the very end, because the PACS and Pierce-legal passes
+    # above can still fill a mailing address — counting it beside the GIS sweep
+    # reported addresses missing that were recovered moments later (Codex Medium).
+    #
+    # Counted for EVERY county, with or without a mailing source. Gating it on
+    # has_mailing_source() is what let a county with no source print "Enrichment
+    # complete: addresses added" over 1,335 leads and 0 mailing addresses (Clark job
+    # 62404bd0, 2026-10-02); "N leads have no mailing address available" is the
+    # honest line there too.
     if summary is not None:
         try:
-            from src.scrapers.enrichment.county_gis import has_mailing_source
-
-            if has_mailing_source(config.county, config.state):
-                summary["mailing_missing"] = len([
-                    res for res in all_results
-                    if not res.is_duplicate and not res.mailing_address
-                    and res.parcel_id and len(res.parcel_id.strip()) >= 6
-                ])
+            summary["mailing_missing"] = len([
+                res for res in all_results
+                if not res.is_duplicate and not res.mailing_address
+                and res.parcel_id and len(res.parcel_id.strip()) >= 6
+            ])
         except Exception as exc:  # noqa: BLE001 -- a report must never fail the job
             _logger.warning("mailing_missing count skipped: %s", str(exc)[:120])
 

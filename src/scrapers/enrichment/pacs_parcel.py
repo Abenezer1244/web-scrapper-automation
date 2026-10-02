@@ -115,7 +115,7 @@ _TIMEOUT_S = 25
 _RETRY_BACKOFF_S = 8.0
 # One call's wall-clock budget; parcels past it defer to mailing recovery.
 # ponytail: fixed budget per call, pass one in from the caller if a job needs more.
-CALL_BUDGET_S = 240.0
+CALL_BUDGET_S = 120.0  # the recovery tick shares 480 s across every county
 _LEASE_WAIT_S = 10.0
 
 

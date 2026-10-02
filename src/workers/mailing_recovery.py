@@ -629,7 +629,15 @@ def recover_deferred_gis_mailing() -> dict:
             ).all()
         db.rollback()  # release the read snapshot before any network I/O
 
+        # Page-based sources (Clark, the PACS counties, Thurston) each spend up to
+        # their own call budget, so the tick stops starting new counties once its own
+        # budget is gone. Counties it did not reach keep their rows untouched; they
+        # are still the oldest in the queue, so the next tick takes them first.
+        started = time.monotonic()
         for county, parcels in by_county.items():
+            if time.monotonic() - started > _TICK_BUDGET_S:
+                stats["counties_deferred"] = stats.get("counties_deferred", 0) + 1
+                continue
             rows = rows_by_county.get(county) or []
             if not rows:
                 continue

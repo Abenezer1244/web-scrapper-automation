@@ -5096,6 +5096,21 @@ line as `  injection ...`; it reads `  fault injection ...`) before writing anyt
     the hung publish entered.
   - 57 tests pass. Mutations on the changed lines: 12/12 caught (runner 42 mutants: 41
     caught + the equivalent AO5).
+- **Codex r3 (on `82622fbe`): NO-GO, 1 P2 + 1 P3.** r2 CLOSED; Codex confirmed the real quote
+  route never writes a payload the stricter validation refuses (stops, int `remaining`,
+  5/8-cent prices, `USD`, `2026-06`), and that `caplog` sees the `api.jobs` logger.
+  - (P2) `json.loads` accepts `NaN` / `Infinity`, which then failed the jsonb cast (a 500).
+  - (P3) the stop scan missed `AnnAssign`.
+  - Fixed in `8e57fc65` (`parse_constant`; the scan covers Assign + AnnAssign and fails on
+    a computed stop).
+- **Codex r4 (on `8e57fc65`): NO-GO, 1 P2, and it REFUTED my reasoning.** I had argued that
+  no non-finite float could reach the snapshot once the constants were refused. Wrong:
+  `1e9999` is a valid JSON NUMBER that Python reads as `inf`. Fixed in `5fa54e83` at the
+  SINK, not the parse: `_snapshot_json` serializes once, before the transaction, with
+  `allow_nan=False` and no `\u0000` (jsonb refuses both) → 409 `quote_unsupported`;
+  `parse_constant` dropped as redundant. I also closed the same class proactively: a NUL
+  byte in `currency` / `pricing_version` (text columns) is refused. 64 tests; the 4 new
+  mutants are caught (runner: 45 mutants, 44 caught + the equivalent AO5).
 - **Codex diff review r1: NO-GO, 1 P1 + 3 P2 + 1 P3, all fixed in `c840ea45`:**
   - the post-commit import + publish are guarded (P1);
   - strict validation of the stored payload → 409 `quote_unsupported` (naive expiry,

@@ -19,6 +19,102 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-10-01 — Landing: scroll story, a dark site and its revert, landing JS, and the sign-in link that ate clicks (bridgeleads-web #189–#197)
+
+> Frontend repo only (`bridgeleads-web`). Plan and review log: `tasks/todo-landing-scroll-story.md`
+> there. Handoff: `docs/HANDOFF-landing-scroll-dark-2026-10-01.md` (local, untracked in the main BE checkout).
+
+**Built / Shipped (all merged and verified live on bridgeleads.io):**
+- **#189** (`16257ac6`): the landing told as one record's trip (filed → matched → enriched →
+  delivered).
+  - GSAP is lazy-loaded only when a section is near and its media query matches.
+  - CSS `position: sticky` does the pinning, so there are no pin-spacers.
+  - The scroll length is reserved in SSR CSS; the 12-gate Playwright suite measured layout shift 0.000 over a full scroll at 320–1440.
+  - Real WA county geometry comes from us-atlas, converted once offline.
+  - The hero shows an honest miss ("1 phone found · no email").
+- **#190** (`c6879c87`): design-review fixes. 44px touch targets; small text collapsed to three
+  sizes.
+- **#192** (`4564ad2c`) and **#193** (`4efadc1a`): the owner chose "dark, like the app", then
+  found it "looks so off" next to /login, /register and the app, which are all light.
+  - #193 reverts #192; the site is light again.
+  - #193 also: the closing trail runs vertically below `sm` (three labels needed ~360px in a 280px
+    row), /pricing plan names are h2 (axe heading-order, a11y 98 → 100), and the /register
+    consent line flows as text (`Label` is flex, which made each link its own column).
+- **#195** (`753f7c3e`): the auth pages use the site's wordmark, not a teal "B" tile.
+- **#196** (`c6ba12cb`), mobile TBT:
+  - **Providers moved.** The root layout wrapped every route in next-auth `SessionProvider`
+    (plus a `/api/auth/session` fetch), react-query, `MotionConfig`, `TooltipProvider` and
+    sonner. Now only `ThemeProvider` sits at the root. `AppProviders` lives in the (auth) and
+    (dashboard) layouts.
+  - **No prefetch from marketing.** Marketing `<Link>`s to /register and /login are
+    `prefetch={false}` (the mobile menu uses plain `<a>`, which never prefetches).
+  - **Results.** Landing initial JS went from 266KB to 211KB gzip. Late scripts went from 9 to
+    1 (the prefetch was pulling zod + next-auth). In a local interleaved A/B (12 runs each, 4x
+    CPU), the blocking median went from 1251ms to 715ms.
+- **#197** (`8a51bb5d`): "Create one free" on /login, "Sign in" on /register and the
+  forgot-password links did nothing on the first click. See Caught & fixed.
+
+**Tried / Decided:**
+- **Light vs dark.** The owner was offered dark auth pages or a dark app, and chose to revert
+  the dark marketing site instead. Site and sign-in are light; the app keeps its own user light/dark toggle.
+- **Theme provider placement.** Codex's plan consult said to keep `next-themes` at the root, or
+  dark-mode users lose the html class on marketing and on not-found/error. Adopted.
+- **`prefetch={false}` on sign-up links.** Measured before deciding: 1381ms → 501ms blocking.
+  The cost is that the first click into sign-up fetches its code on click.
+- **Form validation timing.** The auth forms now validate on submit and re-validate on change,
+  not on blur. The rejected alternatives:
+  - `onTouched` still validates on the first blur.
+  - Dropping `autoFocus` only masks the problem until a user focuses a field.
+  - Reserving space for error lines works but isn't needed.
+
+**Failed / Blocked (honest record):**
+- **Eager GSAP** cost +64KB and doubled mobile TBT. Fixed by lazy loading (#189).
+- **Moving the providers did nothing at first.** `ThemeProvider` was exported from
+  `providers.tsx`, so importing it at the root dragged the whole provider graph back into every
+  page; the initial JS stayed at 854KB. It works only as its own module
+  (`components/theme-provider.tsx`).
+- **A conflict marker reached a commit.** During the #192 revert, my Python conflict resolver
+  failed ("No Python", since anaconda is gone), I staged the file anyway, and the
+  `<<<<<<<` markers were committed. Caught by grep and amended before the push.
+- **Production TBT is unproven.** The deploy URLs sit behind Vercel auth, so production
+  before/after couldn't be A/B'd. One prod batch before the merge measured 437ms; four after
+  measured 596–985ms. This box can't resolve that; use real-user data (Speed Insights).
+- **Two wrong first reads of the auth bug.** Codex blamed the provider move, which was refuted
+  because production failed without it. I read the repeated `?_rsc=` fetches as a
+  router retry loop; they were hover prefetches.
+- **A broken deploy wait.** The "wait for deploy" script matched 0 chunks, because production
+  serves `/_next/static/immutable/chunks/`, and reported "live" immediately. The rewritten script
+  counts the chunks and checks for SessionProvider.
+
+**Caught & fixed:**
+- **The auth "dead link" (#197), a live P1.** The first field has `autoFocus`, and react-hook-form
+  used `mode: "onBlur"`. Mousedown on a link below the form blurred the field. "Enter a valid
+  email address" then rendered and pushed the link 12–24px down before mouseup, so the click never
+  landed.
+  - Bisected in `next dev`: bare pages ✓, bare page inside AuthShell ✓, the real form ✗, blur
+    first then click ✓ (production too).
+  - Gate: the link moves 0px on mousedown and navigates on the first click, in chromium and
+    webkit, on production.
+
+**Pending / Handoff:**
+- Real iPhone test (owner).
+- The backend `/billing/pricing` comparison is drifted ("22 counties", Pro "Per-lookup", team
+  members 5). The landing renders from `data.ts` instead.
+- Production TBT: confirm with real-user data.
+
+**Facts learned:**
+- **Local Next is older than production.** The shared `node_modules` in the main FE checkout is
+  Next **16.1.7**, but package.json/lock pin **16.3.5** (what a clean install from the lockfile gets).
+  Local perf numbers are on the older Next.
+- **Where a provider is imported decides where it ships.** A client provider exported from a
+  module that also imports heavy libraries ships them all; the importing layout, not the
+  render tree, decides.
+- **"The click does nothing" with a silent console:** measure the target's
+  `getBoundingClientRect` across mousedown before suspecting the router.
+- **App Router `prefetch={false}`** disables both viewport and hover prefetch.
+
+---
+
 ## 2026-10-01 — Contact lookup 1b-2: O-C (skip-trace billing decides on what was SENT) and O-D (the worker DELETE grant)
 
 > The two hard gates before 2d (the confirm endpoint that makes contact lookup live). O-C closes

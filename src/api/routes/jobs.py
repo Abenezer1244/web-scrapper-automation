@@ -1341,9 +1341,18 @@ return 0
 """
 
 
+_PG_INT_MAX = 2_147_483_647  # contact_lookup_actions.unit_price_cents is INTEGER
+_QUOTE_STOPS = (None, "cap", "credit_cap", "scan_limit")  # the planner's window.stopped
+
+
+def _is_count(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 0
+
+
 def _valid_quote_payload(quote: dict):
-    """(expires_at, unique quoted ids) when the stored quote is complete and well-formed,
-    else None. A corrupt payload is refused as unsupported, never a 500 (2d review r1)."""
+    """(expires_at, unique quoted ids, truncated) when the stored quote is complete and
+    well-formed, else None. A corrupt payload is refused as unsupported, never a 500
+    (2d reviews r1, r2)."""
     try:
         expires_at = datetime.fromisoformat(quote["expires_at"])
         if expires_at.tzinfo is None:
@@ -1354,13 +1363,15 @@ def _valid_quote_payload(quote: dict):
         ids = list(dict.fromkeys(str(uuid.UUID(str(i))) for i in raw_ids))
         price, cur, pv = (quote["unit_price_cents"], quote["currency"],
                           quote["pricing_version"])
+        stopped, remaining = quote["stopped"], quote["remaining"]
     except (KeyError, TypeError, ValueError, AttributeError):
         return None
-    if not (isinstance(price, int) and not isinstance(price, bool) and price > 0
+    if not (_is_count(price) and 0 < price <= _PG_INT_MAX
             and isinstance(cur, str) and len(cur) == 3
-            and isinstance(pv, str) and 0 < len(pv) <= 32):
+            and isinstance(pv, str) and 0 < len(pv) <= 32
+            and stopped in _QUOTE_STOPS and _is_count(remaining)):
         return None
-    return expires_at, ids
+    return expires_at, ids, stopped is not None and remaining > 0
 
 
 def _confirm_refusal(status_code: int, code: str, message: str) -> HTTPException:
@@ -1506,6 +1517,8 @@ async def confirm_contact_lookups(
         quote = json.loads(raw)
     except ValueError:
         quote = {}
+    if not isinstance(quote, dict):  # valid JSON, but not a quote object
+        quote = {}
     if quote.get("v") != 2:
         raise _confirm_refusal(status.HTTP_409_CONFLICT, "quote_unsupported",
                                "This quote cannot be confirmed. Please get a new quote.")
@@ -1516,7 +1529,7 @@ async def confirm_contact_lookups(
     if valid is None:
         raise _confirm_refusal(status.HTTP_409_CONFLICT, "quote_unsupported",
                                "This quote cannot be confirmed. Please get a new quote.")
-    expires_at, ids = valid
+    expires_at, ids, truncated = valid
     if expires_at <= now:
         raise _quote_expired()
     if not ids:
@@ -1524,7 +1537,6 @@ async def confirm_contact_lookups(
                                "This quote offered no leads to look up.")
 
     action_id = str(uuid.uuid4())
-    truncated = quote.get("stopped") is not None and (quote.get("remaining") or 0) > 0
     snapshot = {  # what the quote showed, frozen with the action (V6)
         k: quote.get(k) for k in (
             "counts", "examined", "stopped", "remaining", "window_end", "policy",

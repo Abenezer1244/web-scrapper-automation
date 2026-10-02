@@ -511,7 +511,7 @@ async def test_a_stamp_the_database_refuses_still_accepts_the_purchase(
 
 
 async def test_a_busy_publisher_is_skipped_and_never_waited_on(
-    db, client, business_user, business_token, _lookups_on, published,
+    db, client, business_user, business_token, _lookups_on, published, caplog,
 ):
     """AO3: with both publish slots held (a broker stall in progress), the confirm
     does not wait: it accepts, and the reconciler publishes later."""
@@ -530,6 +530,7 @@ async def test_a_busy_publisher_is_skipped_and_never_waited_on(
 
     assert r.status_code == 202, r.text
     assert published == []
+    assert "publish skipped (broker busy)" in caplog.text  # skipped, not bypassed
     assert _action(r.json()["action_id"]).dispatched_at is None
     assert elapsed < 3.0, elapsed
 
@@ -546,6 +547,11 @@ async def test_a_busy_publisher_is_skipped_and_never_waited_on(
     {"currency": "DOLLARS"},
     {"pricing_version": ""},
     {"pricing_version": "v" * 33},
+    {"unit_price_cents": 2_147_483_648},             # overflows the INTEGER column
+    {"stopped": "credit_cap", "remaining": "3"},
+    {"remaining": -1},
+    {"remaining": None},
+    {"stopped": "not_a_planner_stop"},
 ])
 async def test_a_corrupt_stored_quote_is_refused_never_a_500(
     db, client, business_user, business_token, redis_client, _lookups_on, published, corrupt,
@@ -579,13 +585,14 @@ async def test_quoted_ids_held_in_a_mapping_are_refused_not_bought(
     assert _actions_of(business_user.id) == 0
 
 
+@pytest.mark.parametrize("raw", ["{not json", "[]", "null", '"a string"', "1"])
 async def test_an_unreadable_stored_quote_is_refused_never_a_500(
-    db, client, business_user, business_token, redis_client, _lookups_on, published,
+    db, client, business_user, business_token, redis_client, _lookups_on, published, raw,
 ):
     job = _job(business_user.id)
     _seed(business_user.id, job, [{}])
     qid = await _quoted(client, business_token, job)
-    redis_client.set(jobs_routes._quote_key(business_user.id, job, "new"), "{not json", ex=600)
+    redis_client.set(jobs_routes._quote_key(business_user.id, job, "new"), raw, ex=600)
 
     r = await _confirm(client, business_token, job, qid)
 
@@ -653,7 +660,7 @@ async def test_the_publish_never_retries_inside_the_request(
 
 
 async def test_a_worker_module_that_fails_to_import_still_accepts_the_purchase(
-    db, client, business_user, business_token, _lookups_on, monkeypatch,
+    db, client, business_user, business_token, _lookups_on, monkeypatch, caplog,
 ):
     """FAULT INJECTION (labelled): the worker module cannot be imported after the
     purchase committed (2d review r1, P1). 202, and `dispatched_at` stays NULL for P3."""
@@ -669,6 +676,7 @@ async def test_a_worker_module_that_fails_to_import_still_accepts_the_purchase(
     assert r.status_code == 202, r.text
     a = _action(r.json()["action_id"])
     assert (a.status, a.dispatched_at) == ("dispatching", None)
+    assert "publish not attempted" in caplog.text  # the import really failed
 
 
 def _all_slots_free() -> bool:
@@ -682,13 +690,17 @@ def _all_slots_free() -> bool:
 async def test_the_publish_helper_never_raises_and_frees_its_slot(monkeypatch):
     """FAULT INJECTION (labelled): the broker refuses. The helper itself answers False
     (its contract, not only the route's guard) and its slot comes back."""
+    attempts: list[str] = []
+
     def refused(*args, **kwargs):
+        attempts.append("refused")
         raise ConnectionError("injected: broker refused the publish")
 
     monkeypatch.setattr(cla.lookup_contacts, "apply_async", refused)
 
     assert await jobs_routes._publish_contact_lookup(cla.lookup_contacts,
                                                      str(uuid.uuid4())) is False
+    assert attempts == ["refused"]
     for _ in range(50):
         if _all_slots_free():
             break
@@ -699,13 +711,17 @@ async def test_the_publish_helper_never_raises_and_frees_its_slot(monkeypatch):
 
 async def test_a_pool_that_will_not_start_the_publish_frees_the_slot(monkeypatch):
     """FAULT INJECTION (labelled): the executor refuses the job (e.g. shut down)."""
+    attempts: list[str] = []
+
     def no_threads(*args, **kwargs):
+        attempts.append("submit")
         raise RuntimeError("injected: cannot schedule new futures after shutdown")
 
     monkeypatch.setattr(jobs_routes._publish_pool, "submit", no_threads)
 
     assert await jobs_routes._publish_contact_lookup(cla.lookup_contacts,
                                                      str(uuid.uuid4())) is False
+    assert attempts == ["submit"]
     assert _all_slots_free()
 
 
@@ -753,9 +769,10 @@ async def test_a_publish_that_hangs_is_bounded_and_frees_its_slot(
     job = _job(business_user.id)
     _seed(business_user.id, job, [{}])
     qid = await _quoted(client, business_token, job)
-    release = threading.Event()
+    release, entered = threading.Event(), threading.Event()
 
     def hangs(*args, **kwargs):
+        entered.set()
         release.wait(20)
 
     monkeypatch.setattr(cla.lookup_contacts, "apply_async", hangs)
@@ -765,6 +782,7 @@ async def test_a_publish_that_hangs_is_bounded_and_frees_its_slot(
     release.set()
 
     assert r.status_code == 202, r.text
+    assert entered.is_set()  # the publish really started and hung
     assert elapsed < 6.0, elapsed
     assert _action(r.json()["action_id"]).dispatched_at is None
     for _ in range(50):  # the publish thread returns and releases its slot
@@ -774,6 +792,23 @@ async def test_a_publish_that_hangs_is_bounded_and_frees_its_slot(
     else:
         pytest.fail("the hung publish never released its slot")
     jobs_routes._publish_slots.release()
+
+
+def test_the_confirm_accepts_every_stop_the_planner_can_record():
+    """`_QUOTE_STOPS` mirrors `window.stopped`. A new stop reason in the planner that
+    the confirm does not know would refuse every such quote as unsupported."""
+    import ast
+    import inspect
+
+    from src.api import contact_lookup_planner as planner
+
+    assigned = {
+        n.value.value for n in ast.walk(ast.parse(inspect.getsource(planner)))
+        if isinstance(n, ast.Assign) and isinstance(n.value, ast.Constant)
+        and any(isinstance(t, ast.Attribute) and t.attr == "stopped" for t in n.targets)
+    }
+    assert assigned, "no `.stopped = ...` assignment found: the scan is stale"
+    assert assigned <= set(jobs_routes._QUOTE_STOPS), assigned
 
 
 def test_the_api_never_imports_the_worker_module_at_load():

@@ -1521,6 +1521,80 @@
         "title": "ContactLookupExcluded",
         "type": "object"
       },
+      "ContactLookupList": {
+        "description": "A run's newest contact-lookup actions (at most 20), newest first.",
+        "properties": {
+          "actions": {
+            "items": {
+              "$ref": "#/components/schemas/ContactLookupSummary"
+            },
+            "title": "Actions",
+            "type": "array"
+          }
+        },
+        "required": [
+          "actions"
+        ],
+        "title": "ContactLookupList",
+        "type": "object"
+      },
+      "ContactLookupOutcomes": {
+        "description": "Every lead the action quoted, each in exactly one bucket; they add up to\n`quoted_count`. Only `found` and `not_found` count as billable lookups (taken from\nthe included allowance first, then overage). `pending`: not decided yet;\n`in_progress`: bought and being looked up; `not_found_no_charge`: the provider could\nnot match it and it was not billed; `reused_no_charge`: answered from an earlier\nlookup; `already_answered` / `already_in_progress`: answered or being looked up\nelsewhere, not bought again; `not_eligible`: no longer eligible when the lookups\nran; `not_looked_up`: never sent, nothing charged.",
+        "properties": {
+          "already_answered": {
+            "default": 0,
+            "title": "Already Answered",
+            "type": "integer"
+          },
+          "already_in_progress": {
+            "default": 0,
+            "title": "Already In Progress",
+            "type": "integer"
+          },
+          "found": {
+            "default": 0,
+            "title": "Found",
+            "type": "integer"
+          },
+          "in_progress": {
+            "default": 0,
+            "title": "In Progress",
+            "type": "integer"
+          },
+          "not_eligible": {
+            "default": 0,
+            "title": "Not Eligible",
+            "type": "integer"
+          },
+          "not_found": {
+            "default": 0,
+            "title": "Not Found",
+            "type": "integer"
+          },
+          "not_found_no_charge": {
+            "default": 0,
+            "title": "Not Found No Charge",
+            "type": "integer"
+          },
+          "not_looked_up": {
+            "default": 0,
+            "title": "Not Looked Up",
+            "type": "integer"
+          },
+          "pending": {
+            "default": 0,
+            "title": "Pending",
+            "type": "integer"
+          },
+          "reused_no_charge": {
+            "default": 0,
+            "title": "Reused No Charge",
+            "type": "integer"
+          }
+        },
+        "title": "ContactLookupOutcomes",
+        "type": "object"
+      },
       "ContactLookupPause": {
         "description": "Whether the daily lookup limit is pausing lookups for this account.\n\n`unknown` means the state could not be read right now, never \"not paused\".\n`advanced_resume_at` is `\"never\"` when address-only (advanced) lookups cannot\nrun under the current limit at all; normal lookups may still run.",
         "properties": {
@@ -1716,6 +1790,243 @@
           }
         },
         "title": "ContactLookupQuoteRequest",
+        "type": "object"
+      },
+      "ContactLookupStatus": {
+        "description": "What a confirmed \"look up contacts\" action has bought so far. `settled`,\n`failed` and `expired` are final; poll every 5 seconds or slower until then.\n`billable` = `found + not_found`. `pause` is set only while lookups can still wait\non the daily limit, else null.",
+        "properties": {
+          "action_id": {
+            "title": "Action Id",
+            "type": "string"
+          },
+          "billable": {
+            "title": "Billable",
+            "type": "integer"
+          },
+          "category": {
+            "enum": [
+              "new",
+              "already_delivered"
+            ],
+            "title": "Category",
+            "type": "string"
+          },
+          "claimed_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Claimed At"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "currency": {
+            "title": "Currency",
+            "type": "string"
+          },
+          "outcomes": {
+            "$ref": "#/components/schemas/ContactLookupOutcomes"
+          },
+          "pause": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ContactLookupPause"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "quoted_count": {
+            "title": "Quoted Count",
+            "type": "integer"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "lookups_switched_off",
+                  "retrying",
+                  "plan_not_eligible",
+                  "account_inactive",
+                  "run_unavailable",
+                  "leads_changed",
+                  "not_started_in_time",
+                  "under_review",
+                  "other"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "settled_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Settled At"
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Started At"
+          },
+          "status": {
+            "enum": [
+              "dispatching",
+              "running",
+              "claimed",
+              "settled",
+              "failed",
+              "expired"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "status_changed_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status Changed At"
+          },
+          "truncated": {
+            "title": "Truncated",
+            "type": "boolean"
+          },
+          "unit_price_cents": {
+            "title": "Unit Price Cents",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "action_id",
+          "category",
+          "status",
+          "quoted_count",
+          "truncated",
+          "outcomes",
+          "billable",
+          "unit_price_cents",
+          "currency",
+          "created_at"
+        ],
+        "title": "ContactLookupStatus",
+        "type": "object"
+      },
+      "ContactLookupSummary": {
+        "description": "One action of a run, for finding it again; its counts are on the status route.",
+        "properties": {
+          "action_id": {
+            "title": "Action Id",
+            "type": "string"
+          },
+          "category": {
+            "enum": [
+              "new",
+              "already_delivered"
+            ],
+            "title": "Category",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "quoted_count": {
+            "title": "Quoted Count",
+            "type": "integer"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "lookups_switched_off",
+                  "retrying",
+                  "plan_not_eligible",
+                  "account_inactive",
+                  "run_unavailable",
+                  "leads_changed",
+                  "not_started_in_time",
+                  "under_review",
+                  "other"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "settled_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Settled At"
+          },
+          "status": {
+            "enum": [
+              "dispatching",
+              "running",
+              "claimed",
+              "settled",
+              "failed",
+              "expired"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "truncated": {
+            "title": "Truncated",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "action_id",
+          "category",
+          "status",
+          "quoted_count",
+          "truncated",
+          "created_at"
+        ],
+        "title": "ContactLookupSummary",
         "type": "object"
       },
       "ContactLookupUnavailableDetail": {
@@ -7308,6 +7619,78 @@
       }
     },
     "/jobs/{job_id}/contact-lookups": {
+      "get": {
+        "description": "A run's newest contact-lookup actions, so a reloaded page can find them again.",
+        "operationId": "list_contact_lookups_jobs__job_id__contact_lookups_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "title": "Job Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "category",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "new",
+                    "already_delivered"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Category"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ContactLookupList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "description": "No such run for this account."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "429": {
+            "description": "Too many requests: the account's general budget, 60 per minute."
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "List Contact Lookups",
+        "tags": [
+          "jobs"
+        ]
+      },
       "post": {
         "description": "Buy the lookups a quote offered. Idempotent: the same quote returns the same\naction. Accepted (202): the lookups are queued by a worker shortly after.",
         "operationId": "confirm_contact_lookups_jobs__job_id__contact_lookups_post",
@@ -7506,6 +7889,69 @@
           }
         ],
         "summary": "Quote Contact Lookups",
+        "tags": [
+          "jobs"
+        ]
+      }
+    },
+    "/jobs/{job_id}/contact-lookups/{action_id}": {
+      "get": {
+        "description": "What a confirmed contact-lookup action has bought so far. Final once `status` is\n`settled`, `failed` or `expired`.",
+        "operationId": "get_contact_lookup_jobs__job_id__contact_lookups__action_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "title": "Job Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "action_id",
+            "required": true,
+            "schema": {
+              "title": "Action Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ContactLookupStatus"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "description": "No such contact lookup on this run for this account."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "429": {
+            "description": "Too many requests: the account's general budget, 60 per minute. Poll every 5 seconds or slower."
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Get Contact Lookup",
         "tags": [
           "jobs"
         ]

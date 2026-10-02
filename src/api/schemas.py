@@ -2115,6 +2115,83 @@ class ContactLookupConfirmErrorResponse(BaseModel):
     detail: ContactLookupConfirmErrorDetail
 
 
+# ─── Contact lookups: the status (Phase 1b-2e) ───────────────────────────────
+
+# Why an action is waiting, failed or expired, in the customer's words. `retrying`:
+# it is handed back and tried again by itself. `under_review`: a lead's outcome needs a
+# person to confirm it; nothing more is charged meanwhile. `other`: a reason this API
+# does not name yet.
+ContactLookupReason = Literal[
+    "lookups_switched_off", "retrying", "plan_not_eligible", "account_inactive",
+    "run_unavailable", "leads_changed", "not_started_in_time", "under_review", "other",
+]
+
+
+class ContactLookupOutcomes(BaseModel):
+    """Every lead the action quoted, each in exactly one bucket; they add up to
+    `quoted_count`. Only `found` and `not_found` count as billable lookups (taken from
+    the included allowance first, then overage). `pending`: not decided yet;
+    `in_progress`: bought and being looked up; `not_found_no_charge`: the provider could
+    not match it and it was not billed; `reused_no_charge`: answered from an earlier
+    lookup; `already_answered` / `already_in_progress`: answered or being looked up
+    elsewhere, not bought again; `not_eligible`: no longer eligible when the lookups
+    ran; `not_looked_up`: never sent, nothing charged."""
+
+    pending: int = 0
+    in_progress: int = 0
+    found: int = 0
+    not_found: int = 0
+    not_found_no_charge: int = 0
+    reused_no_charge: int = 0
+    already_answered: int = 0
+    already_in_progress: int = 0
+    not_eligible: int = 0
+    not_looked_up: int = 0
+
+
+class ContactLookupStatus(BaseModel):
+    """What a confirmed "look up contacts" action has bought so far. `settled`,
+    `failed` and `expired` are final; poll every 5 seconds or slower until then.
+    `billable` = `found + not_found`. `pause` is set only while lookups can still wait
+    on the daily limit, else null."""
+
+    action_id: str
+    category: Literal["new", "already_delivered"]
+    status: Literal["dispatching", "running", "claimed", "settled", "failed", "expired"]
+    reason: ContactLookupReason | None = None
+    quoted_count: int
+    truncated: bool
+    outcomes: ContactLookupOutcomes
+    billable: int
+    unit_price_cents: int
+    currency: str
+    created_at: datetime
+    started_at: datetime | None = None
+    claimed_at: datetime | None = None
+    settled_at: datetime | None = None
+    status_changed_at: datetime | None = None
+    pause: ContactLookupPause | None = None
+
+
+class ContactLookupSummary(BaseModel):
+    """One action of a run, for finding it again; its counts are on the status route."""
+
+    action_id: str
+    category: Literal["new", "already_delivered"]
+    status: Literal["dispatching", "running", "claimed", "settled", "failed", "expired"]
+    reason: ContactLookupReason | None = None
+    quoted_count: int
+    truncated: bool
+    created_at: datetime
+    settled_at: datetime | None = None
+
+
+class ContactLookupList(BaseModel):
+    """A run's newest contact-lookup actions (at most 20), newest first."""
+
+    actions: list[ContactLookupSummary]
+
+
 # ─── Live run (SSE) ───────────────────────────────────────────────────────────
 
 class LogLine(BaseModel):

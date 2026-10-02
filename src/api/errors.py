@@ -14,8 +14,12 @@ plain ``{"detail": "<sentence>"}``.
 
 from __future__ import annotations
 
+import os
 from datetime import datetime
 
+import asyncpg
+import asyncpg.exceptions as _pg
+import sqlalchemy.exc as _sa
 from fastapi import HTTPException, Request, status
 from fastapi.responses import JSONResponse
 
@@ -61,3 +65,69 @@ async def run_refused_handler(request: Request, exc: RunRefusedHTTPException) ->
         content=body.model_dump(mode="json"),
         headers=exc.headers,
     )
+
+
+# ─── Database unreachable → 503 ──────────────────────────────────────────────
+# 2026-10-01: the database stopped answering and every DB route, login included,
+# returned the generic 500, which the app shows as "Something went wrong", the
+# same as a bug. DatabaseUnavailableMiddleware (src/api/middleware/) asks this
+# function whether an uncaught exception means the database could not be
+# reached, and answers 503 + Retry-After when it does.
+#
+# Deliberately narrow; anything not matched stays a 500:
+#   * QueryCanceledError (57014, statement timeout) is not here: a slow query is
+#     as likely a bug as an outage.
+#   * Supavisor's "tenant/user not found" (an InternalServerError, XX000) is not
+#     here: a paused or misrouted project is not fixed by retrying in 30 s.
+#   * CancelledError is control flow, never an availability signal.
+# Connect failures are NOT wrapped by SQLAlchemy: a refused port or a connect
+# timeout escapes as a bare ConnectionRefusedError / TimeoutError. Those builtins
+# also come from outbound HTTP and app-level timeouts, so they count only when
+# raised inside asyncpg.
+
+_UNAVAILABLE = (
+    _pg.PostgresConnectionError,   # class 08, e.g. 08006 "authentication did not complete"
+    _pg.CannotConnectNowError,     # 57P03, server starting up or shutting down
+    _pg.TooManyConnectionsError,   # 53300
+    _sa.TimeoutError,              # pool checkout timed out
+)
+# realpath: a symlinked or junctioned site-packages must still match.
+_ASYNCPG_ROOT = os.path.normcase(os.path.realpath(os.path.dirname(asyncpg.__file__))) + os.sep
+# A cap on exceptions examined, beside the cycle check: real chains are a handful
+# deep, and past the cap the answer is the safe default, a 500.
+_MAX_CHAIN = 32
+
+
+def _raised_in_asyncpg(exc: BaseException) -> bool:
+    tb = exc.__traceback__
+    while tb is not None:
+        filename = os.path.normcase(os.path.realpath(tb.tb_frame.f_code.co_filename))
+        if filename.startswith(_ASYNCPG_ROOT):
+            return True
+        tb = tb.tb_next
+    return False
+
+
+def is_database_unavailable(exc: BaseException) -> bool:
+    """True when ``exc`` (or anything in its cause/context chain) means the
+    database could not be reached, as opposed to a query that failed."""
+    seen: set[int] = set()
+    pending: list[BaseException] = [exc]
+    while pending and len(seen) < _MAX_CHAIN:
+        link = pending.pop()
+        if id(link) in seen:
+            continue
+        seen.add(id(link))
+        if isinstance(link, _UNAVAILABLE):
+            return True
+        # SQLAlchemy sets this when the connection died under a statement.
+        if isinstance(link, _sa.DBAPIError) and link.connection_invalidated:
+            return True
+        if isinstance(link, (ConnectionError, TimeoutError)) and _raised_in_asyncpg(link):
+            return True
+        # Both branches: `raise X from Y` inside an except block sets them apart.
+        pending.extend(e for e in (link.__context__, link.__cause__) if e is not None)
+        # A TaskGroup raises its children's failures as one ExceptionGroup.
+        if isinstance(link, BaseExceptionGroup):
+            pending.extend(link.exceptions)
+    return False

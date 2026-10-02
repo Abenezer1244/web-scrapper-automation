@@ -1,4 +1,5 @@
 from .auth_hardening import BruteForceProtection, MfaFailureGuard, TokenBlacklist
+from .database_unavailable import DatabaseUnavailableMiddleware
 from .rate_limit import client_ip, once_per, rate_limit, release_once
 from .security import (
     SecurityHeadersMiddleware,
@@ -20,6 +21,7 @@ __all__ = [
     "BruteForceProtection",
     "MfaFailureGuard",
     "SecurityHeadersMiddleware",
+    "DatabaseUnavailableMiddleware",
     "validate_scraping_target",
     "add_scrape_domain",
     "add_http_allowed_host",

@@ -3220,6 +3220,7 @@ Response `ContactLookupAction {action_id, status, quoted_count}`.
 ### 1b-2e — `GET /jobs/{job_id}/contact-lookups/{action_id}`
 - Status, counts, and the pause state (the quote's reader), for the 1c page.
 - Files: route, schema, openapi, tests, plan.
+- **Superseded by "## Phase 1b-2e — the status endpoint (BUILD SPEC)" below 2d.**
 
 ### Questions for the consult
 1. S1 derived settlement vs 15-5's in-writer updates: what breaks?
@@ -5170,7 +5171,253 @@ line as `  injection ...`; it reads `  fault injection ...`) before writing anyt
 
   **2d is the live switch: the first customer confirm becomes possible on deploy.**
 
-## Phase 1c - the action, frontend
+### 2d MERGED + LIVE (2026-10-02): #432, merge `bd17ef2d`
+- Merged under the standing rule (quiet 4×0, CI green on the exact head, Codex GO, main
+  unchanged, `--match-head-commit`). api / worker / beat SUCCESS on `bd17ef2d`; an
+  unauthenticated POST is 401 (the route is live); worker logs clean.
+- **Contact lookups are purchasable in production from this deploy.**
+- The 2d BUILD_JOURNAL entry rides with 2e (owner, 2026-10-02).
+
+## Phase 1b-2e — the status endpoint (BUILD SPEC, 2026-10-02, BEFORE the Codex consult)
+Owner: **START 2e** (2026-10-02). Branch `feat/lookup-1b2e-status` off main `40a310f5`. The
+1c page polls this to show what a confirmed action bought; it is a READ and changes nothing.
+
+**Facts (read 2026-10-02, main `40a310f5`):**
+- Writers (the only ones): the API writes the action in `dispatching` with `quoted_count`,
+  `truncated`, the price fields and `quote_snapshot`, plus one `quoted` verdict per lead
+  (2d). The worker (`contact_lookup_action.py`) and the reconciler
+  (`scheduler_helpers/contact_lookups.py`) write every later status, `status_reason`,
+  verdict and count, through `_move` / `_flag` / `_set_verdicts`.
+- `status_reason` values, by status (all literal in code today):
+  - `dispatching`: NULL (fresh), `kill_switch`, `claim_lock_busy`, `claim_unenforced`,
+    `worker_error` (the worker handed it back, `_wait`), `lease_expired` (P2);
+  - `failed`: `job_not_delivered`, `plan_not_eligible`, `access_starter|frozen|ended`,
+    `quoted_set_mismatch`;
+  - `expired`: `deadline` (P1);
+  - `claimed`: NULL, or a flag for a human: `pending_row_missing`,
+    `result_state_unexpected`, `billing_decision_unknown`,
+    `provider_reconciliation_required`;
+  - `running`, `settled`: NULL.
+- The counts on the action are a CACHE (101: "fully recomputable" from the verdicts):
+  `claimed_count`, `reused_count`, `newly_queued_count`, `tracerfy_credits` are written
+  once at claim; `billable_rows` on every P4 visit. The verdict rows are the truth and
+  move AFTER the claim (`newly_queued` → a terminal answer), so the claim-time counts go
+  stale by design.
+- The verdict vocabulary is `CONTACT_LOOKUP_DISPOSITIONS` (models.py:1808, 18 values incl.
+  107's `unmatched_unbilled`; a DB CHECK holds it). Billable = `answered_hit`,
+  `answered_miss`, `unmatched_billable` (`rec._BILLABLE_VERDICTS`).
+- `dispatched_at` means "last publish ATTEMPT" once the reconciler's P3 has touched it
+  (AA7), not "dispatched": not a customer fact.
+- The pause state: `read_pause_state(r, user_id, now)` via `_bounded` on `_lookup_redis()`;
+  any failure reads `unknown`, never "not paused" (the quote, `jobs.py:1253-1256`).
+- Rate zones (`rate_limit.py:24`): `general` 60/min per user (fails OPEN on a Redis error,
+  not in `_FALLBACK_ZONES`); `writes` 30; `lookup_quote` 10.
+- Reads: `ix_contact_lookup_actions_*` (PK on `id`) and
+  `ix_contact_lookup_action_results_action_tenant (action_id, user_id)`; one action holds
+  at most 2,000 verdict rows (the planner cap).
+
+**Design:**
+- `GET /jobs/{job_id}/contact-lookups/{action_id}` → 200 `ContactLookupStatus`;
+  `get_rls_db` (RLS is the belt) and every query filters `user_id` (the suspenders).
+1. `rate_limit(zone="general", identifier=user)`, bounded by `_LOOKUP_REDIS_CALL_BOUND_S`.
+   An outer timeout → **proceed** (proposal: the `general` zone already fails open on a
+   Redis error; a read buys nothing; a polling page must not flap to 503 on a slow
+   limiter). 429 on exhaustion as usual. (Q1)
+2. `job_id = _canonical_job_id(job_id)`; `action_id` parsed the same way by a sibling
+   helper → malformed = 404, never a DataError 500.
+3. **ONE statement, one snapshot** (READ COMMITTED gives each statement its own; two
+   statements could show `status=claimed` beside verdicts already settled):
+   ```sql
+   SELECT a.category, a.status, a.status_reason, a.status_changed_at, a.quoted_count,
+          a.truncated, a.unit_price_cents, a.currency, a.created_at, a.started_at,
+          a.claimed_at, a.settled_at,
+          (SELECT COALESCE(jsonb_object_agg(d.disposition, d.n), '{}'::jsonb)
+             FROM (SELECT c.disposition, count(*) AS n
+                     FROM contact_lookup_action_results c
+                    WHERE c.action_id = a.id AND c.user_id = a.user_id
+                    GROUP BY c.disposition) d) AS outcomes
+     FROM contact_lookup_actions a
+    WHERE a.id = CAST(:a AS uuid) AND a.user_id = CAST(:u AS uuid)
+      AND a.job_id = CAST(:j AS uuid)
+   ```
+   No row → **404 "Contact lookup not found"**, identical for: no such action, another
+   tenant's, this tenant's under another job. No separate job read (the composite FK
+   ties the action to this tenant's job; a deleted job cascades its actions away).
+4. **No mutable gate** (the AO1 principle for a read): no plan, frozen/ended, kill-switch
+   or delivered check. A buyer always sees what they bought.
+5. **Counts are DERIVED, never the cache (Q2):** `outcomes` = one int per CUSTOMER
+   bucket (AP4's table; every bucket present, 0 by default; never the ledger names);
+   `billable` = `found + not_found`, i.e. lookups that count as billable (the included
+   allowance first, then overage), NOT a statement of a Stripe charge (AQ2).
+   The cached `claimed_count` / `reused_count` / `newly_queued_count` / `billable_rows`
+   are not returned. Invariant: `sum(outcomes) == quoted_count` (V1 + the claim's
+   coverage check); a test pins it, the route does not enforce it.
+6. **`reason`, a closed customer vocabulary, never the raw `status_reason`** (it carries
+   internal names like `claim_unenforced`):
+   | raw | `reason` |
+   |---|---|
+   | NULL | null |
+   | `kill_switch` | `lookups_switched_off` |
+   | `claim_lock_busy`, `claim_unenforced`, `worker_error`, `lease_expired` | `retrying` |
+   | `plan_not_eligible`, `access_starter` | `plan_not_eligible` |
+   | `access_frozen`, `access_ended` | `account_inactive` |
+   | `job_not_delivered` | `run_unavailable` |
+   | `quoted_set_mismatch` | `leads_changed` |
+   | `deadline` | `not_started_in_time` |
+   | `pending_row_missing`, `result_state_unexpected`, `billing_decision_unknown`, `provider_reconciliation_required` (the four known claimed flags, AR1) | `under_review` |
+   | anything else | `other` (a writer added a reason; never a 500) |
+7. **Pause** only while something can still wait on it (AP3): `status in (dispatching,
+   running)`, or `status = claimed` with `outcomes.in_progress > 0` → the quote's reader
+   (`_bounded(read_pause_state, ...)`, any exception → `unknown`); otherwise (a terminal
+   status, or `claimed` with nothing in progress) `pause: null` and NO Redis call. A
+   Redis failure is NEVER a 503 here.
+8. Body `ContactLookupStatus`: `action_id`, `category`, `status`, `reason`,
+   `quoted_count`, `truncated`, `outcomes`, `billable`, `unit_price_cents`, `currency`,
+   `created_at`, `started_at`, `claimed_at`, `settled_at`, `status_changed_at`, `pause`.
+   **Never:** lead ids, `quote_id`, `quote_snapshot`, `pricing_version`, the lease,
+   `dispatched_at`, `tracerfy_credits` (operator cost; the pause contract already keeps
+   spend numbers from customers), events.
+9. No audit line (a read). A DB outage is #428's service-wide 503.
+
+**Files (6, owner-approved 2026-10-02):** `src/api/routes/jobs.py`, `src/api/schemas.py`,
+`schema/openapi.json` (`$PY scripts/export_openapi.py`, then `--check`, 0 deletions vs
+main), `tests/test_contact_lookup_status.py` (NEW), this plan, and
+`docs/BUILD_JOURNAL.md` (the 2d entry, plus 2e once built; docs only).
+
+**Tests** (real PG + Redis; each state reached by the REAL quote → confirm → worker
+`cla.run_action` → reconciler `rec._reconcile_contact_lookups_impl()`; pending rows moved
+as ingest would, the reconciler tests' `_row` / `_result` / `_queue` pattern):
+- each status, with its `reason` and `outcomes`: `dispatching` (fresh); `dispatching` +
+  `lookups_switched_off` (switch off, run the worker); `claimed`; `claimed` +
+  `under_review` (a flag); `settled` (hit / miss / unmatched billed + unbilled /
+  errored / released all mapped); `failed` + `plan_not_eligible` (plan lost before the
+  worker); `expired` + `not_started_in_time` (aged past the deadline, a tick);
+- `sum(outcomes) == quoted_count` in every state; after settle, `billable` ==
+  `billable_rows` (the cache agrees once settled);
+- 404, one body for: another tenant's action, an own action under another own job, a
+  malformed `job_id`, a malformed `action_id`, a random id;
+- a buyer who lost the plan / is frozen / with the switch off still gets 200;
+- pause (AP3): a terminal status, and `claimed` with nothing in progress → `null` and
+  NO Redis call (a pass-through spy on the reader); `dispatching`, `running`, and
+  `claimed` with a lead in progress → the published state; Redis on a closed port /
+  blackholed → `unknown`, 200, within the bound;
+- the limiter: the 61st call in a minute → 429; a stalled limiter → 200 within the
+  bound (Q1);
+- the body never carries a lead id, the `quote_id` or a credit count (string scan);
+- schema pins (AP4): `ContactLookupOutcomes` fields == the AP4 bucket names; the
+  disposition → bucket map covers `CONTACT_LOOKUP_DISPOSITIONS` exactly once each; the
+  dispositions under `found` + `not_found` == `rec._BILLABLE_VERDICTS`; every raw reason
+  in the table maps, an unknown one → `other`.
+- Mutations per PR (`mut_2e.py`).
+
+**Questions for the consult:**
+1. The limiter: `general` (shared with the results list) vs a new zone (a 7th file,
+   `rate_limit.py`); fail open or 503 on a stalled limiter call?
+2. Derived counts vs the cache: any reason to return the cached ones too?
+3. The `reason` vocabulary: right grain for the page; anything leaking or missing?
+4. Pause only on non-terminal statuses: right? Should `claimed` with no lead still
+   `newly_queued` skip it too?
+5. The one-statement snapshot: is a correlated aggregate inside the action read the
+   right shape, and is its cost fine at a 5 s poll with 2,000 verdicts?
+6. 1c after a reload: the page needs the action ids of a job. Is a list route
+   (`GET /jobs/{job_id}/contact-lookups`) needed, and does it belong here (a 7th file
+   of the same kind) or in its own step before 1c?
+7. Anything that makes a read here a write, a lock or a leak (RLS, `FOR SHARE`, the
+   guards).
+
+### Codex pre-code consult r1 on 2e (2026-10-02): PLAN: REVISE, 2 P1 + 2 P2, all adopted
+Output: `<scratchpad 79ada66a>/codex_2e_consult_r1_out.txt`. Answers:
+- Q1: `general`, fail OPEN on a stalled limiter call;
+- Q2: derived counts only;
+- Q3: the reason table is complete for action-level reasons (`trial_allowance` is a
+  per-lead EVENT reason, never a `status_reason`); unknown → `other`;
+- Q5: one statement is right (a PK read + the `(action_id, user_id)` index, no lock);
+- Q7: no write, guard or lock; `bridgeleads_app` has SELECT + the RLS policy.
+
+The amendments (they supersede Design where they differ):
+- **AP1 (P1) nothing the DB may hold NULL or absent can fail response validation.**
+  `started_at`, `claimed_at`, `settled_at`, `status_changed_at` are `datetime | None`.
+  The aggregate returns only the dispositions present, so the route zero-fills every
+  bucket before building the model. Tests: a fresh `dispatching` action (all three NULL,
+  only `quoted` present) is a 200.
+- **AP2 (P1) a list route, in 2e:** `GET /jobs/{job_id}/contact-lookups` → 200
+  `ContactLookupList {actions: [ContactLookupSummary]}`, so a reloaded page can find its
+  actions. Same files (no 7th).
+  - `ContactLookupSummary` = `action_id`, `category`, `status`, `reason`, `quoted_count`,
+    `truncated`, `created_at`, `settled_at`. No outcomes and no pause (the page
+    fetches the status of the one it shows; 20 aggregates per poll would not be cheap).
+  - Query: `WHERE a.user_id = :u AND a.job_id = :j [AND a.category = :c]
+    ORDER BY a.created_at DESC, a.id DESC LIMIT 20`; uses `ix_contact_lookup_actions_job_tenant`.
+    An optional `category` query param (the tab), allowlisted (`new` /
+    `already_delivered`, else 422). No pagination: the page shows the newest; older
+    actions stay readable by id.
+  - The job is checked: `_canonical_job_id`, then `Job(id, user_id)` else 404 (an
+    empty list must not confirm or deny another tenant's job). No delivered / plan /
+    switch gate.
+  - Same limiter as the status route.
+- **AP3 (P2) pause only when something still waits on it:** `status in (dispatching,
+  running)`, or `status = claimed AND outcomes' in-progress bucket > 0`. Otherwise
+  `pause: null` and no Redis call.
+- **AP4 (P2) a customer outcome vocabulary, never the ledger names.** `outcomes` is
+  `ContactLookupOutcomes`, each bucket an int, every ledger disposition in EXACTLY one:
+  | bucket | dispositions | counts as billable |
+  |---|---|---|
+  | `pending` | `quoted` | no (not decided yet) |
+  | `in_progress` | `newly_queued` | being looked up |
+  | `found` | `answered_hit` | yes |
+  | `not_found` | `answered_miss`, `unmatched_billable` | yes |
+  | `not_found_no_charge` | `unmatched_unbilled` | no |
+  | `reused_no_charge` | `reused` | no |
+  | `already_answered` | `already_answered` | no |
+  | `already_in_progress` | `in_progress_elsewhere` | no |
+  | `not_eligible` | `ineligible`, the five `excluded_*` | no |
+  | `not_looked_up` | `abandoned`, `errored_unsubmitted`, `released` | no |
+
+  `billable = found + not_found`. Tests pin: the mapping covers
+  `CONTACT_LOOKUP_DISPOSITIONS` exactly once each; its charged set ==
+  `rec._BILLABLE_VERDICTS`; `sum(outcomes) == quoted_count`. A disposition the map does
+  not know (a writer added one) → logged and counted in `not_looked_up`? NO: it would
+  misstate a charge. It raises → 500 with a ref, and the schema-pin test fails first in
+  CI. (Q for r2.)
+- Tests added: the list route (newest first, the 20 bound, the category filter, 404 for
+  another tenant's / a malformed job, an own job with no actions → `[]`, no lead id or
+  `quote_id` in it); the pause gate on `claimed` with and without an in-progress lead.
+
+### Codex consult r2 on 2e (2026-10-02): PLAN: REVISE, 1 P1 + 2 P2, all plan text, fixed IN PLACE
+Output: `codex_2e_consult_r2_out.txt`. AP1-AP4 CLOSED. Codex verified AP4 against billing:
+all 18 dispositions in exactly one bucket; `found` + `not_found` == `_BILLABLE_VERDICTS`;
+`unmatched_billable` / `unmatched_unbilled` follow `skip_trace_queues.unmatched_billed`
+(`skip_trace_usage.py:624-663`); `errored_unsubmitted` and `released` never reached
+Tracerfy. The list route's 404 / LIMIT 20 / category are right; the ORM `Job` read under
+`get_rls_db` is tenant-safe.
+- **AQ1 (P1)** Design 5 and the schema-pin test still named the ledger dispositions as
+  fields, contradicting AP4: rewritten to the buckets (the map's coverage pinned
+  separately).
+- **AQ2 (P2)** "charged" overstated it: a billable lookup is taken from the included
+  allowance first, and only the overage reaches Stripe (`skip_trace_usage.py:158-161`).
+  The AP4 column reads **counts as billable**; `billable` is documented as "counts as a
+  billable lookup (the included allowance first, then overage)" in the schema too.
+- **AQ3 (P2)** Design 7 and the pause test still read Redis for every `claimed`: both now
+  follow AP3.
+- **AP4's open question, answered:** an unmapped disposition raises a dedicated
+  `UnmappedDispositionError` → the house catch-all `{"detail": "Internal error", "ref"}`
+  (`main.py:101-115`). Never a bucket (it could falsely state "no charge"), never a 503
+  (a code invariant, not an outage).
+- AP1 applies to `ContactLookupSummary.settled_at` too (`datetime | None`).
+
+### Codex consult r3 on 2e (2026-10-02): PLAN: REVISE, 1 P2, fixed IN PLACE
+Output: `codex_2e_consult_r3_out.txt`. AQ1-AQ3, the unknown-disposition rule and the
+nullable `settled_at` CLOSED; the rest of the section consistent with the code.
+- **AR1 (P2)** "any claimed flag" would map an unknown future claimed reason to
+  `under_review` (`status_reason` is free text and `_flag()` takes any value): the table
+  now names the four known flags; anything else, an unknown claimed reason included, is
+  `other`. Tested on both routes.
+
+### Codex consult r4 on 2e (2026-10-02): **PLAN: GO**, no findings
+Output: `codex_2e_consult_r4_out.txt`. AR1 CLOSED; every action-level `status_reason`
+literal in the worker and the reconciler matches Design 6. Build on: Design 1-9 as
+amended by AP1-AP4, AQ1-AQ3, AR1.
+
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever
       the tab has leads that have never been looked up; when the quote comes back with
       `max_new_lookups = 0` the dialog explains why (every lead is already answered, in progress,

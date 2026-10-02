@@ -37,7 +37,7 @@ def test_business_advertises_all_types_and_ten_counties():
 
 import pytest
 
-from src.api.routes.billing import pricing_page
+from src.api.routes.billing import _pricing_tables
 from src.config.constants import (
     ALL_RECORD_TYPES,
     BATCH_PLANS,
@@ -53,7 +53,7 @@ _PLAN_IDS = ("starter", "pro", "business", "agency")
 
 @pytest.mark.asyncio
 async def test_the_comparison_record_types_row_agrees_with_the_gate():
-    comparison = (await pricing_page())["comparison"]["Record types"]
+    comparison = _pricing_tables()["comparison"]["Record types"]
     assert comparison["starter"] == "Probate"
     assert comparison["pro"] == "Pre-Foreclosure, Probate, Tax Delinquent, Trustee Sale"
     for plan in ("business", "agency"):
@@ -63,7 +63,7 @@ async def test_the_comparison_record_types_row_agrees_with_the_gate():
 
 @pytest.mark.asyncio
 async def test_the_comparison_export_and_schedule_rows_agree_with_the_gates():
-    comparison = (await pricing_page())["comparison"]
+    comparison = _pricing_tables()["comparison"]
     assert comparison["Export formats"]["starter"] == "CSV"
     assert comparison["Export formats"]["pro"] == "CSV, Excel"
     assert comparison["Export formats"]["business"] == "All formats"
@@ -78,7 +78,7 @@ async def test_the_comparison_export_and_schedule_rows_agree_with_the_gates():
 @pytest.mark.asyncio
 async def test_the_comparison_skip_trace_row_carries_the_included_amount():
     """Pro read "Per-lookup", which dropped the 250 its own bullet includes."""
-    comparison = (await pricing_page())["comparison"]["Skip tracing"]
+    comparison = _pricing_tables()["comparison"]["Skip tracing"]
     assert comparison["starter"] is False
     for plan in ("pro", "business", "agency"):
         assert comparison[plan] == f"{settings.SKIP_TRACE_BUNDLED_QUOTAS[plan]:,} included"
@@ -86,7 +86,7 @@ async def test_the_comparison_skip_trace_row_carries_the_included_amount():
 
 @pytest.mark.asyncio
 async def test_the_comparison_feature_rows_agree_with_their_allowlists():
-    comparison = (await pricing_page())["comparison"]
+    comparison = _pricing_tables()["comparison"]
     for plan in _PLAN_IDS:
         assert comparison["Overlap and intersection lists"][plan] == (plan in OVERLAP_PLANS)
         assert comparison["Batch scraping"][plan] == (plan in BATCH_PLANS)
@@ -98,7 +98,7 @@ async def test_the_comparison_claims_nothing_the_product_does_not_have():
     """Team seats sat here as 1 / 1 / 5 / Unlimited with no seat model anywhere:
     no invite flow, no member table, no route. White-label is not built and has
     to keep its "coming soon" qualifier wherever it appears."""
-    comparison = (await pricing_page())["comparison"]
+    comparison = _pricing_tables()["comparison"]
     assert "Team members" not in comparison
     assert comparison["White-label"]["agency"] == "Coming soon"
     assert comparison["White-label"]["business"] is False
@@ -109,14 +109,14 @@ async def test_email_delivery_is_not_advertised_as_a_gate_nothing_enforces():
     """The row said Starter False. `deliver.emails` is accepted on every plan and
     the Starter card never claimed otherwise, so the row was the thing that was
     wrong."""
-    comparison = (await pricing_page())["comparison"]["Email delivery"]
+    comparison = _pricing_tables()["comparison"]["Email delivery"]
     assert all(comparison[plan] is True for plan in _PLAN_IDS)
 
 
 @pytest.mark.asyncio
 async def test_the_records_row_is_the_enforced_quota():
     """The row was typed by hand; it now reads PLAN_LIMITS, which the gate enforces."""
-    comparison = (await pricing_page())["comparison"]["Records per month"]
+    comparison = _pricing_tables()["comparison"]["Records per month"]
     assert comparison == {"starter": "50", "pro": "1,000", "business": "5,000", "agency": "Unlimited"}
     assert settings.PLAN_LIMITS["agency"] < 0
 
@@ -127,7 +127,7 @@ async def test_webhook_dialer_and_api_rows_follow_the_business_gate():
     below Business; the three rows say exactly that."""
     from src.config.constants import BUSINESS_FEATURES_PLANS
 
-    comparison = (await pricing_page())["comparison"]
+    comparison = _pricing_tables()["comparison"]
     for row in ("Webhook delivery", "Dialer delivery", "API access"):
         assert comparison[row] == {"starter": False, "pro": False, "business": True, "agency": True}
         assert {p for p in _PLAN_IDS if comparison[row][p]} == set(BUSINESS_FEATURES_PLANS)
@@ -140,7 +140,7 @@ async def test_the_faq_makes_no_claim_the_product_does_not_keep():
     available for 30 days after cancellation". None of it was true or enforced."""
     import re
 
-    answers = " ".join(item["a"] for item in (await pricing_page())["faq"]).lower()
+    answers = " ".join(item["a"] for item in _pricing_tables()["faq"]).lower()
     assert not re.search(r"\b\d+ (washington|wa)\b", answers)  # no hand-typed county count
     assert "30 seconds" not in answers
     assert "every lead" not in answers
@@ -148,3 +148,9 @@ async def test_the_faq_makes_no_claim_the_product_does_not_keep():
     assert "after cancellation" not in answers
     # The Starter delay IS real (test_plan_entitlement_audit), so the FAQ keeps it.
     assert "delayed 7 days" in answers
+    # And what it says instead is what the code does.
+    assert "up to the current day" in answers  # paid end_date is today (dates.py)
+    assert settings.SKIP_TRACE_BUNDLED_QUOTAS["starter"] == 0
+    assert "starter does not include lookups" in answers
+    assert all(settings.SKIP_TRACE_BUNDLED_QUOTAS[p] > 0 for p in ("pro", "business", "agency"))
+    assert "coverage page" in answers

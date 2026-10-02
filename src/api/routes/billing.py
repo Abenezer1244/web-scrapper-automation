@@ -560,11 +560,20 @@ async def pricing_page() -> dict:
 
     Public endpoint — no auth required. Used by the frontend pricing page.
     """
-    founding = await _get_founding_offer()
-
     return {
         "plans": _PLANS,
-        "founding_offer": founding,
+        "founding_offer": await _get_founding_offer(),
+        **_pricing_tables(),
+    }
+
+
+def _pricing_tables() -> dict:
+    """The comparison matrix, trial and FAQ that /billing/pricing serves.
+
+    Pure (no Stripe, no Redis), so the tests that hold these cells to the
+    gates do not depend on the founding-offer lookup in pricing_page.
+    """
+    return {
         "comparison": {
             # Derived from the quota the gate enforces, like the rows below.
             "Records per month": {

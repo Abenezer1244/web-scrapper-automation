@@ -5699,6 +5699,17 @@ Output: `codex_1c_consult_r3_out.txt`.
   delivered tab's `DeliveredLookupSummary` keeps its own polite region (a different fact, the
   tab's leads, not this action), and that file stays out of scope.
 
+### Codex consult r4 on 1c (2026-10-02): PLAN: REVISE, 1 P2, adopted; AU2-AU3 CLOSED
+Output: `codex_1c_consult_r4_out.txt`. Units verified: normal = 1 credit, address-only = 2;
+`over_trial_allowance` counts LEADS.
+- **AV1 (P2) supersedes AU1's trigger:** the planner can count a lead over the trial cap and still
+  end with `stopped = None` (no later lead fit), so `truncated_reason` is null while
+  `over_trial_allowance > 0`. The trial-cap copy shows whenever `over_trial_allowance > 0`,
+  whatever `truncated_reason` says, and reads "lifetime": "Your free trial includes
+  {trial_credit_allowance} lookup credits for its lifetime (an address-only lookup uses 2).
+  {over_trial_allowance} more leads do not fit; upgrade to look them up." "Get another quote for
+  the remaining R" is shown ONLY for `cap` / `scan_limit`.
+
 ## Safety PR: Alembic can never reach production from a test or a stray CLI run (PLAN, 2026-09-27)
 
 The Deferred bullet below, taken now. Same class as the two production wipes.

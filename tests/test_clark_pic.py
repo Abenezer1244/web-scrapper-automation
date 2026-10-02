@@ -55,35 +55,33 @@ def _clean_source_state(redis_client):
     _reset()
 
 
+def _tr(label: str, value: str) -> str:
+    return (f'<tr>\n\n    <td style="vertical-align:top;">{label}</td>\n\n'
+            f'    <td align="right">{value}</td>\n\n</tr>\n')
+
+
 def _page(pid: str, mailing_lines: list[str] | None, *, owner: str = "DOE JANE A",
           site: str = "13114 NE 144TH ST, BRUSH PRAIRIE, WA  98606",
           extra_echo: str | None = None) -> str:
-    """A PIC page in the live markup. mailing_lines=None drops the mailing cell."""
-    echo = (f'<td class="picBasicInfo1"> Property Identification Number: '
-            f'<span class="picBasicInfo2">{pid}</span></td>')
+    """A Fact Sheet in the live markup. mailing_lines=None drops the mailing row."""
+    rows = _tr("Property Account", pid)
     if extra_echo:
-        echo += (f'<td class="picBasicInfo1"> Property Identification Number: '
-                 f'<span class="picBasicInfo2">{extra_echo}</span></td>')
-    mail = ""
+        rows += _tr("Property Account", extra_echo)
+    rows += _tr("Site Address", site) + _tr("Legal Desc", "SOME PLAT LOT 1")
+    rows += _tr("Owner", owner)
     if mailing_lines is not None:
-        body = "<br />\n\t\t\t\t".join(mailing_lines)
-        mail = (f'<td class="picBasicInfo1" valign="top" width="34%">Owner Mailing Address<br />'
-                f'\n\t\t<span class="picBasicInfo2">\n\t\t\t{body}\n      </span>\t\n    </td>')
-    return f"""<html><body>
-<table><tr>{echo}</tr></table>
-<table class="picContainer"><tr>
-  <td class="picBasicInfo1" valign="top" width="33%"><div id="gis-wrapper"><div style="float:left">
-    Property Owner<br /><span class="picBasicInfo2">{owner}</span></div></div></td>
-  {mail}
-  <td class="picBasicInfo1" valign="top" width="33%">Property Site Address<br />
-    <span class="picBasicInfo2">{site}</span></td>
-</tr></table>
+        body = " \n\n\t             \t<br />".join(mailing_lines)
+        rows += _tr("Mail Address", f"\n\n    \t\t\t{body}   \n\n    ")
+    rows += _tr("Tax Status", "Regular")
+    return f"""<html><body><table>
+<tr><td colspan="2" class="txLargeBold">General Information</td></tr>
+{rows}</table>
 <div id="footerGISDisclaimer">RCW 42.56 prohibits releasing and/or using lists of individuals
 gathered from this site for commercial purposes</div></body></html>"""
 
 
-_NOT_FOUND = ("<html><body><h1>Property Information Center</h1>Street Address: Tax Account: "
-              "Search Clear Form No Records Found. Searching Options (choose one)</body></html>")
+# Clark answers an unknown account with the SAME template, account "0".
+_NOT_FOUND = _page("0", [", 0"], owner="")
 
 
 class _Resp:
@@ -98,8 +96,8 @@ def _serve(monkeypatch, pages: dict):
 
     def _get(url, *, params=None, **kw):
         assert url == cp._URL
-        pid = params["pid"]
-        assert params["account"] == pid
+        pid = params["account"]
+        assert set(params) == {"account"}
         asked.append(pid)
         answer = pages[pid]
         if isinstance(answer, list):
@@ -127,13 +125,13 @@ class TestParsePage:
         # The county printed the property's street as the mailing address, so it is
         # stored; the SITE cell is never read as mailing.
         a = cp.parse_page(_page("196948000", ["13114 NE 144TH ST",
-                                              "BRUSH PRAIRIE WA \n , 98606", "US"],
+                                              "BRUSH PRAIRIE WA \n , 98606 US"],
                                 site="1 SOMEWHERE ELSE, VANCOUVER, WA 98660"), "196948000")
         assert a.mailing_address == "13114 NE 144TH ST, BRUSH PRAIRIE, WA 98606"
 
     def test_out_of_state_mailing_is_kept(self):
-        a = cp.parse_page(_page("37915015", ["4410 E CACTUS RD", "PHOENIX AZ , 85032-1234",
-                                             "US"]), "37915015")
+        a = cp.parse_page(_page("37915015", ["4410 E CACTUS RD", "PHOENIX AZ , 85032-1234 US"]),
+                          "37915015")
         assert a.mailing_address == "4410 E CACTUS RD, PHOENIX, AZ 85032-1234"
 
     def test_po_box(self):
@@ -142,23 +140,33 @@ class TestParsePage:
         assert a.mailing_address == "PO BOX 1872, BATTLE GROUND, WA 98604"
 
     def test_unit_is_preserved_as_the_county_printed_it(self):
-        a = cp.parse_page(_page("97976264", ["311-T NE 85TH ST", "VANCOUVER WA , 98665",
-                                             "US"]), "97976264")
+        a = cp.parse_page(_page("97976264", ["311-T NE 85TH ST", "VANCOUVER WA , 98665 US"]),
+                          "97976264")
         assert a.mailing_address == "311-T NE 85TH ST, VANCOUVER, WA 98665"
         b = cp.parse_page(_page("97976264", ["900 MAIN ST", "APT 4B", "VANCOUVER WA , 98660"]),
                           "97976264")
         assert b.mailing_address == "900 MAIN ST, APT 4B, VANCOUVER, WA 98660"
 
-    def test_addressee_line_before_the_street_is_dropped(self):
-        a = cp.parse_page(_page("110089668", ["JANE A DOE REVOCABLE LIVING TRUST",
-                                              "14506 NE 31ST ST", "VANCOUVER WA , 98682"]),
-                          "110089668")
-        assert a.mailing_address == "14506 NE 31ST ST, VANCOUVER, WA 98682"
+    @pytest.mark.parametrize(("line", "street"), [
+        # The live Fact Sheet prints the addressee and the street on ONE line.
+        ("JANE A DOE REVOCABLE LIVING TRUST 14506 NE 31ST ST", "14506 NE 31ST ST"),
+        # A year inside a trust name is not a house number.
+        ("JOHN Q DOE AND JANE R DOE 2001 TRUSTS 1010 S 50TH CT", "1010 S 50TH CT"),
+        ("C/O JOHN DOE PO BOX 5", "PO BOX 5"),
+        ("JOHN DOE 900 MAIN ST", "900 MAIN ST"),
+        # Already a street: an addressee word inside it is left alone.
+        ("123 ESTATE DR", "123 ESTATE DR"),
+        # A trust name that itself STARTS with digits (Codex P1, round 6).
+        ("2001 TRUSTS 1010 S 50TH CT", "1010 S 50TH CT"),
+    ])
+    def test_addressee_in_front_of_the_street_is_dropped(self, line, street):
+        a = cp.parse_page(_page("110089668", [line, "VANCOUVER WA \n , 98682"]), "110089668")
+        assert a.mailing_address == f"{street}, VANCOUVER, WA 98682"
 
-    def test_foreign_mailing_keeps_its_country(self):
-        a = cp.parse_page(_page("37915015", ["12 HIGH ST", "LONDON SW1A 1AA",
-                                             "UNITED KINGDOM"]), "37915015")
-        assert a.mailing_address == "12 HIGH ST, LONDON SW1A 1AA, UNITED KINGDOM"
+    def test_non_us_country_is_kept(self):
+        a = cp.parse_page(_page("37915015", ["4410 E CACTUS RD", "PHOENIX AZ , 85032 MEXICO"]),
+                          "37915015")
+        assert a.mailing_address == "4410 E CACTUS RD, PHOENIX, AZ 85032, MEXICO"
 
     def test_empty_mailing_cell_is_a_settled_none(self):
         a = cp.parse_page(_page("37915015", []), "37915015")
@@ -185,8 +193,9 @@ class TestParsePage:
     @pytest.mark.parametrize("body", [
         "<html><body>Service temporarily unavailable</body></html>",
         _page("37915015", None),                                    # mailing cell gone
-        _page("37915015", ["SOMEONE", "VANCOUVER WA , 98664"]),     # no street line
-        _page("37915015", ["105 NE 89TH AVE", "garbled locality"]),  # unreadable locality
+        _page("37915015", ["SMITH FAMILY LLC", "VANCOUVER WA , 98664"]),  # no street
+        _page("37915015", ["105 NE 89TH AVE", "LONDON SW1A 1AA"]),  # foreign: never guessed
+        _page("37915015", ["105 NE 89TH AVE", "FOO ZZ , 98664"]),  # not a US state
     ])
     def test_unreadable_pages_are_unparsed_not_none(self, body):
         assert cp.parse_page(body, "37915015").outcome == "unparsed"
@@ -471,7 +480,7 @@ class TestJobAndRecovery:
             "196948000": _page("196948000", ["PO BOX 77", "BOISE ID , 83701"]),
             "999999999": _NOT_FOUND,
             "37915015": _page("37915016", ["1 ELSEWHERE", "VANCOUVER WA , 98660"]),
-            "2222222": _page("2222222", ["SOMEONE", "VANCOUVER WA , 98664"]),
+            "2222222": _page("2222222", ["SMITH FAMILY LLC", "VANCOUVER WA , 98664"]),
         })
         await asyncio.to_thread(mr.recover_deferred_gis_mailing)
 

@@ -57,6 +57,10 @@ app = Celery(
         "src.workers.contact_lookup_action",
         # Database latency canary: a BEAT task, same trap as above.
         "src.workers.db_canary",
+        # Per-run data-quality sweep: a BEAT task, same trap as above. It shipped once
+        # without this line (#436), and beat's ticks were dropped as unregistered;
+        # tests/test_beat_schedule.py now fails for any beat task missing from here.
+        "src.workers.data_quality",
     ],
 )
 

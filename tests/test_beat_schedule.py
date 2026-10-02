@@ -152,3 +152,16 @@ def test_the_dispatch_interval_is_refused_at_boot_outside_60_to_599(value, ok):
 def test_beat_runs_in_utc():
     assert app.conf.timezone == "UTC"
     assert app.conf.enable_utc is True
+
+
+def test_every_beat_task_module_is_imported_by_the_worker():
+    """A beat entry whose module the worker never imports is sent every tick and
+    dropped as "unregistered task": the job silently never runs. It happened to
+    several sweeps (see the include-list comments) and to data_quality in #436."""
+    included = set(app.conf.include) | {"src.workers.scheduler"}
+    missing = sorted(
+        f"{name} -> {entry['task']}"
+        for name, entry in app.conf.beat_schedule.items()
+        if entry["task"].rsplit(".", 1)[0] not in included
+    )
+    assert missing == []

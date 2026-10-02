@@ -5058,7 +5058,27 @@ line as `  injection ...`; it reads `  fault injection ...`) before writing anyt
   `current_user`, and the audit line read it → MissingGreenlet → a 500 after a committed
   purchase. The audit now uses the plain `user_id`.
 - **Mutations: 18/18 caught** on the pre-review code (runner `mut_2d.py` in scratchpad
-  feececfd). **Not yet re-run after review r1's changes.**
+  feececfd).
+- **Mutation re-run after r1 (2026-10-01, `1d67f8ff`): 36/37 caught**, 19 mutants added for
+  `_valid_quote_payload` (one per check), unparseable JSON, the guarded import, slot
+  release on submit failure and in the thread, `retry=False`, AO5 and `truncated`.
+  - The first pass found 1 survivor and several unreached checks. The outer post-commit
+    guard MASKED the helper's own "never raises" contract (the route still answered 202),
+    and no input reached the list / zero / bool / long-version / dedup checks. Pinned by
+    15 new tests (47 total): direct helper tests (a refused publish, a pool that will not
+    start it), an import failure after commit, a mapping of real ids, a doubled id bought
+    once, `truncated` semantics, `retry=False`.
+  - "unparseable JSON is a 500" timed out (INCONCLUSIVE) in the full-file run; run alone
+    against its target test it is CAUGHT in 15 s (the escaped 500 appears to hang a later
+    teardown, never a pass).
+  - **SURVIVED, judged equivalent in practice:** AO5 (`if False and (...)`, so ANY
+    IntegrityError re-fetches). It differs only when a non-quote integrity error fires
+    AND a winning action for the same quote already exists; then it returns that winner
+    (202) instead of raising. With no winner it still raises. Killing it needs a
+    contrived double fault; put to Codex r2.
+  - The first background run was KILLED by host memory pressure mid-mutant and left a
+    LIVE mutant in `jobs.py` (the list check removed). Caught by `sha256sum -c`,
+    restored by `git checkout`, re-verified by hash.
 - **Codex diff review r1: NO-GO, 1 P1 + 3 P2 + 1 P3, all fixed in `c840ea45`:**
   - the post-commit import + publish are guarded (P1);
   - strict validation of the stored payload → 409 `quote_unsupported` (naive expiry,

@@ -19,6 +19,102 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-10-01 — Contact lookup 1b-2: O-C (skip-trace billing decides on what was SENT) and O-D (the worker DELETE grant)
+
+> The two hard gates before 2d (the confirm endpoint that makes contact lookup live). O-C closes
+> a pre-existing live billing gap found by consult W3. O-D lets the claim withdraw its own
+> lost-race rows. Contract: `tasks/todo-lookup-contacts.md`, "## Phase O-C" and "## Phase O-D".
+
+**Built / Shipped:**
+- **#421** (merge `bf792931`): migration 110 adds `skip_trace_queues.rows_sent INTEGER NULL` and
+  `unmatched_billed BOOLEAN NULL`. No default, no backfill, `lock_timeout` 5s both ways. It
+  shipped ALONE, schema first.
+- **#422** (`1a4076d4`): `_persist_submission` writes `rows_sent = len(claimed)`, the POST's
+  rows on the live, retry and adoption paths. The model gains both columns.
+- **#424** (`7a08c0a7`), the live billing change:
+  - `queue_accepted_all` = `rows_sent > 0 AND rows_uploaded >= rows_sent`. A NULL (pre-110) or
+    zero sent count is "not proven", so the batch bills `completed` only.
+  - `report_usage_from_webhook` stores the decision with `COALESCE(unmatched_billed,
+    :decided) ... RETURNING` and bills by the RETURNED value, so recorded == billed.
+  - The contact-lookup reconciler maps `unmatched` from the stored decision. None stored →
+    the new flag `billing_decision_unknown`, never guessed.
+- **#425** (`9bfc73b3`): `GRANT DELETE ON pending_skip_trace_rows TO bridgeleads_system` in all
+  three grant sources. The tests read the sources as executed (a four-way equality plus
+  ordered-REVOKE checks), and an AST scan finds the claim withdrawal as the only STATICALLY
+  visible pending-row delete in `src`. SQL built at runtime and `session.delete(instance)`
+  are out of a static scan's reach, and the test says so.
+- **Production:** `verify_worker_delete_grants.py --apply`, owner-approved, granted DELETE on
+  `pending_skip_trace_rows` AND `skip_trace_cache`. Verified read-only afterwards: 8/8 tables,
+  role NOSUPERUSER/NOBYPASSRLS, RLS forced, the app role with no pending-row privilege, 0
+  `InsufficientPrivilege` in the worker logs.
+- **Release gates (read-only, outside the repo, `C:/Users/Windows/bl-checks/`):**
+  - `oc_schema_check.py`: production at 110, both columns;
+  - `oc_post_deploy_check.py`: `--pre` found 0 un-ingested NULL-`rows_sent` queues; after
+    the merge, 0 queues completed without a decision.
+
+**Tried / Decided:**
+- **2 PRs became 3 (Codex AE1).** A worker on new code against a not-yet-migrated schema would
+  fail ingest's full ORM read of `SkipTraceQueue`. After 3 retries, `on_failure` marks the
+  queue `errored`, and a PAID batch is never auto-ingested. Applying 110 out of band was ruled
+  out: a DB ahead of the image's alembic head fails the API boot. So the migration shipped
+  alone, the schema was verified in production, and only then did code name the columns.
+- **The old-worker overlap during #424's rollout (AF1)** was handled by the merge gate, not a
+  worker drain: `quiet.py` zeros at merge, plus a post-deploy proof that every queue
+  completed since then carries a decision.
+- **`rows_sent > 0`** was added beyond the spec, toward the customer: `0 >= 0` would otherwise
+  read as "accepted".
+- **AK2:** the grant is table-wide, and system-role RLS is `USING (true)`. Codex suggested a
+  DELETE-only policy for queued, unsubmitted rows. **The owner ACCEPTED the trusted-worker
+  risk instead.**
+- **Applying the grant also fixed `skip_trace_cache`.** The owner chose "both".
+
+**Failed / Blocked:**
+- **The C: drive filled to 0 bytes during a mutation run.** The runner's restore write raised
+  ENOSPC, leaving `skip_trace_usage.py` and `contact_lookups.py` at 0 bytes in the worktree.
+  Local only: nothing was pushed or deployed. Once the owner freed space, both were rebuilt
+  (`git checkout` + the one uncommitted edit) and matched their pre-run SHA-256. Mutations
+  and regression were re-run.
+- **My own mutation runners lied twice, and both were caught:**
+  - a mutant that called an unimported `text` "failed" with a NameError on the wrong test;
+  - a heredoc ate `\n` escapes and broke two runner files.
+
+  Every runner now asserts each mutant applied, refuses a RED baseline, verifies the restore
+  by hash, and treats a hang as INCONCLUSIVE, never as caught.
+- Background runs and CI waits stretched as machine load rose (other sessions' cleanup).
+
+**Caught & fixed:**
+- **#424 review r1:** the stored decision could differ from what billing billed (the UPDATE
+  kept an old value, while billing used the fresh rule). Fixed by billing from `RETURNING`.
+- **#424 mutation survivor:** an undecided `unmatched` row counted as mappable would hold the
+  reconciler's group-(a) slot forever (a starvation bug). It is now a test.
+- **#425, 3 review rounds of test rigor:**
+  - grants surviving only in comments;
+  - REVOKEs hidden in `DO $$` blocks or written `ON TABLE` / `public.`;
+  - ORM import aliases, `query().delete()` chains, and nested same-name functions.
+
+  23 mutation cases, including two controls.
+- **A Codex premise refuted with evidence:** "a second delete in the approved function still
+  passes". The hit set is keyed by line, and the mutant failed with "Left contains one more
+  item". Codex confirmed.
+
+**Pending / Handoff:**
+- **2d (the confirm endpoint): the owner said START.** Both gates are met.
+- **A follow-up:** `scripts/deactivate_test_batch_configs.py` and
+  `scripts/purge_test_batch_configs.py` docstrings still say the system role has "DELETE=False
+  on every table".
+
+**Facts learned:**
+- **Billing runs ONCE per queue:** ingest's `completed` status is the replay anchor. Nothing
+  rewrites `rows_uploaded` or the stamped set after billing commits.
+- **Worker and beat run the advisory-locked migration on boot and fail OPEN; the API fails
+  CLOSED.** A schema-first deploy is the only safe order for a new ORM column on a hot table.
+- **`verify_worker_delete_grants.py --apply` grants EVERY missing listed table.** Run the report
+  first.
+- **Production had silently lacked DELETE on `skip_trace_cache`.** The §7 retention purge
+  could not delete.
+
+---
+
 ## 2026-10-01 — UX 2e (F-009 / Q4): "Lookup failed", one contact status for phone and email
 
 > UX audit queue item 2e. An errored lead showed Phone "Error" beside Email "None found", and

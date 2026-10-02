@@ -4824,6 +4824,30 @@ trusted-worker risk; the RLS hardening is the owner's call (and, if wanted, befo
 - **Follow-up (not in O-D):** correct the two scripts' "DELETE=False on every table"
   docstrings.
 
+### O-D MERGED (2026-10-01): #425, merge `9bfc73b3`. APPLIED IN PRODUCTION THE SAME DAY (below)
+- CI green on `e1fac4d8`, quiet all zeros, main unchanged, `--match-head-commit`. api, worker
+  and beat SUCCESS on `9bfc73b3`, `/health` 200. (Scripts + tests only: no runtime change.)
+- **Read-only prod report** (`verify_worker_delete_grants.py` from main, no `--apply`): **TWO**
+  missing, not one:
+  - `pending_skip_trace_rows` (O-D, expected);
+  - **`skip_trace_cache`: PRE-EXISTING DRIFT.** The section 7 retention purge's DELETE would
+    fail with InsufficientPrivilege.
+  `--apply` would grant BOTH. **Asked of the owner:** apply both, or only the O-D grant.
+- **OWNER DECISIONS (2026-10-01):** apply BOTH grants; **AK2 ACCEPTED** (the table-wide
+  worker DELETE is an owner-accepted trusted-worker risk; no RLS DELETE policy); **START 2d**;
+  a BUILD_JOURNAL entry: yes.
+- **APPLIED IN PRODUCTION (2026-10-01):** `verify_worker_delete_grants.py --apply` (main's copy,
+  byte-identical, `DATABASE_URL_MIGRATE`): "repaired: granted DELETE on skip_trace_cache,
+  pending_skip_trace_rows". Verified read-only afterwards (AK5):
+  - the report: DELETE held on all 8 required tables;
+  - `priv_check.py`: the role is NOSUPERUSER + NOBYPASSRLS; pending rows S/I/U/D; events
+    still S/I only; RLS enabled + forced; only the policy `pending_skip_trace_rows_system`
+    (ALL, system);
+  - `bridgeleads_app` holds NO privilege on `pending_skip_trace_rows`;
+  - worker logs: 0 `InsufficientPrivilege`.
+
+  **O-D is DONE. Both 2d gates (O-C, O-D) are met.** The skip_trace_cache drift is fixed with it.
+
 ## Phase 1c - the action, frontend
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever
       the tab has leads that have never been looked up; when the quote comes back with

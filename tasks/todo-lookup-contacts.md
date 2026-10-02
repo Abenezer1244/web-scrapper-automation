@@ -5129,6 +5129,20 @@ line as `  injection ...`; it reads `  fault injection ...`) before writing anyt
     `str`, so a malformed id there is the same DataError → 500 (with a ref; no stack is
     leaked). Pre-existing, house-wide, so it belongs in its own PR.
   - 70 tests pass. Runner: 52 mutants, 51 caught + the equivalent AO5.
+- **Codex r6 (on `6c98eb2d`): GATE: GO**, 1 non-blocking P3: the QUOTE route stored its key
+  from the raw path, so an upper-case quote was unconfirmable on the canonical confirm (a
+  safe 410, nothing bought). Codex also ruled the house-wide malformed-id follow-up
+  non-blocking. Applied anyway in `8d566267`: one helper, `_canonical_job_id`, for the
+  quote AND the confirm. This touches the LIVE quote route: a malformed id there is now
+  404 (was a DataError 500); a canonical id's response and payload are unchanged.
+- **Codex r7 (on `8d566267`): GATE: GO**, no findings: the P3 is closed and the quote is
+  byte-identical for canonical ids.
+- **Final state on `8d566267`:** 72 confirm tests + 26 quote tests pass. Mutation runner:
+  54 mutants, 53 caught + AO5 (equivalent: Codex r2). The **regression (60 files, 9
+  chunks): 1,457 passed, 0 failed**; source hashes verified after. ruff clean; no type
+  checker is configured for this repo. `openapi.json --check` OK (+218, 0 deletions).
+- **NEXT:** rebase onto main after #428 (another session's middleware PR), prove the 2d
+  diff byte-identical, Codex re-check, open the PR, CI, quiet, merge, deploy verify.
 - **Codex diff review r1: NO-GO, 1 P1 + 3 P2 + 1 P3, all fixed in `c840ea45`:**
   - the post-commit import + publish are guarded (P1);
   - strict validation of the stored payload → 409 `quote_unsupported` (naive expiry,

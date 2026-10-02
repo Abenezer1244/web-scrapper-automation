@@ -105,6 +105,13 @@ def _events(aid: str) -> list[tuple]:
             "WHERE action_id = :a ORDER BY at, id"), {"a": aid})]
 
 
+def _deep(levels: int):
+    v: object = 1
+    for _ in range(levels):
+        v = [v]
+    return v
+
+
 def _set_quote(redis_client, user_id: str, job_id: str, **changes) -> None:
     key = jobs_routes._quote_key(user_id, job_id, "new")
     stored = json.loads(redis_client.get(key))
@@ -319,6 +326,30 @@ async def test_another_accounts_job_is_404(
     job = _job(starter_user.id)
     r = await _confirm(client, business_token, job, "q" * 43)
     assert r.status_code == 404
+
+
+async def test_a_malformed_job_id_is_404_never_a_500(
+    db, client, business_token, _lookups_on, published,
+):
+    r = await _confirm(client, business_token, "not-a-uuid", "q" * 43)
+    assert r.status_code == 404, r.text
+
+
+async def test_an_upper_case_job_id_is_the_same_run_and_the_same_action(
+    db, client, business_user, business_token, _lookups_on, published,
+):
+    """r5: the path id is canonical before the quote key and the replay match, so the
+    same run spelled in upper case buys once and replays, never a false conflict."""
+    job = _job(business_user.id)
+    _seed(business_user.id, job, [{}])
+    qid = await _quoted(client, business_token, job)
+
+    first = await _confirm(client, business_token, job.upper(), qid)
+    again = await _confirm(client, business_token, job, qid)
+
+    assert (first.status_code, again.status_code) == (202, 202), (first.text, again.text)
+    assert first.json()["action_id"] == again.json()["action_id"]
+    assert _actions_of(business_user.id) == 1
 
 
 async def test_a_run_that_has_not_finished_is_409(
@@ -559,6 +590,7 @@ async def test_a_busy_publisher_is_skipped_and_never_waited_on(
     {"pricing_version": "2026\x0006"},
     {"included_remaining_at_quote": "lone\ud800surrogate"},  # not encodable as UTF-8
     {"currency": "U\ud800D"},
+    {"counts": _deep(40)},                           # past the snapshot depth limit
 ])
 async def test_a_corrupt_stored_quote_is_refused_never_a_500(
     db, client, business_user, business_token, redis_client, _lookups_on, published, corrupt,
@@ -615,7 +647,11 @@ async def test_quoted_ids_held_in_a_mapping_are_refused_not_bought(
     assert _actions_of(business_user.id) == 0
 
 
-@pytest.mark.parametrize("raw", ["{not json", "[]", "null", '"a string"', "1"])
+@pytest.mark.parametrize("raw", [
+    "{not json", "[]", "null", '"a string"', "1",
+    pytest.param('{"v": 2, "x": ' + "[" * 100_000 + "]" * 100_000 + "}",
+                 id="nested-past-the-parser-stack"),  # RecursionError in json.loads
+])
 async def test_an_unreadable_stored_quote_is_refused_never_a_500(
     db, client, business_user, business_token, redis_client, _lookups_on, published, raw,
 ):

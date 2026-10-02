@@ -1349,11 +1349,29 @@ def _is_count(v) -> bool:
     return isinstance(v, int) and not isinstance(v, bool) and v >= 0
 
 
+_SNAPSHOT_MAX_DEPTH = 16  # a real snapshot nests 3 deep (counts, policy, window_end)
+
+
+def _nested_deeper_than(value, limit: int) -> bool:
+    stack = [(value, 1)]
+    while stack:
+        v, depth = stack.pop()
+        if depth > limit:
+            return True
+        if isinstance(v, dict):
+            stack.extend((x, depth + 1) for x in v.values())
+        elif isinstance(v, list):
+            stack.extend((x, depth + 1) for x in v)
+    return False
+
+
 def _snapshot_json(snapshot: dict) -> str | None:
     """The snapshot as JSON PostgreSQL's jsonb accepts, else None (reviews r3, r4): no
     non-finite number (NaN, Infinity, or an overflowing literal such as 1e9999), no NUL
     escape, and valid UTF-8 (a lone surrogate), any of which fails as a 500 after the
     gates."""
+    if _nested_deeper_than(snapshot, _SNAPSHOT_MAX_DEPTH):  # jsonb has a stack limit (r5)
+        return None
     try:
         snap = json.dumps(snapshot, allow_nan=False, ensure_ascii=False)
         snap.encode("utf-8")
@@ -1487,6 +1505,12 @@ async def confirm_contact_lookups(
         )
     except TimeoutError:
         raise _lookups_unavailable() from None
+    try:
+        # Canonical from here on: the uuid casts, the quote key, the replay match (r5).
+        job_id = str(uuid.UUID(job_id))
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                            detail="Job not found") from None
 
     job = (await db.execute(
         select(Job).where(Job.id == job_id, Job.user_id == current_user.id)
@@ -1529,7 +1553,7 @@ async def confirm_contact_lookups(
         raise _quote_expired()
     try:
         quote = json.loads(raw)
-    except ValueError:
+    except (ValueError, RecursionError):  # unreadable, or nested past Python's stack
         quote = {}
     if not isinstance(quote, dict):  # valid JSON, but not a quote object
         quote = {}

@@ -145,7 +145,10 @@ def _http_post(session: requests.Session, url: str, data: dict) -> requests.Resp
     from src.utils.safe_http import same_origin
 
     resp = session.post(url, data=data, timeout=_TIMEOUT_S, allow_redirects=False)
-    if resp.status_code not in (301, 302, 303, 307, 308):
+    if resp.status_code not in (302, 303):
+        # 302/303 is what PACS sends (a GET of the results page). A 307/308 would ask
+        # for the POST to be replayed; it is returned unfollowed (a 3xx is not 200,
+        # so it counts as request_failed) rather than silently turned into a GET.
         return resp
     target = urljoin(url, resp.headers.get("Location", ""))
     if not same_origin(target, url):

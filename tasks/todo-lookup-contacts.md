@@ -5437,6 +5437,21 @@ amended by AP1-AP4, AQ1-AQ3, AR1.
   A full-file run showed 5 unrelated failures once: peer -76 ran a FLUSHDB on Redis db 13
   mid-run (confirmed by them); each catch was re-verified against its expected test.
 - ruff clean; no type checker is configured for this repo.
+- **Codex diff review r1 (three-dot, on `cfec173c`): GATE: NO-GO, 1 P2 + 1 P3**
+  (`codex_2e_review_r1_out.txt`). Fixed in `60a488c3`:
+  - (P2) a malformed run id on the status route answered "Job not found", not the route's one
+    404 body, and the test asserted only the status code: `_canonical_lookup_id` for both
+    path ids; the exact body asserted.
+  - (P3) the API-role test ran the SQL, not the route: renamed to say so, and
+    `test_both_routes_run_in_the_tenant_session` pins each route's own `db` to `get_rls_db`
+    (`get_db` legitimately sits below it, in auth and inside `get_rls_db`).
+  - Their mutants: 3/3 caught (runner total 32/32).
+- **Codex r2 (on `60a488c3`): GATE: GO**, r1 closed, no new findings.
+- **Regression AFTER the GO (61 files = 2d's 60 + the new file, 8 chunks): 1,487 passed,
+  0 failed**; sources hash-verified after every chunk. ruff clean repo-wide; `openapi --check` OK.
+- `docs/BUILD_JOURNAL.md`: the 2026-10-02 entry (2d + 2e), owner-approved to ride here.
+- **NEXT:** PR → CI on the exact head → quiet (owner) → merge (standing rule, "merging" to every
+  peer) → deploy verify (unauth GET on both routes = 401). Then 1c.
 
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever
       the tab has leads that have never been looked up; when the quote comes back with

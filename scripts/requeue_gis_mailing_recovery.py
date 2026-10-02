@@ -77,11 +77,11 @@ _MARK_SQL = """
 
 def requeue(db, counties: list[str], *, apply: bool, report: Path | None = None) -> dict:
     """Mark eligible rows deferred. Returns counts; writes nothing unless ``apply``."""
-    from src.scrapers.enrichment.county_gis import has_gis_mailing_source
+    from src.scrapers.enrichment.county_gis import has_mailing_source
 
-    unsupported = [c for c in counties if not has_gis_mailing_source(c, "WA")]
+    unsupported = [c for c in counties if not has_mailing_source(c, "WA")]
     if unsupported:
-        raise ValueError(f"no county GIS mailing source for: {', '.join(unsupported)}")
+        raise ValueError(f"no county mailing source for: {', '.join(unsupported)}")
 
     rows = db.execute(text(_CANDIDATES_SQL), {"counties": counties}).all()
     stats: dict = {

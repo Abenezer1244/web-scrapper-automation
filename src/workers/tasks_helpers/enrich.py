@@ -908,11 +908,12 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
         _publish_log(r, job_id, "info", f"Looking up {len(results_need_addr)} property addresses...", db=db)
         from src.scrapers.enrichment.county_gis import (
             batch_enrich_parcels_gis,
-            has_gis_mailing_source,
+            has_mailing_source,
         )
-        # Only a county whose own layer publishes mailing can have its mailing lookup
-        # "not happen". Everywhere else there was never a lookup to defer.
-        gis_mailing_source = has_gis_mailing_source(config.county, config.state)
+        # Only a county with a mailing source (its GIS layer, or a bulk/page source
+        # such as Clark's) can have its mailing lookup "not happen". Everywhere else
+        # there was never a lookup to defer.
+        gis_mailing_source = has_mailing_source(config.county, config.state)
         gis_mailing_deferred = 0
         parcel_map: dict[str, list] = {}
         for res in results_need_addr:
@@ -967,6 +968,18 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                     # Runs for every branch below, including vacant land, so a parcel
                     # with no street still records WHERE it is.
                     _keep_situs_parts(res, gis_data)
+                    # The source answered and has no mailing address for this parcel
+                    # (clark_pic: none / parcel_not_found / parcel_mismatch). Recorded
+                    # under recovery's durable outcome key, so the row reads "looked
+                    # up, nothing there" rather than "never looked up", and the
+                    # historical requeue does not queue it again.
+                    if (gis_data.get("mailing_lookup") in ("none", "parcel_not_found",
+                                                           "parcel_mismatch")
+                            and not res.mailing_address):
+                        _ed = dict(res.enrichment_data) if isinstance(res.enrichment_data, dict) else {}
+                        _ed["mailing_recovery_outcome"] = gis_data["mailing_lookup"]
+                        _ed["mailing_source"] = gis_data.get("mailing_source")
+                        res.enrichment_data = _ed
                     if prop:
                         res.property_address = prop
                         # Only a REAL mailing overwrites (King never echoes the
@@ -2036,9 +2049,9 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
     # (Codex Medium).
     if summary is not None:
         try:
-            from src.scrapers.enrichment.county_gis import has_gis_mailing_source
+            from src.scrapers.enrichment.county_gis import has_mailing_source
 
-            if has_gis_mailing_source(config.county, config.state):
+            if has_mailing_source(config.county, config.state):
                 summary["mailing_missing"] = len([
                     res for res in all_results
                     if not res.is_duplicate and not res.mailing_address

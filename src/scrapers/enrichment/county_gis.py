@@ -648,22 +648,33 @@ def _empty() -> dict[str, str | None]:
     return {"property_address": None, "mailing_address": None}
 
 
-# Counties whose owner mailing comes from a BULK county export rather than a live
-# per-parcel layer. Registered explicitly, NOT inferred from the GIS config: the
-# Snohomish GIS mailing fields are dead weight now, and deleting them must not also
-# delete Snohomish from mailing recovery (Codex).
-_BULK_MAILING_COUNTIES: frozenset[str] = frozenset({"snohomish_WA"})
+# Counties whose owner mailing comes from a non-ArcGIS county source (a bulk export,
+# or Clark's per-parcel Property Information Center page) rather than a live parcel
+# layer, mapped to the provenance tag stored as `mailing_source`. Registered
+# explicitly, NOT inferred from the GIS config: the Snohomish GIS mailing fields are
+# dead weight now, and deleting them must not also delete Snohomish from mailing
+# recovery (Codex).
+_BULK_MAILING_SOURCES: dict[str, str] = {
+    "snohomish_WA": "snohomish_assessor_roll",
+    "clark_WA": "clark_pic",
+}
+_BULK_MAILING_COUNTIES: frozenset[str] = frozenset(_BULK_MAILING_SOURCES)
 
-# Bulk exports carrying the SAME RCW 42.56.070(8) restriction on lists of
-# individuals as the county's live layer. The Snohomish Assessor Roll is literally
-# the same taxpayer block behind the same clause, so it MUST answer to the same
-# kill switch: gating only the live layer would mean turning the switch off for a
-# legal reason silently stopped nothing.
-_BULK_MAILING_LICENSE_RESTRICTED: frozenset[str] = frozenset({"snohomish_WA"})
+# Bulk-source outcomes that ARE an answer about the parcel, just not an address
+# (clark_pic). Every other non-found outcome means "we do not know" and defers.
+_SETTLED_NO_MAILING: frozenset[str] = frozenset({"none", "parcel_not_found", "parcel_mismatch"})
+
+# Sources carrying the SAME RCW 42.56.070(8) restriction on lists of individuals as
+# the gated live layers. The Snohomish Assessor Roll is literally the same taxpayer
+# block behind the same clause, and Clark's page footer cites the same statute, so
+# both MUST answer to the same kill switch: gating only the live layer would mean
+# turning the switch off for a legal reason silently stopped nothing. Clark was
+# cleared by the product owner on 2026-10-02.
+_BULK_MAILING_LICENSE_RESTRICTED: frozenset[str] = frozenset({"snohomish_WA", "clark_WA"})
 
 
 def has_bulk_mailing_source(county: str, state: str) -> bool:
-    """True when a county publishes owner mailing as a bulk file we can resolve."""
+    """True when a county publishes owner mailing through a non-ArcGIS source we resolve."""
     key = f"{(county or '').lower()}_{(state or '').upper()}"
     if key not in _BULK_MAILING_COUNTIES:
         return False
@@ -673,15 +684,29 @@ def has_bulk_mailing_source(county: str, state: str) -> bool:
     return True
 
 
+def has_mailing_source(county: str, state: str) -> bool:
+    """True when ANY mailing source covers this county: its GIS layer or a bulk source.
+
+    Every "was there a lookup to defer / retry / requeue" decision goes through here.
+    Checking the GIS layer alone silently excluded a county served only by a bulk
+    source (Clark) from deferral and from the historical requeue.
+    """
+    return has_gis_mailing_source(county, state) or has_bulk_mailing_source(county, state)
+
+
 def _resolve_bulk_mailing(county_key: str, parcel_ids: list[str]) -> dict:
     """Bulk-source answers for these parcels, keyed by caller id. Never raises."""
-    if county_key != "snohomish_WA":
-        return {}
     try:
-        from src.scrapers.enrichment.snohomish_assessor_roll import resolve_mailing
-
+        if county_key == "snohomish_WA":
+            from src.scrapers.enrichment.snohomish_assessor_roll import resolve_mailing
+        elif county_key == "clark_WA":
+            from src.scrapers.enrichment.clark_pic import resolve_mailing
+        else:
+            return {}
         return resolve_mailing(parcel_ids)
     except Exception as exc:  # noqa: BLE001 -- enrichment is best-effort
+        if type(exc).__name__ in ("SoftTimeLimitExceeded", "TimeLimitExceeded"):
+            raise  # the job's own deadline, not a source failure
         _logger.warning("Bulk mailing source failed for %s: %s", county_key, str(exc)[:160])
         return {}
 
@@ -706,9 +731,7 @@ def gis_mailing_source_counties(state: str = "WA") -> list[str]:
     keys = set(_KNOWN_GIS_ENDPOINTS) | _BULK_MAILING_COUNTIES
     return sorted(
         key[: -len(suffix)] for key in keys
-        if key.endswith(suffix)
-        and (has_gis_mailing_source(key[: -len(suffix)], state)
-             or has_bulk_mailing_source(key[: -len(suffix)], state))
+        if key.endswith(suffix) and has_mailing_source(key[: -len(suffix)], state)
     )
 
 
@@ -804,7 +827,26 @@ def batch_enrich_parcels_gis(
         if needs_mail:
             answers = _resolve_bulk_mailing(county_key, needs_mail)
             filled_pids: set[str] = set()
+            settled_pids: set[str] = set()
             for pid, answer in answers.items():
+                outcome = getattr(answer, "outcome", None)
+                if outcome in _SETTLED_NO_MAILING:
+                    # The source answered THIS parcel and there is no mailing address
+                    # to take (Clark: none / parcel_not_found / parcel_mismatch). Not
+                    # deferred: rotating it would re-ask the county every tick forever.
+                    # Recovery reads `mailing_lookup` and records it terminal.
+                    # mailing_source says WHO answered, so a "none" stays provable.
+                    results[pid] = {**(results.get(pid) or _empty()), "mailing_lookup": outcome,
+                                    "mailing_source": _BULK_MAILING_SOURCES[county_key]}
+                    settled_pids.add(pid)
+                    if stats is not None and pid in stats.get("county_unreached", []):
+                        stats["county_unreached"].remove(pid)
+                    continue
+                if outcome in ("unparsed", "request_failed"):
+                    # A request WAS sent and the page was unreadable or the request failed.
+                    # It still defers (below), but recovery charges it an attempt, so a
+                    # parcel that never answers ends at the ceiling, not re-fetched forever.
+                    results[pid] = {**(results.get(pid) or _empty()), "mailing_lookup": "error"}
                 if not getattr(answer, "is_found", False):
                     # NOT an answer about this parcel. Leaving it unmarked is what
                     # made this a NO-GO: with the county layer dead, a parcel whose
@@ -826,7 +868,7 @@ def batch_enrich_parcels_gis(
                     continue
                 row = dict(results.get(pid) or _empty())
                 row["mailing_address"] = answer.mailing_address
-                row["mailing_source"] = "snohomish_assessor_roll"
+                row["mailing_source"] = _BULK_MAILING_SOURCES[county_key]
                 row["mailing_role"] = answer.role
                 row["mailing_revision"] = answer.revision
                 results[pid] = row
@@ -840,14 +882,16 @@ def batch_enrich_parcels_gis(
             # swallows its exceptions and returns {}, so iterating the response left
             # every parcel unmarked on exactly the failure the deferral exists for,
             # reopening the High it was meant to close (Codex).
-            unresolved = [pid for pid in needs_mail if pid not in filled_pids]
+            unresolved = [pid for pid in needs_mail
+                          if pid not in filled_pids and pid not in settled_pids]
             if unresolved and stats is not None:
                 _note_unreached(stats["county_unreached"],
                                 {pid: [pid] for pid in unresolved})
-            if filled_pids or unresolved:
+            if filled_pids or unresolved or settled_pids:
                 _logger.info(
-                    "Bulk mailing source: filled %d, deferred %d of %d %s parcels",
-                    len(filled_pids), len(unresolved), len(needs_mail), county.lower(),
+                    "Bulk mailing source: filled %d, no mailing %d, deferred %d of %d "
+                    "%s parcels", len(filled_pids), len(settled_pids), len(unresolved),
+                    len(needs_mail), county.lower(),
                 )
 
     return results

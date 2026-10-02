@@ -1,0 +1,117 @@
+
+
+<script language="JavaScript">
+<!--
+
+function uncheck()
+{
+	document.check.understand.checked = false;
+	document.subform.paybutton.disabled = true;
+}
+
+function understandcheck()
+{
+	if (document.subform.paybutton.disabled)
+		document.subform.paybutton.disabled = false;
+	else
+		document.subform.paybutton.disabled = true;
+}
+
+var newWindow
+var oldStuff = parseInt(navigator.appversion) < 3
+var clHeight = screen.height
+var avHeight = screen.availHeight
+var clWidth = screen.width
+var avWidth = screen.availWidth
+
+
+function ShowPopupHelp (template, WindowName, x, y, Width, Height, Type, Parent, Anchor)
+{
+	var sAttribs = "location=no,buttons=no,menubar=yes,toolbar=no,scrollbars=yes,width=" + Width + ",height=" + Height ;
+	if (navigator.appName == "Netscape" && navigator.appVersion.charAt (0) >= 4)
+		sAttribs += ",resizable=no,left=" + x + ",top=" + y ;
+	else if (navigator.appName == "Microsoft Internet Explorer")
+		sAttribs += ",resizable=yes,left=" + x + ",top=" + y ;
+	HelpWindow = window.open (template, WindowName, sAttribs) ;
+
+	if (navigator.appName == "Microsoft Internet Explorer" && navigator.appVersion.charAt (0) >= 4 &&
+		HelpWindow.opener == null)
+	{
+		HelpWindow.opener = window ;
+	}
+	// Bring window to front on Navigator 3.0+ and MSIE 4.0+
+	if (navigator.appName == "Netscape" && navigator.appVersion.charAt (0) >= 3
+	|| navigator.appName == "Microsoft Internet Explorer" && navigator.appVersion.charAt (0) >= 4)
+	{
+		HelpWindow.focus () ;
+	}
+}
+
+function ShowHelp (template)
+{
+	var nh, nw
+	if (avHeight < 600)
+		nh = 500
+	else
+		nh = 600;
+
+	if (avWidth < 800)
+		nw = 640
+	else
+		nw = 800;
+  ShowPopupHelp (template, "Help", 0, 0, nw, nh, "Page", null, null) ;
+}
+
+function ShowGeo (template)
+{
+  window.open (template);
+}
+
+function ShowHelpSm (template)
+{
+  ShowPopupHelp (template, "Details", 0, 0, 600, 400, "Page", null, null) ;
+}
+
+//-->
+</script>
+<html><head><title>Thurston County A+ Parcel Search: 74700001201</title><link rel='stylesheet' href='assrcol_print.css'></head><body><table width='100%'>
+<tr><td class='emphatic' align=center style={font-size:14pt; } colspan='2'>Thurston County Assessor</td></tr>
+<tr>
+<td width='50%'>
+<table width='100%'>
+<tr><td  class='emphatic' colspan='2' style={font-size:10pt; }>Parcel Number: 74700001201</td></tr>
+<tr><td colspan='2'>&nbsp;</td></tr>
+<tr><td class='emphatic' width='30%'>Situs Address:</td>
+<td>1418 COLLEGE ST SE</td></tr>
+<tr><td colspan='2'>&nbsp;</td></tr>
+<tr><td class='emphatic'>Owner:</td>
+<td>NAME REDACTED</td></tr>
+<tr><td class='emphatic'>Address:</td><td>3000 PACIFIC AVE SE</td></tr>
+<tr><td>&nbsp;</td><td>OLYMPIA, WA   98501</td></tr>
+<tr><td colspan='2'>&nbsp;</td></tr>
+<tr><td class='emphatic'>Taxpayer:</td>
+<td>NAME REDACTED - TAX TITLE</td></tr>
+<tr><td class='emphatic'>Address:</td><td>3000 PACIFIC AVE SE</td></tr>
+<tr><td>&nbsp;</td><td>OLYMPIA, WA   98501</td></tr>
+<tr><td colspan='2'>&nbsp;</td></tr>
+<tr><td class='emphatic'>Abbreviated Legal:</td><td>SMITHS S/D LOT 12 W 1FT OF E 26FT</td></tr>
+<tr><td colspan='2'>&nbsp;</td></tr>
+</td></tr>
+</table>
+<td width='50%'>
+<table width='100%'>
+<tr><td  class='emphatic_right' colspan='2' style={font-size:10pt; }>Date: 10/2/2026</td></tr>
+<tr><td colspan='2'>&nbsp;</td></tr>
+<tr><td class='emphatic' width='30%'>Sect/Town/Range:</td><td>21  18  1W</td></tr>
+<tr><td colspan='2'>&nbsp;</td></tr>
+<tr><td class='emphatic'>Size:</td><td>.003 Acres</td></tr>
+<tr><td class='emphatic'>UseCode:</td><td>91 Undeveloped Land</td></tr>
+<tr><td class='emphatic'>TCA Number:</td><td>241</td></tr>
+<tr><td class='emphatic'>Neighborhood:</td><td>FDYA</td></tr>
+<tr><td class='emphatic'>Property Type:</td><td>LND</td></tr>
+<tr><td class='emphatic'>Taxable:</td><td>YES</td></tr>
+<tr><td class='emphatic'>Active Exemptions:</td><td>Government Property - Property is exempt from property tax and the assessed value may not represent market value.</td><tr><td class='emphatic'>Fire District:</td><td>FIRE DISTRICT #03                                                                                   </td></tr><tr><td class='emphatic'>School District:</td><td>NORTH THURSTON S.D. #3                                                                              </td></tr><tr><td colspan='2'>&nbsp;</td></tr>
+</td></tr></table></td></tr></table><hr style={color:black}><p class='little'><b>Market Values</b></p><table width='100%'>
+<tr><td align='left' width='20%' class='emphatic'>Tax Year</th><td align='right' width='8%' class='emphatic'>2027</th><td align='right' width='8%' class='emphatic'>2026</th><td align='right' width='8%' class='emphatic'>2025</th><td align='right' width='8%' class='emphatic'>2024</th><td align='right' width='8%' class='emphatic'>2023</th><td align='right' width='8%' class='emphatic'>2022</th><td align='right' width='8%' class='emphatic'>2021</th><td align='right' width='8%' class='emphatic'>2020</th><td align='right' width='8%' class='emphatic'>2019</th><td align='right' width='8%' class='emphatic'>2018</th></tr><tr><td align='left' width='20%' class='emphatic'>Assessment Year</th><td align='right' width='8%' class='emphatic'>2026</th><td align='right' width='8%' class='emphatic'>2025</th><td align='right' width='8%' class='emphatic'>2024</th><td align='right' width='8%' class='emphatic'>2023</th><td align='right' width='8%' class='emphatic'>2022</th><td align='right' width='8%' class='emphatic'>2021</th><td align='right' width='8%' class='emphatic'>2020</th><td align='right' width='8%' class='emphatic'>2019</th><td align='right' width='8%' class='emphatic'>2018</th><td align='right' width='8%' class='emphatic'>2017</th></tr><tr><td>&nbsp;</td><td colspan='10'><hr style={color:black}></th></tr><tr><td>Market Value Land</td><td class=normal_right>$400</td><td class=normal_right>$400</td><td class=normal_right>$400</td><td class=normal_right>$400</td><td class=normal_right>$200</td><td class=normal_right>$300</td><td class=normal_right>$300</td><td class=normal_right>$300</td><td class=normal_right>$200</td><td class=normal_right>$200</td></tr><tr><td>Market Value Buildings</td><td class=normal_right>&nbsp;</td><td class=normal_right>&nbsp;</td><td class=normal_right>&nbsp;</td><td class=normal_right>&nbsp;</td><td class=normal_right>&nbsp;</td><td class=normal_right>&nbsp;</td><td class=normal_right>&nbsp;</td><td class=normal_right>&nbsp;</td><td class=normal_right>&nbsp;</td><td class=normal_right>&nbsp;</td></tr><tr><td class=emphatic>Market Value Total</td><td class=emphatic_right>$400</td><td class=emphatic_right>$400</td><td class=emphatic_right>$400</td><td class=emphatic_right>$400</td><td class=emphatic_right>$200</td><td class=emphatic_right>$300</td><td class=emphatic_right>$300</td><td class=emphatic_right>$300</td><td class=emphatic_right>$200</td><td class=emphatic_right>$200</td></tr></table><hr style={color:black}></div><p class='little'><b>Land Characteristics</b></p><table width='100%'><tr><td width='50%' valign='top' align='left'><table style='background-color:#F8F8F8' cellpadding='0' width='100%' border='0' cellspacing='0'><tr><td class='emphatic'  width='50%'>Land Flag</td><td align='left' width='14%'>1100</td></tr><td>&nbsp;</td><tr><td class='emphatic'  width='50%'>Lot Square Footage</td><td align='left' width='14%'>148</td></tr><td>&nbsp;</td><tr><td class='emphatic'  width='50%'>Lot Acreage</td><td align='left' width='14%'>0.003</td></tr><td>&nbsp;</td><tr><td class='emphatic' width='50%'>Effective Frontage</td><td align='left' width='14%'>Not Listed</td></tr><td>&nbsp;</td><tr><td class='emphatic' width='50%'>Effective Depth</td><td align='left' width='14%'>Not Listed</td></tr><td>&nbsp;</td></table></td><td width='45%' valign='top' align='left'><table style='background-color:#F8F8F8' cellpadding='0' width='100%' border='0' cellspacing='0'><tr><td class='emphatic'  width='52%'>Land Influence(s)</td><td width='40%' align='left' valign='top'>US-UNUSEABLE<img src='images/blank.gif' height='10'><br></td></tr></td></table></td></table></td><hr style={color:black}><table border='0' width='75%' align='center' style={margin: 5; }><tr><td>The Assessor's Office maintains property records on approximately 112,000 parcels in Thurston County for tax purposes. Though records are updated regularly, the accuracy and timeliness of published data cannot be guaranteed. Any person or entity that relies on information obtained from this website does so at his or her own risk. Neither Thurston County nor the Assessor will be held liable for damage or losses caused by use of this information. <i><b>All critical information should be independently verified.</b></i></td></tr><tr><td>&nbsp;</td></tr><tr><td align='center'><p><b>Office of the Assessor</b></td></tr><tr><td align='center'><b>Steven J. Drew, Assessor</b></td></tr><tr><td align='center'>3000 Pacific Ave SE, Olympia WA 98501</td></tr><tr><td align='center'><b>Customer Service (360)867-2200 -- Fax (360)867-2201 -- TDD (360)754-2933</b></td></tr><tr><td>&nbsp;</td></tr></table></div>
+</body>
+</html>

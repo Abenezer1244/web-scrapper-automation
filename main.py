@@ -18,7 +18,7 @@ from src.api import (
     webhooks_router,
 )
 from src.api.errors import RunRefusedHTTPException, run_refused_handler
-from src.api.middleware import SecurityHeadersMiddleware
+from src.api.middleware import DatabaseUnavailableMiddleware, SecurityHeadersMiddleware
 from src.api.readiness import database_ready
 from src.config import settings
 
@@ -64,6 +64,9 @@ app = FastAPI(
 
 # ─── Middleware ────────────────────────────────────────────────────────────────
 
+# Added first, so it sits innermost: its 503 then gets the security and CORS
+# headers below, which the catch-all Exception handler's responses never do.
+app.add_middleware(DatabaseUnavailableMiddleware)
 app.add_middleware(SecurityHeadersMiddleware)
 
 app.add_middleware(

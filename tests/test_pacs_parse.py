@@ -256,3 +256,15 @@ def test_uppercase_tags_still_counted():
     assert out is not None
     assert out["address"] == "9 PINE RD, FREELAND WA 98249"
     assert "parcel_id" not in out
+
+
+def test_name_path_requires_the_row_to_name_the_searched_owner():
+    """The portal search is starts-with: a search for DOE JANE can return DOE JANET.
+    With the searched name given, only a row naming that owner (or the owner as the
+    first co-owner) is an answer (Codex P1)."""
+    html = _page(_row("9876543210", "1234567890", "1 FIR LN, COUPEVILLE WA 98239", "DOE JANET"))
+    assert parse_pacs_result_html(html, "DOE JANE") is None
+    assert parse_pacs_result_html(html, "DOE JANET") is not None
+    co = _page(_row("9876543210", "1234567890", "1 FIR LN, COUPEVILLE WA 98239", "DOE JANE & DOE JOHN"))
+    assert parse_pacs_result_html(co, "DOE JANE") is not None
+    assert parse_pacs_result_html(co, "DOE JOHN") is None

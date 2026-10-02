@@ -156,13 +156,28 @@ def pacs_detail_url(pacs_url: str, prop_id: str) -> str:
     return urljoin(base, f"Property.aspx?cid={cid}&prop_id={prop_id}")
 
 
-def parse_pacs_result_html(html_text: str) -> dict | None:
+def _norm_name(text: str) -> str:
+    return " ".join(re.sub(r"[^A-Z0-9&' ]", " ", (text or "").upper()).split())
+
+
+def owner_cell_matches(cell: str, owner_name: str) -> bool:
+    """The grid's Owner Name cell names the searched owner: exactly, or as the first
+    of co-owners ("QUERY & SPOUSE"). The portal search is a starts-with match, so a
+    search for DOE JANE can return DOE JANET; that row is not an answer (Codex P1)."""
+    cell_n, q = _norm_name(cell), _norm_name(owner_name)
+    return bool(q) and (cell_n == q or cell_n.startswith(q + " &"))
+
+
+def parse_pacs_result_html(html_text: str, owner_name: str | None = None) -> dict | None:
     """Parse a PACS PropertyAccess search-results page into {address, value, prop_id}.
 
     ``address`` is the grid's Property Address (the SITUS). The grid has no mailing
     column, so ``mailing`` is never returned from here; ``prop_id`` (the portal's
     own integer key, taken from the row's detail link) is what a caller uses to
     fetch the Property.aspx page where the labelled "Mailing Address:" lives.
+    With ``owner_name`` the single row must also name that owner (see
+    ``owner_cell_matches``); without a header naming the owner column, any cell
+    may carry the name.
 
     Over-inference guard (Codex point C). An owner-name search can match MANY
     properties; the old parser flattened ALL result rows' cells and trusted the
@@ -210,6 +225,11 @@ def parse_pacs_result_html(html_text: str) -> dict | None:
     if len(candidate_rows) != 1:
         return None
     cells, row_html = candidate_rows[0]
+    if owner_name is not None and not any(owner_cell_matches(c, owner_name) for c in cells):
+        # Column positions drift (empty cells are dropped above), so any cell may
+        # carry the name; an exact normalized owner string cannot collide with an
+        # address, legal or value cell.
+        return None
 
     result: dict[str, str] = {}
     for cell in cells:
@@ -328,7 +348,7 @@ def lookup_pacs_by_name(pacs_url: str, owner_name: str) -> dict | None:
         if r is None or r.status_code != 200 or "None found" in r.text:
             return None
 
-        result = parse_pacs_result_html(r.text)
+        result = parse_pacs_result_html(r.text, owner_name)
         if result and result.get("prop_id"):
             # The grid never carries the owner's mailing address; the detail page
             # does, under its own label. One more same-origin GET per unique hit.

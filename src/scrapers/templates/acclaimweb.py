@@ -1100,7 +1100,7 @@ class AcclaimWebScraper(BridgeScraper):
                 # key. Replaces the old flatten-all-rows / first-10-digit-cell parse
                 # that could trust row 1 of an ambiguous match (and mislabel the
                 # account number as the parcel).
-                result = parse_pacs_result_html(r.text)
+                result = parse_pacs_result_html(r.text, name)
                 if result and result.get("prop_id"):
                     # The grid's address cell is the situs; the owner's mailing
                     # address lives only on the detail page, under its own label.

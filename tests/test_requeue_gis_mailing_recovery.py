@@ -127,8 +127,8 @@ async def test_rerunning_is_a_no_op(db, business_user, tmp_path):
 
 
 async def test_a_county_without_a_mailing_source_is_refused(tmp_path):
-    with pytest.raises(ValueError, match="thurston"):
-        await asyncio.to_thread(_run, ["thurston"], True, tmp_path)
+    with pytest.raises(ValueError, match="kitsap"):
+        await asyncio.to_thread(_run, ["kitsap"], True, tmp_path)
 
 
 async def test_a_json_null_row_is_queued_where_the_sweep_can_see_it_and_recovers(

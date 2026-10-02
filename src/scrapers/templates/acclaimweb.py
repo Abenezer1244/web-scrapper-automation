@@ -25,7 +25,7 @@ from src.scrapers.base_scraper import (
     normalize_party_text,
 )
 from src.scrapers.divorce import is_divorce_doc, orient_divorce_party
-from src.scrapers.enrichment.pacs import parse_pacs_result_html
+from src.scrapers.enrichment.pacs import mailing_from_detail, parse_pacs_result_html
 from src.scrapers.preforeclosure import (
     is_cancellation_or_admin,
     orient_pre_foreclosure_party,
@@ -1100,7 +1100,16 @@ class AcclaimWebScraper(BridgeScraper):
                 # key. Replaces the old flatten-all-rows / first-10-digit-cell parse
                 # that could trust row 1 of an ambiguous match (and mislabel the
                 # account number as the parcel).
-                return parse_pacs_result_html(r.text)
+                result = parse_pacs_result_html(r.text, name)
+                if result and result.get("prop_id"):
+                    # The grid's address cell is the situs; the owner's mailing
+                    # address lives only on the detail page, under its own label.
+                    mailing = mailing_from_detail(_s, pacs_url, result.pop("prop_id"), timeout=10)
+                    if mailing:
+                        result["mailing"] = mailing
+                elif result:
+                    result.pop("prop_id", None)
+                return result
             except Exception:
                 return None
 
@@ -1136,39 +1145,9 @@ class AcclaimWebScraper(BridgeScraper):
         Lookups run serialized on one worker thread (one session, one disclaimer
         acceptance, polite spacing), off the event loop.
         """
-        from src.scrapers.enrichment.taxsifter import TaxSifterClient
+        from src.scrapers.enrichment.taxsifter import fill_addresses_by_owner
 
-        loop = asyncio.get_running_loop()
-        try:
-            client = await loop.run_in_executor(None, TaxSifterClient, self.county)
-        except Exception as exc:
-            _logger.warning("TaxSifter unavailable for %s: %s", self.county, type(exc).__name__)
-            return
-
-        found = failures = 0
-        for record in records:
-            try:
-                result = await loop.run_in_executor(None, client.lookup, record.party_name)
-                failures = 0
-            except Exception as exc:
-                # One failed lookup is skipped. A refused disclaimer, or three
-                # failures in a row, ends the pass: the rest would fail the same way.
-                failures += 1
-                _logger.warning("TaxSifter lookup failed for %s: %s", self.county, type(exc).__name__)
-                if "disclaimer" in str(exc) or failures >= 3:
-                    break
-                continue
-            if not result:
-                continue
-            record.property_address = result["address"]
-            if result.get("mailing"):
-                record.mailing_address = result["mailing"]
-            if result.get("value"):
-                record.enrichment_data = record.enrichment_data or {}
-                record.enrichment_data["assessed_value"] = result["value"]
-            found += 1
-        _logger.info("TaxSifter lookup (%s): found addresses for %d/%d records",
-                     self.county, found, len(records))
+        await fill_addresses_by_owner(self.county, records)
 
     async def _go_next_page(self) -> bool:
         """Click the Next page button in the Kendo pager."""

@@ -298,6 +298,15 @@ app.conf.beat_schedule = {
         "task": "src.workers.mailing_recovery.recover_deferred_mailing",
         "schedule": crontab(minute="3-59/10"),  # every 10 minutes from :03
     },
+    "data-quality-sweep": {
+        # Judges each job that finished in the last day, once, against its county x
+        # record-type baseline (parcel / property / mailing / phone / email coverage,
+        # mailing-echoes-property). A collapse raises an ops alert; nothing about the
+        # job changes. Hourly is plenty: the signal is "this county went dark", not
+        # "this row is late". See src/workers/data_quality.py.
+        "task": "src.workers.data_quality.data_quality_sweep",
+        "schedule": crontab(minute=33),  # hourly at :33, clear of the King sweeps
+    },
     "recover-deferred-owners": {
         # The reading half of `owner_lookup_deferred`: names delivered King tax
         # leads whose owner lookup a job could not finish. Bounded (120 parcels,

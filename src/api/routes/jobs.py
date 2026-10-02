@@ -1351,11 +1351,13 @@ def _is_count(v) -> bool:
 
 def _snapshot_json(snapshot: dict) -> str | None:
     """The snapshot as JSON PostgreSQL's jsonb accepts, else None (reviews r3, r4): no
-    non-finite number (NaN, Infinity, or an overflowing literal such as 1e9999) and no
-    NUL escape, either of which fails the cast as a 500 after the gates."""
+    non-finite number (NaN, Infinity, or an overflowing literal such as 1e9999), no NUL
+    escape, and valid UTF-8 (a lone surrogate), any of which fails as a 500 after the
+    gates."""
     try:
-        snap = json.dumps(snapshot, allow_nan=False)
-    except ValueError:
+        snap = json.dumps(snapshot, allow_nan=False, ensure_ascii=False)
+        snap.encode("utf-8")
+    except ValueError:  # UnicodeEncodeError is a ValueError
         return None
     return None if "\\u0000" in snap else snap
 
@@ -1380,7 +1382,7 @@ def _valid_quote_payload(quote: dict):
     if not (_is_count(price) and 0 < price <= _PG_INT_MAX
             and isinstance(cur, str) and len(cur) == 3
             and isinstance(pv, str) and 0 < len(pv) <= 32
-            and "\x00" not in cur + pv  # a text column refuses a NUL byte
+            and (cur + pv).isascii() and (cur + pv).isprintable()  # no NUL, no surrogate
             and stopped in _QUOTE_STOPS and _is_count(remaining)):
         return None
     return expires_at, ids, stopped is not None and remaining > 0

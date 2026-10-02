@@ -557,6 +557,8 @@ async def test_a_busy_publisher_is_skipped_and_never_waited_on(
     {"included_remaining_at_quote": "nul\x00byte"},  # jsonb refuses \u0000
     {"currency": "U\x00D"},                          # a text column refuses NUL
     {"pricing_version": "2026\x0006"},
+    {"included_remaining_at_quote": "lone\ud800surrogate"},  # not encodable as UTF-8
+    {"currency": "U\ud800D"},
 ])
 async def test_a_corrupt_stored_quote_is_refused_never_a_500(
     db, client, business_user, business_token, redis_client, _lookups_on, published, corrupt,

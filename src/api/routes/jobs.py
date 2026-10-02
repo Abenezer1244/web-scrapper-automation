@@ -1349,6 +1349,10 @@ def _is_count(v) -> bool:
     return isinstance(v, int) and not isinstance(v, bool) and v >= 0
 
 
+def _no_json_constant(name: str):
+    raise ValueError(f"non-standard JSON constant {name}")
+
+
 def _valid_quote_payload(quote: dict):
     """(expires_at, unique quoted ids, truncated) when the stored quote is complete and
     well-formed, else None. A corrupt payload is refused as unsupported, never a 500
@@ -1514,7 +1518,8 @@ async def confirm_contact_lookups(
     if raw is None:
         raise _quote_expired()
     try:
-        quote = json.loads(raw)
+        # NaN / Infinity would pass here and then fail the jsonb snapshot cast (r3).
+        quote = json.loads(raw, parse_constant=_no_json_constant)
     except ValueError:
         quote = {}
     if not isinstance(quote, dict):  # valid JSON, but not a quote object

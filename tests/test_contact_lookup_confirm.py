@@ -552,6 +552,8 @@ async def test_a_busy_publisher_is_skipped_and_never_waited_on(
     {"remaining": -1},
     {"remaining": None},
     {"stopped": "not_a_planner_stop"},
+    {"counts": float("nan")},                        # stored as NaN: not JSON for jsonb
+    {"examined": float("inf")},
 ])
 async def test_a_corrupt_stored_quote_is_refused_never_a_500(
     db, client, business_user, business_token, redis_client, _lookups_on, published, corrupt,
@@ -802,12 +804,25 @@ def test_the_confirm_accepts_every_stop_the_planner_can_record():
 
     from src.api import contact_lookup_planner as planner
 
-    assigned = {
-        n.value.value for n in ast.walk(ast.parse(inspect.getsource(planner)))
-        if isinstance(n, ast.Assign) and isinstance(n.value, ast.Constant)
-        and any(isinstance(t, ast.Attribute) and t.attr == "stopped" for t in n.targets)
-    }
-    assert assigned, "no `.stopped = ...` assignment found: the scan is stale"
+    def targets(n):
+        if isinstance(n, ast.Assign):
+            return n.targets
+        return [n.target] if isinstance(n, ast.AnnAssign) else []
+
+    def named_stopped(t) -> bool:
+        return (isinstance(t, ast.Attribute) and t.attr == "stopped") or (
+            isinstance(t, ast.Name) and t.id == "stopped")
+
+    assigned, other = set(), []
+    for n in ast.walk(ast.parse(inspect.getsource(planner))):
+        if not any(named_stopped(t) for t in targets(n)) or n.value is None:
+            continue
+        if isinstance(n.value, ast.Constant):
+            assigned.add(n.value.value)
+        else:  # a computed stop cannot be checked statically: fail, do not skip
+            other.append(ast.unparse(n))
+    assert not other, other
+    assert {"cap", "credit_cap", "scan_limit"} <= assigned, "the scan is stale"
     assert assigned <= set(jobs_routes._QUOTE_STOPS), assigned
 
 

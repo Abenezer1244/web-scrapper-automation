@@ -9,10 +9,17 @@ Owner's question: for every supported WA county and record type, does BridgeLead
 - [x] 1. Map architecture source -> UI (5 parallel read-only mappers: county_gis, enrich orchestration, persistence/API/export, scraper registry, recovery sweep)
 - [x] 12. Read-only prod DB analysis (`scratchpad/dq_mailing_audit.py` via `railway run`, role postgres, transaction_read_only=on). Result: coverage is COUNTY-shaped, not record-type-shaped.
 - [x] 4. Clark + Benton probate jobs pulled (ids, ranges, counts, logs, samples) — see report
-- [ ] 2/3. County x record-type matrices (code + prod config + official-source research, 3 parallel research agents)
-- [ ] 5. Verify a controlled sample of real parcels against official county sources (research agents, 1 lookup each, masked)
-- [ ] 6/7/9/10/11. Confirm from code: no property->mailing copy; parcel stays string; no skip-trace coupling; dedup does not block later enrichment; no field-name drop
-- [ ] 8. County source changes for the broken integrations (HTTP status, bot protection, tokens)
+- [x] 2/3. County x record-type matrices (code + prod config + official-source research) — see final report
+- [x] 5. Real parcels verified: Clark 196948000 + 97976264 (PIC), Benton 131073011125003 (PACS: county publishes mailing, BridgeLeads NULL), Okanogan 9935250696 / 1250110000 / 3322070010 (TaxSifter: 1250110000 is county-owned, assigned to two leads = wrong inference), Thurston 74700001201 (A+)
+- [x] 6/7/9/10/11. Confirmed from code: no property->mailing copy in enrichment (but the PACS grid parser WAS a situs echo: fixed); parcels never int-cast; skip trace gates only Tracerfy; dedup does not block later lookups; one column name end to end
+- [x] 8. Sources probed: PACS forms identical on 6 portals (Island offline), Clark PIC 429 after ~10 fast requests, Chelan detail GET 500 without session, Whitman token-required, Kitsap psearch 500s
+- [x] Phase 1 `86195315`: pacs_parcel.py adapter (7 PACS counties) + pacs.py situs-echo fix + detail parser; 72 tests
+- [x] Phase 2 `c07d7c78`: thurston_assessor.py; 24 tests
+- [x] Phase 3 `1d2c3d2a`: Okanogan never infers parcel from surname; TaxSifter owner addresses shared helper; 36 tests
+- [x] Phase 4 `77a6a86c` + `e4f1d153`: workers/data_quality.py hourly sweep + ops alert + scripts/data_quality_report.py; 17 tests. Prod dry run: king code_violation 37014cb9 is a TRUE positive (3.5% mailing vs 65% baseline)
+- [ ] Phase 5 (after -76 pushes fix/clark-probate-mailing): wire adapters into county_gis `_BULK_MAILING_SOURCES`; `has_mailing_source()` drives deferral + `mailing_missing`; recovery/backfill discover `parcel + NULL mailing` rows marker-independently (Snohomish tax 1,751)
+- [ ] Phase 6: backfill script (dry-run default, county-scoped, fill-only, outcome counts) — counts to owner, approval before apply
+- [ ] Phase 7: Playwright E2E Benton (+ Clark once -76 lands), Codex review, journal, memory
 - [x] Codex consult with the evidence (scratchpad `codex_consult_out.txt`): root cause CONFIRMED fleet-wide; P1s to honor: PACS parcel→prop_id identity must be corroborated (explicit parcel_mismatch), never reuse the owner-NAME PACS parser for parcel enrichment, PACS "mailing" built from address lines may be a situs echo (reject mailing == property unless the page labels it mailing), provenance on every write, backfill discovers rows independent of deferred markers with dry-run + per-source outcome counts + rollback; DQ report needs outcome distributions not just coverage %.
 - [x] Coordination: Clark PIC mailing is being built by session -76 (worktree wt-clark-mailing, uncommitted, Codex P1s in progress, no PR). Clark is OUT of my fix scope; I stack on its `_BULK_MAILING_SOURCES` / `has_mailing_source()` after it merges. Until then I touch only NEW files.
 - [ ] CHECK-IN with owner: findings + proposed fix scope before any code change

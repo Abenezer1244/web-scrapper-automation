@@ -116,6 +116,8 @@ _RETRY_BACKOFF_S = 8.0
 # One call's wall-clock budget; parcels past it defer to mailing recovery.
 # ponytail: fixed budget per call, pass one in from the caller if a job needs more.
 CALL_BUDGET_S = 120.0  # the recovery tick shares 480 s across every county
+# The budget is checked before each parcel, so a call can overrun it by at most one
+# parcel's worst case (two requests that each time out once): bounded, accepted.
 _LEASE_WAIT_S = 10.0
 
 
@@ -135,7 +137,22 @@ def _http_get(session: requests.Session, url: str) -> requests.Response:
 
 
 def _http_post(session: requests.Session, url: str, data: dict) -> requests.Response:
-    return session.post(url, data=data, timeout=_TIMEOUT_S, allow_redirects=True)
+    """The search postback. PACS answers it with a 302 to SearchResults.aspx on the same
+    portal; that ONE hop is followed by hand, and only when it stays on the portal's
+    own origin (Codex P1, SSRF): a Location anywhere else is refused, never fetched."""
+    from urllib.parse import urljoin
+
+    from src.utils.safe_http import same_origin
+
+    resp = session.post(url, data=data, timeout=_TIMEOUT_S, allow_redirects=False)
+    if resp.status_code not in (301, 302, 303, 307, 308):
+        return resp
+    target = urljoin(url, resp.headers.get("Location", ""))
+    if not same_origin(target, url):
+        _logger.warning("pacs_parcel: refused an off-origin redirect from the search")
+        resp.status_code = 400  # a client error: not retried, counted as request_failed
+        return resp
+    return session.get(target, timeout=_TIMEOUT_S, allow_redirects=False)
 
 
 def _form_tokens(html: str) -> dict[str, str] | None:

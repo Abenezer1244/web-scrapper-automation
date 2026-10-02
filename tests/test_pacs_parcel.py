@@ -362,3 +362,42 @@ class TestResolve:
         monkeypatch.setattr(pp, "_http_post", lambda session, url, data: (events.append("post"), _Resp(200, _GOOD_SEARCH))[1])
         pp.resolve_mailing("benton", [_PARCEL])
         assert events == ["sleep 3", "get", "sleep 3", "post", "sleep 3", "get"]
+
+
+class _RedirectSession:
+    """A session whose POST answers with a redirect; records what was fetched."""
+
+    def __init__(self, location: str):
+        self.location, self.fetched = location, []
+
+    def post(self, url, **kw):
+        assert kw.get("allow_redirects") is False
+        r = _Resp(302)
+        r.headers = {"Location": self.location}
+        return r
+
+    def get(self, url, **kw):
+        assert kw.get("allow_redirects") is False
+        self.fetched.append(url)
+        return _Resp(200, _GOOD_SEARCH)
+
+
+class TestSearchRedirect:
+    """The search postback 302s to SearchResults.aspx; only that same-origin hop is
+    followed (Codex P1, SSRF)."""
+
+    def test_the_same_origin_results_hop_is_followed(self):
+        s = _RedirectSession("SearchResults.aspx?cid=0")
+        resp = pp._http_post(s, _SITE.search_url, {})
+        assert resp.status_code == 200
+        assert s.fetched == ["https://propertysearch.co.benton.wa.us/propertyaccess/SearchResults.aspx?cid=0"]
+
+    @pytest.mark.parametrize("location", [
+        "http://169.254.169.254/latest/meta-data/",
+        "https://evil.example/propertyaccess/SearchResults.aspx",
+        "http://propertysearch.co.benton.wa.us/propertyaccess/SearchResults.aspx",
+    ])
+    def test_an_off_origin_redirect_is_refused_never_fetched(self, location):
+        s = _RedirectSession(location)
+        resp = pp._http_post(s, _SITE.search_url, {})
+        assert resp.status_code == 400 and s.fetched == []

@@ -166,7 +166,7 @@ def main() -> None:
     ap.add_argument("--apply", action="store_true", help="write; default is a dry run")
     ap.add_argument("--batch", type=int, default=20, help="parcels per adapter call")
     ap.add_argument("--max-parcels", type=int, default=200, help="parcels per run")
-    ap.add_argument("--report", help="JSONL of per-row outcomes (ids truncated, no addresses)")
+    ap.add_argument("--report", help="JSONL of per-row outcomes: row id prefix, parcel (a public record id), outcome; never an address or name")
     args = ap.parse_args()
     if args.batch < 1 or args.max_parcels < 1:
         ap.error("--batch and --max-parcels must be positive")

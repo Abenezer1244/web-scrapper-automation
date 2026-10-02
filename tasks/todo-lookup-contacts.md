@@ -5632,6 +5632,49 @@ prod without the owner).
 5. Cache invalidation between the quote, the progress and the results table.
 6. Anything in the 5-file split, or the stub-rig verification, that misses a real failure.
 
+### Codex pre-code consult r1 on 1c (2026-10-02): PLAN: REVISE, 5 P1 + 3 P2 + 1 P3, all adopted
+Output: `<scratchpad 79ada66a>/codex_1c_consult_r1_out.txt`. Answers: Q1 show on BOTH tabs, disabled
+with the upsell below Pro (fresh, fail-closed `["me"]`); Q2 newest action only; Q4 the server's
+`quote_id` idempotency is the money guard, the client adds a synchronous guard; Q6 the split is
+fine. The amendments (they supersede the BUILD SPEC where they differ):
+- **AS1 (P1) scope:** the dialog says, prominently: "This covers every eligible lead on the
+  {New / Already delivered} tab, not only the ones your search or filters show."
+- **AS2 (P1) no raw backend text in the dialog:** every refusal renders FIXED copy chosen by
+  `detail.code` (`quote_expired`, `quote_stale`, `quote_unsupported`, `quote_mismatch`,
+  `nothing_to_look_up`, `run_not_finished`, `contact_lookups_unavailable`); anything else goes
+  through `getFriendlyError(err, fixed fallback)`. Never `error.message` / `detail.message`
+  directly. The in-dialog error has `role="alert"`. Re-quote is offered on `quote_expired`,
+  `quote_stale` AND `quote_unsupported`.
+- **AS3 (P1) polling within the shared 60/min bucket:** the status polls every **15 s** (not 10),
+  only while the document is visible (React Query's default `refetchIntervalInBackground:
+  false`), one poller per page (the newest action); the contact-lookup queries never auto-retry
+  a 429, and after a 429 the next poll waits 60 s. Budget per open page: ~4 status + 0.25 list
+  req/min beside the results list's 2/min. Cross-tab coordination and a dedicated backend bucket
+  are NOT built (decision: the backoff bounds it; a backend zone is a later BE PR if real use
+  shows 429s).
+- **AS4 (P1)** the existing "Results typically appear within 10-15 minutes" notice (page.tsx
+  ~776-792) promises a time the backend deliberately does not (caps and the kill switch pause
+  lookups). Replaced by "Contact lookups are processing. This page refreshes automatically.";
+  timing and pause language live only in the progress component.
+- **AS5 (P1) price honesty:** "After your included lookups, each billable lookup costs $X. Leads we
+  can answer from an earlier lookup, and some the provider cannot match, are not billed, so the
+  final billable count may be lower." No estimated total (the API gives none).
+- **AS6 (P2)** a status 404 shows "This lookup is no longer available." with a "Refresh" action
+  (re-reads the list), never an empty or success state.
+- **AS7 (P2) exact query keys:** `["contact-lookups", jobId, category]` (the list) and
+  `["contact-lookup", jobId, category, actionId]` (the status). A confirm invalidates the list
+  key; a change in the newest action's outcomes, or it turning final, invalidates
+  `["results", jobId]` (prefix: every page / search / sort) and, when final, the list.
+- **AS8 (P2) one live region:** a single stable `role="status" aria-live="polite"
+  aria-atomic="true"` element holds status, reason, pause and outcomes. Every dialog state has a
+  `DialogTitle` and a `DialogDescription`.
+- **AS9 (P3) verification matrix, added:** double-click confirm, two tabs confirming the same
+  quote, a quote replaced by a newer one (410), reload after a 202 (the progress finds it via the
+  list), 409 / 410 / 402 / 503 bodies including a hostile-looking `message` (must not render),
+  a status 404, a 429 on the poll (backs off, no error flood), an active search / tax filter
+  while quoting (AS1 copy visible).
+- Files unchanged (5). `page.tsx` now also carries AS4.
+
 ## Safety PR: Alembic can never reach production from a test or a stray CLI run (PLAN, 2026-09-27)
 
 The Deferred bullet below, taken now. Same class as the two production wipes.

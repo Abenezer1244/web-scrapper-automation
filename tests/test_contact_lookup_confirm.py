@@ -352,6 +352,27 @@ async def test_an_upper_case_job_id_is_the_same_run_and_the_same_action(
     assert _actions_of(business_user.id) == 1
 
 
+async def test_a_quote_made_on_an_upper_case_path_is_confirmable(
+    db, client, business_user, business_token, redis_client, _lookups_on, published,
+):
+    """r6: the QUOTE canonicalizes too, so the pair agrees on the key whatever the
+    spelling (it used to store the raw path, and the canonical confirm missed it)."""
+    job = _job(business_user.id)
+    _seed(business_user.id, job, [{}])
+    qid = await _quoted(client, business_token, job.upper())
+
+    assert _stored(redis_client, business_user.id, job)["job_id"] == job
+    r = await _confirm(client, business_token, job, qid)
+    assert r.status_code == 202, r.text
+
+
+async def test_a_malformed_job_id_is_404_on_the_quote_too(
+    db, client, business_token, _lookups_on,
+):
+    r = await _quote(client, business_token, "not-a-uuid")
+    assert r.status_code == 404, r.text
+
+
 async def test_a_run_that_has_not_finished_is_409(
     db, client, business_user, business_token, _lookups_on, published,
 ):

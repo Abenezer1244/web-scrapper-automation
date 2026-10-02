@@ -1128,6 +1128,16 @@ def _quote_key(user_id: str, job_id: str, category: str) -> str:
     return f"bridgeleads:contact_lookup:quote:v2:{user_id}:{job_id}:{category}"
 
 
+def _canonical_job_id(job_id: str) -> str:
+    """The path id as a canonical UUID, so the quote and its confirm agree on the quote
+    key, the replay match and every cast; a malformed one is 404, never a 500 (2d r5/r6)."""
+    try:
+        return str(uuid.UUID(job_id))
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                            detail="Job not found") from None
+
+
 def _lookups_unavailable() -> HTTPException:
     return HTTPException(
         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -1167,6 +1177,7 @@ async def quote_contact_lookups(
         )
     except TimeoutError:
         raise _lookups_unavailable() from None
+    job_id = _canonical_job_id(job_id)
 
     job = (await db.execute(
         select(Job).where(Job.id == job_id, Job.user_id == current_user.id)
@@ -1505,12 +1516,7 @@ async def confirm_contact_lookups(
         )
     except TimeoutError:
         raise _lookups_unavailable() from None
-    try:
-        # Canonical from here on: the uuid casts, the quote key, the replay match (r5).
-        job_id = str(uuid.UUID(job_id))
-    except ValueError:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
-                            detail="Job not found") from None
+    job_id = _canonical_job_id(job_id)  # the casts, the quote key, the replay match (r5)
 
     job = (await db.execute(
         select(Job).where(Job.id == job_id, Job.user_id == current_user.id)

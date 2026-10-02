@@ -5418,6 +5418,26 @@ Output: `codex_2e_consult_r4_out.txt`. AR1 CLOSED; every action-level `status_re
 literal in the worker and the reconciler matches Design 6. Build on: Design 1-9 as
 amended by AP1-AP4, AQ1-AQ3, AR1.
 
+### 2e BUILT (2026-10-02, branch `feat/lookup-1b2e-status`, rebased on main `d10f95a6`), before the Codex diff review
+- `jobs.py`: `GET /jobs/{job_id}/contact-lookups/{action_id}` and `GET /jobs/{job_id}/contact-lookups`
+  as specified: `_OUTCOME_BUCKET` (AP4), `_CUSTOMER_REASON` (Design 6, AR1),
+  `UnmappedDispositionError`, `_canonical_action_id`, `_lookup_read_rate_limit` (general,
+  a stall proceeds), `_lookup_pause` (AP3), `_ACTION_STATUS_SQL` (one statement, the
+  aggregate typed `JSONB` so asyncpg returns a dict).
+- `schemas.py`: `ContactLookupReason`, `ContactLookupOutcomes`, `ContactLookupStatus`,
+  `ContactLookupSummary`, `ContactLookupList`. `openapi.json`: +446, 0 deletions, `--check` OK.
+- `tests/test_contact_lookup_status.py`: **27 pass**, every state reached by the real chain;
+  the bucket / billable / reason pins; an API-role + RLS test of the status query.
+- Test traps hit (fixed): the pause spy also counts the QUOTE's read (cleared after setup);
+  `results.skip_trace_status` is NOT NULL (`purged` is the non-answer); `SET LOCAL ROLE`
+  left in the fixture transaction broke teardown (rolled back in `finally`).
+- **Mutations (`mut_2e.py`): 30/30 caught.** One survivor on the first pass ("an unreadable
+  pause is a 500"): `read_pause_state` absorbs a failing CALL, so the route's own guard was
+  reached by no test; pinned by a real fault (a `REDIS_URL` the client cannot be built from).
+  A full-file run showed 5 unrelated failures once: peer -76 ran a FLUSHDB on Redis db 13
+  mid-run (confirmed by them); each catch was re-verified against its expected test.
+- ruff clean; no type checker is configured for this repo.
+
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever
       the tab has leads that have never been looked up; when the quote comes back with
       `max_new_lookups = 0` the dialog explains why (every lead is already answered, in progress,

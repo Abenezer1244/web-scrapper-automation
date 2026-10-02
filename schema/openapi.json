@@ -7408,7 +7408,7 @@
                 }
               }
             },
-            "description": "Lookups are switched off or a dependency is unreachable."
+            "description": "Lookups are switched off or a dependency is unreachable. A database outage answers with the service-wide body instead, {detail, ref} with Retry-After; retrying is safe (a confirmed quote replays its action)."
           }
         },
         "security": [

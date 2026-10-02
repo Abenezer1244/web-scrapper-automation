@@ -1494,7 +1494,10 @@ async def _publish_contact_lookup(task, action_id: str) -> bool:
         410: {"model": ContactLookupConfirmErrorResponse,
               "description": "The quote expired or was replaced. Nothing was charged."},
         503: {"model": ContactLookupUnavailableResponse,
-              "description": "Lookups are switched off or a dependency is unreachable."},
+              "description": "Lookups are switched off or a dependency is unreachable. "
+                             "A database outage answers with the service-wide body "
+                             "instead, {detail, ref} with Retry-After; retrying is "
+                             "safe (a confirmed quote replays its action)."},
     },
 )
 async def confirm_contact_lookups(
@@ -1674,9 +1677,13 @@ async def confirm_contact_lookups(
             )
             await db.commit()
         except Exception:  # noqa: BLE001 - only the publish clock; P3 tolerates NULL
-            await db.rollback()
             _logger.warning("contact lookup %s: dispatched_at not stamped", action_id,
                             exc_info=True)
+            try:
+                await db.rollback()
+            except Exception:  # noqa: BLE001 - a dead connection; the purchase is committed
+                _logger.warning("contact lookup %s: rollback after the stamp failed",
+                                action_id, exc_info=True)
 
     # `user_id`, never `current_user.id`: a rollback above (a failed stamp) expires the
     # ORM user, and reading it would lazy-load on an async session (MissingGreenlet),

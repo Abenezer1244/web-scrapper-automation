@@ -13,6 +13,7 @@ between the publish and the `dispatched_at` stamp (AO2).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib
 import json
 import time
@@ -103,6 +104,29 @@ def _events(aid: str) -> list[tuple]:
         return [tuple(r) for r in s.execute(text(
             "SELECT from_status, to_status FROM contact_lookup_action_events "
             "WHERE action_id = :a ORDER BY at, id"), {"a": aid})]
+
+
+@contextlib.contextmanager
+def _stamp_refused(quote_id: str):
+    """FAULT INJECTION (labelled): a temporary trigger refuses this action's
+    `dispatched_at` stamp, after its purchase has committed."""
+    fn, trig = f"t_refuse_stamp_{uuid.uuid4().hex[:8]}", f"trg_{uuid.uuid4().hex[:8]}"
+    with system_sync_session() as s:
+        s.execute(text(
+            f"CREATE FUNCTION {fn}() RETURNS trigger AS $f$ BEGIN "
+            f"IF NEW.quote_id = '{quote_id}' AND NEW.dispatched_at IS NOT NULL THEN "
+            "RAISE EXCEPTION 'injected: the stamp is refused'; END IF; RETURN NEW; END "
+            "$f$ LANGUAGE plpgsql"))
+        s.execute(text(f"CREATE TRIGGER {trig} BEFORE UPDATE ON contact_lookup_actions "
+                       f"FOR EACH ROW EXECUTE FUNCTION {fn}()"))
+        s.commit()
+    try:
+        yield
+    finally:
+        with system_sync_session() as s:
+            s.execute(text(f"DROP TRIGGER {trig} ON contact_lookup_actions"))
+            s.execute(text(f"DROP FUNCTION {fn}()"))
+            s.commit()
 
 
 def _deep(levels: int):
@@ -537,28 +561,45 @@ async def test_a_stamp_the_database_refuses_still_accepts_the_purchase(
     job = _job(business_user.id)
     _seed(business_user.id, job, [{}])
     qid = await _quoted(client, business_token, job)
-    fn, trig = f"t_refuse_stamp_{uuid.uuid4().hex[:8]}", f"trg_{uuid.uuid4().hex[:8]}"
-    with system_sync_session() as s:
-        s.execute(text(
-            f"CREATE FUNCTION {fn}() RETURNS trigger AS $f$ BEGIN "
-            f"IF NEW.quote_id = '{qid}' AND NEW.dispatched_at IS NOT NULL THEN "
-            "RAISE EXCEPTION 'injected: the stamp is refused'; END IF; RETURN NEW; END "
-            "$f$ LANGUAGE plpgsql"))
-        s.execute(text(f"CREATE TRIGGER {trig} BEFORE UPDATE ON contact_lookup_actions "
-                       f"FOR EACH ROW EXECUTE FUNCTION {fn}()"))
-        s.commit()
-    try:
+    with _stamp_refused(qid):
         r = await _confirm(client, business_token, job, qid)
-    finally:
-        with system_sync_session() as s:
-            s.execute(text(f"DROP TRIGGER {trig} ON contact_lookup_actions"))
-            s.execute(text(f"DROP FUNCTION {fn}()"))
-            s.commit()
 
     assert r.status_code == 202, r.text
     aid = r.json()["action_id"]
     assert published == [aid]
     a = _action(aid)
+    assert (a.status, a.dispatched_at) == ("dispatching", None)
+
+
+async def test_a_rollback_that_fails_after_the_stamp_still_accepts_the_purchase(
+    db, client, business_user, business_token, _lookups_on, published, monkeypatch,
+    caplog,
+):
+    """FAULT INJECTION (labelled), rebase check: the stamp fails AND the rollback after
+    it fails (a dead connection). The purchase is committed, so the answer is still 202;
+    the DB-outage middleware (#428) must never turn it into a 503."""
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    job = _job(business_user.id)
+    _seed(business_user.id, job, [{}])
+    qid = await _quoted(client, business_token, job)
+    real_rollback = AsyncSession.rollback
+    failed: list[str] = []
+
+    async def rollback_fails_once(self):
+        if not failed:
+            failed.append("rollback")
+            raise ConnectionError("injected: the connection died mid-rollback")
+        return await real_rollback(self)
+
+    monkeypatch.setattr(AsyncSession, "rollback", rollback_fails_once)
+    with _stamp_refused(qid):
+        r = await _confirm(client, business_token, job, qid)
+
+    assert r.status_code == 202, r.text
+    assert failed == ["rollback"]
+    assert "rollback after the stamp failed" in caplog.text
+    a = _action(r.json()["action_id"])
     assert (a.status, a.dispatched_at) == ("dispatching", None)
 
 

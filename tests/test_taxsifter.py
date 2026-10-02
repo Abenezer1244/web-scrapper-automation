@@ -266,10 +266,34 @@ def test_requests_are_spaced(portal, monkeypatch):
     assert time.monotonic() - start >= 0.6
 
 
-def test_the_douglas_origin_is_the_only_one_and_https():
+def test_the_origins_are_the_two_known_portals_and_https():
     assert taxsifter.TAXSIFTER_ORIGINS == {
         "douglas": "https://douglaswa-taxsifter.publicaccessnow.com",
+        "okanogan": "https://okanoganwa-taxsifter.publicaccessnow.com",
     }
+
+
+class _Rec:
+    def __init__(self, party_name: str):
+        self.party_name = party_name
+        self.parcel_id = None
+        self.property_address = None
+        self.mailing_address = None
+        self.enrichment_data = None
+
+
+async def test_fill_addresses_by_owner_fills_address_and_mailing_and_never_a_parcel(portal, monkeypatch):
+    """The shared helper behind Douglas (AcclaimWeb) and Okanogan (Tyler SelfService):
+    a unique owner match fills property and mailing; parcel_id stays None."""
+    monkeypatch.setattr(taxsifter, "_SPACING_S", 0.0)
+    monkeypatch.setattr(taxsifter, "TaxSifterClient", lambda county: _client(portal))
+    hit, junk = _Rec("DOE JANE Q"), _Rec("INC")  # "INC" is not an owner query: no request
+    filled = await taxsifter.fill_addresses_by_owner("okanogan", [hit, junk])
+    assert filled == 1
+    assert hit.property_address == "12 SAMPLE LN"
+    assert hit.mailing_address.startswith("PO BOX 77, SAMPLETON, ")
+    assert hit.parcel_id is None
+    assert junk.property_address is None and junk.mailing_address is None
 
 
 def test_a_failed_results_page_is_not_cached_so_the_name_is_retried(portal, monkeypatch):

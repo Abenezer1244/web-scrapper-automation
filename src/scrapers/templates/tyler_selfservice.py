@@ -319,12 +319,15 @@ class TylerSelfServiceScraper(BridgeScraper):
             self.county, len(filtered), len(all_records), self.active_record_type or "none",
         )
 
-        # Step 7: enrich parcels via county assessor TaxSifter (name → parcel)
-        # Tyler SelfService detail pages are blocked, so we use the county
-        # assessor's public search to look up parcels by grantor name.
-        needs_parcel = [r for r in filtered if not r.parcel_id and r.party_name]
-        if needs_parcel:
-            await self._enrich_parcels_via_assessor(needs_parcel)
+        # Step 7: property + mailing address from the county assessor's TaxSifter,
+        # for a UNIQUE owner-name match only. Tyler SelfService detail pages are
+        # blocked, so these rows carry no parcel; nothing here invents one. The
+        # previous surname search took the first 10-digit number on the page as
+        # the parcel, which in production assigned a county-owned parcel to two
+        # different leads and fed it into dedup and billing (audit 2026-10-02).
+        needs_address = [r for r in filtered if not r.property_address and r.party_name]
+        if needs_address:
+            await self._enrich_addresses_via_assessor(needs_address)
 
         # Step 8: drop records without parcel_id if opted in
         if self.require_parcel_id:
@@ -657,7 +660,7 @@ class TylerSelfServiceScraper(BridgeScraper):
         docs (Discontinuance, Rescission, Substitution of Trustee — they
         substring-match the legit keywords but are the OPPOSITE of active
         distress) and re-orient the party so the BORROWER (person) lands in
-        party_name. Orientation MUST run here, before _enrich_parcels_via_assessor
+        party_name. Orientation MUST run here, before _enrich_addresses_via_assessor
         keys its name → parcel lookup off party_name.
         """
         if not self.active_record_type or self.active_record_type == "all":
@@ -705,100 +708,18 @@ class TylerSelfServiceScraper(BridgeScraper):
             kept.append(r)
         return kept
 
-    # ─── Assessor-based parcel enrichment ─────────────────────────────────
+    # ─── Assessor-based address enrichment ────────────────────────────────
 
-    # Okanogan uses TaxSifter (publicaccessnow.com). Other Tyler SelfService
-    # counties may use different assessor portals — add mappings here.
-    _ASSESSOR_URLS: dict[str, str] = {
-        "okanogan": "https://okanoganwa-taxsifter.publicaccessnow.com",
-    }
+    async def _enrich_addresses_via_assessor(self, records: list[ScrapedRecord]) -> None:
+        """Property and mailing addresses from the county's TaxSifter, by owner name.
 
-    async def _enrich_parcels_via_assessor(self, records: list[ScrapedRecord]) -> None:
-        """Look up parcel IDs from the county assessor portal by grantor name.
-
-        Tyler SelfService detail pages are blocked (server session state
-        issue), so we use the county assessor's public TaxSifter portal
-        as an alternative parcel source. This reuses the same Playwright
-        browser context — navigates to TaxSifter, accepts disclaimer,
-        searches each grantor name, and extracts the first matching parcel.
+        Shared with the AcclaimWeb template (Douglas): a unique owner match fills
+        property_address / mailing_address / assessed value and NEVER parcel_id.
+        Counties without a TaxSifter origin are skipped.
         """
-        assessor_url = self._ASSESSOR_URLS.get(self.county.lower())
-        if not assessor_url:
-            _logger.info("No assessor URL configured for %s — skipping parcel enrichment", self.county)
+        from src.scrapers.enrichment.taxsifter import TAXSIFTER_ORIGINS, fill_addresses_by_owner
+
+        if self.county.lower() not in TAXSIFTER_ORIGINS:
+            _logger.info("No assessor configured for %s; addresses left to enrichment", self.county)
             return
-
-        _logger.info("Enriching %d records via assessor TaxSifter (%s)", len(records), assessor_url)
-
-        from urllib.parse import urlparse
-
-        from src.api.middleware.security import add_scrape_domain
-        domain = urlparse(assessor_url).hostname
-        if domain:
-            add_scrape_domain(domain)
-
-        try:
-            # Navigate to TaxSifter and accept disclaimer
-            await self.navigate(assessor_url)
-            try:
-                await self.page.wait_for_load_state("networkidle", timeout=10_000)
-            except Exception:
-                pass
-
-            # Accept disclaimer if present
-            agree_btn = self.page.locator(
-                "input[value*='Agree' i], a:has-text('Agree'), button:has-text('Agree')"
-            ).first
-            if await agree_btn.count() > 0:
-                try:
-                    async with self.page.expect_navigation(timeout=10_000):
-                        await agree_btn.click()
-                except Exception:
-                    await self.page.wait_for_timeout(2_000)
-
-            found = 0
-            for record in records:
-                if record.parcel_id:
-                    continue
-                name = record.party_name
-                if not name:
-                    continue
-                # Use the first grantor name (before any comma-separated list)
-                # e.g. "SALSKY, RICHARD B" → search "SALSKY"
-                search_name = name.split(",")[0].strip()
-                if not search_name or len(search_name) < 3:
-                    continue
-
-                parcel = await self._taxsifter_search(search_name)
-                if parcel:
-                    record.parcel_id = parcel
-                    found += 1
-
-            _logger.info("Assessor enrichment: %d/%d parcels found", found, len(records))
-
-        except Exception as exc:
-            _logger.warning("Assessor enrichment error: %s", str(exc)[:120])
-
-    async def _taxsifter_search(self, name: str) -> str | None:
-        """Search TaxSifter for an owner name and return the first parcel ID.
-
-        TaxSifter is ASP.NET and ignores URL query params — must use the
-        actual search form (fill input + press Enter) for each lookup.
-        """
-        try:
-            search_input = self.page.locator("input[type='text']").first
-            if await search_input.count() == 0:
-                return None
-            await search_input.fill(name)
-            await search_input.press("Enter")
-            await self.page.wait_for_timeout(3_000)
-
-            # Extract first parcel number (10+ digits)
-            parcel = await self.page.evaluate(r"""() => {
-                const text = document.body.innerText;
-                const match = text.match(/\b(\d{10,})\b/);
-                return match ? match[1] : null;
-            }""")
-
-            return parcel
-        except Exception:
-            return None
+        await fill_addresses_by_owner(self.county, records)

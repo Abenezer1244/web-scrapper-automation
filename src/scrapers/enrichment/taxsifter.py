@@ -22,6 +22,7 @@ Logging carries counts and outcome categories only: no names, addresses or parce
 """
 from __future__ import annotations
 
+import asyncio
 import re
 import time
 import unicodedata
@@ -37,8 +38,15 @@ from src.utils.pinned_http import pinned_session
 _logger = setup_logger("scraper.enrichment.taxsifter")
 
 # County -> TaxSifter origin. The ONLY hosts this module will contact.
+# Okanogan (2026-10-02): the same PublicAccessNow deployment as Douglas (verified:
+# disclaimer 302, div.result cards, Assessor.aspx?keyId=&parcelNumber=, the
+# ParcelOwnerInfo1 lbAddress/lbCity/lbState/lbZip mailing block). It replaces the
+# recorder template's surname search that took the FIRST 10-digit number on the
+# page as the parcel: in production that assigned one county-owned parcel to two
+# different leads, and that parcel then keyed dedup and billing.
 TAXSIFTER_ORIGINS: dict[str, str] = {
     "douglas": "https://douglaswa-taxsifter.publicaccessnow.com",
+    "okanogan": "https://okanoganwa-taxsifter.publicaccessnow.com",
 }
 
 _DISCLAIMER_PATH = "/Disclaimer.aspx"
@@ -237,3 +245,48 @@ class TaxSifterClient:
         # transport or page failure raised above, so that name can be retried.
         self._cache[query] = result
         return result
+
+
+async def fill_addresses_by_owner(county: str, records: list) -> int:
+    """Fill property/mailing address (and assessed value) on scraped records from a
+    unique owner-name match on the county's TaxSifter. Returns how many were filled.
+
+    Shared by every recorder template whose county runs TaxSifter (AcclaimWeb for
+    Douglas, Tyler SelfService for Okanogan). Same contract as the PACS name
+    lookup: address, mailing and value only, and only for a UNIQUE owner match;
+    ``parcel_id`` is never set from an owner-name lookup (it is the identity,
+    dedup and billing key). Lookups run serialized on one worker thread (one
+    session, one disclaimer acceptance, polite spacing), off the event loop.
+    """
+    loop = asyncio.get_running_loop()
+    try:
+        client = await loop.run_in_executor(None, TaxSifterClient, county)
+    except Exception as exc:
+        _logger.warning("TaxSifter unavailable for %s: %s", county, type(exc).__name__)
+        return 0
+
+    found = failures = 0
+    for record in records:
+        try:
+            result = await loop.run_in_executor(None, client.lookup, record.party_name)
+            failures = 0
+        except Exception as exc:
+            # One failed lookup is skipped. A refused disclaimer, or three
+            # failures in a row, ends the pass: the rest would fail the same way.
+            failures += 1
+            _logger.warning("TaxSifter lookup failed for %s: %s", county, type(exc).__name__)
+            if "disclaimer" in str(exc) or failures >= 3:
+                break
+            continue
+        if not result:
+            continue
+        record.property_address = result["address"]
+        if result.get("mailing"):
+            record.mailing_address = result["mailing"]
+        if result.get("value"):
+            record.enrichment_data = record.enrichment_data or {}
+            record.enrichment_data["assessed_value"] = result["value"]
+        found += 1
+    _logger.info("TaxSifter lookup (%s): found addresses for %d/%d records",
+                 county, found, len(records))
+    return found

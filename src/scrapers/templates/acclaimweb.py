@@ -1145,39 +1145,9 @@ class AcclaimWebScraper(BridgeScraper):
         Lookups run serialized on one worker thread (one session, one disclaimer
         acceptance, polite spacing), off the event loop.
         """
-        from src.scrapers.enrichment.taxsifter import TaxSifterClient
+        from src.scrapers.enrichment.taxsifter import fill_addresses_by_owner
 
-        loop = asyncio.get_running_loop()
-        try:
-            client = await loop.run_in_executor(None, TaxSifterClient, self.county)
-        except Exception as exc:
-            _logger.warning("TaxSifter unavailable for %s: %s", self.county, type(exc).__name__)
-            return
-
-        found = failures = 0
-        for record in records:
-            try:
-                result = await loop.run_in_executor(None, client.lookup, record.party_name)
-                failures = 0
-            except Exception as exc:
-                # One failed lookup is skipped. A refused disclaimer, or three
-                # failures in a row, ends the pass: the rest would fail the same way.
-                failures += 1
-                _logger.warning("TaxSifter lookup failed for %s: %s", self.county, type(exc).__name__)
-                if "disclaimer" in str(exc) or failures >= 3:
-                    break
-                continue
-            if not result:
-                continue
-            record.property_address = result["address"]
-            if result.get("mailing"):
-                record.mailing_address = result["mailing"]
-            if result.get("value"):
-                record.enrichment_data = record.enrichment_data or {}
-                record.enrichment_data["assessed_value"] = result["value"]
-            found += 1
-        _logger.info("TaxSifter lookup (%s): found addresses for %d/%d records",
-                     self.county, found, len(records))
+        await fill_addresses_by_owner(self.county, records)
 
     async def _go_next_page(self) -> bool:
         """Click the Next page button in the Kendo pager."""

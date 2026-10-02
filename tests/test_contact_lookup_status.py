@@ -317,6 +317,19 @@ async def test_a_blackholed_redis_reads_unknown_within_the_bound(
     assert elapsed < 3.0, elapsed
 
 
+
+async def test_a_redis_client_that_cannot_be_built_reads_unknown(
+    db, client, business_user, business_token, _lookups_on, _other_clients_built, monkeypatch,
+):
+    """The route's OWN guard, not the reader's: `read_pause_state` absorbs a failing
+    call, but building the client happens before it and can raise too."""
+    job, aid, _ = await _bought(client, business_token, business_user.id)
+    jobs_routes._lookup_redis_client = None
+    monkeypatch.setattr(settings, "REDIS_URL", "notredis://127.0.0.1:1/0")
+    with pytest.raises(ValueError):  # the fault is real: from_url refuses the scheme
+        jobs_routes._lookup_redis()
+    assert (await _ok(client, business_token, job, aid))["pause"]["status"] == "unknown"
+
 # ── ownership ────────────────────────────────────────────────────────────────
 
 

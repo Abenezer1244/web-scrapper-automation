@@ -195,7 +195,11 @@ def parse_detail(html: str, parcel_key: str) -> MailingAnswer:
         return MailingAnswer(UNPARSED)
     if all(not lines for lines in blocks):
         return MailingAnswer(NONE)
-    composed = {compose_pacs_mailing(lines) for lines in blocks if lines}
+    if any(not lines for lines in blocks):
+        # One owner prints an address and a co-owner prints none: the page does not
+        # say whose address the parcel's mail goes to. Ambiguous, never found (Codex).
+        return MailingAnswer(AMBIGUOUS)
+    composed = {compose_pacs_mailing(lines) for lines in blocks}
     if None in composed:
         return MailingAnswer(UNPARSED)
     if len(composed) != 1:

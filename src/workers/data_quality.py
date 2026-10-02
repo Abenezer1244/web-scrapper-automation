@@ -30,6 +30,7 @@ measured, not assumed. The checked marker lives in Redis so a job is judged once
 """
 from __future__ import annotations
 
+import uuid
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import text
@@ -53,7 +54,9 @@ ECHO_RUN_PCT = 95.0
 ECHO_BASELINE_PCT = 70.0
 BASELINE_DAYS = 90
 SWEEP_LOOKBACK_HOURS = 24
-SWEEP_MAX_JOBS = 50
+# Per tick. A judged job costs three indexed queries, so this is cheap; it only has
+# to exceed the busiest day's finished-job count so nothing ages out unjudged.
+SWEEP_MAX_JOBS = 500
 _CHECKED_TTL_S = 14 * 24 * 3600
 
 _COUNTS = """
@@ -229,12 +232,14 @@ def run_data_quality_sweep(*, lookback_hours: int = SWEEP_LOOKBACK_HOURS,
         job_ids = [r["id"] for r in db.execute(text(_RECENT_DONE_SQL), {"since": since, "limit": limit}).mappings()]
         for job_id in job_ids:
             key = _checked_key(str(job_id))
+            token = uuid.uuid4().hex
             # Claim first with a short TTL so two ticks never judge the same job at
             # once; the 14-day "judged" mark is written only AFTER a successful check.
-            # A check that fails releases the claim, so a transient DB error never
-            # silences a job for two weeks (Codex P1).
+            # A check that fails releases ITS OWN claim (compare-and-delete on the
+            # token, so an expired claim never deletes a newer worker's), and a
+            # transient DB error never silences a job for two weeks (Codex P1/P2).
             try:
-                if client is not None and not client.set(key, "claimed", nx=True, ex=_CLAIM_TTL_S):
+                if client is not None and not client.set(key, token, nx=True, ex=_CLAIM_TTL_S):
                     stats["skipped"] += 1
                     continue
             except Exception:  # noqa: BLE001
@@ -244,7 +249,7 @@ def run_data_quality_sweep(*, lookback_hours: int = SWEEP_LOOKBACK_HOURS,
             except Exception as exc:  # noqa: BLE001 -- one bad job never stops the sweep
                 _logger.error("Data quality check failed for job %s: %s", str(job_id)[:8], str(exc)[:160])
                 db.rollback()
-                _release(client, key)
+                _release(client, key, token)
                 continue
             _mark_judged(client, key)
             stats["checked"] += 1
@@ -254,12 +259,13 @@ def run_data_quality_sweep(*, lookback_hours: int = SWEEP_LOOKBACK_HOURS,
 
 
 _CLAIM_TTL_S = 600
+_RELEASE_LUA = "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) end return 0"
 
 
-def _release(client, key: str) -> None:
+def _release(client, key: str, token: str) -> None:
     try:
         if client is not None:
-            client.delete(key)
+            client.eval(_RELEASE_LUA, 1, key, token)
     except Exception:  # noqa: BLE001
         pass
 

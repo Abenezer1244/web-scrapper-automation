@@ -24,6 +24,14 @@ PACE
     403/429 cools the source for everyone). This script adds --batch (parcels per
     adapter call) and --max-parcels per run so a backfill is a bounded, repeatable
     unit, never a flood.
+
+CONCURRENCY
+    Run ONE backfill per county at a time (an operator action, not a beat task).
+    Candidate rows are not claimed: the adapter's lease already serialises county
+    traffic, the address write is fill-only at the database, and the only thing two
+    overlapping runs could race on is the attempts/outcome bookkeeping, which is
+    advisory. Accepted (Codex P2); a durable claim would buy nothing an operator
+    cannot get by not starting two.
 """
 from __future__ import annotations
 

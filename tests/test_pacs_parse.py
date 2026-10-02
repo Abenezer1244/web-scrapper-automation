@@ -195,6 +195,12 @@ def test_name_path_an_unreadable_co_owner_block_blocks_the_answer():
     assert mailing_from_detail(_Sess(page), url, "58808") is None
 
 
+def test_name_path_a_co_owner_with_no_address_is_no_answer():
+    page = _detail(["9 PINE RD <BR> LANGLEY, WA 98260", ""])
+    url = "https://propertysearch.co.benton.wa.us/propertyaccess/PropertySearch.aspx?cid=0"
+    assert mailing_from_detail(_Sess(page), url, "58808") is None
+
+
 def test_name_path_non_200_is_no_answer():
     url = "https://propertysearch.co.benton.wa.us/propertyaccess/PropertySearch.aspx?cid=0"
     assert mailing_from_detail(_Sess("", 500), url, "58808") is None

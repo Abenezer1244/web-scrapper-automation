@@ -252,7 +252,9 @@ def mailing_from_detail(session: requests.Session, pacs_url: str, prop_id: str,
         # redirect, a session page or a layout change is never somebody's address.
         return None
     blocks = page["mailing"]
-    composed = {compose_pacs_mailing(lines) for lines in blocks if lines}
+    if not blocks or any(not lines for lines in blocks):
+        return None  # no owner block, or a co-owner with no address: not an answer
+    composed = {compose_pacs_mailing(lines) for lines in blocks}
     if None in composed:
         return None  # an owner block we cannot read is not a block we may ignore
     return composed.pop() if len(composed) == 1 else None

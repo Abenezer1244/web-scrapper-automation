@@ -140,6 +140,12 @@ class TestParseDetail:
         html = _detail(["9 PINE RD <BR> LANGLEY, WA 98260", "9 PINE RD <BR> LANGLEY, WA 98260"])
         assert pp.parse_detail(html, _PARCEL).mailing_address == "9 PINE RD, LANGLEY, WA 98260"
 
+    def test_a_co_owner_with_no_address_makes_the_page_ambiguous(self):
+        """One owner prints an address, the other prints none: whose mail? (Codex P1)"""
+        html = _detail(["9 PINE RD <BR> LANGLEY, WA 98260", ""])
+        answer = pp.parse_detail(html, _PARCEL)
+        assert answer.outcome == AMBIGUOUS and answer.mailing_address is None
+
     def test_co_owners_with_different_addresses_are_ambiguous(self):
         html = _detail(["9 PINE RD <BR> LANGLEY, WA 98260", "PO BOX 1 <BR> LANGLEY, WA 98260"])
         assert pp.parse_detail(html, _PARCEL).outcome == AMBIGUOUS

@@ -225,10 +225,24 @@ class TestResolve:
         assert out[third].outcome == pp.NONE
 
     def test_answers_every_caller_spelling_with_one_lookup(self, monkeypatch):
-        log = _serve(monkeypatch, {_PARCEL: _GOOD_SEARCH}, {"58808": _GOOD_DETAIL})
+        """Three spellings of one parcel: one portal search, sent in the longest
+        (zero-kept) spelling, and every caller gets the answer."""
+        log = _serve(monkeypatch, {"0" + _PARCEL: _GOOD_SEARCH}, {"58808": _GOOD_DETAIL})
         out = pp.resolve_mailing("benton", [_PARCEL, "0" + _PARCEL, _PARCEL[:6] + "-" + _PARCEL[6:]])
         assert all(a.is_found for a in out.values()) and len(out) == 3
-        assert [e for e in log if e[0] == "search"] == [("search", _PARCEL)]
+        assert [e for e in log if e[0] == "search"] == [("search", "0" + _PARCEL)]
+
+    def test_the_portal_is_asked_with_leading_zeros_kept(self, monkeypatch):
+        """Clallam-style Geo IDs start with 0 and the portal search may be fixed-width:
+        the query keeps the caller's zeros, only the comparison key strips them (Codex P2)."""
+        raw = "0530084000100000"
+        key = "530084000100000"
+        results = _results([(raw, "48565")])
+        detail = _detail(["1 MAIN ST <BR> PORT ANGELES, WA 98362"], geo=raw)
+        log = _serve(monkeypatch, {raw: results}, {"48565": detail})
+        out = pp.resolve_mailing("benton", ["053008-400010-0000", key])
+        assert [e for e in log if e[0] == "search"] == [("search", raw)]
+        assert all(a.is_found for a in out.values())
 
     def test_a_detail_page_for_another_parcel_is_a_mismatch_not_an_address(self, monkeypatch):
         _serve(monkeypatch, {_PARCEL: _GOOD_SEARCH}, {"58808": _detail(["9 PINE RD <BR> LANGLEY, WA 98260"], geo="1")})

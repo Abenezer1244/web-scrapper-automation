@@ -229,8 +229,12 @@ def run_data_quality_sweep(*, lookback_hours: int = SWEEP_LOOKBACK_HOURS,
         job_ids = [r["id"] for r in db.execute(text(_RECENT_DONE_SQL), {"since": since, "limit": limit}).mappings()]
         for job_id in job_ids:
             key = _checked_key(str(job_id))
+            # Claim first with a short TTL so two ticks never judge the same job at
+            # once; the 14-day "judged" mark is written only AFTER a successful check.
+            # A check that fails releases the claim, so a transient DB error never
+            # silences a job for two weeks (Codex P1).
             try:
-                if client is not None and not client.set(key, "1", nx=True, ex=_CHECKED_TTL_S):
+                if client is not None and not client.set(key, "claimed", nx=True, ex=_CLAIM_TTL_S):
                     stats["skipped"] += 1
                     continue
             except Exception:  # noqa: BLE001
@@ -240,11 +244,32 @@ def run_data_quality_sweep(*, lookback_hours: int = SWEEP_LOOKBACK_HOURS,
             except Exception as exc:  # noqa: BLE001 -- one bad job never stops the sweep
                 _logger.error("Data quality check failed for job %s: %s", str(job_id)[:8], str(exc)[:160])
                 db.rollback()
+                _release(client, key)
                 continue
+            _mark_judged(client, key)
             stats["checked"] += 1
             if report.get("warnings"):
                 stats["warned"] += 1
     return stats
+
+
+_CLAIM_TTL_S = 600
+
+
+def _release(client, key: str) -> None:
+    try:
+        if client is not None:
+            client.delete(key)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _mark_judged(client, key: str) -> None:
+    try:
+        if client is not None:
+            client.set(key, "1", ex=_CHECKED_TTL_S)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 try:  # pragma: no cover -- registration only

@@ -280,8 +280,11 @@ async def fill_addresses_by_owner(county: str, records: list) -> int:
             continue
         if not result:
             continue
-        record.property_address = result["address"]
-        if result.get("mailing"):
+        # Fill-only on both addresses: a value the recorder document itself carried
+        # outranks one inferred from an owner name (Codex P2).
+        if not record.property_address:
+            record.property_address = result["address"]
+        if result.get("mailing") and not record.mailing_address:
             record.mailing_address = result["mailing"]
         if result.get("value"):
             record.enrichment_data = record.enrichment_data or {}

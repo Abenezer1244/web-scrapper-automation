@@ -42,7 +42,8 @@ SETTLED_NO_MAILING = frozenset({"none", "parcel_not_found", "parcel_mismatch"})
 _CANDIDATES = """
 SELECT r.id, r.user_id, r.parcel_id, r.property_address, r.property_city, r.property_state,
        r.property_zip,
-       coalesce((r.enrichment_data::jsonb ->> 'mailing_recovery_attempts')::int, 0) AS attempts
+       (CASE WHEN coalesce(r.enrichment_data::jsonb ->> 'mailing_recovery_attempts', '0') ~ '^[0-9]{1,6}$'
+             THEN coalesce(r.enrichment_data::jsonb ->> 'mailing_recovery_attempts', '0')::int ELSE 0 END) AS attempts
 FROM results r
 JOIN jobs j ON j.id = r.job_id
 JOIN scraper_configs sc ON sc.id = j.scraper_config_id
@@ -52,8 +53,10 @@ WHERE j.status = 'done'
   AND r.parcel_id IS NOT NULL AND length(btrim(r.parcel_id)) >= 6
   AND coalesce(r.enrichment_data::jsonb ->> 'mailing_recovery_outcome', '')
       NOT IN ('none', 'parcel_not_found', 'parcel_mismatch')
-  AND coalesce((r.enrichment_data::jsonb ->> 'mailing_recovery_attempts')::int, 0) < :max_attempts
-  AND (coalesce(r.enrichment_data::jsonb ->> 'mailing_recovery_attempts', '0') ~ '^[0-9]+$')
+  -- The regex guards the cast inside one CASE (Codex P2): a malformed historical
+  -- value is treated as 0 attempts, never as a reason to fail the whole run.
+  AND (CASE WHEN coalesce(r.enrichment_data::jsonb ->> 'mailing_recovery_attempts', '0') ~ '^[0-9]{1,6}$'
+            THEN coalesce(r.enrichment_data::jsonb ->> 'mailing_recovery_attempts', '0')::int ELSE 0 END) < :max_attempts
 ORDER BY r.created_at
 LIMIT :limit
 """
@@ -157,6 +160,8 @@ def main() -> None:
     ap.add_argument("--max-parcels", type=int, default=200, help="parcels per run")
     ap.add_argument("--report", help="JSONL of per-row outcomes (ids truncated, no addresses)")
     args = ap.parse_args()
+    if args.batch < 1 or args.max_parcels < 1:
+        ap.error("--batch and --max-parcels must be positive")
     report = open(args.report, "a", encoding="utf-8") if args.report else None
     try:
         run(args.county, apply=args.apply, batch=args.batch, max_parcels=args.max_parcels, report=report)

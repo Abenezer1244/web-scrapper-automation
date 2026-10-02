@@ -233,10 +233,17 @@ def _request(do, still_held) -> tuple[requests.Response | None, str | None]:
     return None, None
 
 
-def _resolve_one(session, site: PacsSite, tokens: dict, parcel_key: str, still_held
-                 ) -> tuple[MailingAnswer, str | None]:
+def query_digits(value: object) -> str:
+    """What is SENT to the portal: the caller's parcel with separators removed and
+    leading zeros KEPT. The county's search may be fixed-width (Clallam's Geo IDs
+    start with 0); only the comparison key strips zeros (Codex P2)."""
+    return re.sub(r"[\s.\-]", "", str(value or ""))
+
+
+def _resolve_one(session, site: PacsSite, tokens: dict, parcel_key: str, still_held,
+                 query: str | None = None) -> tuple[MailingAnswer, str | None]:
     """Search POST, then detail GET, for one parcel. (answer, block_reason)."""
-    data = {**tokens, "propertySearchOptions$geoid": parcel_key,
+    data = {**tokens, "propertySearchOptions$geoid": query or parcel_key,
             "propertySearchOptions$search": "Search"}
     resp, blocked = _request(lambda: _http_post(session, site.search_url, data), still_held)
     if blocked or resp is None:
@@ -276,12 +283,16 @@ def resolve_mailing(county: str, parcel_ids: list[str], *, time_budget_s: float 
     if site.license_restricted and not settings.COUNTY_GIS_RESTRICTED_MAILING_ENABLED:
         return out
     by_key: dict[str, list[str]] = {}
+    queries: dict[str, str] = {}  # key -> the longest caller spelling (zeros kept)
     for pid in parcel_ids:
         key = normalize_pacs_parcel(pid)
         if key is None:
             out[pid] = MailingAnswer(PARCEL_NOT_FOUND)
         else:
             by_key.setdefault(key, []).append(pid)
+            q = query_digits(pid)
+            if len(q) > len(queries.get(key, "")):
+                queries[key] = q
     if not by_key:
         return out
 
@@ -315,7 +326,8 @@ def resolve_mailing(county: str, parcel_ids: list[str], *, time_budget_s: float 
             time.sleep(_PACE_S + random.uniform(0, _JITTER_S))  # noqa: S311
             if not admission.still_held():
                 break
-            answer, blocked = _resolve_one(session, site, tokens, key, admission.still_held)
+            answer, blocked = _resolve_one(session, site, tokens, key, admission.still_held,
+                                           query=queries[key])
             if blocked:
                 record_source_blocked(site.source_key, f"PACS {blocked}")
                 _logger.warning("%s blocked (%s); pass stopped", site.source_key, blocked)

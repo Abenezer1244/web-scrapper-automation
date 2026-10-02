@@ -144,7 +144,12 @@ def compose_pacs_mailing(lines: list[str]) -> str | None:
 
 def pacs_detail_url(pacs_url: str, prop_id: str) -> str:
     """The Property.aspx detail URL on the same portal (same origin, same cid)."""
-    cid = (parse_qs(urlparse(pacs_url).query).get("cid") or ["0"])[0]
+    parsed = urlparse(pacs_url)
+    if parsed.scheme != "https" or not parsed.netloc:
+        raise ValueError("PACS portal URL must be https")  # same origin, same scheme as the search
+    cid = (parse_qs(parsed.query).get("cid") or ["0"])[0]
+    if not cid.isdigit():
+        raise ValueError("PACS cid must be numeric")
     base = pacs_url.split("?", 1)[0]
     if not base.endswith("/"):
         base = base.rsplit("/", 1)[0] + "/"
@@ -241,9 +246,15 @@ def mailing_from_detail(session: requests.Session, pacs_url: str, prop_id: str,
         return None
     if r.status_code != 200:
         return None
-    blocks = parse_pacs_detail_html(r.text)["mailing"]
+    page = parse_pacs_detail_html(r.text)
+    if page["prop_ids"] != [str(prop_id)]:
+        # The page must be the record the grid row pointed at (Codex P1): a
+        # redirect, a session page or a layout change is never somebody's address.
+        return None
+    blocks = page["mailing"]
     composed = {compose_pacs_mailing(lines) for lines in blocks if lines}
-    composed.discard(None)
+    if None in composed:
+        return None  # an owner block we cannot read is not a block we may ignore
     return composed.pop() if len(composed) == 1 else None
 
 

@@ -116,6 +116,17 @@ async def test_unreached_parcels_spend_nothing_and_stay_eligible(db, starter_use
     assert len(calls) == 2
 
 
+async def test_a_malformed_attempts_value_does_not_fail_the_run(db, starter_user, monkeypatch):
+    """Historical JSON can hold junk; the row is treated as 0 attempts, not as a crash (Codex P2)."""
+    job = await _job(db, starter_user)
+    rid = await _row(db, starter_user, job, "131073011125003",
+                     enrichment={"mailing_recovery_attempts": "lots"})
+    calls: list = []
+    _answers(monkeypatch, {"131073011125003": MailingAnswer(FOUND, "PO BOX 1, X, WA 98001")}, calls)
+    stats = bf.run("benton", apply=True, batch=10, max_parcels=10)
+    assert stats["written"] == 1 and _state(rid)[0] == "PO BOX 1, X, WA 98001"
+
+
 async def test_rows_past_the_attempt_cap_are_left_alone(db, starter_user, monkeypatch):
     job = await _job(db, starter_user)
     await _row(db, starter_user, job, "131073011125003",

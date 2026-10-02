@@ -156,9 +156,10 @@ class TestResolve:
         assert out[third].outcome == ta.PARCEL_NOT_FOUND
 
     def test_answers_every_caller_spelling_with_one_request(self, monkeypatch):
-        asked = _serve(monkeypatch, {_PN: _GOOD})
+        """One request, sent in the longest (zero-kept) spelling; every caller answered."""
+        asked = _serve(monkeypatch, {"0" + _PN: _GOOD})
         out = ta.resolve_mailing([_PN, "0" + _PN, "747-00001201"])
-        assert all(a.is_found for a in out.values()) and asked == [_PN]
+        assert all(a.is_found for a in out.values()) and asked == ["0" + _PN]
 
     def test_a_malformed_parcel_is_never_requested(self, monkeypatch):
         asked = _serve(monkeypatch, {})

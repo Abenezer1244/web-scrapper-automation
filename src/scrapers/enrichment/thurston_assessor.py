@@ -155,12 +155,16 @@ def resolve_mailing(parcel_ids: list[str], *, time_budget_s: float = CALL_BUDGET
 
     out = {pid: MailingAnswer(SOURCE_UNAVAILABLE) for pid in parcel_ids}
     by_key: dict[str, list[str]] = {}
+    queries: dict[str, str] = {}  # key -> what is sent: separators dropped, zeros kept
     for pid in parcel_ids:
         key = normalize_parcel(pid)
         if key is None:
             out[pid] = MailingAnswer(PARCEL_NOT_FOUND)
         else:
             by_key.setdefault(key, []).append(pid)
+            q = re.sub(r"[\s.\-]", "", str(pid))
+            if len(q) > len(queries.get(key, "")):
+                queries[key] = q
     if not by_key:
         return out
 
@@ -185,7 +189,7 @@ def resolve_mailing(parcel_ids: list[str], *, time_budget_s: float = CALL_BUDGET
             time.sleep(_PACE_S + random.uniform(0, _JITTER_S))  # noqa: S311
             if not admission.still_held():
                 break
-            resp, blocked = _request(partial(_http_get, session, key), admission.still_held)
+            resp, blocked = _request(partial(_http_get, session, queries[key]), admission.still_held)
             if blocked:
                 record_source_blocked(SOURCE, f"Thurston A+ {blocked}")
                 _logger.warning("%s blocked (%s); pass stopped", SOURCE, blocked)

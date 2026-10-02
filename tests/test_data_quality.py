@@ -200,6 +200,27 @@ class TestSweep:
         assert redis_client.get(dq._checked_key(job)) in (b"1", "1")
         assert second["skipped"] >= 1 and second["checked"] < first["checked"]
 
+    async def test_a_failed_check_releases_the_claim_so_the_job_is_judged_next_tick(
+            self, db, starter_user, redis_client, monkeypatch):
+        """A transient error must not silence a job for 14 days (Codex P1)."""
+        job = await _job(db, starter_user)
+        await _rows(db, starter_user, job, n=12, with_mailing=10)
+        redis_client.delete(dq._checked_key(job))
+        calls = {"n": 0}
+
+        def _boom(db_, job_id, **kw):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("db hiccup")
+            return {"job_id": job_id, "warnings": []}
+
+        monkeypatch.setattr(dq, "check_job", _boom)
+        first = dq.run_data_quality_sweep(lookback_hours=2, limit=500)
+        assert redis_client.get(dq._checked_key(job)) is None  # claim released
+        second = dq.run_data_quality_sweep(lookback_hours=2, limit=500)
+        assert first["checked"] < second["checked"] + 1 and calls["n"] >= 2
+        assert redis_client.get(dq._checked_key(job)) in (b"1", "1")
+
     async def test_the_sweep_is_registered_hourly_off_the_king_minutes(self):
         from src.workers.scheduler import app
 

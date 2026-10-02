@@ -13,6 +13,7 @@ import pytest
 
 from src.scrapers.enrichment.pacs import (
     compose_pacs_mailing,
+    mailing_from_detail,
     normalize_pacs_parcel,
     pacs_detail_url,
     parse_pacs_detail_html,
@@ -165,6 +166,44 @@ def test_compose_pacs_mailing_without_a_deliverable_line_is_none():
 ])
 def test_normalize_pacs_parcel(raw, key):
     assert normalize_pacs_parcel(raw) == key
+
+
+class _Sess:
+    """A requests.Session stand-in for the name path's detail fetch: one page."""
+
+    def __init__(self, body: str, status: int = 200):
+        self.body, self.status = body, status
+
+    def get(self, url, **kw):
+        class R:
+            status_code = self.status
+            text = self.body
+        return R()
+
+
+def test_name_path_detail_must_echo_the_requested_prop_id():
+    """The detail page must be the record the grid row pointed at (Codex P1)."""
+    page = _detail(["9 PINE RD <BR> LANGLEY, WA 98260"])  # Property ID 58808
+    url = "https://propertysearch.co.benton.wa.us/propertyaccess/PropertySearch.aspx?cid=0"
+    assert mailing_from_detail(_Sess(page), url, "58808") == "9 PINE RD, LANGLEY, WA 98260"
+    assert mailing_from_detail(_Sess(page), url, "99999") is None
+
+
+def test_name_path_an_unreadable_co_owner_block_blocks_the_answer():
+    page = _detail(["9 PINE RD <BR> LANGLEY, WA 98260", "DOE FAMILY TRUST"])
+    url = "https://propertysearch.co.benton.wa.us/propertyaccess/PropertySearch.aspx?cid=0"
+    assert mailing_from_detail(_Sess(page), url, "58808") is None
+
+
+def test_name_path_non_200_is_no_answer():
+    url = "https://propertysearch.co.benton.wa.us/propertyaccess/PropertySearch.aspx?cid=0"
+    assert mailing_from_detail(_Sess("", 500), url, "58808") is None
+
+
+@pytest.mark.parametrize("bad", ["http://pacs.example/propertyaccess/?cid=0", "https://pacs.example/propertyaccess/?cid=x"])
+def test_pacs_detail_url_refuses_plaintext_and_odd_cid(bad):
+    with pytest.raises(ValueError):
+        pacs_detail_url(bad, "1")
 
 
 def test_pacs_detail_url_keeps_origin_and_cid():

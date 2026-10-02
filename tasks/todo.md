@@ -1,3 +1,40 @@
+# DB outage prevention — 2026-10-01 incident (login "Something went wrong")
+
+Branch: `fix/db-unavailable-503` · worktree `C:/Users/Windows/bl-wt/db503`
+
+Incident: ~15:00–18:20 UTC the Supabase instance was resource-starved (API asyncpg
+"authentication did not complete within 15000ms", worker statement timeouts, Supabase's
+own control plane could not connect). Fixed by the owner's compute upgrade. Root resource
+(CPU / memory / IO) NOT confirmed — needs the dashboard charts.
+
+## Plan (agreed with Codex, revised by measurement)
+- [ ] 1. 👤 Ops: external uptime monitor on `/ready` (latency + status), synthetic
+      bad-password login expecting 401 < 3 s, Supabase resource alerts.
+- [x] 2. ~~Contain recovery sweeps~~ — DROPPED: they already have Redis single-flight locks,
+      30–120 parcel batches and wall-clock budgets; pg_stat_statements shows their writes are ms.
+- [ ] 3. Slow-query investigation — pg_stat_statements: top consumers are manual diagnostics
+      (EXPLAIN ANALYZE / count(*) / GROUP BY over `results`); `pgbouncer.get_auth` 285k calls.
+- [x] 4. DB unreachable → 503 + Retry-After the browser can read — **#428 `9a3080c7` LIVE**.
+- [x] 4b. pypdf 6.19.0 (required audit gate was red on main) — **#429 `84588fb8` LIVE**.
+- [ ] 5. FE: show "temporarily unavailable" on 503 / network error (needs #4 live).
+- [ ] 6. API connection model (NullPool → bounded pool / transaction mode) — Codex design
+      review + load test first.
+
+## Review (#428)
+- New `DatabaseUnavailableMiddleware`, registered innermost so its 503 carries CORS and
+  security headers. Starlette runs the catch-all `Exception` handler in ServerErrorMiddleware,
+  OUTSIDE CORS, so the old 500 (and any 503 from there) was unreadable to the browser.
+- `is_database_unavailable()` (errors.py): asyncpg connection-class errors, pool timeout,
+  invalidated connections, bare ConnectionError/TimeoutError only when raised inside asyncpg;
+  walks __cause__, __context__ and ExceptionGroup members. Statement timeouts and Supavisor
+  "tenant not found" stay 500 by design.
+- Codex: design GO; review rounds 1 PASS → 2 FAIL (wrapped errors, class registrations) →
+  redesign → 3 FAIL (ExceptionGroup P2) → 4 PASS.
+- Every behaviour mutation-verified (middleware removed / outside CORS / started-guard /
+  chain branch / group branch / asyncpg-provenance).
+
+---
+
 # King County pre_foreclosure: Auction Date / Principal Owing = N/A
 
 Branch: `investigate/king-nts-parcel-bridge` · worktree `C:/Users/Windows/bl-wt-kingnts`

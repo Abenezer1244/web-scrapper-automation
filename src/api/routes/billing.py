@@ -28,6 +28,7 @@ from src.config.constants import (
     ALL_RECORD_TYPES,
     ALL_SCHEDULE_FREQUENCIES,
     BATCH_PLANS,
+    BUSINESS_FEATURES_PLANS,
     COUNTY_LIMIT_BY_PLAN,
     OVERLAP_PLANS,
     PRIORITY_QUEUE_PLANS,
@@ -565,7 +566,12 @@ async def pricing_page() -> dict:
         "plans": _PLANS,
         "founding_offer": founding,
         "comparison": {
-            "Records per month": {"starter": "50", "pro": "1,000", "business": "5,000", "agency": "Unlimited"},
+            # Derived from the quota the gate enforces, like the rows below.
+            "Records per month": {
+                plan: ("Unlimited" if settings.PLAN_LIMITS[plan] < 0
+                       else f"{settings.PLAN_LIMITS[plan]:,}")
+                for plan in ("starter", "pro", "business", "agency")
+            },
             # Derived from the ENFORCED cap, never re-typed. These cells had
             # drifted to the pre-2026-06 pricing (pro "5", business
             # "Unlimited") while COUNTY_LIMIT_BY_PLAN caps them at 3 and 10.
@@ -598,8 +604,16 @@ async def pricing_page() -> dict:
             # accepted on every plan, and the Starter card never claimed otherwise.
             # A row nothing implements is a promise in the wrong direction.
             "Email delivery": {"starter": True, "pro": True, "business": True, "agency": True},
-            "Webhook delivery": {"starter": False, "pro": False, "business": True, "agency": True},
-            "Dialer delivery": {"starter": False, "pro": False, "business": True, "agency": True},
+            # Webhook, dialer and API access share one gate (scrapers.py refuses
+            # webhook/dialer delivery, auth.py refuses API keys, below Business).
+            "Webhook delivery": {
+                plan: plan in BUSINESS_FEATURES_PLANS
+                for plan in ("starter", "pro", "business", "agency")
+            },
+            "Dialer delivery": {
+                plan: plan in BUSINESS_FEATURES_PLANS
+                for plan in ("starter", "pro", "business", "agency")
+            },
             # Pro read "Per-lookup", which dropped the 250 lookups its own card
             # bullet includes. Derived from the same quotas the meter bills on.
             "Skip tracing": {
@@ -614,7 +628,10 @@ async def pricing_page() -> dict:
                 plan: plan in BATCH_PLANS
                 for plan in ("starter", "pro", "business", "agency")
             },
-            "API access": {"starter": False, "pro": False, "business": True, "agency": True},
+            "API access": {
+                plan: plan in BUSINESS_FEATURES_PLANS
+                for plan in ("starter", "pro", "business", "agency")
+            },
             "Priority queue": {
                 plan: plan in PRIORITY_QUEUE_PLANS
                 for plan in ("starter", "pro", "business", "agency")
@@ -640,10 +657,19 @@ async def pricing_page() -> dict:
         },
         "faq": [
             {"q": "What are motivated seller leads?", "a": "Public records (probate, foreclosure, tax delinquent, etc.) that indicate a property owner may be willing to sell below market value."},
-            {"q": "How fresh is the data?", "a": "We scrape county portals daily. Paid plans get same-day data. Free tier has a 7-day delay."},
-            {"q": "What counties do you cover?", "a": "22 Washington State counties are live and scraped daily. We can add any US county in 30 seconds. Request yours after signing up."},
-            {"q": "Does it include phone and email?", "a": "Yes. Skip tracing is built in: every lead gets phone number, phone type, and email via Tracerfy within 10-15 minutes."},
-            {"q": "Can I cancel anytime?", "a": "Yes. No contracts, no cancellation fees. Your data exports remain available for 30 days after cancellation."},
+            # The 7-day Starter delay is real: tasks_helpers/dates.py ends a
+            # Starter run's window seven days back (test_plan_entitlement_audit).
+            {"q": "How fresh is the data?", "a": "We read county portals on the schedule you set. Paid plans get records up to the current day; Starter's data is delayed 7 days."},
+            # No count here: coverage changes as connectors go live or degrade,
+            # and "22 counties" / "any US county in 30 seconds" had drifted from
+            # it. /scrapers/connectors (the coverage page) is the live answer.
+            {"q": "What counties do you cover?", "a": "Washington State counties, with more added over time. The live list, with the record types each county covers, is on the coverage page."},
+            # Never imply every lookup finds contacts: a trace can come back with
+            # fewer or none. Starter has no lookup allowance (Skip tracing row).
+            {"q": "Does it include phone and email?", "a": "On Pro, Business and Agency, BridgeLeads looks up the owner's phone and email. Each plan includes a monthly allowance, then lookups are billed per use. A lookup can come back with fewer contacts or none. Starter does not include lookups."},
+            # "Exports remain available for 30 days after cancellation" was not
+            # implemented anywhere (no cancellation expiry; retention is separate).
+            {"q": "Can I cancel anytime?", "a": "Yes. No contracts, no cancellation fees."},
             {"q": "What export formats do you support?", "a": "CSV, Excel, and JSON. Each run delivers one file in the format you pick. Starter is CSV, Pro adds Excel, and Business and Agency get every format plus API access for direct integration."},
         ],
     }

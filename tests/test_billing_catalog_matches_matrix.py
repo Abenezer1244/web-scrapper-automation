@@ -111,3 +111,40 @@ async def test_email_delivery_is_not_advertised_as_a_gate_nothing_enforces():
     wrong."""
     comparison = (await pricing_page())["comparison"]["Email delivery"]
     assert all(comparison[plan] is True for plan in _PLAN_IDS)
+
+
+@pytest.mark.asyncio
+async def test_the_records_row_is_the_enforced_quota():
+    """The row was typed by hand; it now reads PLAN_LIMITS, which the gate enforces."""
+    comparison = (await pricing_page())["comparison"]["Records per month"]
+    assert comparison == {"starter": "50", "pro": "1,000", "business": "5,000", "agency": "Unlimited"}
+    assert settings.PLAN_LIMITS["agency"] < 0
+
+
+@pytest.mark.asyncio
+async def test_webhook_dialer_and_api_rows_follow_the_business_gate():
+    """scrapers.py refuses webhook/dialer delivery and auth.py refuses API keys
+    below Business; the three rows say exactly that."""
+    from src.config.constants import BUSINESS_FEATURES_PLANS
+
+    comparison = (await pricing_page())["comparison"]
+    for row in ("Webhook delivery", "Dialer delivery", "API access"):
+        assert comparison[row] == {"starter": False, "pro": False, "business": True, "agency": True}
+        assert {p for p in _PLAN_IDS if comparison[row][p]} == set(BUSINESS_FEATURES_PLANS)
+
+
+@pytest.mark.asyncio
+async def test_the_faq_makes_no_claim_the_product_does_not_keep():
+    """The FAQ said "22 Washington State counties", "any US county in 30
+    seconds", "every lead gets phone number ... and email" and "exports remain
+    available for 30 days after cancellation". None of it was true or enforced."""
+    import re
+
+    answers = " ".join(item["a"] for item in (await pricing_page())["faq"]).lower()
+    assert not re.search(r"\b\d+ (washington|wa)\b", answers)  # no hand-typed county count
+    assert "30 seconds" not in answers
+    assert "every lead" not in answers
+    assert "fewer contacts or none" in answers
+    assert "after cancellation" not in answers
+    # The Starter delay IS real (test_plan_entitlement_audit), so the FAQ keeps it.
+    assert "delayed 7 days" in answers

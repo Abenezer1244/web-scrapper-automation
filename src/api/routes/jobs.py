@@ -1382,7 +1382,7 @@ def _valid_quote_payload(quote: dict):
     if not (_is_count(price) and 0 < price <= _PG_INT_MAX
             and isinstance(cur, str) and len(cur) == 3
             and isinstance(pv, str) and 0 < len(pv) <= 32
-            and (cur + pv).isascii() and (cur + pv).isprintable()  # no NUL, no surrogate
+            and (cur + pv).isprintable()  # no NUL / control byte, no lone surrogate
             and stopped in _QUOTE_STOPS and _is_count(remaining)):
         return None
     return expires_at, ids, stopped is not None and remaining > 0

@@ -5686,6 +5686,19 @@ this PR, a P2 operational follow-up if real 429s appear.
   `refetchOnMount: "always"`, fresh only once `dataUpdatedAt` passes mount time, else
   `starter`), the scrapers/new pattern; never the session snapshot.
 
+### Codex consult r3 on 1c (2026-10-02): PLAN: REVISE, 1 P1 + 2 P2, all adopted; AT1-AT2 CLOSED
+Output: `codex_1c_consult_r3_out.txt`.
+- **AU1 (P1) the trial cap is not "another quote":** `truncated_reason` drives the copy. `cap` and
+  `scan_limit`: "This covers the first N; get another quote for the remaining R." `credit_cap`:
+  "Your free trial covers up to {trial_credit_allowance} lookup credits (an address-only lookup
+  uses 2). {over_trial_allowance} more leads do not fit; upgrade to look them up." No re-quote
+  promise. The zero state names the trial cap too when `over_trial_allowance > 0`.
+- **AU2 (P2) no count of earlier actions** (the list holds at most 20): unnumbered copy, "You also
+  have earlier lookups on this tab.", shown when the list has more than one action.
+- **AU3 (P2) AS8 is narrowed to the progress component:** its one `role="status"` region. The
+  delivered tab's `DeliveredLookupSummary` keeps its own polite region (a different fact, the
+  tab's leads, not this action), and that file stays out of scope.
+
 ## Safety PR: Alembic can never reach production from a test or a stray CLI run (PLAN, 2026-09-27)
 
 The Deferred bullet below, taken now. Same class as the two production wipes.

@@ -83,6 +83,7 @@ from src.api.schemas import (
     VerifyEmailRequest,
 )
 from src.config import settings
+from src.config.constants import BUSINESS_FEATURES_PLANS
 from src.db import User, get_db  # noqa: F401 (User used in Annotated type)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -498,7 +499,7 @@ async def reset_password(
 async def create_api_key(
     body: ReauthRequest,
     request: Request,
-    current_user: Annotated[User, Depends(require_plan("business", "agency"))],
+    current_user: Annotated[User, Depends(require_plan(*sorted(BUSINESS_FEATURES_PLANS)))],
     _session: Annotated[User, Depends(require_session)],
     db: AsyncSession = Depends(get_db),
 ) -> ApiKeyResponse:

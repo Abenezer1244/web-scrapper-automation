@@ -58,7 +58,7 @@ pandas==2.2.3
 openpyxl==3.1.5
 
 # Storage (Cloudflare R2 / S3-compatible)
-boto3==1.43.60               # service-model churn only for our S3-compatible R2 use (upload + presigned GET)
+boto3==1.43.104               # service-model churn only for our S3-compatible R2 use (upload + presigned GET)
 
 # Email
 resend==2.7.0

@@ -23,7 +23,8 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 > Phase 1b-2 of contact lookup. 2d is the switch that made lookups purchasable in production;
 > 2e is the read the 1c page needs. Both under the house loop: Codex consult to PLAN: GO,
-> mutation runner, Codex three-dot review to GATE: GO, regression in chunks, standing-rule merge.
+> mutation runner, Codex three-dot review to GATE: GO, regression in chunks; 2d merged under the
+> standing rule, 2e not yet.
 
 **Built / Shipped:**
 - **#432** (merge `bd17ef2d`, live + verified: api/worker/beat SUCCESS, unauth POST = 401):
@@ -33,7 +34,7 @@ to understand *why* the code is the way it is and *what's been attempted before*
   run) and the initial event; compare-and-delete of the quote key; a bounded publish on its own
   2-thread pool behind a non-blocking semaphore (a broker stall holds no request thread); the
   `dispatched_at` stamp may lose the race to the worker and that is success.
-- **2e** (branch `feat/lookup-1b2e-status`): `GET /jobs/{job_id}/contact-lookups/{action_id}`
+- **2e: BUILT, PENDING PR / merge / deploy** (branch `feat/lookup-1b2e-status`): `GET /jobs/{job_id}/contact-lookups/{action_id}`
   and `GET /jobs/{job_id}/contact-lookups` (the newest 20, so a reloaded page finds its
   actions). Counts DERIVED from the verdict rows in one statement (the action's counters are a
   cache that goes stale by design); a closed customer vocabulary for outcomes and reasons, never
@@ -78,8 +79,8 @@ to understand *why* the code is the way it is and *what's been attempted before*
 **Pending / Handoff:**
 - 2e: PR, CI on the exact head, quiet, merge under the standing rule, deploy verify.
 - Then 1c, the frontend page (sibling repo).
-- Follow-up PRs: every other `/jobs/{job_id}` route still turns a malformed id into a 500 (with
-  a ref); move them onto `_canonical_job_id`. Two scripts still say the system role has
+- Follow-up PRs: `GET/DELETE /jobs/{job_id}`, `/results`, `/logs`, `/export-url` and `/download`
+  still turn a malformed id into a 500 (with a ref); move them onto `_canonical_job_id`. Two scripts still say the system role has
   "DELETE=False on every table".
 
 **Facts learned:**

@@ -95,6 +95,13 @@ class TestEvaluate:
     def test_an_owner_occupied_county_is_not_an_echo_warning(self):
         assert dq.evaluate(self._m(50, 100.0, echo=100.0), self._m(500, 80.0, echo=90.0)) == []
 
+    def test_phone_and_email_are_judged_only_with_skip_tracing_on(self):
+        """A config without skip tracing has no phone/email by design (prod: Pierce
+        probate 4474edb2 read as 0% phone vs a 34% baseline). Not a collapse."""
+        run, base = self._m(50, 90.0, phone=0.0, email=0.0), self._m(500, 90.0, phone=35.0, email=40.0)
+        assert dq.evaluate(run, base, skip_trace=False) == []
+        assert {w["field"] for w in dq.evaluate(run, base, skip_trace=True)} == {"phone", "email"}
+
     def test_a_property_collapse_is_reported_too(self):
         warnings = dq.evaluate(self._m(50, 80.0, property_address=20.0), self._m(500, 80.0))
         assert [w["field"] for w in warnings] == ["property_address"]

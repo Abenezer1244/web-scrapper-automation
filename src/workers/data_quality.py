@@ -90,10 +90,15 @@ GROUP BY 1 ORDER BY 2 DESC
 """
 
 _JOB_SQL = """
-SELECT j.id, j.finished_at, lower(sc.county) AS county, upper(sc.state) AS state, sc.record_type
+SELECT j.id, j.finished_at, lower(sc.county) AS county, upper(sc.state) AS state, sc.record_type,
+       sc.skip_trace_enabled
 FROM jobs j JOIN scraper_configs sc ON sc.id = j.scraper_config_id
 WHERE j.id = :job_id
 """
+
+# Phone and e-mail only exist when the customer bought skip tracing for the config;
+# judging them on a config that did not is a false alarm, not a collapse.
+_SKIP_TRACE_FIELDS = frozenset({"phone", "email"})
 
 _RECENT_DONE_SQL = """
 SELECT j.id FROM jobs j
@@ -133,15 +138,16 @@ def baseline_coverage(db, *, job_id: str, county: str, state: str, record_type: 
     return _shares(row)
 
 
-def evaluate(run: dict, baseline: dict) -> list[dict]:
+def evaluate(run: dict, baseline: dict, *, skip_trace: bool = True) -> list[dict]:
     """Warnings for this run. Empty when the run is within its baseline, when there
-    is no baseline worth the name, or when the run is too small to judge."""
+    is no baseline worth the name, or when the run is too small to judge. Phone and
+    e-mail are judged only when the config has skip tracing on."""
     warnings: list[dict] = []
     if run["rows"] < MIN_RUN_ROWS or baseline["rows"] < MIN_BASELINE_ROWS:
         return warnings
     for f in FIELDS:
         base, now = baseline["pct"][f], run["pct"][f]
-        if base < MIN_BASELINE_PCT:
+        if base < MIN_BASELINE_PCT or (f in _SKIP_TRACE_FIELDS and not skip_trace):
             continue
         if now + DROP_POINTS < base:
             warnings.append({"field": f, "run_pct": now, "baseline_pct": base,
@@ -180,7 +186,7 @@ def check_job(db, job_id: str, *, alert: bool = True) -> dict:
     run = run_coverage(db, job_id)
     baseline = baseline_coverage(db, job_id=job_id, county=job["county"], state=job["state"],
                                  record_type=job["record_type"])
-    warnings = evaluate(run, baseline)
+    warnings = evaluate(run, baseline, skip_trace=bool(job["skip_trace_enabled"]))
     report = {"job_id": job_id, "county": job["county"], "state": job["state"],
               "record_type": job["record_type"], "run": run, "baseline": baseline,
               "warnings": warnings}

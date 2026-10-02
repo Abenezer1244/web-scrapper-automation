@@ -5141,8 +5141,16 @@ line as `  injection ...`; it reads `  fault injection ...`) before writing anyt
   54 mutants, 53 caught + AO5 (equivalent: Codex r2). The **regression (60 files, 9
   chunks): 1,457 passed, 0 failed**; source hashes verified after. ruff clean; no type
   checker is configured for this repo. `openapi.json --check` OK (+218, 0 deletions).
-- **NEXT:** rebase onto main after #428 (another session's middleware PR), prove the 2d
-  diff byte-identical, Codex re-check, open the PR, CI, quiet, merge, deploy verify.
+- **Rebased onto main `9a3080c7`** (#427 docs, #429 pypdf, #428 a DB-outage → 503
+  middleware). The 2d diff is byte-identical to the reviewed one (102,943 bytes). **Codex's
+  post-rebase check: NO-GO, 1 P2 + 1 P3, a real interaction with #428:** the stamp
+  handler's own `rollback()` could raise on a dead connection and escape, and #428 turns
+  that into a 503 for a purchase already committed (a retry replays safely, but a
+  committed purchase must answer 202). Fixed in `ba306b8b`: the rollback is guarded and
+  logged, pinned by a labelled double-fault test (a stamp trigger + a rollback that raises
+  once), and its mutant is caught. The 503 docs now name the service-wide `{detail, ref}`
+  body. **Re-check: GATE: GO**: nothing after the commit can fail the request.
+- **NEXT:** open the PR, CI on the exact head, quiet, merge, deploy verify.
 - **Codex diff review r1: NO-GO, 1 P1 + 3 P2 + 1 P3, all fixed in `c840ea45`:**
   - the post-commit import + publish are guarded (P1);
   - strict validation of the stored payload → 409 `quote_unsupported` (naive expiry,

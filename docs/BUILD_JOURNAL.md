@@ -19,6 +19,100 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-10-03 — Mailing backfills applied (Benton, Snohomish), Okanogan's invented parcels cleared and re-run
+
+> Follow-up to #436/#437 (mailing-address audit). Owner approved `--apply` for Benton, Snohomish
+> and Clark, and "clear first, then rerun" for Okanogan. No app code changed this session.
+
+**Built / Shipped:**
+- **Data-quality sweep: first tick ran** at 08:33 UTC on the worker (one tick, not yet a trend):
+  "Data quality sweep: 2 checked, 0 warned, 0 already judged".
+- **Backfills (`scripts/backfill_mailing_by_county.py`), run ON the Railway worker.** Dry run
+  first each time, then a spot-check against an independent county read, then `--apply`:
+
+  | County | Before | Written | After | Spot-check |
+  |---|---|---|---|---|
+  | Benton | 0/7 | 4/4 candidates (`pacs_benton`) | 4/7 (3 rows have no parcel) | 4/4 MATCH raw PACS detail page |
+  | Snohomish | 2,359/4,119 | 1,760/1,760, 0 errors, 3 min (`snohomish_assessor_roll`) | **4,119/4,119** | 5/5 random MATCH county GIS `taxpr*` |
+
+  Owner flags were recomputed by `_write_row`: Snohomish 823 absentee, 63 out-of-state.
+- **Okanogan job `1c6ee3b1`** (probate, owner's admin account): 13 rows, 10 surname-inferred
+  parcels, 3 parcels shared by two decedents.
+  - **Clear.** 13 rows over 10 distinct parcels (3 parcels on 2 rows each), so 10 distinct
+    `property_key`s and 10 membership rows. One SERIALIZABLE transaction over a pinned
+    row→parcel manifest. It NULLed
+    `parcel_id`, the property address parts, `property_key` and the owner flags. Each row's old
+    values are stored in `enrichment_data.parcel_cleared.preimage`. The 10 stale
+    `property_list_membership` rows were deleted, and the post-commit state was verified.
+    Not touched: `dedup_hash`, `is_duplicate`, `delivered_records` (frozen billing key).
+  - **Re-run (job `6a5c4ae2`).** Same config and the original 06/15–09/13/2026 window. The
+    schedule swap and the job INSERT were one transaction, the window persisted on the job row
+    was verified, and the schedule was restored byte-for-byte.
+  - **Result:** 30 records (all 13 old instruments included), 0 parcels, 0 duplicates, 1 lead
+    with an address (unique owner-name TaxSifter fill), "29 without an address".
+
+**Tried / Decided:**
+- **Ran ON the worker via `railway ssh`, not `railway run`.** `railway run` executes locally and
+  cannot reach prod's private Redis, so the county adapter either fails closed (no lease) or,
+  with a local Redis override, competes with prod's recovery sweep. Registered an SSH key on
+  the owner's Railway account and added the ssh.railway.com host key to known_hosts.
+- **Clark skipped at the Clark session's request.** Its beat recovery (`clark_pic`, one fleet-wide lease)
+  already owned all 1,634 historical rows (1,690/1,741 at 09:03 UTC, rising). A second stream
+  would only queue behind the same lease.
+- **Okanogan: cleared `parcel_id` itself.** The standing rule "parcel_id is source identity,
+  never rewrite it" (`repair_probate_party_and_bad_parcel.py`) does not hold here: every one of
+  these parcels was invented from a surname, not read from the record. Codex agreed.
+- **Re-run billing accepted, with the reason recorded:** the account is the owner's admin
+  account (agency, `records_limit=-1`), so a second delivery charges nobody. The new rows hash
+  NAME|DATE and the old ones hashed parcel|address, so they do not dedup against each other.
+- **Per-job date window: rejected for this one-off.** `run_scrape_job` resolves the window from
+  `scraper_configs.schedule`, not the job row. Instead of an app change: a guarded
+  schedule swap, verifying the window the worker persisted, and a restore that refuses if any
+  other job appeared on the config (job-id snapshot, not timestamps).
+
+**Failed / Blocked:**
+- **Codex took 8 rounds on the two Okanogan scripts.** Real catches, in order:
+  - `assert` guards (stripped by `-O`)
+  - restoring the schedule while a pending job could still read it
+  - a non-atomic swap + INSERT
+  - an unbounded wait and an unbounded broker publish
+  - restore racing a newer job (`created_at` is the transaction start time)
+  - manifest pinned by set rather than by exact row→parcel mapping
+
+  The DATE-typing finding was disputed: `jobs.date_from` is `String(16)`.
+- **Our own dry run caught a UUID vs str comparison** in the re-run scope guard. It failed closed.
+- **The auto-mode classifier blocked the clear `--apply`.** The owner then sent the exact
+  command as a message, and it was run once.
+- First tries at the inspection query guessed column names (`delivered_records.result_id`,
+  `scraper_configs.label`). Read `models.py` first.
+
+**Caught & fixed:** nothing in shipped code. The fixes above were to one-off operator scripts,
+which were not committed (session scratchpad). Their production effects (the backfill writes,
+the Okanogan clear, the re-run) were applied deliberately and are described above.
+
+**Pending / Handoff:**
+- `taxsifter.fill_addresses_by_owner` writes no `mailing_source` / address provenance key and
+  leaves the owner flags NULL. Found on the Okanogan re-run's single filled row.
+- The old Okanogan rows still carry `is_duplicate` flags caused by the shared wrong parcels
+  (frozen by design; the `parcel_cleared` marker says why). The new job supersedes them.
+- Handoff §8 step 4 follow-ups are unchanged:
+  - Kitsap / Whitman / Douglas sources
+  - Pierce: 96 rows missing mailing
+  - King code_violation job `37014cb9` (3.5% vs a 65% baseline)
+- Clark: the `clark_pic` recovery sweep is finishing the last ~51 rows.
+
+**Facts learned:**
+- **`railway ssh --service worker -- <cmd>` is real remote execution** (`railway run` is local).
+  - Needs a registered key (`railway ssh keys add --key "C:\\...\\id_ed25519.pub"`; a
+    POSIX-style path is "Key not found") and the host key in known_hosts.
+  - Pipe ad-hoc scripts on stdin: `-- python - < file.py`.
+  - `PYTHONPATH=/app` is required for `scripts/*.py`; there is no `time` builtin in the
+    container shell.
+- The Snohomish Assessor Roll backfill is bulk: 1,760 rows in 3 minutes, no per-parcel county
+  requests.
+- A job's billed count (`record_count`) excludes leads with no deliverable address. "Billed 1"
+  on a 30-record run is not deduplication.
+
 ## 2026-10-02/03 — Clark mailing addresses: 0 to 1,578 of 1,741, and the page that stopped answering
 
 > Owner report: an admin Clark probate run returned no mailing addresses. Job `62404bd0`

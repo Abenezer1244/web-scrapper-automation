@@ -37,7 +37,7 @@ from collections.abc import Callable
 
 from sqlalchemy import text
 
-from src.scrapers.enrichment.source_health import KING_EREALPROPERTY
+from src.scrapers.enrichment.source_health import CLARK_PIC, KING_EREALPROPERTY
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("enrichment.source_probe")
@@ -146,9 +146,57 @@ def _redirect_hint(response) -> str:
     return f" -> {target[:120]}"
 
 
+# Parcels Clark County itself owns ("CLARK COUNTY INTERNAL SERVICES", verified
+# 2026-10-03 on the Fact Sheet): 1300 and 1200 Franklin St, Vancouver, the county's
+# own government buildings. Using the county's parcels rather than our scraped rows
+# keeps every tenant's lead data out of a system probe (Codex), and a seat of county
+# government is not retired the way a residential parcel can be.
+_CLARK_PROBE_PARCELS = ("55735000", "50490000")
+
+
+def probe_clark_pic(db) -> tuple[bool, str]:
+    """Is Clark's Property Information Center Fact Sheet serving readable records?
+
+    Healthy requires a 200 whose page names the parcel asked for AND yields a mailing
+    address: the same `parse_page` the enrichment path uses, held to `found` only, so
+    a challenge, maintenance or re-laid-out page can never clear the source. `db` is
+    unused; the targets are fixed county parcels.
+    """
+    from src.scrapers.enrichment.clark_pic import (
+        _PACE_S,
+        _TIMEOUT_S,
+        _URL,
+        FOUND,
+        parse_page,
+    )
+    from src.utils.safe_http import safe_get
+
+    outcomes: list[str] = []
+    for i, pid in enumerate(_CLARK_PROBE_PARCELS):
+        if i:
+            time.sleep(_PACE_S)  # Clark answers 429 at 1.5 s spacing; ~7 s is safe
+        try:
+            r = safe_get(_URL, params={"account": pid},
+                         headers={"User-Agent": "Mozilla/5.0 (compatible; BridgeLeads)"},
+                         timeout=_TIMEOUT_S)
+        except Exception as exc:  # noqa: BLE001
+            outcomes.append(f"{pid}:{type(exc).__name__}")
+            continue
+        if r.status_code != 200:
+            outcomes.append(f"{pid}:HTTP{r.status_code}{_redirect_hint(r)}")
+            continue
+        outcome = parse_page(r.text, pid).outcome
+        if outcome != FOUND:
+            outcomes.append(f"{pid}:{outcome}")  # an outcome code, never page content
+            continue
+        return True, f"200 + readable Fact Sheet for county parcel {pid}"
+    return False, "; ".join(outcomes)
+
+
 # source_key -> probe. A source with no entry is left alone by the canary rather
 # than guessed at: clearing a source we cannot actually verify would be worse
 # than leaving it in cooldown.
 PROBES: dict[str, Callable[[object], tuple[bool, str]]] = {
     KING_EREALPROPERTY: probe_king_erealproperty,
+    CLARK_PIC: probe_clark_pic,
 }

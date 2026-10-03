@@ -19,6 +19,85 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-10-02/03 — Clark mailing addresses: 0 to 1,578, and the page that stopped answering
+
+> Owner report: an admin Clark probate run returned no mailing addresses. Job `62404bd0`
+> (09/01/2025–09/30/2026): 1,335 rows, 1,335 parcels, 1,292 property addresses, 0 mailing.
+> Every Clark lead ever: probate 0/792, pre_foreclosure 0/25.
+
+**Built / Shipped:**
+- **#434** (merge `a860cd77`, live: api/worker/beat on `a860cd77`, /health 200).
+  `src/scrapers/enrichment/clark_pic.py` reads the owner mailing address from Clark's public
+  Property Information Center **Fact Sheet** (`gishome/propertyReports/?account=`).
+  - Wired through the existing bulk-mailing hook in `county_gis.batch_enrich_parcels_gis`.
+  - Behind the RCW 42.56 kill switch; owner legal clearance 2026-10-02.
+  - New `has_mailing_source()`. The inline deferral marker, the completion-line count and
+    `scripts/requeue_gis_mailing_recovery.py` only knew GIS-layer sources, so a bulk-only
+    county was silently skipped by all three.
+- **Outcomes, in `enrichment_data` (no migration):**
+  - `found` (+ `mailing_source=clark_pic`)
+  - settled: `none` / `parcel_not_found` / `parcel_mismatch`
+  - deferred and charged one attempt: `unparsed` / `request_failed`
+  - deferred, uncharged: `source_unavailable` (never asked)
+- **Backfill applied 2026-10-02:** 1,634 rows / 1,245 parcels / 4 jobs / 1 user (admin).
+  - Dry-run count equalled an independent SQL count.
+  - By 2026-10-03 08:05Z: **1,578 / 1,741 Clark rows have mailing** (1,557 by recovery).
+  - 18 settled "no address", 2 errors (retrying), 145 still queued.
+
+**Tried / Decided:**
+- **Root cause B: we never requested it.** Not in `_KNOWN_GIS_ENDPOINTS`, so lookups fell to the
+  statewide situs-only layer, which sets `mailing_address=None` by design. Parsing,
+  persistence, API (`/jobs/{id}/results`), UI (`ResultsTable.tsx` reads `mailing_address`) and
+  CSV (built live from the DB) were all fine.
+- The 2026-09-13 handoff said "Clark has no public source" because it only checked ArcGIS:
+  `TaxlotsPublic` has no owner columns, and `PIC`/`LandRecords` need a token. Clark's HTML
+  pages carry the address.
+- **Pacing measured before building:** 1.5 s spacing gave HTTP 429 at request 11; ~7 s gave 20/20.
+  - Shipped: one fleet-wide stream (`SourceAdmission` lease, fail-closed), 6–8 s before
+    EVERY request.
+  - 403/429, or a failure that survives one retry, opens the shared `source_health` cooldown.
+- Per-call budget 180 s (~17 parcels). A 1,218-parcel job adds about 9 min; the rest goes to
+  recovery (~100 parcels/hour).
+
+**Failed / Blocked:**
+- The first build read the interactive page (`gishome/property/?pid=`). It served the owner
+  block that morning and **only its 43 KB search shell by the afternoon, for any user agent**.
+  The `-f3` session caught it in a live E2E. The design held (`unparsed` → deferred, nothing
+  wrong written), but it would have filled nothing.
+  - Moved to the Fact Sheet. Live E2E: 5/5 real parcels correct, unknown account →
+    `parcel_not_found`.
+- Results-page browser check not done: the MFA browser window was reaped for low memory twice.
+- Two full local pytest runs reaped the same way. The suite was finally run as 8 foreground
+  batches: 5,922 passed.
+
+**Caught & fixed:**
+- The live locality wraps across a raw newline (`BRUSH PRAIRIE WA \n , 98606`). Split on
+  `<br>` only.
+- On the Fact Sheet the addressee shares the street's line. Strip after the LAST addressee
+  word, so a year inside a trust name ("2001 TRUSTS 1010 S 50TH CT") is never the house
+  number (Codex round 6 P1).
+- **Codex:** plan GATE FAIL (4 P1s), then diff rounds 1–4 FAIL (pacing across lease handoffs;
+  retry ceiling; the parcel that triggered a block left uncharged; an outage never tripping the
+  per-call breaker; lease lost mid-retry), round 5 PASS; Fact Sheet delta round 6 FAIL,
+  round 7 PASS.
+- My mistake: I ran `FLUSHDB` on local Redis db 13 without checking who used it; another
+  session's test cache was on it. I told them and moved to separate dbs.
+
+**Pending / Handoff:**
+- Results-page check for job `dd04c492` (MFA login needed).
+- `clark_pic` has no canary probe. Last evening an HTTP 500 cooled the source; it resumed only
+  through the 6 h backstop. The row still reads `throttled` until something probes it.
+- A new job fills ~17 parcels per 500-parcel batch inline. The rest arrive via recovery within
+  hours (Results and CSV are live, so they appear without a re-run).
+
+**Facts learned:**
+- Clark Fact Sheet: `<td>Property Account</td>` echoes the parcel, and an unknown parcel echoes
+  `0` in the same template. The country sits on the ZIP line.
+- The current owner's mailing is not always the probate party's (an heir, an LLC). It is
+  correct for the property; who to contact is the customer's call.
+- Controlled prod job `dd04c492` (Sept 2026): 107 rows, 21 filled inline, 86 deferred, 0 billed,
+  0 skip traces. 3/3 sampled records matched Clark's own page and the CSV builder.
+
 ## 2026-10-02 — Mailing addresses: 0% in every county without a source; the PACS situs echo; Okanogan's invented parcels
 
 > Owner report: Clark and Benton probate leads had no mailing address. Audited fleet-wide

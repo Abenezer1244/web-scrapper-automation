@@ -5453,6 +5453,15 @@ amended by AP1-AP4, AQ1-AQ3, AR1.
 - **NEXT:** PR → CI on the exact head → quiet (owner) → merge (standing rule, "merging" to every
   peer) → deploy verify (unauth GET on both routes = 401). Then 1c.
 
+### 2e MERGED + LIVE (2026-10-02): #435, merge `b5dd93ee`
+- Standing rule met: quiet 4×0 (run twice), CI green on `b53380fe`, Codex GO, main unchanged,
+  `--match-head-commit`. api / worker / beat SUCCESS on `b5dd93ee`; `/health` 200; both GETs
+  401 unauthenticated (live); worker and api logs clean.
+- Found afterwards: the 2e plan edit had DROPPED the `## Phase 1c` heading below (the one
+  "deletion" in #435's diff; neither review caught it). Restored on the 1c spec branch.
+
+## Phase 1c - the action, frontend
+
 - [ ] "Look up contacts" button on the results header for the current tab. It is shown whenever
       the tab has leads that have never been looked up; when the quote comes back with
       `max_new_lookups = 0` the dialog explains why (every lead is already answered, in progress,
@@ -5529,6 +5538,200 @@ amended by AP1-AP4, AQ1-AQ3, AR1.
       An expired or evicted quote returns 409 `quote_expired` and the dialog offers to
       re-quote (safe to retry, nothing was charged); an unknown category is 422; Redis unavailable
       is a friendly 503 and nothing is queued.
+
+### 1c BUILD SPEC (2026-10-02, BEFORE the Codex consult)
+Owner: **START 1c** (2026-10-02). Frontend repo `bridgeleads-web`, worktree
+`C:/Users/Windows/bl-fe-lookup1c`, branch `feat/lookup-1c-contacts-page` off master `28dcb52`
+(includes FE #205). The backend is complete and LIVE: quote (1b-1c), confirm (2d, #432), status
++ list (2e, #435). The state-machine / reconciler bullets above are BACKEND work, all done in 1b-2.
+
+**Facts (read 2026-10-02, FE master `28dcb52`):**
+- `app/(dashboard)/results/[id]/page.tsx` (911 lines): the run page. The tab is `view` (`new` /
+  `delivered`) in the URL; `category` = `new` / `already_delivered` follows it. The header holds
+  the Download button; `DeliveredLookupSummary` renders above the toolbar on the delivered tab.
+  The results query polls (5 s while enriching / running; 30 s while any row is `queued` /
+  `submitted`).
+- `lib/api.ts` `apiFetch` throws `ApiError {status, detail?}`; `readErrorBody` keeps an object
+  `detail {code, message, title?}`, so 402 (`skip_trace` plan), 409 / 410 (`quote_*`,
+  `nothing_to_look_up`, `run_not_finished`) and 503 (`contact_lookups_unavailable`) all arrive
+  with `detail.code`. The #428 DB-outage 503 is `{detail: string, ref}` (a plain message).
+- `lib/errors.ts`: `getFriendlyError`, `toastError` (402 → `toastUpgrade`, the plan notice),
+  `toastSuccess`. `components/ui/dialog.tsx` (Radix); the BillingTab charge-confirm dialog is the
+  precedent. `canSkipTracePlan(plan)` (Pro+) with the plan read FRESH from `["me"]`, failing
+  closed (the scrapers/new pattern).
+- `lib/api-types.generated.ts` regenerated from backend main now has `ContactLookupQuote`,
+  `ContactLookupAction`, `ContactLookupStatus`, `ContactLookupOutcomes`, `ContactLookupSummary`,
+  `ContactLookupList` (+269 lines).
+- No FE test runner: proof is `tsc --noEmit`, `eslint`, `next build`, the bundle grep, and a
+  real-browser drive (the stub-API rig, memory `reference_fe_playwright_stub_api_rig`).
+
+**Design (1c-i, one FE PR):**
+1. `lib/api.ts`: `quoteContactLookups(jobId, category)`, `confirmContactLookups(jobId, quoteId,
+   category)`, `listContactLookups(jobId, category)`, `getContactLookup(jobId, actionId)`, typed
+   with the generated schemas.
+2. **Button** "Look up contacts" in the results header beside Download, for the CURRENT tab:
+   shown when the job is finished (`!isRunning`) and the tab has leads (new count / delivered
+   count > 0). Plan below Pro (fresh `["me"]`, fail closed): shown disabled with the existing
+   upsell wording; the backend 402 is the authority and renders through `toastUpgrade`.
+3. **Quote → confirm dialog** (`_components/ContactLookupDialog.tsx`): opening it POSTs the quote
+   (a spinner; errors → `toastError`, the dialog closes). It shows:
+   - `max_new_lookups` = 0: why (already answered / in progress / previously attempted / each
+     excluded reason, non-zero only) and NO confirm button.
+   - else: "Up to N leads will be looked up" (+ "M of them by address only" when
+     `advanced_count`), the exclusion breakdown, already answered / in progress, "answers we
+     already have are reused at no charge", included lookups left this month, then the price
+     per lookup (`unit_price_cents`, `currency`) after the allowance; a trial: its allowance;
+     `truncated`: "this covers the first N; get another quote for the remaining R"; the pause
+     state when `paused` (resume times; "address-only lookups cannot run under today's limit"
+     for `never`); `unknown` says nothing.
+   - Confirm → 202: close, `toastSuccess`, invalidate the tab's list + the action query.
+     410 `quote_expired`: an in-dialog notice + "Get a new quote" (re-POSTs the quote). 409 codes:
+     their message in the dialog; `quote_stale` also offers the re-quote. 402 / 503 / other:
+     `toastError`. The confirm button disables itself past `expires_at` (offers the re-quote).
+   - No em dashes in user copy (`node scripts/find-user-facing-dashes.mjs`).
+4. **Progress** (`_components/ContactLookupProgress.tsx`), above the toolbar on each tab:
+   - `listContactLookups(jobId, category)` → the newest action's status via
+     `getContactLookup`, polled every 10 s until `settled` / `failed` / `expired`; the list is
+     re-read on a confirm and when the newest turns final. Older actions: one quiet line
+     ("N earlier lookups on this tab"), no extra polling. Budget: ~6 req/min of the account's
+     60/min `general` bucket.
+   - Copy per status / reason (2e's closed vocabularies; an unknown value gets neutral copy):
+     `dispatching` (starting; `lookups_switched_off`: paused by BridgeLeads, starts when they
+     resume, nothing charged until then; `retrying`: taking longer than usual, retried
+     automatically), `running` (starting), `claimed` (looking up N; `under_review`: a result
+     needs a manual check, nothing more is charged meanwhile), the pause line when `pause` says
+     `paused`, `settled` (done), `failed` (`plan_not_eligible` / `account_inactive` /
+     `run_unavailable` / `leads_changed` / `other`: nothing was looked up or charged),
+     `expired` (did not start in time; nothing charged).
+   - The outcomes line, non-zero buckets only, in the DeliveredLookupSummary style; plus
+     "B count as billable lookups". `aria-live="polite"`.
+   - When the newest action's outcomes change (or it turns final), invalidate `["results", id]`
+     so the phones and emails appear in the table.
+   - Query errors: `isError` → a compact retry, never silence (the four-states convention). A 404
+     on the status (the action went with its run) drops it from view.
+5. `page.tsx` mounts the button and the progress; no other change to the page.
+
+**Files (5, FE):** `lib/api.ts`, `lib/api-types.generated.ts`, `app/(dashboard)/results/[id]/page.tsx`,
+`.../_components/ContactLookupDialog.tsx` (NEW), `.../_components/ContactLookupProgress.tsx` (NEW).
+This plan (BE repo) rides in its own docs PR with the 2e MERGED record.
+
+**Verification:** `tsc --noEmit`, `eslint .`, `next build`, the dashes script, the bundle grep for
+the new copy; a real-browser drive against the stub API through every dialog state (zero,
+normal, truncated, trial, paused, expired re-quote, 402) and every progress status; then Codex
+three-dot review to GATE: GO; FE CI; merge to master (= Vercel deploy); prod check: the page
+loads and the button opens a quote for an eligible account (a quote is read-only; NO confirm in
+prod without the owner).
+
+**Questions for the consult:**
+1. Button visibility: shown-disabled below Pro vs hidden; on the delivered tab too?
+2. The polling plan (newest only, 10 s) vs every non-final action.
+3. Copy honesty: "billable", "no charge", the price line vs the included allowance; anything that
+   promises more than the API states.
+4. Re-quote flows (410, `quote_stale`, expiry) and double-submit (the confirm is idempotent on
+   `quote_id`; is disabling while pending enough?).
+5. Cache invalidation between the quote, the progress and the results table.
+6. Anything in the 5-file split, or the stub-rig verification, that misses a real failure.
+
+### Codex pre-code consult r1 on 1c (2026-10-02): PLAN: REVISE, 5 P1 + 3 P2 + 1 P3, all adopted
+Output: `<scratchpad 79ada66a>/codex_1c_consult_r1_out.txt`. Answers: Q1 show on BOTH tabs, disabled
+with the upsell below Pro (fresh, fail-closed `["me"]`); Q2 newest action only; Q4 the server's
+`quote_id` idempotency is the money guard, the client adds a synchronous guard; Q6 the split is
+fine. The amendments (they supersede the BUILD SPEC where they differ):
+- **AS1 (P1) scope:** the dialog says, prominently: "This covers every eligible lead on the
+  {New / Already delivered} tab, not only the ones your search or filters show."
+- **AS2 (P1) no raw backend text in the dialog:** every refusal renders FIXED copy chosen by
+  `detail.code` (`quote_expired`, `quote_stale`, `quote_unsupported`, `quote_mismatch`,
+  `nothing_to_look_up`, `run_not_finished`, `contact_lookups_unavailable`); anything else goes
+  through `getFriendlyError(err, fixed fallback)`. Never `error.message` / `detail.message`
+  directly. The in-dialog error has `role="alert"`. Re-quote is offered on `quote_expired`,
+  `quote_stale` AND `quote_unsupported`.
+- **AS3 (P1) polling within the shared 60/min bucket:** the status polls every **15 s** (not 10),
+  only while the document is visible (React Query's default `refetchIntervalInBackground:
+  false`), one poller per page (the newest action); the contact-lookup queries never auto-retry
+  a 429, and after a 429 the next poll waits 60 s. Budget per open page: ~4 status + 0.25 list
+  req/min beside the results list's 2/min. Cross-tab coordination and a dedicated backend bucket
+  are NOT built (decision: the backoff bounds it; a backend zone is a later BE PR if real use
+  shows 429s).
+- **AS4 (P1)** the existing "Results typically appear within 10-15 minutes" notice (page.tsx
+  ~776-792) promises a time the backend deliberately does not (caps and the kill switch pause
+  lookups). Replaced by "Contact lookups are processing. This page refreshes automatically.";
+  timing and pause language live only in the progress component.
+- **AS5 (P1) price honesty:** "After your included lookups, each billable lookup costs $X. Leads we
+  can answer from an earlier lookup, and some the provider cannot match, are not billed, so the
+  final billable count may be lower." No estimated total (the API gives none).
+- **AS6 (P2)** a status 404 shows "This lookup is no longer available." with a "Refresh" action
+  (re-reads the list), never an empty or success state.
+- **AS7 (P2) exact query keys:** `["contact-lookups", jobId, category]` (the list) and
+  `["contact-lookup", jobId, category, actionId]` (the status). A confirm invalidates the list
+  key; a change in the newest action's outcomes, or it turning final, invalidates
+  `["results", jobId]` (prefix: every page / search / sort) and, when final, the list.
+- **AS8 (P2) one live region:** a single stable `role="status" aria-live="polite"
+  aria-atomic="true"` element holds status, reason, pause and outcomes. Every dialog state has a
+  `DialogTitle` and a `DialogDescription`.
+- **AS9 (P3) verification matrix, added:** double-click confirm, two tabs confirming the same
+  quote, a quote replaced by a newer one (410), reload after a 202 (the progress finds it via the
+  list), 409 / 410 / 402 / 503 bodies including a hostile-looking `message` (must not render),
+  a status 404, a 429 on the poll (backs off, no error flood), an active search / tax filter
+  while quoting (AS1 copy visible).
+- Files unchanged (5). `page.tsx` now also carries AS4.
+
+### Codex consult r2 on 1c (2026-10-02): PLAN: REVISE, design CLOSED; 1 P1 + 1 consistency fix
+Output: `codex_1c_consult_r2_out.txt`. AS1-AS9 close r1 in the design (Codex listed each as "open in
+code" because no code exists yet: a pre-code consult). AS3 accepted as a bounded-risk decision for
+this PR, a P2 operational follow-up if real 429s appear.
+- **AT1 (P1)** the button and the quote flow are gated on `job.status === "done"`, the backend's
+  `_run_delivered` (jobs.py:158), NOT `!isRunning`: a failed or cancelled run would show a button
+  that can only ever 409.
+- **AT2** the plan is read through React Query `["me"]` (`getMe`, `staleTime: 0`,
+  `refetchOnMount: "always"`, fresh only once `dataUpdatedAt` passes mount time, else
+  `starter`), the scrapers/new pattern; never the session snapshot.
+
+### Codex consult r3 on 1c (2026-10-02): PLAN: REVISE, 1 P1 + 2 P2, all adopted; AT1-AT2 CLOSED
+Output: `codex_1c_consult_r3_out.txt`.
+- **AU1 (P1) the trial cap is not "another quote":** `truncated_reason` drives the copy. `cap` and
+  `scan_limit`: "This covers the first N; get another quote for the remaining R." `credit_cap`:
+  "Your free trial covers up to {trial_credit_allowance} lookup credits (an address-only lookup
+  uses 2). {over_trial_allowance} more leads do not fit; upgrade to look them up." No re-quote
+  promise. The zero state names the trial cap too when `over_trial_allowance > 0`.
+- **AU2 (P2) no count of earlier actions** (the list holds at most 20): unnumbered copy, "You also
+  have earlier lookups on this tab.", shown when the list has more than one action.
+- **AU3 (P2) AS8 is narrowed to the progress component:** its one `role="status"` region. The
+  delivered tab's `DeliveredLookupSummary` keeps its own polite region (a different fact, the
+  tab's leads, not this action), and that file stays out of scope.
+
+### Codex consult r4 on 1c (2026-10-02): PLAN: REVISE, 1 P2, adopted; AU2-AU3 CLOSED
+Output: `codex_1c_consult_r4_out.txt`. Units verified: normal = 1 credit, address-only = 2;
+`over_trial_allowance` counts LEADS.
+- **AV1 (P2) supersedes AU1's trigger:** the planner can count a lead over the trial cap and still
+  end with `stopped = None` (no later lead fit), so `truncated_reason` is null while
+  `over_trial_allowance > 0`. The trial-cap copy shows whenever `over_trial_allowance > 0`,
+  whatever `truncated_reason` says, and reads "lifetime": "Your free trial includes
+  {trial_credit_allowance} lookup credits for its lifetime (an address-only lookup uses 2).
+  {over_trial_allowance} more leads do not fit; upgrade to look them up." "Get another quote for
+  the remaining R" is shown ONLY for `cap` / `scan_limit`.
+
+### Codex consult r5 on 1c (2026-10-02): **PLAN: GO**, no findings; AV1 CLOSED
+Output: `codex_1c_consult_r5_out.txt`. The planner counts `over_credit_cap` for every lead past the remaining
+trial credits, including when the rows run out with `stopped = None`, and the quote exposes it as
+`over_trial_allowance` independently of `truncated_reason`, which stays limited to the `cap` / `scan_limit`
+re-quote cases. The rest of the 1c section and its amendments are consistent.
+
+### 1c BUILT, REVIEWED AND LIVE (2026-10-03): FE #209, merge `9ee1f9b`
+- Files (4 after the rebase): `lib/api.ts`, `results/[id]/page.tsx`, `ContactLookupDialog.tsx`, `ContactLookupProgress.tsx` (NEW).
+  The regenerated types landed first as FE #208 (`f6d99ca`; BE #435 had turned the FE "API types in sync"
+  gate red on EVERY FE PR), and the no-timing-promise copy as FE #206 (`b34dbea`).
+- Codex diff review: r1 NO-GO (state after close, error routing vs the contract, the action key, a 404
+  under cached data, billable 0, prototype keys), r2 NO-GO (a failed poll hidden under cached data),
+  r3 NO-GO (P1 the ContactStatus tooltip's 10-15 min promise -> #206; P2 focus/reconnect bypassing the
+  429 backoff), r4 GATE: GO, post-rebase GATE: GO.
+- Real-browser drive (stub API, scratchpad `drive_1c.mjs` / `stub_1c.mjs`): 73/73. The 429 gate proven
+  both ways: 0 status requests in the 30-60 s window with it, 3 with it removed. Traps hit: a forced
+  second click waits 30 s for a detached button (bound it); React Query's focus listener is on WINDOW
+  and a reconnect is an offline->online CHANGE (synthetic events on document never reached it, so the
+  first mutant survived); the app's 30 s staleTime hides a focus refetch inside 30 s.
+- Prod: Vercel SUCCESS on `9ee1f9b`; the live shared chunk carries `/contact-lookups/quote`. The
+  authenticated page itself was NOT viewed in prod (admin login needs MFA): owner check pending.
+- Follow-ups: none blocking. A dedicated backend rate bucket only if real 429s appear (AS3).
 
 ## Safety PR: Alembic can never reach production from a test or a stray CLI run (PLAN, 2026-09-27)
 

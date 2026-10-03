@@ -5710,6 +5710,12 @@ Output: `codex_1c_consult_r4_out.txt`. Units verified: normal = 1 credit, addres
   {over_trial_allowance} more leads do not fit; upgrade to look them up." "Get another quote for
   the remaining R" is shown ONLY for `cap` / `scan_limit`.
 
+### Codex consult r5 on 1c (2026-10-02): **PLAN: GO**, no findings; AV1 CLOSED
+Output: `codex_1c_consult_r5_out.txt`. The planner counts `over_credit_cap` for every lead past the remaining
+trial credits, including when the rows run out with `stopped = None`, and the quote exposes it as
+`over_trial_allowance` independently of `truncated_reason`, which stays limited to the `cap` / `scan_limit`
+re-quote cases. The rest of the 1c section and its amendments are consistent.
+
 ### 1c BUILT, REVIEWED AND LIVE (2026-10-03): FE #209, merge `9ee1f9b`
 - Files (4 after the rebase): `lib/api.ts`, `results/[id]/page.tsx`, `ContactLookupDialog.tsx`, `ContactLookupProgress.tsx` (NEW).
   The regenerated types landed first as FE #208 (`f6d99ca`; BE #435 had turned the FE "API types in sync"

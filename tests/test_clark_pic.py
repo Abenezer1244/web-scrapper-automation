@@ -88,6 +88,7 @@ class _Resp:
     def __init__(self, status: int, body: str = ""):
         self.status_code = status
         self.text = body
+        self.headers: dict = {}
 
 
 def _serve(monkeypatch, pages: dict):
@@ -593,3 +594,89 @@ async def test_api_returns_the_persisted_clark_mailing(client, db, business_user
     assert resp.status_code == 200, resp.text
     items = resp.json()["items"]
     assert [i["mailing_address"] for i in items] == ["4410 E CACTUS RD, PHOENIX, AZ 85032"]
+
+
+# ─── Canary: a cooled-down Clark source comes back on evidence ───────────────
+
+def _serve_probe(monkeypatch, pages: dict):
+    """The probe calls safe_get from src.utils.safe_http directly (never the gate)."""
+    asked: list[str] = []
+
+    def _get(url, *, params=None, **kw):
+        assert url == cp._URL and set(params) == {"account"}
+        asked.append(params["account"])
+        answer = pages[params["account"]]
+        if isinstance(answer, Exception):
+            raise answer
+        return _Resp(answer, "") if isinstance(answer, int) else _Resp(200, answer)
+
+    monkeypatch.setattr("src.utils.safe_http.safe_get", _get)
+    monkeypatch.setattr(cp.time, "sleep", lambda s: asked.append(f"sleep {s:g}"))
+    return asked
+
+
+class TestClarkCanaryProbe:
+    def test_registered_for_the_canary(self):
+        from src.scrapers.enrichment.source_probe import PROBES, probe_clark_pic
+
+        assert PROBES["clark_pic"] is probe_clark_pic
+
+    def test_a_readable_county_page_is_healthy_after_one_request(self, monkeypatch):
+        from src.scrapers.enrichment.source_probe import probe_clark_pic
+
+        asked = _serve_probe(monkeypatch, {
+            "55735000": _page("55735000", ["PO BOX 5000", "VANCOUVER WA , 98666 US"])})
+        healthy, detail = probe_clark_pic(None)
+        assert healthy is True and "55735000" in detail
+        assert asked == ["55735000"]
+
+    @pytest.mark.parametrize("first", [
+        "<html><body>Please complete the security check</body></html>",  # challenge
+        _page("55735000", []),          # 200, right parcel, but no mailing: not proof
+        _NOT_FOUND,                     # the empty template
+        429,
+        requests.ConnectionError("reset"),
+    ])
+    def test_anything_short_of_a_readable_record_is_not_healthy(self, monkeypatch, first):
+        from src.scrapers.enrichment.source_probe import probe_clark_pic
+
+        asked = _serve_probe(monkeypatch, {"55735000": first, "50490000": first})
+        healthy, detail = probe_clark_pic(None)
+        assert healthy is False
+        # Both county parcels tried, paced like the real source between them.
+        assert asked == ["55735000", f"sleep {cp._PACE_S:g}", "50490000"]
+        # Outcome codes and parcel ids only: never page content.
+        assert "security check" not in detail and "PO BOX" not in detail
+
+    def test_the_second_county_parcel_can_carry_the_probe(self, monkeypatch):
+        from src.scrapers.enrichment.source_probe import probe_clark_pic
+
+        _serve_probe(monkeypatch, {
+            "55735000": 503,
+            "50490000": _page("50490000", ["PO BOX 5000", "VANCOUVER WA , 98666 US"])})
+        assert probe_clark_pic(None)[0] is True
+
+    def test_canary_clears_a_cooled_clark_source_on_evidence(self, monkeypatch):
+        from src.db.session import system_sync_session
+        from src.scrapers.enrichment.source_health import (
+            get_source_state,
+            is_source_available,
+            record_source_blocked,
+        )
+        from src.workers.scheduler_helpers.health import _enrichment_source_canary_impl
+
+        monkeypatch.setattr("src.workers.ops_alerts.send_ops_alert", lambda *a, **k: False)
+        record_source_blocked("clark_pic", "Property Information Center HTTP 500")
+        with system_sync_session() as s:
+            s.execute(text("UPDATE external_source_health SET cooldown_until = now() - "
+                           "interval '1 minute' WHERE source_key = 'clark_pic'"))
+            s.commit()
+            assert is_source_available(s, "clark_pic") is False  # expired, not yet probed
+        _serve_probe(monkeypatch, {
+            "55735000": _page("55735000", ["PO BOX 5000", "VANCOUVER WA , 98666 US"])})
+
+        _enrichment_source_canary_impl()
+
+        with system_sync_session() as s:
+            assert get_source_state(s, "clark_pic")["status"] == "healthy"
+            assert is_source_available(s, "clark_pic") is True

@@ -5710,6 +5710,23 @@ Output: `codex_1c_consult_r4_out.txt`. Units verified: normal = 1 credit, addres
   {over_trial_allowance} more leads do not fit; upgrade to look them up." "Get another quote for
   the remaining R" is shown ONLY for `cap` / `scan_limit`.
 
+### 1c BUILT, REVIEWED AND LIVE (2026-10-03): FE #209, merge `9ee1f9b`
+- Files (4 after the rebase): `lib/api.ts`, `results/[id]/page.tsx`, `ContactLookupDialog.tsx`, `ContactLookupProgress.tsx` (NEW).
+  The regenerated types landed first as FE #208 (`f6d99ca`; BE #435 had turned the FE "API types in sync"
+  gate red on EVERY FE PR), and the no-timing-promise copy as FE #206 (`b34dbea`).
+- Codex diff review: r1 NO-GO (state after close, error routing vs the contract, the action key, a 404
+  under cached data, billable 0, prototype keys), r2 NO-GO (a failed poll hidden under cached data),
+  r3 NO-GO (P1 the ContactStatus tooltip's 10-15 min promise -> #206; P2 focus/reconnect bypassing the
+  429 backoff), r4 GATE: GO, post-rebase GATE: GO.
+- Real-browser drive (stub API, scratchpad `drive_1c.mjs` / `stub_1c.mjs`): 73/73. The 429 gate proven
+  both ways: 0 status requests in the 30-60 s window with it, 3 with it removed. Traps hit: a forced
+  second click waits 30 s for a detached button (bound it); React Query's focus listener is on WINDOW
+  and a reconnect is an offline->online CHANGE (synthetic events on document never reached it, so the
+  first mutant survived); the app's 30 s staleTime hides a focus refetch inside 30 s.
+- Prod: Vercel SUCCESS on `9ee1f9b`; the live shared chunk carries `/contact-lookups/quote`. The
+  authenticated page itself was NOT viewed in prod (admin login needs MFA): owner check pending.
+- Follow-ups: none blocking. A dedicated backend rate bucket only if real 429s appear (AS3).
+
 ## Safety PR: Alembic can never reach production from a test or a stray CLI run (PLAN, 2026-09-27)
 
 The Deferred bullet below, taken now. Same class as the two production wipes.

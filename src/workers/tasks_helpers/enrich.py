@@ -75,9 +75,19 @@ def enrichment_completion_log(summary: dict) -> tuple[str, str]:
     # so a county answering "nothing" without erroring (Snohomish, 2026-09-18) read
     # as fully enriched. Reports what is missing, not what this pass happened to mark.
     missing_mail = int(summary.get("mailing_missing") or 0)
-    if not mail and not owner and not missing_mail:
+    # Rows with no property AND no mailing address (not leads), and owner-name
+    # lookups the county site never answered. Either one makes "addresses added" false.
+    no_address = int(summary.get("no_address") or 0)
+    lookup_failed = int(summary.get("name_lookup_failed") or 0)
+    if not mail and not owner and not missing_mail and not no_address and not lookup_failed:
         return "success", "Enrichment complete: addresses added"
     parts = ["Address enrichment partly complete."]
+    if no_address:
+        noun = "record has" if no_address == 1 else "records have"
+        parts.append(f"{no_address:,} {noun} no property or mailing address.")
+    if lookup_failed:
+        noun = "lookup" if lookup_failed == 1 else "lookups"
+        parts.append(f"{lookup_failed:,} address {noun} failed.")
     if missing_mail and not mail:
         noun = "lead has" if missing_mail == 1 else "leads have"
         parts.append(f"{missing_mail:,} {noun} no mailing address available.")
@@ -1157,7 +1167,12 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
         from src.scrapers.enrichment.assessor_urls import KNOWN_ASSESSOR_URLS
         key = f"{config.county.lower()}_{config.state.upper()}"
         connector_assessor_url = KNOWN_ASSESSOR_URLS.get(key)
-    from src.scrapers.enrichment.pacs import batch_lookup_pacs_by_name, is_pacs_url
+    from src.scrapers.enrichment.pacs import (
+        LOOKUP_FAILED,
+        PACS_NAME_LOOKUP_KEY,
+        batch_lookup_pacs_by_name,
+        is_pacs_url,
+    )
     if connector_assessor_url and is_pacs_url(connector_assessor_url):
         results_no_addr = [
             res for res in all_results
@@ -1174,8 +1189,16 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
             pacs_results = batch_lookup_pacs_by_name(
                 connector_assessor_url, names, max_workers=5,
             )
-            name_hits = 0
-            for res, pacs in zip(results_no_addr, pacs_results, strict=False):
+            name_hits = name_failed = 0
+            for res, (outcome, pacs) in zip(results_no_addr, pacs_results, strict=True):
+                # Every row looked up records what the lookup came to, so the results
+                # page can tell "the county site did not answer" from "no property
+                # under this name" instead of showing both as a blank address.
+                ed = dict(res.enrichment_data) if isinstance(res.enrichment_data, dict) else {}
+                ed[PACS_NAME_LOOKUP_KEY] = outcome
+                res.enrichment_data = ed
+                if outcome == LOOKUP_FAILED:
+                    name_failed += 1
                 if not pacs:
                     continue
                 if pacs.get("address"):
@@ -1188,19 +1211,32 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                 # _parse_pacs_result_html no longer returns it; this is the
                 # explicit provenance boundary at the consumer.
                 name_hits += 1
-            if name_hits:
-                try:
-                    db.commit()
-                except Exception as exc:
-                    _logger.warning(
-                        "Job %s: PACS enrichment commit failed (%d fills discarded): %s",
-                        job_id, name_hits, str(exc)[:120],
-                    )
-                    db.rollback()
-                    db.commit()
+            save_failed = False
+            try:
+                db.commit()
+            except Exception as exc:
+                _logger.warning(
+                    "Job %s: PACS enrichment commit failed (%d fills discarded): %s",
+                    job_id, name_hits, type(exc).__name__,
+                )
+                db.rollback()
+                db.commit()
+                # Nothing was kept, markers included: every row is unanswered, and the
+                # line below must not report fills that were thrown away (Codex).
+                name_hits, name_failed, save_failed = 0, len(results_no_addr), True
+            # A failed lookup is not a miss. Folding the two together is how a run
+            # whose every request failed read "Found 0/71" and then "addresses added".
+            failed_note = (
+                f" ({name_failed} lookup{'' if name_failed == 1 else 's'} failed: the county site did not answer)"
+                if name_failed else ""
+            )
+            if summary is not None:
+                summary["name_lookup_failed"] = name_failed
             _publish_log(
-                r, job_id, "info",
-                f"Found {name_hits}/{len(results_no_addr)} addresses via PACS",
+                r, job_id, "warning" if name_failed else "info",
+                f"Address lookups via PACS could not be saved; {name_failed} records are left without one"
+                if save_failed else
+                f"Found {name_hits}/{len(results_no_addr)} addresses via PACS{failed_note}",
                 db=db,
             )
 
@@ -2061,6 +2097,16 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
             ])
         except Exception as exc:  # noqa: BLE001 -- a report must never fail the job
             _logger.warning("mailing_missing count skipped: %s", str(exc)[:120])
+        # Rows left with neither address. mailing_missing above counts parcel-bearing
+        # rows only, so a run whose records carry no parcel at all (Island probate,
+        # 71 of 71) reported nothing missing and closed on "addresses added".
+        # Address half of the delivery rule only: a retried job can still carry an
+        # earlier attempt's over-quota marker, which is not a missing address (Codex).
+        try:
+            from src.api.lead_actionability import has_address
+            summary["no_address"] = sum(1 for res in all_results if not has_address(res))
+        except Exception as exc:  # noqa: BLE001 -- a report must never fail the job
+            _logger.warning("no_address count skipped: %s", type(exc).__name__)
 
     # Skip trace is deliberately NOT enqueued here. Which rows are delivered is
     # still undecided at this point: the same-run survivor re-election, the claim

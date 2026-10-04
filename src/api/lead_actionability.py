@@ -124,6 +124,12 @@ def is_actionable(row: Any) -> bool:
     enr = _field(row, "enrichment_data")
     if isinstance(enr, dict) and enr.get(DELIVERY_EXCLUDED_KEY) == OVER_QUOTA:
         return False
+    return has_address(row)
+
+
+def has_address(row: Any) -> bool:
+    """The ADDRESS half of ``is_actionable`` alone (Python twin of
+    ``address_actionable_sql``): a usable property OR mailing address."""
     prop = _field(row, "property_address")
     mail = _field(row, "mailing_address")
     if prop and prop.strip() and prop.strip() != ADDRESS_PLACEHOLDER:

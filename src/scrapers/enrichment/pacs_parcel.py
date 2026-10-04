@@ -64,6 +64,7 @@ from src.scrapers.enrichment.pacs import (
     normalize_pacs_parcel,
     pacs_detail_url,
     parse_pacs_detail_html,
+    post_search,
 )
 from src.scrapers.enrichment.snohomish_assessor_roll import (
     AMBIGUOUS,
@@ -137,25 +138,8 @@ def _http_get(session: requests.Session, url: str) -> requests.Response:
 
 
 def _http_post(session: requests.Session, url: str, data: dict) -> requests.Response:
-    """The search postback. PACS answers it with a 302 to SearchResults.aspx on the same
-    portal; that ONE hop is followed by hand, and only when it stays on the portal's
-    own origin (Codex P1, SSRF): a Location anywhere else is refused, never fetched."""
-    from urllib.parse import urljoin
-
-    from src.utils.safe_http import same_origin
-
-    resp = session.post(url, data=data, timeout=_TIMEOUT_S, allow_redirects=False)
-    if resp.status_code not in (302, 303):
-        # 302/303 is what PACS sends (a GET of the results page). A 307/308 would ask
-        # for the POST to be replayed; it is returned unfollowed (a 3xx is not 200,
-        # so it counts as request_failed) rather than silently turned into a GET.
-        return resp
-    target = urljoin(url, resp.headers.get("Location", ""))
-    if not same_origin(target, url):
-        _logger.warning("pacs_parcel: refused an off-origin redirect from the search")
-        resp.status_code = 400  # a client error: not retried, counted as request_failed
-        return resp
-    return session.get(target, timeout=_TIMEOUT_S, allow_redirects=False)
+    """The search postback, its one same-origin redirect followed (pacs.post_search)."""
+    return post_search(session, url, data, _TIMEOUT_S)
 
 
 def _form_tokens(html: str) -> dict[str, str] | None:

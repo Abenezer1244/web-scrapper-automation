@@ -1795,12 +1795,13 @@ def _canonical_lookup_id(value: str) -> str:
 
 
 async def _lookup_read_rate_limit(request: Request, user_id) -> None:
-    """The `general` bucket, as the results list. A stalled limiter call PROCEEDS: the
-    zone already fails open on a Redis error, a read buys nothing, and a polling page
-    must not flap to 503 on a slow limiter (consult Q1)."""
+    """The `lookup_read` bucket, shared by the list and the status and by nothing else, so
+    the page's polling and its results table never spend each other's budget (follow-up
+    C). A stalled limiter call PROCEEDS: the zone fails open on a Redis error, a read buys
+    nothing, and a polling page must not flap to 503 on a slow limiter (consult Q1)."""
     try:
         await asyncio.wait_for(
-            rate_limit(request, zone="general", identifier=user_id),
+            rate_limit(request, zone="lookup_read", identifier=user_id),
             _LOOKUP_REDIS_CALL_BOUND_S,
         )
     except TimeoutError:
@@ -1839,8 +1840,8 @@ _ACTION_STATUS_SQL = text(
     response_model=ContactLookupList,
     responses={
         404: {"description": "No such run for this account."},
-        429: {"description": "Too many requests: the account's general budget, 60 per "
-                             "minute."},
+        429: {"description": "Too many requests: the account's contact-lookup read budget, "
+                             "60 per minute, shared with the status route."},
     },
 )
 async def list_contact_lookups(
@@ -1886,8 +1887,9 @@ async def list_contact_lookups(
     response_model=ContactLookupStatus,
     responses={
         404: {"description": "No such contact lookup on this run for this account."},
-        429: {"description": "Too many requests: the account's general budget, 60 per "
-                             "minute. Poll every 5 seconds or slower."},
+        429: {"description": "Too many requests: the account's contact-lookup read budget, "
+                             "60 per minute, shared with the list route. Poll every 5 "
+                             "seconds or slower."},
     },
 )
 async def get_contact_lookup(

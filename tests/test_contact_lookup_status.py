@@ -430,7 +430,17 @@ def test_an_unmapped_verdict_is_never_guessed_into_a_bucket():
 # ── the limiter ──────────────────────────────────────────────────────────────
 
 
-async def test_sixty_reads_a_minute_then_429(
+async def _results(client, token: str, job_id: str):
+    return await client.get(f"/jobs/{job_id}/results", headers=_auth(token))
+
+
+def test_the_lookup_reads_have_their_own_zone_that_fails_open():
+    """Follow-up C. Literal on purpose: a change of the budget is a deliberate test edit."""
+    assert rate_limit_module._ZONES["lookup_read"] == (60, 60)
+    assert "lookup_read" not in rate_limit_module._FALLBACK_ZONES  # a read buys nothing
+
+
+async def test_sixty_reads_a_minute_then_429_and_the_results_list_is_untouched(
     db, client, business_user, business_token, _lookups_on,
 ):
     job, aid, _ = await _bought(client, business_token, business_user.id)
@@ -439,6 +449,20 @@ async def test_sixty_reads_a_minute_then_429(
         assert r.status_code == 200, f"read {i + 1}: {r.status_code}"
     assert (await _status(client, business_token, job, aid)).status_code == 429
     assert (await _list(client, business_token, job)).status_code == 429  # one bucket
+    # The polling spent `lookup_read` only: the results table still loads.
+    assert (await _results(client, business_token, job)).status_code == 200
+
+
+async def test_a_busy_results_list_never_starves_the_lookup_reads(
+    db, client, business_user, business_token, _lookups_on,
+):
+    job, aid, _ = await _bought(client, business_token, business_user.id)
+    for i in range(60):
+        r = await _results(client, business_token, job)
+        assert r.status_code == 200, f"results read {i + 1}: {r.status_code}"
+    assert (await _results(client, business_token, job)).status_code == 429  # `general` charged
+    assert (await _status(client, business_token, job, aid)).status_code == 200
+    assert (await _list(client, business_token, job)).status_code == 200
 
 
 async def test_a_stalled_rate_limiter_proceeds_within_the_bound(

@@ -5856,6 +5856,26 @@ comments + the FE drift gate), described as a comment refresh. Amendments (super
   /scrapers/{config_id}/records` (raw `str` path params into UUID columns). A separate PR if the owner
   wants it.
 
+### A BUILT AND REVIEWED (2026-10-04): BE #444, head `4a8ef323`
+- 38 tests (`tests/test_jobs_malformed_job_id.py`): 24 RED on main (asyncpg `DataError` escaping as a 500,
+  braced spellings included), 38/38 green. Mutation 9/9 killed (each route's call, dialer-replay's
+  config id, the raw-claim compare), every restore hash-verified. Codex diff review r1 **GATE: GO**, no
+  findings. Regression: 31 files, 541 passed (one failure was my env: `BL_TEST_REDIS_SERVER` unset; it
+  passed once set). No schema change.
+
+### B BUILT AND REVIEWED (2026-10-04): BE #445, head `f2513257`
+- Three scripts, docstrings only: the 8-table DELETE list, the purge's only grant
+  (`pending_skip_trace_rows`), `--apply` alone on `DATABASE_URL_MIGRATE`, `delete_scraper` for the line
+  number. py_compile + ruff clean. Codex diff review r1 **GATE: GO**, no findings.
+
+### C BUILT (2026-10-04, branch `feat/lookup-read-rate-zone`, stacked on A), before the Codex diff review
+- `_ZONES["lookup_read"] = (60, 60)`, not in `_FALLBACK_ZONES`; `_lookup_read_rate_limit` spends it; the
+  zone list in `rate_limit()`'s docstring; the two 429 descriptions → `schema/openapi.json` regenerated
+  with `$PY` (exactly those 2 lines). Tests: the zone literal + fail-open; 60 lookup reads → the 61st
+  status AND list 429, the results list still 200; 60 results reads → the 61st 429, status and list
+  still 200. The log replay stays in `general` (unchanged, not separately tested: AW7).
+- After merge: an FE types-regen PR (the 429 descriptions are generated comments; the FE drift gate).
+
 ## Safety PR: Alembic can never reach production from a test or a stray CLI run (PLAN, 2026-09-27)
 
 The Deferred bullet below, taken now. Same class as the two production wipes.

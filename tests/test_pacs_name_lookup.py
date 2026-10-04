@@ -18,6 +18,7 @@ from src.scrapers.enrichment.pacs import (
     LOOKUP_FAILED,
     LOOKUP_FOUND,
     LOOKUP_NO_MATCH,
+    LOOKUP_SKIPPED,
     batch_lookup_pacs_by_name,
     lookup_pacs_by_name,
     post_search,
@@ -173,9 +174,11 @@ def test_batch_keeps_order_and_outcomes(portal, monkeypatch):
         return answers[name]
 
     monkeypatch.setattr(pacs, "lookup_pacs_by_name", fake)
+    monkeypatch.setattr(pacs, "NAME_PACE_S", 0.0)
+    monkeypatch.setattr(pacs, "NAME_JITTER_S", 0.0)
     assert batch_lookup_pacs_by_name(URL, ["A", "B", "C"]) == [
         (LOOKUP_FOUND, {"address": "1 A ST"}), (LOOKUP_NO_MATCH, None), (LOOKUP_FAILED, None)]
-    assert batch_lookup_pacs_by_name("", ["A"]) == [(LOOKUP_FAILED, None)]
+    assert batch_lookup_pacs_by_name("", ["A"]) == [(LOOKUP_SKIPPED, None)]
 
 
 def test_post_search_follows_one_same_origin_hop():
@@ -293,3 +296,71 @@ def test_the_no_address_count_ignores_a_quota_marker():
     for empty in (None, "", "   ", "(enrichment unavailable)"):
         assert not has_address({"property_address": empty, "mailing_address": empty})
     assert has_address({"property_address": None, "mailing_address": "PO BOX 1"})
+
+
+# ─── Pacing: one request at a time, a budget, and a breaker ─────────────────
+
+def test_the_pass_is_sequential_and_paced(monkeypatch):
+    """It used to fire 5 unpaced workers at a county portal. Now one at a time, with
+    the pace between names (never before the first)."""
+    events: list = []
+    monkeypatch.setattr(pacs, "lookup_pacs_by_name", lambda url, n: events.append(('ask', n)) or (LOOKUP_NO_MATCH, None))
+    import time as _time
+    monkeypatch.setattr(_time, "sleep", lambda s: events.append(('sleep', round(s, 1))))
+    monkeypatch.setattr(pacs, "NAME_PACE_S", 3.0)
+    monkeypatch.setattr(pacs, "NAME_JITTER_S", 0.0)
+    batch_lookup_pacs_by_name(URL, ["A", "B", "C"])
+    assert events == [('ask', 'A'), ('sleep', 3.0), ('ask', 'B'), ('sleep', 3.0), ('ask', 'C')]
+
+
+def test_a_portal_that_keeps_failing_stops_the_pass(monkeypatch):
+    """Island answers every request with its maintenance page while offline. After
+    NAME_BREAKER failures in a row the rest are skipped, not hammered."""
+    asked: list = []
+    monkeypatch.setattr(pacs, "lookup_pacs_by_name", lambda url, n: asked.append(n) or (LOOKUP_FAILED, None))
+    monkeypatch.setattr(pacs, "NAME_PACE_S", 0.0)
+    monkeypatch.setattr(pacs, "NAME_JITTER_S", 0.0)
+    out = batch_lookup_pacs_by_name(URL, [f"N{i}" for i in range(10)])
+    assert asked == ["N0", "N1", "N2"]
+    assert [o for o, _ in out] == [LOOKUP_FAILED] * 3 + [LOOKUP_SKIPPED] * 7
+
+
+def test_an_answer_resets_the_breaker(monkeypatch):
+    seq = iter([LOOKUP_FAILED, LOOKUP_FAILED, LOOKUP_NO_MATCH, LOOKUP_FAILED, LOOKUP_FAILED, LOOKUP_FOUND])
+    monkeypatch.setattr(pacs, "lookup_pacs_by_name", lambda url, n: (next(seq), None))
+    monkeypatch.setattr(pacs, "NAME_PACE_S", 0.0)
+    monkeypatch.setattr(pacs, "NAME_JITTER_S", 0.0)
+    out = batch_lookup_pacs_by_name(URL, list("abcdef"))
+    assert LOOKUP_SKIPPED not in [o for o, _ in out]
+
+
+def test_names_past_the_budget_are_skipped_not_failed(monkeypatch):
+    import time as _time
+    # deadline, check A, check B, after-pace B, check C -> past the budget
+    clock = iter([0.0, 0.0, 10.0, 10.0, 99999.0, 99999.0])
+    monkeypatch.setattr(_time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(pacs, "lookup_pacs_by_name", lambda url, n: (LOOKUP_NO_MATCH, None))
+    monkeypatch.setattr(pacs, "NAME_PACE_S", 0.0)
+    monkeypatch.setattr(pacs, "NAME_JITTER_S", 0.0)
+    out = batch_lookup_pacs_by_name(URL, ["A", "B", "C"])
+    assert [o for o, _ in out] == [LOOKUP_NO_MATCH, LOOKUP_NO_MATCH, LOOKUP_SKIPPED]
+
+
+def test_the_completion_line_names_records_not_looked_up():
+    from src.workers.tasks_helpers.enrich import enrichment_completion_log
+
+    level, msg = enrichment_completion_log({"name_lookup_skipped": 7})
+    assert level == "info" and "7 records were not looked up." in msg
+    assert "1 record was not looked up." in enrichment_completion_log({"name_lookup_skipped": 1})[1]
+
+
+def test_a_pace_that_crosses_the_deadline_asks_no_more(monkeypatch):
+    import time as _time
+    clock = iter([0.0, 0.0, 10.0, 99999.0])  # deadline, check A, check B, after-pace B
+    monkeypatch.setattr(_time, "monotonic", lambda: next(clock))
+    asked: list = []
+    monkeypatch.setattr(pacs, "lookup_pacs_by_name", lambda url, n: asked.append(n) or (LOOKUP_NO_MATCH, None))
+    monkeypatch.setattr(pacs, "NAME_PACE_S", 0.0)
+    monkeypatch.setattr(pacs, "NAME_JITTER_S", 0.0)
+    out = batch_lookup_pacs_by_name(URL, ["A", "B"])
+    assert asked == ["A"] and [o for o, _ in out] == [LOOKUP_NO_MATCH, LOOKUP_SKIPPED]

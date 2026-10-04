@@ -28,7 +28,6 @@ owner-occupancy fact. The grid parser no longer returns ``mailing`` at all.
 """
 
 import re
-from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import parse_qs, urljoin, urlparse
 
 import requests
@@ -314,6 +313,8 @@ def post_search(session: requests.Session, url: str, data: dict, timeout: float)
 LOOKUP_FOUND = "found"
 LOOKUP_NO_MATCH = "no_match"
 LOOKUP_FAILED = "failed"
+# Not asked this run: the pass ran out of time, or stopped because the portal was down.
+LOOKUP_SKIPPED = "skipped"
 # Where enrichment records that outcome on each row it looked up (results.enrichment_data).
 PACS_NAME_LOOKUP_KEY = "pacs_name_lookup"
 
@@ -411,31 +412,46 @@ def lookup_pacs_by_name(pacs_url: str, owner_name: str) -> tuple[str, dict | Non
         return LOOKUP_FAILED, None
 
 
+# The owner-name pass, paced like the parcel-keyed adapter (pacs_parcel: one request
+# at a time, ~3 s apart). It used to fire 5 unpaced workers at a county portal.
+# ponytail: fixed pace and budget; make them per-county if one portal needs other.
+NAME_PACE_S = 3.0
+NAME_JITTER_S = 1.0
+# Wall-clock budget for one job's pass (the scrape job has 60 min in all). Names not
+# reached are LOOKUP_SKIPPED: never asked, so neither a miss nor a failure.
+NAME_BUDGET_S = 15 * 60
+# Consecutive failures that mean the portal is down (Island answers every request
+# with its maintenance page while offline): stop asking, skip the rest.
+NAME_BREAKER = 3
+
+
 def batch_lookup_pacs_by_name(
     pacs_url: str,
     owner_names: list[str],
-    max_workers: int = 5,
 ) -> list[tuple[str, dict | None]]:
-    """Concurrent PACS name lookups. Returns one ``(outcome, result)`` per input
-    name, in the same order as owner_names (see ``lookup_pacs_by_name``).
+    """Owner-name lookups, ONE AT A TIME and paced. Returns one ``(outcome, result)``
+    per input name, in order (see ``lookup_pacs_by_name``). Names past the budget or
+    the breaker are ``LOOKUP_SKIPPED``.
     """
-    failed: tuple[str, dict | None] = (LOOKUP_FAILED, None)
-    if not pacs_url or not owner_names:
-        return [failed] * len(owner_names)
+    import random
+    import time
 
-    results: list[tuple[str, dict | None]] = [failed] * len(owner_names)
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(lookup_pacs_by_name, pacs_url, name): i
-            for i, name in enumerate(owner_names)
-        }
-        for fut in futures:
-            i = futures[fut]
-            # No per-future timeout: every request inside a lookup carries its own,
-            # and the pool waits for its workers on exit regardless. A shorter wait
-            # here only discarded slow answers and labelled them failed (Codex P1).
-            try:
-                results[i] = fut.result()
-            except Exception:
-                results[i] = failed
+    skipped: tuple[str, dict | None] = (LOOKUP_SKIPPED, None)
+    results: list[tuple[str, dict | None]] = [skipped] * len(owner_names)
+    if not pacs_url:
+        return results
+    deadline = time.monotonic() + NAME_BUDGET_S
+    failures_in_a_row = 0
+    for i, name in enumerate(owner_names):
+        if time.monotonic() >= deadline or failures_in_a_row >= NAME_BREAKER:
+            break
+        if i:
+            time.sleep(NAME_PACE_S + random.uniform(0, NAME_JITTER_S))  # noqa: S311
+            if time.monotonic() >= deadline:  # the pace itself can cross it (Codex)
+                break
+        try:
+            results[i] = lookup_pacs_by_name(pacs_url, name)
+        except Exception:
+            results[i] = (LOOKUP_FAILED, None)
+        failures_in_a_row = failures_in_a_row + 1 if results[i][0] == LOOKUP_FAILED else 0
     return results

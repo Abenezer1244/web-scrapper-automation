@@ -18,6 +18,7 @@ from src.scrapers.enrichment.county_gis import (
 
 SNOHOMISH = _KNOWN_GIS_ENDPOINTS["snohomish_WA"]
 COWLITZ = _KNOWN_GIS_ENDPOINTS["cowlitz_WA"]
+DOUGLAS = _KNOWN_GIS_ENDPOINTS["douglas_WA"]
 
 
 def _feature(attrs: dict) -> dict:
@@ -388,6 +389,58 @@ class TestSingleParcelKeepsCountyMailing:
         )
         out = cg.enrich_parcel_gis(None, "cowlitz", "WA", owner_name="FOYEN VERLINDA")
         assert out["mailing_address"] is None
+
+
+# ─── Douglas (2026-10-03) ────────────────────────────────────────────────────
+# Unlike the sections above, these VALUES are synthetic: the columns, their shapes and
+# the Address2-then-Address1 layout are the live layer's (verified on a 2,000-row
+# sample), but no real taxpayer's name or address is committed.
+
+def _douglas(**attrs) -> dict:
+    row = {"ParcelNumb": "00000000001", "Situs": "1 SAMPLE RD", "Address1": None,
+           "Address2": None, "City": None, "State": None, "Zip": None}
+    return _parse_gis_response(_feature({**row, **attrs}), DOUGLAS)
+
+
+def test_douglas_mailing_street_is_address2_and_an_addressee_line_is_ignored():
+    parsed = _douglas(Address1="C/O SAMPLE TRUSTEE", Address2="PO BOX 5",
+                      City="WATERVILLE", State="WA", Zip="98858")
+    assert parsed["mailing_address"] == "PO BOX 5, WATERVILLE, WA 98858"
+    assert parsed["property_address"] == "1 SAMPLE RD"
+
+
+def test_douglas_falls_back_to_address1_when_it_alone_is_a_street():
+    parsed = _douglas(Address1="22 OTHER ST", City="BOISE", State="ID", Zip="83702")
+    assert parsed["mailing_address"] == "22 OTHER ST, BOISE, ID 83702"
+
+
+def test_douglas_situs_is_in_wa_so_an_out_of_state_owner_is_computable():
+    from src.utils.address_intel import compute_owner_flags
+
+    parsed = _douglas(Address2="22 OTHER ST", City="BOISE", State="ID", Zip="83702")
+    assert parsed.get("property_state") == "WA"
+    flags = compute_owner_flags(parsed["property_address"], parsed["mailing_address"],
+                                property_state=parsed["property_state"])
+    assert flags["out_of_state_owner"] is True
+
+
+def test_douglas_publishes_the_postcode_as_is_never_zero_padded():
+    parsed = _douglas(Address2="7 HARBOUR ST", City="SYDNEY", State="AUSTRALIA", Zip="2000")
+    assert parsed["mailing_address"] == "7 HARBOUR ST, SYDNEY, AUSTRALIA 2000"
+
+
+def test_a_placeholder_plus_four_is_dropped_and_a_real_one_kept():
+    assert _douglas(Address2="1 A ST", City="EAST WENATCHEE", State="WA",
+                    Zip="98802-0000")["mailing_address"] == "1 A ST, EAST WENATCHEE, WA 98802"
+    assert _douglas(Address2="1 A ST", City="EAST WENATCHEE", State="WA",
+                    Zip="98802-1234")["mailing_address"] == "1 A ST, EAST WENATCHEE, WA 98802-1234"
+    # Only a US ZIP+4 is touched: any other value ending in -0000 is left as published.
+    assert _douglas(Address2="1 A ST", City="X", State="AUSTRALIA",
+                    Zip="AB-0000")["mailing_address"] == "1 A ST, X, AUSTRALIA AB-0000"
+
+
+def test_douglas_with_no_mailing_street_stores_no_mailing():
+    assert _douglas(City="WATERVILLE", State="WA", Zip="98858")["mailing_address"] is None
 
 
 # ─── Codex gate on the rebased branch (2026-09-12) ───────────────────────────

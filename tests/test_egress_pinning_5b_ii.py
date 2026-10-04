@@ -105,7 +105,7 @@ def _validated(dns, module) -> int:
 
 def test_pacs_never_connects_to_an_internal_address(internal_service, rebinding_dns):
     url = f"https://{_REBIND_HOST}:{internal_service.port}/PropertyAccess/"
-    assert pacs.lookup_pacs_by_name(url, "SMITH JOHN") is None
+    assert pacs.lookup_pacs_by_name(url, "SMITH JOHN") == (pacs.LOOKUP_FAILED, None)
     assert _validated(rebinding_dns, pacs) == 1  # the real check ran and passed
     assert internal_service.accepted == 0
 

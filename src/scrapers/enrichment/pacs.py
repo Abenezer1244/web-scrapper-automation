@@ -280,27 +280,64 @@ def mailing_from_detail(session: requests.Session, pacs_url: str, prop_id: str,
     return composed.pop() if len(composed) == 1 else None
 
 
-def lookup_pacs_by_name(pacs_url: str, owner_name: str) -> dict | None:
+def post_search(session: requests.Session, url: str, data: dict, timeout: float) -> requests.Response:
+    """The search postback. PACS answers it with a 302 to SearchResults.aspx on the same
+    portal; that ONE hop is followed by hand, and only when it stays on the portal's
+    own origin (Codex P1, SSRF): a Location anywhere else is refused, never fetched.
+
+    Shared by the owner-name path below and pacs_parcel. The name path used to post
+    with allow_redirects=False and read the 302 itself as "no match", so on a portal
+    that answers this way every lookup failed silently (Island probate job 6b1f3445,
+    2026-10-03: 0/71 found, and the run logged "addresses added").
+    """
+    from src.utils.safe_http import same_origin
+
+    resp = session.post(url, data=data, timeout=timeout, allow_redirects=False)
+    if resp.status_code not in (302, 303):
+        # 302/303 is what PACS sends (a GET of the results page). A 307/308 would ask
+        # for the POST to be replayed; it is returned unfollowed (a 3xx is not 200,
+        # so the caller counts it as failed) rather than silently turned into a GET.
+        return resp
+    target = urljoin(url, resp.headers.get("Location", ""))
+    if not same_origin(target, url):
+        _logger.warning("pacs: refused an off-origin redirect from the search")
+        resp.status_code = 400  # a client error: not retried, counted as failed
+        return resp
+    return session.get(target, timeout=timeout, allow_redirects=False)
+
+
+# What one owner-name lookup came to. FAILED means the portal never gave an answer
+# (an error, a non-200, a page that is neither results nor "None found"); NO_MATCH
+# means it answered and no single row named this owner with an address. Only those
+# two may be told apart on the results page: "the county site did not answer" and
+# "there is no property under this name" are different things to a customer.
+LOOKUP_FOUND = "found"
+LOOKUP_NO_MATCH = "no_match"
+LOOKUP_FAILED = "failed"
+# Where enrichment records that outcome on each row it looked up (results.enrichment_data).
+PACS_NAME_LOOKUP_KEY = "pacs_name_lookup"
+
+
+def lookup_pacs_by_name(pacs_url: str, owner_name: str) -> tuple[str, dict | None]:
     """Search a PACS PropertyAccess portal by owner name.
 
-    Returns a dict with any of: address, mailing, value (NEVER parcel_id — an
-    owner-name match is weak evidence; see ``parse_pacs_result_html``).
-    Returns None on no unique match or error.
+    Returns ``(outcome, result)``. ``result`` is set only for ``LOOKUP_FOUND``: a
+    dict with any of address, mailing, value (NEVER parcel_id — an owner-name match
+    is weak evidence; see ``parse_pacs_result_html``).
 
     Blocks on HTTP; call from a thread pool when batching.
     """
     if not pacs_url or not owner_name:
-        return None
+        return LOOKUP_FAILED, None
 
     # N1: pacs_url is DB config (CountyConnector.assessor_url). An operator
     # could point it at an internal host, or a PACS host could 302 internally.
     # Validate with resolve=True (DNS-rebinding aware) BEFORE any outbound
     # request, and refuse plaintext (PACS portals are HTTPS). raise -> caught
-    # by the except below and logged as a failed lookup (returns None).
+    # by the except below and logged as a failed lookup.
     if urlparse(pacs_url).scheme != "https":
         _logger.warning("PACS lookup refused non-HTTPS assessor_url")
-        return None
-    validate_scraping_target(pacs_url, require_allowlisted=False, resolve=True)
+        return LOOKUP_FAILED, None
 
     # Island PACS responses run 10-18s on estate-name searches — bumped
     # timeouts + one retry on read timeout recovers ~2x the records
@@ -333,10 +370,10 @@ def lookup_pacs_by_name(pacs_url: str, owner_name: str) -> dict | None:
             "propertySearchOptions$ownerName": owner_name,
             "propertySearchOptions$search": "Search",
         }
-        r = sess.post(pacs_url, data=data, timeout=_POST_TIMEOUT, allow_redirects=False)
-        return sess, r
+        return sess, post_search(sess, pacs_url, data, _POST_TIMEOUT)
 
     try:
+        validate_scraping_target(pacs_url, require_allowlisted=False, resolve=True)
         sess, r = None, None
         for attempt in range(2):  # one retry on read timeout
             try:
@@ -345,40 +382,48 @@ def lookup_pacs_by_name(pacs_url: str, owner_name: str) -> dict | None:
             except requests.exceptions.ReadTimeout:
                 if attempt == 1:
                     raise
-        if r is None or r.status_code != 200 or "None found" in r.text:
-            return None
+        if r is None or r.status_code != 200:
+            return LOOKUP_FAILED, None
+        if "None found" in r.text:
+            return LOOKUP_NO_MATCH, None
+        if "resultsTable" not in r.text:
+            # A 200 that is neither a results grid nor "None found" (an error or
+            # session page) is not an answer about this owner.
+            return LOOKUP_FAILED, None
 
         result = parse_pacs_result_html(r.text, owner_name)
-        if result and result.get("prop_id"):
+        if result is None:
+            return LOOKUP_NO_MATCH, None
+        prop_id = result.pop("prop_id", None)
+        if prop_id:
             # The grid never carries the owner's mailing address; the detail page
             # does, under its own label. One more same-origin GET per unique hit.
-            mailing = mailing_from_detail(sess, pacs_url, result.pop("prop_id"), timeout=_GET_TIMEOUT)
+            mailing = mailing_from_detail(sess, pacs_url, prop_id, timeout=_GET_TIMEOUT)
             if mailing:
                 result["mailing"] = mailing
-        elif result:
-            result.pop("prop_id", None)
-        return result
+        return LOOKUP_FOUND, result
     except Exception as exc:
         # PII: owner_name is a third party who never signed up, and the log file has
-        # no rotation or retention, so it is dropped. Only pacs_url and owner_name are
-        # in scope here and there is no non-identifying record id to correlate on, so
-        # the exception text is the diagnostic handle.
-        _logger.warning("PACS name lookup failed: %s", str(exc)[:80])
-        return None
+        # no rotation or retention, so it is never logged. Neither is the exception
+        # text: a lower layer may echo request data into it (Codex). The class is
+        # the diagnostic handle; the per-row outcome is the record.
+        _logger.warning("PACS name lookup failed: %s", type(exc).__name__)
+        return LOOKUP_FAILED, None
 
 
 def batch_lookup_pacs_by_name(
     pacs_url: str,
     owner_names: list[str],
     max_workers: int = 5,
-) -> list[dict | None]:
-    """Concurrent PACS name lookups. Returns one result (or None) per input name,
-    in the same order as owner_names.
+) -> list[tuple[str, dict | None]]:
+    """Concurrent PACS name lookups. Returns one ``(outcome, result)`` per input
+    name, in the same order as owner_names (see ``lookup_pacs_by_name``).
     """
+    failed: tuple[str, dict | None] = (LOOKUP_FAILED, None)
     if not pacs_url or not owner_names:
-        return [None] * len(owner_names)
+        return [failed] * len(owner_names)
 
-    results: list[dict | None] = [None] * len(owner_names)
+    results: list[tuple[str, dict | None]] = [failed] * len(owner_names)
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
             executor.submit(lookup_pacs_by_name, pacs_url, name): i
@@ -386,8 +431,11 @@ def batch_lookup_pacs_by_name(
         }
         for fut in futures:
             i = futures[fut]
+            # No per-future timeout: every request inside a lookup carries its own,
+            # and the pool waits for its workers on exit regardless. A shorter wait
+            # here only discarded slow answers and labelled them failed (Codex P1).
             try:
-                results[i] = fut.result(timeout=30)
+                results[i] = fut.result()
             except Exception:
-                results[i] = None
+                results[i] = failed
     return results

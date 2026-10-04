@@ -157,6 +157,8 @@ def test_phones_decision_table(mode):
         (_enc_json([_phone("2065550100", "fe1:zz")]), ([_phone("2065550100", None)], True)),
         (_enc_json([_phone("2065550100", " " + FERNET_SHAPED)]), ([_phone("2065550100", None)], True)),
         (_enc_json([_phone("2065550100", 7)]), ([_phone("2065550100", None)], False)),
+        # Residue in the label of an entry that is dropped anyway is still reported.
+        (_enc_json([{"type": "fe1:zz"}, good]), ([good], True)),
         (_enc_json([_phone("2065550100", "  ")]), ([_phone("2065550100", None)], False)),
         (json.dumps([good]), ([good], False) if tolerant else (None, True)),
     ]
@@ -184,7 +186,7 @@ def test_emails_decision_table(mode):
 
 def test_phone_type_rule():
     assert cd.clean_phone_type(None) == (None, False)
-    assert cd.clean_phone_type(7) == (None, False)
+    assert cd.clean_phone_type(7) == (None, True)  # the plain column: never a non-string
     assert cd.clean_phone_type("  ") == (None, False)
     assert cd.clean_phone_type(" Mobile ") == ("Mobile", False)
     assert cd.clean_phone_type("fe1:abc") == (None, True)
@@ -237,7 +239,8 @@ def test_contact_types_store_exactly_what_the_parent_types_store(mode):
     stored_json = EncryptedContactJSON("phones").process_bind_param([_phone("2065550100")], None)
     assert json.loads(crypto.decrypt_field(stored_json)) == [_phone("2065550100")]
     # ContactLabel has no bind step at all: the value is bound exactly as given.
-    assert ContactLabel(16).bind_processor(postgresql.dialect()) is None
+    assert ContactLabel().bind_processor(postgresql.dialect()) is None
+    assert ContactLabel().impl.length == 16  # the column's existing storage
 
 
 def test_contact_types_read_through_the_decoder(mode):
@@ -248,8 +251,8 @@ def test_contact_types_read_through_the_decoder(mode):
     assert phones.process_result_value("", None) is None  # blank array: unreadable
     assert phones.process_result_value(CORRUPT_FE1, None) is None
     assert phones.process_result_value(_enc_json([_phone("2065550100")]), None) == [_phone("2065550100")]
-    assert ContactLabel(16).process_result_value("fe1:zz", None) is None
-    assert ContactLabel(16).process_result_value(" Mobile ", None) == "Mobile"
+    assert ContactLabel().process_result_value("fe1:zz", None) is None
+    assert ContactLabel().process_result_value(" Mobile ", None) == "Mobile"
 
 
 # ─── 3. The Results page and the run CSV (real endpoint) ──────────────────────

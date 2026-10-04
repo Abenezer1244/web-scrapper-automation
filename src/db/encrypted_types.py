@@ -125,11 +125,12 @@ class EncryptedContactJSON(EncryptedJSON):
 class ContactLabel(TypeDecorator):
     """A plain-text contact label column (``phone_type``), cleaned on read.
 
-    Not encrypted (the label is not PII). Storage and bind are a plain ``String``;
-    the read side drops residue and blanks with the decoder's phone type rule.
+    Not encrypted (the label is not PII). Storage and bind are the column's existing
+    ``String(16)``; the read side drops residue and blanks with the decoder's phone
+    type rule. No constructor arguments, so the statement cache key is the class.
     """
 
-    impl = String
+    impl = String(16)
     cache_ok = True
 
     def process_result_value(self, value: Any, dialect: Any) -> str | None:

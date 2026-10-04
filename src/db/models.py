@@ -911,7 +911,7 @@ class Result(Base):
     # runs the one contact decoder (src/utils/contact_decode.py), so an unreadable
     # value reads as None instead of leaking ciphertext or failing the read.
     phone = Column(EncryptedContactString("phone"), nullable=True)
-    phone_type = Column(ContactLabel(16), nullable=True)  # Mobile | Landline | VoIP
+    phone_type = Column(ContactLabel(), nullable=True)  # Mobile | Landline | VoIP
     phone_dnc_flag = Column(Boolean, nullable=True)
     email = Column(EncryptedContactString("email"), nullable=True)
     # Multi-contact (up to 3). The scalar phone/email above stay the PRIMARY

@@ -100,12 +100,14 @@ def _clean_label(value: Any) -> tuple[str | None, bool]:
 def clean_phone_type(
     value: Any, *, field: str = "phone_type", lead_id: str | None = None
 ) -> tuple[str | None, bool]:
-    """A phone type label (Mobile | Landline | VoIP, as the provider gave it).
-
-    Trimmed; a non-string or blank label is simply absent (no failure); residue is
-    dropped as a failure. Used for the plain ``phone_type`` column and, through
-    ``clean_phones``, for ``phones[].type``.
+    """The plain ``phone_type`` column (Mobile | Landline | VoIP, as the provider
+    gave it): trimmed; blank is absent (no failure); residue or a non-string value is
+    dropped as a failure. ``phones[].type`` uses the quieter ``_clean_label`` through
+    ``clean_phones``, where a non-string type is simply absent.
     """
+    if value is not None and not isinstance(value, str):
+        _warn(field, lead_id)
+        return None, True
     label, failed = _clean_label(value)
     if failed:
         _warn(field, lead_id)
@@ -130,6 +132,10 @@ def clean_phones(value: Any, *, lead_id: str | None = None) -> tuple[list[dict] 
     for item in value:
         if not isinstance(item, dict):
             continue
+        # The label is judged even when the entry is then dropped, so residue in it
+        # is still reported.
+        label, bad_label = _clean_label(item.get("type"))
+        type_failed = type_failed or bad_label
         number = item.get("number")
         if not isinstance(number, str) or not number.strip():
             continue
@@ -137,8 +143,6 @@ def clean_phones(value: Any, *, lead_id: str | None = None) -> tuple[list[dict] 
         if _is_residue(number):
             number_failed = True
             continue
-        label, bad_label = _clean_label(item.get("type"))
-        type_failed = type_failed or bad_label
         out.append({"number": number, "type": label})
     emptied = bool(value) and not out
     if number_failed or emptied:

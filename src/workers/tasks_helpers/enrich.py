@@ -79,7 +79,8 @@ def enrichment_completion_log(summary: dict) -> tuple[str, str]:
     # lookups the county site never answered. Either one makes "addresses added" false.
     no_address = int(summary.get("no_address") or 0)
     lookup_failed = int(summary.get("name_lookup_failed") or 0)
-    if not mail and not owner and not missing_mail and not no_address and not lookup_failed:
+    lookup_skipped = int(summary.get("name_lookup_skipped") or 0)
+    if not (mail or owner or missing_mail or no_address or lookup_failed or lookup_skipped):
         return "success", "Enrichment complete: addresses added"
     parts = ["Address enrichment partly complete."]
     if no_address:
@@ -88,6 +89,9 @@ def enrichment_completion_log(summary: dict) -> tuple[str, str]:
     if lookup_failed:
         noun = "lookup" if lookup_failed == 1 else "lookups"
         parts.append(f"{lookup_failed:,} address {noun} failed.")
+    if lookup_skipped:
+        noun = "record was" if lookup_skipped == 1 else "records were"
+        parts.append(f"{lookup_skipped:,} {noun} not looked up.")
     if missing_mail and not mail:
         noun = "lead has" if missing_mail == 1 else "leads have"
         parts.append(f"{missing_mail:,} {noun} no mailing address available.")
@@ -1169,6 +1173,7 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
         connector_assessor_url = KNOWN_ASSESSOR_URLS.get(key)
     from src.scrapers.enrichment.pacs import (
         LOOKUP_FAILED,
+        LOOKUP_SKIPPED,
         PACS_NAME_LOOKUP_KEY,
         batch_lookup_pacs_by_name,
         is_pacs_url,
@@ -1186,10 +1191,8 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                 db=db,
             )
             names = [res.party_name for res in results_no_addr]
-            pacs_results = batch_lookup_pacs_by_name(
-                connector_assessor_url, names, max_workers=5,
-            )
-            name_hits = name_failed = 0
+            pacs_results = batch_lookup_pacs_by_name(connector_assessor_url, names)
+            name_hits = name_failed = name_skipped = 0
             for res, (outcome, pacs) in zip(results_no_addr, pacs_results, strict=True):
                 # Every row looked up records what the lookup came to, so the results
                 # page can tell "the county site did not answer" from "no property
@@ -1199,6 +1202,8 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                 res.enrichment_data = ed
                 if outcome == LOOKUP_FAILED:
                     name_failed += 1
+                elif outcome == LOOKUP_SKIPPED:
+                    name_skipped += 1
                 if not pacs:
                     continue
                 if pacs.get("address"):
@@ -1224,16 +1229,21 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                 # Nothing was kept, markers included: every row is unanswered, and the
                 # line below must not report fills that were thrown away (Codex).
                 name_hits, name_failed, save_failed = 0, len(results_no_addr), True
+                name_skipped = 0  # all counted as failed above, never twice
             # A failed lookup is not a miss. Folding the two together is how a run
             # whose every request failed read "Found 0/71" and then "addresses added".
             failed_note = (
                 f" ({name_failed} lookup{'' if name_failed == 1 else 's'} failed: the county site did not answer)"
                 if name_failed else ""
             )
+            if name_skipped:
+                failed_note += (f" ({name_skipped} not looked up: the pass stopped because the county"
+                                " site kept failing, or ran out of time)")
             if summary is not None:
                 summary["name_lookup_failed"] = name_failed
+                summary["name_lookup_skipped"] = name_skipped
             _publish_log(
-                r, job_id, "warning" if name_failed else "info",
+                r, job_id, "warning" if name_failed or name_skipped else "info",
                 f"Address lookups via PACS could not be saved; {name_failed} records are left without one"
                 if save_failed else
                 f"Found {name_hits}/{len(results_no_addr)} addresses via PACS{failed_note}",

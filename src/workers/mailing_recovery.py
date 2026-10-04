@@ -597,6 +597,7 @@ def recover_deferred_gis_mailing() -> dict:
     from src.scrapers.enrichment.county_gis import (
         batch_enrich_parcels_gis,
         gis_mailing_source_counties,
+        has_gis_mailing_source,
     )
 
     stats = {"candidates": 0, "parcels": 0, "found": 0, "none": 0, "unverified": 0,
@@ -664,16 +665,28 @@ def recover_deferred_gis_mailing() -> dict:
             unreached -= {p for p in unreached
                           if (found.get(p) or {}).get("mailing_lookup") == "error"}
             attempted = [p for p in parcels if p in by_parcel and p not in unreached]
+            # For a county whose mailing comes from its own GIS LAYER, a parcel the layer
+            # returned no feature for is not on the county's roll: parcel_not_found, not
+            # "found, no mailing". Only that layer's rows carry matched=True (a statewide
+            # situs fallback row never does). Bulk sources say why themselves. Both
+            # labels are settled; this only makes the recorded answer true (the 20
+            # Pierce parcels of 2026-10-04 were retired/absent, not mail-less).
+            layer_source = has_gis_mailing_source(county, "WA")
             enriched = {}
             for pid in attempted:
                 row = found.get(pid) or {}
                 lookup = row.get("mailing_lookup")
+                # Only when NO source gave a reason: an explicit answer (a bulk roll's
+                # "none" on a county that also has a layer, e.g. Snohomish) is kept.
+                off_layer = (layer_source and not lookup and row.get("matched") is not True
+                             and not row.get("mailing_address"))
                 enriched[pid] = {
                     "mailing_address": row.get("mailing_address"),
                     # The county answered this request. No mailing address in that
-                    # answer, matched or not, is a real "none" from the source, unless
-                    # the source said more precisely why (clark_pic).
+                    # answer is a real "none" from the source, unless the source said
+                    # more precisely why (clark_pic) or the layer has no such parcel.
                     "mailing_lookup": (lookup if lookup in ("parcel_not_found", "error")
+                                       else "parcel_not_found" if off_layer
                                        else "none"),
                     # A page that named a different parcel says nothing about this one.
                     "parcel_lookup": "mismatch" if lookup == "parcel_mismatch" else None,

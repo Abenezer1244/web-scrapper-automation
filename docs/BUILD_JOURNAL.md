@@ -19,6 +19,78 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-10-03 — Contact lookups get a page (1c): the button, the quote, the progress; Phase 1 complete
+
+> Phase 1c of contact lookup, in the frontend repo (`bridgeleads-web`). The backend chain was already
+> live (quote 1b-1c, confirm 2d #432, status + list 2e #435). Same house loop: Codex consult to
+> PLAN: GO, three-dot review to GATE: GO, a real-browser drive (the FE has no test runner), merge
+> under the standing rule. With this, Phase 1 is complete end to end.
+
+**Built / Shipped:**
+- **FE #209** (merge `9ee1f9b`, Vercel SUCCESS): the page. `lib/api.ts` (`quoteContactLookups`,
+  `confirmContactLookups`, `listContactLookups`, `getContactLookup`), `results/[id]/page.tsx` (mounts
+  the button and the progress, gated on `job.status === "done"`), `ContactLookupDialog.tsx` (quote →
+  confirm, fixed refusal copy by `detail.code`, a fresh fail-closed plan gate, an expiry timer, a
+  synchronous double-submit guard) and `ContactLookupProgress.tsx` (NEW: the newest action polled every
+  15 s while visible, 60 s after a 429, one `role=status` region, the results table invalidated when
+  the outcomes change).
+- **FE #208** (`f6d99ca`): `lib/api-types.generated.ts` regenerated for #435. #435's schema change had
+  turned the "API types in sync" gate red on EVERY open FE PR.
+- **FE #206** (`b34dbea`): no lookup-time promise. The ContactStatus tooltip and the run-page notice
+  said "10-15 minutes"; the backend deliberately promises no time (caps and the kill switch pause it).
+- **BE #440** (merge `3ff82402`): the 1c spec, its consult records, the LIVE record and the handoff.
+  It also restored the `## Phase 1c` plan heading that #435's plan edit had silently dropped.
+- **Owner check in production (2026-10-03): PASSED, by the owner's own report** (the answer they
+  selected, verbatim): "I opened a finished run, clicked Look up contacts, the quote dialog looked
+  right, and I did NOT press Confirm." No purchase. Not independently verified by me.
+
+**Tried / Decided:**
+- The button shows on BOTH tabs, disabled with the upsell below Pro; hiding it would leave a user who
+  expects lookups with no explanation (consult r1).
+- The quote covers the WHOLE tab, not the filtered view; the dialog says so in words (AS1).
+- No raw backend text in the dialog: known refusal codes render fixed copy chosen by `detail.code`;
+  anything else goes through `getFriendlyError` with a fixed fallback (AS2).
+- No estimated total in the price line: the API gives none, and reused answers and provider misses are
+  not billed (AS5).
+- The trial cap is NOT "get another quote": the trial copy shows whenever `over_trial_allowance > 0`,
+  even with `truncated_reason` null, because the planner can count a lead over the cap and still end
+  with nothing stopped (AV1, consult r4).
+- Polling stays inside the account's shared 60/min `general` bucket (~4 status + 0.25 list req/min per
+  open page). A dedicated backend bucket is NOT built: only if real 429s appear (AS3).
+
+**Failed / Blocked:**
+- Consult took five rounds (r1-r5) and the diff review four (r1-r3 NO-GO, r4 GO), plus a post-rebase
+  GO. r3's P1 was outside the PR: the ContactStatus tooltip's 10-15 min promise, split out as #206.
+- My first two proofs of the 429 backoff were vacuous: React Query's focus listener is on `window`
+  (a synthetic `visibilitychange` on `document` never reaches it), a reconnect is an offline→online
+  CHANGE, and the app's 30 s `staleTime` hides a focus refetch inside 30 s. The mutant survived until
+  the drive was fixed; the final proof: 0 status requests in the 30-60 s window with the gate, 3 without.
+- Playwright: a forced second click on a detached button waits 30 s (now bounded with `timeout: 500`);
+  `head -N` on the driver cut its login block; a scenario that inherits stub state from the previous one
+  proves nothing (every scenario now sets its own).
+- `next dev` leaves an orphan `start-server.js` child after a TaskStop; found by port, parent confirmed
+  as my worktree's `next dev` before killing both.
+- The #440 handoff said "consult r1-r5" while the plan recorded only r1-r4. Codex's gate flagged the
+  handoff; the handoff was right, the r5 record (PLAN: GO) had never been written. Added before merge.
+
+**Caught & fixed:**
+- Diff review r1: dialog state surviving a close; error routing against the contract; the action query
+  key; a status 404 hidden under cached data; "billable 0" shown; prototype keys in a lookup map.
+- r2: a failed poll hidden under cached data (now a visible retry, never silence).
+- r3: focus and reconnect refetches bypassing the 429 backoff (P2).
+
+**Pending / Handoff:**
+- Phase 1 is complete. The next piece of work is the owner's pick. Candidates: the malformed `job_id` →
+  500 on the other `/jobs/{job_id}` routes (move them onto `_canonical_job_id`); the stale
+  "DELETE=False on every table" comments in two `scripts/` batch-config tools; a backend rate bucket for
+  lookup reads only if real 429s appear.
+
+**Facts learned:**
+- A BE merge that changes `schema/openapi.json` breaks every FE PR's CI until an FE types-regen PR lands;
+  open it right after the BE merge.
+- After editing a plan, grep the headings you expect: an Edit whose `old_string` ends at a heading and
+  whose `new_string` does not re-add it deletes the heading silently.
+
 ## 2026-10-03 — Mailing backfills applied (Benton, Snohomish), Okanogan's invented parcels cleared and re-run
 
 > Follow-up to #436/#437 (mailing-address audit). Owner approved `--apply` for Benton, Snohomish

@@ -5738,8 +5738,9 @@ re-quote cases. The rest of the 1c section and its amendments are consistent.
   "consult r1-r5" vs a plan that recorded r1-r4; the handoff was right, the r5 record was added in
   `9ff80b26`), r2 GATE: GO. CI green on `9ff80b26`, quiet 4×0, main unchanged, `--match-head-commit`;
   api / worker / beat SUCCESS on `3ff82402`, `/health` 200. Docs only: no FE types regen needed.
-- **Owner check in production: PASSED** (2026-10-03). The owner opened a finished run, clicked "Look up
-  contacts", and the quote dialog read correctly. Nothing was confirmed: no purchase.
+- **Owner check in production: PASSED, by the owner's own report** (2026-10-03; the answer they selected,
+  verbatim): "I opened a finished run, clicked Look up contacts, the quote dialog looked right, and I did
+  NOT press Confirm." No purchase. Not independently verified.
 - BUILD_JOURNAL entry for 1c written (owner-approved), in this close-out PR.
 - **Phase 1 is COMPLETE.** Next work is the owner's pick (candidates: handoff §7.4).
 

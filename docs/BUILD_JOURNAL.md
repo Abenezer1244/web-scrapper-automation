@@ -40,15 +40,16 @@ to understand *why* the code is the way it is and *what's been attempted before*
   said "10-15 minutes"; the backend deliberately promises no time (caps and the kill switch pause it).
 - **BE #440** (merge `3ff82402`): the 1c spec, its consult records, the LIVE record and the handoff.
   It also restored the `## Phase 1c` plan heading that #435's plan edit had silently dropped.
-- **Owner check in production (2026-10-03): PASSED.** The owner opened a finished run, clicked "Look up
-  contacts", the quote dialog read correctly, and nothing was confirmed (no purchase).
+- **Owner check in production (2026-10-03): PASSED, by the owner's own report** (the answer they
+  selected, verbatim): "I opened a finished run, clicked Look up contacts, the quote dialog looked
+  right, and I did NOT press Confirm." No purchase. Not independently verified by me.
 
 **Tried / Decided:**
 - The button shows on BOTH tabs, disabled with the upsell below Pro; hiding it would leave a user who
   expects lookups with no explanation (consult r1).
-- The quote covers the WHOLE tab, not the filtered view; the dialog says so in words (AS1). A quote
-  priced on the filtered view would have bought leads the user never saw.
-- No raw backend text in the dialog: every refusal renders fixed copy chosen by `detail.code` (AS2).
+- The quote covers the WHOLE tab, not the filtered view; the dialog says so in words (AS1).
+- No raw backend text in the dialog: known refusal codes render fixed copy chosen by `detail.code`;
+  anything else goes through `getFriendlyError` with a fixed fallback (AS2).
 - No estimated total in the price line: the API gives none, and reused answers and provider misses are
   not billed (AS5).
 - The trial cap is NOT "get another quote": the trial copy shows whenever `over_trial_allowance > 0`,

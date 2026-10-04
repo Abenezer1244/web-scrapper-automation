@@ -455,6 +455,7 @@ async def get_job(
     current_user: CurrentUser,
     db: AsyncSession = Depends(get_rls_db),
 ) -> JobResponse:
+    job_id = _canonical_job_id(job_id)
     result = await db.execute(
         select(Job).where(Job.id == job_id, Job.user_id == current_user.id)
     )
@@ -478,6 +479,7 @@ async def cancel_job(
     db: AsyncSession = Depends(get_rls_db),
 ) -> None:
     await rate_limit(request, zone="writes", identifier=current_user.id)  # audit #3 S3-09
+    job_id = _canonical_job_id(job_id)
     # One statement, so the status is checked against the row as it is when the
     # write lands. Checking in Python and then writing by primary key let a cancel
     # that read 'enriching' overwrite the worker's just-committed billed 'done':
@@ -541,6 +543,7 @@ async def get_results(
 ) -> ResultsPage:
     # Rate-limit before the (expensive, multi-query) read to prevent DB-amplification DoS.
     await rate_limit(request, zone="general", identifier=current_user.id)
+    job_id = _canonical_job_id(job_id)
     result = await db.execute(
         select(Job).where(Job.id == job_id, Job.user_id == current_user.id)
     )
@@ -1947,6 +1950,9 @@ async def stream_logs(
     30 minutes or if its lease was reclaimed, after which the client reconnects.
     Nothing here affects the job itself: the worker never reads stream state.
     """
+    # Canonical, so the ownership read cannot 500 and the subscription below is the
+    # `job_logs:{id}` channel the worker publishes on.
+    job_id = _canonical_job_id(job_id)
     # Verify ownership
     result = await db.execute(
         select(Job).where(Job.id == job_id, Job.user_id == current_user.id)
@@ -2164,6 +2170,7 @@ async def get_export_url(
     The token is safe to put in a URL — it's not the full JWT.
     """
     await rate_limit(request, zone="export", identifier=user.id)  # audit #3 S3-09
+    job_id = _canonical_job_id(job_id)  # the token below carries the canonical id
     result = await db.execute(
         select(Job).where(Job.id == job_id, Job.user_id == user.id)
     )
@@ -2241,7 +2248,15 @@ async def _user_from_download_token(token: str, job_id: str, db: AsyncSession) -
     user_id = payload.get("sub")
     if payload.get("purpose") != "download" or not user_id:
         raise HTTPException(status_code=401, detail="Invalid or expired download link")
-    if payload.get("job_id") != job_id:
+    # `job_id` is canonical (the route canonicalizes it), so the claim is compared in its
+    # canonical form too: a link minted with another spelling of the same run still opens.
+    # A missing, non-string or unparseable claim is the same 403, never a 500 (AX4).
+    claim = payload.get("job_id")
+    try:
+        claim_id = str(uuid.UUID(claim)) if isinstance(claim, str) else None
+    except ValueError:
+        claim_id = None
+    if claim_id != job_id:
         raise HTTPException(status_code=403, detail="Token not valid for this job")
 
     # A token minted before the iat claim existed: its lifetime is fixed at
@@ -2310,6 +2325,9 @@ async def download_export(
     # revocation it enforces (token blacklist, logout-all, the session family) applies
     # here too. This route used to re-implement the check, missed the session family,
     # and kept serving signed-out sessions.
+    # The id is checked BEFORE either credential: a malformed one names no run, so it is the
+    # same 404 with or without a token or a bearer, never a 401 / 403 / 500 (follow-up A, AW2).
+    job_id = _canonical_job_id(job_id)
     if token:
         user = await _user_from_download_token(token, job_id, db)
     else:

@@ -1344,9 +1344,14 @@ async def replay_dialer_push(
     """
     from sqlalchemy import update
 
+    from src.api.routes.jobs import _canonical_job_id
     from src.db.models import DialerDelivery, Job
 
     await rate_limit(request, zone="general", identifier=current_user.id)
+    # Both path ids canonical: a malformed one is 404 "Job not found", never a uuid-cast
+    # 500, and the outbox task and the response carry the canonical run id (follow-up A).
+    config_id = _canonical_job_id(config_id)
+    job_id = _canonical_job_id(job_id)
 
     job = (
         await db.execute(

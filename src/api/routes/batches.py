@@ -34,7 +34,7 @@ from src.api.entitlements import (
     schedule_frequency_violation,
     skip_trace_violation,
 )
-from src.api.errors import run_refusal_http
+from src.api.errors import no_store_errors, run_refusal_http
 from src.api.lead_actionability import actionable_condition
 from src.api.middleware.rate_limit import rate_limit
 from src.api.schemas import (
@@ -733,14 +733,15 @@ async def download_batch(
     status (`_DOWNLOADABLE_STATUSES`) — a zero-row overlaps_only run is still
     'done' and downloads a headers-only CSV.
     """
-    # Each download rebuilds the CSV (a threadpool worker + sync DB connection +
-    # full-CSV buffer), so rate-limit to keep concurrent downloads from starving
-    # API capacity (Codex). The `export` zone (audit #4 S4-03), shared with every
-    # other full-CSV export, and taken before the owner lookup so a miss spends it.
-    await rate_limit(request, zone="export", identifier=current_user.id)
-    batch = await _owned_batch(db, batch_id, current_user.id)  # 404s if not the owner
-    run = await _run_for(db, batch_id, current_user.id)
-    return await _stream_run_csv(batch_id, run, batch.fields, batch.delivery_mode or "everything")
+    with no_store_errors():
+        # Each download rebuilds the CSV (a threadpool worker + sync DB connection +
+        # full-CSV buffer), so rate-limit to keep concurrent downloads from starving
+        # API capacity (Codex). The `export` zone (audit #4 S4-03), shared with every
+        # other full-CSV export, and taken before the owner lookup so a miss spends it.
+        await rate_limit(request, zone="export", identifier=current_user.id)
+        batch = await _owned_batch(db, batch_id, current_user.id)  # 404s if not the owner
+        run = await _run_for(db, batch_id, current_user.id)
+        return await _stream_run_csv(batch_id, run, batch.fields, batch.delivery_mode or "everything")
 
 
 async def _stream_run_csv(
@@ -783,7 +784,12 @@ async def _stream_run_csv(
     return StreamingResponse(
         io.BytesIO(rendered.data),
         media_type="text/csv",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        # no-store: lead contacts in the file; both download routes' errors get it
+        # from no_store_errors().
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store",
+        },
         # Both batch download routes come through here, so recording once at the
         # response covers them both. Stamped on the OWNER, not on the run's child
         # jobs: the combined CSV is a filtered, deduplicated selection across
@@ -858,20 +864,21 @@ async def download_batch_run(
 ) -> StreamingResponse:
     """Run-scoped combined-CSV download (2B): history downloads must not drift to
     the latest run the way /download (latest-run semantics) does."""
-    await rate_limit(request, zone="export", identifier=current_user.id)  # audit #4 S4-03
-    batch = await _owned_batch(db, batch_id, current_user.id)  # 404s if not the owner
-    run = (
-        await db.execute(
-            select(BatchRun).where(
-                BatchRun.id == run_id,
-                BatchRun.batch_id == batch_id,  # run must belong to THIS batch
-                BatchRun.user_id == current_user.id,
+    with no_store_errors():
+        await rate_limit(request, zone="export", identifier=current_user.id)  # audit #4 S4-03
+        batch = await _owned_batch(db, batch_id, current_user.id)  # 404s if not the owner
+        run = (
+            await db.execute(
+                select(BatchRun).where(
+                    BatchRun.id == run_id,
+                    BatchRun.batch_id == batch_id,  # run must belong to THIS batch
+                    BatchRun.user_id == current_user.id,
+                )
             )
-        )
-    ).scalar_one_or_none()
-    if run is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found")
-    return await _stream_run_csv(batch_id, run, batch.fields, batch.delivery_mode or "everything")
+        ).scalar_one_or_none()
+        if run is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found")
+        return await _stream_run_csv(batch_id, run, batch.fields, batch.delivery_mode or "everything")
 
 
 # ─── Combined leads view (in-app "one list") ─────────────────────────────────

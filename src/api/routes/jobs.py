@@ -14,7 +14,7 @@ from typing import Literal
 
 import redis as _sync_redis
 import redis.exceptions as _redis_exceptions
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials
@@ -40,7 +40,7 @@ from src.api.auth import CurrentUser, get_auth_context
 from src.api.deps import get_db, get_rls_db
 from src.api.dialer_filters import dialer_ready_conditions
 from src.api.entitlements import raise_plan_features, skip_trace_violation
-from src.api.errors import run_refusal_http
+from src.api.errors import no_store_errors, run_refusal_http
 from src.api.lead_actionability import actionable_condition, has_address_condition
 from src.api.middleware import audit_log, rate_limit, sanitize_search
 from src.api.owner_filters import build_owner_conditions
@@ -515,6 +515,7 @@ async def get_results(
     job_id: str,
     current_user: CurrentUser,
     request: Request,
+    response: Response,
     db: AsyncSession = Depends(get_rls_db),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=500),
@@ -546,506 +547,517 @@ async def get_results(
     # List only: the CSV, export URL and contact lookups still take ResultsCategory.
     category: ResultsListCategory = Query(DEFAULT_RESULTS_CATEGORY),
 ) -> ResultsPage:
-    # Rate-limit before the (expensive, multi-query) read to prevent DB-amplification DoS.
-    await rate_limit(request, zone="general", identifier=current_user.id)
-    job_id = _canonical_job_id(job_id)
-    result = await db.execute(
-        select(Job).where(Job.id == job_id, Job.user_id == current_user.id)
-    )
-    job = result.scalar_one_or_none()
-    if job is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
-
-    # Look up the scraper config to get the date_range_mode
-    config_result = await db.execute(
-        select(ScraperConfig).where(
-            ScraperConfig.id == job.scraper_config_id,
-            ScraperConfig.user_id == current_user.id,  # defense-in-depth owner filter
+    with no_store_errors():
+        # Contacts in the body: no cache may keep it (errors: no_store_errors()).
+        response.headers["Cache-Control"] = "no-store"
+        # Rate-limit before the (expensive, multi-query) read to prevent DB-amplification DoS.
+        await rate_limit(request, zone="general", identifier=current_user.id)
+        job_id = _canonical_job_id(job_id)
+        result = await db.execute(
+            select(Job).where(Job.id == job_id, Job.user_id == current_user.id)
         )
-    )
-    config = config_result.scalar_one_or_none()
-    from typing import cast
+        job = result.scalar_one_or_none()
+        if job is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
 
-    from src.api.schemas import ScheduleConfigDict
-    schedule: ScheduleConfigDict = cast(
-        ScheduleConfigDict, (config.schedule or {}) if config else {}
-    )
-    date_range_mode = schedule.get("date_range_mode") or schedule.get("range_mode", "rolling_90")  # type: ignore[call-overload]  # legacy "range_mode" alias
-
-    safe_q = sanitize_search(q)
-
-    # Standing rule (owner, 2026-09-04): a duplicate is NEVER shown. It was already
-    # delivered — and paid for — on an earlier run, so listing it again produced a
-    # page of rows for a job the list, the email, the webhook and the bill all
-    # reported as zero. The rows stay in `results` as dedup bookkeeping and are still
-    # counted in `duplicate_count`/`total_scraped`, which is what the "all N were
-    # duplicates" banner is built from — so the run is explained without shipping the
-    # rows. Previously they were listed after the new leads and greyed.
-    #
-    # Per-job delivery ONLY. Lists/segments (src/api/routes/segments.py) and the batch
-    # combined export deliberately KEEP duplicates: there, a lead whose only
-    # contactable row happens to be a duplicate must not disappear.
-    #
-    # Owner, 2026-09-17: "227 already delivered" was a number nobody could check.
-    # The default view is unchanged (new leads only, never mixed with duplicates);
-    # ?category=already_delivered lists the prior-run duplicates on their OWN, with
-    # every other rule below (actionable, tax cap, search, filters, sort, paging)
-    # applied identically. Reading them is a plain SELECT: nothing here bills,
-    # counts against quota or queues a skip trace.
-    base_query = select(Result).where(
-        Result.job_id == job_id,
-        Result.user_id == current_user.id,
-        no_address_condition() if category == "no_address" else category_condition(category),
-    )
-    if not _run_delivered(job):
-        # N-03: rows exist from `saving` on, but the quota reservation marks the
-        # over-allowance ones only after enrichment, and billing happens only at
-        # `done`. Until then the run has delivered nothing, so it lists nothing.
-        # The scrape stats below still describe the run in progress.
-        base_query = base_query.where(false())
-    if safe_q:
-        pattern = f"%{safe_q}%"
-        base_query = base_query.where(
-            Result.party_name.ilike(pattern, escape="\\")
-            | Result.parcel_id.ilike(pattern, escape="\\")
-            | Result.property_address.ilike(pattern, escape="\\")
+        # Look up the scraper config to get the date_range_mode
+        config_result = await db.execute(
+            select(ScraperConfig).where(
+                ScraperConfig.id == job.scraper_config_id,
+                ScraperConfig.user_id == current_user.id,  # defense-in-depth owner filter
+            )
         )
+        config = config_result.scalar_one_or_none()
+        from typing import cast
 
-    # Phase 4: tax filters (amount owed / months delinquent). Applied to the
-    # paginated view query so `total` + `items` reflect the filter; the job-level
-    # scrape stats below (enriched/parcel/dedup counts) intentionally stay
-    # unfiltered (they describe the scrape, not the current filter view).
-    from datetime import UTC, datetime, timedelta
-    today = datetime.now(UTC).date()
-    tax_conditions = build_tax_conditions(
-        min_amount, max_amount, min_months, max_months, today
-    )
-    for cond in tax_conditions:
-        base_query = base_query.where(cond)
+        from src.api.schemas import ScheduleConfigDict
+        schedule: ScheduleConfigDict = cast(
+            ScheduleConfigDict, (config.schedule or {}) if config else {}
+        )
+        date_range_mode = schedule.get("date_range_mode") or schedule.get("range_mode", "rolling_90")  # type: ignore[call-overload]  # legacy "range_mode" alias
 
-    # Hard product cap: tax-delinquent rows whose OLDEST unpaid year is more than
-    # 18 months old are NEVER shown/counted, regardless of the optional amount/
-    # months filters above. Self-scoping (NULL bill_year rows pass), so it's safe
-    # on every record type. NOT part of `tax_conditions` because that variable
-    # gates the empty-scrape "previous job" hint below — the cap is a standing
-    # rule, not a user-set view filter, so it must not change that branch.
-    base_query = base_query.where(tax_cap_condition(today))
-    # Standing product rule (owner, 2026-09-02): a row with no property AND no
-    # mailing address is not a lead — not listed, exported, counted or billed.
-    # Kept in `results` for dedup/health only. See src/api/lead_actionability.py.
-    # The no_address list is, by definition, the rows this rule excludes.
-    if category != "no_address":
-        base_query = base_query.where(actionable_condition())
+        safe_q = sanitize_search(q)
 
-    # Tier 0 (057): owner-location filters (absentee / out-of-state). Same view
-    # semantics as the tax filters — narrows total + items, leaves scrape stats.
-    for cond in build_owner_conditions(absentee, out_of_state):
-        base_query = base_query.where(cond)
+        # Standing rule (owner, 2026-09-04): a duplicate is NEVER shown. It was already
+        # delivered — and paid for — on an earlier run, so listing it again produced a
+        # page of rows for a job the list, the email, the webhook and the bill all
+        # reported as zero. The rows stay in `results` as dedup bookkeeping and are still
+        # counted in `duplicate_count`/`total_scraped`, which is what the "all N were
+        # duplicates" banner is built from — so the run is explained without shipping the
+        # rows. Previously they were listed after the new leads and greyed.
+        #
+        # Per-job delivery ONLY. Lists/segments (src/api/routes/segments.py) and the batch
+        # combined export deliberately KEEP duplicates: there, a lead whose only
+        # contactable row happens to be a duplicate must not disappear.
+        #
+        # Owner, 2026-09-17: "227 already delivered" was a number nobody could check.
+        # The default view is unchanged (new leads only, never mixed with duplicates);
+        # ?category=already_delivered lists the prior-run duplicates on their OWN, with
+        # every other rule below (actionable, tax cap, search, filters, sort, paging)
+        # applied identically. Reading them is a plain SELECT: nothing here bills,
+        # counts against quota or queues a skip trace.
+        base_query = select(Result).where(
+            Result.job_id == job_id,
+            Result.user_id == current_user.id,
+            no_address_condition() if category == "no_address" else category_condition(category),
+        )
+        if not _run_delivered(job):
+            # N-03: rows exist from `saving` on, but the quota reservation marks the
+            # over-allowance ones only after enrichment, and billing happens only at
+            # `done`. Until then the run has delivered nothing, so it lists nothing.
+            # The scrape stats below still describe the run in progress.
+            base_query = base_query.where(false())
+        if safe_q:
+            pattern = f"%{safe_q}%"
+            base_query = base_query.where(
+                Result.party_name.ilike(pattern, escape="\\")
+                | Result.parcel_id.ilike(pattern, escape="\\")
+                | Result.property_address.ilike(pattern, escape="\\")
+            )
 
-    # Phase 5: dialer-ready filter (valid phone + not known-DNC). Uses
-    # include_unknown_dnc=True because skip-trace leaves phone_dnc_flag NULL
-    # (no DNC feed); a strict IS-FALSE would hide every skip-traced phone. The
-    # dialer does the authoritative DNC scrub.
-    if dialer_ready:
-        for cond in dialer_ready_conditions(include_unknown_dnc=True):
+        # Phase 4: tax filters (amount owed / months delinquent). Applied to the
+        # paginated view query so `total` + `items` reflect the filter; the job-level
+        # scrape stats below (enriched/parcel/dedup counts) intentionally stay
+        # unfiltered (they describe the scrape, not the current filter view).
+        from datetime import UTC, datetime, timedelta
+        today = datetime.now(UTC).date()
+        tax_conditions = build_tax_conditions(
+            min_amount, max_amount, min_months, max_months, today
+        )
+        for cond in tax_conditions:
             base_query = base_query.where(cond)
 
-    count_result = await db.execute(
-        select(func.count()).select_from(base_query.subquery())
-    )
-    total = count_result.scalar_one()
+        # Hard product cap: tax-delinquent rows whose OLDEST unpaid year is more than
+        # 18 months old are NEVER shown/counted, regardless of the optional amount/
+        # months filters above. Self-scoping (NULL bill_year rows pass), so it's safe
+        # on every record type. NOT part of `tax_conditions` because that variable
+        # gates the empty-scrape "previous job" hint below — the cap is a standing
+        # rule, not a user-set view filter, so it must not change that branch.
+        base_query = base_query.where(tax_cap_condition(today))
+        # Standing product rule (owner, 2026-09-02): a row with no property AND no
+        # mailing address is not a lead — not listed, exported, counted or billed.
+        # Kept in `results` for dedup/health only. See src/api/lead_actionability.py.
+        # The no_address list is, by definition, the rows this rule excludes.
+        if category != "no_address":
+            base_query = base_query.where(actionable_condition())
 
-    rows_result = await db.execute(
-        # Sorted over the whole filtered set BEFORE offset/limit (see results_sort).
-        base_query.order_by(*results_order_by(config.record_type if config else None, sort))
-        .offset((page - 1) * page_size)
-        .limit(page_size)
-    )
-    items = [ResultRow.model_validate(r) for r in rows_result.scalars().all()]
-    if category == "already_delivered" and items:
-        await _attach_delivery_provenance(db, current_user.id, items, today)
+        # Tier 0 (057): owner-location filters (absentee / out-of-state). Same view
+        # semantics as the tax filters — narrows total + items, leaves scrape stats.
+        for cond in build_owner_conditions(absentee, out_of_state):
+            base_query = base_query.where(cond)
 
-    # Count enriched records (have real property_address), excluding duplicates
-    enriched_result = await db.execute(
-        select(func.count()).where(
-            Result.job_id == job_id,
-            Result.user_id == current_user.id,
-            Result.is_duplicate.is_(False),
-            Result.property_address.isnot(None),
-            Result.property_address != "",
-            Result.property_address != "(enrichment unavailable)",
+        # Phase 5: dialer-ready filter (valid phone + not known-DNC). Uses
+        # include_unknown_dnc=True because skip-trace leaves phone_dnc_flag NULL
+        # (no DNC feed); a strict IS-FALSE would hide every skip-traced phone. The
+        # dialer does the authoritative DNC scrub.
+        if dialer_ready:
+            for cond in dialer_ready_conditions(include_unknown_dnc=True):
+                base_query = base_query.where(cond)
+
+        count_result = await db.execute(
+            select(func.count()).select_from(base_query.subquery())
         )
-    )
-    enriched_count = enriched_result.scalar_one()
+        total = count_result.scalar_one()
 
-    # Check if enrichment is still running:
-    # It's running if parcels exist without addresses AND the enrichment
-    # task hasn't finished yet (no "Enrichment complete" log entry).
-    parcel_count_result = await db.execute(
-        select(func.count()).where(
-            Result.job_id == job_id,
-            Result.user_id == current_user.id,
-            func.length(Result.parcel_id) >= 10,
+        rows_result = await db.execute(
+            # Sorted over the whole filtered set BEFORE offset/limit (see results_sort).
+            base_query.order_by(*results_order_by(config.record_type if config else None, sort))
+            .offset((page - 1) * page_size)
+            .limit(page_size)
         )
-    )
-    parcel_count = parcel_count_result.scalar_one()
+        items = [ResultRow.model_validate(r) for r in rows_result.scalars().all()]
+        if category == "already_delivered" and items:
+            await _attach_delivery_provenance(db, current_user.id, items, today)
 
-    enrichment_done_result = await db.execute(
-        select(func.count()).where(
-            JobLog.job_id == job_id,
-            JobLog.message.like("Enrichment complete%"),
-        )
-    )
-    enrichment_task_finished = enrichment_done_result.scalar_one() > 0
-
-    # Also check the "No records" log — enrichment skipped
-    if not enrichment_task_finished:
-        skip_result = await db.execute(
+        # Count enriched records (have real property_address), excluding duplicates
+        enriched_result = await db.execute(
             select(func.count()).where(
+                Result.job_id == job_id,
+                Result.user_id == current_user.id,
+                Result.is_duplicate.is_(False),
+                Result.property_address.isnot(None),
+                Result.property_address != "",
+                Result.property_address != "(enrichment unavailable)",
+            )
+        )
+        enriched_count = enriched_result.scalar_one()
+
+        # Check if enrichment is still running:
+        # It's running if parcels exist without addresses AND the enrichment
+        # task hasn't finished yet (no "Enrichment complete" log entry).
+        parcel_count_result = await db.execute(
+            select(func.count()).where(
+                Result.job_id == job_id,
+                Result.user_id == current_user.id,
+                func.length(Result.parcel_id) >= 10,
+            )
+        )
+        parcel_count = parcel_count_result.scalar_one()
+
+        enrichment_done_result = await db.execute(
+            select(func.count())
+            .select_from(JobLog)
+            .join(Job, JobLog.job_id == Job.id)
+            .where(
                 JobLog.job_id == job_id,
-                JobLog.message.like("No records with parcel%"),
-            )
-        )
-        enrichment_task_finished = skip_result.scalar_one() > 0
-
-    # A terminal job cannot still be enriching: inline enrichment runs before the job
-    # leaves `enriching`. Matching log text alone missed every completion line added
-    # later ("Address enrichment partly complete...", "Address enrichment failed..."),
-    # so a job with deferred mailing lookups reported enriching=true forever and the
-    # results page polled every 5 seconds indefinitely. Background mailing recovery is
-    # surfaced per row (enrichment_data.mailing_lookup_deferred), not by this flag.
-    if job.status in {"done", "failed", "cancelled"}:
-        enrichment_task_finished = True
-
-    enriching = parcel_count > 0 and not enrichment_task_finished
-
-    # Total scraped (including duplicates) and duplicate count — both scoped to
-    # ACTIONABLE rows so the "all N records were duplicates" banner can never be
-    # driven by rows that are not leads (Codex).
-    # ONE aggregate, not four (Codex). These counts explain each other on the
-    # page: the banner renders `duplicate_count`, and the UI derives
-    # "duplicates from an earlier run" as duplicate_count - same_run_count.
-    # Read under separate READ COMMITTED snapshots, a finalize committing
-    # between two of them could return a same_run_count larger than the
-    # duplicate_count taken moments earlier, and the UI would render a negative
-    # number. One statement, one snapshot, and the arithmetic cannot go
-    # inconsistent no matter what commits alongside it.
-    #
-    # new_count is deliberately NOT tax-capped, matching workers/tasks.py's
-    # billable_count exactly — it must track jobs.record_count, which is what the
-    # list, the email and the webhook all report, not `total`.
-    #
-    # A 'superseded' row is left out of every count here. It held the claim on
-    # this run without ever being delivered, and a LATER run took the claim and
-    # delivered the lead (transfer_undelivered_claims). From this run's page it is
-    # neither new nor "already delivered", and counting it as a duplicate would
-    # name a source run newer than this one. It only becomes actionable here if a
-    # backfill fills its address after the handover, which is exactly when a
-    # count would start telling the reader something false.
-    counts_row = (await db.execute(
-        select(
-            func.count().label("total_scraped"),
-            func.count().filter(Result.is_duplicate.is_(True)).label("duplicates"),
-            func.count().filter(Result.is_duplicate.is_(False)).label("new_leads"),
-            func.count()
-            .filter(
-                Result.is_duplicate.is_(True),
-                Result.duplicate_reason == "same_run",
-            )
-            .label("same_run"),
-            # The tab number. Same predicate as the already_delivered list's base
-            # query before view filters, INCLUDING the tax cap that the list applies
-            # and new_leads (a billing mirror) deliberately does not.
-            func.count()
-            .filter(already_delivered_condition(), tax_cap_condition(today))
-            .label("already_delivered"),
-            # Skip-trace state of exactly those rows (AlreadyDeliveredContacts). A lead
-            # already delivered can still be looked up later, and the tab says so.
-            # Every bucket is counted from its own predicate and they are disjoint;
-            # `unknown` is the only remainder, so a status this code does not know is
-            # never reported as "not looked up" (2e).
-            *(
-                func.count()
-                .filter(already_delivered_condition(), tax_cap_condition(today), condition)
-                .label(f"delivered_{bucket}")
-                for bucket, condition in _CONTACT_BUCKETS
-            ),
-            # Of the answered ones, those copied from an earlier answer (no lookup bought).
-            func.count()
-            .filter(already_delivered_condition(), tax_cap_condition(today),
-                    Result.skip_trace_status.in_(("hit", "miss")),
-                    Result.skip_trace_source == "reused")
-            .label("delivered_reused"),
-        ).where(
-            Result.job_id == job_id,
-            Result.user_id == current_user.id,
-            actionable_condition(),
-            func.coalesce(Result.duplicate_reason, "") != "superseded",
-        )
-    )).one()
-    total_scraped = counts_row.total_scraped
-    duplicate_count = counts_row.duplicates
-    new_count = counts_row.new_leads
-    same_run_duplicate_count = counts_row.same_run
-    already_delivered_count = counts_row.already_delivered
-    # The no_address tab number: the list's own predicate before view filters,
-    # tax cap included like already_delivered_count. Its own statement because
-    # counts_row is scoped to actionable rows, which this set never is (Codex P1).
-    no_address_count = (await db.execute(
-        select(func.count()).where(
-            Result.job_id == job_id,
-            Result.user_id == current_user.id,
-            no_address_condition(),
-            tax_cap_condition(today),
-        )
-    )).scalar_one()
-    delivered_buckets = {
-        bucket: getattr(counts_row, f"delivered_{bucket}") for bucket, _ in _CONTACT_BUCKETS
-    }
-    already_delivered_contacts = AlreadyDeliveredContacts(
-        **delivered_buckets,
-        unknown=already_delivered_count - sum(delivered_buckets.values()),
-        reused=counts_row.delivered_reused,
-    )
-
-    # ── Where this job's duplicates came from (migration 089) ───────────────
-    # Read off results.duplicate_source_* — stamped by the worker at the moment
-    # each row was classified. NOT a live join against delivered_records: that
-    # table is worker-only (bridgeleads_app holds no privilege on it and
-    # provision_rls_roles.sql hard-fails if it ever does), its claims are
-    # released and re-claimed so a read-time join answers "who holds this now"
-    # rather than "who held it then", and 82% of its production rows already
-    # point at a purged job.
-    #
-    # Scoped to the SAME actionable predicate as duplicate_count above, so the
-    # groups sum to the number the banner renders instead of disagreeing with it.
-    # Rows stamped before 089 have a NULL source and land in `unattributed`.
-    dup_source_rows = await db.execute(
-        select(
-            Result.duplicate_source_job_id,
-            func.max(Result.duplicate_source_at).label("run_at"),
-            func.count().label("n"),
-        )
-        .where(
-            Result.job_id == job_id,
-            Result.user_id == current_user.id,
-            Result.is_duplicate.is_(True),
-            actionable_condition(),
-            # The same buckets as the counts above: only prior deliveries.
-            func.coalesce(Result.duplicate_reason, "prior_run") == "prior_run",
-        )
-        .group_by(Result.duplicate_source_job_id)
-        .order_by(func.count().desc())
-    )
-    grouped = dup_source_rows.all()
-    unattributed_duplicate_count = sum(
-        g.n for g in grouped if g.duplicate_source_job_id is None
-    )
-    named = [g for g in grouped if g.duplicate_source_job_id is not None]
-
-    # A source job may have been purged. Confirm each still exists, still belongs
-    # to this user, and actually FINISHED before offering a link to it. The id is
-    # stamped without a foreign key on purpose, so a dangling pointer is expected
-    # rather than exceptional. The `done` check is separate and load-bearing: a
-    # claim is written BEFORE its job completes, so a run that crashed after
-    # claiming (and then released those claims) must never be presented as the
-    # run that delivered these leads.
-    #
-    # One batched query, not one per group: the group count is bounded by this
-    # user's prior runs of this scraper, which is small but not fixed, and an
-    # unbounded per-group round trip on a read path is how a results page starts
-    # timing out for the heaviest accounts.
-    linkable: set[str] = set()
-    if named:
-        avail = await db.execute(
-            select(Job.id).where(
-                Job.id.in_([g.duplicate_source_job_id for g in named]),
                 Job.user_id == current_user.id,
-                Job.status == "done",
+                JobLog.message.like("Enrichment complete%"),
             )
         )
-        linkable = {str(j) for j in avail.scalars().all()}
+        enrichment_task_finished = enrichment_done_result.scalar_one() > 0
 
-    duplicate_sources = [
-        DuplicateSource(
-            job_id=g.duplicate_source_job_id,
-            run_at=g.run_at,
-            duplicate_count=g.n,
-            job_available=str(g.duplicate_source_job_id) in linkable,
-        )
-        for g in named
-    ]
-
-
-    # When results are empty (all duplicates or no new leads), find
-    # the most recent previous job for the same county/record_type
-    # that has actual Result rows, so the user can navigate there.
-    # Searches across ALL scraper configs for the same county+type,
-    # not just the same config_id.
-    previous_job_id = None
-    previous_job_run_at = None
-    # Skip the empty-scrape "previous job" suggestion when ANY view filter is
-    # active: total==0 then means "no rows matched the filter", NOT "the job
-    # scraped nothing", and the prior job wasn't checked against the same filter
-    # so suggesting it would be misleading (Codex).
-    if (
-        total == 0
-        # Only the new-leads view explains an empty page this way. An empty
-        # already-delivered view just means this run re-found nothing old.
-        and category == "new"
-        and config
-        and not tax_conditions
-        and not dialer_ready
-        # owner-location filters were missed here (Codex): with one active, total==0
-        # means "nothing matched the filter", so pointing at a previous job — which
-        # was never checked against that filter — is just as misleading as it is for
-        # the tax/dialer filters this already guards.
-        and not build_owner_conditions(absentee, out_of_state)
-    ):
-        # Find all config IDs for same county/state/record_type
-        sibling_configs = await db.execute(
-            select(ScraperConfig.id).where(
-                func.lower(ScraperConfig.county) == config.county.lower(),
-                func.upper(ScraperConfig.state) == config.state.upper(),
-                ScraperConfig.record_type == config.record_type,
-                ScraperConfig.user_id == current_user.id,
-            )
-        )
-        sibling_ids = list(sibling_configs.scalars().all())
-
-        if sibling_ids:
-            # Find most recent done job across all sibling configs
-            # that has at least 1 non-duplicate Result row
-            from sqlalchemy import exists
-            prev_result = await db.execute(
-                select(Job.id, Job.created_at)
+        # Also check the "No records" log — enrichment skipped
+        if not enrichment_task_finished:
+            skip_result = await db.execute(
+                select(func.count())
+                .select_from(JobLog)
+                .join(Job, JobLog.job_id == Job.id)
                 .where(
-                    Job.scraper_config_id.in_(sibling_ids),
+                    JobLog.job_id == job_id,
                     Job.user_id == current_user.id,
-                    Job.id != job_id,
-                    Job.status == "done",
-                    # The link is labelled "View previous results". Without this
-                    # bound it ordered by created_at DESC across ALL sibling
-                    # jobs, so opening an OLD all-duplicate run linked to the
-                    # NEWEST run — in production, a run two months LATER that
-                    # delivered none of the leads being explained. The page
-                    # asserted "you already received these" and then offered a
-                    # link that appeared to disprove it, which is how a correct
-                    # duplicate classification was reported as a cross-tenant
-                    # leak (2026-09-08). Previous means previous.
-                    Job.created_at < job.created_at,
-                    exists(
-                        select(Result.id).where(
-                            Result.job_id == Job.id,
-                            Result.user_id == current_user.id,
-                            Result.is_duplicate.is_(False),
-                            # Only a prior job with VISIBLE leads is worth linking
-                            # to — same standing rules as the list (Codex).
-                            tax_cap_condition(today),
-                            actionable_condition(),
-                        )
-                    ),
+                    JobLog.message.like("No records with parcel%"),
                 )
-                .order_by(Job.created_at.desc())
-                .limit(1)
             )
-            prev_row = prev_result.first()
-            if prev_row:
-                previous_job_id = prev_row.id
-                # Dated so the banner can name the run instead of saying
-                # only "previous", which is what left the reader with no
-                # way to check the claim.
-                previous_job_run_at = prev_row.created_at
+            enrichment_task_finished = skip_result.scalar_one() > 0
 
-    # NTS Tier 1: show the Auction Date / Default Owed columns for EVERY
-    # pre_foreclosure job (user pref: consistent columns across scrapes — the cells
-    # read '—' where a lead has no matched trustee sale, rather than the whole columns
-    # vanishing on a job that happened to match zero). trustee_sale (Auction Leads) is
-    # sourced FROM the NTS cache, so every row has auction data — the record type IS
-    # the rule for both; other types keep the row probe (defensive — nothing else
-    # populates auction today). Job-wide, not page-scoped, so the columns don't
-    # flicker by page when matches are sparse (Codex).
-    if config is not None and config.record_type in ("pre_foreclosure", "trustee_sale"):
-        has_auction_data = True
-    else:
-        auction_probe = await db.execute(
-            select(Result.id)
+        # A terminal job cannot still be enriching: inline enrichment runs before the job
+        # leaves `enriching`. Matching log text alone missed every completion line added
+        # later ("Address enrichment partly complete...", "Address enrichment failed..."),
+        # so a job with deferred mailing lookups reported enriching=true forever and the
+        # results page polled every 5 seconds indefinitely. Background mailing recovery is
+        # surfaced per row (enrichment_data.mailing_lookup_deferred), not by this flag.
+        if job.status in {"done", "failed", "cancelled"}:
+            enrichment_task_finished = True
+
+        enriching = parcel_count > 0 and not enrichment_task_finished
+
+        # Total scraped (including duplicates) and duplicate count — both scoped to
+        # ACTIONABLE rows so the "all N records were duplicates" banner can never be
+        # driven by rows that are not leads (Codex).
+        # ONE aggregate, not four (Codex). These counts explain each other on the
+        # page: the banner renders `duplicate_count`, and the UI derives
+        # "duplicates from an earlier run" as duplicate_count - same_run_count.
+        # Read under separate READ COMMITTED snapshots, a finalize committing
+        # between two of them could return a same_run_count larger than the
+        # duplicate_count taken moments earlier, and the UI would render a negative
+        # number. One statement, one snapshot, and the arithmetic cannot go
+        # inconsistent no matter what commits alongside it.
+        #
+        # new_count is deliberately NOT tax-capped, matching workers/tasks.py's
+        # billable_count exactly — it must track jobs.record_count, which is what the
+        # list, the email and the webhook all report, not `total`.
+        #
+        # A 'superseded' row is left out of every count here. It held the claim on
+        # this run without ever being delivered, and a LATER run took the claim and
+        # delivered the lead (transfer_undelivered_claims). From this run's page it is
+        # neither new nor "already delivered", and counting it as a duplicate would
+        # name a source run newer than this one. It only becomes actionable here if a
+        # backfill fills its address after the handover, which is exactly when a
+        # count would start telling the reader something false.
+        counts_row = (await db.execute(
+            select(
+                func.count().label("total_scraped"),
+                func.count().filter(Result.is_duplicate.is_(True)).label("duplicates"),
+                func.count().filter(Result.is_duplicate.is_(False)).label("new_leads"),
+                func.count()
+                .filter(
+                    Result.is_duplicate.is_(True),
+                    Result.duplicate_reason == "same_run",
+                )
+                .label("same_run"),
+                # The tab number. Same predicate as the already_delivered list's base
+                # query before view filters, INCLUDING the tax cap that the list applies
+                # and new_leads (a billing mirror) deliberately does not.
+                func.count()
+                .filter(already_delivered_condition(), tax_cap_condition(today))
+                .label("already_delivered"),
+                # Skip-trace state of exactly those rows (AlreadyDeliveredContacts). A lead
+                # already delivered can still be looked up later, and the tab says so.
+                # Every bucket is counted from its own predicate and they are disjoint;
+                # `unknown` is the only remainder, so a status this code does not know is
+                # never reported as "not looked up" (2e).
+                *(
+                    func.count()
+                    .filter(already_delivered_condition(), tax_cap_condition(today), condition)
+                    .label(f"delivered_{bucket}")
+                    for bucket, condition in _CONTACT_BUCKETS
+                ),
+                # Of the answered ones, those copied from an earlier answer (no lookup bought).
+                func.count()
+                .filter(already_delivered_condition(), tax_cap_condition(today),
+                        Result.skip_trace_status.in_(("hit", "miss")),
+                        Result.skip_trace_source == "reused")
+                .label("delivered_reused"),
+            ).where(
+                Result.job_id == job_id,
+                Result.user_id == current_user.id,
+                actionable_condition(),
+                func.coalesce(Result.duplicate_reason, "") != "superseded",
+            )
+        )).one()
+        total_scraped = counts_row.total_scraped
+        duplicate_count = counts_row.duplicates
+        new_count = counts_row.new_leads
+        same_run_duplicate_count = counts_row.same_run
+        already_delivered_count = counts_row.already_delivered
+        # The no_address tab number: the list's own predicate before view filters,
+        # tax cap included like already_delivered_count. Its own statement because
+        # counts_row is scoped to actionable rows, which this set never is (Codex P1).
+        no_address_count = (await db.execute(
+            select(func.count()).where(
+                Result.job_id == job_id,
+                Result.user_id == current_user.id,
+                no_address_condition(),
+                tax_cap_condition(today),
+            )
+        )).scalar_one()
+        delivered_buckets = {
+            bucket: getattr(counts_row, f"delivered_{bucket}") for bucket, _ in _CONTACT_BUCKETS
+        }
+        already_delivered_contacts = AlreadyDeliveredContacts(
+            **delivered_buckets,
+            unknown=already_delivered_count - sum(delivered_buckets.values()),
+            reused=counts_row.delivered_reused,
+        )
+
+        # ── Where this job's duplicates came from (migration 089) ───────────────
+        # Read off results.duplicate_source_* — stamped by the worker at the moment
+        # each row was classified. NOT a live join against delivered_records: that
+        # table is worker-only (bridgeleads_app holds no privilege on it and
+        # provision_rls_roles.sql hard-fails if it ever does), its claims are
+        # released and re-claimed so a read-time join answers "who holds this now"
+        # rather than "who held it then", and 82% of its production rows already
+        # point at a purged job.
+        #
+        # Scoped to the SAME actionable predicate as duplicate_count above, so the
+        # groups sum to the number the banner renders instead of disagreeing with it.
+        # Rows stamped before 089 have a NULL source and land in `unattributed`.
+        dup_source_rows = await db.execute(
+            select(
+                Result.duplicate_source_job_id,
+                func.max(Result.duplicate_source_at).label("run_at"),
+                func.count().label("n"),
+            )
             .where(
                 Result.job_id == job_id,
                 Result.user_id == current_user.id,
-                Result.auction_date.isnot(None),
+                Result.is_duplicate.is_(True),
+                actionable_condition(),
+                # The same buckets as the counts above: only prior deliveries.
+                func.coalesce(Result.duplicate_reason, "prior_run") == "prior_run",
             )
-            .limit(1)
+            .group_by(Result.duplicate_source_job_id)
+            .order_by(func.count().desc())
         )
-        has_auction_data = auction_probe.scalar_one_or_none() is not None
-
-    # Why those columns look the way they do. Only meaningful for pre_foreclosure:
-    # trustee_sale rows are sourced FROM the notice cache so they always carry a sale
-    # date, and no other record type has auction data at all. Computed from each
-    # lead's own recording date rather than a stored marker, so a run that predates
-    # the missing-reason stamping still reports correctly.
-    auction_coverage = None
-    if config is not None and config.record_type == "pre_foreclosure":
-        pub_cutoff = today - timedelta(days=AUCTION_PUBLICATION_LAG_DAYS)
-        cov = (await db.execute(
-            select(
-                func.count().filter(Result.auction_date.isnot(None)).label("matched"),
-                func.count().filter(
-                    Result.auction_date.is_(None),
-                    Result.date_recorded_parsed.isnot(None),
-                    Result.date_recorded_parsed > pub_cutoff,
-                ).label("awaiting"),
-                func.count().filter(
-                    Result.auction_date.is_(None),
-                    or_(
-                        Result.date_recorded_parsed.is_(None),
-                        Result.date_recorded_parsed <= pub_cutoff,
-                    ),
-                ).label("no_notice"),
-            ).where(Result.job_id == job_id, Result.user_id == current_user.id)
-        )).first()
-        auction_coverage = AuctionCoverage(
-            matched=cov.matched or 0,
-            awaiting_publication=cov.awaiting or 0,
-            no_notice_found=cov.no_notice or 0,
+        grouped = dup_source_rows.all()
+        unattributed_duplicate_count = sum(
+            g.n for g in grouped if g.duplicate_source_job_id is None
         )
+        named = [g for g in grouped if g.duplicate_source_job_id is not None]
 
-    # The run-count breakdown: the worker's done-time snapshot, else the same
-    # partition read now (one aggregate, scoped by job AND user on this RLS session).
-    # Only for a finished run: before `done`, records_found is written ahead of the
-    # filter and the saves, so rows still on their way would read as "not saved".
-    # A REJECTED stored snapshot shows nothing: never the live partition in its place.
-    breakdown, rejected = _snapshot_breakdown(job)
-    breakdown_basis = "snapshot" if breakdown is not None else None
-    if breakdown is None and not rejected and job.status == "done":
-        live, _why = live_breakdown(
-            await read_partition_async(db, job_id, current_user.id),
-            status=job.status,
-            records_found=job.records_found,
-            retry_count=job.retry_count,
+        # A source job may have been purged. Confirm each still exists, still belongs
+        # to this user, and actually FINISHED before offering a link to it. The id is
+        # stamped without a foreign key on purpose, so a dangling pointer is expected
+        # rather than exceptional. The `done` check is separate and load-bearing: a
+        # claim is written BEFORE its job completes, so a run that crashed after
+        # claiming (and then released those claims) must never be presented as the
+        # run that delivered these leads.
+        #
+        # One batched query, not one per group: the group count is bounded by this
+        # user's prior runs of this scraper, which is small but not fixed, and an
+        # unbounded per-group round trip on a read path is how a results page starts
+        # timing out for the heaviest accounts.
+        linkable: set[str] = set()
+        if named:
+            avail = await db.execute(
+                select(Job.id).where(
+                    Job.id.in_([g.duplicate_source_job_id for g in named]),
+                    Job.user_id == current_user.id,
+                    Job.status == "done",
+                )
+            )
+            linkable = {str(j) for j in avail.scalars().all()}
+
+        duplicate_sources = [
+            DuplicateSource(
+                job_id=g.duplicate_source_job_id,
+                run_at=g.run_at,
+                duplicate_count=g.n,
+                job_available=str(g.duplicate_source_job_id) in linkable,
+            )
+            for g in named
+        ]
+
+
+        # When results are empty (all duplicates or no new leads), find
+        # the most recent previous job for the same county/record_type
+        # that has actual Result rows, so the user can navigate there.
+        # Searches across ALL scraper configs for the same county+type,
+        # not just the same config_id.
+        previous_job_id = None
+        previous_job_run_at = None
+        # Skip the empty-scrape "previous job" suggestion when ANY view filter is
+        # active: total==0 then means "no rows matched the filter", NOT "the job
+        # scraped nothing", and the prior job wasn't checked against the same filter
+        # so suggesting it would be misleading (Codex).
+        if (
+            total == 0
+            # Only the new-leads view explains an empty page this way. An empty
+            # already-delivered view just means this run re-found nothing old.
+            and category == "new"
+            and config
+            and not tax_conditions
+            and not dialer_ready
+            # owner-location filters were missed here (Codex): with one active, total==0
+            # means "nothing matched the filter", so pointing at a previous job — which
+            # was never checked against that filter — is just as misleading as it is for
+            # the tax/dialer filters this already guards.
+            and not build_owner_conditions(absentee, out_of_state)
+        ):
+            # Find all config IDs for same county/state/record_type
+            sibling_configs = await db.execute(
+                select(ScraperConfig.id).where(
+                    func.lower(ScraperConfig.county) == config.county.lower(),
+                    func.upper(ScraperConfig.state) == config.state.upper(),
+                    ScraperConfig.record_type == config.record_type,
+                    ScraperConfig.user_id == current_user.id,
+                )
+            )
+            sibling_ids = list(sibling_configs.scalars().all())
+
+            if sibling_ids:
+                # Find most recent done job across all sibling configs
+                # that has at least 1 non-duplicate Result row
+                from sqlalchemy import exists
+                prev_result = await db.execute(
+                    select(Job.id, Job.created_at)
+                    .where(
+                        Job.scraper_config_id.in_(sibling_ids),
+                        Job.user_id == current_user.id,
+                        Job.id != job_id,
+                        Job.status == "done",
+                        # The link is labelled "View previous results". Without this
+                        # bound it ordered by created_at DESC across ALL sibling
+                        # jobs, so opening an OLD all-duplicate run linked to the
+                        # NEWEST run — in production, a run two months LATER that
+                        # delivered none of the leads being explained. The page
+                        # asserted "you already received these" and then offered a
+                        # link that appeared to disprove it, which is how a correct
+                        # duplicate classification was reported as a cross-tenant
+                        # leak (2026-09-08). Previous means previous.
+                        Job.created_at < job.created_at,
+                        exists(
+                            select(Result.id).where(
+                                Result.job_id == Job.id,
+                                Result.user_id == current_user.id,
+                                Result.is_duplicate.is_(False),
+                                # Only a prior job with VISIBLE leads is worth linking
+                                # to — same standing rules as the list (Codex).
+                                tax_cap_condition(today),
+                                actionable_condition(),
+                            )
+                        ),
+                    )
+                    .order_by(Job.created_at.desc())
+                    .limit(1)
+                )
+                prev_row = prev_result.first()
+                if prev_row:
+                    previous_job_id = prev_row.id
+                    # Dated so the banner can name the run instead of saying
+                    # only "previous", which is what left the reader with no
+                    # way to check the claim.
+                    previous_job_run_at = prev_row.created_at
+
+        # NTS Tier 1: show the Auction Date / Default Owed columns for EVERY
+        # pre_foreclosure job (user pref: consistent columns across scrapes — the cells
+        # read '—' where a lead has no matched trustee sale, rather than the whole columns
+        # vanishing on a job that happened to match zero). trustee_sale (Auction Leads) is
+        # sourced FROM the NTS cache, so every row has auction data — the record type IS
+        # the rule for both; other types keep the row probe (defensive — nothing else
+        # populates auction today). Job-wide, not page-scoped, so the columns don't
+        # flicker by page when matches are sparse (Codex).
+        if config is not None and config.record_type in ("pre_foreclosure", "trustee_sale"):
+            has_auction_data = True
+        else:
+            auction_probe = await db.execute(
+                select(Result.id)
+                .where(
+                    Result.job_id == job_id,
+                    Result.user_id == current_user.id,
+                    Result.auction_date.isnot(None),
+                )
+                .limit(1)
+            )
+            has_auction_data = auction_probe.scalar_one_or_none() is not None
+
+        # Why those columns look the way they do. Only meaningful for pre_foreclosure:
+        # trustee_sale rows are sourced FROM the notice cache so they always carry a sale
+        # date, and no other record type has auction data at all. Computed from each
+        # lead's own recording date rather than a stored marker, so a run that predates
+        # the missing-reason stamping still reports correctly.
+        auction_coverage = None
+        if config is not None and config.record_type == "pre_foreclosure":
+            pub_cutoff = today - timedelta(days=AUCTION_PUBLICATION_LAG_DAYS)
+            cov = (await db.execute(
+                select(
+                    func.count().filter(Result.auction_date.isnot(None)).label("matched"),
+                    func.count().filter(
+                        Result.auction_date.is_(None),
+                        Result.date_recorded_parsed.isnot(None),
+                        Result.date_recorded_parsed > pub_cutoff,
+                    ).label("awaiting"),
+                    func.count().filter(
+                        Result.auction_date.is_(None),
+                        or_(
+                            Result.date_recorded_parsed.is_(None),
+                            Result.date_recorded_parsed <= pub_cutoff,
+                        ),
+                    ).label("no_notice"),
+                ).where(Result.job_id == job_id, Result.user_id == current_user.id)
+            )).first()
+            auction_coverage = AuctionCoverage(
+                matched=cov.matched or 0,
+                awaiting_publication=cov.awaiting or 0,
+                no_notice_found=cov.no_notice or 0,
+            )
+
+        # The run-count breakdown: the worker's done-time snapshot, else the same
+        # partition read now (one aggregate, scoped by job AND user on this RLS session).
+        # Only for a finished run: before `done`, records_found is written ahead of the
+        # filter and the saves, so rows still on their way would read as "not saved".
+        # A REJECTED stored snapshot shows nothing: never the live partition in its place.
+        breakdown, rejected = _snapshot_breakdown(job)
+        breakdown_basis = "snapshot" if breakdown is not None else None
+        if breakdown is None and not rejected and job.status == "done":
+            live, _why = live_breakdown(
+                await read_partition_async(db, job_id, current_user.id),
+                status=job.status,
+                records_found=job.records_found,
+                retry_count=job.retry_count,
+            )
+            if live is not None:
+                breakdown, breakdown_basis = RunBreakdown(**live), "live"
+
+        return ResultsPage(
+            job_id=job_id, total=total, page=page, page_size=page_size,
+            items=items, enriched_count=enriched_count, enriching=enriching,
+            total_scraped=total_scraped, duplicate_count=duplicate_count,
+            new_count=new_count,
+            date_range_mode=date_range_mode,
+            previous_job_id=previous_job_id,
+            previous_job_run_at=previous_job_run_at,
+            duplicate_sources=duplicate_sources,
+            unattributed_duplicate_count=unattributed_duplicate_count,
+            same_run_duplicate_count=same_run_duplicate_count,
+            already_delivered_count=already_delivered_count,
+            no_address_count=no_address_count,
+            already_delivered_contacts=already_delivered_contacts,
+            has_auction_data=has_auction_data,
+            auction_coverage=auction_coverage,
+            breakdown=breakdown,
+            breakdown_basis=breakdown_basis,
         )
-        if live is not None:
-            breakdown, breakdown_basis = RunBreakdown(**live), "live"
-
-    return ResultsPage(
-        job_id=job_id, total=total, page=page, page_size=page_size,
-        items=items, enriched_count=enriched_count, enriching=enriching,
-        total_scraped=total_scraped, duplicate_count=duplicate_count,
-        new_count=new_count,
-        date_range_mode=date_range_mode,
-        previous_job_id=previous_job_id,
-        previous_job_run_at=previous_job_run_at,
-        duplicate_sources=duplicate_sources,
-        unattributed_duplicate_count=unattributed_duplicate_count,
-        same_run_duplicate_count=same_run_duplicate_count,
-        already_delivered_count=already_delivered_count,
-        no_address_count=no_address_count,
-        already_delivered_contacts=already_delivered_contacts,
-        has_auction_data=has_auction_data,
-        auction_coverage=auction_coverage,
-        breakdown=breakdown,
-        breakdown_basis=breakdown_basis,
-    )
 
 
 async def _attach_delivery_provenance(
@@ -2166,6 +2178,7 @@ async def _stream_stored_log_lines(job_id: str, user_id: str) -> list[str]:
 async def get_export_url(
     job_id: str,
     request: Request,
+    response: Response,
     user: CurrentUser,
     db: AsyncSession = Depends(get_rls_db),
     # Phase 4: carry the tax view-filters through so the in-app export flow
@@ -2190,54 +2203,57 @@ async def get_export_url(
     Generates a single-use token (60s) scoped to this job + user.
     The token is safe to put in a URL — it's not the full JWT.
     """
-    await rate_limit(request, zone="export", identifier=user.id)  # audit #3 S3-09
-    job_id = _canonical_job_id(job_id)  # the token below carries the canonical id
-    result = await db.execute(
-        select(Job).where(Job.id == job_id, Job.user_id == user.id)
-    )
-    job = result.scalar_one_or_none()
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    if not _run_delivered(job):
-        raise _undelivered_run_409()
-    if not job.export_key:
-        raise HTTPException(status_code=404, detail="No export available yet")
+    with no_store_errors():
+        # A bearer download capability in the body: a cached copy could replay it.
+        response.headers["Cache-Control"] = "no-store"
+        await rate_limit(request, zone="export", identifier=user.id)  # audit #3 S3-09
+        job_id = _canonical_job_id(job_id)  # the token below carries the canonical id
+        result = await db.execute(
+            select(Job).where(Job.id == job_id, Job.user_id == user.id)
+        )
+        job = result.scalar_one_or_none()
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        if not _run_delivered(job):
+            raise _undelivered_run_409()
+        if not job.export_key:
+            raise HTTPException(status_code=404, detail="No export available yet")
 
-    # Generate a short-lived download token (60 seconds, scoped to
-    # this job). H6 (full-SaaS review): include aud/iss/jti claims
-    # alongside the existing sub/job_id/purpose/exp so (a) tokens
-    # minted for a different purpose cannot be reused as downloads,
-    # (b) the token can be distinguished from full session JWTs
-    # during verification, and (c) a jti lets us blacklist a
-    # download link in the rare case we need to revoke one before
-    # its 60s TTL expires.
-    # Shared mint helper (also used by worker delivery). Claims: sub/job_id/
-    # purpose/aud/iss/jti/iat/exp. iat lets the logout-all revocation check
-    # compare the token's age against the user's most recent /auth/logout-all.
-    from src.api.download_tokens import mint_download_token
-    download_token = mint_download_token(str(user.id), job_id, ttl_seconds=60)
+        # Generate a short-lived download token (60 seconds, scoped to
+        # this job). H6 (full-SaaS review): include aud/iss/jti claims
+        # alongside the existing sub/job_id/purpose/exp so (a) tokens
+        # minted for a different purpose cannot be reused as downloads,
+        # (b) the token can be distinguished from full session JWTs
+        # during verification, and (c) a jti lets us blacklist a
+        # download link in the rare case we need to revoke one before
+        # its 60s TTL expires.
+        # Shared mint helper (also used by worker delivery). Claims: sub/job_id/
+        # purpose/aud/iss/jti/iat/exp. iat lets the logout-all revocation check
+        # compare the token's age against the user's most recent /auth/logout-all.
+        from src.api.download_tokens import mint_download_token
+        download_token = mint_download_token(str(user.id), job_id, ttl_seconds=60)
 
-    # Append any active tax filters so the download matches the filtered view.
-    from urllib.parse import urlencode
-    query: dict = {"token": download_token}
-    for key, val in (
-        ("min_amount", min_amount),
-        ("max_amount", max_amount),
-        ("min_months", min_months),
-        ("max_months", max_months),
-    ):
-        if val is not None:
-            query[key] = val
-    if dialer_ready:
-        query["dialer_ready"] = "true"
-    # Owner-location filters carry through too (lowercase bools for the query string).
-    if absentee is not None:
-        query["absentee"] = "true" if absentee else "false"
-    if out_of_state is not None:
-        query["out_of_state"] = "true" if out_of_state else "false"
-    if category != DEFAULT_RESULTS_CATEGORY:
-        query["category"] = category
-    return {"url": f"/jobs/{job_id}/download?{urlencode(query)}"}
+        # Append any active tax filters so the download matches the filtered view.
+        from urllib.parse import urlencode
+        query: dict = {"token": download_token}
+        for key, val in (
+            ("min_amount", min_amount),
+            ("max_amount", max_amount),
+            ("min_months", min_months),
+            ("max_months", max_months),
+        ):
+            if val is not None:
+                query[key] = val
+        if dialer_ready:
+            query["dialer_ready"] = "true"
+        # Owner-location filters carry through too (lowercase bools for the query string).
+        if absentee is not None:
+            query["absentee"] = "true" if absentee else "false"
+        if out_of_state is not None:
+            query["out_of_state"] = "true" if out_of_state else "false"
+        if category != DEFAULT_RESULTS_CATEGORY:
+            query["category"] = category
+        return {"url": f"/jobs/{job_id}/download?{urlencode(query)}"}
 
 
 async def _user_from_download_token(token: str, job_id: str, db: AsyncSession) -> User:
@@ -2338,230 +2354,231 @@ async def download_export(
     Accepts a short-lived download token (from /export-url) OR an Authorization header.
     The download token is scoped to a specific job, expires in 60s, and is safe for URLs.
     """
-    # Two ways in (audit #3, S3-07). ?token= carries ONLY a job-bound download token
-    # (purpose=download, audience bridgeleads-download), minted by /export-url (60 s)
-    # or by the worker for emailed links; a session JWT there is refused, since bearer
-    # credentials do not belong in URLs, history or access logs. The Authorization
-    # header goes through get_auth_context, the single decode point, so every
-    # revocation it enforces (token blacklist, logout-all, the session family) applies
-    # here too. This route used to re-implement the check, missed the session family,
-    # and kept serving signed-out sessions.
-    # The id is checked BEFORE either credential: a malformed one names no run, so it is the
-    # same 404 with or without a token or a bearer, never a 401 / 403 / 500 (follow-up A, AW2).
-    job_id = _canonical_job_id(job_id)
-    if token:
-        user = await _user_from_download_token(token, job_id, db)
-    else:
-        header = request.headers.get("authorization", "") if request else ""
-        scheme, _, credentials = header.partition(" ")
-        if scheme.lower() != "bearer" or not credentials.strip():
-            raise HTTPException(status_code=401, detail="Authentication required")
-        ctx = await get_auth_context(
-            HTTPAuthorizationCredentials(scheme="Bearer", credentials=credentials.strip()), db
+    with no_store_errors():
+        # Two ways in (audit #3, S3-07). ?token= carries ONLY a job-bound download token
+        # (purpose=download, audience bridgeleads-download), minted by /export-url (60 s)
+        # or by the worker for emailed links; a session JWT there is refused, since bearer
+        # credentials do not belong in URLs, history or access logs. The Authorization
+        # header goes through get_auth_context, the single decode point, so every
+        # revocation it enforces (token blacklist, logout-all, the session family) applies
+        # here too. This route used to re-implement the check, missed the session family,
+        # and kept serving signed-out sessions.
+        # The id is checked BEFORE either credential: a malformed one names no run, so it is the
+        # same 404 with or without a token or a bearer, never a 401 / 403 / 500 (follow-up A, AW2).
+        job_id = _canonical_job_id(job_id)
+        if token:
+            user = await _user_from_download_token(token, job_id, db)
+        else:
+            header = request.headers.get("authorization", "") if request else ""
+            scheme, _, credentials = header.partition(" ")
+            if scheme.lower() != "bearer" or not credentials.strip():
+                raise HTTPException(status_code=401, detail="Authentication required")
+            ctx = await get_auth_context(
+                HTTPAuthorizationCredentials(scheme="Bearer", credentials=credentials.strip()), db
+            )
+            user = ctx.user
+
+        await rate_limit(request, zone="export", identifier=user.id)  # audit #3 S3-09
+
+        # Set RLS context BEFORE any tenant read so the Job/Result queries get the
+        # RLS belt in addition to the explicit user_id filter. This route uses
+        # get_db (not get_rls_db) because the user is resolved from a download
+        # token rather than the standard dependency, so we set the context here.
+        # Also store it on session.info so the after_begin listener (session.py)
+        # re-applies the GUC if this path ever commits mid-request — consistent
+        # with get_rls_db and forward-safe for the non-BYPASSRLS cutover role.
+        db.sync_session.info["rls_user_id"] = str(user.id)
+        await db.execute(
+            text("SELECT set_config('app.current_user_id', :uid, true)"),
+            {"uid": str(user.id)},
         )
-        user = ctx.user
 
-    await rate_limit(request, zone="export", identifier=user.id)  # audit #3 S3-09
-
-    # Set RLS context BEFORE any tenant read so the Job/Result queries get the
-    # RLS belt in addition to the explicit user_id filter. This route uses
-    # get_db (not get_rls_db) because the user is resolved from a download
-    # token rather than the standard dependency, so we set the context here.
-    # Also store it on session.info so the after_begin listener (session.py)
-    # re-applies the GUC if this path ever commits mid-request — consistent
-    # with get_rls_db and forward-safe for the non-BYPASSRLS cutover role.
-    db.sync_session.info["rls_user_id"] = str(user.id)
-    await db.execute(
-        text("SELECT set_config('app.current_user_id', :uid, true)"),
-        {"uid": str(user.id)},
-    )
-
-    result = await db.execute(
-        select(Job).where(Job.id == job_id, Job.user_id == user.id)
-    )
-    job = result.scalar_one_or_none()
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    if not _run_delivered(job):
-        raise _undelivered_run_409()
-    if not job.export_key:
-        raise HTTPException(status_code=404, detail="No export available yet")
-
-    import io
-
-    try:
-        # RLS context already set above (before the Job ownership read).
-        # Generate CSV directly from database results
-        from datetime import UTC, datetime
-        today = datetime.now(UTC).date()
-        dl_query = select(Result).where(Result.job_id == job_id, Result.user_id == user.id)
-        # Phase 4: apply the SAME tax view-filters as get_results so the export
-        # matches the filtered view. Track whether a filter is active so an
-        # empty filtered set returns a header-only CSV (a valid "no matches")
-        # rather than the 404 used for a genuinely empty job.
-        tax_conditions = build_tax_conditions(
-            min_amount, max_amount, min_months, max_months, today
+        result = await db.execute(
+            select(Job).where(Job.id == job_id, Job.user_id == user.id)
         )
-        for cond in tax_conditions:
-            dl_query = dl_query.where(cond)
-        # Hard product cap: never EXPORT tax rows whose oldest unpaid year is >18
-        # months old, regardless of user filters. Matches get_results.
-        dl_query = dl_query.where(tax_cap_condition(today))
-        # Standing rules (match get_results + the worker exports): unactionable rows
-        # and duplicates are never exported. None of these three is a user "filter" —
-        # they are product rules, which is why the empty-result branch below probes
-        # for rows using only the quarantine rules and asks nothing about them.
-        dl_query = dl_query.where(actionable_condition())
-        # Default: new leads only, exactly as before. The already_delivered file is
-        # the same set that view lists; a download bills nothing either way.
-        dl_query = dl_query.where(category_condition(category))
-        # Phase 5: dialer-ready filter (not known-DNC; matches get_results +
-        # the push — strict IS-FALSE would hide skip-traced phones whose DNC is
-        # NULL; the dialer scrubs DNC).
-        if dialer_ready:
-            for cond in dialer_ready_conditions(include_unknown_dnc=True):
+        job = result.scalar_one_or_none()
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        if not _run_delivered(job):
+            raise _undelivered_run_409()
+        if not job.export_key:
+            raise HTTPException(status_code=404, detail="No export available yet")
+
+        import io
+
+        try:
+            # RLS context already set above (before the Job ownership read).
+            # Generate CSV directly from database results
+            from datetime import UTC, datetime
+            today = datetime.now(UTC).date()
+            dl_query = select(Result).where(Result.job_id == job_id, Result.user_id == user.id)
+            # Phase 4: apply the SAME tax view-filters as get_results so the export
+            # matches the filtered view. Track whether a filter is active so an
+            # empty filtered set returns a header-only CSV (a valid "no matches")
+            # rather than the 404 used for a genuinely empty job.
+            tax_conditions = build_tax_conditions(
+                min_amount, max_amount, min_months, max_months, today
+            )
+            for cond in tax_conditions:
                 dl_query = dl_query.where(cond)
-        # Tier 0 (057): owner-location filters (match get_results).
-        owner_conditions = build_owner_conditions(absentee, out_of_state)
-        for cond in owner_conditions:
-            dl_query = dl_query.where(cond)
+            # Hard product cap: never EXPORT tax rows whose oldest unpaid year is >18
+            # months old, regardless of user filters. Matches get_results.
+            dl_query = dl_query.where(tax_cap_condition(today))
+            # Standing rules (match get_results + the worker exports): unactionable rows
+            # and duplicates are never exported. None of these three is a user "filter" —
+            # they are product rules, which is why the empty-result branch below probes
+            # for rows using only the quarantine rules and asks nothing about them.
+            dl_query = dl_query.where(actionable_condition())
+            # Default: new leads only, exactly as before. The already_delivered file is
+            # the same set that view lists; a download bills nothing either way.
+            dl_query = dl_query.where(category_condition(category))
+            # Phase 5: dialer-ready filter (not known-DNC; matches get_results +
+            # the push — strict IS-FALSE would hide skip-traced phones whose DNC is
+            # NULL; the dialer scrubs DNC).
+            if dialer_ready:
+                for cond in dialer_ready_conditions(include_unknown_dnc=True):
+                    dl_query = dl_query.where(cond)
+            # Tier 0 (057): owner-location filters (match get_results).
+            owner_conditions = build_owner_conditions(absentee, out_of_state)
+            for cond in owner_conditions:
+                dl_query = dl_query.where(cond)
 
-        # Deterministic order (groups an estate's records together) — the SAME
-        # order the scheduled/R2 export uses, so the two exports are byte-identical,
-        # not just same-columns (Codex).
-        dl_query = dl_query.order_by(
-            Result.party_name, Result.date_recorded, Result.id
-        )
-
-        results_query = await db.execute(dl_query)
-        records = results_query.scalars().all()
-
-        if not records:
-            # A genuinely empty job still 404s (existing contract). Everything else
-            # gets a valid header-only CSV.
-            #
-            # Two ways to arrive here with rows in the DB:
-            #  1. a USER filter matched nothing — "no matches", not an empty job;
-            #  2. every deliverable row is a DUPLICATE. That is the whole shape of an
-            #     all-duplicate run, and the completion email for such a job still
-            #     links here — so 404ing it would hand the user a dead download for a
-            #     job the product legitimately reports as "0 records" (Codex).
-            # The probe therefore runs unconditionally and asks "did this job persist
-            # any actionable, in-cap row at all", INDEPENDENT of the duplicate rule.
-            exists_row = await db.execute(
-                select(Result.id)
-                .where(
-                    Result.job_id == job_id,
-                    Result.user_id == user.id,
-                    # "Has rows" means the job persisted a row with a usable
-                    # ADDRESS. Deliberately the address half only: every other rule
-                    # here (duplicate, over-plan-quota, tax cap) says a row is not
-                    # DELIVERABLE, which is precisely the header-only case — the job
-                    # produced rows, none of them ship, and its completion email
-                    # still links here. Using the full actionable_condition() would
-                    # 404 an all-over-quota job the same way it used to 404 an
-                    # all-duplicate one (Codex). Only a job with no addressable row
-                    # at all is genuinely empty.
-                    has_address_condition(),
-                )
-                .limit(1)
+            # Deterministic order (groups an estate's records together) — the SAME
+            # order the scheduled/R2 export uses, so the two exports are byte-identical,
+            # not just same-columns (Codex).
+            dl_query = dl_query.order_by(
+                Result.party_name, Result.date_recorded, Result.id
             )
-            job_has_any = exists_row.scalar_one_or_none() is not None
-            if not job_has_any:
-                raise HTTPException(status_code=404, detail="No records found for this job")
 
-        # Build CSV in memory — includes skip trace fields (phone, email)
-        # when available. The download always reads LIVE from the DB, so
-        # phone/email appear as soon as the skip trace dispatcher completes,
-        # even if the original export was uploaded before skip trace ran.
-        output = io.StringIO()
-        # Canonical dialer-ready CSV via the shared builder — the SAME format the
-        # scheduled/R2 export uses, so every export path produces an identical file
-        # (no "use the in-app download for dialers" caveat). This reads LIVE DB rows,
-        # so skip-trace phone/email appear as soon as the dispatcher completes.
-        # Honor the user's output-field visibility for this job's config (blank
-        # deselected hideable columns; identity/derived columns always present).
-        # Loaded scoped to the owner (RLS belt + explicit user filter); legacy/empty
-        # fields => show everything. Covers batch children too: each child is its OWN
-        # ScraperConfig carrying the batch's `fields` (batches.py), and Job.scraper_
-        # config_id is NOT NULL, so the guard's None branch is defensive only. (The
-        # batch COMBINED export is a separate path — see batch_export.py.)
-        from src.utils.lead_export import (
-            resolve_export_layout,
-            resolve_hidden_output_fields,
-            write_lead_csv,
-        )
-        hidden_fields: set[str] = set()
-        # Lean per-record-type columns: this download is a SINGLE record type (each
-        # job — batch child or standalone — has one ScraperConfig.record_type). The
-        # combined batch export is a separate superset path (batch_export.py). None
-        # scraper_config_id (defensive; Job.scraper_config_id is NOT NULL) -> full.
-        columns: list[str] | None = None
-        labels: dict[str, str] | None = None
-        # Source county/state/record_type for the rows: a Result carries none of
-        # them, and without a record type the party-name order is unknown (blank
-        # First/Last). Read from the SAME owner-scoped config row as the layout.
-        context: dict[str, str] | None = None
-        if job.scraper_config_id:
-            cfg_row = await db.execute(
-                select(
-                    ScraperConfig.fields, ScraperConfig.record_type, ScraperConfig.deliver,
-                    ScraperConfig.county, ScraperConfig.state,
-                ).where(
-                    ScraperConfig.id == job.scraper_config_id,
-                    ScraperConfig.user_id == user.id,
+            results_query = await db.execute(dl_query)
+            records = results_query.scalars().all()
+
+            if not records:
+                # A genuinely empty job still 404s (existing contract). Everything else
+                # gets a valid header-only CSV.
+                #
+                # Two ways to arrive here with rows in the DB:
+                #  1. a USER filter matched nothing — "no matches", not an empty job;
+                #  2. every deliverable row is a DUPLICATE. That is the whole shape of an
+                #     all-duplicate run, and the completion email for such a job still
+                #     links here — so 404ing it would hand the user a dead download for a
+                #     job the product legitimately reports as "0 records" (Codex).
+                # The probe therefore runs unconditionally and asks "did this job persist
+                # any actionable, in-cap row at all", INDEPENDENT of the duplicate rule.
+                exists_row = await db.execute(
+                    select(Result.id)
+                    .where(
+                        Result.job_id == job_id,
+                        Result.user_id == user.id,
+                        # "Has rows" means the job persisted a row with a usable
+                        # ADDRESS. Deliberately the address half only: every other rule
+                        # here (duplicate, over-plan-quota, tax cap) says a row is not
+                        # DELIVERABLE, which is precisely the header-only case — the job
+                        # produced rows, none of them ship, and its completion email
+                        # still links here. Using the full actionable_condition() would
+                        # 404 an all-over-quota job the same way it used to 404 an
+                        # all-duplicate one (Codex). Only a job with no addressable row
+                        # at all is genuinely empty.
+                        has_address_condition(),
+                    )
+                    .limit(1)
                 )
+                job_has_any = exists_row.scalar_one_or_none() is not None
+                if not job_has_any:
+                    raise HTTPException(status_code=404, detail="No records found for this job")
+
+            # Build CSV in memory — includes skip trace fields (phone, email)
+            # when available. The download always reads LIVE from the DB, so
+            # phone/email appear as soon as the skip trace dispatcher completes,
+            # even if the original export was uploaded before skip trace ran.
+            output = io.StringIO()
+            # Canonical dialer-ready CSV via the shared builder — the SAME format the
+            # scheduled/R2 export uses, so every export path produces an identical file
+            # (no "use the in-app download for dialers" caveat). This reads LIVE DB rows,
+            # so skip-trace phone/email appear as soon as the dispatcher completes.
+            # Honor the user's output-field visibility for this job's config (blank
+            # deselected hideable columns; identity/derived columns always present).
+            # Loaded scoped to the owner (RLS belt + explicit user filter); legacy/empty
+            # fields => show everything. Covers batch children too: each child is its OWN
+            # ScraperConfig carrying the batch's `fields` (batches.py), and Job.scraper_
+            # config_id is NOT NULL, so the guard's None branch is defensive only. (The
+            # batch COMBINED export is a separate path — see batch_export.py.)
+            from src.utils.lead_export import (
+                resolve_export_layout,
+                resolve_hidden_output_fields,
+                write_lead_csv,
             )
-            cfg = cfg_row.one_or_none()
-            if cfg is not None:
-                hidden_fields = resolve_hidden_output_fields(cfg.fields)
-                layout = cfg.deliver.get("csv_layout") if isinstance(cfg.deliver, dict) else None
-                columns, labels = resolve_export_layout(layout, cfg.record_type)
-                context = {
-                    "county": cfg.county, "state": cfg.state, "record_type": cfg.record_type,
-                }
-        write_lead_csv(
-            records, output, hidden_fields=hidden_fields, columns=columns,
-            labels=labels, context=context,
-        )
+            hidden_fields: set[str] = set()
+            # Lean per-record-type columns: this download is a SINGLE record type (each
+            # job — batch child or standalone — has one ScraperConfig.record_type). The
+            # combined batch export is a separate superset path (batch_export.py). None
+            # scraper_config_id (defensive; Job.scraper_config_id is NOT NULL) -> full.
+            columns: list[str] | None = None
+            labels: dict[str, str] | None = None
+            # Source county/state/record_type for the rows: a Result carries none of
+            # them, and without a record type the party-name order is unknown (blank
+            # First/Last). Read from the SAME owner-scoped config row as the layout.
+            context: dict[str, str] | None = None
+            if job.scraper_config_id:
+                cfg_row = await db.execute(
+                    select(
+                        ScraperConfig.fields, ScraperConfig.record_type, ScraperConfig.deliver,
+                        ScraperConfig.county, ScraperConfig.state,
+                    ).where(
+                        ScraperConfig.id == job.scraper_config_id,
+                        ScraperConfig.user_id == user.id,
+                    )
+                )
+                cfg = cfg_row.one_or_none()
+                if cfg is not None:
+                    hidden_fields = resolve_hidden_output_fields(cfg.fields)
+                    layout = cfg.deliver.get("csv_layout") if isinstance(cfg.deliver, dict) else None
+                    columns, labels = resolve_export_layout(layout, cfg.record_type)
+                    context = {
+                        "county": cfg.county, "state": cfg.state, "record_type": cfg.record_type,
+                    }
+            write_lead_csv(
+                records, output, hidden_fields=hidden_fields, columns=columns,
+                labels=labels, context=context,
+            )
 
-        csv_bytes = output.getvalue().encode("utf-8")
-        # The two files must not be confused once they sit in a downloads folder.
-        filename = (
-            f"bridgeleads_{job_id[:8]}_already_delivered.csv"
-            if category == "already_delivered"
-            else f"bridgeleads_{job_id[:8]}.csv"
-        )
+            csv_bytes = output.getvalue().encode("utf-8")
+            # The two files must not be confused once they sit in a downloads folder.
+            filename = (
+                f"bridgeleads_{job_id[:8]}_already_delivered.csv"
+                if category == "already_delivered"
+                else f"bridgeleads_{job_id[:8]}.csv"
+            )
 
-        from starlette.background import BackgroundTask
-        from starlette.responses import Response
+            from starlette.background import BackgroundTask
+            from starlette.responses import Response
 
-        from src.api.download_tracking import mark_leads_downloaded
+            from src.api.download_tracking import mark_leads_downloaded
 
-        return Response(
-            content=csv_bytes,
-            media_type="text/csv",
-            headers={
-                "Content-Disposition": f'attachment; filename="{filename}"',
-                # no-store: the file is built LIVE (skip-trace phones, the scraper's
-                # CSV layout). A cached copy served a stale file for an hour, e.g. the
-                # old headers after a layout switch (local browser check, 2026-09-15),
-                # and owner PII should not sit in a shared browser cache anyway.
-                "Cache-Control": "no-store",
-            },
-            # Activation signal, recorded AFTER the bytes go out. As a background
-            # task it cannot turn a bookkeeping failure into a failed download,
-            # and it cannot be reached by the `except Exception -> 500` below.
-            # Only when the file carried leads: the header-only responses above
-            # (all-duplicate, all-over-quota, a filter that matched nothing) are
-            # a valid CSV but not leads in anyone's hands.
-            background=(
-                BackgroundTask(mark_leads_downloaded, str(user.id))
-                if records else None
-            ),
-        )
-    except HTTPException:
-        raise
-    except Exception:
-        _logger.exception("Download error for job %s", job_id)
-        raise HTTPException(status_code=500, detail="Download temporarily unavailable")
+            return Response(
+                content=csv_bytes,
+                media_type="text/csv",
+                headers={
+                    "Content-Disposition": f'attachment; filename="{filename}"',
+                    # no-store: the file is built LIVE (skip-trace phones, the scraper's
+                    # CSV layout). A cached copy served a stale file for an hour, e.g. the
+                    # old headers after a layout switch (local browser check, 2026-09-15),
+                    # and owner PII should not sit in a shared browser cache anyway.
+                    "Cache-Control": "no-store",
+                },
+                # Activation signal, recorded AFTER the bytes go out. As a background
+                # task it cannot turn a bookkeeping failure into a failed download,
+                # and it cannot be reached by the `except Exception -> 500` below.
+                # Only when the file carried leads: the header-only responses above
+                # (all-duplicate, all-over-quota, a filter that matched nothing) are
+                # a valid CSV but not leads in anyone's hands.
+                background=(
+                    BackgroundTask(mark_leads_downloaded, str(user.id))
+                    if records else None
+                ),
+            )
+        except HTTPException:
+            raise
+        except Exception:
+            _logger.exception("Download error for job %s", job_id)
+            raise HTTPException(status_code=500, detail="Download temporarily unavailable")

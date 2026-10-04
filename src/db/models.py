@@ -26,7 +26,13 @@ from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, relationship, validates
 
 from src.config.constants import RUN_SCRAPE_TIME_LIMIT_S
-from src.db.encrypted_types import EncryptedJSON, EncryptedString
+from src.db.encrypted_types import (
+    ContactLabel,
+    EncryptedContactJSON,
+    EncryptedContactString,
+    EncryptedJSON,
+    EncryptedString,
+)
 
 # src.utils.crypto.blind_index is imported LAZILY inside the @validates hook below
 # (not at module top level) so that importing models — which alembic/env.py does
@@ -901,15 +907,18 @@ class Result(Base):
     # not_attempted → queued → submitted → hit | miss | errored.
     # H3: encrypted at rest (EncryptedString/EncryptedJSON over TEXT, migration
     # 046). Display-only PII — never a SQL filter/join/dedup key.
-    phone = Column(EncryptedString, nullable=True)
-    phone_type = Column(String(16), nullable=True)  # Mobile | Landline | VoIP
+    # UX 3.8s1: the Contact variants store exactly the same bytes; their READ side
+    # runs the one contact decoder (src/utils/contact_decode.py), so an unreadable
+    # value reads as None instead of leaking ciphertext or failing the read.
+    phone = Column(EncryptedContactString("phone"), nullable=True)
+    phone_type = Column(ContactLabel(), nullable=True)  # Mobile | Landline | VoIP
     phone_dnc_flag = Column(Boolean, nullable=True)
-    email = Column(EncryptedString, nullable=True)
+    email = Column(EncryptedContactString("email"), nullable=True)
     # Multi-contact (up to 3). The scalar phone/email above stay the PRIMARY
     # (= phones[0]/emails[0]) for all existing consumers; these add the extras
     # for display. NULL = legacy/not-yet-traced; [] = traced, none found.
-    phones = Column(EncryptedJSON, nullable=True)  # [{"number": str, "type": str|None}]
-    emails = Column(EncryptedJSON, nullable=True)  # [str]
+    phones = Column(EncryptedContactJSON("phones"), nullable=True)  # [{"number": str, "type": str|None}]
+    emails = Column(EncryptedContactJSON("emails"), nullable=True)  # [str]
     skip_trace_status = Column(String(16), nullable=False, default="not_attempted")
     skip_trace_attempted_at = Column(DateTime(timezone=True), nullable=True)
     # Where a settled (hit/miss) answer came from (migration 097): 'lookup' = Tracerfy

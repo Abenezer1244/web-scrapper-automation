@@ -1,8 +1,10 @@
 """Deactivate the 12 test batch-child scraper_configs (soft delete).
 
-Same effect as the product's own DELETE /scrapers/{id} (src/api/routes/scrapers.py:399
-sets active=False, "preserves job history") — which is also the only deletion the
-`bridgeleads_system` role can perform: it has DELETE=False on every table.
+Same effect as the product's own DELETE /scrapers/{id} (`delete_scraper` in
+src/api/routes/scrapers.py sets active=False, "preserves job history") — which is also
+the only way the `bridgeleads_system` role can remove these configs: it has no DELETE on
+scraper_configs, jobs or results. (Its DELETE grants are a short list of other tables:
+`REQUIRED_DELETE_TABLES` in scripts/verify_worker_delete_grants.py.)
 
 Clears these one-shot test configs out of the live view without touching the
 44,479 result rows (297 carrying paid skip-trace data) that a hard delete would

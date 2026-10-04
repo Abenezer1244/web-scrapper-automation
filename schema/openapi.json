@@ -7678,7 +7678,7 @@
             "description": "Validation Error"
           },
           "429": {
-            "description": "Too many requests: the account's general budget, 60 per minute."
+            "description": "Too many requests: the account's contact-lookup read budget, 60 per minute, shared with the status route."
           }
         },
         "security": [
@@ -7943,7 +7943,7 @@
             "description": "Validation Error"
           },
           "429": {
-            "description": "Too many requests: the account's general budget, 60 per minute. Poll every 5 seconds or slower."
+            "description": "Too many requests: the account's contact-lookup read budget, 60 per minute, shared with the list route. Poll every 5 seconds or slower."
           }
         },
         "security": [

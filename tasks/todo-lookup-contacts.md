@@ -5733,6 +5733,17 @@ re-quote cases. The rest of the 1c section and its amendments are consistent.
   authenticated page itself was NOT viewed in prod (admin login needs MFA): owner check pending.
 - Follow-ups: none blocking. A dedicated backend rate bucket only if real 429s appear (AS3).
 
+### Phase 1 CLOSED OUT (2026-10-03)
+- **BE #440 MERGED + LIVE:** merge `3ff82402` (09:43:15Z). Codex gate r1 NO-GO (P3: the handoff's
+  "consult r1-r5" vs a plan that recorded r1-r4; the handoff was right, the r5 record was added in
+  `9ff80b26`), r2 GATE: GO. CI green on `9ff80b26`, quiet 4×0, main unchanged, `--match-head-commit`;
+  api / worker / beat SUCCESS on `3ff82402`, `/health` 200. Docs only: no FE types regen needed.
+- **Owner check in production: PASSED, by the owner's own report** (2026-10-03; the answer they selected,
+  verbatim): "I opened a finished run, clicked Look up contacts, the quote dialog looked right, and I did
+  NOT press Confirm." No purchase. Not independently verified.
+- BUILD_JOURNAL entry for 1c written (owner-approved), in this close-out PR.
+- **Phase 1 is COMPLETE.** Next work is the owner's pick (candidates: handoff §7.4).
+
 ## Safety PR: Alembic can never reach production from a test or a stray CLI run (PLAN, 2026-09-27)
 
 The Deferred bullet below, taken now. Same class as the two production wipes.

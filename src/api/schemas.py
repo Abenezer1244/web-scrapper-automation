@@ -1956,6 +1956,11 @@ class ResultsPage(BaseModel):
     # as the counts above. So the number on the tab is the `total` that view
     # returns unfiltered, and the CSV it downloads holds the same rows.
     already_delivered_count: int = 0
+    # The rows with no property AND no mailing address (the breakdown's no_address
+    # bucket), counted with the predicate ?category=no_address pages through before
+    # any view filter, tax cap included. Read now, so it can be smaller than a
+    # snapshot breakdown's no_address after a backfill or on a capped tax run.
+    no_address_count: int = 0
     # Skip-trace state of those same rows (see AlreadyDeliveredContacts).
     already_delivered_contacts: AlreadyDeliveredContacts = AlreadyDeliveredContacts()
     # NTS Tier 1: True if the JOB has ANY auction-matched lead (independent of the

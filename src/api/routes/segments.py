@@ -40,6 +40,7 @@ from src.api.entitlements import (
     overlap_violation,
     plan_limit_http,
 )
+from src.api.errors import no_store_errors
 from src.api.lead_actionability import actionable_sql
 from src.api.middleware import rate_limit
 from src.api.results_sort import auction_date_fallback_sql, filing_date_sql
@@ -651,6 +652,7 @@ async def _fetch_intersection(
 async def intersection_preview(
     body: SegmentIntersectionRequest,
     request: Request,
+    response: Response,
     current_user: CurrentUser,
     db: AsyncSession = Depends(get_rls_db),
 ) -> SegmentIntersectionResponse:
@@ -658,42 +660,45 @@ async def intersection_preview(
 
     Strong-identity only — the response says so via identity_strength.
     """
-    await rate_limit(request, zone="general", identifier=current_user.id)
+    with no_store_errors():
+        # Contacts in the body: no cache may keep it (errors: no_store_errors()).
+        response.headers["Cache-Control"] = "no-store"
+        await rate_limit(request, zone="general", identifier=current_user.id)
 
-    # Fetch one extra row to detect truncation without a second count query.
-    rows, excluded_no_date = await _fetch_intersection(
-        db, str(current_user.id), body.record_types, body.counties, PREVIEW_CAP + 1,
-        body.lookback_days, body.filing_from, body.filing_to,
-    )
-    truncated = len(rows) > PREVIEW_CAP
-    rows = rows[:PREVIEW_CAP]
+        # Fetch one extra row to detect truncation without a second count query.
+        rows, excluded_no_date = await _fetch_intersection(
+            db, str(current_user.id), body.record_types, body.counties, PREVIEW_CAP + 1,
+            body.lookback_days, body.filing_from, body.filing_to,
+        )
+        truncated = len(rows) > PREVIEW_CAP
+        rows = rows[:PREVIEW_CAP]
 
-    return SegmentIntersectionResponse(
-        record_types=body.record_types,
-        counties=body.counties,
-        property_count=len(rows),
-        truncated=truncated,
-        excluded_no_date_count=excluded_no_date,
-        rows=[
-            SegmentLeadRow(
-                id=str(r.id),
-                date_recorded=r.date_recorded,
-                party_name=r.party_name,
-                parcel_id=r.parcel_id,
-                property_address=r.property_address,
-                mailing_address=r.mailing_address,
-                county=r.county,
-                state=r.state,
-                phone=r.phone,
-                phone_type=r.phone_type,
-                email=r.email,
-                matched_record_types=list(r.matched_record_types or []),
-                overlap_count=r.overlap_count,
-                date_is_auction_date=bool(r.date_is_auction_date),
-            )
-            for r in rows
-        ],
-    )
+        return SegmentIntersectionResponse(
+            record_types=body.record_types,
+            counties=body.counties,
+            property_count=len(rows),
+            truncated=truncated,
+            excluded_no_date_count=excluded_no_date,
+            rows=[
+                SegmentLeadRow(
+                    id=str(r.id),
+                    date_recorded=r.date_recorded,
+                    party_name=r.party_name,
+                    parcel_id=r.parcel_id,
+                    property_address=r.property_address,
+                    mailing_address=r.mailing_address,
+                    county=r.county,
+                    state=r.state,
+                    phone=r.phone,
+                    phone_type=r.phone_type,
+                    email=r.email,
+                    matched_record_types=list(r.matched_record_types or []),
+                    overlap_count=r.overlap_count,
+                    date_is_auction_date=bool(r.date_is_auction_date),
+                )
+                for r in rows
+            ],
+        )
 
 
 @router.post("/intersection/export")
@@ -706,22 +711,23 @@ async def intersection_export(
     """CSV export of the intersection. One representative lead per property,
     with matched_record_types + overlap_count columns. CSV-injection sanitized.
     """
-    await rate_limit(request, zone="export", identifier=current_user.id)  # audit #4 S4-03
+    with no_store_errors():
+        await rate_limit(request, zone="export", identifier=current_user.id)  # audit #4 S4-03
 
-    rows, _excluded = await _fetch_intersection(
-        db, str(current_user.id), body.record_types, body.counties, EXPORT_CAP,
-        body.lookback_days, body.filing_from, body.filing_to,
-    )
-    if len(rows) >= EXPORT_CAP:
-        _logger.warning(
-            "Intersection export hit EXPORT_CAP=%d for user %s (types=%s) — truncated",
-            EXPORT_CAP, current_user.id, body.record_types,
+        rows, _excluded = await _fetch_intersection(
+            db, str(current_user.id), body.record_types, body.counties, EXPORT_CAP,
+            body.lookback_days, body.filing_from, body.filing_to,
         )
+        if len(rows) >= EXPORT_CAP:
+            _logger.warning(
+                "Intersection export hit EXPORT_CAP=%d for user %s (types=%s) — truncated",
+                EXPORT_CAP, current_user.id, body.record_types,
+            )
 
-    types_slug = "_".join(body.record_types)[:60]
-    return _segment_csv_response(
-        rows, f"bridgeleads_overlap_{types_slug}", str(current_user.id)
-    )
+        types_slug = "_".join(body.record_types)[:60]
+        return _segment_csv_response(
+            rows, f"bridgeleads_overlap_{types_slug}", str(current_user.id)
+        )
 
 
 async def _fetch_union(
@@ -799,28 +805,32 @@ def _union_rows(rows: list) -> list[SegmentLeadRow]:
 async def union_preview(
     body: SegmentUnionRequest,
     request: Request,
+    response: Response,
     current_user: CurrentUser,
     db: AsyncSession = Depends(get_rls_db),
 ) -> SegmentUnionResponse:
     """JSON preview of the combined ('union') deduped lead set, capped at
     PREVIEW_CAP. Inclusive — each row carries its identity_strength."""
-    await rate_limit(request, zone="general", identifier=current_user.id)
+    with no_store_errors():
+        # Contacts in the body: no cache may keep it (errors: no_store_errors()).
+        response.headers["Cache-Control"] = "no-store"
+        await rate_limit(request, zone="general", identifier=current_user.id)
 
-    rows, excluded_no_date = await _fetch_union(
-        db, str(current_user.id), body.record_types, body.counties, PREVIEW_CAP + 1,
-        body.lookback_days, body.filing_from, body.filing_to,
-    )
-    truncated = len(rows) > PREVIEW_CAP
-    rows = rows[:PREVIEW_CAP]
+        rows, excluded_no_date = await _fetch_union(
+            db, str(current_user.id), body.record_types, body.counties, PREVIEW_CAP + 1,
+            body.lookback_days, body.filing_from, body.filing_to,
+        )
+        truncated = len(rows) > PREVIEW_CAP
+        rows = rows[:PREVIEW_CAP]
 
-    return SegmentUnionResponse(
-        record_types=body.record_types,
-        counties=body.counties,
-        lead_count=len(rows),
-        truncated=truncated,
-        excluded_no_date_count=excluded_no_date,
-        rows=_union_rows(rows),
-    )
+        return SegmentUnionResponse(
+            record_types=body.record_types,
+            counties=body.counties,
+            lead_count=len(rows),
+            truncated=truncated,
+            excluded_no_date_count=excluded_no_date,
+            rows=_union_rows(rows),
+        )
 
 
 @router.post("/union/export")
@@ -832,19 +842,20 @@ async def union_export(
 ) -> Response:
     """CSV export of the combined ('union') deduped lead set. Adds an
     identity_strength column (strong|weak). CSV-injection sanitized."""
-    await rate_limit(request, zone="export", identifier=current_user.id)  # audit #4 S4-03
+    with no_store_errors():
+        await rate_limit(request, zone="export", identifier=current_user.id)  # audit #4 S4-03
 
-    rows, _excluded = await _fetch_union(
-        db, str(current_user.id), body.record_types, body.counties, EXPORT_CAP,
-        body.lookback_days, body.filing_from, body.filing_to,
-    )
-    if len(rows) >= EXPORT_CAP:
-        _logger.warning(
-            "Union export hit EXPORT_CAP=%d for user %s (types=%s) — truncated",
-            EXPORT_CAP, current_user.id, body.record_types,
+        rows, _excluded = await _fetch_union(
+            db, str(current_user.id), body.record_types, body.counties, EXPORT_CAP,
+            body.lookback_days, body.filing_from, body.filing_to,
         )
+        if len(rows) >= EXPORT_CAP:
+            _logger.warning(
+                "Union export hit EXPORT_CAP=%d for user %s (types=%s) — truncated",
+                EXPORT_CAP, current_user.id, body.record_types,
+            )
 
-    types_slug = "_".join(body.record_types)[:60]
-    return _segment_csv_response(
-        rows, f"bridgeleads_combined_{types_slug}", str(current_user.id)
-    )
+        types_slug = "_".join(body.record_types)[:60]
+        return _segment_csv_response(
+            rows, f"bridgeleads_combined_{types_slug}", str(current_user.id)
+        )

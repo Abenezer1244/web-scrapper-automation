@@ -15,6 +15,8 @@ plain ``{"detail": "<sentence>"}``.
 from __future__ import annotations
 
 import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime
 
 import asyncpg
@@ -65,6 +67,33 @@ async def run_refused_handler(request: Request, exc: RunRefusedHTTPException) ->
         content=body.model_dump(mode="json"),
         headers=exc.headers,
     )
+
+
+# ─── no-store on a contact-bearing route's errors ────────────────────────────
+# A route that returns lead contacts (phones, emails) or a download capability
+# sets `Cache-Control: no-store` on its success response. FastAPI builds an
+# HTTPException's response separately from any injected Response, so an error
+# from the same route went out with no Cache-Control at all, and a cache could
+# keep a stale 404 / 409 for a URL that later serves PII. Each such route wraps
+# its WHOLE body in this, so every error it raises carries the header too.
+# Out of reach by design: dependency / validation errors raised before the body
+# runs, and the global 500 handler (its body is only `detail` + `ref`).
+
+
+@contextmanager
+def no_store_errors() -> Iterator[None]:
+    """Re-raise any HTTPException from the block with ``Cache-Control: no-store``
+    merged into its headers. Its other headers (Retry-After, WWW-Authenticate)
+    stay, and a Cache-Control it already carries is kept as is. Any other
+    exception propagates untouched."""
+    try:
+        yield
+    except HTTPException as exc:
+        headers = dict(exc.headers or {})
+        if not any(name.lower() == "cache-control" for name in headers):
+            headers["Cache-Control"] = "no-store"
+        exc.headers = headers
+        raise
 
 
 # ─── Database unreachable → 503 ──────────────────────────────────────────────

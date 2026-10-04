@@ -1181,6 +1181,10 @@ class BatchQuality(BaseModel):
     tax_applicable) is per property. So a stacked lead whose probate row represents
     it counts as auction-applicable but missing its auction date: that is what the
     user receives, and the check must not report a pass the file does not contain.
+
+    Known limit: with_phone / with_email count STORED values. A stored contact that
+    cannot be decrypted is shown blank (UX 3.8s2 decoder) but still counted here.
+    Production runs PII_ENCRYPTION_STRICT and had 0 such rows on 2026-10-04.
     """
 
     leads: int = 0

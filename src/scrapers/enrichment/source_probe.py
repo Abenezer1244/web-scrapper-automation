@@ -37,7 +37,11 @@ from collections.abc import Callable
 
 from sqlalchemy import text
 
-from src.scrapers.enrichment.source_health import CLARK_PIC, KING_EREALPROPERTY
+from src.scrapers.enrichment.source_health import (
+    CLARK_PIC,
+    KING_CV_PARCEL_LOCATE,
+    KING_EREALPROPERTY,
+)
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("enrichment.source_probe")
@@ -193,10 +197,36 @@ def probe_clark_pic(db) -> tuple[bool, str]:
     return False, "; ".join(outcomes)
 
 
+# A fixed public King parcel the strict locate rule matches (PIN 0904000025; the same
+# point and address the king_code_violation tests use, from a real layer answer).
+_KING_CV_PROBE_POINT = ("47.66817947", "-122.40862917", "5412 39TH AVE W, SEATTLE WA 98199")
+
+
+def probe_king_cv_parcel_locate(db) -> tuple[bool, str]:
+    """Can the King code-violation locate step run: extract usable AND layer matching?
+
+    The step (cv_mailing_recovery) stands down when either half fails, so both must be
+    proven before it is cleared: the Assessor extract must load (cached_extract, the
+    same call the step makes) and the parcel layer must give a strict `matched` for a
+    fixed public point (one request). `db` is unused.
+    """
+    from src.scrapers.enrichment.king_parcel_locate import locate
+    from src.scrapers.enrichment.king_rpacct import cached_extract
+
+    try:
+        if cached_extract() is None:
+            return False, "Assessor extract unavailable"
+        status = locate(*_KING_CV_PROBE_POINT).status
+    except Exception as exc:  # noqa: BLE001 -- a probe reports, it never raises
+        return False, type(exc).__name__
+    return status == "matched", f"extract ok, layer {status}"
+
+
 # source_key -> probe. A source with no entry is left alone by the canary rather
 # than guessed at: clearing a source we cannot actually verify would be worse
 # than leaving it in cooldown.
 PROBES: dict[str, Callable[[object], tuple[bool, str]]] = {
     KING_EREALPROPERTY: probe_king_erealproperty,
     CLARK_PIC: probe_clark_pic,
+    KING_CV_PARCEL_LOCATE: probe_king_cv_parcel_locate,
 }

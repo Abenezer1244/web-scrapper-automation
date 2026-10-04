@@ -83,16 +83,26 @@ async def _get(db, rid: str):
         "FROM results WHERE id = :i"), {"i": rid})).first()
 
 
-def _county_answers(monkeypatch, answers: dict, unreached: tuple[str, ...] = ()):
-    """Stand in for the county layer. `answers` maps parcel -> mailing (or None)."""
+def _county_answers(monkeypatch, answers: dict, unreached: tuple[str, ...] = (),
+                    off_layer: tuple[str, ...] = (), lookups: dict | None = None):
+    """Stand in for the county layer. `answers` maps parcel -> mailing (or None). A row
+    the layer matched carries matched=True, as the real one does; an `off_layer` parcel
+    gets only a statewide-style situs row (no matched flag), as the real batch does."""
     calls: list[tuple[list[str], str]] = []
 
     def _fake(parcel_ids, county, state, stats=None):
         calls.append((list(parcel_ids), county))
         if stats is not None:
             stats["county_unreached"] = [p for p in parcel_ids if p in unreached]
-        return {p: {"property_address": "22801 64TH PL W", "mailing_address": answers[p]}
-                for p in parcel_ids if p in answers and p not in unreached}
+        out = {p: {"property_address": "22801 64TH PL W", "mailing_address": answers[p],
+                   "matched": True}
+               for p in parcel_ids if p in answers and p not in unreached}
+        out.update({p: {"property_address": "22801 64TH PL W", "mailing_address": None}
+                    for p in parcel_ids if p in off_layer})
+        for p, lookup in (lookups or {}).items():   # a bulk source's explicit answer
+            if p in out:
+                out[p]["mailing_lookup"] = lookup
+        return out
 
     monkeypatch.setattr(cg, "batch_enrich_parcels_gis", _fake)
     return calls
@@ -134,6 +144,34 @@ class TestRecoverySweep:
         assert row.enrichment_data["mailing_lookup_deferred"] is False
         # NULL stays NULL and nothing is inferred from the property address.
         assert row.owner_state is None
+
+    async def test_a_parcel_not_on_the_county_layer_settles_as_parcel_not_found(
+        self, db, business_user, monkeypatch,
+    ):
+        job_id = await _job(db, business_user, county="pierce")
+        rid = await _row(db, business_user, job_id, parcel="4193994520")
+        _county_answers(monkeypatch, {}, off_layer=("4193994520",))
+
+        await asyncio.to_thread(mr.recover_deferred_gis_mailing)
+
+        row = await _get(db, rid)
+        assert row.mailing_address is None
+        assert row.enrichment_data["mailing_recovery_outcome"] == "parcel_not_found"
+        assert row.enrichment_data["mailing_lookup_deferred"] is False
+
+    async def test_an_explicit_bulk_answer_off_the_layer_is_kept(
+        self, db, business_user, monkeypatch,
+    ):
+        # Snohomish has a (mailing-stripped) layer AND the Assessor Roll: the roll's own
+        # "none" for a parcel the layer did not match must not be relabelled.
+        job_id = await _job(db, business_user, county="snohomish")
+        rid = await _row(db, business_user, job_id, parcel="00522400008900")
+        _county_answers(monkeypatch, {}, off_layer=("00522400008900",),
+                        lookups={"00522400008900": "none"})
+
+        await asyncio.to_thread(mr.recover_deferred_gis_mailing)
+
+        assert (await _get(db, rid)).enrichment_data["mailing_recovery_outcome"] == "none"
 
     async def test_an_unreached_parcel_is_not_charged_an_attempt(
         self, db, business_user, monkeypatch,

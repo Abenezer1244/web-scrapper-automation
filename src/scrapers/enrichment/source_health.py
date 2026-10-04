@@ -47,8 +47,9 @@ PIERCE_ATIP_OWNER = "pierce_atip_owner"
 # source_probe.probe_clark_pic, which clears it once the cooldown expires.
 CLARK_PIC = "clark_pic"
 # King code-violation locate step (parcel layer + Assessor extract), used by the
-# cv_mailing_recovery sweep. No canary probe is registered for it, so a block clears
-# through is_source_available's backstop (cooldown + 6 h), never blind.
+# cv_mailing_recovery sweep. Probed by source_probe.probe_king_cv_parcel_locate (extract
+# usable AND the parcel layer matching a fixed point), so the canary clears it once
+# the cause is fixed instead of waiting out the cooldown + 6 h backstop.
 KING_CV_PARCEL_LOCATE = "king_cv_parcel_locate"
 
 # 1h first, then 6h, 24h, 48h and 72h for every subsequent failed probe.

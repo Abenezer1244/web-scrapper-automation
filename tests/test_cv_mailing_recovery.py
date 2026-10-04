@@ -223,3 +223,30 @@ async def test_a_lead_edited_during_the_lookup_gets_nothing(db, business_user, t
     assert (stats["stale"], stats["found"]) == (1, 0)
     got = await _row(db, rid)
     assert got.mailing_address is None and "kc_pin" not in got.enrichment_data
+
+
+# ─── the canary probe (2026-10-04) ───────────────────────────────────────────
+
+def test_the_probe_is_registered_for_the_canary():
+    from src.scrapers.enrichment.source_probe import PROBES, probe_king_cv_parcel_locate
+
+    assert PROBES[KING_CV_PARCEL_LOCATE] is probe_king_cv_parcel_locate
+
+
+def test_the_probe_fails_without_the_extract_before_any_layer_request(monkeypatch):
+    from src.scrapers.enrichment.source_probe import probe_king_cv_parcel_locate
+
+    calls = _layer_down(monkeypatch)
+    monkeypatch.setattr(kr, "cached_extract", lambda *a, **kw: None)
+    assert probe_king_cv_parcel_locate(None) == (False, "Assessor extract unavailable")
+    assert calls == []
+
+
+def test_the_probe_passes_only_on_a_strict_match(monkeypatch, tmp_path):
+    from src.scrapers.enrichment.source_probe import probe_king_cv_parcel_locate
+
+    _with_extract(monkeypatch, tmp_path)
+    _layer(monkeypatch, P0904)
+    assert probe_king_cv_parcel_locate(None) == (True, "extract ok, layer matched")
+    _layer_down(monkeypatch)
+    assert probe_king_cv_parcel_locate(None) == (False, "extract ok, layer error")

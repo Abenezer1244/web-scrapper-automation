@@ -295,8 +295,8 @@ class TestCountyUnreachedIsReported:
 
     def test_mailing_source_registry(self):
         assert cg.gis_mailing_source_counties("WA") == [
-            "benton", "chelan", "clallam", "clark", "cowlitz", "grant", "island", "jefferson",
-            "pierce", "snohomish", "thurston", "whatcom"]
+            "benton", "chelan", "clallam", "clark", "cowlitz", "douglas", "grant", "island",
+            "jefferson", "pierce", "snohomish", "thurston", "whatcom"]
         assert cg.has_gis_mailing_source("king", "WA") is False
         # Clark has no GIS mailing layer; its source is the PIC page (clark_pic).
         assert cg.has_gis_mailing_source("clark", "WA") is False

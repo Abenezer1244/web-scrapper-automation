@@ -1,3 +1,38 @@
+# Batch system audit + redesign (2026-10-04)
+
+Branch `audit/batch-system-redesign`, BE worktree `C:/Users/Windows/bl-wt/batch-audit`, base `a4d13234`.
+Audit findings: `docs/audits/2026-10-04-batch-system-audit.md` (Codex consulted, concurs; P1 on new-vs-delivered).
+No merge, no deploy without owner OK. Each phase <= 5 files, verified, then owner approval.
+
+## Decisions (owner said "Start" on the recommendations, 2026-10-04)
+- [x] D1 keep all rows; split new vs already delivered; badge rows; filter
+- [x] D2 Skip tracing OFF = option A (no new paid lookups, own prior answers reused free, always disclosed)
+
+## Phase 1 (BE): honest batch counts + contact provenance  [P1 fix]
+- [x] `_COMBINED_CTES`: provenance columns on candidates; `has_new` per bucket in agg
+- [x] `_QUALITY_SQL` (separate statement, one pass over the shared ranked CTE; `_DELIVERY_COUNTS_SQL` left as-is because its dict is persisted and asserted exactly)
+- [x] `BatchLeadRow`: `already_delivered`, `skip_trace_status`, `skip_trace_attempted_at`, `contact_reused` (raw source stays internal)
+- [x] filter `?delivery=new|delivered` (shared `_VIEW_FILTERS`, page and pager cannot drift; CSV binds NULL)
+- [x] tests: batch A vs B, forged foreign-tenant job id, new/delivered split + reconciliation, filter + page 2, 422 on bad value, reused provenance, skip OFF = reused + 0 pending rows. County collision / leading zero / hyphen / missing parcel were ALREADY pinned in test_property_identity.py
+- [x] openapi regenerated (additive only), ruff clean, no BE type checker configured
+- [x] Codex review: 2 P1 + 5 P2 raised; verified: P1 NULL is_duplicate (column NOT NULL in DB) and P1 CSV widening (DictWriter fieldnames whitelist) rejected with evidence; PACS P2 was my 2-dot diff against a moved origin/main (not this branch); blank-contact P2 rejected (blank stored as NULL); accepted: quality doc clarity, 4th-query ceiling note, page-2 test
+- [ ] full suite (4 batches, isolated DB `bridgeleads_batchaudit_test`)
+- NOTE: phase touched 3 src + 4 test files (+ openapi, todo); tests are consequence of the SQL bind contract
+
+## Phase 2 (BE): run summary API for one-row-per-batch
+- [ ] batch list response: status rollup (queued/running/complete/complete with issues/failed/cancelled), children[] (county, record type, status, new, already delivered), markets, record types, skip-trace state from execution data (off / on / mixed / reused-only), quality state
+- [ ] tests: 1/2/10-child, multi-county, failed/cancelled/mixed, child not double-counted
+
+## Phase 3 (FE): dashboard + navigation
+- [ ] dashboard uses standalone scrapers + batches (one row per batch, `batch_id`, no name matching); section renamed "Recent runs"
+- [ ] batch runs findable (filter/search by county, record type, child name)
+
+## Phase 4 (FE): batch detail redesign
+- [ ] overview first (unique properties, stacked, single-list, new vs already delivered), leads, quality checks, scrapes, activity; contact provenance chips; explicit CSV scope
+- [ ] mobile cards at 320-1440, a11y pass, Playwright verification
+
+## Phase 5: Codex review gate + security Master Review + journal
+
 # Results run summary UX (2026-10-03)
 
 Branches `fix/results-run-summary-ux` in BE worktree `C:/Users/Windows/bl-wt/run-summary-be` (base `76c8fa08`) and FE worktree `C:/Users/Windows/bl-wt/run-summary-fe` (base `9ee1f9b6`). No merge, no deploy.

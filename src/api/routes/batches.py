@@ -11,6 +11,7 @@ import io
 import json
 import uuid
 from datetime import UTC, datetime
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import StreamingResponse
@@ -46,6 +47,7 @@ from src.api.schemas import (
     BatchDetailResponse,
     BatchLeadRow,
     BatchLeadsPage,
+    BatchQuality,
     BatchRunResponse,
     BatchSummaryResponse,
 )
@@ -892,6 +894,7 @@ async def _leads_page(
     response: Response,
     record_type: str | None = None,
     county: str | None = None,
+    delivery: str | None = None,
 ) -> BatchLeadsPage:
     """Shared body for the latest-run and run-scoped leads endpoints. Caller has
     verified batch ownership and (for the run-scoped variant) run membership.
@@ -912,6 +915,7 @@ async def _leads_page(
         _DELIVERY_COUNTS_SQL,
         _FACETS_SQL,
         _FILTERED_TOTAL_SQL,
+        _QUALITY_SQL,
     )
 
     if run is None or run.status not in _DOWNLOADABLE_STATUSES:
@@ -944,8 +948,8 @@ async def _leads_page(
     # it MUST come from the filtered query or pagination would offer pages that
     # render empty.
     overlaps_only = delivery_mode == "overlaps_only"
-    filters = {"f_record_type": record_type, "f_county": county}
-    filtered = record_type is not None or county is not None
+    filters = {"f_record_type": record_type, "f_county": county, "f_delivery": delivery}
+    filtered = record_type is not None or county is not None or delivery is not None
 
     facet_record_types: list[str] = []
     facet_counties: list[str] = []
@@ -964,6 +968,15 @@ async def _leads_page(
                 {"uid": run.user_id, "job_ids": job_ids,
                  "overlaps_only": overlaps_only, **filters, TAX_CAP_BIND: tax_bind},
             )).one().total)
+
+    # Whole-set quality facts: unfiltered and mode-independent, like `counts`.
+    # ponytail: a 4th pass over the same CTE per page load (counts, facets, page,
+    # quality), each bounded by one batch's rows. Fold into one statement or persist
+    # at finalize if batch pages get slow.
+    quality = BatchQuality(**(await db.execute(
+        text(_QUALITY_SQL),
+        {"uid": run.user_id, "job_ids": job_ids, TAX_CAP_BIND: tax_bind},
+    )).one()._mapping) if job_ids else BatchQuality()
 
     rows = []
     if job_ids:
@@ -1006,6 +1019,8 @@ async def _leads_page(
             except ValueError:
                 enrichment = None
         data["date_is_auction_date"] = is_auction_date_fallback(data.get("date_recorded"), enrichment)
+        data["skip_trace_status"] = data.get("skip_trace_status") or "not_attempted"
+        data["contact_reused"] = data.pop("skip_trace_source", None) == "reused"
         leads.append(BatchLeadRow(**data))
 
     return BatchLeadsPage(
@@ -1019,6 +1034,8 @@ async def _leads_page(
         county=county,
         available_record_types=facet_record_types,
         available_counties=facet_counties,
+        delivery=delivery,
+        quality=quality,
     )
 
 
@@ -1043,6 +1060,14 @@ async def list_batch_leads(
     county: str | None = Query(
         None, max_length=128, description="Narrow to leads sourced from this county."
     ),
+    delivery: Literal["new", "delivered"] | None = Query(
+        None,
+        description=(
+            "new = properties with at least one row delivered to the account for the "
+            "first time in this batch; delivered = properties every row of which an "
+            "earlier run already delivered."
+        ),
+    ),
     db: AsyncSession = Depends(get_rls_db),
 ) -> BatchLeadsPage:
     """The combined (deduped, overlap-first, mode-filtered) lead list of the
@@ -1052,7 +1077,7 @@ async def list_batch_leads(
         batch = await _owned_batch(db, batch_id, current_user.id)
         run = await _run_for(db, batch_id, current_user.id)
         return await _leads_page(
-            db, batch, run, page, page_size, response, record_type, county
+            db, batch, run, page, page_size, response, record_type, county, delivery
         )
     except HTTPException as exc:
         # Codex P2: FastAPI builds exception responses separately from the
@@ -1084,6 +1109,14 @@ async def list_batch_run_leads(
     county: str | None = Query(
         None, max_length=128, description="Narrow to leads sourced from this county."
     ),
+    delivery: Literal["new", "delivered"] | None = Query(
+        None,
+        description=(
+            "new = properties with at least one row delivered to the account for the "
+            "first time in this batch; delivered = properties every row of which an "
+            "earlier run already delivered."
+        ),
+    ),
     db: AsyncSession = Depends(get_rls_db),
 ) -> BatchLeadsPage:
     """Run-scoped combined lead list (2B history parity with the CSV download)."""
@@ -1102,7 +1135,7 @@ async def list_batch_run_leads(
         if run is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found")
         return await _leads_page(
-            db, batch, run, page, page_size, response, record_type, county
+            db, batch, run, page, page_size, response, record_type, county, delivery
         )
     except HTTPException as exc:
         # Codex P2: FastAPI builds exception responses separately from the

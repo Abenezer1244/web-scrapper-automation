@@ -1135,6 +1135,53 @@ class BatchLeadRow(BaseModel):
     lead_subtype: str | None = None
     # Same meaning as ResultRow.date_is_auction_date: show date_recorded as blank.
     date_is_auction_date: bool = False
+    # Every row of this property was delivered to the account in an EARLIER run
+    # (none is new in this batch). A combined set spans all child rows, so without
+    # this an already-delivered property reads as a fresh lead.
+    already_delivered: bool = False
+    # Contact provenance of the row this lead shows, same vocabulary as ResultRow:
+    # not_attempted|queued|submitted|hit|miss|errored|purged.
+    skip_trace_status: str = "not_attempted"
+    skip_trace_attempted_at: datetime | None = None  # when the answer was obtained
+    # True when the contact is the account's OWN earlier answer copied onto this
+    # row with no new lookup bought (results.skip_trace_source = 'reused'). This is
+    # how a batch with skip tracing off can still show a contact: the UI must say so.
+    contact_reused: bool = False
+
+
+class BatchQuality(BaseModel):
+    """Data-quality facts over the whole combined set (one statement, see
+    batch_export._QUALITY_SQL). Plain counts, never a blended score: each check is
+    "N of M" so the UI can state it as-is. Exclusive groups:
+    new_leads + already_delivered = leads; stacked + single_list + no_identity = leads.
+
+    The with_* fields measure the row each combined lead SHOWS (what the CSV and the
+    table deliver), not the best sibling row. Applicability (auction_applicable,
+    tax_applicable) is per property. So a stacked lead whose probate row represents
+    it counts as auction-applicable but missing its auction date: that is what the
+    user receives, and the check must not report a pass the file does not contain.
+    """
+
+    leads: int = 0
+    new_leads: int = 0
+    already_delivered: int = 0
+    stacked: int = 0          # same property on 2+ record types in this batch
+    stacked_new: int = 0      # of those, with at least one row new to the account
+    single_list: int = 0
+    no_identity: int = 0      # no parcel/address identity, so never cross-matched
+    with_parcel: int = 0
+    with_property_address: int = 0
+    with_mailing_address: int = 0
+    with_phone: int = 0
+    with_email: int = 0
+    contacts_looked_up: int = 0  # answered by a lookup bought for this row
+    contacts_reused: int = 0     # the account's own earlier answer, no new lookup
+    auction_applicable: int = 0  # pre-foreclosure / trustee-sale leads
+    with_auction_date: int = 0
+    with_default_amount: int = 0
+    tax_applicable: int = 0      # tax-delinquent leads
+    with_tax_balance: int = 0
+    with_tax_year: int = 0
 
 
 class BatchLeadsPage(BaseModel):
@@ -1158,6 +1205,9 @@ class BatchLeadsPage(BaseModel):
     # entirely for a single-county batch.
     available_record_types: list[str] = Field(default_factory=list)
     available_counties: list[str] = Field(default_factory=list)
+    # Echo of the new-vs-delivered filter (null = both).
+    delivery: Literal["new", "delivered"] | None = None
+    quality: BatchQuality = Field(default_factory=BatchQuality)
 
 
 # ─── Jobs ─────────────────────────────────────────────────────────────────────

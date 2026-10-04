@@ -234,6 +234,7 @@ async def test_combined_sql_excludes_out_of_window(
         # No-op view filters (the export/delivery path binds these as NULL too).
         "f_record_type": None,
         "f_county": None,
+        "f_delivery": None,
         TAX_CAP_BIND: _CAP_BIND_VALUE,
     })
     returned = {str(r._mapping["id"]) for r in result.fetchall()}

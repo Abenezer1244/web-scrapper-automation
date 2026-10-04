@@ -460,6 +460,16 @@
       "BatchLeadRow": {
         "description": "One combined-view lead — mirrors the combined CSV's columns.",
         "properties": {
+          "already_delivered": {
+            "default": false,
+            "title": "Already Delivered",
+            "type": "boolean"
+          },
+          "contact_reused": {
+            "default": false,
+            "title": "Contact Reused",
+            "type": "boolean"
+          },
           "date_is_auction_date": {
             "default": false,
             "title": "Date Is Auction Date",
@@ -580,6 +590,23 @@
             ],
             "title": "Property Address"
           },
+          "skip_trace_attempted_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Skip Trace Attempted At"
+          },
+          "skip_trace_status": {
+            "default": "not_attempted",
+            "title": "Skip Trace Status",
+            "type": "string"
+          },
           "source_counties": {
             "items": {
               "type": "string"
@@ -625,6 +652,21 @@
             ],
             "title": "County"
           },
+          "delivery": {
+            "anyOf": [
+              {
+                "enum": [
+                  "new",
+                  "delivered"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Delivery"
+          },
           "delivery_mode": {
             "title": "Delivery Mode",
             "type": "string"
@@ -643,6 +685,9 @@
           "page_size": {
             "title": "Page Size",
             "type": "integer"
+          },
+          "quality": {
+            "$ref": "#/components/schemas/BatchQuality"
           },
           "record_type": {
             "anyOf": [
@@ -669,6 +714,113 @@
           "total"
         ],
         "title": "BatchLeadsPage",
+        "type": "object"
+      },
+      "BatchQuality": {
+        "description": "Data-quality facts over the whole combined set (one statement, see\nbatch_export._QUALITY_SQL). Plain counts, never a blended score: each check is\n\"N of M\" so the UI can state it as-is. Exclusive groups:\nnew_leads + already_delivered = leads; stacked + single_list + no_identity = leads.\n\nThe with_* fields measure the row each combined lead SHOWS (what the CSV and the\ntable deliver), not the best sibling row. Applicability (auction_applicable,\ntax_applicable) is per property. So a stacked lead whose probate row represents\nit counts as auction-applicable but missing its auction date: that is what the\nuser receives, and the check must not report a pass the file does not contain.",
+        "properties": {
+          "already_delivered": {
+            "default": 0,
+            "title": "Already Delivered",
+            "type": "integer"
+          },
+          "auction_applicable": {
+            "default": 0,
+            "title": "Auction Applicable",
+            "type": "integer"
+          },
+          "contacts_looked_up": {
+            "default": 0,
+            "title": "Contacts Looked Up",
+            "type": "integer"
+          },
+          "contacts_reused": {
+            "default": 0,
+            "title": "Contacts Reused",
+            "type": "integer"
+          },
+          "leads": {
+            "default": 0,
+            "title": "Leads",
+            "type": "integer"
+          },
+          "new_leads": {
+            "default": 0,
+            "title": "New Leads",
+            "type": "integer"
+          },
+          "no_identity": {
+            "default": 0,
+            "title": "No Identity",
+            "type": "integer"
+          },
+          "single_list": {
+            "default": 0,
+            "title": "Single List",
+            "type": "integer"
+          },
+          "stacked": {
+            "default": 0,
+            "title": "Stacked",
+            "type": "integer"
+          },
+          "stacked_new": {
+            "default": 0,
+            "title": "Stacked New",
+            "type": "integer"
+          },
+          "tax_applicable": {
+            "default": 0,
+            "title": "Tax Applicable",
+            "type": "integer"
+          },
+          "with_auction_date": {
+            "default": 0,
+            "title": "With Auction Date",
+            "type": "integer"
+          },
+          "with_default_amount": {
+            "default": 0,
+            "title": "With Default Amount",
+            "type": "integer"
+          },
+          "with_email": {
+            "default": 0,
+            "title": "With Email",
+            "type": "integer"
+          },
+          "with_mailing_address": {
+            "default": 0,
+            "title": "With Mailing Address",
+            "type": "integer"
+          },
+          "with_parcel": {
+            "default": 0,
+            "title": "With Parcel",
+            "type": "integer"
+          },
+          "with_phone": {
+            "default": 0,
+            "title": "With Phone",
+            "type": "integer"
+          },
+          "with_property_address": {
+            "default": 0,
+            "title": "With Property Address",
+            "type": "integer"
+          },
+          "with_tax_balance": {
+            "default": 0,
+            "title": "With Tax Balance",
+            "type": "integer"
+          },
+          "with_tax_year": {
+            "default": 0,
+            "title": "With Tax Year",
+            "type": "integer"
+          }
+        },
+        "title": "BatchQuality",
         "type": "object"
       },
       "BatchRunResponse": {
@@ -6751,6 +6903,28 @@
               "description": "Narrow to leads sourced from this county.",
               "title": "County"
             }
+          },
+          {
+            "description": "new = properties with at least one row delivered to the account for the first time in this batch; delivered = properties every row of which an earlier run already delivered.",
+            "in": "query",
+            "name": "delivery",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "new",
+                    "delivered"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "new = properties with at least one row delivered to the account for the first time in this batch; delivered = properties every row of which an earlier run already delivered.",
+              "title": "Delivery"
+            }
           }
         ],
         "responses": {
@@ -6975,6 +7149,28 @@
               ],
               "description": "Narrow to leads sourced from this county.",
               "title": "County"
+            }
+          },
+          {
+            "description": "new = properties with at least one row delivered to the account for the first time in this batch; delivered = properties every row of which an earlier run already delivered.",
+            "in": "query",
+            "name": "delivery",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "new",
+                    "delivered"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "new = properties with at least one row delivered to the account for the first time in this batch; delivered = properties every row of which an earlier run already delivered.",
+              "title": "Delivery"
             }
           }
         ],

@@ -56,6 +56,12 @@ _ZONES: dict[str, tuple[int, int]] = {
     # never spends the customer's CSV download budget (`export`) and downloads never
     # block a quote. 10/min per user is ample for a dialog that re-quotes on open.
     "lookup_quote": (10, 60),
+    # GET /jobs/{id}/contact-lookups and GET /jobs/{id}/contact-lookups/{action_id}, the
+    # two reads the results page polls (~4 a minute per open page). Their own bucket, so
+    # the polling never spends the results list's `general` budget and a busy results
+    # table never starves the progress panel. Fails OPEN like `general`: a read buys
+    # nothing (not in _FALLBACK_ZONES).
+    "lookup_read": (60, 60),
 }
 
 _redis_client: aioredis.Redis | None = None
@@ -198,7 +204,7 @@ async def rate_limit(request: Request, zone: str = "general", identifier: str | 
     Args:
         request: The incoming FastAPI request.
         zone: A key of _ZONES ('auth', 'jobs', 'general', 'webhook', 'stripe',
-            'export', 'writes', 'lookup_quote'). An unknown zone falls back to
+            'export', 'writes', 'lookup_quote', 'lookup_read'). An unknown zone falls back to
             'general'.
         identifier: Custom key (e.g. user_id). Falls back to client IP.
     """

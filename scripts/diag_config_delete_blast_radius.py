@@ -1,7 +1,7 @@
 """READ-ONLY: exactly what a HARD delete of the 12 backfilled configs would destroy.
 
-The product's own DELETE /scrapers/{id} is a SOFT delete (scrapers.py:399 sets
-active=False, "preserves job history"), so a hard delete has no application path
+The product's own DELETE /scrapers/{id} is a SOFT delete (`delete_scraper` in
+src/api/routes/scrapers.py sets active=False, "preserves job history"), so a hard delete has no application path
 and its cascade reach is not obvious. This counts every row that would go.
 
     railway run --service worker python scripts/diag_config_delete_blast_radius.py

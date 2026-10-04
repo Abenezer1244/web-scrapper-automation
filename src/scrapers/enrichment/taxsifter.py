@@ -49,6 +49,17 @@ TAXSIFTER_ORIGINS: dict[str, str] = {
     "okanogan": "https://okanoganwa-taxsifter.publicaccessnow.com",
 }
 
+# County -> TaxSifter base URL for the PARCEL-keyed mailing source (resolve_mailing
+# below), as opposed to the owner-name fill. Whitman (verified 2026-10-03): TerraScan
+# TaxSifter under /Taxsifter, the same markup as Douglas/Okanogan (ParcelOwnerInfo1
+# lbAddress/lbCity/lbState/lbZip, lbParcelNumber echo, btnAgree, no RCW text on the
+# disclaimer). Whitman's GIS page says its data may not be used "to generate commercial
+# mailing lists" (RCW 42.56.070(9)); owner cleared all counties 2026-10-02 and asked for
+# Whitman 2026-10-04, so it answers to COUNTY_GIS_RESTRICTED_MAILING_ENABLED.
+TAXSIFTER_PARCEL_SITES: dict[str, str] = {
+    "whitman": "https://terrascan.whitmancounty.net/Taxsifter",
+}
+
 _DISCLAIMER_PATH = "/Disclaimer.aspx"
 _RESULTS_PATH = "/Search/Results.aspx"
 _ASSESSOR_PATH = "/Assessor.aspx"
@@ -131,6 +142,21 @@ def parse_taxsifter_results(html: str, query: str) -> tuple[str, str] | None:
     return key, parcel
 
 
+def _mailing_from(soup) -> str | None:
+    """"STREET, CITY, ST ZIP5" from an Assessor.aspx owner block; None when incomplete."""
+    def span(suffix: str) -> str:
+        el = soup.find(id=f"cphContent_ParcelOwnerInfo1_{suffix}")
+        return " ".join(el.get_text(" ").split()) if el else ""
+
+    street = " ".join(p for p in (span("lbAddress"), span("lbAddress2")) if p)
+    city, state = span("lbCity"), span("lbState")
+    zip5 = re.match(r"[0-9]{5}", span("lbZip"))
+    if not (street and city and state):
+        return None
+    tail = f"{state} {zip5.group(0)}" if zip5 else state
+    return f"{street}, {city}, {tail}"
+
+
 def parse_taxsifter_assessor(html: str) -> dict[str, str] | None:
     """{address, mailing?, value?} from an Assessor.aspx page; None without a situs."""
     soup = BeautifulSoup(html, "html.parser")
@@ -144,12 +170,9 @@ def parse_taxsifter_assessor(html: str) -> dict[str, str] | None:
         return None
     result = {"address": situs}
 
-    street = " ".join(p for p in (span("lbAddress"), span("lbAddress2")) if p)
-    city, state = span("lbCity"), span("lbState")
-    zip5 = re.match(r"[0-9]{5}", span("lbZip"))
-    if street and city and state:
-        tail = f"{state} {zip5.group(0)}" if zip5 else state
-        result["mailing"] = f"{street}, {city}, {tail}"
+    mailing = _mailing_from(soup)
+    if mailing:
+        result["mailing"] = mailing
 
     table = soup.find(id="cphContent_ctl00_dvMarketValues")
     if table is not None:
@@ -169,8 +192,10 @@ class TaxSifterClient:
     thread-safe by design: one client, one thread, one request at a time.
     """
 
-    def __init__(self, county: str):
-        origin = TAXSIFTER_ORIGINS.get(county.lower())
+    def __init__(self, county: str, *, parcel_site: bool = False):
+        # The two registries never leak into each other: a parcel-only portal (Whitman)
+        # is not an owner-name source, and an owner-name portal is not a parcel source.
+        origin = (TAXSIFTER_PARCEL_SITES if parcel_site else TAXSIFTER_ORIGINS).get(county.lower())
         if origin is None:
             raise ValueError("no TaxSifter origin for this county")
         validate_scraping_target(origin, require_allowlisted=False, resolve=True)
@@ -189,10 +214,12 @@ class TaxSifterClient:
         if wait > 0:
             time.sleep(wait)
         try:
-            return self._session.request(
+            resp = self._session.request(
                 method, self._origin + path, timeout=settings.DEFAULT_TIMEOUT,
                 allow_redirects=False, **kwargs,
             )
+            self.last_status = resp.status_code  # lets a caller see a 403/429 refusal
+            return resp
         finally:
             self._last_request = time.monotonic()
 
@@ -216,8 +243,9 @@ class TaxSifterClient:
             return False
         target = urlparse(urljoin(self._origin + _DISCLAIMER_PATH, resp.headers.get("Location", "")))
         expected = urlparse(self._origin)
+        base = expected.path.rstrip("/").lower()  # Whitman serves the portal under /Taxsifter
         return (target.scheme, target.netloc) == (expected.scheme, expected.netloc) \
-            and target.path.lower() in _AGREED_PATHS
+            and target.path.lower() in {base + p for p in _AGREED_PATHS}
 
     def lookup(self, party_name: str | None) -> dict[str, str] | None:
         """{address, mailing?, value?} for a unique owner match; never a parcel."""
@@ -302,3 +330,203 @@ async def fill_addresses_by_owner(county: str, records: list) -> int:
     _logger.info("TaxSifter lookup (%s): found addresses for %d/%d records",
                  county, found, len(records))
     return found
+
+
+# ─── Parcel-keyed mailing (Whitman) ──────────────────────────────────────────
+#
+# The owner-name fill above never yields a parcel. This path is the other way round:
+# the lead already HAS a parcel (EagleWeb reads it off the recorder document), and the
+# county's own page is asked for that parcel's taxpayer mailing. Identity closes twice,
+# like pacs_parcel: the search must return exactly one assessor link whose
+# parcelNumber is ours, and that page must echo our parcel in lbParcelNumber. Same
+# outcome vocabulary as pacs_parcel: only ``found`` carries an address; ``none``,
+# ``parcel_not_found`` and ``parcel_mismatch`` are settled; ``ambiguous``, ``unparsed``,
+# ``request_failed`` and ``source_unavailable`` stay retryable.
+
+_RECORDS_FOUND_RE = re.compile(r"\b([0-9]{1,6})\s+records?\s+found\b", re.I)
+_PARCEL_CALL_BUDGET_S = 120.0  # same share of the recovery tick as a PACS county
+_PARCEL_LEASE_WAIT_S = 10.0
+_PARCEL_UNPARSED_STREAK_LIMIT = 3
+_BLOCK_STATUSES = (403, 429)
+
+
+def parse_parcel_results(html: str, parcel_key: str) -> tuple[str, tuple[str, str] | None]:
+    """(outcome, (keyId, parcelNumber)) for a parcel search, judged against ``parcel_key``
+    (already normalised). "0 records found" is the only proof of parcel_not_found; a page
+    without the record count is unparsed, never an answer about the parcel."""
+    from src.scrapers.enrichment.pacs import normalize_pacs_parcel
+    from src.scrapers.enrichment.pacs_parcel import PARCEL_NOT_FOUND, UNPARSED
+    from src.scrapers.enrichment.snohomish_assessor_roll import AMBIGUOUS, FOUND
+
+    soup = BeautifulSoup(html, "html.parser")
+    count = _RECORDS_FOUND_RE.search(" ".join(soup.get_text(" ").split()))
+    if count is None:
+        return UNPARSED, None
+    links: set[tuple[str, str]] = set()
+    for a in soup.select("div.result a[href]"):
+        u = urlparse(a.get("href", ""))
+        if u.scheme or u.netloc or not u.path.lower().endswith("assessor.aspx"):
+            continue
+        params = parse_qs(u.query, keep_blank_values=True)
+        keys, parcels = params.get("keyId", []), params.get("parcelNumber", [])
+        if len(keys) != 1 or len(parcels) != 1:
+            continue
+        if not (_DIGITS.fullmatch(keys[0]) and _DIGITS.fullmatch(parcels[0])):
+            continue
+        links.add((keys[0], parcels[0]))
+    # The count and the links must agree before anything is SETTLED (Codex P1): a page
+    # that claims records but yields no readable link is layout drift, not an answer.
+    if int(count.group(1)) == 0:
+        # Any result card at all (readable link or not) contradicts "0 records".
+        return (UNPARSED if links or soup.select("div.result") else PARCEL_NOT_FOUND), None
+    if not links:
+        return UNPARSED, None
+    hits = {link for link in links if normalize_pacs_parcel(link[1]) == parcel_key}
+    if not hits:
+        return PARCEL_NOT_FOUND, None  # only OTHER parcels (the portal's prefix match)
+    if len(hits) > 1:
+        return AMBIGUOUS, None
+    return FOUND, hits.pop()
+
+
+def parse_parcel_assessor(html: str, parcel_key: str):
+    """MailingAnswer for an Assessor.aspx page, which must name exactly our parcel."""
+    from src.scrapers.enrichment.pacs import normalize_pacs_parcel
+    from src.scrapers.enrichment.pacs_parcel import NONE, PARCEL_MISMATCH, UNPARSED
+    from src.scrapers.enrichment.snohomish_assessor_roll import FOUND, MailingAnswer
+
+    soup = BeautifulSoup(html, "html.parser")
+    echo = soup.find(id="cphContent_ParcelOwnerInfo1_lbParcelNumber")
+    if echo is None:
+        return MailingAnswer(UNPARSED)
+    if normalize_pacs_parcel(" ".join(echo.get_text(" ").split())) != parcel_key:
+        return MailingAnswer(PARCEL_MISMATCH)  # never an address off another parcel's page
+    if soup.find(id="cphContent_ParcelOwnerInfo1_lbAddress") is None:
+        return MailingAnswer(UNPARSED)
+    mailing = _mailing_from(soup)
+    if mailing is None:
+        return MailingAnswer(NONE)
+    return MailingAnswer(FOUND, mailing_address=mailing, role="taxpayer")
+
+
+def resolve_mailing(county: str, parcel_ids: list[str], *,
+                    time_budget_s: float = _PARCEL_CALL_BUDGET_S) -> dict:
+    """Taxpayer mailing for one county's parcels, keyed by CALLER id. Never raises.
+
+    Every requested id gets an answer; parcels this call did not reach (license switch,
+    lease, cooldown, budget, a block mid-pass) are ``source_unavailable`` so the caller
+    defers them. One stream fleet-wide per county (SourceAdmission), every request
+    spaced, a 403/429 stops the pass and cools the source.
+    """
+    from src.scrapers.enrichment.pacs import normalize_pacs_parcel
+    from src.scrapers.enrichment.pacs_parcel import (
+        PARCEL_NOT_FOUND,
+        REQUEST_FAILED,
+        UNPARSED,
+        query_digits,
+    )
+    from src.scrapers.enrichment.snohomish_assessor_roll import (
+        FOUND,
+        SOURCE_UNAVAILABLE,
+        MailingAnswer,
+    )
+    from src.scrapers.enrichment.source_admission import SourceAdmission
+    from src.scrapers.enrichment.source_health import (
+        SourceUnavailableError,
+        check_source_or_raise,
+        record_source_blocked,
+    )
+
+    county = (county or "").lower()
+    out = {pid: MailingAnswer(SOURCE_UNAVAILABLE) for pid in parcel_ids}
+    if county not in TAXSIFTER_PARCEL_SITES or not settings.COUNTY_GIS_RESTRICTED_MAILING_ENABLED:
+        return out
+    by_key: dict[str, list[str]] = {}
+    queries: dict[str, str] = {}  # key -> the longest caller spelling (zeros kept)
+    for pid in parcel_ids:
+        key = normalize_pacs_parcel(pid)
+        if key is None:
+            out[pid] = MailingAnswer(PARCEL_NOT_FOUND)
+            continue
+        by_key.setdefault(key, []).append(pid)
+        q = query_digits(pid)
+        if len(q) > len(queries.get(key, "")):
+            queries[key] = q
+    if not by_key:
+        return out
+
+    source_key = f"taxsifter_{county}"
+    counts: dict[str, int] = {}
+    deadline = time.monotonic() + time_budget_s
+    with SourceAdmission(source_key, max_wait_s=_PARCEL_LEASE_WAIT_S) as admission:
+        if not admission.holds_lease:
+            _logger.info("%s: lease not held; %d parcel(s) deferred", source_key, len(by_key))
+            return out
+        try:
+            check_source_or_raise(source_key)
+            client = TaxSifterClient(county, parcel_site=True)
+            if not client._accept_disclaimer():
+                if getattr(client, "last_status", None) in _BLOCK_STATUSES:
+                    record_source_blocked(source_key, "TaxSifter disclaimer HTTP 403/429")
+                _logger.warning("%s: disclaimer not accepted; %d parcel(s) deferred",
+                                source_key, len(by_key))
+                return out
+        except SourceUnavailableError as exc:
+            _logger.info("%s: %s; %d parcel(s) deferred", source_key, exc, len(by_key))
+            return out
+        except Exception as exc:  # noqa: BLE001 -- a source problem defers, never raises
+            _logger.warning("%s unavailable: %s", source_key, type(exc).__name__)
+            return out
+
+        def _page(path: str, **params):
+            """(response, blocked) for one spaced GET; None response on transport error."""
+            try:
+                resp = client._get(path, **params)
+            except Exception as exc:  # noqa: BLE001
+                _logger.warning("%s request %s", source_key, type(exc).__name__)
+                return None, False
+            if resp.status_code in _BLOCK_STATUSES:
+                return None, True
+            if not client._html_ok(resp) or _AGREE_FIELD in resp.text:
+                return None, False  # an error page or a bounce back to the disclaimer
+            return resp, False
+
+        streak = 0
+        reserve = 2 * (_SPACING_S + settings.DEFAULT_TIMEOUT)
+        for i, (key, callers) in enumerate(by_key.items()):
+            if i and time.monotonic() + reserve > deadline:
+                break
+            if not admission.still_held():
+                break
+            resp, blocked = _page(_RESULTS_PATH, q=queries[key])
+            answer = None
+            if not blocked and resp is not None:
+                outcome, link = parse_parcel_results(resp.text, key)
+                if outcome != FOUND:
+                    answer = MailingAnswer(outcome)
+                elif time.monotonic() > deadline:
+                    break  # the second request would overrun the budget: defer this parcel
+                elif admission.still_held():
+                    resp, blocked = _page(_ASSESSOR_PATH, keyId=link[0], parcelNumber=link[1],
+                                          typeID="1")
+                    if not blocked and resp is not None:
+                        answer = parse_parcel_assessor(resp.text, key)
+                else:
+                    break
+            if blocked:
+                record_source_blocked(source_key, "TaxSifter HTTP 403/429")
+                _logger.warning("%s blocked; pass stopped", source_key)
+                break
+            if answer is None:
+                answer = MailingAnswer(REQUEST_FAILED)
+            for pid in callers:
+                out[pid] = answer
+            counts[answer.outcome] = counts.get(answer.outcome, 0) + 1
+            streak = streak + 1 if answer.outcome == UNPARSED else 0
+            if streak >= _PARCEL_UNPARSED_STREAK_LIMIT:
+                _logger.error("%s: %d unparsed pages in a row; layout drift, pass stopped",
+                              source_key, streak)
+                break
+    # Counts only: no parcels, no addresses, no names in logs.
+    _logger.info("%s: %d parcel(s) requested, outcomes %s", source_key, len(by_key), counts)
+    return out

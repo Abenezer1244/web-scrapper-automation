@@ -699,6 +699,8 @@ _BULK_MAILING_SOURCES: dict[str, str] = {
     "clark_WA": "clark_pic",
     "thurston_WA": "thurston_assessor",
     **{f"{c}_WA": f"pacs_{c}" for c in _PACS_MAILING_COUNTIES},
+    # Whitman: parcel-keyed on its TerraScan TaxSifter (taxsifter.resolve_mailing).
+    "whitman_WA": "taxsifter_whitman",
 }
 _BULK_MAILING_COUNTIES: frozenset[str] = frozenset(_BULK_MAILING_SOURCES)
 # Answered from a local snapshot, so asking again costs the county nothing and an
@@ -721,6 +723,7 @@ _SETTLED_NO_MAILING: frozenset[str] = frozenset({"none", "parcel_not_found", "pa
 # Thurston carry no such clause on their pages.
 _BULK_MAILING_LICENSE_RESTRICTED: frozenset[str] = frozenset({
     "snohomish_WA", "clark_WA", "grant_WA", "whatcom_WA", "island_WA", "chelan_WA",
+    "whitman_WA",
 })
 
 
@@ -755,6 +758,10 @@ def _resolve_bulk_mailing(county_key: str, parcel_ids: list[str]) -> dict:
             from src.scrapers.enrichment.pacs_parcel import resolve_mailing as _pacs
 
             return _pacs(county_key[: -len("_WA")], parcel_ids)
+        if source.startswith("taxsifter_"):
+            from src.scrapers.enrichment.taxsifter import resolve_mailing as _taxsifter
+
+            return _taxsifter(county_key[: -len("_WA")], parcel_ids)
         if source == "snohomish_assessor_roll":
             from src.scrapers.enrichment.snohomish_assessor_roll import resolve_mailing
         elif source == "clark_pic":

@@ -23,12 +23,26 @@ file contains.
 """
 from typing import Literal
 
-from sqlalchemy import and_, func, or_
+from sqlalchemy import and_, func, not_, or_
 
+from src.api.lead_actionability import has_address_condition
 from src.db.models import Result
 
 ResultsCategory = Literal["new", "already_delivered"]
 DEFAULT_RESULTS_CATEGORY: ResultsCategory = "new"
+
+# What the Results LIST may page through: the two lead categories, plus the rows
+# the run-count breakdown names "no_address" (no usable property AND no mailing
+# address). Those are not leads, so they exist only here, to be looked at: the CSV,
+# the export URL and contact lookups keep validating ResultsCategory and refuse it.
+ResultsListCategory = Literal["new", "already_delivered", "no_address"]
+
+
+def no_address_condition():
+    """Exactly the run breakdown's first branch (``NOT address_actionable_sql``):
+    every row of the job with neither address, whatever else is true of it. No
+    duplicate or superseded exclusion, because the breakdown applies none either."""
+    return not_(has_address_condition())
 
 
 def already_delivered_condition():

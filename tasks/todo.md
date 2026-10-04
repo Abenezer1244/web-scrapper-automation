@@ -1,30 +1,49 @@
-# Mailing follow-ups (2026-10-03)
+# Results run summary UX (2026-10-03)
 
-Branch `fix/mailing-followups-2026-10-03` (from origin/main `9933c203`), worktree `C:/Users/Windows/bl-wt/mailing-audit`.
-Owner: "Complete these" (5 follow-ups from the 10-03 backfill session).
+Branches `fix/results-run-summary-ux` in BE worktree `C:/Users/Windows/bl-wt/run-summary-be` (base `76c8fa08`) and FE worktree `C:/Users/Windows/bl-wt/run-summary-fe` (base `9ee1f9b6`). No merge, no deploy.
 
-## Evidence gathered (read-only, prod via `railway ssh --service worker`)
-- **TaxSifter owner fill** (`taxsifter.fill_addresses_by_owner`, Okanogan + Douglas only): writes addresses + `assessed_value`, no `mailing_source`; flags stay NULL because the TaxSifter situs is street-only, so `property_state` is never set (`address_intel.compute_owner_flags` needs it for out_of_state and for absentee when streets match).
-- **King code_violation `37014cb9`** (1,756 rows, 635 mailing): the Seattle SDCI parcel-locate step (`enrich.py:1249+`, 420 s budget) reached only ~308 rows (357 `address_mismatch`, ~812 never reached). Unreached rows are only ever revisited by a MANUAL script (`scripts/backfill_king_code_violation_mailing.py`); there is a beat sweep for CV owner NAMES (`cv_owner_recovery`) but none for CV mailing. Root cause = no second look, not a source outage.
-- **Pierce**: 200 done rows without mailing, not 96: 96 have a parcel but no deferral marker and no recovery outcome (never retried, jobs since 06-23); 104 have no parcel (cannot be looked up). 4 parcels are 9 digits (Pierce = 10).
-- **Kitsap / Whitman / Douglas**: prod has NO Kitsap or Douglas configs, and Whitman's single probate config has never finished a job, so there are zero rows to fill. Legal: Kitsap "No one is permitted to sell this information except in accordance with a written agreement with Kitsap County" (RCW 42.56.070(9)); Whitman GIS "cannot be ... used to generate commercial mailing lists"; Douglas hub "requires permission".
-- **Okanogan**: 43 rows, 0 parcels. No verified parcel source for a name-only probate lead (bulk `parcels.zip` 404; recorder index has no parcel field). "Never a parcel from a name" stands.
+Owner report: "Complete · 0 new / Of 71 records found: 71 No address 0 New leads" over a table saying "No records found."
 
-## Phase 1 — code (≤5 files)
-- [ ] 1a. `taxsifter.fill_addresses_by_owner`: stamp `mailing_source=taxsifter_<county>` when it fills mailing, `property_source=taxsifter_<county>` when it fills the situs; set `property_state='WA'` ONLY when this helper filled the situs and the row has no state (never overwrite; the TaxSifter site only lists its own WA county). Flags then come from the existing end-of-job recompute. Tests: provenance stamped / not stamped on a partial fill, out-of-state mailing + WA situs → out_of_state_owner True, existing state untouched.
-- [ ] 1b. King CV mailing recovery beat sweep: the "second look" for rows the job's 420 s budget never reached, reusing `king_parcel_locate.resolve_code_violation_mailing` and the guarded write already in `scripts/backfill_king_code_violation_mailing.py` (move that write into the worker module; script calls it). Bounded per tick, shared King lease + the existing `source_health` cooldown on 403/429 (same pattern as `cv_owner_recovery`), never parcel_id/dedup/billing. Eligibility = terminal job, no parcel_id, no mailing, no `kc_pin_status` (the step stamps every row it decides), so a decided row is never re-asked. Per-tick log: attempted / found / blocked / remaining. Semantics match the existing mailing recovery: a done job's enrichment may continue in the background. + beat entry + tests (lease held elsewhere, cooldown, guarded no-op write, repeat tick).
-- [ ] Verify: targeted pytest on the isolated test DB, Codex review, CI.
+## Verified so far (from code)
+- The six-bucket partition already exists (`src/api/run_breakdown.py`): one SQL CASE, first match wins, so rows land in exactly one bucket. `_invalid()` rejects any snapshot whose buckets do not add up to `records_found`. A live read has `dropped_before_save=None` (no total) for retried runs or ones with no `records_found`.
+- `no_address` = NOT (usable property_address OR usable mailing_address). The placeholder `(enrichment unavailable)` counts as no address. It is checked FIRST, so a no-address row is never counted as a duplicate or as over quota. It does NOT mean "parcel not found": the parcel can resolve while both addresses stay empty.
+- `dropped_before_save` = living-owner Transfer-on-Death exclusions plus repeat filings merged at save time.
+- The 71 rows are KEPT in `results` (lead_actionability.py). The list endpoint hides them through `actionable_condition()`, so there is no way to look at them today.
+- The table's "No records found." describes the NEW-leads list, not the scrape.
+- The prod trace of the 71-record run was BLOCKED (auto-mode denied production reads). Script ready: `scratchpad/diag_run71.py` (read-only, MIGRATE role, readonly session, no PII printed). Needs an owner run.
 
-## Phase 2 — ops on prod (owner approval per item, dry run first)
-- [ ] 2a. Pierce: `scripts/requeue_gis_mailing_recovery.py --counties pierce` (DB-only markers) → the existing paced recovery sweep looks them up. Targets only the 96 rows WITH a parcel (the 104 without stay excluded). The 4 nine-digit parcels: check Pierce GIS read-only; leave them to the sweep's own parcel_not_found outcome, never zero-pad.
-- [ ] 2b. King CV: let the new sweep drain `37014cb9` (or run the existing backfill with `--limit`, paced 0.35 s; King has rate-blocked us twice).
+## Prod trace of the run (owner ran the read-only diag, 2026-10-03)
+- Job `6b1f3445`: Island WA probate, rolling_90 (07/05 to 10/03), finished 05:50 UTC. Snapshot: found 71 = dropped 0 + no_address 71 + merged 0 + delivered 0 + over_quota 0 + new 0. It reconciles, and record/billed count is 0.
+- All 71 rows: parcel_id NULL, property NULL, mailing NULL, no placeholder, no duplicates. The recording index has no parcel (EagleWeb parcel-less county). 37 probate_death_inheritance + 34 tod_living_owner_estate_planning (TOD deed / PR deed / death certificate).
+- The only address path is `enrich.py:1137` (PACS search by owner name). Log: "Found 0/71 addresses via PACS" in 23 s. The code says Island searches take 10–18 s each, so 71 names / 5 workers should take minutes. The 23 s points to fast failures.
+- **ROOT CAUSE (probed the public portal 2026-10-03):** the search POST now answers `302 → SearchResults.aspx`, and an unrelated GET then hit `302 → customdisplay.htm?aspxerrorpath=` (ASP.NET error page). `lookup_pacs_by_name` posts with `allow_redirects=False` and returns None on any non-200 (pacs.py:348). Every exception is also None (pacs.py:361). So "portal changed/erroring" is indistinguishable from "no match", and the run logged "Enrichment complete: addresses added".
+- Verdict: **71 is correct; 0 is NOT a trustworthy answer**. It is a silent enrichment failure, not proof the records lack addresses.
+- Side defect: `doc_type` stores "Transfer on Death Deed\n4606292" (the instrument number is glued on).
 
-- [ ] 2c. Stamp the 1 historical TaxSifter-filled Okanogan row (guarded single UPDATE: provenance + property_state + recomputed flags).
+## Codex consult (high) — GATE FAIL, reconciled
+- P1 the no_address list/count must bypass actionable_condition → planned (own branch + own count query)
+- P1 the superseded population → the no_address list uses the partition's first branch exactly, with no superseded exclusion
+- P1 snapshot vs live drift (backfill) and P1 tax-cap drift → the summary shows the frozen number and the tab shows the live count. A one-line note appears when they differ. The tax cap stays on the list (owner rule: "never shown").
+- P2 "couldn't be matched to a property" overclaims → the copy becomes "had no property or mailing address". The per-row reason comes from parcel_id: "Not matched to a parcel" / "No address on file for this parcel".
+- P3 tenant tests + keep no_address out of the download/export/contact-lookup category → adopted
 
-## Not doing (owner to confirm)
-- Kitsap / Whitman / Douglas sources: zero leads today + license terms that need an owner/legal decision. Revisit when a customer runs one of them. Whitman's only config is the owner's admin config from 10-02 whose one job was CANCELLED that day (not a failing source), so no gating change (Codex P1 disputed with this evidence).
-- Okanogan parcel source: none exists for name-only leads. Owner option: request the county's parcel file (Okanogan GIS, (509) 422-7123; FTP okgis.ddns.net). Until then 1a is the only automatic path. A county file only helps if it links owners to parcels AND its terms allow commercial use.
+## Plan (owner approved 2026-10-03: separate PACS PR first; store per-row outcome; keep tax cap; no unmatched CSV)
+- [x] 0. Owner ran the diag; root cause = PACS search redirect read as "no match" (see above)
+- [x] PACS PR (branch fix/pacs-owner-search-redirect, worktree bl-wt/pacs-redirect, commit 9cae2a66): post_search follows the same-origin 302; found/no_match/failed; enrichment_data.pacs_name_lookup; honest step + completion lines
+- [x] BE-1 results_category: ResultsListCategory + no_address_condition (list only)
+- [x] BE-2 get_results: no_address branch, own no_address_count, schema field
+- [x] BE-3 tests/test_results_no_address.py (Island 71/71, list == breakdown bucket on every row kind, tax cap, search, 422 on export/download/quote, tenant 404)
+- [x] FE-1 types regen + ResultsCategory/ResultsListCategory split; lib/run-summary.ts + node:test (12)
+- [x] FE-2 RunSummary / RunOutcomes (Live page too)
+- [x] FE-3 page: one new-lead count, Run complete + icon, 3 tabs, CSV gating (csvHasRows vs tabHasLeads), EmptyNewLeads
+- [x] FE-4 table copy per view, per-row reason, "No address" badge
+- [x] V-1 tsc/eslint/next build; pytest subsets (PACS 1257 passed; UX 845 passed after supplying BL_TEST_REDIS_SERVER); Playwright 95/95 at 7 widths
+- [x] V-2 Codex: consult FAIL->reconciled; PACS review FAIL->PASS; UX review NO-GO->(3 passes)->PASS
 
+## Review
+- 71 was right; 0 was not a trustworthy answer: a silent enrichment failure (PACS 302), now visible per row and in the run log.
+- No new taxonomy: the six-bucket partition already reconciled. The UX now words it honestly ("had no property or mailing address", never "couldn't be matched"), puts new leads first, gives every outcome a way to inspect it, and stops saying "No records found" on a run that found records.
+- Follow-ups: Island throttle (pacing + budget + deferral for the owner-name path); re-run 6b1f3445's records after the PACS PR deploys; FE PR must wait for the BE schema merge (types gate).
 
 # Mailing-address forensic audit (2026-10-02)
 

@@ -19,6 +19,57 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-10-03/04 — "71 found, 0 new, No records found": the run summary, and the lookup that never answered
+
+> Owner report: an Island probate run read "Complete · 0 new / Of 71 records found: 71 No address 0
+> New leads" over a table saying "No records found." Traced the run first (owner ran a read-only diag;
+> my own prod read was denied by auto mode), then fixed the data defect and the page as two PRs.
+
+**Built / Shipped (branches, not merged):**
+- **BE `fix/pacs-owner-search-redirect`** (`9cae2a66`): `pacs.post_search` follows the portal's
+  same-origin 302 for BOTH PACS paths; `lookup_pacs_by_name` returns found / no_match / failed;
+  enrichment writes `enrichment_data.pacs_name_lookup` per row, counts failures in the step line,
+  and the completion line no longer says "addresses added" over rows with no address at all.
+- **BE `fix/results-run-summary-ux`**: `GET /jobs/{id}/results?category=no_address` (list only:
+  export, download and contact lookups still refuse it) + `no_address_count`.
+- **FE `fix/results-run-summary-ux`**: `lib/run-summary.ts` (all the wording, `node --test`),
+  RunSummary (found -> new leads, biggest -> each outcome with View/Review -> "All N accounted
+  for"), "Run complete" with an icon, New / Already delivered / No address tabs, an empty state in
+  place of the empty table, the CSV disabled when the tab has nothing, a per-row reason, and a
+  "No address" badge (the rows used to be badged "New").
+
+**Tried / Decided:**
+- No new taxonomy. `run_breakdown.py` already sorts every record into exactly one bucket and
+  refuses snapshots that do not sum to `records_found`; the defect was the words and the missing
+  way to inspect the bucket.
+- "No address" in the backend means NO property AND NO mailing address, checked first. Copy says
+  exactly that; "couldn't be matched to a property" was rejected (Codex P2): a parcel can match
+  and still have no address. The per-row reason distinguishes lookup failed / no property under
+  the name / no address on file / not matched to a parcel, from stored facts only.
+- The no-address list keeps the owner's 18-month tax cap; the summary says when the live list
+  differs from the frozen count.
+
+**Failed / Blocked:**
+- Auto mode denied my read-only prod query; the owner ran it. Full local pytest hit the 1 h
+  background limit at 29% (shared box); ran every affected file instead.
+- **Island throttles**: after one request, requests within seconds get a 302 to the ASP.NET error
+  page. The owner-name path still fires 5 unpaced workers, so many lookups will now be reported as
+  failed. Not fixed: needs pacing + a budget + deferral (follow-up).
+
+**Caught & fixed:** Codex: batch `fut.result(timeout=30)` labelled slow successes failed (P1);
+`is_actionable` counted quota markers as missing addresses; a failed save logged as found; CSV
+gating hid contact lookups under a tax filter, then mis-gated under search (P1 x2). Playwright:
+the "NEW" badge on not-a-lead rows. A harness artifact: Playwright's fullPage screenshot drops
+`pointer: coarse` emulation, so touch targets measured 28 px in a reused tab.
+
+**Facts learned:**
+- Root cause of 71 -> 0: job `6b1f3445` (Island WA probate, 07/05-10/03): 71 parcel-less recording
+  index rows (TOD deeds, PR deeds, death certificates); the ONLY address path is the PACS
+  owner-name search, which answered every POST with a 302 the code treated as "no match"
+  (0/71 in 23 s; real searches take 10-18 s each).
+- `doc_type` on Island rows carries the instrument number (`Transfer on Death Deed` followed by `4606292` on a second line).
+- `.env*` files are unreadable to the agent: pass `next dev` its env inline.
+
 ## 2026-10-04 — Mailing follow-ups: Douglas + Whitman sources, a King extract outage, the code-violation second look
 
 > Owner: "Complete these" (the 10-03 follow-ups), "build all three" (Kitsap, Whitman,

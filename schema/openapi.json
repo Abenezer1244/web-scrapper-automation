@@ -4062,6 +4062,11 @@
             "title": "New Count",
             "type": "integer"
           },
+          "no_address_count": {
+            "default": 0,
+            "title": "No Address Count",
+            "type": "integer"
+          },
           "page": {
             "title": "Page",
             "type": "integer"
@@ -8551,7 +8556,8 @@
               "default": "new",
               "enum": [
                 "new",
-                "already_delivered"
+                "already_delivered",
+                "no_address"
               ],
               "title": "Category",
               "type": "string"

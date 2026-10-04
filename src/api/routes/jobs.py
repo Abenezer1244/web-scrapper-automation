@@ -48,8 +48,10 @@ from src.api.quota import run_eligibility
 from src.api.results_category import (
     DEFAULT_RESULTS_CATEGORY,
     ResultsCategory,
+    ResultsListCategory,
     already_delivered_condition,
     category_condition,
+    no_address_condition,
 )
 from src.api.results_sort import DEFAULT_RESULTS_SORT, ResultsSort, results_order_by
 from src.api.routes.auth_helpers.registration import _integrity_error_fields
@@ -539,7 +541,10 @@ async def get_results(
     sort: ResultsSort = Query(DEFAULT_RESULTS_SORT),
     # Which bucket to list: the run's new leads (default) or the rows an earlier
     # run of this account already delivered. Allowlisted; anything else is a 422.
-    category: ResultsCategory = Query(DEFAULT_RESULTS_CATEGORY),
+    # ``no_address`` lists the rows the run breakdown counts under that name (no
+    # property AND no mailing address), so its "N had no address" can be checked.
+    # List only: the CSV, export URL and contact lookups still take ResultsCategory.
+    category: ResultsListCategory = Query(DEFAULT_RESULTS_CATEGORY),
 ) -> ResultsPage:
     # Rate-limit before the (expensive, multi-query) read to prevent DB-amplification DoS.
     await rate_limit(request, zone="general", identifier=current_user.id)
@@ -590,7 +595,7 @@ async def get_results(
     base_query = select(Result).where(
         Result.job_id == job_id,
         Result.user_id == current_user.id,
-        category_condition(category),
+        no_address_condition() if category == "no_address" else category_condition(category),
     )
     if not _run_delivered(job):
         # N-03: rows exist from `saving` on, but the quota reservation marks the
@@ -628,7 +633,9 @@ async def get_results(
     # Standing product rule (owner, 2026-09-02): a row with no property AND no
     # mailing address is not a lead — not listed, exported, counted or billed.
     # Kept in `results` for dedup/health only. See src/api/lead_actionability.py.
-    base_query = base_query.where(actionable_condition())
+    # The no_address list is, by definition, the rows this rule excludes.
+    if category != "no_address":
+        base_query = base_query.where(actionable_condition())
 
     # Tier 0 (057): owner-location filters (absentee / out-of-state). Same view
     # semantics as the tax filters — narrows total + items, leaves scrape stats.
@@ -781,6 +788,17 @@ async def get_results(
     new_count = counts_row.new_leads
     same_run_duplicate_count = counts_row.same_run
     already_delivered_count = counts_row.already_delivered
+    # The no_address tab number: the list's own predicate before view filters,
+    # tax cap included like already_delivered_count. Its own statement because
+    # counts_row is scoped to actionable rows, which this set never is (Codex P1).
+    no_address_count = (await db.execute(
+        select(func.count()).where(
+            Result.job_id == job_id,
+            Result.user_id == current_user.id,
+            no_address_condition(),
+            tax_cap_condition(today),
+        )
+    )).scalar_one()
     delivered_buckets = {
         bucket: getattr(counts_row, f"delivered_{bucket}") for bucket, _ in _CONTACT_BUCKETS
     }
@@ -1021,6 +1039,7 @@ async def get_results(
         unattributed_duplicate_count=unattributed_duplicate_count,
         same_run_duplicate_count=same_run_duplicate_count,
         already_delivered_count=already_delivered_count,
+        no_address_count=no_address_count,
         already_delivered_contacts=already_delivered_contacts,
         has_auction_data=has_auction_data,
         auction_coverage=auction_coverage,

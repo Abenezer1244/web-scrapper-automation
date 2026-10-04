@@ -19,6 +19,91 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-10-04 — SEO: from a 53 audit to crawlable, canonical, structured; 16 county pages (FE only)
+
+> The owner ran `/seo` on bridgeleads.io (score 53/100; Lighthouse mobile perf 73 / a11y 96 / BP 100 /
+> SEO 91), then asked to "get it to 100". Four stacked FE PRs, one phase each, Codex consulted on the
+> plan and gating every diff. Plan and per-phase notes: `bridgeleads-web` `tasks/todo-seo-100.md`.
+> No backend code changed.
+
+**Built / Shipped (all FE, OPEN, owner merges in order #222 → #223 → #224 → #225):**
+- **#222 crawl files:** `/robots.txt` and `/sitemap.xml` 307'd to /login. Neither file existed, and
+  `proxy.ts` guards every path not on PUBLIC_ROUTES. The matcher's `public/` exclusion never matched
+  (public files are served at the root), so it was removed. Adds `app/robots.ts`, `app/sitemap.ts`,
+  `lib/site.ts` + root `metadataBase`, and replaces the root description's old "Scrape…" copy.
+- **#223 share + schema:** per-page canonical (`alternates.canonical: "./"`), a 1200×630 link-preview card
+  (`app/opengraph-image.tsx`, the pillar still + hero line), Organization/WebSite JSON-LD, pricing
+  SoftwareApplication offers built from the same `PLANS` the cards render, noindex on the auth group.
+- **#224:** pricing toggle label white on teal (4.09:1 → 4.83:1, a11y → 100); `llms.txt` from the same
+  constants; the still pillar where WebGL renders on the CPU (SwiftShader/llvmpipe/softpipe/Basic Render
+  Driver, which includes PageSpeed's servers).
+- **#225:** `/coverage/{county}-county-wa` for all 16 live counties: each live record type with its
+  source host, pre-foreclosure documents, partial-coverage notes, a map with the county lit, and the
+  3 nearest live counties; BreadcrumbList; ISR hourly. `/coverage` links them and the sitemap lists them.
+- Vercel Preview env: `API_URL=https://api.bridgeleads.io` (owner OK, all previews). Before this,
+  every preview's `/coverage` said "loading slowly" and the county pages 500'd.
+
+**Tried / Decided:**
+- County pages: I recommended 4 pages (King, Pierce, Snohomish, Clark: genuinely different data) plus a
+  richer /coverage. The owner chose all 16. The 12 recorder-only pages share ~70% of their structure;
+  this is recorded on the PR as a ranking risk, not hidden.
+- A WA county that isn't live renders a noindex page, not a 404 (a county pausing for a day shouldn't
+  churn the index); a junk slug 404s. The page THROWS when the API returns null, on purpose: ISR then
+  keeps the last good page, where a rendered fallback would be cached for an hour over a good one.
+- Perf target: the owner kept the live pillar. The measured ceiling is low-to-mid 80s mobile; we stopped
+  there (owner took the recommendation) rather than refactor the landing's hydration.
+- Filing counts per county ("214 probate filings in 90 days") NOT built: `ENABLE_DAILY_SCRAPE=false`
+  on prod worker + beat, so `county_records` holds only what users ran. Counts would measure our
+  customers, not the county.
+- Sources are shown as real hostnames, not agency names I would have had to guess.
+
+**Failed / Blocked:**
+- **Pillar deferral (start three.js after `load` + idle): no effect, reverted.** `load` fires ~630 ms,
+  so three.js still started at 640–1100 ms, and TBT didn't move (interleaved 3×3 runs).
+- **A botched revert.** `git revert -q … | tail` failed silently, and the `--amend` that followed
+  relabelled the DEFERRAL commit as "Revert …" while keeping its code. Caught by `git diff --stat`
+  before push, reset to the pushed commit, reverted properly.
+- My first SwiftShader commit message and code comment claimed headless Chrome renders on the CPU and
+  that the check saved ~500 ms. Wrong: locally headless used the Intel Iris Xe GPU. Corrected in a
+  follow-up commit; the measured SwiftShader result is: still loads, no three.js, perf 83, TBT 286.
+- The prod DB read to check `county_records` completeness was denied by the permission classifier; not
+  pursued (the ENABLE_DAILY_SCRAPE finding answered it anyway).
+- No local tsc/eslint/build: the main FE checkout's node_modules is stale (next 16.1.7, no @types, eslint
+  missing a dep) and C: had 2.1 GB free. Verified via CI + Vercel previews + `vercel curl` instead.
+- The PageSpeed API was out of anonymous quota; Lighthouse 12 ran locally instead.
+
+**Caught & fixed (each only by curling the preview, not by reading code):**
+- Inside the `(marketing)` route group, Next 16 serves `opengraph-image` at
+  `/opengraph-image-<hash of the group path>`, which the exact PUBLIC_ROUTES entry missed → 307 to
+  /login. Moved to the `app/` root.
+- The marketing layout's `openGraph` object REPLACED the root's, dropping the og:image Next attaches at
+  the image's own segment, so no og:image was emitted. Shared openGraph/twitter now live in the root layout.
+- Codex P1 "canonical './' resolves to / on every page" was disproven by the preview (Next resolves it
+  against the request pathname: `accumulateMetadata` passes one pathname to every segment). Codex P1
+  "tuple type error in centre()" was disproven by the type-checked Vercel build.
+
+**Pending / Handoff:**
+- Owner: merge #222→#225 in order; #223–#225 get CI `check` (lint + tsc) only once their base becomes
+  master, so wait for it. Then submit the sitemap in Search Console.
+- Owner-only items still capping the score: the legal entity name + the other privacy/terms placeholders;
+  a real mailbox (no MX on .io or .com); a `www` DNS record (NXDOMAIN today); About-page facts.
+- `app.bridgeleads.io` serves the whole marketing site; #223's canonicals point it at bridgeleads.io.
+  A redirect would be stronger.
+- Mobile perf beyond the mid-80s needs less hydration JS on the landing (server-render or lazy-load the
+  below-the-fold client sections).
+
+**Facts learned:**
+- The FE proxy runs on every root-level file: anything a signed-out visitor or a crawler must fetch
+  (robots, sitemap, llms.txt, opengraph-image) must be on PUBLIC_ROUTES or served from `/_next/static`.
+- The pillar's cost is real hardware cost: ~400–500 ms of TBT on an Intel iGPU (production, WebGL on
+  71/74 vs off 82/87). The remaining lab floor is React hydration of ~10 landing client components plus
+  a 153 KB HTML parse.
+- Local Lighthouse noise is ±7 points per run here; only interleaved medians mean anything. SSO previews
+  are reachable with `vercel env run` + `--extra-headers` `x-vercel-trusted-oidc-idp-token`.
+- Long branch names get a hashed preview alias; find it with `vercel ls`, not by guessing the URL.
+
+---
+
 ## 2026-10-04 — Contact lookup follow-ups A-C: no more 500 on a malformed run id, honest grant comments, a rate bucket for the lookup reads
 
 > The three candidates the Phase 1 handoff left (§7.4), all taken at the owner's word ("complete 1-3 with

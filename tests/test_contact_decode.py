@@ -68,6 +68,22 @@ def mode(request, monkeypatch):
     return request.param
 
 
+@pytest.fixture(autouse=True)
+def _leave_skip_trace_cache_as_found():
+    """conftest's teardown does not clear skip_trace_cache, and several cases here
+    write to it (directly, or through the copy and ingest paths). Remove exactly the
+    rows each test added, so no case or later suite reads another's entries."""
+    with system_sync_session() as db:
+        before = list(db.execute(text("SELECT address_hash FROM skip_trace_cache")).scalars())
+    yield
+    with system_sync_session() as db:
+        db.execute(
+            text("DELETE FROM skip_trace_cache WHERE NOT (address_hash = ANY(:keep))"),
+            {"keep": before},
+        )
+        db.commit()
+
+
 def _enc_json(value) -> str:
     return encrypt_field(json.dumps(value))
 
@@ -579,7 +595,7 @@ async def test_tracerfy_ingest_stores_ciphertext_and_reads_back_clean(
     assert stored["phone"].startswith("fe1:") and is_encrypted(stored["phone"])
     assert is_encrypted(stored["phones"]) and is_encrypted(stored["emails"])
     with system_sync_session() as db:
-        cached = db.execute(  # only what this ingest wrote; other cases leave rows behind
+        cached = db.execute(  # only what this ingest wrote
             text("SELECT phone, phones FROM skip_trace_cache WHERE fetched_at >= :t"),
             {"t": started},
         ).all()

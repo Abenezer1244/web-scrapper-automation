@@ -5875,6 +5875,41 @@ comments + the FE drift gate), described as a comment refresh. Amendments (super
   status AND list 429, the results list still 200; 60 results reads → the 61st 429, status and list
   still 200. The log replay stays in `general` (unchanged, not separately tested: AW7).
 - After merge: an FE types-regen PR (the 429 descriptions are generated comments; the FE drift gate).
+- Codex diff review r1 **GATE: GO**, no findings. Mutation 3/3 killed (zone back to `general`, budget
+  61, added to `_FALLBACK_ZONES`). Regression: 22 files, 588 passed.
+
+### A-C MERGED + LIVE (2026-10-04)
+Each under the standing rule: CI green on the exact head, quiet 4×0, main unchanged, Codex GO,
+`--match-head-commit`; "merging" / "verified" to every peer. GitHub requires a BE branch to be up to
+date with main, so every merge ahead of a PR meant a rebase, a byte-identical diff proof (`index`
+lines stripped, `cmp`), a Codex re-check and a fresh CI run (A once onto `fbf32759`; C onto
+`9386949b` and `65de11fe`; B onto `9386949b`, `65de11fe` and `9e4a0b1c`).
+**Rule breach (B):** after B's LAST rebase (onto `9e4a0b1c`, head `8881d9cf`) the byte-identical proof
+was made and CI ran green, but the Codex re-check was SKIPPED before the merge. Codex checked it after
+the fact, in the review of this close-out PR (result below in the Review).
+- **A, BE #444**: merge `9386949b` (07:05:27Z). api / worker / beat SUCCESS, `/health` 200; live:
+  `GET /jobs/not-a-uuid/download` = 404 "Job not found", `GET /jobs/not-a-uuid` unauthenticated = 401.
+  The first quiet run showed 1 live job + 1 lock: waited ~4 min until 4×0 rather than redeploy under it.
+- **C, BE #448**: merge `9e4a0b1c` (GitHub `mergedAt` 09:09:24Z; the commit is stamped 09:09:23Z). api / worker / beat SUCCESS, `/health` 200; the lookup
+  list unauthenticated = 401. **FE #213** (types regen, 2 comment lines): merge `98ff5ed`, FE CI `check`
+  + Vercel SUCCESS. tsc + eslint run locally; a local `next build` was skipped (disk at 99%, a comment-
+  only change) and the Vercel build of the PR stood in for it.
+- **B, BE #445**: merge `7d97e795` (09:40:22Z). api / worker / beat SUCCESS, `/health` 200.
+- Peers' #446, #449 (a King extract hotfix, given priority) and #447 merged between them.
+
+### Review: Phase 1 follow-ups A-C (2026-10-04)
+- **Done:** all three handoff §7.4 candidates, as the owner asked. For an authenticated caller, a malformed run
+  id is a 404 on all seven routes that take one (unauthenticated stays 401, except download: 404 either
+  way) (not six: Codex's consult found dialer-replay); download links survive any
+  spelling of the run id. The scripts state the system role's real DELETE grants. The lookup reads
+  have their own 60/min bucket, so the 1c page's polling and its results table cannot starve each other.
+- **Mistakes, recorded:** one regression chunk ran without `BL_TEST_REDIS_SERVER` (a false failure,
+  passed once set). While freeing disk I deleted `bl-fe-lookup1c/.next` after misreading a link check
+  (`cmd //c dir /AL .` from Git Bash lists `C:\Program Files\Git`, not the cwd); it was real build output
+  (`du` 460 MB, which a junction would not report) and the main FE checkout and the other worktrees'
+  `.next` were intact afterwards.
+- **Not built (owner's call):** the same malformed-id 500 on `/scrapers/{scraper_id}` routes
+  (`get_scraper`, `delete_scraper`, `update_scraper`, csv-layout) and `GET /scrapers/{config_id}/records`.
 
 ## Safety PR: Alembic can never reach production from a test or a stray CLI run (PLAN, 2026-09-27)
 

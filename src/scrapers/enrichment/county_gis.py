@@ -146,6 +146,41 @@ _KNOWN_GIS_ENDPOINTS: dict[str, dict] = {
             "SITUS_STREET_SUFFIX,SITUS_STREET_UNIT,SITUS_CITY,SITUS_ZIP_CODE"
         ),
     },
+    # Douglas County — the county's public "Parcels_view_(Joined)" layer: its parcels
+    # joined with the Assessor roll (2026-10-03: no token, Query capability, 2,000
+    # records per page). Before this entry Douglas fell to the WA statewide layer,
+    # which for Douglas carries no situs city/ZIP and no mailing at all, so moving
+    # the situs here loses nothing.
+    #
+    # Verified on a 2,000-row sample: Address1..Zip is the TAXPAYER mailing block
+    # (owner states include NY/WY/ID/AZ for parcels that are all in Douglas WA; PO
+    # boxes), never the situs. Like Cowlitz, the street usually sits in Address2 while
+    # Address1 holds an addressee line, so Address2 is tried first and Address1 only
+    # when it independently looks like a street. ParcelNumb is an 11-digit string, the
+    # same id the statewide layer used. Zip is passed through as published: the two
+    # 4-digit values in the sample were a WA typo and an Australian postcode, so
+    # zero-padding would corrupt a real foreign address.
+    #
+    # LICENSE: the county's data hub lists this dataset as "requires permission";
+    # owner cleared RCW 42.56.070 for all counties 2026-10-02 and asked for Douglas
+    # 2026-10-03. Restricted like the other taxpayer blocks; see _effective_gis_config.
+    "douglas_WA": {
+        "endpoint": (
+            "https://services2.arcgis.com/fjst9C4kBtvXuiLQ/arcgis/rest/services"
+            "/Parcels_view_(Joined)/FeatureServer/0/query"
+        ),
+        "parcel_field": "ParcelNumb",
+        "address_field": "Situs",
+        # Situs is street-only and the layer has no situs city/state/zip columns; the
+        # state is WA by construction (Douglas County's own service).
+        "situs_part_fields": [None, None, None],
+        "situs_state_literal": "WA",
+        "mailing_street_fields": ["Address2", "Address1"],
+        "mailing_locality_fields": ["City", "State", "Zip"],
+        "out_fields": "ParcelNumb,Situs,Address1,Address2,City,State,Zip",
+        "mailing_license_restricted": True,
+        "situs_only_out_fields": "ParcelNumb,Situs",
+    },
 }
 
 _MAILING_KEYS = ("mailing_street_fields", "mailing_locality_fields", "mailing_fields")
@@ -1238,6 +1273,10 @@ def _compose_mailing(attrs: dict, gis_config: dict) -> str | None:
         return _attr_text(attrs, locality[i]) if i < len(locality) else None
 
     city, state, zipcode = _loc(0), _loc(1), _loc(2)
+    if zipcode:
+        # "98802-0000": a +4 of 0000 is a placeholder, never a real add-on (40% of
+        # the Douglas roll publishes it). The ZIP itself is kept; a real +4 is kept.
+        zipcode = re.sub(r"^(\d{5})-0000$", r"\1", zipcode)
     tail = ", ".join(p for p in (city, state) if p)
     if zipcode:
         tail = f"{tail} {zipcode}".strip()

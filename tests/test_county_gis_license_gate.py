@@ -11,7 +11,7 @@ import pytest
 from src.config import settings
 from src.scrapers.enrichment import county_gis as cg
 
-_RESTRICTED = ("snohomish", "cowlitz")
+_RESTRICTED = ("snohomish", "cowlitz", "douglas")
 
 
 @pytest.mark.parametrize("county", _RESTRICTED)
@@ -27,7 +27,8 @@ def test_mailing_is_off_by_default_but_situs_lookup_remains(county):
 def test_gated_counties_request_no_owner_or_taxpayer_columns():
     for county in _RESTRICTED:
         fields = cg._effective_gis_config(f"{county}_WA")["out_fields"].lower()
-        assert "taxpr" not in fields and "deed_holder" not in fields, county
+        for owner_column in ("taxpr", "deed_holder", "address1", "address2"):
+            assert owner_column not in fields, (county, owner_column)
 
 
 def test_the_mailing_recovery_sweep_skips_gated_counties():

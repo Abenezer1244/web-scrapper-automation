@@ -5744,6 +5744,118 @@ re-quote cases. The rest of the 1c section and its amendments are consistent.
 - BUILD_JOURNAL entry for 1c written (owner-approved), in this close-out PR.
 - **Phase 1 is COMPLETE.** Next work is the owner's pick (candidates: handoff §7.4).
 
+## Phase 1 follow-ups A-C (PLAN, 2026-10-04, BEFORE the Codex consult)
+Owner (2026-10-04): "complete 1-3 with codex in the loop" = all three handoff §7.4 candidates,
+including C, which the 1c plan had deferred until real 429s appeared. Three PRs, in order A, B, C;
+each: consult → build → Codex three-dot review to GATE: GO → CI on the exact head → quiet → merge.
+
+### A: a malformed `job_id` is 404 "Job not found" on every `/jobs/{job_id}` route, never a 500
+**Facts (main `76c8fa08`):** `Job.id` is `UUID(as_uuid=False)` (`models.py:82`). Six routes put the
+raw path string into `Job.id == job_id` with no validation: `get_job` (jobs.py:452), `cancel_job`
+(:473), `get_results` (:509), `stream_logs` (:1934), `get_export_url` (:2138), `download_export`
+(:2273). A non-UUID reaches Postgres as a uuid cast → DataError → 500 (to be PROVEN by a failing
+test first). The quote / confirm / list routes already call `_canonical_job_id` (:1137): malformed →
+404 "Job not found"; the status route uses `_canonical_lookup_id` (its own 404 body) and stays.
+**Design:** `job_id = _canonical_job_id(job_id)` in each of the six, before the first DB or Redis use
+of `job_id`; after the existing rate-limit call where one comes first (a malformed flood still spends
+budget). Side effects, both intended: a non-canonical spelling (upper case, braces, no hyphens) of a
+real id now resolves to that id; `stream_logs` subscribes to the canonical `job_logs:{id}` channel the
+worker publishes on, and `get_export_url` mints the token with the canonical id, so the download's
+`payload["job_id"] != job_id` check compares canonical with canonical.
+`download_export`: canonicalize FIRST, before the token / bearer resolution (open question Q1).
+**Files (3):** `src/api/routes/jobs.py`, `tests/test_jobs_malformed_job_id.py` (NEW), this plan.
+**Tests (real PG + Redis, through the API client):** for each of the six routes, `not-a-uuid` (and
+`''`-free variants: `123`, a 37-char near-UUID) → 404 `{"detail": "Job not found"}`; RED first on
+main (500 or an escaped DataError). An upper-case spelling of the caller's OWN job → the same answer
+as the canonical id (GET /jobs/{id} 200, same body); another tenant's job id, any spelling → 404
+(no cross-tenant change). download: malformed + valid bearer → 404; malformed + a download token
+minted for a real job → 404, not 403/500. Mutation: drop the call in each route (6 mutants).
+
+### B: the stale "DELETE=False on every table" comments
+**Facts:** `scripts/deactivate_test_batch_configs.py:5` and `scripts/purge_test_batch_configs.py:56`
+say `bridgeleads_system` has DELETE on NO table. Since the cutover it holds DELETE on exactly the 8
+tables in `scripts/verify_worker_delete_grants.py::REQUIRED_DELETE_TABLES` (delivered_records,
+county_records, property_list_membership, mfa_backup_codes, mfa_break_glass_codes,
+pending_registrations, skip_trace_cache, pending_skip_trace_rows). Of the purge's cascade it can
+delete only `pending_skip_trace_rows`; not scraper_configs, jobs, results, job_logs or the rest. The deactivate docstring also cites
+`scrapers.py:399` for the soft delete; it is now ~:492.
+**Design:** reword both to the true, narrower claim (no DELETE on the tables THIS script touches;
+its DELETE grants are the short list in `verify_worker_delete_grants.py`), cite the function name
+(`delete_scraper` in `src/api/routes/scrapers.py`) instead of a line number. Comments only: no
+behaviour change; the purge still needs the elevated role (it deletes from jobs / results).
+**Files (3):** the two scripts, this plan. **Verify:** py_compile, ruff, grep; no tests (no code).
+
+### C: a dedicated `lookup_read` rate bucket for the two lookup reads
+**Facts:** `_lookup_read_rate_limit` (jobs.py:1794) spends from `general` (60/min per user, fails
+OPEN), shared with the results list, the log replay and the rest of the app. The 1c page polls the
+status every 15 s (60 s after a 429) and re-reads the list on events: ~4.25 req/min per open page.
+The quote has its own zone (`lookup_quote`, 10/min, fail-closed). openapi.json's two 429
+descriptions say "the account's general budget, 60 per minute".
+**Design:** `_ZONES["lookup_read"] = (60, 60)`, per user, NOT in `_FALLBACK_ZONES` (fails open like
+`general`: a read buys nothing; the stall-proceeds rule stays). Status + list share it (one bucket).
+Effect: polling can no longer starve the results table / log replay, and they cannot starve the
+progress panel. The two 429 descriptions updated → `schema/openapi.json` regenerated (with `$PY`)
+→ an FE types-regen PR right after the merge.
+**Files (5):** `src/api/middleware/rate_limit.py`, `src/api/routes/jobs.py`, `schema/openapi.json`,
+`tests/test_contact_lookup_status.py` (the 60/min test moves to the new zone; new: 60 lookup reads
+then the results list still 200, and 60 results reads then the status still 200), this plan.
+Mutation: zone name back to `general`; budget 60→61; add to `_FALLBACK_ZONES`.
+
+### Questions for the consult
+1. A, download: canonicalize before auth (an unauthenticated malformed id gets 404, not 401) or after?
+2. A: anything that relies on the non-canonical spelling today (emailed download links, the FE)?
+3. A: any `/jobs/{job_id}` route or helper I missed (batches? segments? `_canonical_lookup_id`)?
+4. B: is the narrower wording true for the purge's full cascade list, including pending_skip_trace_rows?
+5. C: 60/min right? Fail open right? Should `general`'s log-replay / results also be split (no: scope)?
+6. C: does the openapi description change really alter the generated FE types (regen PR needed)?
+
+### Codex pre-code consult r1 on A-C (2026-10-04): PLAN: REVISE, 2 P1 + 4 P2 + 1 P3, all adopted
+Output: `<scratchpad 0ad15ad1>/codex_fu_consult_r1_out.txt`. Facts verified (the 500 path: a
+DataError-family error that `src/api/errors.py` does not class as DB-unavailable → the generic 500
+handler). Answers: Q1 canonicalize first in download; Q2 emailed links carry `str(job.id)` (canonical);
+Q5 60/min, fail open, results + log replay stay in `general`; Q6 the regen IS needed (generated
+comments + the FE drift gate), described as a comment refresh. Amendments (supersede A-C above):
+- **AW1 (P1) A has SEVEN routes:** `POST /scrapers/{config_id}/jobs/{job_id}/dialer-replay`
+  (`scrapers.py:1328`) compares raw `Job.id == job_id` and `DialerDelivery.job_id == job_id`. Canonicalize
+  `job_id` AND `config_id` there (same statement: a malformed config id is the same 500), after its
+  rate-limit call, 404 "Job not found". Files for A become 4: + `src/api/routes/scrapers.py`.
+- **AW2 (P1) the 500 is AUTHENTICATED-only:** `CurrentUser` runs before the handler, so an unauthenticated
+  malformed id stays 401 on the six authenticated routes (unchanged, pinned by a test). download today:
+  no auth 401, a real-job download token 403, a valid bearer 500. New precedence, pinned: download
+  canonicalizes FIRST, so malformed + (no auth | bearer | download token) are all 404.
+- **AW3 (P2) download token comparison:** compare the CANONICAL token claim with the canonical path
+  (an unparseable claim → the existing 403). Test: a token whose claim is a non-canonical spelling of
+  the real id is accepted (the 48 h emailed link path, `_user_from_download_token`).
+- **AW4 (P2) B wording:** "`bridgeleads_system` cannot delete from the purge's config / job / result /
+  log tables (its only DELETE grant in this cascade is `pending_skip_trace_rows`); the purge runs on
+  `DATABASE_URL_MIGRATE`." Never "no DELETE on any table it touches".
+- **AW5 (P2) B has THREE scripts:** + `scripts/diag_config_delete_blast_radius.py:3-4` (also cites
+  `scrapers.py:399`). Every such line reference → `delete_scraper` in `src/api/routes/scrapers.py`.
+  Files for B: 4 (three scripts + this plan).
+- **AW6 (P2) C tests not vacuous:** each bucket proven to CHARGE: 60 lookup reads → the 61st lookup read
+  429 (status and list share it), and then the results list still 200; separately 60 results reads → the
+  61st results read 429, and then the status still 200. Fresh user per test (own Redis keys).
+- **AW7 (P3) C's claim narrowed:** isolation is proven for the results list only; the log replay is
+  "unchanged, still `general`" (not separately tested).
+
+### Codex consult r2 on A-C (2026-10-04): PLAN: REVISE, 1 P1 + 3 P2 + 2 P3, all adopted IN PLACE here
+- **AX1 (P1)** A's tests and mutations cover all SEVEN routes (wherever A above says "six"): malformed
+  `job_id` on each; dialer-replay ALSO malformed `config_id`; the upper-case own-job spelling and the
+  cross-tenant id on each; mutation = drop the call per route (7) + dialer-replay's config_id call (8).
+- **AX2 (P2)** dialer-replay uses the REASSIGNED canonical `job_id` everywhere after the call: the two
+  queries, `process_dialer_outbox.delay(job_id)` and the returned `{"job_id": job_id}`.
+- **AX3 (P2)** AW2's 401 pin covers dialer-replay too: unauthenticated malformed → 401; authenticated → 404.
+- **AX4 (P2)** the claim canonicalization lives in `_user_from_download_token`: a missing, non-string or
+  unparseable `job_id` claim → the existing 403 "Token not valid for this job", never a 500. Tested.
+- **AX5 (P3)** AW4 reads "the destructive `--apply` purge runs on `DATABASE_URL_MIGRATE`" (a dry run uses
+  the ordinary session).
+- **AX6 (P3)** C also rewords the docs that name `general` for the lookup reads: the
+  `_lookup_read_rate_limit` docstring and the `rate_limit.py` comment near :200.
+- **Deferred (logged, NOT in A):** the same malformed-id 500 likely exists on `/scrapers/{scraper_id}`
+  routes (`get_scraper`, `delete_scraper`, `update_scraper`, csv-layout) and `GET
+  /scrapers/{config_id}/records` (raw `str` path params into UUID columns). A separate PR if the owner
+  wants it.
+
 ## Safety PR: Alembic can never reach production from a test or a stray CLI run (PLAN, 2026-09-27)
 
 The Deferred bullet below, taken now. Same class as the two production wipes.

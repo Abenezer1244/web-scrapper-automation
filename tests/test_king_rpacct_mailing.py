@@ -501,3 +501,70 @@ def test_a_soft_time_limit_is_never_swallowed(monkeypatch, tmp_path):
     monkeypatch.setattr(mod, "download_extract", _limit)
     with pytest.raises(SoftTimeLimitExceeded):
         _REAL_CACHED_EXTRACT()
+
+
+# ─── download size (2026-10-04) ──────────────────────────────────────────────
+
+class TestExtractDownloadSize:
+    """The RPAcct extract is ~18 MB, past safe_get's 16 MiB page default; every refresh
+    failed for two weeks. Real HTTP, real streaming cap; only the URL validator is
+    bypassed (the SSRF guard has its own suite, and CI must not depend on DNS)."""
+
+    @staticmethod
+    def _plain_transport(monkeypatch):
+        """Stand in for the SSRF layers (URL validator + pinned transport), which refuse
+        loopback by design and have their own suite in test_safe_http.py. The streaming
+        size cap under test (_read_capped) stays real."""
+        import requests
+
+        from src.utils import safe_http
+
+        monkeypatch.setattr(safe_http, "validate_scraping_target", lambda *a, **kw: None)
+        monkeypatch.setattr(safe_http, "_get", lambda url, **kw: requests.get(url, **kw))
+
+    def _serve(self, body: bytes, declared: int | None = None):
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        class _H(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Type", "application/zip")
+                self.send_header("Content-Length", str(declared or len(body)))
+                self.send_header("Last-Modified", "Sat, 26 Sep 2026 00:33:20 GMT")
+                self.end_headers()
+                if declared is None:
+                    self.wfile.write(body)
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _H)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return server, f"http://127.0.0.1:{server.server_port}/Real%20Property%20Account.zip"
+
+    def test_an_extract_larger_than_the_page_default_downloads(self, monkeypatch, tmp_path):
+        import os
+
+        src = _extract(tmp_path, [_acct("090400", "0025", "PO BOX 5003", "BELLEVUE WA", "98009")])
+        with zipfile.ZipFile(src, "a") as zf:      # pad past 16 MiB, incompressible
+            zf.writestr(zipfile.ZipInfo("padding.bin"), os.urandom(17 * 1024 * 1024))
+        body = src.read_bytes()
+        assert len(body) > 16 * 1024 * 1024
+        server, url = self._serve(body)
+        self._plain_transport(monkeypatch)
+        try:
+            dest = tmp_path / "out.zip"
+            assert kr.download_zip(url, dest, kr._csv_name, "King RPAcct") == "2026-09-26"
+            assert dest.read_bytes() == body
+        finally:
+            server.shutdown()
+
+    def test_the_cap_is_still_a_hard_bound(self, monkeypatch, tmp_path):
+        server, url = self._serve(b"", declared=kr._EXTRACT_MAX_BYTES + 1)
+        self._plain_transport(monkeypatch)
+        try:
+            with pytest.raises(Exception, match="too large"):
+                kr.download_zip(url, tmp_path / "out.zip", kr._csv_name, "King RPAcct")
+        finally:
+            server.shutdown()

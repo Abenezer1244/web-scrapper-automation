@@ -60,6 +60,14 @@ class Answer:
     mailing_address: str | None = None
 
 
+# Ceiling for one Assessor extract download. safe_get's default (16 MiB) is sized for
+# pages, and the RPAcct extract outgrew it: 18,644,053 bytes on 2026-09-26, after which
+# every refresh failed ("Response body too large") and no row got extract mailing after
+# 2026-09-17 (King code-violation job 37014cb9 logged 0 of ~300 located). Still a hard
+# bound, with headroom over today's largest extract (3.5x).
+_EXTRACT_MAX_BYTES = 64 * 1024 * 1024
+
+
 def download_zip(url: str, dest: Path, check: Callable[[zipfile.ZipFile], object],
                  label: str, timeout: int = 300) -> str:
     """Download a King Assessor extract zip to ``dest``; return its Last-Modified date.
@@ -68,7 +76,8 @@ def download_zip(url: str, dest: Path, check: Callable[[zipfile.ZipFile], object
     the expected member: a moved file or an error page must fail loudly, not look like
     "the county has no data for any parcel".
     """
-    resp = safe_get(url, headers={"User-Agent": "Mozilla/5.0 BridgeLeads/1.0"}, timeout=timeout)
+    resp = safe_get(url, headers={"User-Agent": "Mozilla/5.0 BridgeLeads/1.0"}, timeout=timeout,
+                    max_bytes=_EXTRACT_MAX_BYTES)
     if resp.status_code != 200:
         raise RuntimeError(f"{label} download returned HTTP {resp.status_code}")
     body = resp.content

@@ -64,7 +64,7 @@ from src.config.constants import (
 from src.db import CountyConnector
 from src.db.models import BatchRun, Job, Result, ScraperBatch, ScraperConfig
 from src.scrapers.probate import new_probate_config_tod_default
-from src.utils.contact_decode import clean_phone_type, decode_scalar
+from src.utils.contact_decode import clean_phone_type, decode_array, decode_scalar
 from src.utils.lead_export import resolve_hidden_output_fields
 from src.utils.logger import setup_logger
 from src.utils.source_dates import is_auction_date_fallback
@@ -1087,12 +1087,19 @@ async def _leads_page(
     for r in rows:
         data = dict(r._mapping)
         data["id"] = str(data["id"])
-        # Raw text() SQL: no column type runs, so the contact goes through the one
-        # decoder (UX 3.8s2). An unreadable value is None + a WARNING naming the
-        # lead and field, never ciphertext and never a failed page.
-        data["phone"], _ = decode_scalar(data.get("phone"), field="phone", lead_id=data["id"])
-        data["email"], _ = decode_scalar(data.get("email"), field="email", lead_id=data["id"])
-        data["phone_type"], _ = clean_phone_type(data.get("phone_type"), lead_id=data["id"])
+        # Raw text() SQL: no column type runs, so every contact goes through the one
+        # decoder (UX 3.8s2, arrays 3.8a). An unreadable value is None + a WARNING
+        # naming the lead and field, never ciphertext and never a failed page, and
+        # the row says so (contact_decode_failed) without touching skip_trace_status.
+        lead = data["id"]
+        data["phone"], bad_phone = decode_scalar(data.get("phone"), field="phone", lead_id=lead)
+        data["email"], bad_email = decode_scalar(data.get("email"), field="email", lead_id=lead)
+        data["phone_type"], bad_type = clean_phone_type(data.get("phone_type"), lead_id=lead)
+        data["phones"], bad_phones = decode_array(data.get("phones"), kind="phones", lead_id=lead)
+        data["emails"], bad_emails = decode_array(data.get("emails"), kind="emails", lead_id=lead)
+        data["contact_decode_failed"] = any(
+            (bad_phone, bad_email, bad_type, bad_phones, bad_emails)
+        )
         # Honor the batch's output-field visibility exactly like the CSV
         # (of the hideable set, only mailing_address is a combined-view column).
         if "mailing_address" in hidden:

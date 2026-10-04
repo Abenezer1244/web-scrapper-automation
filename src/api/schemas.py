@@ -1137,6 +1137,12 @@ class BatchDetailResponse(BatchSummaryResponse):
     delivery_counts: BatchDeliveryCounts | None = None
 
 
+class PhoneContact(BaseModel):
+    """One skip-traced phone. ``type`` is Mobile|Landline|VoIP|null."""
+    number: str
+    type: str | None = None
+
+
 class BatchLeadRow(BaseModel):
     """One combined-view lead — mirrors the combined CSV's columns."""
 
@@ -1159,14 +1165,45 @@ class BatchLeadRow(BaseModel):
     # account (the Results page's already-delivered rule, results_category). A combined set spans all child rows, so without
     # this an already-delivered property reads as a fresh lead.
     already_delivered: bool = False
+    # Multi-contact (up to 3 each), decoded like ResultRow.phones / .emails. The
+    # scalar phone / email stay the primary values.
+    phones: list[PhoneContact] | None = Field(
+        default=None,
+        description=(
+            "Up to 3 skip-traced phones of the row this lead shows. null when the row "
+            "has no list (never looked up, purged, or unreadable); [] when a lookup "
+            "found none."
+        ),
+    )
+    emails: list[str] | None = Field(
+        default=None,
+        description="Up to 3 skip-traced emails of the row this lead shows; same null / [] rules as phones.",
+    )
     # Contact provenance of the row this lead shows, same vocabulary as ResultRow:
     # not_attempted|queued|submitted|hit|miss|errored|purged.
-    skip_trace_status: str = "not_attempted"
+    skip_trace_status: str = Field(
+        default="not_attempted",
+        description=(
+            "Skip-trace status of the row whose contact values are shown (the property's "
+            "representative row), the same row-level meaning as ResultRow.skip_trace_status. "
+            "The representative is chosen by the scalar phone / email only, so a sibling "
+            "row with arrays but no scalar never displaces it. A decode failure never "
+            "changes this value."
+        ),
+    )
     skip_trace_attempted_at: datetime | None = None  # when the answer was obtained
     # True when the contact is the account's OWN earlier answer copied onto this
     # row with no new lookup bought (results.skip_trace_source = 'reused'). This is
     # how a batch with skip tracing off can still show a contact: the UI must say so.
     contact_reused: bool = False
+    contact_decode_failed: bool = Field(
+        default=False,
+        description=(
+            "True when a stored contact value of this row could not be read and was "
+            "dropped (phone, email, phone_type, phones incl. a phone's type, or emails). "
+            "Show the contact as unavailable, never as a lookup result."
+        ),
+    )
 
 
 class BatchQuality(BaseModel):
@@ -1744,12 +1781,6 @@ class JobResponse(BaseModel):
             records_found=self.records_found,
         )
         self.progress_label = self.stage_label
-
-
-class PhoneContact(BaseModel):
-    """One skip-traced phone. ``type`` is Mobile|Landline|VoIP|null."""
-    number: str
-    type: str | None = None
 
 
 class ResultRow(BaseModel):

@@ -21,12 +21,13 @@ Important boundaries:
 import json
 from typing import Any
 
-from sqlalchemy.types import Text, TypeDecorator
+from sqlalchemy.types import String, Text, TypeDecorator
 
-# NOTE: src.utils.crypto is imported LAZILY inside the bind/result methods, not at
-# module top level. alembic/env.py imports Base (-> models -> this module) for every
-# Alembic command; a top-level crypto import would instantiate Settings (SECRET_KEY,
-# REDIS_URL, ...) and break migration-only environments that only provide the DB URL.
+# NOTE: src.utils.crypto (and src.utils.contact_decode, which imports it) are imported
+# LAZILY inside the bind/result methods, not at module top level. alembic/env.py
+# imports Base (-> models -> this module) for every Alembic command; a top-level
+# crypto import would instantiate Settings (SECRET_KEY, REDIS_URL, ...) and break
+# migration-only environments that only provide the DB URL.
 
 
 class EncryptedString(TypeDecorator):
@@ -76,3 +77,61 @@ class EncryptedJSON(TypeDecorator):
             return None
         from src.utils.crypto import decrypt_field
         return json.loads(decrypt_field(value))
+
+
+# ─── Contact columns (UX 3.8s1) ───────────────────────────────────────────────
+# A lead's contact PII reaches clients (Results, run CSVs, scheduled R2 exports,
+# deliveries, the dialer) through ORM reads of these columns, so the read side runs
+# the one contact decoder (src.utils.contact_decode): a value that cannot be read
+# becomes None and is logged, instead of leaking ciphertext (tolerant mode) or
+# failing the whole read (strict mode). The bind side, and the stored bytes, are
+# exactly the parent types'. A type cannot see its row, so its log line names the
+# column only.
+#
+# Only Result uses these. SkipTraceCache deliberately keeps the plain types: its
+# cache-hit copy derives hit/miss from the values it reads, so a scrub there would
+# turn a corrupt entry into a fabricated miss; the residue it may copy is scrubbed
+# when the Result is read.
+
+
+class EncryptedContactString(EncryptedString):
+    """``EncryptedString`` for a contact scalar (``phone`` / ``email``)."""
+
+    cache_ok = True
+
+    def __init__(self, field: str, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.field = field
+
+    def process_result_value(self, value: Any, dialect: Any) -> str | None:
+        from src.utils.contact_decode import decode_scalar
+        return decode_scalar(value, field=self.field)[0]
+
+
+class EncryptedContactJSON(EncryptedJSON):
+    """``EncryptedJSON`` for a contact array (``phones`` / ``emails``)."""
+
+    cache_ok = True
+
+    def __init__(self, kind: str, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.kind = kind
+
+    def process_result_value(self, value: Any, dialect: Any) -> Any:
+        from src.utils.contact_decode import decode_array
+        return decode_array(value, kind=self.kind)[0]
+
+
+class ContactLabel(TypeDecorator):
+    """A plain-text contact label column (``phone_type``), cleaned on read.
+
+    Not encrypted (the label is not PII). Storage and bind are a plain ``String``;
+    the read side drops residue and blanks with the decoder's phone type rule.
+    """
+
+    impl = String
+    cache_ok = True
+
+    def process_result_value(self, value: Any, dialect: Any) -> str | None:
+        from src.utils.contact_decode import clean_phone_type
+        return clean_phone_type(value)[0]

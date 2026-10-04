@@ -1,7 +1,7 @@
 """ONE-TIME, DESTRUCTIVE: hard-delete the 12 test batch-child scraper_configs.
 
 The product has NO hard-delete path — DELETE /scrapers/{id} sets active=False and
-says "preserves job history" (src/api/routes/scrapers.py:399). This bypasses that
+says "preserves job history" (`delete_scraper` in src/api/routes/scrapers.py). This bypasses that
 deliberately, at explicit user request, after the blast radius was measured and
 confirmed twice:
 
@@ -53,10 +53,14 @@ from src.db.session import system_sync_session
 def elevated_session():
     """Session on DATABASE_URL_MIGRATE — the `postgres` role used for migrations.
 
-    Required because the ordinary app role (`bridgeleads_system`) has DELETE=False
-    on EVERY table: least privilege deliberately makes a hard delete impossible
-    from normal ops paths. This is the sanctioned elevated credential already in
-    the environment, so nothing new is provisioned to run this.
+    Used only by the destructive `--apply` run (a dry run reads on the ordinary
+    session). Required because the ordinary app role (`bridgeleads_system`) cannot
+    delete from this purge's config / job / result / log tables: least privilege
+    deliberately makes a hard delete impossible from normal ops paths. Its only DELETE
+    grant in this cascade is `pending_skip_trace_rows` (the full list:
+    `REQUIRED_DELETE_TABLES` in scripts/verify_worker_delete_grants.py). This is the
+    sanctioned elevated credential already in the environment, so nothing new is
+    provisioned to run this.
     """
     raw = os.environ.get("DATABASE_URL_MIGRATE")
     if not raw:

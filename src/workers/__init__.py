@@ -61,6 +61,9 @@ app = Celery(
         # without this line (#436), and beat's ticks were dropped as unregistered;
         # tests/test_beat_schedule.py now fails for any beat task missing from here.
         "src.workers.data_quality",
+        # King code-violation mailing recovery (locate + extract mailing for rows the
+        # job's budget never reached): a BEAT task, same trap as above.
+        "src.workers.cv_mailing_recovery",
     ],
 )
 

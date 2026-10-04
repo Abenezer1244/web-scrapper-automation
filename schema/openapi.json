@@ -132,6 +132,11 @@
       "BatchChildSummary": {
         "description": "One child scrape within a batch (county x record_type) and its job status.",
         "properties": {
+          "already_delivered_count": {
+            "default": 0,
+            "title": "Already Delivered Count",
+            "type": "integer"
+          },
           "config_id": {
             "title": "Config Id",
             "type": "string"
@@ -159,6 +164,11 @@
           "record_type": {
             "title": "Record Type",
             "type": "string"
+          },
+          "skip_trace_enabled": {
+            "default": false,
+            "title": "Skip Trace Enabled",
+            "type": "boolean"
           },
           "status": {
             "$ref": "#/components/schemas/JobStatus",
@@ -348,6 +358,16 @@
             "title": "Children",
             "type": "array"
           },
+          "children_done": {
+            "default": 0,
+            "title": "Children Done",
+            "type": "integer"
+          },
+          "children_failed": {
+            "default": 0,
+            "title": "Children Failed",
+            "type": "integer"
+          },
           "combined_export_ready": {
             "default": false,
             "title": "Combined Export Ready",
@@ -375,6 +395,11 @@
               }
             ],
             "title": "Completed At"
+          },
+          "contacts_looked_up": {
+            "default": 0,
+            "title": "Contacts Looked Up",
+            "type": "integer"
           },
           "counties": {
             "items": {
@@ -433,6 +458,11 @@
             ],
             "title": "Name"
           },
+          "new_records": {
+            "default": 0,
+            "title": "New Records",
+            "type": "integer"
+          },
           "record_types": {
             "items": {
               "type": "string"
@@ -443,6 +473,16 @@
           "run_status": {
             "$ref": "#/components/schemas/BatchRunStatus",
             "default": "pending"
+          },
+          "skip_trace": {
+            "default": "off",
+            "enum": [
+              "off",
+              "on",
+              "mixed"
+            ],
+            "title": "Skip Trace",
+            "type": "string"
           },
           "state": {
             "title": "State",
@@ -717,7 +757,7 @@
         "type": "object"
       },
       "BatchQuality": {
-        "description": "Data-quality facts over the whole combined set (one statement, see\nbatch_export._QUALITY_SQL). Plain counts, never a blended score: each check is\n\"N of M\" so the UI can state it as-is. Exclusive groups:\nnew_leads + already_delivered = leads; stacked + single_list + no_identity = leads.\n\nThe with_* fields measure the row each combined lead SHOWS (what the CSV and the\ntable deliver), not the best sibling row. Applicability (auction_applicable,\ntax_applicable) is per property. So a stacked lead whose probate row represents\nit counts as auction-applicable but missing its auction date: that is what the\nuser receives, and the check must not report a pass the file does not contain.",
+        "description": "Data-quality facts over the whole combined set (one statement, see\nbatch_export._QUALITY_SQL). Plain counts, never a blended score: each check is\n\"N of M\" so the UI can state it as-is. Exclusive groups:\nnew_leads + already_delivered + not_new_not_delivered = leads;\nstacked + single_list + no_identity = leads.\n\nThe with_* fields measure the row each combined lead SHOWS (what the CSV and the\ntable deliver), not the best sibling row. Applicability (auction_applicable,\ntax_applicable) is per property. So a stacked lead whose probate row represents\nit counts as auction-applicable but missing its auction date: that is what the\nuser receives, and the check must not report a pass the file does not contain.",
         "properties": {
           "already_delivered": {
             "default": 0,
@@ -752,6 +792,11 @@
           "no_identity": {
             "default": 0,
             "title": "No Identity",
+            "type": "integer"
+          },
+          "not_new_not_delivered": {
+            "default": 0,
+            "title": "Not New Not Delivered",
             "type": "integer"
           },
           "single_list": {
@@ -927,6 +972,16 @@
             "title": "Child Count",
             "type": "integer"
           },
+          "children_done": {
+            "default": 0,
+            "title": "Children Done",
+            "type": "integer"
+          },
+          "children_failed": {
+            "default": 0,
+            "title": "Children Failed",
+            "type": "integer"
+          },
           "combined_export_ready": {
             "default": false,
             "title": "Combined Export Ready",
@@ -954,6 +1009,11 @@
               }
             ],
             "title": "Completed At"
+          },
+          "contacts_looked_up": {
+            "default": 0,
+            "title": "Contacts Looked Up",
+            "type": "integer"
           },
           "counties": {
             "items": {
@@ -987,6 +1047,11 @@
             ],
             "title": "Name"
           },
+          "new_records": {
+            "default": 0,
+            "title": "New Records",
+            "type": "integer"
+          },
           "record_types": {
             "items": {
               "type": "string"
@@ -997,6 +1062,16 @@
           "run_status": {
             "$ref": "#/components/schemas/BatchRunStatus",
             "default": "pending"
+          },
+          "skip_trace": {
+            "default": "off",
+            "enum": [
+              "off",
+              "on",
+              "mixed"
+            ],
+            "title": "Skip Trace",
+            "type": "string"
           },
           "state": {
             "title": "State",

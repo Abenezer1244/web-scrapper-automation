@@ -1078,6 +1078,11 @@ class BatchChildSummary(BaseModel):
     job_id: str | None = None  # None until the dispatch worker creates the job
     status: JobStatus = JobStatus.PENDING  # a child IS a job, so it uses the job state machine
     record_count: int = 0
+    # Leads this child found that an EARLIER run already delivered (same per-row
+    # rules as record_count: actionable, inside the tax cap). The "275 already
+    # delivered" beside "15 new"; never summed into the batch's new figure.
+    already_delivered_count: int = 0
+    skip_trace_enabled: bool = False  # what this child was configured to do
 
 
 class BatchSummaryResponse(BaseModel):
@@ -1107,6 +1112,21 @@ class BatchSummaryResponse(BaseModel):
     combined_record_count: int | None = None
     created_at: datetime
     completed_at: datetime | None = None
+    # One batch = one run row on the dashboard. These let that row say "1 of 2
+    # complete" and "16 new" without loading every child (latest run only).
+    children_done: int = 0
+    children_failed: int = 0  # failed or cancelled: delivered nothing
+    # Sum of the DONE children's record_count: the new records each scrape was
+    # billed for, the same "15 new" / "1 new" each child shows. It counts records,
+    # not properties: one property new on two lists counts twice here, and once in
+    # the combined view (GET /leads quality.new_leads).
+    new_records: int = 0
+    # Skip tracing as CONFIGURED across the children: off, on, or mixed.
+    skip_trace: Literal["off", "on", "mixed"] = "off"
+    # Rows of the latest run's children answered by a lookup bought for them
+    # (results.skip_trace_source = 'lookup'). Execution, not configuration: a batch
+    # set "off" that shows a non-zero here is an anomaly, never hidden.
+    contacts_looked_up: int = 0
 
 
 class BatchDetailResponse(BatchSummaryResponse):
@@ -1135,8 +1155,8 @@ class BatchLeadRow(BaseModel):
     lead_subtype: str | None = None
     # Same meaning as ResultRow.date_is_auction_date: show date_recorded as blank.
     date_is_auction_date: bool = False
-    # Every row of this property was delivered to the account in an EARLIER run
-    # (none is new in this batch). A combined set spans all child rows, so without
+    # No row of this property is new, and an EARLIER run delivered it to the
+    # account (the Results page's already-delivered rule, results_category). A combined set spans all child rows, so without
     # this an already-delivered property reads as a fresh lead.
     already_delivered: bool = False
     # Contact provenance of the row this lead shows, same vocabulary as ResultRow:
@@ -1153,7 +1173,8 @@ class BatchQuality(BaseModel):
     """Data-quality facts over the whole combined set (one statement, see
     batch_export._QUALITY_SQL). Plain counts, never a blended score: each check is
     "N of M" so the UI can state it as-is. Exclusive groups:
-    new_leads + already_delivered = leads; stacked + single_list + no_identity = leads.
+    new_leads + already_delivered + not_new_not_delivered = leads;
+    stacked + single_list + no_identity = leads.
 
     The with_* fields measure the row each combined lead SHOWS (what the CSV and the
     table deliver), not the best sibling row. Applicability (auction_applicable,
@@ -1164,7 +1185,9 @@ class BatchQuality(BaseModel):
 
     leads: int = 0
     new_leads: int = 0
-    already_delivered: int = 0
+    already_delivered: int = 0  # an EARLIER run delivered it (duplicate_reason prior_run)
+    # Neither: only same-run siblings / superseded rows. Never handed over, never new.
+    not_new_not_delivered: int = 0
     stacked: int = 0          # same property on 2+ record types in this batch
     stacked_new: int = 0      # of those, with at least one row new to the account
     single_list: int = 0

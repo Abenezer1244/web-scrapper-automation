@@ -19,6 +19,7 @@ from typing import NamedTuple
 from sqlalchemy import select, text, update
 
 from src.api.lead_actionability import actionable_sql
+from src.api.results_category import already_delivered_sql
 from src.api.tax_filters import TAX_CAP_BIND, tax_cap_min_year, tax_cap_sql
 
 # Human-readable record-type labels. The private copy this replaces existed only
@@ -68,6 +69,9 @@ WITH candidates AS (
            r.absentee_owner, r.out_of_state_owner, r.owner_state,
            r.auction_date, r.default_amount, r.enrichment_data,
            r.property_key, r.is_duplicate,
+           -- The canonical "an EARLIER run delivered this" (results_category). Not
+           -- is_duplicate alone: same-run siblings and superseded rows carry it too.
+           {already_delivered_sql('r')} AS prior_delivered,
            -- Contact provenance (097/098): lookup = Tracerfy answered THIS row,
            -- reused = the account's own earlier answer copied free, NULL = none.
            r.skip_trace_status, r.skip_trace_source, r.skip_trace_attempted_at,
@@ -121,7 +125,8 @@ agg AS (
            -- only of already-delivered rows is not a new lead, and every count the
            -- user sees must say which is which (2026-10-04 audit: a batch showed
            -- 1 + 384 combined leads beside 15 + 1 new ones).
-           bool_or(NOT is_duplicate) AS has_new
+           bool_or(NOT is_duplicate) AS has_new,
+           bool_or(prior_delivered) AS has_prior
     FROM candidates
     GROUP BY bucket
 )"""
@@ -149,15 +154,17 @@ ranked AS (
 # drift from the exported file.
 # Containment (= ANY), not equality: the combined set is DEDUPED, so one lead
 # legitimately carries several record types / counties (that IS an overlap).
-# f_delivery: 'new' = the property has at least one row this run delivered for the
-# first time; 'delivered' = every row of it was delivered in an earlier run.
+# f_delivery: 'new' = the property has at least one row new to the account;
+# 'delivered' = no new row, and an EARLIER run delivered it (results_category).
+# A property made only of same-run siblings / superseded rows is neither.
 _VIEW_FILTERS = """
   AND (CAST(:f_record_type AS text) IS NULL
        OR CAST(:f_record_type AS text) = ANY(a.matched_record_types))
   AND (CAST(:f_county AS text) IS NULL
        OR CAST(:f_county AS text) = ANY(a.source_counties))
   AND (CAST(:f_delivery AS text) IS NULL
-       OR (CAST(:f_delivery AS text) = 'new') = a.has_new)
+       OR (CAST(:f_delivery AS text) = 'new' AND a.has_new)
+       OR (CAST(:f_delivery AS text) = 'delivered' AND NOT a.has_new AND a.has_prior))
 """
 
 _COMBINED_SQL = _COMBINED_CTES + _RANKED_CTE + """
@@ -174,7 +181,7 @@ SELECT rk.id, rk.date_recorded, rk.date_recorded_parsed, rk.party_name, rk.heirs
        -- from the synthetic tax date after the tax bill_year is coalesced in (Codex).
        rk.record_type,
        a.matched_record_types, a.overlap_count, a.source_counties, a.lead_subtype,
-       NOT a.has_new AS already_delivered,
+       (NOT a.has_new AND a.has_prior) AS already_delivered,
        rk.skip_trace_status, rk.skip_trace_source, rk.skip_trace_attempted_at
 FROM ranked rk
 JOIN agg a ON a.bucket = rk.bucket
@@ -224,7 +231,7 @@ WHERE (NOT :overlaps_only OR (a.bucket LIKE 'pk:%' AND a.overlap_count >= 2))
 # bucket shows up here as missing them, which is the truth about the file.
 _QUALITY_SQL = _COMBINED_CTES + _RANKED_CTE + """,
 q AS (
-    SELECT rk.*, a.has_new, a.overlap_count, a.matched_record_types,
+    SELECT rk.*, a.has_new, a.has_prior, a.overlap_count, a.matched_record_types,
            a.delinquent_amount AS agg_delinquent_amount,
            a.delinquent_bill_year AS agg_delinquent_bill_year,
            ('pre_foreclosure' = ANY(a.matched_record_types)
@@ -235,7 +242,9 @@ q AS (
 )
 SELECT count(*) AS leads,
        count(*) FILTER (WHERE has_new) AS new_leads,
-       count(*) FILTER (WHERE NOT has_new) AS already_delivered,
+       count(*) FILTER (WHERE NOT has_new AND has_prior) AS already_delivered,
+       -- Neither: only same-run siblings / superseded rows (never handed over).
+       count(*) FILTER (WHERE NOT has_new AND NOT has_prior) AS not_new_not_delivered,
        count(*) FILTER (WHERE bucket LIKE 'pk:%' AND overlap_count >= 2) AS stacked,
        count(*) FILTER (WHERE bucket LIKE 'pk:%' AND overlap_count >= 2 AND has_new) AS stacked_new,
        count(*) FILTER (WHERE bucket LIKE 'pk:%' AND overlap_count < 2) AS single_list,

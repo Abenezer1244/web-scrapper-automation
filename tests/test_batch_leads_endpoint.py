@@ -250,6 +250,7 @@ class TestBatchLeadsAudit:
         body = await self._get(client, starter_token, audit_batch)
         assert body["quality"] == {
             "leads": 4, "new_leads": 2, "already_delivered": 2,
+            "not_new_not_delivered": 0,
             "stacked": 1, "stacked_new": 0, "single_list": 2, "no_identity": 1,
             "with_parcel": 3, "with_property_address": 4, "with_mailing_address": 2,
             "with_phone": 1, "with_email": 1,
@@ -261,7 +262,8 @@ class TestBatchLeadsAudit:
         }
         # Exclusive groups reconcile.
         q = body["quality"]
-        assert q["new_leads"] + q["already_delivered"] == q["leads"]
+        assert (q["new_leads"] + q["already_delivered"]
+                + q["not_new_not_delivered"] == q["leads"])
         assert q["stacked"] + q["single_list"] + q["no_identity"] == q["leads"]
         assert body["total"] == q["leads"] == body["counts"]["leads_total"]
 

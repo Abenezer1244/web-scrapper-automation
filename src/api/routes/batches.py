@@ -61,7 +61,7 @@ from src.config.constants import (
 from src.db import CountyConnector
 from src.db.models import BatchRun, Job, Result, ScraperBatch, ScraperConfig
 from src.scrapers.probate import new_probate_config_tod_default
-from src.utils.crypto import decrypt_field
+from src.utils.contact_decode import clean_phone_type, decode_scalar
 from src.utils.lead_export import resolve_hidden_output_fields
 from src.utils.logger import setup_logger
 from src.utils.source_dates import is_auction_date_fallback
@@ -986,8 +986,12 @@ async def _leads_page(
     for r in rows:
         data = dict(r._mapping)
         data["id"] = str(data["id"])
-        data["phone"] = decrypt_field(data["phone"]) if data.get("phone") else None
-        data["email"] = decrypt_field(data["email"]) if data.get("email") else None
+        # Raw text() SQL: no column type runs, so the contact goes through the one
+        # decoder (UX 3.8s2). An unreadable value is None + a WARNING naming the
+        # lead and field, never ciphertext and never a failed page.
+        data["phone"], _ = decode_scalar(data.get("phone"), field="phone", lead_id=data["id"])
+        data["email"], _ = decode_scalar(data.get("email"), field="email", lead_id=data["id"])
+        data["phone_type"], _ = clean_phone_type(data.get("phone_type"), lead_id=data["id"])
         # Honor the batch's output-field visibility exactly like the CSV
         # (of the hideable set, only mailing_address is a combined-view column).
         if "mailing_address" in hidden:

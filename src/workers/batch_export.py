@@ -11,7 +11,6 @@ CSV is re-downloadable once they land. The CSV is built on property identity,
 which is ready at child-job enrichment.
 """
 import io
-import json
 import uuid
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -27,7 +26,7 @@ from src.api.tax_filters import TAX_CAP_BIND, tax_cap_min_year, tax_cap_sql
 # not a route, so both call sites can share the one map.
 from src.config.constants import record_type_label as _label
 from src.db.models import BatchRun, Job, ScraperBatch
-from src.utils.crypto import decrypt_field
+from src.utils.contact_decode import clean_phone_type, decode_array, decode_scalar
 from src.utils.data_exporter import DataExporter
 from src.utils.lead_export import PROBATE_SUBTYPE_AGG_SQL, write_lead_csv_with_overlap
 from src.utils.logger import setup_logger
@@ -264,21 +263,18 @@ def _combined_pairs(
     rows = []
     for r in result.fetchall():
         data = dict(r._mapping)
-        if data.get("phone") is not None:
-            data["phone"] = decrypt_field(data["phone"])
-        if data.get("email") is not None:
-            data["email"] = decrypt_field(data["email"])
-        # Multi-contact arrays (EncryptedJSON over raw text()) — decrypt + parse so
-        # phone_2/3 + email_2/3 populate, exactly like segments._decrypt_pii_rows.
-        # Unparseable → None (CSV then emits blank secondaries, never a 500).
-        for key in ("phones", "emails"):
-            raw = data.get(key)
-            if raw is None:
-                continue
-            try:
-                data[key] = json.loads(decrypt_field(raw))
-            except (ValueError, TypeError):
-                data[key] = None
+        # Raw text() SQL: no column type runs, so every contact goes through the one
+        # decoder (UX 3.8s2), exactly like segments._decrypt_pii_rows. An unreadable
+        # value is None + a WARNING naming the lead and field: a blank cell, never
+        # ciphertext in the file and never a failed render. The arrays feed
+        # phone_2/3 + email_2/3. The bucket was ranked over ciphertext, so a
+        # malformed representative reads blank; no sibling is substituted (accepted).
+        lead = str(data.get("id"))
+        data["phone"], _ = decode_scalar(data.get("phone"), field="phone", lead_id=lead)
+        data["email"], _ = decode_scalar(data.get("email"), field="email", lead_id=lead)
+        data["phone_type"], _ = clean_phone_type(data.get("phone_type"), lead_id=lead)
+        for kind in ("phones", "emails"):
+            data[kind], _ = decode_array(data.get(kind), kind=kind, lead_id=lead)
         # The winning row's own enrichment_data carries a lead_subtype, but the
         # bucket-AGGREGATED subtype (a.lead_subtype via PROBATE_SUBTYPE_AGG_SQL) is
         # authoritative — a bucket's representative row may be non-probate. Drop the

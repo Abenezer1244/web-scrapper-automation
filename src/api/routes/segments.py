@@ -22,7 +22,6 @@ suspenders). All exported fields pass sanitize_for_csv.
 Union (inclusive, strong + weak) is a deliberately separate later slice.
 """
 import io
-import json
 from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 
@@ -58,7 +57,7 @@ from src.api.tax_filters import TAX_CAP_BIND, tax_cap_min_year, tax_cap_sql
 # copy of it. The fallback still title-cases an unknown slug so an export never
 # shows a raw token.
 from src.config.constants import record_type_label as _label
-from src.utils.crypto import decrypt_field
+from src.utils.contact_decode import clean_phone_type, decode_array, decode_scalar
 from src.utils.lead_export import PROBATE_SUBTYPE_AGG_SQL, write_lead_csv_with_overlap
 from src.utils.logger import setup_logger
 
@@ -568,28 +567,28 @@ def _decrypt_pii_rows(rows: list) -> list:
     ``SimpleNamespace`` rows so existing attribute access (``r.phone``,
     ``r.party_name``, ...) is unchanged.
     ``party_name``/addresses are out of H3 scope (plaintext) and pass through.
+
+    Through the one contact decoder (UX 3.8s2): a value that cannot be read
+    (tolerant mode used to hand ciphertext back as-is; strict raised and failed the
+    whole request) becomes None and logs a WARNING with the lead id and field,
+    never the value. ``phone_type`` is a plain column, but no column type cleans it
+    on ``text()``, so it goes through ``clean_phone_type`` here.
+
     The contactability ranking + ``ORDER BY`` already ran in SQL over ciphertext,
-    which is correct (ciphertext is non-NULL; blanks were normalized to NULL).
+    so a malformed non-NULL contact can win its bucket; its value then reads absent
+    and no sibling's contact is substituted (accepted; decode-aware ranking is
+    backlog).
     """
     out = []
     for r in rows:
         data = dict(r._mapping)
-        if data.get("phone") is not None:
-            data["phone"] = decrypt_field(data["phone"])
-        if data.get("email") is not None:
-            data["email"] = decrypt_field(data["email"])
-        # Multi-contact arrays (EncryptedJSON): decrypt + parse; a legacy
-        # plaintext-JSON row passes through decrypt_field unchanged (non-strict)
-        # and still parses. Anything unparseable degrades to None — the CSV
-        # builder then just emits blank phone_2/3 + email_2/3 (never a 500).
-        for key in ("phones", "emails"):
-            raw = data.get(key)
-            if raw is None:
-                continue
-            try:
-                data[key] = json.loads(decrypt_field(raw))
-            except (ValueError, TypeError):
-                data[key] = None
+        lead = str(data.get("id"))
+        data["phone"], _ = decode_scalar(data.get("phone"), field="phone", lead_id=lead)
+        data["email"], _ = decode_scalar(data.get("email"), field="email", lead_id=lead)
+        data["phone_type"], _ = clean_phone_type(data.get("phone_type"), lead_id=lead)
+        # The CSV builder reads phone_2/3 + email_2/3 from these arrays.
+        for kind in ("phones", "emails"):
+            data[kind], _ = decode_array(data.get(kind), kind=kind, lead_id=lead)
         out.append(SimpleNamespace(**data))
     return out
 

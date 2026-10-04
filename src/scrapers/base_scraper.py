@@ -176,6 +176,11 @@ class ScrapedRecord:
     #: in to_dict(): scrapers hash to_dict() into raw_html_hash, and adding a key would
     #: change every existing record's identity.
     property_zip: str | None = None
+    #: The situs STATE when the source knows it but its property_address is street-only
+    #: (a county assessor only lists its own county's parcels). Feeds results.property_state
+    #: and so the out-of-state / absentee flags; a state parsed from property_address wins.
+    #: Not in to_dict(), for the same identity reason as property_zip.
+    property_state: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {

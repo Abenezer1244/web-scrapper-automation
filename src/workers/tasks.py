@@ -1240,7 +1240,8 @@ def run_scrape_job(self, job_id: str) -> None:
                 # is usually NULL pre-enrichment (so absentee/out_of_state come back
                 # NULL here); the end-of-job recompute after _run_inline_enrichment
                 # is the authoritative pass once mailing is filled.
-                _owner = compute_owner_flags(rec.property_address, rec.mailing_address)
+                _owner = compute_owner_flags(rec.property_address, rec.mailing_address,
+                                             property_state=rec.property_state)
                 # Migration 085: keep the situs city/zip the SOURCE gave us (a notice's
                 # "commonly known as" line carries them) — enrichment later replaces
                 # property_address with the assessor's street-only line, which would

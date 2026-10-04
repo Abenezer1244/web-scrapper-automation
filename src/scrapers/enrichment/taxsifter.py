@@ -281,13 +281,22 @@ async def fill_addresses_by_owner(county: str, records: list) -> int:
         if not result:
             continue
         # Fill-only on both addresses: a value the recorder document itself carried
-        # outranks one inferred from an owner name (Codex P2).
-        if not record.property_address:
+        # outranks one inferred from an owner name (Codex P2). Every value written
+        # here is stamped with where it came from, like every other mailing source.
+        record.enrichment_data = record.enrichment_data or {}
+        source = f"taxsifter_{county}"
+        if not record.property_address and result.get("address"):
             record.property_address = result["address"]
+            record.enrichment_data["property_source"] = source
+            # TaxSifter's situs is street-only, but the site lists only its own WA
+            # county's parcels, so the state is a fact, not a guess. Without it the
+            # owner flags cannot be computed. Never overwrites a state already known.
+            if not getattr(record, "property_state", None):
+                record.property_state = "WA"
         if result.get("mailing") and not record.mailing_address:
             record.mailing_address = result["mailing"]
+            record.enrichment_data["mailing_source"] = source
         if result.get("value"):
-            record.enrichment_data = record.enrichment_data or {}
             record.enrichment_data["assessed_value"] = result["value"]
         found += 1
     _logger.info("TaxSifter lookup (%s): found addresses for %d/%d records",

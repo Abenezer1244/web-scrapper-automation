@@ -296,6 +296,50 @@ async def test_fill_addresses_by_owner_fills_address_and_mailing_and_never_a_par
     assert junk.property_address is None and junk.mailing_address is None
 
 
+async def test_fill_stamps_its_source_and_the_situs_state(portal, monkeypatch):
+    """Every value the owner-name fill writes says where it came from, and the
+    street-only TaxSifter situs gets its state (the site lists only its own WA
+    county) so the owner flags can be computed downstream."""
+    from src.scrapers.base_scraper import ScrapedRecord
+
+    monkeypatch.setattr(taxsifter, "_SPACING_S", 0.0)
+    monkeypatch.setattr(taxsifter, "TaxSifterClient", lambda county: _client(portal))
+    rec = ScrapedRecord(party_name="DOE JANE Q", enrichment_data={"instrument_number": "1"})
+    assert await taxsifter.fill_addresses_by_owner("okanogan", [rec]) == 1
+    assert rec.enrichment_data == {"instrument_number": "1", "property_source": "taxsifter_okanogan",
+                                   "mailing_source": "taxsifter_okanogan", "assessed_value": "$250,500"}
+    assert rec.property_state == "WA"
+    assert rec.parcel_id is None
+    # Not part of the record's identity hash input (to_dict), like property_zip.
+    assert "property_state" not in rec.to_dict()
+
+
+async def test_fill_never_overwrites_a_situs_or_state_the_record_already_had(portal, monkeypatch):
+    from src.scrapers.base_scraper import ScrapedRecord
+
+    monkeypatch.setattr(taxsifter, "_SPACING_S", 0.0)
+    monkeypatch.setattr(taxsifter, "TaxSifterClient", lambda county: _client(portal))
+    rec = ScrapedRecord(party_name="DOE JANE Q", property_address="9 RECORDED RD",
+                        property_state="ID")
+    await taxsifter.fill_addresses_by_owner("douglas", [rec])
+    assert rec.property_address == "9 RECORDED RD" and rec.property_state == "ID"
+    assert "property_source" not in rec.enrichment_data
+    assert rec.enrichment_data["mailing_source"] == "taxsifter_douglas"
+
+
+def test_a_situs_state_makes_out_of_state_computable_but_never_confirms_same_place():
+    from src.utils.address_intel import compute_owner_flags
+
+    out = compute_owner_flags("12 SAMPLE LN", "4 OTHER ST, BOISE, ID 83702", property_state="WA")
+    assert out["property_state"] == "WA" and out["owner_state"] == "ID"
+    assert out["out_of_state_owner"] is True and out["absentee_owner"] is True
+    # Same street, and the property side knows only its state: unknown, not "owner-occupied".
+    same = compute_owner_flags("12 SAMPLE LN", "12 SAMPLE LN, SAMPLETON, WA 98800", property_state="WA")
+    assert same["out_of_state_owner"] is False and same["absentee_owner"] is None
+    # Without the state nothing can be said about out-of-state (the old behaviour).
+    assert compute_owner_flags("12 SAMPLE LN", "4 OTHER ST, BOISE, ID 83702")["out_of_state_owner"] is None
+
+
 def test_a_failed_results_page_is_not_cached_so_the_name_is_retried(portal, monkeypatch):
     monkeypatch.setattr(taxsifter, "_SPACING_S", 0.0)
     _Portal.fail_results = 1

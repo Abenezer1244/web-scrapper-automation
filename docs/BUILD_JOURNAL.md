@@ -19,6 +19,75 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-10-04 — Mailing follow-ups: Douglas + Whitman sources, a King extract outage, the code-violation second look
+
+> Owner: "Complete these" (the 10-03 follow-ups), "build all three" (Kitsap, Whitman,
+> Douglas), then "work on the still open 1 by 1".
+
+**Built / Shipped:**
+- **#443** (`fbf32759`):
+  - TaxSifter owner-name fill (Okanogan, Douglas) stamps `property_source` /
+    `mailing_source = taxsifter_<county>`.
+  - New optional `ScrapedRecord.property_state` (NOT in `to_dict`, so record identity
+    is unchanged) is set to WA, which makes the owner flags computable.
+  - New hourly beat `cv_mailing_recovery` (:30): the second look for King
+    code-violation rows that the job's 420 s locate step never reached.
+- **#446** (`c5d069c7`): Douglas `_KNOWN_GIS_ENDPOINTS` entry on the county's public
+  `Parcels_view_(Joined)` layer.
+  - Address2-then-Address1 taxpayer block, license-restricted.
+  - The mailing composer drops a US ZIP+4 `-0000` placeholder (40% of the Douglas roll).
+- **#449** (`01817c5b`), hotfix: King's RPAcct extract (18,644,053 B) exceeded
+  `safe_get`'s default 16 MiB cap.
+  - Every refresh had failed since ~09-17; no row got extract mailing after that date.
+  - Fix: `download_zip` passes `max_bytes=64 MiB`.
+  - Verified on the worker: snapshot 2026-09-26.
+- **#447** (`65de11fe`): Whitman `taxsifter.resolve_mailing`, parcel-keyed on its
+  TerraScan TaxSifter.
+  - Search by parcel must return exactly one link for our parcel, then the page must
+    echo it.
+  - `parcel_site=True` registry; license-restricted.
+- **#450**: a canary probe for `king_cv_parcel_locate`, and GIS recovery labels a parcel
+  that is absent from the county layer as `parcel_not_found` instead of `none`.
+- **Ops on prod** (`railway ssh` on the worker):
+  - Pierce: 96 rows requeued. All settled; the 20 parcels are absent from Pierce's
+    340k-feature layer.
+  - The one TaxSifter-filled Okanogan row was stamped.
+
+**Tried / Decided:**
+- **Kitsap NOT built.** `Parcels.txt` sits behind an Azure WAF JS challenge, and the
+  terms require a written agreement with Kitsap County to sell. We never script past
+  bot protection; the owner is to obtain the agreement and the file.
+- **Douglas as a config entry, not an adapter.** The statewide layer gives Douglas no
+  situs city/ZIP either, so moving the situs costs nothing.
+- **Whitman:** `Assessor.aspx` needs `keyId` (`parcelNumber` alone does not echo).
+  - The statewide layer's DATA_LINK keyId pointed at an older record for the same
+    parcel ("COOPER STREET" vs "ST").
+  - We use the record the county's own search returns.
+
+**Failed / Blocked:**
+- The first `cv_mailing_recovery` tick stood down ("Assessor extract unavailable"),
+  which is what exposed #449.
+- With no probe registered, the cooldown then waited for the 6 h backstop, and
+  `ops_clear_source_health.py` correctly refused a blind clear. Hence the probe in #450.
+- Codex review rounds: 1b r1 FAIL; Whitman r1 + r2 FAIL; the probe and label P1s. All
+  P1s fixed before merge.
+- Escaping slips while patching: a regex backreference became `\x01`, and a backslash
+  in a heredoc. Tests caught both. Patch files byte-wise, never through nested string
+  escapes.
+
+**Facts learned:**
+- **A 200 with the right shape can still be a capped download.** "Response body too
+  large" sat silently in worker logs for two weeks. King probate/pre-foreclosure stayed
+  at 100% (eRealProperty path), so coverage alarms never fired.
+- **TaxSifter (Douglas, Okanogan, Whitman):**
+  - same `ParcelOwnerInfo1_lb*` markup;
+  - "N records found" is the only proof of not-found;
+  - one parcel can have several keyIds.
+- `railway ssh --service worker -- python - < script.py` is real remote execution
+  (`railway run` is local).
+
+**Pending / Handoff:** Kitsap written agreement (owner).
+
 ## 2026-10-03 — Contact lookups get a page (1c): the button, the quote, the progress; Phase 1 complete
 
 > Phase 1c of contact lookup, in the frontend repo (`bridgeleads-web`). The backend chain was already

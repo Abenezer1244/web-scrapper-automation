@@ -79,7 +79,7 @@ class TestRegistry:
             monkeypatch.setattr(settings, "COUNTY_GIS_RESTRICTED_MAILING_ENABLED", flag)
             assert cg.has_mailing_source(county, "WA") is True
 
-    @pytest.mark.parametrize("county", ["grant", "whatcom", "island", "chelan", "douglas"])
+    @pytest.mark.parametrize("county", ["grant", "whatcom", "island", "chelan", "douglas", "whitman"])
     def test_rcw_clause_counties_answer_to_the_license_switch(self, county, monkeypatch):
         from src.config import settings
 
@@ -88,7 +88,7 @@ class TestRegistry:
         monkeypatch.setattr(settings, "COUNTY_GIS_RESTRICTED_MAILING_ENABLED", True)
         assert cg.has_mailing_source(county, "WA") is True
 
-    @pytest.mark.parametrize("county", ["kitsap", "okanogan", "whitman"])
+    @pytest.mark.parametrize("county", ["kitsap", "okanogan"])
     def test_counties_without_a_parcel_source_stay_without_one(self, county, monkeypatch):
         from src.config import settings
 

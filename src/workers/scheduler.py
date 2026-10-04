@@ -337,6 +337,16 @@ app.conf.beat_schedule = {
         "task": "src.workers.property_recovery.recover_deferred_property",
         "schedule": crontab(minute="7-59/20"),  # every 20 minutes from :07
     },
+    "recover-code-violation-mailing": {
+        # Locates the parcel (King parcel layer, strict rule) and takes the Assessor
+        # extract mailing for Seattle SDCI code-violation leads the job's 420 s step
+        # never reached (job 37014cb9 left ~800). Bounded (150 rows, 300 s), gated on
+        # GIS_ENRICHMENT_ENABLED and its own source cooldown; parcel layer and extract
+        # only, NOT eRealProperty, so it holds no King eRealProperty lease. Never bills,
+        # never creates a job, never writes parcel_id. :30 is 3 min from :27 and :33.
+        "task": "src.workers.cv_mailing_recovery.recover_code_violation_mailing_task",
+        "schedule": crontab(minute=30),  # hourly at :30
+    },
     "recover-pierce-cv-owners": {
         # Names delivered Tacoma code-violation leads the job's bounded owner pass did
         # not reach (Pierce ATIP taxpayer record; owner decision 2026-09-14 scopes it to

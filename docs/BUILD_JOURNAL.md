@@ -19,6 +19,70 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-10-04 — Contact lookup follow-ups A-C: no more 500 on a malformed run id, honest grant comments, a rate bucket for the lookup reads
+
+> The three candidates the Phase 1 handoff left (§7.4), all taken at the owner's word ("complete 1-3 with
+> codex in the loop"). One Codex consult for the three plans (r1-r3 to PLAN: GO), then one PR each.
+
+**Built / Shipped:**
+- **A, BE #444** (merge `9386949b`): for an authenticated caller, a malformed run id is 404 "Job not
+  found" on every route that takes one, never a 500 (an unauthenticated caller still gets 401; download,
+  which resolves its credential inside the handler, is 404 either way). Six `/jobs/{job_id}` routes plus `POST /scrapers/{config_id}/jobs/{job_id}/dialer-replay`
+  now canonicalize with `_canonical_job_id` first. `download` checks the id before either credential; the
+  download token's `job_id` claim is compared in canonical form (a missing, non-string or unparseable
+  claim stays the 403). Live: `GET /jobs/not-a-uuid/download` = 404.
+- **B, BE #445** (merge `7d97e795`): three ops scripts said `bridgeleads_system` had "DELETE=False on every
+  table". It holds DELETE on the 8 tables in `verify_worker_delete_grants.REQUIRED_DELETE_TABLES`; of the
+  purge's cascade only `pending_skip_trace_rows`. Comments only.
+- **C, BE #448** (merge `9e4a0b1c`) + **FE #213** (`98ff5ed`): the two contact-lookup reads spend a new
+  `lookup_read` zone (60/min per account, fails open) instead of `general`, so the 1c page's polling and
+  its results table cannot starve each other. FE #213 regenerated the API types (2 comment lines).
+
+**Tried / Decided:**
+- C had been deferred "until real 429s appear"; the owner chose to build it now. It fails OPEN like
+  `general`: a read buys nothing.
+- download now answers 404 for a malformed id even with no credential (it was 401 / 403 / 500 by
+  credential). It reveals nothing: a malformed id names no run.
+- The same class on `/scrapers/{scraper_id}` routes and `GET /scrapers/{config_id}/records` was found and
+  logged, NOT built: outside what the owner asked.
+
+**Failed / Blocked:**
+- My first plan named six routes; Codex's consult found the seventh (dialer-replay), the auth-dependent
+  shape of the bug (only an AUTHENTICATED caller reached the 500) and that braced spellings 500 too.
+- **Rule breach:** after #445's last rebase (head `8881d9cf`) I made the byte-identical proof and CI ran
+  green, but merged without the Codex re-check the rule requires after every rebase. Codex checked it
+  after the fact in the close-out PR's review.
+- One regression chunk ran without `BL_TEST_REDIS_SERVER`: a false failure, green once set.
+- Freeing disk (C: at 99-100%), I deleted `bl-fe-lookup1c/.next` (460 MB) after misreading a link
+  check: `cmd //c dir /AL .` run from Git Bash lists `C:\Program Files\Git`, not the cwd. It was real
+  build output (`du` does not follow junctions) and the main FE checkout and the other worktrees were
+  intact. Also cleared: the npm cache (~0.8 GB), old crash dumps, pip's download cache. The uv cache was
+  in use by another session and was left alone.
+- Merges were slow: GitHub requires a BE branch to be up to date with main, so each peer merge ahead
+  (#443, #446, #449, #447) cost a rebase, a proof, a Codex re-check and ~25 min of CI.
+- A background CI watcher was killed by the harness under memory pressure; CI is now polled in the
+  foreground (under 590 s per call).
+
+**Caught & fixed:**
+- A: mutation 9/9 killed (each route's call, dialer-replay's config id, the raw-claim compare). 24 of the
+  38 new tests were RED on main (asyncpg `DataError` escaping as a 500).
+- C: mutation 3/3 killed (zone back to `general`, budget 61, fail-closed).
+- The plan's B wording was itself wrong twice before code (Codex: "no DELETE on any table it touches" is
+  false for `pending_skip_trace_rows`; only `--apply` uses `DATABASE_URL_MIGRATE`).
+
+**Pending / Handoff:**
+- The `/scrapers/{scraper_id}` malformed-id 500: the owner's call.
+- About 20 `bl-fe-*` worktrees, several with `.next` build output, take disk; only the owner can say which
+  are finished.
+
+**Facts learned:**
+- An unhandled asyncpg `DataError` is not classed as DB-unavailable by `src/api/errors.py`: it reaches
+  the generic 500 handler. A raw `str` path param that reaches a uuid comparison
+  unvalidated (after auth passes) is that 500; canonicalize it first (`_canonical_job_id`).
+- `ASGITransport` re-raises app exceptions, so in tests a 500 shows as an escaped exception, not a status.
+- openapi-typescript copies response descriptions into the FE types, so even a wording change on BE needs
+  an FE regen PR.
+
 ## 2026-10-03/04 — "71 found, 0 new, No records found": the run summary, and the lookup that never answered
 
 > Owner report: an Island probate run read "Complete · 0 new / Of 71 records found: 71 No address 0

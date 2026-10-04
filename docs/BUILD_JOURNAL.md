@@ -19,6 +19,67 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-10-04 — UX 3.8 security phases: no-store everywhere contacts go, and the raw-SQL decoder paths (BE)
+
+> UX audit item 3, Phase 3.8 (owner-approved plan, Codex plan GO r18; plan + Todo in `bridgeleads-web`
+> `docs/ux-audit/todo-item3-batches-B-E.md`). This session shipped the last two of its three security
+> sub-phases (3.8s1 shipped earlier the same day as #454). Each was one phase with an owner OK first,
+> a Codex diff gate, a coordinated merge, and a Railway check.
+
+**Built / Shipped (both LIVE, api/worker/beat SUCCESS, /health 200):**
+- **#457 (3.8e, `c194e1b2`):** `Cache-Control: no-store` on success AND on every error the body raises,
+  for `/jobs/{id}/results`, `/download`, `/export-url`, the four Segments routes and both batch CSV
+  downloads. FastAPI builds an HTTPException's response apart from any injected Response, so these
+  errors used to carry no Cache-Control at all. One context manager, `no_store_errors()` in
+  `src/api/errors.py`, wraps each whole route body. `get_results`' two JobLog counts now join Job and
+  filter `Job.user_id`. Live: an in-body 404 from the run CSV route now carries `no-store`.
+- **#459 (3.8s2, `02bdb5f6`):** `segments._decrypt_pii_rows`, `batches._leads_page` and
+  `batch_export._combined_pairs` call the 3.8s1 decoder (`decode_scalar` / `decode_array` /
+  `clean_phone_type`) with the lead id, in place of bare `decrypt_field`. Golden Segments and combined
+  CSV bytes were captured from the base commit and are byte-identical after.
+
+**Tried / Decided:**
+- Out of the no-store contract, per the plan: dependency/validation errors raised before the body
+  (auth 401, Segments plan 402, body 422) and the global 500 (body is only detail + ref).
+- Accepted, stated: Segments and the combined CSV still rank over ciphertext, so a malformed contact
+  can win its bucket. It reads absent and no sibling is substituted; decode-aware ranking is backlog.
+- The authenticated prod check was replaced by a read-only probe through the deployed functions (the
+  owner's admin has MFA). 5 Segments union sets came back 2,188 rows (601 with contacts) and the batch
+  run checked was clean: 0 residue, 0 decode warnings. Only 1 of the 5 latest batch runs had rows.
+
+**Failed / Blocked:**
+- The low-memory reaper killed background test runs and a Codex run twice. The `codex exec` child
+  survived and was waited on. Tests were then run in the foreground in chunks of about 50 to 75.
+- Local Postgres crashed into recovery mode under memory pressure mid-suite ("the database system is in
+  recovery mode", 21 errors). It recovered on its own in about 3 minutes, and the test DB was reset
+  before the re-run.
+
+**Caught & fixed:**
+- Own security pass (3.8e): auth's `_CREDENTIALS_EXCEPTION` is a module-level singleton raised in-body
+  by the run CSV's bearer check. Stamping the header onto it would have leaked `no-store` onto every
+  later 401 app-wide, so `no_store_errors()` raises a copy instead.
+- My first copy used `copy.copy`, which rebuilds through `__init__` from `exc.args`. Those are empty for
+  a keyword-built HTTPException, so it raised a TypeError and caused 29 test failures. My probe had used
+  positional args and passed. Fixed with an init-free clone (`type(e).__new__` + `__dict__` + `args`).
+- 3.8s2 fixtures: the unwindowed Segments intersection returned 0 rows because it reads
+  `property_list_membership`, which the worker's dedup step writes (there is no trigger). The fixtures
+  now seed it. A filing-window request uses other SQL, which is why an existing test never needed it.
+
+**Pending / Handoff:**
+- 3.8a (BatchLeadRow `phones`/`emails`/`skip_trace_status`) waits on the owner. A peer session's
+  unpushed batch-audit branch (`audit/batch-system-redesign`) already adds `skip_trace_status` and
+  related fields to the same rows, so the order is the owner's call. 3.8b (FE types regen) must land
+  right after 3.8a, then 3.8d.
+- The FE docs branch `docs/ux-item3-3.8e-handoff` carries the 3.8e and 3.8s2 plan ticks (no PR yet).
+
+**Facts learned:**
+- Production runs with `PII_ENCRYPTION_STRICT=True`. Before 3.8s2, one undecryptable contact failed
+  a whole Segments page or batch CSV with a 500.
+- A golden CSV must avoid date-derived columns (`freshness_days`, `days_to_auction`,
+  `months_delinquent`): a fixture with no filing, auction or tax-year dates keeps its bytes stable.
+
+---
+
 ## 2026-10-04 — SEO: from a 53 audit to crawlable, canonical, structured; 16 county pages (FE only)
 
 > The owner ran `/seo` on bridgeleads.io (score 53/100; Lighthouse mobile perf 73 / a11y 96 / BP 100 /

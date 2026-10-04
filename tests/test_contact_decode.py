@@ -145,6 +145,7 @@ def test_phones_decision_table(mode):
         (_enc_json([_phone(" 2065550100 ", " Mobile ")]), ([good], False)),
         (_enc_json({"number": "2065550100"}), (None, True)),
         (_enc_json("2065550100"), (None, True)),
+        (_enc_json(None), (None, True)),  # JSON null is not how "no list" is stored
         (encrypt_field("not json"), (None, True)),
         (CORRUPT_FE1, (None, True)),
         (FERNET_SHAPED, (None, True)),
@@ -177,6 +178,7 @@ def test_emails_decision_table(mode):
         (_enc_json([CORRUPT_FE1, "a@example.com"]), (["a@example.com"], True)),
         (_enc_json([FERNET_SHAPED]), (None, True)),
         (_enc_json({"a": 1}), (None, True)),
+        (_enc_json(None), (None, True)),
         (CORRUPT_FE1, (None, True)),
         (json.dumps(["a@example.com"]), (["a@example.com"], False) if tolerant else (None, True)),
     ]
@@ -250,6 +252,8 @@ def test_contact_types_read_through_the_decoder(mode):
     assert phone.process_result_value("  ", None) is None  # blank scalar: no value
     assert phones.process_result_value("", None) is None  # blank array: unreadable
     assert phones.process_result_value(CORRUPT_FE1, None) is None
+    assert phones.process_result_value(_enc_json(None), None) is None
+    assert cd.parse_array("null", kind="emails") == (None, True)
     assert phones.process_result_value(_enc_json([_phone("2065550100")]), None) == [_phone("2065550100")]
     assert ContactLabel().process_result_value("fe1:zz", None) is None
     assert ContactLabel().process_result_value(" Mobile ", None) == "Mobile"

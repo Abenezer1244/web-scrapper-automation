@@ -196,6 +196,11 @@ def parse_array(text: str, *, kind: str, lead_id: str | None = None) -> tuple[li
     except ValueError:
         _warn(kind, lead_id)
         return None, True
+    # Stored array text is always a JSON list (SQL NULL is how "no list" is stored),
+    # so any other JSON value, ``null`` included, is unreadable.
+    if not isinstance(parsed, list):
+        _warn(kind, lead_id)
+        return None, True
     return cleaner(parsed, lead_id=lead_id)
 
 

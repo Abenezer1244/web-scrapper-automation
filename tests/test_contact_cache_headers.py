@@ -29,8 +29,9 @@ from fastapi import HTTPException
 from httpx import AsyncClient, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.api.auth import _CREDENTIALS_EXCEPTION
 from src.api.download_tokens import mint_download_token
-from src.api.errors import no_store_errors
+from src.api.errors import RunRefusedHTTPException, no_store_errors
 from src.api.routes import batches, jobs, segments
 from src.db.models import BatchRun, Job, JobLog, Result, ScraperBatch, ScraperConfig, User
 
@@ -139,6 +140,21 @@ async def test_no_store_errors_keeps_an_existing_cache_control():
             raise HTTPException(status_code=404, detail="x",
                                 headers={"cache-control": "private, no-store"})
     assert caught.value.headers == {"cache-control": "private, no-store"}
+
+
+async def test_no_store_errors_raises_a_copy_and_never_touches_the_original():
+    """Some exceptions are module-level singletons: the header goes on a copy of
+    the same class with the same attributes, never on the shared instance."""
+    original = RunRefusedHTTPException("frozen", "Account frozen.", None,
+                                       headers={"Retry-After": "60"})
+    with pytest.raises(RunRefusedHTTPException) as caught:
+        with no_store_errors():
+            raise original
+    raised = caught.value
+    assert raised is not original and raised.__cause__ is original
+    assert (raised.status_code, raised.detail, raised.code) == (402, "Account frozen.", "frozen")
+    assert raised.headers == {"Retry-After": "60", "Cache-Control": "no-store"}
+    assert original.headers == {"Retry-After": "60"}
 
 
 async def test_no_store_errors_leaves_any_other_exception_untouched():
@@ -339,6 +355,20 @@ async def test_download_errors_carry_no_store(
         ("/jobs/not-a-uuid/download", {}, 404),                                 # malformed id
     ]:
         _assert_no_store(await client.get(path, headers=headers), code)
+
+
+async def test_download_bad_bearer_401_keeps_the_auth_singleton_clean(
+    client: AsyncClient, db: AsyncSession, starter_user: User
+):
+    """The in-body bearer check raises auth's module-level _CREDENTIALS_EXCEPTION.
+    Its 401 carries no-store AND its WWW-Authenticate, and the shared instance is
+    left exactly as it was, so no other route's 401 inherits the header."""
+    job_id = await _delivered_job_with_contact(db, starter_user)
+    before = dict(_CREDENTIALS_EXCEPTION.headers)
+    resp = await client.get(f"/jobs/{job_id}/download", headers=_auth("not-a-jwt"))
+    _assert_no_store(resp, 401)
+    assert resp.headers["www-authenticate"] == "Bearer"
+    assert _CREDENTIALS_EXCEPTION.headers == before == {"WWW-Authenticate": "Bearer"}
 
 
 # ─── POST /segments/* ────────────────────────────────────────────────────────

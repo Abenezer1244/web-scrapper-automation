@@ -85,15 +85,26 @@ def no_store_errors() -> Iterator[None]:
     """Re-raise any HTTPException from the block with ``Cache-Control: no-store``
     merged into its headers. Its other headers (Retry-After, WWW-Authenticate)
     stay, and a Cache-Control it already carries is kept as is. Any other
-    exception propagates untouched."""
+    exception propagates untouched.
+
+    A COPY is raised, of the same class and attributes: some exceptions are
+    module-level singletons (auth's ``_CREDENTIALS_EXCEPTION``, reachable from
+    the run CSV's in-body bearer check), and stamping the header onto the shared
+    instance would leak it onto every later raise of it, app-wide."""
     try:
         yield
     except HTTPException as exc:
         headers = dict(exc.headers or {})
-        if not any(name.lower() == "cache-control" for name in headers):
-            headers["Cache-Control"] = "no-store"
-        exc.headers = headers
-        raise
+        if any(name.lower() == "cache-control" for name in headers):
+            raise
+        headers["Cache-Control"] = "no-store"
+        # Not copy.copy: it rebuilds through __init__ from exc.args, which are
+        # empty for an HTTPException built with keyword arguments.
+        stamped = type(exc).__new__(type(exc))
+        stamped.__dict__.update(exc.__dict__)
+        stamped.args = exc.args
+        stamped.headers = headers
+        raise stamped.with_traceback(exc.__traceback__) from exc
 
 
 # ─── Database unreachable → 503 ──────────────────────────────────────────────

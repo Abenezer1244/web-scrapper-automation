@@ -4,6 +4,7 @@ route decorators + signatures stay in auth.py; these hold the moved bodies.
 """
 
 import json
+import secrets
 import time
 from datetime import UTC, datetime
 
@@ -42,6 +43,7 @@ from .tokens import (
     _decode_mfa_challenge_token,
     _mint_mfa_challenge_token,
 )
+from .user_sessions import check_session_on_refresh, start_session
 
 
 async def login_user(
@@ -97,7 +99,7 @@ async def login_user(
 
     await BruteForceProtection.clear(ip, body.email)
     # Password-only session (no MFA on this account): amr=["pwd"].
-    token, refresh = create_token_pair(user.id, amr=["pwd"])
+    token, refresh = await start_session(db, request, user.id, amr=["pwd"])
     audit_log(request, "login_success", user.id)
     return LoginResponse(access_token=token, refresh_token=refresh)
 
@@ -205,7 +207,7 @@ async def login_mfa_redeem(
     # Full MFA-backed session (H2-P5): amr=["pwd","mfa"], auth_time=now (default)
     # — this is the only login path that mints an "mfa" session, the marker the
     # admin step-up dependency requires.
-    token, refresh = create_token_pair(user.id, amr=["pwd", "mfa"])
+    token, refresh = await start_session(db, request, user.id, amr=["pwd", "mfa"])
     audit_log(request, "login_success", user.id)
     return LoginResponse(access_token=token, refresh_token=refresh)
 
@@ -384,7 +386,7 @@ async def login_break_glass_redeem(
     # Mint the DEGRADED recovery session. amr WITHOUT "mfa" -> can never satisfy
     # admin step-up; mfa_enabled is now False so require_admin routes the user to
     # re-enrollment.
-    token, refresh = create_token_pair(user.id, amr=["pwd", "break_glass"])
+    token, refresh = await start_session(db, request, user.id, amr=["pwd", "break_glass"])
     audit_log(request, "mfa_breakglass_used", user_id)
     return LoginResponse(access_token=token, refresh_token=refresh)
 
@@ -538,7 +540,11 @@ async def refresh_tokens(
     if propagated_auth_time is None:
         propagated_auth_time = 0
     # The rotated pair stays in the presented token's session family; a legacy
-    # token minted before families existed starts one here.
+    # token minted before families existed starts one here. The family's DB row
+    # is authoritative for its life: signed out from Settings, or past the 30-day
+    # absolute lifetime, ends it here (401); a family with no row is adopted.
+    fam = fam or secrets.token_hex(16)
+    await check_session_on_refresh(db, user.id, fam)
     new_access, new_refresh = create_token_pair(
         user.id, amr=propagated_amr, auth_time=propagated_auth_time, fam=fam
     )
@@ -556,8 +562,14 @@ async def refresh_tokens(
         pass
     # A logout that landed while this pair was being minted revoked its family;
     # answer that, rather than a 200 carrying tokens that are already dead.
+    # Same for a "sign out everywhere" (logout-all, password or email change)
+    # that committed after the check at the top: the new pair's iat is AFTER
+    # that stamp, so without re-checking the PRESENTED token here it would
+    # survive the revoke (Codex).
     try:
         if await TokenBlacklist.is_family_revoked(fam):
+            raise HTTPException(status_code=401, detail="Refresh token revoked")
+        if await TokenBlacklist.is_revoked_by_user_logout_all(user_id, issued_at):
             raise HTTPException(status_code=401, detail="Refresh token revoked")
     except _redis_exceptions.RedisError:
         raise revocation_unavailable_503()

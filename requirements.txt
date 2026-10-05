@@ -57,6 +57,13 @@ pypdf==6.19.0                # NTS Tier 1: extract text from Pacific Publishing 
 pandas==2.2.3
 openpyxl==3.1.5
 
+# Profile photo: decode + re-encode every upload to a 256px WebP (src/utils/avatar.py).
+# Wheels bundle libjpeg/libpng/libwebp. 2026-10-05: latest, no OSV advisories, MIT-CMU.
+pillow==12.3.0
+# IANA zone data for zoneinfo (users.timezone validation). Already pulled in by pandas;
+# pinned because the app now relies on it directly (python:slim and Windows ship none).
+tzdata==2026.5
+
 # Storage (Cloudflare R2 / S3-compatible)
 boto3==1.43.60               # service-model churn only for our S3-compatible R2 use (upload + presigned GET)
 

@@ -13,30 +13,38 @@ are re-exported here so existing `from src.api.routes.auth import X` imports and
 the wrappers keep working unchanged.
 """
 
+import asyncio
 import time
+import uuid
 from typing import Annotated
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response, status
+from fastapi.concurrency import run_in_threadpool
 from jwt.exceptions import InvalidTokenError as JWTError
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.auth import (
+    AuthContext,
     CurrentUser,
     decode_secure_token,
     generate_api_key,
+    get_auth_context,
     require_plan,
     require_session,
     verify_password,
 )
 from src.api.deps import get_rls_db
 from src.api.middleware import audit_log, rate_limit
+from src.api.routes.auth_helpers import email_change as _email_change
 from src.api.routes.auth_helpers import login as _login_helpers
 from src.api.routes.auth_helpers import mfa as _mfa_helpers
 from src.api.routes.auth_helpers import password as _password_helpers
 from src.api.routes.auth_helpers import registration as _registration_helpers
 from src.api.routes.auth_helpers import session as _session_helpers
+from src.api.routes.auth_helpers import user_sessions as _user_sessions
 
 # Re-export the stateless token primitives so existing imports of these names
 # from src.api.routes.auth keep resolving (rule 4) and so any in-module use is
@@ -61,6 +69,8 @@ from src.api.routes.auth_helpers.tokens import (  # noqa: F401
 from src.api.schemas import (
     ApiKeyResponse,
     BreakGlassLoginRequest,
+    EmailChangeConfirm,
+    EmailChangeRequest,
     ForgotPasswordRequest,
     LoginResponse,
     LogoutRequest,
@@ -76,6 +86,8 @@ from src.api.schemas import (
     ReauthRequest,
     RegisterResponse,
     ResetPasswordRequest,
+    SecurityEventResponse,
+    SessionResponse,
     TokenResponse,
     UserLogin,
     UserRegister,
@@ -85,6 +97,8 @@ from src.api.schemas import (
 from src.config import settings
 from src.config.constants import BUSINESS_FEATURES_PLANS
 from src.db import User, get_db  # noqa: F401 (User used in Annotated type)
+from src.db.models import AuditEvent, UserAvatar
+from src.utils.avatar import ALLOWED_CONTENT_TYPES, MAX_UPLOAD_BYTES, AvatarError, process_avatar
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -224,9 +238,30 @@ async def refresh_token(
     return await _login_helpers.refresh_tokens(body, request, db)
 
 
+async def _user_response(db: AsyncSession, user: User) -> UserResponse:
+    """UserResponse plus the photo version, which lives in user_avatars.
+
+    Every route that returns UserResponse goes through here: the frontend writes
+    these responses straight into its cached profile, so one that omitted the
+    photo would blank it until the next refetch. `db` must be the caller's
+    RLS-bound session (user_avatars is tenant-scoped); the user_id filter is the
+    query-level guard on top of it.
+    """
+    version = (
+        await db.execute(
+            select(UserAvatar.version).where(
+                UserAvatar.user_id == user.id, UserAvatar.image.is_not(None)
+            )
+        )
+    ).scalar_one_or_none()
+    return UserResponse.model_validate(user).model_copy(update={"avatar_version": version})
+
+
 @router.get("/me", response_model=UserResponse)
-async def me(current_user: CurrentUser) -> UserResponse:
-    return UserResponse.model_validate(current_user)
+async def me(
+    current_user: CurrentUser, db: AsyncSession = Depends(get_rls_db)
+) -> UserResponse:
+    return await _user_response(db, current_user)
 
 
 @router.put("/notification-preferences", response_model=UserResponse)
@@ -234,7 +269,7 @@ async def update_notification_preferences(
     body: NotificationPrefsUpdate,
     request: Request,
     current_user: CurrentUser,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_rls_db),
 ) -> UserResponse:
     """Persist the user's email-notification toggles (settings → Notifications).
 
@@ -254,7 +289,7 @@ async def update_notification_preferences(
     await db.commit()
     await db.refresh(user)
     audit_log(request, "notification_prefs_updated", current_user.id)
-    return UserResponse.model_validate(user)
+    return await _user_response(db, user)
 
 
 @router.put("/profile", response_model=UserResponse)
@@ -262,10 +297,11 @@ async def update_profile(
     body: ProfileUpdate,
     request: Request,
     current_user: CurrentUser,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_rls_db),
 ) -> UserResponse:
     """Persist the user's editable profile (Settings → Account AND the required-
-    name gate): first_name + last_name.
+    name gate): first_name + last_name, and timezone when the caller sends it
+    (omitted = unchanged, so the name-only gate never touches it).
 
     Both are already sanitized + required (non-empty) by ProfileUpdate. This is
     the endpoint a legacy incomplete-profile user calls to satisfy the gate, so
@@ -279,10 +315,225 @@ async def update_profile(
     user = result.scalar_one()
     user.first_name = body.first_name
     user.last_name = body.last_name
+    if "timezone" in body.model_fields_set:
+        user.timezone = body.timezone
     await db.commit()
     await db.refresh(user)
     audit_log(request, "profile_updated", current_user.id)
-    return UserResponse.model_validate(user)
+    return await _user_response(db, user)
+
+
+# ─── Profile photo ───────────────────────────────────────────────────────────
+# The client crops and sends the image as the raw request body (Content-Type
+# image/jpeg|png|webp), not multipart: reading the stream ourselves lets us stop
+# at MAX_UPLOAD_BYTES instead of spooling an unbounded multipart body first.
+# Decoding is CPU-heavy, so it runs off the event loop and at most two at a time
+# per process.
+_AVATAR_DECODES = asyncio.Semaphore(2)
+
+
+async def _read_capped_body(request: Request) -> bytes:
+    declared = request.headers.get("content-length")
+    if declared is not None and declared.isdigit() and int(declared) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                            "The photo must be 5 MB or smaller.")
+    body = bytearray()
+    async for chunk in request.stream():
+        body += chunk
+        if len(body) > MAX_UPLOAD_BYTES:
+            raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                                "The photo must be 5 MB or smaller.")
+    return bytes(body)
+
+
+async def _store_avatar(db: AsyncSession, user_id: str, image: bytes | None) -> None:
+    """Upsert the user's photo row. A NEW version on every write (also on remove)
+    so nothing cached under an old version can be served as the current photo."""
+    stmt = pg_insert(UserAvatar).values(
+        user_id=user_id, image=image, version=uuid.uuid4().hex
+    )
+    stmt = stmt.on_conflict_do_update(
+        index_elements=[UserAvatar.user_id],
+        set_={"image": stmt.excluded.image, "version": stmt.excluded.version,
+              "updated_at": func.now()},
+    )
+    await db.execute(stmt)
+
+
+@router.post("/avatar", response_model=UserResponse)
+async def upload_avatar(
+    request: Request,
+    current_user: Annotated[User, Depends(require_session)],
+    db: AsyncSession = Depends(get_rls_db),
+) -> UserResponse:
+    """Set or replace the profile photo. Signed-in sessions only (not API keys)."""
+    await rate_limit(request, zone="avatar", identifier=f"avatar:{current_user.id}")
+    content_type = request.headers.get("content-type", "").split(";")[0].strip().lower()
+    if content_type not in ALLOWED_CONTENT_TYPES:
+        raise HTTPException(status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+                            "Upload a JPEG, PNG or WebP image.")
+    raw = await _read_capped_body(request)
+    async with _AVATAR_DECODES:
+        try:
+            webp = await run_in_threadpool(process_avatar, raw)
+        except AvatarError as exc:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from None
+    await _store_avatar(db, current_user.id, webp)
+    await db.commit()
+    audit_log(request, "avatar_updated", current_user.id)
+    return await _user_response(db, current_user)
+
+
+@router.delete("/avatar", response_model=UserResponse)
+async def remove_avatar(
+    request: Request,
+    current_user: Annotated[User, Depends(require_session)],
+    db: AsyncSession = Depends(get_rls_db),
+) -> UserResponse:
+    """Remove the profile photo; the bytes are erased, not just hidden."""
+    await rate_limit(request, zone="avatar", identifier=f"avatar:{current_user.id}")
+    await _store_avatar(db, current_user.id, None)
+    await db.commit()
+    audit_log(request, "avatar_removed", current_user.id)
+    return await _user_response(db, current_user)
+
+
+@router.get("/sessions", response_model=list[SessionResponse])
+async def list_my_sessions(
+    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+    _session: Annotated[User, Depends(require_session)],
+    db: AsyncSession = Depends(get_rls_db),
+) -> list[SessionResponse]:
+    """The user's signed-in devices, most recently active first."""
+    current_fam = (ctx.payload or {}).get("fam")
+    rows = await _user_sessions.list_sessions(db, ctx.user.id, ctx.user.revoked_at)
+    return [
+        SessionResponse.model_validate(r).model_copy(update={"current": r.id == current_fam})
+        for r in rows
+    ]
+
+
+async def _revoke_my_sessions(
+    request: Request, db: AsyncSession, user: User, *, only: str | None = None,
+    keep: str | None = None,
+) -> int:
+    import redis.exceptions as _redis_exceptions
+
+    from src.api.middleware.auth_hardening import revocation_unavailable_503
+
+    await rate_limit(request, zone="auth", identifier=f"sessions:{user.id}")
+    try:
+        return await _user_sessions.revoke_sessions(db, user.id, only=only, keep=keep)
+    except _redis_exceptions.RedisError:
+        raise revocation_unavailable_503()
+
+
+@router.delete("/sessions/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def revoke_my_session(
+    session_id: str,
+    request: Request,
+    current_user: Annotated[User, Depends(require_session)],
+    db: AsyncSession = Depends(get_rls_db),
+) -> None:
+    """Sign out one device. Only the caller's own sessions can match."""
+    if not await _revoke_my_sessions(request, db, current_user, only=session_id):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Session not found.")
+    audit_log(request, "session_revoked", current_user.id)
+
+
+@router.post("/sessions/revoke-others", status_code=status.HTTP_204_NO_CONTENT)
+async def revoke_my_other_sessions(
+    request: Request,
+    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+    _session: Annotated[User, Depends(require_session)],
+    db: AsyncSession = Depends(get_rls_db),
+) -> None:
+    """Sign out every device except this one."""
+    keep = (ctx.payload or {}).get("fam")
+    await _revoke_my_sessions(request, db, ctx.user, keep=keep)
+    audit_log(request, "sessions_revoked_others", ctx.user.id)
+
+
+@router.post("/email/change", status_code=status.HTTP_202_ACCEPTED)
+async def request_email_change(
+    body: EmailChangeRequest,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    current_user: Annotated[User, Depends(require_session)],
+    db: AsyncSession = Depends(get_rls_db),
+) -> dict:
+    """Email a confirmation link to the new address. Same answer whether or not
+    that address already has an account."""
+    await _reauthenticate(request, current_user, body.current_password)
+    user = (await db.execute(select(User).where(User.id == current_user.id))).scalar_one()
+    await _email_change.request_email_change(
+        request, background_tasks, db, user, str(body.new_email), body.mfa_code
+    )
+    return {"message": "Check the new address for a confirmation link. It expires in 1 hour."}
+
+
+@router.post("/email/confirm")
+async def confirm_email_change(
+    body: EmailChangeConfirm, request: Request, db: AsyncSession = Depends(get_db)
+) -> dict:
+    """Redeem the emailed link. The token is the credential, so no session is
+    needed (the link may be opened on another device). Signs out every session."""
+    await _email_change.confirm_email_change(request, db, body.token)
+    return {"message": "Your email address was changed. Sign in with the new address."}
+
+
+# Security activity a user should be able to recognise (or not) as their own.
+# An allowlist, not "everything with my user_id": the audit log also holds
+# operational events (job_created, ...) that are not security activity.
+SECURITY_EVENTS = (
+    "login_success", "password_changed", "password_reset", "mfa_enabled",
+    "mfa_disabled", "mfa_breakglass_used", "api_key_created", "email_change_requested",
+    "email_changed", "session_revoked", "sessions_revoked_others", "logout_all",
+)
+
+
+@router.get("/security-events", response_model=list[SecurityEventResponse])
+async def my_security_events(
+    current_user: CurrentUser, db: AsyncSession = Depends(get_rls_db)
+) -> list[SecurityEventResponse]:
+    """The user's 20 most recent security events (Settings > Security)."""
+    rows = await db.execute(
+        select(AuditEvent.event, AuditEvent.created_at)
+        .where(AuditEvent.user_id == current_user.id, AuditEvent.event.in_(SECURITY_EVENTS))
+        .order_by(AuditEvent.created_at.desc())
+        .limit(20)
+    )
+    return [SecurityEventResponse(event=e, created_at=t) for e, t in rows.all()]
+
+
+@router.get("/avatar", responses={200: {"content": {"image/webp": {}}}})
+async def get_avatar(
+    current_user: CurrentUser,
+    v: str | None = None,
+    db: AsyncSession = Depends(get_rls_db),
+) -> Response:
+    """The signed-in user's photo as WebP. `v` is the avatar_version from /auth/me:
+    a request for the CURRENT version is cacheable forever (the version changes
+    with the photo); any other version is served uncached."""
+    row = (
+        await db.execute(
+            select(UserAvatar.image, UserAvatar.version).where(
+                UserAvatar.user_id == current_user.id
+            )
+        )
+    ).one_or_none()
+    if row is None or row.image is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No profile photo.")
+    cache = ("private, max-age=31536000, immutable" if v == row.version
+             else "private, no-store")
+    return Response(
+        content=row.image,
+        media_type="image/webp",
+        # Vary: a browser shared by two accounts must never answer one user's
+        # request from the other's cached photo.
+        headers={"Cache-Control": cache, "Vary": "Authorization",
+                 "X-Content-Type-Options": "nosniff"},
+    )
 
 
 @router.get("/onboarding")
@@ -305,6 +556,7 @@ async def onboarding_status(
 async def logout(
     request: Request,
     body: LogoutRequest | None = None,
+    db: AsyncSession = Depends(get_db),
 ) -> None:
     """End THIS session: the access token (bearer), the refresh token (body), or both.
 
@@ -337,6 +589,14 @@ async def logout(
             pass
     if not presented:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
+
+    # Durable record FIRST: the session row is what refresh trusts, so even if
+    # Redis fails below (or later evicts the markers) this session can never
+    # refresh again. Both tokens were signed by us and carry their own sub +
+    # fam, so no tenant can be named here but the token's own.
+    for payload in presented:
+        if payload.get("sub") and payload.get("fam"):
+            await _user_sessions.mark_sessions_revoked(db, payload["sub"], [payload["fam"]])
 
     # Logout MUST actually revoke. If Redis is unavailable we cannot, so 503:
     # reporting success would tell the client the session is dead while it

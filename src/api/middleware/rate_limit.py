@@ -62,6 +62,10 @@ _ZONES: dict[str, tuple[int, int]] = {
     # table never starves the progress panel. Fails OPEN like `general`: a read buys
     # nothing (not in _FALLBACK_ZONES).
     "lookup_read": (60, 60),
+    # POST/DELETE /auth/avatar, keyed per user. Each upload decodes and re-encodes
+    # an image (CPU), so it fails CLOSED (_FALLBACK_ZONES). 20/hour covers a user
+    # trying a few photos; nobody changes their photo every few seconds.
+    "avatar": (20, 3600),
 }
 
 _redis_client: aioredis.Redis | None = None
@@ -140,7 +144,9 @@ def client_ip(request: Request) -> str:
 # `export` and `writes` join them (audit #3 consult with Codex): an outage must not
 # open unlimited CSV rebuilds or scraper churn either; nor unlimited tab scans
 # (`lookup_quote`).
-_FALLBACK_ZONES = frozenset({"auth", "webhook", "stripe", "export", "writes", "lookup_quote"})
+_FALLBACK_ZONES = frozenset(
+    {"auth", "webhook", "stripe", "export", "writes", "lookup_quote", "avatar"}
+)
 # Insertion-ordered (dict preserves order), so the oldest keys are the cheapest
 # to find when we need to reclaim space.
 _fallback_hits: dict[str, list[float]] = {}

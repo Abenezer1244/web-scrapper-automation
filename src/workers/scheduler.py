@@ -186,6 +186,12 @@ app.conf.beat_schedule = {
         "task": "src.workers.scheduler.purge_expired_pending_registrations",
         "schedule": crontab(minute=39),  # hourly at :39
     },
+    "drain-email-change-outbox": {
+        # Confirmed email changes: notify the OLD address + sync the Stripe
+        # customer email, retried with backoff (src/workers/account_emails.py).
+        "task": "src.workers.scheduler.drain_email_change_outbox",
+        "schedule": 60.0,
+    },
     "dispatch-pending-verification-emails": {
         # Email-verification OUTBOX: send the verification email for each due
         # pending_registrations row and record the outcome on the row. The row is
@@ -546,6 +552,18 @@ def purge_skip_trace_pii() -> None:
     RETENTION_PURGE_ENABLED; logs without writing while RETENTION_PURGE_DRY_RUN.
     """
     return _purge_skip_trace_pii_impl()
+
+
+@app.task(name="src.workers.scheduler.drain_email_change_outbox")
+def drain_email_change_outbox() -> None:
+    """Finish confirmed email changes (old-address notice + Stripe email sync).
+
+    Every 60s. The pending_email_changes row is the outbox, so a confirmation
+    made while Redis or Resend or Stripe was down still completes once they
+    recover; permanent failures are marked and ops-alerted.
+    """
+    from src.workers.account_emails import _drain_email_change_outbox_impl
+    return _drain_email_change_outbox_impl()
 
 
 @app.task(name="src.workers.scheduler.dispatch_pending_verification_emails")

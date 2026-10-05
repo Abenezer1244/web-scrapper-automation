@@ -11,7 +11,7 @@ import io
 import json
 import uuid
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import StreamingResponse
@@ -41,6 +41,7 @@ from src.api.middleware.rate_limit import rate_limit
 from src.api.results_category import already_delivered_condition
 from src.api.schemas import (
     RUN_START_402_RESPONSES,
+    BatchAttention,
     BatchChildSummary,
     BatchCreateRequest,
     BatchCreateResponse,
@@ -495,9 +496,9 @@ def _combined_record_count(batch: ScraperBatch, run: BatchRun | None) -> int | N
 
 async def _execution_facts(
     db: AsyncSession, user_id: str, runs: list[BatchRun]
-) -> dict[str, dict[str, int]]:
+) -> dict[str, dict[str, Any]]:
     """Per-batch facts from what the latest run's children actually DID, keyed by
-    batch_id. Two grouped queries for any number of runs (no per-batch query), both
+    batch_id. Three grouped queries for any number of runs (no per-batch query), all
     pinned to the user and to the runs' own child_job_ids, so one batch's jobs can
     never be counted in another's row."""
     job_ids = list(dict.fromkeys(str(j) for r in runs for j in (r.child_job_ids or [])))
@@ -506,9 +507,11 @@ async def _execution_facts(
     # A job counts only for the batch its config belongs to, so a stale or wrong
     # id in child_job_ids (even the same user's other batch) adds nothing.
     jobs = {
-        str(jid): (st, rc or 0, bid)
-        for jid, st, rc, bid in (await db.execute(
-            select(Job.id, Job.status, Job.record_count, ScraperConfig.batch_id)
+        str(jid): (st, rc or 0, bid, county, rt, bool(skip_on))
+        for jid, st, rc, bid, county, rt, skip_on in (await db.execute(
+            select(Job.id, Job.status, Job.record_count, ScraperConfig.batch_id,
+                   ScraperConfig.county, ScraperConfig.record_type,
+                   ScraperConfig.skip_trace_enabled)
             .join(ScraperConfig, ScraperConfig.id == Job.scraper_config_id)
             .where(
                 Job.user_id == user_id,
@@ -529,22 +532,67 @@ async def _execution_facts(
             .group_by(Result.job_id)
         )).all()
     }
-    facts: dict[str, dict[str, int]] = {}
+    # Field coverage of each DONE child's NEW leads (the same per-row rules as its
+    # record_count: actionable, inside the tax cap, not a duplicate). An empty
+    # string is not a value.
+    done_ids = [j for j, v in jobs.items() if v[0] == "done"]
+    coverage = {
+        str(jid): (n, n_parcel, n_mailing)
+        for jid, n, n_parcel, n_mailing in (await db.execute(
+            select(
+                Result.job_id,
+                func.count(Result.id),
+                func.count(Result.id).filter(func.nullif(func.btrim(Result.parcel_id), "").is_not(None)),
+                func.count(Result.id).filter(func.nullif(func.btrim(Result.mailing_address), "").is_not(None)),
+            )
+            .where(
+                Result.user_id == user_id,
+                Result.job_id.in_(done_ids),
+                Result.is_duplicate.is_(False),
+                actionable_condition(),
+                tax_cap_condition(datetime.now(UTC).date()),
+            )
+            .group_by(Result.job_id)
+        )).all()
+    } if done_ids else {}
+    facts: dict[str, dict[str, Any]] = {}
     for run in runs:
-        f = {"children_done": 0, "children_failed": 0, "new_records": 0,
-             "contacts_looked_up": 0}
+        f: dict[str, Any] = {"children_done": 0, "children_failed": 0, "new_records": 0,
+                             "contacts_looked_up": 0, "attention": []}
+        counted = 0
+        off_lookups = 0  # lookups bought for a child configured OFF (any batch rollup)
         for jid in dict.fromkeys(str(j) for j in (run.child_job_ids or [])):
-            st, rc, bid = jobs.get(jid, (None, 0, None))
+            st, rc, bid, county, rt, skip_on = jobs.get(jid, (None, 0, None, None, None, False))
             if bid != run.batch_id:
                 continue
+            counted += 1
             if st == "done":
                 f["children_done"] += 1
                 f["new_records"] += rc
+                n, n_parcel, n_mailing = coverage.get(jid, (0, 0, 0))
+                # ponytail: fixed launch heuristic (>= 10 new leads, under half
+                # covered); move to a per-county baseline once history allows.
+                if n >= _ATTENTION_MIN_LEADS:
+                    for code, have in (("low_parcel_coverage", n_parcel),
+                                       ("low_mailing_coverage", n_mailing)):
+                        if have * 2 < n:
+                            f["attention"].append(BatchAttention(
+                                code=code, county=county, record_type=rt, have=have, of=n))
             elif st in _UNDELIVERABLE_CHILD_STATUSES:
                 f["children_failed"] += 1
             f["contacts_looked_up"] += looked_up.get(jid, 0)
+            if not skip_on:
+                off_lookups += looked_up.get(jid, 0)
+        if off_lookups:
+            f["attention"].append(BatchAttention(code="lookup_while_off", have=off_lookups))
+        if f["children_failed"]:
+            f["attention"].insert(0, BatchAttention(
+                code="scrapes_failed", have=f["children_failed"], of=counted))
         facts[run.batch_id] = f
     return facts
+
+
+_ATTENTION_MIN_LEADS = 10
 
 
 def _skip_trace_rollup(flags: set[bool]) -> str:
@@ -560,12 +608,16 @@ def _summary(
     child_count: int,
     record_types: list[str] | None = None,
     counties: list[str] | None = None,
-    facts: dict[str, int] | None = None,
+    facts: dict[str, Any] | None = None,
     skip_flags: set[bool] | None = None,
 ) -> BatchSummaryResponse:
+    facts = dict(facts or {})
+    skip_trace = _skip_trace_rollup(skip_flags or set())
+    attention = list(facts.pop("attention", []))
     return BatchSummaryResponse(
-        **(facts or {}),
-        skip_trace=_skip_trace_rollup(skip_flags or set()),
+        **facts,
+        attention=attention,
+        skip_trace=skip_trace,
         id=batch.id,
         name=batch.name,
         state=batch.state,
@@ -702,15 +754,19 @@ async def get_batch(
     job_by_config: dict[str, tuple[str, str, int]] = {}
     persisted: dict[str, int] = {}
     delivered_by_job: dict[str, int] = {}
+    times_by_config: dict[str, tuple] = {}
     if run and run.child_job_ids:
         job_rows = (
             await db.execute(
-                select(Job.id, Job.scraper_config_id, Job.status, Job.record_count).where(
+                select(Job.id, Job.scraper_config_id, Job.status, Job.record_count,
+                       Job.started_at, Job.finished_at).where(
                     Job.user_id == current_user.id, Job.id.in_(run.child_job_ids)
                 )
             )
         ).all()
-        job_by_config = {scid: (jid, st, rc) for (jid, scid, st, rc) in job_rows}
+        job_by_config = {scid: (jid, st, rc) for (jid, scid, st, rc, _s, _f) in job_rows}
+        # Kept apart from the (id, status, record_count) tuple _child_lead_count reads.
+        times_by_config = {scid: (sa, fa) for (_j, scid, _st, _rc, sa, fa) in job_rows}
         # Deliverable rows each child ACTUALLY saved. Same per-row rules the
         # combined export applies in _COMBINED_CTES — actionability (no property
         # AND no mailing address = not a lead) and the tax recency cap — plus the
@@ -790,6 +846,8 @@ async def get_batch(
                     if job and job[1] not in _UNDELIVERABLE_CHILD_STATUSES else 0
                 ),
                 skip_trace_enabled=bool(skip_on),
+                started_at=times_by_config.get(cid, (None, None))[0],
+                finished_at=times_by_config.get(cid, (None, None))[1],
             )
         )
 

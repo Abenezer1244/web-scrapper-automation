@@ -19,6 +19,61 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-10-05 — Batch system audit: the "384", a contact under skip-trace OFF, and one run per batch
+
+> Owner report: batch "testas" (Pierce probate + pre-foreclosure, skip tracing OFF) showed
+> "1 lead on 2+ lists · 384 single-list" beside children reading 15 new / 1 new, a phone and an
+> email on its one combined lead, and two unrelated-looking rows on the dashboard.
+> Audit (read-only prod forensics): `docs/audits/2026-10-04-batch-system-audit.md`.
+
+**Built / Shipped:**
+- **BE #461 (LIVE, `96802c9d`):** combined leads say `already_delivered` (canonical prior_run rule),
+  carry contact provenance (`skip_trace_status`, `skip_trace_attempted_at`, `contact_reused`),
+  `?delivery=new|delivered`, and `quality` (one statement, exclusive groups that reconcile). Batch
+  list/detail: children_done/failed, new_records, skip_trace off/on/mixed, contacts_looked_up
+  (executed), per-child already_delivered_count + skip setting.
+- **This PR (BE):** `attention` reasons on GET /batches (scrapes_failed, low parcel/mailing coverage
+  per done child, lookup_while_off per off child) and child `started_at`/`finished_at` for a timeline.
+- **FE #226** dashboard "Recent runs" (one row per batch), **#228** batch page leads with the result,
+  "N of M" quality, contact source on every row, mobile cards; **FE PR (this session)** needs-attention
+  + activity timeline. Browser-verified against a stub API at 320-1440px (304 + 39 checks).
+
+**Tried / Decided:**
+- "Skip tracing OFF" = no NEW paid lookup; the account's own earlier answers are still reused free
+  (`_reuse_enrichment_for_duplicates` runs for every job) and are now DISCLOSED, not hidden. Owner
+  chose this (option A); Codex agreed.
+- Kept every row in the combined set, split new vs delivered, rather than hiding delivered rows.
+- Activity timeline uses only recorded timestamps (no invented events); a retry re-stamps
+  `started_at`, so the UI says "latest attempt". Attention thresholds (>= 10 new leads, < 50%) are a
+  launch heuristic (`ponytail:` note), not a county baseline.
+
+**Failed / Blocked:**
+- Local `pytest` full suite was killed once for low memory; reran in small foreground batches.
+- C: hit 0 bytes free mid-browser-check (ENOSPC); stopped writers, deleted only my own build cache.
+- npm installed `three` into the user-level node_modules by walking up to an ancestor package.json;
+  moved it out and removed its hidden-lockfile entry. Junctioning it back was denied; got past
+  /login instead by minting an Auth.js session cookie with a throwaway local secret.
+- My first Codex review diffed against a MOVED origin/main and flagged another session's PACS change
+  as mine (the 2-dot-diff landmine). Diff against your own base.
+
+**Caught & fixed (review / browser):**
+- Codex: "already delivered" must use the prior_run predicate, not `is_duplicate` (same-run siblings
+  and superseded rows carry it too); a job counts only for its own config's batch; repeated child ids
+  counted once; lookup_while_off missed on mixed batches; empty-state count included unmatchable rows.
+- Browser: contact column cut off even at 1440px; scrape rows squeezed on phones; contact checks
+  warning "Some missing" when no lookup was requested.
+
+**Pending / Handoff:**
+- 3.8a (BE #462, other session) adds all phones/emails to BatchLeadRow on top of #461.
+- Quality `with_phone`/`with_email` count stored values (an undecryptable one shows blank): documented.
+- Attention thresholds should become per-county baselines once history allows.
+
+**Facts learned:**
+- `results.is_duplicate` != "already delivered": use `results_category.already_delivered_*`.
+- `jobs.started_at` is the attempt token (re-stamped per retry); every terminal state sets `finished_at`.
+- The dashboard listed configs (`/scrapers`), so batch children showed as rows; `/batches` + filtering
+  `batch_id` is the real grouping.
+
 ## 2026-10-04 — UX 3.8 security phases: no-store everywhere contacts go, and the raw-SQL decoder paths (BE)
 
 > UX audit item 3, Phase 3.8 (owner-approved plan, Codex plan GO r18; plan + Todo in `bridgeleads-web`

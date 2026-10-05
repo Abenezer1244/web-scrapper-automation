@@ -129,6 +129,70 @@
         "title": "AuctionCoverage",
         "type": "object"
       },
+      "BatchAttention": {
+        "description": "One reason a batch needs a look, in facts not a score. The UI words it.\n\nCodes: scrapes_failed (have = failed OR cancelled children, worded \"did not\nfinish\"; of = child scrapes);\nlow_parcel_coverage / low_mailing_coverage (one DONE scrape whose NEW leads\ncarry the field on fewer than half, of >= 10; launch heuristics, not a county\nbaseline); lookup_while_off (skip tracing configured off, yet a lookup was\nbought for a row of a child configured off, whatever the batch rollup).",
+        "properties": {
+          "code": {
+            "enum": [
+              "scrapes_failed",
+              "low_parcel_coverage",
+              "low_mailing_coverage",
+              "lookup_while_off"
+            ],
+            "title": "Code",
+            "type": "string"
+          },
+          "county": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "County"
+          },
+          "have": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Have"
+          },
+          "of": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Of"
+          },
+          "record_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Record Type"
+          }
+        },
+        "required": [
+          "code"
+        ],
+        "title": "BatchAttention",
+        "type": "object"
+      },
       "BatchChildSummary": {
         "description": "One child scrape within a batch (county x record_type) and its job status.",
         "properties": {
@@ -144,6 +208,18 @@
           "county": {
             "title": "County",
             "type": "string"
+          },
+          "finished_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finished At"
           },
           "job_id": {
             "anyOf": [
@@ -169,6 +245,18 @@
             "default": false,
             "title": "Skip Trace Enabled",
             "type": "boolean"
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Started At"
           },
           "status": {
             "$ref": "#/components/schemas/JobStatus",
@@ -346,6 +434,13 @@
       "BatchDetailResponse": {
         "description": "A batch with its per-child summary + failed-child detail — for the run view.",
         "properties": {
+          "attention": {
+            "items": {
+              "$ref": "#/components/schemas/BatchAttention"
+            },
+            "title": "Attention",
+            "type": "array"
+          },
           "child_count": {
             "default": 0,
             "title": "Child Count",
@@ -1004,6 +1099,13 @@
       "BatchSummaryResponse": {
         "description": "A batch + its (single, on-demand 2A) run status — for the list view.",
         "properties": {
+          "attention": {
+            "items": {
+              "$ref": "#/components/schemas/BatchAttention"
+            },
+            "title": "Attention",
+            "type": "array"
+          },
           "child_count": {
             "default": 0,
             "title": "Child Count",

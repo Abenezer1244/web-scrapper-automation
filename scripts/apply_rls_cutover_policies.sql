@@ -268,7 +268,8 @@ $batches$;
 
 -- ── audit_events: app INSERT-only WITH CHECK (true) — the audit background
 --    task runs in a fresh AsyncSessionLocal with NO GUC and nullable user_id
---    (anon login failures). No app SELECT (no read path; forensics = owner).
+--    (anon login failures). App SELECT of its OWN rows only: see the 111
+--    audit_events_app_select_own policy below.
 DROP POLICY IF EXISTS audit_events_app_insert ON public.audit_events;
 CREATE POLICY audit_events_app_insert ON public.audit_events
     FOR INSERT TO bridgeleads_app WITH CHECK (true);
@@ -308,6 +309,44 @@ CREATE POLICY notifications_app_update ON public.notifications
 DROP POLICY IF EXISTS notifications_system ON public.notifications;
 CREATE POLICY notifications_system ON public.notifications
     FOR ALL TO bridgeleads_system USING (true) WITH CHECK (true);
+
+-- ── Profile & account (111): user_avatars, user_sessions, pending_email_changes.
+--    App SELECT/INSERT/UPDATE on its OWN rows only (no DELETE grant or policy).
+--    Login/refresh/confirm-email bind the GUC by hand once the user is known.
+--    pending_email_changes also gets a system policy: the beat drainer updates
+--    confirmed rows' outbox state cross-tenant. Drop migration 111's untargeted
+--    isolation policies first, then role-target.
+DO $profile$
+DECLARE
+    t text;
+    guc text := 'user_id = NULLIF(current_setting(''app.current_user_id'', true), '''')::uuid';
+BEGIN
+    FOREACH t IN ARRAY ARRAY['user_avatars', 'user_sessions', 'pending_email_changes'] LOOP
+        EXECUTE format('DROP POLICY IF EXISTS %I ON public.%I', t || '_user_isolation', t);
+        EXECUTE format('DROP POLICY IF EXISTS %I ON public.%I', t || '_app_select', t);
+        EXECUTE format(
+            'CREATE POLICY %I ON public.%I FOR SELECT TO bridgeleads_app USING (%s)',
+            t || '_app_select', t, guc);
+        EXECUTE format('DROP POLICY IF EXISTS %I ON public.%I', t || '_app_insert', t);
+        EXECUTE format(
+            'CREATE POLICY %I ON public.%I FOR INSERT TO bridgeleads_app WITH CHECK (%s)',
+            t || '_app_insert', t, guc);
+        EXECUTE format('DROP POLICY IF EXISTS %I ON public.%I', t || '_app_update', t);
+        EXECUTE format(
+            'CREATE POLICY %I ON public.%I FOR UPDATE TO bridgeleads_app USING (%s) WITH CHECK (%s)',
+            t || '_app_update', t, guc, guc);
+    END LOOP;
+END
+$profile$;
+DROP POLICY IF EXISTS pending_email_changes_system ON public.pending_email_changes;
+CREATE POLICY pending_email_changes_system ON public.pending_email_changes
+    FOR ALL TO bridgeleads_system USING (true) WITH CHECK (true);
+-- audit_events (111): the app reads its OWN activity feed. Paired with the
+-- INSERT-only policy above; no app UPDATE/DELETE policy exists.
+DROP POLICY IF EXISTS audit_events_app_select_own ON public.audit_events;
+CREATE POLICY audit_events_app_select_own ON public.audit_events
+    FOR SELECT TO bridgeleads_app
+    USING (user_id = NULLIF(current_setting('app.current_user_id', true), '')::uuid);
 
 -- ── stripe_webhook_events (095): app SELECT + INSERT, every row. The webhook
 --    runs with no tenant GUC and the table holds event ids only, no tenant

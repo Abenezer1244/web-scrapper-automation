@@ -318,23 +318,89 @@ def test_batches_app_select_insert_only(cutover_ready: bool) -> None:
         conn.rollback()
 
 
-def test_audit_events_app_insert_only_no_read(cutover_ready: bool) -> None:
-    """audit_events: app INSERTs with NO GUC + NULL user_id; SELECT is denied."""
+def test_audit_events_app_inserts_and_reads_only_its_own(cutover_ready: bool) -> None:
+    """audit_events: app INSERTs with NO GUC + NULL user_id; it READS only rows
+    whose user_id is its GUC (Settings > Security activity, migration 111), and
+    can never UPDATE or DELETE."""
     with sync_engine.begin() as conn:
+        user_a, user_b, _ra, _rb = _seed_two_tenants(conn)
+        ea, eb, anon = str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4())
         conn.execute(text("SET LOCAL ROLE bridgeleads_app"))
         # Deliberately NO GUC — mirrors the audit background task session.
         conn.execute(
             text("""
-                INSERT INTO audit_events (id, event, user_id, ip, path, detail)
-                VALUES (:i, 'rls_test_event', NULL, '127.0.0.1', '/test', 'h1')
+                INSERT INTO audit_events (id, event, user_id, ip, path, detail) VALUES
+                (:ea, 'rls_test_event', :a, '127.0.0.1', '/test', 'h1'),
+                (:eb, 'rls_test_event', :b, '127.0.0.1', '/test', 'h1'),
+                (:n, 'rls_test_event', NULL, '127.0.0.1', '/test', 'h1')
             """),
-            {"i": str(uuid.uuid4())},
+            {"ea": ea, "eb": eb, "n": anon, "a": user_a, "b": user_b},
         )
-        # No read path for the app role — not even its own insert.
-        with pytest.raises(DBAPIError):
-            with conn.begin_nested():
-                conn.execute(text("SELECT id FROM audit_events LIMIT 1"))
 
+        def visible() -> set[str]:
+            return set(conn.execute(
+                text("SELECT id::text FROM audit_events WHERE id IN (:ea, :eb, :n)"),
+                {"ea": ea, "eb": eb, "n": anon},
+            ).scalars())
+
+        assert visible() == set(), "app role with no GUC must read no audit rows"
+        conn.execute(
+            text("SELECT set_config('app.current_user_id', :u, true)"), {"u": user_a}
+        )
+        assert visible() == {ea}, "app role A read another tenant's or anon audit rows"
+        for statement in (
+            "UPDATE audit_events SET detail = 'x' WHERE id = :ea",
+            "DELETE FROM audit_events WHERE id = :ea",
+        ):
+            nested = conn.begin_nested()
+            with pytest.raises(DBAPIError):
+                conn.execute(text(statement), {"ea": ea})
+            nested.rollback()
+
+        conn.execute(text("RESET ROLE"))
+        conn.rollback()
+
+
+@pytest.mark.parametrize("table", ["user_avatars", "user_sessions", "pending_email_changes"])
+def test_profile_tables_app_crud_is_tenant_scoped_without_delete(
+    cutover_ready: bool, table: str
+) -> None:
+    """Migration 111 tables: the app writes and reads ONLY its own rows, and has
+    no DELETE (removal is NULL image / revoked_at / status)."""
+    insert = {
+        "user_avatars": "INSERT INTO user_avatars (user_id, image, version) "
+                        "VALUES (:u, '\\x00'::bytea, 'v1')",
+        "user_sessions": "INSERT INTO user_sessions (id, user_id) VALUES (:k, :u)",
+        "pending_email_changes": (
+            "INSERT INTO pending_email_changes (id, user_id, new_email, new_email_hmac, "
+            "expires_at) VALUES (:k, :u, 'enc', 'h', now() + interval '1 hour')"
+        ),
+    }[table]
+    with sync_engine.begin() as conn:
+        user_a, user_b, _ra, _rb = _seed_two_tenants(conn)
+        conn.execute(text("SET LOCAL ROLE bridgeleads_app"))
+        conn.execute(
+            text("SELECT set_config('app.current_user_id', :u, true)"), {"u": user_a}
+        )
+        key = uuid.uuid4().hex if table == "user_sessions" else str(uuid.uuid4())
+        conn.execute(text(insert), {"u": user_a, "k": key})
+        # Cannot write a row for another tenant.
+        nested = conn.begin_nested()
+        with pytest.raises(DBAPIError):
+            conn.execute(text(insert), {"u": user_b, "k": uuid.uuid4().hex})
+        nested.rollback()
+        own = f"SELECT COUNT(*) FROM {table} WHERE user_id = :u"
+        assert conn.execute(text(own), {"u": user_a}).scalar() == 1
+        nested = conn.begin_nested()
+        with pytest.raises(DBAPIError):
+            conn.execute(text(f"DELETE FROM {table} WHERE user_id = :u"), {"u": user_a})
+        nested.rollback()
+        conn.execute(
+            text("SELECT set_config('app.current_user_id', :u, true)"), {"u": user_b}
+        )
+        assert conn.execute(text(own), {"u": user_a}).scalar() == 0, (
+            f"app role B read A's {table} row"
+        )
         conn.execute(text("RESET ROLE"))
         conn.rollback()
 

@@ -48,3 +48,14 @@ Adopted P2s: fixed DTO for security events (no detail/path/ip), sanitize forward
 - Workspace/account split (plan, Stripe, quota live on users)
 - API key revoke endpoint + api_key_revoked event (key only cleared as side effect today)
 - Delete account / export data implementation
+
+## Review (2026-10-05)
+Done on branches (local, unpushed): BE `feat/profile-account-redesign` (299867d0->rebased ae70dce0, af3b2924, f9859037, ea834a4d) on main d2be916e; FE `feat/profile-account-redesign` ac017bc on master a6b03eb.
+- [x] P1 migration 111 + RLS/grants in 3 scripts (RLS tests 23 passed, mutation-checked)
+- [x] P2 avatar API (28 tests), P3 sessions + 30-day cap (9), P4 activity + email change (12); auth regression 180 passed (2 timing flakes re-verified in isolation)
+- [x] P5-P7 FE: UserAvatar/initials (node:test 7/7), menu, Account, Security, mobile settings, /confirm-email; tsc + eslint clean
+- [x] P8 deletion/export design doc (docs/product/account-deletion-and-export.md)
+- [~] P9 Playwright: run 2 = 41/46 (all 5 failures traced to harness timing/landmine and fixed); run 3 reached 39/40 before the OS killed it for low memory. Email-change e2e passed in run 2. "other device signed out" failed once in run 3 (passed in run 2; probe shows redirect in ~5s) -> re-verify.
+- [ ] Codex FE diff review: killed by low memory before output -> rerun
+- [ ] PRs not opened; no merge/deploy (owner decision)
+Codex: architecture GATE FAIL -> reconciled; BE P1 GATE PASS; avatar GATE PASS; sessions/email GATE FAIL -> both P1s fixed (DB-first revoke; post-mint logout-all recheck).

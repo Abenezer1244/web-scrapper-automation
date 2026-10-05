@@ -7,10 +7,13 @@ done/failed counts, new records billed, skip tracing as configured, and lookups 
 executed. DB-backed, real Postgres.
 """
 import uuid
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select
 
 from src.db.models import BatchRun, Job, Result, ScraperBatch, ScraperConfig
+
+_T0 = datetime(2026, 10, 4, 6, 52, tzinfo=UTC)
 
 
 def _auth(token: str) -> dict:
@@ -36,8 +39,10 @@ async def _make_batch(db, user_id, name, children, *, extra_job_ids=()):
         )
         db.add(cfg)
         await db.flush()
+        terminal = st in ("done", "failed", "cancelled")
         job = Job(id=str(uuid.uuid4()), user_id=user_id, scraper_config_id=cfg.id,
-                  status=st, trigger="batch", record_count=rc)
+                  status=st, trigger="batch", record_count=rc,
+                  started_at=_T0, finished_at=_T0 + timedelta(minutes=5) if terminal else None)
         db.add(job)
         await db.flush()
         job_ids.append(job.id)
@@ -242,3 +247,75 @@ class TestDetailChildren:
         assert kids["pre_foreclosure"]["skip_trace_enabled"] is True
         assert body["skip_trace"] == "mixed"
         assert body["children_done"] == 1 and body["children_failed"] == 1
+
+
+def _rows(n, **over):
+    return [{"parcel_id": f"P{i:05d}", **over} for i in range(n)]
+
+
+class TestAttention:
+    async def test_failed_scrape_and_low_mailing_are_named_per_scrape(
+        self, client, db, starter_user, starter_token,
+    ):
+        rows = _rows(10)  # 10 new leads, every one with a parcel
+        for r in rows[:2]:
+            r["mailing_address"] = "PO BOX 1"  # mailing on only 2 of 10
+        await _make_batch(db, starter_user.id, "needs-look", [
+            ("pierce", "probate", "done", 10, False, rows),
+            ("king", "pre_foreclosure", "failed", 0, False, []),
+        ])
+        b = (await _list(client, starter_token))["needs-look"]
+        codes = [(a["code"], a.get("county"), a.get("have"), a.get("of")) for a in b["attention"]]
+        assert ("scrapes_failed", None, 1, 2) in codes
+        assert ("low_mailing_coverage", "pierce", 2, 10) in codes
+        # Every lead had a parcel: no parcel flag.
+        assert not any(c[0] == "low_parcel_coverage" for c in codes)
+
+    async def test_small_scrapes_are_not_judged(self, client, db, starter_user, starter_token):
+        await _make_batch(db, starter_user.id, "tiny", [
+            ("pierce", "probate", "done", 9, False, [{} for _ in range(9)]),
+        ])
+        assert (await _list(client, starter_token))["tiny"]["attention"] == []
+
+    async def test_lookup_while_off_is_flagged(self, client, db, starter_user, starter_token):
+        await _make_batch(db, starter_user.id, "off-but-bought", [
+            ("pierce", "probate", "done", 1, False, [
+                {"skip_trace_status": "hit", "skip_trace_source": "lookup"},
+            ]),
+        ])
+        codes = [a["code"] for a in (await _list(client, starter_token))["off-but-bought"]["attention"]]
+        assert codes == ["lookup_while_off"]
+
+
+class TestTimeline:
+    async def test_children_carry_their_latest_attempt_times(
+        self, client, db, starter_user, starter_token,
+    ):
+        batch_id, _ = await _make_batch(db, starter_user.id, "timed", [
+            ("pierce", "probate", "done", 1, False, []),
+            ("pierce", "pre_foreclosure", "scraping", 0, False, []),
+        ])
+        kids = {c["record_type"]: c for c in (await client.get(
+            f"/batches/{batch_id}", headers=_auth(starter_token))).json()["children"]}
+        assert kids["probate"]["started_at"].startswith("2026-10-04T06:52")
+        assert kids["probate"]["finished_at"].startswith("2026-10-04T06:57")
+        # Still in flight: started, not finished.
+        assert kids["pre_foreclosure"]["started_at"] is not None
+        assert kids["pre_foreclosure"]["finished_at"] is None
+
+
+    async def test_lookup_on_an_off_child_of_a_mixed_batch_is_flagged(
+        self, client, db, starter_user, starter_token,
+    ):
+        """Codex P1: the rollup is "mixed", but the OFF child still bought a lookup."""
+        await _make_batch(db, starter_user.id, "mixed-bought", [
+            ("pierce", "probate", "done", 1, True, [
+                {"skip_trace_status": "hit", "skip_trace_source": "lookup"},
+            ]),
+            ("pierce", "pre_foreclosure", "done", 1, False, [
+                {"skip_trace_status": "hit", "skip_trace_source": "lookup"},
+            ]),
+        ])
+        b = (await _list(client, starter_token))["mixed-bought"]
+        assert b["skip_trace"] == "mixed"
+        assert [(a["code"], a["have"]) for a in b["attention"]] == [("lookup_while_off", 1)]

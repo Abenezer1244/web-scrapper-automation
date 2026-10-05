@@ -1083,6 +1083,28 @@ class BatchChildSummary(BaseModel):
     # delivered" beside "15 new"; never summed into the batch's new figure.
     already_delivered_count: int = 0
     skip_trace_enabled: bool = False  # what this child was configured to do
+    # The job's LATEST attempt: a retry re-stamps started_at (it is the attempt
+    # token). finished_at is set on every terminal state (done, failed, the
+    # batch barrier's cancel, a user cancel), so null means still in flight.
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+
+
+class BatchAttention(BaseModel):
+    """One reason a batch needs a look, in facts not a score. The UI words it.
+
+    Codes: scrapes_failed (have = failed OR cancelled children, worded "did not
+    finish"; of = child scrapes);
+    low_parcel_coverage / low_mailing_coverage (one DONE scrape whose NEW leads
+    carry the field on fewer than half, of >= 10; launch heuristics, not a county
+    baseline); lookup_while_off (skip tracing configured off, yet a lookup was
+    bought for a row of a child configured off, whatever the batch rollup)."""
+
+    code: Literal["scrapes_failed", "low_parcel_coverage", "low_mailing_coverage", "lookup_while_off"]
+    county: str | None = None
+    record_type: str | None = None
+    have: int | None = None
+    of: int | None = None
 
 
 class BatchSummaryResponse(BaseModel):
@@ -1127,6 +1149,8 @@ class BatchSummaryResponse(BaseModel):
     # (results.skip_trace_source = 'lookup'). Execution, not configuration: a batch
     # set "off" that shows a non-zero here is an anomaly, never hidden.
     contacts_looked_up: int = 0
+    # Empty = nothing to flag. Each entry names the scrape and the numbers.
+    attention: list[BatchAttention] = Field(default_factory=list)
 
 
 class BatchDetailResponse(BatchSummaryResponse):

@@ -50,7 +50,9 @@ DECLARE
         -- apply to the table OWNER, so the policies would look correct while not
         -- constraining every path.
         'contact_lookup_actions', 'contact_lookup_action_results',
-        'contact_lookup_action_events'
+        'contact_lookup_action_events',
+        -- Profile & account (111): own avatar / sessions / email change
+        'user_avatars', 'user_sessions', 'pending_email_changes'
     ];
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bridgeleads_app')
@@ -108,6 +110,7 @@ $guard$;
 --     'scraper_batches','batch_runs','audit_events','nts_notices',
 --     'notifications','pending_registrations','stripe_webhook_events',
 --     'contact_lookup_actions','contact_lookup_action_results',
---     'contact_lookup_action_events']
+--     'contact_lookup_action_events','user_avatars','user_sessions',
+--     'pending_email_changes']
 --   LOOP EXECUTE format('ALTER TABLE IF EXISTS public.%I NO FORCE ROW LEVEL SECURITY', t);
 --   END LOOP; END $$;

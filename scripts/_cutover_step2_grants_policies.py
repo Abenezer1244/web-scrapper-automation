@@ -48,7 +48,13 @@ _GRANTS = [
     "skip_trace_cache, skip_trace_meter_events FROM bridgeleads_app",
     "REVOKE INSERT, DELETE ON mfa_break_glass_codes FROM bridgeleads_app",
     "REVOKE UPDATE, DELETE ON scraper_batches, batch_runs FROM bridgeleads_app",
-    "REVOKE SELECT, UPDATE, DELETE ON audit_events FROM bridgeleads_app",
+    # audit_events (111): the app READS its own rows (policy-bounded); never writes back.
+    "GRANT SELECT ON audit_events TO bridgeleads_app",
+    "REVOKE UPDATE, DELETE ON audit_events FROM bridgeleads_app",
+    # Profile & account (111): own avatar / sessions / email change. No DELETE.
+    "GRANT SELECT, INSERT, UPDATE ON user_avatars, user_sessions, pending_email_changes "
+    "TO bridgeleads_app",
+    "REVOKE DELETE ON user_avatars, user_sessions, pending_email_changes FROM bridgeleads_app",
     "REVOKE INSERT, DELETE ON dialer_deliveries FROM bridgeleads_app",
     # contact_lookup_* (migration 101). Mirrors provision_rls_roles.sql. The
     # REVOKE must precede the column GRANT: a table-level REVOKE also clears
@@ -117,7 +123,6 @@ _VERIFY_APP_GRANTS = """
             AND table_name IN ('mfa_break_glass_codes','dialer_deliveries'))
         OR (privilege_type = 'UPDATE'
             AND table_name IN ('scraper_batches','batch_runs','audit_events'))
-        OR (privilege_type = 'SELECT' AND table_name = 'audit_events')
         -- contact_lookup_* (101), mirroring provision_rls_roles.sql.
         OR (privilege_type = 'UPDATE'
             AND table_name IN ('contact_lookup_actions',

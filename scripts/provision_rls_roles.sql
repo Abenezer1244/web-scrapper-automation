@@ -163,6 +163,16 @@ GRANT UPDATE (dispatched_at) ON contact_lookup_actions TO bridgeleads_app;
 GRANT SELECT, INSERT ON contact_lookup_action_results TO bridgeleads_app;
 GRANT SELECT, INSERT ON contact_lookup_action_events TO bridgeleads_app;
 
+-- Profile & account (migration 111). The user's own avatar, login sessions and
+-- pending email change: the API creates and updates its own rows. No DELETE:
+-- removing an avatar NULLs `image`, signing a session out sets `revoked_at`, a
+-- replaced email request becomes status 'superseded'.
+GRANT SELECT, INSERT, UPDATE ON user_avatars, user_sessions, pending_email_changes
+    TO bridgeleads_app;
+-- audit_events: the app may READ its OWN rows (Settings > Security recent
+-- activity; the policy bounds it to the tenant GUC). Still no UPDATE/DELETE.
+GRANT SELECT ON audit_events TO bridgeleads_app;
+
 -- Converge to least privilege regardless of any prior (over-)grant: GRANT does
 -- not remove privileges an earlier version of this script handed out, so
 -- explicitly REVOKE everything the app must NOT hold (Codex review). DELETE is
@@ -181,7 +191,9 @@ REVOKE ALL ON nts_notices FROM bridgeleads_app;
 -- H1 drift tables — converge to exactly the grants above:
 REVOKE INSERT, DELETE ON mfa_break_glass_codes FROM bridgeleads_app;
 REVOKE UPDATE, DELETE ON scraper_batches, batch_runs FROM bridgeleads_app;
-REVOKE SELECT, UPDATE, DELETE ON audit_events FROM bridgeleads_app;
+REVOKE UPDATE, DELETE ON audit_events FROM bridgeleads_app;
+-- Profile & account (111): never an app DELETE (removal is NULL / revoked_at / status).
+REVOKE DELETE ON user_avatars, user_sessions, pending_email_changes FROM bridgeleads_app;
 REVOKE INSERT, DELETE ON dialer_deliveries FROM bridgeleads_app;
 -- notifications (065): app gets SELECT + UPDATE only; system writes the feed.
 REVOKE INSERT, DELETE ON notifications FROM bridgeleads_app;
@@ -220,7 +232,7 @@ BEGIN
                                'notifications'))
         OR (privilege_type = 'UPDATE'
             AND table_name IN ('scraper_batches', 'batch_runs', 'audit_events'))
-        OR (privilege_type = 'SELECT' AND table_name = 'audit_events')
+        -- audit_events SELECT is allowed since 111 (own rows, policy-bounded).
         -- contact_lookup_* (101): the API may never transition a verdict or
         -- rewrite history. Its UPDATE on contact_lookup_actions is COLUMN
         -- level, which information_schema.role_table_grants does not report
@@ -318,6 +330,10 @@ GRANT DELETE ON mfa_backup_codes, mfa_break_glass_codes TO bridgeleads_system;
 -- (outbox send) and the hourly purge DELETEs expired rows. SELECT/UPDATE come
 -- from the ALL TABLES grant above; DELETE is granted explicitly here.
 GRANT DELETE ON pending_registrations TO bridgeleads_system;
+-- pending_email_changes (111): the beat drainer SELECTs + UPDATEs the confirmed
+-- rows' outbox state. Explicit because the ALL TABLES grant above does not cover
+-- a table created after it ran. Nothing on user_avatars / user_sessions.
+GRANT SELECT, UPDATE ON pending_email_changes TO bridgeleads_system;
 -- skip_trace_cache: the daily Privacy Policy §7 retention sweep
 -- (scheduler_helpers/retention.py) DELETEs rows past the reuse window, which hold
 -- raw_response (the full Tracerfy payload). NULLing the PII columns on `results`

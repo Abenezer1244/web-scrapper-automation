@@ -14,7 +14,6 @@ from sqlalchemy import (
     ForeignKeyConstraint,
     Index,
     Integer,
-    LargeBinary,
     Numeric,
     String,
     Text,
@@ -250,9 +249,6 @@ class User(Base):
     # Allowlisted boolean keys: job_completed, job_failed, new_records,
     # usage_alert, payment_failed. Empty dict = service defaults apply.
     notification_prefs = Column(JSON, nullable=False, default=dict, server_default="{}")
-    # IANA zone id the user picked in Settings > Account (migration 111). Display
-    # only: schedules stay UTC and nothing reads this to schedule. NULL = never set.
-    timezone = Column(String(64), nullable=True)
     is_active = Column(Boolean, nullable=False, default=True)
     is_admin = Column(Boolean, nullable=False, default=False)
     # Logout-everywhere / password-reset / account-compromise revocation
@@ -349,81 +345,6 @@ class PendingRegistration(Base):
         """Keep email_hmac in lockstep with email (mirrors User._sync_email_hmac)."""
         from src.utils.crypto import blind_index
         self.email_hmac = blind_index(value) if value is not None else None
-        return value
-
-
-class UserAvatar(Base):
-    """The user's profile photo (migration 111): the SERVER re-encoded 256px WebP,
-    never the uploaded bytes. Kept off `users` so ordinary user reads never load
-    image data. Removal sets `image` to NULL (the app role has no DELETE).
-    `version` is new on every upload, so a URL or cache keyed on it can never
-    serve a replaced photo."""
-    __tablename__ = "user_avatars"
-
-    user_id = Column(
-        UUID(as_uuid=False), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
-    )
-    image = Column(LargeBinary, nullable=True)
-    version = Column(String(32), nullable=False)
-    updated_at = Column(
-        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
-    )
-
-
-class UserSession(Base):
-    """One login session family (migration 111); `id` is the JWT `fam` claim.
-
-    Lists the user's devices in Settings > Security. `revoked_at` is the durable
-    revoke, checked at refresh: the Redis family marker is the fast path for
-    access tokens but can be evicted, so the DB row is authoritative. Families
-    minted before this table existed are adopted on their next refresh.
-    `user_agent` is client-forwarded, display-only data (never trusted)."""
-    __tablename__ = "user_sessions"
-
-    id = Column(String(32), primary_key=True)
-    user_id = Column(
-        UUID(as_uuid=False), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
-    )
-    user_agent = Column(String(256), nullable=True)
-    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
-    last_seen_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
-    revoked_at = Column(DateTime(timezone=True), nullable=True)
-
-
-class PendingEmailChange(Base):
-    """A requested email change awaiting proof of the new address (migration 111).
-
-    Every request inserts a NEW row and supersedes the user's previous pending one
-    (status 'superseded'), never rewriting an address in place, so an older link
-    can never confirm a newer address. A partial unique index allows at most one
-    'pending' row per user. On confirmation the row becomes the outbox for the
-    old-address security notice and the Stripe customer email sync
-    (notice_state / stripe_state), drained by beat like pending_registrations.
-    new_email / old_email are encrypted at rest; new_email_hmac is the blind index.
-    """
-    __tablename__ = "pending_email_changes"
-
-    id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)
-    user_id = Column(
-        UUID(as_uuid=False), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
-    )
-    new_email = Column(EncryptedString, nullable=False)
-    new_email_hmac = Column(String(64), nullable=False)
-    old_email = Column(EncryptedString, nullable=True)
-    status = Column(String(16), nullable=False, server_default="pending")
-    expires_at = Column(DateTime(timezone=True), nullable=False)
-    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
-    confirmed_at = Column(DateTime(timezone=True), nullable=True)
-    notice_state = Column(String(16), nullable=True)
-    stripe_state = Column(String(16), nullable=True)
-    outbox_attempts = Column(Integer, nullable=False, server_default="0")
-    next_outbox_attempt_at = Column(DateTime(timezone=True), nullable=True)
-
-    @validates("new_email")
-    def _sync_new_email_hmac(self, _key, value):
-        """Keep new_email_hmac in lockstep with new_email (mirrors User)."""
-        from src.utils.crypto import blind_index
-        self.new_email_hmac = blind_index(value) if value is not None else None
         return value
 
 

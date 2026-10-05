@@ -61,7 +61,7 @@ class TestRawSqlExecutesOnPostgres:
     time, so no fixture rows are needed; both empty + non-empty job_ids are
     exercised (empty -> ANY(CAST('{}' AS uuid[])) must not error)."""
 
-    def _run(self, sql: str, record_type=None, county=None):
+    def _run(self, sql: str, record_type=None, county=None, delivery=None):
         from datetime import UTC, datetime
 
         from sqlalchemy import text
@@ -80,6 +80,7 @@ class TestRawSqlExecutesOnPostgres:
                 if ":f_record_type" in sql:
                     params["f_record_type"] = record_type
                     params["f_county"] = county
+                    params["f_delivery"] = delivery
                 if f":{TAX_CAP_BIND}" in sql:
                     params[TAX_CAP_BIND] = tax_cap_min_year(datetime.now(UTC).date())
                 db.execute(text(sql), params).fetchall()
@@ -107,6 +108,18 @@ class TestRawSqlExecutesOnPostgres:
 
         self._run(_FILTERED_TOTAL_SQL)
         self._run(_FILTERED_TOTAL_SQL, record_type="probate", county="king")
+        self._run(_FILTERED_TOTAL_SQL, delivery="new")
+
+    def test_delivery_filter_executes(self):
+        """The new-vs-delivered filter compares a text bind to a boolean
+        aggregate; it must plan for both values and for NULL (the export path)."""
+        self._run(_COMBINED_SQL, delivery="new")
+        self._run(_COMBINED_SQL, delivery="delivered")
+
+    def test_quality_sql_executes(self):
+        from src.workers.batch_export import _QUALITY_SQL
+
+        self._run(_QUALITY_SQL)
 
     def test_facets_sql_executes(self):
         from src.workers.batch_export import _FACETS_SQL

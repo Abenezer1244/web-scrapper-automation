@@ -243,6 +243,26 @@ async def test_a_prior_hit_is_copied_not_bought_again(
     assert row.skip_trace_source == "reused"  # reuse statement 1
 
 
+async def test_a_prior_hit_is_reused_free_when_skip_trace_is_off(
+    business_user, redis_client, _skip_trace_on,
+):
+    """Skip tracing OFF means no NEW lookup, not "hide what the account already paid
+    for" (2026-10-04 batch audit: a skip-off batch showed a phone). The answer is copied
+    free and marked reused, nothing is queued, so nothing can be bought or charged."""
+    first = _run(business_user.id, skip_on=True)
+    _lead(business_user.id, first, 1, status="hit", traced_days_ago=3,
+          phone="2065550100", email="owner@example.com", source="lookup")
+    again = _run(business_user.id, skip_on=False)
+    dup = _lead(business_user.id, again, 1, dup=True)
+
+    _enqueue(again, redis_client)
+
+    assert _pending(dup) == 0
+    row = _row(dup)
+    assert row.phone == "2065550100"
+    assert row.skip_trace_source == "reused"
+
+
 async def test_a_trace_bought_on_a_later_run_is_reused_by_the_next_one(
     business_user, redis_client, _skip_trace_on,
 ):

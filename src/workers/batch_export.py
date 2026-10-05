@@ -19,6 +19,7 @@ from typing import NamedTuple
 from sqlalchemy import select, text, update
 
 from src.api.lead_actionability import actionable_sql
+from src.api.results_category import already_delivered_sql
 from src.api.tax_filters import TAX_CAP_BIND, tax_cap_min_year, tax_cap_sql
 
 # Human-readable record-type labels. The private copy this replaces existed only
@@ -68,6 +69,12 @@ WITH candidates AS (
            r.absentee_owner, r.out_of_state_owner, r.owner_state,
            r.auction_date, r.default_amount, r.enrichment_data,
            r.property_key, r.is_duplicate,
+           -- The canonical "an EARLIER run delivered this" (results_category). Not
+           -- is_duplicate alone: same-run siblings and superseded rows carry it too.
+           {already_delivered_sql('r')} AS prior_delivered,
+           -- Contact provenance (097/098): lookup = Tracerfy answered THIS row,
+           -- reused = the account's own earlier answer copied free, NULL = none.
+           r.skip_trace_status, r.skip_trace_source, r.skip_trace_attempted_at,
            r.enrichment_data->>'lead_subtype' AS lead_subtype,
            sc.record_type, sc.county, j.created_at AS job_created_at,
            CASE
@@ -111,12 +118,22 @@ agg AS (
            -- by nature (only tax rows populate them), so max() can't cross-contaminate.
            max(delinquent_amount) AS delinquent_amount,
            max(delinquent_bill_year) AS delinquent_bill_year,
-           array_agg(DISTINCT county ORDER BY county) AS source_counties
+           array_agg(DISTINCT county ORDER BY county) AS source_counties,
+           -- New vs already delivered, per property. candidates spans EVERY row of
+           -- the child jobs, including rows the account received in earlier runs
+           -- (is_duplicate). A bucket is "new" when ANY of its rows is new; one made
+           -- only of already-delivered rows is not a new lead, and every count the
+           -- user sees must say which is which (2026-10-04 audit: a batch showed
+           -- 1 + 384 combined leads beside 15 + 1 new ones).
+           bool_or(NOT is_duplicate) AS has_new,
+           bool_or(prior_delivered) AS has_prior
     FROM candidates
     GROUP BY bucket
 )"""
 
-_COMBINED_SQL = _COMBINED_CTES + """,
+# The representative row per bucket. Shared by _COMBINED_SQL and _QUALITY_SQL so
+# the quality checks measure exactly the row each combined lead shows.
+_RANKED_CTE = """,
 ranked AS (
     SELECT c.*,
            row_number() OVER (
@@ -128,7 +145,29 @@ ranked AS (
                         c.id DESC
            ) AS rn
     FROM candidates c
-)
+)"""
+
+# Optional in-app view filters, shared by _COMBINED_SQL and _FILTERED_TOTAL_SQL so
+# the page and its pager can never disagree. Each defaults to NULL (a NULL bind lets
+# every row pass), so the CSV/delivery path binds NULL and behaves exactly as it did
+# before the filters existed: one query, not two, so the filtered view can never
+# drift from the exported file.
+# Containment (= ANY), not equality: the combined set is DEDUPED, so one lead
+# legitimately carries several record types / counties (that IS an overlap).
+# f_delivery: 'new' = the property has at least one row new to the account;
+# 'delivered' = no new row, and an EARLIER run delivered it (results_category).
+# A property made only of same-run siblings / superseded rows is neither.
+_VIEW_FILTERS = """
+  AND (CAST(:f_record_type AS text) IS NULL
+       OR CAST(:f_record_type AS text) = ANY(a.matched_record_types))
+  AND (CAST(:f_county AS text) IS NULL
+       OR CAST(:f_county AS text) = ANY(a.source_counties))
+  AND (CAST(:f_delivery AS text) IS NULL
+       OR (CAST(:f_delivery AS text) = 'new' AND a.has_new)
+       OR (CAST(:f_delivery AS text) = 'delivered' AND NOT a.has_new AND a.has_prior))
+"""
+
+_COMBINED_SQL = _COMBINED_CTES + _RANKED_CTE + """
 SELECT rk.id, rk.date_recorded, rk.date_recorded_parsed, rk.party_name, rk.heirs,
        rk.parcel_id, rk.property_address, rk.mailing_address,
        rk.property_city, rk.property_state, rk.property_zip,
@@ -141,21 +180,14 @@ SELECT rk.id, rk.date_recorded, rk.date_recorded_parsed, rk.party_name, rk.heirs
        -- The representative row's own type — lets the CSV builder tell a real date
        -- from the synthetic tax date after the tax bill_year is coalesced in (Codex).
        rk.record_type,
-       a.matched_record_types, a.overlap_count, a.source_counties, a.lead_subtype
+       a.matched_record_types, a.overlap_count, a.source_counties, a.lead_subtype,
+       (NOT a.has_new AND a.has_prior) AS already_delivered,
+       rk.skip_trace_status, rk.skip_trace_source, rk.skip_trace_attempted_at
 FROM ranked rk
 JOIN agg a ON a.bucket = rk.bucket
 WHERE rk.rn = 1
   AND (NOT :overlaps_only OR (rk.bucket LIKE 'pk:%' AND a.overlap_count >= 2))
-  -- Optional in-app view filters. Both default to NULL (a NULL filter bind lets
-  -- every row pass), so the CSV/delivery path binds NULL and this query stays BYTE-
-  -- IDENTICAL in behavior to before the filters existed — one query, not two, so
-  -- the filtered view can never drift from the exported file.
-  -- Containment (= ANY), not equality: the combined set is DEDUPED, so one lead
-  -- legitimately carries several record types / counties (that IS an overlap).
-  AND (CAST(:f_record_type AS text) IS NULL
-       OR CAST(:f_record_type AS text) = ANY(a.matched_record_types))
-  AND (CAST(:f_county AS text) IS NULL
-       OR CAST(:f_county AS text) = ANY(a.source_counties))
+""" + _VIEW_FILTERS + """
 ORDER BY a.overlap_count DESC,
          (CASE WHEN rk.phone IS NOT NULL OR rk.email IS NOT NULL THEN 0 ELSE 1 END),
          rk.job_created_at DESC NULLS LAST,
@@ -185,10 +217,52 @@ _FILTERED_TOTAL_SQL = _COMBINED_CTES + """
 SELECT count(*) AS total
 FROM agg a
 WHERE (NOT :overlaps_only OR (a.bucket LIKE 'pk:%' AND a.overlap_count >= 2))
-  AND (CAST(:f_record_type AS text) IS NULL
-       OR CAST(:f_record_type AS text) = ANY(a.matched_record_types))
-  AND (CAST(:f_county AS text) IS NULL
-       OR CAST(:f_county AS text) = ANY(a.source_counties))
+""" + _VIEW_FILTERS
+
+# Batch data-quality facts, one statement over the representative rows (the row
+# each combined lead SHOWS), so a check can never pass on a sibling row the user
+# never sees. Not mode-filtered and not view-filtered: these describe the whole
+# combined set. Categories are exclusive only where named so:
+#   new + already_delivered = leads; stacked + single_list + no_identity = leads.
+# Record-type checks count only the leads they apply to (auction fields only exist
+# on pre-foreclosure / trustee-sale rows, tax fields only on tax-delinquent ones).
+# Auction / default amount are read off the representative row because that is
+# what the combined lead delivers, so a stacked lead whose probate row won the
+# bucket shows up here as missing them, which is the truth about the file.
+_QUALITY_SQL = _COMBINED_CTES + _RANKED_CTE + """,
+q AS (
+    SELECT rk.*, a.has_new, a.has_prior, a.overlap_count, a.matched_record_types,
+           a.delinquent_amount AS agg_delinquent_amount,
+           a.delinquent_bill_year AS agg_delinquent_bill_year,
+           ('pre_foreclosure' = ANY(a.matched_record_types)
+            OR 'trustee_sale' = ANY(a.matched_record_types)) AS auction_applies,
+           'tax_delinquent' = ANY(a.matched_record_types) AS tax_applies
+    FROM ranked rk JOIN agg a ON a.bucket = rk.bucket
+    WHERE rk.rn = 1
+)
+SELECT count(*) AS leads,
+       count(*) FILTER (WHERE has_new) AS new_leads,
+       count(*) FILTER (WHERE NOT has_new AND has_prior) AS already_delivered,
+       -- Neither: only same-run siblings / superseded rows (never handed over).
+       count(*) FILTER (WHERE NOT has_new AND NOT has_prior) AS not_new_not_delivered,
+       count(*) FILTER (WHERE bucket LIKE 'pk:%' AND overlap_count >= 2) AS stacked,
+       count(*) FILTER (WHERE bucket LIKE 'pk:%' AND overlap_count >= 2 AND has_new) AS stacked_new,
+       count(*) FILTER (WHERE bucket LIKE 'pk:%' AND overlap_count < 2) AS single_list,
+       count(*) FILTER (WHERE bucket NOT LIKE 'pk:%') AS no_identity,
+       count(*) FILTER (WHERE nullif(btrim(parcel_id), '') IS NOT NULL) AS with_parcel,
+       count(*) FILTER (WHERE nullif(btrim(property_address), '') IS NOT NULL) AS with_property_address,
+       count(*) FILTER (WHERE nullif(btrim(mailing_address), '') IS NOT NULL) AS with_mailing_address,
+       count(*) FILTER (WHERE phone IS NOT NULL) AS with_phone,
+       count(*) FILTER (WHERE email IS NOT NULL) AS with_email,
+       count(*) FILTER (WHERE skip_trace_source = 'lookup') AS contacts_looked_up,
+       count(*) FILTER (WHERE skip_trace_source = 'reused') AS contacts_reused,
+       count(*) FILTER (WHERE auction_applies) AS auction_applicable,
+       count(*) FILTER (WHERE auction_applies AND auction_date IS NOT NULL) AS with_auction_date,
+       count(*) FILTER (WHERE auction_applies AND default_amount IS NOT NULL) AS with_default_amount,
+       count(*) FILTER (WHERE tax_applies) AS tax_applicable,
+       count(*) FILTER (WHERE tax_applies AND agg_delinquent_amount IS NOT NULL) AS with_tax_balance,
+       count(*) FILTER (WHERE tax_applies AND agg_delinquent_bill_year IS NOT NULL) AS with_tax_year
+FROM q
 """
 
 # The facet values actually present in the mode-filtered combined set, so the UI
@@ -257,6 +331,7 @@ def _combined_pairs(
             # no-op, so the delivered file is exactly what it was before.
             "f_record_type": None,
             "f_county": None,
+            "f_delivery": None,
             TAX_CAP_BIND: tax_cap_min_year(datetime.now(UTC).date()),
         },
     )

@@ -11,6 +11,7 @@ import io
 import json
 import uuid
 from datetime import UTC, datetime
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import StreamingResponse
@@ -37,6 +38,7 @@ from src.api.entitlements import (
 from src.api.errors import no_store_errors, run_refusal_http
 from src.api.lead_actionability import actionable_condition
 from src.api.middleware.rate_limit import rate_limit
+from src.api.results_category import already_delivered_condition
 from src.api.schemas import (
     RUN_START_402_RESPONSES,
     BatchChildSummary,
@@ -46,6 +48,7 @@ from src.api.schemas import (
     BatchDetailResponse,
     BatchLeadRow,
     BatchLeadsPage,
+    BatchQuality,
     BatchRunResponse,
     BatchSummaryResponse,
 )
@@ -490,14 +493,79 @@ def _combined_record_count(batch: ScraperBatch, run: BatchRun | None) -> int | N
     return counts.get("leads_total")
 
 
+async def _execution_facts(
+    db: AsyncSession, user_id: str, runs: list[BatchRun]
+) -> dict[str, dict[str, int]]:
+    """Per-batch facts from what the latest run's children actually DID, keyed by
+    batch_id. Two grouped queries for any number of runs (no per-batch query), both
+    pinned to the user and to the runs' own child_job_ids, so one batch's jobs can
+    never be counted in another's row."""
+    job_ids = list(dict.fromkeys(str(j) for r in runs for j in (r.child_job_ids or [])))
+    if not job_ids:
+        return {}
+    # A job counts only for the batch its config belongs to, so a stale or wrong
+    # id in child_job_ids (even the same user's other batch) adds nothing.
+    jobs = {
+        str(jid): (st, rc or 0, bid)
+        for jid, st, rc, bid in (await db.execute(
+            select(Job.id, Job.status, Job.record_count, ScraperConfig.batch_id)
+            .join(ScraperConfig, ScraperConfig.id == Job.scraper_config_id)
+            .where(
+                Job.user_id == user_id,
+                ScraperConfig.user_id == user_id,
+                Job.id.in_(job_ids),
+            )
+        )).all()
+    }
+    looked_up = {
+        str(jid): n
+        for jid, n in (await db.execute(
+            select(Result.job_id, func.count(Result.id))
+            .where(
+                Result.user_id == user_id,
+                Result.job_id.in_(job_ids),
+                Result.skip_trace_source == "lookup",
+            )
+            .group_by(Result.job_id)
+        )).all()
+    }
+    facts: dict[str, dict[str, int]] = {}
+    for run in runs:
+        f = {"children_done": 0, "children_failed": 0, "new_records": 0,
+             "contacts_looked_up": 0}
+        for jid in dict.fromkeys(str(j) for j in (run.child_job_ids or [])):
+            st, rc, bid = jobs.get(jid, (None, 0, None))
+            if bid != run.batch_id:
+                continue
+            if st == "done":
+                f["children_done"] += 1
+                f["new_records"] += rc
+            elif st in _UNDELIVERABLE_CHILD_STATUSES:
+                f["children_failed"] += 1
+            f["contacts_looked_up"] += looked_up.get(jid, 0)
+        facts[run.batch_id] = f
+    return facts
+
+
+def _skip_trace_rollup(flags: set[bool]) -> str:
+    """Configured skip tracing across a batch's children."""
+    if flags == {True}:
+        return "on"
+    return "mixed" if True in flags else "off"
+
+
 def _summary(
     batch: ScraperBatch,
     run: BatchRun | None,
     child_count: int,
     record_types: list[str] | None = None,
     counties: list[str] | None = None,
+    facts: dict[str, int] | None = None,
+    skip_flags: set[bool] | None = None,
 ) -> BatchSummaryResponse:
     return BatchSummaryResponse(
+        **(facts or {}),
+        skip_trace=_skip_trace_rollup(skip_flags or set()),
         id=batch.id,
         name=batch.name,
         state=batch.state,
@@ -585,6 +653,7 @@ async def list_batches(
                 ScraperConfig.batch_id,
                 ScraperConfig.record_type,
                 ScraperConfig.county,
+                ScraperConfig.skip_trace_enabled,
             ).where(
                 ScraperConfig.user_id == current_user.id,
                 ScraperConfig.batch_id.in_(batch_ids),
@@ -595,12 +664,15 @@ async def list_batches(
     counts: dict[str, int] = {}
     rtypes: dict[str, set[str]] = {}
     bcounties: dict[str, set[str]] = {}
-    for bid, rt, county in cfg_rows:
+    skip_flags: dict[str, set[bool]] = {}
+    for bid, rt, county, skip_on in cfg_rows:
         counts[bid] = counts.get(bid, 0) + 1
         if rt:
             rtypes.setdefault(bid, set()).add(rt)
         if county:
             bcounties.setdefault(bid, set()).add(county)
+        skip_flags.setdefault(bid, set()).add(bool(skip_on))
+    facts = await _execution_facts(db, current_user.id, list(run_by_batch.values()))
     return [
         _summary(
             b,
@@ -608,6 +680,8 @@ async def list_batches(
             counts.get(b.id, 0),
             sorted(rtypes.get(b.id, set())),
             sorted(bcounties.get(b.id, set())),
+            facts.get(b.id),
+            skip_flags.get(b.id),
         )
         for b in batches
     ]
@@ -627,6 +701,7 @@ async def get_batch(
     # an unrelated job on the same config — should not happen in 2A — can't leak in).
     job_by_config: dict[str, tuple[str, str, int]] = {}
     persisted: dict[str, int] = {}
+    delivered_by_job: dict[str, int] = {}
     if run and run.child_job_ids:
         job_rows = (
             await db.execute(
@@ -648,25 +723,31 @@ async def get_batch(
         # dedups ACROSS children into property buckets, and a bucket spanning two
         # children cannot be attributed to either one. The delivered figure is the
         # batch-level combined_record_count, which reads the run's delivery_counts.
-        persisted = dict(
-            (
-                await db.execute(
-                    select(Result.job_id, func.count(Result.id))
-                    .where(
-                        Result.user_id == current_user.id,
-                        Result.job_id.in_(run.child_job_ids),
-                        Result.is_duplicate.is_not(True),
-                        actionable_condition(),
-                        tax_cap_condition(datetime.now(UTC).date()),
-                    )
-                    .group_by(Result.job_id)
+        # The same statement counts the child's already-delivered rows by the same
+        # rules, so "N new" and "M already delivered" can never be counted two ways.
+        for jid, new_n, delivered_n in (
+            await db.execute(
+                select(
+                    Result.job_id,
+                    func.count(Result.id).filter(Result.is_duplicate.is_not(True)),
+                    func.count(Result.id).filter(already_delivered_condition()),
                 )
-            ).all()
-        )
+                .where(
+                    Result.user_id == current_user.id,
+                    Result.job_id.in_(run.child_job_ids),
+                    actionable_condition(),
+                    tax_cap_condition(datetime.now(UTC).date()),
+                )
+                .group_by(Result.job_id)
+            )
+        ).all():
+            persisted[str(jid)] = new_n
+            delivered_by_job[str(jid)] = delivered_n
 
     config_rows = (
         await db.execute(
-            select(ScraperConfig.id, ScraperConfig.county, ScraperConfig.record_type)
+            select(ScraperConfig.id, ScraperConfig.county, ScraperConfig.record_type,
+                   ScraperConfig.skip_trace_enabled)
             .where(
                 ScraperConfig.batch_id == batch_id,
                 ScraperConfig.user_id == current_user.id,
@@ -683,7 +764,7 @@ async def get_batch(
         if isinstance(e, dict) and e.get("config_id")
     }
     children = []
-    for cid, county, record_type in config_rows:
+    for cid, county, record_type, skip_on in config_rows:
         job = job_by_config.get(cid)
         if job:
             child_status = job[1]
@@ -702,14 +783,23 @@ async def get_batch(
                 # are unreachable now that the combined export filters on done);
                 # in flight -> counted rows. See _child_lead_count.
                 record_count=_child_lead_count(job, persisted) if job else 0,
+                # A failed/cancelled child delivered nothing, so it reports no
+                # already-delivered figure either (same rule as record_count).
+                already_delivered_count=(
+                    delivered_by_job.get(str(job[0]), 0)
+                    if job and job[1] not in _UNDELIVERABLE_CHILD_STATUSES else 0
+                ),
+                skip_trace_enabled=bool(skip_on),
             )
         )
 
-    record_types = sorted({rt for _, _, rt in config_rows if rt})
-    detail_counties = sorted({c for _, c, _ in config_rows if c})
+    record_types = sorted({row.record_type for row in config_rows if row.record_type})
+    detail_counties = sorted({row.county for row in config_rows if row.county})
+    facts = await _execution_facts(db, current_user.id, [run] if run else [])
     return BatchDetailResponse(
         **_summary(
-            batch, run, len(children), record_types, detail_counties
+            batch, run, len(children), record_types, detail_counties,
+            facts.get(batch.id), {bool(row.skip_trace_enabled) for row in config_rows},
         ).model_dump(),
         failed_children=run.failed_children if run else None,
         children=children,
@@ -892,6 +982,7 @@ async def _leads_page(
     response: Response,
     record_type: str | None = None,
     county: str | None = None,
+    delivery: str | None = None,
 ) -> BatchLeadsPage:
     """Shared body for the latest-run and run-scoped leads endpoints. Caller has
     verified batch ownership and (for the run-scoped variant) run membership.
@@ -912,6 +1003,7 @@ async def _leads_page(
         _DELIVERY_COUNTS_SQL,
         _FACETS_SQL,
         _FILTERED_TOTAL_SQL,
+        _QUALITY_SQL,
     )
 
     if run is None or run.status not in _DOWNLOADABLE_STATUSES:
@@ -944,8 +1036,8 @@ async def _leads_page(
     # it MUST come from the filtered query or pagination would offer pages that
     # render empty.
     overlaps_only = delivery_mode == "overlaps_only"
-    filters = {"f_record_type": record_type, "f_county": county}
-    filtered = record_type is not None or county is not None
+    filters = {"f_record_type": record_type, "f_county": county, "f_delivery": delivery}
+    filtered = record_type is not None or county is not None or delivery is not None
 
     facet_record_types: list[str] = []
     facet_counties: list[str] = []
@@ -964,6 +1056,15 @@ async def _leads_page(
                 {"uid": run.user_id, "job_ids": job_ids,
                  "overlaps_only": overlaps_only, **filters, TAX_CAP_BIND: tax_bind},
             )).one().total)
+
+    # Whole-set quality facts: unfiltered and mode-independent, like `counts`.
+    # ponytail: a 4th pass over the same CTE per page load (counts, facets, page,
+    # quality), each bounded by one batch's rows. Fold into one statement or persist
+    # at finalize if batch pages get slow.
+    quality = BatchQuality(**(await db.execute(
+        text(_QUALITY_SQL),
+        {"uid": run.user_id, "job_ids": job_ids, TAX_CAP_BIND: tax_bind},
+    )).one()._mapping) if job_ids else BatchQuality()
 
     rows = []
     if job_ids:
@@ -1006,6 +1107,8 @@ async def _leads_page(
             except ValueError:
                 enrichment = None
         data["date_is_auction_date"] = is_auction_date_fallback(data.get("date_recorded"), enrichment)
+        data["skip_trace_status"] = data.get("skip_trace_status") or "not_attempted"
+        data["contact_reused"] = data.pop("skip_trace_source", None) == "reused"
         leads.append(BatchLeadRow(**data))
 
     return BatchLeadsPage(
@@ -1019,6 +1122,8 @@ async def _leads_page(
         county=county,
         available_record_types=facet_record_types,
         available_counties=facet_counties,
+        delivery=delivery,
+        quality=quality,
     )
 
 
@@ -1043,6 +1148,14 @@ async def list_batch_leads(
     county: str | None = Query(
         None, max_length=128, description="Narrow to leads sourced from this county."
     ),
+    delivery: Literal["new", "delivered"] | None = Query(
+        None,
+        description=(
+            "new = properties with at least one row delivered to the account for the "
+            "first time in this batch; delivered = properties every row of which an "
+            "earlier run already delivered."
+        ),
+    ),
     db: AsyncSession = Depends(get_rls_db),
 ) -> BatchLeadsPage:
     """The combined (deduped, overlap-first, mode-filtered) lead list of the
@@ -1052,7 +1165,7 @@ async def list_batch_leads(
         batch = await _owned_batch(db, batch_id, current_user.id)
         run = await _run_for(db, batch_id, current_user.id)
         return await _leads_page(
-            db, batch, run, page, page_size, response, record_type, county
+            db, batch, run, page, page_size, response, record_type, county, delivery
         )
     except HTTPException as exc:
         # Codex P2: FastAPI builds exception responses separately from the
@@ -1084,6 +1197,14 @@ async def list_batch_run_leads(
     county: str | None = Query(
         None, max_length=128, description="Narrow to leads sourced from this county."
     ),
+    delivery: Literal["new", "delivered"] | None = Query(
+        None,
+        description=(
+            "new = properties with at least one row delivered to the account for the "
+            "first time in this batch; delivered = properties every row of which an "
+            "earlier run already delivered."
+        ),
+    ),
     db: AsyncSession = Depends(get_rls_db),
 ) -> BatchLeadsPage:
     """Run-scoped combined lead list (2B history parity with the CSV download)."""
@@ -1102,7 +1223,7 @@ async def list_batch_run_leads(
         if run is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found")
         return await _leads_page(
-            db, batch, run, page, page_size, response, record_type, county
+            db, batch, run, page, page_size, response, record_type, county, delivery
         )
     except HTTPException as exc:
         # Codex P2: FastAPI builds exception responses separately from the

@@ -194,8 +194,14 @@ jobs:
       - name: Run tests
         run: pytest tests/ -m "not integration" --cov=src --cov-report=xml --cov-report=term-missing -v
 
+      # Coverage is reporting, never a gate (fail_ci_if_error: false says so). The
+      # action still fails the step when it cannot reach Codecov at all, before that
+      # flag applies: 2026-10-05, cli.codecov.io / ingest.codecov.io refused TLS for
+      # hours and blocked every BE merge although every test had passed. The tests,
+      # ruff, migrations and the OpenAPI check above still gate.
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v4
+        continue-on-error: true
         with:
           file: coverage.xml
           fail_ci_if_error: false

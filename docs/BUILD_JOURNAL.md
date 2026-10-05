@@ -19,6 +19,29 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-10-04/05 — Island re-run, the weak-claim trap, and pacing a county portal
+
+**Built / Shipped:** BE #456 (paced owner-name pass, budget, breaker, `skipped`) + FE #220 ("Not looked up");
+owner-approved one-off releasing Island job 6b1f3445's 66 weak claims, then re-run `85c8762e`: 140 found,
+6 new leads (billed 6), 10 no_match, 3 failed, 121 skipped (the breaker tripped about 19 names in). This PR:
+`release_parcelless_no_address_claims` after every DONE run, plus a per-portal admission lease, Island at 10 s,
+and never-answered names first.
+
+**Tried / Decided:** a background sweep that fills addresses on finished runs was REJECTED: those rows would
+become unbilled leads on an already-charged run. The fix instead lets the next run find them again.
+
+**Failed / Blocked:** a plain re-run would have shown about 66 never-delivered filings as "already delivered":
+claims are written before enrichment, and transfer refuses WEAK (name|date) hashes. Island's "throttle" turned
+out to be partly a maintenance outage ("offline for maintenance", confirmed from another network).
+
+**Caught & fixed (Codex, 3 passes):** cross-run concurrency (another run already flagged against the claim keeps
+it); a retry finding its own rows hidden (release only after DONE); pace per worker, not per portal (lease);
+the lease not rechecked after a pace. Argued and not adopted: filing identity versus hash identity (no
+immutable filing id exists; dedup already relies on stable hashing).
+
+**Pending:** 206 legacy trapped claims across 18 done runs (124 of them Island `85c8762e`); a backfill
+needs owner approval.
+
 ## 2026-10-05 — Batch system audit: the "384", a contact under skip-trace OFF, and one run per batch
 
 > Owner report: batch "testas" (Pierce probate + pre-foreclosure, skip tracing OFF) showed

@@ -182,6 +182,14 @@ def upgrade() -> None:
             END IF;
             IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bridgeleads_system') THEN
                 GRANT SELECT, UPDATE ON public.pending_email_changes TO bridgeleads_system;
+                -- The beat outbox drains confirmed rows cross-tenant with no GUC, so
+                -- the untargeted isolation policy alone would hide every row from it.
+                -- Created here (not only in apply_rls_cutover_policies.sql) so the
+                -- outbox works the moment this migration lands; that script
+                -- re-creates the same policy idempotently.
+                DROP POLICY IF EXISTS pending_email_changes_system ON public.pending_email_changes;
+                CREATE POLICY pending_email_changes_system ON public.pending_email_changes
+                    FOR ALL TO bridgeleads_system USING (true) WITH CHECK (true);
             END IF;
         END
         $profile_grants$;

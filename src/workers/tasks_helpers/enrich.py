@@ -1184,6 +1184,31 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
             if res.party_name
             and not res.property_address
         ]
+        # Names an earlier run of this account never got an answer for go first. The
+        # pass stops at a budget or a breaker, so a fixed order would re-ask the same
+        # first names every run and never reach the rest (Island, 2026-10-04: 19 of 140
+        # asked). Answered before = asked longest ago last; stable within each group.
+        _hashes = sorted({r.dedup_hash for r in results_no_addr if r.dedup_hash})
+        if _hashes:
+            from sqlalchemy import text as sa_text
+
+            try:
+                _asked = dict(db.execute(
+                    sa_text(
+                        "SELECT dedup_hash, max(created_at) FROM results "
+                        "WHERE user_id = CAST(:uid AS uuid) AND job_id <> CAST(:jid AS uuid) "
+                        "  AND dedup_hash = ANY(:hashes) "
+                        "  AND enrichment_data->>'pacs_name_lookup' IN ('found', 'no_match') "
+                        "GROUP BY 1"
+                    ),
+                    {"uid": str(job.user_id), "jid": str(job_id), "hashes": _hashes},
+                ).all())
+                results_no_addr.sort(key=lambda r: (r.dedup_hash in _asked,
+                                                    _asked.get(r.dedup_hash) or 0))
+            except Exception as exc:  # noqa: BLE001 -- ordering is an optimisation
+                db.rollback()
+                _logger.warning("Job %s: name-lookup ordering skipped: %s", job_id,
+                                type(exc).__name__)
         if results_no_addr:
             _publish_log(
                 r, job_id, "info",
@@ -1191,7 +1216,9 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
                 db=db,
             )
             names = [res.party_name for res in results_no_addr]
-            pacs_results = batch_lookup_pacs_by_name(connector_assessor_url, names)
+            pacs_results = batch_lookup_pacs_by_name(
+                connector_assessor_url, names, source_key=f"pacs_{config.county.lower()}",
+            )
             name_hits = name_failed = name_skipped = 0
             for res, (outcome, pacs) in zip(results_no_addr, pacs_results, strict=True):
                 # Every row looked up records what the lookup came to, so the results

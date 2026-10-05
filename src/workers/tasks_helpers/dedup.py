@@ -1124,3 +1124,61 @@ def _promote_elected(db, job_id, uid, user_id, elected, members, record_type) ->
             db, user_id, elected.get("id"),
             _merged_survivor_fields(elected, members, record_type),
         )
+
+
+def release_parcelless_no_address_claims(db, job_id: str, user_id) -> int:
+    """Release the claims this run took for parcel-less filings it could not address.
+
+    A filing with no parcel claims on a WEAK name|date hash before enrichment runs.
+    If the run then finds no address for it, the row is not a lead (never listed,
+    exported or billed), yet its claim made every later run flag the same filing
+    "already delivered" and hide it, and transfer_undelivered_claims deliberately
+    never moves a weak claim. Island probate (owner, 2026-10-04): a re-run would have
+    hidden 66 filings nobody was ever given; an owner-approved one-off released them.
+    This makes that release part of every run.
+
+    Released only when ALL hold, per hash, re-checked inside the statement:
+      - the claim is anchored to THIS run and is weak (no parcel, no address on it);
+      - no row of this run for the hash has a parcel or an address. A parcel-bearing
+        row is excluded on purpose: background mailing recovery may still give it an
+        address, and then it appears as a lead, which is intended.
+    Those rows are marked 'superseded' (what a claim transfer does to an anchor), so
+    nothing that later gives them an address can put them in this run's download.
+
+    One transaction; the caller treats a failure as non-fatal. Returns hashes released.
+    """
+    from src.api.lead_actionability import address_actionable_sql
+
+    params = {"jid": str(job_id), "uid": str(user_id)}
+    released = db.execute(
+        sa_text(
+            "DELETE FROM delivered_records d "
+            "WHERE d.user_id = CAST(:uid AS uuid) AND d.first_job_id = CAST(:jid AS uuid) "
+            "  AND COALESCE(btrim(d.parcel_id), '') = '' "
+            "  AND COALESCE(btrim(d.property_address), '') = '' "
+            # Another run already flagged against this claim keeps it: releasing it
+            # would leave that run's rows marked delivered by nobody (Codex P1).
+            "  AND NOT EXISTS (SELECT 1 FROM results o WHERE o.user_id = d.user_id "
+            "              AND o.dedup_hash = d.dedup_hash AND o.job_id <> CAST(:jid AS uuid) "
+            "              AND o.is_duplicate IS TRUE AND o.duplicate_reason IS DISTINCT FROM 'superseded') "
+            "  AND EXISTS (SELECT 1 FROM results r WHERE r.job_id = CAST(:jid AS uuid) "
+            "              AND r.user_id = d.user_id AND r.dedup_hash = d.dedup_hash) "
+            "  AND NOT EXISTS (SELECT 1 FROM results r WHERE r.job_id = CAST(:jid AS uuid) "
+            "              AND r.user_id = d.user_id AND r.dedup_hash = d.dedup_hash "
+            f"             AND ({address_actionable_sql('r')} "
+            "                   OR COALESCE(btrim(r.parcel_id), '') <> '')) "
+            "RETURNING d.dedup_hash"
+        ),
+        params,
+    ).scalars().all()
+    if released:
+        db.execute(
+            sa_text(
+                "UPDATE results SET is_duplicate = true, duplicate_reason = 'superseded' "
+                "WHERE job_id = CAST(:jid AS uuid) AND user_id = CAST(:uid AS uuid) "
+                "  AND dedup_hash = ANY(:hashes)"
+            ),
+            {**params, "hashes": list(released)},
+        )
+    db.commit()
+    return len(released)

@@ -2210,6 +2210,25 @@ def run_scrape_job(self, job_id: str) -> None:
             return
         display_count = _outcome.display_count
 
+
+        # A parcel-less filing this run could not address keeps no claim, or every
+        # later run would call it "already delivered" (Island, 2026-10-04). Only now,
+        # once the run is DONE: a failed attempt releases nothing, so a retry cannot
+        # find its own rows hidden (Codex P1). These rows were never billed or
+        # exported, and the frozen breakdown counts them as no_address either way.
+        try:
+            from src.workers.tasks_helpers.dedup import release_parcelless_no_address_claims
+
+            _released = release_parcelless_no_address_claims(db, job_id, job.user_id)
+            if _released:
+                _logger.info(
+                    "Job %s: released %d claim(s) on parcel-less filings with no address",
+                    job_id, _released,
+                )
+        except Exception as exc:  # noqa: BLE001 -- never fails a delivered run
+            db.rollback()
+            _logger.warning("Job %s: claim release failed: %s", job_id, type(exc).__name__)
+
         if user.records_limit != -1 and user.records_used > user.records_limit:
             overage = user.records_used - user.records_limit
             _publish_log(r, job_id, "warning", f"Plan limit exceeded by {overage} records. Upgrade to keep scraping.", db=db)

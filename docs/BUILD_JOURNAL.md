@@ -19,6 +19,40 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-10-05 — Profile & account redesign (photo, devices, email change, mobile settings)
+
+**Built / Shipped (branches only, no PR/merge yet):** BE `feat/profile-account-redesign`: migration 111
+(`users.timezone`, `user_avatars`, `user_sessions`, `pending_email_changes`, app SELECT on own `audit_events`,
+RLS + grants mirrored in all three role scripts), `/auth/avatar`, `/auth/sessions*`, `/auth/security-events`,
+`/auth/email/change|confirm` + beat outbox, 30-day absolute session lifetime, design doc
+`docs/product/account-deletion-and-export.md`. FE `feat/profile-account-redesign`: UserAvatar (initials "AU"),
+identity menu without Billing, Account/Security tabs, photo editor, `?tab=` settings with a mobile list->detail,
+`/confirm-email`, themed toasts.
+
+**Tried / Decided:** avatars in Postgres (owner) instead of R2: removes the R2/DB atomicity problem for a 15 KB
+file. Raw-body upload, not multipart: FastAPI spools a multipart body before the handler sees it. No client UA
+forwarding header: login already comes from the browser; adopted legacy sessions show "Unknown device".
+Timezone is display-only; schedules stay UTC. Delete/export: design only, needs owner + counsel.
+
+**Failed / Blocked:** the shared Desktop checkouts were 661 (BE) / 309 (FE) commits stale; first audit pass
+was wasted until own worktrees at origin heads. Codex with a 58 KB inline prompt silently printed nothing
+("Argument list too long"): use stdin. API + next dev + Playwright + Codex at once got every background job
+killed for low memory; reran one at a time.
+
+**Caught & fixed:** wrong 2FA code on email change would have 500'd (rollback expired `user`); Codex P1s:
+revoke order (now DB-first, then Redis) and a pre-existing refresh race where a pair minted during a
+logout-all survived it (re-check after minting). Old verify blocks hard-failed on any app SELECT of
+`audit_events` and `_cutover_step2_grants_policies.py` would have re-revoked it.
+
+**Pending / Handoff:** open PRs (BE first: migration ships with the code), run `apply_rls_cutover_policies.sql`
+in prod after migrate, FE PR after BE is live (types). Separate PRs: Redis `allkeys-lru` vs revocation markers,
+timezone-aware time display, API-key revoke endpoint, delete/export build.
+
+**Facts learned:** the app DB role has no DELETE anywhere, so every "remove" is an UPDATE. `revoke_all_for_user`
+from inside a txn that holds the users row deadlocks; stamp `revoked_at` in-txn + `update_revoke_cache`.
+Tests: RLS 23, avatar 28, sessions 9, email change 12, auth regression 180 (2 timing flakes on 60 s windows),
+FE node:test 7, Playwright walkthrough 46/46 on the final code.
+
 ## 2026-10-04/05 — Island re-run, the weak-claim trap, and pacing a county portal
 
 **Built / Shipped:** BE #456 (paced owner-name pass, budget, breaker, `skipped`) + FE #220 ("Not looked up");

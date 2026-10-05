@@ -505,6 +505,12 @@
             "title": "Already Delivered",
             "type": "boolean"
           },
+          "contact_decode_failed": {
+            "default": false,
+            "description": "True when a stored contact value of this row could not be read and was dropped (phone, email, phone_type, phones incl. a phone's type, or emails). Show the contact as unavailable, never as a lookup result.",
+            "title": "Contact Decode Failed",
+            "type": "boolean"
+          },
           "contact_reused": {
             "default": false,
             "title": "Contact Reused",
@@ -536,6 +542,21 @@
               }
             ],
             "title": "Email"
+          },
+          "emails": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Up to 3 skip-traced emails of the row this lead shows; same null / [] rules as phones.",
+            "title": "Emails"
           },
           "id": {
             "title": "Id",
@@ -619,6 +640,21 @@
             ],
             "title": "Phone Type"
           },
+          "phones": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/PhoneContact"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Up to 3 skip-traced phones of the row this lead shows. null when the row has no list (never looked up, purged, or unreadable); [] when a lookup found none.",
+            "title": "Phones"
+          },
           "property_address": {
             "anyOf": [
               {
@@ -644,6 +680,7 @@
           },
           "skip_trace_status": {
             "default": "not_attempted",
+            "description": "Skip-trace status of the row whose contact values are shown (the property's representative row), the same row-level meaning as ResultRow.skip_trace_status. The representative is chosen by the scalar phone / email only, so a sibling row with arrays but no scalar never displaces it. A decode failure never changes this value.",
             "title": "Skip Trace Status",
             "type": "string"
           },

@@ -242,7 +242,7 @@ async def test_the_job_pass_records_each_rows_outcome_and_counts_failures(
 
     asked: list = []
 
-    def scripted(url, names, max_workers=5):
+    def scripted(url, names, **_kw):
         asked.append((url, list(names)))
         by_name = {"FOUND ANN": (LOOKUP_FOUND, {"address": "1 FIR LN", "mailing": "PO BOX 1, CLINTON, WA 98236"}),
                    "MISS BOB": (LOOKUP_NO_MATCH, None), "FAIL CAL": (LOOKUP_FAILED, None)}
@@ -308,6 +308,7 @@ def test_the_pass_is_sequential_and_paced(monkeypatch):
     import time as _time
     monkeypatch.setattr(_time, "sleep", lambda s: events.append(('sleep', round(s, 1))))
     monkeypatch.setattr(pacs, "NAME_PACE_S", 3.0)
+    monkeypatch.setattr(pacs, "NAME_PACE_BY_HOST", {})  # the default pace, not Island's
     monkeypatch.setattr(pacs, "NAME_JITTER_S", 0.0)
     batch_lookup_pacs_by_name(URL, ["A", "B", "C"])
     assert events == [('ask', 'A'), ('sleep', 3.0), ('ask', 'B'), ('sleep', 3.0), ('ask', 'C')]

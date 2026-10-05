@@ -416,6 +416,9 @@ def lookup_pacs_by_name(pacs_url: str, owner_name: str) -> tuple[str, dict | Non
 # at a time, ~3 s apart). It used to fire 5 unpaced workers at a county portal.
 # ponytail: fixed pace and budget; make them per-county if one portal needs other.
 NAME_PACE_S = 3.0
+# Portals that refuse that pace. Island answered ~19 paced names on 2026-10-04 and then
+# refused 3 in a row (job 85c8762e); it answered again minutes later.
+NAME_PACE_BY_HOST = {"assessor.islandcountywa.gov": 10.0}
 NAME_JITTER_S = 1.0
 # Wall-clock budget for one job's pass (the scrape job has 60 min in all). Names not
 # reached are LOOKUP_SKIPPED: never asked, so neither a miss nor a failure.
@@ -428,26 +431,44 @@ NAME_BREAKER = 3
 def batch_lookup_pacs_by_name(
     pacs_url: str,
     owner_names: list[str],
+    source_key: str | None = None,
 ) -> list[tuple[str, dict | None]]:
     """Owner-name lookups, ONE AT A TIME and paced. Returns one ``(outcome, result)``
     per input name, in order (see ``lookup_pacs_by_name``). Names past the budget or
     the breaker are ``LOOKUP_SKIPPED``.
-    """
-    import random
-    import time
 
+    ``source_key`` (``pacs_<county>``, the parcel adapter's key) takes the fleet-wide
+    SourceAdmission lease, so concurrent runs and the parcel adapter never hit one
+    portal at once: the pace is per worker, the lease is per portal (Codex P1). Not
+    admitted, or the lease lost mid-pass: the rest are skipped.
+    """
     skipped: tuple[str, dict | None] = (LOOKUP_SKIPPED, None)
     results: list[tuple[str, dict | None]] = [skipped] * len(owner_names)
     if not pacs_url:
         return results
+    if source_key:
+        from src.scrapers.enrichment.source_admission import SourceAdmission
+
+        with SourceAdmission(source_key) as admission:
+            if not admission.admitted:
+                return results
+            return _paced_pass(pacs_url, owner_names, results, admission.still_held)
+    return _paced_pass(pacs_url, owner_names, results, lambda: True)
+
+
+def _paced_pass(pacs_url, owner_names, results, still_held):
+    import random
+    import time
+
+    pace = NAME_PACE_BY_HOST.get((urlparse(pacs_url).hostname or "").lower(), NAME_PACE_S)
     deadline = time.monotonic() + NAME_BUDGET_S
     failures_in_a_row = 0
     for i, name in enumerate(owner_names):
-        if time.monotonic() >= deadline or failures_in_a_row >= NAME_BREAKER:
+        if time.monotonic() >= deadline or failures_in_a_row >= NAME_BREAKER or not still_held():
             break
         if i:
-            time.sleep(NAME_PACE_S + random.uniform(0, NAME_JITTER_S))  # noqa: S311
-            if time.monotonic() >= deadline:  # the pace itself can cross it (Codex)
+            time.sleep(pace + random.uniform(0, NAME_JITTER_S))  # noqa: S311
+            if time.monotonic() >= deadline or not still_held():  # the pace can cross either (Codex)
                 break
         try:
             results[i] = lookup_pacs_by_name(pacs_url, name)

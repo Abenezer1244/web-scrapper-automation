@@ -357,6 +357,61 @@ REVOKE UPDATE ON contact_lookup_action_events FROM bridgeleads_system;
 
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO bridgeleads_system;
 
+-- ── Role 4: bridgeleads_purge — owner of the account-deletion functions (112) ──
+-- NOLOGIN; nothing is a member of it. The ONLY way to act as it is to call one of
+-- its SECURITY DEFINER functions, and the guard triggers check current_user =
+-- 'bridgeleads_purge'. Migration 112 creates it (the functions need their owner
+-- the moment they exist); this mirrors and re-verifies it. Must stay AFTER the
+-- system ALL TABLES grant above: that grant hands the worker INSERT/UPDATE on the
+-- deletion tables, which only the purge role may write.
+DO $purge$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bridgeleads_purge'
+               AND (rolcanlogin OR rolsuper OR rolbypassrls OR rolcreatedb
+                    OR rolcreaterole OR rolinherit OR rolreplication)) THEN
+        RAISE EXCEPTION 'bridgeleads_purge exists with attributes it must not have';
+    END IF;
+    -- Only the migration owner (trusted) may hold a membership, and none may SET or
+    -- INHERIT the role. Mirrors migration 112.
+    IF EXISTS (SELECT 1 FROM pg_roles r WHERE r.rolname = 'bridgeleads_purge') THEN
+        IF EXISTS (SELECT 1 FROM pg_auth_members m
+                   JOIN pg_roles pr ON pr.oid = m.roleid AND pr.rolname = 'bridgeleads_purge'
+                   WHERE m.member <> current_user::regrole
+                      OR m.set_option OR m.inherit_option) THEN
+            RAISE EXCEPTION 'unexpected membership in bridgeleads_purge';
+        END IF;
+    END IF;
+    IF to_regclass('public.account_deletions') IS NOT NULL THEN
+        REVOKE ALL ON account_deletions, consumed_trial_emails FROM bridgeleads_system;
+        REVOKE ALL ON account_deletions, consumed_trial_emails FROM bridgeleads_app;
+        GRANT SELECT ON account_deletions, consumed_trial_emails TO bridgeleads_app;
+        -- consumed_trial_emails has no user_id (no GUC policy): without this the
+        -- grant above sees zero rows. Mirrors migration 112, which skips it when the
+        -- app role did not exist yet.
+        DROP POLICY IF EXISTS consumed_trial_emails_app_select ON consumed_trial_emails;
+        CREATE POLICY consumed_trial_emails_app_select ON consumed_trial_emails
+            FOR SELECT TO bridgeleads_app USING (true);
+        GRANT USAGE ON SCHEMA public TO bridgeleads_purge;
+        GRANT SELECT (id, is_active, deletion_state) ON users TO bridgeleads_purge;
+        GRANT UPDATE (deletion_state) ON users TO bridgeleads_purge;
+        GRANT SELECT, INSERT, UPDATE ON account_deletions TO bridgeleads_purge;
+        GRANT SELECT, INSERT ON consumed_trial_emails TO bridgeleads_purge;
+        GRANT EXECUTE ON FUNCTION request_account_deletion(),
+              restore_account_deletion() TO bridgeleads_app;
+    END IF;
+    -- users CASCADEs into account_deletions: only the owner may delete/truncate it.
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+        REVOKE DELETE, TRUNCATE ON users FROM anon;
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+        REVOKE DELETE, TRUNCATE ON users FROM authenticated;
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
+        REVOKE DELETE, TRUNCATE ON users FROM service_role;
+    END IF;
+END
+$purge$;
+
 -- ── Role 3: owner / migration role ──────────────────────────────────────────
 -- The existing schema owner keeps DDL rights and is used ONLY by Alembic via
 -- DATABASE_URL_MIGRATE (Phase 3). No new role here — do NOT grant DDL to

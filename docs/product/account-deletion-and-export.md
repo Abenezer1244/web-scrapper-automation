@@ -1,7 +1,8 @@
 # Account deletion and data export: proposed design
 
-**Status:** proposal, 2026-10-05. Nothing here is built. Needs owner approval, and
-the retention questions in §4 need counsel (see `docs/legal/COUNSEL-BRIEF-retention-2026-09-17.md`).
+**Status:** owner-approved engineering defaults, 2026-10-06 (§4). Nothing here is built.
+The §4 decisions came from engineering research (three independent passes), not legal
+advice; the open items in §4.3 still go to counsel (see `docs/legal/COUNSEL-BRIEF-retention-2026-09-17.md`).
 Until it ships, Settings > Account tells users to email support for an export or
 to close their account. That is a real, supported path; there is no fake button.
 
@@ -35,19 +36,21 @@ Verified in `src/db/models.py` on 2026-10-05:
    pause every schedule, clear the API key, sign out every session
    (`users.revoked_at`), set `users.deletion_requested_at`. The account stops
    doing anything but still exists.
-3. **Grace period (proposal: 14 days):** signing in shows "This account is
+3. **Grace period (decided: 30 days, see §4):** signing in shows "This account is
    scheduled for deletion on <date>" with a Restore button. Restoring clears the
    flag; schedules stay paused for the user to resume.
 4. **Purge (beat task, worker role + migrate role for the deletes):**
    - delete R2 objects under the user's export prefix;
    - delete tenant data that carries personal information about third parties
      (results, skip-trace links, lists, deliveries, contact lookups);
-   - **retain** what counsel says must survive (likely: billing ledgers, Stripe
-     ids, audit events), with the user's PII removed: `users` row tombstoned
-     (email/name/phone/avatar nulled, `email_hmac` replaced so the address can
-     register again, `is_active=false`, `deleted_at` set);
-   - Stripe customer: keep (invoices are legal records) but clear metadata and
-     the email if counsel agrees.
+   - **retain** the categories in §4.1, with the user's profile PII removed: `users`
+     row tombstoned (email/name/phone/avatar nulled, `email_hmac` replaced so the
+     address can register again, `is_active=false`, `deleted_at` set). Retained rows
+     are *pseudonymised* (linkable via Stripe), never described as "deidentified";
+   - `delivered_records` (who received which parcel) is **kept**, not purged: it is
+     the only way to pass a homeowner's later deletion request on to the customers
+     who received that lead;
+   - Stripe: once no invoice or refund is open, delete the Stripe Customer (§4.4).
    - Each step idempotent and recorded on a `account_deletions` row (outbox
      pattern, like `pending_email_changes`), so a crash resumes, never half-runs.
 5. **Confirmation email** to the address the account had, after the purge.
@@ -60,16 +63,59 @@ already deliverable to the user, using the existing `DataExporter` (CSV-injectio
 sanitised). The user gets an expiring signed link by email and in-app. One export
 per 24 h per account. Same RLS and `user_id` filters as every other read.
 
-## 4. Questions for the owner / counsel before building
+## 4. Decisions (owner, 2026-10-06)
 
-1. Which records must be retained after deletion, and for how long (billing
-   ledgers, audit events, invoices)?
-2. Grace period length (14 days proposed), and whether deletion is reversible
-   during it.
-3. Does a deletion request also trigger the privacy-policy "deletion request"
-   purge for third-party lead data the user exported (we cannot recall files
-   already downloaded; the policy wording should say so)?
-4. Should the Stripe customer email be cleared, or kept for invoice delivery?
+Reconciled from three independent research passes (Claude, Perplexity, ChatGPT).
+Sources: RCW 82.32.070 + WAC 458-20-254 (WA tax records, 5 years); IRS record
+periods (3/6/7 years); Cal. Civ. Code 1798.105(d) and 11 CCR 7022/7101;
+Stripe docs ("Delete a customer", "Redact personal data", "Handling customer
+deletion requests").
+
+### 4.1 What survives the purge, and for how long
+
+| Record | Kept for | Why |
+|---|---|---|
+| Billing: Stripe ids, `skip_trace_meter_events`, contact-lookup ledgers, invoices | 7 years | WA requires 5; 7 also covers the IRS 6- and 7-year cases. Keeps amount, date, product and location fields; profile details removed |
+| Audit events: deletion, MFA, password, export, admin changes | 24 months | Security / fraud exception; also the dispute evidence (terms, cancellation, use) |
+| Audit events: sign-ins and other routine events | 12 months | No legal minimum found; keep less |
+| `delivered_records` (customer -> parcel) | 24 months after last delivery | Needed to forward a homeowner deletion request to recipients |
+| Everything else (profile, settings, schedules, results, skip-trace data, R2 exports, sessions, dialer config, avatar) | Deleted at purge | No retention purpose |
+
+No separate "dispute evidence" store: the 7-year billing records plus the 24-month
+high-value audit events already hold it. The expiry jobs for these periods are a
+later phase; the first purge only has to stop deleting them.
+
+### 4.2 Grace period and billing
+
+- 30 days, user can undo by signing in and pressing Restore. The purge date is
+  the earlier of day 30 and any legal deadline (CCPA: 45 days from the request,
+  not from verification). In-app "Delete account" counts as the deletion request.
+- Billing: the subscription is set to cancel at period end, no refund; the dialog
+  says so. Restoring before period end un-cancels it; after period end the user
+  subscribes again.
+
+### 4.3 Downloaded files, and open items for counsel
+
+- Policy must say plainly that deletion cannot erase files already downloaded,
+  and that the customer remains responsible for those copies (Terms §5(c)).
+  Draft wording for counsel: ChatGPT research pass, "Previously exported lead data".
+- Homeowner removal requests are a **separate workflow** (suppression list so a
+  removed homeowner does not come back on the next scrape). Next project after
+  this one. The published privacy contact address (`bridgeleads.com`) does not
+  receive mail and must be fixed first.
+- For counsel: California coverage and data-broker status field by field; WA
+  sales-tax classification after the Oct 2025 changes (decides which location
+  fields billing must keep); an FCRA prohibited-use clause; how to reach a former
+  customer for a downstream notice after their email is erased.
+
+### 4.4 Stripe
+
+Keep the Customer through the grace period and final invoice (deleting it is
+irreversible and cancels subscriptions immediately). At purge, once nothing is
+open, delete the Customer. Finalized invoices keep their own copy of the
+customer's details, so the tax record survives. Never use Stripe redaction: it
+cannot redact invoices, and a redacted payment cannot be refunded and loses any
+dispute automatically.
 
 ## 5. Size
 

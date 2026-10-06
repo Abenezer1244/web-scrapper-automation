@@ -208,3 +208,16 @@ Homeowner suppression is the NEXT project, not this one.
 - Plan round 6 (Codex): no P0. P1 definer boundary (PUBLIC revoke, caller-bound via GUC, no
   direct writes to account_deletions), P1 bounded drain (day 40), P1 external side effects
   after commit + reconcile: adopted.
+- P1 build (migration 112) Codex diff review, 6 rounds -> GATE PASS. Adopted: non-superuser
+  downgrade drops the functions as their owner; account_deletions id/requested_at immutable;
+  DROP POLICY IF EXISTS before CREATE; app SELECT policy mirrored in provisioning; purge-role
+  membership locked to the migration owner's inert ADMIN row (hand-over REVOKEs its own
+  grant); no anon/authenticated/service_role DELETE/TRUNCATE on users (CASCADE into
+  account_deletions). Refuted with evidence: restore's row lock needing table-wide UPDATE
+  (test runs it as the purge role), DELETE-users cascade by runtime roles (no grant;
+  asserted), provisioning roles absent (the script creates them first). Accepted residual
+  (Codex agreed, not P1): the GUC is set by the shared API role, the same trust boundary as
+  every RLS policy; the DB has no per-end-user principal.
+  Verified: local PG16 superuser round trip; prod-like PG16 simulation (non-superuser owner
+  with CREATEROLE+BYPASSRLS, ADMIN-only purge membership, Supabase default privileges)
+  upgrade -> downgrade -> upgrade with zero leaked privileges (check proven to detect a leak).

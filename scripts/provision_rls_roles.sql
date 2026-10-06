@@ -399,6 +399,16 @@ BEGIN
         GRANT EXECUTE ON FUNCTION request_account_deletion(),
               restore_account_deletion() TO bridgeleads_app;
     END IF;
+    -- users CASCADEs into account_deletions: only the owner may delete/truncate it.
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+        REVOKE DELETE, TRUNCATE ON users FROM anon;
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+        REVOKE DELETE, TRUNCATE ON users FROM authenticated;
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
+        REVOKE DELETE, TRUNCATE ON users FROM service_role;
+    END IF;
 END
 $purge$;
 

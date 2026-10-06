@@ -344,6 +344,21 @@ def upgrade() -> None:
             {revoke_tables}
             {revoke_functions}
 
+            -- users CASCADEs into account_deletions, so deleting (or truncating) users
+            -- would erase a deletion's record outside the lifecycle. The runtime roles
+            -- never had DELETE/TRUNCATE on users; Supabase's API roles got ALL from the
+            -- default privileges, and nothing uses them (no service_role key anywhere).
+            -- Not re-granted on downgrade: they never needed it.
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+                REVOKE DELETE, TRUNCATE ON public.users FROM anon;
+            END IF;
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+                REVOKE DELETE, TRUNCATE ON public.users FROM authenticated;
+            END IF;
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
+                REVOKE DELETE, TRUNCATE ON public.users FROM service_role;
+            END IF;
+
             -- Purge role: exactly what the functions touch.
             GRANT USAGE ON SCHEMA public TO bridgeleads_purge;
             GRANT SELECT (id, is_active, deletion_state) ON public.users TO bridgeleads_purge;

@@ -242,8 +242,9 @@ def test_runtime_roles_reach_the_lifecycle_only_through_the_functions(conn) -> N
                 {"r": role, "p": priv}).scalar() is False, (role, priv)
         # users CASCADEs into account_deletions: deleting a user would be a second,
         # unguarded way to erase a deletion's record. Neither role may do it.
-        assert conn.execute(text("SELECT has_table_privilege(:r, 'users', 'DELETE')"),
-                            {"r": role}).scalar() is False, role
+        for priv in ("DELETE", "TRUNCATE"):
+            assert conn.execute(text("SELECT has_table_privilege(:r, 'users', :p)"),
+                                {"r": role, "p": priv}).scalar() is False, (role, priv)
 
     conn.execute(text("SET LOCAL ROLE bridgeleads_system"))
     assert _sqlstate(conn, "SELECT * FROM request_account_deletion()") == "42501"
@@ -287,3 +288,7 @@ def test_supabase_api_roles_get_nothing(conn) -> None:
         for fn in ("request_account_deletion()", "restore_account_deletion()"):
             assert conn.execute(text("SELECT has_function_privilege(:r, :f, 'EXECUTE')"),
                                 {"r": role, "f": fn}).scalar() is False
+        # users CASCADEs into account_deletions.
+        for priv in ("DELETE", "TRUNCATE"):
+            assert conn.execute(text("SELECT has_table_privilege(:r, 'users', :p)"),
+                                {"r": role, "p": priv}).scalar() is False, (role, priv)

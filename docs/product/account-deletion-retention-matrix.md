@@ -83,3 +83,11 @@ unchanged (until its retention expiry, a later phase); **TOMBSTONE** see the use
 5. R2 prefix lists empty after the final sweep, and every key the user's `jobs.export_key` / `batch_runs.combined_export_key` referenced (captured before any delete) returns 404.
 6. A crash after any phase resumes to the same end state (idempotent re-run).
 7. The users row matches the TOMBSTONE spec and the original address can register again.
+
+## 5. Owner decisions (2026-10-06)
+
+1. Lead shells keep property address + parcel (public record); everything else personal is blanked.
+2. `consumed_trial_emails` 2-year HMAC exception approved.
+3. Tracerfy's copies: no vendor call in the purge; added to the counsel list (contract deletion path).
+4. Rollout: the owner switches `ACCOUNT_DELETION_ENABLED` on only after P3 (purge), P4 (export) and
+   P5 (Settings UI) are live and verified.

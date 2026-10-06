@@ -262,3 +262,8 @@ Homeowner suppression is the NEXT project, not this one.
   flag off, restore MFA, no mint into a pending account. Refuted: missing rate limit
   (_reauthenticate is per-account limited), missing normalization (blind_index normalizes).
   Accepted (existing patterns): Redis cutoff before commit fails safe; MFA guard clear.
+- P3a retention matrix (docs/product/account-deletion-retention-matrix.md): Codex 2 rounds; owner
+  signed off 2026-10-06 (address+parcel kept, trial HMAC 2 y, Tracerfy to counsel, flag flipped by
+  owner after P5). Key finding: billing ledgers CASCADE from jobs/results/configs/batches, so those
+  become scrubbed skeletons, not deleted rows. Next: migration 113 (fence triggers + claim/phase/
+  complete/purge functions) per the matrix.

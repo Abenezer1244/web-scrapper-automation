@@ -1,5 +1,7 @@
+import functools
 import re
 import unicodedata
+import zoneinfo
 from datetime import UTC, date, datetime, timedelta
 from typing import Any, Literal, TypedDict
 from urllib.parse import urlparse
@@ -254,6 +256,12 @@ class UserResponse(BaseModel):
     trial_days_remaining: int | None = None
     notification_prefs: dict[str, bool] = {}
     created_at: datetime
+    # IANA zone id the user picked; None = never set (the FE suggests the browser's).
+    timezone: str | None = None
+    # Version of the user's profile photo, or None for no photo (show initials).
+    # Fetch the image from GET /auth/avatar?v=<this>; a new upload gets a new
+    # version, so a cached photo can never outlive its replacement.
+    avatar_version: str | None = None
 
     model_config = {"from_attributes": True}
 
@@ -295,6 +303,63 @@ class ProfileUpdate(BaseModel):
     @classmethod
     def last_name_validation(cls, v: str) -> str:
         return _validate_required_name(v, "Last name")
+
+    # Optional so the required-name gate (names only) keeps working. Omitted =
+    # unchanged; null = cleared; otherwise it must be a real IANA zone id.
+    timezone: str | None = None
+
+    @field_validator("timezone")
+    @classmethod
+    def timezone_validation(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        if v not in _iana_zones():
+            raise ValueError("Choose a timezone from the list.")
+        return v
+
+
+@functools.cache
+def _iana_zones() -> frozenset[str]:
+    """Valid IANA zone ids (from the pinned tzdata package), fixed per process."""
+    return frozenset(zoneinfo.available_timezones())
+
+
+class SessionResponse(BaseModel):
+    """One signed-in device (Settings > Security). `id` is only for signing it
+    out; `user_agent` is what that browser reported (display only). No IP."""
+    id: str
+    user_agent: str | None = None
+    created_at: datetime
+    last_seen_at: datetime
+    current: bool = False
+
+    model_config = {"from_attributes": True}
+
+
+class EmailChangeRequest(BaseModel):
+    """Start an email change: the new address, re-proved by the current password
+    and, when two-factor is on, a TOTP or backup code."""
+    new_email: EmailStr = Field(max_length=254)
+    current_password: str = Field(min_length=1, max_length=128)
+    mfa_code: str | None = Field(default=None, max_length=32)
+
+    model_config = {"extra": "forbid"}
+
+
+class EmailChangeConfirm(BaseModel):
+    token: str = Field(min_length=1, max_length=2048)
+
+    model_config = {"extra": "forbid"}
+
+
+class SecurityEventResponse(BaseModel):
+    """One entry of the user's own recent security activity. Deliberately only
+    the event name and time: audit rows also hold ip/path/detail, which are
+    operator forensics and never leave the server."""
+    event: str
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
 
 
 class NotificationPrefsUpdate(BaseModel):

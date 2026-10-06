@@ -2782,6 +2782,58 @@
         "title": "DuplicateSource",
         "type": "object"
       },
+      "EmailChangeConfirm": {
+        "additionalProperties": false,
+        "properties": {
+          "token": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "title": "Token",
+            "type": "string"
+          }
+        },
+        "required": [
+          "token"
+        ],
+        "title": "EmailChangeConfirm",
+        "type": "object"
+      },
+      "EmailChangeRequest": {
+        "additionalProperties": false,
+        "description": "Start an email change: the new address, re-proved by the current password\nand, when two-factor is on, a TOTP or backup code.",
+        "properties": {
+          "current_password": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Current Password",
+            "type": "string"
+          },
+          "mfa_code": {
+            "anyOf": [
+              {
+                "maxLength": 32,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mfa Code"
+          },
+          "new_email": {
+            "format": "email",
+            "maxLength": 254,
+            "title": "New Email",
+            "type": "string"
+          }
+        },
+        "required": [
+          "new_email",
+          "current_password"
+        ],
+        "title": "EmailChangeRequest",
+        "type": "object"
+      },
       "EnrichmentConfig": {
         "properties": {
           "property_lookup": {
@@ -3768,6 +3820,17 @@
           "last_name": {
             "title": "Last Name",
             "type": "string"
+          },
+          "timezone": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Timezone"
           }
         },
         "required": [
@@ -5097,6 +5160,26 @@
         "title": "ScraperConfigUpdate",
         "type": "object"
       },
+      "SecurityEventResponse": {
+        "description": "One entry of the user's own recent security activity. Deliberately only\nthe event name and time: audit rows also hold ip/path/detail, which are\noperator forensics and never leave the server.",
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "event": {
+            "title": "Event",
+            "type": "string"
+          }
+        },
+        "required": [
+          "event",
+          "created_at"
+        ],
+        "title": "SecurityEventResponse",
+        "type": "object"
+      },
       "SegmentIntersectionRequest": {
         "description": "Intersection ('on both lists'): properties a user has on ALL of the\nselected record-type lists. STRONG-IDENTITY ONLY (parcel/address match);\nweak name/date rows are excluded by design (see property_identity).\n\nrecord_types must be 2+ distinct slugs — a single list cannot 'overlap'\nitself. counties is an optional lowercase filter.",
         "properties": {
@@ -5507,6 +5590,48 @@
         "title": "SegmentUnionResponse",
         "type": "object"
       },
+      "SessionResponse": {
+        "description": "One signed-in device (Settings > Security). `id` is only for signing it\nout; `user_agent` is what that browser reported (display only). No IP.",
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "current": {
+            "default": false,
+            "title": "Current",
+            "type": "boolean"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "last_seen_at": {
+            "format": "date-time",
+            "title": "Last Seen At",
+            "type": "string"
+          },
+          "user_agent": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "User Agent"
+          }
+        },
+        "required": [
+          "id",
+          "created_at",
+          "last_seen_at"
+        ],
+        "title": "SessionResponse",
+        "type": "object"
+      },
       "SkipTraceStats": {
         "properties": {
           "email_pct": {
@@ -5783,6 +5908,17 @@
       },
       "UserResponse": {
         "properties": {
+          "avatar_version": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Avatar Version"
+          },
           "created_at": {
             "format": "date-time",
             "title": "Created At",
@@ -5852,6 +5988,17 @@
           "records_used": {
             "title": "Records Used",
             "type": "integer"
+          },
+          "timezone": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Timezone"
           },
           "trial_days_remaining": {
             "anyOf": [
@@ -6071,6 +6218,110 @@
         ]
       }
     },
+    "/auth/avatar": {
+      "delete": {
+        "description": "Remove the profile photo; the bytes are erased, not just hidden.",
+        "operationId": "remove_avatar_auth_avatar_delete",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Remove Avatar",
+        "tags": [
+          "auth"
+        ]
+      },
+      "get": {
+        "description": "The signed-in user's photo as WebP. `v` is the avatar_version from /auth/me:\na request for the CURRENT version is cacheable forever (the version changes\nwith the photo); any other version is served uncached.",
+        "operationId": "get_avatar_auth_avatar_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "v",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "V"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              },
+              "image/webp": {}
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Get Avatar",
+        "tags": [
+          "auth"
+        ]
+      },
+      "post": {
+        "description": "Set or replace the profile photo. Signed-in sessions only (not API keys).",
+        "operationId": "upload_avatar_auth_avatar_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Upload Avatar",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
     "/auth/change-password": {
       "post": {
         "description": "Change the current user's password.",
@@ -6130,6 +6381,99 @@
           }
         },
         "summary": "Auth Config",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/auth/email/change": {
+      "post": {
+        "description": "Email a confirmation link to the new address. Same answer whether or not\nthat address already has an account.",
+        "operationId": "request_email_change_auth_email_change_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EmailChangeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Request Email Change Auth Email Change Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Request Email Change",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/auth/email/confirm": {
+      "post": {
+        "description": "Redeem the emailed link. The token is the credential, so no session is\nneeded (the link may be opened on another device). Signs out every session.",
+        "operationId": "confirm_email_change_auth_email_confirm_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EmailChangeConfirm"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Confirm Email Change Auth Email Confirm Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Confirm Email Change",
         "tags": [
           "auth"
         ]
@@ -6630,7 +6974,7 @@
     },
     "/auth/profile": {
       "put": {
-        "description": "Persist the user's editable profile (Settings → Account AND the required-\nname gate): first_name + last_name.\n\nBoth are already sanitized + required (non-empty) by ProfileUpdate. This is\nthe endpoint a legacy incomplete-profile user calls to satisfy the gate, so\nit MUST stay reachable while the profile is incomplete (no auth gate on it\nbeyond normal login). The WHERE id == current_user.id filter is the tenant\nguard — RLS on `users` is permissive under the app role, so the query filter\nis the real own-row constraint (belt-and-suspenders per the project rules).\nThe audit log records the action only, never the name values (they are PII).",
+        "description": "Persist the user's editable profile (Settings → Account AND the required-\nname gate): first_name + last_name, and timezone when the caller sends it\n(omitted = unchanged, so the name-only gate never touches it).\n\nBoth are already sanitized + required (non-empty) by ProfileUpdate. This is\nthe endpoint a legacy incomplete-profile user calls to satisfy the gate, so\nit MUST stay reachable while the profile is incomplete (no auth gate on it\nbeyond normal login). The WHERE id == current_user.id filter is the tenant\nguard — RLS on `users` is permissive under the app role, so the query filter\nis the real own-row constraint (belt-and-suspenders per the project rules).\nThe audit log records the action only, never the name values (they are PII).",
         "operationId": "update_profile_auth_profile_put",
         "requestBody": {
           "content": {
@@ -6806,6 +7150,129 @@
           }
         },
         "summary": "Reset Password",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/auth/security-events": {
+      "get": {
+        "description": "The user's 20 most recent security events (Settings > Security).",
+        "operationId": "my_security_events_auth_security_events_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/SecurityEventResponse"
+                  },
+                  "title": "Response My Security Events Auth Security Events Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "My Security Events",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/auth/sessions": {
+      "get": {
+        "description": "The user's signed-in devices, most recently active first.",
+        "operationId": "list_my_sessions_auth_sessions_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/SessionResponse"
+                  },
+                  "title": "Response List My Sessions Auth Sessions Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "List My Sessions",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/auth/sessions/revoke-others": {
+      "post": {
+        "description": "Sign out every device except this one.",
+        "operationId": "revoke_my_other_sessions_auth_sessions_revoke_others_post",
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Revoke My Other Sessions",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/auth/sessions/{session_id}": {
+      "delete": {
+        "description": "Sign out one device. Only the caller's own sessions can match.",
+        "operationId": "revoke_my_session_auth_sessions__session_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Revoke My Session",
         "tags": [
           "auth"
         ]

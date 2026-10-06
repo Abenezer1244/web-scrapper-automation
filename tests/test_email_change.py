@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.api.auth import generate_api_key
 from src.api.routes.auth_helpers.email_change import _mint_token
 from src.api.routes.auth_helpers.tokens import _mint_reset_token
+from src.config import settings
 from src.db.models import AuditEvent, PendingEmailChange, User
 from src.utils.crypto import encrypt_field
 from src.workers.account_emails import _drain_email_change_outbox_impl
@@ -207,13 +208,16 @@ async def test_api_key_cannot_change_the_email(
 
 @pytest.mark.asyncio
 async def test_outbox_waits_without_a_mail_key(
-    client: AsyncClient, db: AsyncSession, starter_user: User
+    client: AsyncClient, db: AsyncSession, starter_user: User, monkeypatch
 ) -> None:
+    # The premise is "no key configured" (CI sets a dummy key, which instead
+    # exercises the permanent-failure path).
+    monkeypatch.setattr(settings, "RESEND_API_KEY", "")
     auth = await _session(client, starter_user)
     await _request(client, auth, "outbox@example.com")
     (row,) = await _pending(db, starter_user)
     await _confirm(client, _link_token(row))
-    _drain_email_change_outbox_impl()  # RESEND_API_KEY is unset in tests
+    _drain_email_change_outbox_impl()
     (row,) = await _pending(db, starter_user)
     assert row.notice_state == "pending" and row.outbox_attempts == 0
 

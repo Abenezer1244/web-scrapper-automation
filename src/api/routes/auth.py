@@ -497,8 +497,8 @@ async def delete_account(
     out every device and the API key now; signing in again and restoring undoes it."""
     if not settings.ACCOUNT_DELETION_ENABLED:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Not Found")
-    await _reauthenticate(request, current_user, body.current_password)
-    user = (await db.execute(select(User).where(User.id == current_user.id))).scalar_one()
+    user = await _account_deletion.lock_user(db, current_user.id)
+    await _reauthenticate(request, user, body.current_password)
     purge_after = await _account_deletion.request_deletion(
         request, db, user, body.mfa_code, body.confirm_email
     )
@@ -514,8 +514,8 @@ async def restore_account(
 ) -> None:
     """Cancel a pending deletion. Never gated by ACCOUNT_DELETION_ENABLED: switching
     deletion off must not strand an account that is already pending."""
-    await _reauthenticate(request, current_user, body.current_password)
-    user = (await db.execute(select(User).where(User.id == current_user.id))).scalar_one()
+    user = await _account_deletion.lock_user(db, current_user.id)
+    await _reauthenticate(request, user, body.current_password)
     await _account_deletion.restore_deletion(request, db, user, body.mfa_code)
 
 

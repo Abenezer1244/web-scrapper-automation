@@ -44,6 +44,19 @@ def _sqlstate(exc: DBAPIError) -> str | None:
     return getattr(exc.orig, "sqlstate", None) or getattr(exc.orig, "pgcode", None)
 
 
+async def lock_user(db: AsyncSession, user_id: str) -> User:
+    """The users row, locked for the rest of the transaction BEFORE the password and
+    second factor are checked, so neither can change between the check and the
+    lifecycle transition. FOR NO KEY UPDATE: the same lock the migration-112 functions
+    take (users row first, everywhere), and it does not wait on child-table inserts."""
+    return (
+        await db.execute(
+            select(User).where(User.id == str(user_id)).with_for_update(key_share=True)
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one()
+
+
 async def _second_factor(db: AsyncSession, user: User, mfa_code: str | None) -> None:
     """Require a TOTP or backup code when two-factor is on (email-change pattern).
     The consumed code is committed with the caller's transaction."""
@@ -61,8 +74,9 @@ async def _second_factor(db: AsyncSession, user: User, mfa_code: str | None) -> 
 async def request_deletion(
     request: Request, db: AsyncSession, user: User, mfa_code: str | None, confirm_email: str
 ) -> datetime:
-    """Caller re-proved the password and holds an RLS-bound session. Returns the purge
-    date. A repeat request while one is pending changes nothing and returns its date."""
+    """Caller holds the users row lock (lock_user) and re-proved the password on it.
+    Returns the purge date. A repeat request while one is pending changes nothing but
+    the consumed second-factor code, and returns its date."""
     user_id = str(user.id)
     await _second_factor(db, user, mfa_code)
     try:
@@ -125,7 +139,7 @@ async def request_deletion(
 async def restore_deletion(
     request: Request, db: AsyncSession, user: User, mfa_code: str | None
 ) -> None:
-    """Caller re-proved the password and holds an RLS-bound session."""
+    """Caller holds the users row lock (lock_user) and re-proved the password on it."""
     user_id = str(user.id)
     await _second_factor(db, user, mfa_code)
     try:

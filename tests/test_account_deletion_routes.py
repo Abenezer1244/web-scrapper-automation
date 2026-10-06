@@ -107,7 +107,9 @@ async def test_delete_schedules_and_shuts_everything_down_now(
     entitlement = await _config(db, business_user, active=False, reason="entitlement")
     user_paused = await _config(db, business_user, active=False, reason=None)
     auth = await _session(client, business_user)
-    other_device = await _session(client, business_user)
+    login = await client.post("/auth/login", json={"email": business_user.email, "password": _PW})
+    other_device = {"Authorization": f"Bearer {login.json()['access_token']}"}
+    refresh = login.json()["refresh_token"]
     key = (await client.post("/auth/api-key", json={"current_password": _PW},
                              headers=auth)).json()["api_key"]
     key_auth = {"Authorization": f"Bearer {key}"}
@@ -133,6 +135,13 @@ async def test_delete_schedules_and_shuts_everything_down_now(
     live = (await db.execute(select(UserSession.id).where(
         UserSession.user_id == business_user.id, UserSession.revoked_at.is_(None)))).all()
     assert live == []
+    assert (await db.execute(select(User.revoked_at, User.api_key_hash).where(
+        User.id == business_user.id).execution_options(populate_existing=True))).one() != (
+        None, None)
+    assert (await db.execute(select(User.api_key_hash).where(
+        User.id == business_user.id))).scalar_one() is None
+    r = await client.post("/auth/refresh", json={"refresh_token": refresh})
+    assert r.status_code == 401, "a refresh token outlived the deletion request"
     assert await _events(db, business_user, "account_deletion_requested") == 1
 
 
@@ -158,10 +167,13 @@ async def test_a_repeat_request_changes_nothing(
 ) -> None:
     first = await _delete(client, await _session(client, starter_user), starter_user)
     assert first.status_code == 200
-    again = await _delete(client, await _session(client, starter_user), starter_user)
+    new_session = await _session(client, starter_user)
+    again = await _delete(client, new_session, starter_user)
     assert again.status_code == 200
     assert again.json()["purge_after"] == first.json()["purge_after"]
     assert await _events(db, starter_user, "account_deletion_requested") == 1
+    # Nothing was re-run: the session opened after the first request still works.
+    assert (await client.get("/auth/me", headers=new_session)).status_code == 200
 
 
 @pytest.mark.asyncio
@@ -229,3 +241,32 @@ async def test_api_keys_cannot_delete_or_restore(
     key_auth = {"Authorization": f"Bearer {key}"}
     assert (await _delete(client, key_auth, business_user)).status_code == 403
     assert (await _restore(client, key_auth)).status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_switching_deletion_off_never_strands_a_pending_account(
+    client: AsyncClient, db: AsyncSession, starter_user: User, monkeypatch
+) -> None:
+    monkeypatch.setattr(settings, "ACCOUNT_DELETION_ENABLED", True)
+    assert (await _delete(client, await _session(client, starter_user), starter_user)
+            ).status_code == 200
+    monkeypatch.setattr(settings, "ACCOUNT_DELETION_ENABLED", False)
+    assert (await _restore(client, await _session(client, starter_user))).status_code == 204
+    assert await _state(db, starter_user) is None
+
+
+@pytest.mark.asyncio
+async def test_restore_needs_the_second_factor_too(
+    client: AsyncClient, db: AsyncSession, starter_user: User, deletion_on
+) -> None:
+    assert (await _delete(client, await _session(client, starter_user), starter_user)
+            ).status_code == 200
+    auth = await _session(client, starter_user)  # session predates MFA, still valid
+    secret = pyotp.random_base32()
+    await db.execute(update(User).where(User.id == starter_user.id).values(
+        mfa_enabled=True, mfa_secret_encrypted=encrypt_field(secret)))
+    await db.commit()
+    assert (await _restore(client, auth)).status_code == 400
+    assert await _state(db, starter_user) == "pending"
+    assert (await _restore(client, auth, mfa_code=pyotp.TOTP(secret).now())).status_code == 204
+    assert await _state(db, starter_user) is None

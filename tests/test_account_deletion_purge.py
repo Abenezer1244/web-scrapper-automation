@@ -534,6 +534,17 @@ def test_fence_refuses_inserts_and_pins_scrubbed_columns_once_purging(conn) -> N
                         {"u": uid}).scalar() is False  # a paused schedule never revives
     conn.execute(text("UPDATE notifications SET read_at = now() WHERE user_id = :u"),
                  {"u": uid})  # rows the purge deletes: updates are harmless
+    # Audit events are kept, but a purging owner's free text is never stored.
+    conn.execute(text("INSERT INTO audit_events (id, event, user_id, detail) VALUES "
+                      "(gen_random_uuid(), 'late', :u, 'free text'), "
+                      "(gen_random_uuid(), 'late', :b, 'free text')"),
+                 {"u": uid, "b": bystander})
+    conn.execute(text("UPDATE audit_events SET detail = 'again' WHERE user_id = :u"), {"u": uid})
+    late = dict(conn.execute(text(
+        "SELECT user_id::text, detail FROM audit_events WHERE event = 'late'")).all())
+    assert late == {uid: None, bystander: "free text"}
+    assert conn.execute(text("SELECT count(*) FROM audit_events WHERE user_id = :u "
+                             "AND detail IS NOT NULL"), {"u": uid}).scalar() == 0
     assert _sqlstate(conn, "INSERT INTO delivered_records (id, user_id, dedup_hash) "
                            "VALUES (gen_random_uuid(), :u, 'late')", {"u": uid}) == "BLD20"
     assert _sqlstate(conn, "INSERT INTO user_sessions (id, user_id) VALUES ('late', :u)",
@@ -645,7 +656,8 @@ def test_purge_functions_and_fence_are_locked_down(conn) -> None:
         assert (owner, definer) == ("bridgeleads_purge", True), fn
         assert config == ["search_path=pg_catalog, pg_temp"]
         assert acl is not None and not any(e.startswith("=") for e in acl.strip("{}").split(","))
-    for fn in ("account_deletion_fence", "account_deletion_fence_job_logs"):
+    for fn in ("account_deletion_fence", "account_deletion_fence_job_logs",
+               "account_deletion_fence_audit"):
         definer, acl = conn.execute(text(
             "SELECT prosecdef, proacl::text FROM pg_proc WHERE proname = :f"), {"f": fn}).one()
         assert definer is False
@@ -653,7 +665,7 @@ def test_purge_functions_and_fence_are_locked_down(conn) -> None:
     enabled = dict(conn.execute(text(
         "SELECT c.relname, t.tgenabled FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid "
         "WHERE t.tgname = 'zz_account_deletion_fence'")).all())
-    assert enabled == dict.fromkeys(_FENCED, "A")
+    assert enabled == dict.fromkeys((*_FENCED, "audit_events"), "A")
     assert conn.execute(text(
         "SELECT count(*) FROM pg_auth_members WHERE roleid = 'bridgeleads_purge'::regrole "
         "AND (set_option OR inherit_option OR member <> current_user::regrole)")).scalar() == 0
@@ -671,6 +683,7 @@ def test_supabase_api_roles_cannot_run_the_purge(conn) -> None:
                    "purge_account_data(uuid, uuid, text[], integer)",
                    "complete_account_deletion(uuid, uuid)",
                    "account_deletion_fence()", "account_deletion_fence_job_logs()",
+                   "account_deletion_fence_audit()",
                    "account_deletion_owner_state(uuid, uuid, boolean)"):
             assert conn.execute(text("SELECT has_function_privilege(:r, :f, 'EXECUTE')"),
                                 {"r": role, "f": fn}).scalar() is False, (role, fn)

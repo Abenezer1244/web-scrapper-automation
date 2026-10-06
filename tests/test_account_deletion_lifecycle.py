@@ -91,7 +91,8 @@ def test_request_opens_one_pending_deletion_30_days_out(conn) -> None:
     before = datetime.now(UTC)
     first = conn.execute(text("SELECT * FROM request_account_deletion()")).one()
     assert first.created is True
-    assert timedelta(days=29, hours=23) < first.purge_after - before < timedelta(days=30, hours=1)
+    # +-2 h: `interval '30 days'` follows the session time zone across a DST change.
+    assert timedelta(days=29, hours=22) < first.purge_after - before < timedelta(days=30, hours=2)
     assert _state(conn, uid) == "pending"
     rows = _rows(conn, uid)
     assert [(r.status, r.stripe_state) for r in rows] == [("pending", "pending_cancel")]

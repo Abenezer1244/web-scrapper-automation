@@ -203,16 +203,20 @@ async def test_restore_is_refused_once_the_purge_has_started(
 ) -> None:
     assert (await _delete(client, await _session(client, starter_user), starter_user)
             ).status_code == 200
-    # What the P3 claim function will do, done here as the purge role (lock order:
-    # users row, then the deletion row).
+    pending_session = await _session(client, starter_user)  # signing in to restore is allowed
+    # What claim_account_deletion (113) does, done here as the purge role because the
+    # row is not due for 30 days (lock order: users row, then the deletion row).
     with sync_engine.begin() as conn:
         conn.execute(text("SET LOCAL ROLE bridgeleads_purge"))
-        conn.execute(text("UPDATE users SET deletion_state = 'purging' WHERE id = :u"),
-                     {"u": starter_user.id})
+        conn.execute(text("UPDATE users SET deletion_state = 'purging', is_active = false "
+                          "WHERE id = :u"), {"u": starter_user.id})
         conn.execute(text("UPDATE account_deletions SET status = 'purging' "
                           "WHERE user_id = :u AND status = 'pending'"), {"u": starter_user.id})
-    r = await _restore(client, await _session(client, starter_user))
-    assert r.status_code == 409
+    # The account is gone from the user's side: no restore, no new sign-in (a 401, not
+    # the 500 the purge's write fence would raise on a new session row).
+    assert (await _restore(client, pending_session)).status_code == 401
+    r = await client.post("/auth/login", json={"email": starter_user.email, "password": _PW})
+    assert r.status_code == 401
     assert await _state(db, starter_user) == "purging"
 
 

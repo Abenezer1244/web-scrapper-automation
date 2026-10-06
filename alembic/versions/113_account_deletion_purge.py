@@ -180,6 +180,22 @@ BEGIN
 END
 $fn$;
 
+-- audit_events keeps the event (no foreign key, no lock needed) but never stores the
+-- free-text detail of a purging/deleted owner, on INSERT or UPDATE.
+CREATE FUNCTION public.account_deletion_fence_audit() RETURNS trigger
+LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog, pg_temp AS $fn$
+BEGIN
+    IF current_user = 'bridgeleads_purge' OR NEW.user_id IS NULL OR NEW.detail IS NULL THEN
+        RETURN NEW;
+    END IF;
+    IF public.account_deletion_owner_state(NEW.user_id, NULL, false)
+       IN ('purging', 'deleted') THEN
+        NEW.detail := NULL;
+    END IF;
+    RETURN NEW;
+END
+$fn$;
+
 CREATE FUNCTION public.account_deletion_fence_job_logs() RETURNS trigger
 LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog, pg_temp AS $fn$
 BEGIN
@@ -480,7 +496,7 @@ BEGIN
     -- A queue row is a batch shared with other tenants: only a finished one is touched,
     -- so a co-tenant's ingest never loses its download link.
     UPDATE public.skip_trace_queues SET download_url = NULL, error_message = NULL
-     WHERE user_id = v_uid AND status <> 'pending'
+     WHERE user_id = v_uid AND status IN ('completed', 'errored')
        AND (download_url IS NOT NULL OR error_message IS NOT NULL);
     UPDATE public.jobs SET export_key = NULL, error_message = NULL
      WHERE user_id = v_uid AND (export_key IS NOT NULL OR error_message IS NOT NULL);
@@ -584,6 +600,11 @@ def upgrade() -> None:
         "FOR EACH ROW EXECUTE FUNCTION public.account_deletion_fence_job_logs()"
     )
     op.execute(f"ALTER TABLE public.job_logs ENABLE ALWAYS TRIGGER {_TRIGGER}")
+    op.execute(
+        f"CREATE TRIGGER {_TRIGGER} BEFORE INSERT OR UPDATE ON public.audit_events "
+        "FOR EACH ROW EXECUTE FUNCTION public.account_deletion_fence_audit()"
+    )
+    op.execute(f"ALTER TABLE public.audit_events ENABLE ALWAYS TRIGGER {_TRIGGER}")
     op.execute(_FUNCTIONS_SQL)
 
     grants = []
@@ -598,7 +619,8 @@ def upgrade() -> None:
     revokes = [f"REVOKE ALL ON FUNCTION {fns} FROM PUBLIC;"]
     revokes += [_guarded(r, f"REVOKE ALL ON FUNCTION {fns} FROM {r};") for r in _API_ROLES]
     fence_fns = ("public.account_deletion_fence(), "
-                 "public.account_deletion_fence_job_logs()")
+                 "public.account_deletion_fence_job_logs(), "
+                 "public.account_deletion_fence_audit()")
     fence_revokes = [f"REVOKE ALL ON FUNCTION {fence_fns} FROM PUBLIC;"]
     fence_revokes += [
         _guarded(r, f"REVOKE ALL ON FUNCTION {fence_fns} FROM {r};")
@@ -666,7 +688,7 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.execute(text("SET LOCAL lock_timeout = '5s'"))
-    for tbl in (*_FENCED, "job_logs"):
+    for tbl in (*_FENCED, "job_logs", "audit_events"):
         op.execute(f"DROP TRIGGER IF EXISTS {_TRIGGER} ON public.{tbl}")
     drops = " ".join(f"DROP FUNCTION IF EXISTS public.{f};"
                      for f in (*_WORKER_FUNCTIONS, _OWNER_STATE_FN))
@@ -694,6 +716,7 @@ def downgrade() -> None:
     )
     op.execute("DROP FUNCTION IF EXISTS public.account_deletion_fence()")
     op.execute("DROP FUNCTION IF EXISTS public.account_deletion_fence_job_logs()")
+    op.execute("DROP FUNCTION IF EXISTS public.account_deletion_fence_audit()")
     revokes = []
     for tbl, _ in _PURGE_GRANTS:
         revokes.append(f"DROP POLICY IF EXISTS {tbl}_purge ON public.{tbl};")

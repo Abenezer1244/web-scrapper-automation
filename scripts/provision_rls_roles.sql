@@ -371,10 +371,15 @@ BEGIN
                     OR rolcreaterole OR rolinherit OR rolreplication)) THEN
         RAISE EXCEPTION 'bridgeleads_purge exists with attributes it must not have';
     END IF;
-    IF EXISTS (SELECT 1 FROM pg_roles r
-               WHERE r.rolname IN ('bridgeleads_app', 'bridgeleads_system')
-                 AND pg_has_role(r.oid, 'bridgeleads_purge', 'MEMBER')) THEN
-        RAISE EXCEPTION 'a runtime role is a member of bridgeleads_purge';
+    -- Only the migration owner (trusted) may hold a membership, and none may SET or
+    -- INHERIT the role. Mirrors migration 112.
+    IF EXISTS (SELECT 1 FROM pg_roles r WHERE r.rolname = 'bridgeleads_purge') THEN
+        IF EXISTS (SELECT 1 FROM pg_auth_members m
+                   JOIN pg_roles pr ON pr.oid = m.roleid AND pr.rolname = 'bridgeleads_purge'
+                   WHERE m.member <> current_user::regrole
+                      OR m.set_option OR m.inherit_option) THEN
+            RAISE EXCEPTION 'unexpected membership in bridgeleads_purge';
+        END IF;
     END IF;
     IF to_regclass('public.account_deletions') IS NOT NULL THEN
         REVOKE ALL ON account_deletions, consumed_trial_emails FROM bridgeleads_system;

@@ -22,7 +22,12 @@ tasks/todo-account-deletion.md (phase P1). Schema only: no ORM mapping ships wit
                            exception, expires_at bounds it).
   request_account_deletion()  / restore_account_deletion()
                            act on the user bound to the session GUC `app.current_user_id`
-                           (no user id parameter, so a caller can only act on itself).
+                           (no user id parameter). The GUC is set by the API role from
+                           the authenticated session, the same trust boundary every RLS
+                           policy in this schema relies on: the database has no
+                           per-end-user principal, so a party able to run SQL as
+                           bridgeleads_app is already trusted (it can read and update
+                           any users row). A forged request is also undoable for 30 days.
 
 Supabase default privileges grant ALL on every new table, and EXECUTE on every new
 function, to anon / authenticated / service_role (service_role bypasses RLS). Everything
@@ -377,16 +382,20 @@ def upgrade() -> None:
             ALTER FUNCTION public.restore_account_deletion() OWNER TO bridgeleads_purge;
             REVOKE CREATE ON SCHEMA public FROM bridgeleads_purge;
             IF NOT v_super THEN
-                EXECUTE format('REVOKE SET OPTION FOR bridgeleads_purge FROM %I',
-                               current_user);
+                -- Removes only the grant made just above (REVOKE touches grants made by
+                -- the current role); the ADMIN-only row CREATE ROLE gave this role,
+                -- granted by the bootstrap superuser, stays for future migrations.
+                EXECUTE format('REVOKE bridgeleads_purge FROM %I', current_user);
             END IF;
 
-            -- No runtime role may reach the purge role.
-            IF EXISTS (SELECT 1 FROM pg_roles r
-                       WHERE r.rolname IN ('bridgeleads_app', 'bridgeleads_system',
-                                           'anon', 'authenticated', 'service_role')
-                         AND pg_has_role(r.oid, 'bridgeleads_purge', 'MEMBER')) THEN
-                RAISE EXCEPTION 'a runtime role is a member of bridgeleads_purge';
+            -- Nobody but the migration owner (trusted, like a superuser) may hold any
+            -- membership in the purge role, not even an inert or ADMIN-only one, and
+            -- nobody may be able to become or inherit it.
+            IF EXISTS (SELECT 1 FROM pg_auth_members m
+                       WHERE m.roleid = 'bridgeleads_purge'::regrole
+                         AND (m.member <> current_user::regrole
+                              OR m.set_option OR m.inherit_option)) THEN
+                RAISE EXCEPTION 'unexpected membership in bridgeleads_purge';
             END IF;
         END
         $deletion_grants$;
@@ -416,7 +425,7 @@ def downgrade() -> None:
             {drops}
             IF NOT v_super THEN
                 RESET ROLE;
-                EXECUTE format('REVOKE SET OPTION FOR bridgeleads_purge FROM %I', v_me);
+                EXECUTE format('REVOKE bridgeleads_purge FROM %I', v_me);
             END IF;
         END
         $purge_drop$;

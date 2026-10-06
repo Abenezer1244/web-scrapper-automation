@@ -189,7 +189,7 @@ def test_purge_role_and_functions_are_locked_down(conn) -> None:
     # or inherit the purge role (an ADMIN-only row from CREATE ROLE is inert).
     assert conn.execute(text(
         "SELECT count(*) FROM pg_auth_members WHERE roleid = 'bridgeleads_purge'::regrole "
-        "AND (set_option OR inherit_option)")).scalar() == 0
+        "AND (set_option OR inherit_option OR member <> current_user::regrole)")).scalar() == 0
     for fn in ("request_account_deletion", "restore_account_deletion"):
         owner, definer, config, acl = conn.execute(text(
             "SELECT pg_get_userbyid(proowner), prosecdef, proconfig, proacl::text "

@@ -255,3 +255,10 @@ Homeowner suppression is the NEXT project, not this one.
   restore step-up; email checked under the row lock; scheduled email via the P3 beat outbox;
   purge waits for Stripe cancel confirmation. Not adopted: audit inside the txn (every
   security event in the codebase is audited post-commit). Dropped: restore notice email.
+- P2a build Codex diff review, 3 rounds -> GATE PASS. Adopted: lock + re-read the users row
+  (FOR NO KEY UPDATE) before the password/second-factor check; API-key mint made a conditional
+  UPDATE ... WHERE deletion_state IS NULL (a mint blocked on the deletion's lock could
+  otherwise write a fresh key after it); tests for refresh death, repeat no-op, restore with
+  flag off, restore MFA, no mint into a pending account. Refuted: missing rate limit
+  (_reauthenticate is per-account limited), missing normalization (blind_index normalizes).
+  Accepted (existing patterns): Redis cutoff before commit fails safe; MFA guard clear.

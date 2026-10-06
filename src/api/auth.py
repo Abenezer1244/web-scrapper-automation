@@ -137,7 +137,8 @@ def create_secure_token(
     amr defaults to ["pwd"]; auth_time defaults to now. Both are sanitized so an
     issued token never carries an unknown auth-method token.
     """
-    now = int(time.time())
+    now_ms = time.time_ns() // 1_000_000
+    now = now_ms // 1000
     payload = {
         "sub": user_id,
         "jti": str(uuid.uuid4()),
@@ -155,6 +156,8 @@ def create_secure_token(
             else now
         ),
         "iat": now,
+        # Millisecond issue time from the same clock sample (sub-second revoke).
+        "iat_ms": now_ms,
         "exp": now + _ACCESS_TOKEN_EXPIRE_SECONDS,
     }
     if fam:
@@ -175,7 +178,8 @@ def create_refresh_token(
     auth_time as the access token so /auth/refresh can propagate session strength
     and freshness UNCHANGED into the rotated pair.
     """
-    now = int(time.time())
+    now_ms = time.time_ns() // 1_000_000
+    now = now_ms // 1000
     payload = {
         "sub": user_id,
         "jti": str(uuid.uuid4()),
@@ -193,6 +197,8 @@ def create_refresh_token(
             else now
         ),
         "iat": now,
+        # Millisecond issue time from the same clock sample (sub-second revoke).
+        "iat_ms": now_ms,
         "exp": now + _REFRESH_TOKEN_EXPIRE_SECONDS,
     }
     if fam:
@@ -375,7 +381,7 @@ async def get_auth_context(
         if await TokenBlacklist.is_blacklisted(jti):
             raise _CREDENTIALS_EXCEPTION
 
-        if await TokenBlacklist.is_revoked_by_user_logout_all(user_id, issued_at):
+        if await TokenBlacklist.is_revoked_by_user_logout_all(user_id, issued_at, payload):
             raise _CREDENTIALS_EXCEPTION
 
         # The session this token belongs to was logged out, or burned by a

@@ -472,7 +472,7 @@ async def refresh_tokens(
     if not jti or ttl <= 0:
         raise HTTPException(status_code=401, detail="Invalid or expired refresh token")
     try:
-        if await TokenBlacklist.is_revoked_by_user_logout_all(user_id, issued_at):
+        if await TokenBlacklist.is_revoked_by_user_logout_all(user_id, issued_at, payload):
             raise HTTPException(status_code=401, detail="Refresh token revoked")
         # This session was logged out, or burned by an earlier replay (A-1/A-5).
         if await TokenBlacklist.is_family_revoked(fam):
@@ -569,7 +569,7 @@ async def refresh_tokens(
     try:
         if await TokenBlacklist.is_family_revoked(fam):
             raise HTTPException(status_code=401, detail="Refresh token revoked")
-        if await TokenBlacklist.is_revoked_by_user_logout_all(user_id, issued_at):
+        if await TokenBlacklist.is_revoked_by_user_logout_all(user_id, issued_at, payload):
             raise HTTPException(status_code=401, detail="Refresh token revoked")
     except _redis_exceptions.RedisError:
         raise revocation_unavailable_503()

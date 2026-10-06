@@ -383,6 +383,16 @@ def test_purge_leaves_exactly_the_matrix_end_state(conn) -> None:
         "INSERT INTO skip_trace_queues (id, tracerfy_queue_id, user_id, download_url) "
         "VALUES (gen_random_uuid(), :n, :u, 'https://vendor.test/live.csv') RETURNING id"),
         {"n": random.randint(1, 2**31 - 1), "u": victim}).scalar()
+    # A finished batch "owned" by a co-tenant (user_id = its first tenant) that also
+    # carried the victim's row: its link holds the victim's data too.
+    co_tenant = _user(conn)
+    shared_n = random.randint(1, 2**31 - 1)
+    conn.execute(text(
+        "INSERT INTO skip_trace_queues (id, tracerfy_queue_id, user_id, status, download_url) "
+        "VALUES (gen_random_uuid(), :n, :u, 'completed', 'https://vendor.test/shared.csv')"),
+        {"n": shared_n, "u": co_tenant})
+    conn.execute(text("UPDATE pending_skip_trace_rows SET tracerfy_queue_id = :n "
+                      "WHERE user_id = :u"), {"n": shared_n, "u": victim})
     kept = {t: _count(conn, t, victim) for t in _KEPT}
     before_other = _snapshot(conn, o)
 
@@ -413,6 +423,8 @@ def test_purge_leaves_exactly_the_matrix_end_state(conn) -> None:
                             {"u": victim, "q": str(in_flight)}).scalar() == 0, t
     assert conn.execute(text("SELECT download_url FROM skip_trace_queues WHERE id = :q"),
                         {"q": str(in_flight)}).scalar() == "https://vendor.test/live.csv"
+    assert conn.execute(text("SELECT download_url FROM skip_trace_queues "
+                             "WHERE tracerfy_queue_id = :n"), {"n": shared_n}).scalar() is None
     assert {t: _count(conn, t, victim) for t in _KEPT} == kept
     cfg = conn.execute(text("SELECT name, fields::text, enrichment::text, schedule::text, "
                             "deliver::text, active FROM scraper_configs WHERE user_id = :u"),
@@ -571,6 +583,9 @@ def test_fence_never_lets_a_row_change_owner(conn) -> None:
                      {"a": a, "b": b}) == "BLD21"
     assert _sqlstate(conn, "UPDATE job_logs SET job_id = :jb WHERE job_id = :ja",
                      {"ja": ids_a["job"], "jb": ids_b["job"]}) == "BLD21"
+    for target in (":b", "NULL"):
+        assert _sqlstate(conn, f"UPDATE audit_events SET user_id = {target} WHERE user_id = :a",
+                         {"a": a, "b": b}) == "BLD21"
 
 
 def test_purge_waits_for_a_writer_already_past_the_fence() -> None:

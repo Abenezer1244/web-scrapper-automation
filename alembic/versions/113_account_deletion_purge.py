@@ -181,10 +181,14 @@ END
 $fn$;
 
 -- audit_events keeps the event (no foreign key, no lock needed) but never stores the
--- free-text detail of a purging/deleted owner, on INSERT or UPDATE.
+-- free-text detail of a purging/deleted owner, on INSERT or UPDATE. user_id may never
+-- change, so no row can be re-parented out of the scrub.
 CREATE FUNCTION public.account_deletion_fence_audit() RETURNS trigger
 LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog, pg_temp AS $fn$
 BEGIN
+    IF TG_OP = 'UPDATE' AND OLD.user_id IS DISTINCT FROM NEW.user_id THEN
+        RAISE EXCEPTION 'user_id is immutable' USING ERRCODE = 'BLD21';
+    END IF;
     IF current_user = 'bridgeleads_purge' OR NEW.user_id IS NULL OR NEW.detail IS NULL THEN
         RETURN NEW;
     END IF;
@@ -493,11 +497,16 @@ BEGIN
      WHERE user_id = v_uid
        AND (first_name IS NOT NULL OR last_name IS NOT NULL OR mail_address IS NOT NULL
          OR mail_city IS NOT NULL OR mail_state IS NOT NULL OR mail_zip IS NOT NULL);
-    -- A queue row is a batch shared with other tenants: only a finished one is touched,
-    -- so a co-tenant's ingest never loses its download link.
-    UPDATE public.skip_trace_queues SET download_url = NULL, error_message = NULL
-     WHERE user_id = v_uid AND status IN ('completed', 'errored')
-       AND (download_url IS NOT NULL OR error_message IS NOT NULL);
+    -- A queue row is a Tracerfy batch shared by several tenants and its user_id is only
+    -- the first of them: find every batch that carried this user's rows through the kept
+    -- pending rows. Only finished ones are touched (ingest reads the link from the
+    -- webhook payload, never from this column, and retention clears it anyway).
+    UPDATE public.skip_trace_queues q SET download_url = NULL, error_message = NULL
+     WHERE q.status IN ('completed', 'errored')
+       AND (q.download_url IS NOT NULL OR q.error_message IS NOT NULL)
+       AND (q.user_id = v_uid OR q.tracerfy_queue_id IN (
+            SELECT p.tracerfy_queue_id FROM public.pending_skip_trace_rows p
+             WHERE p.user_id = v_uid AND p.tracerfy_queue_id IS NOT NULL));
     UPDATE public.jobs SET export_key = NULL, error_message = NULL
      WHERE user_id = v_uid AND (export_key IS NOT NULL OR error_message IS NOT NULL);
     UPDATE public.scraper_configs
@@ -569,7 +578,15 @@ BEGIN
                     OR p.mail_address IS NOT NULL OR p.mail_city IS NOT NULL
                     OR p.mail_state IS NOT NULL OR p.mail_zip IS NOT NULL))
        OR EXISTS (SELECT 1 FROM public.jobs j WHERE j.user_id = v_uid
-                  AND (j.export_key IS NOT NULL OR j.error_message IS NOT NULL)) THEN
+                  AND (j.export_key IS NOT NULL OR j.error_message IS NOT NULL))
+       -- A batch that finished after the first pass still carries its link.
+       OR EXISTS (SELECT 1 FROM public.skip_trace_queues q
+                   WHERE q.status IN ('completed', 'errored')
+                     AND (q.download_url IS NOT NULL OR q.error_message IS NOT NULL)
+                     AND (q.user_id = v_uid OR q.tracerfy_queue_id IN (
+                          SELECT p.tracerfy_queue_id FROM public.pending_skip_trace_rows p
+                           WHERE p.user_id = v_uid AND p.tracerfy_queue_id IS NOT NULL)))
+       THEN
         RAISE EXCEPTION 'personal data written during the purge: run the purge again'
             USING ERRCODE = 'BLD36';
     END IF;

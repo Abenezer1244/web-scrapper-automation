@@ -267,3 +267,32 @@ Homeowner suppression is the NEXT project, not this one.
   owner after P5). Key finding: billing ledgers CASCADE from jobs/results/configs/batches, so those
   become scrubbed skeletons, not deleted rows. Next: migration 113 (fence triggers + claim/phase/
   complete/purge functions) per the matrix.
+- P3a migration 113 build (2026-10-06, session 2). Re-read: claim now sets `is_active=false`
+  (every sign-in/refresh/password-reset/API-key lookup already filters it -> 401, no route
+  change); repeated purge calls no longer rewrite scrubbed rows. A code audit then found
+  cross-tenant beat UPDATEs (skip-trace dispatcher, NTS matcher, dialer push, quota and
+  owner/mailing recovery sweeps) that a raise-on-UPDATE fence would abort for every tenant
+  once any account is purging. Codex design consult: DESIGN: REVISE. **Owner chose "pin":**
+  UPDATE never raises; the matrix SCRUB columns keep their OLD values for a purging/deleted
+  owner; INSERT still raises BLD20 under FOR KEY SHARE. UPDATE takes no users lock (would
+  deadlock with code holding users FOR UPDATE): its row lock orders it against the purge, the
+  purge is re-runnable, and complete refuses (BLD36) while scrubbed data reappeared.
+  Adopted from the consult: definer owner-state lookup (no fail-open under the caller's RLS),
+  `zz_` trigger name (fires last), skip_trace_queues off the fence (shared Tracerfy batches,
+  user_id = first tenant), claim withdraws unsent lookups (dispatcher's own cancel path).
+  Accepted residuals (owner): skip_trace_cache rows from an ingest still in flight at a
+  forced day-40 purge; per-row deadlock between a child UPDATE and the purge is resolved by
+  Postgres (P3b retries 40P01). P3b must: re-run the purge after the 24 h reclaim; treat
+  claimed/submitted pending rows as in-flight work in the precondition; dispatcher re-checks
+  deletion_state before submitting.
+  Prod-like simulation found the migration owner's EXECUTE on the lookup was dropped by
+  ALTER OWNER -> granted by the new owner during the hand-over. Fence cost (10k rows):
+  INSERT +19%, UPDATE ~77 us/row for an active owner.
+  Codex diff review round 1: FAIL. Adopted: audit_events fence (detail never stored for a
+  purging/deleted owner), explicit completed/errored queue allowlist. Refuted: trial upsert
+  privileges (112 grants INSERT), pending_registrations recreation (registration stages a row
+  only when no users row has the HMAC). Accepted P2: only results/list membership batched.
+  Round 2: FAIL. Adopted: audit_events.user_id immutable; queues that carried the user's rows
+  (via kept pending rows' tracerfy_queue_id) are scrubbed when finished and checked by
+  complete. Refuted: lock-taking lookup callable by app/system (they already hold UPDATE on
+  users with RLS USING true and can lock any row; every FK insert takes the same lock).

@@ -262,6 +262,11 @@ class UserResponse(BaseModel):
     # Fetch the image from GET /auth/avatar?v=<this>; a new upload gets a new
     # version, so a cached photo can never outlive its replacement.
     avatar_version: str | None = None
+    # Account deletion: NULL, or pending (restorable until deletion_purge_after),
+    # purging or deleted. While set, every route but GET /auth/me and
+    # POST /auth/account/restore answers 403.
+    deletion_state: str | None = None
+    deletion_purge_after: datetime | None = None
 
     model_config = {"from_attributes": True}
 

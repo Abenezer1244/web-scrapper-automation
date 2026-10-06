@@ -2314,8 +2314,12 @@ async def _user_from_download_token(token: str, job_id: str, db: AsyncSession) -
 
     # is_active (audit 2026-09-25, D-1): an emailed link lives 48h, and a
     # deactivated account must not keep downloading through one.
+    # deletion_state: belt to the logout-all cutoff a deletion request already raised,
+    # so no emailed link keeps working for an account scheduled for deletion.
     user = (
-        await db.execute(select(User).where(User.id == user_id, User.is_active))
+        await db.execute(select(User).where(
+            User.id == user_id, User.is_active, User.deletion_state.is_(None)
+        ))
     ).scalar_one_or_none()
     if user is None:
         raise HTTPException(status_code=401, detail="User not found")

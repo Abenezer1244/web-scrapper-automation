@@ -48,3 +48,17 @@ async def test_revoke_only_touches_the_callers_key(
     other = await _session(client, starter_user)
     assert (await client.delete("/auth/api-key", headers=other)).status_code == 404
     assert (await client.get("/auth/me", headers={"Authorization": f"Bearer {raw}"})).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_a_signed_out_device_cannot_revoke_the_key(
+    client: AsyncClient, db: AsyncSession, business_user: User
+) -> None:
+    old = await _session(client, business_user)
+    keeper = await _session(client, business_user)
+    raw = (await client.post("/auth/api-key", json={"current_password": "TestPass123!"},
+                             headers=keeper)).json()["api_key"]
+    assert (await client.post("/auth/sessions/revoke-others", headers=keeper)).status_code == 204
+    assert (await client.delete("/auth/api-key", headers=old)).status_code == 401
+    assert (await client.get("/auth/me", headers={"Authorization": f"Bearer {raw}"})).status_code == 200
+    assert (await client.delete("/auth/api-key", headers=keeper)).status_code == 204

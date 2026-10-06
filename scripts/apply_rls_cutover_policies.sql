@@ -138,6 +138,18 @@ CREATE POLICY users_app ON public.users
 DROP POLICY IF EXISTS users_system ON public.users;
 CREATE POLICY users_system ON public.users
     FOR ALL TO bridgeleads_system USING (true) WITH CHECK (true);
+-- Account-deletion definer functions run as bridgeleads_purge (112). Its column
+-- grants limit it to id / is_active / deletion_state; the policy only lets RLS see
+-- the rows. The deletion tables' own policies live in migration 112.
+DO $users_purge$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bridgeleads_purge') THEN
+        DROP POLICY IF EXISTS users_purge ON public.users;
+        CREATE POLICY users_purge ON public.users
+            FOR ALL TO bridgeleads_purge USING (true) WITH CHECK (true);
+    END IF;
+END
+$users_purge$;
 
 -- ── pending_registrations (074): email-verified signup STAGING (pre-account, no
 --    user_id) — broad app like users (register INSERT + verify SELECT/DELETE);

@@ -357,6 +357,40 @@ REVOKE UPDATE ON contact_lookup_action_events FROM bridgeleads_system;
 
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO bridgeleads_system;
 
+-- ── Role 4: bridgeleads_purge — owner of the account-deletion functions (112) ──
+-- NOLOGIN; nothing is a member of it. The ONLY way to act as it is to call one of
+-- its SECURITY DEFINER functions, and the guard triggers check current_user =
+-- 'bridgeleads_purge'. Migration 112 creates it (the functions need their owner
+-- the moment they exist); this mirrors and re-verifies it. Must stay AFTER the
+-- system ALL TABLES grant above: that grant hands the worker INSERT/UPDATE on the
+-- deletion tables, which only the purge role may write.
+DO $purge$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bridgeleads_purge'
+               AND (rolcanlogin OR rolsuper OR rolbypassrls OR rolcreatedb
+                    OR rolcreaterole OR rolinherit OR rolreplication)) THEN
+        RAISE EXCEPTION 'bridgeleads_purge exists with attributes it must not have';
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_roles r
+               WHERE r.rolname IN ('bridgeleads_app', 'bridgeleads_system')
+                 AND pg_has_role(r.oid, 'bridgeleads_purge', 'MEMBER')) THEN
+        RAISE EXCEPTION 'a runtime role is a member of bridgeleads_purge';
+    END IF;
+    IF to_regclass('public.account_deletions') IS NOT NULL THEN
+        REVOKE ALL ON account_deletions, consumed_trial_emails FROM bridgeleads_system;
+        REVOKE ALL ON account_deletions, consumed_trial_emails FROM bridgeleads_app;
+        GRANT SELECT ON account_deletions, consumed_trial_emails TO bridgeleads_app;
+        GRANT USAGE ON SCHEMA public TO bridgeleads_purge;
+        GRANT SELECT (id, is_active, deletion_state) ON users TO bridgeleads_purge;
+        GRANT UPDATE (deletion_state) ON users TO bridgeleads_purge;
+        GRANT SELECT, INSERT, UPDATE ON account_deletions TO bridgeleads_purge;
+        GRANT SELECT, INSERT ON consumed_trial_emails TO bridgeleads_purge;
+        GRANT EXECUTE ON FUNCTION request_account_deletion(),
+              restore_account_deletion() TO bridgeleads_app;
+    END IF;
+END
+$purge$;
+
 -- ── Role 3: owner / migration role ──────────────────────────────────────────
 -- The existing schema owner keeps DDL rights and is used ONLY by Alembic via
 -- DATABASE_URL_MIGRATE (Phase 3). No new role here — do NOT grant DDL to

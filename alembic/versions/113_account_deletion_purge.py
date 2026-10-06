@@ -610,8 +610,6 @@ def upgrade() -> None:
                      for r in ("anon", "authenticated", "service_role")]
     state_grants += [_guarded(r, f"GRANT EXECUTE ON FUNCTION {state_fn} TO {r};")
                      for r in ("bridgeleads_app", "bridgeleads_system")]
-    state_grants.append(
-        f"EXECUTE format('GRANT EXECUTE ON FUNCTION {state_fn} TO %I', current_user);")
     alters = "\n".join(
         f"ALTER FUNCTION public.{f} OWNER TO bridgeleads_purge;"
         for f in (*_WORKER_FUNCTIONS, _OWNER_STATE_FN)
@@ -621,6 +619,7 @@ def upgrade() -> None:
         f"""
         DO $purge_grants$
         DECLARE
+            v_me text := current_user;
             v_super boolean;
         BEGIN
             {nl.join(grants)}
@@ -643,6 +642,12 @@ def upgrade() -> None:
             END IF;
             GRANT CREATE ON SCHEMA public TO bridgeleads_purge;
             {alters}
+            -- The migration owner writes fenced tables too (data migrations), so it
+            -- needs the owner-state lookup. Granted by the new owner: a grant made
+            -- before ALTER OWNER is the old owner's own entry and is dropped with it.
+            SET LOCAL ROLE bridgeleads_purge;
+            EXECUTE format('GRANT EXECUTE ON FUNCTION {state_fn} TO %I', v_me);
+            RESET ROLE;
             REVOKE CREATE ON SCHEMA public FROM bridgeleads_purge;
             IF NOT v_super THEN
                 EXECUTE format('REVOKE bridgeleads_purge FROM %I', current_user);

@@ -19,6 +19,47 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-10-06 — Profile follow-ups 2-4 live; account deletion P1+P2 live, P3 started
+
+**Built / Shipped:** BE #470 (fam session needs a live user_sessions row), FE #241 (times in the
+user's zone), BE #471 + FE #243 (revoke the API key), all merged + prod-verified. Account deletion
+(follow-up 5): owner decisions recorded (30-day undoable grace, cancel at period end, 7 y billing,
+12/24 mo audit, keep delivered_records 24 mo, never redact Stripe); BE #472 migration 112 (NOLOGIN
+`bridgeleads_purge` role owning SECURITY DEFINER request/restore functions, users.deletion_state +
+guard triggers, account_deletions, consumed_trial_emails); #473 delete/restore routes behind
+`ACCOUNT_DELETION_ENABLED=false`; #474 gate (pending accounts see only /auth/me + restore). All live.
+P3a: owner-signed retention matrix `docs/product/account-deletion-retention-matrix.md`; migration 113
+(fence + claim/progress/purge/complete) committed WIP on branch `feat/account-deletion-p3a`, untested.
+
+**Tried / Decided:** three research passes (Claude, Perplexity, ChatGPT) reconciled into the decisions.
+Purge deletes via definer functions owned by a NOLOGIN role (no broad DELETE grants), fenced by
+`FOR KEY SHARE` row triggers vs the purge's `FOR UPDATE` (Codex confirmed after 7 plan rounds).
+Routes never call Stripe or send mail: only the purge role can record outcomes, so the beat does.
+Billing ledgers CASCADE from jobs/results/configs/batches, so those become scrubbed skeletons, not
+deleted rows (owner signed). Largest prod account has 106k results -> the purge is batched.
+
+**Failed / Blocked:** background CI waiters were killed for low memory twice; fell back to foreground
+polls. A tool call hung on a stray `cat > file` with no stdin. A bash heredoc with nested quotes
+failed; wrote the patch script to a file instead. BE peer session -76 disappeared mid-day.
+
+**Caught & fixed:** Codex across rounds: non-superuser downgrade could not drop purge-owned
+functions; purge-role membership not locked down; Supabase API roles had DELETE/TRUNCATE on users
+(CASCADE into account_deletions) -> revoked; step-up checked before the row lock; an API-key mint
+blocked on the deletion's lock could write a fresh key afterwards -> conditional UPDATE. Two tests
+passed for the wrong reason until fixed: a download link minted in the same second was refused by
+the older whole-second cutoff (now sleeps >1 s, belt mutation-checked); audit events were counted
+before the fire-and-forget write (now await security._audit_tasks).
+
+**Pending / Handoff:** `docs/HANDOFF-account-deletion-p3-2026-10-06.md`.
+
+**Facts learned:** prod migrates as `postgres` on PG17: NOT superuser (CREATEROLE + BYPASSRLS).
+Supabase default privileges grant ALL on new tables / EXECUTE on new functions to anon,
+authenticated, service_role (BYPASSRLS): revoke on every new object. ALTER OWNER to a NOLOGIN role
+needs temporary SET on it + CREATE on the schema; REVOKE afterwards removes only the current role's
+own grant. Postgres `interval '30 days'` follows the session time zone (DST shifts an hour). Stripe
+finalized invoices freeze customer_email/name/address; the Redaction API cannot redact invoices and
+redacted charges cannot be refunded and lose disputes.
+
 ## 2026-10-05 — Profile & account redesign (photo, devices, email change, mobile settings)
 
 **Built / Shipped (branches only, no PR/merge yet):** BE `feat/profile-account-redesign`: migration 111

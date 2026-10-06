@@ -253,6 +253,10 @@ class User(Base):
     # IANA zone id the user picked in Settings > Account (migration 111). Display
     # only: schedules stay UTC and nothing reads this to schedule. NULL = never set.
     timezone = Column(String(64), nullable=True)
+    # Account deletion lifecycle (migration 112): NULL | pending | purging | deleted.
+    # Read-only to the app: a trigger rejects any write that does not come from the
+    # request/restore/purge functions (owned by the bridgeleads_purge role).
+    deletion_state = Column(String(16), nullable=True)
     is_active = Column(Boolean, nullable=False, default=True)
     is_admin = Column(Boolean, nullable=False, default=False)
     # Logout-everywhere / password-reset / account-compromise revocation

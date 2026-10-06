@@ -140,12 +140,37 @@ Homeowner suppression is the NEXT project, not this one.
 
 ## Phases (each: plan -> Codex -> build -> tests -> Codex diff review to GATE PASS -> PR -> CI -> merge -> verify; owner approval between phases)
 
-- [ ] **P1 migration 112 (schema only, no ORM)** `bridgeleads_purge` role (guarded, mirrored
+- [x] **P1 migration 112 (schema only, no ORM)** `bridgeleads_purge` role (guarded, mirrored
       in provision_rls_roles.sql); `users.deletion_state` + CHECK + state-machine trigger;
       `request_account_deletion` / `restore_account_deletion` definer functions;
       `account_deletions` (+ partial unique, RLS user isolation + system policy, grants per the
       111 pattern); `consumed_trial_emails`. Test: `alembic upgrade head` + constraint tests.
-- [ ] **P2 request + restore + gate** ORM mapping; `POST /auth/account/delete` (session +
+- [ ] **P2a request + restore (design rev 2 after Codex consult)**
+      Both routes behind `settings.ACCOUNT_DELETION_ENABLED` (default False -> 404): nobody can
+      open a deletion that nothing will finish until the P3 beat is live and verified.
+      `POST /auth/account/delete` {current_password, mfa_code?, confirm_email}: require_session +
+      get_rls_db; `_reauthenticate`; MFA (`_consume_second_factor` + MfaFailureGuard); then ONE
+      transaction: `request_account_deletion()` FIRST (it locks the users row; BLD01 -> 409),
+      then compare confirm_email (normalize_email + blind_index) with the locked row (mismatch
+      -> rollback, 400). `created=false` is a pure no-op (no pause/revoke/audit). On create:
+      pause configs (active OR paused_reason='entitlement' -> active=false,
+      paused_reason='account_deletion'; user-paused ones stay as they are), sign out everywhere
+      in-txn (revoked_at, api_key_hash=None, live user_sessions rows revoked,
+      update_revoke_cache; RedisError -> rollback + 503), commit, audit
+      `account_deletion_requested`. 200 {purge_after}.
+      `POST /auth/account/restore` {current_password, mfa_code?}: same step-up as delete;
+      `restore_account_deletion()` (BLD02 -> 404, BLD01 -> 409); configs stay paused; audit
+      `account_deletion_restored` only on a real transition.
+      No email and no Stripe call from the routes: the P3 beat sends the "scheduled" email
+      (`scheduled_email_sent_at` marker, only while status is pending) and drives
+      cancel/uncancel from `stripe_state`. Restore notice email dropped (anyone who can
+      restore can already sign in). Audit stays post-commit like every other security event.
+      Files: models.py, schemas.py, auth_helpers/account_deletion.py (new), routes/auth.py,
+      config/settings.py + .env.example (+ tests, openapi).
+- [ ] **P2b gate** 403 `account_pending_deletion` in get_auth_context (allowlist GET /auth/me,
+      POST /auth/account/restore; logout/refresh never pass through it), `/auth/me` gains
+      deletion_state + purge date, dispatcher `quota_block_reason` refuses pending users.
+- [ ] ~~**P2 request + restore + gate**~~ (split into P2a/P2b above) ORM mapping; `POST /auth/account/delete` (session +
       password + TOTP if enabled + typed email; idempotent); `POST /auth/account/restore`;
       day-0 effects in one txn (pause configs `paused_reason='account_deletion'`, revoke
       sessions + API key per the email_change pattern, 503 on Redis failure); inline Stripe
@@ -162,6 +187,11 @@ Homeowner suppression is the NEXT project, not this one.
       rejected, expired-lease reclaim, scrub through the trusted path, no app/worker role can
       `DELETE FROM users` (CASCADE would be a second purge path). Plus an inventory of every
       R2 writer and Celery hard time limit (the 24 h second sweep must exceed all of them).
+- [ ] **P3 contract (from P2a consult):** Stripe calls outside DB txns with idempotency keys,
+      ambiguous timeouts re-driven; the purge does NOT start until `stripe_state` is
+      `cancel_set` or `not_applicable` (a deleted account must never keep being charged),
+      ops alert if still unconfirmed at day 40; the scheduled email is sent by the beat
+      only while status is pending; then flip ACCOUNT_DELETION_ENABLED.
 - [ ] **P3b purge beat task** claim -> in-flight precondition -> R2 sweep 1 (paginated list
       helper) -> `purge_account_data` (deletes + retained-PII scrub) -> final email ->
       tombstone + trial HMAC -> >= 24 h -> R2 sweep 2 (fail closed) -> Stripe cleanup when
@@ -221,3 +251,14 @@ Homeowner suppression is the NEXT project, not this one.
   Verified: local PG16 superuser round trip; prod-like PG16 simulation (non-superuser owner
   with CREATEROLE+BYPASSRLS, ADMIN-only purge membership, Supabase default privileges)
   upgrade -> downgrade -> upgrade with zero leaked privileges (check proven to detect a leak).
+- P2a design consult (Codex): DESIGN: REVISE. Adopted: created=false pure no-op; readiness flag;
+  restore step-up; email checked under the row lock; scheduled email via the P3 beat outbox;
+  purge waits for Stripe cancel confirmation. Not adopted: audit inside the txn (every
+  security event in the codebase is audited post-commit). Dropped: restore notice email.
+- P2a build Codex diff review, 3 rounds -> GATE PASS. Adopted: lock + re-read the users row
+  (FOR NO KEY UPDATE) before the password/second-factor check; API-key mint made a conditional
+  UPDATE ... WHERE deletion_state IS NULL (a mint blocked on the deletion's lock could
+  otherwise write a fresh key after it); tests for refresh death, repeat no-op, restore with
+  flag off, restore MFA, no mint into a pending account. Refuted: missing rate limit
+  (_reauthenticate is per-account limited), missing normalization (blind_index normalizes).
+  Accepted (existing patterns): Redis cutoff before commit fails safe; MFA guard clear.

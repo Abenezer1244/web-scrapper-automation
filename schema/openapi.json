@@ -1,6 +1,86 @@
 {
   "components": {
     "schemas": {
+      "AccountDeleteRequest": {
+        "additionalProperties": false,
+        "description": "Schedule the account for deletion. `confirm_email` is the typed confirmation:\nit must be the account's own address.",
+        "properties": {
+          "confirm_email": {
+            "maxLength": 254,
+            "minLength": 1,
+            "title": "Confirm Email",
+            "type": "string"
+          },
+          "current_password": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Current Password",
+            "type": "string"
+          },
+          "mfa_code": {
+            "anyOf": [
+              {
+                "maxLength": 32,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mfa Code"
+          }
+        },
+        "required": [
+          "current_password",
+          "confirm_email"
+        ],
+        "title": "AccountDeleteRequest",
+        "type": "object"
+      },
+      "AccountDeletionResponse": {
+        "description": "When the account will be purged unless it is restored first.",
+        "properties": {
+          "purge_after": {
+            "format": "date-time",
+            "title": "Purge After",
+            "type": "string"
+          }
+        },
+        "required": [
+          "purge_after"
+        ],
+        "title": "AccountDeletionResponse",
+        "type": "object"
+      },
+      "AccountRestoreRequest": {
+        "additionalProperties": false,
+        "description": "Cancel a pending account deletion: the same step-up as requesting it.",
+        "properties": {
+          "current_password": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Current Password",
+            "type": "string"
+          },
+          "mfa_code": {
+            "anyOf": [
+              {
+                "maxLength": 32,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mfa Code"
+          }
+        },
+        "required": [
+          "current_password"
+        ],
+        "title": "AccountRestoreRequest",
+        "type": "object"
+      },
       "AlreadyDeliveredContacts": {
         "description": "Where the skip trace stands for this run's already-delivered leads.\n\nDelivered and traced are separate facts: a lead an earlier run delivered can still\nbe looked up when this run has skip trace on. The buckets partition\n``already_delivered_count`` exactly (same statement, same predicate), so they\nalways add up to the tab's number. Read from ``results`` alone: the queue tables\nare worker-only, so whether an answer was bought now or reused is not reported.",
         "properties": {
@@ -6168,6 +6248,93 @@
         "summary": "Analytics Summary",
         "tags": [
           "analytics"
+        ]
+      }
+    },
+    "/auth/account/delete": {
+      "post": {
+        "description": "Schedule this account for deletion in 30 days. Pauses every schedule and signs\nout every device and the API key now; signing in again and restoring undoes it.",
+        "operationId": "delete_account_auth_account_delete_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AccountDeleteRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccountDeletionResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Delete Account",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/auth/account/restore": {
+      "post": {
+        "description": "Cancel a pending deletion. Never gated by ACCOUNT_DELETION_ENABLED: switching\ndeletion off must not strand an account that is already pending.",
+        "operationId": "restore_account_auth_account_restore_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AccountRestoreRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Restore Account",
+        "tags": [
+          "auth"
         ]
       }
     },

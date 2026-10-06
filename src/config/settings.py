@@ -457,6 +457,12 @@ class Settings(BaseSettings):
     # WOULD purge, writes nothing) -> read the counts -> DRY_RUN=false.
     # Leaving this off leaves a KNOWN compliance gap; it is tracked as an owner
     # step in tasks/PHASE2-OWNER-RUNBOOK.md, not forgotten here.
+    # Account deletion (docs/product/account-deletion-and-export.md). Gates ONLY
+    # POST /auth/account/delete: keep it off until the P3 purge beat (which cancels the
+    # Stripe subscription, sends the scheduled email and purges) is live, so nobody can
+    # open a deletion nothing would finish. Restore is never gated, so turning this off
+    # can never strand an account that is already pending.
+    ACCOUNT_DELETION_ENABLED: bool = False
     RETENTION_PURGE_ENABLED: bool = False
     RETENTION_PURGE_DRY_RUN: bool = True
     SKIP_TRACE_PII_RETENTION_DAYS: int = 365

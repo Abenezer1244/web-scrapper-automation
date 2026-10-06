@@ -336,6 +336,25 @@ class SessionResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class AccountRestoreRequest(BaseModel):
+    """Cancel a pending account deletion: the same step-up as requesting it."""
+    current_password: str = Field(min_length=1, max_length=128)
+    mfa_code: str | None = Field(default=None, max_length=32)
+
+    model_config = {"extra": "forbid"}
+
+
+class AccountDeleteRequest(AccountRestoreRequest):
+    """Schedule the account for deletion. `confirm_email` is the typed confirmation:
+    it must be the account's own address."""
+    confirm_email: str = Field(min_length=1, max_length=254)
+
+
+class AccountDeletionResponse(BaseModel):
+    """When the account will be purged unless it is restored first."""
+    purge_after: datetime
+
+
 class EmailChangeRequest(BaseModel):
     """Start an email change: the new address, re-proved by the current password
     and, when two-factor is on, a TOTP or backup code."""

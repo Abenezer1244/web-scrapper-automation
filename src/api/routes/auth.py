@@ -38,6 +38,7 @@ from src.api.auth import (
 )
 from src.api.deps import get_rls_db
 from src.api.middleware import audit_log, rate_limit
+from src.api.routes.auth_helpers import account_deletion as _account_deletion
 from src.api.routes.auth_helpers import email_change as _email_change
 from src.api.routes.auth_helpers import login as _login_helpers
 from src.api.routes.auth_helpers import mfa as _mfa_helpers
@@ -67,6 +68,9 @@ from src.api.routes.auth_helpers.tokens import (  # noqa: F401
     _mint_reset_token,
 )
 from src.api.schemas import (
+    AccountDeleteRequest,
+    AccountDeletionResponse,
+    AccountRestoreRequest,
     ApiKeyResponse,
     BreakGlassLoginRequest,
     EmailChangeConfirm,
@@ -482,6 +486,39 @@ async def confirm_email_change(
     return {"message": "Your email address was changed. Sign in with the new address."}
 
 
+@router.post("/account/delete", response_model=AccountDeletionResponse)
+async def delete_account(
+    body: AccountDeleteRequest,
+    request: Request,
+    current_user: Annotated[User, Depends(require_session)],
+    db: AsyncSession = Depends(get_rls_db),
+) -> AccountDeletionResponse:
+    """Schedule this account for deletion in 30 days. Pauses every schedule and signs
+    out every device and the API key now; signing in again and restoring undoes it."""
+    if not settings.ACCOUNT_DELETION_ENABLED:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Not Found")
+    user = await _account_deletion.lock_user(db, current_user.id)
+    await _reauthenticate(request, user, body.current_password)
+    purge_after = await _account_deletion.request_deletion(
+        request, db, user, body.mfa_code, body.confirm_email
+    )
+    return AccountDeletionResponse(purge_after=purge_after)
+
+
+@router.post("/account/restore", status_code=status.HTTP_204_NO_CONTENT)
+async def restore_account(
+    body: AccountRestoreRequest,
+    request: Request,
+    current_user: Annotated[User, Depends(require_session)],
+    db: AsyncSession = Depends(get_rls_db),
+) -> None:
+    """Cancel a pending deletion. Never gated by ACCOUNT_DELETION_ENABLED: switching
+    deletion off must not strand an account that is already pending."""
+    user = await _account_deletion.lock_user(db, current_user.id)
+    await _reauthenticate(request, user, body.current_password)
+    await _account_deletion.restore_deletion(request, db, user, body.mfa_code)
+
+
 # Security activity a user should be able to recognise (or not) as their own.
 # An allowlist, not "everything with my user_id": the audit log also holds
 # operational events (job_created, ...) that are not security activity.
@@ -490,6 +527,7 @@ SECURITY_EVENTS = (
     "mfa_disabled", "mfa_breakglass_used", "api_key_created", "api_key_revoked",
     "email_change_requested",
     "email_changed", "session_revoked", "sessions_revoked_others", "logout_all",
+    "account_deletion_requested", "account_deletion_restored",
 )
 
 
@@ -773,10 +811,20 @@ async def create_api_key(
     await _reauthenticate(request, current_user, body.current_password)
     raw_key, key_hash = generate_api_key()
 
-    result = await db.execute(select(User).where(User.id == current_user.id))
-    user = result.scalar_one()
-    user.api_key_hash = key_hash
-    await db.flush()
+    # Conditional, not read-then-assign: an account deletion signs out everything and
+    # clears the key under the users row lock. A mint that started before it blocks on
+    # that lock and, under READ COMMITTED, re-checks this WHERE against the committed
+    # row, so it cannot write a fresh key into an account that is now pending deletion
+    # (API-key auth never consults revoked_at).
+    minted = await db.execute(
+        update(User)
+        .where(User.id == current_user.id, User.deletion_state.is_(None))
+        .values(api_key_hash=key_hash)
+    )
+    if minted.rowcount == 0:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "This account is scheduled for deletion."
+        )
 
     audit_log(request, "api_key_created", current_user.id)
     return ApiKeyResponse(api_key=raw_key)

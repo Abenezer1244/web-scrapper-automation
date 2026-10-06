@@ -6,7 +6,6 @@ Real DB, real Redis, real login/refresh endpoints. No mocks.
 
 from __future__ import annotations
 
-import asyncio
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -155,9 +154,6 @@ async def test_logout_and_logout_all_drop_sessions_from_the_list(
     assert len((await client.get("/auth/sessions", headers=_auth(a))).json()) == 2
 
     assert (await client.post("/auth/logout-all", headers=_auth(a))).status_code == 204
-    # JWT iat is whole seconds and revoked_at is not, so a token minted in the same
-    # second as a logout-all reads as issued before it (pre-existing; follow-up).
-    await asyncio.sleep(1.1)
     fresh = await _login(client, starter_user)
     listed = (await client.get("/auth/sessions", headers=_auth(fresh))).json()
     assert len(listed) == 1 and listed[0]["current"] is True, "logout-all'd sessions still listed"

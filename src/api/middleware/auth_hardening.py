@@ -2,7 +2,7 @@
 
 import logging
 import time
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 
 import redis.asyncio as aioredis
 import redis.exceptions as redis_exceptions
@@ -13,6 +13,70 @@ from src.utils.crypto import blind_index
 from src.utils.logger import email_fingerprint
 
 _logger = logging.getLogger("security.auth_hardening")
+
+
+# ─── Sub-second revocation (cutoff and token issue time in epoch milliseconds) ─
+# JWT `iat` is whole seconds, so comparing it with the revoke cutoff rejected a
+# login made in the same second as a logout-all. Session tokens also carry
+# `iat_ms`; the cutoff is kept at millisecond precision. The Redis cache value
+# is "ms:<epoch ms>": an older container cannot parse it and falls back to the
+# DB (correct, just slower), and this code ignores the legacy whole-second
+# format for the same reason, so a truncated cutoff is never trusted.
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+
+
+def _epoch_ms(dt: datetime) -> int:
+    return (dt - _EPOCH) // timedelta(milliseconds=1)
+
+
+def _revoke_cache_value(dt: datetime) -> str:
+    return f"ms:{_epoch_ms(dt)}"
+
+
+def _parse_revoke_cache_value(val) -> int:
+    text = val.decode() if isinstance(val, bytes) else str(val)
+    if not text.startswith("ms:"):
+        return 0  # legacy whole-second value: not trusted, read the DB
+    return int(text[3:])
+
+
+def token_issued_ms(payload: dict) -> int:
+    """When a token was issued, in epoch ms. Legacy tokens (no iat_ms) count as
+    the START of their `iat` second, so a legacy token in the revoke second stays
+    revoked, as before. A present-but-malformed iat_ms raises ValueError."""
+    iat = payload.get("iat")
+    if isinstance(iat, bool) or not isinstance(iat, int):
+        raise ValueError("token has no integer iat")
+    if "iat_ms" not in payload:
+        return iat * 1000
+    iat_ms = payload["iat_ms"]
+    if isinstance(iat_ms, bool) or not isinstance(iat_ms, int) or iat_ms // 1000 != iat:
+        raise ValueError("token iat_ms is malformed")
+    return iat_ms
+
+
+# Only ever RAISE the cached cutoff. Two revokes (or a DB backfill finishing after
+# a newer revoke) writing out of order must not leave an older cutoff in Redis,
+# which reads would then trust over the durable DB value (Codex). Atomic in Redis.
+_RAISE_REVOKE_LUA = """
+local cur = redis.call('GET', KEYS[1])
+local new = tonumber(ARGV[1])
+if cur then
+  local have
+  if string.sub(cur, 1, 3) == 'ms:' then have = tonumber(string.sub(cur, 4))
+  else have = (tonumber(cur) or 0) * 1000 + 999 end  -- legacy seconds: its upper bound
+  if have and have >= new then
+    if string.sub(cur, 1, 3) ~= 'ms:' then redis.call('SETEX', KEYS[1], ARGV[2], 'ms:' .. have) end
+    return 0
+  end
+end
+redis.call('SETEX', KEYS[1], ARGV[2], 'ms:' .. ARGV[1])
+return 1
+"""
+
+
+async def _raise_revoke_cache(r, key: str, cutoff_ms: int, ttl: int) -> None:
+    await r.eval(_RAISE_REVOKE_LUA, 1, key, cutoff_ms, ttl)
 
 _redis_client: aioredis.Redis | None = None
 
@@ -231,7 +295,7 @@ class TokenBlacklist:
         """
         from datetime import UTC, datetime
 
-        from sqlalchemy import update
+        from sqlalchemy import func, select, update
 
         from src.db.models import User
         from src.db.session import async_engine
@@ -259,18 +323,37 @@ class TokenBlacklist:
         # known limit of the current mechanism.
         async with async_engine.begin() as conn:
             now = datetime.now(UTC)
-            await conn.execute(
-                update(User).where(User.id == user_id).values(revoked_at=now)
+            # Publish the cutoff BEFORE the commit, so no request that starts
+            # after this point can read an older cached cutoff (Codex). If the
+            # commit then fails the cache over-revokes, which fails closed and the
+            # caller gets a 5xx to retry. Raise-only, so it never lowers a cutoff.
+            # A RedisError propagates and rolls the txn back: the caller answers
+            # 503 rather than commit a revoke the cache may not reflect (Codex).
+            existing = (await conn.execute(
+                select(User.revoked_at).where(User.id == user_id)
+            )).scalar_one_or_none()
+            await _raise_revoke_cache(
+                _get_redis(), f"{TokenBlacklist._USER_REVOKE_PREFIX}{user_id}",
+                _epoch_ms(max(now, existing) if existing else now),
+                TokenBlacklist._REVOKE_CACHE_TTL_SECONDS,
             )
+            stored = (await conn.execute(
+                # GREATEST: a revoke stamped by a container whose clock runs behind must
+                # never move the cutoff backward and re-authorize tokens (Codex). The
+                # cache and the caller get the STORED cutoff, which may be later.
+                update(User).where(User.id == user_id).values(
+                    revoked_at=func.greatest(func.coalesce(User.revoked_at, now), now)
+                ).returning(User.revoked_at)
+            )).scalar_one_or_none()
+            if stored is not None:
+                now = stored
 
         # 2) Best-effort Redis write. If it fails, invalidate the key
         # so a stale "0" sentinel cannot mask the now-durable revocation.
         key = f"{TokenBlacklist._USER_REVOKE_PREFIX}{user_id}"
         try:
             r = _get_redis()
-            await r.setex(
-                key, TokenBlacklist._REVOKE_CACHE_TTL_SECONDS, str(int(now.timestamp())),
-            )
+            await _raise_revoke_cache(r, key, _epoch_ms(now), TokenBlacklist._REVOKE_CACHE_TTL_SECONDS)
         except redis_exceptions.RedisError as exc:
             _logger.warning(
                 "revoke_all_for_user: Redis SETEX failed; attempting DEL to invalidate stale cache: %s",
@@ -327,9 +410,7 @@ class TokenBlacklist:
         key = f"{TokenBlacklist._USER_REVOKE_PREFIX}{user_id}"
         try:
             r = _get_redis()
-            await r.setex(
-                key, TokenBlacklist._REVOKE_CACHE_TTL_SECONDS, str(int(now.timestamp())),
-            )
+            await _raise_revoke_cache(r, key, _epoch_ms(now), TokenBlacklist._REVOKE_CACHE_TTL_SECONDS)
         except redis_exceptions.RedisError as exc:
             _logger.error(
                 "update_revoke_cache: SETEX failed; failing closed (best-effort "
@@ -343,6 +424,11 @@ class TokenBlacklist:
 
     @staticmethod
     async def get_user_revoke_time(user_id: str) -> int:
+        """Whole-second view of get_user_revoke_ms (0 if never revoked)."""
+        return await TokenBlacklist.get_user_revoke_ms(user_id) // 1000
+
+    @staticmethod
+    async def get_user_revoke_ms(user_id: str) -> int:
         """Return the epoch timestamp at which all tokens for this user were revoked (0 if never).
 
         Reads Redis first (microsecond hot path) and uses the cached
@@ -380,7 +466,7 @@ class TokenBlacklist:
                 # that window: the next read goes to the DB and
                 # observes the durable users.revoked_at row.
                 try:
-                    cached_ts = int(val)
+                    cached_ts = _parse_revoke_cache_value(val)
                 except (TypeError, ValueError):
                     cached_ts = 0
                 if cached_ts > 0:
@@ -405,7 +491,7 @@ class TokenBlacklist:
 
         if row is None or row[0] is None:
             return 0
-        ts = int(row[0].timestamp())
+        ts = _epoch_ms(row[0])
 
         # Backfill the POSITIVE case only. Never-revoked users keep
         # paying the DB hop on cache miss — that's the trade-off for
@@ -414,13 +500,15 @@ class TokenBlacklist:
         # again, which is the worst-case path anyway.
         try:
             r = _get_redis()
-            await r.setex(key, TokenBlacklist._REVOKE_CACHE_TTL_SECONDS, str(ts))
+            await _raise_revoke_cache(r, key, ts, TokenBlacklist._REVOKE_CACHE_TTL_SECONDS)
         except redis_exceptions.RedisError:
             pass
         return ts
 
     @staticmethod
-    async def is_revoked_by_user_logout_all(user_id: str, issued_at: int) -> bool:
+    async def is_revoked_by_user_logout_all(
+        user_id: str, issued_at: int, payload: dict | None = None
+    ) -> bool:
         """True if `user_id` has done logout-all and the token was issued at or before that moment.
 
         Use ``issued_at <= revoke_time`` (NOT strict ``<``) — token
@@ -436,8 +524,13 @@ class TokenBlacklist:
         Caller is responsible for catching ``RedisError`` (we let it
         propagate so failure surfaces as 503, not as "not revoked").
         """
-        revoke_time = await TokenBlacklist.get_user_revoke_time(user_id)
-        return revoke_time > 0 and issued_at <= revoke_time
+        revoke_ms = await TokenBlacklist.get_user_revoke_ms(user_id)
+        try:
+            issued_ms = (token_issued_ms(payload) if payload is not None
+                         else int(issued_at) * 1000)
+        except ValueError:
+            return True  # a malformed issue time is never trusted
+        return revoke_ms > 0 and issued_ms <= revoke_ms
 
 
 # ─── Brute-force protection ───────────────────────────────────────────────────

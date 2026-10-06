@@ -4,29 +4,29 @@ Implements docs/product/account-deletion-retention-matrix.md (owner-signed 2026-
 design + Codex review log in tasks/todo-account-deletion.md. Nothing calls these until
 the P3b beat task ships, and ACCOUNT_DELETION_ENABLED stays off until the owner flips it.
 
-  account_deletion_fence()   BEFORE INSERT OR UPDATE row trigger (ENABLE ALWAYS) on every
-                             table the purge deletes from or scrubs. Locks the owning users
-                             row FOR KEY SHARE and refuses the write (BLD20) once the
-                             account is purging/deleted; user_id may never change (BLD21).
-                             KEY SHARE does not serialize a user's writers, but conflicts
-                             with the FOR UPDATE the purge takes first: the purge waits for
-                             every writer already past the fence, and every later writer
-                             blocks, re-reads the row, sees `purging` and fails. Writes made
-                             by the purge functions themselves (current_user =
-                             bridgeleads_purge) pass. Billing ledgers are not fenced: late
-                             billing evidence from in-flight work is kept, never purged.
+  zz_account_deletion_fence  BEFORE INSERT OR UPDATE row trigger (ENABLE ALWAYS) on every
+                             table the purge deletes from or scrubs (not skip_trace_queues:
+                             one queue row is shared by several tenants). Once the owner is
+                             purging/deleted an INSERT is refused (BLD20) and an UPDATE
+                             keeps the matrix's SCRUB columns at their old values, so beat
+                             sweeps that update many tenants in one statement never abort;
+                             user_id may never change (BLD21). See the SQL for the locking.
+                             Billing ledgers are not fenced: late billing evidence from
+                             in-flight work is kept, never purged.
   claim_account_deletion()   picks one due deletion through its USERS row (lock order users
-                             -> account_deletions everywhere) and moves it pending -> purging,
-                             or reclaims an expired lease with a new token.
+                             -> account_deletions everywhere) and moves it pending -> purging
+                             (is_active false, unsent skip-trace lookups withdrawn), or
+                             reclaims an expired lease with a new token.
   record_deletion_progress() the only writer of phase markers, Stripe state (compare-and-set)
                              and errors (backoff).
   purge_account_data()       the matrix, in bounded batches: returns true when nothing is
-                             left; db_purged_at is set in the same transaction as the last
-                             batch, so a committed purge is never redone.
-  complete_account_deletion() purging -> deleted once every phase marker is set.
+                             left. Idempotent and re-run after the 24 h reclaim.
+  complete_account_deletion() purging -> deleted once every phase marker is set and no
+                             scrubbed column was filled again.
 
-All four are SECURITY DEFINER, owned by bridgeleads_purge (NOLOGIN, migration 112), with a
-fixed search_path, and executable only by bridgeleads_system (the beat worker).
+The four are SECURITY DEFINER, owned by bridgeleads_purge (NOLOGIN, migration 112), with a
+fixed search_path, and executable only by bridgeleads_system (the beat worker). The fence's
+owner-state lookup is a fifth definer function, executable by every writer.
 
 Revision ID: 113
 Revises: 112
@@ -40,15 +40,28 @@ down_revision = "112"
 branch_labels = None
 depends_on = None
 
-# Tables carrying user_id that the purge deletes from or scrubs (job_logs is fenced
-# separately: it has no user_id of its own).
-_FENCED = (
-    "results", "jobs", "scraper_configs", "scraper_batches", "batch_runs",
-    "notifications", "user_record_views", "property_list_membership",
-    "dialer_deliveries", "delivered_records", "pending_skip_trace_rows",
-    "skip_trace_queues", "user_sessions", "user_avatars", "pending_email_changes",
-    "password_history", "mfa_backup_codes", "mfa_break_glass_codes",
-)
+# Tables carrying user_id that the purge deletes from or scrubs, with the columns an
+# UPDATE may never write once the owner is purging/deleted (the matrix's SCRUB columns).
+# job_logs is fenced separately: it has no user_id of its own. skip_trace_queues is NOT
+# fenced: one queue row is a Tracerfy batch shared by several tenants and its user_id
+# is only the first of them, so fencing it would fail every co-tenant's ingest.
+_FENCED = {
+    "results": ("party_name", "heirs", "legal_description", "mailing_address",
+                "enrichment_data", "phone", "phone_type", "phone_dnc_flag", "email",
+                "phones", "emails", "owner_state", "absentee_owner", "out_of_state_owner",
+                "last_trace_outcome", "skip_trace_subject_hash"),
+    "pending_skip_trace_rows": ("first_name", "last_name", "mail_address", "mail_city",
+                                "mail_state", "mail_zip"),
+    "jobs": ("export_key", "error_message"),
+    "scraper_configs": ("name", "fields", "enrichment", "schedule", "deliver", "doc_types",
+                        "include_living_owner_tod", "active"),
+    "scraper_batches": ("name", "fields", "enrichment", "schedule", "deliver",
+                        "delivery_mode", "status"),
+    "batch_runs": (), "notifications": (), "user_record_views": (),
+    "property_list_membership": (), "dialer_deliveries": (), "delivered_records": (),
+    "user_sessions": (), "user_avatars": (), "pending_email_changes": (),
+    "password_history": (), "mfa_backup_codes": (), "mfa_break_glass_codes": (),
+}
 # purge role privileges: (table, privileges). Table-level SELECT keeps the batched
 # id-subqueries simple; UPDATE is column-level wherever the purge only scrubs.
 _PURGE_GRANTS = (
@@ -69,9 +82,9 @@ _PURGE_GRANTS = (
     ("results", "SELECT, UPDATE (party_name, heirs, legal_description, mailing_address, "
                 "enrichment_data, phone, phone_type, phone_dnc_flag, email, phones, emails, "
                 "owner_state, absentee_owner, out_of_state_owner, last_trace_outcome, "
-                "skip_trace_subject_hash)"),
+                "skip_trace_subject_hash, skip_trace_status)"),
     ("pending_skip_trace_rows", "SELECT, UPDATE (first_name, last_name, mail_address, "
-                                "mail_city, mail_state, mail_zip)"),
+                                "mail_city, mail_state, mail_zip, status)"),
     ("skip_trace_queues", "SELECT, UPDATE (download_url, error_message)"),
     ("jobs", "SELECT, UPDATE (export_key, error_message)"),
     ("scraper_configs", "SELECT, UPDATE (name, fields, enrichment, schedule, deliver, "
@@ -88,6 +101,11 @@ _WORKER_FUNCTIONS = (
     "complete_account_deletion(uuid, uuid)",
 )
 _API_ROLES = ("anon", "authenticated", "service_role", "bridgeleads_app")
+# The fence's state lookup runs as the purge role and is called by every writer of a
+# fenced table: the runtime roles and the migration owner.
+_OWNER_STATE_FN = "account_deletion_owner_state(uuid, uuid, boolean)"
+# zz_: BEFORE row triggers fire in name order, so the fence sees the final NEW.
+_TRIGGER = "zz_account_deletion_fence"
 
 
 def _guarded(role: str, stmt: str) -> str:
@@ -96,22 +114,67 @@ def _guarded(role: str, stmt: str) -> str:
 
 
 _FENCE_SQL = """
+-- The owner's lifecycle state, read as the purge role: the caller's own RLS or column
+-- privileges on users can never hide the row and make the fence fail open. NULL means
+-- the owner row does not exist (the foreign key rejects that write anyway).
+-- p_lock takes the same FOR KEY SHARE the foreign-key check takes on INSERT.
+CREATE FUNCTION public.account_deletion_owner_state(p_user uuid, p_job uuid, p_lock boolean)
+RETURNS text
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $fn$
+DECLARE
+    v_uid uuid := p_user;
+    v_state text;
+BEGIN
+    IF v_uid IS NULL THEN
+        SELECT j.user_id INTO v_uid FROM public.jobs j WHERE j.id = p_job;
+    END IF;
+    IF p_lock THEN
+        SELECT u.deletion_state INTO v_state FROM public.users u WHERE u.id = v_uid
+           FOR KEY SHARE;
+    ELSE
+        SELECT u.deletion_state INTO v_state FROM public.users u WHERE u.id = v_uid;
+    END IF;
+    IF NOT FOUND THEN
+        RETURN NULL;
+    END IF;
+    RETURN COALESCE(v_state, 'active');
+END
+$fn$;
+
+-- INSERT for a purging/deleted owner: refused (BLD20). The KEY SHARE conflicts with the
+-- purge's FOR UPDATE on the users row, so the purge waits for every inserter already
+-- past this point, and every later inserter blocks, re-reads the row and fails.
+-- UPDATE: never refused, because beat sweeps update many tenants' rows in one statement
+-- and one refusal would abort them all. Instead the columns named in TG_ARGV (the
+-- matrix's SCRUB columns) keep their OLD values, so nothing scrubbed can be written
+-- back. No users lock on UPDATE: it would deadlock against code that holds users
+-- FOR UPDATE and then updates a child row. The row lock this UPDATE holds orders it
+-- against the purge instead, and complete_account_deletion refuses while any scrubbed
+-- column is filled again (a re-run of the purge clears it).
+-- Writes by the purge functions themselves (current_user = bridgeleads_purge) pass.
 CREATE FUNCTION public.account_deletion_fence() RETURNS trigger
 LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog, pg_temp AS $fn$
 DECLARE
-    v_state text;
+    v_pin jsonb;
 BEGIN
     IF current_user = 'bridgeleads_purge' THEN
         RETURN NEW;
     END IF;
-    IF TG_OP = 'UPDATE' AND OLD.user_id IS DISTINCT FROM NEW.user_id THEN
+    IF TG_OP = 'INSERT' THEN
+        IF public.account_deletion_owner_state(NEW.user_id, NULL, true)
+           IN ('purging', 'deleted') THEN
+            RAISE EXCEPTION 'account is being deleted' USING ERRCODE = 'BLD20';
+        END IF;
+        RETURN NEW;
+    END IF;
+    IF OLD.user_id IS DISTINCT FROM NEW.user_id THEN
         RAISE EXCEPTION 'user_id is immutable' USING ERRCODE = 'BLD21';
     END IF;
-    SELECT u.deletion_state INTO v_state
-      FROM public.users u WHERE u.id = NEW.user_id FOR KEY SHARE;
-    -- Not found: the foreign key rejects the row anyway; do not mask its error.
-    IF FOUND AND v_state IS NOT NULL AND v_state <> 'pending' THEN
-        RAISE EXCEPTION 'account is being deleted' USING ERRCODE = 'BLD20';
+    IF TG_NARGS > 0
+       AND public.account_deletion_owner_state(NEW.user_id, NULL, false)
+           IN ('purging', 'deleted') THEN
+        SELECT jsonb_object_agg(k, to_jsonb(OLD) -> k) INTO v_pin FROM unnest(TG_ARGV) k;
+        NEW := jsonb_populate_record(NEW, v_pin);
     END IF;
     RETURN NEW;
 END
@@ -119,20 +182,18 @@ $fn$;
 
 CREATE FUNCTION public.account_deletion_fence_job_logs() RETURNS trigger
 LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog, pg_temp AS $fn$
-DECLARE
-    v_state text;
 BEGIN
     IF current_user = 'bridgeleads_purge' THEN
         RETURN NEW;
     END IF;
-    IF TG_OP = 'UPDATE' AND OLD.job_id IS DISTINCT FROM NEW.job_id THEN
-        RAISE EXCEPTION 'job_id is immutable' USING ERRCODE = 'BLD21';
+    IF TG_OP = 'UPDATE' THEN
+        IF OLD.job_id IS DISTINCT FROM NEW.job_id THEN
+            RAISE EXCEPTION 'job_id is immutable' USING ERRCODE = 'BLD21';
+        END IF;
+        RETURN NEW;
     END IF;
-    SELECT u.deletion_state INTO v_state
-      FROM public.jobs j JOIN public.users u ON u.id = j.user_id
-     WHERE j.id = NEW.job_id
-       FOR KEY SHARE OF u;
-    IF FOUND AND v_state IS NOT NULL AND v_state <> 'pending' THEN
+    IF public.account_deletion_owner_state(NULL, NEW.job_id, true)
+       IN ('purging', 'deleted') THEN
         RAISE EXCEPTION 'account is being deleted' USING ERRCODE = 'BLD20';
     END IF;
     RETURN NEW;
@@ -186,6 +247,16 @@ BEGIN
         -- tripping the fence on a user_sessions/password_history write (500).
         UPDATE public.users SET deletion_state = 'purging', is_active = false
          WHERE id = v_uid;
+        -- Withdraw the lookups not yet sent, exactly as the dispatcher withdraws
+        -- undeliverable ones: never charged, so nothing is ever submitted (or billed)
+        -- for a purging account. Claimed/submitted ones are the caller's precondition.
+        WITH withdrawn AS (
+            UPDATE public.pending_skip_trace_rows p SET status = 'cancelled'
+             WHERE p.user_id = v_uid AND p.status = 'queued'
+            RETURNING p.result_id)
+        UPDATE public.results r SET skip_trace_status = 'not_attempted'
+         WHERE r.user_id = v_uid AND r.skip_trace_status = 'queued'
+           AND r.id IN (SELECT w.result_id FROM withdrawn w);
         UPDATE public.account_deletions
            SET status = 'purging', claim_token = v_token, claimed_until = v_now + p_lease,
                attempts = attempts + 1, next_attempt_at = NULL
@@ -342,9 +413,9 @@ BEGIN
        OR v_row.claimed_until < clock_timestamp() THEN
         RAISE EXCEPTION 'not the live claim on this deletion' USING ERRCODE = 'BLD33';
     END IF;
-    IF v_row.db_purged_at IS NOT NULL THEN
-        RETURN true;  -- already committed: never redone
-    END IF;
+    -- Re-runnable on purpose: every statement below is idempotent, and the P3b task runs
+    -- it again after the 24 h reclaim to catch an UPDATE that was in flight at the claim
+    -- (complete_account_deletion refuses until that second pass has left nothing).
     IF v_row.r2_first_sweep_at IS NULL THEN
         RAISE EXCEPTION 'R2 export files must be swept first' USING ERRCODE = 'BLD34';
     END IF;
@@ -406,8 +477,11 @@ BEGIN
      WHERE user_id = v_uid
        AND (first_name IS NOT NULL OR last_name IS NOT NULL OR mail_address IS NOT NULL
          OR mail_city IS NOT NULL OR mail_state IS NOT NULL OR mail_zip IS NOT NULL);
+    -- A queue row is a batch shared with other tenants: only a finished one is touched,
+    -- so a co-tenant's ingest never loses its download link.
     UPDATE public.skip_trace_queues SET download_url = NULL, error_message = NULL
-     WHERE user_id = v_uid AND (download_url IS NOT NULL OR error_message IS NOT NULL);
+     WHERE user_id = v_uid AND status <> 'pending'
+       AND (download_url IS NOT NULL OR error_message IS NOT NULL);
     UPDATE public.jobs SET export_key = NULL, error_message = NULL
      WHERE user_id = v_uid AND (export_key IS NOT NULL OR error_message IS NOT NULL);
     UPDATE public.scraper_configs
@@ -422,8 +496,9 @@ BEGIN
      WHERE user_id = v_uid;
     UPDATE public.audit_events SET detail = NULL WHERE user_id = v_uid AND detail IS NOT NULL;
     -- Trial-fraud exception (owner-approved): only for an account that used its trial;
-    -- a repeat keeps the LONGER expiry.
-    IF v_trial IS NOT NULL THEN
+    -- a repeat keeps the LONGER expiry. After the tombstone email_hmac is the
+    -- placeholder's, so a later pass records nothing.
+    IF v_trial IS NOT NULL AND v_row.tombstoned_at IS NULL THEN
         INSERT INTO public.consumed_trial_emails (email_hmac, expires_at)
         VALUES (v_hmac, v_now + interval '2 years')
         ON CONFLICT (email_hmac) DO UPDATE
@@ -433,7 +508,8 @@ BEGIN
     IF v_more THEN
         RETURN false;
     END IF;
-    UPDATE public.account_deletions SET db_purged_at = v_now WHERE id = p_deletion_id;
+    UPDATE public.account_deletions SET db_purged_at = COALESCE(db_purged_at, v_now)
+     WHERE id = p_deletion_id;
     RETURN true;
 END
 $fn$;
@@ -461,6 +537,26 @@ BEGIN
        OR v_row.r2_final_sweep_at < v_row.r2_first_sweep_at + interval '24 hours' THEN
         RAISE EXCEPTION 'deletion has unfinished phases' USING ERRCODE = 'BLD34';
     END IF;
+    -- An UPDATE in flight at the claim can land on a row the first pass had already
+    -- passed over: refuse until a purge re-run has blanked it.
+    IF EXISTS (SELECT 1 FROM public.results r WHERE r.user_id = v_uid
+                  AND (r.party_name IS NOT NULL OR r.heirs IS NOT NULL
+                    OR r.legal_description IS NOT NULL OR r.mailing_address IS NOT NULL
+                    OR r.enrichment_data IS NOT NULL OR r.phone IS NOT NULL
+                    OR r.phone_type IS NOT NULL OR r.phone_dnc_flag IS NOT NULL
+                    OR r.email IS NOT NULL OR r.phones IS NOT NULL OR r.emails IS NOT NULL
+                    OR r.owner_state IS NOT NULL OR r.absentee_owner IS NOT NULL
+                    OR r.out_of_state_owner IS NOT NULL OR r.last_trace_outcome IS NOT NULL
+                    OR r.skip_trace_subject_hash IS NOT NULL))
+       OR EXISTS (SELECT 1 FROM public.pending_skip_trace_rows p WHERE p.user_id = v_uid
+                  AND (p.first_name IS NOT NULL OR p.last_name IS NOT NULL
+                    OR p.mail_address IS NOT NULL OR p.mail_city IS NOT NULL
+                    OR p.mail_state IS NOT NULL OR p.mail_zip IS NOT NULL))
+       OR EXISTS (SELECT 1 FROM public.jobs j WHERE j.user_id = v_uid
+                  AND (j.export_key IS NOT NULL OR j.error_message IS NOT NULL)) THEN
+        RAISE EXCEPTION 'personal data written during the purge: run the purge again'
+            USING ERRCODE = 'BLD36';
+    END IF;
     -- Audit rows written while purging (e.g. a refused sign-in) lose their detail too.
     UPDATE public.audit_events SET detail = NULL WHERE user_id = v_uid AND detail IS NOT NULL;
     UPDATE public.users SET deletion_state = 'deleted' WHERE id = v_uid;
@@ -476,17 +572,18 @@ $fn$;
 def upgrade() -> None:
     op.execute(text("SET LOCAL lock_timeout = '5s'"))
     op.execute(_FENCE_SQL)
-    for tbl in _FENCED:
+    for tbl, pinned in _FENCED.items():
         op.execute(
-            f"CREATE TRIGGER account_deletion_fence BEFORE INSERT OR UPDATE ON public.{tbl} "
-            "FOR EACH ROW EXECUTE FUNCTION public.account_deletion_fence()"
+            f"CREATE TRIGGER {_TRIGGER} BEFORE INSERT OR UPDATE ON public.{tbl} "
+            "FOR EACH ROW EXECUTE FUNCTION public.account_deletion_fence("
+            + ", ".join(f"'{c}'" for c in pinned) + ")"
         )
-        op.execute(f"ALTER TABLE public.{tbl} ENABLE ALWAYS TRIGGER account_deletion_fence")
+        op.execute(f"ALTER TABLE public.{tbl} ENABLE ALWAYS TRIGGER {_TRIGGER}")
     op.execute(
-        "CREATE TRIGGER account_deletion_fence BEFORE INSERT OR UPDATE ON public.job_logs "
+        f"CREATE TRIGGER {_TRIGGER} BEFORE INSERT OR UPDATE ON public.job_logs "
         "FOR EACH ROW EXECUTE FUNCTION public.account_deletion_fence_job_logs()"
     )
-    op.execute("ALTER TABLE public.job_logs ENABLE ALWAYS TRIGGER account_deletion_fence")
+    op.execute(f"ALTER TABLE public.job_logs ENABLE ALWAYS TRIGGER {_TRIGGER}")
     op.execute(_FUNCTIONS_SQL)
 
     grants = []
@@ -507,8 +604,17 @@ def upgrade() -> None:
         _guarded(r, f"REVOKE ALL ON FUNCTION {fence_fns} FROM {r};")
         for r in (*_API_ROLES, "bridgeleads_system")
     ]
+    state_fn = f"public.{_OWNER_STATE_FN}"
+    state_grants = [f"REVOKE ALL ON FUNCTION {state_fn} FROM PUBLIC;"]
+    state_grants += [_guarded(r, f"REVOKE ALL ON FUNCTION {state_fn} FROM {r};")
+                     for r in ("anon", "authenticated", "service_role")]
+    state_grants += [_guarded(r, f"GRANT EXECUTE ON FUNCTION {state_fn} TO {r};")
+                     for r in ("bridgeleads_app", "bridgeleads_system")]
+    state_grants.append(
+        f"EXECUTE format('GRANT EXECUTE ON FUNCTION {state_fn} TO %I', current_user);")
     alters = "\n".join(
-        f"ALTER FUNCTION public.{f} OWNER TO bridgeleads_purge;" for f in _WORKER_FUNCTIONS
+        f"ALTER FUNCTION public.{f} OWNER TO bridgeleads_purge;"
+        for f in (*_WORKER_FUNCTIONS, _OWNER_STATE_FN)
     )
     nl = "\n"
     op.execute(
@@ -525,6 +631,7 @@ def upgrade() -> None:
             -- Trigger functions cannot be called directly, but Supabase's default
             -- privileges still grant EXECUTE on them: take it back like everything else.
             {nl.join(fence_revokes)}
+            {nl.join(state_grants)}
             {_guarded("bridgeleads_system", f"GRANT EXECUTE ON FUNCTION {fns} TO bridgeleads_system;")}
 
             -- Same temporary hand-over as 112: SET on the purge role + CREATE on public,
@@ -554,7 +661,10 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.execute(text("SET LOCAL lock_timeout = '5s'"))
-    drops = " ".join(f"DROP FUNCTION IF EXISTS public.{f};" for f in _WORKER_FUNCTIONS)
+    for tbl in (*_FENCED, "job_logs"):
+        op.execute(f"DROP TRIGGER IF EXISTS {_TRIGGER} ON public.{tbl}")
+    drops = " ".join(f"DROP FUNCTION IF EXISTS public.{f};"
+                     for f in (*_WORKER_FUNCTIONS, _OWNER_STATE_FN))
     op.execute(
         f"""
         DO $purge_drop$
@@ -577,8 +687,6 @@ def downgrade() -> None:
         $purge_drop$;
         """
     )
-    for tbl in (*_FENCED, "job_logs"):
-        op.execute(f"DROP TRIGGER IF EXISTS account_deletion_fence ON public.{tbl}")
     op.execute("DROP FUNCTION IF EXISTS public.account_deletion_fence()")
     op.execute("DROP FUNCTION IF EXISTS public.account_deletion_fence_job_logs()")
     revokes = []

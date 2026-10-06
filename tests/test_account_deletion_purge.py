@@ -27,11 +27,12 @@ from src.db.session import sync_engine
 from src.utils.crypto import blind_index
 
 _LEASE = "interval '5 minutes'"
+# skip_trace_queues is deliberately absent: a queue row is shared by several tenants.
 _FENCED = (
     "results", "jobs", "scraper_configs", "scraper_batches", "batch_runs",
     "notifications", "user_record_views", "property_list_membership",
     "dialer_deliveries", "delivered_records", "pending_skip_trace_rows",
-    "skip_trace_queues", "user_sessions", "user_avatars", "pending_email_changes",
+    "user_sessions", "user_avatars", "pending_email_changes",
     "password_history", "mfa_backup_codes", "mfa_break_glass_codes", "job_logs",
 )
 # Matrix §2 DELETE tables with their own user_id (job_logs, skip_trace_cache and
@@ -135,9 +136,9 @@ def _seed(conn, uid: str) -> dict[str, str]:
                disposition) VALUES (gen_random_uuid(), :action, :u, :r1, 'answered_hit')""",
         """INSERT INTO contact_lookup_action_events (id, action_id, user_id, to_status)
            VALUES (gen_random_uuid(), :action, :u, 'settled')""",
-        """INSERT INTO skip_trace_queues (id, tracerfy_queue_id, job_id, user_id, download_url,
-               error_message) VALUES (gen_random_uuid(), :qn, :job, :u,
-               'https://vendor.test/x.csv', 'row: 1 Main St')""",
+        """INSERT INTO skip_trace_queues (id, tracerfy_queue_id, job_id, user_id, status,
+               download_url, error_message) VALUES (gen_random_uuid(), :qn, :job, :u,
+               'completed', 'https://vendor.test/x.csv', 'row: 1 Main St')""",
         """INSERT INTO skip_trace_meter_events (id, tracerfy_queue_id, user_id, billable_units)
            VALUES (gen_random_uuid(), :qn, :u, 1)""",
         """INSERT INTO pending_skip_trace_rows (id, job_id, result_id, user_id, property_address,
@@ -253,7 +254,14 @@ def _snapshot(conn, ids: dict) -> dict:
 # ── Claim ────────────────────────────────────────────────────────────────────────
 
 def test_claim_takes_only_a_due_deletion_whose_billing_is_stopped(conn) -> None:
-    uid = _user(conn)
+    uid, other = _user(conn), _user(conn)
+    ids, other_ids = _seed(conn, uid), _seed(conn, other)
+    # A lookup not yet sent (and another tenant's), plus one already with the vendor.
+    conn.execute(text("UPDATE results SET skip_trace_status = 'queued' WHERE id IN (:a, :b)"),
+                 {"a": ids["r1"], "b": other_ids["r1"]})
+    conn.execute(text(
+        "INSERT INTO pending_skip_trace_rows (id, job_id, result_id, user_id, property_address, "
+        "status) VALUES (gen_random_uuid(), :job, :r2, :u, '1 Main St', 'submitted')"), ids)
     did = _open_due(conn, uid, stripe="pending_cancel")
     assert _claim(conn) is None  # still being billed
 
@@ -266,6 +274,18 @@ def test_claim_takes_only_a_due_deletion_whose_billing_is_stopped(conn) -> None:
     row = _deletion(conn, did)
     assert (row.status, str(row.claim_token), row.attempts) == ("purging", str(claim.claim_token), 1)
     assert _claim(conn) is None  # the live lease is not up for grabs
+    # The unsent lookup is withdrawn exactly as the dispatcher withdraws one; the one
+    # already with the vendor is left for the precondition; the other tenant untouched.
+    pending = dict(conn.execute(text(
+        "SELECT result_id::text, status FROM pending_skip_trace_rows WHERE user_id = :u"),
+        {"u": uid}).all())
+    assert pending == {ids["r1"]: "cancelled", ids["r2"]: "submitted"}
+    statuses = dict(conn.execute(text(
+        "SELECT id::text, skip_trace_status FROM results WHERE id IN (:a, :b)"),
+        {"a": ids["r1"], "b": other_ids["r1"]}).all())
+    assert statuses == {ids["r1"]: "not_attempted", other_ids["r1"]: "queued"}
+    assert conn.execute(text("SELECT status FROM pending_skip_trace_rows WHERE user_id = :u"),
+                        {"u": other}).scalar() == "queued"
 
 
 def test_claim_waits_for_the_deadline_and_the_backoff(conn) -> None:
@@ -358,6 +378,11 @@ def test_purge_leaves_exactly_the_matrix_end_state(conn) -> None:
     # A previous deletion of the same address left a LONGER trial hold: it must survive.
     conn.execute(text("INSERT INTO consumed_trial_emails (email_hmac, expires_at) "
                       "VALUES (:h, now() + interval '3 years')"), {"h": v["hmac"]})
+    # A Tracerfy batch still in flight, shared with co-tenants: its link must survive.
+    in_flight = conn.execute(text(
+        "INSERT INTO skip_trace_queues (id, tracerfy_queue_id, user_id, download_url) "
+        "VALUES (gen_random_uuid(), :n, :u, 'https://vendor.test/live.csv') RETURNING id"),
+        {"n": random.randint(1, 2**31 - 1), "u": victim}).scalar()
     kept = {t: _count(conn, t, victim) for t in _KEPT}
     before_other = _snapshot(conn, o)
 
@@ -383,8 +408,11 @@ def test_purge_leaves_exactly_the_matrix_end_state(conn) -> None:
     # §4.2 every SCRUB column is blank, every KEEP count unchanged.
     for t, cols in _SCRUBBED.items():
         filled = " OR ".join(f"{c} IS NOT NULL" for c in cols)
-        assert conn.execute(text(f"SELECT count(*) FROM {t} WHERE user_id = :u AND ({filled})"),
-                            {"u": victim}).scalar() == 0, t
+        assert conn.execute(text(f"SELECT count(*) FROM {t} WHERE user_id = :u AND ({filled}) "
+                                 "AND id <> :q"),
+                            {"u": victim, "q": str(in_flight)}).scalar() == 0, t
+    assert conn.execute(text("SELECT download_url FROM skip_trace_queues WHERE id = :q"),
+                        {"q": str(in_flight)}).scalar() == "https://vendor.test/live.csv"
     assert {t: _count(conn, t, victim) for t in _KEPT} == kept
     cfg = conn.execute(text("SELECT name, fields::text, enrichment::text, schedule::text, "
                             "deliver::text, active FROM scraper_configs WHERE user_id = :u"),
@@ -425,7 +453,7 @@ def test_purge_records_a_trial_hold_only_for_a_used_trial(conn) -> None:
 
 def test_complete_needs_every_phase_and_the_24_hour_gap(conn) -> None:
     uid = _user(conn)
-    _seed(conn, uid)
+    ids = _seed(conn, uid)
     did = _open_due(conn, uid)
     token = _claim(conn).claim_token
 
@@ -453,6 +481,13 @@ def test_complete_needs_every_phase_and_the_24_hour_gap(conn) -> None:
     token = _claim(conn).claim_token
     assert refused(token)
     _progress(conn, did, token, "r2_final_sweep")
+    # An UPDATE that was in flight at the claim lands after the first pass (written here
+    # through the purge role, the only writer the fence lets through): complete refuses
+    # until the purge has run again.
+    _as_purge(conn, "UPDATE results SET party_name = 'Late Write' WHERE id = :r", {"r": ids["r1"]})
+    assert _sqlstate(conn, "SELECT complete_account_deletion(:d, :t)",
+                     {"d": did, "t": token}) == "BLD36"
+    assert _purge(conn, did, token) is True
     # An audit row written while purging (a refused sign-in) loses its detail too.
     conn.execute(text("INSERT INTO audit_events (id, event, user_id, detail) "
                       "VALUES (gen_random_uuid(), 'login_failure', :u, 'late')"), {"u": uid})
@@ -470,20 +505,35 @@ def test_complete_needs_every_phase_and_the_24_hour_gap(conn) -> None:
 
 # ── Fence ────────────────────────────────────────────────────────────────────────
 
-def test_fence_refuses_every_write_once_purging(conn) -> None:
+def test_fence_refuses_inserts_and_pins_scrubbed_columns_once_purging(conn) -> None:
     uid, bystander = _user(conn), _user(conn)
     ids = _seed(conn, uid)
     bys = _seed(conn, bystander)
     did = _open_due(conn, uid)
     # Pending accounts are still writable (the user may restore).
     conn.execute(text("UPDATE notifications SET read_at = now() WHERE user_id = :u"), {"u": uid})
+    conn.execute(text("UPDATE scraper_configs SET active = false WHERE user_id = :u"), {"u": uid})
     _claim(conn)
 
     note = ("INSERT INTO notifications (id, user_id, type) "
             "VALUES (gen_random_uuid(), :u, 'job_done')")
     assert _sqlstate(conn, note, {"u": uid}) == "BLD20"
-    assert _sqlstate(conn, "UPDATE results SET phone = '999' WHERE user_id = :u",
-                     {"u": uid}) == "BLD20"
+    # A cross-tenant sweep is never aborted: the status write lands, the personal data
+    # does not (pinned to its old value until the purge blanks it, then to NULL).
+    conn.execute(text("UPDATE results SET phone = '999', party_name = 'X', "
+                      "skip_trace_status = 'errored' WHERE user_id IN (:u, :b)"),
+                 {"u": uid, "b": bystander})
+    rows = conn.execute(text("SELECT user_id::text, phone, party_name, skip_trace_status "
+                             "FROM results WHERE user_id IN (:u, :b)"),
+                        {"u": uid, "b": bystander}).all()
+    assert {(r.user_id, r.phone, r.party_name, r.skip_trace_status) for r in rows} == {
+        (uid, "555", "Jane Doe", "errored"), (bystander, "999", "X", "errored")}
+    conn.execute(text("UPDATE scraper_configs SET active = true, paused_reason = NULL "
+                      "WHERE user_id = :u"), {"u": uid})
+    assert conn.execute(text("SELECT active FROM scraper_configs WHERE user_id = :u"),
+                        {"u": uid}).scalar() is False  # a paused schedule never revives
+    conn.execute(text("UPDATE notifications SET read_at = now() WHERE user_id = :u"),
+                 {"u": uid})  # rows the purge deletes: updates are harmless
     assert _sqlstate(conn, "INSERT INTO delivered_records (id, user_id, dedup_hash) "
                            "VALUES (gen_random_uuid(), :u, 'late')", {"u": uid}) == "BLD20"
     assert _sqlstate(conn, "INSERT INTO user_sessions (id, user_id) VALUES ('late', :u)",
@@ -588,7 +638,7 @@ async def test_a_purging_account_cannot_sign_in_or_refresh(
 
 def test_purge_functions_and_fence_are_locked_down(conn) -> None:
     for fn in ("claim_account_deletion", "record_deletion_progress", "purge_account_data",
-               "complete_account_deletion"):
+               "complete_account_deletion", "account_deletion_owner_state"):
         owner, definer, config, acl = conn.execute(text(
             "SELECT pg_get_userbyid(proowner), prosecdef, proconfig, proacl::text "
             "FROM pg_proc WHERE proname = :f"), {"f": fn}).one()
@@ -602,8 +652,8 @@ def test_purge_functions_and_fence_are_locked_down(conn) -> None:
         assert acl is not None and not any(e.startswith("=") for e in acl.strip("{}").split(","))
     enabled = dict(conn.execute(text(
         "SELECT c.relname, t.tgenabled FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid "
-        "WHERE t.tgname = 'account_deletion_fence'")).all())
-    assert enabled == {t: "A" for t in _FENCED}
+        "WHERE t.tgname = 'zz_account_deletion_fence'")).all())
+    assert enabled == dict.fromkeys(_FENCED, "A")
     assert conn.execute(text(
         "SELECT count(*) FROM pg_auth_members WHERE roleid = 'bridgeleads_purge'::regrole "
         "AND (set_option OR inherit_option OR member <> current_user::regrole)")).scalar() == 0
@@ -620,7 +670,8 @@ def test_supabase_api_roles_cannot_run_the_purge(conn) -> None:
                    "record_deletion_progress(uuid, uuid, text, text, text, text)",
                    "purge_account_data(uuid, uuid, text[], integer)",
                    "complete_account_deletion(uuid, uuid)",
-                   "account_deletion_fence()", "account_deletion_fence_job_logs()"):
+                   "account_deletion_fence()", "account_deletion_fence_job_logs()",
+                   "account_deletion_owner_state(uuid, uuid, boolean)"):
             assert conn.execute(text("SELECT has_function_privilege(:r, :f, 'EXECUTE')"),
                                 {"r": role, "f": fn}).scalar() is False, (role, fn)
 
@@ -645,6 +696,7 @@ def _require_runtime_roles(conn) -> None:
 def test_runtime_roles_hit_the_fence_and_only_the_worker_runs_the_purge(conn) -> None:
     _require_runtime_roles(conn)
     uid, bystander = _user(conn), _user(conn)
+    ids = _seed(conn, uid)
     _open_due(conn, uid)
     _claim(conn)
     note = ("INSERT INTO notifications (id, user_id, type) "
@@ -653,6 +705,10 @@ def test_runtime_roles_hit_the_fence_and_only_the_worker_runs_the_purge(conn) ->
     conn.execute(text("SET LOCAL ROLE bridgeleads_system"))
     assert _sqlstate(conn, note, {"u": uid}) == "BLD20"
     conn.execute(text(note), {"u": bystander})  # the invoker's own privileges suffice
+    conn.execute(text("UPDATE results SET phone = '999', skip_trace_status = 'errored' "
+                      "WHERE id = :r"), {"r": ids["r1"]})
+    assert tuple(conn.execute(text("SELECT phone, skip_trace_status FROM results WHERE id = :r"),
+                              {"r": ids["r1"]}).one()) == ("555", "errored")
     assert conn.execute(text(f"SELECT * FROM claim_account_deletion({_LEASE})")).all() == []
     conn.execute(text("RESET ROLE"))
 

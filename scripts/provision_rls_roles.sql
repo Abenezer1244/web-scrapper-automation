@@ -399,6 +399,46 @@ BEGIN
         GRANT EXECUTE ON FUNCTION request_account_deletion(),
               restore_account_deletion() TO bridgeleads_app;
     END IF;
+    -- Purge (113): mirrors the migration's grants. Its role-targeted <table>_purge
+    -- policies live in the migration only (apply_rls_cutover_policies.sql drops
+    -- policies by name and never touches them).
+    IF to_regproc('public.purge_account_data') IS NOT NULL THEN
+        GRANT SELECT, DELETE ON user_sessions, user_avatars, pending_email_changes,
+              password_history, mfa_backup_codes, mfa_break_glass_codes, notifications,
+              user_record_views, property_list_membership, dialer_deliveries, batch_runs,
+              job_logs, skip_trace_cache, pending_registrations TO bridgeleads_purge;
+        GRANT SELECT ON results, pending_skip_trace_rows, skip_trace_queues, jobs,
+              scraper_configs, scraper_batches, audit_events, delivered_records
+              TO bridgeleads_purge;
+        GRANT UPDATE (party_name, heirs, legal_description, mailing_address,
+              enrichment_data, phone, phone_type, phone_dnc_flag, email, phones, emails,
+              owner_state, absentee_owner, out_of_state_owner, last_trace_outcome,
+              skip_trace_subject_hash, skip_trace_status) ON results TO bridgeleads_purge;
+        GRANT UPDATE (first_name, last_name, mail_address, mail_city, mail_state, mail_zip,
+              status) ON pending_skip_trace_rows TO bridgeleads_purge;
+        GRANT UPDATE (download_url, error_message) ON skip_trace_queues TO bridgeleads_purge;
+        GRANT UPDATE (export_key, error_message) ON jobs TO bridgeleads_purge;
+        GRANT UPDATE (name, fields, enrichment, schedule, deliver, doc_types,
+              include_living_owner_tod, active) ON scraper_configs TO bridgeleads_purge;
+        GRANT UPDATE (name, fields, enrichment, schedule, deliver, delivery_mode, status)
+              ON scraper_batches TO bridgeleads_purge;
+        GRANT UPDATE (detail) ON audit_events TO bridgeleads_purge;
+        GRANT SELECT (email_hmac, trial_consumed_at) ON users TO bridgeleads_purge;
+        GRANT UPDATE (is_active) ON users TO bridgeleads_purge;
+        GRANT UPDATE (expires_at) ON consumed_trial_emails TO bridgeleads_purge;
+        -- Only the beat worker drives the purge; every writer of a fenced table calls
+        -- the fence's owner-state lookup.
+        REVOKE ALL ON FUNCTION claim_account_deletion(interval),
+              record_deletion_progress(uuid, uuid, text, text, text, text),
+              purge_account_data(uuid, uuid, text[], integer),
+              complete_account_deletion(uuid, uuid) FROM bridgeleads_app;
+        GRANT EXECUTE ON FUNCTION claim_account_deletion(interval),
+              record_deletion_progress(uuid, uuid, text, text, text, text),
+              purge_account_data(uuid, uuid, text[], integer),
+              complete_account_deletion(uuid, uuid) TO bridgeleads_system;
+        GRANT EXECUTE ON FUNCTION account_deletion_owner_state(uuid, uuid, boolean)
+              TO bridgeleads_app, bridgeleads_system;
+    END IF;
     -- users CASCADEs into account_deletions: only the owner may delete/truncate it.
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
         REVOKE DELETE, TRUNCATE ON users FROM anon;

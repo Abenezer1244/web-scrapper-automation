@@ -13,7 +13,6 @@ they are absent (CI).
 from __future__ import annotations
 
 import random
-import threading
 import uuid
 
 import pytest
@@ -588,10 +587,11 @@ def test_fence_never_lets_a_row_change_owner(conn) -> None:
                          {"a": a, "b": b}) == "BLD21"
 
 
-def test_purge_waits_for_a_writer_already_past_the_fence() -> None:
-    """The writer passed the fence while the account was pending and has not committed.
-    The purge must wait for it, then delete what it wrote; a writer arriving after the
-    claim is refused."""
+def test_claim_skips_an_account_with_a_write_in_flight() -> None:
+    """A writer passed the fence while the account was pending and has not committed.
+    The claim must not take the account until it commits (else the write would land
+    after the claim); the purge then removes what it wrote, and a writer arriving after
+    the claim is refused."""
     with sync_engine.connect() as setup, setup.begin():
         uid = _user(setup)
         did = _open_due(setup, uid)
@@ -602,29 +602,14 @@ def test_purge_waits_for_a_writer_already_past_the_fence() -> None:
                             "VALUES (gen_random_uuid(), :u, 'in_flight')"), {"u": uid})
         with sync_engine.connect() as p:
             with p.begin():
-                p.execute(text("SET LOCAL lock_timeout = '5s'"))  # KEY SHARE must not block
+                assert _claim(p) is None  # skipped, not blocked: the writer holds KEY SHARE
+            w.commit()
+            with p.begin():
                 claim = _claim(p)
                 assert str(claim.user_id) == uid
             with p.begin():
                 _progress(p, did, claim.claim_token, "r2_first_sweep")
-
-        outcome: dict = {}
-
-        def purge() -> None:
-            try:
-                with sync_engine.connect() as c, c.begin():
-                    c.execute(text("SET LOCAL lock_timeout = '30s'"))
-                    outcome["done"] = _purge(c, did, claim.claim_token)
-            except Exception as exc:  # surfaced by the assert below
-                outcome["error"] = exc
-
-        t = threading.Thread(target=purge)
-        t.start()
-        t.join(2)
-        assert t.is_alive() and not outcome, outcome  # blocked behind the writer
-        w.commit()
-        t.join(30)
-        assert outcome == {"done": True}
+                assert _purge(p, did, claim.claim_token) is True
         with sync_engine.connect() as check, check.begin():
             assert _count(check, "notifications", uid) == 0
             assert _sqlstate(check, "INSERT INTO notifications (id, user_id, type) "

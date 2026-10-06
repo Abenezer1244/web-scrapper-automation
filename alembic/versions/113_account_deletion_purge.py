@@ -192,7 +192,10 @@ BEGIN
     IF current_user = 'bridgeleads_purge' OR NEW.user_id IS NULL OR NEW.detail IS NULL THEN
         RETURN NEW;
     END IF;
-    IF public.account_deletion_owner_state(NEW.user_id, NULL, false)
+    -- Locking read (no foreign key takes one here): claim and complete take the users
+    -- row FOR UPDATE, so a detail written while pending is committed before either
+    -- runs, and complete's final scrub removes it.
+    IF public.account_deletion_owner_state(NEW.user_id, NULL, true)
        IN ('purging', 'deleted') THEN
         NEW.detail := NULL;
     END IF;
@@ -236,8 +239,11 @@ BEGIN
     IF p_lease IS NULL OR p_lease <= interval '0' OR p_lease > interval '1 hour' THEN
         RAISE EXCEPTION 'lease must be between 0 and 1 hour' USING ERRCODE = 'BLD30';
     END IF;
-    -- Candidate chosen and locked through the USERS row (users-first lock order);
-    -- SKIP LOCKED so concurrent workers take different accounts.
+    -- Candidate chosen and locked through the USERS row (users-first lock order).
+    -- FOR UPDATE conflicts with the fence's FOR KEY SHARE: an account with a write
+    -- still in flight (passed the fence while pending, not yet committed) is skipped
+    -- until it commits, so nothing written before the claim can land after it.
+    -- SKIP LOCKED also lets concurrent workers take different accounts.
     SELECT u.id INTO v_uid
       FROM public.users u
       JOIN public.account_deletions d ON d.user_id = u.id
@@ -247,7 +253,7 @@ BEGIN
          OR (d.status = 'purging' AND d.claimed_until < v_now))
      ORDER BY d.purge_after
      LIMIT 1
-       FOR NO KEY UPDATE OF u SKIP LOCKED;
+       FOR UPDATE OF u SKIP LOCKED;
     IF NOT FOUND THEN
         RETURN;
     END IF;
@@ -550,7 +556,9 @@ BEGIN
     IF NOT FOUND THEN
         RAISE EXCEPTION 'unknown deletion' USING ERRCODE = 'BLD31';
     END IF;
-    PERFORM 1 FROM public.users u WHERE u.id = v_uid FOR NO KEY UPDATE;
+    -- FOR UPDATE: waits for every write still in flight under the fence's KEY SHARE
+    -- (an audit row included) before the checks below and the final scrub.
+    PERFORM 1 FROM public.users u WHERE u.id = v_uid FOR UPDATE;
     SELECT * INTO v_row FROM public.account_deletions d WHERE d.id = p_deletion_id FOR UPDATE;
     IF v_row.status <> 'purging' OR v_row.claim_token IS DISTINCT FROM p_claim_token
        OR v_row.claimed_until < clock_timestamp() THEN

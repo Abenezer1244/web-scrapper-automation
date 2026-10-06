@@ -345,6 +345,8 @@ def _set_progress(
             _sa_update(Job)
             .where(
                 Job.id == job.id,
+                # Tenant filter on every query (RLS is the belt, this the suspenders).
+                Job.user_id == job.user_id,
                 Job.status.not_in(_TERMINAL_STATUSES),
                 *_attempt_clauses(expected_started_at),
             )

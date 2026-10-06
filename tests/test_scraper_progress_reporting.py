@@ -175,6 +175,29 @@ def test_a_cancelled_run_stops_accepting_progress():
         assert row.units_done is None and row.records_found is None and row.stage is None
 
 
+def test_a_job_object_carrying_another_tenant_writes_nothing():
+    """Every query filters by user_id, RLS being only the belt. A job object whose
+    user_id does not match the row's owner must not land an observation, even with
+    the right id and attempt token. The object is detached before the change, so
+    the altered user_id cannot be autoflushed onto the row ahead of the UPDATE."""
+    with SyncSessionLocal() as db:
+        job = _job_row(db)
+        other = _job_row(db)
+        owner = job.user_id
+        db.expunge(job)
+        job.user_id = other.user_id
+
+        fired = _set_progress(
+            db, job, expected_started_at=job.started_at, units_done=1, units_total=5,
+        )
+        assert fired is False
+
+    with SyncSessionLocal() as db:
+        row = db.get(Job, job.id)
+        assert row.user_id == owner
+        assert row.units_done is None and row.units_total is None
+
+
 def test_a_stage_write_stamps_when_the_stage_began():
     """stage_started_at is what lets the UI say 'still connecting after 3 minutes'
     without re-deriving it from log timestamps."""

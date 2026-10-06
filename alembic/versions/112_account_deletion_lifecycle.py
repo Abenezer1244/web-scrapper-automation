@@ -209,7 +209,9 @@ def upgrade() -> None:
                     RAISE EXCEPTION 'a deletion request starts pending'
                         USING ERRCODE = 'BLD11';
                 END IF;
-            ELSIF OLD.user_id IS DISTINCT FROM NEW.user_id
+            ELSIF OLD.id IS DISTINCT FROM NEW.id
+               OR OLD.user_id IS DISTINCT FROM NEW.user_id
+               OR OLD.requested_at IS DISTINCT FROM NEW.requested_at
                OR OLD.purge_after IS DISTINCT FROM NEW.purge_after
                OR (OLD.status IS DISTINCT FROM NEW.status AND NOT (
                       (OLD.status = 'pending' AND NEW.status IN ('purging', 'restored'))
@@ -312,6 +314,8 @@ def upgrade() -> None:
     )
     op.execute("ALTER TABLE public.consumed_trial_emails ENABLE ROW LEVEL SECURITY")
     for tbl in ("users", *_NEW_TABLES):
+        # IF EXISTS: apply_rls_cutover_policies.sql also manages users_purge.
+        op.execute(f"DROP POLICY IF EXISTS {tbl}_purge ON public.{tbl}")
         op.execute(
             f"CREATE POLICY {tbl}_purge ON public.{tbl} FOR ALL TO bridgeleads_purge "
             "USING (true) WITH CHECK (true)"
@@ -390,8 +394,32 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.execute(text("SET LOCAL lock_timeout = '5s'"))
-    for fn in _DEFINER_FUNCTIONS:
-        op.execute(f"DROP FUNCTION IF EXISTS public.{fn}")
+    # The definer functions belong to bridgeleads_purge. A non-superuser migration role
+    # (Supabase) must become that role to drop them: same temporary SET grant as the
+    # upgrade's hand-over, taken back afterwards.
+    drops = " ".join(f"DROP FUNCTION IF EXISTS public.{fn};" for fn in _DEFINER_FUNCTIONS)
+    op.execute(
+        f"""
+        DO $purge_drop$
+        DECLARE
+            v_me text := current_user;
+            v_super boolean;
+        BEGIN
+            SELECT rolsuper INTO v_super FROM pg_roles WHERE rolname = v_me;
+            IF NOT v_super THEN
+                EXECUTE format('GRANT bridgeleads_purge TO %I WITH SET TRUE, INHERIT FALSE',
+                               v_me);
+                SET LOCAL ROLE bridgeleads_purge;
+            END IF;
+            {drops}
+            IF NOT v_super THEN
+                RESET ROLE;
+                EXECUTE format('REVOKE SET OPTION FOR bridgeleads_purge FROM %I', v_me);
+            END IF;
+        END
+        $purge_drop$;
+        """
+    )
     op.execute("DROP TRIGGER IF EXISTS users_deletion_state_guard_ins ON public.users")
     op.execute("DROP TRIGGER IF EXISTS users_deletion_state_guard_upd ON public.users")
     op.execute("DROP FUNCTION IF EXISTS public.users_deletion_state_guard()")

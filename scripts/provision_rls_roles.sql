@@ -380,6 +380,12 @@ BEGIN
         REVOKE ALL ON account_deletions, consumed_trial_emails FROM bridgeleads_system;
         REVOKE ALL ON account_deletions, consumed_trial_emails FROM bridgeleads_app;
         GRANT SELECT ON account_deletions, consumed_trial_emails TO bridgeleads_app;
+        -- consumed_trial_emails has no user_id (no GUC policy): without this the
+        -- grant above sees zero rows. Mirrors migration 112, which skips it when the
+        -- app role did not exist yet.
+        DROP POLICY IF EXISTS consumed_trial_emails_app_select ON consumed_trial_emails;
+        CREATE POLICY consumed_trial_emails_app_select ON consumed_trial_emails
+            FOR SELECT TO bridgeleads_app USING (true);
         GRANT USAGE ON SCHEMA public TO bridgeleads_purge;
         GRANT SELECT (id, is_active, deletion_state) ON users TO bridgeleads_purge;
         GRANT UPDATE (deletion_state) ON users TO bridgeleads_purge;

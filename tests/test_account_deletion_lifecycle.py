@@ -166,8 +166,11 @@ def test_no_one_but_the_functions_moves_the_lifecycle(conn) -> None:
                      {"u": uid}) == "BLD11"
     assert _sqlstate(conn, "UPDATE account_deletions SET status = 'completed' "
                            "WHERE user_id = :u", {"u": uid}) == "BLD11"
-    assert _sqlstate(conn, "UPDATE account_deletions SET purge_after = now() + "
-                           "interval '90 days' WHERE user_id = :u", {"u": uid}) == "BLD11"
+    for change in ("purge_after = now() + interval '90 days'",
+                   "requested_at = now() - interval '1 day'",
+                   "id = gen_random_uuid()"):
+        assert _sqlstate(conn, f"UPDATE account_deletions SET {change} WHERE user_id = :u",
+                         {"u": uid}) == "BLD11", change
     conn.execute(text("RESET ROLE"))
     # Ordinary writes to other users columns are untouched by the guard.
     conn.execute(text("UPDATE users SET timezone = 'UTC' WHERE id = :u"), {"u": uid})
@@ -181,6 +184,11 @@ def test_purge_role_and_functions_are_locked_down(conn) -> None:
     assert not any(role)
     assert conn.execute(text(
         "SELECT has_schema_privilege('bridgeleads_purge', 'public', 'CREATE')")).scalar() is False
+    # The ownership hand-over's temporary SET grant was taken back: no role can become
+    # or inherit the purge role (an ADMIN-only row from CREATE ROLE is inert).
+    assert conn.execute(text(
+        "SELECT count(*) FROM pg_auth_members WHERE roleid = 'bridgeleads_purge'::regrole "
+        "AND (set_option OR inherit_option)")).scalar() == 0
     for fn in ("request_account_deletion", "restore_account_deletion"):
         owner, definer, config, acl = conn.execute(text(
             "SELECT pg_get_userbyid(proowner), prosecdef, proconfig, proacl::text "
@@ -250,5 +258,25 @@ def test_runtime_roles_reach_the_lifecycle_only_through_the_functions(conn) -> N
     assert conn.execute(text("SELECT count(*) FROM account_deletions")).scalar() == 1
     _bind(conn, str(uuid.uuid4()))
     assert conn.execute(text("SELECT count(*) FROM account_deletions")).scalar() == 0
+    _bind(conn, uid)
+    assert conn.execute(text("SELECT restore_account_deletion()")).scalar() is not None
     conn.execute(text("RESET ROLE"))
-    assert _state(conn, uid) == "pending"
+    assert _state(conn, uid) is None
+
+
+def test_supabase_api_roles_get_nothing(conn) -> None:
+    """Supabase default privileges hand anon/authenticated/service_role ALL on new
+    tables and EXECUTE on new functions; 112 revokes them. Skips per absent role."""
+    present = [r for (r,) in conn.execute(text(
+        "SELECT rolname FROM pg_roles WHERE rolname IN "
+        "('anon', 'authenticated', 'service_role')")).all()]
+    if not present:
+        pytest.skip("no Supabase API roles on this cluster")
+    for role in present:
+        for tbl in ("account_deletions", "consumed_trial_emails"):
+            for priv in ("SELECT", "INSERT", "UPDATE", "DELETE"):
+                assert conn.execute(text("SELECT has_table_privilege(:r, :t, :p)"),
+                                    {"r": role, "t": tbl, "p": priv}).scalar() is False
+        for fn in ("request_account_deletion()", "restore_account_deletion()"):
+            assert conn.execute(text("SELECT has_function_privilege(:r, :f, 'EXECUTE')"),
+                                {"r": role, "f": fn}).scalar() is False

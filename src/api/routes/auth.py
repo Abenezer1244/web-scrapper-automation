@@ -811,10 +811,20 @@ async def create_api_key(
     await _reauthenticate(request, current_user, body.current_password)
     raw_key, key_hash = generate_api_key()
 
-    result = await db.execute(select(User).where(User.id == current_user.id))
-    user = result.scalar_one()
-    user.api_key_hash = key_hash
-    await db.flush()
+    # Conditional, not read-then-assign: an account deletion signs out everything and
+    # clears the key under the users row lock. A mint that started before it blocks on
+    # that lock and, under READ COMMITTED, re-checks this WHERE against the committed
+    # row, so it cannot write a fresh key into an account that is now pending deletion
+    # (API-key auth never consults revoked_at).
+    minted = await db.execute(
+        update(User)
+        .where(User.id == current_user.id, User.deletion_state.is_(None))
+        .values(api_key_hash=key_hash)
+    )
+    if minted.rowcount == 0:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "This account is scheduled for deletion."
+        )
 
     audit_log(request, "api_key_created", current_user.id)
     return ApiKeyResponse(api_key=raw_key)

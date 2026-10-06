@@ -270,3 +270,16 @@ async def test_restore_needs_the_second_factor_too(
     assert await _state(db, starter_user) == "pending"
     assert (await _restore(client, auth, mfa_code=pyotp.TOTP(secret).now())).status_code == 204
     assert await _state(db, starter_user) is None
+
+
+@pytest.mark.asyncio
+async def test_no_api_key_can_be_minted_into_a_pending_account(
+    client: AsyncClient, db: AsyncSession, business_user: User, deletion_on
+) -> None:
+    assert (await _delete(client, await _session(client, business_user), business_user)
+            ).status_code == 200
+    auth = await _session(client, business_user)
+    r = await client.post("/auth/api-key", json={"current_password": _PW}, headers=auth)
+    assert r.status_code == 409, r.text
+    assert (await db.execute(select(User.api_key_hash).where(User.id == business_user.id)
+                             .execution_options(populate_existing=True))).scalar_one() is None

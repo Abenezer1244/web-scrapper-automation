@@ -22,7 +22,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request,
 from fastapi.concurrency import run_in_threadpool
 from jwt.exceptions import InvalidTokenError as JWTError
 from pydantic import BaseModel
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -487,7 +487,8 @@ async def confirm_email_change(
 # operational events (job_created, ...) that are not security activity.
 SECURITY_EVENTS = (
     "login_success", "password_changed", "password_reset", "mfa_enabled",
-    "mfa_disabled", "mfa_breakglass_used", "api_key_created", "email_change_requested",
+    "mfa_disabled", "mfa_breakglass_used", "api_key_created", "api_key_revoked",
+    "email_change_requested",
     "email_changed", "session_revoked", "sessions_revoked_others", "logout_all",
 )
 
@@ -779,3 +780,27 @@ async def create_api_key(
 
     audit_log(request, "api_key_created", current_user.id)
     return ApiKeyResponse(api_key=raw_key)
+
+
+@router.delete("/api-key", status_code=status.HTTP_204_NO_CONTENT)
+async def revoke_api_key(
+    request: Request,
+    current_user: Annotated[User, Depends(require_session)],
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    """Revoke the account's API key on its own (without signing out everywhere).
+
+    Signed-in session only, like creating one: a leaked key must not be able to
+    act on itself. Takes effect on the next request, since the key is checked
+    against this hash every time. 404 when there is no key to revoke.
+    """
+    await rate_limit(request, zone="auth", identifier=f"api-key-revoke:{current_user.id}")
+    # Conditional + rowcount: two concurrent revokes cannot both report success.
+    cleared = await db.execute(
+        update(User)
+        .where(User.id == current_user.id, User.api_key_hash.is_not(None))
+        .values(api_key_hash=None)
+    )
+    if cleared.rowcount == 0:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "There is no API key to revoke.")
+    audit_log(request, "api_key_revoked", current_user.id)

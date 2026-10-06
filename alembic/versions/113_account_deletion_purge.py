@@ -181,7 +181,11 @@ BEGIN
         RETURN;
     END IF;
     IF v_row.status = 'pending' THEN
-        UPDATE public.users SET deletion_state = 'purging' WHERE id = v_uid;
+        -- is_active = false: every sign-in, refresh, password reset and API-key lookup
+        -- already requires is_active, so they all refuse (401) from here on instead of
+        -- tripping the fence on a user_sessions/password_history write (500).
+        UPDATE public.users SET deletion_state = 'purging', is_active = false
+         WHERE id = v_uid;
         UPDATE public.account_deletions
            SET status = 'purging', claim_token = v_token, claimed_until = v_now + p_lease,
                attempts = attempts + 1, next_attempt_at = NULL
@@ -392,18 +396,25 @@ BEGIN
          LIMIT p_batch);
     GET DIAGNOSTICS v_n = ROW_COUNT;
     v_more := v_more OR v_n = p_batch;
+    -- The rest is small or one-shot: the NOT-yet-scrubbed predicates keep every later
+    -- batch call from rewriting rows an earlier call already blanked.
+    -- ponytail: unbatched; pending rows are bounded by results, fine under the 2 min
+    -- statement_timeout at today's largest account. Batch like results if that changes.
     UPDATE public.pending_skip_trace_rows
        SET first_name = NULL, last_name = NULL, mail_address = NULL, mail_city = NULL,
            mail_state = NULL, mail_zip = NULL
-     WHERE user_id = v_uid;
+     WHERE user_id = v_uid
+       AND (first_name IS NOT NULL OR last_name IS NOT NULL OR mail_address IS NOT NULL
+         OR mail_city IS NOT NULL OR mail_state IS NOT NULL OR mail_zip IS NOT NULL);
     UPDATE public.skip_trace_queues SET download_url = NULL, error_message = NULL
-     WHERE user_id = v_uid;
-    UPDATE public.jobs SET export_key = NULL, error_message = NULL WHERE user_id = v_uid;
+     WHERE user_id = v_uid AND (download_url IS NOT NULL OR error_message IS NOT NULL);
+    UPDATE public.jobs SET export_key = NULL, error_message = NULL
+     WHERE user_id = v_uid AND (export_key IS NOT NULL OR error_message IS NOT NULL);
     UPDATE public.scraper_configs
        SET name = 'deleted', fields = '[]'::json, enrichment = '[]'::json,
            schedule = '{}'::json, deliver = '{}'::json, doc_types = NULL,
            include_living_owner_tod = NULL, active = false
-     WHERE user_id = v_uid;
+     WHERE user_id = v_uid;  -- a handful of rows per account: rewritten each call
     UPDATE public.scraper_batches
        SET name = 'deleted', fields = '[]'::json, enrichment = '[]'::json,
            schedule = '{}'::json, deliver = '{}'::json, delivery_mode = 'everything',
@@ -489,6 +500,13 @@ def upgrade() -> None:
     fns = ", ".join(f"public.{f}" for f in _WORKER_FUNCTIONS)
     revokes = [f"REVOKE ALL ON FUNCTION {fns} FROM PUBLIC;"]
     revokes += [_guarded(r, f"REVOKE ALL ON FUNCTION {fns} FROM {r};") for r in _API_ROLES]
+    fence_fns = ("public.account_deletion_fence(), "
+                 "public.account_deletion_fence_job_logs()")
+    fence_revokes = [f"REVOKE ALL ON FUNCTION {fence_fns} FROM PUBLIC;"]
+    fence_revokes += [
+        _guarded(r, f"REVOKE ALL ON FUNCTION {fence_fns} FROM {r};")
+        for r in (*_API_ROLES, "bridgeleads_system")
+    ]
     alters = "\n".join(
         f"ALTER FUNCTION public.{f} OWNER TO bridgeleads_purge;" for f in _WORKER_FUNCTIONS
     )
@@ -501,8 +519,12 @@ def upgrade() -> None:
         BEGIN
             {nl.join(grants)}
             GRANT SELECT (email_hmac, trial_consumed_at) ON public.users TO bridgeleads_purge;
+            GRANT UPDATE (is_active) ON public.users TO bridgeleads_purge;
             GRANT UPDATE (expires_at) ON public.consumed_trial_emails TO bridgeleads_purge;
             {nl.join(revokes)}
+            -- Trigger functions cannot be called directly, but Supabase's default
+            -- privileges still grant EXECUTE on them: take it back like everything else.
+            {nl.join(fence_revokes)}
             {_guarded("bridgeleads_system", f"GRANT EXECUTE ON FUNCTION {fns} TO bridgeleads_system;")}
 
             -- Same temporary hand-over as 112: SET on the purge role + CREATE on public,
@@ -570,6 +592,7 @@ def downgrade() -> None:
         BEGIN
             {nl.join(revokes)}
             REVOKE SELECT (email_hmac, trial_consumed_at) ON public.users FROM bridgeleads_purge;
+            REVOKE UPDATE (is_active) ON public.users FROM bridgeleads_purge;
             REVOKE UPDATE (expires_at) ON public.consumed_trial_emails FROM bridgeleads_purge;
         END
         $purge_revoke$;

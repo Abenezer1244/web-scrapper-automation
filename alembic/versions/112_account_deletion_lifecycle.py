@@ -231,7 +231,9 @@ def upgrade() -> None:
 
     # ── 4. Lifecycle functions (SECURITY DEFINER; owner set to bridgeleads_purge below).
     #       Lock order everywhere: users row, then the account_deletions row. FOR NO KEY
-    #       UPDATE (not FOR UPDATE) so request/restore never wait on ordinary writers. ──
+    #       UPDATE (not FOR UPDATE): it does not conflict with the FOR KEY SHARE lock that
+    #       every child-table insert takes on the user row, so request/restore never wait
+    #       on those (they still queue behind other UPDATEs of the same users row). ──
     op.execute(
         """
         CREATE FUNCTION public.request_account_deletion()

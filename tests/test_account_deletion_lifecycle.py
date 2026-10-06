@@ -78,9 +78,10 @@ def _rows(conn, uid: str):
 def _to_purging(conn, uid: str) -> None:
     """What the P3 claim function will do, done here as the purge role."""
     conn.execute(text("SET LOCAL ROLE bridgeleads_purge"))
+    # The plan's lock order: users row first, then the account_deletions row.
+    conn.execute(text("UPDATE users SET deletion_state = 'purging' WHERE id = :u"), {"u": uid})
     conn.execute(text("UPDATE account_deletions SET status = 'purging' "
                       "WHERE user_id = :u AND status = 'pending'"), {"u": uid})
-    conn.execute(text("UPDATE users SET deletion_state = 'purging' WHERE id = :u"), {"u": uid})
     conn.execute(text("RESET ROLE"))
 
 
@@ -239,6 +240,10 @@ def test_runtime_roles_reach_the_lifecycle_only_through_the_functions(conn) -> N
             assert conn.execute(text(
                 "SELECT pg_has_role(:r, 'bridgeleads_purge', :p)"),
                 {"r": role, "p": priv}).scalar() is False, (role, priv)
+        # users CASCADEs into account_deletions: deleting a user would be a second,
+        # unguarded way to erase a deletion's record. Neither role may do it.
+        assert conn.execute(text("SELECT has_table_privilege(:r, 'users', 'DELETE')"),
+                            {"r": role}).scalar() is False, role
 
     conn.execute(text("SET LOCAL ROLE bridgeleads_system"))
     assert _sqlstate(conn, "SELECT * FROM request_account_deletion()") == "42501"
@@ -248,6 +253,8 @@ def test_runtime_roles_reach_the_lifecycle_only_through_the_functions(conn) -> N
     conn.execute(text("RESET ROLE"))
 
     conn.execute(text("SET LOCAL ROLE bridgeleads_app"))
+    _bind(conn, uid)
+    assert conn.execute(text("SELECT count(*) FROM users WHERE id = :u"), {"u": uid}).scalar() == 1
     assert _sqlstate(conn, "INSERT INTO account_deletions (user_id, purge_after) "
                            "VALUES (:u, now())", {"u": uid}) == "42501"
     assert _sqlstate(conn, "UPDATE users SET deletion_state = 'pending' WHERE id = :u",

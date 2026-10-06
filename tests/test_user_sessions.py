@@ -188,3 +188,17 @@ async def test_security_events_are_own_allowlisted_and_carry_no_forensics(
     assert all(set(e) == {"event", "created_at"} for e in mine), "ip/path/detail leaked"
     theirs = (await client.get("/auth/security-events", headers=_auth(b))).json()
     assert {e["event"] for e in theirs} == {"login_success"}, "saw another account's events"
+
+
+@pytest.mark.asyncio
+async def test_an_evicted_redis_marker_does_not_revive_a_signed_out_device(
+    client: AsyncClient, db: AsyncSession, starter_user: User
+) -> None:
+    """Revoked in the DB only (as if Redis evicted the family marker): the access
+    token must stop working at once, not when it expires."""
+    tokens = await _login(client, starter_user)
+    assert (await client.get("/auth/me", headers=_auth(tokens))).status_code == 200
+    await db.execute(update(UserSession).where(UserSession.user_id == starter_user.id)
+                     .values(revoked_at=datetime.now(UTC)))
+    await db.commit()
+    assert (await client.get("/auth/me", headers=_auth(tokens))).status_code == 401

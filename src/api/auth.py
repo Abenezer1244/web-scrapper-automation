@@ -12,7 +12,7 @@ import jwt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jwt.exceptions import InvalidTokenError as JWTError
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.middleware.auth_hardening import TokenBlacklist
@@ -397,6 +397,32 @@ async def get_auth_context(
     user = result.scalar_one_or_none()
     if user is None:
         raise _CREDENTIALS_EXCEPTION
+
+    # Durable per-session revoke. The Redis family marker above is the fast path,
+    # but Redis may evict it (maxmemory policy), which would let a device signed
+    # out from Settings keep using its access token for up to an hour. The
+    # session row is authoritative. One indexed lookup on a query this request
+    # already pays for. The tenant GUC is bound first: under RLS the row is
+    # invisible without it, which would silently read as "not revoked".
+    # Every session minted since migration 111 has a row (written before its
+    # tokens), and pre-111 ones were adopted at refresh, so a MISSING row is an
+    # anomaly and is refused, not read as "not revoked" (Codex).
+    if "fam" in payload:
+        from src.db.models import UserSession
+
+        fam = payload["fam"]
+        if not isinstance(fam, str) or not fam:
+            raise _CREDENTIALS_EXCEPTION
+        await db.execute(
+            text("SELECT set_config('app.current_user_id', :uid, true)"), {"uid": str(user.id)}
+        )
+        row = (await db.execute(
+            select(UserSession.revoked_at).where(
+                UserSession.id == fam, UserSession.user_id == user.id
+            )
+        )).first()
+        if row is None or row.revoked_at is not None:
+            raise _CREDENTIALS_EXCEPTION
 
     return AuthContext(
         user=user,

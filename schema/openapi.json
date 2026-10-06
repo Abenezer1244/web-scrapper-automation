@@ -6172,6 +6172,24 @@
       }
     },
     "/auth/api-key": {
+      "delete": {
+        "description": "Revoke the account's API key on its own (without signing out everywhere).\n\nSigned-in session only, like creating one: a leaked key must not be able to\nact on itself. Takes effect on the next request, since the key is checked\nagainst this hash every time. 404 when there is no key to revoke.",
+        "operationId": "revoke_api_key_auth_api_key_delete",
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Revoke Api Key",
+        "tags": [
+          "auth"
+        ]
+      },
       "post": {
         "description": "Generate a new API key. The raw key is shown exactly once.\n\nA key never expires, so minting one needs the password and a signed-in\nsession (audit 2026-09-25, A-2): a stolen one-hour token, or a leaked key,\nmust not be able to turn itself into a permanent credential.",
         "operationId": "create_api_key_auth_api_key_post",

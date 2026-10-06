@@ -242,5 +242,11 @@ def quota_block_reason(user, now: datetime | None = None) -> str | None:
     A thin reading of ``run_eligibility`` for the enqueue gates, which only
     need the caller-facing sentence.
     """
+    # Account deletion: nothing new starts during the grace period (schedules were
+    # paused when it was requested; this is the belt for anything already queued for
+    # the dispatcher). API routes never get here for such an account: the auth gate
+    # refuses them first.
+    if getattr(user, "deletion_state", None) is not None:
+        return "This account is scheduled for deletion."
     eligibility = run_eligibility(user, now)
     return None if eligibility.can_run else eligibility.message

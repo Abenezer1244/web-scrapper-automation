@@ -168,9 +168,11 @@ async def test_a_repeat_request_changes_nothing(
     first = await _delete(client, await _session(client, starter_user), starter_user)
     assert first.status_code == 200
     new_session = await _session(client, starter_user)
+    # A pending account is gated (P2b): the repeat never reaches the function, whose
+    # own idempotency is covered in test_account_deletion_lifecycle.py.
     again = await _delete(client, new_session, starter_user)
-    assert again.status_code == 200
-    assert again.json()["purge_after"] == first.json()["purge_after"]
+    assert again.status_code == 403
+    assert await _state(db, starter_user) == "pending"
     assert await _events(db, starter_user, "account_deletion_requested") == 1
     # Nothing was re-run: the session opened after the first request still works.
     assert (await client.get("/auth/me", headers=new_session)).status_code == 200
@@ -279,7 +281,9 @@ async def test_no_api_key_can_be_minted_into_a_pending_account(
     assert (await _delete(client, await _session(client, business_user), business_user)
             ).status_code == 200
     auth = await _session(client, business_user)
+    # The gate answers first now (403); the conditional mint stays as the belt for a
+    # mint that was already past the gate when the deletion committed.
     r = await client.post("/auth/api-key", json={"current_password": _PW}, headers=auth)
-    assert r.status_code == 409, r.text
+    assert r.status_code == 403, r.text
     assert (await db.execute(select(User.api_key_hash).where(User.id == business_user.id)
                              .execution_options(populate_existing=True))).scalar_one() is None

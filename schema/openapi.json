@@ -6004,6 +6004,29 @@
             "title": "Created At",
             "type": "string"
           },
+          "deletion_purge_after": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Deletion Purge After"
+          },
+          "deletion_state": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Deletion State"
+          },
           "email": {
             "title": "Email",
             "type": "string"

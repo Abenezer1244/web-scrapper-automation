@@ -22,7 +22,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request,
 from fastapi.concurrency import run_in_threadpool
 from jwt.exceptions import InvalidTokenError as JWTError
 from pydantic import BaseModel
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -258,7 +258,17 @@ async def _user_response(db: AsyncSession, user: User) -> UserResponse:
             )
         )
     ).scalar_one_or_none()
-    return UserResponse.model_validate(user).model_copy(update={"avatar_version": version})
+    extra: dict = {"avatar_version": version}
+    if user.deletion_state is not None:
+        # Own row only: the GUC policy on account_deletions plus this user_id filter.
+        extra["deletion_purge_after"] = (
+            await db.execute(
+                text("SELECT purge_after FROM account_deletions WHERE user_id = :u "
+                     "AND status IN ('pending', 'purging')"),
+                {"u": str(user.id)},
+            )
+        ).scalar_one_or_none()
+    return UserResponse.model_validate(user).model_copy(update=extra)
 
 
 @router.get("/me", response_model=UserResponse)

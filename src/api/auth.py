@@ -9,7 +9,7 @@ from typing import Annotated
 
 import bcrypt
 import jwt
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jwt.exceptions import InvalidTokenError as JWTError
 from sqlalchemy import select, text
@@ -289,9 +289,33 @@ class AuthContext:
     payload: dict | None
 
 
+# What an account pending deletion may still do once signed in again: see that it is
+# pending (and until when), and undo it. POST /auth/logout and /auth/refresh never pass
+# through get_auth_context, so signing in and out keeps working too.
+_PENDING_DELETION_ALLOWED = frozenset({
+    ("GET", "/auth/me"),
+    ("POST", "/auth/account/restore"),
+})
+
+
+def _refuse_if_pending_deletion(user: User, request: Request | None) -> None:
+    """403 for every request from an account in any deletion state, except the allowlist.
+    Fail closed: a caller that hands in no Request (the direct internal callers) is
+    refused."""
+    if user.deletion_state is None:
+        return
+    if request is not None and (request.method, request.url.path) in _PENDING_DELETION_ALLOWED:
+        return
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="This account is scheduled for deletion. Restore it to continue.",
+    )
+
+
 async def get_auth_context(
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer)],
     db: Annotated[AsyncSession, Depends(get_db)],
+    request: Request = None,
 ) -> AuthContext:
     """FastAPI dependency: resolve + validate the caller into an AuthContext.
 
@@ -339,6 +363,7 @@ async def get_auth_context(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="API access requires a Business or Agency plan.",
             )
+        _refuse_if_pending_deletion(user_match, request)
         return AuthContext(
             user=user_match,
             auth_method="api_key",
@@ -424,6 +449,7 @@ async def get_auth_context(
         if row is None or row.revoked_at is not None:
             raise _CREDENTIALS_EXCEPTION
 
+    _refuse_if_pending_deletion(user, request)
     return AuthContext(
         user=user,
         auth_method="jwt",

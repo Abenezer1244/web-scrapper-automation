@@ -1,5 +1,6 @@
-"""Account deletion beat, P3b-1: Stripe cancel/un-cancel, the scheduled notice, overdue
-alerts, and the skip-trace gate for accounts being deleted.
+"""Account deletion beat (P3b): Stripe cancel/un-cancel, the scheduled notice, alerts,
+the skip-trace gate, and the purge driver end to end (R2, data, tombstone, completion,
+Stripe Customer).
 
 Real database: the task opens its own sessions, so every test commits its rows and
 deletes its users afterwards (users CASCADE to their deletion rows). Stripe and Resend
@@ -24,10 +25,19 @@ from src.workers.skip_trace_claim import ACCESS_ENDED, paid_lookup_access, read_
 
 
 class FakeStripe:
-    def __init__(self, subs: dict[str, tuple[str, bool]] | None = None, fail: bool = False):
+    def __init__(self, subs: dict[str, tuple[str, bool]] | None = None, fail: bool = False,
+                 customers: dict[str, str] | None = None):
         self.subs = dict(subs or {})
         self.fail = fail
+        self.customers = dict(customers or {})  # id -> 'open' | 'closable'
         self.calls: list[tuple] = []
+
+    def customer_state(self, customer_id):
+        return self.customers.get(customer_id, "missing")
+
+    def delete_customer(self, customer_id, key):
+        self.calls.append(("delete_customer", customer_id, key))
+        self.customers.pop(customer_id, None)
 
     def status(self, subscription_id):
         if self.fail:
@@ -87,9 +97,27 @@ def _row(did: str):
                          {"d": did}).one()
 
 
-def _run(stripe=None, send=None):
+class FakeR2:
+    """In-memory bucket. Lists at most 2 keys per call, so the sweep's paging is real."""
+
+    def __init__(self, keys=(), fail=()):
+        self.keys = set(keys)
+        self.fail = set(fail)
+
+    def list(self, prefix):
+        return sorted(k for k in self.keys if k.startswith(prefix))[:2]
+
+    def delete(self, key):
+        if key in self.fail:
+            return False
+        self.keys.discard(key)
+        return True
+
+
+def _run(stripe=None, send=None, r2=None, send_final=None):
     return beat._drive_account_deletions_impl(
-        stripe_api=stripe or FakeStripe(), send=send or (lambda to, when: None))
+        stripe_api=stripe or FakeStripe(), send=send or (lambda to, when: None),
+        r2=r2 or FakeR2(), send_final=send_final or (lambda to: None))
 
 
 # ── Stripe ───────────────────────────────────────────────────────────────────────
@@ -196,8 +224,9 @@ def test_no_notice_before_billing_is_confirmed_stopped(made, resend_on) -> None:
 # ── Alerts, single run ───────────────────────────────────────────────────────────
 
 def test_a_deletion_overdue_by_ten_days_alerts_ops(made) -> None:
-    _, did, _ = _account(made, overdue=True)
-    assert _run()["overdue_alerts"] >= 1
+    sub = f"sub_{uuid.uuid4().hex[:12]}"
+    _, did, _ = _account(made, sub=sub, overdue=True)
+    assert _run(FakeStripe(fail=True))["overdue_alerts"] >= 1  # billing never confirmed
     with sync_engine.connect() as c:
         assert c.execute(text(
             "SELECT count(*) FROM audit_events WHERE event = 'ops_alert' "
@@ -222,3 +251,203 @@ def test_an_account_being_deleted_buys_no_lookups(made) -> None:
         row = read_access_rows(c, [uid], lock="")[uid]
     assert row.deletion_state == "pending"
     assert paid_lookup_access(row, datetime.now(UTC) + timedelta(seconds=1)) == ACCESS_ENDED
+
+
+# ── The purge driver (P3b-2) ─────────────────────────────────────────────────────
+
+def _as_purge(sql: str, params: dict) -> None:
+    with sync_engine.begin() as c:
+        c.execute(text("SET LOCAL ROLE bridgeleads_purge"))
+        c.execute(text(sql), params)
+
+
+def _seeded(made, **kw):
+    """A due account holding a row in every matrix table, plus its R2 objects."""
+    from tests.test_account_deletion_purge import _seed
+
+    uid, did, email = _account(made, overdue=True, **kw)
+    with sync_engine.begin() as c:
+        ids = _seed(c, uid)
+        c.execute(text("UPDATE jobs SET export_key = :k WHERE id = :j"),
+                  {"k": f"exports/{uid}/{ids['job']}/leads.csv", "j": ids["job"]})
+        pend = c.execute(text(
+            "SELECT user_id, property_address, city, state, trace_type, first_name, "
+            "last_name FROM pending_skip_trace_rows WHERE user_id = :u"), {"u": uid}).one()
+        from src.scrapers.enrichment.skip_trace import pending_row_subject_key
+        ids["cachekey"] = pending_row_subject_key(pend)
+        c.execute(text("INSERT INTO skip_trace_cache (address_hash, phone) VALUES (:k, '555')"),
+                  {"k": ids["cachekey"]})
+    r2 = FakeR2({f"exports/{uid}/{ids['job']}/leads.csv", f"exports/{uid}/batch/x/combined.csv",
+                 f"exports/{uid}/a.csv", "exports/someone-else/keep.csv"})
+    return uid, did, email, ids, r2
+
+
+def _user_row(uid: str):
+    with sync_engine.connect() as c:
+        return c.execute(text("SELECT * FROM users WHERE id = :u"), {"u": uid}).one()
+
+
+def _cleanup_cache(ids) -> None:
+    with sync_engine.begin() as c:
+        c.execute(text("DELETE FROM skip_trace_cache WHERE address_hash IN (:a, :b)"),
+                  {"a": ids["subject"], "b": ids["cachekey"]})
+
+
+def _due_now(did: str) -> None:
+    _as_purge("UPDATE account_deletions SET next_attempt_at = now() - interval '1 second', "
+              "claimed_until = LEAST(claimed_until, now() - interval '1 second') "
+              "WHERE id = :d", {"d": did})
+
+
+def _a_day_later(did: str) -> None:
+    _as_purge("UPDATE account_deletions SET r2_first_sweep_at = r2_first_sweep_at "
+              "- interval '25 hours', next_attempt_at = now() - interval '1 second' "
+              "WHERE id = :d", {"d": did})
+
+
+def test_the_whole_deletion_from_claim_to_completion(made) -> None:
+    from src.utils.crypto import decrypt_field
+
+    uid, did, email, ids, r2 = _seeded(made)
+    try:
+        finals: list = []
+        result = _run(r2=r2, send_final=finals.append)
+        assert result["purges"] == {"tombstoned": 1}
+        # R2: the account's prefix and recorded keys gone, other tenants untouched.
+        assert r2.keys == {"exports/someone-else/keep.csv"}
+        # The final email went to the ORIGINAL address, before the tombstone.
+        assert finals == [email]
+        user = _user_row(uid)
+        placeholder = f"deleted+{uid}@invalid"
+        assert decrypt_field(user.email) == placeholder
+        assert user.email_hmac == blind_index(placeholder)
+        assert (user.is_active, user.deletion_state, user.first_name) == (False, "purging", None)
+        with sync_engine.connect() as c:
+            # The original address is free to register again.
+            assert c.execute(text("SELECT count(*) FROM users WHERE email_hmac = :h"),
+                             {"h": blind_index(email)}).scalar() == 0
+            assert c.execute(text("SELECT count(*) FROM results WHERE user_id = :u "
+                                  "AND party_name IS NOT NULL"), {"u": uid}).scalar() == 0
+            assert c.execute(text("SELECT count(*) FROM skip_trace_cache "
+                                  "WHERE address_hash = :k"), {"k": ids["cachekey"]}).scalar() == 0
+        row = _row(did)
+        assert row.status == "purging" and row.tombstoned_at is not None
+        assert _run(r2=r2)["purges"] == {}  # parked: nothing before 24 h
+
+        # 24 h later (moved by hand): the second pass completes, and with no Stripe
+        # customer the billing side is done too.
+        _a_day_later(did)
+        result = _run(r2=r2)
+        assert result["purges"] == {"completed": 1} and result["customers_deleted"] == 1
+        row = _row(did)
+        assert (row.status, row.stripe_state) == ("completed", "customer_deleted")
+        assert _user_row(uid).deletion_state == "deleted"
+    finally:
+        _cleanup_cache(ids)
+
+
+def test_work_in_flight_defers_the_purge_until_day_40(made) -> None:
+    from tests.test_account_deletion_purge import _seed
+
+    uid, did, _ = _account(made, stripe_state="not_applicable")
+    with sync_engine.begin() as c:
+        ids = _seed(c, uid)
+        c.execute(text("UPDATE jobs SET status = 'running' WHERE id = :j"), {"j": ids["job"]})
+        # purge_after is immutable: replace the row with one that fell due yesterday.
+        c.execute(text("SET LOCAL ROLE bridgeleads_purge"))
+        c.execute(text("UPDATE account_deletions SET status = 'restored' WHERE id = :d"),
+                  {"d": did})
+        did = str(c.execute(text(
+            "INSERT INTO account_deletions (user_id, status, purge_after, stripe_state) "
+            "VALUES (:u, 'pending', now() - interval '1 day', 'not_applicable') "
+            "RETURNING id"), {"u": uid}).scalar())
+    try:
+        assert _run()["purges"] == {}
+        row = _row(did)
+        assert (row.status, row.last_error) == ("pending", "waiting for in-flight work")
+        assert row.next_attempt_at > datetime.now(UTC)
+        with sync_engine.begin() as c:
+            c.execute(text("UPDATE jobs SET status = 'done' WHERE id = :j"), {"j": ids["job"]})
+            c.execute(text("UPDATE batch_runs SET status = 'completed' WHERE user_id = :u"),
+                      {"u": uid})
+        _due_now(did)
+        assert _run()["purges"] == {"tombstoned": 1}
+    finally:
+        _cleanup_cache(ids)
+
+    # Past day 40 the CCPA deadline wins: purged under the write fence anyway.
+    uid2, did2, _, ids2, r2 = _seeded(made)
+    try:
+        with sync_engine.begin() as c:
+            c.execute(text("UPDATE jobs SET status = 'running' WHERE id = :j"), {"j": ids2["job"]})
+        assert _run(r2=r2)["purges"] == {"tombstoned": 1}
+    finally:
+        _cleanup_cache(ids2)
+
+
+def test_an_r2_failure_fails_closed_and_retries(made) -> None:
+    uid, did, _, ids, r2 = _seeded(made)
+    try:
+        r2.fail = {f"exports/{uid}/a.csv"}
+        assert _run(r2=r2)["purges"] == {"error": 1}
+        row = _row(did)
+        assert row.status == "purging" and row.r2_first_sweep_at is None
+        assert "RuntimeError" in row.last_error
+        r2.fail = set()
+        _due_now(did)
+        assert _run(r2=r2)["purges"] == {"tombstoned": 1}
+    finally:
+        _cleanup_cache(ids)
+
+
+def test_a_crash_after_the_data_purge_resumes_at_the_email(made) -> None:
+    uid, did, email, ids, r2 = _seeded(made)
+    try:
+        def broken(to):
+            raise ConnectionError("resend down")
+
+        assert _run(r2=r2, send_final=broken)["purges"] == {"error": 1}
+        row = _row(did)
+        assert row.db_purged_at is not None and row.final_email_sent_at is None
+        assert _user_row(uid).email_hmac == blind_index(email)  # not tombstoned yet
+        _due_now(did)
+        finals: list = []
+        assert _run(r2=r2, send_final=finals.append)["purges"] == {"tombstoned": 1}
+        assert finals == [email]
+    finally:
+        _cleanup_cache(ids)
+
+
+def test_out_of_time_pauses_and_the_next_claim_resumes(made, monkeypatch) -> None:
+    uid, did, _, ids, r2 = _seeded(made)
+    try:
+        monkeypatch.setattr(beat, "_LEASE_MARGIN", beat._LEASE_SECONDS)  # no time left
+        assert _run(r2=r2)["purges"] == {"paused": 1}
+        assert _row(did).r2_first_sweep_at is None
+        monkeypatch.setattr(beat, "_LEASE_MARGIN", 120)
+        _due_now(did)  # the lease ran out
+        assert _run(r2=r2)["purges"] == {"tombstoned": 1}
+    finally:
+        _cleanup_cache(ids)
+
+
+def test_the_stripe_customer_goes_only_once_nothing_is_open(made) -> None:
+    cus = f"cus_{uuid.uuid4().hex[:12]}"
+    uid, did, _, ids, r2 = _seeded(made)
+    try:
+        with sync_engine.begin() as c:
+            c.execute(text("UPDATE users SET stripe_customer_id = :c WHERE id = :u"),
+                      {"c": cus, "u": uid})
+        stripe = FakeStripe(customers={cus: "open"})
+        _run(stripe, r2=r2)
+        _a_day_later(did)
+        result = _run(stripe, r2=r2)
+        assert result["purges"] == {"completed": 1} and result["customers_deleted"] == 0
+        assert _row(did).stripe_state == "not_applicable" and stripe.calls == []
+        stripe.customers[cus] = "closable"
+        _due_now(did)
+        assert _run(stripe, r2=r2)["customers_deleted"] == 1
+        assert stripe.calls == [("delete_customer", cus, f"acctdel-{did}-customer")]
+        assert _row(did).stripe_state == "customer_deleted"
+    finally:
+        _cleanup_cache(ids)

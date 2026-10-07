@@ -330,6 +330,24 @@ class DataExporter:
         )
         return False
 
+    def list_r2_keys(self, prefix: str) -> list[str]:
+        """Up to 1000 object keys under `prefix` (one page of the Cloudflare R2 API, the
+        same API delete_from_r2 uses; production's S3 keys cannot list). RAISES on any
+        failure: an account deletion's sweep must read "could not list" as not swept,
+        never as empty. Callers page by deleting what they got and listing again
+        until the page is empty."""
+        if not prefix or ".." in prefix or prefix.startswith("/") or not prefix.endswith("/"):
+            raise ValueError(f"Invalid prefix: {prefix}")
+        resp = _requests.get(
+            f"{_r2_api_base()}/objects", headers=_r2_headers(),
+            params={"prefix": prefix, "per_page": 1000}, timeout=60,
+        )
+        resp.raise_for_status()
+        body = resp.json()
+        if not body.get("success") or not isinstance(body.get("result"), list):
+            raise RuntimeError(f"R2 list failed for {prefix}: {body.get('errors')}")
+        return [obj["key"] for obj in body["result"]]
+
     def get_download_url(self, object_key: str, expires_in: int = 3600) -> str:
         """Generate a temporary download URL for an R2 object.
 

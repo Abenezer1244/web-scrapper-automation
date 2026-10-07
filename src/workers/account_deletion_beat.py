@@ -11,10 +11,18 @@ then its outcome recorded, so a crash in between is re-driven on a later tick.
   Email       pending rows get the "scheduled for deletion" notice once billing is
               confirmed stopped (at-least-once:
               a crash after the send and before the record sends it again)
+  Purge       a due deletion whose billing is stopped and whose account has no work in
+              flight (until day 40) is claimed, then: R2 sweep 1 (recorded export keys +
+              everything under exports/{user_id}/, listed until empty) -> data purge in
+              batches -> final email to the original address -> users row tombstoned.
+              The row is parked 24 h; on the reclaim: data purge again (catches an UPDATE
+              in flight at the claim) -> R2 sweep 2 (fail closed) -> completed.
+              Each claim stops before its lease (or the tick budget) runs out and the
+              next tick resumes from the markers; a failure backs off and retries.
+  Customer    after completion, the Stripe Customer is deleted once no subscription is
+              live and no invoice is draft/open (never redacted, design 4.4)
   Alerts      ops hear about a deletion still not purging 10 days after its deadline
-              (the CCPA limit is 45 days from the request)
-
-The purge itself (claim, R2, data, tombstone, completion) is P3b-2.
+              (the CCPA limit is 45 days from the request), and one stuck in retries
 """
 
 from __future__ import annotations
@@ -60,6 +68,47 @@ class StripeSubscriptions:
         stripe.api_key = settings.STRIPE_SECRET_KEY
         stripe.Subscription.modify(subscription_id, cancel_at_period_end=value,
                                    idempotency_key=key)
+
+    def customer_state(self, customer_id: str) -> str:
+        """'missing' (already gone), 'open' (a live subscription, or an invoice still
+        draft/open: deleting now would cancel or orphan it) or 'closable'."""
+        import stripe
+
+        stripe.api_key = settings.STRIPE_SECRET_KEY
+        try:
+            subs = stripe.Subscription.list(customer=customer_id, status="all", limit=100)
+            if any(s["status"] not in _ENDED for s in subs.auto_paging_iter()):
+                return "open"
+            for status in ("draft", "open"):
+                if stripe.Invoice.list(customer=customer_id, status=status, limit=1)["data"]:
+                    return "open"
+        except stripe.error.InvalidRequestError as exc:
+            if getattr(exc, "code", None) == "resource_missing":
+                return "missing"
+            raise
+        return "closable"
+
+    def delete_customer(self, customer_id: str, key: str) -> None:
+        import stripe
+
+        stripe.api_key = settings.STRIPE_SECRET_KEY
+        try:
+            stripe.Customer.delete(customer_id, idempotency_key=key)
+        except stripe.error.InvalidRequestError as exc:
+            if getattr(exc, "code", None) != "resource_missing":
+                raise
+
+
+class R2Store:
+    """The account's export files in R2. Tests pass an in-memory stand-in."""
+
+    def list(self, prefix: str) -> list[str]:
+        from src.utils.data_exporter import DataExporter
+        return DataExporter().list_r2_keys(prefix)
+
+    def delete(self, key: str) -> bool:
+        from src.utils.data_exporter import DataExporter
+        return DataExporter().delete_from_r2(key)
 
 
 def _scheduled_notice(purge_after: datetime) -> tuple:
@@ -179,8 +228,258 @@ def _alert_overdue(db) -> int:
     return len(rows)
 
 
+# ── The purge (P3b-2) ────────────────────────────────────────────────────────────
+
+_LEASE_SECONDS = 900
+_LEASE_MARGIN = 120        # never start a phase this close to the end of the lease
+_TICK_BUDGET = 180         # seconds of purge work per tick (task soft limit is 240)
+_PURGE_BATCH = 5000
+_MAX_CLAIMS = 5
+_STUCK_ATTEMPTS = 6
+# Work that would still write the account's rows: the purge waits for it (until day 40,
+# then proceeds under the write fence; the CCPA limit is 45 days).
+_IN_FLIGHT = """
+    EXISTS (SELECT 1 FROM jobs j WHERE j.user_id = d.user_id
+               AND j.status NOT IN ('done', 'failed', 'cancelled'))
+ OR EXISTS (SELECT 1 FROM batch_runs b WHERE b.user_id = d.user_id
+               AND b.status IN ('pending', 'running'))
+ OR EXISTS (SELECT 1 FROM pending_skip_trace_rows p WHERE p.user_id = d.user_id
+               AND p.status IN ('submitting', 'submitted'))
+ OR EXISTS (SELECT 1 FROM skip_trace_queues q WHERE q.user_id = d.user_id
+               AND q.status = 'pending')
+"""
+
+
+class _OutOfTimeError(Exception):
+    """The lease or the tick budget is nearly spent: stop; the next tick resumes."""
+
+
+def _defer_in_flight(db) -> int:
+    ids = db.execute(text(
+        "SELECT d.id FROM account_deletions d "  # noqa: S608 - fixed literals
+        " WHERE d.status = 'pending' AND d.purge_after <= now() "
+        "   AND d.purge_after + interval '10 days' > now() "
+        "   AND d.stripe_state IN ('cancel_set', 'not_applicable') "
+        "   AND (d.next_attempt_at IS NULL OR d.next_attempt_at <= now()) "
+        f"  AND ({_IN_FLIGHT}) ORDER BY d.purge_after LIMIT :n"), {"n": _BATCH}).scalars().all()
+    db.rollback()
+    for did in ids:
+        _record(db, did, "error", error="waiting for in-flight work")
+    return len(ids)
+
+
+def _sweep_r2(r2: R2Store, uid: str, keys: list[str]) -> None:
+    """Delete the given keys and everything under exports/{uid}/, then require the
+    prefix to list empty. Raises (= not swept) on any failure: fail closed."""
+    for key in keys:
+        if not r2.delete(key):
+            raise RuntimeError("R2 delete failed")
+    prefix = f"exports/{uid}/"
+    for _ in range(1000):
+        page = r2.list(prefix)
+        if not page:
+            return
+        for key in page:
+            if not r2.delete(key):
+                raise RuntimeError("R2 delete failed")
+    raise RuntimeError("R2 prefix did not empty")
+
+
+def _final_notice() -> tuple:
+    return (
+        "Your BridgeLeads account has been deleted",
+        "Your account and its data have been deleted.",
+        ["Your BridgeLeads account has been deleted, as you asked. Its leads, schedules, "
+         "settings and stored exports are gone, and you will not be charged again.",
+         "We keep billing records for 7 years, as the law requires. Files you downloaded "
+         "earlier are not affected.",
+         "This address can be used to create a new account at any time."],
+        None,
+    )
+
+
+def _send_final_notice(to: str) -> None:
+    from src.workers.account_emails import _send
+
+    subject, preheader, lines, cta = _final_notice()
+    _send(to, subject, preheader, lines, cta=cta)
+
+
+def _tombstone(db, uid: str) -> None:
+    """The users row keeps only what billing needs (matrix §2); the placeholder email
+    recomputes email_hmac (ORM validator), freeing the address."""
+    import secrets
+
+    from src.api.auth import hash_password
+    from src.db.models import User
+
+    user = db.get(User, uid)
+    user.email = f"deleted+{uid}@invalid"
+    for col in ("name", "first_name", "last_name", "timezone", "api_key_hash",
+                "mfa_secret_encrypted", "mfa_enrolled_at", "mfa_last_totp_counter",
+                "referral_code"):
+        setattr(user, col, None)
+    user.mfa_enabled = False
+    user.is_admin = False
+    user.notification_prefs = {}
+    user.password_hash = hash_password(secrets.token_urlsafe(32))
+    user.revoked_at = datetime.now(UTC)
+    db.commit()
+
+
+def _call(db, sql: str, params: dict):
+    value = db.execute(text(sql), params).scalar()
+    db.commit()
+    return value
+
+
+def _advance(db, claim, r2: R2Store, send_final, deadline: float) -> str:
+    """Drive one claimed deletion as far as its markers allow. Returns the phase reached."""
+    import time
+
+    from src.scrapers.enrichment.skip_trace import pending_row_subject_key
+
+    did, uid, token = str(claim.deletion_id), str(claim.user_id), claim.claim_token
+    p = {"d": did, "t": token}
+
+    def check_time() -> None:
+        if time.monotonic() >= deadline:  # >=: Windows' clock ticks ~15 ms
+            raise _OutOfTimeError
+
+    row = db.execute(text("SELECT * FROM account_deletions WHERE id = :d"), p).one()
+    if row.r2_first_sweep_at is None:
+        keys = db.execute(text(
+            "SELECT export_key FROM jobs WHERE user_id = :u AND export_key IS NOT NULL "
+            "UNION SELECT combined_export_key FROM batch_runs "
+            " WHERE user_id = :u AND combined_export_key IS NOT NULL"), {"u": uid}).scalars().all()
+        db.rollback()
+        _sweep_r2(r2, uid, list(keys))
+        check_time()
+        _call(db, "SELECT record_deletion_progress(:d, :t, 'r2_first_sweep')", p)
+
+    # The user's cached vendor answers, keyed from the pending rows BEFORE their scrub
+    # (on a re-run the scrubbed rows give keys that match nothing: harmless).
+    pending = db.execute(text(
+        "SELECT user_id, property_address, city, state, trace_type, first_name, last_name "
+        "  FROM pending_skip_trace_rows WHERE user_id = :u"), {"u": uid}).all()
+    cache_keys = sorted({pending_row_subject_key(r) for r in pending})
+    db.rollback()
+    while not _call(db, "SELECT purge_account_data(:d, :t, :k, :b)",
+                    {**p, "k": cache_keys, "b": _PURGE_BATCH}):
+        check_time()
+
+    if row.tombstoned_at is None:
+        check_time()
+        if row.final_email_sent_at is None:
+            from src.db.models import User
+
+            email = db.get(User, uid).email  # the original address, before the tombstone
+            db.rollback()
+            send_final(email)
+            _call(db, "SELECT record_deletion_progress(:d, :t, 'final_email_sent')", p)
+        _tombstone(db, uid)
+        # Releases the lease and parks the row until 24 h after the first sweep.
+        _call(db, "SELECT record_deletion_progress(:d, :t, 'tombstoned')", p)
+        return "tombstoned"
+
+    # Second pass, >= 24 h after the first sweep: the data purge above ran again.
+    check_time()
+    _sweep_r2(r2, uid, [])
+    _call(db, "SELECT record_deletion_progress(:d, :t, 'r2_final_sweep')", p)
+    _call(db, "SELECT complete_account_deletion(:d, :t)", p)
+    return "completed"
+
+
+def _run_purges(db, r2: R2Store, send_final) -> dict:
+    import time
+
+    started = time.monotonic()
+    phases: dict[str, int] = {}
+    for _ in range(_MAX_CLAIMS):
+        if time.monotonic() - started > _TICK_BUDGET:
+            break
+        claim = db.execute(text(
+            "SELECT * FROM claim_account_deletion(make_interval(secs => :s))"),
+            {"s": _LEASE_SECONDS}).one_or_none()
+        db.commit()
+        if claim is None:
+            break
+        deadline = min(time.monotonic() + _LEASE_SECONDS - _LEASE_MARGIN,
+                       started + _TICK_BUDGET)
+        try:
+            phase = _advance(db, claim, r2, send_final, deadline)
+        except _OutOfTimeError:
+            db.rollback()
+            phase = "paused"  # the lease runs out; the next tick reclaims and resumes
+        except Exception as exc:  # noqa: BLE001 - recorded, retried with backoff
+            db.rollback()
+            phase = "error"
+            reason = type(exc).__name__ + (f" {exc.orig.pgcode}" if hasattr(exc, "orig")
+                                           and getattr(exc.orig, "pgcode", None) else "")
+            _logger.warning("account deletion %s: purge step failed: %s",
+                            claim.deletion_id, reason)
+            try:
+                _call(db, "SELECT record_deletion_progress(:d, :t, 'error', NULL, NULL, :e)",
+                      {"d": str(claim.deletion_id), "t": claim.claim_token,
+                       "e": f"purge: {reason}"})
+            except Exception:  # noqa: BLE001 - the lease lapses on its own
+                db.rollback()
+                _logger.exception("account deletion %s: could not record the error",
+                                  claim.deletion_id)
+        phases[phase] = phases.get(phase, 0) + 1
+    return phases
+
+
+def _close_stripe_customers(db, stripe_api: StripeSubscriptions) -> int:
+    """After completion: delete the Stripe Customer once nothing is live or open.
+    Finalized invoices keep their own copy of the customer details (the tax record)."""
+    rows = db.execute(text(
+        "SELECT d.id, d.stripe_state, u.stripe_customer_id "
+        "  FROM account_deletions d JOIN users u ON u.id = d.user_id "
+        " WHERE d.status = 'completed' AND d.stripe_state IN ('cancel_set', 'not_applicable') "
+        "   AND (d.next_attempt_at IS NULL OR d.next_attempt_at <= now()) "
+        " ORDER BY d.completed_at LIMIT :n"), {"n": _BATCH}).all()
+    db.rollback()
+    done = 0
+    for row in rows:
+        try:
+            if row.stripe_customer_id:
+                state = stripe_api.customer_state(row.stripe_customer_id)
+                if state == "open":
+                    _record(db, row.id, "error",
+                            error="waiting for the subscription to end / invoices to close")
+                    continue
+                if state == "closable":
+                    stripe_api.delete_customer(row.stripe_customer_id,
+                                               f"acctdel-{row.id}-customer")
+        except Exception as exc:  # noqa: BLE001 - recorded, retried with backoff
+            _record(db, row.id, "error", error=f"stripe customer: {type(exc).__name__}")
+            continue
+        if _record(db, row.id, "stripe", row.stripe_state, "customer_deleted"):
+            done += 1
+    return done
+
+
+def _alert_stuck(db) -> int:
+    from src.workers.ops_alerts import send_ops_alert
+
+    rows = db.execute(text(
+        "SELECT id, attempts, last_error FROM account_deletions "
+        "WHERE status = 'purging' AND attempts >= :stuck "
+        "ORDER BY attempts DESC LIMIT :n"), {"stuck": _STUCK_ATTEMPTS, "n": _BATCH}).all()
+    db.rollback()
+    for row in rows:
+        send_ops_alert(
+            "account_deletion_stuck", str(row.id), "Account deletion stuck",
+            f"Deletion {row.id} has been retried {row.attempts} times; last error: "
+            f"{(row.last_error or '')[:200]}",
+        )
+    return len(rows)
+
+
 def _drive_account_deletions_impl(*, stripe_api: StripeSubscriptions | None = None,
-                                  send=None) -> dict:
+                                  send=None, r2: R2Store | None = None,
+                                  send_final=None) -> dict:
     from src.db.session import system_sync_session
 
     with system_sync_session() as lock_db:
@@ -189,12 +488,17 @@ def _drive_account_deletions_impl(*, stripe_api: StripeSubscriptions | None = No
             _logger.info("account deletion beat: another run holds the lock")
             return {"skipped": True}
         try:
+            stripe_api = stripe_api or StripeSubscriptions()
             with system_sync_session() as db:
                 return {
-                    "stripe": _reconcile_stripe(db, stripe_api or StripeSubscriptions()),
+                    "stripe": _reconcile_stripe(db, stripe_api),
                     "scheduled_emails": _send_scheduled_emails(
                         db, send or _send_scheduled_notice),
+                    "deferred": _defer_in_flight(db),
+                    "purges": _run_purges(db, r2 or R2Store(), send_final or _send_final_notice),
+                    "customers_deleted": _close_stripe_customers(db, stripe_api),
                     "overdue_alerts": _alert_overdue(db),
+                    "stuck_alerts": _alert_stuck(db),
                 }
         finally:
             lock_db.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": _LOCK_KEY})

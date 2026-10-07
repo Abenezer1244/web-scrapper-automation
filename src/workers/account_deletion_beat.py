@@ -284,6 +284,7 @@ def _sweep_r2(r2: R2Store, uid: str, keys: list[str], check_time) -> None:
         if not page:
             return
         for key in page:
+            check_time()
             if not r2.delete(key):
                 raise RuntimeError("R2 delete failed")
 
@@ -452,7 +453,7 @@ def _run_purges(db, r2: R2Store, send_final) -> dict:
     return phases
 
 
-def _close_stripe_customers(db, stripe_api: StripeSubscriptions) -> int:
+def _close_stripe_customers(db, stripe_api: StripeSubscriptions, deadline: float) -> int:
     """After completion: delete the Stripe Customer once nothing is live or open.
     Finalized invoices keep their own copy of the customer details (the tax record)."""
     rows = db.execute(text(
@@ -462,8 +463,12 @@ def _close_stripe_customers(db, stripe_api: StripeSubscriptions) -> int:
         "   AND (d.next_attempt_at IS NULL OR d.next_attempt_at <= now()) "
         " ORDER BY d.completed_at LIMIT :n"), {"n": _BATCH}).all()
     db.rollback()
+    import time
+
     done = 0
     for row in rows:
+        if time.monotonic() >= deadline:
+            break  # the next tick carries on
         try:
             if row.stripe_customer_id:
                 state = stripe_api.customer_state(row.stripe_customer_id)
@@ -487,7 +492,13 @@ def _alert_stuck(db) -> int:
 
     rows = db.execute(text(
         "SELECT id, attempts, last_error FROM account_deletions "
-        "WHERE status = 'purging' AND attempts >= :stuck "
+        "WHERE (status = 'purging' AND attempts >= :stuck) "
+        # A Customer waits for its subscription to end (an annual plan: up to a year)
+        # and for invoices to close; longer than any billing period is stuck, and so is
+        # a run of Stripe errors.
+        "   OR (status = 'completed' AND stripe_state IN ('cancel_set', 'not_applicable') "
+        "       AND (completed_at < now() - interval '400 days' "
+        "            OR (attempts >= :stuck AND last_error LIKE 'stripe customer: %'))) "
         "ORDER BY attempts DESC LIMIT :n"), {"stuck": _STUCK_ATTEMPTS, "n": _BATCH}).all()
     db.rollback()
     for row in rows:
@@ -510,6 +521,9 @@ def _drive_account_deletions_impl(*, stripe_api: StripeSubscriptions | None = No
             _logger.info("account deletion beat: another run holds the lock")
             return {"skipped": True}
         try:
+            import time
+
+            started = time.monotonic()
             stripe_api = stripe_api or StripeSubscriptions()
             with system_sync_session() as db:
                 return {
@@ -518,7 +532,8 @@ def _drive_account_deletions_impl(*, stripe_api: StripeSubscriptions | None = No
                         db, send or _send_scheduled_notice),
                     "deferred": _defer_in_flight(db),
                     "purges": _run_purges(db, r2 or R2Store(), send_final or _send_final_notice),
-                    "customers_deleted": _close_stripe_customers(db, stripe_api),
+                    "customers_deleted": _close_stripe_customers(
+                        db, stripe_api, started + _TICK_BUDGET + 40),
                     "overdue_alerts": _alert_overdue(db),
                     "stuck_alerts": _alert_stuck(db),
                 }

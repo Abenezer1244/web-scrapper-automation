@@ -462,3 +462,21 @@ def test_a_stale_claim_cannot_commit_the_tombstone(made) -> None:
     with system_sync_session() as db, pytest.raises(beat._OutOfTimeError):
         beat._tombstone(db, uid, did, uuid.uuid4())  # not the live claim
     assert _user_row(uid).email_hmac == blind_index(email)
+
+
+def test_a_stripe_customer_left_past_any_billing_period_alerts_ops(made) -> None:
+    cus = f"cus_{uuid.uuid4().hex[:12]}"
+    uid, did, _, ids, r2 = _seeded(made)
+    try:
+        with sync_engine.begin() as c:
+            c.execute(text("UPDATE users SET stripe_customer_id = :c WHERE id = :u"),
+                      {"c": cus, "u": uid})
+        stripe = FakeStripe(customers={cus: "open"})
+        _run(stripe, r2=r2)
+        _a_day_later(did)
+        assert _run(stripe, r2=r2)["stuck_alerts"] == 0  # waiting is normal
+        _as_purge("UPDATE account_deletions SET completed_at = now() - interval '401 days' "
+                  "WHERE id = :d", {"d": did})
+        assert _run(stripe, r2=r2)["stuck_alerts"] >= 1
+    finally:
+        _cleanup_cache(ids)

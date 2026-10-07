@@ -97,10 +97,10 @@ def upgrade() -> None:
             "attempts >= 0 AND email_attempts >= 0 AND (size_bytes IS NULL OR size_bytes >= 0)",
             name="ck_account_exports_counts",
         ),
-        # Code-shaped only: no space, digit, '@' or '.', so it cannot carry an address,
-        # a name or exception text.
+        # A fixed code, so it can never carry an address, a name or exception text.
         sa.CheckConstraint(
-            "last_error IS NULL OR last_error ~ '^[a-z_]{1,64}$'",
+            "last_error IS NULL OR last_error IN ('deletion_requested', 'too_large', "
+            "'build_failed', 'upload_failed')",
             name="ck_account_exports_error_code",
         ),
     )

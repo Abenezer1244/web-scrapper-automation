@@ -102,7 +102,7 @@ def test_status_invariants(conn) -> None:
     assert _sqlstate(conn, "UPDATE account_exports SET expires_at = now() WHERE id = :i",
                      p) == "23514"  # an expiry needs its ready_at
     for bad in ("attempts = -1", "email_attempts = -1", "size_bytes = -1",
-                "last_error = 'Traceback: jane@x.com'", "last_error = 'too large'"):
+                "last_error = 'Traceback: jane@x.com'", "last_error = 'jane'"):
         assert _sqlstate(conn, f"UPDATE account_exports SET {bad} WHERE id = :i", p) == "23514", bad
     conn.execute(text("UPDATE account_exports SET last_error = 'too_large' WHERE id = :i"), p)
     conn.execute(text("UPDATE account_exports SET status = 'ready', size_bytes = 1, "

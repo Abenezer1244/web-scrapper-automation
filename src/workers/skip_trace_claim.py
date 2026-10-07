@@ -123,7 +123,7 @@ def held_lookup_message(access: str, held: int, trial_allowance: int) -> str | N
 # cannot read different facts.
 ACCESS_COLUMNS = (
     "id", "plan", "is_admin", "subscription_status", "trial_ends_at",
-    "entitlement_ends_at", "entitlement_grace_ends_at",
+    "entitlement_ends_at", "entitlement_grace_ends_at", "deletion_state",
 )
 
 
@@ -132,6 +132,7 @@ def paid_lookup_access(user, now=None) -> str:
 
     | account                                                  | access  |
     |----------------------------------------------------------|---------|
+    | scheduled for deletion, or being deleted (deletion_state)| ended   |
     | Starter plan                                             | starter |
     | frozen for non-payment (`is_frozen`)                     | frozen  |
     | paid term already ended (`entitlement_ends_at <= now`)   | ended   |
@@ -154,6 +155,10 @@ def paid_lookup_access(user, now=None) -> str:
     from src.config.constants import normalize_plan
 
     now = as_utc(now or datetime.now(UTC))
+    # An account scheduled for deletion buys nothing more, and nothing it queued is
+    # sent: the purge must never be racing a paid lookup (a restore sets it back to NULL).
+    if getattr(user, "deletion_state", None) is not None:
+        return ACCESS_ENDED
     if normalize_plan(getattr(user, "plan", None)) == "starter":
         return ACCESS_STARTER
     if is_frozen(user, now):

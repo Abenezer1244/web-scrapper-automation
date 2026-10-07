@@ -186,6 +186,13 @@ app.conf.beat_schedule = {
         "task": "src.workers.scheduler.purge_expired_pending_registrations",
         "schedule": crontab(minute=39),  # hourly at :39
     },
+    "drive-account-deletions": {
+        # Account deletion (src/workers/account_deletion_beat.py): Stripe cancel /
+        # un-cancel, the "scheduled for deletion" notice, overdue alerts. 5 min: a
+        # deletion's clocks run in days, a restore's un-cancel should not wait long.
+        "task": "src.workers.scheduler.drive_account_deletions",
+        "schedule": 300.0,
+    },
     "drain-email-change-outbox": {
         # Confirmed email changes: notify the OLD address + sync the Stripe
         # customer email, retried with backoff (src/workers/account_emails.py).
@@ -564,6 +571,18 @@ def drain_email_change_outbox() -> None:
     """
     from src.workers.account_emails import _drain_email_change_outbox_impl
     return _drain_email_change_outbox_impl()
+
+
+@app.task(name="src.workers.scheduler.drive_account_deletions",
+          soft_time_limit=240, time_limit=280)
+def drive_account_deletions() -> dict:
+    """Move every account deletion to its next state (account_deletion_beat.py).
+
+    Every 5 min, one run at a time (advisory lock). Limits below the interval so
+    two runs never overlap through a hung Stripe or Resend call.
+    """
+    from src.workers.account_deletion_beat import _drive_account_deletions_impl
+    return _drive_account_deletions_impl()
 
 
 @app.task(name="src.workers.scheduler.dispatch_pending_verification_emails")

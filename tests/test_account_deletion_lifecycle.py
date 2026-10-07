@@ -249,7 +249,12 @@ def test_runtime_roles_reach_the_lifecycle_only_through_the_functions(conn) -> N
 
     conn.execute(text("SET LOCAL ROLE bridgeleads_system"))
     assert _sqlstate(conn, "SELECT * FROM request_account_deletion()") == "42501"
-    assert _sqlstate(conn, "SELECT 1 FROM account_deletions") == "42501"
+    # The beat worker reads the deletion queue (migration 114) but never writes it.
+    assert _sqlstate(conn, "SELECT 1 FROM account_deletions") is None
+    for write in ("INSERT INTO account_deletions (user_id, purge_after) VALUES (:u, now())",
+                  "UPDATE account_deletions SET status = 'restored' WHERE user_id = :u",
+                  "DELETE FROM account_deletions WHERE user_id = :u"):
+        assert _sqlstate(conn, write, {"u": uid}) == "42501", write
     assert _sqlstate(conn, "UPDATE users SET deletion_state = 'pending' WHERE id = :u",
                      {"u": uid}) == "BLD10"
     conn.execute(text("RESET ROLE"))

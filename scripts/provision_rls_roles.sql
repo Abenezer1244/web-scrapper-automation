@@ -383,6 +383,9 @@ BEGIN
     END IF;
     IF to_regclass('public.account_deletions') IS NOT NULL THEN
         REVOKE ALL ON account_deletions, consumed_trial_emails FROM bridgeleads_system;
+        -- The beat worker READS the deletion queue (114); every write is a definer
+        -- function. The matching SELECT policy lives in migration 114.
+        GRANT SELECT ON account_deletions TO bridgeleads_system;
         REVOKE ALL ON account_deletions, consumed_trial_emails FROM bridgeleads_app;
         GRANT SELECT ON account_deletions, consumed_trial_emails TO bridgeleads_app;
         -- consumed_trial_emails has no user_id (no GUC policy): without this the

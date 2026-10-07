@@ -451,3 +451,12 @@ def test_the_stripe_customer_goes_only_once_nothing_is_open(made) -> None:
         assert _row(did).stripe_state == "customer_deleted"
     finally:
         _cleanup_cache(ids)
+
+
+def test_a_stale_claim_cannot_commit_the_tombstone(made) -> None:
+    from src.db.session import system_sync_session
+
+    uid, did, email = _account(made)
+    with system_sync_session() as db, pytest.raises(beat._OutOfTimeError):
+        beat._tombstone(db, uid, did, uuid.uuid4())  # not the live claim
+    assert _user_row(uid).email_hmac == blind_index(email)

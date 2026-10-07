@@ -268,14 +268,18 @@ def _defer_in_flight(db) -> int:
     return len(ids)
 
 
-def _sweep_r2(r2: R2Store, uid: str, keys: list[str]) -> None:
+def _sweep_r2(r2: R2Store, uid: str, keys: list[str], check_time) -> None:
     """Delete the given keys and everything under exports/{uid}/, then require the
-    prefix to list empty. Raises (= not swept) on any failure: fail closed."""
+    prefix to list empty. Raises (= not swept) on any failure: fail closed. Checks the
+    time on every page, so a huge prefix pauses and resumes instead of outliving
+    the lease (deletes are idempotent: a resumed sweep just lists again)."""
     for key in keys:
+        check_time()
         if not r2.delete(key):
             raise RuntimeError("R2 delete failed")
     prefix = f"exports/{uid}/"
-    for _ in range(1000):
+    for _ in range(10_000):
+        check_time()
         page = r2.list(prefix)
         if not page:
             return
@@ -305,9 +309,12 @@ def _send_final_notice(to: str) -> None:
     _send(to, subject, preheader, lines, cta=cta)
 
 
-def _tombstone(db, uid: str) -> None:
+def _tombstone(db, uid: str, deletion_id: str, token) -> None:
     """The users row keeps only what billing needs (matrix §2); the placeholder email
-    recomputes email_hmac (ORM validator), freeing the address."""
+    recomputes email_hmac (ORM validator), freeing the address. Committed only while
+    this run still holds the live claim (users is not write-fenced; one run at a
+    time under the advisory lock, and the task's hard limit is far below the lease,
+    so this is a belt)."""
     import secrets
 
     from src.api.auth import hash_password
@@ -324,6 +331,13 @@ def _tombstone(db, uid: str) -> None:
     user.notification_prefs = {}
     user.password_hash = hash_password(secrets.token_urlsafe(32))
     user.revoked_at = datetime.now(UTC)
+    db.flush()
+    if not db.execute(text(
+            "SELECT 1 FROM account_deletions WHERE id = :d AND status = 'purging' "
+            "AND claim_token = :t AND claimed_until > clock_timestamp()"),
+            {"d": deletion_id, "t": token}).first():
+        db.rollback()
+        raise _OutOfTimeError
     db.commit()
 
 
@@ -353,7 +367,7 @@ def _advance(db, claim, r2: R2Store, send_final, deadline: float) -> str:
             "UNION SELECT combined_export_key FROM batch_runs "
             " WHERE user_id = :u AND combined_export_key IS NOT NULL"), {"u": uid}).scalars().all()
         db.rollback()
-        _sweep_r2(r2, uid, list(keys))
+        _sweep_r2(r2, uid, list(keys), check_time)
         check_time()
         _call(db, "SELECT record_deletion_progress(:d, :t, 'r2_first_sweep')", p)
 
@@ -364,6 +378,7 @@ def _advance(db, claim, r2: R2Store, send_final, deadline: float) -> str:
         "  FROM pending_skip_trace_rows WHERE user_id = :u"), {"u": uid}).all()
     cache_keys = sorted({pending_row_subject_key(r) for r in pending})
     db.rollback()
+    check_time()
     while not _call(db, "SELECT purge_account_data(:d, :t, :k, :b)",
                     {**p, "k": cache_keys, "b": _PURGE_BATCH}):
         check_time()
@@ -377,14 +392,14 @@ def _advance(db, claim, r2: R2Store, send_final, deadline: float) -> str:
             db.rollback()
             send_final(email)
             _call(db, "SELECT record_deletion_progress(:d, :t, 'final_email_sent')", p)
-        _tombstone(db, uid)
+        _tombstone(db, uid, did, token)
         # Releases the lease and parks the row until 24 h after the first sweep.
         _call(db, "SELECT record_deletion_progress(:d, :t, 'tombstoned')", p)
         return "tombstoned"
 
     # Second pass, >= 24 h after the first sweep: the data purge above ran again.
     check_time()
-    _sweep_r2(r2, uid, [])
+    _sweep_r2(r2, uid, [], check_time)
     _call(db, "SELECT record_deletion_progress(:d, :t, 'r2_final_sweep')", p)
     _call(db, "SELECT complete_account_deletion(:d, :t)", p)
     return "completed"

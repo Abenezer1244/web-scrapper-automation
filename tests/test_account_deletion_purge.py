@@ -609,6 +609,9 @@ def test_fence_never_lets_a_row_change_owner(conn) -> None:
                      {"a": a, "b": b}) == "BLD21"
     assert _sqlstate(conn, "UPDATE job_logs SET job_id = :jb WHERE job_id = :ja",
                      {"ja": ids_a["job"], "jb": ids_b["job"]}) == "BLD21"
+    for change in ("user_id = :b", "tracerfy_queue_id = tracerfy_queue_id + 1"):
+        assert _sqlstate(conn, f"UPDATE skip_trace_queues SET {change} WHERE user_id = :a",
+                         {"a": a, "b": b}) == "BLD21", change
     for target in (":b", "NULL"):
         assert _sqlstate(conn, f"UPDATE audit_events SET user_id = {target} WHERE user_id = :a",
                          {"a": a, "b": b}) == "BLD21"

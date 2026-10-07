@@ -208,6 +208,11 @@ $fn$;
 CREATE FUNCTION public.account_deletion_fence_queue() RETURNS trigger
 LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog, pg_temp AS $fn$
 BEGIN
+    -- The purge finds a batch through these two: they may never be re-pointed.
+    IF TG_OP = 'UPDATE' AND (OLD.user_id IS DISTINCT FROM NEW.user_id
+                             OR OLD.tracerfy_queue_id IS DISTINCT FROM NEW.tracerfy_queue_id) THEN
+        RAISE EXCEPTION 'a batch''s tenant and queue id are immutable' USING ERRCODE = 'BLD21';
+    END IF;
     IF current_user = 'bridgeleads_purge'
        OR (NEW.download_url IS NULL AND NEW.error_message IS NULL) THEN
         RETURN NEW;

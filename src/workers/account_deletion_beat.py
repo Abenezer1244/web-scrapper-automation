@@ -8,7 +8,8 @@ then its outcome recorded, so a crash in between is re-driven on a later tick.
   Stripe      pending  `pending_cancel`   -> subscription set to cancel at period end
               restored `pending_uncancel` -> un-cancelled while the period is still live
               (`not_applicable` when there is no live subscription to change)
-  Email       pending rows get the "scheduled for deletion" notice once (at-least-once:
+  Email       pending rows get the "scheduled for deletion" notice once billing is
+              confirmed stopped (at-least-once:
               a crash after the send and before the record sends it again)
   Alerts      ops hear about a deletion still not purging 10 days after its deadline
               (the CCPA limit is 45 days from the request)
@@ -61,20 +62,26 @@ class StripeSubscriptions:
                                    idempotency_key=key)
 
 
-def _send_scheduled_notice(to: str, purge_after: datetime) -> None:
-    """Raises on failure: the caller backs off and retries."""
-    from src.workers.account_emails import _send
-
+def _scheduled_notice(purge_after: datetime) -> tuple:
+    """(subject, preheader, lines, cta) of the "scheduled for deletion" notice."""
     when = purge_after.astimezone(UTC).strftime("%B %d, %Y")
-    _send(
-        to, "Your BridgeLeads account is scheduled for deletion",
+    return (
+        "Your BridgeLeads account is scheduled for deletion",
         f"Your account and its data will be deleted on {when}.",
         [f"You asked us to delete your BridgeLeads account. It will be deleted, with its "
          f"leads, schedules and settings, on {when}.",
          "Your subscription will not renew, and you will not be charged again.",
          "Changed your mind? Sign in and press Restore before that date to keep everything."],
-        cta=("Sign in to restore", f"{settings.FRONTEND_URL}/login"),
+        ("Sign in to restore", f"{settings.FRONTEND_URL}/login"),
     )
+
+
+def _send_scheduled_notice(to: str, purge_after: datetime) -> None:
+    """Raises on failure: the caller backs off and retries."""
+    from src.workers.account_emails import _send
+
+    subject, preheader, lines, cta = _scheduled_notice(purge_after)
+    _send(to, subject, preheader, lines, cta=cta)
 
 
 def _record(db, deletion_id, phase: str, frm=None, to=None, error=None) -> bool:
@@ -133,7 +140,9 @@ def _send_scheduled_emails(db, send) -> int:
     from src.workers.delivery import _email_error_summary
 
     sent = 0
-    rows = _due(db, "d.status = 'pending' AND d.scheduled_email_sent_at IS NULL")
+    # Only once billing is confirmed stopped: the notice says the plan will not renew.
+    rows = _due(db, "d.status = 'pending' AND d.scheduled_email_sent_at IS NULL "
+                    "AND d.stripe_state IN ('cancel_set', 'not_applicable')")
     for row in rows:
         email = db.get(User, row.user_id).email  # ORM: decrypted
         db.rollback()

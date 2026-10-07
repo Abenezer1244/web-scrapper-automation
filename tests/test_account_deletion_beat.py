@@ -176,16 +176,21 @@ def test_a_failed_notice_is_retried_and_no_key_sends_nothing(made, resend_on, mo
     assert sent == [] and _row(did).scheduled_email_sent_at is None
 
 
-def test_the_real_notice_renders(monkeypatch) -> None:
-    """The default sender builds a real Resend payload (Resend itself not called)."""
-    import resend
+def test_the_notice_names_the_date_and_how_to_restore() -> None:
+    subject, preheader, lines, cta = beat._scheduled_notice(
+        datetime(2026, 11, 5, 17, tzinfo=UTC))
+    assert "scheduled for deletion" in subject
+    assert "November 05, 2026" in preheader and "November 05, 2026" in lines[0]
+    assert any("not renew" in line for line in lines)
+    assert cta == ("Sign in to restore", f"{settings.FRONTEND_URL}/login")
 
-    captured: list = []
-    monkeypatch.setattr(resend.Emails, "send", lambda payload: captured.append(payload))
-    beat._send_scheduled_notice("x@bl.test", datetime(2026, 11, 5, 17, tzinfo=UTC))
-    (payload,) = captured
-    assert payload["to"] == ["x@bl.test"]
-    assert "November 05, 2026" in payload["text"] and "/login" in payload["html"]
+
+def test_no_notice_before_billing_is_confirmed_stopped(made, resend_on) -> None:
+    sub = f"sub_{uuid.uuid4().hex[:12]}"
+    _, did, _ = _account(made, sub=sub)
+    sent: list = []
+    _run(FakeStripe(fail=True), send=lambda to, when: sent.append(to))
+    assert sent == [] and _row(did).stripe_state == "pending_cancel"
 
 
 # ── Alerts, single run ───────────────────────────────────────────────────────────

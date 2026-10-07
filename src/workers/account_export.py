@@ -218,17 +218,16 @@ _HOLDS_CLAIM = ("id = :id AND claim_id = :claim AND status = 'building' "
 
 
 def _fail(db, row, store: ExportStore, code: str) -> None:
-    """Give up on this export (the row stays as the request log), then delete anything
-    it uploaded. Only while this run still holds the claim: a run that lost it must
-    not delete the object of the run that holds it now."""
-    failed = db.execute(text(
-        "UPDATE account_exports SET status = 'failed', last_error = :e, "  # noqa: S608
-        f"claim_id = NULL, claimed_until = NULL WHERE {_HOLDS_CLAIM}"),
-        {"id": row.id, "claim": row.claim_id, "e": code}).rowcount
+    """Give up on this export (the row stays as the request log). Only while this run
+    still holds the claim. The row is parked as a spent build (no attempts left, lease
+    over) and _give_up_exhausted deletes its object before marking it failed, so a
+    failed delete or a crash in between is retried next run, never orphaned."""
+    db.execute(text(
+        f"UPDATE account_exports SET attempts = GREATEST(attempts, {_MAX_ATTEMPTS}), "  # noqa: S608
+        "claimed_until = now() - interval '1 second', last_error = :e "
+        f"WHERE {_HOLDS_CLAIM}"), {"id": row.id, "claim": row.claim_id, "e": code})
     db.commit()
-    if failed and not store.delete(export_key(row.user_id, row.id)):
-        # Under exports/{user_id}/: the account purge sweeps it if nothing else does.
-        _logger.error("account export %s: could not delete its object", row.id)
+    _give_up_exhausted(db, store)
 
 
 def _retry_later(db, row, store: ExportStore, code: str) -> None:
@@ -244,18 +243,24 @@ def _retry_later(db, row, store: ExportStore, code: str) -> None:
 
 
 def _give_up_exhausted(db, store: ExportStore) -> int:
-    """A build whose worker died on its last allowed attempt: never claimed again
-    (the claim skips it), failed here once its lease has run out."""
-    rows = db.execute(text(
-        "UPDATE account_exports SET status = 'failed', last_error = 'build_failed', "
-        "claim_id = NULL, claimed_until = NULL WHERE status = 'building' "
-        "AND claimed_until < now() AND attempts >= :max RETURNING id, user_id"),
-        {"max": _MAX_ATTEMPTS}).all()
-    db.commit()
+    """A spent build (no attempts left, lease over: a worker that died on its last try,
+    or one _fail parked): never claimed again. Its object is deleted FIRST, then the row
+    is marked failed; a failed delete leaves the row for the next run to retry."""
+    spent = ("status = 'building' AND claimed_until < now() AND attempts >= :max")
+    rows = db.execute(text(f"SELECT id, user_id FROM account_exports WHERE {spent}"),  # noqa: S608
+                      {"max": _MAX_ATTEMPTS}).all()
+    db.rollback()
+    failed = 0
     for row in rows:
         if not store.delete(export_key(row.user_id, row.id)):
-            _logger.error("account export %s: could not delete its object", row.id)
-    return len(rows)
+            _logger.error("account export %s: could not delete its object; retrying", row.id)
+            continue
+        failed += db.execute(text(
+            "UPDATE account_exports SET status = 'failed', claim_id = NULL, "  # noqa: S608
+            "claimed_until = NULL, last_error = COALESCE(last_error, 'build_failed') "
+            f"WHERE id = :id AND {spent}"), {"id": row.id, "max": _MAX_ATTEMPTS}).rowcount
+        db.commit()
+    return failed
 
 
 def _sweep_local_files() -> None:

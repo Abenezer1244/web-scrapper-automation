@@ -266,6 +266,30 @@ def test_a_crashed_build_is_claimed_again_until_it_gives_up(made) -> None:
     assert store.objects == {}
 
 
+def test_a_give_up_whose_delete_fails_is_retried_not_orphaned(made) -> None:
+    """The deletion lands mid-build, and R2 refuses the first delete of the uploaded
+    object: the row is not marked failed (nothing would ever retry the delete) until a
+    later run has deleted it."""
+    a = _account(made)
+    store = FakeStore(on_upload=lambda: _set_pending_deletion(a["user"]))
+    deletes = {"left_to_fail": 1}
+    real_delete = store.delete
+
+    def flaky_delete(key):
+        if deletes["left_to_fail"]:
+            deletes["left_to_fail"] -= 1
+            return False
+        return real_delete(key)
+
+    store.delete = flaky_delete
+    _run(store)
+    assert _row(a["export"]).status == "building" and _key(a) in store.objects
+    assert _run(store)["gave_up"] == 1
+    row = _row(a["export"])
+    assert (row.status, row.last_error) == ("failed", "deletion_requested")
+    assert store.objects == {}
+
+
 def test_files_a_killed_build_left_on_disk_are_removed(made) -> None:
     stale = [settings.EXPORTS_DIR / "account_export_dead.zip",
              settings.EXPORTS_DIR / "acct_deadbeef_20260101_000000.csv"]

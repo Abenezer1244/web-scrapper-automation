@@ -149,7 +149,10 @@ def _build_zip(user_id: str, zip_path: Path) -> None:
             lead_file = None
             # The rule GET /jobs/{id}/download applies: a finished run with a file.
             if job.status == "done" and job.export_key:
-                rows = db.scalars(download_rows_select(job.id, user_id, today)).all()
+                # Never load more than the cap allows (one row over proves "too large").
+                remaining = settings.ACCOUNT_EXPORT_MAX_ROWS - total
+                rows = db.scalars(
+                    download_rows_select(job.id, user_id, today).limit(remaining + 1)).all()
                 total += len(rows)
                 if total > settings.ACCOUNT_EXPORT_MAX_ROWS:
                     raise _TooLargeError
@@ -161,6 +164,12 @@ def _build_zip(user_id: str, zip_path: Path) -> None:
                         zf.write(path, lead_file)
                     finally:
                         path.unlink(missing_ok=True)
+                    # Memory holds one job's rows at a time, and the size is checked as
+                    # the ZIP grows, not once it is complete.
+                    for r in rows:
+                        db.expunge(r)
+                    if zf.fp.tell() > settings.ACCOUNT_EXPORT_MAX_BYTES:
+                        raise _TooLargeError
             runs.append({
                 "id": job.id, "scraper_config_id": job.scraper_config_id,
                 "scraper_name": cfg.name if cfg else None,
@@ -194,11 +203,12 @@ def _claim(db):
          WHERE e.id = (
                SELECT id FROM account_exports
                 WHERE (status = 'pending' OR (status = 'building' AND claimed_until < now()))
+                  AND attempts < {_MAX_ATTEMPTS}
                   AND (next_attempt_at IS NULL OR next_attempt_at <= now())
                 ORDER BY requested_at
                 LIMIT 1 FOR UPDATE SKIP LOCKED)
      RETURNING e.id, e.user_id, e.claim_id, e.attempts
-    """)).one_or_none()  # noqa: S608 - _LEASE is a fixed literal
+    """)).one_or_none()  # noqa: S608 - _LEASE and _MAX_ATTEMPTS are fixed literals
     db.commit()
     return row
 
@@ -233,6 +243,32 @@ def _retry_later(db, row, store: ExportStore, code: str) -> None:
     db.commit()
 
 
+def _give_up_exhausted(db, store: ExportStore) -> int:
+    """A build whose worker died on its last allowed attempt: never claimed again
+    (the claim skips it), failed here once its lease has run out."""
+    rows = db.execute(text(
+        "UPDATE account_exports SET status = 'failed', last_error = 'build_failed', "
+        "claim_id = NULL, claimed_until = NULL WHERE status = 'building' "
+        "AND claimed_until < now() AND attempts >= :max RETURNING id, user_id"),
+        {"max": _MAX_ATTEMPTS}).all()
+    db.commit()
+    for row in rows:
+        if not store.delete(export_key(row.user_id, row.id)):
+            _logger.error("account export %s: could not delete its object", row.id)
+    return len(rows)
+
+
+def _sweep_local_files() -> None:
+    """Remove ZIPs and lead CSVs a killed build left on this container's disk. Runs
+    under the advisory lock, so no build of ours is writing them."""
+    from src.utils.data_exporter import DataExporter
+
+    export_dir = DataExporter().export_dir
+    for pattern in ("account_export_*.zip", "acct_*.csv"):
+        for path in export_dir.glob(pattern):
+            path.unlink(missing_ok=True)
+
+
 def _owner_state(db, user_id: str, lock: bool = False):
     sql = "SELECT deletion_state, is_active FROM users WHERE id = :u"
     return db.execute(text(sql + (" FOR SHARE" if lock else "")), {"u": user_id}).one()
@@ -244,13 +280,9 @@ def _build_one(db, row, store: ExportStore) -> str:
     if owner.deletion_state is not None or not owner.is_active:
         _fail(db, row, store, "deletion_requested")
         return "failed"
-    if row.attempts > _MAX_ATTEMPTS:  # crashed or was killed every time
-        _fail(db, row, store, "build_failed")
-        return "failed"
-
     from src.utils.data_exporter import DataExporter
 
-    zip_path = DataExporter().export_dir / f"account_{row.id}.zip"
+    zip_path = DataExporter().export_dir / f"account_export_{row.id}.zip"
     key = export_key(row.user_id, row.id)
     try:
         try:
@@ -391,10 +423,12 @@ def _build_account_exports_impl(*, store: ExportStore | None = None, send=None) 
             with system_sync_session() as db:
                 # ponytail: one build per tick (every minute); queue several per tick if
                 # exports ever back up.
+                _sweep_local_files()
+                gave_up = _give_up_exhausted(db, store)
                 row = _claim(db)
                 built = _build_one(db, row, store) if row else None
                 return {
-                    "built": built,
+                    "built": built, "gave_up": gave_up,
                     "emails": _send_links(db, send or _send_export_ready),
                     "expired": _expire(db, store),
                 }

@@ -257,8 +257,28 @@ def test_a_crashed_build_is_claimed_again_until_it_gives_up(made) -> None:
                        "claim_id = gen_random_uuid(), "
                        "claimed_until = now() - interval '1 minute' WHERE id = :i"),
                   {"i": b["export"]})
-    assert _run()["built"] == "failed"
-    assert _row(b["export"]).last_error == "build_failed"
+    store = FakeStore()
+    store.objects[_key(b)] = b"partial"
+    stats = _run(store)
+    assert (stats["built"], stats["gave_up"]) == (None, 1)  # never claimed a 4th time
+    row = _row(b["export"])
+    assert (row.status, row.last_error, row.attempts) == ("failed", "build_failed", 3)
+    assert store.objects == {}
+
+
+def test_files_a_killed_build_left_on_disk_are_removed(made) -> None:
+    stale = [settings.EXPORTS_DIR / "account_export_dead.zip",
+             settings.EXPORTS_DIR / "acct_deadbeef_20260101_000000.csv"]
+    for p in stale:
+        p.write_text("Jane Doe, 1 Main St")
+    unrelated = settings.EXPORTS_DIR / "job_keepme_20260101_000000.csv"
+    unrelated.write_text("x")
+    try:
+        _run()
+        assert not any(p.exists() for p in stale)
+        assert unrelated.exists()
+    finally:
+        unrelated.unlink(missing_ok=True)
 
 
 def test_a_live_lease_is_never_taken(made) -> None:

@@ -76,8 +76,10 @@ class StripeSubscriptions:
 
         stripe.api_key = settings.STRIPE_SECRET_KEY
         try:
+            # One bounded page: more than 100 subscriptions reads as "open" (retry later)
+            # rather than paging Stripe inside the tick.
             subs = stripe.Subscription.list(customer=customer_id, status="all", limit=100)
-            if any(s["status"] not in _ENDED for s in subs.auto_paging_iter()):
+            if subs["has_more"] or any(s["status"] not in _ENDED for s in subs["data"]):
                 return "open"
             for status in ("draft", "open"):
                 if stripe.Invoice.list(customer=customer_id, status=status, limit=1)["data"]:
@@ -400,7 +402,8 @@ def _advance(db, claim, r2: R2Store, send_final, deadline: float) -> str:
     # Second pass, >= 24 h after the first sweep: the data purge above ran again.
     check_time()
     _sweep_r2(r2, uid, [], check_time)
-    _call(db, "SELECT record_deletion_progress(:d, :t, 'r2_final_sweep')", p)
+    if row.r2_final_sweep_at is None:  # a retry after BLD36 keeps the first marker
+        _call(db, "SELECT record_deletion_progress(:d, :t, 'r2_final_sweep')", p)
     _call(db, "SELECT complete_account_deletion(:d, :t)", p)
     return "completed"
 
@@ -492,7 +495,9 @@ def _alert_stuck(db) -> int:
 
     rows = db.execute(text(
         "SELECT id, attempts, last_error FROM account_deletions "
-        "WHERE (status = 'purging' AND attempts >= :stuck) "
+        # A purge normally completes a day after its claim (day 41 at the latest, when
+        # in-flight work deferred it); purging 12 days past the deadline is stuck.
+        "WHERE (status = 'purging' AND purge_after + interval '12 days' < now()) "
         # A Customer waits for its subscription to end (an annual plan: up to a year)
         # and for invoices to close; longer than any billing period is stuck, and so is
         # a run of Stripe errors.

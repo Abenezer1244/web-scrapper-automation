@@ -480,3 +480,31 @@ def test_a_stripe_customer_left_past_any_billing_period_alerts_ops(made) -> None
         assert _run(stripe, r2=r2)["stuck_alerts"] >= 1
     finally:
         _cleanup_cache(ids)
+
+
+def test_completion_waits_for_a_linked_batch_then_retries(made) -> None:
+    import random
+
+    uid, did, _, ids, r2 = _seeded(made)
+    n = random.randint(1, 2**31 - 1)
+    try:
+        assert _run(r2=r2)["purges"] == {"tombstoned": 1}
+        with sync_engine.begin() as c:  # a Tracerfy batch of the account still in flight
+            c.execute(text("INSERT INTO skip_trace_queues (id, tracerfy_queue_id, user_id) "
+                           "VALUES (gen_random_uuid(), :n, :u)"), {"n": n, "u": uid})
+        _a_day_later(did)
+        assert _run(r2=r2)["purges"] == {"error": 1}
+        row = _row(did)
+        assert row.status == "purging" and "BLD36" in row.last_error
+        assert row.r2_final_sweep_at is not None
+        with sync_engine.begin() as c:
+            c.execute(text("UPDATE skip_trace_queues SET status = 'completed' "
+                           "WHERE tracerfy_queue_id = :n"), {"n": n})
+        _due_now(did)
+        assert _run(r2=r2)["purges"] == {"completed": 1}
+        assert _row(did).r2_final_sweep_at == row.r2_final_sweep_at  # first marker kept
+    finally:
+        with sync_engine.begin() as c:
+            c.execute(text("DELETE FROM skip_trace_queues WHERE tracerfy_queue_id = :n"),
+                      {"n": n})
+        _cleanup_cache(ids)

@@ -296,3 +296,21 @@ Homeowner suppression is the NEXT project, not this one.
   (via kept pending rows' tracerfy_queue_id) are scrubbed when finished and checked by
   complete. Refuted: lock-taking lookup callable by app/system (they already hold UPDATE on
   users with RLS USING true and can lock any row; every FK insert takes the same lock).
+  Round 3: FAIL. Adopted: claim takes users FOR UPDATE SKIP LOCKED (skips an account with
+  a write in flight; mutation-checked), complete FOR UPDATE, audit fence locks. Refuted:
+  Supabase API roles losing fenced writes (unused; fail closed is intended).
+  Round 4: FAIL. Adopted: complete checks scrubbed configs/batches. Refuted: dispatch
+  status transitions (all conditional on status='queued'; claimed ones = P3b precondition).
+  Round 5: FAIL. Adopted: tombstone invariant checked by the 'tombstoned' marker and complete
+  (what SQL can see; email verified in P3b Python); complete refuses while a linked batch
+  is pending. Refuted: UPDATE in flight across the >= 24 h gap.
+  Round 6: FAIL. Adopted: DELETE/TRUNCATE on the four skeleton tables revoked from the
+  Supabase API roles (runtime roles never had it; asserted).
+  Round 7: FAIL. Adopted: non-raising skip_trace_queues trigger stores no link/error once
+  any tenant of the batch is purging. Refuted: NULL-unsafe compares (columns NOT NULL).
+  Round 8: FAIL. Adopted: pending_skip_trace_rows.tracerfy_queue_id pinned.
+  Round 9: FAIL. Adopted: queue user_id/tracerfy_queue_id immutable (BLD21; no code
+  changes them).
+  Round 10: FAIL. Taint lookup made VOLATILE + waiting-webhook race test; mutation showed
+  STABLE was not exploitable (called from the volatile trigger).
+  **Round 11: GATE: PASS.** Prod-like simulation PASS after every round.

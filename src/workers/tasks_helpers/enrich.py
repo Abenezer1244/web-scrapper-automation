@@ -1026,6 +1026,11 @@ def _run_inline_enrichment(
                 # Parcels, not rows: one lookup serves every lead on a parcel, and the
                 # King summary counts parcels too (Codex P2).
                 batch_deferred: set[str] = set()
+                # Parcels whose lookup did NOT happen this batch, whether or not their
+                # deferral marker was already set by an earlier run (batch_deferred
+                # counts only markers newly written, for the recovery summary, and is
+                # a subset of this). These are not CHECKED: the count leaves them out.
+                batch_unchecked: set[str] = set()
                 # (row, gis_data) pairs whose mailing came from a BULK county export.
                 # Written below through a guarded UPDATE instead of the ORM.
                 _bulk_fills: list[tuple] = []
@@ -1110,6 +1115,8 @@ def _run_inline_enrichment(
                     _n, _failed = _apply_bulk_mailing(db, _bulk_fills, job_id)
                     batch_updated += _n
                     for _res in _failed:
+                        if _res.parcel_id:
+                            batch_unchecked.add(_res.parcel_id.strip())
                         # Its write did not land, so it must stay retryable.
                         _ed = dict(_res.enrichment_data) if isinstance(_res.enrichment_data, dict) else {}
                         if _ed.get("mailing_lookup_deferred") is not True:
@@ -1130,6 +1137,7 @@ def _run_inline_enrichment(
                         for res in parcel_map.get(pid, []):
                             if res.mailing_address:
                                 continue
+                            batch_unchecked.add(pid)
                             ed = dict(res.enrichment_data) if isinstance(res.enrichment_data, dict) else {}
                             if ed.get("mailing_lookup_deferred") is not True:
                                 ed["mailing_lookup_deferred"] = True
@@ -1181,17 +1189,20 @@ def _run_inline_enrichment(
                     continue
                 gis_mailing_deferred += len(batch_deferred)
                 rows_updated += batch_updated
-                checked += len(set(batch_pids) - batch_deferred)
-                if measured:
-                    # Right after the batch commit, before its log line and Redis
-                    # publish: the session is clean here, so the write lands.
-                    progress.report(_LOOKUP_GIS_STAGE, done=checked, total=len(all_pids))
-                _publish_log(
-                    r, job_id, "info",
-                    f"Property lookup progress: {checked}"
-                    f"/{len(all_pids)} parcels ({rows_updated} rows updated)",
-                    db=db,
-                )
+                checked += len(set(batch_pids) - batch_unchecked)
+                # Right after the batch commit, before its log line and Redis publish:
+                # the session is clean here, so the write lands unless this attempt
+                # was superseded or the run ended. Then its log line is not published
+                # either: a refused write must not be followed by a progress line.
+                landed = measured and progress.report(
+                    _LOOKUP_GIS_STAGE, done=checked, total=len(all_pids))
+                if landed or not measured:
+                    _publish_log(
+                        r, job_id, "info",
+                        f"Property lookup progress: {checked}"
+                        f"/{len(all_pids)} parcels ({rows_updated} rows updated)",
+                        db=db,
+                    )
         finally:
             # Back to the umbrella stage (counters cleared) however the sweep ends,
             # including when it raises (a Redis publish, a time limit): the passes

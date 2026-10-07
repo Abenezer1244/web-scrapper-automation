@@ -347,6 +347,43 @@ class TestGisSweep:
         assert _counts(writes)[0] == (GIS, 2, 4, "parcel")
         assert _progress_logs(job_id)[0] == "Property lookup progress: 2/4 parcels (1 rows updated)"
 
+    async def test_a_parcel_already_deferred_is_not_counted_when_its_lookup_fails_again(
+            self, db, business_user, redis_client, monkeypatch, caplog):
+        """A lead an earlier run already marked for mailing recovery. Its lookup fails
+        again, so its marker does not change; it is still not CHECKED. Both ways a
+        lookup is deferred: the county unreached, and a bulk mailing write that RAISES
+        (the real driver rejects a NUL byte inside the row's savepoint)."""
+        job_id, token, pids = await _job(db, business_user, parcels=4)
+        await db.execute(text(
+            "UPDATE results SET enrichment_data = (enrichment_data::jsonb || "
+            "'{\"mailing_lookup_deferred\": true}'::jsonb)::json "
+            "WHERE job_id = :j AND parcel_id IN (:a, :b)"),
+            {"j": job_id, "a": pids[0], "b": pids[2]})
+        await db.commit()
+        _batch(monkeypatch)
+        writes = _recorder(monkeypatch)
+
+        def _per_call(i, batch, stats):
+            out = _all_answered(i, batch, stats)
+            if i == 0:
+                out[batch[0]] = _answer(batch[0], mailing=False)
+                stats["county_unreached"] = [batch[0]]
+            else:
+                out[batch[0]]["mailing_address"] = "PO BOX\x00 7, KENNEWICK, WA 99336"
+                out[batch[0]]["mailing_source"] = "pacs_benton"
+            return out
+
+        _county(monkeypatch, _per_call)
+        with caplog.at_level(logging.WARNING, logger="worker.task"):
+            await _enrich(job_id, redis_client, token)
+
+        assert "bulk mailing write failed" in caplog.text  # the write really raised
+        assert _counts(writes) == [
+            (GIS, 1, 4, "parcel"), (None, 2, 4, "parcel"), (UMBRELLA, None, None, None),
+        ]
+        assert [m.split(" (")[0] for m in _progress_logs(job_id)] == [
+            "Property lookup progress: 1/4 parcels", "Property lookup progress: 2/4 parcels"]
+
     async def test_a_one_batch_sweep_is_not_measured(
             self, db, business_user, redis_client, monkeypatch):
         job_id, token, _pids = await _job(db, business_user, parcels=2)
@@ -481,6 +518,8 @@ class TestAttempt:
         _county(monkeypatch, _all_answered)
         await _enrich(job_id, redis_client, stale)
         assert writes == []
+        # A refused progress write is not followed by a progress line either.
+        assert _progress_logs(job_id) == []
         end = _row(job_id)
         assert (end.stage, end.units_total) == (UMBRELLA, None)
         assert all(prop is not None for prop, _m, _e in _results(job_id).values())

@@ -20,6 +20,7 @@ from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 
 from src.config import settings
 from src.db.models import Job, Result, ScraperConfig
@@ -1123,9 +1124,10 @@ async def test_repair_write_guard_skips_a_row_whose_party_parcel_or_case_moved(d
                         {"u": user_id, "j": job_id})
             sdb.commit()
 
-    await asyncio.to_thread(_config_owner, starter_user.id)   # config re-parented to another tenant
-    assert await asyncio.to_thread(_write) == 0
-    await asyncio.to_thread(_config_owner, business_user.id)
+    # A config can no longer be re-parented to another tenant at all: since migration 113
+    # the database refuses it (BLD21), which is stronger than the write guard's check.
+    with pytest.raises(DBAPIError, match="user_id is immutable"):
+        await asyncio.to_thread(_config_owner, starter_user.id)
     assert await asyncio.to_thread(_write) == 1
 
 

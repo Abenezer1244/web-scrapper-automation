@@ -63,6 +63,13 @@ already deliverable to the user, using the existing `DataExporter` (CSV-injectio
 sanitised). The user gets an expiring signed link by email and in-app. One export
 per 24 h per account. Same RLS and `user_id` filters as every other read.
 
+Decided 2026-10-07 (owner, P4): an account scheduled for deletion cannot download any
+export, including one made before the request (the request already revokes every link).
+The delete dialog says "download your data first"; a user who forgot restores, downloads,
+and asks again. Deletion supersedes an export still being built. The link lasts 7 days;
+`account_exports` rows (ids, timestamps, status) are kept 24 months as the request log.
+Build plan and review log: `tasks/todo-account-deletion.md` (P4).
+
 ## 4. Decisions (owner, 2026-10-06)
 
 Reconciled from three independent research passes (Claude, Perplexity, ChatGPT).

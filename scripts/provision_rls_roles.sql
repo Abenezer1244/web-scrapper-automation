@@ -449,6 +449,21 @@ BEGIN
               account_deletion_queue_tainted(integer, uuid)
               TO bridgeleads_app, bridgeleads_system;
     END IF;
+    -- Account data export (115). The app inserts a pending row for itself and reads its
+    -- own rows; the beat worker moves it. Nobody deletes (24-month request log). Must
+    -- stay AFTER the system ALL TABLES grant, which would hand the worker INSERT.
+    IF to_regclass('public.account_exports') IS NOT NULL THEN
+        REVOKE ALL ON account_exports FROM bridgeleads_app, bridgeleads_system;
+        GRANT SELECT ON account_exports TO bridgeleads_app;
+        GRANT INSERT (user_id) ON account_exports TO bridgeleads_app;
+        GRANT SELECT ON account_exports TO bridgeleads_system;
+        GRANT UPDATE (status, claim_id, claimed_until, next_attempt_at, attempts,
+              size_bytes, ready_at, expires_at, email_sent_at, email_attempts, last_error)
+              ON account_exports TO bridgeleads_system;
+        DROP POLICY IF EXISTS account_exports_system ON account_exports;
+        CREATE POLICY account_exports_system ON account_exports
+            FOR ALL TO bridgeleads_system USING (true) WITH CHECK (true);
+    END IF;
     -- users CASCADEs into account_deletions: only the owner may delete/truncate it.
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
         REVOKE DELETE, TRUNCATE ON users FROM anon;

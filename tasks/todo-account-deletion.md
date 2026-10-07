@@ -120,8 +120,8 @@ Homeowner suppression is the NEXT project, not this one.
   only; they must never move `deletion_state` back; reconciliation must never revive
   `paused_reason='account_deletion'` (test).
 - **403 gate allowlist (exhaustive):** `GET /auth/me` (shows state + date),
-  `POST /auth/account/restore`, `POST /auth/logout`, `POST /auth/refresh`, and (P4)
-  downloading an export made before the request. Creating a new export while pending is
+  `POST /auth/account/restore`, `POST /auth/logout`, `POST /auth/refresh`. (P4 decision A,
+  2026-10-07: no export download while pending; restore first.) Creating a new export while pending is
   403 (the dialog says "download your data first"). Everything else 403 `account_pending_deletion`. API keys are cleared on
   day 0 so they cannot reach the gate.
 - **Trial farming:** at purge, if `trial_consumed_at` was set, keep the email HMAC in
@@ -385,3 +385,151 @@ Resend through the existing fake-module test pattern.
 - Kept by documented decision: proceed at day 40 under the fence (CCPA 45-day deadline, design doc
   "Deferred ... only until day 40"), with an ops alert; emails are at-least-once (Resend 2.7.0 has
   no idempotency key; design: "rare duplicate on crash accepted"). R2 has no object versioning.
+
+## P4 plan: data export (2026-10-07, draft for Codex consult + owner OK)
+
+Spec: design doc §3. P3 is live (main @ 181e2e1c, alembic 114, prod 0 deletion rows, flag OFF).
+
+### Facts this plan rests on (read 2026-10-07)
+- R2 presigned URLs 401 in production (`tasks_helpers/status.py:_delivery_download_url`); every
+  emailed link is an app URL carrying a revocable `purpose=download` JWT (`download_tokens.py`),
+  verified against the jti blacklist + the logout-all cutoff + `is_active` + `deletion_state IS NULL`
+  (`jobs.py:_user_from_download_token`). There is no R2 GET helper yet (only PUT/DELETE/list).
+- The lead CSV a user "can already download" is built LIVE per job by `GET /jobs/{id}/download`
+  (standing rules: actionable, tax cap, category `new`, config layout/hidden fields), only for
+  delivered jobs with an `export_key`. Batch combined and segment exports are re-cuts of the same
+  rows, so one CSV per downloadable job covers every lead.
+- A deletion request already revokes every token (logout-all cutoff, `account_deletion.py`), and
+  the P3 R2 sweep deletes everything under `exports/{user_id}/` twice.
+- `audit_log` is best-effort fire-and-forget: it cannot hold the 24 h limit. Redis is not durable.
+- `retention._sweep_exports(db, stmt, clear_stmt, cutoff, batch)` is generic (delete object, then
+  conditional NULL of the key).
+
+### Design
+- **Table `account_exports` (migration 115, ask owner first; `purgesim.py` before merge).**
+  id uuid PK, user_id uuid NOT NULL FK users, status `pending|building|ready|failed` (CHECK),
+  requested_at, claimed_until (lease), attempts, object_key NULL, size_bytes, ready_at,
+  expires_at (= ready_at + 7 d), email_sent_at, last_error (no PII). Partial UNIQUE: one
+  `pending|building` row per user. RLS: user isolation (app SELECT/INSERT own rows), system
+  SELECT/UPDATE (worker); no DELETE for anyone. The 113 fence trigger `account_deletion_fence`
+  attached with `object_key, status` pinned (INSERT for a purging/deleted owner raises BLD20; an
+  in-flight build can never publish a key after the claim). Retention: KEEP 24 months as the
+  request log (CCPA 11 CCR 7101 keeps records of access requests 24 months), matrix row added; the
+  purge needs no new grant. Mirrored in provision_rls_roles.sql.
+- **`POST /auth/export`** {current_password, mfa_code?}: `require_session` + `get_rls_db`;
+  `lock_user` (users row FOR NO KEY UPDATE serialises two clicks); `_reauthenticate`; second
+  factor (`_second_factor`); refuse 429 (+ `Retry-After`) if a non-failed export was requested in
+  the last 24 h; refuse 409 if one is in progress; INSERT pending row; commit; audit
+  `account_export_requested` (added to SECURITY_EVENTS). 202 {id, status}. Pending account = 403
+  from the existing gate (not allowlisted). Not behind ACCOUNT_DELETION_ENABLED (export is
+  useful alone; owner to confirm).
+- **`GET /auth/export`**: the latest export (status, requested_at, ready_at, expires_at,
+  next_allowed_at) for the in-app panel. **`GET /auth/export/{id}/url`**: 60 s token URL
+  (mirror of `/jobs/{id}/export-url`), 404 unless ready, own and unexpired.
+- **`GET /auth/export/{id}/download?token=`**: token-only. New `purpose=account_export` token
+  (claim `export_id`, own mint fn in `download_tokens.py`, so a job token can never open an export
+  or vice versa); verification shares `_user_from_download_token`'s checks (refactored to take the
+  purpose + claim name). Streams the ZIP from R2 via a new `DataExporter.stream_from_r2(key)`
+  (native API GET, like list/delete). `Cache-Control: no-store`, export rate-limit zone.
+- **Worker: outbox, not `.delay()` alone.** Beat `build_account_exports` every 1 min (own advisory
+  lock) claims `pending` rows (lease 30 min, `FOR UPDATE SKIP LOCKED`), and the route also
+  `.delay()`s for latency; a lost message is picked up by the beat. Skip + `failed` if the owner's
+  `deletion_state` is not NULL (checked at claim and again before upload and email). Build in a
+  temp dir:
+  - `profile.json` (email, names, timezone, plan, subscription status, created_at, notification
+    prefs, mfa_enabled; never hashes, keys or tokens),
+  - `scrapers.json` (configs incl. schedule/fields/deliver), `batches.json`, `runs.json`
+    (jobs + batch_runs: status, counts, dates; no export keys),
+  - `leads/<config-name>_<job8>.csv` per downloadable job, through the SAME query as the job
+    download (extracted from `jobs.py` into a shared helper so the two can never drift) and
+    `DataExporter.export(fmt="csv")` (CSV-injection sanitised by the shared builder). The JSON
+    files are not lead rows (DataExporter's JSON is the lead-row schema), so they are `json.dump`
+    of explicit allowlisted dicts; the CSV injection risk does not apply to JSON.
+  - Every query filters `user_id` explicitly. ZIP_DEFLATED, uploaded to
+    `exports/{user_id}/account/{export_id}.zip` (inside the P3 sweep prefix).
+  - Then CAS `building -> ready` with key/size/expiry, then email (7-day token link, capped at
+    expires_at) -> `email_sent_at` (at-least-once). Failure -> attempts++, backoff, `failed`
+    after 3 (row + ops log, no PII); a failed export does not count toward the 24 h limit.
+- **Expiry:** retention gains one `_sweep_exports` call for `account_exports.object_key` with
+  `expires_at < now()` (object deleted first, then key NULLed conditionally). Download refuses
+  past `expires_at` even before the sweep runs.
+- **Size guard:** a hard cap on rows per export (configurable setting) so one huge account cannot
+  run a worker out of disk/time; over the cap -> `failed` with a "contact support" message (owner
+  to confirm the cap; today's largest account is far below it, to measure read-only).
+
+### Open question (handoff §3): the download belt during the grace period
+The design doc says a pending user may download an export made BEFORE the request; the P2b belt
+refuses every link for a non-NULL deletion_state. Options:
+- **A (recommended): keep the belt strict.** The request already kills every link (logout-all
+  cutoff), the delete dialog says "download your data first", and a pending account is gated to
+  /auth/me + Restore. A user who forgot restores, downloads, and asks again. Change: amend design
+  doc §2 + the allowlist line above. No code.
+- B: allowlist `GET /auth/export`, `/url` and the download for pending accounts, only for exports
+  with `requested_at <` the deletion's `requested_at`. Tokens are freshly minted after sign-in, so
+  revocation holds; cost: a wider gate, and a pending account keeps a working data path for 30 d.
+
+### Codex design consult round 1: DESIGN: REVISE (no P0). Revised design, supersedes the above
+- **Table (revised):** + `claim_id` uuid, `next_attempt_at`, status adds `expired`. CHECKs:
+  `object_key` is exactly `'exports/'||user_id||'/account/'||id||'.zip'` when set (so no row can
+  point at another tenant's object; download/retention also recompute it); `ready` => key, size,
+  ready_at, expires_at set; `pending|building` => no key; `expires_at = ready_at + 7 days`. App
+  role: column INSERT on `(user_id)` only + RLS WITH CHECK own id, SELECT own rows; no UPDATE.
+  Worker (`bridgeleads_system`, not owner, NOBYPASSRLS policy pattern as 114) SELECT/UPDATE.
+- **One worker entry point:** the beat only (every minute, no `.delay()` from the route). Claim =
+  one conditional UPDATE (`pending`, or `building` with an expired lease, and `next_attempt_at`
+  due) `FOR UPDATE SKIP LOCKED`, rotating `claim_id`; every later write matches id + status +
+  claim_id + live lease.
+- **Finalise vs deletion (race):** the `building -> ready` CAS runs in a txn that first takes
+  `SELECT deletion_state FROM users ... FOR SHARE` (conflicts with the deletion request's FOR NO
+  KEY UPDATE; users row first, the same lock order as 112/113) and requires it NULL. Refused ->
+  the uploaded object is deleted and the row goes `failed` ("account scheduled for deletion").
+  So an export is downloadable only if it was ready before any deletion request. Deletion
+  supersedes an export in progress; the P5 dialog shows "an export is being prepared".
+- **Email separate from build:** `ready` never reverts on a Resend failure; email retried on its
+  own (`email_sent_at`, backoff), sent to the account's CURRENT address read at send time.
+- **Redaction allowlists for every JSON file** (seeded-secret test): `deliver` keeps only
+  non-secret keys (method, layout, destination type); `webhook_secret`, `dialer_webhook_secret`,
+  API keys, headers and tokens never leave. `last_error` is a fixed code, never exception text.
+- **ZIP member names from ids only** (`leads/<job_id>.csv`; `runs.json` maps job -> config
+  name/county/type), so no user string reaches a path.
+- **Limits:** row cap, ZIP byte cap (checked before upload), Celery soft time limit; temp dir
+  removed in `finally`; nothing published until the ZIP is complete.
+- **Snapshot:** all reads in one REPEATABLE READ read-only transaction (build-time snapshot).
+- **CSV injection:** already an invariant: `write_lead_csv` runs every cell through
+  `sanitize_for_csv` (`lead_export.py`); test formula payloads in every lead field.
+- **Order of refusals on POST:** 403 pending (gate) -> step-up -> 409 in progress -> 429 within
+  24 h. URL minting rate-limited (export zone), separate from download.
+- Refuted: CSRF (the API authenticates by `Authorization: Bearer`, never cookies). Kept by
+  existing pattern: token in the query string (same as every emailed job link; no-store,
+  `Referrer-Policy: strict-origin-when-cross-origin`, the ZIP is an attachment with no page
+  resources; the token is never logged by our code), audit best-effort (quota lives in the DB).
+- **A vs B:** Codex recommends A (keep the belt strict).
+
+### Owner decisions (2026-10-07)
+1. A: belt stays strict; design doc §3 amended. 2. Migration 115 approved; rows KEEP 24 mo
+(request log, matrix row). 3. Own flag `ACCOUNT_EXPORT_ENABLED` (default false; 404 when off).
+4. Caps: 250k lead rows, 200 MB ZIP (settings), largest real account measured read-only first.
+
+### P4a build (migration 115) review log
+- Built as revised above, except: the ZIP key is not stored at all (derived from user_id + id), and
+  the fence is attached with no pinned columns (publishing is ordered by the worker's users FOR SHARE;
+  a pin would make the expiry sweep retry a deleted owner's row forever).
+- Codex diff review round 1: FAIL. Adopted: expiry needs ready_at (NULL hole), non-negative counters,
+  constrained last_error. Refuted: CASCADE FK defeats retention (no role can delete users, asserted since
+  112; account_deletions has the same FK), provisioning role guards (the script creates the roles
+  first), role tests skipping in CI (existing pattern; purgesim enforces the matrix).
+- Round 2: FAIL (shape check admits names) -> fixed allowlist of codes. **Round 3: GATE: PASS.**
+- purgesim.py extended (account_exports role x privilege matrix + column grants, proven to catch a
+  hand-granted DELETE): PASS after every round. 21 fenced tables ENABLE ALWAYS.
+
+### PRs (each: tests on the real DB, stand-ins only for R2/Resend; Codex diff review to GATE PASS)
+- [ ] **P4a migration 115** (alone, schema-first): table, CHECK, partial unique, RLS + grants,
+      fence trigger, provisioning mirror, downgrade; tests (constraints, RLS cross-tenant, fence
+      BLD20 + pin, no DELETE); `purgesim.py` extended + PASS. Owner OK before merge.
+- [ ] **P4b worker**: ORM model, shared deliverable-rows query (jobs.py refactor, behaviour
+      unchanged), `stream_from_r2`, builder + beat task + email, retention sweep line. Tests: full
+      ZIP content on a seeded account (another tenant's rows absent), CSV injection sanitised,
+      pending account refused, crash after upload resumes, lease, expiry sweep.
+- [ ] **P4c routes**: POST/GET export, url, download, token purpose, schemas, OpenAPI regen (0
+      deletions) -> FE types-regen PR. Tests: step-up + MFA, 24 h limit, 409 in progress, 403
+      pending, cross-tenant 404, token purpose/claim/expiry/logout-all/deletion belt, audit event.

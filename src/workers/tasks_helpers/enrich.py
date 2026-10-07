@@ -1209,6 +1209,16 @@ def _run_inline_enrichment(
             # after it are unmeasured, and a stale "500 of 1200" must not outlive
             # the sweep. The original exception always propagates.
             if progress is not None and progress.last_stage == _LOOKUP_GIS_STAGE:
+                if not db.is_active:
+                    # A failed flush or commit (e.g. the per-batch log line's) left
+                    # the transaction unusable: nothing in it can ever commit, so a
+                    # rollback loses nothing and lets the reset land. Pending work in
+                    # a USABLE transaction is never rolled back here; report() skips.
+                    try:
+                        db.rollback()
+                    except Exception as rb_exc:  # noqa: BLE001 -- keep the original error
+                        _logger.warning("Job %s: rollback before the lookup stage reset "
+                                        "failed: %s", job_id, type(rb_exc).__name__)
                 progress.report(_LOOKUP_STAGE)
         if gis_mailing_deferred:
             _logger.warning(

@@ -483,6 +483,43 @@ class TestAbnormalEnd:
         assert (end.stage, end.units_done, end.units_total, end.progress_unit) == (
             UMBRELLA, None, None, None)
 
+    async def test_a_failed_log_commit_after_the_progress_write_still_resets(
+            self, db, business_user, redis_client, monkeypatch):
+        """The per-batch log row is rejected AT ITS COMMIT by a real PostgreSQL trigger
+        (created for this test only), after the batch's progress write landed. The
+        transaction is unusable, so the reset rolls it back and lands; the database
+        error escapes unchanged."""
+        from sqlalchemy.exc import DBAPIError
+
+        suffix = uuid.uuid4().hex[:12]
+        fn, trg = f"bl_test_reject_progress_log_{suffix}", f"bl_test_reject_{suffix}"
+        await db.execute(text(
+            f"CREATE FUNCTION {fn}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+            "IF NEW.message LIKE 'Property lookup progress:%' THEN "
+            "RAISE EXCEPTION 'progress log rejected for this test'; END IF; "
+            "RETURN NEW; END $$"))
+        await db.execute(text(
+            f"CREATE TRIGGER {trg} BEFORE INSERT ON job_logs "
+            f"FOR EACH ROW EXECUTE FUNCTION {fn}()"))
+        await db.commit()
+        try:
+            job_id, token, _pids = await _job(db, business_user, parcels=5)
+            _batch(monkeypatch)
+            writes = _recorder(monkeypatch)
+            _county(monkeypatch, _all_answered)
+            with pytest.raises(DBAPIError, match="progress log rejected"):
+                await _enrich(job_id, redis_client, token)
+        finally:
+            await db.rollback()
+            await db.execute(text(f"DROP TRIGGER IF EXISTS {trg} ON job_logs"))
+            await db.execute(text(f"DROP FUNCTION IF EXISTS {fn}()"))
+            await db.commit()
+        assert _counts(writes) == [(GIS, 2, 5, "parcel"), (UMBRELLA, None, None, None)]
+        end = _row(job_id)
+        assert (end.stage, end.units_done, end.units_total, end.progress_unit) == (
+            UMBRELLA, None, None, None)
+        assert _progress_logs(job_id) == []
+
     async def test_a_soft_time_limit_resets_and_escapes_unchanged(
             self, db, business_user, redis_client, monkeypatch):
         job_id, token, _pids = await _job(db, business_user, parcels=5)

@@ -19,6 +19,80 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-10-06 (session 2) — Account deletion P3a live (migration 113); P3b built, reviewed
+
+**Built / Shipped:** BE #476 (squash 5b7a00aa) migration 113 LIVE and prod-verified read-only.
+It adds the purge write fence (`zz_account_deletion_fence` on 20 tables, ENABLE ALWAYS), four
+definer functions (claim / progress / purge / complete) and two definer lookups, all owned by
+`bridgeleads_purge`. BE #477 (P3b-1, open, CI green, Codex GATE PASS) adds:
+- the `drive_account_deletions` beat (5 min, advisory-locked);
+- the Stripe cancel/un-cancel reconcile with idempotency keys;
+- the "scheduled for deletion" notice, sent only after billing is confirmed stopped;
+- an overdue alert;
+- the skip-trace access rule: `deletion_state` means `ended`;
+- migration 114 (the worker may READ account_deletions).
+
+P3b-2 (branch `feat/account-deletion-p3b2`, stacked on #477, Codex GATE PASS, not pushed) is the
+purge driver:
+- defer while work is in flight (until day 40) → claim → R2 sweep;
+- batched purge → final email → ORM tombstone;
+- after the 24 h reclaim: purge re-run → R2 sweep 2, fail closed → complete;
+- Stripe Customer deleted once nothing is live or open.
+
+**Tried / Decided:**
+- A code audit found beat sweeps that UPDATE many tenants in one statement: the skip-trace
+  dispatcher, NTS matcher, dialer push, quota and recovery sweeps. A fence that raises on UPDATE
+  would have aborted them for everyone once any account was purging. The owner chose the "pin"
+  fence: INSERT raises BLD20; UPDATE keeps the SCRUB columns at their old values; `user_id` is
+  immutable.
+- `skip_trace_queues` rows are shared Tracerfy batches whose `user_id` is only the FIRST
+  tenant. They get their own non-raising trigger, their identity columns are immutable, and the
+  purge finds them through the kept pending rows.
+- The claim takes users `FOR UPDATE SKIP LOCKED`, so it skips accounts with a write in flight.
+  It sets `is_active=false`, so every sign-in path returns 401 with no route change.
+- UPDATEs take no users lock, because it would deadlock with existing `FOR UPDATE` code. The
+  purge is re-runnable instead, and complete refuses (BLD36) while scrubbed data reappeared.
+
+**Failed / Blocked:**
+- Background CI pollers and a local full-suite run were killed or superseded; I re-ran the
+  suite in the foreground.
+- Heredocs carrying Python patches broke twice (unterminated strings). I wrote the patches with
+  the Write tool instead.
+- `--timeout` isn't a pytest flag here (no pytest-timeout installed).
+
+**Caught & fixed:**
+- In the prod-like non-superuser simulation, the migration owner's EXECUTE grant was dropped by
+  ALTER OWNER. It is now granted as the new owner.
+- The STABLE-function finding was mutation-tested and was not exploitable, because the function
+  is called from a volatile trigger.
+- Production's R2 S3 keys cannot ListObjects (Unauthorized). Listing uses the native Cloudflare
+  API, verified read-only against production.
+- Codex rounds: 113 diff 11, P3b-1 2, P3b-2 7. Highlights:
+  - the audit-detail fence;
+  - a tombstone invariant checked in SQL;
+  - DELETE on billing skeletons revoked from the API roles;
+  - the pending lookup's `tracerfy_queue_id` pinned;
+  - an R2 sweep with time checks;
+  - a pause that hands the lease back;
+  - all in-flight deferrals drained before any claim.
+
+**Pending / Handoff:** `docs/HANDOFF-account-deletion-p3b-2026-10-06.md`:
+- merge #477 (owner approval: migration 114);
+- rebase and push P3b-2 → PR → CI → owner OK → merge;
+- then P4 export and P5 frontend;
+- the owner flips `ACCOUNT_DELETION_ENABLED` last.
+
+**Facts learned:**
+- Supabase `postgres` is not a superuser. Grant to `current_user` only AFTER `ALTER OWNER`, as
+  the new owner.
+- The worker role had no access to `account_deletions` before 114.
+- Production's R2 S3 credentials can't list; the native API token can.
+- The local full pytest has 3 pre-existing contact_lookup_schema worker-role failures (the same
+  at 112).
+- `time.monotonic()` ticks at about 15 ms on Windows, so deadline checks use `>=`.
+
+---
+
 ## 2026-10-06 — Profile follow-ups 2-4 live; account deletion P1+P2 live, P3 started
 
 **Built / Shipped:** BE #470 (fam session needs a live user_sessions row), FE #241 (times in the

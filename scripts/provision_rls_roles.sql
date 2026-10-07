@@ -439,7 +439,8 @@ BEGIN
               record_deletion_progress(uuid, uuid, text, text, text, text),
               purge_account_data(uuid, uuid, text[], integer),
               complete_account_deletion(uuid, uuid) TO bridgeleads_system;
-        GRANT EXECUTE ON FUNCTION account_deletion_owner_state(uuid, uuid, boolean)
+        GRANT EXECUTE ON FUNCTION account_deletion_owner_state(uuid, uuid, boolean),
+              account_deletion_queue_tainted(integer, uuid)
               TO bridgeleads_app, bridgeleads_system;
     END IF;
     -- users CASCADEs into account_deletions: only the owner may delete/truncate it.

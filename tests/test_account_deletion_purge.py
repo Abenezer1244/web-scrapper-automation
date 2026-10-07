@@ -507,8 +507,9 @@ def test_complete_needs_every_phase_and_the_24_hour_gap(conn) -> None:
         assert _sqlstate(conn, "SELECT complete_account_deletion(:d, :t)",
                          {"d": did, "t": token}) == "BLD36", late
         assert _purge(conn, did, token) is True
-    # A Tracerfy batch carrying the user's row still in flight would write its link after
-    # completion: refused until it finishes, then the purge re-run clears the link.
+    # A Tracerfy batch carrying the user's row still in flight: completion waits for it
+    # to finish, and the link it finishes with is never stored (shared batches are
+    # pinned, not refused, once any tenant is purging).
     queue_n = random.randint(1, 2**31 - 1)
     conn.execute(text("INSERT INTO skip_trace_queues (id, tracerfy_queue_id, user_id) "
                       "VALUES (gen_random_uuid(), :n, :u)"), {"n": queue_n, "u": uid})
@@ -517,9 +518,8 @@ def test_complete_needs_every_phase_and_the_24_hour_gap(conn) -> None:
     conn.execute(text("UPDATE skip_trace_queues SET status = 'completed', "
                       "download_url = 'https://vendor.test/late.csv' "
                       "WHERE tracerfy_queue_id = :n"), {"n": queue_n})
-    assert _sqlstate(conn, "SELECT complete_account_deletion(:d, :t)",
-                     {"d": did, "t": token}) == "BLD36"
-    assert _purge(conn, did, token) is True
+    assert conn.execute(text("SELECT download_url FROM skip_trace_queues "
+                             "WHERE tracerfy_queue_id = :n"), {"n": queue_n}).scalar() is None
     # An audit row written while purging (a refused sign-in) loses its detail too.
     conn.execute(text("INSERT INTO audit_events (id, event, user_id, detail) "
                       "VALUES (gen_random_uuid(), 'login_failure', :u, 'late')"), {"u": uid})
@@ -670,7 +670,8 @@ async def test_a_purging_account_cannot_sign_in_or_refresh(
 
 def test_purge_functions_and_fence_are_locked_down(conn) -> None:
     for fn in ("claim_account_deletion", "record_deletion_progress", "purge_account_data",
-               "complete_account_deletion", "account_deletion_owner_state"):
+               "complete_account_deletion", "account_deletion_owner_state",
+               "account_deletion_queue_tainted"):
         owner, definer, config, acl = conn.execute(text(
             "SELECT pg_get_userbyid(proowner), prosecdef, proconfig, proacl::text "
             "FROM pg_proc WHERE proname = :f"), {"f": fn}).one()
@@ -678,7 +679,7 @@ def test_purge_functions_and_fence_are_locked_down(conn) -> None:
         assert config == ["search_path=pg_catalog, pg_temp"]
         assert acl is not None and not any(e.startswith("=") for e in acl.strip("{}").split(","))
     for fn in ("account_deletion_fence", "account_deletion_fence_job_logs",
-               "account_deletion_fence_audit"):
+               "account_deletion_fence_audit", "account_deletion_fence_queue"):
         definer, acl = conn.execute(text(
             "SELECT prosecdef, proacl::text FROM pg_proc WHERE proname = :f"), {"f": fn}).one()
         assert definer is False
@@ -686,7 +687,7 @@ def test_purge_functions_and_fence_are_locked_down(conn) -> None:
     enabled = dict(conn.execute(text(
         "SELECT c.relname, t.tgenabled FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid "
         "WHERE t.tgname = 'zz_account_deletion_fence'")).all())
-    assert enabled == dict.fromkeys((*_FENCED, "audit_events"), "A")
+    assert enabled == dict.fromkeys((*_FENCED, "audit_events", "skip_trace_queues"), "A")
     assert conn.execute(text(
         "SELECT count(*) FROM pg_auth_members WHERE roleid = 'bridgeleads_purge'::regrole "
         "AND (set_option OR inherit_option OR member <> current_user::regrole)")).scalar() == 0
@@ -704,7 +705,8 @@ def test_supabase_api_roles_cannot_run_the_purge(conn) -> None:
                    "purge_account_data(uuid, uuid, text[], integer)",
                    "complete_account_deletion(uuid, uuid)",
                    "account_deletion_fence()", "account_deletion_fence_job_logs()",
-                   "account_deletion_fence_audit()",
+                   "account_deletion_fence_audit()", "account_deletion_fence_queue()",
+                   "account_deletion_queue_tainted(integer, uuid)",
                    "account_deletion_owner_state(uuid, uuid, boolean)"):
             assert conn.execute(text("SELECT has_function_privilege(:r, :f, 'EXECUTE')"),
                                 {"r": role, "f": fn}).scalar() is False, (role, fn)

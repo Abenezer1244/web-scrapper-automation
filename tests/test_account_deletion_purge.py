@@ -478,6 +478,11 @@ def test_complete_needs_every_phase_and_the_24_hour_gap(conn) -> None:
     assert refused(token)
     _progress(conn, did, token, "final_email_sent")
     assert refused(token)
+    # The marker needs the users row really tombstoned (what SQL can see of it).
+    conn.execute(text("UPDATE users SET first_name = 'Jane' WHERE id = :u"), {"u": uid})
+    assert _sqlstate(conn, "SELECT record_deletion_progress(:d, :t, 'tombstoned')",
+                     {"d": did, "t": token}) == "BLD34"
+    conn.execute(text("UPDATE users SET first_name = NULL WHERE id = :u"), {"u": uid})
     # Tombstone parks the row until 24 h after the first sweep, lease released.
     _progress(conn, did, token, "tombstoned")
     row = _deletion(conn, did)
@@ -502,6 +507,19 @@ def test_complete_needs_every_phase_and_the_24_hour_gap(conn) -> None:
         assert _sqlstate(conn, "SELECT complete_account_deletion(:d, :t)",
                          {"d": did, "t": token}) == "BLD36", late
         assert _purge(conn, did, token) is True
+    # A Tracerfy batch carrying the user's row still in flight would write its link after
+    # completion: refused until it finishes, then the purge re-run clears the link.
+    queue_n = random.randint(1, 2**31 - 1)
+    conn.execute(text("INSERT INTO skip_trace_queues (id, tracerfy_queue_id, user_id) "
+                      "VALUES (gen_random_uuid(), :n, :u)"), {"n": queue_n, "u": uid})
+    assert _sqlstate(conn, "SELECT complete_account_deletion(:d, :t)",
+                     {"d": did, "t": token}) == "BLD36"
+    conn.execute(text("UPDATE skip_trace_queues SET status = 'completed', "
+                      "download_url = 'https://vendor.test/late.csv' "
+                      "WHERE tracerfy_queue_id = :n"), {"n": queue_n})
+    assert _sqlstate(conn, "SELECT complete_account_deletion(:d, :t)",
+                     {"d": did, "t": token}) == "BLD36"
+    assert _purge(conn, did, token) is True
     # An audit row written while purging (a refused sign-in) loses its detail too.
     conn.execute(text("INSERT INTO audit_events (id, event, user_id, detail) "
                       "VALUES (gen_random_uuid(), 'login_failure', :u, 'late')"), {"u": uid})

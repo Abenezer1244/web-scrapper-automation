@@ -425,6 +425,9 @@ BEGIN
         GRANT UPDATE (detail) ON audit_events TO bridgeleads_purge;
         GRANT SELECT (email_hmac, trial_consumed_at) ON users TO bridgeleads_purge;
         GRANT UPDATE (is_active) ON users TO bridgeleads_purge;
+        GRANT SELECT (is_admin, mfa_enabled, name, first_name, last_name, timezone,
+              api_key_hash, mfa_secret_encrypted, referral_code, notification_prefs)
+              ON users TO bridgeleads_purge;
         GRANT UPDATE (expires_at) ON consumed_trial_emails TO bridgeleads_purge;
         -- Only the beat worker drives the purge; every writer of a fenced table calls
         -- the fence's owner-state lookup.

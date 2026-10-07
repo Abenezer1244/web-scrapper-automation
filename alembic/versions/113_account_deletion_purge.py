@@ -104,6 +104,9 @@ _API_ROLES = ("anon", "authenticated", "service_role", "bridgeleads_app")
 # The fence's state lookup runs as the purge role and is called by every writer of a
 # fenced table: the runtime roles and the migration owner.
 _OWNER_STATE_FN = "account_deletion_owner_state(uuid, uuid, boolean)"
+# users columns the tombstone check reads (id/is_active/deletion_state come from 112).
+_TOMBSTONE_COLS = ("is_admin, mfa_enabled, name, first_name, last_name, timezone, "
+                   "api_key_hash, mfa_secret_encrypted, referral_code, notification_prefs")
 # zz_: BEFORE row triggers fire in name order, so the fence sees the final NEW.
 _TRIGGER = "zz_account_deletion_fence"
 
@@ -385,6 +388,16 @@ BEGIN
             IF v_row.final_email_sent_at IS NULL THEN
                 RAISE EXCEPTION 'tombstone before the final email' USING ERRCODE = 'BLD34';
             END IF;
+            -- The tombstone is written in Python (the Fernet email placeholder); what SQL can
+            -- verify of it must hold before the marker is set and again at completion.
+            IF EXISTS (SELECT 1 FROM public.users u WHERE u.id = v_uid
+                          AND (u.is_active OR u.is_admin OR u.mfa_enabled OR u.name IS NOT NULL
+                            OR u.first_name IS NOT NULL OR u.last_name IS NOT NULL
+                            OR u.timezone IS NOT NULL OR u.api_key_hash IS NOT NULL
+                            OR u.mfa_secret_encrypted IS NOT NULL OR u.referral_code IS NOT NULL
+                            OR u.notification_prefs::text <> '{}')) THEN
+                RAISE EXCEPTION 'users row is not tombstoned' USING ERRCODE = 'BLD34';
+            END IF;
             UPDATE public.account_deletions
                SET tombstoned_at = COALESCE(tombstoned_at, v_now), claimed_until = v_now,
                    next_attempt_at = r2_first_sweep_at + interval '24 hours'
@@ -597,16 +610,28 @@ BEGIN
                     OR b.delivery_mode <> 'everything' OR b.fields::text <> '[]'
                     OR b.enrichment::text <> '[]' OR b.schedule::text <> '{}'
                     OR b.deliver::text <> '{}'))
-       -- A batch that finished after the first pass still carries its link.
+       -- A batch that finished after the first pass still carries its link; one still
+       -- in flight would write it after completion (Tracerfy retries end in errored).
        OR EXISTS (SELECT 1 FROM public.skip_trace_queues q
-                   WHERE q.status IN ('completed', 'errored')
-                     AND (q.download_url IS NOT NULL OR q.error_message IS NOT NULL)
+                   WHERE (q.status = 'pending'
+                          OR (q.status IN ('completed', 'errored')
+                              AND (q.download_url IS NOT NULL OR q.error_message IS NOT NULL)))
                      AND (q.user_id = v_uid OR q.tracerfy_queue_id IN (
                           SELECT p.tracerfy_queue_id FROM public.pending_skip_trace_rows p
                            WHERE p.user_id = v_uid AND p.tracerfy_queue_id IS NOT NULL)))
        THEN
         RAISE EXCEPTION 'personal data written during the purge: run the purge again'
             USING ERRCODE = 'BLD36';
+    END IF;
+    -- The tombstone is written in Python (the Fernet email placeholder); what SQL can
+    -- verify of it must hold before the marker is set and again at completion.
+    IF EXISTS (SELECT 1 FROM public.users u WHERE u.id = v_uid
+                  AND (u.is_active OR u.is_admin OR u.mfa_enabled OR u.name IS NOT NULL
+                    OR u.first_name IS NOT NULL OR u.last_name IS NOT NULL
+                    OR u.timezone IS NOT NULL OR u.api_key_hash IS NOT NULL
+                    OR u.mfa_secret_encrypted IS NOT NULL OR u.referral_code IS NOT NULL
+                    OR u.notification_prefs::text <> '{}')) THEN
+        RAISE EXCEPTION 'users row is not tombstoned' USING ERRCODE = 'BLD34';
     END IF;
     -- Audit rows written while purging (e.g. a refused sign-in) lose their detail too.
     UPDATE public.audit_events SET detail = NULL WHERE user_id = v_uid AND detail IS NOT NULL;
@@ -682,6 +707,7 @@ def upgrade() -> None:
             {nl.join(grants)}
             GRANT SELECT (email_hmac, trial_consumed_at) ON public.users TO bridgeleads_purge;
             GRANT UPDATE (is_active) ON public.users TO bridgeleads_purge;
+            GRANT SELECT ({_TOMBSTONE_COLS}) ON public.users TO bridgeleads_purge;
             GRANT UPDATE (expires_at) ON public.consumed_trial_emails TO bridgeleads_purge;
             {nl.join(revokes)}
             -- Trigger functions cannot be called directly, but Supabase's default
@@ -764,6 +790,7 @@ def downgrade() -> None:
             {nl.join(revokes)}
             REVOKE SELECT (email_hmac, trial_consumed_at) ON public.users FROM bridgeleads_purge;
             REVOKE UPDATE (is_active) ON public.users FROM bridgeleads_purge;
+            REVOKE SELECT ({_TOMBSTONE_COLS}) ON public.users FROM bridgeleads_purge;
             REVOKE UPDATE (expires_at) ON public.consumed_trial_emails FROM bridgeleads_purge;
         END
         $purge_revoke$;

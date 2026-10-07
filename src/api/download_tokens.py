@@ -35,3 +35,26 @@ def mint_download_token(user_id: str, job_id: str, ttl_seconds: int = 60) -> str
         settings.SECRET_KEY,
         algorithm=_ALGORITHM,
     )
+
+
+def mint_account_export_token(user_id: str, export_id: str, ttl_seconds: int) -> str:
+    """Return a signed token for one account data export (GET /auth/export/{id}/download).
+
+    Its own purpose and claim (``purpose=account_export``, ``export_id``), so a job
+    download token can never open an export, nor an export token a job's file. Same
+    audience/issuer/jti/iat as a job token, so the same revocation checks apply."""
+    now = int(time.time())
+    return jwt.encode(
+        {
+            "sub": str(user_id),
+            "export_id": export_id,
+            "purpose": "account_export",
+            "aud": "bridgeleads-download",
+            "iss": "bridgeleads",
+            "jti": uuid.uuid4().hex,
+            "iat": now,
+            "exp": now + ttl_seconds,
+        },
+        settings.SECRET_KEY,
+        algorithm=_ALGORITHM,
+    )

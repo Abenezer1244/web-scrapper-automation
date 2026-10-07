@@ -281,6 +281,7 @@ class DataExporter:
             ".csv": "text/csv",
             ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             ".json": "application/json",
+            ".zip": "application/zip",  # the account data export (account_export.py)
         }
         content_type = content_types.get(local_path.suffix, "application/octet-stream")
 

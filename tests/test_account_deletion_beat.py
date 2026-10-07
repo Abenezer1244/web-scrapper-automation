@@ -288,9 +288,12 @@ def _user_row(uid: str):
 
 
 def _cleanup_cache(ids) -> None:
+    """Rows _seed writes with no foreign key to users (deleting the user leaves them)."""
     with sync_engine.begin() as c:
         c.execute(text("DELETE FROM skip_trace_cache WHERE address_hash IN (:a, :b)"),
                   {"a": ids["subject"], "b": ids["cachekey"]})
+        c.execute(text("DELETE FROM pending_registrations WHERE email_hmac = :h"),
+                  {"h": ids["hmac"]})
 
 
 def _due_now(did: str) -> None:

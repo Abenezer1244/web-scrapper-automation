@@ -314,3 +314,74 @@ Homeowner suppression is the NEXT project, not this one.
   Round 10: FAIL. Taint lookup made VOLATILE + waiting-webhook race test; mutation showed
   STABLE was not exploitable (called from the volatile trigger).
   **Round 11: GATE: PASS.** Prod-like simulation PASS after every round.
+
+## P3b plan (2026-10-06, draft for Codex consult + owner OK)
+
+Two PRs, each <= 5 files, Python only (no migration). One beat task
+`src.workers.scheduler.drive_account_deletions` every 5 min (float, < 10 min rule), thin
+wrapper over `_drive_account_deletions_impl()` in a new `src/workers/account_deletion_beat.py`
+(added to `src/workers/__init__.py` include). Runs regardless of ACCOUNT_DELETION_ENABLED
+(prod has 0 rows; it must already run when the owner flips the flag). External calls never
+inside a DB transaction; every phase records its result through record_deletion_progress.
+Stripe and R2 go through injectable callables (precedent: `_expire_trials_impl(subscription_lookup=)`),
+Resend through the existing fake-module test pattern.
+
+### P3b-1: billing, notice, dispatcher gate
+- [ ] `skip_trace_claim.py`: `deletion_state` in ACCESS_COLUMNS; non-NULL -> ACCESS_ENDED, so
+      claim, dispatcher filter and the locked re-check all withdraw a pending/purging account's
+      lookups (pending users already cannot start jobs: quota_block_reason).
+- [ ] Stripe reconcile: pending rows `pending_cancel` -> `Subscription.modify(sub,
+      cancel_at_period_end=True, idempotency_key="acctdel-<id>-cancel")` -> CAS to `cancel_set`;
+      no subscription / already canceled -> `not_applicable`. Restored rows `pending_uncancel` ->
+      modify(False, key "acctdel-<id>-uncancel") only while the sub is still live and set to
+      cancel, else `not_applicable`. Failure -> 'error' (no token) backoff; bracket access only
+      (stripe 15 StripeObject).
+- [ ] Scheduled email (pending, `scheduled_email_sent_at` NULL): date + Restore CTA, then
+      record 'scheduled_email_sent' (at-least-once).
+- [ ] Day-40 ops alert (`purge_after + 10 d` passed, still not purging): send_ops_alert
+      (6 h cooldown), no PII.
+- [ ] Tests (real DB): CAS paths, restored uncancel, no-sub, Stripe failure backoff, email once,
+      dispatcher withdraws a pending account's queued lookups.
+
+### P3b-2: the purge driver
+- [ ] Precondition before the claim: for each due pending row with in-flight work (non-terminal
+      job, batch run, skip-trace queue, pending row claimed/submitting/submitted) and not past day
+      40 -> 'error' (no token) "waiting for in-flight work" (claim honours next_attempt_at).
+- [ ] Claim (lease 15 min) -> by markers, the next phase:
+      1. R2 sweep 1: capture jobs.export_key + batch_runs.combined_export_key, list
+         `exports/{uid}/` (new paginated `DataExporter.list_r2_keys(prefix)`, native API cursor),
+         delete all (404-safe) -> 'r2_first_sweep'.
+      2. Cache keys = pending_row_subject_key(row) for every pending row (before the scrub) ->
+         purge_account_data batches of 5000 until true (each its own txn; stop if the lease is
+         near its end).
+      3. Final email to the original address (ORM-decrypted before the tombstone) ->
+         'final_email_sent'.
+      4. Tombstone via ORM (email `deleted+<id>@invalid` recomputes email_hmac; names/timezone
+         NULL; prefs {}; password hash_password(token_urlsafe(32)); MFA/api key/referral cleared;
+         is_admin false) -> 'tombstoned' (DB checks the invariant).
+      5. After the 24 h reclaim: purge re-run, R2 sweep 2 (delete, then list must be empty: fail
+         closed) -> 'r2_final_sweep' -> complete (BLD36 -> error backoff, re-run next tick).
+- [ ] Stripe after completion: completed rows with `cancel_set`/`not_applicable` and a customer
+      id: Customer.delete only once no live subscription and no open invoice -> CAS
+      `customer_deleted`; else wait.
+- [ ] Any exception (incl. 40P01) -> 'error' with the token (lease released, backoff).
+- [ ] Tests: the whole walk on a real account (matrix §4 end state incl. users row tombstone and
+      the address registering again), crash after each phase resumes, two workers never share a
+      claim, deferral until day 40, R2 sweep-2 fail-closed.
+
+### P3b Codex design consult (round 1: REVISE) and how each was handled
+- Adopted: check the remaining lease before every external call (stop and let the next tick
+  resume); Customer.delete re-checks subscriptions + open invoices right before, idempotency key
+  `acctdel-<id>-customer`, `resource_missing` = already deleted = success; ops alert also for a
+  purging row stuck in retries (attempts >= 6); R2 sweep deletes the captured explicit keys AND the
+  prefix, any list error = not swept (fail closed); crash-resume tests around each marker.
+- Refuted (evidence): claim cannot reclaim parked rows (it does: tombstoned sets claimed_until=now
+  and next_attempt_at=first sweep+24h; tested); ORM tombstone vs the fence (users is not a fenced
+  table; its guard only covers deletion_state); ACCESS_ENDED blocks restored accounts (restore sets
+  deletion_state NULL); restore tokens in email (none: the CTA is a sign-in link, restore needs the
+  password); email changed during grace (pending accounts are 403-gated, email change included);
+  preflight race (pending accounts cannot start jobs/batches/lookups: quota gate + P3b-1 dispatcher
+  gate; the claim skips accounts with a write in flight).
+- Kept by documented decision: proceed at day 40 under the fence (CCPA 45-day deadline, design doc
+  "Deferred ... only until day 40"), with an ops alert; emails are at-least-once (Resend 2.7.0 has
+  no idempotency key; design: "rare duplicate on crash accepted"). R2 has no object versioning.

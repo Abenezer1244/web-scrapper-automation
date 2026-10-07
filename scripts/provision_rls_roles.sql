@@ -383,6 +383,12 @@ BEGIN
     END IF;
     IF to_regclass('public.account_deletions') IS NOT NULL THEN
         REVOKE ALL ON account_deletions, consumed_trial_emails FROM bridgeleads_system;
+        -- The beat worker READS the deletion queue (114); every write is a definer
+        -- function. Policy mirrored here so a role provisioned after 114 can see rows.
+        GRANT SELECT ON account_deletions TO bridgeleads_system;
+        DROP POLICY IF EXISTS account_deletions_system_select ON account_deletions;
+        CREATE POLICY account_deletions_system_select ON account_deletions
+            FOR SELECT TO bridgeleads_system USING (true);
         REVOKE ALL ON account_deletions, consumed_trial_emails FROM bridgeleads_app;
         GRANT SELECT ON account_deletions, consumed_trial_emails TO bridgeleads_app;
         -- consumed_trial_emails has no user_id (no GUC policy): without this the

@@ -510,6 +510,18 @@ refuses every link for a non-NULL deletion_state. Options:
 (request log, matrix row). 3. Own flag `ACCOUNT_EXPORT_ENABLED` (default false; 404 when off).
 4. Caps: 250k lead rows, 200 MB ZIP (settings), largest real account measured read-only first.
 
+### P4a build (migration 115) review log
+- Built as revised above, except: the ZIP key is not stored at all (derived from user_id + id), and
+  the fence is attached with no pinned columns (publishing is ordered by the worker's users FOR SHARE;
+  a pin would make the expiry sweep retry a deleted owner's row forever).
+- Codex diff review round 1: FAIL. Adopted: expiry needs ready_at (NULL hole), non-negative counters,
+  constrained last_error. Refuted: CASCADE FK defeats retention (no role can delete users, asserted since
+  112; account_deletions has the same FK), provisioning role guards (the script creates the roles
+  first), role tests skipping in CI (existing pattern; purgesim enforces the matrix).
+- Round 2: FAIL (shape check admits names) -> fixed allowlist of codes. **Round 3: GATE: PASS.**
+- purgesim.py extended (account_exports role x privilege matrix + column grants, proven to catch a
+  hand-granted DELETE): PASS after every round. 21 fenced tables ENABLE ALWAYS.
+
 ### PRs (each: tests on the real DB, stand-ins only for R2/Resend; Codex diff review to GATE PASS)
 - [ ] **P4a migration 115** (alone, schema-first): table, CHECK, partial unique, RLS + grants,
       fence trigger, provisioning mirror, downgrade; tests (constraints, RLS cross-tenant, fence

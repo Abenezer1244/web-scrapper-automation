@@ -192,7 +192,9 @@ $fn$;
 -- pending row in it) is purging/deleted. Read as the purge role, like the lookup above.
 CREATE FUNCTION public.account_deletion_queue_tainted(p_queue integer, p_user uuid)
 RETURNS boolean
-LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $fn$
+-- VOLATILE: it must always read current state. (Called from the VOLATILE trigger it
+-- gets a fresh snapshot either way; this keeps that true for any other caller.)
+LANGUAGE sql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $fn$
     SELECT EXISTS (
         SELECT 1 FROM public.users u
          WHERE u.deletion_state IN ('purging', 'deleted')

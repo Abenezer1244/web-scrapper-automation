@@ -13,6 +13,7 @@ they are absent (CI).
 from __future__ import annotations
 
 import random
+import threading
 import uuid
 
 import pytest
@@ -647,6 +648,55 @@ def test_claim_skips_an_account_with_a_write_in_flight() -> None:
     finally:
         writer.close()
         with sync_engine.connect() as cleanup, cleanup.begin():
+            cleanup.execute(text("DELETE FROM users WHERE id = :u"), {"u": uid})
+
+
+def test_a_batch_write_waiting_across_the_claim_stores_no_link() -> None:
+    """A webhook's queue UPDATE that started before the claim but waited on the row lock
+    must see the account as purging when its trigger finally runs (a fresh read, not
+    the statement's old snapshot)."""
+    n = random.randint(1, 2**31 - 1)
+    with sync_engine.connect() as setup, setup.begin():
+        uid = _user(setup)
+        _open_due(setup, uid)
+        setup.execute(text("INSERT INTO skip_trace_queues (id, tracerfy_queue_id, user_id) "
+                           "VALUES (gen_random_uuid(), :n, :u)"), {"n": n, "u": uid})
+    holder = sync_engine.connect()
+    try:
+        h = holder.begin()
+        holder.execute(text("UPDATE skip_trace_queues SET rows_uploaded = 1 "
+                            "WHERE tracerfy_queue_id = :n"), {"n": n})
+        outcome: dict = {}
+
+        def webhook() -> None:
+            try:
+                with sync_engine.connect() as c, c.begin():
+                    c.execute(text("SET LOCAL lock_timeout = '30s'"))
+                    c.execute(text("UPDATE skip_trace_queues SET status = 'completed', "
+                                   "download_url = 'https://vendor.test/late.csv' "
+                                   "WHERE tracerfy_queue_id = :n"), {"n": n})
+                outcome["done"] = True
+            except Exception as exc:  # surfaced by the assert below
+                outcome["error"] = exc
+
+        t = threading.Thread(target=webhook)
+        t.start()
+        t.join(1)
+        assert t.is_alive()  # its statement snapshot predates the claim
+        with sync_engine.connect() as p, p.begin():
+            assert str(_claim(p).user_id) == uid
+        h.commit()
+        t.join(30)
+        assert outcome == {"done": True}, outcome
+        with sync_engine.connect() as check:
+            assert tuple(check.execute(text(
+                "SELECT status, download_url FROM skip_trace_queues WHERE tracerfy_queue_id = :n"),
+                {"n": n}).one()) == ("completed", None)
+    finally:
+        holder.close()
+        with sync_engine.connect() as cleanup, cleanup.begin():
+            cleanup.execute(text("DELETE FROM skip_trace_queues WHERE tracerfy_queue_id = :n"),
+                            {"n": n})
             cleanup.execute(text("DELETE FROM users WHERE id = :u"), {"u": uid})
 
 

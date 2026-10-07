@@ -423,7 +423,9 @@ def test_out_of_time_pauses_and_the_next_claim_resumes(made, monkeypatch) -> Non
     try:
         monkeypatch.setattr(beat, "_LEASE_MARGIN", beat._LEASE_SECONDS)  # no time left
         assert _run(r2=r2)["purges"] == {"paused": 1}
-        assert _row(did).r2_first_sweep_at is None
+        row = _row(did)
+        assert row.r2_first_sweep_at is None and row.last_error == "paused: out of time"
+        assert row.claimed_until <= datetime.now(UTC)  # the lease was handed back
         monkeypatch.setattr(beat, "_LEASE_MARGIN", 120)
         _due_now(did)  # the lease ran out
         assert _run(r2=r2)["purges"] == {"tombstoned": 1}

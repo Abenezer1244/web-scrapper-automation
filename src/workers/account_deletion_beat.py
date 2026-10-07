@@ -278,7 +278,7 @@ def _sweep_r2(r2: R2Store, uid: str, keys: list[str], check_time) -> None:
         if not r2.delete(key):
             raise RuntimeError("R2 delete failed")
     prefix = f"exports/{uid}/"
-    for _ in range(10_000):
+    while True:  # bounded by check_time: a huge prefix pauses and resumes
         check_time()
         page = r2.list(prefix)
         if not page:
@@ -286,7 +286,6 @@ def _sweep_r2(r2: R2Store, uid: str, keys: list[str], check_time) -> None:
         for key in page:
             if not r2.delete(key):
                 raise RuntimeError("R2 delete failed")
-    raise RuntimeError("R2 prefix did not empty")
 
 
 def _final_notice() -> tuple:
@@ -425,7 +424,15 @@ def _run_purges(db, r2: R2Store, send_final) -> dict:
             phase = _advance(db, claim, r2, send_final, deadline)
         except _OutOfTimeError:
             db.rollback()
-            phase = "paused"  # the lease runs out; the next tick reclaims and resumes
+            phase = "paused"
+            # Hand the lease back (short backoff) so the next tick resumes from the
+            # markers instead of waiting out the lease. A lost claim fails here: fine.
+            try:
+                _call(db, "SELECT record_deletion_progress(:d, :t, 'error', NULL, NULL, :e)",
+                      {"d": str(claim.deletion_id), "t": claim.claim_token,
+                       "e": "paused: out of time"})
+            except Exception:  # noqa: BLE001 - the lease lapses on its own
+                db.rollback()
         except Exception as exc:  # noqa: BLE001 - recorded, retried with backoff
             db.rollback()
             phase = "error"

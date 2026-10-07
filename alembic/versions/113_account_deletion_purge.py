@@ -104,6 +104,8 @@ _API_ROLES = ("anon", "authenticated", "service_role", "bridgeleads_app")
 # The fence's state lookup runs as the purge role and is called by every writer of a
 # fenced table: the runtime roles and the migration owner.
 _OWNER_STATE_FN = "account_deletion_owner_state(uuid, uuid, boolean)"
+# Kept rows the billing ledgers hang off via ON DELETE CASCADE.
+_SKELETONS = ("jobs", "results", "scraper_configs", "scraper_batches")
 # users columns the tombstone check reads (id/is_active/deletion_state come from 112).
 _TOMBSTONE_COLS = ("is_admin, mfa_enabled, name, first_name, last_name, timezone, "
                    "api_key_hash, mfa_secret_encrypted, referral_code, notification_prefs")
@@ -692,6 +694,10 @@ def upgrade() -> None:
                      for r in ("anon", "authenticated", "service_role")]
     state_grants += [_guarded(r, f"GRANT EXECUTE ON FUNCTION {state_fn} TO {r};")
                      for r in ("bridgeleads_app", "bridgeleads_system")]
+    skeleton_revokes = [
+        _guarded(r, f"REVOKE DELETE, TRUNCATE ON public.{', public.'.join(_SKELETONS)} FROM {r};")
+        for r in ("anon", "authenticated", "service_role")
+    ]
     alters = "\n".join(
         f"ALTER FUNCTION public.{f} OWNER TO bridgeleads_purge;"
         for f in (*_WORKER_FUNCTIONS, _OWNER_STATE_FN)
@@ -714,6 +720,11 @@ def upgrade() -> None:
             -- privileges still grant EXECUTE on them: take it back like everything else.
             {nl.join(fence_revokes)}
             {nl.join(state_grants)}
+            -- The skeletons the billing ledgers CASCADE from must never be deleted
+            -- outside the (later) retention expiry. The runtime roles never held DELETE
+            -- on them (asserted in tests); Supabase's API roles got ALL from the
+            -- default privileges and use none of it. Not re-granted on downgrade.
+            {nl.join(skeleton_revokes)}
             {_guarded("bridgeleads_system", f"GRANT EXECUTE ON FUNCTION {fns} TO bridgeleads_system;")}
 
             -- Same temporary hand-over as 112: SET on the purge role + CREATE on public,

@@ -708,6 +708,16 @@ def test_supabase_api_roles_cannot_run_the_purge(conn) -> None:
                    "account_deletion_owner_state(uuid, uuid, boolean)"):
             assert conn.execute(text("SELECT has_function_privilege(:r, :f, 'EXECUTE')"),
                                 {"r": role, "f": fn}).scalar() is False, (role, fn)
+        _assert_cannot_delete_skeletons(conn, role)
+
+
+def _assert_cannot_delete_skeletons(conn, role: str) -> None:
+    """The billing ledgers CASCADE from these rows: deleting one would erase evidence."""
+    for tbl in ("jobs", "results", "scraper_configs", "scraper_batches"):
+        for priv in ("DELETE", "TRUNCATE"):
+            assert conn.execute(text("SELECT has_table_privilege(:r, :t, :p)"),
+                                {"r": role, "t": tbl, "p": priv}).scalar() is False, (
+                role, tbl, priv)
 
 
 def _require_runtime_roles(conn) -> None:
@@ -756,3 +766,4 @@ def test_runtime_roles_hit_the_fence_and_only_the_worker_runs_the_purge(conn) ->
         for priv in ("MEMBER", "USAGE", "SET"):
             assert conn.execute(text("SELECT pg_has_role(:r, 'bridgeleads_purge', :p)"),
                                 {"r": role, "p": priv}).scalar() is False, (role, priv)
+        _assert_cannot_delete_skeletons(conn, role)

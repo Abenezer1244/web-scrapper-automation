@@ -551,7 +551,7 @@ def _drive_account_deletions_impl(*, stripe_api: StripeSubscriptions | None = No
                     if drained else {})
                 return stats | {
                     "customers_deleted": _close_stripe_customers(
-                        db, stripe_api, started + _TICK_BUDGET + 40),
+                        db, stripe_api, started + _TICK_BUDGET),  # + <=4 Stripe calls x 10 s < soft limit
                     "overdue_alerts": _alert_overdue(db),
                     "stuck_alerts": _alert_stuck(db),
                 }

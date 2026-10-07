@@ -578,6 +578,37 @@ class TestAttempt:
         assert _results(without) == _results(with_token)
 
 
+    @pytest.mark.parametrize("fence", ["terminal", "other_tenant"])
+    async def test_report_is_refused_for_a_finished_run_or_another_tenant(
+            self, db, business_user, starter_user, fence):
+        """_LookupProgress inherits _set_progress's fence: a cancelled run, or a job
+        object carrying another user's id, gets no write and the row is unchanged."""
+        from src.db.session import system_sync_session
+
+        job_id, token, _pids = await _job(db, business_user, parcels=2)
+        if fence == "terminal":
+            await db.execute(text("UPDATE jobs SET status = 'cancelled' WHERE id = :j"),
+                             {"j": job_id})
+            await db.commit()
+
+        def _go():
+            with system_sync_session() as sdb:
+                job = sdb.get(Job, job_id)
+                sdb.commit()
+                if fence == "other_tenant":
+                    # Detached first, so changing its user_id can never autoflush.
+                    sdb.expunge(job)
+                    job.user_id = starter_user.id
+                progress = enrich._LookupProgress(sdb, job, token)
+                return progress.report(GIS, done=1, total=2), progress.last_stage
+
+        landed, last = await asyncio.to_thread(_go)
+        assert landed is False and last == UMBRELLA
+        row = _row(job_id)
+        assert (row.stage, row.units_done, row.units_total) == (UMBRELLA, None, None)
+        assert str(row.user_id) == str(business_user.id)
+
+
 # ─── Telemetry never commits enrichment's work ───────────────────────────────
 
 class TestCleanSession:

@@ -154,7 +154,16 @@ JOB_STAGES: tuple[str, ...] = (
     "saving",            # persisting scraped rows
     "deduping",          # duplicate check against prior deliveries
     "exporting",         # building + uploading the CSV
-    "enriching",         # property and mailing address lookup
+    # The scrapers' own mid-scrape parcel lookup, and the post-scrape lookup as
+    # written by a worker from before address_lookup existed (rolling deploys).
+    "enriching",
+    # The post-scrape property and mailing address lookup (_run_inline_enrichment).
+    # Unmeasured: King's own passes and every other county pass report no counts.
+    "address_lookup",
+    # The one MEASURED pass inside it: the county GIS parcel sweep, counted in parcels
+    # checked, only when it runs more than one commit batch. Returns to
+    # address_lookup (counters cleared) when the sweep ends.
+    "address_lookup_gis",
     "queuing_contacts",  # skip-trace ENQUEUE only; the provider answers later
     "finalizing",        # billing settle + terminal transition
 )

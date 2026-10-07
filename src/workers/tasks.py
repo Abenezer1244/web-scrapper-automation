@@ -1689,7 +1689,10 @@ def run_scrape_job(self, job_id: str) -> None:
         # request's wait. If a hang slips through both, Celery hard-kills
         # the worker — which is what the previous thread guard was
         # actually relying on anyway.
-        if not _still_ours(_set_stage(db, job, "enriching", expected_started_at=attempt_token,
+        # `address_lookup`, not `enriching`: the in-scrape parcel phase still reports
+        # `enriching`, and the post-scrape lookup gets its own stage so its one measured
+        # pass (the GIS sweep, `address_lookup_gis`) can return to it when it ends.
+        if not _still_ours(_set_stage(db, job, "address_lookup", expected_started_at=attempt_token,
                                       commit=False)):
             return
         _publish_log(r, job_id, "info", "Looking up property and mailing addresses...", db=db)
@@ -1704,7 +1707,8 @@ def run_scrape_job(self, job_id: str) -> None:
             # a complete one either, and the user needs to be able to tell the
             # difference between "scrape failed" and "some enrichment is pending".
             enrich_summary: dict = {}
-            _run_inline_enrichment(db, job, r, job_id, config, summary=enrich_summary)
+            _run_inline_enrichment(db, job, r, job_id, config, summary=enrich_summary,
+                                   attempt_token=attempt_token)
             _enrichment_ok = True
             _level, _msg = enrichment_completion_log(enrich_summary)
             _publish_log(r, job_id, _level, _msg, db=db)

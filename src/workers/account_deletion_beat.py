@@ -164,7 +164,9 @@ def _alert_overdue(db) -> int:
 
     rows = db.execute(text(
         "SELECT id, status, stripe_state, attempts FROM account_deletions "
-        "WHERE status = 'pending' AND purge_after + interval '10 days' < now()")).all()
+        "WHERE status = 'pending' AND purge_after + interval '10 days' < now() "
+        # send_ops_alert's 6 h cooldown per deletion keeps this from repeating each tick.
+        "ORDER BY purge_after LIMIT :n"), {"n": _BATCH}).all()
     db.rollback()
     for row in rows:
         send_ops_alert(

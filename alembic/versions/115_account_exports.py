@@ -89,8 +89,19 @@ def upgrade() -> None:
             name="ck_account_exports_ready",
         ),
         sa.CheckConstraint(
-            "expires_at IS NULL OR expires_at = ready_at + interval '7 days'",
+            "expires_at IS NULL OR (ready_at IS NOT NULL "
+            "AND expires_at = ready_at + interval '7 days')",
             name="ck_account_exports_expiry",
+        ),
+        sa.CheckConstraint(
+            "attempts >= 0 AND email_attempts >= 0 AND (size_bytes IS NULL OR size_bytes >= 0)",
+            name="ck_account_exports_counts",
+        ),
+        # Code-shaped only: no space, digit, '@' or '.', so it cannot carry an address,
+        # a name or exception text.
+        sa.CheckConstraint(
+            "last_error IS NULL OR last_error ~ '^[a-z_]{1,64}$'",
+            name="ck_account_exports_error_code",
         ),
     )
     op.create_index(

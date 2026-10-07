@@ -587,6 +587,16 @@ BEGIN
                     OR p.mail_state IS NOT NULL OR p.mail_zip IS NOT NULL))
        OR EXISTS (SELECT 1 FROM public.jobs j WHERE j.user_id = v_uid
                   AND (j.export_key IS NOT NULL OR j.error_message IS NOT NULL))
+       OR EXISTS (SELECT 1 FROM public.scraper_configs c WHERE c.user_id = v_uid
+                  AND (c.name <> 'deleted' OR c.active OR c.doc_types IS NOT NULL
+                    OR c.include_living_owner_tod IS NOT NULL OR c.fields::text <> '[]'
+                    OR c.enrichment::text <> '[]' OR c.schedule::text <> '{}'
+                    OR c.deliver::text <> '{}'))
+       OR EXISTS (SELECT 1 FROM public.scraper_batches b WHERE b.user_id = v_uid
+                  AND (b.name IS DISTINCT FROM 'deleted' OR b.status <> 'archived'
+                    OR b.delivery_mode <> 'everything' OR b.fields::text <> '[]'
+                    OR b.enrichment::text <> '[]' OR b.schedule::text <> '{}'
+                    OR b.deliver::text <> '{}'))
        -- A batch that finished after the first pass still carries its link.
        OR EXISTS (SELECT 1 FROM public.skip_trace_queues q
                    WHERE q.status IN ('completed', 'errored')

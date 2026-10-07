@@ -495,10 +495,13 @@ def test_complete_needs_every_phase_and_the_24_hour_gap(conn) -> None:
     # An UPDATE that was in flight at the claim lands after the first pass (written here
     # through the purge role, the only writer the fence lets through): complete refuses
     # until the purge has run again.
-    _as_purge(conn, "UPDATE results SET party_name = 'Late Write' WHERE id = :r", {"r": ids["r1"]})
-    assert _sqlstate(conn, "SELECT complete_account_deletion(:d, :t)",
-                     {"d": did, "t": token}) == "BLD36"
-    assert _purge(conn, did, token) is True
+    for late in ("UPDATE results SET party_name = 'Late Write' WHERE id = :r",
+                 "UPDATE scraper_configs SET deliver = '{\"email\": \"x@y.test\"}' "
+                 "WHERE user_id = :u"):
+        _as_purge(conn, late, {"r": ids["r1"], "u": uid})
+        assert _sqlstate(conn, "SELECT complete_account_deletion(:d, :t)",
+                         {"d": did, "t": token}) == "BLD36", late
+        assert _purge(conn, did, token) is True
     # An audit row written while purging (a refused sign-in) loses its detail too.
     conn.execute(text("INSERT INTO audit_events (id, event, user_id, detail) "
                       "VALUES (gen_random_uuid(), 'login_failure', :u, 'late')"), {"u": uid})

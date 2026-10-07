@@ -15,7 +15,7 @@ import redis as sync_redis
 from src.config import settings
 from src.utils.logger import setup_logger
 from src.workers.property_identity import legacy_strong_signature as _legacy_strong_signature
-from src.workers.tasks_helpers.status import _now, _publish_log
+from src.workers.tasks_helpers.status import _now, _publish_log, _set_progress
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -849,7 +849,65 @@ def _apply_bulk_mailing(db, fills: list[tuple], job_id: str) -> tuple[int, list]
     return written, failed
 
 
-def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None = None) -> None:
+# The post-scrape address lookup's stages (JOB_STAGES). run_scrape_job writes the
+# umbrella before calling _run_inline_enrichment; the GIS sweep is the one pass that
+# reports counts, and it returns to the umbrella when it ends.
+_LOOKUP_STAGE = "address_lookup"
+_LOOKUP_GIS_STAGE = "address_lookup_gis"
+
+
+class _LookupProgress:
+    """Progress telemetry for ONE attempt's post-scrape address lookup.
+
+    Writes go through ``_set_progress``, so they are fenced on the tenant, the attempt
+    token and a non-terminal status, and a refused write (superseded, cancelled) just
+    stops the telemetry; enrichment itself carries on exactly as before.
+
+    A write COMMITS, and a commit on this session would also commit whatever the
+    lookup has pending (an open transaction, new / dirty / deleted ORM objects). So a
+    report is made only on a CLEAN session and is otherwise skipped with a WARNING:
+    telemetry must never decide when enrichment's own writes land. Both call sites sit
+    right after a commit, where the session is clean.
+    """
+
+    def __init__(self, db, job, attempt_token) -> None:
+        self._db = db
+        self._job = job
+        self._token = attempt_token
+        # run_scrape_job wrote the umbrella stage before calling in.
+        self.last_stage = _LOOKUP_STAGE
+
+    def report(self, stage: str, done: int | None = None, total: int | None = None) -> bool:
+        """Record ``stage`` with ``done`` of ``total`` parcels (no counts = cleared).
+
+        The stage and its clock are written only when the stage changes, so the clock
+        means "in this pass since", not "since the last batch". Returns whether the
+        write landed; ``last_stage`` advances only when it did.
+        """
+        db = self._db
+        if db.in_transaction() or db.new or db.dirty or db.deleted:
+            _logger.warning(
+                "Job %s: %s progress not recorded, the session has uncommitted work",
+                self._job.id, stage,
+            )
+            return False
+        now = _now()
+        values: dict = {"last_progress_at": now}
+        if stage != self.last_stage:
+            values |= {"stage": stage, "stage_started_at": now}
+        if done is None:
+            values |= {"units_done": None, "units_total": None, "progress_unit": None}
+        else:
+            values |= {"units_done": done, "units_total": total, "progress_unit": "parcel"}
+        landed = _set_progress(db, self._job, expected_started_at=self._token, **values)
+        if landed:
+            self.last_stage = stage
+        return landed
+
+
+def _run_inline_enrichment(
+    db, job, r, job_id: str, config, summary: dict | None = None, attempt_token=None,
+) -> None:
     """Run GIS + King County enrichment inline (before job marks done).
 
     ``summary`` is an optional out-parameter the caller may pass to learn what
@@ -864,11 +922,17 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
     address whose lookup did not happen and is now queued for background recovery.
     ``owner_deferred`` -- King tax leads still missing an owner name because this
     run's lookup did not get an answer (see OWNER_DEFERRED_KEY).
+
+    ``attempt_token`` is the run's attempt (claim_attempt). With it, the GIS sweep
+    reports its progress on the job row (_LookupProgress); without it (scripts,
+    tests) nothing is reported and the lookup is otherwise identical.
     """
     from sqlalchemy import func
     from sqlalchemy import select as sa_select
 
     from src.db.models import Result
+
+    progress = _LookupProgress(db, job, attempt_token) if attempt_token is not None else None
 
     # Reuse prior enrichment for duplicate leads BEFORE any external lookup, so a
     # re-scrape of already-seen records doesn't re-hit county GIS or re-pay
@@ -943,177 +1007,198 @@ def _run_inline_enrichment(db, job, r, job_id: str, config, summary: dict | None
         all_pids = list(parcel_map.keys())
         rows_updated = 0
         commit_failures = 0
-        for i in range(0, len(all_pids), _GIS_COMMIT_BATCH):
-            batch_pids = all_pids[i:i + _GIS_COMMIT_BATCH]
-            gis_stats: dict = {}
-            gis_results = batch_enrich_parcels_gis(
-                batch_pids, config.county, config.state, stats=gis_stats
-            )
-            batch_updated = 0
-            # Parcels, not rows: one lookup serves every lead on a parcel, and the
-            # King summary counts parcels too (Codex P2).
-            batch_deferred: set[str] = set()
-            # (row, gis_data) pairs whose mailing came from a BULK county export.
-            # Written below through a guarded UPDATE instead of the ORM.
-            _bulk_fills: list[tuple] = []
-            for pid, gis_data in gis_results.items():
-                prop = gis_data.get("property_address")
-                mail = gis_data.get("mailing_address")
-                # A bulk county export is a MONTHLY snapshot. A row can reach this
-                # sweep because its PROPERTY address was missing while already
-                # holding a good, fresher mailing address, and the live-layer
-                # branches below overwrite mailing whenever they have one. Letting a
-                # snapshot replace a better value that way is a silent downgrade, so
-                # a bulk answer is fill-only (Codex).
-                bulk_source = gis_data.get("mailing_source")
-                for res in parcel_map.get(pid, []):
-                    # A bulk answer is fill-only, and the check has to happen in the
-                    # DATABASE, not against ORM state loaded before the lookup: the
-                    # network round trip is long enough for the recovery sweep to
-                    # fill the same row, and this object would still hold NULL and
-                    # overwrite the newer address (Codex High). The guarded UPDATE
-                    # below mirrors mailing_recovery's writer; `row_mail` keeps the
-                    # ORM branches from writing it a second time.
-                    row_mail = None if bulk_source else mail
-                    if mail and bulk_source:
-                        _bulk_fills.append((res, gis_data))
-                    # Migration 085 (#188) — capture the REAL situs parts BEFORE the
-                    # assessor's street-only line replaces the scraper's fuller one.
-                    # Runs for every branch below, including vacant land, so a parcel
-                    # with no street still records WHERE it is.
-                    _keep_situs_parts(res, gis_data)
-                    # The source answered and has no mailing address for this parcel
-                    # (clark_pic: none / parcel_not_found / parcel_mismatch). Recorded
-                    # under recovery's durable outcome key, so the row reads "looked
-                    # up, nothing there" rather than "never looked up", and the
-                    # historical requeue does not queue it again.
-                    if (gis_data.get("mailing_lookup") in ("none", "parcel_not_found",
-                                                           "parcel_mismatch")
-                            and not res.mailing_address):
-                        _ed = dict(res.enrichment_data) if isinstance(res.enrichment_data, dict) else {}
-                        _ed["mailing_recovery_outcome"] = gis_data["mailing_lookup"]
-                        _ed["mailing_source"] = gis_data.get("mailing_source")
-                        res.enrichment_data = _ed
-                    if prop:
-                        res.property_address = prop
-                        # Only a REAL mailing overwrites (King never echoes the
-                        # property into mailing — Codex): never clobber an existing
-                        # value with None.
-                        if row_mail:
-                            res.mailing_address = row_mail
-                        batch_updated += 1
-                    elif row_mail:
-                        # No street, but a real mailing (e.g. a Pierce parcel with a
-                        # Delivery_Address but null Site_Address) — keep it rather
-                        # than drop it into the vacant branch (Codex P2).
-                        res.mailing_address = row_mail
-                        batch_updated += 1
-                    elif gis_data.get("vacant_no_situs"):
-                        # Matched but no street (vacant/raw land, ~1/3 of King
-                        # delinquent parcels). Keep property_address NULL — skip
-                        # trace BILLS off it, so a city-only pseudo-address would
-                        # buy a lookup for an address we do not have — but record
-                        # WHERE the parcel is for display (Codex).
-                        ed = dict(res.enrichment_data) if isinstance(res.enrichment_data, dict) else {}
-                        ed["gis_matched"] = True
-                        ed["vacant_no_situs"] = True
-                        for k in ("situs_city", "situs_state", "situs_zip"):
-                            if gis_data.get(k):
-                                ed[k] = gis_data[k]
-                        res.enrichment_data = ed
-                        # #153 predates migration 085 and could only stash the situs
-                        # in enrichment_data. The real columns exist now, and this is
-                        # exactly what they are for: a vacant parcel with a known city
-                        # and ZIP can still answer out_of_state_owner. Fill-only —
-                        # never overwrite a value a real source already set.
-                        for _col, _src, _w in (("property_city", "situs_city", 128),
-                                               ("property_state", "situs_state", 2),
-                                               ("property_zip", "situs_zip", 10)):
-                            _v = gis_data.get(_src)
-                            if _v and not getattr(res, _col, None):
-                                setattr(res, _col, str(_v).strip()[:_w])
-                        batch_updated += 1
-            if _bulk_fills:
-                _n, _failed = _apply_bulk_mailing(db, _bulk_fills, job_id)
-                batch_updated += _n
-                for _res in _failed:
-                    # Its write did not land, so it must stay retryable.
-                    _ed = dict(_res.enrichment_data) if isinstance(_res.enrichment_data, dict) else {}
-                    if _ed.get("mailing_lookup_deferred") is not True:
-                        _ed["mailing_lookup_deferred"] = True
-                        _res.enrichment_data = _ed
-                        # Count it, or the completion line reports fewer pending
-                        # recoveries than there are (Codex).
-                        if _res.parcel_id:
-                            batch_deferred.add(_res.parcel_id.strip())
-            if gis_mailing_source:
-                # The county request for these parcels failed (HTTP error, timeout,
-                # ArcGIS error body), so their mailing lookup never happened. Without a
-                # marker they read exactly like "the county has no mailing address"
-                # and nothing ever asks again. Mark them for the background recovery
-                # sweep, the same contract King's deferral uses. Fill-only: a row that
-                # already has a mailing address is left alone.
-                for pid in gis_stats.get("county_unreached", []):
-                    for res in parcel_map.get(pid, []):
-                        if res.mailing_address:
-                            continue
-                        ed = dict(res.enrichment_data) if isinstance(res.enrichment_data, dict) else {}
-                        if ed.get("mailing_lookup_deferred") is not True:
-                            ed["mailing_lookup_deferred"] = True
-                            res.enrichment_data = ed
-                            batch_deferred.add(pid)
-            try:
-                db.commit()
-            except Exception as exc:
-                # Don't rollback-then-empty-commit (that would discard this batch's
-                # fills while reporting success). Roll back (recovers the session
-                # for the next batch) and skip the progress log. Enrichment is
-                # best-effort by design — the caller wraps this whole function in a
-                # try/except and delivers the job DONE without enriched fields on
-                # failure (tasks.py) — so a commit hiccup must not fail the job. The
-                # unfilled rows stay in results_need_addr and are re-attempted if
-                # the job is re-run; the end-of-sweep summary below surfaces it.
-                db.rollback()
-                commit_failures += 1
-                _logger.warning(
-                    "Job %s: GIS batch commit failed at %d/%d: %s",
-                    job_id, i, len(all_pids), str(exc)[:120],
+        # Parcels CHECKED so far: every parcel of a committed batch, answered or not,
+        # minus those whose lookup was deferred. ONE count feeds both the progress
+        # write and the log line below, so the two can never disagree. A failed
+        # batch adds nothing (its fills rolled back).
+        checked = 0
+        # Measured only when the sweep runs more than one batch: a single batch would
+        # read "0 of N" and then jump to the end, which tells nobody anything.
+        measured = progress is not None and len(all_pids) > _GIS_COMMIT_BATCH
+        try:
+            for i in range(0, len(all_pids), _GIS_COMMIT_BATCH):
+                batch_pids = all_pids[i:i + _GIS_COMMIT_BATCH]
+                gis_stats: dict = {}
+                gis_results = batch_enrich_parcels_gis(
+                    batch_pids, config.county, config.state, stats=gis_stats
                 )
+                batch_updated = 0
+                # Parcels, not rows: one lookup serves every lead on a parcel, and the
+                # King summary counts parcels too (Codex P2).
+                batch_deferred: set[str] = set()
+                # (row, gis_data) pairs whose mailing came from a BULK county export.
+                # Written below through a guarded UPDATE instead of the ORM.
+                _bulk_fills: list[tuple] = []
+                for pid, gis_data in gis_results.items():
+                    prop = gis_data.get("property_address")
+                    mail = gis_data.get("mailing_address")
+                    # A bulk county export is a MONTHLY snapshot. A row can reach this
+                    # sweep because its PROPERTY address was missing while already
+                    # holding a good, fresher mailing address, and the live-layer
+                    # branches below overwrite mailing whenever they have one. Letting a
+                    # snapshot replace a better value that way is a silent downgrade, so
+                    # a bulk answer is fill-only (Codex).
+                    bulk_source = gis_data.get("mailing_source")
+                    for res in parcel_map.get(pid, []):
+                        # A bulk answer is fill-only, and the check has to happen in the
+                        # DATABASE, not against ORM state loaded before the lookup: the
+                        # network round trip is long enough for the recovery sweep to
+                        # fill the same row, and this object would still hold NULL and
+                        # overwrite the newer address (Codex High). The guarded UPDATE
+                        # below mirrors mailing_recovery's writer; `row_mail` keeps the
+                        # ORM branches from writing it a second time.
+                        row_mail = None if bulk_source else mail
+                        if mail and bulk_source:
+                            _bulk_fills.append((res, gis_data))
+                        # Migration 085 (#188) — capture the REAL situs parts BEFORE the
+                        # assessor's street-only line replaces the scraper's fuller one.
+                        # Runs for every branch below, including vacant land, so a parcel
+                        # with no street still records WHERE it is.
+                        _keep_situs_parts(res, gis_data)
+                        # The source answered and has no mailing address for this parcel
+                        # (clark_pic: none / parcel_not_found / parcel_mismatch). Recorded
+                        # under recovery's durable outcome key, so the row reads "looked
+                        # up, nothing there" rather than "never looked up", and the
+                        # historical requeue does not queue it again.
+                        if (gis_data.get("mailing_lookup") in ("none", "parcel_not_found",
+                                                               "parcel_mismatch")
+                                and not res.mailing_address):
+                            _ed = dict(res.enrichment_data) if isinstance(res.enrichment_data, dict) else {}
+                            _ed["mailing_recovery_outcome"] = gis_data["mailing_lookup"]
+                            _ed["mailing_source"] = gis_data.get("mailing_source")
+                            res.enrichment_data = _ed
+                        if prop:
+                            res.property_address = prop
+                            # Only a REAL mailing overwrites (King never echoes the
+                            # property into mailing — Codex): never clobber an existing
+                            # value with None.
+                            if row_mail:
+                                res.mailing_address = row_mail
+                            batch_updated += 1
+                        elif row_mail:
+                            # No street, but a real mailing (e.g. a Pierce parcel with a
+                            # Delivery_Address but null Site_Address) — keep it rather
+                            # than drop it into the vacant branch (Codex P2).
+                            res.mailing_address = row_mail
+                            batch_updated += 1
+                        elif gis_data.get("vacant_no_situs"):
+                            # Matched but no street (vacant/raw land, ~1/3 of King
+                            # delinquent parcels). Keep property_address NULL — skip
+                            # trace BILLS off it, so a city-only pseudo-address would
+                            # buy a lookup for an address we do not have — but record
+                            # WHERE the parcel is for display (Codex).
+                            ed = dict(res.enrichment_data) if isinstance(res.enrichment_data, dict) else {}
+                            ed["gis_matched"] = True
+                            ed["vacant_no_situs"] = True
+                            for k in ("situs_city", "situs_state", "situs_zip"):
+                                if gis_data.get(k):
+                                    ed[k] = gis_data[k]
+                            res.enrichment_data = ed
+                            # #153 predates migration 085 and could only stash the situs
+                            # in enrichment_data. The real columns exist now, and this is
+                            # exactly what they are for: a vacant parcel with a known city
+                            # and ZIP can still answer out_of_state_owner. Fill-only —
+                            # never overwrite a value a real source already set.
+                            for _col, _src, _w in (("property_city", "situs_city", 128),
+                                                   ("property_state", "situs_state", 2),
+                                                   ("property_zip", "situs_zip", 10)):
+                                _v = gis_data.get(_src)
+                                if _v and not getattr(res, _col, None):
+                                    setattr(res, _col, str(_v).strip()[:_w])
+                            batch_updated += 1
+                if _bulk_fills:
+                    _n, _failed = _apply_bulk_mailing(db, _bulk_fills, job_id)
+                    batch_updated += _n
+                    for _res in _failed:
+                        # Its write did not land, so it must stay retryable.
+                        _ed = dict(_res.enrichment_data) if isinstance(_res.enrichment_data, dict) else {}
+                        if _ed.get("mailing_lookup_deferred") is not True:
+                            _ed["mailing_lookup_deferred"] = True
+                            _res.enrichment_data = _ed
+                            # Count it, or the completion line reports fewer pending
+                            # recoveries than there are (Codex).
+                            if _res.parcel_id:
+                                batch_deferred.add(_res.parcel_id.strip())
                 if gis_mailing_source:
-                    # The rollback discarded this batch's mailing fills AND any
-                    # deferral markers, so none of its rows got the mailing answer
-                    # the lookup produced. Leave a marker-only write behind so the
-                    # recovery sweep asks again; without it they read as "no address"
-                    # forever (Codex P1). Counted only once it is actually stored.
-                    batch_deferred = set()
-                    try:
-                        for pid in batch_pids:
-                            for res in parcel_map.get(pid, []):
-                                if res.mailing_address:
-                                    continue
-                                ed = (dict(res.enrichment_data)
-                                      if isinstance(res.enrichment_data, dict) else {})
-                                if ed.get("mailing_lookup_deferred") is not True:
-                                    ed["mailing_lookup_deferred"] = True
-                                    res.enrichment_data = ed
-                                    batch_deferred.add(pid)
-                        db.commit()
-                        gis_mailing_deferred += len(batch_deferred)
-                    except Exception as mark_exc:
-                        db.rollback()
-                        _logger.warning(
-                            "Job %s: deferral markers after a failed GIS commit were "
-                            "not stored either: %s", job_id, str(mark_exc)[:120],
-                        )
-                continue
-            gis_mailing_deferred += len(batch_deferred)
-            rows_updated += batch_updated
-            _publish_log(
-                r, job_id, "info",
-                f"Property lookup progress: {min(i + _GIS_COMMIT_BATCH, len(all_pids))}"
-                f"/{len(all_pids)} parcels ({rows_updated} rows updated)",
-                db=db,
-            )
+                    # The county request for these parcels failed (HTTP error, timeout,
+                    # ArcGIS error body), so their mailing lookup never happened. Without a
+                    # marker they read exactly like "the county has no mailing address"
+                    # and nothing ever asks again. Mark them for the background recovery
+                    # sweep, the same contract King's deferral uses. Fill-only: a row that
+                    # already has a mailing address is left alone.
+                    for pid in gis_stats.get("county_unreached", []):
+                        for res in parcel_map.get(pid, []):
+                            if res.mailing_address:
+                                continue
+                            ed = dict(res.enrichment_data) if isinstance(res.enrichment_data, dict) else {}
+                            if ed.get("mailing_lookup_deferred") is not True:
+                                ed["mailing_lookup_deferred"] = True
+                                res.enrichment_data = ed
+                                batch_deferred.add(pid)
+                try:
+                    db.commit()
+                except Exception as exc:
+                    # Don't rollback-then-empty-commit (that would discard this batch's
+                    # fills while reporting success). Roll back (recovers the session
+                    # for the next batch) and skip the progress log. Enrichment is
+                    # best-effort by design — the caller wraps this whole function in a
+                    # try/except and delivers the job DONE without enriched fields on
+                    # failure (tasks.py) — so a commit hiccup must not fail the job. The
+                    # unfilled rows stay in results_need_addr and are re-attempted if
+                    # the job is re-run; the end-of-sweep summary below surfaces it.
+                    db.rollback()
+                    commit_failures += 1
+                    _logger.warning(
+                        "Job %s: GIS batch commit failed at %d/%d: %s",
+                        job_id, i, len(all_pids), str(exc)[:120],
+                    )
+                    if gis_mailing_source:
+                        # The rollback discarded this batch's mailing fills AND any
+                        # deferral markers, so none of its rows got the mailing answer
+                        # the lookup produced. Leave a marker-only write behind so the
+                        # recovery sweep asks again; without it they read as "no address"
+                        # forever (Codex P1). Counted only once it is actually stored.
+                        batch_deferred = set()
+                        try:
+                            for pid in batch_pids:
+                                for res in parcel_map.get(pid, []):
+                                    if res.mailing_address:
+                                        continue
+                                    ed = (dict(res.enrichment_data)
+                                          if isinstance(res.enrichment_data, dict) else {})
+                                    if ed.get("mailing_lookup_deferred") is not True:
+                                        ed["mailing_lookup_deferred"] = True
+                                        res.enrichment_data = ed
+                                        batch_deferred.add(pid)
+                            db.commit()
+                            gis_mailing_deferred += len(batch_deferred)
+                        except Exception as mark_exc:
+                            db.rollback()
+                            _logger.warning(
+                                "Job %s: deferral markers after a failed GIS commit were "
+                                "not stored either: %s", job_id, str(mark_exc)[:120],
+                            )
+                    continue
+                gis_mailing_deferred += len(batch_deferred)
+                rows_updated += batch_updated
+                checked += len(set(batch_pids) - batch_deferred)
+                if measured:
+                    # Right after the batch commit, before its log line and Redis
+                    # publish: the session is clean here, so the write lands.
+                    progress.report(_LOOKUP_GIS_STAGE, done=checked, total=len(all_pids))
+                _publish_log(
+                    r, job_id, "info",
+                    f"Property lookup progress: {checked}"
+                    f"/{len(all_pids)} parcels ({rows_updated} rows updated)",
+                    db=db,
+                )
+        finally:
+            # Back to the umbrella stage (counters cleared) however the sweep ends,
+            # including when it raises (a Redis publish, a time limit): the passes
+            # after it are unmeasured, and a stale "500 of 1200" must not outlive
+            # the sweep. The original exception always propagates.
+            if progress is not None and progress.last_stage == _LOOKUP_GIS_STAGE:
+                progress.report(_LOOKUP_STAGE)
         if gis_mailing_deferred:
             _logger.warning(
                 "Job %s: county GIS unreachable for %d row(s); mailing deferred to recovery",

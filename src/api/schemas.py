@@ -1420,6 +1420,8 @@ _STAGE_LABELS: dict[str, str] = {
     "deduping": "Checking for leads you already have",
     "exporting": "Preparing your file",
     "enriching": "Adding property and mailing details",
+    "address_lookup": "Looking up property and mailing addresses",
+    "address_lookup_gis": "Checking county parcel records",
     "queuing_contacts": "Queuing contact lookups",
     "finalizing": "Finishing up",
 }

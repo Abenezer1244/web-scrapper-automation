@@ -531,12 +531,25 @@ def _drive_account_deletions_impl(*, stripe_api: StripeSubscriptions | None = No
             started = time.monotonic()
             stripe_api = stripe_api or StripeSubscriptions()
             with system_sync_session() as db:
-                return {
+                stats = {
                     "stripe": _reconcile_stripe(db, stripe_api),
                     "scheduled_emails": _send_scheduled_emails(
                         db, send or _send_scheduled_notice),
-                    "deferred": _defer_in_flight(db),
-                    "purges": _run_purges(db, r2 or R2Store(), send_final or _send_final_notice),
+                }
+                # Every due account with work in flight must be deferred BEFORE any claim
+                # (the claim itself does not look at in-flight work): drain the deferral
+                # in batches, and claim nothing this tick if that does not finish.
+                stats["deferred"], drained = 0, False
+                while time.monotonic() - started < _TICK_BUDGET / 2:
+                    n = _defer_in_flight(db)
+                    stats["deferred"] += n
+                    if n < _BATCH:
+                        drained = True
+                        break
+                stats["purges"] = (
+                    _run_purges(db, r2 or R2Store(), send_final or _send_final_notice)
+                    if drained else {})
+                return stats | {
                     "customers_deleted": _close_stripe_customers(
                         db, stripe_api, started + _TICK_BUDGET + 40),
                     "overdue_alerts": _alert_overdue(db),

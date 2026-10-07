@@ -508,3 +508,32 @@ def test_completion_waits_for_a_linked_batch_then_retries(made) -> None:
             c.execute(text("DELETE FROM skip_trace_queues WHERE tracerfy_queue_id = :n"),
                       {"n": n})
         _cleanup_cache(ids)
+
+
+def test_no_account_with_work_in_flight_is_claimed_past_one_batch(made, monkeypatch) -> None:
+    """More in-flight accounts than one deferral batch: every one is deferred before
+    any claim, so none is purged while its work still runs."""
+    from tests.test_account_deletion_purge import _seed
+
+    monkeypatch.setattr(beat, "_BATCH", 2)
+    cleanup, dids = [], []
+    for _ in range(5):
+        uid, did, _ = _account(made, stripe_state="not_applicable")
+        with sync_engine.begin() as c:
+            ids = _seed(c, uid)
+            cleanup.append(ids)
+            c.execute(text("UPDATE jobs SET status = 'running' WHERE id = :j"), {"j": ids["job"]})
+            c.execute(text("SET LOCAL ROLE bridgeleads_purge"))
+            c.execute(text("UPDATE account_deletions SET status = 'restored' WHERE id = :d"),
+                      {"d": did})
+            dids.append(str(c.execute(text(
+                "INSERT INTO account_deletions (user_id, status, purge_after, stripe_state) "
+                "VALUES (:u, 'pending', now() - interval '1 day', 'not_applicable') "
+                "RETURNING id"), {"u": uid}).scalar()))
+    try:
+        result = _run()
+        assert result["purges"] == {} and result["deferred"] == 5
+        assert {_row(d).status for d in dids} == {"pending"}
+    finally:
+        for ids in cleanup:
+            _cleanup_cache(ids)

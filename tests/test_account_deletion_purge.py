@@ -560,6 +560,12 @@ def test_fence_refuses_inserts_and_pins_scrubbed_columns_once_purging(conn) -> N
                         {"u": uid, "b": bystander}).all()
     assert {(r.user_id, r.phone, r.party_name, r.skip_trace_status) for r in rows} == {
         (uid, "555", "Jane Doe", "errored"), (bystander, "999", "X", "errored")}
+    # A row cannot join a Tracerfy batch after the claim (the purge finds batches by it).
+    conn.execute(text("UPDATE pending_skip_trace_rows SET tracerfy_queue_id = 42, "
+                      "status = 'submitted' WHERE user_id = :u"), {"u": uid})
+    assert tuple(conn.execute(text(
+        "SELECT tracerfy_queue_id, status FROM pending_skip_trace_rows WHERE user_id = :u"),
+        {"u": uid}).one()) == (None, "submitted")
     conn.execute(text("UPDATE scraper_configs SET active = true, paused_reason = NULL "
                       "WHERE user_id = :u"), {"u": uid})
     assert conn.execute(text("SELECT active FROM scraper_configs WHERE user_id = :u"),

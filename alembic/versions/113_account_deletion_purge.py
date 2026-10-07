@@ -50,8 +50,10 @@ _FENCED = {
                 "enrichment_data", "phone", "phone_type", "phone_dnc_flag", "email",
                 "phones", "emails", "owner_state", "absentee_owner", "out_of_state_owner",
                 "last_trace_outcome", "skip_trace_subject_hash"),
+    # tracerfy_queue_id too: a purging owner's row can never join a batch after the
+    # claim, so the batches the purge finds through it are the complete set.
     "pending_skip_trace_rows": ("first_name", "last_name", "mail_address", "mail_city",
-                                "mail_state", "mail_zip"),
+                                "mail_state", "mail_zip", "tracerfy_queue_id"),
     "jobs": ("export_key", "error_message"),
     "scraper_configs": ("name", "fields", "enrichment", "schedule", "deliver", "doc_types",
                         "include_living_owner_tod", "active"),

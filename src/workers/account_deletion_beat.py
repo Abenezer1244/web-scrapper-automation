@@ -76,10 +76,10 @@ class StripeSubscriptions:
 
         stripe.api_key = settings.STRIPE_SECRET_KEY
         try:
-            # One bounded page: more than 100 subscriptions reads as "open" (retry later)
-            # rather than paging Stripe inside the tick.
-            subs = stripe.Subscription.list(customer=customer_id, status="all", limit=100)
-            if subs["has_more"] or any(s["status"] not in _ENDED for s in subs["data"]):
+            # Stripe's default list leaves canceled subscriptions out, so old ones can
+            # never fill the page: anything here that has not ended is live.
+            subs = stripe.Subscription.list(customer=customer_id, limit=100)
+            if any(s["status"] not in _ENDED for s in subs["data"]):
                 return "open"
             for status in ("draft", "open"):
                 if stripe.Invoice.list(customer=customer_id, status=status, limit=1)["data"]:

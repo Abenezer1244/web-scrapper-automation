@@ -78,7 +78,7 @@ class ExportStore:
         return DataExporter().delete_from_r2(key)
 
 
-class _TooLarge(Exception):
+class _TooLargeError(Exception):
     pass
 
 
@@ -111,7 +111,7 @@ def _batch(batch) -> dict:
 
 
 def _build_zip(user_id: str, zip_path: Path) -> None:
-    """Write the account's ZIP to zip_path. Raises _TooLarge over the row cap."""
+    """Write the account's ZIP to zip_path. Raises _TooLargeError over the row cap."""
     from src.api.results_category import download_rows_select
     from src.api.schemas import ScraperConfigResponse
     from src.db.models import BatchRun, Job, ScraperBatch, ScraperConfig, User
@@ -152,7 +152,7 @@ def _build_zip(user_id: str, zip_path: Path) -> None:
                 rows = db.scalars(download_rows_select(job.id, user_id, today)).all()
                 total += len(rows)
                 if total > settings.ACCOUNT_EXPORT_MAX_ROWS:
-                    raise _TooLarge
+                    raise _TooLargeError
                 if rows:
                     path = exporter.export(rows, filename=f"acct_{job.id[:8]}", fmt="csv",
                                            **config_export_options(cfg))
@@ -255,7 +255,7 @@ def _build_one(db, row, store: ExportStore) -> str:
     try:
         try:
             _build_zip(row.user_id, zip_path)
-        except _TooLarge:
+        except _TooLargeError:
             _fail(db, row, store, "too_large")
             return "failed"
         except Exception:  # noqa: BLE001 - logged with the id only; retried with backoff

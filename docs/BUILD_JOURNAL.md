@@ -41,9 +41,10 @@ background 401 can't beat it to a plain /login. Export downloads: up to 50 MB fe
 navigates to the 60 s link (streams to disk). A probe GET (false audit event), a hidden iframe (CSP
 frame-src), window.open after an await (popup-blocked) and a 200 MB blob (phones) were each rejected.
 
-**Failed / Blocked:** the owner asked me to flip both flags and I could not: the session's permission
-classifier refused the Railway variable writes (and a read-only `railway variables` after them). **Both
-flags are still OFF; the owner flips them.** Merges also needed the owner to type `gh pr merge` once.
+**Failed / Blocked:** "switch the flags" alone was refused by the session's permission classifier
+(Railway variable writes, and a read-only `railway variables` right after); it went through once the
+owner sent the exact `railway variables --set` commands. Merges likewise needed the owner to type
+`gh pr merge` once.
 Rig: Turbopack refuses a junction `node_modules` (`--webpack` works); port 3100 was another session's
 `next start`; the export worker writes through Cloudflare's native R2 API at a fixed host, so local
 downloads needed a scratch launcher pointing `_r2_api_base` at a throwaway store (one request reached
@@ -57,8 +58,12 @@ delete during an in-dialog download, copy said "is scheduled" before confirming)
 a failed download navigated the whole tab onto the API's 503 JSON page (live in #249, unreachable with
 flags off; fixed in #252); a squeezed spinner on mobile.
 
-**Pending / Handoff:** owner: set `ACCOUNT_EXPORT_ENABLED=true` on api + worker, then
-`ACCOUNT_DELETION_ENABLED=true`; then a read-only prod check and a real signed-in look at Settings.
+**Switched on (2026-10-08, owner-run):** `ACCOUNT_EXPORT_ENABLED=true` (api df399615, worker 8e0b4fbf),
+then `ACCOUNT_DELETION_ENABLED=true` (api c1c99ad8, worker 8c65666e), all SUCCESS, /health 200.
+Read-only prod check after: alembic 115, privileges/RLS/fence (21 tables) unchanged, 0 account_exports
+and 0 account_deletions rows.
+
+**Pending / Handoff:** a real signed-in look at Settings > Account in prod (I had no prod session).
 Not browser-tested: the "deletion has started" screen (purging/deleted; needs the purge driver). Counsel
 items unchanged (handoff §9).
 

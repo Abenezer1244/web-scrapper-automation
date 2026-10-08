@@ -19,6 +19,42 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-10-07/08 — UX 3.10a-FE2: the results bar shows the measured parcel sweep
+
+**Built / Shipped:** bridgeleads-web #248 (334b73e), 2 files, owner OK, Codex PLAN GO r12, diff gate
+r1 GATE: PASS, CI green, Vercel production success. While the county parcel sweep reports
+`address_lookup_gis` ("Checking county parcel records: Property N of M", BE #478 / #483), the results
+banner's progressbar gets `aria-valuenow` / `aria-valuetext` (the full label) and a determinate fill;
+every other payload keeps the 3.10a unmeasured bar. The guard trusts nothing: status `enriching`, an
+allowlisted stage, integer counters in range, a label ending in exactly these counts, and the BE's own
+capped derivation `min(99, floor(done/total*100))`. Count line "N property addresses found so far".
+Ends the 3.10a chain (FE #245, BE #475, #478, #483, FE #248).
+
+**Tried / Decided:** the measured label is shown but never retained: the terminal-reconciliation
+window keeps the counts-stripped sentence, so a finished run never claims a sweep position. King
+lookup ids stay unmeasured until a BE phase reports them (rename or unknown id = safe fallback).
+
+**Failed / Blocked:** the plan's CDP `Accessibility.getFullAXTree` check for `valuetext` cannot pass
+in this Chromium (rev 1234): CDP reports `valuetext` "" for every range role, even on a minimal static
+page, headless or headed. Proved it instead through Windows UI Automation on headed Chromium
+(ValuePattern.Value = the label, RangeValue 41; empty after the reset). The rig's stub and server
+were reaped by the low-memory reaper after the final run (no result lost).
+
+**Caught & fixed:** the frame-by-frame proof caught the global reduced-motion rule
+(`globals.css`: `transition-duration: 0.01ms !important` on `*`, property `all`) tweening the new
+fill's width over a frame under reduced motion; the plan required no transition at all. Fixed with an
+inline `transitionProperty: "none"` (the rule only forces duration). Five checks first labelled
+SEMANTIC also passed on master (end states 3.10a already meets) and were relabelled REGRESSION.
+
+**Pending / Handoff:** optional: capture the measured label on a real prod run (owner OK for the
+prod write). Next item-3 phase needs owner OK.
+
+**Facts learned:** a global `*` reduced-motion duration override turns every inline style change into
+a one-frame tween unless `transition-property` is set; CDP is not a source of truth for
+`aria-valuetext`. Proof: branch 113/0 (SEMANTIC 30, REGRESSION 83), master SEMANTIC 0/30.
+
+---
+
 ## 2026-10-07/08 — Account data export (P4) live behind a flag: migration 115, worker, routes
 
 **Built / Shipped:** four BE PRs, each Codex GATE PASS, CI green, owner-approved, prod-verified

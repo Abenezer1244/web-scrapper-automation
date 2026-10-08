@@ -19,6 +19,38 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-10-08 — UX 3.10b: status dots say what they mean (F-018)
+
+**Built / Shipped:** bridgeleads-web #251 (2c7a1bf), 4 files, owner OK, Codex PLAN GO r5, diff gate
+r1 GATE: PASS, CI green, Vercel production success. Counties (admin): every health dot now sits
+beside "Healthy / Degraded / Down / Unknown, checked X" (or "not checked yet"); the raw stored value
+is never shown or exposed. Sidebar "Today": visible "Running" (name "Today Running"; collapsed name
+and tooltip "Today (running)"). Scrapers cards: the status dot is gone.
+
+**Tried / Decided:** the Scrapers dot was removed, not labelled: `GET /scrapers` lists only active
+configs (`src/api/routes/scrapers.py:122-124`), so the dot was a constant green ping that read as
+"live" on idle cards. No `globals.css` contrast change: every remaining dot has visible text, so it
+is supplementary. Out of scope: an at-rest running cue on the collapsed sidebar; the failure reason
+(no BE field).
+
+**Failed / Blocked:** the plan took five Codex rounds. r1 caught that an sr-only "running" text left
+a 2.3:1 amber dot as the only visible cue; r2 caught that the sidebar flag used `isRunning`, which
+lit "Running" for pending / queued jobs (fixed with `isProcessing`). Twice an orphaned `next start`
+outlived its stopped task and held the rig port (EADDRINUSE, a 300s login timeout).
+
+**Caught & fixed:** the first master run passed 10 SEMANTIC checks: the "raw value hidden" check
+read only text (master leaked "flaky" through `title` / `aria-label`), and single-record-type rows
+never wrap, so they cannot reproduce the audit's 320px squash. With realistic multi-type rows master
+squashes the dot to 1.9px; checks were strengthened or relabelled REGRESSION where master already
+complies. Final: branch 163/0, master SEMANTIC 0/101.
+
+**Pending / Handoff:** next item-3 phase 3.10c (remaining touch targets), owner OK first.
+
+**Facts learned:** `aria-label` on a plain span (role generic) names nothing; stopping a background
+`npx next start` leaves the node server listening, so free the port before every rig start.
+
+---
+
 ## 2026-10-07/08 — UX 3.10a-FE2: the results bar shows the measured parcel sweep
 
 **Built / Shipped:** bridgeleads-web #248 (334b73e), 2 files, owner OK, Codex PLAN GO r12, diff gate

@@ -40,6 +40,7 @@ from src.db.models import User
 from .account_deletion import _second_factor
 
 _URL_TTL = 60
+_ONE_OPEN = "uq_account_exports_one_open"
 _COLUMNS = "id, status, requested_at, ready_at, expires_at, size_bytes, last_error"
 # When the next export may be asked for: 24 h after the latest one that did not fail.
 _NEXT_ALLOWED = (
@@ -87,6 +88,11 @@ async def request_export(
     and re-proved the password on it. A refusal still commits, so a consumed
     second-factor code stays consumed."""
     user_id = str(user.id)
+    # The gate ran before the lock: a deletion request may have committed since.
+    if user.deletion_state is not None:
+        await db.rollback()
+        raise HTTPException(status.HTTP_403_FORBIDDEN,
+                            "This account is scheduled for deletion. Restore it to continue.")
     await _second_factor(db, user, mfa_code)
     state = (await db.execute(text(
         "SELECT EXISTS (SELECT 1 FROM account_exports WHERE user_id = :u "  # noqa: S608 - fixed literals
@@ -108,8 +114,12 @@ async def request_export(
         row = (await db.execute(text(
             f"INSERT INTO account_exports (user_id) VALUES (:u) RETURNING {_COLUMNS}, "  # noqa: S608
             "requested_at + interval '1 day' AS next_allowed_at"), {"u": user_id})).one()
-    except IntegrityError:  # the one-open-export index: lost a race we cannot lose
-        await db.rollback()  # under the users lock, kept as the belt
+    except IntegrityError as exc:
+        # The one-open-export index (a race the users lock already prevents; the belt).
+        # Any other integrity failure is a real error, not "already being prepared".
+        if _ONE_OPEN not in str(exc.orig):  # asyncpg and psycopg both name it here
+            raise
+        await db.rollback()
         raise HTTPException(status.HTTP_409_CONFLICT,
                             "Your data export is already being prepared.") from None
     await db.commit()
@@ -148,6 +158,10 @@ async def resolve_download(db: AsyncSession, token: str, export_id: str) -> tupl
     user_id, claim = payload.get("sub"), payload.get("export_id")
     if payload.get("purpose") != "account_export" or not isinstance(user_id, str):
         raise _BAD_LINK
+    try:
+        user_id = str(uuid.UUID(user_id))
+    except ValueError:
+        raise _BAD_LINK from None
     try:
         claim_id = str(uuid.UUID(claim)) if isinstance(claim, str) else None
     except ValueError:

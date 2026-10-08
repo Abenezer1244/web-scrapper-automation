@@ -14,6 +14,7 @@ the wrappers keep working unchanged.
 """
 
 import asyncio
+import itertools
 import time
 import uuid
 from typing import Annotated
@@ -602,14 +603,20 @@ async def download_account_export(
     export_id = _account_export.canonical_id(export_id)
     user_id, size = await _account_export.resolve_download(db, token, export_id)
     await rate_limit(request, zone="export", identifier=user_id)
+    def open_stream(key: str):
+        # The first chunk is read here: a storage failure is a 503, never a 200 that
+        # breaks off before any byte.
+        chunks = store.stream(key)
+        return chunks, next(chunks, b"")
+
     try:
-        chunks = await run_in_threadpool(store.stream, export_key(user_id, export_id))
+        chunks, first = await run_in_threadpool(open_stream, export_key(user_id, export_id))
     except Exception:  # noqa: BLE001 - storage read failed before any byte was sent
         _logger.exception("account export %s: storage read failed", export_id)
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE,
                             "Download temporarily unavailable") from None
     audit_log(request, "account_export_downloaded", user_id)
-    return StreamingResponse(chunks, media_type="application/zip", headers={
+    return StreamingResponse(itertools.chain([first], chunks), media_type="application/zip", headers={
         "Content-Disposition": 'attachment; filename="bridgeleads-data-export.zip"',
         "Content-Length": str(size),
         "Cache-Control": "no-store",

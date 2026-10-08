@@ -36,10 +36,14 @@ class Store:
         self.read: list[str] = []
 
     def stream(self, key):
-        if self.fail:
-            raise RuntimeError("r2 down")
         self.read.append(key)
-        return iter([_ZIP[:10], _ZIP[10:]])
+
+        def chunks():  # like DataExporter.stream_from_r2: the read fails on iteration
+            if self.fail:
+                raise RuntimeError("r2 down")
+            yield _ZIP[:10]
+            yield _ZIP[10:]
+        return chunks()
 
 
 @pytest.fixture
@@ -256,9 +260,19 @@ async def test_an_expired_export_never_downloads(client, starter_user, export_on
 
 @pytest.mark.asyncio
 async def test_a_storage_failure_is_a_503_not_a_broken_file(
-        client, starter_user, export_on, store) -> None:
+        client, db, starter_user, export_on, store) -> None:
+    """The read fails on its first chunk: a 503 before any byte, and no download event."""
     store.fail = True
     uid = str(starter_user.id)
     eid = _ready(uid)
     token = mint_account_export_token(uid, eid, 60)
     assert (await client.get(f"/auth/export/{eid}/download?token={token}")).status_code == 503
+    assert await _events(db, starter_user, "account_export_downloaded") == 0
+
+
+@pytest.mark.asyncio
+async def test_a_signed_token_with_a_malformed_subject_is_refused(
+        client, starter_user, export_on, store) -> None:
+    eid = _ready(str(starter_user.id))
+    token = mint_account_export_token("not-a-uuid", eid, 60)
+    assert (await client.get(f"/auth/export/{eid}/download?token={token}")).status_code == 401

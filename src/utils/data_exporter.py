@@ -334,7 +334,8 @@ class DataExporter:
     def stream_from_r2(self, object_key: str, chunk_size: int = 1 << 16):
         """Iterate an R2 object's bytes (native API, like delete/list; production's S3
         presigning is broken). RAISES before the first byte if the object cannot be
-        read, so a caller never starts a response it cannot finish."""
+        read, so a caller never starts a response it cannot finish. The connection is
+        closed when the iteration ends, fails or is abandoned."""
         if ".." in object_key or object_key.startswith("/"):
             raise ValueError(f"Invalid object key: {object_key}")
         resp = _requests.get(f"{_r2_api_base()}/objects/{object_key}",
@@ -342,7 +343,13 @@ class DataExporter:
         if resp.status_code != 200:
             resp.close()
             raise RuntimeError(f"R2 read failed for {object_key} ({resp.status_code})")
-        return resp.iter_content(chunk_size)
+
+        def chunks():
+            try:
+                yield from resp.iter_content(chunk_size)
+            finally:
+                resp.close()
+        return chunks()
 
     def list_r2_keys(self, prefix: str) -> list[str]:
         """Up to 1000 object keys under `prefix` (one page of the Cloudflare R2 API, the

@@ -5,7 +5,7 @@ under ONE stage, `enriching`, with no counts, so the results page could only sho
 indeterminate bar for what is often the longest part of a run. Now run_scrape_job
 writes the umbrella stage `address_lookup`, and the generic county GIS sweep (the one
 pass that runs for every county with parcel rows, King included) reports
-`address_lookup_gis` with "parcels checked of N" after every committed batch, then
+`address_lookup_gis` with "parcels processed of N" after every committed batch, then
 returns to the umbrella when it ends, however it ends.
 
 Real test database and real Redis throughout. The county GIS adapter
@@ -154,18 +154,19 @@ def _results(job_id: str) -> dict[str, tuple]:
         }
 
 
-def _run(job_id: str, r, token) -> None:
+def _run(job_id: str, r, token, summary: dict | None = None) -> None:
     from src.db.session import system_sync_session
 
     with system_sync_session() as sdb:
         job = sdb.get(Job, job_id)
         config = sdb.get(ScraperConfig, job.scraper_config_id)
-        enrich._run_inline_enrichment(sdb, job, r, job_id, config, summary={},
+        enrich._run_inline_enrichment(sdb, job, r, job_id, config,
+                                      summary={} if summary is None else summary,
                                       attempt_token=token)
 
 
-async def _enrich(job_id: str, r, token) -> None:
-    await asyncio.to_thread(_run, job_id, r, token)
+async def _enrich(job_id: str, r, token, summary: dict | None = None) -> None:
+    await asyncio.to_thread(_run, job_id, r, token, summary)
 
 
 def _counts(writes: list[dict]) -> list[tuple]:
@@ -290,7 +291,7 @@ class TestGisSweep:
             out = _all_answered(i, batch, stats)
             if i == 0:
                 # One parcel the county could not be reached for: answered with a
-                # property address, mailing deferred to recovery, so not CHECKED.
+                # property address, mailing deferred to recovery. Still PROCESSED.
                 out[batch[0]] = _answer(batch[0], mailing=False)
                 stats["county_unreached"] = [batch[0]]
             if i == 1:
@@ -300,8 +301,9 @@ class TestGisSweep:
         _county(monkeypatch, _per_call)
         await _enrich(job_id, redis_client, token)
 
+        # Batch 1 (2) and batch 3 (2) are processed; the failed batch 2 adds nothing.
         assert _counts(writes) == [
-            (GIS, 1, 6, "parcel"), (None, 3, 6, "parcel"), (UMBRELLA, None, None, None),
+            (GIS, 2, 6, "parcel"), (None, 4, 6, "parcel"), (UMBRELLA, None, None, None),
         ]
         assert [int(m.split(":")[1].split("/")[0]) for m in _progress_logs(job_id)] == [
             w["units_done"] for w in writes[:2]]
@@ -335,7 +337,7 @@ class TestGisSweep:
         assert before_second[0].units_total is None
         assert _counts(writes) == [(GIS, 2, 4, "parcel"), (UMBRELLA, None, None, None)]
 
-    async def test_parcels_with_no_answer_are_checked_deferred_ones_are_not(
+    async def test_parcels_with_no_answer_are_processed(
             self, db, business_user, redis_client, monkeypatch):
         job_id, token, _pids = await _job(db, business_user, parcels=4)
         _batch(monkeypatch)
@@ -347,12 +349,13 @@ class TestGisSweep:
         assert _counts(writes)[0] == (GIS, 2, 4, "parcel")
         assert _progress_logs(job_id)[0] == "Property lookup progress: 2/4 parcels (1 rows updated)"
 
-    async def test_a_parcel_already_deferred_is_not_counted_when_its_lookup_fails_again(
+    async def test_deferred_mailing_parcels_still_count_as_processed(
             self, db, business_user, redis_client, monkeypatch, caplog):
-        """A lead an earlier run already marked for mailing recovery. Its lookup fails
-        again, so its marker does not change; it is still not CHECKED. Both ways a
-        lookup is deferred: the county unreached, and a bulk mailing write that RAISES
-        (the real driver rejects a NUL byte inside the row's savepoint)."""
+        """A deferred MAILING lookup does not make a parcel unprocessed, whether its
+        marker is new or set by an earlier run. Both ways a mailing lookup is deferred:
+        the county unreached, and a bulk mailing write that RAISES (the real driver
+        rejects a NUL byte inside the row's savepoint). The deferral is still reported,
+        by the summary that feeds the completion line."""
         job_id, token, pids = await _job(db, business_user, parcels=4)
         await db.execute(text(
             "UPDATE results SET enrichment_data = (enrichment_data::jsonb || "
@@ -379,10 +382,36 @@ class TestGisSweep:
 
         assert "bulk mailing write failed" in caplog.text  # the write really raised
         assert _counts(writes) == [
-            (GIS, 1, 4, "parcel"), (None, 2, 4, "parcel"), (UMBRELLA, None, None, None),
+            (GIS, 2, 4, "parcel"), (None, 4, 4, "parcel"), (UMBRELLA, None, None, None),
         ]
         assert [m.split(" (")[0] for m in _progress_logs(job_id)] == [
-            "Property lookup progress: 1/4 parcels", "Property lookup progress: 2/4 parcels"]
+            "Property lookup progress: 2/4 parcels", "Property lookup progress: 4/4 parcels"]
+
+    async def test_the_production_shape_county_unreached_for_every_parcel(
+            self, db, business_user, redis_client, monkeypatch):
+        """The 3.10a-BE production proof (Clark, job 371c1a44): the county request fails
+        for every parcel, the statewide layer still answers the property address, and
+        every mailing lookup is deferred. The count moves through the sweep to the end
+        (it read "29 of 866" before); the deferral is reported by the summary."""
+        job_id, token, pids = await _job(db, business_user, parcels=4)  # benton: has a mailing source
+        _batch(monkeypatch)
+        writes = _recorder(monkeypatch)
+
+        def _per_call(i, batch, stats):
+            stats["county_unreached"] = list(batch)
+            return {p: _answer(p, mailing=False) for p in batch}
+
+        _county(monkeypatch, _per_call)
+        summary: dict = {}
+        await _enrich(job_id, redis_client, token, summary)
+
+        assert _counts(writes) == [
+            (GIS, 2, 4, "parcel"), (None, 4, 4, "parcel"), (UMBRELLA, None, None, None),
+        ]
+        assert summary["mailing_deferred"] == 4
+        rows = _results(job_id)
+        assert all(prop is not None and mail is None for prop, mail, _e in rows.values())
+        assert all(ed.get("mailing_lookup_deferred") is True for _p, _m, ed in rows.values())
 
     async def test_a_one_batch_sweep_is_not_measured(
             self, db, business_user, redis_client, monkeypatch):

@@ -113,45 +113,46 @@ def _check_beat() -> None:
 
 
 def _check_r2() -> None:
-    creds = all(
-        getattr(settings, n, "")
-        for n in ("R2_ENDPOINT_URL", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY")
-    )
-    if not creds:
-        _record(_WARN, "R2 lifecycle", "R2 credentials absent - cannot check the rule")
+    # Native Cloudflare API, NOT boto3/S3. The worker's S3-compatible credentials
+    # do not authenticate in production (head_bucket, list_objects and
+    # get_lifecycle all returned 401), which is why an earlier version of this
+    # check reported a misleading "Unauthorized". upload_to_r2 has always used the
+    # native API with R2_API_TOKEN, and so does this.
+    if not (settings.R2_ACCOUNT_ID and settings.R2_API_TOKEN):
+        _record(_WARN, "R2 lifecycle", "R2_ACCOUNT_ID/R2_API_TOKEN absent - cannot check")
         return
-    import boto3
-    from botocore.exceptions import ClientError
+    import requests
 
-    client = boto3.client(
-        "s3", endpoint_url=settings.R2_ENDPOINT_URL,
-        aws_access_key_id=settings.R2_ACCESS_KEY_ID,
-        aws_secret_access_key=settings.R2_SECRET_ACCESS_KEY, region_name="auto",
-    )
+    import src.api  # noqa: F401 — package init first; data_exporter is circular otherwise
+    from src.utils.data_exporter import _r2_api_base, _r2_headers
+
     bucket = settings.R2_BUCKET_NAME
-    try:
-        rules = client.get_bucket_lifecycle_configuration(Bucket=bucket).get("Rules", [])
-    except ClientError as exc:
-        code = exc.response.get("Error", {}).get("Code")
-        if code in ("NoSuchLifecycleConfiguration", "404", "NoSuchConfiguration"):
-            rules = []
-        else:
-            _record(_FAIL, "R2 lifecycle", f"{bucket}: {code}")
-            return
-    ours = [r for r in rules if r.get("ID") == _RULE_ID]
+    resp = requests.get(_r2_api_base() + "/lifecycle", headers=_r2_headers(), timeout=30)
+    if resp.status_code != 200:
+        _record(_FAIL, "R2 lifecycle", f"{bucket}: HTTP {resp.status_code} {resp.text[:80]}")
+        return
+    rules = resp.json().get("result", {}).get("rules", []) or []
+    ours = [r for r in rules if r.get("id") == _RULE_ID]
+    others = ", ".join(str(r.get("id")) for r in rules if r.get("id") != _RULE_ID)
     if not ours:
         _record(
             _FAIL, "R2 lifecycle",
-            f"{bucket} has no '{_RULE_ID}' rule. Delivered exports still hold the "
-            "same phone numbers. Run scripts/set_r2_lifecycle.py --apply",
+            f"{bucket} has no '{_RULE_ID}' rule - delivered exports still hold the "
+            f"same phone numbers. Run scripts/set_r2_lifecycle.py --apply"
+            + (f" (would preserve: {others})" if others else ""),
         )
-    elif ours[0].get("Status") != "Enabled":
-        _record(_FAIL, "R2 lifecycle", f"'{_RULE_ID}' exists but is {ours[0].get('Status')}")
+        return
+    rule = ours[0]
+    max_age = rule.get("deleteObjectsTransition", {}).get("condition", {}).get("maxAge")
+    if not rule.get("enabled"):
+        _record(_FAIL, "R2 lifecycle", f"'{_RULE_ID}' exists but is DISABLED")
+    elif not max_age:
+        _record(_FAIL, "R2 lifecycle", f"'{_RULE_ID}' has no deleteObjectsTransition")
     else:
         _record(
             _PASS, "R2 lifecycle",
-            f"{bucket}: expire after {ours[0].get('Expiration', {}).get('Days')}d "
-            f"({len(rules)} rule(s) total)",
+            f"{bucket}: delete after {max_age // 86400}d "
+            f"({len(rules)} rule(s) total{'; also ' + others if others else ''})",
         )
 
 

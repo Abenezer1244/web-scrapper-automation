@@ -463,6 +463,10 @@ class Settings(BaseSettings):
     # open a deletion nothing would finish. Restore is never gated, so turning this off
     # can never strand an account that is already pending.
     ACCOUNT_DELETION_ENABLED: bool = False
+    # Account data export (P4): one export's ceiling, so a huge account cannot run a
+    # worker out of disk or time. Over it the export fails with "contact support".
+    ACCOUNT_EXPORT_MAX_ROWS: int = 250_000
+    ACCOUNT_EXPORT_MAX_BYTES: int = 200 * 1024 * 1024
     RETENTION_PURGE_ENABLED: bool = False
     RETENTION_PURGE_DRY_RUN: bool = True
     SKIP_TRACE_PII_RETENTION_DAYS: int = 365

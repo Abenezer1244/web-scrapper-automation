@@ -193,6 +193,13 @@ app.conf.beat_schedule = {
         "task": "src.workers.scheduler.drive_account_deletions",
         "schedule": 300.0,
     },
+    "build-account-exports": {
+        # Account data export (src/workers/account_export.py): builds requested ZIPs,
+        # emails the link, deletes them after 7 days. The only builder (the route
+        # only queues a row), so a minute is the most a user waits to start.
+        "task": "src.workers.scheduler.build_account_exports",
+        "schedule": 60.0,
+    },
     "drain-email-change-outbox": {
         # Confirmed email changes: notify the OLD address + sync the Stripe
         # customer email, retried with backoff (src/workers/account_emails.py).
@@ -583,6 +590,16 @@ def drive_account_deletions() -> dict:
     """
     from src.workers.account_deletion_beat import _drive_account_deletions_impl
     return _drive_account_deletions_impl()
+
+
+@app.task(name="src.workers.scheduler.build_account_exports",
+          soft_time_limit=1500, time_limit=1560)
+def build_account_exports() -> dict:
+    """Build the next requested account data export, email ready links, expire old
+    ones (account_export.py). One run at a time (advisory lock); the limits stay
+    under the 30-minute claim lease, so a killed build is always reclaimable."""
+    from src.workers.account_export import _build_account_exports_impl
+    return _build_account_exports_impl()
 
 
 @app.task(name="src.workers.scheduler.dispatch_pending_verification_emails")

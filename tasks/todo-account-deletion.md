@@ -521,6 +521,23 @@ refuses every link for a non-NULL deletion_state. Options:
 - Round 2: FAIL (shape check admits names) -> fixed allowlist of codes. **Round 3: GATE: PASS.**
 - purgesim.py extended (account_exports role x privilege matrix + column grants, proven to catch a
   hand-granted DELETE): PASS after every round. 21 fenced tables ENABLE ALWAYS.
+- Merged #480 (owner OK) as c0fc56ec; prod verified read-only (alembic 115, grants, policies, fence,
+  CHECKs, 0 rows); VERIFIED posted.
+
+### P4b build (worker) review log
+- Shared: `download_rows_select()` (results_category.py) and `config_export_options()` (lead_export.py),
+  extracted from GET /jobs/{id}/download, which now uses them (475 download/export/beat tests pass).
+  No ORM model (account_deletions has none either). Expiry runs in the export beat, not retention
+  (RETENTION_PURGE ships off). Configs exported through ScraperConfigResponse (secrets already
+  write-only there); batch deliver filtered by DELIVER_SECRET_FIELDS. Verified the build session is
+  REPEATABLE READ + read-only with the GUC bound. Largest prod account: ~91k raw rows / 100 runs.
+- Mutation-checked: FOR SHARE re-check, secret filter, lease check, email deletion filter, row cap.
+- Codex round 1: FAIL. Adopted: LIMIT remaining+1 per job, rows expunged per job, ZIP size checked as
+  it grows; claim only attempts < 3 + separate give-up; local temp-file sweep. Refuted: email race
+  (a deletion request and an email change both raise the logout-all cutoff in the same txn, so a link
+  minted before either is dead; no lock across an external call).
+- Round 2: FAIL (give-up marked failed before deleting the object) -> delete first, then CAS; a failed
+  delete is retried next tick (failure-injection test). **Round 3: GATE: PASS.**
 
 ### PRs (each: tests on the real DB, stand-ins only for R2/Resend; Codex diff review to GATE PASS)
 - [ ] **P4a migration 115** (alone, schema-first): table, CHECK, partial unique, RLS + grants,

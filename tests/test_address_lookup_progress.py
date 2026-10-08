@@ -389,11 +389,12 @@ class TestGisSweep:
 
     async def test_the_production_shape_county_unreached_for_every_parcel(
             self, db, business_user, redis_client, monkeypatch):
-        """The 3.10a-BE production proof (Clark, job 371c1a44): the county request fails
-        for every parcel, the statewide layer still answers the property address, and
-        every mailing lookup is deferred. The count moves through the sweep to the end
-        (it read "29 of 866" before); the deferral is reported by the summary."""
-        job_id, token, pids = await _job(db, business_user, parcels=4)  # benton: has a mailing source
+        """Production-shaped (the 3.10a-BE proof, Clark job 371c1a44, had this shape):
+        the county request fails for every parcel, the statewide layer still answers the
+        property address, and every mailing lookup is deferred. The count moves through
+        the sweep to the end (that run read "29 of 866"); the deferral is reported by the
+        summary. Benton stands in: a county with a mailing source."""
+        job_id, token, pids = await _job(db, business_user, county="benton", parcels=4)
         _batch(monkeypatch)
         writes = _recorder(monkeypatch)
 

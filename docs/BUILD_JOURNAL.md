@@ -19,6 +19,57 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-10-07/08 — Account data export (P4) live behind a flag: migration 115, worker, routes
+
+**Built / Shipped:** four BE PRs, each Codex GATE PASS, CI green, owner-approved, prod-verified
+read-only with VERIFIED posted:
+- #480 (c0fc56ec) migration 115 `account_exports`: the durable 24 h limit, status, the beat's outbox
+  (claim_id lease, backoff) and the 7-day expiry. The ZIP key is derived
+  (`exports/{user_id}/account/{id}.zip`, inside the P3 purge sweep), never stored. App: INSERT
+  (user_id) + SELECT own; worker: SELECT + UPDATE of system columns; nobody DELETE (24-month request
+  log). Fence trigger attached (BLD20/21).
+- #481 (867b85cc) the job download's standing-rules query and CSV layout moved into
+  `download_rows_select()` / `config_export_options()`; prod check: 25/25 recent jobs, identical rows.
+- #482 (8a1a4fb4) `src/workers/account_export.py`, beat `build_account_exports` every minute (one
+  run at a time). REPEATABLE READ read-only snapshot; configs through `ScraperConfigResponse` (secrets
+  write-only), batch deliver minus `DELIVER_SECRET_FIELDS`; lead CSVs through the same query + builder
+  as the Download button; publish reads the users row FOR SHARE (ordered against a deletion request);
+  7-day link emailed to the current address; caps 250k rows / 200 MB.
+- #484 (0fb3fc14) `POST/GET /auth/export`, `/url`, `/download` behind `ACCOUNT_EXPORT_ENABLED`
+  (off). Dedicated download verifier (purpose `account_export`, export_id claim, jti, logout-all,
+  deletion belt). OpenAPI +300/-0. FE types-regen PR bridgeleads-web #247.
+
+**Tried / Decided:** owner, 2026-10-07: (A) the download belt stays strict, so a pending-deletion
+account downloads nothing, even an export made before the request (the request already revokes
+every link; restore, download, ask again). Design doc §3 amended. Rows kept 24 months; own flag;
+caps from the largest prod account (~91k raw rows / 100 runs). Expiry lives in the export beat, not
+the retention sweep (RETENTION_PURGE ships off). No ORM model (account_deletions has none).
+
+**Failed / Blocked:** one local test run reported 12 h wall time (the machine slept; all passed).
+A background CI watcher was reaped for low memory; CI itself was unaffected. A patch script broke
+once on quote escaping (nothing applied); rewritten with the Write tool. The P4b PR touched 9 files, so it was split (P4b-1 #481 / P4b-2 #482) for the 5-file
+rule.
+
+**Caught & fixed:** Codex: P4a: an expiry CHECK that passed with NULL ready_at, an unconstrained
+`last_error` (now a fixed code allowlist). P4b: the build loaded all rows before checking the cap
+(now LIMIT remaining+1 per job, rows expunged per job, ZIP size checked as it grows); an attempts
+off-by-one; a give-up that marked failed BEFORE deleting the object (orphan on crash: now delete
+first, CAS after, retried next tick). P4c: deletion could commit between the gate and the lock
+(recheck under the lock); the stream could 200 then break and leaked the R2 connection (prefetch
+the first chunk, close in finally); any IntegrityError became a 409; a malformed signed `sub` was a
+500. Mine: asyncpg errors have no `.diag`, so matching the constraint by attribute would never fire.
+
+**Pending / Handoff:** FE #247 (types) awaiting owner merge. P5 frontend (Settings > Account > Your
+data: export button + status/link, delete dialog with "download your data first" and "an export is
+being prepared", grace banner + Restore). Then the owner switches on ACCOUNT_EXPORT_ENABLED and
+ACCOUNT_DELETION_ENABLED. Plan + every review round: `tasks/todo-account-deletion.md` (P4).
+
+**Facts learned:** a stacked PR (base not main) runs NO CI; after the base squash-merges, retarget
+then `git rebase --onto origin/main <old base>` + force-push, which triggers CI. Branch protection
+requires up-to-date branches, so two sessions merging BE PRs back to back cost a full CI re-run for
+the second. `tools/purgesim.py` now checks the account_exports privilege matrix (proven to flag a
+hand-granted DELETE).
+
 ## 2026-10-06 (session 2) — Account deletion P3a live (migration 113); P3b built, reviewed
 
 **Built / Shipped:** BE #476 (squash 5b7a00aa) migration 113 LIVE and prod-verified read-only.

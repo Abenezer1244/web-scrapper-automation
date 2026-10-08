@@ -77,6 +77,11 @@ class ExportStore:
         from src.utils.data_exporter import DataExporter
         return DataExporter().delete_from_r2(key)
 
+    def stream(self, key: str):
+        """The object's bytes, for GET /auth/export/{id}/download."""
+        from src.utils.data_exporter import DataExporter
+        return DataExporter().stream_from_r2(key)
+
 
 class _TooLargeError(Exception):
     pass

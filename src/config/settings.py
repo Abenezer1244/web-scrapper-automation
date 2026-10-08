@@ -463,7 +463,10 @@ class Settings(BaseSettings):
     # open a deletion nothing would finish. Restore is never gated, so turning this off
     # can never strand an account that is already pending.
     ACCOUNT_DELETION_ENABLED: bool = False
-    # Account data export (P4): one export's ceiling, so a huge account cannot run a
+    # Account data export (P4): gates every /auth/export route (404 when off). The
+    # owner switches it on with the Settings UI (P5).
+    ACCOUNT_EXPORT_ENABLED: bool = False
+    # One export's ceiling, so a huge account cannot run a
     # worker out of disk or time. Over it the export fails with "contact support".
     ACCOUNT_EXPORT_MAX_ROWS: int = 250_000
     ACCOUNT_EXPORT_MAX_BYTES: int = 200 * 1024 * 1024

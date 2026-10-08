@@ -14,6 +14,7 @@ the wrappers keep working unchanged.
 """
 
 import asyncio
+import itertools
 import time
 import uuid
 from typing import Annotated
@@ -39,6 +40,7 @@ from src.api.auth import (
 from src.api.deps import get_rls_db
 from src.api.middleware import audit_log, rate_limit
 from src.api.routes.auth_helpers import account_deletion as _account_deletion
+from src.api.routes.auth_helpers import account_export as _account_export
 from src.api.routes.auth_helpers import email_change as _email_change
 from src.api.routes.auth_helpers import login as _login_helpers
 from src.api.routes.auth_helpers import mfa as _mfa_helpers
@@ -70,6 +72,9 @@ from src.api.routes.auth_helpers.tokens import (  # noqa: F401
 from src.api.schemas import (
     AccountDeleteRequest,
     AccountDeletionResponse,
+    AccountExportRequest,
+    AccountExportResponse,
+    AccountExportUrlResponse,
     AccountRestoreRequest,
     ApiKeyResponse,
     BreakGlassLoginRequest,
@@ -103,8 +108,16 @@ from src.config.constants import BUSINESS_FEATURES_PLANS
 from src.db import User, get_db  # noqa: F401 (User used in Annotated type)
 from src.db.models import AuditEvent, UserAvatar
 from src.utils.avatar import ALLOWED_CONTENT_TYPES, MAX_UPLOAD_BYTES, AvatarError, process_avatar
+from src.utils.logger import setup_logger
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+_logger = setup_logger("api.auth")
+
+
+def _account_export_store():
+    """Where export ZIPs are read from (R2). A dependency, so tests pass a stand-in."""
+    from src.workers.account_export import ExportStore
+    return ExportStore()
 
 
 async def _reauthenticate(request: Request, user: User, password: str) -> None:
@@ -529,6 +542,87 @@ async def restore_account(
     await _account_deletion.restore_deletion(request, db, user, body.mfa_code)
 
 
+@router.post("/export", response_model=AccountExportResponse,
+             status_code=status.HTTP_202_ACCEPTED)
+async def request_account_export(
+    body: AccountExportRequest,
+    request: Request,
+    current_user: Annotated[User, Depends(require_session)],
+    db: AsyncSession = Depends(get_rls_db),
+) -> AccountExportResponse:
+    """Ask for a ZIP of this account's data. It is built within minutes and the link is
+    emailed (and shown here) for 7 days. One per 24 h."""
+    _account_export.require_enabled()
+    user = await _account_deletion.lock_user(db, current_user.id)
+    await _reauthenticate(request, user, body.current_password)
+    return await _account_export.request_export(request, db, user, body.mfa_code)
+
+
+@router.get("/export", response_model=AccountExportResponse | None)
+async def get_account_export(
+    current_user: Annotated[User, Depends(require_session)],
+    db: AsyncSession = Depends(get_rls_db),
+) -> AccountExportResponse | None:
+    """The latest data export (null when there has never been one)."""
+    _account_export.require_enabled()
+    return await _account_export.latest(db, str(current_user.id))
+
+
+@router.get("/export/{export_id}/url", response_model=AccountExportUrlResponse)
+async def get_account_export_url(
+    export_id: str,
+    request: Request,
+    response: Response,
+    current_user: Annotated[User, Depends(require_session)],
+    db: AsyncSession = Depends(get_rls_db),
+) -> AccountExportUrlResponse:
+    """A one-minute download link for a ready export."""
+    _account_export.require_enabled()
+    response.headers["Cache-Control"] = "no-store"  # a bearer link in the body
+    export_id = _account_export.canonical_id(export_id)
+    await rate_limit(request, zone="export", identifier=current_user.id)
+    url = await _account_export.download_url(db, str(current_user.id), export_id)
+    return AccountExportUrlResponse(url=url)
+
+
+@router.get("/export/{export_id}/download",
+            responses={200: {"content": {"application/zip": {}}}})
+async def download_account_export(
+    export_id: str,
+    request: Request,
+    token: str = "",
+    db: AsyncSession = Depends(get_db),
+    store=Depends(_account_export_store),
+):
+    """The export ZIP, streamed from storage. Token only (from /url or the email)."""
+    from fastapi.responses import StreamingResponse
+
+    from src.workers.account_export import export_key
+
+    _account_export.require_enabled()
+    export_id = _account_export.canonical_id(export_id)
+    user_id, size = await _account_export.resolve_download(db, token, export_id)
+    await rate_limit(request, zone="export", identifier=user_id)
+    def open_stream(key: str):
+        # The first chunk is read here: a storage failure is a 503, never a 200 that
+        # breaks off before any byte.
+        chunks = store.stream(key)
+        return chunks, next(chunks, b"")
+
+    try:
+        chunks, first = await run_in_threadpool(open_stream, export_key(user_id, export_id))
+    except Exception:  # noqa: BLE001 - storage read failed before any byte was sent
+        _logger.exception("account export %s: storage read failed", export_id)
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE,
+                            "Download temporarily unavailable") from None
+    audit_log(request, "account_export_downloaded", user_id)
+    return StreamingResponse(itertools.chain([first], chunks), media_type="application/zip", headers={
+        "Content-Disposition": 'attachment; filename="bridgeleads-data-export.zip"',
+        "Content-Length": str(size),
+        "Cache-Control": "no-store",
+    })
+
+
 # Security activity a user should be able to recognise (or not) as their own.
 # An allowlist, not "everything with my user_id": the audit log also holds
 # operational events (job_created, ...) that are not security activity.
@@ -538,6 +632,7 @@ SECURITY_EVENTS = (
     "email_change_requested",
     "email_changed", "session_revoked", "sessions_revoked_others", "logout_all",
     "account_deletion_requested", "account_deletion_restored",
+    "account_export_requested", "account_export_downloaded",
 )
 
 

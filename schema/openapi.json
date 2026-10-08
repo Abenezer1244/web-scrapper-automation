@@ -52,6 +52,126 @@
         "title": "AccountDeletionResponse",
         "type": "object"
       },
+      "AccountExportRequest": {
+        "additionalProperties": false,
+        "description": "Ask for a ZIP of this account's data: the same step-up as deleting it.",
+        "properties": {
+          "current_password": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Current Password",
+            "type": "string"
+          },
+          "mfa_code": {
+            "anyOf": [
+              {
+                "maxLength": 32,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mfa Code"
+          }
+        },
+        "required": [
+          "current_password"
+        ],
+        "title": "AccountExportRequest",
+        "type": "object"
+      },
+      "AccountExportResponse": {
+        "description": "The account's latest data export. `status`: pending | building | ready | failed |\nexpired. `last_error` (failed only): deletion_requested | too_large | build_failed |\nupload_failed. `next_allowed_at`: when another export may be requested (one per\n24 h; a failed one does not count).",
+        "properties": {
+          "expires_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expires At"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "last_error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Error"
+          },
+          "next_allowed_at": {
+            "format": "date-time",
+            "title": "Next Allowed At",
+            "type": "string"
+          },
+          "ready_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ready At"
+          },
+          "requested_at": {
+            "format": "date-time",
+            "title": "Requested At",
+            "type": "string"
+          },
+          "size_bytes": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Size Bytes"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "status",
+          "requested_at",
+          "next_allowed_at"
+        ],
+        "title": "AccountExportResponse",
+        "type": "object"
+      },
+      "AccountExportUrlResponse": {
+        "description": "A one-minute download link for a ready export.",
+        "properties": {
+          "url": {
+            "title": "Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "title": "AccountExportUrlResponse",
+        "type": "object"
+      },
       "AccountRestoreRequest": {
         "additionalProperties": false,
         "description": "Cancel a pending account deletion: the same step-up as requesting it.",
@@ -6682,6 +6802,186 @@
           }
         },
         "summary": "Confirm Email Change",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/auth/export": {
+      "get": {
+        "description": "The latest data export (null when there has never been one).",
+        "operationId": "get_account_export_auth_export_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/AccountExportResponse"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "title": "Response Get Account Export Auth Export Get"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Get Account Export",
+        "tags": [
+          "auth"
+        ]
+      },
+      "post": {
+        "description": "Ask for a ZIP of this account's data. It is built within minutes and the link is\nemailed (and shown here) for 7 days. One per 24 h.",
+        "operationId": "request_account_export_auth_export_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AccountExportRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccountExportResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Request Account Export",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/auth/export/{export_id}/download": {
+      "get": {
+        "description": "The export ZIP, streamed from storage. Token only (from /url or the email).",
+        "operationId": "download_account_export_auth_export__export_id__download_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "export_id",
+            "required": true,
+            "schema": {
+              "title": "Export Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "token",
+            "required": false,
+            "schema": {
+              "default": "",
+              "title": "Token",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              },
+              "application/zip": {}
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Download Account Export",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/auth/export/{export_id}/url": {
+      "get": {
+        "description": "A one-minute download link for a ready export.",
+        "operationId": "get_account_export_url_auth_export__export_id__url_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "export_id",
+            "required": true,
+            "schema": {
+              "title": "Export Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccountExportUrlResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Get Account Export Url",
         "tags": [
           "auth"
         ]

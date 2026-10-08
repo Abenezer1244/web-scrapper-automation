@@ -360,6 +360,30 @@ class AccountDeletionResponse(BaseModel):
     purge_after: datetime
 
 
+class AccountExportRequest(AccountRestoreRequest):
+    """Ask for a ZIP of this account's data: the same step-up as deleting it."""
+
+
+class AccountExportResponse(BaseModel):
+    """The account's latest data export. `status`: pending | building | ready | failed |
+    expired. `last_error` (failed only): deletion_requested | too_large | build_failed |
+    upload_failed. `next_allowed_at`: when another export may be requested (one per
+    24 h; a failed one does not count)."""
+    id: str
+    status: str
+    requested_at: datetime
+    ready_at: datetime | None = None
+    expires_at: datetime | None = None
+    size_bytes: int | None = None
+    last_error: str | None = None
+    next_allowed_at: datetime
+
+
+class AccountExportUrlResponse(BaseModel):
+    """A one-minute download link for a ready export."""
+    url: str
+
+
 class EmailChangeRequest(BaseModel):
     """Start an email change: the new address, re-proved by the current password
     and, when two-factor is on, a TOTP or backup code."""

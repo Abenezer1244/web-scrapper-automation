@@ -538,6 +538,21 @@ refuses every link for a non-NULL deletion_state. Options:
   minted before either is dead; no lock across an external call).
 - Round 2: FAIL (give-up marked failed before deleting the object) -> delete first, then CAS; a failed
   delete is retried next tick (failure-injection test). **Round 3: GATE: PASS.**
+- Split for the 5-file rule: P4b-1 #481 (shared query/layout, 3 files) and P4b-2 #482 (worker, stacked;
+  no CI until retargeted to main, then a fresh push is needed: a retarget runs no CI).
+
+### P4c build (routes) review log
+- POST /auth/export (step-up as delete; 409 in progress, 429 + Retry-After within 24 h, failed ones
+  free), GET /auth/export (latest + next_allowed_at), GET /auth/export/{id}/url (60 s token), GET
+  /auth/export/{id}/download?token= (dedicated verifier: purpose account_export, export_id claim,
+  jti, logout-all, is_active, deletion_state IS NULL; streams from R2 through an injectable store).
+  All behind ACCOUNT_EXPORT_ENABLED. Audit account_export_requested / _downloaded (security events).
+  OpenAPI regenerated (0 deletions) -> FE types-regen PR after merge.
+- Mutation-checked: purpose, deletion belt, logout-all, claim compare, download expiry, 24 h limit.
+- Codex round 1: FAIL. Adopted: deletion recheck after lock_user, prefetch first chunk + close the R2
+  response, 409 only for the one-open index, canonical sub. Refuted: missing current_password
+  (inherited), early IP rate limit / header tokens (job-download pattern, F-01). **Round 2: GATE: PASS.**
+  Tests: 13 route + 14 worker + 53 auth regression pass; OpenAPI --check OK.
 
 ### PRs (each: tests on the real DB, stand-ins only for R2/Resend; Codex diff review to GATE PASS)
 - [ ] **P4a migration 115** (alone, schema-first): table, CHECK, partial unique, RLS + grants,

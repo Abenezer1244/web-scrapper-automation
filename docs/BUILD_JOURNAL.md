@@ -19,6 +19,35 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-10-08 — UX 3.10c: real targets for the last small controls (F-026)
+
+**Built / Shipped:** bridgeleads-web #253 (1ac9e62), 4 files, owner OK, Codex PLAN GO r5, diff gate
+r1 GATE: PASS, CI green, Vercel production success. Enrichment dismiss, the Live cancel confirm
+and "Mark all read" are 32px for a mouse and 44px on touch; the Live "keep" button is now the words
+"Keep running" instead of a bare X beside "Yes, cancel"; the row chevron is 24px for a mouse.
+
+**Tried / Decided:** the chevron stays 32px on touch on purpose: the whole table row is already the
+touch toggle and a 44px button would overlap the next row's hit area (proven with real touch taps on
+two row points and the chevron, each toggling once). The Live header stacks below sm so the confirm
+pair has the full width at 320. The dismiss keeps the banner height with a calibrated `-my-[5px]`
+(Codex r2 caught that `-my-2` would have shrunk it).
+
+**Failed / Blocked:** none in the product. Rig: the first calibration counted the icon's box as a
+second text line, and a touch tap landed on an interactive cell; both fixed in the verifier.
+
+**Caught & fixed:** master passed the cancel-prompt collision check (its small X fits), so that check
+is REGRESSION, not SEMANTIC. The Results page overflows 23px at 320 from its header actions
+(Look up contacts / Download new CSV), on master too: outside the diff, logged as backlog. Final:
+branch 256/0, master SEMANTIC 0/61.
+
+**Pending / Handoff:** backlog item above; next item-3 phase 3.11 Polish (F-049, F-050), owner OK first.
+
+**Facts learned:** a negative margin sized to the OLD outer height (here 22px) is what keeps a
+container unchanged when a target grows; an orphaned `next start` appeared again after TaskStop and
+was freed before reuse (the landmine note works).
+
+---
+
 ## 2026-10-08 — UX 3.10b: status dots say what they mean (F-018)
 
 **Built / Shipped:** bridgeleads-web #251 (2c7a1bf), 4 files, owner OK, Codex PLAN GO r5, diff gate

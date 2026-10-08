@@ -51,6 +51,7 @@ from src.api.results_category import (
     ResultsListCategory,
     already_delivered_condition,
     category_condition,
+    download_rows_select,
     no_address_condition,
 )
 from src.api.results_sort import DEFAULT_RESULTS_SORT, ResultsSort, results_order_by
@@ -2415,7 +2416,14 @@ async def download_export(
             # Generate CSV directly from database results
             from datetime import UTC, datetime
             today = datetime.now(UTC).date()
-            dl_query = select(Result).where(Result.job_id == job_id, Result.user_id == user.id)
+            # Standing rules (match get_results + the worker exports), in file order:
+            # unactionable rows, rows over the 18-month tax cap and the other category
+            # are never in this file. None of these is a user "filter": they are
+            # product rules, which is why the empty-result branch below probes for rows
+            # using only the quarantine rules and asks nothing about them. Default
+            # category: new leads only; a download bills nothing either way. The same
+            # query builds the account data export's lead files.
+            dl_query = download_rows_select(job_id, user.id, today, category)
             # Phase 4: apply the SAME tax view-filters as get_results so the export
             # matches the filtered view. Track whether a filter is active so an
             # empty filtered set returns a header-only CSV (a valid "no matches")
@@ -2425,17 +2433,6 @@ async def download_export(
             )
             for cond in tax_conditions:
                 dl_query = dl_query.where(cond)
-            # Hard product cap: never EXPORT tax rows whose oldest unpaid year is >18
-            # months old, regardless of user filters. Matches get_results.
-            dl_query = dl_query.where(tax_cap_condition(today))
-            # Standing rules (match get_results + the worker exports): unactionable rows
-            # and duplicates are never exported. None of these three is a user "filter" —
-            # they are product rules, which is why the empty-result branch below probes
-            # for rows using only the quarantine rules and asks nothing about them.
-            dl_query = dl_query.where(actionable_condition())
-            # Default: new leads only, exactly as before. The already_delivered file is
-            # the same set that view lists; a download bills nothing either way.
-            dl_query = dl_query.where(category_condition(category))
             # Phase 5: dialer-ready filter (not known-DNC; matches get_results +
             # the push — strict IS-FALSE would hide skip-traced phones whose DNC is
             # NULL; the dialer scrubs DNC).
@@ -2446,13 +2443,6 @@ async def download_export(
             owner_conditions = build_owner_conditions(absentee, out_of_state)
             for cond in owner_conditions:
                 dl_query = dl_query.where(cond)
-
-            # Deterministic order (groups an estate's records together) — the SAME
-            # order the scheduled/R2 export uses, so the two exports are byte-identical,
-            # not just same-columns (Codex).
-            dl_query = dl_query.order_by(
-                Result.party_name, Result.date_recorded, Result.id
-            )
 
             results_query = await db.execute(dl_query)
             records = results_query.scalars().all()
@@ -2507,24 +2497,14 @@ async def download_export(
             # ScraperConfig carrying the batch's `fields` (batches.py), and Job.scraper_
             # config_id is NOT NULL, so the guard's None branch is defensive only. (The
             # batch COMBINED export is a separate path — see batch_export.py.)
-            from src.utils.lead_export import (
-                resolve_export_layout,
-                resolve_hidden_output_fields,
-                write_lead_csv,
-            )
-            hidden_fields: set[str] = set()
-            # Lean per-record-type columns: this download is a SINGLE record type (each
-            # job — batch child or standalone — has one ScraperConfig.record_type). The
-            # combined batch export is a separate superset path (batch_export.py). None
-            # scraper_config_id (defensive; Job.scraper_config_id is NOT NULL) -> full.
-            columns: list[str] | None = None
-            labels: dict[str, str] | None = None
-            # Source county/state/record_type for the rows: a Result carries none of
-            # them, and without a record type the party-name order is unknown (blank
-            # First/Last). Read from the SAME owner-scoped config row as the layout.
-            context: dict[str, str] | None = None
+            # Lean per-record-type columns (each job, batch child or standalone, has one
+            # ScraperConfig.record_type), the config's layout and the source context, all
+            # from config_export_options. None scraper_config_id (defensive; Job.scraper_
+            # config_id is NOT NULL) -> full superset.
+            from src.utils.lead_export import config_export_options, write_lead_csv
+            cfg = None
             if job.scraper_config_id:
-                cfg_row = await db.execute(
+                cfg = (await db.execute(
                     select(
                         ScraperConfig.fields, ScraperConfig.record_type, ScraperConfig.deliver,
                         ScraperConfig.county, ScraperConfig.state,
@@ -2532,19 +2512,8 @@ async def download_export(
                         ScraperConfig.id == job.scraper_config_id,
                         ScraperConfig.user_id == user.id,
                     )
-                )
-                cfg = cfg_row.one_or_none()
-                if cfg is not None:
-                    hidden_fields = resolve_hidden_output_fields(cfg.fields)
-                    layout = cfg.deliver.get("csv_layout") if isinstance(cfg.deliver, dict) else None
-                    columns, labels = resolve_export_layout(layout, cfg.record_type)
-                    context = {
-                        "county": cfg.county, "state": cfg.state, "record_type": cfg.record_type,
-                    }
-            write_lead_csv(
-                records, output, hidden_fields=hidden_fields, columns=columns,
-                labels=labels, context=context,
-            )
+                )).one_or_none()
+            write_lead_csv(records, output, **config_export_options(cfg))
 
             csv_bytes = output.getvalue().encode("utf-8")
             # The two files must not be confused once they sit in a downloads folder.

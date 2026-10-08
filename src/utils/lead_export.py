@@ -278,6 +278,26 @@ def resolve_export_layout(
     return resolve_lead_export_columns(record_type), None
 
 
+def config_export_options(config: Any) -> dict[str, Any]:
+    """The write_lead_csv / DataExporter.export keyword arguments for one job's file,
+    from its scraper config (anything with fields, deliver, record_type, county,
+    state): the user's hidden columns, the config's CSV layout, and the source context
+    (a Result carries no county/state/record type, and without the record type the
+    party-name order is unknown). None = no config: everything, full superset."""
+    if config is None:
+        return {}
+    layout = config.deliver.get("csv_layout") if isinstance(config.deliver, dict) else None
+    columns, labels = resolve_export_layout(layout, config.record_type)
+    return {
+        "hidden_fields": resolve_hidden_output_fields(config.fields),
+        "columns": columns,
+        "labels": labels,
+        "context": {
+            "county": config.county, "state": config.state, "record_type": config.record_type,
+        },
+    }
+
+
 # ── Party-name order per source ─────────────────────────────────────────────
 # Verified 2026-09-14 against scraper code AND a read-only prod sample: county
 # recorder indexes and assessor/treasurer owner names are 'LAST FIRST [MIDDLE]';

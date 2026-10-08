@@ -21,11 +21,13 @@ The predicate lives here once so the list, the header count and the CSV cannot
 drift apart: the tab reading "227" must be the set the table pages through and the
 file contains.
 """
+from datetime import date
 from typing import Literal
 
-from sqlalchemy import and_, func, not_, or_
+from sqlalchemy import and_, func, not_, or_, select
 
-from src.api.lead_actionability import has_address_condition
+from src.api.lead_actionability import actionable_condition, has_address_condition
+from src.api.tax_filters import tax_cap_condition
 from src.db.models import Result
 
 ResultsCategory = Literal["new", "already_delivered"]
@@ -91,3 +93,20 @@ def category_condition(category: ResultsCategory):
     # The routes validate against ResultsCategory, so this is a programming error.
     # Falling back to "new" would quietly hand a caller the wrong set of rows.
     raise ValueError(f"unknown results category: {category!r}")
+
+
+def download_rows_select(job_id: str, user_id: str, today: date,
+                         category: ResultsCategory = DEFAULT_RESULTS_CATEGORY):
+    """The rows of one job's lead CSV before any view filter, in file order: the
+    product's standing rules (actionable, the tax-delinquency cap, the category), never
+    a user's choice. Shared by GET /jobs/{id}/download and the account data export, so
+    "every lead CSV you can download" is the same file in both."""
+    return (
+        select(Result)
+        .where(
+            Result.job_id == job_id, Result.user_id == user_id,
+            tax_cap_condition(today), actionable_condition(), category_condition(category),
+        )
+        # Groups an estate's records together; the same order the R2 export uses.
+        .order_by(Result.party_name, Result.date_recorded, Result.id)
+    )

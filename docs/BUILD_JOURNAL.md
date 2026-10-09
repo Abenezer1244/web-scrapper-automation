@@ -19,6 +19,59 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-10-08 — Account deletion + export P5: the frontend (Your data, delete dialog, grace gate)
+
+**Built / Shipped:** bridgeleads-web, all owner OK, Codex GATE: PASS, CI + Vercel preview green, prod
+checked with both flags off: **#249** (9c3f513) Settings > Account > Your data drives the P4 export
+(step-up dialog, status polled only while building, download, expiry / next-allowed / per-failure copy,
+`too_large` -> support); **#250** (6c91f1e) the dashboard layout reads `deletion_state` from /auth/me
+and renders a full-screen "scheduled for deletion" gate with Restore instead of the app (no shell query
+fires, so nothing 403s); **#252** (78f09f2) the delete dialog (30-day grace, billing, sessions, retention,
+"download your data first" with the ready export offered in-dialog, typed email + password + 2FA) and a
+`/login?account=deletion-scheduled` notice. Plan + every review round: bridgeleads-web
+`tasks/todo-account-your-data.md`. No backend change.
+
+**Tried / Decided:** owner decisions 2026-10-08: no endpoint reveals ACCOUNT_DELETION_ENABLED, so the
+Delete row follows the export flag and a delete 404 says "isn't available yet" (flip export, then
+deletion, back to back); generic retention wording ("kept for as long as the law requires") until
+counsel's. The grace gate lives in the server layout (like the profile gate), so a pending account never
+mounts the shell. The restore form always shows an optional 2FA field because /auth/mfa/status is 403
+while pending. Delete rotates the token, then suppresses signOut-on-401 (security-tab's pattern) so a
+background 401 can't beat it to a plain /login. Export downloads: up to 50 MB fetched in-page; bigger
+navigates to the 60 s link (streams to disk). A probe GET (false audit event), a hidden iframe (CSP
+frame-src), window.open after an await (popup-blocked) and a 200 MB blob (phones) were each rejected.
+
+**Failed / Blocked:** "switch the flags" alone was refused by the session's permission classifier
+(Railway variable writes, and a read-only `railway variables` right after); it went through once the
+owner sent the exact `railway variables --set` commands. Merges likewise needed the owner to type
+`gh pr merge` once.
+Rig: Turbopack refuses a junction `node_modules` (`--webpack` works); port 3100 was another session's
+`next start`; the export worker writes through Cloudflare's native R2 API at a fixed host, so local
+downloads needed a scratch launcher pointing `_r2_api_base` at a throwaway store (one request reached
+api.cloudflare.com first: empty account and token, 404, nothing stored); a nested store path broke
+Windows MAX_PATH; the memory reaper killed the dev server twice.
+
+**Caught & fixed:** Codex: PR A 5 rounds (dead Download after expiry, refetch loop when allowed,
+cached status replaced by the fallback on a failed refetch, no way back from a missed boundary
+refetch, flag turned off mid-session), B1 1 round, B2 3 rounds (dialog stuck if the refresh threw,
+delete during an in-dialog download, copy said "is scheduled" before confirming). Mine, while verifying:
+a failed download navigated the whole tab onto the API's 503 JSON page (live in #249, unreachable with
+flags off; fixed in #252); a squeezed spinner on mobile.
+
+**Switched on (2026-10-08, owner-run):** `ACCOUNT_EXPORT_ENABLED=true` (api df399615, worker 8e0b4fbf),
+then `ACCOUNT_DELETION_ENABLED=true` (api c1c99ad8, worker 8c65666e), all SUCCESS, /health 200.
+Read-only prod check after: alembic 115, privileges/RLS/fence (21 tables) unchanged, 0 account_exports
+and 0 account_deletions rows.
+
+**Pending / Handoff:** a real signed-in look at Settings > Account in prod (I had no prod session).
+Not browser-tested: the "deletion has started" screen (purging/deleted; needs the purge driver). Counsel
+items unchanged (handoff §9).
+
+**Facts learned:** a delete request revokes every session, so other tabs see 401 (refresh fails ->
+sign out), never the pending-deletion 403; the 403 only meets an account that signs in again. Decision
+A holds end to end: a download link minted before the delete answers 401 after it. React Query v5's
+focus refetch listens on `window` `visibilitychange` (a synthetic event on `document` does nothing).
+
 ## 2026-10-08 — UX 3.10c: real targets for the last small controls (F-026)
 
 **Built / Shipped:** bridgeleads-web #253 (1ac9e62), 4 files, owner OK, Codex PLAN GO r5, diff gate

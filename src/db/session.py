@@ -53,6 +53,7 @@ async_engine = create_async_engine(
     _async_url,
     poolclass=NullPool,
     echo=settings.DEBUG,
+    hide_parameters=True,  # P0-04: bound values (names, addresses) never reach error text or logs
     connect_args={
         "statement_cache_size": 0,
         **_ssl_connect_args(_async_url, async_driver=True),
@@ -97,6 +98,7 @@ sync_engine = create_engine(
     max_overflow=3,
     pool_timeout=30,  # wait max 30s for a connection from the pool
     echo=settings.DEBUG,
+    hide_parameters=True,  # P0-04
     connect_args={
         "connect_timeout": 10,  # 10s to establish TCP connection
         # 120s max per SQL statement — prevents infinite hangs when
@@ -149,6 +151,7 @@ heartbeat_engine = create_engine(
     _sync_url,
     poolclass=NullPool,
     echo=False,  # never echo: this fires every 60s per running job
+    hide_parameters=True,  # P0-04
     connect_args={
         "connect_timeout": 10,
         # Deliberately far tighter than the work engine's 120s. A liveness ping
@@ -225,6 +228,7 @@ canary_engine = create_engine(
     _canary_url,
     poolclass=NullPool,
     echo=False,
+    hide_parameters=True,  # P0-04
     connect_args={
         # Overrides any URL connect_timeout ON PURPOSE: a probe that has not
         # connected in 5 s has its answer, whatever the API is willing to wait.
@@ -444,6 +448,7 @@ def check_rls_role_status() -> dict:
                 tmp_engine = create_engine(
                     async_as_sync_url,
                     poolclass=NullPool,
+                    hide_parameters=True,  # P0-04
                     connect_args={"connect_timeout": 10},
                 )
                 try:

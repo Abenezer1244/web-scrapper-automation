@@ -153,7 +153,24 @@ app.conf.update(
 # would throw "Scraping target not in approved domain list" on the
 # first scrape of any connector seeded outside the API. See Sprint
 # 6.3 Phase 3 audit in docs/compliance/connector-audit-2026-04-10.md
-from celery.signals import worker_ready  # noqa: E402
+from celery.signals import after_setup_logger, after_setup_task_logger, worker_ready  # noqa: E402
+
+
+# P0-04: Celery builds its own log handlers (root, task, multiprocessing) and
+# never runs main.py's install_global_redaction(), so worker and beat logs went
+# out unscrubbed. Both signals fire for `celery worker` and `celery beat`, and
+# forked pool children inherit the filtered handlers. They are skipped if a
+# `setup_logging` receiver ever takes over logging: that receiver must then
+# call install_global_redaction() itself.
+@after_setup_logger.connect
+@after_setup_task_logger.connect
+def _install_log_redaction(logger=None, **_kwargs) -> None:
+    from celery.utils.log import get_multiprocessing_logger
+
+    from src.utils.logger import install_global_redaction
+
+    extra = [lg for lg in (logger, get_multiprocessing_logger()) if lg is not None]
+    install_global_redaction(*extra)
 
 
 @worker_ready.connect

@@ -51,21 +51,42 @@ _SECRET_PATTERNS: list[tuple[re.Pattern, str]] = [
         r"(?i)((?:primary_|mobile_|cell_|home_|work_|landline_)?phone(?:_number)?[\"']?\s*[:=]\s*[\"']?)"
         r"\+?[\d().\-]+(?:[ \t][\d().\-]+){0,4}"
     ), r"\1[REDACTED_PHONE]"),
+    # P0-04: presigned R2/S3 links are bearer credentials until they expire.
+    (re.compile(r"(?i)(X-Amz-(?:Signature|Credential|Security-Token)=)[^&\s\"'<>]+"), r"\1[REDACTED]"),
+    # P0-04: search terms in access-log URLs are owner names and addresses.
+    (re.compile(r"(?i)([?&](?:q|search)=)[^&\s\"'<>]+"), r"\1[REDACTED]"),
+    # P0-04: hide_parameters drops SQLAlchemy's "[parameters: ...]", but Postgres
+    # still echoes values in its DETAIL line: unique/FK keys (both pairs of a
+    # "conflicts with existing key" line) and whole rows on NOT NULL/CHECK
+    # failures. Bounded and line-limited so a long near-miss line stays cheap.
+    (re.compile(r"((?:[Kk]ey|existing key) \([^()\n]{1,200}\)=\()[^\n]{0,500}?(\)(?= already exists| is not present| conflicts with|\.?[ \t]*$))", re.M),
+     r"\1[REDACTED]\2"),
+    (re.compile(r"(Failing row contains \()[^\n]{0,2000}(\))"), r"\1[REDACTED]\2"),
 ]
 
 
-def install_global_redaction() -> None:
+def _scrub(text: str) -> str:
+    for pattern, repl in _SECRET_PATTERNS:
+        text = pattern.sub(repl, text)
+    return text
+
+
+_exc_formatter = logging.Formatter()
+
+
+def install_global_redaction(*extra_loggers: logging.Logger) -> None:
     """Best-effort: attach the redaction filter to the root + uvicorn loggers.
 
     setup_logger() already filters its own handlers, but modules that use
     ``logging.getLogger(...)`` directly (e.g. middleware) bypass that. Adding
     the filter at the logger level here scrubs records emitted directly to
     those loggers; the per-source fingerprinting remains the primary defense
-    for PII. Idempotent — safe to call more than once.
+    for PII. Idempotent — safe to call more than once. ``extra_loggers`` get the
+    same treatment (Celery passes its root, task and multiprocessing loggers).
     """
     names = [None, "uvicorn", "uvicorn.error", "uvicorn.access", "security"]
-    for name in names:
-        lg = logging.getLogger(name) if name else logging.getLogger()
+    loggers = [logging.getLogger(name) if name else logging.getLogger() for name in names]
+    for lg in [*loggers, *extra_loggers]:
         if _redaction_filter not in lg.filters:
             lg.addFilter(_redaction_filter)
         for handler in lg.handlers:
@@ -77,16 +98,31 @@ class _RedactionFilter(logging.Filter):
     """Rewrite log records to scrub secret-shaped substrings before output."""
 
     def filter(self, record: logging.LogRecord) -> bool:
+        # Each part is scrubbed on its own: a failure in one must neither drop
+        # the record nor skip the others.
         try:
             msg = record.getMessage()
+            redacted = _scrub(msg)
+            if redacted != msg:
+                record.msg = redacted
+                record.args = ()
         except Exception:
-            return True
-        redacted = msg
-        for pattern, repl in _SECRET_PATTERNS:
-            redacted = pattern.sub(repl, redacted)
-        if redacted != msg:
-            record.msg = redacted
-            record.args = ()
+            pass
+        # P0-04: handlers format exc_info AFTER filters run and then reuse
+        # record.exc_text, so the traceback is scrubbed here. It may already be
+        # cached unscrubbed by an earlier handler, so always scrub what is there.
+        try:
+            if record.exc_info and not record.exc_text:
+                record.exc_text = _exc_formatter.formatException(record.exc_info)
+            if record.exc_text:
+                record.exc_text = _scrub(record.exc_text)
+        except Exception:
+            pass
+        try:
+            if record.stack_info:
+                record.stack_info = _scrub(record.stack_info)
+        except Exception:
+            pass
         return True
 
 

@@ -19,6 +19,61 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-10-08/10 — UX 3.11 Polish (F-049, F-050): narrow widths, one name per page, counts, notifications
+
+**Built / Shipped:** bridgeleads-web, five sub-phases, each with its own Codex PLAN GO, owner OK
+("Work in bcd"), branch GREEN / master RED proof, Codex diff gate PASS, CI + Vercel production success:
+**#254** 3.11a (459a837) the scraper form holds together at 320 (checkbox sizes, Run time row, Edit
+padding); **#256** 3.11b (f95508b) mobile lead cards keep ZIP+4 on one line and break joined names at
+`,` `/` `&` before mid-word; **#255** 3.11c (e8e15cb) page titles match the nav (Today / Deliver /
+Counties), "Back to Today", the palette says "Pierce, WA"; **#257** 3.11d (8eb2898) counts read with
+thousands separators: `formatCount` (explicit en-US), `AnimatedCounter` wheels plus static commas, the
+Results and Live pages, and a fit rule so a long value scales to a narrow card; **#258** 3.11e (e505cc5)
+notification rows differ (two-line title, the exact time to the second in a `<time>`, formatted counts,
+an unclipped subtitle), the in-shell error page says "Today", and its "Try again" now recovers.
+Plan and every review round: bridgeleads-web `docs/ux-audit/todo-item3-batches-B-E.md` (docs PR #238).
+
+**Tried / Decided:** 3.11d's fit rule scales the glyph row with `transform: scale(k)` instead of the
+plan's "scale fontSize": a transform does not change layout, so the width the card gives the counter
+never depends on the scale (scaling fontSize would feed back into a content-sized flex item and could
+ratchet smaller); Codex accepted the deviation. 3.11e recovery drops only queries nobody observes
+(`removeQueries` with an observer-count predicate), accepting that other pages' unobserved caches reload
+on their next visit; tagging route-owned keys would have meant touching every page. Backend stage labels
+("Part 4089 of 10000") stay unformatted: changing them forks the 3.10a-FE2 guard, so that is a named
+BE + FE follow-up.
+
+**Failed / Blocked:** 3.11d's first width gate passed falsely: it measured the digit-wheel boxes, which
+flex-shrink (6px each for "1,000,000" in the 55px Live card) while the glyphs overlap; it now measures
+glyph ink with a Range plus a no-overlap check, and master shows the same overlap. Plan facts that
+measurement overturned: with 1,057 / 2,048 the notification subtitle fits at 320 even on master, and
+master's implicit `toLocaleString()` already groups in an en-US browser (the honest SEMANTIC signal for
+those lines is a de-DE browser, where master prints "1.500"). Rig: edit scripts in JS template literals
+stripped backslashes twice (`/\s+/g` became `/s+/g`, replacing every letter "s"; the Edit tool is the
+fix); a CRLF file defeated a string replace (the script threw, nothing written); the memory reaper
+killed the stub, the server, the verifier and a Codex run in one sweep (restarted on owner OK, then
+one job at a time); another session's stub held 127.0.0.1:8123, so this rig moved to 8124 and no
+longer frees 8123.
+
+**Caught & fixed:** Codex: 3.11d plan r1-r5 and gate r1 (a value rounding to -0 read "-0"; fixed in
+`formatCount`, NaN stays visible); 3.11e plan r1-r5 (r3: "Try again" re-threw from React Query's cache;
+r5: `resetQueries({ type: "inactive" })` refetches every inactive query, so `removeQueries`); 3.11e gate
+r1 (a query observed only while disabled counts as inactive and could be orphaned). Mine: doubled parens
+around `formatCount` arguments; a "no extra requests" check that compared against the dashboard's URLs
+too, so it could not have caught a refetch (now calibrated against the /scrapers page only).
+Final proofs: 3.11d branch 57/57, master SEMANTIC 0/26; 3.11e branch 37/37, master SEMANTIC 0/11.
+
+**Pending / Handoff:** F-050's count item is PARTIAL until "formatCount in Results / Live child
+components" ships (run-breakdown, run-summary, tabs, pagination, delivered summary, contact progress,
+lookup dialog, RunOutcomes, and the sidebar usage line, which prints "4.321 / 5.000" in a de-DE
+browser), max 5 files per phase; "BE: thousands separators in stage labels" with the FE2 guard; the
+Results header overflow at 320 (3.10c backlog). Next item-3 phase needs owner OK.
+
+**Facts learned:** TanStack Query 5.90: `resetQueries(filters)` refetches `{ type: "active", ...filters }`,
+so an `inactive` filter refetches every inactive query; an observer with `enabled: false` makes its query
+inactive; a crashed route's queries keep their failing data (staleTime 30 s) and a bare `reset()`
+re-throws. In a flex row an `overflow-hidden` child can shrink below its content, so element boxes prove
+nothing about legibility; measure text with a Range.
+
 ## 2026-10-08 — Account deletion + export P5: the frontend (Your data, delete dialog, grace gate)
 
 **Built / Shipped:** bridgeleads-web, all owner OK, Codex GATE: PASS, CI + Vercel preview green, prod

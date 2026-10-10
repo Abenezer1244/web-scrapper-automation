@@ -19,6 +19,48 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-10-10 — UX 3.11f/g: the rest of the counts in Results, Live and the sidebar (F-050)
+
+**Built / Shipped:** bridgeleads-web, owner "proceed", each with Codex PLAN GO, branch GREEN / master
+RED, Codex gate PASS, CI `check` green (master is now branch-protected), Vercel production success:
+**#260** 3.11f (b0c42c0) the run summary (Results + Live outcomes), `RunLeadCount` (Results index,
+dashboard) and the Results tab counts; **#261** 3.11g (729ea2b) Results pagination (range, page of
+pages, page pills), the contact lookup dialog / progress, the delivered lookup summary and the sidebar
+usage badge. Every count now goes through explicit en-US grouping, so a German browser reads "1,234",
+not "1.234". This finishes the follow-up named in the 3.11 entry below.
+
+**Tried / Decided:** `lib/run-summary.ts` got a one-line module-local en-US helper instead of importing
+`formatCount`: the file is loaded by plain `node --test` (`npm run test:unit`, now in CI), which cannot
+resolve `@/lib/utils`, and tsc rejects `./utils.ts` (no `allowImportingTsExtensions`); its own header
+already promised type-only imports. A page pill that was a fixed 32px circle now widens from "1,000"
+(`min-w-8 px-1.5`), the same circle up to "999". The delivered lookup summary still renders nothing when
+no lead was looked up: Codex's gate flagged it, the component documents that choice, and it stayed.
+
+**Failed / Blocked:** none in the product. Rig: the worktree's `node_modules` held Next 16.3.5 after
+#259 moved the lock to 16.3.8 (`npm ci` first, 6 min); a `/menu/i` button selector hit "Account menu"
+before "Open sidebar", so the first drawer check read the hidden desktop badge; reaching pill 1,000
+needs 499 clicks (the page number is not in the URL).
+
+**Caught & fixed:** Codex plan rounds: 3.11f r1 (unit proof overclaimed master; 320 checks; the
+stacked lead count has no "·"); 3.11g r1-r2 (progress needs `claimed` not `running`; the dialog's
+`pause` is non-null and typed `ContactLookupQuote`; delivered buckets must partition the count; the
+badge's summary is only the collapsed link's label). Mine: a `count` helper name would have been
+shadowed by local `count` variables (named `grouped`); two relabels where master passed (the pill fit,
+en-US output of lines master already grouped). Proofs: 3.11f branch 33/33, master SEMANTIC 0/11 (unit
+24/24 vs 23/23); 3.11g branch 38/38, master SEMANTIC 0/12.
+
+**Pending / Handoff:** named, unscheduled: "implicit count formats app-wide" (Batch, Dashboard charts,
+Settings Billing, Segments, records page, scraper cards, quota banner, list filter, chart, coverage,
+admin funnel); "dates in a non-US browser" (`formatUtcDate` uses the browser locale: "resets 1. Nov.");
+"BE: thousands separators in stage labels". Next item-3 phase is 3.12 Records truth (F-047), which
+waits on the owner's decision (retire / relabel the cache-backed records page, or turn the daily
+scrape back on).
+
+**Facts learned:** a de-DE browser context is the cheapest honest proof of locale-dependent
+formatting: Node and an en-US browser both print "1,234" through implicit `toLocaleString()`, which
+hides the defect. Codex accepts "the code documents this choice" as an answer when the comment
+really says it.
+
 ## 2026-10-08/10 — UX 3.11 Polish (F-049, F-050): narrow widths, one name per page, counts, notifications
 
 **Built / Shipped:** bridgeleads-web, five sub-phases, each with its own Codex PLAN GO, owner OK

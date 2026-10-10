@@ -266,7 +266,7 @@ class AcclaimWebScraper(BridgeScraper):
 
         try:
             body_text = await self.page.inner_text("body")
-            _logger.debug("Page text (first 500): %s", body_text[:500].replace('\n', ' '))
+            _logger.debug("Page text: %d chars", len(body_text))  # P0-04: never the text
 
             # Strategy 1: Checkbox-based disclaimer (Chelan pattern)
             # Some AcclaimWeb sites use a checkbox labeled "Accept Disclaimer"
@@ -581,7 +581,7 @@ class AcclaimWebScraper(BridgeScraper):
             # Log page state after search
             body = await self.page.inner_text("body")
             _logger.info("After search URL: %s", self.page.url)
-            _logger.debug("After search text (500): %s", body[:500].replace('\n', ' '))
+            _logger.debug("After search text: %d chars", len(body))  # P0-04
 
         except ScraperExecutionError:
             raise

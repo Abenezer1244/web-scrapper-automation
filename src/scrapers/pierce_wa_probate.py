@@ -475,7 +475,7 @@ class PierceWAARMSScraper(BridgeScraper):
             record_type=self._record_type,
             page=getattr(self, "_page_total", None),
             context=last_exc,
-        )
+        ) from last_exc  # the message names only its type (P0-04); the traceback keeps it
 
     async def _fetch_parcels_from_detail(self, records: list[ScrapedRecord]) -> None:
         """Extract parcel IDs from the Legal Description tab on each detail page.

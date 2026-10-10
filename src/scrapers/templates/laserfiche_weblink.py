@@ -32,6 +32,7 @@ from src.scrapers.preforeclosure import (
     orient_pre_foreclosure_party,
 )
 from src.scrapers.probate import orient_probate_party
+from src.scrapers.reliability import detect_block
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("scraper.template.laserfiche")
@@ -199,10 +200,11 @@ class LaserficheWebLinkScraper(BridgeScraper):
         # never rendered (block / error / portal down) — fail loud instead of
         # returning a false-empty [].
         if not count_seen:
-            body_head = (await self.page.inner_text("body"))[:200].replace("\n", " ")
+            body = await self.page.inner_text("body")
             raise RuntimeError(
                 f"{self.county}: Laserfiche results count never appeared — page "
-                f"never loaded / blocked. Body head: {body_head!r}"
+                f"never loaded / blocked. Block marker: {detect_block(body) or 'none'}; "  # P0-04
+                f"body {len(body)} chars"
             )
         _logger.info("Search returned %d total results", total)
         if total == 0:

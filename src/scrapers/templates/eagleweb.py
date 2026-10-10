@@ -29,6 +29,7 @@ from src.scrapers.preforeclosure import (
     orient_pre_foreclosure_party,
 )
 from src.scrapers.probate import orient_probate_party
+from src.scrapers.reliability import detect_block
 from src.utils.logger import setup_logger
 from src.utils.safe_http import safe_get
 
@@ -823,7 +824,8 @@ class EagleWebScraper(BridgeScraper):
                     raise RuntimeError(
                         f"{self.county}: EagleWeb results table missing and no "
                         f"empty-marker present — page never loaded / blocked. "
-                        f"Body head: {page_text[:200]!r}"
+                        f"Block marker: {detect_block(page_text) or 'none'}; "  # P0-04: never the page text
+                        f"body {len(page_text or '')} chars"
                     )
                 _logger.warning("Could not find results table via JS (page %d)", page_num)
                 return []

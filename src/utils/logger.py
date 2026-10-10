@@ -59,9 +59,13 @@ _SECRET_PATTERNS: list[tuple[re.Pattern, str]] = [
     # still echoes values in its DETAIL line: unique/FK keys (both pairs of a
     # "conflicts with existing key" line) and whole rows on NOT NULL/CHECK
     # failures. Bounded and line-limited so a long near-miss line stays cheap.
-    (re.compile(r"((?:[Kk]ey|existing key) \([^()\n]{1,200}\)=\()[^\n]{0,500}?(\)(?= already exists| is not present| conflicts with|\.?[ \t]*$))", re.M),
+    (re.compile(r"((?:[Kk]ey|existing key) \([^()\n]{1,200}\)=\()[^\n]{0,500}?(\)(?= already exists| is not present| conflicts with|\.?[ \t\r]*$))", re.M),
      r"\1[REDACTED]\2"),
-    (re.compile(r"(Failing row contains \()[^\n]{0,2000}(\))"), r"\1[REDACTED]\2"),
+    (re.compile(r"(Failing row contains \()[^\n]*(\))"), r"\1[REDACTED]\2"),
+    # Fail closed: a value too long (or too odd) for the two patterns above
+    # loses the rest of its line rather than leaking.
+    (re.compile(r"((?:[Kk]ey|existing key) \([^()\n]{1,200}\)=\(|Failing row contains \()(?!\[REDACTED\])[^\n]*"),
+     r"\1[REDACTED]"),
 ]
 
 
@@ -92,12 +96,22 @@ def install_global_redaction(*extra_loggers: logging.Logger) -> None:
         for handler in lg.handlers:
             if _redaction_filter not in handler.filters:
                 handler.addFilter(_redaction_filter)
+    # P0-04: the API never configures the root logger, so a bare
+    # logging.getLogger() record (e.g. api.unhandled's 500 traceback) falls
+    # through to logging.lastResort, which no logger-level filter reaches.
+    last = logging.lastResort
+    if last is not None and _redaction_filter not in last.filters:
+        last.addFilter(_redaction_filter)
 
 
 class _RedactionFilter(logging.Filter):
     """Rewrite log records to scrub secret-shaped substrings before output."""
 
     def filter(self, record: logging.LogRecord) -> bool:
+        # A record reaches every handler it propagates to; scrub it once.
+        if getattr(record, "_bl_redacted", False):
+            return True
+        record._bl_redacted = True
         # Each part is scrubbed on its own: a failure in one must neither drop
         # the record nor skip the others.
         try:

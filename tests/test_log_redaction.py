@@ -183,3 +183,35 @@ def test_celery_logger_setup_attaches_the_filter():
             assert "deadbeefcafe0123456789" not in out.getvalue()
         finally:
             lg.removeHandler(handler)
+
+
+@pytest.mark.parametrize(
+    "msg",
+    [
+        "DETAIL:  Key (k)=(" + "Jane Doe " * 80 + ") already exists.",  # past the 500 bound
+        "DETAIL:  Key (k)=(Jane Doe, no closing paren",
+        "DETAIL:  Failing row contains (7, Jane Doe, no closing paren",
+        "DETAIL:  Key (k)=(Jane Doe)\r\nnext",
+    ],
+    ids=["long-key", "unclosed-key", "unclosed-row", "crlf"],
+)
+def test_detail_patterns_fail_closed(msg):
+    assert "Jane" not in _redact(msg)
+
+
+def test_last_resort_handler_is_filtered(capsys):
+    # The API never configures the root logger: a handler-less logger's record
+    # goes to logging.lastResort (stderr). api.unhandled's 500 traceback did.
+    from src.utils.logger import install_global_redaction
+
+    install_global_redaction()
+    lg = logging.getLogger("p0_04_no_handlers")
+    lg.propagate = False
+    capsys.readouterr()
+    try:
+        raise RuntimeError(f"upload failed for {_SIGNED}")
+    except RuntimeError:
+        lg.exception("Unhandled error ref=abc")
+    err = capsys.readouterr().err
+    assert "Unhandled error ref=abc" in err and "Traceback" in err
+    assert "deadbeefcafe0123456789" not in err

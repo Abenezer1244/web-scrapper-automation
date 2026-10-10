@@ -224,8 +224,9 @@ class TestCancelSweep:
 
         Migration 100 stops a lead holding two active claims, and the claim path
         refuses to write without it. But 100 ABORTS precisely when duplicates
-        already exist, and start.sh boots the worker anyway, so the dispatcher
-        would drain both rows of a duplicate pair and charge for one lead twice.
+        already exist, and the index can be missing or invalid under a running
+        worker (dropped, rebuilt, a rollback past 100), so the dispatcher would
+        drain both rows of a duplicate pair and charge for one lead twice.
         With the invariant off it holds those leads back instead, and submits
         everything else rather than halting every tenant over a condition most
         are not in.

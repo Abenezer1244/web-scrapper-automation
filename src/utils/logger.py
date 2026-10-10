@@ -24,6 +24,9 @@ def email_fingerprint(email: str | None) -> str:
     msg = email.strip().lower().encode()
     return hmac.new(key, msg, hashlib.sha256).hexdigest()[:12]
 
+# Everything up to the next line that is not database error text (see below).
+_UNTIL_NOT_DB = r"(?:(?!\n\[SQL|\n\(Background|\n\nThe above exception|\n\nDuring handling)[\s\S])*"
+
 # ─── Secret redaction (defense-in-depth) ─────────────────────────────────────
 # Last-line scrub so a stray log call can't leak a credential to console/file/
 # Loki. Patterns target common secret shapes; the per-record cost is small and
@@ -56,16 +59,16 @@ _SECRET_PATTERNS: list[tuple[re.Pattern, str]] = [
     # P0-04: search terms in access-log URLs are owner names and addresses.
     (re.compile(r"(?i)([?&](?:q|search)=)[^&\s\"'<>]+"), r"\1[REDACTED]"),
     # P0-04: hide_parameters drops SQLAlchemy's "[parameters: ...]", but Postgres
-    # still echoes values in its DETAIL line: unique/FK keys (both pairs of a
-    # "conflicts with existing key" line) and whole rows on NOT NULL/CHECK
-    # failures. Fail closed: everything after the marker goes (column names
-    # too) up to SQLAlchemy's "[SQL" / "(Background" line, a blank line or the
-    # end, so no value shape, length or embedded newline can slip past.
-    (re.compile(r"(Key \(|Failing row contains \()(?:(?!\n\[SQL|\n\(Background|\n\n)[\s\S])*"),
-     r"\1[REDACTED]"),
-    # P0-04: Postgres's primary message echoes a bad bound value too
-    # ('invalid input syntax for type integer: "..."', '... for enum x: "..."').
-    (re.compile(r'(invalid input (?:syntax|value) for [^:\n]{1,120}: )"[^\n]*'), r"\1[REDACTED]"),
+    # echoes values in too many message shapes to list one by one, so these two
+    # rules key on WHERE the values sit and fail closed up to the next line that
+    # is not database text: SQLAlchemy's "[SQL" / "(Background" lines or
+    # Python's chained-exception separators (tracebacks after it stay readable).
+    #  1. Diagnostic blocks: DETAIL / CONTEXT, and bare "Key (" / "Failing row
+    #     contains (" (asyncpg may drop the DETAIL: prefix).
+    #  2. A psycopg2/asyncpg primary message's quoted value: invalid input,
+    #     malformed array literal, date/time out of range, enum, and the rest.
+    (re.compile(r"(DETAIL:|CONTEXT:|Key \(|Failing row contains \()" + _UNTIL_NOT_DB), r"\1[REDACTED]"),
+    (re.compile(r'((?:psycopg2|asyncpg)[^\n]*?: )"' + _UNTIL_NOT_DB), r'\1"[REDACTED]'),
 ]
 
 

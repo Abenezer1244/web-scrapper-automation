@@ -201,14 +201,37 @@ def test_celery_logger_setup_attaches_the_filter():
         "DETAIL:  Key (k)=(Joe) already exists. Jane Doe",  # text after a full match
         "DETAIL:  Key (k)=(Jane) already exists) already exists.",  # value holds the suffix
         "DETAIL:  Failing row contains (7, 12 Elm St\nJane Doe, null).\n[SQL: INSERT ...]",
-        'invalid input syntax for type integer: "Jane Doe"\nLINE 1: ...',
-        'invalid input value for enum record_type: "Jane Doe"',
+        '(psycopg2.errors.InvalidTextRepresentation) invalid input syntax for type integer: "Jane Doe"\nLINE 1: ...',
+        '(psycopg2.errors.InvalidTextRepresentation) invalid input value for enum record_type: "Jane Doe"',
+        "DETAIL:  Key (k)=(safe\n\nJane Q Marker) already exists.",  # blank line inside a value
+        '(psycopg2.errors.InvalidTextRepresentation) malformed array literal: "{Jane Doe"\nDETAIL:  ...',
+        '(psycopg2.errors.DatetimeFieldOverflow) date/time field value out of range: "Jane Doe"',
+        '(psycopg2.errors.InvalidTextRepresentation) invalid input syntax for type json\n'
+        'DETAIL:  Token "Jane" is invalid.\nCONTEXT:  JSON data, line 1: {"owner": Jane Doe',
+        "asyncpg.exceptions.InvalidTextRepresentationError: invalid input syntax for type uuid: \"Jane Doe\"",
     ],
-    ids=["long-key", "unclosed-key", "unclosed-row", "crlf", "long-column",
-         "trailing-text", "suffix-in-value", "newline-in-value", "bad-integer", "bad-enum"],
+    ids=["long-key", "unclosed-key", "unclosed-row", "crlf", "long-column", "trailing-text",
+         "suffix-in-value", "newline-in-value", "bad-integer", "bad-enum", "blank-line-in-value",
+         "malformed-array", "datetime-range", "json-context", "asyncpg"],
 )
 def test_detail_patterns_fail_closed(msg):
     assert "Jane" not in _redact(msg)
+
+
+def test_a_real_bad_value_error_is_scrubbed_but_the_traceback_stays_readable():
+    from src.db.session import sync_engine
+
+    with sync_engine.connect() as conn:
+        with pytest.raises(DBAPIError) as caught:
+            conn.execute(text("SELECT CAST(:v AS integer)"), {"v": _MARKER})
+        conn.rollback()
+    assert _MARKER in str(caught.value)  # Postgres's primary message echoes it
+    out = _render(_exc_record(caught.value, "query failed"), logging.Formatter())
+    assert _MARKER not in out
+    assert "invalid input syntax for type integer" in out
+    # The chained psycopg2 -> SQLAlchemy traceback survives the redaction.
+    assert "The above exception was the direct cause of the following exception" in out
+    assert "[SQL: SELECT CAST(%(v)s AS integer)]" in out
 
 
 def test_last_resort_handler_is_filtered(capsys):

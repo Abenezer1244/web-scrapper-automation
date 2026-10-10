@@ -508,7 +508,8 @@ def _query_wa_statewide(parcel_id: str, county: str) -> dict[str, str | None]:
                 zipcode = str(zipcode).strip()
 
             parcel_found = attrs.get("ORIG_PARCEL_ID") or apn_clean
-            _logger.info("WA statewide GIS enriched parcel %s: %s", parcel_found, address)
+            # P0-04: ids only; the situs address stays out of the logs.
+            _logger.info("WA statewide GIS enriched parcel %s (%s)", parcel_found, county)
             return {
                 "property_address": address,
                 # The statewide layer is SITUS-only: it never knows where the owner
@@ -652,12 +653,9 @@ def _parse_gis_response(data: dict, gis_config: dict) -> dict[str, str | None]:
     }
 
     if property_address:
-        _logger.info(
-            "GIS enriched parcel: %s → %s (owner: %s)",
-            attrs.get(gis_config.get("parcel_field", ""), "?"),
-            property_address,
-            owner_name or "?",
-        )
+        # P0-04: ids only; address and owner name stay out of the logs.
+        _logger.info("GIS enriched parcel %s (owner %s)",
+                     attrs.get(parcel_field) or "?", "found" if owner_name else "missing")
 
     return result
 

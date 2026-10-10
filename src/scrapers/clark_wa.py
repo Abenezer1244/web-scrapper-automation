@@ -419,7 +419,6 @@ class ClarkWAScraper(BridgeScraper):
         dropped_no_pid = 0
         dropped_wrong_doctype = 0
         doc_type_counter: dict[str, int] = {}
-        sample_legal: list[str] = []
         for item in raw:
             item_doc_type = (item.get("docType") or "").strip().upper()
             doc_type_counter[item_doc_type] = doc_type_counter.get(item_doc_type, 0) + 1
@@ -448,8 +447,6 @@ class ClarkWAScraper(BridgeScraper):
                 pid_match = _PID_FALLBACK_PATTERN.search(legal)
             if not pid_match and not self._skip_pid:
                 dropped_no_pid += 1
-                if len(sample_legal) < 3 and legal:
-                    sample_legal.append(legal[:120])
                 continue
 
             record = ScrapedRecord()
@@ -516,7 +513,4 @@ class ClarkWAScraper(BridgeScraper):
         if top_types:
             _logger.info("  Top doc types in page: %s",
                           ", ".join(f"{t}={n}" for t, n in top_types))
-        if sample_legal:
-            for i, s in enumerate(sample_legal):
-                _logger.info("  Sample dropped legal[%d]: %s", i, s)
         return records

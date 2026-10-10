@@ -28,6 +28,11 @@ In practice:
 - Make new constraints `NOT VALID` first and validate them separately when existing rows might violate them.
 - `CREATE INDEX CONCURRENTLY` must use `IF NOT EXISTS` and handle a leftover INVALID index; `033` and `062` show the pattern.
 
+Known limit: an `alembic_version` value this code does not recognize is treated
+as "ahead" (old code cannot tell a newer release's revision from a typo), so a
+hand-edited bogus revision would let worker and beat start. Never edit
+`alembic_version` by hand.
+
 ## Rollback
 
 - **Default to a forward fix.** Ship a new migration that corrects the problem.

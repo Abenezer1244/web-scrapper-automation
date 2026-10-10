@@ -61,9 +61,12 @@ def _read_versions(engine) -> set[str]:
 
 
 def main() -> int:
-    url = os.getenv("DATABASE_URL_SYNC") or os.getenv("DATABASE_URL_MIGRATE")
+    # The runtime DSN only. No fallback to DATABASE_URL_MIGRATE: a worker that
+    # silently reached for the owner credential would undo the point of not
+    # giving it one.
+    url = os.getenv("DATABASE_URL_SYNC")
     if not url:
-        sys.stderr.write("wait_for_schema: neither DATABASE_URL_SYNC nor DATABASE_URL_MIGRATE is set\n")
+        sys.stderr.write("wait_for_schema: DATABASE_URL_SYNC is not set\n")
         return 1
     script = ScriptDirectory.from_config(Config(ALEMBIC_INI))
     engine = create_engine(url, poolclass=NullPool, connect_args={"connect_timeout": 10})

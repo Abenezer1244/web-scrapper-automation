@@ -129,11 +129,9 @@ def test_dialer_webhook_response_body_is_not_surfaced():
     If a response body ever reaches the user, a rebind stops being a blind POST
     and becomes full-read SSRF against the internal network.
     """
-    from pathlib import Path
+    from src.workers.webhook_delivery import _response_excerpt
 
-    wd = (Path(__file__).resolve().parents[1] / "src/workers/webhook_delivery.py").read_text(
-        encoding="utf-8", errors="replace"
-    )
-    assert "_redact_response" in wd, (
-        "the dialer response-redaction guard disappeared; blind-SSRF assumption broken"
-    )
+    # Every event, dialer or not: the excerpt is the body's length, not the body.
+    excerpt = _response_excerpt('{"internal": "169.254.169.254 metadata", "owner": "Jane"}')
+    assert "internal" not in excerpt and "Jane" not in excerpt
+    assert excerpt.endswith("chars, not kept>")

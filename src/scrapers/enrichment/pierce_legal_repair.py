@@ -287,18 +287,21 @@ def find_pierce_parcels_by_legal(legal: str | None) -> list[dict]:
             return []
         data = resp.json()
         if "error" in data:
-            _logger.warning("Pierce legal query error for plat %r: %s", plat, str(data["error"])[:120])
+            # P0-04: counts and codes, never the legal description or provider text.
+            err = data["error"]
+            _logger.warning("Pierce legal query error (code %s)",
+                            err.get("code") if isinstance(err, dict) else type(err).__name__)
             return []
         feats = data.get("features") or []
         # A capped / transfer-limited response means we cannot see the full plat,
         # so we cannot prove the lot-suffix pick is exhaustive -> refuse (safe).
         if data.get("exceededTransferLimit") or len(feats) >= cap:
-            _logger.info("Pierce legal %r/%s ambiguous: server capped (%d rows)", plat, lot, len(feats))
+            _logger.info("Pierce legal lookup ambiguous: server capped (%d rows)", len(feats))
             return []
         matches = collect_legal_matches(feats, plat, lot, block)
-        _logger.info("Pierce legal %r LT %s BLK %s: %d plat rows, %d exact-lot survivors",
-                     plat, lot, block, len(feats), len(matches))
+        _logger.info("Pierce legal lookup: %d plat rows, %d exact-lot survivors",
+                     len(feats), len(matches))
         return matches
     except Exception as exc:
-        _logger.warning("Pierce legal lookup failed for %r: %s", plat, str(exc)[:80])
+        _logger.warning("Pierce legal lookup failed: %s", type(exc).__name__)
         return []

@@ -283,7 +283,8 @@ class AcclaimWebScraper(BridgeScraper):
                     parent_text = await cb.evaluate(
                         "el => (el.parentElement?.textContent || el.closest('label')?.textContent || '').trim()"
                     )
-                    _logger.info("Checkbox %d: id=%s name=%s label=%s", i, cb_id, cb_name, parent_text[:60])
+                    _logger.info("Checkbox %d: id=%s name=%s label %d chars", i, cb_id, cb_name,
+                                 len(parent_text))  # P0-04: portal text stays out of logs
 
                     if any(kw in (cb_id + cb_name + parent_text).lower()
                            for kw in ["accept", "disclaim", "agree", "acknowledge"]):

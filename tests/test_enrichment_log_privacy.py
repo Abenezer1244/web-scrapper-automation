@@ -54,7 +54,7 @@ def test_scraper_error_message_never_carries_page_text():
         exc = cls("King", "AcclaimWeb", "block wall detected", page=3, context=page[:120])
         assert "block wall detected" in str(exc) and "page=3" in str(exc)
         assert "Marker" not in str(exc)
-        assert exc.context == page[:120]  # kept for code, not for the message
+        assert not hasattr(exc, "context")  # not kept anywhere on the error either
     wrapped = ScraperExecutionError("King", "AcclaimWeb", "page extraction failed",
                                     context=TimeoutError(f"waiting for {_OWNER}"))
     assert "ctx=TimeoutError" in str(wrapped) and "Marker" not in str(wrapped)

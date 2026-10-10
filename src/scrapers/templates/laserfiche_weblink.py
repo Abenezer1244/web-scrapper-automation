@@ -160,7 +160,7 @@ class LaserficheWebLinkScraper(BridgeScraper):
             # than return [] (which would score as a healthy 0-record scrape).
             raise RuntimeError(
                 f"{self.county}: Laserfiche date-fill failed — search page never "
-                f"loaded / blocked: {str(exc)[:120]}"
+                f"loaded / blocked: {type(exc).__name__}"  # P0-04; chained below
             ) from exc
 
         # Submit search
@@ -174,7 +174,7 @@ class LaserficheWebLinkScraper(BridgeScraper):
         except Exception as exc:
             raise RuntimeError(
                 f"{self.county}: Laserfiche submit failed — search never ran: "
-                f"{str(exc)[:120]}"
+                f"{type(exc).__name__}"  # P0-04; chained below
             ) from exc
 
         # Wait for the async PrimeFaces datatable to populate, THEN read the

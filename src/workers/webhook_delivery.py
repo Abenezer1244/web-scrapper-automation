@@ -108,6 +108,17 @@ def _redact_url_secrets(text: str, webhook_url: str) -> str:
     return text
 
 
+def _response_excerpt(text: str) -> str:
+    """What a delivery logs and keeps (Celery result) of the endpoint's reply.
+
+    Its length, never its content, for every event (P0-04). Dialer pushes carry
+    lead PII and any endpoint may echo the request back; and a body that never
+    surfaces keeps an SSRF through a rebinding host blind. The status code
+    carries the outcome.
+    """
+    return f"<response body: {len(text or '')} chars, not kept>"
+
+
 def _read_excerpt(resp: requests.Response, webhook_url: str) -> str:
     """Up to _RESPONSE_EXCERPT_BYTES of the RAW body, then close the socket.
 
@@ -322,14 +333,7 @@ def deliver_job_webhook(self, job_id: str, webhook_url: str, payload: dict) -> d
     """
     attempt = self.request.retries + 1
     host = urlparse(webhook_url).hostname or "?"
-    # Phase 5: dialer pushes carry lead PII in the request body. A rejecting
-    # endpoint may echo the submitted fields back in its response, so we must NOT
-    # log or persist (Celery result backend) the response body for these events
-    # (Codex). Redact it to a status-only marker.
-    _redact_response = payload.get("event") == "leads.dialer_ready"
-
-    def _excerpt(text: str) -> str:
-        return "<redacted: dialer push>" if _redact_response else text[:500]
+    _excerpt = _response_excerpt
 
     # SSRF guard: re-validate the destination immediately before the POST so a
     # host that rebinds to a private/metadata IP after config-save is caught

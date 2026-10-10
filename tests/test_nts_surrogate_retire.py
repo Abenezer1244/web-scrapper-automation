@@ -66,11 +66,15 @@ def test_snohomish_parser_matches_king_parser_on_every_non_apn_notice():
 # ── P1-b ──────────────────────────────────────────────────────────────────────
 
 def _affinia_row() -> dict:
-    """The real 2026-09-09 Affinia notice as a row (REF-202411260448, 10/09/2026)."""
+    """The real 2026-09-09 Affinia notice as a row (REF-202411260448, 10/09/2026).
+
+    `today` is pinned to the issue date: with date.today() the sale went past on
+    2026-10-10, notice_to_row marked it inactive, and all seven tests below failed.
+    """
     parsed = parse_snoho_notice(
         _block("nts_snoho_tribune_2026-09-09.pdf", "Affinia Default Services, LLC Current"))
     row = nts.notice_to_row(parsed, source_url="https://example.invalid/legals.pdf",
-                            today=date.today(), source=_SOURCE, county="snohomish")
+                            today=date(2026, 9, 9), source=_SOURCE, county="snohomish")
     assert row is not None and row["ts_number"] == "REF-202411260448" and row["is_active"]
     return row
 

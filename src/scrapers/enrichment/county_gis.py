@@ -424,7 +424,8 @@ def _query_gis_by_name(owner_name: str, gis_config: dict, county_key: str) -> di
     # pierce_legal_repair._LIKE_META (Codex, 2026-09-03).
     if _LIKE_META.search(name_clean):
         _logger.warning(
-            "GIS owner-name lookup skipped: LIKE metacharacter in %r", name_clean[:40]
+            "GIS owner-name lookup skipped: LIKE metacharacter in the owner name (%s)",
+            county_key,  # P0-04: never the name
         )
         return _empty()
 

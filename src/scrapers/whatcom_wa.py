@@ -411,8 +411,8 @@ class WhatcomWAScraper(BridgeScraper):
                 if oriented is None:
                     _logger.info(
                         "pre_foreclosure: no person party — doc=%r parcel=%r "
-                        "grantor=%r grantee=%r (dropped)",
-                        doc_type, parcel_id, (grantor or "")[:40], (grantee or "")[:40],
+                        "grantor %s, grantee %s (dropped)",  # P0-04: no names
+                        doc_type, parcel_id, "set" if grantor else "empty", "set" if grantee else "empty",
                     )
                     continue
                 record.party_name, record.heirs = oriented

@@ -19,6 +19,47 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-10-10 — UX 3.12: the cache-backed records page is retired (F-047)
+
+**Built / Shipped:** owner decision "retire the page" (not relabel, not re-enable the daily scrape).
+bridgeleads-web: **#262** 3.12a (d055d64) nothing links there: dashboard and Scrapers "View" with no known
+run -> `/results`; a batch child without a run has no View; the all-duplicates banner links only to a
+known previous run; and "No recent run" / N/A replace "Never run" / "0 records", because `GET /jobs`
+holds only the newest 100 jobs and cannot prove a scraper never ran. **#263** 3.12b (b88273a)
+`next.config.ts` redirects `/scrapers/:id/records` to `/scrapers` (307 before any render; checked live)
+and the route file, `getCachedRecords`, the cached-record types and `NewBadge` are gone. **#264** 3.12c
+(dc28c4e) the command palette opens a scraper's edit page (a batch child: its batch). The backend
+endpoint `GET /scrapers/{id}/records` and its generated contract stay (named BE follow-up).
+
+**Tried / Decided:** Codex took 6 plan rounds; the decisive one (r1) found that every "never ran" branch
+was a guess from a 100-job window, so the fix routes to the Results index and words the state neutrally
+instead of hiding or misclassifying. A cap-aware "Never run when the list is provably complete" rule was
+rejected (it would copy the 100-job cap into two more files). A build-time file swap kept each phase at
+5 files: dropping a now-dead `jobsLoaded` prop pulled `dashboard/page.tsx` into 3.12a, so the palette
+moved to 3.12c.
+
+**Failed / Blocked:** the planned page-level `redirect()` answered **200** with a client-side redirect
+(the dashboard layout streams before the page renders), failing the plan's raw 307 check; the redirect
+moved to `next.config.ts` and the route file was deleted. Rig: `git grep "/records"` in Git Bash returned
+nothing because MSYS rewrote the leading-slash argument for git.exe (`MSYS_NO_PATHCONV=1` fixes it); a
+Node `execSync` gate through cmd.exe mangled a quoted pathspec, errored, and my catch returned "clean"
+(now `execFileSync`, and any git error fails the check); text from adjacent spans concatenates
+("Probate0records"), so `\b0` never matched.
+
+**Caught & fixed:** Codex plan r1-r5 (newest-100, palette batch children, generated contract stays,
+docs and stale comments, redirect checked on the FE origin not the BE path of the same shape, fresh
+browser contexts for the shared jobs cache, the batch child test must expand its card on the Scrapers
+page); gates: 3.12a r1 PASS + P3 (unused parameter), 3.12b r1 PASS, 3.12c r1 PASS. Proofs: 3.12a branch
+30/30, master SEMANTIC 0/19; 3.12b 5/5 vs 0/4; 3.12c 2/2 vs 0/2.
+
+**Pending / Handoff:** BE: retire `GET /scrapers/{id}/records` and regenerate the FE contract. The 3.11
+follow-ups stand ("implicit count formats app-wide", "dates in a non-US browser", BE stage-label
+separators). Next item-3 work needs the owner.
+
+**Facts learned:** in Next 16 a `redirect()` in a page under a streaming layout is a 200 plus a client
+redirect; use `next.config` `redirects()` (or the proxy) when the HTTP status matters. Any "must be
+absent" gate needs one run against a file known to contain a match before it is trusted.
+
 ## 2026-10-10 — UX 3.11f/g: the rest of the counts in Results, Live and the sidebar (F-050)
 
 **Built / Shipped:** bridgeleads-web, owner "proceed", each with Codex PLAN GO, branch GREEN / master

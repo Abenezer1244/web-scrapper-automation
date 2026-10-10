@@ -44,3 +44,17 @@ def test_regrid_success_line_names_the_parcel_only():
     assert "Regrid enriched 0123456789 (address found, owner found, value found)" in out
     for pii in (_OWNER, _SITUS, "412345", "Marker"):
         assert pii not in out
+
+
+def test_scraper_error_message_never_carries_page_text():
+    from src.scrapers.reliability import ScraperExecutionError, TransientScrapeError
+
+    page = f"Search results: {_OWNER}, {_SITUS}, LOT 4 BLK 2"
+    for cls in (ScraperExecutionError, TransientScrapeError):
+        exc = cls("King", "AcclaimWeb", "block wall detected", page=3, context=page[:120])
+        assert "block wall detected" in str(exc) and "page=3" in str(exc)
+        assert "Marker" not in str(exc)
+        assert exc.context == page[:120]  # kept for code, not for the message
+    wrapped = ScraperExecutionError("King", "AcclaimWeb", "page extraction failed",
+                                    context=TimeoutError(f"waiting for {_OWNER}"))
+    assert "ctx=TimeoutError" in str(wrapped) and "Marker" not in str(wrapped)

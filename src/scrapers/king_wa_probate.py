@@ -1066,7 +1066,7 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
 
             # Handle the response — could be error dict or data dict
             if isinstance(raw, dict) and 'error' in raw:
-                _logger.info("No results table: %s — html: %s", raw.get('error'), raw.get('html', '')[:200])
+                _logger.info("No results table: %s (html %d chars)", raw.get('error'), len(raw.get('html') or ''))  # P0-04
                 return []
 
             if isinstance(raw, dict):

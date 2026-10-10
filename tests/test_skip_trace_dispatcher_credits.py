@@ -77,3 +77,32 @@ def test_singular_credit_wording():
 ])
 def test_classify_submit_failure(message, kind):
     assert classify_submit_failure(message) == kind
+
+
+# P0-04: the submit error text keeps what the dispatcher reads and nothing else.
+@pytest.mark.parametrize("status, body, kind", [
+    (400, '{"error":"bad row: Jane Q Marker, 1234 Marker Elm St"}', "provider_error"),
+    (400, '{"error":"Insufficient credits; row Jane Q Marker"}', "out_of_credits"),
+    (418, "rate limit exceeded for Jane Q Marker", "rate_limited"),
+    (503, "<html>upstream down for Jane Q Marker</html>", "provider_unavailable"),
+])
+def test_submit_failure_message_drops_the_body_but_keeps_the_classification(status, body, kind):
+    from src.scrapers.enrichment.skip_trace import _http_failure_message
+
+    msg = _http_failure_message(status, body)
+    assert "Marker" not in msg
+    assert classify_submit_failure(msg) == kind
+
+
+def test_a_402_keeps_the_credit_notice_the_dispatcher_parses():
+    from src.scrapers.enrichment.skip_trace import _http_failure_message
+
+    body = _PROD_402.split("Tracerfy returned 402: ", 1)[1][:-2] + ' Row: Jane Q Marker."}'
+    msg = _http_failure_message(402, body)
+    assert "Marker" not in msg
+    assert classify_submit_failure(msg) == "out_of_credits"
+    assert affordable_row_count(msg, 344, "normal") == 118
+    # No shortfall in the body: still out_of_credits, and the dispatcher does not guess.
+    bare = _http_failure_message(402, '{"error":"no credits for Jane Q Marker"}')
+    assert "Marker" not in bare and classify_submit_failure(bare) == "out_of_credits"
+    assert affordable_row_count(bare, 344, "normal") == 0

@@ -160,9 +160,12 @@ def get_json_with_retries(url: str, params: dict, *, what: str, require_features
                                 for f in data["features"])))):
                 err = ""
                 if isinstance(data, dict) and isinstance(data.get("error"), dict):
-                    err = str(data["error"].get("message", data["error"]))[:160]
+                    message = data["error"].get("message")  # server text only, never the object
+                    err = message[:160] if isinstance(message, str) else ""
+                # P0-04: the body's shape, never the body (it can hold records).
+                shape = f"keys {sorted(data)[:10]}" if isinstance(data, dict) else type(data).__name__
                 raise ArcGISErrorBodyError(
-                    f"{what}: ArcGIS returned an error or malformed body: {err or str(data)[:160]}")
+                    f"{what}: ArcGIS returned an error or malformed body: {err or shape}")
             return data
         except Exception as exc:
             raise_if_time_limit(exc)

@@ -528,6 +528,29 @@ class TracerfyError(Exception):
     """Tracerfy API returned a non-success status or malformed response."""
 
 
+_BODY_HINTS = ("insufficient credit", "rate limit")
+
+
+def _http_failure_message(status: int, body: str) -> str:
+    """The TracerfyError text for a >=400 submit response.
+
+    P0-04: a provider error body may echo submitted rows (names, addresses), and
+    this text reaches logs, the job's errors and ops alerts. The dispatcher reads
+    it, though: classify_submit_failure() keys on the status and on the
+    _BODY_HINTS words, and affordable_row_count() parses a 402's "You need N
+    more credits". So the text is rebuilt from those parts alone: a 402 keeps
+    only the parsed shortfall, anything else the hint words; both add a length.
+    """
+    body = body or ""
+    if status == 402:
+        need = re.search(r"need\s+(\d+)\s+more\s+credits?", body, re.IGNORECASE)
+        shortfall = f" You need {need.group(1)} more credits." if need else ""
+        return f"Tracerfy returned 402: insufficient credits.{shortfall} (body {len(body)} chars)"
+    hints = [h for h in _BODY_HINTS if h in body.lower()]
+    return (f"Tracerfy returned {status}" + (f": {', '.join(hints)}" if hints else "")
+            + f" (body {len(body)} chars)")
+
+
 def submit_batch(
     rows: list[dict],
     trace_type: str = "normal",
@@ -655,18 +678,17 @@ def submit_batch(
             "Dispatcher should back off and retry next tick."
         )
     if resp.status_code >= 400:
-        raise TracerfyError(
-            f"Tracerfy returned {resp.status_code}: {resp.text[:500]}"
-        )
+        raise TracerfyError(_http_failure_message(resp.status_code, resp.text))
 
     try:
         data = resp.json()
     except ValueError as exc:
-        raise TracerfyError(f"Tracerfy returned non-JSON: {resp.text[:200]}") from exc
+        raise TracerfyError(f"Tracerfy returned non-JSON (body {len(resp.text or '')} chars)") from exc
 
     queue_id = data.get("queue_id")
     if queue_id is None:
-        raise TracerfyError(f"Tracerfy response missing queue_id: {data}")
+        keys = sorted(data) if isinstance(data, dict) else type(data).__name__
+        raise TracerfyError(f"Tracerfy response missing queue_id (keys: {keys})")
 
     _logger.info(
         "Tracerfy batch submitted: queue_id=%s rows=%s trace_type=%s wait=%ss",

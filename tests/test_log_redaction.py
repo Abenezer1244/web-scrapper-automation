@@ -96,9 +96,14 @@ def test_p0_04_patterns(msg, secret):
     assert secret not in out and "REDACTED" in out, out
 
 
-def test_p0_04_detail_patterns_stay_on_their_line():
-    msg = "DETAIL:  Key (a)=(MARKER1) already exists.\nnext line (kept) stays"
-    assert _redact(msg).endswith("next line (kept) stays")
+def test_p0_04_detail_rule_stops_at_the_sql_line():
+    # A newline is not a safe boundary (values can hold one); SQLAlchemy's
+    # [SQL ...] / (Background ...) lines are, and they stay for debugging.
+    msg = ("DETAIL:  Key (a)=(MARKER1\nMARKER2) already exists.\n[SQL: INSERT INTO t VALUES (%(a)s)]"
+           "\n(Background on this error at: https://sqlalche.me/e/20/gkpj)")
+    out = _redact(msg)
+    assert "MARKER" not in out
+    assert out.endswith("[SQL: INSERT INTO t VALUES (%(a)s)]\n(Background on this error at: https://sqlalche.me/e/20/gkpj)")
 
 
 def test_hide_parameters_keeps_bound_values_out_of_sql_errors():
@@ -195,9 +200,12 @@ def test_celery_logger_setup_attaches_the_filter():
         "DETAIL:  Key (" + "c" * 201 + ")=(Jane Doe) already exists.",  # long column list
         "DETAIL:  Key (k)=(Joe) already exists. Jane Doe",  # text after a full match
         "DETAIL:  Key (k)=(Jane) already exists) already exists.",  # value holds the suffix
+        "DETAIL:  Failing row contains (7, 12 Elm St\nJane Doe, null).\n[SQL: INSERT ...]",
+        'invalid input syntax for type integer: "Jane Doe"\nLINE 1: ...',
+        'invalid input value for enum record_type: "Jane Doe"',
     ],
     ids=["long-key", "unclosed-key", "unclosed-row", "crlf", "long-column",
-         "trailing-text", "suffix-in-value"],
+         "trailing-text", "suffix-in-value", "newline-in-value", "bad-integer", "bad-enum"],
 )
 def test_detail_patterns_fail_closed(msg):
     assert "Jane" not in _redact(msg)

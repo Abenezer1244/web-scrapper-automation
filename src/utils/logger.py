@@ -58,9 +58,14 @@ _SECRET_PATTERNS: list[tuple[re.Pattern, str]] = [
     # P0-04: hide_parameters drops SQLAlchemy's "[parameters: ...]", but Postgres
     # still echoes values in its DETAIL line: unique/FK keys (both pairs of a
     # "conflicts with existing key" line) and whole rows on NOT NULL/CHECK
-    # failures. Fail closed: everything after the marker to the end of the line
-    # goes (column names too), so no value shape or length can slip past.
-    (re.compile(r"(Key \(|Failing row contains \()[^\n]*"), r"\1[REDACTED]"),
+    # failures. Fail closed: everything after the marker goes (column names
+    # too) up to SQLAlchemy's "[SQL" / "(Background" line, a blank line or the
+    # end, so no value shape, length or embedded newline can slip past.
+    (re.compile(r"(Key \(|Failing row contains \()(?:(?!\n\[SQL|\n\(Background|\n\n)[\s\S])*"),
+     r"\1[REDACTED]"),
+    # P0-04: Postgres's primary message echoes a bad bound value too
+    # ('invalid input syntax for type integer: "..."', '... for enum x: "..."').
+    (re.compile(r'(invalid input (?:syntax|value) for [^:\n]{1,120}: )"[^\n]*'), r"\1[REDACTED]"),
 ]
 
 
@@ -82,6 +87,9 @@ def install_global_redaction(*extra_loggers: logging.Logger) -> None:
     those loggers; the per-source fingerprinting remains the primary defense
     for PII. Idempotent — safe to call more than once. ``extra_loggers`` get the
     same treatment (Celery passes its root, task and multiprocessing loggers).
+
+    Known limit: filters are per sink. A handler added after this runs, on a
+    logger not set up by setup_logger(), is not covered; give it the filter.
     """
     names = [None, "uvicorn", "uvicorn.error", "uvicorn.access", "security"]
     loggers = [logging.getLogger(name) if name else logging.getLogger() for name in names]

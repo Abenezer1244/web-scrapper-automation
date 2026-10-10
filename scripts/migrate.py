@@ -170,7 +170,13 @@ def main() -> int:
         if not acquired:
             return 1
 
-        print("migrate: lock acquired; running 'alembic upgrade head'", flush=True)
+        # Which credential migrates is a deploy fact worth one log line: DDL must
+        # run as the owner role (DATABASE_URL_MIGRATE), never the runtime role.
+        source = "DATABASE_URL_MIGRATE" if os.getenv("DATABASE_URL_MIGRATE") else "DATABASE_URL_SYNC"
+        role = conn.execute(text("SELECT current_user")).scalar()
+        conn.commit()
+        print(f"migrate: lock acquired as role {role} (from {source}); "
+              "running 'alembic upgrade head'", flush=True)
         cfg = Config(ALEMBIC_INI)
         cfg.attributes["connection"] = conn  # env.py runs migrations on this conn
         command.upgrade(cfg, "head")  # raises on failure -> propagates, fail-closed

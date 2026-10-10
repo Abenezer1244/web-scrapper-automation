@@ -24,35 +24,33 @@ QUEUES="${WORKER_QUEUES:-scrape-priority,scrape,enrichment}"
 # included. Rolling deploys start these services independently, so "the API will
 # have migrated by then" is a race, not a guarantee.
 #
-# scripts/migrate.py is advisory-locked and idempotent, so whichever service gets
-# there first applies the migration and the rest block, then no-op.
-#
-# The API keeps failing CLOSED, as it always has: serving requests against a
-# stale schema is worse than not serving. Worker and beat fail OPEN, and that is
-# deliberate. migrate.py needs DATABASE_URL_MIGRATE or DATABASE_URL_SYNC and
-# refuses a :6543 pooler DSN; those variables are set per Railway service, and a
-# worker whose env differs from the API's would go from "briefly fails queries
-# until the API migrates" to "never starts at all", which does not self-heal.
-# Failing open leaves the worker exactly where it is today in that case, and
-# closes the window in every normal one. The failure is loud either way.
+# ONE migrator: the API runs scripts/migrate.py (advisory locked, idempotent, so
+# its replicas serialize) and fails CLOSED: serving against a stale schema is
+# worse than not serving. Worker and beat never migrate and hold no DDL
+# credential; scripts/wait_for_schema.py blocks their boot on the runtime role
+# until the schema this code needs is in place, and fails CLOSED too (exit, so
+# Railway restarts the boot) if it never arrives. They used to run migrate.py
+# themselves and start anyway on failure. See docs/deployment/migrations.md.
 run_migrations() {
-  _svc="${1:-service}"
-  echo "Running migrations (advisory-locked) for ${_svc}..."
+  echo "Running migrations (advisory-locked) for API..."
   if python scripts/migrate.py; then
     echo "Migrations applied."
     return 0
   fi
-  if [ "$_svc" = "API" ]; then
-    echo "migration run failed; refusing to start API"
+  echo "migration run failed; refusing to start API"
+  exit 1
+}
+
+wait_for_schema() {
+  echo "Waiting for the schema this code needs (${1})..."
+  if ! python scripts/wait_for_schema.py; then
+    echo "schema never reached this code's head; refusing to start ${1}"
     exit 1
   fi
-  echo "WARNING: migration run failed for ${_svc}; starting anyway against the"
-  echo "WARNING: schema that is there. Queries naming a column from an unapplied"
-  echo "WARNING: migration will fail until the API applies it."
 }
 
 if [ "$RAILWAY_SERVICE_NAME" = "worker" ]; then
-  run_migrations worker
+  wait_for_schema worker
   echo "Starting Celery worker (concurrency=$CONCURRENCY, queues=$QUEUES)..."
 
   # Expand /dev/shm for multiple Chromium instances (default 64MB is too small)
@@ -81,7 +79,7 @@ if [ "$RAILWAY_SERVICE_NAME" = "worker" ]; then
     --hostname="worker-${RAILWAY_REPLICA_ID:-0}@%h" \
     --max-tasks-per-child=3
 elif [ "$RAILWAY_SERVICE_NAME" = "beat" ]; then
-  run_migrations beat
+  wait_for_schema beat
   echo "Starting Celery beat scheduler..."
   exec celery -A src.workers beat --loglevel=info --scheduler celery.beat.PersistentScheduler
 else
@@ -91,8 +89,7 @@ else
   # loser's `UPDATE alembic_version WHERE version=<prev>` matches 0 rows and
   # Alembic aborts that boot. scripts/migrate.py serializes the runners behind a
   # PostgreSQL advisory lock (held on a direct, non-pgbouncer connection) so the
-  # losers wait, then run a no-op upgrade and start cleanly. The same lock is what
-  # lets worker and beat call this too.
-  run_migrations API
+  # losers wait, then run a no-op upgrade and start cleanly.
+  run_migrations
   exec uvicorn main:app --host 0.0.0.0 --port "${PORT:-8000}"
 fi

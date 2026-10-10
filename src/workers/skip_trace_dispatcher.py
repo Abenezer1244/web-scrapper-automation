@@ -234,10 +234,12 @@ def _dispatch_tick() -> dict:
         # Migration 100's unique index is what stops one lead holding two active
         # claims, and the claim path refuses to write without it. But this
         # dispatcher is what SPENDS money, and it drains rows that already exist.
-        # If 100 ever aborts -- which happens precisely when duplicates are
-        # already present -- start.sh still boots the worker, and the dispatcher
-        # would submit both rows of a duplicate pair and charge the customer
-        # twice for one lead.
+        # 100 aborts precisely when duplicates are already present. Workers now
+        # wait for the API's migration before they start (scripts/wait_for_schema.py),
+        # but the index can still be missing or INVALID under a running worker
+        # (dropped, rebuilt, a rollback past 100), and then the dispatcher would
+        # submit both rows of a duplicate pair and charge the customer twice for
+        # one lead.
         #
         # So when the invariant is unenforced, say so loudly and skip exactly the
         # leads that are duplicated, rather than halting every tenant's lookups

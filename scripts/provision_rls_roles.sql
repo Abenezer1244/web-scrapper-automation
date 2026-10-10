@@ -405,6 +405,14 @@ BEGIN
         GRANT EXECUTE ON FUNCTION request_account_deletion(),
               restore_account_deletion() TO bridgeleads_app;
     END IF;
+    -- Worker and beat wait on alembic_version before they start (116,
+    -- scripts/wait_for_schema.py). A revision id is not sensitive.
+    IF to_regclass('public.alembic_version') IS NOT NULL THEN
+        GRANT SELECT ON alembic_version TO bridgeleads_system;
+        DROP POLICY IF EXISTS alembic_version_system_select ON alembic_version;
+        CREATE POLICY alembic_version_system_select ON alembic_version
+            FOR SELECT TO bridgeleads_system USING (true);
+    END IF;
     -- Purge (113): mirrors the migration's grants. Its role-targeted <table>_purge
     -- policies live in the migration only (apply_rls_cutover_policies.sql drops
     -- policies by name and never touches them).

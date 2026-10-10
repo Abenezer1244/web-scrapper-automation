@@ -313,31 +313,11 @@ jobs:
           RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN_STAGING }}
         run: railway up --service api --environment staging
 
-  # ─── Deploy Production ────────────────────────────────────────────────────────
-  deploy-production:
-    name: Run Migrations
-    runs-on: ubuntu-latest
-    needs: build
-    if: github.ref == 'refs/heads/main'
-    environment: production
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Run DB migrations
-        env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL || 'postgresql+asyncpg://unused:unused@localhost/unused' }}
-          DATABASE_URL_SYNC: ${{ secrets.DATABASE_URL_SYNC }}
-          REDIS_URL: ${{ secrets.REDIS_URL || 'redis://localhost:6379/0' }}
-          SECRET_KEY: ${{ secrets.SECRET_KEY || 'migration-ci-placeholder-not-used-in-production!!' }}
-          # H3 (migration 053): the User.email cutover reconciles email_hmac =
-          # blind_index(email) IN-MIGRATION, so the migration runner MUST have the
-          # SAME BLIND_INDEX_KEY the app uses for login lookups — otherwise it hashes
-          # under the SECRET_KEY fallback and locks every user out (Codex P1). It also
-          # fails closed if the key is absent in production. FIELD_ENCRYPTION_KEY is
-          # provided too so decrypt_field uses the same Fernet key as the app.
-          BLIND_INDEX_KEY: ${{ secrets.BLIND_INDEX_KEY }}
-          FIELD_ENCRYPTION_KEY: ${{ secrets.FIELD_ENCRYPTION_KEY }}
-        run: |
-          pip install -r requirements.txt
-          alembic upgrade head
+  # ─── Production migrations: NOT here ─────────────────────────────────────────
+  # There is deliberately no production job. Production migrations run in exactly
+  # one place: the API service's boot (start.sh -> scripts/migrate.py, advisory
+  # locked, fail closed). Worker and beat wait for that schema instead of
+  # migrating. A job here used to run a second, unlocked `alembic upgrade head`
+  # against production on every push to main. tests/test_ci_workflows.py fails the
+  # build if any workflow references a production database or key secret again.
+  # See docs/deployment/migrations.md.

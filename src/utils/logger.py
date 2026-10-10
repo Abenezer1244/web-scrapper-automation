@@ -58,14 +58,9 @@ _SECRET_PATTERNS: list[tuple[re.Pattern, str]] = [
     # P0-04: hide_parameters drops SQLAlchemy's "[parameters: ...]", but Postgres
     # still echoes values in its DETAIL line: unique/FK keys (both pairs of a
     # "conflicts with existing key" line) and whole rows on NOT NULL/CHECK
-    # failures. Bounded and line-limited so a long near-miss line stays cheap.
-    (re.compile(r"((?:[Kk]ey|existing key) \([^()\n]{1,200}\)=\()[^\n]{0,500}?(\)(?= already exists| is not present| conflicts with|\.?[ \t\r]*$))", re.M),
-     r"\1[REDACTED]\2"),
-    (re.compile(r"(Failing row contains \()[^\n]*(\))"), r"\1[REDACTED]\2"),
-    # Fail closed: a value too long (or too odd) for the two patterns above
-    # loses the rest of its line rather than leaking.
-    (re.compile(r"((?:[Kk]ey|existing key) \([^()\n]{1,200}\)=\(|Failing row contains \()(?!\[REDACTED\])[^\n]*"),
-     r"\1[REDACTED]"),
+    # failures. Fail closed: everything after the marker to the end of the line
+    # goes (column names too), so no value shape or length can slip past.
+    (re.compile(r"(Key \(|Failing row contains \()[^\n]*"), r"\1[REDACTED]"),
 ]
 
 
@@ -108,10 +103,6 @@ class _RedactionFilter(logging.Filter):
     """Rewrite log records to scrub secret-shaped substrings before output."""
 
     def filter(self, record: logging.LogRecord) -> bool:
-        # A record reaches every handler it propagates to; scrub it once.
-        if getattr(record, "_bl_redacted", False):
-            return True
-        record._bl_redacted = True
         # Each part is scrubbed on its own: a failure in one must neither drop
         # the record nor skip the others.
         try:

@@ -125,7 +125,7 @@ def test_postgres_detail_value_is_scrubbed_from_a_logged_unique_violation():
         conn.rollback()
     assert _MARKER in str(caught.value)  # Postgres's DETAIL echoes the key
     out = _render(_exc_record(caught.value, "insert failed"), logging.Formatter())
-    assert "already exists" in out and _MARKER not in out
+    assert "duplicate key value violates unique constraint" in out and _MARKER not in out
 
 
 @pytest.mark.parametrize(
@@ -192,8 +192,12 @@ def test_celery_logger_setup_attaches_the_filter():
         "DETAIL:  Key (k)=(Jane Doe, no closing paren",
         "DETAIL:  Failing row contains (7, Jane Doe, no closing paren",
         "DETAIL:  Key (k)=(Jane Doe)\r\nnext",
+        "DETAIL:  Key (" + "c" * 201 + ")=(Jane Doe) already exists.",  # long column list
+        "DETAIL:  Key (k)=(Joe) already exists. Jane Doe",  # text after a full match
+        "DETAIL:  Key (k)=(Jane) already exists) already exists.",  # value holds the suffix
     ],
-    ids=["long-key", "unclosed-key", "unclosed-row", "crlf"],
+    ids=["long-key", "unclosed-key", "unclosed-row", "crlf", "long-column",
+         "trailing-text", "suffix-in-value"],
 )
 def test_detail_patterns_fail_closed(msg):
     assert "Jane" not in _redact(msg)

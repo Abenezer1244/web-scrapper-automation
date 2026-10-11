@@ -154,13 +154,14 @@ def _build_lead_delivery_email(
 def deliver_job_email(
     self,
     job_id: str,
-    scraper_name: str,
-    record_count: int,
-    download_url: str,
-    recipient_emails: list[str],
+    scraper_name: str | None = None,
+    record_count: int = 0,
+    download_url: str | None = None,
+    recipient_emails: list[str] | None = None,
     fmt: str = "csv",
     summary_message: str | None = None,
     link_expires: bool = True,
+    sealed: str | None = None,
 ) -> None:
     """Send the lead-delivery email via Resend, with retries.
 
@@ -177,7 +178,24 @@ def deliver_job_email(
 
     download_url is built by the caller (tokenized 48h link for a job; the in-app
     batch page for a batch) — its TTL vastly exceeds the retry window.
+
+    P0-04b: callers pass everything but job_id in ``sealed`` (see
+    seal_task_args), so recipients, the link and the name never sit in the broker
+    as plaintext. The plain keyword arguments remain for messages enqueued by the
+    previous release; a sealed envelope that does not open raises, never falls
+    back to them.
     """
+    if sealed is not None:
+        from src.utils.crypto import unseal_task_args
+
+        args = unseal_task_args(
+            sealed, required=("scraper_name", "record_count", "download_url", "recipient_emails"))
+        scraper_name, record_count = args["scraper_name"], args["record_count"]
+        download_url, recipient_emails = args["download_url"], args["recipient_emails"]
+        fmt = args.get("fmt", fmt)
+        summary_message = args.get("summary_message", summary_message)
+        link_expires = args.get("link_expires", link_expires)
+
     if not recipient_emails:
         _logger.info("No delivery emails for job %s — skipping", job_id)
         return
@@ -192,6 +210,7 @@ def deliver_job_email(
         scraper_name, record_count, download_url, fmt, summary_message=summary_message, link_expires=link_expires
     )
 
+    retry_summary: str | None = None
     try:
         resend.Emails.send(build_payload(
             to=recipient_emails,
@@ -207,28 +226,39 @@ def deliver_job_email(
                 "Delivery email for job %s failed (attempt %d/%d, retryable): %s",
                 job_id, attempt, self.max_retries + 1, summary,
             )
-            raise self.retry(exc=exc, countdown=_BACKOFF_BASE * (5 ** self.request.retries))
-        # Permanent failure, or retries exhausted — give up WITHOUT raising so a
-        # delivery failure never marks the (already-done) scrape job as errored.
-        # Surface it to ops so a silently-undelivered purchased email is visible
-        # (the export IS in storage; the user can still download in-app).
-        _logger.error(
-            "Delivery email for job %s GAVE UP after %d attempt(s): %s",
-            job_id, attempt, summary,
-        )
-        from src.workers.ops_alerts import send_ops_alert
-        send_ops_alert(
-            "email_delivery", job_id,
-            "Lead delivery email failed",
-            f"Delivery email for job {job_id} ({scraper_name}) gave up after "
-            f"{attempt} attempt(s): {summary}. The export is in storage; the "
-            f"user can still download it in-app.",
-        )
-        return
+            retry_summary = summary
+        else:
+            _give_up(job_id, scraper_name, attempt, summary)
+            return
+    if retry_summary is not None:
+        # P0-04b: the retry's exception and traceback go to the result backend.
+        # Raised OUTSIDE the except so Resend's exception (its message can echo
+        # the recipient) is not chained as __context__; it carries the summary.
+        raise self.retry(exc=RuntimeError(f"delivery email send failed: {retry_summary}"),
+                         countdown=_BACKOFF_BASE * (5 ** self.request.retries))
 
     _logger.info(
         "Delivery email sent for job %s to %d recipients (%d records)",
         job_id, len(recipient_emails), record_count,
+    )
+
+
+def _give_up(job_id: str, scraper_name: str | None, attempt: int, summary: str) -> None:
+    """Permanent failure, or retries exhausted: give up WITHOUT raising so a
+    delivery failure never marks the (already-done) scrape job as errored, and
+    surface it to ops so a silently-undelivered purchased email is visible (the
+    export IS in storage; the user can still download in-app)."""
+    _logger.error(
+        "Delivery email for job %s GAVE UP after %d attempt(s): %s",
+        job_id, attempt, summary,
+    )
+    from src.workers.ops_alerts import send_ops_alert
+    send_ops_alert(
+        "email_delivery", job_id,
+        "Lead delivery email failed",
+        f"Delivery email for job {job_id} ({scraper_name}) gave up after "
+        f"{attempt} attempt(s): {summary}. The export is in storage; the "
+        f"user can still download it in-app.",
     )
 
 

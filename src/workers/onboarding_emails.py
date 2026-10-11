@@ -25,7 +25,7 @@ from src.utils.email_layout import (
     render_email,
     text_footer,
 )
-from src.utils.logger import setup_logger
+from src.utils.logger import email_fingerprint, setup_logger
 from src.workers import app
 
 _logger = setup_logger("worker.onboarding")
@@ -34,16 +34,19 @@ resend.api_key = settings.RESEND_API_KEY
 
 
 def _send(email: str, subject: str, html_body: str, text_body: str) -> None:
+    # P0-04b: a fingerprint, never the address; the exception's type, never its
+    # message (Resend's can echo the recipient back).
+    fp = email_fingerprint(email)
     if not settings.RESEND_API_KEY:
-        _logger.warning("RESEND_API_KEY not set, skipping email to %s", email)
+        _logger.warning("RESEND_API_KEY not set, skipping email to %s", fp)
         return
     try:
         resend.Emails.send(build_payload(
             to=[email], subject=subject, html_body=html_body, text_body=text_body,
         ))
-        _logger.info("Sent '%s' to %s", subject, email)
+        _logger.info("Sent '%s' to %s", subject, fp)
     except Exception as exc:
-        _logger.error("Failed to send '%s' to %s: %s", subject, email, exc)
+        _logger.error("Failed to send '%s' to %s: %s", subject, fp, type(exc).__name__)
 
 
 def _days_phrase(days: int) -> str:
@@ -122,7 +125,7 @@ def send_welcome_email(email: str) -> None:
 # ─── Duplicate signup: "you already have an account" ───────────────────────
 
 @app.task(name="src.workers.onboarding_emails.send_duplicate_signup_email")
-def send_duplicate_signup_email(email: str) -> None:
+def send_duplicate_signup_email(email: str | None = None, sealed: str | None = None) -> None:
     """Sent when someone submits /auth/register for an address that ALREADY has
     an account (the duplicate-email branch returns a generic 400 to the client to
     avoid user enumeration; this out-of-band note to the inbox owner is how a
@@ -136,7 +139,14 @@ def send_duplicate_signup_email(email: str) -> None:
     The copy intentionally does not over-confirm: it states only that a signup
     was ATTEMPTED for this address (which the inbox owner can see anyway) and
     offers login + reset. It does not echo any other account detail.
+
+    P0-04b: the address arrives in ``sealed`` (seal_task_args), never as a plain
+    broker argument; ``email`` remains for messages from the previous release.
     """
+    if sealed is not None:
+        from src.utils.crypto import unseal_task_args
+
+        email = unseal_task_args(sealed, required=("email",))["email"]
     login_url = frontend_routes.absolute(frontend_routes.LOGIN)
     reset_url = frontend_routes.absolute(frontend_routes.FORGOT_PASSWORD)
     subject = "You already have a BridgeLeads account"

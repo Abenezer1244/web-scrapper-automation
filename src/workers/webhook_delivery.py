@@ -316,13 +316,24 @@ def _blocked(job_id: str, host: str, attempt: int) -> dict:
     soft_time_limit=_TASK_SOFT_TIME_LIMIT,
     time_limit=_TASK_TIME_LIMIT,
 )
-def deliver_job_webhook(self, job_id: str, webhook_url: str, payload: dict) -> dict:
+def deliver_job_webhook(
+    self,
+    job_id: str,
+    webhook_url: str | None = None,
+    payload: dict | None = None,
+    sealed: str | None = None,
+) -> dict:
     """POST a job-completion payload to the configured webhook URL.
 
     Args:
         job_id: The job UUID (for logging correlation only)
         webhook_url: Full URL to POST to
         payload: Pre-built JSON payload (from build_webhook_payload)
+        sealed: P0-04b: {"url", "payload"} via seal_task_args, so the URL (which
+            can carry a secret), signed download links and dialer leads never sit
+            in the broker as plaintext. webhook_url/payload remain for messages
+            from the previous release; a sealed envelope that does not open
+            raises, never falls back to them.
 
     Returns:
         Dict with {status_code, response_excerpt, attempts}.
@@ -331,6 +342,11 @@ def deliver_job_webhook(self, job_id: str, webhook_url: str, payload: dict) -> d
         requests.RequestException: on network error (Celery auto-retries)
         Exception: on non-2xx status (Celery retries up to _MAX_RETRIES times)
     """
+    if sealed is not None:
+        from src.utils.crypto import unseal_task_args
+
+        args = unseal_task_args(sealed, required=("url", "payload"))
+        webhook_url, payload = args["url"], args["payload"]
     attempt = self.request.retries + 1
     host = urlparse(webhook_url).hostname or "?"
     _excerpt = _response_excerpt

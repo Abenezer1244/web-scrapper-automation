@@ -19,6 +19,67 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-10-11 — UX 3.13: the backend records endpoint is retired (F-047 BE follow-up, S3-21)
+
+**Built / Shipped:** owner-chosen follow-up (4). Backend `GET /scrapers/{config_id}/records`, the endpoint
+behind the cache-backed records page retired in 3.12, is gone, in four capped sub-phases plus two added
+by review: **#495** 3.13a (8269998f) the route, its private helpers and the `CachedRecordRow` /
+`CachedResultsPage` schemas removed, `schema/openapi.json` regenerated, a fixture-free retirement test
+kept beside the SQL date-parser tests; production `/scrapers/x/records` answers the default 404 `Not
+Found` before any dependency. bridgeleads-web **#265** 3.13c (21b660fb) the generated contract followed,
+regenerated from the schema at the exact merged SHA. **#497** 3.13b (6ca9f6f7) the dead
+`cached_records_order_by` helper removed and the test file split into correctly named files (moves
+byte-identical). **#498** 3.13d (556ea7ef) comments that cited the retired filter. **#500** 3.13e (1632efe5) the
+`exclude_batch_children` description names every caller that needs batch children; bridgeleads-web
+**#266** 3.13f (2234ef7a) the contract followed again. This closes S3-21 in application code (the endpoint read the
+shared county_records PII table without the quota / payment / Starter-delay gates); least-privilege DDL
+is pending.
+
+**Tried / Decided:** Codex PLAN review ran ten rounds (r1-r9 NO-GO, each folded in; r6 and r10 were killed
+by the memory reaper); the owner gave the GO in place of r10. One Codex demand was answered rather than
+adopted: logs covering the route's whole life back to 2026-03-22, or a mandatory 410 period. No log
+retention reaches that far, so it would force a 410 on every retirement; the plan used the API-key count,
+the retained window, 7 days of post-rollout watching and a one-PR-per-repo revert instead, and Codex r6
+accepted that. The owner then WAIVED the merge gate itself ("unblock and merge"): the key count and the
+log search were not run, recorded on #495; the 7-day watch stands. A schema freeze with the peer session
+(no backend `schema/openapi.json` change) covered the window between each backend schema merge and its FE
+types PR, because FE CI regenerates from backend main.
+
+**Failed / Blocked:** I wrote 3.13a's `exclude_batch_children` description naming only the TOD notice;
+Codex's 3.13d gate found that five FE screens read the full list and four need the batch children, so a
+wrong description shipped in the OpenAPI and the FE types until 3.13e/f (documentation text only).
+Proof-rig bugs, all caught before they could pass a change: the probe's route check expected `.path` on a
+FULL match, but FastAPI 0.141 keeps an included router as one `_IncludedRouter` in `app.routes` (now it
+counts matches); the 3.13b move gate compared the parent's LF index blob with the CRLF worktree copy and
+failed falsely (now blob vs blob); `MSYS_NO_PATHCONV=1` also stops Git Bash translating `/c/...` paths for
+native python; Git Bash `grep -c $'\r$'` reported 0 CRs in a CRLF file, so line endings are checked with
+Python byte counts. The full local suite runs for hours on this box (17% of one quarter in 9 minutes), so
+CI's `Test` job carried it and the PRs say so. Background jobs (two Codex runs, a CI watcher) were reaped
+for low memory; orphans were identified by their output file and stopped, and restarts waited for the
+owner.
+
+**Caught & fixed:** Codex plan rounds found, among others: the FE regen command reads raw GitHub (404 for
+the private repo), so 3.13c regenerates the CI way at the exact merged SHA; a rollback must revert every
+merged sub-phase in dependency order (3.13b deletes a helper the restored endpoint imports); `assert` in
+destructive rig guards is stripped by `python -O`, and libpq routing variables can redirect a `DROP
+DATABASE`; JWTs come from the public login too, so an API-key count alone proves nothing about scripted
+callers. Proof (3.13a, at ccfc4226 vs 091cb318): branch 24/24, base 26/26 incl. CONTROL (base serves the
+inserted row), RED SEMANTIC 0/10 + REGRESSION 14/14, in-repo test 1 pass / 1 fail, RED GATE PASS;
+collection 6817 -> 6804 (-14 +1).
+
+**Pending / Handoff:** owner: watch the api access log for `/records` hits for 7 days from 2026-10-11 06:34
+UTC (my five post-deploy checks at 06:34:26-31 GMT and later verification requests excluded); any real
+caller -> revert 3.13d/e -> 3.13b -> 3.13a, then the FE PRs. Named follow-ups (production DDL, owner):
+revoke the API role's `county_records` read (grant + migration 028 policy + `apply_rls_hotfix.py`), drop
+`user_record_views` through a new forward migration (113 untouched), decide the daily cache writer's fate
+(`ENABLE_DAILY_SCRAPE`, off). S3-21: fixed in application code, DDL pending.
+
+**Facts learned:** FastAPI >= 0.141 stores an `include_router` as one `_IncludedRouter` entry in
+`app.routes` (no `.path`); match routes with `route.matches(scope)` on a complete ASGI scope and count.
+An unmatched path is answered 404 before any dependency, so a retired route costs no auth, DB or
+rate-limit work. With `core.autocrlf=true` the index is LF and the worktree CRLF: compare committed
+blobs, never a blob against a worktree file.
+
 ## 2026-10-10 — UX 3.12: the cache-backed records page is retired (F-047)
 
 **Built / Shipped:** owner decision "retire the page" (not relabel, not re-enable the daily scrape).

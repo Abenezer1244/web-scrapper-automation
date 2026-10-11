@@ -1,10 +1,12 @@
-"""The SQL text-date parser is total: every input yields a date or NULL, never an error.
+"""The SQL date parser and guard are total: every input yields a date or NULL, never an error.
 
-results_sort._text_date / _valid_date parse the free-text date_recorded column inside PostgreSQL.
-They order the Results page and place dates in the Segments windows. The junk values are real
-shapes from prod Pierce rows (instrument numbers and scraped UI text in date_recorded): they must
-parse as "no date", never fail a query. Evaluated by PostgreSQL, no mocks. (Moved here in UX 3.13b
-from the retired cached-records test file, unchanged.)
+results_sort._text_date parses free-text date_recorded inside PostgreSQL for the auction-date
+fallback used by Results ordering and the Segments stand-in filter. results_sort._valid_date
+guards _month_name_date and _iso_date, which feed Results ordering and the Segments filing-date
+windows. The junk values are real shapes from prod Pierce rows (instrument numbers and scraped
+UI text in date_recorded): they must parse as "no date", never fail a query. Evaluated by
+PostgreSQL, no mocks. (Moved here in UX 3.13b from the retired cached-records test file,
+unchanged.)
 """
 import pytest
 from sqlalchemy import literal, select

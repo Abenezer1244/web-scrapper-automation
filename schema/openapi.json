@@ -9935,13 +9935,13 @@
         "operationId": "list_scrapers_scrapers_get",
         "parameters": [
           {
-            "description": "Exclude configs that are children of a batch (batch_id is set). The Scrapers list sets this so one user-initiated batch renders as ONE row instead of one row per county x record_type child. Default False on purpose: the grandfathered-probate TOD notice counts EVERY probate config, including batch children. Flipping the default would silently break it.",
+            "description": "Exclude configs that are children of a batch (batch_id is set). The Scrapers list sets this so one user-initiated batch renders as ONE row instead of one row per county x record_type child. Default False on purpose: other callers need every config, batch children included (the grandfathered-probate TOD notice, the Deliver list, the dashboard counts and the command palette). The Results index also reads the full list for scraper names and fallback county/state/record_type display metadata, but does not need batch children. Flipping the default would silently break the first four.",
             "in": "query",
             "name": "exclude_batch_children",
             "required": false,
             "schema": {
               "default": false,
-              "description": "Exclude configs that are children of a batch (batch_id is set). The Scrapers list sets this so one user-initiated batch renders as ONE row instead of one row per county x record_type child. Default False on purpose: the grandfathered-probate TOD notice counts EVERY probate config, including batch children. Flipping the default would silently break it.",
+              "description": "Exclude configs that are children of a batch (batch_id is set). The Scrapers list sets this so one user-initiated batch renders as ONE row instead of one row per county x record_type child. Default False on purpose: other callers need every config, batch children included (the grandfathered-probate TOD notice, the Deliver list, the dashboard counts and the command palette). The Results index also reads the full list for scraper names and fallback county/state/record_type display metadata, but does not need batch children. Flipping the default would silently break the first four.",
               "title": "Exclude Batch Children",
               "type": "boolean"
             }

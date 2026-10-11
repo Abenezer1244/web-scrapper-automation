@@ -63,10 +63,12 @@ async def test_default_still_returns_batch_children(
     client: AsyncClient, db: AsyncSession, starter_user: User, starter_token: str,
     scraper_config: ScraperConfig,
 ):
-    """The DEFAULT must not change. Two callers depend on seeing every config:
-    the grandfathered-probate TOD notice counts EVERY probate config (a batch
-    child can be one), and /scrapers/{id}/records resolves a child out of this
-    list. Flipping the default would silently break both."""
+    """The DEFAULT must not change. Four callers need every config, batch
+    children included: the grandfathered-probate TOD notice, the Deliver list,
+    the dashboard counts and the command palette. The Results index also reads
+    the full list (scraper names and fallback county/state/record_type display
+    metadata) but does not need batch children. Flipping the default would
+    silently break the first four."""
     _batch_id, child_ids = await _batch_with_children(db, starter_user)
 
     r = await client.get("/scrapers", headers=_auth(starter_token))

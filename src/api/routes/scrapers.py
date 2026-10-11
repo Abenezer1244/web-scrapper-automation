@@ -107,9 +107,12 @@ async def list_scrapers(
             "Exclude configs that are children of a batch (batch_id is set). The "
             "Scrapers list sets this so one user-initiated batch renders as ONE row "
             "instead of one row per county x record_type child. "
-            "Default False on purpose: the grandfathered-probate TOD notice counts "
-            "EVERY probate config, including batch children. Flipping the default "
-            "would silently break it."
+            "Default False on purpose: other callers need every config, batch "
+            "children included (the grandfathered-probate TOD notice, the Deliver "
+            "list, the dashboard counts and the command palette). The Results index "
+            "also reads the full list for scraper names and fallback "
+            "county/state/record_type display metadata, but does not need batch "
+            "children. Flipping the default would silently break the first four."
         ),
     ),
     db: AsyncSession = Depends(get_rls_db),

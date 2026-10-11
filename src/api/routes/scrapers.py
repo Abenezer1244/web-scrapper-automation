@@ -1,13 +1,12 @@
 """Scraper config routes: CRUD for user's scraper configurations."""
 
-import re
 import uuid
 from collections.abc import Iterable
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.security import HTTPAuthorizationCredentials
-from sqlalchemy import case, func, select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.auth import CurrentUser, _bearer, get_auth_context, require_admin, require_admin_mfa
@@ -26,11 +25,8 @@ from src.api.entitlements import (
 )
 from src.api.middleware.rate_limit import rate_limit
 from src.api.middleware.security import audit_log
-from src.api.results_sort import cached_records_order_by
 from src.api.schemas import (
     DELIVER_SECRET_FIELDS,
-    CachedRecordRow,
-    CachedResultsPage,
     ConfigRunEligibilityResponse,
     ConnectorCreate,
     ConnectorResponse,
@@ -46,7 +42,7 @@ from src.config.constants import (
     SKIP_TRACE_ADDON_PLANS,
     normalize_plan,
 )
-from src.db import CountyConnector, CountyRecord, ScraperConfig, get_db
+from src.db import CountyConnector, ScraperConfig, get_db
 from src.scrapers.probate import (
     effective_tod_on_update,
     new_probate_config_tod_default,
@@ -111,10 +107,9 @@ async def list_scrapers(
             "Exclude configs that are children of a batch (batch_id is set). The "
             "Scrapers list sets this so one user-initiated batch renders as ONE row "
             "instead of one row per county x record_type child. "
-            "Default False on purpose: other callers legitimately need the children "
-            "(the grandfathered-probate TOD notice counts EVERY probate config, and "
-            "/scrapers/{id}/records resolves a child config out of this list). "
-            "Flipping the default would silently break both."
+            "Default False on purpose: the grandfathered-probate TOD notice counts "
+            "EVERY probate config, including batch children. Flipping the default "
+            "would silently break it."
         ),
     ),
     db: AsyncSession = Depends(get_rls_db),
@@ -1105,224 +1100,6 @@ async def create_connector(
     db.add(connector)
     await db.flush()
     return ConnectorResponse.model_validate(connector)
-
-
-# ─── Cached records endpoint ─────────────────────────────────────────────────
-
-# Older cache writers stored this literal when a parcel lookup came back empty.
-# It is a placeholder, not an address — the API must return null for it so the
-# UI renders "—" rather than a fake value (the same rule the results page has).
-_CACHE_ADDRESS_PLACEHOLDER = "(enrichment unavailable)"
-# A first-ever view has no last_viewed_at: every cached row counts as new.
-_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
-
-
-def _cache_address_or_none(value: str | None) -> str | None:
-    if not value or value.strip() == _CACHE_ADDRESS_PLACEHOLDER:
-        return None
-    return value
-
-
-def _cached_doc_type_filter(record_type: str) -> tuple[str | None, dict]:
-    r"""SQL fragment + bind params restricting county_records to one record type.
-
-    A typed config gets ONLY rows whose doc_type matches its keywords. The former
-    `doc_type IS NULL OR …` escape hatch let every untyped row through to every
-    record type: on 2026-09-02 the entire cache (3,305 rows, all doc_type NULL,
-    scraped in March by a since-replaced parser) was served under a probate
-    config as if it were probate — column-shifted rows, NULL party names and the
-    literal "(enrichment unavailable)" included. Keywords are hardcoded values
-    (never user input) bound as parameters; the fragment is never f-string
-    interpolated with them. (None, {}) for a record type with no keyword list.
-
-    Mirrors the scraper's own matcher (eagleweb._doc_type_matches +
-    _DOC_TYPE_EXCLUDE, Codex review): multi-word / long keywords are substring
-    matches (ILIKE), short single-token codes (<=5 chars: SUCC, NTS, TOD, …) are
-    WORD-BOUNDARY matches (PostgreSQL ARE `\m…\M`) so "SUCC" cannot bleed into
-    "SUCCESSOR TRUSTEE", and the record type's exclude phrases drop the row.
-    """
-    from src.scrapers.templates.eagleweb import _DOC_TYPE_EXCLUDE, _DOC_TYPE_MAP
-
-    keywords = _DOC_TYPE_MAP.get(record_type, [])
-    if not keywords:
-        return None, {}
-    conditions = []
-    params: dict = {}
-    for i, kw in enumerate(keywords):
-        name = f"kw_{i}"
-        if " " in kw or len(kw) > 5:
-            conditions.append(f"doc_type ILIKE :{name}")
-            params[name] = f"%{kw}%"
-        else:
-            conditions.append(f"doc_type ~* :{name}")
-            params[name] = rf"\m{re.escape(kw)}\M"
-    clause = "(" + " OR ".join(conditions) + ")"
-    excludes = _DOC_TYPE_EXCLUDE.get(record_type, [])
-    if excludes:
-        ex_conditions = []
-        for i, ex in enumerate(excludes):
-            name = f"ex_{i}"
-            ex_conditions.append(f"doc_type ILIKE :{name}")
-            params[name] = f"%{ex}%"
-        clause += " AND NOT (" + " OR ".join(ex_conditions) + ")"
-    return clause, params
-
-
-@router.get("/{config_id}/records", response_model=CachedResultsPage)
-async def get_cached_records(
-    config_id: str,
-    current_user: CurrentUser,
-    request: Request,
-    db: AsyncSession = Depends(get_rls_db),
-    page: int = Query(1, ge=1),
-    page_size: int = Query(50, ge=1, le=500),
-    q: str | None = None,
-):
-    """Serve pre-scraped records from cache with per-user 'new' badges."""
-    # Rate-limit before the cached-records query (FOR UPDATE + counts).
-    await rate_limit(request, zone="general", identifier=current_user.id)
-    # 1. Verify config belongs to user
-    config_result = await db.execute(
-        select(ScraperConfig).where(
-            ScraperConfig.id == config_id,
-            ScraperConfig.user_id == current_user.id,
-            ScraperConfig.active,
-        )
-    )
-    config = config_result.scalar_one_or_none()
-    if config is None:
-        raise HTTPException(status_code=404, detail="Scraper config not found")
-
-    county = config.county.lower()
-    state = config.state.upper()
-
-    # 2. Atomic: read old last_viewed_at, then update to NOW()
-    old_view_result = await db.execute(
-        text("""
-            SELECT last_viewed_at FROM user_record_views
-            WHERE user_id = :user_id AND scraper_config_id = :config_id
-            FOR UPDATE
-        """),
-        {"user_id": current_user.id, "config_id": config_id},
-    )
-    old_row = old_view_result.fetchone()
-    previous_viewed = old_row.last_viewed_at if old_row else None
-
-    await db.execute(
-        text("""
-            INSERT INTO user_record_views (id, user_id, scraper_config_id, last_viewed_at)
-            VALUES (gen_random_uuid(), :user_id, :config_id, NOW())
-            ON CONFLICT (user_id, scraper_config_id)
-            DO UPDATE SET last_viewed_at = NOW()
-        """),
-        {"user_id": current_user.id, "config_id": config_id},
-    )
-
-    # 3. Build doc_type filter from record_type keywords (safe: hardcoded values only)
-    type_clauses = []
-    query_params: dict = {}
-    doc_type_clause, doc_type_params = _cached_doc_type_filter(config.record_type)
-    if doc_type_clause:
-        type_clauses.append(doc_type_clause)
-        query_params.update(doc_type_params)
-
-    # 4. Search filter (parameterized — :q is never interpolated into SQL)
-    if q and len(q) <= 100:
-        from src.api.middleware.security import sanitize_search
-        clean_q = sanitize_search(q)
-        type_clauses.append("(party_name ILIKE :q OR property_address ILIKE :q OR parcel_id ILIKE :q)")
-        query_params["q"] = f"%{clean_q}%"
-
-    # Build WHERE extension from clauses (all parameterized, no f-string interpolation)
-    extra_where = (" AND " + " AND ".join(type_clauses)) if type_clauses else ""
-
-    # 5. Count total + new_count
-    count_sql = text(
-        "SELECT"
-        "  COUNT(*) AS total,"
-        "  COUNT(*) FILTER (WHERE scraped_at > COALESCE(:prev_viewed, '1970-01-01'::timestamptz)) AS new_count"
-        " FROM county_records"
-        " WHERE LOWER(county) = :county AND UPPER(state) = :state"
-        + extra_where
-    )
-    counts = await db.execute(
-        count_sql,
-        {"county": county, "state": state, "prev_viewed": previous_viewed, **query_params},
-    )
-    count_row = counts.fetchone()
-    total = count_row.total if count_row else 0
-    new_count = count_row.new_count if count_row else 0
-
-    # 6. Fetch paginated records
-    # A Core select rather than a SQL string: the date ORDER BY carries regex
-    # patterns, and inlining them as literals doubles their backslashes. The
-    # doc_type/search clauses stay the same parameterized text, bound below.
-    offset = (page - 1) * page_size
-    records_stmt = (
-        select(
-            *CountyRecord.__table__.c,
-            # CASE, not a bare comparison: always true/false, never NULL, as before.
-            case(
-                (CountyRecord.scraped_at > (previous_viewed if previous_viewed is not None else _EPOCH), True),
-                else_=False,
-            ).label("is_new"),
-        )
-        .where(
-            func.lower(CountyRecord.county) == county,
-            func.upper(CountyRecord.state) == state,
-            *[text(clause) for clause in type_clauses],
-        )
-        .order_by(*cached_records_order_by())
-        .limit(page_size)
-        .offset(offset)
-    )
-    result = await db.execute(records_stmt, query_params)
-    rows = result.fetchall()
-
-    # 7. Cache age
-    cache_age = None
-    cache_stale = True
-    if rows:
-        latest_batch = await db.execute(
-            text("SELECT MAX(batch_date) FROM county_records WHERE LOWER(county) = :county AND UPPER(state) = :state"),
-            {"county": county, "state": state},
-        )
-        max_batch = latest_batch.scalar()
-        if max_batch:
-            age = datetime.now(UTC).date() - max_batch
-            cache_age = f"{age.days}d" if age.days > 0 else "today"
-            cache_stale = age.days > 1
-
-    # M2 (full-SaaS review): get_db dependency commits on normal
-    # exit, so the explicit commit here is redundant. Removed.
-
-    return CachedResultsPage(
-        config_id=config_id,
-        county=config.county,
-        state=config.state,
-        total=total,
-        new_count=new_count,
-        cache_age=cache_age,
-        cache_stale=cache_stale,
-        page=page,
-        page_size=page_size,
-        items=[
-            CachedRecordRow(
-                id=str(r.id),
-                date_recorded=r.date_recorded,
-                party_name=r.party_name,
-                heirs=r.heirs,
-                doc_type=r.doc_type,
-                legal_description=r.legal_description,
-                parcel_id=r.parcel_id,
-                property_address=_cache_address_or_none(r.property_address),
-                mailing_address=_cache_address_or_none(r.mailing_address),
-                is_new=r.is_new,
-                scraped_at=r.scraped_at,
-            )
-            for r in rows
-        ],
-    )
 
 
 @router.post("/{config_id}/jobs/{job_id}/dialer-replay")

@@ -25,7 +25,7 @@ from src.utils.email_layout import (
     render_email,
     text_footer,
 )
-from src.utils.logger import setup_logger
+from src.utils.logger import email_fingerprint, setup_logger
 from src.workers import app
 
 _logger = setup_logger("worker.onboarding")
@@ -34,16 +34,19 @@ resend.api_key = settings.RESEND_API_KEY
 
 
 def _send(email: str, subject: str, html_body: str, text_body: str) -> None:
+    # P0-04b: a fingerprint, never the address; the exception's type, never its
+    # message (Resend's can echo the recipient back).
+    fp = email_fingerprint(email)
     if not settings.RESEND_API_KEY:
-        _logger.warning("RESEND_API_KEY not set, skipping email to %s", email)
+        _logger.warning("RESEND_API_KEY not set, skipping email to %s", fp)
         return
     try:
         resend.Emails.send(build_payload(
             to=[email], subject=subject, html_body=html_body, text_body=text_body,
         ))
-        _logger.info("Sent '%s' to %s", subject, email)
+        _logger.info("Sent '%s' to %s", subject, fp)
     except Exception as exc:
-        _logger.error("Failed to send '%s' to %s: %s", subject, email, exc)
+        _logger.error("Failed to send '%s' to %s: %s", subject, fp, type(exc).__name__)
 
 
 def _days_phrase(days: int) -> str:

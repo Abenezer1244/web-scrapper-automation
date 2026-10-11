@@ -118,8 +118,14 @@ def test_a_retry_never_carries_resends_message(monkeypatch):
     # store in the result backend for a queued retry.
     with pytest.raises((RuntimeError, Retry)) as caught:
         delivery.deliver_job_email.run(job_id=str(uuid.uuid4()), sealed=seal_task_args(_EMAIL_ARGS))
+    import traceback
+
     assert "ApplicationError (code=429)" in str(caught.value)
-    assert "marker" not in str(caught.value).lower()
+    # Not in the message, nor chained in as context, nor anywhere in the traceback
+    # Celery would store with the retry.
+    assert caught.value.__context__ is None and caught.value.__cause__ is None
+    rendered = "".join(traceback.format_exception(caught.value))
+    assert "marker" not in rendered.lower()
 
 
 # ── send_duplicate_signup_email ──────────────────────────────────────────────

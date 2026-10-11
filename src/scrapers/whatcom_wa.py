@@ -29,6 +29,7 @@ from src.scrapers.preforeclosure import (
     orient_pre_foreclosure_party,
 )
 from src.scrapers.probate import orient_probate_party
+from src.scrapers.reliability import detect_block
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("scraper.whatcom_wa")
@@ -221,10 +222,10 @@ class WhatcomWAScraper(BridgeScraper):
             "() => !!document.querySelector('.search-result, #search-results-header, .floating-message')"
         )
         if not ui_present:
-            body_head = (await self.page.inner_text("body"))[:200].replace("\n", " ")
+            body = await self.page.inner_text("body")
             raise RuntimeError(
                 f"Whatcom: results UI never rendered — page blocked / errored. "
-                f"Body head: {body_head!r}"
+                f"Block marker: {detect_block(body) or 'none'}; body {len(body)} chars"  # P0-04
             )
 
         all_records: list[ScrapedRecord] = []
@@ -411,8 +412,8 @@ class WhatcomWAScraper(BridgeScraper):
                 if oriented is None:
                     _logger.info(
                         "pre_foreclosure: no person party — doc=%r parcel=%r "
-                        "grantor=%r grantee=%r (dropped)",
-                        doc_type, parcel_id, (grantor or "")[:40], (grantee or "")[:40],
+                        "grantor %s, grantee %s (dropped)",  # P0-04: no names
+                        doc_type, parcel_id, "set" if grantor else "empty", "set" if grantee else "empty",
                     )
                     continue
                 record.party_name, record.heirs = oriented

@@ -61,8 +61,12 @@ class ScraperExecutionError(RuntimeError):
             meta.append(f"page={page}")
         if date_from or date_to:
             meta.append(f"window={date_from}..{date_to}")
-        if context is not None:
-            meta.append(f"ctx={str(context)[:120]}")
+        # P0-04: context is often raw portal page text (party names, legal
+        # descriptions), and this message reaches logs, retries, the canary and
+        # the job record. It is not kept at all; an exception context keeps only
+        # its type here, and callers chain it (`from exc`) for the traceback.
+        if isinstance(context, BaseException):
+            meta.append(f"ctx={type(context).__name__}")
         msg = f"{county or '?'}: {platform} — {reason}"
         if meta:
             msg += " [" + " ".join(meta) + "]"

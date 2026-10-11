@@ -119,13 +119,10 @@ def _parse_regrid_response(data: dict) -> dict[str, str | None]:
     }
 
     if owner_name or assessed_value:
-        _logger.info(
-            "Regrid enriched %s: %s (owner: %s, value: %s)",
-            props.get("parcelnumb", "?"),
-            property_address or "no address",
-            owner_name or "?",
-            assessed_value or "?",
-        )
+        # P0-04: ids only; address, owner name and value stay out of the logs.
+        _logger.info("Regrid enriched %s (address %s, owner %s, value %s)",
+                     props.get("parcelnumb", "?"),
+                     *("found" if v else "missing" for v in (property_address, owner_name, assessed_value)))
 
     return result
 

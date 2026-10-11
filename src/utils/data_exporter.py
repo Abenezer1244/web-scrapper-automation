@@ -293,7 +293,7 @@ class DataExporter:
             resp = _requests.put(url, headers=headers, data=f, timeout=120)
 
         if resp.status_code not in (200, 201):
-            raise RuntimeError(f"R2 upload failed ({resp.status_code}): {resp.text[:200]}")
+            raise RuntimeError(f"R2 upload failed ({resp.status_code}, body {len(resp.text)} chars)")  # P0-04
 
         _logger.info("Uploaded to R2: %s", object_key)
         return object_key
@@ -327,7 +327,7 @@ class DataExporter:
         # that still has thousands to clear. The caller counts failures and the
         # key is left in place so the next run retries it.
         _logger.error(
-            "R2 delete failed for %s (%s): %s", object_key, resp.status_code, resp.text[:200]
+            "R2 delete failed for %s (%s, body %d chars)", object_key, resp.status_code, len(resp.text)  # P0-04
         )
         return False
 
@@ -366,7 +366,8 @@ class DataExporter:
         resp.raise_for_status()
         body = resp.json()
         if not body.get("success") or not isinstance(body.get("result"), list):
-            raise RuntimeError(f"R2 list failed for {prefix}: {body.get('errors')}")
+            codes = [e.get("code") for e in body.get("errors") or [] if isinstance(e, dict)]
+            raise RuntimeError(f"R2 list failed for {prefix}: error codes {codes}")  # P0-04
         return [obj["key"] for obj in body["result"]]
 
     def get_download_url(self, object_key: str, expires_in: int = 3600) -> str:
@@ -422,7 +423,7 @@ class DataExporter:
                 _logger.info("Generated S3 presigned URL for %s", object_key)
                 return presigned
             except Exception as exc:
-                _logger.warning("S3 presigned URL failed: %s", str(exc)[:80])
+                _logger.warning("S3 presigned URL failed: %s", type(exc).__name__)  # P0-04
 
         # Cloudflare R2 native API presigned URL (used only when the
         # boto3 S3-compatible path above is not configured — currently
@@ -437,7 +438,7 @@ class DataExporter:
                     if presigned:
                         return presigned
             except Exception as exc:
-                _logger.warning("R2 API presigned URL failed: %s", str(exc)[:80])
+                _logger.warning("R2 API presigned URL failed: %s", type(exc).__name__)  # P0-04
 
         _logger.error("No download URL method available for %s", object_key)
         raise RuntimeError("Export download is not configured. Contact support.")

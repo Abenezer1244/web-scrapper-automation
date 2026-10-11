@@ -121,12 +121,15 @@ class PierceWACodeViolationScraper(BridgeScraper):
                 if not isinstance(data, dict) or "error" in data or "features" not in data:
                     err = ""
                     if isinstance(data, dict) and isinstance(data.get("error"), dict):
-                        err = str(data["error"].get("message", data["error"]))[:160]
+                        message = data["error"].get("message")  # server text only, never the object
+                        err = message[:160] if isinstance(message, str) else ""
                     # _ArcGISErrorBodyError is retryable (usually a transient throttle);
                     # a persistent bad query still fails loud after MAX_RETRIES.
+                    # P0-04: the body's shape, never the body (it can hold records).
+                    shape = f"keys {sorted(data)[:10]}" if isinstance(data, dict) else type(data).__name__
                     raise _ArcGISErrorBodyError(
                         f"ArcGIS returned an error/malformed body at offset {offset} "
-                        f"(page {page_num + 1}): {err or str(data)[:160]}"
+                        f"(page {page_num + 1}): {err or shape}"
                     )
                 return data
             except Exception as exc:

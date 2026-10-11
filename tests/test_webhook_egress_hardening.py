@@ -81,7 +81,7 @@ def test_a_gzip_bomb_is_not_decoded_into_memory(local_endpoint):
     ).get()
     assert result["status"] == "delivered"
     # Compressed despite Accept-Encoding: identity, so it is never decompressed.
-    assert result["response_excerpt"] == "<gzip body, not decoded>"
+    assert result["response_excerpt"].endswith("chars, not kept>")
 
 
 def test_a_huge_error_body_is_not_read_in_full(local_endpoint):
@@ -117,7 +117,10 @@ def test_an_echoed_url_secret_is_scrubbed_from_excerpt_and_logs(local_endpoint, 
             retries=wd._MAX_RETRIES,
         ).get()
     assert result["status"] == "failed" and result["status_code"] == 400
-    assert "bad request" in result["response_excerpt"]  # the excerpt is still useful
+    # P0-04: the reply's content is never kept, only its length.
+    assert "bad request" not in result["response_excerpt"]
+    assert result["response_excerpt"].endswith("chars, not kept>")
+    assert "bad request" not in caplog.text
     assert "ECHOEDSECRETVALUE456" not in result["response_excerpt"]
     assert "ECHOEDSECRETVALUE456" not in caplog.text
 

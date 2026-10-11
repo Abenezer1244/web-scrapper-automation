@@ -32,6 +32,7 @@ from src.scrapers.preforeclosure import (
     orient_pre_foreclosure_party,
 )
 from src.scrapers.probate import orient_probate_party
+from src.scrapers.reliability import detect_block
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("scraper.template.laserfiche")
@@ -159,7 +160,7 @@ class LaserficheWebLinkScraper(BridgeScraper):
             # than return [] (which would score as a healthy 0-record scrape).
             raise RuntimeError(
                 f"{self.county}: Laserfiche date-fill failed — search page never "
-                f"loaded / blocked: {str(exc)[:120]}"
+                f"loaded / blocked: {type(exc).__name__}"  # P0-04; chained below
             ) from exc
 
         # Submit search
@@ -173,7 +174,7 @@ class LaserficheWebLinkScraper(BridgeScraper):
         except Exception as exc:
             raise RuntimeError(
                 f"{self.county}: Laserfiche submit failed — search never ran: "
-                f"{str(exc)[:120]}"
+                f"{type(exc).__name__}"  # P0-04; chained below
             ) from exc
 
         # Wait for the async PrimeFaces datatable to populate, THEN read the
@@ -199,10 +200,11 @@ class LaserficheWebLinkScraper(BridgeScraper):
         # never rendered (block / error / portal down) — fail loud instead of
         # returning a false-empty [].
         if not count_seen:
-            body_head = (await self.page.inner_text("body"))[:200].replace("\n", " ")
+            body = await self.page.inner_text("body")
             raise RuntimeError(
                 f"{self.county}: Laserfiche results count never appeared — page "
-                f"never loaded / blocked. Body head: {body_head!r}"
+                f"never loaded / blocked. Block marker: {detect_block(body) or 'none'}; "  # P0-04
+                f"body {len(body)} chars"
             )
         _logger.info("Search returned %d total results", total)
         if total == 0:

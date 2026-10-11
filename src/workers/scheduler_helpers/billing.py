@@ -486,7 +486,7 @@ def _expire_trials_impl(subscription_lookup=None) -> None:
                 "— not downgraded", user.id,
             )
             return False
-        _logger.info("Trial expired for %s — downgraded to starter", user.email)
+        _logger.info("Trial expired for user %s — downgraded to starter", user.id)  # P0-04: id, not email
         apply_reconciliation_sync(db, str(user.id), "starter")
         db.commit()  # per-row, so a later Stripe failure cannot strand this one
         return True

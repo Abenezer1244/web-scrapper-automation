@@ -1066,7 +1066,7 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
 
             # Handle the response — could be error dict or data dict
             if isinstance(raw, dict) and 'error' in raw:
-                _logger.info("No results table: %s — html: %s", raw.get('error'), raw.get('html', '')[:200])
+                _logger.info("No results table: %s (html %d chars)", raw.get('error'), len(raw.get('html') or ''))  # P0-04
                 return []
 
             if isinstance(raw, dict):
@@ -1085,11 +1085,9 @@ class KingCountyLandmarkWebScraper(BridgeScraper):
 
             _logger.info("Data rows: %d", len(raw))
 
-            # Log first 3 rows
-            for i, sample in enumerate(raw[:3]):
-                if sample:
-                    _logger.info("  Row %d: %s", i + 1,
-                                 {k: (v[:80] if isinstance(v, str) and v else v) for k, v in sample.items()})
+            # P0-04: the row SHAPE only; values are party names and legal text.
+            if raw and raw[0]:
+                _logger.info("  Row fields: %s", sorted(raw[0]))
 
             for item in raw:
                 if not item:

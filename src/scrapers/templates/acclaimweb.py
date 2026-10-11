@@ -266,7 +266,7 @@ class AcclaimWebScraper(BridgeScraper):
 
         try:
             body_text = await self.page.inner_text("body")
-            _logger.debug("Page text (first 500): %s", body_text[:500].replace('\n', ' '))
+            _logger.debug("Page text: %d chars", len(body_text))  # P0-04: never the text
 
             # Strategy 1: Checkbox-based disclaimer (Chelan pattern)
             # Some AcclaimWeb sites use a checkbox labeled "Accept Disclaimer"
@@ -283,7 +283,8 @@ class AcclaimWebScraper(BridgeScraper):
                     parent_text = await cb.evaluate(
                         "el => (el.parentElement?.textContent || el.closest('label')?.textContent || '').trim()"
                     )
-                    _logger.info("Checkbox %d: id=%s name=%s label=%s", i, cb_id, cb_name, parent_text[:60])
+                    _logger.info("Checkbox %d: id=%s name=%s label %d chars", i, cb_id, cb_name,
+                                 len(parent_text))  # P0-04: portal text stays out of logs
 
                     if any(kw in (cb_id + cb_name + parent_text).lower()
                            for kw in ["accept", "disclaim", "agree", "acknowledge"]):
@@ -581,7 +582,7 @@ class AcclaimWebScraper(BridgeScraper):
             # Log page state after search
             body = await self.page.inner_text("body")
             _logger.info("After search URL: %s", self.page.url)
-            _logger.debug("After search text (500): %s", body[:500].replace('\n', ' '))
+            _logger.debug("After search text: %d chars", len(body))  # P0-04
 
         except ScraperExecutionError:
             raise

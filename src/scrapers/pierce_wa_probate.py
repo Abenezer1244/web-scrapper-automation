@@ -475,7 +475,7 @@ class PierceWAARMSScraper(BridgeScraper):
             record_type=self._record_type,
             page=getattr(self, "_page_total", None),
             context=last_exc,
-        )
+        ) from last_exc  # the message names only its type (P0-04); the traceback keeps it
 
     async def _fetch_parcels_from_detail(self, records: list[ScrapedRecord]) -> None:
         """Extract parcel IDs from the Legal Description tab on each detail page.
@@ -771,9 +771,10 @@ class PierceWAARMSScraper(BridgeScraper):
                     if oriented is None:
                         # No person on either visible role — log (never silent) so a
                         # systematic borrower-behind-"(+)" loss is observable.
+                        # P0-04: which roles were present, not the names.
                         _logger.info(
-                            "pre_foreclosure: no person party — [R]=%r [E]=%r (dropped)",
-                            party, heirs,
+                            "pre_foreclosure: no person party — [R] %s, [E] %s (dropped)",
+                            "set" if party else "empty", "set" if heirs else "empty",
                         )
                         record.party_name = None  # dropped by the party-name guard below
                     else:

@@ -173,8 +173,8 @@ def test_single_charge_parcel_amount_and_label():
     assert b.parcel_id == "0222222222"
     # No fabricated owner name — blank (honest); real name comes from skip-trace/eRealProperty.
     assert b.party_name is None
-    # doc_type stays None (like Snoho tax) so cached-records `doc_type IS NULL`
-    # keeps these rows visible.
+    # doc_type stays None (like Snoho tax): a tax roll is not a recorded
+    # instrument, so there is no document type to store.
     assert b.doc_type is None
 
 

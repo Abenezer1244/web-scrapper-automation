@@ -153,8 +153,8 @@ def test_parse_single_year_amount_and_fields():
     # pipeline's sanitize_for_csv covers these — never raw-from-enrichment).
     assert cissna.party_name == "CISSNA RICHARD C/KATHRYN A"
     assert "SNOHOMISH" in cissna.property_address
-    # doc_type stays None (like King tax) so the cached-records filter's
-    # `doc_type IS NULL` branch keeps these rows visible (Codex P2).
+    # doc_type stays None (like King tax): a tax roll is not a recorded
+    # instrument, so there is no document type to store.
     assert cissna.doc_type is None
 
 

@@ -472,6 +472,18 @@ BEGIN
         CREATE POLICY account_exports_system ON account_exports
             FOR ALL TO bridgeleads_system USING (true) WITH CHECK (true);
     END IF;
+    -- Job degradations (117): worker-only history of phases that failed on a DONE
+    -- job, plus the skip-trace repair queue. Nobody deletes (rows go with their job);
+    -- the app role reads nothing. Must stay AFTER the system ALL TABLES grant.
+    IF to_regclass('public.job_degradations') IS NOT NULL THEN
+        REVOKE ALL ON job_degradations FROM bridgeleads_app, bridgeleads_system;
+        GRANT SELECT, INSERT ON job_degradations TO bridgeleads_system;
+        GRANT UPDATE (repair_status, attempts, next_attempt_at, last_error_type)
+              ON job_degradations TO bridgeleads_system;
+        DROP POLICY IF EXISTS job_degradations_system ON job_degradations;
+        CREATE POLICY job_degradations_system ON job_degradations
+            FOR ALL TO bridgeleads_system USING (true) WITH CHECK (true);
+    END IF;
     -- users CASCADEs into account_deletions: only the owner may delete/truncate it.
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
         REVOKE DELETE, TRUNCATE ON users FROM anon;

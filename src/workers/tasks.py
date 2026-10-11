@@ -1724,11 +1724,18 @@ def run_scrape_job(self, job_id: str) -> None:
             _logger.warning("Inline enrichment error: %s", str(exc)[:200])
             record_degraded(db, r, job_id, "enrichment", exc)
         else:
-            # Outside the try: a failed live-log push after a completed enrichment
-            # is not an enrichment failure (Codex).
+            # Outside that try: a failed completion line after a completed
+            # enrichment is not an enrichment failure, and it never failed a
+            # delivery before either (Codex).
             _enrichment_ok = True
-            _level, _msg = enrichment_completion_log(enrich_summary)
-            _publish_log(r, job_id, _level, _msg, db=db)
+            try:
+                _level, _msg = enrichment_completion_log(enrich_summary)
+                _publish_log(r, job_id, _level, _msg, db=db)
+            except Exception as exc:
+                reraise_time_limit(exc)
+                db.rollback()
+                _logger.warning("Job %s: enrichment completion line failed: %s",
+                                job_id, type(exc).__name__)
 
         # NTS Tier 1: attach matched trustee-sale auction data onto a pre_foreclosure
         # job's leads (any county with an NTS source — Pierce/Snohomish, King later).
@@ -1832,6 +1839,7 @@ def run_scrape_job(self, job_id: str) -> None:
                 .order_by(Result.party_name, Result.date_recorded, Result.id)
             ).scalars().all()
         except Exception as exc:
+            reraise_time_limit(exc)
             db.rollback()
             _logger.warning("Job %s: post-enrichment refetch failed: %s", job_id, str(exc)[:120])
             # Sentinel: None means the refetch FAILED. We skip re-export AND
@@ -1996,6 +2004,7 @@ def run_scrape_job(self, job_id: str) -> None:
                         )
                     db.commit()
                 except Exception as exc:
+                    reraise_time_limit(exc)
                     db.rollback()
                     _cap_error = exc
 
@@ -2135,6 +2144,7 @@ def run_scrape_job(self, job_id: str) -> None:
                     else:
                         reexport_error = upload_exc
             except Exception as exc:
+                reraise_time_limit(exc)
                 reexport_error = exc
             finally:
                 if enriched_file:

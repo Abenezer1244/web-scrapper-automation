@@ -82,14 +82,29 @@ def make_job(monkeypatch):
                                 (*nts_matcher_task.NTS_MATCH_COUNTIES, county))
         return job.id
 
+    def again(job_id: str) -> str:
+        """A second pending job of the same scraper: it re-finds the same leads."""
+        with SyncSessionLocal() as s:
+            first = s.get(Job, job_id)
+            job = Job(id=str(uuid.uuid4()), user_id=first.user_id,
+                      scraper_config_id=first.scraper_config_id,
+                      status="pending", trigger="manual")
+            s.add(job)
+            s.commit()
+            return job.id
+
+    make.again = again
+    # The same leads on every run of this test, so a second run sees prior claims.
+    seed = uuid.uuid4().hex
+
     async def _portal(*_a, **_k):
         return [
             ScrapedRecord(
                 date_recorded="10/01/2026", party_name=f"Estate Of Wiring {i}",
-                doc_type="Probate", parcel_id=f"P007{i}{uuid.uuid4().hex[:8]}",
+                doc_type="Probate", parcel_id=f"P007{i}{seed[:8]}",
                 property_address=f"{100 + i} Wiring Ave, Seattle, WA 98101",
                 mailing_address=f"{100 + i} Wiring Ave, Seattle, WA 98101",
-                raw_html_hash=uuid.uuid4().hex,
+                raw_html_hash=f"{seed[:24]}{i:08d}",
             )
             for i in range(_RECORDS)
         ]
@@ -224,24 +239,75 @@ def test_a_failed_completion_line_is_not_an_enrichment_failure(
     job_id = make_job()
     monkeypatch.setattr(tasks, "enrichment_completion_log", _crash)
     _apply(job_id)
-    _job, markers, _logs, _alerts, _claims = _outcome(job_id)
+    job, markers, _logs, _alerts, _claims = _outcome(job_id)
     assert [m.reason for m in markers] == []
+    # ...and it does not cost the customer the delivery either.
+    assert job.status == "done"
+    assert job.billing_applied_at is not None
 
 
-@pytest.mark.parametrize(("module", "attr"), [
-    (tasks, "_run_inline_enrichment"),
-    (dedup, "transfer_undelivered_claims"),
-    (tasks, "_upsert_property_membership"),
-])
-def test_a_time_limit_in_a_phase_escapes_unmarked(make_job, redis_client, monkeypatch,
-                                                   module, attr):
-    """Out of time goes to the watchdog's retry path, never to a marker or DONE."""
-    job_id = make_job()
+def test_one_failed_claim_transfer_inside_the_loop_marks_the_run(
+        make_job, redis_client, monkeypatch):
+    """The per-hash catch inside transfer_undelivered_claims used to swallow it
+    before the caller's handler could see it (Codex)."""
+    first = make_job()
+    _apply(first)
+    second = make_job.again(first)
+    monkeypatch.setattr(dedup, "_transfer_one_claim", _crash)
+    _apply(second)
+    job, markers, _logs, _alerts, _claims = _outcome(second)
+    assert job.status == "done"
+    assert [(m.reason, m.exc_type) for m in markers] == [
+        ("claim_transfer", "_PhaseCrashError")]
+
+
+def test_a_time_limit_inside_the_claim_transfer_loop_escapes_unmarked(
+        make_job, redis_client, monkeypatch):
+    first = make_job()
+    _apply(first)
+    second = make_job.again(first)
 
     def out_of_time(*_a, **_k):
         raise SoftTimeLimitExceeded()
 
-    monkeypatch.setattr(module, attr, out_of_time)
+    monkeypatch.setattr(dedup, "_transfer_one_claim", out_of_time)
+    result = _apply(second)
+    assert isinstance(result.result, SoftTimeLimitExceeded)
+    job, markers, _logs, _alerts, _claims = _outcome(second)
+    assert job.status not in ("done", "failed")
+    assert markers == []
+
+
+def _out_of_time(*_a, **_k):
+    raise SoftTimeLimitExceeded()
+
+
+def _out_of_time_on_reexport():
+    """The first export calls it too; run out of time only on the re-export."""
+    real = tasks._result_rows_to_export_dicts
+    calls = {"n": 0}
+
+    def rows(*a, **k):
+        calls["n"] += 1
+        if calls["n"] > 1:
+            _out_of_time()
+        return real(*a, **k)
+
+    return rows
+
+
+@pytest.mark.parametrize(("module", "attr", "factory"), [
+    (tasks, "_run_inline_enrichment", lambda: _out_of_time),
+    (dedup, "transfer_undelivered_claims", lambda: _out_of_time),
+    (tasks, "reserve_job_quota", lambda: _out_of_time),  # the plan cap
+    (tasks, "_result_rows_to_export_dicts", _out_of_time_on_reexport),
+    (tasks, "_upsert_property_membership", lambda: _out_of_time),
+], ids=["enrichment", "claim_transfer", "plan_cap", "reexport", "membership"])
+def test_a_time_limit_in_a_phase_escapes_unmarked(make_job, redis_client, monkeypatch,
+                                                   module, attr, factory):
+    """Out of time goes to the watchdog's retry path, never to a marker or DONE."""
+    job_id = make_job()
+    monkeypatch.setattr(module, attr, factory())
     result = _apply(job_id)
     assert isinstance(result.result, SoftTimeLimitExceeded)
     job, markers, _logs, alerts, claims = _outcome(job_id)

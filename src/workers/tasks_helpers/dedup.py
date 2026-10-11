@@ -887,8 +887,12 @@ def transfer_undelivered_claims(db, job_id: str, user_id, record_type=None) -> i
     'superseded'.
 
     Returns the number of claims transferred (each un-flags exactly one row).
+    If any hash failed, every other hash still gets its chance and keeps its
+    commit, then the first failure is raised so the run is marked degraded
+    (P0-07): a lead left hidden as "already delivered" must not finish silently.
     """
     from src.api.lead_actionability import actionable_sql
+    from src.utils.celery_limits import reraise_time_limit
 
     uid = str(user_id)
     candidates = db.execute(
@@ -906,6 +910,7 @@ def transfer_undelivered_claims(db, job_id: str, user_id, record_type=None) -> i
         groups[row.dedup_hash].append(dict(row._mapping))
 
     transferred = 0
+    first_failure: Exception | None = None
     # Sorted: a stable lock order across concurrent runs of the same user.
     for dedup_hash in sorted(groups):
         try:
@@ -913,15 +918,18 @@ def transfer_undelivered_claims(db, job_id: str, user_id, record_type=None) -> i
                                    groups[dedup_hash], record_type):
                 transferred += 1
         except Exception as exc:
-            # One hash's failure must not hide the claims already moved: each
-            # commits on its own, and the caller subtracts the returned count
-            # from the run's duplicate total. Rolled back, logged with the job and
-            # a hash prefix, and the remaining hashes still get their chance.
+            # One hash's failure must not undo the claims already moved: each
+            # commits on its own. Rolled back, logged with the job and a hash
+            # prefix, and the remaining hashes still get their chance.
+            reraise_time_limit(exc)
             db.rollback()
             _logger.warning(
                 "Job %s: claim transfer failed for hash %s: %s",
                 job_id, dedup_hash[:12], str(exc)[:160],
             )
+            first_failure = first_failure or exc
+    if first_failure is not None:
+        raise first_failure
     return transferred
 
 

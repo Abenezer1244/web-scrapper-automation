@@ -682,15 +682,17 @@ def _deliver(
         # Enqueue on Celery so a transient Resend failure is retried instead of
         # dropped. The delivery_started_at CAS above already guarantees this runs
         # at most once per batch, so enqueue-once + retry-on-failure is safe.
-        deliver_job_email.delay(
-            job_id=str(run.id),
-            scraper_name=batch.name or "Batch scrape",
-            record_count=lead_count,
-            download_url=url,
-            recipient_emails=emails,
-            summary_message=summary,
-            link_expires=False,  # in-app batch page — not a presigned URL (Codex P2)
-        )
+        from src.utils.crypto import seal_task_args
+
+        # P0-04b: recipients travel sealed; only the run id is readable in the broker.
+        deliver_job_email.delay(job_id=str(run.id), sealed=seal_task_args({
+            "scraper_name": batch.name or "Batch scrape",
+            "record_count": lead_count,
+            "download_url": url,
+            "recipient_emails": emails,
+            "summary_message": summary,
+            "link_expires": False,  # in-app batch page — not a presigned URL (Codex P2)
+        }))
     except Exception as exc:  # enqueue is best-effort — the CSV is in R2 either way
         # The delivery_started_at CAS above is already consumed, so no future
         # finalizer will retry this batch email — surface the miss to ops (the

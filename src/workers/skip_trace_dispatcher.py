@@ -2224,12 +2224,9 @@ def _redrive_completed_queue(queue: dict) -> None:
     try:
         from src.workers.tracerfy_ingest import ingest_tracerfy_batch
 
-        ingest_tracerfy_batch.delay(
-            queue_id=queue["id"],
-            download_url=download_url,
-            rows_uploaded=queue.get("rows_uploaded", 0),
-            credits_deducted=queue.get("credits_deducted", 0),
-        )
+        # P0-04b: the queue id only; the task reads link and counts from the
+        # provider's record, so the bearer link never sits in the broker.
+        ingest_tracerfy_batch.delay(queue_id=queue["id"])
         _logger.info(
             "Reconciliation: re-drove ingest for completed Tracerfy queue %s",
             queue["id"],

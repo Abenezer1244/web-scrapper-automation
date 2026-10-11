@@ -31,10 +31,6 @@ REASONS: dict[str, str] = {
         "Address lookup stopped early. Some leads may be missing an address or "
         "owner details, and contact lookup did not run for this search."
     ),
-    "enrichment_time_limit": (
-        "Address lookup ran out of time. Some leads may be missing an address or "
-        "owner details, and contact lookup did not run for this search."
-    ),
     "nts_match": (
         "Auction details could not be added yet. They are filled in on the next "
         "daily update; your download will include them then."
@@ -127,9 +123,11 @@ def record_degraded(db, r, job_id: str, reason: str, exc: BaseException | None) 
 
     send_ops_alert(
         "job_degraded", f"{job_id}:{reason}",
-        f"Job finished degraded: {reason}",
-        f"Job {job_id} reached DONE, but its '{reason}' phase failed ({exc_type or 'unknown'}). "
-        f"The customer's job log says so. "
+        f"Job degraded: {reason}",
+        # Not "reached DONE": a later phase can still fail the attempt, and a retry
+        # may then complete. The marker is the history of this phase failing.
+        f"Job {job_id}: its '{reason}' phase failed ({exc_type or 'unknown'}) and the "
+        f"run carried on. The customer's job log says so. "
         + ("Repair is automatic (skip-trace re-enqueue beat)." if repair == "pending"
            else "Recover with the matching backfill script if the customer needs it."),
     )

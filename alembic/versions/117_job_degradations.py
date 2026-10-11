@@ -37,7 +37,7 @@ depends_on = None
 
 # Keep in step with src/workers/tasks_helpers/degradation.py REASONS.
 _REASONS = (
-    "enrichment", "enrichment_time_limit", "nts_match", "survivor_reelection",
+    "enrichment", "nts_match", "survivor_reelection",
     "claim_transfer", "skip_trace_enqueue", "property_key", "property_membership",
     "owner_flags", "claim_release",
 )

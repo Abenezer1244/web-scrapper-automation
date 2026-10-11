@@ -36,6 +36,7 @@ from src.scrapers.probate import (
     should_include_probate_row,
 )
 from src.utils.address_intel import compute_owner_flags
+from src.utils.celery_limits import reraise_time_limit
 from src.utils.logger import setup_logger
 from src.workers import app
 from src.workers.property_identity import (
@@ -59,6 +60,10 @@ from src.workers.tasks_helpers.dedup import (  # noqa: F401  (re-export)
     _upsert_property_membership,
     _write_result_property_keys,
     validate_tax_delinquent_records,
+)
+from src.workers.tasks_helpers.degradation import (
+    DegradationNotRecordedError,
+    record_degraded,
 )
 from src.workers.tasks_helpers.enrich import (  # noqa: F401  (re-export)
     _enqueue_skip_trace_rows,
@@ -1709,16 +1714,21 @@ def run_scrape_job(self, job_id: str) -> None:
             enrich_summary: dict = {}
             _run_inline_enrichment(db, job, r, job_id, config, summary=enrich_summary,
                                    attempt_token=attempt_token)
+        except (SoftTimeLimitExceeded, TimeLimitExceeded):
+            # Out of time is the attempt's problem, not a degraded result: the
+            # watchdog retries it (see the scrape's own handler). No marker, which
+            # a retry that then completes would carry as a false one forever.
+            raise
+        except Exception as exc:
+            db.rollback()
+            _logger.warning("Inline enrichment error: %s", str(exc)[:200])
+            record_degraded(db, r, job_id, "enrichment", exc)
+        else:
+            # Outside the try: a failed live-log push after a completed enrichment
+            # is not an enrichment failure (Codex).
             _enrichment_ok = True
             _level, _msg = enrichment_completion_log(enrich_summary)
             _publish_log(r, job_id, _level, _msg, db=db)
-        except Exception as exc:
-            _logger.warning("Inline enrichment error: %s", str(exc)[:200])
-            _publish_log(
-                r, job_id, "warning",
-                "Address enrichment failed. Leads were delivered without enriched fields.",
-                db=db,
-            )
 
         # NTS Tier 1: attach matched trustee-sale auction data onto a pre_foreclosure
         # job's leads (any county with an NTS source — Pierce/Snohomish, King later).
@@ -1738,8 +1748,10 @@ def run_scrape_job(self, job_id: str) -> None:
                     if n:
                         _logger.info("Job %s: NTS auction data matched onto %d leads", job_id, n)
             except Exception as exc:
+                reraise_time_limit(exc)
                 db.rollback()
                 _logger.warning("Job %s: NTS inline match failed: %s", job_id, str(exc)[:120])
+                record_degraded(db, r, job_id, "nts_match", exc)
 
         # Re-elect each same-run group's survivor now that enrichment has
         # settled. collapse_same_run_siblings had to run before the export and
@@ -1776,10 +1788,12 @@ def run_scrape_job(self, job_id: str) -> None:
                     job_id, _swapped,
                 )
         except Exception as exc:
+            reraise_time_limit(exc)
             db.rollback()
             _logger.warning(
                 "Job %s: same-run reconciliation failed: %s", job_id, str(exc)[:160]
             )
+            record_degraded(db, r, job_id, "survivor_reelection", exc)
 
         # Take over any claim whose holder never delivered the lead: an earlier
         # run's address-less row pins a property that THIS run found with an
@@ -1801,10 +1815,12 @@ def run_scrape_job(self, job_id: str) -> None:
                     "ever delivering the lead", job_id, _transferred,
                 )
         except Exception as exc:
+            reraise_time_limit(exc)
             db.rollback()
             _logger.warning(
                 "Job %s: claim transfer failed: %s", job_id, str(exc)[:160]
             )
+            record_degraded(db, r, job_id, "claim_transfer", exc)
 
         # Fetch post-enrichment rows ONCE; reused by re-export AND membership.
         # Same deterministic order as the in-app download (jobs.py) so the emailed/
@@ -1853,8 +1869,10 @@ def run_scrape_job(self, job_id: str) -> None:
                     db.commit()
                     _logger.info("Job %s: owner flags recomputed for %d rows", job_id, _owner_changed)
             except Exception as exc:
+                reraise_time_limit(exc)
                 db.rollback()
                 _logger.warning("Job %s: owner-flag recompute failed: %s", job_id, str(exc)[:120])
+                record_degraded(db, r, job_id, "owner_flags", exc)
 
         # ── APPLY THE PLAN CAP (after enrichment, before delivery) ───────────
         # Every scraped row was persisted and enriched, so actionability is now
@@ -2056,10 +2074,12 @@ def run_scrape_job(self, job_id: str) -> None:
                     attempt_token=attempt_token,
                 )
             except Exception as exc:
+                reraise_time_limit(exc)
                 db.rollback()
                 _logger.warning(
                     "Job %s: skip trace enqueue failed: %s", job_id, str(exc)[:160]
                 )
+                record_degraded(db, r, job_id, "skip_trace_enqueue", exc)
 
         # Reload the rows every consumer below reads, for EVERY plan.
         #
@@ -2164,6 +2184,7 @@ def run_scrape_job(self, job_id: str) -> None:
                     job_id, _pk_updated, _pk_weak,
                 )
             except Exception as exc:
+                reraise_time_limit(exc)
                 try:
                     db.rollback()
                 except Exception:
@@ -2172,6 +2193,7 @@ def run_scrape_job(self, job_id: str) -> None:
                     "Job %s: property_key write FAILED (heal via backfill): %s",
                     job_id, str(exc)[:200],
                 )
+                record_degraded(db, r, job_id, "property_key", exc)
 
         # ── PHASE 1: PROPERTY MEMBERSHIP (cross-list overlap rollup) ─────────
         # Strong-identity rollup keyed (user_id, record_type, property_key),
@@ -2194,6 +2216,7 @@ def run_scrape_job(self, job_id: str) -> None:
                 # _set_status(... "done") write can still succeed (Codex review:
                 # the helper only rolls back OperationalError, not e.g.
                 # ProgrammingError/IntegrityError/RLS errors).
+                reraise_time_limit(exc)
                 try:
                     db.rollback()
                 except Exception:
@@ -2202,6 +2225,7 @@ def run_scrape_job(self, job_id: str) -> None:
                     "Job %s: property membership upsert FAILED (heal via backfill): %s",
                     job_id, str(exc)[:200],
                 )
+                record_degraded(db, r, job_id, "property_membership", exc)
 
         # Billing and the done transition, in one transaction: moved verbatim to
         # src/workers/tasks_helpers/finalize.py so the tests run production code.
@@ -2232,6 +2256,20 @@ def run_scrape_job(self, job_id: str) -> None:
         except Exception as exc:  # noqa: BLE001 -- never fails a delivered run
             db.rollback()
             _logger.warning("Job %s: claim release failed: %s", job_id, type(exc).__name__)
+            # Recorded AFTER DONE, so outside the "marked before DONE" guarantee.
+            # The run is delivered and billed: an unrecordable marker must not
+            # skip the delivery below (and on_failure could not fail a done job).
+            try:
+                record_degraded(db, r, job_id, "claim_release", exc)
+            except DegradationNotRecordedError:
+                from src.workers.ops_alerts import send_ops_alert
+
+                send_ops_alert(
+                    "job_degraded", f"{job_id}:claim_release",
+                    "Job degraded marker not recorded: claim_release",
+                    f"Job {job_id} is done, but its parcel-less claim release failed "
+                    f"({type(exc).__name__}) and the degraded marker could not be written.",
+                )
 
         if user.records_limit != -1 and user.records_used > user.records_limit:
             overage = user.records_used - user.records_limit

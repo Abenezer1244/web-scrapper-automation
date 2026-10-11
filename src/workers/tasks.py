@@ -112,7 +112,8 @@ _R2_UPLOAD_BACKOFF = 2  # seconds, multiplied by attempt number (2s, 4s)
 
 
 def _upload_export_with_retry(exporter, local_file, object_key) -> tuple[bool, Exception | None]:
-    """Upload an export to R2 with bounded retries. Never raises.
+    """Upload an export to R2 with bounded retries. Raises only a Celery time limit,
+    which belongs to the watchdog's retry path, not to an upload failure.
 
     Returns ``(ok, last_exception)``: ``(True, None)`` on the first successful
     upload, else ``(False, <last error>)`` after exhausting the attempts. R2
@@ -126,6 +127,7 @@ def _upload_export_with_retry(exporter, local_file, object_key) -> tuple[bool, E
             exporter.upload_to_r2(local_file, object_key)
             return True, None
         except Exception as exc:
+            reraise_time_limit(exc)
             last_exc = exc
             _logger.warning(
                 "R2 upload attempt %d/%d failed: %s",

@@ -235,9 +235,17 @@ def test_enrichment_failure_no_longer_writes_the_old_line_or_queues_contacts(
 
 def test_a_failed_completion_line_is_not_an_enrichment_failure(
         make_job, redis_client, monkeypatch):
-    """Codex P1: the completion log ran inside the enrichment try."""
+    """Codex P1: the completion log ran inside the enrichment try. Here the line
+    is stored and its live push then fails, as a Redis outage would."""
     job_id = make_job()
-    monkeypatch.setattr(tasks, "enrichment_completion_log", _crash)
+    real = tasks._publish_log
+
+    def publish(r, jid, level, message, **k):
+        real(r, jid, level, message, **k)
+        if message.startswith("Enrichment complete"):
+            raise ConnectionError("redis unavailable")
+
+    monkeypatch.setattr(tasks, "_publish_log", publish)
     _apply(job_id)
     job, markers, _logs, _alerts, _claims = _outcome(job_id)
     assert [m.reason for m in markers] == []
@@ -253,9 +261,19 @@ def test_one_failed_claim_transfer_inside_the_loop_marks_the_run(
     first = make_job()
     _apply(first)
     second = make_job.again(first)
-    monkeypatch.setattr(dedup, "_transfer_one_claim", _crash)
+    real = dedup._transfer_one_claim
+    tried: list[str] = []
+
+    def one_fails(db, job_id, uid, user_id, dedup_hash, *a, **k):
+        tried.append(dedup_hash)
+        if len(tried) == 1:
+            _crash()
+        return real(db, job_id, uid, user_id, dedup_hash, *a, **k)
+
+    monkeypatch.setattr(dedup, "_transfer_one_claim", one_fails)
     _apply(second)
     job, markers, _logs, _alerts, _claims = _outcome(second)
+    assert len(set(tried)) == _RECORDS  # the failure did not stop the other hashes
     assert job.status == "done"
     assert [(m.reason, m.exc_type) for m in markers] == [
         ("claim_transfer", "_PhaseCrashError")]
@@ -282,6 +300,22 @@ def _out_of_time(*_a, **_k):
     raise SoftTimeLimitExceeded()
 
 
+def _out_of_time_on_upload(nth: int):
+    """R2 runs out of time on upload number ``nth`` (1 = first export, 2 = re-export)."""
+    def factory():
+        calls = {"n": 0}
+
+        def upload(self, path, key):
+            calls["n"] += 1
+            if calls["n"] == nth:
+                _out_of_time()
+            return key
+
+        return upload
+
+    return factory
+
+
 def _out_of_time_on_reexport():
     """The first export calls it too; run out of time only on the re-export."""
     real = tasks._result_rows_to_export_dicts
@@ -301,8 +335,11 @@ def _out_of_time_on_reexport():
     (dedup, "transfer_undelivered_claims", lambda: _out_of_time),
     (tasks, "reserve_job_quota", lambda: _out_of_time),  # the plan cap
     (tasks, "_result_rows_to_export_dicts", _out_of_time_on_reexport),
+    (DataExporter, "upload_to_r2", _out_of_time_on_upload(1)),
+    (DataExporter, "upload_to_r2", _out_of_time_on_upload(2)),
     (tasks, "_upsert_property_membership", lambda: _out_of_time),
-], ids=["enrichment", "claim_transfer", "plan_cap", "reexport", "membership"])
+], ids=["enrichment", "claim_transfer", "plan_cap", "reexport", "first_upload",
+        "reexport_upload", "membership"])
 def test_a_time_limit_in_a_phase_escapes_unmarked(make_job, redis_client, monkeypatch,
                                                    module, attr, factory):
     """Out of time goes to the watchdog's retry path, never to a marker or DONE."""

@@ -19,6 +19,47 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-10-11 — UX 3.14: the Results header toolbar fits at 320 (3.10c backlog)
+
+**Built / Shipped:** bridgeleads-web **#267** (a23f88d), one file, `app/(dashboard)/results/[id]/page.tsx`.
+At 320px the Results page scrolled sideways by 23px. The header toolbar was `shrink-0`, so it kept its
+one-line width (two buttons, 327px) inside a 288px column and its own `flex-wrap` never fired. It is now
+`flex min-w-0 max-w-full flex-wrap items-center gap-2 sm:max-w-none sm:shrink-0`: below `sm` it caps at the
+column and wraps; from `sm` up it is unchanged. No copy change, no backend or contract impact.
+
+**Tried / Decided:** Codex PLAN review ran six rounds (r1 NO-GO; r2 was reaped by the memory reaper last
+session and rerun; r2-r5 NO-GO, each folded in; r6 GO with no findings). Codex never faulted the class
+change; every finding tightened the proof: causal isolation (hide the toolbar, the overflow must go), artifact
+identity (master built from its own clean detached commit rather than a file swap, an empty `.next` per build,
+the served toolbar's class token set checked), an eight-state toolbar matrix with exact controls, settling the
+lookup gate and the entrance animation before measuring, header comparisons at 640 / 768 / 1440, and stating
+how a production build reaches the external stub (build-time `NEXT_PUBLIC_API_URL`, `bypassCSP`, per-state
+stub receipt). `sm:max-w-none` was added at r3 so the desktop class is literally equivalent.
+
+**Failed / Blocked:** my first `gh pr merge` was denied by the auto-mode classifier ("Merge Without
+Review") despite the standing owner permission; I released the peer's merge hold and asked; the owner said
+"merge it yourself" and the retry merged. Rig bugs on the first master runs (not product bugs): the stub
+answered the contact-lookup quote POST with `{}` and then with `pause: null`, so the dialog threw and never
+opened (a quote's `pause` is required and non-null); and the S2 `/auth/me` body was evicted before it was
+read (now read in a response listener as it arrives).
+
+**Caught & fixed:** Codex r2 found S3 renders the lookup button too (a delivered run with leads), and r3 that
+the toolbar container renders for every loaded job (only its buttons are conditional). Proof, production
+builds, fine + coarse pointer: master S1 at 320 = content box 16-304, toolbar 327.22px, buttons 152 / 167px
+(each fits), overflow 23px, toolbar hidden -> 0px; master also overflows in S2 (58px), S3 (56px), S5 (23px).
+Master 110 pass / 2 SEMANTIC fail (S1, as planned); branch 134 pass / 0 fail (SEMANTIC 10, REGRESSION 124).
+Gates: tsc, eslint, `next build --webpack`, `test:unit` 24/24, 1 file, 0 em dashes added; §14 twice clean;
+Codex diff gate PASS (r1, no findings); CI + Vercel Production success; MERGING NOW / VERIFIED with -2e.
+
+**Pending / Handoff:** named follow-ups for the owner to choose: (1) implicit count formats app-wide,
+(2) dates in a non-US browser, (3) backend thousands separators in stage labels. Still owner-only from 3.13:
+the 7-day `/records` access-log watch (from 2026-10-11 06:34 UTC) and the production DDL follow-ups.
+
+**Facts learned:** a flex item with `flex-shrink: 0` keeps its max-content width even after its row wraps it
+onto its own line, so its own `flex-wrap` never triggers; the fix is to let it shrink only below the
+breakpoint. The contact-lookup dialog cannot render without a full quote (`pause` included). A Playwright
+response body read after navigation can be gone; capture it in the listener.
+
 ## 2026-10-11 — UX 3.13: the backend records endpoint is retired (F-047 BE follow-up, S3-21)
 
 **Built / Shipped:** owner-chosen follow-up (4). Backend `GET /scrapers/{config_id}/records`, the endpoint

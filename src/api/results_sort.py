@@ -33,7 +33,7 @@ from sqlalchemy import JSON, Integer, Text, and_, case, cast, func, literal_colu
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects.postgresql import ARRAY
 
-from src.db.models import CountyRecord, Result
+from src.db.models import Result
 from src.utils.source_dates import SNOHOMISH_TRIBUNE_SOURCE
 
 ResultsSort = Literal["date_desc", "date_asc"]
@@ -216,19 +216,3 @@ def results_order_by(record_type: str | None, sort: ResultsSort) -> list:
     # Explicit in both directions: Postgres puts NULLs FIRST on DESC by default,
     # which would open the page with the undated rows.
     return [ordered.nulls_last(), Result.id.asc()]
-
-
-def cached_records_order_by() -> list:
-    """ORDER BY clauses for the cached records page (GET /scrapers/{id}/records).
-
-    The cache is refreshed in batches that share one scraped_at (Benton: 2,574 rows,
-    one timestamp), so scraped_at alone left each batch in heap order. It stays the
-    primary key, which the "new since you last looked" feed depends on; within a batch
-    rows run newest date first, undated last, and id makes the order total.
-    county_records has no parsed date column, so the text is parsed here.
-    """
-    return [
-        CountyRecord.scraped_at.desc(),
-        _text_date(CountyRecord.date_recorded).desc().nulls_last(),
-        CountyRecord.id.asc(),
-    ]

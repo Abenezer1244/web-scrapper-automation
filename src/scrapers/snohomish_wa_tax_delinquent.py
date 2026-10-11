@@ -656,10 +656,9 @@ def parse_tax_list(
         # filing or delinquency date; "01/01/<year>" asserted an event that never
         # happened. The year is surfaced as oldest_tax_year / delinquent_bill_year.
         rec.date_recorded = None
-        # doc_type left None (like King tax rows): the daily-cache records filter
-        # for tax_delinquent matches `doc_type IS NULL` OR keyword ILIKE patterns
-        # ("TAX DELINQUENT", ...); the slug "tax_delinquent" would match neither
-        # and hide these rows from /scrapers/{id}/records (Codex P2).
+        # doc_type left None (like King tax rows): a tax roll is not a recorded
+        # instrument, so there is no document type to store. The record type comes
+        # from the scraper config (tax_delinquent), not from this field.
         rec.enrichment_data = {
             "source": _SOURCE,
             # Source-gated structured tax fields read by _extract_tax_fields.

@@ -5,8 +5,7 @@ fallback used by Results ordering and the Segments stand-in filter. results_sort
 guards _month_name_date and _iso_date, which feed Results ordering and the Segments filing-date
 windows. The junk values are real shapes from prod Pierce rows (instrument numbers and scraped
 UI text in date_recorded): they must parse as "no date", never fail a query. Evaluated by
-PostgreSQL, no mocks. (Moved here in UX 3.13b from the retired cached-records test file,
-unchanged.)
+PostgreSQL, no mocks. (Moved here unchanged in UX 3.13b.)
 """
 import pytest
 from sqlalchemy import literal, select

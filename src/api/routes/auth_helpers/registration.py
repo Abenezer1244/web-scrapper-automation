@@ -103,8 +103,10 @@ async def _notify_existing_account(email: str) -> None:
     if not await once_per(key, _DUP_SIGNUP_NOTICE_TTL):
         return
     try:
+        from src.utils.crypto import seal_task_args
         from src.workers.onboarding_emails import send_duplicate_signup_email
-        send_duplicate_signup_email.delay(email)
+        # P0-04b: the address travels sealed, never as a plain broker argument.
+        send_duplicate_signup_email.delay(sealed=seal_task_args({"email": email}))
     except Exception as exc:  # noqa: BLE001 — never break the response on a broker blip
         # The gate was claimed but the enqueue failed: RELEASE it so the next
         # attempt within 24h can retry, and log a PII-safe warning (class only).

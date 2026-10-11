@@ -539,10 +539,7 @@ def _defer_until_provider_complete(queue_id: int, rechecks: int) -> dict:
     if rechecks < _PROVIDER_RECHECKS:
         try:
             ingest_tracerfy_batch.apply_async(
-                kwargs={
-                    "queue_id": queue_id, "download_url": "",
-                    "provider_rechecks": rechecks + 1,
-                },
+                kwargs={"queue_id": queue_id, "provider_rechecks": rechecks + 1},
                 countdown=_PROVIDER_RECHECK_SECONDS,
             )
             _logger.warning(

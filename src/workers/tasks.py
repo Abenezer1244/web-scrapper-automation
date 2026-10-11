@@ -2255,14 +2255,17 @@ def run_scrape_job(self, job_id: str) -> None:
         if emails and object_key:
             try:
                 download_url = _delivery_download_url(job_id, job.user_id, object_key, exporter)
-                deliver_job_email.delay(
-                    job_id=job_id,
-                    scraper_name=config.name,
-                    record_count=display_count,
-                    download_url=download_url,
-                    recipient_emails=emails,
-                    fmt=fmt,
-                )
+                from src.utils.crypto import seal_task_args
+
+                # P0-04b: recipients and the tokenized link travel sealed; only
+                # the job id is readable in the broker.
+                deliver_job_email.delay(job_id=job_id, sealed=seal_task_args({
+                    "scraper_name": config.name,
+                    "record_count": display_count,
+                    "download_url": download_url,
+                    "recipient_emails": emails,
+                    "fmt": fmt,
+                }))
             except Exception as email_exc:
                 # Most common cause: API_BASE_URL unset in prod (the URL builder
                 # raises). Was silently swallowed — now surfaced to ops so a
@@ -2315,7 +2318,12 @@ def run_scrape_job(self, job_id: str) -> None:
                     download_url=signed_download,
                     webhook_secret=webhook_secret,
                 )
-                deliver_job_webhook.delay(job_id, webhook_url, payload)
+                from src.utils.crypto import seal_task_args
+
+                # P0-04b: the URL (can carry a secret) and the signed download link
+                # in the payload travel sealed.
+                deliver_job_webhook.delay(
+                    job_id, sealed=seal_task_args({"url": webhook_url, "payload": payload}))
                 # Host-only — a webhook URL can carry secrets in its path/query,
                 # and this log line is surfaced to the user's job log (Codex).
                 from urllib.parse import urlparse

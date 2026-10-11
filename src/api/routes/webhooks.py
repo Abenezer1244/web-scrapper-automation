@@ -141,12 +141,10 @@ async def _process_tracerfy_webhook(request: Request) -> dict:
     # forged/malformed first webhook for a real queue_id suppress the genuine
     # retry for the whole TTL — net-negative versus the worker's DB guard.
     from src.workers.tracerfy_ingest import ingest_tracerfy_batch
-    ingest_tracerfy_batch.delay(
-        queue_id=queue_id,
-        download_url=download_url,
-        rows_uploaded=payload.get("rows_uploaded", 0),
-        credits_deducted=payload.get("credits_deducted", 0),
-    )
+    # P0-04b: the queue id only. The signed download link and the counts are
+    # read from Tracerfy's own record by the task (audit #5 S3-15), so the
+    # bearer link never sits in the broker.
+    ingest_tracerfy_batch.delay(queue_id=queue_id)
 
     return {"received": True, "queue_id": queue_id}
 

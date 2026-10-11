@@ -328,8 +328,13 @@ def _dialer_push_sweep_impl() -> None:
                             "dialer_webhook_url": url,
                             "dialer_webhook_secret": deliver.get("dialer_webhook_secret"),
                         }
+                        from src.utils.crypto import seal_task_args
+
+                        # P0-04b: the leads (names, phones, emails, addresses) and
+                        # the URL travel sealed; only the job id is readable.
                         for req in connector.build_requests(leads, job_meta):
-                            deliver_job_webhook.delay(str(job.id), req["url"], req["payload"])
+                            deliver_job_webhook.delay(str(job.id), sealed=seal_task_args(
+                                {"url": req["url"], "payload": req["payload"]}))
                     pushed += 1
                     _logger.info(
                         "Dialer push queued for job %s: %d of %d dialer-ready leads (%s)",

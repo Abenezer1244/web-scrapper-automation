@@ -187,3 +187,81 @@ def test_tracerfy_ingest_no_longer_requires_the_download_url():
 
     params = inspect.signature(ingest_tracerfy_batch.run).parameters
     assert params["download_url"].default == ""
+
+
+# ── release B: producers send only an id + sealed ────────────────────────────
+
+_SEALED_TASKS = {"deliver_job_email", "deliver_job_webhook", "send_duplicate_signup_email",
+                 "ingest_tracerfy_batch"}
+_ALLOWED_KWARGS = {"job_id", "queue_id", "sealed", "kwargs", "countdown"}
+_ALLOWED_INNER_KWARGS = {"queue_id", "provider_rechecks", "job_id", "sealed"}
+
+
+def _plaintext_enqueues(source: str, filename: str) -> list[str]:
+    """Every .delay / .apply_async of a sealed task that passes more than an id
+    (one positional, or job_id / queue_id) plus `sealed`."""
+    import ast
+
+    bad = []
+    for node in ast.walk(ast.parse(source)):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr in ("delay", "apply_async")
+                and isinstance(node.func.value, ast.Name) and node.func.value.id in _SEALED_TASKS):
+            continue
+        where = f"{filename}:{node.lineno}"
+        # Only the webhook task takes a positional, and it is the job id; any
+        # other positional is a plaintext value (e.g. the duplicate-signup email).
+        if len(node.args) > (1 if node.func.value.id == "deliver_job_webhook" else 0):
+            bad.append(f"{where} positional args")
+        for kw in node.keywords:
+            if kw.arg not in _ALLOWED_KWARGS:
+                bad.append(f"{where} {kw.arg}=")
+            if kw.arg == "kwargs" and isinstance(kw.value, ast.Dict):
+                bad += [f"{where} kwargs[{k.value}]" for k in kw.value.keys
+                        if isinstance(k, ast.Constant) and k.value not in _ALLOWED_INNER_KWARGS]
+    return bad
+
+
+def test_no_producer_enqueues_plaintext_arguments():
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parents[1] / "src"
+    bad = [b for f in src.rglob("*.py")
+           for b in _plaintext_enqueues(f.read_text(encoding="utf-8"), str(f.relative_to(src)))]
+    assert bad == []
+
+
+def test_the_policy_check_flags_the_old_calls():
+    old = (
+        "deliver_job_email.delay(job_id=j, scraper_name=n, recipient_emails=e)\n"
+        "deliver_job_webhook.delay(j, url, payload)\n"
+        "send_duplicate_signup_email.delay(email)\n"
+        "ingest_tracerfy_batch.delay(queue_id=q, download_url=u)\n"
+        "ingest_tracerfy_batch.apply_async(kwargs={'queue_id': q, 'download_url': ''})\n"
+    )
+    assert len(_plaintext_enqueues(old, "old.py")) == 6
+
+
+async def test_the_real_duplicate_signup_message_carries_no_address():
+    # Published through Celery to the test Redis broker; before_task_publish
+    # sees exactly what the broker stores (body + headers, incl. kwargsrepr,
+    # which is what a worker's "Received task" line prints).
+    from celery.signals import before_task_publish
+
+    from src.api.routes.auth_helpers.registration import _notify_existing_account
+
+    published: list[tuple] = []
+
+    def _capture(sender=None, body=None, headers=None, **_kw):
+        published.append((sender, body, headers))
+
+    before_task_publish.connect(_capture, weak=False)
+    try:
+        await _notify_existing_account(f"jane+{uuid.uuid4().hex[:8]}@marker.example")
+    finally:
+        before_task_publish.disconnect(_capture)
+    (sender, body, headers), = [p for p in published if p[0].endswith("send_duplicate_signup_email")]
+    wire = json.dumps([body, headers], default=str).lower()
+    assert "marker" not in wire and "jane" not in wire
+    sealed = body[1]["sealed"]
+    assert unseal_task_args(sealed, required=("email",))["email"].endswith("@marker.example")

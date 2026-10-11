@@ -122,7 +122,7 @@ def send_welcome_email(email: str) -> None:
 # ─── Duplicate signup: "you already have an account" ───────────────────────
 
 @app.task(name="src.workers.onboarding_emails.send_duplicate_signup_email")
-def send_duplicate_signup_email(email: str) -> None:
+def send_duplicate_signup_email(email: str | None = None, sealed: str | None = None) -> None:
     """Sent when someone submits /auth/register for an address that ALREADY has
     an account (the duplicate-email branch returns a generic 400 to the client to
     avoid user enumeration; this out-of-band note to the inbox owner is how a
@@ -136,7 +136,14 @@ def send_duplicate_signup_email(email: str) -> None:
     The copy intentionally does not over-confirm: it states only that a signup
     was ATTEMPTED for this address (which the inbox owner can see anyway) and
     offers login + reset. It does not echo any other account detail.
+
+    P0-04b: the address arrives in ``sealed`` (seal_task_args), never as a plain
+    broker argument; ``email`` remains for messages from the previous release.
     """
+    if sealed is not None:
+        from src.utils.crypto import unseal_task_args
+
+        email = unseal_task_args(sealed, required=("email",))["email"]
     login_url = frontend_routes.absolute(frontend_routes.LOGIN)
     reset_url = frontend_routes.absolute(frontend_routes.FORGOT_PASSWORD)
     subject = "You already have a BridgeLeads account"

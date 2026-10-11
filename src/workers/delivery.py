@@ -154,13 +154,14 @@ def _build_lead_delivery_email(
 def deliver_job_email(
     self,
     job_id: str,
-    scraper_name: str,
-    record_count: int,
-    download_url: str,
-    recipient_emails: list[str],
+    scraper_name: str | None = None,
+    record_count: int = 0,
+    download_url: str | None = None,
+    recipient_emails: list[str] | None = None,
     fmt: str = "csv",
     summary_message: str | None = None,
     link_expires: bool = True,
+    sealed: str | None = None,
 ) -> None:
     """Send the lead-delivery email via Resend, with retries.
 
@@ -177,7 +178,24 @@ def deliver_job_email(
 
     download_url is built by the caller (tokenized 48h link for a job; the in-app
     batch page for a batch) — its TTL vastly exceeds the retry window.
+
+    P0-04b: callers pass everything but job_id in ``sealed`` (see
+    seal_task_args), so recipients, the link and the name never sit in the broker
+    as plaintext. The plain keyword arguments remain for messages enqueued by the
+    previous release; a sealed envelope that does not open raises, never falls
+    back to them.
     """
+    if sealed is not None:
+        from src.utils.crypto import unseal_task_args
+
+        args = unseal_task_args(
+            sealed, required=("scraper_name", "record_count", "download_url", "recipient_emails"))
+        scraper_name, record_count = args["scraper_name"], args["record_count"]
+        download_url, recipient_emails = args["download_url"], args["recipient_emails"]
+        fmt = args.get("fmt", fmt)
+        summary_message = args.get("summary_message", summary_message)
+        link_expires = args.get("link_expires", link_expires)
+
     if not recipient_emails:
         _logger.info("No delivery emails for job %s — skipping", job_id)
         return
@@ -207,7 +225,10 @@ def deliver_job_email(
                 "Delivery email for job %s failed (attempt %d/%d, retryable): %s",
                 job_id, attempt, self.max_retries + 1, summary,
             )
-            raise self.retry(exc=exc, countdown=_BACKOFF_BASE * (5 ** self.request.retries))
+            # P0-04b: the retry stores exc in the result backend; Resend's message
+            # can echo the recipient, so it carries the summary, never the raw text.
+            raise self.retry(exc=RuntimeError(f"delivery email send failed: {summary}"),
+                             countdown=_BACKOFF_BASE * (5 ** self.request.retries))
         # Permanent failure, or retries exhausted — give up WITHOUT raising so a
         # delivery failure never marks the (already-done) scrape job as errored.
         # Surface it to ops so a silently-undelivered purchased email is visible

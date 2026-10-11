@@ -592,7 +592,7 @@ def _defer_until_provider_complete(queue_id: int, rechecks: int) -> dict:
 def ingest_tracerfy_batch(
     self,
     queue_id: int,
-    download_url: str,
+    download_url: str = "",  # P0-04b: callers stop sending it (a bearer link); never read
     rows_uploaded: int = 0,
     credits_deducted: int = 0,
     provider_rechecks: int = 0,

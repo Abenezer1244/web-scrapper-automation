@@ -23,6 +23,7 @@ process start (SECRET_KEY is validated elsewhere).
 import base64
 import hashlib
 import hmac
+import json
 import threading
 
 from cryptography.fernet import Fernet, InvalidToken, MultiFernet
@@ -180,6 +181,34 @@ def is_encrypted(value: str | None) -> bool:
     if value.startswith(_ENC_PREFIX):
         return _fernet_decrypt(value[len(_ENC_PREFIX):]) is not None
     return _fernet_decrypt(value) is not None
+
+
+# ─── Sealed Celery task arguments (P0-04b) ──────────────────────────────────
+# Task arguments sit in the Redis broker (and its retries) as JSON. Arguments
+# carrying PII or bearer links travel sealed instead: compact JSON, Fernet under
+# the same keys. Rotation: a sealed message is readable only while its key is
+# still in FIELD_ENCRYPTION_KEY, so keep the old key until queued and retrying
+# deliveries have drained (hours, not days).
+_SEAL_PREFIX = "tk1:"
+
+
+def seal_task_args(args: dict) -> str:
+    """Seal a dict of JSON-serializable task arguments for the broker."""
+    body = json.dumps(args, separators=(",", ":"))
+    return _SEAL_PREFIX + _instance().encrypt(body.encode("utf-8")).decode("ascii")
+
+
+def unseal_task_args(token: str, required: tuple[str, ...]) -> dict:
+    """Open a sealed envelope. Strict: a token that is not ours, does not decrypt
+    under any configured key (InvalidToken), or lacks a required key raises. It
+    never falls back to treating the input as plaintext."""
+    if not isinstance(token, str) or not token.startswith(_SEAL_PREFIX):
+        raise ValueError("not a sealed task-arguments envelope")
+    data = json.loads(_instance().decrypt(token[len(_SEAL_PREFIX):].encode("ascii")))
+    missing = [k for k in required if not isinstance(data, dict) or k not in data]
+    if missing:
+        raise ValueError(f"sealed task arguments missing {missing}")
+    return data
 
 
 def _derive_blind_index_key() -> bytes:

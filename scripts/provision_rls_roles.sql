@@ -476,7 +476,16 @@ BEGIN
     -- job, plus the skip-trace repair queue. Nobody deletes (rows go with their job);
     -- the app role reads nothing. Must stay AFTER the system ALL TABLES grant.
     IF to_regclass('public.job_degradations') IS NOT NULL THEN
-        REVOKE ALL ON job_degradations FROM bridgeleads_app, bridgeleads_system;
+        REVOKE ALL ON job_degradations FROM PUBLIC, bridgeleads_app, bridgeleads_system;
+        IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+            REVOKE ALL ON job_degradations FROM anon;
+        END IF;
+        IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+            REVOKE ALL ON job_degradations FROM authenticated;
+        END IF;
+        IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
+            REVOKE ALL ON job_degradations FROM service_role;
+        END IF;
         GRANT SELECT, INSERT ON job_degradations TO bridgeleads_system;
         GRANT UPDATE (repair_status, attempts, next_attempt_at, last_error_type)
               ON job_degradations TO bridgeleads_system;

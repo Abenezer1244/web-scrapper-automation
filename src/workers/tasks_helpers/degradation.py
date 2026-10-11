@@ -76,12 +76,17 @@ def record_degraded(db, r, job_id: str, reason: str, exc: BaseException | None) 
     this call recorded it. Raises DegradationNotRecordedError if the row and job-log
     line cannot be committed.
     """
-    from src.workers.tasks_helpers.status import _publish_log
+    import json
+    import uuid
+
+    from src.db.models import JobLog
+    from src.workers.tasks_helpers.status import _now
 
     if reason not in REASONS:
         raise ValueError(f"unknown degradation reason {reason!r}")
     exc_type = type(exc).__name__[:64] if exc is not None else None
     repair = "pending" if reason in _REPAIRED_AUTOMATICALLY else "none"
+    log_id = str(uuid.uuid4())
     try:
         inserted = db.execute(
             text(
@@ -95,9 +100,9 @@ def record_degraded(db, r, job_id: str, reason: str, exc: BaseException | None) 
         if inserted is None:
             db.rollback()
             return False
-        # _publish_log adds the job-log row to this session and commits: the
-        # marker and the customer's line land in one transaction.
-        _publish_log(r, job_id, "warning", REASONS[reason], db=db)
+        # The marker and the customer's job-log line land in one transaction.
+        db.add(JobLog(id=log_id, job_id=job_id, level="warning", message=REASONS[reason]))
+        db.commit()
     except Exception as write_exc:  # noqa: BLE001 — re-raised as a typed refusal
         try:
             db.rollback()
@@ -108,6 +113,16 @@ def record_degraded(db, r, job_id: str, reason: str, exc: BaseException | None) 
         raise DegradationNotRecordedError(f"job {job_id}: {reason} marker not recorded") from None
 
     _logger.warning("Job %s: degraded (%s): %s", job_id, reason, exc_type)
+    # Committed: everything below is best effort and never undoes the record. The
+    # live stream gets the same payload _publish_log sends; a viewer who misses it
+    # still reads the stored line on reload.
+    try:
+        r.publish(f"job_logs:{job_id}", json.dumps({
+            "id": log_id, "level": "warning", "message": REASONS[reason],
+            "created_at": _now().isoformat(), "type": "log",
+        }))
+    except Exception as pub_exc:  # noqa: BLE001 — the line is stored; only the push failed
+        _logger.warning("Job %s: degraded log publish failed: %s", job_id, type(pub_exc).__name__)
     from src.workers.ops_alerts import send_ops_alert
 
     send_ops_alert(

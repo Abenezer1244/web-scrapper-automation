@@ -111,3 +111,14 @@ def test_rows_go_with_their_job(job_id, redis_client):
         s.commit()
         assert s.execute(text(
             "SELECT count(*) FROM job_degradations WHERE job_id = :j"), {"j": job_id}).scalar() == 0
+
+
+def test_a_failed_live_publish_does_not_undo_the_record(job_id):
+    # A real client to a port nothing listens on: the push fails AFTER the commit.
+    import redis as sync_redis
+
+    dead = sync_redis.Redis(host="127.0.0.1", port=1, socket_connect_timeout=0.5)
+    with SyncSessionLocal() as db:
+        assert record_degraded(db, dead, job_id, "property_key", RuntimeError("x")) is True
+    marker, logs, alerts = _state(job_id, "property_key")
+    assert len(marker) == 1 and len(logs) == 1 and len(alerts) == 1

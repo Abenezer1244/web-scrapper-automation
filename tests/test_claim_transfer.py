@@ -447,6 +447,66 @@ async def test_running_it_again_changes_nothing(
     assert (await _fresh(db, Result, row)).is_duplicate is False
 
 
+async def test_settled_claims_are_skipped_in_bulk_and_the_rest_still_move(
+    db, starter_user: User, scraper_config: ScraperConfig, monkeypatch,
+):
+    """One run meets all three kinds at once: a claim whose source run was purged
+    (dropped by the bulk pre-read), an undelivered claim (moves), and a claim the
+    sweep already released (taken). The pre-read must drop only the first, and the
+    first must never cost a per-hash round trip: 15,410 of them blew the Celery
+    time limit on job 1b44217a."""
+    from src.workers.tasks_helpers import dedup
+
+    visited: list[str] = []
+    real = dedup._transfer_one_claim
+
+    def _spy(db_, job_id, uid, user_id, dedup_hash, *rest):
+        visited.append(dedup_hash)
+        return real(db_, job_id, uid, user_id, dedup_hash, *rest)
+
+    monkeypatch.setattr(dedup, "_transfer_one_claim", _spy)
+    old_job = await _job(db, starter_user, scraper_config, status="failed", billed_at=None)
+    new_job = await _job(db, starter_user, scraper_config, status="enriching", billed_at=None)
+
+    purged = _strong(parcel="1111111111")
+    await _claim(db, starter_user.id, purged, None, str(uuid.uuid4()), parcel="1111111111")
+
+    undelivered = _strong(parcel="2222222222")
+    anchor = await _row(db, old_job, starter_user.id, undelivered, parcel_id="2222222222")
+    await _claim(db, starter_user.id, undelivered, anchor, old_job, parcel="2222222222")
+
+    released = _strong(parcel="3333333333")
+
+    rows = {}
+    for h, parcel in ((purged, "1111111111"), (undelivered, "2222222222"),
+                      (released, "3333333333")):
+        rows[h] = await _row(db, new_job, starter_user.id, h, parcel_id=parcel,
+                             is_duplicate=True, duplicate_reason="prior_run",
+                             duplicate_source_job_id=old_job,
+                             property_address="5006 61ST STREET CT E")
+
+    assert await _transfer(db, new_job, starter_user.id) == 2
+    assert sorted(visited) == sorted([undelivered, released])
+
+    assert (await _fresh(db, Result, rows[purged])).is_duplicate is True
+    assert (await _fresh(db, Result, rows[undelivered])).is_duplicate is False
+    assert (await _fresh(db, Result, rows[released])).is_duplicate is False
+
+
+async def test_another_accounts_purged_claim_cannot_settle_this_accounts_hash(
+    db, starter_user: User, business_user: User, scraper_config: ScraperConfig,
+):
+    """The bulk pre-read is tenant-scoped: another account holding a purged-anchor
+    claim on the very same property must not make this account's hash look settled."""
+    h, old_job, _, _ = await _setup_undelivered(
+        db, starter_user, scraper_config, status="failed", billed_at=None)
+    await _claim(db, business_user.id, h, None, str(uuid.uuid4()))
+    new_job, row = await _found_again(db, starter_user, scraper_config, h, old_job)
+
+    assert await _transfer(db, new_job, starter_user.id) == 1
+    assert (await _fresh(db, Result, row)).is_duplicate is False
+
+
 async def test_a_promoted_row_the_plan_cap_then_excludes_releases_the_claim(
     db, starter_user: User, scraper_config: ScraperConfig,
 ):

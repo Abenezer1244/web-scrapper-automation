@@ -18,18 +18,21 @@ from src.workers import data_quality as dq
 
 
 async def _job(db, user: User, *, county: str = "benton", record_type: str = "probate",
-               finished_hours_ago: float = 1.0) -> str:
+               finished_hours_ago: float = 1.0, records_found: int | None = None,
+               window: tuple[str, str] | None = None, doc_types: list | None = None) -> str:
     config = ScraperConfig(
         id=str(uuid.uuid4()), user_id=user.id, name=f"{county} {record_type} dq",
         county=county, state="WA", record_type=record_type,
         fields=["party_name"], enrichment=[], schedule={"frequency": "manual"},
-        deliver={"format": "csv", "emails": []},
+        deliver={"format": "csv", "emails": []}, doc_types=doc_types,
     )
     db.add(config)
     await db.commit()
     job_id = str(uuid.uuid4())
     db.add(Job(id=job_id, user_id=user.id, scraper_config_id=config.id, status="done",
                trigger="manual", record_count=0, billed_count=0,
+               records_found=records_found,
+               date_from=window[0] if window else None, date_to=window[1] if window else None,
                finished_at=datetime.now(UTC) - timedelta(hours=finished_hours_ago)))
     await db.commit()
     return job_id
@@ -240,3 +243,136 @@ class TestSweep:
         entry = app.conf.beat_schedule["data-quality-sweep"]
         assert entry["task"] == "src.workers.data_quality.data_quality_sweep"
         assert set(entry["schedule"].minute) == {33}
+
+
+# ── Volume (P0-08): a source that silently returns nothing ─────────────────────
+
+_WEEK = ("10/01/2026", "10/07/2026")
+_QUARTER = ("07/10/2026", "10/07/2026")
+
+
+class TestEvaluateVolume:
+    @staticmethod
+    def _v(found, *, rate=4.0, days=7, jobs=6, record_type="probate"):
+        return {"records_found": found, "median_rate": rate, "days": days,
+                "baseline_jobs": jobs, "record_type": record_type}
+
+    def test_zero_against_a_steady_source_is_a_collapse(self):
+        w = dq.evaluate_volume(self._v(0))
+        assert w["kind"] == "volume_collapse" and w["expected"] == 28.0 and w["found"] == 0
+
+    def test_a_normal_or_slow_week_is_not(self):
+        assert dq.evaluate_volume(self._v(20)) is None
+        assert dq.evaluate_volume(self._v(6)) is None  # 21% of expected
+
+    def test_a_quiet_source_is_never_judged_on_chance(self):
+        """Expected under 10: a zero is what a rural county does."""
+        assert dq.evaluate_volume(self._v(0, rate=1.0)) is None
+
+    def test_too_few_comparable_runs_or_no_window_is_no_judgement(self):
+        assert dq.evaluate_volume(self._v(0, jobs=dq.VOLUME_MIN_BASELINE_JOBS - 1)) is None
+        assert dq.evaluate_volume(self._v(0, days=None)) is None
+        assert dq.evaluate_volume(None) is None
+
+    def test_trustee_sale_is_not_judged(self):
+        assert dq.evaluate_volume(self._v(0, record_type="trustee_sale")) is None
+
+
+async def _baseline(db, user, county, n=6, found=30, window=_WEEK, doc_types=None,
+                    record_type="probate"):
+    for i in range(n):
+        await _job(db, user, county=county, record_type=record_type, records_found=found,
+                   window=window, doc_types=doc_types, finished_hours_ago=24 + i)
+
+
+async def _audit_paths(prefix: str) -> list[str]:
+    rows: list = []
+    for _ in range(30):
+        with _sync() as s:
+            rows = s.execute(text(
+                "SELECT path FROM audit_events WHERE event = 'ops_alert' AND path LIKE :p"),
+                {"p": prefix + "%"}).scalars().all()
+        if rows:
+            break
+        await asyncio.sleep(0.1)
+    return rows
+
+
+class TestVolume:
+    async def test_a_silent_source_raises_a_durable_alert(self, db, starter_user, monkeypatch):
+        from src.config import settings
+
+        monkeypatch.setattr(settings, "OPS_ALERT_EMAIL", "")
+        county = f"dqv{uuid.uuid4().hex[:6]}"
+        await _baseline(db, starter_user, county)
+        silent = await _job(db, starter_user, county=county, records_found=0, window=_WEEK)
+        with _sync() as s:
+            report = dq.check_job(s, silent)
+        vol = [w for w in report["warnings"] if w["kind"] == "volume_collapse"]
+        assert vol == [{"kind": "volume_collapse", "found": 0, "expected": 30.0,
+                        "window_days": 7, "baseline_jobs": 6, "doc_types": None}]
+        assert await _audit_paths(f"data_quality_volume:{county}/") == [
+            f"data_quality_volume:{county}/WA/probate/all"]
+
+    async def test_a_normal_run_raises_no_volume_warning(self, db, starter_user):
+        county = f"dqv{uuid.uuid4().hex[:6]}"
+        await _baseline(db, starter_user, county)
+        ok = await _job(db, starter_user, county=county, records_found=27, window=_WEEK)
+        with _sync() as s:
+            assert dq.check_job(s, ok, alert=False)["warnings"] == []
+
+    async def test_runs_with_a_far_wider_window_are_not_its_baseline(self, db, starter_user):
+        """A 7-day run on a lagged county is not judged against 90-day runs."""
+        county = f"dqv{uuid.uuid4().hex[:6]}"
+        await _baseline(db, starter_user, county, found=900, window=_QUARTER)
+        week = await _job(db, starter_user, county=county, records_found=0, window=_WEEK)
+        with _sync() as s:
+            v = dq.volume(s, week)
+        assert v["baseline_jobs"] == 0 and dq.evaluate_volume(v) is None
+
+    async def test_another_document_selection_is_not_its_baseline(self, db, starter_user):
+        county = f"dqv{uuid.uuid4().hex[:6]}"
+        await _baseline(db, starter_user, county, doc_types=["NOTICE OF TRUSTEE SALE"])
+        narrow = await _job(db, starter_user, county=county, records_found=0, window=_WEEK,
+                            doc_types=["LIS PENDENS"])
+        with _sync() as s:
+            assert dq.volume(s, narrow)["baseline_jobs"] == 0
+
+    async def test_a_zero_run_is_judged_although_it_is_below_the_coverage_minimum(
+            self, db, starter_user):
+        """The coverage check skips runs under MIN_RUN_ROWS; volume must not."""
+        county = f"dqv{uuid.uuid4().hex[:6]}"
+        await _baseline(db, starter_user, county)
+        silent = await _job(db, starter_user, county=county, records_found=0, window=_WEEK)
+        with _sync() as s:
+            report = dq.check_job(s, silent, alert=False)
+        assert report["run"]["rows"] == 0
+        assert [w["kind"] for w in report["warnings"]] == ["volume_collapse"]
+
+
+    async def test_the_same_selection_in_another_order_is_its_baseline(self, db, starter_user):
+        county = f"dqv{uuid.uuid4().hex[:6]}"
+        await _baseline(db, starter_user, county, doc_types=["NOTICE OF DEFAULT", "LIS PENDENS"])
+        job = await _job(db, starter_user, county=county, records_found=0, window=_WEEK,
+                         doc_types=["NOTICE OF DEFAULT", "LIS PENDENS", "LIS PENDENS"])
+        with _sync() as s:
+            assert dq.volume(s, job)["baseline_jobs"] == 6
+
+    async def test_a_coverage_and_a_volume_collapse_together_both_alert(
+            self, db, starter_user, monkeypatch):
+        """The volume warning never reaches the coverage formatter (Codex asked)."""
+        from src.config import settings
+
+        monkeypatch.setattr(settings, "OPS_ALERT_EMAIL", "")
+        county = f"dqv{uuid.uuid4().hex[:6]}"
+        await _baseline(db, starter_user, county, found=300)
+        base = await _job(db, starter_user, county=county, finished_hours_ago=30)
+        await _rows(db, starter_user, base, n=60, with_mailing=50)
+        bad = await _job(db, starter_user, county=county, records_found=15, window=_WEEK)
+        await _rows(db, starter_user, bad, n=15, with_mailing=0)
+        with _sync() as s:
+            report = dq.check_job(s, bad)
+        assert sorted(w["kind"] for w in report["warnings"]) == [
+            "coverage_collapse", "volume_collapse"]
+        assert len(await _audit_paths(f"data_quality_volume:{county}/")) == 1
+        assert len(await _audit_paths(f"data_quality:{county}/")) == 1

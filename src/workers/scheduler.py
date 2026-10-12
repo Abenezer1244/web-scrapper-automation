@@ -502,13 +502,8 @@ def enrichment_source_canary() -> None:
 
 @app.task(name="src.workers.scheduler.canary_check")
 def canary_check() -> None:
-    """Run a 1-page test scrape per active connector to verify portal health.
-
-    Updates county_connectors.health_status:
-      - 'healthy'  — canary returned ≥ 1 record
-      - 'degraded' — canary returned 0 records (portal reachable but empty)
-      - 'down'     — canary threw an exception
-    """
+    """Probe a few (connector, record type) pairs; see _canary_check_impl for the
+    health_status rules, including the zero-output downgrade and its ops alert."""
     return _canary_check_impl()
 
 

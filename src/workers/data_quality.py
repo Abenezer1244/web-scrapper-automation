@@ -104,6 +104,89 @@ WHERE j.id = :job_id
 # judging them on a config that did not is a false alarm, not a collapse.
 _SKIP_TRACE_FIELDS = frozenset({"phone", "email"})
 
+# VOLUME (P0-08). A source that silently returns nothing still finishes DONE with
+# 0 leads, and the coverage check above never judges a run that small. So every
+# run's raw scrape count (jobs.records_found) is also judged against what the same
+# county x record type x document selection produced per day of window over the
+# baseline, among runs whose window is comparable (a 7-day run on a lagged county
+# is not judged against 90-day runs that reach past the lag).
+VOLUME_MIN_BASELINE_JOBS = 5
+# Alert when the run found this share of the expected count or less, and the
+# expected count is high enough that it is not chance: P(X <= 2 | lambda 10) ~ 0.3%.
+VOLUME_DROP_RATIO = 0.2
+VOLUME_MIN_EXPECTED = 10.0
+# Auctions arrive in batches and zero upcoming is legitimate; trustee_sale has its
+# own stale-source failure (src/scrapers/trustee_sale.py).
+VOLUME_SKIP_RECORD_TYPES = frozenset({"trustee_sale"})
+
+# A run's window in days, from its resolved MM/DD/YYYY bounds (NULL if malformed).
+_VOLUME_SQL = """
+WITH me AS (
+  SELECT j.id, j.records_found, lower(sc.county) AS county, upper(sc.state) AS state,
+         sc.record_type,
+         -- the document selection, order and repeats ignored
+         (CASE WHEN jsonb_typeof(sc.doc_types::jsonb) = 'array' THEN (SELECT coalesce(jsonb_agg(DISTINCT e ORDER BY e), '[]'::jsonb) FROM jsonb_array_elements_text(sc.doc_types::jsonb) e) ELSE sc.doc_types::jsonb END) AS doc_types,
+         (CASE WHEN j.date_from ~ '^[0-9]{2}/[0-9]{2}/[0-9]{4}$'
+              AND j.date_to ~ '^[0-9]{2}/[0-9]{2}/[0-9]{4}$'
+         THEN to_date(j.date_to, 'MM/DD/YYYY') - to_date(j.date_from, 'MM/DD/YYYY') + 1 END) AS days
+  FROM jobs j JOIN scraper_configs sc ON sc.id = j.scraper_config_id
+  WHERE j.id = :job_id
+), base AS (
+  SELECT j.records_found::float / w.days AS rate
+  FROM jobs j
+  JOIN scraper_configs sc ON sc.id = j.scraper_config_id
+  CROSS JOIN LATERAL (SELECT (CASE WHEN j.date_from ~ '^[0-9]{2}/[0-9]{2}/[0-9]{4}$'
+              AND j.date_to ~ '^[0-9]{2}/[0-9]{2}/[0-9]{4}$'
+         THEN to_date(j.date_to, 'MM/DD/YYYY') - to_date(j.date_from, 'MM/DD/YYYY') + 1 END) AS days) w
+  CROSS JOIN me
+  WHERE j.status = 'done' AND j.id <> me.id AND j.finished_at >= :since
+    AND j.records_found IS NOT NULL AND w.days > 0
+    AND lower(sc.county) = me.county AND upper(sc.state) = me.state
+    AND sc.record_type = me.record_type
+    AND (CASE WHEN jsonb_typeof(sc.doc_types::jsonb) = 'array' THEN (SELECT coalesce(jsonb_agg(DISTINCT e ORDER BY e), '[]'::jsonb) FROM jsonb_array_elements_text(sc.doc_types::jsonb) e) ELSE sc.doc_types::jsonb END) IS NOT DISTINCT FROM me.doc_types
+    AND w.days BETWEEN me.days * 0.5 AND me.days * 2
+)
+SELECT me.records_found, me.days, me.record_type, me.state, me.doc_types,
+       (SELECT count(*) FROM base) AS baseline_jobs,
+       (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY rate) FROM base) AS median_rate
+FROM me
+"""
+
+
+def volume(db, job_id: str, *, days: int = BASELINE_DAYS) -> dict | None:
+    """This run's raw scrape count and its comparable baseline (counts only, no PII)."""
+    row = db.execute(text(_VOLUME_SQL), {
+        "job_id": job_id, "since": datetime.now(UTC) - timedelta(days=days),
+    }).mappings().one_or_none()
+    return dict(row) if row is not None else None
+
+
+def _volume_key(job, warning: dict) -> str:
+    """Cooldown key: one silent county x state x record type x document selection
+    pages once, however many tenants run it; a different selection is its own."""
+    import hashlib
+    import json
+
+    sel = warning.get("doc_types")
+    tag = "all" if sel is None else hashlib.sha256(
+        json.dumps(sel, sort_keys=True).encode()).hexdigest()[:8]
+    return f"{job['county']}/{job['state']}/{job['record_type']}/{tag}"
+
+
+def evaluate_volume(v: dict | None) -> dict | None:
+    """A warning when the run found far fewer records than its baseline predicts."""
+    if (v is None or v["record_type"] in VOLUME_SKIP_RECORD_TYPES
+            or v["records_found"] is None or not v["days"] or v["days"] <= 0
+            or v["baseline_jobs"] < VOLUME_MIN_BASELINE_JOBS or v["median_rate"] is None):
+        return None
+    expected = float(v["median_rate"]) * int(v["days"])
+    if expected >= VOLUME_MIN_EXPECTED and v["records_found"] <= VOLUME_DROP_RATIO * expected:
+        return {"kind": "volume_collapse", "found": int(v["records_found"]),
+                "expected": round(expected, 1), "window_days": int(v["days"]),
+                "baseline_jobs": int(v["baseline_jobs"]), "doc_types": v.get("doc_types")}
+    return None
+
+
 _RECENT_DONE_SQL = """
 SELECT j.id FROM jobs j
 WHERE j.status = 'done' AND j.finished_at >= :since
@@ -191,9 +274,27 @@ def check_job(db, job_id: str, *, alert: bool = True) -> dict:
     baseline = baseline_coverage(db, job_id=job_id, county=job["county"], state=job["state"],
                                  record_type=job["record_type"])
     warnings = evaluate(run, baseline, skip_trace=bool(job["skip_trace_enabled"]))
+    # Judged whatever the run's size: a silent source is exactly the 0-row run.
+    volume_warning = evaluate_volume(volume(db, job_id))
     report = {"job_id": job_id, "county": job["county"], "state": job["state"],
               "record_type": job["record_type"], "run": run, "baseline": baseline,
-              "warnings": warnings}
+              "warnings": warnings + ([volume_warning] if volume_warning else [])}
+    if volume_warning and alert:
+        from src.workers.ops_alerts import send_ops_alert
+
+        where = f"{job['county']}/{job['state']} {job['record_type']}"
+        v = volume_warning
+        _logger.warning("Data quality: %s job %s found %d, expected ~%s", where,
+                        str(job["id"])[:8], v["found"], v["expected"])
+        send_ops_alert(
+            "data_quality_volume", _volume_key(job, v),
+            f"Data volume: {where} job {str(job['id'])[:8]} found {v['found']} records, "
+            f"expected about {v['expected']}",
+            f"Job {job['id']} ({where}) scraped {v['found']} records over a "
+            f"{v['window_days']}-day window. The median of {v['baseline_jobs']} comparable "
+            f"runs over {BASELINE_DAYS} days predicts about {v['expected']}. The source may "
+            "have gone silent, or the scraper stopped extracting.",
+        )
     if warnings and alert:
         from src.workers.ops_alerts import send_ops_alert
 
@@ -201,7 +302,7 @@ def check_job(db, job_id: str, *, alert: bool = True) -> dict:
         _logger.warning("%s: %s", subject, "; ".join(
             f"{w['field']} {w['run_pct']}% vs {w['baseline_pct']}%" for w in warnings))
         send_ops_alert("data_quality", f"{job['county']}/{job['record_type']}", subject, body)
-    elif not warnings:
+    elif not report["warnings"]:  # a volume-only collapse is not "within baseline"
         _logger.info("Data quality: job %s (%s/%s) within baseline; mailing %.1f%% of %d rows",
                      job_id[:8], job["county"], job["record_type"],
                      run["pct"]["mailing_address"], run["rows"])

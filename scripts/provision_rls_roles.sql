@@ -493,6 +493,25 @@ BEGIN
         CREATE POLICY job_degradations_system ON job_degradations
             FOR ALL TO bridgeleads_system USING (true) WITH CHECK (true);
     END IF;
+    -- King parcel owners (118): one eRealProperty owner answer per parcel, shared by
+    -- every account's leads (public record, no user_id). Worker-only; the app role
+    -- reads nothing. Must stay AFTER the system ALL TABLES grant.
+    IF to_regclass('public.king_parcel_owners') IS NOT NULL THEN
+        REVOKE ALL ON king_parcel_owners FROM PUBLIC, bridgeleads_app, bridgeleads_system;
+        IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+            REVOKE ALL ON king_parcel_owners FROM anon;
+        END IF;
+        IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+            REVOKE ALL ON king_parcel_owners FROM authenticated;
+        END IF;
+        IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
+            REVOKE ALL ON king_parcel_owners FROM service_role;
+        END IF;
+        GRANT SELECT, INSERT, UPDATE ON king_parcel_owners TO bridgeleads_system;
+        DROP POLICY IF EXISTS king_parcel_owners_system ON king_parcel_owners;
+        CREATE POLICY king_parcel_owners_system ON king_parcel_owners
+            FOR ALL TO bridgeleads_system USING (true) WITH CHECK (true);
+    END IF;
     -- users CASCADEs into account_deletions: only the owner may delete/truncate it.
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
         REVOKE DELETE, TRUNCATE ON users FROM anon;

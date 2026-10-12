@@ -1341,6 +1341,35 @@ class BatchLeadRow(BaseModel):
             "Show the contact as unavailable, never as a lookup result."
         ),
     )
+    # Results parity (2026-10-11): the fields a single-scrape ResultRow carries, so a
+    # batch lead is never less informative than the same lead in a regular run. Same
+    # names, types and derivations as ResultRow.
+    heirs: str | None = None
+    legal_description: str | None = None
+    doc_type: str | None = None
+    enrichment_data: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "The representative row's enrichment_data with each record-type group's keys "
+            "(tax, code violation, NTS auction) replaced by that group's source row's own."
+        ),
+    )
+    delinquent_amount: float | None = None
+    delinquent_bill_year: int | None = None
+    auction_date: date | None = None
+    default_amount: float | None = None
+    months_delinquent: int | None = None
+    days_to_auction: int | None = None
+    located_parcel_id: str | None = None
+    located_parcel_match: str | None = None
+    # Where each record-type group came from: a stacked property's groups are read
+    # whole from one row of their own record type, which is usually NOT the row that
+    # supplies the owner and contact (batch_export._GROUP_SOURCE_CTES). null = the
+    # batch has no row of that type with data for this property.
+    tax_source_id: str | None = None
+    auction_source_id: str | None = None
+    auction_source_record_type: str | None = None
+    violation_source_id: str | None = None
 
 
 class BatchQuality(BaseModel):

@@ -801,6 +801,25 @@ OVERLAP_LEAD_COLUMNS: list[str] = [
     "auction_date", "days_to_auction", "default_amount",
 ]
 
+# The batch combined CSV: every per-job column the overlap set lacks, appended at the
+# END in canonical order (back-compat: existing columns keep their positions). Only the
+# batch CSV gets them because only batch_export folds each record-type group from its
+# own source row (apply_group_sources); a segment row's enrichment is one arbitrary
+# row's, so a probate "status" would print as a code-violation status there.
+# Spelled out, not derived from LEAD_CSV_COLUMNS, so a change there can never shift
+# this file's columns (Codex P2). Tax / violation / auction values come from their
+# group's source row; the rest belong to the representative row, like filed_date.
+BATCH_LEAD_COLUMNS: list[str] = OVERLAP_LEAD_COLUMNS + [
+    "assessed_value", "instrument_number",
+    "code_violation_type", "code_violation_status",
+    "code_violation_description", "code_violation_last_inspection",
+    "tax_billed_amount", "tax_paid_amount", "tax_account_status",
+    "months_delinquent", "wa_foreclosure_eligible",
+    "freshness_days", "contactability_score",
+    "absentee_owner", "out_of_state_owner", "owner_state",
+    "trustee", "ts_number", "current_owner", "title_status", "parcel_source",
+]
+
 
 def build_overlap_export_row(
     record: Any,
@@ -809,6 +828,7 @@ def build_overlap_export_row(
     *,
     today: date | None = None,
     auction_today: date | None = None,
+    columns: list[str] = OVERLAP_LEAD_COLUMNS,
 ) -> dict[str, str]:
     """One overlap-CSV row from a lead record + its overlap metadata.
 
@@ -836,14 +856,15 @@ def build_overlap_export_row(
         # .get not [] so a future builder rename can't raise here (Codex P2).
         "filed_date": base.get("date_recorded", ""),
     }
-    for col in OVERLAP_LEAD_COLUMNS:
+    for col in columns:
         if col not in row:
             row[col] = base.get(col, "")
     return row
 
 
 def write_lead_csv_with_overlap(
-    rows: list[tuple[Any, dict[str, Any]]], filelike, hidden_fields: set[str] | None = None
+    rows: list[tuple[Any, dict[str, Any]]], filelike, hidden_fields: set[str] | None = None,
+    columns: list[str] = OVERLAP_LEAD_COLUMNS,
 ) -> None:
     """Write the overlap/combine CSV. `rows` = iterable of (record, overlap_dict),
     already ordered by the caller (hottest-first). Header + rows, no footer.
@@ -858,9 +879,10 @@ def write_lead_csv_with_overlap(
     _now = datetime.now(UTC)
     today = _now.date()
     auction_today = auction_reference_date(_now)
-    writer = csv.DictWriter(filelike, fieldnames=OVERLAP_LEAD_COLUMNS)
+    writer = csv.DictWriter(filelike, fieldnames=columns)
     writer.writeheader()
     for record, overlap in rows:
         writer.writerow(build_overlap_export_row(
-            record, overlap, hidden_fields, today=today, auction_today=auction_today
+            record, overlap, hidden_fields, today=today, auction_today=auction_today,
+            columns=columns,
         ))

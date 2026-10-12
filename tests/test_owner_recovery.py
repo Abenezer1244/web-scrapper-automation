@@ -5,9 +5,11 @@ Since #298 a King tax lead the job could not name carries
 lead stayed unnamed forever unless a human re-ran the scraper (job b2f2ecd5:
 840 delivered leads, 0 owner names). This sweep is the reading half.
 
-Contract pinned here: delivered leads only, one lookup per parcel, largest
-balance first; a name is filled only onto a row that is still blank, still
-deferred and still delivered; no billing, quota, skip trace or other column is
+Contract pinned here: every visible lead (delivered and already delivered), one
+lookup per parcel, parcels with a delivered lead first, then largest balance; a
+name is filled only onto a row that is still blank, still visible and not yet
+settled; one stored answer per parcel names every waiting lead with no further
+request while it is fresh; no billing, quota, skip trace or other column is
 touched; an attempt is charged only when King was actually asked; a kill switch
 and the source-health gate stop it before any request.
 
@@ -87,6 +89,9 @@ def _fast_and_clean(monkeypatch):
         with SyncSessionLocal() as sdb:
             sdb.execute(text("DELETE FROM external_source_health WHERE source_key = :k"),
                         {"k": KING_EREALPROPERTY})
+            # Stored answers are shared by parcel, not per test user; clear them so
+            # one test's answer cannot name another test's lead.
+            sdb.execute(text("DELETE FROM king_parcel_owners"))
             sdb.commit()
 
     _wipe()
@@ -113,7 +118,8 @@ async def _job(db, user: User, *, county: str = "king", record_type: str = "tax_
 
 async def _row(db, user: User, job_id: str, *, parcel: str, amount: str = "100.00",
                deferred: bool = True, attempts: int | None = None, party: str | None = None,
-               over_quota: bool = False, duplicate: bool = False) -> str:
+               over_quota: bool = False, duplicate: bool = False,
+               duplicate_reason: str = "prior_run") -> str:
     ed: dict = {"source": "king_county_delinquent_taxes"}
     if deferred:
         ed["owner_lookup_deferred"] = True
@@ -126,7 +132,7 @@ async def _row(db, user: User, job_id: str, *, parcel: str, amount: str = "100.0
     db.add(Result(
         id=rid, user_id=user.id, job_id=job_id, parcel_id=parcel, party_name=party,
         delinquent_amount=amount, mailing_address="PO BOX 1, KENT, WA 98032",
-        is_duplicate=duplicate, duplicate_reason="prior_run" if duplicate else None,
+        is_duplicate=duplicate, duplicate_reason=duplicate_reason if duplicate else None,
         skip_trace_status="not_attempted", enrichment_data=ed,
     ))
     await db.commit()
@@ -173,15 +179,17 @@ async def test_a_delivered_lead_gets_its_owner_and_nothing_else_moves(
     assert stats["found"] == 1
 
 
-async def test_leads_that_are_not_delivered_or_not_king_tax_are_never_looked_up(
+async def test_leads_that_are_not_shown_or_not_king_tax_are_never_looked_up(
     db, business_user, monkeypatch,
 ):
     _lease(monkeypatch)
     asked = _county(monkeypatch, {})
     king = await _job(db, business_user)
     await _row(db, business_user, king, parcel="1000000001", over_quota=True)
-    await _row(db, business_user, king, parcel="1000000002", duplicate=True)
-    await _row(db, business_user, king, parcel="1000000003", deferred=False)
+    await _row(db, business_user, king, parcel="1000000002", duplicate=True,
+               duplicate_reason="same_run")
+    await _row(db, business_user, king, parcel="1000000003", duplicate=True,
+               duplicate_reason="superseded")
     await _row(db, business_user, king, parcel="1000000004", party="ALREADY NAMED")
     await _row(db, business_user, king, parcel="1000000005", attempts=orc._MAX_ATTEMPTS)
     live = await _job(db, business_user, status="enriching")
@@ -194,6 +202,29 @@ async def test_leads_that_are_not_delivered_or_not_king_tax_are_never_looked_up(
     stats = await asyncio.to_thread(_tick)
 
     assert asked == [] and stats["parcels"] == 0
+
+
+async def test_already_delivered_and_never_flagged_leads_are_named_too(
+    db, business_user, monkeypatch,
+):
+    """Owner decision 2026-10-12: every visible unnamed lead is filled. 22,009
+    delivered King tax leads were never flagged deferred, and the already-delivered
+    list showed thousands more; this sweep saw none of them."""
+    _lease(monkeypatch)
+    asked = _county(monkeypatch, {
+        "1000000011": _Resp(200, _page("1000000011", "DUPLICATE OWNER")),
+        "1000000012": _Resp(200, _page("1000000012", "UNFLAGGED OWNER")),
+    })
+    job_id = await _job(db, business_user)
+    already = await _row(db, business_user, job_id, parcel="1000000011", duplicate=True)
+    unflagged = await _row(db, business_user, job_id, parcel="1000000012", deferred=False)
+
+    stats = await asyncio.to_thread(_tick)
+
+    assert sorted(asked) == ["1000000011", "1000000012"]
+    assert (await _get(db, already)).party_name == "DUPLICATE OWNER"
+    assert (await _get(db, unflagged)).party_name == "UNFLAGGED OWNER"
+    assert stats["found"] == 2
 
 
 async def test_each_county_answer_settles_or_retries_the_lead(db, business_user, monkeypatch):
@@ -410,3 +441,110 @@ async def test_the_parcel_in_flight_when_the_lookup_crashed_is_charged(
     assert ed["owner_recovery_attempts"] == 1 and ed["owner_lookup_deferred"] is True
     assert "owner_recovery_attempts" not in (await _get(db, never)).enrichment_data
     assert stats["transient"] == 1 and stats["unreached"] == 1
+
+# ─── One answer per parcel (king_parcel_owners) ──────────────────────────────
+
+def _store_answer(pid: str, outcome: str, owner: str | None, *, days_old: int = 0) -> None:
+    from src.db.session import system_sync_session
+
+    with system_sync_session() as sdb:
+        sdb.execute(text(
+            "INSERT INTO king_parcel_owners (parcel_id, outcome, owner_name, observed_at, source) "
+            "VALUES (:p, :o, :n, now() - make_interval(days => :d), 'erealproperty')"),
+            {"p": pid, "o": outcome, "n": owner, "d": days_old})
+        sdb.commit()
+
+
+def _stored(pid: str):
+    from src.db.session import system_sync_session
+
+    with system_sync_session() as sdb:
+        return sdb.execute(text(
+            "SELECT outcome, owner_name, observed_at FROM king_parcel_owners "
+            "WHERE parcel_id = :p"), {"p": pid}).first()
+
+
+async def test_one_answer_names_every_account_s_lead_on_the_parcel_and_is_stored(
+    db, business_user, starter_user, monkeypatch,
+):
+    _lease(monkeypatch)
+    asked = _county(monkeypatch, {"1000000021": _Resp(200, _page("1000000021", "SHARED OWNER"))})
+    mine = await _row(db, business_user, await _job(db, business_user), parcel="1000000021")
+    theirs = await _row(db, starter_user, await _job(db, starter_user), parcel="1000000021",
+                        duplicate=True)
+
+    stats = await asyncio.to_thread(_tick)
+
+    assert asked == ["1000000021"]                 # one request for the property
+    assert (await _get(db, mine)).party_name == "SHARED OWNER"
+    assert (await _get(db, theirs)).party_name == "SHARED OWNER"
+    ed = (await _get(db, mine)).enrichment_data
+    assert ed["owner_recovery_outcome"] == "found" and ed["owner_recovery_attempts"] == 1
+    assert ed["owner_lookup_deferred"] is False and "owner_lookup_deferred_reason" not in ed
+    assert (await asyncio.to_thread(_stored, "1000000021"))[:2] == ("found", "SHARED OWNER")
+    assert stats["found"] == 2 and stats["parcels"] == 1
+
+
+async def test_a_fresh_stored_answer_names_leads_with_no_request_even_in_cooldown(
+    db, business_user, monkeypatch,
+):
+    from src.db.session import system_sync_session
+    from src.scrapers.enrichment.source_health import mark_source_unhealthy
+
+    _lease(monkeypatch)
+    asked = _county(monkeypatch, {})
+    named = await _row(db, business_user, await _job(db, business_user), parcel="1000000022")
+    nobody = await _row(db, business_user, await _job(db, business_user), parcel="1000000023",
+                        duplicate=True)
+    await asyncio.to_thread(_store_answer, "1000000022", "found", "STORED OWNER", days_old=3)
+    await asyncio.to_thread(_store_answer, "1000000023", "not_on_record", None, days_old=3)
+
+    def _block():
+        with system_sync_session() as sdb:
+            mark_source_unhealthy(sdb, KING_EREALPROPERTY, "test cooldown")
+
+    await asyncio.to_thread(_block)
+    stats = await asyncio.to_thread(_tick)
+
+    assert asked == []
+    assert stats["cached"] == 2 and stats["skipped"] == "king_erealproperty is in cooldown"
+    row = await _get(db, named)
+    assert row.party_name == "STORED OWNER"
+    assert "owner_recovery_attempts" not in row.enrichment_data   # no request, no charge
+    settled = await _get(db, nobody)
+    assert settled.party_name is None
+    assert settled.enrichment_data["owner_lookup_outcome"] == "not_on_record"
+    assert settled.enrichment_data["owner_lookup_deferred"] is False
+
+
+async def test_a_stale_stored_answer_is_asked_again_and_replaced(
+    db, business_user, monkeypatch,
+):
+    _lease(monkeypatch)
+    asked = _county(monkeypatch, {"1000000024": _Resp(200, _page("1000000024", "NEW OWNER"))})
+    rid = await _row(db, business_user, await _job(db, business_user), parcel="1000000024")
+    await asyncio.to_thread(_store_answer, "1000000024", "found", "SOLD LAST YEAR",
+                            days_old=orc._FRESH_DAYS + 1)
+    before = (await asyncio.to_thread(_stored, "1000000024")).observed_at
+
+    await asyncio.to_thread(_tick)
+
+    assert asked == ["1000000024"]
+    assert (await _get(db, rid)).party_name == "NEW OWNER"
+    outcome, owner, observed = await asyncio.to_thread(_stored, "1000000024")
+    assert (outcome, owner) == ("found", "NEW OWNER") and observed > before
+
+
+async def test_parcels_with_a_delivered_lead_are_asked_before_already_delivered_ones(
+    db, business_user, monkeypatch,
+):
+    _lease(monkeypatch)
+    monkeypatch.setattr(orc, "_BATCH_PARCELS", 1)
+    asked = _county(monkeypatch, {"1000000026": _Resp(200, _page("1000000026", "DELIVERED"))})
+    job_id = await _job(db, business_user)
+    await _row(db, business_user, job_id, parcel="1000000025", amount="99999.00", duplicate=True)
+    await _row(db, business_user, job_id, parcel="1000000026", amount="1.00")
+
+    await asyncio.to_thread(_tick)
+
+    assert asked == ["1000000026"]

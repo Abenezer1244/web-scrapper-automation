@@ -1532,19 +1532,19 @@ def _stage_label(
         # front) can then say how big the job is straight away, which is the most
         # reassuring thing available during the long silent opening.
         count = (
-            f"{noun} {units_done} of {units_total}" if noun
-            else f"{units_done} of {units_total}"
+            f"{noun} {units_done:,} of {units_total:,}" if noun
+            else f"{units_done:,} of {units_total:,}"
         )
         return f"{label}: {count}"
     if units_done is not None and units_done > 0:
         # A count with no denominator. "Page 3", never "Page 3 of 0".
-        return f"{label}: {noun} {units_done}" if noun else f"{label}: {units_done}"
+        return f"{label}: {noun} {units_done:,}" if noun else f"{label}: {units_done:,}"
 
     # No unit count, but a record total was observed. 0 is worth saying out loud on
     # a stage past the scrape: it means the county answered and had nothing, which
     # is a result, not a missing reading.
     if records_found is not None and stage not in (None, "preparing", "connecting", "searching"):
-        return f"{label}: {records_found} records found"
+        return f"{label}: {records_found:,} records found"
     return label
 
 
@@ -1653,14 +1653,20 @@ class JobResponse(BaseModel):
     # false — otherwise it asserts a run is fine when nothing is reporting.
     stage_seconds: int | None = None
     # Human copy for `stage`. Lives here so one wording change can never leave the
-    # API and the UI disagreeing about what the worker is doing.
+    # API and the UI disagreeing about what the worker is doing. Display text only:
+    # its counts are grouped for reading ("Part 4,089 of 10,000", `f"{n:,}"`, the
+    # same en-US grouping the web app uses), so clients must not parse it; the numbers
+    # are in units_done, units_total, records_found and record_count (progress_unit
+    # names what units_done counts).
     stage_label: str | None = None
     estimated_total_records: int | None = None
     estimated_seconds_remaining: int | None = None
     estimated_time_remaining: str | None = None  # "2m 30s", "45s", "Done"
     elapsed_seconds: int | None = None
     elapsed_time: str | None = None  # "1m 15s"
-    progress_label: str | None = None  # "Scraping page 3 of 5", "Looking up parcels 42/100"
+    # The same display text as stage_label ("Collecting records: Part 3 of 5"); not
+    # for parsing, see stage_label.
+    progress_label: str | None = None
     # True when this job holds an ACTIVE status but nothing has reported progress
     # for HEARTBEAT_STALE_MINUTES. The client must use it to stop presenting the
     # run as live: a worker killed mid-scrape (deploy, OOM, hard timeout) leaves
@@ -1736,7 +1742,7 @@ class JobResponse(BaseModel):
             # and calling it "records" beside records_found was one of the four
             # disagreeing numbers of UX F-001.
             self.progress_label = (
-                f"Complete: {self.record_count} new "
+                f"Complete: {self.record_count:,} new "
                 f"lead{'' if self.record_count == 1 else 's'}"
                 if self.status == JobStatus.DONE
                 else self.status.value.title()

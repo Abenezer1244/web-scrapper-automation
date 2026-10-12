@@ -115,9 +115,24 @@ def test_a_record_type_with_no_scraper_is_down_and_paged(connector, monkeypatch)
     assert _probe(c, "divorce") == ("down", [("canary", f"{c.county}/WA/divorce")])
 
 
-def test_an_unproven_connector_with_nothing_anywhere_is_degraded_quietly(connector, monkeypatch):
+def test_a_connector_that_never_yielded_is_paged_too(connector, monkeypatch):
+    """Listed to customers and returns nothing anywhere: worth a page."""
     _portal(monkeypatch, now=[], history=[])
+    c = connector(status="unknown")
+    assert _probe(c) == ("degraded", [("canary_zero_output", f"{c.county}/WA/probate")])
+
+
+def test_unproven_with_an_unreadable_history_is_degraded_quietly(connector, monkeypatch):
+    _portal(monkeypatch, now=[], history=TimeoutError("portal slow"))
     assert _probe(connector(status="unknown")) == ("degraded", [])
+
+
+def test_a_second_broken_type_on_a_degraded_connector_is_paged(connector, monkeypatch):
+    """The connector's one status flag must not gate another type's page (Codex P1)."""
+    _portal(monkeypatch, now=[], history=[])
+    c = connector(record_types=("probate", "pre_foreclosure"), status="degraded")
+    assert _probe(c, "pre_foreclosure") == (
+        "degraded", [("canary_zero_output", f"{c.county}/WA/pre_foreclosure")])
 
 
 def test_the_page_never_carries_the_scrapers_error_text(connector, monkeypatch):

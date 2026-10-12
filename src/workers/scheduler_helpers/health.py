@@ -497,23 +497,26 @@ def _probe_unit(connector, record_type: str, pending_alerts: list) -> None:
                 connector.health_status = "healthy"
                 _logger.info("Canary %s %s: source_lagged (current week empty, "
                              "historical records OK) -> healthy", where, record_type)
-            elif prev_status == "healthy" and history == "empty":
-                # It used to stay healthy whatever the probe found (sticky health),
-                # so a source returning nothing at all looked like a quiet week.
-                # 'degraded' is still listed to customers.
+            elif history == "empty":
+                # Nothing this week and nothing in any window back: a broken
+                # extraction or a source that stopped publishing. It used to stay
+                # healthy whatever the probe found (sticky health), so it looked
+                # like a quiet week. Paged EVERY time it is confirmed, whatever the
+                # connector's status: that is one flag for all its types, so gating
+                # on it let a second broken type go unpaged (Codex P1). The
+                # per-type cooldown dedupes repeats. 'degraded' is still listed.
                 connector.health_status = "degraded"
                 pending_alerts.append((
                     "canary_zero_output", f"{where}/{record_type}",
-                    f"Canary ZERO OUTPUT: {where} {record_type} (was healthy)",
+                    f"Canary ZERO OUTPUT: {where} {record_type} (was {prev_status})",
                     f"connector={where}\nrecord_type={record_type}\n"
                     "The 7-day probe and every historical window returned no records. "
                     "The portal answered, so this is a broken extraction or a source "
                     "that stopped publishing.",
                 ))
-            elif prev_status in ("unknown", "down") and history != "hit":
-                # Nothing now or historically: genuinely empty or broken. Leave an
-                # existing 'degraded' as is; a healthy source with an inconclusive
-                # history keeps its status until a probe can say.
+            elif prev_status in ("unknown", "down"):
+                # Empty now and the history could not be read: not proven working.
+                # A healthy source keeps its status until a probe can say.
                 connector.health_status = "degraded"
         _logger.info("Canary %s %s: %s (%d records)", where, record_type,
                      connector.health_status, len(records))

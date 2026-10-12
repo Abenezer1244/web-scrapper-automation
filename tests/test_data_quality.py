@@ -357,3 +357,22 @@ class TestVolume:
                          doc_types=["NOTICE OF DEFAULT", "LIS PENDENS", "LIS PENDENS"])
         with _sync() as s:
             assert dq.volume(s, job)["baseline_jobs"] == 6
+
+    async def test_a_coverage_and_a_volume_collapse_together_both_alert(
+            self, db, starter_user, monkeypatch):
+        """The volume warning never reaches the coverage formatter (Codex asked)."""
+        from src.config import settings
+
+        monkeypatch.setattr(settings, "OPS_ALERT_EMAIL", "")
+        county = f"dqv{uuid.uuid4().hex[:6]}"
+        await _baseline(db, starter_user, county, found=300)
+        base = await _job(db, starter_user, county=county, finished_hours_ago=30)
+        await _rows(db, starter_user, base, n=60, with_mailing=50)
+        bad = await _job(db, starter_user, county=county, records_found=15, window=_WEEK)
+        await _rows(db, starter_user, bad, n=15, with_mailing=0)
+        with _sync() as s:
+            report = dq.check_job(s, bad)
+        assert sorted(w["kind"] for w in report["warnings"]) == [
+            "coverage_collapse", "volume_collapse"]
+        assert len(await _audit_paths(f"data_quality_volume:{county}/")) == 1
+        assert len(await _audit_paths(f"data_quality:{county}/")) == 1

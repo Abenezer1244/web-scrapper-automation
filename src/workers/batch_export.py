@@ -11,6 +11,7 @@ CSV is re-downloadable once they land. The CSV is built on property identity,
 which is ready at child-job enrichment.
 """
 import io
+import json
 import uuid
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -29,7 +30,11 @@ from src.config.constants import record_type_label as _label
 from src.db.models import BatchRun, Job, ScraperBatch
 from src.utils.contact_decode import clean_phone_type, decode_array, decode_scalar
 from src.utils.data_exporter import DataExporter
-from src.utils.lead_export import PROBATE_SUBTYPE_AGG_SQL, write_lead_csv_with_overlap
+from src.utils.lead_export import (
+    BATCH_LEAD_COLUMNS,
+    PROBATE_SUBTYPE_AGG_SQL,
+    write_lead_csv_with_overlap,
+)
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("worker.batch_export")
@@ -108,16 +113,6 @@ agg AS (
            array_agg(DISTINCT record_type ORDER BY record_type) AS matched_record_types,
            CASE WHEN bucket LIKE 'pk:%' THEN count(DISTINCT record_type) ELSE 1 END AS overlap_count,
            {PROBATE_SUBTYPE_AGG_SQL},
-           -- Coalesce the tax-delinquency fields ACROSS the bucket (like the probate
-           -- subtype above): a cross-matched property's representative row is usually
-           -- the PROBATE row (it carries the owner name, so it is the one skip-trace
-           -- reaches and rn=1 picks), which leaves delinquent_amount/bill_year NULL.
-           -- The tax figures live on the sibling tax_delinquent row. max() over the
-           -- bucket lifts them onto the combined lead so it shows BOTH the death cert
-           -- AND the delinquency (the whole point of a combined lead). Single-source
-           -- by nature (only tax rows populate them), so max() can't cross-contaminate.
-           max(delinquent_amount) AS delinquent_amount,
-           max(delinquent_bill_year) AS delinquent_bill_year,
            array_agg(DISTINCT county ORDER BY county) AS source_counties,
            -- New vs already delivered, per property. candidates spans EVERY row of
            -- the child jobs, including rows the account received in earlier runs
@@ -147,6 +142,64 @@ ranked AS (
     FROM candidates c
 )"""
 
+# Record-type field groups (2026-10-11, owner decision D1). The representative row
+# is picked for its CONTACT, so on a stacked property it is often the probate row,
+# whose auction / tax / violation fields are NULL while a sibling row of that type
+# holds them. Each group is therefore read WHOLE from ONE source row of its own
+# record type in the bucket, never assembled field by field from several rows (the
+# old independent max(amount) / max(bill_year) could pair one tax row's amount with
+# another's year). Shared by _COMBINED_SQL and _QUALITY_SQL, so the table, the CSV
+# and the quality checks read the same values. Rules (deterministic, id last):
+#   tax       one tax_delinquent row with an amount or year: has amount, newest job
+#   auction   one pre_foreclosure / trustee_sale row with auction data: has auction
+#             date, has default amount, newest job
+#   violation one code_violation row: newest job
+# A bucket with no such row has NULL for the group (nothing to show, no fallback):
+# apply_group_sources also strips that group's enrichment keys, so a representative
+# row of ANOTHER type can never show its own "status" as a violation status.
+_GROUP_SOURCE_CTES = """,
+tax_src AS (
+    SELECT DISTINCT ON (bucket) bucket, id AS tax_source_id,
+           delinquent_amount AS src_delinquent_amount,
+           delinquent_bill_year AS src_delinquent_bill_year,
+           enrichment_data AS tax_enrichment
+    FROM candidates
+    WHERE record_type = 'tax_delinquent'
+      AND (delinquent_amount IS NOT NULL OR delinquent_bill_year IS NOT NULL
+           -- ->> reads a JSON null as SQL NULL, so a null key is not data.
+           OR enrichment_data ->> 'billed_amount' IS NOT NULL
+           OR enrichment_data ->> 'paid_amount' IS NOT NULL
+           OR enrichment_data ->> 'account_status' IS NOT NULL)
+    ORDER BY bucket, (delinquent_amount IS NULL), job_created_at DESC NULLS LAST, id DESC
+),
+auction_src AS (
+    SELECT DISTINCT ON (bucket) bucket, id AS auction_source_id,
+           record_type AS auction_source_record_type,
+           auction_date AS src_auction_date, default_amount AS src_default_amount,
+           -- Only an nts OBJECT is auction data (a JSON null or scalar is not).
+           CASE WHEN json_typeof(enrichment_data -> 'nts') = 'object'
+                THEN enrichment_data -> 'nts' END AS auction_nts
+    FROM candidates
+    WHERE record_type IN ('pre_foreclosure', 'trustee_sale')
+      AND (auction_date IS NOT NULL OR default_amount IS NOT NULL
+           OR json_typeof(enrichment_data -> 'nts') = 'object')
+    ORDER BY bucket, (auction_date IS NULL), (default_amount IS NULL),
+             job_created_at DESC NULLS LAST, id DESC
+),
+violation_src AS (
+    SELECT DISTINCT ON (bucket) bucket, id AS violation_source_id,
+           enrichment_data AS violation_enrichment
+    FROM candidates
+    WHERE record_type = 'code_violation'
+    ORDER BY bucket, job_created_at DESC NULLS LAST, id DESC
+)"""
+
+_GROUP_SOURCE_JOINS = """
+LEFT JOIN tax_src ts ON ts.bucket = rk.bucket
+LEFT JOIN auction_src aus ON aus.bucket = rk.bucket
+LEFT JOIN violation_src vs ON vs.bucket = rk.bucket
+"""
+
 # Optional in-app view filters, shared by _COMBINED_SQL and _FILTERED_TOTAL_SQL so
 # the page and its pager can never disagree. Each defaults to NULL (a NULL bind lets
 # every row pass), so the CSV/delivery path binds NULL and behaves exactly as it did
@@ -167,16 +220,22 @@ _VIEW_FILTERS = """
        OR (CAST(:f_delivery AS text) = 'delivered' AND NOT a.has_new AND a.has_prior))
 """
 
-_COMBINED_SQL = _COMBINED_CTES + _RANKED_CTE + """
+_COMBINED_SQL = _COMBINED_CTES + _RANKED_CTE + _GROUP_SOURCE_CTES + """
 SELECT rk.id, rk.date_recorded, rk.date_recorded_parsed, rk.party_name, rk.heirs,
        rk.parcel_id, rk.property_address, rk.mailing_address,
        rk.property_city, rk.property_state, rk.property_zip,
        rk.legal_description, rk.doc_type,
-       -- Bucket-coalesced (agg), NOT the representative row's own — see agg CTE.
-       a.delinquent_amount, a.delinquent_bill_year,
+       -- Record-type groups come from their own source rows (_GROUP_SOURCE_CTES).
+       ts.src_delinquent_amount AS delinquent_amount,
+       ts.src_delinquent_bill_year AS delinquent_bill_year,
        rk.phone, rk.phone_type, rk.email, rk.phones, rk.emails,
        rk.absentee_owner, rk.out_of_state_owner, rk.owner_state,
-       rk.auction_date, rk.default_amount, rk.enrichment_data,
+       aus.src_auction_date AS auction_date, aus.src_default_amount AS default_amount,
+       rk.enrichment_data,
+       -- Merged into a copy of enrichment_data by apply_group_sources().
+       ts.tax_enrichment, aus.auction_nts, vs.violation_enrichment,
+       ts.tax_source_id, aus.auction_source_id, aus.auction_source_record_type,
+       vs.violation_source_id,
        -- The representative row's own type — lets the CSV builder tell a real date
        -- from the synthetic tax date after the tax bill_year is coalesced in (Codex).
        rk.record_type,
@@ -184,8 +243,7 @@ SELECT rk.id, rk.date_recorded, rk.date_recorded_parsed, rk.party_name, rk.heirs
        (NOT a.has_new AND a.has_prior) AS already_delivered,
        rk.skip_trace_status, rk.skip_trace_source, rk.skip_trace_attempted_at
 FROM ranked rk
-JOIN agg a ON a.bucket = rk.bucket
-WHERE rk.rn = 1
+JOIN agg a ON a.bucket = rk.bucket""" + _GROUP_SOURCE_JOINS + """WHERE rk.rn = 1
   AND (NOT :overlaps_only OR (rk.bucket LIKE 'pk:%' AND a.overlap_count >= 2))
 """ + _VIEW_FILTERS + """
 ORDER BY a.overlap_count DESC,
@@ -226,19 +284,17 @@ WHERE (NOT :overlaps_only OR (a.bucket LIKE 'pk:%' AND a.overlap_count >= 2))
 #   new + already_delivered = leads; stacked + single_list + no_identity = leads.
 # Record-type checks count only the leads they apply to (auction fields only exist
 # on pre-foreclosure / trustee-sale rows, tax fields only on tax-delinquent ones).
-# Auction / default amount are read off the representative row because that is
-# what the combined lead delivers, so a stacked lead whose probate row won the
-# bucket shows up here as missing them, which is the truth about the file.
-_QUALITY_SQL = _COMBINED_CTES + _RANKED_CTE + """,
+# Record-type fields are read off the same group source rows the combined lead
+# delivers (_GROUP_SOURCE_CTES), so a check passes exactly when the file has the value.
+_QUALITY_SQL = _COMBINED_CTES + _RANKED_CTE + _GROUP_SOURCE_CTES + """,
 q AS (
     SELECT rk.*, a.has_new, a.has_prior, a.overlap_count, a.matched_record_types,
-           a.delinquent_amount AS agg_delinquent_amount,
-           a.delinquent_bill_year AS agg_delinquent_bill_year,
+           ts.src_delinquent_amount, ts.src_delinquent_bill_year,
+           aus.src_auction_date, aus.src_default_amount,
            ('pre_foreclosure' = ANY(a.matched_record_types)
             OR 'trustee_sale' = ANY(a.matched_record_types)) AS auction_applies,
            'tax_delinquent' = ANY(a.matched_record_types) AS tax_applies
-    FROM ranked rk JOIN agg a ON a.bucket = rk.bucket
-    WHERE rk.rn = 1
+    FROM ranked rk JOIN agg a ON a.bucket = rk.bucket""" + _GROUP_SOURCE_JOINS + """    WHERE rk.rn = 1
 )
 SELECT count(*) AS leads,
        count(*) FILTER (WHERE has_new) AS new_leads,
@@ -257,11 +313,11 @@ SELECT count(*) AS leads,
        count(*) FILTER (WHERE skip_trace_source = 'lookup') AS contacts_looked_up,
        count(*) FILTER (WHERE skip_trace_source = 'reused') AS contacts_reused,
        count(*) FILTER (WHERE auction_applies) AS auction_applicable,
-       count(*) FILTER (WHERE auction_applies AND auction_date IS NOT NULL) AS with_auction_date,
-       count(*) FILTER (WHERE auction_applies AND default_amount IS NOT NULL) AS with_default_amount,
+       count(*) FILTER (WHERE auction_applies AND src_auction_date IS NOT NULL) AS with_auction_date,
+       count(*) FILTER (WHERE auction_applies AND src_default_amount IS NOT NULL) AS with_default_amount,
        count(*) FILTER (WHERE tax_applies) AS tax_applicable,
-       count(*) FILTER (WHERE tax_applies AND agg_delinquent_amount IS NOT NULL) AS with_tax_balance,
-       count(*) FILTER (WHERE tax_applies AND agg_delinquent_bill_year IS NOT NULL) AS with_tax_year
+       count(*) FILTER (WHERE tax_applies AND src_delinquent_amount IS NOT NULL) AS with_tax_balance,
+       count(*) FILTER (WHERE tax_applies AND src_delinquent_bill_year IS NOT NULL) AS with_tax_year
 FROM q
 """
 
@@ -300,6 +356,66 @@ _EMPTY_COUNTS = {
     "singletons_suppressed": 0,
     "unmatchable_no_parcel": 0,
 }
+
+
+# The enrichment_data keys each record-type group owns (the keys build_lead_export_row
+# and the Results UI read for that group). apply_group_sources moves exactly these
+# from the group's source row onto the lead, so a group is never half one row's.
+_TAX_ENRICHMENT_KEYS = ("billed_amount", "paid_amount", "account_status")
+_VIOLATION_ENRICHMENT_KEYS = (
+    "violation_category", "record_type", "case_type", "status", "description",
+    "last_inspection", "record_number", "case_number",
+)
+
+
+def _json_dict(value) -> dict | None:
+    """A json column as a dict. Raw text() SQL returns it parsed (psycopg2) or as its
+    text (asyncpg); anything that is not an object reads as None."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return None
+    return value if isinstance(value, dict) else None
+
+
+def apply_group_sources(data: dict) -> dict:
+    """Fold a _COMBINED_SQL row's record-type group sources into the lead, in place.
+
+    Pops the helper columns (tax_enrichment, auction_nts, violation_enrichment) and,
+    for EVERY group, drops that group's keys from a COPY of the representative row's
+    enrichment_data (the fetched value is never mutated), then sets them from the
+    group's source row when it has one. A group without a source shows nothing: the
+    representative row belongs to another record type, so its keys under those names
+    mean something else (Codex P1). The source ids become strings. One function for the CSV and the API, so the two can
+    never fold differently.
+    """
+    tax = _json_dict(data.pop("tax_enrichment", None))
+    nts = data.pop("auction_nts", None)
+    if isinstance(nts, str):
+        try:
+            nts = json.loads(nts)
+        except ValueError:
+            nts = None
+    violation = _json_dict(data.pop("violation_enrichment", None))
+    for key in ("tax_source_id", "auction_source_id", "violation_source_id"):
+        if data.get(key) is not None:
+            data[key] = str(data[key])
+
+    original = _json_dict(data.get("enrichment_data"))
+    enr = dict(original or {})
+    groups = (
+        (data.get("tax_source_id"), _TAX_ENRICHMENT_KEYS, tax or {}),
+        (data.get("violation_source_id"), _VIOLATION_ENRICHMENT_KEYS, violation or {}),
+        (data.get("auction_source_id"), ("nts",), {"nts": nts} if nts is not None else {}),
+    )
+    for source_id, keys, source in groups:
+        for key in keys:
+            enr.pop(key, None)
+            if source_id is not None and source.get(key) not in (None, ""):
+                enr[key] = source[key]
+    data["enrichment_data"] = enr if (enr or original is not None) else None
+    return data
 
 
 def _combined_pairs(
@@ -345,6 +461,7 @@ def _combined_pairs(
         # phone_2/3 + email_2/3. The bucket was ranked over ciphertext, so a
         # malformed representative reads blank; no sibling is substituted (accepted).
         lead = str(data.get("id"))
+        apply_group_sources(data)
         data["phone"], _ = decode_scalar(data.get("phone"), field="phone", lead_id=lead)
         data["email"], _ = decode_scalar(data.get("email"), field="email", lead_id=lead)
         data["phone_type"], _ = clean_phone_type(data.get("phone_type"), lead_id=lead)
@@ -447,7 +564,8 @@ def render_combined_csv(
     with system_sync_session() as db:
         pairs = _combined_pairs_all(db, user_id, job_ids, delivery_mode=delivery_mode)
         buf = io.StringIO()
-        write_lead_csv_with_overlap(pairs, buf, hidden_fields=hidden_fields)
+        write_lead_csv_with_overlap(
+            pairs, buf, hidden_fields=hidden_fields, columns=BATCH_LEAD_COLUMNS)
         db.rollback()  # read-only
         # One CSV row per pair, so len(pairs) IS the lead count in the file.
         return RenderedCsv(buf.getvalue().encode("utf-8"), len(pairs))
@@ -543,7 +661,8 @@ def finalize_batch_run(db, run, forced: bool = False, claim_token: str | None = 
         exporter.export_dir.mkdir(parents=True, exist_ok=True)
         try:
             with open(local_path, "w", newline="", encoding="utf-8") as fh:
-                write_lead_csv_with_overlap(pairs, fh, hidden_fields=hidden_fields)
+                write_lead_csv_with_overlap(
+                    pairs, fh, hidden_fields=hidden_fields, columns=BATCH_LEAD_COLUMNS)
             object_key = exporter.upload_to_r2(
                 local_path, f"exports/{run.user_id}/batch/{run.id}/combined.csv"
             )

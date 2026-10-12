@@ -2523,7 +2523,7 @@ def copy_cached_answer(db, user_id, rec, payload: dict) -> bool:
 
 def _enqueue_skip_trace_rows(
     db, job, r, job_id: str, config, *, on_begin=None, attempt_token=None,
-) -> None:
+) -> str:
     """Enqueue eligible Result rows into pending_skip_trace_rows.
 
     Called by run_scrape_job AFTER enrichment AND the plan cap, so the
@@ -2554,10 +2554,16 @@ def _enqueue_skip_trace_rows(
 
     ``attempt_token`` (run_scrape_job's `AttemptToken`) fences the claim to the
     attempt that owns the job: see the check under the claim lock below.
+
+    Returns why it stopped, for the degraded-run repair beat (P0-07 6b):
+    "done" (the enqueue ran to completion, whatever it queued), "unenforced"
+    (claims paused, see ClaimUnenforcedError below), or the gate that stopped it:
+    "disabled", "no_token", "config_off", "starter", "not_owner".
     """
     # Local imports — sa_select must be imported here because the module-
     # level import is scoped inside _run_inline_enrichment, not globally
     from sqlalchemy import select as sa_select
+    from sqlalchemy import text as sa_text
 
     from src.db.models import Result
     from src.scrapers.enrichment.skip_trace import (
@@ -2567,16 +2573,16 @@ def _enqueue_skip_trace_rows(
     from src.utils.address_intel import street_is_placeholder
 
     if not settings.SKIP_TRACE_ENABLED:
-        return
+        return "disabled"
     if not settings.TRACERFY_API_TOKEN:
         _publish_log(
             r, job_id, "warning",
             "Skip trace requested but TRACERFY_API_TOKEN not configured",
             db=db,
         )
-        return
+        return "no_token"
     if not getattr(config, "skip_trace_enabled", False):
-        return
+        return "config_off"
     # Plan gate: Starter excluded. Pro/Business/Agency allowed.
     from src.config.constants import normalize_plan
 
@@ -2587,7 +2593,7 @@ def _enqueue_skip_trace_rows(
             "Upgrade to Pro to unlock skip trace ($0.08/lookup).",
             db=db,
         )
-        return
+        return "starter"
 
     # ONE ENQUEUE PER JOB AT A TIME (Codex round 15 diff review, round 4).
     #
@@ -2690,7 +2696,7 @@ def _enqueue_skip_trace_rows(
             )
 
     if not eligible:
-        return
+        return "done"
 
     # Contact lookups are about to be ATTEMPTED — not necessarily queued; the
     # exceptions are listed at the end of this comment. Safe to commit on its own
@@ -2806,7 +2812,19 @@ def _enqueue_skip_trace_rows(
                 "Job %s: attempt token changed or job terminal; not queuing contact "
                 "lookups", job_id,
             )
-            return
+            return "not_owner"
+    # The customer may have switched skip trace off since `config` was read: the
+    # repair beat calls this long after the run, and a run can wait on the lock.
+    # FOR SHARE holds off a concurrent switch until the final commit, so the
+    # answer stays true for the claim it guards. No commit, no log: lock held.
+    _still_on = db.execute(
+        sa_text("SELECT skip_trace_enabled FROM scraper_configs WHERE id = :cid FOR SHARE"),
+        {"cid": str(config.id)},
+    ).scalar()
+    if not _still_on:
+        db.rollback()
+        _logger.info("Job %s: skip trace switched off; not queuing contact lookups", job_id)
+        return "config_off"
     # Re-read the leads under the lock. The set read before it is stale by now:
     # a concurrent enqueue may have claimed some of them, and the claim's own
     # join would drop those anyway, but re-reading keeps the cache-hit path from
@@ -2866,7 +2884,7 @@ def _enqueue_skip_trace_rows(
                 "matched to the lead",
                 db=db,
             )
-        return
+        return "done"
 
     skipped_ineligible = 0
     skipped_atip_policy = 0
@@ -2925,6 +2943,7 @@ def _enqueue_skip_trace_rows(
     # spent, Starter, frozen, ended). Told to the customer after the commit.
     claim_report: dict = {}
     _held_line: str | None = None
+    _unenforced = False
     if to_claim:
         from src.workers.skip_trace_claim import (
             ClaimUnenforcedError,
@@ -2974,6 +2993,7 @@ def _enqueue_skip_trace_rows(
                 db=db,
             )
             to_claim = []
+            _unenforced = True
         claimed = set(claimed_ids)
         for payload in to_claim:
             if str(payload["result_id"]) not in claimed:
@@ -3078,3 +3098,4 @@ def _enqueue_skip_trace_rows(
         job_id, cache_hits, cache_misses, enqueued_normal, enqueued_advanced,
         _v2_key_reads,
     )
+    return "unenforced" if _unenforced else "done"

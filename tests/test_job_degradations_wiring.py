@@ -42,7 +42,7 @@ def make_job(monkeypatch):
     """make_job(record_type) -> job_id: a pending job for a fresh business account."""
     connectors: list[str] = []
 
-    def make(record_type: str = "probate") -> str:
+    def make(record_type: str = "probate", skip_trace: bool = False) -> str:
         county = f"p007-{uuid.uuid4().hex[:8]}"
         start = datetime.now(UTC) - timedelta(days=10)
         with SyncSessionLocal() as s:
@@ -67,6 +67,7 @@ def make_job(monkeypatch):
                 id=str(uuid.uuid4()), user_id=user.id, name="p007 wiring",
                 county=county, state="WA", record_type=record_type,
                 fields=["party_name", "property_address"], enrichment=[],
+                skip_trace_enabled=skip_trace,
                 schedule={"frequency": "manual"}, deliver={"format": "csv", "emails": []},
                 active=True,
             )
@@ -205,7 +206,8 @@ _PHASES = [
 @pytest.mark.parametrize(("reason", "record_type", "module", "attr", "factory", "repair"),
                          _PHASES, ids=[p[0] for p in _PHASES])
 def test_a_failed_phase_finishes_done_and_marked(
-        make_job, redis_client, monkeypatch, reason, record_type, module, attr, factory, repair):
+        make_job, redis_client, monkeypatch, caplog, reason, record_type, module, attr,
+        factory, repair):
     job_id = make_job(record_type)
     monkeypatch.setattr(module, attr, factory())
     _apply(job_id)
@@ -219,6 +221,7 @@ def test_a_failed_phase_finishes_done_and_marked(
     assert [a.path for a in alerts] == [f"job_degraded:{job_id}:{reason}"]
     # Never the exception's text (P0-04).
     assert "wiring elm" not in repr((markers, logs, alerts)).lower()
+    assert "wiring elm" not in caplog.text.lower()  # nor in the worker's own log
 
 
 def test_enrichment_failure_no_longer_writes_the_old_line_or_queues_contacts(

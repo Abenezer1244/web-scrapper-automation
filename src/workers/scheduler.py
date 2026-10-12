@@ -16,6 +16,7 @@ from celery.schedules import crontab
 from src.config import settings
 from src.utils.logger import setup_logger
 from src.workers import app
+from src.workers.degradation_repair import REPAIR_SOFT_TIME_LIMIT_S, REPAIR_TIME_LIMIT_S
 
 # ─── Re-exports (preserve the historical scheduler.py import surface) ────────
 from src.workers.scheduler_helpers.batch import (  # noqa: F401
@@ -101,6 +102,11 @@ app.conf.beat_schedule = {
     "sweep-stranded-dedup-claims": {
         "task": "src.workers.scheduler.sweep_dedup_claims",
         "schedule": 300.0,  # every 5 minutes, alongside the reservation sweep
+    },
+    "repair-degraded-skip-trace": {
+        # P0-07 6b: re-queue the contact lookups of DONE jobs whose enqueue crashed.
+        "task": "src.workers.scheduler.repair_degraded_skip_trace",
+        "schedule": crontab(minute="1-59/15"),  # :01 :16 :31 :46, a free minute
     },
     "canary-check": {
         "task": "src.workers.scheduler.canary_check",
@@ -451,6 +457,22 @@ def sweep_dedup_claims() -> int:
     from src.workers.tasks_helpers.status import sweep_stranded_dedup_claims
 
     return sweep_stranded_dedup_claims()
+
+
+@app.task(
+    name="src.workers.scheduler.repair_degraded_skip_trace",
+    soft_time_limit=REPAIR_SOFT_TIME_LIMIT_S,
+    time_limit=REPAIR_TIME_LIMIT_S,
+)
+def repair_degraded_skip_trace() -> dict:
+    """Re-run the skip-trace enqueue of DONE jobs whose enqueue crashed (P0-07).
+
+    See src/workers/degradation_repair.py. Its own time limit is below the row
+    lease, so a run that is still alive never has its rows claimed twice.
+    """
+    from src.workers.degradation_repair import repair_degraded_skip_trace as _run
+
+    return _run()
 
 
 @app.task(name="src.workers.scheduler.watchdog_stuck_jobs")

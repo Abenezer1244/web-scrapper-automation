@@ -946,7 +946,7 @@ def transfer_undelivered_claims(db, job_id: str, user_id, record_type=None) -> i
             db.rollback()
             _logger.warning(
                 "Job %s: claim transfer failed for hash %s: %s",
-                job_id, dedup_hash[:12], str(exc)[:160],
+                job_id, dedup_hash[:12], type(exc).__name__,
             )
             first_failure = first_failure or exc
     if first_failure is not None:

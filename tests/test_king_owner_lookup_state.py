@@ -405,6 +405,8 @@ _STORED = "1000000001"     # answered in king_parcel_owners before the run
 _HIDDEN = "1000000002"     # only on a prior_run duplicate whose claim is settled
 _OPEN_DUP = "1000000003"   # only on a prior_run duplicate with no claim: can be promoted
 _LIVE = "1000000004"       # a new lead, and a settled duplicate on the same parcel
+_SAME_RUN = "1000000005"   # a same-run copy: survivor re-election can swap it in
+_SWEEPABLE = "1000000006"  # claim held by a failed, never-billed run: the sweep frees it
 
 
 async def _store_answer(db, pid: str, outcome: str, owner: str | None) -> None:
@@ -435,33 +437,42 @@ async def _rerun_job(db, user: User) -> tuple[str, dict[str, str]]:
     await db.commit()
     job_id = str(uuid.uuid4())
     db.add(Job(id=job_id, user_id=user.id, scraper_config_id=config.id, status="enriching",
-               trigger="manual", record_count=5, billed_count=2))
+               trigger="manual", record_count=7, billed_count=2))
+    # A run that claimed a lead, failed and never billed: sweep_stranded_dedup_claims
+    # releases its claims, so they can be gone before this run transfers claims.
+    failed_id = str(uuid.uuid4())
+    db.add(Job(id=failed_id, user_id=user.id, scraper_config_id=config.id, status="failed",
+               trigger="manual", record_count=1))
     await db.commit()
     rows = {
-        # key: (parcel, is_duplicate, claim) -- claim: "settled" = a claim whose
-        # anchor row is gone (purged run), None = no claim at all.
-        "stored_new": (_STORED, False, None),
-        "hidden": (_HIDDEN, True, "settled"),
-        "open_dup": (_OPEN_DUP, True, None),
-        "live_new": (_LIVE, False, None),
-        "live_hidden": (_LIVE, True, "settled"),
+        # key: (parcel, duplicate_reason, claim) -- claim: "settled" = a claim whose
+        # anchor row is gone (purged run) and whose run delivered; "sweepable" = the
+        # same, held by the failed run above; None = no claim at all.
+        "stored_new": (_STORED, None, None),
+        "hidden": (_HIDDEN, "prior_run", "settled"),
+        "open_dup": (_OPEN_DUP, "prior_run", None),
+        "live_new": (_LIVE, None, None),
+        "live_hidden": (_LIVE, "prior_run", "settled"),
+        "same_run": (_SAME_RUN, "same_run", None),
+        "sweepable": (_SWEEPABLE, "prior_run", "sweepable"),
     }
     ids: dict[str, str] = {}
-    for key, (parcel, dup, claim) in rows.items():
+    for key, (parcel, reason, claim) in rows.items():
         rid = str(uuid.uuid4())
         dedup_hash = f"{key}-{parcel}".ljust(64, "0")
         db.add(Result(
             id=rid, user_id=user.id, job_id=job_id, party_name=None, parcel_id=parcel,
             legal_description=parcel, mailing_address="3420 S 164TH ST, SEATAC, WA 98188",
-            is_duplicate=dup, duplicate_reason="prior_run" if dup else None,
+            is_duplicate=reason is not None, duplicate_reason=reason,
             dedup_hash=dedup_hash, skip_trace_status="not_attempted",
             enrichment_data={"source": "king_county_delinquent_taxes",
                              "delinquent_amount": "7066.18"},
         ))
         await db.commit()
-        if claim == "settled":
+        if claim:
             db.add(DeliveredRecord(id=str(uuid.uuid4()), user_id=user.id,
-                                   dedup_hash=dedup_hash, first_result_id=None))
+                                   dedup_hash=dedup_hash, first_result_id=None,
+                                   first_job_id=failed_id if claim == "sweepable" else None))
             await db.commit()
         ids[key] = rid
     return job_id, ids
@@ -491,9 +502,11 @@ async def test_a_rerun_asks_king_only_about_rows_that_can_still_be_delivered(
     await asyncio.to_thread(_enrich, job_id, redis_client)
 
     # Never asked: the parcel with a stored answer, and the row that stays hidden.
-    # Still asked: the new lead, and the duplicate a claim transfer could promote.
-    assert sorted(phase1_asked) == sorted([_OPEN_DUP, _LIVE])
-    assert sorted(owner_asked) == sorted([_OPEN_DUP, _LIVE])
+    # Still asked: the new lead, and every duplicate that can still be delivered
+    # (no claim, a same-run copy, a claim the stranded-claim sweep can release).
+    can_deliver = sorted([_OPEN_DUP, _LIVE, _SAME_RUN, _SWEEPABLE])
+    assert sorted(phase1_asked) == can_deliver
+    assert sorted(owner_asked) == can_deliver
     rows = await _rows(db, ids)
     assert rows["stored_new"].party_name == "STORED OWNER LLC"
     assert rows["live_new"].party_name == "OWNER 4"
@@ -505,10 +518,14 @@ async def test_a_rerun_asks_king_only_about_rows_that_can_still_be_delivered(
     assert rows["hidden"].party_name is None
     assert "owner_lookup_deferred" not in rows["hidden"].enrichment_data
     # What King said is stored for every later run and account.
+    assert rows["same_run"].party_name == "OWNER 5"
+    assert rows["sweepable"].party_name == "OWNER 6"
     assert await _stored(db) == {
         _STORED: ("found", "STORED OWNER LLC"),
         _OPEN_DUP: ("found", "OWNER 3"),
         _LIVE: ("found", "OWNER 4"),
+        _SAME_RUN: ("found", "OWNER 5"),
+        _SWEEPABLE: ("found", "OWNER 6"),
     }
     assert "Used saved county owner records for 1 leads." in await _logs(db, job_id)
 
@@ -567,3 +584,33 @@ async def test_only_a_page_for_the_parcel_asked_about_is_stored(
     stored = await _stored(db)
     assert stored.get(_LIVE) == ("found", "PAGE OWNER")
     assert _OPEN_DUP not in stored and "9999999999" not in stored
+
+
+async def test_a_page_showing_no_owner_is_stored_and_not_asked_again_in_the_same_run(
+    db, business_user, redis_client, monkeypatch,
+):
+    _lease(monkeypatch, admitted=True)
+    job_id, ids = await _rerun_job(db, business_user)
+    owner_asked: list[str] = []
+
+    async def _phase1(parcel_ids, **kw):
+        # The page echoed the parcel and has a site address but no owner.
+        return {_LIVE: {"property_address": "1 MAIN ST", "owner_name": None,
+                        "parcel_lookup": "verified"}}
+
+    def _get(url, **k):
+        owner_asked.append(url[-10:])
+        return _Resp(200, _page(url[-10:], "SOMEONE"))
+
+    monkeypatch.setattr(kca, "_batch_enrich_king_county", _phase1)
+    monkeypatch.setattr(kca, "safe_get", _get)
+
+    await asyncio.to_thread(_enrich, job_id, redis_client)
+
+    assert _LIVE not in owner_asked
+    assert (await _stored(db))[_LIVE] == ("not_on_record", None)
+    rows = await _rows(db, ids)
+    for key in ("live_new", "live_hidden"):
+        assert rows[key].party_name is None
+        assert rows[key].enrichment_data["owner_lookup_outcome"] == "not_on_record", key
+

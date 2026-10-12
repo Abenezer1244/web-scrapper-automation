@@ -245,7 +245,8 @@ def _fill_king_owners_from_store(db, rows) -> int:
 
 def _hidden_duplicate_ids(db, rows, user_id, job_id: str) -> set:
     """Ids of rows that stay "already delivered" whatever this run does: prior_run
-    duplicates whose claim transfer_undelivered_claims can never move here.
+    duplicates whose claim transfer_undelivered_claims can never move here, not even
+    after the stranded-claim sweep runs.
 
     The job's King per-parcel owner lookups skip only these. Any other duplicate can
     still become this run's lead after enrichment (same-run survivor re-election, a
@@ -256,7 +257,8 @@ def _hidden_duplicate_ids(db, rows, user_id, job_id: str) -> set:
 
     prior = [res for res in rows
              if res.is_duplicate and res.duplicate_reason == "prior_run" and res.dedup_hash]
-    settled = settled_claim_hashes(db, user_id, job_id, list({res.dedup_hash for res in prior}))
+    settled = settled_claim_hashes(db, user_id, job_id, list({res.dedup_hash for res in prior}),
+                                   sweep_proof=True)
     return {res.id for res in prior if res.dedup_hash in settled}
 
 
@@ -1746,9 +1748,10 @@ def _run_inline_enrichment(
                     prop = data.get("property_address")
                     mail = data.get("mailing_address")
                     owner = data.get("owner_name")
-                    if owner and data.get("parcel_lookup") == "verified":
-                        # The page echoed the parcel we asked for: a settled answer.
-                        _p1_answers[pid] = ("found", owner)
+                    if data.get("parcel_lookup") == "verified":
+                        # The page echoed the parcel we asked for: a settled answer,
+                        # read the same way as the owner-only pass reads it.
+                        _p1_answers[pid] = ("found", owner) if owner else ("not_on_record", None)
                     for res in pid_map.get(pid, []):
                         if data.get("resolved_by") == "gis_plus_owner_match" and not (
                             # Compare against the assessor OWNER that actually proved the
@@ -2063,6 +2066,16 @@ def _run_inline_enrichment(
             def _ed(res) -> dict:
                 return dict(res.enrichment_data) if isinstance(res.enrichment_data, dict) else {}
 
+            # Answers pass 1 just stored name or settle rows with no second request.
+            try:
+                _fill_king_owners_from_store(db, all_results)
+                db.commit()
+            except Exception as exc:  # noqa: BLE001 -- the owner-only pass asks instead
+                if type(exc).__name__ in ("SoftTimeLimitExceeded", "TimeLimitExceeded"):
+                    raise
+                db.rollback()
+                _logger.warning("Job %s: pass-1 owner answers not applied: %s",
+                                job_id, str(exc)[:120])
             owner_needs = [
                 res for res in all_results
                 if res.parcel_id and len(res.parcel_id.strip()) >= 6

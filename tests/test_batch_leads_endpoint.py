@@ -12,10 +12,22 @@ from decimal import Decimal
 
 import pytest
 import pytest_asyncio
+from sqlalchemy import func, select
 
 import src.utils.crypto as crypto
 from src.config import settings
-from src.db.models import BatchRun, Job, Result, ScraperBatch, ScraperConfig
+from src.db.models import (
+    BatchRun,
+    Job,
+    PendingSkipTraceRow,
+    Result,
+    ScraperBatch,
+    ScraperConfig,
+    SkipTraceCache,
+    SkipTraceMeterEvent,
+    SkipTraceQueue,
+)
+from src.utils.lead_export import LEAD_CSV_COLUMNS, OVERLAP_LEAD_COLUMNS
 from tests.test_contact_decode import (
     CORRUPT_FE1,
     FERNET_SHAPED,
@@ -268,9 +280,10 @@ class TestBatchLeadsAudit:
             "with_parcel": 3, "with_property_address": 4, "with_mailing_address": 2,
             "with_phone": 1, "with_email": 1,
             "contacts_looked_up": 0, "contacts_reused": 1,
-            # The stacked lead shows its probate row (contact first), so the file
-            # carries no auction date for it: the check reports that, not a pass.
-            "auction_applicable": 3, "with_auction_date": 1, "with_default_amount": 1,
+            # The stacked lead's probate row carries its contact, but its auction
+            # group comes from its own pre-foreclosure row (group sources, 2026-10-11),
+            # so the file has the date and the check counts it.
+            "auction_applicable": 3, "with_auction_date": 2, "with_default_amount": 2,
             "tax_applicable": 0, "with_tax_balance": 0, "with_tax_year": 0,
         }
         # Exclusive groups reconcile.
@@ -509,3 +522,257 @@ class TestBatchLeadContacts:
         cells = {r["party_name"]: r for r in rows}
         assert cells["CORRUPT REP"]["phone"] == ""
         assert (cells["HIT"]["phone_2"], cells["HIT"]["email_3"]) == ("2065550101", "third@example.com")
+
+
+# â”€â”€ Results parity: record-type groups, provenance, hidden fields (2026-10-11) â”€â”€
+#
+# The batch table showed less than the same lead in a single-scrape Results table.
+# A stacked property's representative row is chosen for its CONTACT, so its auction /
+# tax / violation fields used to be whatever that (often probate) row had: blank.
+# Each group is now read whole from one row of its own record type.
+
+async def _child_at(db, user_id, batch_id, record_type, created_at):
+    job = await _child(db, user_id, batch_id, record_type)
+    job.created_at = created_at
+    await db.flush()
+    return job
+
+
+@pytest_asyncio.fixture
+async def parity_batch(db, starter_user, business_user):
+    """One property on four lists, with a contact-bearing probate row, two disagreeing
+    pre-foreclosure rows, two disagreeing tax rows, a code-violation row, and another
+    tenant's tax row for the same property whose job id is forged into the run."""
+    t0 = datetime(2026, 10, 1, 12, tzinfo=UTC)
+    batch = await _batch(db, starter_user.id, "Parity")
+    probate = await _child_at(db, starter_user.id, batch.id, "probate", t0 + timedelta(hours=1))
+    prefc_a = await _child_at(db, starter_user.id, batch.id, "pre_foreclosure", t0)
+    prefc_b = await _child_at(db, starter_user.id, batch.id, "pre_foreclosure", t0 + timedelta(hours=2))
+    tax_old = await _child_at(db, starter_user.id, batch.id, "tax_delinquent", t0)
+    tax_new = await _child_at(db, starter_user.id, batch.id, "tax_delinquent", t0 + timedelta(hours=3))
+    violation = await _child_at(db, starter_user.id, batch.id, "code_violation", t0)
+    foreign_batch = await _batch(db, business_user.id, "Foreign")
+    foreign = await _child_at(
+        db, business_user.id, foreign_batch.id, "tax_delinquent", t0 + timedelta(hours=9))
+
+    ids = {}
+
+    def row(key, job, user_id=starter_user.id, **kw):
+        rid = str(uuid.uuid4())
+        ids[key] = rid
+        kw.setdefault("party_name", "STACK OWNER")
+        kw.setdefault("date_recorded", "09/20/2026")
+        db.add(Result(
+            id=rid, user_id=user_id, job_id=job.id, property_key="pk-parity",
+            parcel_id="0444444444", property_address="1 STACK ST", **kw,
+        ))
+
+    row("probate", probate, mailing_address="PO BOX 4", heirs="HEIR ONE",
+        legal_description="LOT 1 BLOCK 2", is_duplicate=True,
+        phone="2535550144", email="stack@example.com",
+        phones=[{"number": "2535550144", "type": "Mobile"},
+                {"number": "2535550145", "type": "Landline"}],
+        emails=["stack@example.com", "second@example.com"],
+        skip_trace_status="hit", skip_trace_source="reused",
+        skip_trace_attempted_at=datetime(2026, 9, 26, 8, tzinfo=UTC))
+    row("prefc_a", prefc_a, auction_date=date(2026, 11, 6), default_amount=Decimal("1000.00"),
+        enrichment_data={"nts": {"trustee": "TRUSTEE A", "ts_number": "TS-A"}})
+    # Newer, but no auction date: it must not win, and none of its fields may leak.
+    row("prefc_b", prefc_b, default_amount=Decimal("5000.00"),
+        enrichment_data={"nts": {"trustee": "TRUSTEE B", "ts_number": "TS-B"}})
+    # The old independent max() paired 200.00 (new row) with 2026 (old row).
+    row("tax_old", tax_old, delinquent_amount=Decimal("100.00"), delinquent_bill_year=2026,
+        date_recorded="01/01/2026",
+        enrichment_data={"billed_amount": 150, "paid_amount": 50, "account_status": "OLD"})
+    row("tax_new", tax_new, delinquent_amount=Decimal("200.00"), delinquent_bill_year=2025,
+        date_recorded="01/01/2025",
+        enrichment_data={"billed_amount": 250, "account_status": "NEW"})
+    row("violation", violation,
+        enrichment_data={"case_type": "Junk Storage", "status": "Open", "case_number": "CV-9"})
+    row("foreign", foreign, user_id=business_user.id, delinquent_amount=Decimal("999.00"),
+        delinquent_bill_year=2026, date_recorded="01/01/2026")
+
+    children = [probate, prefc_a, prefc_b, tax_old, tax_new, violation, foreign]
+    db.add(BatchRun(id=str(uuid.uuid4()), batch_id=batch.id, user_id=starter_user.id,
+                    status="done", child_job_ids=[j.id for j in children]))
+    await db.commit()
+    return batch, ids
+
+
+class TestBatchLeadParity:
+    async def _lead(self, client, token, batch):
+        resp = await client.get(f"/batches/{batch.id}/leads", headers=_auth(token))
+        assert resp.status_code == 200
+        body = resp.json()
+        assert len(body["leads"]) == 1  # one property, four lists
+        return body, body["leads"][0]
+
+    async def _csv_row(self, client, token, batch):
+        resp = await client.get(f"/batches/{batch.id}/download", headers=_auth(token))
+        assert resp.status_code == 200
+        rows = list(csv.DictReader(io.StringIO(resp.text)))
+        assert len(rows) == 1
+        return rows[0]
+
+    async def test_identity_address_and_split_contacts(self, client, starter_token, parity_batch):
+        batch, ids = parity_batch
+        _, lead = await self._lead(client, starter_token, batch)
+        assert lead["id"] == ids["probate"]  # the contact-bearing row represents it
+        assert (lead["party_name"], lead["parcel_id"]) == ("STACK OWNER", "0444444444")
+        assert (lead["property_address"], lead["mailing_address"]) == ("1 STACK ST", "PO BOX 4")
+        assert (lead["heirs"], lead["legal_description"]) == ("HEIR ONE", "LOT 1 BLOCK 2")
+        assert [p["number"] for p in lead["phones"]] == ["2535550144", "2535550145"]
+        assert lead["emails"] == ["stack@example.com", "second@example.com"]
+        assert lead["contact_reused"] is True
+        assert lead["matched_record_types"] == [
+            "code_violation", "pre_foreclosure", "probate", "tax_delinquent",
+        ]
+        assert lead["overlap_count"] == 4
+
+    async def test_each_group_comes_whole_from_one_source_row(
+        self, client, starter_token, parity_batch,
+    ):
+        batch, ids = parity_batch
+        _, lead = await self._lead(client, starter_token, batch)
+        enr = lead["enrichment_data"]
+        # Auction: the row WITH an auction date, never the newer one without.
+        assert (lead["auction_date"], lead["default_amount"]) == ("2026-11-06", 1000.0)
+        assert lead["auction_source_id"] == ids["prefc_a"]
+        assert lead["auction_source_record_type"] == "pre_foreclosure"
+        assert enr["nts"] == {"trustee": "TRUSTEE A", "ts_number": "TS-A"}
+        assert isinstance(lead["days_to_auction"], int)
+        # Tax: amount, year and enrichment all from the newest tax row; the old row's
+        # paid_amount must not ride along, and the other tenant's row never counts.
+        assert (lead["delinquent_amount"], lead["delinquent_bill_year"]) == (200.0, 2025)
+        assert lead["tax_source_id"] == ids["tax_new"]
+        assert (enr["billed_amount"], enr["account_status"]) == (250, "NEW")
+        assert "paid_amount" not in enr
+        assert lead["months_delinquent"] is not None
+        # Violation.
+        assert lead["violation_source_id"] == ids["violation"]
+        assert (enr["case_type"], enr["status"], enr["case_number"]) == (
+            "Junk Storage", "Open", "CV-9")
+
+    async def test_csv_carries_the_same_values(self, client, starter_token, parity_batch):
+        batch, _ = parity_batch
+        _, lead = await self._lead(client, starter_token, batch)
+        row = await self._csv_row(client, starter_token, batch)
+        assert (row["parcel_id"], row["property_address"], row["mailing_address"]) == (
+            "0444444444", "1 STACK ST", "PO BOX 4")
+        assert (row["phone"], row["phone_2"], row["email"], row["email_2"]) == (
+            "2535550144", "2535550145", "stack@example.com", "second@example.com")
+        assert (row["auction_date"], row["default_amount"]) == ("2026-11-06", "1000.00")
+        assert row["days_to_auction"] == str(lead["days_to_auction"])
+        assert (row["delinquent_amount"], row["delinquent_bill_year"]) == ("200.00", "2025")
+        assert row["lists_count"] == "4"
+        # The per-job columns the combined CSV lacked, each from its group's source row.
+        assert (row["trustee"], row["ts_number"]) == ("TRUSTEE A", "TS-A")
+        assert (row["tax_billed_amount"], row["tax_account_status"], row["tax_paid_amount"]) == (
+            "250", "NEW", "")
+        assert row["months_delinquent"] == str(lead["months_delinquent"])
+        assert (row["code_violation_type"], row["code_violation_status"]) == (
+            "Junk Storage", "Open")
+
+    async def test_batch_csv_appends_the_per_job_columns(
+        self, client, starter_token, parity_batch,
+    ):
+        """Existing combined columns keep their positions; every per-job column the
+        combined file lacked follows them (header-mapped and ordinal importers both
+        keep working). Segment (Lists) CSVs keep the old header."""
+        batch, _ = parity_batch
+        resp = await client.get(f"/batches/{batch.id}/download", headers=_auth(starter_token))
+        header = next(csv.reader(io.StringIO(resp.text)))
+        assert header[:len(OVERLAP_LEAD_COLUMNS)] == OVERLAP_LEAD_COLUMNS
+        assert set(header) == set(OVERLAP_LEAD_COLUMNS) | (set(LEAD_CSV_COLUMNS) - {"date_recorded"})
+        assert len(header) == len(set(header))
+
+    async def test_quality_counts_the_group_values(self, client, starter_token, parity_batch):
+        batch, _ = parity_batch
+        body, _ = await self._lead(client, starter_token, batch)
+        q = body["quality"]
+        assert (q["auction_applicable"], q["with_auction_date"], q["with_default_amount"]) == (
+            1, 1, 1)
+        assert (q["tax_applicable"], q["with_tax_balance"], q["with_tax_year"]) == (1, 1, 1)
+
+    async def test_hidden_fields_stay_hidden(self, client, starter_token, db, parity_batch):
+        batch, _ = parity_batch
+        row = await db.get(ScraperBatch, batch.id)
+        row.fields = {"mailing_address": False, "heirs": False, "legal_description": False}
+        await db.commit()
+        _, lead = await self._lead(client, starter_token, batch)
+        assert (lead["mailing_address"], lead["heirs"], lead["legal_description"]) == (
+            None, None, None)
+        csv_row = await self._csv_row(client, starter_token, batch)
+        assert (csv_row["mailing_address"], csv_row["heirs"], csv_row["legal_description"]) == (
+            "", "", "")
+
+    async def test_showing_a_reused_contact_buys_nothing(
+        self, client, starter_token, db, parity_batch,
+    ):
+        """Skip tracing off: viewing and downloading a lead whose contact was reused
+        from an earlier run queues no lookup and meters no charge."""
+        batch, _ = parity_batch
+        tables = (SkipTraceQueue, PendingSkipTraceRow, SkipTraceMeterEvent, SkipTraceCache)
+
+        async def counts():
+            return [(await db.execute(select(func.count()).select_from(t))).scalar_one()
+                    for t in tables]
+
+        before = await counts()
+        await self._lead(client, starter_token, batch)
+        await self._csv_row(client, starter_token, batch)
+        assert await counts() == before
+
+
+@pytest_asyncio.fixture
+async def no_source_batch(db, starter_user):
+    """Three single-property leads that each test a group with NO usable source row:
+    a probate lead whose own enrichment uses violation / tax key names, a tax lead
+    with enrichment-only tax data, and a pre-foreclosure lead whose nts is JSON null."""
+    t0 = datetime(2026, 10, 1, 12, tzinfo=UTC)
+    batch = await _batch(db, starter_user.id, "NoSource")
+    probate = await _child_at(db, starter_user.id, batch.id, "probate", t0)
+    tax = await _child_at(db, starter_user.id, batch.id, "tax_delinquent", t0)
+    prefc = await _child_at(db, starter_user.id, batch.id, "pre_foreclosure", t0)
+    for job, party, pk, enrichment in (
+        (probate, "PROBATE ONLY", "pk-prob",
+         {"status": "Closed", "description": "Estate", "billed_amount": 7, "kept": "yes"}),
+        (tax, "TAX ENRICH ONLY", "pk-tax", {"billed_amount": 300, "account_status": "OPEN"}),
+        (prefc, "NTS NULL", "pk-nts", {"nts": None}),
+    ):
+        db.add(Result(
+            id=str(uuid.uuid4()), user_id=starter_user.id, job_id=job.id,
+            date_recorded="09/20/2026", party_name=party, property_key=pk,
+            parcel_id="05" + pk[-3:].upper().ljust(8, "0"), property_address=f"1 {party} ST",
+            enrichment_data=enrichment,
+        ))
+    db.add(BatchRun(id=str(uuid.uuid4()), batch_id=batch.id, user_id=starter_user.id,
+                    status="done", child_job_ids=[probate.id, tax.id, prefc.id]))
+    await db.commit()
+    return batch
+
+
+class TestBatchLeadGroupsWithoutSource:
+    async def test_no_source_means_no_group_values(self, client, starter_token, no_source_batch):
+        resp = await client.get(f"/batches/{no_source_batch.id}/leads", headers=_auth(starter_token))
+        assert resp.status_code == 200
+        leads = {lead["party_name"]: lead for lead in resp.json()["leads"]}
+        # A probate row's own "status" / "billed_amount" are not violation / tax data.
+        prob = leads["PROBATE ONLY"]
+        assert prob["enrichment_data"] == {"kept": "yes"}
+        assert (prob["tax_source_id"], prob["violation_source_id"]) == (None, None)
+        # Enrichment-only tax data still makes the tax row its group's source.
+        tax = leads["TAX ENRICH ONLY"]
+        assert tax["tax_source_id"] == tax["id"]
+        assert (tax["enrichment_data"]["billed_amount"], tax["enrichment_data"]["account_status"]) == (
+            300, "OPEN")
+        # A JSON-null nts is not auction data.
+        nts = leads["NTS NULL"]
+        assert nts["auction_source_id"] is None
+        assert "nts" not in (nts["enrichment_data"] or {})
+
+        csv_resp = await client.get(f"/batches/{no_source_batch.id}/download",
+                                    headers=_auth(starter_token))
+        assert csv_resp.status_code == 200
+        rows = {r["party_name"]: r for r in csv.DictReader(io.StringIO(csv_resp.text))}
+        assert set(rows) == set(leads)

@@ -8,7 +8,6 @@ by the dispatch worker (system-written), so this route only persists the parent
 + children, then kicks off the fan-out.
 """
 import io
-import json
 import uuid
 from datetime import UTC, datetime
 from typing import Any, Literal
@@ -66,7 +65,9 @@ from src.db import CountyConnector
 from src.db.models import BatchRun, Job, Result, ScraperBatch, ScraperConfig
 from src.scrapers.probate import new_probate_config_tod_default
 from src.utils.contact_decode import clean_phone_type, decode_array, decode_scalar
-from src.utils.lead_export import resolve_hidden_output_fields
+from src.utils.lead_export import HIDEABLE_OUTPUT_FIELDS, resolve_hidden_output_fields
+from src.utils.lead_signals import auction_reference_date, derive_signals
+from src.utils.located_parcel import located_parcel_id, located_parcel_match
 from src.utils.logger import setup_logger
 from src.utils.source_dates import is_auction_date_fallback
 
@@ -1062,6 +1063,7 @@ async def _leads_page(
         _FACETS_SQL,
         _FILTERED_TOTAL_SQL,
         _QUALITY_SQL,
+        apply_group_sources,
     )
 
     if run is None or run.status not in _DOWNLOADABLE_STATUSES:
@@ -1141,10 +1143,17 @@ async def _leads_page(
         rows = result.fetchall()
 
     hidden = resolve_hidden_output_fields(batch.fields)
+    # One clock pair per page, the same two clocks ResultRow uses (UTC for the tax
+    # signals, county-local for the auction countdown).
+    now = datetime.now(UTC)
+    auction_today = auction_reference_date(now)
     leads = []
     for r in rows:
         data = dict(r._mapping)
         data["id"] = str(data["id"])
+        # Record-type groups from their own source rows, folded exactly as the CSV
+        # folds them (batch_export.apply_group_sources).
+        apply_group_sources(data)
         # Raw text() SQL: no column type runs, so every contact goes through the one
         # decoder (UX 3.8s2, arrays 3.8a). An unreadable value is None + a WARNING
         # naming the lead and field, never ciphertext and never a failed page, and
@@ -1158,20 +1167,20 @@ async def _leads_page(
         data["contact_decode_failed"] = any(
             (bad_phone, bad_email, bad_type, bad_phones, bad_emails)
         )
-        # Honor the batch's output-field visibility exactly like the CSV
-        # (of the hideable set, only mailing_address is a combined-view column).
-        if "mailing_address" in hidden:
-            data["mailing_address"] = None
+        # Honor the batch's output-field visibility exactly like the CSV.
+        for field in hidden & HIDEABLE_OUTPUT_FIELDS:
+            data[field] = None
         data["matched_record_types"] = list(data.get("matched_record_types") or [])
         data["source_counties"] = list(data.get("source_counties") or [])
-        # Raw text() SQL: a json column can arrive as its text rather than a dict.
-        enrichment = data.get("enrichment_data")
-        if isinstance(enrichment, str):
-            try:
-                enrichment = json.loads(enrichment)
-            except ValueError:
-                enrichment = None
+        enrichment = data.get("enrichment_data")  # a dict or None after the fold
         data["date_is_auction_date"] = is_auction_date_fallback(data.get("date_recorded"), enrichment)
+        # Derived after date_is_auction_date (freshness reads it), like ResultRow.
+        signals = derive_signals(data, now.date(), auction_today=auction_today)
+        data["months_delinquent"] = signals["months_delinquent"]
+        data["days_to_auction"] = signals["days_to_auction"]
+        if not data.get("parcel_id"):
+            data["located_parcel_id"] = located_parcel_id(enrichment)
+            data["located_parcel_match"] = located_parcel_match(enrichment)
         data["skip_trace_status"] = data.get("skip_trace_status") or "not_attempted"
         data["contact_reused"] = data.pop("skip_trace_source", None) == "reused"
         leads.append(BatchLeadRow(**data))

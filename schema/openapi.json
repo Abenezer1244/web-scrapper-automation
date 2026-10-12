@@ -800,6 +800,40 @@
             "title": "Already Delivered",
             "type": "boolean"
           },
+          "auction_date": {
+            "anyOf": [
+              {
+                "format": "date",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Auction Date"
+          },
+          "auction_source_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Auction Source Id"
+          },
+          "auction_source_record_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Auction Source Record Type"
+          },
           "contact_decode_failed": {
             "default": false,
             "description": "True when a stored contact value of this row could not be read and was dropped (phone, email, phone_type, phones incl. a phone's type, or emails). Show the contact as unavailable, never as a lookup result.",
@@ -827,6 +861,61 @@
             ],
             "title": "Date Recorded"
           },
+          "days_to_auction": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Days To Auction"
+          },
+          "default_amount": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Default Amount"
+          },
+          "delinquent_amount": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Delinquent Amount"
+          },
+          "delinquent_bill_year": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Delinquent Bill Year"
+          },
+          "doc_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Doc Type"
+          },
           "email": {
             "anyOf": [
               {
@@ -853,6 +942,30 @@
             "description": "Up to 3 skip-traced emails of the row this lead shows; same null / [] rules as phones.",
             "title": "Emails"
           },
+          "enrichment_data": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The representative row's enrichment_data with each record-type group's keys (tax, code violation, NTS auction) replaced by that group's source row's own.",
+            "title": "Enrichment Data"
+          },
+          "heirs": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Heirs"
+          },
           "id": {
             "title": "Id",
             "type": "string"
@@ -867,6 +980,39 @@
               }
             ],
             "title": "Lead Subtype"
+          },
+          "legal_description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Legal Description"
+          },
+          "located_parcel_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Located Parcel Id"
+          },
+          "located_parcel_match": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Located Parcel Match"
           },
           "mailing_address": {
             "anyOf": [
@@ -885,6 +1031,17 @@
             },
             "title": "Matched Record Types",
             "type": "array"
+          },
+          "months_delinquent": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Months Delinquent"
           },
           "overlap_count": {
             "default": 1,
@@ -985,6 +1142,28 @@
             },
             "title": "Source Counties",
             "type": "array"
+          },
+          "tax_source_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tax Source Id"
+          },
+          "violation_source_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Violation Source Id"
           }
         },
         "required": [

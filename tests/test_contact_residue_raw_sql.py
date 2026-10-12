@@ -339,8 +339,14 @@ GOLDEN_SEGMENTS_CSV = (
     b',1,Probate,pierce,OWNER,GOLDEN,2065550100,Mobile,owner@example.com,2065550101,2065550102,second@example.com,third@example.com,100 GOLDEN OWNER ST,TACOMA,WA,98402,,,,,GOLDEN OWNER,,,,,"100 GOLDEN OWNER ST, TACOMA, WA 98402",,,,,,,,\r\n'
 )
 GOLDEN_COMBINED_CSV = (
-    b'overlap,lists_count,lists,counties,first_name,last_name,phone,phone_type,email,phone_2,phone_3,email_2,email_3,property_street,property_city,property_state,property_zip,filed_date,doc_type,delinquent_amount,delinquent_bill_year,party_name,mailing_address,parcel_id,heirs,legal_description,property_address,lead_subtype,mailing_street,mailing_city,mailing_state,mailing_zip,auction_date,days_to_auction,default_amount\r\n'
-    b',1,Probate,pierce,OWNER,GOLDEN,2065550100,Mobile,owner@example.com,2065550101,2065550102,second@example.com,third@example.com,100 GOLDEN OWNER ST,TACOMA,WA,98402,,,,,GOLDEN OWNER,,,,,"100 GOLDEN OWNER ST, TACOMA, WA 98402",,,,,,,,\r\n'
+    b'overlap,lists_count,lists,counties,first_name,last_name,phone,phone_type,email,phone_2,phone_3,email_2,email_3,property_street,property_city,property_state,property_zip,filed_date,doc_type,delinquent_amount,delinquent_bill_year,party_name,mailing_address,parcel_id,heirs,legal_description,property_address,lead_subtype,mailing_street,mailing_city,mailing_state,mailing_zip,auction_date,days_to_auction,default_amount'
+    # The batch file's per-job columns, appended after the combined set (2026-10-12):
+    # every byte above is unchanged, so ordinal importers keep working.
+    b',assessed_value,instrument_number,code_violation_type,code_violation_status,code_violation_description,code_violation_last_inspection,tax_billed_amount,tax_paid_amount,tax_account_status,months_delinquent,wa_foreclosure_eligible,freshness_days,contactability_score,absentee_owner,out_of_state_owner,owner_state,trustee,ts_number,current_owner,title_status,parcel_source'
+    b'\r\n'
+    b',1,Probate,pierce,OWNER,GOLDEN,2065550100,Mobile,owner@example.com,2065550101,2065550102,second@example.com,third@example.com,100 GOLDEN OWNER ST,TACOMA,WA,98402,,,,,GOLDEN OWNER,,,,,"100 GOLDEN OWNER ST, TACOMA, WA 98402",,,,,,,,'
+    b',,,,,,,,,,,,,6,,,,,,,,'
+    b'\r\n'
 )
 
 

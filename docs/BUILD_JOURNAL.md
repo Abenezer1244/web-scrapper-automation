@@ -53,6 +53,40 @@ pending").
 the flag it keyed on. A marker a reader depends on has to be set on every path that produces the state, or the
 reader needs a predicate that does not depend on it.
 
+## 2026-10-12 — UX 3.16 + 3.17: dates and server labels read en-US (follow-ups 2 and 3)
+
+**Built / Shipped:** follow-up 2: bridgeleads-web **#272** (208a3c6) `formatUtcDate` and the batch run-history date
+pass "en-US" like every other date helper; a de-DE browser had read "Resets 1. Nov." and "Switching to Pro on 1.
+Nov.." (a doubled full stop) inside English copy. Follow-up 3, FE first: bridgeleads-web **#273** (2243c34) the
+Results page's measured parcel-sweep guard accepts both "Property 4089 of 10000" and "Property 4,089 of 10,000";
+then **#509** here (c4afb22e) `_stage_label` and the finished label group every count with `f"{n:,}"` ("Collecting
+records: Part 4,089 of 10,000", "Complete: 4,089 new leads"). The numeric fields are unchanged; the field comments say
+the labels are display text that clients must not parse. No OpenAPI change (`export_openapi.py --check` OK).
+
+**Tried / Decided:** FE-first was the whole design of 3.17: the guard matched raw digits, so a backend that shipped
+first would have silently turned the measured bar into the unmeasured one. The dual-form guard went live and its
+production deployment was checked at the exact SHA before #509 merged; rollback order is #509 first. Documenting "do
+not parse" as a code comment, not a `Field(description=...)`, was deliberate: a description would change the
+OpenAPI contract and force a schema freeze and an FE types PR for a comment. Codex PLAN 3.16 GO at r3, PLAN 3.17 GO at
+r4, every diff gate PASS (3.17a and 3.17b each needed a round 2 for P3 comment / assertion fixes).
+
+**Failed / Blocked:** nothing failed in production. The peer's BE #505 merged first, so #509 was rebased onto it
+(no overlapping files), retested (101 pass) and re-run in CI (Test 29 min). Railway auto-deployed both #505 and #509;
+it had not deployed #501-#503 earlier on 2026-10-11, so the deployment SHA is checked, not assumed. Production reads
+are blocked for me: the #509 deployment read (api / worker / beat SUCCESS on c4afb22e) came from the peer session.
+
+**Caught & fixed:** Codex caught that the run-history list renders only with two or more runs (my one-run fixture
+would never have reached the date), that `next_reset_at: null` needs an entitlement end before the window end (Oct 25,
+not Dec 15), a missing no-noun no-denominator label branch, and that a raw-form mismatch must be tested too. Proof:
+3.16 master 13 SEMANTIC fails in de-DE, branch 103 / 0; 3.17a master falls back to the unmeasured bar on the grouped
+label, branch 20 / 0; 3.17b nine new tests RED on main, GREEN on the branch, the 92 existing label tests unchanged.
+
+**Pending / Handoff:** owner: one real API response or Live headline for a run with >= 1000 counts ("Complete: 1,234
+new leads"). The raw arm of the 3.17a guard can be dropped later. Optional: "raw ungrouped counts" in the FE.
+
+**Facts learned:** Playwright's `page.clock.setFixedTime` pins `Date` without freezing timers, so date fixtures stay
+consistent with "now". `f"{n:,}"` is locale-independent in Python, unlike `toLocaleString()` in a browser.
+
 ## 2026-10-12 — UX 3.15: every implicit-locale count format now renders en-US (follow-up 1)
 
 **Built / Shipped:** owner chose "all 1 by 1" (follow-ups 1, 2, 3 in order). Follow-up 1 is done in four capped

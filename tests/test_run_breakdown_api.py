@@ -311,3 +311,23 @@ async def test_row_level_security_bounds_the_live_partition_as_the_app_role(
 
     assert mine.new == 2
     assert theirs.persisted == 0
+
+
+@pytest.mark.asyncio
+async def test_list_and_detail_serialize_grouped_label_counts(
+    client: AsyncClient, db, starter_user, starter_token, scraper_config,
+):
+    """UX 3.17b: the API path, not just the model. A finished run with 4,089 new leads
+    reads "Complete: 4,089 new leads" in both labels on detail and list; the numeric
+    field stays a raw int."""
+    job_id = await _job(db, starter_user, scraper_config,
+                        **_snapshotted(record_count=4089, billed_count=4089, records_found=12345))
+
+    detail = (await client.get(f"/jobs/{job_id}", headers=_auth(starter_token))).json()
+    listed = next(j for j in (await client.get("/jobs", headers=_auth(starter_token))).json()
+                  if j["id"] == job_id)
+    for body in (detail, listed):
+        assert body["stage_label"] == "Complete: 4,089 new leads"
+        assert body["progress_label"] == "Complete: 4,089 new leads"
+        assert body["record_count"] == 4089
+        assert body["records_found"] == 12345

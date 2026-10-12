@@ -909,6 +909,27 @@ def transfer_undelivered_claims(db, job_id: str, user_id, record_type=None) -> i
     for row in candidates:
         groups[row.dedup_hash].append(dict(row._mapping))
 
+    # Drop, in ONE query, every hash _transfer_one_claim's peek would turn away on
+    # its first read: a claim whose anchor row is gone (purged source run) or is
+    # already this run's. Same join and predicate as the peek; the claim is unique
+    # on (user_id, dedup_hash), so there is one row to judge. Asked one hash at a
+    # time, a King tax run with 15,410 purged-anchor claims spent over 30 minutes
+    # in round trips here and ran out its Celery time limit (job 1b44217a,
+    # 2026-10-11). A hash with no claim at all is kept: _take_unheld_claim gets it.
+    if groups:
+        settled = db.execute(
+            sa_text(
+                "SELECT d.dedup_hash FROM delivered_records d "
+                "LEFT JOIN results a ON a.id = d.first_result_id AND a.user_id = d.user_id "
+                "WHERE d.user_id = CAST(:uid AS uuid) "
+                "  AND d.dedup_hash = ANY(CAST(:hashes AS text[])) "
+                "  AND (a.job_id IS NULL OR a.job_id = CAST(:jid AS uuid))"
+            ),
+            {"uid": uid, "hashes": list(groups), "jid": job_id},
+        ).scalars().all()
+        for dedup_hash in settled:
+            groups.pop(dedup_hash, None)
+
     transferred = 0
     first_failure: Exception | None = None
     # Sorted: a stable lock order across concurrent runs of the same user.

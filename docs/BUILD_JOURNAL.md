@@ -19,6 +19,41 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-10-11 — The "finale" batch: claim transfer ran out the Celery time limit
+
+**Built / Shipped:** PR #504 (`fix/claim-transfer-timeout-bulk-prefilter`): `transfer_undelivered_claims`
+(`src/workers/tasks_helpers/dedup.py`) drops, in one pre-read, every hash its per-hash peek would turn
+away (claim anchor purged, or already this run's). Two tests in `tests/test_claim_transfer.py`: a run
+mixing purged / undelivered / released claims (only the last two reach `_transfer_one_claim`), and a
+cross-tenant purged claim on the same hash.
+
+**Tried / Decided:** read-only audit of prod batch `0518cbeb` ("finale", King: pre_foreclosure, probate,
+tax_delinquent). Tax child `1b44217a` (15,491 rows, 34 new) finished enrichment at 10:04, then logged
+nothing until `Hard time limit (3900s) exceeded` + SIGKILL at 10:42. Worker log at the 3600s mark:
+`claim transfer failed for hash b6d837e72691: SoftTimeLimitExceeded()`. 15,410 of its 15,457 prior_run
+claims point at results purged April-July; each cost a peek + rollback (~125 ms to the pooler), over 30
+min in all. The watchdog re-queued it at 10:59; the batch's 90-minute backstop (`BATCH_FORCE_MINUTES`,
+from `running_at`) cancelled it at 11:07:54 and finalized the run `partial` with 0 combined leads
+(delivery mode `overlaps_only`, no overlaps between the two done children). The first version of this
+branch also re-raised Celery time limits from the loop and its two callers; #503 (P0-07) landed the
+same re-raises (plus the NTS / owner-flag blocks) while CI ran, so the branch was rebuilt on it with
+the pre-read alone and the two time-limit tests dropped as duplicates of #503's. Codex consult on the
+design: GATE FAIL, two P1s checked against code and rejected (the returned count was only logged; the
+claim is unique per `(user_id, dedup_hash)`). Codex diff review: GATE PASS; its cross-tenant P3 became
+a test.
+
+**Failed / Blocked:** the full local suite was killed at ~3% by Claude Code's low-memory reaper; CI ran
+it (Test, 23 min, green on the first version). Two of my own scripted edits silently no-opped on CRLF
+files (a mutation needle and a test-porting separator); both were caught by counting, then redone.
+
+**Pending / Handoff:** after deploy, re-run the finale batch (a `pending` batch_runs row; the recovery
+sweep dispatches it through the normal quota/entitlement gates) for the ~34 new tax leads, whose
+claims were released at 11:09:53.
+
+**Facts learned:** a cancelled job is only a status; a worker still inside a loop that never checks it
+runs on until its own time limit. Re-raising the time limit makes a slow pass fail cleanly; it does not
+make it finish. The per-item round trip was the actual defect.
+
 ## 2026-10-11 — UX 3.14: the Results header toolbar fits at 320 (3.10c backlog)
 
 **Built / Shipped:** bridgeleads-web **#267** (a23f88d), one file, `app/(dashboard)/results/[id]/page.tsx`.

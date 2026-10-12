@@ -28,6 +28,7 @@ import redis as sync_redis
 from httpx import ASGITransport, AsyncClient
 from main import app
 from sqlalchemy import delete
+from sqlalchemy import text as sa_text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
@@ -205,6 +206,8 @@ async def db() -> AsyncSession:
         # the whole run — the failure mode that hides this bug behind a
         # different one.
         await session.execute(delete(User))
+        # Not per-user: King owner answers any King tax job in a test stores.
+        await session.execute(sa_text("DELETE FROM king_parcel_owners"))
         await session.commit()
 
 

@@ -203,6 +203,63 @@ async def _run_scraper(
     return records
 
 
+def _fill_king_owners_from_store(db, rows) -> int:
+    """Name King tax leads from fresh stored eRealProperty answers (king_parcel_owners).
+
+    Every row passed counts, duplicates included: no King request is made, and a
+    duplicate can still be promoted and delivered after enrichment. `found` names a
+    blank or placeholder lead; `not_on_record` settles it. Either way the lead's retry
+    marker is cleared, as owner recovery does. Caller commits. Returns rows changed."""
+    from src.scrapers.king_wa_tax_delinquent import is_tax_placeholder_party
+    from src.workers.owner_recovery import fresh_answers
+
+    def _ed(res) -> dict:
+        return dict(res.enrichment_data) if isinstance(res.enrichment_data, dict) else {}
+
+    waiting = [
+        res for res in rows
+        if res.parcel_id
+        and (not res.party_name or is_tax_placeholder_party(res.party_name))
+        and _ed(res).get(OWNER_OUTCOME_KEY) != OWNER_NOT_ON_RECORD
+    ]
+    if not waiting:
+        return 0
+    answers = fresh_answers(db, {res.parcel_id.strip() for res in waiting})
+    changed = 0
+    for res in waiting:
+        outcome, owner = answers.get(res.parcel_id.strip(), (None, None))
+        if outcome not in ("found", "not_on_record"):
+            continue
+        ed = _ed(res)
+        if outcome == "found":
+            res.party_name = owner
+        else:
+            ed[OWNER_OUTCOME_KEY] = OWNER_NOT_ON_RECORD
+        if OWNER_DEFERRED_KEY in ed or outcome == "not_on_record":
+            ed[OWNER_DEFERRED_KEY] = False
+        ed.pop(OWNER_DEFERRED_REASON_KEY, None)
+        res.enrichment_data = ed
+        changed += 1
+    return changed
+
+
+def _hidden_duplicate_ids(db, rows, user_id, job_id: str) -> set:
+    """Ids of rows that stay "already delivered" whatever this run does: prior_run
+    duplicates whose claim transfer_undelivered_claims can never move here.
+
+    The job's King per-parcel owner lookups skip only these. Any other duplicate can
+    still become this run's lead after enrichment (same-run survivor re-election, a
+    claim moved from a run that never delivered), so it is asked as before. On a
+    King tax re-run nearly every row is one of these (15,410 of 15,491 on job
+    b1c01782), and asking King about them is what tripped its throttle."""
+    from src.workers.tasks_helpers.dedup import settled_claim_hashes
+
+    prior = [res for res in rows
+             if res.is_duplicate and res.duplicate_reason == "prior_run" and res.dedup_hash]
+    settled = settled_claim_hashes(db, user_id, job_id, list({res.dedup_hash for res in prior}))
+    return {res.id for res in prior if res.dedup_hash in settled}
+
+
 def _reuse_enrichment_for_duplicates(db, job, job_id: str) -> int:
     """Copy enrichment + settled skip-trace from the originally-delivered Result
     onto THIS job's is_duplicate rows, so a re-scrape of already-seen leads does
@@ -1564,10 +1621,35 @@ def _run_inline_enrichment(
         # row whose mailing had already been filled upstream — the shape that left
         # a real 384-lead King job with 0 owner names.
         is_tax_delinquent = config.record_type == "tax_delinquent"
+        # Owner names: stored answers first (no request), and no per-parcel owner
+        # request for a lead that stays "already delivered". Those are named after
+        # the owner pass from this run's answers, or later by the owner recovery sweep.
+        hidden_ids: set = set()
+        if is_tax_delinquent:
+            try:
+                _from_store = _fill_king_owners_from_store(db, all_results)
+                db.commit()
+                if _from_store:
+                    _publish_log(r, job_id, "info",
+                                 f"Used saved county owner records for {_from_store:,} leads.",
+                                 db=db)
+                hidden_ids = _hidden_duplicate_ids(db, all_results, job.user_id, job_id)
+            except Exception as exc:  # noqa: BLE001 -- fall back to asking about every row
+                if type(exc).__name__ in ("SoftTimeLimitExceeded", "TimeLimitExceeded"):
+                    raise
+                db.rollback()
+                hidden_ids = set()
+                _logger.warning("Job %s: stored owner answers not applied: %s",
+                                job_id, str(exc)[:120])
         needs = [
             res for res in all_results
             if res.parcel_id and len(res.parcel_id.strip()) >= 6
-            and (not res.mailing_address or (is_tax_delinquent and not res.party_name))
+            and (not res.mailing_address
+                 or (is_tax_delinquent and not res.party_name and res.id not in hidden_ids
+                     # Settled: its own county page showed no owner.
+                     and not (isinstance(res.enrichment_data, dict)
+                              and res.enrichment_data.get(OWNER_OUTCOME_KEY)
+                              == OWNER_NOT_ON_RECORD)))
         ]
         if needs:
             from src.scrapers.enrichment.king_county_assessor import batch_enrich_king_county
@@ -1650,6 +1732,8 @@ def _run_inline_enrichment(
             # is who holds title NOW — often an heir/trust. Surface it + a conservative
             # flag so the user isn't mailing a decedent.
             is_probate_family = config.record_type in ("probate", "death_certificate")
+            _p1_answers: dict[str, tuple[str, str | None]] = {}
+
             def _apply_king(enriched: dict) -> None:
                 """Write ONE chunk's lookups onto their rows (caller commits).
 
@@ -1662,6 +1746,9 @@ def _run_inline_enrichment(
                     prop = data.get("property_address")
                     mail = data.get("mailing_address")
                     owner = data.get("owner_name")
+                    if owner and data.get("parcel_lookup") == "verified":
+                        # The page echoed the parcel we asked for: a settled answer.
+                        _p1_answers[pid] = ("found", owner)
                     for res in pid_map.get(pid, []):
                         if data.get("resolved_by") == "gis_plus_owner_match" and not (
                             # Compare against the assessor OWNER that actually proved the
@@ -1923,6 +2010,10 @@ def _run_inline_enrichment(
                 except Exception as exc:
                     _logger.warning("Job %s: deferred-marker commit failed: %s", job_id, str(exc)[:120])
                     db.rollback()
+            # Nothing is pending here: every chunk and the markers above committed or
+            # rolled back. store_answers commits on its own.
+            from src.workers.owner_recovery import store_answers
+            store_answers(db, _p1_answers)
             if king_error or deferred:
                 # ENGINEERING DETAIL goes to the worker log, never to the user's
                 # log stream. The old line published the raw exception straight
@@ -1983,6 +2074,7 @@ def _run_inline_enrichment(
                 # Settled: the parcel's own county page named it and showed no owner.
                 # Asking again spends a request on the same answer.
                 and _ed(res).get(OWNER_OUTCOME_KEY) != OWNER_NOT_ON_RECORD
+                and res.id not in hidden_ids
             ]
             if owner_needs:
                 _publish_log(
@@ -2112,6 +2204,13 @@ def _run_inline_enrichment(
                     summary["owner_deferred"] = (
                         owner_deferred_rows if committed else len(owner_needs)
                     )
+                # Store this run's settled answers; the commit or rollback above left
+                # nothing pending.
+                from src.workers.owner_recovery import store_answers
+                store_answers(db, {
+                    **{pid: ("not_on_record", None) for pid in _no_owner if not owners.get(pid)},
+                    **{pid: ("found", name) for pid, name in owners.items() if name},
+                })
                 # USER-FACING, one line per fact, and only facts. "Resolved 0 owner
                 # names from 0/16576 parcels" read as a finished lookup that found
                 # nothing, when the county had never been asked.
@@ -2154,6 +2253,19 @@ def _run_inline_enrichment(
                     except Exception as exc:
                         _logger.warning("Job %s: owner-only progress log failed: %s", job_id, str(exc)[:120])
                         db.rollback()  # log write failed; swaps already settled — keep going
+            # The skipped "already delivered" rows on parcels this run answered (pass 1
+            # or the owner-only pass, both stored above): named with no request.
+            if hidden_ids:
+                try:
+                    _fill_king_owners_from_store(
+                        db, [res for res in all_results if res.id in hidden_ids])
+                    db.commit()
+                except Exception as exc:  # noqa: BLE001 -- the sweep names them later
+                    if type(exc).__name__ in ("SoftTimeLimitExceeded", "TimeLimitExceeded"):
+                        raise
+                    db.rollback()
+                    _logger.warning("Job %s: owner names for already-delivered rows not "
+                                    "applied: %s", job_id, str(exc)[:120])
 
     if is_king:
         # Every King pass is done. A lead that still has no property address, whose

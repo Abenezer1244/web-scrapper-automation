@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from datetime import UTC, datetime
 
@@ -395,6 +396,59 @@ def _store(db, pid: str, outcome: str, owner: str | None) -> bool:
         _logger.warning("Owner recovery: answer for parcel %s not stored: %s",
                         pid[-4:], type(exc).__name__)
         return False
+
+
+# Fresh stored answers for a set of parcels: what the scrape job reads before it asks King.
+_FRESH_SQL = """
+    SELECT parcel_id, outcome, owner_name FROM king_parcel_owners
+    WHERE parcel_id = ANY(CAST(:pids AS text[]))
+      AND observed_at > now() - make_interval(days => :fresh_days)
+"""
+
+
+def _is_pin(pid: str | None) -> bool:
+    return bool(pid) and re.fullmatch(r"[0-9]{10}", pid) is not None
+
+
+def fresh_answers(db, parcels) -> dict[str, tuple[str, str | None]]:
+    """{pid: (outcome, owner_name)} for every parcel with a fresh stored answer.
+
+    Read by the scrape job (enrich.py) before its King page passes, so a parcel
+    answered in the last `_FRESH_DAYS` is named with no request. Only a 10-digit
+    PIN can have an answer; anything else is never looked up here."""
+    pins = sorted({p for p in parcels if _is_pin(p)})
+    if not pins:
+        return {}
+    rows = db.execute(sa_text(_FRESH_SQL), {"pids": pins, "fresh_days": _FRESH_DAYS}).all()
+    return {row.parcel_id: (row.outcome, row.owner_name) for row in rows}
+
+
+def store_answers(db, answers: dict[str, tuple[str, str | None]]) -> int:
+    """Store the scrape job's settled eRealProperty answers, {pid: (outcome, owner)}.
+
+    Only answers from a page that echoed the requested 10-digit PIN belong here; the
+    caller passes nothing else. One statement, one commit; call it with nothing else
+    pending, because a failure rolls back. Returns answers sent, 0 on failure (the
+    job's own leads are already written; the beat sweep asks King later)."""
+    params = []
+    for pid, (outcome, owner) in answers.items():
+        name = (owner or "").strip() if outcome == "found" else None
+        if not _is_pin(pid) or outcome not in ("found", "not_on_record"):
+            continue
+        if outcome == "found" and not name:
+            continue
+        params.append({"pid": pid, "outcome": outcome, "owner": name})
+    if not params:
+        return 0
+    try:
+        db.execute(sa_text(_STORE_SQL), params)
+        db.commit()
+    except Exception as exc:  # noqa: BLE001 -- the answers are on the job's leads already
+        db.rollback()
+        _logger.warning("Owner store: %d answers from the job not stored: %s",
+                        len(params), type(exc).__name__)
+        return 0
+    return len(params)
 
 
 def _fill_from_store(db, parcels: list[str] | None = None) -> dict[str, int]:

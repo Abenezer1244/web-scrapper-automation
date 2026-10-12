@@ -1723,7 +1723,7 @@ def run_scrape_job(self, job_id: str) -> None:
             raise
         except Exception as exc:
             db.rollback()
-            _logger.warning("Inline enrichment error: %s", str(exc)[:200])
+            _logger.warning("Inline enrichment error: %s", type(exc).__name__)
             record_degraded(db, r, job_id, "enrichment", exc)
         else:
             # Outside that try: a failed completion line after a completed
@@ -1759,7 +1759,7 @@ def run_scrape_job(self, job_id: str) -> None:
             except Exception as exc:
                 reraise_time_limit(exc)
                 db.rollback()
-                _logger.warning("Job %s: NTS inline match failed: %s", job_id, str(exc)[:120])
+                _logger.warning("Job %s: NTS inline match failed: %s", job_id, type(exc).__name__)
                 record_degraded(db, r, job_id, "nts_match", exc)
 
         # Re-elect each same-run group's survivor now that enrichment has
@@ -1800,7 +1800,7 @@ def run_scrape_job(self, job_id: str) -> None:
             reraise_time_limit(exc)
             db.rollback()
             _logger.warning(
-                "Job %s: same-run reconciliation failed: %s", job_id, str(exc)[:160]
+                "Job %s: same-run reconciliation failed: %s", job_id, type(exc).__name__
             )
             record_degraded(db, r, job_id, "survivor_reelection", exc)
 
@@ -1827,7 +1827,7 @@ def run_scrape_job(self, job_id: str) -> None:
             reraise_time_limit(exc)
             db.rollback()
             _logger.warning(
-                "Job %s: claim transfer failed: %s", job_id, str(exc)[:160]
+                "Job %s: claim transfer failed: %s", job_id, type(exc).__name__
             )
             record_degraded(db, r, job_id, "claim_transfer", exc)
 
@@ -1843,7 +1843,7 @@ def run_scrape_job(self, job_id: str) -> None:
         except Exception as exc:
             reraise_time_limit(exc)
             db.rollback()
-            _logger.warning("Job %s: post-enrichment refetch failed: %s", job_id, str(exc)[:120])
+            _logger.warning("Job %s: post-enrichment refetch failed: %s", job_id, type(exc).__name__)
             # Sentinel: None means the refetch FAILED. We skip re-export AND
             # membership so we neither overwrite the good export with an empty
             # file nor write partial membership (Codex review).
@@ -1881,7 +1881,7 @@ def run_scrape_job(self, job_id: str) -> None:
             except Exception as exc:
                 reraise_time_limit(exc)
                 db.rollback()
-                _logger.warning("Job %s: owner-flag recompute failed: %s", job_id, str(exc)[:120])
+                _logger.warning("Job %s: owner-flag recompute failed: %s", job_id, type(exc).__name__)
                 record_degraded(db, r, job_id, "owner_flags", exc)
 
         # ── APPLY THE PLAN CAP (after enrichment, before delivery) ───────────
@@ -2088,7 +2088,7 @@ def run_scrape_job(self, job_id: str) -> None:
                 reraise_time_limit(exc)
                 db.rollback()
                 _logger.warning(
-                    "Job %s: skip trace enqueue failed: %s", job_id, str(exc)[:160]
+                    "Job %s: skip trace enqueue failed: %s", job_id, type(exc).__name__
                 )
                 record_degraded(db, r, job_id, "skip_trace_enqueue", exc)
 
@@ -2203,7 +2203,7 @@ def run_scrape_job(self, job_id: str) -> None:
                     pass
                 _logger.error(
                     "Job %s: property_key write FAILED (heal via backfill): %s",
-                    job_id, str(exc)[:200],
+                    job_id, type(exc).__name__,
                 )
                 record_degraded(db, r, job_id, "property_key", exc)
 
@@ -2235,7 +2235,7 @@ def run_scrape_job(self, job_id: str) -> None:
                     pass
                 _logger.error(
                     "Job %s: property membership upsert FAILED (heal via backfill): %s",
-                    job_id, str(exc)[:200],
+                    job_id, type(exc).__name__,
                 )
                 record_degraded(db, r, job_id, "property_membership", exc)
 

@@ -310,9 +310,9 @@ class TestVolume:
             report = dq.check_job(s, silent)
         vol = [w for w in report["warnings"] if w["kind"] == "volume_collapse"]
         assert vol == [{"kind": "volume_collapse", "found": 0, "expected": 30.0,
-                        "window_days": 7, "baseline_jobs": 6}]
-        assert await _audit_paths(f"data_quality_volume:{county}/probate") == [
-            f"data_quality_volume:{county}/probate"]
+                        "window_days": 7, "baseline_jobs": 6, "doc_types": None}]
+        assert await _audit_paths(f"data_quality_volume:{county}/") == [
+            f"data_quality_volume:{county}/WA/probate/all"]
 
     async def test_a_normal_run_raises_no_volume_warning(self, db, starter_user):
         county = f"dqv{uuid.uuid4().hex[:6]}"
@@ -348,3 +348,12 @@ class TestVolume:
             report = dq.check_job(s, silent, alert=False)
         assert report["run"]["rows"] == 0
         assert [w["kind"] for w in report["warnings"]] == ["volume_collapse"]
+
+
+    async def test_the_same_selection_in_another_order_is_its_baseline(self, db, starter_user):
+        county = f"dqv{uuid.uuid4().hex[:6]}"
+        await _baseline(db, starter_user, county, doc_types=["NOTICE OF DEFAULT", "LIS PENDENS"])
+        job = await _job(db, starter_user, county=county, records_found=0, window=_WEEK,
+                         doc_types=["NOTICE OF DEFAULT", "LIS PENDENS", "LIS PENDENS"])
+        with _sync() as s:
+            assert dq.volume(s, job)["baseline_jobs"] == 6

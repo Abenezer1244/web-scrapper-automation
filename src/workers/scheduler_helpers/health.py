@@ -419,6 +419,11 @@ def _canary_check_impl() -> None:
                      returns nothing anywhere is not certified healthy (P0-08).
                      Still listed to customers.
       - 'down'     — the probe raised, or no scraper resolves (ops alert)
+
+    health_status is ONE flag per connector and only decides what customers are
+    listed (healthy and degraded both are), so the last probed record type sets
+    it. The per-type truth is in the alerts, keyed by connector AND record type so
+    one type's cooldown never silences another's.
     """
     from sqlalchemy import select
 
@@ -468,14 +473,15 @@ def _probe_unit(connector, record_type: str, pending_alerts: list) -> None:
     # M6: alert only on the TRANSITION into a bad state (the cooldown also dedupes).
     prev_status = connector.health_status
     try:
-        scraper_class, _ = get_scraper_class(connector.county, connector.state, record_type)
+        scraper_class, matched_type = get_scraper_class(connector.county, connector.state, record_type)
         # Probe a 7-day window. A 1-day window produces false-positive "degraded"
         # statuses for rural counties that routinely file 0 probates or
         # pre-foreclosures on a given day.
         today = datetime.now(UTC).date()
         week_ago = today - timedelta(days=7)
         records = asyncio.run(
-            _canary_scrape(scraper_class, week_ago.strftime("%m/%d/%Y"), today.strftime("%m/%d/%Y"))
+            _canary_scrape(scraper_class, week_ago.strftime("%m/%d/%Y"), today.strftime("%m/%d/%Y"),
+                           record_type=matched_type)
         )
         if records:
             connector.health_status = "healthy"
@@ -486,7 +492,7 @@ def _probe_unit(connector, record_type: str, pending_alerts: list) -> None:
             # further back, e.g. AcclaimWeb "released through" ~2 months behind)
             # from a broken one. Only a CONFIRMED empty history counts against a
             # source: a history probe that errored proves nothing either way.
-            history = _canary_probe_historical(scraper_class, today)
+            history = _canary_probe_historical(scraper_class, today, matched_type)
             if history == "hit":
                 connector.health_status = "healthy"
                 _logger.info("Canary %s %s: source_lagged (current week empty, "
@@ -524,7 +530,7 @@ def _probe_unit(connector, record_type: str, pending_alerts: list) -> None:
         # (scraper errors can embed raw page content, a PII risk: Codex P2).
         if prev_status != "down":
             pending_alerts.append((
-                "canary", where,
+                "canary", f"{where}/{record_type}",
                 f"Canary DOWN: {where} {record_type} (was {prev_status})",
                 f"connector={where}\nrecord_type={record_type}\n"
                 f"previous_status={prev_status}\n"
@@ -532,12 +538,23 @@ def _probe_unit(connector, record_type: str, pending_alerts: list) -> None:
             ))
 
 
-async def _canary_scrape(scraper_class, date_from: str, date_to: str) -> list:
-    async with scraper_class() as scraper:
+async def _canary_scrape(scraper_class, date_from: str, date_to: str,
+                         record_type: str | None = None) -> list:
+    """One read-only scrape of ``record_type``. Built like _run_scraper builds it:
+    a multi-type scraper constructed without the type probes its DEFAULT type, so
+    every other type would be certified by the default one's answer (Codex P1)."""
+    import inspect
+
+    try:
+        params = inspect.signature(scraper_class).parameters
+    except (ValueError, TypeError):
+        params = {}
+    kwargs = {"record_type": record_type} if record_type and "record_type" in params else {}
+    async with scraper_class(**kwargs) as scraper:
         return await scraper.scrape(date_from, date_to)
 
 
-def _canary_probe_historical(scraper_class, today) -> str:
+def _canary_probe_historical(scraper_class, today, record_type: str | None = None) -> str:
     """"hit" if any historical fallback window has a record, "empty" if every
     window answered with none, "inconclusive" if none hit and one errored.
 
@@ -553,8 +570,11 @@ def _canary_probe_historical(scraper_class, today) -> str:
         win_from = (today - timedelta(days=days_start)).strftime("%m/%d/%Y")
         win_to = (today - timedelta(days=days_end)).strftime("%m/%d/%Y")
         try:
-            records = asyncio.run(_canary_scrape(scraper_class, win_from, win_to))
+            records = asyncio.run(_canary_scrape(scraper_class, win_from, win_to, record_type))
         except Exception as exc:  # transient/blocked historical probe: proves nothing
+            from src.utils.celery_limits import reraise_time_limit
+
+            reraise_time_limit(exc)
             _logger.info(
                 "Canary historical probe %s-%s errored: %s",
                 win_from, win_to, type(exc).__name__,

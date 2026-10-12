@@ -123,7 +123,9 @@ VOLUME_SKIP_RECORD_TYPES = frozenset({"trustee_sale"})
 _VOLUME_SQL = """
 WITH me AS (
   SELECT j.id, j.records_found, lower(sc.county) AS county, upper(sc.state) AS state,
-         sc.record_type, sc.doc_types::jsonb AS doc_types,
+         sc.record_type,
+         -- the document selection, order and repeats ignored
+         (CASE WHEN jsonb_typeof(sc.doc_types::jsonb) = 'array' THEN (SELECT coalesce(jsonb_agg(DISTINCT e ORDER BY e), '[]'::jsonb) FROM jsonb_array_elements_text(sc.doc_types::jsonb) e) ELSE sc.doc_types::jsonb END) AS doc_types,
          (CASE WHEN j.date_from ~ '^[0-9]{2}/[0-9]{2}/[0-9]{4}$'
               AND j.date_to ~ '^[0-9]{2}/[0-9]{2}/[0-9]{4}$'
          THEN to_date(j.date_to, 'MM/DD/YYYY') - to_date(j.date_from, 'MM/DD/YYYY') + 1 END) AS days
@@ -141,10 +143,10 @@ WITH me AS (
     AND j.records_found IS NOT NULL AND w.days > 0
     AND lower(sc.county) = me.county AND upper(sc.state) = me.state
     AND sc.record_type = me.record_type
-    AND sc.doc_types::jsonb IS NOT DISTINCT FROM me.doc_types
+    AND (CASE WHEN jsonb_typeof(sc.doc_types::jsonb) = 'array' THEN (SELECT coalesce(jsonb_agg(DISTINCT e ORDER BY e), '[]'::jsonb) FROM jsonb_array_elements_text(sc.doc_types::jsonb) e) ELSE sc.doc_types::jsonb END) IS NOT DISTINCT FROM me.doc_types
     AND w.days BETWEEN me.days * 0.5 AND me.days * 2
 )
-SELECT me.records_found, me.days, me.record_type,
+SELECT me.records_found, me.days, me.record_type, me.state, me.doc_types,
        (SELECT count(*) FROM base) AS baseline_jobs,
        (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY rate) FROM base) AS median_rate
 FROM me
@@ -159,6 +161,18 @@ def volume(db, job_id: str, *, days: int = BASELINE_DAYS) -> dict | None:
     return dict(row) if row is not None else None
 
 
+def _volume_key(job, warning: dict) -> str:
+    """Cooldown key: one silent county x state x record type x document selection
+    pages once, however many tenants run it; a different selection is its own."""
+    import hashlib
+    import json
+
+    sel = warning.get("doc_types")
+    tag = "all" if sel is None else hashlib.sha256(
+        json.dumps(sel, sort_keys=True).encode()).hexdigest()[:8]
+    return f"{job['county']}/{job['state']}/{job['record_type']}/{tag}"
+
+
 def evaluate_volume(v: dict | None) -> dict | None:
     """A warning when the run found far fewer records than its baseline predicts."""
     if (v is None or v["record_type"] in VOLUME_SKIP_RECORD_TYPES
@@ -169,7 +183,7 @@ def evaluate_volume(v: dict | None) -> dict | None:
     if expected >= VOLUME_MIN_EXPECTED and v["records_found"] <= VOLUME_DROP_RATIO * expected:
         return {"kind": "volume_collapse", "found": int(v["records_found"]),
                 "expected": round(expected, 1), "window_days": int(v["days"]),
-                "baseline_jobs": int(v["baseline_jobs"])}
+                "baseline_jobs": int(v["baseline_jobs"]), "doc_types": v.get("doc_types")}
     return None
 
 
@@ -273,7 +287,7 @@ def check_job(db, job_id: str, *, alert: bool = True) -> dict:
         _logger.warning("Data quality: %s job %s found %d, expected ~%s", where,
                         str(job["id"])[:8], v["found"], v["expected"])
         send_ops_alert(
-            "data_quality_volume", f"{job['county']}/{job['record_type']}",
+            "data_quality_volume", _volume_key(job, v),
             f"Data volume: {where} job {str(job['id'])[:8]} found {v['found']} records, "
             f"expected about {v['expected']}",
             f"Job {job['id']} ({where}) scraped {v['found']} records over a "

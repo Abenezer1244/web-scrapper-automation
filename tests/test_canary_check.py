@@ -50,9 +50,11 @@ def _portal(monkeypatch, *, now, history):
     """The current week returns ``now``; every historical window returns ``history``."""
     calls: list[str] = []
 
-    async def fetch(_scraper_class, date_from, _date_to):
+    async def fetch(_scraper_class, date_from, _date_to, record_type=None):
         calls.append(date_from)
         answer = now if date_from == _THIS_WEEK else history
+        if callable(answer):
+            answer = answer(record_type)
         if isinstance(answer, Exception):
             raise answer
         return answer
@@ -102,7 +104,7 @@ def test_a_broken_probe_is_down_and_paged_once(connector, monkeypatch):
     _portal(monkeypatch, now=RuntimeError("Jane Q Canary, 12 Elm St"), history=[])
     c = connector()
     status, alerts = _probe(c)
-    assert (status, alerts) == ("down", [("canary", f"{c.county}/WA")])
+    assert (status, alerts) == ("down", [("canary", f"{c.county}/WA/probate")])
     assert _probe(c) == ("down", [])  # already down: no second page
 
 
@@ -110,7 +112,7 @@ def test_a_record_type_with_no_scraper_is_down_and_paged(connector, monkeypatch)
     """It used to go 'down' with no alert (Codex P2)."""
     _portal(monkeypatch, now=["r"], history=[])
     c = connector(record_types=("probate",))
-    assert _probe(c, "divorce") == ("down", [("canary", f"{c.county}/WA")])
+    assert _probe(c, "divorce") == ("down", [("canary", f"{c.county}/WA/divorce")])
 
 
 def test_an_unproven_connector_with_nothing_anywhere_is_degraded_quietly(connector, monkeypatch):
@@ -134,3 +136,43 @@ def test_every_record_type_is_in_the_rotation(connector):
         [(a.county, "probate"), (a.county, "pre_foreclosure"), (a.county, "tax_delinquent"),
          (b.county, "probate")])
     assert len(health._canary_units([a, b], k=2)) == 2
+
+
+def test_each_record_type_is_scraped_as_itself(connector, monkeypatch):
+    """A multi-type connector probed for one type must scrape THAT type (Codex P1):
+    here pre_foreclosure returns nothing anywhere while probate yields."""
+    _portal(monkeypatch,
+            now=lambda rt: ["r"] if rt == "probate" else [],
+            history=lambda rt: ["r"] if rt == "probate" else [])
+    c = connector(record_types=("probate", "pre_foreclosure"))
+    assert _probe(c, "pre_foreclosure") == (
+        "degraded", [("canary_zero_output", f"{c.county}/WA/pre_foreclosure")])
+    # The same tick's other type still yields, and its alert key is its own.
+    assert _probe(c, "probate") == ("healthy", [])
+
+
+def test_the_probe_constructs_the_scraper_for_the_record_type():
+    import asyncio
+
+    built: list[dict] = []
+
+    class Scraper:
+        def __init__(self, record_type=None):
+            built.append({"record_type": record_type})
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def scrape(self, date_from, date_to):
+            return []
+
+    class Untyped(Scraper):
+        def __init__(self):
+            built.append({})
+
+    asyncio.run(health._canary_scrape(Scraper, "10/01/2026", "10/07/2026", "pre_foreclosure"))
+    asyncio.run(health._canary_scrape(Untyped, "10/01/2026", "10/07/2026", "pre_foreclosure"))
+    assert built == [{"record_type": "pre_foreclosure"}, {}]

@@ -180,3 +180,53 @@ def test_a_claimed_row_is_not_claimed_again_and_a_lost_lease_writes_nothing(
     assert repair._settle(first[0], repair_status="repaired") is False  # stale run
     assert _marker(degraded_job).repair_status == "pending"
     assert repair._settle(second[0], repair_status="repaired") is True
+
+
+def test_paused_claims_wait_quietly_across_retries(degraded_job, redis_client, monkeypatch):
+    """Claims paused: wait, no attempt used, and no customer line per retry (Codex)."""
+    from src.workers import skip_trace_claim
+
+    monkeypatch.setattr(skip_trace_claim, "claim_enforcement_ok", lambda db: False)
+    with SyncSessionLocal() as s:
+        before = s.execute(text("SELECT count(*) FROM job_logs WHERE job_id = :j"),
+                           {"j": degraded_job}).scalar_one()
+    for _ in range(2):
+        repair.repair_degraded_skip_trace()
+        _due_now(degraded_job)
+    m = _marker(degraded_job)
+    assert (m.repair_status, m.attempts) == ("pending", 0)
+    with SyncSessionLocal() as s:
+        after = s.execute(text("SELECT count(*) FROM job_logs WHERE job_id = :j"),
+                          {"j": degraded_job}).scalar_one()
+    assert after == before
+    assert _queued(degraded_job) == 0
+
+
+def test_a_switch_off_cannot_land_while_the_claim_is_being_made(
+        degraded_job, redis_client, monkeypatch):
+    """FOR SHARE holds the scraper's row from the re-read to the claim's commit."""
+    from sqlalchemy.exc import OperationalError
+
+    from src.workers import skip_trace_claim
+
+    real = skip_trace_claim.claim_skip_trace_rows
+    probe: dict = {}
+
+    def claim_while_probing(db, *a, **k):
+        with SyncSessionLocal() as other:
+            other.execute(text("SET lock_timeout = '300ms'"))
+            try:
+                other.execute(text(
+                    "UPDATE scraper_configs SET skip_trace_enabled = false WHERE id = "
+                    "(SELECT scraper_config_id FROM jobs WHERE id = :j)"), {"j": degraded_job})
+                probe["blocked"] = False
+            except OperationalError:
+                probe["blocked"] = True
+            other.rollback()
+        return real(db, *a, **k)
+
+    monkeypatch.setattr(skip_trace_claim, "claim_skip_trace_rows", claim_while_probing)
+    repair.repair_degraded_skip_trace()
+    assert probe == {"blocked": True}
+    assert _marker(degraded_job).repair_status == "repaired"
+    assert _queued(degraded_job) > 0

@@ -88,6 +88,7 @@ def _repair_one(row, r) -> str:
     from src.config.constants import normalize_plan
     from src.db.models import Job, ScraperConfig
     from src.db.session import rls_sync_session, system_sync_session
+    from src.workers.skip_trace_claim import claim_enforcement_ok
     from src.workers.tasks_helpers.enrich import _enqueue_skip_trace_rows
 
     with system_sync_session() as s:
@@ -106,6 +107,11 @@ def _repair_one(row, r) -> str:
         if (job is None or config is None or not config.skip_trace_enabled
                 or normalize_plan(job.user.plan) == "starter"):
             return "suppressed"
+        # Claims paused (migration 100's index missing): the enqueue would post
+        # its pause warning to the customer on every retry. Wait quietly; ops is
+        # alerted by every run that hits it.
+        if not claim_enforcement_ok(db):
+            return "wait"
         # No attempt token: the job is DONE, there is no attempt to fence.
         outcome = _enqueue_skip_trace_rows(db, job, r, row.job_id, config)
     if outcome == "done":

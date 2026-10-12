@@ -19,6 +19,40 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-10-12 — UX 3.18 + 3.19: the guard's raw arm is gone, and the last raw counts are grouped
+
+**Built / Shipped:** 3.18: bridgeleads-web **#277** (dfb060e) the Results page's measured parcel-sweep guard matches
+only the grouped label ("Property 4,089 of 10,000"); the raw arm added for the 3.17 rollout is dropped. 3.19:
+bridgeleads-web **#278** (a11258d) the last three counts that can reach 1,000 and still rendered raw now use
+`formatCount`: the batch download menu's per-child "N leads", the Results index's unfiltered "N exports" and the admin
+funnel's drop-off user count. Along the way: **#274** (bc34e0a) the item-3 plan history for 3.14 to 3.17, and **#275**
+(5159c8f) the FE API types regenerated after #508 (batch-lead parity), which had left every FE PR's types check red.
+
+**Tried / Decided:** 3.18 is safe because `stage_label` is computed per response by `_stage_label` and never stored, so
+once #509 was live the API could not return a raw "Property 4089 of 10000" again; the FE fetch helper is `no-store`.
+A raw label of 1,000 or more now shows the unmeasured bar, never a wrong number. 3.19 left every count capped below
+1,000 alone (batch children under `BATCH_HARD_CEILING = 250`, counties, types, lists, referrals): grouped and raw are
+the same string there. Plurals still key off the raw number. Codex PLAN 3.18 NO-GO r1 (producers and cache, precision,
+proof assertions; answered with evidence) then GO r2; PLAN 3.19 GO r1. Both diff gates PASS r1.
+
+**Failed / Blocked:** Vercel created no deployments for about 45 minutes. A preview showed "Error" at 0 s with no build
+log; only the Vercel API named the cause (`git_info_fail`, Git information retrieval failed). It recovered by itself,
+but afterwards Vercel stopped posting GitHub commit statuses, so deployments were checked per SHA through the API.
+
+**Caught & fixed:** my first 3.19 rig read the batch per-child counts without opening the download menu, and used a
+0-lead child that the menu filters out (`record_count > 0`); fixed to open the menu and use a 1-lead child. Codex
+caught an imprecise 3.18 comment ("below 1,000" must be both counts). Proof on production builds, en-US and de-DE:
+3.18 branch 24 / 0, master fails only the two raw-label SEMANTIC checks; 3.19 branch 27 / 0, master fails only its
+8 SEMANTIC checks, and the 19 REGRESSION checks (including the funnel rates) pass on both.
+
+**Pending / Handoff:** owner: one real >= 1000 stage label or "Complete:" headline in production (from 3.17). Item 3's
+owner follow-ups (counts, dates, labels) and both optional clean-ups are done.
+
+**Facts learned:** a Vercel deployment that errors at 0 s with empty `vercel inspect --logs` is not a build failure;
+`vercel api /v13/deployments/<id>` returns `errorCode`. A schema-changing BE merge leaves every FE PR red until its FE
+types PR lands, whoever opens the next FE PR.
+
+
 ## 2026-10-12 — King tax owner names Phase 2 live: the job reads stored answers (#512), proven on a prod re-run
 
 **Built / Shipped:** **#512** (`fc634606`, admin squash-merge 15:07 UTC): before the King page passes, the scrape

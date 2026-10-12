@@ -19,6 +19,40 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-10-12 — King tax owner names: one stored answer per parcel, every visible lead (Phase 1)
+
+**Built / Shipped:** branch `feat/king-owner-fill`. Migration 118 `king_parcel_owners` (one settled eRealProperty
+answer per parcel: found / not_on_record; public record, no user_id; worker-only like 117, mirrored in
+`scripts/provision_rls_roles.sql`). `src/workers/owner_recovery.py`: eligibility no longer needs the
+`owner_lookup_deferred` flag and includes the account's already-delivered (prior_run) rows; settled rows stay out;
+parcels with a delivered lead are asked first. Each tick names leads from fresh stored answers (30 days) in one
+UPDATE with no King request, before the cooldown gate; a King answer is stored once and names every waiting lead
+of the parcel across accounts. Five new tests in `tests/test_owner_recovery.py`; the old "duplicates are never
+looked up" test was split into what is still excluded (over quota, same_run / superseded, other counties, live
+jobs) and what is now included.
+
+**Tried / Decided:** found while auditing the finale re-run: 22,009 of 22,855 delivered King tax leads had no
+owner name and none was flagged deferred, so recovery never saw them; the already-delivered lists held 76,210
+more. King's bulk extract redacts names (RCW 42.56.070), so every name costs one eRealProperty page. Owner chose
+to fill every visible lead (not hide, not delete). Codex design consult: GATE FAIL; parcel identity, per-parcel
+requests and guarded writes were already in place; adopted "never seed from customers' rows" and the 117-style
+lockdown; disagreed on freshness (Codex 7 days, chose 30: at 7 a weekly King tax run would re-ask ~15,000
+parcels). Codex diff review: GATE FAIL on three P1s (provisioning roles, test cleanup grants, table owner) that
+did not hold against the provisioning script, the test fixture and the migration owner; adopted its error-count
+P2. Second review: GATE PASS.
+
+**Failed / Blocked:** `sed -i` on a CRLF test file rewrote it LF-only; caught by counting, rewritten CRLF.
+
+**Pending / Handoff:** owner approval to merge (= deploy; migration 118 + a ~2-day background backfill against
+King at 120 parcels per 15 min, paused on every throttle). Prod dry run of the new predicate: 24,830 delivered +
+89,068 already-delivered rows, ~26,200 parcels, 3 accounts, 0 named rows selected. Phase 2 (job owner pass reads
+the table; per-parcel King requests only for deliverable rows), Phase 3 (speed), Phase 4 (FE "Owner name
+pending").
+
+**Facts learned:** the recovery sweep was correct for the rows it could see; the rows that mattered never got
+the flag it keyed on. A marker a reader depends on has to be set on every path that produces the state, or the
+reader needs a predicate that does not depend on it.
+
 ## 2026-10-11 — The "finale" batch: claim transfer ran out the Celery time limit
 
 **Built / Shipped:** PR #504 (`fix/claim-transfer-timeout-bulk-prefilter`): `transfer_undelivered_claims`

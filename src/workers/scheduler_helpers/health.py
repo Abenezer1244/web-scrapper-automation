@@ -392,22 +392,39 @@ def _watchdog_stuck_jobs_impl() -> None:
         send_ops_alert(kind, key, subject, body)
 
 
+# Probes per canary tick. A unit is one (connector, record type): probing only a
+# connector's first record type left every other type uncertified (P0-08, Codex).
+CANARY_UNITS_PER_TICK = 5
+# Its "history" windows are forward auction horizons and zero upcoming auctions is
+# legitimate, so an empty probe never downgrades it; it has its own stale-source path.
+_NO_ZERO_OUTPUT_DOWNGRADE = frozenset({"trustee_sale"})
+
+
+def _canary_units(connectors, k: int = CANARY_UNITS_PER_TICK) -> list:
+    """A random sample of (connector, record_type) pairs, rotating through all of them."""
+    import random
+
+    units = [(c, rt) for c in connectors for rt in (c.record_types or [])]
+    return random.sample(units, min(k, len(units)))
+
+
 def _canary_check_impl() -> None:
-    """Run a 1-page test scrape per active connector to verify portal health.
+    """Probe a few (connector, record type) pairs to verify each source still yields.
 
     Updates county_connectors.health_status:
-      - 'healthy'  — canary returned ≥ 1 record
-      - 'degraded' — canary returned 0 records (portal reachable but empty)
-      - 'down'     — canary threw an exception
+      - 'healthy'  — the 7-day probe returned >= 1 record, or it was empty but the
+                     source has records further back (a lagged or quiet source)
+      - 'degraded' — empty now AND confirmed empty historically. A connector that
+                     was healthy is downgraded too, with an ops alert: a source that
+                     returns nothing anywhere is not certified healthy (P0-08).
+                     Still listed to customers.
+      - 'down'     — the probe raised, or no scraper resolves (ops alert)
     """
-    import asyncio
-
     from sqlalchemy import select
 
     from src.api.middleware.security import register_connector_domains_from_db
     from src.db.models import CountyConnector
     from src.db.session import SyncSessionLocal
-    from src.scrapers.registry import UnsupportedCountyError, get_scraper_class
 
     # Refresh the in-process SSRF allowlist so connectors added via
     # POST /scrapers/connectors after this worker booted are not falsely
@@ -423,94 +440,14 @@ def _canary_check_impl() -> None:
             select(CountyConnector).where(CountyConnector.active)
         ).scalars().all()
 
-        # Check max 5 counties per run (rotate through all over time)
-        import random
-        connectors = random.sample(all_connectors, min(5, len(all_connectors)))
-        _logger.info("Canary: checking %d/%d counties", len(connectors), len(all_connectors))
+        units = _canary_units(all_connectors)
+        _logger.info("Canary: checking %d (connector, record type) pairs of %d connectors",
+                     len(units), len(all_connectors))
 
         # M6: alert payloads queued here, dispatched only AFTER the commit below.
         pending_alerts: list[tuple[str, str, str, str]] = []
-        for connector in connectors:
-            # M6: alert only on the TRANSITION into 'down' (not every tick a
-            # connector stays down — the cooldown also dedupes, belt+suspenders).
-            prev_status = connector.health_status
-            try:
-                scraper_class, _ = get_scraper_class(
-                    connector.county, connector.state, connector.record_types[0]
-                )
-                # Probe a 7-day window. A 1-day window produces
-                # false-positive "degraded" statuses for rural counties
-                # that routinely file 0 probates or pre-foreclosures on
-                # a given day. 7 days is short enough to stay cheap but
-                # long enough that any county with meaningful filing
-                # volume will return at least one record when healthy.
-                today = datetime.now(UTC).date()
-                week_ago = today - timedelta(days=7)
-
-                records = asyncio.run(
-                    _canary_scrape(scraper_class, week_ago.strftime("%m/%d/%Y"), today.strftime("%m/%d/%Y"))
-                )
-                # Sticky health: once a connector has been marked
-                # 'healthy', do NOT downgrade it to 'degraded' just
-                # because the most recent 7-day probe returned zero
-                # records. Small counties oscillate based on which
-                # week the canary happens to sample, and flipping the
-                # status causes them to vanish from the user-facing
-                # connectors endpoint. Only a real exception path
-                # (caught below) downgrades a healthy connector.
-                # Non-healthy connectors still get upgraded normally
-                # when they produce records.
-                if records:
-                    connector.health_status = "healthy"
-                elif connector.health_status != "healthy":
-                    # Current-week probe empty AND not sticky-healthy. Before
-                    # settling on a non-healthy status, distinguish a data-LAGGED
-                    # but working portal from a broken scraper by re-probing
-                    # historical windows (see _canary_probe_historical). A hit
-                    # means the scraper works and the empty current week is just
-                    # source lag (e.g. AcclaimWeb "released through" ~2mo behind),
-                    # so we fold it into 'healthy' to keep the connector visible.
-                    # No DB/enum change: the lag reason is logged, not persisted.
-                    # Stage 2 runs ONLY here (non-healthy + empty), bounding cost,
-                    # and only ever UPGRADES — a historical-probe error never
-                    # downgrades (it just counts as "no hit").
-                    if _canary_probe_historical(scraper_class, today):
-                        connector.health_status = "healthy"
-                        _logger.info(
-                            "Canary %s/%s: source_lagged (current week empty, "
-                            "historical records OK) -> healthy",
-                            connector.county, connector.state,
-                        )
-                    elif connector.health_status in ("unknown", "down"):
-                        # No records now or historically — genuinely empty or a
-                        # broken scraper/extraction. Move 'unknown'/'down' to
-                        # 'degraded'; leave an existing 'degraded' as-is.
-                        connector.health_status = "degraded"
-                _logger.info(
-                    "Canary %s/%s: %s (%d records)",
-                    connector.county, connector.state, connector.health_status, len(records)
-                )
-            except UnsupportedCountyError:
-                _logger.warning("Canary: no scraper for %s/%s", connector.county, connector.state)
-                connector.health_status = "down"
-            except Exception as exc:
-                _logger.error("Canary failed for %s/%s: %s", connector.county, connector.state, exc)
-                connector.health_status = "down"
-                # M6: a previously-working portal just broke — queue an ops page
-                # (was log-only). Sent post-commit; exception CLASS only in the
-                # email (scraper errors can embed raw page content = PII risk —
-                # Codex P2; the full error is already in worker logs above).
-                if prev_status != "down":
-                    pending_alerts.append((
-                        "canary",
-                        f"{connector.county}/{connector.state}",
-                        f"Canary DOWN: {connector.county}/{connector.state} "
-                        f"(was {prev_status})",
-                        f"connector={connector.county}/{connector.state}\n"
-                        f"previous_status={prev_status}\n"
-                        f"error_class={type(exc).__name__} (full error in worker logs)",
-                    ))
-
+        for connector, record_type in units:
+            _probe_unit(connector, record_type, pending_alerts)
             connector.last_checked = datetime.now(UTC)
 
         db.commit()
@@ -521,41 +458,116 @@ def _canary_check_impl() -> None:
         send_ops_alert(kind, key, subject, body)
 
 
+def _probe_unit(connector, record_type: str, pending_alerts: list) -> None:
+    """Probe one (connector, record type); set health_status; queue any ops alert."""
+    import asyncio
+
+    from src.scrapers.registry import UnsupportedCountyError, get_scraper_class
+
+    where = f"{connector.county}/{connector.state}"
+    # M6: alert only on the TRANSITION into a bad state (the cooldown also dedupes).
+    prev_status = connector.health_status
+    try:
+        scraper_class, _ = get_scraper_class(connector.county, connector.state, record_type)
+        # Probe a 7-day window. A 1-day window produces false-positive "degraded"
+        # statuses for rural counties that routinely file 0 probates or
+        # pre-foreclosures on a given day.
+        today = datetime.now(UTC).date()
+        week_ago = today - timedelta(days=7)
+        records = asyncio.run(
+            _canary_scrape(scraper_class, week_ago.strftime("%m/%d/%Y"), today.strftime("%m/%d/%Y"))
+        )
+        if records:
+            connector.health_status = "healthy"
+        elif record_type in _NO_ZERO_OUTPUT_DOWNGRADE and prev_status == "healthy":
+            pass  # see _NO_ZERO_OUTPUT_DOWNGRADE
+        else:
+            # Empty this week. Tell a data-LAGGED but working source (records
+            # further back, e.g. AcclaimWeb "released through" ~2 months behind)
+            # from a broken one. Only a CONFIRMED empty history counts against a
+            # source: a history probe that errored proves nothing either way.
+            history = _canary_probe_historical(scraper_class, today)
+            if history == "hit":
+                connector.health_status = "healthy"
+                _logger.info("Canary %s %s: source_lagged (current week empty, "
+                             "historical records OK) -> healthy", where, record_type)
+            elif prev_status == "healthy" and history == "empty":
+                # It used to stay healthy whatever the probe found (sticky health),
+                # so a source returning nothing at all looked like a quiet week.
+                # 'degraded' is still listed to customers.
+                connector.health_status = "degraded"
+                pending_alerts.append((
+                    "canary_zero_output", f"{where}/{record_type}",
+                    f"Canary ZERO OUTPUT: {where} {record_type} (was healthy)",
+                    f"connector={where}\nrecord_type={record_type}\n"
+                    "The 7-day probe and every historical window returned no records. "
+                    "The portal answered, so this is a broken extraction or a source "
+                    "that stopped publishing.",
+                ))
+            elif prev_status in ("unknown", "down") and history != "hit":
+                # Nothing now or historically: genuinely empty or broken. Leave an
+                # existing 'degraded' as is; a healthy source with an inconclusive
+                # history keeps its status until a probe can say.
+                connector.health_status = "degraded"
+        _logger.info("Canary %s %s: %s (%d records)", where, record_type,
+                     connector.health_status, len(records))
+    except Exception as exc:
+        from src.utils.celery_limits import reraise_time_limit
+
+        reraise_time_limit(exc)  # out of time is not the source being down
+        if isinstance(exc, UnsupportedCountyError):
+            _logger.warning("Canary: no scraper for %s %s", where, record_type)
+        else:
+            _logger.error("Canary failed for %s %s: %s", where, record_type, type(exc).__name__)
+        connector.health_status = "down"
+        # A previously-working source just broke: page ops. Exception CLASS only
+        # (scraper errors can embed raw page content, a PII risk: Codex P2).
+        if prev_status != "down":
+            pending_alerts.append((
+                "canary", where,
+                f"Canary DOWN: {where} {record_type} (was {prev_status})",
+                f"connector={where}\nrecord_type={record_type}\n"
+                f"previous_status={prev_status}\n"
+                f"error_class={type(exc).__name__}",
+            ))
+
+
 async def _canary_scrape(scraper_class, date_from: str, date_to: str) -> list:
     async with scraper_class() as scraper:
         return await scraper.scrape(date_from, date_to)
 
 
-def _canary_probe_historical(scraper_class, today) -> bool:
-    """True if the scraper retrieves >=1 record in any historical fallback window.
+def _canary_probe_historical(scraper_class, today) -> str:
+    """"hit" if any historical fallback window has a record, "empty" if every
+    window answered with none, "inconclusive" if none hit and one errored.
 
     Read-only: uses the same scrape() path as the live probe (returns records,
-    persists nothing). Swallows per-window exceptions and stops at the first hit.
-    This runs ONLY for already-non-healthy connectors whose current-week probe was
-    empty, and only ever UPGRADES them to 'healthy' — so a transient historical
-    error must never downgrade a connector; it simply counts as "no hit" and the
-    caller keeps the current non-healthy status. Bounded by _CANARY_HISTORICAL_WINDOWS.
+    persists nothing). Stops at the first hit. Only "empty" may count against a
+    source: a transient or blocked historical probe proves nothing, and must never
+    downgrade a connector (P0-08, Codex). Bounded by _CANARY_HISTORICAL_WINDOWS.
     """
     import asyncio
 
+    errored = False
     for days_start, days_end in _CANARY_HISTORICAL_WINDOWS:
         win_from = (today - timedelta(days=days_start)).strftime("%m/%d/%Y")
         win_to = (today - timedelta(days=days_end)).strftime("%m/%d/%Y")
         try:
             records = asyncio.run(_canary_scrape(scraper_class, win_from, win_to))
-        except Exception as exc:  # transient/blocked historical probe — never downgrades
+        except Exception as exc:  # transient/blocked historical probe: proves nothing
             _logger.info(
-                "Canary historical probe %s-%s errored (ignored): %s",
-                win_from, win_to, str(exc)[:80],
+                "Canary historical probe %s-%s errored: %s",
+                win_from, win_to, type(exc).__name__,
             )
+            errored = True
             continue
         if records:
             _logger.info(
                 "Canary historical probe hit %s-%s: %d records",
                 win_from, win_to, len(records),
             )
-            return True
-    return False
+            return "hit"
+    return "inconclusive" if errored else "empty"
 
 
 # ─── Enrichment-source canary ────────────────────────────────────────────────

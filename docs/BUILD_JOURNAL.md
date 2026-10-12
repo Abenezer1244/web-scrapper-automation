@@ -19,6 +19,44 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-10-12 — UX 3.15: every implicit-locale count format now renders en-US (follow-up 1)
+
+**Built / Shipped:** owner chose "all 1 by 1" (follow-ups 1, 2, 3 in order). Follow-up 1 is done in four capped
+sub-phases, all frontend: bridgeleads-web **#268** 3.15a (386f798, 4 batch-page files), **#269** 3.15b (5ccc044,
+dashboard trend / record mix / scrapers table / batch card / Results index), **#270** 3.15c (44448e8, billing usage
+and plan limits, quota banner, segments summary, the shared list-filter count, the wizard's lookup pricing line),
+**#271** 3.15d (36f53dd, chart tooltip, auction coverage note, admin funnel). Every `n.toLocaleString()` count (17
+files, 39 calls) now uses `formatCount` (explicit en-US), except the generic chart tooltip, which passes "en-US" and
+keeps decimals. A de-DE browser used to read "4.089" where the rest of the app said "4,089". The one intended en-US
+change: a batch child row's raw "4089 new" became "4,089 new".
+
+**Tried / Decided:** Codex PLAN 3.15 took seven rounds (r4 was reaped by the memory reaper, its orphan finished and
+was read), then each sub-phase got its own callsite matrix and its own small Codex GO before its build (3.15b r2,
+3.15c r2, 3.15d r2): reviewing four small matrices beat one huge one. Out of scope by decision: raw ungrouped small
+counts (e.g. `batches/[id]/page.tsx:500`, `results/page.tsx:218`, the funnel drop-off), money, dates (follow-up 2).
+
+**Failed / Blocked:** memory. Free RAM sat at 3.1-3.4 GB: the reaper killed a stub, a master build and a Codex round
+while the session was idle. What worked: start the build in the background and stay busy in a foreground wait loop
+(the reaper only takes background jobs while the session is idle); one heavy job at a time. Builds ran with the stub
+down for both master and branch (symmetric; every touched page is client-rendered). My fixtures were wrong more than
+once and Codex caught it: a `BatchQuality` that broke its own partitions (new + delivered + other must equal stacked +
+single + no identity), "11,145" written as "12,345", the stub's `/auth/me` missing `profile_complete`.
+
+**Caught & fixed:** rig bugs, never product bugs: the batch contact note renders under "Phone numbers" when anything
+was looked up; a donut sector's box centre is in the hole (hover a point `elementFromPoint` confirms); the results
+search param is `q`; a window switch passes through a loading state (wait for a numeric value). Proof per sub-phase:
+master RED for the stated reason in de-DE (3.15a 14, b 8, c 17, d 9 SEMANTIC fails), branch GREEN (62, 47, 135, 53
+checks, 0 fails), en-US equal to master on every locator; fixtures checked against the generated schema's required
+keys; Codex diff gate PASS r1 on all four.
+
+**Pending / Handoff:** follow-up 2 (dates in a non-US browser, `formatUtcDate`) next, then 3 (backend thousands
+separators in stage labels; Railway auto-deploy on main pushes has looked broken since BE #500, so a BE merge needs a
+`railway deployment list` check). Optional later: "raw ungrouped counts".
+
+**Facts learned:** a Playwright `locale` changes only the browser's `Intl`; an SSR-rendered implicit format follows the
+server's locale, so every site has to be classified CLIENT or SSR before a browser-locale proof means anything. A
+`/health` 200 proves the API is up, not that a merge deployed.
+
 ## 2026-10-11 — The "finale" batch: claim transfer ran out the Celery time limit
 
 **Built / Shipped:** PR #504 (`fix/claim-transfer-timeout-bulk-prefilter`): `transfer_undelivered_claims`

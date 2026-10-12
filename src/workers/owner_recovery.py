@@ -308,7 +308,9 @@ def _tick(stats: dict) -> dict:
     deadline = time.monotonic() + _TICK_BUDGET_S
     with system_sync_session() as db:
         # Stored answers first: no King request, so this runs during a cooldown too.
-        stats["cached"] = sum(_fill_from_store(db).values())
+        cached = _fill_from_store(db)
+        stats["cached"] = cached["found"] + cached["not_on_record"]
+        stats["errors"] += cached["errors"]
         if not is_source_available(db, KING_EREALPROPERTY):
             stats["skipped"] = "king_erealproperty is in cooldown"
             return stats
@@ -364,8 +366,8 @@ def _tick(stats: dict) -> dict:
             # A lead selected for these parcels but not written changed during the
             # lookup (named by a re-run, capped, its job reopened): left alone.
             expected = sum(len(by_parcel[p]) for p in stored)
-            if expected <= _CACHE_FILL_ROWS:
-                stats["stale"] += max(0, expected - sum(filled.values()))
+            if expected <= _CACHE_FILL_ROWS and not filled["errors"]:
+                stats["stale"] += max(0, expected - filled["found"] - filled["not_on_record"])
 
     _logger.info(
         "Owner recovery: %d named from stored answers; %d parcel(s) / %d lead(s) asked; "
@@ -400,8 +402,8 @@ def _fill_from_store(db, parcels: list[str] | None = None) -> dict[str, int]:
 
     `parcels` None: any parcel (the start of a tick; nothing is charged). A list: the
     parcels King just answered on this tick, so each lead is charged its attempt as
-    `_write` would. Returns rows written per outcome."""
-    counts = {"found": 0, "not_on_record": 0}
+    `_write` would. Returns rows written per outcome, and `errors` 1 if the fill failed."""
+    counts = {"found": 0, "not_on_record": 0, "errors": 0}
     try:
         written = db.execute(sa_text(_CACHE_FILL_SQL), {
             "max_attempts": _MAX_ATTEMPTS, "fresh_days": _FRESH_DAYS,
@@ -413,6 +415,7 @@ def _fill_from_store(db, parcels: list[str] | None = None) -> dict[str, int]:
         db.rollback()
         _logger.warning("Owner recovery: fill from stored answers failed: %s",
                         type(exc).__name__)
+        counts["errors"] = 1
         return counts
     for outcome in written:
         counts[outcome] += 1

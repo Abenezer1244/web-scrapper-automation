@@ -372,3 +372,58 @@ def test_a_pre_099_worker_still_gets_its_page_counters_read():
              record_count=30)
     assert (j.units_done, j.units_total) == (3, 4)
     assert j.progress_pct == 75
+
+
+# ─── Counts in the label are grouped for reading (UX 3.17b) ──────────────────
+# The label is display text: a King run read "Part 4089 of 10000" while every count
+# the web app shows itself reads "4,089". The numeric fields stay raw ints.
+
+def _labels(j: JobResponse) -> str:
+    """progress_label mirrors stage_label; both must carry the grouped text."""
+    assert j.progress_label == j.stage_label
+    return j.stage_label
+
+
+def test_a_large_denominator_is_grouped_in_the_label():
+    j = _job(stage="scraping", units_done=1234, units_total=10000, progress_unit="chunk")
+    assert _labels(j) == "Collecting records: Part 1,234 of 10,000"
+    assert (j.units_done, j.units_total) == (1234, 10000)
+
+
+def test_a_large_count_without_a_noun_is_grouped():
+    j = _job(stage="scraping", units_done=1234, units_total=10000, progress_unit=None)
+    assert _labels(j) == "Collecting records: 1,234 of 10,000"
+
+
+def test_a_large_count_without_a_denominator_is_grouped():
+    j = _job(stage="scraping", units_done=4089, units_total=None, progress_unit="page")
+    assert _labels(j) == "Collecting records: Page 4,089"
+
+
+def test_a_large_count_with_no_noun_and_no_denominator_is_grouped():
+    j = _job(stage="scraping", units_done=4089, units_total=None, progress_unit=None)
+    assert _labels(j) == "Collecting records: 4,089"
+
+
+def test_a_large_records_found_is_grouped():
+    j = _job(stage="saving", units_done=None, units_total=None, records_found=4089)
+    assert _labels(j) == "Saving records: 4,089 records found"
+
+
+def test_a_large_parcel_sweep_is_grouped():
+    """The exact form the web app's measured-lookup guard accepts (3.17a)."""
+    j = _job(status="enriching", stage="address_lookup_gis", units_done=4089,
+             units_total=10000, progress_unit="parcel")
+    assert _labels(j) == "Checking county parcel records: Property 4,089 of 10,000"
+
+
+def test_the_grouping_starts_at_one_thousand():
+    j = _job(stage="scraping", units_done=999, units_total=1000, progress_unit="chunk")
+    assert _labels(j) == "Collecting records: Part 999 of 1,000"
+
+
+def test_a_large_finished_count_is_grouped():
+    j = _job(status="done", finished_at=_ago(seconds=5), record_count=4089,
+             records_found=12345, stage="finalizing")
+    assert _labels(j) == "Complete: 4,089 new leads"
+    assert j.record_count == 4089

@@ -7,7 +7,8 @@ under a shared source lease and a wall-clock budget. A job that loses the lease,
 runs out of budget or meets a throttle leaves leads unnamed and (since #298) marks
 each one `owner_lookup_deferred = true` with the reason. Job b2f2ecd5 delivered 840
 King tax leads with 0 owner names; without this sweep they would stay that way
-until someone re-ran the scraper.
+until someone re-ran the scraper. On 2026-10-12, 22,009 of 22,855 delivered King tax
+leads were still unnamed, none of them flagged, so this sweep never saw them.
 
 WHAT THIS IS NOT
 ----------------
@@ -19,17 +20,27 @@ sweep in mailing_recovery.py:
   * It never enqueues a skip trace (Tracerfy keys off the property address, which
     this never changes) and never touches `skip_trace_status`, phone or email.
   * It only fills a `party_name` that is still blank, on a row that is still
-    deferred and still delivered, on a terminal job. Each condition is re-checked
+    visible and not yet settled, on a terminal job. Each condition is re-checked
     in the UPDATE itself, so a row a re-run named, or the plan cap excluded, while
     the lookup was in flight is left alone.
 
 WHICH LEADS
 -----------
-Only DELIVERED leads: non-duplicate rows the plan cap did not mark over quota.
-Over-quota rows and duplicates are never shown to the customer, and every
-eRealProperty request costs goodwill with a source that has IP-blocked us twice.
-An over-quota lead delivered later by another job is named by that job's own
-enrichment. Largest balance first, the order the tax plan cap delivers in.
+Every VISIBLE unnamed King tax lead (owner decision 2026-10-12): delivered rows the
+plan cap did not mark over quota, AND the account's already-delivered rows (shown on
+the run's "already delivered" list). Over-quota and same-run/superseded rows are
+never shown, so never asked about. The deferred flag is not required: leads
+delivered before #298 never got it.
+
+ONE ANSWER PER PARCEL
+---------------------
+Every eRealProperty request costs goodwill with a source that has IP-blocked us
+twice, and the same parcels return on every run for every account. So each settled
+answer (found / not on record, from a page that echoed the requested PIN) is stored
+in `king_parcel_owners` and names every waiting lead of that parcel in one UPDATE,
+with no further request for `_FRESH_DAYS`. Stored answers are applied first on each
+tick, so they keep naming leads while King is in cooldown. Parcels with a delivered
+lead are asked first, then fewest attempts, then the largest balance.
 
 KING RATE LIMITS
 ----------------
@@ -77,22 +88,47 @@ _TICK_BUDGET_S = 300.0
 _LOCK_KEY = "bl:owner_recovery:lock"
 _LOCK_TTL_S = 1200
 
-# Delivered King tax leads still waiting for an owner. The same predicate guards
-# every write (`_ELIGIBLE_ROW` below), so selection and write cannot disagree.
+# How long a stored eRealProperty answer (king_parcel_owners) stands in for asking
+# King again. Ownership changes on a sale, so this is a trade between a stale name
+# and King's throttle: at 7 days every weekly King tax run would re-ask ~15,000
+# parcels, the load that trips it (Codex suggested 7; 30 chosen, 2026-10-12).
+_FRESH_DAYS = 30
+# Leads filled from stored answers per tick: one set-based UPDATE, no King request.
+_CACHE_FILL_ROWS = 5000
+
+# Visible King tax leads still waiting for an owner: delivered leads AND the
+# account's already-delivered rows (owner decision 2026-10-12: fill every unnamed
+# lead, once per property). A lead is waiting until one of its answers settles it:
+# found (named), not on record, a parcel King answers for with another PIN, or
+# out of attempts. The deferred flag is not required: leads delivered before the
+# job learned to set it (22,009 on 2026-10-12) never got it. The same predicate
+# guards every write, so selection and write cannot disagree.
 _ELIGIBLE_ROW = """
-      r.is_duplicate = false
+      (r.is_duplicate = false
+       OR (r.is_duplicate = true AND coalesce(r.duplicate_reason, 'prior_run') = 'prior_run'))
   AND r.enrichment_data->>'delivery_excluded_reason' IS NULL
-  AND coalesce(r.enrichment_data->>'owner_lookup_deferred', '') = 'true'
+  AND coalesce(r.enrichment_data->>'owner_lookup_outcome', '') <> 'not_on_record'
+  AND coalesce(r.enrichment_data->>'owner_recovery_outcome', '')
+      NOT IN ('found', 'not_on_record', 'parcel_mismatch', 'gave_up')
   AND (r.party_name IS NULL OR btrim(r.party_name) = '')
   AND btrim(r.parcel_id) ~ '^[0-9]{10}$'
   AND (CASE WHEN r.enrichment_data->>'owner_recovery_attempts' ~ '^[0-9]{1,6}$'
             THEN (r.enrichment_data->>'owner_recovery_attempts')::int ELSE 0 END) < :max_attempts
 """
 
-# Pick PARCELS, not rows (two leads on one parcel share one lookup): fewest
-# attempts first, then the longest since last tried, then the largest balance.
+_KING_TAX_JOB = """
+      j.status = 'done'
+  AND lower(sc.county) = 'king' AND upper(sc.state) = 'WA'
+  AND sc.record_type = 'tax_delinquent'
+"""
+
+# Pick PARCELS, not rows (two leads on one parcel share one lookup): parcels with
+# a delivered lead first, then fewest attempts, the longest since last tried, the
+# largest balance. A parcel with a fresh stored answer is never asked again; the
+# cache fill names its leads instead.
 _CANDIDATE_PARCELS_SQL = f"""
     SELECT btrim(r.parcel_id) AS parcel_id,
+           bool_or(r.is_duplicate = false) AS delivered,
            min(CASE WHEN r.enrichment_data->>'owner_recovery_attempts' ~ '^[0-9]{1,6}$'
                     THEN (r.enrichment_data->>'owner_recovery_attempts')::int ELSE 0 END) AS attempts,
            min(coalesce(r.enrichment_data->>'owner_recovery_last_at', '')) AS last_at,
@@ -100,14 +136,71 @@ _CANDIDATE_PARCELS_SQL = f"""
     FROM results r
     JOIN jobs j ON j.id = r.job_id
     JOIN scraper_configs sc ON sc.id = j.scraper_config_id
-    WHERE j.status = 'done'
-      AND lower(sc.county) = 'king' AND upper(sc.state) = 'WA'
-      AND sc.record_type = 'tax_delinquent'
+    WHERE {_KING_TAX_JOB}
       AND {_ELIGIBLE_ROW}
+      AND NOT EXISTS (
+        SELECT 1 FROM king_parcel_owners k
+        WHERE k.parcel_id = btrim(r.parcel_id)
+          AND k.observed_at > now() - make_interval(days => :fresh_days))
     GROUP BY btrim(r.parcel_id)
-    ORDER BY attempts ASC, last_at ASC, amount DESC NULLS LAST, parcel_id ASC
+    ORDER BY delivered DESC, attempts ASC, last_at ASC, amount DESC NULLS LAST, parcel_id ASC
     LIMIT :batch
-"""  # noqa: S608 -- splices only the _ELIGIBLE_ROW constant; every value is bound
+"""  # noqa: S608 -- splices only constant SQL fragments; every value is bound
+
+# Name every waiting lead whose parcel has a fresh stored answer, in one statement
+# and without asking King. Same eligibility as every other write; the payload is
+# what `_write` stores for the same outcome. RETURNING feeds the stats.
+_CACHE_FILL_SQL = f"""
+    UPDATE results r SET
+      party_name = CASE WHEN k.outcome = 'found' THEN k.owner_name ELSE r.party_name END,
+      enrichment_data = (
+        ((CASE WHEN jsonb_typeof(r.enrichment_data::jsonb) = 'object'
+               THEN r.enrichment_data::jsonb ELSE '{{}}'::jsonb END)
+         - 'owner_lookup_deferred_reason')
+        || jsonb_build_object('owner_lookup_deferred', false,
+                              'owner_recovery_outcome', k.outcome,
+                              'owner_recovery_last_at', CAST(:now_iso AS text))
+        -- Charged only when King was asked for this lead's parcel on this tick; a
+        -- lead named from an earlier answer cost no request.
+        || CASE WHEN CAST(:count_attempt AS boolean)
+                THEN jsonb_build_object('owner_recovery_attempts',
+                  (CASE WHEN r.enrichment_data->>'owner_recovery_attempts' ~ '^[0-9]{1,6}$'
+                        THEN (r.enrichment_data->>'owner_recovery_attempts')::int ELSE 0 END) + 1)
+                ELSE '{{}}'::jsonb END
+        || CASE WHEN k.outcome = 'not_on_record'
+                THEN jsonb_build_object('owner_lookup_outcome', 'not_on_record')
+                ELSE '{{}}'::jsonb END)::json
+    FROM king_parcel_owners k
+    WHERE r.id IN (
+        SELECT r.id FROM results r
+        JOIN jobs j ON j.id = r.job_id
+        JOIN scraper_configs sc ON sc.id = j.scraper_config_id
+        JOIN king_parcel_owners k ON k.parcel_id = btrim(r.parcel_id)
+        WHERE {_KING_TAX_JOB}
+          AND {_ELIGIBLE_ROW}
+          AND k.observed_at > now() - make_interval(days => :fresh_days)
+          AND (CAST(:parcels AS text[]) IS NULL OR k.parcel_id = ANY(CAST(:parcels AS text[])))
+        ORDER BY r.id
+        LIMIT :fill_rows)
+      AND k.parcel_id = btrim(r.parcel_id)
+      AND k.observed_at > now() - make_interval(days => :fresh_days)
+      AND {_ELIGIBLE_ROW}
+      AND EXISTS (
+        SELECT 1 FROM jobs j JOIN scraper_configs sc ON sc.id = j.scraper_config_id
+        WHERE j.id = r.job_id AND {_KING_TAX_JOB})
+    RETURNING k.outcome
+"""  # noqa: S608 -- splices only constant SQL fragments; every value is bound
+
+# Store one settled eRealProperty answer for its parcel. A newer observation wins;
+# an older one never overwrites it.
+_STORE_SQL = """
+    INSERT INTO king_parcel_owners (parcel_id, outcome, owner_name, observed_at, source)
+    VALUES (:pid, :outcome, :owner, now(), 'erealproperty')
+    ON CONFLICT (parcel_id) DO UPDATE SET
+      outcome = EXCLUDED.outcome, owner_name = EXCLUDED.owner_name,
+      observed_at = EXCLUDED.observed_at, source = EXCLUDED.source
+    WHERE EXCLUDED.observed_at > king_parcel_owners.observed_at
+"""
 
 _CANDIDATE_ROWS_SQL = f"""
     SELECT r.id, r.user_id, btrim(r.parcel_id) AS parcel_id, r.enrichment_data
@@ -186,7 +279,7 @@ def recover_deferred_king_owners() -> dict:
     """One bounded tick. Returns a stats dict (also read by the tests)."""
     stats = {"parcels": 0, "rows": 0, "found": 0, "not_on_record": 0, "parcel_mismatch": 0,
              "transient": 0, "gave_up": 0, "unreached": 0, "stale": 0, "errors": 0,
-             "skipped": ""}
+             "cached": 0, "skipped": ""}
     if not settings.OWNER_RECOVERY_ENABLED:
         stats["skipped"] = "OWNER_RECOVERY_ENABLED is off"
         return stats
@@ -214,10 +307,12 @@ def _tick(stats: dict) -> dict:
 
     deadline = time.monotonic() + _TICK_BUDGET_S
     with system_sync_session() as db:
+        # Stored answers first: no King request, so this runs during a cooldown too.
+        stats["cached"] = sum(_fill_from_store(db).values())
         if not is_source_available(db, KING_EREALPROPERTY):
             stats["skipped"] = "king_erealproperty is in cooldown"
             return stats
-        params = {"max_attempts": _MAX_ATTEMPTS}
+        params = {"max_attempts": _MAX_ATTEMPTS, "fresh_days": _FRESH_DAYS}
         parcels = [r.parcel_id for r in db.execute(
             sa_text(_CANDIDATE_PARCELS_SQL), {**params, "batch": _BATCH_PARCELS}).all()]
         if not parcels:
@@ -253,18 +348,75 @@ def _tick(stats: dict) -> dict:
             stats["skipped"] = f"{type(exc).__name__}: {str(exc)[:120]}"
             _logger.warning("Owner recovery: lookup failed: %s", stats["skipped"])
 
+        stored: list[str] = []
         for pid, outcome in _classify(parcels, owners, o_stats).items():
+            # A settled answer is stored once for the parcel and fills its leads in
+            # one statement below; anything else is charged row by row as before.
+            if outcome in ("found", "not_on_record") and _store(db, pid, outcome, owners.get(pid)):
+                stored.append(pid)
+                continue
             for row in by_parcel.get(pid, []):
                 stats[_write(db, row, outcome, owners.get(pid))] += 1
+        if stored:
+            filled = _fill_from_store(db, stored)
+            for outcome, n in filled.items():
+                stats[outcome] += n
+            # A lead selected for these parcels but not written changed during the
+            # lookup (named by a re-run, capped, its job reopened): left alone.
+            expected = sum(len(by_parcel[p]) for p in stored)
+            if expected <= _CACHE_FILL_ROWS:
+                stats["stale"] += max(0, expected - sum(filled.values()))
 
     _logger.info(
-        "Owner recovery: %d parcel(s) / %d lead(s); leads: %d found, %d not on record, "
+        "Owner recovery: %d named from stored answers; %d parcel(s) / %d lead(s) asked; "
+        "leads: %d found, %d not on record, "
         "%d parcel mismatch, %d transient, %d gave up, %d unreached, %d stale, %d error%s",
-        stats["parcels"], stats["rows"], stats["found"], stats["not_on_record"],
+        stats["cached"], stats["parcels"], stats["rows"], stats["found"], stats["not_on_record"],
         stats["parcel_mismatch"], stats["transient"], stats["gave_up"], stats["unreached"],
         stats["stale"], stats["errors"], f" ({stats['skipped']})" if stats["skipped"] else "",
     )
     return stats
+
+
+def _store(db, pid: str, outcome: str, owner: str | None) -> bool:
+    """Store one settled eRealProperty answer for its parcel. False when it could not
+    be stored, so the caller falls back to writing the parcel's leads one by one."""
+    name = (owner or "").strip() if outcome == "found" else None
+    if outcome == "found" and not name:
+        return False
+    try:
+        db.execute(sa_text(_STORE_SQL), {"pid": pid, "outcome": outcome, "owner": name})
+        db.commit()
+        return True
+    except Exception as exc:  # noqa: BLE001 -- the row-by-row write still runs
+        db.rollback()
+        _logger.warning("Owner recovery: answer for parcel %s not stored: %s",
+                        pid[-4:], type(exc).__name__)
+        return False
+
+
+def _fill_from_store(db, parcels: list[str] | None = None) -> dict[str, int]:
+    """Name waiting leads from fresh stored answers. One UPDATE, no King request.
+
+    `parcels` None: any parcel (the start of a tick; nothing is charged). A list: the
+    parcels King just answered on this tick, so each lead is charged its attempt as
+    `_write` would. Returns rows written per outcome."""
+    counts = {"found": 0, "not_on_record": 0}
+    try:
+        written = db.execute(sa_text(_CACHE_FILL_SQL), {
+            "max_attempts": _MAX_ATTEMPTS, "fresh_days": _FRESH_DAYS,
+            "fill_rows": _CACHE_FILL_ROWS, "now_iso": _now_iso(), "parcels": parcels,
+            "count_attempt": parcels is not None,
+        }).scalars().all()
+        db.commit()
+    except Exception as exc:  # noqa: BLE001 -- the next tick tries again
+        db.rollback()
+        _logger.warning("Owner recovery: fill from stored answers failed: %s",
+                        type(exc).__name__)
+        return counts
+    for outcome in written:
+        counts[outcome] += 1
+    return counts
 
 
 def _classify(parcels: list[str], owners: dict, o_stats: dict) -> dict[str, str]:

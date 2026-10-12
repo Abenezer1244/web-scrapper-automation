@@ -916,19 +916,8 @@ def transfer_undelivered_claims(db, job_id: str, user_id, record_type=None) -> i
     # time, a King tax run with 15,410 purged-anchor claims spent over 30 minutes
     # in round trips here and ran out its Celery time limit (job 1b44217a,
     # 2026-10-11). A hash with no claim at all is kept: _take_unheld_claim gets it.
-    if groups:
-        settled = db.execute(
-            sa_text(
-                "SELECT d.dedup_hash FROM delivered_records d "
-                "LEFT JOIN results a ON a.id = d.first_result_id AND a.user_id = d.user_id "
-                "WHERE d.user_id = CAST(:uid AS uuid) "
-                "  AND d.dedup_hash = ANY(CAST(:hashes AS text[])) "
-                "  AND (a.job_id IS NULL OR a.job_id = CAST(:jid AS uuid))"
-            ),
-            {"uid": uid, "hashes": list(groups), "jid": job_id},
-        ).scalars().all()
-        for dedup_hash in settled:
-            groups.pop(dedup_hash, None)
+    for dedup_hash in settled_claim_hashes(db, uid, job_id, list(groups)):
+        groups.pop(dedup_hash, None)
 
     transferred = 0
     first_failure: Exception | None = None
@@ -952,6 +941,42 @@ def transfer_undelivered_claims(db, job_id: str, user_id, record_type=None) -> i
     if first_failure is not None:
         raise first_failure
     return transferred
+
+
+def settled_claim_hashes(db, user_id, job_id: str, hashes: list[str], *,
+                         sweep_proof: bool = False) -> set[str]:
+    """The hashes whose claim transfer_undelivered_claims turns away right now: the
+    claim's anchor row is gone (purged source run) or is already this run's.
+
+    A hash with no claim is not settled: _take_unheld_claim can still promote it.
+    One query for all hashes.
+
+    `sweep_proof`: also drop a claim sweep_stranded_dedup_claims could still delete
+    before this run's claim transfer (its first job is another run that is not done,
+    never billed, and recent), since a deleted claim makes the hash promotable again.
+    What is left stays hidden for the rest of the run, so the job's King per-parcel
+    owner lookups skip it (enrich.py).
+    """
+    if not hashes:
+        return set()
+    sweepable = (
+        "  AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.id = d.first_job_id "
+        "    AND j.user_id = d.user_id AND j.id <> CAST(:jid AS uuid) "
+        "    AND j.status <> 'done' AND j.billing_applied_at IS NULL "
+        "    AND j.created_at >= :since)"
+    ) if sweep_proof else ""
+    return set(db.execute(
+        sa_text(
+            "SELECT d.dedup_hash FROM delivered_records d "
+            "LEFT JOIN results a ON a.id = d.first_result_id AND a.user_id = d.user_id "
+            "WHERE d.user_id = CAST(:uid AS uuid) "
+            "  AND d.dedup_hash = ANY(CAST(:hashes AS text[])) "
+            "  AND (a.job_id IS NULL OR a.job_id = CAST(:jid AS uuid))"
+            f"{sweepable}"
+        ),
+        {"uid": str(user_id), "hashes": list(hashes), "jid": job_id,
+         "since": BILLING_STAMP_RELIABLE_SINCE},
+    ).scalars().all())
 
 
 def _transfer_one_claim(db, job_id, uid, user_id, dedup_hash, members, record_type) -> bool:

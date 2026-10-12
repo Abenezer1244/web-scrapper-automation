@@ -16,6 +16,7 @@ from src.config import settings
 from src.utils.logger import setup_logger
 from src.workers.property_identity import legacy_strong_signature as _legacy_strong_signature
 from src.workers.tasks_helpers.status import _now, _publish_log, _set_progress
+from src.workers.tasks_helpers.step_timing import timed_step
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -1077,13 +1078,20 @@ def _run_inline_enrichment(
         # Measured only when the sweep runs more than one batch: a single batch would
         # read "0 of N" and then jump to the end, which tells nobody anything.
         measured = progress is not None and len(all_pids) > _GIS_COMMIT_BATCH
+        # Worker-log diagnostics only (step_timing): how much of the sweep is the
+        # county answering and how much is our own writes.
+        gis_started = _time.monotonic()
+        gis_fetch_s = 0.0
+        gis_commit_s = 0.0
         try:
             for i in range(0, len(all_pids), _GIS_COMMIT_BATCH):
                 batch_pids = all_pids[i:i + _GIS_COMMIT_BATCH]
                 gis_stats: dict = {}
+                _fetch_started = _time.monotonic()
                 gis_results = batch_enrich_parcels_gis(
                     batch_pids, config.county, config.state, stats=gis_stats
                 )
+                gis_fetch_s += _time.monotonic() - _fetch_started
                 batch_updated = 0
                 # Parcels, not rows: one lookup serves every lead on a parcel, and the
                 # King summary counts parcels too (Codex P2).
@@ -1198,7 +1206,9 @@ def _run_inline_enrichment(
                                 res.enrichment_data = ed
                                 batch_deferred.add(pid)
                 try:
+                    _commit_started = _time.monotonic()
                     db.commit()
+                    gis_commit_s += _time.monotonic() - _commit_started
                 except Exception as exc:
                     # Don't rollback-then-empty-commit (that would discard this batch's
                     # fills while reporting success). Roll back (recovers the session
@@ -1289,6 +1299,12 @@ def _run_inline_enrichment(
                 "addresses are unfilled (best-effort; re-run to fill)",
                 job_id, commit_failures,
             )
+        _logger.info(
+            "Job %s: step gis_sweep took %.1fs (county fetch %.1fs, batch commits %.1fs, "
+            "%d parcels, %d rows updated)",
+            job_id, _time.monotonic() - gis_started, gis_fetch_s, gis_commit_s,
+            len(all_pids), rows_updated,
+        )
 
     if is_king:
         # Condo UNIT addresses, which King GIS never has. After the GIS sweep (so only its
@@ -1296,8 +1312,9 @@ def _run_inline_enrichment(
         # and mailing and still fills any unit this could not complete. One streamed scan
         # of a ~7 MB weekly file plus one GIS request per 50 complexes.
         try:
-            _condo_filled = _fill_king_condo_unit_situs(db, all_results, job_id)
-            db.commit()
+            with timed_step(db, job_id, "king_condo_units"):
+                _condo_filled = _fill_king_condo_unit_situs(db, all_results, job_id)
+                db.commit()
             if _condo_filled:
                 _publish_log(r, job_id, "info",
                              f"Found {_condo_filled} condo unit property addresses in King "
@@ -1629,8 +1646,9 @@ def _run_inline_enrichment(
         hidden_ids: set = set()
         if is_tax_delinquent:
             try:
-                _from_store = _fill_king_owners_from_store(db, all_results)
-                db.commit()
+                with timed_step(db, job_id, "king_owners_from_store"):
+                    _from_store = _fill_king_owners_from_store(db, all_results)
+                    db.commit()
                 if _from_store:
                     _publish_log(r, job_id, "info",
                                  f"Used saved county owner records for {_from_store:,} leads.",
@@ -1681,10 +1699,12 @@ def _run_inline_enrichment(
             # or unreadable file falls straight through to the pages as before.
             # Budget: one streamed scan of the file (~15 s) before _king_deadline
             # starts, well inside the soft-limit headroom computed below.
-            _rpacct_filled = _fill_king_mailing_from_extract(pid_map, job_id)
+            with timed_step(db, job_id, "king_rpacct_extract_scan"):
+                _rpacct_filled = _fill_king_mailing_from_extract(pid_map, job_id)
             if _rpacct_filled:
                 try:
-                    db.commit()
+                    with timed_step(db, job_id, "king_rpacct_extract_write"):
+                        db.commit()
                     _publish_log(
                         r, job_id, "info",
                         f"Found {_rpacct_filled} mailing addresses in King County "

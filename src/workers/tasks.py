@@ -101,6 +101,7 @@ from src.workers.tasks_helpers.status import (
     finalize_exit,
     transient_retry_notice,
 )
+from src.workers.tasks_helpers.step_timing import timed_step
 
 _logger = setup_logger("worker.task")
 
@@ -1782,15 +1783,17 @@ def run_scrape_job(self, job_id: str) -> None:
             from src.workers.tasks_helpers.dedup import (
                 reconcile_same_run_survivors,
             )
-            _swapped = reconcile_same_run_survivors(
-                db, job_id, job.user_id, config.record_type
-            )
+            with timed_step(db, job_id, "survivor_reelection"):
+                _swapped = reconcile_same_run_survivors(
+                    db, job_id, job.user_id, config.record_type
+                )
             # Commit unconditionally: the pass also merges the losers' source-only
             # fields onto each survivor, and those writes happen even when no
             # survivor actually moved. Gating the commit on _swapped would leave
             # them riding on someone else's transaction, to be lost by the next
             # rollback.
-            db.commit()
+            with timed_step(db, job_id, "survivor_reelection_commit"):
+                db.commit()
             if _swapped:
                 _logger.info(
                     "Job %s: re-elected %d same-run survivor(s) after enrichment",
@@ -1815,9 +1818,10 @@ def run_scrape_job(self, job_id: str) -> None:
         try:
             from src.workers.tasks_helpers.dedup import transfer_undelivered_claims
 
-            _transferred = transfer_undelivered_claims(
-                db, job_id, job.user_id, config.record_type
-            )
+            with timed_step(db, job_id, "claim_transfer"):
+                _transferred = transfer_undelivered_claims(
+                    db, job_id, job.user_id, config.record_type
+                )
             if _transferred:
                 _logger.info(
                     "Job %s: took over %d claim(s) an earlier run held without "
@@ -1835,11 +1839,12 @@ def run_scrape_job(self, job_id: str) -> None:
         # Same deterministic order as the in-app download (jobs.py) so the emailed/
         # R2 CSV and the download are byte-identical, not just same-columns (Codex).
         try:
-            refreshed = db.execute(
-                select(Result)
-                .where(Result.job_id == job_id, Result.user_id == job.user_id)
-                .order_by(Result.party_name, Result.date_recorded, Result.id)
-            ).scalars().all()
+            with timed_step(db, job_id, "refetch"):
+                refreshed = db.execute(
+                    select(Result)
+                    .where(Result.job_id == job_id, Result.user_id == job.user_id)
+                    .order_by(Result.party_name, Result.date_recorded, Result.id)
+                ).scalars().all()
         except Exception as exc:
             reraise_time_limit(exc)
             db.rollback()
@@ -1858,25 +1863,27 @@ def run_scrape_job(self, job_id: str) -> None:
         if refreshed is not None:
             try:
                 _owner_changed = 0
-                for res in refreshed:
-                    flags = compute_owner_flags(
-                        res.property_address, res.mailing_address,
-                        property_city=res.property_city, property_state=res.property_state,
-                        property_zip=res.property_zip,
-                    )
-                    if (
-                        res.property_state != flags["property_state"]
-                        or res.owner_state != flags["owner_state"]
-                        or res.absentee_owner != flags["absentee_owner"]
-                        or res.out_of_state_owner != flags["out_of_state_owner"]
-                    ):
-                        res.property_state = flags["property_state"]
-                        res.owner_state = flags["owner_state"]
-                        res.absentee_owner = flags["absentee_owner"]
-                        res.out_of_state_owner = flags["out_of_state_owner"]
-                        _owner_changed += 1
+                with timed_step(db, job_id, "owner_flags_compute"):
+                    for res in refreshed:
+                        flags = compute_owner_flags(
+                            res.property_address, res.mailing_address,
+                            property_city=res.property_city, property_state=res.property_state,
+                            property_zip=res.property_zip,
+                        )
+                        if (
+                            res.property_state != flags["property_state"]
+                            or res.owner_state != flags["owner_state"]
+                            or res.absentee_owner != flags["absentee_owner"]
+                            or res.out_of_state_owner != flags["out_of_state_owner"]
+                        ):
+                            res.property_state = flags["property_state"]
+                            res.owner_state = flags["owner_state"]
+                            res.absentee_owner = flags["absentee_owner"]
+                            res.out_of_state_owner = flags["out_of_state_owner"]
+                            _owner_changed += 1
                 if _owner_changed:
-                    db.commit()
+                    with timed_step(db, job_id, "owner_flags_write"):
+                        db.commit()
                     _logger.info("Job %s: owner flags recomputed for %d rows", job_id, _owner_changed)
             except Exception as exc:
                 reraise_time_limit(exc)

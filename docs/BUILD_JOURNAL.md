@@ -19,6 +19,41 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-10-12 — King tax owner names Phase 2 live: the job reads stored answers (#512), proven on a prod re-run
+
+**Built / Shipped:** **#512** (`fc634606`, admin squash-merge 15:07 UTC): before the King page passes, the scrape
+job names unnamed rows from `king_parcel_owners` (fresh `found` names it, `not_on_record` settles it), skips
+per-parcel King requests for `prior_run` duplicates whose claim is settled and not sweepable
+(`dedup.settled_claim_hashes(..., sweep_proof=True)`), and stores its own answers. Deployed under #511
+(`c147b096`, SUCCESS on api / worker / beat 15:10); confirmed by Railway commit hash plus ancestry, not /health.
+
+**Tried / Decided:** proof was a prod re-run of batch `finale` (owner-approved): one pending `batch_runs` row
+inserted, dispatched by `batch_recovery_sweep` through the normal quota and entitlement gates. Run `8f167f23`
+against the morning run `b9f89257` (post #503/#504, pre #512), King tax_delinquent child:
+
+| | `b9f89257` | `8f167f23` (#512) |
+|---|---|---|
+| total | 35m06s | **23m26s** |
+| owner names asked | 14,493 | **77** |
+| owner pass | ~5m47s | **49s** |
+| mailing done → owner pass | ~7m28s | **53s** |
+| mailing found / no address | 15,206 / 235 | 15,206 / 237 |
+
+0 new leads is expected: the morning run delivered the 34. ~40 min of headroom under the 65-min hard limit
+that killed `1b44217a` on 10-11 (the original "finale stuck at 2 of 3" report).
+
+**Failed / Blocked:** the auto-mode classifier blocked the first prod INSERT (the owner then ran it); the copy
+step was inside the blocked command, so the first owner-approved attempt hit "can't open file". The read-only
+watcher was reaped for low memory mid-run; one snapshot after the fact read the terminal state.
+
+**Pending / Handoff:** 77 King tax leads still unnamed and 283 mailing lookups pending (recovery sweeps own
+both). Phase 3 (speed) and Phase 4 (FE "Owner name pending") open. Peer sessions held BE merges around the run
+(merge = deploy = kills a long job).
+
+**Facts learned:** the "stuck" batch was a hard-kill at the 65-min limit, not a hang; the slow part was asking
+King again about rows that never surface. A re-run with a log line that counts the work ("Resolving owner names
+for N") is a cheaper proof than timing alone.
+
 ## 2026-10-12 — King tax owner names: one stored answer per parcel, every visible lead (Phase 1)
 
 **Built / Shipped:** branch `feat/king-owner-fill`. Migration 118 `king_parcel_owners` (one settled eRealProperty

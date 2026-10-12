@@ -191,3 +191,10 @@ def test_the_probe_constructs_the_scraper_for_the_record_type():
     asyncio.run(health._canary_scrape(Scraper, "10/01/2026", "10/07/2026", "pre_foreclosure"))
     asyncio.run(health._canary_scrape(Untyped, "10/01/2026", "10/07/2026", "pre_foreclosure"))
     assert built == [{"record_type": "pre_foreclosure"}, {}]
+
+
+def test_an_empty_trustee_sale_probe_never_pages_whatever_the_status(connector, monkeypatch):
+    """Codex P2: the exemption held only while the connector was healthy."""
+    _portal(monkeypatch, now=[], history=[])
+    c = connector(record_types=("trustee_sale",), status="degraded")
+    assert _probe(c, "trustee_sale") == ("degraded", [])

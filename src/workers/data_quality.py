@@ -302,7 +302,7 @@ def check_job(db, job_id: str, *, alert: bool = True) -> dict:
         _logger.warning("%s: %s", subject, "; ".join(
             f"{w['field']} {w['run_pct']}% vs {w['baseline_pct']}%" for w in warnings))
         send_ops_alert("data_quality", f"{job['county']}/{job['record_type']}", subject, body)
-    elif not warnings:
+    elif not report["warnings"]:  # a volume-only collapse is not "within baseline"
         _logger.info("Data quality: job %s (%s/%s) within baseline; mailing %.1f%% of %d rows",
                      job_id[:8], job["county"], job["record_type"],
                      run["pct"]["mailing_address"], run["rows"])

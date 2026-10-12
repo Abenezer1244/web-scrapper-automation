@@ -506,14 +506,16 @@ def _probe_unit(connector, record_type: str, pending_alerts: list) -> None:
                 # on it let a second broken type go unpaged (Codex P1). The
                 # per-type cooldown dedupes repeats. 'degraded' is still listed.
                 connector.health_status = "degraded"
-                pending_alerts.append((
-                    "canary_zero_output", f"{where}/{record_type}",
-                    f"Canary ZERO OUTPUT: {where} {record_type} (was {prev_status})",
-                    f"connector={where}\nrecord_type={record_type}\n"
-                    "The 7-day probe and every historical window returned no records. "
-                    "The portal answered, so this is a broken extraction or a source "
-                    "that stopped publishing.",
-                ))
+                # Zero upcoming auctions is legitimate: a trustee_sale pair is never paged.
+                if record_type not in _NO_ZERO_OUTPUT_DOWNGRADE:
+                    pending_alerts.append((
+                        "canary_zero_output", f"{where}/{record_type}",
+                        f"Canary ZERO OUTPUT: {where} {record_type} (was {prev_status})",
+                        f"connector={where}\nrecord_type={record_type}\n"
+                        "The 7-day probe and every historical window returned no records. "
+                        "The portal answered, so this is a broken extraction or a source "
+                        "that stopped publishing.",
+                    ))
             elif prev_status in ("unknown", "down"):
                 # Empty now and the history could not be read: not proven working.
                 # A healthy source keeps its status until a probe can say.

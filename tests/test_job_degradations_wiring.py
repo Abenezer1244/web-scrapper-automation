@@ -42,7 +42,7 @@ def make_job(monkeypatch):
     """make_job(record_type) -> job_id: a pending job for a fresh business account."""
     connectors: list[str] = []
 
-    def make(record_type: str = "probate") -> str:
+    def make(record_type: str = "probate", skip_trace: bool = False) -> str:
         county = f"p007-{uuid.uuid4().hex[:8]}"
         start = datetime.now(UTC) - timedelta(days=10)
         with SyncSessionLocal() as s:
@@ -67,6 +67,7 @@ def make_job(monkeypatch):
                 id=str(uuid.uuid4()), user_id=user.id, name="p007 wiring",
                 county=county, state="WA", record_type=record_type,
                 fields=["party_name", "property_address"], enrichment=[],
+                skip_trace_enabled=skip_trace,
                 schedule={"frequency": "manual"}, deliver={"format": "csv", "emails": []},
                 active=True,
             )

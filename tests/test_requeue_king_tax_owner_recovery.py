@@ -139,6 +139,7 @@ async def test_a_queued_lead_is_one_the_owner_sweep_selects(db, business_user, t
         with system_sync_session() as sdb:
             return [r.parcel_id for r in sdb.execute(
                 text(orc._CANDIDATE_PARCELS_SQL),
-                {"max_attempts": orc._MAX_ATTEMPTS, "batch": 500}).all()]
+                {"max_attempts": orc._MAX_ATTEMPTS, "fresh_days": orc._FRESH_DAYS,
+                 "batch": 500}).all()]
 
     assert "1000000099" in await asyncio.to_thread(_selected)

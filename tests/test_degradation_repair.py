@@ -204,29 +204,37 @@ def test_paused_claims_wait_quietly_across_retries(degraded_job, redis_client, m
 
 def test_a_switch_off_cannot_land_while_the_claim_is_being_made(
         degraded_job, redis_client, monkeypatch):
-    """FOR SHARE holds the scraper's row from the re-read to the claim's commit."""
+    """FOR SHARE holds the scraper's row from the re-read to the claim's commit.
+
+    The tick may also repair other due jobs left by earlier tests, so the probe
+    targets the scraper of the job each claim is for, and every one must hold.
+    """
     from sqlalchemy.exc import OperationalError
 
     from src.workers import skip_trace_claim
 
     real = skip_trace_claim.claim_skip_trace_rows
-    probe: dict = {}
+    probes: dict[str, bool] = {}
 
-    def claim_while_probing(db, *a, **k):
+    def claim_while_probing(db, payloads, *a, **k):
         with SyncSessionLocal() as other:
+            job_id = str(other.execute(text(
+                "SELECT job_id FROM results WHERE id = :r"),
+                {"r": str(payloads[0]["result_id"])}).scalar_one())
             other.execute(text("SET lock_timeout = '300ms'"))
             try:
                 other.execute(text(
                     "UPDATE scraper_configs SET skip_trace_enabled = false WHERE id = "
-                    "(SELECT scraper_config_id FROM jobs WHERE id = :j)"), {"j": degraded_job})
-                probe["blocked"] = False
+                    "(SELECT scraper_config_id FROM jobs WHERE id = :j)"), {"j": job_id})
+                probes[job_id] = False
             except OperationalError:
-                probe["blocked"] = True
+                probes[job_id] = True
             other.rollback()
-        return real(db, *a, **k)
+        return real(db, payloads, *a, **k)
 
     monkeypatch.setattr(skip_trace_claim, "claim_skip_trace_rows", claim_while_probing)
     repair.repair_degraded_skip_trace()
-    assert probe == {"blocked": True}
+    assert probes.get(degraded_job) is True
+    assert all(probes.values()), probes
     assert _marker(degraded_job).repair_status == "repaired"
     assert _queued(degraded_job) > 0

@@ -408,6 +408,7 @@ def test_a_large_count_with_no_noun_and_no_denominator_is_grouped():
 def test_a_large_records_found_is_grouped():
     j = _job(stage="saving", units_done=None, units_total=None, records_found=4089)
     assert _labels(j) == "Saving records: 4,089 records found"
+    assert j.records_found == 4089
 
 
 def test_a_large_parcel_sweep_is_grouped():
@@ -427,3 +428,4 @@ def test_a_large_finished_count_is_grouped():
              records_found=12345, stage="finalizing")
     assert _labels(j) == "Complete: 4,089 new leads"
     assert j.record_count == 4089
+    assert j.records_found == 12345

@@ -330,3 +330,4 @@ async def test_list_and_detail_serialize_grouped_label_counts(
         assert body["stage_label"] == "Complete: 4,089 new leads"
         assert body["progress_label"] == "Complete: 4,089 new leads"
         assert body["record_count"] == 4089
+        assert body["records_found"] == 12345

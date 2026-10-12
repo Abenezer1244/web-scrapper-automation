@@ -1627,7 +1627,8 @@ class JobResponse(BaseModel):
     # API and the UI disagreeing about what the worker is doing. Display text only:
     # its counts are grouped for reading ("Part 4,089 of 10,000", `f"{n:,}"`, the
     # same en-US grouping the web app uses), so clients must not parse it; the numbers
-    # are in units_done, units_total, progress_unit, records_found and record_count.
+    # are in units_done, units_total, records_found and record_count (progress_unit
+    # names what units_done counts).
     stage_label: str | None = None
     estimated_total_records: int | None = None
     estimated_seconds_remaining: int | None = None

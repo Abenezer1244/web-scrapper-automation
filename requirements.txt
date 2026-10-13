@@ -31,7 +31,7 @@ celery[redis]==5.6.3
 # broker/result backend. Re-verified against kombu's PyPI metadata 2026-07-31 after
 # dependabot proposed redis 8.0.1 (#103, closed). A matching ignore rule now lives
 # in .github/dependabot.yml so it stops being re-proposed.
-redis==5.2.1
+redis==6.4.0
 
 # Scraping
 # 1.60 bundles Chromium 148 (was 131 on 1.49). Canary-verified against a live

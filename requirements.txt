@@ -89,7 +89,7 @@ resend==2.7.0
 # RETURNED object that changed. Bump only together with converting those call sites to
 # attribute / bracket access, plus tests built on real v15-shaped StripeObjects, since
 # nothing in tests/ currently exercises a Stripe call at all (Codex High, 2026-09-03).
-stripe==11.4.0
+stripe==16.0.0
 
 # Logging
 colorlog==6.9.0

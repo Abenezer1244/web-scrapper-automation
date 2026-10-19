@@ -96,6 +96,7 @@ from src.config.lookup_pricing import included_lookups_remaining, unit_price_cen
 from src.db import Job, JobLog, Result, ScraperConfig, User
 from src.db import session as db_session
 from src.utils.logger import setup_logger
+from src.utils.owner_pending import is_king_tax, owner_name_pending
 from src.utils.skip_trace_pause_state import UNKNOWN as PAUSE_UNKNOWN
 from src.utils.skip_trace_pause_state import PauseState, read_pause_state
 
@@ -667,6 +668,10 @@ async def get_results(
             .limit(page_size)
         )
         items = [ResultRow.model_validate(r) for r in rows_result.scalars().all()]
+        if config and is_king_tax(config.county, config.record_type):
+            for item in items:
+                item.owner_name_pending = owner_name_pending(
+                    item.party_name, item.parcel_id, item.enrichment_data)
         if category == "already_delivered" and items:
             await _attach_delivery_provenance(db, current_user.id, items, today)
 

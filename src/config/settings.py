@@ -507,6 +507,9 @@ class Settings(BaseSettings):
     # (kind, key) so a down portal emails once per window, not once per tick.
     OPS_ALERT_EMAIL: str = ""
     OPS_ALERT_COOLDOWN_SECONDS: int = 21600  # 6h
+    # Second, independent route (P0-09): a Better Stack incoming-webhook URL. The URL
+    # IS the credential, so it is never logged. Empty = webhook route off.
+    OPS_ALERT_WEBHOOK_URL: str = ""
 
     # ─── Plan limits: records per month (-1 = unlimited) ──────────────────────
     PLAN_LIMITS: ClassVar[dict[str, int]] = {

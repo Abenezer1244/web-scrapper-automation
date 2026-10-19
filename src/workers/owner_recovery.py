@@ -80,9 +80,11 @@ RECOVERY_OUTCOME_KEY = "owner_recovery_outcome"
 # settled as `gave_up` so a permanently failing parcel cannot hold its place.
 _MAX_ATTEMPTS = 5
 
-# Parcels per tick. At `_PACE_S` that is about two minutes of requests, inside
-# `_TICK_BUDGET_S`, and small against the 15-minute schedule.
-_BATCH_PARCELS = 120
+# Parcels per tick, at most 160 King requests an hour. It was 120 (480 an hour):
+# on 2026-10-18 the sweeps alone ran King into its ExceedCount.aspx request cap
+# and every King pass sat in cooldown for over a day. King publishes no number,
+# so this is a guess; raise it only after a week with no ExceedCount.
+_BATCH_PARCELS = 40
 _PACE_S = 1.0
 _TICK_BUDGET_S = 300.0
 

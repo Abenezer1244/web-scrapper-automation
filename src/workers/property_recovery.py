@@ -64,7 +64,7 @@ ATTEMPTS_KEY = "property_recovery_attempts"
 LAST_AT_KEY = "property_recovery_last_at"
 
 _MAX_ATTEMPTS = 5
-_BATCH_PARCELS = 120
+_BATCH_PARCELS = 40  # was 120; see owner_recovery._BATCH_PARCELS (King ExceedCount, 2026-10-18)
 _TICK_BUDGET_S = 300.0
 _PACE_S = 1.0
 

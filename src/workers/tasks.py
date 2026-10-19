@@ -1778,6 +1778,9 @@ def run_scrape_job(self, job_id: str) -> None:
         #
         # Elects exactly one survivor per group, so the duplicate count and the
         # charge cannot move. Non-fatal: a delivered job must not fail here.
+        # Each post-enrichment step logs its own elapsed time: on a 15k-row King tax
+        # job these four ran ~7 silent minutes and no log said which one (Phase 3a).
+        _t_step = time.monotonic()
         try:
             from src.workers.tasks_helpers.dedup import (
                 reconcile_same_run_survivors,
@@ -1791,11 +1794,10 @@ def run_scrape_job(self, job_id: str) -> None:
             # them riding on someone else's transaction, to be lost by the next
             # rollback.
             db.commit()
-            if _swapped:
-                _logger.info(
-                    "Job %s: re-elected %d same-run survivor(s) after enrichment",
-                    job_id, _swapped,
-                )
+            _logger.info(
+                "Job %s: re-elected %d same-run survivor(s) after enrichment in %.1fs",
+                job_id, _swapped, time.monotonic() - _t_step,
+            )
         except Exception as exc:
             reraise_time_limit(exc)
             db.rollback()
@@ -1812,17 +1814,18 @@ def run_scrape_job(self, job_id: str) -> None:
         # trace, the re-export and billing, so all four see the promoted row.
         # Each claim commits on its own. Non-fatal: a failure leaves the rows
         # flagged exactly as the cross-run dedup left them.
+        _t_step = time.monotonic()
         try:
             from src.workers.tasks_helpers.dedup import transfer_undelivered_claims
 
             _transferred = transfer_undelivered_claims(
                 db, job_id, job.user_id, config.record_type
             )
-            if _transferred:
-                _logger.info(
-                    "Job %s: took over %d claim(s) an earlier run held without "
-                    "ever delivering the lead", job_id, _transferred,
-                )
+            _logger.info(
+                "Job %s: took over %d claim(s) an earlier run held without "
+                "ever delivering the lead, in %.1fs",
+                job_id, _transferred, time.monotonic() - _t_step,
+            )
         except Exception as exc:
             reraise_time_limit(exc)
             db.rollback()
@@ -1834,12 +1837,15 @@ def run_scrape_job(self, job_id: str) -> None:
         # Fetch post-enrichment rows ONCE; reused by re-export AND membership.
         # Same deterministic order as the in-app download (jobs.py) so the emailed/
         # R2 CSV and the download are byte-identical, not just same-columns (Codex).
+        _t_step = time.monotonic()
         try:
             refreshed = db.execute(
                 select(Result)
                 .where(Result.job_id == job_id, Result.user_id == job.user_id)
                 .order_by(Result.party_name, Result.date_recorded, Result.id)
             ).scalars().all()
+            _logger.info("Job %s: refetched %d rows after enrichment in %.1fs",
+                         job_id, len(refreshed), time.monotonic() - _t_step)
         except Exception as exc:
             reraise_time_limit(exc)
             db.rollback()
@@ -1856,6 +1862,7 @@ def run_scrape_job(self, job_id: str) -> None:
         # pass here keeps absentee/out_of_state fresh for rows whose mailing was
         # NULL at insert. Non-fatal: a failure must not fail a delivered job.
         if refreshed is not None:
+            _t_step = time.monotonic()
             try:
                 _owner_changed = 0
                 for res in refreshed:
@@ -1877,7 +1884,8 @@ def run_scrape_job(self, job_id: str) -> None:
                         _owner_changed += 1
                 if _owner_changed:
                     db.commit()
-                    _logger.info("Job %s: owner flags recomputed for %d rows", job_id, _owner_changed)
+                _logger.info("Job %s: owner flags recomputed for %d of %d rows in %.1fs",
+                             job_id, _owner_changed, len(refreshed), time.monotonic() - _t_step)
             except Exception as exc:
                 reraise_time_limit(exc)
                 db.rollback()

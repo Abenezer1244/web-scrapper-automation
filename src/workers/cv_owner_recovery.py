@@ -70,7 +70,7 @@ _MAX_ATTEMPTS = 5
 
 # Parcels per tick. At `_PACE_S` that is about two minutes of requests, inside
 # `_TICK_BUDGET_S`, and small against the 20-minute schedule.
-_BATCH_PARCELS = 120
+_BATCH_PARCELS = 40  # was 120; see owner_recovery._BATCH_PARCELS (King ExceedCount, 2026-10-18)
 _PACE_S = 1.0
 _TICK_BUDGET_S = 300.0
 # The writes after the lookup get their own bound, and each UPDATE its own timeout.

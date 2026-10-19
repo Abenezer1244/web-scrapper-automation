@@ -335,7 +335,7 @@ app.conf.beat_schedule = {
     },
     "recover-deferred-owners": {
         # The reading half of `owner_lookup_deferred`: names delivered King tax
-        # leads whose owner lookup a job could not finish. Bounded (120 parcels,
+        # leads whose owner lookup a job could not finish. Bounded (40 parcels,
         # 300 s), gated on source health and OWNER_RECOVERY_ENABLED, shares the
         # King source lease with every other eRealProperty pass. Never bills,
         # never creates a job, never enqueues a skip trace.
@@ -345,7 +345,7 @@ app.conf.beat_schedule = {
     "recover-code-violation-owners": {
         # Names delivered King code-violation leads the job's 240 s owner pass did
         # not reach: Seattle SDCI leads located on a shown parcel, and Bellevue,
-        # Burien and King County Accela leads by the parcel_id they printed. Bounded (120 parcels, 300 s), gated on source health and
+        # Burien and King County Accela leads by the parcel_id they printed. Bounded (40 parcels, 300 s), gated on source health and
         # OWNER_RECOVERY_ENABLED, shares the King source lease with every other
         # eRealProperty pass. Never bills, never creates a job, never enqueues a
         # skip trace. At least 2 minutes from every other King sweep's start
@@ -357,7 +357,7 @@ app.conf.beat_schedule = {
         # The reading half of `property_lookup_deferred`: fills King property
         # addresses a job could not look up (condo unit extract first, then the
         # eRealProperty page under the shared King lease). Only leads a job marked,
-        # delivered only; bounded (120 parcels, 300 s), gated on source health and
+        # delivered only; bounded (40 parcels, 300 s), gated on source health and
         # PROPERTY_RECOVERY_ENABLED. Never bills, never creates a job, never
         # enqueues a skip trace, never copies mailing into property.
         "task": "src.workers.property_recovery.recover_deferred_property",

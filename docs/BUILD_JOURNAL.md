@@ -19,6 +19,40 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-10-19 — King owner names Phase 3a + 4: timed the silent steps, a "Pending" owner cell, and the sweeps slowed after King's request cap
+
+**Built / Shipped:** BE **#515** (f2f2c8f3) survivor re-election, claim transfer, the post-enrichment refetch and the
+owner-flag recompute each log their elapsed seconds and row counts. Logging only: on the 15k-row King tax re-run these
+four steps ran ~7 minutes with no log line between them. BE **#516** (da8f6e56) adds `owner_name_pending` on `ResultRow` and
+`BatchLeadRow`, derived per page by `src/utils/owner_pending.py`: King tax, 10-digit parcel, blank name, no settled
+outcome, fewer than 5 attempts (the states and ceiling `owner_recovery._ELIGIBLE_ROW` uses). Never stored, never in the CSV.
+BE **#518** (045e1672) drops the owner, code-violation owner and property recovery sweeps from 120 to 40 parcels per tick. FE
+**#280** (14343de) shows "Pending" for those owners on Results (`isOwnerPending` now reads the backend flag) and in the
+batch lead table and cards.
+
+**Tried / Decided:** the batch flag requires the REPRESENTATIVE row (the one whose name the cell shows) to be the King
+tax row: in a probate + tax bucket the sweep names only the tax row, so a probate representative would read "Pending"
+forever (Codex r1 P1). The FE previously keyed "Pending" off `owner_lookup_deferred`, a marker most of the 12k unnamed
+King tax leads never got, and one that cannot tell when the sweep gave up. Batching the slow writes (3b) and skipping
+hidden duplicates (3c) were deferred: 3b waits on #515's timings and Codex's two P1s (stale ORM objects after a Core
+UPDATE, a policy for concurrent writers); 3c changes stored addresses, so it needs an owner decision.
+
+**Failed / Blocked:** the check found the sweeps had been STALLED since 2026-10-18. `external_source_health.king_erealproperty`
+was `throttled` from 15:20 UTC, with reason `HTTP302 -> /Assessor/eRealProperty/ExceedCount.aspx` (King's per-IP request cap).
+No scrape job was running: the background sweeps alone tripped it. Two probes failed, and the cooldown ran to 10-19 22:29 UTC.
+12,527 visible King tax leads (4,679 parcels) were still unnamed, down from 22,009 on 10-12. On #518, Codex failed rounds
+1 (the other sweeps were still at 120) and 2 (read the cross-tick `_MAX_ATTEMPTS` as in-tick retries; the code shows
+`fetch_attempts=1` and `safe_get` with no redirects, so one request per parcel); round 3 passed. Locally, the shared FE
+`node_modules` was missing `@types/react` and an eslint dependency, so the worktree got its own `npm ci`, and the test
+Postgres crashed once (0xC0000142) and recovered.
+
+**Pending / Handoff:** watch the first ticks after the cooldown: no new ExceedCount, and the unnamed count falling. If 40
+still trips, the real fix is a shared per-source request budget that counts every King request, scrape jobs included.
+Lists (`SegmentLeadRow`) have no pending flag yet. 3b and 3c as above.
+
+**Facts learned:** King answers an over-cap client with a 302 to `ExceedCount.aspx` and publishes no number. Four King
+sweeps share one source lease but no request budget: worst case was ~1,380 requests an hour, now ~580.
+
 ## 2026-10-12 — UX 3.18 + 3.19: the guard's raw arm is gone, and the last raw counts are grouped
 
 **Built / Shipped:** 3.18: bridgeleads-web **#277** (dfb060e) the Results page's measured parcel-sweep guard matches

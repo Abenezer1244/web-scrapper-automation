@@ -126,7 +126,7 @@ def test_an_undelivered_alert_still_writes_a_row(monkeypatch):
     assert row.event == "ops_alert"
     assert row.user_id is None, "system-written, not tenant-scoped"
     assert row.path == "canary:king/WA"
-    assert row.detail == "[undelivered] crawler barren"
+    assert row.detail == "[undelivered] [email:off webhook:off] crawler barren"
     assert row.created_at is not None, "client-side created_at avoids INSERT..RETURNING"
 
 
@@ -142,7 +142,7 @@ def test_a_delivered_alert_is_recorded_as_sent(monkeypatch):
     added = []
     monkeypatch.setattr(settings, "OPS_ALERT_EMAIL", "ops@test.invalid")
     monkeypatch.setattr(settings, "RESEND_API_KEY", "re_test_not_real")
-    monkeypatch.setattr(ops_alerts, "_cooldown_acquired", lambda kind, key: True)
+    monkeypatch.setattr(ops_alerts, "_cooldown_acquired", lambda *_a: True)
     monkeypatch.setattr(ops_alerts, "_session_for_persist", _fake_session(added))
 
     fake = types.ModuleType("resend")
@@ -151,7 +151,7 @@ def test_a_delivered_alert_is_recorded_as_sent(monkeypatch):
     monkeypatch.setitem(sys.modules, "resend", fake)
 
     assert ops_alerts.send_ops_alert("nts_crawl_barren", "queen_anne_news", "subj", "b") is True
-    assert added[0].detail == "[sent] subj"
+    assert added[0].detail == "[sent] [email:ok webhook:off] subj"
 
 
 def test_a_cooldown_suppressed_alert_is_still_recorded(monkeypatch):
@@ -163,7 +163,7 @@ def test_a_cooldown_suppressed_alert_is_still_recorded(monkeypatch):
     added = []
     monkeypatch.setattr(settings, "OPS_ALERT_EMAIL", "ops@test.invalid")
     monkeypatch.setattr(settings, "RESEND_API_KEY", "re_test_not_real")
-    monkeypatch.setattr(ops_alerts, "_cooldown_acquired", lambda kind, key: False)
+    monkeypatch.setattr(ops_alerts, "_cooldown_acquired", lambda *_a: False)
     monkeypatch.setattr(ops_alerts, "_session_for_persist", _fake_session(added))
 
     assert ops_alerts.send_ops_alert("canary", "pierce/WA", "s", "b") is False
@@ -264,6 +264,6 @@ def test_unconfigured_alerting_warns_instead_of_returning_silently(caplog):
         ops_alerts.send_ops_alert("canary", "king/WA", "a barren crawl", "body")
 
     warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
-    assert any("OPS_ALERT_EMAIL not configured" in m for m in warnings), warnings
+    assert any("no ops alert route configured" in m for m in warnings), warnings
     # and it names the alert it dropped, so the log line is actionable
     assert any("canary:king/WA" in m and "a barren crawl" in m for m in warnings), warnings

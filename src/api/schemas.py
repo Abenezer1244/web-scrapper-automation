@@ -2652,6 +2652,8 @@ class SegmentLeadRow(BaseModel):
     identity_strength: str = "strong"
     # Same meaning as ResultRow.date_is_auction_date: show date_recorded as blank.
     date_is_auction_date: bool = False
+    # Same meaning as ResultRow.owner_name_pending, for the row shown.
+    owner_name_pending: bool = False
 
 
 class SegmentIntersectionResponse(BaseModel):

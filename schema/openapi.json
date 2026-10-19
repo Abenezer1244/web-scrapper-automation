@@ -5590,6 +5590,11 @@
             "title": "Overlap Count",
             "type": "integer"
           },
+          "owner_name_pending": {
+            "default": false,
+            "title": "Owner Name Pending",
+            "type": "boolean"
+          },
           "parcel_id": {
             "anyOf": [
               {

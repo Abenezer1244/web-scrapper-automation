@@ -118,7 +118,7 @@ def test_configured_send_success_and_cooldown_suppression(monkeypatch):
 # handling and the log hygiene are all exercised for real. Only Resend (an external API)
 # is faked, as above.
 
-_SECRET_PATH = "/integration/secret-token-p009"
+_WEBHOOK_PATH = "/integration/secret-token-p009"
 
 
 @pytest.fixture
@@ -149,7 +149,7 @@ def webhook_server():
     t.start()
     try:
         yield (
-            f"http://127.0.0.1:{srv.server_port}{_SECRET_PATH}",
+            f"http://127.0.0.1:{srv.server_port}{_WEBHOOK_PATH}",
             received,
             lambda code: state.__setitem__("status", code),
         )
@@ -239,7 +239,7 @@ def test_unreachable_webhook_never_raises(monkeypatch, details):
     with socket.socket() as s:  # a port nothing listens on once closed
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
-    monkeypatch.setattr(settings, "OPS_ALERT_WEBHOOK_URL", f"http://127.0.0.1:{port}{_SECRET_PATH}")
+    monkeypatch.setattr(settings, "OPS_ALERT_WEBHOOK_URL", f"http://127.0.0.1:{port}{_WEBHOOK_PATH}")
     monkeypatch.setattr(ops_alerts, "_cooldown_acquired", lambda *_a: True)
 
     assert send_ops_alert("canary", "x/WA", "s", "b") is False
@@ -329,7 +329,7 @@ def test_a_failed_send_frees_its_cooldown_for_the_next_occurrence(monkeypatch, d
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
-    monkeypatch.setattr(settings, "OPS_ALERT_WEBHOOK_URL", f"http://127.0.0.1:{port}{_SECRET_PATH}")
+    monkeypatch.setattr(settings, "OPS_ALERT_WEBHOOK_URL", f"http://127.0.0.1:{port}{_WEBHOOK_PATH}")
     kind, key = f"p009test-{uuid.uuid4().hex}", "x/WA"
     r = sync_redis.from_url(settings.REDIS_URL, **settings.redis_kwargs())
     try:

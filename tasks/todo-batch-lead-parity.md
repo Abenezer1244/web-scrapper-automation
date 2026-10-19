@@ -153,7 +153,84 @@ has the logic: date label, parcel display, money, auction countdown), `lib/types
 - [ ] Coordinate with the UX 3.15a session (it edits page.tsx / BatchOverview / BatchLeadFilters
       for number formatting): rebase on it, no overlapping hunks
 
+### Phase 2 status (2026-10-12): BUILT, FE commit b8f452b (bl-wt/batch-parity-fe), NOT pushed
+- [x] Columns, scope, shared helpers, sticky Party Name, mobile cards (all items above)
+- [x] tsc, eslint, test:unit 24/24, next build --webpack (Turbopack refuses the junctioned
+      node_modules); 44 Chromium checks at 1440/1280/768/390 on the stub rig, ALL PASSED
+- [x] Codex r1 FAIL: P2 cards ignored the record-type scope (fixed + browser check), P3 status-only
+      violation hidden on cards (fixed), P2 date label from page rows REJECTED (on master already,
+      deliberate: a stable "Notice Date" would mislabel an overlap's probate date). r2 PASS
+- [x] Types came from FE #275 (identical regen); rebased onto 5159c8f, gates re-run, pushed as
+      FE PR #276 (owner approved push + PR 2026-10-12), CI check PASS. MERGED 2026-10-12 as f980ee43 (owner "merge now"); master CI
+      PASS; Vercel production READY on f980ee43 (via vercel api, no GitHub status posted)
+
 ### Phase 3: details view (D2) and Phase 4: search + sort (D3), each its own PR if approved
+
+### Phase 3 status (2026-10-19): BUILT, FE commits 6e0accf + 393f907 on feat/batch-lead-details
+(bl-wt/batch-parity-fe, rebased on master a11258d), NOT pushed
+- [x] Side sheet (Radix dialog): row click (skips buttons / links / text selection) or the row's
+      details button; mobile cards get "View details"; focus returns to the opener; closes when rows
+      change. Shared helpers moved to lead-fields.tsx (table, cards, sheet)
+- [x] Laptop died mid-session 2026-10-12 with the work uncommitted; recovered intact. Found a TDZ
+      crash in the unfinished edit (violation description / inspection read before declared: a
+      description-only violation lead crashed the sheet); fixed + a stub row + browser check
+- [x] Gates: tsc, eslint, test:unit 24/24; Chromium on the stub rig: details 32/32, table 43/43
+      (1440 / 1280 / 768 / 390)
+- [x] Codex r1 FAIL: P1 "group extras read from the rep row" REJECTED (apply_group_sources, BE
+      #508, already folds tax / violation / nts keys from each source row; assessor = identity
+      group by policy), P3 stale open state fixed. r2 PASS + P2 trustee / TS # from nts missing:
+      fixed + check. r3 PASS; its P2s rejected (render-phase reset is React's documented
+      prop-change pattern; text() already returns only strings / numbers)
+- [ ] Follow-up, not in scope: assessed value renders raw ("412000"), same as Results; format in
+      both together if wanted
+- [x] Pushed + FE PR #279 opened 2026-10-19 (owner "open push merge"); CI + Vercel preview PASS.
+      Merge BLOCKED by the session's auto-mode classifier ("Merge Without Review"): owner merges
+
+### Phase 4 plan (D3: search + sort, server-side), owner "then phase 4" 2026-10-19
+BE branch feat/batch-lead-search (worktree bl-wt/batch-search-be, from main a3bb2c37).
+Files: `src/workers/batch_export.py`, `src/api/routes/batches.py`, a new test file, `openapi.json`.
+- [ ] `q` (str, <= 100 chars, trimmed; blank = no search) and `sort` (Literal relevance | date_desc
+      | date_asc | auction_asc | auction_desc, default relevance) on BOTH leads endpoints
+- [ ] Search matches the REPRESENTATIVE row's shown fields (what the table shows): party_name,
+      parcel_id (compared alnum-only, so "0419-12-3456" finds 0419123456), property_address, and
+      mailing_address ONLY when the batch does not hide it. Case-insensitive `strpos` on lower(),
+      never LIKE, so % and _ are literal (no escaping to get wrong). Phones / emails are encrypted:
+      not searchable (stated, not hidden)
+- [ ] Search lives in the shared `_VIEW_FILTERS`, so the page and its pager use one predicate.
+      `_FILTERED_TOTAL_SQL` counts rn=1 representative rows (ranked JOIN agg) instead of agg alone,
+      so a search on rep-row fields is countable; one row per bucket either way
+- [ ] Sort: CASE keys on a `:sort` bind placed BEFORE today's ORDER BY (which stays as the
+      tie-break, then id). A NULL / relevance bind leaves every CASE NULL = today's order exactly,
+      so the combined CSV is unchanged. Date key = the date the table SHOWS: `filing_date_sql('rk')`
+      (Results' parser), NULL for an auction-date stand-in (`auction_date_fallback_sql('rk')`) and
+      for the synthetic tax date when rk is its own tax source (FE `leadDate` rule). Auction key =
+      the auction group's `src_auction_date`. NULLS LAST in both directions
+- [ ] CSV caller (`batch_export.py:439`) binds the new params as NULL; existing tests updated
+- [ ] Tests (real test DB): each searchable field; dashed parcel; hidden mailing NOT searchable;
+      %/_ literal; no-match total 0; total == rows across pages; search + filter combined; date sort
+      both ways, stand-in + synthetic tax dates sort as undated, nulls last; auction sort; another
+      tenant's same-name lead never returned; run-scoped endpoint; CSV order unchanged
+### Phase 4 BE status (2026-10-19): BUILT on feat/batch-lead-search
+- [x] Codex PLAN r1 FAIL, 4 P1s folded in (punctuation-only needle, hidden mailing in rows AND
+      total, tenant scope on every path, total == rendered rows); P3 FE races: React Query keys
+      every response by its query, so a stale answer never lands on the current key
+- [x] q + sort on both endpoints; view_filter_params() is the ONE bind builder (API, CSV, tests),
+      so no caller can miss a bind; the CSV binds all-NULL = today's file, tested
+- [x] 20 tests on the real test DB; RED proven (main route: 19 fail; no punctuation guard: 1;
+      mailing always searchable: 1). 656 batch / export / segment / csv tests pass; ruff clean;
+      openapi additive only (+76), --check OK
+- [x] 20k-row seeded batch (isolated test DB): pages 0.2-0.8 s, totals 0.1-0.4 s (filtered total
+      71 -> 257 ms, it now ranks). A first run with no ANALYZE hit the 120 s statement timeout,
+      and main's own page 1 took 12 s once on the same data: pre-existing plan sensitivity, note
+- [x] Codex diff r1 PASS (P3 CSV-endpoint test: covered by the existing CSV golden tests; P3
+      run-scoped twin: added). §14 x2 clean
+- [ ] Not searched (stated): located parcel (Python tier rules), phones / emails (encrypted)
+
+FE (worktree from master after #279 merges): `lib/api.ts`, `page.tsx`, `BatchLeadFilters.tsx`,
+`BatchLeadsTable.tsx`, types regen.
+- [ ] `q` + `sort` in the URL like the filters; search box debounced, resets to page 1; clear button
+- [ ] Sortable Date / Auction Date headers (button + aria-sort + arrow); a Sort select on cards
+- [ ] Empty state "No leads match …" with clear search; Chromium checks 1440 / 1280 / 768 / 390
 
 ## Verification (every phase)
 - BE: pytest on the guarded test DB (TEST_DATABASE_URL, never prod), ruff

@@ -966,6 +966,9 @@ _RUN_HISTORY_CAP = 100  # newest-first page bound — recurring dailies grow for
 # nothing was produced, so it stays not-ready (matches the UI's copy).
 _DOWNLOADABLE_STATUSES = ("done", "partial")
 
+# Batch lead table order (Phase 4, D3). relevance = the combined order the CSV uses.
+BatchLeadsSort = Literal["relevance", "date_desc", "date_asc", "auction_asc", "auction_desc"]
+
 
 def _run_response(run: BatchRun) -> BatchRunResponse:
     return BatchRunResponse(
@@ -1043,6 +1046,8 @@ async def _leads_page(
     record_type: str | None = None,
     county: str | None = None,
     delivery: str | None = None,
+    q: str | None = None,
+    sort: str = "relevance",
 ) -> BatchLeadsPage:
     """Shared body for the latest-run and run-scoped leads endpoints. Caller has
     verified batch ownership and (for the run-scoped variant) run membership.
@@ -1065,6 +1070,7 @@ async def _leads_page(
         _FILTERED_TOTAL_SQL,
         _QUALITY_SQL,
         apply_group_sources,
+        view_filter_params,
     )
 
     if run is None or run.status not in _DOWNLOADABLE_STATUSES:
@@ -1097,8 +1103,18 @@ async def _leads_page(
     # it MUST come from the filtered query or pagination would offer pages that
     # render empty.
     overlaps_only = delivery_mode == "overlaps_only"
-    filters = {"f_record_type": record_type, "f_county": county, "f_delivery": delivery}
-    filtered = record_type is not None or county is not None or delivery is not None
+    hidden = resolve_hidden_output_fields(batch.fields)
+    filters = view_filter_params(
+        record_type, county, delivery, q,
+        # A hidden mailing address is never searched: it would find (and count) a
+        # lead by a value the batch does not show (Codex P1).
+        mailing_searchable="mailing_address" not in hidden,
+        sort=sort,
+    )
+    filtered = (
+        record_type is not None or county is not None or delivery is not None
+        or filters["f_q"] is not None
+    )
 
     facet_record_types: list[str] = []
     facet_counties: list[str] = []
@@ -1143,7 +1159,6 @@ async def _leads_page(
         )
         rows = result.fetchall()
 
-    hidden = resolve_hidden_output_fields(batch.fields)
     # One clock pair per page, the same two clocks ResultRow uses (UTC for the tax
     # signals, county-local for the auction countdown).
     now = datetime.now(UTC)
@@ -1241,6 +1256,23 @@ async def list_batch_leads(
             "earlier run already delivered."
         ),
     ),
+    q: str | None = Query(
+        None,
+        max_length=100,
+        description=(
+            "Search the shown owner name, property address, parcel ID (punctuation "
+            "ignored) and, when the batch shows it, the mailing address. "
+            "Case-insensitive substring; blank = no search."
+        ),
+    ),
+    sort: BatchLeadsSort = Query(
+        "relevance",
+        description=(
+            "relevance = stacked first, then contactable, then newest (the CSV order); "
+            "date = the record date the table shows; auction = the auction date. "
+            "Undated leads sort last either way."
+        ),
+    ),
     db: AsyncSession = Depends(get_rls_db),
 ) -> BatchLeadsPage:
     """The combined (deduped, overlap-first, mode-filtered) lead list of the
@@ -1250,7 +1282,8 @@ async def list_batch_leads(
         batch = await _owned_batch(db, batch_id, current_user.id)
         run = await _run_for(db, batch_id, current_user.id)
         return await _leads_page(
-            db, batch, run, page, page_size, response, record_type, county, delivery
+            db, batch, run, page, page_size, response, record_type, county, delivery,
+            q, sort,
         )
     except HTTPException as exc:
         # Codex P2: FastAPI builds exception responses separately from the
@@ -1290,6 +1323,23 @@ async def list_batch_run_leads(
             "earlier run already delivered."
         ),
     ),
+    q: str | None = Query(
+        None,
+        max_length=100,
+        description=(
+            "Search the shown owner name, property address, parcel ID (punctuation "
+            "ignored) and, when the batch shows it, the mailing address. "
+            "Case-insensitive substring; blank = no search."
+        ),
+    ),
+    sort: BatchLeadsSort = Query(
+        "relevance",
+        description=(
+            "relevance = stacked first, then contactable, then newest (the CSV order); "
+            "date = the record date the table shows; auction = the auction date. "
+            "Undated leads sort last either way."
+        ),
+    ),
     db: AsyncSession = Depends(get_rls_db),
 ) -> BatchLeadsPage:
     """Run-scoped combined lead list (2B history parity with the CSV download)."""
@@ -1308,7 +1358,8 @@ async def list_batch_run_leads(
         if run is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found")
         return await _leads_page(
-            db, batch, run, page, page_size, response, record_type, county, delivery
+            db, batch, run, page, page_size, response, record_type, county, delivery,
+            q, sort,
         )
     except HTTPException as exc:
         # Codex P2: FastAPI builds exception responses separately from the

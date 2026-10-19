@@ -69,6 +69,7 @@ from src.utils.lead_export import HIDEABLE_OUTPUT_FIELDS, resolve_hidden_output_
 from src.utils.lead_signals import auction_reference_date, derive_signals
 from src.utils.located_parcel import located_parcel_id, located_parcel_match
 from src.utils.logger import setup_logger
+from src.utils.owner_pending import is_king_tax, owner_name_pending
 from src.utils.source_dates import is_auction_date_fallback
 
 _logger = setup_logger("api.batches")
@@ -1181,6 +1182,16 @@ async def _leads_page(
         if not data.get("parcel_id"):
             data["located_parcel_id"] = located_parcel_id(enrichment)
             data["located_parcel_match"] = located_parcel_match(enrichment)
+        # The owner cell shows the REPRESENTATIVE row's name, and the sweep names only
+        # King tax rows, so the cell is pending only when that row is one. A probate
+        # row standing in for the property never gets a King name, however long
+        # anyone waits.
+        counties = data["source_counties"]
+        data["owner_name_pending"] = (
+            bool(counties)
+            and all(is_king_tax(c, data.get("record_type")) for c in counties)
+            and owner_name_pending(data.get("party_name"), data.get("parcel_id"), enrichment)
+        )
         data["skip_trace_status"] = data.get("skip_trace_status") or "not_attempted"
         data["contact_reused"] = data.pop("skip_trace_source", None) == "reused"
         leads.append(BatchLeadRow(**data))

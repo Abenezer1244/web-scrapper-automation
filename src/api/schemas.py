@@ -1298,6 +1298,10 @@ class BatchLeadRow(BaseModel):
     lead_subtype: str | None = None
     # Same meaning as ResultRow.date_is_auction_date: show date_recorded as blank.
     date_is_auction_date: bool = False
+    # King tax only: the owner cell is blank because the name is still being looked
+    # up (King's bulk extract redacts it), not because there is no owner. Derived per
+    # page, never stored, never exported (src/utils/owner_pending.py).
+    owner_name_pending: bool = False
     # No row of this property is new, and an EARLIER run delivered it to the
     # account (the Results page's already-delivered rule, results_category). A combined set spans all child rows, so without
     # this an already-delivered property reads as a fresh lead.
@@ -2040,6 +2044,10 @@ class ResultRow(BaseModel):
     # this parcel, and the complaint's coordinates fall on it). None whenever
     # located_parcel_id is None.
     located_parcel_match: str | None = None
+    # King tax only: the owner cell is blank because the name is still being looked
+    # up (King's bulk extract redacts it), not because there is no owner. Derived per
+    # page, never stored, never exported (src/utils/owner_pending.py).
+    owner_name_pending: bool = False
 
     model_config = {"from_attributes": True}
 

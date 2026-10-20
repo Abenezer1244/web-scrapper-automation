@@ -12,6 +12,7 @@ which is ready at child-job enrichment.
 """
 import io
 import json
+import re
 import uuid
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -21,6 +22,7 @@ from sqlalchemy import select, text, update
 
 from src.api.lead_actionability import actionable_sql
 from src.api.results_category import already_delivered_sql
+from src.api.results_sort import auction_date_fallback_sql, filing_date_sql
 from src.api.tax_filters import TAX_CAP_BIND, tax_cap_min_year, tax_cap_sql
 
 # Human-readable record-type labels. The private copy this replaces existed only
@@ -218,7 +220,65 @@ _VIEW_FILTERS = """
   AND (CAST(:f_delivery AS text) IS NULL
        OR (CAST(:f_delivery AS text) = 'new' AND a.has_new)
        OR (CAST(:f_delivery AS text) = 'delivered' AND NOT a.has_new AND a.has_prior))
+""" + """
+  -- Search (Phase 4, D3): the REPRESENTATIVE row's shown fields, i.e. what the table
+  -- row shows. strpos, never LIKE, so a typed % or _ is literal. :f_q is already
+  -- trimmed + lowercased, :f_q_parcel alnum-only and NULL when nothing is left (an
+  -- empty strpos needle matches everything: Codex P1). Mailing is searched only when
+  -- the batch shows it (:f_q_mailing), so a hidden value cannot find or count a lead.
+  -- Phones / emails are encrypted at rest: not searchable.
+  AND (CAST(:f_q AS text) IS NULL
+       OR strpos(lower(coalesce(rk.party_name, '')), CAST(:f_q AS text)) > 0
+       OR strpos(lower(coalesce(rk.property_address, '')), CAST(:f_q AS text)) > 0
+       OR (CAST(:f_q_mailing AS boolean)
+           AND strpos(lower(coalesce(rk.mailing_address, '')), CAST(:f_q AS text)) > 0)
+       OR (CAST(:f_q_parcel AS text) IS NOT NULL
+           AND strpos(regexp_replace(lower(coalesce(rk.parcel_id, '')), '[^a-z0-9]', '', 'g'),
+                      CAST(:f_q_parcel AS text)) > 0))
 """
+
+# Sort keys, ahead of the relevance order (which stays as the tie-break). Every key
+# is a CASE on the :sort bind, so NULL / 'relevance' leaves them all NULL and the
+# order is exactly today's: the combined CSV binds NULL. The date is the one the
+# table SHOWS (FE leadDate): Results' filing-date parser, NULL for an auction-date
+# stand-in and for the synthetic "01/01/{bill year}" when the row is its own tax
+# source. Undated rows sort last in both directions.
+_SHOWN_DATE_SQL = (
+    f"CASE WHEN {auction_date_fallback_sql('rk')} THEN NULL"
+    " WHEN ts.tax_source_id = rk.id"
+    " AND rk.date_recorded = '01/01/' || ts.src_delinquent_bill_year::text THEN NULL"
+    f" ELSE {filing_date_sql('rk')} END"
+)
+_SORT_KEYS = f"""
+ORDER BY (CASE WHEN CAST(:sort AS text) = 'date_asc' THEN {_SHOWN_DATE_SQL} END) ASC NULLS LAST,
+         (CASE WHEN CAST(:sort AS text) = 'date_desc' THEN {_SHOWN_DATE_SQL} END) DESC NULLS LAST,
+         (CASE WHEN CAST(:sort AS text) = 'auction_asc' THEN aus.src_auction_date END) ASC NULLS LAST,
+         (CASE WHEN CAST(:sort AS text) = 'auction_desc' THEN aus.src_auction_date END) DESC NULLS LAST,
+"""
+
+
+def view_filter_params(
+    record_type: str | None = None,
+    county: str | None = None,
+    delivery: str | None = None,
+    q: str | None = None,
+    mailing_searchable: bool = False,
+    sort: str | None = None,
+) -> dict:
+    """Every view-filter / sort bind _COMBINED_SQL and _FILTERED_TOTAL_SQL take, in
+    one place, so no caller can forget one. All defaults = no filter, today's order:
+    the combined CSV binds exactly this."""
+    term = (q or "").strip().lower() or None
+    return {
+        "f_record_type": record_type,
+        "f_county": county,
+        "f_delivery": delivery,
+        "f_q": term,
+        # NULL, not "", when only punctuation is left: "" would match every parcel.
+        "f_q_parcel": (re.sub(r"[^a-z0-9]", "", term) or None) if term else None,
+        "f_q_mailing": mailing_searchable,
+        "sort": sort,
+    }
 
 _COMBINED_SQL = _COMBINED_CTES + _RANKED_CTE + _GROUP_SOURCE_CTES + """
 SELECT rk.id, rk.date_recorded, rk.date_recorded_parsed, rk.party_name, rk.heirs,
@@ -245,8 +305,7 @@ SELECT rk.id, rk.date_recorded, rk.date_recorded_parsed, rk.party_name, rk.heirs
 FROM ranked rk
 JOIN agg a ON a.bucket = rk.bucket""" + _GROUP_SOURCE_JOINS + """WHERE rk.rn = 1
   AND (NOT :overlaps_only OR (rk.bucket LIKE 'pk:%' AND a.overlap_count >= 2))
-""" + _VIEW_FILTERS + """
-ORDER BY a.overlap_count DESC,
+""" + _VIEW_FILTERS + _SORT_KEYS + """         a.overlap_count DESC,
          (CASE WHEN rk.phone IS NOT NULL OR rk.email IS NOT NULL THEN 0 ELSE 1 END),
          rk.job_created_at DESC NULLS LAST,
          rk.id DESC
@@ -267,14 +326,16 @@ FROM agg
 
 # Mode-aware total UNDER the active view filters. Deliberately NOT a second
 # counting rule: same _COMBINED_CTES, same dedup buckets, same mode predicate as
-# _COMBINED_SQL / _DELIVERY_COUNTS_SQL — only narrowed. agg has exactly one row
-# per bucket and ranked-rn=1 has exactly one row per bucket, so counting over agg
-# matches the rows the page renders (this is the same equivalence
-# _DELIVERY_COUNTS_SQL already relies on).
-_FILTERED_TOTAL_SQL = _COMBINED_CTES + """
+# _COMBINED_SQL / _DELIVERY_COUNTS_SQL — only narrowed. Counts the rn=1
+# representative rows joined to agg, exactly the FROM / WHERE of _COMBINED_SQL, so
+# the search (which reads the representative row) counts what the page renders.
+# One rn=1 row per bucket, so without a search this equals counting agg.
+_FILTERED_TOTAL_SQL = _COMBINED_CTES + _RANKED_CTE + """
 SELECT count(*) AS total
-FROM agg a
-WHERE (NOT :overlaps_only OR (a.bucket LIKE 'pk:%' AND a.overlap_count >= 2))
+FROM ranked rk
+JOIN agg a ON a.bucket = rk.bucket
+WHERE rk.rn = 1
+  AND (NOT :overlaps_only OR (rk.bucket LIKE 'pk:%' AND a.overlap_count >= 2))
 """ + _VIEW_FILTERS
 
 # Batch data-quality facts, one statement over the representative rows (the row
@@ -443,11 +504,9 @@ def _combined_pairs(
             "limit": limit,
             "offset": offset,
             "overlaps_only": delivery_mode == "overlaps_only",
-            # Export is never view-filtered — NULL/NULL makes the new predicate a
-            # no-op, so the delivered file is exactly what it was before.
-            "f_record_type": None,
-            "f_county": None,
-            "f_delivery": None,
+            # Export is never view-filtered or re-sorted: the all-NULL binds make every
+            # filter and sort key a no-op, so the delivered file is exactly as before.
+            **view_filter_params(),
             TAX_CAP_BIND: tax_cap_min_year(datetime.now(UTC).date()),
         },
     )

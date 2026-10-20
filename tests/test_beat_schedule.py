@@ -173,3 +173,17 @@ def test_every_beat_task_is_registered_once_the_worker_loads_its_modules():
     app.loader.import_default_modules()
     assert sorted(e["task"] for e in app.conf.beat_schedule.values()
                   if e["task"] not in app.tasks) == []
+
+
+def test_the_retired_county_cache_writer_stays_retired():
+    """The daily county_records cache scrape was retired once UX 3.13 removed its only
+    reader. Re-adding any piece of it would fill a table nothing reads; the weekly purge,
+    which also clears property_list_membership, must keep running."""
+    import importlib.util
+
+    app.loader.import_default_modules()
+    retired = {"src.workers.scheduler.scrape_county_daily", "src.workers.scheduler.run_single_county_scrape"}
+    assert sorted(retired & set(app.tasks)) == []
+    assert "scrape-county-daily" not in app.conf.beat_schedule
+    assert app.conf.beat_schedule["purge-old-records"]["task"] == "src.workers.scheduler.purge_old_records"
+    assert importlib.util.find_spec("src.workers.daily_scrape") is None

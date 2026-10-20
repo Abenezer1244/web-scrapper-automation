@@ -19,6 +19,49 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-10-20 — The county_records cache writer is retired (#522), and the /records watch could not be proven
+
+**Built / Shipped:** BE **#522** (1ed4ac0b, squash 07:03 UTC) retires the daily `county_records` cache scrape, owner
+decision 2026-10-19 after UX 3.13 removed its only reader: `src/workers/daily_scrape.py` deleted, the
+`scrape_county_daily` / `run_single_county_scrape` tasks and the `scrape-county-daily` beat entry gone,
+`ENABLE_DAILY_SCRAPE` removed from settings (`extra="ignore"`, so a leftover Railway var is inert), and
+`test_the_retired_county_cache_writer_stays_retired`. The weekly `purge_old_records` stays: it also clears
+`property_list_membership`. This PR: the `.env.example` line and the `scripts/migrate.py` lock note.
+
+**Tried / Decided:** Codex PLAN W1 took nine rounds (r1-r8 NO-GO, all on the production cutover, not the code), which
+produced a merge gate: G1a `ENABLE_DAILY_SCRAPE='false'` on worker and beat; G1b the worker logged
+`scrape_county_daily` received + succeeded at 09:00 UTC every day 10-13..10-19 with zero "Daily scrape: dispatching"
+lines (the flag was off in the running processes, not just in Railway's variables); G2 a statistics-independent
+fingerprint of `county_records` (3,305 rows, md5 `94d40dac5de3f9a0aaf05ced46a125ba`, newest row 2026-03-23), because
+`pg_stat_database.stats_reset` is NULL in prod and the counters prove nothing; G3 `celery inspect active / reserved /
+scheduled` (4/4 workers, all empty) and a read-only broker scan (queues, kombu priority sub-queues and the late-ack
+`unacked` hash: 0 keys, CLEAR), twice, immediately before the merge. Merged in [09:15, 08:00) UTC so no 09:00 beat
+tick straddled the deploy. Peers -49 (#524/#525) and -90 (an env-var redeploy) held until VERIFIED. Diff gate PASS r1.
+
+**Failed / Blocked:** the full local suite never finished: the shared `bl-testenv` Postgres crashed mid-run
+(`0xC0000142`, a DLL-init failure under memory pressure) and was left down rather than restarted under the same
+pressure; the full suite ran in PR CI instead (Test 34 min, green twice). GitHub Actions was degraded for about an
+hour, so every run in the repo sat queued. The UX 3.13 `/records` 7-day watch (W = 2026-10-11 06:34 .. 10-18 06:34
+UTC) is **INCONCLUSIVE**: 17 api deployments, 6,176 HTTP requests and 6,178 uvicorn access lines retained, **0
+`/records` hits**, but Railway retains nothing before 2026-10-13 07:39 and the retained span has 82 gaps over 30
+minutes with neither HTTP nor deploy lines, so absence of callers cannot be shown. C1 / C2 (county_records grants,
+dropping `user_record_views`) stay gated on that watch.
+
+**Caught & fixed:** the watch script's first real runs failed: `railway` on PATH is an npm shim Node cannot spawn
+(`ENOENT`), and Railway's API rejects `--lines` above 5,000 (`Error in beforeLimit - Invalid input`); the scope rule
+also swept in all 990 historical deployments. Fixed to the real `railway.exe`, a 5,000-line cap with halving, and
+"deployments created inside W plus the pre-W ones back to the newest that deployed".
+
+**Pending / Handoff:** at +7 days (2026-10-27) re-take the G2 fingerprint; any change in count or md5 = investigate,
+revert #522. Owner: decide how to close the `/records` watch (accept 0 hits in the retained logs, or run a fresh
+forward watch that exports logs daily before Railway drops them), which unblocks C1 / C2. Owner: one real >= 1,000
+"Complete:" headline in production (UX 3.17).
+
+**Facts learned:** Railway CLI `railway logs --lines` max is 5,000; HTTP log rows carry `deploymentInstanceId`,
+`requestId`, `path`, `httpStatus`; prod api is probed on `/ready` every 20-30 s. Retained Railway logs are partial
+even inside 7 days, so an access-log watch must export as it goes. `railway ssh -s worker -- <cmd>` runs one command
+in a worker container (`celery -A src.workers inspect ...`); prod runs 4 worker replicas.
+
 ## 2026-10-20 — King owner names Phase 3b + 3c and the Lists flag: the slow writes are gone, hidden duplicates are skipped
 
 **Built / Shipped:** BE **#521** (7776c0ea) 3c: on King tax jobs, rows in `_hidden_duplicate_ids` (prior_run duplicates

@@ -60,6 +60,7 @@ from src.config.constants import record_type_label as _label
 from src.utils.contact_decode import clean_phone_type, decode_array, decode_scalar
 from src.utils.lead_export import PROBATE_SUBTYPE_AGG_SQL, write_lead_csv_with_overlap
 from src.utils.logger import setup_logger
+from src.utils.owner_pending import is_king_tax, owner_name_pending
 
 _logger = setup_logger("api.segments")
 
@@ -215,6 +216,10 @@ WITH candidates AS (
            r.doc_type, r.heirs, r.legal_description,
            r.delinquent_amount, r.delinquent_bill_year,
            r.enrichment_data->>'lead_subtype' AS lead_subtype,
+           -- Owner lookup state, for owner_name_pending (src/utils/owner_pending.py).
+           r.enrichment_data->>'owner_lookup_outcome' AS owner_lookup_outcome,
+           r.enrichment_data->>'owner_recovery_outcome' AS owner_recovery_outcome,
+           r.enrichment_data->>'owner_recovery_attempts' AS owner_recovery_attempts,
            sc.record_type, sc.county, sc.state, j.created_at AS job_created_at,
            {_STAND_IN_SQL} AS date_is_auction_date
     FROM results r
@@ -267,6 +272,7 @@ SELECT rk.id, rk.date_recorded, rk.party_name, rk.parcel_id, rk.property_address
        -- `matched_record_types` stays the source for the `lists` column; this
        -- is the representative row's own type, which is what name order needs.
        rk.record_type,
+       rk.owner_lookup_outcome, rk.owner_recovery_outcome, rk.owner_recovery_attempts,
        rk.delinquent_amount, rk.delinquent_bill_year,
        a.matched_record_types, a.overlap_count, a.lead_subtype
 FROM ranked rk
@@ -317,6 +323,10 @@ WITH candidates AS (
            r.doc_type, r.heirs, r.legal_description,
            r.delinquent_amount, r.delinquent_bill_year,
            r.enrichment_data->>'lead_subtype' AS lead_subtype,
+           -- Owner lookup state, for owner_name_pending (src/utils/owner_pending.py).
+           r.enrichment_data->>'owner_lookup_outcome' AS owner_lookup_outcome,
+           r.enrichment_data->>'owner_recovery_outcome' AS owner_recovery_outcome,
+           r.enrichment_data->>'owner_recovery_attempts' AS owner_recovery_attempts,
            sc.record_type, sc.county, sc.state, j.created_at AS job_created_at,
            {_STAND_IN_SQL} AS date_is_auction_date,
            COALESCE(r.property_key, r.dedup_hash, 'id:' || r.id::text) AS bucket
@@ -393,6 +403,7 @@ SELECT rk.id, rk.date_recorded, rk.party_name, rk.parcel_id, rk.property_address
        -- `matched_record_types` stays the source for the `lists` column; this
        -- is the representative row's own type, which is what name order needs.
        rk.record_type,
+       rk.owner_lookup_outcome, rk.owner_recovery_outcome, rk.owner_recovery_attempts,
        rk.delinquent_amount, rk.delinquent_bill_year,
        a.matched_record_types, a.overlap_count, a.identity_strength, a.lead_subtype
 FROM ranked rk
@@ -429,6 +440,10 @@ WITH candidates AS (
            r.doc_type, r.heirs, r.legal_description,
            r.delinquent_amount, r.delinquent_bill_year,
            r.enrichment_data->>'lead_subtype' AS lead_subtype,
+           -- Owner lookup state, for owner_name_pending (src/utils/owner_pending.py).
+           r.enrichment_data->>'owner_lookup_outcome' AS owner_lookup_outcome,
+           r.enrichment_data->>'owner_recovery_outcome' AS owner_recovery_outcome,
+           r.enrichment_data->>'owner_recovery_attempts' AS owner_recovery_attempts,
            sc.record_type, sc.county, sc.state, j.created_at AS job_created_at,
            {_STAND_IN_SQL} AS date_is_auction_date
     FROM results r
@@ -478,6 +493,7 @@ SELECT rk.id, rk.date_recorded, rk.party_name, rk.parcel_id, rk.property_address
        -- `matched_record_types` stays the source for the `lists` column; this
        -- is the representative row's own type, which is what name order needs.
        rk.record_type,
+       rk.owner_lookup_outcome, rk.owner_recovery_outcome, rk.owner_recovery_attempts,
        rk.delinquent_amount, rk.delinquent_bill_year,
        a.matched_record_types, a.overlap_count, a.lead_subtype
 FROM ranked rk
@@ -694,6 +710,7 @@ async def intersection_preview(
                     matched_record_types=list(r.matched_record_types or []),
                     overlap_count=r.overlap_count,
                     date_is_auction_date=bool(r.date_is_auction_date),
+                    owner_name_pending=_owner_pending(r),
                 )
                 for r in rows
             ],
@@ -777,6 +794,14 @@ async def _fetch_union(
     return rows, excluded
 
 
+def _owner_pending(r) -> bool:
+    """The shown (representative) row is a King tax lead still waiting on its owner."""
+    return is_king_tax(r.county, r.record_type) and owner_name_pending(
+        r.party_name, r.parcel_id,
+        {k: getattr(r, k) for k in
+         ("owner_lookup_outcome", "owner_recovery_outcome", "owner_recovery_attempts")})
+
+
 def _union_rows(rows: list) -> list[SegmentLeadRow]:
     return [
         SegmentLeadRow(
@@ -795,6 +820,7 @@ def _union_rows(rows: list) -> list[SegmentLeadRow]:
             overlap_count=r.overlap_count,
             date_is_auction_date=bool(r.date_is_auction_date),
             identity_strength=r.identity_strength,
+            owner_name_pending=_owner_pending(r),
         )
         for r in rows
     ]

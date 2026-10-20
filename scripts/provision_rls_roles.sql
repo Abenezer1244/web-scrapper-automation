@@ -95,11 +95,10 @@ TO bridgeleads_app;
 GRANT SELECT, INSERT ON county_connectors, password_history TO bridgeleads_app;
 
 -- Read-only: the request path SELECTs these but never writes them.
--- results + job_logs are written only by Celery workers; county_records is the
--- shared dedup cache (a migration-023 trigger blocks non-system writes anyway).
+-- results + job_logs are written only by Celery workers.
 -- referral_events: /referral READS it; the WRITE is done by the SECURITY
 -- DEFINER public.grant_referral_credit() (migration 029, runs as owner).
-GRANT SELECT ON results, job_logs, county_records, referral_events,
+GRANT SELECT ON results, job_logs, referral_events,
     property_list_membership TO bridgeleads_app;
 
 -- ── H1 drift tables (2026-06-12, Codex-consulted session 019ebbc2) ──────────
@@ -180,8 +179,11 @@ GRANT SELECT ON audit_events TO bridgeleads_app;
 REVOKE DELETE ON users, scraper_configs, jobs, user_record_views FROM bridgeleads_app;
 REVOKE UPDATE, DELETE ON county_connectors, password_history FROM bridgeleads_app;
 REVOKE INSERT, UPDATE, DELETE ON
-    results, job_logs, county_records, referral_events,
+    results, job_logs, referral_events,
     property_list_membership FROM bridgeleads_app;
+-- county_records (119): no app reader or writer is left (UX 3.13, #522); only the
+-- worker's weekly purge touches it.
+REVOKE ALL ON county_records FROM bridgeleads_app;
 REVOKE ALL ON
     delivered_records, pending_skip_trace_rows, skip_trace_queues,
     skip_trace_cache, skip_trace_meter_events FROM bridgeleads_app;
@@ -219,13 +221,13 @@ BEGIN
         (privilege_type = 'DELETE'
             AND table_name NOT IN ('mfa_backup_codes', 'pending_registrations'))
         OR (privilege_type IN ('INSERT', 'UPDATE')
-            AND table_name IN ('results', 'job_logs', 'county_records', 'referral_events',
+            AND table_name IN ('results', 'job_logs', 'referral_events',
                                'property_list_membership'))
         OR (privilege_type = 'UPDATE'
             AND table_name IN ('county_connectors', 'password_history'))
         OR table_name IN ('delivered_records', 'pending_skip_trace_rows',
                           'skip_trace_queues', 'skip_trace_cache', 'skip_trace_meter_events',
-                          'nts_notices')
+                          'nts_notices', 'county_records')
         -- H1 drift tables:
         OR (privilege_type = 'INSERT'
             AND table_name IN ('mfa_break_glass_codes', 'dialer_deliveries',
@@ -293,7 +295,7 @@ GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO bridgeleads_app;
 -- ── Role 2: bridgeleads_system — Celery workers + scheduler ──────────────────
 -- Cross-tenant ingest/canary/watchdog/retention. SELECT/INSERT/UPDATE on all,
 -- DELETE only where the code physically deletes (county_records retention,
--- src/workers/scheduler.py:521). NOBYPASSRLS — gets a named-role policy
+-- src/workers/scheduler_helpers/county.py). NOBYPASSRLS — gets a named-role policy
 -- carve-out in Phase 2 instead of bypassing RLS wholesale.
 SELECT NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bridgeleads_system') AS create_sys \gset
 \if :create_sys
@@ -316,7 +318,7 @@ $verify_sys$;
 
 GRANT USAGE ON SCHEMA public TO bridgeleads_system;
 GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA public TO bridgeleads_system;
-GRANT DELETE ON county_records TO bridgeleads_system;   -- scheduler.py:521 retention only
+GRANT DELETE ON county_records TO bridgeleads_system;   -- scheduler_helpers/county.py retention only
 GRANT DELETE ON property_list_membership TO bridgeleads_system;  -- overlap rollup retention prune
 -- tasks.py releases THIS job's cross-job dedup claims when the export upload to
 -- R2 fails (no deliverable produced) so the never-delivered, unbilled leads

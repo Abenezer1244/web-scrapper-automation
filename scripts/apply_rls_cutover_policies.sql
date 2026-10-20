@@ -173,13 +173,11 @@ DROP POLICY IF EXISTS county_connectors_system ON public.county_connectors;
 CREATE POLICY county_connectors_system ON public.county_connectors
     FOR ALL TO bridgeleads_system USING (true) WITH CHECK (true);
 
--- ── county_records: app shared-read (GUC present); system FOR ALL (trigger
---    still blocks GUC-scoped writes) ──────────────────────────────────────────
+-- ── county_records: no app access (119: no API reader or writer is left);
+--    system FOR ALL for the weekly purge (trigger still blocks GUC-scoped writes) ──
 DROP POLICY IF EXISTS county_records_shared_read ON public.county_records;
 DROP POLICY IF EXISTS county_records_app_read ON public.county_records;
-CREATE POLICY county_records_app_read ON public.county_records
-    FOR SELECT TO bridgeleads_app
-    USING (NULLIF(current_setting('app.current_user_id', true), '') IS NOT NULL);
+REVOKE ALL ON public.county_records FROM bridgeleads_app;
 DROP POLICY IF EXISTS county_records_system ON public.county_records;
 CREATE POLICY county_records_system ON public.county_records
     FOR ALL TO bridgeleads_system USING (true) WITH CHECK (true);
@@ -453,5 +451,8 @@ FROM pg_policies
 WHERE schemaname = 'public'
   AND (policyname LIKE '%_app%' OR policyname LIKE '%_system%'
        OR policyname IN ('county_connectors_app_read', 'county_connectors_app_insert',
-                         'county_records_app_read', 'public_sample_cache_app_read'))
+                         'public_sample_cache_app_read'))
 ORDER BY tablename, policyname;
+-- county_records (119): the app must hold nothing; both must be false.
+SELECT has_table_privilege('bridgeleads_app', 'public.county_records', 'SELECT') AS app_table_select,
+       has_any_column_privilege('bridgeleads_app', 'public.county_records', 'SELECT') AS app_column_select;

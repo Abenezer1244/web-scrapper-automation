@@ -29,7 +29,7 @@ _GRANTS = [
     "GRANT USAGE ON SCHEMA public TO bridgeleads_app",
     "GRANT SELECT, INSERT, UPDATE ON users, scraper_configs, jobs, user_record_views TO bridgeleads_app",
     "GRANT SELECT, INSERT ON county_connectors, password_history TO bridgeleads_app",
-    "GRANT SELECT ON results, job_logs, county_records, referral_events, "
+    "GRANT SELECT ON results, job_logs, referral_events, "
     "property_list_membership TO bridgeleads_app",
     # H1 drift tables — mfa_backup_codes carries the SINGLE allowlisted app DELETE
     "GRANT SELECT, INSERT, UPDATE, DELETE ON mfa_backup_codes TO bridgeleads_app",
@@ -42,8 +42,10 @@ _GRANTS = [
     "GRANT SELECT, INSERT, DELETE ON pending_registrations TO bridgeleads_app",
     "REVOKE DELETE ON users, scraper_configs, jobs, user_record_views FROM bridgeleads_app",
     "REVOKE UPDATE, DELETE ON county_connectors, password_history FROM bridgeleads_app",
-    "REVOKE INSERT, UPDATE, DELETE ON results, job_logs, county_records, referral_events, "
+    "REVOKE INSERT, UPDATE, DELETE ON results, job_logs, referral_events, "
     "property_list_membership FROM bridgeleads_app",
+    # county_records (119): no app reader or writer is left; only the worker's purge.
+    "REVOKE ALL ON county_records FROM bridgeleads_app",
     "REVOKE ALL ON delivered_records, pending_skip_trace_rows, skip_trace_queues, "
     "skip_trace_cache, skip_trace_meter_events FROM bridgeleads_app",
     "REVOKE INSERT, DELETE ON mfa_break_glass_codes FROM bridgeleads_app",
@@ -113,12 +115,13 @@ _VERIFY_APP_GRANTS = """
         (privilege_type = 'DELETE'
             AND table_name NOT IN ('mfa_backup_codes','pending_registrations'))
         OR (privilege_type IN ('INSERT','UPDATE')
-            AND table_name IN ('results','job_logs','county_records','referral_events',
+            AND table_name IN ('results','job_logs','referral_events',
                                'property_list_membership'))
         OR (privilege_type = 'UPDATE'
             AND table_name IN ('county_connectors','password_history'))
         OR table_name IN ('delivered_records','pending_skip_trace_rows',
-                          'skip_trace_queues','skip_trace_cache','skip_trace_meter_events')
+                          'skip_trace_queues','skip_trace_cache','skip_trace_meter_events',
+                          'county_records')
         OR (privilege_type = 'INSERT'
             AND table_name IN ('mfa_break_glass_codes','dialer_deliveries'))
         OR (privilege_type = 'UPDATE'
@@ -163,7 +166,7 @@ _VERIFY_APP_ACTION_COLUMNS = """
 #
 # Keep in sync with the worker's actual DELETE statements. Current sources:
 #   delivered_records        tasks.py (dedup-claim release x5)
-#   county_records           scheduler.py retention
+#   county_records           scheduler_helpers/county.py retention
 #   property_list_membership overlap rollup prune
 #   mfa_backup_codes         scripts/reset_user_mfa.py
 #   mfa_break_glass_codes    scripts/reset_user_mfa.py

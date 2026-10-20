@@ -8123,6 +8123,44 @@
               "description": "new = properties with at least one row delivered to the account for the first time in this batch; delivered = properties every row of which an earlier run already delivered.",
               "title": "Delivery"
             }
+          },
+          {
+            "description": "Search the shown owner name, property address, parcel ID (punctuation ignored) and, when the batch shows it, the mailing address. Case-insensitive substring; blank = no search.",
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 100,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Search the shown owner name, property address, parcel ID (punctuation ignored) and, when the batch shows it, the mailing address. Case-insensitive substring; blank = no search.",
+              "title": "Q"
+            }
+          },
+          {
+            "description": "relevance = stacked first, then contactable, then newest (the CSV order); date = the record date the table shows; auction = the auction date. Undated leads sort last either way.",
+            "in": "query",
+            "name": "sort",
+            "required": false,
+            "schema": {
+              "default": "relevance",
+              "description": "relevance = stacked first, then contactable, then newest (the CSV order); date = the record date the table shows; auction = the auction date. Undated leads sort last either way.",
+              "enum": [
+                "relevance",
+                "date_desc",
+                "date_asc",
+                "auction_asc",
+                "auction_desc"
+              ],
+              "title": "Sort",
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -8369,6 +8407,44 @@
               ],
               "description": "new = properties with at least one row delivered to the account for the first time in this batch; delivered = properties every row of which an earlier run already delivered.",
               "title": "Delivery"
+            }
+          },
+          {
+            "description": "Search the shown owner name, property address, parcel ID (punctuation ignored) and, when the batch shows it, the mailing address. Case-insensitive substring; blank = no search.",
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 100,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Search the shown owner name, property address, parcel ID (punctuation ignored) and, when the batch shows it, the mailing address. Case-insensitive substring; blank = no search.",
+              "title": "Q"
+            }
+          },
+          {
+            "description": "relevance = stacked first, then contactable, then newest (the CSV order); date = the record date the table shows; auction = the auction date. Undated leads sort last either way.",
+            "in": "query",
+            "name": "sort",
+            "required": false,
+            "schema": {
+              "default": "relevance",
+              "description": "relevance = stacked first, then contactable, then newest (the CSV order); date = the record date the table shows; auction = the auction date. Undated leads sort last either way.",
+              "enum": [
+                "relevance",
+                "date_desc",
+                "date_asc",
+                "auction_asc",
+                "auction_desc"
+              ],
+              "title": "Sort",
+              "type": "string"
             }
           }
         ],

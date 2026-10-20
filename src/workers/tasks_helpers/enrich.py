@@ -1033,10 +1033,34 @@ def _run_inline_enrichment(
             _logger.warning("Job %s: King account-number resolution failed: %s",
                             job_id, str(exc)[:120])
 
+    # King tax: rows that stay "already delivered" whatever this run does get no address
+    # or owner lookup (owner decision 2026-10-19). On a re-run they are nearly every
+    # row (15,410 of 15,491) and the GIS, condo and mailing passes over them were ~13 of
+    # 23 minutes. They keep what the reuse step above copied from the delivered lead.
+    # A claim settled with sweep proof never becomes promotable again, so computing
+    # this once up front cannot hide a row this run later delivers. On failure: the
+    # empty set, i.e. every row is looked up as before.
+    hidden_ids: set = set()
+    if is_king and config.record_type == "tax_delinquent":
+        try:
+            hidden_ids = _hidden_duplicate_ids(db, all_results, job.user_id, job_id)
+        except Exception as exc:  # noqa: BLE001 -- fall back to looking up every row
+            if type(exc).__name__ in ("SoftTimeLimitExceeded", "TimeLimitExceeded"):
+                raise
+            db.rollback()
+            hidden_ids = set()
+            _logger.warning("Job %s: already-delivered rows not identified: %s",
+                            job_id, str(exc)[:120])
+        if hidden_ids:
+            _publish_log(r, job_id, "info",
+                         f"Skipped address lookups for {len(hidden_ids):,} leads already "
+                         "delivered to you.", db=db)
+    lookup_rows = [res for res in all_results if res.id not in hidden_ids]
+
     # GIS batch enrichment for property AND mailing addresses
     # Run for records missing either property address or mailing address
     results_need_addr = [
-        res for res in all_results
+        res for res in lookup_rows
         if res.parcel_id and len(res.parcel_id.strip()) >= 6
         and (not res.property_address or res.property_address == "(enrichment unavailable)"
              or not res.mailing_address)
@@ -1296,7 +1320,7 @@ def _run_inline_enrichment(
         # and mailing and still fills any unit this could not complete. One streamed scan
         # of a ~7 MB weekly file plus one GIS request per 50 complexes.
         try:
-            _condo_filled = _fill_king_condo_unit_situs(db, all_results, job_id)
+            _condo_filled = _fill_king_condo_unit_situs(db, lookup_rows, job_id)
             db.commit()
             if _condo_filled:
                 _publish_log(r, job_id, "info",
@@ -1623,10 +1647,9 @@ def _run_inline_enrichment(
         # row whose mailing had already been filled upstream — the shape that left
         # a real 384-lead King job with 0 owner names.
         is_tax_delinquent = config.record_type == "tax_delinquent"
-        # Owner names: stored answers first (no request), and no per-parcel owner
-        # request for a lead that stays "already delivered". Those are named after
-        # the owner pass from this run's answers, or later by the owner recovery sweep.
-        hidden_ids: set = set()
+        # Owner names: stored answers first, for every row (no request). A lead that
+        # stays "already delivered" (hidden_ids, above) gets no request at all, mailing
+        # or owner: it is named later by the owner recovery sweep.
         if is_tax_delinquent:
             try:
                 _from_store = _fill_king_owners_from_store(db, all_results)
@@ -1635,19 +1658,17 @@ def _run_inline_enrichment(
                     _publish_log(r, job_id, "info",
                                  f"Used saved county owner records for {_from_store:,} leads.",
                                  db=db)
-                hidden_ids = _hidden_duplicate_ids(db, all_results, job.user_id, job_id)
-            except Exception as exc:  # noqa: BLE001 -- fall back to asking about every row
+            except Exception as exc:  # noqa: BLE001 -- the pass below asks instead
                 if type(exc).__name__ in ("SoftTimeLimitExceeded", "TimeLimitExceeded"):
                     raise
                 db.rollback()
-                hidden_ids = set()
                 _logger.warning("Job %s: stored owner answers not applied: %s",
                                 job_id, str(exc)[:120])
         needs = [
-            res for res in all_results
+            res for res in lookup_rows
             if res.parcel_id and len(res.parcel_id.strip()) >= 6
             and (not res.mailing_address
-                 or (is_tax_delinquent and not res.party_name and res.id not in hidden_ids
+                 or (is_tax_delinquent and not res.party_name
                      # Settled: its own county page showed no owner.
                      and not (isinstance(res.enrichment_data, dict)
                               and res.enrichment_data.get(OWNER_OUTCOME_KEY)

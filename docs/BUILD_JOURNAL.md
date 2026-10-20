@@ -19,6 +19,34 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-10-20 — King owner names Phase 3b + 3c and the Lists flag: the slow writes are gone, hidden duplicates are skipped
+
+**Built / Shipped:** BE **#521** (7776c0ea) 3c: on King tax jobs, rows in `_hidden_duplicate_ids` (prior_run duplicates
+whose claim can never move to this run; ~15,410 of 15,491 on a re-run) are computed once, after account resolution,
+and skip the GIS sweep, the condo fill and the King mailing and owner passes. They keep what the reuse step copied
+from the delivered lead. Owner decision 2026-10-19. BE **#523** (3488fa0b) 3b: `tasks_helpers/owner_flags.recompute_owner_flags`
+writes the owner flags in chunked `UPDATE ... FROM jsonb_to_recordset` statements instead of ~15k single-row ORM UPDATEs
+(~6 minutes), and the refetch before and after it uses `populate_existing`. BE **#524** gives Lists (`SegmentLeadRow`)
+`owner_name_pending`; the FE follow-up shows "Pending" there.
+
+**Tried / Decided:** 3b went through four Codex rounds. r1: the identity map is stale after a Core UPDATE, and there
+was no concurrency policy. r2: `commit()` flushes pending ORM state, and output columns were missing from the guard.
+r3: skipped rows were left stale. r3b: rows never written were not refreshed either. The answer, in order: flush first;
+write only rows whose 5 inputs AND 4 flags still match what was read; apply RETURNING values with `set_committed_value`
+only after the commit; expire skipped rows; refetch the job with `populate_existing`. 3c: hidden rows that reuse could
+not fill drop off the run's "already delivered" list and a batch's "everything" view (both require an address).
+Accepted by the owner, and said so in the PR.
+
+**Failed / Blocked:** #523's first CI failed `test_job_degradations_wiring[owner_flags]`, because the test injected its
+crash into `tasks.compute_owner_flags`, which the step no longer calls. It now patches `owner_flags.recompute_owner_flags`.
+The local test Postgres crashed three times (0xC0000142) under memory pressure, and the harness reaped its restart
+twice, so the wider local runs were invalid. Targeted files were run in small batches, and CI ran the full suite.
+
+**Pending / Handoff:** measure the next King tax run's timings (#515 logs per step) against the 23-minute baseline.
+
+**Facts learned:** after #518 King recovered at 22:34 UTC and stayed healthy at 40 parcels per tick. By 10-20 05:37 UTC
+unnamed visible King tax leads were down from 12,527 to 7,632, and King mailing deferrals from 229 to 10.
+
 ## 2026-10-19 — King owner names Phase 3a + 4: timed the silent steps, a "Pending" owner cell, and the sweeps slowed after King's request cap
 
 **Built / Shipped:** BE **#515** (f2f2c8f3) survivor re-election, claim transfer, the post-enrichment refetch and the

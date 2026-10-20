@@ -22,7 +22,7 @@ from src.db.session import SyncSessionLocal
 from src.scrapers.base_scraper import ScrapedRecord
 from src.utils.data_exporter import DataExporter
 from src.workers import nts_matcher_task, tasks
-from src.workers.tasks_helpers import dedup
+from src.workers.tasks_helpers import dedup, owner_flags
 from src.workers.tasks_helpers.degradation import REASONS
 
 _SECRET = "Jane Q Wiring, 1234 Wiring Elm St"
@@ -171,20 +171,6 @@ def test_a_clean_run_is_done_and_unmarked(make_job, redis_client):
     assert markers == [] and alerts == []
 
 
-def _owner_flags_after_insert():
-    """compute_owner_flags also runs once per record at insert; crash only after."""
-    real = tasks.compute_owner_flags
-    calls = {"n": 0}
-
-    def flags(*a, **k):
-        calls["n"] += 1
-        if calls["n"] > _RECORDS:
-            _crash()
-        return real(*a, **k)
-
-    return flags
-
-
 # (reason, record_type, module, attribute, replacement factory, repair_status)
 _PHASES = [
     ("enrichment", "probate", tasks, "_run_inline_enrichment", lambda: _crash, "none"),
@@ -192,7 +178,7 @@ _PHASES = [
     ("survivor_reelection", "probate", dedup, "reconcile_same_run_survivors",
      lambda: _crash, "none"),
     ("claim_transfer", "probate", dedup, "transfer_undelivered_claims", lambda: _crash, "none"),
-    ("owner_flags", "probate", tasks, "compute_owner_flags", _owner_flags_after_insert, "none"),
+    ("owner_flags", "probate", owner_flags, "recompute_owner_flags", lambda: _crash, "none"),
     ("skip_trace_enqueue", "probate", tasks, "_enqueue_skip_trace_rows",
      lambda: _crash, "pending"),
     ("property_key", "probate", tasks, "_write_result_property_keys", lambda: _crash, "none"),

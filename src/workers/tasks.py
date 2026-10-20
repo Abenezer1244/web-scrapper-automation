@@ -1837,13 +1837,19 @@ def run_scrape_job(self, job_id: str) -> None:
         # Fetch post-enrichment rows ONCE; reused by re-export AND membership.
         # Same deterministic order as the in-app download (jobs.py) so the emailed/
         # R2 CSV and the download are byte-identical, not just same-columns (Codex).
+        # Earlier raw-SQL writes (duplicate reuse, claim transfer, the owner flags
+        # below) do not update objects this session already holds, so every read
+        # overwrites them from the DB: the plan cap and the re-export must read what
+        # is stored.
+        _refetch = (
+            select(Result)
+            .where(Result.job_id == job_id, Result.user_id == job.user_id)
+            .order_by(Result.party_name, Result.date_recorded, Result.id)
+            .execution_options(populate_existing=True)
+        )
         _t_step = time.monotonic()
         try:
-            refreshed = db.execute(
-                select(Result)
-                .where(Result.job_id == job_id, Result.user_id == job.user_id)
-                .order_by(Result.party_name, Result.date_recorded, Result.id)
-            ).scalars().all()
+            refreshed = db.execute(_refetch).scalars().all()
             _logger.info("Job %s: refetched %d rows after enrichment in %.1fs",
                          job_id, len(refreshed), time.monotonic() - _t_step)
         except Exception as exc:
@@ -1864,33 +1870,28 @@ def run_scrape_job(self, job_id: str) -> None:
         if refreshed is not None:
             _t_step = time.monotonic()
             try:
-                _owner_changed = 0
-                for res in refreshed:
-                    flags = compute_owner_flags(
-                        res.property_address, res.mailing_address,
-                        property_city=res.property_city, property_state=res.property_state,
-                        property_zip=res.property_zip,
-                    )
-                    if (
-                        res.property_state != flags["property_state"]
-                        or res.owner_state != flags["owner_state"]
-                        or res.absentee_owner != flags["absentee_owner"]
-                        or res.out_of_state_owner != flags["out_of_state_owner"]
-                    ):
-                        res.property_state = flags["property_state"]
-                        res.owner_state = flags["owner_state"]
-                        res.absentee_owner = flags["absentee_owner"]
-                        res.out_of_state_owner = flags["out_of_state_owner"]
-                        _owner_changed += 1
-                if _owner_changed:
-                    db.commit()
-                _logger.info("Job %s: owner flags recomputed for %d of %d rows in %.1fs",
-                             job_id, _owner_changed, len(refreshed), time.monotonic() - _t_step)
+                # Set-based (Phase 3b): ~15k single-row ORM UPDATEs took ~6 minutes.
+                from src.workers.tasks_helpers.owner_flags import recompute_owner_flags
+
+                _owner_changed, _owner_skipped = recompute_owner_flags(
+                    db, refreshed, job_id, job.user_id)
+                _logger.info("Job %s: owner flags recomputed for %d of %d rows (%d changed "
+                             "meanwhile, left alone) in %.1fs", job_id, _owner_changed,
+                             len(refreshed), _owner_skipped, time.monotonic() - _t_step)
             except Exception as exc:
                 reraise_time_limit(exc)
                 db.rollback()
                 _logger.warning("Job %s: owner-flag recompute failed: %s", job_id, type(exc).__name__)
                 record_degraded(db, r, job_id, "owner_flags", exc)
+            # Once more, so rows the flags pass did not write (already correct, or
+            # changed meanwhile, or all of them after a rollback) are read as stored too.
+            try:
+                refreshed = db.execute(_refetch).scalars().all()
+            except Exception as exc:
+                reraise_time_limit(exc)
+                db.rollback()
+                _logger.warning("Job %s: post-flags refetch failed: %s", job_id, type(exc).__name__)
+                refreshed = None  # same sentinel as the first refetch
 
         # ── APPLY THE PLAN CAP (after enrichment, before delivery) ───────────
         # Every scraped row was persisted and enriched, so actionability is now

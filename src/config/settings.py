@@ -439,8 +439,7 @@ class Settings(BaseSettings):
             raise ValueError("SSE_MAX_STREAMS_PER_USER must be at least 1.")
         return v
 
-    # ─── Daily Scrape Cache ────────────────────────────────────────────────
-    ENABLE_DAILY_SCRAPE: bool = False
+    # ─── County records retention (weekly purge_old_records) ───────────────
     RECORD_RETENTION_DAYS: int = 365
 
     # ─── Skip-trace PII retention (Privacy Policy §7) ─────────────────────────

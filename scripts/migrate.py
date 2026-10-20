@@ -55,9 +55,9 @@ Design notes (the non-obvious bits)
   singleton release step (see start.sh note) rather than every-replica-on-boot.
 
 The ``(classid, objid)`` two-int lock form lives in a SEPARATE lock namespace
-from the single-bigint ``pg_advisory_lock(key)`` that
-``src/workers/daily_scrape.py`` uses for per-county locks, so the two can never
-collide regardless of value.
+from the single-bigint ``pg_advisory_xact_lock(key)`` form the workers use, so
+those can never collide regardless of value. The API's own two-int locks share
+this namespace but use classids 4242-4244, never ``LOCK_CLASSID``.
 """
 
 import os

@@ -32,11 +32,7 @@ from src.workers.scheduler_helpers.billing import (
     _reset_skip_trace_usage_impl,
 )
 from src.workers.scheduler_helpers.contact_lookups import _reconcile_contact_lookups_impl
-from src.workers.scheduler_helpers.county import (
-    _purge_old_records_impl,
-    _run_single_county_scrape_impl,
-    _scrape_county_daily_impl,
-)
+from src.workers.scheduler_helpers.county import _purge_old_records_impl
 from src.workers.scheduler_helpers.dialer import (  # noqa: F401
     _dialer_push_sweep_impl,
     _materialize_dialer_outbox,
@@ -164,10 +160,6 @@ app.conf.beat_schedule = {
         # skip_trace_period_start is earlier than the current month.
         "task": "src.workers.scheduler.reset_skip_trace_usage",
         "schedule": crontab(hour=0, minute=5),  # 00:05 UTC daily
-    },
-    "scrape-county-daily": {
-        "task": "src.workers.scheduler.scrape_county_daily",
-        "schedule": crontab(hour=9, minute=0),  # 9 AM UTC = 2 AM PT (Seattle)
     },
     "purge-old-records": {
         "task": "src.workers.scheduler.purge_old_records",
@@ -628,20 +620,6 @@ def dispatch_pending_verification_emails() -> None:
     recovers. No-op when EMAIL_VERIFICATION_ENABLED is off.
     """
     return _dispatch_pending_verification_emails_impl()
-
-
-# ─── Task 6: Daily county scrape ────────────────────────────────────────────
-
-@app.task(name="src.workers.scheduler.scrape_county_daily")
-def scrape_county_daily() -> None:
-    """Dispatch daily scrape for each active county. Runs at 2 AM UTC."""
-    return _scrape_county_daily_impl(run_single_county_scrape)
-
-
-@app.task(name="src.workers.scheduler.run_single_county_scrape", queue="scrape")
-def run_single_county_scrape(county: str, state: str) -> None:
-    """Scrape a single county's daily records into county_records cache."""
-    return _run_single_county_scrape_impl(county, state)
 
 
 # ─── Task 6: Purge old records ──────────────────────────────────────────────

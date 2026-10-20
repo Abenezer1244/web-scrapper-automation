@@ -453,6 +453,12 @@ WHERE schemaname = 'public'
        OR policyname IN ('county_connectors_app_read', 'county_connectors_app_insert',
                          'public_sample_cache_app_read'))
 ORDER BY tablename, policyname;
--- county_records (119): the app must hold nothing; both must be false.
-SELECT has_table_privilege('bridgeleads_app', 'public.county_records', 'SELECT') AS app_table_select,
-       has_any_column_privilege('bridgeleads_app', 'public.county_records', 'SELECT') AS app_column_select;
+-- county_records (119): the app must hold nothing; fail the run if it can still read.
+DO $county_records_no_app$
+BEGIN
+    IF has_table_privilege('bridgeleads_app', 'public.county_records', 'SELECT')
+       OR has_any_column_privilege('bridgeleads_app', 'public.county_records', 'SELECT') THEN
+        RAISE EXCEPTION 'bridgeleads_app can still read county_records';
+    END IF;
+END
+$county_records_no_app$;

@@ -143,3 +143,20 @@ class TestBatchLeadsOwnerPending:
         assert _pending_by_parcel(resp.json()["leads"]) == {
             "0000000001": True, "0000000002": False, "0000000003": False,
         }
+
+
+class TestListsOwnerPending:
+    async def test_union_rows_carry_the_flag(self, db, starter_user):
+        from src.api.routes import segments
+
+        await _job(db, starter_user, "King")
+        await _job(db, starter_user, "pierce")
+        await db.commit()
+        rows, _ = await segments._fetch_union(
+            db, str(starter_user.id), ["tax_delinquent"], None, 100)
+        got = {(r.parcel_id, r.county.lower()): r.owner_name_pending
+               for r in segments._union_rows(rows)}
+        assert got[("0000000001", "king")] is True
+        assert got[("0000000002", "king")] is False
+        assert got[("0000000003", "king")] is False
+        assert not any(v for (_, c), v in got.items() if c == "pierce")

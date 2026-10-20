@@ -614,3 +614,65 @@ async def test_a_page_showing_no_owner_is_stored_and_not_asked_again_in_the_same
         assert rows[key].party_name is None
         assert rows[key].enrichment_data["owner_lookup_outcome"] == "not_on_record", key
 
+
+
+# ── Phase 3c (2026-10-19): rows that stay "already delivered" get no address lookup ──
+# On a King tax re-run they were nearly every row, and the GIS, condo and mailing
+# passes over them were ~13 of 23 minutes. A row that can still be delivered, or a
+# new one sharing the parcel, is looked up exactly as before.
+
+async def test_a_rerun_looks_up_addresses_only_for_rows_that_can_still_be_delivered(
+    db, business_user, redis_client, monkeypatch,
+):
+    from src.scrapers.enrichment import county_gis
+    from src.workers.tasks_helpers import enrich
+
+    _lease(monkeypatch, admitted=True)
+    job_id, ids = await _rerun_job(db, business_user)
+    # Nothing copied from the delivered lead: every row lacks both addresses.
+    await db.execute(text("UPDATE results SET mailing_address = NULL, property_address = NULL "
+                          "WHERE job_id = :j"), {"j": job_id})
+    await db.commit()
+
+    gis_asked: list[str] = []
+    condo_rows: list[str] = []
+    phase1_asked: list[str] = []
+
+    def _gis(parcel_ids, county, state, stats=None):
+        gis_asked.extend(parcel_ids)
+        return {pid: {"property_address": f"{pid[-1]} MAIN ST",
+                      "mailing_address": f"PO BOX {pid[-1]}, SEATTLE, WA 98101"}
+                for pid in parcel_ids}
+
+    real_condo = enrich._fill_king_condo_unit_situs
+
+    def _condo(sdb, rows, jid):
+        condo_rows.extend(str(r.id) for r in rows)
+        return real_condo(sdb, rows, jid)
+
+    async def _phase1_records(parcel_ids, **kw):
+        phase1_asked.extend(parcel_ids)
+        return {}
+
+    monkeypatch.setattr(county_gis, "batch_enrich_parcels_gis", _gis)
+    monkeypatch.setattr(enrich, "_fill_king_condo_unit_situs", _condo)
+    monkeypatch.setattr(kca, "_batch_enrich_king_county", _phase1_records)
+    monkeypatch.setattr(kca, "safe_get", lambda url, **k: _Resp(200, _page(url[-10:], "X")))
+
+    await asyncio.to_thread(_enrich, job_id, redis_client)
+
+    hidden = {ids["hidden"], ids["live_hidden"]}
+    # _LIVE is asked once, for the new lead; _HIDDEN, only on a hidden row, never.
+    assert sorted(gis_asked) == sorted([_STORED, _OPEN_DUP, _LIVE, _SAME_RUN, _SWEEPABLE])
+    assert not hidden & set(condo_rows)
+    assert _HIDDEN not in phase1_asked
+    got = {str(r.id): r for r in (await db.execute(text(
+        "SELECT id, property_address, mailing_address, enrichment_data FROM results "
+        "WHERE job_id = :j"), {"j": job_id})).all()}
+    assert got[ids["live_new"]].property_address == "4 MAIN ST"
+    assert got[ids["open_dup"]].mailing_address == "PO BOX 3, SEATTLE, WA 98101"
+    for rid in hidden:
+        # Kept what it had (nothing), and no marker promising a later lookup.
+        assert got[rid].property_address is None and got[rid].mailing_address is None
+        assert not (got[rid].enrichment_data or {}).get("mailing_lookup_deferred")
+    assert "Skipped address lookups for 2 leads already delivered to you." in await _logs(db, job_id)

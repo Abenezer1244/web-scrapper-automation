@@ -39,7 +39,10 @@ class TestCombinedSql:
         # overlaps_only filters in SQL BEFORE LIMIT (Codex P1: a Python filter
         # after the 50k cap could miss real overlaps + lie in counts).
         assert ":overlaps_only" in _COMBINED_SQL
-        assert "ORDER BY a.overlap_count DESC" in _COMBINED_SQL
+        # The view's sort keys come first (all NULL on the CSV binds), then the
+        # overlap-first relevance order, which stays as the tie-break.
+        assert "ORDER BY (CASE WHEN CAST(:sort AS text)" in _COMBINED_SQL
+        assert "DESC NULLS LAST,\n         a.overlap_count DESC," in _COMBINED_SQL
         assert "LIMIT :limit OFFSET :offset" in _COMBINED_SQL
 
     def test_counts_sql_shape(self):
@@ -61,7 +64,7 @@ class TestRawSqlExecutesOnPostgres:
     time, so no fixture rows are needed; both empty + non-empty job_ids are
     exercised (empty -> ANY(CAST('{}' AS uuid[])) must not error)."""
 
-    def _run(self, sql: str, record_type=None, county=None, delivery=None):
+    def _run(self, sql: str, record_type=None, county=None, delivery=None, q=None, sort=None):
         from datetime import UTC, datetime
 
         from sqlalchemy import text
@@ -78,9 +81,11 @@ class TestRawSqlExecutesOnPostgres:
                 if ":overlaps_only" in sql:
                     params["overlaps_only"] = True
                 if ":f_record_type" in sql:
-                    params["f_record_type"] = record_type
-                    params["f_county"] = county
-                    params["f_delivery"] = delivery
+                    from src.workers.batch_export import view_filter_params
+
+                    params.update(view_filter_params(
+                        record_type, county, delivery, q, mailing_searchable=True, sort=sort,
+                    ))
                 if f":{TAX_CAP_BIND}" in sql:
                     params[TAX_CAP_BIND] = tax_cap_min_year(datetime.now(UTC).date())
                 db.execute(text(sql), params).fetchall()
@@ -115,6 +120,16 @@ class TestRawSqlExecutesOnPostgres:
         aggregate; it must plan for both values and for NULL (the export path)."""
         self._run(_COMBINED_SQL, delivery="new")
         self._run(_COMBINED_SQL, delivery="delivered")
+
+    def test_search_and_sort_execute(self):
+        """Search + every sort key must PLAN on Postgres: the CASE keys type-resolve on a
+        NULL bind (the CSV path) and on each value, and the filtered total accepts the
+        search over the representative row."""
+        from src.workers.batch_export import _FILTERED_TOTAL_SQL
+
+        for sort in (None, "relevance", "date_desc", "date_asc", "auction_asc", "auction_desc"):
+            self._run(_COMBINED_SQL, q="0419-12 smith", sort=sort)
+        self._run(_FILTERED_TOTAL_SQL, q="%_")
 
     def test_quality_sql_executes(self):
         from src.workers.batch_export import _QUALITY_SQL

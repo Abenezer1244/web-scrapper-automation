@@ -33,7 +33,7 @@ import src.api.routes.segments as segments
 import src.workers.batch_export as batch_export
 from src.api.tax_filters import TAX_CAP_BIND, tax_cap_min_year, tax_cap_sql
 from src.db.models import Job, PropertyListMembership, Result, ScraperConfig, User
-from src.workers.batch_export import _COMBINED_SQL
+from src.workers.batch_export import _COMBINED_SQL, view_filter_params
 
 # Frozen "today" — tax_cap_min_year() is the same math the queries bind, so the
 # boundary year is whatever the cap resolves to right now. Pick rows clearly inside
@@ -231,10 +231,8 @@ async def test_combined_sql_excludes_out_of_window(
         "limit": 1000,
         "offset": 0,
         "overlaps_only": False,
-        # No-op view filters (the export/delivery path binds these as NULL too).
-        "f_record_type": None,
-        "f_county": None,
-        "f_delivery": None,
+        # No-op view filters (the export/delivery path binds exactly these too).
+        **view_filter_params(),
         TAX_CAP_BIND: _CAP_BIND_VALUE,
     })
     returned = {str(r._mapping["id"]) for r in result.fetchall()}

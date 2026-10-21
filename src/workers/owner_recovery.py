@@ -80,12 +80,16 @@ RECOVERY_OUTCOME_KEY = "owner_recovery_outcome"
 # settled as `gave_up` so a permanently failing parcel cannot hold its place.
 _MAX_ATTEMPTS = 5
 
-# Parcels per tick, at most 160 King requests an hour. It was 120 (480 an hour):
-# on 2026-10-18 the sweeps alone ran King into its ExceedCount.aspx request cap
-# and every King pass sat in cooldown for over a day. King publishes no number,
-# so this is a guess; raise it only after a week with no ExceedCount.
-_BATCH_PARCELS = 40
-_PACE_S = 1.0
+# Parcels per tick: this sweep asks King at most 100 times an hour (2,400 a day).
+# Jobs and the other King sweeps take turns on the same lease but are not counted
+# here, so this is not a cap on the source as a whole. King publishes
+# no number, so this is read off the two times the sweep alone hit its
+# ExceedCount.aspx cap: at 120 a tick (480 an hour) on 2026-10-18, and at 40 a tick
+# on 2026-10-20 after ~3,200 requests in 24 hours. Raise it only after a week with
+# no ExceedCount. The pace spreads a tick over ~2.5 minutes rather than firing
+# every request in under one.
+_BATCH_PARCELS = 25
+_PACE_S = 5.0
 _TICK_BUDGET_S = 300.0
 
 _LOCK_KEY = "bl:owner_recovery:lock"

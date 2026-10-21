@@ -329,3 +329,45 @@ def test_a_blank_parcel_cell_does_not_mask_a_later_mismatching_one():
 def test_an_empty_requested_pid_is_never_trusted():
     assert not parcel_page_is_for(_ECHO_MATCH, "")
     assert not parcel_page_is_for("<tr><td>Name</td><td>SMITH JANE</td></tr>", "")
+
+
+# ── King's request cap (ExceedCount.aspx), 2026-10-20 ───────────────────────
+# Header shape King serves when the per-IP quota is spent: a 302 to its cap page.
+
+class _ExceedCount:
+    status_code = 302
+    url = "https://blue.kingcounty.com/Assessor/eRealProperty/Dashboard.aspx?ParcelNbr=1"
+    headers = {"Location": "/Assessor/eRealProperty/ExceedCount.aspx"}
+    text = ""
+
+
+async def test_owner_lookup_does_not_retry_into_the_request_cap(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "src.scrapers.enrichment.king_county_assessor.safe_get",
+        lambda *a, **k: calls.append(a) or _ExceedCount(),
+    )
+    evidence: dict = {}
+    assert await _fetch_king_owner("1954600115", max_attempts=3, evidence=evidence) == (None, True)
+    assert evidence == {"quota_refusal": True}
+    assert len(calls) == 1
+
+
+async def test_owner_batch_closes_the_source_on_the_first_cap_refusal(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "src.scrapers.enrichment.king_county_assessor.safe_get",
+        lambda *a, **k: calls.append(a) or _ExceedCount(),
+    )
+    stats: dict = {}
+    with pytest.raises(KingOwnerLookupBlockedError, match="ExceedCount"):
+        await batch_extract_king_owners(
+            [f"12345678{i:02d}" for i in range(20)], delay=0, circuit_window=20, stats=stats)
+    assert len(calls) == 1  # not the 3+ a 20-request breaker window used to spend
+    assert stats["outcome"] == "breaker_tripped"
+    assert stats["transient"] == ["1234567800"]
+    from src.db.session import SyncSessionLocal
+    with SyncSessionLocal() as db:
+        status = db.execute(text("SELECT status FROM external_source_health WHERE source_key = :k"),
+                            {"k": KING_EREALPROPERTY}).scalar()
+    assert status == "throttled"

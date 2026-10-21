@@ -37,6 +37,7 @@ from src.utils.lead_export import (
     PROBATE_SUBTYPE_AGG_SQL,
     write_lead_csv_with_overlap,
 )
+from src.utils.located_parcel import shown_tier_sql
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("worker.batch_export")
@@ -202,6 +203,16 @@ LEFT JOIN auction_src aus ON aus.bucket = rk.bucket
 LEFT JOIN violation_src vs ON vs.bucket = rk.bucket
 """
 
+# "located_parcel_id(rk.enrichment_data) is not None" in SQL: the shown tier/source pairs
+# come from located_parcel's own constants (shown_tier_sql), so the two cannot drift.
+_LOCATED_PIN_SHOWN_SQL = (
+    "(jsonb_typeof(rk.enrichment_data::jsonb) = 'object'"
+    " AND rk.enrichment_data::jsonb->>'kc_pin_status' = 'matched'"
+    f" AND {shown_tier_sql('rk.enrichment_data::jsonb')}"
+    " AND jsonb_typeof(rk.enrichment_data::jsonb->'kc_pin') = 'string'"
+    " AND rk.enrichment_data::jsonb->>'kc_pin' ~ '^[0-9]{10}$')"
+)
+
 # Optional in-app view filters, shared by _COMBINED_SQL and _FILTERED_TOTAL_SQL so
 # the page and its pager can never disagree. Each defaults to NULL (a NULL bind lets
 # every row pass), so the CSV/delivery path binds NULL and behaves exactly as it did
@@ -234,7 +245,13 @@ _VIEW_FILTERS = """
            AND strpos(lower(coalesce(rk.mailing_address, '')), CAST(:f_q AS text)) > 0)
        OR (CAST(:f_q_parcel AS text) IS NOT NULL
            AND strpos(regexp_replace(lower(coalesce(rk.parcel_id, '')), '[^a-z0-9]', '', 'g'),
-                      CAST(:f_q_parcel AS text)) > 0))
+                      CAST(:f_q_parcel AS text)) > 0)
+       -- The located King PIN the table shows in place of a missing parcel ID
+       -- (located_parcel_id, its exact twin: tested to agree on every shape).
+       OR (CAST(:f_q_parcel AS text) IS NOT NULL
+           AND coalesce(rk.parcel_id, '') = ''
+           AND """ + _LOCATED_PIN_SHOWN_SQL + """
+           AND strpos(rk.enrichment_data::jsonb->>'kc_pin', CAST(:f_q_parcel AS text)) > 0))
 """
 
 # Sort keys, ahead of the relevance order (which stays as the tie-break). Every key

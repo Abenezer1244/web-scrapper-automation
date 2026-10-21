@@ -1,15 +1,14 @@
-"""Emergency hotfix: close the Supabase anon-API exposure of county_records.
+"""Emergency hotfix: close any read exposure of county_records.
 
-Applies the live state that migrations 027 + 028 will make permanent, for the
-case where you must stop the bleeding BEFORE the full branch deploys via alembic.
-
-Idempotent and SAFE on the current BYPASSRLS role (verified: both DATABASE_URL
-and DATABASE_URL_SYNC = postgres/bypassrls):
+Applies the read side of migrations 027 + 119, for the case where you must stop
+the bleeding BEFORE a branch deploys via alembic. Idempotent:
   * ENABLE RLS on county_records  -> default-deny for the anon/authenticated
-    PostgREST roles (closes the homeowner-PII read hole); the app bypasses RLS
-    so its reads/writes are unaffected.
-  * shared-read SELECT policy      -> any authenticated app session (sets
-    app.current_user_id) may read the shared catalog; anon stays denied.
+    PostgREST roles (closes the homeowner-PII read hole).
+  * drop both read policies       -> 028's county_records_shared_read and the
+    cutover's county_records_app_read; nothing in the API reads this table.
+  * REVOKE ALL from bridgeleads_app (when the role exists) -> the API role
+    cannot read it even if a read policy came back.
+The worker's county_records_system policy and grants (weekly purge) are left alone.
 
 Uses a DIRECT (5432) connection, not the pooled pgbouncer one, so the DDL runs
 cleanly. Runs inside one transaction (Postgres DDL is transactional).
@@ -26,10 +25,12 @@ from src.config import settings
 _DDL = [
     "ALTER TABLE public.county_records ENABLE ROW LEVEL SECURITY",
     "DROP POLICY IF EXISTS county_records_shared_read ON county_records",
+    "DROP POLICY IF EXISTS county_records_app_read ON county_records",
     (
-        "CREATE POLICY county_records_shared_read ON county_records "
-        "FOR SELECT USING ("
-        "NULLIF(current_setting('app.current_user_id', true), '') IS NOT NULL)"
+        "DO $no_app_read$ BEGIN "
+        "IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bridgeleads_app') THEN "
+        "REVOKE ALL ON public.county_records FROM bridgeleads_app; END IF; "
+        "END $no_app_read$"
     ),
 ]
 
@@ -45,7 +46,7 @@ def main() -> None:
             for stmt in _DDL:
                 conn.execute(text(stmt))
                 print(f"OK: {stmt[:70]}")
-        print("\nApplied. county_records: RLS enabled + shared-read policy.")
+        print("\nApplied. county_records: RLS enabled, no read policy, no app grant.")
     finally:
         engine.dispose()
 

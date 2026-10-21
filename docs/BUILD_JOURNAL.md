@@ -19,6 +19,34 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-10-21 — King tripped its request cap again at 40 a tick: stop on the first refusal, and ask less
+
+**Built / Shipped:** this PR. `king_county_assessor._is_quota_refusal` (a 3xx to `ExceedCount.aspx`, read through the
+existing `_redirect_target`). The owner-only fetch no longer retries a refusal, and the owner batch closes the source
+and raises `KingOwnerLookupBlockedError` on the first one; the phase-1 enricher trips its breaker on the first one too.
+The owner sweep drops from 40 parcels a tick at a 1 s pace to 25 at 5 s (100 requests an hour, spread over ~2.5 min).
+
+**Tried / Decided:** after #518, King ran clean from 10-19 22:34 to 10-20 23:20 UTC, then the 23:20 owner tick hit
+ExceedCount at parcel 29 and spent 3 refused requests before its 20-request breaker window closed the source. The owner
+sweep was the only caller (the mailing, property and code-violation sweeps had no work; no King job since 10-17), and
+it had asked about 3,200 times in the 24 hours before. The planned shared per-source request budget is NOT built:
+King's rule is unknown (10-16/10-17 saw more in 24 h without a recorded trip), so any number would be a guess, and the
+owner backlog is down to 1,316 parcels (from 22,009), after which demand is a few new parcels per job. Codex consult
+r1 FAIL (3 P1s): "cooldown expiry is not a quota reset" and "same burst can retrip" were folded in (first-refusal stop,
+lower rate, spread pace); "no shared gate" was rebutted (every King path runs through `check_source_or_raise` and the
+shared `SourceAdmission` lease). Diff review r1 FAIL: its P1 assumed an expired cooldown releases traffic, but
+`is_source_available` holds everyone until a claimed canary probe gets real pages; withdrawn in r2. Its P2 was right:
+the comment claimed a source-wide cap; it now says the 100 an hour is this sweep's only. r2 PASS.
+
+**Pending / Handoff:** once King is healthy and the owner backlog is drained, measure a King tax run's per-step timings
+(#515 logs) against the 23-minute baseline: no King tax job has run since #521/#523 deployed. Re-running batch `finale`
+needs the owner's OK (it is a production run that asks King). Build an aggregate King budget only if a trip recurs
+with the backlog empty.
+
+**Facts learned:** a probe failing on ExceedCount escalates the cooldown (1h, then 6h). The block `reason` in
+`external_source_health` is overwritten by each probe, so the original trip is only in the worker logs, and the
+worker's logs belong to the deployment that ran (`railway logs <deployment-id> --filter ...`).
+
 ## 2026-10-20 — The county_records cache writer is retired (#522), and the /records watch could not be proven
 
 **Built / Shipped:** BE **#522** (1ed4ac0b, squash 07:03 UTC) retires the daily `county_records` cache scrape, owner

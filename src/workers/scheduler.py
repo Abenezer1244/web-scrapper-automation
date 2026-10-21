@@ -327,7 +327,7 @@ app.conf.beat_schedule = {
     },
     "recover-deferred-owners": {
         # The reading half of `owner_lookup_deferred`: names delivered King tax
-        # leads whose owner lookup a job could not finish. Bounded (40 parcels,
+        # leads whose owner lookup a job could not finish. Bounded (25 parcels,
         # 300 s), gated on source health and OWNER_RECOVERY_ENABLED, shares the
         # King source lease with every other eRealProperty pass. Never bills,
         # never creates a job, never enqueues a skip trace.

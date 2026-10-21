@@ -1341,19 +1341,6 @@ class CountyRecord(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
-class UserRecordView(Base):
-    __tablename__ = "user_record_views"
-    __table_args__ = (
-        UniqueConstraint("user_id", "scraper_config_id", name="uq_user_scraper_view"),
-    )
-
-    id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)
-    user_id = Column(UUID(as_uuid=False), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
-    scraper_config_id = Column(UUID(as_uuid=False), ForeignKey("scraper_configs.id", ondelete="CASCADE"), nullable=False, index=True)
-    last_viewed_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
-    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
-
-
 # ─── Sprint 4: Skip trace (Tracerfy) ─────────────────────────────────────────
 
 class SkipTraceCache(Base):

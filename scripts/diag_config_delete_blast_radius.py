@@ -63,7 +63,6 @@ def main() -> None:
             ("job_logs", "job_id"),
             ("notifications", "job_id"),
             ("delivered_records", "job_id"),
-            ("user_record_views", "scraper_config_id"),
         ):
             try:
                 key = "jids" if col == "job_id" else "ids"

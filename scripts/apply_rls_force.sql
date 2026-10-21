@@ -31,7 +31,7 @@ DECLARE
     tbls text[] := ARRAY[
         'scraper_configs', 'jobs', 'results', 'job_logs', 'delivered_records',
         'pending_skip_trace_rows', 'skip_trace_queues', 'password_history',
-        'user_record_views', 'referral_events', 'users', 'county_connectors',
+        'referral_events', 'users', 'county_connectors',
         'county_records', 'skip_trace_cache', 'skip_trace_meter_events',
         'public_sample_cache', 'property_list_membership',
         -- H1 drift tables (2026-06-12): policies in apply_rls_cutover_policies.sql
@@ -103,7 +103,7 @@ $guard$;
 -- DO $$ DECLARE t text; BEGIN
 --   FOREACH t IN ARRAY ARRAY['scraper_configs','jobs','results','job_logs',
 --     'delivered_records','pending_skip_trace_rows','skip_trace_queues',
---     'password_history','user_record_views','referral_events','users',
+--     'password_history','referral_events','users',
 --     'county_connectors','county_records','skip_trace_cache',
 --     'skip_trace_meter_events','public_sample_cache','property_list_membership',
 --     'mfa_backup_codes','mfa_break_glass_codes','dialer_deliveries',

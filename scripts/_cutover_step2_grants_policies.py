@@ -27,7 +27,7 @@ _POLICY_SQL = "scripts/apply_rls_cutover_policies.sql"
 # H1 drift tables 2026-06-12 — keep BOTH files in lockstep, Codex finding #9).
 _GRANTS = [
     "GRANT USAGE ON SCHEMA public TO bridgeleads_app",
-    "GRANT SELECT, INSERT, UPDATE ON users, scraper_configs, jobs, user_record_views TO bridgeleads_app",
+    "GRANT SELECT, INSERT, UPDATE ON users, scraper_configs, jobs TO bridgeleads_app",
     "GRANT SELECT, INSERT ON county_connectors, password_history TO bridgeleads_app",
     "GRANT SELECT ON results, job_logs, referral_events, "
     "property_list_membership TO bridgeleads_app",
@@ -40,7 +40,7 @@ _GRANTS = [
     # pending_registrations (074): register INSERT + verify SELECT/DELETE (2nd
     # allowlisted app DELETE — verify drops the address's sibling staging rows).
     "GRANT SELECT, INSERT, DELETE ON pending_registrations TO bridgeleads_app",
-    "REVOKE DELETE ON users, scraper_configs, jobs, user_record_views FROM bridgeleads_app",
+    "REVOKE DELETE ON users, scraper_configs, jobs FROM bridgeleads_app",
     "REVOKE UPDATE, DELETE ON county_connectors, password_history FROM bridgeleads_app",
     "REVOKE INSERT, UPDATE, DELETE ON results, job_logs, referral_events, "
     "property_list_membership FROM bridgeleads_app",

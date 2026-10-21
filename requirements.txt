@@ -58,8 +58,9 @@ pandas==2.2.3
 openpyxl==3.1.5
 
 # Profile photo: decode + re-encode every upload to a 256px WebP (src/utils/avatar.py).
-# Wheels bundle libjpeg/libpng/libwebp. 2026-10-05: latest, no OSV advisories, MIT-CMU.
-pillow==12.3.0
+# Wheels bundle libjpeg/libpng/libwebp. 2026-10-21: 13.0.0 fixes 8 decoder CVEs in 12.3.0
+# (TIFF/GIF/EPS/PPM/PDF; avatar.py only opens JPEG/PNG/WEBP); pip-audit clean, MIT-CMU.
+pillow==13.0.0
 # IANA zone data for zoneinfo (users.timezone validation). Already pulled in by pandas;
 # pinned because the app now relies on it directly (python:slim and Windows ship none).
 tzdata==2026.5

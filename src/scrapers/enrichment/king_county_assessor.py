@@ -235,6 +235,16 @@ def _redirect_target(response) -> str:
     return target[:120]
 
 
+def _is_quota_refusal(response) -> bool:
+    """True when King answered with its request-cap page (ExceedCount.aspx).
+
+    That is not a transient error: the quota is spent, and every further request
+    while it is spent is one more against it. On 2026-10-20 the owner sweep took
+    three of these before its 20-request breaker window closed the source.
+    """
+    return _redirect_target(response).lower().endswith("/exceedcount.aspx")
+
+
 @dataclass(frozen=True)
 class _OwnerLookupOutcome:
     resolved: bool
@@ -298,6 +308,12 @@ async def _fetch_king_owner(
                     return None, False
                 else:
                     return _extract_owner_name(r.text), False  # genuine result (name or miss)
+            elif _is_quota_refusal(r):
+                # King's per-IP request cap. A retry only spends more of a quota that
+                # is already gone, so stop and let the caller close the source.
+                if evidence is not None:
+                    evidence["quota_refusal"] = True
+                return None, True
         except (SoftTimeLimitExceeded, TimeLimitExceeded):
             raise  # the Celery worker is ending the task; not a transient county failure
         except Exception as exc:
@@ -467,6 +483,16 @@ async def _batch_extract_king_owners(
         evidence: dict = {}
         owner, errored = await _fetch_king_owner(
             pid, max_attempts=fetch_attempts, evidence=evidence)
+        if evidence.get("quota_refusal"):
+            msg = (
+                f"King owner lookup refused by the request cap (ExceedCount) after "
+                f"{i} of {len(clean)} parcels, resolved={len(owners)}. Stopping."
+            )
+            _logger.warning(msg)
+            record_source_blocked(KING_EREALPROPERTY, msg)
+            st["transient"].append(pid)
+            st["outcome"] = "breaker_tripped"
+            raise KingOwnerLookupBlockedError(msg)
         if owner:
             owners[pid] = owner
             st["attempted"].append(pid)
@@ -832,7 +858,7 @@ async def _batch_enrich_king_county(
                 _p1.mark_last_failed("HTTP200_no_parcel")
                 failed = True
 
-            if _p1.should_trip():
+            if _p1.should_trip() or _is_quota_refusal(r):
                 msg = (
                     "King phase-1 circuit breaker tripped: "
                     f"{_p1.window_failures}/{_p1.window_size} recent eRealProperty "

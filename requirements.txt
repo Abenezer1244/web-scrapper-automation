@@ -48,7 +48,7 @@ playwright==1.62.0
 beautifulsoup4==4.12.3
 lxml==6.1.0                  # M3: PYSEC-2026-87
 requests==2.34.2             # M3: CVE-2024-47081, CVE-2026-25645. 2.34: inline typing + less-greedy no_proxy matching
-pypdf==6.19.0                # NTS Tier 1: extract text from Pacific Publishing legals PDFs (pure-python, no native deps). 6.19.0: PYSEC-2026-4153..4160 (crafted-PDF runtime/memory DoS: indirect-object tokens, /ToUnicode, /Widths, FlateDecode recovery, page labels, embedded files, form fields; fixed 6.17.0-6.19.0). Its new parser limits RAISE (fail-closed) on a pathological PDF, a per-issue crawl failure; extraction byte-identical to 6.16.1 on all 5 NTS fixtures. 6.16.1: 6.16.1: PYSEC-2026-3655/3656 + CVE-2026-84309/84310/84311 (crafted-PDF memory/runtime DoS, infinite loop; fixed 6.15.0-6.16.1). 6.14.2: CVE-2026-59935/59936 (extract_text infinite loop), CVE-2026-59937 (xref long runtime), CVE-2026-59938 (image memory-DoS); prior 6.13.3: GHSA-jm82-fx9c-mx94
+pypdf==6.21.1                # NTS Tier 1: extract text from Pacific Publishing legals PDFs (pure-python, no native deps). 6.21.1: CVE-2026-113786 (DCTDecode image parser reachable), CVE-2026-113792..113795 (crafted-PDF infinite loops / memory: outline items, filter chains, truncated xref; fixed 6.20.0-6.21.1); extraction byte-identical to 6.19.0 on all 5 NTS fixtures (raw + normalized + notice-block counts). 6.19.0: PYSEC-2026-4153..4160 (crafted-PDF runtime/memory DoS: indirect-object tokens, /ToUnicode, /Widths, FlateDecode recovery, page labels, embedded files, form fields; fixed 6.17.0-6.19.0). Its new parser limits RAISE (fail-closed) on a pathological PDF, a per-issue crawl failure; extraction byte-identical to 6.16.1 on all 5 NTS fixtures. 6.16.1: 6.16.1: PYSEC-2026-3655/3656 + CVE-2026-84309/84310/84311 (crafted-PDF memory/runtime DoS, infinite loop; fixed 6.15.0-6.16.1). 6.14.2: CVE-2026-59935/59936 (extract_text infinite loop), CVE-2026-59937 (xref long runtime), CVE-2026-59938 (image memory-DoS); prior 6.13.3: GHSA-jm82-fx9c-mx94
 
 # CAPTCHA solving (2Captcha)
 2captcha-python==1.5.0
@@ -58,8 +58,9 @@ pandas==2.2.3
 openpyxl==3.1.5
 
 # Profile photo: decode + re-encode every upload to a 256px WebP (src/utils/avatar.py).
-# Wheels bundle libjpeg/libpng/libwebp. 2026-10-05: latest, no OSV advisories, MIT-CMU.
-pillow==12.3.0
+# Wheels bundle libjpeg/libpng/libwebp. 2026-10-21: 13.0.0 fixes 8 decoder CVEs in 12.3.0
+# (TIFF/GIF/EPS/PPM/PDF; avatar.py only opens JPEG/PNG/WEBP); pip-audit clean, MIT-CMU.
+pillow==13.0.0
 # IANA zone data for zoneinfo (users.timezone validation). Already pulled in by pandas;
 # pinned because the app now relies on it directly (python:slim and Windows ship none).
 tzdata==2026.5

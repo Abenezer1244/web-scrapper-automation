@@ -10,7 +10,6 @@ from .models import (
     Result,
     ScraperConfig,
     User,
-    UserRecordView,
 )
 from .session import (
     AsyncSessionLocal,
@@ -31,7 +30,6 @@ __all__ = [
     "CountyRecord",
     "JobLog",
     "Notification",
-    "UserRecordView",
     "PasswordHistory",
     "PendingRegistration",
     "async_engine",

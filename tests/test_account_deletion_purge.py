@@ -30,7 +30,7 @@ _LEASE = "interval '5 minutes'"
 # skip_trace_queues is deliberately absent: a queue row is shared by several tenants.
 _FENCED = (
     "results", "jobs", "scraper_configs", "scraper_batches", "batch_runs",
-    "notifications", "user_record_views", "property_list_membership",
+    "notifications", "property_list_membership",
     "dialer_deliveries", "delivered_records", "pending_skip_trace_rows",
     "user_sessions", "user_avatars", "pending_email_changes",
     "password_history", "mfa_backup_codes", "mfa_break_glass_codes", "job_logs",
@@ -39,7 +39,7 @@ _FENCED = (
 # pending_registrations are checked separately).
 _DELETED = (
     "user_sessions", "user_avatars", "pending_email_changes", "password_history",
-    "mfa_backup_codes", "mfa_break_glass_codes", "notifications", "user_record_views",
+    "mfa_backup_codes", "mfa_break_glass_codes", "notifications",
     "property_list_membership", "dialer_deliveries", "batch_runs",
 )
 # Rows that must survive with an unchanged count: the billing ledgers, delivered_records,
@@ -149,7 +149,6 @@ def _seed(conn, uid: str) -> dict[str, str]:
            VALUES (gen_random_uuid(), :batch, :u, '[]', 'exports/b.csv')""",
         """INSERT INTO notifications (id, user_id, type, job_id, detail)
            VALUES (gen_random_uuid(), :u, 'job_done', :job, '{"n": 1}')""",
-        "INSERT INTO user_record_views (user_id, scraper_config_id) VALUES (:u, :config)",
         """INSERT INTO property_list_membership (user_id, record_type, property_key)
            VALUES (:u, 'probate', 'k1'), (:u, 'probate', 'k2')""",
         """INSERT INTO dialer_deliveries (id, job_id, result_id, user_id, scraper_config_id,

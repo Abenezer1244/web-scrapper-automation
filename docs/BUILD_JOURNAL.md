@@ -47,6 +47,50 @@ with the backlog empty.
 `external_source_health` is overwritten by each probe, so the original trip is only in the worker logs, and the
 worker's logs belong to the deployment that ran (`railway logs <deployment-id> --filter ...`).
 
+## 2026-10-20 — Batch leads match single-scrape Results: details sheet, search + sort, two follow-ups
+
+**Built / Shipped:** the last phases of batch lead parity (plan: `tasks/todo-batch-lead-parity.md`).
+FE **#279** (33b5a812): a batch lead opens a Radix side sheet with its whole record (record, auction /
+tax / violation groups each from its own source row incl. trustee and TS # from `nts`, contact with
+provenance, assessor extras). BE **#519** (7897409a) + FE **#281** (6110a5b2): server-side `q` (the
+representative row's owner, property address, parcel ID alnum-only, mailing only when the batch shows
+it; `strpos`, never `LIKE`) and `sort` (relevance | date_* | auction_*) on both leads endpoints;
+`view_filter_params()` is the one bind builder for the API, the CSV and the tests, and the CSV binds
+all-NULL so its file is unchanged (tested). Follow-ups: FE **#283** (dbad69b5) the assessed value reads
+"$412,000" on Results and batches; BE **#532** (open, merges after #531) makes search find the located
+King PIN the table shows.
+
+**Tried / Decided:** search matches the REPRESENTATIVE row only (what the table row shows), not any row of
+the bucket: a stacked probate rep hides its pre-foreclosure sibling's borrower name, accepted and
+tested. The filtered total now counts rn=1 rows joined to agg (with a record-type filter on a seeded
+20k-row batch: 71 ms before, 257 ms after; pages stay 0.2-0.8 s) so a
+search counts exactly what the page renders. Sort keys are CASE-on-bind ahead of the old order, so a
+NULL bind is today's order. Located-PIN search reuses `shown_tier_sql`; `located_parcel_id` was
+tightened to ASCII digits so Python and SQL agree (Codex P1).
+
+**Failed / Blocked:** the laptop shut off mid Phase 3 (2026-10-12); the uncommitted work survived in
+`bl-wt/batch-parity-fe`. Merging #279 was refused once by the auto-mode classifier ("Merge Without
+Review"); merged on the owner's next "proceed". #519 was rebased twice (#520, a journal PR, landed during
+a peer's merge hold). A GitHub Actions incident left #519's finished green Test job reading "pending" for
+hours: the job log (`gh api .../actions/jobs/<id>/logs`) showed 6,743 passed long before the check did.
+The first 20k-row benchmark hit the 120 s statement timeout: fresh table, no ANALYZE (main's own page 1
+took 12 s once on the same data). Memory pressure killed background watchers and dev servers repeatedly;
+`next dev` killed by TaskStop leaves its child node holding :3131.
+
+**Caught & fixed:** a TDZ crash in the unfinished Phase 3 edit (violation description read before its
+`const`): a description-only violation lead would have crashed the sheet; a stale open-lead state that
+could reopen from React Query's cached array; a debounce that Clear could not cancel; a > 100-char URL
+`q` that would 422; `$0` assessments hidden by truthiness guards; "-$0"; a reverted #515 file folded into
+#519's squash by a `reset --soft` onto a moved main (caught by diffing against main before push).
+
+**Pending / Handoff:** BE #532 merges after the pillow bump #531 (pip-audit gate). Phones / emails stay
+unsearchable (encrypted at rest).
+
+**Facts learned:** a squash-merged dependency PR leaves the stacked branch carrying the old commits:
+`git rebase --onto origin/master <last dep commit>`. `--match-head-commit` pins a merge to the tested
+head. The FE type-contract check reads the BE schema from main, so a FE PR on new API params stays red
+until the BE PR merges; re-run it, do not regenerate against a branch.
+
 ## 2026-10-20 — The county_records cache writer is retired (#522), and the /records watch could not be proven
 
 **Built / Shipped:** BE **#522** (1ed4ac0b, squash 07:03 UTC) retires the daily `county_records` cache scrape, owner

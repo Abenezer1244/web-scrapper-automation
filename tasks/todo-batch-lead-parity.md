@@ -181,10 +181,11 @@ has the logic: date label, parcel display, money, auction countdown), `lib/types
       group by policy), P3 stale open state fixed. r2 PASS + P2 trustee / TS # from nts missing:
       fixed + check. r3 PASS; its P2s rejected (render-phase reset is React's documented
       prop-change pattern; text() already returns only strings / numbers)
-- [ ] Follow-up, not in scope: assessed value renders raw ("412000"), same as Results; format in
-      both together if wanted
+- [x] Follow-up: assessed value rendered raw ("412000"), same as Results. Fixed in both by FE #283
+      (dbad69b5, LIVE 2026-10-20): one formatAssessedValue helper, "$412,000"
 - [x] Pushed + FE PR #279 opened 2026-10-19 (owner "open push merge"); CI + Vercel preview PASS.
-      Merge BLOCKED by the session's auto-mode classifier ("Merge Without Review"): owner merges
+      First merge attempt blocked by the auto-mode classifier ("Merge Without Review"); MERGED
+      2026-10-20 as 33b5a812 on the owner's "proceed"; Vercel production READY
 
 ### Phase 4 plan (D3: search + sort, server-side), owner "then phase 4" 2026-10-19
 BE branch feat/batch-lead-search (worktree bl-wt/batch-search-be, from main a3bb2c37).
@@ -224,13 +225,19 @@ Files: `src/workers/batch_export.py`, `src/api/routes/batches.py`, a new test fi
       and main's own page 1 took 12 s once on the same data: pre-existing plan sensitivity, note
 - [x] Codex diff r1 PASS (P3 CSV-endpoint test: covered by the existing CSV golden tests; P3
       run-scoped twin: added). §14 x2 clean
-- [ ] Not searched (stated): located parcel (Python tier rules), phones / emails (encrypted)
+- [x] MERGED 2026-10-20 as 7897409a (rebased twice: #520 landed mid-hold); Railway api / worker / beat
+      SUCCESS on it. A GitHub Actions incident left the finished green check "pending" for hours
+- [ ] Located parcel: searchable by BE #532 (OPEN, merges after the pillow bump #531) (_LOCATED_PIN_SHOWN_SQL = located_parcel_id in SQL, a
+      17-shape agreement test; located_parcel_id now ASCII digits only). Phones / emails stay
+      unsearchable: encrypted at rest (stated in the API description)
 
 FE (worktree from master after #279 merges): `lib/api.ts`, `page.tsx`, `BatchLeadFilters.tsx`,
 `BatchLeadsTable.tsx`, types regen.
-- [ ] `q` + `sort` in the URL like the filters; search box debounced, resets to page 1; clear button
-- [ ] Sortable Date / Auction Date headers (button + aria-sort + arrow); a Sort select on cards
-- [ ] Empty state "No leads match …" with clear search; Chromium checks 1440 / 1280 / 768 / 390
+- [x] `q` + `sort` in the URL like the filters; search box debounced, resets to page 1; clear button
+- [x] Sortable Date / Auction Date headers (button + aria-sort + arrow); a Sort select on cards
+- [x] Empty state "No leads match …" with clear search; Chromium search / sort 31/31 (1440 + 390
+      touch), table 43/43, details 32/32. Codex PASS (debounce cancel on Clear, long URL q fixed).
+      FE #281 MERGED 2026-10-20 as 6110a5b2, Vercel production READY
 
 ## Verification (every phase)
 - BE: pytest on the guarded test DB (TEST_DATABASE_URL, never prod), ruff
@@ -239,5 +246,10 @@ FE (worktree from master after #279 merges): `lib/api.ts`, `page.tsx`, `BatchLea
   reused-contact provenance, empty fields, mobile cards
 - §14 security review twice; Codex diff gate until PASS; no push / merge / deploy without approval
 
-## Review
-(filled at the end)
+## Review (2026-10-20)
+All four phases LIVE: BE #508 (+ CSV columns), FE #276, FE #279, BE #519 + FE #281; follow-ups FE
+#283 (assessed value, LIVE) and BE #532 (located PIN search, OPEN behind #531). A batch lead now carries every field a
+single-scrape result does, plus its lists, stacked / delivered marks, contact provenance, a details
+sheet, search and sort. The laptop died mid Phase 3 (2026-10-12) with the work uncommitted; it
+survived in its worktree, and a TDZ crash in the unfinished edit was caught on resume. Open, by
+design: phones / emails are not searchable (encrypted at rest).

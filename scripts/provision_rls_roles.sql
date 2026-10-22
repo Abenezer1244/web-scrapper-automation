@@ -84,8 +84,7 @@ GRANT USAGE ON SCHEMA public TO bridgeleads_app;
 GRANT SELECT, INSERT, UPDATE ON
     users,              -- register (INSERT), password/profile/plan (UPDATE)
     scraper_configs,    -- create (INSERT), edit + soft-delete (UPDATE)
-    jobs,               -- create (INSERT), cancel (UPDATE)
-    user_record_views   -- INSERT ... ON CONFLICT DO UPDATE (scrapers.py:469)
+    jobs                -- create (INSERT), cancel (UPDATE)
 TO bridgeleads_app;
 
 -- SELECT + INSERT (append/read, never UPDATE/DELETE):
@@ -176,7 +175,7 @@ GRANT SELECT ON audit_events TO bridgeleads_app;
 -- not remove privileges an earlier version of this script handed out, so
 -- explicitly REVOKE everything the app must NOT hold (Codex review). DELETE is
 -- never granted to the app on any table.
-REVOKE DELETE ON users, scraper_configs, jobs, user_record_views FROM bridgeleads_app;
+REVOKE DELETE ON users, scraper_configs, jobs FROM bridgeleads_app;
 REVOKE UPDATE, DELETE ON county_connectors, password_history FROM bridgeleads_app;
 REVOKE INSERT, UPDATE, DELETE ON
     results, job_logs, referral_events,
@@ -421,7 +420,7 @@ BEGIN
     IF to_regproc('public.purge_account_data') IS NOT NULL THEN
         GRANT SELECT, DELETE ON user_sessions, user_avatars, pending_email_changes,
               password_history, mfa_backup_codes, mfa_break_glass_codes, notifications,
-              user_record_views, property_list_membership, dialer_deliveries, batch_runs,
+              property_list_membership, dialer_deliveries, batch_runs,
               job_logs, skip_trace_cache, pending_registrations TO bridgeleads_purge;
         GRANT SELECT ON results, pending_skip_trace_rows, skip_trace_queues, jobs,
               scraper_configs, scraper_batches, audit_events, delivered_records

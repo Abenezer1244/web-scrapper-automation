@@ -16,7 +16,7 @@ and its row counts verified.
 
 Design (Codex-reviewed):
   * FK map verified against src/db/models.py, not assumed:
-      CASCADE  jobs<-configs, results<-jobs, job_logs<-jobs, user_record_views<-configs,
+      CASCADE  jobs<-configs, results<-jobs, job_logs<-jobs,
                skip_trace_queues<-jobs, pending_skip_trace_rows<-jobs/results,
                dialer_deliveries<-jobs/results/configs
       SET NULL delivered_records.first_result_id
@@ -77,7 +77,6 @@ def elevated_session():
 # (table, column, id-set) — everything that dies or changes. Verified against models.py.
 _CASCADE = [
     ("jobs", "scraper_config_id", "configs"),
-    ("user_record_views", "scraper_config_id", "configs"),
     ("results", "job_id", "jobs"),
     ("job_logs", "job_id", "jobs"),
     ("skip_trace_queues", "job_id", "jobs"),

@@ -54,7 +54,7 @@ DECLARE
     t text;
     guc text := 'user_id = NULLIF(current_setting(''app.current_user_id'', true), '''')::uuid';
 BEGIN
-    FOREACH t IN ARRAY ARRAY['scraper_configs', 'jobs', 'user_record_views']
+    FOREACH t IN ARRAY ARRAY['scraper_configs', 'jobs']
     LOOP
         EXECUTE format('DROP POLICY IF EXISTS %I ON public.%I', t || '_user_isolation', t);
         EXECUTE format('DROP POLICY IF EXISTS urv_user_only ON public.%I', t);  -- 023 legacy name

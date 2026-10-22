@@ -235,3 +235,79 @@ class TestRunScopedTwin:
         for params in ({"q": "x" * 101}, {"sort": "party_name"}):
             resp = await client.get(url, params=params, headers=_auth(starter_token))
             assert resp.status_code == 422
+
+
+# ── Located King PIN (search gap follow-up, 2026-10-20) ──────────────────────────
+# The table shows enrichment_data.kc_pin as the Parcel ID when a lead has none
+# (located_parcel_id). Search must find exactly the PINs the table shows.
+
+_SHOWN = {"kc_pin": "0220099999", "kc_pin_status": "matched",
+          "kc_pin_source": "king_gis_point_in_parcel", "kc_pin_match": "exact"}
+_PIN_SHAPES = [
+    _SHOWN,
+    {**_SHOWN, "kc_pin_match": "street_only"},
+    {**_SHOWN, "kc_pin_source": "king_gis_address_point", "kc_pin_match": "address_point"},
+    {**_SHOWN, "kc_pin_match": "address_only"},
+    {**_SHOWN, "kc_pin_match": "condo_complex"},
+    {**_SHOWN, "kc_pin_source": "king_gis_address_point", "kc_pin_match": "exact"},
+    {**_SHOWN, "kc_pin_status": "no_match"},
+    {**_SHOWN, "kc_pin": "022009999"},
+    {**_SHOWN, "kc_pin": 220099999},
+    {**_SHOWN, "kc_pin": "٠٢٢٠٠٩٩٩٩٩"},  # Arabic-Indic digits: isdigit() but not a PIN
+    {**_SHOWN, "kc_pin_source": ["king_gis_point_in_parcel"]},
+    {**_SHOWN, "kc_pin_match": {"x": 1}},
+    {k: v for k, v in _SHOWN.items() if k != "kc_pin_status"},
+    {},
+    None,
+    [1, 2],
+    "a string",
+]
+
+
+async def test_located_pin_sql_agrees_with_located_parcel_id(db):
+    """The SQL predicate and the Python rule must give the same answer on every shape."""
+    import json
+
+    from src.utils.located_parcel import located_parcel_id
+    from src.workers.batch_export import _LOCATED_PIN_SHOWN_SQL
+
+    sql = text(f"SELECT {_LOCATED_PIN_SHOWN_SQL} AS shown FROM (SELECT CAST(:ed AS json) AS enrichment_data) rk")
+    for shape in _PIN_SHAPES:
+        got = (await db.execute(sql, {"ed": json.dumps(shape)})).scalar()
+        assert bool(got) == (located_parcel_id(shape) is not None), shape
+
+
+@pytest_asyncio.fixture
+async def pin_batch(db, starter_user):
+    batch = await _batch(db, starter_user.id, "Pins")
+    cv = await _child(db, starter_user.id, batch.id, "code_violation")
+
+    def row(party, pk, **kw):
+        db.add(Result(id=str(uuid.uuid4()), user_id=starter_user.id, job_id=cv.id, party_name=party,
+                      property_key=pk, date_recorded="10/01/2026", property_address=f"1 {party} ST", **kw))
+
+    row("LOCATED", "pk-a", enrichment_data={**_SHOWN, "kc_pin": "0220099999"})
+    row("HAS PARCEL", "pk-b", parcel_id="1111111111", enrichment_data={**_SHOWN, "kc_pin": "0220088888"})
+    row("CONDO", "pk-c", enrichment_data={**_SHOWN, "kc_pin": "0220077777", "kc_pin_match": "condo_complex"})
+    row("UNMATCHED", "pk-d", enrichment_data={**_SHOWN, "kc_pin": "0220066666", "kc_pin_status": "no_match"})
+    # An empty-string parcel ID is blank too (Python: falsy), so its PIN is what shows.
+    row("EMPTY PARCEL", "pk-e", parcel_id="", enrichment_data={**_SHOWN, "kc_pin": "0220055555"})
+    run = BatchRun(id=str(uuid.uuid4()), batch_id=batch.id, user_id=starter_user.id, status="done",
+                   child_job_ids=[cv.id])
+    db.add(run)
+    await db.commit()
+    return batch
+
+
+class TestLocatedPinSearch:
+    async def test_shown_pin_is_found_dashes_ignored(self, client, starter_token, pin_batch):
+        assert await _names(client, starter_token, pin_batch, q="0220099999") == (["LOCATED"], 1)
+        assert await _names(client, starter_token, pin_batch, q="022009-9999") == (["LOCATED"], 1)
+        assert await _names(client, starter_token, pin_batch, q="0220055555") == (["EMPTY PARCEL"], 1)
+
+    async def test_pins_the_table_does_not_show_are_not_found(self, client, starter_token, pin_batch):
+        # Hidden behind a real parcel ID, a condo complex parcel, an unmatched lookup.
+        for pin in ("0220088888", "0220077777", "0220066666"):
+            assert await _names(client, starter_token, pin_batch, q=pin) == ([], 0), pin
+        # The real parcel ID still matches as before.
+        assert await _names(client, starter_token, pin_batch, q="1111111111") == (["HAS PARCEL"], 1)

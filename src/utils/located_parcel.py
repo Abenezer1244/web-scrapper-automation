@@ -69,7 +69,9 @@ def located_parcel_match(enrichment_data: Any) -> str | None:
     if not isinstance(enrichment_data, dict):
         return None
     pin = enrichment_data.get("kc_pin")
-    if not (isinstance(pin, str) and len(pin) == 10 and pin.isdigit()):
+    # ASCII digits only: str.isdigit() also accepts other scripts' digits, which no King
+    # PIN has and which the SQL twins (search, cv_owner_recovery) reject as [0-9].
+    if not (isinstance(pin, str) and len(pin) == 10 and pin.isascii() and pin.isdigit()):
         return None
     match = enrichment_data.get("kc_pin_match")
     source = enrichment_data.get("kc_pin_source")

@@ -19,6 +19,45 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-10-25 — UX 3.13 follow-ups closed, S3-21 fixed, and FE off a critical Next.js advisory
+
+**Built / Shipped:** BE #535 `134d179c` (the 10-22 journal entry, retention matrix, 3.13 handoff); BE #537 `2676446c`
+(`SECURITY-AUDIT.md` S3-21 -> FIXED: application code by UX 3.13a #495, least-privilege DDL by migration 119 #527, the
+API role's SELECT on `county_records` fails with 42501). FE #284 `2e3337a3` (the three 3.13 named follow-ups marked
+DONE in `docs/ux-audit/todo-item3-batches-B-E.md`, with the 10-27 fingerprint left open). FE #285 `68711e74`: `next`
+16.3.8 -> 16.4.3 (exact pin) and `zod` ^4.3.6 -> ^4.6.7. BE merges went through MERGING NOW / VERIFIED with peers
+-0c / -49 / -90 and were checked by Railway commit hash on api / worker / beat; FE merges by the Vercel production
+deployment for the SHA plus `vercel inspect bridgeleads.io`.
+
+**Tried / Decided:** the owner-only UX 3.17 check was done with the owner signing in (MFA) in a headed Chromium on the
+saved audit profile, then read over CDP: `/live/5b7b9266` reads "Complete: 2,190 new leads" and `GET /jobs/{id}`
+`stage_label` is identical; the Results page shows "Run complete" + "2,190 new leads" by design. The Next.js bump was
+taken as its own PR after reviewing exposure: the image optimizer is on by default and `public/` serves SVGs, so the
+image-optimizer RCE was plausibly reachable; there is no `use cache` and no Server Action. Codex consulted on every
+plan and gated every diff (all PASS; one P3 wording fix taken on #284; its P1 on #285 was "inspect exposure first",
+done before merge).
+
+**Failed / Blocked:** GitHub Actions locked the whole account (a declined $26.52 charge; jobs "not started" in 2 s)
+until the owner paid. The Claude-in-Chrome extension was not connected, so the browser check used Playwright instead.
+Vercel previews sit behind Vercel SSO (302 to `vercel.com/sso-api`), so the pre-merge smoke ran on a local
+`next start` of the same build. The FE `npm audit` gate had kept FE `master` red since 2026-10-23 and blocked every FE
+PR, unowned by any session.
+
+**Caught & fixed:** S3-21 still said "DDL pending" three days after migration 119 proved the API role could not read
+the table. The local image-optimizer 500 for `/next.svg` is most likely not the upgrade, inferred from two observations: the server log said "internal image
+response failed for /next.svg 307" (the proxy redirects signed-out requests for `public/` files to /login, a known
+landmine), and production on 16.3.8 answers 307 for the same `/_next/image` URL.
+
+**Pending / Handoff:** 2026-10-27 read-only G2 fingerprint, against the baseline recorded in
+`docs/HANDOFF-ux313-followups-2026-10-25.md` (taken by an earlier session, not re-measured here): `county_records`
+3,305 rows / md5 `94d40dac5de3f9a0aaf05ced46a125ba`. A match means the table did not change after the writer was
+retired; any change = investigate, and revert #522 if the writer is the cause.
+
+**Facts learned:** under the `DATABASE_URL` roles a read-only `SELECT FROM jobs` returns 0 rows (RLS); read through
+`DATABASE_URL_MIGRATE` with `set_session(readonly=True)`, and strip its `postgresql+psycopg2://` scheme for
+psycopg2. FE CI does not run `next build` (Vercel does), so a dependency bump needs a local build. Remotion (dev only)
+pins `zod` 4.5.4, so npm nests copies under it; `npm audit --omit=dev` does not count them.
+
 ## 2026-10-25 — King tax run measured after the owner-name work: 9m40s, down from 23m26s
 
 **Built / Shipped:** nothing new; this entry records a production measurement. #529 (first-ExceedCount stop, owner sweep 25 a

@@ -26,7 +26,6 @@ docs/
 scripts/
   bootstrap.sh               ← First-time production setup script
 docker-compose.prod.yml      ← Full stack with monitoring (Prometheus, Grafana, Loki)
-railway.toml                 ← Railway deployment config
 pyproject.toml               ← Ruff linting + pytest + coverage config
 ```
 
@@ -108,6 +107,26 @@ Railway
 Vercel → Next.js frontend
 Resend → Transactional email
 ```
+
+### Railway Service Settings
+
+The build and start settings live in each service's Railway settings, not in the repo.
+`railway.toml` was removed on 2026-10-25 because Railway stops reading Config as Code
+files on 2026-12-01. The same values are set on api, worker and beat:
+
+| Setting | Value |
+|---------|-------|
+| Dockerfile path | `Dockerfile`, set explicitly. The builder field still reads Railpack because Railway's API has no Dockerfile value; the root `Dockerfile` is what gets built, and the build log says "Using detected Dockerfile!" |
+| Start command | `/app/start.sh` (routes on `RAILWAY_SERVICE_NAME`) |
+| Restart policy | On failure, 3 retries |
+
+These settings are not versioned. If a service is recreated, or someone edits them in the
+dashboard, set them again from this table; restoring `railway.toml` no longer works after
+the cutoff.
+
+Railway's Infrastructure as Code (`.railway/railway.ts`) was not adopted. A file that
+declares a service owns its whole variable set, so any variable added in the dashboard and
+missing from the file would be deleted on the next `railway config apply`.
 
 ### Nginx Config Highlights
 - Rate limiting by zone: auth (10 req/min), job creation (5 req/min), general (60 req/min)

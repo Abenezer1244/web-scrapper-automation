@@ -19,6 +19,29 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-10-25 — King tax run measured after the owner-name work: 9m40s, down from 23m26s
+
+**Built / Shipped:** nothing new; this entry records a production measurement. #529 (first-ExceedCount stop, owner sweep 25 a
+tick at 5 s) shipped 10-22 in the combined deploy e34c806c (#529 + #528 + #534) after Railway's build pause.
+
+**Tried / Decided:** no King job runs on a schedule (every King job in prod was manual or batch), so the "next natural
+King tax run" was never coming. With the owner's OK the `finale` batch (0518cbeb) was re-run once (run a4aca911) by
+inserting one pending `batch_runs` row for `batch_recovery_sweep` to dispatch, after a preflight that refused on an
+active run, any in-flight job, or King not healthy. Peer sessions held BE merges for the duration.
+
+**Facts learned:** King tax job e629d68a: 06:48:41 -> 06:58:22 UTC = 9m40s (10-12 baseline 8f167f23: 23m26s), 14,836
+rows, 2 newly claimed. The #515 step timings: dedup ~12 s; King property extract for 66 parcels ~6.7 min (most of the
+run); owner names asked of King: 1 (10-12: 77); re-elect 0.2 s; claim takeover 20.9 s for 0 taken (the next candidate
+to trim); refetch 1.5 s; owner flags 67 rows 0.2 s; property_key + membership ~16 s. Probate and pre-foreclosure each
+~3.5 min. 0 ExceedCount. The job's "14,769 King leads ... queued for recovery" are hidden prior-run duplicates, not a
+King flood: the next property sweep took 1 parcel. The 07:05 owner sweep (the first with work since #529) asked 4
+parcels in 28 s; all 4 came back as King 200 pages with no parcel (transient, retried until `_MAX_ATTEMPTS` = 5, then
+`gave_up`); King stayed healthy.
+
+**Pending / Handoff:** none from this thread. If the claim-takeover step grows, look at it first.
+
+---
+
 ## 2026-10-22 — UX 3.13 follow-ups closed: county_records is unreadable by the API (119), user_record_views is gone (120), and a Railway outage in between
 
 **Built / Shipped:** BE **#527** (0f9c2083, migration 119): the API role loses SELECT on `county_records` and its read
@@ -59,6 +82,8 @@ one real >= 1,000 "Complete:" headline (UX 3.17).
 export as it goes. `CREATE OR REPLACE FUNCTION` from `pg_get_functiondef` round-trips byte-identically and keeps owner
 and ACL. In prod, `postgres` holds an ADMIN-only (no SET, no INHERIT) membership in `bridgeleads_purge` from
 `supabase_admin`, which 113's membership assertion allows.
+
+---
 
 ## 2026-10-21 — King tripped its request cap again at 40 a tick: stop on the first refusal, and ask less
 

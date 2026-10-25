@@ -58,6 +58,8 @@ Production head: api / worker / beat all SUCCESS on `04ee22ec` (main). Peers (-0
 
 - Coordinate every BE merge with the peer sessions: MERGING NOW before, VERIFIED after (deploy checked by Railway
   commit hash, never `/health` alone).
+- **Hold after #535:** peer -49 starts a ~45 min prod re-run of the King `finale` batch right after #535's VERIFIED;
+  any BE merge redeploys the worker and kills it. No BE merge until -49 sends DONE.
 - Destructive production writes need the owner's explicit OK (C1 and C2 got it). Code merges: owner allowed.
 - Codex PLAN before building and a diff gate after (inline prompt on stdin: `codex exec -c 'mcp_servers={}'
   --skip-git-repo-check - < prompt.txt`; never let Codex read files or run shell).

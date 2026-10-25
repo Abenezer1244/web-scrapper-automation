@@ -115,6 +115,117 @@ def _hash(case: str) -> str:
     return hashlib.sha256(f"kingco_accela_code_enforcement|{case}".encode()).hexdigest()[:32]
 
 
+# -- The search form (the live failure of 2026-09-16) -------------------------
+
+
+class _FormBox:
+    """One input on the fake search form."""
+
+    def __init__(self, form, selector):
+        self.form, self.selector = form, selector
+
+    async def click(self):
+        self.form.focused = self.selector
+
+    async def press(self, key):
+        if key in ("Control+a", "Delete"):
+            self.form.values[self.selector] = ""
+        elif key == "Tab":
+            self.form.postback(self.selector)
+
+    async def type(self, text, delay=0):
+        self.form.values[self.selector] = self.form.values.get(self.selector, "") + text
+
+
+class _FakeForm:
+    """The Accela search form, including its postback that resets the OTHER date box.
+
+    Leaving a date box posts back; the portal re-renders the form and puts the box the
+    user is NOT in back at its default. That is what made every retry fail in production.
+    """
+
+    START_DEFAULT = "09/17/2021"
+    END_DEFAULT = "09/16/2026"
+
+    def __init__(self, *, resets=True):
+        self.values = {ka.SEL_START_DATE: self.START_DEFAULT, ka.SEL_END_DATE: self.END_DEFAULT,
+                       ka.SEL_RECORD_TYPE: ka.RECORD_TYPE_VALUE}
+        self.resets = resets
+        self.focused = None
+        self.settles = 0
+        self.typed_boxes: list[str] = []
+
+    def postback(self, selector):
+        self.typed_boxes.append(selector)
+        if not self.resets:
+            return
+        other = ka.SEL_END_DATE if selector == ka.SEL_START_DATE else ka.SEL_START_DATE
+        self.values[other] = self.END_DEFAULT if other == ka.SEL_END_DATE else self.START_DEFAULT
+
+    def locator(self, selector):
+        return _FormBox(self, selector)
+
+    async def input_value(self, selector):
+        return self.values[selector]
+
+    async def wait_for_load_state(self, _state, timeout=None):
+        self.settles += 1
+
+
+@pytest.mark.asyncio
+async def test_a_postback_that_resets_the_other_date_box_is_refilled_not_failed():
+    form = _FakeForm()
+
+    await ka.fill_search_dates(form, date(2026, 7, 30), date(2026, 8, 5), timeout_ms=1000)
+
+    assert (form.values[ka.SEL_START_DATE], form.values[ka.SEL_END_DATE]) == ("07/30/2026", "08/05/2026")
+    # One pass: the start box is left (one postback, which resets the end box we have not
+    # typed yet), the end box is typed last and never left, so nothing resets it.
+    assert form.typed_boxes == [ka.SEL_START_DATE]
+    assert form.settles == 1
+
+
+@pytest.mark.asyncio
+async def test_a_form_that_takes_the_dates_first_time_is_not_typed_again():
+    form = _FakeForm(resets=False)
+
+    await ka.fill_search_dates(form, date(2026, 7, 30), date(2026, 8, 5), timeout_ms=1000)
+
+    assert form.typed_boxes == [ka.SEL_START_DATE]   # only the first box is left/posted back
+    # A window already showing in the form costs no postback at all.
+    again = _FakeForm(resets=False)
+    again.values[ka.SEL_START_DATE], again.values[ka.SEL_END_DATE] = "07/30/2026", "08/05/2026"
+    await ka.fill_search_dates(again, date(2026, 7, 30), date(2026, 8, 5), timeout_ms=1000)
+    assert again.typed_boxes == []
+
+
+@pytest.mark.asyncio
+async def test_a_form_that_never_takes_the_window_still_fails_loud():
+    """A form that ignores what is typed (a changed portal, a read-only box) must raise
+    rather than search whatever range the portal chose."""
+
+    class _Ignores(_FakeForm):
+        async def input_value(self, selector):
+            if selector == ka.SEL_RECORD_TYPE:
+                return ka.RECORD_TYPE_VALUE
+            return self.START_DEFAULT if selector == ka.SEL_START_DATE else self.END_DEFAULT
+
+    form = _Ignores()
+    with pytest.raises(RuntimeError, match="did not take the criteria"):
+        await ka.fill_search_dates(form, date(2026, 7, 30), date(2026, 8, 5), timeout_ms=1000)
+    # Bounded: one postback per pass (the last wrong box is never left), then loud.
+    assert len(form.typed_boxes) == ka.FORM_FILL_PASSES
+
+
+@pytest.mark.asyncio
+async def test_a_record_type_the_form_dropped_fails_even_with_good_dates():
+    form = _FakeForm(resets=False)
+    form.values[ka.SEL_RECORD_TYPE] = ""
+
+    with pytest.raises(RuntimeError, match="did not take the criteria"):
+        await ka.fill_search_dates(form, date(2026, 7, 30), date(2026, 8, 5), timeout_ms=1000)
+
+
 # ── Windows ──────────────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize(("start", "end", "windows"), [

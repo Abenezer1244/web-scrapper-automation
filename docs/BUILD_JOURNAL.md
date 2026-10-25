@@ -19,6 +19,47 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-10-22 — UX 3.13 follow-ups closed: county_records is unreadable by the API (119), user_record_views is gone (120), and a Railway outage in between
+
+**Built / Shipped:** BE **#527** (0f9c2083, migration 119): the API role loses SELECT on `county_records` and its read
+policy (`county_records_app_read` and 028's PUBLIC `county_records_shared_read` both dropped); provisioning, cutover and
+hotfix scripts mirrored, the cutover script RAISEs if the app can still read it. BE **#528** (881d95f2, migration 120):
+`purge_account_data()` rewritten from its live definition minus its one `user_record_views` DELETE line, as
+`bridgeleads_purge` through 113's hand-over, checked (body, SECURITY DEFINER, owner, ACL), then `DROP TABLE
+user_record_views RESTRICT`, all one transaction; `UserRecordView` model removed. BE **#531** (973c48a4): pillow 13.0.0.
+BE **#530**: the scripts stop naming the dropped table. This PR: the retention matrix and this entry.
+
+**Tried / Decided:** the `/records` watch (UX 3.13) was closed ON EVIDENCE (owner decision): 0 users hold any API key,
+0 `/records` hits in every retained log 2026-10-13..10-20, fresh-log completeness proven by 8/8 canaries in HTTP and
+uvicorn logs (Railway's HTTP `path` omits the query string), and a 404 since 10-11. A 7-day forward canary watch was
+dropped (Codex PLAN FW r1 NO-GO, 7 P1; it needed this laptop awake for a week). Codex: PLAN C1 GO r3 (indirect readers
+audited in prod: no view, no role membership, no column ACL; only the 023 write-block trigger function mentions the
+table), PLAN C2 GO r2 (drop first, scripts right after; fail-closed RuntimeError checks; downgrade restores the full
+ACL). Supabase `anon`/`authenticated`/`service_role` table grants (default ACL, 0 rows under forced RLS) are left as a
+project-wide decision. Proof rigs on a fresh local Postgres with the real roles: C1 12/12, C2 14/14 (function differs
+by exactly one line; downgrade byte-identical). Backup before 120: 10 rows, sha256 19f129e7...ba8, owner-only.
+
+**Failed / Blocked:** pip-audit failed every BE PR twice in a day: 8 pillow 12.3.0 CVEs (fixed by #531; avatar.py only
+opens JPEG/PNG/WEBP, so none was reachable) and 5 pypdf 6.19.0 CVEs (fixed by peer #534). Railway had a major outage
+from 2026-10-21 ~08:00 UTC: #529 was never auto-deployed, `redeploy` answered "Deploys have been paused", `railway run`,
+`variable list` and `ssh` failed, and the CLI logged out. #528 was merged on the owner's instruction during the pause;
+once builds resumed, `railway redeploy --from-source -y` (api first, then worker and beat) shipped #529 + #528 + #534 as
+one head, e34c806c (2026-10-22 16:51 UTC). The shared local test Postgres crashed under memory pressure (0xC0000142) and
+was later stopped by the memory reaper; full suites ran in CI instead.
+
+**Caught & fixed:** Codex caught the hotfix script still recreating a read policy (C1 r1), the cutover script only
+reporting instead of failing (C1 gate), an assert-based destructive guard and an unsafe script-first order (C2 r1).
+The rig's psql emulator split a gset query on a `;` inside a comment; fixed by skipping whole-line comments.
+
+**Pending / Handoff:** 2026-10-27: re-take the `county_records` fingerprint (3,305 rows, md5 94d40dac...); any change =
+investigate. The first King owner sweep after #529 had 0 parcels, so its 25-per-tick cap is not yet exercised. Owner:
+one real >= 1,000 "Complete:" headline (UX 3.17).
+
+**Facts learned:** Railway `--lines` max is 5,000 and its logs are partial even inside 7 days, so a log watch must
+export as it goes. `CREATE OR REPLACE FUNCTION` from `pg_get_functiondef` round-trips byte-identically and keeps owner
+and ACL. In prod, `postgres` holds an ADMIN-only (no SET, no INHERIT) membership in `bridgeleads_purge` from
+`supabase_admin`, which 113's membership assertion allows.
+
 ## 2026-10-21 — King tripped its request cap again at 40 a tick: stop on the first refusal, and ask less
 
 **Built / Shipped:** this PR. `king_county_assessor._is_quota_refusal` (a 3xx to `ExceedCount.aspx`, read through the

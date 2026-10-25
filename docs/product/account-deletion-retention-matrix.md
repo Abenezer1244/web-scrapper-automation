@@ -17,7 +17,7 @@ through `ON DELETE CASCADE` foreign keys:
 |---|---|
 | `jobs` | `contact_lookup_actions` -> `contact_lookup_action_results`, `contact_lookup_action_events`; `skip_trace_queues`; `pending_skip_trace_rows`; `results` |
 | `results` | `contact_lookup_action_results`, `pending_skip_trace_rows`, `dialer_deliveries` |
-| `scraper_configs` | `jobs` (and everything above), `dialer_deliveries`, `user_record_views` |
+| `scraper_configs` | `jobs` (and everything above), `dialer_deliveries` (`user_record_views` was dropped by migration 120, 2026-10-22) |
 | `scraper_batches` | `scraper_configs` (and everything above), `batch_runs` |
 
 So the purge **cannot delete jobs, results, configs or batches** without destroying the
@@ -42,7 +42,7 @@ unchanged (until its retention expiry, a later phase); **TOMBSTONE** see the use
 | `users` | TOMBSTONE | Capture the original email HMAC first (for `pending_registrations` and the trial table). email -> `deleted+<id>@invalid` (recomputes email_hmac, frees the address); name, first_name, last_name, timezone, notification_prefs -> NULL/default; password_hash -> unusable random; mfa_* cleared; api_key_hash NULL; referral_code NULL; is_admin false; is_active false; deletion_state `deleted`. Kept: id, plan, stripe_customer_id, stripe_subscription_id, subscription_status, billing/quota/entitlement columns, created_at, referred_by_user_id (referral credit evidence, with referral_events). |
 | `pending_registrations` | DELETE matching | No FK to users: raw email + names of a sign-up in progress. Delete rows whose email_hmac equals the captured original. |
 | `user_avatars`, `user_sessions`, `pending_email_changes`, `password_history`, `mfa_backup_codes`, `mfa_break_glass_codes` | DELETE | Own credentials/profile. |
-| `notifications`, `user_record_views`, `property_list_membership`, `job_logs`, `batch_runs`, `dialer_deliveries` | DELETE | No dependents need them; job_logs messages can carry addresses; batch_runs only after its R2 export is swept. |
+| `notifications`, `property_list_membership`, `job_logs`, `batch_runs`, `dialer_deliveries` (`user_record_views` until migration 120 dropped it) | DELETE | No dependents need them; job_logs messages can carry addresses; batch_runs only after its R2 export is swept. |
 | `scraper_batches` | SCRUB | name -> 'deleted', fields/enrichment/schedule/deliver -> empty JSON, delivery_mode NULL, status 'archived'. (deliver can hold emails and webhook targets.) Kept: state (billing context). |
 | `scraper_configs` | SCRUB | name -> 'deleted', fields/enrichment/schedule/deliver/doc_types -> empty, include_living_owner_tod default, active false (already paused at request). Kept: county, state, record_type, skip_trace_enabled (what the jobs were billed for; not personal data). |
 | `jobs` | SCRUB | export_key NULL (after the R2 delete), error_message NULL. Kept: status, counts, billed_count, billing_applied_at, dates, breakdown counts. |

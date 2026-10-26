@@ -20,11 +20,11 @@ ADDR = "5006 61ST STREET CT E"
 SNAPSHOT = {
     "breakdown_dropped_before_save": 1, "breakdown_no_address": 2,
     "breakdown_same_run_merged": 0, "breakdown_already_delivered": 3,
-    "breakdown_over_quota": 0, "breakdown_new": 4,
+    "breakdown_not_qualified": 0, "breakdown_over_quota": 0, "breakdown_new": 4,
 }
 SNAPSHOT_FIELDS = {
     "dropped_before_save": 1, "no_address": 2, "same_run_merged": 0,
-    "already_delivered": 3, "over_quota": 0, "new": 4,
+    "already_delivered": 3, "not_qualified": 0, "over_quota": 0, "new": 4,
 }
 
 
@@ -61,7 +61,7 @@ LIVE_ROWS = [
     {"mailing_address": "PO BOX 1"},
 ]
 LIVE = {"no_address": 1, "same_run_merged": 0, "already_delivered": 1,
-        "over_quota": 0, "new": 2}
+        "not_qualified": 0, "over_quota": 0, "new": 2}
 
 
 # ── JobResponse: snapshot only ───────────────────────────────────────────────

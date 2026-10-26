@@ -19,6 +19,46 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-10-26 — Code-violation lead qualification gate (built, not merged)
+
+**Built / Shipped:** nothing merged or deployed. BE branch `fix/code-violation-lead-qualification` (worktree
+`C:/Users/Windows/bl-wt/cv-qual`): `src/api/lead_qualification.py` (one policy, Python + SQL + ORM twins, read-side
+state/reasons); wired into `lead_actionability` (actionable rule, `withheld_*`, `deliverable_before_cap_sql`);
+worker stamps `qualification_policy` at the single insert, holds unqualified code violations as
+`delivery_excluded_reason='not_qualified'` before the quota reservation for every plan
+(`plan_cap.mark_not_qualified_rows`), the cap ranks qualified rows only, the paid skip-trace dispatcher refuses
+withheld rows, a blocked owner source now says so in the run log; run breakdown bucket `not_qualified` + migration
+121; `schema/openapi.json` regenerated. FE branch `fix/lead-quality-delivery-gate` (worktree
+`C:/Users/Windows/bl-wt/fe-cv-qual`): `lib/run-summary.ts` counts `not_qualified` and shows a "Held back" card.
+
+**Tried / Decided:** forensics on run 1ad28ded (King CV, 2026-10-17, read-only): 5,455 found = 491 billed + 4,915
+prior_run + 38 same-run + 11 no-address. In-job owner lookup named 0 of 1,182 parcels (King eRealProperty in breaker
+cooldown, recovered 10-18 01:59 UTC), so the delivered CSV named nobody; the beat sweep named 368 twelve hours later;
+123 billed rows can never be named under the parcel rules. The 4,915 "already delivered" rows are unenriched
+duplicate copies (N/A by design since #521). Accela (unincorporated KC) returned 0 rows (#332 still unmerged).
+Population: 4,212 billed CV rows, 3,283 pass the strict rule. Owner decisions: mailing mandatory (costs 28 rows);
+a held record stays held and a later run takes the claim and bills it (claim transfer already does this once the
+held row is not actionable). Scope is stamped, not dated, so history is untouched.
+
+**Failed / Blocked:** two parallel full suites were reaped for low memory; a third run collided with my own
+targeted run on the same test DB (teardown deletes every user) and its failures were noise. Killing an orphaned
+pytest was classifier-denied. The box ran ~1.6 s/test; the suite was finally run as 18 reset-per-chunk slices.
+
+**Caught & fixed:** Codex consult FAIL (11 P1s folded in); review r1-r4 FAIL, r5 PASS, final pass FAIL then r7 PASS.
+Real bugs found: SQL twin NULL instead of FALSE (hold step would skip rows); `{10}` regex quantifier broke
+`segments.py`, which runs spliced SQL through `str.format` (82 failures); `not_(text(...))` crashed the dispatcher
+(now `literal_column(..., Boolean)`); Python strip() vs Postgres btrim() and JSON-typed values let the twins
+disagree (bill vs file); placeholder parcel/case text; no-address rows left unheld. Rejected with test evidence:
+"held survivor blocks the next run's claim".
+
+**Pending / Handoff:** owner review, then commit/PR. Deploy FE first or together (live FE sums the buckets it
+knows). Phase 2 (results `not_qualified` category with reasons, Already Delivered shows the delivered original),
+Phase 3 (monitoring, historical dry-run report), Accela #332, quota decision on the 929 pre-gate rows.
+
+**Facts learned:** spliced SQL must be `str.format`-safe (no braces). A TextClause cannot be negated. A stamped
+policy key is the safe way to change a delivery rule without moving history. `breakdown_from_job` treats any NULL
+column as a partial snapshot, so a new bucket must read NULL as 0 on old snapshots.
+
 ## 2026-10-25 — UX 3.13 follow-ups closed, S3-21 fixed, and FE off a critical Next.js advisory
 
 **Built / Shipped:** BE #535 `134d179c` (the 10-22 journal entry, retention matrix, 3.13 handoff); BE #537 `2676446c`

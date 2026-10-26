@@ -7,9 +7,12 @@ from sqlalchemy import text as sa_text
 
 from src.api.lead_actionability import (
     DELIVERY_EXCLUDED_KEY,
+    NOT_QUALIFIED,
     OVER_QUOTA,
     address_actionable_sql,
+    deliverable_before_cap_sql,
 )
+from src.api.lead_qualification import POLICY_CODE_VIOLATION, POLICY_KEY, qualified_sql
 from src.scrapers.king_cv_sources import settled_sql
 
 # Every record type without its own order below ranks by who and when, which also keeps
@@ -57,11 +60,13 @@ def mark_over_quota_rows(db, *, job_id: str, user_id: str, remaining: int,
                          record_type: str | None) -> list[str]:
     """Mark every deliverable lead ranked past ``remaining`` over quota; return their ids.
 
-    Ranks the job's non-duplicate rows that are deliverable ON ADDRESS
-    (address_actionable_sql, deliberately not the full rule: a row this job already
-    marked must still be ranked, or a re-run would renumber the survivors and mark
-    a second batch). Rows with no address are never ranked, never marked and never
-    billed. The caller clears this job's previous marks first and commits.
+    Ranks the job's non-duplicate rows that are deliverable ON ADDRESS and qualified
+    (deliverable_before_cap_sql, deliberately not the full rule: a row this job already
+    marked over quota must still be ranked, or a re-run would renumber the survivors and
+    mark a second batch). Rows with no address, and code violations held by
+    mark_not_qualified_rows, are never ranked, never marked over quota and never billed,
+    so the quota is spent only on leads that can be delivered. The caller clears this
+    job's previous marks first and commits.
     """
     statement = (  # noqa: S608 -- splices only the module ORDER BY constants and address_actionable_sql; every value is bound
         "WITH ranked AS ("
@@ -77,7 +82,7 @@ def mark_over_quota_rows(db, *, job_id: str, user_id: str, remaining: int,
         "   || jsonb_build_object(:key, :reason))::json "
         "FROM ranked WHERE r.id = ranked.id AND ranked.rn > :remaining "
         "RETURNING r.id"
-    ).format(order=cap_rank_order_sql(record_type), addr_rule=address_actionable_sql("results"))
+    ).format(order=cap_rank_order_sql(record_type), addr_rule=deliverable_before_cap_sql("results"))
     return [
         str(row[0]) for row in db.execute(
             sa_text(statement),
@@ -85,3 +90,57 @@ def mark_over_quota_rows(db, *, job_id: str, user_id: str, remaining: int,
              "reason": OVER_QUOTA, "remaining": remaining},
         ).fetchall()
     ]
+
+
+
+_ED_OBJECT = ("(CASE WHEN jsonb_typeof(COALESCE(enrichment_data, '{}')::jsonb) = 'object' "
+              "THEN COALESCE(enrichment_data, '{}')::jsonb ELSE '{}'::jsonb END)")
+_CLEAR_HOLDS_SQL = (  # splices only module constants; every value is bound
+    f"UPDATE results SET enrichment_data = ({_ED_OBJECT} - :key)::json "  # noqa: S608
+    "WHERE job_id = :jid AND user_id = CAST(:uid AS uuid) "
+    "  AND enrichment_data->>:key = :reason"
+)
+_HOLD_SQL = (  # splices only module constants; every value is bound
+    f"UPDATE results SET enrichment_data = ({_ED_OBJECT} || jsonb_build_object(CAST(:key AS text), CAST(:reason AS text)))::json "  # noqa: S608
+    "WHERE job_id = :jid AND user_id = CAST(:uid AS uuid) "
+    "  AND (is_duplicate = false OR duplicate_reason = 'same_run') "
+    f"  AND NOT {qualified_sql('results')} "
+    f"RETURNING id, dedup_hash, is_duplicate, {address_actionable_sql('results')} AS has_address"
+)
+_HOLD_SIBLINGS_SQL = (  # splices only module constants; every value is bound
+    f"UPDATE results SET enrichment_data = ({_ED_OBJECT} || jsonb_build_object(CAST(:key AS text), CAST(:reason AS text)))::json "  # noqa: S608
+    "WHERE job_id = :jid AND user_id = CAST(:uid AS uuid) "
+    "  AND duplicate_reason = 'same_run' "
+    "  AND dedup_hash = ANY(CAST(:hashes AS text[])) "
+    f"  AND enrichment_data->>'{POLICY_KEY}' = '{POLICY_CODE_VIOLATION}' "
+    "  AND COALESCE(enrichment_data->>:key, '') <> :reason"
+)
+
+
+def mark_not_qualified_rows(db, *, job_id: str, user_id: str) -> int:
+    """Hold this job's code violations that are not qualified leads; return how many.
+
+    Runs after enrichment and the claim transfer, before the quota reservation and the
+    cap, for EVERY plan (an unlimited account is never capped but must still not receive
+    an unqualified lead). A held row carries delivery_excluded_reason = 'not_qualified',
+    which lead_actionability treats like over_quota: not listed, exported, counted,
+    billed, skip traced or pushed. The decision is frozen with the run: a sweep naming
+    the owner later does not unhold it; the next run takes the claim and delivers it.
+
+    Idempotent for a watchdog re-run: this job's previous holds are cleared first, so a
+    row the re-run enriched is decided again. A row with no address is held too (Codex
+    final pass): a sweep that later finds its address and owner must not put it in this
+    finished run either. It still reports in the no_address bucket, which the run
+    breakdown checks first, and is not counted in the return value (the run log names
+    no-address records on its own line). A held survivor's same-run siblings are held
+    with it, because lists and the batch export keep duplicates and would otherwise
+    deliver the property through a sibling. Does not commit.
+    """
+    params = {"jid": job_id, "uid": str(user_id), "key": DELIVERY_EXCLUDED_KEY,
+              "reason": NOT_QUALIFIED}
+    db.execute(sa_text(_CLEAR_HOLDS_SQL), params)
+    held = db.execute(sa_text(_HOLD_SQL), params).fetchall()
+    survivor_hashes = [row.dedup_hash for row in held if row.dedup_hash and not row.is_duplicate]
+    if survivor_hashes:
+        db.execute(sa_text(_HOLD_SIBLINGS_SQL), {**params, "hashes": survivor_hashes})
+    return sum(1 for row in held if not row.is_duplicate and row.has_address)

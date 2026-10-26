@@ -69,8 +69,11 @@ def _sql_eval(sql: str, prop, mail) -> bool:
 
 @pytest.mark.parametrize("prop, mail, expected", CASES)
 def test_sql_twin_agrees(prop, mail, expected):
-    # All three spellings agree, including whitespace-only values (Codex).
-    assert _sql_eval(actionable_sql("r"), prop, mail) is expected
+    # All three spellings agree, including whitespace-only values (Codex). The address
+    # half is checked on its own: since lead qualification (2026-10-25) the full rule
+    # also carries the qualification clause, which names the address columns again.
+    assert _sql_eval(address_actionable_sql("r"), prop, mail) is expected
+    assert address_actionable_sql("r") in actionable_sql("r")
 
 
 def test_sql_twin_is_alias_scoped_and_literal_only():

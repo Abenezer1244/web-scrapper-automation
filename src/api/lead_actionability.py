@@ -19,8 +19,9 @@ disagree about which rows are leads.
 """
 from typing import Any
 
-from sqlalchemy import and_, func, or_
+from sqlalchemy import and_, func, not_, or_
 
+from src.api.lead_qualification import is_qualified, qualified_condition, qualified_sql
 from src.db.models import Result
 
 # Older enrichment writers stored this literal instead of NULL when a parcel
@@ -47,6 +48,12 @@ ADDRESS_PLACEHOLDER = "(enrichment unavailable)"
 # project's prod on deploy. A dedicated boolean is the cleaner long-term model.
 DELIVERY_EXCLUDED_KEY = "delivery_excluded_reason"
 OVER_QUOTA = "over_quota"
+# A subject row that failed qualification when its run delivered (src/api/lead_qualification.py).
+# Frozen like over_quota: a sweep that names the owner later does not put the row in a
+# finished run's file or bill; a later run takes the claim and delivers it (owner,
+# 2026-10-25). Any other value in this key is not an exclusion.
+NOT_QUALIFIED = "not_qualified"
+EXCLUSION_REASONS = (OVER_QUOTA, NOT_QUALIFIED)
 
 
 def quota_excluded_sql(alias: str) -> str:
@@ -57,8 +64,53 @@ def quota_excluded_sql(alias: str) -> str:
     )
 
 
+def not_qualified_excluded_sql(alias: str) -> str:
+    """The row was marked not qualified at delivery. The run-count breakdown names these."""
+    return (
+        f"COALESCE({alias}.enrichment_data->>'{DELIVERY_EXCLUDED_KEY}', '') = '{NOT_QUALIFIED}'"
+    )
+
+
+def delivery_excluded_sql(alias: str) -> str:
+    """Any delivery exclusion (over quota or not qualified)."""
+    listed = ", ".join(f"'{r}'" for r in EXCLUSION_REASONS)
+    return f"COALESCE({alias}.enrichment_data->>'{DELIVERY_EXCLUDED_KEY}', '') IN ({listed})"
+
+
+def delivery_excluded_condition():
+    """ORM twin of delivery_excluded_sql."""
+    return func.coalesce(
+        Result.enrichment_data.op("->>")(DELIVERY_EXCLUDED_KEY), ""
+    ).in_(EXCLUSION_REASONS)
+
+
+def withheld_sql(alias: str) -> str:
+    """Never deliver or buy contact data for this row: excluded, or not qualified.
+
+    What anything that SPENDS money on a row (paid skip trace) checks, so a stamped code
+    violation is refused even in the window before the hold step has marked it."""
+    return f"({delivery_excluded_sql(alias)} OR NOT {qualified_sql(alias)})"
+
+
+def withheld_condition():
+    """ORM twin of withheld_sql."""
+    return or_(delivery_excluded_condition(), not_(qualified_condition()))
+
+
 def _not_quota_excluded_sql(alias: str) -> str:
-    return f"NOT ({quota_excluded_sql(alias)})"
+    return f"NOT ({delivery_excluded_sql(alias)})"
+
+
+def deliverable_before_cap_sql(alias: str) -> str:
+    """What the plan cap ranks: address AND qualified AND not marked not qualified.
+
+    Leaves the over_quota mark out on purpose (see address_actionable_sql): a re-run must
+    rank the rows it already marked, or it would renumber and mark a second batch. The
+    not_qualified mark is written before the cap ranks, from the same rule, so including
+    it changes nothing on a first pass and keeps a re-run from ranking a held row.
+    """
+    return (f"({address_actionable_sql(alias)} AND {qualified_sql(alias)} "
+            f"AND NOT ({not_qualified_excluded_sql(alias)}))")
 
 
 def address_actionable_sql(alias: str) -> str:
@@ -91,8 +143,8 @@ def actionable_condition():
     # whose comparator has no astext. On PostgreSQL this emits the same operator.
     not_excluded = func.coalesce(
         Result.enrichment_data.op("->>")(DELIVERY_EXCLUDED_KEY), ""
-    ) != OVER_QUOTA
-    return and_(has_address, not_excluded)
+    ).notin_(EXCLUSION_REASONS)
+    return and_(has_address, not_excluded, qualified_condition())
 
 
 def has_address_condition():
@@ -116,15 +168,16 @@ def has_address_condition():
 def actionable_sql(alias: str) -> str:
     """Raw-SQL twin of actionable_condition for hand-written queries. No binds:
     the only literal is the fixed placeholder constant, never user input."""
-    return f"({address_actionable_sql(alias)} AND {_not_quota_excluded_sql(alias)})"
+    return (f"({address_actionable_sql(alias)} AND {_not_quota_excluded_sql(alias)} "
+            f"AND {qualified_sql(alias)})")
 
 
 def is_actionable(row: Any) -> bool:
     """Python twin for ORM rows / ScrapedRecords / dicts (attribute or key access)."""
     enr = _field(row, "enrichment_data")
-    if isinstance(enr, dict) and enr.get(DELIVERY_EXCLUDED_KEY) == OVER_QUOTA:
+    if isinstance(enr, dict) and enr.get(DELIVERY_EXCLUDED_KEY) in EXCLUSION_REASONS:
         return False
-    return has_address(row)
+    return has_address(row) and is_qualified(row)
 
 
 def has_address(row: Any) -> bool:

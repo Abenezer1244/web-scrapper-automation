@@ -4762,7 +4762,7 @@
         "type": "object"
       },
       "RunBreakdown": {
-        "description": "What happened to every record a finished run found (src/api/run_breakdown.py).\n\nrecords_found = dropped_before_save + no_address + same_run_merged\n              + already_delivered + over_quota + new\n\nMutually exclusive, first match wins per saved row: no usable address, then\ncombined into another row of this run, then already delivered by an earlier run\nof this account, then past the plan cap; `new` is what was delivered and billed\n(equal to record_count on a snapshot). RAW: no tax cap and no view filter, so on\na tax run `already_delivered` can exceed the tab's `already_delivered_count`.",
+        "description": "What happened to every record a finished run found (src/api/run_breakdown.py).\n\nrecords_found = dropped_before_save + no_address + same_run_merged\n              + already_delivered + not_qualified + over_quota + new\n\nMutually exclusive, first match wins per saved row: no usable address, then\ncombined into another row of this run, then already delivered by an earlier run\nof this account, then held back as not qualified (a code violation without a\nconfirmed owner, parcel or mailing address; never billed), then past the plan cap; `new` is what was delivered and billed\n(equal to record_count on a snapshot). RAW: no tax cap and no view filter, so on\na tax run `already_delivered` can exceed the tab's `already_delivered_count`.",
         "properties": {
           "already_delivered": {
             "title": "Already Delivered",
@@ -4785,6 +4785,11 @@
           },
           "no_address": {
             "title": "No Address",
+            "type": "integer"
+          },
+          "not_qualified": {
+            "default": 0,
+            "title": "Not Qualified",
             "type": "integer"
           },
           "over_quota": {

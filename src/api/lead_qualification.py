@@ -205,6 +205,17 @@ def is_qualified(row: Any) -> bool:
     return not qualification_reasons(row)
 
 
+# Why a row was held, frozen by the hold step with the run (the hold itself is frozen: a sweep
+# naming the owner later does not unhold it). Live reasons can drift to [] after a sweep, so
+# the Results page reads this key to say why the run held the row.
+HOLD_KEY = "qualification_hold"
+
+
+def hold_record(row: Any) -> dict:
+    """The value the hold step freezes under HOLD_KEY for a held row."""
+    return {"reasons": qualification_reasons(row), "policy": POLICY_CODE_VIOLATION}
+
+
 def qualification_state(row: Any) -> str | None:
     """The state the API shows for a subject row; None for a row not subject to the policy.
 

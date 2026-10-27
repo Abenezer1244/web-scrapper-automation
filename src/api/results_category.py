@@ -24,9 +24,14 @@ file contains.
 from datetime import date
 from typing import Literal
 
-from sqlalchemy import and_, func, not_, or_, select
+from sqlalchemy import not_, or_, select
 
-from src.api.lead_actionability import actionable_condition, has_address_condition
+from src.api.lead_actionability import (
+    already_delivered_condition,
+    already_delivered_sql,
+    has_address_condition,
+    shown_condition,
+)
 from src.api.tax_filters import tax_cap_condition
 from src.db.models import Result
 
@@ -47,20 +52,8 @@ def no_address_condition():
     return not_(has_address_condition())
 
 
-def already_delivered_condition():
-    """Rows an earlier run of this account already holds the claim for."""
-    return and_(
-        Result.is_duplicate.is_(True),
-        func.coalesce(Result.duplicate_reason, "prior_run") == "prior_run",
-    )
-
-
-def already_delivered_sql(alias: str) -> str:
-    """``already_delivered_condition`` for raw SQL over ``results`` aliased ``alias``.
-    Kept beside the ORM form so the two spellings cannot drift. ``alias`` is always a
-    code literal, never input."""
-    return (f"({alias}.is_duplicate IS TRUE "
-            f"AND COALESCE({alias}.duplicate_reason, 'prior_run') = 'prior_run')")
+# already_delivered_condition / already_delivered_sql live in lead_actionability
+# (shown_condition needs them); routes and workers keep importing them from here.
 
 
 def skip_trace_eligible_condition():
@@ -98,14 +91,15 @@ def category_condition(category: ResultsCategory):
 def download_rows_select(job_id: str, user_id: str, today: date,
                          category: ResultsCategory = DEFAULT_RESULTS_CATEGORY):
     """The rows of one job's lead CSV before any view filter, in file order: the
-    product's standing rules (actionable, the tax-delinquency cap, the category), never
-    a user's choice. Shared by GET /jobs/{id}/download and the account data export, so
+    product's standing rules (shown, the tax-delinquency cap, the category), never
+    a user's choice. shown_condition is actionable_condition for new leads; it only lets
+    the already-delivered file keep the code violations its tab lists. Shared by GET /jobs/{id}/download and the account data export, so
     "every lead CSV you can download" is the same file in both."""
     return (
         select(Result)
         .where(
             Result.job_id == job_id, Result.user_id == user_id,
-            tax_cap_condition(today), actionable_condition(), category_condition(category),
+            tax_cap_condition(today), shown_condition(), category_condition(category),
         )
         # Groups an estate's records together; the same order the R2 export uses.
         .order_by(Result.party_name, Result.date_recorded, Result.id)

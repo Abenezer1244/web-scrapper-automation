@@ -1,5 +1,8 @@
 """Migration 106: the done-time run-count breakdown columns on `jobs`.
 
+Only 106's own six are checked here; 121 added breakdown_not_qualified
+(tests/test_lead_qualification_worker.py).
+
 Schema comes from `alembic upgrade head`. The down/up round trip runs inside ONE
 transaction that is rolled back, so the shared test database is never left without
 the columns (Postgres DDL is transactional).
@@ -36,8 +39,8 @@ def _columns(conn) -> dict[str, tuple[str, str]]:
     rows = conn.execute(text(
         "SELECT column_name, data_type, is_nullable FROM information_schema.columns "
         "WHERE table_schema = 'public' AND table_name = 'jobs' "
-        "AND column_name LIKE 'breakdown\\_%'"
-    )).all()
+        "AND column_name = ANY(:names)"
+    ), {"names": list(BREAKDOWN_COLUMNS)}).all()
     return {r.column_name: (r.data_type, r.is_nullable) for r in rows}
 
 

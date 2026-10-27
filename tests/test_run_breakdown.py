@@ -174,7 +174,7 @@ def test_owner_with_a_reconciling_partition_writes_the_six_values():
     assert cols == {
         "breakdown_dropped_before_save": 2, "breakdown_no_address": 7,
         "breakdown_same_run_merged": 0, "breakdown_already_delivered": 246,
-        "breakdown_over_quota": 0, "breakdown_new": 12,
+        "breakdown_not_qualified": 0, "breakdown_over_quota": 0, "breakdown_new": 12,
     }
     assert sum(cols.values()) == 267
 
@@ -229,7 +229,7 @@ def _stored(**over):
     base = {"records_found": 267, "record_count": 12, "billed_count": 12,
             "breakdown_dropped_before_save": 2, "breakdown_no_address": 7,
             "breakdown_same_run_merged": 0, "breakdown_already_delivered": 246,
-            "breakdown_over_quota": 0, "breakdown_new": 12}
+            "breakdown_not_qualified": 0, "breakdown_over_quota": 0, "breakdown_new": 12}
     base.update(over)
     return Job(**base)
 
@@ -238,7 +238,7 @@ def test_a_valid_snapshot_is_returned():
     got, reason = breakdown_from_job(_stored())
     assert reason is None
     assert got == {"dropped_before_save": 2, "no_address": 7, "same_run_merged": 0,
-                   "already_delivered": 246, "over_quota": 0, "new": 12}
+                   "already_delivered": 246, "not_qualified": 0, "over_quota": 0, "new": 12}
 
 
 def test_no_snapshot_is_not_an_error():
@@ -305,7 +305,7 @@ def test_completion_message_lists_only_non_zero_buckets_in_fixed_order():
     assert completion_message(12, one) == "Job complete: 12 new leads (7 without an address)"
 
     every = {"dropped_before_save": 1, "no_address": 7, "same_run_merged": 3,
-             "already_delivered": 246, "over_quota": 4, "new": 12}
+             "already_delivered": 246, "not_qualified": 0, "over_quota": 4, "new": 12}
     assert completion_message(12, every) == (
         "Job complete: 12 new leads (246 already delivered, 3 combined in this run, "
         "7 without an address, 4 over your plan limit, 1 not saved)"

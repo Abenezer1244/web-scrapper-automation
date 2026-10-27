@@ -158,10 +158,10 @@ def _publish_pause_state(*, tombstone: bool = False) -> None:
 
 def _dispatch_tick() -> dict:
     """One dispatcher tick; `dispatch_pending_skip_trace` publishes after it."""
-    from sqlalchemy import and_, func, select, text, tuple_, update
+    from sqlalchemy import and_, not_, select, text, tuple_, update
     from sqlalchemy import true as sa_true
 
-    from src.api.lead_actionability import DELIVERY_EXCLUDED_KEY, OVER_QUOTA
+    from src.api.lead_actionability import withheld_condition
     from src.api.results_category import skip_trace_eligible_condition
     from src.db.models import Job, PendingSkipTraceRow, Result
     from src.db.session import system_sync_session
@@ -415,9 +415,7 @@ def _dispatch_tick() -> dict:
                                 # Delivered now, or by an earlier run of this account:
                                 # same-run siblings and superseded rows are never bought.
                                 skip_trace_eligible_condition(),
-                                func.coalesce(
-                                    Result.enrichment_data.op("->>")(DELIVERY_EXCLUDED_KEY), ""
-                                ) != OVER_QUOTA,
+                                not_(withheld_condition()),
                                 # An ATIP-named Tacoma lead is never submitted while the
                                 # paid switch is off, whatever the sweep above did.
                                 _atip_paid_allowed_sql(),
@@ -894,7 +892,7 @@ def _cancel_undeliverable_queued(db) -> int:
     """
     from sqlalchemy import text
 
-    from src.api.lead_actionability import DELIVERY_EXCLUDED_KEY, OVER_QUOTA
+    from src.api.lead_actionability import withheld_sql
     from src.api.results_category import skip_trace_eligible_sql
     from src.scrapers.enrichment.pierce_atip_owner import OWNER_SOURCE as PIERCE_OWNER_SOURCE
     from src.workers.tasks_helpers.dedup import BILLING_STAMP_RELIABLE_SINCE
@@ -909,7 +907,7 @@ def _cancel_undeliverable_queued(db) -> int:
             f"  AND ({_job_undelivered_sql('j')} "
             f"       OR NOT {skip_trace_eligible_sql('r')} "
             "       OR r.skip_trace_status <> 'queued' "
-            "       OR COALESCE(r.enrichment_data->>:key, '') = :over_quota "
+            f"       OR {withheld_sql('r')} "
             # An ATIP-named Tacoma lead while PIERCE_CV_OWNER_SKIP_TRACE_ENABLED is
             # off: the name may be shown, not spent on. A row enqueued before the
             # switch was turned off is withdrawn here, before the submit loop that
@@ -920,8 +918,7 @@ def _cancel_undeliverable_queued(db) -> int:
             "           AND r.enrichment_data->>'owner_source' = :atip_source)) "
             "RETURNING p.result_id, p.user_id"
         ),
-        {"key": DELIVERY_EXCLUDED_KEY, "over_quota": OVER_QUOTA,
-         "since": BILLING_STAMP_RELIABLE_SINCE,
+        {"since": BILLING_STAMP_RELIABLE_SINCE,
          "atip_blocked": not settings.PIERCE_CV_OWNER_SKIP_TRACE_ENABLED,
          "atip_source": PIERCE_OWNER_SOURCE},
     ).fetchall()
@@ -1035,9 +1032,9 @@ def _settle_queued_from_known_answers(db) -> int | None:
     lock); best-effort like the cancel sweep: a failure leaves rows queued, and the hold
     in the claim path still refuses to buy an answer the cache already has.
     """
-    from sqlalchemy import func, select, text, update
+    from sqlalchemy import func, not_, select, text, update
 
-    from src.api.lead_actionability import DELIVERY_EXCLUDED_KEY, OVER_QUOTA
+    from src.api.lead_actionability import withheld_condition
     from src.api.results_category import skip_trace_eligible_condition
     from src.db.models import PendingSkipTraceRow, Result
 
@@ -1105,9 +1102,7 @@ def _settle_queued_from_known_answers(db) -> int | None:
                     Result.user_id == p.user_id,  # tenant-pinned: system session
                     Result.skip_trace_status == "queued",
                     skip_trace_eligible_condition(),
-                    func.coalesce(
-                        Result.enrichment_data.op("->>")(DELIVERY_EXCLUDED_KEY), ""
-                    ) != OVER_QUOTA,
+                    not_(withheld_condition()),
                     _atip_paid_allowed_sql(),
                 )
                 .values(**values)
@@ -1385,9 +1380,9 @@ def _partition_still_deliverable(db, rows: list) -> tuple[list, list, int]:
     """
     if not rows:
         return [], [], 0
-    from sqlalchemy import func, not_, select, tuple_
+    from sqlalchemy import not_, select, tuple_
 
-    from src.api.lead_actionability import DELIVERY_EXCLUDED_KEY, OVER_QUOTA
+    from src.api.lead_actionability import withheld_condition
     from src.api.results_category import skip_trace_eligible_condition
     from src.db.models import Job, Result
     from src.workers.tasks_helpers.dedup import BILLING_STAMP_RELIABLE_SINCE
@@ -1403,9 +1398,7 @@ def _partition_still_deliverable(db, rows: list) -> tuple[list, list, int]:
                 not_(skip_trace_eligible_condition()),
                 # Same spelling as lead_actionability.actionable_condition; a NULL
                 # blob yields NULL from ->>, which the COALESCE turns into ''.
-                func.coalesce(
-                    Result.enrichment_data.op("->>")(DELIVERY_EXCLUDED_KEY), ""
-                ) == OVER_QUOTA,
+                withheld_condition(),
                 Job.status,
                 Job.billing_applied_at.is_not(None),
                 Job.created_at >= BILLING_STAMP_RELIABLE_SINCE,

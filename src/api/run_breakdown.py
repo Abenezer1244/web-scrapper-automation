@@ -5,12 +5,15 @@ A finished run used to show numbers that disagreed (records_found 265, the worke
 point over a different set of rows. The breakdown names every record once:
 
     records_found = dropped_before_save + no_address + same_run_merged
-                  + already_delivered + over_quota + new
+                  + already_delivered + not_qualified + over_quota + new
 
 Per SAVED row of the job, first match wins (``PARTITION_CASE``):
   no_address         no usable property or mailing address, whatever else is true
   same_run_merged    combined into another row of this same run
   already_delivered  an earlier run of the account holds the claim (results_category)
+  not_qualified      not a duplicate, a code violation held back because its verified
+                     owner, parcel or mailing address could not be confirmed
+                     (src/api/lead_qualification.py); never billed
   over_quota         not a duplicate, past the plan cap
   new                not a duplicate, not over quota: EXACTLY the billing predicate
   unclassified       anything else (a 'superseded' row that has an address). Never
@@ -37,8 +40,10 @@ from sqlalchemy import text
 from src.api.lead_actionability import (
     actionable_sql,
     address_actionable_sql,
+    not_qualified_excluded_sql,
     quota_excluded_sql,
 )
+from src.api.lead_qualification import qualified_sql
 from src.api.results_category import already_delivered_sql
 
 # The customer-facing order, which is also the order of the frozen columns.
@@ -47,6 +52,7 @@ BREAKDOWN_FIELDS = (
     "no_address",
     "same_run_merged",
     "already_delivered",
+    "not_qualified",
     "over_quota",
     "new",
 )
@@ -63,6 +69,8 @@ def partition_case(alias: str) -> str:
         f" WHEN {alias}.is_duplicate IS TRUE AND {alias}.duplicate_reason = 'same_run'"
         "  THEN 'same_run_merged'"
         f" WHEN {already_delivered_sql(alias)} THEN 'already_delivered'"
+        f" WHEN {alias}.is_duplicate = false AND ({not_qualified_excluded_sql(alias)}"
+        f"  OR NOT {qualified_sql(alias)}) THEN 'not_qualified'"
         f" WHEN {alias}.is_duplicate = false AND {quota_excluded_sql(alias)}"
         "  THEN 'over_quota'"
         # `new` is the billing predicate verbatim, so a row the bill would not count
@@ -90,6 +98,7 @@ class RowPartition:
     no_address: int = 0
     same_run_merged: int = 0
     already_delivered: int = 0
+    not_qualified: int = 0
     over_quota: int = 0
     new: int = 0
     unclassified: int = 0
@@ -236,6 +245,11 @@ def breakdown_from_job(job: Any) -> tuple[dict[str, int] | None, str | None]:
     numbers that contradict each other.
     """
     stored = {f: getattr(job, col, None) for f, col in SNAPSHOT_COLUMNS.items()}
+    # not_qualified arrived after the other six (migration 121): a snapshot frozen
+    # before it has NULL there and held nothing back, so it reads as 0.
+    if stored["not_qualified"] is None and any(
+            v is not None for f, v in stored.items() if f != "not_qualified"):
+        stored["not_qualified"] = 0
     if all(v is None for v in stored.values()):
         return None, None
     if any(v is None for v in stored.values()):
@@ -284,6 +298,7 @@ _LOG_PHRASES = (
     ("already_delivered", "already delivered"),
     ("same_run_merged", "combined in this run"),
     ("no_address", "without an address"),
+    ("not_qualified", "held back without a confirmed owner"),
     ("over_quota", "over your plan limit"),
     ("dropped_before_save", "not saved"),
 )

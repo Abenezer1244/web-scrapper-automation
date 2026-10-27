@@ -1563,11 +1563,12 @@ class RunBreakdown(BaseModel):
     """What happened to every record a finished run found (src/api/run_breakdown.py).
 
     records_found = dropped_before_save + no_address + same_run_merged
-                  + already_delivered + over_quota + new
+                  + already_delivered + not_qualified + over_quota + new
 
     Mutually exclusive, first match wins per saved row: no usable address, then
     combined into another row of this run, then already delivered by an earlier run
-    of this account, then past the plan cap; `new` is what was delivered and billed
+    of this account, then held back as not qualified (a code violation without a
+    confirmed owner, parcel or mailing address; never billed), then past the plan cap; `new` is what was delivered and billed
     (equal to record_count on a snapshot). RAW: no tax cap and no view filter, so on
     a tax run `already_delivered` can exceed the tab's `already_delivered_count`.
     """
@@ -1579,6 +1580,8 @@ class RunBreakdown(BaseModel):
     no_address: int
     same_run_merged: int
     already_delivered: int
+    # 0 on every run that has no lead-qualification policy (all but code violations).
+    not_qualified: int = 0
     over_quota: int
     new: int
 

@@ -10,7 +10,7 @@ import time
 import uuid
 from collections.abc import AsyncGenerator
 from datetime import UTC, datetime, timedelta
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 
 import redis as _sync_redis
 import redis.exceptions as _redis_exceptions
@@ -43,11 +43,19 @@ from src.api.entitlements import raise_plan_features, skip_trace_violation
 from src.api.errors import no_store_errors, run_refusal_http
 from src.api.lead_actionability import (
     ADDRESS_PLACEHOLDER,
+    DELIVERY_EXCLUDED_KEY,
+    NOT_QUALIFIED,
     actionable_condition,
     has_address_condition,
     shown_condition,
 )
-from src.api.lead_qualification import is_subject, qualification_reasons, qualification_state
+from src.api.lead_qualification import (
+    HOLD_KEY,
+    POLICY_CODE_VIOLATION,
+    is_subject,
+    qualification_reasons,
+    qualification_state,
+)
 from src.api.middleware import audit_log, rate_limit, sanitize_search
 from src.api.owner_filters import build_owner_conditions
 from src.api.quota import run_eligibility
@@ -82,6 +90,7 @@ from src.api.schemas import (
     JobCreate,
     JobResponse,
     LogLine,
+    QualificationReason,
     ResultRow,
     ResultsPage,
     RunBreakdown,
@@ -681,7 +690,7 @@ async def get_results(
             for row, item in zip(rows, items, strict=True):
                 if is_subject(row.enrichment_data):
                     item.qualification_state = qualification_state(row)
-                    item.qualification_reasons = qualification_reasons(row)
+                    item.qualification_reasons = _shown_reasons(row)
         if config and is_king_tax(config.county, config.record_type):
             for item in items:
                 item.owner_name_pending = owner_name_pending(
@@ -1088,6 +1097,26 @@ async def get_results(
             breakdown=breakdown,
             breakdown_basis=breakdown_basis,
         )
+
+
+_REASON_CODES = frozenset(get_args(QualificationReason))
+
+
+def _shown_reasons(row: Result) -> list[str]:
+    """Why a code violation is not delivered. For a row this run held, the reasons the
+    hold step froze with the mark (#547): why it WAS held, even after a later sweep or
+    run changed the row. State stays live, so a row completed since reads "qualified"
+    with the reasons it was held for. Live reasons instead when there is no usable
+    record: held before #547, another policy's, or empty after dropping unknown codes
+    (Codex). Only known codes are echoed, so a malformed record can never fail the page."""
+    ed = row.enrichment_data
+    hold = ed.get(HOLD_KEY) if isinstance(ed, dict) and ed.get(DELIVERY_EXCLUDED_KEY) == NOT_QUALIFIED else None
+    if isinstance(hold, dict) and hold.get("policy") == POLICY_CODE_VIOLATION:
+        frozen = hold.get("reasons")
+        known = [r for r in frozen if isinstance(r, str) and r in _REASON_CODES] if isinstance(frozen, list) else []
+        if known:
+            return known
+    return qualification_reasons(row)
 
 
 # What an already-delivered copy may show from its original, in display order.

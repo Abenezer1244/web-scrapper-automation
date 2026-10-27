@@ -56,6 +56,25 @@ NOT_QUALIFIED = "not_qualified"
 EXCLUSION_REASONS = (OVER_QUOTA, NOT_QUALIFIED)
 
 
+def already_delivered_condition():
+    """Rows an earlier run of this account already holds the claim for (a prior-run copy).
+
+    ``duplicate_reason`` is 'prior_run', or NULL on rows classified before migration 089,
+    when losing a prior claim was the only way to be flagged. Lives here, not in
+    results_category, because shown_condition below needs it."""
+    return and_(
+        Result.is_duplicate.is_(True),
+        func.coalesce(Result.duplicate_reason, "prior_run") == "prior_run",
+    )
+
+
+def already_delivered_sql(alias: str) -> str:
+    """``already_delivered_condition`` for raw SQL over ``results`` aliased ``alias``.
+    ``alias`` is always a code literal, never input."""
+    return (f"({alias}.is_duplicate IS TRUE "
+            f"AND COALESCE({alias}.duplicate_reason, 'prior_run') = 'prior_run')")
+
+
 def quota_excluded_sql(alias: str) -> str:
     """The row was marked past the plan cap. The run-count breakdown names these;
     everything else wants the negation inside actionable_sql."""
@@ -145,6 +164,24 @@ def actionable_condition():
         Result.enrichment_data.op("->>")(DELIVERY_EXCLUDED_KEY), ""
     ).notin_(EXCLUSION_REASONS)
     return and_(has_address, not_excluded, qualified_condition())
+
+
+def shown_condition():
+    """What a run's Results view and its already-delivered counts may show: the
+    actionable rule, except that a prior-run copy is not judged by qualification.
+
+    A copy repeats a lead an earlier run delivered, and duplicate copies are never
+    enriched, so a code-violation copy has no owner of its own. Judged by the gate,
+    every already-delivered code violation vanished from that list and its count while
+    the run breakdown still said "N already delivered" (found 2026-10-27, before any
+    production run hit it). DISPLAY ONLY: claim transfer, billing, segments, dialers
+    and paid lookups keep actionable_condition, so an unqualified copy can never take a
+    claim, be delivered or be traced. For non-duplicates this IS actionable_condition."""
+    not_excluded = func.coalesce(
+        Result.enrichment_data.op("->>")(DELIVERY_EXCLUDED_KEY), ""
+    ).notin_(EXCLUSION_REASONS)
+    return and_(has_address_condition(), not_excluded,
+                or_(qualified_condition(), already_delivered_condition()))
 
 
 def has_address_condition():

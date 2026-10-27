@@ -4336,6 +4336,26 @@
             ],
             "title": "Enrichment Data"
           },
+          "filled_from_original": {
+            "anyOf": [
+              {
+                "items": {
+                  "enum": [
+                    "party_name",
+                    "parcel_id",
+                    "property_address",
+                    "mailing_address"
+                  ],
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Filled From Original"
+          },
           "freshness_days": {
             "anyOf": [
               {
@@ -4551,6 +4571,47 @@
             ],
             "title": "Property State"
           },
+          "qualification_reasons": {
+            "anyOf": [
+              {
+                "items": {
+                  "enum": [
+                    "missing_owner",
+                    "owner_conflict",
+                    "parcel_unresolved",
+                    "address_ambiguous",
+                    "missing_property_address",
+                    "mailing_unresolved",
+                    "invalid_case_data",
+                    "unsupported_source"
+                  ],
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Qualification Reasons"
+          },
+          "qualification_state": {
+            "anyOf": [
+              {
+                "enum": [
+                  "qualified",
+                  "enrichment_pending",
+                  "needs_review",
+                  "not_qualified"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Qualification State"
+          },
           "skip_trace_attempted_at": {
             "anyOf": [
               {
@@ -4698,6 +4759,11 @@
           "no_address_count": {
             "default": 0,
             "title": "No Address Count",
+            "type": "integer"
+          },
+          "not_qualified_count": {
+            "default": 0,
+            "title": "Not Qualified Count",
             "type": "integer"
           },
           "page": {
@@ -10032,7 +10098,8 @@
               "enum": [
                 "new",
                 "already_delivered",
-                "no_address"
+                "no_address",
+                "not_qualified"
               ],
               "title": "Category",
               "type": "string"

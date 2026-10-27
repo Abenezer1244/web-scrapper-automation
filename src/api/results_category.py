@@ -26,7 +26,14 @@ from typing import Literal
 
 from sqlalchemy import and_, func, not_, or_, select
 
-from src.api.lead_actionability import actionable_condition, has_address_condition
+from src.api.lead_actionability import (
+    DELIVERY_EXCLUDED_KEY,
+    NOT_QUALIFIED,
+    already_delivered_condition,
+    already_delivered_sql,
+    has_address_condition,
+    shown_condition,
+)
 from src.api.tax_filters import tax_cap_condition
 from src.db.models import Result
 
@@ -35,9 +42,10 @@ DEFAULT_RESULTS_CATEGORY: ResultsCategory = "new"
 
 # What the Results LIST may page through: the two lead categories, plus the rows
 # the run-count breakdown names "no_address" (no usable property AND no mailing
-# address). Those are not leads, so they exist only here, to be looked at: the CSV,
-# the export URL and contact lookups keep validating ResultsCategory and refuse it.
-ResultsListCategory = Literal["new", "already_delivered", "no_address"]
+# address) and "not_qualified" (code violations held back by src/api/lead_qualification.py).
+# Those are not leads, so they exist only here, to be looked at: the CSV, the export URL
+# and contact lookups keep validating ResultsCategory and refuse them.
+ResultsListCategory = Literal["new", "already_delivered", "no_address", "not_qualified"]
 
 
 def no_address_condition():
@@ -47,20 +55,36 @@ def no_address_condition():
     return not_(has_address_condition())
 
 
-def already_delivered_condition():
-    """Rows an earlier run of this account already holds the claim for."""
+# already_delivered_condition / already_delivered_sql live in lead_actionability
+# (shown_condition needs them); routes and workers keep importing them from here.
+
+
+def not_qualified_condition():
+    """The rows this run held back as not qualified when it delivered.
+
+    Keyed on the hold MARK, not on is_duplicate: the mark is written once, before
+    billing, and nothing clears it, so the list keeps naming what the run held back.
+    A later run that takes the claim and delivers the lead turns the held row into a
+    'superseded' duplicate (dedup.transfer_undelivered_claims keeps the mark); it stays
+    listed here and its duplicate_source_job_id names that later run. Same-run siblings
+    carry the mark too but are another filing of a listed row, so they stay out, as in
+    the run breakdown. A held row with no address is in the no_address list instead.
+    Only meaningful once the run delivered (the route gates every list on that)."""
     return and_(
-        Result.is_duplicate.is_(True),
-        func.coalesce(Result.duplicate_reason, "prior_run") == "prior_run",
+        has_address_condition(),
+        func.coalesce(Result.enrichment_data.op("->>")(DELIVERY_EXCLUDED_KEY), "") == NOT_QUALIFIED,
+        or_(Result.is_duplicate.is_(False), Result.duplicate_reason == "superseded"),
     )
 
 
-def already_delivered_sql(alias: str) -> str:
-    """``already_delivered_condition`` for raw SQL over ``results`` aliased ``alias``.
-    Kept beside the ORM form so the two spellings cannot drift. ``alias`` is always a
-    code literal, never input."""
-    return (f"({alias}.is_duplicate IS TRUE "
-            f"AND COALESCE({alias}.duplicate_reason, 'prior_run') = 'prior_run')")
+def list_condition(category: ResultsListCategory):
+    """The row predicate for one Results LIST category: the two lead categories plus the
+    two look-only ones. Their tab counts use this same predicate."""
+    if category == "no_address":
+        return no_address_condition()
+    if category == "not_qualified":
+        return not_qualified_condition()
+    return category_condition(category)
 
 
 def skip_trace_eligible_condition():
@@ -98,14 +122,15 @@ def category_condition(category: ResultsCategory):
 def download_rows_select(job_id: str, user_id: str, today: date,
                          category: ResultsCategory = DEFAULT_RESULTS_CATEGORY):
     """The rows of one job's lead CSV before any view filter, in file order: the
-    product's standing rules (actionable, the tax-delinquency cap, the category), never
-    a user's choice. Shared by GET /jobs/{id}/download and the account data export, so
+    product's standing rules (shown, the tax-delinquency cap, the category), never
+    a user's choice. shown_condition is actionable_condition for new leads; it only lets
+    the already-delivered file keep the code violations its tab lists. Shared by GET /jobs/{id}/download and the account data export, so
     "every lead CSV you can download" is the same file in both."""
     return (
         select(Result)
         .where(
             Result.job_id == job_id, Result.user_id == user_id,
-            tax_cap_condition(today), actionable_condition(), category_condition(category),
+            tax_cap_condition(today), shown_condition(), category_condition(category),
         )
         # Groups an estate's records together; the same order the R2 export uses.
         .order_by(Result.party_name, Result.date_recorded, Result.id)

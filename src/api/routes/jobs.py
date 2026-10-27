@@ -10,7 +10,7 @@ import time
 import uuid
 from collections.abc import AsyncGenerator
 from datetime import UTC, datetime, timedelta
-from typing import Literal
+from typing import Any, Literal
 
 import redis as _sync_redis
 import redis.exceptions as _redis_exceptions
@@ -41,7 +41,13 @@ from src.api.deps import get_db, get_rls_db
 from src.api.dialer_filters import dialer_ready_conditions
 from src.api.entitlements import raise_plan_features, skip_trace_violation
 from src.api.errors import no_store_errors, run_refusal_http
-from src.api.lead_actionability import actionable_condition, has_address_condition
+from src.api.lead_actionability import (
+    ADDRESS_PLACEHOLDER,
+    actionable_condition,
+    has_address_condition,
+    shown_condition,
+)
+from src.api.lead_qualification import is_subject, qualification_reasons, qualification_state
 from src.api.middleware import audit_log, rate_limit, sanitize_search
 from src.api.owner_filters import build_owner_conditions
 from src.api.quota import run_eligibility
@@ -50,9 +56,8 @@ from src.api.results_category import (
     ResultsCategory,
     ResultsListCategory,
     already_delivered_condition,
-    category_condition,
     download_rows_select,
-    no_address_condition,
+    list_condition,
 )
 from src.api.results_sort import DEFAULT_RESULTS_SORT, ResultsSort, results_order_by
 from src.api.routes.auth_helpers.registration import _integrity_error_fields
@@ -601,7 +606,7 @@ async def get_results(
         base_query = select(Result).where(
             Result.job_id == job_id,
             Result.user_id == current_user.id,
-            no_address_condition() if category == "no_address" else category_condition(category),
+            list_condition(category),
         )
         if not _run_delivered(job):
             # N-03: rows exist from `saving` on, but the quota reservation marks the
@@ -639,9 +644,9 @@ async def get_results(
         # Standing product rule (owner, 2026-09-02): a row with no property AND no
         # mailing address is not a lead — not listed, exported, counted or billed.
         # Kept in `results` for dedup/health only. See src/api/lead_actionability.py.
-        # The no_address list is, by definition, the rows this rule excludes.
-        if category != "no_address":
-            base_query = base_query.where(actionable_condition())
+        # The no_address and not_qualified lists are, by definition, rows this rule excludes.
+        if category not in ("no_address", "not_qualified"):
+            base_query = base_query.where(shown_condition())
 
         # Tier 0 (057): owner-location filters (absentee / out-of-state). Same view
         # semantics as the tax filters — narrows total + items, leaves scrape stats.
@@ -667,13 +672,26 @@ async def get_results(
             .offset((page - 1) * page_size)
             .limit(page_size)
         )
-        items = [ResultRow.model_validate(r) for r in rows_result.scalars().all()]
+        rows = rows_result.scalars().all()
+        items = [ResultRow.model_validate(r) for r in rows]
+        # Why a code violation was or was not delivered, read off the row as it is now.
+        # Not on already-delivered copies: they were never enriched, so their reasons
+        # would describe the copy rather than the lead the earlier run delivered.
+        if category in ("new", "not_qualified"):
+            for row, item in zip(rows, items, strict=True):
+                if is_subject(row.enrichment_data):
+                    item.qualification_state = qualification_state(row)
+                    item.qualification_reasons = qualification_reasons(row)
         if config and is_king_tax(config.county, config.record_type):
             for item in items:
                 item.owner_name_pending = owner_name_pending(
                     item.party_name, item.parcel_id, item.enrichment_data)
-        if category == "already_delivered" and items:
-            await _attach_delivery_provenance(db, current_user.id, items, today)
+        # A held row a later run delivered is a 'superseded' duplicate naming that run;
+        # the same checks decide whether its link may be shown.
+        if category in ("already_delivered", "not_qualified") and items:
+            await _attach_delivery_provenance(
+                db, current_user.id, items, today,
+                fill_from_original=category == "already_delivered")
 
         # Count enriched records (have real property_address), excluding duplicates
         enriched_result = await db.execute(
@@ -797,7 +815,10 @@ async def get_results(
             ).where(
                 Result.job_id == job_id,
                 Result.user_id == current_user.id,
-                actionable_condition(),
+                # shown, not actionable: the already-delivered numbers count what the
+                # list shows. new_leads (a billing mirror) is non-duplicates, where the
+                # two are the same rule.
+                shown_condition(),
                 func.coalesce(Result.duplicate_reason, "") != "superseded",
             )
         )).one()
@@ -809,14 +830,16 @@ async def get_results(
         # The no_address tab number: the list's own predicate before view filters,
         # tax cap included like already_delivered_count. Its own statement because
         # counts_row is scoped to actionable rows, which this set never is (Codex P1).
-        no_address_count = (await db.execute(
-            select(func.count()).where(
+        no_address_count, not_qualified_count = (await db.execute(
+            select(
+                func.count().filter(list_condition("no_address")),
+                func.count().filter(list_condition("not_qualified")),
+            ).where(
                 Result.job_id == job_id,
                 Result.user_id == current_user.id,
-                no_address_condition(),
                 tax_cap_condition(today),
             )
-        )).scalar_one()
+        )).one()
         delivered_buckets = {
             bucket: getattr(counts_row, f"delivered_{bucket}") for bucket, _ in _CONTACT_BUCKETS
         }
@@ -848,7 +871,7 @@ async def get_results(
                 Result.job_id == job_id,
                 Result.user_id == current_user.id,
                 Result.is_duplicate.is_(True),
-                actionable_condition(),
+                shown_condition(),
                 # The same buckets as the counts above: only prior deliveries.
                 func.coalesce(Result.duplicate_reason, "prior_run") == "prior_run",
             )
@@ -1058,6 +1081,7 @@ async def get_results(
             same_run_duplicate_count=same_run_duplicate_count,
             already_delivered_count=already_delivered_count,
             no_address_count=no_address_count,
+            not_qualified_count=not_qualified_count,
             already_delivered_contacts=already_delivered_contacts,
             has_auction_data=has_auction_data,
             auction_coverage=auction_coverage,
@@ -1066,8 +1090,17 @@ async def get_results(
         )
 
 
+# What an already-delivered copy may show from its original, in display order.
+_ORIGINAL_FIELDS = ("party_name", "parcel_id", "property_address", "mailing_address")
+
+
+def _blank(value: str | None) -> bool:
+    return value is None or not value.strip() or value.strip() == ADDRESS_PLACEHOLDER
+
+
 async def _attach_delivery_provenance(
-    db: AsyncSession, user_id: str, items: list[ResultRow], today
+    db: AsyncSession, user_id: str, items: list[ResultRow], today,
+    *, fill_from_original: bool = False,
 ) -> None:
     """Say, per already-delivered row on THIS page, what can be checked about it.
 
@@ -1082,6 +1115,12 @@ async def _attach_delivery_provenance(
     Both are scoped to `user_id` explicitly as well as by RLS, so a source id that
     somehow named another account's run reads as unavailable and never confirms
     that run exists.
+
+    fill_from_original (the already-delivered list): a duplicate copy is never
+    enriched, so it reads blank where the lead it repeats was named. Each blank field
+    in _ORIGINAL_FIELDS is shown from that visible original, never over a value the
+    copy has, and only on the response: the row and its CSV are untouched. One
+    original per (run, key), the lowest id, so fields never mix across rows.
     """
     source_ids = {r.duplicate_source_job_id for r in items if r.duplicate_source_job_id}
     available: set[str] = set()
@@ -1097,6 +1136,7 @@ async def _attach_delivery_provenance(
 
     hashes: dict[str, str | None] = {}
     visible: set[tuple[str, str]] = set()
+    original_rows: dict[tuple[str, str], Any] = {}
     if available:
         # dedup_hash is not on ResultRow (an internal key), so read it for the
         # page's ids in the same round trip as the originals it is matched against.
@@ -1110,16 +1150,20 @@ async def _attach_delivery_provenance(
         wanted = {h for h in hashes.values() if h}
         if wanted:
             originals = await db.execute(
-                select(Result.job_id, Result.dedup_hash).where(
+                select(Result.job_id, Result.dedup_hash,
+                       *(getattr(Result, f) for f in _ORIGINAL_FIELDS)).where(
                     Result.user_id == user_id,
                     Result.job_id.in_(available),
                     Result.dedup_hash.in_(wanted),
                     Result.is_duplicate.is_(False),
                     actionable_condition(),
                     tax_cap_condition(today),
-                ).distinct()
+                ).order_by(Result.id)
             )
-            visible = {(str(o.job_id), o.dedup_hash) for o in originals}
+            for o in originals:
+                # The first (lowest id) original per run and key wins.
+                original_rows.setdefault((str(o.job_id), o.dedup_hash), o)
+            visible = set(original_rows)
 
     for r in items:
         src = r.duplicate_source_job_id
@@ -1127,6 +1171,13 @@ async def _attach_delivery_provenance(
         r.duplicate_original_visible = bool(
             src and src in available and (src, hashes.get(r.id)) in visible
         )
+        if fill_from_original and r.duplicate_original_visible:
+            original = original_rows[(src, hashes.get(r.id))]
+            filled = [f for f in _ORIGINAL_FIELDS
+                      if _blank(getattr(r, f)) and not _blank(getattr(original, f))]
+            for f in filled:
+                setattr(r, f, getattr(original, f))
+            r.filled_from_original = filled or None
         # Echo a run id only when this account can open it. A purged run's id is
         # useless to the page, and an id that ever named another account's run
         # (0 in production, 2026-09-17) must not be handed back at all. The claim

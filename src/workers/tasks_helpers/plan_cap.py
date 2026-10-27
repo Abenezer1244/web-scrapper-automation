@@ -3,6 +3,8 @@
 Lives outside tasks.py so the tests run the statement the job runs, not a copy.
 """
 
+import json
+
 from sqlalchemy import text as sa_text
 
 from src.api.lead_actionability import (
@@ -12,7 +14,13 @@ from src.api.lead_actionability import (
     address_actionable_sql,
     deliverable_before_cap_sql,
 )
-from src.api.lead_qualification import POLICY_CODE_VIOLATION, POLICY_KEY, qualified_sql
+from src.api.lead_qualification import (
+    HOLD_KEY,
+    POLICY_CODE_VIOLATION,
+    POLICY_KEY,
+    hold_record,
+    qualified_sql,
+)
 from src.scrapers.king_cv_sources import settled_sql
 
 # Every record type without its own order below ranks by who and when, which also keeps
@@ -96,7 +104,8 @@ def mark_over_quota_rows(db, *, job_id: str, user_id: str, remaining: int,
 _ED_OBJECT = ("(CASE WHEN jsonb_typeof(COALESCE(enrichment_data, '{}')::jsonb) = 'object' "
               "THEN COALESCE(enrichment_data, '{}')::jsonb ELSE '{}'::jsonb END)")
 _CLEAR_HOLDS_SQL = (  # splices only module constants; every value is bound
-    f"UPDATE results SET enrichment_data = ({_ED_OBJECT} - :key)::json "  # noqa: S608
+    # The frozen reasons go with the mark, so a re-run that qualifies the row leaves neither.
+    f"UPDATE results SET enrichment_data = ({_ED_OBJECT} - :key - '{HOLD_KEY}')::json "  # noqa: S608
     "WHERE job_id = :jid AND user_id = CAST(:uid AS uuid) "
     "  AND enrichment_data->>:key = :reason"
 )
@@ -105,7 +114,14 @@ _HOLD_SQL = (  # splices only module constants; every value is bound
     "WHERE job_id = :jid AND user_id = CAST(:uid AS uuid) "
     "  AND (is_duplicate = false OR duplicate_reason = 'same_run') "
     f"  AND NOT {qualified_sql('results')} "
-    f"RETURNING id, dedup_hash, is_duplicate, {address_actionable_sql('results')} AS has_address"
+    f"RETURNING id, dedup_hash, is_duplicate, {address_actionable_sql('results')} AS has_address, "
+    # The columns qualification_reasons reads, so the reasons are frozen from this row as held.
+    "  party_name, parcel_id, property_address, mailing_address, date_recorded, enrichment_data"
+)
+_FREEZE_REASONS_SQL = (  # splices only module constants; every value is bound
+    f"UPDATE results SET enrichment_data = ({_ED_OBJECT} || jsonb_build_object('{HOLD_KEY}', v.hold))::json "  # noqa: S608
+    "FROM jsonb_to_recordset(CAST(:payload AS jsonb)) AS v(id uuid, hold jsonb) "
+    "WHERE results.id = v.id AND results.job_id = :jid AND results.user_id = CAST(:uid AS uuid)"
 )
 _HOLD_SIBLINGS_SQL = (  # splices only module constants; every value is bound
     f"UPDATE results SET enrichment_data = ({_ED_OBJECT} || jsonb_build_object(CAST(:key AS text), CAST(:reason AS text)))::json "  # noqa: S608
@@ -140,6 +156,12 @@ def mark_not_qualified_rows(db, *, job_id: str, user_id: str) -> int:
               "reason": NOT_QUALIFIED}
     db.execute(sa_text(_CLEAR_HOLDS_SQL), params)
     held = db.execute(sa_text(_HOLD_SQL), params).fetchall()
+    # Freeze WHY with the hold: a sweep may complete the row later, and the Results page
+    # must still say why this run held it. One statement for the run; same-run siblings
+    # are never listed on their own, so they carry only the mark.
+    frozen = [{"id": str(row.id), "hold": hold_record(row)} for row in held if not row.is_duplicate]
+    if frozen:
+        db.execute(sa_text(_FREEZE_REASONS_SQL), {**params, "payload": json.dumps(frozen)})
     survivor_hashes = [row.dedup_hash for row in held if row.dedup_hash and not row.is_duplicate]
     if survivor_hashes:
         db.execute(sa_text(_HOLD_SIBLINGS_SQL), {**params, "hashes": survivor_hashes})

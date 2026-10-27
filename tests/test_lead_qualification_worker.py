@@ -26,9 +26,14 @@ from src.api.lead_actionability import (
     withheld_sql,
 )
 from src.api.lead_qualification import (
+    HOLD_KEY,
+    MAILING_UNRESOLVED,
+    MISSING_OWNER,
+    OWNER_CONFLICT,
     POLICY_CODE_VIOLATION,
     POLICY_KEY,
     is_qualified,
+    qualification_reasons,
     qualified_sql,
 )
 from src.api.run_breakdown import read_partition
@@ -206,6 +211,82 @@ async def test_held_survivor_holds_its_same_run_siblings(db, business_user):
     assert await _reason(db, sibling) == NOT_QUALIFIED
 
 
+async def _frozen(db, rid):
+    return (await db.execute(text(
+        "SELECT enrichment_data->:k FROM results WHERE id = :i"), {"k": HOLD_KEY, "i": rid})).scalar()
+
+
+@pytest.mark.asyncio
+async def test_hold_freezes_why_and_a_later_sweep_does_not_change_it(db, business_user):
+    cfg = await _config(db, business_user)
+    job_id = await _job(db, business_user, cfg)
+    good = await _row(db, job_id, business_user.id, seattle())
+    no_owner_no_mail = seattle(party_name=None, mailing_address=None,
+                               ed={"owner_source": None, "owner_pin": None})
+    rid = await _row(db, job_id, business_user.id, no_owner_no_mail)
+    conflict_spec = seattle(ed={"owner_pin": "9999999999"})
+    conflict = await _row(db, job_id, business_user.id, conflict_spec)
+    assert await _hold(db, job_id, business_user.id) == 2
+
+    expected = qualification_reasons(no_owner_no_mail)
+    assert set(expected) >= {MISSING_OWNER, MAILING_UNRESOLVED}  # the fixture means what it says
+    assert await _frozen(db, rid) == {"reasons": expected, "policy": POLICY_CODE_VIOLATION}
+    assert (await _frozen(db, conflict))["reasons"] == [OWNER_CONFLICT]
+    assert await _frozen(db, good) is None
+
+    # The cv sweep names the owner and mailing after the run: the hold and its frozen
+    # reasons stand, while live reasons are now empty.
+    row = await db.get(Result, rid)
+    row.party_name, row.mailing_address = "HARTLEY MARGARET A", "PO BOX 1, SEATTLE, WA 98101"
+    row.enrichment_data = {**row.enrichment_data, "owner_source": "king_erealproperty",
+                           "owner_pin": "1234567890"}
+    await db.commit()
+    await db.refresh(row)
+    assert qualification_reasons(row) == []
+    assert await _reason(db, rid) == NOT_QUALIFIED
+    assert (await _frozen(db, rid))["reasons"] == expected
+
+
+@pytest.mark.asyncio
+async def test_rerun_that_qualifies_a_row_clears_its_frozen_reasons(db, business_user):
+    cfg = await _config(db, business_user)
+    job_id = await _job(db, business_user, cfg)
+    rid = await _row(db, job_id, business_user.id, seattle(mailing_address=None))
+    assert await _hold(db, job_id, business_user.id) == 1
+    assert (await _frozen(db, rid))["reasons"] == [MAILING_UNRESOLVED]
+    row = await db.get(Result, rid)
+    row.mailing_address = "PO BOX 1, SEATTLE, WA 98101"
+    await db.commit()
+    assert await _hold(db, job_id, business_user.id) == 0
+    assert await _reason(db, rid) is None
+    assert await _frozen(db, rid) is None
+    # A re-run where the row is still held re-freezes the reasons it is held for NOW.
+    row.mailing_address, row.party_name = None, None
+    await db.commit()
+    assert await _hold(db, job_id, business_user.id) == 1
+    assert set((await _frozen(db, rid))["reasons"]) == {MISSING_OWNER, MAILING_UNRESOLVED}
+    row.mailing_address, row.party_name = "PO BOX 1, SEATTLE, WA 98101", seattle()["party_name"]
+    await db.commit()
+    assert await _hold(db, job_id, business_user.id) == 0
+    # Other enrichment keys survive the clear.
+    assert (await db.execute(text("SELECT enrichment_data->>:k FROM results WHERE id = :i"),
+                             {"k": POLICY_KEY, "i": rid})).scalar() == POLICY_CODE_VIOLATION
+
+
+@pytest.mark.asyncio
+async def test_a_held_survivors_siblings_carry_no_frozen_reasons(db, business_user):
+    cfg = await _config(db, business_user)
+    job_id = await _job(db, business_user, cfg)
+    h = uuid.uuid4().hex
+    survivor = await _row(db, job_id, business_user.id, seattle(mailing_address=None), dedup_hash=h)
+    sibling = await _row(db, job_id, business_user.id, seattle(mailing_address=None), dedup_hash=h,
+                         is_duplicate=True, duplicate_reason="same_run")
+    assert await _hold(db, job_id, business_user.id) == 1
+    assert await _frozen(db, survivor) is not None
+    assert await _reason(db, sibling) == NOT_QUALIFIED
+    assert await _frozen(db, sibling) is None
+
+
 @pytest.mark.asyncio
 async def test_sibling_hold_skips_an_unstamped_sibling(db, business_user):
     # A watchdog re-run of a job started before the stamp shipped mixes both kinds.
@@ -233,6 +314,7 @@ async def test_hold_never_touches_another_account(db, business_user, starter_use
         s, job_id=job_b, user_id=str(business_user.id))) == 0
     assert await _hold(db, job_a, business_user.id) == 0
     assert await _reason(db, theirs) is None
+    assert await _frozen(db, theirs) is None
 
 
 # ── quota: never spent on a held row, never charged for one ──────────────────

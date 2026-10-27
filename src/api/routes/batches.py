@@ -35,7 +35,7 @@ from src.api.entitlements import (
     skip_trace_violation,
 )
 from src.api.errors import no_store_errors, run_refusal_http
-from src.api.lead_actionability import actionable_condition
+from src.api.lead_actionability import actionable_condition, shown_condition
 from src.api.middleware.rate_limit import rate_limit
 from src.api.results_category import already_delivered_condition
 from src.api.schemas import (
@@ -793,7 +793,9 @@ async def get_batch(
                 .where(
                     Result.user_id == current_user.id,
                     Result.job_id.in_(run.child_job_ids),
-                    actionable_condition(),
+                    # The child pages' rule (new is non-duplicates, where it equals
+                    # actionable), so this already-delivered count matches theirs.
+                    shown_condition(),
                     tax_cap_condition(datetime.now(UTC).date()),
                 )
                 .group_by(Result.job_id)

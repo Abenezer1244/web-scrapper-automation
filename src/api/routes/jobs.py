@@ -41,7 +41,11 @@ from src.api.deps import get_db, get_rls_db
 from src.api.dialer_filters import dialer_ready_conditions
 from src.api.entitlements import raise_plan_features, skip_trace_violation
 from src.api.errors import no_store_errors, run_refusal_http
-from src.api.lead_actionability import actionable_condition, has_address_condition
+from src.api.lead_actionability import (
+    actionable_condition,
+    has_address_condition,
+    shown_condition,
+)
 from src.api.middleware import audit_log, rate_limit, sanitize_search
 from src.api.owner_filters import build_owner_conditions
 from src.api.quota import run_eligibility
@@ -641,7 +645,7 @@ async def get_results(
         # Kept in `results` for dedup/health only. See src/api/lead_actionability.py.
         # The no_address list is, by definition, the rows this rule excludes.
         if category != "no_address":
-            base_query = base_query.where(actionable_condition())
+            base_query = base_query.where(shown_condition())
 
         # Tier 0 (057): owner-location filters (absentee / out-of-state). Same view
         # semantics as the tax filters — narrows total + items, leaves scrape stats.
@@ -797,7 +801,10 @@ async def get_results(
             ).where(
                 Result.job_id == job_id,
                 Result.user_id == current_user.id,
-                actionable_condition(),
+                # shown, not actionable: the already-delivered numbers count what the
+                # list shows. new_leads (a billing mirror) is non-duplicates, where the
+                # two are the same rule.
+                shown_condition(),
                 func.coalesce(Result.duplicate_reason, "") != "superseded",
             )
         )).one()
@@ -848,7 +855,7 @@ async def get_results(
                 Result.job_id == job_id,
                 Result.user_id == current_user.id,
                 Result.is_duplicate.is_(True),
-                actionable_condition(),
+                shown_condition(),
                 # The same buckets as the counts above: only prior deliveries.
                 func.coalesce(Result.duplicate_reason, "prior_run") == "prior_run",
             )

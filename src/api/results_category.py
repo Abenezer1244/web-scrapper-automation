@@ -24,9 +24,11 @@ file contains.
 from datetime import date
 from typing import Literal
 
-from sqlalchemy import not_, or_, select
+from sqlalchemy import and_, func, not_, or_, select
 
 from src.api.lead_actionability import (
+    DELIVERY_EXCLUDED_KEY,
+    NOT_QUALIFIED,
     already_delivered_condition,
     already_delivered_sql,
     has_address_condition,
@@ -40,9 +42,10 @@ DEFAULT_RESULTS_CATEGORY: ResultsCategory = "new"
 
 # What the Results LIST may page through: the two lead categories, plus the rows
 # the run-count breakdown names "no_address" (no usable property AND no mailing
-# address). Those are not leads, so they exist only here, to be looked at: the CSV,
-# the export URL and contact lookups keep validating ResultsCategory and refuse it.
-ResultsListCategory = Literal["new", "already_delivered", "no_address"]
+# address) and "not_qualified" (code violations held back by src/api/lead_qualification.py).
+# Those are not leads, so they exist only here, to be looked at: the CSV, the export URL
+# and contact lookups keep validating ResultsCategory and refuse them.
+ResultsListCategory = Literal["new", "already_delivered", "no_address", "not_qualified"]
 
 
 def no_address_condition():
@@ -54,6 +57,34 @@ def no_address_condition():
 
 # already_delivered_condition / already_delivered_sql live in lead_actionability
 # (shown_condition needs them); routes and workers keep importing them from here.
+
+
+def not_qualified_condition():
+    """The rows this run held back as not qualified when it delivered.
+
+    Keyed on the hold MARK, not on is_duplicate: the mark is written once, before
+    billing, and nothing clears it, so the list keeps naming what the run held back.
+    A later run that takes the claim and delivers the lead turns the held row into a
+    'superseded' duplicate (dedup.transfer_undelivered_claims keeps the mark); it stays
+    listed here and its duplicate_source_job_id names that later run. Same-run siblings
+    carry the mark too but are another filing of a listed row, so they stay out, as in
+    the run breakdown. A held row with no address is in the no_address list instead.
+    Only meaningful once the run delivered (the route gates every list on that)."""
+    return and_(
+        has_address_condition(),
+        func.coalesce(Result.enrichment_data.op("->>")(DELIVERY_EXCLUDED_KEY), "") == NOT_QUALIFIED,
+        or_(Result.is_duplicate.is_(False), Result.duplicate_reason == "superseded"),
+    )
+
+
+def list_condition(category: ResultsListCategory):
+    """The row predicate for one Results LIST category: the two lead categories plus the
+    two look-only ones. Their tab counts use this same predicate."""
+    if category == "no_address":
+        return no_address_condition()
+    if category == "not_qualified":
+        return not_qualified_condition()
+    return category_condition(category)
 
 
 def skip_trace_eligible_condition():

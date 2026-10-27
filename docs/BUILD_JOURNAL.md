@@ -19,6 +19,42 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-10-27 — Results: no stranded summary card, Held back icon, phone tabs, API types (FE #289)
+
+**Built / Shipped:** FE #289 squash-merged as `f51a200`; Vercel Production reported success for that SHA.
+Frontend only. `lib/summary-card-layout.ts` (node tests) fixes the card columns per breakpoint and per count,
+and the total card (explicit `total` flag from both card builders) takes a whole row where that evens the rest:
+5 to 8 cards never leave one alone (7: 1+3+3 on a tablet, 4+3 from 1280px, one row from 1700px; 8: 4+4). Held
+back (#288) gets `ShieldAlert`. Tabs: "Delivered" on phones with the full accessible name kept, so the Results
+tabs fit 375px; an overflowing strip (a batch's five tabs) fades its hiding edge, and the selected tab is kept
+in view by the strip's own scroll, also after a resize. `lib/api-types.generated.ts` regenerated from backend
+`main` (RunBreakdown.not_qualified, BE #542) and #288's hand-written bridge type removed.
+
+**Tried / Decided:** Codex plan consult rejected the auto-fit grid (it cannot guarantee a split), position as
+"the total", interpolated Tailwind classes and `scrollIntoView` (it also scrolls the page); all adopted. Seven
+in one row waits until 1700px: at 1536 a card left a label ~80px. A ninth card type would lay out 4+4+1; the
+module says where to add its rule (eight is the most today).
+
+**Failed / Blocked:** the first merge attempt was refused by the auto-mode classifier as a production deploy;
+merged on the owner's explicit "ship them". No live logged-in look at #289 yet (needs the owner's login).
+
+**Caught & fixed:** Tailwind v4 emits an arbitrary `min-[1400px]` rule BEFORE the named `xl` rules, so
+`xl:hidden min-[1400px]:inline-flex` hid the card icons at every width from 1280px (shipped that way in #287 and
+very likely live until #289). And v4 `max-[1699px]` means width < 1699, so exactly 1699 matched no range and
+seven cards fell to two columns. Both found by reading computed style at boundary widths, not by screenshots;
+every range is now non-overlapping. CI's API-contract check failed every FE PR after BE #542 landed; fixed by
+the regeneration, the same steps CI runs. Codex diff review GATE PASS; its P2 (re-reveal the selected tab after
+a resize) and the ResizeObserver guard adopted; a generated-CSS test declined (no CSS test tooling; the browser
+suite tests the real cascade).
+
+**Pending / Handoff:** live look at #289 on a wide screen (card icons back, the Held back shield). 5 cards on a
+tablet read 3+2 and 8 read 3+3+2: short last rows, nobody alone.
+
+**Facts learned:** where a named and an arbitrary breakpoint set the same property, make the ranges disjoint
+(`sm:max-xl`, `xl:max-[1700px]`, `min-[1700px]`) and check computed style at 1279/1280, 1399/1400, 1699/1700.
+Inside a flex parent a computed `inline-flex` reads `flex`. A backend schema change breaks every frontend PR's
+contract check until someone regenerates `lib/api-types.generated.ts`.
+
 ## 2026-10-25/26 — Results: Run breakdown tab removed, cards readable, auction line compact (FE #287)
 
 **Built / Shipped:** FE #287 squash-merged as `aec06a4`; Vercel Production deployment for that SHA reported

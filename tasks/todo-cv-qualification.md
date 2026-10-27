@@ -79,3 +79,67 @@ Branch `fix/code-violation-lead-qualification`, worktree `C:/Users/Windows/bl-wt
   Playwright Chromium at 1440 and 390 on a stub API: "Held back 124", "5,455 found", no overflow, no em dash.
 - Codex: BE r7 GATE PASS, FE GATE PASS.
 - Not done: commit/push/PR (awaiting owner), Phase 2, Phase 3.
+
+## Phase 2 plan (2026-10-27, Codex consult pending)
+Goal: the user can SEE the held-back rows and why, and Already Delivered shows the delivered original's data
+instead of the unenriched duplicate copy. Read-only everywhere: nothing bills, claims, quotas or skip-traces.
+
+### 2a BE: `?category=not_qualified` list + reasons (<= 5 files)
+- results_category.py: `not_qualified_list_condition()` = the breakdown CASE's not_qualified branch verbatim
+  (address-actionable AND NOT duplicate AND (marked not_qualified OR NOT qualified)), ORM form built from the
+  same helpers, so tab count == breakdown.not_qualified. ResultsListCategory gains "not_qualified"; the CSV /
+  export URL / contact lookups keep ResultsCategory and still 422 it (held rows are not leads).
+- jobs.py GET results: category=not_qualified skips actionable_condition (as no_address does), keeps job/user
+  scope, delivered-run gate, tax cap, search, filters, sort, paging. Per page item: qualification_state +
+  qualification_reasons from lead_qualification (Python, already twin-tested).
+- schemas.py: ResultRow.qualification_state: str|None, qualification_reasons: list[str]|None (None off-tab).
+- openapi.json regen. tests/test_results_not_qualified.py: count == breakdown, rows == held set, reasons,
+  other-tenant isolation, CSV/export/lookup still 422, pre-delivery run lists nothing.
+
+### 2b BE: Already Delivered shows the original (<= 4 files)
+- _attach_delivery_provenance: one extra batched query: delivered_records(user_id, dedup_hash) ->
+  first_result_id -> results row (same user_id, RLS + explicit filter). Attach `delivered_original`
+  {party_name, parcel_id, property_address, mailing_address, mailing_city/state/zip, job_id} when the row still
+  exists; null when purged (SET NULL) -> FE says "original no longer available".
+- Never overwrite the duplicate's own columns (the CSV/export of already_delivered unchanged in this phase).
+- schemas.py + openapi + tests (original attached, purged -> null, other tenant's hash never matched).
+
+### 2c FE (bridgeleads-web): "Held back" tab with reason labels; Already Delivered rows render
+`delivered_original` fields with an "as delivered" hint. Types regenerated from openapi. Deploy BE first
+(additive fields), FE after.
+
+Open questions for Codex: predicate parity with the CASE; whether reasons should be computed live (rows can
+qualify later via the sweep -> state may say qualified while still marked not_qualified); first_result_id vs
+hash-match on the original.
+## Phase 2 plan r2: reconciliation of Codex consult r1 (GATE FAIL, 3 P1)
+P1-1 live vs frozen reasons. ADOPTED (frozen): mark_not_qualified_rows already freezes the HOLD with the run
+(a sweep never unholds; the next run takes the claim and bills). So the hold step also freezes WHY: after
+_HOLD_SQL returns the held ids, the worker computes qualification_reasons() (the Python twin, already parity-tested
+against qualified_sql) for those rows and writes enrichment_data.qualification_hold = {"reasons": [...],
+"policy": "code_violation_v1"} in ONE batched UPDATE (jsonb_set, same statement scope, job+user filter).
+_CLEAR_HOLDS_SQL removes the key on a watchdog re-run. API returns hold_reasons (frozen) AND
+current_state = qualification_state(row) (live); FE copy: "Held: <frozen reasons>. Since then: complete, your
+next run delivers it" when live state is qualified. Rows held before this ships (deployed 10-27 01:09Z, a few
+runs at most) have no frozen key -> hold_reasons = null, FE shows live state only, labelled "reason not recorded".
+P1-2 parity. ADOPTED: ORM = has_address_condition() AND is_duplicate IS FALSE AND (marked OR NOT
+qualified_condition()); never actionable_condition(). Tax cap NOT applied on this tab: the breakdown applies none,
+and a held row is always a code_violation subject row (tax rows are never subject and qualified_sql is TRUE for
+non-subject rows), so the cap could only ever diverge, never help. Test: list total == computed breakdown
+not_qualified over a fixture with every bucket (no-address precedence, same_run, prior_run, over_quota, marked,
+currently-unqualified, qualified-but-marked).
+P1-3 delivered original. ADOPTED: original = delivered_records(user_id, dedup_hash).first_result_id -> results row
+with results.user_id = user AND results.job_id IN `available` (the existing done + same-user source-job check). No
+hash fallback when first_result_id is NULL (purged) -> null, "original no longer available". delivered_original
+is a FULL ResultRow (not a field subset) so the FE renders the original row whole, never a hybrid; the duplicate's
+own provenance badge (source run, delivered date) stays. One batched query per page (query-count test).
+Isolation tests: other tenant's same hash; forged first_result_id pointing at another tenant's row -> null.
+Export contract: the CSV is built from download_rows_select / its own writer, not ResultRow serialization ->
+assert exact CSV headers unchanged in a regression test anyway.
+P2/P3: perf: list query uses existing job_id index; qualified_sql cost is per-row over one job (<= a few
+thousand rows); EXPLAIN on a realistic local job before PR.
+Phase split (each <= 5 files): 2a worker freeze (plan_cap.py + test). 2b API not_qualified tab (results_category,
+jobs, schemas, openapi, test). 2c API delivered_original (jobs, schemas, openapi, test). 2d FE.
+Codex consult r2: P1-2, P1-3 resolved. P1-1 residual (stale frozen reasons after a re-run unholds a row): already
+planned (_CLEAR_HOLDS_SQL strips qualification_hold with the mark) + belt ADOPTED: the API returns hold_reasons
+only while delivery_excluded_reason = 'not_qualified'. Test: re-run that qualifies a held row -> key gone, row
+leaves the tab. Plan reconciled; awaiting owner approval.

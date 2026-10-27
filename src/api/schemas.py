@@ -1964,6 +1964,16 @@ class JobResponse(BaseModel):
         self.progress_label = self.stage_label
 
 
+# The qualification vocabulary (src/api/lead_qualification.py; a test pins them equal).
+QualificationState = Literal["qualified", "enrichment_pending", "needs_review", "not_qualified"]
+QualificationReason = Literal[
+    "missing_owner", "owner_conflict", "parcel_unresolved", "address_ambiguous",
+    "missing_property_address", "mailing_unresolved", "invalid_case_data", "unsupported_source",
+]
+# Fields an already-delivered copy may show from the lead its earlier run delivered.
+OriginalField = Literal["party_name", "parcel_id", "property_address", "mailing_address"]
+
+
 class ResultRow(BaseModel):
     id: str
     date_recorded: str | None
@@ -2051,6 +2061,17 @@ class ResultRow(BaseModel):
     # up (King's bulk extract redacts it), not because there is no owner. Derived per
     # page, never stored, never exported (src/utils/owner_pending.py).
     owner_name_pending: bool = False
+    # Code violations only (rows stamped with the qualification policy), set on the
+    # new and not_qualified lists, derived per page from the row as it is NOW, never
+    # stored. A held row a sweep completed later reads "qualified": the hold is frozen
+    # and a later run delivers it. None on rows the policy does not cover.
+    qualification_state: QualificationState | None = None
+    qualification_reasons: list[QualificationReason] | None = None
+    # Already-delivered list only: the fields this duplicate copy shows from the lead
+    # its earlier run delivered, because the copy itself was never enriched. Filled
+    # only where the copy is blank, never over a value it has. Response only, never
+    # stored or exported. None when nothing was filled.
+    filled_from_original: list[OriginalField] | None = None
 
     model_config = {"from_attributes": True}
 
@@ -2254,6 +2275,10 @@ class ResultsPage(BaseModel):
     # any view filter, tax cap included. Read now, so it can be smaller than a
     # snapshot breakdown's no_address after a backfill or on a capped tax run.
     no_address_count: int = 0
+    # The code violations this run held back (?category=not_qualified, same predicate,
+    # before any view filter, tax cap included): marked at delivery, including those a
+    # later run has since delivered. Matches the snapshot breakdown's not_qualified.
+    not_qualified_count: int = 0
     # Skip-trace state of those same rows (see AlreadyDeliveredContacts).
     already_delivered_contacts: AlreadyDeliveredContacts = AlreadyDeliveredContacts()
     # NTS Tier 1: True if the JOB has ANY auction-matched lead (independent of the

@@ -258,3 +258,24 @@ See `.env.example` for all options. Key vars:
 - `STRIPE_SECRET_KEY` — Stripe secret key
 - `RESEND_API_KEY` — Resend email API key
 - `S3_BUCKET`, `S3_ENDPOINT`, `S3_ACCESS_KEY`, `S3_SECRET_KEY` — Cloudflare R2
+
+## Skill routing
+
+When the user's request clearly matches an available skill, invoke it via the Skill tool. If no skill clearly fits, or the listed skill is not available, follow the Working Instructions above.
+
+**Precedence:** routing is additive and never authorizes anything on its own. A skill does not replace the Codex brainstorm/review gates, phased execution, or owner approval, and it never by itself authorizes creating a PR, merging, or deploying (a merge to main deploys). Anything a skill saves (e.g. /context-save) follows the security rules: no secrets, no owner PII, in this public repo.
+
+Key routing rules:
+- Product ideas/brainstorming → invoke /office-hours
+- Strategy/scope → invoke /plan-ceo-review
+- Architecture → invoke /plan-eng-review
+- Design system/plan review → invoke /design-consultation or /plan-design-review
+- Full review pipeline → invoke /autoplan
+- Bugs/errors → invoke /investigate
+- QA/testing site behavior → invoke /qa or /qa-only
+- Code review/diff check → invoke /review
+- Visual polish → invoke /design-review
+- Ship/deploy/PR → invoke /ship or /land-and-deploy
+- Save progress → invoke /context-save
+- Resume context → invoke /context-restore
+- Author a backlog-ready spec/issue → invoke /spec

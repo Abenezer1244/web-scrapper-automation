@@ -76,7 +76,7 @@ async def test_the_island_run_lists_all_71_records_it_could_not_address(
     assert lead_view["no_address_count"] == 71
     assert lead_view["breakdown"] == {
         "dropped_before_save": 0, "no_address": 71, "same_run_merged": 0,
-        "already_delivered": 0, "over_quota": 0, "new": 0,
+        "already_delivered": 0, "not_qualified": 0, "over_quota": 0, "new": 0,
     }
 
     seen: set[str] = set()

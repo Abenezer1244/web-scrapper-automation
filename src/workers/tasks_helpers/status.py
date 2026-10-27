@@ -140,6 +140,7 @@ class JobUpdateFields(TypedDict, total=False):
     breakdown_same_run_merged: int | None
     breakdown_already_delivered: int | None
     breakdown_over_quota: int | None
+    breakdown_not_qualified: int | None
     breakdown_new: int | None
 
 

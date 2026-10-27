@@ -833,6 +833,9 @@ class Job(Base):
     breakdown_same_run_merged = Column(Integer, nullable=True)
     breakdown_already_delivered = Column(Integer, nullable=True)
     breakdown_over_quota = Column(Integer, nullable=True)
+    # Migration 121: code violations held back by lead qualification. NULL on a
+    # snapshot frozen before 121, read as 0 (run_breakdown.breakdown_from_job).
+    breakdown_not_qualified = Column(Integer, nullable=True)
     breakdown_new = Column(Integer, nullable=True)
     # Migration 063: idempotent billing. billing_applied_at is the CAS gate —
     # only the attempt that flips it from NULL increments users.records_used, so a

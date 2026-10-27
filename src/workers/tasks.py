@@ -16,9 +16,10 @@ from sqlalchemy import text as sa_text
 from src.api.lead_actionability import (
     DELIVERY_EXCLUDED_KEY,
     OVER_QUOTA,
-    address_actionable_sql,
+    deliverable_before_cap_sql,
     is_actionable,
 )
+from src.api.lead_qualification import stamp as stamp_qualification_policy
 from src.api.quota_window import (
     window_cte_sql,
     window_set_sql,
@@ -1268,6 +1269,11 @@ def run_scrape_job(self, job_id: str) -> None:
                         rec.doc_type, _enrichment.get("comment")
                     )
                     _enrichment = {**_enrichment, "lead_subtype": _subtype.value}
+                elif config.record_type == "code_violation":
+                    # Gates delivery and billing on a verified owner, parcel and mailing
+                    # address (src/api/lead_qualification.py). Stamped here, the single
+                    # insert, so only rows created from now on are subject to it.
+                    _enrichment = stamp_qualification_policy(_enrichment)
                 rows.append({
                     "id": str(_uuid.uuid4()),
                     "job_id": job_id,
@@ -1893,6 +1899,46 @@ def run_scrape_job(self, job_id: str) -> None:
                 _logger.warning("Job %s: post-flags refetch failed: %s", job_id, type(exc).__name__)
                 refreshed = None  # same sentinel as the first refetch
 
+        # ── HOLD UNQUALIFIED CODE VIOLATIONS (every plan, before the cap) ────
+        # A code violation is delivered only with a verified owner, parcel and mailing
+        # address (src/api/lead_qualification.py); the rest are held here so the cap
+        # never spends quota on them and nothing downstream delivers or bills them.
+        # Fatal before billing, like the cap: billing would otherwise charge rows the
+        # hold was meant to exclude (the belt in actionable_sql still refuses them, so
+        # failing here costs the customer nothing but a re-run).
+        if config.record_type == "code_violation":
+            from src.workers.tasks_helpers.plan_cap import mark_not_qualified_rows
+
+            try:
+                _held = mark_not_qualified_rows(db, job_id=job_id, user_id=str(job.user_id))
+                db.commit()
+            except Exception as exc:
+                reraise_time_limit(exc)
+                db.rollback()
+                _logger.error("Job %s: holding unqualified code violations failed: %s",
+                              job_id, type(exc).__name__)
+                try:
+                    release_run_claims_if_owned(db, job_id, _boot_user_id, attempt_token)
+                    db.commit()
+                except Exception as cleanup_exc:
+                    db.rollback()
+                    _alert_dedup_release_failed(job_id, _boot_user_id, "qualification_hold",
+                                                cleanup_exc)
+                _fail_attempt(
+                    "Lead checks could not be completed, so no file was delivered and you "
+                    "were not charged. Please run the scraper again."
+                )
+                return
+            if _held:
+                _publish_log(
+                    r, job_id, "warning",
+                    f"{_held:,} code violation record{'s' if _held != 1 else ''} held back: "
+                    "not delivered and not billed, because the verified property owner, "
+                    "parcel or owner mailing address could not be confirmed. A later run "
+                    "delivers them once the county records confirm the owner.",
+                    db=db,
+                )
+
         # ── APPLY THE PLAN CAP (after enrichment, before delivery) ───────────
         # Every scraped row was persisted and enriched, so actionability is now
         # known. Mark everything past the user's remaining quota as excluded:
@@ -1931,7 +1977,7 @@ def run_scrape_job(self, job_id: str) -> None:
                         sa_text(
                             "SELECT count(*) FROM results "
                             "WHERE job_id = :jid AND user_id = CAST(:uid AS uuid) "
-                            f"  AND is_duplicate = false AND {address_actionable_sql('results')}"
+                            f"  AND is_duplicate = false AND {deliverable_before_cap_sql('results')}"
                         ),
                         {"jid": job_id, "uid": str(job.user_id)},
                     ).scalar() or 0

@@ -1627,6 +1627,15 @@ def _run_inline_enrichment(
                 # Names read before the breaker tripped are still real; keep them.
                 _logger.warning("Job %s: code violation owner lookup aborted: %s",
                                 job_id, str(exc)[:180])
+                # Say it in the run log: without a confirmed owner these leads are
+                # held back, and "Found 0 property owners" alone read as if the county
+                # had none (run 1ad28ded, 2026-10-17).
+                _publish_log(r, job_id, "warning",
+                             "King County property owner records were temporarily "
+                             "unavailable, so owners could not be confirmed for some code "
+                             "violations. Those records are held back, not delivered and "
+                             "not billed. Run this scraper again later to include them.",
+                             db=db)
             _cv_named = apply_owner_names(
                 _cv_owner_map, _cv_owners, checked_at=_now().isoformat())
             try:

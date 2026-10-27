@@ -604,7 +604,9 @@ def test_every_status_and_fail_write_in_run_scrape_job_carries_the_token():
     for call in fails + statuses:
         assert "expected_started_at=attempt_token" in call, call
     assert "DELETE FROM delivered_records" not in body
-    assert body.count("release_run_claims_if_owned(db, job_id, _boot_user_id, attempt_token)") == 4
+    # Five fail-before-billing paths, each attempt-pinned (the fifth: the lead-qualification
+    # hold, 2026-10-25).
+    assert body.count("release_run_claims_if_owned(db, job_id, _boot_user_id, attempt_token)") == 5
     cap = body[body.index("release_capped_dedup_claims(") - 400:body.index("release_capped_dedup_claims(")]
     assert "attempt_state(db, job_id, _boot_user_id, attempt_token).owned" in cap
 

@@ -19,6 +19,46 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-10-25/26 — Results: Run breakdown tab removed, cards readable, auction line compact (FE #287)
+
+**Built / Shipped:** FE #287 squash-merged as `aec06a4`; Vercel Production deployment for that SHA reported
+success. Frontend only, no BE change. The Run breakdown tab, its `RunSummary` panel and the pager's "View run
+breakdown" link are gone (the summary cards already show every bucket); an old `?view=breakdown` link opens New
+leads and the URL drops the stale view. Summary cards are number over label everywhere, wrap instead of
+truncating ("Already ...", "Over pla..." at 1440px), 2 / 3 / one-row columns, numbers top-aligned. The auction
+notice is a closed `<details>` line ("Auction dates: 3 of 296 records") with the three buckets behind Details
+(`lib/auction-coverage.ts`, moved out of `lib/coverage.ts`). New pure helpers with node tests:
+`withListedViews`, `noAddressDriftLine` (`lib/run-summary.ts`).
+
+**Tried / Decided:** kept the one fact only the breakdown carried (the no-address count frozen at done vs the
+list now) as a line under the cards, so it shows even when the list is empty and its tab is gone. A card whose
+list is empty is plain text, not a button (the page would bounce back to New). Dropped on purpose: the
+"Counted from this run's saved records" footnote. Card icons hide from 1280 to 1399px, where six cards left a
+label ~80px and "County records found" ran to three lines.
+
+**Failed / Blocked:** the live logged-in check on bridgeleads.io never ran: the headed Chromium waiting for the
+owner's MFA login was reaped for low memory twice (1.8 GB free of 15.4 GB; six Claude sessions held 2.6 GB). The
+deploy is verified by SHA, not by eye. No Python on the box (anaconda gone), so file edits went through Node / the
+Edit tool.
+
+**Caught & fixed:** the auction note called its population "leads": `auction_coverage` (src/api/routes/jobs.py)
+counts EVERY saved Result row of the job, so a 15-lead Pierce run read "3 of 296 leads". It now says records.
+Codex consult flagged three release blockers, all adopted: canonicalize `?view=breakdown`, keep the zero-list
+drift message reachable, records not leads. Codex diff review GATE PASS; its P2 (no tests for the page rules)
+adopted as the two helpers; its P3 ("unused `BreakdownBasis` import") rejected, `RunOutcomes` still uses it.
+Screenshots caught what 46 passing checks did not: numbers at different heights across the row, and a 4 + 1
+orphan card at 1024px.
+
+**Pending / Handoff:** the live check (needs the owner's login and free memory). FE #288 (lead-quality "Held
+back" card) merged on top of #287 cleanly; its card has no icon in `components/results/summary-cards.tsx` (falls
+back to the file icon), and code-violation runs now reach seven cards more often, which leaves one card alone on
+the second row from 1280px. Phone tab strip scrolls sideways (existing `UnderlineTabs` design).
+
+**Facts learned:** run summary cards are the done-time snapshot; the tab counts are the records now; never
+"fix" a mismatch by recomputing one from the other. A stub API on :8137 plus `next dev` with env passed inline
+is enough to drive the real Results page at every width (this session's scratchpad `stub_api.mjs`,
+`verify.mjs`, 51 checks).
+
 ## 2026-10-26 — Code-violation lead qualification gate (built, not merged)
 
 **Built / Shipped:** nothing merged or deployed. BE branch `fix/code-violation-lead-qualification` (worktree

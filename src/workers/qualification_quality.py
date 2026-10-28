@@ -80,12 +80,16 @@ _OTHER = "other"
 UNRECORDED = "unrecorded"
 
 _SUBJECT = f"(r.enrichment_data->>'{POLICY_KEY}' = '{POLICY_CODE_VIOLATION}')"
+# Every query starts from the few post-gate code-violation jobs (jobs + scraper_configs) and
+# reaches results through its job_id index; nothing scans results across record types.
+_CV_JOBS = ("JOIN jobs j ON j.id = r.job_id "
+            "JOIN scraper_configs sc ON sc.id = j.scraper_config_id AND sc.record_type = 'code_violation'")
 _POST_GATE_DONE = ("j.status = 'done' AND j.started_at >= :boundary AND j.finished_at >= :since "
                    "AND r.user_id = j.user_id")
 
 _UNHELD_UNQUALIFIED_SQL = f"""
 SELECT r.job_id::text AS job_id, count(*) AS n
-FROM results r JOIN jobs j ON j.id = r.job_id
+FROM results r {_CV_JOBS}
 WHERE {_POST_GATE_DONE} AND r.is_duplicate = false AND {_SUBJECT}
   AND NOT ({delivery_excluded_sql('r')}) AND NOT {qualified_sql('r')}
 GROUP BY r.job_id ORDER BY n DESC
@@ -96,14 +100,14 @@ SELECT job_id, sum(n)::bigint AS n FROM (
   SELECT r.job_id::text AS job_id, count(*) AS n
   FROM dialer_deliveries d
   JOIN results r ON r.id = d.result_id AND r.user_id = d.user_id
-  JOIN jobs j ON j.id = r.job_id
+  {_CV_JOBS}
   WHERE d.status = 'delivered' AND {_POST_GATE_DONE} AND {_SUBJECT} AND {not_qualified_excluded_sql('r')}
   GROUP BY r.job_id
   UNION ALL
   SELECT r.job_id::text AS job_id, count(*) AS n
   FROM pending_skip_trace_rows p
   JOIN results r ON r.id = p.result_id AND r.user_id = p.user_id
-  JOIN jobs j ON j.id = r.job_id
+  {_CV_JOBS}
   WHERE p.status = ANY(:sent) AND {_POST_GATE_DONE} AND {_SUBJECT} AND {not_qualified_excluded_sql('r')}
   GROUP BY r.job_id
 ) t GROUP BY job_id ORDER BY n DESC
@@ -111,9 +115,8 @@ SELECT job_id, sum(n)::bigint AS n FROM (
 
 _UNSTAMPED_SQL = f"""
 SELECT r.job_id::text AS job_id, count(*) AS n
-FROM results r JOIN jobs j ON j.id = r.job_id
-JOIN scraper_configs sc ON sc.id = j.scraper_config_id
-WHERE {_POST_GATE_DONE} AND sc.record_type = 'code_violation'
+FROM results r {_CV_JOBS}
+WHERE {_POST_GATE_DONE}
   AND COALESCE(r.enrichment_data->>'{POLICY_KEY}', '') <> '{POLICY_CODE_VIOLATION}'
 GROUP BY r.job_id ORDER BY n DESC
 """  # noqa: S608 -- splices only module constants; every value is bound
@@ -199,9 +202,7 @@ GROUP BY 1
 _BASELINE_YIELD_SQL = f"""
 SELECT {_SOURCE_EXPR} AS source, count(*) AS n,
        count(*) FILTER (WHERE {not_qualified_excluded_sql('r')}) AS held
-FROM results r
-JOIN jobs j ON j.id = r.job_id
-JOIN scraper_configs sc ON sc.id = j.scraper_config_id
+FROM results r {_CV_JOBS}
 WHERE {_POST_GATE_DONE} AND j.id <> :job_id AND r.is_duplicate = false AND {_SUBJECT}
   AND lower(sc.county) = :county AND upper(sc.state) = :state AND sc.record_type = :record_type
 GROUP BY 1
@@ -257,8 +258,13 @@ def qualification_yield(db, *, job_id: str, county: str, state: str, record_type
     }
 
 
+def _pass_rate(c: dict[str, int]) -> float:
+    return 100.0 * (c["n"] - c["held"]) / c["n"] if c["n"] else 0.0
+
+
 def _pass_pct(c: dict[str, int]) -> float:
-    return round(100.0 * (c["n"] - c["held"]) / c["n"], 1) if c["n"] else 0.0
+    """For display only; the threshold compares _pass_rate."""
+    return round(_pass_rate(c), 1)
 
 
 def evaluate_yield(measured: dict) -> tuple[list[dict], list[str]]:
@@ -271,8 +277,9 @@ def evaluate_yield(measured: dict) -> tuple[list[dict], list[str]]:
         if run["n"] < MIN_RUN_ROWS or base["n"] < MIN_BASELINE_ROWS:
             unjudged.append(cohort)
             continue
-        now, before = _pass_pct(run), _pass_pct(base)
-        if now + DROP_POINTS < before:
+        # Unrounded and inclusive: a drop of exactly DROP_POINTS warns (Codex P2).
+        if _pass_rate(base) - _pass_rate(run) >= DROP_POINTS:
+            now, before = _pass_pct(run), _pass_pct(base)
             warnings.append({"kind": "qualification_collapse", "field": cohort, "run_pct": now,
                              "baseline_pct": before, "run_rows": run["n"], "held": run["held"],
                              "baseline_rows": base["n"],

@@ -335,3 +335,79 @@ async def test_the_sweep_runs_the_gate_check(db, business_user, monkeypatch):
     await _row(db, job, business_user.id, _held())
     stats = dq.run_data_quality_sweep(lookback_hours=2, limit=500)
     assert stats["gate_breaches"] >= 1
+
+
+# ── Codex review r1 (P2 threshold, P3 coverage) ──────────────────────────────
+
+def _measured(run_n, run_held, base_n=60, base_held=6) -> dict:
+    return {"run": {SEATTLE: {"n": run_n, "held": run_held}},
+            "baseline": {SEATTLE: {"n": base_n, "held": base_held}}, "reasons": {}}
+
+
+def test_a_drop_of_exactly_the_threshold_warns_and_just_under_does_not():
+    assert qq.DROP_POINTS == 30.0
+    [w] = qq.evaluate_yield(_measured(10, 4))[0]                 # 90% -> 60%: exactly 30
+    assert (w["run_pct"], w["baseline_pct"]) == (60.0, 90.0)
+    assert qq.evaluate_yield(_measured(10, 3))[0] == []          # 90% -> 70%
+    # Unrounded: 66.67% (40/60) vs 36.7% (367/1000) is a 29.97-point drop; the rounded
+    # figures (66.7 - 36.7) would read exactly 30 and warn.
+    assert qq.evaluate_yield(_measured(1000, 633, base_n=60, base_held=20))[0] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["submitting", "unmatched"])
+async def test_every_spent_skip_trace_status_on_a_held_row_is_a_breach(db, business_user, status):
+    cfg = await _config(db, business_user)
+    job = await _job(db, business_user, cfg)
+    rid = await _row(db, job, business_user.id, _held(), mark=NOT_QUALIFIED)
+    db.add(PendingSkipTraceRow(id=str(uuid.uuid4()), job_id=job, result_id=rid, user_id=business_user.id,
+                               property_address="4512 S HOLLY ST", status=status))
+    await db.commit()
+    assert _mine(_measure(qq.gate_invariants), job)["outbound_held"] == {job: 1}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", ["null", '"a string"', "[1, 2]"])
+async def test_a_null_or_scalar_enrichment_reads_as_unstamped_never_crashes(db, business_user, value):
+    cfg = await _config(db, business_user)
+    job = await _job(db, business_user, cfg)
+    rid = await _row(db, job, business_user.id, seattle())
+    await db.execute(text(f"UPDATE results SET enrichment_data = '{value}'::json WHERE id = :i"), {"i": rid})
+    await db.commit()
+    found = _mine(_measure(qq.gate_invariants), job)
+    assert found["unstamped"] == {job: 1} and found["unheld_unqualified"] == {}
+
+
+def test_the_judged_marker_is_versioned():
+    assert dq._checked_key("abc") == "bl:dq:checked:v2:abc"
+
+
+@pytest.mark.asyncio
+async def test_a_failing_gate_check_never_breaks_the_sweep(db, business_user, monkeypatch):
+    cfg = await _config(db, business_user)
+    await _job(db, business_user, cfg)
+
+    def boom(*a, **k):
+        raise RuntimeError("statement timeout")
+
+    monkeypatch.setattr(qq, "gate_invariants", boom)
+    stats = dq.run_data_quality_sweep(lookback_hours=2, limit=500)
+    assert stats["checked"] >= 1 and "gate_breaches" not in stats
+
+
+@pytest.mark.asyncio
+async def test_the_gate_check_still_runs_after_a_coverage_check_aborts_its_transaction(
+        db, business_user, monkeypatch):
+    from src.config import settings
+
+    monkeypatch.setattr(settings, "OPS_ALERT_EMAIL", "")
+    cfg = await _config(db, business_user)
+    job = await _job(db, business_user, cfg)
+    await _row(db, job, business_user.id, _held())
+
+    def aborts(db_, job_id, **kw):
+        db_.execute(text("SELECT 1/0"))  # leaves the session's transaction aborted
+
+    monkeypatch.setattr(dq, "check_job", aborts)
+    stats = dq.run_data_quality_sweep(lookback_hours=2, limit=500)
+    assert stats["checked"] == 0 and stats["gate_breaches"] >= 1

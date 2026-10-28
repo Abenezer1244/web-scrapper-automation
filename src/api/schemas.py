@@ -601,7 +601,62 @@ def _validate_https_webhook_url(v: str | None) -> str | None:
         raise ValueError("webhook url must use https://")
     if not parsed.hostname:
         raise ValueError("webhook url must include a host")
+    if is_masked_webhook_url(v):
+        # A redacted readback that could not be matched to the stored URL
+        # (copied into a new scraper, or edited): never persist it.
+        raise ValueError("re-enter the full webhook URL")
     return v
+
+
+# Destination URLs a response never returns in full: an unsigned webhook (e.g. a
+# Zapier catch-hook) treats the URL itself as the credential.
+WEBHOOK_URL_FIELDS: tuple[str, ...] = ("webhook_url", "dialer_webhook_url")
+# Raw "<" and ">" are not legal in a URL (RFC 3986 requires them percent-encoded),
+# so no real destination can ever equal a mask; a real "/%3Chidden%3E" differs.
+_WEBHOOK_URL_MASK_PATH = "/<hidden>"
+_UNPARSEABLE_URL_MASK = "https://invalid" + _WEBHOOK_URL_MASK_PATH
+
+
+def mask_webhook_url(url: str | None) -> str | None:
+    """Readback form of a stored webhook URL: scheme + host[:port] + "/<hidden>".
+
+    Deterministic, so a PATCH that echoes it back unchanged can be recognised
+    and the stored URL kept (_merge_deliver). Userinfo, path, query and
+    fragment are dropped. Residual disclosure: the hostname stays visible.
+    Never raises: one malformed legacy value must not break a scraper list or
+    an account export.
+    """
+    if not url:
+        return url
+    try:
+        parsed = urlparse(url)
+        host = parsed.hostname
+        try:
+            port = parsed.port
+        except ValueError:
+            port = None
+    except ValueError:
+        return _UNPARSEABLE_URL_MASK
+    if not host:
+        return _UNPARSEABLE_URL_MASK
+    if ":" in host:
+        host = f"[{host}]"
+    scheme = parsed.scheme if parsed.scheme in ("http", "https") else "https"
+    return f"{scheme}://{host}{f':{port}' if port else ''}{_WEBHOOK_URL_MASK_PATH}"
+
+
+def is_masked_webhook_url(url: str) -> bool:
+    return urlparse(url).path == _WEBHOOK_URL_MASK_PATH
+
+
+def redact_deliver(deliver: dict) -> dict:
+    """A copy of a stored deliver dict with write-only secrets dropped and
+    destination URLs masked — the shape any user-facing readback may carry."""
+    out = {k: v for k, v in deliver.items() if k not in DELIVER_SECRET_FIELDS}
+    for f in WEBHOOK_URL_FIELDS:
+        if f in out:
+            out[f] = mask_webhook_url(out[f])
+    return out
 
 
 def _validate_webhook_secret(v: str | None) -> str | None:
@@ -976,9 +1031,9 @@ class ScraperConfigResponse(BaseModel):
         self.deliver["dialer_webhook_secret_set"] = bool(self.deliver.get("dialer_webhook_secret"))
         # Thread 3: the PhoneBurner OAuth token is a credential — write-only too.
         self.deliver["phoneburner_access_token_set"] = bool(self.deliver.get("phoneburner_access_token"))
-        self.deliver.pop("webhook_secret", None)
-        self.deliver.pop("dialer_webhook_secret", None)
-        self.deliver.pop("phoneburner_access_token", None)
+        # Destination URLs are credentials too (unsigned hooks): masked readback,
+        # set flags above included, via the same helper the account export uses.
+        self.deliver = redact_deliver(self.deliver)
         # Also normalize fields / enrichment / schedule defensively
         if isinstance(self.fields, list):
             self.fields = dict.fromkeys(self.fields, True)

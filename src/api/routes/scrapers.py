@@ -27,6 +27,7 @@ from src.api.middleware.rate_limit import rate_limit
 from src.api.middleware.security import audit_log
 from src.api.schemas import (
     DELIVER_SECRET_FIELDS,
+    WEBHOOK_URL_FIELDS,
     ConfigRunEligibilityResponse,
     ConnectorCreate,
     ConnectorResponse,
@@ -35,6 +36,7 @@ from src.api.schemas import (
     ScraperConfigCreate,
     ScraperConfigResponse,
     ScraperConfigUpdate,
+    mask_webhook_url,
 )
 from src.config.constants import (
     ACTIVE_STATUSES,
@@ -526,6 +528,14 @@ def _merge_deliver(stored: dict, update) -> DeliverConfig:
     from pydantic import ValidationError
 
     merged = update.model_dump()
+    # GET returns destination URLs masked; an edit form that left one untouched
+    # echoes the exact mask back, which means "keep the stored URL". Blank still
+    # removes it, any other value replaces it, and an unmatched mask is rejected
+    # by DeliverConfig's URL validator below.
+    for url_field in WEBHOOK_URL_FIELDS:
+        stored_url = stored.get(url_field)
+        if stored_url and merged.get(url_field) == mask_webhook_url(stored_url):
+            merged[url_field] = stored_url
     for secret in DELIVER_SECRET_FIELDS:
         new_val = merged.get(secret)
         if not (isinstance(new_val, str) and new_val.strip()) or _is_secret_placeholder(new_val):

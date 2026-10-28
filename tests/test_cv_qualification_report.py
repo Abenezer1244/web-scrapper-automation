@@ -102,3 +102,91 @@ def test_account_prefixes_lengthen_when_two_collide():
     names = rep.short_ids({a, b, "99999999" + "0" * 28})
     assert len(set(names.values())) == 3
     assert names[a] != names[b] and len(names[a]) == 12
+
+
+# ── Codex review r1 (P2 overlap, Tacoma, reconciliation; P3 coverage) ─────────
+
+def _tacoma(**kw) -> dict:
+    """A Tacoma case on its printed Pierce parcel, named by ATIP; from before the gate."""
+    ed = {"source": "tacoma_code_violations", "case_number": "CODE-2026-0042",
+          "case_type": "Nuisance", "owner_source": "pierce_atip", "owner_pin": "2012345678"}
+    ed.update(kw.pop("ed", {}))
+    row = {"party_name": "TAHOMA PROPERTIES LLC", "parcel_id": "2012345678",
+           "property_address": "5110 S PINE ST", "mailing_address": "PO BOX 98, TACOMA, WA 98401",
+           "date_recorded": "09/02/2026", "enrichment_data": ed}
+    row.update(kw)
+    return row
+
+
+@pytest.mark.asyncio
+async def test_named_later_and_still_failing_rows_are_counted_once(db, business_user):
+    cfg = await _config(db, business_user)
+    uid = business_user.id
+    job = await _job(db, business_user, cfg, started=GATE_DEPLOYED_AT - timedelta(days=3), hours_ago=60)
+    await db.execute(text("UPDATE jobs SET billed_count = 5 WHERE id = :j"), {"j": job})
+    await _row(db, job, uid, _legacy(mailing_address=None, ed={"cv_owner_recovery_outcome": "found"}))  # both
+    await _row(db, job, uid, _legacy(party_name=None, ed={"owner_source": None}))                        # fail only
+    await _row(db, job, uid, _legacy(ed={"cv_owner_recovery_outcome": "found"}))                         # named only
+    await _row(db, job, uid, _tacoma(ed={"owner_recovery_last_at": "2026-09-20T10:00:00Z"}))             # Tacoma named
+    await _row(db, job, uid, _tacoma())                                                                  # clean
+    await db.commit()
+    r = {x["job"]: x for x in _report()["runs"]}[job[:8]]
+    assert (r["candidates"], r["strict_fail"], r["named_after_delivery"]) == (5, 2, 3)
+    assert (r["named_and_still_failing"], r["affected"]) == (1, 4)
+    assert r["billed_minus_candidates"] == 0
+    assert r["by_jurisdiction"]["tacoma_code_violations"] == {"candidates": 2, "strict_fail": 0}
+
+
+@pytest.mark.asyncio
+async def test_billed_and_candidates_that_disagree_are_reported_not_hidden(db, business_user):
+    cfg = await _config(db, business_user)
+    job = await _job(db, business_user, cfg, started=GATE_DEPLOYED_AT - timedelta(days=3), hours_ago=60)
+    await db.execute(text("UPDATE jobs SET billed_count = 7 WHERE id = :j"), {"j": job})
+    await _row(db, job, business_user.id, _legacy())
+    report = _report()
+    r = {x["job"]: x for x in report["runs"]}[job[:8]]
+    assert r["billed_minus_candidates"] == 6
+    [a] = report["accounts"].values()
+    assert a["unreconciled_runs_pre_gate"] == 1
+    assert "evidence, not an exact count" in rep.render(report)
+
+
+@pytest.mark.asyncio
+async def test_a_copy_whose_source_is_another_accounts_run_counts_as_gone(db, business_user, starter_user):
+    mine, theirs = await _config(db, business_user), await _config(db, starter_user)
+    old_mine = await _job(db, business_user, mine, started=GATE_DEPLOYED_AT - timedelta(days=9), hours_ago=200)
+    old_theirs = await _job(db, starter_user, theirs, started=GATE_DEPLOYED_AT - timedelta(days=9), hours_ago=200)
+    job = await _job(db, business_user, mine, started=GATE_DEPLOYED_AT - timedelta(days=3), hours_ago=60)
+    copy = {"is_duplicate": True, "duplicate_reason": "prior_run"}
+    await _row(db, job, business_user.id, _legacy(), duplicate_source_job_id=old_mine, **copy)
+    await _row(db, job, business_user.id, _legacy(), duplicate_source_job_id=old_theirs, **copy)
+    await _row(db, job, business_user.id, _legacy(), duplicate_source_job_id=None, **copy)
+    report = _report()
+    r = {x["job"]: x for x in report["runs"]}[job[:8]]
+    assert (r["prior_run_copies"], r["copies_source_gone"]) == (3, 2)
+    assert len(report["accounts"]) == 2  # two tenants, never merged
+
+
+@pytest.mark.asyncio
+async def test_the_report_writes_nothing_anywhere(db, business_user):
+    cfg = await _config(db, business_user)
+    job = await _job(db, business_user, cfg, started=GATE_DEPLOYED_AT - timedelta(days=3), hours_ago=60)
+    await _row(db, job, business_user.id, _legacy(party_name=None, ed={"owner_source": None}))
+    q = text("SELECT (SELECT count(*) FROM audit_events), (SELECT md5(string_agg(r::text, '' ORDER BY id)) "
+             "FROM results r WHERE job_id = :j), (SELECT md5(j::text) FROM jobs j WHERE id = :j)")
+    with system_sync_session() as s:
+        before = s.execute(q, {"j": job}).one()
+    _report()
+    with system_sync_session() as s:
+        assert s.execute(q, {"j": job}).one() == before
+
+
+def test_a_failed_run_prints_the_exception_class_only(monkeypatch, capsys):
+    def boom(db):
+        raise RuntimeError("party_name=HARTLEY MARGARET A at 4512 S HOLLY ST")
+
+    monkeypatch.setattr(rep, "build_report", boom)
+    monkeypatch.setattr("sys.argv", ["cv_qualification_report.py"])
+    assert rep.main() == 1
+    out = capsys.readouterr()
+    assert out.err.strip() == "Report failed: RuntimeError" and out.out == ""

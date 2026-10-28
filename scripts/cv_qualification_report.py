@@ -18,11 +18,17 @@ Per run:
     (src/api/lead_qualification.py). A row from before the gate carries no policy stamp,
     so it is judged on an in-memory copy stamped for the purpose; nothing is written.
     Reasons overlap (a row can lack both owner and mailing); "failing" counts rows once.
-  * named after delivery: failing or passing rows whose owner the background sweep named
-    (cv_owner_recovery_outcome = found), i.e. incomplete when delivered, repaired later.
+  * named after delivery: rows whose owner a background sweep named after the run (King:
+    cv_owner_recovery_outcome = found; Tacoma: owner_recovery_last_at on a named row), i.e.
+    delivered without an owner. Can overlap strict fail (named, still no mailing).
+  * affected: rows that fail strict now OR were named after delivery, counted once: the
+    rows delivered incomplete, as far as the stored evidence shows.
+  * billed - candidates: where it is not 0 the failing count cannot be tied row-for-row to
+    what was billed (rows filled or purged since); the report says so, never hides it.
   * held: rows the gate held (post-gate runs), and how many are complete now (the next
     run delivers those).
-  * already delivered: prior-run copies, and how many point at a source run that is gone.
+  * already delivered: prior-run copies, and how many point at a source run that is gone
+    (or that belongs to another account, which is treated as gone).
 
 The 929 in tasks/todo-cv-qualification.md is a 2026-10-25 measurement, not an expected
 total: owner names filled since then move rows from failing to passing.
@@ -61,7 +67,8 @@ JOIN scraper_configs sc ON sc.id = j.scraper_config_id
 WHERE sc.record_type = 'code_violation' AND j.status = 'done'
 """
 
-_EXISTING_JOBS_SQL = "SELECT id::text FROM jobs WHERE id = ANY(CAST(:ids AS uuid[]))"
+_EXISTING_JOBS_SQL = ("SELECT id::text, user_id::text FROM jobs "
+                      "WHERE id = ANY(CAST(:ids AS uuid[]))")
 
 _SOURCES = frozenset(OWNER_SOURCE_BY_SOURCE)
 
@@ -73,6 +80,18 @@ def _jurisdiction(ed: Any) -> str:
 
 def _excluded(ed: Any) -> bool:
     return isinstance(ed, dict) and ed.get(DELIVERY_EXCLUDED_KEY) in EXCLUSION_REASONS
+
+
+def _named_after_delivery(row: dict) -> bool:
+    """A background sweep named this row's owner after its run delivered it."""
+    ed = row["enrichment_data"]
+    if not isinstance(ed, dict):
+        return False
+    if ed.get("cv_owner_recovery_outcome") == "found":  # King (cv_owner_recovery.py)
+        return True
+    # Tacoma (pierce_cv_owner_recovery.py): only the sweep stamps owner_recovery_last_at.
+    name = row["party_name"]
+    return bool(ed.get("owner_recovery_last_at")) and isinstance(name, str) and bool(name.strip())
 
 
 def _strict_reasons(row: dict) -> list[str]:
@@ -96,7 +115,8 @@ def _run(job: dict) -> dict:
         "gate": "post" if job["started_at"] and job["started_at"] >= GATE_DEPLOYED_AT else "pre",
         "billed": int(job["billed_count"] or 0),
         "candidates": 0, "strict_pass": 0, "strict_fail": 0, "reasons": Counter(),
-        "named_after_delivery": 0, "held": 0, "held_complete_now": 0,
+        "named_after_delivery": 0, "named_and_still_failing": 0, "affected": 0,
+        "held": 0, "held_complete_now": 0,
         "prior_run_copies": 0, "copies_source_gone": 0,
         "by_jurisdiction": defaultdict(lambda: {"candidates": 0, "strict_fail": 0}),
     }
@@ -107,7 +127,8 @@ def build_report(db) -> dict:
     db.execute(text(_READ_ONLY))
     jobs = [dict(r) for r in db.execute(text(_JOBS_SQL)).mappings()]
     runs = {j["id"]: _run(j) for j in jobs}
-    copy_sources: dict[str, list[str]] = defaultdict(list)
+    copy_sources: dict[str, list[str | None]] = defaultdict(list)
+    owner_of = {j["id"]: j["user_id"] for j in jobs}
     for row in db.execute(text(_ROWS_SQL)).mappings():
         row = dict(row)
         run = runs.get(row["job_id"])
@@ -136,12 +157,18 @@ def build_report(db) -> dict:
             run["reasons"].update(reasons)
         else:
             run["strict_pass"] += 1
-        if isinstance(ed, dict) and ed.get("cv_owner_recovery_outcome") == "found":
-            run["named_after_delivery"] += 1
+        named = _named_after_delivery(row)
+        run["named_after_delivery"] += named
+        run["named_and_still_failing"] += named and bool(reasons)
+        run["affected"] += named or bool(reasons)
     sources = {s for ids in copy_sources.values() for s in ids if s}
-    existing = {r[0] for r in db.execute(text(_EXISTING_JOBS_SQL), {"ids": sorted(sources)})} if sources else set()
+    existing = dict(db.execute(text(_EXISTING_JOBS_SQL), {"ids": sorted(sources)}).all()) if sources else {}
     for job_id, ids in copy_sources.items():
-        runs[job_id]["copies_source_gone"] = sum(1 for s in ids if not s or s not in existing)
+        # A source run of another account is not this copy's original: counted as gone.
+        runs[job_id]["copies_source_gone"] = sum(
+            1 for s in ids if not s or existing.get(s) != owner_of[job_id])
+    for run in runs.values():
+        run["billed_minus_candidates"] = run["billed"] - run["candidates"]
     return _summarise(list(runs.values()))
 
 
@@ -154,7 +181,8 @@ def _summarise(runs: list[dict]) -> dict:
         r["by_jurisdiction"] = {k: dict(v) for k, v in sorted(r["by_jurisdiction"].items())}
         a = accounts.setdefault(r["account"], {
             "runs": 0, "billed_pre_gate": 0, "candidates_pre_gate": 0, "strict_fail_pre_gate": 0,
-            "named_after_delivery_pre_gate": 0, "billed_post_gate": 0, "held_post_gate": 0,
+            "named_after_delivery_pre_gate": 0, "affected_pre_gate": 0,
+            "unreconciled_runs_pre_gate": 0, "billed_post_gate": 0, "held_post_gate": 0,
             "held_complete_now": 0})
         a["runs"] += 1
         if r["gate"] == "pre":
@@ -162,6 +190,8 @@ def _summarise(runs: list[dict]) -> dict:
             a["candidates_pre_gate"] += r["candidates"]
             a["strict_fail_pre_gate"] += r["strict_fail"]
             a["named_after_delivery_pre_gate"] += r["named_after_delivery"]
+            a["affected_pre_gate"] += r["affected"]
+            a["unreconciled_runs_pre_gate"] += r["billed_minus_candidates"] != 0
         else:
             a["billed_post_gate"] += r["billed"]
             a["held_post_gate"] += r["held"]
@@ -173,23 +203,29 @@ def render(report: dict) -> str:
     out = [f"Code-violation runs vs the strict policy (gate deployed {report['gate_deployed_at']}). "
            "Read only; counts only.", ""]
     head = (f"{'account':<10}{'job':<10}{'finished':<12}{'gate':<6}{'billed':>7}{'cands':>7}"
-            f"{'pass':>6}{'fail':>6}{'named*':>7}{'held':>6}{'held ok':>8}{'copies':>7}{'gone':>6}")
+            f"{'pass':>6}{'fail':>6}{'named*':>7}{'both':>6}{'affect':>7}{'b-c':>6}{'held':>6}"
+            f"{'held ok':>8}{'copies':>7}{'gone':>6}")
     out.append(head)
     for r in report["runs"]:
         out.append(f"{r['account']:<10}{r['job']:<10}{r['finished'] or '':<12}{r['gate']:<6}"
                    f"{r['billed']:>7}{r['candidates']:>7}{r['strict_pass']:>6}{r['strict_fail']:>6}"
-                   f"{r['named_after_delivery']:>7}{r['held']:>6}{r['held_complete_now']:>8}"
+                   f"{r['named_after_delivery']:>7}{r['named_and_still_failing']:>6}{r['affected']:>7}"
+                   f"{r['billed_minus_candidates']:>6}{r['held']:>6}{r['held_complete_now']:>8}"
                    f"{r['prior_run_copies']:>7}{r['copies_source_gone']:>6}")
         if r["reasons"]:
             out.append("    fail reasons (overlap): " + ", ".join(f"{k} {v}" for k, v in r["reasons"].items()))
         for place, c in r["by_jurisdiction"].items():
             out.append(f"    {place}: {c['candidates']} candidates, {c['strict_fail']} fail")
-    out += ["", "* named: owner named by the background sweep after the run delivered.", "",
+    out += ["", "* named: owner named by a background sweep after the run delivered; both: named and",
+            "  still failing strict; affect: fail OR named, once per row; b-c: billed minus candidates.",
+            "Candidates are today's rows. Where b-c is not 0, rows were filled or purged since billing and",
+            "the failing count is evidence, not an exact count of incomplete rows billed.", "",
             "Per account (pre-gate = the quota-credit question; nothing is changed automatically):"]
     for name, a in sorted(report["accounts"].items()):
         out.append(f"  {name}: {a['runs']} runs; pre-gate billed {a['billed_pre_gate']}, "
                    f"{a['candidates_pre_gate']} candidates now, {a['strict_fail_pre_gate']} fail strict now, "
-                   f"{a['named_after_delivery_pre_gate']} named after delivery; post-gate billed "
+                   f"{a['named_after_delivery_pre_gate']} named after delivery, {a['affected_pre_gate']} "
+                   f"affected, {a['unreconciled_runs_pre_gate']} runs where billed != candidates; post-gate billed "
                    f"{a['billed_post_gate']}, held {a['held_post_gate']} ({a['held_complete_now']} complete now)")
     return "\n".join(out)
 

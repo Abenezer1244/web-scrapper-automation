@@ -39,13 +39,17 @@ import argparse
 import json
 import sys
 from collections import Counter, defaultdict
+from pathlib import Path
 from typing import Any
 
-from sqlalchemy import text
+# `python scripts/cv_qualification_report.py` puts scripts/ on the path, not the repo root.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.api.lead_actionability import DELIVERY_EXCLUDED_KEY, EXCLUSION_REASONS, NOT_QUALIFIED, has_address
-from src.api.lead_qualification import OWNER_SOURCE_BY_SOURCE, qualification_reasons, stamp
-from src.workers.qualification_quality import GATE_DEPLOYED_AT
+from sqlalchemy import text  # noqa: E402
+
+from src.api.lead_actionability import DELIVERY_EXCLUDED_KEY, EXCLUSION_REASONS, NOT_QUALIFIED, has_address  # noqa: E402
+from src.api.lead_qualification import OWNER_SOURCE_BY_SOURCE, qualification_reasons, stamp  # noqa: E402
+from src.workers.qualification_quality import GATE_DEPLOYED_AT  # noqa: E402
 
 _READ_ONLY = "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
 

@@ -190,3 +190,32 @@ def test_a_failed_run_prints_the_exception_class_only(monkeypatch, capsys):
     assert rep.main() == 1
     out = capsys.readouterr()
     assert out.err.strip() == "Report failed: RuntimeError" and out.out == ""
+
+
+@pytest.mark.asyncio
+async def test_more_candidates_than_billed_is_unreconciled_too(db, business_user):
+    """Codex r2 P3: an address filled after billing adds a candidate the run never billed."""
+    cfg = await _config(db, business_user)
+    job = await _job(db, business_user, cfg, started=GATE_DEPLOYED_AT - timedelta(days=3), hours_ago=60)
+    await db.execute(text("UPDATE jobs SET billed_count = 1 WHERE id = :j"), {"j": job})
+    await _row(db, job, business_user.id, _legacy())
+    await _row(db, job, business_user.id, _legacy())
+    report = _report()
+    assert {x["job"]: x for x in report["runs"]}[job[:8]]["billed_minus_candidates"] == -1
+    [a] = report["accounts"].values()
+    assert a["unreconciled_runs_pre_gate"] == 1
+
+
+def test_the_documented_command_imports_the_app():
+    """Codex r2 P2: `python scripts/cv_qualification_report.py` must find src/ by itself."""
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    done = subprocess.run([sys.executable, str(root / "scripts" / "cv_qualification_report.py"), "--help"],
+                          cwd=root / "scripts", env=env, capture_output=True, text=True, timeout=120)
+    assert done.returncode == 0, done.stderr[-400:]
+    assert "--json" in done.stdout

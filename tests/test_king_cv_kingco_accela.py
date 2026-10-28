@@ -140,8 +140,9 @@ class _FormBox:
 class _FakeForm:
     """The Accela search form, including its postback that resets the OTHER date box.
 
-    Leaving a date box posts back; the portal re-renders the form and puts the box the
-    user is NOT in back at its default. That is what made every retry fail in production.
+    Modelled as a refresh fired when a date box is left, which puts the box the user is
+    NOT in back at its default: the late form refresh that made every retry fail in
+    production (on the live portal it comes from the record type's delayed postback).
     """
 
     START_DEFAULT = "09/17/2021"

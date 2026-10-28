@@ -467,15 +467,15 @@ async def wait_or_wall(get_page, waiting):
 
 # ── Browser ──────────────────────────────────────────────────────────────────
 
-# Passes over the two date boxes before the criteria are given up on. Leaving a date box
-# fires the portal's own postback, and that postback re-renders the form with the OTHER
-# box back at its default ("09/17/2021" for the start, today for the end) — so a
-# fill-both-then-check pass fails whenever the second box's postback lands after the
-# first box was already typed. One window hid this (the defaults happened to match a
-# 30-day range); the first multi-window run in production failed every retry on
-# "search form did not take the criteria" and shipped no unincorporated King County
-# cases at all (job 5b7b9266, 2026-09-16). Each pass re-types ONLY the boxes that are
-# wrong, then lets the form settle again.
+# Passes over the two date boxes before the criteria are given up on. A form refresh that
+# lands after a box was typed puts it back at its default (five years ago for the start,
+# today for the end), so a fill-both-then-check pass failed every retry of the first
+# multi-window run in production on "search form did not take the criteria" and shipped
+# no unincorporated King County cases at all (job 5b7b9266, 2026-09-16; again run
+# 1ad28ded, 2026-10-17). The live markup (read 2026-10-28) shows the refresh source: the
+# record type's delayed UpdatePanel postback, which _search now waits for; the date
+# boxes carry only onblur="ClearSplitChar(this, true)". Each pass re-types ONLY the boxes
+# that are wrong, then lets the form settle again, in case a refresh still lands late.
 FORM_FILL_PASSES = 4
 
 
@@ -495,10 +495,9 @@ async def fill_search_dates(page, start: date, end: date, *, timeout_ms: int) ->
             await box.press("Control+a")
             await box.press("Delete")
             await box.type(wanted[selector], delay=40)
-            # Tab leaves the box, which fires the postback that resets the OTHER box. Only
-            # worth it while a box we have not typed yet is still wrong. The LAST wrong box
-            # is never left: its value stays in the form and the search click posts it with
-            # everything else, so nothing can reset it.
+            # Tab leaves the box and lets anything it triggers settle before the next box
+            # is typed. The LAST wrong box is never left: its value stays in the form and
+            # the search (a DOM click, no blur) posts it with everything else.
             if selector != wrong[-1]:
                 await box.press("Tab")
                 await page.wait_for_load_state("networkidle", timeout=timeout_ms)

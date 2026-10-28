@@ -53,7 +53,7 @@ import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import parse_qs, urljoin, urlsplit
 
 from bs4 import BeautifulSoup
 
@@ -531,12 +531,19 @@ class AccelaPortal(BridgeScraper):
             raise RuntimeError(f"{KINGCO_ACCELA}: the portal returned its error page")
         return snap
 
-    async def _postback(self, action) -> None:
+    async def _postback(self, action, control: str | None = None) -> None:
+        """Run ``action`` and wait for its postback; with ``control``, only the POST that
+        control raised (its __EVENTTARGET) counts, never some other control's postback."""
         timeout = settings.DEFAULT_TIMEOUT * 1000
+        target = control.lstrip("#").replace("_", "$") if control else None
+
+        def is_ours(r) -> bool:
+            if r.request.method != "POST" or urlsplit(r.url).hostname != _HOST:
+                return False
+            return target is None or parse_qs(r.request.post_data or "").get("__EVENTTARGET") == [target]
+
         await self._pace()
-        async with self.page.expect_response(
-                lambda r: r.request.method == "POST" and urlsplit(r.url).hostname == _HOST,
-                timeout=timeout):
+        async with self.page.expect_response(is_ours, timeout=timeout):
             await action()
         await self.page.wait_for_load_state("networkidle", timeout=timeout)
 
@@ -556,12 +563,17 @@ class AccelaPortal(BridgeScraper):
                 or soup.select_one(SEL_START_DATE) is None or soup.select_one(SEL_END_DATE) is None):
             raise AccelaFormatError(f"{KINGCO_ACCELA}: the search form changed")
 
-        await self._pace()
-        await self.page.select_option(SEL_RECORD_TYPE, RECORD_TYPE_VALUE)
-        await self.page.wait_for_load_state("networkidle", timeout=timeout)
+        # The record type's onchange posts back from a setTimeout (an UpdatePanel refresh
+        # that re-renders the date boxes), so networkidle alone can return before it even
+        # starts and the refresh then lands on dates already typed. Wait for its response.
+        await self._postback(lambda: self.page.select_option(SEL_RECORD_TYPE, RECORD_TYPE_VALUE),
+                             SEL_RECORD_TYPE)
         await fill_search_dates(self.page, start, end, timeout_ms=timeout)
 
-        await self._postback(lambda: self.page.click(SEL_SEARCH))
+        # A DOM click runs the button's postback without moving focus, so the date box
+        # still focused is never left (no blur) between the check above and the submit.
+        await self._postback(lambda: self.page.locator(SEL_SEARCH).evaluate("el => el.click()"),
+                             SEL_SEARCH)
         # One match skips the grid and lands on that case's detail page.
         await self.page.wait_for_selector(
             f"{SEL_GRID}, {SEL_NO_RESULTS}, {SEL_DETAIL_CASE}", timeout=timeout)

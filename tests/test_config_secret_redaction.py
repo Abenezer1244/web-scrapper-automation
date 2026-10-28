@@ -31,9 +31,10 @@ def test_secrets_stripped_from_response():
     # Presence flags reflect that secrets WERE set, without leaking the value.
     assert r.deliver["webhook_secret_set"] is True
     assert r.deliver["dialer_webhook_secret_set"] is True
-    # Non-secret fields (URLs) are preserved.
-    assert r.deliver["webhook_url"] == "https://hook.example/x"
-    assert r.deliver["dialer_webhook_url"] == "https://dialer.example/y"
+    # Destination URLs come back masked (an unsigned hook's URL is its
+    # credential); see test_webhook_url_redaction.py.
+    assert r.deliver["webhook_url"] == "https://hook.example/<hidden>"
+    assert r.deliver["dialer_webhook_url"] == "https://dialer.example/<hidden>"
 
 
 def test_presence_flags_false_when_unset():

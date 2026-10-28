@@ -103,14 +103,14 @@ def _profile(user) -> dict:
 
 
 def _batch(batch) -> dict:
-    from src.api.schemas import DELIVER_SECRET_FIELDS
+    from src.api.schemas import redact_deliver
 
     deliver = batch.deliver if isinstance(batch.deliver, dict) else {}
     return {
         "id": batch.id, "name": batch.name, "state": batch.state, "status": batch.status,
         "delivery_mode": batch.delivery_mode, "fields": batch.fields,
         "enrichment": batch.enrichment, "schedule": batch.schedule,
-        "deliver": {k: v for k, v in deliver.items() if k not in DELIVER_SECRET_FIELDS},
+        "deliver": redact_deliver(deliver),
         "created_at": batch.created_at,
     }
 

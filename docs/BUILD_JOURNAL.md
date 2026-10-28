@@ -19,9 +19,9 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
-## 2026-10-28 — Results: first live check of #287-#290, cards that blanked on uncached tab switches, owner/phone filters (FE, not merged)
+## 2026-10-28 — Results: first live check of #287-#290, cards that blanked on uncached tab switches, owner/phone filters, DNC notice (FE #291)
 
-**Built / Shipped:** nothing merged or deployed. FE branch `fix/results-live-check-filters-dnc` (worktree
+**Built / Shipped:** FE #291 squash-merged as `7773d58`; Vercel Production reported success for that SHA. FE branch `fix/results-live-check-filters-dnc` (worktree
 `C:/Users/micha/bl-wt/fe-results-verify`, base `b7af3e7`), four commits: `4153a01` the empty New tab's "Review…"
 button no longer points at a list that has since emptied (`withListedAction`, shares one `isUnlisted` rule with the
 cards); `5f19f50` the summary cards and auction line stay put while another tab's list loads; `0b9e440` a Filter on
@@ -48,7 +48,7 @@ paths (`MSYS_NO_PATHCONV=1`). One live request died with `ERR_CONNECTION_RESET` 
 Shipping: the first push was rejected because `fix/results-remove-redundant-breakdown` already existed on GitHub (the
 stale source branch of #287, tree identical to its squash `aec06a4`); pushed under a new name instead of forcing.
 `gh` is not installed on this machine and reading a token from the credential manager was refused (rightly), so
-the session pushed both branches but could not open or merge the PRs.
+the session pushed both branches; the owner then installed `gh` and signed in (`gh auth login`), and the session opened and merged the PRs.
 
 **Caught & fixed:** the live check found what every stub run hid (the stub answered instantly): switching to an
 uncached tab blanked the summary cards and auction line for 2.5-3s, flashed the header's no-breakdown fallback
@@ -66,7 +66,7 @@ popover too); focus now moves to the first filter. DNC notice: Codex plan consul
 back tables can show phones), its rule adopted (always on finished lead lists + current-page override + menu line);
 diff review GATE PASS. Cost accepted: about two lines of notice on finished runs with no phones.
 
-**Pending / Handoff:** a live look after deploy. King tax `016d3490`: the Already delivered card says 14,753, its
+**Pending / Handoff:** a logged-in live look at #291 (the session login was deleted after the read-only check). King tax `016d3490`: the Already delivered card says 14,753, its
 tab 14,772 (no-address 237 vs 218 has its drift line; delivered has none).
 
 **Facts learned:** a stub that answers instantly cannot show loading-state bugs; give it a production-like delay

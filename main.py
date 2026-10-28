@@ -2,7 +2,7 @@ import logging
 import uuid
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -19,6 +19,7 @@ from src.api import (
 )
 from src.api.errors import RunRefusedHTTPException, run_refused_handler
 from src.api.middleware import DatabaseUnavailableMiddleware, SecurityHeadersMiddleware
+from src.api.middleware.rate_limit import require_valid_bff_assertion
 from src.api.readiness import database_ready
 from src.config import settings
 
@@ -60,6 +61,9 @@ app = FastAPI(
     redoc_url="/redoc" if settings.DEBUG else None,
     openapi_url="/openapi.json" if settings.DEBUG else None,
     lifespan=lifespan,
+    # Rejects a forged/misconfigured web-app IP assertion before any endpoint
+    # (and so before any commit or audit_log call) runs.
+    dependencies=[Depends(require_valid_bff_assertion)],
 )
 
 # ─── Middleware ────────────────────────────────────────────────────────────────

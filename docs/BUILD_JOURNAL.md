@@ -21,13 +21,16 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ## 2026-10-28 — Results: first live check of #287-#290, cards that blanked on uncached tab switches, owner/phone filters (FE, not merged)
 
-**Built / Shipped:** nothing merged or deployed. FE branch `fix/results-remove-redundant-breakdown` (worktree
-`C:/Users/micha/bl-wt/fe-results-verify`, base `a70d199`), three commits: `83d8825` the empty New tab's "Review…"
+**Built / Shipped:** nothing merged or deployed. FE branch `fix/results-live-check-filters-dnc` (worktree
+`C:/Users/micha/bl-wt/fe-results-verify`, base `b7af3e7`), four commits: `4153a01` the empty New tab's "Review…"
 button no longer points at a list that has since emptied (`withListedAction`, shares one `isUnlisted` rule with the
-cards); `c60cd39` the summary cards and auction line stay put while another tab's list loads; `4c99d0f` a Filter on
+cards); `5f19f50` the summary cards and auction line stay put while another tab's list loads; `0b9e440` a Filter on
 New and Already delivered, except the empty-New explanation (Owner: absentee / out of state, Contact: has a phone number, Tax on tax runs) wired to the
 `absentee`, `out_of_state` and `dialer_ready` params `GET /jobs/{id}/results` and `/download` already took
-(`lib/results-filters.ts`). No backend change.
+(`lib/results-filters.ts`); `aed543c` the DNC notice wherever phone numbers can be seen or exported: always on a
+finished run's lead lists, on any list whose page shows a phone, and a one-line warning in the export menu (it used
+to show only when the page on screen had a phone, so it vanished on Already delivered, later pages, searches,
+filters and every list load, and never accompanied the CSV). No backend change.
 
 **Tried / Decided:** the live check ran read-only on bridgeleads.io with the owner's session (headed Chromium for MFA,
 8 GB free this time): navigation, tab/card clicks, Details, sort only; never Export (downloads are tracked) or Look
@@ -54,12 +57,13 @@ CSV scope, applied-count semantics, no cross-run leakage); diff review FAIL with
 old run's filters and page for a render; Reset then typing within 400ms revived the old tax bound; an undone filter
 brought a masked selection back), 1 declined (no Filter on an empty New tab, per #287); re-review GATE PASS. Our own
 testing found Reset hiding itself dropped keyboard focus to the body with the popover open (true of the old tax
-popover too); focus now moves to the first filter.
+popover too); focus now moves to the first filter. DNC notice: Codex plan consult NO-GO on a page-sampled
+"run has phones" latch (sampling cannot prove absence; `found` counts include email-only answers; No address / Held
+back tables can show phones), its rule adopted (always on finished lead lists + current-page override + menu line);
+diff review GATE PASS. Cost accepted: about two lines of notice on finished runs with no phones.
 
-**Pending / Handoff:** owner: push the FE branch and open the PR (three commits), then a live look after deploy.
-The DNC notice above the table is gated on the current page having a phone, so it can be missing on a run whose
-phones sit on later pages while "Has a phone number" is offered: worth its own change. King tax `016d3490`: the
-Already delivered card says 14,753, its tab 14,772 (no-address 237 vs 218 has its drift line; delivered has none).
+**Pending / Handoff:** a live look after deploy. King tax `016d3490`: the Already delivered card says 14,753, its
+tab 14,772 (no-address 237 vs 218 has its drift line; delivered has none).
 
 **Facts learned:** a stub that answers instantly cannot show loading-state bugs; give it a production-like delay
 (`STUB_RESULTS_DELAY_MS`). Run-level fields that ride on a per-list response need a run-keyed latch or they vanish

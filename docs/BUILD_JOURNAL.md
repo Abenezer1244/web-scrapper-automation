@@ -45,6 +45,10 @@ suspended on No address / Held back. Per-run state moved into `<RunResults key={
 **Failed / Blocked:** the first local stub run never reached the API: the dev CSP permits local HTTP API connections only at
 `localhost:8000` / `127.0.0.1:8000`, so the stub moved there (no config change). Git Bash rewrites `/results/...` CLI args into Windows
 paths (`MSYS_NO_PATHCONV=1`). One live request died with `ERR_CONNECTION_RESET` (King tax at 375px); clean on re-check.
+Shipping: the first push was rejected because `fix/results-remove-redundant-breakdown` already existed on GitHub (the
+stale source branch of #287, tree identical to its squash `aec06a4`); pushed under a new name instead of forcing.
+`gh` is not installed on this machine and reading a token from the credential manager was refused (rightly), so
+the session pushed both branches but could not open or merge the PRs.
 
 **Caught & fixed:** the live check found what every stub run hid (the stub answered instantly): switching to an
 uncached tab blanked the summary cards and auction line for 2.5-3s, flashed the header's no-breakdown fallback

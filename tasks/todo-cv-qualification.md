@@ -206,3 +206,19 @@ No quota/billing/delivery row is read for writing or changed.
   enqueues; a test proves a write inside it fails and that the run leaves no audit_events/alert rows; sources
   and reasons allowlisted; account ids shortened with collision detection.
 - Wording: monitoring writes audit_events through send_ops_alert; it never writes results/jobs.
+
+## Review (Phase 3 + #548 re-check, 2026-10-28, machine C:/Users/micha)
+- [x] #548 re-verified: 113 related tests pass; negative control fails the key test; Codex review GATE PASS,
+      its two P3 test gaps adopted (e0417cda on fix/cv-frozen-hold-reasons-verify, mutation-checked).
+- [x] 3a monitoring (9cf58513, e1051278, c36d9eda): Codex consult r1 FAIL (folded in before code); review
+      r1 FAIL (2 P2 + P3, adopted), r2 FAIL (float threshold, adopted), r3 PASS.
+- [x] 3b dry-run report (33ea7204, ade5b61d, bfafa95e): review r1 FAIL (3 P2 + P3, adopted), r2 FAIL (CLI
+      import path, adopted), r3 GATE PASS.
+- [x] Tests: 27 monitoring + 11 report new; 339 passed across every gate-adjacent suite; app import and
+      openapi --check OK; ruff clean. Mutants killed: boundary, dialer status, tenant join, live-vs-frozen
+      yield, per-jurisdiction cohort, rounded and strict threshold, unstamped judging, READ ONLY, report
+      tenant check, Tacoma rule, CLI bootstrap.
+- Not done here: a representative EXPLAIN of the gate queries on prod data (needs read-only prod access);
+  the prod run of the report (no Railway CLI on this machine); full 6.8k-test suite (CI runs it).
+- Follow-up found: scripts/data_quality_report.py fails as documented (`No module named 'src'`), same fix.
+- [ ] Owner: approve push/PRs, merge order (#548, then Phase 3; no migration), run the report, decide credit.

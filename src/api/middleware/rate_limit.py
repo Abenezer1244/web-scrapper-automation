@@ -10,6 +10,7 @@ Usage:
 
 import ipaddress
 import logging
+import secrets
 import time
 
 import redis.asyncio as aioredis
@@ -101,6 +102,46 @@ def _is_trusted_proxy(ip_str: str) -> bool:
 # real client is the Nth entry from the end. Railway/Fly = 1. (I1)
 _TRUSTED_PROXY_HOPS = max(1, settings.TRUSTED_PROXY_HOPS)
 
+BFF_SECRET_HEADER = "X-BL-BFF-Secret"
+BFF_CLIENT_IP_HEADER = "X-BL-Client-IP"
+# Below this a secret is guessable; such an entry is never trusted.
+_BFF_SECRET_MIN_LEN = 32
+
+
+def _bff_secrets() -> list[str]:
+    # Comma-separated so a rotation can accept "new,old" for one deploy window.
+    return [
+        s.strip()
+        for s in settings.BFF_SHARED_SECRET.split(",")
+        if len(s.strip()) >= _BFF_SECRET_MIN_LEN
+    ]
+
+
+def _asserted_client_ip(request: Request, presented: str) -> str:
+    """The canonical client IP from a BFF assertion, or 401."""
+    trusted = any(
+        secrets.compare_digest(presented.encode(), s.encode()) for s in _bff_secrets()
+    )
+    if trusted:
+        try:
+            return str(ipaddress.ip_address(request.headers.get(BFF_CLIENT_IP_HEADER, "").strip()))
+        except ValueError:
+            pass
+    _logger.warning("Rejected BFF client-IP assertion (trusted_secret=%s)", trusted)
+    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid client assertion")
+
+
+def require_valid_bff_assertion(request: Request) -> None:
+    """App-wide dependency (main.py): reject a presented-but-invalid BFF
+    assertion BEFORE any endpoint runs, and cache the asserted IP.
+
+    Without this, the first client_ip() call could come from audit_log() after
+    a mutation had committed, failing the request and dropping its audit event.
+    """
+    presented = request.headers.get(BFF_SECRET_HEADER)
+    if presented is not None:
+        request.state.bff_client_ip = _asserted_client_ip(request, presented)
+
 
 def client_ip(request: Request) -> str:
     """Extract the client IP, trusting forwarded headers only from known proxies.
@@ -122,7 +163,21 @@ def client_ip(request: Request) -> str:
     itself appended to X-Forwarded-For. If a CDN like Cloudflare is added in
     front later, validate the immediate peer or strip/normalize the header at
     the edge before trusting its vendor header.
+
+    BFF assertion: the web app's server-side auth route (bridgeleads-web
+    /api/session/login) calls the API from Vercel, so the peer is Vercel, not
+    the user. It sends the user's IP in X-BL-Client-IP together with a shared
+    secret in X-BL-BFF-Secret. A matching secret makes that IP authoritative;
+    a PRESENTED but invalid assertion is rejected (401) rather than ignored, so
+    a misconfigured BFF fails loudly instead of collapsing every user into one
+    shared rate-limit bucket. require_valid_bff_assertion() validates it before
+    any endpoint runs; this reuses that result.
     """
+    presented = request.headers.get(BFF_SECRET_HEADER)
+    if presented is not None:
+        cached = getattr(request.state, "bff_client_ip", None)
+        return cached if cached is not None else _asserted_client_ip(request, presented)
+
     direct_ip = request.client.host if request.client else "unknown"
 
     if _is_trusted_proxy(direct_ip):

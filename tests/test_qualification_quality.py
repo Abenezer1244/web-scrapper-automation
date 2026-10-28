@@ -349,6 +349,8 @@ def test_a_drop_of_exactly_the_threshold_warns_and_just_under_does_not():
     [w] = qq.evaluate_yield(_measured(10, 4))[0]                 # 90% -> 60%: exactly 30
     assert (w["run_pct"], w["baseline_pct"]) == (60.0, 90.0)
     assert qq.evaluate_yield(_measured(10, 3))[0] == []          # 90% -> 70%
+    # 45/54 -> 8/15 is exactly 30 points; float subtraction reads 29.999999999999993.
+    assert len(qq.evaluate_yield(_measured(15, 7, base_n=54, base_held=9))[0]) == 1
     # Unrounded: 66.67% (40/60) vs 36.7% (367/1000) is a 29.97-point drop; the rounded
     # figures (66.7 - 36.7) would read exactly 30 and warn.
     assert qq.evaluate_yield(_measured(1000, 633, base_n=60, base_held=20))[0] == []

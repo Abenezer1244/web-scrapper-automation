@@ -42,6 +42,7 @@ counts only). Alerts go through send_ops_alert, which writes the durable audit_e
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from fractions import Fraction
 
 from sqlalchemy import text
 
@@ -258,13 +259,14 @@ def qualification_yield(db, *, job_id: str, county: str, state: str, record_type
     }
 
 
-def _pass_rate(c: dict[str, int]) -> float:
-    return 100.0 * (c["n"] - c["held"]) / c["n"] if c["n"] else 0.0
+def _pass_rate(c: dict[str, int]) -> Fraction:
+    """Exact percent: float subtraction reads 45/54 - 8/15 (exactly 30 points) as 29.99..."""
+    return Fraction(100 * (c["n"] - c["held"]), c["n"]) if c["n"] else Fraction(0)
 
 
 def _pass_pct(c: dict[str, int]) -> float:
     """For display only; the threshold compares _pass_rate."""
-    return round(_pass_rate(c), 1)
+    return round(float(_pass_rate(c)), 1)
 
 
 def evaluate_yield(measured: dict) -> tuple[list[dict], list[str]]:
@@ -277,8 +279,8 @@ def evaluate_yield(measured: dict) -> tuple[list[dict], list[str]]:
         if run["n"] < MIN_RUN_ROWS or base["n"] < MIN_BASELINE_ROWS:
             unjudged.append(cohort)
             continue
-        # Unrounded and inclusive: a drop of exactly DROP_POINTS warns (Codex P2).
-        if _pass_rate(base) - _pass_rate(run) >= DROP_POINTS:
+        # Exact, unrounded and inclusive: a drop of exactly DROP_POINTS warns (Codex P2 r1, r2).
+        if _pass_rate(base) - _pass_rate(run) >= Fraction(DROP_POINTS):
             now, before = _pass_pct(run), _pass_pct(base)
             warnings.append({"kind": "qualification_collapse", "field": cohort, "run_pct": now,
                              "baseline_pct": before, "run_rows": run["n"], "held": run["held"],

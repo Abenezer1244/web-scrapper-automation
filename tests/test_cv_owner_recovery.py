@@ -993,3 +993,140 @@ def test_a_registration_failure_is_logged_at_error_with_the_exception(monkeypatc
     errors = [r for r in records if r.levelno == logging.ERROR and "NOT registered" in r.getMessage()]
     assert errors and errors[0].exc_info is not None
     assert "src.workers.cv_owner_recovery.recover_code_violation_owners_task" in app.tasks
+
+
+# ── held code violations (qualification gate, #542) ──────────────────────────
+
+def _held(pin: str, **extra) -> dict:
+    return {**_located(pin), "qualification_policy": "code_violation_v1",
+            "delivery_excluded_reason": "not_qualified",
+            "qualification_hold": {"reasons": ["missing_owner", "mailing_unresolved"],
+                                   "policy": "code_violation_v1"}, **extra}
+
+
+async def test_a_held_code_violation_is_named_and_stays_held(db, business_user, monkeypatch):
+    """Since the gate every unnamed code violation is held; the delivered-only rule meant the
+    sweep could never reach one (actionable requires qualified, which requires an owner)."""
+    _lease(monkeypatch)
+    job_id = await _job(db, business_user)
+    rid = await _row(db, business_user, job_id, pin="9138100481", ed=_held("9138100481"))
+    _county(monkeypatch, {"9138100481": _Resp(200, _page("9138100481", "7011 ROOSEVELT WAY NE LLC"))})
+    used = (await db.execute(text("SELECT records_used FROM users WHERE id = :u"),
+                             {"u": business_user.id})).scalar()
+
+    stats = await asyncio.to_thread(_tick)
+
+    assert stats["found"] == 1
+    row = await _get(db, rid)
+    ed = row.enrichment_data
+    assert row.party_name == "7011 ROOSEVELT WAY NE LLC"
+    assert (ed["owner_source"], ed["owner_pin"]) == ("king_erealproperty", "9138100481")
+    assert ed["delivery_excluded_reason"] == "not_qualified"            # naming never unholds
+    assert ed["qualification_hold"]["reasons"] == ["missing_owner", "mailing_unresolved"]
+    assert (await db.execute(text("SELECT records_used FROM users WHERE id = :u"),
+                             {"u": business_user.id})).scalar() == used
+
+
+async def test_held_rows_the_gate_cannot_deliver_are_never_looked_up(db, business_user, monkeypatch):
+    _lease(monkeypatch)
+    asked = _county(monkeypatch, {})
+    job_id = await _job(db, business_user)
+    no_address = await _row(db, business_user, job_id, pin="1000000201", ed=_held("1000000201"))
+    await db.execute(text("UPDATE results SET property_address = NULL WHERE id = :i"), {"i": no_address})
+    await db.commit()
+    superseded = await _row(db, business_user, job_id, pin="1000000202", duplicate=True,
+                            ed=_held("1000000202"))
+    await db.execute(text("UPDATE results SET duplicate_reason = 'superseded' WHERE id = :i"),
+                     {"i": superseded})
+    await db.commit()
+    unstamped = {k: v for k, v in _held("1000000203").items() if k != "qualification_policy"}
+    legacy = await _row(db, business_user, job_id, pin="1000000203", ed=unstamped)
+    capped = await _row(db, business_user, job_id, pin="1000000204",
+                        ed=_held("1000000204", delivery_excluded_reason="over_quota"))
+
+    stats = await asyncio.to_thread(_tick)
+
+    assert asked == [] and stats["parcels"] == 0
+    for rid in (no_address, superseded, legacy, capped):
+        assert "cv_owner_recovery_last_at" not in (await _get(db, rid)).enrichment_data
+
+
+async def test_delivered_leads_are_named_before_held_ones(db, business_user, monkeypatch):
+    _lease(monkeypatch)
+    monkeypatch.setattr(cvr, "_BATCH_PARCELS", 1)
+    job_id = await _job(db, business_user)
+    held = await _row(db, business_user, job_id, pin="9138100481", ed=_held("9138100481"),
+                      date="10/20/2026")
+    delivered = await _row(db, business_user, job_id, pin="5249802770", date="01/02/2026")
+    asked = _county(monkeypatch, {
+        "9138100481": _Resp(200, _page("9138100481", "HELD OWNER")),
+        "5249802770": _Resp(200, _page("5249802770", "DELIVERED OWNER")),
+    })
+
+    await asyncio.to_thread(_tick)
+
+    assert asked == ["5249802770"]
+    assert (await _get(db, delivered)).party_name == "DELIVERED OWNER"
+    assert (await _get(db, held)).party_name is None
+
+
+async def test_a_held_row_taken_over_during_the_lookup_is_left_alone(db, business_user, monkeypatch):
+    """The write re-applies eligibility: a row a later run took over (now a duplicate) is stale."""
+    _lease(monkeypatch)
+    job_id = await _job(db, business_user)
+    rid = await _row(db, business_user, job_id, pin="9138100481", ed=_held("9138100481"))
+
+    def _get_and_take_over(url, **_k):
+        from src.db.session import system_sync_session
+
+        with system_sync_session() as other:
+            other.execute(text("UPDATE results SET is_duplicate = true, duplicate_reason = 'superseded' "
+                               "WHERE id = :i"), {"i": rid})
+            other.commit()
+        return _Resp(200, _page("9138100481", "SOMEONE"))
+
+    monkeypatch.setattr(kca, "safe_get", _get_and_take_over)
+    stats = await asyncio.to_thread(_tick)
+    assert stats["stale"] == 1
+    assert (await _get(db, rid)).party_name is None
+
+
+async def test_a_held_row_whose_tenant_differs_from_its_job_is_never_touched(
+    db, business_user, starter_user, monkeypatch,
+):
+    """Codex P3: the held branch keeps the job/tenant scope of the delivered one."""
+    _lease(monkeypatch)
+    asked = _county(monkeypatch, {})
+    foreign_job = await _job(db, starter_user)
+    rid = await _row(db, business_user, foreign_job, pin="1000000211", ed=_held("1000000211"))
+
+    stats = await asyncio.to_thread(_tick)
+
+    assert asked == [] and stats["parcels"] == 0
+    assert "cv_owner_recovery_last_at" not in (await _get(db, rid)).enrichment_data
+
+
+@pytest.mark.parametrize("change", [
+    "UPDATE results SET enrichment_data = (enrichment_data::jsonb - 'qualification_policy')::json WHERE id = :i",
+    "UPDATE results SET enrichment_data = (enrichment_data::jsonb || '{\"delivery_excluded_reason\": \"over_quota\"}')::json WHERE id = :i",
+], ids=["stamp_removed", "reclassified_over_quota"])
+async def test_a_held_row_whose_hold_changed_during_the_lookup_is_left_alone(
+    db, business_user, monkeypatch, change,
+):
+    """Codex P3: the write re-applies the held branch (stamp and exclusion reason)."""
+    _lease(monkeypatch)
+    job_id = await _job(db, business_user)
+    rid = await _row(db, business_user, job_id, pin="9138100481", ed=_held("9138100481"))
+
+    def _get_and_change(url, **_k):
+        from src.db.session import system_sync_session
+
+        with system_sync_session() as other:
+            other.execute(text(change), {"i": rid})
+            other.commit()
+        return _Resp(200, _page("9138100481", "SOMEONE"))
+
+    monkeypatch.setattr(kca, "safe_get", _get_and_change)
+    stats = await asyncio.to_thread(_tick)
+    assert stats["stale"] == 1
+    assert (await _get(db, rid)).party_name is None

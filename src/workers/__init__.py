@@ -52,6 +52,8 @@ app = Celery(
         "src.workers.property_recovery",
         # Tacoma code-violation owner naming (Pierce ATIP): a BEAT task, same trap as above.
         "src.workers.pierce_cv_owner_recovery",
+        # Late delivery of held code violations a sweep completed: a BEAT task, same trap.
+        "src.workers.cv_late_delivery",
         # Contact-lookup action worker (Phase 1b-2): lookup_contacts is published by
         # the confirm endpoint and re-published by the action reconciler. Same trap.
         "src.workers.contact_lookup_action",

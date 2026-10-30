@@ -258,20 +258,61 @@ def reserve_job_quota(db, *, job_id: str, user_id, want: int) -> int | None:
     if not claimed:
         return None
 
-    # 1b. The account may still be charged (S4-01, Codex 4a review). The
-    #    pre-scrape check is a read, and a freeze or a term end can commit while
-    #    the scrape runs. Decided HERE under the users row lock the grant below
-    #    takes anyway (jobs, then users: the order above), so nothing can land
-    #    between this decision and the grant. A frozen or ended account is
-    #    granted nothing: every row is capped, so nothing is delivered, billed or
-    #    traced. `reserved_at` is the clock read under that lock: the decision,
-    #    the window and the job's record all use this one instant.
-    block, reserved_at = account_charge_state(db, user_id, lock="FOR UPDATE")
+    # 1b + 2. The user-locked grant (grant_records below): charge eligibility, lazy
+    #    rollover and the atomic grant, judged at one post-lock clock.
+    granted, new_start, reserved_at, block = grant_records(db, user_id=user_id, want=want)
     if block:
         _logger.warning(
             "Job %s: account %s froze or ended during the run; granting 0 records",
             job_id, user_id,
         )
+    # 3. Record what was granted AND which entitlement window it was charged to,
+    #    so settlement and release can tell "still current" from "the window this
+    #    was charged to has since rolled and been zeroed". Comparing calendar
+    #    months (the previous test) is only accidentally right while every window
+    #    starts on the 1st. Same job row, already locked by step 1 — no new lock
+    #    is taken. `new_start` is never NULL (users.quota_anchor_at,
+    #    quota_period_start and quota_period_end are NOT NULL, and
+    #    public.quota_next_start is STRICT over them and a non-NULL `at`),
+    #    so reservation_is_current_sql never falls back to the pre-088 reading
+    #    of `reserved_at`, and replacing the claim marker here changes nothing
+    #    for settlement or release.
+    db.execute(
+        sa_text(
+            "UPDATE jobs SET reserved_count = :n, "
+            "quota_period_start = CAST(:ws AS timestamptz), "
+            "reserved_at = CAST(:at AS timestamptz) "
+            "WHERE id = :jid"
+        ),
+        {"n": granted, "jid": job_id, "ws": new_start, "at": reserved_at},
+    )
+    return granted
+
+
+def grant_records(db, *, user_id, want: int, unlimited_grants: bool = False):
+    """Take up to ``want`` records from the account's quota under the users row lock.
+
+    Returns ``(granted, window_start, at, block)``. Shared by reserve_job_quota (a
+    run's reservation) and src/workers/cv_late_delivery.py (one held code violation
+    delivered after its run), so both judge the account and its window by ONE rule.
+    Does NOT commit. A caller that also locks a job must lock it FIRST (jobs, then
+    users: reserve_job_quota's documented order).
+
+    ``unlimited_grants``: an unlimited plan (effective limit -1) is granted ``want``
+    and charged for it. A run never reserves on an unlimited plan (it is charged at
+    billing), so reserve_job_quota leaves this off and keeps its arithmetic; a late
+    delivery is charged here or nowhere, so it turns it on.
+    """
+    # 1b. The account may still be charged (S4-01, Codex 4a review). The
+    #    pre-scrape check is a read, and a freeze or a term end can commit while
+    #    the scrape runs. Decided HERE under the users row lock the grant below
+    #    takes anyway (jobs, then users), so nothing can land between this
+    #    decision and the grant. A frozen or ended account is granted nothing:
+    #    every row is capped, so nothing is delivered, billed or traced. `at` is
+    #    the clock read under that lock: the decision, the window and the
+    #    caller's record all use this one instant.
+    block, at = account_charge_state(db, user_id, lock="FOR UPDATE")
+    if block:
         want = 0
     # 2. Compute the grant and consume it in ONE statement. FOR UPDATE serialises
     #    concurrent reservations for this user: the loser blocks, then re-reads
@@ -297,7 +338,8 @@ def reserve_job_quota(db, *, job_id: str, user_id, want: int) -> int | None:
             "  SELECT cur.*, " + window_cte_sql() + " FROM cur"
             "), g AS ("
             "  SELECT w.*,"
-            "         LEAST(:want, GREATEST(0, eff_limit - base))"
+            "         CASE WHEN :unlimited AND eff_limit = -1 THEN :want"
+            "              ELSE LEAST(:want, GREATEST(0, eff_limit - base)) END"
             "           AS granted"
             "  FROM w"
             ") UPDATE users u SET"
@@ -306,30 +348,9 @@ def reserve_job_quota(db, *, job_id: str, user_id, want: int) -> int | None:
             + "  FROM g WHERE u.id = g.id"
             "  RETURNING g.granted, g.new_start"
         ),
-        {"want": want, "uid": str(user_id), "at": reserved_at},
+        {"want": want, "uid": str(user_id), "at": at, "unlimited": unlimited_grants},
     ).one()
-    granted = int(res_row.granted or 0)
-    # 3. Record what was granted AND which entitlement window it was charged to,
-    #    so settlement and release can tell "still current" from "the window this
-    #    was charged to has since rolled and been zeroed". Comparing calendar
-    #    months (the previous test) is only accidentally right while every window
-    #    starts on the 1st. Same job row, already locked by step 1 — no new lock
-    #    is taken. `new_start` is never NULL (users.quota_anchor_at,
-    #    quota_period_start and quota_period_end are NOT NULL, and
-    #    public.quota_next_start is STRICT over them and a non-NULL `at`),
-    #    so reservation_is_current_sql never falls back to the pre-088 reading
-    #    of `reserved_at`, and replacing the claim marker here changes nothing
-    #    for settlement or release.
-    db.execute(
-        sa_text(
-            "UPDATE jobs SET reserved_count = :n, "
-            "quota_period_start = CAST(:ws AS timestamptz), "
-            "reserved_at = CAST(:at AS timestamptz) "
-            "WHERE id = :jid"
-        ),
-        {"n": granted, "jid": job_id, "ws": res_row.new_start, "at": reserved_at},
-    )
-    return granted
+    return int(res_row.granted or 0), res_row.new_start, at, block
 
 
 def skip_reason_for_config(active: bool, paused_reason: str | None) -> str | None:

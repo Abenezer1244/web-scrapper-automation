@@ -122,6 +122,41 @@ async def test_a_download_token_for_another_job_is_refused(client, db):
     assert dl.status_code in (401, 403) and "S307 OWNER" not in dl.text
 
 
+_BROWSER = {"Accept": "text/html,application/xhtml+xml,*/*;q=0.8"}
+
+
+@pytest.mark.asyncio
+async def test_a_refused_link_opened_in_a_browser_gets_a_page_back_to_the_app(client, db):
+    # The Download button and the emailed links NAVIGATE here, so a refusal is
+    # the page the user lands on: same status, plain HTML with a way back.
+    session, user_id, job_id = await _session_with_a_done_run(client, db)
+    other = mint_download_token(user_id, str(uuid.uuid4()), ttl_seconds=60)
+    page = await client.get(f"/jobs/{job_id}/download", params={"token": other}, headers=_BROWSER)
+    api = await client.get(f"/jobs/{job_id}/download", params={"token": other})
+    assert page.status_code == api.status_code
+    assert page.headers["content-type"].startswith("text/html")
+    assert page.headers["cache-control"] == "no-store"
+    assert "Back to BridgeLeads" in page.text and "S307 OWNER" not in page.text
+    assert api.headers["content-type"].startswith("application/json")
+
+
+@pytest.mark.asyncio
+async def test_a_malformed_job_id_link_gets_the_same_page(client, db):
+    session, user_id, job_id = await _session_with_a_done_run(client, db)
+    token = mint_download_token(user_id, job_id, ttl_seconds=60)
+    page = await client.get("/jobs/not-a-uuid/download", params={"token": token}, headers=_BROWSER)
+    assert page.status_code == 404 and "Back to BridgeLeads" in page.text
+
+
+@pytest.mark.asyncio
+async def test_a_good_link_opened_in_a_browser_still_downloads_the_csv(client, db):
+    session, user_id, job_id = await _session_with_a_done_run(client, db)
+    token = mint_download_token(user_id, job_id, ttl_seconds=60)
+    dl = await client.get(f"/jobs/{job_id}/download", params={"token": token}, headers=_BROWSER)
+    assert dl.status_code == 200 and "S307 OWNER" in dl.text
+    assert "attachment" in dl.headers["content-disposition"]
+
+
 # ─── S3-09: rate limits ───────────────────────────────────────────────────────
 
 @pytest.mark.asyncio

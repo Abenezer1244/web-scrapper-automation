@@ -18,11 +18,12 @@ import ipaddress
 import logging
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
 
 import pytest
 
 from src.api.middleware.security import _ip_is_blocked
-from src.utils.pinned_http import pinned_session
+from src.utils.pinned_http import log_host, pinned_session
 from src.workers import webhook_delivery as wd
 from tests.test_webhook_dns_pinning import _loopback_adapter
 
@@ -42,6 +43,10 @@ class _Handler(BaseHTTPRequestHandler):
         elif self.path.startswith("/echo"):  # an endpoint that echoes our request line
             body = f"bad request: {self.path}".encode()
             self.send_response(400)
+        elif self.path.startswith("/badredirect"):  # an authority urlparse raises on
+            body = b""
+            self.send_response(302)
+            self.send_header("Location", "https://[broken/x?k=LOCATIONSECRET123")
         else:  # /flood: a large plain body
             body = b"x" * (32 * 1024 * 1024)
             self.send_response(500)
@@ -165,3 +170,28 @@ def test_ipv4_embedding_forms_of_blocked_addresses_are_blocked(addr):
 def test_public_addresses_stay_allowed(addr):
     # Positive control: NAT64 of a PUBLIC address (8.8.8.8) is still public.
     assert not _ip_is_blocked(ipaddress.ip_address(addr))
+
+
+def test_a_malformed_redirect_location_neither_crashes_nor_leaks(local_endpoint, caplog):
+    # urlparse raises on this authority; uncaught, the task would fail and its
+    # exception text land in Celery's failure log and result backend.
+    with caplog.at_level(logging.DEBUG):
+        result = wd.deliver_job_webhook.apply(
+            args=("job-badloc", f"{local_endpoint}/badredirect", {"event": "job.completed"})
+        ).get()
+    assert result["status"] == "failed" and result["reason"] == "invalid_response"
+    assert "LOCATIONSECRET123" not in caplog.text
+
+
+def test_an_unparseable_url_never_puts_its_netloc_in_an_exception():
+    # Fullwidth solidus: urlparse raises with the raw netloc in its message.
+    url = "https://CATCHSECRET123／example.com/hooks"
+    with pytest.raises(ValueError, match="CATCHSECRET123"):
+        urlparse(url)
+    assert log_host(url) == "?"
+    assert wd._redact_url_secrets(f"echo {url}", url) == "echo <redacted>"
+
+
+def test_a_username_token_is_redacted_too():
+    url = "https://USERTOKEN12345@hooks.example.com/x"
+    assert wd._redact_url_secrets(f"got {url}", url) == "got https://<redacted>@hooks.example.com/x"

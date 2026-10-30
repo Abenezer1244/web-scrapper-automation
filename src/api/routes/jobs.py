@@ -3,6 +3,7 @@
 import asyncio
 import concurrent.futures
 import functools
+import html
 import json
 import secrets
 import threading
@@ -16,7 +17,7 @@ import redis as _sync_redis
 import redis.exceptions as _redis_exceptions
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials
 from sqlalchemy import (
     ColumnElement,
@@ -115,6 +116,28 @@ from src.utils.skip_trace_pause_state import UNKNOWN as PAUSE_UNKNOWN
 from src.utils.skip_trace_pause_state import PauseState, read_pause_state
 
 _logger = setup_logger("api.jobs")
+
+# Rows per cursor FETCH when a job's lead CSV streams (download_export): small
+# enough to keep the API's memory flat, large enough not to round-trip per row.
+_DOWNLOAD_STREAM_ROWS = 500
+
+
+class _ClosingStreamingResponse(StreamingResponse):
+    """A StreamingResponse that always runs `on_close` when the response ends,
+    however it ends. Starlette can return without closing the body iterator when
+    a send fails, and an iterator that never started has no `finally` to run; a
+    server-side cursor left to garbage collection would hold its transaction
+    (and a pooled connection) open. `on_close` must be idempotent."""
+
+    def __init__(self, *args, on_close, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._on_close = on_close
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            await self._on_close()
 
 # Live log stream (GET /jobs/{id}/logs).
 _SSE_TERMINAL_STATUSES = frozenset({"done", "failed", "cancelled"})
@@ -2412,7 +2435,44 @@ async def _user_from_download_token(token: str, job_id: str, db: AsyncSession) -
     return user
 
 
+# One page for every failure, so it reveals no more than the uniform JSON error
+# does; the status code is unchanged.
+_DOWNLOAD_LINK_ERROR_HTML = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Download unavailable - BridgeLeads</title></head>
+<body style="font-family: system-ui, sans-serif; max-width: 32rem; margin: 15vh auto; padding: 0 1rem; color: #1a1a1a">
+<h1 style="font-size: 1.25rem">This download isn't available</h1>
+<p>The link may have expired, or the export is no longer available. Go back to BridgeLeads and start the download again.</p>
+<p><a href="{home}">Back to BridgeLeads</a></p>
+</body></html>"""
+
+
+def _html_errors_for_download_links(route):
+    """A ``?token=`` download is a browser NAVIGATION (the app's Download button
+    and the emailed links), so a refusal is the page the user lands on: show a
+    plain page with a way back instead of raw JSON. Bearer callers, and anything
+    not asking for HTML, keep the JSON error."""
+
+    @functools.wraps(route)
+    async def wrapper(*args, **kwargs):
+        try:
+            return await route(*args, **kwargs)
+        except HTTPException as exc:
+            request = kwargs.get("request")
+            accept = request.headers.get("accept", "") if request is not None else ""
+            if kwargs.get("token") and "text/html" in accept:
+                return HTMLResponse(
+                    _DOWNLOAD_LINK_ERROR_HTML.replace("{home}", html.escape(settings.FRONTEND_URL)),
+                    status_code=exc.status_code,
+                    headers={"Cache-Control": "no-store"},
+                )
+            raise
+
+    return wrapper
+
+
 @router.get("/{job_id}/download", tags=["jobs"])
+@_html_errors_for_download_links
 async def download_export(
     job_id: str,
     token: str = Query(default=""),
@@ -2529,10 +2589,11 @@ async def download_export(
             for cond in owner_conditions:
                 dl_query = dl_query.where(cond)
 
-            results_query = await db.execute(dl_query)
-            records = results_query.scalars().all()
+            # Probe, don't load: the rows themselves are streamed below. One row
+            # settles the empty-job / header-only rules and the activation signal.
+            has_rows = (await db.execute(dl_query.limit(1))).first() is not None
 
-            if not records:
+            if not has_rows:
                 # A genuinely empty job still 404s (existing contract). Everything else
                 # gets a valid header-only CSV.
                 #
@@ -2566,11 +2627,10 @@ async def download_export(
                 if not job_has_any:
                     raise HTTPException(status_code=404, detail="No records found for this job")
 
-            # Build CSV in memory — includes skip trace fields (phone, email)
-            # when available. The download always reads LIVE from the DB, so
+            # Streamed, not built in memory — includes skip trace fields (phone,
+            # email) when available. The download always reads LIVE from the DB, so
             # phone/email appear as soon as the skip trace dispatcher completes,
             # even if the original export was uploaded before skip trace ran.
-            output = io.StringIO()
             # Canonical dialer-ready CSV via the shared builder — the SAME format the
             # scheduled/R2 export uses, so every export path produces an identical file
             # (no "use the in-app download for dialers" caveat). This reads LIVE DB rows,
@@ -2598,9 +2658,50 @@ async def download_export(
                         ScraperConfig.user_id == user.id,
                     )
                 )).one_or_none()
-            write_lead_csv(records, output, **config_export_options(cfg))
+            export_options = config_export_options(cfg)
 
-            csv_bytes = output.getvalue().encode("utf-8")
+            # The CSV streams from a server-side cursor in partitions, so the API
+            # never holds the whole export (an Agency job is unbounded). It stays on
+            # THIS session and transaction: the RLS GUC above is transaction-local,
+            # and a cursor survives the Supabase transaction pooler only inside one
+            # transaction. Each FETCH is bounded. There is deliberately no
+            # idle-in-transaction timeout: a slow but reading client leaves the
+            # transaction idle between FETCHes, and that must not cut its download.
+            await db.execute(text("SET LOCAL statement_timeout = '120s'"))
+            stream = await db.stream_scalars(
+                dl_query.execution_options(yield_per=_DOWNLOAD_STREAM_ROWS)
+            )
+            partitions = stream.partitions()
+            try:
+                # The FIRST partition is fetched here, before any byte is sent, so a
+                # failing query or first FETCH is still the clean 500 below instead
+                # of a 200 with a cut-off body. Later failures can only truncate.
+                first_partition = await anext(partitions, None)
+            except BaseException:
+                await stream.close()
+                raise
+            export_now = datetime.now(UTC)  # one "today" for every partition
+
+            async def csv_chunks():
+                try:
+                    buf = io.StringIO()
+                    # A header-only file when no row ships (rows exist, none deliverable).
+                    write_lead_csv(first_partition or [], buf, now=export_now, **export_options)
+                    yield buf.getvalue().encode("utf-8")
+                    async for partition in partitions:
+                        buf = io.StringIO()
+                        write_lead_csv(
+                            partition, buf, write_header=False, now=export_now, **export_options
+                        )
+                        yield buf.getvalue().encode("utf-8")
+                except Exception:
+                    # Headers are already out: the client sees a cut-off download,
+                    # never a 500. Log it; the cursor still closes below.
+                    _logger.exception("Download stream failed for job %s", job_id)
+                    raise
+                finally:
+                    await stream.close()
+
             # The two files must not be confused once they sit in a downloads folder.
             filename = (
                 f"bridgeleads_{job_id[:8]}_already_delivered.csv"
@@ -2609,12 +2710,12 @@ async def download_export(
             )
 
             from starlette.background import BackgroundTask
-            from starlette.responses import Response
 
             from src.api.download_tracking import mark_leads_downloaded
 
-            return Response(
-                content=csv_bytes,
+            return _ClosingStreamingResponse(
+                csv_chunks(),
+                on_close=stream.close,
                 media_type="text/csv",
                 headers={
                     "Content-Disposition": f'attachment; filename="{filename}"',
@@ -2632,7 +2733,7 @@ async def download_export(
                 # a valid CSV but not leads in anyone's hands.
                 background=(
                     BackgroundTask(mark_leads_downloaded, str(user.id))
-                    if records else None
+                    if has_rows else None
                 ),
             )
         except HTTPException:

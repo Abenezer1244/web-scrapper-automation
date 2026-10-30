@@ -250,6 +250,11 @@ class Settings(BaseSettings):
     # entry to X-Forwarded-For). Railway/Fly = 1. Used by the rate limiter to
     # take the real client IP from the RIGHT of the XFF chain (rate_limit I1).
     TRUSTED_PROXY_HOPS: int = 1
+    # Shared secret the web app's server-side auth route sends so its
+    # X-BL-Client-IP assertion is trusted (rate_limit.client_ip). Server-only on
+    # both sides; >= 32 chars. "new,old" accepts both during a rotation. Empty =
+    # no assertion is ever trusted.
+    BFF_SHARED_SECRET: str = ""
 
     # ─── Analytics (Phase 3) ──────────────────────────────────────────────────
     # Day-grouping timezone for the dashboard charts. Postgres groups

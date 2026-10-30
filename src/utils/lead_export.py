@@ -18,6 +18,7 @@ Input is duck-typed: each record may be an ORM object (attribute access) OR a di
 exports never silently drop them.
 """
 import csv
+from collections.abc import Iterable
 from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -677,11 +678,13 @@ def build_lead_export_row(
 
 
 def write_lead_csv(
-    records: list[Any], filelike, hidden_fields: set[str] | None = None,
+    records: Iterable[Any], filelike, hidden_fields: set[str] | None = None,
     columns: list[str] | None = None,
     *,
     labels: dict[str, str] | None = None,
     context: dict[str, Any] | None = None,
+    write_header: bool = True,
+    now: datetime | None = None,
 ) -> None:
     """Write the canonical lead CSV (header + rows) to an open text file/StringIO.
 
@@ -700,23 +703,28 @@ def write_lead_csv(
     `labels` (from `resolve_export_layout`) replaces the header TEXT only; None
     writes the keys themselves (legacy_v1). `context` is the source county/state/
     record_type for rows that don't carry it (see build_lead_export_row).
+
+    A file written in several calls (a streamed download, one partition of rows
+    at a time) passes `write_header=False` after the first call and the SAME `now`
+    to every call, so all its rows share one pair of "today"s.
     """
     # One consistent pair of "today"s for the whole file: UTC for the tax signals,
     # county-local for the auction countdown (lead_signals.AUCTION_TZ). Derived from a
     # SINGLE instant — two separate now() calls can straddle a date boundary and pair a
     # UTC date from one moment with a local date from another (Codex).
-    _now = datetime.now(UTC)
+    _now = now or datetime.now(UTC)
     today = _now.date()
     auction_today = auction_reference_date(_now)
     fieldnames = columns or LEAD_CSV_COLUMNS
     writer = csv.DictWriter(filelike, fieldnames=fieldnames, extrasaction="ignore")
-    if labels:
-        # Same csv dialect as DictWriter, so quoting/line endings match the rows.
-        csv.writer(filelike).writerow(
-            [sanitize_for_csv(labels.get(key, key)) for key in fieldnames]
-        )
-    else:
-        writer.writeheader()
+    if write_header:
+        if labels:
+            # Same csv dialect as DictWriter, so quoting/line endings match the rows.
+            csv.writer(filelike).writerow(
+                [sanitize_for_csv(labels.get(key, key)) for key in fieldnames]
+            )
+        else:
+            writer.writeheader()
     for rec in records:
         writer.writerow(_apply_visibility(
             build_lead_export_row(

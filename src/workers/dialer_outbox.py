@@ -21,14 +21,13 @@ SECURITY (docs/dialer_connectors_spike.md), all enforced here:
   carry host + status + the outbox row id, never the token/PII/body.
 """
 from datetime import UTC, datetime
-from urllib.parse import urlparse
 
 import requests
 
 from src.api.lead_actionability import actionable_condition
 from src.api.middleware.security import validate_outbound_webhook
 from src.utils.logger import setup_logger
-from src.utils.pinned_http import is_blocked_destination, pinned_session
+from src.utils.pinned_http import is_blocked_destination, log_host, pinned_session
 from src.workers import app
 
 _logger = setup_logger("worker.dialer_outbox")
@@ -231,7 +230,7 @@ def _deliver_one(connector, req: dict, row) -> None:
     delivered_at). Never raises — a per-row failure must not abort the chunk.
     """
     url = req["url"]
-    host = urlparse(url).hostname or "?"
+    host = log_host(url)
 
     # Host pin: the destination must be the connector's hardcoded vendor host.
     if host not in connector.ALLOWED_HOSTS:
@@ -279,6 +278,17 @@ def _deliver_one(connector, req: dict, row) -> None:
         row.last_error = f"network error: {type(exc).__name__}"
         _logger.warning(
             "dialer_outbox row %s: network error to %s (%s)",
+            str(row.id)[:8], host, type(exc).__name__,
+        )
+        return
+    except ValueError as exc:
+        # A malformed 3xx Location: requests parses it for resp.next even with
+        # allow_redirects=False, and its text can carry the receiver's credential
+        # (webhook_delivery has the same clause). Type only; this must not raise.
+        row.status = "failed"
+        row.last_error = f"invalid response: {type(exc).__name__}"
+        _logger.warning(
+            "dialer_outbox row %s: unparseable response from %s (%s)",
             str(row.id)[:8], host, type(exc).__name__,
         )
         return

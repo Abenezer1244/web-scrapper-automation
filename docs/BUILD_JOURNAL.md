@@ -19,6 +19,55 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-10-30 — Why production served an older commit after #292, and a watch that now catches it (FE #293)
+
+**Built / Shipped:** FE #293 squash-merged as `07098dd`: `.github/workflows/production-deploy-watch.yml` and
+`scripts/check-production-deploy.sh`. On every push to master it reads the GitHub deployments Vercel writes and fails
+the run if no production deployment of the commit succeeds within 15 min (unless, once that wait ends with none, a
+newer commit containing it has deployed successfully from a deployment created since `WATCH_SINCE`, default 10 min
+before the run), if every build failed, or if an older commit's production deployment, created up to an hour before
+ours, succeeded after ours (checked after a 5-min settle).
+GitHub API trouble or unknown ancestry exits 2, never a pass. Read-only (`contents`/`deployments` read, the run's own
+token), `actions/checkout` pinned to the v7.0.1 commit, inputs through `env` only; `.gitattributes` forces `*.sh` to
+LF. First real run (on its own merge) passed in about 6 min: waited for Vercel, saw `07098dd` live at 15:17:32Z, no
+older replacement; `vercel inspect bridgeleads.io` agreed.
+
+**Tried / Decided:** investigated read-only (Vercel API, GitHub API, git reflogs, this machine's Claude Code session
+logs). CORRECTION to the previous entry, which said "Vercel's bot deployed ... the older `20d5de7`": that deployment's
+Vercel `source` is `cli`, not `git`. The sequence: on 10-28 a landing session force-pushed its feature branch
+(`0f230a1`) and, seconds later in the same command, pushed a local squash with the identical tree to master
+(`20d5de7`). Vercel built only the branch preview; master got no deployment and no commit status, nothing failed or
+canceled. On 10-29 that session's own production deploy was blocked and it handed the owner a command; the owner ran
+it on 10-30 at 14:31:46Z, 39 s after #292's Git build started; it finished last and took the domain; the landing
+session promoted #292 back at 14:34:16Z. A control (`b7af3e7` / `902550a`, same tree, pushed ~1 min apart) deployed
+both, so identical trees alone do not skip a build; the seconds-apart pushes are the leading hypothesis, unproven
+(Vercel's GitHub App delivery log is visible only to Vercel). Project settings rule out a skip setting (no ignored-
+build step, production branch master, auto-deploy on, not paused).
+
+**Failed / Blocked:** the merge of #293 was refused by the auto-mode classifier until the owner said "merge". No repo
+webhooks to inspect (Vercel uses its GitHub App). Git Bash path conversion again broke `vercel api /v13/...` and a
+state-file path (`MSYS_NO_PATHCONV=1`, `cygpath -m`).
+
+**Caught & fixed:** Codex plan consult NO-GO (list order is not time; only an older build that SUCCEEDED AFTER ours
+matters; nonterminal and `inactive` statuses; API errors are not "no deployment"; the superseded rule must prove a
+descendant), all adopted. Diff review FAIL: several production deployments of one commit; an old descendant deployment
+could excuse a missed push (now only deployments since `WATCH_SINCE`); rollback wording. Re-review FAIL: `head -n 1`
+under pipefail could SIGPIPE `sort`. Declined: early-stop paging (it would rely on list order). Final GATE PASS. Own
+testing found an API failure inside `< <(...)` would read as "nothing found" and that error text inside `$(...)` was
+swallowed (now captured first and sent to stderr), and a `printf` that wrote a literal carriage return into
+`.gitattributes`. Tested on the real deployment history: `4fd3219` (the incident) exits 1 naming `20d5de7` and both
+times; `7773d58`, `b7af3e7` 0; `013b13a` (merged in, never the tip) 0 with the watch at its push and 1 with the default
+window; missing environment 1; bad input and an invalid token 2.
+
+**Pending / Handoff:** none. Limits by design: GitHub does not see Vercel promotions or rollbacks (a deliberate
+rollback is reported; the message says no action is needed), an older deploy finishing after the 5-min window is not
+seen, and there is no Vercel token in CI. Merge to master through PRs; never deploy a specific older SHA to production
+once master has moved.
+
+**Facts learned:** a Vercel deployment's `source` (`git` vs `cli`) tells a Git-triggered build from a manual one; the
+GitHub deployment `creator` is `vercel[bot]` for both. A missed Git deploy is silent: no status at all, so only a check
+that expects one notices.
+
 ## 2026-10-29/30 — Results: #291 verified live; every card that disagrees with its list is now said (FE #292); a production deploy race
 
 **Built / Shipped:** FE #292 squash-merged as `4fd3219`; Vercel Production built it, and bridgeleads.io serves it

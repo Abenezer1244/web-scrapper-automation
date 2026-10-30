@@ -345,6 +345,14 @@ app.conf.beat_schedule = {
         "task": "src.workers.cv_owner_recovery.recover_code_violation_owners_task",
         "schedule": crontab(minute="18-59/20"),  # :18, :38, :58 every hour
     },
+    "deliver-completed-held-code-violations": {
+        # Delivers and bills held code violations the owner/mailing sweeps completed
+        # (src/workers/cv_late_delivery.py): one record each, against the quota window
+        # it is delivered in, never over quota, never a superseded row. No county
+        # request, so it is clear of every source lease. CV_LATE_DELIVERY_ENABLED.
+        "task": "src.workers.cv_late_delivery.deliver_completed_held_rows_task",
+        "schedule": crontab(minute="5-59/20"),  # :05, :25, :45 every hour
+    },
     "recover-deferred-property": {
         # The reading half of `property_lookup_deferred`: fills King property
         # addresses a job could not look up (condo unit extract first, then the

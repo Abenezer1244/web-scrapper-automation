@@ -12,6 +12,7 @@ them; these tests pin the checks that watch the gate (src/workers/qualification_
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
 from datetime import UTC, datetime, timedelta
 
@@ -145,7 +146,7 @@ async def test_rows_outside_the_gate_are_never_judged(db, business_user, variant
         spec["enrichment_data"] = {k: v for k, v in spec["enrichment_data"].items() if k != "qualification_policy"}
     await _row(db, job, business_user.id, spec)
     found = _mine(_measure(qq.gate_invariants), job)
-    assert found == {"unheld_unqualified": {}, "outbound_held": {}, "unstamped": {}}
+    assert found == {kind: {} for kind in qq.INVARIANTS}
 
 
 @pytest.mark.asyncio
@@ -413,3 +414,47 @@ async def test_the_gate_check_still_runs_after_a_coverage_check_aborts_its_trans
     monkeypatch.setattr(dq, "check_job", aborts)
     stats = dq.run_data_quality_sweep(lookback_hours=2, limit=500)
     assert stats["checked"] == 0 and stats["gate_breaches"] >= 1
+
+
+# ── late delivery (src/workers/cv_late_delivery.py) ──────────────────────────
+
+_LATE = {"delivered_at": "2026-10-30T12:00:00+00:00", "policy": POLICY_CODE_VIOLATION}
+_HOLD = {"reasons": ["missing_owner"], "policy": POLICY_CODE_VIOLATION}
+
+
+@pytest.mark.asyncio
+async def test_a_late_delivered_row_still_counts_as_held_at_the_gate(db, business_user):
+    """Codex (late delivery r1): the run's pass rate and the baselines are frozen at the gate;
+    late delivery removes the mark but must not rewrite them."""
+    cfg = await _config(db, business_user)
+    run = await _cohort_run(db, business_user, cfg, n=20, held=10, hours_ago=1, hold=_HOLD)
+    late_ids = (await db.execute(text(
+        "SELECT id FROM results WHERE job_id = :j AND enrichment_data->>'delivery_excluded_reason' = "
+        "'not_qualified' ORDER BY id LIMIT 4"), {"j": run})).scalars().all()
+    await db.execute(text(
+        "UPDATE results SET party_name = 'NAMED LATER', enrichment_data = ((enrichment_data::jsonb "
+        "- 'delivery_excluded_reason') || jsonb_build_object('late_delivery', CAST(:late AS jsonb)))::json "
+        "WHERE id = ANY(:ids)"), {"late": json.dumps(_LATE), "ids": list(late_ids)})
+    await db.commit()
+
+    measured = _yield(run)
+    assert measured["run"] == {SEATTLE: {"n": 20, "held": 10}}
+    assert measured["reasons"] == {SEATTLE: {"missing_owner": 10}}
+    assert _mine(_measure(qq.gate_invariants), run) == {kind: {} for kind in qq.INVARIANTS}
+
+
+@pytest.mark.asyncio
+async def test_a_hold_released_without_a_late_charge_is_a_breach(db, business_user):
+    cfg = await _config(db, business_user)
+    job = await _job(db, business_user, cfg)
+    await _row(db, job, business_user.id, seattle(), hold=_HOLD)                  # released, uncharged
+    rid =await _row(db, job, business_user.id, seattle(), hold=_HOLD)
+    await db.execute(text("UPDATE results SET enrichment_data = (enrichment_data::jsonb || "
+                          "jsonb_build_object('late_delivery', CAST(:late AS jsonb)))::json WHERE id = :i"),
+                     {"late": json.dumps(_LATE), "i": rid})                          # released, charged
+    await db.commit()
+    await _row(db, job, business_user.id, _held(), mark=NOT_QUALIFIED, hold=_HOLD)  # still held
+
+    found = _mine(_measure(qq.gate_invariants), job)
+    assert found["released_without_charge"] == {job: 1}
+    assert found["unheld_unqualified"] == {}

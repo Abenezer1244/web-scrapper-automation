@@ -318,6 +318,10 @@ class Settings(BaseSettings):
     # (src/workers/owner_recovery.py). Kill switch: False stops it before any
     # eRealProperty request, e.g. while King is rate-limiting us.
     OWNER_RECOVERY_ENABLED: bool = True
+    # Background delivery of held code violations that became complete after their run
+    # (src/workers/cv_late_delivery.py): each is delivered and billed once, against the
+    # quota window it is delivered in. Kill switch: False delivers and bills nothing.
+    CV_LATE_DELIVERY_ENABLED: bool = True
     # Background sweep that fills King property addresses a job could not look up
     # (src/workers/property_recovery.py): condo extract first, then eRealProperty under the
     # shared lease. Kill switch: False stops it before any request.

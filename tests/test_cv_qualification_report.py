@@ -219,3 +219,17 @@ def test_the_documented_command_imports_the_app():
                           cwd=root / "scripts", env=env, capture_output=True, text=True, timeout=120)
     assert done.returncode == 0, done.stderr[-400:]
     assert "--json" in done.stdout
+
+
+@pytest.mark.asyncio
+async def test_a_late_delivered_row_is_counted_on_its_own(db, business_user):
+    """Held at the gate, delivered and charged later: never a candidate the run billed."""
+    cfg = await _config(db, business_user)
+    job = await _job(db, business_user, cfg, hours_ago=2)
+    late_ed = {**seattle()["enrichment_data"],
+               "late_delivery": {"delivered_at": "2026-10-30T12:00:00+00:00", "policy": "code_violation_v1"},
+               "qualification_hold": {"reasons": ["missing_owner"], "policy": "code_violation_v1"}}
+    await _row(db, job, business_user.id, {**seattle(), "enrichment_data": late_ed})
+    await _row(db, job, business_user.id, seattle())
+    r = {x["job"]: x for x in _report()["runs"]}[job[:8]]
+    assert (r["late_delivered"], r["candidates"], r["held"]) == (1, 1, 0)

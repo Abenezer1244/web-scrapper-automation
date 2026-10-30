@@ -25,8 +25,9 @@ Per run:
     rows delivered incomplete, as far as the stored evidence shows.
   * billed - candidates: where it is not 0 the failing count cannot be tied row-for-row to
     what was billed (rows filled or purged since); the report says so, never hides it.
-  * held: rows the gate held (post-gate runs), and how many are complete now (the next
-    run delivers those).
+  * held: rows the gate held (post-gate runs) and still holds, and how many are complete
+    now (late delivery, src/workers/cv_late_delivery.py, delivers those). late: rows the
+    gate held that were delivered and charged one record each after the run.
   * already delivered: prior-run copies, and how many point at a source run that is gone
     (or that belongs to another account, which is treated as gone).
 
@@ -120,7 +121,7 @@ def _run(job: dict) -> dict:
         "billed": int(job["billed_count"] or 0),
         "candidates": 0, "strict_pass": 0, "strict_fail": 0, "reasons": Counter(),
         "named_after_delivery": 0, "named_and_still_failing": 0, "affected": 0,
-        "held": 0, "held_complete_now": 0,
+        "held": 0, "held_complete_now": 0, "late_delivered": 0,
         "prior_run_copies": 0, "copies_source_gone": 0,
         "by_jurisdiction": defaultdict(lambda: {"candidates": 0, "strict_fail": 0}),
     }
@@ -148,6 +149,11 @@ def build_report(db) -> dict:
             run["held"] += 1
             if not _strict_reasons(row):
                 run["held_complete_now"] += 1
+            continue
+        if isinstance(ed, dict) and ed.get("late_delivery") is not None:
+            # Held at the gate, delivered and charged one record later by
+            # src/workers/cv_late_delivery.py: not part of what the run billed.
+            run["late_delivered"] += 1
             continue
         if _excluded(ed) or not has_address(row):
             continue
@@ -208,13 +214,14 @@ def render(report: dict) -> str:
            "Read only; counts only.", ""]
     head = (f"{'account':<10}{'job':<10}{'finished':<12}{'gate':<6}{'billed':>7}{'cands':>7}"
             f"{'pass':>6}{'fail':>6}{'named*':>7}{'both':>6}{'affect':>7}{'b-c':>6}{'held':>6}"
-            f"{'held ok':>8}{'copies':>7}{'gone':>6}")
+            f"{'held ok':>8}{'late':>6}{'copies':>7}{'gone':>6}")
     out.append(head)
     for r in report["runs"]:
         out.append(f"{r['account']:<10}{r['job']:<10}{r['finished'] or '':<12}{r['gate']:<6}"
                    f"{r['billed']:>7}{r['candidates']:>7}{r['strict_pass']:>6}{r['strict_fail']:>6}"
                    f"{r['named_after_delivery']:>7}{r['named_and_still_failing']:>6}{r['affected']:>7}"
                    f"{r['billed_minus_candidates']:>6}{r['held']:>6}{r['held_complete_now']:>8}"
+                   f"{r['late_delivered']:>6}"
                    f"{r['prior_run_copies']:>7}{r['copies_source_gone']:>6}")
         if r["reasons"]:
             out.append("    fail reasons (overlap): " + ", ".join(f"{k} {v}" for k, v in r["reasons"].items()))

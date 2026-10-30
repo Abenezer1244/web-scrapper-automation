@@ -143,3 +143,89 @@ Codex consult r2: P1-2, P1-3 resolved. P1-1 residual (stale frozen reasons after
 planned (_CLEAR_HOLDS_SQL strips qualification_hold with the mark) + belt ADOPTED: the API returns hold_reasons
 only while delivery_excluded_reason = 'not_qualified'. Test: re-run that qualifies a held row -> key gone, row
 leaves the tab. Plan reconciled; awaiting owner approval.
+
+## Phase 3 plan (2026-10-28, worktree C:/Users/micha/bl-wt/cv-phase3, branch feat/cv-qual-phase3)
+Context: #548 re-verified on this machine (113 related tests pass; negative control fails the key test;
+Codex review GATE PASS, its two P3 test gaps adopted as commit e0417cda on fix/cv-frozen-hold-reasons-verify).
+
+### 3a Monitoring (<= 3 files: src/workers/qualification_quality.py NEW, src/workers/data_quality.py hook,
+tests/test_qualification_quality.py NEW). Judged once per done job by the existing hourly sweep
+(same Redis claim/judged marker, same send_ops_alert cooldown). Counts only, never PII, never writes.
+- I1 gate breach (critical, no baseline needed): subject, non-duplicate, has address, NOT marked
+  not_qualified/over_quota, and NOT qualified_sql now. Means the hold step missed a row, or a delivered
+  row lost a value after delivery (it silently vanished from its file). Alert key per job.
+- I2 outbound breach (critical): dialer_deliveries / pending_skip_trace_rows of this job whose result row
+  is withheld (withheld_sql). Both writers filter on the gate today; this proves it stays so.
+- C1 pass-rate collapse: among subject, non-duplicate, has-address rows, held share = marked not_qualified
+  (the frozen decision, not live state). Pass rate vs the same county x record_type's other done jobs
+  over 90 days (subject rows only). Alert when pass rate fell >= 30 points, run >= 10 subject rows,
+  baseline >= 50 subject rows. Zero qualified with a healthy baseline is this case. Body: per jurisdiction
+  (enrichment_data.source) and per frozen reason.
+- Not built: "qualified without ownership evidence" is structurally impossible (qualified_sql requires
+  owner_source allowlisted for the source AND owner_pin == shown parcel); I1 covers drift.
+
+### 3b Historical dry-run report (2 files: scripts/cv_qualification_report.py NEW, tests NEW)
+Read-only (SET TRANSACTION READ ONLY), counts only, account ids shortened to 8 chars, no names/addresses.
+Per done code_violation run and per jurisdiction: found / billed (non-dup actionable) / stamped vs legacy;
+billed rows that fail the strict rule NOW, by reason (legacy rows evaluated as if stamped, via stamp()
+on a copy, nothing written); held rows and whether they are complete now; prior_run copies whose original
+was purged. Summary per account: billed-before-gate rows failing strict rule (the 929 quota question).
+No quota/billing/delivery row is read for writing or changed.
+
+### 3c Accela #332 (fix/accela-search-form-postback e7f14bc6): rebase/assess vs main, live portal check
+(read-only GETs/POSTs to the public search, bounded), tests, Codex review.
+
+### 4 Quota decision on pre-gate billed rows: owner decides from the 3b report. Nothing automatic.
+
+### Phase 3 consult r1 (Codex GATE FAIL, 6 P1 / 4 P2): reconciliation, all adopted unless noted
+- P1 I2 queue != spend: I2 now counts only work that went out: dialer_deliveries status='delivered' and
+  pending_skip_trace_rows in ('submitting','submitted','completed','unmatched'), on rows MARKED
+  not_qualified (frozen before any send, so a hit is a breach, not drift). Joined on result_id AND user_id.
+- P1 once-per-job cannot see drift: I1/I2/I3 move out of check_job into a recurring, set-based global check
+  over every done post-gate job finished in the last 90 days, once per sweep tick, ONE alert per kind
+  (incident level, cooldown key "qualification_gate/<kind>", body = counts + short job ids). A condition that
+  persists re-alerts after the cooldown, which is also the retry for a failed send (Codex P2-7).
+- P1 stamp integrity: I3 = rows of code_violation jobs STARTED at/after the gate boundary without the stamp.
+  Boundary = GATE_DEPLOYED_AT, 2026-10-27 01:30 UTC (deploy 01:09Z per this file + restart margin; a job that
+  started earlier can straddle the deploy and is not judged). Keyed on jobs.started_at, not finish time.
+- P2 revalidate done inside the check: the global SQL joins jobs.status = 'done' itself.
+- P1 C1 frozen numerator / mutable denominator: yield is row-level and fully frozen: among subject
+  non-duplicate rows (no address filter, the hold also holds no-address rows), held = marked not_qualified;
+  everything else (new, over_quota) passes. Mark and is_duplicate are both frozen at the gate.
+- P2 jurisdiction mix: cohorts are county x state x record_type x enrichment_data.source (allowlisted to the
+  policy's sources, else 'other'), baseline = same cohort, other done post-gate jobs, 90 days. "Insufficient
+  baseline" is reported, not alerted. Held rows without a frozen record count as reason "unrecorded".
+- P1 judged marker skips recent jobs at deploy: marker key versioned (bl:dq:checked:v2:...), so the last day's
+  jobs are judged once more under the new check (coverage alerts stay inside their cooldown).
+- P1 report billing evidence: billed total = jobs.billed_count (stored, never recomputed); reconstructed
+  candidates shown next to it with the discrepancy, never called "billed".
+- P2 credit decision numbers: per account and run: stored billed total, surviving pre-gate candidates, strict
+  pass/fail now, unique failing rows, overlapping reason counts, recovered since delivery (owner named by
+  the sweep: cv_owner_recovery_outcome = 'found'), purged/unreconciled. The 929 is labelled a prior measurement.
+- P2 executable read-only contract: one READ ONLY transaction opened first; no helper that commits, alerts or
+  enqueues; a test proves a write inside it fails and that the run leaves no audit_events/alert rows; sources
+  and reasons allowlisted; account ids shortened with collision detection.
+- Wording: monitoring writes audit_events through send_ops_alert; it never writes results/jobs.
+
+## Review (Phase 3 + #548 re-check, 2026-10-28, machine C:/Users/micha)
+- [x] #548 re-verified: 113 related tests pass; negative control fails the key test; Codex review GATE PASS,
+      its two P3 test gaps adopted (e0417cda on fix/cv-frozen-hold-reasons-verify, mutation-checked).
+- [x] 3a monitoring (9cf58513, e1051278, c36d9eda): Codex consult r1 FAIL (folded in before code); review
+      r1 FAIL (2 P2 + P3, adopted), r2 FAIL (float threshold, adopted), r3 PASS.
+- [x] 3b dry-run report (33ea7204, ade5b61d, bfafa95e): review r1 FAIL (3 P2 + P3, adopted), r2 FAIL (CLI
+      import path, adopted), r3 GATE PASS.
+- [x] Tests: 27 monitoring + 11 report new; 339 passed across every gate-adjacent suite; app import and
+      openapi --check OK; ruff clean. Mutants killed: boundary, dialer status, tenant join, live-vs-frozen
+      yield, per-jurisdiction cohort, rounded and strict threshold, unstamped judging, READ ONLY, report
+      tenant check, Tacoma rule, CLI bootstrap.
+- Not done here: a representative EXPLAIN of the gate queries on prod data (needs read-only prod access);
+  the prod run of the report (no Railway CLI on this machine); full 6.8k-test suite (CI runs it).
+- Follow-up found: scripts/data_quality_report.py fails as documented (`No module named 'src'`), same fix.
+- [ ] Owner: approve push/PRs, merge order (#548, then Phase 3; no migration), run the report, decide credit.
+
+## Quota decision (owner, 2026-10-30): C, no credit
+Prod dry run (scripts/cv_qualification_report.py, read only, 2026-10-30): one account (b6d2095d, the owner's test
+admin), 5 pre-gate runs, 4,212 billed = 4,212 candidates (reconciled on every run); 929 fail strict now (unchanged
+since 10-25), 2,181 named after delivery, 3,085 affected; run 1ad28ded: all 491 affected. No post-gate run yet.
+Owner chose C (no credit): the account is the owner's own test admin. Nothing changed.
+Open question to the owner: an opt-in for incomplete records (include in CSV, or deliver when completed).

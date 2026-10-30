@@ -202,7 +202,7 @@ async def test_a_claim_taken_after_discovery_is_caught_under_the_lock(db, busine
     job = await _job(db, business_user, cfg)
     rid = await _held_row(db, business_user, job)
     with system_sync_session() as s:
-        [found] = s.execute(text(late._CANDIDATES_SQL), {"batch": 10}).mappings().all()
+        [found] = s.execute(text(late._CANDIDATES_SQL), {"batch": 10, "per_account": 10}).mappings().all()
         s.rollback()
     later = await _job(db, business_user, cfg)
     newer = await _row(db, later, business_user.id, seattle())
@@ -299,6 +299,56 @@ async def test_two_ticks_at_once_charge_once(db, business_user):
 
     assert sum(r["delivered"] for r in results) == 5
     assert await _used(db, business_user) == used + 5
+
+
+@pytest.mark.asyncio
+async def test_one_accounts_backlog_never_crowds_out_another(db, business_user, starter_user, monkeypatch):
+    """Codex P2: oldest-first over everyone let an account with no quota hold every slot."""
+    await db.execute(text("UPDATE users SET records_used = records_limit WHERE id = :u"), {"u": business_user.id})
+    await db.execute(text("UPDATE users SET plan = 'business', records_limit = 5000, records_used = 0 "
+                          "WHERE id = :u"), {"u": starter_user.id})
+    await db.commit()
+    full_cfg, other_cfg = await _config(db, business_user), await _config(db, starter_user)
+    full_job, other_job = await _job(db, business_user, full_cfg), await _job(db, starter_user, other_cfg)
+    for _ in range(6):
+        await _held_row(db, business_user, full_job)           # older, and cannot be charged
+    theirs = await _held_row(db, starter_user, other_job)
+
+    stats = late.deliver_completed_held_rows(batch=3)
+
+    assert stats["delivered"] == 1 and stats["no_quota"] == 1   # one try for the full account, then skipped
+    assert DELIVERY_EXCLUDED_KEY not in (await _state(db, theirs))[0]
+
+
+@pytest.mark.asyncio
+async def test_a_failure_after_the_grant_rolls_the_charge_back(db, business_user, monkeypatch):
+    cfg = await _config(db, business_user)
+    job = await _job(db, business_user, cfg)
+    rid = await _held_row(db, business_user, job)
+    used = await _used(db, business_user)
+    monkeypatch.setattr(late, "_DELIVER_SQL", "UPDATE results SET no_such_column = 1")
+
+    stats = _tick()
+
+    assert stats["errors"] == 1 and stats["delivered"] == 0
+    assert await _used(db, business_user) == used               # the grant went with the rollback
+    assert (await _state(db, rid))[0][DELIVERY_EXCLUDED_KEY] == NOT_QUALIFIED
+
+
+@pytest.mark.asyncio
+async def test_a_full_account_whose_window_rolled_is_charged_in_the_new_window(db, business_user):
+    """The grant is judged at the post-lock clock: a window that ended resets the counter."""
+    cfg = await _config(db, business_user)
+    job = await _job(db, business_user, cfg)
+    await _held_row(db, business_user, job)
+    await db.execute(text(
+        "UPDATE users SET records_used = records_limit, quota_period_start = now() - interval '40 days', "
+        "quota_period_end = now() - interval '10 days', quota_anchor_at = now() - interval '40 days' "
+        "WHERE id = :u"), {"u": business_user.id})
+    await db.commit()
+
+    assert _tick()["delivered"] == 1
+    assert await _used(db, business_user) == 1
 
 
 @pytest.mark.asyncio

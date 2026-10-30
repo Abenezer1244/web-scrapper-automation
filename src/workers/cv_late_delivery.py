@@ -55,6 +55,9 @@ LATE_KEY = "late_delivery"
 # Rows per tick. Each is one short transaction; the bound only keeps a backlog from
 # holding the beat worker.
 _BATCH_ROWS = 200
+# Rows per account per tick, taken round-robin (every account's oldest row before any
+# account's second), so one account's backlog never crowds the others out (Codex P2).
+_PER_ACCOUNT_ROWS = 20
 _STATEMENT_TIMEOUT_MS = 10000
 
 _HELD = (f"r.enrichment_data::jsonb->>'{POLICY_KEY}' = '{POLICY_CODE_VIOLATION}' "
@@ -64,18 +67,24 @@ _ELIGIBLE = (f"r.is_duplicate = false AND r.duplicate_reason IS NULL "
              f"AND jsonb_typeof(r.enrichment_data::jsonb) = 'object' AND {_HELD} "
              f"AND {qualified_sql('r')}")
 
-# Discovery only (ids): oldest held first. Every condition is decided again under the
-# locks below, so a row that changes after this read is simply skipped.
+# Discovery only (ids, on the system session: it spans accounts). Round-robin across
+# accounts, oldest first within each. Every condition is decided again under the locks,
+# in the account's own RLS session, so a row that changes after this read is skipped.
 _CANDIDATES_SQL = f"""
-    SELECT r.id::text AS id, r.user_id::text AS user_id, r.job_id::text AS job_id
-    FROM results r
-    JOIN jobs j ON j.id = r.job_id AND j.user_id = r.user_id AND j.status = 'done'
-    JOIN scraper_configs sc ON sc.id = j.scraper_config_id AND sc.user_id = j.user_id
-                           AND sc.record_type = 'code_violation'
-    JOIN delivered_records dr ON dr.user_id = r.user_id AND dr.dedup_hash = r.dedup_hash
-                             AND dr.first_result_id = r.id
-    WHERE {_ELIGIBLE}
-    ORDER BY r.created_at, r.id
+    SELECT id, user_id, job_id FROM (
+      SELECT r.id::text AS id, r.user_id::text AS user_id, r.job_id::text AS job_id,
+             r.created_at,
+             row_number() OVER (PARTITION BY r.user_id ORDER BY r.created_at, r.id) AS rn
+      FROM results r
+      JOIN jobs j ON j.id = r.job_id AND j.user_id = r.user_id AND j.status = 'done'
+      JOIN scraper_configs sc ON sc.id = j.scraper_config_id AND sc.user_id = j.user_id
+                             AND sc.record_type = 'code_violation'
+      JOIN delivered_records dr ON dr.user_id = r.user_id AND dr.dedup_hash = r.dedup_hash
+                               AND dr.first_result_id = r.id
+      WHERE {_ELIGIBLE}
+    ) c
+    WHERE rn <= :per_account
+    ORDER BY rn, created_at, id
     LIMIT :batch
 """  # noqa: S608 -- splices only module constants; every value is bound
 
@@ -100,7 +109,7 @@ _DELIVER_SQL = f"""
 
 def deliver_completed_held_rows(*, batch: int = _BATCH_ROWS) -> dict:
     """One bounded tick. Returns counts (also read by the tests); never raises for one row."""
-    from src.db.session import system_sync_session
+    from src.db.session import rls_sync_session, system_sync_session
 
     stats = {"candidates": 0, "delivered": 0, "no_quota": 0, "blocked": 0, "stale": 0,
              "errors": 0, "skipped": ""}
@@ -108,11 +117,22 @@ def deliver_completed_held_rows(*, batch: int = _BATCH_ROWS) -> dict:
         stats["skipped"] = "CV_LATE_DELIVERY_ENABLED is off"
         return stats
     with system_sync_session() as db:
-        rows = db.execute(sa_text(_CANDIDATES_SQL), {"batch": batch}).mappings().all()
+        rows = db.execute(sa_text(_CANDIDATES_SQL),
+                          {"batch": batch, "per_account": _PER_ACCOUNT_ROWS}).mappings().all()
         db.rollback()
-        stats["candidates"] = len(rows)
-        for row in rows:
-            stats[_deliver_one(db, row)] += 1
+    stats["candidates"] = len(rows)
+    by_account: dict[str, list] = {}
+    for row in rows:
+        by_account.setdefault(row["user_id"], []).append(row)
+    # Every charge and unhold runs in the account's own RLS session (as a scrape job's
+    # reservation does), with explicit user_id predicates as well.
+    for user_id, account_rows in by_account.items():
+        with rls_sync_session(user_id) as db:
+            for row in account_rows:
+                outcome = _deliver_one(db, row)
+                stats[outcome] += 1
+                if outcome in ("no_quota", "blocked"):
+                    break                        # the rest of this account cannot be charged either
     if stats["candidates"]:
         _logger.info("Late delivery: %d candidate(s): %d delivered, %d no quota, %d blocked, "
                      "%d stale, %d error(s)", stats["candidates"], stats["delivered"],

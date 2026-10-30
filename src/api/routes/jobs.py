@@ -3,6 +3,7 @@
 import asyncio
 import concurrent.futures
 import functools
+import html
 import json
 import secrets
 import threading
@@ -16,7 +17,7 @@ import redis as _sync_redis
 import redis.exceptions as _redis_exceptions
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials
 from sqlalchemy import (
     ColumnElement,
@@ -2412,7 +2413,44 @@ async def _user_from_download_token(token: str, job_id: str, db: AsyncSession) -
     return user
 
 
+# One page for every failure, so it reveals no more than the uniform JSON error
+# does; the status code is unchanged.
+_DOWNLOAD_LINK_ERROR_HTML = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Download unavailable - BridgeLeads</title></head>
+<body style="font-family: system-ui, sans-serif; max-width: 32rem; margin: 15vh auto; padding: 0 1rem; color: #1a1a1a">
+<h1 style="font-size: 1.25rem">This download isn't available</h1>
+<p>The link may have expired, or the export is no longer available. Go back to BridgeLeads and start the download again.</p>
+<p><a href="{home}">Back to BridgeLeads</a></p>
+</body></html>"""
+
+
+def _html_errors_for_download_links(route):
+    """A ``?token=`` download is a browser NAVIGATION (the app's Download button
+    and the emailed links), so a refusal is the page the user lands on: show a
+    plain page with a way back instead of raw JSON. Bearer callers, and anything
+    not asking for HTML, keep the JSON error."""
+
+    @functools.wraps(route)
+    async def wrapper(*args, **kwargs):
+        try:
+            return await route(*args, **kwargs)
+        except HTTPException as exc:
+            request = kwargs.get("request")
+            accept = request.headers.get("accept", "") if request is not None else ""
+            if kwargs.get("token") and "text/html" in accept:
+                return HTMLResponse(
+                    _DOWNLOAD_LINK_ERROR_HTML.replace("{home}", html.escape(settings.FRONTEND_URL)),
+                    status_code=exc.status_code,
+                    headers={"Cache-Control": "no-store"},
+                )
+            raise
+
+    return wrapper
+
+
 @router.get("/{job_id}/download", tags=["jobs"])
+@_html_errors_for_download_links
 async def download_export(
     job_id: str,
     token: str = Query(default=""),

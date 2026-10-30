@@ -111,7 +111,7 @@ scrapers, get_cached_records, checkout. `/download` resolves identity from token
     referral_events + increments credit atomically). users updates stay direct (broad users policy).
   - `/billing/activation-funnel` → `SECURITY DEFINER` aggregate fn returning ONLY funnel metrics
     (admin-gated route calls it; no raw cross-tenant rows exposed).
-  - `/scrapers/sample` → precomputed sanitized sample table refreshed by a Celery worker; public
+  - `/scrapers/sample` → precomputed sanitized sample table refreshed by a Celery worker; public (Retired 2026-10-30: endpoint and refresh task removed; table kept)
     endpoint reads ONLY that table (no live tenant query, no elevation).
   - Phase 2c policy note: referral_events INSERT policy must be ASYMMETRIC — `WITH CHECK
     (referrer_id = GUC)`, not the loose 018 `referrer OR referee` read rule.

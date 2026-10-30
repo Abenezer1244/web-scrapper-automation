@@ -65,7 +65,7 @@ listener keyed off the session's user_id), on both async and sync RLS sessions. 
 ### Phase 2 — code + role-targeted policies
 Code (migrations + routes, run via normal `alembic upgrade head`): per-transaction GUC reapply
 (`session.py`), tenant routes set the GUC (`get_rls_db`), SECURITY DEFINER helpers + sample cache
-(migration 029), and the precomputed `/scrapers/sample`.
+(migration 029), and the precomputed `/scrapers/sample`. (Retired 2026-10-30: endpoint and refresh task removed; table kept.)
 
 The **role-targeted policies** (app per-tenant / system FOR ALL / anon denied) are applied by
 `scripts/apply_rls_cutover_policies.sql` — NOT by an Alembic migration. Migrations 030/031 are

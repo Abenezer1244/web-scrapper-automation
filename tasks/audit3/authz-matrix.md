@@ -31,7 +31,7 @@ Legend. Authn: `JWT|key` = `get_auth_context` (`src/api/auth.py:286`) accepting 
 | /auth/mfa/setup, /enable, /disable | POST | JWT only | self | own row | no | no | none |
 | /auth/forgot-password, /auth/reset-password | POST | none / reset token | token-bound | n/a | no | no | none (auth leaf) |
 | /auth/api-key | POST | JWT only + password | self | own row `routes/auth.py:516` | no | business, agency `routes/auth.py:501` | none |
-| /scrapers/sample | GET | none | public | reads only `public_sample_cache` id=1 `scrapers.py:86` | no | no | none (PII leaf) |
+| /scrapers/sample | GET | none | public | reads only `public_sample_cache` id=1 `scrapers.py:86` | no | no | none (PII leaf) **Retired 2026-10-30: endpoint and refresh task removed; table kept.** |
 | /scrapers | GET | JWT or key | owner | `ScraperConfig.user_id == current_user.id` `scrapers.py:121` | no | no | none |
 | /scrapers | POST | JWT or key | owner | row created with `user_id=current_user.id` `scrapers.py:322` | no | county cap + record type `scrapers.py:266` (flagged), delivery, skip trace, formats, frequency `scrapers.py:286` (always) | none |
 | /scrapers/connectors | GET | none; `include_all=true` needs admin | public picker; admin view | n/a (global table) | `require_admin` on include_all `scrapers.py:399-400` | no | AZ-3 (API key passes) |

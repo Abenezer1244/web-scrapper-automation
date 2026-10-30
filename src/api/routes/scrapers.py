@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.security import HTTPAuthorizationCredentials
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.auth import CurrentUser, _bearer, get_auth_context, require_admin, require_admin_mfa
@@ -64,38 +64,6 @@ def _validate_tod_toggle(record_type: str, include_living_owner_tod: bool | None
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="include_living_owner_tod is only valid for the probate record type",
         )
-
-
-@router.get("/sample")
-async def sample_records(db: AsyncSession = Depends(get_db)) -> dict:
-    """Public endpoint: returns precomputed, sanitized sample records.
-
-    Reads ONLY the public_sample_cache singleton (refreshed hourly by the
-    refresh_public_sample_cache Celery task, which does all PII redaction).
-    This unauthenticated endpoint therefore never live-queries the tenant
-    tables (results/jobs/scraper_configs) — so under the non-BYPASSRLS cutover
-    role it needs no cross-tenant read access, and there is no path by which an
-    anonymous caller can reach un-sanitized PII (RLS cutover Phase 2b, Codex
-    design). Returns an empty-but-valid shape until the first refresh runs.
-    """
-    import json
-
-    row = await db.execute(
-        text("SELECT payload FROM public.public_sample_cache WHERE id = 1")
-    )
-    cached = row.scalar_one_or_none()
-    if cached is None:
-        # Cache not yet warmed (fresh DB / before the first beat tick).
-        return {
-            "records": [],
-            "total_scraped": "0+",
-            "counties_active": 0,
-            "enrichment_rate": "95%+",
-            "freshness": "Updated daily",
-        }
-    # asyncpg may hand back jsonb as a dict or a JSON string depending on codecs;
-    # normalize both.
-    return cached if isinstance(cached, dict) else json.loads(cached)
 
 
 @router.get("", response_model=list[ScraperConfigResponse])

@@ -10469,30 +10469,6 @@
         ]
       }
     },
-    "/scrapers/sample": {
-      "get": {
-        "description": "Public endpoint: returns precomputed, sanitized sample records.\n\nReads ONLY the public_sample_cache singleton (refreshed hourly by the\nrefresh_public_sample_cache Celery task, which does all PII redaction).\nThis unauthenticated endpoint therefore never live-queries the tenant\ntables (results/jobs/scraper_configs) — so under the non-BYPASSRLS cutover\nrole it needs no cross-tenant read access, and there is no path by which an\nanonymous caller can reach un-sanitized PII (RLS cutover Phase 2b, Codex\ndesign). Returns an empty-but-valid shape until the first refresh runs.",
-        "operationId": "sample_records_scrapers_sample_get",
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Sample Records Scrapers Sample Get",
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Successful Response"
-          }
-        },
-        "summary": "Sample Records",
-        "tags": [
-          "scrapers"
-        ]
-      }
-    },
     "/scrapers/{config_id}/jobs/{job_id}/dialer-replay": {
       "post": {
         "description": "Re-queue FAILED native-dialer (outbox) deliveries for a job.\n\nNative bulk-less dialers (e.g. PhoneBurner) deliver one contact per POST, so a\njob can finish with some contacts failed (rate-limit/401/outage). This resets\nonly the failed rows to pending and re-runs the outbox drain — delivered rows\nare never re-pushed. The reset runs on the RLS app session (H1: the API holds\napp-role credentials only — no system session in the request path) with the\nexplicit user_id filter kept as the suspenders.",

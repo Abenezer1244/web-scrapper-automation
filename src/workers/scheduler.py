@@ -51,7 +51,6 @@ from src.workers.scheduler_helpers.health import (  # noqa: F401
 )
 from src.workers.scheduler_helpers.meter import _flush_skip_trace_meter_outbox_impl
 from src.workers.scheduler_helpers.onboarding import _send_onboarding_emails_impl
-from src.workers.scheduler_helpers.public_cache import _refresh_public_sample_cache_impl
 from src.workers.scheduler_helpers.registration import (
     _dispatch_pending_verification_emails_impl,
     _purge_expired_pending_registrations_impl,
@@ -247,14 +246,6 @@ app.conf.beat_schedule = {
         # Job.dialer_pushed_at. No-op when no config has a dialer_webhook_url.
         "task": "src.workers.scheduler.dialer_push_sweep",
         "schedule": 300.0,  # every 5 minutes
-    },
-    "refresh-public-sample-cache": {
-        # RLS cutover Phase 2b: precompute the sanitized landing-page samples
-        # so the public /scrapers/sample endpoint reads a cache row instead of
-        # live-querying tenant tables (results/jobs/scraper_configs). Hourly is
-        # plenty — the landing page tolerates stale-by-an-hour sample rows.
-        "task": "src.workers.scheduler.refresh_public_sample_cache",
-        "schedule": crontab(minute=57),  # hourly at :57
     },
     "crawl-nts-tacoma-index": {
         # NTS Tier 1: harvest Pierce trustee-sale auction data (auction date /
@@ -628,23 +619,6 @@ def dispatch_pending_verification_emails() -> None:
 def purge_old_records() -> None:
     """Delete county_records older than RECORD_RETENTION_DAYS. Weekly."""
     return _purge_old_records_impl()
-
-
-# ─── Task: Refresh public sample cache (landing page) ───────────────────────
-
-@app.task(name="src.workers.scheduler.refresh_public_sample_cache")
-def refresh_public_sample_cache() -> None:
-    """Recompute the sanitized landing-page samples + stats into
-    public_sample_cache (RLS cutover Phase 2b).
-
-    The public /scrapers/sample endpoint reads ONLY this precomputed row, so an
-    unauthenticated request never live-queries the tenant tables
-    (results/jobs/scraper_configs) and the API role needs no cross-tenant read
-    policy for it. ALL PII redaction happens HERE, so the cached payload is safe
-    to serve publicly. Runs via system_sync_session (cross-tenant, no RLS user
-    context) — under the cutover the bridgeleads_system FOR ALL policy applies.
-    """
-    return _refresh_public_sample_cache_impl()
 
 
 # ─── Task: Onboarding emails (daily at 7 AM PT) ─────────────────────────────

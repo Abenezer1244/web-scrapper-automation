@@ -282,3 +282,107 @@ async def test_another_accounts_original_is_never_shown(
     [row] = (await _results(client, my_run, starter_token, category="already_delivered"))["items"]
     assert row["party_name"] is None and row["filled_from_original"] is None
     assert row["duplicate_source_job_id"] is None
+
+
+# ── frozen reasons (#547): why a row WAS held, not what it reads now ─────────
+
+@pytest.mark.asyncio
+async def test_a_row_completed_after_the_hold_still_says_why_it_was_held(
+        client, db, business_user, business_token):
+    cfg = await _config(db, business_user)
+    job = await _done_job(db, business_user, cfg)
+    held = await _row(db, job, business_user.id, seattle(mailing_address=None))
+    await _hold(db, job, business_user.id)
+    # A mailing address found after delivery: the row now passes, the hold stands.
+    await db.execute(text("UPDATE results SET mailing_address = 'PO BOX 7, SEATTLE, WA 98101' "
+                          "WHERE id = :i"), {"i": held})
+    await db.commit()
+    [row] = (await _results(client, job, business_token, category="not_qualified"))["items"]
+    assert row["qualification_reasons"] == ["mailing_unresolved"]
+    assert row["qualification_state"] == "qualified"
+
+
+@pytest.mark.asyncio
+async def test_a_malformed_hold_record_never_fails_the_page(client, db, business_user, business_token):
+    cfg = await _config(db, business_user)
+    job = await _done_job(db, business_user, cfg)
+    await _row(db, job, business_user.id, seattle(party_name=None, ed={
+        DELIVERY_EXCLUDED_KEY: "not_qualified",
+        lq.HOLD_KEY: {"reasons": ["missing_owner", "not_a_code", 7], "policy": lq.POLICY_CODE_VIOLATION}}))
+    [row] = (await _results(client, job, business_token, category="not_qualified"))["items"]
+    assert row["qualification_reasons"] == ["missing_owner"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hold", [
+    {"reasons": [], "policy": "code_violation_v1"},
+    {"reasons": ["not_a_code"], "policy": "code_violation_v1"},
+    {"reasons": ["mailing_unresolved"], "policy": "some_future_policy"},
+])
+async def test_an_unusable_hold_record_falls_back_to_live_reasons(
+        client, db, business_user, business_token, hold):
+    cfg = await _config(db, business_user)
+    job = await _done_job(db, business_user, cfg)
+    await _row(db, job, business_user.id, seattle(party_name=None, ed={
+        DELIVERY_EXCLUDED_KEY: "not_qualified", lq.HOLD_KEY: hold}))
+    [row] = (await _results(client, job, business_token, category="not_qualified"))["items"]
+    assert row["qualification_reasons"] == ["missing_owner"]
+
+
+@pytest.mark.asyncio
+async def test_a_row_held_before_the_record_existed_reads_live_reasons(
+        client, db, business_user, business_token):
+    cfg = await _config(db, business_user)
+    job = await _done_job(db, business_user, cfg)
+    await _row(db, job, business_user.id, seattle(party_name=None, ed={DELIVERY_EXCLUDED_KEY: "not_qualified"}))
+    [row] = (await _results(client, job, business_token, category="not_qualified"))["items"]
+    assert row["qualification_reasons"] == ["missing_owner"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hold", [None, "missing_owner", ["missing_owner"], 7,
+                                  {"reasons": "missing_owner", "policy": "code_violation_v1"},
+                                  {"reasons": None, "policy": "code_violation_v1"}])
+async def test_a_hold_record_of_the_wrong_shape_falls_back_to_live_reasons(
+        client, db, business_user, business_token, hold):
+    """Codex P3: a record that is not an object, or whose reasons is not a list, is unusable."""
+    cfg = await _config(db, business_user)
+    job = await _done_job(db, business_user, cfg)
+    await _row(db, job, business_user.id, seattle(party_name=None, mailing_address=None, ed={
+        DELIVERY_EXCLUDED_KEY: "not_qualified", lq.HOLD_KEY: hold}))
+    [row] = (await _results(client, job, business_token, category="not_qualified"))["items"]
+    assert row["qualification_reasons"] == ["missing_owner", "mailing_unresolved"]
+
+
+@pytest.mark.asyncio
+async def test_a_rerun_that_qualifies_a_held_row_drops_why_it_was_held(
+        client, db, business_user, business_token):
+    """Codex P3: the re-run's hold step clears the mark with the record, so the row leaves the
+    held list and the new list reads it as qualified with no reasons."""
+    cfg = await _config(db, business_user)
+    job = await _done_job(db, business_user, cfg)
+    held = await _row(db, job, business_user.id, seattle(mailing_address=None))
+    assert await _hold(db, job, business_user.id) == 1
+    await db.execute(text("UPDATE results SET mailing_address = 'PO BOX 7, SEATTLE, WA 98101' "
+                          "WHERE id = :i"), {"i": held})
+    await db.commit()
+    assert await _hold(db, job, business_user.id) == 0
+    ed = (await db.execute(text("SELECT enrichment_data FROM results WHERE id = :i"),
+                           {"i": held})).scalar_one()
+    assert lq.HOLD_KEY not in ed and DELIVERY_EXCLUDED_KEY not in ed
+    page = await _results(client, job, business_token, category="not_qualified")
+    assert page["items"] == [] and page["not_qualified_count"] == 0
+    [row] = (await _results(client, job, business_token, category="new"))["items"]
+    assert row["qualification_state"] == "qualified" and row["qualification_reasons"] == []
+
+
+@pytest.mark.asyncio
+async def test_a_frozen_record_without_the_hold_mark_is_never_echoed(
+        client, db, business_user, business_token):
+    """Codex P3: reasons are frozen only while the row is marked; an orphaned record is ignored."""
+    cfg = await _config(db, business_user)
+    job = await _done_job(db, business_user, cfg)
+    await _row(db, job, business_user.id, seattle(ed={
+        lq.HOLD_KEY: {"reasons": ["missing_owner"], "policy": lq.POLICY_CODE_VIOLATION}}))
+    [row] = (await _results(client, job, business_token, category="new"))["items"]
+    assert row["qualification_state"] == "qualified" and row["qualification_reasons"] == []

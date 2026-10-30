@@ -19,6 +19,59 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-10-30 — Client-side secret-exposure audit: no server secret leaked; the session tokens moved out of page JavaScript
+
+**Built / Shipped (local branches, not pushed):** BE `fix/bff-forwarded-client-ip` (client_ip trusts
+X-BL-Client-IP only with BFF_SHARED_SECRET; invalid assertion -> 401 before any endpoint), `fix/webhook-urls-write-only`
+(webhook URLs masked `scheme://host/<hidden>` in readbacks and exports; an exact echo keeps the stored URL),
+`fix/webhook-redirect-host-parse` (a malformed receiver Location no longer crashes delivery or leaks into Celery logs).
+FE stack: `fix/server-side-token-exchange` (POST /api/session/login does login/MFA/break-glass/verify-email/register
+server-side) -> `fix/bff-phase1-server-token` (lib/backend-token.ts) -> `phase2-proxy-route` (/api/backend proxy, CSRF
+header + exact Origin) -> `phase3-apifetch` (apiFetch via the proxy; refresh keyed on {tokenLogin, tokenGeneration})
+-> `phase4-blob-stream` (downloads + log stream via the proxy; session no longer carries accessToken). Every finding:
+Codex consult before, Codex review after, no commit without GO.
+
+**Tried / Decided:** audit first: production bundle built with canary secrets, live bridgeleads.io chunks, both repos'
+tracked files and full history, API response schemas. No server secret anywhere client-side. What reached page JS were
+the user's own tokens: the 7-day refresh token at login (#1) and the 1-hour access token in the session (#2). Rate
+limiting on Vercel-originated calls solved with a shared-secret IP assertion, not by trusting X-Forwarded-For.
+docker-compose's literal local password kept (by design, 71d9a5e996). Stale middleware.ts in the FE checkout deleted
+(identical to c4d4625; it was the pre-GHSA-8fpg guard).
+
+**Failed / Blocked:** the main BE checkout is a detached HEAD 775 commits behind main, so the first backend scan ran on
+stale code and was redone on origin/main. Codex's sandbox user cannot read the scratchpad, so the worktrees live in
+Desktop/bl-security-worktrees. A branch ref vanished during a concurrent auto-gc (commit intact, recreated). The
+pre-existing DST failure in test_account_export_worker, plus test_task_args_sealing, fail on clean origin/main.
+
+**Caught & fixed:** Codex: an invalid IP assertion could fail a request after its commit and drop the audit event
+(now validated app-wide first); previews without the secret skipped the assertion; tokenGeneration restarts per login,
+so an old login's 401 could replay under a new one (tokenLogin uuid); session.accessToken still serialised. Own testing:
+requests parses a 3xx Location inside Session.post and raises a plain ValueError (not RequestException); a missing CORS
+alias in the Origin allowlist would have signed users out on that host; and a real-browser two-tab test signed both
+tabs out because every response wrapped by proxy.ts re-issues the session cookie and wrote the OLD token back over a
+rotation. Excluding /api/backend from the matcher fixed it (strict stub 4/4; the pre-phase-3 code failed 2 of 3).
+
+**Pending / Handoff:** ship order for #1: deploy BE with BFF_SHARED_SECRET on Railway, set the same secret on Vercel,
+then deploy FE, then smoke-test login. Rebase the FE stack onto current master (#292/#293 landed since). The three
+follow-ups raised here are now done, each Codex-consulted and reviewed to GO:
+- Cookie race (P1), FE `fix/session-cookie-stale-write`: session READS (GET /api/auth/session, proxy.ts responses) no
+  longer write the session cookie; if a read would write one, every session-token header is dropped (deletions too, so a
+  chunk-count change can't half-delete it). Replaying a stale cookie after a rotation: before 2+1+1 stale writes and a
+  rotation response carrying 2 session cookies; after 0/0/0 and 1. Reads no longer slide the 7-day expiry; rotations do.
+- Large exports (Medium), FE `fix/job-export-direct-download` + BE `fix/download-link-error-page`: the job lead CSV uses
+  the API's 60 s download link and streams to disk (29.9 MB test: page heap +0 MB, nothing through the proxy); a refused
+  link opened in a browser gets one generic HTML page with the same status. Batch and segment exports stay proxied
+  (streamed responses are exempt from Vercel's 4.5 MB limit; the 300 s cap applies). The API still builds each CSV in
+  its own memory before sending it (pre-existing).
+- CI gap, FE `ci/next-build` (off master): the CI job runs `npm run build`. It needs no API or secrets, and a
+  middleware.ts next to proxy.ts fails it.
+
+**Facts learned:** /api/auth/session re-sets the session cookie it read (stale-write race). Node's IncomingMessage
+'close' fires once the body is read, not on disconnect (use res 'close'). Next 16 resolves `..` before routing, so
+`/api/backend/t/../x` reaches `/x`. `next dev` writes an untracked AGENTS.md. The dev CSP only allows the API on :8000.
+
+---
+
 ## 2026-10-30 — Self-check of the Results/deploy work: security review, tax bounds (FE #294), what is and is not verified live, a false-alarm bug in the deploy watch (FE #296)
 
 **Built / Shipped:** FE #294 squash-merged as `6a222fb`, live (domain checked): `parseTaxBound` in

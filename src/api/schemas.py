@@ -2064,7 +2064,9 @@ class ResultRow(BaseModel):
     # Code violations only (rows stamped with the qualification policy), set on the
     # new and not_qualified lists, derived per page from the row as it is NOW, never
     # stored. A held row a sweep completed later reads "qualified": the hold is frozen
-    # and a later run delivers it. None on rows the policy does not cover.
+    # and a later run delivers it. On a held row the REASONS are the ones it was held
+    # for (frozen with the hold, #547), so "qualified" with reasons means "complete now,
+    # held for these". None on rows the policy does not cover.
     qualification_state: QualificationState | None = None
     qualification_reasons: list[QualificationReason] | None = None
     # Already-delivered list only: the fields this duplicate copy shows from the lead

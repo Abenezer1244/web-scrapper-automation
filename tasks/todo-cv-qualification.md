@@ -222,3 +222,10 @@ No quota/billing/delivery row is read for writing or changed.
   the prod run of the report (no Railway CLI on this machine); full 6.8k-test suite (CI runs it).
 - Follow-up found: scripts/data_quality_report.py fails as documented (`No module named 'src'`), same fix.
 - [ ] Owner: approve push/PRs, merge order (#548, then Phase 3; no migration), run the report, decide credit.
+
+## Quota decision (owner, 2026-10-30): C, no credit
+Prod dry run (scripts/cv_qualification_report.py, read only, 2026-10-30): one account (b6d2095d, the owner's test
+admin), 5 pre-gate runs, 4,212 billed = 4,212 candidates (reconciled on every run); 929 fail strict now (unchanged
+since 10-25), 2,181 named after delivery, 3,085 affected; run 1ad28ded: all 491 affected. No post-gate run yet.
+Owner chose C (no credit): the account is the owner's own test admin. Nothing changed.
+Open question to the owner: an opt-in for incomplete records (include in CSV, or deliver when completed).

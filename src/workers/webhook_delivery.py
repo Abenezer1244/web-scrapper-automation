@@ -52,7 +52,7 @@ import urllib3
 
 from src.api.middleware.security import validate_outbound_webhook
 from src.utils.logger import setup_logger
-from src.utils.pinned_http import is_blocked_destination, pinned_session
+from src.utils.pinned_http import is_blocked_destination, log_host, pinned_session
 from src.workers import app
 
 _logger = setup_logger("worker.webhook_delivery")
@@ -85,8 +85,13 @@ def _url_secrets(webhook_url: str) -> list[str]:
     others in the query or userinfo. Short fragments are skipped so that words
     like "hooks" or "api" do not blank out the whole excerpt.
     """
-    parts = urlparse(webhook_url)
-    found = [parts.password or ""]
+    try:
+        parts = urlparse(webhook_url)
+    except ValueError:
+        # Unparseable (see pinned_http.log_host): treat the whole URL as secret.
+        return [webhook_url] if webhook_url else []
+    # Userinfo: some services put the token in the USERNAME (https://TOKEN@host).
+    found = [parts.password or "", parts.username or ""]
     found += [seg for seg in parts.path.split("/") if len(seg) >= 6]
     found += [value for _, value in parse_qsl(parts.query, keep_blank_values=False) if len(value) >= 4]
     # parse_qsl decodes, so keep the RAW values too: an echo of `ab%2Bcd` must match.
@@ -348,7 +353,7 @@ def deliver_job_webhook(
         args = unseal_task_args(sealed, required=("url", "payload"))
         webhook_url, payload = args["url"], args["payload"]
     attempt = self.request.retries + 1
-    host = urlparse(webhook_url).hostname or "?"
+    host = log_host(webhook_url)
     _excerpt = _response_excerpt
 
     # SSRF guard: re-validate the destination immediately before the POST so a
@@ -415,6 +420,18 @@ def deliver_job_webhook(
         raise requests.ConnectionError(
             f"webhook delivery network error: {reason} (host {host})"
         ) from None  # Celery autoretry_for catches this
+    except ValueError as exc:
+        # After RequestException on purpose: some of those (InvalidURL…) are also
+        # ValueErrors and keep the retry path above. A PLAIN ValueError here is
+        # requests parsing a 3xx Location to set resp.next even with
+        # allow_redirects=False: its text is the receiver's authority, which can
+        # carry a credential. Permanent, like the 3xx case below: type and host
+        # only, never retried, never raised into Celery's failure log.
+        _logger.warning(
+            "Webhook %s endpoint sent an unparseable response (%s) from host %s",
+            job_id[:8], type(exc).__name__, host,
+        )
+        return {"status": "failed", "reason": "invalid_response", "attempts": attempt}
     body_text = _read_excerpt(resp, webhook_url)
 
     # Redirects are disabled, so a 3xx is a misconfigured endpoint, not a
@@ -423,7 +440,7 @@ def deliver_job_webhook(
     if 300 <= resp.status_code < 400:
         # Log the redirect target HOST only — a Location header can itself carry
         # query-string secrets (same log-leak class as the webhook URL, Codex).
-        _loc_host = urlparse(resp.headers.get("Location") or "").hostname or "?"
+        _loc_host = log_host(resp.headers.get("Location"))
         _logger.warning(
             "Webhook %s endpoint returned redirect %d to host %s — not following",
             job_id[:8], resp.status_code, _loc_host,

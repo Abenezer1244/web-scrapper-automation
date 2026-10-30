@@ -21,6 +21,7 @@ so a later DNS change cannot move it.
 """
 import ipaddress
 import socket
+from urllib.parse import urlparse
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -149,3 +150,17 @@ def is_blocked_destination(exc: BaseException) -> bool:
             return True
         stack.extend((cur.__cause__, cur.__context__, getattr(cur, "reason", None), *cur.args))
     return False
+
+
+def log_host(url: str | None) -> str:
+    """The host of ``url`` for a log line, or "?"; never raises.
+
+    urlparse raises ValueError on a malformed authority (bad IPv6 brackets, a
+    fullwidth slash under NFKC) with the raw netloc IN THE MESSAGE. A webhook
+    URL, or a receiver's Location header, can carry a credential there, and an
+    uncaught exception would put it in Celery's failure log and result backend.
+    """
+    try:
+        return urlparse(url or "").hostname or "?"
+    except (ValueError, TypeError):
+        return "?"

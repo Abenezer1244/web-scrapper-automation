@@ -18,43 +18,6 @@ to understand *why* the code is the way it is and *what's been attempted before*
 > `docs/security/REVIEW-2026-06-01.md` (security tracker) and `CLAUDE.md`.
 
 ---
-## 2026-10-28 - Code-violation gate: #548 re-checked, gate monitoring + dry-run report, Accela #332 ported (not pushed)
-
-**Built / Shipped:** nothing pushed, merged or deployed. Three local branches (worktrees under C:/Users/micha/bl-wt):
-`fix/cv-frozen-hold-reasons-verify` (#548 + e0417cda, two Codex P3 tests); `feat/cv-qual-phase3`
-(src/workers/qualification_quality.py: three gate invariants checked every sweep tick over every post-gate code-violation
-job, one alert per kind; per-jurisdiction qualification yield per finished job, frozen at the gate; hooked into
-data_quality.py with a versioned judged marker; scripts/cv_qualification_report.py, a READ ONLY dry run for the
-pre-gate quota-credit decision); `fix/accela-search-form-postback-rebase` (#332 cherry-picked onto main plus a
-postback hardening).
-
-**Tried / Decided:** Codex consult on Phase 3 failed with 6 P1 / 4 P2 before any code, all folded in: count only
-outbound work that went out (delivered dialer rows, spent skip-trace statuses) on rows marked held; recurring global
-invariants instead of once-per-job; a stamp-integrity check from a started_at boundary (2026-10-27 01:30 UTC); a
-frozen, row-level yield per jurisdiction; billed = jobs.billed_count, never recomputed. Accela: live markup shows the
-date boxes have no postback handler; the record-type dropdown's delayed UpdatePanel refresh is the likelier reset, so
-_search now waits for that control's own postback and submits with a DOM click.
-
-**Failed / Blocked:** this machine had no Python, Postgres, Redis, Node or Codex; installed (local test DBs only).
-`localhost` on Windows made Redis calls time out (IPv6 first), so a sweep test failed on untouched main; the test env
-uses 127.0.0.1. `codex review --base` refuses a prompt, so reviews ran via `codex exec -s read-only`; in the
-background it hangs on stdin unless given `< /dev/null`. My first mutation loop restored an UNTRACKED file with git
-checkout (a no-op), so mutations stacked; caught, restored by hand and re-run from a saved copy. No Railway CLI here,
-so the report has not run on prod.
-
-**Caught & fixed:** float subtraction read an exact 30-point yield drop (45/54 vs 8/15) as 29.999999999999993 (now
-Fraction); the gate queries did not start from code-violation jobs; the report double-read named-and-still-failing
-rows, missed Tacoma's sweep evidence, hid billed != candidates, and could not import src when run as documented
-(scripts/data_quality_report.py has the same bug today, open).
-
-**Pending / Handoff:** owner approval to push and open PRs (#548 first, then Phase 3, Accela independent; no
-migration). Owner runs `railway run --service worker python scripts/cv_qualification_report.py` and decides quota
-credit. A prod EXPLAIN of the gate queries. Accela: no automated test for _postback target matching or the DOM click.
-
-**Facts learned:** a hold mark and is_duplicate are frozen at the gate, so the frozen yield needs no snapshot column.
-Only pierce_cv_owner_recovery stamps owner_recovery_last_at. Test runs need their own database each: the fixture
-teardown deletes every user.
-
 
 ## 2026-10-30 — Self-check of the Results/deploy work: security review, tax bounds (FE #294), what is and is not verified live, a false-alarm bug in the deploy watch (FE #296)
 
@@ -192,6 +155,50 @@ after a newer one (both `vercel[bot]`, no payload); a merge right after another 
 **Facts learned:** after a merge, check what the domain serves (`vercel inspect <domain>`), not only the commit's
 deployment status; a "success" for your SHA does not mean it holds the alias. Unit 70/70, browser 13/13 on the stub,
 live 7/7.
+
+## 2026-10-28/30 - Code-violation gate: #548 re-checked, gate monitoring + dry-run report (#550), Accela #332 ported (#551), late delivery (#555 + Phase B)
+
+**Built / Shipped:** nothing pushed, merged or deployed. Three local branches (worktrees under C:/Users/micha/bl-wt):
+`fix/cv-frozen-hold-reasons-verify` (#548 + e0417cda, two Codex P3 tests); `feat/cv-qual-phase3`
+(src/workers/qualification_quality.py: three gate invariants checked every sweep tick over every post-gate code-violation
+job, one alert per kind; per-jurisdiction qualification yield per finished job, frozen at the gate; hooked into
+data_quality.py with a versioned judged marker; scripts/cv_qualification_report.py, a READ ONLY dry run for the
+pre-gate quota-credit decision); `fix/accela-search-form-postback-rebase` (#332 cherry-picked onto main plus a
+postback hardening).
+
+**Tried / Decided:** Codex consult on Phase 3 failed with 6 P1 / 4 P2 before any code, all folded in: count only
+outbound work that went out (delivered dialer rows, spent skip-trace statuses) on rows marked held; recurring global
+invariants instead of once-per-job; a stamp-integrity check from a started_at boundary (2026-10-27 01:30 UTC); a
+frozen, row-level yield per jurisdiction; billed = jobs.billed_count, never recomputed. Accela: live markup shows the
+date boxes have no postback handler; the record-type dropdown's delayed UpdatePanel refresh is the likelier reset, so
+_search now waits for that control's own postback and submits with a DOM click.
+
+**Failed / Blocked:** this machine had no Python, Postgres, Redis, Node or Codex; installed (local test DBs only).
+`localhost` on Windows made Redis calls time out (IPv6 first), so a sweep test failed on untouched main; the test env
+uses 127.0.0.1. `codex review --base` refuses a prompt, so reviews ran via `codex exec -s read-only`; in the
+background it hangs on stdin unless given `< /dev/null`. My first mutation loop restored an UNTRACKED file with git
+checkout (a no-op), so mutations stacked; caught, restored by hand and re-run from a saved copy. No Railway CLI here,
+so the report has not run on prod.
+
+**Caught & fixed:** float subtraction read an exact 30-point yield drop (45/54 vs 8/15) as 29.999999999999993 (now
+Fraction); the gate queries did not start from code-violation jobs; the report double-read named-and-still-failing
+rows, missed Tacoma's sweep evidence, hid billed != candidates, and could not import src when run as documented
+(scripts/data_quality_report.py has the same bug today, open).
+
+**Pending / Handoff (updated 2026-10-30):** #548 merged + deployed (24ef7c1e); #550 merged (1cd4dbe7). Prod dry
+run (read only): one account (the owner's test admin), 4,212 pre-gate billed = 4,212 candidates, 929 fail strict now,
+3,085 delivered incomplete; owner chose no credit. Owner chose option 2 (deliver a held row once complete): Phase A
+#555 (the King/Tacoma owner sweeps never reached a held row since #542; they now name held rows, never unholding),
+Phase B branch feat/cv-late-delivery-b (cv_late_delivery.py: one record per row via tasks.grant_records, locks
+jobs->results->delivered_records->users, RLS session per account, round-robin; late rows still count as held in the
+frozen yield; new invariant released_without_charge; kill switch CV_LATE_DELIVERY_ENABLED). Codex: Phase A PASS r1,
+Phase B FAIL r1 -> PASS r2/r3. Phase C (UI label + notification) and D (dialer/skip trace for late rows) open.
+Admin merge was refused by the permission classifier; every merge waited for its own CI after update-branch.
+
+**Facts learned:** a hold mark and is_duplicate are frozen at the gate, so the frozen yield needs no snapshot column.
+Only pierce_cv_owner_recovery stamps owner_recovery_last_at. Test runs need their own database each: the fixture
+teardown deletes every user.
+
 
 ## 2026-10-28 — Results: first live check of #287-#290, cards that blanked on uncached tab switches, owner/phone filters, DNC notice (FE #291)
 

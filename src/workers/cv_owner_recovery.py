@@ -20,18 +20,27 @@ An OWNER-NAME FILL and nothing else, on the same boundary as owner_recovery.py:
   * It never changes `parcel_id`, `dedup_hash`, `property_key`, mailing or
     `skip_trace_status`, and never enqueues a skip trace.
   * It only fills a `party_name` that is still blank, on a row that is still
-    delivered, still on the SAME parcel (the located PIN at a shown tier, or the
-    printed parcel_id), with no owner source yet, on a job that is still done. Each
-    condition is re-checked in the UPDATE itself, so a row a re-run named, re-located,
-    re-parceled or the plan cap excluded while the lookup was in flight is left alone.
-    A printed-PIN row's owner_pin is its parcel_id, which is what skip trace requires.
+    delivered (or still held by the qualification gate, below), still on the SAME
+    parcel (the located PIN at a shown tier, or the printed parcel_id), with no owner
+    source yet, on a job that is still done. Each condition is re-checked in the UPDATE
+    itself, so a row a re-run named, re-located, re-parceled or the plan cap excluded
+    while the lookup was in flight is left alone. A printed-PIN row's owner_pin is its
+    parcel_id, which is what skip trace requires.
+  * It never unholds a held row: naming it only makes it complete. Delivering and
+    billing a completed held row is src/workers/cv_late_delivery.py's job.
 
 WHICH LEADS
 -----------
-Delivered leads only: non-duplicate rows the plan cap did not mark over quota,
-with a usable property or mailing address (src/api/lead_actionability.py).
-One lookup per PARCEL (two cases on one parcel share it): fewest attempts first,
-then the longest since last tried, then the newest case.
+Non-duplicate rows with a usable property or mailing address that are either
+  * delivered leads (no delivery exclusion, actionable: src/api/lead_actionability.py), or
+  * code violations the qualification gate held (`delivery_excluded_reason =
+    'not_qualified'`, stamped with the policy). Since the gate (#542) a code violation
+    without an owner is always held, and the delivered branch can never pick it up
+    (actionable requires a qualified row, which requires an owner), so without this
+    branch nothing would ever name it between runs.
+Never an over-quota row, a duplicate, or a superseded row (a later run took its claim:
+it is a duplicate). One lookup per PARCEL (two cases on one parcel share it):
+delivered leads first, then fewest attempts, the longest since last tried, the newest.
 
 KING RATE LIMITS
 ----------------
@@ -51,7 +60,8 @@ from datetime import UTC, datetime
 from celery.exceptions import SoftTimeLimitExceeded, TimeLimitExceeded
 from sqlalchemy import text as sa_text
 
-from src.api.lead_actionability import actionable_sql
+from src.api.lead_actionability import NOT_QUALIFIED, actionable_sql, address_actionable_sql
+from src.api.lead_qualification import POLICY_CODE_VIOLATION, POLICY_KEY
 from src.config import settings
 from src.scrapers.king_cv_sources import PARCEL_AT_SCRAPE_SOURCES
 from src.utils.located_parcel import located_parcel_id, shown_tier_sql
@@ -104,7 +114,6 @@ _PIN_SQL = (f"(CASE WHEN r.enrichment_data::jsonb->>'source' IN ({_PRINTED_SOURC
 _ELIGIBLE_ROW = """
       r.is_duplicate = false
   AND jsonb_typeof(r.enrichment_data::jsonb) = 'object'
-  AND r.enrichment_data::jsonb->>'delivery_excluded_reason' IS NULL
   AND (r.party_name IS NULL OR r.party_name ~ '^[[:space:]]*$')
   AND ((r.enrichment_data::jsonb->>'source' = 'seattle_sdci_code_violations'
         AND r.enrichment_data::jsonb->>'kc_pin_status' = 'matched'
@@ -120,8 +129,16 @@ _ELIGIBLE_ROW = """
   AND (CASE WHEN r.enrichment_data::jsonb->>'cv_owner_recovery_attempts' ~ '^[0-9]{1,6}$'
             THEN (r.enrichment_data::jsonb->>'cv_owner_recovery_attempts')::int ELSE 0 END)
       < :max_attempts
-""" + f"""  AND {actionable_sql("r")}
-"""  # a row with no usable address is not a lead: never shown, exported or billed
+""" + f"""  AND (
+        (r.enrichment_data::jsonb->>'delivery_excluded_reason' IS NULL AND {actionable_sql("r")})
+     OR (r.enrichment_data::jsonb->>'{POLICY_KEY}' = '{POLICY_CODE_VIOLATION}'
+         AND r.enrichment_data::jsonb->>'delivery_excluded_reason' = '{NOT_QUALIFIED}'
+         AND {address_actionable_sql("r")}))
+"""  # a row with no usable address is not a lead: never shown, exported, billed or named
+
+# 0 for a delivered lead, 1 for a held one: delivered leads are named first.
+_HELD_RANK_SQL = ("(CASE WHEN r.enrichment_data::jsonb->>'delivery_excluded_reason' IS NULL "
+                  "THEN 0 ELSE 1 END)")
 
 _KING_CV_JOB = """
       j.status = 'done'
@@ -134,6 +151,7 @@ _KING_CV_JOB = """
 # then the newest case. A PIN shared by an SDCI row and a printed-PIN row is one lookup.
 _CANDIDATE_PARCELS_SQL = f"""
     SELECT {_PIN_SQL} AS pin,
+           min({_HELD_RANK_SQL}) AS held,
            min(CASE WHEN r.enrichment_data::jsonb->>'cv_owner_recovery_attempts' ~ '^[0-9]{{1,6}}$'
                     THEN (r.enrichment_data::jsonb->>'cv_owner_recovery_attempts')::int
                     ELSE 0 END) AS attempts,
@@ -145,7 +163,7 @@ _CANDIDATE_PARCELS_SQL = f"""
     WHERE {_KING_CV_JOB}
       AND {_ELIGIBLE_ROW}
     GROUP BY {_PIN_SQL}
-    ORDER BY attempts ASC, last_at ASC, newest DESC NULLS LAST, pin ASC
+    ORDER BY held ASC, attempts ASC, last_at ASC, newest DESC NULLS LAST, pin ASC
     LIMIT :batch
 """  # noqa: S608 -- splices only module constants; every value is bound
 

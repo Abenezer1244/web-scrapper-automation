@@ -15,8 +15,12 @@ An OWNER-NAME fill and nothing else, on the same boundary as owner_recovery.py:
   * It never enqueues a skip trace and never touches `skip_trace_status`, phone,
     email, mailing, parcel_id or dedup.
   * It only fills a `party_name` that is still blank, on a delivered Tacoma
-    code-violation row of a terminal job whose parcel_id is unchanged. Each
-    condition is re-checked in the UPDATE itself.
+    code-violation row of a terminal job whose parcel_id is unchanged, or on one the
+    qualification gate held (stamped, `delivery_excluded_reason = 'not_qualified'`,
+    with an address: since the gate an unnamed code violation is always held, so the
+    sweep would otherwise never reach it). Delivered leads first. Each condition is
+    re-checked in the UPDATE itself. Naming a held row never unholds it; delivering
+    it is src/workers/cv_late_delivery.py's job.
 
 Owner decision 2026-09-14: ATIP taxpayer names are stored for code-violation owner
 naming only. `PIERCE_CV_OWNER_ENABLED` (default off) stops this sweep before any
@@ -31,6 +35,8 @@ from datetime import UTC, datetime
 
 from sqlalchemy import text as sa_text
 
+from src.api.lead_actionability import NOT_QUALIFIED, address_actionable_sql
+from src.api.lead_qualification import POLICY_CODE_VIOLATION, POLICY_KEY
 from src.config import settings
 from src.scrapers.enrichment.pierce_atip_owner import OWNER_ROW_GUARD
 from src.utils.logger import setup_logger
@@ -56,7 +62,6 @@ _LOCK_TTL_S = 900
 
 _ELIGIBLE_ROW = """
       r.is_duplicate = false
-  AND r.enrichment_data::jsonb->>'delivery_excluded_reason' IS NULL
   AND jsonb_typeof(r.enrichment_data::jsonb) = 'object'
   AND r.enrichment_data::jsonb->>'source' = 'tacoma_code_violations'
   AND (r.party_name IS NULL OR btrim(r.party_name) = '')
@@ -67,7 +72,15 @@ _ELIGIBLE_ROW = """
   AND (CASE WHEN r.enrichment_data::jsonb->>'owner_recovery_attempts' ~ '^[0-9]{1,6}$'
             THEN (r.enrichment_data::jsonb->>'owner_recovery_attempts')::int ELSE 0 END)
       < :max_attempts
+""" + f"""  AND (r.enrichment_data::jsonb->>'delivery_excluded_reason' IS NULL
+     OR (r.enrichment_data::jsonb->>'{POLICY_KEY}' = '{POLICY_CODE_VIOLATION}'
+         AND r.enrichment_data::jsonb->>'delivery_excluded_reason' = '{NOT_QUALIFIED}'
+         AND {address_actionable_sql("r")}))
 """
+
+# 0 for a delivered lead, 1 for a held one: delivered leads are named first.
+_HELD_RANK_SQL = ("(CASE WHEN r.enrichment_data::jsonb->>'delivery_excluded_reason' IS NULL "
+                  "THEN 0 ELSE 1 END)")
 
 _JOB_SCOPE = """
       j.status = 'done' AND j.user_id = r.user_id AND sc.user_id = r.user_id
@@ -77,6 +90,7 @@ _JOB_SCOPE = """
 
 _CANDIDATE_PARCELS_SQL = f"""
     SELECT btrim(r.parcel_id) AS parcel_id,
+           min({_HELD_RANK_SQL}) AS held,
            min(CASE WHEN r.enrichment_data::jsonb->>'owner_recovery_attempts' ~ '^[0-9]{{1,6}}$'
                     THEN (r.enrichment_data::jsonb->>'owner_recovery_attempts')::int ELSE 0 END)
              AS attempts,
@@ -86,7 +100,7 @@ _CANDIDATE_PARCELS_SQL = f"""
     JOIN scraper_configs sc ON sc.id = j.scraper_config_id
     WHERE {_JOB_SCOPE} AND {_ELIGIBLE_ROW}
     GROUP BY btrim(r.parcel_id)
-    ORDER BY attempts ASC, last_at ASC, parcel_id ASC
+    ORDER BY held ASC, attempts ASC, last_at ASC, parcel_id ASC
     LIMIT :batch
 """  # noqa: S608 -- splices only module constants; every value is bound
 

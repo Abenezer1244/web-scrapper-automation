@@ -1198,3 +1198,105 @@ def test_old_label_is_rebuilt_exactly_from_the_source_row():
     assert bpo.old_scraper_label(TACOMA_2117) == "Nuisance - 2117 AVE S"
     assert bpo.old_scraper_label(TACOMA_602) == "Derelict Building  - 2.01.060 (D) - 602 AVE S"
     assert bpo.old_scraper_label({"casetype": "Nuisance"}) == "Nuisance"
+
+
+# ── held code violations (qualification gate, #542) ──────────────────────────
+
+def _held_ed(parcel="2021110133", **extra) -> dict:
+    return {"source": "tacoma_code_violations", "case_number": "60000303996",
+            "source_parcel": parcel, "qualification_policy": "code_violation_v1",
+            "delivery_excluded_reason": "not_qualified",
+            "qualification_hold": {"reasons": ["missing_owner"], "policy": "code_violation_v1"},
+            **extra}
+
+
+@pytest.mark.asyncio
+async def test_the_sweep_names_a_held_row_and_leaves_it_held(
+    db, business_user, monkeypatch, paces, clean_health,
+):
+    """Since the gate every unnamed code violation is held; naming it only makes it complete."""
+    job_id = await _pierce_job(db, business_user)
+    held, dedup = await _stored(db, business_user, job_id, party=None, ed=_held_ed())
+    _Portal({"2021110133": [(200, ATIP_2117)]}).install(monkeypatch)
+    used = (await db.execute(text("SELECT records_used FROM users WHERE id = :u"),
+                             {"u": business_user.id})).scalar()
+
+    stats = await asyncio.to_thread(rec.recover_pierce_cv_owners)
+
+    assert stats["matched"] == 1
+    row = (await _fetch_rows(db, [held]))[held]
+    assert row.party_name == "TACOMA TOWN CENTER PARCELS LLC"
+    assert row.enrichment_data["delivery_excluded_reason"] == "not_qualified"   # still held
+    assert row.enrichment_data["qualification_hold"]["reasons"] == ["missing_owner"]
+    assert (row.parcel_id, row.dedup_hash, row.skip_trace_status) == ("2021110133", dedup, "not_attempted")
+    assert (await db.execute(text("SELECT records_used FROM users WHERE id = :u"),
+                             {"u": business_user.id})).scalar() == used
+
+
+@pytest.mark.asyncio
+async def test_held_rows_the_gate_cannot_deliver_are_never_asked(
+    db, business_user, monkeypatch, paces, clean_health,
+):
+    job_id = await _pierce_job(db, business_user)
+    no_address, _ = await _stored(db, business_user, job_id, party=None, ed=_held_ed())
+    await db.execute(text("UPDATE results SET property_address = NULL, mailing_address = NULL "
+                          "WHERE id = :i"), {"i": no_address})
+    await db.commit()
+    superseded, _ = await _stored(db, business_user, job_id, party=None, is_duplicate=True,
+                                  ed=_held_ed())
+    unstamped = {k: v for k, v in _held_ed().items() if k != "qualification_policy"}
+    legacy, _ = await _stored(db, business_user, job_id, party=None, ed=unstamped)
+    portal = _Portal({"2021110133": [(200, ATIP_2117)]}).install(monkeypatch)
+
+    stats = await asyncio.to_thread(rec.recover_pierce_cv_owners)
+
+    assert portal.requests == [] and stats.get("matched", 0) == 0
+    got = await _fetch_rows(db, [no_address, superseded, legacy])
+    assert all(r.party_name is None for r in got.values())
+
+
+@pytest.mark.asyncio
+async def test_delivered_leads_are_named_before_held_ones(
+    db, business_user, monkeypatch, paces, clean_health,
+):
+    monkeypatch.setattr(rec, "_BATCH_PARCELS", 1)
+    job_id = await _pierce_job(db, business_user)
+    held, _ = await _stored(db, business_user, job_id, party=None, ed=_held_ed())
+    delivered, _ = await _stored(db, business_user, job_id, party=None, parcel="2006120010",
+                                 address="602 AVE S")
+    portal = _Portal({"2021110133": [(200, ATIP_2117)],
+                      "2006120010": [(200, ATIP_602)]}).install(monkeypatch)
+
+    await asyncio.to_thread(rec.recover_pierce_cv_owners)
+
+    assert portal.requests == ["2006120010"]
+    got = await _fetch_rows(db, [held, delivered])
+    assert got[delivered].party_name == "602 LLC" and got[held].party_name is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", [
+    "UPDATE results SET is_duplicate = true WHERE id = :i",
+    "UPDATE results SET enrichment_data = (enrichment_data::jsonb - 'qualification_policy')::json WHERE id = :i",
+    "UPDATE results SET enrichment_data = (enrichment_data::jsonb || '{\"delivery_excluded_reason\": \"over_quota\"}')::json WHERE id = :i",
+], ids=["taken_over", "stamp_removed", "reclassified_over_quota"])
+async def test_a_held_row_changed_during_the_lookup_is_left_alone(
+    db, business_user, monkeypatch, paces, clean_health, change,
+):
+    """Codex P3: the Tacoma write re-applies the held branch, like King's."""
+    job_id = await _pierce_job(db, business_user)
+    rid, _ = await _stored(db, business_user, job_id, party=None, ed=_held_ed())
+    _Portal({"2021110133": [(200, ATIP_2117)]}).install(monkeypatch)
+    real_fetch = pao._fetch_summary
+
+    async def _fetch_then_change(session, parcel):
+        from src.db.session import system_sync_session
+
+        with system_sync_session() as other:
+            other.execute(text(change), {"i": rid})
+            other.commit()
+        return await real_fetch(session, parcel)
+
+    monkeypatch.setattr(pao, "_fetch_summary", _fetch_then_change)
+    await asyncio.to_thread(rec.recover_pierce_cv_owners)
+    assert (await _fetch_rows(db, [rid]))[rid].party_name is None

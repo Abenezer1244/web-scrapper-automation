@@ -18,6 +18,7 @@ import ipaddress
 import logging
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
 
 import pytest
 
@@ -186,7 +187,7 @@ def test_an_unparseable_url_never_puts_its_netloc_in_an_exception():
     # Fullwidth solidus: urlparse raises with the raw netloc in its message.
     url = "https://CATCHSECRET123／example.com/hooks"
     with pytest.raises(ValueError, match="CATCHSECRET123"):
-        __import__("urllib.parse").parse.urlparse(url).hostname
+        urlparse(url)
     assert log_host(url) == "?"
     assert wd._redact_url_secrets(f"echo {url}", url) == "echo <redacted>"
 

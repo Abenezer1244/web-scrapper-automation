@@ -86,7 +86,7 @@ to the same helper would close the inconsistency.
 
 | METHOD | PATH | id param | auth | session | ownership enforcement | verdict |
 |---|---|---|---|---|---|---|
-| GET | `/scrapers/sample` | — | **public** | get_db | n/a — pre-redacted singleton `public_sample_cache` | OK by design |
+| GET | `/scrapers/sample` | — | **public** | get_db | n/a — pre-redacted singleton `public_sample_cache` | OK by design **Retired 2026-10-30: endpoint and refresh task removed; table kept.** |
 | GET | `/scrapers` | — | CU | rls | `:121 ScraperConfig.user_id==cu.id` | OK |
 | POST | `/scrapers` | — | CU | rls | `:322 user_id=current_user.id` on insert | OK |
 | GET | `/scrapers/connectors` | — | **public** | get_db | n/a — `county_connectors` has no tenant column | OK (see INFO-1) |

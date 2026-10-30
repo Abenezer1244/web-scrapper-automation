@@ -71,7 +71,7 @@ a request body or query: those names appear only on response models
 
 | Method | Path | Auth | Session | Tenant predicate | Gate | Verdict |
 |---|---|---|---|---|---|---|
-| GET | `/scrapers/sample` | public | db | none; reads pre-redacted `public_sample_cache` only | none | OK by design |
+| GET | `/scrapers/sample` | public | db | none; reads pre-redacted `public_sample_cache` only | none | OK by design **Retired 2026-10-30: endpoint and refresh task removed; table kept.** |
 | GET | `/scrapers` | CU | rls | `:121` | none | OK |
 | POST | `/scrapers` | CU | rls | insert `user_id=current_user.id` `:321` | `enforce_entitlements` | OK |
 | GET | `/scrapers/connectors` | public | db | n/a, no tenant column | none | OK (INFO-1 carry-over) |

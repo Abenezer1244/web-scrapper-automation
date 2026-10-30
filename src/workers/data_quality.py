@@ -36,6 +36,7 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import text
 
 from src.utils.logger import setup_logger
+from src.workers import qualification_quality as qq
 
 _logger = setup_logger("workers.data_quality")
 
@@ -276,9 +277,21 @@ def check_job(db, job_id: str, *, alert: bool = True) -> dict:
     warnings = evaluate(run, baseline, skip_trace=bool(job["skip_trace_enabled"]))
     # Judged whatever the run's size: a silent source is exactly the 0-row run.
     volume_warning = evaluate_volume(volume(db, job_id))
+    # Code violations: the share the qualification gate let through, per jurisdiction,
+    # against that jurisdiction's own post-gate runs (src/workers/qualification_quality.py).
+    yield_warnings: list[dict] = []
+    qualification = None
+    if job["record_type"] == "code_violation":
+        measured = qq.qualification_yield(db, job_id=job_id, county=job["county"],
+                                          state=job["state"], record_type=job["record_type"])
+        yield_warnings, unjudged = qq.evaluate_yield(measured)
+        qualification = {**measured, "unjudged": unjudged}
     report = {"job_id": job_id, "county": job["county"], "state": job["state"],
               "record_type": job["record_type"], "run": run, "baseline": baseline,
-              "warnings": warnings + ([volume_warning] if volume_warning else [])}
+              "qualification": qualification,
+              "warnings": warnings + ([volume_warning] if volume_warning else []) + yield_warnings}
+    if yield_warnings and alert:
+        qq.alert_yield(job, yield_warnings)
     if volume_warning and alert:
         from src.workers.ops_alerts import send_ops_alert
 
@@ -310,7 +323,9 @@ def check_job(db, job_id: str, *, alert: bool = True) -> dict:
 
 
 def _checked_key(job_id: str) -> str:
-    return f"bl:dq:checked:{job_id}"
+    # v2: the qualification-yield check joined check_job; jobs judged before it shipped
+    # are judged once more (coverage alerts repeat only outside their cooldown).
+    return f"bl:dq:checked:v2:{job_id}"
 
 
 def run_data_quality_sweep(*, lookback_hours: int = SWEEP_LOOKBACK_HOURS,
@@ -357,6 +372,14 @@ def run_data_quality_sweep(*, lookback_hours: int = SWEEP_LOOKBACK_HOURS,
             stats["checked"] += 1
             if report.get("warnings"):
                 stats["warned"] += 1
+        # Recurring, not once per job: a delivered row can lose a value, and a dialer or a
+        # paid lookup can act on a row, long after its run was judged.
+        try:
+            breaches = qq.check_gate_invariants(db)
+            stats["gate_breaches"] = sum(len(jobs) for jobs in breaches.values())
+        except Exception as exc:  # noqa: BLE001 -- the coverage sweep above already ran
+            _logger.error("Lead quality gate check failed: %s", str(exc)[:160])
+            db.rollback()
     return stats
 
 

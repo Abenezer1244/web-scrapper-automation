@@ -55,6 +55,7 @@ from src.api.lead_qualification import (
     qualified_sql,
 )
 from src.utils.logger import setup_logger
+from src.workers.cv_late_delivery import LATE_KEY
 
 _logger = setup_logger("workers.qualification_quality")
 
@@ -87,6 +88,11 @@ _CV_JOBS = ("JOIN jobs j ON j.id = r.job_id "
             "JOIN scraper_configs sc ON sc.id = j.scraper_config_id AND sc.record_type = 'code_violation'")
 _POST_GATE_DONE = ("j.status = 'done' AND j.started_at >= :boundary AND j.finished_at >= :since "
                    "AND r.user_id = j.user_id")
+# Held AT THE GATE: still marked, or delivered later by src/workers/cv_late_delivery.py (which
+# removes the mark and stamps late_delivery). The yield and the held reasons read this, so a
+# late delivery never rewrites a run's pass rate or its baseline (Codex, late delivery r1).
+_HELD_AT_GATE = (f"({not_qualified_excluded_sql('r')} "
+                 f"OR (r.enrichment_data->'{LATE_KEY}') IS NOT NULL)")
 
 _UNHELD_UNQUALIFIED_SQL = f"""
 SELECT r.job_id::text AS job_id, count(*) AS n
@@ -122,14 +128,28 @@ WHERE {_POST_GATE_DONE}
 GROUP BY r.job_id ORDER BY n DESC
 """  # noqa: S608 -- splices only module constants; every value is bound
 
+# A row that lost its hold mark but carries the hold record and no late_delivery stamp was
+# released by something other than late delivery, so nothing charged it (the hold record is
+# only ever written with the mark, and a watchdog re-run clears both together).
+_RELEASED_WITHOUT_CHARGE_SQL = f"""
+SELECT r.job_id::text AS job_id, count(*) AS n
+FROM results r {_CV_JOBS}
+WHERE {_POST_GATE_DONE} AND r.is_duplicate = false AND {_SUBJECT}
+  AND NOT ({delivery_excluded_sql('r')})
+  AND (r.enrichment_data->'{HOLD_KEY}') IS NOT NULL
+  AND (r.enrichment_data->'{LATE_KEY}') IS NULL
+GROUP BY r.job_id ORDER BY n DESC
+"""  # noqa: S608 -- splices only module constants; every value is bound
+
 INVARIANTS = {
     "unheld_unqualified": (
         _UNHELD_UNQUALIFIED_SQL,
         "code violations that fail the qualification policy are not held",
-        "The hold step marks every failing code violation before billing, and a mark is never "
-        "removed after the run. These rows carry no mark and fail the policy now: either the "
-        "hold step missed them, or a delivered lead lost its owner, parcel or address afterwards "
-        "and dropped out of its run's list.",
+        "The hold step marks every failing code violation before billing, and after the run only "
+        "late delivery removes a mark, once the row qualifies. These rows carry no mark and fail "
+        "the policy now: the hold step missed them, a late delivery released an incomplete row, "
+        "or a delivered lead lost its owner, parcel or address afterwards and dropped out of its "
+        "run's list.",
     ),
     "outbound_held": (
         _OUTBOUND_HELD_SQL,
@@ -145,6 +165,13 @@ INVARIANTS = {
         "qualification_policy stamp. The policy passes unstamped rows, so the gate is off for "
         "them: check the insert in src/workers/tasks.py and any writer that replaces "
         "enrichment_data.",
+    ),
+    "released_without_charge": (
+        _RELEASED_WITHOUT_CHARGE_SQL,
+        "held code violations were released without a late-delivery charge",
+        "These rows carry the qualification hold record but no hold mark and no late_delivery "
+        "stamp: something other than src/workers/cv_late_delivery.py released them, so they are "
+        "listed and downloadable without having been charged.",
     ),
 }
 
@@ -194,7 +221,7 @@ _SOURCE_EXPR = "coalesce(r.enrichment_data->>'source', '')"
 
 _RUN_YIELD_SQL = f"""
 SELECT {_SOURCE_EXPR} AS source, count(*) AS n,
-       count(*) FILTER (WHERE {not_qualified_excluded_sql('r')}) AS held
+       count(*) FILTER (WHERE {_HELD_AT_GATE}) AS held
 FROM results r
 WHERE r.job_id = :job_id AND r.is_duplicate = false AND {_SUBJECT}
 GROUP BY 1
@@ -202,7 +229,7 @@ GROUP BY 1
 
 _BASELINE_YIELD_SQL = f"""
 SELECT {_SOURCE_EXPR} AS source, count(*) AS n,
-       count(*) FILTER (WHERE {not_qualified_excluded_sql('r')}) AS held
+       count(*) FILTER (WHERE {_HELD_AT_GATE}) AS held
 FROM results r {_CV_JOBS}
 WHERE {_POST_GATE_DONE} AND j.id <> :job_id AND r.is_duplicate = false AND {_SUBJECT}
   AND lower(sc.county) = :county AND upper(sc.state) = :state AND sc.record_type = :record_type
@@ -213,7 +240,7 @@ _HELD_REASONS_SQL = f"""
 SELECT {_SOURCE_EXPR} AS source, r.enrichment_data->'{HOLD_KEY}' AS hold
 FROM results r
 WHERE r.job_id = :job_id AND r.is_duplicate = false AND {_SUBJECT}
-  AND {not_qualified_excluded_sql('r')}
+  AND {_HELD_AT_GATE}
 """  # noqa: S608 -- splices only module constants; every value is bound
 
 

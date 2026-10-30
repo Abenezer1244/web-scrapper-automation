@@ -19,6 +19,49 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-10-29/30 — Results: #291 verified live; every card that disagrees with its list is now said (FE #292); a production deploy race
+
+**Built / Shipped:** FE #292 squash-merged as `4fd3219`; Vercel Production built it, and bridgeleads.io serves it
+(verified with `vercel inspect bridgeleads.io` and a live read-only check). `lib/run-summary.ts`: `listDriftLine`
+replaces `noAddressDriftLine`: a line shown under the cards when a listed count differs, for every New, Already
+delivered, No address or Held back list whose count differs from its card, when both counts are known; card number
+then listed number as facts ("none listed now" for zero). King tax `016d3490` now reads "Already
+delivered: 14,753 when the run finished, 14,772 listed now. No address: 237 when the run finished, 218 listed now.
+This can happen when an address is found, after the run, for records earlier runs had already delivered to you; the
+counts alone cannot show which records changed." No backend change.
+
+**Tried / Decided:** #291 live check, read-only (Pierce, King tax, King CV): 18/18 (DNC notice on New and Already
+delivered, cards and notice present through every tab load, export-menu DNC line, absentee filter 20 -> 4 -> 20 on
+Pierce, 375px light/dark). Why the cards and tabs differ: the breakdown puts a record without a property or mailing
+address under No address first (`run_breakdown.partition_case`); every list but No address requires an address and
+the lists apply the tax cap (`jobs.py`, `results_category.py`). A mailing address found after the run can take a
+record out of No address and, if eligible, into another list. The 19/19 mirror on 016d3490 fits that, but cannot be
+shown row by row (rows do not keep their done-time bucket) and the four tabs do not cover every saved record, so the
+copy states the differences as facts and the cause only as what "can happen". Wording follows `breakdown_basis`;
+counts come from the response in hand; the last counts are latched while results are loading.
+
+**Failed / Blocked:** the merge of #292 and a later `vercel promote` were each refused by the auto-mode classifier
+until the owner said so explicitly; the owner then asked for the CLI. First browser run timed out on the Results
+page's cold compile (passed warm). Line endings: the test files are CRLF in the working copy, so `\n`-anchored
+scripted edits silently missed; normalize first.
+
+**Caught & fixed:** Codex plan consult NO-GO: my plan said the mirror was "consistent only with" movement between
+the two lists and offered "most likely" as the cause; both too strong (Combined, Over plan limit and non-held
+taken-over records sit outside the tabs). Diff review FAIL twice, both copy overclaims: "the lists show only records
+with an address" (No address holds the opposite) and "into the list it belongs in" (a combined record joins none).
+Removed "a later run can take over a held record" as a cause myself: Held back keeps superseded held rows
+(`not_qualified_condition`). Review #3 GATE PASS. Production: Vercel's bot deployed `4fd3219` at 14:32:10Z and then
+the older `20d5de7` (the commit before it) at 14:32:35Z, which took the domain; the live check caught #292 missing.
+By the time the owner-approved `vercel promote` ran, `4fd3219` was already production again (409 "already the current
+production deployment"), so nothing was changed by hand; the re-check passed 7/7.
+
+**Pending / Handoff:** none for this work. Worth a look: why Vercel deployed an older master commit to production
+after a newer one (both `vercel[bot]`, no payload); a merge right after another can lose the race.
+
+**Facts learned:** after a merge, check what the domain serves (`vercel inspect <domain>`), not only the commit's
+deployment status; a "success" for your SHA does not mean it holds the alias. Unit 70/70, browser 13/13 on the stub,
+live 7/7.
+
 ## 2026-10-28 — Results: first live check of #287-#290, cards that blanked on uncached tab switches, owner/phone filters, DNC notice (FE #291)
 
 **Built / Shipped:** FE #291 squash-merged as `7773d58`; Vercel Production reported success for that SHA. FE branch `fix/results-live-check-filters-dnc` (worktree

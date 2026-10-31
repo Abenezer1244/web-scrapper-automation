@@ -94,6 +94,12 @@ _TICK_BUDGET_S = 480.0
 # phase 1 eats the budget phase 2 needs.
 _SWEEP_PACE_S = 0.5
 
+# A parcel King does not carry is settled only on three proofs (see _settle_no_record).
+# The last one is one King GIS request, whose timeout is 30 s, so it is made only while
+# that much of the tick is still left, with margin; otherwise the parcel just rotates.
+_GIS_PROOF_MIN_S = 45.0
+NO_RECORD_SOURCE = "king_erealproperty+king_gis+king_rpacct"
+
 # Single-flight lock TTL. Longer than the tick budget so a crashed tick's lock
 # still expires on its own, and long enough that a slow-but-live tick never has
 # its lease expire underneath it.
@@ -270,6 +276,10 @@ def _recover_impl(stats: dict, deadline: float | None = None) -> dict:
         # all. Those are written as "found" now and removed from this tick's page list,
         # so the rate-limited tax-bill page only sees what the file cannot answer.
         _extract = resolve_pins(set(parcels))
+        # Kept for the whole tick: an `absent` answer from a file that loaded is one of
+        # the proofs _settle_no_record needs. No usable file means no answers at all.
+        _answers: dict = {}
+        _snapshot: str | None = None
         if _extract is not None:
             _answers, _snapshot = _extract
             _hits = [p for p in parcels if _answers.get(p) and _answers[p].status == "found"]
@@ -331,7 +341,8 @@ def _recover_impl(stats: dict, deadline: float | None = None) -> dict:
         # terminalised it unlooked-at. A phase-1 failure leaves the parcel
         # deferred and uncharged, which is safe: if phase 1 keeps failing, the
         # breaker and the health gate stop the sweep entirely rather than letting
-        # it spin.
+        # it spin. Not for a SMALL backlog: the breaker needs 30 failures, so a few
+        # PINs King does not carry never trip it. _settle_no_record ends those.
         attempted = [p for p in dict.fromkeys(king_stats.get("mailing_attempted_pids", []))
                      if p in by_parcel]
         stats["parcels"] = len(attempted)
@@ -353,10 +364,55 @@ def _recover_impl(stats: dict, deadline: float | None = None) -> dict:
                      and (enriched.get(p) or {}).get("parcel_lookup") == "mismatch"]
         if _mismatch:
             _apply(db, by_parcel, _mismatch, enriched, stats)
-        _touch = [p for p in parcels if p not in set(attempted) and p not in set(_mismatch)]
+        _absent = _settle_no_record(db, by_parcel, parcels, set(attempted) | set(_mismatch),
+                                    enriched, _answers, _snapshot, deadline, stats)
+        _touch = [p for p in parcels if p not in set(attempted) and p not in set(_mismatch)
+                  and p not in _absent]
         if _touch:
             _rotate(db, by_parcel, _touch, stats)
     return stats
+
+
+def _settle_no_record(db, by_parcel: dict, parcels: list[str], settled_already: set[str],
+                      enriched: dict, answers: dict, snapshot: str | None, deadline: float,
+                      stats: dict) -> set[str]:
+    """Settle as `parcel_not_found` the parcels three King sources agree do not exist.
+
+    A PIN eRealProperty does not carry used to rotate through this sweep every tick
+    forever: its page is a phase-1 failure, phase 1 failures are never charged, and the
+    breaker that was meant to stop a persistent failure needs 30 of them while a small
+    backlog never reaches it (seen live 2026-10-31: the same 4 parcels every 10 minutes).
+    One page is not enough to give up on a lead, so all three must hold, this tick:
+      1. the eRealProperty page was its explicit "No data found." answer (`no_record`);
+      2. the Assessor extract loaded and has no account for the PIN (`absent`);
+      3. King's parcel layer answered and carries no such PIN.
+    Anything less leaves the parcel uncharged and rotating, exactly as before.
+    Returns the parcels it settled.
+    """
+    candidates = [p for p in parcels if p not in settled_already
+                  and (enriched.get(p) or {}).get("parcel_lookup") == "no_record"
+                  and getattr(answers.get(p), "status", None) == "absent"]
+    if not candidates:
+        return set()
+    if deadline - time.monotonic() < _GIS_PROOF_MIN_S:
+        _logger.info("Mailing recovery: no time left this tick to confirm %d missing King "
+                     "parcel(s) against GIS; they rotate", len(candidates))
+        return set()
+
+    from src.scrapers.enrichment.king_county_assessor import king_gis_absent
+
+    gis_absent = king_gis_absent(candidates)
+    settled = [p for p in candidates if p in gis_absent]
+    if settled:
+        _apply(db, by_parcel, settled, {
+            p: {"mailing_lookup": "parcel_not_found", "source": NO_RECORD_SOURCE,
+                "snapshot": snapshot}
+            for p in settled
+        }, stats)
+        _logger.info("Mailing recovery: %d parcel(s) King does not carry (eRealProperty, "
+                     "GIS and the Assessor extract agree) settled as parcel_not_found",
+                     len(settled))
+    return set(settled)
 
 
 def _rotate(db, by_parcel: dict, parcels: list[str], stats: dict) -> None:
@@ -429,7 +485,10 @@ def _apply(db, by_parcel: dict, parcels: list[str], enriched: dict, stats: dict)
                        # stays provable which source said so.
                        source=(data.get("source") if mailing or outcome in (
                            "none", "parcel_not_found", "parcel_mismatch") else None),
-                       snapshot=data.get("snapshot") if mailing else None)
+                       # A settled parcel_not_found keeps the snapshot too: the extract
+                       # that lacked it is part of that proof.
+                       snapshot=(data.get("snapshot")
+                                 if mailing or outcome == "parcel_not_found" else None))
 
         _key = {"found": "found", "none": "none", "parcel_not_found": "none",
                 "parcel_mismatch": "parcel_mismatch",

@@ -78,6 +78,15 @@ _PARCEL_ECHO_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
+# eRealProperty's answer for a PIN it does not carry (verified live 2026-10-31 with
+# ParcelNbr=0000000001): a 200 whose message label reads exactly "No data found." and
+# whose PARCEL section is an empty div, where a real parcel renders the
+# DetailsViewDashboardHeader table. Matched on the exact element and text, never a
+# loose substring, so an interstitial or a changed layout is not mistaken for it.
+_NO_RECORD_MSG_RE = re.compile(
+    r'<span\s+id="cphContent_LblMsg"[^>]*>\s*No data found\.\s*</span>', re.IGNORECASE)
+_DASHBOARD_HEADER_ID = 'id="cphContent_DetailsViewDashboardHeader"'
+
 # Delay before each parcel-repair candidate lookup. Repair is rare and its
 # requests are extra, so they are paced conservatively.
 _REPAIR_PACE_S = 0.5
@@ -119,6 +128,18 @@ def parcel_page_is_for(page_html: str, requested_pid: str) -> bool:
     """
     want = _digits(requested_pid)
     return bool(want) and _extract_parcel_echo(page_html) == want
+
+
+def is_no_record_page(page_html: str) -> bool:
+    """True only for eRealProperty's own "no such parcel" answer.
+
+    One proof of three: this page alone never settles a parcel (a page is one
+    request, and one request can be wrong). The mailing recovery sweep settles a
+    parcel only when the Assessor extract and King GIS also lack it.
+    """
+    return (_extract_parcel_echo(page_html) is None
+            and _DASHBOARD_HEADER_ID not in page_html
+            and _NO_RECORD_MSG_RE.search(page_html) is not None)
 
 
 class KingOwnerLookupBlockedError(RuntimeError):
@@ -595,6 +616,25 @@ def _gis_exists(candidates: list[str]) -> set[str]:
     return set(batch_enrich_parcels_gis(candidates, "king", "WA"))
 
 
+def king_gis_absent(pins: list[str]) -> set[str]:
+    """The PINs King's own parcel layer ANSWERED about and does not carry.
+
+    Absence needs an answer: a PIN in a chunk that timed out, errored, came back
+    attribute-empty or was capped is in `county_unreached`, never in this set. It also
+    needs the county layer itself: without the King entry (or if it ever stopped
+    skipping the statewide fallback, whose failures are not tracked) an empty result
+    would prove nothing, so the answer is the empty set.
+    """
+    from src.scrapers.enrichment.county_gis import _KNOWN_GIS_ENDPOINTS, batch_enrich_parcels_gis
+
+    if not pins or not (_KNOWN_GIS_ENDPOINTS.get("king_WA") or {}).get("skip_statewide_fallback"):
+        return set()
+    gis_stats: dict = {}
+    found = batch_enrich_parcels_gis(pins, "king", "WA", stats=gis_stats)
+    unreached = set(gis_stats.get("county_unreached") or [])
+    return {p for p in pins if p not in found and p not in unreached}
+
+
 def _owner_of(pin: str) -> str | None:
     """Assessor owner for one candidate, echo-verified (a page that names another
     parcel yields None, so a truncating answer can never break the tie).
@@ -857,6 +897,14 @@ async def _batch_enrich_king_county(
                 # truncation class either, so it never enters the repair path.
                 _p1.mark_last_failed("HTTP200_no_parcel")
                 failed = True
+                if is_no_record_page(r.text):
+                    # Still a failure and still deferred: only a LABEL for the
+                    # recovery sweep, which settles it on two more independent
+                    # proofs. Without it a dead PIN rotated through that sweep
+                    # every tick forever (the breaker needs 30 failures, and a
+                    # small backlog never reaches it).
+                    results[pid] = {"property_address": None, "mailing_address": None,
+                                    "owner_name": None, "parcel_lookup": "no_record"}
 
             if _p1.should_trip() or _is_quota_refusal(r):
                 msg = (

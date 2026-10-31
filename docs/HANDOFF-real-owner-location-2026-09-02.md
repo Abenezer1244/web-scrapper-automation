@@ -141,8 +141,8 @@ worktree; test everything.
    railway run --service worker python …/scripts/backfill_property_situs_parts.py            # dry-run
    ```
    Read the evidence JSONL, sanity-check a few `gained` rows against the source, then `--apply`.
-4. **Verify in the live UI** (Playwright headless Chromium, creds `zowiegirma29@gmail.com` /
-   `1212!Michael`, host `bridgeleads.io` NOT `app.`): open Test 3 (job
+4. **Verify in the live UI** (Playwright headless Chromium, creds `[redacted-email]` /
+   `[REDACTED 2026-10-31: leaked credential, must be rotated]`, host `bridgeleads.io` NOT `app.`): open Test 3 (job
    `5db4a9c7-36aa-4426-ac73-b6ed9886dd0a`) and confirm mailing addresses are real and
    `absentee_owner` is now a real **False** where the county says mail goes to the property
    (Hill, Vicedo, Kallansrud, CN Foods) rather than blank/unknown.

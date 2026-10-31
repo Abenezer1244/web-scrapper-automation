@@ -186,7 +186,7 @@ main repo's entry).
 CI. Confirm the Test check reads SUCCESS before merging.
 
 ### The live account to explain afterwards
-`zowiegirma29@gmail.com` (user id `01dc9396…`), plan pro,
+`[redacted-email]` (user id `01dc9396…`), plan pro,
 **`records_limit = 1000`, `records_period_start = 2026-09-01`**.
 
 `records_used` was **1007** going into the deploy — 1,001 restored by an earlier

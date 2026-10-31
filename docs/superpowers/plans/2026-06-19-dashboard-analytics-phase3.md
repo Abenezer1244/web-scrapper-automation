@@ -917,7 +917,7 @@ import { SkipTraceRate } from "./_components/SkipTraceRate";
 - [ ] **Step 2: Typecheck + lint.** Run: `npx tsc --noEmit && npm run lint`
 Expected: clean.
 
-- [ ] **Step 3: Visual verify (headless — headed browse is broken on this box).** Start/confirm dev server on :3000, log in (`admin@bridgeleads.io` / `BridgeLeads2026!`), screenshot `/dashboard`. Confirm: trend area renders + toggles 30/90, donut colors match record types, bars show counties, skip-trace stat renders; all four show loading→data and a sane empty state on a fresh account.
+- [ ] **Step 3: Visual verify (headless — headed browse is broken on this box).** Start/confirm dev server on :3000, log in (`admin@bridgeleads.io` / `[REDACTED 2026-10-31: leaked credential, must be rotated]`), screenshot `/dashboard`. Confirm: trend area renders + toggles 30/90, donut colors match record types, bars show counties, skip-trace stat renders; all four show loading→data and a sane empty state on a fresh account.
 
 - [ ] **Step 4: Commit.**
 

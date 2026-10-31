@@ -300,7 +300,7 @@ safety net — the lazy path on reserve/settle/enforcement is what makes quota c
 At no point do both mechanisms grant (steps 1-4 agree by construction; step 5 is the single
 handover) and at no point can neither roll (step 5 only lands after 3 and 4 are verified live).
 
-**The 1007/1000 account (`zowiegirma29@gmail.com`, `01dc9396…`)** at step 1:
+**The 1007/1000 account (`[redacted-email]`, `01dc9396…`)** at step 1:
 `quota_anchor_at = quota_period_start = 2026-09-01`, `quota_period_end = 2026-10-01`,
 `records_used = 1007` untouched, `records_limit = 1000` -> still over cap, still blocked,
 next reset 2026-10-01. The migration adds columns and changes no counter. After step 6 its

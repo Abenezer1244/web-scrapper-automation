@@ -9,7 +9,7 @@ County; same ASP.NET form). The SSRF allowlist only holds hosts of connector bas
 redirect is refused and every Skagit job and canary fails.
 - [x] Migration 122: county_connectors skagit/WA base_url old -> new (guarded on the old value;
       downgrade reverses). Exact FQDN, never the parent domain (subdomain matching).
-- [x] registry: route both hosts to SkagitRecordingScraper (old rows keep working until migrated).
+- [x] registry: route both hosts (exact match) to SkagitRecordingScraper. Old rows are routed but their redirect is still refused until migrated: migrations run on API boot, workers wait for head and refresh the allowlist per job and canary.
 - [x] template docstring; tests for both URLs.
 - [x] Live: 14-day probate window at the new URL, through the normal SSRF path: 30 records (4 doc-type searches).
 

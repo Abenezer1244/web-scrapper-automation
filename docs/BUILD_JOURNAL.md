@@ -19,6 +19,35 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-10-31 — A repair for the leads the PACS bug exhausted or falsely settled (script only, not run)
+
+**Built / Shipped:** branch `fix/pacs-mailing-repair`: `scripts/repair_pacs_mailing_recovery.py`, a
+dry-run-by-default operator script. Cohort A (Clallam, Grant, Jefferson, Chelan, Island, Whatcom;
+outcome `error`, out of attempts) is re-deferred with attempts and outcome removed: one more bounded
+round, since `error` also covers real timeouts. Cohort B (Island lettered ids "not found" by
+`pacs_island` without a request) loses the false outcome, source and attempts but is not queued.
+Runbook and decisions: `tasks/todo-pacs-mailing-repair.md`. Not run: it reads and writes production,
+so the owner runs the dry-run first.
+
+**Tried / Decided:** the existing requeue script cannot reach these rows (it skips any row with an
+outcome). Codex plan review (NO-GO -> 5 amendments): a versioned marker so a row is repaired once and
+its evidence never overwritten; a deployed-commit check; cohort B also requires job done and not
+deferred; A is honestly a retry cohort; every UPDATE pins the values it was read with.
+
+**Caught & fixed:** Codex diff review, twice NO-GO on the lock. First: borrowing the sweep's
+`_acquire_single_flight`/`_release_single_flight` gave a lock with no owner, refreshed by row count, so
+it could expire mid-run, then extend or delete a sweep tick's lock. Now an owned lease (token, Lua
+compare-and-expire / compare-and-delete). Second: ownership was checked only when a renewal was due, so
+for up to 60 s a lost key went unnoticed; now every check proves ownership and only renewal is
+throttled. Also: subtracting a '' key for cohort A (now a CASE).
+
+**Facts learned:** the sweeps' lock is SET NX with a timestamp value and a blind DELETE on release; any
+tool that must exclude the sweeps should hold that key with its own token, never reuse those helpers.
+`railway run` runs locally with the service's env, so a "deployed code" guard can only check a SHA the
+operator names.
+
+---
+
 ## 2026-10-31 — PACS mailing worked in 1 of 7 counties: the search never said which search it was
 
 **Built / Shipped:** branch `fix/pacs-search-mode`. `pacs.search_type_field`: the parcel search posts

@@ -209,3 +209,28 @@ Never spend outside the existing gates; never touch any OTHER row of the run.
 - Codex r2 confirmed: only_result_ids as an optional filter on both the eligible query and the lock-time
   re-read leaves normal runs unchanged; claim + dispatcher keep every spend gate; the drain may run after
   dialer_pushed_at; replay stays the user's action.
+
+## Phases C and D done (2026-10-31)
+- [x] C1 BE #561 (79300bdf): ResultRow.delivered_late_at, ResultsPage.late_delivered_count (New list only),
+  NotificationType.LATE_DELIVERY + prefs toggle.
+- [x] C2 FE bridgeleads-web #298 (63d17055): Results "Delivered after the run" line, summary line, bell,
+  settings toggle; Vercel production deploy succeeded.
+- [x] C3 BE #566 (d692fc8a): notify_late_deliveries, one notice per account batch, exactly once.
+- [x] D1 BE #568 (1568a56d): paid skip trace through the run's own enqueue (only_result_ids, quiet);
+  Codex r1 GATE FAIL, r2 GATE PASS; 382 targeted tests passed locally, CI green.
+- [x] D2 BE #569 (06757393): dialer push exactly once (outbox idempotent; generic webhook via_sweep /
+  skipped_overlap / send_failed; 24 h trace wait); Codex r1 GATE FAIL, r2 GATE PASS; CI green.
+- [x] Deployed to api/worker/beat; prod ticks every 20 min return errors 0 (candidates 0 so far).
+
+## Review
+- Shipped: Phases A-D in seven BE PRs (#555 #559 #561 #566 #568 #569, plus #564 for Accela postback tests)
+  and FE #298. A held code violation is now named by the owner sweeps, delivered and billed once when
+  complete, announced once per account, skip traced if its run would have been, and pushed to the run's
+  dialer at most once.
+- Decisions kept: no quota credit for the 929 pre-gate rows (owner decision C); a lost dialer push is
+  preferred to a duplicate CRM import (generic webhook overlap window skipped); a late row never makes
+  the run's other untraced leads get traced.
+- Notes: the `test_audit4_held_lookup_log` source pin had to follow D1's quiet `_log` wrapper; the local
+  test DB once lost its tables before a run (cause not found, rebuilt with `alembic upgrade head`).
+- Nothing pending. Watch the worker tick stats (`delivered`, `contacts_requested`, `dialer_pushed`) for
+  the first real late delivery.

@@ -279,13 +279,21 @@ def test_the_deployed_commit_check_reads_the_real_history():
     assert rp.commit_has_fix("d3d0d08e") is False                      # main before #575
     assert rp.commit_has_fix("HEAD") is False                          # refs are refused: hex only
     assert rp.commit_has_fix("not-a-sha") is False
-    # Main with #575 but before the Clallam land-id fix: fine for Jefferson, refused for
-    # any run that includes Clallam, the default run among them.
-    assert rp.commit_has_fix("2c0cae53", ("jefferson",)) is True
-    assert rp.commit_has_fix("2c0cae53", ("clallam",)) is False
-    assert rp.commit_has_fix("2c0cae53", ("jefferson", "clallam")) is False
-    assert rp.commit_has_fix("2c0cae53") is False
     assert rp.commit_has_fix(head, ("clallam",)) is True
+
+
+@pytest.mark.parametrize("shape", range(len(rp._CLALLAM_FIX_SHAPES)))
+def test_code_without_the_clallam_fix_is_refused_only_for_runs_that_include_clallam(shape):
+    # CI checks out shallow, so "main before the fix" is built from this tree's own source
+    # with one piece of the Clallam fix taken out, not read from an older commit.
+    src = (rp.REPO / "src/scrapers/enrichment/pacs_parcel.py").read_text(encoding="utf-8")
+    assert rp.source_has_fix(src) is True
+    before = rp._CLALLAM_FIX_SHAPES[shape].sub("", src)
+    assert rp.source_has_fix(before, ("jefferson",)) is True
+    assert rp.source_has_fix(before, ("clallam",)) is False
+    assert rp.source_has_fix(before, ("jefferson", "clallam")) is False
+    assert rp.source_has_fix(before) is False                         # the default run
+    assert rp.source_has_fix(src.replace("search_type_field", ""), ("jefferson",)) is False
 
 
 @pytest.mark.parametrize(("argv", "expected"), [

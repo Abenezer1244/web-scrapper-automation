@@ -706,7 +706,8 @@ def _resolve_king_account_parcels(db, rows: list, job_id: str) -> int:
 PROPERTY_DEFERRED_KEY = "property_lookup_deferred"
 PROPERTY_OUTCOME_KEY = "property_lookup_outcome"
 # Outcomes that settle a parcel: no source can give it a property address.
-PROPERTY_SETTLED_OUTCOMES = ("no_site_address", "parcel_mismatch")
+# parcel_not_found: three King sources agree the PIN does not exist (property_recovery).
+PROPERTY_SETTLED_OUTCOMES = ("no_site_address", "parcel_mismatch", "parcel_not_found")
 
 _SQL_MARK_PROPERTY_DEFERRED = f"""
     UPDATE results
@@ -716,7 +717,7 @@ _SQL_MARK_PROPERTY_DEFERRED = f"""
        -- Re-checked in SQL, not only on this job's ORM copy: a sweep may have settled
        -- the row meanwhile, and re-marking it would start a pointless retry.
        AND coalesce(enrichment_data::jsonb->>'property_lookup_outcome', '')
-           NOT IN ('found', 'no_site_address', 'parcel_mismatch', 'gave_up')
+           NOT IN ('found', 'no_site_address', 'parcel_mismatch', 'parcel_not_found', 'gave_up')
 """
 
 

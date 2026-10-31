@@ -98,7 +98,6 @@ _SWEEP_PACE_S = 0.5
 # The last one is one King GIS request, whose timeout is 30 s, so it is made only while
 # that much of the tick is still left, with margin; otherwise the parcel just rotates.
 _GIS_PROOF_MIN_S = 45.0
-NO_RECORD_SOURCE = "king_erealproperty+king_gis+king_rpacct"
 
 # Single-flight lock TTL. Longer than the tick budget so a crashed tick's lock
 # still expires on its own, and long enough that a slow-but-live tick never has
@@ -346,7 +345,6 @@ def _recover_impl(stats: dict, deadline: float | None = None) -> dict:
         attempted = [p for p in dict.fromkeys(king_stats.get("mailing_attempted_pids", []))
                      if p in by_parcel]
         stats["parcels"] = len(attempted)
-        stats["unreached"] = len(parcels) - len(attempted)
         _apply(db, by_parcel, attempted, enriched, stats)
 
         # Parcels we REQUESTED but could not mailing-attempt (phase 1 failed, or
@@ -368,6 +366,9 @@ def _recover_impl(stats: dict, deadline: float | None = None) -> dict:
                                     enriched, _answers, _snapshot, deadline, stats)
         _touch = [p for p in parcels if p not in set(attempted) and p not in set(_mismatch)
                   and p not in _absent]
+        # Recomputed now that settling is done: a parcel settled as a mismatch or as
+        # parcel_not_found was fetched and answered, so it is not unreached work.
+        stats["unreached"] = len(_touch)
         if _touch:
             _rotate(db, by_parcel, _touch, stats)
     return stats
@@ -399,13 +400,16 @@ def _settle_no_record(db, by_parcel: dict, parcels: list[str], settled_already: 
                      "parcel(s) against GIS; they rotate", len(candidates))
         return set()
 
-    from src.scrapers.enrichment.king_county_assessor import king_gis_absent
+    from src.scrapers.enrichment.king_county_assessor import (
+        NOT_CARRIED_SOURCE,
+        confirm_not_carried,
+    )
 
-    gis_absent = king_gis_absent(candidates)
-    settled = [p for p in candidates if p in gis_absent]
+    proven = confirm_not_carried(candidates, answers)
+    settled = [p for p in candidates if p in proven]
     if settled:
         _apply(db, by_parcel, settled, {
-            p: {"mailing_lookup": "parcel_not_found", "source": NO_RECORD_SOURCE,
+            p: {"mailing_lookup": "parcel_not_found", "source": NOT_CARRIED_SOURCE,
                 "snapshot": snapshot}
             for p in settled
         }, stats)

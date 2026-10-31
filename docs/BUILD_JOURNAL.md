@@ -19,6 +19,35 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-10-31 — King "no record" follow-ups: property recovery settles dead PINs too; one shared proof; honest sweep stats
+
+**Built / Shipped:** branch `fix/king-no-record-followups`, after #565 was verified live (05:53Z tick
+settled the 4 looping parcels; 06:03Z tick had 0 candidates). `confirm_not_carried` (king_county_assessor)
+is now the one three-proof check; property_recovery settles a dead PIN as `parcel_not_found` instead of
+spending five charged ticks and ending `gave_up`; the mailing sweep's "unreached" stat no longer counts
+settled parcels. `resolve_pins`/`cached_extract` gained `refresh=False` (cache only, never download).
+Plan and review: `tasks/todo-king-no-record-followups.md`.
+
+**Tried / Decided:** live-job settling (enrich.py) was planned and NOT built. Codex NO-GO: it needs
+conservative identity rules (previously recovered parcels), durable per-chunk fallback markers with an
+atomic swap to settled, bounded GIS batches inside the live budget and owner-pass suppression, in the
+most central file, to save one sweep request per dead PIN. Left to the owner.
+
+**Failed / Blocked:** the first full test run failed 31 tests with "connection refused" on :6543:
+`src.db.session` rewrites the sync URL to the pooler port and nothing listened locally (something had
+earlier). Ran a local 6543 -> 5432 forwarder for the session; not a code regression.
+
+**Caught & fixed:** Codex diff review [High]: the property proof called `resolve_pins`, which DOWNLOADS
+the 18 MB extract (300 s timeout) on a cold or stale worker cache, inside a 300 s tick; a time check
+before it cannot bound a download already running. Now cache-only. [Medium]: tests swapped out project
+code; the extract helper now runs the real cache, and both sweeps have a real end-to-end page test.
+
+**Facts learned:** the RPAcct cache is per worker replica and re-downloads after every deploy, so a
+proof that reads it must not assume it is warm. Owner recovery charges every attempt (capped at 5), so
+dead PINs cannot loop there.
+
+---
+
 ## 2026-10-31 — King mailing recovery: a PIN King does not carry is settled, not re-fetched every 10 minutes forever
 
 **Built / Shipped:** branch `fix/king-parcel-not-found`. `is_no_record_page` + a `no_record` phase-1

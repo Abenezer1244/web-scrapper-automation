@@ -868,9 +868,10 @@ async def get_results(
             select(
                 func.count().filter(list_condition("no_address")),
                 func.count().filter(list_condition("not_qualified")),
+                # An object stamp only: a JSON null is not SQL NULL and must not count.
                 func.count().filter(
                     Result.is_duplicate.is_(False),
-                    Result.enrichment_data.op("->")(LATE_DELIVERY_KEY).is_not(None)),
+                    func.json_typeof(Result.enrichment_data.op("->")(LATE_DELIVERY_KEY)) == "object"),
             ).where(
                 Result.job_id == job_id,
                 Result.user_id == current_user.id,

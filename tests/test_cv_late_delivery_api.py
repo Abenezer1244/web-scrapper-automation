@@ -111,6 +111,25 @@ async def test_another_accounts_late_leads_never_count(client, db, business_user
 
 
 @pytest.mark.asyncio
+async def test_a_null_or_scalar_stamp_and_another_users_row_never_count(
+        client, db, business_user, starter_user, business_token):
+    """Codex P2/P3: only an object stamp counts, and only this account's rows of the job."""
+    job = await _done_job(db, business_user)
+    await _row(db, job, business_user.id, late=STAMP)
+    await _row(db, job, business_user.id, property_address="2 NULL ST")
+    await _row(db, job, business_user.id, property_address="3 SCALAR ST")
+    await db.execute(text("UPDATE results SET enrichment_data = (enrichment_data::jsonb || "
+                          "'{\"late_delivery\": null}')::json WHERE property_address = '2 NULL ST'"))
+    await db.execute(text("UPDATE results SET enrichment_data = (enrichment_data::jsonb || "
+                          "'{\"late_delivery\": \"yes\"}')::json WHERE property_address = '3 SCALAR ST'"))
+    await db.commit()
+    await _row(db, job, starter_user.id, late=STAMP, property_address="4 FOREIGN ST")   # same job, other account
+    page = await _page(client, job, business_token, category="new")
+    assert page["late_delivered_count"] == 1
+    assert sum(1 for i in page["items"] if i["delivered_late_at"]) == 1
+
+
+@pytest.mark.asyncio
 async def test_the_late_delivery_notice_can_be_turned_off(client, business_token):
     resp = await client.put("/auth/notification-preferences", json={"late_delivery": False},
                             headers={"Authorization": f"Bearer {business_token}"})

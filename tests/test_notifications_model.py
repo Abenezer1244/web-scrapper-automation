@@ -6,8 +6,9 @@ def test_notification_type_values():
     assert NotificationType.JOB_COMPLETED == "job_completed"
     assert NotificationType.JOB_FAILED == "job_failed"
     assert NotificationType.PAYMENT_FAILED == "payment_failed"
+    assert NotificationType.LATE_DELIVERY == "late_delivery"
     assert {t.value for t in NotificationType} == {
-        "job_completed", "job_failed", "payment_failed",
+        "job_completed", "job_failed", "payment_failed", "late_delivery",
     }
 
 

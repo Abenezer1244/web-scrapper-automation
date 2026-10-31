@@ -137,7 +137,95 @@ def deliver_completed_held_rows(*, batch: int = _BATCH_ROWS) -> dict:
         _logger.info("Late delivery: %d candidate(s): %d delivered, %d no quota, %d blocked, "
                      "%d stale, %d error(s)", stats["candidates"], stats["delivered"],
                      stats["no_quota"], stats["blocked"], stats["stale"], stats["errors"])
+    # Every tick, not only after a delivery: it also announces rows a crashed tick
+    # delivered and never announced.
+    try:
+        stats["notified_accounts"] = notify_late_deliveries()
+    except (SoftTimeLimitExceeded, TimeLimitExceeded):
+        raise
+    except Exception as exc:  # noqa: BLE001 -- deliveries are committed; the notice retries next tick
+        _logger.warning("Late delivery notices failed: %s", type(exc).__name__)
     return stats
+
+
+# Rows delivered but not announced yet, in the same scope as discovery (done code-violation
+# jobs of the row's own account), so neither query reaches across record types or accounts.
+_PENDING_SCOPE = f"""
+    FROM results r
+    JOIN jobs j ON j.id = r.job_id AND j.user_id = r.user_id AND j.status = 'done'
+    JOIN scraper_configs sc ON sc.id = j.scraper_config_id AND sc.user_id = j.user_id
+                           AND sc.record_type = 'code_violation'
+    WHERE r.enrichment_data::jsonb->'{LATE_KEY}'->>'notified' = 'false'
+"""  # noqa: S608 -- splices only module constants
+# Oldest pending delivery first, so a backlog drains in order and no account is skipped
+# every tick (Codex C3 P2).
+_PENDING_ACCOUNTS_SQL = f"""
+    SELECT r.user_id::text AS user_id
+    {_PENDING_SCOPE}
+    GROUP BY r.user_id
+    ORDER BY min(r.enrichment_data::jsonb->'{LATE_KEY}'->>'delivered_at'), r.user_id
+    LIMIT :limit
+"""  # noqa: S608 -- splices only module constants; every value is bound
+_PENDING_ROWS_SQL = f"""
+    SELECT r.id::text AS id, r.job_id::text AS job_id
+    {_PENDING_SCOPE}
+      AND r.user_id = CAST(:uid AS uuid)
+    ORDER BY r.enrichment_data::jsonb->'{LATE_KEY}'->>'delivered_at', r.id
+    FOR UPDATE OF r
+"""  # noqa: S608 -- splices only module constants; every value is bound
+_MARK_NOTIFIED_SQL = f"""
+    UPDATE results SET enrichment_data =
+      jsonb_set(enrichment_data::jsonb, '{{{LATE_KEY},notified}}', 'true'::jsonb)::json
+    WHERE user_id = CAST(:uid AS uuid) AND id = ANY(CAST(:ids AS uuid[]))
+"""  # noqa: S608 -- splices only module constants; every value is bound
+_NOTIFY_ACCOUNTS = 500
+_JOBS_IN_NOTICE = 5
+
+
+def notify_late_deliveries() -> int:
+    """One in-app notice per account for every delivered row not announced yet; returns
+    the number of accounts announced.
+
+    Exactly once: per account, ONE system-session transaction takes an advisory lock on
+    the account (two ticks never split or double an account's batch), locks the pending
+    rows, adds the notification (notification_emit.add_notification: type and prefs
+    rules, no commit) and marks those rows notified, then commits. A crash before the
+    commit leaves the rows pending and nothing written; after it, nothing is pending.
+    Prefs off: the rows are marked and no notice is added. Ids and counts only.
+    """
+    from src.config.constants import NotificationType
+    from src.db.session import system_sync_session
+    from src.workers.notification_emit import add_notification
+
+    with system_sync_session() as db:
+        accounts = [r[0] for r in db.execute(sa_text(_PENDING_ACCOUNTS_SQL), {"limit": _NOTIFY_ACCOUNTS})]
+        db.rollback()
+    announced = 0
+    for user_id in accounts:
+        with system_sync_session() as db:
+            try:
+                db.execute(sa_text("SELECT pg_advisory_xact_lock(hashtext(:k))"),
+                           {"k": f"cv_late_notify:{user_id}"})
+                rows = db.execute(sa_text(_PENDING_ROWS_SQL), {"uid": user_id}).mappings().all()
+                if not rows:
+                    db.rollback()
+                    continue
+                job_ids = list(dict.fromkeys(r["job_id"] for r in rows))
+                added = add_notification(
+                    db, user_id=user_id, type=NotificationType.LATE_DELIVERY.value,
+                    job_id=job_ids[0] if len(job_ids) == 1 else None,
+                    detail={"count": len(rows), "job_ids": job_ids[:_JOBS_IN_NOTICE]})
+                db.execute(sa_text(_MARK_NOTIFIED_SQL), {"uid": user_id, "ids": [r["id"] for r in rows]})
+                db.commit()
+                announced += int(added)
+            except (SoftTimeLimitExceeded, TimeLimitExceeded):
+                db.rollback()
+                raise
+            except Exception as exc:  # noqa: BLE001 -- one account never stops the others
+                db.rollback()
+                _logger.warning("Late delivery notice failed for account %s: %s", str(user_id)[:8],
+                                type(exc).__name__)
+    return announced
 
 
 def _deliver_one(db, row) -> str:
@@ -166,7 +254,9 @@ def _deliver_one(db, row) -> str:
             return "blocked" if block else "no_quota"
         late = {LATE_KEY: {"delivered_at": at.isoformat(), "quota_period_start":
                            window_start.isoformat() if window_start else None,
-                           "policy": POLICY_CODE_VIOLATION}}
+                           "policy": POLICY_CODE_VIOLATION,
+                           # Announced by notify_late_deliveries, exactly once.
+                           "notified": False}}
         written = db.execute(sa_text(_DELIVER_SQL), {**params, "late": json.dumps(late)}).rowcount
         if written != 1:
             db.rollback()

@@ -5,15 +5,17 @@ forever. Each page was eRealProperty's "No data found." answer, which phase 1 co
 a failure; failures are never charged, and the breaker meant to stop a persistent
 failure needs 30 of them, which a 4-parcel backlog never reaches.
 
-Real DB, real rows, a real Assessor extract zip (tmp_path) read by the real reader, and
-the real King GIS code with only its HTTP request substituted. The eRealProperty pass is
-substituted as in test_mailing_recovery: what is under test is what the sweep WRITES.
+Real DB, real rows, a real Assessor extract zip in a real worker cache (tmp_path; only the
+download is substituted), and the real King GIS code with only its HTTP request
+substituted. Most cases substitute the eRealProperty pass as test_mailing_recovery does,
+because what is under test is what the sweep WRITES; one runs the real pass end to end.
 """
 from __future__ import annotations
 
 import asyncio
 import csv
 import io
+import json
 import uuid
 import zipfile
 
@@ -21,8 +23,10 @@ import pytest
 from sqlalchemy import text
 
 from src.db.models import Job, Result, ScraperConfig
+from src.scrapers.enrichment import king_county_assessor as kca
 from src.scrapers.enrichment import king_rpacct as kr
 from src.workers import mailing_recovery as mr
+from tests.test_king_no_record_page import NO_RECORD_PAGE, _Resp, offline  # noqa: F401  (fixture)
 
 PIN = "9999990001"
 SNAPSHOT = "2026-10-31"
@@ -53,18 +57,38 @@ async def _row(db, user, parcel=PIN) -> str:
     return rid
 
 
-def _use_extract(monkeypatch, tmp_path, accounts: list[dict]) -> None:
-    """A real RPAcct zip, read by the real reader. `accounts` never names PIN unless asked."""
+_REAL_CACHED_EXTRACT = kr.cached_extract  # captured at import, before conftest stubs it
+
+
+def _real_cache(monkeypatch, cache_dir) -> list:
+    """The real worker cache, rooted in `cache_dir`. Returns the download attempts made."""
+    downloads: list = []
+
+    def _download(dest):
+        downloads.append(dest)
+        raise OSError("no network in tests")
+
+    monkeypatch.setattr(kr, "_CACHE_DIR", cache_dir)
+    monkeypatch.setattr(kr, "download_extract", _download)
+    monkeypatch.setattr(kr, "cached_extract", _REAL_CACHED_EXTRACT)
+    return downloads
+
+
+def _use_extract(monkeypatch, tmp_path, accounts: list[dict]) -> list:
+    """A real RPAcct zip in a fresh real cache, read by the real reader. `accounts` never
+    names PIN unless asked. Returns the download attempts (a fresh cache makes none)."""
     cols = ["AcctNbr", "Major", "Minor", "AttnLine", "AddrLine", "CityState", "ZipCode"]
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=cols)
     writer.writeheader()
     for a in accounts:
         writer.writerow({c: a.get(c, "") for c in cols})
-    path = tmp_path / "rpacct.zip"
-    with zipfile.ZipFile(path, "w") as zf:
+    cache = tmp_path / "rpacct_cache"
+    cache.mkdir()
+    with zipfile.ZipFile(cache / "rpacct.zip", "w") as zf:
         zf.writestr("EXTR_RPAcct_NoName.csv", buf.getvalue().encode("latin-1"))
-    monkeypatch.setattr(kr, "cached_extract", lambda *a, **kw: (path, SNAPSHOT))
+    (cache / "snapshot.json").write_text(json.dumps({"snapshot": SNAPSHOT}), encoding="utf-8")
+    return _real_cache(monkeypatch, cache)
 
 
 _OTHER_ACCOUNT = {"Major": "132140", "Minor": "0230", "AddrLine": "2736 ROSECLIFF TERRACE",
@@ -133,7 +157,7 @@ async def test_three_agreeing_sources_settle_the_pin_and_it_is_never_asked_again
     ed = await _ed(db, rid)
     assert ed["mailing_recovery_outcome"] == "parcel_not_found"
     assert ed["mailing_lookup_deferred"] is False and ed["mailing_recovery_attempts"] == 1
-    assert ed["mailing_source"] == mr.NO_RECORD_SOURCE
+    assert ed["mailing_source"] == kca.NOT_CARRIED_SOURCE
     assert ed["mailing_rpacct_snapshot"] == SNAPSHOT
     mailing = (await db.execute(text("SELECT mailing_address FROM results WHERE id = :i"), {"i": rid})).scalar()
     assert mailing is None
@@ -211,35 +235,9 @@ async def test_a_capped_gis_page_proves_nothing(db, business_user, monkeypatch, 
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("offline")
 async def test_the_real_phase_one_answer_settles_end_to_end(db, business_user, monkeypatch, tmp_path):
     """No substituted pass: the real eRealProperty loop labels the page, the sweep settles."""
-    from src.scrapers.enrichment import king_county_assessor as kca
-    from tests.test_king_no_record_page import NO_RECORD_PAGE, _Resp
-
-    class _Lease:
-        admitted = True
-
-        def __init__(self, *a, **k):
-            pass
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return None
-
-        def still_held(self):
-            return True
-
-    real_sleep = asyncio.sleep
-
-    async def _no_pace(_seconds):
-        await real_sleep(0)
-
-    monkeypatch.setattr("src.scrapers.enrichment.source_admission.SourceAdmission", _Lease)
-    monkeypatch.setattr(kca, "check_source_or_raise", lambda *_a, **_k: None)
-    monkeypatch.setattr(kca, "record_source_blocked", lambda *_a, **_k: None)
-    monkeypatch.setattr(kca.asyncio, "sleep", _no_pace)
     erp: list = []
 
     def _erp_get(url, **kw):
@@ -256,7 +254,7 @@ async def test_the_real_phase_one_answer_settles_end_to_end(db, business_user, m
     assert len(erp) == 1 and erp[0].endswith(PIN) and len(gis) == 1 and stats["none"] == 1
     ed = await _ed(db, rid)
     assert ed["mailing_recovery_outcome"] == "parcel_not_found"
-    assert ed["mailing_source"] == mr.NO_RECORD_SOURCE
+    assert ed["mailing_source"] == kca.NOT_CARRIED_SOURCE
 
 
 @pytest.mark.asyncio
@@ -284,3 +282,44 @@ async def test_with_no_time_left_for_gis_it_rotates_instead(db, business_user, m
     await asyncio.to_thread(mr.recover_deferred_king_mailing)
 
     assert gis == [] and _rotated_uncharged(await _ed(db, rid))
+
+
+def test_one_proof_makes_at_most_one_gis_request(monkeypatch):
+    pins = [f"99999{i:05d}" for i in range(60)]
+    gis = _gis(monkeypatch)
+
+    proven = kca.confirm_not_carried(pins, {p: kr.Answer("absent") for p in pins})
+
+    # Only the first 50: one county_gis chunk, so one request inside its 30 s timeout.
+    assert len(gis) == 1 and proven == set(pins[:50])
+
+
+def test_no_usable_extract_proves_nothing_and_asks_gis_nothing(monkeypatch):
+    gis = _gis(monkeypatch)
+
+    assert kca.confirm_not_carried([PIN], None) == set()
+    assert kca.confirm_not_carried([PIN], {PIN: kr.Answer("no_address")}) == set()
+    assert gis == []
+
+
+@pytest.mark.asyncio
+async def test_settled_parcels_are_not_counted_as_unreached(db, business_user, monkeypatch, tmp_path):
+    """One tick, three parcels: a mismatch, a proven missing PIN, and a plain failure."""
+    mismatch, missing, failed = "9999990002", PIN, "9999990003"
+    for parcel in (mismatch, missing, failed):
+        await _row(db, business_user, parcel)
+    _use_extract(monkeypatch, tmp_path, [_OTHER_ACCOUNT])
+    _gis(monkeypatch)
+    labels = {mismatch: "mismatch", missing: "no_record"}
+
+    async def _batch(parcels, **kw):
+        kw["stats"].update({"requested_pids": list(parcels), "mailing_attempted_pids": []})
+        return {p: {"property_address": None, "mailing_address": None, "parcel_lookup": labels[p]}
+                for p in parcels if p in labels}
+
+    monkeypatch.setattr("src.scrapers.enrichment.king_county_assessor.batch_enrich_king_county", _batch)
+
+    stats = await asyncio.to_thread(mr.recover_deferred_king_mailing)
+
+    assert stats["parcel_mismatch"] == 1 and stats["none"] == 1
+    assert stats["unreached"] == 1                     # only the plain failure is still open

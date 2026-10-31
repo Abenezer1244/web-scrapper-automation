@@ -635,6 +635,31 @@ def king_gis_absent(pins: list[str]) -> set[str]:
     return {p for p in pins if p not in found and p not in unreached}
 
 
+# Provenance written on a lead settled by confirm_not_carried: the three King sources
+# that agreed the parcel does not exist.
+NOT_CARRIED_SOURCE = "king_erealproperty+king_gis+king_rpacct"
+
+# King GIS answers up to 50 PINs per request (county_gis chunk size) inside its 30 s
+# timeout. A caller budgets time for exactly ONE request, so one proof never asks more.
+_NOT_CARRIED_MAX_PINS = 50
+
+
+def confirm_not_carried(pins: list[str], extract_answers: dict | None) -> set[str]:
+    """The PINs two more King sources confirm do not exist. The callers' third proof.
+
+    The caller already holds proof 1: this tick's eRealProperty page for each PIN was its
+    own "No data found." answer (`parcel_lookup == "no_record"`). This adds:
+      2. the Assessor extract, LOADED (`extract_answers` from `resolve_pins`; None means
+         no usable file, which proves nothing), has no account for the PIN (`absent`);
+      3. King's parcel layer answered and carries no such PIN (king_gis_absent).
+    At most one GIS request: PINs past the first 50 stay unproven, and the caller owns
+    the deadline. Anything not returned stays deferred exactly as before.
+    """
+    absent = [p for p in dict.fromkeys(pins)
+              if getattr((extract_answers or {}).get(p), "status", None) == "absent"]
+    return king_gis_absent(absent[:_NOT_CARRIED_MAX_PINS]) if absent else set()
+
+
 def _owner_of(pin: str) -> str | None:
     """Assessor owner for one candidate, echo-verified (a page that names another
     parcel yields None, so a truncating answer can never break the tie).

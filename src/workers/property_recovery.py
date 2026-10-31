@@ -56,6 +56,7 @@ from src.workers.tasks_helpers.enrich import (
     KING_ACCOUNT_RESOLVER,
     PROPERTY_DEFERRED_KEY,
     PROPERTY_OUTCOME_KEY,
+    PROPERTY_SETTLED_OUTCOMES,
 )
 
 _logger = setup_logger("worker.property_recovery")
@@ -70,6 +71,15 @@ _PACE_S = 1.0
 
 _LOCK_KEY = "bl:property_recovery:lock"
 _LOCK_TTL_S = 1200
+
+# A PIN King does not carry settles as parcel_not_found on the mailing sweep's three
+# proofs (king_county_assessor.confirm_not_carried) instead of spending five transient
+# attempts. The Assessor extract is read from the worker's cache only, never downloaded,
+# and scanned once (enrich.py budgets ~15 s for a scan); King GIS is asked once (30 s
+# timeout). Each step starts only with that much of the tick left. After a long page pass,
+# or with no fresh extract on this worker, the PIN stays transient this tick: safe.
+_EXTRACT_PROOF_MIN_S = 60.0
+_GIS_PROOF_MIN_S = 45.0
 
 _TRAILING_ZIP_RE = re.compile(r"\s(\d{5})(?:-\d{4})?$")
 
@@ -180,7 +190,7 @@ def _release_lock(lock: tuple) -> None:
 def recover_deferred_king_property() -> dict:
     """One bounded tick. Returns a stats dict (also read by the tests)."""
     stats = {"parcels": 0, "rows": 0, "found_extract": 0, "found_page": 0, "no_site_address": 0,
-             "parcel_mismatch": 0, "transient": 0, "gave_up": 0, "unreached": 0, "stale": 0,
+             "parcel_mismatch": 0, "parcel_not_found": 0, "transient": 0, "gave_up": 0, "unreached": 0, "stale": 0,
              "errors": 0, "skipped": ""}
     if not settings.PROPERTY_RECOVERY_ENABLED:
         stats["skipped"] = "PROPERTY_RECOVERY_ENABLED is off"
@@ -285,6 +295,7 @@ def _tick(stats: dict) -> dict:
             _logger.warning("Property recovery: lookup failed: %s", stats["skipped"])
 
         requested = set(k_stats.get("requested_pids") or [])
+        not_carried, not_carried_snapshot = _prove_not_carried(remaining, requested, enriched, deadline)
         for pin in remaining:
             data = enriched.get(pin) or {}
             prop = (data.get("property_address") or "").strip() or None
@@ -313,11 +324,42 @@ def _tick(stats: dict) -> dict:
                     stats[_write(db, row, "no_site_address")] += 1
                 elif lookup == "mismatch":
                     stats[_write(db, row, "parcel_mismatch")] += 1
+                elif lookup == "no_record" and pin in not_carried:
+                    stats[_write(db, row, "parcel_not_found", extra={
+                        "property_source": king_county_assessor.NOT_CARRIED_SOURCE,
+                        "property_source_snapshot": not_carried_snapshot})] += 1
                 else:
                     stats[_write(db, row, "transient")] += 1
 
     _logger.info("Property recovery: %s", {k: v for k, v in stats.items() if v})
     return stats
+
+
+def _prove_not_carried(pins: list[str], requested: set[str], enriched: dict,
+                       deadline: float) -> tuple[set[str], str | None]:
+    """(PINs proven not to exist, extract snapshot). Proof 1 is this tick's own page.
+
+    Only PINs requested THIS tick whose page was eRealProperty's "No data found." answer
+    qualify. One extract scan, one GIS request, each only with time left for it.
+    """
+    candidates = [p for p in pins if p in requested
+                  and (enriched.get(p) or {}).get("parcel_lookup") == "no_record"]
+    if not candidates or deadline - time.monotonic() < _EXTRACT_PROOF_MIN_S:
+        return set(), None
+    from src.scrapers.enrichment.king_county_assessor import confirm_not_carried
+    from src.scrapers.enrichment.king_rpacct import resolve_pins
+
+    # Cache only: a cold or stale cache would mean an 18 MB download with a 300 s timeout,
+    # which no check here could bound. No file on disk means no proof this tick.
+    resolved = resolve_pins(set(candidates), refresh=False)
+    if resolved is None or deadline - time.monotonic() < _GIS_PROOF_MIN_S:
+        return set(), None
+    answers, snapshot = resolved
+    proven = confirm_not_carried(candidates, answers)
+    if proven:
+        _logger.info("Property recovery: %d parcel(s) King does not carry (eRealProperty, GIS "
+                     "and the Assessor extract agree) settle as parcel_not_found", len(proven))
+    return proven, snapshot
 
 
 def _rotate(db, rows: list) -> None:
@@ -352,8 +394,8 @@ def _write(db, row, outcome: str, *, address: str | None = None, city: str | Non
     if outcome in ("found_extract", "found_page"):
         payload.update({PROPERTY_DEFERRED_KEY: False, PROPERTY_OUTCOME_KEY: "found",
                         "property_source": source, **(extra or {})})
-    elif outcome in ("no_site_address", "parcel_mismatch"):
-        payload.update({PROPERTY_DEFERRED_KEY: False, PROPERTY_OUTCOME_KEY: outcome})
+    elif outcome in PROPERTY_SETTLED_OUTCOMES:
+        payload.update({PROPERTY_DEFERRED_KEY: False, PROPERTY_OUTCOME_KEY: outcome, **(extra or {})})
     else:
         gave_up = attempts >= _MAX_ATTEMPTS
         payload.update({PROPERTY_DEFERRED_KEY: not gave_up,

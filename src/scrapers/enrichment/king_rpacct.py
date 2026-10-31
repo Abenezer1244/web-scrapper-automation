@@ -113,18 +113,23 @@ def _reraise_time_limit(exc: BaseException) -> None:
         raise exc
 
 
-def cached_extract(max_age_s: float = _CACHE_MAX_AGE_S) -> tuple[Path, str] | None:
+def cached_extract(max_age_s: float = _CACHE_MAX_AGE_S, *,
+                   refresh: bool = True) -> tuple[Path, str] | None:
     """(zip path, snapshot date) for a recent extract, downloading when stale or missing.
 
     Returns None when there is no usable file at all; the caller then falls back to the
     per-parcel tax-bill pages exactly as before. A failed refresh keeps using the file
     already on disk (a days-old snapshot beats none), and says so in the log.
+    `refresh=False` is for a caller that cannot afford the download (its timeout is
+    300 s): never download, and use only a file still fresh (younger than `max_age_s`).
     """
-    return cached_zip(_CACHE_DIR, "rpacct", download_extract, "King RPAcct", max_age_s=max_age_s)
+    return cached_zip(_CACHE_DIR, "rpacct", download_extract, "King RPAcct",
+                      max_age_s=max_age_s, refresh=refresh)
 
 
 def cached_zip(cache_dir: Path, stem: str, download: Callable[[Path], str], label: str,
-               max_age_s: float = _CACHE_MAX_AGE_S) -> tuple[Path, str] | None:
+               max_age_s: float = _CACHE_MAX_AGE_S, *,
+               refresh: bool = True) -> tuple[Path, str] | None:
     """The worker-local cache behind every King Assessor extract (see cached_extract)."""
     zip_path = cache_dir / f"{stem}.zip"
     meta_path = cache_dir / "snapshot.json"
@@ -136,7 +141,10 @@ def cached_zip(cache_dir: Path, stem: str, download: Callable[[Path], str], labe
             return None
 
     age = _age()
-    if age is None or age >= max_age_s:
+    if not refresh:
+        if age is None or age >= max_age_s:
+            return None
+    elif age is None or age >= max_age_s:
         # Unique per attempt (not per PID): threads in one process must not share it.
         tmp = cache_dir / f"{stem}.{os.getpid()}.{uuid.uuid4().hex}.part"
         meta_tmp = tmp.with_suffix(".json")
@@ -170,9 +178,12 @@ def cached_zip(cache_dir: Path, stem: str, download: Callable[[Path], str], labe
     return zip_path, snapshot
 
 
-def resolve_pins(pins: set[str]) -> tuple[dict[str, Answer], str] | None:
-    """Answers for ``pins`` from the cached extract, or None when no extract is usable."""
-    cached = cached_extract()
+def resolve_pins(pins: set[str], *, refresh: bool = True) -> tuple[dict[str, Answer], str] | None:
+    """Answers for ``pins`` from the cached extract, or None when no extract is usable.
+
+    `refresh=False`: the file already on disk and fresh, or None; never a download.
+    """
+    cached = cached_extract(refresh=refresh)
     if cached is None or not pins:
         return None
     zip_path, snapshot = cached

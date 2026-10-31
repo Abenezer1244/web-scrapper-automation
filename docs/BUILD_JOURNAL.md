@@ -21,7 +21,9 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ## 2026-10-30 — Client-side secret-exposure audit: no server secret leaked; the session tokens moved out of page JavaScript
 
-**Built / Shipped (local branches, not pushed):** BE `fix/bff-forwarded-client-ip` (client_ip trusts
+**Built / Shipped:** LIVE 2026-10-30 as BE #558 (rebase-merged, main `d9aaa961`; Railway auto-deployed api, worker
+and beat) and FE #297 (rebase-merged, master `392b6fea`; deploy watch and the Vercel API confirm bridgeleads.io serves
+it). The per-fix branches below were folded into those two PRs. BE `fix/bff-forwarded-client-ip` (client_ip trusts
 X-BL-Client-IP only with BFF_SHARED_SECRET; invalid assertion -> 401 before any endpoint), `fix/webhook-urls-write-only`
 (webhook URLs masked `scheme://host/<hidden>` in readbacks and exports; an exact echo keeps the stored URL),
 `fix/webhook-redirect-host-parse` (a malformed receiver Location no longer crashes delivery or leaks into Celery logs).
@@ -51,9 +53,25 @@ alias in the Origin allowlist would have signed users out on that host; and a re
 tabs out because every response wrapped by proxy.ts re-issues the session cookie and wrote the OLD token back over a
 rotation. Excluding /api/backend from the matcher fixed it (strict stub 4/4; the pre-phase-3 code failed 2 of 3).
 
-**Pending / Handoff:** ship order for #1: deploy BE with BFF_SHARED_SECRET on Railway, set the same secret on Vercel,
-then deploy FE, then smoke-test login. Rebase the FE stack onto current master (#292/#293 landed since). The three
-follow-ups raised here are now done, each Codex-consulted and reviewed to GO:
+**Deploy (2026-10-30, done in this order):** BFF_SHARED_SECRET set on Railway api (`--skip-deploys`) and the same value
+on Vercel Production and Preview -> BE #558 merged and deployed -> FE #297 merged and deployed. Mishaps: Windows
+PowerShell 5.1 has no `[RandomNumberGenerator]::GetBytes(32)`, so an empty secret was briefly set on Railway (harmless
+under --skip-deploys) before the real one; `$ErrorActionPreference='Stop'` turned vercel's stderr hint into a failure,
+so the Vercel value was piped from Railway's (never printed). #558 was knocked BEHIND twice by concurrent CV merges
+(#551, #555) under main's strict up-to-date rule, and each Test run takes ~30 min. After one update-branch and a green
+run, the owner merged with `--admin --match-head-commit <tested head>` (the only new main commit, #555, shared no files).
+FE #297 was 1 commit behind master (SEO, no overlap) and was rebased locally, tsc/eslint/`next build` green, before merge.
+Verified live: a bad assertion on api.bridgeleads.io gets 401 `Invalid client assertion`; a wrong-password login via
+bridgeleads.io gets the normal `Invalid credentials` 401 (secrets match) and the API audit log records the caller's
+real public IP; the proxy refuses a missing CSRF header and a foreign Origin (403); the only "Rejected BFF client-IP
+assertion" log line was the deliberate probe; the live-bundle pattern scan is clean (44 files; positive control hit).
+Owner's real login: the readable session = {user, expires, tokenLogin, tokenGeneration}, no JWT in any page-readable
+storage or cookie, 0 browser requests to api.bridgeleads.io (all via /api/backend), dashboard + live job log work, the
+job CSV comes through the 60 s export-url link (20/20 rows, no formula-leading cells). Not done: an exact-value scan of
+the live bundle (would need prod secret values written to disk; declined).
+
+**Pending / Handoff:** nothing for this audit. The three follow-ups raised here shipped in the same PRs, each
+Codex-consulted and reviewed to GO:
 - Cookie race (P1), FE `fix/session-cookie-stale-write`: session READS (GET /api/auth/session, proxy.ts responses) no
   longer write the session cookie; if a read would write one, every session-token header is dropped (deletions too, so a
   chunk-count change can't half-delete it). Replaying a stale cookie after a rotation: before 2+1+1 stale writes and a

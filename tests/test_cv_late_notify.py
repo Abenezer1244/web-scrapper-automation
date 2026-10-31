@@ -78,6 +78,22 @@ async def test_rows_a_crashed_tick_never_announced_are_announced_next_tick(db, b
 
 
 @pytest.mark.asyncio
+async def test_a_pending_stamp_outside_done_code_violation_runs_is_never_touched(db, business_user):
+    """Codex C3 P2: the per-account rows use the same scope as the account discovery."""
+    cfg = await _config(db, business_user)
+    running = await _job(db, business_user, cfg, status="enriching")
+    stamp = {"delivered_at": "2026-10-31T02:25:00+00:00", "policy": "code_violation_v1", "notified": False}
+    rid = await _row(db, running, business_user.id, seattle())
+    await db.execute(text("UPDATE results SET enrichment_data = (enrichment_data::jsonb || "
+                          "jsonb_build_object('late_delivery', CAST(:s AS jsonb)))::json WHERE id = :i"),
+                     {"s": json.dumps(stamp), "i": rid})
+    await db.commit()
+
+    assert late.notify_late_deliveries() == 0
+    assert await _notices(db, business_user) == [] and await _pending(db, business_user) == 1
+
+
+@pytest.mark.asyncio
 async def test_notices_turned_off_mark_the_rows_and_add_nothing(db, business_user):
     await db.execute(text("UPDATE users SET notification_prefs = '{\"late_delivery\": false}' WHERE id = :u"),
                      {"u": business_user.id})

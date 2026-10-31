@@ -148,22 +148,28 @@ def deliver_completed_held_rows(*, batch: int = _BATCH_ROWS) -> dict:
     return stats
 
 
-# Accounts with delivered rows not announced yet. Scoped like discovery (done code-violation
-# jobs of the same account), so it never scans results across record types.
-_PENDING_ACCOUNTS_SQL = f"""
-    SELECT DISTINCT r.user_id::text AS user_id
+# Rows delivered but not announced yet, in the same scope as discovery (done code-violation
+# jobs of the row's own account), so neither query reaches across record types or accounts.
+_PENDING_SCOPE = f"""
     FROM results r
     JOIN jobs j ON j.id = r.job_id AND j.user_id = r.user_id AND j.status = 'done'
     JOIN scraper_configs sc ON sc.id = j.scraper_config_id AND sc.user_id = j.user_id
                            AND sc.record_type = 'code_violation'
     WHERE r.enrichment_data::jsonb->'{LATE_KEY}'->>'notified' = 'false'
+"""  # noqa: S608 -- splices only module constants
+# Oldest pending delivery first, so a backlog drains in order and no account is skipped
+# every tick (Codex C3 P2).
+_PENDING_ACCOUNTS_SQL = f"""
+    SELECT r.user_id::text AS user_id
+    {_PENDING_SCOPE}
+    GROUP BY r.user_id
+    ORDER BY min(r.enrichment_data::jsonb->'{LATE_KEY}'->>'delivered_at'), r.user_id
     LIMIT :limit
 """  # noqa: S608 -- splices only module constants; every value is bound
 _PENDING_ROWS_SQL = f"""
     SELECT r.id::text AS id, r.job_id::text AS job_id
-    FROM results r
-    WHERE r.user_id = CAST(:uid AS uuid)
-      AND r.enrichment_data::jsonb->'{LATE_KEY}'->>'notified' = 'false'
+    {_PENDING_SCOPE}
+      AND r.user_id = CAST(:uid AS uuid)
     ORDER BY r.enrichment_data::jsonb->'{LATE_KEY}'->>'delivered_at', r.id
     FOR UPDATE OF r
 """  # noqa: S608 -- splices only module constants; every value is bound

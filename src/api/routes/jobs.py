@@ -706,6 +706,8 @@ async def get_results(
         )
         rows = rows_result.scalars().all()
         items = [ResultRow.model_validate(r) for r in rows]
+        for row, item in zip(rows, items, strict=True):
+            item.delivered_late_at = _delivered_late_at(row.enrichment_data)
         # Why a code violation was or was not delivered, read off the row as it is now.
         # Not on already-delivered copies: they were never enriched, so their reasons
         # would describe the copy rather than the lead the earlier run delivered.
@@ -862,10 +864,13 @@ async def get_results(
         # The no_address tab number: the list's own predicate before view filters,
         # tax cap included like already_delivered_count. Its own statement because
         # counts_row is scoped to actionable rows, which this set never is (Codex P1).
-        no_address_count, not_qualified_count = (await db.execute(
+        no_address_count, not_qualified_count, late_delivered_count = (await db.execute(
             select(
                 func.count().filter(list_condition("no_address")),
                 func.count().filter(list_condition("not_qualified")),
+                func.count().filter(
+                    Result.is_duplicate.is_(False),
+                    Result.enrichment_data.op("->")(LATE_DELIVERY_KEY).is_not(None)),
             ).where(
                 Result.job_id == job_id,
                 Result.user_id == current_user.id,
@@ -1114,6 +1119,7 @@ async def get_results(
             already_delivered_count=already_delivered_count,
             no_address_count=no_address_count,
             not_qualified_count=not_qualified_count,
+            late_delivered_count=late_delivered_count,
             already_delivered_contacts=already_delivered_contacts,
             has_auction_data=has_auction_data,
             auction_coverage=auction_coverage,
@@ -1140,6 +1146,24 @@ def _shown_reasons(row: Result) -> list[str]:
         if known:
             return known
     return qualification_reasons(row)
+
+
+# src/workers/cv_late_delivery.py LATE_KEY (not imported: that module registers a Celery
+# task). tests/test_cv_late_delivery_api.py pins the two equal.
+LATE_DELIVERY_KEY = "late_delivery"
+
+
+def _delivered_late_at(enrichment_data: Any) -> datetime | None:
+    """When late delivery delivered this row, from its stamp; None when absent or malformed."""
+    late = enrichment_data.get(LATE_DELIVERY_KEY) if isinstance(enrichment_data, dict) else None
+    at = late.get("delivered_at") if isinstance(late, dict) else None
+    if not isinstance(at, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(at)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
 # What an already-delivered copy may show from its original, in display order.

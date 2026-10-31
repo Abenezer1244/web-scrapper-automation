@@ -108,3 +108,25 @@ async def test_a_done_jobs_log_is_not_appended_to(db, business_user):
     before = (await db.execute(text("SELECT count(*) FROM job_logs WHERE job_id = :j"), {"j": job})).scalar()
     late.deliver_completed_held_rows()
     assert (await db.execute(text("SELECT count(*) FROM job_logs WHERE job_id = :j"), {"j": job})).scalar() == before
+
+
+@pytest.mark.asyncio
+async def test_asking_again_after_a_lost_marker_never_queues_or_pays_twice(db, business_user, monkeypatch):
+    """Codex D1 r1 P1: the enqueue commits before the marker; if the marker is lost the row is
+    asked again, and the enqueue must find nothing to buy (the row is no longer
+    not_attempted, and the active-row index refuses a second pending row)."""
+    job = await _run(db, business_user)
+    held = await _held_row(db, business_user, job, _held(**_situs()))
+    monkeypatch.setattr(late, "_MARK_CONTACTS_SQL", "UPDATE results SET no_such_column = 1")
+    late.deliver_completed_held_rows()
+    assert await _contacts(db, held) == "pending" and await _queued(db, job) == {held}
+    monkeypatch.undo()
+    monkeypatch.setattr(settings, "CV_LATE_DELIVERY_ENABLED", True, raising=False)
+    monkeypatch.setattr(settings, "SKIP_TRACE_ENABLED", True)
+    monkeypatch.setattr(settings, "TRACERFY_API_TOKEN", "test-token-not-real")
+
+    late.deliver_completed_held_rows()
+
+    assert await _contacts(db, held) == "requested"
+    assert (await db.execute(text("SELECT count(*) FROM pending_skip_trace_rows WHERE result_id = :r"),
+                             {"r": held})).scalar() == 1

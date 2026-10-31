@@ -36,6 +36,9 @@ class NotificationType(str, Enum):
     JOB_COMPLETED = "job_completed"
     JOB_FAILED = "job_failed"
     PAYMENT_FAILED = "payment_failed"
+    # Held code violations a background sweep completed and src/workers/cv_late_delivery.py
+    # delivered after their run (one notice per account for every batch delivered).
+    LATE_DELIVERY = "late_delivery"
 
 
 class BatchRunStatus(str, Enum):

@@ -420,6 +420,7 @@ class NotificationPrefsUpdate(BaseModel):
     new_records: bool | None = None
     usage_alert: bool | None = None
     payment_failed: bool | None = None
+    late_delivery: bool | None = None
 
     model_config = {"extra": "forbid"}
 
@@ -2129,6 +2130,10 @@ class ResultRow(BaseModel):
     # only where the copy is blank, never over a value it has. Response only, never
     # stored or exported. None when nothing was filled.
     filled_from_original: list[OriginalField] | None = None
+    # A code violation the gate held at its run and src/workers/cv_late_delivery.py
+    # delivered (and charged) later, once its owner and mailing address were found: when.
+    # From the row's enrichment_data.late_delivery stamp. None for every other row.
+    delivered_late_at: datetime | None = None
 
     model_config = {"from_attributes": True}
 
@@ -2336,6 +2341,10 @@ class ResultsPage(BaseModel):
     # before any view filter, tax cap included): marked at delivery, including those a
     # later run has since delivered. Matches the snapshot breakdown's not_qualified.
     not_qualified_count: int = 0
+    # Of this run's NEW leads (?category=new, before view filters), how many were held at
+    # the run and delivered later (late delivery). Read now; the run's own counts
+    # (record_count, the breakdown) never move.
+    late_delivered_count: int = 0
     # Skip-trace state of those same rows (see AlreadyDeliveredContacts).
     already_delivered_contacts: AlreadyDeliveredContacts = AlreadyDeliveredContacts()
     # NTS Tier 1: True if the JOB has ANY auction-matched lead (independent of the

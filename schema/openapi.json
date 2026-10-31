@@ -3845,6 +3845,17 @@
             ],
             "title": "Job Failed"
           },
+          "late_delivery": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Late Delivery"
+          },
           "new_records": {
             "anyOf": [
               {
@@ -3945,7 +3956,8 @@
         "enum": [
           "job_completed",
           "job_failed",
-          "payment_failed"
+          "payment_failed",
+          "late_delivery"
         ],
         "title": "NotificationType",
         "type": "string"
@@ -4231,6 +4243,18 @@
               }
             ],
             "title": "Delinquent Bill Year"
+          },
+          "delivered_late_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Delivered Late At"
           },
           "doc_type": {
             "anyOf": [
@@ -4750,6 +4774,11 @@
           "job_id": {
             "title": "Job Id",
             "type": "string"
+          },
+          "late_delivered_count": {
+            "default": 0,
+            "title": "Late Delivered Count",
+            "type": "integer"
           },
           "new_count": {
             "default": 0,

@@ -192,5 +192,6 @@ def test_the_held_line_is_published_after_the_enqueue_commit():
     src = inspect.getsource(_enqueue_skip_trace_rows)
     claim = src.index("claim_skip_trace_rows(db, to_claim")
     commit = src.index("db.commit()", claim)
-    publish = src.index('_publish_log(r, job_id, "info", _held_line')
+    # _log is _publish_log unless the enqueue runs quiet (late delivery D1).
+    publish = src.index('_log(r, job_id, "info", _held_line')
     assert claim < commit < publish

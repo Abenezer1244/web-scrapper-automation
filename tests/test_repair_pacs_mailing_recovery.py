@@ -254,7 +254,7 @@ async def test_apply_refuses_without_the_fix_or_while_a_sweep_holds_the_lock(
     # An option-shaped value reaches the script this way; the hex check must refuse it.
     assert await asyncio.to_thread(rp.main, ["--apply", "--deployed-commit=--output=x",
                                              "--report", report]) == 2
-    monkeypatch.setattr(rp, "commit_has_fix", lambda sha: True)
+    monkeypatch.setattr(rp, "commit_has_fix", lambda sha, counties=(): True)
     redis_client.set(mr._LOCK_KEY, "a sweep tick", ex=60)
     try:
         assert await asyncio.to_thread(rp.main, ["--apply", "--deployed-commit", "abc1234",
@@ -279,6 +279,27 @@ def test_the_deployed_commit_check_reads_the_real_history():
     assert rp.commit_has_fix("d3d0d08e") is False                      # main before #575
     assert rp.commit_has_fix("HEAD") is False                          # refs are refused: hex only
     assert rp.commit_has_fix("not-a-sha") is False
+    # Main with #575 but before the Clallam land-id fix: fine for Jefferson, refused for
+    # any run that includes Clallam, the default run among them.
+    assert rp.commit_has_fix("2c0cae53", ("jefferson",)) is True
+    assert rp.commit_has_fix("2c0cae53", ("clallam",)) is False
+    assert rp.commit_has_fix("2c0cae53", ("jefferson", "clallam")) is False
+    assert rp.commit_has_fix("2c0cae53") is False
+    assert rp.commit_has_fix(head, ("clallam",)) is True
+
+
+@pytest.mark.parametrize(("argv", "expected"), [
+    (["--county", "jefferson"], ("jefferson",)),
+    (["--county", "clallam", "--county", "jefferson"], ("clallam", "jefferson")),
+    ([], rp.RETRY_COUNTIES),
+])
+def test_apply_checks_the_fix_for_the_counties_it_would_repair(tmp_path, monkeypatch, argv, expected):
+    asked: list = []
+    monkeypatch.setattr(rp, "commit_has_fix", lambda sha, counties=(): asked.append(counties) or False)
+
+    assert rp.main(["--apply", "--deployed-commit", "abc1234", "--report",
+                    str(tmp_path / "e.jsonl"), *argv]) == 2
+    assert asked == [expected]
 
 
 async def test_attempts_stored_as_a_string_are_still_the_ceiling(db, business_user, tmp_path):
@@ -370,7 +391,7 @@ async def test_apply_refuses_when_redis_is_unreachable(db, business_user, tmp_pa
 
     rid = await _row(db, business_user, "clallam", _GAVE_UP)
     before = await _ed(db, rid)
-    monkeypatch.setattr(rp, "commit_has_fix", lambda sha: True)
+    monkeypatch.setattr(rp, "commit_has_fix", lambda sha, counties=(): True)
 
     def _unreachable(*a, **k):
         raise ConnectionError("no route to redis")

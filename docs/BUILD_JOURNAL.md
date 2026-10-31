@@ -19,6 +19,74 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-10-31 — Repair run for Jefferson; Skagit's new domain; worker DB fork + canary; Clallam 12-digit ids
+
+**Built / Shipped:**
+- **#576 repair** gained `--county`. A production dry-run found 55 candidates in cohort A (Jefferson 51,
+  Clallam 4) and none in cohort B. A live test on #575 code found the Jefferson ids. The Clallam
+  12-digit ids came back `ambiguous`, so the run was split by county. Applied for Jefferson only, on
+  `2c0cae53`: 51 repaired, 0 skipped.
+- **#578:** Skagit's recorder moved to `classic.skagitcountywa.gov`, and the SSRF redirect guard
+  refused the 301 from the old host. Migration 122 moves the connector rows, and the registry matches
+  exact hosts. The migration ran on API boot.
+- **#579:** prefork children inherited the parent's pooled TLS connections, which surfaced as
+  `SSL error: wrong version number`. `worker_process_init` now calls `dispose(close=False)`. The
+  canary held one transaction across minutes of probing; its commit died (`SSL SYSCALL error: EOF`)
+  and every unit's health was lost. Each unit is now written in its own short transaction, and its
+  alerts go out only after the write lands.
+- **Branch `fix/clallam-land-suffix`:** a Clallam caller id of exactly 12 digits, as the statewide
+  layer prints it, is equated with the portal's `id + "0000"` Geo ID only when all three hold:
+  - that row is the only one extending the id;
+  - the heading proves the page is the whole result set ("1 - N of N", N = rows read, no page
+    links);
+  - the detail page names the row the grid matched.
+
+  `parse_results` now returns `matched_key`. The repair script's `commit_has_fix(sha, counties)`
+  refuses any run that includes Clallam on code without this fix, the default run among them.
+
+**Tried / Decided:**
+- **Clallam proof.** Sampling alone was not enough (Codex High). The deciding evidence is the
+  county's own parcel layer (`Parcels___Clallam_County`, `GEO_12` -> `PROP_ID`). Each `GEO_12` maps to
+  exactly one `PROP_ID` across 54,675 rows. That `PROP_ID` is the portal's prop_id on the `id+0000` row
+  in 33 of 33 parcels: the 4 leads plus 29 seeded random ones.
+- **Multi-suffix bases stay ambiguous.** Bases holding other suffixes exist (`053002300000` has `1000`
+  and `2001`, with one statewide row). The county GIS points those at `2001`, so they are left
+  ambiguous on purpose. Using the GIS crosswalk as a resolver would answer them too; it is deferred
+  because it would be a second live dependency.
+- **Spokane `pre_foreclosure` is not fixable by us:** a Cloudflare browser challenge, which we do not
+  bypass. It stays down and hidden.
+
+**Failed / Blocked:**
+- Claude's production apply and merges were denied by the auto-mode classifier until the owner said
+  "merge".
+- The owner's `railway` call failed because `%APPDATA%\npm` is not on PATH in their PowerShell.
+- The repair's lock refused to run from a laptop (exit 3): the worker's `REDIS_URL` is
+  `redis.railway.internal`. It ran with the Redis service's public proxy URL substituted in-process
+  (same db 0, same credentials, so the same lock).
+
+**Caught & fixed:**
+- **Codex consult** (GO with amendments, 4 High findings, all built in):
+  - completeness of the result set before the land row counts;
+  - eligibility read from the zero-kept spelling;
+  - callers that disagree on the spelling get no equivalence;
+  - the matched key flows into the detail check.
+- **Mutation-checked:** removing each guard fails a test.
+- **Live run** on the branch: the 4 leads were found (one after a transient portal 302 recorded as
+  `request_failed`), and `053002300000` stayed ambiguous.
+
+**Pending / Handoff:**
+- Merge and deploy the Clallam branch, then run `--county clallam`: dry-run first, then
+  `--apply --deployed-commit <new sha>`.
+- Island lettered ids; Whatcom outage; Spokane (owner contacts the county).
+- Inline enrichment in `tasks_helpers/enrich.py` still mixes DB transactions with long network work
+  (Codex note).
+- A Linux prefork recycle test for #579 (Codex P3).
+
+**Facts learned:**
+- Clallam's portal heads its grid "Geographic ID" and prints "1 - N of N for Year ...".
+- The county map link searches the county map for the 12-digit id itself.
+- `railway run` from a laptop cannot reach `*.railway.internal`.
+
 ## 2026-10-31 — A repair for the leads the PACS bug exhausted or falsely settled (script only, not run)
 
 **Built / Shipped:** branch `fix/pacs-mailing-repair`: `scripts/repair_pacs_mailing_recovery.py`, a

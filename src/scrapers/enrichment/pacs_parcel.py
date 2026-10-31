@@ -91,6 +91,10 @@ class PacsSite:
     county: str
     search_url: str  # the PropertySearch.aspx page, with its cid
     license_restricted: bool
+    # A county whose leads carry a SHORTER id than its Geo ID: the land record is the
+    # short id plus this suffix. Empty for every county without that evidence.
+    land_suffix: str = ""
+    short_id_len: int = 0
 
     @property
     def source_key(self) -> str:
@@ -98,12 +102,27 @@ class PacsSite:
         portal never cools the others."""
         return f"pacs_{self.county}"
 
+    def land_id(self, query: str) -> str | None:
+        """The Geo ID a short caller id names (zeros kept), or None when it is not one.
+
+        Width is read off the caller's own spelling, never the zero-stripped key, so a
+        shorter id is never padded into an eligible one (Codex).
+        """
+        if self.land_suffix and re.fullmatch(rf"[0-9]{{{self.short_id_len}}}", query or ""):
+            return query + self.land_suffix
+        return None
+
 
 # origin + cid are per county on purpose (Codex): the vendor is shared, the
 # deployment is not. Verified 2026-10-02 by loading each search form.
 PACS_SITES: dict[str, PacsSite] = {
     "benton": PacsSite("benton", "https://propertysearch.co.benton.wa.us/propertyaccess/PropertySearch.aspx?cid=0", False),
-    "clallam": PacsSite("clallam", "https://websrv22.clallam.net/propertyaccess/PropertySearch.aspx?cid=0", False),
+    # Clallam leads carry the statewide layer's 12-digit id; the portal prints 16 digits.
+    # The county's own parcel layer maps each 12-digit GEO_12 to ONE PROP_ID, and that is
+    # the portal's id + "0000" row in 33 of 33 parcels checked live 2026-10-31. A base
+    # can also hold other suffixes ("1000", "2001"), which stay ambiguous.
+    "clallam": PacsSite("clallam", "https://websrv22.clallam.net/propertyaccess/PropertySearch.aspx?cid=0", False,
+                        land_suffix="0000", short_id_len=12),
     "jefferson": PacsSite("jefferson", "https://trueweb.jeffcowa.us/propertyaccess/PropertySearch.aspx?cid=0", False),
     "grant": PacsSite("grant", "https://propertysearch.grantcountywa.gov/propertyaccess/PropertySearch.aspx?cid=10", True),
     "whatcom": PacsSite("whatcom", "https://property.whatcomcounty.us/propertyaccess/PropertySearch.aspx?cid=0", True),
@@ -154,8 +173,28 @@ def _form_tokens(html: str) -> dict[str, str] | None:
     return {k: v for k, v in fields.items() if k.startswith("__")}
 
 
-def parse_results(html: str, parcel_key: str) -> tuple[str, str | None]:
-    """(outcome, prop_id) for a search-results page, judged against ``parcel_key``.
+_PAGE_HEADING_RE = re.compile(r"(\d+)\s*-\s*(\d+)\s+of\s+(\d+)")
+
+
+def _grid_is_complete(soup: BeautifulSoup, data_rows: int) -> bool | None:
+    """True when this page IS the whole result set, False when there is more, None
+    when the page does not say. The heading reads "1 - 1 of 1"; a longer set prints
+    page links in the paging cell (live 2026-10-31: "1 - 25 of 12772")."""
+    heading = soup.find(id=re.compile(r"pageHeading"))
+    m = _PAGE_HEADING_RE.search(heading.get_text(" ")) if heading else None
+    if m is None:
+        return None
+    first, last, total = (int(g) for g in m.groups())
+    paging = soup.find("td", class_="paging")
+    if (paging is not None and paging.find("a")) or total > last:
+        return False
+    return first == 1 and last == total == data_rows
+
+
+def parse_results(html: str, parcel_key: str, land_id: str | None = None
+                  ) -> tuple[str, str | None, str | None]:
+    """(outcome, prop_id, matched_key) for a search-results page, judged against
+    ``parcel_key``; ``matched_key`` is the key the detail page must then name.
 
     The grid is matched on its Geo ID column, never on position: exactly one row
     whose cell normalises to our parcel is required. A page with rows for OTHER
@@ -164,22 +203,28 @@ def parse_results(html: str, parcel_key: str) -> tuple[str, str | None]:
 
     Two pages are NOT a settled "not found" (Codex): a row whose Geo ID only EXTENDS
     ours (Clallam prints 16 digits, `0630115504300000`, where another source has the
-    12-digit `063011550430`; which one a lead carries is not proven, so it is
-    ``ambiguous``: charged and capped, never equated, never re-fetched for free); and
-    a row whose Geo ID cell cannot be read at all (``unparsed``).
+    12-digit `063011550430`) is ``ambiguous``: charged and capped, never re-fetched
+    for free; and a row whose Geo ID cell cannot be read at all (``unparsed``).
+
+    ``land_id`` (PacsSite.land_id, zeros kept) is the one extension a site has proven
+    equal to the short id. Its row is ours only when it is the ONLY row extending our
+    id and the page is the whole result set; otherwise ``ambiguous``, or ``unparsed``
+    when the page does not say whether it is complete (Codex).
     """
     soup = BeautifulSoup(html, "html.parser")
     table = soup.find("table", id=re.compile(r"resultsTable"))
     if table is None:
         if "None found" in soup.get_text(" "):
-            return PARCEL_NOT_FOUND, None
-        return UNPARSED, None
+            return PARCEL_NOT_FOUND, None, None
+        return UNPARSED, None, None
     heads = [th.get_text(" ", strip=True) for th in table.find_all("th")]
     geo_col = next((i for i, h in enumerate(heads) if _GEO_HEADER_RE.search(h)), None)
     if geo_col is None:
-        return UNPARSED, None
-    hits: list[str | None] = []
+        return UNPARSED, None, None
+    exact: list[str | None] = []
+    land: list[str | None] = []
     extends_ours = unreadable = False
+    data_rows = 0
     for tr in table.find_all("tr"):
         tds = tr.find_all("td")
         if len(tds) <= geo_col:
@@ -188,25 +233,44 @@ def parse_results(html: str, parcel_key: str) -> tuple[str, str | None]:
             # which must not let the page read as a settled "not found" (Codex).
             unreadable = unreadable or len(tds) > 1
             continue
-        cell = normalize_pacs_parcel(tds[geo_col].get_text(" ", strip=True))
+        data_rows += 1
+        text = tds[geo_col].get_text(" ", strip=True)
+        cell = normalize_pacs_parcel(text)
         if cell is None:
             unreadable = True
             continue
-        if cell != parcel_key:
+        if cell == parcel_key:
+            hits = exact
+        elif land_id is not None and query_digits(text) == land_id:
+            hits = land     # compared zeros kept: stripping must not make a match
+        else:
             extends_ours = extends_ours or cell.startswith(parcel_key)
             continue
         link = tr.find("a", href=re.compile(r"prop_id=\d+", re.I))
         m = re.search(r"prop_id=(\d{1,12})", link["href"], re.I) if link else None
         hits.append(m.group(1) if m else None)
-    if not hits:
+    if not exact and not land:
         if unreadable:
-            return UNPARSED, None
+            return UNPARSED, None, None
         if extends_ours:
-            return AMBIGUOUS, None
-        return PARCEL_NOT_FOUND, None
-    if len(hits) > 1:
-        return AMBIGUOUS, None
-    return (FOUND, hits[0]) if hits[0] else (UNPARSED, None)
+            return AMBIGUOUS, None, None
+        return PARCEL_NOT_FOUND, None, None
+    if len(exact) + len(land) > 1:
+        return AMBIGUOUS, None, None
+    if land:
+        if unreadable:
+            return UNPARSED, None, None
+        if extends_ours:
+            return AMBIGUOUS, None, None
+        complete = _grid_is_complete(soup, data_rows)
+        if complete is None:
+            return UNPARSED, None, None
+        if not complete:
+            return AMBIGUOUS, None, None
+    prop_id = (exact or land)[0]
+    if not prop_id:
+        return UNPARSED, None, None
+    return FOUND, prop_id, parcel_key if exact else normalize_pacs_parcel(land_id)
 
 
 def parse_detail(html: str, parcel_key: str) -> MailingAnswer:
@@ -272,16 +336,17 @@ def query_digits(value: object) -> str:
 
 
 def _resolve_one(session, site: PacsSite, tokens: dict, parcel_key: str, still_held,
-                 query: str | None = None, mode: dict | None = None
+                 query: str | None = None, mode: dict | None = None, land_id: str | None = None
                  ) -> tuple[MailingAnswer, str | None]:
     """Search POST, then detail GET, for one parcel. (answer, block_reason).
-    `mode` is the form's search-mode field (pacs.search_type_field)."""
+    `mode` is the form's search-mode field (pacs.search_type_field); `land_id` is
+    PacsSite.land_id for this parcel's callers, or None."""
     data = {**tokens, **(mode or {}), "propertySearchOptions$geoid": query or parcel_key,
             "propertySearchOptions$search": "Search"}
     resp, blocked = _request(lambda: _http_post(session, site.search_url, data), still_held)
     if blocked or resp is None:
         return MailingAnswer(REQUEST_FAILED), blocked
-    outcome, prop_id = parse_results(resp.text, parcel_key)
+    outcome, prop_id, matched_key = parse_results(resp.text, parcel_key, land_id)
     if outcome != FOUND:
         return MailingAnswer(outcome), None
     time.sleep(_PACE_S + random.uniform(0, _JITTER_S))  # noqa: S311
@@ -291,7 +356,8 @@ def _resolve_one(session, site: PacsSite, tokens: dict, parcel_key: str, still_h
     resp, blocked = _request(lambda: _http_get(session, url), still_held)
     if blocked or resp is None:
         return MailingAnswer(REQUEST_FAILED), blocked
-    return parse_detail(resp.text, parcel_key), None
+    # The detail page must name the row the grid matched, not either spelling (Codex).
+    return parse_detail(resp.text, matched_key), None
 
 
 def resolve_mailing(county: str, parcel_ids: list[str], *, time_budget_s: float = CALL_BUDGET_S
@@ -317,6 +383,10 @@ def resolve_mailing(county: str, parcel_ids: list[str], *, time_budget_s: float 
         return out
     by_key: dict[str, list[str]] = {}
     queries: dict[str, str] = {}  # key -> the longest caller spelling (zeros kept)
+    # key -> the land id every caller of that key names; None as soon as two callers
+    # disagree (one 12-digit spelling, one not), so one caller never lends another
+    # an equivalence its own spelling does not carry (Codex).
+    land_ids: dict[str, str | None] = {}
     unsupported = 0
     for pid in parcel_ids:
         key = normalize_pacs_parcel(pid)
@@ -333,6 +403,8 @@ def resolve_mailing(county: str, parcel_ids: list[str], *, time_budget_s: float 
             q = query_digits(pid)
             if len(q) > len(queries.get(key, "")):
                 queries[key] = q
+            lid = site.land_id(q)
+            land_ids[key] = lid if land_ids.get(key, lid) == lid else None
     if unsupported:
         _logger.info("%s: %d parcel id(s) in a format this lookup cannot search; deferred",
                      site.source_key, unsupported)
@@ -375,7 +447,7 @@ def resolve_mailing(county: str, parcel_ids: list[str], *, time_budget_s: float 
             if not admission.still_held():
                 break
             answer, blocked = _resolve_one(session, site, tokens, key, admission.still_held,
-                                           query=queries[key], mode=mode)
+                                           query=queries[key], mode=mode, land_id=land_ids[key])
             if blocked:
                 record_source_blocked(site.source_key, f"PACS {blocked}")
                 _logger.warning("%s blocked (%s); pass stopped", site.source_key, blocked)

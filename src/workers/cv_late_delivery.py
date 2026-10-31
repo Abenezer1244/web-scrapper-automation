@@ -40,6 +40,7 @@ can look up its contacts by hand. No PII is logged: ids and counts only.
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta
 
 from celery.exceptions import SoftTimeLimitExceeded, TimeLimitExceeded
 from sqlalchemy import text as sa_text
@@ -58,6 +59,31 @@ LATE_KEY = "late_delivery"
 # scraper now, a Starter plan, not the owner). Never asked twice.
 CONTACTS_KEY = "contacts"
 CONTACTS_PENDING = "pending"
+# late_delivery.dialer: "pending" (the run's scraper pushes to a dialer; not decided yet), then
+# exactly one terminal state: "pushed"; "via_sweep" (the run's sweep sends or sent it); for a
+# generic webhook only, "skipped_overlap" (pushed too close to the run's own push to know
+# whether that push carried it) and "send_failed" (the request could not be queued; never
+# re-sent, a webhook has no per-lead idempotency); "not_ready" (no dialable contact when
+# decided); "not_eligible" (no Business+ plan or no destination now).
+DIALER_KEY = "dialer"
+DIALER_PENDING = "pending"
+
+
+def uses_outbox(deliver) -> bool:
+    """The run's dialer is a native vendor that pushes from the idempotent outbox."""
+    from src.workers.dialer_connectors import get_connector
+
+    return isinstance(deliver, dict) and get_connector(deliver.get("dialer_type")).uses_outbox
+
+
+def has_dialer_destination(deliver) -> bool:
+    """The sweep's rule (scheduler_helpers/dialer.py): a generic webhook URL, or a native
+    vendor dialer_type that pushes from the outbox."""
+    if not isinstance(deliver, dict):
+        return False
+    url = deliver.get("dialer_webhook_url")
+    kind = deliver.get("dialer_type")
+    return bool(url) or (bool(kind) and kind != "generic_webhook")
 # Rows per tick. Each is one short transaction; the bound only keeps a backlog from
 # holding the beat worker.
 _BATCH_ROWS = 200
@@ -94,7 +120,7 @@ _CANDIDATES_SQL = f"""
     LIMIT :batch
 """  # noqa: S608 -- splices only module constants; every value is bound
 
-_LOCK_JOB_SQL = ("SELECT sc.skip_trace_enabled FROM jobs j JOIN scraper_configs sc ON sc.id = j.scraper_config_id "
+_LOCK_JOB_SQL = ("SELECT sc.skip_trace_enabled, sc.deliver FROM jobs j JOIN scraper_configs sc ON sc.id = j.scraper_config_id "
                  "WHERE j.id = CAST(:jid AS uuid) AND j.user_id = CAST(:uid AS uuid) "
                  "AND sc.user_id = j.user_id AND sc.record_type = 'code_violation' "
                  "AND j.status = 'done' FOR UPDATE OF j")
@@ -150,6 +176,12 @@ def deliver_completed_held_rows(*, batch: int = _BATCH_ROWS) -> dict:
         raise
     except Exception as exc:  # noqa: BLE001 -- deliveries are committed; retried next tick
         _logger.warning("Late delivery contact requests failed: %s", type(exc).__name__)
+    try:
+        stats["dialer_pushed"] = push_late_dialer()
+    except (SoftTimeLimitExceeded, TimeLimitExceeded):
+        raise
+    except Exception as exc:  # noqa: BLE001 -- deliveries are committed; retried next tick
+        _logger.warning("Late delivery dialer pushes failed: %s", type(exc).__name__)
     try:
         stats["notified_accounts"] = notify_late_deliveries()
     except (SoftTimeLimitExceeded, TimeLimitExceeded):
@@ -268,6 +300,185 @@ def request_late_contacts() -> int:
     return asked
 
 
+# Late rows waiting for their dialer decision, oldest first.
+_DIALER_PENDING_SQL = f"""
+    SELECT r.id::text AS id, r.user_id::text AS user_id, r.job_id::text AS job_id
+    FROM results r
+    JOIN jobs j ON j.id = r.job_id AND j.user_id = r.user_id AND j.status = 'done'
+    JOIN scraper_configs sc ON sc.id = j.scraper_config_id AND sc.user_id = j.user_id
+                           AND sc.record_type = 'code_violation'
+    WHERE r.is_duplicate = false
+      AND r.enrichment_data::jsonb->'{LATE_KEY}'->>'{DIALER_KEY}' = '{DIALER_PENDING}'
+    ORDER BY r.enrichment_data::jsonb->'{LATE_KEY}'->>'delivered_at', r.id
+    LIMIT :limit
+"""  # noqa: S608 -- splices only module constants; every value is bound
+_DIALER_LOCK_JOB_SQL = """
+    SELECT j.dialer_pushed_at, sc.id AS config_id, lower(btrim(u.plan)) AS plan
+    FROM jobs j
+    JOIN scraper_configs sc ON sc.id = j.scraper_config_id AND sc.user_id = j.user_id
+    JOIN users u ON u.id = j.user_id
+    WHERE j.id = CAST(:jid AS uuid) AND j.user_id = CAST(:uid AS uuid) AND j.status = 'done'
+    FOR UPDATE OF j
+"""
+_DIALER_LOCK_ROW_SQL = f"""
+    SELECT r.enrichment_data::jsonb->'{LATE_KEY}'->>'delivered_at' AS delivered_at
+    FROM results r
+    WHERE r.id = CAST(:rid AS uuid) AND r.user_id = CAST(:uid AS uuid) AND r.job_id = CAST(:jid AS uuid)
+      AND r.enrichment_data::jsonb->'{LATE_KEY}'->>'{DIALER_KEY}' = '{DIALER_PENDING}'
+    FOR UPDATE OF r
+"""  # noqa: S608 -- splices only module constants; every value is bound
+_TRACE_IN_FLIGHT_SQL = """
+    SELECT EXISTS (SELECT 1 FROM pending_skip_trace_rows p
+                   WHERE p.result_id = CAST(:rid AS uuid) AND p.user_id = CAST(:uid AS uuid)
+                     AND p.status IN ('queued', 'submitting', 'submitted'))
+"""
+_MARK_DIALER_SQL = f"""
+    UPDATE results SET enrichment_data =
+      jsonb_set(enrichment_data::jsonb, '{{{LATE_KEY},{DIALER_KEY}}}', to_jsonb(CAST(:state AS text)))::json
+    WHERE id = CAST(:rid AS uuid) AND user_id = CAST(:uid AS uuid) AND job_id = CAST(:jid AS uuid)
+"""  # noqa: S608 -- splices only module constants; every value is bound
+_DIALER_ROWS = 100
+# A dialer wants the row's contacts: wait for its own skip trace, but never longer than this.
+_DIALER_WAIT = timedelta(hours=24)
+# The run's sweep reads its rows right after it claims the job; a row delivered late within this
+# margin of that claim may already be in that push, so it is not pushed again.
+_SWEEP_OVERLAP = timedelta(minutes=10)
+
+
+def push_late_dialer() -> int:
+    """Send late rows to the run's dialer, once each; returns the number pushed.
+
+    Per row, in the account's RLS session, under the job lock then the row lock:
+      * the run's dialer push has not run yet: "via_sweep" (the sweep sends the row,
+        which is a lead of the run now);
+      * the run was pushed within _SWEEP_OVERLAP of this delivery: "skipped_overlap"
+        (that push may already carry it; a duplicate import cannot be undone);
+      * no Business+ plan or no dialer destination now: "not_eligible";
+      * the row's own skip trace is in flight: wait, at most _DIALER_WAIT;
+      * the sweep's full predicate for this one row (dialer_ready_conditions with unknown
+        DNC, not a duplicate, the 18-month tax cap, actionable): otherwise "not_ready";
+      * then claim FIRST ("pushed", committed), send after: an outbox vendor gets the one
+        row (idempotent per job and result) and the outbox drains; a generic webhook gets
+        one sealed request. A send that raises before anything is sent puts the row back to
+        "pending" (the sweep's un-claim). Replay of a failed delivery stays the user's action.
+    """
+    from sqlalchemy import select
+
+    from src.api.dialer_filters import dialer_ready_conditions
+    from src.api.lead_actionability import actionable_condition
+    from src.api.tax_filters import tax_cap_condition
+    from src.config.constants import BUSINESS_FEATURES_PLANS
+    from src.db.models import Job, Result, ScraperConfig
+    from src.db.session import rls_sync_session, system_sync_session
+
+    with system_sync_session() as db:
+        rows = db.execute(sa_text(_DIALER_PENDING_SQL), {"limit": _DIALER_ROWS}).mappings().all()
+        db.rollback()
+    pushed = 0
+    for row in rows:
+        params = {"rid": row["id"], "uid": row["user_id"], "jid": row["job_id"]}
+        with rls_sync_session(row["user_id"]) as db:
+            try:
+                run = db.execute(sa_text(_DIALER_LOCK_JOB_SQL), params).mappings().first()
+                if run is None:
+                    db.rollback()
+                    continue
+                locked = db.execute(sa_text(_DIALER_LOCK_ROW_SQL), params).first()
+                if locked is None or not locked.delivered_at:
+                    db.rollback()
+                    continue
+                delivered_at = datetime.fromisoformat(locked.delivered_at)
+                config = db.get(ScraperConfig, run["config_id"])
+                state = None
+                if run["plan"] not in BUSINESS_FEATURES_PLANS or not has_dialer_destination(
+                        config.deliver if config else None):
+                    state = "not_eligible"
+                elif run["dialer_pushed_at"] is None:
+                    state = "via_sweep"
+                elif not uses_outbox(config.deliver):
+                    # A generic webhook keeps no per-lead record, so the run's push is judged by
+                    # time (Codex D2 P1): delivered before the run's claim, the sweep read it;
+                    # inside the margin, unknown: skipped, never risked twice (the sweep's own
+                    # at-most-once rule: a lost push is recoverable by export, a duplicate CRM
+                    # import is not). An outbox vendor needs neither: its insert is idempotent
+                    # per job and result, so a lead the sweep already queued is a no-op.
+                    if delivered_at < run["dialer_pushed_at"]:
+                        state = "via_sweep"
+                    elif delivered_at <= run["dialer_pushed_at"] + _SWEEP_OVERLAP:
+                        state = "skipped_overlap"
+                if state is None:
+                    in_flight = db.execute(sa_text(_TRACE_IN_FLIGHT_SQL), params).scalar()
+                    if in_flight and datetime.now(UTC) - delivered_at < _DIALER_WAIT:
+                        db.rollback()
+                        continue                         # its contacts are still coming
+                    lead = db.execute(select(Result).where(
+                        Result.id == row["id"], Result.job_id == row["job_id"],
+                        Result.user_id == row["user_id"], Result.is_duplicate.is_(False),
+                        *dialer_ready_conditions(include_unknown_dnc=True),
+                        tax_cap_condition(datetime.now(UTC).date()), actionable_condition(),
+                    )).scalars().first()
+                    if lead is None:
+                        state = "not_ready"
+                if state is not None:
+                    db.execute(sa_text(_MARK_DIALER_SQL), {**params, "state": state})
+                    db.commit()
+                    continue
+                # Claim first, then send (the sweep's at-most-once order).
+                db.execute(sa_text(_MARK_DIALER_SQL), {**params, "state": "pushed"})
+                db.commit()
+                try:
+                    _send_to_dialer(db, db.get(Job, row["job_id"]), config, lead)
+                except Exception:
+                    # Outbox vendor: the insert is idempotent, so try again next tick. Generic
+                    # webhook: the publish may have gone out before the error, so never again.
+                    db.rollback()
+                    retry = uses_outbox(config.deliver)
+                    db.execute(sa_text(_MARK_DIALER_SQL),
+                               {**params, "state": DIALER_PENDING if retry else "send_failed"})
+                    db.commit()
+                    raise
+                pushed += 1
+            except (SoftTimeLimitExceeded, TimeLimitExceeded):
+                db.rollback()
+                raise
+            except Exception as exc:  # noqa: BLE001 -- one row never stops the others
+                db.rollback()
+                _logger.warning("Late dialer push failed for row %s: %s", str(row["id"])[:8],
+                                type(exc).__name__)
+    return pushed
+
+
+def _send_to_dialer(db, job, config, row) -> None:
+    """The sweep's dispatch (scheduler_helpers/dialer.py) for ONE lead: the outbox for a
+    native vendor, one sealed generic-webhook request otherwise. Same payload fields."""
+    from src.utils.crypto import seal_task_args
+    from src.workers.dialer_connectors import get_connector
+    from src.workers.dialer_outbox import process_dialer_outbox
+    from src.workers.scheduler_helpers.dialer import _materialize_dialer_outbox
+    from src.workers.webhook_delivery import deliver_job_webhook
+
+    deliver = config.deliver or {}
+    connector = get_connector(deliver.get("dialer_type"))
+    lead = {"id": row.id, "party_name": row.party_name, "phone": row.phone,
+            "phone_type": row.phone_type, "phone_dnc_flag": row.phone_dnc_flag, "email": row.email,
+            "property_address": row.property_address, "mailing_address": row.mailing_address}
+    if connector.uses_outbox:
+        _materialize_dialer_outbox(db, job, config, connector.VENDOR_ID, [lead])
+        db.commit()
+        process_dialer_outbox.delay(str(job.id))
+        return
+    url = deliver.get("dialer_webhook_url")
+    if not url:
+        raise RuntimeError("generic dialer webhook without a URL")
+    job_meta = {"job_id": str(job.id), "scraper_config_id": str(config.id), "scraper_name": config.name,
+                "county": config.county, "state": config.state, "record_type": config.record_type,
+                "total_dialer_ready_count": 1, "dialer_webhook_url": url,
+                "dialer_webhook_secret": deliver.get("dialer_webhook_secret")}
+    for req in connector.build_requests([lead], job_meta):
+        deliver_job_webhook.delay(str(job.id), sealed=seal_task_args(
+            {"url": req["url"], "payload": req["payload"]}))
+
+
 _NOTIFY_ACCOUNTS = 500
 _JOBS_IN_NOTICE = 5
 
@@ -352,6 +563,9 @@ def _deliver_one(db, row) -> str:
             # The run would have traced it: request_late_contacts asks the same enqueue,
             # for this row only, once (late delivery D1).
             late[LATE_KEY][CONTACTS_KEY] = CONTACTS_PENDING
+        if has_dialer_destination(run.deliver):
+            # The run pushes to a dialer: push_late_dialer decides, once (late delivery D2).
+            late[LATE_KEY][DIALER_KEY] = DIALER_PENDING
         written = db.execute(sa_text(_DELIVER_SQL), {**params, "late": json.dumps(late)}).rowcount
         if written != 1:
             db.rollback()

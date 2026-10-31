@@ -508,6 +508,18 @@ async def fill_search_dates(page, start: date, end: date, *, timeout_ms: int) ->
     raise RuntimeError(f"{KINGCO_ACCELA}: search form did not take the criteria ({typed})")
 
 
+def postback_target(control: str | None) -> str | None:
+    """The __EVENTTARGET an ASP.NET control posts back as: its element id with '_' as '$'."""
+    return control.lstrip("#").replace("_", "$") if control else None
+
+
+def is_portal_postback(method: str, url: str, post_data: str | None, target: str | None) -> bool:
+    """A POST to the portal; with ``target``, only the one that control raised."""
+    if method != "POST" or urlsplit(url).hostname != _HOST:
+        return False
+    return target is None or parse_qs(post_data or "").get("__EVENTTARGET") == [target]
+
+
 class AccelaPortal(BridgeScraper):
     """The Playwright session: one fresh context per search, paced navigations."""
 
@@ -534,12 +546,10 @@ class AccelaPortal(BridgeScraper):
         """Run ``action`` and wait for its postback; with ``control``, only the POST that
         control raised (its __EVENTTARGET) counts, never some other control's postback."""
         timeout = settings.DEFAULT_TIMEOUT * 1000
-        target = control.lstrip("#").replace("_", "$") if control else None
+        target = postback_target(control)
 
         def is_ours(r) -> bool:
-            if r.request.method != "POST" or urlsplit(r.url).hostname != _HOST:
-                return False
-            return target is None or parse_qs(r.request.post_data or "").get("__EVENTTARGET") == [target]
+            return is_portal_postback(r.request.method, r.url, r.request.post_data, target)
 
         await self._pace()
         async with self.page.expect_response(is_ours, timeout=timeout):

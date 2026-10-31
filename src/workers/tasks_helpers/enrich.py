@@ -532,12 +532,16 @@ def _reuse_enrichment_for_duplicates(db, job, job_id: str) -> int:
     return len(touched)
 
 
-def _fill_king_mailing_from_extract(pid_map: dict[str, list], job_id: str) -> int:
+def _fill_king_mailing_from_extract(pid_map: dict[str, list], job_id: str,
+                                    answers_out: dict | None = None) -> int:
     """Fill missing King mailing addresses from the Assessor extract. Returns rows filled.
 
     Only rows with no mailing address are touched, and only from an unambiguous answer
     (every account on the parcel agrees). Provenance is stamped so a later reader can
     tell this value from a tax-bill page lookup. The caller commits.
+    `answers_out` receives {"answers", "snapshot"} from the file this already read, so
+    _settle_king_not_carried can use its `absent` answers without a second scan. It stays
+    empty when the extract is unusable.
     """
     from src.scrapers.enrichment.king_rpacct import SOURCE, resolve_pins
 
@@ -556,6 +560,8 @@ def _fill_king_mailing_from_extract(pid_map: dict[str, list], job_id: str) -> in
         _logger.info("Job %s: King extract unavailable, mailing uses the tax-bill pages", job_id)
         return 0
     answers, snapshot = resolved
+    if answers_out is not None:
+        answers_out.update({"answers": answers, "snapshot": snapshot})
     filled = 0
     for pid, answer in answers.items():
         if answer.status != "found":
@@ -754,6 +760,144 @@ def _mark_king_property_deferred(db, rows: list, job_id: str, user_id: str) -> i
     _logger.info("Job %s: %d King lead(s) still have no property address; queued for recovery",
                  job_id, result.rowcount or 0)
     return result.rowcount or 0
+
+
+# ── A PIN King does not carry, settled inside the job ─────────────────────────
+# A parcel whose eRealProperty page is "No data found." used to be deferred here and
+# settled by the mailing sweep on its next tick (#565), one more King request later.
+# The job now settles it itself on the same three proofs (king_county_assessor.
+# confirm_not_carried), but only for a parcel NOTHING in the job contradicts, and only
+# all-or-nothing per parcel. Anything less leaves the rows deferred, as before.
+_KING_PIN_ASCII_RE = re.compile(r"[0-9]{10}")   # not \d: that also takes Unicode digits
+# Any of these on a row: its real parcel may not be the printed one.
+_KING_IDENTITY_KEYS = ("resolved_by", "resolved_parcel_id", "source_parcel_id")
+# One King GIS request per batch of up to 50 PINs. Its timeout is a 30 s SOCKET timeout
+# (connect / read), not a wall clock, so a slow body can still run past this floor.
+_NOT_CARRIED_GIS_MIN_S = 45.0
+_NOT_CARRIED_BATCH = 50
+
+
+def _contradicts_not_carried(res) -> bool:
+    """True when this row says, or may say, that its parcel exists or is another parcel.
+
+    Must match _CONTRADICTS_NOT_CARRIED_SQL: a missing key, JSON null and "" all read as
+    absent in both.
+    """
+    ed = res.enrichment_data if isinstance(res.enrichment_data, dict) else {}
+    return bool(
+        res.mailing_address
+        or (res.property_address and res.property_address != "(enrichment unavailable)")
+        or any(ed.get(k) not in (None, "") for k in _KING_IDENTITY_KEYS)
+        or ed.get("vacant_no_situs") is True                       # King GIS matched it
+        or (ed.get("condo_unit_status") or "absent") != "absent"    # the condo extract knows it
+        or ed.get("property_source") not in (None, "")
+    )
+
+
+def _contradicts_not_carried_sql(alias: str) -> str:
+    ed = f"{alias}.enrichment_data::jsonb"
+    return (f"({alias}.mailing_address IS NOT NULL"
+            f" OR coalesce(btrim({alias}.property_address), '') NOT IN ('', '(enrichment unavailable)')"
+            + "".join(f" OR coalesce({ed}->>'{k}', '') <> ''" for k in _KING_IDENTITY_KEYS)
+            + f" OR coalesce({ed}->>'vacant_no_situs', '') = 'true'"
+            f" OR coalesce({ed}->>'condo_unit_status', 'absent') NOT IN ('', 'absent')"
+            f" OR coalesce({ed}->>'property_source', '') <> '')")
+
+
+# Every guard repeated in SQL against the CURRENT rows, the target and every sibling on the
+# same parcel in this job: the ORM copies the job decided on can be stale.
+_SQL_SETTLE_NOT_CARRIED = f"""
+    UPDATE results r
+       SET enrichment_data = {ED_MERGE_SQL}
+     WHERE r.id = ANY(CAST(:ids AS uuid[])) AND r.user_id = CAST(:uid AS uuid)
+       AND r.job_id = CAST(:jid AS uuid) AND btrim(r.parcel_id) = :pid
+       AND btrim(r.parcel_id) ~ '^[0-9]{{10}}$' AND {ED_MERGEABLE_SQL}
+       AND coalesce(r.enrichment_data::jsonb->>'mailing_lookup_deferred', '') = 'true'
+       AND NOT {_contradicts_not_carried_sql("r")}
+       AND NOT EXISTS (
+           SELECT 1 FROM results s
+            WHERE s.job_id = r.job_id AND s.user_id = r.user_id AND btrim(s.parcel_id) = :pid
+              AND {_contradicts_not_carried_sql("s")})
+    RETURNING r.id
+"""  # noqa: S608 -- splices only module constants; every value is bound
+
+
+def _settle_king_not_carried(db, all_rows: list, hidden_ids: set, no_record_pids: set,
+                             extract: dict, time_left, job_id: str, user_id: str) -> set:
+    """Settle as parcel_not_found the job's King parcels three sources say do not exist.
+
+    Proof 1 is this run's own page for the pid ("No data found.", phase 1's `no_record`);
+    `extract` is what _fill_king_mailing_from_extract already read (proof 2 needs its
+    `absent`); confirm_not_carried adds King GIS (proof 3). Called only after the deferred
+    markers committed, so every failure here leaves the rows deferred.
+
+    Whole parcel: judged over ALL the job's rows on the pid, hidden ones included. A hidden
+    row, a mailing address, a resolved identity or any evidence the parcel exists on any of
+    them keeps it deferred. All or nothing: a parcel is written only if EVERY one of its rows
+    passes the SQL guards. Writes the mailing outcome the sweep would, without a recovery
+    attempt (none was made), and settles the property lookup. Returns committed row ids.
+    """
+    import json
+
+    from sqlalchemy import text as _sa_text
+
+    from src.scrapers.enrichment.king_county_assessor import NOT_CARRIED_SOURCE, confirm_not_carried
+
+    answers = (extract or {}).get("answers")
+    if not no_record_pids or answers is None:
+        return set()
+    by_pid: dict[str, list] = {}
+    for res in all_rows:
+        if res.parcel_id:
+            by_pid.setdefault(res.parcel_id.strip(), []).append(res)
+    candidates = [
+        pid for pid in sorted(no_record_pids)
+        if _KING_PIN_ASCII_RE.fullmatch(pid) and pid in by_pid
+        and not any(res.id in hidden_ids or _contradicts_not_carried(res) for res in by_pid[pid])
+        and getattr(answers.get(pid), "status", None) == "absent"
+    ]
+    proven: set[str] = set()
+    for i in range(0, len(candidates), _NOT_CARRIED_BATCH):
+        if time_left() < _NOT_CARRIED_GIS_MIN_S:
+            break
+        proven |= confirm_not_carried(candidates[i:i + _NOT_CARRIED_BATCH], answers)
+    if not proven:
+        return set()
+
+    patch = json.dumps({
+        "mailing_lookup_deferred": False, "mailing_recovery_outcome": "parcel_not_found",
+        "mailing_source": NOT_CARRIED_SOURCE, "mailing_rpacct_snapshot": extract.get("snapshot"),
+        PROPERTY_OUTCOME_KEY: "parcel_not_found", PROPERTY_DEFERRED_KEY: False,
+    })
+    settled: set = set()
+    try:
+        db.flush()
+        for pid in sorted(proven):
+            want = {str(res.id) for res in by_pid[pid]}
+            savepoint = db.begin_nested()
+            got = {str(row[0]) for row in db.execute(_sa_text(_SQL_SETTLE_NOT_CARRIED), {
+                "ids": sorted(want), "uid": user_id, "jid": job_id, "pid": pid, "patch": patch,
+            }).all()}
+            if got == want:
+                savepoint.commit()
+                settled |= want
+            else:
+                savepoint.rollback()   # a row changed under us: the whole parcel stays deferred
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        if type(exc).__name__ in ("SoftTimeLimitExceeded", "TimeLimitExceeded"):
+            raise
+        _logger.warning("Job %s: King not-carried settlement not stored: %s", job_id, str(exc)[:120])
+        return set()
+    for pid in proven:
+        for res in by_pid[pid]:
+            db.expire(res, ["enrichment_data"])
+    if settled:
+        _logger.info("Job %s: %d King lead(s) name a PIN King does not carry (eRealProperty, GIS "
+                     "and the Assessor extract agree); settled as parcel_not_found",
+                     job_id, len(settled))
+    return settled
 
 
 def _fill_king_condo_unit_situs(db, rows: list, job_id: str) -> int:
@@ -1684,6 +1828,9 @@ def _run_inline_enrichment(
                               and res.enrichment_data.get(OWNER_OUTCOME_KEY)
                               == OWNER_NOT_ON_RECORD)))
         ]
+        # Rows this run settled as naming a PIN King does not carry: the owner-only pass
+        # below must not ask King about them again.
+        _not_carried_ids: set = set()
         if needs:
             from src.scrapers.enrichment.king_county_assessor import batch_enrich_king_county
             from src.scrapers.enrichment.king_parcel_repair import owner_matches_party
@@ -1712,7 +1859,9 @@ def _run_inline_enrichment(
             # or unreadable file falls straight through to the pages as before.
             # Budget: one streamed scan of the file (~15 s) before _king_deadline
             # starts, well inside the soft-limit headroom computed below.
-            _rpacct_filled = _fill_king_mailing_from_extract(pid_map, job_id)
+            _extract_read: dict = {}
+            _rpacct_filled = _fill_king_mailing_from_extract(pid_map, job_id,
+                                                             answers_out=_extract_read)
             if _rpacct_filled:
                 try:
                     db.commit()
@@ -1766,6 +1915,9 @@ def _run_inline_enrichment(
             # flag so the user isn't mailing a decedent.
             is_probate_family = config.record_type in ("probate", "death_certificate")
             _p1_answers: dict[str, tuple[str, str | None]] = {}
+            # Pids whose page this run was eRealProperty's "No data found." answer: the
+            # first of the three proofs _settle_king_not_carried needs.
+            _no_record_pids: set[str] = set()
 
             def _apply_king(enriched: dict) -> None:
                 """Write ONE chunk's lookups onto their rows (caller commits).
@@ -1779,6 +1931,8 @@ def _run_inline_enrichment(
                     prop = data.get("property_address")
                     mail = data.get("mailing_address")
                     owner = data.get("owner_name")
+                    if data.get("parcel_lookup") == "no_record":
+                        _no_record_pids.add(pid)
                     if data.get("parcel_lookup") == "verified":
                         # The page echoed the parcel we asked for: a settled answer,
                         # read the same way as the owner-only pass reads it.
@@ -2038,12 +2192,39 @@ def _run_inline_enrichment(
                     ed = dict(res.enrichment_data) if isinstance(res.enrichment_data, dict) else {}
                     ed["mailing_lookup_deferred"] = True
                     res.enrichment_data = ed
+            _markers_committed = True
             if deferred:
                 try:
                     db.commit()
                 except Exception as exc:
                     _logger.warning("Job %s: deferred-marker commit failed: %s", job_id, str(exc)[:120])
                     db.rollback()
+                    _markers_committed = False
+            # A parcel three King sources agree does not exist is settled now instead of
+            # waiting for the mailing sweep. Only AFTER the markers above committed, so any
+            # failure in there leaves its rows deferred exactly as before.
+            if _markers_committed and _no_record_pids:
+                _not_carried_ids = _settle_king_not_carried(
+                    db, all_results, hidden_ids, _no_record_pids, _extract_read, _king_left,
+                    job_id, str(job.user_id))
+                if _not_carried_ids:
+                    _settled_pids = {res.parcel_id.strip() for res in all_results
+                                     if str(res.id) in _not_carried_ids}
+                    mailing_pending -= sum(1 for p in deferred if p in _settled_pids)
+                    deferred = [p for p in deferred if p not in _settled_pids]
+                    _n = len(_not_carried_ids)
+                    try:
+                        _publish_log(
+                            r, job_id, "info",
+                            f"King County sources did not find the parcel IDs listed on {_n:,} "
+                            f"{'lead' if _n == 1 else 'leads'}.",
+                            db=db,
+                        )
+                    except Exception as exc:  # noqa: BLE001 -- the settlement already committed
+                        if type(exc).__name__ in ("SoftTimeLimitExceeded", "TimeLimitExceeded"):
+                            raise
+                        db.rollback()
+                        _logger.warning("Job %s: not-carried log line failed: %s", job_id, str(exc)[:120])
             # Nothing is pending here: every chunk and the markers above committed or
             # rolled back. store_answers commits on its own.
             from src.workers.owner_recovery import store_answers
@@ -2119,6 +2300,9 @@ def _run_inline_enrichment(
                 # Asking again spends a request on the same answer.
                 and _ed(res).get(OWNER_OUTCOME_KEY) != OWNER_NOT_ON_RECORD
                 and res.id not in hidden_ids
+                # Settled above: three King sources agree its PIN does not exist, so the
+                # page can only say "No data found." again. No owner outcome is claimed.
+                and str(res.id) not in _not_carried_ids
             ]
             if owner_needs:
                 _publish_log(

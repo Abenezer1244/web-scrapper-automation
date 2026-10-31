@@ -106,10 +106,13 @@ _CACHE_FILL_ROWS = 5000
 # Visible King tax leads still waiting for an owner: delivered leads AND the
 # account's already-delivered rows (owner decision 2026-10-12: fill every unnamed
 # lead, once per property). A lead is waiting until one of its answers settles it:
-# found (named), not on record, a parcel King answers for with another PIN, or
-# out of attempts. The deferred flag is not required: leads delivered before the
-# job learned to set it (22,009 on 2026-10-12) never got it. The same predicate
-# guards every write, so selection and write cannot disagree.
+# found (named), not on record, a parcel King answers for with another PIN, a PIN
+# three King sources agree does not exist (the mailing sweep or the job settled it;
+# its page can only say "No data found." again), or out of attempts. The deferred
+# flag is not required: leads delivered before the job learned to set it (22,009 on
+# 2026-10-12) never got it. The same predicate guards every write, so selection and
+# write cannot disagree. The source literal is king_county_assessor.NOT_CARRIED_SOURCE
+# (that module is not imported here; a test pins the two together).
 _ELIGIBLE_ROW = """
       (r.is_duplicate = false
        OR (r.is_duplicate = true AND coalesce(r.duplicate_reason, 'prior_run') = 'prior_run'))
@@ -117,6 +120,9 @@ _ELIGIBLE_ROW = """
   AND coalesce(r.enrichment_data->>'owner_lookup_outcome', '') <> 'not_on_record'
   AND coalesce(r.enrichment_data->>'owner_recovery_outcome', '')
       NOT IN ('found', 'not_on_record', 'parcel_mismatch', 'gave_up')
+  AND NOT (coalesce(r.enrichment_data->>'mailing_recovery_outcome', '') = 'parcel_not_found'
+           AND coalesce(r.enrichment_data->>'mailing_source', '')
+               = 'king_erealproperty+king_gis+king_rpacct')
   AND (r.party_name IS NULL OR btrim(r.party_name) = '')
   AND btrim(r.parcel_id) ~ '^[0-9]{10}$'
   AND (CASE WHEN r.enrichment_data->>'owner_recovery_attempts' ~ '^[0-9]{1,6}$'

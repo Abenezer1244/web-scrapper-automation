@@ -19,6 +19,36 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-10-31 — Live King jobs settle a PIN King does not carry; owner recovery stops re-asking
+
+**Built / Shipped:** branch `fix/king-live-job-not-carried`. A live King job settles a parcel as
+`parcel_not_found` (mailing and property) on the three proofs (#565/#571), instead of deferring it to
+the sweeps; the owner-only pass and owner_recovery no longer ask King about it. Plan, Codex findings and
+review: `tasks/todo-king-live-job-not-carried.md`.
+
+**Tried / Decided:** built at the owner's request after Codex's NO-GO on the first sketch (risk in the
+central live-job flow for a one-request saving). Two plan rounds with Codex fixed the design: judge the
+WHOLE parcel over every job row (hidden already-delivered rows included); any mailing, resolved identity
+or positive evidence the parcel exists (property address, `property_source`, a GIS `vacant_no_situs`
+match, a condo-extract unit) blocks it; all or nothing per parcel (savepoint + exact `RETURNING` set);
+run only after the deferred markers committed, so any failure leaves today's deferred state; GIS in
+batches of 50 with a time check before each (a 30 s socket timeout, not a wall clock). No recovery
+attempt is recorded (none was made) and no owner outcome is invented.
+
+**Failed / Blocked:** #571 merged the instant auto-merge was enabled, with CI `Test` still running: the
+repo is now private on the free plan, so main has no branch protection and no required checks. Merges
+are no longer CI-gated; run the related suites locally before merging.
+
+**Caught & fixed:** Codex (plan 2): rows outside `pid_map` (hidden, mailed) must count; partial
+settlement must roll back; ASCII-only PIN digits; positive condo/vacant evidence; owner recovery would
+re-ask. Codex diff review: GO, no findings.
+
+**Facts learned:** `_mark_king_property_deferred` and the owner pass both write `enrichment_data` later
+in the job, so a raw-SQL settlement must expire the ORM copies or a later flush could restore the stale
+document.
+
+---
+
 ## 2026-10-31 — King "no record" follow-ups: property recovery settles dead PINs too; one shared proof; honest sweep stats
 
 **Built / Shipped:** branch `fix/king-no-record-followups`, after #565 was verified live (05:53Z tick

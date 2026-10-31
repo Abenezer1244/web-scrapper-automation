@@ -2678,6 +2678,7 @@ def copy_cached_answer(db, user_id, rec, payload: dict) -> bool:
 
 def _enqueue_skip_trace_rows(
     db, job, r, job_id: str, config, *, on_begin=None, attempt_token=None,
+    only_result_ids: list[str] | None = None, quiet: bool = False,
 ) -> str:
     """Enqueue eligible Result rows into pending_skip_trace_rows.
 
@@ -2714,7 +2715,16 @@ def _enqueue_skip_trace_rows(
     "done" (the enqueue ran to completion, whatever it queued), "unenforced"
     (claims paused, see ClaimUnenforcedError below), or the gate that stopped it:
     "disabled", "no_token", "config_off", "starter", "not_owner".
+
+    ``only_result_ids`` (late delivery, src/workers/cv_late_delivery.py) narrows the rows
+    considered to those ids and changes nothing else: every gate, the advisory lock, the
+    claim and the dispatcher apply exactly as for a run. ``quiet`` writes nothing to the
+    job's log (a done job's log is not appended to after the run).
     """
+    def _log(*args, **kwargs):
+        if not quiet:
+            _publish_log(*args, **kwargs)
+
     # Local imports — sa_select must be imported here because the module-
     # level import is scoped inside _run_inline_enrichment, not globally
     from sqlalchemy import select as sa_select
@@ -2730,7 +2740,7 @@ def _enqueue_skip_trace_rows(
     if not settings.SKIP_TRACE_ENABLED:
         return "disabled"
     if not settings.TRACERFY_API_TOKEN:
-        _publish_log(
+        _log(
             r, job_id, "warning",
             "Skip trace requested but TRACERFY_API_TOKEN not configured",
             db=db,
@@ -2742,7 +2752,7 @@ def _enqueue_skip_trace_rows(
     from src.config.constants import normalize_plan
 
     if normalize_plan(job.user.plan) == "starter":
-        _publish_log(
+        _log(
             r, job_id, "warning",
             "Skip trace requested but user plan (starter) does not include it. "
             "Upgrade to Pro to unlock skip trace ($0.08/lookup).",
@@ -2798,6 +2808,7 @@ def _enqueue_skip_trace_rows(
             actionable_condition(),
             Result.skip_trace_status == "not_attempted",
             skip_trace_eligible_condition(),
+            *([Result.id.in_(only_result_ids)] if only_result_ids is not None else []),
         )
     ).scalars().all()
 
@@ -2807,7 +2818,7 @@ def _enqueue_skip_trace_rows(
     if _settled_n:
         # Committed here: `if not eligible: return` below would otherwise drop it.
         db.commit()
-        _publish_log(
+        _log(
             r, job_id, "info",
             f"Skip trace not repeated for {_settled_n} already delivered lead(s): an "
             "earlier lookup was charged but could not be matched to the lead",
@@ -2826,7 +2837,7 @@ def _enqueue_skip_trace_rows(
     placeholder_rows = [rec for rec in eligible if street_is_placeholder(rec.property_address)]
     if placeholder_rows:
         eligible = [rec for rec in eligible if not street_is_placeholder(rec.property_address)]
-        _publish_log(
+        _log(
             r, job_id, "warning",
             f"Skip trace skipped for {len(placeholder_rows)} lead(s): the county supplied a "
             "placeholder property address, so a lookup would be billed against an address "
@@ -2843,7 +2854,7 @@ def _enqueue_skip_trace_rows(
         if settled_rows:
             _settled_ids = {rec.id for rec in settled_rows}
             eligible = [rec for rec in eligible if rec.id not in _settled_ids]
-            _publish_log(
+            _log(
                 r, job_id, "info",
                 f"Skip trace skipped for {len(settled_rows)} code violation lead(s) whose "
                 "case the city already settled (completed, duplicate, voided or no violation)",
@@ -3032,7 +3043,7 @@ def _enqueue_skip_trace_rows(
             # Reported HERE as well as at the end: this early return is the path
             # where the late pass settled every remaining lead, and it is exactly
             # the case worth telling the customer about.
-            _publish_log(
+            _log(
                 r, job_id, "info",
                 f"Skip trace not repeated for {_late_settled} further already "
                 "delivered lead(s): an earlier lookup was charged but could not be "
@@ -3138,7 +3149,7 @@ def _enqueue_skip_trace_rows(
                 )
             except Exception:  # noqa: BLE001 - an alert failure must not fail the job
                 _logger.exception("skip-trace unenforced-claim alert failed to send")
-            _publish_log(
+            _log(
                 r, job_id, "warning",
                 f"Contact lookups are paused for {len(to_claim)} lead(s): a "
                 "database safeguard that stops a lead being looked up twice is "
@@ -3208,12 +3219,12 @@ def _enqueue_skip_trace_rows(
 
     if _held_line:
         # After the commit: _publish_log commits, and the job lock had to stay held.
-        _publish_log(r, job_id, "info", _held_line, db=db)
+        _log(r, job_id, "info", _held_line, db=db)
 
     if _late_settled:
         # Reported only now: this log commits, and until the line above it the
         # job lock had to stay held.
-        _publish_log(
+        _log(
             r, job_id, "info",
             f"Skip trace not repeated for {_late_settled} further already delivered "
             "lead(s): an earlier lookup was charged but could not be matched to the "
@@ -3222,7 +3233,7 @@ def _enqueue_skip_trace_rows(
         )
 
     if skipped_atip_policy:
-        _publish_log(
+        _log(
             r, job_id, "info",
             f"Skip trace skipped for {skipped_atip_policy} Tacoma code violation lead(s): "
             "their owner name comes from the county's property record, which we may show "
@@ -3231,7 +3242,7 @@ def _enqueue_skip_trace_rows(
         )
 
     if skipped_ineligible:
-        _publish_log(
+        _log(
             r, job_id, "info",
             f"Skip trace skipped for {skipped_ineligible} lead(s): no traceable "
             "owner name, or the property's city/state could not be determined "
@@ -3240,7 +3251,7 @@ def _enqueue_skip_trace_rows(
             db=db,
         )
 
-    _publish_log(
+    _log(
         r, job_id, "info",
         f"Skip trace: {cache_hits} cache hits, {cache_misses} queued "
         f"({enqueued_normal} normal + {enqueued_advanced} advanced). "

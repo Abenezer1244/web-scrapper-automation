@@ -151,3 +151,61 @@ No migration (notifications.type has no DB constraint; late_delivery lives in en
   results.enrichment_data and goes with the row. Nothing to add.
 - P2 delivered_late_at from the row's stamp, parsed defensively (None when absent/malformed). Adopted.
 - P3 settings copy says "email": updated in C2 to cover in-app.
+
+## Phase D plan (2026-10-31): dialer + paid skip trace for late-delivered rows (owner: "complete these")
+A late row is an ordinary lead now; a run that had skip tracing / a dialer on would have traced and pushed it.
+Never spend outside the existing gates; never touch any OTHER row of the run.
+### D1 skip trace (enrich.py, cv_late_delivery.py, tests)
+- _enqueue_skip_trace_rows gains `only_result_ids: list[str] | None = None`: when set, the eligible-row selection
+  (and its re-check under the advisory lock) is further restricted to those ids. Every existing gate is unchanged:
+  SKIP_TRACE_ENABLED, token, config.skip_trace_enabled, plan not Starter, claim enforcement, per-account claim and
+  Tracerfy capacity/billing, cache-hit copy. A run's other untraced rows (deliberately skipped, capped) are never
+  queued by a late delivery.
+- cv_late_delivery: delivery stamps late_delivery.contacts = "pending" ONLY when the row's config has
+  skip_trace_enabled (decided under the row lock). A per-tick step, per job, in the account's RLS session (as
+  degradation_repair does for a done job, no attempt token): calls the enqueue with only_result_ids = the job's
+  pending late rows, then marks them contacts = "queued" (or "skipped:<gate>" for a gate outcome, so a gate never
+  loops). Rows the enqueue copied from cache or queued leave skip_trace_status = not_attempted on their own.
+### D2 dialer (scheduler_helpers/dialer.py, cv_late_delivery.py, tests)
+- Job not pushed yet (dialer_pushed_at NULL): nothing to do, the normal sweep includes the row (actionable now).
+- Job already pushed: insert the late row into dialer_deliveries via the existing idempotent outbox insert
+  (_materialize_dialer_outbox, ON CONFLICT (job_id, result_id) DO NOTHING) once its skip trace has settled (the
+  sweep's own rule: dialers want contacts), then the existing process_dialer_outbox drains it.
+- Same dialer_ready / config / vendor checks the sweep applies.
+### Questions for Codex
+- Is only_result_ids enough to keep the enqueue's claim/quota/billing invariants (advisory lock, frontier,
+  spend weight, account spent) correct for a done job? Does process_dialer_outbox drain rows of a job whose
+  dialer_pushed_at is already set? Anything that would double-send to a dialer or double-charge a trace?
+
+### Phase D consult r1 (Codex GATE FAIL, 3 P1 / 4 P2): reconciliation
+- P1 capacity frontier: only_result_ids NARROWS the enqueue; it skips nothing. The rows still go through
+  claim_skip_trace_rows (access, trial allowance, freeze/end, account limits, spend weight, frontier) and the
+  dispatcher (batching, rate limit, re-check before submit). Nothing is treated as free or pre-reserved. The
+  per-row outcome is read from the ROW after the call, never from the enqueue's return value:
+  skip_trace_status completed/unmatched (cache copy) -> contacts "settled"; a pending_skip_trace_rows row exists
+  -> "queued"; still not_attempted -> "not_queued:<gate>" (terminal; never retried in a loop).
+- P2 job log: the enqueue gains quiet=True (no _publish_log lines) for this caller; a done job's log never grows.
+- P2 entitlement changes: covered by the claim and the dispatcher as above; outcomes are per row.
+- P1 unbounded dialer wait: a late row goes to the dialer when its contacts settle OR 24 h after late delivery,
+  whichever comes first; then it is pushed only if dialer_ready_conditions hold for it (else dialer
+  "not_ready", terminal). Never waits forever.
+- P1 outbox drain skips the sweep's gates: the late path re-checks, for THAT result, in the account's RLS session:
+  job done + owned, config dialer settings present, plan Business+ (the sweep's rule), dialer_ready_conditions,
+  actionable. Only then it inserts that ONE result (job_id+result_id scoped, same user) and calls
+  process_dialer_outbox.delay(job_id). Other pending rows the drain sends are the sweep's own, already checked.
+  Only jobs with dialer_pushed_at set (the sweep already pushed); unpushed jobs pick the row up in the sweep.
+- P2 ON CONFLICT on an existing failed/skipped delivery: never replayed by this path (dialer outcome
+  "already_in_outbox"); replay stays the user's explicit action (existing endpoint).
+- P2 tenant scope: the late path selects job+user scoped rows only; the insert helper is given rows whose
+  user_id and job_id are checked against the job before insert.
+- Split: D1 (skip trace) PR first, D2 (dialer) PR second.
+### Phase D consult r2 (Codex GATE FAIL, 1 P1 / 1 P2): reconciliation
+- P1 the late dialer gate = the FULL sweep predicate for that result: Business+ plan, owned config with a dialer
+  destination, dialer_ready_conditions(include_unknown_dnc=True), is_duplicate = false, the 18-month tax cap,
+  actionable_condition(). Built from the same helpers the sweep uses (no copy).
+- P2 outcomes: D1 records only late_delivery.contacts = "requested" once the enqueue was called for the row
+  (never called again for it); it claims nothing about the result. The dialer step (D2) reads the row's live
+  state (skip_trace_status hit/miss/errored, open pending_skip_trace_rows) when it decides, with the 24 h bound.
+- Codex r2 confirmed: only_result_ids as an optional filter on both the eligible query and the lock-time
+  re-read leaves normal runs unchanged; claim + dispatcher keep every spend gate; the drain may run after
+  dialer_pushed_at; replay stays the user's action.

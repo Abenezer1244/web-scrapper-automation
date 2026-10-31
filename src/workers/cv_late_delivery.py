@@ -52,6 +52,12 @@ from src.utils.logger import setup_logger
 _logger = setup_logger("worker.cv_late_delivery")
 
 LATE_KEY = "late_delivery"
+# late_delivery.contacts: "pending" (the run's scraper has skip tracing on; not asked yet),
+# "requested" (the enqueue was called for this row: its own gates, claim and dispatcher
+# decided the rest), "not_requested" (a gate that will not change: skip tracing off for the
+# scraper now, a Starter plan, not the owner). Never asked twice.
+CONTACTS_KEY = "contacts"
+CONTACTS_PENDING = "pending"
 # Rows per tick. Each is one short transaction; the bound only keeps a backlog from
 # holding the beat worker.
 _BATCH_ROWS = 200
@@ -88,7 +94,7 @@ _CANDIDATES_SQL = f"""
     LIMIT :batch
 """  # noqa: S608 -- splices only module constants; every value is bound
 
-_LOCK_JOB_SQL = ("SELECT 1 FROM jobs j JOIN scraper_configs sc ON sc.id = j.scraper_config_id "
+_LOCK_JOB_SQL = ("SELECT sc.skip_trace_enabled FROM jobs j JOIN scraper_configs sc ON sc.id = j.scraper_config_id "
                  "WHERE j.id = CAST(:jid AS uuid) AND j.user_id = CAST(:uid AS uuid) "
                  "AND sc.user_id = j.user_id AND sc.record_type = 'code_violation' "
                  "AND j.status = 'done' FOR UPDATE OF j")
@@ -137,8 +143,13 @@ def deliver_completed_held_rows(*, batch: int = _BATCH_ROWS) -> dict:
         _logger.info("Late delivery: %d candidate(s): %d delivered, %d no quota, %d blocked, "
                      "%d stale, %d error(s)", stats["candidates"], stats["delivered"],
                      stats["no_quota"], stats["blocked"], stats["stale"], stats["errors"])
-    # Every tick, not only after a delivery: it also announces rows a crashed tick
-    # delivered and never announced.
+    # Every tick: also picks up rows a crashed tick delivered and never asked or announced.
+    try:
+        stats["contacts_requested"] = request_late_contacts()
+    except (SoftTimeLimitExceeded, TimeLimitExceeded):
+        raise
+    except Exception as exc:  # noqa: BLE001 -- deliveries are committed; retried next tick
+        _logger.warning("Late delivery contact requests failed: %s", type(exc).__name__)
     try:
         stats["notified_accounts"] = notify_late_deliveries()
     except (SoftTimeLimitExceeded, TimeLimitExceeded):
@@ -178,6 +189,85 @@ _MARK_NOTIFIED_SQL = f"""
       jsonb_set(enrichment_data::jsonb, '{{{LATE_KEY},notified}}', 'true'::jsonb)::json
     WHERE user_id = CAST(:uid AS uuid) AND id = ANY(CAST(:ids AS uuid[]))
 """  # noqa: S608 -- splices only module constants; every value is bound
+# Late rows whose run had skip tracing on and that were not asked yet, per job.
+_CONTACTS_PENDING_SQL = f"""
+    SELECT r.job_id::text AS job_id, r.user_id::text AS user_id, array_agg(r.id::text) AS ids
+    FROM results r
+    JOIN jobs j ON j.id = r.job_id AND j.user_id = r.user_id AND j.status = 'done'
+    JOIN scraper_configs sc ON sc.id = j.scraper_config_id AND sc.user_id = j.user_id
+                           AND sc.record_type = 'code_violation'
+    WHERE r.is_duplicate = false
+      AND r.enrichment_data::jsonb->'{LATE_KEY}'->>'{CONTACTS_KEY}' = '{CONTACTS_PENDING}'
+    GROUP BY r.job_id, r.user_id
+    ORDER BY min(r.enrichment_data::jsonb->'{LATE_KEY}'->>'delivered_at')
+    LIMIT :limit
+"""  # noqa: S608 -- splices only module constants; every value is bound
+_MARK_CONTACTS_SQL = f"""
+    UPDATE results SET enrichment_data =
+      jsonb_set(enrichment_data::jsonb, '{{{LATE_KEY},{CONTACTS_KEY}}}', to_jsonb(CAST(:state AS text)))::json
+    WHERE user_id = CAST(:uid AS uuid) AND job_id = CAST(:jid AS uuid) AND id = ANY(CAST(:ids AS uuid[]))
+      AND enrichment_data::jsonb->'{LATE_KEY}'->>'{CONTACTS_KEY}' = '{CONTACTS_PENDING}'
+"""  # noqa: S608 -- splices only module constants; every value is bound
+_CONTACT_JOBS = 50
+# The enqueue's own outcomes (as degradation_repair reads them): wait and try next tick,
+# or a gate that stands.
+_CONTACTS_WAIT = {"disabled", "no_token", "unenforced"}
+_CONTACTS_SUPPRESS = {"config_off", "starter", "not_owner"}
+
+
+def request_late_contacts() -> int:
+    """Ask the run's paid skip trace for late rows whose scraper has it on; returns the
+    number of jobs asked.
+
+    The SAME enqueue a run uses (_enqueue_skip_trace_rows), narrowed to this job's
+    pending late rows (only_result_ids) and quiet (a done job's log is not appended to):
+    every spend gate, the per-job advisory lock, the claim (access, trial allowance,
+    freeze/end, account limits) and the dispatcher apply unchanged. A run's other
+    untraced rows are never queued by this. Each row is asked once: "requested" once
+    the enqueue ran, "not_requested" for a gate that stands; a waiting gate (skip trace
+    switched off globally, claims paused) leaves it pending for the next tick.
+    In the account's own RLS session, like degradation_repair's done-job enqueue.
+    """
+    from src.db.models import Job, ScraperConfig
+    from src.db.session import rls_sync_session, system_sync_session
+    from src.workers.tasks_helpers.enrich import _enqueue_skip_trace_rows
+    from src.workers.tasks_helpers.status import _redis
+
+    with system_sync_session() as db:
+        jobs = db.execute(sa_text(_CONTACTS_PENDING_SQL), {"limit": _CONTACT_JOBS}).mappings().all()
+        db.rollback()
+    if not jobs:
+        return 0
+    r = _redis()
+    asked = 0
+    for row in jobs:
+        params = {"uid": row["user_id"], "jid": row["job_id"], "ids": list(row["ids"])}
+        with rls_sync_session(row["user_id"]) as db:
+            try:
+                job = db.get(Job, row["job_id"])
+                config = db.get(ScraperConfig, job.scraper_config_id) if job else None
+                if job is None or config is None or str(job.user_id) != row["user_id"]:
+                    db.rollback()
+                    continue
+                outcome = _enqueue_skip_trace_rows(db, job, r, row["job_id"], config,
+                                                   only_result_ids=list(row["ids"]), quiet=True)
+                if outcome in _CONTACTS_WAIT:
+                    db.rollback()
+                    continue
+                state = "not_requested" if outcome in _CONTACTS_SUPPRESS else "requested"
+                db.execute(sa_text(_MARK_CONTACTS_SQL), {**params, "state": state})
+                db.commit()
+                asked += state == "requested"
+            except (SoftTimeLimitExceeded, TimeLimitExceeded):
+                db.rollback()
+                raise
+            except Exception as exc:  # noqa: BLE001 -- one job never stops the others
+                db.rollback()
+                _logger.warning("Late contact request failed for job %s: %s", str(row["job_id"])[:8],
+                                type(exc).__name__)
+    return asked
+
+
 _NOTIFY_ACCOUNTS = 500
 _JOBS_IN_NOTICE = 5
 
@@ -235,7 +325,8 @@ def _deliver_one(db, row) -> str:
     params = {"rid": row["id"], "uid": row["user_id"], "jid": row["job_id"]}
     try:
         db.execute(sa_text(f"SET LOCAL statement_timeout = '{_STATEMENT_TIMEOUT_MS}'"))
-        if db.execute(sa_text(_LOCK_JOB_SQL), params).first() is None:
+        run = db.execute(sa_text(_LOCK_JOB_SQL), params).first()
+        if run is None:
             db.rollback()
             return "stale"
         locked = db.execute(sa_text(_LOCK_ROW_SQL), params).first()
@@ -257,6 +348,10 @@ def _deliver_one(db, row) -> str:
                            "policy": POLICY_CODE_VIOLATION,
                            # Announced by notify_late_deliveries, exactly once.
                            "notified": False}}
+        if run.skip_trace_enabled:
+            # The run would have traced it: request_late_contacts asks the same enqueue,
+            # for this row only, once (late delivery D1).
+            late[LATE_KEY][CONTACTS_KEY] = CONTACTS_PENDING
         written = db.execute(sa_text(_DELIVER_SQL), {**params, "late": json.dumps(late)}).rowcount
         if written != 1:
             db.rollback()

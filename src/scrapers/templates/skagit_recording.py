@@ -1,6 +1,7 @@
 """Skagit County Recording Search template scraper.
 
-Custom ASP.NET recorder portal at skagitcounty.net/Search/Recording/.
+Custom ASP.NET recorder portal at classic.skagitcountywa.gov/search/Recording/
+(formerly skagitcounty.net/Search/Recording/, which now 301s there).
 Not a shared platform (EagleWeb/AcclaimWeb/Tyler) — Skagit-specific but
 could potentially serve as a base for other custom ASP.NET recorder sites.
 

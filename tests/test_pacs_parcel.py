@@ -256,8 +256,11 @@ class TestResolve:
 
     def test_a_malformed_parcel_is_never_requested(self, monkeypatch):
         log = _serve(monkeypatch, {}, {})
-        out = pp.resolve_mailing("benton", ["", "ABC", "0000"])
-        assert {a.outcome for a in out.values()} == {pp.PARCEL_NOT_FOUND}
+        out = pp.resolve_mailing("benton", ["", "0000", "ABC", "R03213-049-3470"])
+        # No parcel at all settles; a real id in a format this lookup cannot search
+        # (Island's letters) was never asked about, so it is deferred, never "not found".
+        assert out[""].outcome == out["0000"].outcome == pp.PARCEL_NOT_FOUND
+        assert out["ABC"].outcome == out["R03213-049-3470"].outcome == SOURCE_UNAVAILABLE
         assert log == []
 
     def test_an_unknown_county_makes_no_request(self, monkeypatch):

@@ -14,7 +14,9 @@ posts back first, and a search button that posts back on click.
 from __future__ import annotations
 
 import asyncio
+import time
 from types import SimpleNamespace
+from urllib.parse import parse_qs
 
 import pytest
 
@@ -42,7 +44,7 @@ _HTML = f"""<!doctype html><html><body>
   // The portal's shape: the dropdown's postback starts LATER, from a timer.
   document.getElementById("{_RECORD_TYPE_ID}").onchange = () => {{
     postBack("other$control");                                  // a different control, at once
-    setTimeout(() => postBack("{_RECORD_TYPE_ID.replace('_', '$')}"), 700);
+    setTimeout(() => postBack("{_RECORD_TYPE_ID.replace('_', '$')}"), 1500);
   }};
   document.getElementById("{_SEARCH_ID}").onclick = () => postBack("{_SEARCH_ID.replace('_', '$')}");
 </script></body></html>"""
@@ -68,11 +70,15 @@ def test_only_the_named_controls_portal_post_counts(method, url, body, target, o
     assert ka.is_portal_postback(method, url, body, target) is ours
 
 
-async def _page(browser):
+async def _page(browser, received: list | None = None):
+    """The fake portal; every POST's __EVENTTARGET and arrival time go into ``received``."""
     page = await browser.new_page()
 
     async def serve(route):
         if route.request.method == "POST":
+            if received is not None:
+                target = parse_qs(route.request.post_data or "").get("__EVENTTARGET", [""])[0]
+                received.append((target, time.monotonic()))
             await asyncio.sleep(0.05)
             await route.fulfill(status=200, body="ok")
         else:
@@ -96,14 +102,19 @@ async def test_the_record_type_wait_ignores_an_earlier_postback_and_catches_the_
     async with async_playwright() as p:
         browser = await p.chromium.launch()
         try:
-            page = await _page(browser)
+            received: list = []
+            page = await _page(browser, received)
             await ka.AccelaPortal._postback(
                 _portal(page), lambda: page.select_option(ka.SEL_RECORD_TYPE, ka.RECORD_TYPE_VALUE),
                 ka.SEL_RECORD_TYPE)
-            posted = await page.evaluate("window.posted")
-            # Returned only after the dropdown's OWN (delayed) postback, not the decoy's.
-            assert ka.postback_target(ka.SEL_RECORD_TYPE) in posted
-            assert posted[0] == "other$control"
+            returned_at = time.monotonic()
+            arrived = dict(received)
+            # The decoy posted first, and the wait still held until the dropdown's OWN
+            # postback (started 1.5 s later) had reached the portal (Codex P2: decided by
+            # arrival time at return, not by what is posted afterwards).
+            assert received[0][0] == "other$control"
+            own = ka.postback_target(ka.SEL_RECORD_TYPE)
+            assert own in arrived and arrived[own] < returned_at
         finally:
             await browser.close()
 
@@ -116,11 +127,13 @@ async def test_the_dom_click_submits_without_leaving_the_focused_date_box():
         browser = await p.chromium.launch()
         try:
             page = await _page(browser)
+            await page.fill(ka.SEL_START_DATE, "10/01/2026")
             await page.focus(ka.SEL_START_DATE)
             await ka.AccelaPortal._postback(
                 _portal(page), lambda: page.locator(ka.SEL_SEARCH).evaluate("el => el.click()"),
                 ka.SEL_SEARCH)
             assert await page.evaluate("document.activeElement.id") == _START_ID
+            assert await page.input_value(ka.SEL_START_DATE) == "10/01/2026"   # the typed date stands
             assert ka.postback_target(ka.SEL_SEARCH) in await page.evaluate("window.posted")
             # The contrast that made the DOM click necessary: a real click moves focus.
             await page.focus(ka.SEL_START_DATE)

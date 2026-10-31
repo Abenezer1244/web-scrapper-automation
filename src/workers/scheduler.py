@@ -118,6 +118,17 @@ app.conf.beat_schedule = {
         "schedule": 120.0,  # every 2 minutes
         "options": {"expires": 110},
     },
+    "ops-heartbeat": {
+        # P0-02: ping the external heartbeat monitor (src/workers/ops_heartbeat.py),
+        # which pages the owner when pings stop: beat, Redis or the worker is down.
+        # The monitor waits 5 min plus 5 min grace, so a deploy's fresh interval
+        # entry (one full period before its first tick) does not page.
+        # expires: a ping that sat in the queue past 4 min would prove a backlog,
+        # not a live worker, so it is dropped and the missing ping tells the truth.
+        "task": "src.workers.scheduler.ops_heartbeat",
+        "schedule": 300.0,  # every 5 minutes
+        "options": {"expires": 240},
+    },
     "enrichment-source-canary": {
         # The recovery half of external_source_health, which shipped without one:
         # probe each blocked enrichment source whose cooldown has expired and
@@ -505,6 +516,18 @@ def canary_check() -> None:
     """Probe a few (connector, record type) pairs; see _canary_check_impl for the
     health_status rules, including the zero-output downgrade and its ops alert."""
     return _canary_check_impl()
+
+
+@app.task(name="src.workers.scheduler.ops_heartbeat")
+def ops_heartbeat() -> bool:
+    """P0-02: one ping to the external heartbeat monitor; see src/workers/ops_heartbeat.py.
+
+    Proves beat + Redis + a worker on the celery queue. Never raises; a failed ping
+    is a missing ping, which is exactly what the monitor alerts on.
+    """
+    from src.workers.ops_heartbeat import ping_heartbeat
+
+    return ping_heartbeat()
 
 
 # ─── Task 4: Entitlement-window reconciliation + skip-trace reset ────────────

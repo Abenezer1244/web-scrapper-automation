@@ -265,7 +265,8 @@ class Settings(BaseSettings):
 
     # ─── Worker scaling ──────────────────────────────────────────────────────
     WORKER_CONCURRENCY: int = 2
-    WORKER_QUEUES: str = "scrape,enrichment"
+    # start.sh reads WORKER_QUEUES from the environment; this mirrors its default.
+    WORKER_QUEUES: str = "celery,scrape-priority,scrape,enrichment"
 
     # ─── Playwright ───────────────────────────────────────────────────────────
     PLAYWRIGHT_HEADLESS: bool = True
@@ -515,9 +516,15 @@ class Settings(BaseSettings):
     # (kind, key) so a down portal emails once per window, not once per tick.
     OPS_ALERT_EMAIL: str = ""
     OPS_ALERT_COOLDOWN_SECONDS: int = 21600  # 6h
-    # Second, independent route (P0-09): a Better Stack incoming-webhook URL. The URL
-    # IS the credential, so it is never logged. Empty = webhook route off.
+    # Second, independent route (P0-09): an incident tool's incoming-webhook URL
+    # (production: Grafana Cloud IRM). The URL IS the credential, so it is never
+    # logged. Empty = webhook route off.
     OPS_ALERT_WEBHOOK_URL: str = ""
+    # P0-02: external heartbeat URL (Better Stack) pinged every 5 min by the
+    # ops_heartbeat beat task, so a dead beat/worker/broker pages from outside. The
+    # URL IS the credential (it can fake liveness): never logged. https only.
+    # Empty = heartbeat off.
+    OPS_HEARTBEAT_URL: str = ""
 
     # ─── Plan limits: records per month (-1 = unlimited) ──────────────────────
     PLAN_LIMITS: ClassVar[dict[str, int]] = {

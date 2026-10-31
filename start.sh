@@ -10,10 +10,14 @@ CONCURRENCY="${WORKER_CONCURRENCY:-2}"
 # ─── Worker queue routing ────────────────────────────────────────────────────
 # WORKER_QUEUES: which queues this worker consumes (comma-separated).
 # Priority queue listed first = processed first when multiple jobs are waiting.
-# "scrape-priority,scrape,enrichment" = default (paid users first)
+# "celery,scrape-priority,scrape,enrichment" = default, and what production sets.
+# `celery` carries every beat task (task_routes in src/workers/__init__.py): the
+# dispatchers, sweeps, canaries and the P0-02 ops heartbeat. A worker without it
+# leaves all of them queued and nothing scheduled ever runs, so some worker must
+# always list it.
 # "scrape" = scrape jobs only
 # "enrichment" = enrichment jobs only
-QUEUES="${WORKER_QUEUES:-scrape-priority,scrape,enrichment}"
+QUEUES="${WORKER_QUEUES:-celery,scrape-priority,scrape,enrichment}"
 
 # ─── Schema gate (all services) ──────────────────────────────────────────────
 # Every service must agree not to run against a stale schema. The API has always

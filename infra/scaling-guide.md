@@ -31,13 +31,13 @@ railway up --replicas 4
 On the **worker** service:
 ```
 WORKER_CONCURRENCY=3      # 3 parallel scrapes per replica (4×3 = 12 total)
-WORKER_QUEUES=scrape,enrichment
+WORKER_QUEUES=celery,scrape-priority,scrape,enrichment
 ```
 
-On the **beat** service (stays at 1 replica):
-```
-WORKER_QUEUES=celery       # scheduler tasks only
-```
+Keep `celery` on at least one worker. Every beat task (dispatch, sweeps, canaries,
+the ops heartbeat) is routed to it, and only a **worker** consumes it. The **beat**
+service stays at 1 replica and only publishes tasks; it consumes no queue, so
+WORKER_QUEUES has no effect there.
 
 ### Step 3: Upgrade Railway Plan
 
@@ -58,7 +58,7 @@ Task Type          → Queue        → Worker Pool
 ─────────────────────────────────────────────────
 run_scrape_job     → scrape       → worker replicas (4×3 = 12 slots)
 enrich_job_results → enrichment   → same workers (or dedicated)
-scheduler tasks    → celery       → beat service (1 replica)
+scheduler tasks    → celery       → a worker (beat only publishes them)
 ```
 
 Each worker replica consumes from the same Redis queue — Celery handles
@@ -70,9 +70,10 @@ For national scale (3,000+ counties, 1000+ users):
 
 ### Dedicated Queue Workers
 ```
-worker-scrape:     WORKER_QUEUES=scrape        WORKER_CONCURRENCY=4  × 8 replicas = 32 scrapes
-worker-enrich:     WORKER_QUEUES=enrichment    WORKER_CONCURRENCY=2  × 4 replicas = 8 enrichments
-beat:              WORKER_QUEUES=celery        (1 replica, scheduler only)
+worker-scrape:     WORKER_QUEUES=scrape-priority,scrape  WORKER_CONCURRENCY=4  × 8 replicas = 32 scrapes
+worker-enrich:     WORKER_QUEUES=enrichment              WORKER_CONCURRENCY=2  × 4 replicas = 8 enrichments
+worker-scheduled:  WORKER_QUEUES=celery                  WORKER_CONCURRENCY=2  × 1 replica  (beat tasks)
+beat:              (1 replica, publishes only; no WORKER_QUEUES)
 ```
 
 ### Auto-Scaling (Railway Pro)

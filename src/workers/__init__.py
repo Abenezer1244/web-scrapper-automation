@@ -155,7 +155,12 @@ app.conf.update(
 # would throw "Scraping target not in approved domain list" on the
 # first scrape of any connector seeded outside the API. See Sprint
 # 6.3 Phase 3 audit in docs/compliance/connector-audit-2026-04-10.md
-from celery.signals import after_setup_logger, after_setup_task_logger, worker_ready  # noqa: E402
+from celery.signals import (  # noqa: E402
+    after_setup_logger,
+    after_setup_task_logger,
+    worker_process_init,
+    worker_ready,
+)
 
 
 # P0-04: Celery builds its own log handlers (root, task, multiprocessing) and
@@ -173,6 +178,22 @@ def _install_log_redaction(logger=None, **_kwargs) -> None:
 
     extra = [lg for lg in (logger, get_multiprocessing_logger()) if lg is not None]
     install_global_redaction(*extra)
+
+
+@worker_process_init.connect
+def _reset_inherited_db_pool(**_kwargs) -> None:
+    """Drop the parent's pooled DB connections in every new prefork child.
+
+    The parent opens TLS connections to the pooler (``worker_ready`` registers connector
+    domains from the DB), and a child forked after that (every
+    ``--max-tasks-per-child`` recycle) inherits them in ``sync_engine``'s pool. Two
+    processes on one TLS stream corrupt it: "SSL error: wrong version number" in
+    dispatch_scheduled_jobs, 2026-10-31. ``close=False`` leaves the sockets to the
+    parent; the child opens its own. The async and heartbeat engines use NullPool.
+    """
+    from src.db.session import sync_engine
+
+    sync_engine.dispose(close=False)
 
 
 @worker_ready.connect

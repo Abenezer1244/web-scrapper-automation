@@ -19,6 +19,37 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-10-31 - Late delivery D1 and D2 shipped; late delivery A-D is complete
+
+**Built / Shipped:** BE #568 (D1, 1568a56d): a held code violation delivered late gets the paid skip
+trace its run would have given it, through the run's own `_enqueue_skip_trace_rows` narrowed by
+`only_result_ids` and made `quiet` (no lines appended to a done job's log); `late_delivery.contacts`
+goes pending, then requested or not_requested. BE #569 (D2, 06757393): the late row reaches the
+run's dialer once: outbox vendors through the idempotent insert, a generic webhook judged by time
+against the run's push claim (before it: via_sweep; within 10 min after: skipped_overlap; a raised
+send: send_failed, terminal), with a 24 h wait for a requested trace. Both deployed to
+api/worker/beat; prod ticks every 20 min return errors 0, candidates 0 so far. FE #298 had merged
+earlier (63d17055). This closes the handoff of the 2026-10-30/31 late delivery entry below.
+
+**Tried / Decided:** stacked D2 on D1 and brought each squash in with a merge commit from main (no
+force push). Each conflict was the newer branch rewriting the older text, so the branch side was
+kept, and the result was checked byte-identical to the tested file before committing.
+
+**Failed / Blocked:** the local test DB had lost every table before a run (last normal activity
+21:46, first missing-table error 22:19 when the run started; none of the targeted tests drops
+tables; cause not found). 436 errors until it was rebuilt with `alembic upgrade head`, as CI does.
+Local Redis and the port forwarder were again stopped for low memory while idle.
+
+**Caught & fixed:** `test_audit4_held_lookup_log` pins the enqueue's source text to prove the held
+line is published after the enqueue commit; D1 routed that call through the quiet `_log` wrapper,
+so the pin now looks for the wrapper (same order invariant). It would have failed CI.
+
+**Pending / Handoff:** none for late delivery. The first real late delivery, trace and dialer push
+will appear in the worker tick stats (`delivered`, `contacts_requested`, `dialer_pushed`).
+
+**Facts learned:** tests that pin source with `inspect.getsource` break on behaviour-neutral
+refactors; grep tests for the old call text before wrapping a function's calls.
+
 ## 2026-10-31 — Live King jobs settle a PIN King does not carry; owner recovery stops re-asking
 
 **Built / Shipped:** branch `fix/king-live-job-not-carried`. A live King job settles a parcel as

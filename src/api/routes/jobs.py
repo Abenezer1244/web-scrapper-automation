@@ -868,9 +868,11 @@ async def get_results(
             select(
                 func.count().filter(list_condition("no_address")),
                 func.count().filter(list_condition("not_qualified")),
-                # An object stamp only: a JSON null is not SQL NULL and must not count.
+                # Late leads on the New list NOW (the frontend moves exactly these from New back
+                # to Held when it compares the lists with the run's frozen counts; Codex C2 P2),
+                # with an object stamp only: a JSON null is not SQL NULL and must not count.
                 func.count().filter(
-                    Result.is_duplicate.is_(False),
+                    list_condition("new"), shown_condition(),
                     func.json_typeof(Result.enrichment_data.op("->")(LATE_DELIVERY_KEY)) == "object"),
             ).where(
                 Result.job_id == job_id,

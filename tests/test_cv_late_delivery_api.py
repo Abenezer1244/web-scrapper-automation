@@ -130,6 +130,21 @@ async def test_a_null_or_scalar_stamp_and_another_users_row_never_count(
 
 
 @pytest.mark.asyncio
+async def test_only_late_leads_on_the_new_list_count(client, db, business_user, business_token):
+    """Codex C2 P2: the frontend shifts exactly late_delivered_count from New back to Held,
+    so a late row that is not on the New list (excluded since, or with no address) never counts."""
+    job = await _done_job(db, business_user)
+    await _row(db, job, business_user.id, late=STAMP)
+    await _row(db, job, business_user.id, late=STAMP, property_address="2 CAPPED ST")
+    await _row(db, job, business_user.id, late=STAMP, property_address=None, mailing_address=None)
+    await db.execute(text("UPDATE results SET enrichment_data = (enrichment_data::jsonb || "
+                          "'{\"delivery_excluded_reason\": \"over_quota\"}')::json WHERE property_address = '2 CAPPED ST'"))
+    await db.commit()
+    page = await _page(client, job, business_token, category="new")
+    assert page["late_delivered_count"] == 1 and page["new_count"] == 1
+
+
+@pytest.mark.asyncio
 async def test_the_late_delivery_notice_can_be_turned_off(client, business_token):
     resp = await client.put("/auth/notification-preferences", json={"late_delivery": False},
                             headers={"Authorization": f"Bearer {business_token}"})

@@ -2341,8 +2341,9 @@ class ResultsPage(BaseModel):
     # before any view filter, tax cap included): marked at delivery, including those a
     # later run has since delivered. Matches the snapshot breakdown's not_qualified.
     not_qualified_count: int = 0
-    # Of this run's leads, how many were held at the run and delivered later (late
-    # delivery). Read now; the run's own counts (record_count, the breakdown) never move.
+    # Of this run's NEW leads (?category=new, before view filters), how many were held at
+    # the run and delivered later (late delivery). Read now; the run's own counts
+    # (record_count, the breakdown) never move.
     late_delivered_count: int = 0
     # Skip-trace state of those same rows (see AlreadyDeliveredContacts).
     already_delivered_contacts: AlreadyDeliveredContacts = AlreadyDeliveredContacts()

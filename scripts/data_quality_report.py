@@ -11,12 +11,17 @@ number an alert would have fired on.
 from __future__ import annotations
 
 import argparse
+import sys
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
-from sqlalchemy import text
+# `python scripts/data_quality_report.py` puts scripts/ on the path, not the repo root.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.db.session import system_sync_session
-from src.workers.data_quality import FIELDS, check_job
+from sqlalchemy import text  # noqa: E402
+
+from src.db.session import system_sync_session  # noqa: E402
+from src.workers.data_quality import FIELDS, check_job  # noqa: E402
 
 _COVERAGE = """
 SELECT lower(sc.county) AS county, sc.record_type,

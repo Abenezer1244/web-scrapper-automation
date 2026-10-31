@@ -128,8 +128,19 @@ _REPAIR_SQL = f"""
 """  # noqa: S608 -- splices only module constants; every value is bound
 
 
-def commit_has_fix(sha: str) -> bool:
-    """True when commit `sha` (as known to this checkout) carries #575's fix.
+# What the deployed pacs_parcel.py must carry before Clallam rows are re-queued: the
+# site's land suffix, the resolver handing it to the grid, and the detail check naming
+# the row the grid matched. Each is structure, not a token a comment could satisfy alone.
+_CLALLAM_FIX_SHAPES = (
+    re.compile(r'"clallam":\s*PacsSite\([^)]*land_suffix="0000"[^)]*short_id_len=12'),
+    re.compile(r"land_id=land_ids\[key\]"),
+    re.compile(r"parse_detail\(resp\.text,\s*matched_key\)"),
+)
+
+
+def commit_has_fix(sha: str, counties: tuple[str, ...] = RETRY_COUNTIES) -> bool:
+    """True when commit `sha` (as known to this checkout) carries #575's fix, and, when
+    ``counties`` includes Clallam, the 12-digit land-id fix too.
 
     Only a hex commit id is accepted, so the argument can never reach git as an option.
     """
@@ -142,7 +153,9 @@ def commit_has_fix(sha: str) -> bool:
             capture_output=True, text=True, check=True, timeout=30).stdout
     except (subprocess.SubprocessError, OSError):
         return False
-    return "search_type_field" in src
+    if "search_type_field" not in src:
+        return False
+    return "clallam" not in counties or all(p.search(src) for p in _CLALLAM_FIX_SHAPES)
 
 
 def select_candidates(db, counties: tuple[str, ...] = RETRY_COUNTIES) -> list:
@@ -270,9 +283,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--report", type=Path,
                     default=Path(f"repair_pacs_mailing_{datetime.now(UTC):%Y%m%dT%H%M%SZ}.jsonl"),
                     help="JSON-lines evidence file (one line per candidate row)")
-    # Clallam's leads carry 12-digit ids the portal only prints extended to 16 (#575
-    # reads that as ambiguous): repairing them before that is solved would spend their
-    # fresh attempts on the same answer and mark them so they are never repaired again.
+    # Clallam's leads carry 12-digit ids the portal only prints extended to 16: repairing
+    # them on code without the land-id fix would spend their fresh attempts on
+    # "ambiguous" and mark them so they are never repaired again (commit_has_fix).
     ap.add_argument("--county", action="append", choices=RETRY_COUNTIES, default=None,
                     help="repair only this county (repeatable; default: every PACS county)")
     args = ap.parse_args(argv)
@@ -287,10 +300,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"evidence -> {args.report}")
         return 0
 
-    if not args.deployed_commit or not commit_has_fix(args.deployed_commit):
+    if not args.deployed_commit or not commit_has_fix(args.deployed_commit, counties):
         print("refused: --deployed-commit must name the worker's running commit, and it must "
-              "contain the #575 PACS fix (fetch main first if this checkout lacks it). "
-              "Re-queued rows would otherwise burn their attempts on the old code.")
+              "contain the #575 PACS fix, plus the Clallam land-id fix when Clallam is "
+              "included (fetch main first if this checkout lacks it). Re-queued rows would "
+              "otherwise burn their attempts on the old code.")
         return 2
     import redis as sync_redis
 

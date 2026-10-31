@@ -86,27 +86,27 @@ def _detail(mailing_cells: list[str], *, geo: str = _PARCEL) -> str:
 
 class TestParseResults:
     def test_real_benton_grid_resolves_the_one_matching_row(self):
-        assert pp.parse_results(_fixture(f"benton_pacs_results_{_PARCEL}.html"), _PARCEL) == (FOUND, "58808")
+        assert pp.parse_results(_fixture(f"benton_pacs_results_{_PARCEL}.html"), _PARCEL)[:2] == (FOUND, "58808")
 
     def test_rows_for_other_parcels_only_is_not_found(self):
-        assert pp.parse_results(_results([("131073011125999", "1")]), _PARCEL) == (pp.PARCEL_NOT_FOUND, None)
+        assert pp.parse_results(_results([("131073011125999", "1")]), _PARCEL)[:2] == (pp.PARCEL_NOT_FOUND, None)
 
     def test_two_rows_for_our_parcel_is_ambiguous(self):
-        assert pp.parse_results(_results([(_PARCEL, "1"), (_PARCEL, "2")]), _PARCEL) == (AMBIGUOUS, None)
+        assert pp.parse_results(_results([(_PARCEL, "1"), (_PARCEL, "2")]), _PARCEL)[:2] == (AMBIGUOUS, None)
 
     def test_a_matching_row_among_strangers_is_still_found(self):
         html = _results([("131073011125999", "1"), (_PARCEL, "58808"), ("131073011125001", "3")])
-        assert pp.parse_results(html, _PARCEL) == (FOUND, "58808")
+        assert pp.parse_results(html, _PARCEL)[:2] == (FOUND, "58808")
 
     def test_none_found_page(self):
-        assert pp.parse_results(_NONE_FOUND, _PARCEL) == (pp.PARCEL_NOT_FOUND, None)
+        assert pp.parse_results(_NONE_FOUND, _PARCEL)[:2] == (pp.PARCEL_NOT_FOUND, None)
 
     def test_a_page_without_the_grid_is_unparsed_not_not_found(self):
-        assert pp.parse_results("<html><body>Maintenance</body></html>", _PARCEL) == (pp.UNPARSED, None)
+        assert pp.parse_results("<html><body>Maintenance</body></html>", _PARCEL)[:2] == (pp.UNPARSED, None)
 
     def test_leading_zeros_and_hyphens_in_the_county_cell_still_match(self):
         html = _results([("0" + _PARCEL[:6] + "-" + _PARCEL[6:], "58808")])
-        assert pp.parse_results(html, _PARCEL) == (FOUND, "58808")
+        assert pp.parse_results(html, _PARCEL)[:2] == (FOUND, "58808")
 
 
 class TestParseDetail:

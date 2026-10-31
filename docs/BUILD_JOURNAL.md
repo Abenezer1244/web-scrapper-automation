@@ -19,6 +19,42 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-10-31 — King mailing recovery: a PIN King does not carry is settled, not re-fetched every 10 minutes forever
+
+**Built / Shipped:** branch `fix/king-parcel-not-found`. `is_no_record_page` + a `no_record` phase-1
+label (king_county_assessor.py), `king_gis_absent`, and `_settle_no_record` in mailing_recovery.py:
+a parcel settles as the existing terminal `parcel_not_found` only when eRealProperty's page is its
+exact "No data found." answer AND the Assessor extract (loaded) lacks it AND King's parcel layer
+(answered) lacks it. Plan and review: `tasks/todo-king-parcel-not-found.md`.
+
+**Tried / Decided:** found after the secret-audit deploy, in the worker log: `recover_deferred_mailing`
+fetched the same 4 parcels (10 leads) every tick, `4/4 fetches failed [HTTP200_no_parcelx4]`, then
+"rotated ... un-attempted". Phase-1 failures are never charged, and the comment relied on the
+breaker, which needs 30 failures; a 4-parcel backlog never reaches it (about 576 needless King
+requests a day). Reproduced live: a made-up PIN returns 200 with `cphContent_LblMsg` "No data
+found." and no parcel echo; real PINs still echo, so it was not a block or a layout change.
+Charging every no-echo page (Option B) was rejected with Codex: a 50-minute interstitial on a small
+backlog would give up on real parcels unseen by the breaker. Live-job and property-recovery settling
+left as follow-ups (property recovery is already bounded at 5 charged attempts).
+
+**Failed / Blocked:** the 4 production PINs are unknown: production DB reads are blocked for Claude.
+Two side findings judged Low: a `build_account_exports` connection drop on `pg_advisory_unlock`
+(no lock leak: the lock transaction pins one PgBouncer backend, and the next runs returned
+`built`, not `skipped`) and the 18.7 MB extract re-downloading per worker replica.
+
+**Caught & fixed:** Codex (plan): the GIS call must fit the tick deadline (one 30 s request, so only
+with >= 45 s left), keep it out of the mismatch path, keep the extract snapshot as provenance.
+Codex (diff): add an end-to-end test through the real phase 1, and a capped GIS page case. My own
+test harness: a sed-built file list with a trailing space ran the whole suite; two pytest runs on
+one test DB collided.
+
+**Facts learned:** eRealProperty's unknown-parcel answer is a 200 with `cphContent_LblMsg` "No data
+found." and an empty PARCEL div. In `batch_enrich_parcels_gis`, absence for King is "not in results
+and not in `county_unreached`" (503, error bodies, exceptions, attribute-empty and capped pages all
+land in `county_unreached`); a matched parcel with no street is still a result.
+
+---
+
 ## 2026-10-30/31 - Late delivery A-D, pypdf 6.21.4, auto-merge on, branch rule relaxed
 
 **Built / Shipped:** BE #555 (Phase A: the King and Tacoma owner sweeps never reached a held code violation since
@@ -62,6 +98,8 @@ updated by merge commits, no force push). Phase D dialer pushes and skip traces 
 **Facts learned:** gh auto-merge plus a strict up-to-date rule still needs a manual update-branch after every
 other merge. Results.skip_trace_status for a cache copy is hit/miss, not completed. The dialer outbox drains only
 pending rows and its insert is ON CONFLICT DO NOTHING per job and result.
+
+---
 
 ## 2026-10-30 — Client-side secret-exposure audit: no server secret leaked; the session tokens moved out of page JavaScript
 

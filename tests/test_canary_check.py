@@ -198,3 +198,125 @@ def test_an_empty_trustee_sale_probe_never_pages_whatever_the_status(connector, 
     _portal(monkeypatch, now=[], history=[])
     c = connector(record_types=("trustee_sale",), status="degraded")
     assert _probe(c, "trustee_sale") == ("degraded", [])
+
+
+# ── The run: no transaction held across probes; each unit's verdict is its own write ──
+
+def _run_only(monkeypatch, wanted):
+    """Run the real canary over just ``wanted`` [(connector, record_type)], in order.
+    Returns the alerts it sent, as (kind, key)."""
+    order = [(c.id, rt) for c, rt in wanted]
+    monkeypatch.setattr(health, "_canary_units", lambda rows: [
+        (r, rt) for cid, rt in order for r in rows if r.id == cid])
+    sent: list = []
+    import src.workers.ops_alerts as ops
+    monkeypatch.setattr(ops, "send_ops_alert", lambda kind, key, _s, _b: sent.append((kind, key)))
+    return sent
+
+
+def _status(c) -> str | None:
+    with SyncSessionLocal() as s:
+        return s.execute(text("SELECT health_status FROM county_connectors WHERE id = :i"),
+                         {"i": c.id}).scalar()
+
+
+def test_no_db_connection_is_held_while_a_portal_is_probed(connector, monkeypatch):
+    from src.db.session import sync_engine
+
+    held: list[int] = []
+
+    async def fetch(_cls, _f, _t, record_type=None):
+        held.append(sync_engine.pool.checkedout())
+        return ["r"]
+
+    a, b = connector(status="unknown"), connector(status="unknown")
+    _run_only(monkeypatch, [(a, "probate"), (b, "probate")])
+    monkeypatch.setattr(health, "_canary_scrape", fetch)
+
+    health._canary_check_impl()
+
+    assert held == [0, 0]
+    assert (_status(a), _status(b)) == ("healthy", "healthy")
+
+
+def test_a_run_stopped_by_its_time_limit_keeps_and_pages_what_it_finished(connector, monkeypatch):
+    from celery.exceptions import SoftTimeLimitExceeded
+
+    a, b = connector(), connector()
+
+    async def fetch(_cls, _f, _t, record_type=None):
+        raise RuntimeError("portal broke") if not stopped else SoftTimeLimitExceeded()
+
+    stopped = False
+    real_record = health._record_unit
+
+    def record(c):
+        nonlocal stopped
+        ok = real_record(c)
+        stopped = True                     # the next unit runs out of time
+        return ok
+
+    sent = _run_only(monkeypatch, [(a, "probate"), (b, "probate")])
+    monkeypatch.setattr(health, "_canary_scrape", fetch)
+    monkeypatch.setattr(health, "_record_unit", record)
+
+    with pytest.raises(SoftTimeLimitExceeded):
+        health._canary_check_impl()
+
+    assert (_status(a), _status(b)) == ("down", "healthy")
+    assert sent == [("canary", f"{a.county}/WA/probate")]
+
+
+def test_a_failed_write_loses_only_its_own_unit(connector, monkeypatch):
+    a, b = connector(), connector()
+    _portal(monkeypatch, now=RuntimeError("portal broke"), history=[])
+    sent = _run_only(monkeypatch, [(a, "probate"), (b, "probate")])
+    real_record = health._record_unit
+
+    def record(c):
+        if c.id == b.id:
+            raise ConnectionError("pooler dropped the connection")
+        return real_record(c)
+
+    monkeypatch.setattr(health, "_record_unit", record)
+
+    with pytest.raises(ConnectionError):
+        health._canary_check_impl()
+
+    assert (_status(a), _status(b)) == ("down", "healthy")
+    assert sent == [("canary", f"{a.county}/WA/probate")]   # b's verdict never landed: no page
+
+
+def test_a_connector_deleted_mid_run_is_not_paged(connector, monkeypatch):
+    a, b = connector(), connector(status="unknown")
+
+    async def fetch(_cls, _f, _t, record_type=None):
+        if fetch.calls == 0:
+            with SyncSessionLocal() as s:
+                s.execute(text("DELETE FROM county_connectors WHERE id = :i"), {"i": a.id})
+                s.commit()
+            fetch.calls += 1
+            raise RuntimeError("portal broke")
+        return ["r"]
+
+    fetch.calls = 0
+    sent = _run_only(monkeypatch, [(a, "probate"), (b, "probate")])
+    monkeypatch.setattr(health, "_canary_scrape", fetch)
+
+    health._canary_check_impl()
+
+    assert sent == []
+    assert _status(a) is None and _status(b) == "healthy"
+
+
+def test_types_sharing_a_connector_still_see_each_others_status(connector, monkeypatch):
+    """One status flag per connector: the second type's 'previous status' is the first's."""
+    c = connector(record_types=("probate", "pre_foreclosure"))
+    _portal(monkeypatch, now=lambda rt: RuntimeError("x") if rt == "probate" else RuntimeError("y"),
+            history=[])
+    sent = _run_only(monkeypatch, [(c, "probate"), (c, "pre_foreclosure")])
+
+    health._canary_check_impl()
+
+    assert _status(c) == "down"
+    assert sent == [("canary", f"{c.county}/WA/probate")]   # already down for the second type

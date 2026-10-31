@@ -440,27 +440,55 @@ def _canary_check_impl() -> None:
     # connector from users (it filters out `down` rows by default).
     register_connector_domains_from_db()
 
+    # Read, then let the session go before probing. A probe scrapes a county portal for
+    # minutes; one transaction held across every probe was dropped by the pooler, and
+    # the single commit at the end then lost every unit's result ("SSL SYSCALL error:
+    # EOF detected", 2026-10-31). The rows stay usable detached (expire_on_commit=False),
+    # so units sharing a connector still see each other's in-memory status.
     with SyncSessionLocal() as db:
         all_connectors = db.execute(
             select(CountyConnector).where(CountyConnector.active)
         ).scalars().all()
+        db.expunge_all()
 
-        units = _canary_units(all_connectors)
-        _logger.info("Canary: checking %d (connector, record type) pairs of %d connectors",
-                     len(units), len(all_connectors))
+    units = _canary_units(all_connectors)
+    _logger.info("Canary: checking %d (connector, record type) pairs of %d connectors",
+                 len(units), len(all_connectors))
 
-        # M6: alert payloads queued here, dispatched only AFTER the commit below.
-        pending_alerts: list[tuple[str, str, str, str]] = []
-        for connector, record_type in units:
-            _probe_unit(connector, record_type, pending_alerts)
-            connector.last_checked = datetime.now(UTC)
-
-        db.commit()
-
-    # M6: alerts only after the health statuses durably committed (Codex P2).
+    # M6: a unit's alerts are queued only once its status is durably written (Codex P2),
+    # and the queued ones go out even if a later unit stops the run.
     from src.workers.ops_alerts import send_ops_alert
-    for kind, key, subject, body in pending_alerts:
-        send_ops_alert(kind, key, subject, body)
+
+    committed_alerts: list[tuple[str, str, str, str]] = []
+    try:
+        for connector, record_type in units:
+            unit_alerts: list[tuple[str, str, str, str]] = []
+            _probe_unit(connector, record_type, unit_alerts)
+            connector.last_checked = datetime.now(UTC)
+            if _record_unit(connector):
+                committed_alerts.extend(unit_alerts)
+            else:
+                _logger.warning("Canary %s/%s %s: connector row is gone; result not recorded",
+                                connector.county, connector.state, record_type)
+    finally:
+        for kind, key, subject, body in committed_alerts:
+            send_ops_alert(kind, key, subject, body)
+
+
+def _record_unit(connector) -> bool:
+    """Write one unit's verdict in its own short transaction. False if the row is gone."""
+    from sqlalchemy import update
+
+    from src.db.models import CountyConnector
+    from src.db.session import SyncSessionLocal
+
+    with SyncSessionLocal() as db:
+        result = db.execute(
+            update(CountyConnector).where(CountyConnector.id == connector.id)
+            .values(health_status=connector.health_status, last_checked=connector.last_checked)
+        )
+        db.commit()
+    return result.rowcount == 1
 
 
 def _probe_unit(connector, record_type: str, pending_alerts: list) -> None:

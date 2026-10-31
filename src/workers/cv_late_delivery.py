@@ -60,12 +60,20 @@ LATE_KEY = "late_delivery"
 CONTACTS_KEY = "contacts"
 CONTACTS_PENDING = "pending"
 # late_delivery.dialer: "pending" (the run's scraper pushes to a dialer; not decided yet), then
-# exactly one terminal state: "pushed", "via_sweep" (the run's dialer push has not run yet; the
-# sweep includes the row), "skipped_overlap" (the run was pushed too close to this delivery to
-# know whether that push already carried the row: never risk a duplicate import), "not_ready"
-# (no dialable contact when decided), "not_eligible" (no Business+ plan or no destination now).
+# exactly one terminal state: "pushed"; "via_sweep" (the run's sweep sends or sent it); for a
+# generic webhook only, "skipped_overlap" (pushed too close to the run's own push to know
+# whether that push carried it) and "send_failed" (the request could not be queued; never
+# re-sent, a webhook has no per-lead idempotency); "not_ready" (no dialable contact when
+# decided); "not_eligible" (no Business+ plan or no destination now).
 DIALER_KEY = "dialer"
 DIALER_PENDING = "pending"
+
+
+def uses_outbox(deliver) -> bool:
+    """The run's dialer is a native vendor that pushes from the idempotent outbox."""
+    from src.workers.dialer_connectors import get_connector
+
+    return isinstance(deliver, dict) and get_connector(deliver.get("dialer_type")).uses_outbox
 
 
 def has_dialer_destination(deliver) -> bool:
@@ -387,8 +395,17 @@ def push_late_dialer() -> int:
                     state = "not_eligible"
                 elif run["dialer_pushed_at"] is None:
                     state = "via_sweep"
-                elif delivered_at <= run["dialer_pushed_at"] + _SWEEP_OVERLAP:
-                    state = "skipped_overlap"
+                elif not uses_outbox(config.deliver):
+                    # A generic webhook keeps no per-lead record, so the run's push is judged by
+                    # time (Codex D2 P1): delivered before the run's claim, the sweep read it;
+                    # inside the margin, unknown: skipped, never risked twice (the sweep's own
+                    # at-most-once rule: a lost push is recoverable by export, a duplicate CRM
+                    # import is not). An outbox vendor needs neither: its insert is idempotent
+                    # per job and result, so a lead the sweep already queued is a no-op.
+                    if delivered_at < run["dialer_pushed_at"]:
+                        state = "via_sweep"
+                    elif delivered_at <= run["dialer_pushed_at"] + _SWEEP_OVERLAP:
+                        state = "skipped_overlap"
                 if state is None:
                     in_flight = db.execute(sa_text(_TRACE_IN_FLIGHT_SQL), params).scalar()
                     if in_flight and datetime.now(UTC) - delivered_at < _DIALER_WAIT:
@@ -412,8 +429,12 @@ def push_late_dialer() -> int:
                 try:
                     _send_to_dialer(db, db.get(Job, row["job_id"]), config, lead)
                 except Exception:
+                    # Outbox vendor: the insert is idempotent, so try again next tick. Generic
+                    # webhook: the publish may have gone out before the error, so never again.
                     db.rollback()
-                    db.execute(sa_text(_MARK_DIALER_SQL), {**params, "state": DIALER_PENDING})
+                    retry = uses_outbox(config.deliver)
+                    db.execute(sa_text(_MARK_DIALER_SQL),
+                               {**params, "state": DIALER_PENDING if retry else "send_failed"})
                     db.commit()
                     raise
                 pushed += 1

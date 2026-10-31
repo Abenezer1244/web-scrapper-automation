@@ -79,13 +79,66 @@ async def test_a_run_not_pushed_yet_leaves_it_to_the_sweep(db, business_user):
     assert await _dialer(db, rid) == "via_sweep" and await _outbox(db, job) == set()
 
 
+_GENERIC = {"format": "csv", "emails": [], "dialer_webhook_url": "https://dialer.example/hook"}
+
+
 @pytest.mark.asyncio
-async def test_a_run_pushed_right_before_the_delivery_is_never_pushed_again(db, business_user):
-    """The sweep reads its rows right after it claims the run; this one may be in that push."""
+async def test_an_outbox_vendor_is_pushed_even_right_after_the_runs_push(db, business_user):
+    """Codex D2 P1: the outbox insert is idempotent per job and result, so no overlap guess is
+    needed (a lead the sweep already queued would be a no-op)."""
     job = await _run(db, business_user, pushed_hours_ago=0.0)
     rid = await _held_row(db, business_user, job, _held(), phone=PHONE)
     late.deliver_completed_held_rows()
-    assert await _dialer(db, rid) == "skipped_overlap" and await _outbox(db, job) == set()
+    assert await _dialer(db, rid) == "pushed" and await _outbox(db, job) == {rid}
+
+
+@pytest.mark.asyncio
+async def test_a_generic_webhook_pushed_right_before_the_delivery_is_never_pushed_again(
+        db, business_user, monkeypatch):
+    """No per-lead record: inside the margin the run's own push may carry it; never twice."""
+    from src.workers import webhook_delivery
+
+    sent = []
+    monkeypatch.setattr(webhook_delivery.deliver_job_webhook, "delay", lambda *a, **k: sent.append(a))
+    job = await _run(db, business_user, deliver=_GENERIC, pushed_hours_ago=0.0)
+    rid = await _held_row(db, business_user, job, _held(), phone=PHONE)
+    late.deliver_completed_held_rows()
+    assert await _dialer(db, rid) == "skipped_overlap" and sent == []
+
+
+@pytest.mark.asyncio
+async def test_a_generic_lead_delivered_before_the_runs_push_was_the_sweeps(db, business_user, monkeypatch):
+    from src.workers import webhook_delivery
+
+    sent = []
+    monkeypatch.setattr(webhook_delivery.deliver_job_webhook, "delay", lambda *a, **k: sent.append(a))
+    job = await _run(db, business_user, deliver=_GENERIC, pushed_hours_ago=None)
+    rid = await _held_row(db, business_user, job, _held(), phone=PHONE)
+    late.deliver_completed_held_rows()                              # delivered now; run not pushed yet
+    await db.execute(text("UPDATE jobs SET dialer_pushed_at = now() + interval '1 hour' WHERE id = :j"),
+                     {"j": job})
+    await db.execute(text("UPDATE results SET enrichment_data = jsonb_set(enrichment_data::jsonb, "
+                          "'{late_delivery,dialer}', '\"pending\"')::json WHERE id = :i"), {"i": rid})
+    await db.commit()
+    late.push_late_dialer()
+    assert await _dialer(db, rid) == "via_sweep" and sent == []
+
+
+@pytest.mark.asyncio
+async def test_a_generic_send_that_raised_is_never_sent_again(db, business_user, monkeypatch):
+    """Codex D2 P1: the publish may have gone out before the error; a webhook has no per-lead key."""
+    from src.workers import webhook_delivery
+
+    def boom(*a, **k):
+        raise RuntimeError("broker acked, client raised")
+
+    monkeypatch.setattr(webhook_delivery.deliver_job_webhook, "delay", boom)
+    job = await _run(db, business_user, deliver=_GENERIC)
+    rid = await _held_row(db, business_user, job, _held(), phone=PHONE)
+    late.deliver_completed_held_rows()
+    assert await _dialer(db, rid) == "send_failed"
+    late.push_late_dialer()
+    assert await _dialer(db, rid) == "send_failed"
 
 
 @pytest.mark.asyncio

@@ -8,6 +8,7 @@ and being listed in the DB.
 import importlib
 from collections.abc import Callable
 from typing import TYPE_CHECKING
+from urllib.parse import urlparse
 
 from sqlalchemy import func, select
 
@@ -196,6 +197,10 @@ def connector_scraper_class(connector) -> type | None:
         return None
 
 
+_SKAGIT_RECORDING_HOSTS = frozenset({"www.skagitcounty.net", "skagitcounty.net",
+                                     "classic.skagitcountywa.gov"})
+
+
 def _detect_template(base_url: str):
     """Detect if a URL matches a known recorder platform template.
 
@@ -246,8 +251,11 @@ def _detect_template(base_url: str):
         from src.scrapers.templates.acclaimweb import AcclaimWebScraper
         return AcclaimWebScraper
 
-    # Skagit County Recording Search — custom ASP.NET portal
-    if "skagitcounty.net" in url_lower and "recording" in url_lower:
+    # Skagit County Recording Search — custom ASP.NET portal. The county moved it from
+    # skagitcounty.net to classic.skagitcountywa.gov (the old host 301s there; 2026-10-31).
+    # Exact hosts, never a substring: the URL is connector data.
+    parsed = urlparse(url_lower)
+    if (parsed.hostname or "") in _SKAGIT_RECORDING_HOSTS and "recording" in parsed.path:
         from src.scrapers.templates.skagit_recording import SkagitRecordingScraper
         return SkagitRecordingScraper
 

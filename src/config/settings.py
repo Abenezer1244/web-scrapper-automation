@@ -265,7 +265,8 @@ class Settings(BaseSettings):
 
     # ─── Worker scaling ──────────────────────────────────────────────────────
     WORKER_CONCURRENCY: int = 2
-    WORKER_QUEUES: str = "scrape,enrichment"
+    # start.sh reads WORKER_QUEUES from the environment; this mirrors its default.
+    WORKER_QUEUES: str = "celery,scrape-priority,scrape,enrichment"
 
     # ─── Playwright ───────────────────────────────────────────────────────────
     PLAYWRIGHT_HEADLESS: bool = True

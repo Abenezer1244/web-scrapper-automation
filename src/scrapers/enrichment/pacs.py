@@ -305,6 +305,32 @@ def post_search(session: requests.Session, url: str, data: dict, timeout: float)
     return session.get(target, timeout=timeout, allow_redirects=False)
 
 
+_SEARCH_TYPE_SELECT_RE = re.compile(
+    r'<select[^>]*\bname="propertySearchOptions\$searchType"[^>]*>(.*?)</select>', re.S | re.I)
+
+
+def search_type_field(form_html: str, wanted: str) -> dict[str, str] | None:
+    """The `searchType` field a postback must carry for a `wanted` search
+    ("account-number" for a parcel, "owner" for a name), read from the form itself.
+
+    Most portals only read the search field the form's mode dropdown selects, and our
+    postback never sent the mode: Clallam, Grant, Jefferson, Chelan and Island answered
+    every parcel search with the empty form and "You must enter search criteria."
+    (verified live 2026-10-31; Benton has no owner mode, so its default happened to
+    fit). Grant's default mode is `owner`, so a browser-style "submit the selected
+    option" would still search the wrong field: the mode is chosen explicitly.
+
+    {} when the form has no mode dropdown (that portal reads the field we fill); None
+    when it has one that does not offer `wanted`, because posting would run a
+    different kind of search and read its answer as ours.
+    """
+    m = _SEARCH_TYPE_SELECT_RE.search(form_html)
+    if m is None:
+        return {}
+    offered = re.findall(r'<option[^>]*\bvalue="([^"]*)"', m.group(1), re.I)
+    return {"propertySearchOptions$searchType": wanted} if wanted in offered else None
+
+
 # What one owner-name lookup came to. FAILED means the portal never gave an answer
 # (an error, a non-200, a page that is neither results nor "None found"); NO_MATCH
 # means it answered and no single row named this owner with an address. Only those
@@ -364,10 +390,14 @@ def lookup_pacs_by_name(pacs_url: str, owner_name: str) -> tuple[str, dict | Non
         vsg = re.search(r'__VIEWSTATEGENERATOR.*?value="([^"]+)"', r0.text)
         if not vs:
             return None, None
+        mode = search_type_field(r0.text, "owner")
+        if mode is None:
+            return None, None   # the form cannot run a name search: not an answer
         data = {
             "__VIEWSTATE": vs.group(1),
             "__EVENTVALIDATION": ev.group(1) if ev else "",
             "__VIEWSTATEGENERATOR": vsg.group(1) if vsg else "",
+            **mode,
             "propertySearchOptions$ownerName": owner_name,
             "propertySearchOptions$search": "Search",
         }

@@ -19,6 +19,36 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-10-31 — PACS mailing worked in 1 of 7 counties: the search never said which search it was
+
+**Built / Shipped:** branch `fix/pacs-search-mode`. `pacs.search_type_field`: the parcel search posts
+`searchType=account-number` and the owner-name search `owner`, read from each portal's own form (defer
+if it lacks the mode); the results parser reads a "Geographic ID" column; an id with letters (Island)
+defers instead of settling `parcel_not_found` unasked; a prefix-only match is `ambiguous`; an unreadable
+or truncated identity row is `unparsed`. Plan and review: `tasks/todo-pacs-search-mode.md`.
+
+**Tried / Decided:** started from one log line (`pacs_clallam: 3 unparsed pages in a row; layout
+drift`). Reproduced live with the module's own functions: Clallam, Grant, Jefferson, Chelan and Island
+all answered our postback with "You must enter search criteria."; Benton worked only because it has no
+owner mode; Whatcom was down. A browser-style "submit every selected option" was rejected with Codex:
+Grant's default mode is `owner`. A Clallam 12-digit -> 16-digit `+0000` equivalence was rejected as
+unproven; prefix-only rows are `ambiguous` (charged, capped), not settled and not free to re-ask.
+
+**Failed / Blocked:** cannot see which Clallam spelling our leads carry, or how many leads already gave
+up or were wrongly settled: production reads are blocked for Claude. Island's correct query format for
+letter-bearing ids is unknown (a stripped id returns no rows). Remediation of the affected leads needs
+an owner-approved repair; `scripts/requeue_gis_mailing_recovery.py` skips exactly those rows.
+
+**Caught & fixed:** Codex (plan): explicit mode only when offered, the owner path's identical omission,
+unreadable cells must not settle. Codex (diff): truncated data rows; a Benton "no owner mode -> no POST"
+test. Fixture ViewState decoded and checked for the redacted personal data before commit.
+
+**Facts learned:** the PACS module docstring's "verified on each portal 2026-10-02" meant the forms
+loaded, not that a parcel chain resolved; only Benton's chain was ever demonstrated. Clallam runs PACS
+9.0.40.29, the others 9.0.50.1004; the behaviour is the same on both.
+
+---
+
 ## 2026-10-31 - Late delivery D1 and D2 shipped; late delivery A-D is complete
 
 **Built / Shipped:** BE #568 (D1, 1568a56d): a held code violation delivered late gets the paid skip
@@ -49,6 +79,8 @@ will appear in the worker tick stats (`delivered`, `contacts_requested`, `dialer
 
 **Facts learned:** tests that pin source with `inspect.getsource` break on behaviour-neutral
 refactors; grep tests for the old call text before wrapping a function's calls.
+
+---
 
 ## 2026-10-31 — Live King jobs settle a PIN King does not carry; owner recovery stops re-asking
 

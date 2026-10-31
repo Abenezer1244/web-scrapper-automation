@@ -65,6 +65,7 @@ from src.scrapers.enrichment.pacs import (
     pacs_detail_url,
     parse_pacs_detail_html,
     post_search,
+    search_type_field,
 )
 from src.scrapers.enrichment.snohomish_assessor_roll import (
     AMBIGUOUS,
@@ -130,7 +131,9 @@ def _reserve_s() -> float:
     return 2 * (_PACE_S + _JITTER_S + _TIMEOUT_S)
 _UNPARSED_STREAK_LIMIT = 3
 _BLOCK_STATUSES = (403, 429)
-_GEO_HEADER_RE = re.compile(r"geo\s*id|parcel", re.I)
+# Benton heads the column "Parcel # / Geo ID"; Clallam and Island head it "Geographic ID"
+# (live 2026-10-31), which `geo\s*id` alone never matched.
+_GEO_HEADER_RE = re.compile(r"geo(?:graphic)?\s*id|parcel", re.I)
 
 
 def _http_get(session: requests.Session, url: str) -> requests.Response:
@@ -158,6 +161,12 @@ def parse_results(html: str, parcel_key: str) -> tuple[str, str | None]:
     whose cell normalises to our parcel is required. A page with rows for OTHER
     parcels only (the portal's prefix search) is ``parcel_not_found``; several
     rows for ours is ``ambiguous``.
+
+    Two pages are NOT a settled "not found" (Codex): a row whose Geo ID only EXTENDS
+    ours (Clallam prints 16 digits, `0630115504300000`, where another source has the
+    12-digit `063011550430`; which one a lead carries is not proven, so it is
+    ``ambiguous``: charged and capped, never equated, never re-fetched for free); and
+    a row whose Geo ID cell cannot be read at all (``unparsed``).
     """
     soup = BeautifulSoup(html, "html.parser")
     table = soup.find("table", id=re.compile(r"resultsTable"))
@@ -170,16 +179,30 @@ def parse_results(html: str, parcel_key: str) -> tuple[str, str | None]:
     if geo_col is None:
         return UNPARSED, None
     hits: list[str | None] = []
+    extends_ours = unreadable = False
     for tr in table.find_all("tr"):
         tds = tr.find_all("td")
         if len(tds) <= geo_col:
+            # A header row has no <td>; the paging footer ("Page: 1") is one spanning cell.
+            # Anything else this short is a data row we could not read the identity of,
+            # which must not let the page read as a settled "not found" (Codex).
+            unreadable = unreadable or len(tds) > 1
             continue
-        if normalize_pacs_parcel(tds[geo_col].get_text(" ", strip=True)) != parcel_key:
+        cell = normalize_pacs_parcel(tds[geo_col].get_text(" ", strip=True))
+        if cell is None:
+            unreadable = True
+            continue
+        if cell != parcel_key:
+            extends_ours = extends_ours or cell.startswith(parcel_key)
             continue
         link = tr.find("a", href=re.compile(r"prop_id=\d+", re.I))
         m = re.search(r"prop_id=(\d{1,12})", link["href"], re.I) if link else None
         hits.append(m.group(1) if m else None)
     if not hits:
+        if unreadable:
+            return UNPARSED, None
+        if extends_ours:
+            return AMBIGUOUS, None
         return PARCEL_NOT_FOUND, None
     if len(hits) > 1:
         return AMBIGUOUS, None
@@ -249,9 +272,11 @@ def query_digits(value: object) -> str:
 
 
 def _resolve_one(session, site: PacsSite, tokens: dict, parcel_key: str, still_held,
-                 query: str | None = None) -> tuple[MailingAnswer, str | None]:
-    """Search POST, then detail GET, for one parcel. (answer, block_reason)."""
-    data = {**tokens, "propertySearchOptions$geoid": query or parcel_key,
+                 query: str | None = None, mode: dict | None = None
+                 ) -> tuple[MailingAnswer, str | None]:
+    """Search POST, then detail GET, for one parcel. (answer, block_reason).
+    `mode` is the form's search-mode field (pacs.search_type_field)."""
+    data = {**tokens, **(mode or {}), "propertySearchOptions$geoid": query or parcel_key,
             "propertySearchOptions$search": "Search"}
     resp, blocked = _request(lambda: _http_post(session, site.search_url, data), still_held)
     if blocked or resp is None:
@@ -292,15 +317,25 @@ def resolve_mailing(county: str, parcel_ids: list[str], *, time_budget_s: float 
         return out
     by_key: dict[str, list[str]] = {}
     queries: dict[str, str] = {}  # key -> the longest caller spelling (zeros kept)
+    unsupported = 0
     for pid in parcel_ids:
         key = normalize_pacs_parcel(pid)
-        if key is None:
-            out[pid] = MailingAnswer(PARCEL_NOT_FOUND)
+        if key is None and re.search(r"[A-Za-z]", str(pid or "")):
+            # A real id in a format this module cannot key (Island prints
+            # `R03213-049-3470`) was never asked about. It used to be recorded
+            # PARCEL_NOT_FOUND - a settled answer - with no request at all. It stays
+            # source_unavailable: deferred, not charged.
+            unsupported += 1
+        elif key is None:
+            out[pid] = MailingAnswer(PARCEL_NOT_FOUND)   # empty or all zeros: no parcel
         else:
             by_key.setdefault(key, []).append(pid)
             q = query_digits(pid)
             if len(q) > len(queries.get(key, "")):
                 queries[key] = q
+    if unsupported:
+        _logger.info("%s: %d parcel id(s) in a format this lookup cannot search; deferred",
+                     site.source_key, unsupported)
     if not by_key:
         return out
 
@@ -326,6 +361,11 @@ def resolve_mailing(county: str, parcel_ids: list[str], *, time_budget_s: float 
         if tokens is None:
             _logger.warning("%s: search form unreadable; %d parcel(s) deferred", site.source_key, len(by_key))
             return out
+        mode = search_type_field(resp.text, "account-number")
+        if mode is None:
+            _logger.warning("%s: search form offers no account-number search; %d parcel(s) "
+                            "deferred", site.source_key, len(by_key))
+            return out
         streak = 0
         reserve = _reserve_s()
         for i, (key, callers) in enumerate(by_key.items()):
@@ -335,7 +375,7 @@ def resolve_mailing(county: str, parcel_ids: list[str], *, time_budget_s: float 
             if not admission.still_held():
                 break
             answer, blocked = _resolve_one(session, site, tokens, key, admission.still_held,
-                                           query=queries[key])
+                                           query=queries[key], mode=mode)
             if blocked:
                 record_source_blocked(site.source_key, f"PACS {blocked}")
                 _logger.warning("%s blocked (%s); pass stopped", site.source_key, blocked)

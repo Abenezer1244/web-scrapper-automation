@@ -92,7 +92,7 @@ _CANDIDATES_SQL = f"""
             (lower(sc.county) = ANY(:counties)
              AND {_ED}->>'mailing_recovery_outcome' = 'error'
              AND {_ATTEMPTS} >= :max_attempts)
-         OR (lower(sc.county) = 'island'
+         OR (lower(sc.county) = 'island' AND 'island' = ANY(:counties)
              AND {_ED}->>'mailing_recovery_outcome' = 'parcel_not_found'
              AND {_ED}->>'mailing_source' = '{ISLAND_SOURCE}'
              AND btrim(r.parcel_id) ~ '[A-Za-z]')
@@ -145,10 +145,10 @@ def commit_has_fix(sha: str) -> bool:
     return "search_type_field" in src
 
 
-def select_candidates(db) -> list:
-    """Both cohorts, as read now. Every later write re-checks its own row."""
+def select_candidates(db, counties: tuple[str, ...] = RETRY_COUNTIES) -> list:
+    """Both cohorts in ``counties``, as read now. Every later write re-checks its own row."""
     rows = db.execute(text(_CANDIDATES_SQL),
-                      {"counties": list(RETRY_COUNTIES), "max_attempts": _MAX_ATTEMPTS}).all()
+                      {"counties": list(counties), "max_attempts": _MAX_ATTEMPTS}).all()
     db.rollback()   # release the read snapshot
     return rows
 
@@ -233,11 +233,12 @@ def apply_rows(db, rows: list, stats: dict, lease: Lease | None = None) -> None:
         stats["repaired" if result.rowcount else "skipped_changed"] += 1
 
 
-def repair(db, *, apply: bool, report: Path, lease: Lease | None = None) -> dict:
+def repair(db, *, apply: bool, report: Path, lease: Lease | None = None,
+           counties: tuple[str, ...] = RETRY_COUNTIES) -> dict:
     """Select, report, then (only with ``apply``) repair. Returns counts."""
     if lease is not None:
         lease.check()
-    rows = select_candidates(db)
+    rows = select_candidates(db, counties)
     stats: dict = {
         "candidates": len(rows),
         "by_cohort": dict(Counter(r.cohort for r in rows)),
@@ -269,13 +270,19 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--report", type=Path,
                     default=Path(f"repair_pacs_mailing_{datetime.now(UTC):%Y%m%dT%H%M%SZ}.jsonl"),
                     help="JSON-lines evidence file (one line per candidate row)")
+    # Clallam's leads carry 12-digit ids the portal only prints extended to 16 (#575
+    # reads that as ambiguous): repairing them before that is solved would spend their
+    # fresh attempts on the same answer and mark them so they are never repaired again.
+    ap.add_argument("--county", action="append", choices=RETRY_COUNTIES, default=None,
+                    help="repair only this county (repeatable; default: every PACS county)")
     args = ap.parse_args(argv)
+    counties = tuple(dict.fromkeys(args.county)) if args.county else RETRY_COUNTIES
 
     from src.db.session import system_sync_session
 
     if not args.apply:
         with system_sync_session() as db:
-            stats = repair(db, apply=False, report=args.report)
+            stats = repair(db, apply=False, report=args.report, counties=counties)
         print(json.dumps(stats, indent=2))
         print(f"evidence -> {args.report}")
         return 0
@@ -304,7 +311,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         with system_sync_session() as db:
             db.execute(text(f"SET statement_timeout = '{_STATEMENT_TIMEOUT_S}s'"))
-            stats = repair(db, apply=True, report=args.report, lease=lease)
+            stats = repair(db, apply=True, report=args.report, lease=lease,
+                           counties=counties)
     except LeaseLostError as exc:
         print(f"stopped: {exc}. Rows written before this point are listed as repaired in the "
               "database; rerun later to finish (repaired rows are never selected again).")

@@ -79,11 +79,11 @@ async def _ed(db, rid: str) -> dict:
     return (await db.execute(text("SELECT enrichment_data FROM results WHERE id = :i"), {"i": rid})).scalar()
 
 
-def _repair(tmp_path, *, apply: bool) -> dict:
+def _repair(tmp_path, *, apply: bool, counties: tuple[str, ...] = rp.RETRY_COUNTIES) -> dict:
     from src.db.session import system_sync_session
 
     with system_sync_session() as sdb:
-        return rp.repair(sdb, apply=apply, report=tmp_path / "evidence.jsonl")
+        return rp.repair(sdb, apply=apply, report=tmp_path / "evidence.jsonl", counties=counties)
 
 
 def _sweep_selects(county: str, parcel: str) -> bool:
@@ -414,3 +414,34 @@ async def test_ownership_is_proven_before_every_write_not_only_at_renewal(db, bu
     assert rp.MARKER in await _ed(db, written)
     assert rp.MARKER not in await _ed(db, held_back)
     assert {written, held_back} == {first, second}
+
+
+async def test_a_county_filter_repairs_only_that_county(db, business_user, tmp_path):
+    jeff = await _row(db, business_user, "jefferson", _GAVE_UP, parcel="901013015")
+    clallam = await _row(db, business_user, "clallam", _GAVE_UP)
+    island = await _row(db, business_user, "island", _FALSE_NOT_FOUND, parcel=_ISLAND_ID)
+    before = {clallam: await _ed(db, clallam), island: await _ed(db, island)}
+
+    stats = await asyncio.to_thread(_repair, tmp_path, apply=True, counties=("jefferson",))
+
+    assert stats["candidates"] == 1 and stats["repaired"] == 1
+    assert (await _ed(db, jeff))[rp.MARKER]["cohort"] == "A"
+    assert {clallam: await _ed(db, clallam), island: await _ed(db, island)} == before
+
+    stats = await asyncio.to_thread(_repair, tmp_path, apply=False, counties=("jefferson", "island"))
+    assert stats["by_cohort"] == {"B": 1}                   # jefferson is done; clallam still excluded
+
+
+async def test_the_county_option_reaches_the_selection(db, business_user, tmp_path):
+    await _row(db, business_user, "jefferson", _GAVE_UP, parcel="901013015")
+    await _row(db, business_user, "clallam", _GAVE_UP)
+    report = tmp_path / "cli.jsonl"
+
+    code = await asyncio.to_thread(
+        rp.main, ["--county", "jefferson", "--county", "jefferson", "--report", str(report)])
+
+    assert code == 0
+    lines = [json.loads(x) for x in report.read_text(encoding="utf-8").splitlines()]
+    assert [x["county"] for x in lines] == ["jefferson"]
+    with pytest.raises(SystemExit):
+        rp.main(["--county", "benton"])                     # its lookups worked: not a repair county

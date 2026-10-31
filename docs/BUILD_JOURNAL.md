@@ -6378,7 +6378,7 @@ filter/display parity for every month of 2026-2028, bill years 1990-2030, min/ma
 - ⏭️ The `security-codex-reminder` hook is still skipped pending Codex's interactive `trusted_hash`
   approval. Needs one interactive `codex` run from a real terminal. Low value now that AGENTS.md
   carries the same content.
-- ⏭️ Account is now `memiki70@gmail.com`; `zowiegirma29@gmail.com` quota resets ~07:06 daily.
+- ⏭️ Account is now `memiki70@gmail.com`; `[redacted-email]` quota resets ~07:06 daily.
 
 ## 2026-09-07 — the watched account moved 1007 → 1001, and what that cost to prove
 
@@ -8851,7 +8851,7 @@ keyed on email fingerprint not IP, fail-closed) + `release_once()` on enqueue fa
 pre-check duplicate branch and the `email_hmac` race branch only (`_is_duplicate_email_violation` =
 23505 + email_hmac substring; verified constraint `users_email_hmac_key`, mig 053).
 **Tried / Decided:** Diagnosed the actual report first (read-only prod lookup, `scripts/diag_check_user_email.py`
-via `railway run`): `mikitsegaye29@gmail.com` already had an account since 2026-03-23 → duplicate branch →
+via `railway run`): `[redacted-email]` already had an account since 2026-03-23 → duplicate branch →
 **expected** generic 400, not a bug. Welcome email stays inline (success path, no enumeration concern);
 duplicate notice is Celery (failure path, must not leak timing). Gate kept in request path (~1ms, async
 redis client healthy there) rather than in the task (asyncio.run + cached aioredis client tied to a dead

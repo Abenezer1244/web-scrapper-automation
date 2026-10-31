@@ -8,7 +8,7 @@ decisions and three deliberately-deferred items. A fresh session can start from 
 
 ## 1. The goal
 
-The user (account `zowiegirma29@gmail.com`, user id `01dc9396-9a36-49b5-9b98-5343ec107232`) reported
+The user (account `[redacted-email]`, user id `01dc9396-9a36-49b5-9b98-5343ec107232`) reported
 data-quality problems in the leads under the scraper config **"Test 2"** (`fde53328`, pierce / WA /
 `pre_foreclosure`, job **`e72bd6bf-6bf4-4562-abe9-9de3375d5380`**, 217 rows, window 06/03–09/01/2026,
 scraped 2026-09-02):

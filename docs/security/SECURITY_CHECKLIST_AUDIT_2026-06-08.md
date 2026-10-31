@@ -84,9 +84,9 @@
 - **Fix:** App-layer encryption (e.g. `pgcrypto` or app-side AEAD) for `results.phone/email`, `skip_trace_cache.raw_response`, and stored integration secrets/tokens. Key via env/KMS.
 
 ### H4 — Privileged admin account uses a weak, hardcoded password · Control 17
-- **Evidence:** `admin@bridgeleads.io` / `BridgeLeads2026!` hardcoded in `scripts/diag_is_pro.py:14`, `scripts/ui_county_audit.py:36`, `scripts/saas_county_audit.py:30`, `scripts/test_counties_systematic.py:22`, `scripts/e2e_chelan_probate.py:13`.
-- **Verified correction:** Claude's agent called this "CRITICAL — in git history / cloned repos." **That is false.** `git log --all -S "BridgeLeads2026!"` returns nothing, and `git ls-files` shows these 5 scripts are **untracked local files**. The only git-tracked password (`scripts/e2e_all_counties.py:37`) belongs to an **ephemeral random-uuid test account** → Low.
-- **Why still High:** A real, privileged production admin account has a weak guessable password (`BridgeLeads2026!`), and `scripts/` is **not gitignored** — one `git add scripts/` from committing the admin cred. Two real problems: weak admin secret + near-miss exposure path.
+- **Evidence:** `admin@bridgeleads.io` / `[REDACTED 2026-10-31: leaked credential, must be rotated]` hardcoded in `scripts/diag_is_pro.py:14`, `scripts/ui_county_audit.py:36`, `scripts/saas_county_audit.py:30`, `scripts/test_counties_systematic.py:22`, `scripts/e2e_chelan_probate.py:13`.
+- **Verified correction:** Claude's agent called this "CRITICAL — in git history / cloned repos." **That is false.** `git log --all -S "[REDACTED 2026-10-31: leaked credential, must be rotated]"` returns nothing, and `git ls-files` shows these 5 scripts are **untracked local files**. The only git-tracked password (`scripts/e2e_all_counties.py:37`) belongs to an **ephemeral random-uuid test account** → Low.
+- **Why still High:** A real, privileged production admin account has a weak guessable password (`[REDACTED 2026-10-31: leaked credential, must be rotated]`), and `scripts/` is **not gitignored** — one `git add scripts/` from committing the admin cred. Two real problems: weak admin secret + near-miss exposure path.
 - **Fix:** (1) Rotate the `admin@bridgeleads.io` password to a strong random secret. (2) Move all script creds to env / `.env.test`. (3) Add `scripts/**_audit.py`, `scripts/e2e_*.py`, `scripts/diag_*.py` patterns to `.gitignore` or strip the literals. (4) Enable MFA on admin (see H2).
 
 ---

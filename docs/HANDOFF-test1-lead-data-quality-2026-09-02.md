@@ -48,7 +48,7 @@ the Test 2 branch touched the same file) and possibly `src/scrapers/enrichment/c
 
 The user asked for an end-to-end root-cause investigation of scraper **"Test 1"** (config
 `be5dc73b-4db1-42d7-bd51-e01a80b9c4b6`, job `1e358ca8-edbd-489b-850f-eaadbde67e07`,
-pierce/WA/probate, 110 rows, account `zowiegirma29@gmail.com`, Pro trial): leads with missing party
+pierce/WA/probate, 110 rows, account `[redacted-email]`, Pro trial): leads with missing party
 name, parcel, property address, mailing address, phone, email, and possible placeholder data.
 
 **Verified at the sources — these are NOT bugs, do not re-investigate:**

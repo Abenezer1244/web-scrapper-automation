@@ -106,7 +106,7 @@ The app encrypts `users.email` and needs the real `FIELD_ENCRYPTION_KEY` (Railwa
    is partial-synced, missing `@types/react`), set `.env.local`
    NEXT_PUBLIC_API_URL=http://localhost:8000 + NEXTAUTH_URL=http://localhost:3000
    (+ NEXTAUTH_SECRET from main checkout), then next dev :3000. Admin:
-   admin@bridgeleads.io / BridgeLeads2026! (401s with the fallback key; works under `railway run`).
+   admin@bridgeleads.io / [REDACTED 2026-10-31: leaked credential, must be rotated] (401s with the fallback key; works under `railway run`).
 4. CLEAN UP after: kill servers, delete copied `.env`/`.env.local` (hold secrets; gitignored
    but remove). Zero writes to prod (login + GET only).
 

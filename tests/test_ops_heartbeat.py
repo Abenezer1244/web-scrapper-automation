@@ -138,6 +138,24 @@ def test_plain_http_off_the_machine_is_refused_before_any_request(monkeypatch, c
 
 
 @pytest.mark.parametrize(
+    "url",
+    [
+        # urlsplit raises on both, and the NFKC error message quotes the netloc (Codex P2).
+        f"https://[::1{_TOKEN}/x",
+        f"https://{_TOKEN}／evil.example/x",
+    ],
+)
+def test_a_malformed_url_is_refused_without_raising_or_logging_it(monkeypatch, caplog, url):
+    monkeypatch.setattr(settings, "OPS_HEARTBEAT_URL", url)
+
+    with caplog.at_level(logging.DEBUG):
+        assert ping_heartbeat() is False  # returned, not raised into the Celery task
+
+    assert "must be an https URL" in caplog.text
+    assert _TOKEN not in caplog.text
+
+
+@pytest.mark.parametrize(
     ("url", "ok"),
     [
         ("https://uptime.betterstack.com/api/v1/heartbeat/x", True),

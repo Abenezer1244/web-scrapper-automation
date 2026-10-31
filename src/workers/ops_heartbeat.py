@@ -35,10 +35,16 @@ _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 
 
 def _allowed(url: str) -> bool:
-    parts = urlsplit(url)
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname
+    except ValueError:
+        # A malformed IPv6 host or an NFKC-invalid netloc raises, and the message
+        # quotes the netloc. Refuse here so it can never escape into a task log.
+        return False
     if parts.scheme == "https":
-        return bool(parts.hostname)
-    return parts.scheme == "http" and parts.hostname in _LOOPBACK_HOSTS
+        return bool(host)
+    return parts.scheme == "http" and host in _LOOPBACK_HOSTS
 
 
 def ping_heartbeat() -> bool:
@@ -53,8 +59,8 @@ def ping_heartbeat() -> bool:
     if not _allowed(url):
         _logger.error("ops heartbeat not sent: OPS_HEARTBEAT_URL must be an https URL")
         return False
-    req = urllib.request.Request(url, method="GET")  # noqa: S310 — scheme checked by _allowed above
     try:
+        req = urllib.request.Request(url, method="GET")  # noqa: S310 — scheme checked by _allowed above
         # A 3xx with no redirect handler raises HTTPError, like a 4xx/5xx does.
         with urllib.request.build_opener(_NoRedirect).open(req, timeout=_HEARTBEAT_TIMEOUT_SECONDS) as resp:
             if 200 <= resp.status < 300:

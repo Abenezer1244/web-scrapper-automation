@@ -153,6 +153,11 @@ def commit_has_fix(sha: str, counties: tuple[str, ...] = RETRY_COUNTIES) -> bool
             capture_output=True, text=True, check=True, timeout=30).stdout
     except (subprocess.SubprocessError, OSError):
         return False
+    return source_has_fix(src, counties)
+
+
+def source_has_fix(src: str, counties: tuple[str, ...] = RETRY_COUNTIES) -> bool:
+    """commit_has_fix's judgement of one pacs_parcel.py source, without git."""
     if "search_type_field" not in src:
         return False
     return "clallam" not in counties or all(p.search(src) for p in _CLALLAM_FIX_SHAPES)

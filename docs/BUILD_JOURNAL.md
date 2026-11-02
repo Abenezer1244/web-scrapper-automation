@@ -19,6 +19,54 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-11-02 — enrich.py Phase 2 (#583); Island name search gated; the Island "backlog" was released duplicates
+
+**Built / Shipped:**
+- **#581 merged and deployed** (Phase 1 of the enrich transaction work). It was held until the ops
+  heartbeat drill reported DRILL DONE.
+- **PR #583 (Phase 2):** `_end_transaction_before_network` ends any read before a slow call after a
+  failure, and re-raises a Celery time limit. It is applied to the GIS retry, the PACS name pass, King
+  condo, King not-carried and King chunk paths.
+- **Branch `fix/pacs-name-gate`:** a license-restricted county's inline owner-name search now answers to
+  `COUNTY_GIS_RESTRICTED_MAILING_ENABLED`, like every other restricted lookup. Before this it ran
+  ungated. The switch is on in production, so nothing changes there.
+
+**Tried / Decided:**
+- **Owner decision 2026-11-02:** commercial owner-name searching of Island's portal is cleared, sweep
+  included.
+- **Search-term normalization (Phase 3a) dropped on measurement.** Stripping caption phrases changed
+  nothing for the 10 `no_match` names: all were still "None found".
+- **The name-recovery sweep (3b-2) was built, Codex-reviewed and parked.** Its SQL plans against
+  production, but it selects zero rows. Every one of the 205 address-less Island rows is
+  `superseded`, from the intended parcel-less claim release (126 filings). The 6 delivered Island leads
+  all have addresses. "195 never answered" was a count of released filings, not of customer leads.
+
+**Failed / Blocked:**
+- **Wrong premise.** I sized Phase 3 on "195 of 211 Island leads never answered" without first checking
+  `is_duplicate`. The first EXPLAIN of the sweep's own selection exposed it.
+- **The parked sweep's Codex NO-GO:**
+  - P1: a delivered-only guard is needed in both the selection and the UPDATE;
+  - P2: a "found" answer with no street must not write a mailing address.
+- **Local DB tests could not run** (the forwarder was stopped for low memory). CI ran them.
+
+**Caught & fixed:**
+- **Phase 2 (Codex):** the helper swallowed Celery time limits; the probe counted unrelated
+  connections.
+- **3b-1 (Codex):**
+  - a third Island name-pass test lacked the restricted switch;
+  - the gate test's assertions were loose;
+  - an unrestricted county was added to the gate test.
+
+**Pending / Handoff:**
+- If Island coverage matters, decide how a released parcel-less filing is re-claimed and looked up,
+  then revisit the parked sweep.
+- A King chunk recovery test (Codex, non-blocking).
+
+**Facts learned:**
+- Island production: 1 user, 3 jobs.
+- `release_parcelless_no_address_claims` marks every row of a released filing
+  `superseded`, so no "original" row survives by design.
+
 ## 2026-11-02 — Repairs verified; Whatcom is back; enrich.py stops holding transactions across lookups
 
 **Built / Shipped:**

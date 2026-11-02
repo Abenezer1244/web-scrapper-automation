@@ -140,6 +140,9 @@ async def test_after_a_failed_ordering_read_the_name_pass_holds_no_transaction(
         if "max(created_at)" in statement and "pacs_name_lookup" in statement:
             raise RuntimeError("ordering read failed at the cursor")
 
+    from src.config import settings
+
+    monkeypatch.setattr(settings, "COUNTY_GIS_RESTRICTED_MAILING_ENABLED", True)   # Island is restricted
     monkeypatch.setattr(pacs, "batch_lookup_pacs_by_name", _scripted)
     event.listen(sync_engine, "before_cursor_execute", _fail_ordering)
     try:

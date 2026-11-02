@@ -1546,6 +1546,16 @@ def _run_inline_enrichment(
         batch_lookup_pacs_by_name,
         is_pacs_url,
     )
+    from src.scrapers.enrichment.pacs_parcel import PACS_SITES
+    # A portal whose pages cite RCW 42.56.070(8) answers to the same switch as every other
+    # restricted source, owner-name searches included (they had no gate; Codex). The owner
+    # cleared Island's name searches on 2026-11-02; the switch remains the kill switch.
+    _name_site = PACS_SITES.get(config.county.lower()) if config.state.upper() == "WA" else None
+    if (_name_site is not None and _name_site.license_restricted
+            and not settings.COUNTY_GIS_RESTRICTED_MAILING_ENABLED):
+        _logger.info("Job %s: owner-name lookup skipped: %s is a restricted source and "
+                     "COUNTY_GIS_RESTRICTED_MAILING_ENABLED is off", job_id, _name_site.source_key)
+        connector_assessor_url = None
     if connector_assessor_url and is_pacs_url(connector_assessor_url):
         results_no_addr = [
             res for res in all_results

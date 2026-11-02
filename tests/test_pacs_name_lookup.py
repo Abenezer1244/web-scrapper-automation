@@ -218,8 +218,11 @@ async def test_the_job_pass_records_each_rows_outcome_and_counts_failures(
 
     from sqlalchemy import text
 
+    from src.config import settings
     from src.db.models import Job, Result, ScraperConfig
 
+    # Island is a restricted source: its name searches answer to the restricted switch.
+    monkeypatch.setattr(settings, "COUNTY_GIS_RESTRICTED_MAILING_ENABLED", True)
     config = ScraperConfig(
         id=str(uuid.uuid4()), user_id=business_user.id, name="island probate name pass",
         county="island", state="WA", record_type="probate", fields=["party_name"],
@@ -365,3 +368,60 @@ def test_a_pace_that_crosses_the_deadline_asks_no_more(monkeypatch):
     monkeypatch.setattr(pacs, "NAME_JITTER_S", 0.0)
     out = batch_lookup_pacs_by_name(URL, ["A", "B"])
     assert asked == ["A"] and [o for o, _ in out] == [LOOKUP_NO_MATCH, LOOKUP_SKIPPED]
+
+
+@pytest.mark.parametrize(("county", "switch_on", "asked"), [
+    ("island", False, False),    # restricted portal, switch off: no request at all
+    ("island", True, True),
+])
+async def test_a_restricted_portal_is_name_searched_only_with_the_restricted_switch(
+        db, business_user, redis_client, monkeypatch, county, switch_on, asked):
+    """The owner-name pass answers to COUNTY_GIS_RESTRICTED_MAILING_ENABLED, like every other
+    lookup against a portal whose pages cite RCW 42.56.070(8). It used to run ungated."""
+    import asyncio
+    import uuid
+
+    from sqlalchemy import text
+
+    from src.config import settings
+    from src.db.models import Job, Result, ScraperConfig
+
+    monkeypatch.setattr(settings, "COUNTY_GIS_RESTRICTED_MAILING_ENABLED", switch_on)
+    config = ScraperConfig(
+        id=str(uuid.uuid4()), user_id=business_user.id, name=f"{county} probate gate",
+        county=county, state="WA", record_type="probate", fields=["party_name"],
+        enrichment=[], schedule={"frequency": "manual"}, deliver={"format": "csv", "emails": []},
+    )
+    db.add(config)
+    await db.commit()
+    job_id = str(uuid.uuid4())
+    db.add(Job(id=job_id, user_id=business_user.id, scraper_config_id=config.id,
+               status="enriching", trigger="manual", record_count=0, billed_count=0))
+    rid = str(uuid.uuid4())
+    db.add(Result(id=rid, user_id=business_user.id, job_id=job_id, party_name="DOE JANE",
+                  doc_type="CERTIFICATE OF DEATH", parcel_id=None, property_address=None,
+                  mailing_address=None, enrichment_data={"instrument_number": "1"},
+                  skip_trace_status="not_attempted"))
+    await db.commit()
+    asked_names: list = []
+
+    def scripted(url, names, **_kw):
+        asked_names.extend(names)
+        return [(LOOKUP_NO_MATCH, None) for _ in names]
+
+    monkeypatch.setattr(pacs, "batch_lookup_pacs_by_name", scripted)
+
+    def _go():
+        from src.db.session import system_sync_session
+        from src.workers.tasks_helpers.enrich import _run_inline_enrichment
+
+        with system_sync_session() as sdb:
+            job = sdb.get(Job, job_id)
+            cfg = sdb.get(ScraperConfig, job.scraper_config_id)
+            _run_inline_enrichment(sdb, job, redis_client, job_id, cfg, summary={})
+
+    await asyncio.to_thread(_go)
+
+    assert (asked_names == ["DOE JANE"]) is asked
+    ed = (await db.execute(text("SELECT enrichment_data FROM results WHERE id = :i"), {"i": rid})).scalar()
+    assert (ed.get(pacs.PACS_NAME_LOOKUP_KEY) == LOOKUP_NO_MATCH) is asked

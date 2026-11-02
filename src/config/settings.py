@@ -327,11 +327,6 @@ class Settings(BaseSettings):
     # (src/workers/property_recovery.py): condo extract first, then eRealProperty under the
     # shared lease. Kill switch: False stops it before any request.
     PROPERTY_RECOVERY_ENABLED: bool = True
-    # Background sweep that asks a PACS portal the owner names a job's own name pass never
-    # reached (src/workers/name_recovery.py; Island first, cleared by the owner 2026-11-02).
-    # A license-restricted county also needs COUNTY_GIS_RESTRICTED_MAILING_ENABLED.
-    # Default off until the sweep ships. Kill switch: False stops it before any request.
-    NAME_RECOVERY_ENABLED: bool = False
     # Pierce (Tacoma) code-violation OWNER names from the Pierce Assessor-Treasurer
     # portal (ATIP) taxpayer record, one headless page view per parcel
     # (src/scrapers/enrichment/pierce_atip_owner.py). Owner decision 2026-09-14: legal

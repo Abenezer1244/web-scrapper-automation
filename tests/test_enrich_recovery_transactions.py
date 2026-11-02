@@ -250,3 +250,7 @@ async def test_after_a_failed_king_phase1_commit_the_mailing_pass_holds_no_trans
 
     assert [kind for kind, _ in calls] == ["phase1", "mailing"]
     assert calls[1][1] == 0          # the mailing lookup after the refused phase-1 commit
+    # The phase-1 write really was refused (not silently cleaned), so the rows really expired.
+    rid = _rids[0]
+    assert (await db.execute(text("SELECT property_address FROM results WHERE id = :i"),
+                             {"i": rid})).scalar() is None

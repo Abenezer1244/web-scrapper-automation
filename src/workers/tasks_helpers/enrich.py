@@ -657,6 +657,11 @@ def _end_transaction_before_network(db, job_id: str) -> None:
     try:
         db.commit()
     except Exception as exc:  # noqa: BLE001 -- the lookup must still run, without a transaction
+        # A Celery time limit is not a failed commit: the task must stop and clean up,
+        # not start another long lookup (Codex).
+        from src.utils.celery_limits import reraise_time_limit
+
+        reraise_time_limit(exc)
         db.rollback()
         _logger.warning("Job %s: transaction ended before a lookup failed to commit: %s",
                         job_id, str(exc)[:120])

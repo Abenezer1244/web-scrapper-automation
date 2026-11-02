@@ -71,6 +71,11 @@ boto3==1.43.60               # service-model churn only for our S3-compatible R2
 # Email
 resend==2.7.0
 
+# Error tracking (P0-03). MIT, getsentry/sentry-python; runtime deps urllib3 + certifi
+# only (both already installed). 2.72.0 over 2.73.0 for a 3-week-old release; OSV: no
+# advisories (2026-11-02). Integrations are chosen explicitly in src/utils/error_tracking.py.
+sentry-sdk==2.72.0
+
 # Billing
 # HELD AT 11.x ON PURPOSE — do NOT let dependabot walk this to 15.x without the code
 # change first. Verified 2026-09-03 against stripe 15.6.1 in an isolated venv:

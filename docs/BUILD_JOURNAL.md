@@ -171,8 +171,8 @@ to understand *why* the code is the way it is and *what's been attempted before*
 **Pending / Handoff (owner):**
 - Rotate the BridgeLeads app login used for Playwright UI checks (handoff doc of 2026-09-02,
   step 4).
-- The old secrets are still in git history and in GitHub's `refs/pull/*`. The rewrite decision is
-  with the owner (see the plan file).
+- History rewrite **skipped** (owner, 11-02): the old secrets stay in git history and `refs/pull/*`,
+  but every credential is rotated, the repo is private, and gitleaks guards new commits.
 - Fix the LinkedIn company copy ("across the US").
 
 **Facts learned (durable):**

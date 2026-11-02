@@ -347,6 +347,10 @@ def _watchdog_stuck_jobs_impl() -> None:
                 ):
                     continue
                 _logger.error("Watchdog: permanently failed job %s after 3 retries", job.id)
+                # P0-03 5d: the CAS above committed, so this job is reported once.
+                from src.utils.error_tracking import report_job_failure
+
+                report_job_failure("watchdog_failed")
                 # M6: queue the ops alert; sent AFTER the write durably landed
                 # (Codex P2 — an alert for state that then fails to commit would
                 # also burn the cooldown and suppress the later real alert).

@@ -253,3 +253,54 @@ def test_fail_job_sends_nothing_for_a_business_outcome_or_a_stale_attempt(
 
     sentry_sdk.flush()
     assert tracking == []
+
+
+def _watchdog_outcomes(envelopes: list[str]) -> list[dict]:
+    events = [json.loads(env.splitlines()[-1]) for env in envelopes]
+    return [e for e in events if e.get("tags", {}).get("job_outcome") == "watchdog_failed"]
+
+
+def test_watchdog_reports_a_permanent_failure_once(tracking):
+    import sentry_sdk
+
+    from src.workers.scheduler import watchdog_stuck_jobs
+    from tests.test_workers import _create_stuck_job, _create_sync_config, _create_sync_user
+
+    with SyncSessionLocal() as s:
+        user = _create_sync_user(s)
+        config = _create_sync_config(s, user.id)
+        job = _create_stuck_job(s, user.id, config.id, minutes_ago=75)
+        job.retry_count = 3
+        job_id = job.id
+        s.commit()
+
+    watchdog_stuck_jobs()
+    watchdog_stuck_jobs()  # the job is terminal now: the second tick's CAS cannot land
+    sentry_sdk.flush()
+
+    with SyncSessionLocal() as s:
+        assert s.get(Job, job_id).status == "failed"
+    (event,) = _watchdog_outcomes(tracking)
+    assert event["exception"]["values"][-1]["type"] == "WatchdogFailedError"
+    _assert_clean("".join(tracking))
+
+
+def test_watchdog_requeue_is_not_a_failure(tracking):
+    import sentry_sdk
+
+    from src.workers.scheduler import watchdog_stuck_jobs
+    from tests.test_workers import _create_stuck_job, _create_sync_config, _create_sync_user
+
+    with SyncSessionLocal() as s:
+        user = _create_sync_user(s)
+        config = _create_sync_config(s, user.id)
+        job = _create_stuck_job(s, user.id, config.id, minutes_ago=75)
+        job_id = job.id
+        s.commit()
+
+    watchdog_stuck_jobs()
+    sentry_sdk.flush()
+
+    with SyncSessionLocal() as s:
+        assert s.get(Job, job_id).status == "pending"
+    assert _watchdog_outcomes(tracking) == []

@@ -44,3 +44,13 @@ deferred: no Island lead carries a parcel id.
   after the final commit; on a failed final commit the alert is still sent after the rollback.
 - Tests: tests/test_enrich_network_transactions.py (6). Not run locally (DB forwarder stopped for low
   memory); CI runs them.
+
+## Phase 2 (owner approved 2026-11-02): done on `fix/enrich-recovery-transactions`
+- [x] `_end_transaction_before_network(db, job_id)`: commits an open read before a slow call; a failed
+      commit is rolled back and logged; a Celery time limit is re-raised (Codex Medium).
+- [x] GIS sweep (county/state cached; read ended before each batch), PACS name pass (names + source
+      key read before the committing log), King condo extract, King not-carried confirmation, King chunk.
+- [x] Tests: tests/test_enrich_recovery_transactions.py (real NUL-byte commit failure; cursor-level
+      failure via an engine listener; pg_stat_activity probe restricted to the job's own backends).
+- [x] Codex review: NO-GO (time limit swallowed) -> fixed -> GO.
+- [ ] Follow-up (Codex, non-blocking): a dedicated King chunk recovery test.

@@ -87,9 +87,10 @@ async def test_each_pierce_repair_commits_before_the_next_targets_lookups(
 
         monkeypatch.setattr(pierce_legal_repair, "parcel_hard_negative", _hard_negative)
         monkeypatch.setattr(pierce_legal_repair, "find_pierce_parcels_by_legal", _by_legal)
-        monkeypatch.setattr(pierce_atip, "lookup_atip_addresses", lambda pids: ({}, {}))
+        monkeypatch.setattr(pierce_atip, "lookup_atip_addresses", _atip_none)
         sync_cfg = sync_db.get(ScraperConfig, cfg.id)
-        rows = sync_db.execute(select(Result).where(Result.job_id == job_id)).scalars().all()
+        rows = sorted(sync_db.execute(select(Result).where(Result.job_id == job_id)).scalars().all(),
+                      key=lambda res: res.parcel_id)
         assert sync_db.in_transaction()        # the job's SELECT left one open, as in the task
         enrich.pierce_address_recovery(sync_db, _Redis(), job_id, sync_cfg, rows)
 
@@ -103,26 +104,49 @@ async def test_each_pierce_repair_commits_before_the_next_targets_lookups(
     assert any(m.startswith("Pierce legal repair: recovered 2/2") for m in lines), lines
 
 
-async def test_a_pierce_repair_whose_commit_fails_is_not_counted(db, business_user, monkeypatch):
+def _atip_none(pids):
+    """The ATIP fallback's answer for parcels it could not find (its real stats shape)."""
+    return {}, {"not_found": len(pids), "hard_failure": 0}
+
+
+async def test_a_repair_lost_at_commit_is_not_counted_and_the_next_lookups_hold_nothing(
+        db, business_user, monkeypatch):
     from src.scrapers.enrichment import pierce_atip, pierce_legal_repair
 
     cfg = await _cfg(db, business_user, "pierce")
     job_id = await _job(db, business_user, cfg)
-    await _row(db, job_id, business_user.id, parcel_id="1234000110", legal_description=_LEGAL)
-    monkeypatch.setattr(pierce_legal_repair, "parcel_hard_negative", lambda p: True)
-    monkeypatch.setattr(pierce_legal_repair, "find_pierce_parcels_by_legal", lambda legal: [
-        {"parcel_id": "9876000110", "property_address": "11 PARKWOOD DR"}])
-    monkeypatch.setattr(pierce_atip, "lookup_atip_addresses", lambda pids: ({}, {}))
+    lost = await _row(db, job_id, business_user.id, parcel_id="1234000110", legal_description=_LEGAL)
+    kept = await _row(db, job_id, business_user.id, parcel_id="1234000220", legal_description=_LEGAL)
+    after_failure: list[bool] = []
+    failed = []
 
     def _run(sync_db):
+        def _hard_negative(parcel):
+            if failed:
+                after_failure.append(sync_db.in_transaction())
+            return True
+
+        def _by_legal(legal):
+            if failed:
+                after_failure.append(sync_db.in_transaction())
+            return [{"parcel_id": "9876000110", "property_address": "11 PARKWOOD DR"},
+                    {"parcel_id": "9876000220", "property_address": "22 PARKWOOD DR"}]
+
+        monkeypatch.setattr(pierce_legal_repair, "parcel_hard_negative", _hard_negative)
+        monkeypatch.setattr(pierce_legal_repair, "find_pierce_parcels_by_legal", _by_legal)
+        monkeypatch.setattr(pierce_atip, "lookup_atip_addresses", _atip_none)
         sync_cfg = sync_db.get(ScraperConfig, cfg.id)
-        rows = sync_db.execute(select(Result).where(Result.job_id == job_id)).scalars().all()
+        rows = sorted(sync_db.execute(select(Result).where(Result.job_id == job_id)).scalars().all(),
+                      key=lambda res: res.parcel_id)
         real_commit, calls = sync_db.commit, []
 
         def _commit():
             calls.append(1)
-            if len(calls) == 2:     # the first is the read; the second is this repair's write
+            if len(calls) == 2:     # 1: the read before the first lookup; 2: the first repair
+                # What a dropped connection does at commit: the work is gone, and the
+                # session's rows are expired, so reading one would open a new transaction.
                 sync_db.rollback()
+                failed.append(True)
                 raise RuntimeError("SSL SYSCALL error: EOF detected")
             real_commit()
 
@@ -134,8 +158,12 @@ async def test_a_pierce_repair_whose_commit_fails_is_not_counted(db, business_us
 
     await db.run_sync(_run)
 
+    assert after_failure == [False, False]          # the second target's two lookups
+    lost_row, kept_row = await _result(db, lost), await _result(db, kept)
+    assert (lost_row.parcel_id, lost_row.property_address) == ("1234000110", None)
+    assert (kept_row.parcel_id, kept_row.property_address) == ("9876000220", "22 PARKWOOD DR")
     lines = (await db.execute(select(JobLog.message).where(JobLog.job_id == job_id))).scalars().all()
-    assert any(m.startswith("Pierce legal repair: recovered 0/1") for m in lines), lines
+    assert any(m.startswith("Pierce legal repair: recovered 1/2") for m in lines), lines
 
 
 # ── King account-number resolution ───────────────────────────────────────────────
@@ -167,6 +195,30 @@ async def test_the_king_extract_download_runs_outside_any_transaction(db, busine
     assert seen == [False]
     for rid in (a, b):
         assert (await _result(db, rid)).enrichment_data["resolved_parcel_id"] == "1234567890"
+
+
+async def test_an_unavailable_king_extract_leaves_no_transaction_open(db, business_user, monkeypatch):
+    from src.scrapers.enrichment import king_rpacct
+
+    cfg = await _cfg(db, business_user, "king")
+    job_id = await _job(db, business_user, cfg)
+    rid = await _row(db, job_id, business_user.id, parcel_id="123456789012",
+                     enrichment_data={"source": "king_landmark_json"})
+    seen: list[bool] = []
+
+    def _run(sync_db):
+        def _unavailable(accounts):
+            seen.append(sync_db.in_transaction())
+            return None
+
+        monkeypatch.setattr(king_rpacct, "resolve_account_pins", _unavailable)
+        rows = sync_db.execute(select(Result).where(Result.job_id == job_id)).scalars().all()
+        assert enrich._resolve_king_account_parcels(sync_db, rows, job_id) == 0
+        return sync_db.in_transaction()
+
+    assert await db.run_sync(_run) is False
+    assert seen == [False]
+    assert "resolved_parcel_id" not in (await _result(db, rid)).enrichment_data
 
 
 # ── skip-trace claim refused: the alert waits for the commit ─────────────────────

@@ -641,6 +641,27 @@ _SQL_MARK_PROPERTY = f"""
 """
 
 
+def _end_transaction_before_network(db, job_id: str) -> None:
+    """End any open transaction before a slow network call.
+
+    A rollback expires every row the session holds (even with expire_on_commit=False), so
+    merely READING one of them after a failure opens a new transaction, which then sits idle
+    across minutes of county requests and is dropped by the pooler, losing what follows
+    (#579's canary, Codex audit of this module). Called right before such a call, with only
+    plain values left to read. Every caller has committed or rolled back its own writes by
+    then, so this normally ends a read; if the commit fails anyway it is rolled back and
+    logged, and the lookup still runs.
+    """
+    if not db.in_transaction():
+        return
+    try:
+        db.commit()
+    except Exception as exc:  # noqa: BLE001 -- the lookup must still run, without a transaction
+        db.rollback()
+        _logger.warning("Job %s: transaction ended before a lookup failed to commit: %s",
+                        job_id, str(exc)[:120])
+
+
 def _guarded_update(db, res, sql: str, params: dict, columns: tuple[str, ...]) -> bool:
     """Run one guarded UPDATE for ``res``; sync the ORM object to what was written."""
     import json
@@ -862,6 +883,8 @@ def _settle_king_not_carried(db, all_rows: list, hidden_ids: set, no_record_pids
         and getattr(answers.get(pid), "status", None) == "absent"
     ]
     proven: set[str] = set()
+    # Building `candidates` may have re-read rows a rollback expired; end that read first.
+    _end_transaction_before_network(db, job_id)
     for i in range(0, len(candidates), _NOT_CARRIED_BATCH):
         if time_left() < _NOT_CARRIED_GIS_MIN_S:
             break
@@ -931,6 +954,8 @@ def _fill_king_condo_unit_situs(db, rows: list, job_id: str) -> int:
             todo.setdefault(pin, []).append(res)
     if not todo:
         return 0
+    # The extract refresh (300 s timeout) and the GIS calls below hold no transaction.
+    _end_transaction_before_network(db, job_id)
     resolved = resolve_units(set(todo))
     if resolved is None:
         _logger.info("Job %s: King condo extract unavailable, unit addresses use the pages", job_id)
@@ -1251,12 +1276,16 @@ def _run_inline_enrichment(
         # Measured only when the sweep runs more than one batch: a single batch would
         # read "0 of N" and then jump to the end, which tells nobody anything.
         measured = progress is not None and len(all_pids) > _GIS_COMMIT_BATCH
+        # Plain values: a failed batch rolls back and expires `config`, and reading it for
+        # the next batch would open a transaction that sits across that batch's lookups.
+        gis_county, gis_state = config.county, config.state
         try:
             for i in range(0, len(all_pids), _GIS_COMMIT_BATCH):
                 batch_pids = all_pids[i:i + _GIS_COMMIT_BATCH]
                 gis_stats: dict = {}
+                _end_transaction_before_network(db, job_id)
                 gis_results = batch_enrich_parcels_gis(
-                    batch_pids, config.county, config.state, stats=gis_stats
+                    batch_pids, gis_county, gis_state, stats=gis_stats
                 )
                 batch_updated = 0
                 # Parcels, not rows: one lookup serves every lead on a parcel, and the
@@ -1544,14 +1573,18 @@ def _run_inline_enrichment(
                 _logger.warning("Job %s: name-lookup ordering skipped: %s", job_id,
                                 type(exc).__name__)
         if results_no_addr:
+            # Plain values BEFORE the log line commits: after the ordering rollback above
+            # the rows (and config) are expired, and reading them after that commit would
+            # open a transaction that sits across the whole name pass (900 s budget).
+            names = [res.party_name for res in results_no_addr]
+            name_source_key = f"pacs_{config.county.lower()}"
             _publish_log(
                 r, job_id, "info",
                 f"Looking up {len(results_no_addr)} addresses via PACS by owner name...",
                 db=db,
             )
-            names = [res.party_name for res in results_no_addr]
             pacs_results = batch_lookup_pacs_by_name(
-                connector_assessor_url, names, source_key=f"pacs_{config.county.lower()}",
+                connector_assessor_url, names, source_key=name_source_key,
             )
             name_hits = name_failed = name_skipped = 0
             for res, (outcome, pacs) in zip(results_no_addr, pacs_results, strict=True):
@@ -2067,6 +2100,8 @@ def _run_inline_enrichment(
                 _own = list(_owned if _owned is not None else _chunk)
                 _cs: dict = {}
                 _left = _king_left()
+                # After a failed commit, building this chunk's inputs re-read expired rows.
+                _end_transaction_before_network(db, job_id)
                 try:
                     _enriched = asyncio.run(asyncio.wait_for(
                         batch_enrich_king_county(

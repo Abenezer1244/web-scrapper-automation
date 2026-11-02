@@ -688,18 +688,23 @@ def _resolve_king_account_parcels(db, rows: list, job_id: str) -> int:
     ]
     if not candidates:
         return 0
-    resolved = resolve_account_pins({res.parcel_id.strip() for res in candidates})
+    # Pairs, not a dict: several leads can carry the same account number.
+    accounts = [(res.parcel_id.strip(), res) for res in candidates]
+    # The extract download can take minutes (300 s timeout): never inside the transaction
+    # the caller's SELECT opened. Nothing is pending here, so this only ends the read.
+    db.commit()
+    resolved = resolve_account_pins({account for account, _ in accounts})
     if resolved is None:
         _logger.info("Job %s: King extract unavailable, %d account-number parcel(s) unresolved",
                      job_id, len(candidates))
         return 0
     pins, snapshot = resolved
     done = 0
-    for res in candidates:
-        pin = pins.get(res.parcel_id.strip())
+    for account, res in accounts:
+        pin = pins.get(account)
         if not pin:
             continue
-        patch = {"resolved_parcel_id": pin, "source_parcel_id": res.parcel_id.strip(),
+        patch = {"resolved_parcel_id": pin, "source_parcel_id": account,
                  "resolved_by": KING_ACCOUNT_RESOLVER, "resolved_snapshot": snapshot}
         if _guarded_update(db, res, _SQL_RESOLVE_ACCOUNT, {"patch": patch}, ("enrichment_data",)):
             done += 1
@@ -1169,8 +1174,8 @@ def _run_inline_enrichment(
         # recorder account number is present. Best-effort: unresolved rows are simply
         # looked up as printed, exactly as before.
         try:
-            if _resolve_king_account_parcels(db, all_results, job_id):
-                db.commit()
+            _resolve_king_account_parcels(db, all_results, job_id)
+            db.commit()   # also when nothing resolved: no read left open into later lookups
         except Exception as exc:  # noqa: BLE001 -- enrichment is best-effort
             if type(exc).__name__ in ("SoftTimeLimitExceeded", "TimeLimitExceeded"):
                 raise
@@ -2619,24 +2624,31 @@ def pierce_address_recovery(db, r, job_id: str, config, all_results) -> None:
             parse_pierce_legal,
             same_lot_suffix,
         )
+        # Plain values, read once: a failed commit below rolls back and expires the rows,
+        # and reading an expired row before the next target's lookups would open a
+        # transaction that then sits idle across them (Codex).
         repair_targets = [
-            res for res in all_results
+            (res, res.parcel_id, res.legal_description) for res in all_results
             if res.legal_description and not res.property_address
             and res.parcel_id and len(res.parcel_id.strip()) >= 6
         ]
         repaired = 0
-        for res in repair_targets:
+        if repair_targets:
+            # No transaction across the GIS calls: each one can take 35 s and there is no
+            # loop budget, and a pooler that drops an idle transaction loses its writes.
+            db.commit()
+        for res, scraped_parcel, legal in repair_targets:
             # Only touch a parcel Pierce GIS PROVABLY lacks (hard negative) —
             # never a transient lookup failure (Codex P1).
-            if not parcel_hard_negative(res.parcel_id):
+            if not parcel_hard_negative(scraped_parcel):
                 continue
             legal_matches = [
-                m for m in find_pierce_parcels_by_legal(res.legal_description)
+                m for m in find_pierce_parcels_by_legal(legal)
                 if m.get("property_address")
             ]
             if not legal_matches:
                 continue
-            parsed_legal = parse_pierce_legal(res.legal_description) or (None, None, None)
+            parsed_legal = parse_pierce_legal(legal) or (None, None, None)
             if len(legal_matches) == 1:
                 # ONE exact-legal survivor: accept the shared-suffix class OR a
                 # single-digit recorder typo (edit distance 1). The parcel guard
@@ -2645,7 +2657,7 @@ def pierce_address_recovery(db, r, job_id: str, config, all_results) -> None:
                 # so it additionally requires the GIS legal to name the plat
                 # IMMEDIATELY before the lot (no "DIV 2"-style qualifier between).
                 only = legal_matches[0]
-                method = parcel_repair_method(res.parcel_id, only["parcel_id"])
+                method = parcel_repair_method(scraped_parcel, only["parcel_id"])
                 if method == "plat_lot_unique_edit1" and not (
                     parsed_legal[0]
                     and legal_plat_adjacent(
@@ -2658,13 +2670,13 @@ def pierce_address_recovery(db, r, job_id: str, config, all_results) -> None:
                 # Several subdivisions share the plat+lot: ONLY the 6-digit lot
                 # suffix may disambiguate, and it must leave exactly one.
                 candidates = [
-                    m for m in legal_matches if same_lot_suffix(res.parcel_id, m["parcel_id"])
+                    m for m in legal_matches if same_lot_suffix(scraped_parcel, m["parcel_id"])
                 ]
                 method = "plat_lot_unique_suffix"
             if len(candidates) != 1:
                 continue
             match = candidates[0]
-            old_parcel = res.parcel_id
+            old_parcel = scraped_parcel
             res.property_address = match["property_address"]
             if match.get("mailing_address"):
                 res.mailing_address = match["mailing_address"]
@@ -2682,13 +2694,14 @@ def pierce_address_recovery(db, r, job_id: str, config, all_results) -> None:
                 "gis_parcel_hard_negative": True,            # scraped parcel confirmed absent
             })
             res.enrichment_data = ed  # reassign so SQLAlchemy flags the JSON dirty
-            repaired += 1
-        if repair_targets:
+            # Committed before the next target's lookups, and counted only once it is.
             try:
                 db.commit()
+                repaired += 1
             except Exception as exc:
                 _logger.warning("Job %s: Pierce legal-repair commit failed: %s", job_id, str(exc)[:120])
                 db.rollback()
+        if repair_targets:
             _publish_log(
                 r, job_id, "info",
                 f"Pierce legal repair: recovered {repaired}/{len(repair_targets)} "
@@ -3294,7 +3307,8 @@ def _enqueue_skip_trace_rows(
     # spent, Starter, frozen, ended). Told to the customer after the commit.
     claim_report: dict = {}
     _held_line: str | None = None
-    _unenforced = False
+    # (leads paused, reason) when the claim was refused unenforced; reported after commit.
+    _unenforced: tuple[int, str] | None = None
     if to_claim:
         from src.workers.skip_trace_claim import (
             ClaimUnenforcedError,
@@ -3316,35 +3330,11 @@ def _enqueue_skip_trace_rows(
             claimed_ids = claim_skip_trace_rows(db, to_claim, report=claim_report)
         except ClaimUnenforcedError as exc:
             _logger.error("Job %s skip trace claim refused: %s", job_id, exc)
-            # PAGE someone. Swallowing this keeps the job healthy, which is the
-            # point, but it also means the paid lookup pipeline can sit paused
-            # indefinitely while every worker looks fine. The alert is the only
-            # thing that makes the pause visible.
-            try:
-                from src.workers.ops_alerts import send_ops_alert
-
-                send_ops_alert(
-                    "skip_trace_claim_unenforced", "enqueue",
-                    "Skip-trace claims are refused: migration 100 is not in place",
-                    f"{len(to_claim)} lead(s) on job {job_id} were not queued "
-                    f"because the unique index that stops a lead being looked up "
-                    f"twice is missing, invalid or not the expected index. "
-                    f"Contact lookups are PAUSED and stay paused until it is "
-                    f"applied. Nothing was charged and no lead was lost. {exc}",
-                )
-            except Exception:  # noqa: BLE001 - an alert failure must not fail the job
-                _logger.exception("skip-trace unenforced-claim alert failed to send")
-            _log(
-                r, job_id, "warning",
-                f"Contact lookups are paused for {len(to_claim)} lead(s): a "
-                "database safeguard that stops a lead being looked up twice is "
-                "not in place. No new lookup was charged. These leads stay "
-                "pending and become eligible again on the next run once the "
-                "safeguard is restored.",
-                db=db,
-            )
+            # Sent and logged after the final commit below, not here: the alert is an
+            # email and a webhook, and the log line commits, while the job lock, the
+            # jobs-row lock and the config FOR SHARE must hold to that commit (Codex).
+            _unenforced = (len(to_claim), str(exc))
             to_claim = []
-            _unenforced = True
         claimed = set(claimed_ids)
         for payload in to_claim:
             if str(payload["result_id"]) not in claimed:
@@ -3405,6 +3395,36 @@ def _enqueue_skip_trace_rows(
     if _held_line:
         # After the commit: _publish_log commits, and the job lock had to stay held.
         _log(r, job_id, "info", _held_line, db=db)
+
+    if _unenforced:
+        _paused, _why = _unenforced
+        # PAGE someone. Swallowing the refusal keeps the job healthy, which is the
+        # point, but it also means the paid lookup pipeline can sit paused
+        # indefinitely while every worker looks fine. The alert is the only
+        # thing that makes the pause visible.
+        try:
+            from src.workers.ops_alerts import send_ops_alert
+
+            send_ops_alert(
+                "skip_trace_claim_unenforced", "enqueue",
+                "Skip-trace claims are refused: migration 100 is not in place",
+                f"{_paused} lead(s) on job {job_id} were not queued "
+                f"because the unique index that stops a lead being looked up "
+                f"twice is missing, invalid or not the expected index. "
+                f"Contact lookups are PAUSED and stay paused until it is "
+                f"applied. Nothing was charged and no lead was lost. {_why}",
+            )
+        except Exception:  # noqa: BLE001 - an alert failure must not fail the job
+            _logger.exception("skip-trace unenforced-claim alert failed to send")
+        _log(
+            r, job_id, "warning",
+            f"Contact lookups are paused for {_paused} lead(s): a "
+            "database safeguard that stops a lead being looked up twice is "
+            "not in place. No new lookup was charged. These leads stay "
+            "pending and become eligible again on the next run once the "
+            "safeguard is restored.",
+            db=db,
+        )
 
     if _late_settled:
         # Reported only now: this log commits, and until the line above it the

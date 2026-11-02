@@ -211,3 +211,42 @@ async def test_the_not_carried_confirmation_holds_no_transaction(db, business_us
 
     assert settled == set()
     assert seen == [False]
+
+
+async def test_after_a_failed_king_phase1_commit_the_mailing_pass_holds_no_transaction(
+        db, business_user, redis_client, monkeypatch):
+    """The King chunk driver (Codex, Phase 2 follow-up). Phase 1's commit is refused for real
+    (a NUL byte in the address it writes); the rollback expires the job's rows, and building
+    phase 2's work list reads them again. The phase-2 lookup must still find the job's own
+    connections out of any transaction."""
+    from src.scrapers.enrichment import (
+        county_gis,
+        king_condo_units,
+        king_county_assessor,
+        king_rpacct,
+    )
+
+    monkeypatch.setattr(county_gis, "batch_enrich_parcels_gis", lambda pids, county, state, stats=None: {})
+    monkeypatch.setattr(king_rpacct, "resolve_pins", lambda pins: None)
+    monkeypatch.setattr(king_condo_units, "resolve_units", lambda pins: None)
+    job_id, _rids = await _king_rows(db, business_user)
+    calls: list[tuple[str, int]] = []
+
+    async def _king(parcel_ids, *, time_budget_s=None, stats=None, do_mailing=True,
+                    tax_urls_out=None, tax_urls_in=None, results_seed=None, **_kw):
+        if stats is not None:
+            stats["deferred"] = []
+        if tax_urls_in:                                     # phase 2: the mailing pages
+            calls.append(("mailing", _idle_in_transaction()))
+            return {}
+        calls.append(("phase1", _idle_in_transaction()))
+        for pid in parcel_ids:
+            tax_urls_out[pid] = f"https://payment.kingcounty.gov/Home/Index?app=PropertyTaxes&Search={pid}"
+        return {pid: {"property_address": "1 MAIN\x00 ST", "parcel_lookup": "verified"} for pid in parcel_ids}
+
+    monkeypatch.setattr(king_county_assessor, "batch_enrich_king_county", _king)
+    await db.commit()
+    await _enrich(job_id, redis_client, None)
+
+    assert [kind for kind, _ in calls] == ["phase1", "mailing"]
+    assert calls[1][1] == 0          # the mailing lookup after the refused phase-1 commit

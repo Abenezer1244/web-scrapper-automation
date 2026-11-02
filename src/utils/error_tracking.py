@@ -22,9 +22,13 @@ How (Codex consult, P0-03):
 - Each process role initialises itself (API at startup, the worker parent before
   it forks, beat at start). Initialising twice in one process is a no-op.
 """
+import json
+import math
 import os
 import re
+import uuid
 from collections.abc import Iterable
+from datetime import datetime
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -54,6 +58,8 @@ _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]{0,199}$")
 _FILENAME = re.compile(r"^[A-Za-z0-9_./<>-]{1,300}$")
 _MECHANISM_TYPE = re.compile(r"^[a-z][a-z0-9_.]{0,63}$")
 _LEVELS = frozenset({"fatal", "error", "warning"})
+_EVENT_ID = re.compile(r"^[0-9a-f]{32}$")
+_TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})?$")
 
 _MAX_EXCEPTIONS = 10
 _MAX_FRAMES = 100
@@ -81,15 +87,15 @@ def _valid_dsn(raw: str) -> str | None:
         return None
     if parts.password is not None or parts.query or parts.fragment:
         return None
-    if not _INGEST_HOST.match(host) or not _PUBLIC_KEY.match(parts.username or ""):
+    if not _INGEST_HOST.fullmatch(host) or not _PUBLIC_KEY.fullmatch(parts.username or ""):
         return None
-    if not _PROJECT_PATH.match(parts.path):
+    if not _PROJECT_PATH.fullmatch(parts.path):
         return None
     return dsn
 
 
 def _str_or_none(value: Any, pattern: re.Pattern) -> str | None:
-    return value if isinstance(value, str) and pattern.match(value) else None
+    return value if isinstance(value, str) and pattern.fullmatch(value) else None
 
 
 def _sanitize_frame(frame: Any) -> dict:
@@ -170,9 +176,24 @@ def _sanitize_runtime(contexts: Any) -> dict | None:
     out = {
         key: runtime[key]
         for key in ("name", "version")
-        if isinstance(runtime.get(key), str) and re.match(r"^[A-Za-z0-9_.+-]{1,64}$", runtime[key])
+        if isinstance(runtime.get(key), str) and re.fullmatch(r"^[A-Za-z0-9_.+-]{1,64}$", runtime[key])
     }
     return out or None
+
+
+def _timestamp(value: Any) -> Any:
+    """A datetime, a finite epoch number or a strict ISO-8601 string; else None."""
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value if math.isfinite(value) and value > 0 else None
+    if isinstance(value, str) and _TIMESTAMP.fullmatch(value):
+        try:
+            datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return value
+    return None
 
 
 def _sanitize_event(event: Any, hint: Any = None) -> dict | None:
@@ -191,10 +212,15 @@ def _sanitize_event(event: Any, hint: Any = None) -> dict | None:
         exceptions = [e for e in (_sanitize_exception(v) for v in values[-_MAX_EXCEPTIONS:]) if e]
         if not exceptions:
             return None
+        # The SDK appends hint["attachments"] AFTER before_send; drop them here (and
+        # the transport filter refuses attachment items anyway).
+        if isinstance(hint, dict):
+            hint.pop("attachments", None)
         out: dict = {"exception": {"values": exceptions}, "platform": "python"}
-        for key in ("event_id", "timestamp"):
-            if isinstance(event.get(key), (str, int, float)) and not isinstance(event.get(key), bool):
-                out[key] = event[key]
+        out["event_id"] = _str_or_none(event.get("event_id"), _EVENT_ID) or uuid.uuid4().hex
+        timestamp = _timestamp(event.get("timestamp"))
+        if timestamp is not None:
+            out["timestamp"] = timestamp
         if event.get("level") in _LEVELS:
             out["level"] = event["level"]
         environment = _str_or_none(event.get("environment"), _ENVIRONMENT)
@@ -220,12 +246,78 @@ def _sanitize_event(event: Any, hint: Any = None) -> dict | None:
             out["sdk"] = {
                 key: sdk[key]
                 for key in ("name", "version")
-                if isinstance(sdk.get(key), str) and re.match(r"^[A-Za-z0-9_.+-]{1,64}$", sdk[key])
+                if isinstance(sdk.get(key), str) and re.fullmatch(r"^[A-Za-z0-9_.+-]{1,64}$", sdk[key])
             }
         return out
     except Exception:  # noqa: BLE001 — must never fall back to the unsanitised event
         _logger.error("error_tracking: event dropped, sanitiser failed")
         return None
+
+
+def _filter_envelope(envelope: Any) -> Any:
+    """The envelope reduced to one re-sanitised event item, or None. Never raises.
+
+    The last gate before the network. ``before_send`` only sees error events;
+    sessions, check-ins, attachments, client reports, logs, metrics and user
+    feedback travel in their own envelope items and would skip it. Only an
+    ``event`` item leaves, rebuilt from the sanitiser's output, under headers
+    reduced to the event id and the SDK name/version (no DSN, no trace context).
+    """
+    from sentry_sdk.envelope import Envelope, Item, PayloadRef
+
+    try:
+        events = [item for item in envelope.items if item.type == "event"]
+        if len(events) != 1 or len(envelope.items) != 1:
+            return None
+        payload = events[0].payload
+        data = payload.json if payload.json is not None else json.loads(payload.get_bytes())
+        event = _sanitize_event(data)
+        if event is None:
+            return None
+        headers: dict = {"event_id": event["event_id"]}
+        sdk = envelope.headers.get("sdk")
+        if isinstance(sdk, dict):
+            headers["sdk"] = {
+                key: sdk[key]
+                for key in ("name", "version")
+                if isinstance(sdk.get(key), str) and re.fullmatch(r"^[A-Za-z0-9_.+-]{1,64}$", sdk[key])
+            }
+        return Envelope(headers=headers, items=[Item(payload=PayloadRef(json=event), type="event")])
+    except Exception:  # noqa: BLE001 — fail closed: nothing leaves
+        _logger.error("error_tracking: envelope dropped, filter failed")
+        return None
+
+
+def _event_only(transport_cls: type) -> type:
+    """``transport_cls`` with every outgoing envelope passed through _filter_envelope."""
+
+    class EventOnly(transport_cls):  # type: ignore[valid-type,misc]
+        def capture_envelope(self, envelope: Any) -> None:
+            filtered = _filter_envelope(envelope)
+            if filtered is not None:
+                super().capture_envelope(filtered)
+
+    EventOnly.__name__ = f"EventOnly{transport_cls.__name__}"
+    return EventOnly
+
+
+def _event_only_delegate(inner: Any) -> Any:
+    """An injected transport instance behind the same envelope filter."""
+    from sentry_sdk.transport import Transport
+
+    class EventOnlyDelegate(Transport):
+        def capture_envelope(self, envelope: Any) -> None:
+            filtered = _filter_envelope(envelope)
+            if filtered is not None:
+                inner.capture_envelope(filtered)
+
+        def flush(self, timeout: float, callback: Any = None) -> None:
+            inner.flush(timeout, callback)
+
+        def kill(self) -> None:
+            inner.kill()
+
+    return EventOnlyDelegate()
 
 
 def _drop(*_args: Any, **_kwargs: Any) -> None:
@@ -256,8 +348,9 @@ def init_error_tracking(service: str, *, transport: Any = None) -> bool:
 
     No-op (False) when SENTRY_DSN is empty or refused. A second call for the same
     service in the same process is a no-op (True); a different service is refused.
-    ``transport`` replaces the network transport (the tests pass one that keeps
-    the serialised envelopes in memory).
+    ``transport`` replaces the network transport's sender (the tests pass one that
+    keeps the serialised envelopes in memory); either way every envelope goes
+    through _filter_envelope first.
     """
     global _initialised
     if service not in SERVICES:
@@ -277,12 +370,14 @@ def init_error_tracking(service: str, *, transport: Any = None) -> bool:
         return False
 
     import sentry_sdk
+    from sentry_sdk.transport import HttpTransport
 
+    sender: Any = _event_only(HttpTransport) if transport is None else _event_only_delegate(transport)
     environment = _str_or_none(settings.ENVIRONMENT.strip().lower(), _ENVIRONMENT)
     release = _str_or_none(os.environ.get("RAILWAY_GIT_COMMIT_SHA", "").strip().lower(), _RELEASE)
     sentry_sdk.init(
         dsn=dsn,
-        transport=transport,
+        transport=sender,
         environment=environment,
         release=release,
         server_name="",

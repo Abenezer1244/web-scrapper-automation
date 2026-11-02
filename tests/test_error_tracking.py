@@ -280,3 +280,148 @@ def test_frames_lose_paths_locals_and_source():
 def test_invalid_ref_tag_is_dropped():
     out = _sanitize_event(_event(tags={"ref": _CANARY_PATH_SECRET}))
     assert "tags" not in out
+
+
+def test_non_event_telemetry_never_leaves(tmp_path):
+    attachment = tmp_path / "canary.txt"
+    attachment.write_text(_CANARY_EMAIL, encoding="utf-8")
+    out = _run(
+        f"""
+        from sentry_sdk.crons import capture_checkin
+        from src.utils.error_tracking import init_error_tracking
+
+        init_error_tracking("worker", transport=transport)
+        scope = sentry_sdk.get_isolation_scope()
+        sentry_sdk.set_user({{"email": "{_CANARY_EMAIL}", "ip_address": "203.0.113.7"}})
+        scope.start_session()
+        scope.end_session()
+        capture_checkin(monitor_slug="{_CANARY_PATH_SECRET}", status="ok")
+        sentry_sdk.get_current_scope().add_attachment(bytes=b"{_CANARY_SQL}", filename="{_CANARY_ARG}.txt")
+        sentry_sdk.get_current_scope().add_attachment(path=r"{attachment}")
+        try:
+            raise KeyError("{_CANARY_PHONE}")
+        except KeyError:
+            sentry_sdk.capture_exception()
+        sentry_sdk.get_client().flush()
+        report()
+        """
+    )
+    assert out["item_types"] == ["event"]  # the session, check-in and attachments were all refused
+    _assert_clean("".join(out["envelopes"]))
+    assert "203.0.113.7" not in "".join(out["envelopes"])
+
+
+def test_forged_event_id_timestamp_and_headers_are_replaced():
+    out = _run(
+        f"""
+        from src.utils.error_tracking import init_error_tracking
+
+        init_error_tracking("worker", transport=transport)
+        sentry_sdk.capture_event({{
+            "event_id": "{_CANARY_PATH_SECRET}",
+            "timestamp": "{_CANARY_EMAIL}",
+            "exception": {{"values": [{{"type": "RuntimeError", "value": "{_CANARY_SQL}"}}]}},
+        }})
+        sentry_sdk.flush()
+        report()
+        """
+    )
+    assert out["item_types"] == ["event"]
+    envelope = out["envelopes"][0]
+    _assert_clean(envelope)
+    header = json.loads(envelope.splitlines()[0])
+    assert set(header) <= {"event_id", "sdk", "sent_at"}  # no dsn, no trace context
+    assert len(header["event_id"]) == 32
+    assert "timestamp" not in json.loads(envelope.splitlines()[-1])
+
+
+def test_real_fastapi_route_error_exports_the_template_only():
+    out = _run(
+        f"""
+        from src.utils.error_tracking import init_error_tracking
+
+        assert init_error_tracking("api", transport=transport)
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        app = FastAPI()
+
+        @app.get("/owners/{{owner_id}}")
+        def owner(owner_id: str):
+            raise LookupError("no owner " + owner_id)
+
+        client = TestClient(app, raise_server_exceptions=False)
+        status = client.get(
+            "/owners/{_CANARY_PATH_SECRET}?email={_CANARY_EMAIL}",
+            headers={{"Authorization": "Bearer {_CANARY_JWT}", "Cookie": "s={_CANARY_SIGNED}"}},
+        ).status_code
+        sentry_sdk.flush()
+        report(status=status)
+        """
+    )
+    assert out["status"] == 500
+    assert out["item_types"] == ["event"]
+    envelope = out["envelopes"][0]
+    _assert_clean(envelope)
+    event = json.loads(envelope.splitlines()[-1])
+    assert event["transaction"] == "/owners/{owner_id}"
+    assert event["tags"] == {"service": "api"}
+    assert event["exception"]["values"][-1]["type"] == "LookupError"
+
+
+def test_real_celery_task_error_exports_the_task_name_not_its_args():
+    out = _run(
+        f"""
+        from src.utils.error_tracking import init_error_tracking
+
+        assert init_error_tracking("worker", transport=transport)
+        from celery import Celery
+
+        app = Celery("p003", broker="memory://", backend="cache+memory://")
+
+        @app.task(name="p003.enrich_owner")
+        def enrich_owner(address, email=None):
+            raise ConnectionError("lookup failed for " + address)
+
+        result = enrich_owner.apply(args=["{_CANARY_SQL}"], kwargs={{"email": "{_CANARY_EMAIL}"}})
+        sentry_sdk.flush()
+        report(failed=result.failed())
+        """
+    )
+    assert out["failed"] is True
+    assert out["item_types"] == ["event"]
+    envelope = out["envelopes"][0]
+    _assert_clean(envelope)
+    event = json.loads(envelope.splitlines()[-1])
+    assert event["transaction"] == "p003.enrich_owner"
+    assert event["exception"]["values"][-1]["type"] == "ConnectionError"
+
+
+def test_trailing_newline_does_not_pass_a_pattern():
+    assert _valid_dsn(_GOOD_DSN.replace("/678", "/678\n") + "x") is None
+    out = _sanitize_event(_event(tags={"ref": "0123456789ab\n"}))
+    assert "tags" not in out
+
+
+def test_filter_rebuilds_headers_and_refuses_extra_items():
+    from sentry_sdk.envelope import Envelope, Item, PayloadRef
+
+    from src.utils.error_tracking import _filter_envelope
+
+    hostile = {
+        "event_id": "0" * 32,
+        "dsn": f"https://key@{_CANARY_PATH_SECRET}.example.com/1",
+        "trace": {"transaction": f"/hooks/{_CANARY_PATH_SECRET}", "user": _CANARY_EMAIL},
+        "sdk": {"name": "sentry.python", "version": "2.72.0", "integrations": [_CANARY_ARG]},
+    }
+    clean = _filter_envelope(Envelope(headers=hostile, items=[Item(payload=PayloadRef(json=_event()), type="event")]))
+    assert set(clean.headers) == {"event_id", "sdk"}
+    assert clean.headers["sdk"] == {"name": "sentry.python", "version": "2.72.0"}
+    _assert_clean(clean.serialize().decode())
+    two = Envelope(headers=hostile, items=[
+        Item(payload=PayloadRef(json=_event()), type="event"),
+        Item(payload=_CANARY_SQL.encode(), type="attachment", filename="a.txt"),
+    ])
+    assert _filter_envelope(two) is None
+    session = Envelope(items=[Item(payload=PayloadRef(json={"did": _CANARY_EMAIL}), type="session")])
+    assert _filter_envelope(session) is None

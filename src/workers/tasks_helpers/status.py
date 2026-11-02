@@ -692,6 +692,12 @@ def _fail_job(
             "Job %s: _set_status failed during _fail_job: %s",
             job_id, str(exc)[:200],
         )
+        # A failed commit leaves the session unusable; the callers query ownership
+        # on it next (Codex 5d-i P2).
+        try:
+            db.rollback()
+        except Exception:  # noqa: BLE001 — best effort; cas_ok stays False
+            pass
     if cas_ok and report:
         from src.utils.error_tracking import report_job_failure
 

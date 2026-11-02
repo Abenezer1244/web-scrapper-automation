@@ -205,6 +205,9 @@ def tracking():
         sentry_sdk.get_global_scope().remove_tag("service")
         error_tracking._initialised = None
         settings.SENTRY_DSN = saved
+        assert not sentry_sdk.get_client().is_active()
+        assert "service" not in sentry_sdk.get_global_scope()._tags
+        assert "service" not in sentry_sdk.get_isolation_scope()._tags
 
 
 def _job(user_id, config_id, status="scraping"):

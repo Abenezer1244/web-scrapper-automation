@@ -69,6 +69,27 @@ def test_fail_job_returns_false_when_cas_fails():
     assert "commit" not in db.calls  # a CAS that did not land is rolled back, never committed
 
 
+def test_fail_job_rolls_back_when_the_commit_fails():
+    """A failed commit is not a landed CAS, and the session is left usable (Codex 5d-i P2)."""
+    class _Job:
+        id = "j4"
+        status = "scraping"
+
+    class _FailingCommitDB(_DB):
+        def commit(self):
+            self.calls.append("commit")
+            raise RuntimeError("server closed the connection")
+
+    class _R:
+        def publish(self, *a, **k): pass
+
+    db = _FailingCommitDB()
+    with patch("src.workers.tasks_helpers.status._set_status", lambda *a, **k: True),          patch("src.workers.tasks_helpers.status._publish_log"):
+        result = _fail_job(db, _Job(), _R(), "j4", "boom")
+    assert result is False
+    assert db.calls[:3] == ["rollback", "commit", "rollback"]
+
+
 def test_fail_job_keeps_a_committed_cas_when_the_refresh_fails():
     """A refresh error after the commit must not read as "did not land" (Codex 5d P1)."""
     class _Job:

@@ -534,7 +534,8 @@ def init_error_tracking(service: str, *, transport: Any = None) -> bool:
         before_send_log=_drop,
         before_send_metric=_drop,
     )
-    sentry_sdk.set_tag("service", service)
+    # Global scope: every thread, task and request in this process inherits it.
+    sentry_sdk.get_global_scope().set_tag("service", service)
     _initialised = (pid, service)
     _logger.info("error_tracking: enabled for %s", service)
     return True

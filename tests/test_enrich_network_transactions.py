@@ -159,8 +159,10 @@ async def test_a_repair_lost_at_commit_is_not_counted_and_the_next_lookups_hold_
     await db.run_sync(_run)
 
     assert after_failure == [False, False]          # the second target's two lookups
-    lost_row, kept_row = await _result(db, lost), await _result(db, kept)
+    # One at a time: _result expires the session, so a row read earlier must be asserted first.
+    lost_row = await _result(db, lost)
     assert (lost_row.parcel_id, lost_row.property_address) == ("1234000110", None)
+    kept_row = await _result(db, kept)
     assert (kept_row.parcel_id, kept_row.property_address) == ("9876000220", "22 PARKWOOD DR")
     lines = (await db.execute(select(JobLog.message).where(JobLog.job_id == job_id))).scalars().all()
     assert any(m.startswith("Pierce legal repair: recovered 1/2") for m in lines), lines
@@ -262,3 +264,52 @@ async def test_a_refused_claim_alerts_and_logs_only_after_the_locks_are_released
     assert alerts == [("skip_trace_claim_unenforced", False)]
     lines = (await db.execute(select(JobLog.message).where(JobLog.job_id == job_id))).scalars().all()
     assert any(m.startswith("Contact lookups are paused for 1 lead(s)") for m in lines), lines
+
+
+async def test_a_refused_claim_still_pages_when_the_final_commit_is_lost(
+        db, business_user, _skip_trace_on, monkeypatch, redis_client):
+    from src.workers import ops_alerts, skip_trace_claim
+    from src.workers.skip_trace_claim import INDEX_NAME
+
+    cfg = await _cfg(db, business_user, "clark", skip_trace_enabled=True)
+    job_id = await _job(db, business_user, cfg)
+    await _row(db, job_id, business_user.id, party_name=_PARTY, property_address="1400 MAIN ST",
+               mailing_address="1400 MAIN ST, VANCOUVER, WA 98661", **_SITUS)
+    alerts: list[bool] = []
+    parked = f"{INDEX_NAME}_parked_by_test"
+    await db.execute(text(f"ALTER INDEX {INDEX_NAME} RENAME TO {parked}"))
+    await db.commit()
+    try:
+        def _run(sync_db):
+            real_lock, real_commit = skip_trace_claim.lock_job_for_claim, sync_db.commit
+            locked = []
+
+            def _lock(s, jid):
+                locked.append(True)
+                return real_lock(s, jid)
+
+            def _commit():
+                if locked:      # the first commit under the job lock is the final one
+                    sync_db.rollback()
+                    raise RuntimeError("SSL SYSCALL error: EOF detected")
+                real_commit()
+
+            monkeypatch.setattr(skip_trace_claim, "lock_job_for_claim", _lock)
+            monkeypatch.setattr(ops_alerts, "send_ops_alert",
+                                lambda *_a: alerts.append(sync_db.in_transaction()) or True)
+            sync_db.commit = _commit
+            try:
+                job = sync_db.get(Job, job_id)
+                sync_cfg = sync_db.get(ScraperConfig, cfg.id)
+                with pytest.raises(RuntimeError, match="SSL SYSCALL"):
+                    enrich._enqueue_skip_trace_rows(sync_db, job, redis_client, job_id, sync_cfg)
+            finally:
+                sync_db.commit = real_commit
+
+        await db.run_sync(_run)
+    finally:
+        await db.rollback()
+        await db.execute(text(f"ALTER INDEX {parked} RENAME TO {INDEX_NAME}"))
+        await db.commit()
+
+    assert alerts == [False]        # paged once, after the rollback released every lock

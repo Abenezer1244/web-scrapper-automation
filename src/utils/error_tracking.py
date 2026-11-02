@@ -27,6 +27,8 @@ import logging
 import math
 import os
 import re
+import sys
+import types
 import uuid
 from collections.abc import Iterable
 from datetime import datetime
@@ -39,6 +41,9 @@ from src.utils.logger import setup_logger
 _logger = setup_logger("error_tracking")
 
 SERVICES = frozenset({"api", "worker", "beat"})
+
+# job_outcome tag values (P0-03 5d): a handled path or the watchdog failed a job.
+JOB_OUTCOMES = frozenset({"failed", "watchdog_failed"})
 
 # What the exported exception carries instead of its message text.
 REDACTED_VALUE = "[redacted]"
@@ -167,6 +172,8 @@ def _sanitize_tags(tags: Any) -> dict:
     ref = _str_or_none(tags.get("ref"), _REF)
     if ref is not None:
         out["ref"] = ref
+    if tags.get("job_outcome") in JOB_OUTCOMES:
+        out["job_outcome"] = tags["job_outcome"]
     return out
 
 
@@ -372,6 +379,73 @@ def capture_beat_errors() -> None:
     beat_logger = logging.getLogger("celery.beat")
     if not any(isinstance(h, _BeatErrorCapture) for h in beat_logger.handlers):
         beat_logger.addHandler(_BeatErrorCapture())
+
+
+class JobFailedError(Exception):
+    """A scrape job reached FAILED through a handled path (5d). Never raised."""
+
+
+class WatchdogFailedError(JobFailedError):
+    """The watchdog failed a job whose retries ran out (5d). Never raised."""
+
+
+_MAX_CALLER_FRAMES = 30
+
+
+def _caller_traceback(skip: int) -> types.TracebackType | None:
+    """A traceback over the caller's stack, oldest frame first, capped.
+
+    Lets a synthetic exception point at the line that failed the job. Only frame
+    positions are exported (locals and source are off, and the sanitiser keeps
+    module/function/file/line).
+    """
+    frames: list[types.FrameType] = []
+    frame: types.FrameType | None = sys._getframe(skip)
+    try:
+        while frame is not None and len(frames) < _MAX_CALLER_FRAMES:
+            frames.append(frame)
+            frame = frame.f_back
+        tb = None
+        for caller in frames:  # nearest first, so the last one built is the oldest
+            tb = types.TracebackType(tb, caller, caller.f_lasti, caller.f_lineno)
+        return tb
+    finally:
+        del frame, frames
+
+
+def report_job_failure(outcome: str) -> None:
+    """One Sentry event for a job that just became FAILED. Never raises.
+
+    Call it once, right after the FAILED write is known to have committed (the
+    CAS that landed it), so a job is reported once however many workers race.
+    Inside an ``except`` the active exception becomes the cause; otherwise the
+    event carries the caller's stack. The tag is set on a scope local to this
+    capture. Best effort: a crash between commit and here loses the report.
+    """
+    if _initialised is None:
+        return
+    if outcome not in JOB_OUTCOMES:
+        _logger.error("error_tracking: unknown job outcome; not reported")
+        return
+    error: JobFailedError | None = None
+    try:
+        import sentry_sdk
+
+        error = (WatchdogFailedError if outcome == "watchdog_failed" else JobFailedError)("job failed")
+        cause = sys.exc_info()[1]
+        if cause is not None:
+            error.__cause__ = cause
+            error.__suppress_context__ = True
+        error.__traceback__ = _caller_traceback(2)
+        with sentry_sdk.new_scope() as scope:
+            scope.set_tag("job_outcome", outcome)
+            sentry_sdk.capture_exception(error)
+    except Exception:  # noqa: BLE001 — reporting must never change how a job fails
+        _logger.error("error_tracking: job failure not reported")
+    finally:
+        if error is not None:
+            error.__traceback__ = None
+        del error
 
 
 def tag_request_ref(ref: str) -> None:

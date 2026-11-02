@@ -9,6 +9,22 @@ from unittest.mock import patch
 from src.workers.tasks_helpers.status import _fail_job
 
 
+class _DB:
+    """Records the transaction calls _fail_job makes (it commits the CAS itself)."""
+
+    def __init__(self):
+        self.calls = []
+
+    def commit(self):
+        self.calls.append("commit")
+
+    def rollback(self):
+        self.calls.append("rollback")
+
+    def refresh(self, _obj):
+        self.calls.append("refresh")
+
+
 def test_fail_job_returns_cas_result():
     """_fail_job must return the _set_status CAS boolean so callers can gate emit."""
     class _Job:
@@ -25,9 +41,12 @@ def test_fail_job_returns_cas_result():
 
     with patch("src.workers.tasks_helpers.status._set_status", _fake_set_status), \
          patch("src.workers.tasks_helpers.status._publish_log"):
-        result = _fail_job(object(), _Job(), _R(), "j1", "boom")
+        db = _DB()
+        result = _fail_job(db, _Job(), _R(), "j1", "boom")
     assert result is True
     assert calls["status"] == "failed"
+    # the landed CAS is committed (release_quota_reservation's own calls follow)
+    assert db.calls[:3] == ["rollback", "commit", "refresh"]
 
 
 def test_fail_job_returns_false_when_cas_fails():
@@ -44,5 +63,25 @@ def test_fail_job_returns_false_when_cas_fails():
 
     with patch("src.workers.tasks_helpers.status._set_status", _fake_set_status_false), \
          patch("src.workers.tasks_helpers.status._publish_log"):
-        result = _fail_job(object(), _Job(), _R(), "j2", "too late")
+        db = _DB()
+        result = _fail_job(db, _Job(), _R(), "j2", "too late")
     assert result is False
+    assert "commit" not in db.calls  # a CAS that did not land is rolled back, never committed
+
+
+def test_fail_job_keeps_a_committed_cas_when_the_refresh_fails():
+    """A refresh error after the commit must not read as "did not land" (Codex 5d P1)."""
+    class _Job:
+        id = "j3"
+        status = "scraping"
+
+    class _FlakyRefreshDB(_DB):
+        def refresh(self, _obj):
+            raise RuntimeError("connection dropped after commit")
+
+    class _R:
+        def publish(self, *a, **k): pass
+
+    with patch("src.workers.tasks_helpers.status._set_status", lambda *a, **k: True),          patch("src.workers.tasks_helpers.status._publish_log"):
+        result = _fail_job(_FlakyRefreshDB(), _Job(), _R(), "j3", "boom")
+    assert result is True

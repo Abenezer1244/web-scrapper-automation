@@ -19,6 +19,60 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-11-02 — Repairs verified; Whatcom is back; enrich.py stops holding transactions across lookups
+
+**Built / Shipped:**
+- **Verified repairs (#576/#580, read-only query):** Clallam 4/4 repaired rows carry a mailing address.
+  Jefferson: 50/51, plus 1 settled `parcel_not_found`.
+- **Branch `fix/enrich-network-transactions`:** Phase 1 of a Codex audit of
+  `src/workers/tasks_helpers/enrich.py`. It fixes the three High places where a transaction was held
+  across network work:
+  - the Pierce legal repair, which left repairs uncommitted across later targets' GIS calls and
+    counted rolled-back repairs;
+  - the King account-number extract download (300 s timeout) inside the results SELECT's transaction;
+  - the refused skip-trace claim's ops alert, sent while three locks were held, with a log line that
+    committed mid-lock.
+
+**Tried / Decided:**
+- **Whatcom:** the "outage" was the PACS portal redirecting its form to an error page on 2026-10-31.
+  Live 2026-11-02 it serves the form, and a lookup of 3 statewide parcels found 3/3. No PACS source is
+  cooling down, and the restricted-mailing switch is on in production. No code change. The connector's
+  `degraded` status means "no filings in 7 days, none historically", not that the site is down, and no
+  customer config uses Whatcom.
+- **Island lettered ids:** deferred (Codex agrees). The portal finds `R13202-431-0030` only by that exact
+  spelling, but all 211 Island leads are probate with no parcel id; their addresses come from the
+  owner-name lookup (140 tried, 6 found). Phase 3 targets that path instead.
+- **Spokane:** waits on the county (feed or allowlisting). Not a code item.
+
+**Failed / Blocked:**
+- The local test-DB forwarder and a log watcher were stopped by Claude Code for low memory and not
+  restarted. The new DB tests ran in CI only.
+- Worker logs only reach back a short time, so the recovery outcomes were confirmed by a read-only
+  query instead.
+
+**Caught & fixed:**
+- **King resolution:** rewriting it as a dict would have resolved only one of two leads sharing an
+  account. It uses pairs instead.
+- **Codex diff review (NO-GO twice, then GO):**
+  - an ATIP stub missing its stats keys;
+  - a test reading an expired row through the async session;
+  - the ops page was lost when the final claim commit failed (it is now sent after the rollback);
+  - missing coverage of King's "extract unavailable" path.
+
+**Pending / Handoff:**
+- **Phase 2:** five Medium recovery-path cases where a rollback expires ORM rows and the next read
+  reopens a transaction before a lookup (GIS retry, PACS name pass, King condo, King chunk, King
+  not-carried).
+- **Phase 3:** Island owner-name lookup. Codex's list:
+  - separate the outcomes collapsed into `no_match`;
+  - the six-digit row assumption;
+  - situs required before the detail fetch;
+  - no retry of a missing mailing after a property hit.
+
+**Facts learned:**
+- `SyncSessionLocal` uses `expire_on_commit=False`, but rollback still expires rows.
+- `_publish_log(db=db)` commits before it publishes, so it is a real transaction boundary.
+
 ## 2026-10-31 — Repair run for Jefferson; Skagit's new domain; worker DB fork + canary; Clallam 12-digit ids
 
 **Built / Shipped:**

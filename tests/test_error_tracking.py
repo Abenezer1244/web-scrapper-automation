@@ -425,3 +425,44 @@ def test_filter_rebuilds_headers_and_refuses_extra_items():
     assert _filter_envelope(two) is None
     session = Envelope(items=[Item(payload=PayloadRef(json={"did": _CANARY_EMAIL}), type="session")])
     assert _filter_envelope(session) is None
+
+
+def test_spotlight_env_var_cannot_open_a_second_sender():
+    out = _run(
+        f"""
+        import os, threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        hits = []
+
+        class Sidecar(BaseHTTPRequestHandler):
+            def do_POST(self):
+                hits.append(self.rfile.read(int(self.headers.get("Content-Length") or 0)))
+                self.send_response(200)
+                self.end_headers()
+
+            def log_message(self, *_args):
+                pass
+
+        server = HTTPServer(("127.0.0.1", 0), Sidecar)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        os.environ["SENTRY_SPOTLIGHT"] = f"http://127.0.0.1:{{server.server_port}}/stream"
+
+        from src.utils.error_tracking import init_error_tracking
+
+        init_error_tracking("worker", transport=transport)
+        scope = sentry_sdk.get_isolation_scope()
+        sentry_sdk.set_user({{"email": "{_CANARY_EMAIL}"}})
+        scope.start_session()
+        scope.end_session()
+        try:
+            raise KeyError("{_CANARY_PHONE}")
+        except KeyError:
+            sentry_sdk.capture_exception()
+        sentry_sdk.get_client().flush()
+        server.shutdown()
+        report(spotlight=sentry_sdk.get_client().spotlight is not None, hits=len(hits))
+        """
+    )
+    assert out["spotlight"] is False and out["hits"] == 0
+    assert out["item_types"] == ["event"]

@@ -400,6 +400,9 @@ def init_error_tracking(service: str, *, transport: Any = None) -> bool:
         enable_logs=False,
         enable_metrics=False,
         send_client_reports=False,
+        # Spotlight is a second sender that runs BEFORE the transport (and its
+        # filter); False here beats a SENTRY_SPOTLIGHT env var.
+        spotlight=False,
         before_send=_sanitize_event,
         before_breadcrumb=_drop,
         before_send_transaction=_drop,

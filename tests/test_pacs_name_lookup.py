@@ -373,6 +373,7 @@ def test_a_pace_that_crosses_the_deadline_asks_no_more(monkeypatch):
 @pytest.mark.parametrize(("county", "switch_on", "asked"), [
     ("island", False, False),    # restricted portal, switch off: no request at all
     ("island", True, True),
+    ("benton", False, True),     # not restricted: the switch does not apply
 ])
 async def test_a_restricted_portal_is_name_searched_only_with_the_restricted_switch(
         db, business_user, redis_client, monkeypatch, county, switch_on, asked):
@@ -384,9 +385,19 @@ async def test_a_restricted_portal_is_name_searched_only_with_the_restricted_swi
     from sqlalchemy import text
 
     from src.config import settings
-    from src.db.models import Job, Result, ScraperConfig
+    from src.db.models import CountyConnector, Job, Result, ScraperConfig
 
     monkeypatch.setattr(settings, "COUNTY_GIS_RESTRICTED_MAILING_ENABLED", switch_on)
+    connector_id = None
+    if county == "benton":
+        # Benton has no built-in assessor URL: its connector row names its PACS portal.
+        connector_id = str(uuid.uuid4())
+        db.add(CountyConnector(
+            id=connector_id, county="benton", state="WA", record_types=["probate"],
+            scraper_class="", base_url="https://propertysearch.co.benton.wa.us/",
+            assessor_url="https://propertysearch.co.benton.wa.us/propertyaccess/PropertySearch.aspx?cid=0",
+            active=True))
+        await db.commit()
     config = ScraperConfig(
         id=str(uuid.uuid4()), user_id=business_user.id, name=f"{county} probate gate",
         county=county, state="WA", record_type="probate", fields=["party_name"],
@@ -420,8 +431,18 @@ async def test_a_restricted_portal_is_name_searched_only_with_the_restricted_swi
             cfg = sdb.get(ScraperConfig, job.scraper_config_id)
             _run_inline_enrichment(sdb, job, redis_client, job_id, cfg, summary={})
 
-    await asyncio.to_thread(_go)
+    try:
+        await asyncio.to_thread(_go)
+        ed = (await db.execute(text("SELECT enrichment_data FROM results WHERE id = :i"),
+                               {"i": rid})).scalar()
+    finally:
+        if connector_id:     # county_connectors is not cleaned by the db fixture
+            await db.execute(text("DELETE FROM county_connectors WHERE id = :i"), {"i": connector_id})
+            await db.commit()
 
-    assert (asked_names == ["DOE JANE"]) is asked
-    ed = (await db.execute(text("SELECT enrichment_data FROM results WHERE id = :i"), {"i": rid})).scalar()
-    assert (ed.get(pacs.PACS_NAME_LOOKUP_KEY) == LOOKUP_NO_MATCH) is asked
+    if asked:
+        assert asked_names == ["DOE JANE"]
+        assert ed[pacs.PACS_NAME_LOOKUP_KEY] == LOOKUP_NO_MATCH
+    else:
+        assert asked_names == []
+        assert pacs.PACS_NAME_LOOKUP_KEY not in ed

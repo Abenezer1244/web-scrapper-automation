@@ -136,6 +136,9 @@ def test_island_is_paced_slower(monkeypatch):
 
 async def test_never_answered_names_are_asked_first(db, business_user, redis_client, monkeypatch):
     """Without this, a pass that stops early re-asks the same first names every run."""
+    from src.config import settings
+
+    monkeypatch.setattr(settings, "COUNTY_GIS_RESTRICTED_MAILING_ENABLED", True)   # Island is restricted
     cfg = await _config(db, business_user)
     earlier = await _job(db, business_user, cfg, created_at=NOW - timedelta(days=1), status="done")
     h_answered, h_fresh = uuid.uuid4().hex, uuid.uuid4().hex

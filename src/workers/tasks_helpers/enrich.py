@@ -2874,6 +2874,30 @@ def copy_cached_answer(db, user_id, rec, payload: dict) -> bool:
     return True
 
 
+def _alert_claim_unenforced(job_id: str, paused: int, why: str) -> None:
+    """PAGE someone: the claim refused because migration 100's index is not in place.
+
+    Swallowing the refusal keeps the job healthy, which is the point, but it also means
+    the paid lookup pipeline can sit paused indefinitely while every worker looks fine.
+    The alert is the only thing that makes the pause visible. Called with no transaction
+    open: it is an email and a webhook. Never raises.
+    """
+    try:
+        from src.workers.ops_alerts import send_ops_alert
+
+        send_ops_alert(
+            "skip_trace_claim_unenforced", "enqueue",
+            "Skip-trace claims are refused: migration 100 is not in place",
+            f"{paused} lead(s) on job {job_id} were not queued "
+            f"because the unique index that stops a lead being looked up "
+            f"twice is missing, invalid or not the expected index. "
+            f"Contact lookups are PAUSED and stay paused until it is "
+            f"applied. Nothing was charged and no lead was lost. {why}",
+        )
+    except Exception:  # noqa: BLE001 - an alert failure must not fail the job
+        _logger.exception("skip-trace unenforced-claim alert failed to send")
+
+
 def _enqueue_skip_trace_rows(
     db, job, r, job_id: str, config, *, on_begin=None, attempt_token=None,
     only_result_ids: list[str] | None = None, quiet: bool = False,
@@ -3390,6 +3414,9 @@ def _enqueue_skip_trace_rows(
         # a queued row that was reported as bought and was not.
         _logger.exception("Job %s skip trace enqueue commit failed; rolling back", job_id)
         db.rollback()
+        if _unenforced:
+            # The pause is real whether or not this commit landed: still page (Codex).
+            _alert_claim_unenforced(job_id, *_unenforced)
         raise
 
     if _held_line:
@@ -3398,24 +3425,7 @@ def _enqueue_skip_trace_rows(
 
     if _unenforced:
         _paused, _why = _unenforced
-        # PAGE someone. Swallowing the refusal keeps the job healthy, which is the
-        # point, but it also means the paid lookup pipeline can sit paused
-        # indefinitely while every worker looks fine. The alert is the only
-        # thing that makes the pause visible.
-        try:
-            from src.workers.ops_alerts import send_ops_alert
-
-            send_ops_alert(
-                "skip_trace_claim_unenforced", "enqueue",
-                "Skip-trace claims are refused: migration 100 is not in place",
-                f"{_paused} lead(s) on job {job_id} were not queued "
-                f"because the unique index that stops a lead being looked up "
-                f"twice is missing, invalid or not the expected index. "
-                f"Contact lookups are PAUSED and stay paused until it is "
-                f"applied. Nothing was charged and no lead was lost. {_why}",
-            )
-        except Exception:  # noqa: BLE001 - an alert failure must not fail the job
-            _logger.exception("skip-trace unenforced-claim alert failed to send")
+        _alert_claim_unenforced(job_id, _paused, _why)
         _log(
             r, job_id, "warning",
             f"Contact lookups are paused for {_paused} lead(s): a "

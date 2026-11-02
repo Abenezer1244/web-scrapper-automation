@@ -23,6 +23,7 @@ How (Codex consult, P0-03):
   it forks, beat at start). Initialising twice in one process is a no-op.
 """
 import json
+import logging
 import math
 import os
 import re
@@ -341,6 +342,36 @@ def _integrations(service: str) -> Iterable[Any]:
     from sentry_sdk.integrations.celery import CeleryIntegration
 
     return [*base, CeleryIntegration(propagate_traces=False, monitor_beat_tasks=False)]
+
+
+class _BeatErrorCapture(logging.Handler):
+    """Sends ERROR records that carry an exception to Sentry (beat only).
+
+    Beat catches a failed publish and logs it (celery/beat.py apply_entry,
+    ``exc_info=True``) instead of raising, so no integration ever sees it. Records
+    without an exception (connection-retry chatter) are ignored; the message text
+    is never sent, only the exception, through the same sanitiser.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.ERROR)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        exc_info = record.exc_info
+        if not exc_info or exc_info[1] is None:
+            return
+        import sentry_sdk
+
+        sentry_sdk.capture_exception(exc_info)
+
+
+def capture_beat_errors() -> None:
+    """beat_init: attach _BeatErrorCapture to ``celery.beat`` once; beat client only."""
+    if _initialised is None or _initialised != (os.getpid(), "beat"):
+        return
+    beat_logger = logging.getLogger("celery.beat")
+    if not any(isinstance(h, _BeatErrorCapture) for h in beat_logger.handlers):
+        beat_logger.addHandler(_BeatErrorCapture())
 
 
 def tag_request_ref(ref: str) -> None:

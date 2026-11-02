@@ -368,6 +368,11 @@ def init_error_tracking(service: str, *, transport: Any = None) -> bool:
     if dsn is None:
         _logger.error("error_tracking: SENTRY_DSN is not an https Sentry ingest DSN; error tracking off")
         return False
+    if os.environ.get("SENTRY_PRINT_ENVELOPES", "").strip():
+        # The SDK would wrap the transport in a printer that writes every raw
+        # envelope (sessions, check-ins included) to stderr BEFORE the filter.
+        _logger.error("error_tracking: SENTRY_PRINT_ENVELOPES is set; error tracking off")
+        return False
 
     import sentry_sdk
     from sentry_sdk.transport import HttpTransport
@@ -403,6 +408,7 @@ def init_error_tracking(service: str, *, transport: Any = None) -> bool:
         # Spotlight is a second sender that runs BEFORE the transport (and its
         # filter); False here beats a SENTRY_SPOTLIGHT env var.
         spotlight=False,
+        debug=False,
         before_send=_sanitize_event,
         before_breadcrumb=_drop,
         before_send_transaction=_drop,

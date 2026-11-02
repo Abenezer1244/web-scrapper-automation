@@ -466,3 +466,27 @@ def test_spotlight_env_var_cannot_open_a_second_sender():
     )
     assert out["spotlight"] is False and out["hits"] == 0
     assert out["item_types"] == ["event"]
+
+
+@pytest.mark.parametrize("value", ["1", "true", "yes"])
+def test_envelope_printing_env_var_keeps_tracking_off(value):
+    out = _run(
+        f"""
+        import os
+        os.environ["SENTRY_PRINT_ENVELOPES"] = "{value}"
+        from sentry_sdk.crons import capture_checkin
+        from src.utils.error_tracking import init_error_tracking
+
+        ok = init_error_tracking("worker", transport=transport)
+        scope = sentry_sdk.get_isolation_scope()
+        sentry_sdk.set_user({{"email": "{_CANARY_EMAIL}"}})
+        scope.start_session()
+        scope.end_session()
+        capture_checkin(monitor_slug="{_CANARY_PATH_SECRET}", status="ok")
+        sentry_sdk.flush()
+        report(ok=ok, active=sentry_sdk.get_client().is_active())
+        """
+    )
+    assert out["ok"] is False and out["active"] is False and out["envelopes"] == []
+    assert "SENTRY_PRINT_ENVELOPES is set" in out["stderr"]
+    _assert_clean(out["stderr"])

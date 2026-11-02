@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import uuid
 
+import pytest
 from sqlalchemy import event, select, text
 
 from src.db.models import Result, ScraperConfig
@@ -23,16 +24,58 @@ from tests.test_address_lookup_progress import _all_answered, _batch, _county, _
 from tests.test_skip_trace_enqueue_after_delivery import _job as _plain_job
 from tests.test_skip_trace_enqueue_after_delivery import _row
 
+_WORKER_PIDS: set[int] = set()
+
+
+@pytest.fixture(autouse=True)
+def _record_worker_backends():
+    """The server pid of every connection the worker code checks out during a test, so the
+    probe below looks at the job's own connections and nothing else in the database."""
+    from src.db.session import sync_engine
+
+    def _checkout(dbapi_connection, *_a):
+        _WORKER_PIDS.add(dbapi_connection.get_backend_pid())
+
+    _WORKER_PIDS.clear()
+    event.listen(sync_engine, "checkout", _checkout)
+    yield
+    event.remove(sync_engine, "checkout", _checkout)
+
 
 def _idle_in_transaction() -> int:
-    """Other connections to this database sitting idle inside a transaction, read from a
-    fresh connection so the server's activity snapshot is current."""
+    """The job's connections sitting idle inside a transaction right now, read from a fresh
+    connection (and transaction) so the server's activity snapshot is current."""
     from src.db.session import sync_engine
 
     with sync_engine.connect() as probe:
         return probe.execute(text(
-            "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() "
-            "AND state LIKE 'idle in transaction%' AND pid <> pg_backend_pid()")).scalar()
+            "SELECT count(*) FROM pg_stat_activity WHERE pid = ANY(:pids) "
+            "AND state LIKE 'idle in transaction%' AND pid <> pg_backend_pid()"),
+            {"pids": sorted(_WORKER_PIDS)}).scalar()
+
+
+class SoftTimeLimitExceeded(Exception):  # noqa: N818 -- Celery's own class name, matched by name
+    """What Celery raises asynchronously into whatever line the task is on."""
+
+
+@pytest.mark.parametrize("failure", [SoftTimeLimitExceeded("time is up"),
+                                     RuntimeError("SSL SYSCALL error: EOF detected")])
+def test_a_failed_end_of_transaction_rolls_back_but_a_time_limit_propagates(failure):
+    from src.db.session import system_sync_session
+
+    with system_sync_session() as s:
+        s.execute(text("SELECT 1"))
+
+        def _commit():
+            raise failure
+
+        s.commit = _commit
+        if isinstance(failure, SoftTimeLimitExceeded):
+            with pytest.raises(SoftTimeLimitExceeded):
+                enrich._end_transaction_before_network(s, "job")
+        else:
+            enrich._end_transaction_before_network(s, "job")   # logged; the lookup still runs
+            assert not s.in_transaction()
 
 
 def test_the_helper_ends_a_transaction_a_read_after_rollback_opened():

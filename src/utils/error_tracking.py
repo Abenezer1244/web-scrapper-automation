@@ -343,6 +343,20 @@ def _integrations(service: str) -> Iterable[Any]:
     return [*base, CeleryIntegration(propagate_traces=False, monitor_beat_tasks=False)]
 
 
+def tag_request_ref(ref: str) -> None:
+    """Put an API 500's ref on the request's isolation scope; no-op when tracking is off.
+
+    The Starlette integration captures the re-raised exception after the handler
+    returns, inside the same request scope, so the event carries the ref the
+    client was shown. The sanitiser keeps it only as 12 hex characters.
+    """
+    if _initialised is None:
+        return
+    import sentry_sdk
+
+    sentry_sdk.get_isolation_scope().set_tag("ref", ref)
+
+
 def init_error_tracking(service: str, *, transport: Any = None) -> bool:
     """Initialise Sentry for this process role. True when a client is active.
 

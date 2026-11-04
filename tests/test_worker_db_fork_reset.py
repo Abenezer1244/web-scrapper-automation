@@ -43,7 +43,7 @@ def _read_child_report(read_fd, pid, deadline_s=30.0):
         while True:                        # until EOF: the child's write end closes at exit
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise AssertionError("forked child did not finish within %ss" % deadline_s)
+                raise AssertionError(f"forked child did not finish within {deadline_s}s")
             ready, _, _ = select.select([read_fd], [], [], min(remaining, 0.5))
             if ready:
                 chunk = os.read(read_fd, 4096)
@@ -55,7 +55,7 @@ def _read_child_report(read_fd, pid, deadline_s=30.0):
             if done:
                 status = status_raw
             elif time.monotonic() >= deadline:
-                raise AssertionError("forked child did not exit within %ss" % deadline_s)
+                raise AssertionError(f"forked child did not exit within {deadline_s}s")
             else:
                 time.sleep(0.05)
     finally:
@@ -79,32 +79,37 @@ def test_a_really_forked_child_gets_its_own_postgres_session_and_leaves_the_pare
     from src.db.session import sync_engine
 
     sync_engine.dispose()                  # exactly one pooled connection: the inherited one
-    with sync_engine.connect() as conn:
-        parent_pid = conn.execute(text("SELECT pg_backend_pid()")).scalar()
-        inherited = conn.connection.dbapi_connection
-    assert sync_engine.pool.checkedin() == 1
-
-    read_fd, write_fd = os.pipe()
-    pid = os.fork()
-    if pid == 0:                           # child: no pytest, no teardown, always _exit
-        code = 1
-        try:
-            os.close(read_fd)
-            for _receiver, response in worker_process_init.send(sender=None):
-                if isinstance(response, BaseException):
-                    raise response
-            with sync_engine.connect() as conn:
-                child_pid = conn.execute(text("SELECT pg_backend_pid()")).scalar()
-            report, code = "pid=%s" % child_pid, 0
-        except BaseException as exc:       # noqa: BLE001 -- reported to the parent
-            report = "error=%r" % (exc,)
-        try:
-            os.write(write_fd, report[:2000].encode())
-        finally:
-            os._exit(code)
-
-    os.close(write_fd)
     try:
+        with sync_engine.connect() as conn:
+            parent_pid = conn.execute(text("SELECT pg_backend_pid()")).scalar()
+            inherited = conn.connection.dbapi_connection
+        assert sync_engine.pool.checkedin() == 1
+
+        read_fd, write_fd = os.pipe()
+        try:
+            pid = os.fork()
+        except BaseException:
+            os.close(read_fd)
+            os.close(write_fd)
+            raise
+        if pid == 0:                       # child: no pytest, no teardown, always _exit
+            code = 1
+            try:
+                os.close(read_fd)
+                for _receiver, response in worker_process_init.send(sender=None):
+                    if isinstance(response, BaseException):
+                        raise response
+                with sync_engine.connect() as conn:
+                    child_pid = conn.execute(text("SELECT pg_backend_pid()")).scalar()
+                report, code = f"pid={child_pid}", 0
+            except BaseException as exc:   # noqa: BLE001 -- reported to the parent
+                report = f"error={exc!r}"
+            try:
+                os.write(write_fd, report[:2000].encode())
+            finally:
+                os._exit(code)
+
+        os.close(write_fd)
         report, exit_code = _read_child_report(read_fd, pid)
         assert exit_code == 0, report
         assert report.startswith("pid="), report

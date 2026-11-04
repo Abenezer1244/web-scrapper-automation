@@ -6159,6 +6159,32 @@
       },
       "UserRegister": {
         "properties": {
+          "accepted_privacy_version": {
+            "anyOf": [
+              {
+                "maxLength": 32,
+                "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Accepted Privacy Version"
+          },
+          "accepted_terms_version": {
+            "anyOf": [
+              {
+                "maxLength": 32,
+                "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Accepted Terms Version"
+          },
           "email": {
             "format": "email",
             "title": "Email",
@@ -6410,6 +6436,32 @@
       "VerifyEmailRequest": {
         "description": "POST /auth/verify-email — redeem the emailed verification link.\n\n`token` is the short-lived single-use verification JWT (aud=bridgeleads-verify)\nminted by /auth/register. `new_password` AND the first/last name are set HERE,\nby whoever proves control of the email — NOT at register — so an attacker-\ninitiated signup that the address owner confirms cannot end up with an\nattacker-known password OR an attacker-chosen display name. Names + password\nare validated against the SAME policies as registration.",
         "properties": {
+          "accepted_privacy_version": {
+            "anyOf": [
+              {
+                "maxLength": 32,
+                "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Accepted Privacy Version"
+          },
+          "accepted_terms_version": {
+            "anyOf": [
+              {
+                "maxLength": 32,
+                "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Accepted Terms Version"
+          },
           "first_name": {
             "title": "First Name",
             "type": "string"

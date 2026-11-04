@@ -356,6 +356,30 @@ class PendingRegistration(Base):
         return value
 
 
+class LegalAcceptance(Base):
+    """One accepted legal document (migration 123): append-only evidence that a
+    person accepted a published Terms / Privacy version, and how.
+
+    id and accepted_at have SERVER defaults only and must never be set here: the
+    app role holds no INSERT on them, so accepted_at is always the database clock.
+    Nobody holds UPDATE or DELETE; a re-acceptance is a new row.
+    """
+    __tablename__ = "legal_acceptances"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, server_default=text("gen_random_uuid()"))
+    user_id = Column(UUID(as_uuid=False), ForeignKey("users.id", ondelete="CASCADE"),
+                     nullable=False)
+    document = Column(String(16), nullable=False)    # 'terms' | 'privacy'
+    version = Column(String(32), nullable=False)     # LEGAL_DOCUMENT_VERSIONS value
+    flow = Column(String(16), nullable=False)        # 'register' | 'verify_email' | 'reaccept'
+    accepted_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "document", "version",
+                         name="uq_legal_acceptances_user_doc_version"),
+    )
+
+
 class UserAvatar(Base):
     """The user's profile photo (migration 111): the SERVER re-encoded 256px WebP,
     never the uploaded bytes. Kept off `users` so ordinary user reads never load

@@ -20,7 +20,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 from fastapi import BackgroundTasks, HTTPException, Request, Response, status
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -28,8 +28,9 @@ from src.api.auth import hash_password
 from src.api.middleware import audit_log, once_per, rate_limit, release_once
 from src.api.schemas import RegisterResponse, TokenResponse, UserRegister, VerifyEmailRequest
 from src.config import settings
-from src.config.constants import TRIAL_PERIOD_DAYS
+from src.config.constants import LEGAL_DOCUMENT_VERSIONS, TRIAL_PERIOD_DAYS
 from src.db import PendingRegistration, User
+from src.db.models import LegalAcceptance
 from src.utils.crypto import blind_index
 from src.utils.logger import email_fingerprint, setup_logger
 
@@ -213,6 +214,42 @@ async def _create_real_user(
     return user
 
 
+async def _record_legal_acceptance(
+    db: AsyncSession,
+    user_id: str,
+    terms_version: str | None,
+    privacy_version: str | None,
+    flow: str,
+) -> None:
+    """Record the Terms + Privacy acceptance for a just-created account, in the
+    caller's transaction (so the account and its evidence commit together).
+
+    Written only when the client submitted exactly the CURRENT published versions;
+    the rows carry LEGAL_DOCUMENT_VERSIONS, never the client's strings, and the
+    database stamps accepted_at. A missing or stale pair records nothing: until
+    every client sends the fields (Phase 3d) that must not block a signup.
+    """
+    if terms_version is None and privacy_version is None:
+        return
+    current = (LEGAL_DOCUMENT_VERSIONS["terms"], LEGAL_DOCUMENT_VERSIONS["privacy"])
+    if (terms_version, privacy_version) != current:
+        _logger.warning(
+            "legal acceptance not recorded: submitted versions are not current (flow=%s)",
+            flow,
+        )
+        return
+    # legal_acceptances is RLS-isolated on app.current_user_id; there is no session
+    # yet, so bind the new account for the rest of this transaction only.
+    await db.execute(
+        text("SELECT set_config('app.current_user_id', :uid, true)"), {"uid": str(user_id)}
+    )
+    db.add_all([
+        LegalAcceptance(user_id=user_id, document=document, version=version, flow=flow)
+        for document, version in LEGAL_DOCUMENT_VERSIONS.items()
+    ])
+    await db.flush()
+
+
 async def register_user(
     body: UserRegister,
     request: Request,
@@ -299,6 +336,9 @@ async def _register_user_legacy(
             detail="Registration failed. Please try again.",
         ) from None
 
+    await _record_legal_acceptance(
+        db, user.id, body.accepted_terms_version, body.accepted_privacy_version, "register"
+    )
     await db.commit()
     # Fresh password-only session (H2-P5): amr=["pwd"], auth_time=now (default).
     token, refresh = await start_session(db, request, user.id, amr=["pwd"])
@@ -497,6 +537,11 @@ async def verify_user_email(
     # a redeemable pending row, and a sibling link can't mint a second session.
     await db.execute(
         delete(PendingRegistration).where(PendingRegistration.email_hmac == email_hmac)
+    )
+    # Taken from the verifier's request, never the pending row (see VerifyEmailRequest).
+    await _record_legal_acceptance(
+        db, user.id, body.accepted_terms_version, body.accepted_privacy_version,
+        "verify_email",
     )
     await db.commit()
 

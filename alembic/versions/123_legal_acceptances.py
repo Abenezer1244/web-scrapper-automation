@@ -95,6 +95,30 @@ def upgrade() -> None:
     op.execute(
         "ALTER TABLE public.legal_acceptances ENABLE ALWAYS TRIGGER zz_account_deletion_fence"
     )
+    # Append-only by construction, not only by grants (Codex): no role, the owner
+    # included, may rewrite an accepted version, flow or timestamp. DELETE stays
+    # possible for the owner only, because the matrix's eventual removal of a
+    # tombstoned users row cascades through here; no runtime role holds DELETE.
+    op.execute(
+        """
+        CREATE FUNCTION public.legal_acceptances_immutable() RETURNS trigger
+        LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $fn$
+        BEGIN
+            RAISE EXCEPTION 'legal_acceptances rows are append-only'
+                USING ERRCODE = 'BLD22';
+        END
+        $fn$
+        """
+    )
+    op.execute("REVOKE ALL ON FUNCTION public.legal_acceptances_immutable() FROM PUBLIC")
+    op.execute(
+        "CREATE TRIGGER legal_acceptances_no_update BEFORE UPDATE "
+        "ON public.legal_acceptances FOR EACH ROW "
+        "EXECUTE FUNCTION public.legal_acceptances_immutable()"
+    )
+    op.execute(
+        "ALTER TABLE public.legal_acceptances ENABLE ALWAYS TRIGGER legal_acceptances_no_update"
+    )
 
     op.execute("ALTER TABLE public.legal_acceptances ENABLE ROW LEVEL SECURITY")
     op.execute(
@@ -131,3 +155,4 @@ def upgrade() -> None:
 def downgrade() -> None:
     op.execute(text("SET LOCAL lock_timeout = '5s'"))
     op.drop_table("legal_acceptances")
+    op.execute("DROP FUNCTION IF EXISTS public.legal_acceptances_immutable()")

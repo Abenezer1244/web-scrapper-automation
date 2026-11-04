@@ -102,13 +102,25 @@ def test_check_constraints_refuse_free_text(conn, document, version, flow) -> No
                                      "f": flow}) == "23514"
 
 
-def test_fence_refuses_a_purging_owner_and_pins_the_owner(conn) -> None:
+def test_no_one_may_rewrite_an_acceptance_not_even_the_owner_role(conn) -> None:
+    # This connection is the migration owner, which bypasses grants and RLS: the
+    # trigger is what makes the record append-only (BLD22, before the 113 fence).
     uid, other = _user(conn), _user(conn)
     _accept(conn, uid)
     rid = conn.execute(text("SELECT id FROM legal_acceptances WHERE user_id = :u"),
                        {"u": uid}).scalar()
-    assert _sqlstate(conn, "UPDATE legal_acceptances SET user_id = :o WHERE id = :i",
-                     {"o": other, "i": rid}) == "BLD21"
+    for assignment, params in (
+        ("user_id = :o", {"o": other}),
+        ("version = '2027-01-01'", {}),
+        ("flow = 'reaccept'", {}),
+        ("accepted_at = now() - interval '1 year'", {}),
+    ):
+        assert _sqlstate(conn, f"UPDATE legal_acceptances SET {assignment} WHERE id = :i",
+                         {"i": rid, **params}) == "BLD22", assignment
+
+
+def test_fence_refuses_a_purging_owner(conn) -> None:
+    other = _user(conn)
     _bind(conn, other)
     conn.execute(text("SELECT * FROM request_account_deletion()"))
     conn.execute(text("SET LOCAL ROLE bridgeleads_purge"))
@@ -119,10 +131,11 @@ def test_fence_refuses_a_purging_owner_and_pins_the_owner(conn) -> None:
                                      "f": "register"}) == "BLD20"
 
 
-def test_fence_trigger_fires_always_and_rls_is_on(conn) -> None:
-    assert conn.execute(text(
-        "SELECT tgenabled FROM pg_trigger WHERE tgname = 'zz_account_deletion_fence' "
-        "AND tgrelid = 'public.legal_acceptances'::regclass")).scalar() == "A"
+def test_fence_and_immutability_triggers_fire_always_and_rls_is_on(conn) -> None:
+    for trigger in ("zz_account_deletion_fence", "legal_acceptances_no_update"):
+        assert conn.execute(text(
+            "SELECT tgenabled FROM pg_trigger WHERE tgname = :t "
+            "AND tgrelid = 'public.legal_acceptances'::regclass"), {"t": trigger}).scalar() == "A"
     assert conn.execute(text(
         "SELECT relrowsecurity FROM pg_class WHERE oid = 'public.legal_acceptances'::regclass"
     )).scalar() is True

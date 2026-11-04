@@ -4,6 +4,34 @@ from src.utils.logger import setup_logger
 
 _logger = setup_logger("worker.scheduler")
 
+# Illustrative records for the public /scrapers/sample endpoint. These describe
+# no real person. The endpoint is unauthenticated, and the previous build served
+# real owners' first names, last initials, ZIP+4 and recording dates, which could
+# be matched back to the county recorder index (compliance audit 2026-11, P1-6).
+# Every record carries example=True so a consumer can never mistake it for data.
+_EXAMPLE_RECORDS: tuple[dict, ...] = (
+    {"record_type": "probate", "date_recorded": "Example", "party_name": "Example owner",
+     "county": "King", "property_address": None, "mailing_address": "Seattle, WA, 98101",
+     "has_parcel": True, "example": True},
+    {"record_type": "pre_foreclosure", "date_recorded": "Example", "party_name": "Example owner",
+     "county": "Pierce", "property_address": None, "mailing_address": "Tacoma, WA, 98402",
+     "has_parcel": True, "example": True},
+    {"record_type": "tax_delinquent", "date_recorded": "Example", "party_name": "Example owner",
+     "county": "Snohomish", "property_address": None, "mailing_address": "Everett, WA, 98201",
+     "has_parcel": True, "example": True},
+    {"record_type": "trustee_sale", "date_recorded": "Example", "party_name": "Example owner",
+     "county": "Clark", "property_address": None, "mailing_address": "Vancouver, WA, 98660",
+     "has_parcel": True, "example": True},
+    {"record_type": "code_violation", "date_recorded": "Example", "party_name": "Example owner",
+     "county": "King", "property_address": None, "mailing_address": "Bellevue, WA, 98004",
+     "has_parcel": True, "example": True},
+)
+
+
+def example_sample_records() -> list[dict]:
+    """Return fresh copies of the illustrative sample records (no real data)."""
+    return [dict(r) for r in _EXAMPLE_RECORDS]
+
 
 def _refresh_public_sample_cache_impl() -> None:
     """Recompute the sanitized landing-page samples + stats into
@@ -12,9 +40,10 @@ def _refresh_public_sample_cache_impl() -> None:
     The public /scrapers/sample endpoint reads ONLY this precomputed row, so an
     unauthenticated request never live-queries the tenant tables
     (results/jobs/scraper_configs) and the API role needs no cross-tenant read
-    policy for it. ALL PII redaction happens HERE, so the cached payload is safe
-    to serve publicly. Runs via system_sync_session (cross-tenant, no RLS user
-    context) — under the cutover the bridgeleads_system FOR ALL policy applies.
+    policy for it. Only aggregate counts come from the database; the records are
+    the illustrative _EXAMPLE_RECORDS, so no person's data is ever published here.
+    Runs via system_sync_session (cross-tenant, no RLS user context) — under the
+    cutover the bridgeleads_system FOR ALL policy applies.
     """
     import json
 
@@ -24,14 +53,6 @@ def _refresh_public_sample_cache_impl() -> None:
     from src.db.models import Job, Result, ScraperConfig
     from src.db.session import system_sync_session
 
-    def _generalize_address(addr: str | None) -> str | None:
-        # Drop the leading street segment; keep city/state/ZIP. 1 part (no
-        # comma) → can't isolate the street safely, so redact. (mirrors N2)
-        if not addr:
-            return None
-        parts = [p.strip() for p in addr.split(",") if p.strip()]
-        return ", ".join(parts[1:]) if len(parts) >= 2 else None
-
     def _fmt_count(n: int) -> str:
         if n < 1000:
             return f"{n}+"
@@ -39,42 +60,9 @@ def _refresh_public_sample_cache_impl() -> None:
             return f"{round(n / 1000, 1)}K+"
         return f"{n // 1000:,}K+"
 
+    samples = example_sample_records()
+
     with system_sync_session() as db:
-        rows = db.execute(
-            select(Result, ScraperConfig.county)
-            .join(Job, Result.job_id == Job.id)
-            .join(ScraperConfig, Job.scraper_config_id == ScraperConfig.id)
-            .where(
-                Job.status == "done",
-                Result.property_address.isnot(None),
-                Result.property_address != "",
-                Result.mailing_address.isnot(None),
-                Result.mailing_address != "",
-            )
-            .order_by(Job.created_at.desc())
-            .limit(5)
-        ).all()
-
-        samples = []
-        for r, county_slug in rows:
-            # Partially anonymize: first name + last initial.
-            name = r.party_name or ""
-            parts = name.split()
-            if len(parts) >= 2:
-                anon_name = f"{parts[0]} {parts[1][0]}."
-            else:
-                anon_name = f"{parts[0][0]}." if parts else "—"
-            samples.append({
-                # date_recorded is String(32) in the model, not a date — store
-                # it verbatim (matches the old inline /sample behavior exactly).
-                "date_recorded": r.date_recorded,
-                "party_name": anon_name,
-                "county": (county_slug or "").title(),
-                "property_address": _generalize_address(r.property_address),
-                "mailing_address": _generalize_address(r.mailing_address),
-                "has_parcel": bool(r.parcel_id),
-            })
-
         delivered_count = db.execute(
             select(sa_func.count(Result.id)).where(
                 Result.property_address.isnot(None),

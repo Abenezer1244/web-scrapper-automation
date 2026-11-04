@@ -88,6 +88,42 @@ async def test_endpoint_with_an_unwarmed_cache_serves_examples_and_zero_stats(db
     assert body["total_scraped"] == "0+" and body["counties_active"] == 0
 
 
+async def test_endpoint_ignores_malformed_or_pii_bearing_stats(db, client):
+    # Anything but a count label / small int in the stats falls back to zero, so a
+    # bad row can neither 500 this public endpoint nor leak text through a stat.
+    import json
+
+    from sqlalchemy import text
+
+    bad_payloads = [
+        ["not", "a", "dict"],
+        "just a string",
+        {"total_scraped": "Jane Doe, 98390-1231", "counties_active": "7",
+         "enrichment_rate": "Jane Doe", "freshness": "98390-1231"},
+        {"total_scraped": 5, "counties_active": True},
+    ]
+    try:
+        for payload in bad_payloads:
+            await db.execute(
+                text("""
+                    INSERT INTO public.public_sample_cache (id, payload, refreshed_at)
+                    VALUES (1, CAST(:p AS jsonb), now())
+                    ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload, refreshed_at = now()
+                """),
+                {"p": json.dumps(payload)},
+            )
+            await db.commit()
+            resp = await client.get("/scrapers/sample")
+            assert resp.status_code == 200, payload
+            body = resp.json()
+            assert body["total_scraped"] == "0+" and body["counties_active"] == 0, payload
+            assert body["enrichment_rate"] == "95%+" and body["freshness"] == "Updated daily"
+            assert "Jane" not in resp.text and "98390" not in resp.text
+    finally:
+        await db.execute(text("DELETE FROM public.public_sample_cache WHERE id = 1"))
+        await db.commit()
+
+
 def test_refresh_no_longer_reads_individual_result_rows():
     # The refresh may count rows for the aggregate stats, but it must not select
     # whole Result rows (the old path that copied names and addresses out).

@@ -10500,7 +10500,7 @@
     },
     "/scrapers/sample": {
       "get": {
-        "description": "Public endpoint: returns precomputed, sanitized sample records.\n\nReads ONLY the public_sample_cache singleton (refreshed hourly by the\nrefresh_public_sample_cache Celery task, which does all PII redaction).\nThis unauthenticated endpoint therefore never live-queries the tenant\ntables (results/jobs/scraper_configs) — so under the non-BYPASSRLS cutover\nrole it needs no cross-tenant read access, and there is no path by which an\nanonymous caller can reach un-sanitized PII (RLS cutover Phase 2b, Codex\ndesign). Returns an empty-but-valid shape until the first refresh runs.",
+        "description": "Public endpoint: returns precomputed, sanitized sample records.\n\nReads ONLY the public_sample_cache singleton (refreshed hourly by the\nrefresh_public_sample_cache Celery task, which does all PII redaction).\nThis unauthenticated endpoint therefore never live-queries the tenant\ntables (results/jobs/scraper_configs) — so under the non-BYPASSRLS cutover\nrole it needs no cross-tenant read access, and there is no path by which an\nanonymous caller can reach un-sanitized PII (RLS cutover Phase 2b, Codex\ndesign). The records are always illustrative examples, never real people;\nthe counts read zero until the first refresh runs.",
         "operationId": "sample_records_scrapers_sample_get",
         "responses": {
           "200": {

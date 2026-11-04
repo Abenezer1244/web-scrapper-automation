@@ -346,6 +346,9 @@ class Settings(BaseSettings):
     # ─── Skip Trace (Tracerfy, Sprint 4) ──────────────────────────────────────
     TRACERFY_API_TOKEN: str = ""
     TRACERFY_API_BASE_URL: str = "https://tracerfy.com"
+    # P0-10: page the owner while the Tracerfy credit balance is below this many
+    # credits (src/workers/tracerfy_balance.py, checked hourly). 0 = check off.
+    TRACERFY_LOW_BALANCE_CREDITS: int = 0
     TRACERFY_WEBHOOK_SECRET: str = ""
     # Kill switch for the deprecated `POST /webhooks/tracerfy/{provided_secret}`
     # route, which carries the secret in the URL path. True keeps it working (no
@@ -413,6 +416,13 @@ class Settings(BaseSettings):
             # object.__setattr__: no recursion even if validate_assignment is ever on.
             object.__setattr__(self, "ENTITLEMENT_ENFORCEMENT", True)
         return self
+
+    @field_validator("TRACERFY_LOW_BALANCE_CREDITS")
+    @classmethod
+    def low_balance_threshold_is_not_negative(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("TRACERFY_LOW_BALANCE_CREDITS must be 0 (off) or more")
+        return v
 
     @field_validator("SKIP_TRACE_DISPATCH_INTERVAL_SECONDS")
     @classmethod

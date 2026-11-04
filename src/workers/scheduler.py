@@ -104,6 +104,12 @@ app.conf.beat_schedule = {
         "task": "src.workers.scheduler.repair_degraded_skip_trace",
         "schedule": crontab(minute="1-59/15"),  # :01 :16 :31 :46, a free minute
     },
+    "tracerfy-balance-check": {
+        # P0-10: page while the Tracerfy credit balance is low, before the 402 that
+        # stalls every tenant's skip trace (src/workers/tracerfy_balance.py).
+        "task": "src.workers.scheduler.tracerfy_balance_check",
+        "schedule": crontab(minute=52),  # hourly at :52, a free minute
+    },
     "canary-check": {
         "task": "src.workers.scheduler.canary_check",
         "schedule": crontab(minute=17),  # hourly at :17
@@ -516,6 +522,14 @@ def canary_check() -> None:
     """Probe a few (connector, record type) pairs; see _canary_check_impl for the
     health_status rules, including the zero-output downgrade and its ops alert."""
     return _canary_check_impl()
+
+
+@app.task(name="src.workers.scheduler.tracerfy_balance_check")
+def tracerfy_balance_check() -> str:
+    """P0-10: hourly Tracerfy balance check; see src/workers/tracerfy_balance.py."""
+    from src.workers.tracerfy_balance import check_tracerfy_balance
+
+    return check_tracerfy_balance()
 
 
 @app.task(name="src.workers.scheduler.ops_heartbeat")

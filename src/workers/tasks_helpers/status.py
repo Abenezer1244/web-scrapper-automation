@@ -631,7 +631,9 @@ def sweep_stranded_dedup_claims(limit: int = 5000) -> int:
     return released
 
 
-def _fail_job(db, job, r, job_id: str, reason: str, expected_started_at=None) -> bool:
+def _fail_job(
+    db, job, r, job_id: str, reason: str, expected_started_at=None, *, report: bool = True
+) -> bool:
     """Transition job to FAILED with a human-readable error message.
 
     ``expected_started_at`` (optional) forwards to _set_status to make the FAILED
@@ -662,6 +664,12 @@ def _fail_job(db, job, r, job_id: str, reason: str, expected_started_at=None) ->
     Returns the CAS boolean from _set_status so callers can gate
     notification emit on whether the transition actually succeeded
     (False means the job was already terminal — no-op, no emit).
+
+    P0-03 5d: the CAS commits here, not inside _set_status, so a failed refresh
+    after a successful commit can no longer read as "did not land". The moment
+    the commit is confirmed, the failure is reported to error tracking (once per
+    job: only the winning CAS gets here). ``report=False`` is for business
+    outcomes that are not errors (a paused config, an ended plan, a plan limit).
     """
     try:
         db.rollback()  # Recover from any pending failed transaction
@@ -669,16 +677,35 @@ def _fail_job(db, job, r, job_id: str, reason: str, expected_started_at=None) ->
         pass
     cas_ok = False
     try:
-        cas_ok = _set_status(
+        landed = _set_status(
             db, job, "failed",
-            expected_started_at=expected_started_at,
+            expected_started_at=expected_started_at, commit=False,
             finished_at=_now(), error_message=reason,
         )
+        if landed:
+            db.commit()
+            cas_ok = True
+        else:
+            db.rollback()
     except Exception as exc:
         _logger.error(
             "Job %s: _set_status failed during _fail_job: %s",
             job_id, str(exc)[:200],
         )
+        # A failed commit leaves the session unusable; the callers query ownership
+        # on it next (Codex 5d-i P2).
+        try:
+            db.rollback()
+        except Exception:  # noqa: BLE001 — best effort; cas_ok stays False
+            pass
+    if cas_ok and report:
+        from src.utils.error_tracking import report_job_failure
+
+        report_job_failure("failed")
+    try:
+        db.refresh(job)
+    except Exception as exc:  # noqa: BLE001 — the commit above is what counts
+        _logger.warning("Job %s: refresh after _fail_job failed: %s", job_id, type(exc).__name__)
     # Attempt-scoped no-op: when expected_started_at was supplied and the CAS did
     # NOT fire, the attempt token changed (a newer attempt re-claimed, or the job was
     # re-queued for one). Suppress the

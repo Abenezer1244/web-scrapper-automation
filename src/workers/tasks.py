@@ -652,15 +652,16 @@ def run_scrape_job(self, job_id: str) -> None:
             """
             return landed or _after_missed_write()
 
-        def _fail_attempt(reason: str, *, notify: bool = True) -> None:
+        def _fail_attempt(reason: str, *, notify: bool = True, report: bool = True) -> None:
             """Fail THIS attempt's run; the caller returns afterwards.
 
             `_fail_job` is token-scoped and releases the reservation itself when it
             lands. When it does not land the job is terminal or another attempt's,
             and `_after_missed_write` tells the two apart. The failure notification
-            is sent only for a failure this attempt actually wrote.
+            is sent only for a failure this attempt actually wrote. ``report=False``
+            keeps a business outcome (not an error) out of error tracking.
             """
-            if not _fail_job(db, job, r, job_id, reason, expected_started_at=attempt_token):
+            if not _fail_job(db, job, r, job_id, reason, expected_started_at=attempt_token, report=report):
                 _after_missed_write()
                 return
             if notify:
@@ -721,7 +722,7 @@ def run_scrape_job(self, job_id: str) -> None:
         if _skip_reason is not None:
             # _fail_job writes the job log line, emits the event and releases any
             # reserved quota, so a skipped run reserves and bills nothing.
-            _fail_attempt(_skip_reason, notify=False)
+            _fail_attempt(_skip_reason, notify=False, report=False)
             return
 
         # The ACCOUNT may still start billable work (audit #4 S4-01). The enqueue
@@ -736,7 +737,7 @@ def run_scrape_job(self, job_id: str) -> None:
         db.refresh(user)
         _eligibility = run_eligibility(user)
         if _eligibility.code in ("frozen", "ended"):
-            _fail_attempt(_eligibility.message, notify=False)
+            _fail_attempt(_eligibility.message, notify=False, report=False)
             return
 
         # Execution-time entitlement backstop (audit until ENTITLEMENT_ENFORCEMENT).
@@ -760,7 +761,7 @@ def run_scrape_job(self, job_id: str) -> None:
             # _violation is an entitlements.Violation; str() is its customer-facing
             # message. Both strings below reach the user (live log + job error).
             # _fail_job publishes the same line, and only once its CAS lands.
-            _fail_attempt(f"{_violation.title}. {_violation.message}", notify=False)
+            _fail_attempt(f"{_violation.title}. {_violation.message}", notify=False, report=False)
             return
 
         # Stage rides the commit that _publish_log already performs, so no new commit

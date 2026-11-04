@@ -158,9 +158,30 @@ app.conf.update(
 from celery.signals import (  # noqa: E402
     after_setup_logger,
     after_setup_task_logger,
+    beat_init,
+    celeryd_init,
     worker_process_init,
     worker_ready,
 )
+
+
+# P0-03: error tracking per process role, never at import (the API imports this
+# package to enqueue tasks). celeryd_init runs in the worker parent BEFORE the pool
+# forks, so every prefork child inherits the client; beat_init runs in the beat
+# service. Both are no-ops unless SENTRY_DSN is set (src/utils/error_tracking.py).
+@celeryd_init.connect
+def _init_worker_error_tracking(**_kwargs) -> None:
+    from src.utils.error_tracking import init_error_tracking
+
+    init_error_tracking("worker")
+
+
+@beat_init.connect
+def _init_beat_error_tracking(**_kwargs) -> None:
+    from src.utils.error_tracking import capture_beat_errors, init_error_tracking
+
+    if init_error_tracking("beat"):
+        capture_beat_errors()
 
 
 # P0-04: Celery builds its own log handlers (root, task, multiprocessing) and

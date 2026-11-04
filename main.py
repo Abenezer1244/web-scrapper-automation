@@ -22,6 +22,11 @@ from src.api.middleware import DatabaseUnavailableMiddleware, SecurityHeadersMid
 from src.api.middleware.rate_limit import require_valid_bff_assertion
 from src.api.readiness import database_ready
 from src.config import settings
+from src.utils.error_tracking import init_error_tracking, tag_request_ref
+
+# P0-03: before the app is built, so the Starlette/FastAPI integration wraps it.
+# No-op unless SENTRY_DSN is set (src/utils/error_tracking.py).
+init_error_tracking("api")
 
 
 @asynccontextmanager
@@ -106,15 +111,24 @@ app.include_router(analytics_router)
 # Any uncaught exception returns a generic message + a reference id (logged
 # server-side), so a stack trace is never sent to the client even if DEBUG is
 # accidentally enabled. HTTPException / validation errors keep their own
-# handlers (this only catches the otherwise-unhandled).
+# handlers (this only catches the otherwise-unhandled). The ref also tags the
+# Sentry event (P0-03), so a user's ref finds its stack trace.
 _unhandled_logger = logging.getLogger("api.unhandled")
+
+
+def _route_template(request: Request) -> str:
+    """The matched route's template ("/jobs/{job_id}"), never the raw path: a raw
+    path can carry a credential (the legacy Tracerfy webhook URL does)."""
+    path = getattr(request.scope.get("route"), "path", None)
+    return path if isinstance(path, str) else "<unmatched>"
 
 
 @app.exception_handler(Exception)
 async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     ref = uuid.uuid4().hex[:12]
+    tag_request_ref(ref)
     _unhandled_logger.exception(
-        "Unhandled error ref=%s method=%s path=%s", ref, request.method, request.url.path
+        "Unhandled error ref=%s method=%s route=%s", ref, request.method, _route_template(request)
     )
     return JSONResponse(status_code=500, content={"detail": "Internal error", "ref": ref})
 

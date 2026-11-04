@@ -60,7 +60,11 @@ def fetch_balance(timeout: int = _TIMEOUT_SECONDS) -> int:
         raise BalanceError(UNSAFE_ENDPOINT)
     try:
         validate_scraping_target(url, require_allowlisted=False, resolve=True)
-    except ValueError:
+    except ValueError as exc:
+        # The validator wraps a resolver failure (NXDOMAIN, timeout) as ValueError
+        # from the OSError: a DNS blip, not a policy refusal (Codex 10a P2).
+        if isinstance(exc.__cause__, OSError):
+            raise BalanceError(TRANSIENT) from None
         raise BalanceError(UNSAFE_ENDPOINT) from None
 
     try:

@@ -38,13 +38,16 @@ class _Tracerfy(BaseHTTPRequestHandler):
         _Tracerfy.hits.append({"path": self.path, "auth": self.headers.get("Authorization")})
         time.sleep(_Tracerfy.delay)
         status, body, headers = _Tracerfy.reply
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        for k, v in headers.items():
-            self.send_header(k, v)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            for k, v in headers.items():
+                self.send_header(k, v)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (OSError, ssl.SSLError):
+            pass  # the client gave up first (the timeout test): expected
 
     def log_message(self, *_args):
         pass
@@ -86,8 +89,10 @@ def tracerfy(tmp_path, monkeypatch):
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(cert_pem, key_pem)
     server = ThreadingHTTPServer(("127.0.0.1", 0), _Tracerfy)
+    server.daemon_threads = False  # server_close() then waits for in-flight handlers
     server.socket = ctx.wrap_socket(server.socket, server_side=True)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    serving = threading.Thread(target=server.serve_forever, daemon=True)
+    serving.start()
     base = f"https://localhost:{server.server_address[1]}"
     real_validate = tb.validate_scraping_target
 
@@ -114,6 +119,8 @@ def tracerfy(tmp_path, monkeypatch):
 
     yield reply
     server.shutdown()
+    server.server_close()
+    serving.join(timeout=10)
 
 
 _GOOD = {"total_queues": 12, "properties_traced": 18350, "queues_pending": 2,
@@ -178,18 +185,40 @@ def test_a_slow_answer_is_transient(tracerfy):
 
 
 def test_nothing_listening_is_transient(monkeypatch):
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        port = s.getsockname()[1]  # closed again before the request: connection refused
     from src.utils.pinned_http import pinned_session
 
+    # Bound but never listening, and held until the assertion: the port cannot be
+    # reused meanwhile, and a connect to it is refused.
+    with socket.socket() as held:
+        held.bind(("127.0.0.1", 0))
+        port = held.getsockname()[1]
+        monkeypatch.setattr(settings, "TRACERFY_API_TOKEN", _TOKEN)
+        monkeypatch.setattr(settings, "TRACERFY_API_BASE_URL", f"https://localhost:{port}")
+        monkeypatch.setattr(tb, "validate_scraping_target", lambda *a, **k: None)
+        monkeypatch.setattr(tb, "pinned_session", lambda: pinned_session(_loopback_adapter()))
+        with pytest.raises(tb.BalanceError) as exc:
+            tb.fetch_balance(timeout=2)
+        assert exc.value.category == tb.TRANSIENT
+
+
+def test_a_dns_failure_in_the_real_validator_is_transient_and_pages_nothing(monkeypatch):
+    host = "nxdomain-p010.bridgeleads-test.example"
+    real_getaddrinfo = socket.getaddrinfo
+
+    def getaddrinfo(name, *args, **kwargs):
+        if name == host:
+            raise socket.gaierror(socket.EAI_NONAME, "Name or service not known")
+        return real_getaddrinfo(name, *args, **kwargs)
+
+    sent: list[tuple] = []
+    monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
+    monkeypatch.setattr(tb, "send_ops_alert", lambda *args: sent.append(args) or True)
+    monkeypatch.setattr(settings, "SKIP_TRACE_ENABLED", True)
+    monkeypatch.setattr(settings, "TRACERFY_LOW_BALANCE_CREDITS", 1000)
     monkeypatch.setattr(settings, "TRACERFY_API_TOKEN", _TOKEN)
-    monkeypatch.setattr(settings, "TRACERFY_API_BASE_URL", f"https://localhost:{port}")
-    monkeypatch.setattr(tb, "validate_scraping_target", lambda *a, **k: None)
-    monkeypatch.setattr(tb, "pinned_session", lambda: pinned_session(_loopback_adapter()))
-    with pytest.raises(tb.BalanceError) as exc:
-        tb.fetch_balance(timeout=2)
-    assert exc.value.category == tb.TRANSIENT
+    monkeypatch.setattr(settings, "TRACERFY_API_BASE_URL", f"https://{host}")
+    assert tb.check_tracerfy_balance() == tb.TRANSIENT
+    assert sent == []
 
 
 def test_plain_http_and_a_missing_token_never_leave_the_box(monkeypatch):

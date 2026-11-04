@@ -120,6 +120,7 @@ def test_a_really_forked_child_gets_its_own_postgres_session_and_leaves_the_pare
         cur.execute("SELECT pg_backend_pid()")
         assert cur.fetchone()[0] == parent_pid
         cur.close()
+        inherited.rollback()               # it sits in the pool: no open transaction for pre_ping
         with sync_engine.connect() as conn:
             assert conn.execute(text("SELECT pg_backend_pid()")).scalar() == parent_pid
     finally:

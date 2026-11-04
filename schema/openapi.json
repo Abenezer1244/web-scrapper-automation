@@ -329,6 +329,76 @@
         "title": "AuctionCoverage",
         "type": "object"
       },
+      "AuthConfigResponse": {
+        "properties": {
+          "email_verification_enabled": {
+            "title": "Email Verification Enabled",
+            "type": "boolean"
+          },
+          "legal_versions": {
+            "$ref": "#/components/schemas/LegalVersions"
+          },
+          "password": {
+            "$ref": "#/components/schemas/AuthPasswordRules"
+          },
+          "trial": {
+            "$ref": "#/components/schemas/AuthTrialInfo"
+          }
+        },
+        "required": [
+          "password",
+          "trial",
+          "email_verification_enabled"
+        ],
+        "title": "AuthConfigResponse",
+        "type": "object"
+      },
+      "AuthPasswordRules": {
+        "properties": {
+          "max_length": {
+            "title": "Max Length",
+            "type": "integer"
+          },
+          "min_length": {
+            "title": "Min Length",
+            "type": "integer"
+          },
+          "placeholder": {
+            "title": "Placeholder",
+            "type": "string"
+          }
+        },
+        "required": [
+          "min_length",
+          "max_length",
+          "placeholder"
+        ],
+        "title": "AuthPasswordRules",
+        "type": "object"
+      },
+      "AuthTrialInfo": {
+        "properties": {
+          "days": {
+            "title": "Days",
+            "type": "integer"
+          },
+          "plan": {
+            "title": "Plan",
+            "type": "string"
+          },
+          "records_limit": {
+            "title": "Records Limit",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "days",
+          "plan",
+          "records_limit"
+        ],
+        "title": "AuthTrialInfo",
+        "type": "object"
+      },
       "BatchAttention": {
         "description": "One reason a batch needs a look, in facts not a score. The UI words it.\n\nCodes: scrapes_failed (have = failed OR cancelled children, worded \"did not\nfinish\"; of = child scrapes);\nlow_parcel_coverage / low_mailing_coverage (one DONE scrape whose NEW leads\ncarry the field on fewer than half, of >= 10; launch heuristics, not a county\nbaseline); lookup_while_off (skip tracing configured off, yet a lookup was\nbought for a row of a child configured off, whatever the batch rollup).",
         "properties": {
@@ -3614,6 +3684,25 @@
         "title": "JobStatus",
         "type": "string"
       },
+      "LegalVersions": {
+        "description": "The current published Terms / Privacy versions (GET /auth/config).\n\nTyped as Literals of LEGAL_DOCUMENT_VERSIONS so OpenAPI, and the frontend's\ngenerated types (regenerated and diff-checked in its CI), carry the exact\nvalues: a backend-only version bump then fails the frontend's typecheck\ninstead of silently recording no acceptance. A RESPONSE model only, so a\nstale client can never get a 422 from it.",
+        "properties": {
+          "privacy": {
+            "const": "2026-10-30",
+            "default": "2026-10-30",
+            "title": "Privacy",
+            "type": "string"
+          },
+          "terms": {
+            "const": "2026-10-01",
+            "default": "2026-10-01",
+            "title": "Terms",
+            "type": "string"
+          }
+        },
+        "title": "LegalVersions",
+        "type": "object"
+      },
       "LoginResponse": {
         "description": "POST /auth/login (and /auth/login/mfa) response. Two mutually exclusive\nshapes, discriminated by `mfa_required`:\n- mfa_required=False → login complete: access_token + refresh_token are\n  ALWAYS populated. This is the only shape a non-MFA account ever sees, so\n  the prior no-MFA runtime contract is unchanged.\n- mfa_required=True → password OK but MFA enabled: access_token/refresh_token\n  are null and a short-lived mfa_token is returned to redeem at\n  POST /auth/login/mfa.\nThe fields are Optional (vs TokenResponse's required access_token) only to\nmodel the challenge shape — clients must branch on mfa_required.",
         "properties": {
@@ -6860,9 +6949,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Auth Config Auth Config Get",
-                  "type": "object"
+                  "$ref": "#/components/schemas/AuthConfigResponse"
                 }
               }
             },

@@ -53,6 +53,26 @@ async def _acceptances(db, user_id: str) -> list:
     ), {"u": user_id})).all()
 
 
+async def test_auth_config_publishes_the_current_versions(client: AsyncClient):
+    r = await client.get("/auth/config")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["legal_versions"] == LEGAL_DOCUMENT_VERSIONS
+    # The existing keys are unchanged by the new response model.
+    assert set(body) == {"password", "trial", "email_verification_enabled", "legal_versions"}
+
+
+def test_openapi_pins_the_versions_as_constants():
+    # The frontend regenerates its types from this schema in CI: a literal here is
+    # what turns a backend-only version bump into a frontend typecheck failure.
+    # (app.openapi(), not the route: /openapi.json is served only with DEBUG on.)
+    from main import app
+
+    props = app.openapi()["components"]["schemas"]["LegalVersions"]["properties"]
+    for document, version in LEGAL_DOCUMENT_VERSIONS.items():
+        assert props[document].get("const") == version or props[document].get("enum") == [version]
+
+
 async def test_legacy_signup_records_both_current_documents(client: AsyncClient, db, monkeypatch):
     monkeypatch.setattr(settings, "EMAIL_VERIFICATION_ENABLED", False)
     email = _email()

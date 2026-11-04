@@ -473,6 +473,20 @@ BEGIN
         CREATE POLICY account_exports_system ON account_exports
             FOR ALL TO bridgeleads_system USING (true) WITH CHECK (true);
     END IF;
+    -- Legal acceptances (123): append-only evidence of Terms / Privacy acceptance. The
+    -- app inserts its own rows (never accepted_at: the DB clock stamps it) and reads
+    -- them; the worker only reads (account export). Nobody updates or deletes. Must stay
+    -- AFTER the system ALL TABLES grant, which would hand the worker write access.
+    IF to_regclass('public.legal_acceptances') IS NOT NULL THEN
+        REVOKE ALL ON legal_acceptances FROM bridgeleads_app, bridgeleads_system;
+        GRANT SELECT ON legal_acceptances TO bridgeleads_app;
+        GRANT INSERT (user_id, document, version, flow) ON legal_acceptances
+              TO bridgeleads_app;
+        GRANT SELECT ON legal_acceptances TO bridgeleads_system;
+        DROP POLICY IF EXISTS legal_acceptances_system ON legal_acceptances;
+        CREATE POLICY legal_acceptances_system ON legal_acceptances
+            FOR SELECT TO bridgeleads_system USING (true);
+    END IF;
     -- Job degradations (117): worker-only history of phases that failed on a DONE
     -- job, plus the skip-trace repair queue. Nobody deletes (rows go with their job);
     -- the app role reads nothing. Must stay AFTER the system ALL TABLES grant.

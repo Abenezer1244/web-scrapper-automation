@@ -38,6 +38,56 @@ def test_callers_get_copies_not_the_shared_constant():
     assert example_sample_records()[0]["party_name"] == "Example owner"
 
 
+async def test_endpoint_never_serves_cached_records_even_from_a_legacy_row(db, client):
+    # A cache row written by the old refresh: a real-looking person with ZIP+4
+    # and an exact recording date. The endpoint must ignore its records.
+    import json
+
+    from sqlalchemy import text
+
+    legacy = {
+        "records": [{
+            "date_recorded": "09/01/2026", "party_name": "Legacy P.", "county": "Pierce",
+            "property_address": None, "mailing_address": "SUMNER, WA, 98390-1231",
+            "has_parcel": True,
+        }],
+        "total_scraped": "12K+", "counties_active": 7,
+        "enrichment_rate": "95%+", "freshness": "Updated daily",
+    }
+    await db.execute(
+        text("""
+            INSERT INTO public.public_sample_cache (id, payload, refreshed_at)
+            VALUES (1, CAST(:p AS jsonb), now())
+            ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload, refreshed_at = now()
+        """),
+        {"p": json.dumps(legacy)},
+    )
+    await db.commit()
+    try:
+        resp = await client.get("/scrapers/sample")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["records"] == example_sample_records()
+        assert "Legacy" not in resp.text and "98390-1231" not in resp.text
+        # The aggregate stats still come from the cache.
+        assert body["total_scraped"] == "12K+" and body["counties_active"] == 7
+    finally:
+        await db.execute(text("DELETE FROM public.public_sample_cache WHERE id = 1"))
+        await db.commit()
+
+
+async def test_endpoint_with_an_unwarmed_cache_serves_examples_and_zero_stats(db, client):
+    from sqlalchemy import text
+
+    await db.execute(text("DELETE FROM public.public_sample_cache WHERE id = 1"))
+    await db.commit()
+    resp = await client.get("/scrapers/sample")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["records"] == example_sample_records()
+    assert body["total_scraped"] == "0+" and body["counties_active"] == 0
+
+
 def test_refresh_no_longer_reads_individual_result_rows():
     # The refresh may count rows for the aggregate stats, but it must not select
     # whole Result rows (the old path that copied names and addresses out).

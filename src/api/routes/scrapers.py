@@ -82,22 +82,28 @@ async def sample_records(db: AsyncSession = Depends(get_db)) -> dict:
     """
     import json
 
+    from src.workers.scheduler_helpers.public_cache import example_sample_records
+
     row = await db.execute(
         text("SELECT payload FROM public.public_sample_cache WHERE id = 1")
     )
     cached = row.scalar_one_or_none()
-    if cached is None:
-        # Cache not yet warmed (fresh DB / before the first beat tick).
-        return {
-            "records": [],
-            "total_scraped": "0+",
-            "counties_active": 0,
-            "enrichment_rate": "95%+",
-            "freshness": "Updated daily",
-        }
     # asyncpg may hand back jsonb as a dict or a JSON string depending on codecs;
-    # normalize both.
-    return cached if isinstance(cached, dict) else json.loads(cached)
+    # normalize both. An unwarmed cache (fresh DB / before the first beat tick)
+    # yields the zero stats below.
+    stats = (cached if isinstance(cached, dict) else json.loads(cached)) if cached else {}
+    # Only the aggregate stats are read from the cache. The records are ALWAYS
+    # the illustrative examples, never the cached list: a row written before the
+    # examples shipped (or left behind by a failed refresh) held real owners'
+    # names, ZIP+4 and recording dates, and must never be served (audit 2026-11
+    # P1-6, Codex review).
+    return {
+        "records": example_sample_records(),
+        "total_scraped": stats.get("total_scraped", "0+"),
+        "counties_active": stats.get("counties_active", 0),
+        "enrichment_rate": stats.get("enrichment_rate", "95%+"),
+        "freshness": stats.get("freshness", "Updated daily"),
+    }
 
 
 @router.get("", response_model=list[ScraperConfigResponse])

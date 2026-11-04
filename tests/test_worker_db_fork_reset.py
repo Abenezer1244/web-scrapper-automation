@@ -95,19 +95,19 @@ def test_a_really_forked_child_gets_its_own_postgres_session_and_leaves_the_pare
         if pid == 0:                       # child: no pytest, no teardown, always _exit
             code = 1
             try:
-                os.close(read_fd)
-                for _receiver, response in worker_process_init.send(sender=None):
-                    if isinstance(response, BaseException):
-                        raise response
-                with sync_engine.connect() as conn:
-                    child_pid = conn.execute(text("SELECT pg_backend_pid()")).scalar()
-                report, code = f"pid={child_pid}", 0
-            except BaseException as exc:   # noqa: BLE001 -- reported to the parent
-                report = f"error={exc!r}"
-            try:
+                try:
+                    os.close(read_fd)
+                    for _receiver, response in worker_process_init.send(sender=None):
+                        if isinstance(response, BaseException):
+                            raise response
+                    with sync_engine.connect() as conn:
+                        child_pid = conn.execute(text("SELECT pg_backend_pid()")).scalar()
+                    report, code = f"pid={child_pid}", 0
+                except BaseException as exc:  # noqa: BLE001 -- reported to the parent
+                    report = f"error={exc!r}"
                 os.write(write_fd, report[:2000].encode())
             finally:
-                os._exit(code)
+                os._exit(code)             # nothing below this line ever runs in the child
 
         os.close(write_fd)
         report, exit_code = _read_child_report(read_fd, pid)

@@ -19,6 +19,59 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-11-04 — Terms/Privacy acceptance is recorded (compliance Phase 3a-c, local only)
+
+**Built / Shipped (local branches `audit/compliance-2026-11`, nothing pushed):**
+- BE migration 123 `legal_acceptances`:
+  - append-only (BLD22 trigger plus grants), `accepted_at` from the DB clock, 113 fence, RLS;
+  - kept after purge.
+- BE signup writer records only exactly-current versions, inside the account's transaction.
+  The verified flow records from verify-email only.
+- `/auth/config` publishes `legal_versions` as OpenAPI constants.
+- FE:
+  - BFF allowlist forwards the fields;
+  - the verify-email form gets the same required checkbox;
+  - register sends the versions;
+  - `lib/legal-versions.ts` is typed against the backend schema.
+
+**Tried / Decided:**
+- My first plan was three columns on `users`. Codex's consult rejected it (overwrites history,
+  client-forgeable versions, partial writes), so I switched to an append-only table that
+  mirrors `account_exports` (115).
+- I kept the 115 precedent for policy placement rather than diverging in one table.
+- Enforcement (3d) is deliberately a separate step behind a flag. Optional fields keep
+  today's frontend working during the rollout.
+
+**Failed / Blocked:**
+- The FE half was NO-GO the first time: a backend-only version bump would silently record
+  nothing. Fixed with a compile-time guard (OpenAPI `const`, then the generated TS type), so
+  the drift now fails tsc (TS2322).
+- My E2E left unverified pending rows in the local test DB, and they broke an unrelated
+  dispatcher test until cleared.
+- I ran `git checkout --` to undo a deliberate test edit and it discarded my uncommitted
+  rewrite of `legal-versions.ts`. I rewrote it. Lesson: undo test mutations with a file copy,
+  never git, while work is uncommitted.
+
+**Caught & fixed:**
+- append-only rested on grants alone (now a trigger);
+- the checkbox did not take focus on error;
+- the date test was lenient and tested a copy of the parser.
+
+**Pending / Handoff:**
+- Rollout: **the BE merges first**, then the FE. FE CI regenerates types from BE main.
+- 3d needs owner approval.
+- Owner/counsel: retention period (proposed 6 y, RCW 4.16.040), one combined checkbox vs two,
+  IP/user-agent capture.
+
+**Facts learned:**
+- Sync-engine tests always connect to `:6543`, because `session.py` rewrites the port. Locally,
+  a loopback forwarder 6543→5432 makes them runnable; the 4 "failing" registry tests were only this.
+- CREATE ROLE is transactional, so grants/RLS can be exercised with throwaway roles in a
+  rolled-back transaction without touching the cluster.
+- `/openapi.json` is served only with DEBUG on; tests use `app.openapi()`.
+
+---
+
 ## 2026-11-03 → 11-04 — The #579 fork test runs for real; leftovers closed; GitHub security features on every repo
 
 **Built / Shipped:**

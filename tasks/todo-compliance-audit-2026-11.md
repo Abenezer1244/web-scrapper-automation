@@ -39,11 +39,33 @@
   second GA page_view (`lastSent`); the annual Pro card hides the trial note; `pricingApi.ts` (unused) ignores
   `price_annual`
 
-## Phase 3: record Terms/Privacy acceptance (BE + FE, ≤5 files)
-- [ ] Migration: `users.terms_version`, `terms_accepted_at`, `privacy_version`
-- [ ] Registration schema + route require and persist them (reject if missing)
-- [ ] FE register payload sends the versions; a single source of the version constant
-- Verify: tests, OpenAPI regen, FE build
+## Phase 3: record Terms/Privacy acceptance (3a-3c DONE 2026-11-04, Codex GO; 3d pending)
+The design changed after the Codex consult: user columns became an append-only table,
+the server owns the versions, and acceptance comes from the verifier.
+- [x] 3a-i BE migration 123 `legal_acceptances` (`f6304eec`, `86f6d585`). Append-only by
+      trigger (BLD22) and by grants; DB-clock `accepted_at`; fenced; RLS; kept after purge.
+      Retention period is an owner/counsel item in the matrix.
+- [x] 3a-ii BE writer (`82ca14b4`). Records only exactly-current versions, in the account's
+      transaction; the verified flow records from verify-email only.
+- [x] 3a-iii BE `/auth/config` publishes `legal_versions` as OpenAPI constants (`d85afc4a`)
+- [x] 3b FE BFF allowlist, `lib/legal-versions.ts` typed against the backend schema,
+      verify-email checkbox (`d993bf4`, `99d1968`)
+- [x] 3c FE register sends the versions in the legacy flow (`0db6b7e`)
+- Verified:
+  - BE: 107 auth/registration tests; the role path with throwaway roles in a rolled-back
+    transaction; migration up/down/up.
+  - FE: tsc, eslint, 130 unit tests.
+  - E2E (local stack, desktop + mobile): both flows write rows; unticked is blocked;
+    focus lands on the box.
+  - Drift guard proven (TS2322 on a mismatched version).
+- **Rollout order: the BE PR merges and deploys FIRST, then the FE PR.** FE CI regenerates
+  types from BE main; an FE-first deploy would send fields the old BE silently ignores.
+- [ ] 3d (later, its own approval): require acceptance on both endpoints behind a flag once
+      telemetry shows every signup sends the fields; re-acceptance for existing users and
+      on version bumps; add acceptances to the account export. Owner/counsel: whether to
+      split Terms and Privacy into two checkboxes; whether to store IP/user agent.
+- Local test helpers (not committed): `C:/Users/micha/bl-wt/pg6543_forward.py` (sync tests
+  need :6543), `verify_123_roles.py`, `e2e_db.py`.
 
 ## Phase 4: CAN-SPAM opt-out for promotional email (BE, ≤5 files)
 - [ ] Migration: `users.marketing_emails_opt_out_at`

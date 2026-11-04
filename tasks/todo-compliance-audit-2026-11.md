@@ -20,19 +20,24 @@
 - [x] Executive report + risk register, data inventory, vendor register, retention matrix, source register, SBOMs
 - [x] Codex consult on the register and this plan (pre-implementation): AGREE, reconciled below
 
-## Phase 1: BE quick safety fixes (Category A, ≤5 files)
-- [ ] P1-6: minimise `/scrapers/sample` (initials only, 5-digit ZIP, month-level date) in `public_cache.py`, with a test
-- [ ] P2-10: top-level `permissions: contents: read` in `ci-cd.yml`; pin `@railway/cli`
-- [ ] P2-11: mark the 3 stale compliance docs superseded and fix the `nts_columbian.py:5` comment
-- Verify: ruff, targeted pytest against the guarded test DB only, OpenAPI drift check
+## Phase 1: BE quick safety fixes (DONE, Codex GO after 2 NO-GO rounds; owner chose synthetic records)
+- [x] P1-6: `/scrapers/sample` serves flagged example records. The route ignores cached records and shape-checks
+      the cached counts (`5bbd69b5`, `6bb7b319`, `854872b1`). 7 tests, proven to fail on the old route.
+- [x] P2-10: top-level `permissions: contents: read`; `@railway/cli@5.71.0` pinned (`5bbd69b5`)
+- [x] P2-11: 3 stale docs marked superseded; `nts_columbian.py` comment corrected (`ec930834`)
+- Verified: ruff clean; targeted pytest on the guarded local `_test` DB; OpenAPI regenerated (1 description line);
+  end-to-end refresh on the test DB
 
-## Phase 2: FE disclosure and tracking fixes (Category A, ≤5 files)
-- [ ] P1-8: do not load GA4 when `navigator.globalPrivacyControl` or DNT is set (`site-analytics.tsx`)
-- [ ] P1-8: correct the CookieBanner copy (it currently claims cookies are only for sign-in)
-- [ ] P1-2: DNC notice on batch export; remove "your dialer performs the final DNC scrub" (`DeliveryStep.tsx`)
-- [ ] P1-7: show the upfront annual total on the marketing pricing cards (`PlanCardsGrid.tsx`)
-- [ ] P2-8: disclose "25 contact lookups during the trial" (`data.ts`)
-- Verify: tsc, eslint, next build, Playwright desktop + mobile (no GA request with GPC on)
+## Phase 2: FE disclosure and tracking fixes (DONE, Codex GO after 2 NO-GO rounds; owner chose the GPC model)
+- [x] P1-8: GA4 not loaded under GPC or DNT (`65ea811`)
+- [x] P1-8: truthful cookie notice naming GA, GPC and DNT (`65ea811`, `fde39ca`)
+- [x] P1-2: DNC notice on batch export, tied to the menu by aria-describedby; dialer copy corrected (`9f511ea`, `fde39ca`)
+- [x] P1-7: upfront yearly totals on the pricing cards (`091082e`)
+- [x] P2-8: "25 lookup credits" in all 6 places (`091082e`, `fde39ca`, `563fbce`)
+- Verified: tsc 0, eslint 0, 126/126 unit tests, next build OK, Playwright 22/22 on desktop and mobile
+- Known, not in scope (pre-existing): a repeat visit to the same marketing page in one session sends no
+  second GA page_view (`lastSent`); the annual Pro card hides the trial note; `pricingApi.ts` (unused) ignores
+  `price_annual`
 
 ## Phase 3: record Terms/Privacy acceptance (BE + FE, ≤5 files)
 - [ ] Migration: `users.terms_version`, `terms_accepted_at`, `privacy_version`
@@ -95,5 +100,18 @@ Plan changes:
   - no confirming that a record exists to an unverified requester
 - **Five-file limit:** Codex says it is unsafe for cross-cutting work. Phases 3 and 6 will be split into sequential slices, each verified, rather than raising the limit.
 
-## Review
-(filled in at the end)
+## Review (2026-11-04)
+
+**Done:**
+- The audit (Phase 0) and Phases 1-2 are on local branches in both repos.
+- Every remediation commit passed the project's checks and a final Codex GO.
+- Nothing is pushed, merged or deployed.
+- No production data, Stripe, or paid enrichment was touched.
+
+**Still blocking launch:**
+- The P0 items: dead mailboxes, owner rights machinery, placeholders, source rights and CAPTCHA.
+- All four need the owner, counsel, or Phase 6.
+
+**Next:** owner answers to B1, then approval of Phase 3 (record terms acceptance, staged rollout).
+
+**New since the audit:** Sentry (BE #586) is merged but dormant. Disclose it before setting `SENTRY_DSN`.

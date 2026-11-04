@@ -81,6 +81,48 @@ to understand *why* the code is the way it is and *what's been attempted before*
 - `codex` and `railway` are not on the Bash PATH here: prepend `$(cygpath "$APPDATA")/npm` and
   `/c/Program Files/nodejs`.
 
+## 2026-11-04 — Legal, privacy and launch-readiness audit; first two remediation phases (local only)
+
+**Built / Shipped (local branches, nothing pushed):**
+- The audit is in `docs/legal/audit-2026-11/01..05` plus `sbom/`. The plan is `tasks/todo-compliance-audit-2026-11.md`.
+  The verdict is **not ready**, and Codex agreed independently. Four critical findings:
+  - the legal mailboxes are dead (`bridgeleads.com` is not ours; `bridgeleads.io` has no MX);
+  - non-customers are promised rights that nothing can fulfil;
+  - 11 placeholders are live on the legal pages;
+  - several sources ban automation, and the code can solve CAPTCHAs there.
+- Backend branch `audit/compliance-2026-11`:
+  - `/scrapers/sample` serves flagged example records from the route itself. It used to serve real owners' names, ZIP+4 and recording dates.
+  - CI token is `contents: read`, and the Railway CLI is pinned.
+  - Stale compliance docs are marked superseded.
+- Frontend branch `audit/compliance-2026-11`:
+  - Google Analytics does not load under GPC or DNT, and the cookie notice is now truthful.
+  - Batch exports carry the DNC notice. The dialer copy no longer claims pushed leads are off the DNC list.
+  - Pricing shows the yearly totals, and the trial is described as 25 lookup credits everywhere.
+
+**Tried / Decided:**
+- Owner chose synthetic sample records and the respect-the-browser-signal model for GA.
+- Phases were split to stay within the 5-file rule.
+- Codex rated RLS-off-by-default Critical. I downgraded it to an owner verification: the boot already alerts and is deliberately non-blocking for rollback (`session.py:405-425`).
+
+**Failed / Blocked:**
+- My first sample fix was NO-GO. It changed the writer, but the route served the cache row verbatim, so a pre-deploy row would still leak.
+- The second fix was NO-GO too: cached stats were unvalidated, and a malformed row returned a 500. GO on the third.
+- FE review caught "25 lookups" (the backend grants 25 *credits*) in six places. Two rounds to find them all.
+- `uv` is not on this laptop's PATH. I used a system Python 3.12 venv (`C:/Users/micha/bl-wt/compliance-venv`).
+
+**Caught & fixed:** stale-cache leak; 500 on a malformed cache row; the dialer copy said "not on the Do-Not-Call list" when unknown-DNC numbers are pushed; the batch DNC note was invisible to screen readers.
+
+**Pending / Handoff:**
+- Owner checklist B1 in `01-...`: mail on `bridgeleads.io`, legal entity and address, production flag values, retention windows, the Tracerfy contract and DPAs.
+- Counsel questions C1-C12.
+- Phases 3-7 are in the plan, each needing approval.
+- A new processor to disclose: **Sentry** (BE #586, dormant until `SENTRY_DSN` is set).
+- Merging either branch deploys. Owner approval is needed.
+
+**Facts learned:**
+- `tests/test_scrapers.py` registry tests fail locally because the sync URL is rewritten to `:6543`. They fail the same way on main, so this is environmental.
+- `export_openapi.py` in a requirements.txt Python 3.12 venv reproduces the committed schema byte for byte.
+
 ---
 
 ## 2026-11-02 → 11-04 — SEO skills audited and run; Google Analytics shipped behind a privacy gate

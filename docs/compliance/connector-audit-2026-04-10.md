@@ -1,5 +1,7 @@
 # WA Connector Health Audit — 2026-04-10
 
+> **Superseded in part (2026-11-04).** Several statements here no longer match the code. The current source-by-source record is [`docs/legal/audit-2026-11/05-SOURCE-RIGHTS-REGISTER.md`](../legal/audit-2026-11/05-SOURCE-RIGHTS-REGISTER.md) (section "Superseded claims"). Kept for history.
+
 Phase 1 of Sprint 6.3 triage. Read-only. No DB writes or code changes
 in this commit.
 

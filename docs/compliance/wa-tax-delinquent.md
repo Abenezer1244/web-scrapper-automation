@@ -1,5 +1,7 @@
 # Washington State — Tax Delinquent Record Compliance
 
+> **Superseded in part (2026-11-04).** Several statements here no longer match the code. The current source-by-source record is [`docs/legal/audit-2026-11/05-SOURCE-RIGHTS-REGISTER.md`](../legal/audit-2026-11/05-SOURCE-RIGHTS-REGISTER.md) (section "Superseded claims"). Kept for history.
+
 ## Legal framework
 
 **RCW 42.56.070(8)** (Washington Public Records Act) prohibits using

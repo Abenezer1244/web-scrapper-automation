@@ -1,9 +1,12 @@
 """Clark County (The Columbian classifieds) NTS ingestion adapter.
 
 WA law (RCW 61.24.040) requires every Notice of Trustee Sale to be published in a
-county legal newspaper. The Columbian (Clark County's paper) publishes them free and
-open (robots.txt 404 — no restriction) at classifieds.columbian.com under the "Legal
-Notices" subcategory. Unlike the Tacoma Daily Index (one HTML page per notice) or the
+county legal newspaper. The Columbian (Clark County's paper) publishes them free at
+classifieds.columbian.com under the "Legal Notices" subcategory. Its robots.txt was a
+404 when this adapter was written; as of 2026-11-04 it serves Cloudflare content
+signals (use=reference, ai-train=no) and an EU rights reservation, and the site states
+that use constitutes acceptance of its Terms of Use (not yet reviewed). See
+docs/legal/audit-2026-11/05-SOURCE-RIGHTS-REGISTER.md before relying on this source. Unlike the Tacoma Daily Index (one HTML page per notice) or the
 Pacific Publishing weekly PDFs, The Columbian serves ONE rolling listing page (no
 pagination) that MIXES every current legal notice (court summons, probate, RFP/bids,
 and the occasional trustee sale). Each ad links to a permalink ``/ad-details/<id>``

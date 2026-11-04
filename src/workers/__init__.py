@@ -214,7 +214,7 @@ def _reset_inherited_db_pool(**_kwargs) -> None:
     """
     from src.db.session import sync_engine
 
-    sync_engine.dispose(close=False)
+    sync_engine.dispose(close=True)  # SENSITIVITY CHECK
 
 
 @worker_ready.connect

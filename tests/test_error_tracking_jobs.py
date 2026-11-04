@@ -240,11 +240,14 @@ def test_fail_job_reports_once_when_its_cas_lands(tracking, starter_user, scrape
 def test_fail_job_sends_nothing_for_a_business_outcome_or_a_stale_attempt(
     tracking, starter_user, scraper_config, redis_client
 ):
+    # One active job per config (uq_jobs_one_active_per_config): the refused job is
+    # terminal before the stale-attempt job is created.
     refused = _job(starter_user.id, scraper_config.id)
-    stale = _job(starter_user.id, scraper_config.id)
     with SyncSessionLocal() as s:
         job = s.get(Job, refused)
         assert _fail_job(s, job, redis_client, refused, "paused", report=False) is True
+    stale = _job(starter_user.id, scraper_config.id)
+    with SyncSessionLocal() as s:
         job = s.get(Job, stale)
         old_token = AttemptToken(started_at=datetime(2020, 1, 1, tzinfo=UTC), retry_count=0)
         assert _fail_job(s, job, redis_client, stale, "late", expected_started_at=old_token) is False

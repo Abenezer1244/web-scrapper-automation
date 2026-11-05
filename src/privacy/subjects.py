@@ -131,7 +131,7 @@ _HARD_ENTITY_WORDS = _COMPANY_WORDS | _TRUST_WORDS | _GOVERNMENT_WORDS
 # 'ET AL' / 'ET UX' / 'ET VIR' add other people; the named person is still named.
 _ET_AL_RE = re.compile(r"\s+(?:ET\s*(?:AL|UX|VIR)|ETAL|ETUX)\b\.?", re.IGNORECASE)
 # Broader than the export's prefix: probate cells also write 'EST OF JANE DOE'.
-_ESTATE_PREFIX_RE = re.compile(r"^(?:THE\s+)?EST(?:ATE)?\.?\s+OF\s+", re.IGNORECASE)
+_ESTATE_PREFIX_RE = re.compile(r"^(?:THE\s+)?EST(?:ATE)?\.?\s+OF(?:\s+|$)", re.IGNORECASE)
 _WORD_RE = re.compile(r"[A-Z]+")
 _PUNCT_RE = re.compile(r"[^\w\s]", re.UNICODE)
 _WS_RE = re.compile(r"\s+")
@@ -249,6 +249,7 @@ def _party_subjects(party: str, raw_len: int, base: dict) -> list[Subject]:
                        review_reason=reason, **extra)
 
     capacity = None
+    as_given = party
     party = _ALIAS_TAIL_RE.sub("", _CARE_OF_RE.sub("", party)).strip()
     if _ESTATE_PREFIX_RE.match(party) or _TRAILING_ESTATE_RE.search(party):
         capacity = "estate"
@@ -260,7 +261,9 @@ def _party_subjects(party: str, raw_len: int, base: dict) -> list[Subject]:
     has_prefix = bool(_ESTATE_PREFIX_RE.match(party))
     party = _ESTATE_PREFIX_RE.sub("", party).strip()
     if not _words(party):
-        return []
+        # Nothing left once markers are stripped ('ESTATE OF'): still a review
+        # item, never silently dropped (Codex).
+        return [unresolved(UNREADABLE_IN_ORDER, as_given, capacity=capacity)]
 
     hard_entity = (bool(set(_words(party)) & _HARD_ENTITY_WORDS)
                    or bool(_SPACED_ENTITY_RE.search(party.upper())))
@@ -276,32 +279,46 @@ def _party_subjects(party: str, raw_len: int, base: dict) -> list[Subject]:
     parts = [p.strip() for p in _COOWNER_JOIN_RE.split(party) if p.strip()]
 
     strength = _entity_strength(party, raw_len)
-    if strength:
-        if len(parts) > 1:
-            # The export blanks a whole cell with an entity in it; here that would
-            # hide 'SMITH JOHN' in 'SMITH JOHN & WELLS FARGO BANK NA'. Split when a
-            # strong entity part sits beside a non-entity part; an all-entity cell
-            # ('WSDOT R/E SERVICES') stays whole.
-            strengths = [_entity_strength(p, raw_len if i == len(parts) - 1 else len(p))
-                         for i, p in enumerate(parts)]
-            if "strong" in strengths and None in strengths:
-                out: list[Subject] = []
-                for part, part_strength in zip(parts, strengths, strict=True):
-                    if part_strength == "strong":
-                        out.append(Subject(**base, kind=KIND_ENTITY,
-                                           text=normalize_text(part),
-                                           entity_type=_entity_type(part)))
-                    elif part_strength == "weak":
-                        out.append(unresolved(ENTITY_OR_PERSON, part, capacity=capacity))
-                    else:
-                        out.extend(_read_people([part], part, order, base, capacity))
-                return out
-        if strength == "weak":
+    if strength and len(parts) > 1:
+        # The export blanks a whole cell with an entity in it; here that would hide
+        # 'SMITH JOHN' in 'SMITH JOHN & WELLS FARGO BANK NA'. Only a cell whose
+        # EVERY part is an entity ('WSDOT R/E SERVICES') stays one entity. Beside a
+        # strong entity part, every other part is judged on its own; with no strong
+        # part at all, the evidence spans the joiner and the cell goes to review.
+        strengths = [_entity_strength(p, raw_len if i == len(parts) - 1 else len(p))
+                     for i, p in enumerate(parts)]
+        if all(s == "strong" for s in strengths):
+            return [Subject(**base, kind=KIND_ENTITY, text=normalize_text(party),
+                            entity_type=_entity_type(party))]
+        if "strong" not in strengths:
             return [unresolved(ENTITY_OR_PERSON, capacity=capacity)]
+        out: list[Subject] = []
+        for part, part_strength in zip(parts, strengths, strict=True):
+            if part_strength == "strong":
+                out.append(Subject(**base, kind=KIND_ENTITY, text=normalize_text(part),
+                                   entity_type=_entity_type(part)))
+            elif part_strength == "weak":
+                out.append(unresolved(ENTITY_OR_PERSON, part, capacity=capacity))
+            else:
+                out.extend(_guarded_people([part], part, order, base, capacity))
+        return out
+    if strength == "weak":
+        return [unresolved(ENTITY_OR_PERSON, capacity=capacity)]
+    if strength == "strong":
         return [Subject(**base, kind=KIND_ENTITY, text=normalize_text(party),
                         entity_type=_entity_type(party))]
-    if _CAPACITY_RE.search(party) or _HONORIFIC_RE.search(party):
-        return [unresolved(ROLE_OR_CAPACITY, capacity=capacity)]
+    return _guarded_people(parts, party, order, base, capacity)
+
+
+def _guarded_people(
+    parts: list[str], party: str, order: str | None, base: dict, capacity: str | None
+) -> list[Subject]:
+    """The one way into _read_people: a role, capacity or honorific word anywhere
+    in ``party`` ('SMITH JOHN AS AGENT', 'LANGE CARL R MRS') makes it review-only."""
+    if (_PERSON_ROLE_RE.search(party) or _CAPACITY_RE.search(party)
+            or _HONORIFIC_RE.search(party)):
+        return [Subject(**base, kind=KIND_UNRESOLVED, text=normalize_text(party),
+                        review_reason=ROLE_OR_CAPACITY, capacity=capacity)]
     return _read_people(parts, party, order, base, capacity)
 
 
@@ -380,6 +397,11 @@ def subjects_from(
     for party in _PARTY_SEP_RE.split(text):
         if party.strip():
             subjects.extend(_party_subjects(party.strip(), len(party.strip()), base))
+    if not subjects:
+        # Non-empty text that left no party (', A MARRIED MAN', ' ; '): only empty
+        # input may yield nothing, so this still reaches review.
+        subjects.append(Subject(**base, kind=KIND_UNRESOLVED, text=normalize_text(folded),
+                                review_reason=UNREADABLE_IN_ORDER))
     return subjects
 
 

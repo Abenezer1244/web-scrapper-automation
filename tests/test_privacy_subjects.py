@@ -191,6 +191,34 @@ def test_a_mixed_cell_part_that_is_not_a_full_name_goes_to_review():
         (KIND_ENTITY, None), (KIND_UNRESOLVED, GIVEN_NAME_MISSING)]
 
 
+def test_a_weak_part_beside_a_strong_entity_is_not_swallowed():
+    subs = _subs("CHURCH JOHN & ACME LLC", REC)
+    assert [(s.kind, s.review_reason) for s in subs] == [
+        (KIND_UNRESOLVED, ENTITY_OR_PERSON), (KIND_ENTITY, None)]
+
+
+def test_a_cell_with_no_strong_part_goes_to_review_whole():
+    (sub,) = _subs("CHURCH JOHN & BANK JANE", REC)
+    assert sub.review_reason == ENTITY_OR_PERSON and subject_key_values(sub) == []
+
+
+@pytest.mark.parametrize("raw", ["SMITH JOHN AS AGENT & ACME LLC",
+                                 "LANGE CARL R MRS & ACME LLC"])
+def test_a_mixed_cell_person_part_keeps_the_role_guards(raw):
+    subs = _subs(raw, REC)
+    assert [(s.kind, s.review_reason) for s in subs] == [
+        (KIND_UNRESOLVED, ROLE_OR_CAPACITY), (KIND_ENTITY, None)]
+    assert all(k == "entity" for k, _v in _keys(raw, REC))
+
+
+@pytest.mark.parametrize("raw", ["ESTATE OF", ", A MARRIED MAN", " ; ", "---",
+                                 "SMITH JOHN / ESTATE OF"])
+def test_non_empty_text_is_never_silently_dropped(raw):
+    subs = _subs(raw, REC)
+    assert subs, "only empty input may yield no subject"
+    assert subs[-1].kind == KIND_UNRESOLVED and subs[-1].review_reason == UNREADABLE_IN_ORDER
+
+
 # ── Estates, roles, noise ────────────────────────────────────────────────────
 
 def test_estates_are_marked_not_decided():

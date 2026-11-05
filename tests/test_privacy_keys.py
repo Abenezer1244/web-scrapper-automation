@@ -33,8 +33,17 @@ def test_digest_is_deterministic_hex_and_keyed():
     assert d != hashlib.sha256(b"smith|john").hexdigest()
 
 
-def test_kinds_are_domain_separated():
+def test_kinds_are_domain_separated(monkeypatch):
+    # Give property a form for this test only, so the same value can be keyed
+    # under two kinds: the kind inside the MAC input must still separate them.
+    monkeypatch.setitem(keys._CANONICAL, "property", lambda v: v)
     assert keys.privacy_hmac("entity", "main") != keys.privacy_hmac("property", "main")
+
+
+@pytest.mark.parametrize("kind", ["property", "mailing"])
+def test_addresses_cannot_be_keyed_until_their_normaliser_exists(kind):
+    with pytest.raises(ValueError):
+        keys.privacy_hmac(kind, "123 main st")
 
 
 @pytest.mark.parametrize(("kind", "value"), [
@@ -47,7 +56,6 @@ def test_kinds_are_domain_separated():
     ("phone", "12065551234"),
     ("email", "Jane@Example.com"),
     ("email", "not-an-email"),
-    ("property", " 123 main st"),
 ])
 def test_non_canonical_values_are_refused(kind, value):
     # Two spellings of one value would make two digests that never meet.

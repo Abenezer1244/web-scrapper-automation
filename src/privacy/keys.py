@@ -19,8 +19,9 @@ a rule of another (a surname equal to a street name, say).
 Canonical values only: ``privacy_hmac`` refuses a value that is not already in
 its kind's canonical form (the normalisers in src/privacy/subjects.py), because a
 digest of 'Smith|John' and one of 'smith|john' would never meet. Property and
-mailing addresses get their normaliser with the address matcher; until then the
-floor is trimmed, casefolded text.
+mailing addresses have NO canonical form until the address normaliser ships with
+the address matcher, so until then they cannot be keyed at all: a weak floor
+('123 Main St.' vs '123 MAIN STREET') would make rules that silently never match.
 
 Configuration is read ONCE per process, as one snapshot of (current version,
 keyring): a running worker never mixes a current version from new settings with a
@@ -61,8 +62,8 @@ def _canonical_person(value: str) -> str | None:
     return person_key_value(surname, given) if sep else None
 
 
-def _canonical_text(value: str) -> str | None:
-    return value.strip().casefold() or None
+def _no_canonical_form_yet(value: str) -> str | None:
+    return None  # refused until the address normaliser defines the form
 
 
 # kind -> the normaliser whose output is that kind's only acceptable input.
@@ -71,8 +72,8 @@ _CANONICAL = {
     "entity": entity_key_value,
     "phone": phone_key_value,
     "email": email_key_value,
-    "property": _canonical_text,
-    "mailing": _canonical_text,
+    "property": _no_canonical_form_yet,
+    "mailing": _no_canonical_form_yet,
 }
 
 _lock = threading.Lock()

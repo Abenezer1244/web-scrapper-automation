@@ -16,7 +16,7 @@ from sqlalchemy import text
 
 from src.config import settings
 
-_WEBHOOK_SECRET = "whsec_dispute_alert_signature_secret_0123456789"
+_WEBHOOK_SECRET = "test_dispute_alert_signature_secret_0123456789"
 
 
 def _signed(event: dict) -> tuple[bytes, str]:

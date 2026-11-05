@@ -1,0 +1,126 @@
+"""Versioned keyed HMACs for privacy suppression rules (design section 5).
+
+A rule names a property and a person without storing either: it stores
+``privacy_hmac(kind, value)`` digests. Names and addresses in public records are
+guessable, so an unkeyed hash would be reversible by trying candidates; a keyed
+HMAC is not, to anyone without the key.
+
+Unlike the email blind index this keyring ROTATES. Every digest is tied to a key
+version, a rule records the version it was made under, and during a rotation a
+rule carries digests under every live version (``privacy_hmacs``), so matching
+never has a gap. Each version's key is HKDF-derived from its configured secret
+with the version in the context, so two versions can never collide even if an
+operator reuses a secret.
+
+Domain separation: the ``kind`` ("property", "mailing", "person", "entity",
+"phone", "email") is inside the MAC input, so a value of one kind can never match
+a rule of another (a surname equal to a street name, say).
+"""
+from __future__ import annotations
+
+import hashlib
+import hmac
+import re
+import threading
+
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+from src.config import settings
+
+KINDS = frozenset({"property", "mailing", "person", "entity", "phone", "email"})
+_VERSION_RE = re.compile(r"^v[1-9][0-9]{0,3}$")
+_INFO_PREFIX = b"bridgeleads:privacy-hmac:"
+_DEV_INFO_PREFIX = b"bridgeleads:privacy-hmac:dev:"
+
+_lock = threading.Lock()
+_keyring: dict[str, bytes] | None = None
+
+
+def _derive(secret: bytes, info: bytes) -> bytes:
+    return HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=info).derive(secret)
+
+
+def _load_keyring() -> dict[str, bytes]:
+    """Parse PRIVACY_HMAC_KEYS into {version: derived key}. Raises on any defect.
+
+    Fails CLOSED in production or strict mode when unset, like the blind index: a
+    SECRET_KEY-derived key would change with a routine JWT-key rotation and
+    silently unmatch every suppression rule, which would re-expose people who
+    asked to be removed.
+    """
+    configured = (settings.PRIVACY_HMAC_KEYS or "").strip()
+    current = (settings.PRIVACY_HMAC_CURRENT_VERSION or "").strip()
+    if not _VERSION_RE.match(current):
+        raise RuntimeError(f"PRIVACY_HMAC_CURRENT_VERSION {current!r} is not like 'v1'")
+    if not configured:
+        if settings.PII_ENCRYPTION_STRICT or settings.ENVIRONMENT.strip().lower() == "production":
+            raise RuntimeError(
+                "PRIVACY_HMAC_KEYS is not set in production / strict mode. Refusing the "
+                "SECRET_KEY-derived fallback: a SECRET_KEY rotation would silently unmatch "
+                "every privacy suppression rule."
+            )
+        return {current: _derive(settings.SECRET_KEY.encode("utf-8"),
+                                 _DEV_INFO_PREFIX + current.encode("ascii"))}
+    ring: dict[str, bytes] = {}
+    for entry in configured.split(","):
+        version, sep, secret = entry.strip().partition(":")
+        if not sep or not _VERSION_RE.match(version) or len(secret.strip()) < 32:
+            raise RuntimeError(
+                "PRIVACY_HMAC_KEYS must be 'v1:<secret of 32+ chars>[,v2:<secret>...]'")
+        if version in ring:
+            raise RuntimeError(f"PRIVACY_HMAC_KEYS lists {version} twice")
+        ring[version] = _derive(secret.strip().encode("utf-8"),
+                                _INFO_PREFIX + version.encode("ascii"))
+    if current not in ring:
+        raise RuntimeError(f"PRIVACY_HMAC_CURRENT_VERSION {current} has no key in PRIVACY_HMAC_KEYS")
+    return ring
+
+
+def _ring() -> dict[str, bytes]:
+    global _keyring
+    if _keyring is None:
+        with _lock:
+            if _keyring is None:
+                _keyring = _load_keyring()
+    return _keyring
+
+
+def reset_keyring_cache() -> None:
+    """Forget the parsed keyring (after a settings change; tests)."""
+    global _keyring
+    with _lock:
+        _keyring = None
+
+
+def current_version() -> str:
+    _ring()  # validates the configuration
+    return settings.PRIVACY_HMAC_CURRENT_VERSION.strip()
+
+
+def live_versions() -> tuple[str, ...]:
+    return tuple(sorted(_ring()))
+
+
+def privacy_hmac(kind: str, value: str, version: str | None = None) -> str:
+    """Hex HMAC-SHA256 of an ALREADY-NORMALISED value under one key version.
+
+    Normalisation belongs to the caller (src/privacy/subjects.py), which versions it
+    separately; this function only refuses inputs that cannot be right.
+    """
+    if kind not in KINDS:
+        raise ValueError(f"unknown privacy key kind {kind!r}")
+    if not isinstance(value, str) or not value.strip():
+        # An empty value would make one digest that matches every empty field.
+        raise ValueError("refusing to key an empty value")
+    ring = _ring()
+    v = version or current_version()
+    if v not in ring:
+        raise KeyError(f"privacy key version {v} is not live")
+    msg = b"privacy|" + kind.encode("ascii") + b"|" + value.encode("utf-8")
+    return hmac.new(ring[v], msg, hashlib.sha256).hexdigest()
+
+
+def privacy_hmacs(kind: str, value: str) -> dict[str, str]:
+    """The digest under EVERY live version, for rules made or matched mid-rotation."""
+    return {v: privacy_hmac(kind, value, v) for v in live_versions()}

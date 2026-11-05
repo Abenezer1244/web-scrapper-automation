@@ -81,6 +81,18 @@ class Settings(BaseSettings):
     #   python -c "import secrets; print(secrets.token_urlsafe(32))"
     BLIND_INDEX_KEY: str = ""
 
+    # Privacy suppression keyring (compliance audit 2026-11, Phase 6 design, section 5).
+    # Keyed HMACs identify a person in a suppression rule without storing the name or
+    # address. Dedicated and VERSIONED, unlike BLIND_INDEX_KEY, so it can rotate: a
+    # rule records the version it was keyed under, and during a rotation rules carry
+    # HMACs under both. Format: "v1:<secret>[,v2:<secret>...]"; the current version
+    # signs new rules, every listed version still matches. Blank = derived from
+    # SECRET_KEY via HKDF (dev/test only; refused in production or strict mode).
+    # Nothing reads it in production until Phase 6 ships. Generate a secret:
+    #   python -c "import secrets; print(secrets.token_urlsafe(32))"
+    PRIVACY_HMAC_KEYS: str = ""
+    PRIVACY_HMAC_CURRENT_VERSION: str = "v1"
+
     # H3 PII encryption read mode. While False (tolerant), decrypt_field() treats
     # any value that is not a valid fe1:-prefixed Fernet token as legacy
     # plaintext and returns it as-is — required during the backfill window. Flip

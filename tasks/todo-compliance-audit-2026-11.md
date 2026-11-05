@@ -67,12 +67,36 @@ the server owns the versions, and acceptance comes from the verifier.
 - Local test helpers (not committed): `C:/Users/micha/bl-wt/pg6543_forward.py` (sync tests
   need :6543), `verify_123_roles.py`, `e2e_db.py`.
 
-## Phase 4: CAN-SPAM opt-out for promotional email (BE, ≤5 files)
-- [ ] Migration: `users.marketing_emails_opt_out_at`
-- [ ] Signed one-click unsubscribe route (RFC 8058 POST + GET confirmation page)
-- [ ] `List-Unsubscribe` / `List-Unsubscribe-Post` headers and a footer link on promotional mail only
-- [ ] Onboarding nudges and trial-ending mail skip opted-out users
-- Blocked for the postal address in the footer: owner B1-1
+## Phase 4: CAN-SPAM opt-out for commercial email (DONE 2026-11-04; Codex: GO for the email work)
+Design changed after the Codex consult: opt-outs are keyed by the address's email_hmac in their own
+table, not a users column, so they survive deletion and re-registration.
+**Owner decision 2026-11-04:** commercial email is HELD until COMPANY_POSTAL_ADDRESS is set.
+- [x] 4a migration 124 `marketing_email_suppressions` (append-only, BLD23 trigger, HMAC only)
+- [x] 4b signed address-bound token (400 d) + GET confirm / POST opt-out (form or RFC 8058 one-click);
+      hidden from OpenAPI
+- [x] 4c welcome, day-1, day-3 and trial-ending are commercial. Each gets List-Unsubscribe headers,
+      a footer link and the postal address, a send-time suppression check, and is HELD with an ops
+      alert while API_BASE_URL or the address is unusable. Send functions return outcomes.
+- [x] 4d beat skips accounts pending deletion and counts only real sends
+- [x] Codex review fixes:
+  - per-address rate limit (no 429s from shared provider IPs);
+  - the welcome send runs in the threadpool;
+  - form rel=noreferrer (verified: no Referer);
+  - streamed 4 KiB body cap; strict bare-origin base;
+  - cutover step2 re-grant revoked for 123/124.
+- Verified:
+  - 162 tests incl. peer #590's;
+  - E2E on the local API: browser confirm, then POST, then a `link` row; curl one-click gives a
+    `one_click` row; a bad token gives 400;
+  - rendered email checked at phone width.
+- Reasoned disagreement (Codex ACCEPTED): check-then-send race. A lock cannot un-send an in-flight
+  email; CAN-SPAM allows 10 business days.
+- Not changed, tracked as P2-13: the June cutover script would over-grant older post-cutover
+  tables (account_exports, job_degradations, pending_email_changes, deletion tables) if re-run.
+- Polish (P3): the confirm page is unstyled because the API's global CSP drops inline styles, as on
+  the download-error page.
+- Counsel: confirm the commercial/transactional classification and the indefinite suppression
+  retention.
 
 ## Phase 5: checkout and billing disclosures (BE, ≤5 files)
 - [ ] Stripe Checkout `custom_text.submit`: renewal amount, interval, cancel path (test mode only)

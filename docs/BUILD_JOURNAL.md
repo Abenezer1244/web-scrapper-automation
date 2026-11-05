@@ -19,6 +19,58 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-11-04 — CAN-SPAM opt-out for commercial email (compliance Phase 4, local only)
+
+**Built / Shipped (local branch `audit/compliance-2026-11`, nothing pushed):**
+- Migration 124 `marketing_email_suppressions`:
+  - append-only (BLD23), keyed by email_hmac.
+- Signed address-bound unsubscribe token (400 days).
+- `/email/unsubscribe`:
+  - GET shows a confirm page;
+  - POST takes the form or an RFC 8058 one-click.
+- The welcome, day-1, day-3 and trial-ending emails are now commercial. Each carries List-Unsubscribe
+  headers, a footer link and the postal address, checks the suppression list at send time, and is HELD
+  (with an ops alert) while API_BASE_URL or COMPANY_POSTAL_ADDRESS is unusable.
+- The beat skips accounts pending deletion and counts real sends only.
+
+**Tried / Decided:**
+- A users column was rejected (Codex consult): it does not survive deletion or re-registration and
+  would follow a user to a new address. The opt-out is keyed by address instead.
+- **Owner chose to hold commercial mail** until the postal address is set. Until then, no welcome,
+  nudge or trial-ending emails go out.
+- The welcome email counts as commercial (Codex) because it promotes the trial.
+
+**Failed / Blocked:**
+- Codex NO-GO twice.
+  - Round 1:
+    - per-IP rate limit could 429 one-click opt-outs from shared provider IPs;
+    - sync DB + Resend blocked the event loop in the welcome path;
+    - Referer could carry the token;
+    - base-URL path not checked.
+  - Round 2:
+    - the cutover script's blanket re-grant;
+    - the meta referrer is unreliable, so I added form rel=noreferrer;
+    - the Content-Length-only cap, so the body is now read as a stream;
+    - userinfo in the base URL.
+- I first set a Referrer-Policy header that the middleware silently overwrites, and removed it.
+
+**Caught & fixed:**
+- I put a module-level `src.api` import in a worker module (an import-cycle risk) and made it lazy.
+- The outcome log sorted a Counter with mixed None/str keys.
+
+**Pending / Handoff:**
+- Owner sets COMPANY_POSTAL_ADDRESS (and confirms API_BASE_URL) on api + worker.
+- P2-13: the cutover script would over-grant on a re-run for older tables.
+- Counsel: confirm the email classification and the indefinite suppression retention.
+
+**Facts learned:**
+- SecurityHeadersMiddleware overwrites CSP and Referrer-Policy on every response (default-src 'none'
+  strips inline styles on API HTML pages).
+- `rate_limit(identifier=...)` keys a bucket by anything, not just IP.
+- `<form rel=noreferrer>` drops Referer on the POST (verified in Chromium).
+
+---
+
 ## 2026-11-04 — Terms/Privacy acceptance is recorded (compliance Phase 3a-c, local only)
 
 **Built / Shipped (local branches `audit/compliance-2026-11`, nothing pushed):**

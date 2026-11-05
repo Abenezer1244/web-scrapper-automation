@@ -468,6 +468,11 @@ async def test_checkout_sends_two_line_items_and_no_quantity_on_the_metered_one(
     assert items[0] == {"price": plan_price, "quantity": 1}
     assert items[1] == {"price": "price_st_pro_m"}
     assert "quantity" not in items[1]
+    # The renewal terms ride on the same session, for exactly this plan, interval
+    # and metering (compliance audit 2026-11, Phase 5a).
+    _plan, _limit, interval = billing._PRICE_TO_PLAN[plan_price]
+    assert captured["custom_text"] == {
+        "submit": {"message": billing._renewal_terms("pro", interval, metered=True)}}
 
 
 @pytest.mark.integration

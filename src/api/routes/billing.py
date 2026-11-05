@@ -842,6 +842,39 @@ _SKIP_TRACE_METERED_PRICE: dict[str, dict[str, str]] = {
 }
 
 
+def _renewal_terms(plan_id: str, interval: str, metered: bool) -> str:
+    """The automatic-renewal disclosure shown above Checkout's pay button.
+
+    ROSCA (15 U.S.C. 8403) requires the material terms of a negative-option sale to
+    be clear before billing (compliance audit 2026-11, Phase 5; Codex consult). Read
+    from the same catalog and rates Stripe bills from, never typed here. States only
+    what the code can vouch for: no cancellation timing (the live Customer Portal
+    decides it) and no overage invoice timing (that is Stripe price configuration).
+    The overage rate appears only when a metered item is actually on the session.
+    """
+    from src.config.lookup_pricing import unit_price_cents
+    from src.config.plans import get_plan
+
+    plan = get_plan(plan_id)
+    annual = interval == "year"
+    amount = plan["price_annual"] if annual else plan["price_monthly"]
+    parts = [
+        f"Your {plan['name']} plan renews automatically every "
+        f"{'year' if annual else 'month'} for ${amount:,} USD until you cancel or the "
+        "subscription otherwise ends.",
+        "An accepted promotion code reduces only the invoices its terms cover.",
+    ]
+    included = settings.SKIP_TRACE_BUNDLED_QUOTAS.get(plan_id, 0)
+    cents = unit_price_cents(plan_id)
+    if included:
+        lookups = f"It includes {included:,} contact lookups each month"
+        if metered and cents:
+            lookups += f"; additional lookups cost ${cents / 100:.2f} USD each"
+        parts.append(lookups + ".")
+    parts.append("To cancel, open Billing in your BridgeLeads settings.")
+    return " ".join(parts)
+
+
 def _metered_skip_trace_price(plan: str, interval: str) -> str | None:
     """The metered skip-trace Price to put on this subscription, or None.
 
@@ -1208,6 +1241,9 @@ async def create_checkout(
             # the coupon's applies_to, which products it may discount (see the
             # single-customer promotion note above).
             allow_promotion_codes=True,
+            # The renewal terms, above the pay button (ROSCA clear disclosure).
+            custom_text={"submit": {"message": _renewal_terms(
+                _plan_id, _interval, metered=bool(metered_price))}},
         )
 
         # Defense in depth for the one window the checks above leave: a Session

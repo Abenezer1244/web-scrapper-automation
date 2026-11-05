@@ -145,7 +145,8 @@ _ESTATE_PREFIX_RE = re.compile(r"^(?:THE\s+)?EST(?:ATE)?\.?\s+OF\b[\s,.;:]*", re
 _TRAILING_ESTATE_EXTRA_RE = re.compile(
     r"[\s,]+(?:THE\s+)?(?:EST(?:ATE)?\.?(?:\s+OF)?|HEIRS\s+OF)[\s,.;:]*$", re.IGNORECASE)
 _WORD_RE = re.compile(r"[A-Z]+")
-_PUNCT_RE = re.compile(r"[^\w\s]", re.UNICODE)
+# \w keeps '_', which is punctuation in a name ('ACME_LLC' must equal 'ACME LLC').
+_PUNCT_RE = re.compile(r"[^\w\s]|_", re.UNICODE)
 _WS_RE = re.compile(r"\s+")
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
@@ -310,7 +311,12 @@ def _party_subjects(
         return [Subject(**base, kind=KIND_UNRESOLVED, text=normalize_text(as_given),
                         review_reason=UNREADABLE_IN_ORDER, capacity=capacity)]
     subjects = _classify_party(party, raw_len, base, capacity, has_prefix)
-    if orphan:
+    slots = _COOWNER_JOIN_RE.split(party)
+    empty_slot = len(slots) > 1 and any(
+        not slot.strip() or _DANGLING_JOINER_RE.search(slot) for slot in slots)
+    if orphan or empty_slot:
+        # An orphan marker, or an empty co-owner slot ('SMITH JOHN & & DOE JANE'
+        # splits into 'SMITH JOHN' and '& DOE JANE').
         subjects.append(Subject(**base, kind=KIND_UNRESOLVED, text=normalize_text(as_given),
                                 review_reason=UNREADABLE_IN_ORDER))
     return subjects
@@ -462,13 +468,15 @@ def subjects_from(
         return [Subject(**base, kind=KIND_UNRESOLVED, text=normalize_text(folded),
                         review_reason=NON_LATIN_SCRIPT)]
     text = _VESTING_TAIL_RE.sub("", folded)
+    segments = _PARTY_SEP_RE.split(text)
     subjects: list[Subject] = []
-    for party in _PARTY_SEP_RE.split(text):
+    for party in segments:
         if party.strip():
             subjects.extend(_party_subjects(party.strip(), len(party.strip()), base))
-    if not subjects:
-        # Non-empty text that left no party (', A MARRIED MAN', ' ; '): only empty
-        # input may yield nothing, so this still reaches review.
+    if not subjects or (len(segments) > 1 and any(not seg.strip() for seg in segments)):
+        # Non-empty text that left no party (', A MARRIED MAN', ' ; '), or an empty
+        # party slot ('SMITH JOHN ; ; DOE JANE'): only empty input may yield
+        # nothing, so the cell also goes to review as a whole.
         subjects.append(Subject(**base, kind=KIND_UNRESOLVED, text=normalize_text(folded),
                                 review_reason=UNREADABLE_IN_ORDER))
     return subjects

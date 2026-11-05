@@ -312,6 +312,24 @@ def test_a_surname_with_only_an_initial_is_unresolved():
     assert sub.review_reason == GIVEN_NAME_MISSING and subject_key_values(sub) == []
 
 
+def test_underscore_is_punctuation_in_every_key():
+    assert normalize_text("ACME_LLC") == "acme llc"
+    assert _keys("ACME_HOLDINGS LLC", REC) == [("entity", "acme holdings llc")]
+    assert person_key_value("SMITH_JONES", "MARY_ANN") == "smith jones|mary"
+    # Nothing but underscores is not a name.
+    assert person_key_value("___", "john") is None
+    assert [s.review_reason for s in _subs("___", REC)] == [UNREADABLE_IN_ORDER]
+
+
+@pytest.mark.parametrize("raw", ["SMITH JOHN ; ; DOE JANE", "SMITH JOHN & & DOE JANE",
+                                 "ACME LLC & & WELLS FARGO BANK NA"])
+def test_an_empty_slot_between_separators_adds_a_review_item(raw):
+    subs = _subs(raw, REC)
+    assert subs[-1].kind == KIND_UNRESOLVED and subs[-1].review_reason == UNREADABLE_IN_ORDER
+    # The readable neighbours are still read.
+    assert len([s for s in subs if s.kind != KIND_UNRESOLVED]) >= 1
+
+
 def test_care_of_and_alias_tails_do_not_become_people():
     assert _keys("JOHN SMITH C/O JANE DOE", NAT) == [("person", "smith|john")]
     assert _keys("MENDOZA JOSE M AKA JOE MENDOZA", REC) == [("person", "mendoza|jose")]

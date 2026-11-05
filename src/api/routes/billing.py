@@ -1661,10 +1661,12 @@ def _no_subscription_conflict() -> HTTPException:
 
 class ChangePlanRequest(BaseModel):
     price_id: str
-    # The renewal amount (whole USD) the switch dialog SHOWED. When given, the switch
-    # is refused with 409 price_changed if the plan's price is no longer that, so a
-    # customer is never charged an amount they were not shown (compliance audit
-    # 2026-11, Phase 5c). Optional so an older frontend keeps working.
+    # The renewal amount (whole USD) the switch dialog SHOWED. REQUIRED: the switch
+    # is refused with 409 (price_unconfirmed when missing, price_changed when it no
+    # longer matches), so a customer is never charged an amount they were not shown
+    # (compliance audit 2026-11, Phase 5c; Codex). Typed optional only so a missing
+    # value gets that friendly 409 instead of a bare 422: a tab still running the
+    # previous frontend reloads and retries, and no money moves.
     expected_price: int | None = Field(default=None, ge=0)
 
 
@@ -1715,7 +1717,16 @@ async def change_plan(
     # Stripe Price that will be charged, before the per-user lock (Codex, Phase 5).
     verified = _verified_plan_price(new_plan, stripe_price_id, new_interval,
                                     route="change-plan", strict=True)
-    if body.expected_price is not None and body.expected_price * 100 != verified["unit_amount"]:
+    if body.expected_price is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "price_unconfirmed",
+                "message": "Reload Billing and try again, so you can confirm the price "
+                           "before switching.",
+            },
+        )
+    if body.expected_price * 100 != verified["unit_amount"]:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail={

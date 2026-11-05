@@ -107,7 +107,7 @@ async def test_a_declined_upgrade_is_402_and_changes_nothing(db, client, monkeyp
 
     resp = await client.post(
         "/billing/change-plan",
-        json={"price_id": agency_m},
+        json={"price_id": agency_m, "expected_price": get_plan("agency")["price_monthly"]},
         headers={"Authorization": f"Bearer {create_secure_token(user.id)}"},
     )
     assert resp.status_code == 402, resp.text
@@ -166,3 +166,44 @@ async def test_a_switch_at_a_price_the_customer_was_not_shown_is_refused(db, cli
     assert resp.status_code == 409, resp.text
     assert resp.json()["detail"]["code"] == "price_changed"
     assert modified == []  # nothing was charged or changed
+
+
+@pytest.mark.asyncio
+async def test_a_switch_without_a_confirmed_price_is_refused(db, client, monkeypatch):
+    """expected_price is mandatory: a caller that did not show a price cannot switch."""
+    from src.config.plans import get_plan
+
+    pro_m, _, agency_m = _prices()
+    user = User(
+        id=str(uuid.uuid4()),
+        email=f"planchg_{uuid.uuid4().hex[:8]}@test.bridgeleads.io",
+        password_hash=hash_password("TestPass123!"),
+        plan="pro", records_used=0, records_limit=1000,
+        stripe_customer_id="cus_planchg", stripe_subscription_id="sub_live",
+        subscription_status="active",
+    )
+    db.add(user)
+    await db.commit()
+    modified = []
+    monkeypatch.setattr(b.stripe.Subscription, "modify",
+                        lambda sub_id, **kw: modified.append(kw) or {"id": sub_id})
+
+    def _price(pid, **kw):
+        if pid not in b._PRICE_TO_PLAN:
+            return {"unit_amount": 5, "currency": "usd", "billing_scheme": "per_unit",
+                    "recurring": {"interval": "month", "interval_count": 1, "usage_type": "metered"}}
+        plan_id, _limit, interval = b._PRICE_TO_PLAN[pid]
+        plan = get_plan(plan_id)
+        amount = (plan["price_annual"] if interval == "year" else plan["price_monthly"]) * 100
+        return {"unit_amount": amount, "currency": "usd", "billing_scheme": "per_unit",
+                "recurring": {"interval": interval, "interval_count": 1, "usage_type": "licensed"}}
+
+    monkeypatch.setattr(b.stripe.Price, "retrieve", _price)
+    resp = await client.post(
+        "/billing/change-plan",
+        json={"price_id": agency_m},
+        headers={"Authorization": f"Bearer {create_secure_token(user.id)}"},
+    )
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"]["code"] == "price_unconfirmed"
+    assert modified == []

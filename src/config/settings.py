@@ -94,6 +94,12 @@ class Settings(BaseSettings):
     #   python -c "import secrets; print(secrets.token_urlsafe(32))"
     PRIVACY_HMAC_KEYS: str = ""
     PRIVACY_HMAC_CURRENT_VERSION: str = "v1"
+    # The operator half of the privacy-suppression activation guard (Phase 6 design,
+    # section 8; src/privacy/activation.py). A rule can be activated only when this
+    # AND the enforcement version the code implements both reach the required
+    # version, so raising this alone enables nothing. Leave 0 until P7 ships; the
+    # database (migration 125) refuses any active rule regardless until then.
+    PRIVACY_ENFORCEMENT_VERSION: int = 0
 
     # H3 PII encryption read mode. While False (tolerant), decrypt_field() treats
     # any value that is not a valid fe1:-prefixed Fernet token as legacy
@@ -436,6 +442,13 @@ class Settings(BaseSettings):
             # object.__setattr__: no recursion even if validate_assignment is ever on.
             object.__setattr__(self, "ENTITLEMENT_ENFORCEMENT", True)
         return self
+
+    @field_validator("PRIVACY_ENFORCEMENT_VERSION")
+    @classmethod
+    def privacy_enforcement_version_is_not_negative(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("PRIVACY_ENFORCEMENT_VERSION must be 0 (off) or more")
+        return v
 
     @field_validator("TRACERFY_LOW_BALANCE_CREDITS")
     @classmethod

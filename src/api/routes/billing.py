@@ -874,7 +874,9 @@ def _stripe_price_terms(price_id: str) -> dict:
         "currency": str(price.get("currency") or "").lower(),
         "interval": recurring.get("interval"),
         "interval_count": int(recurring.get("interval_count") or 1),
-        "usage_type": recurring.get("usage_type") or "licensed",
+        # No default: a Price whose usage type Stripe did not state is refused,
+        # never assumed licensed (Codex review).
+        "usage_type": recurring.get("usage_type"),
         "per_unit": price.get("billing_scheme", "per_unit") == "per_unit",
     }
 
@@ -934,7 +936,9 @@ def _read_price(price_id: str, *, route: str) -> dict:
 _CATALOG_MISMATCH_ALERTED: set[str] = set()
 
 
-def _verified_plan_price(plan_id: str, price_id: str, interval: str, *, route: str) -> dict:
+def _verified_plan_price(
+    plan_id: str, price_id: str, interval: str, *, route: str, strict: bool = False,
+) -> dict:
     """Read the plan Price from Stripe and check it against what the site quotes.
 
     Used by checkout AND change-plan, the two places a customer is charged, so the
@@ -942,8 +946,10 @@ def _verified_plan_price(plan_id: str, price_id: str, interval: str, *, route: s
     the Stripe Price on every purchase. A read failure, or a Price that is not a
     plain licensed recurring per-unit amount, fails the purchase closed (503). A
     Price that disagrees with the catalog (amount, currency, or the CONFIGURED
-    interval) still sells, since Checkout discloses Stripe's real terms, but pages
-    ops: the pricing page is then wrong.
+    interval) pages ops, because the pricing page is then wrong. Checkout still
+    sells (its disclosure states Stripe's real terms); ``strict`` (change-plan,
+    whose dialog quotes the CATALOG amount) refuses instead, so a customer is never
+    charged a price other than the one they were shown.
     """
     from src.config.plans import get_plan
 
@@ -968,7 +974,21 @@ def _verified_plan_price(plan_id: str, price_id: str, interval: str, *, route: s
             stripe_amount=base["unit_amount"], stripe_currency=base["currency"],
             catalog_amount=expected,
         )
+    if mismatch and strict:
+        _logger.error("%s: Price %s disagrees with the catalog; refusing", route, price_id)
+        raise _billing_unavailable()
     return base
+
+
+def _verified_metered_price(price_id: str, *, route: str) -> dict:
+    """Read a skip-trace overage Price and require a metered per-unit amount (503)."""
+    overage = _read_price(price_id, route=route)
+    if (overage["usage_type"] != "metered" or not overage["per_unit"]
+            or not isinstance(overage["unit_amount"], int)):
+        _logger.error("%s: Price %s is not a metered per-unit amount; refusing",
+                      route, price_id)
+        raise _billing_unavailable()
+    return overage
 
 
 def _checkout_renewal_terms(
@@ -984,14 +1004,7 @@ def _checkout_renewal_terms(
     from src.config.plans import get_plan
 
     base = _verified_plan_price(plan_id, price_id, interval, route="checkout")
-    overage = None
-    if metered_price:
-        overage = _read_price(metered_price, route="checkout")
-        if (overage["usage_type"] != "metered" or not overage["per_unit"]
-                or not isinstance(overage["unit_amount"], int)):
-            _logger.error("checkout: Price %s is not a metered per-unit amount; refusing",
-                          metered_price)
-            raise _billing_unavailable()
+    overage = _verified_metered_price(metered_price, route="checkout") if metered_price else None
     included = settings.SKIP_TRACE_BUNDLED_QUOTAS.get(plan_id, 0)
     return _renewal_terms(get_plan(plan_id)["name"], base, included, overage)
 
@@ -1685,7 +1698,12 @@ async def change_plan(
     new_plan, _limit, new_interval = _PRICE_TO_PLAN[stripe_price_id]
     # The switch dialog quotes this plan's catalog price: check it against the
     # Stripe Price that will be charged, before the per-user lock (Codex, Phase 5).
-    _verified_plan_price(new_plan, stripe_price_id, new_interval, route="change-plan")
+    _verified_plan_price(new_plan, stripe_price_id, new_interval, route="change-plan",
+                         strict=True)
+    # The overage Price _plan_change_items will attach, checked the same way.
+    _target_metered = _metered_skip_trace_price(new_plan, new_interval)
+    if _target_metered:
+        _verified_metered_price(_target_metered, route="change-plan")
 
     try:
         # The SAME lock namespace as checkout (4243). Between them these two

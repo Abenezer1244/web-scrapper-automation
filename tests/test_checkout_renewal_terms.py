@@ -137,3 +137,39 @@ def test_a_price_of_the_wrong_kind_is_refused(stripe_prices, plan_price, metered
         billing._checkout_renewal_terms("pro", "price_plan", "month",
                                         "price_metered" if metered_price else None)
     assert exc.value.status_code == 503
+
+
+def test_a_price_whose_usage_type_stripe_did_not_state_is_refused(stripe_prices):
+    prices, _alerts = stripe_prices
+    prices.update(price_plan={"unit_amount": 19900, "currency": "usd", "billing_scheme": "per_unit",
+                              "recurring": {"interval": "month", "interval_count": 1}})
+    with pytest.raises(HTTPException) as exc:
+        billing._checkout_renewal_terms("pro", "price_plan", "month", None)
+    assert exc.value.status_code == 503
+
+
+def test_change_plan_refuses_a_price_that_disagrees_with_the_quoted_catalog(stripe_prices):
+    # The switch dialog quotes the catalog amount, so change-plan (strict) must not
+    # charge a different one; checkout (not strict) discloses Stripe's own amount.
+    prices, alerts = stripe_prices
+    prices.update(price_plan=_stripe_price(24900))
+    with pytest.raises(HTTPException) as exc:
+        billing._verified_plan_price("pro", "price_plan", "month", route="change-plan",
+                                     strict=True)
+    assert exc.value.status_code == 503
+    assert [key for key, _ctx in alerts] == ["price_catalog_mismatch:price_plan"]
+    assert billing._verified_plan_price("pro", "price_plan", "month", route="checkout")[
+        "unit_amount"] == 24900
+
+
+@pytest.mark.parametrize("bad", [
+    _stripe_price(5, usage="licensed"),
+    _stripe_price(5, usage="metered", scheme="tiered"),
+    _stripe_price(None, usage="metered"),
+])
+def test_change_plans_overage_price_must_be_metered_per_unit(stripe_prices, bad):
+    prices, _alerts = stripe_prices
+    prices.update(price_metered=bad)
+    with pytest.raises(HTTPException) as exc:
+        billing._verified_metered_price("price_metered", route="change-plan")
+    assert exc.value.status_code == 503

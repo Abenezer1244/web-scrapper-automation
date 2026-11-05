@@ -93,6 +93,10 @@ async def test_a_declined_upgrade_is_402_and_changes_nothing(db, client, monkeyp
     from src.config.plans import get_plan
 
     def _price(pid, **kw):
+        if pid not in b._PRICE_TO_PLAN:  # the target plan's metered overage Price
+            return {"unit_amount": 5, "currency": "usd", "billing_scheme": "per_unit",
+                    "recurring": {"interval": "month", "interval_count": 1,
+                                  "usage_type": "metered"}}
         plan_id, _limit, interval = b._PRICE_TO_PLAN[pid]
         plan = get_plan(plan_id)
         amount = (plan["price_annual"] if interval == "year" else plan["price_monthly"]) * 100

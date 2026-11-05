@@ -874,6 +874,7 @@ def _stripe_price_terms(price_id: str) -> dict:
         "currency": str(price.get("currency") or "").lower(),
         "interval": recurring.get("interval"),
         "interval_count": int(recurring.get("interval_count") or 1),
+        "usage_type": recurring.get("usage_type") or "licensed",
         "per_unit": price.get("billing_scheme", "per_unit") == "per_unit",
     }
 
@@ -912,46 +913,87 @@ def _renewal_terms(
     return " ".join(parts)
 
 
-def _checkout_renewal_terms(plan_id: str, price_id: str, metered_price: str | None) -> str:
-    """Build the Checkout disclosure from the Prices Stripe will charge.
+def _billing_unavailable() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="Billing is temporarily unavailable. Please try again later.",
+    )
 
-    A Stripe read failure, or a plan Price that is not a plain recurring per-unit
-    amount, fails the checkout closed (503): selling without telling the customer
-    what renews is the thing this exists to prevent. A Price that disagrees with the
-    catalog the website quotes still sells (the disclosure states Stripe's real
-    amount) but pages ops, because the pricing page is then wrong.
+
+def _read_price(price_id: str, *, route: str) -> dict:
+    try:
+        return _stripe_price_terms(price_id)
+    except stripe.error.StripeError as exc:
+        _logger.error("%s: could not read Price %s from Stripe (%s)",
+                      route, price_id, type(exc).__name__)
+        raise _billing_unavailable() from exc
+
+
+# One catalog-mismatch page per Price per process: the alert's Redis cooldown fails
+# open, so without this a persistent misconfiguration would page on every purchase.
+_CATALOG_MISMATCH_ALERTED: set[str] = set()
+
+
+def _verified_plan_price(plan_id: str, price_id: str, interval: str, *, route: str) -> dict:
+    """Read the plan Price from Stripe and check it against what the site quotes.
+
+    Used by checkout AND change-plan, the two places a customer is charged, so the
+    catalog amount the pricing page and the switch dialog show is verified against
+    the Stripe Price on every purchase. A read failure, or a Price that is not a
+    plain licensed recurring per-unit amount, fails the purchase closed (503). A
+    Price that disagrees with the catalog (amount, currency, or the CONFIGURED
+    interval) still sells, since Checkout discloses Stripe's real terms, but pages
+    ops: the pricing page is then wrong.
     """
     from src.config.plans import get_plan
 
-    plan = get_plan(plan_id)
-    try:
-        base = _stripe_price_terms(price_id)
-        overage = _stripe_price_terms(metered_price) if metered_price else None
-    except stripe.error.StripeError as exc:
-        _logger.error("checkout: could not read Price %s from Stripe (%s)",
-                      price_id, type(exc).__name__)
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Billing is temporarily unavailable. Please try again later.",
-        ) from exc
+    base = _read_price(price_id, route=route)
     if (not isinstance(base["unit_amount"], int) or not base["per_unit"]
+            or base["usage_type"] != "licensed"
             or base["interval"] not in ("day", "week", "month", "year")):
-        _logger.error("checkout: Price %s is not a plain recurring amount; refusing", price_id)
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Billing is temporarily unavailable. Please try again later.",
-        )
-    annual = base["interval"] == "year" and base["interval_count"] == 1
-    expected = (plan["price_annual"] if annual else plan["price_monthly"]) * 100
-    if base["unit_amount"] != expected or base["currency"] != "usd":
+        _logger.error("%s: Price %s is not a plain licensed recurring amount; refusing",
+                      route, price_id)
+        raise _billing_unavailable()
+    plan = get_plan(plan_id)
+    expected = (plan["price_annual"] if interval == "year" else plan["price_monthly"]) * 100
+    mismatch = (base["unit_amount"] != expected or base["currency"] != "usd"
+                or base["interval"] != interval or base["interval_count"] != 1)
+    if mismatch and price_id not in _CATALOG_MISMATCH_ALERTED:
+        _CATALOG_MISMATCH_ALERTED.add(price_id)
         _alert_billing_gap(
             "Stripe Price disagrees with the plan catalog the website quotes",
             f"price_catalog_mismatch:{price_id}",
-            price_id=price_id, plan=plan_id, stripe_amount=base["unit_amount"],
-            stripe_currency=base["currency"], catalog_amount=expected,
+            price_id=price_id, plan=plan_id, configured_interval=interval,
+            stripe_interval=f"{base['interval_count']} {base['interval']}",
+            stripe_amount=base["unit_amount"], stripe_currency=base["currency"],
+            catalog_amount=expected,
         )
+    return base
+
+
+def _checkout_renewal_terms(
+    plan_id: str, price_id: str, interval: str, metered_price: str | None,
+) -> str:
+    """Build the Checkout disclosure from the Prices Stripe will charge.
+
+    Fails the checkout closed (503) when Stripe cannot be read or a Price is the
+    wrong kind (a plan Price that is not licensed, an overage Price that is not a
+    metered per-unit amount): selling without telling the customer what renews is
+    the thing this exists to prevent.
+    """
+    from src.config.plans import get_plan
+
+    base = _verified_plan_price(plan_id, price_id, interval, route="checkout")
+    overage = None
+    if metered_price:
+        overage = _read_price(metered_price, route="checkout")
+        if (overage["usage_type"] != "metered" or not overage["per_unit"]
+                or not isinstance(overage["unit_amount"], int)):
+            _logger.error("checkout: Price %s is not a metered per-unit amount; refusing",
+                          metered_price)
+            raise _billing_unavailable()
     included = settings.SKIP_TRACE_BUNDLED_QUOTAS.get(plan_id, 0)
-    return _renewal_terms(plan["name"], base, included, overage)
+    return _renewal_terms(get_plan(plan_id)["name"], base, included, overage)
 
 
 def _metered_skip_trace_price(plan: str, interval: str) -> str | None:
@@ -1228,6 +1270,13 @@ async def create_checkout(
             detail="Billing is temporarily unavailable. Please try again later.",
         )
 
+    # What will be sold and its renewal terms, read from Stripe BEFORE the per-user
+    # lock below: none of it depends on the user, and a slow Stripe read must not
+    # hold the lock and a database connection (Codex review, Phase 5).
+    _plan_id, _limit, _interval = _PRICE_TO_PLAN[stripe_price_id]
+    metered_price = _metered_skip_trace_price(_plan_id, _interval)
+    renewal_terms = _checkout_renewal_terms(_plan_id, stripe_price_id, _interval, metered_price)
+
     # Serialise this user's checkout attempts. Two requests in flight (two tabs,
     # a double-click, a retry after a slow response) would otherwise both read
     # "no subscription", both pass the guard below, and both create a Session.
@@ -1295,13 +1344,10 @@ async def create_checkout(
         # The plan item, plus the metered skip-trace item when one is
         # provisioned for this plan and interval. A metered price must NOT
         # carry a quantity: Stripe rejects the item outright if it does.
-        _plan_id, _limit, _interval = _PRICE_TO_PLAN[stripe_price_id]
+        # (metered_price and renewal_terms were resolved before the lock.)
         line_items: list[dict] = [{"price": stripe_price_id, "quantity": 1}]
-        metered_price = _metered_skip_trace_price(_plan_id, _interval)
         if metered_price:
             line_items.append({"price": metered_price})
-
-        renewal_terms = _checkout_renewal_terms(_plan_id, stripe_price_id, metered_price)
 
         session = stripe.checkout.Session.create(
             customer=customer_id,
@@ -1637,6 +1683,9 @@ async def change_plan(
         )
 
     new_plan, _limit, new_interval = _PRICE_TO_PLAN[stripe_price_id]
+    # The switch dialog quotes this plan's catalog price: check it against the
+    # Stripe Price that will be charged, before the per-user lock (Codex, Phase 5).
+    _verified_plan_price(new_plan, stripe_price_id, new_interval, route="change-plan")
 
     try:
         # The SAME lock namespace as checkout (4243). Between them these two

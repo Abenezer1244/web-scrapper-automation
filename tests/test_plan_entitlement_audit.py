@@ -472,7 +472,8 @@ async def test_checkout_sends_two_line_items_and_no_quantity_on_the_metered_one(
     # The renewal terms ride on the same session, for exactly this plan, interval
     # and metering (compliance audit 2026-11, Phase 5a).
     message = captured["custom_text"]["submit"]["message"]
-    assert message == billing._checkout_renewal_terms("pro", plan_price, "price_st_pro_m")
+    _plan, _limit, interval = billing._PRICE_TO_PLAN[plan_price]
+    assert message == billing._checkout_renewal_terms("pro", plan_price, interval, "price_st_pro_m")
     assert "renews automatically" in message and "$0.08 USD each" in message
 
 
@@ -1627,9 +1628,10 @@ def _stub_catalog_prices(monkeypatch, billing):
             amount = (plan["price_annual"] if interval == "year" else plan["price_monthly"]) * 100
         else:
             interval, amount = ("year" if "year" in pid or pid.endswith("_y") else "month"), 8
+        usage = "licensed" if pid in billing._PRICE_TO_PLAN else "metered"
         return {"id": pid, "unit_amount": amount, "currency": "usd",
                 "billing_scheme": "per_unit",
-                "recurring": {"interval": interval, "interval_count": 1}}
+                "recurring": {"interval": interval, "interval_count": 1, "usage_type": usage}}
 
     monkeypatch.setattr(billing.stripe.Price, "retrieve", _retrieve)
 

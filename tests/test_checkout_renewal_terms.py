@@ -67,27 +67,49 @@ def test_money_formatting_respects_zero_decimal_currencies():
 
 # ─── Reading the Prices from Stripe ───────────────────────────────────────────
 
-def _stripe_price(amount, interval="month", currency="usd", scheme="per_unit"):
+def _stripe_price(amount, interval="month", currency="usd", scheme="per_unit",
+                  usage="licensed", count=1):
     return {"unit_amount": amount, "currency": currency, "billing_scheme": scheme,
-            "recurring": {"interval": interval, "interval_count": 1}}
+            "recurring": {"interval": interval, "interval_count": count, "usage_type": usage}}
 
 
-def test_checkout_terms_use_stripes_amount_not_the_catalogs(monkeypatch):
-    monkeypatch.setattr(billing.stripe.Price, "retrieve",
-                        lambda pid, **kw: _stripe_price(19900) if pid == "price_plan"
-                        else _stripe_price(5))
-    text = billing._checkout_renewal_terms("pro", "price_plan", "price_metered")
-    assert "$199.00 USD" in text and "$0.05 USD each" in text
-
-
-def test_a_price_that_disagrees_with_the_catalog_pages_ops_but_still_discloses_stripes(monkeypatch):
-    alerts = []
+@pytest.fixture
+def stripe_prices(monkeypatch):
+    """Price.retrieve answers from this dict; alerts are captured, deduper reset."""
+    prices: dict = {}
+    alerts: list = []
+    monkeypatch.setattr(billing.stripe.Price, "retrieve", lambda pid, **kw: prices[pid])
     monkeypatch.setattr(billing, "_alert_billing_gap",
-                        lambda reason, key, **ctx: alerts.append((reason, key, ctx)))
-    monkeypatch.setattr(billing.stripe.Price, "retrieve", lambda pid, **kw: _stripe_price(24900))
-    text = billing._checkout_renewal_terms("pro", "price_plan", None)
+                        lambda reason, key, **ctx: alerts.append((key, ctx)))
+    monkeypatch.setattr(billing, "_CATALOG_MISMATCH_ALERTED", set())
+    return prices, alerts
+
+
+def test_checkout_terms_use_stripes_amount_not_the_catalogs(stripe_prices):
+    prices, alerts = stripe_prices
+    prices.update(price_plan=_stripe_price(19900), price_metered=_stripe_price(5, usage="metered"))
+    text = billing._checkout_renewal_terms("pro", "price_plan", "month", "price_metered")
+    assert "$199.00 USD" in text and "$0.05 USD each" in text
+    assert alerts == []  # matches the catalog
+
+
+def test_a_catalog_mismatch_pages_ops_once_per_price_and_still_discloses_stripes(stripe_prices):
+    prices, alerts = stripe_prices
+    prices.update(price_plan=_stripe_price(24900))
+    for _ in range(3):
+        text = billing._checkout_renewal_terms("pro", "price_plan", "month", None)
     assert "$249.00 USD" in text
-    assert len(alerts) == 1 and alerts[0][1] == "price_catalog_mismatch:price_plan"
+    assert [key for key, _ctx in alerts] == ["price_catalog_mismatch:price_plan"]
+
+
+def test_a_price_on_the_wrong_interval_for_its_slot_pages_ops(stripe_prices):
+    # The annual slot pointing at a monthly Price at the annual amount: amount
+    # matches, but the pricing page and the configured interval are wrong.
+    prices, alerts = stripe_prices
+    plan = get_plan("pro")
+    prices.update(price_annual=_stripe_price(plan["price_annual"] * 100, interval="month"))
+    billing._checkout_renewal_terms("pro", "price_annual", "year", None)
+    assert alerts and alerts[0][1]["configured_interval"] == "year"
 
 
 def test_a_stripe_read_failure_fails_the_checkout_closed(monkeypatch):
@@ -96,17 +118,22 @@ def test_a_stripe_read_failure_fails_the_checkout_closed(monkeypatch):
 
     monkeypatch.setattr(billing.stripe.Price, "retrieve", _down)
     with pytest.raises(HTTPException) as exc:
-        billing._checkout_renewal_terms("pro", "price_plan", None)
+        billing._checkout_renewal_terms("pro", "price_plan", "month", None)
     assert exc.value.status_code == 503
 
 
-@pytest.mark.parametrize("bad", [
-    _stripe_price(None),                      # no flat amount (e.g. custom/tiered)
-    _stripe_price(19900, scheme="tiered"),
-    {"unit_amount": 19900, "currency": "usd", "billing_scheme": "per_unit"},  # one-off
+@pytest.mark.parametrize(("plan_price", "metered_price"), [
+    (_stripe_price(None), None),                                  # no flat amount
+    (_stripe_price(19900, scheme="tiered"), None),
+    ({"unit_amount": 19900, "currency": "usd", "billing_scheme": "per_unit"}, None),  # one-off
+    (_stripe_price(19900, usage="metered"), None),                # a metered plan Price
+    (_stripe_price(19900), _stripe_price(8, usage="licensed")),   # a licensed "overage"
+    (_stripe_price(19900), _stripe_price(8, usage="metered", scheme="tiered")),
 ])
-def test_a_price_that_is_not_a_plain_recurring_amount_is_refused(monkeypatch, bad):
-    monkeypatch.setattr(billing.stripe.Price, "retrieve", lambda pid, **kw: bad)
+def test_a_price_of_the_wrong_kind_is_refused(stripe_prices, plan_price, metered_price):
+    prices, _alerts = stripe_prices
+    prices.update(price_plan=plan_price, price_metered=metered_price)
     with pytest.raises(HTTPException) as exc:
-        billing._checkout_renewal_terms("pro", "price_plan", None)
+        billing._checkout_renewal_terms("pro", "price_plan", "month",
+                                        "price_metered" if metered_price else None)
     assert exc.value.status_code == 503

@@ -907,9 +907,10 @@ def _stub_catalog_prices(monkeypatch, billing):
             amount = (plan["price_annual"] if interval == "year" else plan["price_monthly"]) * 100
         else:
             interval, amount = ("year" if "year" in pid or pid.endswith("_y") else "month"), 8
+        usage = "licensed" if pid in billing._PRICE_TO_PLAN else "metered"
         return {"id": pid, "unit_amount": amount, "currency": "usd",
                 "billing_scheme": "per_unit",
-                "recurring": {"interval": interval, "interval_count": 1}}
+                "recurring": {"interval": interval, "interval_count": 1, "usage_type": usage}}
 
     monkeypatch.setattr(billing.stripe.Price, "retrieve", _retrieve)
 

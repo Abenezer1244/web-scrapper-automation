@@ -88,6 +88,18 @@ async def test_a_declined_upgrade_is_402_and_changes_nothing(db, client, monkeyp
         raise stripe.error.CardError("Your card was declined.", param=None, code="card_declined")
 
     monkeypatch.setattr(b.stripe.Subscription, "modify", _declined)
+    # change-plan now verifies the target Price against the catalog first; answer
+    # as a correctly configured account would.
+    from src.config.plans import get_plan
+
+    def _price(pid, **kw):
+        plan_id, _limit, interval = b._PRICE_TO_PLAN[pid]
+        plan = get_plan(plan_id)
+        amount = (plan["price_annual"] if interval == "year" else plan["price_monthly"]) * 100
+        return {"unit_amount": amount, "currency": "usd", "billing_scheme": "per_unit",
+                "recurring": {"interval": interval, "interval_count": 1, "usage_type": "licensed"}}
+
+    monkeypatch.setattr(b.stripe.Price, "retrieve", _price)
 
     resp = await client.post(
         "/billing/change-plan",

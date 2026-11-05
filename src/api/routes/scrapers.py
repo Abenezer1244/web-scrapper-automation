@@ -1,5 +1,6 @@
 """Scraper config routes: CRUD for user's scraper configurations."""
 
+import re
 import uuid
 from collections.abc import Iterable
 from datetime import UTC, datetime
@@ -68,6 +69,10 @@ def _validate_tod_toggle(record_type: str, include_living_owner_tod: bool | None
         )
 
 
+# The only shape _fmt_count (public_cache.py) produces: "999+", "1.5K+", "12K+".
+_COUNT_LABEL = re.compile(r"\d{1,7}(?:[.,]\d{1,3})*K?\+")
+
+
 @router.get("/sample")
 async def sample_records(db: AsyncSession = Depends(get_db)) -> dict:
     """Public endpoint: returns precomputed, sanitized sample records.
@@ -78,26 +83,40 @@ async def sample_records(db: AsyncSession = Depends(get_db)) -> dict:
     tables (results/jobs/scraper_configs) — so under the non-BYPASSRLS cutover
     role it needs no cross-tenant read access, and there is no path by which an
     anonymous caller can reach un-sanitized PII (RLS cutover Phase 2b, Codex
-    design). Returns an empty-but-valid shape until the first refresh runs.
+    design). The records are always illustrative examples, never real people;
+    the counts read zero until the first refresh runs.
     """
     import json
+
+    from src.workers.scheduler_helpers.public_cache import example_sample_records
 
     row = await db.execute(
         text("SELECT payload FROM public.public_sample_cache WHERE id = 1")
     )
     cached = row.scalar_one_or_none()
-    if cached is None:
-        # Cache not yet warmed (fresh DB / before the first beat tick).
-        return {
-            "records": [],
-            "total_scraped": "0+",
-            "counties_active": 0,
-            "enrichment_rate": "95%+",
-            "freshness": "Updated daily",
-        }
     # asyncpg may hand back jsonb as a dict or a JSON string depending on codecs;
-    # normalize both.
-    return cached if isinstance(cached, dict) else json.loads(cached)
+    # normalize both. An unwarmed or malformed cache yields the zero stats.
+    try:
+        stats = json.loads(cached) if isinstance(cached, str) else cached
+    except ValueError:
+        stats = None
+    if not isinstance(stats, dict):
+        stats = {}
+    # Only two aggregate stats are read from the cache, each shape-checked so a
+    # bad row can neither 500 this public endpoint nor publish anything but a
+    # count. The records are ALWAYS the illustrative examples, never the cached
+    # list: a row written before the examples shipped (or left behind by a
+    # failed refresh) held real owners' names, ZIP+4 and recording dates, and
+    # must never be served (audit 2026-11 P1-6, Codex review).
+    total = stats.get("total_scraped")
+    counties = stats.get("counties_active")
+    return {
+        "records": example_sample_records(),
+        "total_scraped": total if isinstance(total, str) and _COUNT_LABEL.fullmatch(total) else "0+",
+        "counties_active": counties if type(counties) is int and 0 <= counties <= 10_000 else 0,
+        "enrichment_rate": "95%+",
+        "freshness": "Updated daily",
+    }
 
 
 @router.get("", response_model=list[ScraperConfigResponse])

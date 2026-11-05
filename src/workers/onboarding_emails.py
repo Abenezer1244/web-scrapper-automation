@@ -3,6 +3,16 @@
 All five templates render through src/utils/email_layout.py, which owns the
 sender identity (display name + Reply-To) and the email-safe HTML shell.
 
+COMMERCIAL vs TRANSACTIONAL (CAN-SPAM; compliance audit 2026-11, Phase 4). The
+welcome, the day-1 nudge, the day-3 activation reminder and the trial-ending
+upsell promote the service, so they are commercial: each carries an unsubscribe
+link + List-Unsubscribe headers and the business postal address, is skipped for
+an address on marketing_email_suppressions (checked at send time), and is HELD,
+with an ops alert, while either the public unsubscribe URL (API_BASE_URL) or
+COMPANY_POSTAL_ADDRESS is missing (owner decision 2026-11-04). The duplicate-signup
+notice and the verification email are transactional and always go out. Counsel
+to confirm the classification.
+
 Every plan number in this module is READ from config, never written here. The
 trial-expiry email used to hardcode "Pro ($79/mo)" long after billing moved Pro
 to $199, quoting customers a price we do not charge. Prices and record
@@ -16,14 +26,17 @@ import resend
 from src.config import frontend_routes, settings
 from src.config.constants import TRIAL_PERIOD_DAYS
 from src.config.plans import format_price_monthly, get_plan, plan_records_limit
+from src.utils.crypto import blind_index
 from src.utils.email_layout import (
     build_payload,
     bullets,
     callout,
     numbered_steps,
     paragraph,
+    postal_address,
     render_email,
     text_footer,
+    unsubscribe_headers,
 )
 from src.utils.logger import email_fingerprint, setup_logger
 from src.workers import app
@@ -32,21 +45,91 @@ _logger = setup_logger("worker.onboarding")
 
 resend.api_key = settings.RESEND_API_KEY
 
+# What a send function did. Only SENT means an email went out.
+SENT = "sent"
+FAILED = "failed"          # Resend refused or errored, or the opt-out check failed
+SKIPPED = "skipped"        # no RESEND_API_KEY (dev / tests)
+HELD = "held"              # commercial, but no usable unsubscribe URL or postal address
+SUPPRESSED = "suppressed"  # commercial, and the address opted out
+NOT_NEEDED = "not_needed"  # the template decided there is nothing to send
 
-def _send(email: str, subject: str, html_body: str, text_body: str) -> None:
+
+def _send(
+    email: str, subject: str, html_body: str, text_body: str,
+    headers: dict[str, str] | None = None,
+) -> str:
     # P0-04b: a fingerprint, never the address; the exception's type, never its
     # message (Resend's can echo the recipient back).
     fp = email_fingerprint(email)
     if not settings.RESEND_API_KEY:
         _logger.warning("RESEND_API_KEY not set, skipping email to %s", fp)
-        return
+        return SKIPPED
     try:
         resend.Emails.send(build_payload(
             to=[email], subject=subject, html_body=html_body, text_body=text_body,
+            headers=headers,
         ))
         _logger.info("Sent '%s' to %s", subject, fp)
+        return SENT
     except Exception as exc:
         _logger.error("Failed to send '%s' to %s: %s", subject, fp, type(exc).__name__)
+        return FAILED
+
+
+def _is_suppressed(email: str) -> bool:
+    """True when this address opted out of commercial email (raises on DB error)."""
+    from sqlalchemy import text
+
+    from src.db.session import SyncSessionLocal
+
+    with SyncSessionLocal() as db:
+        return db.execute(
+            text("SELECT 1 FROM marketing_email_suppressions WHERE email_hmac = :h"),
+            {"h": blind_index(email)},
+        ).first() is not None
+
+
+def _commercial_footer(email: str) -> dict | str:
+    """Decide whether a commercial email may go to ``email`` right now.
+
+    Returns the footer to render (the unsubscribe URL and postal address) when
+    it may be sent, otherwise the outcome to report (HELD, SUPPRESSED, FAILED,
+    SKIPPED). Checked immediately before each send, so an opt-out recorded after
+    the beat selected its recipients still wins. Fails CLOSED: a missing setting
+    holds the email, and an opt-out check that cannot run sends nothing.
+    """
+    if not settings.RESEND_API_KEY:
+        return SKIPPED
+    # Lazy, like every other worker import from src.api: importing the package
+    # loads the route modules, which import this module.
+    from src.api.unsubscribe_tokens import unsubscribe_url
+
+    fp = email_fingerprint(email)
+    url = unsubscribe_url(email)
+    address = postal_address()
+    if url is None or address is None:
+        missing = " and ".join(name for name, value in (
+            ("API_BASE_URL", url), ("COMPANY_POSTAL_ADDRESS", address)) if value is None)
+        _logger.warning("Commercial email to %s held: %s not usable", fp, missing)
+        from src.workers.ops_alerts import send_ops_alert
+
+        send_ops_alert(
+            "commercial_email_held", "config",
+            "Commercial email is being held",
+            f"Welcome, nudge and trial-ending emails are not being sent because {missing} "
+            "is not set to a usable value. CAN-SPAM requires a working unsubscribe link "
+            "and the business postal address in every commercial email. Set it on the "
+            "API and worker services; account and security emails are unaffected.",
+        )
+        return HELD
+    try:
+        if _is_suppressed(email):
+            _logger.info("Commercial email to %s skipped: address opted out", fp)
+            return SUPPRESSED
+    except Exception as exc:
+        _logger.error("Opt-out check failed for %s, not sending: %s", fp, type(exc).__name__)
+        return FAILED
+    return {"unsubscribe_url": url, "postal_address": address}
 
 
 def _days_phrase(days: int) -> str:
@@ -58,14 +141,17 @@ def _days_phrase(days: int) -> str:
 
 # ─── Day 0: Welcome ─────────────────────────────────────────────────────────
 
-def send_welcome_email(email: str) -> None:
-    """Sent immediately after registration.
+def send_welcome_email(email: str) -> str:
+    """Sent immediately after registration. Commercial (it promotes the trial).
 
     Deliberately generic: the steps name no specific county or record type,
     because the counties and record types a given recipient can reach depend on
     their plan and on which connectors are live. The old copy told everyone to
     pick Pierce or King and to choose probate.
     """
+    footer = _commercial_footer(email)
+    if isinstance(footer, str):
+        return footer
     url = frontend_routes.absolute(frontend_routes.SCRAPERS_NEW)
     plan = get_plan("pro")
     records = plan_records_limit("pro")
@@ -102,6 +188,7 @@ def send_welcome_email(email: str) -> None:
             callout(trial_line),
         ],
         cta=("Set Up Your First Scraper", url),
+        **footer,
     )
 
     text_body = (
@@ -116,10 +203,11 @@ def send_welcome_email(email: str) -> None:
         "and mailing addresses.\n\n"
         f"Set up your first scraper: {url}\n\n"
         f"{trial_line}\n\n"
-        f"{text_footer()}"
+        f"{text_footer(**footer)}"
     )
 
-    _send(email, subject, html_body, text_body)
+    return _send(email, subject, html_body, text_body,
+                 headers=unsubscribe_headers(footer["unsubscribe_url"]))
 
 
 # ─── Duplicate signup: "you already have an account" ───────────────────────
@@ -245,7 +333,7 @@ def send_verification_email(email: str, verify_link: str) -> None:
 
 # ─── Day 1: "Having trouble getting started?" ──────────────────────────────
 
-def send_day1_nudge(email: str, days_left: int) -> None:
+def send_day1_nudge(email: str, days_left: int) -> str:
     """Sent on day 1 to users who haven't created a scraper yet.
 
     Different from the welcome email (day 0): this one acknowledges the gap and
@@ -257,7 +345,11 @@ def send_day1_nudge(email: str, days_left: int) -> None:
 
     ``days_left`` is the caller's real remaining trial days, not a literal. The
     old copy always read "6 more days" regardless of the account's actual state.
+    Commercial.
     """
+    footer = _commercial_footer(email)
+    if isinstance(footer, str):
+        return footer
     url = frontend_routes.absolute(frontend_routes.DASHBOARD)
     subject = "Getting started with your first scrape"
     trial_line = (
@@ -278,6 +370,7 @@ def send_day1_nudge(email: str, days_left: int) -> None:
             callout(trial_line),
         ],
         cta=("Go to Dashboard", url),
+        **footer,
     )
 
     text_body = (
@@ -286,20 +379,24 @@ def send_day1_nudge(email: str, days_left: int) -> None:
         "has a one click option that sets up a scraper and runs it for you.\n\n"
         f"Go to your dashboard: {url}\n\n"
         f"{trial_line}\n\n"
-        f"{text_footer()}"
+        f"{text_footer(**footer)}"
     )
 
-    _send(email, subject, html_body, text_body)
+    return _send(email, subject, html_body, text_body,
+                 headers=unsubscribe_headers(footer["unsubscribe_url"]))
 
 
 # ─── Day 3: Activation nudge ────────────────────────────────────────────────
 
 def send_activation_reminder(
     email: str, has_scraper: bool, has_download: bool, days_left: int
-) -> None:
-    """Sent on day 3 if user hasn't completed activation."""
+) -> str:
+    """Sent on day 3 if user hasn't completed activation. Commercial."""
     if has_download:
-        return  # Already activated
+        return NOT_NEEDED  # Already activated
+    footer = _commercial_footer(email)
+    if isinstance(footer, str):
+        return footer
 
     if not has_scraper:
         subject = "You have not set up a scraper yet"
@@ -331,21 +428,23 @@ def send_activation_reminder(
         heading=heading,
         blocks=[paragraph(message), callout(trial_line)],
         cta=(cta_label, url),
+        **footer,
     )
 
     text_body = (
         f"{heading}\n\n{message}\n\n"
         f"{cta_label}: {url}\n\n"
         f"{trial_line}\n\n"
-        f"{text_footer()}"
+        f"{text_footer(**footer)}"
     )
 
-    _send(email, subject, html_body, text_body)
+    return _send(email, subject, html_body, text_body,
+                 headers=unsubscribe_headers(footer["unsubscribe_url"]))
 
 
 # ─── Day 6-7: Trial expiry ──────────────────────────────────────────────────
 
-def send_trial_ending_email(email: str, days_left: int) -> None:
+def send_trial_ending_email(email: str, days_left: int) -> str:
     """Sent when trial has 1-2 days remaining.
 
     Everything factual here is read from config: the Pro price and feature list
@@ -353,8 +452,11 @@ def send_trial_ending_email(email: str, days_left: int) -> None:
     Starter limit that _expire_trials_impl actually applies when it downgrades
     the account. No county cap is quoted, because per-tier county gating is not
     enforced (settings.ENTITLEMENT_ENFORCEMENT is off) and the billing catalog
-    deliberately does not advertise one either.
+    deliberately does not advertise one either. Commercial (an upsell).
     """
+    footer = _commercial_footer(email)
+    if isinstance(footer, str):
+        return footer
     pro = get_plan("pro")
     starter_records = plan_records_limit("starter")
     price = format_price_monthly("pro")
@@ -386,6 +488,7 @@ def send_trial_ending_email(email: str, days_left: int) -> None:
         ],
         cta=(f"Upgrade to {pro['name']}", url),
         cta_note="You can cancel at any time from your billing settings.",
+        **footer,
     )
 
     text_body = (
@@ -396,10 +499,11 @@ def send_trial_ending_email(email: str, days_left: int) -> None:
         + "".join(f"  - {f}\n" for f in list(pro["features"])[:5])
         + f"\nUpgrade: {url}\n\n"
         "You can cancel at any time from your billing settings.\n\n"
-        f"{text_footer()}"
+        f"{text_footer(**footer)}"
     )
 
-    _send(email, subject, html_body, text_body)
+    return _send(email, subject, html_body, text_body,
+                 headers=unsubscribe_headers(footer["unsubscribe_url"]))
 
 
 __all__ = [

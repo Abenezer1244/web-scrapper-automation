@@ -438,6 +438,7 @@ async def test_checkout_sends_two_line_items_and_no_quantity_on_the_metered_one(
         return _FakeSession()
 
     monkeypatch.setattr(billing.stripe.checkout.Session, "create", _fake_create)
+    _stub_catalog_prices(monkeypatch, billing)
     # The checkout guard added Subscription.list / Session.list / Session.expire
     # to this path, and moved customer adoption onto auto_paging_iter(). Patching
     # only Customer.list (and as a plain dict) would leave the rest reaching the
@@ -468,6 +469,12 @@ async def test_checkout_sends_two_line_items_and_no_quantity_on_the_metered_one(
     assert items[0] == {"price": plan_price, "quantity": 1}
     assert items[1] == {"price": "price_st_pro_m"}
     assert "quantity" not in items[1]
+    # The renewal terms ride on the same session, for exactly this plan, interval
+    # and metering (compliance audit 2026-11, Phase 5a).
+    message = captured["custom_text"]["submit"]["message"]
+    _plan, _limit, interval = billing._PRICE_TO_PLAN[plan_price]
+    assert message == billing._checkout_renewal_terms("pro", plan_price, interval, "price_st_pro_m")
+    assert "renews automatically" in message and "$0.08 USD each" in message
 
 
 @pytest.mark.integration
@@ -1576,6 +1583,7 @@ def _patch_checkout_stripe(
     created=None,
 ):
     """Point every Stripe call create_checkout makes at in-memory data."""
+    _stub_catalog_prices(monkeypatch, billing)
     monkeypatch.setattr(
         billing.stripe.Customer, "list", lambda **kw: _FakeStripeList(customers)
     )
@@ -1605,6 +1613,27 @@ def _patch_checkout_stripe(
         return _FakeSession()
 
     monkeypatch.setattr(billing.stripe.checkout.Session, "create", _create)
+
+
+def _stub_catalog_prices(monkeypatch, billing):
+    """Stripe.Price.retrieve answers as a correctly configured account would: each
+    plan Price at its catalog amount and interval, any other (metered) Price at the
+    plan's per-lookup rate. create_checkout now reads these for its disclosure."""
+    from src.config.plans import get_plan
+
+    def _retrieve(pid, **kw):
+        if pid in billing._PRICE_TO_PLAN:
+            plan_id, _limit, interval = billing._PRICE_TO_PLAN[pid]
+            plan = get_plan(plan_id)
+            amount = (plan["price_annual"] if interval == "year" else plan["price_monthly"]) * 100
+        else:
+            interval, amount = ("year" if "year" in pid or pid.endswith("_y") else "month"), 8
+        usage = "licensed" if pid in billing._PRICE_TO_PLAN else "metered"
+        return {"id": pid, "unit_amount": amount, "currency": "usd",
+                "billing_scheme": "per_unit",
+                "recurring": {"interval": interval, "interval_count": 1, "usage_type": usage}}
+
+    monkeypatch.setattr(billing.stripe.Price, "retrieve", _retrieve)
 
 
 def _pro_price(billing):

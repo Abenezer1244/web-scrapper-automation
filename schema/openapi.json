@@ -329,6 +329,76 @@
         "title": "AuctionCoverage",
         "type": "object"
       },
+      "AuthConfigResponse": {
+        "properties": {
+          "email_verification_enabled": {
+            "title": "Email Verification Enabled",
+            "type": "boolean"
+          },
+          "legal_versions": {
+            "$ref": "#/components/schemas/LegalVersions"
+          },
+          "password": {
+            "$ref": "#/components/schemas/AuthPasswordRules"
+          },
+          "trial": {
+            "$ref": "#/components/schemas/AuthTrialInfo"
+          }
+        },
+        "required": [
+          "password",
+          "trial",
+          "email_verification_enabled"
+        ],
+        "title": "AuthConfigResponse",
+        "type": "object"
+      },
+      "AuthPasswordRules": {
+        "properties": {
+          "max_length": {
+            "title": "Max Length",
+            "type": "integer"
+          },
+          "min_length": {
+            "title": "Min Length",
+            "type": "integer"
+          },
+          "placeholder": {
+            "title": "Placeholder",
+            "type": "string"
+          }
+        },
+        "required": [
+          "min_length",
+          "max_length",
+          "placeholder"
+        ],
+        "title": "AuthPasswordRules",
+        "type": "object"
+      },
+      "AuthTrialInfo": {
+        "properties": {
+          "days": {
+            "title": "Days",
+            "type": "integer"
+          },
+          "plan": {
+            "title": "Plan",
+            "type": "string"
+          },
+          "records_limit": {
+            "title": "Records Limit",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "days",
+          "plan",
+          "records_limit"
+        ],
+        "title": "AuthTrialInfo",
+        "type": "object"
+      },
       "BatchAttention": {
         "description": "One reason a batch needs a look, in facts not a score. The UI words it.\n\nCodes: scrapes_failed (have = failed OR cancelled children, worded \"did not\nfinish\"; of = child scrapes);\nlow_parcel_coverage / low_mailing_coverage (one DONE scrape whose NEW leads\ncarry the field on fewer than half, of >= 10; launch heuristics, not a county\nbaseline); lookup_while_off (skip tracing configured off, yet a lookup was\nbought for a row of a child configured off, whatever the batch rollup).",
         "properties": {
@@ -1633,6 +1703,18 @@
       },
       "ChangePlanRequest": {
         "properties": {
+          "expected_price": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expected Price"
+          },
           "price_id": {
             "title": "Price Id",
             "type": "string"
@@ -3613,6 +3695,25 @@
         ],
         "title": "JobStatus",
         "type": "string"
+      },
+      "LegalVersions": {
+        "description": "The current published Terms / Privacy versions (GET /auth/config).\n\nTyped as Literals of LEGAL_DOCUMENT_VERSIONS so OpenAPI, and the frontend's\ngenerated types (regenerated and diff-checked in its CI), carry the exact\nvalues: a backend-only version bump then fails the frontend's typecheck\ninstead of silently recording no acceptance. A RESPONSE model only, so a\nstale client can never get a 422 from it.",
+        "properties": {
+          "privacy": {
+            "const": "2026-10-30",
+            "default": "2026-10-30",
+            "title": "Privacy",
+            "type": "string"
+          },
+          "terms": {
+            "const": "2026-10-01",
+            "default": "2026-10-01",
+            "title": "Terms",
+            "type": "string"
+          }
+        },
+        "title": "LegalVersions",
+        "type": "object"
       },
       "LoginResponse": {
         "description": "POST /auth/login (and /auth/login/mfa) response. Two mutually exclusive\nshapes, discriminated by `mfa_required`:\n- mfa_required=False → login complete: access_token + refresh_token are\n  ALWAYS populated. This is the only shape a non-MFA account ever sees, so\n  the prior no-MFA runtime contract is unchanged.\n- mfa_required=True → password OK but MFA enabled: access_token/refresh_token\n  are null and a short-lived mfa_token is returned to redeem at\n  POST /auth/login/mfa.\nThe fields are Optional (vs TokenResponse's required access_token) only to\nmodel the challenge shape — clients must branch on mfa_required.",
@@ -6159,6 +6260,32 @@
       },
       "UserRegister": {
         "properties": {
+          "accepted_privacy_version": {
+            "anyOf": [
+              {
+                "maxLength": 32,
+                "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Accepted Privacy Version"
+          },
+          "accepted_terms_version": {
+            "anyOf": [
+              {
+                "maxLength": 32,
+                "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Accepted Terms Version"
+          },
           "email": {
             "format": "email",
             "title": "Email",
@@ -6410,6 +6537,32 @@
       "VerifyEmailRequest": {
         "description": "POST /auth/verify-email — redeem the emailed verification link.\n\n`token` is the short-lived single-use verification JWT (aud=bridgeleads-verify)\nminted by /auth/register. `new_password` AND the first/last name are set HERE,\nby whoever proves control of the email — NOT at register — so an attacker-\ninitiated signup that the address owner confirms cannot end up with an\nattacker-known password OR an attacker-chosen display name. Names + password\nare validated against the SAME policies as registration.",
         "properties": {
+          "accepted_privacy_version": {
+            "anyOf": [
+              {
+                "maxLength": 32,
+                "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Accepted Privacy Version"
+          },
+          "accepted_terms_version": {
+            "anyOf": [
+              {
+                "maxLength": 32,
+                "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Accepted Terms Version"
+          },
           "first_name": {
             "title": "First Name",
             "type": "string"
@@ -6808,9 +6961,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "additionalProperties": true,
-                  "title": "Response Auth Config Auth Config Get",
-                  "type": "object"
+                  "$ref": "#/components/schemas/AuthConfigResponse"
                 }
               }
             },
@@ -8923,7 +9074,7 @@
     },
     "/billing/webhook": {
       "post": {
-        "description": "Handle Stripe webhook events to keep plan state in sync.\n\nRegisters for:\n  - checkout.session.completed      → activate new plan (trial → paid)\n  - customer.subscription.created   → same as updated, entitled statuses only\n  - customer.subscription.updated   → upgrades / downgrades / cancellation\n  - customer.subscription.deleted   → downgrade to starter\n  - invoice.payment_failed          → start the dunning grace + notify\n\nRecovery from dunning arrives as customer.subscription.updated (past_due ->\nactive); invoice.payment_succeeded is deliberately not handled.\n\nNOTE what these handlers deliberately do NOT do: advance a quota window.\nRecord quota rolls on the user's entitlement anniversary, lazily, inside the\nstatement that next charges them (and hourly via reconcile_quota_periods).\nMaking a webhook the mechanism would strand a renewed payer at cap behind a\nlate delivery and hand out a second bucket on a replay — Stripe retries for\nthree days and can deliver out of order. Webhooks update plan, limit, status\nand lifecycle dates; the window advances on its own.",
+        "description": "Handle Stripe webhook events to keep plan state in sync.\n\nRegisters for:\n  - checkout.session.completed      → activate new plan (trial → paid)\n  - customer.subscription.created   → same as updated, entitled statuses only\n  - customer.subscription.updated   → upgrades / downgrades / cancellation\n  - customer.subscription.deleted   → downgrade to starter\n  - invoice.payment_failed          → start the dunning grace + notify\n  - charge.dispute.created / .closed / .funds_withdrawn / .funds_reinstated\n                                    → page ops; access unchanged\n\nRecovery from dunning arrives as customer.subscription.updated (past_due ->\nactive); invoice.payment_succeeded is deliberately not handled.\n\nNOTE what these handlers deliberately do NOT do: advance a quota window.\nRecord quota rolls on the user's entitlement anniversary, lazily, inside the\nstatement that next charges them (and hourly via reconcile_quota_periods).\nMaking a webhook the mechanism would strand a renewed payer at cap behind a\nlate delivery and hand out a second bucket on a replay — Stripe retries for\nthree days and can deliver out of order. Webhooks update plan, limit, status\nand lifecycle dates; the window advances on its own.",
         "operationId": "stripe_webhook_billing_webhook_post",
         "parameters": [
           {
@@ -10500,7 +10651,7 @@
     },
     "/scrapers/sample": {
       "get": {
-        "description": "Public endpoint: returns precomputed, sanitized sample records.\n\nReads ONLY the public_sample_cache singleton (refreshed hourly by the\nrefresh_public_sample_cache Celery task, which does all PII redaction).\nThis unauthenticated endpoint therefore never live-queries the tenant\ntables (results/jobs/scraper_configs) — so under the non-BYPASSRLS cutover\nrole it needs no cross-tenant read access, and there is no path by which an\nanonymous caller can reach un-sanitized PII (RLS cutover Phase 2b, Codex\ndesign). Returns an empty-but-valid shape until the first refresh runs.",
+        "description": "Public endpoint: returns precomputed, sanitized sample records.\n\nReads ONLY the public_sample_cache singleton (refreshed hourly by the\nrefresh_public_sample_cache Celery task, which does all PII redaction).\nThis unauthenticated endpoint therefore never live-queries the tenant\ntables (results/jobs/scraper_configs) — so under the non-BYPASSRLS cutover\nrole it needs no cross-tenant read access, and there is no path by which an\nanonymous caller can reach un-sanitized PII (RLS cutover Phase 2b, Codex\ndesign). The records are always illustrative examples, never real people;\nthe counts read zero until the first refresh runs.",
         "operationId": "sample_records_scrapers_sample_get",
         "responses": {
           "200": {

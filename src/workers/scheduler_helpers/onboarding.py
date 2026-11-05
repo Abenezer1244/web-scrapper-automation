@@ -23,11 +23,14 @@ def _exists(db, *conditions) -> bool:
 
 def _send_onboarding_emails_impl() -> None:
     """Send day-1 nudge, day-3 activation reminder, day 6-7 trial expiry warnings."""
+    from collections import Counter
+
     from sqlalchemy import select
 
     from src.db.models import ScraperConfig, User
     from src.db.session import SyncSessionLocal
     from src.workers.onboarding_emails import (
+        SENT,
         send_activation_reminder,
         send_day1_nudge,
         send_trial_ending_email,
@@ -37,10 +40,20 @@ def _send_onboarding_emails_impl() -> None:
     day1_sent = 0
     day3_sent = 0
     expiry_sent = 0
+    # Every outcome, not just sends: a run where everything was HELD (no postal
+    # address configured) must not log as if the emails went out.
+    outcomes: Counter[str] = Counter()
 
     with SyncSessionLocal() as db:
+        # deletion_state IS NULL: an account that asked to be deleted keeps
+        # is_active until its purge is claimed, and must get no more marketing.
+        # (Opt-outs are checked per address at send time, in the senders.)
         users = db.execute(
-            select(User).where(User.is_active, User.trial_ends_at.isnot(None))
+            select(User).where(
+                User.is_active,
+                User.deletion_state.is_(None),
+                User.trial_ends_at.isnot(None),
+            )
         ).scalars().all()
 
         for user in users:
@@ -60,8 +73,9 @@ def _send_onboarding_emails_impl() -> None:
                 if not has_scraper:
                     # days_left is this user's REAL remaining trial, not a
                     # literal. The copy used to always read "6 more days".
-                    send_day1_nudge(user.email, days_left)
-                    day1_sent += 1
+                    outcome = send_day1_nudge(user.email, days_left)
+                    outcomes[outcome] += 1
+                    day1_sent += outcome == SENT
 
             # Day 3: activation nudge (scraper exists but no downloads yet)
             if days_since_signup == 3:
@@ -76,17 +90,20 @@ def _send_onboarding_emails_impl() -> None:
                     or bool(user.onboarding_download_grandfathered)
                 )
 
-                send_activation_reminder(
+                outcome = send_activation_reminder(
                     user.email, has_scraper, has_download, days_left
                 )
-                day3_sent += 1
+                outcomes[outcome] += 1
+                day3_sent += outcome == SENT
 
             # Day 6 or 7: trial expiry warning
             if days_left in (1, 2):
-                send_trial_ending_email(user.email, days_left)
-                expiry_sent += 1
+                outcome = send_trial_ending_email(user.email, days_left)
+                outcomes[outcome] += 1
+                expiry_sent += outcome == SENT
 
     _logger.info(
-        "Onboarding email check: %d trial users evaluated (day1=%d day3=%d expiry=%d)",
-        len(users), day1_sent, day3_sent, expiry_sent,
+        "Onboarding email check: %d trial users evaluated (sent: day1=%d day3=%d "
+        "expiry=%d; outcomes=%s)",
+        len(users), day1_sent, day3_sent, expiry_sent, dict(outcomes),
     )

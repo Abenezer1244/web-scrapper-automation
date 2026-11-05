@@ -81,6 +81,26 @@ class Settings(BaseSettings):
     #   python -c "import secrets; print(secrets.token_urlsafe(32))"
     BLIND_INDEX_KEY: str = ""
 
+    # Privacy suppression keyring (compliance audit 2026-11, Phase 6 design, section 5).
+    # Keyed HMACs identify a person in a suppression rule without storing the name or
+    # address. Dedicated and VERSIONED, unlike BLIND_INDEX_KEY, so it can rotate: a
+    # rule records the version it was keyed under, and during a rotation rules carry
+    # HMACs under both. Format: "v1:<secret>[,v2:<secret>...]"; the current version
+    # signs new rules, every listed version still matches. Blank = derived from
+    # SECRET_KEY via HKDF, allowed only when ENVIRONMENT is development/dev/local/
+    # test/testing AND PII_ENCRYPTION_STRICT is off (anything else, "staging"
+    # included, refuses to start keying).
+    # Nothing reads it in production until Phase 6 ships. Generate a secret:
+    #   python -c "import secrets; print(secrets.token_urlsafe(32))"
+    PRIVACY_HMAC_KEYS: str = ""
+    PRIVACY_HMAC_CURRENT_VERSION: str = "v1"
+    # The operator half of the privacy-suppression activation guard (Phase 6 design,
+    # section 8; src/privacy/activation.py). A rule can be activated only when this
+    # AND the enforcement version the code implements both reach the required
+    # version, so raising this alone enables nothing. Leave 0 until P7 ships; the
+    # database (migration 125) refuses any active rule regardless until then.
+    PRIVACY_ENFORCEMENT_VERSION: int = 0
+
     # H3 PII encryption read mode. While False (tolerant), decrypt_field() treats
     # any value that is not a valid fe1:-prefixed Fernet token as legacy
     # plaintext and returns it as-is — required during the backfill window. Flip
@@ -215,6 +235,12 @@ class Settings(BaseSettings):
     EMAIL_REPLY_TO: str = "support@bridgeleads.io"
     # Support address printed in email footers / help copy.
     SUPPORT_EMAIL: str = "support@bridgeleads.io"
+    # The business's valid physical postal address, printed in the footer of every
+    # COMMERCIAL email (CAN-SPAM, 15 U.S.C. 7704(a)(5)). Empty = commercial email
+    # (welcome, nudges, trial-ending upsell) is HELD, not sent, and ops is alerted:
+    # it cannot be sent lawfully without it (owner decision 2026-11-04). Security
+    # and account emails are unaffected. One line, e.g. "Name, 1 Main St, City, ST 00000".
+    COMPANY_POSTAL_ADDRESS: str = ""
 
     # Registration email-verification flow (anti-enumeration). Default FALSE =
     # legacy behavior: /auth/register creates the account immediately and returns
@@ -416,6 +442,13 @@ class Settings(BaseSettings):
             # object.__setattr__: no recursion even if validate_assignment is ever on.
             object.__setattr__(self, "ENTITLEMENT_ENFORCEMENT", True)
         return self
+
+    @field_validator("PRIVACY_ENFORCEMENT_VERSION")
+    @classmethod
+    def privacy_enforcement_version_is_not_negative(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("PRIVACY_ENFORCEMENT_VERSION must be 0 (off) or more")
+        return v
 
     @field_validator("TRACERFY_LOW_BALANCE_CREDITS")
     @classmethod

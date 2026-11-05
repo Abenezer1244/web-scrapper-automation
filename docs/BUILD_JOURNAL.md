@@ -19,6 +19,196 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-11-04 — Privacy suppression groundwork (compliance Phase 6 P1 + P2, local only)
+
+**Built / Shipped (local branch `audit/compliance-2026-11`, nothing pushed, nothing wired in):**
+- `src/privacy/keys.py`: a versioned keyed-HMAC keyring for suppression rules.
+  - It reads one settings snapshot.
+  - The SECRET_KEY fallback works only in listed dev/test environments with PII strict mode off.
+  - Secrets need 32+ bytes.
+  - Each kind accepts only its canonical value; addresses are refused until their normaliser exists.
+- `src/privacy/subjects.py`: who a name cell names.
+  - It reads only in the source's declared order (`name_order_for`), reusing the export's `lead_formatting` rules.
+  - Each subject is a person (one reading), a typed entity, or unresolved (review only, no key).
+  - A pinned fingerprint ties `NORMALIZATION_VERSION` (n3) to those reused rules.
+- Migration 125 adds four tables: `privacy_requests`, `privacy_request_payloads`, `privacy_request_events`, `privacy_suppressions`.
+  - Each has an append-only BLD24 trigger. RLS is on with no policies; every role is revoked in the migration and both grant scripts.
+  - The DB activation guard allows `state = 'pending'` only.
+- `src/privacy/activation.py` is the app half of the guard. It needs both the code's implemented version and `PRIVACY_ENFORCEMENT_VERSION`; default 0.
+
+**Tried / Decided:**
+- Rejected: reading cells in both word orders (the first P1 version). SMITH JOHN and JOHN SMITH collided. The source's declared order is trusted instead, and anything unreadable goes to review.
+- Inferred readings (a shared surname) are review only, never keys.
+- Requester PII lives in its own erasable table. DELETE is not trigger-blocked, so retention (D5) stays decidable.
+- A request with a rule cannot be deleted (FK RESTRICT).
+- `actor_user_id` is not an FK to `users`, so the 113 purge stays independent.
+
+**Failed / Caught & fixed:**
+- P1 took 8 Codex rounds. Most findings were paths that silently dropped or mis-keyed a person:
+  - mixed person/entity cells;
+  - per-part tails;
+  - orphan markers;
+  - underscores;
+  - empty slots.
+- Heredoc escaping twice wrote a literal backspace byte where a regex `\b` belonged. Lesson: write edit scripts to files, not inline heredocs.
+- `scope varchar(16)` was too short for the future value, which raised a length error before the CHECK ran. Widened to 24.
+
+**Pending / Handoff:** P3-P9 are blocked on owner/counsel decisions D1-D9. Until P7 ships, requests are handled manually and re-import cannot be prevented.
+
+**Facts learned:** in a CHECK, `x ~ re AND y` with `x` NULL can be false, not unknown. Write `x IS NULL OR ...`, or split the constraint.
+
+## 2026-11-04 — Checkout and billing disclosures (compliance Phase 5, local only)
+
+**Built / Shipped (local branches, nothing pushed):**
+- Stripe Checkout shows the renewal terms read from the Stripe Price itself.
+- Disputes page ops.
+- The plan-change dialog is truthful per direction and states the renewal terms.
+- The dialog's price is binding: `expected_price` is required, so a changed price gets 409 instead of a charge.
+
+**Tried / Decided:**
+- The disclosure first came from the catalog. Codex: Checkout bills the Stripe Price, so read that.
+- A catalog mismatch pages ops. Checkout still sells (its page shows Stripe's real amount); change-plan
+  refuses (its dialog quotes the catalog).
+
+**Failed / Blocked:**
+- Five Codex NO-GO rounds, each narrowing the gap:
+  - catalog vs Stripe;
+  - usage_type;
+  - reads inside the lock;
+  - interval drift;
+  - alert flood;
+  - the change-plan metered Price;
+  - the stale dialog price;
+  - an optional expected_price.
+- My commit message claimed the dedupe still wrote durable rows. It did not. Codex caught it; now
+  hourly re-send.
+- The annual-downgrade forfeiture is still unresolved: it needs a Stripe test key and an owner policy.
+
+**Caught & fixed:**
+- The plan-change dialog told every customer that unused time is credited, which is false for
+  downgrades (proration none).
+- An annual Price id with no amount would buy annual while stating monthly terms.
+
+**Pending / Handoff:**
+- Owner, in the live Stripe dashboard:
+  - subscribe to the dispute events;
+  - check the portal's cancellation setting;
+  - Terms URL;
+  - downgrade policy.
+- The BE deploys before the FE.
+
+**Facts learned:**
+- `/billing/plans` is cached 30 s in the FE, so a displayed price must be confirmed server-side.
+- Stripe zero-decimal currencies need `_format_money`.
+- Change-plan tests must stub `stripe.Price.retrieve`.
+
+---
+
+## 2026-11-04 — CAN-SPAM opt-out for commercial email (compliance Phase 4, local only)
+
+**Built / Shipped (local branch `audit/compliance-2026-11`, nothing pushed):**
+- Migration 124 `marketing_email_suppressions`:
+  - append-only (BLD23), keyed by email_hmac.
+- Signed address-bound unsubscribe token (400 days).
+- `/email/unsubscribe`:
+  - GET shows a confirm page;
+  - POST takes the form or an RFC 8058 one-click.
+- The welcome, day-1, day-3 and trial-ending emails are now commercial. Each carries List-Unsubscribe
+  headers, a footer link and the postal address, checks the suppression list at send time, and is HELD
+  (with an ops alert) while API_BASE_URL or COMPANY_POSTAL_ADDRESS is unusable.
+- The beat skips accounts pending deletion and counts real sends only.
+
+**Tried / Decided:**
+- A users column was rejected (Codex consult): it does not survive deletion or re-registration and
+  would follow a user to a new address. The opt-out is keyed by address instead.
+- **Owner chose to hold commercial mail** until the postal address is set. Until then, no welcome,
+  nudge or trial-ending emails go out.
+- The welcome email counts as commercial (Codex) because it promotes the trial.
+
+**Failed / Blocked:**
+- Codex NO-GO twice.
+  - Round 1:
+    - per-IP rate limit could 429 one-click opt-outs from shared provider IPs;
+    - sync DB + Resend blocked the event loop in the welcome path;
+    - Referer could carry the token;
+    - base-URL path not checked.
+  - Round 2:
+    - the cutover script's blanket re-grant;
+    - the meta referrer is unreliable, so I added form rel=noreferrer;
+    - the Content-Length-only cap, so the body is now read as a stream;
+    - userinfo in the base URL.
+- I first set a Referrer-Policy header that the middleware silently overwrites, and removed it.
+
+**Caught & fixed:**
+- I put a module-level `src.api` import in a worker module (an import-cycle risk) and made it lazy.
+- The outcome log sorted a Counter with mixed None/str keys.
+
+**Pending / Handoff:**
+- Owner sets COMPANY_POSTAL_ADDRESS (and confirms API_BASE_URL) on api + worker.
+- P2-13: the cutover script would over-grant on a re-run for older tables.
+- Counsel: confirm the email classification and the indefinite suppression retention.
+
+**Facts learned:**
+- SecurityHeadersMiddleware overwrites CSP and Referrer-Policy on every response (default-src 'none'
+  strips inline styles on API HTML pages).
+- `rate_limit(identifier=...)` keys a bucket by anything, not just IP.
+- `<form rel=noreferrer>` drops Referer on the POST (verified in Chromium).
+
+---
+
+## 2026-11-04 — Terms/Privacy acceptance is recorded (compliance Phase 3a-c, local only)
+
+**Built / Shipped (local branches `audit/compliance-2026-11`, nothing pushed):**
+- BE migration 123 `legal_acceptances`:
+  - append-only (BLD22 trigger plus grants), `accepted_at` from the DB clock, 113 fence, RLS;
+  - kept after purge.
+- BE signup writer records only exactly-current versions, inside the account's transaction.
+  The verified flow records from verify-email only.
+- `/auth/config` publishes `legal_versions` as OpenAPI constants.
+- FE:
+  - BFF allowlist forwards the fields;
+  - the verify-email form gets the same required checkbox;
+  - register sends the versions;
+  - `lib/legal-versions.ts` is typed against the backend schema.
+
+**Tried / Decided:**
+- My first plan was three columns on `users`. Codex's consult rejected it (overwrites history,
+  client-forgeable versions, partial writes), so I switched to an append-only table that
+  mirrors `account_exports` (115).
+- I kept the 115 precedent for policy placement rather than diverging in one table.
+- Enforcement (3d) is deliberately a separate step behind a flag. Optional fields keep
+  today's frontend working during the rollout.
+
+**Failed / Blocked:**
+- The FE half was NO-GO the first time: a backend-only version bump would silently record
+  nothing. Fixed with a compile-time guard (OpenAPI `const`, then the generated TS type), so
+  the drift now fails tsc (TS2322).
+- My E2E left unverified pending rows in the local test DB, and they broke an unrelated
+  dispatcher test until cleared.
+- I ran `git checkout --` to undo a deliberate test edit and it discarded my uncommitted
+  rewrite of `legal-versions.ts`. I rewrote it. Lesson: undo test mutations with a file copy,
+  never git, while work is uncommitted.
+
+**Caught & fixed:**
+- append-only rested on grants alone (now a trigger);
+- the checkbox did not take focus on error;
+- the date test was lenient and tested a copy of the parser.
+
+**Pending / Handoff:**
+- Rollout: **the BE merges first**, then the FE. FE CI regenerates types from BE main.
+- 3d needs owner approval.
+- Owner/counsel: retention period (proposed 6 y, RCW 4.16.040), one combined checkbox vs two,
+  IP/user-agent capture.
+
+**Facts learned:**
+- Sync-engine tests always connect to `:6543`, because `session.py` rewrites the port. Locally,
+  a loopback forwarder 6543→5432 makes them runnable; the 4 "failing" registry tests were only this.
+- CREATE ROLE is transactional, so grants/RLS can be exercised with throwaway roles in a
+  rolled-back transaction without touching the cluster.
+- `/openapi.json` is served only with DEBUG on; tests use `app.openapi()`.
+
+---
+
 ## 2026-11-03 → 11-04 — The #579 fork test runs for real; leftovers closed; GitHub security features on every repo
 
 **Built / Shipped:**
@@ -80,6 +270,48 @@ to understand *why* the code is the way it is and *what's been attempted before*
 - A psycopg2 cursor left in a transaction breaks `pool_pre_ping`'s `set_session` on the next checkout.
 - `codex` and `railway` are not on the Bash PATH here: prepend `$(cygpath "$APPDATA")/npm` and
   `/c/Program Files/nodejs`.
+
+## 2026-11-04 — Legal, privacy and launch-readiness audit; first two remediation phases (local only)
+
+**Built / Shipped (local branches, nothing pushed):**
+- The audit is in `docs/legal/audit-2026-11/01..05` plus `sbom/`. The plan is `tasks/todo-compliance-audit-2026-11.md`.
+  The verdict is **not ready**, and Codex agreed independently. Four critical findings:
+  - the legal mailboxes are dead (`bridgeleads.com` is not ours; `bridgeleads.io` has no MX);
+  - non-customers are promised rights that nothing can fulfil;
+  - 11 placeholders are live on the legal pages;
+  - several sources ban automation, and the code can solve CAPTCHAs there.
+- Backend branch `audit/compliance-2026-11`:
+  - `/scrapers/sample` serves flagged example records from the route itself. It used to serve real owners' names, ZIP+4 and recording dates.
+  - CI token is `contents: read`, and the Railway CLI is pinned.
+  - Stale compliance docs are marked superseded.
+- Frontend branch `audit/compliance-2026-11`:
+  - Google Analytics does not load under GPC or DNT, and the cookie notice is now truthful.
+  - Batch exports carry the DNC notice. The dialer copy no longer claims pushed leads are off the DNC list.
+  - Pricing shows the yearly totals, and the trial is described as 25 lookup credits everywhere.
+
+**Tried / Decided:**
+- Owner chose synthetic sample records and the respect-the-browser-signal model for GA.
+- Phases were split to stay within the 5-file rule.
+- Codex rated RLS-off-by-default Critical. I downgraded it to an owner verification: the boot already alerts and is deliberately non-blocking for rollback (`session.py:405-425`).
+
+**Failed / Blocked:**
+- My first sample fix was NO-GO. It changed the writer, but the route served the cache row verbatim, so a pre-deploy row would still leak.
+- The second fix was NO-GO too: cached stats were unvalidated, and a malformed row returned a 500. GO on the third.
+- FE review caught "25 lookups" (the backend grants 25 *credits*) in six places. Two rounds to find them all.
+- `uv` is not on this laptop's PATH. I used a system Python 3.12 venv (`C:/Users/micha/bl-wt/compliance-venv`).
+
+**Caught & fixed:** stale-cache leak; 500 on a malformed cache row; the dialer copy said "not on the Do-Not-Call list" when unknown-DNC numbers are pushed; the batch DNC note was invisible to screen readers.
+
+**Pending / Handoff:**
+- Owner checklist B1 in `01-...`: mail on `bridgeleads.io`, legal entity and address, production flag values, retention windows, the Tracerfy contract and DPAs.
+- Counsel questions C1-C12.
+- Phases 3-7 are in the plan, each needing approval.
+- A new processor to disclose: **Sentry** (BE #586, dormant until `SENTRY_DSN` is set).
+- Merging either branch deploys. Owner approval is needed.
+
+**Facts learned:**
+- `tests/test_scrapers.py` registry tests fail locally because the sync URL is rewritten to `:6543`. They fail the same way on main, so this is environmental.
+- `export_openapi.py` in a requirements.txt Python 3.12 venv reproduces the committed schema byte for byte.
 
 ---
 

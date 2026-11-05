@@ -746,8 +746,10 @@ def test_purge_functions_and_fence_are_locked_down(conn) -> None:
         "SELECT c.relname, t.tgenabled FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid "
         "WHERE t.tgname = 'zz_account_deletion_fence'")).all())
     # account_exports (115): fenced, not purged (kept as the request log).
+    # legal_acceptances (123): fenced, not purged (kept as contract evidence).
     assert enabled == dict.fromkeys(
-        (*_FENCED, "audit_events", "skip_trace_queues", "account_exports"), "A")
+        (*_FENCED, "audit_events", "skip_trace_queues", "account_exports",
+         "legal_acceptances"), "A")
     assert conn.execute(text(
         "SELECT count(*) FROM pg_auth_members WHERE roleid = 'bridgeleads_purge'::regrole "
         "AND (set_option OR inherit_option OR member <> current_user::regrole)")).scalar() == 0

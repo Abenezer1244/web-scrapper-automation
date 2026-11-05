@@ -11,6 +11,12 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
+# Least privilege for GITHUB_TOKEN. Every job only checks code out, except
+# `build`, which declares its own (packages: write) below. Without this block the
+# test, audit and deploy jobs inherited the repository's default token scope.
+permissions:
+  contents: read
+
 # Without this, every push to an open PR started ANOTHER full run and the
 # superseded ones ran to completion anyway. One PR with four review fixes cost
 # four complete 14-minute runs where one would have done, and this is a PRIVATE
@@ -306,7 +312,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Railway CLI
-        run: npm install -g @railway/cli
+        # Pinned: this job holds RAILWAY_TOKEN_STAGING, so it must not run
+        # whatever version the registry serves that day.
+        run: npm install -g @railway/cli@5.71.0
 
       - name: Deploy to Railway staging
         env:

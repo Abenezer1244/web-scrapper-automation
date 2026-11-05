@@ -77,10 +77,12 @@ from src.api.schemas import (
     AccountExportUrlResponse,
     AccountRestoreRequest,
     ApiKeyResponse,
+    AuthConfigResponse,
     BreakGlassLoginRequest,
     EmailChangeConfirm,
     EmailChangeRequest,
     ForgotPasswordRequest,
+    LegalVersions,
     LoginResponse,
     LogoutRequest,
     MfaDisableRequest,
@@ -136,7 +138,7 @@ async def _reauthenticate(request: Request, user: User, password: str) -> None:
         )
 
 
-@router.get("/config")
+@router.get("/config", response_model=AuthConfigResponse)
 async def auth_config() -> dict:
     """Public endpoint: returns auth validation rules for frontend forms.
 
@@ -160,6 +162,9 @@ async def auth_config() -> dict:
         # is set at /auth/verify-email) and returns a neutral "check your email"
         # response; when false, register takes a password and logs in immediately.
         "email_verification_enabled": settings.EMAIL_VERIFICATION_ENABLED,
+        # The Terms / Privacy versions signup must submit to be recorded. Typed in
+        # OpenAPI (LegalVersions) so the frontend's CI catches a version drift.
+        "legal_versions": LegalVersions().model_dump(),
     }
 
 

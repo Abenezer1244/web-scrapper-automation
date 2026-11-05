@@ -1,13 +1,14 @@
 """Stripe billing routes: checkout, portal, webhooks, plans, usage."""
 
 import asyncio
+import time
 from collections.abc import Callable
 from datetime import UTC, datetime
 from functools import partial
 
 import stripe
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Request, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import select, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -842,6 +843,182 @@ _SKIP_TRACE_METERED_PRICE: dict[str, dict[str, str]] = {
 }
 
 
+# Stripe's zero-decimal currencies: amounts are already whole units.
+# https://docs.stripe.com/currencies#zero-decimal
+_ZERO_DECIMAL_CURRENCIES = frozenset({
+    "bif", "clp", "djf", "gnf", "jpy", "kmf", "krw", "mga", "pyg", "rwf", "ugx", "vnd",
+    "vuv", "xaf", "xof", "xpf",
+})
+
+
+def _format_money(amount_minor: int, currency: str) -> str:
+    """A Stripe amount (minor units) as readable money, e.g. '$1,910.00 USD'."""
+    code = (currency or "").lower()
+    if code in _ZERO_DECIMAL_CURRENCIES:
+        value = f"{amount_minor:,}"
+    else:
+        value = f"{amount_minor / 100:,.2f}"
+    return f"${value} USD" if code == "usd" else f"{value} {code.upper()}"
+
+
+def _stripe_price_terms(price_id: str) -> dict:
+    """What Stripe will actually charge for one Price: amount, currency, cadence.
+
+    Read from Stripe, not the catalog: Checkout bills the configured Price, so the
+    disclosure must describe that Price (Codex review, Phase 5). Raises on a Stripe
+    error; the caller fails the checkout closed rather than disclose a guess.
+    """
+    price = stripe.Price.retrieve(price_id)
+    recurring = price.get("recurring") or {}
+    return {
+        "unit_amount": price.get("unit_amount"),
+        "currency": str(price.get("currency") or "").lower(),
+        "interval": recurring.get("interval"),
+        "interval_count": int(recurring.get("interval_count") or 1),
+        # No default: a Price whose usage type Stripe did not state is refused,
+        # never assumed licensed (Codex review).
+        "usage_type": recurring.get("usage_type"),
+        "per_unit": price.get("billing_scheme", "per_unit") == "per_unit",
+    }
+
+
+def _renewal_terms(
+    plan_name: str,
+    base: dict,
+    included_lookups: int,
+    overage: dict | None,
+) -> str:
+    """The automatic-renewal disclosure shown above Checkout's pay button. Pure.
+
+    ROSCA (15 U.S.C. 8403) requires the material terms of a negative-option sale to
+    be clear before billing (compliance audit 2026-11, Phase 5; Codex consult).
+    ``base`` and ``overage`` are _stripe_price_terms() of the plan Price and of the
+    metered Price on the session (None when none is). States only what the code can
+    vouch for: no cancellation timing (the live Customer Portal decides it) and no
+    overage invoice timing. The overage rate appears only for a per-unit metered
+    Price that is actually on the session.
+    """
+    count, unit = base["interval_count"], base["interval"]
+    cadence = unit if count == 1 else f"{count} {unit}s"
+    parts = [
+        f"Your {plan_name} plan renews automatically every {cadence} for "
+        f"{_format_money(base['unit_amount'], base['currency'])} until you cancel or "
+        "the subscription otherwise ends.",
+        "An accepted promotion code reduces only the invoices its terms cover.",
+    ]
+    if included_lookups:
+        lookups = f"It includes {included_lookups:,} contact lookups each month"
+        if overage and overage["per_unit"] and overage["unit_amount"] is not None:
+            lookups += ("; additional lookups cost "
+                        f"{_format_money(overage['unit_amount'], overage['currency'])} each")
+        parts.append(lookups + ".")
+    parts.append("To cancel, open Billing in your BridgeLeads settings.")
+    return " ".join(parts)
+
+
+def _billing_unavailable() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="Billing is temporarily unavailable. Please try again later.",
+    )
+
+
+def _read_price(price_id: str, *, route: str) -> dict:
+    try:
+        return _stripe_price_terms(price_id)
+    except stripe.error.StripeError as exc:
+        _logger.error("%s: could not read Price %s from Stripe (%s)",
+                      route, price_id, type(exc).__name__)
+        raise _billing_unavailable() from exc
+
+
+# A catalog mismatch is sent through send_ops_alert (which pages AND writes a durable
+# row) at most once an hour per Price per process. Its own Redis cooldown fails open,
+# so without this a persistent misconfiguration during a Redis outage would page on
+# every purchase; with it, a mismatch that persists still leaves an hourly durable
+# record, and every occurrence in between is logged at ERROR (Codex review).
+_CATALOG_MISMATCH_RESEND_SECONDS = 3600
+_CATALOG_MISMATCH_LAST_SENT: dict[str, float] = {}
+
+
+def _verified_plan_price(
+    plan_id: str, price_id: str, interval: str, *, route: str, strict: bool = False,
+) -> dict:
+    """Read the plan Price from Stripe and check it against what the site quotes.
+
+    Used by checkout AND change-plan, the two places a customer is charged, so the
+    catalog amount the pricing page and the switch dialog show is verified against
+    the Stripe Price on every purchase. A read failure, or a Price that is not a
+    plain licensed recurring per-unit amount, fails the purchase closed (503). A
+    Price that disagrees with the catalog (amount, currency, or the CONFIGURED
+    interval) pages ops, because the pricing page is then wrong. Checkout still
+    sells (its disclosure states Stripe's real terms); ``strict`` (change-plan,
+    whose dialog quotes the CATALOG amount) refuses instead, so a customer is never
+    charged a price other than the one they were shown.
+    """
+    from src.config.plans import get_plan
+
+    base = _read_price(price_id, route=route)
+    if (not isinstance(base["unit_amount"], int) or not base["per_unit"]
+            or base["usage_type"] != "licensed"
+            or base["interval"] not in ("day", "week", "month", "year")):
+        _logger.error("%s: Price %s is not a plain licensed recurring amount; refusing",
+                      route, price_id)
+        raise _billing_unavailable()
+    plan = get_plan(plan_id)
+    expected = (plan["price_annual"] if interval == "year" else plan["price_monthly"]) * 100
+    mismatch = (base["unit_amount"] != expected or base["currency"] != "usd"
+                or base["interval"] != interval or base["interval_count"] != 1)
+    now = time.monotonic()
+    last = _CATALOG_MISMATCH_LAST_SENT.get(price_id)
+    if mismatch and last is not None and now - last < _CATALOG_MISMATCH_RESEND_SECONDS:
+        _logger.error("%s: Price %s still disagrees with the catalog (alerted %.0fs ago)",
+                      route, price_id, now - last)
+    elif mismatch:
+        _CATALOG_MISMATCH_LAST_SENT[price_id] = now
+        _alert_billing_gap(
+            "Stripe Price disagrees with the plan catalog the website quotes",
+            f"price_catalog_mismatch:{price_id}",
+            price_id=price_id, plan=plan_id, configured_interval=interval,
+            stripe_interval=f"{base['interval_count']} {base['interval']}",
+            stripe_amount=base["unit_amount"], stripe_currency=base["currency"],
+            catalog_amount=expected,
+        )
+    if mismatch and strict:
+        _logger.error("%s: Price %s disagrees with the catalog; refusing", route, price_id)
+        raise _billing_unavailable()
+    return base
+
+
+def _verified_metered_price(price_id: str, *, route: str) -> dict:
+    """Read a skip-trace overage Price and require a metered per-unit amount (503)."""
+    overage = _read_price(price_id, route=route)
+    if (overage["usage_type"] != "metered" or not overage["per_unit"]
+            or not isinstance(overage["unit_amount"], int)):
+        _logger.error("%s: Price %s is not a metered per-unit amount; refusing",
+                      route, price_id)
+        raise _billing_unavailable()
+    return overage
+
+
+def _checkout_renewal_terms(
+    plan_id: str, price_id: str, interval: str, metered_price: str | None,
+) -> str:
+    """Build the Checkout disclosure from the Prices Stripe will charge.
+
+    Fails the checkout closed (503) when Stripe cannot be read or a Price is the
+    wrong kind (a plan Price that is not licensed, an overage Price that is not a
+    metered per-unit amount): selling without telling the customer what renews is
+    the thing this exists to prevent.
+    """
+    from src.config.plans import get_plan
+
+    base = _verified_plan_price(plan_id, price_id, interval, route="checkout")
+    overage = _verified_metered_price(metered_price, route="checkout") if metered_price else None
+    included = settings.SKIP_TRACE_BUNDLED_QUOTAS.get(plan_id, 0)
+    return _renewal_terms(get_plan(plan_id)["name"], base, included, overage)
+
+
 def _metered_skip_trace_price(plan: str, interval: str) -> str | None:
     """The metered skip-trace Price to put on this subscription, or None.
 
@@ -1116,6 +1293,13 @@ async def create_checkout(
             detail="Billing is temporarily unavailable. Please try again later.",
         )
 
+    # What will be sold and its renewal terms, read from Stripe BEFORE the per-user
+    # lock below: none of it depends on the user, and a slow Stripe read must not
+    # hold the lock and a database connection (Codex review, Phase 5).
+    _plan_id, _limit, _interval = _PRICE_TO_PLAN[stripe_price_id]
+    metered_price = _metered_skip_trace_price(_plan_id, _interval)
+    renewal_terms = _checkout_renewal_terms(_plan_id, stripe_price_id, _interval, metered_price)
+
     # Serialise this user's checkout attempts. Two requests in flight (two tabs,
     # a double-click, a retry after a slow response) would otherwise both read
     # "no subscription", both pass the guard below, and both create a Session.
@@ -1183,9 +1367,8 @@ async def create_checkout(
         # The plan item, plus the metered skip-trace item when one is
         # provisioned for this plan and interval. A metered price must NOT
         # carry a quantity: Stripe rejects the item outright if it does.
-        _plan_id, _limit, _interval = _PRICE_TO_PLAN[stripe_price_id]
+        # (metered_price and renewal_terms were resolved before the lock.)
         line_items: list[dict] = [{"price": stripe_price_id, "quantity": 1}]
-        metered_price = _metered_skip_trace_price(_plan_id, _interval)
         if metered_price:
             line_items.append({"price": metered_price})
 
@@ -1208,6 +1391,8 @@ async def create_checkout(
             # the coupon's applies_to, which products it may discount (see the
             # single-customer promotion note above).
             allow_promotion_codes=True,
+            # The renewal terms, above the pay button (ROSCA clear disclosure).
+            custom_text={"submit": {"message": renewal_terms}},
         )
 
         # Defense in depth for the one window the checks above leave: a Session
@@ -1476,6 +1661,13 @@ def _no_subscription_conflict() -> HTTPException:
 
 class ChangePlanRequest(BaseModel):
     price_id: str
+    # The renewal amount (whole USD) the switch dialog SHOWED. REQUIRED: the switch
+    # is refused with 409 (price_unconfirmed when missing, price_changed when it no
+    # longer matches), so a customer is never charged an amount they were not shown
+    # (compliance audit 2026-11, Phase 5c; Codex). Typed optional only so a missing
+    # value gets that friendly 409 instead of a bare 422: a tab still running the
+    # previous frontend reloads and retries, and no money moves.
+    expected_price: int | None = Field(default=None, ge=0)
 
 
 @router.post("/change-plan")
@@ -1521,6 +1713,32 @@ async def change_plan(
         )
 
     new_plan, _limit, new_interval = _PRICE_TO_PLAN[stripe_price_id]
+    # The switch dialog quotes this plan's catalog price: check it against the
+    # Stripe Price that will be charged, before the per-user lock (Codex, Phase 5).
+    verified = _verified_plan_price(new_plan, stripe_price_id, new_interval,
+                                    route="change-plan", strict=True)
+    if body.expected_price is None:
+        # ROLLOUT GRACE (one deploy only): the frontend that sends expected_price
+        # cannot pass its CI before this backend is on main, so for the minutes
+        # between the two deploys the live frontend omits it. Still safe: strict=True
+        # above has already proved the catalog price that frontend displays equals
+        # the Stripe Price that will be charged. The follow-up PR restores the 409
+        # (price_unconfirmed) as soon as the new frontend is live (Codex, pre-merge).
+        _logger.warning("change-plan without expected_price (rollout grace): user=%s plan=%s",
+                        current_user.id, new_plan)
+    elif body.expected_price * 100 != verified["unit_amount"]:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "price_changed",
+                "message": "The price of this plan has changed. Reload Billing to see "
+                           "the current price before switching.",
+            },
+        )
+    # The overage Price _plan_change_items will attach, checked the same way.
+    _target_metered = _metered_skip_trace_price(new_plan, new_interval)
+    if _target_metered:
+        _verified_metered_price(_target_metered, route="change-plan")
 
     try:
         # The SAME lock namespace as checkout (4243). Between them these two
@@ -1801,6 +2019,8 @@ async def stripe_webhook(
       - customer.subscription.updated   → upgrades / downgrades / cancellation
       - customer.subscription.deleted   → downgrade to starter
       - invoice.payment_failed          → start the dunning grace + notify
+      - charge.dispute.created / .closed / .funds_withdrawn / .funds_reinstated
+                                        → page ops; access unchanged
 
     Recovery from dunning arrives as customer.subscription.updated (past_due ->
     active); invoice.payment_succeeded is deliberately not handled.
@@ -1954,7 +2174,56 @@ async def _dispatch_stripe_event(
     elif event_type == "invoice.payment_failed":
         return await _handle_payment_failed(data, db)
 
+    elif event_type in _DISPUTE_EVENTS:
+        return [_dispute_alert(event_type, data)]
+
     return []
+
+
+# Chargebacks (compliance audit 2026-11, Phase 5b; Codex consult). Each lifecycle
+# step pages ops: created (respond before Stripe's evidence deadline), closed (won or
+# lost), and the two money movements, which status alone does not show. The Stripe
+# webhook endpoint must be subscribed to these four events (owner, Stripe dashboard).
+_DISPUTE_EVENTS = frozenset({
+    "charge.dispute.created",
+    "charge.dispute.closed",
+    "charge.dispute.funds_withdrawn",
+    "charge.dispute.funds_reinstated",
+})
+
+
+def _dispute_alert(event_type: str, dispute: dict) -> Callable[[], None]:
+    """An ops alert for one dispute event, to send once the event is committed.
+
+    Entitlement is deliberately NOT changed: a dispute proves neither non-payment
+    nor fraud, may concern a metered charge, and may be won. What happens to access
+    on a dispute or a refund is an owner policy decision (audit B1-5). Carries ids,
+    amount, reason and status only: no customer, email, evidence or metadata.
+    """
+    dispute_id = str(dispute.get("id") or "unknown")
+    charge = dispute.get("charge")
+    charge_id = charge.get("id") if isinstance(charge, dict) else charge
+    amount = dispute.get("amount")
+    # Minor units, and not always cents: JPY and other zero-decimal currencies
+    # are already whole units (Codex review).
+    money = (_format_money(amount, str(dispute.get("currency") or ""))
+             if isinstance(amount, int) else "unknown amount")
+    step = event_type.removeprefix("charge.dispute.").replace("_", " ")
+    subject = f"Stripe dispute {step}: {money}"
+    body = (
+        f"Event: {event_type}\nDispute: {dispute_id}\nCharge: {charge_id or 'unknown'}\n"
+        f"Amount: {money}\nReason: {dispute.get('reason') or 'unknown'}\n"
+        f"Status: {dispute.get('status') or 'unknown'}\n\n"
+        "No account access was changed. Review the dispute in the Stripe dashboard."
+    )
+
+    def _send() -> None:
+        from src.workers.ops_alerts import send_ops_alert
+
+        # Keyed by event AND dispute: 'closed' must not fall inside 'created's cooldown.
+        send_ops_alert("stripe_dispute", f"{event_type}:{dispute_id}", subject, body)
+
+    return _send
 
 
 # ─── Webhook handlers ─────────────────────────────────────────────────────────

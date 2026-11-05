@@ -10,6 +10,7 @@ from pydantic import BaseModel, EmailStr, Field, field_validator, model_validato
 
 from src.config.constants import (
     HEARTBEAT_STALE_MINUTES,
+    LEGAL_DOCUMENT_VERSIONS,
     STUCK_CHECK_STATUSES,
     STUCK_STARTED_AT_FALLBACK_MINUTES,
     ZOMBIE_UNSTARTED_MINUTES,
@@ -85,6 +86,42 @@ def _validate_required_name(v: str | None, label: str) -> str:
     return cleaned
 
 
+# A legal document version is its published "Last updated" date (YYYY-MM-DD).
+_LEGAL_VERSION = r"^\d{4}-\d{2}-\d{2}$"
+
+
+class LegalVersions(BaseModel):
+    """The current published Terms / Privacy versions (GET /auth/config).
+
+    Typed as Literals of LEGAL_DOCUMENT_VERSIONS so OpenAPI, and the frontend's
+    generated types (regenerated and diff-checked in its CI), carry the exact
+    values: a backend-only version bump then fails the frontend's typecheck
+    instead of silently recording no acceptance. A RESPONSE model only, so a
+    stale client can never get a 422 from it.
+    """
+    terms: Literal[LEGAL_DOCUMENT_VERSIONS["terms"]] = LEGAL_DOCUMENT_VERSIONS["terms"]  # type: ignore[valid-type]
+    privacy: Literal[LEGAL_DOCUMENT_VERSIONS["privacy"]] = LEGAL_DOCUMENT_VERSIONS["privacy"]  # type: ignore[valid-type]
+
+
+class AuthPasswordRules(BaseModel):
+    min_length: int
+    max_length: int
+    placeholder: str
+
+
+class AuthTrialInfo(BaseModel):
+    days: int
+    plan: str
+    records_limit: int
+
+
+class AuthConfigResponse(BaseModel):
+    password: AuthPasswordRules
+    trial: AuthTrialInfo
+    email_verification_enabled: bool
+    legal_versions: LegalVersions = Field(default_factory=LegalVersions)
+
+
 class UserRegister(BaseModel):
     email: EmailStr
     # Optional because the registration flow depends on EMAIL_VERIFICATION_ENABLED:
@@ -110,6 +147,13 @@ class UserRegister(BaseModel):
     # conversion. Unknown/invalid codes are silently dropped — no
     # error to avoid leaking which codes exist.
     ref: str | None = None
+    # The Terms / Privacy versions the person accepted (the published "Last
+    # updated" dates). Recorded only in the LEGACY flow, and only when both equal
+    # LEGAL_DOCUMENT_VERSIONS. In the verified flow acceptance is taken at
+    # /auth/verify-email from whoever proves the address, never here. Optional
+    # until every client sends them (compliance audit 2026-11, Phase 3).
+    accepted_terms_version: str | None = Field(None, max_length=32, pattern=_LEGAL_VERSION)
+    accepted_privacy_version: str | None = Field(None, max_length=32, pattern=_LEGAL_VERSION)
 
     @field_validator("password")
     @classmethod
@@ -457,6 +501,10 @@ class VerifyEmailRequest(BaseModel):
     new_password: str
     first_name: str
     last_name: str
+    # Accepted here, by the verifier, for the same reason as the name and password:
+    # an attacker-initiated signup must not accept the Terms on the owner's behalf.
+    accepted_terms_version: str | None = Field(None, max_length=32, pattern=_LEGAL_VERSION)
+    accepted_privacy_version: str | None = Field(None, max_length=32, pattern=_LEGAL_VERSION)
 
     @field_validator("new_password")
     @classmethod

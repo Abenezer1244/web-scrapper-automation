@@ -80,6 +80,43 @@ _GRANTS = [
     # grant above (Codex found this script; provision_rls_roles.sql alone was
     # not the whole story).
     "REVOKE UPDATE ON contact_lookup_action_events FROM bridgeleads_system",
+    # The same for the two append-only evidence tables added after the cutover
+    # (migrations 123, 124): the worker only READS them, as provision_rls_roles.sql
+    # grants. Guarded because a rerun on an older database may not have them yet.
+    """DO $append_only$
+    BEGIN
+        IF to_regclass('public.legal_acceptances') IS NOT NULL THEN
+            REVOKE INSERT, UPDATE ON legal_acceptances FROM bridgeleads_system;
+        END IF;
+        IF to_regclass('public.marketing_email_suppressions') IS NOT NULL THEN
+            REVOKE INSERT, UPDATE ON marketing_email_suppressions FROM bridgeleads_system;
+        END IF;
+        -- Privacy requests and suppression (125): no runtime role holds anything
+        -- yet, as provision_rls_roles.sql; the blanket grant above must not either.
+        IF to_regclass('public.privacy_requests') IS NOT NULL THEN
+            REVOKE ALL ON privacy_requests, privacy_request_payloads,
+                          privacy_request_events, privacy_suppressions
+                FROM PUBLIC, bridgeleads_app, bridgeleads_system;
+            -- Migration 125's full role list; guarded per role.
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+                REVOKE ALL ON privacy_requests, privacy_request_payloads,
+                              privacy_request_events, privacy_suppressions FROM anon;
+            END IF;
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+                REVOKE ALL ON privacy_requests, privacy_request_payloads,
+                              privacy_request_events, privacy_suppressions FROM authenticated;
+            END IF;
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
+                REVOKE ALL ON privacy_requests, privacy_request_payloads,
+                              privacy_request_events, privacy_suppressions FROM service_role;
+            END IF;
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bridgeleads_purge') THEN
+                REVOKE ALL ON privacy_requests, privacy_request_payloads,
+                              privacy_request_events, privacy_suppressions FROM bridgeleads_purge;
+            END IF;
+        END IF;
+    END
+    $append_only$""",
     "GRANT DELETE ON county_records TO bridgeleads_system",
     "GRANT DELETE ON property_list_membership TO bridgeleads_system",
     # tasks.py releases a job's cross-job dedup claims on FIVE paths (trustee-sale

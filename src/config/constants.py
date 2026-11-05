@@ -533,3 +533,15 @@ DNC_DISCLAIMER: str = (
 # matcher (src/workers/nts_matcher_task.auction_missing_reason) when it records WHY a
 # lead is blank, and the results API when it reports a run's auction coverage.
 AUCTION_PUBLICATION_LAG_DAYS: int = 55
+
+# ─── Legal documents (Terms of Service, Privacy Policy) ──────────────────────
+# The CURRENT published version of each document: its "Last updated" date as shown
+# on bridgeleads.io/terms and /privacy (frontend app/(marketing)/terms|privacy). The
+# backend owns these. A signup records acceptance in legal_acceptances (migration
+# 123) only when the client submits exactly these values, and it writes THESE, never
+# a client-chosen string. Change a value only together with the published page:
+# a new date means existing customers have not accepted it (re-acceptance, 3d).
+LEGAL_DOCUMENT_VERSIONS: dict[str, str] = {
+    "terms": "2026-10-01",
+    "privacy": "2026-10-30",
+}

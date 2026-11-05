@@ -15,6 +15,11 @@ operator reuses a secret.
 Domain separation: the ``kind`` ("property", "mailing", "person", "entity",
 "phone", "email") is inside the MAC input, so a value of one kind can never match
 a rule of another (a surname equal to a street name, say).
+
+Configuration is read ONCE per process, as one snapshot of (current version,
+keyring): a running worker never mixes a current version from new settings with a
+keyring from old ones. A rotation therefore takes effect at process restart, which
+is how every other secret here is deployed. ``reset_keyring_cache`` exists for tests.
 """
 from __future__ import annotations
 
@@ -32,74 +37,82 @@ KINDS = frozenset({"property", "mailing", "person", "entity", "phone", "email"})
 _VERSION_RE = re.compile(r"^v[1-9][0-9]{0,3}$")
 _INFO_PREFIX = b"bridgeleads:privacy-hmac:"
 _DEV_INFO_PREFIX = b"bridgeleads:privacy-hmac:dev:"
+_MIN_SECRET_BYTES = 32
+# The SECRET_KEY-derived fallback is allowed ONLY here. An allowlist, not a
+# "!= production" test: a misspelt or new environment name ("prod", "staging")
+# must fail closed, not quietly key real rules with a rotating JWT secret.
+_FALLBACK_ENVIRONMENTS = frozenset({"development", "dev", "local", "test", "testing"})
 
 _lock = threading.Lock()
-_keyring: dict[str, bytes] | None = None
+_snapshot: tuple[str, dict[str, bytes]] | None = None
 
 
 def _derive(secret: bytes, info: bytes) -> bytes:
     return HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=info).derive(secret)
 
 
-def _load_keyring() -> dict[str, bytes]:
-    """Parse PRIVACY_HMAC_KEYS into {version: derived key}. Raises on any defect.
+def _load_keyring() -> tuple[str, dict[str, bytes]]:
+    """Parse the settings into (current version, {version: derived key}).
 
-    Fails CLOSED in production or strict mode when unset, like the blind index: a
-    SECRET_KEY-derived key would change with a routine JWT-key rotation and
-    silently unmatch every suppression rule, which would re-expose people who
-    asked to be removed.
+    Raises on any defect. Fails CLOSED outside a development/test environment when
+    PRIVACY_HMAC_KEYS is unset: a SECRET_KEY-derived key would change with a
+    routine JWT-key rotation and silently unmatch every suppression rule, which
+    would re-expose people who asked to be removed.
     """
     configured = (settings.PRIVACY_HMAC_KEYS or "").strip()
     current = (settings.PRIVACY_HMAC_CURRENT_VERSION or "").strip()
     if not _VERSION_RE.match(current):
         raise RuntimeError(f"PRIVACY_HMAC_CURRENT_VERSION {current!r} is not like 'v1'")
     if not configured:
-        if settings.PII_ENCRYPTION_STRICT or settings.ENVIRONMENT.strip().lower() == "production":
+        environment = (settings.ENVIRONMENT or "").strip().lower()
+        if environment not in _FALLBACK_ENVIRONMENTS:
             raise RuntimeError(
-                "PRIVACY_HMAC_KEYS is not set in production / strict mode. Refusing the "
-                "SECRET_KEY-derived fallback: a SECRET_KEY rotation would silently unmatch "
-                "every privacy suppression rule."
+                f"PRIVACY_HMAC_KEYS is not set and ENVIRONMENT={environment!r} is not a "
+                "development/test environment. Refusing the SECRET_KEY-derived fallback: "
+                "a SECRET_KEY rotation would silently unmatch every privacy suppression rule."
             )
-        return {current: _derive(settings.SECRET_KEY.encode("utf-8"),
-                                 _DEV_INFO_PREFIX + current.encode("ascii"))}
+        return current, {current: _derive(settings.SECRET_KEY.encode("utf-8"),
+                                          _DEV_INFO_PREFIX + current.encode("ascii"))}
     ring: dict[str, bytes] = {}
     for entry in configured.split(","):
         version, sep, secret = entry.strip().partition(":")
-        if not sep or not _VERSION_RE.match(version) or len(secret.strip()) < 32:
+        secret_bytes = secret.strip().encode("utf-8")
+        # Bytes, not characters: the floor is about key material.
+        if not sep or not _VERSION_RE.match(version) or len(secret_bytes) < _MIN_SECRET_BYTES:
             raise RuntimeError(
-                "PRIVACY_HMAC_KEYS must be 'v1:<secret of 32+ chars>[,v2:<secret>...]'")
+                "PRIVACY_HMAC_KEYS must be 'v1:<secret of 32+ bytes>[,v2:<secret>...]'")
         if version in ring:
             raise RuntimeError(f"PRIVACY_HMAC_KEYS lists {version} twice")
-        ring[version] = _derive(secret.strip().encode("utf-8"),
-                                _INFO_PREFIX + version.encode("ascii"))
+        ring[version] = _derive(secret_bytes, _INFO_PREFIX + version.encode("ascii"))
     if current not in ring:
         raise RuntimeError(f"PRIVACY_HMAC_CURRENT_VERSION {current} has no key in PRIVACY_HMAC_KEYS")
-    return ring
+    return current, ring
 
 
-def _ring() -> dict[str, bytes]:
-    global _keyring
-    if _keyring is None:
+def _config() -> tuple[str, dict[str, bytes]]:
+    global _snapshot
+    snap = _snapshot
+    if snap is None:
         with _lock:
-            if _keyring is None:
-                _keyring = _load_keyring()
-    return _keyring
+            if _snapshot is None:
+                _snapshot = _load_keyring()
+            snap = _snapshot
+    return snap
 
 
 def reset_keyring_cache() -> None:
-    """Forget the parsed keyring (after a settings change; tests)."""
-    global _keyring
+    """Forget the parsed snapshot so the next call re-reads settings (tests)."""
+    global _snapshot
     with _lock:
-        _keyring = None
+        _snapshot = None
 
 
 def current_version() -> str:
-    _ring()  # validates the configuration
-    return settings.PRIVACY_HMAC_CURRENT_VERSION.strip()
+    return _config()[0]
 
 
 def live_versions() -> tuple[str, ...]:
-    return tuple(sorted(_ring()))
+    return tuple(sorted(_config()[1]))
 
 
 def privacy_hmac(kind: str, value: str, version: str | None = None) -> str:
@@ -113,8 +126,8 @@ def privacy_hmac(kind: str, value: str, version: str | None = None) -> str:
     if not isinstance(value, str) or not value.strip():
         # An empty value would make one digest that matches every empty field.
         raise ValueError("refusing to key an empty value")
-    ring = _ring()
-    v = version or current_version()
+    current, ring = _config()
+    v = version or current
     if v not in ring:
         raise KeyError(f"privacy key version {v} is not live")
     msg = b"privacy|" + kind.encode("ascii") + b"|" + value.encode("utf-8")
@@ -123,4 +136,5 @@ def privacy_hmac(kind: str, value: str, version: str | None = None) -> str:
 
 def privacy_hmacs(kind: str, value: str) -> dict[str, str]:
     """The digest under EVERY live version, for rules made or matched mid-rotation."""
-    return {v: privacy_hmac(kind, value, v) for v in live_versions()}
+    _current, ring = _config()  # one snapshot for every version listed
+    return {v: privacy_hmac(kind, value, v) for v in sorted(ring)}

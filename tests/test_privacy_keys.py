@@ -16,7 +16,6 @@ _S2 = "b" * 40
 @pytest.fixture(autouse=True)
 def _fresh_keyring(monkeypatch):
     monkeypatch.setattr(settings, "ENVIRONMENT", "test")
-    monkeypatch.setattr(settings, "PII_ENCRYPTION_STRICT", False)
     monkeypatch.setattr(settings, "PRIVACY_HMAC_KEYS", f"v1:{_S1}")
     monkeypatch.setattr(settings, "PRIVACY_HMAC_CURRENT_VERSION", "v1")
     keys.reset_keyring_cache()
@@ -71,7 +70,8 @@ def test_an_unlisted_version_is_refused():
 @pytest.mark.parametrize("bad", [
     "v1",                       # no secret
     f"1:{_S1}",                 # bad version label
-    "v1:short",                 # secret under 32 chars
+    "v1:short",                 # secret under 32 bytes
+    "v1:" + "é" * 15,           # 15 chars, 30 bytes: the floor is bytes
     f"v1:{_S1},v1:{_S2}",       # duplicate version
 ])
 def test_malformed_keyring_fails_loudly(monkeypatch, bad):
@@ -88,13 +88,35 @@ def test_current_version_must_have_a_key(monkeypatch):
         keys.privacy_hmac("person", "smith|john")
 
 
-def test_dev_fallback_works_but_production_and_strict_refuse_it(monkeypatch):
-    monkeypatch.setattr(settings, "PRIVACY_HMAC_KEYS", "")
+def test_a_multibyte_secret_of_32_bytes_is_accepted(monkeypatch):
+    monkeypatch.setattr(settings, "PRIVACY_HMAC_KEYS", "v1:" + "é" * 16)
     keys.reset_keyring_cache()
     assert len(keys.privacy_hmac("person", "smith|john")) == 64
-    for env, strict in (("production", False), ("test", True)):
+
+
+def test_dev_fallback_only_in_listed_dev_and_test_environments(monkeypatch):
+    monkeypatch.setattr(settings, "PRIVACY_HMAC_KEYS", "")
+    for env in ("test", " Development ", "local"):
         monkeypatch.setattr(settings, "ENVIRONMENT", env)
-        monkeypatch.setattr(settings, "PII_ENCRYPTION_STRICT", strict)
+        keys.reset_keyring_cache()
+        assert len(keys.privacy_hmac("person", "smith|john")) == 64
+    # Fails closed for anything else, a misspelling or an unexpected name included.
+    for env in ("production", "Production ", "prod", "staging", ""):
+        monkeypatch.setattr(settings, "ENVIRONMENT", env)
         keys.reset_keyring_cache()
         with pytest.raises(RuntimeError):
             keys.privacy_hmac("person", "smith|john")
+
+
+def test_settings_are_read_once_as_one_snapshot(monkeypatch):
+    first = keys.privacy_hmac("person", "smith|john")
+    # A settings change without a restart (or reset) changes nothing: no call can
+    # mix the new current version with the old keyring.
+    monkeypatch.setattr(settings, "PRIVACY_HMAC_KEYS", f"v2:{_S2}")
+    monkeypatch.setattr(settings, "PRIVACY_HMAC_CURRENT_VERSION", "v2")
+    assert keys.current_version() == "v1"
+    assert keys.live_versions() == ("v1",)
+    assert keys.privacy_hmac("person", "smith|john") == first
+    keys.reset_keyring_cache()
+    assert keys.current_version() == "v2"
+    assert keys.privacy_hmac("person", "smith|john") != first

@@ -188,17 +188,22 @@ Each step is split into commits of at most 5 files, each separately verified and
 - An operator blanks the subject's rows by hand under a written procedure.
 - **Before the automation exists, re-import CANNOT be prevented.** Counsel should know this when advising on responses and on data-broker registration timing.
 
-## 11. Decisions needed [D]
+## 11. Decisions [D]: ADOPTED by the owner 2026-11-05, pending counsel review
 
-1. Verification level per request type, and authorized agents.
-2. Co-owner policy.
-3. Erasure scope (skeleton vs delete), and whether opt-out also erases.
-4. Entity-owner handling (an LLC is not a "consumer"; trusts and estates?).
-5. Request-record and suppression retention.
-6. Tracerfy deletion duty.
-7. Customer notification duty and its basis.
-8. Data-broker registration and DROP.
-9. Privacy-choices page copy and footer links.
+The owner adopted these privacy-protective defaults as company policy so P3-P9 can be built. Counsel has not reviewed them.
+Each is a policy constant or configuration value, so it can change after counsel review.
+
+| # | Decision | Adopted default |
+|---|---|---|
+| 1 | Verification | **Opt-out:** email-link confirmation only. **Delete/access:** email link plus a name and property-address match. **Authorized agents:** need signed permission. |
+| 2 | Co-owners | Suppress the WHOLE row from delivery. |
+| 3 | Erasure | **Delete:** blank the person data and keep a nameless property skeleton for billing. **Opt-out:** suppress, no erase. |
+| 4 | Entities | People named as estate, trustee or heir are covered. Pure companies (LLC/INC) are declined with a fixed decision code. |
+| 5 | Retention | **Request records:** 24 months (CCPA regulations). **Requester contact:** deleted 24 months after close. **Suppression rules:** kept indefinitely. |
+| 6 | Tracerfy | Ask for deletion where possible. Never report vendor deletion as done unless confirmed. |
+| 7 | Customer notification | None until counsel confirms a basis. |
+| 8 | Data-broker registration / DROP | Not built until counsel decides. Intake is built so DROP can plug in. |
+| 9 | Privacy-choices page copy | Drafted by engineering, marked for counsel review. |
 
 ## 12. Codex design review (2026-11-04): what changed from v1
 

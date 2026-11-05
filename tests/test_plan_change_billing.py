@@ -169,8 +169,11 @@ async def test_a_switch_at_a_price_the_customer_was_not_shown_is_refused(db, cli
 
 
 @pytest.mark.asyncio
-async def test_a_switch_without_a_confirmed_price_is_refused(db, client, monkeypatch):
-    """expected_price is mandatory: a caller that did not show a price cannot switch."""
+async def test_rollout_grace_a_switch_without_expected_price_reaches_stripe(
+        db, client, monkeypatch):
+    """ROLLOUT GRACE (removed by the follow-up PR, which restores the 409): the
+    live frontend omits expected_price for the minutes until its own deploy, so a
+    missing value proceeds, but only after the strict catalog-vs-Stripe check."""
     from src.config.plans import get_plan
 
     pro_m, _, agency_m = _prices()
@@ -184,9 +187,19 @@ async def test_a_switch_without_a_confirmed_price_is_refused(db, client, monkeyp
     )
     db.add(user)
     await db.commit()
+    live = {
+        "id": "sub_live", "status": "active", "current_period_start": None,
+        "items": {"data": [{"id": "si_0", "price": {"id": pro_m}}]},
+    }
+    monkeypatch.setattr(b, "_live_subscription", lambda customer_id: live)
     modified = []
-    monkeypatch.setattr(b.stripe.Subscription, "modify",
-                        lambda sub_id, **kw: modified.append(kw) or {"id": sub_id})
+
+    def _declined(sub_id, **kw):
+        # Reaching Stripe at all is the point; decline so nothing else is needed.
+        modified.append(kw)
+        raise stripe.error.CardError("Your card was declined.", param=None, code="card_declined")
+
+    monkeypatch.setattr(b.stripe.Subscription, "modify", _declined)
 
     def _price(pid, **kw):
         if pid not in b._PRICE_TO_PLAN:
@@ -204,6 +217,5 @@ async def test_a_switch_without_a_confirmed_price_is_refused(db, client, monkeyp
         json={"price_id": agency_m},
         headers={"Authorization": f"Bearer {create_secure_token(user.id)}"},
     )
-    assert resp.status_code == 409, resp.text
-    assert resp.json()["detail"]["code"] == "price_unconfirmed"
-    assert modified == []
+    assert resp.status_code == 402, resp.text  # got past the price checks to Stripe
+    assert len(modified) == 1

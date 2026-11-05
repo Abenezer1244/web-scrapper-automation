@@ -1718,15 +1718,15 @@ async def change_plan(
     verified = _verified_plan_price(new_plan, stripe_price_id, new_interval,
                                     route="change-plan", strict=True)
     if body.expected_price is None:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={
-                "code": "price_unconfirmed",
-                "message": "Reload Billing and try again, so you can confirm the price "
-                           "before switching.",
-            },
-        )
-    if body.expected_price * 100 != verified["unit_amount"]:
+        # ROLLOUT GRACE (one deploy only): the frontend that sends expected_price
+        # cannot pass its CI before this backend is on main, so for the minutes
+        # between the two deploys the live frontend omits it. Still safe: strict=True
+        # above has already proved the catalog price that frontend displays equals
+        # the Stripe Price that will be charged. The follow-up PR restores the 409
+        # (price_unconfirmed) as soon as the new frontend is live (Codex, pre-merge).
+        _logger.warning("change-plan without expected_price (rollout grace): user=%s plan=%s",
+                        current_user.id, new_plan)
+    elif body.expected_price * 100 != verified["unit_amount"]:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail={

@@ -71,7 +71,7 @@ from src.utils.lead_formatting import (
     normalize_phone_for_dialer,
 )
 
-NORMALIZATION_VERSION = "n2"
+NORMALIZATION_VERSION = "n3"
 
 ROLES = frozenset({"party", "heir", "owner_of_record", "grantor", "contact"})
 NAME_ORDERS = frozenset({NAME_ORDER_RECORDER, NAME_ORDER_NATURAL, NAME_ORDER_COMMA_ONLY})
@@ -133,9 +133,17 @@ _HARD_ENTITY_WORDS = _COMPANY_WORDS | _TRUST_WORDS | _GOVERNMENT_WORDS
 # ('SMITH JOHN & ESTATE OF' -> 'SMITH JOHN &').
 _DANGLING_JOINER_RE = re.compile(r"^\s*(?:[&/\\+]|AND\b)\s*|\s*(?:[&/\\+]|\bAND)\s*$",
                                  re.IGNORECASE)
+# The export's co-owner joiner with the joiner captured, so a cell can be rebuilt.
+_COOWNER_JOIN_CAPTURE_RE = re.compile(f"({_COOWNER_JOIN_RE.pattern})", _COOWNER_JOIN_RE.flags)
 _ET_AL_RE = re.compile(r"\s+(?:ET\s*(?:AL|UX|VIR)|ETAL|ETUX)\b\.?", re.IGNORECASE)
-# Broader than the export's prefix: probate cells also write 'EST OF JANE DOE'.
-_ESTATE_PREFIX_RE = re.compile(r"^(?:THE\s+)?EST(?:ATE)?\.?\s+OF(?:\s+|$)", re.IGNORECASE)
+# Broader than the export's prefix: probate cells also write 'EST OF JANE DOE',
+# and a bare caption may end in punctuation ('ESTATE OF,').
+_ESTATE_PREFIX_RE = re.compile(r"^(?:THE\s+)?EST(?:ATE)?\.?\s+OF\b[\s,.;:]*", re.IGNORECASE)
+# The trailing forms the export's _TRAILING_ESTATE_RE does not take: a leading
+# THE and trailing punctuation ('SMITH JOHN & THE ESTATE OF', '... ESTATE OF,').
+# Applied before it, so the two together cover both grammars.
+_TRAILING_ESTATE_EXTRA_RE = re.compile(
+    r"[\s,]+(?:THE\s+)?(?:EST(?:ATE)?\.?(?:\s+OF)?|HEIRS\s+OF)[\s,.;:]*$", re.IGNORECASE)
 _WORD_RE = re.compile(r"[A-Z]+")
 _PUNCT_RE = re.compile(r"[^\w\s]", re.UNICODE)
 _WS_RE = re.compile(r"\s+")
@@ -262,10 +270,12 @@ def _clean_party(party: str) -> tuple[str, str | None, bool]:
     'ESTATE OF' prefix). The export's cleanup, plus capacity kept, not discarded."""
     capacity = None
     party = _ALIAS_TAIL_RE.sub("", _CARE_OF_RE.sub("", party)).strip()
-    if _ESTATE_PREFIX_RE.match(party) or _TRAILING_ESTATE_RE.search(party):
+    if (_ESTATE_PREFIX_RE.match(party) or _TRAILING_ESTATE_EXTRA_RE.search(party)
+            or _TRAILING_ESTATE_RE.search(party)):
         capacity = "estate"
     elif _ROLE_TAIL_RE.search(party):
         capacity = "fiduciary"
+    party = _TRAILING_ESTATE_EXTRA_RE.sub("", party).strip()
     party = _TRAILING_ESTATE_RE.sub("", party).strip()
     party = _TRAILING_ESTATE_RE.sub("", _ROLE_TAIL_RE.sub("", party)).strip()
     party = _ET_AL_RE.sub("", party).strip()
@@ -345,7 +355,11 @@ def _classify_party(
         strengths = [_part_strength(c, raw_len if i == len(parts) - 1 else len(c))
                      for i, c in enumerate(cleaned)]
         if all(s == "strong" for s in strengths):
-            return [entity(party)]
+            # One entity, named by its parts' CLEANED text with the joiners kept
+            # ('ACME LLC TTEE & WELLS FARGO BANK NA' -> no TTEE in the key).
+            pieces = _COOWNER_JOIN_CAPTURE_RE.split(party)
+            return [entity("".join(_clean_party(p)[0] if i % 2 == 0 else p
+                                   for i, p in enumerate(pieces)))]
         if "strong" not in strengths:
             return [unresolved(ENTITY_OR_PERSON)]
         out: list[Subject] = []

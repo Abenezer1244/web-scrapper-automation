@@ -226,7 +226,13 @@ def test_a_mixed_entity_part_is_keyed_by_its_cleaned_name():
     assert ("entity", "acme llc") in _keys("SMITH JOHN & ACME LLC TTEE & DOE JANE", REC)
 
 
-@pytest.mark.parametrize("raw", ["ESTATE OF & ACME LLC", "HEIRS OF & ACME LLC"])
+def test_an_all_entity_cell_is_keyed_without_its_parts_tails():
+    (sub,) = _subs("ACME LLC TTEE & WELLS FARGO BANK NA", REC)
+    assert sub.kind == KIND_ENTITY and sub.text == "acme llc wells fargo bank na"
+
+
+@pytest.mark.parametrize("raw", ["ESTATE OF & ACME LLC", "HEIRS OF & ACME LLC",
+                                 "THE ESTATE OF & ACME LLC", "ESTATE OF, & ACME LLC"])
 def test_a_marker_only_mixed_part_is_review_not_an_entity(raw):
     subs = _subs(raw, REC)
     assert sorted((s.kind, s.text) for s in subs if s.kind == KIND_ENTITY) == [
@@ -234,7 +240,8 @@ def test_a_marker_only_mixed_part_is_review_not_an_entity(raw):
     assert [s.kind for s in subs].count(KIND_UNRESOLVED) == 1
 
 
-@pytest.mark.parametrize("raw", ["SMITH JOHN & ESTATE OF", "SMITH JOHN AND HEIRS OF"])
+@pytest.mark.parametrize("raw", ["SMITH JOHN & ESTATE OF", "SMITH JOHN AND HEIRS OF",
+                                 "SMITH JOHN & THE ESTATE OF", "SMITH JOHN & ESTATE OF,"])
 def test_an_orphan_marker_co_owner_is_reviewed_and_not_attributed(raw):
     subs = _subs(raw, REC)
     assert [(s.kind, s.capacity, s.review_reason) for s in subs] == [
@@ -360,4 +367,4 @@ def test_normalization_version_is_pinned_to_the_reused_rules():
     # rules reused here: if this fails, a formatter change touched them. When the
     # change alters how any name or phone reads, bump NORMALIZATION_VERSION; either
     # way, re-pin the fingerprint.
-    assert (NORMALIZATION_VERSION, reused_rules_fingerprint()) == ("n2", PINNED_FINGERPRINT)
+    assert (NORMALIZATION_VERSION, reused_rules_fingerprint()) == ("n3", PINNED_FINGERPRINT)

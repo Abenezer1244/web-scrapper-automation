@@ -33,6 +33,18 @@ from src.utils.email_layout import (
 from src.workers import delivery, onboarding_emails
 
 EM_DASH = "—"
+# Test configuration only (settings are monkeypatched per test, never persisted).
+_TEST_POSTAL_ADDRESS = "BridgeLeads test address, 100 Test Ave, Seattle, WA 98101"
+_TEST_API_BASE = "https://api.bridgeleads.io"
+
+
+def _commercial_ready(monkeypatch) -> None:
+    """Make commercial email sendable: a key (never used: _send or the SDK is
+    replaced in every test), a usable unsubscribe base and the postal address.
+    Without these a commercial template returns HELD before rendering."""
+    monkeypatch.setattr(settings, "RESEND_API_KEY", "test-key-not-used-for-network")
+    monkeypatch.setattr(settings, "API_BASE_URL", _TEST_API_BASE)
+    monkeypatch.setattr(settings, "COMPANY_POSTAL_ADDRESS", _TEST_POSTAL_ADDRESS)
 
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
@@ -40,9 +52,10 @@ EM_DASH = "—"
 def _collect_all_emails(monkeypatch) -> list[tuple[str, str, str, str]]:
     """Render every user-facing template. Returns (name, subject, html, text)."""
     out: list[tuple[str, str, str, str]] = []
+    _commercial_ready(monkeypatch)
 
     def _make(name: str):
-        def _capture(email, subject, html_body, text_body):
+        def _capture(email, subject, html_body, text_body, headers=None):
             out.append((name, subject, html_body, text_body))
         return _capture
 
@@ -155,7 +168,8 @@ def test_every_send_site_uses_the_shared_sender_identity(monkeypatch):
     """No template may build its own From header."""
     sent: list[dict] = []
     monkeypatch.setattr(resend.Emails, "send", lambda payload: sent.append(payload))
-    monkeypatch.setattr(settings, "RESEND_API_KEY", "test-key-not-used-for-network")
+    # The welcome is commercial: it sends only with an opt-out URL and an address.
+    _commercial_ready(monkeypatch)
 
     onboarding_emails.send_welcome_email("a@example.com")
     delivery._send_payment_failed_email("a@example.com", 1)
@@ -394,10 +408,11 @@ def test_every_email_has_a_preheader(monkeypatch):
 # ─── Product data comes from config, not literals ───────────────────────────
 
 def test_trial_email_quotes_the_current_pro_price(monkeypatch):
+    _commercial_ready(monkeypatch)
     captured = {}
     monkeypatch.setattr(
         onboarding_emails, "_send",
-        lambda e, s, h, t: captured.update(subject=s, html=h, text=t),
+        lambda e, s, h, t, headers=None: captured.update(subject=s, html=h, text=t),
     )
     onboarding_emails.send_trial_ending_email("a@example.com", 2)
 
@@ -412,10 +427,11 @@ def test_trial_email_quotes_the_current_pro_price(monkeypatch):
 def test_trial_email_states_the_real_post_trial_allowance(monkeypatch):
     """_expire_trials_impl downgrades to Starter, so the email must say Starter's
     actual record limit, and must NOT claim a county cap that is not enforced."""
+    _commercial_ready(monkeypatch)
     captured = {}
     monkeypatch.setattr(
         onboarding_emails, "_send",
-        lambda e, s, h, t: captured.update(html=h, text=t),
+        lambda e, s, h, t, headers=None: captured.update(html=h, text=t),
     )
     onboarding_emails.send_trial_ending_email("a@example.com", 2)
 
@@ -424,9 +440,10 @@ def test_trial_email_states_the_real_post_trial_allowance(monkeypatch):
 
 
 def test_trial_email_days_are_dynamic(monkeypatch):
+    _commercial_ready(monkeypatch)
     seen = []
     monkeypatch.setattr(
-        onboarding_emails, "_send", lambda e, s, h, t: seen.append((s, h)),
+        onboarding_emails, "_send", lambda e, s, h, t, headers=None: seen.append((s, h)),
     )
     onboarding_emails.send_trial_ending_email("a@example.com", 2)
     onboarding_emails.send_trial_ending_email("a@example.com", 1)
@@ -436,10 +453,11 @@ def test_trial_email_days_are_dynamic(monkeypatch):
 
 
 def test_welcome_email_quotes_the_configured_trial_and_allowance(monkeypatch):
+    _commercial_ready(monkeypatch)
     captured = {}
     monkeypatch.setattr(
         onboarding_emails, "_send",
-        lambda e, s, h, t: captured.update(subject=s, html=h, text=t),
+        lambda e, s, h, t, headers=None: captured.update(subject=s, html=h, text=t),
     )
     onboarding_emails.send_welcome_email("a@example.com")
 
@@ -452,9 +470,10 @@ def test_welcome_email_quotes_the_configured_trial_and_allowance(monkeypatch):
 def test_welcome_email_does_not_hardcode_counties_or_record_types(monkeypatch):
     """Counties and record types differ per plan and per live connector, so the
     generic welcome must not tell every recipient to pick a specific one."""
+    _commercial_ready(monkeypatch)
     captured = {}
     monkeypatch.setattr(
-        onboarding_emails, "_send", lambda e, s, h, t: captured.update(html=h),
+        onboarding_emails, "_send", lambda e, s, h, t, headers=None: captured.update(html=h),
     )
     onboarding_emails.send_welcome_email("a@example.com")
 
@@ -463,8 +482,9 @@ def test_welcome_email_does_not_hardcode_counties_or_record_types(monkeypatch):
 
 
 def test_nudge_trial_days_are_dynamic(monkeypatch):
+    _commercial_ready(monkeypatch)
     seen = []
-    monkeypatch.setattr(onboarding_emails, "_send", lambda e, s, h, t: seen.append(h))
+    monkeypatch.setattr(onboarding_emails, "_send", lambda e, s, h, t, headers=None: seen.append(h))
     onboarding_emails.send_day1_nudge("a@example.com", 6)
     onboarding_emails.send_day1_nudge("a@example.com", 1)
     onboarding_emails.send_activation_reminder("a@example.com", True, False, 3)
@@ -478,14 +498,122 @@ def test_nudge_trial_days_are_dynamic(monkeypatch):
 
 
 def test_activation_reminder_skips_an_activated_user(monkeypatch):
+    _commercial_ready(monkeypatch)
     seen = []
-    monkeypatch.setattr(onboarding_emails, "_send", lambda e, s, h, t: seen.append(s))
+    monkeypatch.setattr(onboarding_emails, "_send", lambda e, s, h, t, headers=None: seen.append(s))
     onboarding_emails.send_activation_reminder("a@example.com", True, True, 3)
     assert seen == []
 
 
 def test_cta_urls_use_the_configured_frontend(monkeypatch):
+    # The one non-frontend link allowed is the commercial unsubscribe link, which
+    # lives on the API (mail clients POST to it directly, RFC 8058).
     for name, _s, html_body, _t in _collect_all_emails(monkeypatch):
         for url in re.findall(r'href="(https?://[^"]+)"', html_body):
-            assert url.startswith((settings.FRONTEND_URL, "https://app.bridgeleads.io")), \
+            assert url.startswith((settings.FRONTEND_URL, "https://app.bridgeleads.io",
+                                   f"{_TEST_API_BASE}/email/unsubscribe?token=")), \
                 f"{name}: unexpected link {url}"
+
+
+# ─── Commercial email: CAN-SPAM opt-out (compliance audit 2026-11, Phase 4c) ──
+
+_COMMERCIAL = (
+    ("welcome", lambda e: onboarding_emails.send_welcome_email(e)),
+    ("day1_nudge", lambda e: onboarding_emails.send_day1_nudge(e, 6)),
+    ("day3_reminder", lambda e: onboarding_emails.send_activation_reminder(e, True, False, 3)),
+    ("trial_ending", lambda e: onboarding_emails.send_trial_ending_email(e, 2)),
+)
+
+
+def _capture_sdk(monkeypatch) -> list[dict]:
+    sent: list[dict] = []
+    monkeypatch.setattr(resend.Emails, "send", lambda payload: sent.append(payload) or {"id": "x"})
+    return sent
+
+
+def test_commercial_email_carries_a_working_opt_out_and_the_address(monkeypatch):
+    from urllib.parse import parse_qs, unquote, urlsplit
+
+    from src.api.unsubscribe_tokens import verify_unsubscribe_token
+    from src.utils.crypto import blind_index
+
+    _commercial_ready(monkeypatch)
+    sent = _capture_sdk(monkeypatch)
+    email = "commercial@example.com"
+    for name, run in _COMMERCIAL:
+        assert run(email) == onboarding_emails.SENT, name
+    assert len(sent) == len(_COMMERCIAL)
+    for (name, _), payload in zip(_COMMERCIAL, sent, strict=True):
+        headers = payload["headers"]
+        assert headers["List-Unsubscribe-Post"] == "List-Unsubscribe=One-Click", name
+        url = headers["List-Unsubscribe"].strip("<>")
+        assert url.startswith(f"{_TEST_API_BASE}/email/unsubscribe?token="), name
+        token = unquote(parse_qs(urlsplit(url).query)["token"][0])
+        assert verify_unsubscribe_token(token) == blind_index(email), name
+        # The same link and the postal address appear in both bodies.
+        assert url.replace("&", "&amp;") in payload["html"] or url in payload["html"], name
+        assert url in payload["text"], name
+        for body in (payload["html"], payload["text"]):
+            assert _TEST_POSTAL_ADDRESS in body, name
+            assert "Unsubscribe" in body, name
+
+
+def test_commercial_email_is_held_without_an_address_or_a_usable_api_base(monkeypatch):
+    for missing in ("COMPANY_POSTAL_ADDRESS", "API_BASE_URL"):
+        _commercial_ready(monkeypatch)
+        monkeypatch.setattr(settings, missing, "")
+        sent = _capture_sdk(monkeypatch)
+        for name, run in _COMMERCIAL:
+            assert run("held@example.com") == onboarding_emails.HELD, (missing, name)
+        assert sent == [], missing
+    # A plaintext or multi-line value is as unusable as an empty one.
+    _commercial_ready(monkeypatch)
+    monkeypatch.setattr(settings, "API_BASE_URL", "http://api.bridgeleads.io")
+    assert onboarding_emails.send_day1_nudge("held@example.com", 3) == onboarding_emails.HELD
+    _commercial_ready(monkeypatch)
+    monkeypatch.setattr(settings, "COMPANY_POSTAL_ADDRESS", "Line one\nLine two")
+    assert onboarding_emails.send_day1_nudge("held@example.com", 3) == onboarding_emails.HELD
+
+
+def test_an_opted_out_address_gets_no_commercial_email(monkeypatch):
+    from sqlalchemy import text
+
+    from src.db.session import sync_engine
+    from src.utils.crypto import blind_index
+
+    _commercial_ready(monkeypatch)
+    sent = _capture_sdk(monkeypatch)
+    email = "opted.out@example.com"
+    h = blind_index(email)
+    with sync_engine.begin() as c:
+        c.execute(text("INSERT INTO marketing_email_suppressions (email_hmac, source) "
+                       "VALUES (:h, 'link') ON CONFLICT (email_hmac) DO NOTHING"), {"h": h})
+    try:
+        for name, run in _COMMERCIAL:
+            assert run(email) == onboarding_emails.SUPPRESSED, name
+        assert sent == []
+        # Matching is on the normalized address, as the opt-out link records it.
+        assert onboarding_emails.send_day1_nudge("Opted.Out@Example.com", 3) == \
+            onboarding_emails.SUPPRESSED
+    finally:
+        with sync_engine.begin() as c:
+            c.execute(text("DELETE FROM marketing_email_suppressions WHERE email_hmac = :h"),
+                      {"h": h})
+
+
+def test_transactional_email_is_unaffected_by_the_commercial_rules(monkeypatch):
+    # No postal address and no API base: commercial mail is held, but the
+    # duplicate-signup notice (transactional) still goes out, without opt-out headers.
+    monkeypatch.setattr(settings, "RESEND_API_KEY", "test-key-not-used-for-network")
+    monkeypatch.setattr(settings, "API_BASE_URL", "")
+    monkeypatch.setattr(settings, "COMPANY_POSTAL_ADDRESS", "")
+    sent = _capture_sdk(monkeypatch)
+    onboarding_emails.send_duplicate_signup_email("someone@example.com")
+    assert len(sent) == 1 and "headers" not in sent[0]
+    assert "Unsubscribe" not in sent[0]["html"]
+
+
+def test_no_key_means_skipped_not_sent(monkeypatch):
+    _commercial_ready(monkeypatch)
+    monkeypatch.setattr(settings, "RESEND_API_KEY", "")
+    assert onboarding_emails.send_welcome_email("dev@example.com") == onboarding_emails.SKIPPED

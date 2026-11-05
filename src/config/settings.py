@@ -215,6 +215,12 @@ class Settings(BaseSettings):
     EMAIL_REPLY_TO: str = "support@bridgeleads.io"
     # Support address printed in email footers / help copy.
     SUPPORT_EMAIL: str = "support@bridgeleads.io"
+    # The business's valid physical postal address, printed in the footer of every
+    # COMMERCIAL email (CAN-SPAM, 15 U.S.C. 7704(a)(5)). Empty = commercial email
+    # (welcome, nudges, trial-ending upsell) is HELD, not sent, and ops is alerted:
+    # it cannot be sent lawfully without it (owner decision 2026-11-04). Security
+    # and account emails are unaffected. One line, e.g. "Name, 1 Main St, City, ST 00000".
+    COMPANY_POSTAL_ADDRESS: str = ""
 
     # Registration email-verification flow (anti-enumeration). Default FALSE =
     # legacy behavior: /auth/register creates the account immediately and returns

@@ -163,17 +163,41 @@ def support_email() -> str:
     return (settings.SUPPORT_EMAIL or "").strip() or settings.EMAIL_FROM
 
 
+def postal_address() -> str | None:
+    """The business postal address for commercial-email footers, or None if unusable.
+
+    CAN-SPAM requires a valid physical postal address in every commercial email.
+    None (empty, multi-line, or implausibly long) means commercial email is held.
+    """
+    value = (settings.COMPANY_POSTAL_ADDRESS or "").strip()
+    if not value or "\r" in value or "\n" in value or len(value) > 300:
+        return None
+    return value
+
+
+def unsubscribe_headers(url: str) -> dict[str, str]:
+    """RFC 2369 + RFC 8058 headers: mail clients show their own unsubscribe button
+    and POST to ``url`` with one click (Gmail and Yahoo require both for bulk mail)."""
+    return {
+        "List-Unsubscribe": f"<{url}>",
+        "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+    }
+
+
 def build_payload(
     *,
     to: list[str],
     subject: str,
     html_body: str,
     text_body: str,
+    headers: dict[str, str] | None = None,
 ) -> dict:
     """Assemble the Resend send payload with the shared sender identity.
 
     Every ``resend.Emails.send()`` call site builds its dict here so the From
     display name and Reply-To can never be set (or forgotten) per template.
+    ``headers`` carries extra message headers (the unsubscribe headers on
+    commercial email).
     """
     payload: dict = {
         "from": from_header(),
@@ -185,6 +209,8 @@ def build_payload(
     replies = reply_to()
     if replies:
         payload["reply_to"] = replies
+    if headers:
+        payload["headers"] = dict(headers)
     return payload
 
 
@@ -330,12 +356,16 @@ def render_email(
     cta_note: str | None = None,
     footer_note: str | None = None,
     show_support: bool = True,
+    unsubscribe_url: str | None = None,
+    postal_address: str | None = None,
 ) -> str:
-    """Render one transactional email.
+    """Render one email.
 
     ``blocks`` are fragments from the helpers above (already escaped). ``title``,
     ``preheader``, ``heading``, ``cta_note`` and ``footer_note`` are plain text
-    and are escaped here. ``cta`` is ``(label, url)``.
+    and are escaped here. ``cta`` is ``(label, url)``. A COMMERCIAL email passes
+    ``unsubscribe_url`` and ``postal_address`` (both required by CAN-SPAM), which
+    render as a footer opt-out line and the business address.
     """
     safe_support = html.escape(support_email())
     body_html = "".join(blocks)
@@ -360,6 +390,23 @@ def render_email(
             f'<p class="bl-muted" style="margin:0 0 8px;color:{MUTED_TEXT};'
             f'font-family:{FONT_STACK};font-size:12px;line-height:1.6;">'
             f"{html.escape(footer_note)}</p>"
+        )
+
+    commercial_html = ""
+    if unsubscribe_url:
+        commercial_html += (
+            f'<p class="bl-muted" style="margin:0 0 8px;color:{MUTED_TEXT};'
+            f'font-family:{FONT_STACK};font-size:12px;line-height:1.6;">'
+            "You are getting this email because you signed up for BridgeLeads. "
+            f'<a class="bl-link" href="{html.escape(unsubscribe_url)}" style="color:{BRAND};'
+            'text-decoration:underline;">Unsubscribe</a> from tips, reminders and '
+            "offers. Account and security emails will still arrive.</p>"
+        )
+    if postal_address:
+        commercial_html += (
+            f'<p class="bl-muted" style="margin:0 0 8px;color:{MUTED_TEXT};'
+            f'font-family:{FONT_STACK};font-size:12px;line-height:1.6;">'
+            f"{html.escape(postal_address)}</p>"
         )
 
     return f"""<!DOCTYPE html>
@@ -440,7 +487,7 @@ def render_email(
 
     <tr><td class="bl-pad" style="padding:8px 40px 0;"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr><td class="bl-rule" height="1" bgcolor="{CARD_BORDER}" style="background-color:{CARD_BORDER};height:1px;line-height:1px;font-size:1px;">&nbsp;</td></tr></table></td></tr>
 
-    <tr><td class="bl-pad" style="padding:20px 40px 32px;">{support_html}{footer_note_html}<p class="bl-foot" style="margin:0;color:{MUTED_TEXT};font-family:{FONT_STACK};font-size:12px;line-height:1.6;">The BridgeLeads Team</p></td></tr>
+    <tr><td class="bl-pad" style="padding:20px 40px 32px;">{support_html}{footer_note_html}{commercial_html}<p class="bl-foot" style="margin:0;color:{MUTED_TEXT};font-family:{FONT_STACK};font-size:12px;line-height:1.6;">The BridgeLeads Team</p></td></tr>
 
   </table>
 
@@ -451,10 +498,23 @@ def render_email(
 </html>"""
 
 
-def text_footer(*, footer_note: str | None = None) -> str:
-    """The plain-text counterpart of the shared footer."""
+def text_footer(
+    *,
+    footer_note: str | None = None,
+    unsubscribe_url: str | None = None,
+    postal_address: str | None = None,
+) -> str:
+    """The plain-text counterpart of the shared footer (same commercial lines)."""
     lines = [f"Questions? Reply to this email or contact {support_email()}."]
     if footer_note:
         lines.append(footer_note)
+    if unsubscribe_url:
+        lines.append(
+            "You are getting this email because you signed up for BridgeLeads. "
+            f"Unsubscribe from tips, reminders and offers: {unsubscribe_url}\n"
+            "Account and security emails will still arrive."
+        )
+    if postal_address:
+        lines.append(postal_address)
     lines.append("The BridgeLeads Team")
     return "\n\n".join(lines)

@@ -19,6 +19,70 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-11-03 → 11-04 — The #579 fork test runs for real; leftovers closed; GitHub security features on every repo
+
+**Built / Shipped:**
+- **#587 merged:** `tasks/todo-island-name-recovery.md` now says only the restricted-switch gate
+  (#584) shipped. The name-recovery sweep (3b-2) was parked, then deleted, so the file is the only
+  record of its design. The owner chose to leave Island as is.
+- **#588 merged and deployed (`e71cb1df`, Railway deploy succeeded):** the Linux prefork test Codex
+  asked for on #579 (P3). `tests/test_worker_db_fork_reset.py` really forks. The child reports its
+  own Postgres backend pid through a pipe, and the parent checks the two sessions differ and that its
+  own connection still works. A deadline plus SIGKILL keeps a stuck child from hanging CI, and the
+  child always ends in `os._exit`. The test skips where `os.fork` does not exist (Windows).
+- **GitHub security features on all 70 of the owner's repos** (GitHubSecurityLab `gh secure`, script
+  read in full and pinned at `a04d1c14`; branch protection left out on the owner's choice):
+  - 34 public repos: private vulnerability reporting, secret scanning with push protection,
+    Dependabot alerts and security updates, and CodeQL.
+  - 36 private repos, BridgeLeads included: Dependabot alerts and security updates only.
+
+**Tried / Decided:**
+- **Spokane (owner, 2026-11-04):** the existing captcha path was suggested for Spokane's EagleWeb.
+  It was declined: that solver handles the reCAPTCHA on the King and Pierce portals, while Spokane sits
+  behind Cloudflare Turnstile. Getting past it would mean defeating the county's bot protection. Spokane
+  stays blocked until the county provides a feed, allowlists the worker's IP, or answers a records request.
+- **Clallam crosswalk not built:** the production query found 0 ambiguous rows, so the queried rows did not need one.
+- **Branch protection on `main` stays as is:** the owner is on GitHub Pro, and `main` already requires
+  `Test` and `Dependency Audit (pip-audit + SBOM)`. `gh secure`'s own rule (1 required approving
+  review) would block a solo owner's merges.
+
+**Failed / Blocked:**
+- **#588 took three Codex NO-GOs and one red CI run:**
+  - ruff UP031 on `%` formatting;
+  - the fds and the pool leaked if `fork()` itself failed;
+  - the child could escape into pytest if reporting raised.
+  - CI then failed with `set_session cannot be used inside a transaction`: the parent's raw
+    `inherited` cursor left a transaction open, and `pool_pre_ping` could not reuse the connection.
+    Fixed with `inherited.rollback()`.
+- **`gh secure` reported success where nothing changed:**
+  - On private repos GitHub refuses secret scanning (422, "not available for this repository") without
+    the paid Secret Protection add-on, but the tool still printed push protection as enabled.
+  - Two public repos (`AICHAT`, `ChatBott`) had secret scanning off, so their push protection did not
+    stick; it was turned on by hand.
+  - The final table came from a separate status check, not from the tool's output.
+- The local test forwarder (6543 → 5432) was killed for low memory mid-session, so #588's DB checks
+  ran only in CI. The forwarder was restarted at the end of the session.
+
+**Caught & fixed:** the four #588 problems above, all before merge.
+
+**Pending / Handoff:**
+- Dependabot PRs will now arrive across the owner's repos, BridgeLeads included. The other session
+  was told they are not ours to auto-merge.
+- Private repos get no CodeQL or secret scanning without GitHub's paid Code Security and Secret
+  Protection add-ons; BridgeLeads still has gitleaks in CI.
+- The King chunk recovery test the 11-02 entry left pending has landed (`bb225484`, strengthened in `5b3a85bc`).
+
+**Facts learned:**
+- On GitHub Pro, a private repo gets Dependabot only. Private vulnerability reporting is public-only;
+  CodeQL and secret scanning need paid add-ons.
+- `gh secure` skips a feature it sees as already on, and enables only push protection, not secret
+  scanning itself.
+- A psycopg2 cursor left in a transaction breaks `pool_pre_ping`'s `set_session` on the next checkout.
+- `codex` and `railway` are not on the Bash PATH here: prepend `$(cygpath "$APPDATA")/npm` and
+  `/c/Program Files/nodejs`.
+
+---
+
 ## 2026-11-02 → 11-04 — SEO skills audited and run; Google Analytics shipped behind a privacy gate
 
 **Built / Shipped:**

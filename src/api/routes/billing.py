@@ -1837,6 +1837,7 @@ async def stripe_webhook(
       - customer.subscription.updated   → upgrades / downgrades / cancellation
       - customer.subscription.deleted   → downgrade to starter
       - invoice.payment_failed          → start the dunning grace + notify
+      - charge.dispute.*                → page ops (created, closed, funds moved)
 
     Recovery from dunning arrives as customer.subscription.updated (past_due ->
     active); invoice.payment_succeeded is deliberately not handled.
@@ -1990,7 +1991,54 @@ async def _dispatch_stripe_event(
     elif event_type == "invoice.payment_failed":
         return await _handle_payment_failed(data, db)
 
+    elif event_type in _DISPUTE_EVENTS:
+        return [_dispute_alert(event_type, data)]
+
     return []
+
+
+# Chargebacks (compliance audit 2026-11, Phase 5b; Codex consult). Each lifecycle
+# step pages ops: created (respond before Stripe's evidence deadline), closed (won or
+# lost), and the two money movements, which status alone does not show. The Stripe
+# webhook endpoint must be subscribed to these four events (owner, Stripe dashboard).
+_DISPUTE_EVENTS = frozenset({
+    "charge.dispute.created",
+    "charge.dispute.closed",
+    "charge.dispute.funds_withdrawn",
+    "charge.dispute.funds_reinstated",
+})
+
+
+def _dispute_alert(event_type: str, dispute: dict) -> Callable[[], None]:
+    """An ops alert for one dispute event, to send once the event is committed.
+
+    Entitlement is deliberately NOT changed: a dispute proves neither non-payment
+    nor fraud, may concern a metered charge, and may be won. What happens to access
+    on a dispute or a refund is an owner policy decision (audit B1-5). Carries ids,
+    amount, reason and status only: no customer, email, evidence or metadata.
+    """
+    dispute_id = str(dispute.get("id") or "unknown")
+    charge = dispute.get("charge")
+    charge_id = charge.get("id") if isinstance(charge, dict) else charge
+    amount = dispute.get("amount")
+    currency = str(dispute.get("currency") or "").upper()
+    money = f"{amount / 100:,.2f} {currency}" if isinstance(amount, int) else "unknown amount"
+    step = event_type.removeprefix("charge.dispute.").replace("_", " ")
+    subject = f"Stripe dispute {step}: {money}"
+    body = (
+        f"Event: {event_type}\nDispute: {dispute_id}\nCharge: {charge_id or 'unknown'}\n"
+        f"Amount: {money}\nReason: {dispute.get('reason') or 'unknown'}\n"
+        f"Status: {dispute.get('status') or 'unknown'}\n\n"
+        "No account access was changed. Review the dispute in the Stripe dashboard."
+    )
+
+    def _send() -> None:
+        from src.workers.ops_alerts import send_ops_alert
+
+        # Keyed by event AND dispute: 'closed' must not fall inside 'created's cooldown.
+        send_ops_alert("stripe_dispute", f"{event_type}:{dispute_id}", subject, body)
+
+    return _send
 
 
 # ─── Webhook handlers ─────────────────────────────────────────────────────────

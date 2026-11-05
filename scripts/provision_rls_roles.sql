@@ -503,6 +503,15 @@ BEGIN
         CREATE POLICY marketing_email_suppressions_system ON marketing_email_suppressions
             FOR SELECT TO bridgeleads_system USING (true);
     END IF;
+    -- Privacy requests and suppression (125, Phase 6 groundwork): NO runtime role
+    -- holds anything yet; writers get column grants and policies when they ship
+    -- (P7/P8). UUID keys, so no sequence privileges to take back. Must stay AFTER
+    -- the system ALL TABLES grant, which would hand the worker read/write access.
+    IF to_regclass('public.privacy_requests') IS NOT NULL THEN
+        REVOKE ALL ON privacy_requests, privacy_request_payloads, privacy_request_events,
+                      privacy_suppressions
+            FROM PUBLIC, bridgeleads_app, bridgeleads_system;
+    END IF;
     -- Job degradations (117): worker-only history of phases that failed on a DONE
     -- job, plus the skip-trace repair queue. Nobody deletes (rows go with their job);
     -- the app role reads nothing. Must stay AFTER the system ALL TABLES grant.

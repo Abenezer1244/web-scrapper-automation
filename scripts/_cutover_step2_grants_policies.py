@@ -91,6 +91,13 @@ _GRANTS = [
         IF to_regclass('public.marketing_email_suppressions') IS NOT NULL THEN
             REVOKE INSERT, UPDATE ON marketing_email_suppressions FROM bridgeleads_system;
         END IF;
+        -- Privacy requests and suppression (125): no runtime role holds anything
+        -- yet, as provision_rls_roles.sql; the blanket grant above must not either.
+        IF to_regclass('public.privacy_requests') IS NOT NULL THEN
+            REVOKE ALL ON privacy_requests, privacy_request_payloads,
+                          privacy_request_events, privacy_suppressions
+                FROM bridgeleads_app, bridgeleads_system;
+        END IF;
     END
     $append_only$""",
     "GRANT DELETE ON county_records TO bridgeleads_system",

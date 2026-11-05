@@ -395,6 +395,88 @@ class MarketingEmailSuppression(Base):
     opted_out_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
+# ── Privacy requests and suppression (migration 125; Phase 6 groundwork) ─────────
+# Schema only: no runtime role holds any privilege on these tables yet, and the
+# database refuses any suppression state but 'pending' (the activation guard).
+# Every table is append-only (UPDATE refused, BLD24); ids and timestamps are
+# server defaults. Design: docs/legal/audit-2026-11/06-DESIGN-PRIVACY-REQUESTS-...md.
+
+class PrivacyRequest(Base):
+    """The immutable envelope of a privacy request from anyone, customer or not.
+    No PII: the requester's email is only its blind index. Status is the latest
+    PrivacyRequestEvent, never a column."""
+    __tablename__ = "privacy_requests"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, server_default=text("gen_random_uuid()"))
+    kind = Column(String(16), nullable=False)       # opt_out | delete | access | correct
+    channel = Column(String(16), nullable=False)    # web | email | postal | drop
+    received_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    deadline_at = Column(DateTime(timezone=True), nullable=False)
+    requester_email_hmac = Column(String(64), nullable=True)
+
+
+class PrivacyRequestPayload(Base):
+    """The requester's contact and details, encrypted, kept apart from the envelope
+    so a retention or erasure decision can delete them alone."""
+    __tablename__ = "privacy_request_payloads"
+
+    request_id = Column(UUID(as_uuid=False),
+                        ForeignKey("privacy_requests.id", ondelete="CASCADE"), primary_key=True)
+    contact_encrypted = Column(EncryptedString, nullable=False)
+    details_encrypted = Column(EncryptedString, nullable=True)
+
+
+class PrivacyRequestEvent(Base):
+    """One step of a request's audit trail. Ordered by `seq` (unique per request);
+    a writer takes max(seq) + 1 and a concurrent writer collides instead of both
+    landing. actor_user_id is deliberately not a foreign key (the account purge
+    must never touch this trail)."""
+    __tablename__ = "privacy_request_events"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, server_default=text("gen_random_uuid()"))
+    request_id = Column(UUID(as_uuid=False),
+                        ForeignKey("privacy_requests.id", ondelete="CASCADE"), nullable=False)
+    seq = Column(Integer, nullable=False)
+    event_type = Column(String(24), nullable=False)
+    verification_level = Column(String(32), nullable=True)
+    decision_code = Column(String(32), nullable=True)   # set on 'decided' only
+    deadline_at = Column(DateTime(timezone=True), nullable=True)  # set on 'extended' only
+    actor = Column(String(16), nullable=False)          # system | operator
+    actor_user_id = Column(UUID(as_uuid=False), nullable=True)  # operator only
+    occurred_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("request_id", "seq", name="uq_privacy_request_events_seq"),
+    )
+
+
+class PrivacySuppression(Base):
+    """One row of a suppression rule: an anchor HMAC plus a required subject HMAC
+    (src/privacy/keys.py) under one key and normalisation version. State changes
+    are new rows with the same rule_id. The database allows 'pending' only until
+    every enforcement layer ships (ck_privacy_suppressions_activation_guard)."""
+    __tablename__ = "privacy_suppressions"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, server_default=text("gen_random_uuid()"))
+    rule_id = Column(UUID(as_uuid=False), nullable=False)
+    request_id = Column(UUID(as_uuid=False),
+                        ForeignKey("privacy_requests.id", ondelete="RESTRICT"), nullable=False)
+    anchor_kind = Column(String(16), nullable=False)    # property | mailing | phone | email
+    anchor_hmac = Column(String(64), nullable=False)
+    subject_kind = Column(String(16), nullable=False)   # person | entity
+    subject_hmac = Column(String(64), nullable=False)
+    scope = Column(String(24), nullable=False)          # 'subject' only for now
+    key_version = Column(String(8), nullable=False)
+    normalization_version = Column(String(8), nullable=False)
+    state = Column(String(16), nullable=False)          # 'pending' only for now
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("rule_id", "key_version", "normalization_version", "state",
+                         name="uq_privacy_suppressions_rule_version_state"),
+    )
+
+
 class UserAvatar(Base):
     """The user's profile photo (migration 111): the SERVER re-encoded 256px WebP,
     never the uploaded bytes. Kept off `users` so ordinary user reads never load

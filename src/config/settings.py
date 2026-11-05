@@ -88,7 +88,8 @@ class Settings(BaseSettings):
     # HMACs under both. Format: "v1:<secret>[,v2:<secret>...]"; the current version
     # signs new rules, every listed version still matches. Blank = derived from
     # SECRET_KEY via HKDF, allowed only when ENVIRONMENT is development/dev/local/
-    # test/testing (any other value, "staging" included, refuses to start keying).
+    # test/testing AND PII_ENCRYPTION_STRICT is off (anything else, "staging"
+    # included, refuses to start keying).
     # Nothing reads it in production until Phase 6 ships. Generate a secret:
     #   python -c "import secrets; print(secrets.token_urlsafe(32))"
     PRIVACY_HMAC_KEYS: str = ""

@@ -16,6 +16,7 @@ _S2 = "b" * 40
 @pytest.fixture(autouse=True)
 def _fresh_keyring(monkeypatch):
     monkeypatch.setattr(settings, "ENVIRONMENT", "test")
+    monkeypatch.setattr(settings, "PII_ENCRYPTION_STRICT", False)
     monkeypatch.setattr(settings, "PRIVACY_HMAC_KEYS", f"v1:{_S1}")
     monkeypatch.setattr(settings, "PRIVACY_HMAC_CURRENT_VERSION", "v1")
     keys.reset_keyring_cache()
@@ -33,7 +34,33 @@ def test_digest_is_deterministic_hex_and_keyed():
 
 
 def test_kinds_are_domain_separated():
-    assert keys.privacy_hmac("person", "main") != keys.privacy_hmac("property", "main")
+    assert keys.privacy_hmac("entity", "main") != keys.privacy_hmac("property", "main")
+
+
+@pytest.mark.parametrize(("kind", "value"), [
+    ("person", "Smith|John"),           # not casefolded
+    ("person", "smith john"),           # no separator
+    ("person", "smith|john paul"),      # given is the FIRST given name only
+    ("entity", "ACME LLC"),
+    ("entity", "acme  llc"),
+    ("phone", "(206) 555-1234"),
+    ("phone", "12065551234"),
+    ("email", "Jane@Example.com"),
+    ("email", "not-an-email"),
+    ("property", " 123 main st"),
+])
+def test_non_canonical_values_are_refused(kind, value):
+    # Two spellings of one value would make two digests that never meet.
+    with pytest.raises(ValueError):
+        keys.privacy_hmac(kind, value)
+
+
+def test_canonical_values_from_the_normalisers_are_accepted():
+    from src.privacy.subjects import email_key_value, person_key_value, phone_key_value
+    for kind, value in (("person", person_key_value("Núñez", "José María")),
+                        ("phone", phone_key_value("(206) 555-1234")),
+                        ("email", email_key_value(" Jane@Example.com "))):
+        assert len(keys.privacy_hmac(kind, value)) == 64
 
 
 def test_unknown_kind_and_empty_value_are_refused():
@@ -106,6 +133,12 @@ def test_dev_fallback_only_in_listed_dev_and_test_environments(monkeypatch):
         keys.reset_keyring_cache()
         with pytest.raises(RuntimeError):
             keys.privacy_hmac("person", "smith|john")
+    # PII strict mode means "behave like production", even in a test environment.
+    monkeypatch.setattr(settings, "ENVIRONMENT", "test")
+    monkeypatch.setattr(settings, "PII_ENCRYPTION_STRICT", True)
+    keys.reset_keyring_cache()
+    with pytest.raises(RuntimeError):
+        keys.privacy_hmac("person", "smith|john")
 
 
 def test_settings_are_read_once_as_one_snapshot(monkeypatch):

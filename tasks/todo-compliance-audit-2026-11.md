@@ -143,8 +143,34 @@ table, not a users column, so they survive deletion and re-registration.
   - an explicit erasure inventory with writer gates;
   - an activation guard;
   - decisions first.
-- [ ] D: owner/counsel decisions (section 11 of the design) BEFORE P1
-- [ ] P1-P9: build order in section 10, each step in verified ≤5-file commits with a Codex review
+- [ ] D: owner/counsel decisions (section 11 of the design). The owner chose to build the
+      decision-independent groundwork first ("Phase 6 groundwork"); nothing goes live.
+- [x] **P1 groundwork (Codex GO after 8 rounds):** `src/privacy/keys.py` and `src/privacy/subjects.py`.
+  - The keyring: one settings snapshot; fallback only in listed dev/test environments with PII strict mode off;
+    secrets of 32+ bytes; every kind's value must be canonical; addresses refused until their normaliser exists.
+  - Subjects are read only in the source's declared order (`name_order_for`), reusing the export's
+    `lead_formatting` rules. Each one is a person (one reading), a typed entity, or unresolved (review, no key).
+  - Covered: shared surnames go to review; mixed person/entity cells split; nothing non-empty is dropped;
+    estate and fiduciary capacity are marked, not decided (D4).
+  - A pinned fingerprint ties `NORMALIZATION_VERSION` (n3) to the reused rules.
+  - Codex rounds, in order: both-order collisions, entity overmatch, splitting, provenance; strict mode,
+    shared surnames, canonical kinds, mixed cells; per-part guards, dropped inputs, addresses; part
+    cleanup; weak parts, raw entity text, orphan markers; all-entity cleanup, estate grammar, version; underscore, empty slots.
+- [x] **P2 groundwork (Codex consult then review):** migration 125 plus models, grant scripts, schema tests;
+      `PRIVACY_ENFORCEMENT_VERSION` and `src/privacy/activation.py`.
+  - Four tables: an immutable request envelope, an erasable encrypted payload, an append-only `seq`-ordered
+    event trail, and append-only rule rows.
+  - The DB activation guard (`state = 'pending'` only) plus the two-key app guard (code version AND setting).
+  - UUID keys, RLS on with no policies; every role revoked in the migration and both grant scripts.
+  - Consult changes adopted:
+    - payload split from the envelope;
+    - no DELETE-refusing triggers (retention is D5);
+    - `actor_user_id` is not an FK to `users` (113 purge);
+    - `seq` ordering;
+    - rotation-aware UNIQUE;
+    - no sequences;
+    - a real RLS test.
+- [ ] P3-P9: blocked on D (verification, co-owner, erasure scope, entity policy, retention, Tracerfy, notification).
 - Interim until P7 ships: a manual procedure. Re-import cannot be prevented until then; counsel must know.
 
 ## Phase 7: legal document package (drafts only, not published)

@@ -19,6 +19,44 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-11-04 — Privacy suppression groundwork (compliance Phase 6 P1 + P2, local only)
+
+**Built / Shipped (local branch `audit/compliance-2026-11`, nothing pushed, nothing wired in):**
+- `src/privacy/keys.py`: a versioned keyed-HMAC keyring for suppression rules.
+  - It reads one settings snapshot.
+  - The SECRET_KEY fallback works only in listed dev/test environments with PII strict mode off.
+  - Secrets need 32+ bytes.
+  - Each kind accepts only its canonical value; addresses are refused until their normaliser exists.
+- `src/privacy/subjects.py`: who a name cell names.
+  - It reads only in the source's declared order (`name_order_for`), reusing the export's `lead_formatting` rules.
+  - Each subject is a person (one reading), a typed entity, or unresolved (review only, no key).
+  - A pinned fingerprint ties `NORMALIZATION_VERSION` (n3) to those reused rules.
+- Migration 125 adds four tables: `privacy_requests`, `privacy_request_payloads`, `privacy_request_events`, `privacy_suppressions`.
+  - Each has an append-only BLD24 trigger. RLS is on with no policies; every role is revoked in the migration and both grant scripts.
+  - The DB activation guard allows `state = 'pending'` only.
+- `src/privacy/activation.py` is the app half of the guard. It needs both the code's implemented version and `PRIVACY_ENFORCEMENT_VERSION`; default 0.
+
+**Tried / Decided:**
+- Rejected: reading cells in both word orders (the first P1 version). SMITH JOHN and JOHN SMITH collided. The source's declared order is trusted instead, and anything unreadable goes to review.
+- Inferred readings (a shared surname) are review only, never keys.
+- Requester PII lives in its own erasable table. DELETE is not trigger-blocked, so retention (D5) stays decidable.
+- A request with a rule cannot be deleted (FK RESTRICT).
+- `actor_user_id` is not an FK to `users`, so the 113 purge stays independent.
+
+**Failed / Caught & fixed:**
+- P1 took 8 Codex rounds. Most findings were paths that silently dropped or mis-keyed a person:
+  - mixed person/entity cells;
+  - per-part tails;
+  - orphan markers;
+  - underscores;
+  - empty slots.
+- Heredoc escaping twice wrote a literal backspace byte where a regex `\b` belonged. Lesson: write edit scripts to files, not inline heredocs.
+- `scope varchar(16)` was too short for the future value, which raised a length error before the CHECK ran. Widened to 24.
+
+**Pending / Handoff:** P3-P9 are blocked on owner/counsel decisions D1-D9. Until P7 ships, requests are handled manually and re-import cannot be prevented.
+
+**Facts learned:** in a CHECK, `x ~ re AND y` with `x` NULL can be false, not unknown. Write `x IS NULL OR ...`, or split the constraint.
+
 ## 2026-11-04 — Checkout and billing disclosures (compliance Phase 5, local only)
 
 **Built / Shipped (local branches, nothing pushed):**

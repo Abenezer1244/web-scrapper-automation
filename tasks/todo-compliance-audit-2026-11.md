@@ -132,12 +132,20 @@ table, not a users column, so they survive deletion and re-registration.
 - Rollout: BE then FE. Between the two deploys an old-frontend tab gets 409 on plan switch; no
   money moves.
 
-## Phase 6: data-subject rights for non-customers (design first, then ≤5-file slices)
-- [ ] Design doc + Codex consult: intake (form + mailbox), verification, `privacy_requests` table, person-level
-      suppression keys (normalised name + parcel / address hash), checks on insert and delivery, erasure fan-out
-      (results, skip_trace_cache, pending_skip_trace_rows, nts_notices, king_parcel_owners, R2), audit trail,
-      45-day SLA alerting, DROP-ready hooks
-- [ ] Implementation slices (each its own approval)
+## Phase 6: data-subject rights for non-customers (DESIGN DONE 2026-11-04; build blocked on decisions)
+- [x] Code map of every place person data enters and leaves (subagent; choke points spot-verified)
+- [x] Design v1 written; Codex design review: directionally sound, NOT safe as written (1 Critical, 5 High)
+- [x] Design v2 (`docs/legal/audit-2026-11/06-DESIGN-PRIVACY-REQUESTS-AND-SUPPRESSION.md`) folds in every finding:
+  - exact guarantee semantics;
+  - durable send authorization;
+  - structured subjects and versioned keys;
+  - a dedicated flag;
+  - an explicit erasure inventory with writer gates;
+  - an activation guard;
+  - decisions first.
+- [ ] D: owner/counsel decisions (section 11 of the design) BEFORE P1
+- [ ] P1-P9: build order in section 10, each step in verified ≤5-file commits with a Codex review
+- Interim until P7 ships: a manual procedure. Re-import cannot be prevented until then; counsel must know.
 
 ## Phase 7: legal document package (drafts only, not published)
 - [ ] Privacy Policy, Terms, Cookie notice, AUP, Retention Policy, Breach Response Plan, Privacy Request Procedure,

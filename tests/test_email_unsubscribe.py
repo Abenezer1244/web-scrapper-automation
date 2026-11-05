@@ -80,6 +80,9 @@ def test_a_forged_or_empty_token_is_refused():
     ("https://api.bridgeleads.io?x=1", False),
     ("https://api.bridgeleads.io\r\nX-Evil: 1", False),  # header injection
     ("javascript:alert(1)", False),
+    ("https://api.bridgeleads.io/wrong", False),  # a path: links would miss the route
+    ("https://api.bridgeleads.io:notaport", False),
+    ("https://user:pw@api.bridgeleads.io", False),
 ])
 def test_only_a_safe_absolute_base_builds_links(monkeypatch, base, usable):
     monkeypatch.setattr(settings, "API_BASE_URL", base)
@@ -145,3 +148,41 @@ def test_the_routes_are_not_in_the_public_api_schema():
     from main import app
 
     assert not any(p.startswith("/email") for p in app.openapi()["paths"])
+
+
+async def test_pages_tell_the_browser_to_send_no_referrer(client: AsyncClient):
+    # The middleware's Referrer-Policy header would still send the token-bearing URL
+    # on the confirm form's same-origin POST; the meta tag overrides it.
+    for r in (await client.get("/email/unsubscribe", params={"token": mint_unsubscribe_token(_email())}),
+              await client.get("/email/unsubscribe", params={"token": "bad"})):
+        assert '<meta name="referrer" content="no-referrer">' in r.text
+
+
+async def test_an_oversized_body_is_refused_and_records_nothing(client: AsyncClient, db):
+    email = _email()
+    token = mint_unsubscribe_token(email)
+    r = await client.post("/email/unsubscribe", params={"token": token},
+                          content=b"List-Unsubscribe=One-Click&pad=" + b"x" * 8192,
+                          headers={"Content-Type": "application/x-www-form-urlencoded"})
+    assert r.status_code == 400
+    assert await _rows(db, email) == []
+
+
+async def test_one_busy_sender_ip_never_turns_other_peoples_opt_outs_into_429s(
+    client: AsyncClient, db
+):
+    # Mail providers POST one-click opt-outs from a few shared IPs. 65 different
+    # addresses from ONE client IP exceed the general zone's 60/min per IP: with a
+    # per-IP bucket the tail would get 429 instead of the 2xx RFC 8058 expects.
+    emails = [_email() for _ in range(65)]
+    try:
+        for email in emails:
+            r = await client.post("/email/unsubscribe",
+                                  params={"token": mint_unsubscribe_token(email)},
+                                  data={"List-Unsubscribe": "One-Click"})
+            assert r.status_code == 200, r.status_code
+    finally:
+        for email in emails:
+            await db.execute(text("DELETE FROM marketing_email_suppressions WHERE email_hmac = :h"),
+                             {"h": blind_index(email)})
+        await db.commit()

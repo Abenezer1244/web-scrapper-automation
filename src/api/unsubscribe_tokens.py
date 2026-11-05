@@ -88,10 +88,16 @@ def public_api_base() -> str | None:
     if not base or any(c in base for c in "\r\n <>\"'"):
         return None
     parts = urlsplit(base)
+    try:
+        parts.port  # noqa: B018 -- raises ValueError on a malformed port
+    except ValueError:
+        return None
     local = parts.hostname in ("localhost", "127.0.0.1")
     if parts.scheme != "https" and not (parts.scheme == "http" and local):
         return None
-    if not parts.hostname or parts.query or parts.fragment:
+    # A bare origin: the route is mounted at the API root, so any path, query,
+    # fragment or credentials would build a link that does not reach it.
+    if not parts.hostname or parts.path or parts.query or parts.fragment or parts.username:
         return None
     return base
 

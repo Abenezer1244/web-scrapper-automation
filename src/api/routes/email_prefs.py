@@ -36,16 +36,35 @@ router = APIRouter(prefix="/email", tags=["email"], include_in_schema=False)
 _logger = setup_logger("api.email_prefs")
 
 # The token is a bearer capability in a URL: keep it out of caches and search
-# indexes. Referer is already safe: SecurityHeadersMiddleware sets
-# strict-origin-when-cross-origin on every response, and the only link here goes to
-# another origin, so it carries the origin alone. That middleware's CSP
-# (default-src 'none') also drops the inline styles below, as on the download-error
-# page: the pages stay plain but readable, and form-action is unaffected.
+# indexes, and out of every Referer. SecurityHeadersMiddleware overwrites the
+# Referrer-Policy HEADER with strict-origin-when-cross-origin, which would still send
+# the full URL on the confirm form's same-origin POST, so the page sets
+# <meta name="referrer" content="no-referrer">, which the header cannot override.
+# The middleware's CSP (default-src 'none') also drops the inline styles below, as on
+# the download-error page: the pages stay plain but readable; form-action is unaffected.
 _HEADERS = {
     "Cache-Control": "no-store",
     "X-Robots-Tag": "noindex",
 }
 _ONE_CLICK = ("List-Unsubscribe", "One-Click")
+# A one-click body is "List-Unsubscribe=One-Click"; the confirm form adds a token.
+_MAX_BODY_BYTES = 4096
+
+
+async def _limit(request: Request, email_hmac: str | None) -> None:
+    """Throttle per ADDRESS for a valid link, per IP otherwise.
+
+    Mail providers send RFC 8058 one-click POSTs from a few shared IPs, and the RFC
+    expects a 2xx: a per-IP bucket would let one busy provider IP turn other
+    people's opt-outs into 429s. A valid token is bucketed by the address it names
+    (a provider sends once per message), so only forged or broken links share the
+    per-IP bucket. The general zone fails open, so a Redis outage never blocks an
+    opt-out.
+    """
+    if email_hmac is None:
+        await rate_limit(request, zone="general")
+    else:
+        await rate_limit(request, zone="general", identifier=f"unsubscribe:{email_hmac}")
 
 
 def _page(title: str, body_html: str, status_code: int = 200) -> HTMLResponse:
@@ -55,6 +74,7 @@ def _page(title: str, body_html: str, status_code: int = 200) -> HTMLResponse:
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex">
+<meta name="referrer" content="no-referrer">
 <title>{html.escape(title)} | BridgeLeads</title></head>
 <body style="font-family: system-ui, sans-serif; max-width: 32rem; margin: 15vh auto; padding: 0 1rem; color: #1a1a1a">
 <h1 style="font-size: 1.25rem">{html.escape(title)}</h1>
@@ -77,8 +97,9 @@ def _invalid_link() -> HTMLResponse:
 
 @router.get("/unsubscribe")
 async def unsubscribe_confirm(request: Request, token: str = "") -> HTMLResponse:
-    await rate_limit(request, zone="general")
-    if verify_unsubscribe_token(token) is None:
+    email_hmac = verify_unsubscribe_token(token)
+    await _limit(request, email_hmac)
+    if email_hmac is None:
         return _invalid_link()
     # The token goes in a hidden field so the POST URL carries no token.
     return _page(
@@ -100,11 +121,15 @@ async def unsubscribe(
     token: str = "",
     db: AsyncSession = Depends(get_db),
 ) -> HTMLResponse:
-    await rate_limit(request, zone="general")
+    declared = request.headers.get("content-length")
+    if declared is not None and (not declared.isdigit() or int(declared) > _MAX_BODY_BYTES):
+        await _limit(request, None)
+        return _invalid_link()
     form = await request.form()
     one_click = form.get(_ONE_CLICK[0]) == _ONE_CLICK[1]
     # One-click: token in the URL (RFC 8058). Confirm page: token in the body.
     email_hmac = verify_unsubscribe_token(token or str(form.get("token") or ""))
+    await _limit(request, email_hmac)
     if email_hmac is None:
         return _invalid_link()
     result = await db.execute(

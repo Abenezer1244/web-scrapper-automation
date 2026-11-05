@@ -20,6 +20,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 from fastapi import BackgroundTasks, HTTPException, Request, Response, status
+from fastapi.concurrency import run_in_threadpool
 from sqlalchemy import delete, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -344,10 +345,12 @@ async def _register_user_legacy(
     token, refresh = await start_session(db, request, user.id, amr=["pwd"])
     audit_log(request, "register", user.id)
 
-    # Welcome email (non-blocking — failure must not break registration).
+    # Welcome email (failure must not break registration). It is commercial, so it
+    # checks the opt-out list (a sync DB read) before the sync Resend call: run it
+    # in the threadpool so neither blocks this event loop.
     try:
         from src.workers.onboarding_emails import send_welcome_email
-        send_welcome_email(body.email)
+        await run_in_threadpool(send_welcome_email, body.email)
     except Exception:
         pass
 
@@ -548,10 +551,11 @@ async def verify_user_email(
     token, refresh = await start_session(db, request, user.id, amr=["pwd"])
     audit_log(request, "register_verified", user.id)
 
-    # Welcome email (non-blocking — failure must not break verification).
+    # Welcome email (failure must not break verification). In the threadpool, as
+    # above: its opt-out check and the Resend call are both blocking.
     try:
         from src.workers.onboarding_emails import send_welcome_email
-        send_welcome_email(email)
+        await run_in_threadpool(send_welcome_email, email)
     except Exception:
         pass
 

@@ -83,6 +83,8 @@ def test_a_forged_or_empty_token_is_refused():
     ("https://api.bridgeleads.io/wrong", False),  # a path: links would miss the route
     ("https://api.bridgeleads.io:notaport", False),
     ("https://user:pw@api.bridgeleads.io", False),
+    ("https://:secret@api.bridgeleads.io", False),   # password-only userinfo
+    ("https://[::1", False),                          # malformed host: no exception
 ])
 def test_only_a_safe_absolute_base_builds_links(monkeypatch, base, usable):
     monkeypatch.setattr(settings, "API_BASE_URL", base)
@@ -186,3 +188,35 @@ async def test_one_busy_sender_ip_never_turns_other_peoples_opt_outs_into_429s(
             await db.execute(text("DELETE FROM marketing_email_suppressions WHERE email_hmac = :h"),
                              {"h": blind_index(email)})
         await db.commit()
+
+
+async def test_a_chunked_oversized_body_is_refused_without_content_length(client: AsyncClient, db):
+    # A generator body is sent chunked, with no Content-Length to trust.
+    email = _email()
+
+    async def _chunks():
+        yield b"List-Unsubscribe=One-Click&pad="
+        for _ in range(10):
+            yield b"x" * 1024
+
+    r = await client.post("/email/unsubscribe", params={"token": mint_unsubscribe_token(email)},
+                          content=_chunks(),
+                          headers={"Content-Type": "application/x-www-form-urlencoded"})
+    assert r.status_code == 400
+    assert await _rows(db, email) == []
+
+
+async def test_one_click_accepts_a_multipart_body_as_rfc8058_allows(client: AsyncClient, db):
+    email = _email()
+    try:
+        r = await client.post("/email/unsubscribe", params={"token": mint_unsubscribe_token(email)},
+                              files={"List-Unsubscribe": (None, "One-Click")})
+        assert r.status_code == 200
+        assert [row.source for row in await _rows(db, email)] == ["one_click"]
+    finally:
+        await _cleanup(db, email)
+
+
+async def test_the_confirm_form_asks_for_no_referrer(client: AsyncClient):
+    r = await client.get("/email/unsubscribe", params={"token": mint_unsubscribe_token(_email())})
+    assert 'rel="noreferrer"' in r.text

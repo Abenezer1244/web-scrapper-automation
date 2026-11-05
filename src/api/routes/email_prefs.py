@@ -20,6 +20,7 @@ outcome is a plain HTML page, and the pages never say whether an account exists.
 Hidden from OpenAPI: browsers and mail clients call this, not the frontend.
 """
 import html
+from urllib.parse import parse_qs
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse
@@ -46,9 +47,22 @@ _HEADERS = {
     "Cache-Control": "no-store",
     "X-Robots-Tag": "noindex",
 }
-_ONE_CLICK = ("List-Unsubscribe", "One-Click")
-# A one-click body is "List-Unsubscribe=One-Click"; the confirm form adds a token.
+# A one-click body is "List-Unsubscribe=One-Click"; the confirm form sends a token.
 _MAX_BODY_BYTES = 4096
+
+
+async def _read_capped(request: Request) -> bytes | None:
+    """The request body, or None once it passes _MAX_BODY_BYTES.
+
+    Reads the stream itself, so a chunked or HTTP/2 body with no (or a false)
+    Content-Length is bounded too.
+    """
+    body = bytearray()
+    async for chunk in request.stream():
+        body += chunk
+        if len(body) > _MAX_BODY_BYTES:
+            return None
+    return bytes(body)
 
 
 async def _limit(request: Request, email_hmac: str | None) -> None:
@@ -107,7 +121,9 @@ async def unsubscribe_confirm(request: Request, token: str = "") -> HTMLResponse
         "<p>You will stop getting product tips, reminders and offers from "
         "BridgeLeads. Emails about your account, security and billing will still "
         "arrive.</p>"
-        '<form method="post" action="/email/unsubscribe">'
+        # rel=noreferrer: the browser sends no Referer (which would carry this
+        # page's token-bearing URL) on the POST, whatever the response policy says.
+        '<form method="post" action="/email/unsubscribe" rel="noreferrer">'
         f'<input type="hidden" name="token" value="{html.escape(token)}">'
         '<button type="submit" style="font: inherit; padding: 0.6rem 1.2rem; '
         'border-radius: 6px; border: 0; background: #0f766e; color: #fff; cursor: pointer">'
@@ -121,14 +137,25 @@ async def unsubscribe(
     token: str = "",
     db: AsyncSession = Depends(get_db),
 ) -> HTMLResponse:
-    declared = request.headers.get("content-length")
-    if declared is not None and (not declared.isdigit() or int(declared) > _MAX_BODY_BYTES):
+    body = await _read_capped(request)
+    if body is None:
         await _limit(request, None)
         return _invalid_link()
-    form = await request.form()
-    one_click = form.get(_ONE_CLICK[0]) == _ONE_CLICK[1]
-    # One-click: token in the URL (RFC 8058). Confirm page: token in the body.
-    email_hmac = verify_unsubscribe_token(token or str(form.get("token") or ""))
+    if token:
+        # RFC 8058 one-click: the token is in the URL and the body is
+        # "List-Unsubscribe=One-Click", sent as either form encoding. The body
+        # cannot change the outcome (the URL alone is a valid opt-out), so it is
+        # not parsed: no multipart parser ever sees untrusted input here.
+        one_click, candidate = True, token
+    else:
+        # The confirm page's own form: urlencoded, token in the body.
+        one_click = False
+        try:
+            fields = parse_qs(body.decode("utf-8", "replace"), max_num_fields=4)
+        except ValueError:
+            fields = {}
+        candidate = (fields.get("token") or [""])[0]
+    email_hmac = verify_unsubscribe_token(candidate)
     await _limit(request, email_hmac)
     if email_hmac is None:
         return _invalid_link()

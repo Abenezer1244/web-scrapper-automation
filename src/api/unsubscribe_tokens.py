@@ -87,17 +87,18 @@ def public_api_base() -> str | None:
     base = (settings.API_BASE_URL or "").strip().rstrip("/")
     if not base or any(c in base for c in "\r\n <>\"'"):
         return None
-    parts = urlsplit(base)
     try:
+        parts = urlsplit(base)
         parts.port  # noqa: B018 -- raises ValueError on a malformed port
-    except ValueError:
+        hostname = parts.hostname
+    except ValueError:  # malformed authority, e.g. an unclosed IPv6 bracket
         return None
-    local = parts.hostname in ("localhost", "127.0.0.1")
+    local = hostname in ("localhost", "127.0.0.1")
     if parts.scheme != "https" and not (parts.scheme == "http" and local):
         return None
     # A bare origin: the route is mounted at the API root, so any path, query,
-    # fragment or credentials would build a link that does not reach it.
-    if not parts.hostname or parts.path or parts.query or parts.fragment or parts.username:
+    # fragment or userinfo would build a link that does not reach it.
+    if not hostname or parts.path or parts.query or parts.fragment or "@" in parts.netloc:
         return None
     return base
 

@@ -487,6 +487,22 @@ BEGIN
         CREATE POLICY legal_acceptances_system ON legal_acceptances
             FOR SELECT TO bridgeleads_system USING (true);
     END IF;
+    -- Marketing email suppressions (124): addresses (by email_hmac) that opted out of
+    -- commercial email. Not tenant data: the app inserts from the unsubscribe link
+    -- (no session) and reads; the worker reads at send time. Nobody updates or
+    -- deletes. Must stay AFTER the system ALL TABLES grant.
+    IF to_regclass('public.marketing_email_suppressions') IS NOT NULL THEN
+        REVOKE ALL ON marketing_email_suppressions FROM bridgeleads_app, bridgeleads_system;
+        GRANT SELECT ON marketing_email_suppressions TO bridgeleads_app;
+        GRANT INSERT (email_hmac, source) ON marketing_email_suppressions TO bridgeleads_app;
+        GRANT SELECT ON marketing_email_suppressions TO bridgeleads_system;
+        DROP POLICY IF EXISTS marketing_email_suppressions_app ON marketing_email_suppressions;
+        CREATE POLICY marketing_email_suppressions_app ON marketing_email_suppressions
+            FOR ALL TO bridgeleads_app USING (true) WITH CHECK (true);
+        DROP POLICY IF EXISTS marketing_email_suppressions_system ON marketing_email_suppressions;
+        CREATE POLICY marketing_email_suppressions_system ON marketing_email_suppressions
+            FOR SELECT TO bridgeleads_system USING (true);
+    END IF;
     -- Job degradations (117): worker-only history of phases that failed on a DONE
     -- job, plus the skip-trace repair queue. Nobody deletes (rows go with their job);
     -- the app role reads nothing. Must stay AFTER the system ALL TABLES grant.

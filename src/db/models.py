@@ -380,6 +380,21 @@ class LegalAcceptance(Base):
     )
 
 
+class MarketingEmailSuppression(Base):
+    """An email address that opted out of commercial email (migration 124).
+
+    Keyed by the address's email_hmac, not a user id, so the opt-out survives an
+    account deletion and a re-registration, and never follows a user to a new
+    address. Append-only: opted_out_at is the database clock and no role may
+    update or delete a row.
+    """
+    __tablename__ = "marketing_email_suppressions"
+
+    email_hmac = Column(String(64), primary_key=True)
+    source = Column(String(16), nullable=False)  # 'link' | 'one_click' | 'support'
+    opted_out_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
 class UserAvatar(Base):
     """The user's profile photo (migration 111): the SERVER re-encoded 256px WebP,
     never the uploaded bytes. Kept off `users` so ordinary user reads never load

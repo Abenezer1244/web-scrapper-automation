@@ -13,27 +13,38 @@ A cell becomes a list of Subjects, one per party and co-owner:
   * ``person``: exactly ONE (surname, given) reading in the declared order;
   * ``entity``: an organization, typed trust / government / company / other;
   * ``unresolved``: anything that cannot be read without guessing (order unknown,
-    entity-or-person, a role word, initials only, a non-Latin script). It yields
-    NO key values, so it can never match automatically; the matcher sends it to
-    operator review instead (design section 6).
+    entity-or-person, a role word, initials only, a surname only shared from a
+    co-owner, a non-Latin script). It yields NO key values, so it can never match
+    automatically; the matcher sends it to operator review instead (section 6).
+
+A party whose co-owners are all unreadable ('LUKINS & ANNIS') stays ONE unresolved
+subject, never fragments. A party mixing a person and an entity ('SMITH JOHN &
+WELLS FARGO BANK NA') is split, so the person is never hidden inside the entity.
 
 ``capacity`` records an estate ("ESTATE OF ...", "... EST OF") or a fiduciary
 ("... TTEE", "... PER REP") without deciding anything: whether a decedent's or a
 trustee's request suppresses the record is an owner/counsel decision (section 11,
-D4). ``surname_inherited`` marks a co-owner whose surname is shared from the cell
-("SMITH JOHN & MARY", "JOHN AND JANE SMITH"), so a report can show it was inferred.
+D4). A co-owner whose surname is only shared from the cell ("SMITH JOHN & MARY",
+"JOHN AND JANE SMITH") is unresolved (SURNAME_SHARED) with that reading attached
+as a suggestion for the reviewer, never keyed automatically (Codex).
 
 NORMALIZATION_VERSION is stored on every rule. Change any rule here (or the
 export rules reused from lead_formatting) and it must change, because rules made
 under one normalisation must not be compared with values produced by another.
+``reused_rules_fingerprint`` hashes those reused rules, and a test pins it beside
+the version, so a formatter change cannot slip past unnoticed.
 
 Pure: no I/O. Nothing here is wired into scraping, delivery or enrichment.
 """
 from __future__ import annotations
 
+import hashlib
+import inspect
 import re
 import unicodedata
 from dataclasses import dataclass
+
+import src.utils.lead_formatting as _lead_formatting
 
 # The export's own name rules, reused on purpose (see the module docstring).
 from src.utils.lead_formatting import (
@@ -75,6 +86,7 @@ ENTITY_OR_PERSON = "entity_or_person"
 ROLE_OR_CAPACITY = "role_or_capacity"
 GIVEN_NAME_MISSING = "given_name_missing"
 UNREADABLE_IN_ORDER = "unreadable_in_declared_order"
+SURNAME_SHARED = "surname_shared"
 NON_LATIN_SCRIPT = "non_latin_script"
 
 # Public bodies the export blanks only as a capacity word ('KING COUNTY'); here they
@@ -102,7 +114,10 @@ _COMPANY_WORDS = frozenset({
 _SURNAME_LIKE_MARKERS = frozenset({
     "CHURCH", "BANK", "NA", "CO", "TR", "STATE", "AMERICA", "CENTER", "LIVING",
 })
-_WEAK_ENTITY_MAX_WORDS = 3
+_WEAK_ENTITY_MAX_WORDS = 3  # counted without suffixes and initials ('CO JOHN SMITH JR')
+# A person's name never carries these once estate/heirs text is stripped, so a
+# single surname-like marker beside one ('CHURCH OF JESUS CHRIST') stays an entity.
+_ORG_FUNCTION_WORDS = frozenset({"OF", "FOR", "THE"})
 
 # Words that make a party a ROLE held by unnamed or unreadable people ('UNKNOWN
 # HEIRS OF SMITH JOHN', 'SMITH JOHN AS AGENT'). Checked before the organization
@@ -134,8 +149,9 @@ class Subject:
     given: str | None = None        # person only, normalised first given name
     entity_type: str | None = None  # entity only: trust | government | company | other
     capacity: str | None = None     # estate | fiduciary | None (D4 decides its effect)
-    surname_inherited: bool = False
     review_reason: str | None = None  # unresolved only
+    # A person's surname/given is THE reading; an unresolved SURNAME_SHARED subject
+    # carries the shared-surname reading as a reviewer's suggestion, never a key.
 
 
 def normalize_text(raw: str | None) -> str:
@@ -198,19 +214,30 @@ def _entity_type(party: str) -> str:
     return "other"
 
 
-def _is_weak_entity(party: str) -> bool:
-    """Is the only entity evidence a single surname-like word in a short cell?"""
-    if any(ch.isdigit() for ch in party) or _SPACED_ENTITY_RE.search(party.upper()):
-        return False
-    evidence = _entity_evidence(party)
-    return (len(_words(party)) <= _WEAK_ENTITY_MAX_WORDS and len(evidence) == 1
-            and evidence <= _SURNAME_LIKE_MARKERS)
-
-
 def _name_words(part: str) -> list[str]:
     """Words of a co-owner part that could be a name: no suffixes, no initials."""
     return [t for t in _NAME_TOKEN_RE.findall(part)
             if t.upper() not in _NAME_SUFFIXES and len(t) > 1]
+
+
+def _is_weak_entity(text: str) -> bool:
+    """Is the only entity evidence one surname-like word in an otherwise
+    person-shaped name ('CHURCH JOHN', 'CO JOHN SMITH JR')?"""
+    if any(ch.isdigit() for ch in text) or _SPACED_ENTITY_RE.search(text.upper()):
+        return False
+    if set(_words(text)) & _ORG_FUNCTION_WORDS:
+        return False
+    evidence = _entity_evidence(text)
+    return (len(_name_words(text)) <= _WEAK_ENTITY_MAX_WORDS and len(evidence) == 1
+            and evidence <= _SURNAME_LIKE_MARKERS)
+
+
+def _entity_strength(text: str, cell_len: int) -> str | None:
+    """'strong' (an entity), 'weak' (entity or person) or None (not an entity)."""
+    if not (_is_entity(text) or _looks_like_organization(text, cell_len)
+            or set(_words(text)) & _GOVERNMENT_WORDS):
+        return None
+    return "weak" if _is_weak_entity(text) else "strong"
 
 
 def _party_subjects(party: str, raw_len: int, base: dict) -> list[Subject]:
@@ -239,16 +266,6 @@ def _party_subjects(party: str, raw_len: int, base: dict) -> list[Subject]:
                    or bool(_SPACED_ENTITY_RE.search(party.upper())))
     if _PERSON_ROLE_RE.search(party) and not hard_entity:
         return [unresolved(ROLE_OR_CAPACITY, capacity=capacity)]
-    is_entity = (_is_entity(party) or _looks_like_organization(party, raw_len)
-                 or bool(set(_words(party)) & _GOVERNMENT_WORDS))
-    if is_entity:
-        if _is_weak_entity(party):
-            return [unresolved(ENTITY_OR_PERSON, capacity=capacity)]
-        return [Subject(**base, kind=KIND_ENTITY, text=normalize_text(party),
-                        entity_type=_entity_type(party))]
-    if _CAPACITY_RE.search(party) or _HONORIFIC_RE.search(party):
-        return [unresolved(ROLE_OR_CAPACITY, capacity=capacity)]
-
     order = base["name_order"]
     if has_prefix:
         # Same rule as the export: a recorder source writes BOTH orders after
@@ -256,22 +273,59 @@ def _party_subjects(party: str, raw_len: int, base: dict) -> list[Subject]:
         # natural order after it.
         order = {NAME_ORDER_RECORDER: NAME_ORDER_COMMA_ONLY,
                  NAME_ORDER_COMMA_ONLY: NAME_ORDER_NATURAL}.get(order, order)
-
     parts = [p.strip() for p in _COOWNER_JOIN_RE.split(party) if p.strip()]
-    readings: list[tuple[str | None, str | None]] = []
-    for part in parts:
-        if order is None:
-            readings.append((None, None))
-            continue
-        first, last = _first_person_tokens(part, order)
-        readings.append((first, last) if first and last else (None, last))
+
+    strength = _entity_strength(party, raw_len)
+    if strength:
+        if len(parts) > 1:
+            # The export blanks a whole cell with an entity in it; here that would
+            # hide 'SMITH JOHN' in 'SMITH JOHN & WELLS FARGO BANK NA'. Split when a
+            # strong entity part sits beside a non-entity part; an all-entity cell
+            # ('WSDOT R/E SERVICES') stays whole.
+            strengths = [_entity_strength(p, raw_len if i == len(parts) - 1 else len(p))
+                         for i, p in enumerate(parts)]
+            if "strong" in strengths and None in strengths:
+                out: list[Subject] = []
+                for part, part_strength in zip(parts, strengths, strict=True):
+                    if part_strength == "strong":
+                        out.append(Subject(**base, kind=KIND_ENTITY,
+                                           text=normalize_text(part),
+                                           entity_type=_entity_type(part)))
+                    elif part_strength == "weak":
+                        out.append(unresolved(ENTITY_OR_PERSON, part, capacity=capacity))
+                    else:
+                        out.extend(_read_people([part], part, order, base, capacity))
+                return out
+        if strength == "weak":
+            return [unresolved(ENTITY_OR_PERSON, capacity=capacity)]
+        return [Subject(**base, kind=KIND_ENTITY, text=normalize_text(party),
+                        entity_type=_entity_type(party))]
+    if _CAPACITY_RE.search(party) or _HONORIFIC_RE.search(party):
+        return [unresolved(ROLE_OR_CAPACITY, capacity=capacity)]
+    return _read_people(parts, party, order, base, capacity)
+
+
+def _read_people(
+    parts: list[str], party: str, order: str | None, base: dict, capacity: str | None
+) -> list[Subject]:
+    """Persons (or unresolved subjects) for the co-owner ``parts`` of one party."""
+    def unresolved(reason: str, text: str, **extra) -> Subject:
+        return Subject(**base, kind=KIND_UNRESOLVED, text=normalize_text(text),
+                       review_reason=reason, capacity=capacity, **extra)
+
+    if order is None:
+        return [unresolved(NAME_ORDER_UNKNOWN, party)]
+    readings = [_first_person_tokens(part, order) for part in parts]
+    if not any(first and last for first, last in readings):
+        # Nothing in the party reads as a person: ONE subject for the reviewer,
+        # not fragments ('LUKINS & ANNIS' is a firm, not two people).
+        if len(parts) == 1 and readings[0][1]:
+            return [unresolved(GIVEN_NAME_MISSING, party)]
+        return [unresolved(UNREADABLE_IN_ORDER, party)]
 
     subjects: list[Subject] = []
     for i, part in enumerate(parts):
         first, last = readings[i]
-        if order is None:
-            subjects.append(unresolved(NAME_ORDER_UNKNOWN, part, capacity=capacity))
-            continue
         if first and last:
             subjects.append(Subject(**base, kind=KIND_PERSON, text=normalize_text(part),
                                     surname=normalize_text(last), given=normalize_text(first),
@@ -279,10 +333,10 @@ def _party_subjects(party: str, raw_len: int, base: dict) -> list[Subject]:
             continue
         lone = _name_words(part)
         shared = None
-        if len(lone) == 1 and "," not in part and len(parts) > 1:
-            # A lone given name shares a surname read in the SAME party: the one
+        if len(lone) == 1 and "," not in part:
+            # A lone given name may share a surname read in the SAME party: the one
             # before it in recorder order ('SMITH JOHN A & MARY B'), the one after it
-            # in natural order ('JOHN AND JANE SMITH').
+            # in natural order ('JOHN AND JANE SMITH'). Inferred, so review only.
             if order == NAME_ORDER_RECORDER:
                 prior = [r for r in readings[:i] if r[0] and r[1]]
                 shared = prior[-1][1] if prior else None
@@ -290,14 +344,12 @@ def _party_subjects(party: str, raw_len: int, base: dict) -> list[Subject]:
                 later = [r for r in readings[i + 1:] if r[0] and r[1]]
                 shared = later[0][1] if later else None
         if shared:
-            subjects.append(Subject(**base, kind=KIND_PERSON, text=normalize_text(part),
-                                    surname=normalize_text(shared),
-                                    given=normalize_text(lone[0]),
-                                    capacity=capacity, surname_inherited=True))
+            subjects.append(unresolved(SURNAME_SHARED, part, surname=normalize_text(shared),
+                                       given=normalize_text(lone[0])))
         elif last and not first:
-            subjects.append(unresolved(GIVEN_NAME_MISSING, part, capacity=capacity))
+            subjects.append(unresolved(GIVEN_NAME_MISSING, part))
         else:
-            subjects.append(unresolved(UNREADABLE_IN_ORDER, part, capacity=capacity))
+            subjects.append(unresolved(UNREADABLE_IN_ORDER, part))
     return subjects
 
 
@@ -329,6 +381,37 @@ def subjects_from(
         if party.strip():
             subjects.extend(_party_subjects(party.strip(), len(party.strip()), base))
     return subjects
+
+
+# Every lead_formatting rule the readings above depend on, directly or through the
+# reused functions. reused_rules_fingerprint() hashes them; tests pin the hash.
+_REUSED_RULE_NAMES = (
+    "_ALIAS_TAIL_RE", "_CAPACITY_RE", "_CARE_OF_RE", "_COOWNER_JOIN_RE", "_ENTITY_TOKENS",
+    "_ESTATE_PREFIX_RE", "_EXPORT_PARTICLES", "_FUNCTION_WORDS", "_HISPANIC_SURNAMES",
+    "_HONORIFIC_RE", "_NAME_SUFFIXES", "_NAME_TOKEN_RE", "_ORG_WORDS", "_PARTICLE_PAIRS",
+    "_PARTY_SEP_RE", "_PHONE_EXT_RE", "_ROLE_TAIL_RE", "_SPACED_ENTITY_RE",
+    "_SURNAME_PARTICLES", "_TRAILING_ESTATE_RE", "_TRUNCATED_CELL_LEN", "_VESTING_TAIL_RE",
+    "_VIETNAMESE_SURNAMES", "_drop_initial", "_first_person_tokens", "_is_entity",
+    "_looks_like_organization", "_recorder_first_last", "normalize_phone_for_dialer",
+)
+
+
+def reused_rules_fingerprint() -> str:
+    """SHA-256 over the reused lead_formatting rules (patterns, word sets, function
+    source). Pinned in tests next to NORMALIZATION_VERSION."""
+    digest = hashlib.sha256()
+    for name in _REUSED_RULE_NAMES:
+        obj = getattr(_lead_formatting, name)
+        if inspect.isfunction(obj):
+            data = inspect.getsource(obj)
+        elif isinstance(obj, re.Pattern):
+            data = f"{obj.pattern}|{obj.flags}"
+        elif isinstance(obj, frozenset | set):
+            data = repr(sorted(obj, key=repr))
+        else:
+            data = repr(obj)
+        digest.update(f"{name}={data};".encode())
+    return digest.hexdigest()
 
 
 def subject_key_values(subject: Subject) -> list[tuple[str, str]]:

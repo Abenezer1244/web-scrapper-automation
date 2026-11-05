@@ -18,10 +18,13 @@ from src.privacy.subjects import (
     NON_LATIN_SCRIPT,
     NORMALIZATION_VERSION,
     ROLE_OR_CAPACITY,
+    SURNAME_SHARED,
+    UNREADABLE_IN_ORDER,
     email_key_value,
     normalize_text,
     person_key_value,
     phone_key_value,
+    reused_rules_fingerprint,
     subject_key_values,
     subjects_from,
 )
@@ -33,6 +36,7 @@ from src.utils.lead_formatting import (
 )
 
 REC, NAT, COMMA = NAME_ORDER_RECORDER, NAME_ORDER_NATURAL, NAME_ORDER_COMMA_ONLY
+PINNED_FINGERPRINT = "fb399cce7198ba21fed82885e338268bf7de73ab7269917720ca42427a186f1f"
 
 
 def _subs(raw, order, role="party"):
@@ -94,19 +98,26 @@ def test_parties_split_and_never_blend():
     assert [(s.surname, s.given) for s in subs] == [("smith", "john"), ("doe", "jane")]
 
 
-def test_a_shared_surname_is_inherited_in_the_declared_direction_and_flagged():
+def test_a_shared_surname_is_a_review_suggestion_never_a_key():
+    # The reading is suggested in the declared direction, but it is inferred, so it
+    # routes to review rather than matching automatically (Codex).
     rec = _subs("SMITH JOHN A & MARY B", REC)
-    assert [(s.surname, s.given, s.surname_inherited) for s in rec] == [
-        ("smith", "john", False), ("smith", "mary", True)]
+    assert [(s.kind, s.surname, s.given, s.review_reason) for s in rec] == [
+        (KIND_PERSON, "smith", "john", None),
+        (KIND_UNRESOLVED, "smith", "mary", SURNAME_SHARED)]
     nat = _subs("JOHN AND JANE SMITH, HUSBAND AND WIFE", NAT)
-    assert [(s.surname, s.given, s.surname_inherited) for s in nat] == [
-        ("smith", "john", True), ("smith", "jane", False)]
+    assert [(s.kind, s.surname, s.given, s.review_reason) for s in nat] == [
+        (KIND_UNRESOLVED, "smith", "john", SURNAME_SHARED),
+        (KIND_PERSON, "smith", "jane", None)]
+    assert _keys("SMITH JOHN A & MARY B", REC) == [("person", "smith|john")]
 
 
-def test_no_inheritance_without_a_full_name_in_the_same_party():
-    # Every part is a lone word: nothing to share, nothing matchable.
-    assert _keys("PETRAKOPOULOS/ALEX AND SHANNON", REC) == []
-    assert _keys("LUKINS & ANNIS", REC) == []
+@pytest.mark.parametrize("raw", ["LUKINS & ANNIS", "PETRAKOPOULOS/ALEX AND SHANNON"])
+def test_an_unreadable_party_stays_one_subject(raw):
+    # No part reads as a person: one review item, not fragments of a firm's name.
+    (sub,) = _subs(raw, REC)
+    assert sub.review_reason == UNREADABLE_IN_ORDER and sub.text == normalize_text(raw)
+    assert subject_key_values(sub) == []
 
 
 @pytest.mark.parametrize("raw", ["AT&T", "B&B"])
@@ -143,7 +154,8 @@ def test_entities_are_typed_whole_and_keyed_by_name(raw, etype):
     assert subject_key_values(sub) == [("entity", normalize_text(raw))]
 
 
-@pytest.mark.parametrize("raw", ["CHURCH JOHN", "BANK, JOHN", "NA MIN JUN", "STATE MARY"])
+@pytest.mark.parametrize("raw", ["CHURCH JOHN", "BANK, JOHN", "NA MIN JUN", "STATE MARY",
+                                 "CO JOHN SMITH JR", "CHURCH JOHN A"])
 def test_a_surname_that_is_also_an_entity_word_is_unresolved_not_an_entity(raw):
     # Typing a person as an entity would silently miss that person's rule.
     (sub,) = _subs(raw, REC)
@@ -151,9 +163,32 @@ def test_a_surname_that_is_also_an_entity_word_is_unresolved_not_an_entity(raw):
     assert subject_key_values(sub) == []
 
 
+def test_a_marker_word_beside_an_org_function_word_stays_an_entity():
+    (sub,) = _subs("CHURCH OF JESUS CHRIST", REC)
+    assert sub.kind == KIND_ENTITY
+
+
 def test_an_entity_party_beside_a_person_does_not_hide_the_person():
     subs = _subs("SMITH JOHN / WELLS FARGO BANK NA", REC)
     assert [s.kind for s in subs] == [KIND_PERSON, KIND_ENTITY]
+
+
+@pytest.mark.parametrize(("raw", "order"), [
+    ("SMITH JOHN & WELLS FARGO BANK NA", REC),
+    ("WELLS FARGO BANK NA & SMITH JOHN", REC),
+    ("JOHN SMITH AND ACME HOLDINGS LLC", NAT),
+])
+def test_a_co_owner_cell_mixing_a_person_and_an_entity_is_split(raw, order):
+    # Codex: classifying the whole cell as an entity hid the person entirely.
+    subs = _subs(raw, order)
+    assert sorted(s.kind for s in subs) == [KIND_ENTITY, KIND_PERSON]
+    assert ("person", "smith|john") in _keys(raw, order)
+
+
+def test_a_mixed_cell_part_that_is_not_a_full_name_goes_to_review():
+    subs = _subs("YESLER TOWERS LLC/CHAN J", REC)
+    assert [(s.kind, s.review_reason) for s in subs] == [
+        (KIND_ENTITY, None), (KIND_UNRESOLVED, GIVEN_NAME_MISSING)]
 
 
 # ── Estates, roles, noise ────────────────────────────────────────────────────
@@ -247,7 +282,10 @@ def test_subjects_carry_their_provenance():
     assert (sub.role, sub.source_field, sub.name_order) == ("contact", "skip_trace_name", REC)
 
 
-def test_normalization_version_is_pinned():
-    # Rules store this; changing the rules (here or the export rules reused from
-    # lead_formatting) without bumping it would compare two normalisations as one.
-    assert NORMALIZATION_VERSION == "n2"
+def test_normalization_version_is_pinned_to_the_reused_rules():
+    # Rules store the version; changing how a name reads without bumping it would
+    # compare two normalisations as one. The fingerprint covers the lead_formatting
+    # rules reused here: if this fails, a formatter change touched them. When the
+    # change alters how any name or phone reads, bump NORMALIZATION_VERSION; either
+    # way, re-pin the fingerprint.
+    assert (NORMALIZATION_VERSION, reused_rules_fingerprint()) == ("n2", PINNED_FINGERPRINT)

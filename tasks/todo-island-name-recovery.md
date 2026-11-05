@@ -1,6 +1,6 @@
 # Owner-name lookup recovery (Island first): ask the names a job never reached
 
-Branch `fix/pacs-name-recovery` (stacked on `fix/enrich-recovery-transactions`, PR #583).
+Shipped: only the restricted-switch gate (PR #584). The recovery sweep was parked, then deleted (3b-2).
 Owner cleared commercial owner-name searching of the Island PACS portal, sweep included (2026-11-02).
 
 ## Evidence (production, read-only, counts only, 2026-11-02)
@@ -35,7 +35,8 @@ Owner cleared commercial owner-name searching of the Island PACS portal, sweep i
       answers to COUNTY_GIS_RESTRICTED_MAILING_ENABLED (it ran ungated; the switch is on in production,
       so nothing changes there). Codex: NO-GO (a third Island test lacked the switch; loose gate
       assertions) -> fixed -> GO.
-- [x] 3b-2 BUILT, REVIEWED, PARKED (local branch `fix/pacs-name-recovery`, commit a76ef8e1, not pushed).
+- [x] 3b-2 BUILT, REVIEWED, PARKED, then DELETED (local branch `fix/pacs-name-recovery`, a76ef8e1, never
+      pushed; the branch was deleted 2026-11-02, so this file is the only record of its design).
       Its SQL was EXPLAINed against production (plans), and then it selected ZERO rows: every one of the
       205 address-less Island rows is `is_duplicate = true`, `duplicate_reason = 'superseded'` (126
       filings, 2 jobs). That is the intended parcel-less claim release
@@ -45,5 +46,6 @@ Owner cleared commercial owner-name searching of the Island PACS portal, sweep i
       delivered-only contract needs an actionability guard in selection and UPDATE; P2 a found answer
       without a street must not write mailing. Recovering released filings needs its own
       delivery/claim/quota design. `NAME_RECOVERY_ENABLED` was removed from 3b-1 (nothing uses it).
-- [ ] If Island coverage matters: design how a released parcel-less filing is re-claimed and looked
-      up (owner decision), then revisit the parked sweep with Codex's P1/P2.
+- [x] Island coverage: the owner chose to leave it as is (2026-11-02). Island configs are manual-only,
+      rolling_90; a released filing is looked up again only when the customer re-runs the job. A future
+      sweep must be rebuilt from the design above, with Codex's P1/P2.

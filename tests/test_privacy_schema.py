@@ -260,16 +260,65 @@ def test_trigger_always_rls_on_no_policies_no_sequences(conn, table) -> None:
         {"tab": table}).scalar() == 0
 
 
-def test_an_ordinary_role_can_do_nothing(conn) -> None:
+def _probe_role(conn) -> str:
     # A throwaway NOSUPERUSER NOBYPASSRLS role: the owner bypasses RLS and would
-    # make this test pass falsely. CREATE ROLE is transactional; the rollback drops it.
+    # make these tests pass falsely. CREATE ROLE is transactional; the rollback drops it.
     role = f"privacy_probe_{uuid.uuid4().hex[:8]}"
     conn.execute(text(f"CREATE ROLE {role} NOLOGIN NOSUPERUSER NOBYPASSRLS"))
     conn.execute(text(f"GRANT USAGE ON SCHEMA public TO {role}"))
+    return role
+
+
+def test_without_grants_an_ordinary_role_is_refused(conn) -> None:
+    role = _probe_role(conn)
     conn.execute(text(f"SET LOCAL ROLE {role}"))
     for table in _TABLES:
         assert _sqlstate(conn, f"SELECT 1 FROM {table} LIMIT 1") == "42501", table
     conn.execute(text("RESET ROLE"))
+
+
+def test_with_grants_rls_and_no_policy_still_hide_and_refuse_everything(conn) -> None:
+    # Codex: the test above proves the ACL, not RLS. Here the role HOLDS every
+    # privilege, so only RLS with zero policies stands between it and the rows.
+    rid = _request(conn)
+    conn.execute(text("INSERT INTO privacy_request_payloads (request_id, contact_encrypted) "
+                      "VALUES (:r, :c)"), {"r": rid, "c": encrypt_field("x@example.test")})
+    conn.execute(text(_EVENT), {"r": rid, **_event()})
+    conn.execute(text(_RULE), _rule(rid))
+    role = _probe_role(conn)
+    for table in _TABLES:
+        conn.execute(text(f"GRANT SELECT, INSERT, UPDATE, DELETE ON {table} TO {role}"))
+    conn.execute(text(f"SET LOCAL ROLE {role}"))
+    for table in _TABLES:
+        assert conn.execute(text(f"SELECT count(*) FROM {table}")).scalar() == 0, table
+        # UPDATE and DELETE see no row through RLS, so they touch nothing.
+        assert conn.execute(text(f"DELETE FROM {table}")).rowcount == 0, table
+    # INSERT is refused by RLS itself (no policy admits the new row).
+    assert _sqlstate(conn, "INSERT INTO privacy_requests (kind, channel, deadline_at) "
+                           "VALUES ('delete', 'web', now() + interval '1 day')") == "42501"
+    conn.execute(text("RESET ROLE"))
+    assert conn.execute(text("SELECT count(*) FROM privacy_suppressions "
+                             "WHERE request_id = :r"), {"r": rid}).scalar() == 1
+
+
+_SCRIPTS = ("scripts/provision_rls_roles.sql", "scripts/_cutover_step2_grants_policies.py")
+_REVOKED_ROLES = ("anon", "authenticated", "service_role", "bridgeleads_app",
+                  "bridgeleads_system", "bridgeleads_purge")
+
+
+@pytest.mark.parametrize("script", _SCRIPTS)
+def test_both_grant_scripts_revoke_what_the_migration_revokes(script) -> None:
+    # The scripts re-run blanket grants after the migration, so each must take
+    # every privacy table back from every role migration 125 does (Codex).
+    from pathlib import Path
+    body = Path(__file__).resolve().parent.parent.joinpath(script).read_text(encoding="utf-8")
+    start = body.index("IF to_regclass('public.privacy_requests') IS NOT NULL THEN")
+    block = body[start:body.index("\n    END IF;", start) if script.endswith(".sql")
+                 else body.index("\n        END IF;\n    END", start)]
+    for table in _TABLES:
+        assert table in block, (script, table)
+    for role in _REVOKED_ROLES:
+        assert f"FROM {role}" in block or f", {role}" in block, (script, role)
 
 
 @pytest.mark.parametrize("roles", [("anon", "authenticated", "service_role"),

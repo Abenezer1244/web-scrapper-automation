@@ -511,6 +511,24 @@ BEGIN
         REVOKE ALL ON privacy_requests, privacy_request_payloads, privacy_request_events,
                       privacy_suppressions
             FROM PUBLIC, bridgeleads_app, bridgeleads_system;
+        -- The same role list as migration 125 (tests/test_privacy_schema.py keeps
+        -- the three in step); guarded, since not every cluster has these roles.
+        IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+            REVOKE ALL ON privacy_requests, privacy_request_payloads,
+                          privacy_request_events, privacy_suppressions FROM anon;
+        END IF;
+        IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+            REVOKE ALL ON privacy_requests, privacy_request_payloads,
+                          privacy_request_events, privacy_suppressions FROM authenticated;
+        END IF;
+        IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
+            REVOKE ALL ON privacy_requests, privacy_request_payloads,
+                          privacy_request_events, privacy_suppressions FROM service_role;
+        END IF;
+        IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bridgeleads_purge') THEN
+            REVOKE ALL ON privacy_requests, privacy_request_payloads,
+                          privacy_request_events, privacy_suppressions FROM bridgeleads_purge;
+        END IF;
     END IF;
     -- Job degradations (117): worker-only history of phases that failed on a DONE
     -- job, plus the skip-trace repair queue. Nobody deletes (rows go with their job);

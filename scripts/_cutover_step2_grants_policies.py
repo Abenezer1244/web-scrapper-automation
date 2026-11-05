@@ -96,7 +96,24 @@ _GRANTS = [
         IF to_regclass('public.privacy_requests') IS NOT NULL THEN
             REVOKE ALL ON privacy_requests, privacy_request_payloads,
                           privacy_request_events, privacy_suppressions
-                FROM bridgeleads_app, bridgeleads_system;
+                FROM PUBLIC, bridgeleads_app, bridgeleads_system;
+            -- Migration 125's full role list; guarded per role.
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+                REVOKE ALL ON privacy_requests, privacy_request_payloads,
+                              privacy_request_events, privacy_suppressions FROM anon;
+            END IF;
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+                REVOKE ALL ON privacy_requests, privacy_request_payloads,
+                              privacy_request_events, privacy_suppressions FROM authenticated;
+            END IF;
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
+                REVOKE ALL ON privacy_requests, privacy_request_payloads,
+                              privacy_request_events, privacy_suppressions FROM service_role;
+            END IF;
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bridgeleads_purge') THEN
+                REVOKE ALL ON privacy_requests, privacy_request_payloads,
+                              privacy_request_events, privacy_suppressions FROM bridgeleads_purge;
+            END IF;
         END IF;
     END
     $append_only$""",

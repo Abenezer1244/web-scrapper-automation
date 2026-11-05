@@ -98,10 +98,39 @@ table, not a users column, so they survive deletion and re-registration.
 - Counsel: confirm the commercial/transactional classification and the indefinite suppression
   retention.
 
-## Phase 5: checkout and billing disclosures (BE, ≤5 files)
-- [ ] Stripe Checkout `custom_text.submit`: renewal amount, interval, cancel path (test mode only)
-- [ ] `charge.dispute.created` / `charge.dispute.closed`: ops alert (no entitlement change until owner B1-5)
-- [ ] Annual-downgrade forfeiture (P1-9): reproduce in Stripe test mode first; fix only if reproduced
+## Phase 5: checkout and billing disclosures (DONE 2026-11-04; Codex GO after 5 NO-GO rounds)
+- [x] 5a: Checkout `custom_text.submit` states the renewal terms read from the Stripe Price
+      (amount, currency, cadence), the monthly lookup allowance, and the per-unit overage only when
+      a metered Price is on the session. No claim about cancellation timing.
+      - A Stripe read failure or the wrong Price kind (usage_type, scheme, no amount) fails closed (503).
+      - A catalog mismatch pages ops, hourly re-sent per Price.
+      - Reads happen before the per-user lock.
+- [x] 5b: the four `charge.dispute.*` lifecycle events page ops post-commit (ids, amount JPY-safe,
+      reason, status; no PII). Cooldown keyed by event + dispute. No entitlement change.
+- [x] 5c (FE): the plan-change dialog was FALSE ("Stripe credits the unused part"). It now states
+      three cases, matching `_plan_change_billing` and the anchor rules:
+      - same-cycle upgrade: prorated now;
+      - downgrade: no credit; allowances run to the monthly reset;
+      - cycle switch: billed today; credit only when the new plan is the same size or bigger.
+
+      It also states the renewal terms. Annual is offered only with its amount. The overage
+      sentence is narrowed.
+- [x] The dialog's price is binding:
+      - change-plan requires `expected_price`;
+      - a missing value returns 409 price_unconfirmed, a stale one 409 price_changed;
+      - change-plan verifies the Price strictly (a catalog mismatch is refused, not charged);
+      - the overage Price is validated.
+- Verified: 562 tests across every billing, stripe, checkout, plan, promo, entitlement and webhook
+  suite; FE tsc, eslint, 130 unit tests, build.
+- Not done: 5c-reproduction of the annual-downgrade forfeiture needs a Stripe TEST-mode key and an
+  owner policy decision (credit, forfeit, or defer to period end). The dialog is truthful about
+  today's behaviour meanwhile.
+- Owner (live Stripe dashboard):
+  - subscribe the webhook to the 4 dispute events;
+  - set the Terms URL if consent_collection is wanted;
+  - verify the Customer Portal allows cancellation, and its timing.
+- Rollout: BE then FE. Between the two deploys an old-frontend tab gets 409 on plan switch; no
+  money moves.
 
 ## Phase 6: data-subject rights for non-customers (design first, then ≤5-file slices)
 - [ ] Design doc + Codex consult: intake (form + mailbox), verification, `privacy_requests` table, person-level

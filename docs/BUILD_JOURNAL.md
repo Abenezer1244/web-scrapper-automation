@@ -19,6 +19,53 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-11-04 — Checkout and billing disclosures (compliance Phase 5, local only)
+
+**Built / Shipped (local branches, nothing pushed):**
+- Stripe Checkout shows the renewal terms read from the Stripe Price itself.
+- Disputes page ops.
+- The plan-change dialog is truthful per direction and states the renewal terms.
+- The dialog's price is binding: `expected_price` is required, so a changed price gets 409 instead of a charge.
+
+**Tried / Decided:**
+- The disclosure first came from the catalog. Codex: Checkout bills the Stripe Price, so read that.
+- A catalog mismatch pages ops. Checkout still sells (its page shows Stripe's real amount); change-plan
+  refuses (its dialog quotes the catalog).
+
+**Failed / Blocked:**
+- Five Codex NO-GO rounds, each narrowing the gap:
+  - catalog vs Stripe;
+  - usage_type;
+  - reads inside the lock;
+  - interval drift;
+  - alert flood;
+  - the change-plan metered Price;
+  - the stale dialog price;
+  - an optional expected_price.
+- My commit message claimed the dedupe still wrote durable rows. It did not. Codex caught it; now
+  hourly re-send.
+- The annual-downgrade forfeiture is still unresolved: it needs a Stripe test key and an owner policy.
+
+**Caught & fixed:**
+- The plan-change dialog told every customer that unused time is credited, which is false for
+  downgrades (proration none).
+- An annual Price id with no amount would buy annual while stating monthly terms.
+
+**Pending / Handoff:**
+- Owner, in the live Stripe dashboard:
+  - subscribe to the dispute events;
+  - check the portal's cancellation setting;
+  - Terms URL;
+  - downgrade policy.
+- The BE deploys before the FE.
+
+**Facts learned:**
+- `/billing/plans` is cached 30 s in the FE, so a displayed price must be confirmed server-side.
+- Stripe zero-decimal currencies need `_format_money`.
+- Change-plan tests must stub `stripe.Price.retrieve`.
+
+---
+
 ## 2026-11-04 — CAN-SPAM opt-out for commercial email (compliance Phase 4, local only)
 
 **Built / Shipped (local branch `audit/compliance-2026-11`, nothing pushed):**

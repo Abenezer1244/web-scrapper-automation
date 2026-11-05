@@ -129,3 +129,16 @@ async def test_an_alerting_failure_never_fails_the_webhook(client, db, monkeypat
         assert r.status_code == 200  # the ledger committed; Stripe must not retry
     finally:
         await _cleanup(db, event["id"])
+
+
+async def test_a_zero_decimal_currency_is_not_divided_by_100(client, db, alerts):
+    event = _event("charge.dispute.created")
+    event["data"]["object"].update(amount=1234, currency="jpy")
+    payload, sig = _signed(event)
+    try:
+        r = await client.post("/billing/webhook", content=payload,
+                              headers={"stripe-signature": sig})
+        assert r.status_code == 200
+        assert "1,234 JPY" in alerts[0][2] and "12.34" not in alerts[0][2]
+    finally:
+        await _cleanup(db, event["id"])

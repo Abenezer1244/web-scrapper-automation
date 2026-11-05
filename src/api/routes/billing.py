@@ -842,37 +842,116 @@ _SKIP_TRACE_METERED_PRICE: dict[str, dict[str, str]] = {
 }
 
 
-def _renewal_terms(plan_id: str, interval: str, metered: bool) -> str:
-    """The automatic-renewal disclosure shown above Checkout's pay button.
+# Stripe's zero-decimal currencies: amounts are already whole units.
+# https://docs.stripe.com/currencies#zero-decimal
+_ZERO_DECIMAL_CURRENCIES = frozenset({
+    "bif", "clp", "djf", "gnf", "jpy", "kmf", "krw", "mga", "pyg", "rwf", "ugx", "vnd",
+    "vuv", "xaf", "xof", "xpf",
+})
+
+
+def _format_money(amount_minor: int, currency: str) -> str:
+    """A Stripe amount (minor units) as readable money, e.g. '$1,910.00 USD'."""
+    code = (currency or "").lower()
+    if code in _ZERO_DECIMAL_CURRENCIES:
+        value = f"{amount_minor:,}"
+    else:
+        value = f"{amount_minor / 100:,.2f}"
+    return f"${value} USD" if code == "usd" else f"{value} {code.upper()}"
+
+
+def _stripe_price_terms(price_id: str) -> dict:
+    """What Stripe will actually charge for one Price: amount, currency, cadence.
+
+    Read from Stripe, not the catalog: Checkout bills the configured Price, so the
+    disclosure must describe that Price (Codex review, Phase 5). Raises on a Stripe
+    error; the caller fails the checkout closed rather than disclose a guess.
+    """
+    price = stripe.Price.retrieve(price_id)
+    recurring = price.get("recurring") or {}
+    return {
+        "unit_amount": price.get("unit_amount"),
+        "currency": str(price.get("currency") or "").lower(),
+        "interval": recurring.get("interval"),
+        "interval_count": int(recurring.get("interval_count") or 1),
+        "per_unit": price.get("billing_scheme", "per_unit") == "per_unit",
+    }
+
+
+def _renewal_terms(
+    plan_name: str,
+    base: dict,
+    included_lookups: int,
+    overage: dict | None,
+) -> str:
+    """The automatic-renewal disclosure shown above Checkout's pay button. Pure.
 
     ROSCA (15 U.S.C. 8403) requires the material terms of a negative-option sale to
-    be clear before billing (compliance audit 2026-11, Phase 5; Codex consult). Read
-    from the same catalog and rates Stripe bills from, never typed here. States only
-    what the code can vouch for: no cancellation timing (the live Customer Portal
-    decides it) and no overage invoice timing (that is Stripe price configuration).
-    The overage rate appears only when a metered item is actually on the session.
+    be clear before billing (compliance audit 2026-11, Phase 5; Codex consult).
+    ``base`` and ``overage`` are _stripe_price_terms() of the plan Price and of the
+    metered Price on the session (None when none is). States only what the code can
+    vouch for: no cancellation timing (the live Customer Portal decides it) and no
+    overage invoice timing. The overage rate appears only for a per-unit metered
+    Price that is actually on the session.
     """
-    from src.config.lookup_pricing import unit_price_cents
-    from src.config.plans import get_plan
-
-    plan = get_plan(plan_id)
-    annual = interval == "year"
-    amount = plan["price_annual"] if annual else plan["price_monthly"]
+    count, unit = base["interval_count"], base["interval"]
+    cadence = unit if count == 1 else f"{count} {unit}s"
     parts = [
-        f"Your {plan['name']} plan renews automatically every "
-        f"{'year' if annual else 'month'} for ${amount:,} USD until you cancel or the "
-        "subscription otherwise ends.",
+        f"Your {plan_name} plan renews automatically every {cadence} for "
+        f"{_format_money(base['unit_amount'], base['currency'])} until you cancel or "
+        "the subscription otherwise ends.",
         "An accepted promotion code reduces only the invoices its terms cover.",
     ]
-    included = settings.SKIP_TRACE_BUNDLED_QUOTAS.get(plan_id, 0)
-    cents = unit_price_cents(plan_id)
-    if included:
-        lookups = f"It includes {included:,} contact lookups each month"
-        if metered and cents:
-            lookups += f"; additional lookups cost ${cents / 100:.2f} USD each"
+    if included_lookups:
+        lookups = f"It includes {included_lookups:,} contact lookups each month"
+        if overage and overage["per_unit"] and overage["unit_amount"] is not None:
+            lookups += ("; additional lookups cost "
+                        f"{_format_money(overage['unit_amount'], overage['currency'])} each")
         parts.append(lookups + ".")
     parts.append("To cancel, open Billing in your BridgeLeads settings.")
     return " ".join(parts)
+
+
+def _checkout_renewal_terms(plan_id: str, price_id: str, metered_price: str | None) -> str:
+    """Build the Checkout disclosure from the Prices Stripe will charge.
+
+    A Stripe read failure, or a plan Price that is not a plain recurring per-unit
+    amount, fails the checkout closed (503): selling without telling the customer
+    what renews is the thing this exists to prevent. A Price that disagrees with the
+    catalog the website quotes still sells (the disclosure states Stripe's real
+    amount) but pages ops, because the pricing page is then wrong.
+    """
+    from src.config.plans import get_plan
+
+    plan = get_plan(plan_id)
+    try:
+        base = _stripe_price_terms(price_id)
+        overage = _stripe_price_terms(metered_price) if metered_price else None
+    except stripe.error.StripeError as exc:
+        _logger.error("checkout: could not read Price %s from Stripe (%s)",
+                      price_id, type(exc).__name__)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Billing is temporarily unavailable. Please try again later.",
+        ) from exc
+    if (not isinstance(base["unit_amount"], int) or not base["per_unit"]
+            or base["interval"] not in ("day", "week", "month", "year")):
+        _logger.error("checkout: Price %s is not a plain recurring amount; refusing", price_id)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Billing is temporarily unavailable. Please try again later.",
+        )
+    annual = base["interval"] == "year" and base["interval_count"] == 1
+    expected = (plan["price_annual"] if annual else plan["price_monthly"]) * 100
+    if base["unit_amount"] != expected or base["currency"] != "usd":
+        _alert_billing_gap(
+            "Stripe Price disagrees with the plan catalog the website quotes",
+            f"price_catalog_mismatch:{price_id}",
+            price_id=price_id, plan=plan_id, stripe_amount=base["unit_amount"],
+            stripe_currency=base["currency"], catalog_amount=expected,
+        )
+    included = settings.SKIP_TRACE_BUNDLED_QUOTAS.get(plan_id, 0)
+    return _renewal_terms(plan["name"], base, included, overage)
 
 
 def _metered_skip_trace_price(plan: str, interval: str) -> str | None:
@@ -1222,6 +1301,8 @@ async def create_checkout(
         if metered_price:
             line_items.append({"price": metered_price})
 
+        renewal_terms = _checkout_renewal_terms(_plan_id, stripe_price_id, metered_price)
+
         session = stripe.checkout.Session.create(
             customer=customer_id,
             mode="subscription",
@@ -1242,8 +1323,7 @@ async def create_checkout(
             # single-customer promotion note above).
             allow_promotion_codes=True,
             # The renewal terms, above the pay button (ROSCA clear disclosure).
-            custom_text={"submit": {"message": _renewal_terms(
-                _plan_id, _interval, metered=bool(metered_price))}},
+            custom_text={"submit": {"message": renewal_terms}},
         )
 
         # Defense in depth for the one window the checks above leave: a Session
@@ -1837,7 +1917,8 @@ async def stripe_webhook(
       - customer.subscription.updated   → upgrades / downgrades / cancellation
       - customer.subscription.deleted   → downgrade to starter
       - invoice.payment_failed          → start the dunning grace + notify
-      - charge.dispute.*                → page ops (created, closed, funds moved)
+      - charge.dispute.created / .closed / .funds_withdrawn / .funds_reinstated
+                                        → page ops; access unchanged
 
     Recovery from dunning arrives as customer.subscription.updated (past_due ->
     active); invoice.payment_succeeded is deliberately not handled.
@@ -2021,8 +2102,10 @@ def _dispute_alert(event_type: str, dispute: dict) -> Callable[[], None]:
     charge = dispute.get("charge")
     charge_id = charge.get("id") if isinstance(charge, dict) else charge
     amount = dispute.get("amount")
-    currency = str(dispute.get("currency") or "").upper()
-    money = f"{amount / 100:,.2f} {currency}" if isinstance(amount, int) else "unknown amount"
+    # Minor units, and not always cents: JPY and other zero-decimal currencies
+    # are already whole units (Codex review).
+    money = (_format_money(amount, str(dispute.get("currency") or ""))
+             if isinstance(amount, int) else "unknown amount")
     step = event_type.removeprefix("charge.dispute.").replace("_", " ")
     subject = f"Stripe dispute {step}: {money}"
     body = (

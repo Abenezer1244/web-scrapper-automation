@@ -894,8 +894,29 @@ async def test_a_duplicate_delivery_while_the_first_holds_the_event_lock_gets_40
 
 # ─── Checkout: codes for everyone, one subscription per customer ──────────────
 
+def _stub_catalog_prices(monkeypatch, billing):
+    """Stripe.Price.retrieve answers as a correctly configured account would: each
+    plan Price at its catalog amount and interval, any other (metered) Price at the
+    plan's per-lookup rate. create_checkout now reads these for its disclosure."""
+    from src.config.plans import get_plan
+
+    def _retrieve(pid, **kw):
+        if pid in billing._PRICE_TO_PLAN:
+            plan_id, _limit, interval = billing._PRICE_TO_PLAN[pid]
+            plan = get_plan(plan_id)
+            amount = (plan["price_annual"] if interval == "year" else plan["price_monthly"]) * 100
+        else:
+            interval, amount = ("year" if "year" in pid or pid.endswith("_y") else "month"), 8
+        return {"id": pid, "unit_amount": amount, "currency": "usd",
+                "billing_scheme": "per_unit",
+                "recurring": {"interval": interval, "interval_count": 1}}
+
+    monkeypatch.setattr(billing.stripe.Price, "retrieve", _retrieve)
+
+
 def _patch_checkout(monkeypatch, b, *, created, subscription_reads=None, expired=None):
     reads = iter(subscription_reads or [])
+    _stub_catalog_prices(monkeypatch, b)
 
     def _subs(**kw):
         return _List(next(reads, []))

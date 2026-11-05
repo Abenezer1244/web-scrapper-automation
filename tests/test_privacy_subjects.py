@@ -197,6 +197,23 @@ def test_a_weak_part_beside_a_strong_entity_is_not_swallowed():
         (KIND_UNRESOLVED, ENTITY_OR_PERSON), (KIND_ENTITY, None)]
 
 
+def test_a_mixed_cell_part_gets_its_own_tail_cleanup_and_capacity():
+    # Codex round 4: the part's role tail was missed after the split.
+    subs = _subs("SMITH JOHN TTEE & ACME LLC", REC)
+    assert [(s.kind, s.surname, s.given, s.capacity) for s in subs] == [
+        (KIND_PERSON, "smith", "john", "fiduciary"), (KIND_ENTITY, None, None, None)]
+    subs = _subs("JOHNSON WILLIAM EST OF & ACME LLC", REC)
+    assert (subs[0].kind, subs[0].capacity, subs[0].surname) == (
+        KIND_PERSON, "estate", "johnson")
+    # The enclosing party's estate prefix still applies to the part, with the same
+    # recorder rule: after 'ESTATE OF' only the comma form reads.
+    subs = _subs("ESTATE OF SMITH JOHN & ACME LLC", REC)
+    assert (subs[0].kind, subs[0].capacity) == (KIND_UNRESOLVED, "estate")
+    subs = _subs("ESTATE OF JOHN SMITH AND ACME HOLDINGS LLC", NAT)
+    assert (subs[0].kind, subs[0].capacity, subs[0].surname) == (
+        KIND_PERSON, "estate", "smith")
+
+
 def test_a_cell_with_no_strong_part_goes_to_review_whole():
     (sub,) = _subs("CHURCH JOHN & BANK JANE", REC)
     assert sub.review_reason == ENTITY_OR_PERSON and subject_key_values(sub) == []

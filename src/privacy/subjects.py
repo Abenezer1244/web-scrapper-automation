@@ -129,6 +129,10 @@ _PERSON_ROLE_RE = re.compile(
 )
 _HARD_ENTITY_WORDS = _COMPANY_WORDS | _TRUST_WORDS | _GOVERNMENT_WORDS
 # 'ET AL' / 'ET UX' / 'ET VIR' add other people; the named person is still named.
+# A joiner left hanging at either end once a co-owner's marker was stripped
+# ('SMITH JOHN & ESTATE OF' -> 'SMITH JOHN &').
+_DANGLING_JOINER_RE = re.compile(r"^\s*(?:[&/\\+]|AND\b)\s*|\s*(?:[&/\\+]|\bAND)\s*$",
+                                 re.IGNORECASE)
 _ET_AL_RE = re.compile(r"\s+(?:ET\s*(?:AL|UX|VIR)|ETAL|ETUX)\b\.?", re.IGNORECASE)
 # Broader than the export's prefix: probate cells also write 'EST OF JANE DOE'.
 _ESTATE_PREFIX_RE = re.compile(r"^(?:THE\s+)?EST(?:ATE)?\.?\s+OF(?:\s+|$)", re.IGNORECASE)
@@ -240,6 +244,19 @@ def _entity_strength(text: str, cell_len: int) -> str | None:
     return "weak" if _is_weak_entity(text) else "strong"
 
 
+def _part_strength(cleaned: str, cell_len: int) -> str | None:
+    """_entity_strength for one cleaned co-owner part. Empty text, or a role word
+    with no hard entity word ('HEIRS OF'), is None: that part re-enters the party
+    pipeline and lands in review instead of being typed an org by its OF."""
+    if not _words(cleaned):
+        return None
+    hard = (set(_words(cleaned)) & _HARD_ENTITY_WORDS
+            or _SPACED_ENTITY_RE.search(cleaned.upper()))
+    if _PERSON_ROLE_RE.search(cleaned) and not hard:
+        return None
+    return _entity_strength(cleaned, cell_len)
+
+
 def _clean_party(party: str) -> tuple[str, str | None, bool]:
     """(text without care-of/alias/estate/role/et-al markers, capacity, had an
     'ESTATE OF' prefix). The export's cleanup, plus capacity kept, not discarded."""
@@ -266,25 +283,46 @@ def _party_subjects(
     enclosing party's capacity and estate prefix, so a part's own tails ('SMITH
     JOHN TTEE & ACME LLC') get exactly the cleanup a standalone party gets.
     """
-    def unresolved(reason: str, text: str | None = None, **extra) -> Subject:
-        # Reads `party` at call time: the cleaned text, not the cell as it arrived.
-        return Subject(**base, kind=KIND_UNRESOLVED,
-                       text=normalize_text(party if text is None else text),
-                       review_reason=reason, **extra)
-
     as_given = party
     party, capacity, has_prefix = _clean_party(party)
-    capacity = capacity or outer_capacity
     has_prefix = has_prefix or outer_prefix
+    orphan = _DANGLING_JOINER_RE.search(party)
+    if orphan:
+        # A co-owner that was nothing but a marker ('SMITH JOHN & ESTATE OF'): the
+        # marker belonged to that missing co-owner, not to the rest, so its
+        # capacity is not passed on, and the orphan itself goes to review.
+        party = _DANGLING_JOINER_RE.sub("", party).strip()
+        capacity = "estate" if has_prefix else None
+    capacity = capacity or outer_capacity
     if not _words(party):
         # Nothing left once markers are stripped ('ESTATE OF'): still a review
         # item, never silently dropped (Codex).
-        return [unresolved(UNREADABLE_IN_ORDER, as_given, capacity=capacity)]
+        return [Subject(**base, kind=KIND_UNRESOLVED, text=normalize_text(as_given),
+                        review_reason=UNREADABLE_IN_ORDER, capacity=capacity)]
+    subjects = _classify_party(party, raw_len, base, capacity, has_prefix)
+    if orphan:
+        subjects.append(Subject(**base, kind=KIND_UNRESOLVED, text=normalize_text(as_given),
+                                review_reason=UNREADABLE_IN_ORDER))
+    return subjects
+
+
+def _classify_party(
+    party: str, raw_len: int, base: dict, capacity: str | None, has_prefix: bool
+) -> list[Subject]:
+    """Entity, person(s) or review for one CLEANED party."""
+    def unresolved(reason: str, text: str | None = None) -> Subject:
+        return Subject(**base, kind=KIND_UNRESOLVED,
+                       text=normalize_text(party if text is None else text),
+                       review_reason=reason, capacity=capacity)
+
+    def entity(text: str) -> Subject:
+        return Subject(**base, kind=KIND_ENTITY, text=normalize_text(text),
+                       entity_type=_entity_type(text))
 
     hard_entity = (bool(set(_words(party)) & _HARD_ENTITY_WORDS)
                    or bool(_SPACED_ENTITY_RE.search(party.upper())))
     if _PERSON_ROLE_RE.search(party) and not hard_entity:
-        return [unresolved(ROLE_OR_CAPACITY, capacity=capacity)]
+        return [unresolved(ROLE_OR_CAPACITY)]
     order = base["name_order"]
     if has_prefix:
         # Same rule as the export: a recorder source writes BOTH orders after
@@ -301,34 +339,29 @@ def _party_subjects(
         # EVERY part is an entity ('WSDOT R/E SERVICES') stays one entity. Beside a
         # strong entity part, every other part is judged on its own; with no strong
         # part at all, the evidence spans the joiner and the cell goes to review.
-        # Judged on each part's CLEANED text: 'JOHNSON WILLIAM EST OF' is a person
-        # once its estate tail goes, not an organization by its OF.
-        strengths = [_entity_strength(_clean_party(p)[0] or p,
-                                      raw_len if i == len(parts) - 1 else len(p))
-                     for i, p in enumerate(parts)]
+        # Parts are judged, and entities keyed, on CLEANED text: 'JOHNSON WILLIAM
+        # EST OF' is a person once its tail goes, 'ACME LLC TTEE' keys as 'acme llc'.
+        cleaned = [_clean_party(p)[0] for p in parts]
+        strengths = [_part_strength(c, raw_len if i == len(parts) - 1 else len(c))
+                     for i, c in enumerate(cleaned)]
         if all(s == "strong" for s in strengths):
-            return [Subject(**base, kind=KIND_ENTITY, text=normalize_text(party),
-                            entity_type=_entity_type(party))]
+            return [entity(party)]
         if "strong" not in strengths:
-            return [unresolved(ENTITY_OR_PERSON, capacity=capacity)]
+            return [unresolved(ENTITY_OR_PERSON)]
         out: list[Subject] = []
-        for part, part_strength in zip(parts, strengths, strict=True):
+        for part, clean, part_strength in zip(parts, cleaned, strengths, strict=True):
             if part_strength == "strong":
-                out.append(Subject(**base, kind=KIND_ENTITY, text=normalize_text(part),
-                                   entity_type=_entity_type(part)))
-            elif part_strength == "weak":
-                out.append(unresolved(ENTITY_OR_PERSON, part, capacity=capacity))
+                out.append(entity(clean))
             else:
-                # The full party pipeline again (tails, roles, capacity), never a
-                # shortcut into the name reader. A part has no joiner left, so
-                # this re-entry cannot split again.
+                # Weak, person-like or empty: the full party pipeline again (tails,
+                # roles, capacity, review), never a shortcut. A part has no joiner
+                # left, so this re-entry cannot split again.
                 out.extend(_party_subjects(part, len(part), base, capacity, has_prefix))
         return out
     if strength == "weak":
-        return [unresolved(ENTITY_OR_PERSON, capacity=capacity)]
+        return [unresolved(ENTITY_OR_PERSON)]
     if strength == "strong":
-        return [Subject(**base, kind=KIND_ENTITY, text=normalize_text(party),
-                        entity_type=_entity_type(party))]
+        return [entity(party)]
     return _guarded_people(parts, party, order, base, capacity)
 
 

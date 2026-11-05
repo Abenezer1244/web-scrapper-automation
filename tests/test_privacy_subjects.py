@@ -214,6 +214,33 @@ def test_a_mixed_cell_part_gets_its_own_tail_cleanup_and_capacity():
         KIND_PERSON, "estate", "smith")
 
 
+def test_a_weak_mixed_part_keeps_its_capacity():
+    subs = _subs("CHURCH JOHN TTEE & ACME LLC", REC)
+    assert [(s.kind, s.review_reason, s.capacity) for s in subs] == [
+        (KIND_UNRESOLVED, ENTITY_OR_PERSON, "fiduciary"), (KIND_ENTITY, None, None)]
+
+
+def test_a_mixed_entity_part_is_keyed_by_its_cleaned_name():
+    # Standalone 'ACME LLC TTEE' keys as 'acme llc'; inside a mixed cell it must too.
+    assert _keys("ACME LLC TTEE", REC) == [("entity", "acme llc")]
+    assert ("entity", "acme llc") in _keys("SMITH JOHN & ACME LLC TTEE & DOE JANE", REC)
+
+
+@pytest.mark.parametrize("raw", ["ESTATE OF & ACME LLC", "HEIRS OF & ACME LLC"])
+def test_a_marker_only_mixed_part_is_review_not_an_entity(raw):
+    subs = _subs(raw, REC)
+    assert sorted((s.kind, s.text) for s in subs if s.kind == KIND_ENTITY) == [
+        (KIND_ENTITY, "acme llc")]
+    assert [s.kind for s in subs].count(KIND_UNRESOLVED) == 1
+
+
+@pytest.mark.parametrize("raw", ["SMITH JOHN & ESTATE OF", "SMITH JOHN AND HEIRS OF"])
+def test_an_orphan_marker_co_owner_is_reviewed_and_not_attributed(raw):
+    subs = _subs(raw, REC)
+    assert [(s.kind, s.capacity, s.review_reason) for s in subs] == [
+        (KIND_PERSON, None, None), (KIND_UNRESOLVED, None, UNREADABLE_IN_ORDER)]
+
+
 def test_a_cell_with_no_strong_part_goes_to_review_whole():
     (sub,) = _subs("CHURCH JOHN & BANK JANE", REC)
     assert sub.review_reason == ENTITY_OR_PERSON and subject_key_values(sub) == []

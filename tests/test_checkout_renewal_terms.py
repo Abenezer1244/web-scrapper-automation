@@ -81,7 +81,7 @@ def stripe_prices(monkeypatch):
     monkeypatch.setattr(billing.stripe.Price, "retrieve", lambda pid, **kw: prices[pid])
     monkeypatch.setattr(billing, "_alert_billing_gap",
                         lambda reason, key, **ctx: alerts.append((key, ctx)))
-    monkeypatch.setattr(billing, "_CATALOG_MISMATCH_ALERTED", set())
+    monkeypatch.setattr(billing, "_CATALOG_MISMATCH_LAST_SENT", {})
     return prices, alerts
 
 
@@ -173,3 +173,15 @@ def test_change_plans_overage_price_must_be_metered_per_unit(stripe_prices, bad)
     with pytest.raises(HTTPException) as exc:
         billing._verified_metered_price("price_metered", route="change-plan")
     assert exc.value.status_code == 503
+
+
+def test_a_persisting_mismatch_is_re_recorded_hourly_not_on_every_purchase(stripe_prices):
+    prices, alerts = stripe_prices
+    prices.update(price_plan=_stripe_price(24900))
+    billing._checkout_renewal_terms("pro", "price_plan", "month", None)
+    billing._checkout_renewal_terms("pro", "price_plan", "month", None)
+    assert len(alerts) == 1  # within the hour: logged, not re-sent
+    # An hour later the persisting mismatch is sent (and durably recorded) again.
+    billing._CATALOG_MISMATCH_LAST_SENT["price_plan"] -= billing._CATALOG_MISMATCH_RESEND_SECONDS + 1
+    billing._checkout_renewal_terms("pro", "price_plan", "month", None)
+    assert len(alerts) == 2

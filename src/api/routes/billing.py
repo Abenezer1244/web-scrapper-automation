@@ -1,13 +1,14 @@
 """Stripe billing routes: checkout, portal, webhooks, plans, usage."""
 
 import asyncio
+import time
 from collections.abc import Callable
 from datetime import UTC, datetime
 from functools import partial
 
 import stripe
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Request, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import select, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -931,9 +932,13 @@ def _read_price(price_id: str, *, route: str) -> dict:
         raise _billing_unavailable() from exc
 
 
-# One catalog-mismatch page per Price per process: the alert's Redis cooldown fails
-# open, so without this a persistent misconfiguration would page on every purchase.
-_CATALOG_MISMATCH_ALERTED: set[str] = set()
+# A catalog mismatch is sent through send_ops_alert (which pages AND writes a durable
+# row) at most once an hour per Price per process. Its own Redis cooldown fails open,
+# so without this a persistent misconfiguration during a Redis outage would page on
+# every purchase; with it, a mismatch that persists still leaves an hourly durable
+# record, and every occurrence in between is logged at ERROR (Codex review).
+_CATALOG_MISMATCH_RESEND_SECONDS = 3600
+_CATALOG_MISMATCH_LAST_SENT: dict[str, float] = {}
 
 
 def _verified_plan_price(
@@ -964,8 +969,13 @@ def _verified_plan_price(
     expected = (plan["price_annual"] if interval == "year" else plan["price_monthly"]) * 100
     mismatch = (base["unit_amount"] != expected or base["currency"] != "usd"
                 or base["interval"] != interval or base["interval_count"] != 1)
-    if mismatch and price_id not in _CATALOG_MISMATCH_ALERTED:
-        _CATALOG_MISMATCH_ALERTED.add(price_id)
+    now = time.monotonic()
+    last = _CATALOG_MISMATCH_LAST_SENT.get(price_id)
+    if mismatch and last is not None and now - last < _CATALOG_MISMATCH_RESEND_SECONDS:
+        _logger.error("%s: Price %s still disagrees with the catalog (alerted %.0fs ago)",
+                      route, price_id, now - last)
+    elif mismatch:
+        _CATALOG_MISMATCH_LAST_SENT[price_id] = now
         _alert_billing_gap(
             "Stripe Price disagrees with the plan catalog the website quotes",
             f"price_catalog_mismatch:{price_id}",
@@ -1651,6 +1661,11 @@ def _no_subscription_conflict() -> HTTPException:
 
 class ChangePlanRequest(BaseModel):
     price_id: str
+    # The renewal amount (whole USD) the switch dialog SHOWED. When given, the switch
+    # is refused with 409 price_changed if the plan's price is no longer that, so a
+    # customer is never charged an amount they were not shown (compliance audit
+    # 2026-11, Phase 5c). Optional so an older frontend keeps working.
+    expected_price: int | None = Field(default=None, ge=0)
 
 
 @router.post("/change-plan")
@@ -1698,8 +1713,17 @@ async def change_plan(
     new_plan, _limit, new_interval = _PRICE_TO_PLAN[stripe_price_id]
     # The switch dialog quotes this plan's catalog price: check it against the
     # Stripe Price that will be charged, before the per-user lock (Codex, Phase 5).
-    _verified_plan_price(new_plan, stripe_price_id, new_interval, route="change-plan",
-                         strict=True)
+    verified = _verified_plan_price(new_plan, stripe_price_id, new_interval,
+                                    route="change-plan", strict=True)
+    if body.expected_price is not None and body.expected_price * 100 != verified["unit_amount"]:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "price_changed",
+                "message": "The price of this plan has changed. Reload Billing to see "
+                           "the current price before switching.",
+            },
+        )
     # The overage Price _plan_change_items will attach, checked the same way.
     _target_metered = _metered_skip_trace_price(new_plan, new_interval)
     if _target_metered:

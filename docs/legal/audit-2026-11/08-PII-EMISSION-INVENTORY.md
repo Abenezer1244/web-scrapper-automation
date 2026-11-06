@@ -94,6 +94,13 @@ args. Dormant until `SENTRY_DSN` is set (and must be disclosed first). Nothing t
 - `.gitignore` now ignores the root-level JSONL reports the scripts above write by default
   (named patterns, so a deliberate JSONL file elsewhere is not hidden) and `test11_dq.json`. A
   report holding names and addresses cannot be committed by accident. None was tracked.
+  Checked with `git check-ignore` against every default name: `assumed_mailing_backfill_*`,
+  `pierce_mailing_backfill_*`, `pierce_cv_owner_*`, `situs_parts_backfill_*`, `repair_*`
+  (incl. `repair_probate_*`, `repair_pacs_mailing_*`, `repair_king_property_situs_*`),
+  `requeue_*` (GIS mailing, King tax owner), `stranded_claims_*`, the two fixed absentee
+  reports, and every `king_*` report (CV mailing/owner, RP account, tax bill, tax repair) via
+  the existing `/king_*` rule. A path the operator passes with `--report` / `--journal` /
+  `--backup` is the operator's choice and is not covered.
 
 ## Open (owner decisions, before suppression activation in P7)
 

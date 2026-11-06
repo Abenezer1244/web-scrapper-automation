@@ -145,3 +145,38 @@ async def test_a_lead_without_its_owners_config_is_withdrawn_while_rules_are_act
     _rules(monkeypatch, _active_rule(parcel="9999999999", name="ROE RICK Q"))
     _dispatch()
     assert _pending_status(pid) == "cancelled"
+
+
+async def test_a_lead_on_another_tenants_job_is_withdrawn_while_rules_are_active(
+    business_user, starter_user, monkeypatch,
+):
+    """Corrupt pairing: the lead (tenant A) sits on tenant B's job and config. The
+    config is B's, so it must not lend the lead B's county: withdrawn, not bought."""
+    from sqlalchemy import text
+
+    from src.db.session import system_sync_session
+
+    rid, pid = _lead_queued(business_user.id, 7)
+    stranger_job = _run(starter_user.id, skip_on=True, status="done")
+    with system_sync_session() as db:
+        db.execute(text("UPDATE results SET job_id = :j WHERE id = :r"),
+                   {"j": stranger_job, "r": rid})
+        db.execute(text("UPDATE pending_skip_trace_rows SET job_id = :j WHERE id = :p"),
+                   {"j": stranger_job, "p": pid})
+        db.commit()
+    snapshot = build_snapshot(_active_rule(parcel="9999999999", name="ROE RICK Q"))
+    # The tick's candidate query is tenant-pinned, so the row is never even selected.
+    _rules(monkeypatch, _active_rule(parcel="9999999999", name="ROE RICK Q"))
+    _dispatch()
+    assert _pending_status(pid) == "queued"
+    # And the partition, defence in depth, would withdraw it rather than lend it
+    # tenant B's county.
+    from types import SimpleNamespace
+
+    from src.workers.skip_trace_dispatcher import _partition_still_deliverable
+
+    row = SimpleNamespace(id=pid, result_id=rid, user_id=business_user.id)
+    with system_sync_session() as db:
+        keep, drop, later = _partition_still_deliverable(db, [row], snapshot)
+        db.rollback()
+    assert (keep, drop, later) == ([], [row], 0)

@@ -1429,10 +1429,13 @@ def _partition_still_deliverable(db, rows: list, snapshot) -> tuple[list, list, 
             ScraperConfig.state,
         )
         .join(Job, Job.id == Result.job_id)
-        # Owner-matched; outer so a lead without one is still seen and decided
-        # (withdrawn while any rule is active, below).
+        # The config is read only if BOTH it and the job belong to the lead's own
+        # tenant; outer so a lead without such a config is still seen and decided
+        # (withdrawn while any rule is active, below). A corrupt cross-tenant job
+        # therefore never lends the lead another tenant's county.
         .outerjoin(ScraperConfig, (ScraperConfig.id == Job.scraper_config_id)
-                   & (ScraperConfig.user_id == Job.user_id))
+                   & (ScraperConfig.user_id == Result.user_id)
+                   & (Job.user_id == Result.user_id))
         .where(
             tuple_(Result.id, Result.user_id).in_(
                 [(r.result_id, r.user_id) for r in rows]

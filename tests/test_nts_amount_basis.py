@@ -171,3 +171,62 @@ def test_matched_leads_carry_and_follow_their_notice_basis():
             db.execute(delete(ScraperConfig).where(ScraperConfig.id == cid))
             db.execute(delete(User).where(User.id == uid))
             db.commit()
+
+
+def test_an_older_issue_never_labels_an_amount_it_did_not_supply():
+    """Legacy row: amount from a newer issue, basis unknown. An older issue with a
+    different, labelled figure must not lend its basis to the retained amount; when
+    the stored amount is missing, the older issue supplies amount and basis together."""
+    url = "https://h/static/QA%20Legals%20{}.pdf"
+    tag = uuid.uuid4().hex[:8]
+    base = {"source": "queen_anne_news", "county": "king", "state": "WA", "is_active": True,
+            "auction_date": date.today() + timedelta(days=20)}
+    kept, filled = f"TEST-PAIR-{tag}-a", f"TEST-PAIR-{tag}-b"
+    try:
+        _upsert({**base, "ts_number": kept, "source_url": url.format("10-21-26"),
+                 "fetched_at": datetime.now(UTC), "principal_owing": Decimal("575150.38")})
+        older = _upsert({**base, "ts_number": kept, "source_url": url.format("9-30-26"),
+                         "fetched_at": datetime.now(UTC), "principal_owing": Decimal("500000.00"),
+                         "principal_owing_basis": "principal"})
+        assert (older.principal_owing, older.principal_owing_basis) == (Decimal("575150.38"), None)
+
+        _upsert({**base, "ts_number": filled, "source_url": url.format("10-21-26"),
+                 "fetched_at": datetime.now(UTC), "principal_owing": None,
+                 "principal_owing_basis": None})
+        older = _upsert({**base, "ts_number": filled, "source_url": url.format("9-30-26"),
+                         "fetched_at": datetime.now(UTC), "principal_owing": Decimal("500000.00"),
+                         "principal_owing_basis": "principal"})
+        assert (older.principal_owing, older.principal_owing_basis) == (Decimal("500000.00"), "principal")
+    finally:
+        with SyncSessionLocal() as db:
+            db.execute(delete(NtsNotice).where(NtsNotice.ts_number.like(f"TEST-PAIR-{tag}-%")))
+            db.commit()
+
+
+def test_the_resweep_reaches_a_missing_amount_before_any_unknown_basis():
+    from src.workers.nts_crawler import _RESWEEP_LIMIT, _RESWEEP_SELECT
+
+    tag = uuid.uuid4().hex[:8]
+    source = f"test_resweep_{tag}"
+    soon = date.today() + timedelta(days=5)
+    with SyncSessionLocal() as db:
+        for i in range(_RESWEEP_LIMIT + 1):  # more legacy rows than one run can take, all sooner
+            db.add(NtsNotice(id=str(uuid.uuid4()), source=source, ts_number=f"TEST-RS-{tag}-{i}",
+                             county="pierce", state="WA", auction_date=soon,
+                             principal_owing=Decimal("1.00"), source_url="https://h/x",
+                             is_active=True))
+        db.add(NtsNotice(id=str(uuid.uuid4()), source=source, ts_number=f"TEST-RS-{tag}-amount",
+                         county="pierce", state="WA", auction_date=soon + timedelta(days=30),
+                         principal_owing=None, source_url="https://h/y", is_active=True))
+        db.commit()
+    try:
+        with SyncSessionLocal() as db:
+            picked = [r.ts_number for r in db.execute(_RESWEEP_SELECT, {
+                "source": source, "today": date.today(),
+                "stale_before": datetime.now(UTC), "lim": _RESWEEP_LIMIT}).fetchall()]
+        assert len(picked) == _RESWEEP_LIMIT
+        assert picked[0] == f"TEST-RS-{tag}-amount"
+    finally:
+        with SyncSessionLocal() as db:
+            db.execute(delete(NtsNotice).where(NtsNotice.source == source))
+            db.commit()

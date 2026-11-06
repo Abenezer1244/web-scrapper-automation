@@ -147,10 +147,21 @@ def match_nts_notices() -> dict:
 # pre_foreclosure only: a trustee_sale lead is rebuilt from its frozen nts_source by
 # trustee_sale_finalize on retry, so a refresh there would be silently undone. CSVs
 # already delivered keep the figure they shipped with; the app shows the current one.
+# The amount's basis (migration 128) travels with it in enrichment_data.nts, so it is
+# rewritten only when the notice supplies the amount, and a lead whose amount is
+# unchanged still gains its basis once the notice learns it. A missing or non-object
+# "nts" (or a JSON-null enrichment_data) is rebuilt rather than turned into an array.
 _REFRESH_MATCHED_SQL = """
     UPDATE results r SET
         default_amount = COALESCE(n.principal_owing, r.default_amount),
-        auction_date = n.auction_date
+        auction_date = n.auction_date,
+        enrichment_data = CASE WHEN n.principal_owing IS NULL THEN r.enrichment_data
+            ELSE ((CASE WHEN jsonb_typeof(r.enrichment_data::jsonb) = 'object'
+                        THEN r.enrichment_data::jsonb ELSE '{}'::jsonb END) || jsonb_build_object('nts',
+                CASE WHEN jsonb_typeof(r.enrichment_data::jsonb -> 'nts') = 'object'
+                     THEN r.enrichment_data::jsonb -> 'nts' ELSE '{}'::jsonb END
+                || jsonb_build_object('amount_basis', n.principal_owing_basis)))::json
+            END
     FROM nts_notices n, jobs j, scraper_configs sc
     WHERE r.nts_notice_id = n.id
       AND j.id = r.job_id AND sc.id = j.scraper_config_id
@@ -158,7 +169,9 @@ _REFRESH_MATCHED_SQL = """
       AND n.is_active AND n.auction_date >= :today
       AND (r.auction_date IS DISTINCT FROM n.auction_date
            OR (n.principal_owing IS NOT NULL
-               AND r.default_amount IS DISTINCT FROM n.principal_owing))
+               AND (r.default_amount IS DISTINCT FROM n.principal_owing
+                    OR (r.enrichment_data::jsonb #>> '{nts,amount_basis}')
+                       IS DISTINCT FROM n.principal_owing_basis)))
 """
 
 
@@ -258,7 +271,8 @@ def _match_and_write(
     _COLS = """
             SELECT id, parcel, property_address, property_address_normalized,
                    grantor, auction_date, auction_time, auction_location, trustee,
-                   beneficiary, ts_number, principal_owing, source, source_url
+                   beneficiary, ts_number, principal_owing, principal_owing_basis,
+                   source, source_url
             FROM nts_notices
     """
     live = db.execute(
@@ -434,6 +448,8 @@ def _write_match(
         "source_url": notice.get("source_url"),
         "matched_at": datetime.now(UTC).isoformat(),
         "confidence": confidence,
+        # What default_amount is (migration 128); None = unknown, never "principal".
+        "amount_basis": notice.get("principal_owing_basis"),
     }
     import json
     res = db.execute(
@@ -444,7 +460,9 @@ def _write_match(
                 default_amount = :default_amount,
                 nts_match_confidence = :confidence,
                 nts_notice_id = :notice_id,
-                enrichment_data = COALESCE(enrichment_data, '{}'::json)::jsonb
+                -- JSON null (not SQL NULL) || object would build an array.
+                enrichment_data = (CASE WHEN jsonb_typeof(enrichment_data::jsonb) = 'object'
+                                        THEN enrichment_data::jsonb ELSE '{}'::jsonb END)
                                   || jsonb_build_object('nts', CAST(:nts AS jsonb))
             WHERE id = :rid
               AND (auction_date IS NULL

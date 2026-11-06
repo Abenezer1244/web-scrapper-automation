@@ -74,6 +74,7 @@ async def _seed(db: AsyncSession, user: User) -> str:
         property_city="SEATTLE", property_state="WA", property_zip="98101",
         phone=SEEDED["phone"], phone_type=SEEDED["phone_type"], email=SEEDED["email"],
         auction_date=AUCTION_DATE, default_amount=DEFAULT_AMOUNT,
+        enrichment_data={"nts": {"amount_basis": "principal"}},
         delinquent_amount=DELINQUENT_AMOUNT, delinquent_bill_year=DELINQUENT_BILL_YEAR,
         created_at=NOW,
     ))
@@ -163,6 +164,8 @@ async def test_the_auction_and_tax_columns_carry_their_values(
 
     assert row["auction_date"] == AUCTION_DATE.isoformat()
     assert Decimal(row["default_amount"]) == DEFAULT_AMOUNT
+    # Unknown would read "Amount stated in notice": only the projected basis says this.
+    assert row["default_amount_type"] == "Principal"
     assert row["days_to_auction"].strip() != ""
     assert int(row["days_to_auction"]) > 0
     assert Decimal(row["delinquent_amount"]) == DELINQUENT_AMOUNT

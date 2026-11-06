@@ -721,6 +721,16 @@ def _upsert_notice(db, model, row: dict, *, deed_reference: str | None = None) -
         return new
 
     update_cols = {c: _value(c) for c in row if c not in _NO_UPDATE}
+    if "principal_owing_basis" in update_cols:
+        # The basis describes one amount, so it moves only with the amount it came
+        # with: an older issue may supply it only when it also supplies the amount,
+        # and a read without an amount keeps the stored pair (Codex).
+        update_cols["principal_owing_basis"] = case(
+            (older, case((model.principal_owing.isnot(None), model.principal_owing_basis),
+                         else_=stmt.excluded.principal_owing_basis)),
+            (stmt.excluded.principal_owing.isnot(None), stmt.excluded.principal_owing_basis),
+            else_=model.principal_owing_basis,
+        )
     update_cols["issue_date"] = _func.greatest(model.issue_date, stmt.excluded.issue_date)
     stmt = stmt.on_conflict_do_update(
         constraint="uq_nts_notices_source_ts", set_=update_cols
@@ -786,9 +796,14 @@ _RESWEEP_SELECT = _sa_text(
     """
     SELECT id, ts_number, source_url FROM nts_notices
     WHERE source = :source AND is_active AND auction_date >= :today
-      AND principal_owing IS NULL AND source_url IS NOT NULL
+      -- An amount with no basis was parsed before migration 128: re-read it once so
+      -- it stops showing as an amount of unknown type.
+      AND (principal_owing IS NULL OR principal_owing_basis IS NULL)
+      AND source_url IS NOT NULL
       AND (fetched_at IS NULL OR fetched_at < :stale_before)
-    ORDER BY auction_date ASC
+    -- Missing amounts first: an amount of unknown basis only gets leftover capacity,
+    -- so legacy rows that keep failing cannot crowd out amount recovery (Codex).
+    ORDER BY (principal_owing IS NOT NULL), auction_date ASC
     LIMIT :lim
     """
 )
@@ -798,7 +813,8 @@ _TOUCH_FETCHED = _sa_text("UPDATE nts_notices SET fetched_at = :now WHERE id = :
 def _resweep_null_amount_notices(
     db, model, *, source: str, county: str, today, fetch, parse, notice_to_row,
 ) -> dict:
-    """Re-fetch a bounded batch of active, future-dated notices with NO amount.
+    """Re-fetch a bounded batch of active, future-dated notices with NO amount (or an
+    amount of unknown basis, parsed before migration 128).
 
     ``fetch(url) -> (status_code, html)``; ``parse(html) -> parsed dict``;
     ``notice_to_row`` is the source's row builder. A re-parse that now yields an

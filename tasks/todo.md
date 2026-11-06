@@ -1,3 +1,38 @@
+# NTS amount type marker (owner decision 2026-11-06: keep fallback amounts, mark them)
+
+Branch `feat/nts-amount-basis` (worktree `C:/Users/micha/bl-wt/nts-basis`), stacked on fix/trustee-sale-silent-done (#598).
+Basis: 'principal' (Section IV figure labelled principal) | 'sum_owing' (unlabelled first figure, e.g. matured loans) | NULL (legacy/unknown).
+Labels: only 'principal' says "Principal owing"; 'sum_owing' AND unknown say "Amount stated in notice" (Codex P2: NULL must not imply principal).
+Codex consult (PLAN CHANGES NEEDED, all folded in): notice_to_row + model + matcher SELECT plumbing (P1); trustee_sale frozen
+snapshot carries it (P1); segments projection; CSV column appended at the END of each layout, positions unchanged (P2);
+refresh fires on basis-only change and creates a missing nts object (P2); invariant only for fresh parses (P3).
+
+## Phase A BE data (5 src files)
+- [x] migration 128 nts_notices.principal_owing_basis + CHECK; model column
+- [x] parser returns (amount, basis) from one function; notice_to_row carries it
+- [x] crawler: basis COALESCEd like the amount; resweep also picks active notices with an amount but no basis
+- [x] matcher: SELECT + nts blob amount_basis; refresh syncs basis (basis-only change, missing nts object)
+- [x] tests: labelled/matured/none, row propagation, older-issue, refresh basis-only / absent nts / NULL basis
+- [x] found + fixed: JSON-null enrichment_data (Result(enrichment_data=None)) || object built an ARRAY in
+      _write_match and the refresh; both now guard jsonb_typeof = 'object' (test failed before the fix)
+- [x] 1090 passed (nts/trustee/breakdown/finalize/segments/lead_export/batch_export/migration/privacy), ruff clean,
+      128 down/up clean
+- [x] Codex review 1 GATE FAIL (2 x P2): basis moves only with its amount (older issue cannot label a retained
+      amount); missing amounts resweep before unknown-basis rows. Both regressions fail without the fix.
+- [x] Codex re-review: GATE PASS. 618 NTS/trustee tests pass, ruff clean.
+## Phase B BE surfaces (after approval)
+- [x] trustee_sale nts_source + finalizer carry amount_basis (existing frozen snapshots stay unknown)
+- [x] CSV column appended LAST in every layout (legacy/lean `default_amount_type`, crm_v1 "Amount Type" after the
+      reference block, overlap + batch last): "Principal" only for a labelled principal, else "Amount stated in notice",
+      blank without an amount. Segments project `default_amount_basis` (live test fails without it).
+- [x] API: no schema change; ResultRow and batch leads already return enrichment_data (nts.amount_basis)
+- [x] 5 pinned contract tests updated deliberately; 1967 passed on related suites; ruff clean
+## Phase C FE (after approval)
+- [x] results/batch label per basis (bridgeleads-web #315, stacked on #314): lib/amount-type, "Amount Owing" column
+      with the type under each amount, per-lead label, neutral chooser + quality labels. tsc/eslint/132 unit tests.
+      Codex GATE FAIL (P2 chooser label, P3 10px tag) fixed -> GATE PASS. Not browser-verified (needs auth + API).
+## Merge order (owner): #598 -> #599 (migration 128) -> #314 -> #315
+
 # Trustee-sale "silent done" + Principal Owing coverage (2026-11-06)
 
 BE branch `fix/trustee-sale-silent-done` (worktree `C:/Users/micha/bl-wt/ts-silent`, base origin/main 26d33270).

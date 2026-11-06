@@ -682,7 +682,9 @@ class TestBatchLeadParity:
         batch, _ = parity_batch
         resp = await client.get(f"/batches/{batch.id}/download", headers=_auth(starter_token))
         header = next(csv.reader(io.StringIO(resp.text)))
-        assert header[:len(OVERLAP_LEAD_COLUMNS)] == OVERLAP_LEAD_COLUMNS
+        # default_amount_type came after the batch extras, so it is last here.
+        assert header[:len(OVERLAP_LEAD_COLUMNS) - 1] == OVERLAP_LEAD_COLUMNS[:-1]
+        assert header[-1] == OVERLAP_LEAD_COLUMNS[-1] == "default_amount_type"
         assert set(header) == set(OVERLAP_LEAD_COLUMNS) | (set(LEAD_CSV_COLUMNS) - {"date_recorded"})
         assert len(header) == len(set(header))
 

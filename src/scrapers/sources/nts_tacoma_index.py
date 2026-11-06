@@ -216,23 +216,32 @@ _PRINCIPAL_LABELED = re.compile(r"principal[^$]{0,40}?\$([\d,]+\.\d{2})", re.I |
 _FIRST_DOLLAR_NEAR_ANCHOR = re.compile(r"^[^$]{0,120}?\$([\d,]+\.\d{2})", re.S)
 
 
-def _principal_owing(text: str) -> Decimal | None:
-    """Section IV amount owing on the obligation (see the phrasings above); None if
-    the statutory sentence is absent or carries no dollar figure inside section IV."""
+def _section_iv_amount(text: str) -> tuple[Decimal | None, str | None]:
+    """Section IV amount owing on the obligation (see the phrasings above) and what it
+    is: 'principal' when labelled so, 'sum_owing' when it is the unlabelled first
+    figure (a matured loan's total, not its principal). (None, None) if the statutory
+    sentence is absent or carries no dollar figure inside section IV."""
     m = _SUM_OWING_ANCHOR.search(text)
     if not m:
-        return None
+        return None, None
     span = text[m.end(): m.end() + _SECTION_IV_SPAN_CHARS]
     end = _SECTION_IV_END.search(span)
     if end:
         span = span[: end.start()]
-    hit = _PRINCIPAL_LABELED.search(span) or _FIRST_DOLLAR_NEAR_ANCHOR.search(span)
+    basis = "principal"
+    hit = _PRINCIPAL_LABELED.search(span)
     if not hit:
-        return None
+        basis, hit = "sum_owing", _FIRST_DOLLAR_NEAR_ANCHOR.search(span)
+    if not hit:
+        return None, None
     try:
-        return Decimal(hit.group(1).replace(",", ""))
+        return Decimal(hit.group(1).replace(",", "")), basis
     except (InvalidOperation, ValueError):
-        return None
+        return None, None
+
+
+def _principal_owing(text: str) -> Decimal | None:
+    return _section_iv_amount(text)[0]
 # ── "Note Amount: $234,533.00" (original loan size)
 _NOTE_AMOUNT = re.compile(r"Note\s+Amount\s*:?\s*\$?([\d,]+\.\d{2})", re.I)
 # ── NOD transmittal date ("by both first class and certified mail on 1/20/2026")
@@ -534,6 +543,7 @@ def parse_nts_notice(text: str) -> dict[str, Any]:
                 if pm.group(2):
                     auction_time = " ".join(pm.group(2).split())
 
+    amount, amount_basis = _section_iv_amount(text)
     return {
         # A trustee's page TITLE can carry a trailing dash ("TS# WA-26-1035144-SW-
         # NOTICE OF…", live 2026-09-02) while the body says "WA-26-1035144-SW"; the
@@ -551,7 +561,8 @@ def parse_nts_notice(text: str) -> dict[str, Any]:
         "auction_location": auction_location,
         "property_address": _clean_address(_first(_COMMONLY_KNOWN, text)),
         # Section IV "sum owing ... Principal" is the headline default/payoff figure.
-        "principal_owing": _principal_owing(text),
+        "principal_owing": amount,
+        "principal_owing_basis": amount_basis,
         "note_amount": _money(_NOTE_AMOUNT, text),
         "nod_date": _first(_NOD_DATE, text),
     }
@@ -774,6 +785,7 @@ def notice_to_row(
         "trustee": trustee,
         "beneficiary": beneficiary,
         "principal_owing": parsed.get("principal_owing"),
+        "principal_owing_basis": parsed.get("principal_owing_basis"),
         "note_amount": parsed.get("note_amount"),
         "nod_date": _truncate(parsed.get("nod_date"), 32),
         "source_url": _truncate(source_url, 512),

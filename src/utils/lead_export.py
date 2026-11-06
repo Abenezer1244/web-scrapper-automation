@@ -91,6 +91,10 @@ LEAD_CSV_COLUMNS: list[str] = [
     # Located parcel provenance (2026-09-14): set when parcel_id was filled from a
     # county parcel-map match because the source had no parcel number. Appended at END.
     "parcel_source",
+    # What default_amount is (2026-11-06, migration 128): "Principal" only when the
+    # notice labels it so, else "Amount stated in notice" (an unlabelled total, or a
+    # figure read before the type was recorded). Blank without an amount. Appended at END.
+    "default_amount_type",
 ]
 
 
@@ -140,6 +144,7 @@ _TYPE_EXTRA_COLUMNS: dict[str, tuple[str, ...]] = {
     ),
     "pre_foreclosure": (
         "auction_date", "days_to_auction", "default_amount", "trustee", "ts_number",
+        "default_amount_type",
     ),
     # trustee_sale (Auction Leads) is sourced FROM the NTS cache, so every row has the
     # same auction block as a matched pre_foreclosure lead. heirs/legal_description are
@@ -147,6 +152,7 @@ _TYPE_EXTRA_COLUMNS: dict[str, tuple[str, ...]] = {
     # blank for auction leads, matching how pre_foreclosure handles them.
     "trustee_sale": (
         "auction_date", "days_to_auction", "default_amount", "trustee", "ts_number",
+        "default_amount_type",
     ),
 }
 
@@ -240,9 +246,12 @@ _CRM_REFERENCE: tuple[tuple[str, str], ...] = (
     ("owner_state", "Owner State"), ("freshness_days", "Freshness Days"),
     ("contactability_score", "Contactability Score"),
 )
+# Added after crm_v1 shipped, so it follows the reference block instead of joining
+# the auction block: every existing column keeps its position.
+_CRM_AUCTION_TAIL: tuple[tuple[str, str], ...] = (("default_amount_type", "Amount Type"),)
 CRM_V1_LABELS: dict[str, str] = dict(
     (*_CRM_CORE, *_CRM_AUCTION, *_CRM_TAX, *_CRM_CODE_VIOLATION,
-     *_CRM_TYPE_BLOCKS["probate"], *_CRM_REFERENCE)
+     *_CRM_TYPE_BLOCKS["probate"], *_CRM_REFERENCE, *_CRM_AUCTION_TAIL)
 )
 
 
@@ -259,7 +268,9 @@ def resolve_crm_export_columns(record_type: str | None) -> list[str]:
         else [_CRM_AUCTION, _CRM_TAX, _CRM_CODE_VIOLATION, _CRM_TYPE_BLOCKS["probate"]]
     )
     keys: list[str] = []
-    for key, _label in (*_CRM_CORE, *(pair for block in blocks for pair in block), *_CRM_REFERENCE):
+    tail = _CRM_AUCTION_TAIL if _CRM_AUCTION in blocks else ()
+    for key, _label in (*_CRM_CORE, *(pair for block in blocks for pair in block),
+                        *_CRM_REFERENCE, *tail):
         if key not in keys:
             keys.append(key)
     return keys
@@ -414,6 +425,17 @@ def _nts(enr: dict) -> dict:
     """The nested 'nts' object the matcher wrote into enrichment_data (or empty)."""
     nts = enr.get("nts")
     return nts if isinstance(nts, dict) else {}
+
+
+def _amount_type(record: Any, enr: dict) -> str:
+    """CSV label for what default_amount is (migration 128). Only a notice that labels
+    the figure principal says so; an unlabelled total and an amount read before the
+    type was recorded both say what is certain. Segment rows carry no enrichment, so
+    their query projects the basis as default_amount_basis."""
+    if _get(record, "default_amount") is None:
+        return ""
+    basis = _get(record, "default_amount_basis") or _nts(enr).get("amount_basis")
+    return "Principal" if basis == "principal" else "Amount stated in notice"
 
 
 def _plain(val: Any) -> str:
@@ -655,6 +677,7 @@ def build_lead_export_row(
         "auction_date": _plain(_get(record, "auction_date")),
         "days_to_auction": "" if sig["days_to_auction"] is None else str(sig["days_to_auction"]),
         "default_amount": _plain(_get(record, "default_amount")),
+        "default_amount_type": _amount_type(record, enr),
         "trustee": _enrich_str(_nts(enr), "trustee"),
         "ts_number": _enrich_str(_nts(enr), "ts_number"),
         # Mailing-address split (kept in sync with the property split above).
@@ -788,7 +811,7 @@ PROBATE_SUBTYPE_AGG_SQL: str = (
 )
 
 
-OVERLAP_LEAD_COLUMNS: list[str] = [
+_OVERLAP_V1_COLUMNS: list[str] = [
     "overlap", "lists_count", "lists", "counties",
     "first_name", "last_name",
     "phone", "phone_type", "email", "phone_2", "phone_3", "email_2", "email_3",
@@ -817,7 +840,10 @@ OVERLAP_LEAD_COLUMNS: list[str] = [
 # Spelled out, not derived from LEAD_CSV_COLUMNS, so a change there can never shift
 # this file's columns (Codex P2). Tax / violation / auction values come from their
 # group's source row; the rest belong to the representative row, like filed_date.
-BATCH_LEAD_COLUMNS: list[str] = OVERLAP_LEAD_COLUMNS + [
+# default_amount_type (migration 128) came later: appended at the very end of both
+# files, so neither the overlap columns nor the batch extras move.
+OVERLAP_LEAD_COLUMNS: list[str] = _OVERLAP_V1_COLUMNS + ["default_amount_type"]
+BATCH_LEAD_COLUMNS: list[str] = _OVERLAP_V1_COLUMNS + [
     "assessed_value", "instrument_number",
     "code_violation_type", "code_violation_status",
     "code_violation_description", "code_violation_last_inspection",
@@ -826,6 +852,7 @@ BATCH_LEAD_COLUMNS: list[str] = OVERLAP_LEAD_COLUMNS + [
     "freshness_days", "contactability_score",
     "absentee_owner", "out_of_state_owner", "owner_state",
     "trustee", "ts_number", "current_owner", "title_status", "parcel_source",
+    "default_amount_type",
 ]
 
 

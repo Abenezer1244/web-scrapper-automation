@@ -1,4 +1,4 @@
-"""nts_notices.issue_date: the newest newspaper issue a notice's values came from (126).
+"""nts_notices.issue_date: the newest newspaper issue a notice's values came from (127).
 
 The weekly-PDF crawlers ingest the current issue, then sweep back issues. Both
 upsert on (source, ts_number) and refreshed every value, so a back issue read after
@@ -20,8 +20,8 @@ from datetime import date
 import sqlalchemy as sa
 from alembic import op
 
-revision = "126"
-down_revision = "125"
+revision = "127"
+down_revision = "126"
 branch_labels = None
 depends_on = None
 

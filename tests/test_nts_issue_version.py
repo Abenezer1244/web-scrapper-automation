@@ -87,21 +87,21 @@ def test_a_source_without_issue_dates_keeps_newest_read_wins():
             db.commit()
 
 
-def test_migration_126_backfill_parses_like_the_crawler():
+def test_migration_127_backfill_parses_like_the_crawler():
     """The migration stamps legacy rows with its own copy of the parse (migrations do
     not import app code); the two must agree, or legacy rows get the wrong version."""
     import importlib.util
     from pathlib import Path
 
     spec = importlib.util.spec_from_file_location(
-        "m126", Path(__file__).resolve().parents[1] / "alembic/versions/126_nts_notice_issue_date.py")
-    m126 = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(m126)
+        "m127", Path(__file__).resolve().parents[1] / "alembic/versions/127_nts_notice_issue_date.py")
+    m127 = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m127)
     from src.scrapers.sources.nts_pdf_archive import snoho_names
 
     urls = [issue_url(_SOURCE, n) for n in king_names(date(2026, 9, 2))]
     urls += [issue_url("snohomish_tribune", n) for n in snoho_names(date(2026, 8, 27))]
     urls += ["https://www.tacomadailyindex.com/legal-notices/x", None, "https://h/Legals%2013-40-26.pdf"]
     for u in urls:
-        assert m126._issue_date(u) == issue_date_from_url(u)
+        assert m127._issue_date(u) == issue_date_from_url(u)
 

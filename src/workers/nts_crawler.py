@@ -707,7 +707,7 @@ def _upsert_notice(db, model, row: dict, *, deed_reference: str | None = None) -
     # (a postponed sale reverting to its original date). Only PDF rows carry an
     # issue_date, so HTML sources keep newest-read-wins. An older issue still fills
     # gaps and still moves fetched_at/source_url, which the archive sweep's
-    # "is this issue due" check reads (migration 126, Codex).
+    # "is this issue due" check reads (migration 127, Codex).
     older = and_(
         stmt.excluded.issue_date.isnot(None), model.issue_date.isnot(None),
         stmt.excluded.issue_date < model.issue_date,

@@ -30,12 +30,12 @@ No push, merge, deploy or prod write without owner OK. Evidence = read-only prod
 - [x] tests: negative control (done+NULL without guard), refresh incl. trustee_sale control, alert incl. old/zero rows
 - [x] 646 passed (nts/trustee/breakdown/finalize/progress/degradations/workers), ruff clean, no BE type checker configured
 ## Phase 1b BE (commit 2c653fc6) - done (Codex review 1: GATE FAIL P2)
-- [x] migration 126 nts_notices.issue_date; an older weekly-PDF issue only fills gaps (postponed sale no longer reverts)
+- [x] migration 127 nts_notices.issue_date; an older weekly-PDF issue only fills gaps (postponed sale no longer reverts)
 - [x] real-DB test incl. HTML newest-read-wins control; negative control reproduces the revert; 126 down/up clean
 - [x] 639 passed on the related suites, ruff clean (src, tests, alembic)
 ## Phase 1c BE (Codex review 2: GATE FAIL, 2 x P2) - done
 - [x] issue_date derived inside _upsert_notice (covers scripts/backfill_nts_pdf_archive.py too)
-- [x] migration 126 stamps existing PDF rows from source_url (prod read-only check: 143/143 parse, 115 HTML stay NULL)
+- [x] migration 127 stamps existing PDF rows from source_url (prod read-only check: 143/143 parse, 115 HTML stay NULL)
 - [x] FE: "can also carry ... it states" (7617e19); 640 passed, ruff clean; Chromium re-verified
 ## Phase 2 FE (commit dd1d8e9) - done
 - [x] landing: Principal Owing/trustee/TS# qualified "when we find the published sale notice"; sample attributed

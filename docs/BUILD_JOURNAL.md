@@ -19,6 +19,41 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-11-06 (evening) — Privacy: durable send authorization (compliance Phase 6 P4)
+
+**Built / Shipped:** every send path now re-checks each row against the suppression rules
+(src/privacy/authorize.py) immediately before sending, and fails closed.
+- P4a: migration 129 `privacy_rule_rows()` (SECURITY DEFINER, search_path pinned, loader columns
+  only, EXECUTE for bridgeleads_system only; aborts unless its owner owns privacy_suppressions and
+  RLS is not forced). The loader reads through it; the grant script re-applies the grant.
+- P4b: dialer outbox authorizes per row before its POST; the generic dialer push carries row ids
+  only (`deliver_dialer_push` re-reads config, plan and rows and authorizes at every attempt);
+  legacy sealed `leads.dialer_ready` messages are re-routed by id; the sweep and late delivery load
+  rules before any claim and never queue a withheld row (late: terminal `privacy_withheld`).
+- P4c: Tracerfy dispatcher loads rules per tick before any claim and withdraws withheld leads in
+  `_partition_still_deliverable` (never charged).
+- P4d: ingest quarantines an answer for a withheld lead (`quarantined`, never billed, nothing
+  stored, the subject's cache entry dropped); the contact-lookup reconciler settles it `released`.
+- P4e (#600): PII-emission inventory (docs/legal/audit-2026-11/08) + an activation gate test that
+  blocks P7 while any of 33 listed operator scripts lacks the privacy filter.
+**Tried / Decided:** a SECURITY DEFINER function over a table grant: with RLS and no policy a bare
+GRANT returns zero rows, an allow-all snapshot. Generic dialer delivery stays at-least-once (as
+before; batch.id/external_id are the dedup keys) rather than adding a delivery-state table.
+**Failed / Blocked:** P4 had to wait for NTS #599 (migrations 127/128 chained off 126). #599's CI
+failed on four golden-CSV pins that predated its new `default_amount_type` column; pins updated
+(34543fd3) and #599 merged on the owner's "merge".
+**Caught & fixed (Codex, 9 rounds):** unqualified function names in the grant script; owner/FORCE
+RLS invariant unasserted; legacy sealed dialer payloads still postable; sweep claimed before
+authorizing; RowMapping read by attribute would have looked empty (allow-all); ingest and
+dispatcher not tenant-pinned to the lead (fail closed now); inventory omissions and an
+over-broad ignore. One Codex High was a false positive (`/king_*` already covered the reports).
+**Pending / Handoff:** P5 write paths: late delivery bills before authorize; cache-copy writers
+(`_settle_queued_from_known_answers`, `copy_cached_answer`, duplicate reuse); enforcer sweep;
+owner/grantor adapter. Then P6 erasure, P7 activation.
+**Facts learned:** prod workers' sync engine is `bridgeleads_system` (NOBYPASSRLS); worker and beat
+boot blocks on every migration head (scripts/wait_for_schema.py), so a migration and the code
+that needs it can ship in one PR.
+
 ## 2026-11-06 (later): owner decisions applied; NTS amount type marker Phase A
 
 **Built:** #598 rebased on main, issue_date migration renumbered 126 -> 127 (main's privacy 126 landed first).

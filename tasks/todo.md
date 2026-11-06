@@ -28,7 +28,10 @@ refresh fires on basis-only change and creates a missing nts object (P2); invari
 - [x] API: no schema change; ResultRow and batch leads already return enrichment_data (nts.amount_basis)
 - [x] 5 pinned contract tests updated deliberately; 1967 passed on related suites; ruff clean
 ## Phase C FE (after approval)
-- [ ] results/batch label per basis
+- [x] results/batch label per basis (bridgeleads-web #315, stacked on #314): lib/amount-type, "Amount Owing" column
+      with the type under each amount, per-lead label, neutral chooser + quality labels. tsc/eslint/132 unit tests.
+      Codex GATE FAIL (P2 chooser label, P3 10px tag) fixed -> GATE PASS. Not browser-verified (needs auth + API).
+## Merge order (owner): #598 -> #599 (migration 128) -> #314 -> #315
 
 # Trustee-sale "silent done" + Principal Owing coverage (2026-11-06)
 

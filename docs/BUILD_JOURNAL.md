@@ -36,8 +36,12 @@ _write_match. Latent only (prod: 267,664 objects, 0 null/array). Guarded with js
 **Blocked:** merging #314/#598 was refused by the auto-mode permission classifier; owner merges.
 **Source rights (owner Q3):** no King/Clark source is clean to crawl (DJC robots disallow + ToS; WNPA ToU bars
 scraping with liquidated damages). Licensing route recommended; see the session's review notes.
-**Pending:** Phase B (trustee_sale snapshot, CSV "Amount Type" appended at the end, segments projection, API),
-Phase C (FE label per basis).
+**Phase B (#599):** trustee_sale snapshot + finalizer carry the basis; CSV column appended LAST in every layout
+(legacy/lean/crm_v1/overlap/batch); Lists queries project the basis (live test fails without it). No API schema
+change (enrichment_data is already returned). 5 pinned contract tests updated on purpose. Codex GATE PASS.
+**Phase C (FE #315):** "Amount Owing" + type tag; per-lead label. Codex GATE FAIL (chooser still said principal;
+10px tag) fixed, GATE PASS. Not browser-verified.
+**Merge order:** #598 -> #599 -> #314 -> #315.
 
 ## 2026-11-06 — Trustee-sale "silent done" audit, records_found invariant, NTS version guard, Principal Owing copy
 

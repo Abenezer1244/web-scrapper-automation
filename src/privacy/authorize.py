@@ -34,9 +34,10 @@ SUBJECTS: ``party_name`` (role party) and ``heirs`` (role heir), read in the sou
 declared name order. Owner-of-record and grantor fields have no generic column; their
 allowlisted row adapter is a P5 prerequisite and blocks activation (P7).
 
-ACCESS: migration 125 revokes privacy_suppressions from every runtime role. The role
-that runs ``load_rule_snapshot`` must be granted SELECT when P5 wires the sweep;
-until then only the table owner can load rules.
+ACCESS: migration 125 revokes privacy_suppressions from every runtime role. Workers
+load rules through ``public.privacy_rule_rows()`` (migration 129, SECURITY DEFINER,
+EXECUTE granted to bridgeleads_system only), which returns the loader's columns and
+nothing from the request tables.
 """
 from __future__ import annotations
 
@@ -71,10 +72,12 @@ _HISTORIES = {
 }
 _AUTOMATIC_ANCHOR_KINDS = frozenset({"property", "phone", "email"})
 
+# Through migration 129's SECURITY DEFINER function, never the table: the worker role
+# holds no table privilege, and RLS (no policy) would show it zero rows, i.e. allow all.
 _LOAD_SQL = text(
-    "SELECT id::text AS id, rule_id::text AS rule_id, anchor_kind, anchor_hmac, "
-    "subject_kind, subject_hmac, scope, key_version, normalization_version, state, "
-    "created_at FROM privacy_suppressions"
+    "SELECT id, rule_id, anchor_kind, anchor_hmac, subject_kind, subject_hmac, scope, "
+    "key_version, normalization_version, state, created_at "
+    "FROM public.privacy_rule_rows()"
 )
 
 

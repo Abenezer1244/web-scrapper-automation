@@ -200,6 +200,25 @@ A row can stand for several statements in one function (for example A8, B12, D25
 
 ## Gaps
 
+**Status 2026-11-06 (Phase 6 P3).** The tables below record what was found before the fixes;
+the verdicts there are not rewritten. Where each gap stands now:
+
+| Gap | Status |
+|---|---|
+| 1 late delivery `_ELIGIBLE` | Closed (P3b-1), plus `_PENDING_SCOPE` and `_CONTACTS_PENDING_SQL` (8b) |
+| 2 skip-trace claim | Closed (P3b-1) |
+| 3 run breakdown | Closed (P3a): first branch `privacy_withheld`, frozen in `jobs.breakdown_privacy_withheld`, folded into `dropped_before_save` for customers |
+| 4 backfill script | Closed (P3b-1): the production enqueue's eligibility. No test (operator script) |
+| 5 jobs.py page counts | Closed (P3b-2) |
+| 6 batches `looked_up` | Closed (P3b-2): the displayed count skips withheld rows; the `lookup_while_off` alert keeps every paid lookup (billing signal) |
+| 7 public cache | Closed (P3b-2) |
+| 8a enrich job-log line | Closed (P3b-2) |
+| 8b late notices | Closed (P3b-1 follow-up) |
+| 8c `scripts/repair_orphaned_duplicate_flags.py` | OPEN, operator script: it should reuse `actionable_sql('r2')` before it is run again |
+| 9 contact-lookup confirm | OPEN, optional: the worker's claim re-checks with `actionable_condition()` and the claim itself now refuses withheld rows |
+
+Everything marked DEFER-P4/P5 above (send and write paths) is unchanged and belongs to those slices.
+
 1. **cv_late_delivery.py:98-100 (`_ELIGIBLE`), used by `_CANDIDATES_SQL` :105 and `_LOCK_ROW_SQL` :127.**
    Late delivery removes the hold and BILLS one record using `qualified_sql` only, so a suppressed
    held code violation is charged and stamped delivered. Fix: append

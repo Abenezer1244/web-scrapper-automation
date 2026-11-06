@@ -526,16 +526,20 @@ async def _execution_facts(
             )
         )).all()
     }
+    # (shown, bought) per job. `shown` is the contacts_looked_up figure: like every number
+    # on this page it skips a privacy-withheld row. `bought` keeps every lookup the account
+    # paid for, so the lookup_while_off alert (a billing/configuration signal) never loses
+    # one because the row was withheld afterwards.
     looked_up = {
-        str(jid): n
-        for jid, n in (await db.execute(
-            select(Result.job_id, func.count(Result.id))
+        str(jid): (shown, bought)
+        for jid, shown, bought in (await db.execute(
+            select(Result.job_id,
+                   func.count(Result.id).filter(not_privacy_suppressed_condition()),
+                   func.count(Result.id))
             .where(
                 Result.user_id == user_id,
                 Result.job_id.in_(job_ids),
                 Result.skip_trace_source == "lookup",
-                # Like every number on this page: a privacy-withheld row is not counted.
-                not_privacy_suppressed_condition(),
             )
             .group_by(Result.job_id)
         )).all()
@@ -588,9 +592,10 @@ async def _execution_facts(
                                 code=code, county=county, record_type=rt, have=have, of=n))
             elif st in _UNDELIVERABLE_CHILD_STATUSES:
                 f["children_failed"] += 1
-            f["contacts_looked_up"] += looked_up.get(jid, 0)
+            shown, bought = looked_up.get(jid, (0, 0))
+            f["contacts_looked_up"] += shown
             if not skip_on:
-                off_lookups += looked_up.get(jid, 0)
+                off_lookups += bought
         if off_lookups:
             f["attention"].append(BatchAttention(code="lookup_while_off", have=off_lookups))
         if f["children_failed"]:

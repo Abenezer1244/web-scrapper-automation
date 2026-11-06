@@ -67,6 +67,27 @@ async def test_the_batch_rollup_does_not_count_a_withheld_rows_lookup(
     assert (await _list(client, starter_token))["privacy-rollup"]["contacts_looked_up"] == 1
 
 
+async def test_a_withheld_rows_paid_lookup_still_raises_the_lookup_while_off_alert(
+    client: AsyncClient, db, starter_user: User, starter_token: str,
+):
+    """The alert is a billing/configuration signal: lookups bought for a child configured
+    OFF. A row withheld afterwards still cost money, so it still counts there."""
+    _, [job] = await _make_batch(db, starter_user.id, "privacy-off", [
+        ("pierce", "probate", "done", 2, False, [
+            {"skip_trace_status": "hit", "skip_trace_source": "lookup"},
+            {"skip_trace_status": "hit", "skip_trace_source": "lookup"},
+        ]),
+    ])
+    [withheld] = (await db.execute(text(
+        "SELECT id::text FROM results WHERE job_id = :j ORDER BY party_name LIMIT 1"),
+        {"j": job})).scalars().all()
+    await _withhold(db, withheld)
+    row = (await _list(client, starter_token))["privacy-off"]
+    assert row["contacts_looked_up"] == 1
+    [alert] = [a for a in row["attention"] if a["code"] == "lookup_while_off"]
+    assert alert["have"] == 2
+
+
 async def test_the_public_numbers_never_count_a_withheld_row(
     starter_user: User, db,
 ):
@@ -87,15 +108,21 @@ async def test_the_public_numbers_never_count_a_withheld_row(
     await db.commit()
     await _withhold(db, rid)
 
-    async def counties() -> int:
+    async def numbers() -> tuple[int, str]:
         _refresh_public_sample_cache_impl()
-        return (await db.execute(text(
-            "SELECT (payload->>'counties_active')::int FROM public_sample_cache WHERE id = 1"
-        ))).scalar()
+        row = (await db.execute(text(
+            "SELECT (payload->>'counties_active')::int, payload->>'total_scraped' "
+            "FROM public_sample_cache WHERE id = 1"))).one()
+        return row[0], row[1]
 
-    withheld = await counties()
+    counties, total = await numbers()
     await db.execute(text("UPDATE results SET privacy_suppressed_at = NULL, "
                           "privacy_suppression_id = NULL WHERE id = :i"), {"i": rid})
     await db.commit()
-    assert await counties() == withheld + 1
+    counties_after, total_after = await numbers()
+    assert counties_after == counties + 1
+    # total_scraped is exact below 1,000 ("N+") and rounded above it, where one row
+    # cannot move it; the exact case is the one that proves the filter.
+    if total.endswith("+") and total[:-1].isdigit():
+        assert total_after == f"{int(total[:-1]) + 1}+"
 

@@ -95,15 +95,29 @@ def compute_property_key(
     ``county``/``state`` are REQUIRED call-through context (every caller has
     the ScraperConfig in scope); normalized here so casing can't split keys.
     """
+    key = property_key_input(parcel_id, property_address, county, state)
+    return hashlib.sha256(key.encode("utf-8")).hexdigest() if key is not None else None
+
+
+def property_key_input(
+    parcel_id: str | None,
+    property_address: str | None,
+    county: str | None,
+    state: str | None,
+) -> str | None:
+    """The exact string ``compute_property_key`` hashes: ``P|<STATE>|<county>|<PARCEL>``
+    (parcel branch) or ``A|<STATE>|<county>|<ADDRESS>`` (address branch), None when weak.
+
+    Shared with the privacy property anchor (src/privacy/authorize.py), which keys the
+    PARCEL branch only, so the anchor and the stored key can never drift apart.
+    """
     parcel = normalize_parcel(parcel_id)
     addr = normalize_address(property_address)
     parcel_ok = len(parcel) >= 4 and any(c.isdigit() for c in parcel)
     addr_ok = len(addr) >= 8 and any(c.isalpha() for c in addr)
     scope = f"{(state or '').strip().upper()}|{(county or '').strip().lower()}"
     if parcel_ok:
-        key = f"P|{scope}|{parcel}"
-    elif addr_ok:
-        key = f"A|{scope}|{addr}"
-    else:
-        return None
-    return hashlib.sha256(key.encode("utf-8")).hexdigest()
+        return f"P|{scope}|{parcel}"
+    if addr_ok:
+        return f"A|{scope}|{addr}"
+    return None

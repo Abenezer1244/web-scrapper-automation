@@ -103,3 +103,47 @@ Gaps (do not use the central predicate):
 - [ ] P3b gaps from the inventory, by surface (API counts/quote; worker emitters), ≤5 files each.
 - [x] P3c run breakdown bucket, folded into dropped_before_save for customers (customer_view).
 - [ ] P3d authorization service + property/mailing canonical forms + tests.
+
+## P3d design (draft for Codex consult, 2026-11-06)
+
+No caller until P4 (send paths) and P5 (sweep); nothing activates.
+
+**Anchors.** Automatic matching only on anchors with a robust canonical form:
+- `property`: the PARCEL branch of `compute_property_key`, exactly `P|<STATE>|<county>|<PARCEL>`
+  (same normalisers and thresholds). `property_identity` exposes `property_key_input()` and
+  `compute_property_key` becomes `sha256(property_key_input(...))` (byte-identical output,
+  pinned by a test), so the anchor and the stored key cannot drift.
+- `phone`, `email`: existing canonical forms.
+- The ADDRESS branch (`A|...`) and `mailing` stay REFUSED by `keys.py` (its docstring's reason:
+  a weak address form makes rules that silently never match). A row whose only anchor would be
+  an address goes to operator review (design s5), never to an automatic decision.
+
+**Snapshot** (`load_rule_snapshot(db)`): one SELECT over `privacy_suppressions`; history per
+(rule_id, key_version, normalization_version) must be a prefix of pending -> active -> lifted:
+`{pending}` inactive, `{pending, active}` ACTIVE, `{pending, active, lifted}` inactive; any other
+set (lifted without active, active without pending) raises. An ACTIVE rule under a key version
+that is not live, or a normalization_version other than the current one, raises (fail closed:
+the operation retries; it never runs without a rule it cannot evaluate). Indexed in memory:
+`(anchor_kind, key_version, anchor_hmac) -> [(subject_kind, subject_hmac, suppression_row_id)]`.
+Zero active rules -> a fast path that computes no HMAC.
+
+**authorize(snapshot, row, record_type, county, state) -> Decision**
+(`allowed` | `withheld(suppression_ids)` | `review(reason)`; callers treat review as withheld):
+1. Row anchors under every key version in the snapshot: property (parcel), each phone, each email.
+2. No anchor matched: allowed.
+3. Anchor matched: subjects from `party_name` (role party) and `heirs` (role heir) with
+   `name_order_for(record_type, county)`. Any subject HMAC equal to a matched rule's subject:
+   withheld (D2: whole row). Else any `unresolved` subject: review. Else allowed (the anchor
+   matched, but the rule's person is not on this row).
+4. Any key/normalisation error: raise.
+
+### P3d Codex consult reconciliation
+| Codex | Resolution |
+|---|---|
+| Critical: an address-only row (no parcel) is silently allowed | A SUBJECT match without an exact anchor match is `review` (withheld): covers address-only rows and a moved/mismatched parcel, without withholding every parcel-less row whenever any rule exists. Rule subjects are also indexed by (kind, version, hmac). |
+| High: step 3 underspecified | anchor+subject => withheld (whole row, D2); anchor, no subject match, no unresolved subject => allowed; anchor + any unresolved subject => review; no anchor + subject match => review; neither => allowed. `property_all_persons` is not supported by the schema (scope is 'subject' only). |
+| High: subject coverage | P3d reads `party_name` (party) and `heirs` (heir), and contacts from `phone`, `phones[*].number`, `email`, `emails[*]`. Owner-of-record / grantor fields have no generic Result column; an allowlisted row adapter for them is a **P5 prerequisite and an activation blocker** (P7 must not lift the guard without it). |
+| High: effective state | Load ALL rows (no state filter) in one statement; validate each history is exactly {pending}, {pending, active} or {pending, active, lifted} with created_at order pending <= active <= lifted; anything else raises `RuleSnapshotError`. |
+| High: property_key_input | Added; compute_property_key hashes it; byte-identical regression test. Missing state or county yields no anchor. |
+| Medium: error boundaries | `RuleSnapshotError` (snapshot/key library: abort the operation) vs a `Decision` (allowed / withheld / review). |
+| Medium: contacts | Exact anchor plus exact subject for automatic suppression; an unreadable contact is no anchor (the subject-match review path still applies). |

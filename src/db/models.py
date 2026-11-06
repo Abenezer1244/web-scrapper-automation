@@ -958,6 +958,9 @@ class Job(Base):
     # snapshot frozen before 121, read as 0 (run_breakdown.breakdown_from_job).
     breakdown_not_qualified = Column(Integer, nullable=True)
     breakdown_new = Column(Integer, nullable=True)
+    # Migration 126: rows withheld by a privacy suppression rule. NULL on a snapshot
+    # frozen before 126, read as 0, the same rule as breakdown_not_qualified.
+    breakdown_privacy_withheld = Column(Integer, nullable=True)
     # Migration 063: idempotent billing. billing_applied_at is the CAS gate —
     # only the attempt that flips it from NULL increments users.records_used, so a
     # watchdog re-run can't double-bill. billed_count = what was charged (stored,
@@ -1195,6 +1198,18 @@ class Result(Base):
     # parcel|address scheme (billing dedup) and deliberately DIFFERS — it cannot
     # serve this join.
     property_key = Column(String(64), nullable=True)
+    # Migration 126 (Phase 6 privacy): the row is withheld because a person asked not
+    # to be in the product. A dedicated flag, never a delivery_excluded_reason value,
+    # so privacy and quota/qualification state cannot overwrite each other. Set
+    # together (CHECK); privacy_suppression_id is the concrete versioned rule row
+    # (privacy_suppressions.id). Every read rule in src/api/lead_actionability.py
+    # refuses a flagged row. Writers: the enforcer sweep (P5) and activation (P7).
+    privacy_suppressed_at = Column(DateTime(timezone=True), nullable=True)
+    privacy_suppression_id = Column(
+        UUID(as_uuid=False),
+        ForeignKey("privacy_suppressions.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
     # Phase 4 (migration 038): structured tax-delinquency fields for amount/age
     # filtering. Populated SOURCE-GATED (King Socrata tax_delinquent only);
     # other counties' tax rows stay NULL and never match a filter. bill_year is

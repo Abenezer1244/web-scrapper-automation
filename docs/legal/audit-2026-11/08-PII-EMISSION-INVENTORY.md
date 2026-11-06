@@ -105,10 +105,11 @@ args. Dormant until `SENTRY_DSN` is set (and must be disclosed first). Nothing t
 ## Open (owner decisions, before suppression activation in P7)
 
 1. **Scripts must honour suppression.** Once a rule is active, any script that prints or exports
-   subject data must exclude `privacy_suppressed_at IS NOT NULL` rows, or be retired. Proposed
-   activation checklist item (P7): every High script above either filters with the central
-   predicate (`src/api/lead_actionability.py`) or is deleted. Most are one-off diagnostics whose
-   job is done; deleting them is the simpler fix.
+   subject data must exclude `privacy_suppressed_at IS NOT NULL` rows, or be retired. This is
+   ENFORCED, not just listed: `tests/test_privacy_script_inventory.py` names every High script
+   in section A and fails CI for the change that raises `IMPLEMENTED_ENFORCEMENT_VERSION` (P7)
+   while any of them exists without the privacy filter. Most are one-off diagnostics whose job
+   is done; deleting them (and their entry) is the simpler fix. Owner decision: filter or delete.
 2. `verify_tracerfy_provenance.py` prints decrypted contacts; it can compare hashes and print
    masked values instead.
 3. `purge_test_batch_configs.py --backup` and `verify_entitlement_deploy.py` write bulk personal

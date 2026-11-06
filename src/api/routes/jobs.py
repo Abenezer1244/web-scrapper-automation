@@ -48,6 +48,7 @@ from src.api.lead_actionability import (
     NOT_QUALIFIED,
     actionable_condition,
     has_address_condition,
+    not_privacy_suppressed_condition,
     shown_condition,
 )
 from src.api.lead_qualification import (
@@ -742,6 +743,8 @@ async def get_results(
                 Result.property_address.isnot(None),
                 Result.property_address != "",
                 Result.property_address != "(enrichment unavailable)",
+                # A row withheld by a privacy rule is in no number this page shows.
+                not_privacy_suppressed_condition(),
             )
         )
         enriched_count = enriched_result.scalar_one()
@@ -1061,6 +1064,7 @@ async def get_results(
                     Result.job_id == job_id,
                     Result.user_id == current_user.id,
                     Result.auction_date.isnot(None),
+                    not_privacy_suppressed_condition(),
                 )
                 .limit(1)
             )
@@ -1089,7 +1093,8 @@ async def get_results(
                             Result.date_recorded_parsed <= pub_cutoff,
                         ),
                     ).label("no_notice"),
-                ).where(Result.job_id == job_id, Result.user_id == current_user.id)
+                ).where(Result.job_id == job_id, Result.user_id == current_user.id,
+                        not_privacy_suppressed_condition())
             )).first()
             auction_coverage = AuctionCoverage(
                 matched=cov.matched or 0,

@@ -35,7 +35,11 @@ from src.api.entitlements import (
     skip_trace_violation,
 )
 from src.api.errors import no_store_errors, run_refusal_http
-from src.api.lead_actionability import actionable_condition, shown_condition
+from src.api.lead_actionability import (
+    actionable_condition,
+    not_privacy_suppressed_condition,
+    shown_condition,
+)
 from src.api.middleware.rate_limit import rate_limit
 from src.api.results_category import already_delivered_condition
 from src.api.schemas import (
@@ -530,6 +534,8 @@ async def _execution_facts(
                 Result.user_id == user_id,
                 Result.job_id.in_(job_ids),
                 Result.skip_trace_source == "lookup",
+                # Like every number on this page: a privacy-withheld row is not counted.
+                not_privacy_suppressed_condition(),
             )
             .group_by(Result.job_id)
         )).all()

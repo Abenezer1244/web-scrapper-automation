@@ -2578,6 +2578,8 @@ def _run_inline_enrichment(
         res for res in fresh
         if not (res.property_address and res.property_address != "(enrichment unavailable)")
         and not res.mailing_address
+        # The job log is customer-visible: a privacy-withheld row is not described there.
+        and res.privacy_suppressed_at is None
     ]
     if unactionable:
         # Break down WHY so a genuinely-unrecoverable row (no parcel AND no legal

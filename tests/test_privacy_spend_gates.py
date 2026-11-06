@@ -89,3 +89,36 @@ async def test_the_paid_claim_refuses_a_withheld_row_and_takes_the_rest(
     assert await _status(db, kept) == "queued"
     assert await _status(db, withheld) == "not_attempted"
     assert await _pending(db, withheld) == 0
+
+
+@pytest.mark.asyncio
+async def test_a_late_row_withheld_afterwards_is_not_announced_or_traced(
+    db, business_user: User, monkeypatch,
+):
+    """Delivered late while skip trace was switched off (contacts left 'pending'), then
+    withheld: the next ticks neither announce it nor buy its contacts, and its markers
+    stay pending (so a lifted rule would resume them)."""
+    from src.config import settings
+    from tests.test_cv_late_contacts import _contacts, _queued, _run, _situs
+    from tests.test_cv_late_delivery import _held
+
+    monkeypatch.setattr(settings, "TRACERFY_API_TOKEN", "test-token-not-real")
+    monkeypatch.setattr(settings, "SKIP_TRACE_ENABLED", False)  # contacts wait
+    notify = late.notify_late_deliveries
+    monkeypatch.setattr(late, "notify_late_deliveries", lambda: 0)  # announce later, below
+    job = await _run(db, business_user)
+    rid = await _held_row(db, business_user, job, _held(**_situs()))
+    assert late.deliver_completed_held_rows()["delivered"] == 1
+    assert await _contacts(db, rid) == "pending"
+
+    await _withhold(db, rid)
+    monkeypatch.setattr(settings, "SKIP_TRACE_ENABLED", True)
+
+    assert late.request_late_contacts() == 0
+    assert notify() == 0
+    assert await _queued(db, job) == set()
+    assert await _contacts(db, rid) == "pending"
+    notified = (await db.execute(text(
+        "SELECT enrichment_data::jsonb->'late_delivery'->>'notified' FROM results WHERE id = :i"),
+        {"i": rid})).scalar()
+    assert notified == "false"

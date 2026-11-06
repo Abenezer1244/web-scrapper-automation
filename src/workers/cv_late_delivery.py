@@ -463,33 +463,23 @@ def push_late_dialer() -> int:
 
 def _send_to_dialer(db, job, config, row) -> None:
     """The sweep's dispatch (scheduler_helpers/dialer.py) for ONE lead: the outbox for a
-    native vendor, one sealed generic-webhook request otherwise. Same payload fields."""
-    from src.utils.crypto import seal_task_args
+    native vendor, one id-only generic-webhook push otherwise. Both authorize the row
+    against the privacy rules immediately before sending (Phase 6 P4b)."""
     from src.workers.dialer_connectors import get_connector
     from src.workers.dialer_outbox import process_dialer_outbox
     from src.workers.scheduler_helpers.dialer import _materialize_dialer_outbox
-    from src.workers.webhook_delivery import deliver_job_webhook
+    from src.workers.webhook_delivery import deliver_dialer_push
 
     deliver = config.deliver or {}
     connector = get_connector(deliver.get("dialer_type"))
-    lead = {"id": row.id, "party_name": row.party_name, "phone": row.phone,
-            "phone_type": row.phone_type, "phone_dnc_flag": row.phone_dnc_flag, "email": row.email,
-            "property_address": row.property_address, "mailing_address": row.mailing_address}
     if connector.uses_outbox:
-        _materialize_dialer_outbox(db, job, config, connector.VENDOR_ID, [lead])
+        _materialize_dialer_outbox(db, job, config, connector.VENDOR_ID, [{"id": row.id}])
         db.commit()
         process_dialer_outbox.delay(str(job.id))
         return
-    url = deliver.get("dialer_webhook_url")
-    if not url:
+    if not deliver.get("dialer_webhook_url"):
         raise RuntimeError("generic dialer webhook without a URL")
-    job_meta = {"job_id": str(job.id), "scraper_config_id": str(config.id), "scraper_name": config.name,
-                "county": config.county, "state": config.state, "record_type": config.record_type,
-                "total_dialer_ready_count": 1, "dialer_webhook_url": url,
-                "dialer_webhook_secret": deliver.get("dialer_webhook_secret")}
-    for req in connector.build_requests([lead], job_meta):
-        deliver_job_webhook.delay(str(job.id), sealed=seal_task_args(
-            {"url": req["url"], "payload": req["payload"]}))
+    deliver_dialer_push.delay(str(job.id), result_ids=[str(row.id)], total=1)
 
 
 _NOTIFY_ACCOUNTS = 500

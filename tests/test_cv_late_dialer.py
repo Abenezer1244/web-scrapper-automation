@@ -99,7 +99,7 @@ async def test_a_generic_webhook_pushed_right_before_the_delivery_is_never_pushe
     from src.workers import webhook_delivery
 
     sent = []
-    monkeypatch.setattr(webhook_delivery.deliver_job_webhook, "delay", lambda *a, **k: sent.append(a))
+    monkeypatch.setattr(webhook_delivery.deliver_dialer_push, "delay", lambda *a, **k: sent.append(a))
     job = await _run(db, business_user, deliver=_GENERIC, pushed_hours_ago=0.0)
     rid = await _held_row(db, business_user, job, _held(), phone=PHONE)
     late.deliver_completed_held_rows()
@@ -111,7 +111,7 @@ async def test_a_generic_lead_delivered_before_the_runs_push_was_the_sweeps(db, 
     from src.workers import webhook_delivery
 
     sent = []
-    monkeypatch.setattr(webhook_delivery.deliver_job_webhook, "delay", lambda *a, **k: sent.append(a))
+    monkeypatch.setattr(webhook_delivery.deliver_dialer_push, "delay", lambda *a, **k: sent.append(a))
     job = await _run(db, business_user, deliver=_GENERIC, pushed_hours_ago=None)
     rid = await _held_row(db, business_user, job, _held(), phone=PHONE)
     late.deliver_completed_held_rows()                              # delivered now; run not pushed yet
@@ -132,7 +132,7 @@ async def test_a_generic_send_that_raised_is_never_sent_again(db, business_user,
     def boom(*a, **k):
         raise RuntimeError("broker acked, client raised")
 
-    monkeypatch.setattr(webhook_delivery.deliver_job_webhook, "delay", boom)
+    monkeypatch.setattr(webhook_delivery.deliver_dialer_push, "delay", boom)
     job = await _run(db, business_user, deliver=_GENERIC)
     rid = await _held_row(db, business_user, job, _held(), phone=PHONE)
     late.deliver_completed_held_rows()
@@ -181,12 +181,14 @@ async def test_no_dialable_phone_or_no_business_plan_is_recorded_not_pushed(db, 
 
 
 @pytest.mark.asyncio
-async def test_a_generic_webhook_gets_one_sealed_request_for_the_one_lead(db, business_user, monkeypatch):
+async def test_a_generic_webhook_gets_one_id_only_push_for_the_one_lead(db, business_user, monkeypatch):
+    """Phase 6 P4b-2: the message names the row; deliver_dialer_push re-reads and
+    authorizes it at send, so no person is in the task args at all."""
     from src.workers import webhook_delivery
 
     sent = []
-    monkeypatch.setattr(webhook_delivery.deliver_job_webhook, "delay",
-                        lambda job_id, sealed: sent.append((job_id, sealed)))
+    monkeypatch.setattr(webhook_delivery.deliver_dialer_push, "delay",
+                        lambda job_id, **kw: sent.append((job_id, kw)))
     job = await _run(db, business_user, deliver={"format": "csv", "emails": [],
                                                  "dialer_webhook_url": "https://dialer.example/hook"})
     rid = await _held_row(db, business_user, job, _held(), phone=PHONE)
@@ -194,8 +196,8 @@ async def test_a_generic_webhook_gets_one_sealed_request_for_the_one_lead(db, bu
     late.deliver_completed_held_rows()
 
     assert await _dialer(db, rid) == "pushed"
-    assert len(sent) == 1 and sent[0][0] == job
-    assert PHONE not in json.dumps(sent[0][1])                     # sealed: no PII readable in the task args
+    assert sent == [(job, {"result_ids": [rid], "total": 1})]
+    assert PHONE not in json.dumps(sent[0][1])                     # no PII in the task args
 
 
 @pytest.mark.asyncio

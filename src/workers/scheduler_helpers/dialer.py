@@ -157,9 +157,9 @@ def _dialer_push_sweep_impl() -> None:
     the Tracerfy webhook, so a push at completion would miss exactly the leads
     we want (Codex). A job is "settled" when no Result of it is still
     queued/submitted. Each job is claimed once via Job.dialer_pushed_at, so even
-    a job with zero dialer-ready leads is evaluated only once. Reuses
-    deliver_job_webhook (SSRF re-validate, HMAC, retry, non-fatal). No-op when no
-    config has a dialer_webhook_url.
+    a job with zero dialer-ready leads is evaluated only once. Sends through
+    deliver_dialer_push (row ids only; privacy check, SSRF re-validate, HMAC,
+    retry, non-fatal). No-op when no config has a dialer_webhook_url.
     """
     from sqlalchemy import and_, func, or_, select, update
 
@@ -171,7 +171,7 @@ def _dialer_push_sweep_impl() -> None:
     from src.db.session import system_sync_session
     from src.workers.dialer_connectors import get_connector
     from src.workers.dialer_outbox import process_dialer_outbox
-    from src.workers.webhook_delivery import DIALER_PUSH_CAP, deliver_job_webhook
+    from src.workers.webhook_delivery import DIALER_PUSH_CAP, deliver_dialer_push
 
     _BATCH = 50
     # Jobs still waiting on async skip-trace: see skip_trace_unsettled.
@@ -314,27 +314,14 @@ def _dialer_push_sweep_impl() -> None:
                         db.commit()
                         process_dialer_outbox.delay(str(job.id))
                     else:
-                        # Generic webhook: builds the exact same payload + URL as
-                        # before (locked by tests/test_dialer_connector_base.py) and
-                        # enqueues one delivery — byte-identical to the prior path.
-                        job_meta = {
-                            "job_id": str(job.id),
-                            "scraper_config_id": str(config.id),
-                            "scraper_name": config.name,
-                            "county": config.county,
-                            "state": config.state,
-                            "record_type": config.record_type,
-                            "total_dialer_ready_count": total,
-                            "dialer_webhook_url": url,
-                            "dialer_webhook_secret": deliver.get("dialer_webhook_secret"),
-                        }
-                        from src.utils.crypto import seal_task_args
-
-                        # P0-04b: the leads (names, phones, emails, addresses) and
-                        # the URL travel sealed; only the job id is readable.
-                        for req in connector.build_requests(leads, job_meta):
-                            deliver_job_webhook.delay(str(job.id), sealed=seal_task_args(
-                                {"url": req["url"], "payload": req["payload"]}))
+                        # Generic webhook: the message carries the selected row ids
+                        # only. deliver_dialer_push re-reads the rows, the URL and the
+                        # secret and authorizes each row against the privacy rules at
+                        # every attempt, then builds the same payload as before
+                        # (build_dialer_push_payload, tests/test_dialer_connector_base.py).
+                        deliver_dialer_push.delay(
+                            str(job.id), result_ids=[str(ld["id"]) for ld in leads],
+                            total=total)
                     pushed += 1
                     _logger.info(
                         "Dialer push queued for job %s: %d of %d dialer-ready leads (%s)",

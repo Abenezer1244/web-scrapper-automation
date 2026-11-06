@@ -13,10 +13,10 @@ property and mailing addresses, parcel ids, phones, emails) or about customers (
 
 | Area | Finding | Severity |
 |---|---|---|
-| Product code (`src/`) | Ops alerts, Sentry and log lines carry ids and counts. No log line writes a name, address or contact detail. | Low |
+| Product code (`src/`) | Ops alerts, Sentry and log lines carry ids and counts, except customer-chosen scraper names (one alert, a few logs). No log line writes a lead subject's name, address or contact detail. | Medium |
 | Admin routes | Three `require_admin` routes, none returns personal data. No debug endpoints. | Low |
 | Error tracking | Allowlisted: exception type and frame positions; messages redacted, request data, user, locals and breadcrumbs dropped. | None |
-| Logs | Customer email at the call site (masked by the global filter to `j***@domain`); full parcel ids in enrichment logs. | Medium |
+| Logs | Customer email passed to log calls (emitted masked as `j***@domain`); scraper names; full parcel ids in enrichment logs. | Medium |
 | Scripts | About 30 operator scripts print or write subject or customer data, unfiltered. | High |
 | Privacy flag | No script applies `results.privacy_suppressed_at`. | High (before activation) |
 
@@ -66,12 +66,19 @@ are DDL only.
 ## C. Logs and alerts
 
 - `ops_alerts.send_ops_alert` goes to email, a Better Stack webhook and `audit_events.detail`.
-  All ~40 callers send ids, counts, county names and exception class names; a few send
+  The ~40 callers send ids, counts, county names and exception class names; a few send
   truncated exception text (`finalize.py:95` is a DB error with bound parameters hidden). Low.
+  One exception: `delivery.py:246-261` (`_give_up`) puts the customer-chosen `scraper_name`
+  in the alert body. A scraper name is free text and can contain a person's name, so it
+  reaches the ops email, Better Stack and `audit_events.detail`. Medium.
 - `src/utils/logger.py` masks email local parts, labelled phones and Postgres DETAIL text. It
   does not mask names, addresses or parcel ids, and none are logged except parcel ids.
-- Customer email at the call site: `delivery.py:272,308,310,359,361,374,415,417`,
-  `onboarding_emails.py:331` (masked by the filter; line 359 also logs the client IP). Medium.
+- Customer email: `delivery.py:272,308,310,359,361,374,415,417`, `onboarding_emails.py:331`
+  and `scheduler_helpers/dispatch.py:134` pass the plaintext email into the log record; the
+  global filter masks it in every emitted line (`j***@domain`). Line 359 also logs the client
+  IP. Medium.
+- Customer-chosen scraper names (`config.name`): `scheduler_helpers/dispatch.py:134,170,208,
+  228,233`. Free text that can contain a person's name. Medium.
 - Full parcel ids: `scrapers/enrichment/county_gis.py`, `national.py`, `parcel.py`,
   `clark_pic.py`, `pierce_atip.py`, `pierce_atip_owner.py`, `pierce_legal_repair.py`,
   `pierce_wa_probate.py:572`. Parcel ids are public record keys, but they are also a privacy
@@ -84,8 +91,9 @@ args. Dormant until `SENTRY_DSN` is set (and must be disclosed first). Nothing t
 
 ## Fixed in this slice
 
-- `.gitignore` now ignores root-level `*.jsonl` reports and `test11_dq.json`, so a script report
-  holding names and addresses cannot be committed by accident. None was tracked.
+- `.gitignore` now ignores the root-level JSONL reports the scripts above write by default
+  (named patterns, so a deliberate JSONL file elsewhere is not hidden) and `test11_dq.json`. A
+  report holding names and addresses cannot be committed by accident. None was tracked.
 
 ## Open (owner decisions, before suppression activation in P7)
 
@@ -98,6 +106,8 @@ args. Dormant until `SENTRY_DSN` is set (and must be disclosed first). Nothing t
    masked values instead.
 3. `purge_test_batch_configs.py --backup` and `verify_entitlement_deploy.py` write bulk personal
    data to an unencrypted local file; default them into an ignored directory and print a warning.
-4. Replace plaintext customer emails in `delivery.py` / `onboarding_emails.py` log calls with the
+4. Replace the scraper name in the `_give_up` alert and the dispatch logs with the config id,
+   or accept it as customer-chosen metadata.
+5. Replace plaintext customer emails in `delivery.py` / `onboarding_emails.py` log calls with the
    existing email fingerprint helper; decide whether full parcel ids in enrichment logs are
    acceptable (retention of Railway logs governs the exposure).

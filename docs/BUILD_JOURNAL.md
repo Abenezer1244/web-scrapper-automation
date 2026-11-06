@@ -64,6 +64,52 @@ Section IV amounts; 12 historical stale amounts sit on past/inactive notices (th
   notices ever (07-06, 08-03).
 
 ---
+## 2026-11-06 — Privacy suppression enforcement on read paths (compliance Phase 6 P3)
+
+**Built / Shipped:**
+- #594 (merged 9b89e430, live): migration 126 alone, expand-only.
+  - `results.privacy_suppressed_at` + `privacy_suppression_id`: FK to the concrete versioned rule row, a both-or-neither CHECK, both NOT VALID.
+  - `jobs.breakdown_privacy_withheld`.
+- #595 (merged 0e0370d0, live): every read rule refuses a withheld row.
+  - `actionable_*`, `is_actionable`, `shown_condition`, the plan cap's ranking, `withheld_*`, and every list category including the look-only tabs.
+  - The run breakdown's first branch is `privacy_withheld`. `customer_view` folds it into `dropped_before_save` for customers.
+  - The read inventory is `docs/legal/audit-2026-11/07-RESULTS-READ-INVENTORY.md`.
+- #596 (P3b): the spend paths and counts outside the central predicate.
+  - Spend: late delivery `_ELIGIBLE` (discovery and lock), late notices and contacts, the paid skip-trace claim, the operator backfill.
+  - Counts: page counts, the batch lookup count, public landing-page numbers, a job-log line.
+- P3d (`src/privacy/authorize.py`): the rule snapshot loader and per-row decision. It also adds the parcel-only property anchor (`keys.property_anchor_value`) and the shared `property_key_input`. Nothing calls it yet.
+- Nothing is enforced in production: no code sets the flag (P5/P7), and the DB still allows rule state `pending` only.
+
+**Tried / Decided:**
+- Migration 126 shipped on its own first. Railway migrates at API boot while workers start, so code reading the columns could not ship in the same deploy.
+- The flag stores the concrete versioned rule row (`privacy_suppressions.id`), not `rule_id`. That gives a real FK and keeps the key version auditable after rotation.
+- Withheld rows get their own breakdown bucket, not a WHERE exclusion; excluding them would have counted them as "dropped before save". Customers see them folded into "filtered out before processing", so no number reveals an opt-out. The API schema is unchanged, so the frontend needs no change.
+- No automatic matching on street addresses: the parcel is the only property anchor. A rule's person found WITHOUT its anchor (an address-only row, another parcel) goes to review (withheld). Blanket review of every parcel-less row would hide whole counties.
+- The batch `lookup_while_off` alert keeps counting a withheld row's paid lookup, because it is a billing signal. The displayed count skips it.
+
+**Failed / Blocked:**
+- Codex CLI hung for 15 minutes on its first consult. In a backgrounded shell it waits on stdin, so `< /dev/null` is required.
+- The machine ran low on memory twice and reaped background jobs: the 6543 forwarder and a regression run. They were restarted only on the owner's word.
+- A commit went through with failing tests: `pytest | tail` hid the exit code. The cause was environmental (the forwarder had died) and the tests passed after a restart. Since then every run captures `$?` before tailing.
+- `src/utils/lead_export` has an import cycle (`lead_export` -> `src.api` -> `batches` -> `lead_export`), and importing `src.workers` builds the Celery app. `authorize.py` and `keys.py` import those lazily.
+
+**Caught & fixed (Codex):**
+- Plan consult: a Critical (the inventory was incomplete) and five Highs. They covered the breakdown, snapshot compatibility, deploy order, the property input and the history rules.
+- P3a: a High. Flagged rows fell into `unclassified` and blocked the snapshot.
+- P3b: late contacts and notices. My concern that filtering would starve the batch was wrong: the WHERE runs before the LIMIT.
+- P3d design: a Critical. Address-only rows were silently allowed.
+- P3d code: a value with a trailing `|` was accepted as canonical, and some key errors were not fail-closed.
+
+**Pending / Handoff:**
+- P4: send paths (dialer outbox by id, Tracerfy dispatcher join, ingest quarantine) and the PII-emission inventory.
+- P5: write gates and the enforcer sweep. Also the owner/grantor subject adapter and a SELECT grant on `privacy_suppressions` for the loading role, both activation blockers.
+- P6: erasure. P7: admin activation, which lifts the 125 guard. P8: public intake.
+- Inventory gaps still open: 8c (`scripts/repair_orphaned_duplicate_flags.py` must reuse `actionable_sql` before its next run) and the optional 9.
+- Owner: COMPANY_POSTAL_ADDRESS and API_BASE_URL on api and worker; counsel review of D1-D9.
+
+**Facts learned:**
+- Pinned-SQL and pinned-snapshot tests exist (`test_skip_trace_claim_action`, `test_run_breakdown*`, `test_completion_notification`). A new predicate or bucket must update them on purpose.
+- The local venv lacks `sentry_sdk`, so `test_error_tracking_jobs.py` fails locally only.
 
 ## 2026-11-04 — Privacy suppression groundwork (compliance Phase 6 P1 + P2, local only)
 

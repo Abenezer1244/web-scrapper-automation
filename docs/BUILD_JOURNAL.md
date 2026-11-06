@@ -26,7 +26,7 @@ to understand *why* the code is the way it is and *what's been attempted before*
   - f4099434: `run_scrape_job` now requires the `records_found` write (retry once, else fail the attempt
     before save/reserve/bill). Watchdog: one aggregated ops alert for done + records_found NULL (7 days).
     NTS matcher beat refreshes pre_foreclosure leads from their own live notice (id-keyed, never blanks).
-  - 2c653fc6: migration 126 `nts_notices.issue_date`; an older weekly-PDF issue only fills gaps.
+  - 2c653fc6: migration 127 `nts_notices.issue_date`; an older weekly-PDF issue only fills gaps.
 - FE `fix/principal-owing-copy` (worktree `C:/Users/micha/bl-wt/fe-principal`), dd1d8e9: landing qualifies
   Principal Owing/trustee/TS# as "when we find the published sale notice"; batch check relabelled.
 
@@ -48,10 +48,10 @@ to understand *why* the code is the way it is and *what's been attempted before*
 reverted), and the new refresh would have carried that onto leads. Fixed in 2c653fc6; the negative control
 reproduces the revert.
 Codex review 2 (GATE FAIL, 2 x P2): legacy rows with no issue_date and the operator backfill script
-bypassed the guard. Fixed: _upsert_notice derives issue_date itself; migration 126 stamps existing PDF rows
+bypassed the guard. Fixed: _upsert_notice derives issue_date itself; migration 127 stamps existing PDF rows
 (prod: 143/143 PDF URLs parse). FE copy made per-field conditional (7617e19).
 
-**Pending / Handoff (owner):** deploy order (migration 126 runs on API boot, then worker); Clark coverage
+**Pending / Handoff (owner):** deploy order (migration 127 runs on API boot, then worker); Clark coverage
 disclosure; more legal-newspaper sources after a source-rights review; amount-kind marker for unlabelled
 Section IV amounts; 12 historical stale amounts sit on past/inactive notices (the refresh touches 0 today).
 

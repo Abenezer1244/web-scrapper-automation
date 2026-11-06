@@ -82,6 +82,7 @@ def test_the_property_anchor_is_the_scoped_parcel_only():
     "P|WA|king|1234-567890",       # parcel not normalised
     "P|WA||1234567890",            # no county
     "A|WA|king|1400 MAIN ST",      # the address branch is never keyed
+    "P|WA|king|1234|ATTACKER",     # anything after the parcel
     "1400 MAIN ST",
 ])
 def test_a_non_canonical_or_address_property_value_is_refused(value):
@@ -255,3 +256,37 @@ def test_a_load_that_fails_is_a_snapshot_error_not_an_empty_snapshot():
     conn.close()
     with pytest.raises(RuleSnapshotError):
         load_rule_snapshot(conn)
+
+
+def test_an_entity_rule_matches_the_entity_on_the_row():
+    rows = _history(["pending", "active"], subject=("entity", "smith family trust"))
+    d = authorize(_snap(rows), _row(party_name="SMITH FAMILY TRUST"), **_CTX)
+    assert d.outcome == WITHHELD
+
+
+def test_the_primary_phone_and_email_are_anchors():
+    phone = _history(["pending", "active"], anchor=("phone", "2065551234"))
+    email = _history(["pending", "active"], anchor=("email", "jsmith@example.test"))
+    assert authorize(_snap(phone), _row(parcel_id=None, phone="206-555-1234"),
+                     **_CTX).outcome == WITHHELD
+    assert authorize(_snap(email), _row(parcel_id=None, email="jsmith@example.test"),
+                     **_CTX).outcome == WITHHELD
+
+
+def test_an_unreadable_contact_is_no_anchor_but_the_person_still_goes_to_review():
+    """The contact decoder reads an unreadable value as None (src/utils/contact_decode.py)."""
+    rows = _history(["pending", "active"], anchor=("phone", "2065551234"))
+    d = authorize(_snap(rows), _row(parcel_id=None, phone=None, phones=[None, {"number": None}],
+                                    email=None, emails=[None]), **_CTX)
+    assert (d.outcome, d.reason) == (REVIEW, REVIEW_SUBJECT_WITHOUT_ANCHOR)
+
+
+def test_a_keyring_that_breaks_fails_the_load_and_the_decision(monkeypatch):
+    rows = _history(["pending", "active"])
+    snapshot = _snap(rows)
+    monkeypatch.setattr(settings, "PRIVACY_HMAC_CURRENT_VERSION", "not-a-version")
+    keys.reset_keyring_cache()
+    with pytest.raises(RuleSnapshotError):
+        build_snapshot(rows)
+    with pytest.raises(RuleSnapshotError):
+        authorize(snapshot, _row(), **_CTX)

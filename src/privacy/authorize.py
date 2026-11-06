@@ -127,7 +127,10 @@ def build_snapshot(rows) -> RuleSnapshot:
         groups[(_get(r, "rule_id"), _get(r, "key_version"),
                 _get(r, "normalization_version"))].append(r)
 
-    live = set(keys.live_versions()) if groups else set()
+    try:
+        live = set(keys.live_versions()) if groups else set()
+    except (KeyError, RuntimeError, ValueError) as exc:  # keyring misconfigured
+        raise RuleSnapshotError(f"privacy keyring unavailable: {exc}") from exc
     by_anchor: dict[tuple[str, str, str], list[_Rule]] = defaultdict(list)
     by_subject: dict[tuple[str, str, str], list[_Rule]] = defaultdict(list)
     versions: set[str] = set()
@@ -207,7 +210,9 @@ def _subjects(row: Any, record_type: str | None, county: str | None):
 def _hmac(kind: str, value: str, version: str) -> str:
     try:
         return keys.privacy_hmac(kind, value, version)
-    except (KeyError, RuntimeError) as exc:  # a key that vanished mid-operation
+    except (KeyError, RuntimeError, ValueError) as exc:
+        # A key that vanished mid-operation, or a value the key library refuses: the
+        # decision cannot be made, so the operation fails rather than allowing the row.
         raise RuleSnapshotError(f"privacy key {version} unavailable: {exc}") from exc
 
 

@@ -83,8 +83,11 @@ def property_anchor_value(parcel_id: str | None, county: str | None,
 
 
 def _canonical_property(value: str) -> str | None:
-    branch, state, county, parcel = (value.split("|", 3) + ["", "", ""])[:4]
-    return property_anchor_value(parcel, county, state) if branch == "P" else None
+    parts = value.split("|")
+    if len(parts) != 4 or parts[0] != "P":  # exactly P|STATE|county|PARCEL, nothing after
+        return None
+    _branch, state, county, parcel = parts
+    return property_anchor_value(parcel, county, state)
 
 
 def _no_canonical_form_yet(value: str) -> str | None:

@@ -1948,6 +1948,9 @@ class NtsNotice(Base):
     nod_date = Column(String(32), nullable=True)
     source_url = Column(String(512), nullable=True)
     raw_hash = Column(String(64), nullable=True)
+    # Newest weekly-PDF issue the values came from (migration 127); NULL for HTML
+    # sources. An older issue may only fill gaps (nts_crawler._upsert_notice).
+    issue_date = Column(Date, nullable=True)
     is_active = Column(Boolean, nullable=False, server_default=text("true"))
     fetched_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)

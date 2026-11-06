@@ -395,6 +395,54 @@ def _watchdog_stuck_jobs_impl() -> None:
     for kind, key, subject, body in pending_alerts:
         send_ops_alert(kind, key, subject, body)
 
+    _alert_done_without_count(now)
+
+
+# A week, not a day, so a monitoring outage longer than a day still surfaces the run
+# (Codex). Rows from before migration 099 (2026-09-20) are NULL by construction and
+# fall outside it.
+_DONE_WITHOUT_COUNT_LOOKBACK = timedelta(days=7)
+
+
+def _alert_done_without_count(now: datetime) -> list[str]:
+    """Ops-alert on any run that finished DONE without a recorded records_found.
+
+    run_scrape_job refuses to continue when the count cannot be written, so this
+    should never fire; it is the check that the refusal still holds. One aggregated
+    alert per cooldown, not one per job. Returns the job ids found. Never raises.
+    """
+    from sqlalchemy import text
+
+    from src.db.session import system_sync_session
+
+    try:
+        with system_sync_session() as db:
+            rows = db.execute(
+                text(
+                    "SELECT j.id, sc.county, sc.record_type FROM jobs j "
+                    "JOIN scraper_configs sc ON sc.id = j.scraper_config_id "
+                    "WHERE j.status = 'done' AND j.records_found IS NULL "
+                    "AND j.finished_at >= :since ORDER BY j.finished_at DESC"
+                ),
+                {"since": now - _DONE_WITHOUT_COUNT_LOOKBACK},
+            ).all()
+    except Exception:  # noqa: BLE001 — a monitoring read must not break the watchdog
+        _logger.warning("done-without-count check failed", exc_info=True)
+        return []
+    if not rows:
+        return []
+    from src.workers.ops_alerts import send_ops_alert
+
+    listed = "\n".join(f"{r.id}  {r.county} {r.record_type}" for r in rows[:20])
+    send_ops_alert(
+        "job_done_without_count", "jobs",
+        f"{len(rows)} run(s) finished without a recorded record count",
+        f"These runs finished DONE in the last {_DONE_WITHOUT_COUNT_LOOKBACK.days} days "
+        "with jobs.records_found NULL, so nothing proves what they extracted:\n\n"
+        f"{listed}\n\nCheck the job logs for the 'Scrape complete' line.",
+    )
+    return [str(r.id) for r in rows]
+
 
 # Probes per canary tick. A unit is one (connector, record type): probing only a
 # connector's first record type left every other type uncertified (P0-08, Codex).

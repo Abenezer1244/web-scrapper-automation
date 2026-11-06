@@ -17,6 +17,7 @@ Both ask this module for filenames, so a paper renaming its files is one edit he
 """
 from __future__ import annotations
 
+import re
 import urllib.parse
 from datetime import date, timedelta
 
@@ -112,3 +113,25 @@ def candidate_urls(source: str, today: date, weeks: int) -> list[list[str]]:
                     urls.append(url)
         out.append(urls)
     return out
+
+
+# The date at the end of every spelling above: "M-D-YY.pdf" or "MM-DD-YY.pdf".
+_ISSUE_DATE_RE = re.compile(r"(\d{1,2})-(\d{1,2})-(\d{2})\.pdf$", re.I)
+
+
+def issue_date_from_url(url: str | None) -> date | None:
+    """The issue date a Pacific Publishing PDF URL names, or None for any other URL.
+
+    The inverse of the name builders above. nts_crawler stores it so an older issue
+    can never overwrite values a newer issue already wrote.
+    """
+    if not url:
+        return None
+    path = urllib.parse.unquote(urllib.parse.urlsplit(url).path)
+    m = _ISSUE_DATE_RE.search(path.rsplit("/", 1)[-1])
+    if not m:
+        return None
+    try:
+        return date(2000 + int(m.group(3)), int(m.group(1)), int(m.group(2)))
+    except ValueError:
+        return None

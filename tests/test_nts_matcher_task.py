@@ -439,3 +439,112 @@ def test_bridged_match_is_idempotent_and_does_not_rewrite():
             assert r.auction_date == ids["auction"]
     finally:
         _cleanup(ids)
+
+
+# ── Matched leads follow their own notice (prod 2026-11-06: 11 stale rows, 2 notices) ──
+
+def test_refresh_matched_from_notices_follows_the_notice_never_blanks():
+    """A lead already matched to a notice picks up that notice's restated principal
+    and postponed sale date; a NULL notice amount never blanks the lead; an inactive
+    notice changes nothing."""
+    import uuid
+    from datetime import UTC, date, datetime, timedelta
+    from decimal import Decimal
+
+    from sqlalchemy import delete
+
+    from src.api.auth import hash_password
+    from src.db.models import Job, NtsNotice, Result, ScraperConfig, User
+    from src.db.session import SyncSessionLocal
+    from src.workers.nts_matcher_task import refresh_matched_from_notices
+
+    tag = uuid.uuid4().hex[:8]
+    old_sale = date.today() + timedelta(days=10)
+    new_sale = date.today() + timedelta(days=40)
+    ids = {}
+    with SyncSessionLocal() as db:
+        user = User(
+            id=str(uuid.uuid4()), email=f"ntsref_{tag}@test.bridgeleads.io",
+            password_hash=hash_password("TestPass123!"), plan="pro",
+            records_used=0, records_limit=1000,
+        )
+        db.add(user)
+        db.flush()
+        cfg = ScraperConfig(
+            id=str(uuid.uuid4()), user_id=user.id, name=f"nts refresh {tag}",
+            county="pierce", state="WA", record_type="pre_foreclosure",
+            fields=["party_name"], enrichment=[],
+            schedule={"frequency": "manual"}, deliver={"format": "csv", "emails": []},
+        )
+        db.add(cfg)
+        db.flush()
+        job = Job(id=str(uuid.uuid4()), user_id=user.id, scraper_config_id=cfg.id, status="done")
+        db.add(job)
+        db.flush()
+
+        def notice(ts, principal, active=True):
+            n = NtsNotice(
+                id=str(uuid.uuid4()), source="tacoma_daily_index", ts_number=f"TEST-{tag}-{ts}",
+                county="pierce", state="WA", auction_date=new_sale,
+                principal_owing=principal, is_active=active, fetched_at=datetime.now(UTC),
+            )
+            db.add(n)
+            db.flush()
+            return n.id
+
+        ts_cfg = ScraperConfig(
+            id=str(uuid.uuid4()), user_id=user.id, name=f"nts refresh ts {tag}",
+            county="pierce", state="WA", record_type="trustee_sale",
+            fields=["party_name"], enrichment=[],
+            schedule={"frequency": "manual"}, deliver={"format": "csv", "emails": []},
+        )
+        db.add(ts_cfg)
+        db.flush()
+        ts_job = Job(id=str(uuid.uuid4()), user_id=user.id, scraper_config_id=ts_cfg.id, status="done")
+        db.add(ts_job)
+        db.flush()
+
+        def lead(nid, job=job):
+            r = Result(
+                id=str(uuid.uuid4()), job_id=job.id, user_id=user.id,
+                party_name="TEST OWNER", auction_date=old_sale,
+                default_amount=Decimal("254015.94"), nts_notice_id=nid,
+            )
+            db.add(r)
+            db.flush()
+            return r.id
+
+        restated_nid = notice("a", Decimal("271098.08"))
+        ids["restated"] = lead(restated_nid)
+        # trustee_sale leads are rebuilt from frozen nts_source; never refreshed here
+        ids["auction_lead"] = lead(restated_nid, job=ts_job)
+        ids["unread"] = lead(notice("b", None))
+        ids["inactive"] = lead(notice("c", Decimal("1.00"), active=False))
+        db.commit()
+        uid, jids, cids = user.id, [job.id, ts_job.id], [cfg.id, ts_cfg.id]
+
+    try:
+        with SyncSessionLocal() as db:
+            assert refresh_matched_from_notices(db) >= 2
+            assert refresh_matched_from_notices(db) == 0  # idempotent
+        with SyncSessionLocal() as db:
+            restated = db.get(Result, ids["restated"])
+            assert restated.default_amount == Decimal("271098.08")
+            assert restated.auction_date == new_sale
+            unread = db.get(Result, ids["unread"])
+            assert unread.default_amount == Decimal("254015.94")  # NULL never blanks
+            assert unread.auction_date == new_sale
+            auction_lead = db.get(Result, ids["auction_lead"])
+            assert auction_lead.default_amount == Decimal("254015.94")
+            assert auction_lead.auction_date == old_sale
+            inactive = db.get(Result, ids["inactive"])
+            assert inactive.default_amount == Decimal("254015.94")
+            assert inactive.auction_date == old_sale
+    finally:
+        with SyncSessionLocal() as db:
+            db.execute(delete(Result).where(Result.job_id.in_(jids)))
+            db.execute(delete(NtsNotice).where(NtsNotice.ts_number.like(f"TEST-{tag}-%")))
+            db.execute(delete(Job).where(Job.id.in_(jids)))
+            db.execute(delete(ScraperConfig).where(ScraperConfig.id.in_(cids)))
+            db.execute(delete(User).where(User.id == uid))
+            db.commit()

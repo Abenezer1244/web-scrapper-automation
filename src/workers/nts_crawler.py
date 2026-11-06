@@ -16,6 +16,7 @@ from __future__ import annotations
 import time
 from datetime import UTC, datetime, timedelta
 
+from sqlalchemy import and_, case
 from sqlalchemy import text as _sa_text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
@@ -695,13 +696,32 @@ def _upsert_notice(db, model, row: dict, *, deed_reference: str | None = None) -
         ).first()
         was_inactive = prior is not None and not prior[0]
 
+    from src.scrapers.sources.nts_pdf_archive import issue_date_from_url
+
+    # Derived here, not by each caller, so the beat crawl and the operator backfill
+    # script cannot disagree (Codex). None for any non-PDF source URL.
     row = {**row, "id": str(uuid4())}
+    row.setdefault("issue_date", issue_date_from_url(row.get("source_url")))
     stmt = pg_insert(model).values(**row)
-    update_cols = {
-        c: (_func.coalesce(stmt.excluded[c], getattr(model, c))
-            if c in _COALESCE_ON_UPDATE else stmt.excluded[c])
-        for c in row if c not in _NO_UPDATE
-    }
+    # A back issue read after a newer one must not put the newer one's values back
+    # (a postponed sale reverting to its original date). Only PDF rows carry an
+    # issue_date, so HTML sources keep newest-read-wins. An older issue still fills
+    # gaps and still moves fetched_at/source_url, which the archive sweep's
+    # "is this issue due" check reads (migration 127, Codex).
+    older = and_(
+        stmt.excluded.issue_date.isnot(None), model.issue_date.isnot(None),
+        stmt.excluded.issue_date < model.issue_date,
+    )
+
+    def _value(c: str):
+        new = (_func.coalesce(stmt.excluded[c], getattr(model, c))
+               if c in _COALESCE_ON_UPDATE else stmt.excluded[c])
+        if c in _COALESCE_ON_UPDATE or c == "is_active":
+            return case((older, _func.coalesce(getattr(model, c), stmt.excluded[c])), else_=new)
+        return new
+
+    update_cols = {c: _value(c) for c in row if c not in _NO_UPDATE}
+    update_cols["issue_date"] = _func.greatest(model.issue_date, stmt.excluded.issue_date)
     stmt = stmt.on_conflict_do_update(
         constraint="uq_nts_notices_source_ts", set_=update_cols
     )

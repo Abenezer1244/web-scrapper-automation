@@ -106,6 +106,9 @@ def match_nts_notices() -> dict:
     cutoff = datetime.now(UTC) - _td_days(_RECENT_DAYS)
     total_candidates = total_matched = 0
     with system_sync_session() as db:
+        # First, so a linked lead holding an outdated PAST date is brought current
+        # instead of re-entering the fuzzy candidate pool below (Codex).
+        refreshed = refresh_matched_from_notices(db)
         for county in NTS_MATCH_COUNTIES:
             result_rows = db.execute(
                 _sa_text(
@@ -128,9 +131,46 @@ def match_nts_notices() -> dict:
             matched = _match_and_write(db, [dict(r._mapping) for r in result_rows], county=county)
             total_candidates += len(result_rows)
             total_matched += matched
-    _logger.info("NTS match (beat): %d leads enriched from %d candidates across %s",
-                 total_matched, total_candidates, ",".join(NTS_MATCH_COUNTIES))
-    return {"candidates": total_candidates, "matched": total_matched}
+    _logger.info("NTS match (beat): %d leads enriched from %d candidates across %s; "
+                 "%d matched lead(s) refreshed from their notice",
+                 total_matched, total_candidates, ",".join(NTS_MATCH_COUNTIES), refreshed)
+    return {"candidates": total_candidates, "matched": total_matched, "refreshed": refreshed}
+
+
+# A matched lead keeps the auction date and principal its notice carried at match
+# time, because the candidate query above only reloads unset or past rows. When the
+# trustee re-publishes (sale postponed, amount restated) or a re-parse corrects the
+# notice, the lead went on showing the old figure: prod 2026-11-06 had 11 rows on 2
+# notices with a stale principal. This sync is keyed on the notice id the lead already
+# carries, never on a fuzzy match. A NULL notice amount is "could not read", not "no
+# longer stated" (see nts_crawler._COALESCE_ON_UPDATE), so it never blanks a value.
+# pre_foreclosure only: a trustee_sale lead is rebuilt from its frozen nts_source by
+# trustee_sale_finalize on retry, so a refresh there would be silently undone. CSVs
+# already delivered keep the figure they shipped with; the app shows the current one.
+_REFRESH_MATCHED_SQL = """
+    UPDATE results r SET
+        default_amount = COALESCE(n.principal_owing, r.default_amount),
+        auction_date = n.auction_date
+    FROM nts_notices n, jobs j, scraper_configs sc
+    WHERE r.nts_notice_id = n.id
+      AND j.id = r.job_id AND sc.id = j.scraper_config_id
+      AND sc.record_type = 'pre_foreclosure'
+      AND n.is_active AND n.auction_date >= :today
+      AND (r.auction_date IS DISTINCT FROM n.auction_date
+           OR (n.principal_owing IS NOT NULL
+               AND r.default_amount IS DISTINCT FROM n.principal_owing))
+"""
+
+
+def refresh_matched_from_notices(db) -> int:
+    """Re-sync matched leads to their own live notice's date and principal. Commits."""
+    from sqlalchemy import text as _sa_text
+
+    n = db.execute(
+        _sa_text(_REFRESH_MATCHED_SQL), {"today": datetime.now(UTC).date()}
+    ).rowcount or 0
+    db.commit()
+    return n
 
 
 def match_results_inline(db, result_dicts: list[dict[str, Any]], county: str) -> int:

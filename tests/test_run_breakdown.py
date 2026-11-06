@@ -175,6 +175,7 @@ def test_owner_with_a_reconciling_partition_writes_the_six_values():
         "breakdown_dropped_before_save": 2, "breakdown_no_address": 7,
         "breakdown_same_run_merged": 0, "breakdown_already_delivered": 246,
         "breakdown_not_qualified": 0, "breakdown_over_quota": 0, "breakdown_new": 12,
+        "breakdown_privacy_withheld": 0,
     }
     assert sum(cols.values()) == 267
 
@@ -237,8 +238,10 @@ def _stored(**over):
 def test_a_valid_snapshot_is_returned():
     got, reason = breakdown_from_job(_stored())
     assert reason is None
+    # _stored() names no privacy_withheld column: a pre-126 snapshot reads it as 0.
     assert got == {"dropped_before_save": 2, "no_address": 7, "same_run_merged": 0,
-                   "already_delivered": 246, "not_qualified": 0, "over_quota": 0, "new": 12}
+                   "already_delivered": 246, "not_qualified": 0, "over_quota": 0, "new": 12,
+                   "privacy_withheld": 0}
 
 
 def test_no_snapshot_is_not_an_error():

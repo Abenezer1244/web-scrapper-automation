@@ -17,6 +17,9 @@ refresh fires on basis-only change and creates a missing nts object (P2); invari
       _write_match and the refresh; both now guard jsonb_typeof = 'object' (test failed before the fix)
 - [x] 1090 passed (nts/trustee/breakdown/finalize/segments/lead_export/batch_export/migration/privacy), ruff clean,
       128 down/up clean
+- [x] Codex review 1 GATE FAIL (2 x P2): basis moves only with its amount (older issue cannot label a retained
+      amount); missing amounts resweep before unknown-basis rows. Both regressions fail without the fix.
+- [x] Codex re-review: GATE PASS. 618 NTS/trustee tests pass, ruff clean.
 ## Phase B BE surfaces (after approval)
 - [ ] trustee_sale nts_source + finalizer carry amount_basis (existing frozen snapshots stay unknown)
 - [ ] CSV "Amount Type" appended at the end of each public layout; segments project the basis; API default_amount_basis

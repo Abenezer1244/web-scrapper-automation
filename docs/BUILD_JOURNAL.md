@@ -19,6 +19,26 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-11-06 (later): owner decisions applied; NTS amount type marker Phase A
+
+**Built:** #598 rebased on main, issue_date migration renumbered 126 -> 127 (main's privacy 126 landed first).
+FE #314 also fixes a date bomb in lib/session-cookie.test.mjs (FUTURE = today 12:00 GMT failed master).
+Prod data (owner-approved): 12 stale pre_foreclosure default_amounts synced to their notice principal, keyed on
+nts_notice_id, exact-count guarded (12 updated, 0 remaining); before-values kept in the session log. Verified the
+notice values were the newest issue first (King last read from the 10-21-26 issue before its 10/30 sale).
+Phase A of the amount marker (branch feat/nts-amount-basis, stacked on #598): migration 128
+nts_notices.principal_owing_basis ('principal' | 'sum_owing', NULL unknown), parser returns amount+basis from one
+function, crawler pairs basis with its amount, resweep re-reads unknown-basis amounts after missing ones, matcher +
+refresh carry enrichment_data.nts.amount_basis.
+**Found:** Result(enrichment_data=None) stores JSON null; `COALESCE(...)::jsonb || {...}` turned it into an array in
+_write_match. Latent only (prod: 267,664 objects, 0 null/array). Guarded with jsonb_typeof.
+**Codex:** consult = PLAN CHANGES NEEDED (all folded in); review 1 GATE FAIL 2 x P2 (fixed); re-review GATE PASS.
+**Blocked:** merging #314/#598 was refused by the auto-mode permission classifier; owner merges.
+**Source rights (owner Q3):** no King/Clark source is clean to crawl (DJC robots disallow + ToS; WNPA ToU bars
+scraping with liquidated damages). Licensing route recommended; see the session's review notes.
+**Pending:** Phase B (trustee_sale snapshot, CSV "Amount Type" appended at the end, segments projection, API),
+Phase C (FE label per basis).
+
 ## 2026-11-06 — Trustee-sale "silent done" audit, records_found invariant, NTS version guard, Principal Owing copy
 
 **Built / Shipped (local branches only, nothing pushed or deployed):**

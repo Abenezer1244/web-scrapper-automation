@@ -141,6 +141,26 @@ def test_a_rule_row_a_result_points_at_cannot_be_deleted(conn) -> None:
                      {"s": sid}) == "23503"
 
 
+def test_the_constraints_are_not_valid_by_design(conn) -> None:
+    """NOT VALID skips only the scan of existing rows (all NULL); new writes are checked
+    (proven above). A later VALIDATE is optional, never required for correctness."""
+    rows = dict(conn.execute(text(
+        "SELECT conname, convalidated FROM pg_constraint WHERE conrelid = 'results'::regclass "
+        "AND conname IN ('fk_results_privacy_suppression', 'ck_results_privacy_flag_pair')"
+    )).all())
+    assert rows == {"fk_results_privacy_suppression": False, "ck_results_privacy_flag_pair": False}
+
+
+def test_a_flagged_result_still_goes_with_its_job(conn) -> None:
+    """The account purge and job deletion cascade into results; the flag must not block
+    them (the FK restricts deleting the RULE row, never the result)."""
+    res = _result_row(conn)
+    sid = _rule_row(conn)
+    conn.execute(text(_FLAG), {"at": "2026-11-06T00:00:00Z", "sid": sid, "i": res})
+    job = conn.execute(text("SELECT job_id FROM results WHERE id = :i"), {"i": res}).scalar()
+    assert _sqlstate(conn, "DELETE FROM jobs WHERE id = :j", {"j": job}) is None
+
+
 def test_126_downgrade_drops_and_upgrade_restores_them(conn) -> None:
     mig = _mig126()
     with Operations.context(MigrationContext.configure(conn)):

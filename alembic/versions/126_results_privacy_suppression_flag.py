@@ -12,7 +12,13 @@ never overwrites quota or qualification state and quota never overwrites privacy
                                   so a review after key rotation can tell exactly
                                   which rule instance applied. FK, RESTRICT: a rule row
                                   a result points at cannot be deleted (rule rows are
-                                  append-only anyway).
+                                  append-only anyway). No index on it: rule rows
+                                  are kept indefinitely (design D5) and no role
+                                  holds DELETE on them, so RESTRICT never scans.
+                                  Any future rule-delete path must first add
+                                  CREATE INDEX CONCURRENTLY ... WHERE
+                                  privacy_suppression_id IS NOT NULL (a plain
+                                  CREATE INDEX here would block writes on results).
   jobs.breakdown_privacy_withheld the run-count bucket for those rows, so the snapshot
                                   partition still accounts for every saved row
                                   (records_found = dropped_before_save + buckets).

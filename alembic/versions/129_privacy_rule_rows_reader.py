@@ -13,7 +13,8 @@ roles and enabled RLS with no policy, and the production worker role
     snapshot is empty and every row is allowed. That fails OPEN, silently.
 
 So the read goes through a SECURITY DEFINER function owned by the migration role (the
-table owner, which RLS does not apply to). It returns exactly the columns the loader
+table owner, which RLS does not apply to unless FORCEd; the migration aborts unless both
+hold, and tests/test_privacy_rule_reader.py keeps checking them). It returns exactly the columns the loader
 needs: never request_id, never anything from the request or payload tables. It is
 STABLE, schema-qualified, with search_path pinned (the 029 pattern). EXECUTE is revoked
 from PUBLIC and granted to bridgeleads_system only (guarded: CI has no runtime roles).
@@ -42,6 +43,21 @@ _RUNTIME_READER = "bridgeleads_system"
 
 def upgrade() -> None:
     op.execute(text("SET LOCAL lock_timeout = '5s'"))
+    # The function only sees every row because its owner (this migration's role) owns
+    # the table and RLS is not FORCEd on it. If either drifts, the function would
+    # return zero rows without an error, an allow-all snapshot. Refuse to install it.
+    op.execute("""
+        DO $invariant$
+        BEGIN
+            IF (SELECT c.relowner <> (SELECT oid FROM pg_roles WHERE rolname = current_user)
+                       OR c.relforcerowsecurity
+                FROM pg_class c WHERE c.oid = 'public.privacy_suppressions'::regclass) THEN
+                RAISE EXCEPTION 'privacy_rule_rows: the migration role must own '
+                    'privacy_suppressions and RLS must not be forced on it';
+            END IF;
+        END
+        $invariant$
+    """)
     op.execute("""
         CREATE FUNCTION public.privacy_rule_rows()
         RETURNS TABLE (

@@ -86,6 +86,17 @@ def test_it_is_a_pinned_definer_function_public_cannot_execute(conn) -> None:
     assert public_exec is False
 
 
+def test_its_owner_owns_the_table_and_rls_is_not_forced(conn) -> None:
+    """Otherwise the function would see zero rows without an error: allow-all."""
+    same_owner, forced = conn.execute(text(
+        "SELECT p.proowner = c.relowner, c.relforcerowsecurity "
+        "FROM pg_proc p, pg_class c "
+        "WHERE p.oid = 'public.privacy_rule_rows()'::regprocedure "
+        "  AND c.oid = 'public.privacy_suppressions'::regclass")).one()
+    assert same_owner is True
+    assert forced is False
+
+
 @pytest.mark.parametrize("role,expected", [("bridgeleads_system", True),
                                            ("bridgeleads_app", False)])
 def test_runtime_roles(conn, role, expected) -> None:
@@ -101,8 +112,8 @@ def test_the_grant_script_grants_the_function_to_workers_only() -> None:
     # grant there, workers would fail closed and every send would stop.
     body = (Path(__file__).resolve().parent.parent
             / "scripts/provision_rls_roles.sql").read_text(encoding="utf-8")
-    assert "GRANT EXECUTE ON FUNCTION privacy_rule_rows() TO bridgeleads_system;" in body
-    assert "REVOKE ALL ON FUNCTION privacy_rule_rows() FROM PUBLIC, bridgeleads_app;" in body
+    assert "GRANT EXECUTE ON FUNCTION public.privacy_rule_rows() TO bridgeleads_system;" in body
+    assert "REVOKE ALL ON FUNCTION public.privacy_rule_rows() FROM PUBLIC, bridgeleads_app;" in body
 
 
 def test_a_fresh_uuid_rule_id_round_trips_as_text(conn) -> None:

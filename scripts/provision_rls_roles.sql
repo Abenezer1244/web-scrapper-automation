@@ -532,8 +532,8 @@ BEGIN
         -- Workers read rules ONLY through migration 129's definer function (never a
         -- table grant: RLS with no policy would hand them an empty, allow-all set).
         IF to_regprocedure('public.privacy_rule_rows()') IS NOT NULL THEN
-            REVOKE ALL ON FUNCTION privacy_rule_rows() FROM PUBLIC, bridgeleads_app;
-            GRANT EXECUTE ON FUNCTION privacy_rule_rows() TO bridgeleads_system;
+            REVOKE ALL ON FUNCTION public.privacy_rule_rows() FROM PUBLIC, bridgeleads_app;
+            GRANT EXECUTE ON FUNCTION public.privacy_rule_rows() TO bridgeleads_system;
         END IF;
     END IF;
     -- Job degradations (117): worker-only history of phases that failed on a DONE

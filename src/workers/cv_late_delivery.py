@@ -45,7 +45,11 @@ from datetime import UTC, datetime, timedelta
 from celery.exceptions import SoftTimeLimitExceeded, TimeLimitExceeded
 from sqlalchemy import text as sa_text
 
-from src.api.lead_actionability import DELIVERY_EXCLUDED_KEY, NOT_QUALIFIED
+from src.api.lead_actionability import (
+    DELIVERY_EXCLUDED_KEY,
+    NOT_QUALIFIED,
+    not_privacy_suppressed_sql,
+)
 from src.api.lead_qualification import POLICY_CODE_VIOLATION, POLICY_KEY, qualified_sql
 from src.config import settings
 from src.utils.logger import setup_logger
@@ -95,9 +99,12 @@ _STATEMENT_TIMEOUT_MS = 10000
 _HELD = (f"r.enrichment_data::jsonb->>'{POLICY_KEY}' = '{POLICY_CODE_VIOLATION}' "
          f"AND r.enrichment_data::jsonb->>'{DELIVERY_EXCLUDED_KEY}' = '{NOT_QUALIFIED}' "
          f"AND NOT (r.enrichment_data::jsonb ? '{LATE_KEY}')")
+# Not withheld by a privacy rule (migration 126): a held row a person asked to be removed
+# from must never be delivered or billed late. In discovery AND under the row lock, so a
+# row flagged between the two is skipped as stale.
 _ELIGIBLE = (f"r.is_duplicate = false AND r.duplicate_reason IS NULL "
              f"AND jsonb_typeof(r.enrichment_data::jsonb) = 'object' AND {_HELD} "
-             f"AND {qualified_sql('r')}")
+             f"AND {qualified_sql('r')} AND {not_privacy_suppressed_sql('r')}")
 
 # Discovery only (ids, on the system session: it spans accounts). Round-robin across
 # accounts, oldest first within each. Every condition is decided again under the locks,

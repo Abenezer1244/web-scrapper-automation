@@ -88,7 +88,8 @@ _SCRAPE_INSERT_ONE_ROW = (
     "e) JOIN public.results r ON r.id = v.result_id AND r.user_id = v.user_id AND r.job_i"
     "d = v.job_id JOIN public.jobs j ON j.id = v.job_id AND j.user_id = v.user_id WHERE r"
     ".user_id = CAST(%(uid)s AS uuid) AND j.user_id = CAST(%(uid)s AS uuid) AND r.skip_tr"
-    "ace_status = %(claimable)s ON CONFLICT (result_id) WHERE status IN ('queued', 'submi"
+    "ace_status = %(claimable)s AND r.privacy_suppressed_at IS NULL "
+    "ON CONFLICT (result_id) WHERE status IN ('queued', 'submi"
     "tting', 'submitted') DO NOTHING RETURNING result_id"
 )
 _SCRAPE_PARAM_KEYS = {

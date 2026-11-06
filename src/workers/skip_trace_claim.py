@@ -57,6 +57,7 @@ from uuid import uuid4
 
 from sqlalchemy import text
 
+from src.api.lead_actionability import not_privacy_suppressed_sql
 from src.utils.logger import setup_logger
 
 _logger = setup_logger(__name__)
@@ -694,6 +695,10 @@ def claim_skip_trace_rows(
         f"{action_join}"
         f"WHERE r.user_id = CAST(:uid AS uuid) AND j.user_id = CAST(:uid AS uuid) "
         f"  AND r.skip_trace_status = :claimable "
+        # Every paid lookup is claimed here, so a row withheld by a privacy rule
+        # (migration 126) is refused here too, whatever the caller checked: it
+        # drops out of RETURNING, which every caller already reads as "not won".
+        f"  AND {not_privacy_suppressed_sql('r')} "
         f"{conflict_sql} "
         f"RETURNING result_id"
     )

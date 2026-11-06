@@ -125,3 +125,23 @@ def test_a_row_mapping_is_read_by_key():
     with sync_engine.connect() as conn:
         m = conn.execute(select(literal("SMITH JOHN").label("party_name"))).mappings().one()
     assert authorize_mod._get(m, "party_name") == "SMITH JOHN"
+
+
+async def test_a_lead_without_its_owners_config_is_withdrawn_while_rules_are_active(
+    business_user, starter_user, monkeypatch,
+):
+    """Its county is unknown, so its parcel cannot be checked: never bought unchecked."""
+    from sqlalchemy import text
+
+    from src.db.session import system_sync_session
+
+    rid, pid = _lead_queued(business_user.id, 6)
+    from tests.test_privacy_tracerfy_ingest import _point_job_at_strangers_config
+
+    with system_sync_session() as db:
+        job = db.execute(text("SELECT job_id::text FROM results WHERE id = :r"),
+                         {"r": rid}).scalar_one()
+    _point_job_at_strangers_config(job, starter_user.id)
+    _rules(monkeypatch, _active_rule(parcel="9999999999", name="ROE RICK Q"))
+    _dispatch()
+    assert _pending_status(pid) == "cancelled"

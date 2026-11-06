@@ -96,7 +96,8 @@ async def test_a_withheld_answer_is_quarantined_and_the_other_is_stored(
                         lambda db: build_snapshot(_rule(_PARCEL)))
     before = _usage(starter_user.id)
 
-    _ingest(qid)
+    out = _ingest(qid)
+    assert out["hits"] == 1                                # the quarantined answer is not a hit
 
     row = _result_row(held["result_id"])
     assert (row.skip_trace_status, row.phone, row.email, row.phones, row.emails) == (
@@ -165,3 +166,37 @@ def test_a_contact_lookup_action_settles_a_quarantined_lead_as_released():
     assert "'quarantined'" in contact_lookups._MAPPABLE
     src = inspect.getsource(contact_lookups)
     assert 'status in ("cancelled", "quarantined")' in src
+
+
+def _point_job_at_strangers_config(job_id: str, stranger_id: str) -> None:
+    """A corrupt pairing: the job names a config another tenant owns."""
+    import uuid as _uuid
+
+    from src.db.models import ScraperConfig
+
+    cfg = str(_uuid.uuid4())
+    with system_sync_session() as db:
+        db.add(ScraperConfig(id=cfg, user_id=stranger_id, name="stranger", county="king",
+                             state="WA", record_type="probate", fields=[], enrichment=[],
+                             schedule={"frequency": "manual"}, deliver={"emails": []}))
+        db.flush()
+        db.execute(text("UPDATE jobs SET scraper_config_id = :c WHERE id = :j"),
+                   {"c": cfg, "j": job_id})
+        db.commit()
+
+
+async def test_a_lead_whose_config_is_another_tenants_is_quarantined(
+    starter_user, business_user, answers, monkeypatch,
+):
+    """Corrupt pairing: the job's config belongs to someone else, so the lead's county is
+    unknown and its parcel cannot be checked. With a rule active it is never stored."""
+    qid = _next_queue_id()
+    seed = _seed(starter_user.id, qid, [("6 FIR ST", "TACOMA", "WA")])
+    [row] = seed["rows"]
+    _point_job_at_strangers_config(seed["job_id"], business_user.id)
+    answers(_csv(_ANSWER.format(addr="6 FIR ST")))
+    monkeypatch.setattr(authorize_mod, "load_rule_snapshot",
+                        lambda db: build_snapshot(_rule("5555555555", name="ROE RICK")))
+    _ingest(qid)
+    assert _pending_status(row["pending_id"]) == "quarantined"
+    assert _result_row(row["result_id"]).phone is None

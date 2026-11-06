@@ -1429,8 +1429,8 @@ def _partition_still_deliverable(db, rows: list, snapshot) -> tuple[list, list, 
             ScraperConfig.state,
         )
         .join(Job, Job.id == Result.job_id)
-        # Owner-matched; outer so a lead whose config is gone is still decided
-        # (no county: no parcel anchor, so a rule's subject alone -> review).
+        # Owner-matched; outer so a lead without one is still seen and decided
+        # (withdrawn while any rule is active, below).
         .outerjoin(ScraperConfig, (ScraperConfig.id == Job.scraper_config_id)
                    & (ScraperConfig.user_id == Job.user_id))
         .where(
@@ -1456,8 +1456,13 @@ def _partition_still_deliverable(db, rows: list, snapshot) -> tuple[list, list, 
                                                       and seen["stamped"]):
             drop.append(r)
         elif billed or status == "done" or terminal:
-            if authorize(snapshot, seen, record_type=seen["record_type"],
-                         county=seen["county"], state=seen["state"]).deliverable:
+            # No owner-matched config (none, or another tenant's): no county, so no
+            # parcel anchor to check. With any rule active that is withdrawn, never
+            # bought unchecked; with none active there is nothing to check.
+            unscoped = seen["record_type"] is None and bool(snapshot.by_anchor)
+            if not unscoped and authorize(
+                    snapshot, seen, record_type=seen["record_type"],
+                    county=seen["county"], state=seen["state"]).deliverable:
                 keep.append(r)
             else:
                 drop.append(r)

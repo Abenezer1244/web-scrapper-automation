@@ -535,8 +535,10 @@ def _release_recheck_chain(queue_id: int) -> None:
 def _privacy_withheld(db, snapshot, pending: list) -> set:
     """Pending row ids whose lead a privacy rule withholds or holds for review.
 
-    One read of the leads (tenant-paired) with their owner-matched config's record
-    type, county and state; authorize() is pure. No active rule: nothing to read."""
+    One read of the leads with their job and config, every join pinned to the lead's
+    own tenant; authorize() is pure. No active rule: nothing to read. A pending row
+    whose lead, job or config cannot be read that way cannot be authorized (no county
+    means no parcel anchor), so it is treated as withheld: fail closed, never stored."""
     if not snapshot.by_anchor or not pending:
         return set()
     from sqlalchemy import select, tuple_
@@ -548,16 +550,16 @@ def _privacy_withheld(db, snapshot, pending: list) -> set:
         select(Result.id, Result.user_id, Result.parcel_id, Result.party_name, Result.heirs,
                Result.phone, Result.phones, Result.email, Result.emails,
                ScraperConfig.record_type, ScraperConfig.county, ScraperConfig.state)
-        .join(Job, Job.id == Result.job_id)
-        .outerjoin(ScraperConfig, (ScraperConfig.id == Job.scraper_config_id)
-                   & (ScraperConfig.user_id == Job.user_id))
+        .join(Job, (Job.id == Result.job_id) & (Job.user_id == Result.user_id))
+        .join(ScraperConfig, (ScraperConfig.id == Job.scraper_config_id)
+              & (ScraperConfig.user_id == Result.user_id))
         .where(tuple_(Result.id, Result.user_id).in_(
             [(p.result_id, p.user_id) for p in pending]))
     ).mappings().all()
-    blocked = {(str(m["id"]), str(m["user_id"])) for m in found
-               if not authorize(snapshot, m, record_type=m["record_type"],
-                                county=m["county"], state=m["state"]).deliverable}
-    return {p.id for p in pending if (str(p.result_id), str(p.user_id)) in blocked}
+    allowed = {(str(m["id"]), str(m["user_id"])) for m in found
+               if authorize(snapshot, m, record_type=m["record_type"],
+                            county=m["county"], state=m["state"]).deliverable}
+    return {p.id for p in pending if (str(p.result_id), str(p.user_id)) not in allowed}
 
 
 def _quarantine(db, rows: list, now) -> None:

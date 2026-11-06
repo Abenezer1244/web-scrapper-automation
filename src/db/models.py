@@ -1919,6 +1919,10 @@ class NtsNotice(Base):
     __tablename__ = "nts_notices"
     __table_args__ = (
         UniqueConstraint("source", "ts_number", name="uq_nts_notices_source_ts"),
+        CheckConstraint(
+            "principal_owing_basis IN ('principal', 'sum_owing')",
+            name="ck_nts_notices_principal_owing_basis",
+        ),
         Index(
             "ix_nts_notices_addr_active", "property_address_normalized",
             postgresql_where=text("is_active AND property_address_normalized IS NOT NULL"),
@@ -1944,6 +1948,9 @@ class NtsNotice(Base):
     trustee = Column(String(255), nullable=True)
     beneficiary = Column(String(255), nullable=True)
     principal_owing = Column(Numeric(12, 2), nullable=True)
+    # 'principal' | 'sum_owing' (an unlabelled Section IV total); NULL = unknown,
+    # never presented as principal (migration 128).
+    principal_owing_basis = Column(String(16), nullable=True)
     note_amount = Column(Numeric(12, 2), nullable=True)
     nod_date = Column(String(32), nullable=True)
     source_url = Column(String(512), nullable=True)

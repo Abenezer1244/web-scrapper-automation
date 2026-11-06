@@ -664,7 +664,7 @@ _NO_UPDATE = frozenset({"id", "source", "ts_number", "created_at"})
 _COALESCE_ON_UPDATE = frozenset({
     "auction_date", "auction_time", "auction_location", "parcel", "property_address",
     "property_address_normalized", "grantor", "trustee", "beneficiary",
-    "principal_owing", "note_amount", "nod_date", "county", "state",
+    "principal_owing", "principal_owing_basis", "note_amount", "nod_date", "county", "state",
 })
 
 
@@ -786,7 +786,10 @@ _RESWEEP_SELECT = _sa_text(
     """
     SELECT id, ts_number, source_url FROM nts_notices
     WHERE source = :source AND is_active AND auction_date >= :today
-      AND principal_owing IS NULL AND source_url IS NOT NULL
+      -- An amount with no basis was parsed before migration 128: re-read it once so
+      -- it stops showing as an amount of unknown type.
+      AND (principal_owing IS NULL OR principal_owing_basis IS NULL)
+      AND source_url IS NOT NULL
       AND (fetched_at IS NULL OR fetched_at < :stale_before)
     ORDER BY auction_date ASC
     LIMIT :lim
@@ -798,7 +801,8 @@ _TOUCH_FETCHED = _sa_text("UPDATE nts_notices SET fetched_at = :now WHERE id = :
 def _resweep_null_amount_notices(
     db, model, *, source: str, county: str, today, fetch, parse, notice_to_row,
 ) -> dict:
-    """Re-fetch a bounded batch of active, future-dated notices with NO amount.
+    """Re-fetch a bounded batch of active, future-dated notices with NO amount (or an
+    amount of unknown basis, parsed before migration 128).
 
     ``fetch(url) -> (status_code, html)``; ``parse(html) -> parsed dict``;
     ``notice_to_row`` is the source's row builder. A re-parse that now yields an

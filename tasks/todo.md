@@ -1,3 +1,28 @@
+# NTS amount type marker (owner decision 2026-11-06: keep fallback amounts, mark them)
+
+Branch `feat/nts-amount-basis` (worktree `C:/Users/micha/bl-wt/nts-basis`), stacked on fix/trustee-sale-silent-done (#598).
+Basis: 'principal' (Section IV figure labelled principal) | 'sum_owing' (unlabelled first figure, e.g. matured loans) | NULL (legacy/unknown).
+Labels: only 'principal' says "Principal owing"; 'sum_owing' AND unknown say "Amount stated in notice" (Codex P2: NULL must not imply principal).
+Codex consult (PLAN CHANGES NEEDED, all folded in): notice_to_row + model + matcher SELECT plumbing (P1); trustee_sale frozen
+snapshot carries it (P1); segments projection; CSV column appended at the END of each layout, positions unchanged (P2);
+refresh fires on basis-only change and creates a missing nts object (P2); invariant only for fresh parses (P3).
+
+## Phase A BE data (5 src files)
+- [x] migration 128 nts_notices.principal_owing_basis + CHECK; model column
+- [x] parser returns (amount, basis) from one function; notice_to_row carries it
+- [x] crawler: basis COALESCEd like the amount; resweep also picks active notices with an amount but no basis
+- [x] matcher: SELECT + nts blob amount_basis; refresh syncs basis (basis-only change, missing nts object)
+- [x] tests: labelled/matured/none, row propagation, older-issue, refresh basis-only / absent nts / NULL basis
+- [x] found + fixed: JSON-null enrichment_data (Result(enrichment_data=None)) || object built an ARRAY in
+      _write_match and the refresh; both now guard jsonb_typeof = 'object' (test failed before the fix)
+- [x] 1090 passed (nts/trustee/breakdown/finalize/segments/lead_export/batch_export/migration/privacy), ruff clean,
+      128 down/up clean
+## Phase B BE surfaces (after approval)
+- [ ] trustee_sale nts_source + finalizer carry amount_basis (existing frozen snapshots stay unknown)
+- [ ] CSV "Amount Type" appended at the end of each public layout; segments project the basis; API default_amount_basis
+## Phase C FE (after approval)
+- [ ] results/batch label per basis
+
 # Trustee-sale "silent done" + Principal Owing coverage (2026-11-06)
 
 BE branch `fix/trustee-sale-silent-done` (worktree `C:/Users/micha/bl-wt/ts-silent`, base origin/main 26d33270).

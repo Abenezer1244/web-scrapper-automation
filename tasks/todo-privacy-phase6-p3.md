@@ -1,0 +1,105 @@
+# Phase 6 P3: authorization service, read-path enforcement, dedicated flag, tab gaps
+
+Branch `feat/privacy-phase6-p3` (BE). Design: `docs/legal/audit-2026-11/06-DESIGN-PRIVACY-REQUESTS-AND-SUPPRESSION.md`
+sections 5, 6, 10 and 11 (D1-D9 adopted 2026-11-05, pending counsel).
+
+**Nothing activates in P3.** The DB guard (`state = 'pending'` only) and
+`IMPLEMENTED_ENFORCEMENT_VERSION = 0` stay until P7. No code in P3 sets the new flag, so every
+read path returns exactly what it returns today; the change is a predicate that is always true
+in production until P5/P7 write the flag.
+
+## Code map (verified 2026-11-06)
+
+Customer-facing reads that already go through the central predicate (`src/api/lead_actionability.py`):
+- `actionable_condition` / `actionable_sql` / `is_actionable`: download, account export, segments,
+  batch SQL, batch export, analytics, cv late delivery, R2 job export (`tasks.py` `is_actionable`),
+  dialer, skip-trace dispatcher, contact-lookup planner.
+- `shown_condition`: results list (lead tabs), tab counts, batch listing.
+- `withheld_sql` / `withheld_condition`: anything that SPENDS money on a row.
+- `deliverable_before_cap_sql`: what the plan cap ranks.
+
+Gaps (do not use the central predicate):
+- `no_address` and `not_qualified` tabs: `list_condition` in `src/api/results_category.py`, and the
+  route skips `shown_condition` for them (`jobs.py:680`).
+- Contact-lookup confirm proves quoted ids with raw SQL (`jobs.py:1797`), no actionability clause.
+- Run breakdown (`src/api/run_breakdown.py`): ONE CASE; `new` is `actionable_sql` verbatim, so a
+  row failing a new actionability clause falls to `unclassified` and blocks the snapshot.
+- Download existence probe (`jobs.py:2636`, `has_address_condition`): returns no rows, only
+  decides 404 vs header-only CSV. No change.
+
+## Slices (each ≤5 files, verified, Codex-reviewed)
+
+### P3a: dedicated flag + central predicate
+- [ ] Migration 126: `results.privacy_suppressed_at timestamptz NULL`, `results.privacy_rule_id uuid NULL`,
+      CHECK both NULL or both set. Nullable, no default: metadata-only ALTER on PG 11+.
+      No FK to `privacy_suppressions` (rule_id is not unique there; rule rows are versioned).
+- [ ] `Result` model: the two columns.
+- [ ] `lead_actionability.py`: `not_privacy_suppressed_condition()` / `_sql(alias)` / Python twin.
+      AND it into `actionable_*`, `is_actionable`, `shown_condition`, `deliverable_before_cap_sql`;
+      OR it into `withheld_*` (suppressed = withheld, never bought).
+- [ ] `results_category.py`: `list_condition` ANDs the not-suppressed predicate for EVERY category
+      (closes the `no_address` / `not_qualified` gap). `download_rows_select` already uses `shown_condition`.
+- [ ] Tests (real test DB): a suppressed row is absent from every list category, the CSV, the
+      account-export select, `actionable_sql`, `is_actionable`; present-but-unflagged rows unchanged.
+
+### P3b: remaining read gaps
+- [ ] Run breakdown: suppressed rows are excluded from the partition (WHERE clause), so no bucket
+      and no `unclassified`. Customer-visible counts then never imply a suppressed row exists.
+      (Open question for Codex: exclude vs a dedicated bucket.)
+- [ ] Contact-lookup confirm: the id-proof SQL adds `NOT suppressed`, so a suppressed row in a quote
+      makes it `quote_stale` (nothing bought).
+- [ ] Sweep the rest of the `results` readers in `src/api` for any row-returning path without the
+      predicate; tests for each one changed.
+
+### P3c: authorization service (no callers until P4/P5)
+- [ ] `keys.py`: canonical forms for `property` (the pre-hash string of `compute_property_key`,
+      `P|<STATE>|<county>|<parcel>` or `A|...|<addr>`) and `mailing` (normalised address, county-free),
+      replacing `_no_canonical_form_yet`. Bump nothing else.
+- [ ] `src/privacy/authorize.py`:
+      - `load_rule_snapshot(session)`: ONE query; effective state per (rule_id, key_version,
+        normalization_version) = `active` row present and no `lifted` row; indexed in memory by
+        `(anchor_kind, anchor_hmac)` -> [(subject_kind, subject_hmac, rule_id)].
+        Any load failure raises (operation retries); never "allow on error".
+      - `authorize(snapshot, row) -> Allowed | Suppressed(rule_ids)`: computes the row's anchors
+        (property, mailing, phone, email) and subjects (`subjects_from` over party/heir/owner/grantor
+        fields with the source's name order) under every key version present in the snapshot.
+        Automatic match only on exact anchor AND exact subject HMAC.
+        Any `unresolved` subject on a row whose anchor matches a rule => `NeedsReview`, treated as
+        suppressed for delivery (D2: whole row; fail closed).
+      - Refuses to return `Allowed` for a snapshot with active rules unless `activation_allowed()`?
+        No: snapshot loading is read-only; activation is guarded at write time. Note for Codex.
+- [ ] Tests: synthetic rules inserted as `pending` are ignored; the effective-state logic is unit-tested
+      on in-memory rows (the DB cannot hold `active` until P7).
+
+## Risks
+- Plan-cap re-runs: adding the predicate to `deliverable_before_cap_sql` means a row suppressed between
+  two runs of the cap shifts ranks. Only matters once P5 writes the flag. Accepted: a suppressed row
+  must never consume or hold quota.
+- Snapshot counts frozen at delivery can differ from live counts after a later suppression. Accepted.
+- Every predicate change is a no-op in production until the flag is written (P5/P7).
+
+## Review
+(filled in at the end)
+
+## Codex plan consult (2026-11-06) and how it was reconciled
+
+| Codex finding | Resolution |
+|---|---|
+| Critical: read-path inventory incomplete (batches counts, jobs stats, cv_late_delivery, cv_mailing_recovery, contact_lookup_action) | Bounded inventory first: `docs/legal/audit-2026-11/07-RESULTS-READ-INVENTORY.md`, every `results` read classified A-D with COVERED / GAP / DEFER-P4/P5. Enforcement slices are cut from it by surface. |
+| High: excluding suppressed rows from the breakdown turns them into fake "dropped before save" | Dedicated bucket `privacy_withheld` and snapshot column `jobs.breakdown_privacy_withheld` (NULL on older snapshots reads as 0, the 121 rule). |
+| High: snapshot compatibility underspecified | P3c names `SNAPSHOT_COLUMNS`, `_invalid`, `breakdown_from_job`, finalize done-CAS, schemas, completion text. |
+| High: migration deploy order (API boot migrates while workers start) | 126 is expand-only and ships ALONE in its own PR; no code reads the columns until it has applied. |
+| Medium: no FK; rule_id alone not auditable after rotation | The flag stores `privacy_suppression_id` = the concrete versioned rule row (`privacy_suppressions.id`), with a real FK (RESTRICT) and a both-or-neither CHECK. |
+| High: property canonical input ambiguous | P3d: HMAC over the exact pre-hash string of `compute_property_key` (`P|STATE|county|parcel` or `A|STATE|county|address`), exposed by one shared function so the key and the anchor cannot drift. |
+| High: effective-state rule underspecified | P3d: deterministic rule per (rule_id, key_version, normalization_version): pending < active < lifted, a later state wins, any other history (lifted without active, duplicate states) is a conflict that fails the snapshot load; loaded in one REPEATABLE READ statement. |
+| Medium: fail-closed cases | P3d: an anchor match with an unresolved/unparseable subject, unknown key or normalisation version => NeedsReview (withheld); snapshot or key-library errors fail the whole operation. |
+| Medium: deliverable_before_cap / withheld | Adopted as planned; cap rerun test before and after suppression. |
+| Medium: slice boundaries | Slices below name exact files. |
+
+## Revised slices
+- [x] P3-0 migration 126 alone (+ test). Own PR, merged and applied before anything reads it.
+- [ ] P3-inv read inventory doc.
+- [ ] P3a model + `lead_actionability` + `results_category` + tests.
+- [ ] P3b gaps from the inventory, by surface (API counts/quote; worker emitters), ≤5 files each.
+- [ ] P3c run breakdown bucket (run_breakdown, finalize, status, schemas, test).
+- [ ] P3d authorization service + property/mailing canonical forms + tests.

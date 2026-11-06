@@ -1,3 +1,51 @@
+# Trustee-sale "silent done" + Principal Owing coverage (2026-11-06)
+
+BE branch `fix/trustee-sale-silent-done` (worktree `C:/Users/micha/bl-wt/ts-silent`, base origin/main 26d33270).
+FE branch `fix/principal-owing-copy` (worktree `C:/Users/micha/bl-wt/fe-principal`, base origin/master d2e8a52).
+No push, merge, deploy or prod write without owner OK. Evidence = read-only prod queries (SET TRANSACTION READ ONLY).
+
+## Findings (verified)
+- 12 trustee_sale jobs since 2026-07-01 (pierce 5, king 2, clark 1, snohomish 4), all done.
+  11 have records_found NULL, all created before migration 099 (2026-09-20) and all with stage NULL:
+  the column did not exist. They persisted results (pierce 78 rows, king 9, snohomish 50). NOT a scraper failure.
+- Since 2026-10-02: 0 of 64 done jobs (all types) with records_found NULL. 1 with breakdown NULL = designed
+  snapshot refusal (retried/unreconciled run; API shows the live breakdown).
+- Real gap: `_set_progress` swallows DB errors and the records_found write ignored its result, so a failed write
+  still reached done with NULL (reproduced in test before the fix).
+- trustee_sale reads the nts_notices cache (newspaper crawlers), not county portals.
+- Clark: The Columbian legal listing 2026-11-06 = 24 ads, 0 trustee sales; cache holds 2 Clark notices ever.
+  Source-scoped zero, NOT countywide zero. Source expansion = owner decision (source-rights review).
+- pre_foreclosure: 8,323 rows / 875 with default_amount (10.5%) / 876 nts_notice_id; distinct properties
+  1,048 / 154 with amount (14.7%). Non-dup rows: pierce 607 no-notice-in-source / 230 not-yet-published / 22 matched;
+  king 570 / 116 / 2; snohomish 56 matched; clark 25 no-notice.
+- Of 77 never-matched cached notices, 4 share an exact parcel with a pre_foreclosure lead (lower bound on misses only).
+- default_amount = nts_notices.principal_owing, RCW 61.24.040 Section IV (never Section III arrears).
+  864/876 linked rows equal the notice; 12 stale (2 notices + 1 NULL), all on now-inactive/past notices.
+  Caveat: when Section IV has no "principal" label the parser takes the first $ (total sum owing): over-labelled.
+
+## Phase 1 BE (commit f4099434) - done
+- [x] records_found required to finish: retry once, else fail before save/reserve/bill
+- [x] watchdog: aggregated ops alert for done + records_found NULL in last 7 days
+- [x] matcher beat: refresh pre_foreclosure leads from their own live notice (id-keyed, never blanks, before fuzzy pass)
+- [x] tests: negative control (done+NULL without guard), refresh incl. trustee_sale control, alert incl. old/zero rows
+- [x] 646 passed (nts/trustee/breakdown/finalize/progress/degradations/workers), ruff clean, no BE type checker configured
+## Phase 1b BE (commit 2c653fc6) - done (Codex review 1: GATE FAIL P2)
+- [x] migration 126 nts_notices.issue_date; an older weekly-PDF issue only fills gaps (postponed sale no longer reverts)
+- [x] real-DB test incl. HTML newest-read-wins control; negative control reproduces the revert; 126 down/up clean
+- [x] 639 passed on the related suites, ruff clean (src, tests, alembic)
+## Phase 1c BE (Codex review 2: GATE FAIL, 2 x P2) - done
+- [x] issue_date derived inside _upsert_notice (covers scripts/backfill_nts_pdf_archive.py too)
+- [x] migration 126 stamps existing PDF rows from source_url (prod read-only check: 143/143 parse, 115 HTML stay NULL)
+- [x] FE: "can also carry ... it states" (7617e19); 640 passed, ruff clean; Chromium re-verified
+## Phase 2 FE (commit dd1d8e9) - done
+- [x] landing: Principal Owing/trustee/TS# qualified "when we find the published sale notice"; sample attributed
+- [x] batch quality "Amount in default" -> "Principal owing"; tsc + eslint exit 0; Chromium desktop+mobile verified
+## Owner decisions (not built)
+- [ ] Section IV unlabelled amount: store an amount-kind marker + "Amount stated in notice" label, or drop it
+- [ ] More legal-newspaper sources (King: Seattle DJC; Clark: other papers) after source-rights review
+- [ ] Clark trustee_sale: tell users coverage is limited
+- [ ] 12 historical stale amounts on past sales: leave, or one-off id-keyed sync (dry run: refresh touches 0 today)
+
 # Batch system audit + redesign (2026-10-04)
 
 Branch `audit/batch-system-redesign`, BE worktree `C:/Users/Windows/bl-wt/batch-audit`, base `a4d13234`.

@@ -452,7 +452,6 @@ def _ingest_pdf_blocks(
     Caller commits.
     """
     from src.scrapers.sources import nts_tacoma_index as nts
-    from src.scrapers.sources.nts_pdf_archive import issue_date_from_url
 
     upserted = 0
     for block in blocks:
@@ -467,7 +466,6 @@ def _ingest_pdf_blocks(
                 summary["skipped"] += 1
                 continue
             row["fetched_at"] = datetime.now(UTC)
-            row["issue_date"] = issue_date_from_url(pdf_url)
             with db.begin_nested():
                 _upsert_notice(db, model, row, deed_reference=parsed.get("deed_reference"))
             upserted += 1
@@ -698,7 +696,12 @@ def _upsert_notice(db, model, row: dict, *, deed_reference: str | None = None) -
         ).first()
         was_inactive = prior is not None and not prior[0]
 
+    from src.scrapers.sources.nts_pdf_archive import issue_date_from_url
+
+    # Derived here, not by each caller, so the beat crawl and the operator backfill
+    # script cannot disagree (Codex). None for any non-PDF source URL.
     row = {**row, "id": str(uuid4())}
+    row.setdefault("issue_date", issue_date_from_url(row.get("source_url")))
     stmt = pg_insert(model).values(**row)
     # A back issue read after a newer one must not put the newer one's values back
     # (a postponed sale reverting to its original date). Only PDF rows carry an
@@ -718,8 +721,7 @@ def _upsert_notice(db, model, row: dict, *, deed_reference: str | None = None) -
         return new
 
     update_cols = {c: _value(c) for c in row if c not in _NO_UPDATE}
-    if "issue_date" in row:
-        update_cols["issue_date"] = _func.greatest(model.issue_date, stmt.excluded.issue_date)
+    update_cols["issue_date"] = _func.greatest(model.issue_date, stmt.excluded.issue_date)
     stmt = stmt.on_conflict_do_update(
         constraint="uq_nts_notices_source_ts", set_=update_cols
     )

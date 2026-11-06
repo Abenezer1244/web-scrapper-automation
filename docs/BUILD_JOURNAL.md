@@ -19,6 +19,52 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-11-06 — Trustee-sale "silent done" audit, records_found invariant, NTS version guard, Principal Owing copy
+
+**Built / Shipped (local branches only, nothing pushed or deployed):**
+- BE `fix/trustee-sale-silent-done` (worktree `C:/Users/micha/bl-wt/ts-silent`):
+  - f4099434: `run_scrape_job` now requires the `records_found` write (retry once, else fail the attempt
+    before save/reserve/bill). Watchdog: one aggregated ops alert for done + records_found NULL (7 days).
+    NTS matcher beat refreshes pre_foreclosure leads from their own live notice (id-keyed, never blanks).
+  - 2c653fc6: migration 126 `nts_notices.issue_date`; an older weekly-PDF issue only fills gaps.
+- FE `fix/principal-owing-copy` (worktree `C:/Users/micha/bl-wt/fe-principal`), dd1d8e9: landing qualifies
+  Principal Owing/trustee/TS# as "when we find the published sale notice"; batch check relabelled.
+
+**Tried / Decided:**
+- The owner's report ("Pierce/King/Clark trustee_sale done with NULL records_found since July 4") was NOT a
+  scraper failure: 11 of 12 trustee_sale jobs since 07-01 predate migration 099 (records_found, 09-20) and all
+  persisted results (pierce 78 rows, king 9, snohomish 50). No new outcome-contract columns: records_found +
+  breakdown + snapshot refusal already encode found/zero/unknown.
+- Refresh scoped to pre_foreclosure: trustee_sale rows are rebuilt from frozen nts_source on retry.
+- Section IV unlabelled-amount fallback is over-labelled as Principal Owing: left for an owner decision.
+
+**Failed / Blocked:**
+- Codex CLI failed from Git Bash (node not on PATH); runs from PowerShell with node added to PATH.
+- Port 3107 was held by another session's dev server; used 3191.
+- Local sync tests need 127.0.0.1:6543 (session.py rewrites :5432 -> :6543); used a local TCP forwarder,
+  mirroring CI's 6543:5432 port map.
+
+**Caught & fixed:** Codex GATE FAIL P2: archive back issues overwrote newer notice values (a postponed sale
+reverted), and the new refresh would have carried that onto leads. Fixed in 2c653fc6; the negative control
+reproduces the revert.
+Codex review 2 (GATE FAIL, 2 x P2): legacy rows with no issue_date and the operator backfill script
+bypassed the guard. Fixed: _upsert_notice derives issue_date itself; migration 126 stamps existing PDF rows
+(prod: 143/143 PDF URLs parse). FE copy made per-field conditional (7617e19).
+
+**Pending / Handoff (owner):** deploy order (migration 126 runs on API boot, then worker); Clark coverage
+disclosure; more legal-newspaper sources after a source-rights review; amount-kind marker for unlabelled
+Section IV amounts; 12 historical stale amounts sit on past/inactive notices (the refresh touches 0 today).
+
+**Facts learned:**
+- trustee_sale reads the nts_notices cache filled by newspaper crawlers; it never hits a county portal.
+- Pre-foreclosure amount coverage is source-bound: 154/1,048 properties (875/8,323 rows). Of 77 never-matched
+  notices only 4 share an exact parcel with a lead; most leads carry enrichment_data.nts_missing =
+  SOURCE_HAS_NO_NOTICE or SOURCE_NOT_PUBLISHED_YET.
+- The Columbian legal listing (Clark) carried 0 trustee sales on 2026-11-06 (24 ads); the cache holds 2 Clark
+  notices ever (07-06, 08-03).
+
+---
+
 ## 2026-11-04 — Privacy suppression groundwork (compliance Phase 6 P1 + P2, local only)
 
 **Built / Shipped (local branch `audit/compliance-2026-11`, nothing pushed, nothing wired in):**

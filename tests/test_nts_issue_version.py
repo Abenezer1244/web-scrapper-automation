@@ -25,8 +25,8 @@ def _row(ts: str, issue: date | None, **values) -> dict:
     url = issue_url(_SOURCE, king_names(issue)[0]) if issue else "https://example.test/notice"
     return {
         "source": _SOURCE, "ts_number": ts, "county": "king", "state": "WA",
+        # No issue_date: _upsert_notice derives it, as the operator backfill relies on.
         "source_url": url, "is_active": True, "fetched_at": datetime.now(UTC),
-        **({"issue_date": issue_date_from_url(url)} if issue else {}),
         **values,
     }
 
@@ -85,3 +85,23 @@ def test_a_source_without_issue_dates_keeps_newest_read_wins():
         with SyncSessionLocal() as db:
             db.execute(delete(NtsNotice).where(NtsNotice.ts_number == ts))
             db.commit()
+
+
+def test_migration_126_backfill_parses_like_the_crawler():
+    """The migration stamps legacy rows with its own copy of the parse (migrations do
+    not import app code); the two must agree, or legacy rows get the wrong version."""
+    import importlib.util
+    from pathlib import Path
+
+    spec = importlib.util.spec_from_file_location(
+        "m126", Path(__file__).resolve().parents[1] / "alembic/versions/126_nts_notice_issue_date.py")
+    m126 = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m126)
+    from src.scrapers.sources.nts_pdf_archive import snoho_names
+
+    urls = [issue_url(_SOURCE, n) for n in king_names(date(2026, 9, 2))]
+    urls += [issue_url("snohomish_tribune", n) for n in snoho_names(date(2026, 8, 27))]
+    urls += ["https://www.tacomadailyindex.com/legal-notices/x", None, "https://h/Legals%2013-40-26.pdf"]
+    for u in urls:
+        assert m126._issue_date(u) == issue_date_from_url(u)
+

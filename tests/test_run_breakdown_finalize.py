@@ -23,7 +23,8 @@ from src.workers.tasks_helpers.status import AttemptToken, claim_attempt
 ADDR = "5006 61ST STREET CT E"
 FROZEN_3_NEW = {"breakdown_dropped_before_save": 0, "breakdown_no_address": 0,
                 "breakdown_same_run_merged": 0, "breakdown_already_delivered": 0,
-                "breakdown_not_qualified": 0, "breakdown_over_quota": 0, "breakdown_new": 3}
+                "breakdown_not_qualified": 0, "breakdown_over_quota": 0, "breakdown_new": 3,
+                "breakdown_privacy_withheld": 0}
 
 
 def _live(source: str) -> str:

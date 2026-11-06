@@ -70,7 +70,12 @@ from src.api.results_category import (
 )
 from src.api.results_sort import DEFAULT_RESULTS_SORT, ResultsSort, results_order_by
 from src.api.routes.auth_helpers.registration import _integrity_error_fields
-from src.api.run_breakdown import breakdown_from_job, live_breakdown, read_partition_async
+from src.api.run_breakdown import (
+    breakdown_from_job,
+    customer_view,
+    live_breakdown,
+    read_partition_async,
+)
 from src.api.schemas import (
     RUN_START_402_RESPONSES,
     AlreadyDeliveredContacts,
@@ -230,7 +235,8 @@ def _snapshot_breakdown(job: Job) -> tuple[RunBreakdown | None, bool]:
     values, problem = breakdown_from_job(job)
     if problem is not None:
         _logger.warning("Job %s: stored run-count breakdown rejected (%s)", job.id, problem)
-    return (RunBreakdown(**values) if values is not None else None), problem is not None
+    return ((RunBreakdown(**customer_view(values)) if values is not None else None),
+            problem is not None)
 
 
 def _job_response(job: Job, config: ScraperConfig | None) -> JobResponse:
@@ -1106,7 +1112,7 @@ async def get_results(
                 retry_count=job.retry_count,
             )
             if live is not None:
-                breakdown, breakdown_basis = RunBreakdown(**live), "live"
+                breakdown, breakdown_basis = RunBreakdown(**customer_view(live)), "live"
 
         return ResultsPage(
             job_id=job_id, total=total, page=page, page_size=page_size,

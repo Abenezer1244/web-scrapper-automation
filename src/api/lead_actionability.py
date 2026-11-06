@@ -56,6 +56,28 @@ NOT_QUALIFIED = "not_qualified"
 EXCLUSION_REASONS = (OVER_QUOTA, NOT_QUALIFIED)
 
 
+# Phase 6 privacy (migration 126): a row withheld because a person asked not to be in
+# the product. A DEDICATED column, deliberately not a DELIVERY_EXCLUDED_KEY value: that
+# key is a scalar, so privacy would overwrite quota/qualification state or be
+# overwritten by it. Every rule below refuses a flagged row, so no list, count, file,
+# bill, segment, dialer pick or paid lookup can include one. Nothing sets the flag
+# until the enforcer sweep (P5) and activation (P7); until then every clause here is
+# true for every row. Design: docs/legal/audit-2026-11/06-DESIGN-PRIVACY-REQUESTS-AND-SUPPRESSION.md.
+def not_privacy_suppressed_sql(alias: str) -> str:
+    """The row is not withheld by a privacy rule. ``alias`` is always a code literal."""
+    return f"{alias}.privacy_suppressed_at IS NULL"
+
+
+def not_privacy_suppressed_condition():
+    """ORM twin of not_privacy_suppressed_sql."""
+    return Result.privacy_suppressed_at.is_(None)
+
+
+def is_privacy_suppressed(row: Any) -> bool:
+    """Python twin. A pre-insert record (dict / ScrapedRecord) has no flag: not suppressed."""
+    return _field(row, "privacy_suppressed_at") is not None
+
+
 def already_delivered_condition():
     """Rows an earlier run of this account already holds the claim for (a prior-run copy).
 
@@ -104,16 +126,19 @@ def delivery_excluded_condition():
 
 
 def withheld_sql(alias: str) -> str:
-    """Never deliver or buy contact data for this row: excluded, or not qualified.
+    """Never deliver or buy contact data for this row: excluded, not qualified, or
+    withheld by a privacy rule.
 
     What anything that SPENDS money on a row (paid skip trace) checks, so a stamped code
     violation is refused even in the window before the hold step has marked it."""
-    return f"({delivery_excluded_sql(alias)} OR NOT {qualified_sql(alias)})"
+    return (f"({delivery_excluded_sql(alias)} OR NOT {qualified_sql(alias)} "
+            f"OR NOT {not_privacy_suppressed_sql(alias)})")
 
 
 def withheld_condition():
     """ORM twin of withheld_sql."""
-    return or_(delivery_excluded_condition(), not_(qualified_condition()))
+    return or_(delivery_excluded_condition(), not_(qualified_condition()),
+               not_(not_privacy_suppressed_condition()))
 
 
 def _not_quota_excluded_sql(alias: str) -> str:
@@ -121,7 +146,8 @@ def _not_quota_excluded_sql(alias: str) -> str:
 
 
 def deliverable_before_cap_sql(alias: str) -> str:
-    """What the plan cap ranks: address AND qualified AND not marked not qualified.
+    """What the plan cap ranks: address AND qualified AND not marked not qualified AND
+    not withheld by a privacy rule (a withheld row never takes or holds quota).
 
     Leaves the over_quota mark out on purpose (see address_actionable_sql): a re-run must
     rank the rows it already marked, or it would renumber and mark a second batch. The
@@ -129,7 +155,8 @@ def deliverable_before_cap_sql(alias: str) -> str:
     it changes nothing on a first pass and keeps a re-run from ranking a held row.
     """
     return (f"({address_actionable_sql(alias)} AND {qualified_sql(alias)} "
-            f"AND NOT ({not_qualified_excluded_sql(alias)}))")
+            f"AND NOT ({not_qualified_excluded_sql(alias)}) "
+            f"AND {not_privacy_suppressed_sql(alias)})")
 
 
 def address_actionable_sql(alias: str) -> str:
@@ -163,7 +190,8 @@ def actionable_condition():
     not_excluded = func.coalesce(
         Result.enrichment_data.op("->>")(DELIVERY_EXCLUDED_KEY), ""
     ).notin_(EXCLUSION_REASONS)
-    return and_(has_address, not_excluded, qualified_condition())
+    return and_(has_address, not_excluded, qualified_condition(),
+                not_privacy_suppressed_condition())
 
 
 def shown_condition():
@@ -181,7 +209,8 @@ def shown_condition():
         Result.enrichment_data.op("->>")(DELIVERY_EXCLUDED_KEY), ""
     ).notin_(EXCLUSION_REASONS)
     return and_(has_address_condition(), not_excluded,
-                or_(qualified_condition(), already_delivered_condition()))
+                or_(qualified_condition(), already_delivered_condition()),
+                not_privacy_suppressed_condition())
 
 
 def has_address_condition():
@@ -206,11 +235,13 @@ def actionable_sql(alias: str) -> str:
     """Raw-SQL twin of actionable_condition for hand-written queries. No binds:
     the only literal is the fixed placeholder constant, never user input."""
     return (f"({address_actionable_sql(alias)} AND {_not_quota_excluded_sql(alias)} "
-            f"AND {qualified_sql(alias)})")
+            f"AND {qualified_sql(alias)} AND {not_privacy_suppressed_sql(alias)})")
 
 
 def is_actionable(row: Any) -> bool:
     """Python twin for ORM rows / ScrapedRecords / dicts (attribute or key access)."""
+    if is_privacy_suppressed(row):
+        return False
     enr = _field(row, "enrichment_data")
     if isinstance(enr, dict) and enr.get(DELIVERY_EXCLUDED_KEY) in EXCLUSION_REASONS:
         return False

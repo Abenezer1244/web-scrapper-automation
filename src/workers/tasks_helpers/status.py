@@ -134,7 +134,7 @@ class JobUpdateFields(TypedDict, total=False):
     error_message: str
     export_key: str
     # Migration 106, written only by the done-CAS. None is a real value here: a
-    # refused snapshot writes all six NULL.
+    # refused snapshot writes every bucket NULL.
     breakdown_dropped_before_save: int | None
     breakdown_no_address: int | None
     breakdown_same_run_merged: int | None
@@ -142,6 +142,8 @@ class JobUpdateFields(TypedDict, total=False):
     breakdown_over_quota: int | None
     breakdown_not_qualified: int | None
     breakdown_new: int | None
+    # Migration 126: rows withheld by a privacy rule (run_breakdown.customer_view).
+    breakdown_privacy_withheld: int | None
 
 
 def _now() -> datetime:

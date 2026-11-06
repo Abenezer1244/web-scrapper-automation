@@ -32,6 +32,7 @@ from src.api.lead_actionability import (
     already_delivered_condition,
     already_delivered_sql,
     has_address_condition,
+    not_privacy_suppressed_condition,
     shown_condition,
 )
 from src.api.tax_filters import tax_cap_condition
@@ -79,12 +80,17 @@ def not_qualified_condition():
 
 def list_condition(category: ResultsListCategory):
     """The row predicate for one Results LIST category: the two lead categories plus the
-    two look-only ones. Their tab counts use this same predicate."""
+    two look-only ones. Their tab counts use this same predicate.
+
+    A row withheld by a privacy rule is in NO list, including the two look-only ones
+    (which skip shown_condition), so the clause is ANDed here for every category."""
     if category == "no_address":
-        return no_address_condition()
-    if category == "not_qualified":
-        return not_qualified_condition()
-    return category_condition(category)
+        bucket = no_address_condition()
+    elif category == "not_qualified":
+        bucket = not_qualified_condition()
+    else:
+        bucket = category_condition(category)
+    return and_(bucket, not_privacy_suppressed_condition())
 
 
 def skip_trace_eligible_condition():

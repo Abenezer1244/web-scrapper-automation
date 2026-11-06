@@ -1677,7 +1677,11 @@ class RunBreakdown(BaseModel):
     a tax run `already_delivered` can exceed the tab's `already_delivered_count`.
     """
 
-    # Records found but never saved (the living-TOD filter and the save-time merge).
+    # Records found but never saved (the living-TOD filter and the save-time merge),
+    # PLUS rows withheld by a privacy rule (migration 126): those are saved, but the
+    # customer view folds them in on purpose (run_breakdown.customer_view), so this is
+    # the customer-facing "filtered out before processing" aggregate and no number
+    # reveals that a person in the run opted out. The frozen columns keep the split.
     # None = unknown: a live reading of a run that never recorded records_found, or
     # one that was retried (its saved rows span attempts).
     dropped_before_save: int | None = None

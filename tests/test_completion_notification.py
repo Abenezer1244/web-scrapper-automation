@@ -40,6 +40,7 @@ def _snapshot(already_delivered: int, new: int = 3) -> dict:
         "breakdown_dropped_before_save": 0, "breakdown_no_address": 0,
         "breakdown_same_run_merged": 0, "breakdown_already_delivered": already_delivered,
         "breakdown_not_qualified": 0, "breakdown_over_quota": 0, "breakdown_new": new,
+        "breakdown_privacy_withheld": 0,
         "records_found": already_delivered + new, "record_count": new, "billed_count": new,
     }
 

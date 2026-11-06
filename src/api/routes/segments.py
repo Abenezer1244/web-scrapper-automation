@@ -208,6 +208,8 @@ WITH candidates AS (
            -- CSV printed three auction headers over three permanently empty
            -- columns. batch_export.py was fixed for this; segments was not.
            r.auction_date, r.default_amount,
+           -- What the amount is (migration 128), from the same row as the amount.
+           r.enrichment_data->'nts'->>'amount_basis' AS default_amount_basis,
            -- The rest of what OVERLAP_LEAD_COLUMNS promises. Same silent
            -- failure as the auction pair: absent from the SELECT reads as
            -- NULL through getattr, so these printed headers over empty
@@ -263,7 +265,7 @@ SELECT rk.id, rk.date_recorded, rk.party_name, rk.parcel_id, rk.property_address
        rk.mailing_address, rk.property_city, rk.property_state, rk.property_zip,
        rk.county, rk.state, rk.phone, rk.phone_type, rk.email,
        rk.phones, rk.emails, rk.date_is_auction_date,
-       rk.auction_date, rk.default_amount,
+       rk.auction_date, rk.default_amount, rk.default_amount_basis,
        rk.doc_type, rk.heirs, rk.legal_description,
        -- record_type is SELECTed into the CTE but was never projected, so the
        -- exporter saw None and name_order_for() returned None, which makes
@@ -315,6 +317,8 @@ WITH candidates AS (
            -- CSV printed three auction headers over three permanently empty
            -- columns. batch_export.py was fixed for this; segments was not.
            r.auction_date, r.default_amount,
+           -- What the amount is (migration 128), from the same row as the amount.
+           r.enrichment_data->'nts'->>'amount_basis' AS default_amount_basis,
            -- The rest of what OVERLAP_LEAD_COLUMNS promises. Same silent
            -- failure as the auction pair: absent from the SELECT reads as
            -- NULL through getattr, so these printed headers over empty
@@ -394,7 +398,7 @@ SELECT rk.id, rk.date_recorded, rk.party_name, rk.parcel_id, rk.property_address
        rk.mailing_address, rk.property_city, rk.property_state, rk.property_zip,
        rk.county, rk.state, rk.phone, rk.phone_type, rk.email,
        rk.phones, rk.emails, rk.date_is_auction_date,
-       rk.auction_date, rk.default_amount,
+       rk.auction_date, rk.default_amount, rk.default_amount_basis,
        rk.doc_type, rk.heirs, rk.legal_description,
        -- record_type is SELECTed into the CTE but was never projected, so the
        -- exporter saw None and name_order_for() returned None, which makes
@@ -432,6 +436,8 @@ WITH candidates AS (
            -- CSV printed three auction headers over three permanently empty
            -- columns. batch_export.py was fixed for this; segments was not.
            r.auction_date, r.default_amount,
+           -- What the amount is (migration 128), from the same row as the amount.
+           r.enrichment_data->'nts'->>'amount_basis' AS default_amount_basis,
            -- The rest of what OVERLAP_LEAD_COLUMNS promises. Same silent
            -- failure as the auction pair: absent from the SELECT reads as
            -- NULL through getattr, so these printed headers over empty
@@ -484,7 +490,7 @@ SELECT rk.id, rk.date_recorded, rk.party_name, rk.parcel_id, rk.property_address
        rk.mailing_address, rk.property_city, rk.property_state, rk.property_zip,
        rk.county, rk.state, rk.phone, rk.phone_type, rk.email,
        rk.phones, rk.emails, rk.date_is_auction_date,
-       rk.auction_date, rk.default_amount,
+       rk.auction_date, rk.default_amount, rk.default_amount_basis,
        rk.doc_type, rk.heirs, rk.legal_description,
        -- record_type is SELECTed into the CTE but was never projected, so the
        -- exporter saw None and name_order_for() returned None, which makes

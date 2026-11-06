@@ -76,7 +76,7 @@ class TestHeaderOrder:
         header, _, _ = _export([], "pre_foreclosure")
         assert header == CORE_HEADER + [
             "Auction Date", "Days To Auction", "Principal Owing", "Trustee", "TS Number",
-        ] + REFERENCE_HEADER
+        ] + REFERENCE_HEADER + ["Amount Type"]  # added later: after, so nothing moves
 
     def test_trustee_sale_shares_auction_block(self):
         assert _export([], "trustee_sale")[0] == _export([], "pre_foreclosure")[0]

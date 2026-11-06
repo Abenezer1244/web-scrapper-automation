@@ -213,8 +213,8 @@ def test_auction_columns_are_appended_not_inserted():
     """Column order is a compatibility contract for anyone consuming these CSVs."""
     from src.utils.lead_export import OVERLAP_LEAD_COLUMNS
 
-    assert OVERLAP_LEAD_COLUMNS[-3:] == [
-        "auction_date", "days_to_auction", "default_amount",
+    assert OVERLAP_LEAD_COLUMNS[-4:] == [
+        "auction_date", "days_to_auction", "default_amount", "default_amount_type",
     ]
 
 

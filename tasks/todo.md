@@ -21,8 +21,12 @@ refresh fires on basis-only change and creates a missing nts object (P2); invari
       amount); missing amounts resweep before unknown-basis rows. Both regressions fail without the fix.
 - [x] Codex re-review: GATE PASS. 618 NTS/trustee tests pass, ruff clean.
 ## Phase B BE surfaces (after approval)
-- [ ] trustee_sale nts_source + finalizer carry amount_basis (existing frozen snapshots stay unknown)
-- [ ] CSV "Amount Type" appended at the end of each public layout; segments project the basis; API default_amount_basis
+- [x] trustee_sale nts_source + finalizer carry amount_basis (existing frozen snapshots stay unknown)
+- [x] CSV column appended LAST in every layout (legacy/lean `default_amount_type`, crm_v1 "Amount Type" after the
+      reference block, overlap + batch last): "Principal" only for a labelled principal, else "Amount stated in notice",
+      blank without an amount. Segments project `default_amount_basis` (live test fails without it).
+- [x] API: no schema change; ResultRow and batch leads already return enrichment_data (nts.amount_basis)
+- [x] 5 pinned contract tests updated deliberately; 1967 passed on related suites; ruff clean
 ## Phase C FE (after approval)
 - [ ] results/batch label per basis
 

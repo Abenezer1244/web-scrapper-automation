@@ -202,6 +202,8 @@ def _record_from_notice(notice: NtsNotice) -> ScrapedRecord:
             "default_amount": (
                 str(notice.principal_owing) if notice.principal_owing is not None else None
             ),
+            # Frozen with the amount it describes (migration 128); None = unknown.
+            "amount_basis": notice.principal_owing_basis,
             "ts_number": notice.ts_number,
             "trustee": notice.trustee,
             "beneficiary": notice.beneficiary,

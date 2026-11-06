@@ -34,6 +34,8 @@ from src.utils.lead_export import OVERLAP_LEAD_COLUMNS
 #   phone_2/3, email_2/3                - unpacked from phones/emails
 #   days_to_auction                     - derived from auction_date at render time
 #   lead_subtype                        - already projected as a scalar alias
+#   default_amount_type                 - labelled from default_amount plus the
+#                                         default_amount_basis alias (pinned below)
 _CSV_COLUMN_TO_RESULT_COLUMN = {
     "filed_date": "date_recorded",
     "party_name": "party_name",
@@ -90,7 +92,7 @@ def test_the_mapping_covers_the_csv_contract():
         "phone_2", "phone_3", "email_2", "email_3",
         "property_street", "property_city", "property_state", "property_zip",
         "mailing_street", "mailing_city", "mailing_state", "mailing_zip",
-        "lead_subtype", *_DERIVED_NEVER_SELECTED,
+        "lead_subtype", "default_amount_type", *_DERIVED_NEVER_SELECTED,
     }
     assert unclassified == known_non_row, (
         "OVERLAP_LEAD_COLUMNS changed. Classify the new column as row-backed "
@@ -110,6 +112,15 @@ def test_every_segment_query_projects_every_promised_column(name, column):
     sql = _sql_without_comments(ALL_SEGMENT_SQL[name])
     assert f"r.{column}" in sql, f"{name}: inner SELECT drops {column}"
     assert f"rk.{column}" in sql, f"{name}: final projection drops {column}"
+
+
+@pytest.mark.parametrize("name", sorted(ALL_SEGMENT_SQL))
+def test_every_segment_query_projects_the_amount_basis(name):
+    """Without it a principal reads as "Amount stated in notice" in every Lists CSV:
+    segment rows carry no enrichment_data, so the alias is the only carrier."""
+    sql = _sql_without_comments(ALL_SEGMENT_SQL[name])
+    assert "r.enrichment_data->'nts'->>'amount_basis' AS default_amount_basis" in sql
+    assert "rk.default_amount_basis" in sql
 
 
 @pytest.mark.parametrize("column", _DERIVED_NEVER_SELECTED)

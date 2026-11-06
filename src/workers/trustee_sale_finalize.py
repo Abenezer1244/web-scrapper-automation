@@ -64,6 +64,8 @@ def _nts_update_params(row_id: Any, src: dict) -> dict:
         "source_url": src.get("source_url"),
         "matched_at": datetime.now(UTC).isoformat(),
         "confidence": 1.0,
+        # Snapshots frozen before migration 128 carry none: unknown, never principal.
+        "amount_basis": src.get("amount_basis"),
     }
     return {
         "auction_date": src.get("auction_date"),

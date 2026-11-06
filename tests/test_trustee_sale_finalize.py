@@ -60,6 +60,7 @@ class TestParamMapping:
         assert set(blob) == {
             "ts_number", "trustee", "beneficiary", "auction_time",
             "auction_location", "source", "source_url", "matched_at", "confidence",
+            "amount_basis",
         }
         assert blob["ts_number"] == "WA-24-777"
         assert blob["trustee"] == "Quality Loan Service"

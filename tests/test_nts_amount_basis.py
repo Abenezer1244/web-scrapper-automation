@@ -230,3 +230,65 @@ def test_the_resweep_reaches_a_missing_amount_before_any_unknown_basis():
         with SyncSessionLocal() as db:
             db.execute(delete(NtsNotice).where(NtsNotice.source == source))
             db.commit()
+
+
+def test_the_csv_says_principal_only_when_the_notice_does():
+    from types import SimpleNamespace
+
+    from src.utils.lead_export import build_lead_export_row
+
+    def label(record):
+        return build_lead_export_row(record)["default_amount_type"]
+
+    def lead(amount, basis=None, nts=True):
+        enr = {"nts": {"trustee": "T", "amount_basis": basis}} if nts else {}
+        return {"default_amount": amount, "enrichment_data": enr}
+
+    assert label(lead("296494.82", "principal")) == "Principal"
+    assert label(lead("575150.38", "sum_owing")) == "Amount stated in notice"
+    assert label(lead("254015.94")) == "Amount stated in notice"  # read before migration 128
+    assert label(lead("254015.94", nts=False)) == "Amount stated in notice"
+    assert label(lead(None, "principal")) == ""
+    # A Lists (segment) row has no enrichment_data: its query projects the basis.
+    seg = SimpleNamespace(default_amount=Decimal("1.00"), default_amount_basis="principal",
+                          enrichment_data=None)
+    assert label(seg) == "Principal"
+
+
+def test_the_new_column_lands_after_every_existing_one():
+    from src.utils.lead_export import (
+        BATCH_LEAD_COLUMNS,
+        LEAD_CSV_COLUMNS,
+        OVERLAP_LEAD_COLUMNS,
+        resolve_crm_export_columns,
+        resolve_lead_export_columns,
+    )
+
+    for cols in (LEAD_CSV_COLUMNS, OVERLAP_LEAD_COLUMNS, BATCH_LEAD_COLUMNS,
+                 resolve_lead_export_columns("pre_foreclosure"),
+                 resolve_lead_export_columns("trustee_sale"),
+                 resolve_crm_export_columns("pre_foreclosure"),
+                 resolve_crm_export_columns(None)):
+        assert cols[-1] == "default_amount_type"
+        assert cols.count("default_amount_type") == 1
+    for record_type in ("probate", "tax_delinquent", "code_violation"):
+        assert "default_amount_type" not in resolve_lead_export_columns(record_type)
+        assert "default_amount_type" not in resolve_crm_export_columns(record_type)
+
+
+def test_an_auction_lead_freezes_the_basis_with_its_amount():
+    import json
+
+    from src.scrapers.trustee_sale import _record_from_notice
+    from src.workers.trustee_sale_finalize import _nts_update_params
+
+    notice = NtsNotice(id="n-1", source="tacoma_daily_index", ts_number="WA-26-1",
+                       county="pierce", state="WA", auction_date=date(2026, 12, 1),
+                       principal_owing=Decimal("575150.38"), principal_owing_basis="sum_owing",
+                       property_address="1 MAIN ST, TACOMA, WA 98402", grantor="TEST OWNER")
+    src = _record_from_notice(notice).enrichment_data["nts_source"]
+    assert (src["default_amount"], src["amount_basis"]) == ("575150.38", "sum_owing")
+    assert json.loads(_nts_update_params("r", src)["nts"])["amount_basis"] == "sum_owing"
+    # A snapshot frozen before migration 128 has no basis: unknown, never principal.
+    legacy = {k: v for k, v in src.items() if k != "amount_basis"}
+    assert json.loads(_nts_update_params("r", legacy)["nts"])["amount_basis"] is None

@@ -19,6 +19,12 @@ SECURITY (docs/dialer_connectors_spike.md), all enforced here:
 - Vendor responses (which often echo contact PII on error) are NEVER logged or
   stored: we keep only the status code + a narrowly-extracted contact id. Logs
   carry host + status + the outbox row id, never the token/PII/body.
+
+PRIVACY (Phase 6 P4b, design section 6): the outbox stores row ids only, and each
+row is re-read and AUTHORIZED against the suppression rules immediately before its
+POST. A withheld or under-review row is skipped terminally, never sent. The rules are
+loaded once per drain BEFORE any row is touched: if they cannot be loaded the task
+raises and retries with every row still pending (fail closed, never send unchecked).
 """
 from datetime import UTC, datetime
 
@@ -26,6 +32,7 @@ import requests
 
 from src.api.lead_actionability import actionable_condition
 from src.api.middleware.security import validate_outbound_webhook
+from src.privacy.authorize import RuleSnapshotError, authorize, load_rule_snapshot
 from src.utils.logger import setup_logger
 from src.utils.pinned_http import is_blocked_destination, log_host, pinned_session
 from src.workers import app
@@ -63,7 +70,33 @@ def _extract_contact_id(resp: requests.Response) -> str | None:
     return None
 
 
-@app.task(name="src.workers.dialer_outbox.process_dialer_outbox")
+def _hidden_reason(db, result_id) -> str:
+    """Why an EXISTING row was hidden by the send-time read: the privacy flag, the
+    actionability rule, or the tax cap (in that order). Honest reasons only."""
+    from sqlalchemy import select
+
+    from src.db.models import Result
+
+    flagged, actionable = db.execute(
+        select(Result.privacy_suppressed_at.isnot(None), actionable_condition())
+        .where(Result.id == result_id)).one()
+    if flagged:
+        return "privacy withheld"
+    if not actionable:
+        return "not actionable (no property or mailing address)"
+    return "tax lead past 18-month cap"
+
+
+@app.task(
+    name="src.workers.dialer_outbox.process_dialer_outbox",
+    # Only the rule load retries: it raises before any row changes. Exhausted, the
+    # rows stay pending for the next materialize or a manual replay to re-drive.
+    autoretry_for=(RuleSnapshotError,),
+    max_retries=8,
+    retry_backoff=True,
+    retry_backoff_max=600,
+    retry_jitter=True,
+)
 def process_dialer_outbox(job_id: str) -> None:
     """Drain up to _CHUNK pending dialer_deliveries rows for one job, one POST each.
 
@@ -112,6 +145,13 @@ def process_dialer_outbox(job_id: str) -> None:
         if not pending:
             return
 
+        try:
+            snapshot = load_rule_snapshot(db)
+        except RuleSnapshotError:
+            _logger.error("dialer_outbox job %s: privacy rules unavailable; %d rows left "
+                          "pending, retrying", job_id[:8], len(pending))
+            raise
+
         # Config-level failure (e.g. missing/expired credentials): fail this chunk's
         # rows with a clean message — they stay replay-eligible after the user fixes
         # the config. Never surface the underlying value.
@@ -147,11 +187,11 @@ def process_dialer_outbox(job_id: str) -> None:
                 )
             ).scalar_one_or_none()
             if result is None:
-                # Two reasons the row can be missing now: the result was deleted,
-                # OR it's an out-of-window tax lead the cap intentionally hides.
-                # Either way it's terminal (not a transient error): drop it as
-                # 'skipped' so a replay never re-evaluates it. Re-check existence
-                # without the cap only to log the accurate reason.
+                # The row is missing now because the result was deleted, OR the
+                # read hides it (privacy flag, not actionable, or a tax lead past
+                # the cap; _hidden_reason says which). Either way it's terminal (not
+                # a transient error): drop it as 'skipped' so a replay never
+                # re-evaluates it. Re-check existence only to record the reason.
                 exists = db.execute(
                     select(Result.id).where(
                         Result.id == row.result_id, Result.user_id == job.user_id
@@ -159,15 +199,23 @@ def process_dialer_outbox(job_id: str) -> None:
                 ).first()
                 if exists is not None:
                     row.status = "skipped"
-                    row.last_error = "tax lead past 18-month cap"
-                    _logger.info(
-                        "dialer_outbox row %s: tax lead past 18-month cap — skipped",
-                        str(row.id)[:8],
-                    )
+                    row.last_error = _hidden_reason(db, row.result_id)
+                    _logger.info("dialer_outbox row %s: %s — skipped",
+                                 str(row.id)[:8], row.last_error)
                 else:
                     row.status = "failed"
                     row.last_error = "result row missing"
                 db.commit()
+                continue
+
+            decision = authorize(snapshot, result, record_type=config.record_type,
+                                 county=config.county, state=config.state)
+            if not decision.deliverable:
+                row.status = "skipped"
+                row.last_error = f"privacy {decision.outcome}"
+                db.commit()
+                _logger.info("dialer_outbox row %s: privacy %s — skipped",
+                             str(row.id)[:8], decision.outcome)
                 continue
 
             lead = {

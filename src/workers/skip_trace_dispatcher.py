@@ -316,6 +316,19 @@ def _dispatch_tick() -> dict:
         # fresh cache entry) before anything is bought. Best-effort: on failure the rows
         # stay queued, and the in-flight hold below still stops a second purchase.
         _settle_queued_from_known_answers(db)
+        # Privacy (Phase 6 P4c): every lead is authorized against the suppression rules
+        # right before it is claimed (_partition_still_deliverable). The rules load once
+        # per tick, BEFORE any claim; if they cannot load, nothing is claimed or sent
+        # this tick (fail closed) and the rows stay queued for the next one.
+        from src.privacy.authorize import RuleSnapshotError, load_rule_snapshot
+
+        try:
+            snapshot = load_rule_snapshot(db)
+        except RuleSnapshotError as exc:
+            db.rollback()
+            _logger.error("Dispatcher: privacy rules unavailable (%s); nothing claimed this "
+                          "tick", str(exc)[:160])
+            return _tick_result(0, 0, ["privacy rules unavailable"], deferred="privacy_rules")
 
         for _ in range(max_batches):
             # Pick a trace_type to drain this pass. Prefer 'normal' first
@@ -540,7 +553,7 @@ def _dispatch_tick() -> dict:
                     new = lock_allocated(db, ids, trace_type)
                     seen_users.update(str(r.user_id) for r in new)
                     # Buy a lookup only for a lead that was actually delivered.
-                    new, drop, later = _partition_still_deliverable(db, new)
+                    new, drop, later = _partition_still_deliverable(db, new, snapshot)
                     if drop:
                         _cancel_undeliverable(db, drop)
                         withdrawn.extend(drop)
@@ -1343,7 +1356,7 @@ def _fail_unsubmittable(db, rows: list) -> None:
     )
 
 
-def _partition_still_deliverable(db, rows: list) -> tuple[list, list, int]:
+def _partition_still_deliverable(db, rows: list, snapshot) -> tuple[list, list, int]:
     """Split the FIFO head into (buy now, withdraw) and a count left for later.
 
     A lookup is bought only for a lead that was actually delivered: its Result is
@@ -1377,6 +1390,13 @@ def _partition_still_deliverable(db, rows: list) -> tuple[list, list, int]:
     The job row needs no lock: each job-side answer is final once seen. A job
     that billed stays billed, and a failed or cancelled job that never billed can
     never bill (the done-CAS only moves a non-terminal job).
+
+    Privacy (Phase 6 P4c): a lead that would be bought is first authorized against
+    ``snapshot`` (src/privacy/authorize.py), from the same share-locked Result read and
+    its owner-matched config's record type, county and state. Withheld or under
+    review: withdrawn like any undelivered lead, never sent to Tracerfy, never charged.
+    authorize() is pure; it takes no lock. A key that vanishes mid-tick raises
+    RuleSnapshotError before the claim commits, so nothing is claimed.
     """
     if not rows:
         return [], [], 0
@@ -1384,34 +1404,44 @@ def _partition_still_deliverable(db, rows: list) -> tuple[list, list, int]:
 
     from src.api.lead_actionability import withheld_condition
     from src.api.results_category import skip_trace_eligible_condition
-    from src.db.models import Job, Result
+    from src.db.models import Job, Result, ScraperConfig
+    from src.privacy.authorize import authorize
     from src.workers.tasks_helpers.dedup import BILLING_STAMP_RELIABLE_SINCE
 
+    # The columns authorize() reads (decrypted by their column types), nothing more.
+    person_cols = (Result.parcel_id, Result.party_name, Result.heirs, Result.phone,
+                   Result.phones, Result.email, Result.emails)
+    found = db.execute(
+        select(
+            Result.id,
+            Result.user_id,
+            # A same-run sibling or superseded row; an already-delivered one stays.
+            not_(skip_trace_eligible_condition()).label("ineligible"),
+            # Same spelling as lead_actionability.actionable_condition; a NULL
+            # blob yields NULL from ->>, which the COALESCE turns into ''.
+            withheld_condition().label("excluded"),
+            Job.status.label("job_status"),
+            Job.billing_applied_at.is_not(None).label("billed"),
+            (Job.created_at >= BILLING_STAMP_RELIABLE_SINCE).label("stamped"),
+            *person_cols,
+            ScraperConfig.record_type,
+            ScraperConfig.county,
+            ScraperConfig.state,
+        )
+        .join(Job, Job.id == Result.job_id)
+        # Owner-matched; outer so a lead whose config is gone is still decided
+        # (no county: no parcel anchor, so a rule's subject alone -> review).
+        .outerjoin(ScraperConfig, (ScraperConfig.id == Job.scraper_config_id)
+                   & (ScraperConfig.user_id == Job.user_id))
+        .where(
+            tuple_(Result.id, Result.user_id).in_(
+                [(r.result_id, r.user_id) for r in rows]
+            )
+        )
+        .with_for_update(read=True, skip_locked=True, of=Result)
+    ).mappings().all()
     # Tenant-paired like every other write from this cross-tenant head.
-    state = {
-        (str(rid), str(uid)): (ineligible, excluded, status, billed, stamped)
-        for rid, uid, ineligible, excluded, status, billed, stamped in db.execute(
-            select(
-                Result.id,
-                Result.user_id,
-                # A same-run sibling or superseded row; an already-delivered one stays.
-                not_(skip_trace_eligible_condition()),
-                # Same spelling as lead_actionability.actionable_condition; a NULL
-                # blob yields NULL from ->>, which the COALESCE turns into ''.
-                withheld_condition(),
-                Job.status,
-                Job.billing_applied_at.is_not(None),
-                Job.created_at >= BILLING_STAMP_RELIABLE_SINCE,
-            )
-            .join(Job, Job.id == Result.job_id)
-            .where(
-                tuple_(Result.id, Result.user_id).in_(
-                    [(r.result_id, r.user_id) for r in rows]
-                )
-            )
-            .with_for_update(read=True, skip_locked=True, of=Result)
-        ).all()
-    }
+    state = {(str(m["id"]), str(m["user_id"])): m for m in found}
     keep: list = []
     drop: list = []
     later = 0
@@ -1420,12 +1450,17 @@ def _partition_still_deliverable(db, rows: list) -> tuple[list, list, int]:
         if seen is None:
             later += 1
             continue
-        ineligible, excluded, status, billed, stamped = seen
+        status, billed = seen["job_status"], seen["billed"]
         terminal = status in ("failed", "cancelled")
-        if ineligible or excluded or (terminal and not billed and stamped):
+        if seen["ineligible"] or seen["excluded"] or (terminal and not billed
+                                                      and seen["stamped"]):
             drop.append(r)
         elif billed or status == "done" or terminal:
-            keep.append(r)
+            if authorize(snapshot, seen, record_type=seen["record_type"],
+                         county=seen["county"], state=seen["state"]).deliverable:
+                keep.append(r)
+            else:
+                drop.append(r)
         else:
             later += 1
     return keep, drop, later

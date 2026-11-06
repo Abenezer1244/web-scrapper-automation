@@ -42,6 +42,7 @@ nothing from the request tables.
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -117,7 +118,9 @@ class RuleSnapshot:
 
 
 def _get(row: Any, name: str):
-    return row.get(name) if isinstance(row, dict) else getattr(row, name, None)
+    # Any mapping (a dict, a SQLAlchemy RowMapping) by key; an ORM row by attribute.
+    # A RowMapping read by attribute would yield None for every field: allow-all.
+    return row.get(name) if isinstance(row, Mapping) else getattr(row, name, None)
 
 
 def build_snapshot(rows) -> RuleSnapshot:

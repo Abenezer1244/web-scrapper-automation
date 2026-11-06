@@ -103,7 +103,7 @@ _UNMATCHED_UNDECIDED = (f"EXISTS ({_LEADS_OF_A} AND p.status = 'unmatched' "
 _ANY_BLOCKER = (f"({_STALE_SUBMITTING} OR {_SUBMITTED_IN_ERRORED_QUEUE} "
                 f"OR {_ROW_MISSING} OR {_RESULT_UNEXPECTED} OR {_UNMATCHED_UNDECIDED})")
 # A lead the visit can map right now.
-_MAPPABLE = (f"EXISTS ({_LEADS_OF_A} AND (p.status IN ('errored', 'cancelled') "
+_MAPPABLE = (f"EXISTS ({_LEADS_OF_A} AND (p.status IN ('errored', 'cancelled', 'quarantined') "
              "OR (p.status = 'unmatched' AND q.unmatched_billed IS NOT NULL) "
              "OR (p.status = 'completed' AND r.skip_trace_status IN ('hit', 'miss'))))")
 _NOTHING_ACTIVE = (f"NOT EXISTS ({_LEADS_OF_A} "
@@ -316,7 +316,9 @@ def _settle(db, aid: str, row, summary: dict) -> Callable | None:
                                       else "unmatched_unbilled")
         elif status == "errored":
             verdicts[lead.rid] = "errored_unsubmitted"
-        elif status == "cancelled":
+        elif status in ("cancelled", "quarantined"):
+            # quarantined (Phase 6 P4d): a privacy rule withheld the answer at ingest;
+            # nothing delivered, nothing billed. Released, like a withdrawn lead.
             verdicts[lead.rid] = "released"
         elif ((status == "submitting" and lead.stale)
               or (status == "submitted" and lead.queue_status == "errored")):

@@ -29,25 +29,25 @@ section 6 ("Queued sends"). Merge rule: CI green + Codex GO per slice.
 
 ## Slices (each <= 5 files, own PR, CI green + Codex GO before merge)
 
-- [ ] **P4a: rule read path (expand-only, ships alone first).** Migration 127: SECURITY DEFINER
+- [x] **P4a: rule read path (expand-only, ships alone first).** Migration 127: SECURITY DEFINER
   `public.privacy_rule_rows()` returning exactly the loader's columns (no request_id, no payloads),
   `SET search_path = public, pg_temp`, REVOKE from PUBLIC, GRANT EXECUTE to `bridgeleads_system`
   (guarded IF EXISTS, as 125 does). `load_rule_snapshot` reads through the function. Tests: function
   returns rows despite RLS for a non-owner NOBYPASSRLS role; no table privilege granted.
-- [ ] **P4b: dialer.** Generic webhook carries result ids + total, not people: a new task rebuilds
+- [x] **P4b: dialer.** Generic webhook carries result ids + total, not people: a new task rebuilds
   the payload at send (and on every retry) from Result by id with the P3 predicates, loads one
   snapshot and authorizes each row; URL/secret re-read from the config (owner-matched, plan
   re-checked). Outbox: authorize before build; flagged/withheld rows -> 'skipped' with an honest
   reason. Sweep + late delivery: authorize at selection too (one snapshot per sweep).
-- [ ] **P4c: Tracerfy dispatcher.** `_partition_still_deliverable` authorizes each row (it already
+- [x] **P4c: Tracerfy dispatcher.** `_partition_still_deliverable` authorizes each row (it already
   holds Result FOR SHARE, so Result columns + config come from the same read); non-ALLOWED ->
   `_cancel_undeliverable`. Snapshot loaded once per tick; RuleSnapshotError aborts the tick
   (nothing claimed, nothing posted).
-- [ ] **P4d: ingest quarantine.** Before the cache/Result writes, authorize the matched Result;
+- [x] **P4d: ingest quarantine.** Before the cache/Result writes, authorize the matched Result;
   non-ALLOWED -> write no cache entry and no contact columns, pending -> 'quarantined' (not billed),
   Result -> 'errored'? (Codex question). RuleSnapshotError -> raise, transaction rolls back, ingest
   retries.
-- [ ] **P4e: PII-emission inventory** (scripts/, admin routes, ops alerts, logs): doc
+- [x] **P4e: PII-emission inventory** (scripts/, admin routes, ops alerts, logs): doc
   `docs/legal/audit-2026-11/08-PII-EMISSION-INVENTORY.md`, fixes only where trivial.
 
 ## Open questions for Codex
@@ -87,3 +87,19 @@ Answered, not changed:
 - Late-answer race (rule activates after ingest loaded its snapshot): the P5 enforcer flags the row,
   hiding it on every read path. Rules cannot activate before P7 anyway.
 - Frozen export artifacts are P6 (erasure), per the design's order of work.
+
+## Status (2026-11-06)
+
+- P4e MERGED (#600): inventory doc + named ignore rules + activation gate test. Codex GO (5 rounds).
+- P4a Codex GO (2 rounds). Migration 129 revises 128, so it merges after the NTS stack #598/#599.
+- P4b/P4c Codex GO (2 rounds): outbox, id-only generic push (legacy sealed dialer payloads
+  re-routed by id), sweep and late delivery load rules before any claim, dispatcher authorizes
+  before the claim. authorize._get reads any Mapping.
+- P4d: ingest quarantine ('quarantined' pending status, never billed, Result 'errored', the
+  subject's cache entry dropped); the contact-lookup reconciler settles it as 'released'.
+
+## Carried to P5 (write paths, design section 6)
+- Late delivery (cv_late_delivery.grant_records) bills a held row before any authorize(): the P5
+  write gate must authorize before the grant (Codex P4b review, deferred per the design).
+- Cache copies that write contacts without Tracerfy: _settle_queued_from_known_answers,
+  enrich.copy_cached_answer, duplicate reuse.

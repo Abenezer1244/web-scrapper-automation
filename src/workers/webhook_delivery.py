@@ -353,6 +353,17 @@ def deliver_job_webhook(
 
         args = unseal_task_args(sealed, required=("url", "payload"))
         webhook_url, payload = args["url"], args["payload"]
+    if (payload or {}).get("event") == "leads.dialer_ready":
+        # A dialer push sealed by the release before Phase 6 P4b (still queued or
+        # retrying at deploy). Its people were frozen at selection, so it is never
+        # sent as is: its row ids go through deliver_dialer_push, which re-reads and
+        # authorizes them. Nothing current produces this message.
+        ids = [str(ld["id"]) for ld in payload.get("leads") or [] if ld.get("id")]
+        deliver_dialer_push.delay(job_id, result_ids=ids,
+                                  total=int(payload.get("total_dialer_ready_count") or len(ids)))
+        _logger.info("Dialer push %s: legacy sealed payload re-routed by id (%d rows)",
+                     job_id[:8], len(ids))
+        return {"status": "rerouted", "rows": len(ids)}
     return _post(self, job_id, webhook_url, payload)
 
 

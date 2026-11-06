@@ -8,14 +8,21 @@ the customer's endpoint. Synthetic people only.
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import text
 
+import src.privacy.authorize as authorize_mod
 import src.workers.webhook_delivery as wd
+from src.config import settings
 from src.db.models import Job, Result, ScraperConfig, User
+from src.privacy import keys
 from src.privacy.authorize import RuleSnapshotError, build_snapshot
+from src.privacy.subjects import NORMALIZATION_VERSION, subject_key_values
+from src.workers import cv_late_delivery as late
+from src.workers.scheduler_helpers import dialer
+from tests.test_cv_late_delivery import _held, _held_row
 from tests.test_privacy_authorize import _history, _keyring  # noqa: F401 -- autouse keyring
 from tests.test_privacy_read_paths import _withhold
 
@@ -134,9 +141,122 @@ def test_the_message_carries_no_person():
     import inspect
 
     from src.workers import cv_late_delivery
-    from src.workers.scheduler_helpers import dialer
-
     for src in (inspect.getsource(dialer._dialer_push_sweep_impl),
                 inspect.getsource(cv_late_delivery._send_to_dialer)):
         assert "deliver_dialer_push.delay(" in src
         assert "deliver_job_webhook" not in src and "seal_task_args" not in src
+
+
+# ── the boundaries before the send task (Codex P4b review) ─────────────────────
+
+async def _late_run(db, user) -> str:
+    from tests.test_cv_late_dialer import _GENERIC, _run
+
+    return await _run(db, user, deliver=_GENERIC, pushed_hours_ago=48)
+
+
+async def _late_dialer(db, rid: str):
+    from tests.test_cv_late_dialer import _dialer
+
+    db.expire_all()
+    return await _dialer(db, rid)
+
+
+def _rule_for(party: str, parcel: str, record_type: str, county: str) -> list[dict]:
+    """An active rule for exactly this row's person at this row's parcel."""
+    [subject] = authorize_mod._subjects({"party_name": party}, record_type, county)
+    s_kind, s_value = subject_key_values(subject)[0]
+    anchor = keys.property_anchor_value(parcel, county, "WA")
+    t0 = datetime(2026, 11, 6, tzinfo=UTC)
+    rule_id = str(uuid.uuid4())
+    return [{
+        "id": str(uuid.uuid4()), "rule_id": rule_id, "anchor_kind": "property",
+        "anchor_hmac": keys.privacy_hmac("property", anchor, "v1"),
+        "subject_kind": s_kind, "subject_hmac": keys.privacy_hmac(s_kind, s_value, "v1"),
+        "scope": "subject", "key_version": "v1", "normalization_version": NORMALIZATION_VERSION,
+        "state": state, "created_at": t0 + timedelta(minutes=i),
+    } for i, state in enumerate(("pending", "active"))]
+
+
+@pytest.fixture
+def enqueued(monkeypatch) -> list[tuple]:
+    calls: list[tuple] = []
+    monkeypatch.setattr(wd.deliver_dialer_push, "delay",
+                        lambda job_id, **kw: calls.append((job_id, kw)))
+    return calls
+
+
+async def test_a_legacy_sealed_dialer_message_is_rerouted_by_id_never_sent(
+    db, business_user, posts, enqueued,
+):
+    """A push sealed by the previous release (people frozen at selection) is never
+    posted as is: its ids go through the re-reading, authorizing task."""
+    from src.utils.crypto import seal_task_args
+
+    job, _, ids = await _job(db, business_user, ("DOE JANE", "9876543210"))
+    legacy = {"event": "leads.dialer_ready", "total_dialer_ready_count": 1,
+              "leads": [{"id": ids["DOE JANE"], "party_name": "DOE JANE", "phone": "2065550100"}]}
+    out = wd.deliver_job_webhook(job, sealed=seal_task_args({"url": _HOOK, "payload": legacy}))
+    assert out == {"status": "rerouted", "rows": 1}
+    assert posts == []
+    assert enqueued == [(job, {"result_ids": [ids["DOE JANE"]], "total": 1})]
+
+
+async def _pushed_at(db, job: str):
+    db.expire_all()
+    return (await db.execute(text("SELECT dialer_pushed_at FROM jobs WHERE id = :j"),
+                             {"j": job})).scalar()
+
+
+async def test_the_sweep_claims_nothing_when_rules_cannot_load(
+    db, business_user, enqueued, monkeypatch,
+):
+    job, _, _ = await _job(db, business_user, ("DOE JANE", "9876543210"))
+
+    def _broken(db):
+        raise RuleSnapshotError("rules could not be loaded")
+
+    monkeypatch.setattr(authorize_mod, "load_rule_snapshot", _broken)
+    dialer._dialer_push_sweep_impl()
+    assert await _pushed_at(db, job) is None
+    assert enqueued == []
+
+
+async def test_the_sweep_never_queues_a_withheld_row(db, business_user, enqueued, monkeypatch):
+    job, _, ids = await _job(db, business_user, ("SMITH JOHN", _PARCEL), ("DOE JANE", "9876543210"))
+    monkeypatch.setattr(authorize_mod, "load_rule_snapshot",
+                        lambda db: build_snapshot(_history(["pending", "active"])))
+    dialer._dialer_push_sweep_impl()
+    [(queued_job, kw)] = [c for c in enqueued if c[0] == job]
+    assert kw == {"result_ids": [ids["DOE JANE"]], "total": 1}
+    assert await _pushed_at(db, job) is not None
+
+
+async def test_a_late_row_the_rules_withhold_is_never_sent(db, business_user, enqueued, monkeypatch):
+    monkeypatch.setattr(settings, "CV_LATE_DELIVERY_ENABLED", True, raising=False)
+    job = await _late_run(db, business_user)
+    rid = await _held_row(db, business_user, job, _held(), phone="2065550100")
+    party = (await db.execute(text(
+        "SELECT party_name FROM results WHERE id = :i"), {"i": rid})).scalar()
+    # The row's person under a rule anchored at another parcel: held for review.
+    monkeypatch.setattr(authorize_mod, "load_rule_snapshot", lambda db: build_snapshot(
+        _rule_for(party, "5555555555", "code_violation", "king")))
+    late.deliver_completed_held_rows()               # delivers, then decides its dialer push
+    assert await _late_dialer(db, rid) == "privacy_withheld"
+    assert enqueued == []
+
+
+async def test_late_delivery_claims_no_push_when_rules_cannot_load(
+    db, business_user, enqueued, monkeypatch,
+):
+    monkeypatch.setattr(settings, "CV_LATE_DELIVERY_ENABLED", True, raising=False)
+    job = await _late_run(db, business_user)
+    rid = await _held_row(db, business_user, job, _held(), phone="2065550100")
+
+    def _broken(db):
+        raise RuleSnapshotError("rules could not be loaded")
+
+    monkeypatch.setattr(authorize_mod, "load_rule_snapshot", _broken)
+    stats = late.deliver_completed_held_rows()
+    assert stats["dialer_pushed"] == 0
+    assert await _late_dialer(db, rid) == "pending" and enqueued == []

@@ -169,6 +169,7 @@ def _dialer_push_sweep_impl() -> None:
     from src.config.constants import BUSINESS_FEATURES_PLANS
     from src.db.models import Job, Result, ScraperConfig, User
     from src.db.session import system_sync_session
+    from src.privacy.authorize import RuleSnapshotError, authorize, load_rule_snapshot
     from src.workers.dialer_connectors import get_connector
     from src.workers.dialer_outbox import process_dialer_outbox
     from src.workers.webhook_delivery import DIALER_PUSH_CAP, deliver_dialer_push
@@ -188,6 +189,15 @@ def _dialer_push_sweep_impl() -> None:
         except Exception as exc:  # noqa: BLE001 — a probe must not stop the sweep
             db.rollback()
             _logger.warning("Dialer: missing-queue probe failed: %s", str(exc)[:200])
+        # Privacy (Phase 6 P4b): the rules load ONCE, before any job is claimed. If they
+        # cannot, no job is claimed this sweep (fail closed; the next sweep retries).
+        try:
+            snapshot = load_rule_snapshot(db)
+        except RuleSnapshotError as exc:
+            db.rollback()
+            _logger.error("Dialer push sweep: privacy rules unavailable (%s); nothing "
+                          "claimed", str(exc)[:160])
+            return
         candidates = db.execute(
             select(Job, ScraperConfig)
             # Owner-match in the join (Codex security, defense-in-depth): the DB
@@ -290,19 +300,16 @@ def _dialer_push_sweep_impl() -> None:
                         .order_by(Result.id)  # deterministic before LIMIT
                         .limit(DIALER_PUSH_CAP)
                     ).scalars().all()
-                    leads = [
-                        {
-                            "id": row.id,
-                            "party_name": row.party_name,
-                            "phone": row.phone,
-                            "phone_type": row.phone_type,
-                            "phone_dnc_flag": row.phone_dnc_flag,
-                            "email": row.email,
-                            "property_address": row.property_address,
-                            "mailing_address": row.mailing_address,
-                        }
-                        for row in rows
-                    ]
+                    # Authorized at selection (and again at send, by the task or the
+                    # outbox): a withheld or under-review row is not queued at all.
+                    allowed = [row for row in rows if authorize(
+                        snapshot, row, record_type=config.record_type,
+                        county=config.county, state=config.state).deliverable]
+                    total -= len(rows) - len(allowed)
+                    rows = allowed
+                if total > 0 and rows:
+                    # Ids only: both transports re-read the row at send time.
+                    leads = [{"id": row.id} for row in rows]
                     # Dispatch via the dialer connector seam (Thread 3).
                     if connector.uses_outbox:
                         # Native bulk-less vendor: materialize one durable outbox row

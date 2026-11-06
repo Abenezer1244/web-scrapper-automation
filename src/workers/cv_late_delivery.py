@@ -45,7 +45,11 @@ from datetime import UTC, datetime, timedelta
 from celery.exceptions import SoftTimeLimitExceeded, TimeLimitExceeded
 from sqlalchemy import text as sa_text
 
-from src.api.lead_actionability import DELIVERY_EXCLUDED_KEY, NOT_QUALIFIED
+from src.api.lead_actionability import (
+    DELIVERY_EXCLUDED_KEY,
+    NOT_QUALIFIED,
+    not_privacy_suppressed_sql,
+)
 from src.api.lead_qualification import POLICY_CODE_VIOLATION, POLICY_KEY, qualified_sql
 from src.config import settings
 from src.utils.logger import setup_logger
@@ -95,9 +99,12 @@ _STATEMENT_TIMEOUT_MS = 10000
 _HELD = (f"r.enrichment_data::jsonb->>'{POLICY_KEY}' = '{POLICY_CODE_VIOLATION}' "
          f"AND r.enrichment_data::jsonb->>'{DELIVERY_EXCLUDED_KEY}' = '{NOT_QUALIFIED}' "
          f"AND NOT (r.enrichment_data::jsonb ? '{LATE_KEY}')")
+# Not withheld by a privacy rule (migration 126): a held row a person asked to be removed
+# from must never be delivered or billed late. In discovery AND under the row lock, so a
+# row flagged between the two is skipped as stale.
 _ELIGIBLE = (f"r.is_duplicate = false AND r.duplicate_reason IS NULL "
              f"AND jsonb_typeof(r.enrichment_data::jsonb) = 'object' AND {_HELD} "
-             f"AND {qualified_sql('r')}")
+             f"AND {qualified_sql('r')} AND {not_privacy_suppressed_sql('r')}")
 
 # Discovery only (ids, on the system session: it spans accounts). Round-robin across
 # accounts, oldest first within each. Every condition is decided again under the locks,
@@ -193,12 +200,17 @@ def deliver_completed_held_rows(*, batch: int = _BATCH_ROWS) -> dict:
 
 # Rows delivered but not announced yet, in the same scope as discovery (done code-violation
 # jobs of the row's own account), so neither query reaches across record types or accounts.
+# A row withheld by a privacy rule after its late delivery is neither announced nor sent for
+# contacts (here and _CONTACTS_PENDING_SQL). The filter is in the WHERE, before any LIMIT,
+# so withheld rows take no batch slot; their markers stay pending, so lifting a rule would
+# resume them.
 _PENDING_SCOPE = f"""
     FROM results r
     JOIN jobs j ON j.id = r.job_id AND j.user_id = r.user_id AND j.status = 'done'
     JOIN scraper_configs sc ON sc.id = j.scraper_config_id AND sc.user_id = j.user_id
                            AND sc.record_type = 'code_violation'
     WHERE r.enrichment_data::jsonb->'{LATE_KEY}'->>'notified' = 'false'
+      AND {not_privacy_suppressed_sql('r')}
 """  # noqa: S608 -- splices only module constants
 # Oldest pending delivery first, so a backlog drains in order and no account is skipped
 # every tick (Codex C3 P2).
@@ -230,6 +242,7 @@ _CONTACTS_PENDING_SQL = f"""
                            AND sc.record_type = 'code_violation'
     WHERE r.is_duplicate = false
       AND r.enrichment_data::jsonb->'{LATE_KEY}'->>'{CONTACTS_KEY}' = '{CONTACTS_PENDING}'
+      AND {not_privacy_suppressed_sql('r')}
     GROUP BY r.job_id, r.user_id
     ORDER BY min(r.enrichment_data::jsonb->'{LATE_KEY}'->>'delivered_at')
     LIMIT :limit

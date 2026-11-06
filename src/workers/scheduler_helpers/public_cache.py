@@ -50,6 +50,7 @@ def _refresh_public_sample_cache_impl() -> None:
     from sqlalchemy import func as sa_func
     from sqlalchemy import select, text
 
+    from src.api.lead_actionability import not_privacy_suppressed_condition
     from src.db.models import Job, Result, ScraperConfig
     from src.db.session import system_sync_session
 
@@ -63,10 +64,12 @@ def _refresh_public_sample_cache_impl() -> None:
     samples = example_sample_records()
 
     with system_sync_session() as db:
+        # Public, cross-tenant marketing numbers: a privacy-withheld row is not one.
         delivered_count = db.execute(
             select(sa_func.count(Result.id)).where(
                 Result.property_address.isnot(None),
                 Result.property_address != "",
+                not_privacy_suppressed_condition(),
             )
         ).scalar() or 0
 
@@ -78,6 +81,7 @@ def _refresh_public_sample_cache_impl() -> None:
             .where(
                 Result.property_address.isnot(None),
                 Result.property_address != "",
+                not_privacy_suppressed_condition(),
             )
         ).scalar() or 0
 

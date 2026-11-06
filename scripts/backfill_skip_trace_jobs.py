@@ -99,6 +99,8 @@ def main() -> int:
 
     from sqlalchemy import and_, select
 
+    from src.api.lead_actionability import actionable_condition
+    from src.api.results_category import skip_trace_eligible_condition
     from src.config import settings
     from src.db.models import (
         Job,
@@ -197,6 +199,11 @@ def main() -> int:
                     Result.user_id == job.user_id,
                     Result.skip_trace_status == "not_attempted",
                     Result.property_address.isnot(None),
+                    # The production enqueue's own eligibility: a lead this account
+                    # is delivered (not over quota, qualified, not withheld by a
+                    # privacy rule) and one a lookup may be bought for.
+                    actionable_condition(),
+                    skip_trace_eligible_condition(),
                 )).execution_options(populate_existing=True)
             ).scalars().all()
 

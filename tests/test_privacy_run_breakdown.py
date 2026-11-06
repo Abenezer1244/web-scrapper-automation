@@ -114,3 +114,29 @@ async def test_the_results_page_breakdown_reconciles_without_naming_the_bucket(
                  "already_delivered": 0, "not_qualified": 0, "over_quota": 0, "new": 2}
     assert sum(b.values()) == 8
     assert "privacy" not in resp.text.lower()
+
+
+async def test_a_frozen_snapshot_with_withheld_rows_is_folded_on_every_endpoint(
+    client: AsyncClient, starter_user: User, starter_token: str,
+    scraper_config: ScraperConfig, db,
+):
+    """The worker froze privacy_withheld = 4. GET /jobs/{id} and its results page show
+    the snapshot folded: 1 dropped + 4 withheld = 5 filtered out, no internal bucket."""
+    job = await _job(db, starter_user, scraper_config)
+    await db.execute(update(Job).where(Job.id == job).values(
+        records_found=8, record_count=2, billed_count=2, retry_count=0,
+        breakdown_dropped_before_save=1, breakdown_no_address=1,
+        breakdown_same_run_merged=0, breakdown_already_delivered=0,
+        breakdown_not_qualified=0, breakdown_over_quota=0, breakdown_new=2,
+        breakdown_privacy_withheld=4,
+    ))
+    await db.commit()
+    folded = {"dropped_before_save": 5, "no_address": 1, "same_run_merged": 0,
+              "already_delivered": 0, "not_qualified": 0, "over_quota": 0, "new": 2}
+    for path in (f"/jobs/{job}", f"/jobs/{job}/results"):
+        resp = await client.get(path, headers=_auth(starter_token))
+        assert resp.status_code == 200, (path, resp.text)
+        body = resp.json()
+        assert body["breakdown_basis"] == "snapshot", path
+        assert body["breakdown"] == folded, path
+        assert "privacy" not in resp.text.lower(), path

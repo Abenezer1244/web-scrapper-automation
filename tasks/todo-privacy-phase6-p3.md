@@ -97,9 +97,9 @@ Gaps (do not use the central predicate):
 | Medium: slice boundaries | Slices below name exact files. |
 
 ## Revised slices
-- [x] P3-0 migration 126 alone (+ test). Own PR, merged and applied before anything reads it.
-- [ ] P3-inv read inventory doc.
-- [ ] P3a model + `lead_actionability` + `results_category` + tests.
+- [x] P3-0 migration 126 alone (+ test): PR #594, merged 9b89e430, applied on production 2026-11-06.
+- [x] P3-inv read inventory doc (07-RESULTS-READ-INVENTORY.md).
+- [x] P3a model + `lead_actionability` + `results_category` + tests (Codex: High on the breakdown, fixed by pulling P3c in; then GO).
 - [ ] P3b gaps from the inventory, by surface (API counts/quote; worker emitters), ≤5 files each.
-- [ ] P3c run breakdown bucket (run_breakdown, finalize, status, schemas, test).
+- [x] P3c run breakdown bucket, folded into dropped_before_save for customers (customer_view).
 - [ ] P3d authorization service + property/mailing canonical forms + tests.

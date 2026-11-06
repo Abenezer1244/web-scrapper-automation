@@ -18,10 +18,14 @@ a rule of another (a surname equal to a street name, say).
 
 Canonical values only: ``privacy_hmac`` refuses a value that is not already in
 its kind's canonical form (the normalisers in src/privacy/subjects.py), because a
-digest of 'Smith|John' and one of 'smith|john' would never meet. Property and
-mailing addresses have NO canonical form until the address normaliser ships with
-the address matcher, so until then they cannot be keyed at all: a weak floor
-('123 Main St.' vs '123 MAIN STREET') would make rules that silently never match.
+digest of 'Smith|John' and one of 'smith|john' would never meet. A property is
+keyed by its PARCEL only (``property_anchor_value``: the parcel branch of
+compute_property_key, ``P|<STATE>|<county>|<PARCEL>``), which is robust across
+pipelines. Street addresses (the property key's address branch, and mailing) have
+NO canonical form until the address normaliser ships with the address matcher, so
+they cannot be keyed: a weak floor ('123 Main St.' vs '123 MAIN STREET') would make
+rules that silently never match. A row without a parcel is matched by subject and
+sent to review instead (src/privacy/authorize.py).
 
 Configuration is read ONCE per process, as one snapshot of (current version,
 keyring): a running worker never mixes a current version from new settings with a
@@ -62,6 +66,30 @@ def _canonical_person(value: str) -> str | None:
     return person_key_value(surname, given) if sep else None
 
 
+def property_anchor_value(parcel_id: str | None, county: str | None,
+                          state: str | None) -> str | None:
+    """The canonical property anchor: ``P|<STATE>|<county>|<PARCEL>``, exactly the input
+    compute_property_key hashes on its parcel branch. None without a usable parcel, or
+    without the state or county that scope it (a bare parcel number repeats across
+    counties, so an unscoped anchor could match another county's property)."""
+    # Imported here: importing the src.workers package builds the Celery app, which a
+    # pure key library must not do at import time.
+    from src.workers.property_identity import property_key_input
+
+    if not (state or "").strip() or not (county or "").strip():
+        return None
+    value = property_key_input(parcel_id, None, county, state)
+    return value if value is not None and value.startswith("P|") else None
+
+
+def _canonical_property(value: str) -> str | None:
+    parts = value.split("|")
+    if len(parts) != 4 or parts[0] != "P":  # exactly P|STATE|county|PARCEL, nothing after
+        return None
+    _branch, state, county, parcel = parts
+    return property_anchor_value(parcel, county, state)
+
+
 def _no_canonical_form_yet(value: str) -> str | None:
     return None  # refused until the address normaliser defines the form
 
@@ -72,7 +100,7 @@ _CANONICAL = {
     "entity": entity_key_value,
     "phone": phone_key_value,
     "email": email_key_value,
-    "property": _no_canonical_form_yet,
+    "property": _canonical_property,
     "mailing": _no_canonical_form_yet,
 }
 

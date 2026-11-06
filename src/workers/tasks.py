@@ -1120,13 +1120,27 @@ def run_scrape_job(self, job_id: str) -> None:
         # run that found 57 and billed 2 reads 2 forever after. This is the number in
         # the line below, which is the number the customer was just told.
         # 0 is written as 0 on purpose — a county that returned nothing really did.
-        _set_progress(
-            db, job,
-            expected_started_at=attempt_token,
-            commit=False,
-            records_found=len(records),
-            last_progress_at=_now(),
-        )
+        # It is also REQUIRED to finish: _set_progress swallows a DB error, so an
+        # ignored failed write let a run reach done with records_found NULL, which
+        # reads as "unknown" forever. Retry once, then stop here, before anything is
+        # saved, reserved or billed. A superseded attempt lands here too, and
+        # _fail_attempt is a no-op for it.
+        if not any(
+            _set_progress(
+                db, job,
+                expected_started_at=attempt_token,
+                commit=False,
+                records_found=len(records),
+                last_progress_at=_now(),
+            )
+            for _ in range(2)
+        ):
+            _fail_attempt(
+                "We could not record how many records this run found, so it was "
+                "stopped before anything was saved. You were not charged. Please "
+                "run it again."
+            )
+            return
         _publish_log(r, job_id, "success", f"Scrape complete: {len(records)} records found", db=db)
 
         # ── Phase 3: honest probate output ────────────────────────────────────

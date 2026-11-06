@@ -366,3 +366,51 @@ def test_an_unwritable_marker_after_done_keeps_the_delivered_run(
     assert markers == []
     assert any(m.startswith("Job complete") for m in logs)  # delivery carried on
     assert [a.path for a in alerts] == [f"job_degraded:{job_id}:claim_release"]
+
+
+def test_a_clean_run_records_what_it_found(make_job, redis_client):
+    job_id = make_job()
+    _apply(job_id)
+    with SyncSessionLocal() as s:
+        status, found = s.execute(text(
+            "SELECT status, records_found FROM jobs WHERE id = :j"), {"j": job_id}).one()
+    assert (status, found) == ("done", _RECORDS)
+
+
+@pytest.fixture
+def unwritable_records_found():
+    """A real trigger that refuses every write of jobs.records_found."""
+    with SyncSessionLocal() as s:
+        s.execute(text(
+            "CREATE OR REPLACE FUNCTION zz_test_rf_refuse() RETURNS trigger AS $f$ "
+            "BEGIN RAISE EXCEPTION 'test: records_found refused'; END; $f$ LANGUAGE plpgsql"))
+        s.execute(text("DROP TRIGGER IF EXISTS zz_test_rf_refuse ON jobs"))
+        s.execute(text(
+            "CREATE TRIGGER zz_test_rf_refuse BEFORE UPDATE ON jobs FOR EACH ROW "
+            "WHEN (NEW.records_found IS DISTINCT FROM OLD.records_found) "
+            "EXECUTE FUNCTION zz_test_rf_refuse()"))
+        s.commit()
+    yield
+    with SyncSessionLocal() as s:
+        s.execute(text("DROP TRIGGER IF EXISTS zz_test_rf_refuse ON jobs"))
+        s.execute(text("DROP FUNCTION IF EXISTS zz_test_rf_refuse()"))
+        s.commit()
+
+
+def test_a_run_that_cannot_record_its_count_fails_before_saving_or_billing(
+    make_job, redis_client, unwritable_records_found,
+):
+    """records_found used to be best-effort telemetry: a failed write was ignored and
+    the run still finished DONE with the count NULL ("unknown") forever."""
+    job_id = make_job()
+    _apply(job_id)
+    job, _markers, logs, _alerts, claims = _outcome(job_id)
+    with SyncSessionLocal() as s:
+        found, saved, error = s.execute(text(
+            "SELECT j.records_found, (SELECT count(*) FROM results r WHERE r.job_id = j.id), "
+            "j.error_message FROM jobs j WHERE j.id = :j"), {"j": job_id}).one()
+    assert job.status == "failed"
+    assert found is None and saved == 0 and claims == 0
+    assert job.billing_applied_at is None and job.billed_count == 0
+    assert "could not record how many records" in error
+    assert not any("Scrape complete" in m for m in logs)

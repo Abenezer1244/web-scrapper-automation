@@ -6,8 +6,13 @@ point over a different set of rows. The breakdown names every record once:
 
     records_found = dropped_before_save + no_address + same_run_merged
                   + already_delivered + not_qualified + over_quota + new
+                  + privacy_withheld
 
 Per SAVED row of the job, first match wins (``PARTITION_CASE``):
+  privacy_withheld   withheld by a privacy suppression rule (migration 126), whatever
+                     else is true: a withheld row is in no other bucket, so no
+                     customer-visible number can describe it. Stored on its own;
+                     customer_view folds it into dropped_before_save for display.
   no_address         no usable property or mailing address, whatever else is true
   same_run_merged    combined into another row of this same run
   already_delivered  an earlier run of the account holds the claim (results_category)
@@ -22,7 +27,7 @@ Per SAVED row of the job, first match wins (``PARTITION_CASE``):
 ``dropped_before_save`` = records_found - rows saved (living-TOD filter + the
 save-time fingerprint merge).
 
-The worker freezes the six in the done-CAS (migration 106) from the same statement
+The worker freezes the buckets in the done-CAS (migration 106) from the same statement
 that produces the billed count; the API reads that snapshot, or computes the same
 partition live for a finished job that has none. It is RAW: no tax cap and no view
 filter, so on a tax run the "already delivered" tab (tax-capped) can be smaller.
@@ -40,6 +45,7 @@ from sqlalchemy import text
 from src.api.lead_actionability import (
     actionable_sql,
     address_actionable_sql,
+    not_privacy_suppressed_sql,
     not_qualified_excluded_sql,
     quota_excluded_sql,
 )
@@ -55,7 +61,13 @@ BREAKDOWN_FIELDS = (
     "not_qualified",
     "over_quota",
     "new",
+    # Internal, last so the frozen-column order of the others is unchanged; never
+    # rendered on its own (customer_view).
+    "privacy_withheld",
 )
+# Buckets added after migration 106: a snapshot frozen before the column existed
+# holds NULL there and had nothing in it, so it reads as 0.
+LATER_FIELDS = ("not_qualified", "privacy_withheld")
 ROW_BUCKETS = BREAKDOWN_FIELDS[1:]
 UNCLASSIFIED = "unclassified"
 SNAPSHOT_COLUMNS = {field: f"breakdown_{field}" for field in BREAKDOWN_FIELDS}
@@ -65,6 +77,7 @@ def partition_case(alias: str) -> str:
     """ONE CASE, so a row lands in exactly one bucket by construction."""
     return (
         "CASE"
+        f" WHEN NOT {not_privacy_suppressed_sql(alias)} THEN 'privacy_withheld'"
         f" WHEN NOT {address_actionable_sql(alias)} THEN 'no_address'"
         f" WHEN {alias}.is_duplicate IS TRUE AND {alias}.duplicate_reason = 'same_run'"
         "  THEN 'same_run_merged'"
@@ -101,6 +114,7 @@ class RowPartition:
     not_qualified: int = 0
     over_quota: int = 0
     new: int = 0
+    privacy_withheld: int = 0
     unclassified: int = 0
 
     @property
@@ -245,11 +259,12 @@ def breakdown_from_job(job: Any) -> tuple[dict[str, int] | None, str | None]:
     numbers that contradict each other.
     """
     stored = {f: getattr(job, col, None) for f, col in SNAPSHOT_COLUMNS.items()}
-    # not_qualified arrived after the other six (migration 121): a snapshot frozen
-    # before it has NULL there and held nothing back, so it reads as 0.
-    if stored["not_qualified"] is None and any(
-            v is not None for f, v in stored.items() if f != "not_qualified"):
-        stored["not_qualified"] = 0
+    # not_qualified (121) and privacy_withheld (126) arrived after the other six: a
+    # snapshot frozen before one of them has NULL there and had nothing in it.
+    if any(v is not None for f, v in stored.items() if f not in LATER_FIELDS):
+        for f in LATER_FIELDS:
+            if stored[f] is None:
+                stored[f] = 0
     if all(v is None for v in stored.values()):
         return None, None
     if any(v is None for v in stored.values()):
@@ -292,6 +307,23 @@ def live_breakdown(
     return _full(partition, records_found - partition.persisted), None
 
 
+# ── what a customer is shown ─────────────────────────────────────────────────
+
+def customer_view(values: dict[str, int | None]) -> dict[str, int | None]:
+    """The breakdown as the API and the job log present it.
+
+    Rows withheld by a privacy rule are counted with ``dropped_before_save`` (the
+    frontend's "filtered out before processing"): the total still reconciles to
+    records_found, and no number tells an account that a person in its run opted
+    out. An unknown dropped_before_save (None) stays unknown.
+    """
+    shown = {k: v for k, v in values.items() if k != "privacy_withheld"}
+    withheld = values.get("privacy_withheld") or 0
+    if withheld and shown.get("dropped_before_save") is not None:
+        shown["dropped_before_save"] += withheld
+    return shown
+
+
 # ── the worker's completion line ─────────────────────────────────────────────
 
 _LOG_PHRASES = (
@@ -313,5 +345,6 @@ def completion_message(new: int, snapshot: dict[str, int | None] | None) -> str:
     head = f"Job complete: {new} new lead{'' if new == 1 else 's'}"
     if not snapshot:
         return head
+    snapshot = customer_view(snapshot)
     parts = [f"{snapshot[key]} {label}" for key, label in _LOG_PHRASES if snapshot.get(key)]
     return f"{head} ({', '.join(parts)})" if parts else head

@@ -10,6 +10,7 @@ below) satisfies it too.
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -21,6 +22,10 @@ _ROOT = Path(__file__).resolve().parent.parent
 # Section A of the inventory: High (bulk or contact-level) and cross-tenant stdout.
 HIGH_SCRIPTS = (
     "scripts/verify_tracerfy_provenance.py",
+    "scripts/verify_entitlement_deploy.py",
+    "scripts/diag_test11_dq.py",
+    "scripts/diag_test7_source_capture.py",
+    "scripts/diag_king_tax_owner_results.py",
     "scripts/purge_test_batch_configs.py",
     "scripts/diag_test7_rows.py",
     "scripts/backfill_preforeclosure_party_names.py",
@@ -86,3 +91,14 @@ def test_the_gate_would_fail_if_armed_today(monkeypatch):
                         activation.REQUIRED_ENFORCEMENT_VERSION)
     with pytest.raises(AssertionError):
         test_activation_is_blocked_while_a_listed_script_ignores_suppression()
+
+
+def test_the_list_is_exactly_the_inventorys_high_scripts():
+    """An omission would let activation pass with a documented High script still live:
+    the list must name every script in the inventory's section A High tables and
+    cross-tenant list, and nothing else."""
+    doc = (_ROOT / "docs/legal/audit-2026-11/08-PII-EMISSION-INVENTORY.md").read_text(
+        encoding="utf-8")
+    high = doc[doc.index("## A. Scripts"):doc.index("**Customer emails to stdout")]
+    documented = {f"scripts/{n}" for n in re.findall(r"\b([a-z0-9_]+\.py)\b", high)}
+    assert documented == set(HIGH_SCRIPTS)

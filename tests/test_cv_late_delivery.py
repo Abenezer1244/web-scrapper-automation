@@ -23,6 +23,7 @@ from src.api.lead_actionability import DELIVERY_EXCLUDED_KEY, NOT_QUALIFIED
 from src.api.lead_qualification import HOLD_KEY, POLICY_CODE_VIOLATION
 from src.config import settings
 from src.db.models import DeliveredRecord, Job, Result, ScraperConfig
+from src.privacy.authorize import build_snapshot
 from src.workers import cv_late_delivery as late
 from tests.test_lead_qualification import seattle
 
@@ -212,7 +213,7 @@ async def test_a_claim_taken_after_discovery_is_caught_under_the_lock(db, busine
     used = await _used(db, business_user)
 
     with system_sync_session() as s:
-        assert late._deliver_one(s, found) == "stale"
+        assert late._deliver_one(s, found, build_snapshot([])) == "stale"
     assert (await _state(db, rid))[0][DELIVERY_EXCLUDED_KEY] == NOT_QUALIFIED
     assert await _used(db, business_user) == used
 

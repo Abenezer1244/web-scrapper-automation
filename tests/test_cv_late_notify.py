@@ -13,6 +13,7 @@ import pytest
 from sqlalchemy import text
 
 from src.db.session import system_sync_session
+from src.privacy.authorize import build_snapshot
 from src.workers import cv_late_delivery as late
 from src.workers import notification_emit
 from tests.test_cv_late_delivery import (  # noqa: F401 -- shared fixtures
@@ -141,7 +142,7 @@ async def test_two_notify_passes_at_once_announce_once(db, business_user):
     from src.db.session import rls_sync_session
 
     with rls_sync_session(business_user.id) as s:
-        assert all(late._deliver_one(s, r) == "delivered" for r in rows)
+        assert all(late._deliver_one(s, r, build_snapshot([])) == "delivered" for r in rows)
     gate, out = threading.Barrier(2), []
 
     def run():

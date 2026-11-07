@@ -15,7 +15,10 @@ activates mid-tick raises the generation, so the rows stamped with the older one
 read again next tick.
 
 No lock: every write is idempotent (a flag is set only on an unflagged row, a stamp
-only rises), and the budget keeps a tick well inside the schedule's period.
+only rises) and nothing leaves the database, so an overlapping tick (one beat service
+publishes it every 10 minutes; a tick is budgeted to 240 s) only repeats work. Sees
+every tenant: production's results/jobs/scraper_configs/users policies grant
+bridgeleads_system USING (true) (checked in pg_policies 2026-11-07).
 RuleSnapshotError propagates: the tick fails loudly and the next one retries; nothing
 is ever stamped unchecked.
 """
@@ -65,8 +68,8 @@ def enforce_privacy_rules(*, budget_s: float = _TICK_BUDGET_S, batch: int = _BAT
                 batches += 1
                 after_gen, after_id = page[-1].privacy_checked_gen, str(page[-1].id)
     stats = {"generation": gen, "batches": batches, "checked": totals.checked,
-             "flagged": totals.flagged, "unscoped": totals.unscoped}
-    if totals.flagged or totals.unscoped:
+             "flagged": totals.flagged}
+    if totals.flagged:
         # Counts only: never a name, an address or a rule id.
         _logger.warning("Privacy enforcer: %s", stats)
     return stats

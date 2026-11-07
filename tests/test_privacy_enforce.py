@@ -89,7 +89,7 @@ async def test_withheld_and_review_rows_are_flagged_and_others_stamped(db, busin
                                      ("SMITH JOHN", "5555555555"), ("DOE JANE", _PARCEL))
     snapshot = active_snapshot(rule)
     stats = _enforce(snapshot, [smith, review, doe])
-    assert (stats.checked, stats.flagged, stats.unscoped) == (3, 2, 0)
+    assert (stats.checked, stats.flagged) == (3, 2)
     gen = snapshot.generation
     assert await _state(db, smith) == (True, rule, gen)
     assert await _state(db, review) == (True, rule, gen)   # REVIEW is withheld too
@@ -144,15 +144,33 @@ async def test_a_purging_or_deleted_account_is_left_to_the_purge(db, business_us
     assert await _state(db, rid) == (False, None, 0)
 
 
-async def test_a_row_without_its_own_tenants_config_is_reported_not_allowed(
+async def test_a_row_of_a_corrupt_cross_tenant_job_is_still_decided(
     db, business_user, starter_user,
 ):
+    # Never left undecided (Codex P5c): its job's config, whoever owns it, says how to
+    # read it, and the decision can only withhold.
     rule = await _rule_row(db)
-    job = await _job(db, business_user, config_owner=starter_user)  # corrupt cross-tenant job
+    job = await _job(db, business_user, config_owner=starter_user)
     (rid,) = await _rows(db, business_user, job, ("SMITH JOHN", _PARCEL))
-    stats = _enforce(active_snapshot(rule), [rid])
-    assert (stats.checked, stats.unscoped) == (0, 1)
-    assert await _state(db, rid) == (False, None, 0)   # never stamped: the sweep keeps it
+    snapshot = active_snapshot(rule)
+    assert _enforce(snapshot, [rid]).flagged == 1
+    assert await _state(db, rid) == (True, rule, snapshot.generation)
+
+
+async def test_batches_larger_than_the_sweeps_are_decided_row_by_row(db, business_user):
+    rule = await _rule_row(db)
+    job = await _job(db, business_user)
+    people = [("SMITH JOHN" if i % 3 == 0 else f"DOE JANE{chr(65 + i % 26)}", _PARCEL)
+              for i in range(600)]
+    ids = await _rows(db, business_user, job, *people)
+    snapshot = active_snapshot(rule)
+    stats = _enforce(snapshot, ids)
+    assert (stats.checked, stats.flagged) == (600, 200)
+    flagged = (await db.execute(text(
+        "SELECT count(*) FILTER (WHERE privacy_suppressed_at IS NOT NULL), "
+        "count(*) FILTER (WHERE privacy_checked_gen = :g) FROM results WHERE job_id = :j"),
+        {"g": snapshot.generation, "j": job})).one()
+    assert tuple(flagged) == (200, 600)
 
 
 async def test_an_undecidable_row_rolls_the_whole_batch_back(db, business_user, monkeypatch):

@@ -18,10 +18,12 @@ Two callers:
 Never touched:
   - a row already flagged (the flag is never cleared here; lifting is P7);
   - a row whose owner's account is purging or deleted: the purge owns those rows
-    (migration 113's fence), and nothing is delivered from them;
-  - a row whose job has no config of its own tenant (a corrupt cross-tenant job: no
-    county, so no parcel anchor). While any rule is active it is neither allowed nor
-    stamped, so the sweep keeps reporting it as ``unscoped``.
+    (migration 113's fence), and nothing is delivered from them.
+
+Every other row is decided. Its record type, county and state come from its job's
+config (jobs.scraper_config_id is NOT NULL), read even when a corrupt job points at
+another tenant's config: here the config only selects how to read the row, and the
+outcome can only add a suppression, so no row is ever left undecided (Codex P5c).
 
 Locks: plain row UPDATEs, no users lock (the account-deletion fence's order is users ->
 rows). ``RuleSnapshotError`` from authorize() propagates: the caller's transaction must
@@ -44,12 +46,10 @@ _OWNER_STATES_SKIPPED = ("purging", "deleted")
 class EnforceStats:
     checked: int = 0     # rows authorized and stamped
     flagged: int = 0     # of those, newly flagged
-    unscoped: int = 0    # rows that could not be decided (no own-tenant config)
 
     def add(self, other: EnforceStats) -> None:
         self.checked += other.checked
         self.flagged += other.flagged
-        self.unscoped += other.unscoped
 
 
 def enforce_rows(db, snapshot: RuleSnapshot, result_ids) -> EnforceStats:
@@ -62,9 +62,8 @@ def enforce_rows(db, snapshot: RuleSnapshot, result_ids) -> EnforceStats:
         select(Result.id, *(getattr(Result, c) for c in ROW_COLUMNS),
                ScraperConfig.record_type, ScraperConfig.county, ScraperConfig.state)
         .join(User, User.id == Result.user_id)
-        .join(Job, (Job.id == Result.job_id) & (Job.user_id == Result.user_id))
-        .outerjoin(ScraperConfig, (ScraperConfig.id == Job.scraper_config_id)
-                   & (ScraperConfig.user_id == Result.user_id))
+        .join(Job, Job.id == Result.job_id)
+        .join(ScraperConfig, ScraperConfig.id == Job.scraper_config_id)
         .where(Result.id.in_(ids), Result.privacy_suppressed_at.is_(None),
                or_(User.deletion_state.is_(None),
                    User.deletion_state.not_in(_OWNER_STATES_SKIPPED)))
@@ -73,9 +72,6 @@ def enforce_rows(db, snapshot: RuleSnapshot, result_ids) -> EnforceStats:
     allowed: list[str] = []
     withheld: dict[str, list[str]] = defaultdict(list)  # suppression id -> result ids
     for m in rows:
-        if m["record_type"] is None and snapshot.by_anchor:
-            stats.unscoped += 1
-            continue
         decision = authorize(snapshot, m, record_type=m["record_type"],
                              county=m["county"], state=m["state"])
         if decision.outcome == ALLOWED:

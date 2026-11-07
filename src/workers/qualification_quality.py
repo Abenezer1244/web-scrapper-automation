@@ -73,9 +73,11 @@ MIN_RUN_ROWS = 10
 # Job ids listed per alert body; the count is always the full one.
 _MAX_JOBS_LISTED = 10
 
-# Spent or on its way to Tracerfy ('completed' and 'unmatched' are billed); 'queued' and
-# 'cancelled' are not spend, and cancelling a withheld row is the dispatcher refusing it.
-SKIP_TRACE_SENT = ("submitting", "submitted", "completed", "unmatched")
+# Spent or on its way to Tracerfy ('completed' and 'unmatched' are billed; 'quarantined'
+# was paid to the provider but its answer withheld by a privacy rule, never billed);
+# 'queued' and 'cancelled' are not spend, and cancelling a withheld row is the
+# dispatcher refusing it.
+SKIP_TRACE_SENT = ("submitting", "submitted", "completed", "unmatched", "quarantined")
 
 _SOURCES = frozenset(OWNER_SOURCE_BY_SOURCE)
 _OTHER = "other"

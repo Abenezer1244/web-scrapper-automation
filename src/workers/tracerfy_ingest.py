@@ -532,6 +532,60 @@ def _release_recheck_chain(queue_id: int) -> None:
         _logger.warning("recheck-chain release failed for queue %d: %s", queue_id, str(exc)[:120])
 
 
+def _privacy_withheld(db, snapshot, pending: list) -> set:
+    """Pending row ids whose lead a privacy rule withholds or holds for review.
+
+    One read of the leads with their job and config, every join pinned to the lead's
+    own tenant; authorize() is pure. No active rule: nothing to read. A pending row
+    whose lead, job or config cannot be read that way cannot be authorized (no county
+    means no parcel anchor), so it is treated as withheld: fail closed, never stored."""
+    if not snapshot.by_anchor or not pending:
+        return set()
+    from sqlalchemy import select, tuple_
+
+    from src.db.models import Job, Result, ScraperConfig
+    from src.privacy.authorize import authorize
+
+    found = db.execute(
+        select(Result.id, Result.user_id, Result.parcel_id, Result.party_name, Result.heirs,
+               Result.phone, Result.phones, Result.email, Result.emails,
+               ScraperConfig.record_type, ScraperConfig.county, ScraperConfig.state)
+        .join(Job, (Job.id == Result.job_id) & (Job.user_id == Result.user_id))
+        .join(ScraperConfig, (ScraperConfig.id == Job.scraper_config_id)
+              & (ScraperConfig.user_id == Result.user_id))
+        .where(tuple_(Result.id, Result.user_id).in_(
+            [(p.result_id, p.user_id) for p in pending]))
+    ).mappings().all()
+    allowed = {(str(m["id"]), str(m["user_id"])) for m in found
+               if authorize(snapshot, m, record_type=m["record_type"],
+                            county=m["county"], state=m["state"]).deliverable}
+    return {p.id for p in pending if (str(p.result_id), str(p.user_id)) not in allowed}
+
+
+def _quarantine(db, rows: list, now) -> None:
+    """Store nothing from these answers (design section 6, ingest quarantine).
+
+    The pending row ends 'quarantined': the provider was paid, the customer is not
+    billed (report_usage_from_webhook bills 'completed' and 'unmatched' only). The
+    lead shows 'errored', true from the customer's side: it has no contact data. Any
+    cached answer for the same subject is dropped so nothing re-serves it."""
+    from sqlalchemy import delete, tuple_, update
+
+    from src.db.models import PendingSkipTraceRow, Result, SkipTraceCache
+    from src.scrapers.enrichment.skip_trace import pending_row_subject_key
+
+    db.execute(update(PendingSkipTraceRow)
+               .where(PendingSkipTraceRow.id.in_([p.id for p in rows]))
+               .values(status="quarantined"))
+    db.execute(update(Result)
+               .where(tuple_(Result.id, Result.user_id).in_(
+                   [(p.result_id, p.user_id) for p in rows]),
+                   Result.skip_trace_status.in_(("queued", "submitted")))
+               .values(skip_trace_status="errored", skip_trace_attempted_at=now))
+    db.execute(delete(SkipTraceCache).where(SkipTraceCache.address_hash.in_(
+        {pending_row_subject_key(p) for p in rows})))
+
+
 def _defer_until_provider_complete(queue_id: int, rechecks: int) -> dict:
     """Re-check a queue the provider does not (yet) show complete, a bounded number of
     times, then release the chain and page ops. Never raises and never marks the
@@ -760,6 +814,16 @@ def ingest_tracerfy_batch(
             .all()
         )
 
+        # Privacy (Phase 6 P4d): an answer for a person a suppression rule withholds
+        # (or holds for review) is QUARANTINED, not stored. The rules load inside this
+        # transaction; if they cannot, RuleSnapshotError rolls the whole ingest back
+        # and it retries (the reconciler re-drives a completed queue), so an answer is
+        # never written unchecked.
+        from src.privacy.authorize import load_rule_snapshot
+
+        withheld = _privacy_withheld(db, load_rule_snapshot(db), pending)
+        quarantined_count = 0
+
         pending_by_key: dict[tuple[str, str, str], list] = {}
         for p in pending:
             key = (
@@ -825,6 +889,13 @@ def ingest_tracerfy_batch(
                 )
                 continue
             matched_pending_ids.update(p.id for p in matches)
+            held = [p for p in matches if p.id in withheld]
+            if held:
+                _quarantine(db, held, now)
+                quarantined_count += len(held)
+                matches = [p for p in matches if p.id not in withheld]
+                if not matches:
+                    continue
 
             phone = csv_row.get("phone")
             email = csv_row.get("email")
@@ -985,6 +1056,10 @@ def ingest_tracerfy_batch(
                 "(all %d pending rows were still reconciled)",
                 queue_id, unmatched_csv, len(pending),
             )
+
+        if quarantined_count:
+            _logger.info("Tracerfy ingest queue %d: %d answer(s) quarantined by a privacy "
+                         "rule (nothing stored, not billed)", queue_id, quarantined_count)
 
         # Mark the Tracerfy queue record as completed
         db.execute(

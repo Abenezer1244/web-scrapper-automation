@@ -157,9 +157,9 @@ def _dialer_push_sweep_impl() -> None:
     the Tracerfy webhook, so a push at completion would miss exactly the leads
     we want (Codex). A job is "settled" when no Result of it is still
     queued/submitted. Each job is claimed once via Job.dialer_pushed_at, so even
-    a job with zero dialer-ready leads is evaluated only once. Reuses
-    deliver_job_webhook (SSRF re-validate, HMAC, retry, non-fatal). No-op when no
-    config has a dialer_webhook_url.
+    a job with zero dialer-ready leads is evaluated only once. Sends through
+    deliver_dialer_push (row ids only; privacy check, SSRF re-validate, HMAC,
+    retry, non-fatal). No-op when no config has a dialer_webhook_url.
     """
     from sqlalchemy import and_, func, or_, select, update
 
@@ -169,9 +169,10 @@ def _dialer_push_sweep_impl() -> None:
     from src.config.constants import BUSINESS_FEATURES_PLANS
     from src.db.models import Job, Result, ScraperConfig, User
     from src.db.session import system_sync_session
+    from src.privacy.authorize import RuleSnapshotError, authorize, load_rule_snapshot
     from src.workers.dialer_connectors import get_connector
     from src.workers.dialer_outbox import process_dialer_outbox
-    from src.workers.webhook_delivery import DIALER_PUSH_CAP, deliver_job_webhook
+    from src.workers.webhook_delivery import DIALER_PUSH_CAP, deliver_dialer_push
 
     _BATCH = 50
     # Jobs still waiting on async skip-trace: see skip_trace_unsettled.
@@ -188,6 +189,15 @@ def _dialer_push_sweep_impl() -> None:
         except Exception as exc:  # noqa: BLE001 — a probe must not stop the sweep
             db.rollback()
             _logger.warning("Dialer: missing-queue probe failed: %s", str(exc)[:200])
+        # Privacy (Phase 6 P4b): the rules load ONCE, before any job is claimed. If they
+        # cannot, no job is claimed this sweep (fail closed; the next sweep retries).
+        try:
+            snapshot = load_rule_snapshot(db)
+        except RuleSnapshotError as exc:
+            db.rollback()
+            _logger.error("Dialer push sweep: privacy rules unavailable (%s); nothing "
+                          "claimed", str(exc)[:160])
+            return
         candidates = db.execute(
             select(Job, ScraperConfig)
             # Owner-match in the join (Codex security, defense-in-depth): the DB
@@ -290,19 +300,16 @@ def _dialer_push_sweep_impl() -> None:
                         .order_by(Result.id)  # deterministic before LIMIT
                         .limit(DIALER_PUSH_CAP)
                     ).scalars().all()
-                    leads = [
-                        {
-                            "id": row.id,
-                            "party_name": row.party_name,
-                            "phone": row.phone,
-                            "phone_type": row.phone_type,
-                            "phone_dnc_flag": row.phone_dnc_flag,
-                            "email": row.email,
-                            "property_address": row.property_address,
-                            "mailing_address": row.mailing_address,
-                        }
-                        for row in rows
-                    ]
+                    # Authorized at selection (and again at send, by the task or the
+                    # outbox): a withheld or under-review row is not queued at all.
+                    allowed = [row for row in rows if authorize(
+                        snapshot, row, record_type=config.record_type,
+                        county=config.county, state=config.state).deliverable]
+                    total -= len(rows) - len(allowed)
+                    rows = allowed
+                if total > 0 and rows:
+                    # Ids only: both transports re-read the row at send time.
+                    leads = [{"id": row.id} for row in rows]
                     # Dispatch via the dialer connector seam (Thread 3).
                     if connector.uses_outbox:
                         # Native bulk-less vendor: materialize one durable outbox row
@@ -314,27 +321,14 @@ def _dialer_push_sweep_impl() -> None:
                         db.commit()
                         process_dialer_outbox.delay(str(job.id))
                     else:
-                        # Generic webhook: builds the exact same payload + URL as
-                        # before (locked by tests/test_dialer_connector_base.py) and
-                        # enqueues one delivery — byte-identical to the prior path.
-                        job_meta = {
-                            "job_id": str(job.id),
-                            "scraper_config_id": str(config.id),
-                            "scraper_name": config.name,
-                            "county": config.county,
-                            "state": config.state,
-                            "record_type": config.record_type,
-                            "total_dialer_ready_count": total,
-                            "dialer_webhook_url": url,
-                            "dialer_webhook_secret": deliver.get("dialer_webhook_secret"),
-                        }
-                        from src.utils.crypto import seal_task_args
-
-                        # P0-04b: the leads (names, phones, emails, addresses) and
-                        # the URL travel sealed; only the job id is readable.
-                        for req in connector.build_requests(leads, job_meta):
-                            deliver_job_webhook.delay(str(job.id), sealed=seal_task_args(
-                                {"url": req["url"], "payload": req["payload"]}))
+                        # Generic webhook: the message carries the selected row ids
+                        # only. deliver_dialer_push re-reads the rows, the URL and the
+                        # secret and authorizes each row against the privacy rules at
+                        # every attempt, then builds the same payload as before
+                        # (build_dialer_push_payload, tests/test_dialer_connector_base.py).
+                        deliver_dialer_push.delay(
+                            str(job.id), result_ids=[str(ld["id"]) for ld in leads],
+                            total=total)
                     pushed += 1
                     _logger.info(
                         "Dialer push queued for job %s: %d of %d dialer-ready leads (%s)",

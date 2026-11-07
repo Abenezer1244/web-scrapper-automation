@@ -745,9 +745,9 @@ def dialer_push_sweep() -> None:
     the Tracerfy webhook, so a push at completion would miss exactly the leads
     we want (Codex). A job is "settled" when no Result of it is still
     queued/submitted. Each job is claimed once via Job.dialer_pushed_at, so even
-    a job with zero dialer-ready leads is evaluated only once. Reuses
-    deliver_job_webhook (SSRF re-validate, HMAC, retry, non-fatal). No-op when no
-    config has a dialer_webhook_url.
+    a job with zero dialer-ready leads is evaluated only once. Sends through
+    deliver_dialer_push (row ids only; privacy check, SSRF re-validate, HMAC,
+    retry, non-fatal). No-op when no config has a dialer_webhook_url.
     """
     return _dialer_push_sweep_impl()
 

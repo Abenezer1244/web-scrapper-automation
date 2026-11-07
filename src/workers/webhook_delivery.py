@@ -51,6 +51,7 @@ import requests
 import urllib3
 
 from src.api.middleware.security import validate_outbound_webhook
+from src.privacy.authorize import RuleSnapshotError, authorize, load_rule_snapshot
 from src.utils.logger import setup_logger
 from src.utils.pinned_http import is_blocked_destination, log_host, pinned_session
 from src.workers import app
@@ -352,7 +353,24 @@ def deliver_job_webhook(
 
         args = unseal_task_args(sealed, required=("url", "payload"))
         webhook_url, payload = args["url"], args["payload"]
-    attempt = self.request.retries + 1
+    if (payload or {}).get("event") == "leads.dialer_ready":
+        # A dialer push sealed by the release before Phase 6 P4b (still queued or
+        # retrying at deploy). Its people were frozen at selection, so it is never
+        # sent as is: its row ids go through deliver_dialer_push, which re-reads and
+        # authorizes them. Nothing current produces this message.
+        ids = [str(ld["id"]) for ld in payload.get("leads") or [] if ld.get("id")]
+        deliver_dialer_push.delay(job_id, result_ids=ids,
+                                  total=int(payload.get("total_dialer_ready_count") or len(ids)))
+        _logger.info("Dialer push %s: legacy sealed payload re-routed by id (%d rows)",
+                     job_id[:8], len(ids))
+        return {"status": "rerouted", "rows": len(ids)}
+    return _post(self, job_id, webhook_url, payload)
+
+
+def _post(task, job_id: str, webhook_url: str, payload: dict) -> dict:
+    """One delivery attempt for a bound webhook task: SSRF re-check, POST, and the
+    retry/give-up policy (task.retry on a retryable failure)."""
+    attempt = task.request.retries + 1
     host = log_host(webhook_url)
     _excerpt = _response_excerpt
 
@@ -482,9 +500,9 @@ def deliver_job_webhook(
         # Retry via Celery's mechanism. The exc message reaches logs + the result
         # backend, so it carries the status only, for every event: the body is the
         # customer endpoint's own text, already logged (bounded, redacted) above.
-        raise self.retry(
+        raise task.retry(
             exc=Exception(f"HTTP {resp.status_code}"),
-            countdown=_BACKOFF_BASE * (5 ** self.request.retries),
+            countdown=_BACKOFF_BASE * (5 ** task.request.retries),
         )
 
     _logger.info(
@@ -497,3 +515,100 @@ def deliver_job_webhook(
         "response_excerpt": _excerpt(body_text),
         "attempts": attempt,
     }
+
+
+# Phase 6 P4b-2: the generic dialer push carries row ids, not people. Each attempt
+# re-reads the destination and the rows and authorizes every row against the privacy
+# suppression rules immediately before the POST, so a rule that takes effect while the
+# message waits (or between retries) is honoured. Delivery stays AT-LEAST-ONCE, as it
+# was: a retry after a timeout can repeat a POST the receiver already took, and the
+# payload's batch.id + per-lead external_id are the documented dedup keys.
+
+
+@app.task(
+    name="src.workers.webhook_delivery.deliver_dialer_push",
+    bind=True,
+    max_retries=_MAX_RETRIES,
+    default_retry_delay=_BACKOFF_BASE,
+    autoretry_for=(requests.RequestException, RuleSnapshotError),
+    retry_backoff=True,
+    retry_backoff_max=600,
+    retry_jitter=True,
+    soft_time_limit=_TASK_SOFT_TIME_LIMIT,
+    time_limit=_TASK_TIME_LIMIT,
+)
+def deliver_dialer_push(self, job_id: str, result_ids: list[str], total: int) -> dict:
+    """Rebuild and POST one generic dialer push from the database (see above).
+
+    ``result_ids`` are the rows the sweep selected (at most DIALER_PUSH_CAP),
+    ``total`` the dialer-ready count it saw. Nothing personal is in the message: the
+    URL and signing secret are re-read from the owner-matched config, and the plan is
+    re-checked, at every attempt. A row that is gone, no longer ready or not
+    authorized is left out; when none is left, nothing is sent. Rules that cannot be
+    loaded raise RuleSnapshotError, which retries: never a send without the check.
+    """
+    from sqlalchemy import func, select
+
+    from src.api.dialer_filters import dialer_ready_conditions
+    from src.api.lead_actionability import actionable_condition
+    from src.api.tax_filters import tax_cap_condition
+    from src.config.constants import BUSINESS_FEATURES_PLANS
+    from src.db.models import Job, Result, ScraperConfig, User
+    from src.db.session import system_sync_session
+    from src.workers.dialer_connectors import get_connector
+
+    with system_sync_session() as db:
+        row = db.execute(
+            select(Job, ScraperConfig)
+            .join(ScraperConfig, (ScraperConfig.id == Job.scraper_config_id)
+                  & (ScraperConfig.user_id == Job.user_id))
+            .join(User, User.id == Job.user_id)
+            .where(Job.id == job_id,
+                   func.lower(func.trim(User.plan)).in_(BUSINESS_FEATURES_PLANS))
+        ).first()
+        if row is None:
+            _logger.info("Dialer push %s dropped: job, config or plan no longer eligible",
+                         job_id[:8])
+            return {"status": "skipped", "reason": "not_eligible"}
+        job, config = row
+        deliver = config.deliver or {}
+        connector = get_connector(deliver.get("dialer_type"))
+        url = deliver.get("dialer_webhook_url")
+        if connector.uses_outbox or not url:
+            return {"status": "skipped", "reason": "no_generic_webhook"}
+
+        snapshot = load_rule_snapshot(db)  # RuleSnapshotError -> retry (autoretry_for)
+        rows = db.execute(
+            select(Result)
+            .where(Result.id.in_(result_ids), Result.job_id == job.id,
+                   Result.user_id == job.user_id,
+                   *dialer_ready_conditions(include_unknown_dnc=True),
+                   Result.is_duplicate.is_(False),
+                   tax_cap_condition(datetime.now(UTC).date()),
+                   actionable_condition())
+            .order_by(Result.id)
+        ).scalars().all()
+        leads = [
+            {"id": r.id, "party_name": r.party_name, "phone": r.phone,
+             "phone_type": r.phone_type, "phone_dnc_flag": r.phone_dnc_flag,
+             "email": r.email, "property_address": r.property_address,
+             "mailing_address": r.mailing_address}
+            for r in rows
+            if authorize(snapshot, r, record_type=config.record_type, county=config.county,
+                         state=config.state).deliverable
+        ]
+        job_meta = {
+            "job_id": str(job.id), "scraper_config_id": str(config.id),
+            "scraper_name": config.name, "county": config.county, "state": config.state,
+            "record_type": config.record_type, "total_dialer_ready_count": total,
+            "dialer_webhook_url": url,
+            "dialer_webhook_secret": deliver.get("dialer_webhook_secret"),
+        }
+    withheld = len(result_ids) - len(leads)
+    if withheld:
+        _logger.info("Dialer push %s: %d of %d selected rows left out at send time",
+                     job_id[:8], withheld, len(result_ids))
+    if not leads:
+        return {"status": "skipped", "reason": "no_deliverable_rows"}
+    [req] = connector.build_requests(leads, job_meta)
+    return _post(self, job_id, req["url"], req["payload"])

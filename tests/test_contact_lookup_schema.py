@@ -697,19 +697,23 @@ async def test_the_api_role_without_a_tenant_is_not_the_worker(db, business_user
 @pytest.mark.parametrize("table", sorted(_NO_TENANT_INSERTS))
 async def test_the_worker_role_without_a_tenant_passes_the_guard(db, business_user, table):
     """The other side: bridgeleads_system with no GUC is the worker, and the
-    guard lets it through. The test DB carries only the migration's tenant
-    policy (the role-targeted _system policies come from the cutover script),
-    so the row is then refused by RLS. That refusal is the proof the TRIGGER
-    passed it: the guard would have raised first, with its own message."""
+    guard lets it through. What happens AFTER the guard depends on the cluster:
+    without the roles at migrate time (CI) only 101's tenant policy exists and RLS
+    refuses the row; with them, migration 131's _system policy admits it, and a
+    child row then fails its foreign key (these fixtures point at no action).
+    Any of those proves the TRIGGER passed it: the guard raises first, with its
+    own message. (Before 131 this test asserted the RLS refusal, which was the
+    2026-11-07 incident itself.)"""
     job_id, _rid = await _job_and_result(db, business_user)
     await _become(db, "bridgeleads_system", table)
-    with pytest.raises(Exception) as exc:
+    try:
         await db.execute(text(_NO_TENANT_INSERTS[table]), {
             "id": str(uuid.uuid4()), "q": f"q-{uuid.uuid4()}",
             "uid": business_user.id, "job": job_id,
         })
-    assert "not the worker role" not in str(exc.value)
-    assert "row-level security" in str(exc.value)
+    except Exception as exc:  # noqa: BLE001 - the message is the assertion
+        assert "not the worker role" not in str(exc)
+        assert "row-level security" in str(exc) or "foreign key" in str(exc)
     await db.rollback()
 
 

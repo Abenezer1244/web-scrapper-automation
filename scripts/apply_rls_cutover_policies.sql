@@ -434,13 +434,17 @@ CREATE POLICY contact_lookup_action_events_system_insert
     ON public.contact_lookup_action_events
     FOR INSERT TO bridgeleads_system WITH CHECK (true);
 
--- The action alone also gets UPDATE, for the API's created -> dispatching hop.
--- Deliberately NOT applied to the other two tables in the loop above.
+-- The action alone also gets UPDATE, for the API's one dispatched_at stamp on a
+-- `dispatching` action (its only UPDATE grant is that column; 101's trigger bounds
+-- the rest). Deliberately NOT applied to the other two tables in the loop above.
+-- Migration 131 installs these same policies inline; keep the two identical.
 DROP POLICY IF EXISTS contact_lookup_actions_app_update ON public.contact_lookup_actions;
 CREATE POLICY contact_lookup_actions_app_update ON public.contact_lookup_actions
     FOR UPDATE TO bridgeleads_app
-    USING (user_id = NULLIF(current_setting('app.current_user_id', true), '')::uuid)
-    WITH CHECK (user_id = NULLIF(current_setting('app.current_user_id', true), '')::uuid);
+    USING (user_id = NULLIF(current_setting('app.current_user_id', true), '')::uuid
+           AND status = 'dispatching')
+    WITH CHECK (user_id = NULLIF(current_setting('app.current_user_id', true), '')::uuid
+                AND status = 'dispatching');
 
 COMMIT;
 

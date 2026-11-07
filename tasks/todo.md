@@ -210,3 +210,62 @@ Owner's question: for every supported WA county and record type, does BridgeLead
 
 ## Review
 Root cause: county coverage gap in the shared enrichment (no mailing source outside pierce/king/snohomish/cowlitz), plus a PACS situs-echo parser and Okanogan surname-invented parcels. Fixed on this branch (11 commits on top of -76's Clark commit); 475 targeted tests green; full suite NOT run (memory-reaped). Not merged, not deployed, no prod data changed. Next: -76 PR, this PR, backfill dry runs, owner approval per county.
+
+---
+
+## Contact lookup stuck in "starting" (2026-11-07) — branch `fix/contact-lookup-stuck`
+
+### Root cause (verified against production catalog + rows, read-only)
+- `contact_lookup_actions`, `contact_lookup_action_results`, `contact_lookup_action_events` carry ONLY
+  migration 101's untargeted `*_user_isolation` policy (needs `app.current_user_id`). Workers and the
+  reconciler run as `bridgeleads_system` (NOBYPASSRLS) with no tenant GUC, so they see 0 rows.
+- 101 left the `_app`/`_system` policies to `scripts/apply_rls_cutover_policies.sql`, never re-run in prod.
+  Catalog audit: these 3 are the only RLS tables `bridgeleads_system` can SELECT with no system policy.
+- Effect: worker T1 `_move(dispatching->running)` updates 0 rows and returns `not_dispatching` silently;
+  reconciler P1 (30-min expiry) selects 0 rows silently. All 3 actions ever created sit in `dispatching`
+  (Clark 643 / Thurston 35 / Pierce 9 leads, one account). 0 pending rows, 0 Tracerfy credits: nothing bought.
+- Codex consult (read-only) concurred; corrections folded in below.
+
+### Phase 1 — backend (5 files)
+- [x] Migration 131: role-guarded, idempotent, one transaction. On actions/results: drop `_user_isolation`,
+      add `_app_select`, `_app_insert` (GUC), `_system` FOR ALL. On actions: `_app_update` FOR UPDATE
+      (GUC AND status='dispatching', USING + WITH CHECK). On events: app select/insert, system select/insert.
+      Postcondition: if both roles exist, assert the system policies exist. Downgrade drops every
+      replacement policy, then restores `_user_isolation`.
+- [x] `scripts/apply_rls_cutover_policies.sql`: tighten the existing actions `_app_update` to
+      status='dispatching'; fix its comment. Script and migration agree.
+- [x] Recurrence guard: a beat check (own task, not inside the latency canary's early return) that alerts
+      when any RLS-enabled public table `bridgeleads_system` can SELECT has no policy applying directly to
+      that role for SELECT/ALL. Catalog-only, never RLS-filtered.
+- [x] `run_action` T1 zero-row: log and return distinct outcomes for invisible-or-missing,
+      past-deadline, and not-dispatching.
+- [x] Tests: migration policy shape + system role can move/expire an action (integration, skips without
+      roles), drift-check query flags a table with only a PUBLIC policy, T1 outcome classification.
+
+### Phase 2 — frontend (bridgeleads-web, branch `fix/contact-lookup-stuck`)
+- [x] `ContactLookupProgress.tsx`: `dispatching` (no reason) older than 5 min shows "taking longer than
+      usual to start"; `running` gets its own copy. No billing claim in delayed copy beyond what the
+      dispatching state guarantees. Unit test.
+
+### Not doing (existing design already covers it; the defect was visibility, not lifecycle)
+- Rebuilding lifecycle/heartbeat/retry/idempotency: states, 30-min deadline, lease take-back, republish,
+  fenced tokens and per-row billing decisions already exist and are correct once rows are visible.
+
+### Owner approval required
+- Merge + deploy (migration 131 runs on API boot). Within ~2 min after, the reconciler expires all 3
+  stuck actions -> leads `abandoned`, page shows "didn't start in time, nothing charged". Customer re-quotes.
+- Low, separate: `anon`/`authenticated` hold full grants on `pending_skip_trace_rows` (RLS forced, no
+  policy for them, so blocked); revoke in a later change.
+
+### Phase 1 review (2026-11-07)
+- Done, uncommitted in worktree `C:/Users/micha/bl-wt/contact-stuck`. 6 code files (the 6th is the
+  schema test that asserted the incident's RLS refusal; relaxed to assert only the guard).
+- Tests on isolated `bridgeleads_cls_test` (alembic 129->130 clean): new file 6 passed; contact_lookup /
+  reconcile / beat_schedule / rls subset passed (2 rls_isolation failures were fixture grants missing on
+  a fresh DB, proven environmental). Mutation: dropping the actions system policy fails the migration's
+  own postcondition. ruff clean. No Python type-checker is configured in CI.
+- Codex: consult concurred; adversarial review 0 Critical/High, "would deploy". Fixed both Mediums
+  (single-role cluster now fails; drift alert states it is a convention check). Low accepted:
+  the run_action test uses a missing id, not an RLS-hidden existing one.
+- Production read-only: drift SQL flags exactly the 3 ledger tables today.
+

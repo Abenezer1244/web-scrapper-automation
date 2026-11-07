@@ -260,7 +260,7 @@ Root cause: county coverage gap in the shared enrichment (no mailing source outs
 ### Phase 1 review (2026-11-07)
 - Done, uncommitted in worktree `C:/Users/micha/bl-wt/contact-stuck`. 6 code files (the 6th is the
   schema test that asserted the incident's RLS refusal; relaxed to assert only the guard).
-- Tests on isolated `bridgeleads_cls_test` (alembic 129->130 clean): new file 6 passed; contact_lookup /
+- Tests on isolated `bridgeleads_cls_test` (alembic 130->131 clean, after merging main whose 130 is privacy): new file 6 passed; contact_lookup /
   reconcile / beat_schedule / rls subset passed (2 rls_isolation failures were fixture grants missing on
   a fresh DB, proven environmental). Mutation: dropping the actions system policy fails the migration's
   own postcondition. ruff clean. No Python type-checker is configured in CI.

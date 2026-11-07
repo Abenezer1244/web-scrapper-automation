@@ -80,7 +80,13 @@ until P7; each must still be correct the moment a rule activates.
 - [ ] P5b migration 130 + `snapshot.generation` + `src/privacy/enforce.py` + tests.
 - [ ] P5c enforcer beat (privacy_enforcer.py, scheduler.py, workers/__init__.py, test).
 - [ ] P5d insert gate (tasks.py + test).
-- [ ] P5e shared stores (owner_recovery store, nts_crawler upsert: blank + refuse grantor).
+- [ ] P5e1 King tombstone READERS first (Codex round 2): `_CANDIDATE_PARCELS_SQL` excludes
+  fresh tombstones, `_fill_from_store` / `_fill_king_owners_from_store` / `fresh_answers`
+  treat one as terminal (no name, no county request). Merge, deploy, verify every
+  api/worker/beat runs it.
+- [ ] P5e2 only then the WRITERS (store_answers/_store tombstone; nts_crawler upsert: blank +
+  refuse grantor). Also dormant by construction: a tombstone is written only for a rule
+  that is active, which migration 125's guard forbids until P7.
 - [ ] P5f writers, inline enforce (2-3 PRs by manifest).
 - [ ] P5g late delivery authorize-before-grant + repair script actionable_sql + authorize.
 - [ ] P5h cache copies + ingest authorizes with the incoming contacts.

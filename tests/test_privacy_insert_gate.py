@@ -174,3 +174,9 @@ def test_rules_unreadable_after_enrichment_fail_the_run_unbilled(
     assert len(calls) == 4                                 # insert + three tries
     assert job.status == "failed" and job.billed_count == 0
     assert "privacy requests" in job.error_message
+    with SyncSessionLocal() as s:
+        export_key, claims = s.execute(text(
+            "SELECT j.export_key, (SELECT count(*) FROM delivered_records d "
+            "WHERE d.first_job_id = j.id) FROM jobs j WHERE j.id = :j"), {"j": job_id}).one()
+    assert export_key is None   # the provisional upload is never the run's export
+    assert claims == 0          # released: a rerun does not see its leads as delivered

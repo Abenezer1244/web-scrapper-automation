@@ -1946,6 +1946,15 @@ def run_scrape_job(self, job_id: str) -> None:
         if _privacy_error is not None:
             _logger.error("Job %s: privacy rules unavailable after enrichment: %s",
                           job_id, _privacy_error)
+            # Release this attempt's dedup claims first, as every post-dedup failure
+            # does, so a rerun does not read its own leads as already delivered.
+            try:
+                release_run_claims_if_owned(db, job_id, _boot_user_id, attempt_token)
+                db.commit()
+            except Exception as cleanup_exc:
+                db.rollback()
+                _logger.error("Job %s: failed to release dedup claims after the privacy "
+                              "check failed: %s", job_id, str(cleanup_exc)[:200])
             _fail_attempt(
                 "We could not check this run against privacy requests, so nothing was "
                 "delivered and you were not charged. Please run it again."

@@ -789,7 +789,7 @@ def audit_rls_system_policies() -> list[str]:
             "targets it for SELECT. Unless a PUBLIC or inherited policy admits it, every "
             "worker query there returns zero rows without an error (the 2026-11-07 "
             "contact-lookup incident). Add a <table>_system policy in a migration "
-            "(see migration 131).",
+            "(see migration 133).",
         )
     return gaps
 

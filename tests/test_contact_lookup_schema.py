@@ -699,10 +699,10 @@ async def test_the_worker_role_without_a_tenant_passes_the_guard(db, business_us
     """The other side: bridgeleads_system with no GUC is the worker, and the
     guard lets it through. What happens AFTER the guard depends on the cluster:
     without the roles at migrate time (CI) only 101's tenant policy exists and RLS
-    refuses the row; with them, migration 131's _system policy admits it, and a
+    refuses the row; with them, migration 133's _system policy admits it, and a
     child row then fails its foreign key (these fixtures point at no action).
     Any of those proves the TRIGGER passed it: the guard raises first, with its
-    own message. (Before 131 this test asserted the RLS refusal, which was the
+    own message. (Before 133 this test asserted the RLS refusal, which was the
     2026-11-07 incident itself.)"""
     job_id, _rid = await _job_and_result(db, business_user)
     await _become(db, "bridgeleads_system", table)

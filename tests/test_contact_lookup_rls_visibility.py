@@ -1,11 +1,11 @@
-"""Incident 2026-11-07: the worker could not see contact-lookup actions (migration 131).
+"""Incident 2026-11-07: the worker could not see contact-lookup actions (migration 133).
 
 Production carried only migration 101's untargeted tenant policy on the three ledger
 tables, so bridgeleads_system (NOBYPASSRLS, no tenant GUC) saw zero rows: the worker's
 dispatching -> running CAS and the reconciler's expiry both matched nothing, silently.
 
-Each test first puts the tables back in that state (131's DOWNGRADE_SQL), proves the
-failure, then applies 131's UPGRADE_SQL and proves the fix, as the real roles. Roles
+Each test first puts the tables back in that state (133's DOWNGRADE_SQL), proves the
+failure, then applies 133's UPGRADE_SQL and proves the fix, as the real roles. Roles
 are created when missing (CI has none) and everything is rolled back, as in
 tests/test_contact_lookup_schema.py.
 """
@@ -24,10 +24,10 @@ _TABLES = ("contact_lookup_actions", "contact_lookup_action_results",
            "contact_lookup_action_events")
 
 
-def _mig131():
+def _mig133():
     path = (Path(__file__).resolve().parents[1] / "alembic" / "versions"
-            / "131_contact_lookup_system_policies.py")
-    spec = importlib.util.spec_from_file_location("_mig131", path)
+            / "133_contact_lookup_system_policies.py")
+    spec = importlib.util.spec_from_file_location("_mig133", path)
     mig = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mig)
     return mig
@@ -54,8 +54,8 @@ async def _as(db, role: str, sql: str, params: dict) -> list:
     return rows
 
 
-async def test_the_worker_role_can_see_and_expire_an_action_only_after_131(db, business_user):
-    mig = _mig131()
+async def test_the_worker_role_can_see_and_expire_an_action_only_after_133(db, business_user):
+    mig = _mig133()
     job_id, _rid = await _job_and_result(db, business_user)
     aid = await _action(db, business_user, job_id)
     await _roles(db)
@@ -85,7 +85,7 @@ async def test_the_worker_role_can_see_and_expire_an_action_only_after_131(db, b
 async def test_the_api_stamp_stays_tenant_scoped_and_dispatching_only(
     db, business_user, starter_user,
 ):
-    mig = _mig131()
+    mig = _mig133()
     job_id, _rid = await _job_and_result(db, business_user)
     aid = await _action(db, business_user, job_id)
     await _roles(db)
@@ -114,7 +114,7 @@ async def test_the_api_stamp_stays_tenant_scoped_and_dispatching_only(
 
 
 async def test_upgrade_is_idempotent_and_downgrade_restores_only_the_tenant_policy(db):
-    mig = _mig131()
+    mig = _mig133()
     await _roles(db)
     await db.execute(text(mig.UPGRADE_SQL))
     await db.execute(text(mig.UPGRADE_SQL))  # a replayed boot must not fail
@@ -131,7 +131,7 @@ async def test_upgrade_is_idempotent_and_downgrade_restores_only_the_tenant_poli
 
 
 async def test_the_drift_audit_flags_a_table_the_worker_cannot_select(db):
-    mig = _mig131()
+    mig = _mig133()
     await _roles(db)
     gaps = "SELECT * FROM (" + RLS_SYSTEM_GAPS_SQL + ") g"
 
@@ -155,7 +155,7 @@ async def test_the_drift_audit_flags_a_table_the_worker_cannot_select(db):
 
 
 async def test_a_half_provisioned_cluster_fails_the_migration_instead_of_skipping(db):
-    mig = _mig131()
+    mig = _mig133()
     present = set((await db.execute(text(
         "SELECT rolname FROM pg_roles "
         "WHERE rolname IN ('bridgeleads_app', 'bridgeleads_system')"))).scalars())

@@ -1,4 +1,4 @@
-"""Contact-lookup ledger: install the role-targeted RLS policies inline (131).
+"""Contact-lookup ledger: install the role-targeted RLS policies inline (133).
 
 INCIDENT 2026-11-07. Migration 101 created contact_lookup_actions / _results / _events
 with only the untargeted `<t>_user_isolation` policy and left the role-targeted
@@ -23,15 +23,15 @@ fails the migration rather than recording a no-op). When the roles exist
 it asserts its own postcondition, so a half-applied state fails the migration instead
 of shipping. Idempotent (DROP IF EXISTS before every CREATE), one transaction.
 
-Revision ID: 131
-Revises: 130
+Revision ID: 133
+Revises: 132
 Create Date: 2026-11-07
 """
 from alembic import op
 from sqlalchemy import text
 
-revision = "131"
-down_revision = "130"
+revision = "133"
+down_revision = "132"
 branch_labels = None
 depends_on = None
 
@@ -72,10 +72,10 @@ def _create(t: str, suffix: str, cmd: str, role: str, using: str | None,
 UPGRADE_SQL = (
     "DO $contact_lookup_policies$ BEGIN "
     # One role without the other is a half-provisioned cluster: skipping would record
-    # 131 as applied with the incident still live, so refuse instead (Codex review).
+    # 133 as applied with the incident still live, so refuse instead (Codex review).
     "IF (SELECT count(*) FROM pg_roles "
     "    WHERE rolname IN ('bridgeleads_app', 'bridgeleads_system')) = 1 THEN "
-    "  RAISE EXCEPTION 'migration 131: only one of bridgeleads_app/bridgeleads_system "
+    "  RAISE EXCEPTION 'migration 133: only one of bridgeleads_app/bridgeleads_system "
     "exists; provision both (scripts/provision_rls_roles.sql) and re-run'; "
     "END IF; "
     "IF (SELECT count(*) FROM pg_roles "
@@ -91,7 +91,7 @@ UPGRADE_SQL = (
     "      WHERE p.polrelid = ('public.' || t)::regclass "
     "        AND 'bridgeleads_system'::regrole = ANY(p.polroles) "
     "        AND p.polcmd IN ('r', '*'))) THEN "
-    "  RAISE EXCEPTION 'migration 131: a contact_lookup table has no system SELECT policy'; "
+    "  RAISE EXCEPTION 'migration 133: a contact_lookup table has no system SELECT policy'; "
     "END IF; "
     "END IF; END $contact_lookup_policies$;"
 )

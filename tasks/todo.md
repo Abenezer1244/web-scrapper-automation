@@ -227,7 +227,7 @@ Root cause: county coverage gap in the shared enrichment (no mailing source outs
 - Codex consult (read-only) concurred; corrections folded in below.
 
 ### Phase 1 — backend (5 files)
-- [x] Migration 131: role-guarded, idempotent, one transaction. On actions/results: drop `_user_isolation`,
+- [x] Migration 133: role-guarded, idempotent, one transaction. On actions/results: drop `_user_isolation`,
       add `_app_select`, `_app_insert` (GUC), `_system` FOR ALL. On actions: `_app_update` FOR UPDATE
       (GUC AND status='dispatching', USING + WITH CHECK). On events: app select/insert, system select/insert.
       Postcondition: if both roles exist, assert the system policies exist. Downgrade drops every
@@ -252,7 +252,7 @@ Root cause: county coverage gap in the shared enrichment (no mailing source outs
   fenced tokens and per-row billing decisions already exist and are correct once rows are visible.
 
 ### Owner approval required
-- Merge + deploy (migration 131 runs on API boot). Within ~2 min after, the reconciler expires all 3
+- Merge + deploy (migration 133 runs on API boot). Within ~2 min after, the reconciler expires all 3
   stuck actions -> leads `abandoned`, page shows "didn't start in time, nothing charged". Customer re-quotes.
 - Low, separate: `anon`/`authenticated` hold full grants on `pending_skip_trace_rows` (RLS forced, no
   policy for them, so blocked); revoke in a later change.
@@ -260,7 +260,7 @@ Root cause: county coverage gap in the shared enrichment (no mailing source outs
 ### Phase 1 review (2026-11-07)
 - Done, uncommitted in worktree `C:/Users/micha/bl-wt/contact-stuck`. 6 code files (the 6th is the
   schema test that asserted the incident's RLS refusal; relaxed to assert only the guard).
-- Tests on isolated `bridgeleads_cls_test` (alembic 130->131 clean, after merging main whose 130 is privacy): new file 6 passed; contact_lookup /
+- Tests on isolated `bridgeleads_cls_test` (alembic 132->133 clean, after merging main whose 130-132 are privacy): new file 6 passed; contact_lookup /
   reconcile / beat_schedule / rls subset passed (2 rls_isolation failures were fixture grants missing on
   a fresh DB, proven environmental). Mutation: dropping the actions system policy fails the migration's
   own postcondition. ruff clean. No Python type-checker is configured in CI.

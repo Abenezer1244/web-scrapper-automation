@@ -437,7 +437,7 @@ CREATE POLICY contact_lookup_action_events_system_insert
 -- The action alone also gets UPDATE, for the API's one dispatched_at stamp on a
 -- `dispatching` action (its only UPDATE grant is that column; 101's trigger bounds
 -- the rest). Deliberately NOT applied to the other two tables in the loop above.
--- Migration 131 installs these same policies inline; keep the two identical.
+-- Migration 133 installs these same policies inline; keep the two identical.
 DROP POLICY IF EXISTS contact_lookup_actions_app_update ON public.contact_lookup_actions;
 CREATE POLICY contact_lookup_actions_app_update ON public.contact_lookup_actions
     FOR UPDATE TO bridgeleads_app

@@ -21,7 +21,7 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ## 2026-11-07 — Contact lookups stuck in "starting": the worker could not see them (RLS)
 
-**Built / Shipped:** migration 131 installs the role-targeted RLS policies on contact_lookup_actions /
+**Built / Shipped:** migration 133 installs the role-targeted RLS policies on contact_lookup_actions /
 _results / _events inline (role-guarded, idempotent, postcondition; one runtime role alone fails it). The
 API's one UPDATE (dispatched_at stamp) is limited to `dispatching` in the migration and
 scripts/apply_rls_cutover_policies.sql. run_action returns `action_not_visible` (warning) instead of a
@@ -34,7 +34,7 @@ with no GUC, so the dispatch CAS and the 30-min expiry both matched 0 rows. Fixe
 lifecycle (deadline, lease take-back, republish, per-row billing already exist). No auto-retry of the 3
 stuck actions: after deploy the reconciler expires them (nothing charged); the customer re-quotes.
 **Failed / Blocked:** my migration was numbered 130 and main shipped its own 130 (privacy) meanwhile;
-renumbered to 131 before merge. tests/test_rls_isolation fails 2 on a fresh local DB when the cluster
+renumbered (131, then 133 as main shipped 131-132) before merge. tests/test_rls_isolation fails 2 on a fresh local DB when the cluster
 role bridgeleads_rls_test pre-exists (per-DB grants never issued); environmental, passes once granted.
 **Caught & fixed:** test_contact_lookup_schema asserted the worker being refused, i.e. encoded the
 incident. Codex: half-provisioned cluster must fail, not no-op (fixed); drift alert worded as a

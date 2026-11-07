@@ -118,6 +118,25 @@ async def test_unreadable_rules_stop_the_tick_before_any_request(
     assert _stored(_PIN) is None and (await _get(db, rid)).party_name is None
 
 
+async def test_a_key_lost_mid_tick_stores_and_writes_nothing_for_that_owner(
+    db, business_user, monkeypatch,
+):
+    rule = await _rule_row(db)
+    _rules(monkeypatch, _active(rule, keys.property_anchor_value(_PIN, "king", "WA"),
+                                "smith|john"))
+
+    def _key_gone(*a, **k):
+        raise RuleSnapshotError("privacy key v1 unavailable")
+
+    monkeypatch.setattr(authorize_mod, "authorize", _key_gone)
+    rid = await _row(db, business_user, await _job(db, business_user), parcel=_PIN)
+    _lease(monkeypatch)
+    _county(monkeypatch, {_PIN: _Resp(200, _page(_PIN, "SMITH JOHN"))})
+    stats = await asyncio.to_thread(_tick)
+    assert stats["skipped"] == "privacy rules unavailable"
+    assert _stored(_PIN) is None and (await _get(db, rid)).party_name is None
+
+
 async def test_the_scrape_jobs_answers_store_a_tombstone_too(db, monkeypatch):
     rule = await _rule_row(db)
     _rules(monkeypatch, _active(rule, keys.property_anchor_value(_PIN, "king", "WA"),

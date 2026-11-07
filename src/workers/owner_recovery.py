@@ -428,7 +428,15 @@ def _tick(stats: dict) -> dict:
             # one statement below; anything else is charged row by row as before. An
             # owner a privacy rule withholds is stored as a tombstone (no name) and its
             # leads are flagged by the fill; it is never written row by row.
-            outcome, owner, rule = privacy_outcome(privacy, pid, outcome, owners.get(pid))
+            try:
+                outcome, owner, rule = privacy_outcome(privacy, pid, outcome, owners.get(pid))
+            except RuleSnapshotError as exc:
+                # A key that vanished mid-tick: stop here. Parcels already stored were
+                # each authorized; this one and the rest get no store and no write.
+                db.rollback()
+                stats["skipped"] = "privacy rules unavailable"
+                _logger.error("Owner recovery: privacy rules unavailable mid-tick: %s", exc)
+                break
             if outcome in ("found", "not_on_record", PRIVACY_WITHHELD) and _store(
                     db, pid, outcome, owner, rule):
                 stored.append(pid)

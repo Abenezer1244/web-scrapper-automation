@@ -549,6 +549,7 @@ def _privacy_withheld(db, snapshot, pending: list) -> set:
     found = db.execute(
         select(Result.id, Result.user_id, Result.parcel_id, Result.party_name, Result.heirs,
                Result.phone, Result.phones, Result.email, Result.emails,
+               Result.enrichment_data,
                ScraperConfig.record_type, ScraperConfig.county, ScraperConfig.state)
         .join(Job, (Job.id == Result.job_id) & (Job.user_id == Result.user_id))
         .join(ScraperConfig, (ScraperConfig.id == Job.scraper_config_id)

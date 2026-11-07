@@ -120,6 +120,10 @@ class RuleSnapshot:
     by_anchor: dict[tuple[str, str, str], tuple[_Rule, ...]]   # (kind, version, hmac)
     by_subject: dict[tuple[str, str, str], tuple[_Rule, ...]]  # (kind, version, hmac)
     key_versions: tuple[str, ...]
+    # The number of 'active' rule rows ever written, read in the same statement as the
+    # rules. Rule rows are append-only, so it only grows, and only an activation grows
+    # it: results.privacy_checked_gen below it means "not checked against these rules".
+    generation: int = 0
 
     @property
     def active_rules(self) -> int:
@@ -184,6 +188,8 @@ def build_snapshot(rows) -> RuleSnapshot:
         by_anchor={k: tuple(v) for k, v in by_anchor.items()},
         by_subject={k: tuple(v) for k, v in by_subject.items()},
         key_versions=tuple(sorted(versions)),
+        generation=sum(1 for history in groups.values() for h in history
+                       if _get(h, "state") == "active"),
     )
 
 

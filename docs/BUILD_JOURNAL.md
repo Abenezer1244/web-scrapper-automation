@@ -70,6 +70,34 @@ STRIPE_PRICE_BUSINESS/PRO were product ids (api/worker were right); fixed on the
 bl-test-redis -p 127.0.0.1:6379:6379 redis:7.4-alpine`. A CHECK added NOT VALID still checks
 every new write, including UPDATEs of old rows.
 
+## 2026-11-07 — Contact lookups stuck in "starting": the worker could not see them (RLS)
+
+**Built / Shipped:** migration 133 installs the role-targeted RLS policies on contact_lookup_actions /
+_results / _events inline (role-guarded, idempotent, postcondition; one runtime role alone fails it). The
+API's one UPDATE (dispatched_at stamp) is limited to `dispatching` in the migration and
+scripts/apply_rls_cutover_policies.sql. run_action returns `action_not_visible` (warning) instead of a
+silent `not_dispatching`. Hourly beat `audit-rls-system-policies` (:47) alerts `rls_drift` on any
+worker-readable RLS table with no system SELECT policy. Frontend (bridgeleads-web): a lookup not started
+after 5 min says "taking longer than usual to start" (lib/contact-lookup-delay.ts).
+**Tried / Decided:** root cause from the prod catalog (read-only): 101 left only the untargeted
+`*_user_isolation` policy and the cutover script was never re-run; bridgeleads_system is NOBYPASSRLS
+with no GUC, so the dispatch CAS and the 30-min expiry both matched 0 rows. Fixed the visibility, not the
+lifecycle (deadline, lease take-back, republish, per-row billing already exist). No auto-retry of the 3
+stuck actions: after deploy the reconciler expires them (nothing charged); the customer re-quotes.
+**Failed / Blocked:** my migration was numbered 130 and main shipped its own 130 (privacy) meanwhile;
+renumbered (131, then 133 as main shipped 131-132) before merge. tests/test_rls_isolation fails 2 on a fresh local DB when the cluster
+role bridgeleads_rls_test pre-exists (per-DB grants never issued); environmental, passes once granted.
+**Caught & fixed:** test_contact_lookup_schema asserted the worker being refused, i.e. encoded the
+incident. Codex: half-provisioned cluster must fail, not no-op (fixed); drift alert worded as a
+convention check (fixed); FE: an unexplained reason hid the delay (fixed).
+**Pending / Handoff:** after deploy verify the 3 actions read `expired` and the drift SQL returns 0 rows.
+Codex Medium accepted: FE delay uses client clock vs server timestamps (fix = server-sent age). Low:
+anon/authenticated hold grants on pending_skip_trace_rows (blocked by forced RLS); revoke later.
+**Facts learned:** a policy kept only in a manual script is a deploy-time trap; every RLS table the
+worker reads needs a policy naming bridgeleads_system, and the beat audit now checks it.
+
+---
+
 ## 2026-11-06 (evening) — Privacy: durable send authorization (compliance Phase 6 P4)
 
 **Built / Shipped:** every send path now re-checks each row against the suppression rules

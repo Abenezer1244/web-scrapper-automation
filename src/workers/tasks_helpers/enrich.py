@@ -2890,8 +2890,19 @@ def settle_charged_unanswered(db, user_id, rows: list) -> tuple[list, int]:
     return [rec for rec in rows if rec.id not in settled_ids], len(settled)
 
 
-def copy_cached_answer(db, user_id, rec, payload: dict) -> bool:
-    """Copy a still-fresh cached answer for this exact lookup onto `rec`. True if it did.
+_COPIED_CONTACT_FIELDS = ("phone", "phone_type", "phone_dnc_flag", "email", "phones",
+                          "emails", "skip_trace_status", "skip_trace_attempted_at",
+                          "skip_trace_source", "skip_trace_subject_hash")
+
+
+def copy_cached_answer(db, user_id, rec, payload: dict, privacy) -> str:
+    """Copy a still-fresh cached answer for this exact lookup onto `rec`.
+
+    Returns "copied", "missing" (no fresh answer: the caller may buy one), or
+    "withheld": the row WITH the cached phones/emails (privacy anchors) is not
+    allowed under `privacy`, so nothing is copied, the lead is flagged
+    (enforce_rows) and it must not be bought either (Phase 6 P5h). RuleSnapshotError
+    propagates: the caller's operation rolls back.
 
     v2 (migration 098 cutover): the key is the SUBJECT this lookup would be
     bought for — account, address, trace type and the exact names in the
@@ -2916,11 +2927,12 @@ def copy_cached_answer(db, user_id, rec, payload: dict) -> bool:
     cache_key = payload_subject_key(user_id, payload)
     cached = db.get(SkipTraceCache, cache_key)
     if not cached:
-        return False
+        return "missing"
     # 90-day TTL check
     age = _now() - cached.fetched_at
     if age.days >= settings.SKIP_TRACE_CACHE_DAYS:
-        return False
+        return "missing"
+    before = {f: getattr(rec, f) for f in _COPIED_CONTACT_FIELDS}
     # Copy cached values directly to the Result — no Tracerfy call
     rec.phone = cached.phone
     rec.phone_type = cached.phone_type
@@ -2939,7 +2951,15 @@ def copy_cached_answer(db, user_id, rec, payload: dict) -> bool:
     # name the current owner while these contacts belong to the previous
     # one. The duplicate-reuse passes require an exact match on this.
     rec.skip_trace_subject_hash = cache_key
-    return True
+    if privacy.generation:
+        from src.privacy.enforce import enforce_rows
+
+        # Decided on the row as it would be stored (autoflush sends the copy first).
+        if enforce_rows(db, privacy, [rec.id]).flagged:
+            for field, value in before.items():
+                setattr(rec, field, value)  # the cached answer is never kept on it
+            return "withheld"
+    return "copied"
 
 
 def _alert_claim_unenforced(job_id: str, paused: int, why: str) -> None:
@@ -3344,6 +3364,12 @@ def _enqueue_skip_trace_rows(
 
     skipped_ineligible = 0
     skipped_atip_policy = 0
+    privacy_withheld = 0
+    # One privacy snapshot for every cached copy below (Phase 6 P5h). Unreadable
+    # rules raise: the caller rolls the enqueue back, nothing copied or claimed.
+    from src.privacy.authorize import load_rule_snapshot
+
+    privacy = load_rule_snapshot(db)
     # Payloads for leads with no usable cached answer, claimed in one statement
     # after the loop rather than added row by row inside it.
     to_claim: list[dict] = []
@@ -3369,8 +3395,11 @@ def _enqueue_skip_trace_rows(
         # The v2 subject-keyed cache read and the ORM copy: copy_cached_answer
         # (shared with the contact-lookup action worker).
         _v2_key_reads += 1
-        if copy_cached_answer(db, job.user_id, rec, payload):
+        copied = copy_cached_answer(db, job.user_id, rec, payload, privacy)
+        if copied == "copied":
             cache_hits += 1
+        elif copied == "withheld":
+            privacy_withheld += 1      # flagged: neither copied nor bought
         else:
             # Collected, not inserted here. The claim is ONE set-based statement
             # after the loop (see below) so that a conflict is a row-level
@@ -3521,6 +3550,14 @@ def _enqueue_skip_trace_rows(
             f"Skip trace skipped for {skipped_atip_policy} Tacoma code violation lead(s): "
             "their owner name comes from the county's property record, which we may show "
             "but not use for a paid contact lookup. The leads keep their owner name.",
+            db=db,
+        )
+
+    if privacy_withheld:
+        _log(
+            r, job_id, "info",
+            f"Withheld {privacy_withheld} lead(s) because the people named asked not to "
+            "be included. No contact lookup was made for them.",
             db=db,
         )
 

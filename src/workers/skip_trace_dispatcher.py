@@ -1050,6 +1050,8 @@ def _settle_queued_from_known_answers(db) -> int | None:
     from src.api.lead_actionability import withheld_condition
     from src.api.results_category import skip_trace_eligible_condition
     from src.db.models import PendingSkipTraceRow, Result
+    from src.privacy.authorize import load_rule_snapshot
+    from src.privacy.enforce import enforce_rows
 
     now = datetime.now(UTC)
     window = timedelta(days=int(settings.SKIP_TRACE_CACHE_DAYS))
@@ -1059,6 +1061,9 @@ def _settle_queued_from_known_answers(db) -> int | None:
         ).scalar():
             db.rollback()
             return None
+        # Phase 6 P5h: every copied answer is checked WITH its phones/emails (privacy
+        # anchors) before the commit. Unreadable rules: the except below rolls back.
+        privacy = load_rule_snapshot(db)
         queued = db.execute(
             select(PendingSkipTraceRow)
             .where(PendingSkipTraceRow.status == "queued")
@@ -1082,7 +1087,7 @@ def _settle_queued_from_known_answers(db) -> int | None:
                 )
             ).scalars()
         }
-        reused = failed = 0
+        reused = failed = withheld = 0
         for p in queued:
             answer = cached.get(keys[p.id])
             if answer is None and keys[p.id] not in charged_unanswered:
@@ -1122,6 +1127,24 @@ def _settle_queued_from_known_answers(db) -> int | None:
             ).rowcount
             if not took:
                 continue  # no longer eligible: the cancel sweep withdraws it
+            if answer is not None and enforce_rows(db, privacy, [p.result_id]).flagged:
+                # Withheld with this answer on it: the answer is taken back off (never
+                # committed), the lead flagged, the queued row withdrawn, nothing bought.
+                db.execute(
+                    update(Result)
+                    .where(Result.id == p.result_id, Result.user_id == p.user_id)
+                    .values(phone=None, phone_type=None, phone_dnc_flag=None, email=None,
+                            phones=None, emails=None, skip_trace_status="not_attempted",
+                            skip_trace_attempted_at=None, skip_trace_source=None,
+                            skip_trace_subject_hash=None)
+                )
+                db.execute(
+                    update(PendingSkipTraceRow)
+                    .where(PendingSkipTraceRow.id == p.id, PendingSkipTraceRow.status == "queued")
+                    .values(status="cancelled")
+                )
+                withheld += 1
+                continue
             db.execute(
                 update(PendingSkipTraceRow)
                 .where(PendingSkipTraceRow.id == p.id, PendingSkipTraceRow.status == "queued")
@@ -1132,13 +1155,14 @@ def _settle_queued_from_known_answers(db) -> int | None:
             else:
                 failed += 1
         db.commit()
-        if reused or failed:
+        if reused or failed or withheld:
             _logger.info(
-                "Dispatcher: settled %d queued row(s) from this account's earlier answers "
-                "and %d whose address was already charged without a match; none bought",
-                reused, failed,
+                "Dispatcher: settled %d queued row(s) from this account's earlier answers, "
+                "%d whose address was already charged without a match, and withdrew %d a "
+                "privacy rule withholds; none bought",
+                reused, failed, withheld,
             )
-        return reused + failed
+        return reused + failed + withheld
     except Exception as exc:  # noqa: BLE001 - never break the submit loop
         db.rollback()
         _logger.warning("Dispatcher: known-answer sweep failed: %s", str(exc)[:160])

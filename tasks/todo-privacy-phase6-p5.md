@@ -132,6 +132,11 @@ until P7; each must still be correct the moment a rule activates.
 - #604 (P5e1 readers, migrations 131+132) open; P5e2 writers (Codex GO) on branch
   feat/privacy-phase6-p5e2, ships only after #604 is deployed.
 
+- P5f-P5h built on feat/privacy-phase6-p5f (stacked on p5e2): job gate, owner sweeps,
+  cached/Tracerfy answers with incoming contacts, late delivery, repair script (gap 8c
+  closed), mailing/property predicates. All Codex GO.
+- Merge order: #604 (readers) -> P5e2 writers PR -> P5f-h PR, each CI green + deploy verified.
+
 ## P5f-P5h consult (Codex, APPROVE WITH CHANGES, adopted)
 - Job gate: ONE enforce_rows over the job's results AFTER every in-job writer (inline
   enrichment, NTS match, survivor reconciliation/merges, claim transfer), immediately

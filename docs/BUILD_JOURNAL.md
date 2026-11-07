@@ -70,6 +70,40 @@ STRIPE_PRICE_BUSINESS/PRO were product ids (api/worker were right); fixed on the
 bl-test-redis -p 127.0.0.1:6379:6379 redis:7.4-alpine`. A CHECK added NOT VALID still checks
 every new write, including UPDATEs of old rows.
 
+## 2026-11-07: NTS amount basis, post-deploy verification (handoff steps 1-2) + blank-amount label fix
+
+**Built:** FE #318 (merged by owner OK, live on bridgeleads.io): a blank amount gets no amount label on the
+phone Results card or the batch detail panel. The rest of the session was read-only verification, with no prod writes.
+**Step 1 (read-only prod, 2026-11-07 17:21Z, alembic 128):**
+- Active future notices with an amount: 44 of 61 now carry a basis (42 principal, 2 sum_owing). By source:
+  tacoma 28/28, queen_anne 8/12, snohomish 8/21. Whole cache: 49 of 263 (was 0 at deploy).
+- Matched leads: 381 of 1,013 carry enrichment_data.nts.amount_basis (365 principal, 16 sum_owing).
+  The 13 leads that lag their notice's basis are all by design: 8 trustee_sale snapshots, 5 on past notices.
+- Done jobs with NULL records_found: 0 of 1 in the last 7 days, 0 since deploy. But no job has been created
+  since 2026-11-04 05:59Z (1 weekly config, the rest manual), so this barely exercises the #598 guard.
+**Why 17 notices are still NULL:** they come from the weekly-PDF sources, which have no per-notice resweep.
+The archive sweep re-reads an issue once its newest row is more than 7 days old (about 2026-11-12, before the
+11-20 and 11-30 sales). One notice (WA-26-1051862-BB) was re-read today from the OLDER 10-14 issue, and
+_upsert_notice never sets the basis from an older issue. That is by design and self-heals when the 10-21 issue
+is re-read.
+**Step 2 (Playwright Chromium, owner signed in by hand; session file deleted after):** 17 of 18 checks pass.
+Results table, batch table, batch detail and batch card show "Principal" / "Stated in notice" correctly, and
+a blank amount shows no label. **FAIL:** on the phone-width Results card (LeadCards.tsx:306), a blank-amount
+lead reads "Amount stated in notice: N/A", because the row renders whenever the run has auction data.
+**Fix (#318):** the same bug was latent in BatchLeadDetails.tsx (a label over a dash, shown when a lead has an
+auction section but no amount). The first browser check missed it because its blank lead had no auction
+section. Both rows are now gated on `default_amount != null`, like the batch card and the desktop tables.
+Codex consult GO, Codex review no findings. tsc, eslint and the unit tests are clean. Vercel prod is
+dpl_BFLNwpov (`vercel inspect bridgeleads.io` confirmed). The live re-check passes 18 of 18. The batch-panel
+case has no live lead to exercise it: all 26 of 74 batch leads with an auction section have an amount.
+**Failed attempt:** the first two scans for that case came back "nothing found" but were blind. A raw fetch to
+`/api/backend` without the header `X-BL-Requested-With: fetch` gets a 403 (CSRF guard), and batch leads are
+under `.leads`, not `.items`. Caught by a per-batch count control before the empty result was reported.
+**Gotchas (browser check):** Playwright regex `has_text` with `\b` matched nothing, so use plain text. Typing
+into search before the first results response lands gets reset. inner_text returns CSS-uppercased labels.
+The card DETAILS section is collapsed by default. Batches in delivery_mode `overlaps_only` list only stacked
+properties; use an `everything` batch.
+
 ## 2026-11-07 — Contact lookups stuck in "starting": the worker could not see them (RLS)
 
 **Built / Shipped:** migration 133 installs the role-targeted RLS policies on contact_lookup_actions /

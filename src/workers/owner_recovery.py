@@ -368,6 +368,16 @@ def _tick(stats: dict) -> dict:
 
     deadline = time.monotonic() + _TICK_BUDGET_S
     with system_sync_session() as db:
+        # The privacy rules first: an answer naming a withheld owner must never be
+        # stored or written. Unreadable rules: no request, no write this tick.
+        from src.privacy.authorize import RuleSnapshotError, load_rule_snapshot
+        try:
+            privacy = load_rule_snapshot(db)
+        except RuleSnapshotError as exc:
+            db.rollback()
+            stats["skipped"] = "privacy rules unavailable"
+            _logger.error("Owner recovery: privacy rules unavailable: %s", exc)
+            return stats
         # Stored answers first: no King request, so this runs during a cooldown too.
         cached = _fill_from_store(db)
         stats["cached"] = cached["found"] + cached["not_on_record"]
@@ -415,12 +425,19 @@ def _tick(stats: dict) -> dict:
         stored: list[str] = []
         for pid, outcome in _classify(parcels, owners, o_stats).items():
             # A settled answer is stored once for the parcel and fills its leads in
-            # one statement below; anything else is charged row by row as before.
-            if outcome in ("found", "not_on_record") and _store(db, pid, outcome, owners.get(pid)):
+            # one statement below; anything else is charged row by row as before. An
+            # owner a privacy rule withholds is stored as a tombstone (no name) and its
+            # leads are flagged by the fill; it is never written row by row.
+            outcome, owner, rule = privacy_outcome(privacy, pid, outcome, owners.get(pid))
+            if outcome in ("found", "not_on_record", PRIVACY_WITHHELD) and _store(
+                    db, pid, outcome, owner, rule):
                 stored.append(pid)
                 continue
+            if outcome == PRIVACY_WITHHELD:
+                stats["errors"] += 1  # not stored: its leads wait, unnamed, for next tick
+                continue
             for row in by_parcel.get(pid, []):
-                stats[_write(db, row, outcome, owners.get(pid))] += 1
+                stats[_write(db, row, outcome, owner)] += 1
         if stored:
             filled = _fill_from_store(db, stored)
             for outcome, n in filled.items():
@@ -443,15 +460,16 @@ def _tick(stats: dict) -> dict:
     return stats
 
 
-def _store(db, pid: str, outcome: str, owner: str | None) -> bool:
+def _store(db, pid: str, outcome: str, owner: str | None, rule: str | None = None) -> bool:
     """Store one settled eRealProperty answer for its parcel. False when it could not
-    be stored, so the caller falls back to writing the parcel's leads one by one."""
+    be stored, so the caller falls back to writing the parcel's leads one by one (never
+    for a privacy tombstone: see _tick). A tombstone stores its rule and no name."""
     name = (owner or "").strip() if outcome == "found" else None
-    if outcome == "found" and not name:
+    if (outcome == "found" and not name) or ((outcome == PRIVACY_WITHHELD) != bool(rule)):
         return False
     try:
         db.execute(sa_text(_STORE_SQL), {"pid": pid, "outcome": outcome, "owner": name,
-                                         "rule": None})
+                                         "rule": rule})
         db.commit()
         return True
     except Exception as exc:  # noqa: BLE001 -- the row-by-row write still runs
@@ -490,22 +508,57 @@ def fresh_answers(db, parcels) -> dict[str, tuple[str, str | None, str | None]]:
             for row in rows}
 
 
+def privacy_outcome(snapshot, pid: str, outcome: str,
+                    owner: str | None) -> tuple[str, str | None, str | None]:
+    """(outcome, owner, rule) to store for one King answer under the privacy rules.
+
+    A `found` owner is authorized as the lead it would name (the owner as party on
+    its own King tax parcel). WITHHELD or REVIEW: a tombstone, no name, the first
+    rule's privacy_suppressions id. Any other answer passes through unchanged.
+    RuleSnapshotError propagates: nothing is stored unchecked."""
+    if outcome != "found" or not snapshot.by_anchor:
+        return outcome, owner, None
+    from src.privacy.authorize import ROW_COLUMNS, authorize
+
+    lead = dict.fromkeys(ROW_COLUMNS) | {"parcel_id": pid, "party_name": owner}
+    decision = authorize(snapshot, lead, record_type="tax_delinquent", county="king",
+                         state="WA")
+    if decision.deliverable:
+        return outcome, owner, None
+    return PRIVACY_WITHHELD, None, decision.suppression_ids[0]
+
+
 def store_answers(db, answers: dict[str, tuple[str, str | None]]) -> int:
     """Store the scrape job's settled eRealProperty answers, {pid: (outcome, owner)}.
 
     Only answers from a page that echoed the requested 10-digit PIN belong here; the
     caller passes nothing else. One statement, one commit; call it with nothing else
     pending, because a failure rolls back. Returns answers sent, 0 on failure (the
-    job's own leads are already written; the beat sweep asks King later)."""
-    params = []
+    job's own leads are already written; the beat sweep asks King later). An owner a
+    privacy rule withholds is stored as a tombstone, never by name; rules that cannot
+    be read store nothing."""
+    from src.privacy.authorize import RuleSnapshotError, load_rule_snapshot
+
+    candidates = []
     for pid, (outcome, owner) in answers.items():
         name = (owner or "").strip() if outcome == "found" else None
         if not _is_pin(pid) or outcome not in ("found", "not_on_record"):
             continue
         if outcome == "found" and not name:
             continue
-        params.append({"pid": pid, "outcome": outcome, "owner": name, "rule": None})
-    if not params:
+        candidates.append((pid, outcome, name))
+    if not candidates:
+        return 0
+    try:
+        privacy = load_rule_snapshot(db)
+        params = []
+        for pid, outcome, name in candidates:
+            outcome, name, rule = privacy_outcome(privacy, pid, outcome, name)
+            params.append({"pid": pid, "outcome": outcome, "owner": name, "rule": rule})
+    except RuleSnapshotError as exc:
+        db.rollback()
+        _logger.error("Owner store: privacy rules unavailable, %d answers not stored: %s",
+                      len(candidates), exc)
         return 0
     try:
         db.execute(sa_text(_STORE_SQL), params)

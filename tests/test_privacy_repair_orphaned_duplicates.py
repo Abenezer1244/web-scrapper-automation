@@ -49,3 +49,27 @@ async def test_a_withheld_orphan_never_wins_the_claim(db, business_user):
         s.rollback()
     assert withheld not in claimed
     assert claimed == [kept]          # control: the deliverable twin does take the claim
+
+
+async def test_a_lead_with_only_withheld_orphans_is_reported_never_claimed(db, business_user):
+    """Codex P5g: the reports still count every orphan; one that no deliverable row can
+    resolve is reported apart and does not make the run look unconverged."""
+    rule = await _rule_row(db)
+    job = await _job(db, business_user)
+    (rid,) = await _rows(db, business_user, job, ("SMITH JOHN", "1234567890"))
+    await db.execute(text(
+        "UPDATE results SET is_duplicate = true, duplicate_reason = 'prior_run', "
+        "dedup_hash = :h, property_address = '1 TEST ST', mailing_address = 'PO BOX 1', "
+        "privacy_suppressed_at = now(), privacy_suppression_id = :r WHERE id = :i"),
+        {"h": uuid.uuid4().hex, "r": rule, "i": rid})
+    await db.commit()
+    mod = _script()
+    p = {"uid": business_user.id, "jid": None}
+    with system_sync_session() as s:
+        summary = s.execute(text(mod._Q_SUMMARY), p).one()
+        claimed = s.execute(text(mod._Q_CLAIM), p).scalars().all()
+        remaining = s.execute(text(mod._Q_REMAINING), p).one()
+        s.rollback()
+    assert (summary.winners, summary.unclaimable) == (0, 1)
+    assert claimed == []
+    assert (remaining.claimable, remaining.total) == (0, 1)

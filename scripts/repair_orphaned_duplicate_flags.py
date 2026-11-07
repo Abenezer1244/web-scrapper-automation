@@ -88,9 +88,13 @@ WITH orphan AS (
 ranked AS (
     SELECT r.id, r.job_id, r.user_id, r.dedup_hash,
            r.parcel_id, r.property_address, j.created_at AS job_created_at,
+           -- Only a lead that may be delivered can claim and be promoted: never one a
+           -- privacy rule withholds, over quota or unqualified (07 inventory gap 8c).
+           -- Such a row is still COUNTED (reports and convergence), never the winner.
+           ({actionable_sql('r')}) AS claimable,
            row_number() OVER (
                PARTITION BY r.user_id, r.dedup_hash
-               ORDER BY j.created_at, r.id
+               ORDER BY ({actionable_sql('r')}) DESC, j.created_at, r.id
            ) AS rn
     FROM results r
     JOIN orphan o ON o.user_id = r.user_id AND o.dedup_hash = r.dedup_hash
@@ -98,17 +102,15 @@ ranked AS (
     WHERE j.status = 'done'
       -- A superseded row was never delivered: it can never be the delivery.
       AND COALESCE(r.duplicate_reason, '') <> 'superseded'
-      -- Only a lead that may be delivered can win the claim and be promoted: never
-      -- one a privacy rule withholds, over quota or unqualified (07 inventory gap 8c).
-      AND {actionable_sql('r')}
 )
 """  # noqa: S608 -- splices only the code-literal predicate; every value is bound
 
 # Composed once, at import, from the literal above. Kept as named constants so
 # no query is built at the call site: every text() below receives a plain name.
 _Q_SUMMARY = _RANKED + """
-SELECT count(*) FILTER (WHERE rn = 1) AS winners,
-       count(*) FILTER (WHERE rn > 1) AS losers,
+SELECT count(*) FILTER (WHERE rn = 1 AND claimable) AS winners,
+       count(*) FILTER (WHERE NOT (rn = 1 AND claimable)) AS losers,
+       count(*) FILTER (WHERE rn = 1 AND NOT claimable) AS unclaimable,
        count(DISTINCT user_id) AS users,
        count(DISTINCT job_id) AS jobs
 FROM ranked
@@ -116,8 +118,8 @@ FROM ranked
 
 _Q_PER_JOB = _RANKED + """
 SELECT job_id, user_id,
-       count(*) FILTER (WHERE rn = 1) AS becomes_new,
-       count(*) FILTER (WHERE rn > 1) AS stays_duplicate
+       count(*) FILTER (WHERE rn = 1 AND claimable) AS becomes_new,
+       count(*) FILTER (WHERE NOT (rn = 1 AND claimable)) AS stays_duplicate
 FROM ranked GROUP BY job_id, user_id ORDER BY becomes_new DESC
 """
 
@@ -127,13 +129,14 @@ INSERT INTO delivered_records
      parcel_id, property_address, first_delivered_at)
 SELECT gen_random_uuid(), user_id, dedup_hash, id, job_id,
        parcel_id, property_address, job_created_at
-FROM ranked WHERE rn = 1
+FROM ranked WHERE rn = 1 AND claimable
 ON CONFLICT (user_id, dedup_hash) DO NOTHING
 RETURNING first_result_id
 """
 
+# Orphans a run CAN resolve (a deliverable row exists); the rest are reported apart.
 _Q_REMAINING = _RANKED + """
-SELECT count(*) FROM ranked
+SELECT count(*) FILTER (WHERE claimable) AS claimable, count(*) AS total FROM ranked
 """
 
 _Q_PROMOTE = """
@@ -193,6 +196,8 @@ def main() -> None:
         ).first()
         print(f"leads to restore as delivered: {summary.winners}")
         print(f"rows that stay duplicate but gain a source: {summary.losers}")
+        print(f"leads with no deliverable row (privacy, quota or qualification), "
+              f"left orphaned, never claimed: {summary.unclaimable}")
         print(f"across {summary.users} user(s) / {summary.jobs} job(s)")
 
         print("\nper job:")
@@ -276,9 +281,10 @@ def main() -> None:
 
         left = db.execute(
             text(_Q_REMAINING), p
-        ).scalar()
-        print(f"\norphaned rows remaining: {left}")
-        if left:
+        ).one()
+        print(f"\norphaned rows remaining: {left.total} "
+              f"({left.total - left.claimable} with no deliverable row, never claimed)")
+        if left.claimable:
             print("WARNING: did not converge - re-run the dry run and compare")
 
 

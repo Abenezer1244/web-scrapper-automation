@@ -160,17 +160,18 @@ def deliver_completed_held_rows(*, batch: int = _BATCH_ROWS) -> dict:
 
     with system_sync_session() as db:
         # The privacy rules before any delivery (Phase 6 P5g): a held row a rule
-        # withholds is flagged, never charged. Unreadable rules: nothing delivered on
-        # this tick; the steps below (contacts, dialer, notices) still run, each checking
-        # the rules itself.
+        # withholds is flagged, never charged. Unreadable rules: the whole tick does
+        # nothing (no delivery, contact request, dialer push or notice; Codex), and
+        # still reports every count.
         try:
             privacy = load_rule_snapshot(db)
-            rows = db.execute(sa_text(_CANDIDATES_SQL),
-                              {"batch": batch, "per_account": _PER_ACCOUNT_ROWS}).mappings().all()
         except RuleSnapshotError as exc:
-            stats["skipped"] = "privacy rules unavailable"
+            db.rollback()
             _logger.error("Late delivery: privacy rules unavailable: %s", exc)
-            rows = []
+            return {**stats, "skipped": "privacy rules unavailable",
+                    "contacts_requested": 0, "dialer_pushed": 0, "notified_accounts": 0}
+        rows = db.execute(sa_text(_CANDIDATES_SQL),
+                          {"batch": batch, "per_account": _PER_ACCOUNT_ROWS}).mappings().all()
         db.rollback()
     stats["candidates"] = len(rows)
     by_account: dict[str, list] = {}

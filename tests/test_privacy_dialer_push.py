@@ -265,10 +265,19 @@ async def test_late_delivery_claims_no_push_when_rules_cannot_load(
     def _broken(db):
         raise RuleSnapshotError("rules could not be loaded")
 
+    # A lead an EARLIER tick delivered whose dialer push is still pending: that tick ran
+    # with readable rules and stopped before its dialer step.
+    real_push = late.push_late_dialer
+    monkeypatch.setattr(late, "push_late_dialer", lambda: 0)
+    assert late.deliver_completed_held_rows()["delivered"] == 1
+    assert await _late_dialer(db, rid) == "pending"
+    monkeypatch.setattr(late, "push_late_dialer", real_push)
+
     monkeypatch.setattr(authorize_mod, "load_rule_snapshot", _broken)
     stats = late.deliver_completed_held_rows()
-    # Since P5g nothing is delivered without readable rules; the dialer step still runs
-    # and pushes nothing.
-    assert stats["skipped"] == "privacy rules unavailable" and stats["delivered"] == 0
-    assert stats["dialer_pushed"] == 0
-    assert await _late_dialer(db, rid) is None and enqueued == []
+    # Since P5g, unreadable rules make the whole tick do nothing (Codex): no delivery,
+    # no contact request, no dialer push, no notice. The pending push stays pending.
+    assert stats["skipped"] == "privacy rules unavailable"
+    assert (stats["delivered"], stats["contacts_requested"], stats["dialer_pushed"],
+            stats["notified_accounts"]) == (0, 0, 0, 0)
+    assert await _late_dialer(db, rid) == "pending" and enqueued == []

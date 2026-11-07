@@ -109,3 +109,57 @@ async def test_a_definer_function_the_api_can_still_call_fails_the_migration(db)
         await db.execute(text(_mig134().UPGRADE_SQL))
     assert "can still call a SECURITY DEFINER function" in str(exc.value)
     await db.rollback()
+
+
+async def test_objects_created_after_134_stay_closed_sequences_and_functions_too(db):
+    await _production_grants(db)
+    await db.execute(text(
+        "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO anon, authenticated"))
+    await db.execute(text(
+        "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO anon, authenticated"))
+    await db.execute(text(_mig134().UPGRADE_SQL))
+    await db.execute(text('CREATE TABLE public."Api Role Probe" (id int)'))  # a quoted name
+    await db.execute(text("CREATE SEQUENCE public.api_role_probe_seq"))
+    await db.execute(text(
+        "CREATE FUNCTION public.api_role_probe_fn() RETURNS int LANGUAGE sql AS 'SELECT 1'"))
+    await db.execute(text("REVOKE ALL ON FUNCTION public.api_role_probe_fn() FROM PUBLIC"))
+    for role in ("anon", "authenticated"):
+        assert not (await db.execute(text(
+            "SELECT has_table_privilege(:r, 'public.\"Api Role Probe\"', 'SELECT') "
+            "OR has_sequence_privilege(:r, 'public.api_role_probe_seq', 'USAGE') "
+            "OR has_function_privilege(:r, 'public.api_role_probe_fn()', 'EXECUTE')"),
+            {"r": role})).scalar()
+    await db.rollback()
+
+
+async def test_a_non_superuser_owner_revokes_its_own_and_skips_anothers(db):
+    """On Supabase the migration runs as `postgres`, not a superuser, beside objects owned
+    by bridgeleads_purge: it must revoke what it owns and not fail on the rest."""
+    for role in _API_ROLES:
+        await db.execute(text(
+            f"DO $r$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{role}') "
+            f"THEN CREATE ROLE {role} NOLOGIN; END IF; END $r$"))
+    await db.execute(text("CREATE ROLE api_probe_migrator NOLOGIN NOSUPERUSER"))
+    await db.execute(text("CREATE ROLE api_probe_other NOLOGIN NOSUPERUSER"))
+    await db.execute(text("GRANT CREATE, USAGE ON SCHEMA public TO api_probe_migrator"))
+    await db.execute(text("CREATE TABLE public.api_probe_mine (id int)"))
+    await db.execute(text("ALTER TABLE public.api_probe_mine OWNER TO api_probe_migrator"))
+    await db.execute(text("CREATE TABLE public.api_probe_theirs (id int)"))
+    await db.execute(text("ALTER TABLE public.api_probe_theirs OWNER TO api_probe_other"))
+    await db.execute(text("GRANT SELECT ON public.api_probe_mine TO anon"))  # the finding
+    await db.execute(text("SET LOCAL ROLE api_probe_migrator"))
+    await db.execute(text(_mig134().UPGRADE_SQL))  # the whole body, postcondition included
+    await db.execute(text("RESET ROLE"))
+    assert (await db.execute(text(
+        "SELECT has_table_privilege('anon', 'public.api_probe_mine', 'SELECT')"))).scalar() is False
+    await db.rollback()
+
+
+async def test_the_exposure_audit_runs_without_the_api_roles(db):
+    """CI and local clusters have no anon/authenticated/service_role: no rows, no error."""
+    present = (await db.execute(text(
+        "SELECT count(*) FROM pg_roles WHERE rolname IN ('anon', 'authenticated', 'service_role')"
+    ))).scalar()
+    if present:
+        pytest.skip("this cluster has a Supabase API role")
+    assert await _exposed(db) == set()

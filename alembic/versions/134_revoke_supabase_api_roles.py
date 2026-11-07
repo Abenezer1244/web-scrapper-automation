@@ -74,8 +74,11 @@ BEGIN
   IF EXISTS (
     SELECT 1 FROM pg_roles ro, pg_class c
     JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = 'public'
-    WHERE ro.rolname IN ('anon', 'authenticated') AND c.relkind IN ('r', 'v', 'm', 'p')
-      AND (has_table_privilege(ro.oid, c.oid, 'SELECT')
+    WHERE ro.rolname IN ('anon', 'authenticated') AND c.relkind IN ('r', 'v', 'm', 'p', 'f')
+      AND (has_any_column_privilege(ro.oid, c.oid, 'SELECT')
+           OR has_any_column_privilege(ro.oid, c.oid, 'INSERT')
+           OR has_any_column_privilege(ro.oid, c.oid, 'UPDATE')
+           OR has_table_privilege(ro.oid, c.oid, 'SELECT')
            OR has_table_privilege(ro.oid, c.oid, 'INSERT')
            OR has_table_privilege(ro.oid, c.oid, 'UPDATE')
            OR has_table_privilege(ro.oid, c.oid, 'DELETE')

@@ -765,17 +765,20 @@ ORDER BY 1
 """
 
 # What the Supabase Data API roles can reach in public (migration 134 revoked it all).
-# The Data API serves schema public to the publishable key, so any table privilege or
-# any callable SECURITY DEFINER function here is reachable from the internet.
+# The Data API serves schema public: anon/authenticated access is reachable with the
+# publishable key, service_role access with the secret key. Either is a finding. A
+# definer function callable through PUBLIC counts too (effective privileges).
 API_ROLE_EXPOSURE_SQL = """
 SELECT ro.rolname || ':' || c.relname
 FROM pg_roles ro, pg_class c
 JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = 'public'
-WHERE ro.rolname IN ('anon', 'authenticated') AND c.relkind IN ('r', 'v', 'm', 'p')
+WHERE ro.rolname IN ('anon', 'authenticated') AND c.relkind IN ('r', 'v', 'm', 'p', 'f')
   AND (has_table_privilege(ro.oid, c.oid, 'SELECT') OR has_table_privilege(ro.oid, c.oid, 'INSERT')
        OR has_table_privilege(ro.oid, c.oid, 'UPDATE') OR has_table_privilege(ro.oid, c.oid, 'DELETE')
        OR has_table_privilege(ro.oid, c.oid, 'TRUNCATE')
-       OR has_any_column_privilege(ro.oid, c.oid, 'SELECT'))
+       OR has_any_column_privilege(ro.oid, c.oid, 'SELECT')
+       OR has_any_column_privilege(ro.oid, c.oid, 'INSERT')
+       OR has_any_column_privilege(ro.oid, c.oid, 'UPDATE'))
 UNION ALL
 SELECT ro.rolname || ':' || p.proname || '()'
 FROM pg_roles ro, pg_proc p
@@ -810,9 +813,9 @@ def audit_rls_system_policies() -> list[str]:
         send_ops_alert(
             "api_role_exposure", ",".join(exposed),
             "Supabase Data API can reach application data",
-            f"anon/authenticated/service_role hold access to {', '.join(exposed)} in schema "
-            "public, which the Data API serves to the publishable key. Revoke it in a "
-            "migration (see migration 134).",
+            f"Supabase API roles can reach {', '.join(exposed)} in schema public, which the "
+            "Data API serves (anon/authenticated: the publishable key; service_role: the "
+            "secret key). Revoke it in a migration (see migration 134).",
         )
     if gaps:
         _logger.error("RLS: no policy targets bridgeleads_system for SELECT on %s", gaps)

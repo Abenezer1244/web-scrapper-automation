@@ -49,6 +49,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from sqlalchemy import text  # noqa: E402
 
+from src.api.lead_actionability import actionable_sql  # noqa: E402
 from src.db.session import system_sync_session  # noqa: E402
 
 # Rows asserting a delivery with no claim behind them, ranked so that the
@@ -59,7 +60,7 @@ from src.db.session import system_sync_session  # noqa: E402
 # NULL-tolerant bound predicates rather than interpolated fragments, so there is
 # no string building anywhere and every value arrives as a parameter -- the same
 # rule tasks_helpers/enrich.py follows for its skip-trace reuse statement.
-_RANKED = """
+_RANKED = f"""
 WITH orphan AS (
     SELECT DISTINCT r.user_id, r.dedup_hash
     FROM results r
@@ -97,8 +98,11 @@ ranked AS (
     WHERE j.status = 'done'
       -- A superseded row was never delivered: it can never be the delivery.
       AND COALESCE(r.duplicate_reason, '') <> 'superseded'
+      -- Only a lead that may be delivered can win the claim and be promoted: never
+      -- one a privacy rule withholds, over quota or unqualified (07 inventory gap 8c).
+      AND {actionable_sql('r')}
 )
-"""
+"""  # noqa: S608 -- splices only the code-literal predicate; every value is bound
 
 # Composed once, at import, from the literal above. Kept as named constants so
 # no query is built at the call site: every text() below receives a plain name.

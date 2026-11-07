@@ -1113,6 +1113,15 @@ def _settle_queued_from_known_answers(db) -> int | None:
                 }
             else:
                 values = {"skip_trace_status": "errored", "skip_trace_attempted_at": now}
+            prior = None
+            if answer is not None:
+                # What the lead holds now, locked: a privacy withdrawal below restores
+                # exactly this, never NULLs over contacts it may already carry (Codex).
+                prior = db.execute(
+                    select(*(getattr(Result, f) for f in values))
+                    .where(Result.id == p.result_id, Result.user_id == p.user_id)
+                    .with_for_update()
+                ).mappings().first()
             took = db.execute(
                 update(Result)
                 .where(
@@ -1128,15 +1137,13 @@ def _settle_queued_from_known_answers(db) -> int | None:
             if not took:
                 continue  # no longer eligible: the cancel sweep withdraws it
             if answer is not None and enforce_rows(db, privacy, [p.result_id]).flagged:
-                # Withheld with this answer on it: the answer is taken back off (never
-                # committed), the lead flagged, the queued row withdrawn, nothing bought.
+                # Withheld with this answer on it: the answer is taken back off (the
+                # lead's prior values restored, nothing committed in between), the lead
+                # flagged, the queued row withdrawn, nothing bought.
                 db.execute(
                     update(Result)
                     .where(Result.id == p.result_id, Result.user_id == p.user_id)
-                    .values(phone=None, phone_type=None, phone_dnc_flag=None, email=None,
-                            phones=None, emails=None, skip_trace_status="not_attempted",
-                            skip_trace_attempted_at=None, skip_trace_source=None,
-                            skip_trace_subject_hash=None)
+                    .values(**{**dict(prior), "skip_trace_status": "not_attempted"})
                 )
                 db.execute(
                     update(PendingSkipTraceRow)

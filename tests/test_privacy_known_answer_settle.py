@@ -41,7 +41,8 @@ async def test_a_cached_answer_whose_phone_a_rule_anchors_is_withdrawn_not_kept(
     rows[1]["id"] = rule
     monkeypatch.setattr(authorize_mod, "load_rule_snapshot", lambda db: build_snapshot(rows))
     job = _run(business_user.id)
-    withheld = _lead(business_user.id, job, 7, party="ИВАНОВ ИВАН")
+    # It already carries a phone (Codex: a withdrawal must restore it, never NULL it).
+    withheld = _lead(business_user.id, job, 7, party="ИВАНОВ ИВАН", phone="2065559999")
     held_row = _pending_row(business_user.id, job, withheld, 7, first="IVAN", last="IVANOV")
     _cache_row(_subject(business_user.id, 7, "IVAN", "IVANOV"), "2065550107")
     control = _lead(business_user.id, job, 8, party=DECEASED)
@@ -52,8 +53,9 @@ async def test_a_cached_answer_whose_phone_a_rule_anchors_is_withdrawn_not_kept(
         _settle_queued_from_known_answers(db)
 
     r = _row(withheld)
-    assert (r.phone, r.phones, r.skip_trace_status, r.skip_trace_source) == (
-        None, None, "not_attempted", None)
+    assert (r.phone, r.skip_trace_status, r.skip_trace_source) == (
+        "2065559999", "not_attempted", None)
+    assert r.phones == [{"number": "2065559999", "type": "Mobile"}]
     assert str(r.privacy_suppression_id) == rule
     with system_sync_session() as db:
         assert db.execute(text("SELECT status FROM pending_skip_trace_rows WHERE id = :p"),

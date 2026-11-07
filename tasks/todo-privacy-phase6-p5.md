@@ -76,10 +76,25 @@ until P7; each must still be correct the moment a rule activates.
 
 ## Revised slices (supersede the list above)
 
-- [ ] P5a owner-of-record adapter (authorize.py + tests: exact, unresolved, missing, entity, co-owner).
-- [ ] P5b migration 130 + `snapshot.generation` + `src/privacy/enforce.py` + tests.
-- [ ] P5c enforcer beat (privacy_enforcer.py, scheduler.py, workers/__init__.py, test).
-- [ ] P5d insert gate (tasks.py + test).
+- [x] P5a owner-of-record adapter + projection guard (PR #602, Codex GO).
+- [x] P5b migration 130 (PR #602, Codex GO round 3).
+- [x] P5c enforce_rows + generation + enforcer beat (Codex GO round 2: unscoped rows removed,
+  every row decided with its job's config; RLS checked in prod pg_policies: *_system
+  USING (true) for bridgeleads_system).
+- [x] P5d insert gate (Codex GO).
+- P5e consult (Codex, APPROVE WITH CHANGES, adopted): a nameless King tax lead waiting for
+  its owner carries the owner's property + mailing, and authorize() cannot see a withheld
+  owner it has no name for. So the tombstone carries its rule: migration 131
+  `king_parcel_owners.privacy_suppression_id` (FK RESTRICT, CHECK outcome
+  'privacy_withheld' <=> id set). Readers treat a tombstone as TERMINAL at any age (no
+  county request, no name copied) and, in the same transaction, FLAG every unflagged result
+  of that parcel still WAITING for its owner (blank/placeholder name: exactly the rows the
+  fill would have named) with the tombstone's id + current generation. A row naming someone
+  else on that parcel stays allowed (design: a shared parcel never suppresses others).
+  Writers: one snapshot per operation, fail closed; WITHHELD and REVIEW both tombstone.
+  NTS: suppressed grantor written NULL on insert AND on conflict (explicit, not COALESCE);
+  tests: insert, conflict, repeat crawl, later crawl with parser NULL. Lifting (restoring a
+  tombstoned parcel or a grantor) is P7. 131 + readers = ONE PR, deployed before writers.
 - [ ] P5e1 King tombstone READERS first (Codex round 2): `_CANDIDATE_PARCELS_SQL` excludes
   fresh tombstones, `_fill_from_store` / `_fill_king_owners_from_store` / `fresh_answers`
   treat one as terminal (no name, no county request). Merge, deploy, verify every

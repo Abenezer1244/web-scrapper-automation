@@ -2446,6 +2446,11 @@
             "title": "Action Id",
             "type": "string"
           },
+          "as_of": {
+            "format": "date-time",
+            "title": "As Of",
+            "type": "string"
+          },
           "billable": {
             "title": "Billable",
             "type": "integer"
@@ -2585,7 +2590,8 @@
           "billable",
           "unit_price_cents",
           "currency",
-          "created_at"
+          "created_at",
+          "as_of"
         ],
         "title": "ContactLookupStatus",
         "type": "object"

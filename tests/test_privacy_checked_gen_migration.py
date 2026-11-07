@@ -56,21 +56,38 @@ def test_the_sweep_index_covers_unflagged_rows_by_generation_then_id(conn):
     assert "WHERE (privacy_suppressed_at IS NULL)" in definition
 
 
-_INSERT = ("INSERT INTO king_parcel_owners (parcel_id, outcome, owner_name, observed_at, source) "
-           "VALUES (:p, :o, :n, now(), 'erealproperty')")
+_INSERT = ("INSERT INTO king_parcel_owners (parcel_id, outcome, owner_name, observed_at, source, "
+           "privacy_suppression_id) VALUES (:p, :o, :n, now(), 'erealproperty', :r)")
+
+
+def _rule(conn) -> str:
+    """A real (pending) rule row: since 131 a tombstone must name the rule behind it."""
+    request_id = conn.execute(text(
+        "INSERT INTO privacy_requests (kind, channel, deadline_at) "
+        "VALUES ('opt_out', 'web', now() + interval '45 days') RETURNING id")).scalar()
+    return str(conn.execute(text(
+        "INSERT INTO privacy_suppressions (rule_id, request_id, anchor_kind, anchor_hmac, "
+        "subject_kind, subject_hmac, scope, key_version, normalization_version, state) "
+        "VALUES (gen_random_uuid(), :r, 'property', :h, 'person', :h, 'subject', 'v1', "
+        "'n3', 'pending') RETURNING id"), {"r": request_id, "h": "c" * 64}).scalar())
 
 
 def test_a_privacy_tombstone_is_stored_without_a_name(conn):
-    assert _sqlstate(conn, _INSERT, {"p": _PIN, "o": "privacy_withheld", "n": None}) is None
+    assert _sqlstate(conn, _INSERT, {"p": _PIN, "o": "privacy_withheld", "n": None,
+                                     "r": _rule(conn)}) is None
 
 
 def test_a_privacy_tombstone_can_never_carry_a_name(conn):
-    # 118's pairing CHECK: only 'found' may hold a name.
+    # 118's pairing CHECK: only 'found' may hold a name (the rule is there, so 131's
+    # CHECK is satisfied and this refusal is the name's).
     assert _sqlstate(conn, _INSERT, {"p": _PIN, "o": "privacy_withheld",
-                                     "n": "SMITH JOHN"}) == "23514"
+                                     "n": "SMITH JOHN", "r": _rule(conn)}) == "23514"
 
 
 def test_the_old_outcomes_still_work_and_an_unknown_one_is_refused(conn):
-    assert _sqlstate(conn, _INSERT, {"p": _PIN, "o": "found", "n": "SMITH JOHN"}) is None
-    assert _sqlstate(conn, _INSERT, {"p": _PIN, "o": "not_on_record", "n": None}) is None
-    assert _sqlstate(conn, _INSERT, {"p": _PIN, "o": "withheld", "n": None}) == "23514"
+    assert _sqlstate(conn, _INSERT, {"p": _PIN, "o": "found", "n": "SMITH JOHN",
+                                     "r": None}) is None
+    assert _sqlstate(conn, _INSERT, {"p": _PIN, "o": "not_on_record", "n": None,
+                                     "r": None}) is None
+    assert _sqlstate(conn, _INSERT, {"p": _PIN, "o": "withheld", "n": None,
+                                     "r": None}) == "23514"

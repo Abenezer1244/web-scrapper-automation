@@ -796,6 +796,7 @@ _RESWEEP_SELECT = _sa_text(
     """
     SELECT id, ts_number, source_url FROM nts_notices
     WHERE source = :source AND is_active AND auction_date >= :today
+      AND privacy_suppression_id IS NULL  -- never re-read a withheld notice (132)
       -- An amount with no basis was parsed before migration 128: re-read it once so
       -- it stops showing as an amount of unknown type.
       AND (principal_owing IS NULL OR principal_owing_basis IS NULL)

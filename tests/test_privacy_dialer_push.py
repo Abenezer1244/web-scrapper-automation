@@ -238,11 +238,20 @@ async def test_a_late_row_the_rules_withhold_is_never_sent(db, business_user, en
     rid = await _held_row(db, business_user, job, _held(), phone="2065550100")
     party = (await db.execute(text(
         "SELECT party_name FROM results WHERE id = :i"), {"i": rid})).scalar()
-    # The row's person under a rule anchored at another parcel: held for review.
-    monkeypatch.setattr(authorize_mod, "load_rule_snapshot", lambda db: build_snapshot(
-        _rule_for(party, "5555555555", "code_violation", "king")))
-    late.deliver_completed_held_rows()               # delivers, then decides its dialer push
-    assert await _late_dialer(db, rid) == "privacy_withheld"
+    # The row's person under a rule anchored at another parcel: held for review. Since
+    # P5g late delivery authorizes BEFORE delivering, so the row is flagged (a real rule
+    # row: the flag's foreign key) and never delivered: it never reaches a dialer at all.
+    from tests.test_privacy_nts_readers import _rule_row
+
+    rows = _rule_for(party, "5555555555", "code_violation", "king")
+    rows[-1]["id"] = _rule_row()
+    monkeypatch.setattr(authorize_mod, "load_rule_snapshot", lambda db: build_snapshot(rows))
+    stats = late.deliver_completed_held_rows()
+    assert (stats["delivered"], stats["privacy_withheld"]) == (0, 1)
+    assert await _late_dialer(db, rid) is None       # never delivered, so never pushed
+    flag = (await db.execute(text("SELECT privacy_suppression_id::text FROM results "
+                                  "WHERE id = :i"), {"i": rid})).scalar()
+    assert flag == rows[-1]["id"]
     assert enqueued == []
 
 
@@ -258,5 +267,8 @@ async def test_late_delivery_claims_no_push_when_rules_cannot_load(
 
     monkeypatch.setattr(authorize_mod, "load_rule_snapshot", _broken)
     stats = late.deliver_completed_held_rows()
+    # Since P5g nothing is delivered without readable rules; the dialer step still runs
+    # and pushes nothing.
+    assert stats["skipped"] == "privacy rules unavailable" and stats["delivered"] == 0
     assert stats["dialer_pushed"] == 0
-    assert await _late_dialer(db, rid) == "pending" and enqueued == []
+    assert await _late_dialer(db, rid) is None and enqueued == []

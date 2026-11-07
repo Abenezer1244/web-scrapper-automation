@@ -114,3 +114,63 @@ def test_someone_else_on_another_parcel_is_saved(make_job, redis_client, monkeyp
     _apply(job_id)
     job, rows, _logs = _saved(job_id)
     assert job.status == "done" and len(rows) == 1
+
+
+# ── the post-enrichment gate (P5f): rows an in-job writer named after the insert ──
+
+def _rename_during_enrichment(monkeypatch, name: str) -> None:
+    """Stand in for an in-job enrichment writer that gives a saved lead its owner."""
+    def _enrich(db, job, r, job_id, *a, **k):
+        db.execute(text("UPDATE results SET party_name = :n WHERE job_id = :j"),
+                   {"n": name, "j": job_id})
+        db.commit()
+
+    monkeypatch.setattr(tasks, "_run_inline_enrichment", _enrich)
+
+
+def _real_rule() -> str:
+    from tests.test_privacy_nts_readers import _rule_row
+    return _rule_row()
+
+
+def test_a_lead_enrichment_names_after_the_insert_is_withheld_before_billing(
+    make_job, redis_client, monkeypatch,
+):
+    job_id = make_job()
+    anchor = keys.property_anchor_value(_PARCEL, _county(job_id), "WA")
+    rows = _history(["pending", "active"], anchor=("property", anchor))
+    rows[1]["id"] = _real_rule()             # the flag's foreign key must hold
+    _portal(monkeypatch, ("DOE JANE", _PARCEL))            # allowed at the insert
+    _rules(monkeypatch, build_snapshot(rows))
+    _rename_during_enrichment(monkeypatch, "SMITH JOHN")   # ... then named the withheld person
+    _apply(job_id)
+    job, saved, logs = _saved(job_id)
+    with SyncSessionLocal() as s:
+        flagged = s.execute(text(
+            "SELECT count(*) FROM results WHERE job_id = :j "
+            "AND privacy_suppression_id = :r"), {"j": job_id, "r": rows[1]["id"]}).scalar()
+    assert job.status == "done" and len(saved) == 1 and flagged == 1
+    assert job.billed_count == 0                           # never billed
+    assert any("Withheld 1 lead(s)" in m for m in logs)
+
+
+def test_rules_unreadable_after_enrichment_fail_the_run_unbilled(
+    make_job, redis_client, monkeypatch,
+):
+    job_id = make_job()
+    _portal(monkeypatch, ("DOE JANE", _PARCEL))
+    calls = []
+
+    def _first_load_only(db):
+        calls.append(1)
+        if len(calls) == 1:                                # the insert gate's load
+            return build_snapshot(_history(["pending"]))
+        raise RuleSnapshotError("rules could not be loaded")
+
+    monkeypatch.setattr(authorize_mod, "load_rule_snapshot", _first_load_only)
+    monkeypatch.setattr(tasks.time, "sleep", lambda s: None)
+    _apply(job_id)
+    job, _saved_rows, _logs = _saved(job_id)
+    assert len(calls) == 4                                 # insert + three tries
+    assert job.status == "failed" and job.billed_count == 0
+    assert "privacy requests" in job.error_message

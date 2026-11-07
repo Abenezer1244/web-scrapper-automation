@@ -1410,7 +1410,7 @@ def _partition_still_deliverable(db, rows: list, snapshot) -> tuple[list, list, 
 
     # The columns authorize() reads (decrypted by their column types), nothing more.
     person_cols = (Result.parcel_id, Result.party_name, Result.heirs, Result.phone,
-                   Result.phones, Result.email, Result.emails)
+                   Result.phones, Result.email, Result.emails, Result.enrichment_data)
     found = db.execute(
         select(
             Result.id,

@@ -126,6 +126,12 @@ class RuleSnapshot:
         return len({r.suppression_id for rules in self.by_anchor.values() for r in rules})
 
 
+# Every column authorize() reads. A Mapping row (a column projection) must carry all of
+# them: a projection that silently left one out would read it as empty, i.e. allow.
+ROW_COLUMNS = ("party_name", "heirs", "parcel_id", "phone", "phones", "email", "emails",
+               "enrichment_data")
+
+
 def _get(row: Any, name: str):
     # Any mapping (a dict, a SQLAlchemy RowMapping) by key; an ORM row by attribute.
     # A RowMapping read by attribute would yield None for every field: allow-all.
@@ -246,6 +252,10 @@ def authorize(snapshot: RuleSnapshot, row: Any, *, record_type: str | None,
     """Whether ``row`` (a Result or a dict with its columns) may be delivered."""
     if not snapshot.by_anchor:
         return Decision(ALLOWED)
+    if isinstance(row, Mapping):
+        missing = [c for c in ROW_COLUMNS if c not in row]
+        if missing:  # a caller's projection bug: fail the operation, never allow
+            raise RuleSnapshotError(f"row is missing authorize() columns {missing}")
     subjects = _subjects(row, record_type, county)
     anchors = _anchor_values(row, county, state)
     unresolved = any(s.kind == KIND_UNRESOLVED for s in subjects)

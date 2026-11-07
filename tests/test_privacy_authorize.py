@@ -23,6 +23,7 @@ from src.privacy.authorize import (
     REVIEW,
     REVIEW_SUBJECT_WITHOUT_ANCHOR,
     REVIEW_UNRESOLVED_SUBJECT,
+    ROW_COLUMNS,
     WITHHELD,
     RuleSnapshotError,
     authorize,
@@ -160,7 +161,17 @@ def _snap(*histories):
 
 def _row(**over):
     return {"party_name": "SMITH JOHN", "heirs": None, "parcel_id": "123456-7890",
-            "phone": None, "phones": None, "email": None, "emails": None, **over}
+            "phone": None, "phones": None, "email": None, "emails": None,
+            "enrichment_data": None, **over}
+
+
+@pytest.mark.parametrize("column", ROW_COLUMNS)
+def test_a_projection_missing_any_column_fails_closed_while_a_rule_is_active(column):
+    partial = {k: v for k, v in _row().items() if k != column}
+    with pytest.raises(RuleSnapshotError):
+        authorize(_snap(_history(["pending", "active"])), partial, **_CTX)
+    # No active rule: nothing is read, so nothing can be missed.
+    assert authorize(_snap(_history(["pending"])), partial, **_CTX).outcome == ALLOWED
 
 
 def test_no_active_rule_allows_everything_without_keying_anything(monkeypatch):

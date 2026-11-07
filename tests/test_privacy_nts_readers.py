@@ -8,6 +8,7 @@ the same notice WITHOUT the rule is matched, so the skip is the rule's doing.
 """
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import UTC, date, datetime, timedelta
 
@@ -87,3 +88,77 @@ def test_a_notice_carrying_a_rule_has_no_grantor_and_is_inactive(grantor, active
             s.commit()
     finally:
         _cleanup(ids)
+
+
+def _withhold(notice_id: str) -> None:
+    with SyncSessionLocal() as s:
+        s.execute(text("UPDATE nts_notices SET grantor = NULL, is_active = false, "
+                       "privacy_suppression_id = :r WHERE id = :n"),
+                  {"r": _rule_row(), "n": notice_id})
+        s.commit()
+
+
+def _point_at_its_notice(ids: dict) -> None:
+    """Give the fixture's lead the trustee-sale scraper's nts_source contract."""
+    with SyncSessionLocal() as s:
+        auction = s.execute(text("SELECT auction_date FROM nts_notices WHERE id = :n"),
+                            {"n": ids["notice"]}).scalar_one()
+        s.execute(text(
+            "UPDATE results SET enrichment_data = CAST(:e AS json) WHERE id = :r"),
+            {"r": ids["result"], "e": json.dumps({"nts_source": {
+                "notice_id": ids["notice"], "auction_date": auction.isoformat(),
+                "ts_number": "T"}})})
+        s.commit()
+
+
+def test_the_finalizer_never_writes_a_withheld_notices_auction_data():
+    from src.workers.trustee_sale_finalize import (
+        TrusteeSaleFinalizeError,
+        finalize_trustee_sale_job,
+    )
+
+    control = _scenario(past=False, withheld=False)
+    withheld = _scenario(past=False, withheld=False)
+    try:
+        _point_at_its_notice(control)
+        _point_at_its_notice(withheld)
+        _withhold(withheld["notice"])
+        with SyncSessionLocal() as s:
+            finalize_trustee_sale_job(s, control["job"], control["user"])
+            s.commit()
+        assert _matched(control) == control["notice"]
+        with pytest.raises(TrusteeSaleFinalizeError), SyncSessionLocal() as s:
+            finalize_trustee_sale_job(s, withheld["job"], withheld["user"])  # fails closed
+        assert _matched(withheld) is None
+    finally:
+        _cleanup(control)
+        _cleanup(withheld)
+
+
+def test_snohomish_leads_built_from_the_pdf_drop_a_withheld_notice():
+    from src.db.models import NtsNotice
+    from src.scrapers.base_scraper import ScrapedRecord
+    from src.scrapers.snohomish_wa_pre_foreclosure import _without_withheld_notices
+
+    tag = uuid.uuid4().hex[:8]
+    kept_ts, gone_ts = f"TEST-K-{tag}", f"TEST-W-{tag}"
+    ids = []
+    with SyncSessionLocal() as s:
+        for ts in (kept_ts, gone_ts):
+            n = NtsNotice(id=str(uuid.uuid4()), source="snohomish_tribune", ts_number=ts,
+                          county="snohomish", state="WA", grantor="DOE JANE",
+                          auction_date=date.today() + timedelta(days=20), is_active=True)
+            s.add(n)
+            ids.append(n.id)
+        s.commit()
+    try:
+        _withhold(ids[1])
+        records = [ScrapedRecord(party_name="DOE JANE", enrichment_data={"ts_number": ts})
+                   for ts in (kept_ts, gone_ts)]
+        kept = _without_withheld_notices(records)
+        assert [r.enrichment_data["ts_number"] for r in kept] == [kept_ts]
+    finally:
+        with SyncSessionLocal() as s:
+            s.execute(text("DELETE FROM nts_notices WHERE id = ANY(CAST(:i AS uuid[]))"),
+                      {"i": ids})
+            s.commit()

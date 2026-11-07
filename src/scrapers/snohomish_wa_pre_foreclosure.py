@@ -157,6 +157,34 @@ def _record_from_notice(parsed: dict) -> ScrapedRecord:
     return rec
 
 
+def _without_withheld_notices(records: list[ScrapedRecord]) -> list[ScrapedRecord]:
+    """Drop every lead whose notice the NTS cache holds as privacy-withheld (migration
+    132). This scraper reads the same Tribune notices the crawler caches, but builds
+    leads straight from the PDF, so a notice whose grantor a rule withholds must be
+    matched back to its cached row: a later issue the parser cannot read the grantor
+    from would otherwise yield a nameless lead carrying that person's property, which
+    authorize() cannot match. Counts only in the log."""
+    ts_numbers = sorted({r.enrichment_data.get("ts_number") for r in records
+                         if r.enrichment_data.get("ts_number")})
+    if not ts_numbers:
+        return records
+    from sqlalchemy import text as _sa_text
+
+    from src.db.session import system_sync_session
+
+    with system_sync_session() as db:
+        withheld = {row[0] for row in db.execute(_sa_text(
+            "SELECT ts_number FROM nts_notices WHERE source = :s "
+            "AND ts_number = ANY(CAST(:ts AS text[])) AND privacy_suppression_id IS NOT NULL"),
+            {"s": _SOURCE, "ts": ts_numbers}).all()}
+    if not withheld:
+        return records
+    kept = [r for r in records if r.enrichment_data.get("ts_number") not in withheld]
+    _logger.info("Snohomish Tribune: %d notice(s) withheld under privacy requests",
+                 len(records) - len(kept))
+    return kept
+
+
 class SnohomishWAPreForeclosureScraper(BridgeScraper):
     """Scrapes Notice-of-Trustee-Sale leads from the Snohomish County Tribune PDF."""
 
@@ -228,6 +256,7 @@ class SnohomishWAPreForeclosureScraper(BridgeScraper):
         )
         if partial:
             _logger.warning("Snohomish Tribune: partial coverage, %s (%s)", partial, pdf_url)
+        records = _without_withheld_notices(records)
         _logger.info("Snohomish pre_foreclosure complete — %d blocks → %d leads", len(blocks), len(records))
         if self.on_progress:
             # No unit denominator: this connector does one search, so "1 of 1"

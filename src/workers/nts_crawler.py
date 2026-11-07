@@ -16,7 +16,7 @@ from __future__ import annotations
 import time
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import and_, case
+from sqlalchemy import and_, case, false, null
 from sqlalchemy import text as _sa_text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
@@ -668,6 +668,43 @@ _COALESCE_ON_UPDATE = frozenset({
 })
 
 
+def _privacy_gate(db, row: dict) -> dict:
+    """The notice to write under the privacy rules (Phase 6 P5e2, migration 132).
+
+    The grantor is authorized as the trustee-sale lead it becomes (party on the
+    notice's parcel). It is THIS crawl's grantor, or the stored one when the parser
+    could not read it, so a crawl that misses the name cannot slip past a rule.
+    WITHHELD or REVIEW: no grantor, inactive, the rule's id; the upsert keeps that
+    state on every later crawl. One snapshot per notice, read in a SAVEPOINT;
+    RuleSnapshotError propagates and nothing is written."""
+    from src.privacy.authorize import ROW_COLUMNS, authorize, load_rule_snapshot
+
+    with db.begin_nested():
+        snapshot = load_rule_snapshot(db)
+    row = {**row, "privacy_suppression_id": None}
+    if not snapshot.by_anchor:
+        return row
+    stored = db.execute(
+        _sa_text("SELECT grantor, parcel, county, state FROM nts_notices "
+                 "WHERE source = :source AND ts_number = :ts"),
+        {"source": row["source"], "ts": row["ts_number"]},
+    ).first()
+
+    def _pick(key: str):
+        return row.get(key) or (getattr(stored, key) if stored is not None else None)
+
+    grantor = _pick("grantor")
+    if not grantor:
+        return row
+    lead = dict.fromkeys(ROW_COLUMNS) | {"parcel_id": _pick("parcel"), "party_name": grantor}
+    decision = authorize(snapshot, lead, record_type="trustee_sale",
+                         county=_pick("county"), state=_pick("state"))
+    if decision.deliverable:
+        return row
+    return {**row, "grantor": None, "is_active": False,
+            "privacy_suppression_id": decision.suppression_ids[0]}
+
+
 def _upsert_notice(db, model, row: dict, *, deed_reference: str | None = None) -> None:
     """Upsert one notice on (source, ts_number); refresh all mutable fields.
 
@@ -702,6 +739,7 @@ def _upsert_notice(db, model, row: dict, *, deed_reference: str | None = None) -
     # script cannot disagree (Codex). None for any non-PDF source URL.
     row = {**row, "id": str(uuid4())}
     row.setdefault("issue_date", issue_date_from_url(row.get("source_url")))
+    row = _privacy_gate(db, row)
     stmt = pg_insert(model).values(**row)
     # A back issue read after a newer one must not put the newer one's values back
     # (a postponed sale reverting to its original date). Only PDF rows carry an
@@ -732,6 +770,15 @@ def _upsert_notice(db, model, row: dict, *, deed_reference: str | None = None) -
             else_=model.principal_owing_basis,
         )
     update_cols["issue_date"] = _func.greatest(model.issue_date, stmt.excluded.issue_date)
+    # A notice that carries a privacy rule stays withheld whatever this crawl read: no
+    # grantor (not COALESCEd back), inactive (so no lead is built from it), the rule
+    # kept. Lifting a rule is P7. Migration 132's CHECK enforces the same.
+    held = _func.coalesce(model.privacy_suppression_id, stmt.excluded.privacy_suppression_id)
+    update_cols["privacy_suppression_id"] = held
+    update_cols["grantor"] = case((held.isnot(None), null()),
+                                  else_=update_cols.get("grantor", model.grantor))
+    update_cols["is_active"] = case((held.isnot(None), false()),
+                                    else_=update_cols.get("is_active", model.is_active))
     stmt = stmt.on_conflict_do_update(
         constraint="uq_nts_notices_source_ts", set_=update_cols
     )
@@ -796,6 +843,7 @@ _RESWEEP_SELECT = _sa_text(
     """
     SELECT id, ts_number, source_url FROM nts_notices
     WHERE source = :source AND is_active AND auction_date >= :today
+      AND privacy_suppression_id IS NULL  -- never re-read a withheld notice (132)
       -- An amount with no basis was parsed before migration 128: re-read it once so
       -- it stops showing as an amount of unknown type.
       AND (principal_owing IS NULL OR principal_owing_basis IS NULL)

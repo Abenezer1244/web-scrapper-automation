@@ -209,9 +209,15 @@ def _fill_king_owners_from_store(db, rows) -> int:
     Every row passed counts, duplicates included: no King request is made, and a
     duplicate can still be promoted and delivered after enrichment. `found` names a
     blank or placeholder lead; `not_on_record` settles it. Either way the lead's retry
-    marker is cleared, as owner recovery does. Caller commits. Returns rows changed."""
+    marker is cleared, as owner recovery does. A privacy tombstone (`privacy_withheld`)
+    names no one: it settles the lead and FLAGS it with the tombstone's rule, because
+    the lead carries the withheld owner's property and mailing and authorize() cannot
+    match a nameless row (owner_recovery's cache fill does the same). Caller commits.
+    Returns rows changed."""
+    from datetime import UTC, datetime
+
     from src.scrapers.king_wa_tax_delinquent import is_tax_placeholder_party
-    from src.workers.owner_recovery import fresh_answers
+    from src.workers.owner_recovery import PRIVACY_WITHHELD, fresh_answers
 
     def _ed(res) -> dict:
         return dict(res.enrichment_data) if isinstance(res.enrichment_data, dict) else {}
@@ -219,6 +225,7 @@ def _fill_king_owners_from_store(db, rows) -> int:
     waiting = [
         res for res in rows
         if res.parcel_id
+        and res.privacy_suppressed_at is None
         and (not res.party_name or is_tax_placeholder_party(res.party_name))
         and _ed(res).get(OWNER_OUTCOME_KEY) != OWNER_NOT_ON_RECORD
     ]
@@ -227,15 +234,20 @@ def _fill_king_owners_from_store(db, rows) -> int:
     answers = fresh_answers(db, {res.parcel_id.strip() for res in waiting})
     changed = 0
     for res in waiting:
-        outcome, owner = answers.get(res.parcel_id.strip(), (None, None))
-        if outcome not in ("found", "not_on_record"):
+        outcome, owner, suppression_id = answers.get(res.parcel_id.strip(), (None, None, None))
+        if outcome not in ("found", "not_on_record", PRIVACY_WITHHELD) or (
+                outcome == PRIVACY_WITHHELD and not suppression_id):  # never half a pair
             continue
         ed = _ed(res)
         if outcome == "found":
             res.party_name = owner
+        elif outcome == PRIVACY_WITHHELD:
+            res.privacy_suppressed_at = datetime.now(UTC)
+            res.privacy_suppression_id = suppression_id
+            ed["owner_recovery_outcome"] = PRIVACY_WITHHELD
         else:
             ed[OWNER_OUTCOME_KEY] = OWNER_NOT_ON_RECORD
-        if OWNER_DEFERRED_KEY in ed or outcome == "not_on_record":
+        if OWNER_DEFERRED_KEY in ed or outcome in ("not_on_record", PRIVACY_WITHHELD):
             ed[OWNER_DEFERRED_KEY] = False
         ed.pop(OWNER_DEFERRED_REASON_KEY, None)
         res.enrichment_data = ed
@@ -1874,6 +1886,8 @@ def _run_inline_enrichment(
         needs = [
             res for res in lookup_rows
             if res.parcel_id and len(res.parcel_id.strip()) >= 6
+            # A privacy-withheld lead (its owner tombstoned above) gets no county request.
+            and res.privacy_suppressed_at is None
             and (not res.mailing_address
                  or (is_tax_delinquent and not res.party_name
                      # Settled: its own county page showed no owner.
@@ -2350,6 +2364,8 @@ def _run_inline_enrichment(
                 # digit-free id is dropped there unasked, and marking it "deferred"
                 # would promise a lookup that can never happen.
                 and any(c.isdigit() for c in res.parcel_id)
+                # Privacy-withheld (its owner tombstoned): never asked about again.
+                and res.privacy_suppressed_at is None
                 and (not res.party_name or is_tax_placeholder_party(res.party_name))
                 # Settled: the parcel's own county page named it and showed no owner.
                 # Asking again spends a request on the same answer.

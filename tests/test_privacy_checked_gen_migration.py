@@ -40,7 +40,7 @@ def test_the_checked_generation_column_defaults_to_never_checked(conn):
         "SELECT data_type, is_nullable, column_default FROM information_schema.columns "
         "WHERE table_schema = 'public' AND table_name = 'results' "
         "AND column_name = 'privacy_checked_gen'")).one()
-    assert (row.data_type, row.is_nullable) == ("integer", "NO")
+    assert (row.data_type, row.is_nullable) == ("bigint", "NO")
     assert row.column_default == "0"
 
 

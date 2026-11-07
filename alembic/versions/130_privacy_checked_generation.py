@@ -43,7 +43,6 @@ Revision ID: 130
 Revises: 129
 Create Date: 2026-11-07
 """
-import sqlalchemy as sa
 from alembic import op
 from sqlalchemy import text
 
@@ -67,10 +66,14 @@ _OUTCOME_CHECK = "ck_king_parcel_owners_outcome"
 
 
 def upgrade() -> None:
+    # Every step before the index is idempotent: autocommit_block() commits them, so a
+    # failed index build leaves them applied with 130 unrecorded, and the retry re-runs
+    # them (Codex).
     op.execute(text("SET LOCAL lock_timeout = '5s'"))
-    op.add_column("results", sa.Column("privacy_checked_gen", sa.Integer(), nullable=False,
-                                       server_default=sa.text("0")))
-    op.execute(text(f"ALTER TABLE public.king_parcel_owners DROP CONSTRAINT {_OUTCOME_CHECK}"))
+    op.execute(text("ALTER TABLE public.results ADD COLUMN IF NOT EXISTS "
+                    "privacy_checked_gen bigint NOT NULL DEFAULT 0"))
+    op.execute(text(
+        f"ALTER TABLE public.king_parcel_owners DROP CONSTRAINT IF EXISTS {_OUTCOME_CHECK}"))
     op.execute(text(
         f"ALTER TABLE public.king_parcel_owners ADD CONSTRAINT {_OUTCOME_CHECK} "
         "CHECK (outcome IN ('found', 'not_on_record', 'privacy_withheld')) NOT VALID"
@@ -90,7 +93,13 @@ def downgrade() -> None:
     with op.get_context().autocommit_block():
         op.get_bind().execute(text(f"DROP INDEX CONCURRENTLY IF EXISTS public.{_INDEX}"))
     op.execute(text("SET LOCAL lock_timeout = '5s'"))
-    op.execute(text("DELETE FROM public.king_parcel_owners WHERE outcome = 'privacy_withheld'"))
+    # Never silently delete a tombstone: it is what keeps a withheld owner's name out
+    # of the shared store. A database holding one must be cleaned by a human first.
+    if op.get_bind().execute(text(
+            "SELECT 1 FROM public.king_parcel_owners WHERE outcome = 'privacy_withheld' "
+            "LIMIT 1")).first():
+        raise RuntimeError("king_parcel_owners holds privacy_withheld tombstones; "
+                           "refusing to downgrade 130")
     op.execute(text(f"ALTER TABLE public.king_parcel_owners DROP CONSTRAINT {_OUTCOME_CHECK}"))
     op.execute(text(
         f"ALTER TABLE public.king_parcel_owners ADD CONSTRAINT {_OUTCOME_CHECK} "

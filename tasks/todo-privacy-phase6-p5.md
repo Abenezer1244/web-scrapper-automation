@@ -85,6 +85,25 @@ until P7; each must still be correct the moment a rule activates.
 - [ ] P5g late delivery authorize-before-grant + repair script actionable_sql + authorize.
 - [ ] P5h cache copies + ingest authorizes with the incoming contacts.
 
+## Review log
+
+- P5a Codex GO. Then found myself: two P4 call sites pass authorize() a column PROJECTION
+  (skip_trace_dispatcher person_cols, tracerfy_ingest) without enrichment_data, so the new
+  owner subject read as absent = allow. Fixed both; authorize() now refuses (RuleSnapshotError)
+  a Mapping row missing any of ROW_COLUMNS while a rule is active, so a future projection
+  bug fails closed.
+- 130 Codex NO-GO round 1, adopted: idempotent pre-index steps (verified by simulating a
+  partial apply then `upgrade head`), bigint, downgrade refuses while tombstones exist.
+  Codex High "old readers mishandle privacy_withheld": no writer exists until P5e, so the
+  reader fixes (exclude fresh tombstones from `_CANDIDATE_PARCELS_SQL`, terminal in
+  `_fill_from_store` / `_fill_king_owners_from_store` / `fresh_answers`) ship IN P5e with
+  the writer, with tests proving no county request and no name write.
+  Generation source: kept "count of active rule rows" read in the SAME statement as the
+  snapshot (a separate sequence could disagree with the snapshot it labels); history tests
+  ship with enforce_rows (P5c).
+- Local: tests/test_cv_late_dialer.py 3 tests need Redis (Celery .delay); none local. They
+  fail identically without these changes; CI has Redis.
+
 ## Write-path manifest (each row ends with its gate + test)
 | Writer | Store | Gate |
 |---|---|---|

@@ -1965,6 +1965,11 @@ class NtsNotice(Base):
     is_active = Column(Boolean, nullable=False, server_default=text("true"))
     fetched_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    # Migration 132: the privacy rule that withholds this notice's grantor. While set,
+    # the notice has no grantor and is inactive (CHECK); every reader skips it.
+    privacy_suppression_id = Column(
+        UUID(as_uuid=False), ForeignKey("privacy_suppressions.id", ondelete="RESTRICT"),
+        nullable=True)
 
 
 class ExternalSourceHealth(Base):

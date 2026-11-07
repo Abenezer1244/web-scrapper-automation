@@ -167,6 +167,7 @@ _REFRESH_MATCHED_SQL = """
       AND j.id = r.job_id AND sc.id = j.scraper_config_id
       AND sc.record_type = 'pre_foreclosure'
       AND n.is_active AND n.auction_date >= :today
+      AND n.privacy_suppression_id IS NULL
       AND (r.auction_date IS DISTINCT FROM n.auction_date
            OR (n.principal_owing IS NOT NULL
                AND (r.default_amount IS DISTINCT FROM n.principal_owing
@@ -279,6 +280,7 @@ def _match_and_write(
         _sa_text(
             _COLS + """
             WHERE is_active AND auction_date IS NOT NULL AND auction_date >= :today
+              AND privacy_suppression_id IS NULL
               AND lower(county) = :county
             ORDER BY auction_date ASC, id
             """
@@ -299,6 +301,8 @@ def _match_and_write(
         _sa_text(
             _COLS + """
             WHERE auction_date IS NOT NULL AND auction_date < :today
+              -- A privacy-withheld notice (132) is never attached, past or live.
+              AND privacy_suppression_id IS NULL
               AND auction_date >= :floor AND lower(county) = :county
               AND fetched_at IS NOT NULL AND fetched_at >= :stale_before
             ORDER BY auction_date DESC

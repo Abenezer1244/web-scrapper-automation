@@ -31,8 +31,9 @@ Callers treat REVIEW exactly like WITHHELD until an operator decides (P7).
 ANCHORS: the property PARCEL (keys.property_anchor_value), every phone and every email
 on the row. Street addresses are never an automatic anchor (keys.py says why).
 SUBJECTS: ``party_name`` (role party) and ``heirs`` (role heir), read in the source's
-declared name order. Owner-of-record and grantor fields have no generic column; their
-allowlisted row adapter is a P5 prerequisite and blocks activation (P7).
+declared name order, plus every OWNER-OF-RECORD name a customer receives from
+``enrichment_data`` (``_OWNER_OF_RECORD_KEYS``; exported as "current_owner"). A
+trustee sale's grantor IS its party_name (src/scrapers/trustee_sale.py).
 
 ACCESS: migration 125 revokes privacy_suppressions from every runtime role. Workers
 load rules through ``public.privacy_rule_rows()`` (migration 129, SECURITY DEFINER,
@@ -72,6 +73,14 @@ _HISTORIES = {
     ("pending", "active", "lifted"): False,
 }
 _AUTOMATIC_ANCHOR_KINDS = frozenset({"property", "phone", "email"})
+
+# Every enrichment_data key holding an owner-of-record name that is delivered to a
+# customer (src/utils/lead_export.py). Today only the King Assessor's current owner
+# (written in tasks_helpers/enrich.py); a new owner key must be added here.
+_OWNER_OF_RECORD_KEYS = ("assessor_current_owner",)
+# The Assessor's owner feed is the one tax-delinquent party_name comes from, so it is
+# read in that source's declared order.
+_OWNER_OF_RECORD_ORDER_SOURCE = "tax_delinquent"
 
 # Through migration 129's SECURITY DEFINER function, never the table: the worker role
 # holds no table privilege, and RLS (no policy) would show it zero rows, i.e. allow all.
@@ -207,10 +216,20 @@ def _subjects(row: Any, record_type: str | None, county: str | None):
     from src.utils.lead_export import name_order_for
 
     order = name_order_for(record_type, county)
-    return (subjects_from(_get(row, "party_name"), role="party", source_field="party_name",
-                          name_order=order)
-            + subjects_from(_get(row, "heirs"), role="heir", source_field="heirs",
-                            name_order=order))
+    subjects = (subjects_from(_get(row, "party_name"), role="party", source_field="party_name",
+                              name_order=order)
+                + subjects_from(_get(row, "heirs"), role="heir", source_field="heirs",
+                                name_order=order))
+    enrichment = _get(row, "enrichment_data")
+    if isinstance(enrichment, Mapping):
+        owner_order = name_order_for(_OWNER_OF_RECORD_ORDER_SOURCE, county)
+        for key in _OWNER_OF_RECORD_KEYS:
+            value = enrichment.get(key)
+            if value is not None:  # never skipped by type: subjects_from reads str(value)
+                subjects += subjects_from(value, role="owner_of_record",
+                                          source_field=f"enrichment_data.{key}",
+                                          name_order=owner_order)
+    return subjects
 
 
 def _hmac(kind: str, value: str, version: str) -> str:

@@ -1,0 +1,117 @@
+# Phase 6 P5: write-path gates + enforcer sweep
+
+Owner approved P5 on 2026-11-07 ("approved"). Design: docs/legal/audit-2026-11/06-DESIGN-PRIVACY-REQUESTS-AND-SUPPRESSION.md
+section 6 ("Write paths"). Merge rule: CI green + Codex GO per slice. Branch feat/privacy-phase6-p5.
+No rule can be active before P7 (migration 125 guard), so every gate below is dormant in prod
+until P7; each must still be correct the moment a rule activates.
+
+## Facts found before planning (write-path inventory, 2026-11-07)
+
+- `authorize._subjects` reads only party_name (party) and heirs (heir). Exports also deliver
+  `enrichment_data.assessor_current_owner` as "current_owner" (lead_export.py:690, written at
+  enrich.py:2061). That is the owner-of-record subject the adapter must add. Trustee-sale
+  party_name IS the NTS grantor (trustee_sale.py:170), so grantor is covered via party_name.
+- `results` has NO updated_at: the sweep cannot be incremental by watermark.
+- Insert: one site, tasks.py:1349 (`pg_insert(Result).on_conflict_do_nothing`, batches of 1000,
+  rls_sync_session). `records` is list[ScrapedRecord] (no contacts); record_type/county/state
+  from config. Living-TOD filter at tasks.py:1156 is the drop precedent.
+- UPDATE writers with NO privacy predicate: owner_recovery `_CACHE_FILL_SQL`/`_write`,
+  cv_owner_recovery (held branch), pierce_cv_owner_recovery, pierce_atip_owner.write_owner_decisions,
+  mailing_recovery `_write_row`, cv_mailing_recovery.write_row, property_recovery `_write`,
+  dedup `_apply_survivor_merge` (heirs!), enrich `_reuse_enrichment_for_duplicates` (2 stmts),
+  enrich `_fill_king_owners_from_store`, inline enrichment owner/mailing fills.
+- Flag-only (no authorize): copy_cached_answer, `_settle_queued_from_known_answers`,
+  cv_late_delivery (`grant_records` bills before any authorize).
+- Shared stores: king_parcel_owners (`_STORE_SQL`, keyed by PIN, fans out to every tenant);
+  nts_notices (`_upsert_notice`, grantor COALESCE'd so an erasure is undone by the next crawl).
+  county_records has no writer.
+- Ingest (P4d) authorizes on the lead's stored contacts, not the incoming answer's.
+- scripts/repair_orphaned_duplicate_flags.py ranks winners with no actionable predicate (gap 8c).
+- Fence (migration 113): UPDATE takes no users lock and never refuses; privacy columns are not
+  fenced, so the sweep can flag rows of a purging account. cv_late_delivery locks rows then users.
+
+## Slices (each <= 5 files, own PR, CI green + Codex GO before merge)
+
+- [ ] **P5a owner-of-record adapter.** `authorize._subjects` adds
+  `enrichment_data.assessor_current_owner` (role owner_of_record, allowlisted keys in one tuple).
+  Files: authorize.py, test. Activation blocker cleared.
+- [ ] **P5b enforcer sweep (beat).** New `src/workers/privacy_enforcer.py`: load snapshot; if no
+  active rules, return (one query). Else keyset-scan unflagged results (ORM, decrypted contacts)
+  joined to job/config for record_type/county/state; authorize; flag non-ALLOWED with
+  `UPDATE ... SET privacy_suppressed_at, privacy_suppression_id WHERE id=ANY AND
+  privacy_suppressed_at IS NULL`. Redis single-flight lock; no users lock. Never clears a flag
+  (lifting is P7). Files: privacy_enforcer.py, scheduler.py, workers/__init__.py, settings, test.
+- [ ] **P5c insert gate.** run_scrape_job: load snapshot once before the insert loop
+  (RuleSnapshotError fails the job, retryable), authorize each record, DROP non-ALLOWED before
+  insert like the TOD filter, log counts only. Files: tasks.py, test.
+- [ ] **P5d shared stores.** store_answers/_store: authorize {parcel_id, party_name=owner}; a
+  withheld owner name is not stored. _upsert_notice: a withheld grantor is written as NULL and
+  never restored. Files: owner_recovery.py, nts_crawler.py, tests.
+- [ ] **P5e recovery-writer predicate** (two commits of <= 5 files): `AND privacy_suppressed_at
+  IS NULL` on every UPDATE listed above. Static test that each writer's SQL carries it + one
+  real-DB test.
+- [ ] **P5f late delivery + repair script:** `_deliver_one` authorizes before `grant_records`
+  (non-ALLOWED -> flag, never billed); repair script uses `actionable_sql`.
+- [ ] **P5g cache copies + ingest incoming contacts:** copy_cached_answer,
+  `_settle_queued_from_known_answers` and ingest authorize the row WITH the contacts about to be
+  written.
+
+## Codex consult (2026-11-07): APPROVE WITH CHANGES, all adopted (design silent -> Codex wins)
+
+- Q1 insert gate drops every non-ALLOWED record (REVIEW too), counts only in logs.
+- Q2 no sweep lag for writers that ADD a subject or contact: each authorizes the post-write row
+  in the same transaction via one shared helper `src/privacy/enforce.py::enforce_rows(db,
+  snapshot, result_ids)` (flags non-ALLOWED atomically, stamps the checked generation). The
+  sweep is the backstop and reuses the helper.
+- Q3 no indefinite full scan: migration 130 adds `results.privacy_checked_gen` (bigint) +
+  partial index WHERE privacy_suppressed_at IS NULL. Generation = number of rule rows (the
+  table is append-only, every state change is a row, so it only grows). Sweep scans rows whose
+  gen is stale; writers that change subjects reset or stamp it.
+- Q4 king_parcel_owners: outcome 'privacy_withheld' (no owner name) widened in 130's CHECK.
+  Clearing it when a rule is lifted is P7 (lifting).
+- Fence (Codex High): the helper and the sweep skip rows of accounts that are purging/deleted
+  (app-level refusal), lock order users -> rows preserved (no users lock taken).
+- Critical x2 (late delivery bills first; repair script promotes suppressed rows) -> P5g.
+- High: an explicit write-path MANIFEST (below) and a test per writer, not a static SQL grep.
+
+## Revised slices (supersede the list above)
+
+- [ ] P5a owner-of-record adapter (authorize.py + tests: exact, unresolved, missing, entity, co-owner).
+- [ ] P5b migration 130 + `snapshot.generation` + `src/privacy/enforce.py` + tests.
+- [ ] P5c enforcer beat (privacy_enforcer.py, scheduler.py, workers/__init__.py, test).
+- [ ] P5d insert gate (tasks.py + test).
+- [ ] P5e shared stores (owner_recovery store, nts_crawler upsert: blank + refuse grantor).
+- [ ] P5f writers, inline enforce (2-3 PRs by manifest).
+- [ ] P5g late delivery authorize-before-grant + repair script actionable_sql + authorize.
+- [ ] P5h cache copies + ingest authorizes with the incoming contacts.
+
+## Write-path manifest (each row ends with its gate + test)
+| Writer | Store | Gate |
+|---|---|---|
+| tasks.run_scrape_job insert | results | P5d drop |
+| owner_recovery._CACHE_FILL_SQL, _write | results.party_name | P5f enforce_rows |
+| owner_recovery.store_answers/_store | king_parcel_owners | P5e tombstone |
+| cv_owner_recovery._write | results.party_name | P5f |
+| pierce_cv_owner_recovery._write | results.party_name | P5f |
+| pierce_atip_owner.write_owner_decisions | results.party_name | P5f |
+| mailing_recovery._write_row, cv_mailing_recovery.write_row | results.mailing_address | P5f predicate |
+| property_recovery._write | results.property_address | P5f predicate |
+| dedup._apply_survivor_merge | results.heirs/enrichment_data | P5f |
+| enrich._reuse_enrichment_for_duplicates (2) | results contacts | P5f |
+| enrich._fill_king_owners_from_store, inline owner fills, king_parcel_locate.apply_owner_names | results.party_name, enrichment_data owner | P5f |
+| nts_crawler._upsert_notice | nts_notices.grantor | P5e |
+| cv_late_delivery._deliver_one | billing + unhold | P5g |
+| scripts/repair_orphaned_duplicate_flags.py | delivered_records, is_duplicate | P5g |
+| enrich.copy_cached_answer, skip_trace_dispatcher._settle_queued_from_known_answers | results contacts | P5h |
+| tracerfy_ingest (incoming contacts) | results contacts, cache | P5h |
+
+## Open questions for Codex (answered above)
+1. Insert gate: drop non-ALLOWED (TOD precedent, PII never stored again) or insert flagged?
+   REVIEW too?
+2. Window: a writer that ADDS a subject (owner fill, heirs merge) can make an unflagged row
+   suppressible; reads see it until the next sweep. Accept sweep lag, or authorize inline in
+   those writers too?
+3. Sweep cost: full scan of unflagged rows per tick while any rule is active (no updated_at).
+   Acceptable, or add a column/trigger?
+4. king_parcel_owners outcome for a withheld owner (avoid re-querying the county forever).
+5. Anything missed.

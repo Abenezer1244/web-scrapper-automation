@@ -264,6 +264,57 @@ def test_an_entity_rule_matches_the_entity_on_the_row():
     assert d.outcome == WITHHELD
 
 
+# ── owner of record (enrichment_data, exported as "current_owner") ───────────
+
+def _owned(owner, **over):
+    return _row(party_name="JONES MARY", enrichment_data={"assessor_current_owner": owner,
+                                                          "title_status": "differs"}, **over)
+
+
+def test_the_rules_person_as_owner_of_record_is_withheld():
+    rows = _history(["pending", "active"])
+    d = authorize(_snap(rows), _owned("SMITH JOHN"), **_CTX)
+    assert d.outcome == WITHHELD and d.suppression_ids == (rows[1]["id"],)
+
+
+def test_an_owner_of_record_co_owner_withholds_the_whole_row():
+    d = authorize(_snap(_history(["pending", "active"])), _owned("DOE JANE & SMITH JOHN"), **_CTX)
+    assert d.outcome == WITHHELD
+
+
+def test_an_entity_owner_of_record_matches_an_entity_rule():
+    rows = _history(["pending", "active"], subject=("entity", "smith family trust"))
+    assert authorize(_snap(rows), _owned("SMITH FAMILY TRUST"), **_CTX).outcome == WITHHELD
+
+
+def test_an_unreadable_owner_of_record_on_the_rules_property_goes_to_review():
+    d = authorize(_snap(_history(["pending", "active"])), _owned("ИВАНОВ ИВАН"), **_CTX)
+    assert (d.outcome, d.reason) == (REVIEW, REVIEW_UNRESOLVED_SUBJECT)
+
+
+def test_the_rules_person_as_owner_without_its_anchor_goes_to_review():
+    d = authorize(_snap(_history(["pending", "active"])), _owned("SMITH JOHN", parcel_id=None),
+                  **_CTX)
+    assert (d.outcome, d.reason) == (REVIEW, REVIEW_SUBJECT_WITHOUT_ANCHOR)
+
+
+@pytest.mark.parametrize("enrichment", [None, {}, {"assessor_current_owner": None},
+                                        {"title_status": "differs"}, "not a mapping"])
+def test_no_owner_of_record_leaves_the_decision_to_the_other_subjects(enrichment):
+    snapshot = _snap(_history(["pending", "active"]))
+    other = _row(party_name="JONES MARY", enrichment_data=enrichment)
+    assert authorize(snapshot, other, **_CTX).outcome == ALLOWED
+    named = _row(enrichment_data=enrichment)  # party_name SMITH JOHN
+    assert authorize(snapshot, named, **_CTX).outcome == WITHHELD
+
+
+def test_a_scraped_record_is_read_by_attribute_including_its_owner():
+    from src.scrapers.base_scraper import ScrapedRecord
+    rec = ScrapedRecord(party_name="JONES MARY", parcel_id="123456-7890",
+                        enrichment_data={"assessor_current_owner": "SMITH JOHN"})
+    assert authorize(_snap(_history(["pending", "active"])), rec, **_CTX).outcome == WITHHELD
+
+
 def test_the_primary_phone_and_email_are_anchors():
     phone = _history(["pending", "active"], anchor=("phone", "2065551234"))
     email = _history(["pending", "active"], anchor=("email", "jsmith@example.test"))

@@ -235,7 +235,8 @@ def _fill_king_owners_from_store(db, rows) -> int:
     changed = 0
     for res in waiting:
         outcome, owner, suppression_id = answers.get(res.parcel_id.strip(), (None, None, None))
-        if outcome not in ("found", "not_on_record", PRIVACY_WITHHELD):
+        if outcome not in ("found", "not_on_record", PRIVACY_WITHHELD) or (
+                outcome == PRIVACY_WITHHELD and not suppression_id):  # never half a pair
             continue
         ed = _ed(res)
         if outcome == "found":

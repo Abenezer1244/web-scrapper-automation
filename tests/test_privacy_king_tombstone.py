@@ -115,6 +115,50 @@ async def test_the_scrape_jobs_store_fill_flags_and_settles_without_a_name(db, b
     assert await _flag(db, rid) == (True, rule)
 
 
+async def test_a_lead_still_named_by_kings_placeholder_is_flagged_too(
+    db, business_user, monkeypatch,
+):
+    from decimal import Decimal
+
+    from src.scrapers.king_wa_tax_delinquent import tax_placeholder_party
+
+    rule = await _rule_row(db)
+    _tombstone(_PIN, rule)
+    rid = await _row(db, business_user, await _job(db, business_user), parcel=_PIN,
+                     party=tax_placeholder_party(Decimal("1234"), _PIN))
+    _lease(monkeypatch)
+    assert _county(monkeypatch, {}) == [] and _tick()["privacy_withheld"] == 1
+    assert await _flag(db, rid) == (True, rule)
+
+
+@pytest.mark.parametrize("name", [
+    "Tax Delinquent — $1,234 owed (Parcel 0007200015)",
+    "Tax Delinquent - $5 owed (Parcel X)",
+    "Tax Delinquent — $1,234 owed (Parcel 0007200015) extra",
+    "Tax Delinquents — $1 owed (Parcel 1)",
+    "TAX DELINQUENT — $1 owed (Parcel 1)",
+    "SMITH JOHN",
+    "Tax Delinquent Holdings LLC",
+])
+async def test_the_sql_placeholder_pattern_is_the_python_one(db, name):
+    from src.scrapers.king_wa_tax_delinquent import is_tax_placeholder_party
+
+    matched = (await db.execute(text("SELECT CAST(:n AS text) ~ CAST(:re AS text)"),
+                                {"n": name, "re": orc.TAX_PLACEHOLDER_SQL_RE})).scalar()
+    assert matched is is_tax_placeholder_party(name)
+
+
+async def test_a_later_answer_never_replaces_a_tombstone(db):
+    rule = await _rule_row(db)
+    _tombstone(_PIN, rule, days_old=400)
+    with system_sync_session() as sdb:
+        assert orc.store_answers(sdb, {_PIN: ("found", "SMITH JOHN")}) == 1
+        stored = sdb.execute(text(
+            "SELECT outcome, owner_name, privacy_suppression_id::text FROM king_parcel_owners "
+            "WHERE parcel_id = :p"), {"p": _PIN}).one()
+    assert tuple(stored) == ("privacy_withheld", None, rule)
+
+
 @pytest.mark.parametrize(("outcome", "name", "with_rule"), [
     ("privacy_withheld", None, False),     # a tombstone must name its rule
     ("found", "SMITH JOHN", True),         # only a tombstone carries a rule

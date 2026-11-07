@@ -134,8 +134,43 @@ _ELIGIBLE_ROW = """
 
 # A stored answer stands in for asking King: fresh, or a privacy tombstone at ANY age
 # (the county is never asked for a withheld owner again; lifting a rule is P7).
-_STORED_ANSWER_STANDS = """(k.observed_at > now() - make_interval(days => :fresh_days)
-       OR k.outcome = 'privacy_withheld')"""
+_FRESH_ANSWER = """(k.observed_at > now() - make_interval(days => :fresh_days)
+       AND k.outcome IN ('found', 'not_on_record'))"""
+_STORED_ANSWER_STANDS = f"""({_FRESH_ANSWER} OR k.outcome = 'privacy_withheld')"""
+
+# King's synthetic owner placeholder, the SQL twin of
+# king_wa_tax_delinquent.is_tax_placeholder_party (a test pins the two together).
+TAX_PLACEHOLDER_SQL_RE = r'^Tax Delinquent\y.*?\$[0-9,]+ owed \(Parcel [^)]+\)$'
+
+# A privacy tombstone (130/131): the owner King names is withheld by a rule. Every
+# unflagged King tax lead of that parcel still WAITING for its owner (blank or the
+# placeholder name: exactly the leads an answer would have named) is flagged with the
+# tombstone's rule and settled, whatever its attempts or outcome: the lead carries the
+# withheld owner's property and mailing, and authorize() cannot match a nameless row.
+# Someone else named on the parcel is left alone. A tombstone without a rule (none can
+# exist: 131's CHECK) flags nothing rather than half a pair.
+_TOMBSTONE_FLAG_SQL = """
+    UPDATE results r SET
+      privacy_suppressed_at = now(),
+      privacy_suppression_id = k.privacy_suppression_id,
+      enrichment_data = (
+        ((CASE WHEN jsonb_typeof(r.enrichment_data::jsonb) = 'object'
+               THEN r.enrichment_data::jsonb ELSE '{}'::jsonb END)
+         - 'owner_lookup_deferred_reason')
+        || jsonb_build_object('owner_lookup_deferred', false,
+                              'owner_recovery_outcome', 'privacy_withheld'))::json
+    FROM king_parcel_owners k
+    WHERE k.outcome = 'privacy_withheld' AND k.privacy_suppression_id IS NOT NULL
+      AND k.parcel_id = btrim(r.parcel_id)
+      AND r.privacy_suppressed_at IS NULL
+      AND (r.party_name IS NULL OR btrim(r.party_name) = ''
+           OR r.party_name ~ CAST(:placeholder_re AS text))
+      AND EXISTS (
+        SELECT 1 FROM jobs j JOIN scraper_configs sc ON sc.id = j.scraper_config_id
+        WHERE j.id = r.job_id AND lower(sc.county) = 'king' AND upper(sc.state) = 'WA'
+          AND sc.record_type = 'tax_delinquent')
+    RETURNING r.id
+"""
 
 _KING_TAX_JOB = """
       j.status = 'done'
@@ -170,18 +205,11 @@ _CANDIDATE_PARCELS_SQL = f"""
 
 # Name every waiting lead whose parcel has a fresh stored answer, in one statement
 # and without asking King. Same eligibility as every other write; the payload is
-# what `_write` stores for the same outcome. RETURNING feeds the stats.
-# A privacy tombstone names no one and SETTLES the lead (outcome privacy_withheld), and
-# in the same statement flags it with the tombstone's rule: the lead carries the
-# withheld owner's property and mailing, and authorize() cannot match a nameless row.
+# what `_write` stores for the same outcome. RETURNING feeds the stats. A privacy
+# tombstone is not an answer: _TOMBSTONE_FLAG_SQL runs first and flags its leads.
 _CACHE_FILL_SQL = f"""
     UPDATE results r SET
       party_name = CASE WHEN k.outcome = 'found' THEN k.owner_name ELSE r.party_name END,
-      privacy_suppressed_at = CASE WHEN k.outcome = 'privacy_withheld' THEN now()
-                                   ELSE r.privacy_suppressed_at END,
-      privacy_suppression_id = CASE WHEN k.outcome = 'privacy_withheld'
-                                    THEN k.privacy_suppression_id
-                                    ELSE r.privacy_suppression_id END,
       enrichment_data = (
         ((CASE WHEN jsonb_typeof(r.enrichment_data::jsonb) = 'object'
                THEN r.enrichment_data::jsonb ELSE '{{}}'::jsonb END)
@@ -207,12 +235,12 @@ _CACHE_FILL_SQL = f"""
         JOIN king_parcel_owners k ON k.parcel_id = btrim(r.parcel_id)
         WHERE {_KING_TAX_JOB}
           AND {_ELIGIBLE_ROW}
-          AND {_STORED_ANSWER_STANDS}
+          AND {_FRESH_ANSWER}
           AND (CAST(:parcels AS text[]) IS NULL OR k.parcel_id = ANY(CAST(:parcels AS text[])))
         ORDER BY r.id
         LIMIT :fill_rows)
       AND k.parcel_id = btrim(r.parcel_id)
-      AND {_STORED_ANSWER_STANDS}
+      AND {_FRESH_ANSWER}
       AND {_ELIGIBLE_ROW}
       AND EXISTS (
         SELECT 1 FROM jobs j JOIN scraper_configs sc ON sc.id = j.scraper_config_id
@@ -223,12 +251,16 @@ _CACHE_FILL_SQL = f"""
 # Store one settled eRealProperty answer for its parcel. A newer observation wins;
 # an older one never overwrites it.
 _STORE_SQL = """
-    INSERT INTO king_parcel_owners (parcel_id, outcome, owner_name, observed_at, source)
-    VALUES (:pid, :outcome, :owner, now(), 'erealproperty')
+    INSERT INTO king_parcel_owners (parcel_id, outcome, owner_name, observed_at, source,
+                                    privacy_suppression_id)
+    VALUES (:pid, :outcome, :owner, now(), 'erealproperty', CAST(:rule AS uuid))
     ON CONFLICT (parcel_id) DO UPDATE SET
       outcome = EXCLUDED.outcome, owner_name = EXCLUDED.owner_name,
-      observed_at = EXCLUDED.observed_at, source = EXCLUDED.source
+      observed_at = EXCLUDED.observed_at, source = EXCLUDED.source,
+      privacy_suppression_id = EXCLUDED.privacy_suppression_id
     WHERE EXCLUDED.observed_at > king_parcel_owners.observed_at
+      -- A privacy tombstone is terminal: no later answer replaces it (lifting is P7).
+      AND king_parcel_owners.outcome <> 'privacy_withheld'
 """
 
 _CANDIDATE_ROWS_SQL = f"""
@@ -418,7 +450,8 @@ def _store(db, pid: str, outcome: str, owner: str | None) -> bool:
     if outcome == "found" and not name:
         return False
     try:
-        db.execute(sa_text(_STORE_SQL), {"pid": pid, "outcome": outcome, "owner": name})
+        db.execute(sa_text(_STORE_SQL), {"pid": pid, "outcome": outcome, "owner": name,
+                                         "rule": None})
         db.commit()
         return True
     except Exception as exc:  # noqa: BLE001 -- the row-by-row write still runs
@@ -471,7 +504,7 @@ def store_answers(db, answers: dict[str, tuple[str, str | None]]) -> int:
             continue
         if outcome == "found" and not name:
             continue
-        params.append({"pid": pid, "outcome": outcome, "owner": name})
+        params.append({"pid": pid, "outcome": outcome, "owner": name, "rule": None})
     if not params:
         return 0
     try:
@@ -490,9 +523,13 @@ def _fill_from_store(db, parcels: list[str] | None = None) -> dict[str, int]:
 
     `parcels` None: any parcel (the start of a tick; nothing is charged). A list: the
     parcels King just answered on this tick, so each lead is charged its attempt as
-    `_write` would. Returns rows written per outcome, and `errors` 1 if the fill failed."""
+    `_write` would. Privacy tombstones first, in the same transaction: their waiting
+    leads are flagged, never named (_TOMBSTONE_FLAG_SQL). Returns rows written per
+    outcome, and `errors` 1 if the fill failed."""
     counts = {"found": 0, "not_on_record": 0, "privacy_withheld": 0, "errors": 0}
     try:
+        counts["privacy_withheld"] = len(db.execute(
+            sa_text(_TOMBSTONE_FLAG_SQL), {"placeholder_re": TAX_PLACEHOLDER_SQL_RE}).all())
         written = db.execute(sa_text(_CACHE_FILL_SQL), {
             "max_attempts": _MAX_ATTEMPTS, "fresh_days": _FRESH_DAYS,
             "fill_rows": _CACHE_FILL_ROWS, "now_iso": _now_iso(), "parcels": parcels,
@@ -504,6 +541,7 @@ def _fill_from_store(db, parcels: list[str] | None = None) -> dict[str, int]:
         _logger.warning("Owner recovery: fill from stored answers failed: %s",
                         type(exc).__name__)
         counts["errors"] = 1
+        counts["privacy_withheld"] = 0  # rolled back with the rest
         return counts
     for outcome in written:
         counts[outcome] += 1

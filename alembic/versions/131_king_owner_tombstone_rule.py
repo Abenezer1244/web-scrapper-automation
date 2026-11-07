@@ -42,6 +42,14 @@ _CHECK = "ck_king_parcel_owners_tombstone_rule"
 
 def upgrade() -> None:
     op.execute(text("SET LOCAL lock_timeout = '5s'"))
+    # 130 permitted the outcome but nothing writes it before this PR's successor (P5e2),
+    # so none should exist. One without a rule could never satisfy the CHECK below or
+    # flag a lead: refuse, and let a human decide (Codex).
+    if op.get_bind().execute(text(
+            "SELECT 1 FROM public.king_parcel_owners WHERE outcome = 'privacy_withheld' "
+            "LIMIT 1")).first():
+        raise RuntimeError("king_parcel_owners already holds privacy_withheld rows without "
+                           "a rule; resolve them before applying 131")
     op.execute(text("ALTER TABLE public.king_parcel_owners "
                     "ADD COLUMN IF NOT EXISTS privacy_suppression_id uuid"))
     op.execute(text(f"ALTER TABLE public.king_parcel_owners DROP CONSTRAINT IF EXISTS {_FK}"))

@@ -1210,6 +1210,9 @@ class Result(Base):
         ForeignKey("privacy_suppressions.id", ondelete="RESTRICT"),
         nullable=True,
     )
+    # Migration 130: the rule generation (RuleSnapshot.generation) this row was last
+    # authorized against; the enforcer sweep reads rows behind the current one.
+    privacy_checked_gen = Column(BigInteger, nullable=False, server_default=text("0"))
     # Phase 4 (migration 038): structured tax-delinquency fields for amount/age
     # filtering. Populated SOURCE-GATED (King Socrata tax_delinquent only);
     # other counties' tax rows stay NULL and never match a filter. bill_year is

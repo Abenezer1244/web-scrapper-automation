@@ -31,8 +31,9 @@ Callers treat REVIEW exactly like WITHHELD until an operator decides (P7).
 ANCHORS: the property PARCEL (keys.property_anchor_value), every phone and every email
 on the row. Street addresses are never an automatic anchor (keys.py says why).
 SUBJECTS: ``party_name`` (role party) and ``heirs`` (role heir), read in the source's
-declared name order. Owner-of-record and grantor fields have no generic column; their
-allowlisted row adapter is a P5 prerequisite and blocks activation (P7).
+declared name order, plus every OWNER-OF-RECORD name a customer receives from
+``enrichment_data`` (``_OWNER_OF_RECORD_KEYS``; exported as "current_owner"). A
+trustee sale's grantor IS its party_name (src/scrapers/trustee_sale.py).
 
 ACCESS: migration 125 revokes privacy_suppressions from every runtime role. Workers
 load rules through ``public.privacy_rule_rows()`` (migration 129, SECURITY DEFINER,
@@ -73,6 +74,14 @@ _HISTORIES = {
 }
 _AUTOMATIC_ANCHOR_KINDS = frozenset({"property", "phone", "email"})
 
+# Every enrichment_data key holding an owner-of-record name that is delivered to a
+# customer (src/utils/lead_export.py). Today only the King Assessor's current owner
+# (written in tasks_helpers/enrich.py); a new owner key must be added here.
+_OWNER_OF_RECORD_KEYS = ("assessor_current_owner",)
+# The Assessor's owner feed is the one tax-delinquent party_name comes from, so it is
+# read in that source's declared order.
+_OWNER_OF_RECORD_ORDER_SOURCE = "tax_delinquent"
+
 # Through migration 129's SECURITY DEFINER function, never the table: the worker role
 # holds no table privilege, and RLS (no policy) would show it zero rows, i.e. allow all.
 _LOAD_SQL = text(
@@ -111,10 +120,20 @@ class RuleSnapshot:
     by_anchor: dict[tuple[str, str, str], tuple[_Rule, ...]]   # (kind, version, hmac)
     by_subject: dict[tuple[str, str, str], tuple[_Rule, ...]]  # (kind, version, hmac)
     key_versions: tuple[str, ...]
+    # The number of 'active' rule rows ever written, read in the same statement as the
+    # rules. Rule rows are append-only, so it only grows, and only an activation grows
+    # it: results.privacy_checked_gen below it means "not checked against these rules".
+    generation: int = 0
 
     @property
     def active_rules(self) -> int:
         return len({r.suppression_id for rules in self.by_anchor.values() for r in rules})
+
+
+# Every column authorize() reads. A Mapping row (a column projection) must carry all of
+# them: a projection that silently left one out would read it as empty, i.e. allow.
+ROW_COLUMNS = ("party_name", "heirs", "parcel_id", "phone", "phones", "email", "emails",
+               "enrichment_data")
 
 
 def _get(row: Any, name: str):
@@ -169,6 +188,8 @@ def build_snapshot(rows) -> RuleSnapshot:
         by_anchor={k: tuple(v) for k, v in by_anchor.items()},
         by_subject={k: tuple(v) for k, v in by_subject.items()},
         key_versions=tuple(sorted(versions)),
+        generation=sum(1 for history in groups.values() for h in history
+                       if _get(h, "state") == "active"),
     )
 
 
@@ -207,10 +228,20 @@ def _subjects(row: Any, record_type: str | None, county: str | None):
     from src.utils.lead_export import name_order_for
 
     order = name_order_for(record_type, county)
-    return (subjects_from(_get(row, "party_name"), role="party", source_field="party_name",
-                          name_order=order)
-            + subjects_from(_get(row, "heirs"), role="heir", source_field="heirs",
-                            name_order=order))
+    subjects = (subjects_from(_get(row, "party_name"), role="party", source_field="party_name",
+                              name_order=order)
+                + subjects_from(_get(row, "heirs"), role="heir", source_field="heirs",
+                                name_order=order))
+    enrichment = _get(row, "enrichment_data")
+    if isinstance(enrichment, Mapping):
+        owner_order = name_order_for(_OWNER_OF_RECORD_ORDER_SOURCE, county)
+        for key in _OWNER_OF_RECORD_KEYS:
+            value = enrichment.get(key)
+            if value is not None:  # never skipped by type: subjects_from reads str(value)
+                subjects += subjects_from(value, role="owner_of_record",
+                                          source_field=f"enrichment_data.{key}",
+                                          name_order=owner_order)
+    return subjects
 
 
 def _hmac(kind: str, value: str, version: str) -> str:
@@ -227,6 +258,10 @@ def authorize(snapshot: RuleSnapshot, row: Any, *, record_type: str | None,
     """Whether ``row`` (a Result or a dict with its columns) may be delivered."""
     if not snapshot.by_anchor:
         return Decision(ALLOWED)
+    if isinstance(row, Mapping):
+        missing = [c for c in ROW_COLUMNS if c not in row]
+        if missing:  # a caller's projection bug: fail the operation, never allow
+            raise RuleSnapshotError(f"row is missing authorize() columns {missing}")
     subjects = _subjects(row, record_type, county)
     anchors = _anchor_values(row, county, state)
     unresolved = any(s.kind == KIND_UNRESOLVED for s in subjects)

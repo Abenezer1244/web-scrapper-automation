@@ -348,6 +348,13 @@ app.conf.beat_schedule = {
         "task": "src.workers.data_quality.data_quality_sweep",
         "schedule": crontab(minute=33),  # hourly at :33, clear of the King sweeps
     },
+    "enforce-privacy-rules": {
+        # Phase 6 P5: flags every stored row an active privacy rule withholds, so the
+        # read paths hide it. One rule-snapshot query and nothing else until a rule
+        # has ever been active (P7). Bounded (240 s). See src/workers/privacy_enforcer.py.
+        "task": "src.workers.privacy_enforcer.enforce_privacy_rules",
+        "schedule": crontab(minute="9-59/10"),  # every 10 minutes from :09
+    },
     "recover-deferred-owners": {
         # The reading half of `owner_lookup_deferred`: names delivered King tax
         # leads whose owner lookup a job could not finish. Bounded (25 parcels,

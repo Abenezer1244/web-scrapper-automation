@@ -257,6 +257,12 @@ app.conf.beat_schedule = {
         "task": "src.workers.scheduler.reconcile_contact_lookups",
         "schedule": 120.0,  # every 2 minutes
     },
+    "audit-rls-system-policies": {
+        # Incident 2026-11-07: a table the worker reads had no bridgeleads_system policy,
+        # so RLS hid every row and the worker failed silently for weeks. Catalog-only.
+        "task": "src.workers.scheduler.audit_rls_system_policies",
+        "schedule": crontab(minute=47),  # hourly at :47, a free minute
+    },
     "dialer-push-sweep": {
         # Phase 5: push dialer-ready leads for jobs whose async skip-trace has
         # SETTLED (can't push at scrape completion — cache-miss phones arrive
@@ -341,6 +347,13 @@ app.conf.beat_schedule = {
         # "this row is late". See src/workers/data_quality.py.
         "task": "src.workers.data_quality.data_quality_sweep",
         "schedule": crontab(minute=33),  # hourly at :33, clear of the King sweeps
+    },
+    "enforce-privacy-rules": {
+        # Phase 6 P5: flags every stored row an active privacy rule withholds, so the
+        # read paths hide it. One rule-snapshot query and nothing else until a rule
+        # has ever been active (P7). Bounded (240 s). See src/workers/privacy_enforcer.py.
+        "task": "src.workers.privacy_enforcer.enforce_privacy_rules",
+        "schedule": crontab(minute="9-59/10"),  # every 10 minutes from :09
     },
     "recover-deferred-owners": {
         # The reading half of `owner_lookup_deferred`: names delivered King tax
@@ -734,6 +747,53 @@ def reconcile_contact_lookups() -> dict:
     return _reconcile_contact_lookups_impl()
 
 
+# ─── Task: RLS system-policy drift (hourly) ──────────────────────────────────
+
+# RLS-enabled public tables the worker role may read but no policy lets it SELECT.
+# Under NOBYPASSRLS such a table returns zero rows to every worker query, silently.
+RLS_SYSTEM_GAPS_SQL = """
+SELECT c.relname
+FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = 'public'
+WHERE c.relkind = 'r' AND c.relrowsecurity
+  AND EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bridgeleads_system')
+  AND (has_table_privilege('bridgeleads_system', c.oid, 'SELECT')
+       OR has_any_column_privilege('bridgeleads_system', c.oid, 'SELECT'))
+  AND NOT EXISTS (SELECT 1 FROM pg_policy p WHERE p.polrelid = c.oid
+                    AND 'bridgeleads_system'::regrole = ANY(p.polroles)
+                    AND p.polcmd IN ('r', '*'))
+ORDER BY 1
+"""
+
+
+@app.task(name="src.workers.scheduler.audit_rls_system_policies")
+def audit_rls_system_policies() -> list[str]:
+    """Alert when a worker-readable RLS table has no policy targeting bridgeleads_system.
+
+    A policy-CONVENTION check (every such table carries a `<t>_system` policy), read from
+    the catalog: it does not evaluate predicates, PUBLIC or inherited policies, so it
+    reports where the convention is broken, which is where the 2026-11-07 incident was.
+    """
+    from sqlalchemy import text
+
+    from src.db.session import system_sync_session
+    from src.workers.ops_alerts import send_ops_alert
+
+    with system_sync_session() as db:
+        gaps = list(db.execute(text(RLS_SYSTEM_GAPS_SQL)).scalars())
+    if gaps:
+        _logger.error("RLS: no policy targets bridgeleads_system for SELECT on %s", gaps)
+        send_ops_alert(
+            "rls_drift", ",".join(gaps),
+            "RLS drift: worker-readable table without a system policy",
+            f"bridgeleads_system holds SELECT on {', '.join(gaps)}, but no RLS policy "
+            "targets it for SELECT. Unless a PUBLIC or inherited policy admits it, every "
+            "worker query there returns zero rows without an error (the 2026-11-07 "
+            "contact-lookup incident). Add a <table>_system policy in a migration "
+            "(see migration 133).",
+        )
+    return gaps
+
+
 # ─── Task: Dialer push sweep (Phase 5) ───────────────────────────────────────
 
 @app.task(name="src.workers.scheduler.dialer_push_sweep")
@@ -745,9 +805,9 @@ def dialer_push_sweep() -> None:
     the Tracerfy webhook, so a push at completion would miss exactly the leads
     we want (Codex). A job is "settled" when no Result of it is still
     queued/submitted. Each job is claimed once via Job.dialer_pushed_at, so even
-    a job with zero dialer-ready leads is evaluated only once. Reuses
-    deliver_job_webhook (SSRF re-validate, HMAC, retry, non-fatal). No-op when no
-    config has a dialer_webhook_url.
+    a job with zero dialer-ready leads is evaluated only once. Sends through
+    deliver_dialer_push (row ids only; privacy check, SSRF re-validate, HMAC,
+    retry, non-fatal). No-op when no config has a dialer_webhook_url.
     """
     return _dialer_push_sweep_impl()
 

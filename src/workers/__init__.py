@@ -66,6 +66,8 @@ app = Celery(
         # King code-violation mailing recovery (locate + extract mailing for rows the
         # job's budget never reached): a BEAT task, same trap as above.
         "src.workers.cv_mailing_recovery",
+        # Privacy enforcer sweep (Phase 6 P5): a BEAT task, same trap as above.
+        "src.workers.privacy_enforcer",
     ],
 )
 

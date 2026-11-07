@@ -1210,6 +1210,9 @@ class Result(Base):
         ForeignKey("privacy_suppressions.id", ondelete="RESTRICT"),
         nullable=True,
     )
+    # Migration 130: the rule generation (RuleSnapshot.generation) this row was last
+    # authorized against; the enforcer sweep reads rows behind the current one.
+    privacy_checked_gen = Column(BigInteger, nullable=False, server_default=text("0"))
     # Phase 4 (migration 038): structured tax-delinquency fields for amount/age
     # filtering. Populated SOURCE-GATED (King Socrata tax_delinquent only);
     # other counties' tax rows stay NULL and never match a filter. bill_year is
@@ -1636,7 +1639,8 @@ class PendingSkipTraceRow(Base):
     mail_zip = Column(String(16), nullable=True)
     trace_type = Column(String(16), nullable=False, default="normal")
     status = Column(String(16), nullable=False, default="queued", index=True)
-    # queued | submitting | submitted | completed | unmatched | errored | cancelled
+    # queued | submitting | submitted | completed | unmatched | errored | cancelled | reused
+    # | quarantined (Phase 6 P4d: answered, withheld by a privacy rule, never billed)
     # (cancelled: never sent; the job failed or the lead will not be delivered)
     tracerfy_queue_id = Column(Integer, nullable=True, index=True)
     enqueued_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
@@ -1961,6 +1965,11 @@ class NtsNotice(Base):
     is_active = Column(Boolean, nullable=False, server_default=text("true"))
     fetched_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    # Migration 132: the privacy rule that withholds this notice's grantor. While set,
+    # the notice has no grantor and is inactive (CHECK); every reader skips it.
+    privacy_suppression_id = Column(
+        UUID(as_uuid=False), ForeignKey("privacy_suppressions.id", ondelete="RESTRICT"),
+        nullable=True)
 
 
 class ExternalSourceHealth(Base):

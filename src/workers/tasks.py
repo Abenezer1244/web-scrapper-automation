@@ -1171,6 +1171,42 @@ def run_scrape_job(self, job_id: str) -> None:
                     db=db,
                 )
 
+        # ── Phase 6 P5: privacy write gate (design section 6, "pre-insert filter") ──
+        # A record naming a person whom an active privacy rule withholds (or puts under
+        # review) is never saved: dropped here, with the TOD filter and for the same
+        # reason, so it never reaches persistence, export, dedup, enrichment, billing
+        # or property membership. It counts as "not saved" (run_breakdown). Counts only
+        # in the log. Rules that cannot be read stop the run before anything is saved,
+        # never an unchecked insert. The load runs in a SAVEPOINT: a failure must not
+        # roll back records_found, written above without a commit.
+        from src.privacy.authorize import RuleSnapshotError, authorize, load_rule_snapshot
+        try:
+            with db.begin_nested():
+                _privacy = load_rule_snapshot(db)
+            if _privacy.by_anchor:
+                _before_privacy = len(records)
+                records = [
+                    rec for rec in records
+                    if authorize(_privacy, rec, record_type=config.record_type,
+                                 county=config.county, state=config.state).deliverable
+                ]
+                _dropped_privacy = _before_privacy - len(records)
+                if _dropped_privacy:
+                    _publish_log(
+                        r, job_id, "info",
+                        f"Withheld {_dropped_privacy} record(s) because the people named "
+                        "asked not to be included.",
+                        db=db,
+                    )
+        except RuleSnapshotError as exc:
+            _logger.error("Job %s: privacy rules unavailable: %s", job_id, exc)
+            _fail_attempt(
+                "We could not check this run against privacy requests, so it was "
+                "stopped before anything was saved. You were not charged. Please "
+                "run it again."
+            )
+            return
+
         # ── Plan quota ────────────────────────────────────────────────────────
         # NOT capped here. A row's actionability is unknowable at this point: the
         # counties whose addresses arrive during inline enrichment (King probate,
@@ -1340,6 +1376,8 @@ def run_scrape_job(self, job_id: str) -> None:
                     "owner_state": _owner["owner_state"],
                     "absentee_owner": _owner["absentee_owner"],
                     "out_of_state_owner": _owner["out_of_state_owner"],
+                    # Checked by the privacy gate above against these rules.
+                    "privacy_checked_gen": _privacy.generation,
                 })
             # ON CONFLICT on the partial unique index (job_id, source_fingerprint)
             # WHERE source_fingerprint IS NOT NULL — every row here has a non-null

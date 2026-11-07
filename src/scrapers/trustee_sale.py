@@ -268,6 +268,8 @@ class _TrusteeSaleScraper(BridgeScraper):
             conditions = [
                 func.lower(NtsNotice.county) == self.COUNTY,
                 NtsNotice.is_active.is_(True),
+                # A privacy-withheld notice (132) is inactive too; never built from.
+                NtsNotice.privacy_suppression_id.is_(None),
                 NtsNotice.auction_date.isnot(None),
                 NtsNotice.auction_date >= today,
             ]

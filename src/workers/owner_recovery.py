@@ -75,6 +75,8 @@ _logger = setup_logger("worker.owner_recovery")
 ATTEMPTS_KEY = "owner_recovery_attempts"
 LAST_AT_KEY = "owner_recovery_last_at"
 RECOVERY_OUTCOME_KEY = "owner_recovery_outcome"
+# A stored answer that names no one: the owner is withheld by a privacy rule (130/131).
+PRIVACY_WITHHELD = "privacy_withheld"
 
 # A transient failure is retried this many times across ticks, then the lead is
 # settled as `gave_up` so a permanently failing parcel cannot hold its place.
@@ -119,7 +121,8 @@ _ELIGIBLE_ROW = """
   AND r.enrichment_data->>'delivery_excluded_reason' IS NULL
   AND coalesce(r.enrichment_data->>'owner_lookup_outcome', '') <> 'not_on_record'
   AND coalesce(r.enrichment_data->>'owner_recovery_outcome', '')
-      NOT IN ('found', 'not_on_record', 'parcel_mismatch', 'gave_up')
+      NOT IN ('found', 'not_on_record', 'parcel_mismatch', 'gave_up', 'privacy_withheld')
+  AND r.privacy_suppressed_at IS NULL
   AND NOT (coalesce(r.enrichment_data->>'mailing_recovery_outcome', '') = 'parcel_not_found'
            AND coalesce(r.enrichment_data->>'mailing_source', '')
                = 'king_erealproperty+king_gis+king_rpacct')
@@ -127,6 +130,46 @@ _ELIGIBLE_ROW = """
   AND btrim(r.parcel_id) ~ '^[0-9]{10}$'
   AND (CASE WHEN r.enrichment_data->>'owner_recovery_attempts' ~ '^[0-9]{1,6}$'
             THEN (r.enrichment_data->>'owner_recovery_attempts')::int ELSE 0 END) < :max_attempts
+"""
+
+# A stored answer stands in for asking King: fresh, or a privacy tombstone at ANY age
+# (the county is never asked for a withheld owner again; lifting a rule is P7).
+_FRESH_ANSWER = """(k.observed_at > now() - make_interval(days => :fresh_days)
+       AND k.outcome IN ('found', 'not_on_record'))"""
+_STORED_ANSWER_STANDS = f"""({_FRESH_ANSWER} OR k.outcome = 'privacy_withheld')"""
+
+# King's synthetic owner placeholder, the SQL twin of
+# king_wa_tax_delinquent.is_tax_placeholder_party (a test pins the two together).
+TAX_PLACEHOLDER_SQL_RE = r'^Tax Delinquent\y.*?\$[0-9,]+ owed \(Parcel [^)]+\)$'
+
+# A privacy tombstone (130/131): the owner King names is withheld by a rule. Every
+# unflagged King tax lead of that parcel still WAITING for its owner (blank or the
+# placeholder name: exactly the leads an answer would have named) is flagged with the
+# tombstone's rule and settled, whatever its attempts or outcome: the lead carries the
+# withheld owner's property and mailing, and authorize() cannot match a nameless row.
+# Someone else named on the parcel is left alone. A tombstone without a rule (none can
+# exist: 131's CHECK) flags nothing rather than half a pair.
+_TOMBSTONE_FLAG_SQL = """
+    UPDATE results r SET
+      privacy_suppressed_at = now(),
+      privacy_suppression_id = k.privacy_suppression_id,
+      enrichment_data = (
+        ((CASE WHEN jsonb_typeof(r.enrichment_data::jsonb) = 'object'
+               THEN r.enrichment_data::jsonb ELSE '{}'::jsonb END)
+         - 'owner_lookup_deferred_reason')
+        || jsonb_build_object('owner_lookup_deferred', false,
+                              'owner_recovery_outcome', 'privacy_withheld'))::json
+    FROM king_parcel_owners k
+    WHERE k.outcome = 'privacy_withheld' AND k.privacy_suppression_id IS NOT NULL
+      AND k.parcel_id = btrim(r.parcel_id)
+      AND r.privacy_suppressed_at IS NULL
+      AND (r.party_name IS NULL OR btrim(r.party_name) = ''
+           OR r.party_name ~ CAST(:placeholder_re AS text))
+      AND EXISTS (
+        SELECT 1 FROM jobs j JOIN scraper_configs sc ON sc.id = j.scraper_config_id
+        WHERE j.id = r.job_id AND lower(sc.county) = 'king' AND upper(sc.state) = 'WA'
+          AND sc.record_type = 'tax_delinquent')
+    RETURNING r.id
 """
 
 _KING_TAX_JOB = """
@@ -154,7 +197,7 @@ _CANDIDATE_PARCELS_SQL = f"""
       AND NOT EXISTS (
         SELECT 1 FROM king_parcel_owners k
         WHERE k.parcel_id = btrim(r.parcel_id)
-          AND k.observed_at > now() - make_interval(days => :fresh_days))
+          AND {_STORED_ANSWER_STANDS})
     GROUP BY btrim(r.parcel_id)
     ORDER BY delivered DESC, attempts ASC, last_at ASC, amount DESC NULLS LAST, parcel_id ASC
     LIMIT :batch
@@ -162,7 +205,8 @@ _CANDIDATE_PARCELS_SQL = f"""
 
 # Name every waiting lead whose parcel has a fresh stored answer, in one statement
 # and without asking King. Same eligibility as every other write; the payload is
-# what `_write` stores for the same outcome. RETURNING feeds the stats.
+# what `_write` stores for the same outcome. RETURNING feeds the stats. A privacy
+# tombstone is not an answer: _TOMBSTONE_FLAG_SQL runs first and flags its leads.
 _CACHE_FILL_SQL = f"""
     UPDATE results r SET
       party_name = CASE WHEN k.outcome = 'found' THEN k.owner_name ELSE r.party_name END,
@@ -191,12 +235,12 @@ _CACHE_FILL_SQL = f"""
         JOIN king_parcel_owners k ON k.parcel_id = btrim(r.parcel_id)
         WHERE {_KING_TAX_JOB}
           AND {_ELIGIBLE_ROW}
-          AND k.observed_at > now() - make_interval(days => :fresh_days)
+          AND {_FRESH_ANSWER}
           AND (CAST(:parcels AS text[]) IS NULL OR k.parcel_id = ANY(CAST(:parcels AS text[])))
         ORDER BY r.id
         LIMIT :fill_rows)
       AND k.parcel_id = btrim(r.parcel_id)
-      AND k.observed_at > now() - make_interval(days => :fresh_days)
+      AND {_FRESH_ANSWER}
       AND {_ELIGIBLE_ROW}
       AND EXISTS (
         SELECT 1 FROM jobs j JOIN scraper_configs sc ON sc.id = j.scraper_config_id
@@ -207,12 +251,16 @@ _CACHE_FILL_SQL = f"""
 # Store one settled eRealProperty answer for its parcel. A newer observation wins;
 # an older one never overwrites it.
 _STORE_SQL = """
-    INSERT INTO king_parcel_owners (parcel_id, outcome, owner_name, observed_at, source)
-    VALUES (:pid, :outcome, :owner, now(), 'erealproperty')
+    INSERT INTO king_parcel_owners (parcel_id, outcome, owner_name, observed_at, source,
+                                    privacy_suppression_id)
+    VALUES (:pid, :outcome, :owner, now(), 'erealproperty', CAST(:rule AS uuid))
     ON CONFLICT (parcel_id) DO UPDATE SET
       outcome = EXCLUDED.outcome, owner_name = EXCLUDED.owner_name,
-      observed_at = EXCLUDED.observed_at, source = EXCLUDED.source
+      observed_at = EXCLUDED.observed_at, source = EXCLUDED.source,
+      privacy_suppression_id = EXCLUDED.privacy_suppression_id
     WHERE EXCLUDED.observed_at > king_parcel_owners.observed_at
+      -- A privacy tombstone is terminal: no later answer replaces it (lifting is P7).
+      AND king_parcel_owners.outcome <> 'privacy_withheld'
 """
 
 _CANDIDATE_ROWS_SQL = f"""
@@ -292,7 +340,7 @@ def recover_deferred_king_owners() -> dict:
     """One bounded tick. Returns a stats dict (also read by the tests)."""
     stats = {"parcels": 0, "rows": 0, "found": 0, "not_on_record": 0, "parcel_mismatch": 0,
              "transient": 0, "gave_up": 0, "unreached": 0, "stale": 0, "errors": 0,
-             "cached": 0, "skipped": ""}
+             "cached": 0, "privacy_withheld": 0, "skipped": ""}
     if not settings.OWNER_RECOVERY_ENABLED:
         stats["skipped"] = "OWNER_RECOVERY_ENABLED is off"
         return stats
@@ -320,9 +368,20 @@ def _tick(stats: dict) -> dict:
 
     deadline = time.monotonic() + _TICK_BUDGET_S
     with system_sync_session() as db:
+        # The privacy rules first: an answer naming a withheld owner must never be
+        # stored or written. Unreadable rules: no request, no write this tick.
+        from src.privacy.authorize import RuleSnapshotError, load_rule_snapshot
+        try:
+            privacy = load_rule_snapshot(db)
+        except RuleSnapshotError as exc:
+            db.rollback()
+            stats["skipped"] = "privacy rules unavailable"
+            _logger.error("Owner recovery: privacy rules unavailable: %s", exc)
+            return stats
         # Stored answers first: no King request, so this runs during a cooldown too.
         cached = _fill_from_store(db)
         stats["cached"] = cached["found"] + cached["not_on_record"]
+        stats["privacy_withheld"] += cached["privacy_withheld"]
         stats["errors"] += cached["errors"]
         if not is_source_available(db, KING_EREALPROPERTY):
             stats["skipped"] = "king_erealproperty is in cooldown"
@@ -366,12 +425,27 @@ def _tick(stats: dict) -> dict:
         stored: list[str] = []
         for pid, outcome in _classify(parcels, owners, o_stats).items():
             # A settled answer is stored once for the parcel and fills its leads in
-            # one statement below; anything else is charged row by row as before.
-            if outcome in ("found", "not_on_record") and _store(db, pid, outcome, owners.get(pid)):
+            # one statement below; anything else is charged row by row as before. An
+            # owner a privacy rule withholds is stored as a tombstone (no name) and its
+            # leads are flagged by the fill; it is never written row by row.
+            try:
+                outcome, owner, rule = privacy_outcome(privacy, pid, outcome, owners.get(pid))
+            except RuleSnapshotError as exc:
+                # A key that vanished mid-tick: stop here. Parcels already stored were
+                # each authorized; this one and the rest get no store and no write.
+                db.rollback()
+                stats["skipped"] = "privacy rules unavailable"
+                _logger.error("Owner recovery: privacy rules unavailable mid-tick: %s", exc)
+                break
+            if outcome in ("found", "not_on_record", PRIVACY_WITHHELD) and _store(
+                    db, pid, outcome, owner, rule):
                 stored.append(pid)
                 continue
+            if outcome == PRIVACY_WITHHELD:
+                stats["errors"] += 1  # not stored: its leads wait, unnamed, for next tick
+                continue
             for row in by_parcel.get(pid, []):
-                stats[_write(db, row, outcome, owners.get(pid))] += 1
+                stats[_write(db, row, outcome, owner)] += 1
         if stored:
             filled = _fill_from_store(db, stored)
             for outcome, n in filled.items():
@@ -380,7 +454,8 @@ def _tick(stats: dict) -> dict:
             # lookup (named by a re-run, capped, its job reopened): left alone.
             expected = sum(len(by_parcel[p]) for p in stored)
             if expected <= _CACHE_FILL_ROWS and not filled["errors"]:
-                stats["stale"] += max(0, expected - filled["found"] - filled["not_on_record"])
+                stats["stale"] += max(0, expected - filled["found"] - filled["not_on_record"]
+                                      - filled["privacy_withheld"])
 
     _logger.info(
         "Owner recovery: %d named from stored answers; %d parcel(s) / %d lead(s) asked; "
@@ -393,14 +468,16 @@ def _tick(stats: dict) -> dict:
     return stats
 
 
-def _store(db, pid: str, outcome: str, owner: str | None) -> bool:
+def _store(db, pid: str, outcome: str, owner: str | None, rule: str | None = None) -> bool:
     """Store one settled eRealProperty answer for its parcel. False when it could not
-    be stored, so the caller falls back to writing the parcel's leads one by one."""
+    be stored, so the caller falls back to writing the parcel's leads one by one (never
+    for a privacy tombstone: see _tick). A tombstone stores its rule and no name."""
     name = (owner or "").strip() if outcome == "found" else None
-    if outcome == "found" and not name:
+    if (outcome == "found" and not name) or ((outcome == PRIVACY_WITHHELD) != bool(rule)):
         return False
     try:
-        db.execute(sa_text(_STORE_SQL), {"pid": pid, "outcome": outcome, "owner": name})
+        db.execute(sa_text(_STORE_SQL), {"pid": pid, "outcome": outcome, "owner": name,
+                                         "rule": rule})
         db.commit()
         return True
     except Exception as exc:  # noqa: BLE001 -- the row-by-row write still runs
@@ -411,19 +488,22 @@ def _store(db, pid: str, outcome: str, owner: str | None) -> bool:
 
 
 # Fresh stored answers for a set of parcels: what the scrape job reads before it asks King.
-_FRESH_SQL = """
-    SELECT parcel_id, outcome, owner_name FROM king_parcel_owners
+_FRESH_SQL = f"""
+    SELECT parcel_id, outcome, owner_name, privacy_suppression_id::text AS suppression_id
+    FROM king_parcel_owners k
     WHERE parcel_id = ANY(CAST(:pids AS text[]))
-      AND observed_at > now() - make_interval(days => :fresh_days)
-"""
+      AND {_STORED_ANSWER_STANDS}
+"""  # noqa: S608 -- splices only a constant SQL fragment; every value is bound
 
 
 def _is_pin(pid: str | None) -> bool:
     return bool(pid) and re.fullmatch(r"[0-9]{10}", pid) is not None
 
 
-def fresh_answers(db, parcels) -> dict[str, tuple[str, str | None]]:
-    """{pid: (outcome, owner_name)} for every parcel with a fresh stored answer.
+def fresh_answers(db, parcels) -> dict[str, tuple[str, str | None, str | None]]:
+    """{pid: (outcome, owner_name, suppression_id)} for every parcel with a stored
+    answer that stands: fresh, or a privacy tombstone at any age (outcome
+    privacy_withheld, no name, the rule's privacy_suppressions id; else None).
 
     Read by the scrape job (enrich.py) before its King page passes, so a parcel
     answered in the last `_FRESH_DAYS` is named with no request. Only a 10-digit
@@ -432,7 +512,28 @@ def fresh_answers(db, parcels) -> dict[str, tuple[str, str | None]]:
     if not pins:
         return {}
     rows = db.execute(sa_text(_FRESH_SQL), {"pids": pins, "fresh_days": _FRESH_DAYS}).all()
-    return {row.parcel_id: (row.outcome, row.owner_name) for row in rows}
+    return {row.parcel_id: (row.outcome, row.owner_name, row.suppression_id)
+            for row in rows}
+
+
+def privacy_outcome(snapshot, pid: str, outcome: str,
+                    owner: str | None) -> tuple[str, str | None, str | None]:
+    """(outcome, owner, rule) to store for one King answer under the privacy rules.
+
+    A `found` owner is authorized as the lead it would name (the owner as party on
+    its own King tax parcel). WITHHELD or REVIEW: a tombstone, no name, the first
+    rule's privacy_suppressions id. Any other answer passes through unchanged.
+    RuleSnapshotError propagates: nothing is stored unchecked."""
+    if outcome != "found" or not snapshot.by_anchor:
+        return outcome, owner, None
+    from src.privacy.authorize import ROW_COLUMNS, authorize
+
+    lead = dict.fromkeys(ROW_COLUMNS) | {"parcel_id": pid, "party_name": owner}
+    decision = authorize(snapshot, lead, record_type="tax_delinquent", county="king",
+                         state="WA")
+    if decision.deliverable:
+        return outcome, owner, None
+    return PRIVACY_WITHHELD, None, decision.suppression_ids[0]
 
 
 def store_answers(db, answers: dict[str, tuple[str, str | None]]) -> int:
@@ -441,16 +542,31 @@ def store_answers(db, answers: dict[str, tuple[str, str | None]]) -> int:
     Only answers from a page that echoed the requested 10-digit PIN belong here; the
     caller passes nothing else. One statement, one commit; call it with nothing else
     pending, because a failure rolls back. Returns answers sent, 0 on failure (the
-    job's own leads are already written; the beat sweep asks King later)."""
-    params = []
+    job's own leads are already written; the beat sweep asks King later). An owner a
+    privacy rule withholds is stored as a tombstone, never by name; rules that cannot
+    be read store nothing."""
+    from src.privacy.authorize import RuleSnapshotError, load_rule_snapshot
+
+    candidates = []
     for pid, (outcome, owner) in answers.items():
         name = (owner or "").strip() if outcome == "found" else None
         if not _is_pin(pid) or outcome not in ("found", "not_on_record"):
             continue
         if outcome == "found" and not name:
             continue
-        params.append({"pid": pid, "outcome": outcome, "owner": name})
-    if not params:
+        candidates.append((pid, outcome, name))
+    if not candidates:
+        return 0
+    try:
+        privacy = load_rule_snapshot(db)
+        params = []
+        for pid, outcome, name in candidates:
+            outcome, name, rule = privacy_outcome(privacy, pid, outcome, name)
+            params.append({"pid": pid, "outcome": outcome, "owner": name, "rule": rule})
+    except RuleSnapshotError as exc:
+        db.rollback()
+        _logger.error("Owner store: privacy rules unavailable, %d answers not stored: %s",
+                      len(candidates), exc)
         return 0
     try:
         db.execute(sa_text(_STORE_SQL), params)
@@ -468,9 +584,13 @@ def _fill_from_store(db, parcels: list[str] | None = None) -> dict[str, int]:
 
     `parcels` None: any parcel (the start of a tick; nothing is charged). A list: the
     parcels King just answered on this tick, so each lead is charged its attempt as
-    `_write` would. Returns rows written per outcome, and `errors` 1 if the fill failed."""
-    counts = {"found": 0, "not_on_record": 0, "errors": 0}
+    `_write` would. Privacy tombstones first, in the same transaction: their waiting
+    leads are flagged, never named (_TOMBSTONE_FLAG_SQL). Returns rows written per
+    outcome, and `errors` 1 if the fill failed."""
+    counts = {"found": 0, "not_on_record": 0, "privacy_withheld": 0, "errors": 0}
     try:
+        counts["privacy_withheld"] = len(db.execute(
+            sa_text(_TOMBSTONE_FLAG_SQL), {"placeholder_re": TAX_PLACEHOLDER_SQL_RE}).all())
         written = db.execute(sa_text(_CACHE_FILL_SQL), {
             "max_attempts": _MAX_ATTEMPTS, "fresh_days": _FRESH_DAYS,
             "fill_rows": _CACHE_FILL_ROWS, "now_iso": _now_iso(), "parcels": parcels,
@@ -482,6 +602,7 @@ def _fill_from_store(db, parcels: list[str] | None = None) -> dict[str, int]:
         _logger.warning("Owner recovery: fill from stored answers failed: %s",
                         type(exc).__name__)
         counts["errors"] = 1
+        counts["privacy_withheld"] = 0  # rolled back with the rest
         return counts
     for outcome in written:
         counts[outcome] += 1

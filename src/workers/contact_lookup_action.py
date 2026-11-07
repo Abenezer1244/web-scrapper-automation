@@ -494,6 +494,15 @@ def run_action(action_id: str) -> dict:
         started = _move(db, action_id, "dispatching", "running", None, new_token=token)
         db.commit()
     if not started:
+        with system_sync_session() as db:
+            visible = db.execute(text("SELECT 1 FROM contact_lookup_actions "
+                                      "WHERE id = CAST(:a AS uuid)"), {"a": action_id}).first()
+        if visible is None:
+            # Missing, or hidden from this role by RLS (incident 2026-11-07: no system
+            # policy, so every action silently sat in `dispatching`). Never silent again.
+            _logger.warning("Contact lookup action %s is not visible to the worker "
+                            "(missing, or RLS hides it)", action_id)
+            return {"outcome": "action_not_visible"}
         # Another delivery holds it, or it is past dispatch: nothing to do.
         return {"outcome": "not_dispatching"}
 

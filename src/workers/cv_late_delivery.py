@@ -68,7 +68,8 @@ CONTACTS_PENDING = "pending"
 # generic webhook only, "skipped_overlap" (pushed too close to the run's own push to know
 # whether that push carried it) and "send_failed" (the request could not be queued; never
 # re-sent, a webhook has no per-lead idempotency); "not_ready" (no dialable contact when
-# decided); "not_eligible" (no Business+ plan or no destination now).
+# decided); "not_eligible" (no Business+ plan or no destination now); "privacy_withheld"
+# (a privacy suppression rule withholds or holds the row for review; never sent).
 DIALER_KEY = "dialer"
 DIALER_PENDING = "pending"
 
@@ -372,8 +373,12 @@ def push_late_dialer() -> int:
         DNC, not a duplicate, the 18-month tax cap, actionable): otherwise "not_ready";
       * then claim FIRST ("pushed", committed), send after: an outbox vendor gets the one
         row (idempotent per job and result) and the outbox drains; a generic webhook gets
-        one sealed request. A send that raises before anything is sent puts the row back to
+        one id-only push. A send that raises before anything is sent puts the row back to
         "pending" (the sweep's un-claim). Replay of a failed delivery stays the user's action.
+
+    Privacy (Phase 6 P4b): the rules load once, before any row is claimed; if they cannot,
+    nothing is touched this tick. A row the rules withhold (or hold for review) ends
+    "privacy_withheld" and is never sent; the send paths re-check it anyway.
     """
     from sqlalchemy import select
 
@@ -383,9 +388,19 @@ def push_late_dialer() -> int:
     from src.config.constants import BUSINESS_FEATURES_PLANS
     from src.db.models import Job, Result, ScraperConfig
     from src.db.session import rls_sync_session, system_sync_session
+    from src.privacy.authorize import RuleSnapshotError, authorize, load_rule_snapshot
 
     with system_sync_session() as db:
         rows = db.execute(sa_text(_DIALER_PENDING_SQL), {"limit": _DIALER_ROWS}).mappings().all()
+        if not rows:
+            return 0
+        try:
+            snapshot = load_rule_snapshot(db)
+        except RuleSnapshotError as exc:
+            db.rollback()
+            _logger.error("Late dialer push: privacy rules unavailable (%s); nothing claimed",
+                          str(exc)[:160])
+            return 0
         db.rollback()
     pushed = 0
     for row in rows:
@@ -432,6 +447,9 @@ def push_late_dialer() -> int:
                     )).scalars().first()
                     if lead is None:
                         state = "not_ready"
+                    elif not authorize(snapshot, lead, record_type=config.record_type,
+                                       county=config.county, state=config.state).deliverable:
+                        state = "privacy_withheld"
                 if state is not None:
                     db.execute(sa_text(_MARK_DIALER_SQL), {**params, "state": state})
                     db.commit()
@@ -463,33 +481,23 @@ def push_late_dialer() -> int:
 
 def _send_to_dialer(db, job, config, row) -> None:
     """The sweep's dispatch (scheduler_helpers/dialer.py) for ONE lead: the outbox for a
-    native vendor, one sealed generic-webhook request otherwise. Same payload fields."""
-    from src.utils.crypto import seal_task_args
+    native vendor, one id-only generic-webhook push otherwise. Both authorize the row
+    against the privacy rules immediately before sending (Phase 6 P4b)."""
     from src.workers.dialer_connectors import get_connector
     from src.workers.dialer_outbox import process_dialer_outbox
     from src.workers.scheduler_helpers.dialer import _materialize_dialer_outbox
-    from src.workers.webhook_delivery import deliver_job_webhook
+    from src.workers.webhook_delivery import deliver_dialer_push
 
     deliver = config.deliver or {}
     connector = get_connector(deliver.get("dialer_type"))
-    lead = {"id": row.id, "party_name": row.party_name, "phone": row.phone,
-            "phone_type": row.phone_type, "phone_dnc_flag": row.phone_dnc_flag, "email": row.email,
-            "property_address": row.property_address, "mailing_address": row.mailing_address}
     if connector.uses_outbox:
-        _materialize_dialer_outbox(db, job, config, connector.VENDOR_ID, [lead])
+        _materialize_dialer_outbox(db, job, config, connector.VENDOR_ID, [{"id": row.id}])
         db.commit()
         process_dialer_outbox.delay(str(job.id))
         return
-    url = deliver.get("dialer_webhook_url")
-    if not url:
+    if not deliver.get("dialer_webhook_url"):
         raise RuntimeError("generic dialer webhook without a URL")
-    job_meta = {"job_id": str(job.id), "scraper_config_id": str(config.id), "scraper_name": config.name,
-                "county": config.county, "state": config.state, "record_type": config.record_type,
-                "total_dialer_ready_count": 1, "dialer_webhook_url": url,
-                "dialer_webhook_secret": deliver.get("dialer_webhook_secret")}
-    for req in connector.build_requests([lead], job_meta):
-        deliver_job_webhook.delay(str(job.id), sealed=seal_task_args(
-            {"url": req["url"], "payload": req["payload"]}))
+    deliver_dialer_push.delay(str(job.id), result_ids=[str(row.id)], total=1)
 
 
 _NOTIFY_ACCOUNTS = 500

@@ -165,7 +165,10 @@ def recorder(loopback_transport):  # noqa: F811
 
 
 def test_sealed_and_legacy_webhook_post_the_identical_body(recorder):
-    payload = {"event": "leads.dialer_ready", "leads": [_LEAD], "signature": "abc"}
+    # A completion webhook: a dialer payload is never posted from a message any more
+    # (Phase 6 P4b re-routes it by row id; tests/test_privacy_dialer_push.py).
+    payload = {"event": "job.completed", "job": {"id": "job-1"},
+               "download": {"url": "https://r2.example/signed"}, "signature": "abc"}
     legacy = wd.deliver_job_webhook.apply(args=("job-1", recorder, payload)).get()
     sealed = wd.deliver_job_webhook.apply(
         args=("job-1",), kwargs={"sealed": seal_task_args({"url": recorder, "payload": payload})}).get()

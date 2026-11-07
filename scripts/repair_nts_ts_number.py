@@ -220,6 +220,8 @@ def repair_notice_fields(db, by_issue: dict[str, dict[str, dict]], apply: bool) 
                principal_owing, is_active
           FROM nts_notices
          WHERE source = :src AND source_url IS NOT NULL AND source_url <> ''
+           -- A privacy-withheld notice (132) is never repaired or reactivated.
+           AND privacy_suppression_id IS NULL
          ORDER BY source_url, parcel
     """), {"src": SOURCE}).all()]
 

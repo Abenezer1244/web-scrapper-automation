@@ -48,7 +48,7 @@ def test_upsert_builds_a_coalesce_for_value_columns_only():
     assert "coalesce(stmt.excluded[c], getattr(model, c))" in src.replace("_func.", "")
 
 
-def test_a_reparse_that_loses_an_amount_cannot_erase_it():
+def test_a_reparse_that_loses_an_amount_cannot_erase_it(monkeypatch):
     """The production case, checked against the SQL actually emitted.
 
     Tacoma WA-26-1050840-BB held principal_owing NULL while the lead matched from it
@@ -57,10 +57,15 @@ def test_a_reparse_that_loses_an_amount_cannot_erase_it():
     """
     from sqlalchemy.dialects import postgresql
 
+    import src.workers.nts_crawler as crawler
     from src.db.models import NtsNotice
     from src.workers.nts_crawler import _upsert_notice
 
     captured = {}
+    # This checks the upsert's SQL shape, against a DB that cannot read privacy rules;
+    # the privacy gate has its own real-DB tests (tests/test_privacy_nts_writer.py).
+    monkeypatch.setattr(crawler, "_privacy_gate",
+                        lambda db, row: {**row, "privacy_suppression_id": None})
 
     class _FakeDB:
         def execute(self, stmt, params=None):

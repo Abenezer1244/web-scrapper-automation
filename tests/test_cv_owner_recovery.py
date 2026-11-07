@@ -23,11 +23,15 @@ import pytest
 from sqlalchemy import text
 
 from src.db.models import Job, Result, ScraperConfig, User
+from src.privacy.authorize import build_snapshot
 from src.scrapers.enrichment import king_county_assessor as kca
 from src.scrapers.enrichment.source_health import KING_EREALPROPERTY
 from src.workers import cv_owner_recovery as cvr
 
 pytestmark = pytest.mark.asyncio
+
+# No privacy rule active: the writers' rule snapshot (Phase 6 P5f).
+_NO_RULES = build_snapshot([])
 
 
 def _page(pid: str, owner: str | None, echo: str | None = None) -> str:
@@ -388,7 +392,7 @@ async def test_a_printed_pin_lead_whose_parcel_changed_during_the_lookup_is_left
 
     def _go():
         with system_sync_session() as sdb:
-            return cvr._write(sdb, stale, "found", "SOMEONE")
+            return cvr._write(sdb, stale, "found", "SOMEONE", _NO_RULES)
 
     assert await asyncio.to_thread(_go) == "stale"
 
@@ -565,7 +569,7 @@ async def test_python_located_parcel_rule_is_checked_again_at_write(db, business
 
     def _go():
         with system_sync_session() as sdb:
-            return cvr._write(sdb, row, "found", "SOMEONE")
+            return cvr._write(sdb, row, "found", "SOMEONE", _NO_RULES)
 
     assert await asyncio.to_thread(_go) == "stale"
     assert (await _get(db, rid)).party_name is None
@@ -836,7 +840,7 @@ async def test_a_blank_owner_is_never_written_as_found(db, business_user):
 
     def _go():
         with system_sync_session() as sdb:
-            return cvr._write(sdb, row, "found", "   ")
+            return cvr._write(sdb, row, "found", "   ", _NO_RULES)
 
     label = await asyncio.to_thread(_go)
 

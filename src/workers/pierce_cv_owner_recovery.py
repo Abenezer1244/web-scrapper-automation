@@ -62,6 +62,7 @@ _LOCK_TTL_S = 900
 
 _ELIGIBLE_ROW = """
       r.is_duplicate = false
+  AND r.privacy_suppressed_at IS NULL
   AND jsonb_typeof(r.enrichment_data::jsonb) = 'object'
   AND r.enrichment_data::jsonb->>'source' = 'tacoma_code_violations'
   AND (r.party_name IS NULL OR btrim(r.party_name) = '')
@@ -204,6 +205,16 @@ def _tick(stats: dict, lock: tuple) -> dict:
 
     deadline = time.monotonic() + _TICK_BUDGET_S
     with system_sync_session() as db:
+        # The privacy rules first (Phase 6 P5f): a name a rule withholds flags the lead
+        # instead of being delivered. Unreadable rules: no request, no write this tick.
+        from src.privacy.authorize import RuleSnapshotError, load_rule_snapshot
+        try:
+            privacy = load_rule_snapshot(db)
+        except RuleSnapshotError as exc:
+            db.rollback()
+            stats["skipped"] = "privacy rules unavailable"
+            _logger.error("%s: privacy rules unavailable: %s", __name__, exc)
+            return stats
         params = {"max_attempts": _MAX_ATTEMPTS}
         parcels = [r.parcel_id for r in db.execute(
             sa_text(_CANDIDATE_PARCELS_SQL), {**params, "batch": _BATCH_PARCELS}).all()]
@@ -261,7 +272,7 @@ def _tick(stats: dict, lock: tuple) -> dict:
                 else:
                     stats["unreached"] += 1  # not asked: rotate, charge nothing
                     continue
-                key = _write(db, row, payload, owner, label)
+                key = _write(db, row, payload, owner, label, privacy)
                 writes += 1
                 stats[key] = stats.get(key, 0) + 1
     _logger.info("Pierce CV owner recovery: %s", json.dumps(stats))
@@ -275,7 +286,7 @@ def _attempts(ed) -> int:
         return 0
 
 
-def _write(db, row, payload: dict, owner: str | None, label: str) -> str:
+def _write(db, row, payload: dict, owner: str | None, label: str, privacy) -> str:
     """One guarded UPDATE. Returns the stats key: `label` when written, `stale` when the
     row changed since selection (nothing written), `errors` when the write failed."""
     try:
@@ -285,6 +296,11 @@ def _write(db, row, payload: dict, owner: str | None, label: str) -> str:
             "address": row.property_address, "owner": owner,
             "payload": json.dumps(payload), "max_attempts": _MAX_ATTEMPTS,
         })
+        owner_written = bool(owner)
+        if owner_written and result.rowcount:
+            from src.privacy.enforce import enforce_rows
+
+            enforce_rows(db, privacy, [row.id])  # a withheld name flags the lead
         db.commit()
     except Exception as exc:  # noqa: BLE001
         db.rollback()

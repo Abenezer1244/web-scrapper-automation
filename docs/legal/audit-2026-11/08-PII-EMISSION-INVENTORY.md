@@ -35,8 +35,8 @@ property and mailing addresses, parcel ids, phones, emails) or about customers (
 
 **Cross-tenant reads to stdout (High/Medium):** 
 
-`diag_nts_pointer_integrity.py`, `diag_nts_recent_matches.py`,
-`diag_nts_null_downgrade.py`, `repair_nts_ts_number.py`,
+
+`repair_nts_ts_number.py`,
 `diag_nts_stored_vs_source.py`, `diag_skip_trace_match_audit.py`, `diag_match_key_collisions.py`,
 `rerun_pierce_address_recovery.py`.
 
@@ -132,3 +132,6 @@ Deleted from `scripts/` in Phase 6 P7 (one-off diagnostics and finished backfill
 - diag_probate_party_scan
 - repair_stale_absentee_owner
 - repair_placeholder_absentee
+- diag_nts_null_downgrade
+- diag_nts_pointer_integrity
+- diag_nts_recent_matches

@@ -1,0 +1,136 @@
+# Phase 6 P7: activation (design sections 8, 10)
+
+Owner approved starting P7 on 2026-11-08. Branch `feat/privacy-phase6-p7` (off origin/main fb0c9c63).
+This file is the PLAN. Nothing in production changes until the owner approves it, and the
+final switch (`PRIVACY_ENFORCEMENT_VERSION=1` on Railway) is a separate owner action.
+
+## What exists today (verified 2026-11-08)
+
+- Three locks keep every rule dormant (`src/privacy/activation.py`):
+  1. DB: migration 125 `ck_privacy_suppressions_activation_guard` = `state = 'pending'`.
+  2. Code: `IMPLEMENTED_ENFORCEMENT_VERSION = 0` (required 1).
+  3. Env: `PRIVACY_ENFORCEMENT_VERSION = 0` on every Railway service.
+- Readers already understand `pending -> active -> lifted` (`authorize.py:69`), the enforcer
+  stamps by generation (count of active rows), the erasure driver (P6) acts on `privacy_erasures`
+  rows and only for active, never-lifted deletion rules.
+- NOTHING can write a privacy row: no role holds INSERT on the four 125 tables, no API, no script.
+- `tests/test_privacy_script_inventory.py` arms with P7: CI fails while any of 33 listed operator
+  scripts prints lead subjects without the privacy filter.
+- No public intake (that is P8). Requests arrive by email/post and an operator records them.
+
+## Decisions for the owner (recommendation first)
+
+- **O1. How an operator records and activates a request.**
+  - (a) RECOMMENDED: a CLI, `scripts/privacy_admin.py`, run with `railway run` as the migration
+    role. Every invariant lives in DB functions (below), so the CLI is thin. No new HTTP surface.
+  - (b) Admin API endpoints behind `require_admin_mfa` plus an admin page in the FE repo. Larger,
+    and better built with P8's intake.
+- **O2. The 33 gated scripts.** RECOMMENDED: delete the one-off diagnostics nobody imports
+  (about 22, listed in P7a), and add the privacy filter to the ones still imported or tested
+  (about 11). Deleting is reversible through git history.
+
+**Owner answers 2026-11-08:** O1 = CLI first; O2 = delete unused, filter the rest.
+
+**P7a classification** (kept = imported or tested by code, or named in a runbook/handoff as a
+tool to run; the rest are referenced only by docs/comments):
+- Filter (12): backfill_king_code_violation_owner, backfill_king_code_violation_mailing,
+  backfill_assumed_mailing, backfill_pierce_statewide_mailing, backfill_property_situs_parts,
+  king_rpacct_mailing, king_taxbill_mailing_check, repair_king_property_situs,
+  release_stranded_dedup_claims, repair_nts_ts_number, verify_tracerfy_provenance,
+  purge_test_batch_configs.
+- Delete (21): diag_king_tax_owner_results, diag_preforeclosure_party_names,
+  backfill_preforeclosure_party_names, diag_xcheck_followup, diag_xcheck_king_and_canary,
+  diag_king_ts_repair_plan, diag_test7_rows, diag_test7_source_capture, diag_king_bad_parcel_rows,
+  diag_probate_party_scan, repair_stale_absentee_owner, repair_placeholder_absentee,
+  diag_nts_null_downgrade, diag_nts_pointer_integrity, diag_nts_recent_matches, diag_test11_dq,
+  diag_match_key_collisions, diag_skip_trace_match_audit, verify_entitlement_deploy,
+  diag_nts_stored_vs_source, rerun_pierce_address_recovery.
+- Each delete commit = 3 scripts + the test list + the 08 inventory (5 files), so every commit
+  keeps the list-equals-inventory test green. Retired names move to a "Retired in P7" note
+  outside the gated section of 08.
+
+## Slices (each: <= 5 files per commit, ruff clean, tests on TEST_DATABASE_URL, Codex GO)
+
+### P7a. Clear the script gate (no behaviour change for the product)
+- [ ] Classify all 33: imported or tested (filter) vs unreferenced one-off (delete). Evidence = grep.
+- [ ] Delete the unreferenced ones, and remove each from `HIGH_SCRIPTS` and the 08 inventory in
+      the same commit (the list-equals-inventory test enforces this).
+- [ ] Filter the rest: their result reads go through `actionable_sql`/`not_privacy_suppressed`.
+      Shared-store reads (King, NTS) skip tombstoned/inactive rows.
+- [ ] Positive control still trips (`test_the_gate_would_fail_if_armed_today`).
+
+### P7b. Migration 136: the write side and the new guard
+- [ ] Replace the CHECK with `state IN ('pending', 'active', 'lifted')`.
+- [ ] Owner-only functions (EXECUTE revoked from PUBLIC and every runtime role; no runtime role
+      gains any privilege, so 134's API-role audit stays clean):
+  - `privacy_record_request(kind, channel, deadline_at, email_hmac, contact_enc, details_enc)`
+    -> request id + `received` event.
+  - `privacy_record_event(request_id, event_type, verification_level, decision_code, deadline_at, actor_user_id)`
+    (seq = max + 1 under the request's row lock).
+  - `privacy_add_rule(request_id, anchor_kind, anchor_hmac, subject_kind, subject_hmac, key_version, normalization_version)`
+    -> rule id, state `pending`. Refuses a request that is not `verified`.
+  - `privacy_activate_rule(rule_id, actor_user_id)`: only from pending, never twice, never after
+    lift; writes the `active` row(s) for every version row of the rule, a `decided` event, and for
+    a `delete` request the `privacy_erasures` row, all in one transaction.
+  - `privacy_lift_rule(rule_id, actor_user_id, decision_code)`: only from active.
+- [ ] Downgrade refuses while any non-pending row exists.
+
+### P7c. The operator CLI (if O1 = a)
+- [ ] `scripts/privacy_admin.py` subcommands: `record`, `verify`, `candidates`, `add-rule`,
+      `activate`, `lift`, `status`. Subjects and anchors are built with `src/privacy/subjects.py`
+      and `keys.py` (the same code the enforcer uses), never typed in as HMACs.
+- [ ] `candidates` prints counts and result ids only (WITHHELD vs REVIEW), never names, so the
+      CLI is not itself a new PII emitter.
+- [ ] `activate` calls `assert_activation_allowed()` first; the DB function is the second check.
+
+### P7d. Raise the code key
+- [ ] `IMPLEMENTED_ENFORCEMENT_VERSION = 1`; update `test_privacy_activation.py`.
+- [ ] Pre-raise audit, layer by layer against design section 6, with file:line evidence in this
+      file (read paths, send paths, write paths, enforcer, erasure, scripts).
+- [ ] End-to-end test on the test DB: record -> verify -> add rule -> activate -> enforcer flags
+      the row -> every reader hides it -> erasure driver blanks it (delete) -> lift -> rows return
+      (opt-out only; erased data does not come back).
+
+### P7e. Release (standing Phase 6 rule: merge when CI green AND Codex GO)
+- [ ] Merge, verify Railway: `Running upgrade 135 -> 136`, api/worker/beat SUCCESS, /health 200.
+- [ ] STOP. Report to the owner. Setting `PRIVACY_ENFORCEMENT_VERSION=1` on api, worker and beat
+      is the owner's call (lock 3). Until then the CLI can record requests and pending rules only.
+
+## Gaps found while planning (Claude, 2026-11-08)
+- Nothing ever clears a flag: `enforce.py:19` "the flag is never cleared here; lifting is P7".
+  The lift must unflag rows whose `privacy_suppression_id` is the lifted rule's active row, and
+  reset their `privacy_checked_gen` to 0 so the enforcer re-decides them (another rule may still match).
+- REVIEW matches are flagged exactly like WITHHELD (`enforce.py:5-6`). Without an operator
+  decision they stay hidden forever. P7 needs a review step: `candidates` lists REVIEW rows by
+  id, and the operator either confirms (extends the rule) or releases the row. Erasure still
+  never touches REVIEW (design section 5).
+
+## Codex consult (2026-11-08), reconciled. All adopted into the slices unless noted
+| Codex finding | Sev | Verified | Change |
+|---|---|---|---|
+| `mailing` anchor allowed by 125 but the loader raises on it (`authorize.py:181`): one activation breaks rule loading everywhere | Critical | yes | 136: `privacy_add_rule` refuses anchors other than property/phone/email |
+| No REVIEW resolution path | High | yes (same as mine) | `privacy_resolve_review(result_id, rule_id, decision)`: `confirm` keeps the flag; `release` clears it and records a per-row release that the enforcer honours, so the next tick does not re-flag it |
+| Activation does not withdraw queued work (design section 6) | High | yes | after activate, the CLI runs the enforcer for the rule's candidates at once and withdraws unsent pending skip-trace rows and dialer outbox rows for them; send-time checks stay the final guard |
+| `add_rule` must refuse access/correct requests | High | yes | only `opt_out` and `delete` |
+| Lift must lift every key-version row of the rule, under a lock | High | yes | lock all rows of `rule_id`; one `lifted` row per active version |
+| Activate/lift preconditions race without locks | High | yes | `SELECT ... FOR UPDATE` on the request and every row of the rule |
+| `record_event` must validate the lifecycle | High | yes | refuse events after `closed`/`withdrawn`, a second `decided`, `verified` before `received` |
+| Positive-control test depends on scripts staying unfiltered | High | yes | the control uses a temporary unfiltered file, not the repo |
+| Generation "decreases on lift" | (High) | **no** | it counts every `active` row ever written (`authorize.py:191`); a lift adds a `lifted` row and keeps the `active` one, so it never decreases. But a lift does not raise it either, hence the explicit unflag below |
+| Lift must re-decide, not just clear (a row can match two rules) | High | yes | readers show a row the moment its flag clears, so lift clears the flag and re-runs `enforce_rows` on those ids against the post-lift rules in the SAME transaction |
+| Deletion rules must never be lifted; erased rows never restored | High | yes | `lift` refuses `delete` rules |
+| Lift does not restore King tombstones / NTS inactive rows | Medium | yes | opt-out lift: drop the King tombstone and reactivate NTS rows tied to that rule only; the next crawl or recovery refills |
+| Script gate is a source-marker check | Medium | yes | accept for P7 (deleted scripts are the bulk); filtered scripts get one test each that runs their query on the test DB with a flagged row |
+| `actor_user_id` is self-claimed in a CLI | Medium | yes | the CLI requires `--operator-email`, resolves it to an admin user with MFA enrolled, and refuses otherwise. Railway access stays owner-only. Admin API with MFA step-up is the P8 path |
+| `privacy_erasures` insert must be idempotent, delete-only | Medium | yes | `INSERT ... ON CONFLICT (rule_id) DO NOTHING`, only for `delete` |
+| DELETE privilege | Medium | n/a | 136 grants nothing to any role |
+
+## Open questions for the Codex consult (answered above)
+- Lifting an opt-out: who clears `results.privacy_suppressed_at`? (Enforcer re-decides by
+  generation, but generation counts active rows, so a lift may not bump it.)
+- Should `activate` refuse while the erasure driver is mid-run for the same rule? (It cannot be:
+  the driver only sees rules that are already active.)
+- Key rotation: a rule with rows under two key versions activates all of them atomically.
+
+## Review
+(filled in at the end)

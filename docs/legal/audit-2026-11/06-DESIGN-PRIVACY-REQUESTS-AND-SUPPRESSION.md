@@ -122,6 +122,8 @@ An `heirs` string is split into separate entries. Each is matched on its own and
 
 ## 7. Erasure (deletion requests)
 
+> **Status 2026-11-08 (P6, PR #610, dormant until P7):** built as migration 135 + `src/privacy/erase.py` + `src/workers/privacy_erasure.py`. Deviations: King owners become tombstones (not deleted) so the P5 writer gates hold; only exact (WITHHELD) matches are erased, never REVIEW (section 5); every download already renders from the database, so R2 copies are deleted rather than invalidated. Review log: `tasks/todo-privacy-phase6-p6.md`.
+
 One idempotent procedure with an **explicit column inventory**, run at activation and again after in-flight jobs drain.
 
 | Store | Action |

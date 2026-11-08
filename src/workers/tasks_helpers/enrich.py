@@ -1672,8 +1672,7 @@ def _run_inline_enrichment(
             )
 
     # Pierce (WA): legal-description parcel repair + assessor (ATIP) address
-    # fallback. Extracted so scripts/rerun_pierce_address_recovery.py can re-run
-    # the SAME production path for an already-delivered job.
+    # fallback, in its own function so the production path stays in one place.
     pierce_address_recovery(db, r, job_id, config, all_results)
 
     # Tacoma code violations name the case, never the owner, so party_name arrives
@@ -2672,8 +2671,7 @@ def pierce_address_recovery(db, r, job_id: str, config, all_results) -> None:
     (free GIS, strict guards), then (2) fill still-missing addresses from the
     assessor portal (ATIP, captcha-gated, address only). Both steps are fill-missing,
     commit their own work and publish job-log lines; a source failure never raises.
-    Called inline at the end of every job's enrichment and by
-    scripts/rerun_pierce_address_recovery.py for an existing job.
+    Called inline at the end of every job's enrichment.
     """
     # Pierce probate + pre_foreclosure: repair a typo'd parcel_id from the legal
     # description. ARMS occasionally indexes a non-existent parcel (wrong plat

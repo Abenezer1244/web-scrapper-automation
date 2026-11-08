@@ -130,6 +130,7 @@ tool to run; the rest are referenced only by docs/comments):
 | Erasure | migration 135, `src/privacy/erase.py`, `src/workers/privacy_erasure.py` | P6 #610 |
 | Operator scripts | 21 retired, 12 filtered; gate armed and green (`test_privacy_script_inventory.py`) | P7a |
 | Activation, lift, review | migration 136, `scripts/privacy_admin.py` | P7b/P7c |
+| Activation withdraws queued work | `privacy_admin._withdraw_queued`: the dispatcher's `_cancel_undeliverable_queued` (queued lookups of withheld leads) + the rule's unsent dialer rows skipped; the dispatcher's own tick and the outbox's send-time check stay as backstops | P7c (Codex P7c/d review, High) |
 
 `IMPLEMENTED_ENFORCEMENT_VERSION` has no runtime reader other than `assert_activation_allowed()`,
 which only the CLI calls: raising it changes no worker or API behaviour. `PRIVACY_ENFORCEMENT_VERSION`

@@ -16,8 +16,9 @@ Commands
               or send to review (counts only)
   activate    the rule goes live. Refuses unless both activation keys are turned
               (src/privacy/activation.py). Commits only if the rule snapshot still loads,
-              then flags the matching leads at once (the beat sweep is the backstop).
-              A deletion request also queues the P6 erasure.
+              then flags the matching leads at once (the beat sweep is the backstop) and
+              withdraws their queued work: unsent lookups and dialer sends (design
+              section 6). A deletion request also queues the P6 erasure.
   held        the leads an active rule holds, each with WITHHELD or REVIEW
   release     an operator decides a REVIEW lead is not the rule's subject
   lift        an opt-out ends: the rule stops and its leads are re-decided. A deletion
@@ -156,6 +157,25 @@ def _sweep_now() -> None:
             return
 
 
+def _withdraw_queued(db, rule: str) -> tuple[int, int]:
+    """Cancel the queued work of the leads the rule now holds, as design section 6 asks
+    of an activation. Send-time checks (P4) stay the final guard for anything in flight.
+      lookups  the dispatcher's own cancel sweep: every 'queued' lookup of a withheld
+               lead (and the reasons it always applied), never one already at Tracerfy.
+      dialer   unsent rows ('pending'/'failed') of the rule's leads, skipped with the
+               reason the outbox itself writes at send time."""
+    from src.workers.skip_trace_dispatcher import _cancel_undeliverable_queued
+
+    lookups = _cancel_undeliverable_queued(db)
+    dialer = db.execute(text(
+        "UPDATE dialer_deliveries d SET status = 'skipped', last_error = 'privacy withheld' "
+        "FROM results r JOIN privacy_suppressions s ON s.id = r.privacy_suppression_id "
+        "WHERE d.result_id = r.id AND d.user_id = r.user_id AND s.rule_id = :rule "
+        "  AND d.status IN ('pending', 'failed')"), {"rule": rule}).rowcount
+    db.commit()
+    return lookups, dialer
+
+
 def _commit_if_rules_load(db) -> None:
     """The database cannot see key versions or the normalisation version: a change the
     rule loader would reject must never commit, or every send path would stop."""
@@ -234,6 +254,8 @@ def cmd_activate(db, op, args) -> None:
     _commit_if_rules_load(db)
     print(f"rule {args.rule} active ({n} key version row(s)); flagging its leads")
     _sweep_now()
+    lookups, dialer = _withdraw_queued(db, args.rule)
+    print(f"  withdrawn: {lookups} queued lookup(s), {dialer} dialer send(s)")
 
 
 def cmd_held(db, op, args) -> None:

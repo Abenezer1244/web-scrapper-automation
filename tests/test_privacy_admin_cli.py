@@ -115,9 +115,26 @@ def _add_rule(c, email: str, rid: str) -> str:
                   r=rid).scalar())
 
 
+def _queue_work(c, res: str) -> tuple[str, str]:
+    """A queued lookup and an unsent dialer send for the lead; returns their ids."""
+    job, owner, cfg = _q(c, "SELECT r.job_id, r.user_id, j.scraper_config_id FROM results r "
+                            "JOIN jobs j ON j.id = r.job_id WHERE r.id = :i", i=res).one()
+    _q(c, "UPDATE results SET skip_trace_status = 'queued' WHERE id = :i", i=res)
+    pending, dialer = str(uuid.uuid4()), str(uuid.uuid4())
+    _q(c, "INSERT INTO pending_skip_trace_rows (id, job_id, result_id, user_id, "
+          "property_address, first_name, last_name, mail_address, status) VALUES (:i, :j, "
+          ":r, :u, '1 TEST ST', 'ALEX', 'PRIVACYCLITEST', '2 MAIL ST', 'queued')",
+       i=pending, j=job, r=res, u=owner)
+    _q(c, "INSERT INTO dialer_deliveries (id, job_id, result_id, user_id, scraper_config_id, "
+          "vendor_id, status) VALUES (:i, :j, :r, :u, :cfg, 'phoneburner', 'pending')",
+       i=dialer, j=job, r=res, u=owner, cfg=cfg)
+    return pending, dialer
+
+
 def test_an_opt_out_from_intake_to_lift(c, keys_turned, capsys):
     email = _admin(c)
     exact, review = _lead(c, parcel=_PARCEL), _lead(c, parcel=None)
+    pending, dialer = _queue_work(c, exact)
     rid = _verified_request(c, email, "opt_out")
     rule = _add_rule(c, email, rid)
 
@@ -127,6 +144,13 @@ def test_an_opt_out_from_intake_to_lift(c, keys_turned, capsys):
 
     _run(c, email, "activate", "--rule", rule)
     assert _flag(c, exact) and _flag(c, review)           # flagged at once, not at the tick
+    # Its queued work is withdrawn by the activation itself (design section 6).
+    assert _q(c, "SELECT status FROM pending_skip_trace_rows WHERE id = :i",
+              i=pending).scalar() == "cancelled"
+    assert _q(c, "SELECT skip_trace_status FROM results WHERE id = :i",
+              i=exact).scalar() == "not_attempted"
+    assert _q(c, "SELECT status, last_error FROM dialer_deliveries WHERE id = :i",
+              i=dialer).one() == ("skipped", "privacy withheld")
 
     _run(c, email, "held", "--rule", rule)
     out = capsys.readouterr().out

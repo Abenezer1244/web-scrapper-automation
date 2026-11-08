@@ -40,10 +40,10 @@ _FILTER_MARKERS = ("privacy_suppressed_at", "not_privacy_suppressed", "actionabl
                    "actionable_sql")
 
 
-def _unfiltered() -> list[str]:
+def _unfiltered(root: Path = _ROOT, scripts: tuple[str, ...] = HIGH_SCRIPTS) -> list[str]:
     left = []
-    for rel in HIGH_SCRIPTS:
-        path = _ROOT / rel
+    for rel in scripts:
+        path = root / rel
         if path.exists() and not any(m in path.read_text(encoding="utf-8")
                                      for m in _FILTER_MARKERS):
             left.append(rel)
@@ -64,12 +64,18 @@ def test_every_listed_script_exists():
     assert [rel for rel in HIGH_SCRIPTS if not (_ROOT / rel).is_file()] == []
 
 
-def test_the_gate_would_fail_if_armed_today(monkeypatch):
-    """Positive control: with enforcement claimed, today's scripts trip the gate."""
-    monkeypatch.setattr(activation, "IMPLEMENTED_ENFORCEMENT_VERSION",
-                        activation.REQUIRED_ENFORCEMENT_VERSION)
-    with pytest.raises(AssertionError):
-        test_activation_is_blocked_while_a_listed_script_ignores_suppression()
+def test_the_check_catches_an_unfiltered_script(tmp_path):
+    """Positive control, independent of the repository: a script that reads results
+    without the filter is reported, and the same script with the filter is not."""
+    (tmp_path / "scripts").mkdir()
+    script = tmp_path / "scripts" / "reads_results.py"
+    rel = ("scripts/reads_results.py",)
+    script.write_text("SQL = 'SELECT party_name FROM results r'", encoding="utf-8")
+    assert _unfiltered(tmp_path, rel) == list(rel)
+    script.write_text("from src.api.lead_actionability import not_privacy_suppressed_sql\n"
+                      "SQL = 'SELECT party_name FROM results r WHERE ' "
+                      "+ not_privacy_suppressed_sql('r')", encoding="utf-8")
+    assert _unfiltered(tmp_path, rel) == []
 
 
 def test_the_list_is_exactly_the_inventorys_high_scripts():

@@ -36,6 +36,9 @@ def conn():
 def _reader(conn) -> str:
     role = _probe_role(conn)
     conn.execute(text(f"GRANT EXECUTE ON FUNCTION public.privacy_rule_rows() TO {role}"))
+    # The loader also reads 136's operator releases, through their own definer reader.
+    conn.execute(text(
+        f"GRANT EXECUTE ON FUNCTION public.privacy_review_release_rows() TO {role}"))
     return role
 
 
@@ -114,6 +117,11 @@ def test_the_grant_script_grants_the_function_to_workers_only() -> None:
             / "scripts/provision_rls_roles.sql").read_text(encoding="utf-8")
     assert "GRANT EXECUTE ON FUNCTION public.privacy_rule_rows() TO bridgeleads_system;" in body
     assert "REVOKE ALL ON FUNCTION public.privacy_rule_rows() FROM PUBLIC, bridgeleads_app;" in body
+    # 136: the loader needs the release reader too, or workers fail closed after a
+    # re-provision; and the blanket table grant must not reach the releases table.
+    assert ("GRANT EXECUTE ON FUNCTION public.privacy_review_release_rows() "
+            "TO bridgeleads_system;") in body
+    assert "REVOKE ALL ON privacy_review_releases FROM PUBLIC, bridgeleads_app," in body
 
 
 def test_a_fresh_uuid_rule_id_round_trips_as_text(conn) -> None:

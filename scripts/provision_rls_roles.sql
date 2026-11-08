@@ -535,6 +535,30 @@ BEGIN
             REVOKE ALL ON FUNCTION public.privacy_rule_rows() FROM PUBLIC, bridgeleads_app;
             GRANT EXECUTE ON FUNCTION public.privacy_rule_rows() TO bridgeleads_system;
         END IF;
+        -- Operator releases of REVIEW matches (136): no runtime or API role holds the
+        -- table (the ALL TABLES grant above would hand the worker write access); workers
+        -- read it only through 136's definer reader, which the rule loader requires.
+        IF to_regclass('public.privacy_review_releases') IS NOT NULL THEN
+            REVOKE ALL ON privacy_review_releases FROM PUBLIC, bridgeleads_app,
+                                                       bridgeleads_system;
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+                REVOKE ALL ON privacy_review_releases FROM anon;
+            END IF;
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+                REVOKE ALL ON privacy_review_releases FROM authenticated;
+            END IF;
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
+                REVOKE ALL ON privacy_review_releases FROM service_role;
+            END IF;
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bridgeleads_purge') THEN
+                REVOKE ALL ON privacy_review_releases FROM bridgeleads_purge;
+            END IF;
+        END IF;
+        IF to_regprocedure('public.privacy_review_release_rows()') IS NOT NULL THEN
+            REVOKE ALL ON FUNCTION public.privacy_review_release_rows()
+                FROM PUBLIC, bridgeleads_app;
+            GRANT EXECUTE ON FUNCTION public.privacy_review_release_rows() TO bridgeleads_system;
+        END IF;
     END IF;
     -- Job degradations (117): worker-only history of phases that failed on a DONE
     -- job, plus the skip-trace repair queue. Nobody deletes (rows go with their job);

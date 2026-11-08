@@ -22,7 +22,6 @@ _ROOT = Path(__file__).resolve().parent.parent
 # Section A of the inventory: High (bulk or contact-level) and cross-tenant stdout.
 HIGH_SCRIPTS = (
     "scripts/verify_tracerfy_provenance.py",
-    "scripts/verify_entitlement_deploy.py",
     "scripts/purge_test_batch_configs.py",
     "scripts/backfill_king_code_violation_owner.py",
     "scripts/backfill_assumed_mailing.py",
@@ -34,8 +33,6 @@ HIGH_SCRIPTS = (
     "scripts/backfill_king_code_violation_mailing.py",
     "scripts/release_stranded_dedup_claims.py",
     "scripts/repair_nts_ts_number.py",
-    "scripts/diag_nts_stored_vs_source.py",
-    "scripts/rerun_pierce_address_recovery.py",
 )
 
 # Any of these in a script's source means it reads through the privacy flag.

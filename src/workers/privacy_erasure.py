@@ -159,6 +159,12 @@ def _sweep_r2(db, row, store: R2Store, deadline: float) -> bool:
     return True
 
 
+def _older_work_running(db, row) -> bool:
+    running = db.execute(_IN_FLIGHT_SQL, {"before": row.first_pass_at}).first() is not None
+    db.rollback()
+    return running
+
+
 def _set(db, rule_id: str, assignments: str, now: datetime) -> None:
     """Phase markers take the tick's clock (:now), the same one the phase decisions
     read, never the database's own now()."""
@@ -183,9 +189,7 @@ def _advance(db, row, store: R2Store, deadline: float, now: datetime) -> str:
         _set(db, row.rule_id, "r2_swept_at = :now", now)
         return "r2_swept"
     if row.second_pass_at is None:
-        if now < row.first_pass_at + SECOND_PASS_DELAY or db.execute(
-                _IN_FLIGHT_SQL, {"before": row.first_pass_at}).first():
-            db.rollback()
+        if now < row.first_pass_at + SECOND_PASS_DELAY or _older_work_running(db, row):
             return "second_pass_waiting"
         finished, erased = _run_pass(db, row, rule, deadline, "second_pass_erased")
         if not finished:
@@ -199,10 +203,14 @@ def _advance(db, row, store: R2Store, deadline: float, now: datetime) -> str:
             return "repeat"
         _set(db, row.rule_id, "second_pass_at = :now, scan_cursor = '{}'::jsonb", now)
         return "second_pass_done"
-    # Final sweep: every job and batch run older than the first pass has finished, so
-    # any export one uploaded from pre-erasure data exists now and goes now. Repeated
-    # (idempotent) on every tick that waits for Tracerfy below.
-    if not _sweep_r2(db, row, store, deadline):
+    # Final sweep. The drain barrier is re-checked here, not trusted from the second
+    # pass: an older job can be retried (active again) or upload after that check. So:
+    # wait while anything older runs, sweep, and complete only if nothing older became
+    # active during the sweep (else the next tick sweeps again). Idempotent; repeated on
+    # every tick that waits for Tracerfy.
+    if _older_work_running(db, row) or not _sweep_r2(db, row, store, deadline):
+        return "final_r2_waiting"
+    if _older_work_running(db, row):
         return "final_r2_waiting"
     if db.execute(_OUT_AT_TRACERFY_SQL).first():
         db.rollback()

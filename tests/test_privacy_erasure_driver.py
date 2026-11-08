@@ -269,3 +269,18 @@ def test_a_lookup_still_out_at_tracerfy_holds_completion(conn):
     assert _tick(store, later) == {rule_id: "tracerfy_waiting"}
     _q(conn, "UPDATE pending_skip_trace_rows SET status = 'quarantined' WHERE id = :i", i=pid)
     assert _tick(store, later) == {rule_id: "completed"}
+
+
+def test_an_older_job_retried_after_the_second_pass_holds_the_final_sweep(conn):
+    """Codex P6d re-review: the barrier is re-checked at the final sweep."""
+    rule_id, _ = _rule(conn)
+    lead = _lead(conn)
+    store = _Store()
+    t0 = datetime.now(UTC)
+    later = t0 + SECOND_PASS_DELAY + timedelta(minutes=1)
+    for now in (t0, t0, later):
+        _tick(store, now)                       # first pass, sweep, second pass
+    _q(conn, "UPDATE jobs SET status = 'running' WHERE id = :j", j=lead["job"])  # retried
+    assert _tick(store, later) == {rule_id: "final_r2_waiting"}
+    _q(conn, "UPDATE jobs SET status = 'done' WHERE id = :j", j=lead["job"])
+    assert _tick(store, later) == {rule_id: "completed"}

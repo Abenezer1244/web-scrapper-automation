@@ -355,6 +355,14 @@ app.conf.beat_schedule = {
         "task": "src.workers.privacy_enforcer.enforce_privacy_rules",
         "schedule": crontab(minute="9-59/10"),  # every 10 minutes from :09
     },
+    "drive-privacy-erasures": {
+        # Phase 6 P6: carries each deletion rule's erasure through its passes (first
+        # pass, R2 sweep, second pass >= 24 h later). One query on an empty
+        # privacy_erasures table until P7 activates a rule. Bounded (240 s).
+        # See src/workers/privacy_erasure.py.
+        "task": "src.workers.privacy_erasure.drive_privacy_erasures",
+        "schedule": crontab(minute="6-59/10"),  # every 10 minutes from :06
+    },
     "recover-deferred-owners": {
         # The reading half of `owner_lookup_deferred`: names delivered King tax
         # leads whose owner lookup a job could not finish. Bounded (25 parcels,

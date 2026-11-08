@@ -778,6 +778,9 @@ class BatchRun(Base):
     status = Column(String(16), nullable=False, default="pending")
     child_job_ids = Column(JSON, nullable=False, default=list)
     combined_export_key = Column(String(512), nullable=True)  # R2 key of the combined CSV
+    # Migration 135: the combined CSV held an erased person; downloads render from the
+    # database instead of R2.
+    privacy_invalidated_at = Column(DateTime(timezone=True), nullable=True)
     excluded_no_date_count = Column(Integer, nullable=False, default=0)
     failed_children = Column(JSON, nullable=True)  # [{job_id, county, record_type, reason}]
     # At-most-once barrier claim (Codex P2): the completion sweep stamps this
@@ -900,6 +903,9 @@ class Job(Base):
     page_total = Column(Integer, nullable=False, default=0)
     record_count = Column(Integer, nullable=False, default=0)
     export_key = Column(String(512), nullable=True)
+    # Migration 135: the R2 export held an erased person; the object is deleted and
+    # downloads render from the database (which excludes flagged rows).
+    privacy_invalidated_at = Column(DateTime(timezone=True), nullable=True)
     error_message = Column(Text, nullable=True)
     retry_count = Column(Integer, nullable=False, default=0)
     date_from = Column(String(16), nullable=True)   # resolved MM/DD/YYYY
@@ -1213,6 +1219,8 @@ class Result(Base):
     # Migration 130: the rule generation (RuleSnapshot.generation) this row was last
     # authorized against; the enforcer sweep reads rows behind the current one.
     privacy_checked_gen = Column(BigInteger, nullable=False, server_default=text("0"))
+    # Migration 135: when a deletion request's erasure blanked this row (D3 skeleton).
+    privacy_erased_at = Column(DateTime(timezone=True), nullable=True)
     # Phase 4 (migration 038): structured tax-delinquency fields for amount/age
     # filtering. Populated SOURCE-GATED (King Socrata tax_delinquent only);
     # other counties' tax rows stay NULL and never match a filter. bill_year is

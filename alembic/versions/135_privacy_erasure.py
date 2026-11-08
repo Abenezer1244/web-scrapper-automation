@@ -38,7 +38,8 @@ Per batch, under a transaction advisory lock on the rule:
   king_parcel_owners  matched parcels become tombstones (131).
   nts_notices     matched notices lose the grantor and go inactive (132).
   county_records  matched rows deleted (orphaned store).
-  jobs / batch_runs  marked invalidated when they hold an erased row with an R2 export.
+  jobs / batch_runs  marked invalidated when they hold a row erased in this call (also
+                  before they have an export: the driver's final sweep covers a late one).
 
 Downgrade refuses while any row was erased or invalidated: dropping the markers would
 re-enable the R2 download of a file that still names an erased person.
@@ -194,15 +195,16 @@ BEGIN
     v_counts := v_counts || jsonb_build_object('dialer', v_n);
 
     -- Re-stamped on every erasure (not only the first), so each erasure's R2 sweep
-    -- finds the exports it must delete by time.
+    -- finds the exports it must delete by time. Stamped even before a job has an
+    -- export: an in-flight job can still upload one built from pre-erasure data, and
+    -- the driver's final sweep (after every older job finished) deletes it then.
     UPDATE public.jobs j SET privacy_invalidated_at = now()
-     WHERE j.id = ANY(v_jobs) AND j.export_key IS NOT NULL;
+     WHERE j.id = ANY(v_jobs);
     GET DIAGNOSTICS v_n = ROW_COUNT;
     v_counts := v_counts || jsonb_build_object('jobs', v_n);
 
     UPDATE public.batch_runs b SET privacy_invalidated_at = now()
-     WHERE b.combined_export_key IS NOT NULL
-       AND b.child_job_ids::jsonb ?| CAST(v_jobs AS text[]);
+     WHERE b.child_job_ids::jsonb ?| CAST(v_jobs AS text[]);
     GET DIAGNOSTICS v_n = ROW_COUNT;
     v_counts := v_counts || jsonb_build_object('batch_runs', v_n);
 

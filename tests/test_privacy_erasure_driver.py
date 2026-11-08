@@ -206,3 +206,66 @@ def test_a_second_driver_skips_while_one_holds_the_lock(conn):
             assert drive_privacy_erasures(store=_Store()) == {"skipped": True}
         finally:
             other.execute(text("SELECT pg_advisory_unlock(7135000001)"))
+
+
+def test_an_export_uploaded_late_by_an_in_flight_job_is_swept_before_completion(conn):
+    """Codex P6d: a job running at the first pass builds its export from data it read
+    before the erasure and uploads it after the first sweep."""
+    rule_id, _ = _rule(conn)
+    lead = _lead(conn)
+    _q(conn, "UPDATE jobs SET status = 'running', export_key = NULL WHERE id = :j",
+       j=lead["job"])
+    store = _Store()
+    t0 = datetime.now(UTC)
+    assert _tick(store, t0) == {rule_id: "first_pass_done"}
+    assert _tick(store, t0) == {rule_id: "r2_swept"}
+    later = t0 + SECOND_PASS_DELAY + timedelta(minutes=1)
+    assert _tick(store, later) == {rule_id: "second_pass_waiting"}   # the job still runs
+    late_key = f"exports/{lead['user']}/{lead['job']}/leads.csv"
+    _q(conn, "UPDATE jobs SET status = 'done', export_key = :k WHERE id = :j",
+       k=late_key, j=lead["job"])
+    assert late_key not in store.deleted
+    assert _tick(store, later) == {rule_id: "second_pass_done"}
+    assert _tick(store, later) == {rule_id: "completed"}
+    assert late_key in store.deleted
+
+
+def test_a_running_batch_holds_the_second_pass(conn):
+    rule_id, _ = _rule(conn)
+    lead = _lead(conn)
+    batch = str(uuid.uuid4())
+    _q(conn, "INSERT INTO scraper_batches (id, user_id, state, fields, enrichment, schedule, "
+             "deliver) VALUES (:b, :u, 'WA', '[]', '[]', '{}', '{}')", b=batch, u=lead["user"])
+    run = _q(conn, "INSERT INTO batch_runs (id, batch_id, user_id, status, child_job_ids) "
+                   "VALUES (gen_random_uuid(), :b, :u, 'running', CAST(:kids AS json)) "
+                   "RETURNING id::text",
+             b=batch, u=lead["user"], kids=f'["{lead["job"]}"]').scalar()
+    store = _Store()
+    t0 = datetime.now(UTC)
+    _tick(store, t0)
+    _tick(store, t0)
+    later = t0 + SECOND_PASS_DELAY + timedelta(minutes=1)
+    assert _tick(store, later) == {rule_id: "second_pass_waiting"}
+    combined = f"exports/{lead['user']}/batch/{run}/combined.csv"
+    _q(conn, "UPDATE batch_runs SET status = 'done', combined_export_key = :k WHERE id = :r",
+       k=combined, r=run)
+    assert _tick(store, later) == {rule_id: "second_pass_done"}
+    assert _tick(store, later) == {rule_id: "completed"}
+    assert combined in store.deleted
+
+
+def test_a_lookup_still_out_at_tracerfy_holds_completion(conn):
+    rule_id, _ = _rule(conn)
+    lead = _lead(conn)
+    pid = _q(conn, "INSERT INTO pending_skip_trace_rows (id, job_id, result_id, user_id, "
+                   "property_address, status, tracerfy_queue_id) VALUES (gen_random_uuid(), "
+                   ":j, :r, :u, '1 TEST ST', 'submitted', 991) RETURNING id",
+             j=lead["job"], r=lead["result"], u=lead["user"]).scalar()
+    store = _Store()
+    t0 = datetime.now(UTC)
+    later = t0 + SECOND_PASS_DELAY + timedelta(minutes=1)
+    for now in (t0, t0, later):
+        _tick(store, now)
+    assert _tick(store, later) == {rule_id: "tracerfy_waiting"}
+    _q(conn, "UPDATE pending_skip_trace_rows SET status = 'quarantined' WHERE id = :i", i=pid)
+    assert _tick(store, later) == {rule_id: "completed"}

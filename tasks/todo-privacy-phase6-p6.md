@@ -40,8 +40,8 @@ name too). Privacy-protective and consistent with D2; the row is never delivered
 - [x] P6b src/privacy/erase.py (discovery here, erasure in the 135 function; matches = WITHHELD by this rule only, never REVIEW: design section 5; scan_cursor added to 135 for resumable passes): idempotent batch procedure (above), one transaction per
       batch, lock order users -> rows (account-deletion fence compatible), skips accounts
       purging/deleted (their own purge covers them).
-- [ ] P6c R2 invalidation (per open question 1).
-- [ ] P6d beat task drive_privacy_erasures: advisory lock, lease, budget 240 s; first pass,
+- [x] P6c R2 sweep (no endpoint changes: every download already renders from the DB).
+- [x] P6d beat task drive_privacy_erasures (advisory lock instead of leases; final R2 sweep added after Codex): advisory lock, lease, budget 240 s; first pass,
       R2 sweep, then a second pass >= 24 h later (after in-flight jobs drain); complete only
       if the second pass found nothing re-filled. Registered in scheduler + workers include.
 - [ ] Tests on the test DB for each slice; ruff; full privacy suite.
@@ -89,6 +89,21 @@ name too). Privacy-protective and consistent with D2; the row is never delivered
 - Medium cursor coverage: per-store tests at BATCH 1 and 2 (full pages, short last page,
   hand-over). Medium phone/email anchors: phone-only rule test (ORM-decrypted).
 - Low purging accounts: test that a purging account's row is found but left to 113.
+
+## P6c/d Codex review (first driver commit): NO-GO, fixed
+
+- Critical/High (one root cause): an in-flight job or batch builds its export from data
+  read before the erasure and uploads it after the sweep; the second pass finds nothing
+  new and the rule completes with the copy alive. FIXED: jobs and batch runs are stamped
+  even before they have an export; the drain barrier waits for batch runs too; a FINAL
+  R2 sweep runs after the second pass (everything older has finished) before completion.
+  Regression tests for a late job upload and a running batch.
+- High: no Celery time limits. FIXED: soft 270 s / hard 300 s; the lock is released in
+  finally.
+- Medium: time-window R2 selection can delete copies another erasure marked. Kept and
+  documented: only stale copies are ever deleted, every download renders from the DB.
+- Medium tests: added the late-upload, running-batch and Tracerfy-wait cases.
+- Account ZIPs: only those requested before the latest pass are expired or waited for.
 
 ## Open questions sent to the Codex consult (answered above)
 

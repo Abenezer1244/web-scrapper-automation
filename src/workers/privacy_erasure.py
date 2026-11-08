@@ -7,16 +7,21 @@ tasks/todo-privacy-phase6-p6.md P6c/P6d. One privacy_erasures row per rule (migr
 Phases, each resumable (markers and the scan cursor live on the row):
   first pass   every store, src/privacy/erase.py, one committed step at a time.
   R2 sweep     the exports that named the subject: job exports and batch combined CSVs
-               marked invalidated during this erasure, and the ready account-export
-               ZIPs of their owners (set 'expired'; the owner can request a new one).
+               marked invalidated during this erasure, and their owners' ready
+               account-export ZIPs requested before the pass (set 'expired'; the owner
+               can request a new one). Selection is by time since the erasure began,
+               so it can also delete copies another erasure marked: only stale copies,
+               never anything a download needs.
                Every download renders from the database, which already excludes the
                rows, so nothing a customer can reach breaks; only stale copies go. A
                delete that fails raises: the sweep is never marked done on an error.
-  second pass  at least 24 h after the first, and only once no job created before it
-               is still running. If it erases anything (an in-flight write landed), the
+  second pass  at least 24 h after the first, and only once no job or batch run
+               started before it is still running. If it erases anything (an in-flight write landed), the
                erasure goes round again: new R2 sweep, new second pass 24 h later.
-  complete     once the second pass erased nothing and no lookup of an erased lead is
-               still out at Tracerfy.
+  final sweep  the R2 sweep again, after everything older than the first pass has
+  + complete   finished (a late upload built from pre-erasure data exists by then);
+               complete once it succeeds and no lookup of an erased lead is still out
+               at Tracerfy.
 
 One driver at a time: a session advisory lock held on its own connection for the
 whole tick (as account_deletion_beat). A failure is recorded on the row (the
@@ -43,9 +48,13 @@ _OPEN_SQL = text(
     "first_pass_at, r2_swept_at, second_pass_at, scan_cursor, counts "
     "FROM privacy_erasures WHERE completed_at IS NULL ORDER BY created_at"
 )
-_IN_FLIGHT_JOBS_SQL = text(
+# Anything started before the first pass may still upload an export built from data
+# read before it: the second pass and the final sweep wait for all of it.
+_IN_FLIGHT_SQL = text(
     "SELECT 1 FROM jobs WHERE created_at < :before "
-    "AND status NOT IN ('done', 'failed', 'cancelled') LIMIT 1"
+    "AND status NOT IN ('done', 'failed', 'cancelled') "
+    "UNION ALL SELECT 1 FROM batch_runs WHERE created_at < :before "
+    "AND status IN ('pending', 'running') LIMIT 1"
 )
 _OUT_AT_TRACERFY_SQL = text(
     "SELECT 1 FROM pending_skip_trace_rows p JOIN results r ON r.id = p.result_id "
@@ -62,13 +71,16 @@ _OWNERS_SQL = (
     "SELECT DISTINCT user_id FROM jobs WHERE privacy_invalidated_at >= :since "
     "UNION SELECT DISTINCT user_id FROM batch_runs WHERE privacy_invalidated_at >= :since"
 )
+# Account ZIPs requested before the latest pass could hold the subject; later ones are
+# rendered from the already-erased rows.
 _EXPORTS_BUILDING_SQL = text(
     f"SELECT 1 FROM account_exports WHERE status IN ('pending', 'building') "  # noqa: S608
-    f"AND user_id IN ({_OWNERS_SQL}) LIMIT 1"  # constant SQL only
+    f"AND requested_at < :until AND user_id IN ({_OWNERS_SQL}) LIMIT 1"  # constant SQL
 )
 _EXPORTS_READY_SQL = text(
     f"SELECT id::text AS id, user_id::text AS user_id FROM account_exports "  # noqa: S608
-    f"WHERE status = 'ready' AND user_id IN ({_OWNERS_SQL})"  # constant SQL only
+    f"WHERE status = 'ready' AND requested_at < :until "
+    f"AND user_id IN ({_OWNERS_SQL})"  # constant SQL only
 )
 
 
@@ -122,7 +134,7 @@ def _json(value) -> str:
 def _sweep_r2(db, row, store: R2Store, deadline: float) -> bool:
     """Delete this erasure's export copies. False = wait (an account export is still
     being built for an affected owner, so it could hold the subject)."""
-    since = {"since": row.created_at}
+    since = {"since": row.created_at, "until": row.first_pass_at}
     if db.execute(_EXPORTS_BUILDING_SQL, since).first():
         db.rollback()
         return False
@@ -172,7 +184,7 @@ def _advance(db, row, store: R2Store, deadline: float, now: datetime) -> str:
         return "r2_swept"
     if row.second_pass_at is None:
         if now < row.first_pass_at + SECOND_PASS_DELAY or db.execute(
-                _IN_FLIGHT_JOBS_SQL, {"before": row.first_pass_at}).first():
+                _IN_FLIGHT_SQL, {"before": row.first_pass_at}).first():
             db.rollback()
             return "second_pass_waiting"
         finished, erased = _run_pass(db, row, rule, deadline, "second_pass_erased")
@@ -187,6 +199,11 @@ def _advance(db, row, store: R2Store, deadline: float, now: datetime) -> str:
             return "repeat"
         _set(db, row.rule_id, "second_pass_at = :now, scan_cursor = '{}'::jsonb", now)
         return "second_pass_done"
+    # Final sweep: every job and batch run older than the first pass has finished, so
+    # any export one uploaded from pre-erasure data exists now and goes now. Repeated
+    # (idempotent) on every tick that waits for Tracerfy below.
+    if not _sweep_r2(db, row, store, deadline):
+        return "final_r2_waiting"
     if db.execute(_OUT_AT_TRACERFY_SQL).first():
         db.rollback()
         return "tracerfy_waiting"
@@ -240,7 +257,11 @@ def drive_privacy_erasures(*, budget_s: float = _TICK_BUDGET_S, store: R2Store |
 try:  # pragma: no cover -- registration only
     from src.workers import app
 
-    @app.task(name="src.workers.privacy_erasure.drive_privacy_erasures")
+    # Hard limits above the 240 s budget: a blocked query or R2 call cannot hold the
+    # advisory lock for the worker default's hour. The soft limit raises inside the
+    # tick (recorded as that rule's error); the lock's finally block releases it.
+    @app.task(name="src.workers.privacy_erasure.drive_privacy_erasures",
+              soft_time_limit=270, time_limit=300)
     def drive_privacy_erasures_task() -> dict:
         """Beat entry point: see drive_privacy_erasures."""
         return drive_privacy_erasures()

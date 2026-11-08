@@ -19,6 +19,30 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-11-07 (late) — Supabase Data API could call a privacy function; server clock for the wait copy
+
+**Built / Shipped:** migration 134 revokes everything anon/authenticated hold in public and service_role's EXECUTE
+on functions (object by object, owned objects only, extensions skipped, postcondition, downgrade no-op); hourly
+audit alerts `api_role_exposure`; contact lookup status returns `as_of` and the FE times the delay on it.
+**Tried / Decided:** found while revoking the low-severity pending_skip_trace_rows grants: postgres's default
+privileges grant anon/authenticated everything, and the Data API serves public (probe: GET
+/rest/v1/alembic_version?limit=0 -> 200 []). Rows were safe (RLS, no policy), but SECURITY DEFINER
+privacy_rule_rows() was callable by anon (High). Did not call the RPC to confirm; grants + exposed schema suffice.
+Applying the revoke directly in prod was refused by the session permission layer; it ships as 134 instead.
+**Failed / Blocked:** first draft of 134 used REVOKE ... ON ALL ... IN SCHEMA: on Supabase postgres is not
+superuser and some functions are owned by bridgeleads_purge, so it could have errored; and service_role could
+still call activation_funnel(_v2)/grant_referral_credit, which would have failed the postcondition on deploy.
+Caught by checking prod ACLs before shipping. Gmail draft for the customer failed (connector auth).
+**Caught & fixed:** Codex: foreign tables and column INSERT/UPDATE missing from the checks; alert wording;
+tests for a non-superuser owner, later sequences/functions, absent roles. Rejected: a global PUBLIC EXECUTE
+default revoke (would break future migrations; the audit covers it).
+**Pending / Handoff:** owner: turn the Data API off in the Supabase dashboard; send the customer note.
+**Facts learned:** on this project the Data API is live with the publishable key; every new public object
+created by postgres used to be granted to anon/authenticated, so RLS was the only barrier for tables and
+there was none for SECURITY DEFINER functions.
+
+---
+
 ## 2026-11-07 — Privacy: write gates and the enforcer sweep (compliance Phase 6 P5)
 
 **Built / Shipped:** every path that WRITES person data now honours the suppression rules; all
@@ -103,6 +127,8 @@ under `.leads`, not `.items`. Caught by a per-batch count control before the emp
 into search before the first results response lands gets reset. inner_text returns CSS-uppercased labels.
 The card DETAILS section is collapsed by default. Batches in delivery_mode `overlaps_only` list only stacked
 properties; use an `everything` batch.
+
+---
 
 ## 2026-11-07 — Contact lookups stuck in "starting": the worker could not see them (RLS)
 

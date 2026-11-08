@@ -2111,6 +2111,7 @@ async def get_contact_lookup(
         settled_at=row.settled_at,
         status_changed_at=row.status_changed_at,
         pause=await _lookup_pause(user_id) if waiting else None,
+        as_of=datetime.now(UTC),
     )
 
 

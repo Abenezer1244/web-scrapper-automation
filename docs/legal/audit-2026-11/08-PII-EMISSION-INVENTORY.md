@@ -29,7 +29,6 @@ property and mailing addresses, parcel ids, phones, emails) or about customers (
 | `verify_tracerfy_provenance.py:85-90` | party name, property address, decrypted phone, email, phones, emails | stdout |
 | `purge_test_batch_configs.py:177` (`--backup`) | `SELECT *` of results and related rows | local JSON file |
 | `verify_entitlement_deploy.py:175` | every user's email, plan and usage | local JSON baseline |
-| `diag_test11_dq.py:62` | every scraped row of a live scrape | `test11_dq.json` (now ignored) |
 | `backfill_king_code_violation_owner.py:235,394` | addresses, old and new party | `king_*` JSONL (ignored) |
 | `backfill_assumed_mailing.py`, `backfill_pierce_statewide_mailing.py`, `king_rpacct_mailing.py`, `king_taxbill_mailing_check.py`, `repair_king_property_situs.py`, `backfill_property_situs_parts.py`, `backfill_king_code_violation_mailing.py`, `release_stranded_dedup_claims.py` | parcel, property and mailing addresses, some party names | root-level JSONL (now ignored) + stdout |
 
@@ -37,7 +36,7 @@ property and mailing addresses, parcel ids, phones, emails) or about customers (
 
 
 `repair_nts_ts_number.py`,
-`diag_nts_stored_vs_source.py`, `diag_skip_trace_match_audit.py`, `diag_match_key_collisions.py`,
+`diag_nts_stored_vs_source.py`,
 `rerun_pierce_address_recovery.py`.
 
 **Customer emails to stdout (Medium):** `diag_scraper_name_collisions.py`,
@@ -135,3 +134,6 @@ Deleted from `scripts/` in Phase 6 P7 (one-off diagnostics and finished backfill
 - diag_nts_null_downgrade
 - diag_nts_pointer_integrity
 - diag_nts_recent_matches
+- diag_test11_dq
+- diag_match_key_collisions
+- diag_skip_trace_match_audit

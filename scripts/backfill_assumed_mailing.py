@@ -58,6 +58,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from sqlalchemy import text  # noqa: E402
 
+from src.api.lead_actionability import not_privacy_suppressed_sql  # noqa: E402
 from src.db.session import system_sync_session  # noqa: E402
 from src.scrapers.enrichment.county_gis import (  # noqa: E402
     _KNOWN_GIS_ENDPOINTS,
@@ -101,6 +102,7 @@ _CANDIDATES = text(
       AND r.mailing_address IS NOT NULL AND btrim(r.mailing_address) <> ''
       AND {_SITUS_COPY}
       AND COALESCE(r.enrichment_data ->> '{_STATUS_KEY}', '') <> ALL(:terminal)
+      AND {not_privacy_suppressed_sql("r")}
     ORDER BY (COALESCE(r.enrichment_data ->> '{_STATUS_KEY}', '') = 'retry_later'),
              r.created_at, r.id
     """  # noqa: S608 — all interpolated fragments are module constants, not input
@@ -127,8 +129,10 @@ _MERGE = """
         )::json
 """
 # Guarded on BOTH addresses so a concurrent enrichment write loses the race
-# loudly (rowcount 0) instead of being silently clobbered (Codex P2).
-_WHERE = " WHERE id = :id AND mailing_address = :old AND property_address = :old_property "
+# loudly (rowcount 0) instead of being silently clobbered (Codex P2). A privacy-withheld
+# row is never written (the predicate is a code constant).
+_WHERE = (" WHERE id = :id AND mailing_address = :old AND property_address = :old_property "
+          f" AND {not_privacy_suppressed_sql('results')} ")
 
 _UPDATE = text(
     f"""
@@ -161,7 +165,7 @@ _RULES = {
 # NULL and so can never be re-selected as candidates — they need this pass. No
 # external source is touched; the state comes from the config's own county.
 _REPAIR = text(
-    """
+    f"""
     SELECT r.id, r.property_address, r.mailing_address, r.property_city, r.property_zip,
            r.property_state, r.owner_state, r.absentee_owner, r.out_of_state_owner, sc.state
     FROM results r
@@ -170,18 +174,20 @@ _REPAIR = text(
     WHERE sc.state = 'WA' AND sc.county = ANY(:counties)
       AND COALESCE(r.enrichment_data ->> 'mailing_source', '') <> ''
       AND r.property_address IS NOT NULL AND btrim(r.property_address) <> ''
+      AND {not_privacy_suppressed_sql("r")}
     ORDER BY r.created_at, r.id
-    """
+    """  # noqa: S608 — module constants, not input
 )
 _REPAIR_UPDATE = text(
-    """
+    f"""
     UPDATE results
     SET property_state = :property_state, owner_state = :owner_state,
         absentee_owner = :absentee_owner, out_of_state_owner = :out_of_state_owner
     WHERE id = :id
       AND property_address = :old_property
       AND mailing_address IS NOT DISTINCT FROM :old
-    """
+      AND {not_privacy_suppressed_sql("results")}
+    """  # noqa: S608 — module constants, not input
 )
 
 

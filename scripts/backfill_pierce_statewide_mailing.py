@@ -37,6 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from sqlalchemy import text  # noqa: E402
 
+from src.api.lead_actionability import not_privacy_suppressed_sql  # noqa: E402
 from src.db.session import system_sync_session  # noqa: E402
 from src.scrapers.enrichment.county_gis import (  # noqa: E402
     _KNOWN_GIS_ENDPOINTS,
@@ -51,9 +52,10 @@ _CHUNK = 50
 
 # Exact fabricated signature: the statewide builder produced situs + ", WA" and nothing
 # else in the pipeline does. A legitimate zip-less WA mailing line (e.g. "PO BOX 1,
-# TACOMA, WA") is NOT selected (Codex P1).
+# TACOMA, WA") is NOT selected (Codex P1). A privacy-withheld row is never read,
+# printed or written (the interpolated predicate is a code constant).
 _CANDIDATES = text(
-    """
+    f"""
     SELECT r.id, r.parcel_id, r.property_address, r.mailing_address
     FROM results r
     JOIN jobs j ON j.id = r.job_id
@@ -62,11 +64,12 @@ _CANDIDATES = text(
       AND sc.record_type IN ('pre_foreclosure', 'trustee_sale')
       AND r.parcel_id IS NOT NULL
       AND r.mailing_address = r.property_address || ', WA'
+      AND {not_privacy_suppressed_sql("r")}
     ORDER BY r.created_at
-    """
+    """  # noqa: S608
 )
 _UPDATE = text(
-    """
+    f"""
     UPDATE results
     SET mailing_address = :mailing,
         property_state = :property_state,
@@ -74,7 +77,8 @@ _UPDATE = text(
         absentee_owner = :absentee_owner,
         out_of_state_owner = :out_of_state_owner
     WHERE id = :id AND mailing_address = :old
-    """
+      AND {not_privacy_suppressed_sql("results")}
+    """  # noqa: S608
 )
 
 

@@ -90,6 +90,7 @@ _LOOKUP_PIN = f"""(CASE WHEN r.enrichment_data->>'resolved_by' = '{KING_ACCOUNT_
 
 _ELIGIBLE_ROW = f"""
       r.is_duplicate = false
+  AND r.privacy_suppressed_at IS NULL
   AND r.enrichment_data->>'delivery_excluded_reason' IS NULL
   AND coalesce(r.enrichment_data->>'{PROPERTY_DEFERRED_KEY}', '') = 'true'
   AND coalesce(btrim(r.property_address), '') IN ('', '(enrichment unavailable)')

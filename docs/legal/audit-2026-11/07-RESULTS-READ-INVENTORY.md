@@ -214,7 +214,7 @@ the verdicts there are not rewritten. Where each gap stands now:
 | 7 public cache | Closed (P3b-2) |
 | 8a enrich job-log line | Closed (P3b-2) |
 | 8b late notices | Closed (P3b-1 follow-up) |
-| 8c `scripts/repair_orphaned_duplicate_flags.py` | OPEN, operator script: it should reuse `actionable_sql('r2')` before it is run again |
+| 8c `scripts/repair_orphaned_duplicate_flags.py` | CLOSED (P5g): its ranking CTE, which the claim and the promotion read, requires `actionable_sql('r')` |
 | 9 contact-lookup confirm | OPEN, optional: the worker's claim re-checks with `actionable_condition()` and the claim itself now refuses withheld rows |
 
 Everything marked DEFER-P4/P5 above (send and write paths) is unchanged and belongs to those slices.

@@ -200,3 +200,47 @@ async def test_a_lead_whose_config_is_another_tenants_is_quarantined(
     _ingest(qid)
     assert _pending_status(row["pending_id"]) == "quarantined"
     assert _result_row(row["result_id"]).phone is None
+
+
+def _phone_rule(phone_digits: str) -> list[dict]:
+    """pending -> active: a rule anchored on a PHONE (subject DOE JANE)."""
+    [subject] = authorize_mod._subjects({"party_name": "DOE JANE"}, "probate", "pierce")
+    s_kind, s_value = subject_key_values(subject)[0]
+    t0, rule_id = datetime(2026, 11, 7, tzinfo=UTC), str(uuid.uuid4())
+    return [{
+        "id": str(uuid.uuid4()), "rule_id": rule_id, "anchor_kind": "phone",
+        "anchor_hmac": keys.privacy_hmac("phone", phone_digits, "v1"),
+        "subject_kind": s_kind, "subject_hmac": keys.privacy_hmac(s_kind, s_value, "v1"),
+        "scope": "subject", "key_version": "v1", "normalization_version": NORMALIZATION_VERSION,
+        "state": state, "created_at": t0 + timedelta(minutes=i),
+    } for i, state in enumerate(("pending", "active"))]
+
+
+async def test_an_answer_whose_own_phone_a_rule_anchors_is_quarantined(
+    starter_user, answers, monkeypatch,
+):
+    """P5h: the incoming phone is an anchor too. The lead's name cannot be read in its
+    source's order, so it is allowed until the answer's phone (the rule's anchor) is on
+    it: anchor + unresolved subject -> review -> quarantined. Its control, a readable
+    other person, gets the same phone and is stored and billed as always."""
+    qid = _next_queue_id()
+    seed = _seed(starter_user.id, qid, [("3 FIR ST", "TACOMA", "WA"), ("4 FIR ST", "TACOMA", "WA")])
+    held, kept = seed["rows"]
+    with system_sync_session() as db:
+        db.execute(text("UPDATE results SET party_name = 'ИВАНОВ ИВАН' WHERE id = :r"),
+                   {"r": held["result_id"]})
+        db.execute(text("UPDATE results SET party_name = 'ROE RICK' WHERE id = :r"),
+                   {"r": kept["result_id"]})
+        db.commit()
+    answers(_csv(_ANSWER.format(addr="3 FIR ST"), _ANSWER.format(addr="4 FIR ST")))
+    monkeypatch.setattr(authorize_mod, "load_rule_snapshot",
+                        lambda db: build_snapshot(_phone_rule("2065550100")))
+    before = _usage(starter_user.id)
+
+    _ingest(qid)
+    assert _pending_status(held["pending_id"]) == "quarantined"
+    assert _result_row(held["result_id"]).phone is None
+    assert _cache_count(held["pending_id"]) == 0
+    assert _pending_status(kept["pending_id"]) == "completed"
+    assert _result_row(kept["result_id"]).phone == "2065550100"
+    assert _usage(starter_user.id) == before + 1

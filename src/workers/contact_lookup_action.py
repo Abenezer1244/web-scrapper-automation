@@ -415,14 +415,21 @@ def _claim(db, action_id: str, token: str) -> dict:
 
     # D1 step 4: charged but unanswered -> settled exactly as the enqueue settles it.
     kept, _ = settle_charged_unanswered(db, uid, [rec for rec, _p in candidates])
+    # One privacy snapshot for the cached copies (Phase 6 P5h); unreadable rules raise
+    # and the action's transaction rolls back.
+    from src.privacy.authorize import load_rule_snapshot
+
+    privacy = load_rule_snapshot(db)
     kept_ids = {str(rec.id) for rec in kept}
     to_claim: list[dict] = []
     for rec, payload in candidates:
         rid = str(rec.id)
         if rid not in kept_ids:
             verdicts[rid] = "already_answered"
-        elif copy_cached_answer(db, uid, rec, payload):  # D1 step 5
-            verdicts[rid] = "reused"
+        elif (copied := copy_cached_answer(db, uid, rec, payload, privacy)) == "copied":
+            verdicts[rid] = "reused"                        # D1 step 5
+        elif copied == "withheld":
+            verdicts[rid] = "ineligible"                    # flagged by a privacy rule
         else:
             to_claim.append(payload)
 

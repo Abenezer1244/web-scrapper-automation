@@ -152,11 +152,24 @@ def deliver_completed_held_rows(*, batch: int = _BATCH_ROWS) -> dict:
     from src.db.session import rls_sync_session, system_sync_session
 
     stats = {"candidates": 0, "delivered": 0, "no_quota": 0, "blocked": 0, "stale": 0,
-             "errors": 0, "skipped": ""}
+             "errors": 0, "privacy_withheld": 0, "skipped": ""}
     if not settings.CV_LATE_DELIVERY_ENABLED:
         stats["skipped"] = "CV_LATE_DELIVERY_ENABLED is off"
         return stats
+    from src.privacy.authorize import RuleSnapshotError, load_rule_snapshot
+
     with system_sync_session() as db:
+        # The privacy rules before any delivery (Phase 6 P5g): a held row a rule
+        # withholds is flagged, never charged. Unreadable rules: the whole tick does
+        # nothing (no delivery, contact request, dialer push or notice; Codex), and
+        # still reports every count.
+        try:
+            privacy = load_rule_snapshot(db)
+        except RuleSnapshotError as exc:
+            db.rollback()
+            _logger.error("Late delivery: privacy rules unavailable: %s", exc)
+            return {**stats, "skipped": "privacy rules unavailable",
+                    "contacts_requested": 0, "dialer_pushed": 0, "notified_accounts": 0}
         rows = db.execute(sa_text(_CANDIDATES_SQL),
                           {"batch": batch, "per_account": _PER_ACCOUNT_ROWS}).mappings().all()
         db.rollback()
@@ -169,7 +182,7 @@ def deliver_completed_held_rows(*, batch: int = _BATCH_ROWS) -> dict:
     for user_id, account_rows in by_account.items():
         with rls_sync_session(user_id) as db:
             for row in account_rows:
-                outcome = _deliver_one(db, row)
+                outcome = _deliver_one(db, row, privacy)
                 stats[outcome] += 1
                 if outcome in ("no_quota", "blocked"):
                     break                        # the rest of this account cannot be charged either
@@ -550,8 +563,13 @@ def notify_late_deliveries() -> int:
     return announced
 
 
-def _deliver_one(db, row) -> str:
-    """Deliver and charge one row in its own transaction; the stats key for the outcome."""
+def _deliver_one(db, row, privacy) -> str:
+    """Deliver and charge one row in its own transaction; the stats key for the outcome.
+
+    The row is authorized under `privacy` while locked and BEFORE any charge: a row a
+    rule withholds is flagged and never charged (`privacy_withheld`); a rule error rolls
+    the row back like any other failure."""
+    from src.privacy.enforce import enforce_rows
     from src.workers.tasks import grant_records
 
     params = {"rid": row["id"], "uid": row["user_id"], "jid": row["job_id"]}
@@ -570,6 +588,9 @@ def _deliver_one(db, row) -> str:
         if holder != row["id"]:
             db.rollback()                        # a later run took the claim and delivered it
             return "stale"
+        if enforce_rows(db, privacy, [row["id"]]).flagged:
+            db.commit()                          # flagged: never charged, never delivered
+            return "privacy_withheld"
         granted, window_start, at, block = grant_records(
             db, user_id=row["user_id"], want=1, unlimited_grants=True)
         if granted < 1:

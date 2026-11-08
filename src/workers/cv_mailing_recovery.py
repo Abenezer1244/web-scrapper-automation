@@ -73,6 +73,7 @@ _PRINTED_SOURCES_SQL = ", ".join(f"'{k}'" for k in sorted(PARCEL_AT_SCRAPE_SOURC
 _ELIGIBLE_ROW = f"""
       r.parcel_id IS NULL
   AND r.mailing_address IS NULL
+  AND r.privacy_suppressed_at IS NULL
   AND jsonb_typeof(r.enrichment_data::jsonb) = 'object'
   AND r.enrichment_data::jsonb ? 'latitude'
   AND r.enrichment_data::jsonb ? 'longitude'

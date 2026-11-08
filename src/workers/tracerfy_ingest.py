@@ -532,19 +532,18 @@ def _release_recheck_chain(queue_id: int) -> None:
         _logger.warning("recheck-chain release failed for queue %d: %s", queue_id, str(exc)[:120])
 
 
-def _privacy_withheld(db, snapshot, pending: list) -> set:
-    """Pending row ids whose lead a privacy rule withholds or holds for review.
+def _privacy_leads(db, snapshot, pending: list) -> dict | None:
+    """{pending row id: its lead's authorize() columns + record type/county/state, or
+    None when the lead cannot be read}. None (not a dict) when no rule is active.
 
     One read of the leads with their job and config, every join pinned to the lead's
-    own tenant; authorize() is pure. No active rule: nothing to read. A pending row
-    whose lead, job or config cannot be read that way cannot be authorized (no county
-    means no parcel anchor), so it is treated as withheld: fail closed, never stored."""
+    own tenant. A lead that cannot be read that way cannot be authorized (no county
+    means no parcel anchor): _withheld_with_answer treats it as withheld."""
     if not snapshot.by_anchor or not pending:
-        return set()
+        return None
     from sqlalchemy import select, tuple_
 
     from src.db.models import Job, Result, ScraperConfig
-    from src.privacy.authorize import authorize
 
     found = db.execute(
         select(Result.id, Result.user_id, Result.parcel_id, Result.party_name, Result.heirs,
@@ -557,10 +556,34 @@ def _privacy_withheld(db, snapshot, pending: list) -> set:
         .where(tuple_(Result.id, Result.user_id).in_(
             [(p.result_id, p.user_id) for p in pending]))
     ).mappings().all()
-    allowed = {(str(m["id"]), str(m["user_id"])) for m in found
-               if authorize(snapshot, m, record_type=m["record_type"],
-                            county=m["county"], state=m["state"]).deliverable}
-    return {p.id for p in pending if (str(p.result_id), str(p.user_id)) not in allowed}
+    by_lead = {(str(m["id"]), str(m["user_id"])): m for m in found}
+    return {p.id: by_lead.get((str(p.result_id), str(p.user_id))) for p in pending}
+
+
+def _withheld_with_answer(snapshot, leads: dict | None, matches: list, csv_row: dict) -> list:
+    """The matched pending rows whose lead, WITH this answer's phones and emails on it,
+    a rule withholds or holds for review (Phase 6 P5h: the incoming contacts are privacy
+    anchors too). A lead that could not be read: withheld, fail closed. authorize() is
+    pure; RuleSnapshotError propagates and the ingest rolls back."""
+    if leads is None:
+        return []
+    from src.privacy.authorize import authorize
+
+    phones = [csv_row.get("phone"), *(csv_row.get("phones") or [])]
+    emails = [csv_row.get("email"), *(csv_row.get("emails") or [])]
+    held = []
+    for p in matches:
+        lead = leads.get(p.id)
+        if lead is None:
+            held.append(p)
+            continue
+        row = dict(lead)
+        row["phones"] = [*(lead["phones"] or []), *(x for x in phones if x)]
+        row["emails"] = [*(lead["emails"] or []), *(x for x in emails if x)]
+        if not authorize(snapshot, row, record_type=lead["record_type"],
+                         county=lead["county"], state=lead["state"]).deliverable:
+            held.append(p)
+    return held
 
 
 def _quarantine(db, rows: list, now) -> None:
@@ -822,7 +845,8 @@ def ingest_tracerfy_batch(
         # never written unchecked.
         from src.privacy.authorize import load_rule_snapshot
 
-        withheld = _privacy_withheld(db, load_rule_snapshot(db), pending)
+        privacy = load_rule_snapshot(db)
+        leads = _privacy_leads(db, privacy, pending)
         quarantined_count = 0
 
         pending_by_key: dict[tuple[str, str, str], list] = {}
@@ -890,11 +914,12 @@ def ingest_tracerfy_batch(
                 )
                 continue
             matched_pending_ids.update(p.id for p in matches)
-            held = [p for p in matches if p.id in withheld]
+            held = _withheld_with_answer(privacy, leads, matches, csv_row)
             if held:
                 _quarantine(db, held, now)
                 quarantined_count += len(held)
-                matches = [p for p in matches if p.id not in withheld]
+                held_ids = {p.id for p in held}
+                matches = [p for p in matches if p.id not in held_ids]
                 if not matches:
                     continue
 

@@ -1914,6 +1914,60 @@ def run_scrape_job(self, job_id: str) -> None:
             )
             record_degraded(db, r, job_id, "claim_transfer", exc)
 
+        # ── Phase 6 P5f: privacy gate over everything this job wrote (design section 6) ──
+        # Every in-job writer that can add a subject or contact to a saved row has run by
+        # now: inline enrichment (owner and assessor-owner fills, stored King answers,
+        # duplicate reuse of contacts, cached contact copies), the NTS match, survivor
+        # reconciliation and merges (heirs), claim transfer, the trustee-sale finalizer.
+        # One check of all of the job's rows, before the refetch that the plan cap,
+        # billing, the re-export, skip trace and every delivery read: a row now naming a
+        # withheld person is flagged, and every one of those paths drops it. Rules that
+        # cannot be read (after two short retries) fail the attempt: nothing is capped,
+        # billed or delivered, and a failed run's rows are not shown to the customer.
+        from src.privacy.authorize import RuleSnapshotError, load_rule_snapshot
+        from src.privacy.enforce import EnforceStats, enforce_rows
+
+        _privacy_stats, _privacy_error = EnforceStats(), None
+        for _wait_s in (0, 2, 5):
+            time.sleep(_wait_s)
+            try:
+                _rules_now = load_rule_snapshot(db)
+                if _rules_now.generation:
+                    _privacy_stats = enforce_rows(db, _rules_now, db.execute(
+                        select(Result.id).where(Result.job_id == job_id,
+                                                Result.user_id == job.user_id)
+                    ).scalars().all())
+                    db.commit()
+                _privacy_error = None
+                break
+            except RuleSnapshotError as exc:
+                db.rollback()
+                _privacy_error = exc
+        if _privacy_error is not None:
+            _logger.error("Job %s: privacy rules unavailable after enrichment: %s",
+                          job_id, _privacy_error)
+            # Release this attempt's dedup claims first, as every post-dedup failure
+            # does, so a rerun does not read its own leads as already delivered.
+            try:
+                release_run_claims_if_owned(db, job_id, _boot_user_id, attempt_token)
+                db.commit()
+            except Exception as cleanup_exc:
+                db.rollback()
+                _logger.error("Job %s: failed to release dedup claims after the privacy "
+                              "check failed: %s", job_id, str(cleanup_exc)[:200])
+            _fail_attempt(
+                "We could not check this run against privacy requests, so nothing was "
+                "delivered and you were not charged. Please run it again."
+            )
+            return
+        if _privacy_stats.flagged:
+            _publish_log(
+                r, job_id, "info",
+                f"Withheld {_privacy_stats.flagged} lead(s) because the people named "
+                "asked not to be included.",
+                db=db,
+            )
+
         # Fetch post-enrichment rows ONCE; reused by re-export AND membership.
         # Same deterministic order as the in-app download (jobs.py) so the emailed/
         # R2 CSV and the download are byte-identical, not just same-columns (Codex).

@@ -42,6 +42,58 @@ created by postgres used to be granted to anon/authenticated, so RLS was the onl
 there was none for SECURITY DEFINER functions.
 
 ---
+
+## 2026-11-07 — Privacy: write gates and the enforcer sweep (compliance Phase 6 P5)
+
+**Built / Shipped:** every path that WRITES person data now honours the suppression rules; all
+dormant until P7 (migration 125 keeps every rule 'pending'). Plan + manifest:
+`tasks/todo-privacy-phase6-p5.md`.
+- #601 (P4) merged + verified first (128->129). #602 (P5a+P5b): authorize() reads the owner of
+  record a customer receives (`enrichment_data.assessor_current_owner`); a column projection
+  missing an authorize() column fails closed; migration 130 `results.privacy_checked_gen` +
+  `king_parcel_owners` 'privacy_withheld'. #603 (P5c+P5d): `src/privacy/enforce.py`
+  enforce_rows + the enforcer beat (every 10 min; first prod tick: generation 0, 0.13 s) and
+  the scrape insert gate (withheld records never saved).
+- P5e (#604 readers, then writers): migrations 131/132 make King owner tombstones and NTS
+  notices remember the rule that withheld them; every reader honours it; writers store a
+  tombstone, never the name, and keep a withheld notice inactive across later crawls.
+- P5f-P5h: one privacy check over everything a scrape job wrote (before cap, billing, export,
+  skip trace, delivery); owner sweeps check every name they write; cached and Tracerfy answers
+  are checked WITH their own phones/emails (anchors); late delivery authorizes before charging;
+  the orphaned-duplicate repair only lets a deliverable row claim (gap 8c closed); mailing and
+  property sweeps never write onto a withheld lead.
+
+**Tried / Decided:**
+- A nameless lead (King tax waiting for its owner, a trustee sale built from a notice) still
+  carries the person's property and mailing; authorize() cannot match it. So the shared stores
+  carry the rule and readers flag/skip on it, rather than relying on the name.
+- Sweep cost: no `updated_at` on results, so a checked-generation column (count of active rule
+  rows ever written, read in the same statement as the rules) instead of a full scan per tick.
+- Readers deploy before writers (Codex): #604 alone, the writers in a later PR.
+- Enforcer is lock-free (idempotent writes, nothing leaves the DB); verified in prod
+  pg_policies that bridgeleads_system sees every tenant (`*_system USING (true)`).
+- Operator scripts stay held by P7's activation gate test, not P5.
+
+**Failed / Blocked:**
+- I broke #604's CI with my own 130 test (a tombstone without a rule, which 131 then refused);
+  I had not re-run the 130 test after adding 131. Fixed, Codex GO.
+- A "skip-trace tests only" local run expanded to the whole suite and ran concurrently with
+  another run on the same test DB: interference failures. Only run one pytest per test DB.
+
+**Caught & fixed (Codex, 15+ rounds):** unscoped rows left deliverable; tombstone store
+overwrite; placeholder-named King leads missed; three NTS readers missed (Snohomish PDF,
+finalizer, re-sweep); a writer after the job gate (cached contact copy); stranded claims on a
+failed check; repair-script reports hiding withheld orphans; a withdrawal NULLing contacts.
+Found myself: P4 projections lacked enrichment_data (owner of record read as absent).
+
+**Pending / Handoff:** merge the remaining P5 PRs in order (readers, writers, P5f-h), each
+verified on Railway. Then P6 (erasure) and P7 (activation) need owner approval. Beat's
+STRIPE_PRICE_BUSINESS/PRO were product ids (api/worker were right); fixed on the owner's ask.
+
+**Facts learned:** local tests need a Redis (Celery `.delay`): `docker run -d --name
+bl-test-redis -p 127.0.0.1:6379:6379 redis:7.4-alpine`. A CHECK added NOT VALID still checks
+every new write, including UPDATEs of old rows.
+
 ## 2026-11-07: NTS amount basis, post-deploy verification (handoff steps 1-2) + blank-amount label fix
 
 **Built:** FE #318 (merged by owner OK, live on bridgeleads.io): a blank amount gets no amount label on the

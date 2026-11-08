@@ -570,6 +570,7 @@ def _write_row(db, row, mailing, outcome, attempts, terminal, now_iso, stats,
                 "  AND user_id = :uid "          # tenant filter, always
                 "  AND parcel_id = :pid "        # the parcel we actually looked up
                 "  AND mailing_address IS NULL"  # never overwrite a real value
+                "  AND privacy_suppressed_at IS NULL"  # never onto a withheld lead (P5)
             ),
             {
                 "rid": row.id,

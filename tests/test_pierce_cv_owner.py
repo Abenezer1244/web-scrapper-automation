@@ -24,6 +24,7 @@ from sqlalchemy.exc import DBAPIError
 
 from src.config import settings
 from src.db.models import Job, Result, ScraperConfig
+from src.privacy.authorize import build_snapshot
 from src.scrapers import pierce_wa_code_violation as pcv
 from src.scrapers.enrichment import pierce_atip_owner as pao
 from src.scrapers.enrichment.skip_trace import build_pending_row_payload
@@ -98,6 +99,9 @@ ACCOUNTS = {
     "2000050082": '{"id":"2000050082","appraiser":"HDP","landNetAcres":null,"utlElectric":null,"viewQual":null,"landGrossFf":0,"landGrossAcres":0,"acctType":"Reference","certCode":"6","landNetSf":null,"parcelNb":"2000050082","landWidth":0,"wfType":null,"latitude":47,"groupAccountNo":"25483","bldgs":0,"appraisalDate":"2022-09-01T07:00:00Z","landDepth":0,"landGrossSf":0,"longitude":-122,"utlWater":null,"zoning":"TAC - DR","lea":"2074","approach":"Market","specialUse":null,"businessName":"35 BROADWAY CONDOS","floodFringe":null,"streetType":null,"utlSewer":null,"landVacant":0,"valueArea":"PI4","accountNo":"2000050082"}',  # noqa: E501
     "5000050810": '{"id":"5000050810","appraiser":"HDP ","landNetAcres":null,"utlElectric":"POWER INSTALLED","viewQual":null,"landGrossFf":0,"landGrossAcres":0,"acctType":"Mobile Home","certCode":"7","landNetSf":null,"parcelNb":"0419203047","landWidth":0,"wfType":null,"latitude":47,"groupAccountNo":null,"bldgs":1,"appraisalDate":"2020-12-29T19:54:36Z","landDepth":0,"landGrossSf":0,"longitude":-122,"utlWater":"WATER INSTALLED","zoning":null,"lea":"071304","approach":"Cost","specialUse":null,"businessName":"HIDDEN GLEN ESTATES","floodFringe":null,"streetType":"PAVED","utlSewer":"SEWER/SEPTIC INSTALLED","landVacant":0,"valueArea":"PI2","accountNo":"5000050810"}',  # noqa: E501
 }
+
+# No privacy rule active: the writers' rule snapshot (Phase 6 P5f).
+_NO_RULES = build_snapshot([])
 
 
 def _rows(body: str) -> list[dict]:
@@ -727,7 +731,7 @@ def test_a_task_time_limit_during_a_sweep_write_is_not_swallowed():
     row = SimpleNamespace(id="r", user_id="u", job_id="j", parcel_id="2021110133",
                           raw_parcel_id="2021110133", property_address="2117 AVE S")
     with pytest.raises(SoftTimeLimitExceeded):
-        rec._write(_KilledSession(), row, {}, None, "matched")
+        rec._write(_KilledSession(), row, {}, None, "matched", _NO_RULES)
 
 
 # ── Skip trace: a Tacoma owner is paid for only with its own proof ─────────────

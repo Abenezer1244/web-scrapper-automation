@@ -113,6 +113,7 @@ _PIN_SQL = (f"(CASE WHEN r.enrichment_data::jsonb->>'source' IN ({_PRINTED_SOURC
 # and the same predicate guards every write.
 _ELIGIBLE_ROW = """
       r.is_duplicate = false
+  AND r.privacy_suppressed_at IS NULL
   AND jsonb_typeof(r.enrichment_data::jsonb) = 'object'
   AND (r.party_name IS NULL OR r.party_name ~ '^[[:space:]]*$')
   AND ((r.enrichment_data::jsonb->>'source' = 'seattle_sdci_code_violations'
@@ -304,6 +305,16 @@ def _tick(stats: dict, lock: tuple) -> dict:
 
     deadline = time.monotonic() + _TICK_BUDGET_S
     with system_sync_session() as db:
+        # The privacy rules first (Phase 6 P5f): a name a rule withholds flags the lead
+        # instead of being delivered. Unreadable rules: no request, no write this tick.
+        from src.privacy.authorize import RuleSnapshotError, load_rule_snapshot
+        try:
+            privacy = load_rule_snapshot(db)
+        except RuleSnapshotError as exc:
+            db.rollback()
+            stats["skipped"] = "privacy rules unavailable"
+            _logger.error("%s: privacy rules unavailable: %s", __name__, exc)
+            return stats
         if not is_source_available(db, KING_EREALPROPERTY):
             stats["skipped"] = "king_erealproperty is in cooldown"
             return stats
@@ -363,7 +374,7 @@ def _tick(stats: dict, lock: tuple) -> dict:
                     stop = "lock lost before writing"
                 if stop:
                     break
-                stats[_write(db, row, outcome, owners.get(pin))] += 1
+                stats[_write(db, row, outcome, owners.get(pin), privacy)] += 1
             if stop:
                 stats["skipped"] = stop
                 _logger.warning("Code violation owner recovery: %s", stop)
@@ -409,7 +420,7 @@ def _classify(pins: list[str], owners: dict, o_stats: dict) -> dict[str, str]:
     return out
 
 
-def _write(db, row, outcome: str, owner: str | None) -> str:
+def _write(db, row, outcome: str, owner: str | None, privacy) -> str:
     """One guarded UPDATE per row. Returns the stats key for what was written:
     the outcome, `gave_up`, `stale` (the row changed since selection, nothing
     written) or `errors`."""
@@ -452,6 +463,11 @@ def _write(db, row, outcome: str, owner: str | None) -> str:
             "owner": name or None, "payload": json.dumps(payload),
             "max_attempts": _MAX_ATTEMPTS,
         })
+        owner_written = bool(name)
+        if owner_written and result.rowcount:
+            from src.privacy.enforce import enforce_rows
+
+            enforce_rows(db, privacy, [row.id])  # a withheld name flags the lead
         db.commit()
         return label if result.rowcount else "stale"
     except _CELERY_TIME_LIMITS:

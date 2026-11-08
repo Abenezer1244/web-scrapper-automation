@@ -19,6 +19,7 @@ from sqlalchemy import text
 
 from src.api.lead_actionability import DELIVERY_EXCLUDED_KEY, NOT_QUALIFIED
 from src.db.models import User
+from src.privacy.authorize import build_snapshot
 from src.workers import cv_late_delivery as late
 from tests.test_cv_late_delivery import _config as _cv_config
 from tests.test_cv_late_delivery import (
@@ -67,7 +68,7 @@ async def test_a_row_withheld_after_discovery_is_caught_under_the_lock(db, busin
     used = await _used(db, business_user)
 
     with system_sync_session() as s:
-        assert late._deliver_one(s, found) == "stale"
+        assert late._deliver_one(s, found, build_snapshot([])) == "stale"
     assert (await _state(db, rid))[0][DELIVERY_EXCLUDED_KEY] == NOT_QUALIFIED
     assert await _used(db, business_user) == used
 
@@ -122,3 +123,56 @@ async def test_a_late_row_withheld_afterwards_is_not_announced_or_traced(
         "SELECT enrichment_data::jsonb->'late_delivery'->>'notified' FROM results WHERE id = :i"),
         {"i": rid})).scalar()
     assert notified == "false"
+
+
+@pytest.mark.asyncio
+async def test_a_held_row_naming_a_withheld_person_is_flagged_before_any_charge(
+    db, business_user: User, monkeypatch,
+):
+    """P5g: late delivery authorizes the locked row BEFORE grant_records, so a row a
+    rule withholds (not yet flagged by the enforcer) is flagged and never charged."""
+    import src.privacy.authorize as authorize_mod
+    from tests.test_privacy_authorize import _history
+    from tests.test_privacy_enforce import _rule_row
+
+    rule = await _rule_row(db)
+    rows = _history(["pending", "active"])            # SMITH JOHN
+    rows[1]["id"] = rule
+    monkeypatch.setattr(authorize_mod, "load_rule_snapshot", lambda s: build_snapshot(rows))
+    cfg = await _cv_config(db, business_user)
+    job = await _cv_job(db, business_user, cfg)
+    kept = await _held_row(db, business_user, job)
+    named = await _held_row(db, business_user, job)
+    await db.execute(text("UPDATE results SET party_name = 'SMITH JOHN' WHERE id = :i"),
+                     {"i": named})
+    await db.commit()
+    used = await _used(db, business_user)
+    stats = late.deliver_completed_held_rows()
+    assert (stats["delivered"], stats["privacy_withheld"]) == (1, 1)
+    flag = (await db.execute(text(
+        "SELECT privacy_suppression_id::text FROM results WHERE id = :i"), {"i": named})).scalar()
+    assert flag == rule
+    assert (await _state(db, named))[0][DELIVERY_EXCLUDED_KEY] == NOT_QUALIFIED  # still held
+    assert DELIVERY_EXCLUDED_KEY not in (await _state(db, kept))[0]
+    assert await _used(db, business_user) == used + 1                          # one charge
+
+
+@pytest.mark.asyncio
+async def test_late_delivery_delivers_nothing_when_rules_cannot_be_read(
+    db, business_user: User, monkeypatch,
+):
+    import src.privacy.authorize as authorize_mod
+    from src.privacy.authorize import RuleSnapshotError
+
+    def _broken(s):
+        raise RuleSnapshotError("rules could not be loaded")
+
+    monkeypatch.setattr(authorize_mod, "load_rule_snapshot", _broken)
+    cfg = await _cv_config(db, business_user)
+    job = await _cv_job(db, business_user, cfg)
+    rid = await _held_row(db, business_user, job)
+    used = await _used(db, business_user)
+    stats = late.deliver_completed_held_rows()
+    assert stats["skipped"] == "privacy rules unavailable" and stats["delivered"] == 0
+    assert (await _state(db, rid))[0][DELIVERY_EXCLUDED_KEY] == NOT_QUALIFIED
+    assert await _used(db, business_user) == used

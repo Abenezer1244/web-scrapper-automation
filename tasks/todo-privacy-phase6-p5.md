@@ -125,6 +125,35 @@ until P7; each must still be correct the moment a rule activates.
 - Local: tests/test_cv_late_dialer.py 3 tests need Redis (Celery .delay); none local. They
   fail identically without these changes; CI has Redis.
 
+## Status 2026-11-07 (evening)
+- #602 (P5a+P5b, migration 130) MERGED + deployed (129->130, all SUCCESS, /health 200).
+- #603 (P5c enforcer + P5d insert gate) MERGED + deployed; the enforcer's first prod tick
+  19:19:00 returned generation 0 in 0.13 s.
+- #604 (P5e1 readers, migrations 131+132) open; P5e2 writers (Codex GO) on branch
+  feat/privacy-phase6-p5e2, ships only after #604 is deployed.
+
+- P5f-P5h built on feat/privacy-phase6-p5f (stacked on p5e2): job gate, owner sweeps,
+  cached/Tracerfy answers with incoming contacts, late delivery, repair script (gap 8c
+  closed), mailing/property predicates. All Codex GO.
+- Merge order: #604 (readers) -> P5e2 writers PR -> P5f-h PR, each CI green + deploy verified.
+
+## P5f-P5h consult (Codex, APPROVE WITH CHANGES, adopted)
+- Job gate: ONE enforce_rows over the job's results AFTER every in-job writer (inline
+  enrichment, NTS match, survivor reconciliation/merges, claim transfer), immediately
+  before the post-enrichment refetch. RuleSnapshotError: retry the task; after retries the
+  job fails; never cap/enqueue/bill/notify/deliver. Failed jobs' rows are not customer
+  visible (results need done). The first R2 export is provisional and must be overwritten
+  by the gated re-export before done (add a test).
+- trustee_sale_finalize._apply_survivor_merge is a job writer: covered by the job gate,
+  tested.
+- Incoming contacts: tracerfy_ingest, _settle_queued_from_known_answers and the API
+  contact_lookup_action copy authorize WITH the incoming phones/emails before writing.
+- Beat writers: predicate + enforce_rows on RETURNING ids in the same transaction
+  (owner_recovery _write and cache fill, cv/pierce owner writers, Pierce ATIP); mailing /
+  property recovery predicate only.
+- Operator scripts: out of P5, held by P7's activation gate test (all 33 must be filtered
+  or deleted before any rule can activate).
+
 ## Write-path manifest (each row ends with its gate + test)
 | Writer | Store | Gate |
 |---|---|---|

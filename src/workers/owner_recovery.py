@@ -245,7 +245,7 @@ _CACHE_FILL_SQL = f"""
       AND EXISTS (
         SELECT 1 FROM jobs j JOIN scraper_configs sc ON sc.id = j.scraper_config_id
         WHERE j.id = r.job_id AND {_KING_TAX_JOB})
-    RETURNING k.outcome
+    RETURNING k.outcome, r.id
 """  # noqa: S608 -- splices only constant SQL fragments; every value is bound
 
 # Store one settled eRealProperty answer for its parcel. A newer observation wins;
@@ -379,7 +379,7 @@ def _tick(stats: dict) -> dict:
             _logger.error("Owner recovery: privacy rules unavailable: %s", exc)
             return stats
         # Stored answers first: no King request, so this runs during a cooldown too.
-        cached = _fill_from_store(db)
+        cached = _fill_from_store(db, privacy)
         stats["cached"] = cached["found"] + cached["not_on_record"]
         stats["privacy_withheld"] += cached["privacy_withheld"]
         stats["errors"] += cached["errors"]
@@ -445,9 +445,9 @@ def _tick(stats: dict) -> dict:
                 stats["errors"] += 1  # not stored: its leads wait, unnamed, for next tick
                 continue
             for row in by_parcel.get(pid, []):
-                stats[_write(db, row, outcome, owner)] += 1
+                stats[_write(db, row, outcome, owner, privacy)] += 1
         if stored:
-            filled = _fill_from_store(db, stored)
+            filled = _fill_from_store(db, privacy, stored)
             for outcome, n in filled.items():
                 stats[outcome] += n
             # A lead selected for these parcels but not written changed during the
@@ -579,14 +579,18 @@ def store_answers(db, answers: dict[str, tuple[str, str | None]]) -> int:
     return len(params)
 
 
-def _fill_from_store(db, parcels: list[str] | None = None) -> dict[str, int]:
+def _fill_from_store(db, privacy, parcels: list[str] | None = None) -> dict[str, int]:
     """Name waiting leads from fresh stored answers. One UPDATE, no King request.
 
     `parcels` None: any parcel (the start of a tick; nothing is charged). A list: the
     parcels King just answered on this tick, so each lead is charged its attempt as
     `_write` would. Privacy tombstones first, in the same transaction: their waiting
-    leads are flagged, never named (_TOMBSTONE_FLAG_SQL). Returns rows written per
+    leads are flagged, never named (_TOMBSTONE_FLAG_SQL). Every lead it names is
+    authorized under `privacy` before the commit (enforce_rows: a name a rule withholds
+    flags the lead); a rule error rolls the whole fill back. Returns rows written per
     outcome, and `errors` 1 if the fill failed."""
+    from src.privacy.enforce import enforce_rows
+
     counts = {"found": 0, "not_on_record": 0, "privacy_withheld": 0, "errors": 0}
     try:
         counts["privacy_withheld"] = len(db.execute(
@@ -595,7 +599,8 @@ def _fill_from_store(db, parcels: list[str] | None = None) -> dict[str, int]:
             "max_attempts": _MAX_ATTEMPTS, "fresh_days": _FRESH_DAYS,
             "fill_rows": _CACHE_FILL_ROWS, "now_iso": _now_iso(), "parcels": parcels,
             "count_attempt": parcels is not None,
-        }).scalars().all()
+        }).all()
+        enforce_rows(db, privacy, [w.id for w in written if w.outcome == "found"])
         db.commit()
     except Exception as exc:  # noqa: BLE001 -- the next tick tries again
         db.rollback()
@@ -604,8 +609,8 @@ def _fill_from_store(db, parcels: list[str] | None = None) -> dict[str, int]:
         counts["errors"] = 1
         counts["privacy_withheld"] = 0  # rolled back with the rest
         return counts
-    for outcome in written:
-        counts[outcome] += 1
+    for w in written:
+        counts[w.outcome] += 1
     return counts
 
 
@@ -646,7 +651,7 @@ def _classify(parcels: list[str], owners: dict, o_stats: dict) -> dict[str, str]
     return out
 
 
-def _write(db, row, outcome: str, owner: str | None) -> str:
+def _write(db, row, outcome: str, owner: str | None, privacy) -> str:
     """One guarded UPDATE per row. Returns the stats key for what was written:
     the outcome, `gave_up`, `stale` (the row changed since selection, nothing
     written) or `errors`."""
@@ -685,6 +690,10 @@ def _write(db, row, outcome: str, owner: str | None) -> str:
             "drop_key": drop_key, "payload": json.dumps(payload),
             "max_attempts": _MAX_ATTEMPTS,
         })
+        if outcome == "found" and result.rowcount:
+            from src.privacy.enforce import enforce_rows
+
+            enforce_rows(db, privacy, [row.id])  # a withheld name flags the lead
         db.commit()
         return label if result.rowcount else "stale"
     except Exception as exc:  # noqa: BLE001

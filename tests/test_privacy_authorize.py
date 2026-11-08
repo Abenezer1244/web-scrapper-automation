@@ -214,6 +214,48 @@ def test_the_rules_person_without_its_anchor_goes_to_review(over):
     assert (d.outcome, d.reason) == (REVIEW, REVIEW_SUBJECT_WITHOUT_ANCHOR)
 
 
+# ── operator releases of REVIEW matches (migration 136) ──────────────────────
+
+def _released(rows, result_id, rule_id=None):
+    return build_snapshot(rows, [{"rule_id": rule_id or rows[0]["rule_id"],
+                                  "result_id": result_id}])
+
+
+@pytest.mark.parametrize("over, ctx", [
+    ({"parcel_id": None}, _CTX),                                         # without anchor
+    ({}, {"record_type": None, "county": "king", "state": "WA"}),       # unresolved name
+])
+def test_a_released_review_match_is_allowed_for_that_result_only(over, ctx):
+    rows = _history(["pending", "active"])
+    rid = str(uuid.uuid4())
+    snapshot = _released(rows, rid)
+    assert authorize(snapshot, _row(id=rid, **over), **ctx).outcome == ALLOWED
+    other = authorize(snapshot, _row(id=str(uuid.uuid4()), **over), **ctx)
+    assert other.outcome == REVIEW
+
+
+def test_a_release_never_frees_an_exact_match():
+    rows = _history(["pending", "active"])
+    rid = str(uuid.uuid4())
+    assert authorize(_released(rows, rid), _row(id=rid), **_CTX).outcome == WITHHELD
+
+
+def test_a_release_for_one_rule_leaves_another_rules_review_in_place():
+    first = _history(["pending", "active"])
+    second = _history(["pending", "active"])  # the same person under a second request
+    rid = str(uuid.uuid4())
+    snapshot = build_snapshot(first + second,
+                              [{"rule_id": first[0]["rule_id"], "result_id": rid}])
+    d = authorize(snapshot, _row(id=rid, parcel_id=None), **_CTX)
+    assert d.outcome == REVIEW and d.suppression_ids == (second[1]["id"],)
+
+
+def test_a_row_without_an_id_is_never_released():
+    rows = _history(["pending", "active"])
+    snapshot = _released(rows, "None")  # even a release keyed by the string "None"
+    assert authorize(snapshot, _row(parcel_id=None), **_CTX).outcome == REVIEW
+
+
 def test_an_heir_is_a_subject_too():
     d = authorize(_snap(_history(["pending", "active"])),
                   _row(party_name="JONES MARY", heirs="SMITH JOHN"), **_CTX)

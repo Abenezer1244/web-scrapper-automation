@@ -14,6 +14,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError
 
 from src.db.session import sync_engine
+from src.privacy.authorize import load_rule_snapshot
 
 _H = "c" * 64
 
@@ -254,6 +255,8 @@ def test_a_review_release_is_recorded_and_unflags_only_that_row(conn):
                         {"i": other}).scalar() is not None
     assert conn.execute(text("SELECT rule_id::text, result_id::text "
                              "FROM privacy_review_release_rows()")).all() == [(rule, res)]
+    # The worker's loader carries it into every decision.
+    assert load_rule_snapshot(conn).released == {res: frozenset({rule})}
     # Not held by the rule any more: a second release is refused.
     assert _sqlstate(conn, _RELEASE, res=res, rule=rule, a=op) == "BLD56"
 

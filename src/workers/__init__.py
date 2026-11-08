@@ -68,6 +68,8 @@ app = Celery(
         "src.workers.cv_mailing_recovery",
         # Privacy enforcer sweep (Phase 6 P5): a BEAT task, same trap as above.
         "src.workers.privacy_enforcer",
+        # Privacy erasure driver (Phase 6 P6): a BEAT task, same trap as above.
+        "src.workers.privacy_erasure",
     ],
 )
 

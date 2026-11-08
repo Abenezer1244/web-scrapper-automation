@@ -9,8 +9,9 @@ deletion request blanks the person data and keeps a nameless property skeleton).
   jobs.privacy_invalidated_at      the job's R2 export held an erased person: the object
   batch_runs.privacy_invalidated_at  is deleted and downloads render from the database
                                    (which excludes flagged rows) instead of R2.
-  privacy_erasures                 one row per erased rule: lease, phase markers, the
-                                   last error. Written only through the worker role.
+  privacy_erasures                 one row per erased rule: phase markers, the scan
+                                   cursor, the last error. Written only by the worker
+                                   role; one driver at a time (an advisory lock).
   privacy_erase_batch()            erases one bounded batch the worker found with
                                    authorize() (the HMAC keys live in Python, not SQL).
   privacy_erasure_rule()           the one read of the privacy tables the purge role
@@ -105,6 +106,7 @@ LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $fn$
 DECLARE
     v_rule uuid;
     v_ids uuid[];
+    v_jobs uuid[];
     v_hashes text[];
     v_counts jsonb := '{}'::jsonb;
     v_n integer;
@@ -134,6 +136,8 @@ BEGIN
                FOR UPDATE OF r) x;
     v_ids := coalesce(v_ids, '{}');
 
+    -- The jobs of the rows erased NOW: their exports are what the R2 sweep deletes.
+    WITH erased AS (
     UPDATE public.results r SET
         privacy_suppressed_at = coalesce(r.privacy_suppressed_at, now()),
         privacy_suppression_id = coalesce(r.privacy_suppression_id, p_rule_row),
@@ -150,8 +154,10 @@ BEGIN
                             r.enrichment_data, r.phone, r.phone_type, r.phone_dnc_flag,
                             r.email, r.phones, r.emails, r.owner_state, r.absentee_owner,
                             r.out_of_state_owner, r.last_trace_outcome,
-                            r.skip_trace_subject_hash) > 0);
-    GET DIAGNOSTICS v_n = ROW_COUNT;
+                            r.skip_trace_subject_hash) > 0)
+    RETURNING r.job_id)
+    SELECT coalesce(array_agg(DISTINCT erased.job_id), '{}'), count(*)
+      INTO v_jobs, v_n FROM erased;
     v_counts := v_counts || jsonb_build_object('results', v_n);
 
     DELETE FROM public.skip_trace_cache
@@ -187,17 +193,16 @@ BEGIN
     GET DIAGNOSTICS v_n = ROW_COUNT;
     v_counts := v_counts || jsonb_build_object('dialer', v_n);
 
+    -- Re-stamped on every erasure (not only the first), so each erasure's R2 sweep
+    -- finds the exports it must delete by time.
     UPDATE public.jobs j SET privacy_invalidated_at = now()
-     WHERE j.privacy_invalidated_at IS NULL AND j.export_key IS NOT NULL
-       AND j.id IN (SELECT r.job_id FROM public.results r WHERE r.id = ANY(v_ids));
+     WHERE j.id = ANY(v_jobs) AND j.export_key IS NOT NULL;
     GET DIAGNOSTICS v_n = ROW_COUNT;
     v_counts := v_counts || jsonb_build_object('jobs', v_n);
 
     UPDATE public.batch_runs b SET privacy_invalidated_at = now()
-     WHERE b.privacy_invalidated_at IS NULL AND b.combined_export_key IS NOT NULL
-       AND EXISTS (SELECT 1 FROM public.results r
-                    WHERE r.id = ANY(v_ids)
-                      AND b.child_job_ids::jsonb ? r.job_id::text);
+     WHERE b.combined_export_key IS NOT NULL
+       AND b.child_job_ids::jsonb ?| CAST(v_jobs AS text[]);
     GET DIAGNOSTICS v_n = ROW_COUNT;
     v_counts := v_counts || jsonb_build_object('batch_runs', v_n);
 
@@ -245,8 +250,6 @@ def upgrade() -> None:
             r2_swept_at timestamptz,
             second_pass_at timestamptz,
             completed_at timestamptz,
-            lease_token uuid,
-            lease_until timestamptz,
             attempts integer NOT NULL DEFAULT 0,
             last_error varchar(256),
             counts jsonb NOT NULL DEFAULT '{}'::jsonb,
@@ -255,9 +258,7 @@ def upgrade() -> None:
             CONSTRAINT ck_privacy_erasures_order CHECK (
                 (r2_swept_at IS NULL OR first_pass_at IS NOT NULL)
                 AND (second_pass_at IS NULL OR r2_swept_at IS NOT NULL)
-                AND (completed_at IS NULL OR second_pass_at IS NOT NULL)),
-            CONSTRAINT ck_privacy_erasures_lease CHECK (
-                (lease_token IS NULL) = (lease_until IS NULL))
+                AND (completed_at IS NULL OR second_pass_at IS NOT NULL))
         )
     """))
     op.execute(text("ALTER TABLE public.privacy_erasures ENABLE ROW LEVEL SECURITY"))

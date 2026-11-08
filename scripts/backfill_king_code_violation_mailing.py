@@ -26,7 +26,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from sqlalchemy import text  # noqa: E402
 
-_CANDIDATES_SQL = """
+from src.api.lead_actionability import not_privacy_suppressed_sql  # noqa: E402
+
+# A privacy-withheld row is never read, reported or written (the predicate is a code constant).
+_CANDIDATES_SQL = f"""
     SELECT r.id, r.user_id, r.property_address, r.property_city, r.property_state,
            r.property_zip, r.enrichment_data::jsonb->>'latitude' AS lat,
            r.enrichment_data::jsonb->>'longitude' AS lon
@@ -38,13 +41,14 @@ _CANDIDATES_SQL = """
       AND j.status = 'done'
       AND r.parcel_id IS NULL
       AND r.mailing_address IS NULL
+      AND {not_privacy_suppressed_sql("r")}
       AND r.enrichment_data::jsonb ? 'latitude'
       AND r.enrichment_data::jsonb ? 'longitude'
       AND NOT (r.enrichment_data::jsonb ? 'kc_pin_status')
     ORDER BY r.id
-"""
+"""  # noqa: S608
 
-_UPDATE_SQL = """
+_UPDATE_SQL = f"""
     UPDATE results SET
       mailing_address = CAST(:mail AS text),
       property_state = CASE WHEN CAST(:mail AS text) IS NOT NULL
@@ -56,14 +60,15 @@ _UPDATE_SQL = """
       out_of_state_owner = CASE WHEN CAST(:mail AS text) IS NOT NULL
                                 THEN CAST(:f_out_of_state AS boolean) ELSE out_of_state_owner END,
       enrichment_data = ((CASE WHEN jsonb_typeof(enrichment_data::jsonb) = 'object'
-                               THEN enrichment_data::jsonb ELSE '{}'::jsonb END)
+                               THEN enrichment_data::jsonb ELSE '{{}}'::jsonb END)
                          || CAST(:payload AS jsonb))::json
     WHERE id = :rid AND user_id = :uid
       AND mailing_address IS NULL AND parcel_id IS NULL
       AND (enrichment_data IS NULL OR jsonb_typeof(enrichment_data::jsonb) IN ('object', 'null'))
       AND NOT coalesce(enrichment_data::jsonb ? 'kc_pin_status', false)
+      AND {not_privacy_suppressed_sql("results")}
       AND EXISTS (SELECT 1 FROM jobs j WHERE j.id = results.job_id AND j.status = 'done')
-"""
+"""  # noqa: S608
 
 
 def run(db, *, apply_writes: bool, limit: int | None, report: Path | None,

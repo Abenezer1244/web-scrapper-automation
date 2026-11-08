@@ -152,6 +152,27 @@ def test_events_follow_the_lifecycle(conn):
                 ) == [1, 2, 3, 4]
 
 
+def test_only_closing_follows_a_decision_even_one_made_without_verification(conn):
+    """A request that fails verification is denied with a fixed code (design section 9)."""
+    op = _user(conn)
+    rid = _request(conn, op)
+    _event(conn, rid, op, "decided", d="unverified")
+    for event_type in ("verified", "in_review", "withdrawn", "verification_sent"):
+        assert _sqlstate(conn, _EVENT, r=rid, t=event_type, v="email_link", d=None,
+                         a=op) == "BLD52", event_type
+    _event(conn, rid, op, "closed")
+
+
+def test_an_active_row_without_an_operator_is_refused_even_for_the_owner(conn):
+    op = _user(conn)
+    rid, rule = _verified_rule(conn, op)
+    assert _sqlstate(conn, (
+        "INSERT INTO privacy_suppressions (rule_id, request_id, anchor_kind, anchor_hmac, "
+        "subject_kind, subject_hmac, scope, key_version, normalization_version, state) "
+        "VALUES (:rule, :r, 'property', :h, 'person', :h, 'subject', 'v1', 'n3', 'active')"),
+        rule=rule, r=rid, h=_H) == "23514"
+
+
 def test_a_rule_needs_a_verified_undecided_suppression_request(conn):
     op = _user(conn)
     rid = _request(conn, op)

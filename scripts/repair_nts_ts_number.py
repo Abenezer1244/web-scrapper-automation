@@ -266,7 +266,8 @@ def repair_notice_fields(db, by_issue: dict[str, dict[str, dict]], apply: bool) 
         if apply:
             assign = ", ".join(f"{k} = :{k}" for k in sets)
             res = db.execute(
-                sa_text(f"UPDATE nts_notices SET {assign} WHERE id = CAST(:id AS uuid)"),  # noqa: S608
+                sa_text(f"UPDATE nts_notices SET {assign} WHERE id = CAST(:id AS uuid) "  # noqa: S608
+                        "AND privacy_suppression_id IS NULL"),
                 {**sets, "id": row["id"]},
             )
             _require_one(res, "nts_notices", row["id"])
@@ -317,7 +318,8 @@ def retire_wrong_key(db, by_issue: dict[str, dict[str, dict]], apply: bool) -> i
               f"(issue prints {tr['ts_number']!r}) results={row['results']}")
         if apply:
             res = db.execute(
-                sa_text("UPDATE nts_notices SET is_active = false WHERE id = CAST(:id AS uuid)"),
+                sa_text("UPDATE nts_notices SET is_active = false WHERE id = CAST(:id AS uuid) "
+                        "AND privacy_suppression_id IS NULL"),
                 {"id": row["id"]},
             )
             _require_one(res, "nts_notices", row["id"])
@@ -614,7 +616,8 @@ def repair_notices(db, truth: dict[str, str], apply: bool) -> int:
               f"ts={m['ts_number']!r} results={m['results']} active={m['is_active']}")
         if apply:
             res = db.execute(
-                sa_text("UPDATE nts_notices SET is_active = false WHERE id = CAST(:id AS uuid)"),
+                sa_text("UPDATE nts_notices SET is_active = false WHERE id = CAST(:id AS uuid) "
+                        "AND privacy_suppression_id IS NULL"),
                 {"id": m["id"]},
             )
             _require_one(res, "nts_notices", m["id"])
@@ -662,7 +665,8 @@ def repair_notices(db, truth: dict[str, str], apply: bool) -> int:
               f"{m['ts_number']!r} -> {correct!r}")
         if apply:
             res = db.execute(
-                sa_text("UPDATE nts_notices SET ts_number = :new WHERE id = CAST(:id AS uuid)"),
+                sa_text("UPDATE nts_notices SET ts_number = :new WHERE id = CAST(:id AS uuid) "
+                        "AND privacy_suppression_id IS NULL"),
                 {"new": correct, "id": m["id"]},
             )
             _require_one(res, "nts_notices", m["id"])

@@ -19,6 +19,60 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-11-08 — Privacy: activation, the operator side (compliance Phase 6 P7)
+
+**Built / Shipped:** branch `feat/privacy-phase6-p7` (owner "approved" P7; O1 CLI first, O2 delete
+unused scripts and filter the rest). Plan, audit and review log: `tasks/todo-privacy-phase6-p7.md`.
+Nothing is enforced yet: `PRIVACY_ENFORCEMENT_VERSION` stays 0 until the owner sets it per environment.
+- P7a: 21 PII-printing one-off scripts retired (git history keeps them), 12 kept scripts skip withheld
+  leads on every read and write, each with a DB test; the script gate is armed and green.
+- P7b, migration 136: 125's pending-only guard replaced (`state IN (pending, active, lifted)`; only
+  property/phone/email anchors may leave pending; active/lifted rows carry their operator). Owner-only
+  functions to record requests and events, add/activate/lift rules and release REVIEW matches: each
+  checks an admin with MFA and locks the request, then every row of the rule. Activating a deletion
+  queues its P6 erasure. `privacy_review_releases` + a worker-role reader.
+- P7c: `authorize()` honours a release for REVIEW only (never an exact match, never a row without an
+  id). `scripts/privacy_admin.py` (record, event, add-rule, candidates, activate, held, release, lift,
+  status): ids and counts only. Activate, release and lift commit only if the rule snapshot still
+  loads; activate then flags the leads at once and withdraws their queued lookups and dialer sends.
+- P7d: `IMPLEMENTED_ENFORCEMENT_VERSION = 1` after a layer-by-layer audit (plan). Its only runtime
+  reader is the CLI's activation check.
+
+**Tried / Decided:**
+- CLI as the migration role (`railway run`) over an admin API: no new HTTP surface; the database
+  verifies the operator. Admin page with MFA step-up comes with P8's intake.
+- The database cannot see key or normalisation versions, so the CLI loads the post-change snapshot
+  inside the transaction and commits only if it loads (a rule the loader rejects would stop every
+  send path).
+- A lift unflags in SQL and the CLI re-decides those rows in the same transaction (another rule may
+  still match). Deletion rules are never lifted.
+- A decision without verification stays allowed (design section 9: deny with a fixed code).
+
+**Failed / Blocked:** Git Bash heredocs mangled `\n` and a line-continuation backslash twice (fixed with
+the Edit tool). A test-helper parameter named `c` clashed with a `c=` bind again (made it positional).
+Running a focused test file while the full suite used the same test DB failed an unrelated rate-limit
+test; alone it passes.
+
+**Caught & fixed:** Codex consult: an active `mailing` rule would make the loader refuse every rule
+(Critical); no REVIEW resolution; lift must re-decide; add_rule must refuse access/correct; locks;
+lifecycle; the gate's positive control depended on the repo. Mine: nothing cleared a flag on lift;
+send paths call `authorize()` directly, so a release had to live in the snapshot, not just the flag.
+Codex reviews: lock every rule row; only 'closed' after a decision; actor CHECK; NTS repair UPDATEs on
+withheld notices; activation must withdraw queued work (design section 6, High). Rejected with
+evidence: rotation rows sharing HMACs (each key version digests differently); generation "decreasing"
+on lift (it counts every active row ever written).
+
+**Pending / Handoff:** merge + Railway verification (135 -> 136). Then the owner decides when to set
+`PRIVACY_ENFORCEMENT_VERSION=1` on api, worker and beat; the legal mailbox (no MX on bridgeleads.io)
+must exist before requests can arrive. P8 (public intake, FE page, deadline beat) needs approval.
+Seen, not changed: `scripts/backfill_assumed_mailing.py` apply loop reuses the last planning row's
+`attempts` value.
+
+**Facts learned:** Supabase `postgres` is not superuser but has BYPASSRLS, so it writes FORCE-RLS tables.
+Every send path passes the result id to `authorize()`; pre-insert and shared-store checks do not (and
+must not be released). The dispatcher's cancel sweep already withdraws queued lookups of flagged leads
+each tick (`withheld_sql` includes the flag).
+
 ## 2026-11-08 — Privacy: erasure of a person across every store (compliance Phase 6 P6)
 
 **Built / Shipped:** PR #610 (owner "approved" P6; P7 activation NOT approved). Dormant: migration 125 still

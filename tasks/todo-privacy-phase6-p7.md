@@ -178,4 +178,9 @@ stays 0 in every environment until the owner sets it.
 - Key rotation: a rule with rows under two key versions activates all of them atomically.
 
 ## Review
-(filled in at the end)
+- P7a, P7b, P7c, P7d built and committed; Codex: consult reconciled, P7a/P7b NO-GO -> fixed,
+  P7c/P7d NO-GO (queued-work withdrawal) -> fixed, round 2 GO (one Low, the 08 doc, fixed).
+- Rejected with evidence: rotation rows sharing HMACs; generation decreasing on lift.
+- Tests: every new/affected privacy and script test green locally; full suite run before push.
+- Left for the owner: merge verification, then `PRIVACY_ENFORCEMENT_VERSION=1` per environment
+  (lock 3), the legal mailbox, counsel review of D1-D9. P8 needs approval.

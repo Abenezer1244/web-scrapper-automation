@@ -17,8 +17,8 @@ property and mailing addresses, parcel ids, phones, emails) or about customers (
 | Admin routes | Three `require_admin` routes, none returns personal data. No debug endpoints. | Low |
 | Error tracking | Allowlisted: exception type and frame positions; messages redacted, request data, user, locals and breadcrumbs dropped. | None |
 | Logs | Customer email passed to log calls (emitted masked as `j***@domain`); scraper names; full parcel ids in enrichment logs. | Medium |
-| Scripts | About 30 operator scripts print or write subject or customer data, unfiltered. | High |
-| Privacy flag | No script applies `results.privacy_suppressed_at`. | High (before activation) |
+| Scripts | P7 (2026-11-08): of the 33 scripts in section A, 21 were retired and 12 now skip withheld leads; `tests/test_privacy_script_inventory.py` keeps it that way. | Closed |
+| Privacy flag | Every remaining section A script applies `results.privacy_suppressed_at`. | Closed |
 
 ## A. Scripts (operator-run, usually `railway run`, output to the operator's terminal or a local file)
 
@@ -31,12 +31,7 @@ property and mailing addresses, parcel ids, phones, emails) or about customers (
 | `backfill_king_code_violation_owner.py:235,394` | addresses, old and new party | `king_*` JSONL (ignored) |
 | `backfill_assumed_mailing.py`, `backfill_pierce_statewide_mailing.py`, `king_rpacct_mailing.py`, `king_taxbill_mailing_check.py`, `repair_king_property_situs.py`, `backfill_property_situs_parts.py`, `backfill_king_code_violation_mailing.py`, `release_stranded_dedup_claims.py` | parcel, property and mailing addresses, some party names | root-level JSONL (now ignored) + stdout |
 
-**Cross-tenant reads to stdout (High/Medium):** 
-
-
-`repair_nts_ts_number.py`,
-
-.
+**Cross-tenant reads to stdout (High/Medium):** `repair_nts_ts_number.py` (filtered in P7).
 
 **Customer emails to stdout (Medium):** `diag_scraper_name_collisions.py`,
 `audit_entitlement_violations.py` (decrypted), `sprint4_three_counties_prod.py`; and the

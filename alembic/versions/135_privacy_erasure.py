@@ -250,6 +250,8 @@ def upgrade() -> None:
             attempts integer NOT NULL DEFAULT 0,
             last_error varchar(256),
             counts jsonb NOT NULL DEFAULT '{}'::jsonb,
+            -- Where the current pass stopped: {"store": ..., "after": ...}.
+            scan_cursor jsonb NOT NULL DEFAULT '{}'::jsonb,
             CONSTRAINT ck_privacy_erasures_order CHECK (
                 (r2_swept_at IS NULL OR first_pass_at IS NOT NULL)
                 AND (second_pass_at IS NULL OR r2_swept_at IS NOT NULL)

@@ -193,14 +193,18 @@ def build_snapshot(rows) -> RuleSnapshot:
     )
 
 
+def load_rule_rows(db) -> list:
+    """Every rule row in one statement (sync Session or Connection), unvalidated."""
+    try:
+        return list(db.execute(_LOAD_SQL).mappings().all())
+    except Exception as exc:  # noqa: BLE001 -- re-raised as the fail-closed type
+        raise RuleSnapshotError(f"rules could not be loaded: {type(exc).__name__}") from exc
+
+
 def load_rule_snapshot(db) -> RuleSnapshot:
     """Every rule row in one statement (sync Session or Connection). Raises
     ``RuleSnapshotError`` for any history or version it cannot evaluate."""
-    try:
-        rows = db.execute(_LOAD_SQL).mappings().all()
-    except Exception as exc:  # noqa: BLE001 -- re-raised as the fail-closed type
-        raise RuleSnapshotError(f"rules could not be loaded: {type(exc).__name__}") from exc
-    return build_snapshot(rows)
+    return build_snapshot(load_rule_rows(db))
 
 
 def _anchor_values(row: Any, county: str | None, state: str | None) -> set[tuple[str, str]]:

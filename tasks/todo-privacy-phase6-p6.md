@@ -32,12 +32,12 @@ name too). Privacy-protective and consistent with D2; the row is never delivered
 
 ## Slices (each <= 5 files, Codex review each)
 
-- [ ] P6a migration 135: results.privacy_erased_at; table privacy_erasures (rule_id PK,
+- [x] P6a migration 135 (PR #610, Codex GO after one NO-GO): results.privacy_erased_at; table privacy_erasures (rule_id PK,
       first_pass_at, r2_swept_at, second_pass_after, completed_at, lease token/expiry),
       RLS forced + system policy, no anon/authenticated grants (134 postcondition).
       If bridgeleads_system lacks a needed privilege (DELETE skip_trace_cache /
       county_records), add a SECURITY DEFINER function owned by bridgeleads_purge, as 113.
-- [ ] P6b src/privacy/erase.py: idempotent batch procedure (above), one transaction per
+- [x] P6b src/privacy/erase.py (discovery here, erasure in the 135 function; matches = WITHHELD by this rule only, never REVIEW: design section 5; scan_cursor added to 135 for resumable passes): idempotent batch procedure (above), one transaction per
       batch, lock order users -> rows (account-deletion fence compatible), skips accounts
       purging/deleted (their own purge covers them).
 - [ ] P6c R2 invalidation (per open question 1).

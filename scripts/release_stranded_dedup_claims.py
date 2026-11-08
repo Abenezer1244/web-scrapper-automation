@@ -40,9 +40,28 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from sqlalchemy import text  # noqa: E402
 
+from src.api.lead_actionability import not_privacy_suppressed_sql  # noqa: E402
 from src.db.session import system_sync_session  # noqa: E402
 
 _TERMINAL = ("failed", "cancelled")
+
+# The claims this job holds, as listed and written to the backup. A claim whose first
+# result is withheld by a privacy rule keeps its keys (claim id, hash, result id: all a
+# restore of the ledger row needs) but NOT the subject's parcel or address, so the
+# backup never puts a withheld person's data on disk. It is still selected and counted:
+# --expect and the DELETE below cover every claim of this job, and dropping it from the
+# backup would make that release unrestorable. LEFT JOIN: a claim whose result is gone
+# (first_result_id SET NULL) is withheld by nothing this script can see.
+_NOT_WITHHELD = not_privacy_suppressed_sql("r")
+_Q_CLAIMS = f"""
+    SELECT dr.id::text id, dr.dedup_hash, dr.first_result_id::text rid,
+           CASE WHEN {_NOT_WITHHELD} THEN dr.parcel_id END parcel_id,
+           CASE WHEN {_NOT_WITHHELD} THEN dr.property_address END property_address,
+           dr.first_delivered_at, NOT ({_NOT_WITHHELD}) AS withheld
+      FROM delivered_records dr
+      LEFT JOIN results r ON r.id = dr.first_result_id
+     WHERE dr.first_job_id = :j AND dr.user_id = CAST(:u AS uuid)
+"""  # noqa: S608 -- splices only the code-literal predicate; every value is bound
 
 
 def main() -> None:
@@ -72,13 +91,9 @@ def main() -> None:
                 "Cancel it first if it is stuck."
             )
 
-        rows = db.execute(
-            text("SELECT id::text id, dedup_hash, first_result_id::text rid, "
-                 "parcel_id, property_address, first_delivered_at "
-                 "FROM delivered_records WHERE first_job_id = :j AND user_id = CAST(:u AS uuid)"),
-            {"j": job.id, "u": job.uid},
-        ).all()
-        print(f"stranded claims for this job: {len(rows)}")
+        rows = db.execute(text(_Q_CLAIMS), {"j": job.id, "u": job.uid}).all()
+        print(f"stranded claims for this job: {len(rows)} "
+              f"({sum(1 for r in rows if r.withheld)} privacy-withheld: keys only in the backup)")
         if args.expect is not None and len(rows) != args.expect:
             raise SystemExit(f"refusing: expected {args.expect} rows, found {len(rows)}")
         if not rows:

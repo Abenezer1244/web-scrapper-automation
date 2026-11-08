@@ -29,13 +29,11 @@ property and mailing addresses, parcel ids, phones, emails) or about customers (
 | `verify_tracerfy_provenance.py:85-90` | party name, property address, decrypted phone, email, phones, emails | stdout |
 | `purge_test_batch_configs.py:177` (`--backup`) | `SELECT *` of results and related rows | local JSON file |
 | `verify_entitlement_deploy.py:175` | every user's email, plan and usage | local JSON baseline |
-| `diag_test7_rows.py:46` | full rows for one job (names, heirs, parcel, addresses, enrichment) | stdout JSON |
 | `diag_test11_dq.py:62` | every scraped row of a live scrape | `test11_dq.json` (now ignored) |
-| `diag_test7_source_capture.py:36-39` | raw and parsed recorder rows | JSON in an output dir |
 | `backfill_king_code_violation_owner.py:235,394` | addresses, old and new party | `king_*` JSONL (ignored) |
 | `repair_stale_absentee_owner.py`, `backfill_assumed_mailing.py`, `backfill_pierce_statewide_mailing.py`, `king_rpacct_mailing.py`, `king_taxbill_mailing_check.py`, `repair_king_property_situs.py`, `backfill_property_situs_parts.py`, `repair_placeholder_absentee.py`, `backfill_king_code_violation_mailing.py`, `release_stranded_dedup_claims.py` | parcel, property and mailing addresses, some party names | root-level JSONL (now ignored) + stdout |
 
-**Cross-tenant reads to stdout (High/Medium):** `diag_king_bad_parcel_rows.py`,
+**Cross-tenant reads to stdout (High/Medium):** 
 `diag_probate_party_scan.py`,
 `diag_nts_pointer_integrity.py`, `diag_nts_recent_matches.py`,
 `diag_nts_null_downgrade.py`, `repair_nts_ts_number.py`,
@@ -128,3 +126,6 @@ Deleted from `scripts/` in Phase 6 P7 (one-off diagnostics and finished backfill
 - diag_xcheck_followup
 - diag_xcheck_king_and_canary
 - diag_king_ts_repair_plan
+- diag_test7_rows
+- diag_test7_source_capture
+- diag_king_bad_parcel_rows

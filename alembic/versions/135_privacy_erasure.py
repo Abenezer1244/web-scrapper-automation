@@ -30,8 +30,8 @@ Per batch, under a transaction advisory lock on the rule:
                   blanked (113's list, so enrichment_data = NULL).
   skip_trace_cache  deleted by the rows' subject hashes plus the keys the worker computed
                   from their pending lookups (pending_row_subject_key).
-  pending_skip_trace_rows  unsent ('queued') rows cancelled; names and mailing address
-                  blanked on every row (kept: billing evidence).
+  pending_skip_trace_rows  unsent ('queued') rows deleted; sent rows keep only the
+                  property address (billing evidence).
   skip_trace_queues  download_url cleared on the batches that held those rows.
   dialer_deliveries  unsent ('pending'/'failed') rows skipped; delivered rows kept (ids).
   king_parcel_owners  matched parcels become tombstones (131).
@@ -60,6 +60,7 @@ _API_ROLES = ("anon", "authenticated", "service_role", "bridgeleads_app")
 _PURGE_GRANTS = (
     ("results", "UPDATE (privacy_suppressed_at, privacy_suppression_id, privacy_erased_at)"),
     ("dialer_deliveries", "UPDATE (status, last_error)"),
+    ("pending_skip_trace_rows", "DELETE"),
     ("jobs", "UPDATE (privacy_invalidated_at)"),
     ("batch_runs", "UPDATE (privacy_invalidated_at)"),
     ("king_parcel_owners", "SELECT, UPDATE (owner_name, outcome, privacy_suppression_id)"),
@@ -72,6 +73,7 @@ _DOWNGRADE_REVOKES = (
     ("king_parcel_owners", "ALL"), ("nts_notices", "ALL"), ("county_records", "ALL"),
     ("results", "UPDATE (privacy_suppressed_at, privacy_suppression_id)"),
     ("dialer_deliveries", "UPDATE (status, last_error)"),
+    ("pending_skip_trace_rows", "DELETE"),
 )
 # Tables that had no purge-role policy before (113 covered the rest).
 _NEW_POLICIES = ("king_parcel_owners", "nts_notices", "county_records")
@@ -164,16 +166,21 @@ BEGIN
     GET DIAGNOSTICS v_n = ROW_COUNT;
     v_counts := v_counts || jsonb_build_object('queues', v_n);
 
+    -- Unsent lookups ('queued': never sent, never billed) are deleted outright; rows
+    -- that reached Tracerfy are billing evidence and keep only the property address.
+    DELETE FROM public.pending_skip_trace_rows p
+     WHERE p.result_id = ANY(v_ids) AND p.status = 'queued';
+    GET DIAGNOSTICS v_n = ROW_COUNT;
+    v_counts := v_counts || jsonb_build_object('pending_deleted', v_n);
+
     UPDATE public.pending_skip_trace_rows p SET
-        status = CASE WHEN p.status = 'queued' THEN 'cancelled' ELSE p.status END,
         first_name = NULL, last_name = NULL, mail_address = NULL, mail_city = NULL,
         mail_state = NULL, mail_zip = NULL
      WHERE p.result_id = ANY(v_ids)
-       AND (p.status = 'queued' OR p.first_name IS NOT NULL OR p.last_name IS NOT NULL
-            OR p.mail_address IS NOT NULL OR p.mail_city IS NOT NULL
-            OR p.mail_state IS NOT NULL OR p.mail_zip IS NOT NULL);
+       AND num_nonnulls(p.first_name, p.last_name, p.mail_address, p.mail_city,
+                        p.mail_state, p.mail_zip) > 0;
     GET DIAGNOSTICS v_n = ROW_COUNT;
-    v_counts := v_counts || jsonb_build_object('pending', v_n);
+    v_counts := v_counts || jsonb_build_object('pending_scrubbed', v_n);
 
     UPDATE public.dialer_deliveries d SET status = 'skipped', last_error = 'privacy_erased'
      WHERE d.result_id = ANY(v_ids) AND d.status IN ('pending', 'failed');
@@ -293,11 +300,38 @@ def upgrade() -> None:
         stmts += [_guarded(r, f"REVOKE ALL ON FUNCTION public.{fn} FROM {r};")
                   for r in (*_API_ROLES, "bridgeleads_system")]
     stmts.append(f"GRANT EXECUTE ON FUNCTION public.{_RULE_FN} TO bridgeleads_purge;")
-    stmts.append(f"ALTER FUNCTION public.{_FN} OWNER TO bridgeleads_purge;")
+    # Granted before the hand-over: ALTER OWNER carries the old owner's grants across.
     stmts.append(_guarded("bridgeleads_system",
                           f"GRANT EXECUTE ON FUNCTION public.{_FN} TO bridgeleads_system;"))
     body = "\n".join(stmts)
-    op.execute(text(f"DO $grants$ BEGIN\n{body}\nEND $grants$"))
+    op.execute(text(f"""
+        DO $grants$
+        DECLARE
+            v_super boolean;
+        BEGIN
+            {body}
+            -- Same temporary hand-over as 112/113: SET on the purge role and CREATE on
+            -- public, both taken back in this transaction (a superuser needs neither).
+            SELECT rolsuper INTO v_super FROM pg_roles WHERE rolname = current_user;
+            IF NOT v_super THEN
+                EXECUTE format('GRANT bridgeleads_purge TO %I WITH SET TRUE, INHERIT FALSE',
+                               current_user);
+            END IF;
+            GRANT CREATE ON SCHEMA public TO bridgeleads_purge;
+            ALTER FUNCTION public.{_FN} OWNER TO bridgeleads_purge;
+            REVOKE CREATE ON SCHEMA public FROM bridgeleads_purge;
+            IF NOT v_super THEN
+                EXECUTE format('REVOKE bridgeleads_purge FROM %I', current_user);
+            END IF;
+            IF EXISTS (SELECT 1 FROM pg_auth_members m
+                       WHERE m.roleid = 'bridgeleads_purge'::regrole
+                         AND (m.member <> current_user::regrole
+                              OR m.set_option OR m.inherit_option)) THEN
+                RAISE EXCEPTION 'unexpected membership in bridgeleads_purge';
+            END IF;
+        END
+        $grants$
+    """))
 
 
 def downgrade() -> None:
@@ -308,8 +342,28 @@ def downgrade() -> None:
             "UNION ALL SELECT 1 FROM public.batch_runs "
             "WHERE privacy_invalidated_at IS NOT NULL LIMIT 1")).first():
         raise RuntimeError("erased or invalidated rows exist; refusing to downgrade 135")
-    op.execute(text(f"DROP FUNCTION public.{_FN}"))
-    op.execute(text(f"DROP FUNCTION public.{_RULE_FN}"))
+    # The batch function belongs to the purge role: drop it as that role (as 113).
+    op.execute(text(f"""
+        DO $drop$
+        DECLARE
+            v_me text := current_user;
+            v_super boolean;
+        BEGIN
+            SELECT rolsuper INTO v_super FROM pg_roles WHERE rolname = v_me;
+            IF NOT v_super THEN
+                EXECUTE format('GRANT bridgeleads_purge TO %I WITH SET TRUE, INHERIT FALSE',
+                               v_me);
+                SET LOCAL ROLE bridgeleads_purge;
+            END IF;
+            DROP FUNCTION IF EXISTS public.{_FN};
+            IF NOT v_super THEN
+                RESET ROLE;
+                EXECUTE format('REVOKE bridgeleads_purge FROM %I', v_me);
+            END IF;
+        END
+        $drop$
+    """))
+    op.execute(text(f"DROP FUNCTION IF EXISTS public.{_RULE_FN}"))
     stmts = [f"DROP POLICY IF EXISTS {tbl}_purge ON public.{tbl};" for tbl in _NEW_POLICIES]
     for tbl, privs in _DOWNGRADE_REVOKES:
         stmts.append(f"REVOKE {privs} ON public.{tbl} FROM bridgeleads_purge;")

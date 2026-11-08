@@ -155,7 +155,8 @@ def test_erases_every_store_and_keeps_the_skeleton(conn):
     params = _params(rule, res=[target], keys=["d" * 64], king=["1234567890"], nts=[nts],
                      county=[county])
     counts = conn.execute(text(_CALL), params).scalar()
-    assert counts == {"results": 1, "cache": 2, "queues": 1, "pending": 2, "dialer": 1,
+    assert counts == {"results": 1, "cache": 2, "queues": 1, "pending_deleted": 1,
+                      "pending_scrubbed": 1, "dialer": 1,
                       "jobs": 1, "batch_runs": 1, "king": 1, "nts": 1, "county": 1}
 
     row = conn.execute(text(
@@ -173,7 +174,7 @@ def test_erases_every_store_and_keeps_the_skeleton(conn):
     pend = dict(conn.execute(text(
         "SELECT id::text, status || '|' || coalesce(first_name, '') || coalesce(mail_address, '') "
         "FROM pending_skip_trace_rows WHERE result_id = :r"), {"r": target}).all())
-    assert pend == {queued: "cancelled|", sent: "completed|"}
+    assert pend == {sent: "completed|"}  # the unsent lookup is gone
     assert conn.execute(text("SELECT download_url FROM skip_trace_queues "
                              "WHERE tracerfy_queue_id = 77")).scalar() is None
     dial = dict(conn.execute(text("SELECT id::text, status FROM dialer_deliveries "
@@ -244,3 +245,18 @@ def test_function_is_owned_by_the_purge_role_and_closed_to_public(conn):
     assert conn.execute(text(
         "SELECT relforcerowsecurity FROM pg_class WHERE relname = 'privacy_erasures'")
     ).scalar() is True
+
+
+def test_a_role_without_execute_is_refused(conn):
+    # The caller's own privileges gate the call; inside, the body runs as the purge role
+    # (NOSUPERUSER, NOBYPASSRLS), so every test above exercises that role's grants and
+    # RLS policies even though the test connects as the database owner.
+    rule = _rule(conn, "delete", ("pending", "active"))
+    role = f"privacy_probe_{uuid.uuid4().hex[:8]}"
+    conn.execute(text(f"CREATE ROLE {role} NOLOGIN NOSUPERUSER NOBYPASSRLS"))
+    conn.execute(text(f"GRANT USAGE ON SCHEMA public TO {role}"))
+    conn.execute(text(f"SET LOCAL ROLE {role}"))
+    try:
+        assert _sqlstate(conn, _params(rule)) == "42501"
+    finally:
+        conn.execute(text("RESET ROLE"))

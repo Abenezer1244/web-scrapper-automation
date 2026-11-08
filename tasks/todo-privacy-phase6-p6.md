@@ -60,6 +60,21 @@ name too). Privacy-protective and consistent with D2; the row is never delivered
 | Medium: second-pass completion undefined | ADOPTED. Complete only when: >= 24 h after the first pass, no job created before the first pass is still non-terminal, the second sweep (results + shared stores) erased nothing, and no outbox/pending row for an erased result is non-terminal. Otherwise re-run later. |
 | Medium Q3 | Same as the Critical above. |
 
+## P6a Codex review (5bf81696): NO-GO, fixed
+
+- Critical: ALTER FUNCTION OWNER without 112/113's temporary SET-role hand-over (fails
+  on a non-superuser Supabase migration role). FIXED: same hand-over + membership check.
+- High: downgrade dropped the purge-owned function as the migration role. FIXED.
+- High: unsent lookups were cancelled, not deleted. FIXED: 'queued' rows deleted (no FK
+  references them; the only trigger is AFTER UPDATE); sent rows scrubbed.
+- Medium x2 (the function trusts caller-supplied ids and cache keys): the HMAC keys and
+  pending_row_subject_key live in Python, so discovery cannot move into SQL. Becomes a
+  P6b CONTRACT with required tests: (1) unflagged AND opt-out-flagged matching rows are
+  discovered and erased; (2) every pending row's subject key (several per result) is
+  collected and passed before any mutation.
+- Low (tests run as the owner): the body runs as the purge role (NOSUPERUSER,
+  NOBYPASSRLS), so its grants and RLS are exercised; added a refused-caller test.
+
 ## Open questions sent to the Codex consult (answered above)
 
 1. R2. Job export download (jobs.py:2593) rebuilds the CSV from the DB (already filtered

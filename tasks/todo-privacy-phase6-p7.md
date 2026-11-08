@@ -114,6 +114,27 @@ tool to run; the rest are referenced only by docs/comments):
       the row -> every reader hides it -> erasure driver blanks it (delete) -> lift -> rows return
       (opt-out only; erased data does not come back).
 
+#### Pre-raise audit (2026-11-08), design section 6 layer by layer
+| Layer | Where (evidence) | Shipped |
+|---|---|---|
+| Authorization service | `src/privacy/authorize.py` `authorize()`, fail-closed loader (129 reader) | P3 #597, P7c releases |
+| Storage flag | `results.privacy_suppressed_at` / `privacy_suppression_id` (126), `privacy_checked_gen` (130) | P3 #594, P5 |
+| Read paths, every tab | `src/api/lead_actionability.py` `not_privacy_suppressed_*`; 07 inventory gaps 1-8c closed, 9 optional (claim re-checks) | P3 #595/#596, P5g |
+| Dialer outbox by id | `src/workers/dialer_outbox.py:211`, `webhook_delivery.py:597`, `scheduler_helpers/dialer.py:305` | P4 #601 |
+| Tracerfy dispatcher | `src/workers/skip_trace_dispatcher.py:1497` (rules before any claim) | P4 #601 |
+| Tracerfy ingest quarantine | `src/workers/tracerfy_ingest.py:583` | P4 #601 |
+| Pre-insert filter | `src/workers/tasks.py:1190` | P5 #603 |
+| Shared-store writers | `owner_recovery.py:532` (King tombstone), `nts_crawler.py:700` (`_upsert_notice`) | P5 #606 |
+| Recovery writers, late delivery, cache copies | guarded UPDATEs; `cv_late_delivery.py:463` | P5 #607 |
+| Enforcer sweep | `src/workers/privacy_enforcer.py` (beat) | P5 #603 |
+| Erasure | migration 135, `src/privacy/erase.py`, `src/workers/privacy_erasure.py` | P6 #610 |
+| Operator scripts | 21 retired, 12 filtered; gate armed and green (`test_privacy_script_inventory.py`) | P7a |
+| Activation, lift, review | migration 136, `scripts/privacy_admin.py` | P7b/P7c |
+
+`IMPLEMENTED_ENFORCEMENT_VERSION` has no runtime reader other than `assert_activation_allowed()`,
+which only the CLI calls: raising it changes no worker or API behaviour. `PRIVACY_ENFORCEMENT_VERSION`
+stays 0 in every environment until the owner sets it.
+
 ### P7e. Release (standing Phase 6 rule: merge when CI green AND Codex GO)
 - [ ] Merge, verify Railway: `Running upgrade 135 -> 136`, api/worker/beat SUCCESS, /health 200.
 - [ ] STOP. Report to the owner. Setting `PRIVACY_ENFORCEMENT_VERSION=1` on api, worker and beat

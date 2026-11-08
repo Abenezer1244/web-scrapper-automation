@@ -5,8 +5,8 @@ section 6 has shipped (authorization service, read paths, durable send
 authorization, write-path gates, enforcer sweep, erasure). Until then rules can be
 recorded but stay pending. Three locks, all of which must open:
 
-  1. The database. Migration 125's ck_privacy_suppressions_activation_guard allows
-     state 'pending' only; P7 replaces it in the same release that raises (2).
+  1. The database. Migration 125's guard allowed state 'pending' only; migration 136
+     (P7) replaced it with the operator functions, in the release that raised (2).
   2. The code. IMPLEMENTED_ENFORCEMENT_VERSION says which layers this codebase
      actually has. Only the change that ships the last layer may raise it.
   3. The operator. settings.PRIVACY_ENFORCEMENT_VERSION, raised deliberately per
@@ -21,8 +21,9 @@ from src.config import settings
 
 # Every section-6 layer shipped (P3 through P6 of the design's order of work).
 REQUIRED_ENFORCEMENT_VERSION = 1
-# What this codebase implements today: none of the layers (Phase 6 groundwork).
-IMPLEMENTED_ENFORCEMENT_VERSION = 0
+# What this codebase implements: every section-6 layer (P3-P6) and the operator side
+# (P7). Raising it arms tests/test_privacy_script_inventory.py's script gate.
+IMPLEMENTED_ENFORCEMENT_VERSION = 1
 
 
 class ActivationNotAllowedError(RuntimeError):

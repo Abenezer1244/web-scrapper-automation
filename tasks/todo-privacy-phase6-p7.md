@@ -49,6 +49,29 @@ tool to run; the rest are referenced only by docs/comments):
   keeps the list-equals-inventory test green. Retired names move to a "Retired in P7" note
   outside the gated section of 08.
 
+## Design refinements while building (2026-11-08)
+- Prod check (read-only, Supabase MCP): `postgres` has `rolbypassrls = true` and owns
+  `privacy_erasures` and `results` (both FORCE RLS), so the CLI-as-migration-role can write them.
+- REVIEW release must be visible to `authorize()` itself: the dispatcher and dialer call
+  `authorize()` at send time instead of reading the flag. So 136 adds an append-only
+  `privacy_review_releases(rule_id, result_id, actor)` and a 129-style definer reader for the
+  worker role; `RuleSnapshot` loads it and a REVIEW whose every candidate rule is released for
+  that row id becomes ALLOWED. WITHHELD (exact) is never releasable: re-enforcing re-flags it.
+  "Confirm" needs no operation (a flagged row stays flagged; erasure never touches REVIEW).
+- Every write function checks the actor is an admin with MFA enabled (`users.is_admin`,
+  `users.mfa_enabled`), and records it: `privacy_suppressions.actor_user_id` (new, NOT VALID
+  CHECK so it binds new rows only).
+- The DB cannot know the live key versions or the normalisation version. The CLI therefore
+  activates, lifts and releases inside ONE transaction that also loads the post-change rule
+  snapshot (`load_rule_snapshot`) and commits only if it loads: a rule the loader would reject
+  can never be committed (generalises Codex's mailing Critical). 136 also adds a CHECK that a
+  non-pending row's anchor is property/phone/email.
+- Lift is done in SQL in one function: lifted rows, then unflag results (`privacy_checked_gen = 0`),
+  drop King tombstones, clear NTS rule ids, returning the result ids; the CLI re-runs
+  `enforce_rows` on them before commit.
+- Queued work at activation: the CLI flags the rule's candidates at once (`enforce_rows`);
+  queued Tracerfy rows and dialer sends are re-authorized at send time (P4) and withdrawn there.
+
 ## Slices (each: <= 5 files per commit, ruff clean, tests on TEST_DATABASE_URL, Codex GO)
 
 ### P7a. Clear the script gate (no behaviour change for the product)

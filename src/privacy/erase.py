@@ -60,17 +60,22 @@ _KING_SQL = text(
     "WHERE outcome = 'found' AND owner_name IS NOT NULL AND parcel_id > :after "
     "ORDER BY parcel_id LIMIT :n"
 )
+# The grantor is a notice's only person field. A notice withheld by ANY rule already
+# has none (132's ck_nts_notices_privacy_withheld: rule set => grantor NULL, inactive),
+# so every notice that can still name the subject is one with a grantor.
 _NTS_SQL = text(
     "SELECT id::text AS id, grantor, parcel, county, state FROM nts_notices "
-    "WHERE grantor IS NOT NULL AND privacy_suppression_id IS NULL "
-    "AND id > CAST(:after AS uuid) ORDER BY id LIMIT :n"
+    "WHERE grantor IS NOT NULL AND id > CAST(:after AS uuid) ORDER BY id LIMIT :n"
 )
 _COUNTY_SQL = text(
     "SELECT id::text AS id, county, state, party_name, heirs, parcel_id, enrichment_data "
     "FROM county_records WHERE id > CAST(:after AS uuid) ORDER BY id LIMIT :n"
 )
 # county_records carries no record type, so its name order is unknown: a row is the
-# subject's if ANY order reads it as an exact anchor + subject match.
+# subject's if ANY order reads it as an exact anchor + subject match. Nothing writes
+# the table any more (only the weekly retention purge deletes from it), so no source
+# can be recorded for the rows left; they age out. A wrong-order false match needs the
+# reversed name on the SAME anchor, and only deletes a row of this orphaned store.
 _COUNTY_ORDERS = (None, *sorted(ALL_RECORD_TYPES))
 
 

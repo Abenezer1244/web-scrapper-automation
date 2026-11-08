@@ -75,6 +75,21 @@ name too). Privacy-protective and consistent with D2; the row is never delivered
 - Low (tests run as the owner): the body runs as the purge role (NOSUPERUSER,
   NOBYPASSRLS), so its grants and RLS are exercised; added a refused-caller test.
 
+## P6b Codex review (13477a91): NO-GO, resolved
+
+- High x2 (NTS scan skips notices withheld by another rule; their grantor is blank):
+  132's ck_nts_notices_privacy_withheld makes "withheld by any rule" imply "no grantor,
+  inactive", and the grantor is a notice's only person field, so such a notice holds
+  nothing to erase. Dropped the redundant predicate (scan = every notice WITH a grantor),
+  documented it, and a test proves the CHECK. Disagreement recorded: no NTS lineage
+  column is added.
+- Medium county_records name order: nothing writes the table any more (only the weekly
+  retention purge deletes), so provenance cannot be recorded; trying every order is
+  kept and documented; the rows age out.
+- Medium cursor coverage: per-store tests at BATCH 1 and 2 (full pages, short last page,
+  hand-over). Medium phone/email anchors: phone-only rule test (ORM-decrypted).
+- Low purging accounts: test that a purging account's row is found but left to 113.
+
 ## Open questions sent to the Codex consult (answered above)
 
 1. R2. Job export download (jobs.py:2593) rebuilds the CSV from the DB (already filtered

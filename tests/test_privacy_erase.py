@@ -42,10 +42,11 @@ def _request(s, kind: str) -> str:
         "VALUES (:k, 'web', now() + interval '45 days') RETURNING id"), {"k": kind}).scalar())
 
 
-def _active_rule(s, kind: str) -> tuple[str, str]:
-    """SMITH JOHN on the King parcel, pending then active; returns (rule_id, active row)."""
+def _active_rule(s, kind: str, **history) -> tuple[str, str]:
+    """SMITH JOHN on the King parcel (or ``anchor=``), pending then active; returns
+    (rule_id, active row)."""
     req = _request(s, kind)
-    rows = _history(["pending", "active"])
+    rows = _history(["pending", "active"], **history)
     for r in rows:
         s.execute(_INSERT_RULE, {**r, "req": req})
     return rows[1]["rule_id"], rows[1]["id"]
@@ -210,3 +211,90 @@ def test_a_cursor_resumes_where_the_last_step_stopped(s, monkeypatch):
                                 "WHERE id = ANY(CAST(:i AS uuid[]))"), {"i": ids}).all())
     assert names[ids[0]] == "SMITH JOHN" and names[ids[1]] is None
     json.dumps(step.cursor)  # storable as jsonb
+
+
+def _sweep(s, rule, store: str) -> dict[str, int]:
+    """Walk one store from its start to its end, one step at a time."""
+    totals: dict[str, int] = {}
+    cursor: dict = {"store": store}
+    while cursor.get("store") == store:
+        step = erase_step(s, rule, cursor)
+        for k, v in step.counts.items():
+            totals[k] = totals.get(k, 0) + v
+        if step.done:
+            break
+        cursor = step.cursor
+    return totals
+
+
+@pytest.mark.parametrize("batch", [1, 2])
+def test_every_shared_store_resumes_across_pages(s, monkeypatch, batch):
+    """BATCH 1 and 2 over three matches each: exact-full pages, a short last page, and
+    the hand-over to the next store all happen inside each store."""
+    import src.privacy.erase as erase
+    rule_id, row = _active_rule(s, "delete")
+    rule = load_erasure_rule(s, rule_id, row)
+    monkeypatch.setattr(erase, "BATCH", batch)
+    # Three of each, all on the subject's parcel, so every page boundary is crossed.
+    for i in range(3):
+        s.execute(text(
+            "INSERT INTO king_parcel_owners (parcel_id, outcome, owner_name, observed_at, "
+            "source) VALUES (:p, 'found', 'SMITH JOHN', now(), 'erealproperty')"),
+            {"p": _PARCEL if i == 0 else f"000000000{i}"})
+        nts = str(uuid.uuid4())
+        s.execute(text(
+            "INSERT INTO nts_notices (id, source, ts_number, grantor, parcel, county, state) "
+            "VALUES (:i, 'test', :t, 'JOHN SMITH', :p, 'king', 'WA')"),
+            {"i": nts, "t": nts[:12], "p": _PARCEL})
+        s.execute(text(
+            "INSERT INTO county_records (id, county, state, record_hash, party_name, "
+            "parcel_id) VALUES (gen_random_uuid(), 'king', 'WA', :h, 'SMITH JOHN', :p)"),
+            {"h": uuid.uuid4().hex, "p": _PARCEL})
+    # King keys on the normalised parcel: only the exact parcel is the subject's.
+    assert _sweep(s, rule, "king").get("king") == 1
+    assert _sweep(s, rule, "nts").get("nts") == 3
+    assert _sweep(s, rule, "county").get("county") == 3
+    assert s.execute(text("SELECT count(*) FROM nts_notices WHERE grantor = 'JOHN SMITH'")
+                     ).scalar() == 0
+
+
+def test_a_phone_anchor_erases_only_the_named_subject(s):
+    rule_id, row = _active_rule(s, "delete", anchor=("phone", "2065550100"))
+    rule = load_erasure_rule(s, rule_id, row)
+    uid, job = _owner(s)
+    # No parcel at all: the phone (stored encrypted, read through the ORM) is the anchor.
+    subject = _result(s, uid, job, "SMITH JOHN", None)
+    stranger = _result(s, uid, job, "DOE JANE", None)       # same phone, other person
+    assert _run_pass(s, rule).get("results") == 1
+    names = dict(s.execute(text("SELECT id::text, party_name FROM results "
+                                "WHERE id = ANY(CAST(:i AS uuid[]))"),
+                           {"i": [subject, stranger]}).all())
+    assert names == {subject: None, stranger: "DOE JANE"}
+
+
+def test_an_account_being_purged_is_left_to_its_own_purge(s):
+    rule_id, row = _active_rule(s, "delete")
+    rule = load_erasure_rule(s, rule_id, row)
+    uid, job = _owner(s)
+    rid = _result(s, uid, job, "SMITH JOHN", _PARCEL)
+    s.execute(text("SET LOCAL ROLE bridgeleads_purge"))
+    for state in ("pending", "purging"):
+        s.execute(text("UPDATE users SET deletion_state = :s WHERE id = :u"),
+                  {"s": state, "u": uid})
+    s.execute(text("RESET ROLE"))
+    # Found, but not erased or counted: 113's purge blanks it and owns its lifecycle.
+    assert _run_pass(s, rule).get("results", 0) == 0
+    assert s.execute(text("SELECT privacy_erased_at FROM results WHERE id = :i"),
+                     {"i": rid}).scalar() is None
+
+
+def test_a_withheld_notice_can_never_keep_a_grantor(s):
+    """Why the NTS scan only reads notices with a grantor (132's CHECK)."""
+    _, row = _active_rule(s, "opt_out")
+    nts = str(uuid.uuid4())
+    with pytest.raises(Exception, match="ck_nts_notices_privacy_withheld"):
+        with s.begin_nested():
+            s.execute(text(
+                "INSERT INTO nts_notices (id, source, ts_number, grantor, is_active, "
+                "privacy_suppression_id) VALUES (:i, 'test', :t, 'JOHN SMITH', false, :r)"),
+                {"i": nts, "t": nts[:12], "r": row})

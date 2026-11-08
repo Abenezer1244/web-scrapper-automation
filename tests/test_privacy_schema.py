@@ -64,8 +64,9 @@ def _event(**over) -> dict:
 
 
 _RULE = ("INSERT INTO privacy_suppressions (rule_id, request_id, anchor_kind, anchor_hmac, "
-         "subject_kind, subject_hmac, scope, key_version, normalization_version, state) "
-         "VALUES (:rule, :r, :ak, :ah, :sk, :sh, :scope, :kv, :nv, :state)")
+         "subject_kind, subject_hmac, scope, key_version, normalization_version, state, "
+         "actor_user_id) VALUES (:rule, :r, :ak, :ah, :sk, :sh, :scope, :kv, :nv, :state, "
+         "gen_random_uuid())")
 
 
 def _rule(request_id: str, **over) -> dict:

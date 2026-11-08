@@ -74,9 +74,10 @@ def _rule(c, kind: str = "delete") -> tuple[str, str]:
     for r in rows:
         _q(c, "INSERT INTO privacy_suppressions (id, rule_id, request_id, anchor_kind, "
               "anchor_hmac, subject_kind, subject_hmac, scope, key_version, "
-              "normalization_version, state, created_at) VALUES (:id, :rule_id, :req, "
-              ":anchor_kind, :anchor_hmac, :subject_kind, :subject_hmac, :scope, "
-              ":key_version, :normalization_version, :state, :created_at)", **r, req=req)
+              "normalization_version, state, created_at, actor_user_id) VALUES (:id, "
+              ":rule_id, :req, :anchor_kind, :anchor_hmac, :subject_kind, :subject_hmac, "
+              ":scope, :key_version, :normalization_version, :state, :created_at, "
+              "gen_random_uuid())", **r, req=req)
     rule_id, row = rows[1]["rule_id"], rows[1]["id"]
     _q(c, "INSERT INTO privacy_erasures (rule_id, rule_row_id) VALUES (:r, :w)",
        r=rule_id, w=row)

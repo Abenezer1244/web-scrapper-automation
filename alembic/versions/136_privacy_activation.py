@@ -9,9 +9,9 @@ role could write a privacy row and migration 125's CHECK admitted state 'pending
                                              or email: the rule loader cannot compute a
                                              mailing anchor and would refuse EVERY rule
                                              (fail closed, globally) if one went active.
-  privacy_suppressions.actor_user_id         the operator behind the row. Nullable: only
-                                             the functions below write rule rows, and each
-                                             sets it.
+  privacy_suppressions.actor_user_id         the operator behind the row. Every active or
+                                             lifted row must carry one (NOT VALID CHECK:
+                                             binds new rows only).
   privacy_review_releases                    append-only: an operator decided that a REVIEW
                                              match on this result is not the rule's subject.
                                              authorize() honours it for REVIEW only; an exact
@@ -138,6 +138,10 @@ BEGIN
     ELSIF p_event_type = 'closed' AND NOT ('decided' = ANY(v_req.events)) THEN
         RAISE EXCEPTION 'privacy: a request is closed only after a decision'
             USING ERRCODE = 'BLD52';
+    ELSIF 'decided' = ANY(v_req.events) AND p_event_type <> 'closed' THEN
+        -- A decision without verification is allowed: a request that fails verification
+        -- is denied with a fixed code (design section 9). Only closing may follow one.
+        RAISE EXCEPTION 'privacy: only closing follows a decision' USING ERRCODE = 'BLD52';
     END IF;
     SELECT coalesce(max(e.seq), 0) + 1 INTO v_seq
       FROM public.privacy_request_events e WHERE e.request_id = p_request;
@@ -184,7 +188,11 @@ BEGIN
             USING ERRCODE = 'BLD53';
     END IF;
     IF p_rule_id IS NOT NULL THEN
-        -- A further key-version row of a rule this request already holds.
+        -- A further key-version row of a rule this request already holds. Its HMACs
+        -- differ from the other rows by design (each key version digests the same value
+        -- differently), so only the kinds can be compared here.
+        PERFORM 1 FROM public.privacy_suppressions s WHERE s.rule_id = p_rule_id
+          ORDER BY s.id FOR UPDATE;
         IF NOT EXISTS (SELECT 1 FROM public.privacy_suppressions s
                         WHERE s.rule_id = p_rule_id AND s.request_id = p_request
                           AND s.anchor_kind = p_anchor_kind
@@ -220,6 +228,9 @@ BEGIN
     v_req := public.privacy_lock_request(request_id);
     kind := v_req.kind;
     events := v_req.events;
+    -- Every row of the rule too, after the request (one order for every caller).
+    PERFORM 1 FROM public.privacy_suppressions s WHERE s.rule_id = p_rule
+      ORDER BY s.id FOR UPDATE;
 END
 $fn$;
 
@@ -360,6 +371,9 @@ def upgrade() -> None:
                     "ck_privacy_suppressions_enforceable "
                     "CHECK (state = 'pending' OR anchor_kind IN ('property', 'phone', 'email'))"))
     op.execute(text("ALTER TABLE public.privacy_suppressions ADD COLUMN actor_user_id uuid"))
+    op.execute(text("ALTER TABLE public.privacy_suppressions ADD CONSTRAINT "
+                    "ck_privacy_suppressions_actor "
+                    "CHECK (state = 'pending' OR actor_user_id IS NOT NULL) NOT VALID"))
     op.execute(text("""
         CREATE TABLE public.privacy_review_releases (
             id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -407,6 +421,8 @@ def downgrade() -> None:
     for fn in (_READER,) + _OPERATOR_FUNCTIONS + _HELPERS:
         op.execute(text(f"DROP FUNCTION IF EXISTS public.{fn}"))
     op.execute(text("DROP TABLE public.privacy_review_releases"))
+    op.execute(text("ALTER TABLE public.privacy_suppressions "
+                    "DROP CONSTRAINT IF EXISTS ck_privacy_suppressions_actor"))
     op.execute(text("ALTER TABLE public.privacy_suppressions DROP COLUMN actor_user_id"))
     op.execute(text("ALTER TABLE public.privacy_suppressions "
                     "DROP CONSTRAINT ck_privacy_suppressions_enforceable"))

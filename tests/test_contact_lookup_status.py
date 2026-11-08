@@ -150,6 +150,10 @@ async def test_a_fresh_action_is_dispatching_with_every_lead_pending(
     assert body["unit_price_cents"] > 0 and body["currency"] == "USD"
     assert body["created_at"] is not None and body["status_changed_at"] is not None
     assert body["pause"] is not None and pause_reads == [business_user.id]
+    # The server's clock, so a client times the wait against the same clock (2026-11-07).
+    as_of = datetime.fromisoformat(body["as_of"])
+    assert as_of.tzinfo is not None
+    assert as_of >= datetime.fromisoformat(body["created_at"])
 
 
 async def test_a_running_action_has_started(

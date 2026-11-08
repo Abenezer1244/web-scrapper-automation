@@ -2612,6 +2612,9 @@ class ContactLookupStatus(BaseModel):
     settled_at: datetime | None = None
     status_changed_at: datetime | None = None
     pause: ContactLookupPause | None = None
+    # The server's clock when this status was read, so a client times waits against
+    # the same clock as the timestamps above, never its own (a skewed client misjudges).
+    as_of: datetime
 
 
 class ContactLookupSummary(BaseModel):

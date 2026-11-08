@@ -269,3 +269,16 @@ Root cause: county coverage gap in the shared enrichment (no mailing source outs
   the run_action test uses a missing id, not an RLS-hidden existing one.
 - Production read-only: drift SQL flags exactly the 3 ledger tables today.
 
+## Contact lookup follow-ups (2026-11-07, branch `fix/contact-lookup-followups`)
+- [x] Migration 134: revoke everything anon/authenticated hold in public (tables, sequences, functions, default
+      privileges) and service_role EXECUTE on functions; object by object, owned objects only, extensions skipped;
+      postcondition (tables incl. foreign + column privileges; callable definer functions). Downgrade no-op.
+      Why: Data API serves public to the publishable key; SECURITY DEFINER privacy_rule_rows() was callable by anon.
+- [x] Hourly audit alerts `api_role_exposure` (same checks, effective privileges incl. PUBLIC).
+- [x] Status route returns `as_of` (server clock); FE times the slow-start copy on it (Codex Medium from #319).
+- [x] Tests: tests/test_supabase_api_roles.py (7), as_of assertion in test_contact_lookup_status.
+- Disagreement with Codex (recorded): no global `ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC`;
+  it would silently break future migrations whose app roles rely on the default; the hourly audit catches a
+  definer function callable through PUBLIC within the hour.
+- Owner: disable the Supabase Data API in the dashboard (nothing uses it); send the customer note (draft in session
+  scratchpad). Customer already re-ran Pierce after the fix: settled 2026-11-07, 8 found / 1 not found.

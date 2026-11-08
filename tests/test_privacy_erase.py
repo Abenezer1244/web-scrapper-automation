@@ -55,8 +55,6 @@ def _active_rule(s, kind: str, **history) -> tuple[str, str]:
 @pytest.fixture
 def s():
     with system_sync_session() as session:
-        session.execute(text("ALTER TABLE privacy_suppressions "
-                             "DROP CONSTRAINT ck_privacy_suppressions_activation_guard"))
         try:
             yield session
         finally:

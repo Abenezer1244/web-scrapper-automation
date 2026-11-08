@@ -42,8 +42,6 @@ class _Store:
 def conn(monkeypatch):
     with sync_engine.connect() as c:
         outer = c.begin()
-        c.execute(text("ALTER TABLE privacy_suppressions "
-                       "DROP CONSTRAINT ck_privacy_suppressions_activation_guard"))
         # Nothing else in this database may hold the driver's phases up: earlier runs'
         # unfinished jobs and lookups, and other erasures (all rolled back below).
         c.execute(text("UPDATE jobs SET status = 'done' "

@@ -104,8 +104,6 @@ def _params(rule: str, **over) -> dict:
 def conn():
     with sync_engine.connect() as c:
         tx = c.begin()
-        c.execute(text("ALTER TABLE privacy_suppressions "
-                       "DROP CONSTRAINT ck_privacy_suppressions_activation_guard"))
         try:
             yield c
         finally:

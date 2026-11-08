@@ -42,11 +42,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from sqlalchemy import text  # noqa: E402
 
+from src.api.lead_actionability import not_privacy_suppressed_sql  # noqa: E402
+
 SOURCE = "king_tax_bill"
 OUTCOME_KEY = "mailing_taxbill_outcome"
 _CHUNK = 150  # batch_enrich_king_county caps one mailing pass at 200 pages
 
-_CV_CANDIDATES_SQL = """
+_CV_CANDIDATES_SQL = f"""
     SELECT r.id, r.user_id, r.parcel_id AS raw_pid, r.enrichment_data::jsonb->>'kc_pin' AS pid,
            r.property_address, r.property_city, r.property_state, r.property_zip,
            r.mailing_address, r.enrichment_data::jsonb AS ed
@@ -58,12 +60,13 @@ _CV_CANDIDATES_SQL = """
       AND j.status = 'done'
       AND r.parcel_id IS NULL
       AND r.mailing_address IS NULL
+      AND {not_privacy_suppressed_sql("r")}
       AND r.enrichment_data::jsonb->>'kc_pin_status' = 'matched'
-      AND r.enrichment_data::jsonb->>'kc_pin' ~ '^[0-9]{10}$'
+      AND r.enrichment_data::jsonb->>'kc_pin' ~ '^[0-9]{{10}}$'
       AND btrim(coalesce(r.enrichment_data::jsonb->>'mailing_source', '')) = ''
       AND NOT (r.enrichment_data::jsonb ? 'mailing_taxbill_outcome')
     ORDER BY r.id
-"""
+"""  # noqa: S608 — module constants, not input
 
 _STAMPED_SQL = """
     SELECT r.id FROM results r
@@ -73,7 +76,7 @@ _STAMPED_SQL = """
       AND r.enrichment_data::jsonb ? 'mailing_taxbill_outcome'
 """
 
-_UPDATE_SQL = """
+_UPDATE_SQL = f"""
     UPDATE results SET
       mailing_address = CASE WHEN CAST(:new_mail AS text) IS NOT NULL
                              THEN CAST(:new_mail AS text) ELSE mailing_address END,
@@ -86,19 +89,20 @@ _UPDATE_SQL = """
       out_of_state_owner = CASE WHEN CAST(:new_mail AS text) IS NOT NULL
                                 THEN CAST(:f_out_of_state AS boolean) ELSE out_of_state_owner END,
       enrichment_data = ((CASE WHEN jsonb_typeof(enrichment_data::jsonb) = 'object'
-                               THEN enrichment_data::jsonb ELSE '{}'::jsonb END)
+                               THEN enrichment_data::jsonb ELSE '{{}}'::jsonb END)
                          || CAST(:payload AS jsonb))::json
     WHERE id = :rid
       AND user_id = :uid
       AND parcel_id IS NOT DISTINCT FROM :raw_pid
       AND mailing_address IS NOT DISTINCT FROM :old_mail
+      AND {not_privacy_suppressed_sql("results")}
       AND (enrichment_data IS NULL OR jsonb_typeof(enrichment_data::jsonb) IN ('object', 'null'))
       AND btrim(coalesce(enrichment_data::jsonb->>'mailing_source', '')) = ''
       AND NOT coalesce(enrichment_data::jsonb ? 'mailing_taxbill_outcome', false)
       AND (CAST(:kind AS text) <> 'cv'
            OR coalesce(enrichment_data::jsonb->>'kc_pin', '') = CAST(:pid AS text))
       AND EXISTS (SELECT 1 FROM jobs j WHERE j.id = results.job_id AND j.status = 'done')
-"""
+"""  # noqa: S608 — module constants, not input
 
 
 def _load_rpacct_script():

@@ -19,6 +19,56 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-11-08 — Privacy: erasure of a person across every store (compliance Phase 6 P6)
+
+**Built / Shipped:** PR #610 (owner "approved" P6; P7 activation NOT approved). Dormant: migration 125 still
+admits only 'pending' rules and the erase function refuses anything but an active deletion rule. Plan +
+review log: `tasks/todo-privacy-phase6-p6.md`.
+- Migration 135: `results.privacy_erased_at`, `jobs`/`batch_runs.privacy_invalidated_at`, table
+  `privacy_erasures` (phase markers, scan cursor), `privacy_erase_batch()` (SECURITY DEFINER owned by
+  bridgeleads_purge, system-only) and `privacy_erasure_rule()` (owned by the privacy tables' owner, so those
+  tables still carry no RLS policy).
+- `src/privacy/erase.py`: discovery in Python (the HMAC keys live there), one bounded, resumable batch per
+  step over results (every tenant), King owners, NTS notices, county_records.
+- `src/workers/privacy_erasure.py`: beat `drive-privacy-erasures` (every 10 min from :06, 240 s budget,
+  soft/hard 270/300 s, advisory lock): first pass, R2 sweep, second pass >= 24 h later once nothing older
+  runs, round again if it still finds the subject, final R2 sweep, complete once nothing is out at Tracerfy.
+
+**Tried / Decided:**
+- Only WITHHELD (exact anchor + exact subject) is erased; REVIEW stays hidden but never erased (design
+  section 5: review candidates never apply automatically; erasure cannot be undone).
+- Discovery scans every row, flagged or not: a row first flagged by the person's opt-out rule carries that
+  rule's id (Codex consult, Critical).
+- Co-owned rows are blanked whole (D2 withholds them whole anyway).
+- Unsent lookups are deleted; sent ones keep only the property address (billing evidence).
+- King owners become tombstones rather than deleted rows (the P5 writer gates key on the tombstone).
+- R2: no endpoint changes. Every download (job, batch, account export) already renders from the database,
+  which excludes the rows; the R2 objects are stale copies, deleted by the sweep. Account ZIPs requested
+  before the pass are expired (owner can request again).
+- Advisory lock instead of lease columns (dropped from 135 before it merged).
+
+**Failed / Blocked:** local runs failed 24 tests while Docker/Redis was down (503 auth service, Redis lock);
+with Redis restarted the same tests pass. Codex consult and reviews ran six rounds.
+
+**Caught & fixed:** Codex: ALTER FUNCTION OWNER without 113's SET-role hand-over (Critical, would fail on
+Supabase's non-superuser role); downgrade dropping the purge-owned function as the wrong role; the dialer
+outbox missing from the plan; an in-flight job or batch uploading an export built from pre-erasure data
+after the only sweep (Critical) -> stamp before an export exists, drain batches too, final sweep with the
+barrier re-checked; Celery time limits. Mine: queue join on the wrong id type (uuid vs Tracerfy's int);
+driver mixing its clock with the DB's now(). Disagreements settled with evidence: NTS notices withheld by
+another rule hold no grantor (132's CHECK); no upload can start after the final check (uploads precede
+'done', retries pass the insert gate).
+
+**Pending / Handoff:** P7 (activation: admin review, insert privacy_erasures rows for deletion rules, lift
+125's guard, raise PRIVACY_ENFORCEMENT_VERSION) needs owner approval. Tracerfy vendor deletion and customer
+notification remain [D] with counsel.
+
+**Facts learned:** king_parcel_owners.parcel_id is varchar(10); pending_skip_trace_rows allows one ACTIVE
+row per result; dialer_deliveries one row per (job, result); county_records has no writer left (retention
+purge only).
+
+---
+
 ## 2026-11-07 (late) — Supabase Data API could call a privacy function; server clock for the wait copy
 
 **Built / Shipped:** migration 134 revokes everything anon/authenticated hold in public and service_role's EXECUTE

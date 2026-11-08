@@ -11,6 +11,7 @@ re-enqueued).
 
 from __future__ import annotations
 
+from datetime import date
 from enum import Enum
 
 
@@ -543,5 +544,16 @@ AUCTION_PUBLICATION_LAG_DAYS: int = 55
 # a new date means existing customers have not accepted it (re-acceptance, 3d).
 LEGAL_DOCUMENT_VERSIONS: dict[str, str] = {
     "terms": "2026-10-01",
-    "privacy": "2026-10-30",
+    "privacy": "2026-11-08",
 }
+
+# The Privacy Policy version published just before the current one. A bump makes
+# every page still open on the old text (stale tabs, cached bundles, the gap between
+# the backend and frontend deploys) submit the old version. Until the cutoff below
+# (exclusive, UTC date) a signup sending (current terms, THIS) is recorded as having
+# accepted THIS version: the text that person actually saw, never the current one.
+# After the cutoff it records nothing, like any other stale pair. Re-acceptance
+# (Phase 3d) must treat such a row as NOT accepting the current version. On the next
+# bump, move the old current value here and set the cutoff 14 days after publish.
+PREVIOUS_PRIVACY_VERSION: str = "2026-10-30"
+PREVIOUS_PRIVACY_ACCEPTED_UNTIL: date = date(2026, 11, 22)

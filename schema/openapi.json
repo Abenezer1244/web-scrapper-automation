@@ -3706,8 +3706,8 @@
         "description": "The current published Terms / Privacy versions (GET /auth/config).\n\nTyped as Literals of LEGAL_DOCUMENT_VERSIONS so OpenAPI, and the frontend's\ngenerated types (regenerated and diff-checked in its CI), carry the exact\nvalues: a backend-only version bump then fails the frontend's typecheck\ninstead of silently recording no acceptance. A RESPONSE model only, so a\nstale client can never get a 422 from it.",
         "properties": {
           "privacy": {
-            "const": "2026-10-30",
-            "default": "2026-10-30",
+            "const": "2026-11-08",
+            "default": "2026-11-08",
             "title": "Privacy",
             "type": "string"
           },

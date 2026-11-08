@@ -12,13 +12,20 @@ Properties under test:
 """
 
 import uuid
+from datetime import UTC, date, datetime, timedelta
 
 from httpx import AsyncClient
 from sqlalchemy import delete, select, text
 
+from src.api.routes.auth_helpers import registration
+from src.api.routes.auth_helpers.registration import legal_versions_to_record
 from src.api.routes.auth_helpers.tokens import _mint_verify_token
 from src.config import settings
-from src.config.constants import LEGAL_DOCUMENT_VERSIONS
+from src.config.constants import (
+    LEGAL_DOCUMENT_VERSIONS,
+    PREVIOUS_PRIVACY_ACCEPTED_UNTIL,
+    PREVIOUS_PRIVACY_VERSION,
+)
 from src.db import PendingRegistration, User
 from src.utils.crypto import blind_index
 
@@ -161,6 +168,115 @@ async def test_verified_flow_without_verifier_acceptance_records_nothing(
         })
         assert r.status_code == 200
         assert await _acceptances(db, await _user_id(db, email)) == []
+    finally:
+        await db.execute(delete(PendingRegistration).where(
+            PendingRegistration.email_hmac == blind_index(email)))
+        await db.commit()
+
+
+# --- Previous privacy version, time-boxed (P0-03 6d: privacy page lists Sentry) ---
+# A bump leaves pages open on the old text. Until the cutoff such a signup records
+# the PREVIOUS version (what the person saw), never the current one. Dates are taken
+# relative to the constants or to today, so no verdict changes as the calendar moves.
+
+_TERMS = LEGAL_DOCUMENT_VERSIONS["terms"]
+_BEFORE_CUTOFF = PREVIOUS_PRIVACY_ACCEPTED_UNTIL - timedelta(days=1)
+_PREVIOUS = {"accepted_terms_version": _TERMS, "accepted_privacy_version": PREVIOUS_PRIVACY_VERSION}
+
+
+def _cutoff_in(monkeypatch, days: int) -> None:
+    """Move the cutoff relative to today (0 = already passed: it is exclusive)."""
+    cutoff = datetime.now(UTC).date() + timedelta(days=days)
+    monkeypatch.setattr(registration, "PREVIOUS_PRIVACY_ACCEPTED_UNTIL", cutoff)
+
+
+def test_previous_version_constants_are_coherent():
+    current = date.fromisoformat(LEGAL_DOCUMENT_VERSIONS["privacy"])
+    previous = date.fromisoformat(PREVIOUS_PRIVACY_VERSION)
+    assert previous < current
+    # The window opens at publish and is short: a cached old page cannot keep
+    # signing people up to the old text.
+    assert 7 <= (PREVIOUS_PRIVACY_ACCEPTED_UNTIL - current).days <= 14
+
+
+def test_current_pair_records_the_current_versions():
+    got = legal_versions_to_record(_TERMS, LEGAL_DOCUMENT_VERSIONS["privacy"], _BEFORE_CUTOFF)
+    assert got == LEGAL_DOCUMENT_VERSIONS
+    # A copy: a caller can never mutate the registry through the result.
+    assert got is not LEGAL_DOCUMENT_VERSIONS
+    much_later = PREVIOUS_PRIVACY_ACCEPTED_UNTIL + timedelta(days=365)
+    assert legal_versions_to_record(
+        _TERMS, LEGAL_DOCUMENT_VERSIONS["privacy"], much_later) == LEGAL_DOCUMENT_VERSIONS
+
+
+def test_previous_privacy_is_recorded_as_previous_until_the_cutoff():
+    expected = {"terms": _TERMS, "privacy": PREVIOUS_PRIVACY_VERSION}
+    assert legal_versions_to_record(_TERMS, PREVIOUS_PRIVACY_VERSION, _BEFORE_CUTOFF) == expected
+    # The cutoff is exclusive.
+    assert legal_versions_to_record(
+        _TERMS, PREVIOUS_PRIVACY_VERSION, PREVIOUS_PRIVACY_ACCEPTED_UNTIL) is None
+
+
+def test_other_pairs_record_nothing():
+    for terms, privacy in (
+        ("2020-01-01", PREVIOUS_PRIVACY_VERSION),            # stale terms
+        ("2020-01-01", LEGAL_DOCUMENT_VERSIONS["privacy"]),  # stale terms
+        (_TERMS, "2020-01-01"),                               # older than previous
+        (_TERMS, None),
+        (None, PREVIOUS_PRIVACY_VERSION),
+        (PREVIOUS_PRIVACY_VERSION, _TERMS),                   # swapped
+    ):
+        assert legal_versions_to_record(terms, privacy, _BEFORE_CUTOFF) is None, (terms, privacy)
+
+
+async def test_legacy_signup_with_the_previous_privacy_version_records_it(
+    client: AsyncClient, db, monkeypatch
+):
+    monkeypatch.setattr(settings, "EMAIL_VERIFICATION_ENABLED", False)
+    _cutoff_in(monkeypatch, 1)
+    email = _email()
+    r = await client.post("/auth/register", json=_legacy(email, **_PREVIOUS))
+    assert r.status_code == 201
+    rows = await _acceptances(db, await _user_id(db, email))
+    assert [(x.document, x.version, x.flow) for x in rows] == [
+        ("privacy", PREVIOUS_PRIVACY_VERSION, "register"),
+        ("terms", _TERMS, "register"),
+    ]
+    assert all(x.recent for x in rows)
+
+
+async def test_legacy_signup_with_the_previous_privacy_version_after_the_cutoff_records_nothing(
+    client: AsyncClient, db, monkeypatch
+):
+    monkeypatch.setattr(settings, "EMAIL_VERIFICATION_ENABLED", False)
+    _cutoff_in(monkeypatch, 0)
+    email = _email()
+    r = await client.post("/auth/register", json=_legacy(email, **_PREVIOUS))
+    assert r.status_code == 201
+    assert await _acceptances(db, await _user_id(db, email)) == []
+
+
+async def test_verified_flow_with_the_previous_privacy_version_records_it(
+    client: AsyncClient, db, monkeypatch
+):
+    monkeypatch.setattr(settings, "EMAIL_VERIFICATION_ENABLED", True)
+    _cutoff_in(monkeypatch, 1)
+    email = _email()
+    try:
+        await client.post("/auth/register", json={"email": email, **_PREVIOUS})
+        pending = (await db.execute(select(PendingRegistration).where(
+            PendingRegistration.email_hmac == blind_index(email)))).scalars().one()
+        token = _mint_verify_token(pending.id, pending.expires_at)
+        r = await client.post("/auth/verify-email", json={
+            "token": token, "new_password": _PASSWORD,
+            "first_name": "Verifier", "last_name": "Owner", **_PREVIOUS,
+        })
+        assert r.status_code == 200
+        rows = await _acceptances(db, await _user_id(db, email))
+        assert {(x.document, x.version, x.flow) for x in rows} == {
+            ("terms", _TERMS, "verify_email"),
+            ("privacy", PREVIOUS_PRIVACY_VERSION, "verify_email"),
+        }
     finally:
         await db.execute(delete(PendingRegistration).where(
             PendingRegistration.email_hmac == blind_index(email)))

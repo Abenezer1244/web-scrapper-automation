@@ -17,7 +17,7 @@ The route decorators + signatures stay in auth.py; this holds the moved bodies.
 
 import secrets
 import uuid
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 from fastapi import BackgroundTasks, HTTPException, Request, Response, status
 from fastapi.concurrency import run_in_threadpool
@@ -29,7 +29,12 @@ from src.api.auth import hash_password
 from src.api.middleware import audit_log, once_per, rate_limit, release_once
 from src.api.schemas import RegisterResponse, TokenResponse, UserRegister, VerifyEmailRequest
 from src.config import settings
-from src.config.constants import LEGAL_DOCUMENT_VERSIONS, TRIAL_PERIOD_DAYS
+from src.config.constants import (
+    LEGAL_DOCUMENT_VERSIONS,
+    PREVIOUS_PRIVACY_ACCEPTED_UNTIL,
+    PREVIOUS_PRIVACY_VERSION,
+    TRIAL_PERIOD_DAYS,
+)
 from src.db import PendingRegistration, User
 from src.db.models import LegalAcceptance
 from src.utils.crypto import blind_index
@@ -225,20 +230,22 @@ async def _record_legal_acceptance(
     """Record the Terms + Privacy acceptance for a just-created account, in the
     caller's transaction (so the account and its evidence commit together).
 
-    Written only when the client submitted exactly the CURRENT published versions;
-    the rows carry LEGAL_DOCUMENT_VERSIONS, never the client's strings, and the
-    database stamps accepted_at. A missing or stale pair records nothing: until
-    every client sends the fields (Phase 3d) that must not block a signup.
+    Written only for a pair legal_versions_to_record() accepts; the rows carry the
+    server's constants, never the client's strings, and the database stamps
+    accepted_at. A missing or stale pair records nothing: until every client sends
+    the fields (Phase 3d) that must not block a signup.
     """
     if terms_version is None and privacy_version is None:
         return
-    current = (LEGAL_DOCUMENT_VERSIONS["terms"], LEGAL_DOCUMENT_VERSIONS["privacy"])
-    if (terms_version, privacy_version) != current:
+    versions = legal_versions_to_record(terms_version, privacy_version, datetime.now(UTC).date())
+    if versions is None:
         _logger.warning(
             "legal acceptance not recorded: submitted versions are not current (flow=%s)",
             flow,
         )
         return
+    if versions != LEGAL_DOCUMENT_VERSIONS:
+        _logger.info("legal acceptance recorded for the previous privacy version (flow=%s)", flow)
     # legal_acceptances is RLS-isolated on app.current_user_id; there is no session
     # yet, so bind the new account for the rest of this transaction only.
     await db.execute(
@@ -246,9 +253,29 @@ async def _record_legal_acceptance(
     )
     db.add_all([
         LegalAcceptance(user_id=user_id, document=document, version=version, flow=flow)
-        for document, version in LEGAL_DOCUMENT_VERSIONS.items()
+        for document, version in versions.items()
     ])
     await db.flush()
+
+
+def legal_versions_to_record(
+    terms_version: str | None, privacy_version: str | None, today: date
+) -> dict[str, str] | None:
+    """The versions to record for a submitted pair, or None to record nothing.
+
+    The current pair records the current versions. Until PREVIOUS_PRIVACY_ACCEPTED_UNTIL
+    (exclusive, UTC), current terms with PREVIOUS_PRIVACY_VERSION records that previous
+    version: the text a page opened before the bump showed. Every returned value is a
+    server constant, so a row never holds a client-chosen string.
+    """
+    terms = LEGAL_DOCUMENT_VERSIONS["terms"]
+    if terms_version != terms:
+        return None
+    if privacy_version == LEGAL_DOCUMENT_VERSIONS["privacy"]:
+        return dict(LEGAL_DOCUMENT_VERSIONS)
+    if privacy_version == PREVIOUS_PRIVACY_VERSION and today < PREVIOUS_PRIVACY_ACCEPTED_UNTIL:
+        return {"terms": terms, "privacy": PREVIOUS_PRIVACY_VERSION}
+    return None
 
 
 async def register_user(

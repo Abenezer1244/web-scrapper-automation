@@ -22,6 +22,7 @@ registration stamps on trial_ends_at).
 """
 
 import resend
+from celery.exceptions import SoftTimeLimitExceeded, TimeLimitExceeded
 
 from src.config import frontend_routes, settings
 from src.config.constants import TRIAL_PERIOD_DAYS
@@ -47,11 +48,16 @@ resend.api_key = settings.RESEND_API_KEY
 
 # What a send function did. Only SENT means an email went out.
 SENT = "sent"
-FAILED = "failed"          # Resend refused or errored, or the opt-out check failed
+FAILED = "failed"          # the Resend call errored: it may still have been delivered
+NOT_SENT = "not_sent"      # the opt-out check failed, so nothing reached Resend
 SKIPPED = "skipped"        # no RESEND_API_KEY (dev / tests)
 HELD = "held"              # commercial, but no usable unsubscribe URL or postal address
 SUPPRESSED = "suppressed"  # commercial, and the address opted out
 NOT_NEEDED = "not_needed"  # the template decided there is nothing to send
+
+# A Celery time limit is not a send failure: it must stop the task, not be
+# reported as an outcome (the beat would then release the claim and go on).
+_CELERY_TIME_LIMITS = (SoftTimeLimitExceeded, TimeLimitExceeded)
 
 
 def _send(
@@ -71,6 +77,8 @@ def _send(
         ))
         _logger.info("Sent '%s' to %s", subject, fp)
         return SENT
+    except _CELERY_TIME_LIMITS:
+        raise
     except Exception as exc:
         _logger.error("Failed to send '%s' to %s: %s", subject, fp, type(exc).__name__)
         return FAILED
@@ -93,7 +101,7 @@ def _commercial_footer(email: str) -> dict | str:
     """Decide whether a commercial email may go to ``email`` right now.
 
     Returns the footer to render (the unsubscribe URL and postal address) when
-    it may be sent, otherwise the outcome to report (HELD, SUPPRESSED, FAILED,
+    it may be sent, otherwise the outcome to report (HELD, SUPPRESSED, NOT_SENT,
     SKIPPED). Checked immediately before each send, so an opt-out recorded after
     the beat selected its recipients still wins. Fails CLOSED: a missing setting
     holds the email, and an opt-out check that cannot run sends nothing.
@@ -126,9 +134,11 @@ def _commercial_footer(email: str) -> dict | str:
         if _is_suppressed(email):
             _logger.info("Commercial email to %s skipped: address opted out", fp)
             return SUPPRESSED
+    except _CELERY_TIME_LIMITS:
+        raise
     except Exception as exc:
         _logger.error("Opt-out check failed for %s, not sending: %s", fp, type(exc).__name__)
-        return FAILED
+        return NOT_SENT
     return {"unsubscribe_url": url, "postal_address": address}
 
 

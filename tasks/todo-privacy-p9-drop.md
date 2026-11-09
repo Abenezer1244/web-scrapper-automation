@@ -78,3 +78,64 @@ versioned digests maintained on writes; identifier->result match table; a dedica
 withheld state on results (honoured everywhere); exact matches withheld before sale; an audited
 DROP erasure for deterministic matches, operator review otherwise; statuses only after their
 barrier. Scope comparable to Phase 6 P3-P6 together.
+
+## Foundation built (2026-11-09, branch feat/privacy-drop) -- dormant
+Owner's choice after the consult: "Foundation now, rest later". No change to how any lead
+is read, sent, written, withheld or erased. Nothing runs unless `DROP_ENABLED=true` AND
+`DROP_API_KEY` is set (both default off/empty).
+- [x] `src/privacy/drop.py`: spec-exact Email/Phone standardization + `base64(sha256(utf8))`
+      (None when a value standardizes to nothing); bounded in-memory ZIP parser (size,
+      members, uncompressed bytes, rows, line length; refuses paths/traversal, nested
+      archives, non-DROP names, two files of one DataType, bad header/Id/Hash, one Id with
+      two hashes); header case-insensitive (`ID,Hash` / `Id,Hash`); Removed is
+      `ID,Hash,ListType`; NDZ/MAID/NameVIN/CTVID counted and ignored; status CSV writer
+      (`Id,Status`, codes 2-5, UTF-8, CRLF) and status file naming; `DropClient` for
+      download/upload/amend (X-API-KEY, Accept, 200 ZIP / 200 JSON / 202, 429 and 5xx and
+      timeouts -> `DropRetryLaterError`, other 4xx typed, redirects refused, proxies
+      ignored, size-capped, base URL restricted to DROP production/sandbox, loopback http
+      only in development/test environments). Never logs the key, an Id or a hash.
+- [x] Migration 139: `drop_downloads` (+ `list_files`, the per-list CSV names the status
+      file must reuse; a no-new-data pull is a row with NULL file_name, as cadence
+      evidence) and `drop_identifiers` (CHECKed Id/hash shape, `due_at` = download + 45 d,
+      unique (download, list, Id), index (list, hash)). RLS on, no table grant to any role;
+      definer functions (bridgeleads_system EXECUTE only): `drop_begin_download`,
+      `drop_add_identifiers` (<= 5000, idempotent), `drop_mark_removed` (list+Id+hash),
+      `drop_last_pull`, `drop_pending_hashes` (keyset, for the report). Re-grant block in
+      scripts/provision_rls_roles.sql. Downgrade refuses while ledger rows exist.
+- [x] `src/workers/privacy_drop.py::pull_drop_lists`, beat `pull-drop-lists` DAILY with a
+      7-day spacing (deviation from "weekly": a 202 or a failure is retried the next day,
+      not a week later; the pulls themselves stay weekly). Records in one transaction;
+      on any failure an ops alert (error class + HTTP status only) noting the possible
+      written-notice duty to CalPrivacy (counsel to confirm), then re-raises.
+- [x] `scripts/drop_match_report.py`: read-only sizing, counts only (pending, matched,
+      unmatched, leads hit per list); privacy-suppressed leads excluded.
+- [x] Tests: tests/test_privacy_drop.py, tests/test_privacy_drop_ledger.py,
+      tests/test_privacy_drop_worker.py (real test DB, loopback HTTP server).
+
+### Deliberately NOT built (needs the Codex design above, and counsel's D8)
+- Withholding DROP-matched rows (a dedicated DROP-withheld state honoured on every read,
+  send and writer path; screening before persistence and sale).
+- Erasure of DROP-matched records (an audited DROP-identifier erasure; operator review for
+  ambiguous matches).
+- Status decisions and reporting (upload/amend of `Id,Status` files after each barrier;
+  tracking of the 45-day due dates). NOTE: DROP answers 409 to a new download while the
+  previous batch's statuses are unreported, so once a ZIP has been pulled every later
+  pull fails with 409 and alerts until reporting exists. Do not enable before that.
+- Digest columns maintained on every contact writer (the report hashes in batches instead).
+- The failure-notice workflow itself (the alert is not the notice).
+
+### Spec ambiguities found (v1.2.0)
+- Download header: the schema says all list files use `ID,Hash`; uploads use `Id,Status`.
+  Parsed case-insensitively.
+- The upload example row `680,5` violates the spec's own 12-char Base62 WorkItemId; the
+  writer refuses it.
+- Upload CSV line endings are unspecified (CRLF used).
+- "Whitespace" (email) is undefined: Python `str.isspace()` (Unicode whitespace; NOT
+  zero-width U+200B/U+FEFF). Lowercasing is unspecified as ASCII or Unicode: full Unicode.
+- "Digits" (phone) is unspecified: ASCII 0-9 only.
+- Removed rows carry ID, Hash and ListType; whether Ids are unique across lists or
+  downloads is unstated: removal matches list + Id + hash.
+- 202 has no default Retry-After (60 s used); 429's example is 30 s (used when absent).
+- Whether a 200 "no new data" counts as the 45-day "download": recorded as a pull.
+- Upload 202 means queued for validation; row-level results come only by email/webhook
+  notification, with no API to fetch them.

@@ -67,6 +67,15 @@ _ZONES: dict[str, tuple[int, int]] = {
     # an image (CPU), so it fails CLOSED (_FALLBACK_ZONES). 20/hour covers a user
     # trying a few photos; nobody changes their photo every few seconds.
     "avatar": (20, 3600),
+    # POST /privacy/requests (Phase 6 P8): every valid submission sends an email to an
+    # address nobody has proven they own, so the form must not become a mail cannon.
+    # Per IP, per /24 (or /48), per address, per address domain, and one global daily
+    # budget; all fail CLOSED (_FALLBACK_ZONES). Confirm shares the per-IP bucket.
+    "privacy_ip": (10, 3600),
+    "privacy_net": (30, 3600),
+    "privacy_address": (3, 86400),
+    "privacy_domain": (100, 86400),
+    "privacy_budget": (500, 86400),
 }
 
 _redis_client: aioredis.Redis | None = None
@@ -200,7 +209,8 @@ def client_ip(request: Request) -> str:
 # open unlimited CSV rebuilds or scraper churn either; nor unlimited tab scans
 # (`lookup_quote`).
 _FALLBACK_ZONES = frozenset(
-    {"auth", "webhook", "stripe", "export", "writes", "lookup_quote", "avatar"}
+    {"auth", "webhook", "stripe", "export", "writes", "lookup_quote", "avatar",
+     "privacy_ip", "privacy_net", "privacy_address", "privacy_domain", "privacy_budget"}
 )
 # Insertion-ordered (dict preserves order), so the oldest keys are the cheapest
 # to find when we need to reclaim space.

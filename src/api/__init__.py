@@ -5,6 +5,7 @@ from .routes.billing import router as billing_router
 from .routes.email_prefs import router as email_prefs_router
 from .routes.jobs import router as jobs_router
 from .routes.notifications import router as notifications_router
+from .routes.privacy import router as privacy_router
 from .routes.scrapers import router as scrapers_router
 from .routes.segments import router as segments_router
 from .routes.webhooks import router as webhooks_router
@@ -20,4 +21,5 @@ __all__ = [
     "batches_router",
     "notifications_router",
     "email_prefs_router",
+    "privacy_router",
 ]

@@ -100,6 +100,9 @@ class Settings(BaseSettings):
     # version, so raising this alone enables nothing. Leave 0 until P7 ships; the
     # database (migration 125) refuses any active rule regardless until then.
     PRIVACY_ENFORCEMENT_VERSION: int = 0
+    # The public privacy-request form, POST /privacy/requests (Phase 6 P8). Off (404)
+    # until the page copy has counsel's review (D9) and the legal mailbox exists.
+    PRIVACY_INTAKE_ENABLED: bool = False
 
     # H3 PII encryption read mode. While False (tolerant), decrypt_field() treats
     # any value that is not a valid fe1:-prefixed Fernet token as legacy

@@ -162,7 +162,8 @@ def test_the_zip_holds_every_downloadable_lead_and_no_secret(made) -> None:
     zf = zipfile.ZipFile(io.BytesIO(store.objects[_key(a)]))
     lead_file = f"leads/{a['job']}.csv"
     assert set(zf.namelist()) == {"README.txt", "profile.json", "scrapers.json",
-                                  "batches.json", "runs.json", lead_file}
+                                  "batches.json", "runs.json", "legal_acceptances.json",
+                                  lead_file}
     everything = b"".join(zf.read(n) for n in zf.namelist()).decode()
     for secret in _SECRETS:
         assert secret not in everything

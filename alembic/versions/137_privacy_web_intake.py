@@ -34,6 +34,8 @@ pinned, nothing personal returned):
                             token it minted for that email.
   privacy_outbox_failed()   bridgeleads_system: backoff, bounded attempts.
   privacy_tokens_purge()    bridgeleads_system: deletes long-expired tokens.
+  privacy_requests_due()    bridgeleads_system: open (undecided) requests due within a
+                            window, ids, kinds and deadlines only, for the deadline alert.
 
 No role gains a table privilege. Downgrade refuses while any web-form request exists (one with deadline_rules or an
 outbox row).
@@ -61,6 +63,7 @@ _WORKER_FUNCTIONS = (
     "privacy_outbox_sent(uuid, text, timestamptz)",
     "privacy_outbox_failed(uuid, text)",
     "privacy_tokens_purge()",
+    "privacy_requests_due(interval)",
 )
 _TABLES = ("privacy_request_tokens", "privacy_email_outbox")
 
@@ -194,6 +197,22 @@ LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $fn$
                                            interval '6 hours'),
            gave_up_at = CASE WHEN o.attempts + 1 >= 10 THEN now() END
      WHERE o.id = p_outbox AND o.sent_at IS NULL
+$fn$;
+
+CREATE FUNCTION public.privacy_requests_due(p_within interval)
+RETURNS TABLE (request_id uuid, kind text, deadline_at timestamptz)
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $fn$
+    SELECT r.id, r.kind::text, coalesce(
+               (SELECT max(e.deadline_at) FROM public.privacy_request_events e
+                 WHERE e.request_id = r.id AND e.event_type = 'extended'), r.deadline_at)
+      FROM public.privacy_requests r
+     WHERE NOT EXISTS (SELECT 1 FROM public.privacy_request_events e
+                        WHERE e.request_id = r.id
+                          AND e.event_type IN ('decided', 'closed', 'withdrawn'))
+       AND coalesce((SELECT max(e.deadline_at) FROM public.privacy_request_events e
+                      WHERE e.request_id = r.id AND e.event_type = 'extended'),
+                    r.deadline_at) <= now() + least(p_within, interval '60 days')
+     ORDER BY 3, 1
 $fn$;
 
 CREATE FUNCTION public.privacy_tokens_purge() RETURNS integer

@@ -585,6 +585,7 @@ BEGIN
             GRANT EXECUTE ON FUNCTION public.privacy_outbox_failed(uuid, text)
                 TO bridgeleads_system;
             GRANT EXECUTE ON FUNCTION public.privacy_tokens_purge() TO bridgeleads_system;
+            GRANT EXECUTE ON FUNCTION public.privacy_requests_due(interval) TO bridgeleads_system;
         END IF;
     END IF;
     -- Job degradations (117): worker-only history of phases that failed on a DONE

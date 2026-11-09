@@ -70,6 +70,8 @@ app = Celery(
         "src.workers.privacy_enforcer",
         # Privacy erasure driver (Phase 6 P6): a BEAT task, same trap as above.
         "src.workers.privacy_erasure",
+        # Phase 6 P8: the web-form email outbox and the daily deadline alert (beat).
+        "src.workers.privacy_requests",
     ],
 )
 

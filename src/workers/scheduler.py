@@ -363,6 +363,17 @@ app.conf.beat_schedule = {
         "task": "src.workers.privacy_erasure.drive_privacy_erasures",
         "schedule": crontab(minute="6-59/10"),  # every 10 minutes from :06
     },
+    "send-privacy-outbox": {
+        # Phase 6 P8: the web form's confirmation and receipt emails (migration 137's
+        # outbox). One query on an empty outbox until the form is enabled.
+        "task": "src.workers.privacy_requests.send_privacy_outbox",
+        "schedule": crontab(minute="*"),
+    },
+    "privacy-request-deadlines": {
+        # Phase 6 P8: ops alert for privacy requests due within 7 days; token purge.
+        "task": "src.workers.privacy_requests.privacy_request_deadlines",
+        "schedule": crontab(minute=17, hour=15),  # 07:17 / 08:17 Pacific
+    },
     "recover-deferred-owners": {
         # The reading half of `owner_lookup_deferred`: names delivered King tax
         # leads whose owner lookup a job could not finish. Bounded (25 parcels,

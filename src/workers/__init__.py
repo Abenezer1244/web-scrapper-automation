@@ -72,6 +72,8 @@ app = Celery(
         "src.workers.privacy_erasure",
         # Phase 6 P8: the web-form email outbox and the daily deadline alert (beat).
         "src.workers.privacy_requests",
+        # P9 foundation: the California DROP list pull (beat; dormant unless enabled).
+        "src.workers.privacy_drop",
     ],
 )
 

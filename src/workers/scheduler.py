@@ -374,6 +374,14 @@ app.conf.beat_schedule = {
         "task": "src.workers.privacy_requests.privacy_request_deadlines",
         "schedule": crontab(minute=17, hour=15),  # 07:17 / 08:17 Pacific
     },
+    "pull-drop-lists": {
+        # P9 foundation: the California DROP deletion lists. A no-op unless DROP_ENABLED
+        # and DROP_API_KEY are set; then it pulls when the last pull is 7+ days old, so
+        # a daily tick retries a 202 (preparing) or a failure the next day instead of
+        # a week later. Records only. See src/workers/privacy_drop.py.
+        "task": "src.workers.privacy_drop.pull_drop_lists",
+        "schedule": crontab(minute=29, hour=16),  # 08:29 / 09:29 Pacific
+    },
     "recover-deferred-owners": {
         # The reading half of `owner_lookup_deferred`: names delivered King tax
         # leads whose owner lookup a job could not finish. Bounded (25 parcels,

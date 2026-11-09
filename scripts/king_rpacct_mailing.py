@@ -46,11 +46,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from sqlalchemy import text  # noqa: E402
 
+from src.api.lead_actionability import not_privacy_suppressed_sql  # noqa: E402
+
 REPAIR_REASON = "situs_echo"
 TRUNCATED_REASON = "truncated_taxbill"
 
 
-_CANDIDATES_SQL = """
+_CANDIDATES_SQL = f"""
     SELECT r.id, r.user_id, btrim(r.parcel_id) AS pid, r.parcel_id AS raw_pid,
            r.property_address, r.property_city, r.property_state, r.property_zip,
            r.mailing_address,
@@ -64,15 +66,16 @@ _CANDIDATES_SQL = """
       AND upper(sc.state) = 'WA'
       AND j.status = 'done'
       AND r.parcel_id IS NOT NULL
-      AND btrim(r.parcel_id) ~ '^[0-9]{10}$'
+      AND btrim(r.parcel_id) ~ '^[0-9]{{10}}$'
+      AND {not_privacy_suppressed_sql("r")}
       AND (r.mailing_address IS NOT NULL
            OR coalesce(r.enrichment_data::jsonb->>'mailing_lookup_deferred', '') = 'true')
     ORDER BY r.id
-"""
+"""  # noqa: S608 — module constants, not input
 
 # enrichment_data merges into the existing value only when it is a JSON object: rows
 # written with None store JSON null, and 'null'::jsonb || '{...}' builds an array.
-_UPDATE_SQL = """
+_UPDATE_SQL = f"""
     UPDATE results SET
       mailing_address = :new_mail,
       property_state = CAST(:f_property_state AS varchar),
@@ -80,12 +83,13 @@ _UPDATE_SQL = """
       absentee_owner = CAST(:f_absentee AS boolean),
       out_of_state_owner = CAST(:f_out_of_state AS boolean),
       enrichment_data = ((CASE WHEN jsonb_typeof(enrichment_data::jsonb) = 'object'
-                               THEN enrichment_data::jsonb ELSE '{}'::jsonb END)
+                               THEN enrichment_data::jsonb ELSE '{{}}'::jsonb END)
                          || CAST(:payload AS jsonb))::json
     WHERE id = :rid
       AND user_id = :uid
       AND parcel_id = :raw_pid
       AND mailing_address IS NOT DISTINCT FROM :old_mail
+      AND {not_privacy_suppressed_sql("results")}
       -- Fail closed on metadata this merge could destroy: an array or scalar (rows an old
       -- null-merge bug already damaged) is skipped, never replaced (Codex P1).
       AND (enrichment_data IS NULL OR jsonb_typeof(enrichment_data::jsonb) IN ('object', 'null'))
@@ -101,7 +105,7 @@ _UPDATE_SQL = """
                AND btrim(coalesce(enrichment_data::jsonb->>'mailing_recovery_outcome', ''))
                    IN ('', 'error', 'identity_unverified')))
       AND EXISTS (SELECT 1 FROM jobs j WHERE j.id = results.job_id AND j.status = 'done')
-"""
+"""  # noqa: S608 — module constants, not input
 
 _ECHO_TAIL_RE = re.compile(r",\s*[A-Z][A-Z .'\-]*,\s*WA\s+\d{5}(?:-\d{4})?\s*$", re.I)
 

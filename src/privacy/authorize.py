@@ -26,7 +26,11 @@ DECIDING (``authorize``), per row:
                                                      property: never silently allowed)
   otherwise                                       -> ALLOWED (a shared parcel or phone
                                                      alone never suppresses other people)
-Callers treat REVIEW exactly like WITHHELD until an operator decides (P7).
+Callers treat REVIEW exactly like WITHHELD until an operator decides (P7). An operator
+may RELEASE a REVIEW match for one result (migration 136, privacy_review_releases): that
+rule then no longer puts that result under review. A release never touches WITHHELD (an
+exact anchor + subject match is the subject) and never applies to a row with no id (a
+record not stored yet, or a shared-store lookup).
 
 ANCHORS: the property PARCEL (keys.property_anchor_value), every phone and every email
 on the row. Street addresses are never an automatic anchor (keys.py says why).
@@ -44,7 +48,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from sqlalchemy import text
@@ -89,6 +93,7 @@ _LOAD_SQL = text(
     "key_version, normalization_version, state, created_at "
     "FROM public.privacy_rule_rows()"
 )
+_RELEASES_SQL = text("SELECT rule_id, result_id FROM public.privacy_review_release_rows()")
 
 
 class RuleSnapshotError(RuntimeError):
@@ -120,6 +125,8 @@ class RuleSnapshot:
     by_anchor: dict[tuple[str, str, str], tuple[_Rule, ...]]   # (kind, version, hmac)
     by_subject: dict[tuple[str, str, str], tuple[_Rule, ...]]  # (kind, version, hmac)
     key_versions: tuple[str, ...]
+    # Operator releases of REVIEW matches: result id -> the rule ids released for it.
+    released: Mapping[str, frozenset[str]] = field(default_factory=dict)
     # The number of 'active' rule rows ever written, read in the same statement as the
     # rules. Rule rows are append-only, so it only grows, and only an activation grows
     # it: results.privacy_checked_gen below it means "not checked against these rules".
@@ -142,8 +149,9 @@ def _get(row: Any, name: str):
     return row.get(name) if isinstance(row, Mapping) else getattr(row, name, None)
 
 
-def build_snapshot(rows) -> RuleSnapshot:
-    """Validate every rule history and index the ACTIVE ones (pure; the loader's core)."""
+def build_snapshot(rows, releases=()) -> RuleSnapshot:
+    """Validate every rule history and index the ACTIVE ones (pure; the loader's core).
+    ``releases`` are (rule_id, result_id) pairs from privacy_review_release_rows()."""
     groups: dict[tuple[str, str, str], list] = defaultdict(list)
     for r in rows:
         state = _get(r, "state")
@@ -188,6 +196,7 @@ def build_snapshot(rows) -> RuleSnapshot:
         by_anchor={k: tuple(v) for k, v in by_anchor.items()},
         by_subject={k: tuple(v) for k, v in by_subject.items()},
         key_versions=tuple(sorted(versions)),
+        released=_index_releases(releases),
         generation=sum(1 for history in groups.values() for h in history
                        if _get(h, "state") == "active"),
     )
@@ -201,10 +210,28 @@ def load_rule_rows(db) -> list:
         raise RuleSnapshotError(f"rules could not be loaded: {type(exc).__name__}") from exc
 
 
+def _index_releases(releases) -> dict[str, frozenset[str]]:
+    by_result: dict[str, set[str]] = defaultdict(set)
+    for r in releases:
+        by_result[str(_get(r, "result_id"))].add(str(_get(r, "rule_id")))
+    return {k: frozenset(v) for k, v in by_result.items()}
+
+
+def load_review_releases(db) -> list:
+    """Every operator release (migration 136's reader); fail closed like the rules."""
+    try:
+        return list(db.execute(_RELEASES_SQL).mappings().all())
+    except Exception as exc:  # noqa: BLE001 -- re-raised as the fail-closed type
+        raise RuleSnapshotError(f"releases could not be loaded: {type(exc).__name__}") from exc
+
+
 def load_rule_snapshot(db) -> RuleSnapshot:
-    """Every rule row in one statement (sync Session or Connection). Raises
-    ``RuleSnapshotError`` for any history or version it cannot evaluate."""
-    return build_snapshot(load_rule_rows(db))
+    """Every rule row in one statement (sync Session or Connection), then the releases.
+    Raises ``RuleSnapshotError`` for any history or version it cannot evaluate. A
+    release committed between the two reads only allows a row one load early; a release
+    is never withdrawn, so the second read can never hide one the rules depend on."""
+    rows = load_rule_rows(db)
+    return build_snapshot(rows, load_review_releases(db) if rows else ())
 
 
 def _anchor_values(row: Any, county: str | None, state: str | None) -> set[tuple[str, str]]:
@@ -270,6 +297,9 @@ def authorize(snapshot: RuleSnapshot, row: Any, *, record_type: str | None,
     anchors = _anchor_values(row, county, state)
     unresolved = any(s.kind == KIND_UNRESOLVED for s in subjects)
     keyed_subjects = [kv for s in subjects for kv in subject_key_values(s)]
+    row_id = _get(row, "id")
+    released = (snapshot.released.get(str(row_id), frozenset()) if row_id is not None
+                else frozenset())
 
     on_row: set[tuple[str, str, str]] = set()
     matched_rules: list[_Rule] = []
@@ -284,10 +314,11 @@ def authorize(snapshot: RuleSnapshot, row: Any, *, record_type: str | None,
                    if (r.subject_kind, r.key_version, r.subject_hmac) in on_row})
     if hits:
         return Decision(WITHHELD, tuple(hits))
-    if matched_rules and unresolved:
-        return Decision(REVIEW, tuple(sorted({r.suppression_id for r in matched_rules})),
-                        REVIEW_UNRESOLVED_SUBJECT)
-    named = sorted({r.suppression_id for key in on_row for r in snapshot.by_subject.get(key, ())})
+    review = sorted({r.suppression_id for r in matched_rules if r.rule_id not in released})
+    if review and unresolved:
+        return Decision(REVIEW, tuple(review), REVIEW_UNRESOLVED_SUBJECT)
+    named = sorted({r.suppression_id for key in on_row for r in snapshot.by_subject.get(key, ())
+                    if r.rule_id not in released})
     if named:
         return Decision(REVIEW, tuple(named), REVIEW_SUBJECT_WITHOUT_ANCHOR)
     return Decision(ALLOWED)

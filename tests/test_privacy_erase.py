@@ -32,8 +32,9 @@ _PARCEL = "1234567890"
 _INSERT_RULE = text(
     "INSERT INTO privacy_suppressions (id, rule_id, request_id, anchor_kind, anchor_hmac, "
     "subject_kind, subject_hmac, scope, key_version, normalization_version, state, "
-    "created_at) VALUES (:id, :rule_id, :req, :anchor_kind, :anchor_hmac, :subject_kind, "
-    ":subject_hmac, :scope, :key_version, :normalization_version, :state, :created_at)")
+    "created_at, actor_user_id) VALUES (:id, :rule_id, :req, :anchor_kind, :anchor_hmac, "
+    ":subject_kind, :subject_hmac, :scope, :key_version, :normalization_version, :state, "
+    ":created_at, gen_random_uuid())")
 
 
 def _request(s, kind: str) -> str:
@@ -55,8 +56,6 @@ def _active_rule(s, kind: str, **history) -> tuple[str, str]:
 @pytest.fixture
 def s():
     with system_sync_session() as session:
-        session.execute(text("ALTER TABLE privacy_suppressions "
-                             "DROP CONSTRAINT ck_privacy_suppressions_activation_guard"))
         try:
             yield session
         finally:

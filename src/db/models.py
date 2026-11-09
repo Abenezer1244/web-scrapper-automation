@@ -453,8 +453,8 @@ class PrivacyRequestEvent(Base):
 class PrivacySuppression(Base):
     """One row of a suppression rule: an anchor HMAC plus a required subject HMAC
     (src/privacy/keys.py) under one key and normalisation version. State changes
-    are new rows with the same rule_id. The database allows 'pending' only until
-    every enforcement layer ships (ck_privacy_suppressions_activation_guard)."""
+    are new rows with the same rule_id: pending -> active -> lifted. Written only
+    through migration 136's operator functions (scripts/privacy_admin.py)."""
     __tablename__ = "privacy_suppressions"
 
     id = Column(UUID(as_uuid=False), primary_key=True, server_default=text("gen_random_uuid()"))
@@ -468,7 +468,8 @@ class PrivacySuppression(Base):
     scope = Column(String(24), nullable=False)          # 'subject' only for now
     key_version = Column(String(8), nullable=False)
     normalization_version = Column(String(8), nullable=False)
-    state = Column(String(16), nullable=False)          # 'pending' only for now
+    state = Column(String(16), nullable=False)          # pending | active | lifted
+    actor_user_id = Column(UUID(as_uuid=False), nullable=True)  # the operator (136)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     __table_args__ = (

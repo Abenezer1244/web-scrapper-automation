@@ -30,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from sqlalchemy import text  # noqa: E402
 
+from src.api.lead_actionability import not_privacy_suppressed_sql  # noqa: E402
 from src.db.session import system_sync_session  # noqa: E402
 from src.scrapers.enrichment.county_gis import (  # noqa: E402
     _batch_query_county,
@@ -40,22 +41,23 @@ from src.utils.address_intel import compute_owner_flags  # noqa: E402
 from src.utils.lead_formatting import parse_property_for_display  # noqa: E402
 
 _CANDIDATES = text(
-    """
+    f"""
     SELECT r.id, r.parcel_id, r.property_address, r.mailing_address,
            r.property_city, r.property_state, r.property_zip,
            sc.county, sc.state, n.property_address AS notice_situs
     FROM results r
     JOIN jobs j ON j.id = r.job_id
     JOIN scraper_configs sc ON sc.id = j.scraper_config_id
-    LEFT JOIN nts_notices n ON n.id = r.nts_notice_id
+    LEFT JOIN nts_notices n ON n.id = r.nts_notice_id AND n.privacy_suppression_id IS NULL
     WHERE r.is_duplicate = false AND sc.state = 'WA'
+      AND {not_privacy_suppressed_sql("r")}
       AND r.property_address IS NOT NULL
       AND (r.property_city IS NULL OR r.property_zip IS NULL)
     ORDER BY sc.county, r.created_at, r.id
-    """
+    """  # noqa: S608 — module constants, not input
 )
 _UPDATE = text(
-    """
+    f"""
     UPDATE results
     SET property_city = COALESCE(property_city, :city),
         property_state = COALESCE(property_state, :state),
@@ -63,7 +65,8 @@ _UPDATE = text(
         owner_state = :owner_state, absentee_owner = :absentee_owner,
         out_of_state_owner = :out_of_state_owner
     WHERE id = :id AND (property_city IS NULL OR property_zip IS NULL)
-    """
+      AND {not_privacy_suppressed_sql("results")}
+    """  # noqa: S608 — module constants, not input
 )
 
 

@@ -47,6 +47,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from sqlalchemy import text  # noqa: E402
 
+from src.api.lead_actionability import not_privacy_suppressed_sql  # noqa: E402
 from src.workers.tasks_helpers.enrich import KING_ACCOUNT_RESOLVER  # noqa: E402
 
 REASON_CONDO = "king_condo_unit"
@@ -55,7 +56,7 @@ REASON_GIS = "king_gis_retry"
 _PIN_RE = re.compile(r"\d{10}")
 _ACCOUNT_RE = re.compile(r"\d{12}")
 
-_CANDIDATES_SQL = """
+_CANDIDATES_SQL = f"""
     SELECT r.id, r.user_id, r.job_id, r.parcel_id AS raw_pid, btrim(r.parcel_id) AS pid,
            r.mailing_address, r.property_city, r.property_state, r.property_zip,
            r.enrichment_data::jsonb->>'source' AS row_source,
@@ -69,15 +70,16 @@ _CANDIDATES_SQL = """
       AND j.status = 'done'
       AND (CAST(:job_id AS text) IS NULL OR j.id = CAST(:job_id AS uuid))
       AND r.is_duplicate = false
+      AND {not_privacy_suppressed_sql("r")}
       AND r.enrichment_data::jsonb->>'delivery_excluded_reason' IS NULL
       AND coalesce(btrim(r.property_address), '') IN ('', '(enrichment unavailable)')
-      AND btrim(coalesce(r.parcel_id, '')) ~ '^[0-9]{10}$|^[0-9]{12}$'
+      AND btrim(coalesce(r.parcel_id, '')) ~ '^[0-9]{{10}}$|^[0-9]{{12}}$'
     ORDER BY r.id
-"""
+"""  # noqa: S608 — module constants, not input
 
 # Fully static: every value is a bound parameter. enrichment_data merges only into a JSON
 # object (JSON null counts as empty); an array or scalar is skipped, never replaced.
-_UPDATE_SQL = """
+_UPDATE_SQL = f"""
     UPDATE results SET
       property_address = :address,
       property_city = COALESCE(property_city, CAST(:city AS varchar)),
@@ -87,13 +89,14 @@ _UPDATE_SQL = """
       absentee_owner = CAST(:f_absentee AS boolean),
       out_of_state_owner = CAST(:f_out_of_state AS boolean),
       enrichment_data = ((CASE WHEN jsonb_typeof(enrichment_data::jsonb) = 'object'
-                               THEN enrichment_data::jsonb ELSE '{}'::jsonb END)
+                               THEN enrichment_data::jsonb ELSE '{{}}'::jsonb END)
                          || CAST(:patch AS jsonb))::json
     WHERE id = :rid AND user_id = :uid AND parcel_id = :raw_pid
       AND coalesce(btrim(property_address), '') IN ('', '(enrichment unavailable)')
       AND mailing_address IS NOT DISTINCT FROM :old_mail
       AND (enrichment_data IS NULL OR jsonb_typeof(enrichment_data::jsonb) IN ('object', 'null'))
       AND is_duplicate = false
+      AND {not_privacy_suppressed_sql("results")}
       AND enrichment_data::jsonb->>'delivery_excluded_reason' IS NULL
       AND (CAST(:resolved_pin AS text) IS NULL
            OR coalesce(enrichment_data::jsonb->>'resolved_parcel_id', '') IN ('', :resolved_pin))
@@ -104,7 +107,7 @@ _UPDATE_SQL = """
           = (CASE WHEN CAST(:resolved_pin AS text) IS NOT NULL THEN btrim(parcel_id)
                   ELSE CAST(:lookup_pin AS text) END)
       AND EXISTS (SELECT 1 FROM jobs j WHERE j.id = results.job_id AND j.status = 'done')
-"""
+"""  # noqa: S608 — module constants, not input
 
 
 @dataclass(frozen=True)

@@ -60,6 +60,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from sqlalchemy import text  # noqa: E402
 
+from src.api.lead_actionability import not_privacy_suppressed_sql  # noqa: E402
 from src.utils.located_parcel import shown_tier_sql  # noqa: E402
 
 _SOURCE = "seattle_sdci_code_violations"
@@ -69,7 +70,8 @@ _LABEL_MAX = 120  # the old scraper's cap, needed to rebuild its label byte for 
 _RECORDNUM_RE = re.compile(r"^[0-9A-Za-z-]{1,32}$")
 UNCONFIRMED = "unconfirmed"
 
-# S608: the only interpolation is shown_tier_sql(), built from located_parcel.py constants.
+# S608: the only interpolations are shown_tier_sql() and not_privacy_suppressed_sql(),
+# both built from code constants. A privacy-withheld row is never read, printed or written.
 _CANDIDATES_SQL = """
     SELECT r.id, r.user_id, r.party_name, r.property_address, r.legal_description,
            r.enrichment_data::jsonb AS ed
@@ -79,6 +81,7 @@ _CANDIDATES_SQL = """
     WHERE lower(sc.county) = 'king' AND upper(sc.state) = 'WA'
       AND sc.record_type = 'code_violation'
       AND j.status = 'done'
+      AND {not_withheld}
       AND jsonb_typeof(r.enrichment_data::jsonb) = 'object'
       AND r.enrichment_data::jsonb->>'source' = :source
       AND (NOT (r.enrichment_data::jsonb ? 'cv_semantics_repaired_at')
@@ -86,9 +89,10 @@ _CANDIDATES_SQL = """
                AND {shown_tiers}
                AND NOT (r.enrichment_data::jsonb ? 'owner_source')))
     ORDER BY r.id
-""".format(shown_tiers=shown_tier_sql("r.enrichment_data::jsonb"))  # noqa: S608
+""".format(shown_tiers=shown_tier_sql("r.enrichment_data::jsonb"),  # noqa: S608
+           not_withheld=not_privacy_suppressed_sql("r"))
 
-_UPDATE_SQL = """
+_UPDATE_SQL = f"""
     UPDATE results SET
       party_name = CAST(:new_party AS varchar),
       enrichment_data = (enrichment_data::jsonb || CAST(:payload AS jsonb))::json
@@ -101,11 +105,12 @@ _UPDATE_SQL = """
       AND enrichment_data::jsonb->>'kc_pin_match' IS NOT DISTINCT FROM CAST(:old_pin_match AS text)
       AND enrichment_data::jsonb->>'kc_pin_source' IS NOT DISTINCT FROM CAST(:old_pin_source AS text)
       AND NOT (enrichment_data::jsonb ? 'owner_source')
+      AND {not_privacy_suppressed_sql("results")}
       AND EXISTS (SELECT 1 FROM jobs j WHERE j.id = results.job_id AND j.status = 'done')
-"""
+"""  # noqa: S608 — the only interpolation is a code-constant predicate
 
 
-_AP_CANDIDATES_SQL = """
+_AP_CANDIDATES_SQL = f"""
     SELECT r.id, r.user_id, r.property_address, r.property_city, r.property_state,
            r.property_zip, r.mailing_address, r.enrichment_data::jsonb AS ed,
            r.owner_state, r.absentee_owner, r.out_of_state_owner,
@@ -118,15 +123,16 @@ _AP_CANDIDATES_SQL = """
       AND sc.record_type = 'code_violation'
       AND j.status = 'done'
       AND r.parcel_id IS NULL
+      AND {not_privacy_suppressed_sql("r")}
       AND jsonb_typeof(r.enrichment_data::jsonb) = 'object'
       AND r.enrichment_data::jsonb->>'source' = :source
       AND r.enrichment_data::jsonb->>'kc_pin_status' = ANY(:statuses)
       AND NOT (r.enrichment_data::jsonb ? 'kc_address_point_evidence')
       AND NOT (r.enrichment_data::jsonb ? 'owner_source')
     ORDER BY r.id
-"""
+"""  # noqa: S608 — the only interpolation is a code-constant predicate
 
-_AP_UPDATE_SQL = """
+_AP_UPDATE_SQL = f"""
     UPDATE results SET
       mailing_address = CASE WHEN CAST(:new_mail AS text) IS NOT NULL
                              THEN CAST(:new_mail AS text) ELSE mailing_address END,
@@ -166,8 +172,9 @@ _AP_UPDATE_SQL = """
       AND enrichment_data::jsonb->>'kc_parcel_address' IS NOT DISTINCT FROM CAST(:old_parcel_address AS text)
       AND NOT (enrichment_data::jsonb ? 'kc_address_point_evidence')
       AND NOT (enrichment_data::jsonb ? 'owner_source')
+      AND {not_privacy_suppressed_sql("results")}
       AND EXISTS (SELECT 1 FROM jobs j WHERE j.id = results.job_id AND j.status = 'done')
-"""
+"""  # noqa: S608 — the only interpolation is a code-constant predicate
 
 
 def run_address_points(db, *, apply_writes: bool, limit: int | None = None,

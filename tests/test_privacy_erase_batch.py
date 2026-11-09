@@ -55,8 +55,8 @@ def _rule(conn, kind: str, states: tuple[str, ...]) -> str:
         row = conn.execute(text(
             "INSERT INTO privacy_suppressions (rule_id, request_id, anchor_kind, "
             "anchor_hmac, subject_kind, subject_hmac, scope, key_version, "
-            "normalization_version, state) VALUES (:r, :q, 'property', :h, 'person', :h, "
-            "'subject', 'v1', 'n3', :s) RETURNING id"),
+            "normalization_version, state, actor_user_id) VALUES (:r, :q, 'property', :h, "
+            "'person', :h, 'subject', 'v1', 'n3', :s, gen_random_uuid()) RETURNING id"),
             {"r": rule_id, "q": req, "h": "c" * 64, "s": state}).scalar()
     return str(row)
 
@@ -104,8 +104,6 @@ def _params(rule: str, **over) -> dict:
 def conn():
     with sync_engine.connect() as c:
         tx = c.begin()
-        c.execute(text("ALTER TABLE privacy_suppressions "
-                       "DROP CONSTRAINT ck_privacy_suppressions_activation_guard"))
         try:
             yield c
         finally:
@@ -221,8 +219,9 @@ def test_refuses_a_lifted_rule(conn):
                                 "WHERE id = :i"), {"i": active}).one()
     _ins(conn, "INSERT INTO privacy_suppressions (rule_id, request_id, anchor_kind, "
                "anchor_hmac, subject_kind, subject_hmac, scope, key_version, "
-               "normalization_version, state) VALUES (:r, :q, 'property', :h, 'person', :h, "
-               "'subject', 'v1', 'n3', 'lifted')", r=rule_id[0], q=rule_id[1], h="c" * 64)
+               "normalization_version, state, actor_user_id) VALUES (:r, :q, 'property', :h, "
+               "'person', :h, 'subject', 'v1', 'n3', 'lifted', gen_random_uuid())",
+         r=rule_id[0], q=rule_id[1], h="c" * 64)
     assert _sqlstate(conn, _params(active)) == "BLD41"
 
 

@@ -46,6 +46,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session
 
+from src.api.lead_actionability import not_privacy_suppressed_sql
 from src.db.session import system_sync_session
 
 
@@ -84,6 +85,23 @@ _CASCADE = [
     ("dialer_deliveries", "job_id", "jobs"),
 ]
 _SOFT = [("notifications", "job_id", "jobs")]   # no FK — deleted explicitly
+
+# Phase 6 privacy: the backup is a file on an operator's disk, so it never carries a
+# subject a privacy rule withholds. These tables hold subject data per lead; a row of a
+# withheld lead is left OUT of the dump and only COUNTED (`_meta.privacy_withheld`).
+# The purge itself is unchanged: it still deletes every target row, withheld or not —
+# these are test rows, and skipping one would strand it behind a deleted config.
+# Predicates are code literals over the table's own name, never input.
+def _lead_not_withheld(ref: str) -> str:
+    """The result ``ref`` points at, if any, is not withheld. ``ref`` is a code literal."""
+    return (f"NOT EXISTS (SELECT 1 FROM results wr WHERE wr.id = {ref} "  # noqa: S608
+            f"AND NOT ({not_privacy_suppressed_sql('wr')}))")
+
+
+_KEEP_IN_BACKUP = {
+    "results": not_privacy_suppressed_sql("results"),
+    "pending_skip_trace_rows": _lead_not_withheld("pending_skip_trace_rows.result_id"),
+}
 
 
 def _ids(db) -> list[str]:
@@ -135,8 +153,9 @@ def _safety_checks(db, cfg_ids: list[str], job_ids: list[str]) -> None:
             raise SystemExit(f"ABORT: {pending} batch run(s) referencing these jobs are in flight.")
 
 
-def _dump(db, cfg_ids, job_ids, path: str) -> dict:
-    """Raw-SQL dump of every row about to die. Ciphertext stays ciphertext."""
+def _dump(db, cfg_ids, job_ids, path: str) -> tuple[dict, dict]:
+    """Raw-SQL dump of every row about to die, except a privacy-withheld lead's (counted
+    in the returned ``withheld`` instead). Ciphertext stays ciphertext."""
     sets = {"configs": cfg_ids, "jobs": job_ids}
     payload: dict = {
         "_meta": {
@@ -151,16 +170,25 @@ def _dump(db, cfg_ids, job_ids, path: str) -> dict:
         }
     }
     counts: dict = {}
+    withheld: dict = {}
     payload["scraper_configs"] = _rows(db, "scraper_configs", "id", cfg_ids)
     counts["scraper_configs"] = len(payload["scraper_configs"])
     for table, col, which in _CASCADE + _SOFT:
         payload[table] = _rows(db, table, col, sets[which])
         counts[table] = len(payload[table])
+        if table in _KEEP_IN_BACKUP and sets[which]:
+            withheld[table] = _scalar(
+                db,
+                f"SELECT count(*) FROM {table} WHERE {col} = ANY(CAST(:v AS uuid[])) "  # noqa: S608
+                f"AND NOT ({_KEEP_IN_BACKUP[table]})",
+                {"v": sets[which]},
+            )
     # SET NULL / dangling refs — captured so the damage is reconstructable.
     payload["delivered_records_affected"] = _rows_sql(
         db,
-        "SELECT * FROM delivered_records WHERE first_job_id = ANY(CAST(:v AS uuid[])) "
-        "OR first_result_id IN (SELECT id FROM results WHERE job_id = ANY(CAST(:v AS uuid[])))",
+        "SELECT * FROM delivered_records WHERE (first_job_id = ANY(CAST(:v AS uuid[])) "  # noqa: S608
+        "OR first_result_id IN (SELECT id FROM results WHERE job_id = ANY(CAST(:v AS uuid[])))) "
+        f"AND {_lead_not_withheld('delivered_records.first_result_id')}",
         {"v": job_ids},
     )
     counts["delivered_records_affected"] = len(payload["delivered_records_affected"])
@@ -173,19 +201,21 @@ def _dump(db, cfg_ids, job_ids, path: str) -> dict:
     )
     counts["batch_runs_referencing"] = len(payload["batch_runs_referencing"])
     payload["_meta"]["counts"] = counts
+    payload["_meta"]["privacy_withheld"] = withheld
 
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=1, default=str)
-    return counts
+    return counts, withheld
 
 
 def _rows(db, table: str, col: str, ids: list[str]) -> list[dict]:
     if not ids:
         return []
+    keep = f" AND {_KEEP_IN_BACKUP[table]}" if table in _KEEP_IN_BACKUP else ""
     return _rows_sql(
         db,
-        # table/col are literals from _CASCADE/_SOFT above, never input.
-        f"SELECT * FROM {table} WHERE {col} = ANY(CAST(:v AS uuid[]))",  # noqa: S608
+        # table/col/keep are literals from _CASCADE/_SOFT/_KEEP_IN_BACKUP, never input.
+        f"SELECT * FROM {table} WHERE {col} = ANY(CAST(:v AS uuid[])){keep}",  # noqa: S608
         {"v": ids},
     )
 
@@ -261,14 +291,16 @@ def main() -> None:
             return
 
         print(f"\nWriting backup -> {args.backup}")
-        counts = _dump(db, cfg_ids, job_ids, args.backup)
+        counts, withheld = _dump(db, cfg_ids, job_ids, args.backup)
         for table, n in before.items():
-            got = counts.get(table, 0)
+            # A privacy-withheld row is accounted for by count, not content.
+            got = counts.get(table, 0) + withheld.get(table, 0)
             if got != n:
                 raise SystemExit(
                     f"ABORT before delete: backup of {table} has {got} rows, expected {n}."
                 )
-        print(f"Backup verified: {sum(counts.values())} rows across {len(counts)} tables.")
+        print(f"Backup verified: {sum(counts.values())} rows across {len(counts)} tables"
+              f" (+{sum(withheld.values())} privacy-withheld, counted only).")
 
         # ── the destructive part ────────────────────────────────────────────
         db.execute(text("SET LOCAL lock_timeout = '2s'"))

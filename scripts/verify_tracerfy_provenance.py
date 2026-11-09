@@ -39,6 +39,27 @@ def _digits(p):
     return d[-10:] if len(d) >= 10 else d
 
 
+def _sample_stmt(limit: int):
+    """The skip-trace hits this script prints (names, addresses, decrypted phones and
+    emails). Never a row withheld by a privacy rule: a withheld subject's contact data
+    must not reach an operator's terminal either."""
+    from sqlalchemy import select
+
+    from src.api.lead_actionability import not_privacy_suppressed_condition
+    from src.db.models import Result
+
+    return (
+        select(Result)
+        .where(
+            Result.skip_trace_status == "hit",
+            Result.property_address.isnot(None),
+            not_privacy_suppressed_condition(),
+        )
+        .order_by(Result.skip_trace_attempted_at.desc())
+        .limit(limit)
+    )
+
+
 def main():
     from sqlalchemy import select
 
@@ -61,19 +82,7 @@ def main():
         print(f"DB totals: {total_hits} Result rows status='hit', "
               f"{total_cache} skip_trace_cache rows\n")
 
-        rows = (
-            db.execute(
-                select(Result)
-                .where(
-                    Result.skip_trace_status == "hit",
-                    Result.property_address.isnot(None),
-                )
-                .order_by(Result.skip_trace_attempted_at.desc())
-                .limit(SAMPLE)
-            )
-            .scalars()
-            .all()
-        )
+        rows = db.execute(_sample_stmt(SAMPLE)).scalars().all()
 
         if not rows:
             print("No skip-trace HIT rows found. Nothing to verify.")

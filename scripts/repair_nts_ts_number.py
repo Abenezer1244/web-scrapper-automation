@@ -69,6 +69,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from sqlalchemy import text as sa_text  # noqa: E402
 
+from src.api.lead_actionability import not_privacy_suppressed_sql  # noqa: E402
 from src.db.session import system_sync_session  # noqa: E402
 from src.scrapers.sources import nts_pdf  # noqa: E402
 from src.scrapers.sources import nts_tacoma_index as nts  # noqa: E402
@@ -265,7 +266,8 @@ def repair_notice_fields(db, by_issue: dict[str, dict[str, dict]], apply: bool) 
         if apply:
             assign = ", ".join(f"{k} = :{k}" for k in sets)
             res = db.execute(
-                sa_text(f"UPDATE nts_notices SET {assign} WHERE id = CAST(:id AS uuid)"),  # noqa: S608
+                sa_text(f"UPDATE nts_notices SET {assign} WHERE id = CAST(:id AS uuid) "  # noqa: S608
+                        "AND privacy_suppression_id IS NULL"),
                 {**sets, "id": row["id"]},
             )
             _require_one(res, "nts_notices", row["id"])
@@ -294,6 +296,8 @@ def retire_wrong_key(db, by_issue: dict[str, dict[str, dict]], apply: bool) -> i
           FROM nts_notices n
           LEFT JOIN results r ON r.nts_notice_id = n.id
          WHERE n.source = :src AND n.source_url IS NOT NULL AND n.source_url <> ''
+           -- A privacy-withheld notice (132) is never listed or retired here.
+           AND n.privacy_suppression_id IS NULL
          GROUP BY n.id, n.ts_number, n.parcel, n.source_url, n.is_active, n.auction_date
          ORDER BY n.source_url, n.parcel
     """), {"src": SOURCE}).all()]
@@ -314,7 +318,8 @@ def retire_wrong_key(db, by_issue: dict[str, dict[str, dict]], apply: bool) -> i
               f"(issue prints {tr['ts_number']!r}) results={row['results']}")
         if apply:
             res = db.execute(
-                sa_text("UPDATE nts_notices SET is_active = false WHERE id = CAST(:id AS uuid)"),
+                sa_text("UPDATE nts_notices SET is_active = false WHERE id = CAST(:id AS uuid) "
+                        "AND privacy_suppression_id IS NULL"),
                 {"id": row["id"]},
             )
             _require_one(res, "nts_notices", row["id"])
@@ -370,7 +375,9 @@ def repair_results(db, truth: dict[str, str], apply: bool) -> int:
     # collision surface, so parcel alone must never decide which row gets rewritten
     # (Codex P1). The pre-existing exact-string join had the same hole; it was simply
     # harder to hit.
-    rows = db.execute(sa_text("""
+    # Never a privacy-withheld lead (nor one matched to a withheld notice): this prints
+    # the party name and rewrites the row, and a repair must not touch a withheld subject.
+    rows = db.execute(sa_text(f"""
         SELECT r.id::text AS id, r.job_id::text AS job_id, r.party_name, r.parcel_id,
                r.raw_html_hash, r.source_fingerprint, r.enrichment_data,
                r.nts_notice_id::text AS notice_id, n.parcel AS notice_parcel
@@ -380,7 +387,9 @@ def repair_results(db, truth: dict[str, str], apply: bool) -> int:
            AND r.enrichment_data -> 'nts' ->> 'ts_number' IS NOT NULL
            AND upper(regexp_replace(coalesce(r.parcel_id, ''), '[^A-Za-z0-9]', '', 'g'))
                = ANY(:parcels)
-    """), {"parcels": list(norm_truth), "src": SOURCE}).all()
+           AND {not_privacy_suppressed_sql('r')}
+           AND n.privacy_suppression_id IS NULL
+    """), {"parcels": list(norm_truth), "src": SOURCE}).all()  # noqa: S608
 
     from src.scrapers.sources.nts_matcher import _norm_parcel
 
@@ -526,9 +535,12 @@ def repair_results(db, truth: dict[str, str], apply: bool) -> int:
             # "raw_html_hash = :h", "source_fingerprint = :h"). No value reaches the SQL
             # text — every value is a bound parameter. Which fragments apply varies per
             # row, which is why the statement is composed rather than written out.
+            # The privacy predicate re-checks at write time: a row withheld since the
+            # SELECT above matches nothing, and _require_one aborts the whole run.
             columns = ", ".join(item["sets"])
             res = db.execute(
-                sa_text(f"UPDATE results SET {columns} WHERE id = CAST(:id AS uuid)"),  # noqa: S608
+                sa_text(f"UPDATE results SET {columns} WHERE id = CAST(:id AS uuid) "  # noqa: S608
+                        f"AND {not_privacy_suppressed_sql('results')}"),
                 item["params"],
             )
             _require_one(res, "results", m["id"])
@@ -558,6 +570,10 @@ def repair_notices(db, truth: dict[str, str], apply: bool) -> int:
           FROM nts_notices n
           LEFT JOIN results r ON r.nts_notice_id = n.id
          WHERE n.source = :src AND n.parcel = ANY(:parcels)
+           -- A privacy-withheld notice (132) is never printed, renamed or retired. It is
+           -- inactive with no grantor; it still occupies its ts_number, which `held`
+           -- below models from every row, so a rename can never collide with it.
+           AND n.privacy_suppression_id IS NULL
          GROUP BY n.id, n.ts_number, n.parcel, n.grantor, n.auction_date, n.is_active, n.created_at
     """), {"src": SOURCE, "parcels": list(truth)}).all()]
 
@@ -600,7 +616,8 @@ def repair_notices(db, truth: dict[str, str], apply: bool) -> int:
               f"ts={m['ts_number']!r} results={m['results']} active={m['is_active']}")
         if apply:
             res = db.execute(
-                sa_text("UPDATE nts_notices SET is_active = false WHERE id = CAST(:id AS uuid)"),
+                sa_text("UPDATE nts_notices SET is_active = false WHERE id = CAST(:id AS uuid) "
+                        "AND privacy_suppression_id IS NULL"),
                 {"id": m["id"]},
             )
             _require_one(res, "nts_notices", m["id"])
@@ -648,7 +665,8 @@ def repair_notices(db, truth: dict[str, str], apply: bool) -> int:
               f"{m['ts_number']!r} -> {correct!r}")
         if apply:
             res = db.execute(
-                sa_text("UPDATE nts_notices SET ts_number = :new WHERE id = CAST(:id AS uuid)"),
+                sa_text("UPDATE nts_notices SET ts_number = :new WHERE id = CAST(:id AS uuid) "
+                        "AND privacy_suppression_id IS NULL"),
                 {"new": correct, "id": m["id"]},
             )
             _require_one(res, "nts_notices", m["id"])

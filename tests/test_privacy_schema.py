@@ -64,8 +64,9 @@ def _event(**over) -> dict:
 
 
 _RULE = ("INSERT INTO privacy_suppressions (rule_id, request_id, anchor_kind, anchor_hmac, "
-         "subject_kind, subject_hmac, scope, key_version, normalization_version, state) "
-         "VALUES (:rule, :r, :ak, :ah, :sk, :sh, :scope, :kv, :nv, :state)")
+         "subject_kind, subject_hmac, scope, key_version, normalization_version, state, "
+         "actor_user_id) VALUES (:rule, :r, :ak, :ah, :sk, :sh, :scope, :kv, :nv, :state, "
+         "gen_random_uuid())")
 
 
 def _rule(request_id: str, **over) -> dict:
@@ -97,17 +98,25 @@ def test_a_request_its_payload_trail_and_a_pending_rule_can_be_recorded(conn) ->
 
 # ── The activation guard ─────────────────────────────────────────────────────────
 
-@pytest.mark.parametrize("state", ["active", "lifted", "ACTIVE", ""])
-def test_no_rule_can_be_anything_but_pending(conn, state) -> None:
+@pytest.mark.parametrize("state", ["ACTIVE", "", "suppressed"])
+def test_a_rule_is_only_pending_active_or_lifted(conn, state) -> None:
     rid = _request(conn)
     assert _sqlstate(conn, _RULE, _rule(rid, state=state)) == "23514"
 
 
-def test_the_guard_is_the_named_constraint_p7_must_replace(conn) -> None:
-    definition = conn.execute(text(
-        "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
-        "WHERE conname = 'ck_privacy_suppressions_activation_guard'")).scalar()
-    assert definition == "CHECK (((state)::text = 'pending'::text))"
+def test_136_replaced_the_pending_only_guard(conn) -> None:
+    names = set(conn.execute(text(
+        "SELECT conname FROM pg_constraint "
+        "WHERE conrelid = 'public.privacy_suppressions'::regclass")).scalars())
+    assert "ck_privacy_suppressions_activation_guard" not in names
+    assert {"ck_privacy_suppressions_state", "ck_privacy_suppressions_enforceable"} <= names
+
+
+@pytest.mark.parametrize("state", ["active", "lifted"])
+def test_a_mailing_anchor_never_leaves_pending(conn, state) -> None:
+    """The rule loader cannot compute a mailing anchor and would refuse every rule."""
+    rid = _request(conn)
+    assert _sqlstate(conn, _RULE, _rule(rid, state=state, ak="mailing")) == "23514"
 
 
 # ── Rule shape ──────────────────────────────────────────────────────────────────

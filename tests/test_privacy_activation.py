@@ -12,14 +12,19 @@ from src.config.settings import Settings
 from src.privacy import activation
 
 
-def test_the_shipped_defaults_refuse_activation():
-    # Groundwork: the code implements no enforcement layer, the setting is 0.
-    assert activation.IMPLEMENTED_ENFORCEMENT_VERSION < activation.REQUIRED_ENFORCEMENT_VERSION
+def test_the_code_key_is_turned_and_the_operator_key_is_off_by_default():
+    # P7: the code implements every layer; activation still waits for the operator.
+    assert activation.IMPLEMENTED_ENFORCEMENT_VERSION >= activation.REQUIRED_ENFORCEMENT_VERSION
     assert Settings.model_fields["PRIVACY_ENFORCEMENT_VERSION"].default == 0
+
+
+def test_the_shipped_defaults_refuse_activation(monkeypatch):
+    monkeypatch.setattr(settings, "PRIVACY_ENFORCEMENT_VERSION", 0)
     assert not activation.activation_allowed()
 
 
 def test_raising_the_setting_alone_enables_nothing(monkeypatch):
+    monkeypatch.setattr(activation, "IMPLEMENTED_ENFORCEMENT_VERSION", 0)
     monkeypatch.setattr(settings, "PRIVACY_ENFORCEMENT_VERSION", 99)
     assert not activation.activation_allowed()
     with pytest.raises(activation.ActivationNotAllowedError):

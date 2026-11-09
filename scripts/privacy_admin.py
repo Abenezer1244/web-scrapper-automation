@@ -26,6 +26,8 @@ Commands
               rule is never lifted (erased data cannot come back).
   status      a request's events and rules
   inbox       open requests, soonest deadline first (ids, kinds, dates, last event)
+  hold        place a legal hold on a request: the 24-month retention purge skips it
+  unhold      release that hold
   show        one request's decrypted contact and details, for the operator only
 
 The database is the authority for every lifecycle rule (migration 136); this script only
@@ -330,6 +332,14 @@ def cmd_status(db, op, args) -> None:
     db.rollback()
 
 
+def cmd_hold(db, op, args) -> None:
+    action = "hold" if args.command == "hold" else "release"
+    db.execute(text("SELECT privacy_hold_request(CAST(:r AS uuid), :a, CAST(:o AS uuid))"),
+               {"r": args.request, "a": action, "o": op})
+    db.commit()
+    print(f"request {args.request}: legal hold {'placed' if action == 'hold' else 'released'}")
+
+
 def cmd_inbox(db, op, args) -> None:
     rows = db.execute(text(
         "SELECT r.id, r.kind, r.channel, r.received_at, coalesce("
@@ -401,6 +411,8 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--result", required=True)
     sub.add_parser("status").add_argument("--request", required=True)
     sub.add_parser("inbox")
+    for name in ("hold", "unhold"):
+        sub.add_parser(name).add_argument("--request", required=True)
     sub.add_parser("show").add_argument("--request", required=True)
     return ap
 
@@ -408,7 +420,7 @@ def _parser() -> argparse.ArgumentParser:
 _COMMANDS = {"record": cmd_record, "event": cmd_event, "add-rule": cmd_add_rule,
              "candidates": cmd_candidates, "activate": cmd_activate, "held": cmd_held,
              "release": cmd_release, "lift": cmd_lift, "status": cmd_status,
-             "inbox": cmd_inbox, "show": cmd_show}
+             "inbox": cmd_inbox, "show": cmd_show, "hold": cmd_hold, "unhold": cmd_hold}
 
 
 def main(argv=None, session_factory=operator_session) -> None:

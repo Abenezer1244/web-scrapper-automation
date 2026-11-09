@@ -9,27 +9,32 @@
                                   and posts it here). Always the same 200.
 
 Enumeration-safe by construction: nothing here reads a lead, a customer or an earlier
-request; the database function does the same work for every valid submission (a repeat
-within a day records nothing, silently) and returns nothing; confirm never says whether
-a token existed, expired or was already used. Off until PRIVACY_INTAKE_ENABLED (404),
-because the page copy awaits counsel (D9).
+request; a repeat within a day records nothing and is answered exactly like the first;
+confirm never says whether a token existed, expired or was already used; both answer no
+faster than _FLOOR_S, so the shorter repeat path cannot be told apart by timing. Nothing
+personal is logged or audited (not even the submitter's IP). Off until
+PRIVACY_INTAKE_ENABLED: 404 before the body is even validated, because the page copy
+awaits counsel (D9).
 
-Abuse: every zone below fails CLOSED during a Redis outage (rate_limit._FALLBACK_ZONES):
-per IP, per /24 (or /48), per address, per address domain, and one global daily budget,
-so the form cannot be turned into a mail cannon.
+Abuse: _gate charges every attempt, valid or not, to the caller's IP and /24 (or /48)
+before the body is read. A NEW request is also charged to its address, its address's
+domain and one global daily budget (a repeat sends nothing, so it costs nothing there).
+Every privacy zone refuses (503) while Redis is down (rate_limit._HARD_FAIL_ZONES).
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import ipaddress
 import json
+import time
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.middleware import audit_log, rate_limit
+from src.api.middleware import rate_limit
 from src.api.middleware.rate_limit import client_ip
 from src.config import settings
 from src.db.session import get_db
@@ -77,9 +82,9 @@ class ConfirmIn(BaseModel):
     token: str = Field(min_length=1, max_length=256)
 
 
-def _enabled() -> None:
-    if not settings.PRIVACY_INTAKE_ENABLED:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+# Every answer takes at least this long: a repeat (no insert, no quota) or a garbage
+# token is otherwise measurably faster than a new request or a real confirmation.
+_FLOOR_S = 0.6
 
 
 def _network(ip: str) -> str:
@@ -91,48 +96,67 @@ def _network(ip: str) -> str:
     return str(ipaddress.ip_network(f"{addr}/{prefix}", strict=False))
 
 
-@router.post("/requests", status_code=status.HTTP_202_ACCEPTED)
-async def submit_privacy_request(
-    body: PrivacyRequestIn, request: Request, db: AsyncSession = Depends(get_db),
-) -> dict:
-    _enabled()
-    # The address that gets the email: the agent's when an agent submits.
-    to = str(body.agent.email if body.agent else body.email)
-    to_hmac = blind_index(to)
+async def _gate(request: Request) -> None:
+    """Runs before the body is read or validated: off is a 404 whatever was sent, and
+    every attempt, valid or not, spends the caller's per-IP and per-network budget."""
+    if not settings.PRIVACY_INTAKE_ENABLED:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
     ip = client_ip(request)
     await rate_limit(request, zone="privacy_ip", identifier=ip)
     await rate_limit(request, zone="privacy_net", identifier=_network(ip))
-    await rate_limit(request, zone="privacy_address", identifier=to_hmac)
-    await rate_limit(request, zone="privacy_domain",
-                     identifier=hashlib.sha256(to.rsplit("@", 1)[-1].lower().encode()).hexdigest())
-    await rate_limit(request, zone="privacy_budget", identifier="global")
 
+
+async def _floor(started: float) -> None:
+    remaining = _FLOOR_S - (time.monotonic() - started)
+    if remaining > 0:
+        await asyncio.sleep(remaining)
+
+
+@router.post("/requests", status_code=status.HTTP_202_ACCEPTED,
+             dependencies=[Depends(_gate)])
+async def submit_privacy_request(
+    body: PrivacyRequestIn, request: Request, db: AsyncSession = Depends(get_db),
+) -> dict:
+    started = time.monotonic()
+    # The address that gets the email: the agent's when an agent submits.
+    to = str(body.agent.email if body.agent else body.email)
+    to_hmac = blind_index(to)
     contact = {"email": str(body.email)}
     if body.agent:
         contact["agent"] = body.agent.model_dump(mode="json")
     details = body.model_dump(mode="json", exclude={"kind", "email", "agent"})
     received = await db.execute(text("SELECT now()"))
     deadline = deadline_for(body.kind, received.scalar_one())
-    await db.execute(
+    created = (await db.execute(
         text("SELECT privacy_web_submit(:k, :h, :c, :d, :agent, :dl, :rules)"),
         {"k": body.kind, "h": to_hmac,
          "c": encrypt_field(json.dumps(contact, sort_keys=True)),
          "d": encrypt_field(json.dumps(details, sort_keys=True)),
          "agent": body.agent is not None, "dl": deadline, "rules": RULES_VERSION},
-    )
+    )).scalar_one()
+    if created:
+        # Only a new request queues an email, so only it spends the per-address,
+        # per-domain and global send budgets. Over any of them: nothing is recorded.
+        domain = hashlib.sha256(to.rsplit("@", 1)[-1].lower().encode()).hexdigest()
+        try:
+            await rate_limit(request, zone="privacy_address", identifier=to_hmac)
+            await rate_limit(request, zone="privacy_domain", identifier=domain)
+            await rate_limit(request, zone="privacy_budget", identifier="global")
+        except HTTPException:
+            await db.rollback()
+            raise
     await db.commit()
-    # No address, name or request id in the audit trail: the kind is enough to count.
-    audit_log(request, "privacy_request_submitted", None, detail=body.kind)
+    await _floor(started)
     return _RECEIVED
 
 
-@router.post("/requests/confirm")
+@router.post("/requests/confirm", dependencies=[Depends(_gate)])
 async def confirm_privacy_request(
-    body: ConfirmIn, request: Request, db: AsyncSession = Depends(get_db),
+    body: ConfirmIn, db: AsyncSession = Depends(get_db),
 ) -> dict:
-    _enabled()
-    await rate_limit(request, zone="privacy_ip", identifier=client_ip(request))
+    started = time.monotonic()
     await db.execute(text("SELECT privacy_web_confirm(:h)"),
                      {"h": hashlib.sha256(body.token.encode()).hexdigest()})
     await db.commit()
+    await _floor(started)
     return _DONE

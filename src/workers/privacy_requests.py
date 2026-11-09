@@ -1,12 +1,11 @@
 """Privacy requests from the web form: the outbox email and the deadline alerts (P8d).
 
 send_privacy_outbox (beat, every minute)
-  One row at a time, each in its own transaction (migration 137's privacy_outbox_due
-  locks it FOR UPDATE SKIP LOCKED): decrypt the contact, mint the link's token, send,
-  then store only the token's hash and mark the row sent. A send failure backs off
-  (privacy_outbox_failed); a crash after sending and before the commit sends again
-  (at-least-once; the earlier link then never matches a stored hash, so only the
-  newest works).
+  One row at a time, each step committed (migration 137): claim the row for 15 minutes,
+  mint the link's token and store only its hash, THEN send, then mark it sent. A send
+  failure backs off (privacy_outbox_failed, error class only). A crash after sending
+  leaves the claim to lapse and the row is sent again (at-least-once); both links stay
+  valid until they expire, and either confirms the request once.
   Copy (D9: drafted by engineering, for counsel): what was received and when, the
   response date, one-time link. Never a submitted name, address or match result, and
   never a claim that anything was done.
@@ -91,30 +90,33 @@ def _send(to: str, subject: str, lines: list[str], cta, note: str) -> None:
 
 def _send_one(db) -> bool:
     """Send the next due row; False when none is due."""
-    row = db.execute(text("SELECT * FROM public.privacy_outbox_due(1)")).first()
+    row = db.execute(text("SELECT * FROM public.privacy_outbox_claim(1)")).first()
+    db.commit()  # the claim is durable before anything is sent
     if row is None:
         return False
     contact = json.loads(decrypt_field(row.contact_encrypted))
     to = (contact.get("agent") or {}).get("email") or contact["email"]
-    token = link = None
+    link = None
     if row.email_kind == "verification":
         token = secrets.token_urlsafe(32)
+        # Stored (as a hash) before sending: a link that was emailed always works.
+        db.execute(text("SELECT public.privacy_outbox_token(:o, :h, :x)"), {
+            "o": row.outbox_id, "h": hashlib.sha256(token.encode()).hexdigest(),
+            "x": datetime.now(UTC) + _LINK_TTL})
+        db.commit()
         link = f"{settings.FRONTEND_URL.rstrip('/')}/privacy/request/confirm#t={token}"
     subject, lines, cta, note = _copy(row, link)
     try:
         _send(to, subject, lines, cta, note)
     except Exception as exc:  # noqa: BLE001 -- recorded and retried with backoff
-        from src.workers.delivery import _email_error_summary
+        # The class name only: provider messages can carry the recipient's address.
         db.execute(text("SELECT public.privacy_outbox_failed(:o, :e)"),
-                   {"o": row.outbox_id, "e": _email_error_summary(exc)[:200]})
+                   {"o": row.outbox_id, "e": type(exc).__name__})
         db.commit()
-        _logger.warning("privacy outbox row %s: send failed", str(row.outbox_id)[:8])
+        _logger.warning("privacy outbox row %s: send failed (%s)", str(row.outbox_id)[:8],
+                        type(exc).__name__)
         return True
-    db.execute(text("SELECT public.privacy_outbox_sent(:o, :h, :x)"), {
-        "o": row.outbox_id,
-        "h": hashlib.sha256(token.encode()).hexdigest() if token else None,
-        "x": datetime.now(UTC) + _LINK_TTL if token else None,
-    })
+    db.execute(text("SELECT public.privacy_outbox_sent(:o)"), {"o": row.outbox_id})
     db.commit()
     return True
 

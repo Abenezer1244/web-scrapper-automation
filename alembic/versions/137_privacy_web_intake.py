@@ -9,11 +9,13 @@ records verification.
   privacy_requests.deadline_rules  which deadline rules computed deadline_at (counsel may
                                    change them; old requests keep their own).
   privacy_request_tokens           one row per emailed link: only the SHA-256 of an opaque
-                                   random token, its expiry, and when it was consumed.
+                                   random token, its purpose ('verify'), expiry, and when
+                                   it was consumed.
   privacy_email_outbox             the durable outbox: written in the submit transaction,
-                                   sent by the worker with retries. 'verification' carries
-                                   a link; 'receipt' (an authorized agent's submission)
-                                   does not.
+                                   sent by the worker with retries under a durable claim
+                                   (claimed_until, a 15-minute lease). 'verification'
+                                   carries a link; 'receipt' (an authorized agent's
+                                   submission) does not.
 
 Functions (SECURITY DEFINER, owned by the privacy tables' owner like 129, search_path
 pinned, nothing personal returned):
@@ -21,24 +23,29 @@ pinned, nothing personal returned):
                             encrypted payload, the 'received' event and either
                             'verification_sent' (the requester will get a link) or
                             'in_review' (an agent: the operator checks the signed
-                            permission, D1), plus the outbox row. A repeat of the same kind
-                            from the same address within 24 h records nothing new and the
-                            API answers it identically.
+                            permission, D1), plus the outbox row. Returns whether it
+                            recorded a new request: a repeat of the same kind from the same
+                            address within 24 h records nothing (the API answers it
+                            identically and charges it no per-address quota).
   privacy_web_confirm()     bridgeleads_app. Consumes a token atomically; an opt-out is then
                             'verified' at level 'email_link' (D1), any other kind goes to
                             'in_review' (the operator still matches name and property).
                             Unknown, expired, consumed and closed all do nothing visible.
-  privacy_outbox_due()      bridgeleads_system: due outbox rows with the ciphertext the
-                            worker needs to send them (it holds the decryption key).
-  privacy_outbox_sent()     bridgeleads_system: marks a row sent and stores the hash of the
-                            token it minted for that email.
-  privacy_outbox_failed()   bridgeleads_system: backoff, bounded attempts.
+  privacy_outbox_claim()    bridgeleads_system: claims due rows for 15 minutes (durable:
+                            a crashed worker's rows come back after the lease) and returns
+                            the ciphertext the worker needs (it holds the decryption key).
+  privacy_outbox_token()    bridgeleads_system: stores the hash of the token minted for a
+                            claimed verification row, committed BEFORE the email is sent,
+                            so every link ever emailed stays valid until it expires.
+  privacy_outbox_sent()     bridgeleads_system: marks a claimed row sent.
+  privacy_outbox_failed()   bridgeleads_system: backoff, bounded attempts; stores only an
+                            error class name, never provider text (it can carry addresses).
   privacy_tokens_purge()    bridgeleads_system: deletes long-expired tokens.
   privacy_requests_due()    bridgeleads_system: open (undecided) requests due within a
                             window, ids, kinds and deadlines only, for the deadline alert.
 
-No role gains a table privilege. Downgrade refuses while any web-form request exists (one with deadline_rules or an
-outbox row).
+No role gains a table privilege. Downgrade refuses while any web-form request exists (one
+with deadline_rules or an outbox row).
 
 Revision ID: 137
 Revises: 136
@@ -59,8 +66,9 @@ _APP_FUNCTIONS = (
     "privacy_web_confirm(text)",
 )
 _WORKER_FUNCTIONS = (
-    "privacy_outbox_due(integer)",
-    "privacy_outbox_sent(uuid, text, timestamptz)",
+    "privacy_outbox_claim(integer)",
+    "privacy_outbox_token(uuid, text, timestamptz)",
+    "privacy_outbox_sent(uuid)",
     "privacy_outbox_failed(uuid, text)",
     "privacy_tokens_purge()",
     "privacy_requests_due(interval)",
@@ -71,7 +79,7 @@ _SQL = r"""
 CREATE FUNCTION public.privacy_web_submit(
     p_kind text, p_email_hmac text, p_contact_encrypted text, p_details_encrypted text,
     p_agent boolean, p_deadline_at timestamptz, p_deadline_rules text)
-RETURNS void
+RETURNS boolean
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $fn$
 DECLARE
     v_id uuid;
@@ -93,7 +101,7 @@ BEGIN
     IF EXISTS (SELECT 1 FROM public.privacy_requests r
                 WHERE r.requester_email_hmac = p_email_hmac AND r.kind = p_kind
                   AND r.channel = 'web' AND r.received_at > now() - interval '24 hours') THEN
-        RETURN;
+        RETURN false;
     END IF;
     INSERT INTO public.privacy_requests
         (kind, channel, deadline_at, requester_email_hmac, deadline_rules)
@@ -106,6 +114,7 @@ BEGIN
            (v_id, 2, CASE WHEN p_agent THEN 'in_review' ELSE 'verification_sent' END, 'system');
     INSERT INTO public.privacy_email_outbox (request_id, kind)
     VALUES (v_id, CASE WHEN p_agent THEN 'receipt' ELSE 'verification' END);
+    RETURN true;
 END
 $fn$;
 
@@ -121,7 +130,8 @@ BEGIN
         RETURN;
     END IF;
     UPDATE public.privacy_request_tokens t SET consumed_at = now()
-     WHERE t.token_hash = p_token_hash AND t.consumed_at IS NULL AND t.expires_at > now()
+     WHERE t.token_hash = p_token_hash AND t.purpose = 'verify'
+       AND t.consumed_at IS NULL AND t.expires_at > now()
     RETURNING t.request_id INTO v_request;
     IF v_request IS NULL THEN
         RETURN;
@@ -144,46 +154,70 @@ BEGIN
 END
 $fn$;
 
-CREATE FUNCTION public.privacy_outbox_due(p_limit integer)
+CREATE FUNCTION public.privacy_outbox_claim(p_limit integer)
 RETURNS TABLE (outbox_id uuid, email_kind text, request_kind text, received_at timestamptz,
                deadline_at timestamptz, contact_encrypted text, attempts integer)
 LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $fn$
-    SELECT o.id, o.kind::text, r.kind::text, r.received_at, r.deadline_at,
-           p.contact_encrypted, o.attempts
-      FROM public.privacy_email_outbox o
-      JOIN public.privacy_requests r ON r.id = o.request_id
+    WITH picked AS (
+        SELECT o.id FROM public.privacy_email_outbox o
+         WHERE o.sent_at IS NULL AND o.gave_up_at IS NULL AND o.next_attempt_at <= now()
+           AND (o.claimed_until IS NULL OR o.claimed_until < now())
+         ORDER BY o.next_attempt_at, o.id
+         LIMIT least(greatest(p_limit, 1), 100)
+           FOR UPDATE SKIP LOCKED),
+    claimed AS (
+        UPDATE public.privacy_email_outbox o SET claimed_until = now() + interval '15 minutes'
+          FROM picked WHERE o.id = picked.id
+        RETURNING o.id, o.kind, o.request_id, o.attempts)
+    SELECT c.id, c.kind::text, r.kind::text, r.received_at, r.deadline_at,
+           p.contact_encrypted, c.attempts
+      FROM claimed c
+      JOIN public.privacy_requests r ON r.id = c.request_id
       JOIN public.privacy_request_payloads p ON p.request_id = r.id
-     WHERE o.sent_at IS NULL AND o.gave_up_at IS NULL AND o.next_attempt_at <= now()
-     ORDER BY o.next_attempt_at, o.id
-     LIMIT least(greatest(p_limit, 1), 100)
-       FOR UPDATE OF o SKIP LOCKED
 $fn$;
 
-CREATE FUNCTION public.privacy_outbox_sent(p_outbox uuid, p_token_hash text,
-                                           p_expires_at timestamptz)
+CREATE FUNCTION public.privacy_outbox_token(p_outbox uuid, p_token_hash text,
+                                            p_expires_at timestamptz)
 RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $fn$
+DECLARE
+    v_request uuid;
+BEGIN
+    SELECT o.request_id INTO v_request FROM public.privacy_email_outbox o
+     WHERE o.id = p_outbox AND o.kind = 'verification' AND o.sent_at IS NULL
+       AND o.claimed_until > now();
+    IF v_request IS NULL THEN
+        RAISE EXCEPTION 'privacy_outbox_token: not a claimed verification row'
+            USING ERRCODE = 'BLD58';
+    END IF;
+    IF p_token_hash IS NULL OR p_token_hash !~ '^[0-9a-f]{64}$'
+       OR p_expires_at IS NULL OR p_expires_at <= now()
+       OR p_expires_at > now() + interval '30 days' THEN
+        RAISE EXCEPTION 'privacy_outbox_token: invalid token' USING ERRCODE = 'BLD58';
+    END IF;
+    INSERT INTO public.privacy_request_tokens (request_id, purpose, token_hash, expires_at)
+    VALUES (v_request, 'verify', p_token_hash, p_expires_at);
+END
+$fn$;
+
+CREATE FUNCTION public.privacy_outbox_sent(p_outbox uuid) RETURNS void
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $fn$
 DECLARE
     v_request uuid;
     v_kind text;
 BEGIN
-    UPDATE public.privacy_email_outbox o SET sent_at = now(), last_error = NULL
-     WHERE o.id = p_outbox AND o.sent_at IS NULL
+    UPDATE public.privacy_email_outbox o
+       SET sent_at = now(), claimed_until = NULL, last_error = NULL
+     WHERE o.id = p_outbox AND o.sent_at IS NULL AND o.claimed_until > now()
     RETURNING o.request_id, o.kind INTO v_request, v_kind;
     IF v_request IS NULL THEN
-        RAISE EXCEPTION 'privacy_outbox_sent: no unsent row' USING ERRCODE = 'BLD58';
+        RAISE EXCEPTION 'privacy_outbox_sent: not a claimed unsent row' USING ERRCODE = 'BLD58';
     END IF;
-    IF v_kind = 'verification' THEN
-        IF p_token_hash IS NULL OR p_token_hash !~ '^[0-9a-f]{64}$'
-           OR p_expires_at IS NULL OR p_expires_at <= now()
-           OR p_expires_at > now() + interval '30 days' THEN
-            RAISE EXCEPTION 'privacy_outbox_sent: a verification email needs its token'
-                USING ERRCODE = 'BLD58';
-        END IF;
-        INSERT INTO public.privacy_request_tokens (request_id, token_hash, expires_at)
-        VALUES (v_request, p_token_hash, p_expires_at);
-    ELSIF p_token_hash IS NOT NULL THEN
-        RAISE EXCEPTION 'privacy_outbox_sent: a receipt carries no token' USING ERRCODE = 'BLD58';
+    IF v_kind = 'verification' AND NOT EXISTS (
+            SELECT 1 FROM public.privacy_request_tokens t
+             WHERE t.request_id = v_request AND t.purpose = 'verify') THEN
+        RAISE EXCEPTION 'privacy_outbox_sent: a verification email needs its token'
+            USING ERRCODE = 'BLD58';
     END IF;
 END
 $fn$;
@@ -192,7 +226,10 @@ CREATE FUNCTION public.privacy_outbox_failed(p_outbox uuid, p_error text) RETURN
 LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $fn$
     UPDATE public.privacy_email_outbox o
        SET attempts = o.attempts + 1,
-           last_error = left(coalesce(p_error, ''), 256),
+           -- An error CLASS only: provider messages can carry the recipient's address.
+           last_error = CASE WHEN p_error ~ '^[A-Za-z][A-Za-z0-9_.]{0,63}$' THEN p_error
+                             ELSE 'error' END,
+           claimed_until = NULL,
            next_attempt_at = now() + least(interval '1 minute' * power(2, o.attempts),
                                            interval '6 hours'),
            gave_up_at = CASE WHEN o.attempts + 1 >= 10 THEN now() END
@@ -255,11 +292,13 @@ def upgrade() -> None:
         CREATE TABLE public.privacy_request_tokens (
             id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
             request_id uuid NOT NULL REFERENCES public.privacy_requests(id) ON DELETE CASCADE,
+            purpose varchar(16) NOT NULL DEFAULT 'verify',
             token_hash char(64) NOT NULL UNIQUE,
             created_at timestamptz NOT NULL DEFAULT now(),
             expires_at timestamptz NOT NULL,
             consumed_at timestamptz,
             CONSTRAINT ck_privacy_request_tokens_hash CHECK (token_hash ~ '^[0-9a-f]{64}$'),
+            CONSTRAINT ck_privacy_request_tokens_purpose CHECK (purpose IN ('verify')),
             CONSTRAINT ck_privacy_request_tokens_expiry CHECK (expires_at > created_at)
         )
     """))
@@ -271,6 +310,7 @@ def upgrade() -> None:
             created_at timestamptz NOT NULL DEFAULT now(),
             attempts integer NOT NULL DEFAULT 0,
             next_attempt_at timestamptz NOT NULL DEFAULT now(),
+            claimed_until timestamptz,
             sent_at timestamptz,
             gave_up_at timestamptz,
             last_error varchar(256),

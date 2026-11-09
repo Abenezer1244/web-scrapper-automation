@@ -579,9 +579,10 @@ BEGIN
             GRANT EXECUTE ON FUNCTION public.privacy_web_submit(text, text, text, text,
                 boolean, timestamptz, text) TO bridgeleads_app;
             GRANT EXECUTE ON FUNCTION public.privacy_web_confirm(text) TO bridgeleads_app;
-            GRANT EXECUTE ON FUNCTION public.privacy_outbox_due(integer) TO bridgeleads_system;
-            GRANT EXECUTE ON FUNCTION public.privacy_outbox_sent(uuid, text, timestamptz)
+            GRANT EXECUTE ON FUNCTION public.privacy_outbox_claim(integer) TO bridgeleads_system;
+            GRANT EXECUTE ON FUNCTION public.privacy_outbox_token(uuid, text, timestamptz)
                 TO bridgeleads_system;
+            GRANT EXECUTE ON FUNCTION public.privacy_outbox_sent(uuid) TO bridgeleads_system;
             GRANT EXECUTE ON FUNCTION public.privacy_outbox_failed(uuid, text)
                 TO bridgeleads_system;
             GRANT EXECUTE ON FUNCTION public.privacy_tokens_purge() TO bridgeleads_system;

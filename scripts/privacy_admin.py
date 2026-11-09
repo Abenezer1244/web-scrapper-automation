@@ -95,7 +95,11 @@ def _operator(db, email: str) -> str:
                      {"h": blind_index(email)}).scalar()
     if uid is None:
         raise SystemExit("no account for --operator-email")
-    return str(uid)  # the database checks admin + MFA on every call
+    # Every command, readers included (inbox and show decrypt requests): an admin with
+    # MFA, checked by the same function 136's writers call.
+    db.execute(text("SELECT privacy_operator_check(CAST(:a AS uuid))"), {"a": str(uid)})
+    db.rollback()
+    return str(uid)
 
 
 def _anchor(args) -> tuple[str, str]:

@@ -66,6 +66,16 @@ setup; rate limits + send budget + per-email dedupe instead), ASN-level limits (
 /24 instead), provisional suppression of an unverified opt-out (a rule needs an exact anchor +
 subject; the operator acts within the opt-out deadline, alerted by the beat).
 
+## Codex reviews of the build
+- Round 1 (P8a-c): NO-GO, 2 High + 5 Medium, all adopted (2063f2d0, 960f4c59).
+- Round 2 (P8a-e): NO-GO, 2 High + 2 Medium, all adopted. Conflict with round 1 settled for
+  enumeration safety: round 1 said repeats must not spend the per-address quota; round 2
+  showed that charging only new requests turns the 429 into an oracle for an earlier
+  request. Every valid submission is now charged the same quotas before the database is
+  touched; a repeat still records and sends nothing. The plan line "a repeat is accepted
+  and answered identically" now means identically in every respect, quota included.
+- Frontend: NO-GO on one Medium (BFF turned the API's 503 into 502), fixed (60c6dab).
+
 ## Slices (<= 5 files per commit, ruff, tests on TEST_DATABASE_URL, Codex GO)
 - [ ] P8a migration 137: `privacy_request_tokens`, `privacy_email_outbox`,
       `privacy_web_submit()`, `privacy_web_confirm()`, worker functions for the outbox; grants;

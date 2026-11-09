@@ -17,8 +17,9 @@ PRIVACY_INTAKE_ENABLED: 404 before the body is even validated, because the page 
 awaits counsel (D9).
 
 Abuse: _gate charges every attempt, valid or not, to the caller's IP and /24 (or /48)
-before the body is read. A NEW request is also charged to its address, its address's
-domain and one global daily budget (a repeat sends nothing, so it costs nothing there).
+before the body is read. Every valid submission, new or a repeat, is then charged to its
+address, its address's domain and one global daily budget, so a refusal never depends on
+whether a request already exists (a repeat records and sends nothing, but costs the same).
 Every privacy zone refuses (503) while Redis is down (rate_limit._HARD_FAIL_ZONES).
 """
 from __future__ import annotations
@@ -121,30 +122,27 @@ async def submit_privacy_request(
     # The address that gets the email: the agent's when an agent submits.
     to = str(body.agent.email if body.agent else body.email)
     to_hmac = blind_index(to)
+    # Every valid submission, new or a repeat, is charged the same quotas BEFORE the
+    # database is touched: a 429/503 must not depend on whether a request already
+    # exists (Codex P8 round 2). A repeat records and sends nothing, but costs the same.
+    domain = hashlib.sha256(to.rsplit("@", 1)[-1].lower().encode()).hexdigest()
+    await rate_limit(request, zone="privacy_address", identifier=to_hmac)
+    await rate_limit(request, zone="privacy_domain", identifier=domain)
+    await rate_limit(request, zone="privacy_budget", identifier="global")
     contact = {"email": str(body.email)}
     if body.agent:
         contact["agent"] = body.agent.model_dump(mode="json")
     details = body.model_dump(mode="json", exclude={"kind", "email", "agent"})
     received = await db.execute(text("SELECT now()"))
     deadline = deadline_for(body.kind, received.scalar_one())
-    created = (await db.execute(
+    # Its result (new or repeat) is deliberately unused: nothing downstream may differ.
+    await db.execute(
         text("SELECT privacy_web_submit(:k, :h, :c, :d, :agent, :dl, :rules)"),
         {"k": body.kind, "h": to_hmac,
          "c": encrypt_field(json.dumps(contact, sort_keys=True)),
          "d": encrypt_field(json.dumps(details, sort_keys=True)),
          "agent": body.agent is not None, "dl": deadline, "rules": RULES_VERSION},
-    )).scalar_one()
-    if created:
-        # Only a new request queues an email, so only it spends the per-address,
-        # per-domain and global send budgets. Over any of them: nothing is recorded.
-        domain = hashlib.sha256(to.rsplit("@", 1)[-1].lower().encode()).hexdigest()
-        try:
-            await rate_limit(request, zone="privacy_address", identifier=to_hmac)
-            await rate_limit(request, zone="privacy_domain", identifier=domain)
-            await rate_limit(request, zone="privacy_budget", identifier="global")
-        except HTTPException:
-            await db.rollback()
-            raise
+    )
     await db.commit()
     await _floor(started)
     return _RECEIVED

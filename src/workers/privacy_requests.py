@@ -11,7 +11,8 @@ send_privacy_outbox (beat, every minute)
   never a claim that anything was done.
 
 privacy_request_deadlines (beat, daily)
-  Ops alert listing open requests due within 7 days (ids, kinds, dates only); purges
+  Ops alerts listing open requests due within 7 days, and separately within 2 days
+  (ids, kinds, dates only); purges
   tokens expired for 30 days.
 """
 from __future__ import annotations
@@ -37,6 +38,7 @@ _TZ = ZoneInfo("America/Los_Angeles")
 _LINK_TTL = timedelta(days=7)
 _PER_TICK = 50
 _ALERT_WINDOW = "7 days"
+_URGENT = timedelta(days=2)
 
 _ASKED = {
     "opt_out": "opt out of the sale or sharing of your personal information",
@@ -140,14 +142,20 @@ def privacy_request_deadlines() -> dict:
                          {"w": _ALERT_WINDOW}).all()
         purged = db.execute(text("SELECT public.privacy_tokens_purge()")).scalar() or 0
         db.commit()
-    if due:
-        lines = [f"{r.request_id} {r.kind} due {_day(r.deadline_at)}" for r in due]
-        send_ops_alert(
-            "privacy_deadline", datetime.now(UTC).strftime("%Y-%m-%d"),
-            f"{len(due)} privacy request(s) due within 7 days",
-            "Open privacy requests (decide them with scripts/privacy_admin.py):\n"
-            + "\n".join(lines))
-    return {"due": len(due), "purged_tokens": purged}
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
+    urgent_by = datetime.now(UTC) + _URGENT
+    urgent = [r for r in due if r.deadline_at <= urgent_by]
+    # Two alerts with their own cooldown keys (kind + day), so a daily run sends each at
+    # most once a day and an urgent request is never buried in the weekly list.
+    for kind, rows, window in (("privacy_deadline_urgent", urgent, "2 days"),
+                               ("privacy_deadline", due, "7 days")):
+        if rows:
+            send_ops_alert(
+                kind, today, f"{len(rows)} privacy request(s) due within {window}",
+                "Open privacy requests (decide them with scripts/privacy_admin.py):\n"
+                + "\n".join(f"{r.request_id} {r.kind} due {_day(r.deadline_at)}"
+                            for r in rows))
+    return {"due": len(due), "urgent": len(urgent), "purged_tokens": purged}
 
 
 try:  # pragma: no cover -- registration only

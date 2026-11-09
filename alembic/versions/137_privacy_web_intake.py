@@ -26,7 +26,8 @@ pinned, nothing personal returned):
                             permission, D1), plus the outbox row. Returns whether it
                             recorded a new request: a repeat of the same kind from the same
                             address within 24 h records nothing (the API answers it
-                            identically and charges it no per-address quota).
+                            identically, and charges it the same quotas as any
+                            submission, so no refusal reveals that one exists).
   privacy_web_confirm()     bridgeleads_app. Consumes a token atomically; an opt-out is then
                             'verified' at level 'email_link' (D1), any other kind goes to
                             'in_review' (the operator still matches name and property).
@@ -233,7 +234,9 @@ LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $fn$
            next_attempt_at = now() + least(interval '1 minute' * power(2, o.attempts),
                                            interval '6 hours'),
            gave_up_at = CASE WHEN o.attempts + 1 >= 10 THEN now() END
-     WHERE o.id = p_outbox AND o.sent_at IS NULL
+     -- Only the holder of the live claim: a worker whose lease lapsed must not touch
+     -- the row another worker has claimed since.
+     WHERE o.id = p_outbox AND o.sent_at IS NULL AND o.claimed_until > now()
 $fn$;
 
 CREATE FUNCTION public.privacy_requests_due(p_within interval)

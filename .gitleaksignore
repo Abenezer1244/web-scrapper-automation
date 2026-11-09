@@ -1,0 +1,6 @@
+# Reviewed false positives only. Each line is one exact finding (commit:file:rule:line).
+# The vendored official DROP API spec's curl samples send the placeholder
+# 'X-API-KEY: your...' (documentation, not a key). Reviewed 2026-11-09.
+8a538c82ed427f18659dde54ea30fd04c7b235b3:docs/legal/audit-2026-11/drop/databroker_api-v1.2.0.yaml:curl-auth-header:207
+8a538c82ed427f18659dde54ea30fd04c7b235b3:docs/legal/audit-2026-11/drop/databroker_api-v1.2.0.yaml:curl-auth-header:303
+8a538c82ed427f18659dde54ea30fd04c7b235b3:docs/legal/audit-2026-11/drop/databroker_api-v1.2.0.yaml:curl-auth-header:388

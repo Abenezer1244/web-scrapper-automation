@@ -588,6 +588,13 @@ BEGIN
             GRANT EXECUTE ON FUNCTION public.privacy_tokens_purge() TO bridgeleads_system;
             GRANT EXECUTE ON FUNCTION public.privacy_requests_due(interval) TO bridgeleads_system;
         END IF;
+        -- Retention (138): the worker purges through the function only; nobody holds the
+        -- legal-hold table (operators write it through an owner-only function).
+        IF to_regclass('public.privacy_legal_holds') IS NOT NULL THEN
+            REVOKE ALL ON privacy_legal_holds FROM PUBLIC, bridgeleads_app, bridgeleads_system;
+            GRANT EXECUTE ON FUNCTION public.privacy_retention_purge(integer)
+                TO bridgeleads_system;
+        END IF;
     END IF;
     -- Job degradations (117): worker-only history of phases that failed on a DONE
     -- job, plus the skip-trace repair queue. Nobody deletes (rows go with their job);

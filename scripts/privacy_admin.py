@@ -26,6 +26,8 @@ Commands
               rule is never lifted (erased data cannot come back).
   status      a request's events and rules
   inbox       open requests, soonest deadline first (ids, kinds, dates, last event)
+  hold        place a legal hold on a request: the 24-month retention purge skips it
+  unhold      release that hold
   show        one request's decrypted contact and details, for the operator only
 
 The database is the authority for every lifecycle rule (migration 136); this script only
@@ -191,7 +193,14 @@ def _commit_if_rules_load(db) -> None:
 
 
 def cmd_record(db, op, args) -> None:
-    deadline = datetime.now(UTC) + timedelta(days=args.deadline_days)
+    from src.privacy.deadlines import deadline_for
+
+    # The same rules as the web form (src/privacy/deadlines.py): 15 business days for an
+    # opt-out, 45 calendar days otherwise. --deadline-days overrides, for a request that
+    # arrived earlier than it is being recorded.
+    now = datetime.now(UTC)
+    deadline = (now + timedelta(days=args.deadline_days) if args.deadline_days
+                else deadline_for(args.kind, now))
     rid = db.execute(text(
         "SELECT privacy_record_request(:k, :c, :d, :h, :contact, :details, CAST(:a AS uuid))"),
         {"k": args.kind, "c": args.channel, "d": deadline,
@@ -203,8 +212,17 @@ def cmd_record(db, op, args) -> None:
 
 
 def cmd_event(db, op, args) -> None:
-    deadline = (datetime.now(UTC) + timedelta(days=args.extend_days)
-                if args.extend_days else None)
+    deadline = None
+    if args.extend_days:
+        # From the deadline in force (the last extension, else the original), not today.
+        current = db.execute(text(
+            "SELECT coalesce((SELECT max(deadline_at) FROM privacy_request_events "
+            "WHERE request_id = CAST(:r AS uuid) AND event_type = 'extended'), "
+            "(SELECT deadline_at FROM privacy_requests WHERE id = CAST(:r AS uuid)))"),
+            {"r": args.request}).scalar()
+        if current is None:
+            raise SystemExit("no such request")
+        deadline = current + timedelta(days=args.extend_days)
     seq = db.execute(text(
         "SELECT privacy_record_event(CAST(:r AS uuid), :t, :v, :d, :dl, CAST(:a AS uuid))"),
         {"r": args.request, "t": args.type, "v": args.verification_level,
@@ -330,6 +348,14 @@ def cmd_status(db, op, args) -> None:
     db.rollback()
 
 
+def cmd_hold(db, op, args) -> None:
+    action = "hold" if args.command == "hold" else "release"
+    db.execute(text("SELECT privacy_hold_request(CAST(:r AS uuid), :a, CAST(:o AS uuid))"),
+               {"r": args.request, "a": action, "o": op})
+    db.commit()
+    print(f"request {args.request}: legal hold {'placed' if action == 'hold' else 'released'}")
+
+
 def cmd_inbox(db, op, args) -> None:
     rows = db.execute(text(
         "SELECT r.id, r.kind, r.channel, r.received_at, coalesce("
@@ -368,7 +394,8 @@ def _parser() -> argparse.ArgumentParser:
     p = sub.add_parser("record")
     p.add_argument("--kind", required=True, choices=("opt_out", "delete", "access", "correct"))
     p.add_argument("--channel", required=True, choices=("email", "postal", "web"))
-    p.add_argument("--deadline-days", type=int, default=45)
+    p.add_argument("--deadline-days", type=int,
+                   help="override the deadline rules (src/privacy/deadlines.py)")
     p.add_argument("--contact", required=True, help="how to reach the requester (encrypted)")
     p.add_argument("--requester-email")
     p.add_argument("--details", help="free text from the request (encrypted)")
@@ -401,6 +428,8 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--result", required=True)
     sub.add_parser("status").add_argument("--request", required=True)
     sub.add_parser("inbox")
+    for name in ("hold", "unhold"):
+        sub.add_parser(name).add_argument("--request", required=True)
     sub.add_parser("show").add_argument("--request", required=True)
     return ap
 
@@ -408,7 +437,7 @@ def _parser() -> argparse.ArgumentParser:
 _COMMANDS = {"record": cmd_record, "event": cmd_event, "add-rule": cmd_add_rule,
              "candidates": cmd_candidates, "activate": cmd_activate, "held": cmd_held,
              "release": cmd_release, "lift": cmd_lift, "status": cmd_status,
-             "inbox": cmd_inbox, "show": cmd_show}
+             "inbox": cmd_inbox, "show": cmd_show, "hold": cmd_hold, "unhold": cmd_hold}
 
 
 def main(argv=None, session_factory=operator_session) -> None:

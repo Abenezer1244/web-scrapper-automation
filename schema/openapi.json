@@ -201,6 +201,36 @@
         "title": "AccountRestoreRequest",
         "type": "object"
       },
+      "Agent": {
+        "additionalProperties": false,
+        "description": "Someone acting for the person (D1: needs their signed permission).",
+        "properties": {
+          "authority": {
+            "maxLength": 1000,
+            "minLength": 1,
+            "title": "Authority",
+            "type": "string"
+          },
+          "email": {
+            "format": "email",
+            "title": "Email",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "email",
+          "authority"
+        ],
+        "title": "Agent",
+        "type": "object"
+      },
       "AlreadyDeliveredContacts": {
         "description": "Where the skip trace stands for this run's already-delivered leads.\n\nDelivered and traced are separate facts: a lead an earlier run delivered can still\nbe looked up when this run has skip trace on. The buckets partition\n``already_delivered_count`` exactly (same statement, same predicate), so they\nalways add up to the tab's number. Read from ``results`` alone: the queue tables\nare worker-only, so whether an answer was bought now or reused is not reported.",
         "properties": {
@@ -1815,6 +1845,22 @@
           "can_run"
         ],
         "title": "ConfigRunEligibilityResponse",
+        "type": "object"
+      },
+      "ConfirmIn": {
+        "additionalProperties": false,
+        "properties": {
+          "token": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Token",
+            "type": "string"
+          }
+        },
+        "required": [
+          "token"
+        ],
+        "title": "ConfirmIn",
         "type": "object"
       },
       "ConnectorCreate": {
@@ -4125,6 +4171,112 @@
           "detail"
         ],
         "title": "PlainRefusalResponse",
+        "type": "object"
+      },
+      "PrivacyRequestIn": {
+        "additionalProperties": false,
+        "description": "What the person asks and what lets the operator find their records. Every field\nis a matching hint, not proof of identity; the email only gets the link.",
+        "properties": {
+          "agent": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Agent"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "county": {
+            "anyOf": [
+              {
+                "maxLength": 60,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "County"
+          },
+          "details": {
+            "anyOf": [
+              {
+                "maxLength": 2000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Details"
+          },
+          "email": {
+            "format": "email",
+            "title": "Email",
+            "type": "string"
+          },
+          "first_name": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "First Name",
+            "type": "string"
+          },
+          "kind": {
+            "pattern": "^(opt_out|delete|access|correct)$",
+            "title": "Kind",
+            "type": "string"
+          },
+          "last_name": {
+            "maxLength": 80,
+            "minLength": 1,
+            "title": "Last Name",
+            "type": "string"
+          },
+          "parcel": {
+            "anyOf": [
+              {
+                "maxLength": 40,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parcel"
+          },
+          "property_address": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Property Address"
+          },
+          "state": {
+            "anyOf": [
+              {
+                "pattern": "^[A-Za-z]{2}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "State"
+          }
+        },
+        "required": [
+          "kind",
+          "email",
+          "first_name",
+          "last_name"
+        ],
+        "title": "PrivacyRequestIn",
         "type": "object"
       },
       "ProfileUpdate": {
@@ -10421,6 +10573,92 @@
         "summary": "Mark Read",
         "tags": [
           "notifications"
+        ]
+      }
+    },
+    "/privacy/requests": {
+      "post": {
+        "operationId": "submit_privacy_request_privacy_requests_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PrivacyRequestIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Submit Privacy Request Privacy Requests Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Submit Privacy Request",
+        "tags": [
+          "privacy"
+        ]
+      }
+    },
+    "/privacy/requests/confirm": {
+      "post": {
+        "operationId": "confirm_privacy_request_privacy_requests_confirm_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConfirmIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Confirm Privacy Request Privacy Requests Confirm Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Confirm Privacy Request",
+        "tags": [
+          "privacy"
         ]
       }
     },

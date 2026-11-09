@@ -53,10 +53,12 @@ async def _cleanup(db, *emails: str) -> None:
     await db.commit()
 
 
-async def test_the_form_is_off_until_enabled(client):
-    assert (await client.post("/privacy/requests", json=_form(_email()))).status_code == 404
+async def test_the_form_is_off_until_enabled_whatever_is_sent(client):
+    for body in (_form(_email()), {"garbage": True}, {}):
+        assert (await client.post("/privacy/requests", json=body)).status_code == 404
     assert (await client.post("/privacy/requests/confirm",
                               json={"token": "x"})).status_code == 404
+    assert (await client.post("/privacy/requests/confirm", json={})).status_code == 404
 
 
 async def test_a_submission_is_recorded_as_a_received_unverified_request(client, db, enabled):
@@ -78,12 +80,15 @@ async def test_a_submission_is_recorded_as_a_received_unverified_request(client,
         await _cleanup(db, email)
 
 
-async def test_a_repeat_is_answered_identically_and_records_nothing(client, db, enabled):
+async def test_a_repeat_is_answered_identically_records_nothing_and_costs_nothing(
+        client, db, enabled):
     email = _email()
     try:
-        first = await client.post("/privacy/requests", json=_form(email))
-        second = await client.post("/privacy/requests", json=_form(email))
-        assert (first.status_code, first.json()) == (second.status_code, second.json())
+        # More repeats than the per-address quota (3 a day): a repeat sends nothing,
+        # so it never spends it, and every answer is the same.
+        answers = [await client.post("/privacy/requests", json=_form(email)) for _ in range(5)]
+        assert {(a.status_code, json.dumps(a.json())) for a in answers} == {
+            (202, json.dumps({"status": "received"}))}
         assert len(await _requests(db, email)) == 1
     finally:
         await _cleanup(db, email)
@@ -146,5 +151,34 @@ async def test_confirm_says_the_same_thing_for_every_token(client, db, enabled):
         assert {(a.status_code, json.dumps(a.json())) for a in answers} == {
             (200, json.dumps({"status": "ok"}))}
         assert await _events(db, row.id) == ["received", "verification_sent", "verified"]
+    finally:
+        await _cleanup(db, email)
+
+
+async def test_without_redis_the_form_refuses_rather_than_running_unlimited(
+        client, db, enabled, monkeypatch):
+    import importlib
+
+    import redis.exceptions as redis_exceptions
+
+    # By module path: src.api.middleware re-exports a FUNCTION named rate_limit.
+    rl = importlib.import_module("src.api.middleware.rate_limit")
+
+    class _Down:
+        def pipeline(self):
+            return self
+
+        def __getattr__(self, name):
+            return lambda *a, **k: self
+
+        async def execute(self):
+            raise redis_exceptions.ConnectionError("down")
+
+    monkeypatch.setattr(rl, "_get_redis", lambda: _Down())
+    email = _email()
+    try:
+        r = await client.post("/privacy/requests", json=_form(email))
+        assert r.status_code == 503 and r.headers.get("retry-after")
+        assert await _requests(db, email) == []
     finally:
         await _cleanup(db, email)

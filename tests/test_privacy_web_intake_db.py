@@ -23,10 +23,12 @@ _CONFIRM = "SELECT privacy_web_confirm(:t)"
 _FUNCTIONS = (
     "privacy_web_submit(text, text, text, text, boolean, timestamptz, text)",
     "privacy_web_confirm(text)",
-    "privacy_outbox_due(integer)",
-    "privacy_outbox_sent(uuid, text, timestamptz)",
+    "privacy_outbox_claim(integer)",
+    "privacy_outbox_token(uuid, text, timestamptz)",
+    "privacy_outbox_sent(uuid)",
     "privacy_outbox_failed(uuid, text)",
     "privacy_tokens_purge()",
+    "privacy_requests_due(interval)",
 )
 
 
@@ -72,14 +74,25 @@ def _events(conn, rid) -> list[str]:
                                   "WHERE request_id = :r ORDER BY seq"), {"r": rid}).scalars())
 
 
-def _send(conn, rid) -> str:
-    """The worker's side: claim the due row, mint a token, mark it sent; returns the token."""
-    row = conn.execute(text("SELECT * FROM privacy_outbox_due(10) o JOIN privacy_email_outbox x "
-                            "ON x.id = o.outbox_id WHERE x.request_id = :r"), {"r": rid}).one()
-    assert row.contact_encrypted == "fe1:contact"
+def _claim(conn, rid):
+    return conn.execute(text("SELECT o.* FROM privacy_outbox_claim(100) o "
+                             "JOIN privacy_email_outbox x ON x.id = o.outbox_id "
+                             "WHERE x.request_id = :r"), {"r": rid}).one()
+
+
+def _token(conn, outbox) -> str:
     token = secrets.token_urlsafe(32)
-    conn.execute(text("SELECT privacy_outbox_sent(:o, :h, now() + interval '7 days')"),
-                 {"o": row.outbox_id, "h": hashlib.sha256(token.encode()).hexdigest()})
+    conn.execute(text("SELECT privacy_outbox_token(:o, :h, now() + interval '7 days')"),
+                 {"o": outbox, "h": hashlib.sha256(token.encode()).hexdigest()})
+    return token
+
+
+def _send(conn, rid) -> str:
+    """The worker's side: claim, store the token's hash, (send), mark sent."""
+    row = _claim(conn, rid)
+    assert row.contact_encrypted == "fe1:contact"
+    token = _token(conn, row.outbox_id)
+    conn.execute(text("SELECT privacy_outbox_sent(:o)"), {"o": row.outbox_id})
     return token
 
 
@@ -104,13 +117,11 @@ def test_an_agents_submission_goes_to_review_and_gets_a_receipt_without_a_link(c
     h = _submit(conn, "delete", agent=True)
     rid = _request(conn, h, "delete").id
     assert _events(conn, rid) == ["received", "in_review"]
-    row = conn.execute(text("SELECT o.outbox_id, o.email_kind FROM privacy_outbox_due(10) o "
-                            "JOIN privacy_email_outbox x ON x.id = o.outbox_id "
-                            "WHERE x.request_id = :r"), {"r": rid}).one()
+    row = _claim(conn, rid)
     assert row.email_kind == "receipt"
-    assert _sqlstate(conn, "SELECT privacy_outbox_sent(:o, :h, now() + interval '1 day')",
+    assert _sqlstate(conn, "SELECT privacy_outbox_token(:o, :h, now() + interval '1 day')",
                      o=row.outbox_id, h="a" * 64) == "BLD58"   # a receipt carries no token
-    conn.execute(text("SELECT privacy_outbox_sent(:o, NULL, NULL)"), {"o": row.outbox_id})
+    conn.execute(text("SELECT privacy_outbox_sent(:o)"), {"o": row.outbox_id})
 
 
 def test_a_repeat_within_a_day_records_nothing_but_another_kind_does(conn):
@@ -173,27 +184,68 @@ def test_expired_unknown_and_garbage_tokens_do_nothing(conn):
 
 def test_a_verification_email_cannot_be_marked_sent_without_its_token(conn):
     rid = _request(conn, _submit(conn)).id
+    outbox = _claim(conn, rid).outbox_id
+    assert _sqlstate(conn, "SELECT privacy_outbox_sent(:o)", o=outbox) == "BLD58"
+
+
+def test_an_unclaimed_row_can_be_neither_tokened_nor_marked_sent(conn):
+    rid = _request(conn, _submit(conn)).id
     outbox = conn.execute(text("SELECT id FROM privacy_email_outbox WHERE request_id = :r"),
                           {"r": rid}).scalar()
-    assert _sqlstate(conn, "SELECT privacy_outbox_sent(:o, NULL, NULL)", o=outbox) == "BLD58"
+    assert _sqlstate(conn, "SELECT privacy_outbox_token(:o, :h, now() + interval '1 day')",
+                     o=outbox, h="a" * 64) == "BLD58"
+    assert _sqlstate(conn, "SELECT privacy_outbox_sent(:o)", o=outbox) == "BLD58"
+
+
+def test_a_crash_after_sending_resends_and_both_links_stay_valid(conn):
+    rid = _request(conn, _submit(conn)).id
+    first = _claim(conn, rid).outbox_id
+    first_token = _token(conn, first)                          # emailed, then the worker dies
+    assert conn.execute(text("SELECT count(*) FROM privacy_outbox_claim(100) o "
+                             "WHERE o.outbox_id = :o"), {"o": first}).scalar() == 0  # leased
+    conn.execute(text("UPDATE privacy_email_outbox SET claimed_until = now() - interval '1 s' "
+                      "WHERE id = :o"), {"o": first})          # the lease lapses
+    again = _claim(conn, rid).outbox_id
+    assert again == first
+    _token(conn, again)
+    conn.execute(text("SELECT privacy_outbox_sent(:o)"), {"o": again})
+    _confirm(conn, first_token)                                 # the first email's link works
+    assert _events(conn, rid)[-1] == "verified"
 
 
 # ── Outbox retries and token purge ─────────────────────────────────────────────
 
 def test_a_failed_send_backs_off_and_gives_up_after_ten_attempts(conn):
     rid = _request(conn, _submit(conn)).id
-    outbox = conn.execute(text("SELECT id FROM privacy_email_outbox WHERE request_id = :r"),
-                          {"r": rid}).scalar()
-    conn.execute(text("SELECT privacy_outbox_failed(:o, 'smtp 451')"), {"o": outbox})
-    row = conn.execute(text("SELECT attempts, next_attempt_at > now() AS later, gave_up_at "
-                            "FROM privacy_email_outbox WHERE id = :o"), {"o": outbox}).one()
-    assert (row.attempts, row.later, row.gave_up_at) == (1, True, None)
-    assert conn.execute(text("SELECT count(*) FROM privacy_outbox_due(100) "
+    outbox = _claim(conn, rid).outbox_id
+    conn.execute(text("SELECT privacy_outbox_failed(:o, 'ResendError')"), {"o": outbox})
+    row = conn.execute(text("SELECT attempts, next_attempt_at > now() AS later, gave_up_at, "
+                            "claimed_until, last_error FROM privacy_email_outbox WHERE id = :o"),
+                       {"o": outbox}).one()
+    assert (row.attempts, row.later, row.gave_up_at, row.claimed_until, row.last_error) == (
+        1, True, None, None, "ResendError")
+    assert conn.execute(text("SELECT count(*) FROM privacy_outbox_claim(100) "
                              "WHERE outbox_id = :o"), {"o": outbox}).scalar() == 0
     for _ in range(9):
-        conn.execute(text("SELECT privacy_outbox_failed(:o, 'smtp 451')"), {"o": outbox})
+        conn.execute(text("SELECT privacy_outbox_failed(:o, 'ResendError')"), {"o": outbox})
     assert conn.execute(text("SELECT gave_up_at IS NOT NULL FROM privacy_email_outbox "
                              "WHERE id = :o"), {"o": outbox}).scalar() is True
+
+
+def test_a_provider_message_is_never_stored_only_an_error_class(conn):
+    rid = _request(conn, _submit(conn)).id
+    outbox = _claim(conn, rid).outbox_id
+    conn.execute(text("SELECT privacy_outbox_failed(:o, :e)"),
+                 {"o": outbox, "e": "550 mailbox jane@example.test unavailable"})
+    assert conn.execute(text("SELECT last_error FROM privacy_email_outbox WHERE id = :o"),
+                        {"o": outbox}).scalar() == "error"
+
+
+def test_a_token_has_a_checked_purpose(conn):
+    rid = _request(conn, _submit(conn)).id
+    assert _sqlstate(conn, "INSERT INTO privacy_request_tokens (request_id, purpose, "
+                           "token_hash, expires_at) VALUES (:r, 'login', :h, "
+                           "now() + interval '1 day')", r=rid, h="d" * 64) == "23514"
 
 
 def test_only_long_expired_tokens_are_purged(conn):
@@ -224,8 +276,9 @@ def test_a_role_with_no_grant_reaches_none_of_it(conn):
 
 @pytest.mark.parametrize("role, allowed", [
     ("bridgeleads_app", {"privacy_web_submit", "privacy_web_confirm"}),
-    ("bridgeleads_system", {"privacy_outbox_due", "privacy_outbox_sent", "privacy_outbox_failed",
-                            "privacy_tokens_purge"}),
+    ("bridgeleads_system", {"privacy_outbox_claim", "privacy_outbox_token",
+                            "privacy_outbox_sent", "privacy_outbox_failed",
+                            "privacy_tokens_purge", "privacy_requests_due"}),
     ("anon", set()), ("authenticated", set()), ("service_role", set()),
 ])
 def test_each_runtime_role_reaches_only_its_own_functions(conn, role, allowed):
@@ -241,7 +294,8 @@ def test_the_grant_script_restores_every_grant() -> None:
     body = (Path(__file__).resolve().parent.parent
             / "scripts/provision_rls_roles.sql").read_text(encoding="utf-8")
     for fn, role in (("privacy_web_confirm(text)", "bridgeleads_app"),
-                     ("privacy_outbox_due(integer)", "bridgeleads_system"),
+                     ("privacy_outbox_claim(integer)", "bridgeleads_system"),
+                     ("privacy_requests_due(interval)", "bridgeleads_system"),
                      ("privacy_tokens_purge()", "bridgeleads_system")):
         assert f"GRANT EXECUTE ON FUNCTION public.{fn} TO {role};" in body
     assert "REVOKE ALL ON privacy_request_tokens, privacy_email_outbox" in body

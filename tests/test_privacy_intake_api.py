@@ -146,11 +146,15 @@ async def test_confirm_says_the_same_thing_for_every_token(client, db, enabled):
     try:
         await client.post("/privacy/requests", json=_form(email))
         [row] = await _requests(db, email)
-        outbox = (await db.execute(text(
-            "SELECT id FROM privacy_email_outbox WHERE request_id = :r"), {"r": row.id})).scalar()
+        # The worker's side: claim the row, store the token's hash, mark it sent.
+        await db.execute(text("UPDATE privacy_email_outbox SET gave_up_at = now() "
+                              "WHERE sent_at IS NULL AND gave_up_at IS NULL "
+                              "AND request_id <> :r"), {"r": row.id})
+        outbox = (await db.execute(text("SELECT outbox_id FROM privacy_outbox_claim(1)"))).scalar()
         token = secrets.token_urlsafe(32)
-        await db.execute(text("SELECT privacy_outbox_sent(:o, :h, now() + interval '7 days')"),
+        await db.execute(text("SELECT privacy_outbox_token(:o, :h, now() + interval '7 days')"),
                          {"o": outbox, "h": hashlib.sha256(token.encode()).hexdigest()})
+        await db.execute(text("SELECT privacy_outbox_sent(:o)"), {"o": outbox})
         await db.commit()
         answers = [await client.post("/privacy/requests/confirm", json={"token": t})
                    for t in ("garbage", token, token)]

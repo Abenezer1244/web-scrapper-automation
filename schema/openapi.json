@@ -3748,6 +3748,70 @@
         "title": "JobStatus",
         "type": "string"
       },
+      "LegalAcceptRequest": {
+        "additionalProperties": false,
+        "description": "POST /auth/legal/accept: the versions the dialog showed. Recorded only when they\nare exactly the current ones; otherwise 409 legal_version_changed.",
+        "properties": {
+          "accepted_privacy_version": {
+            "maxLength": 32,
+            "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+            "title": "Accepted Privacy Version",
+            "type": "string"
+          },
+          "accepted_terms_version": {
+            "maxLength": 32,
+            "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+            "title": "Accepted Terms Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "accepted_terms_version",
+          "accepted_privacy_version"
+        ],
+        "title": "LegalAcceptRequest",
+        "type": "object"
+      },
+      "LegalDocumentStatus": {
+        "properties": {
+          "accepted": {
+            "title": "Accepted",
+            "type": "boolean"
+          },
+          "current": {
+            "title": "Current",
+            "type": "string"
+          }
+        },
+        "required": [
+          "current",
+          "accepted"
+        ],
+        "title": "LegalDocumentStatus",
+        "type": "object"
+      },
+      "LegalStatusResponse": {
+        "description": "GET /auth/legal: whether this account has accepted the current versions.",
+        "properties": {
+          "privacy": {
+            "$ref": "#/components/schemas/LegalDocumentStatus"
+          },
+          "required": {
+            "title": "Required",
+            "type": "boolean"
+          },
+          "terms": {
+            "$ref": "#/components/schemas/LegalDocumentStatus"
+          }
+        },
+        "required": [
+          "required",
+          "terms",
+          "privacy"
+        ],
+        "title": "LegalStatusResponse",
+        "type": "object"
+      },
       "LegalVersions": {
         "description": "The current published Terms / Privacy versions (GET /auth/config).\n\nTyped as Literals of LEGAL_DOCUMENT_VERSIONS so OpenAPI, and the frontend's\ngenerated types (regenerated and diff-checked in its CI), carry the exact\nvalues: a backend-only version bump then fails the frontend's typecheck\ninstead of silently recording no acceptance. A RESPONSE model only, so a\nstale client can never get a 422 from it.",
         "properties": {
@@ -7444,6 +7508,80 @@
           }
         },
         "summary": "Forgot Password",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/auth/legal": {
+      "get": {
+        "description": "Whether this account has accepted the current Terms and Privacy versions.",
+        "operationId": "legal_status_auth_legal_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LegalStatusResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Legal Status",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/auth/legal/accept": {
+      "post": {
+        "description": "Record acceptance of the CURRENT versions (flow 'reaccept'). A signed-in session\nonly: an API key cannot accept terms for its owner. Stale versions (the documents\nchanged after the dialog loaded) record nothing: 409 legal_version_changed.",
+        "operationId": "accept_legal_auth_legal_accept_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LegalAcceptRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LegalStatusResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "summary": "Accept Legal",
         "tags": [
           "auth"
         ]

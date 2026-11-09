@@ -287,6 +287,12 @@ async def register_user(
 ) -> TokenResponse | RegisterResponse:
     """Dispatch to the legacy or the enumeration-safe registration flow."""
     await rate_limit(request, zone="auth")
+    if not settings.EMAIL_VERIFICATION_ENABLED:
+        # The legacy flow creates the account here; the verified flow takes
+        # acceptance at /auth/verify-email.
+        from src.api.legal_acceptance import require_current_versions_at_signup
+        require_current_versions_at_signup(body.accepted_terms_version,
+                                           body.accepted_privacy_version)
     if settings.EMAIL_VERIFICATION_ENABLED:
         return await _register_user_verified(body, request, response, background_tasks, db)
     return await _register_user_legacy(body, request, response, db)
@@ -475,6 +481,10 @@ async def verify_user_email(
     the real account from the pending row, and auto-login (mint session tokens).
     """
     await rate_limit(request, zone="auth")
+    # Before the single-use token is touched: a refusal must not burn the link.
+    from src.api.legal_acceptance import require_current_versions_at_signup
+    require_current_versions_at_signup(body.accepted_terms_version,
+                                       body.accepted_privacy_version)
     import jwt
 
     # Catch ONLY the JWT error -> generic 400. Any other exception (e.g. a

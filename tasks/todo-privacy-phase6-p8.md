@@ -87,4 +87,7 @@ subject; the operator acts within the opt-out deadline, alerted by the beat).
 - [ ] P8f frontend: form, confirm page, footer, policy link, BFF allowlist; tests.
 
 ## Review
-(at the end)
+- P8a-P8f built. Codex: consult, build rounds 1-3 (round 3 GO), frontend GO after one fix.
+- Tests: every new/affected test green locally (48 backend P8 tests, 10 BFF unit tests).
+- Off by default: PRIVACY_INTAKE_ENABLED (API 404) and NEXT_PUBLIC_PRIVACY_FORM_ENABLED (footer).
+- Owner: merge, Cloudflare Email Routing, counsel review of copy and deadline rules, then enable.

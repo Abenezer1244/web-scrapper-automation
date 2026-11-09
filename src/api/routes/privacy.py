@@ -83,8 +83,9 @@ class ConfirmIn(BaseModel):
     token: str = Field(min_length=1, max_length=256)
 
 
-# Every answer takes at least this long: a repeat (no insert, no quota) or a garbage
-# token is otherwise measurably faster than a new request or a real confirmation.
+# Every answer takes at least this long: a repeat (same quotas, but no insert and no
+# email) or a garbage token is otherwise measurably faster than a new request or a real
+# confirmation.
 _FLOOR_S = 0.6
 
 

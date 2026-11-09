@@ -407,7 +407,7 @@ def main() -> int:
                     property_state=r.state,
                     property_zip=r.property_zip,
                 )
-                plans.append((r, action, new_mailing, source, status, flags))
+                plans.append((r, action, new_mailing, source, status, flags, attempts))
                 totals[action] += 1
                 statuses[status] = statuses.get(status, 0) + 1
                 fh.write(json.dumps({
@@ -420,7 +420,7 @@ def main() -> int:
                       f"{new_mailing!r} [{source}] absentee={flags['absentee_owner']} "
                       f"out_of_state={flags['out_of_state_owner']}")
             if args.apply:
-                for r, action, new_mailing, source, status, flags in plans:
+                for r, action, new_mailing, source, status, flags, attempts in plans:
                     common = {
                         "id": r.id, "old": r.mailing_address, "old_property": r.property_address,
                         "status": status, "attempts": attempts,

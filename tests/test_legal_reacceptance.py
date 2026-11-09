@@ -148,3 +148,23 @@ def test_every_exemption_names_a_real_route():
     from main import app
     routes = {(m.upper(), path) for path, ops in app.openapi()["paths"].items() for m in ops}
     assert sorted(_EXEMPT - routes) == []
+
+
+async def test_enforced_the_profile_gate_stays_reachable(client, business_token, enforced):
+    """An incomplete profile is sent to PUT /auth/profile; the legal gate must not trap it."""
+    r = await client.put("/auth/profile", json={"first_name": "Ann", "last_name": "Example"},
+                         headers=_bearer(business_token))
+    assert r.status_code == 200
+
+
+async def test_two_simultaneous_accepts_both_succeed_and_record_once(
+        client, db, business_user, business_token):
+    import asyncio
+    try:
+        answers = await asyncio.gather(*(
+            client.post("/auth/legal/accept", json=_CURRENT, headers=_bearer(business_token))
+            for _ in range(2)))
+        assert [a.status_code for a in answers] == [200, 200]
+        assert len(await _rows(db, business_user.id)) == 2
+    finally:
+        await _cleanup(db, business_user.id)

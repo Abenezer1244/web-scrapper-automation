@@ -322,7 +322,7 @@ async def accept_legal(
     """Record acceptance of the CURRENT versions (flow 'reaccept'). A signed-in session
     only: an API key cannot accept terms for its owner. Stale versions (the documents
     changed after the dialog loaded) record nothing: 409 legal_version_changed."""
-    from src.api.legal_acceptance import VERSION_CHANGED_DETAIL, accepted_documents
+    from src.api.legal_acceptance import VERSION_CHANGED_DETAIL
     from src.config.constants import LEGAL_DOCUMENT_VERSIONS
     from src.db.models import LegalAcceptance
 
@@ -331,10 +331,13 @@ async def accept_legal(
     if submitted != LEGAL_DOCUMENT_VERSIONS:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT,
                             detail=VERSION_CHANGED_DETAIL)
-    already = await accepted_documents(db, current_user.id)
-    db.add_all([LegalAcceptance(user_id=current_user.id, document=d, version=v,
-                                flow="reaccept")
-                for d, v in LEGAL_DOCUMENT_VERSIONS.items() if d not in already])
+    # Idempotent under concurrency (two tabs agreeing at once): the unique
+    # (user_id, document, version) makes the second insert a no-op, not a 500.
+    await db.execute(
+        pg_insert(LegalAcceptance)
+        .values([{"user_id": current_user.id, "document": d, "version": v,
+                  "flow": "reaccept"} for d, v in LEGAL_DOCUMENT_VERSIONS.items()])
+        .on_conflict_do_nothing(constraint="uq_legal_acceptances_user_doc_version"))
     await db.commit()
     return await legal_status(current_user, db)
 

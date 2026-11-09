@@ -33,6 +33,8 @@ _EXEMPT = frozenset({
     ("GET", "/auth/me"),
     ("GET", "/auth/legal"),
     ("POST", "/auth/legal/accept"),
+    # Where an incomplete profile is sent to finish it (Codex 3d review).
+    ("PUT", "/auth/profile"),
     # Securing the account.
     ("GET", "/auth/sessions"),
     ("DELETE", "/auth/sessions/{session_id}"),

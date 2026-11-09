@@ -287,12 +287,12 @@ async def register_user(
 ) -> TokenResponse | RegisterResponse:
     """Dispatch to the legacy or the enumeration-safe registration flow."""
     await rate_limit(request, zone="auth")
-    if not settings.EMAIL_VERIFICATION_ENABLED:
-        # The legacy flow creates the account here; the verified flow takes
-        # acceptance at /auth/verify-email.
-        from src.api.legal_acceptance import require_current_versions_at_signup
-        require_current_versions_at_signup(body.accepted_terms_version,
-                                           body.accepted_privacy_version)
+    # Both flows (Codex 3d review): with acceptance required, a signup that does not
+    # submit the current versions is refused here; the verified flow ALSO records them
+    # at /auth/verify-email from whoever proves the address.
+    from src.api.legal_acceptance import require_current_versions_at_signup
+    require_current_versions_at_signup(body.accepted_terms_version,
+                                       body.accepted_privacy_version)
     if settings.EMAIL_VERIFICATION_ENABLED:
         return await _register_user_verified(body, request, response, background_tasks, db)
     return await _register_user_legacy(body, request, response, db)

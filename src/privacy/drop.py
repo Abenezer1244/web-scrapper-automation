@@ -105,10 +105,14 @@ class DropFormatError(ValueError):
 
 @dataclass(frozen=True)
 class Limits:
-    max_zip_bytes: int = 128 * 1024 * 1024
+    """Bounds on a download. Members are streamed row by row, so memory is bounded by
+    the rows kept (max_rows), not by the archive's size."""
+    max_zip_bytes: int = 64 * 1024 * 1024
     max_members: int = 16
-    max_uncompressed_bytes: int = 512 * 1024 * 1024
-    max_rows: int = 4_000_000
+    max_uncompressed_bytes: int = 256 * 1024 * 1024   # all members together
+    max_ratio: int = 100                               # per member, decompressed:compressed
+    ratio_floor_bytes: int = 64 * 1024                 # tiny members are exempt from the ratio
+    max_rows: int = 2_000_000                          # all members together
     max_line_chars: int = 256
 
 
@@ -124,30 +128,101 @@ class ParsedDownload:
     list_files: dict[str, str] = field(default_factory=dict)
 
 
-def _read_member(zf: zipfile.ZipFile, info: zipfile.ZipInfo, budget: int) -> bytes:
-    """The member's bytes, refusing more than ``budget`` actually decompressed (the
-    declared size in the archive is not trusted)."""
-    out = bytearray()
-    with zf.open(info) as fh:
-        while chunk := fh.read(64 * 1024):
-            out += chunk
-            if len(out) > budget:
-                raise DropFormatError("download exceeds the uncompressed size limit")
-    return bytes(out)
+class _Budget:
+    """Decompressed bytes and rows left for the whole archive."""
+
+    def __init__(self, limits: Limits):
+        self.bytes = limits.max_uncompressed_bytes
+        self.rows = limits.max_rows
 
 
-def _rows(data: bytes, name: str, limits: Limits) -> tuple[list[str], list[list[str]]]:
-    try:
-        textual = data.decode("utf-8-sig")
-    except UnicodeDecodeError:
-        raise DropFormatError(f"{name}: not UTF-8") from None
-    lines = textual.splitlines()
-    if any(len(line) > limits.max_line_chars for line in lines):
-        raise DropFormatError(f"{name}: a line exceeds the length limit")
-    parsed = [row for row in csv.reader(lines, strict=True) if row]
-    if not parsed:
+def _ratio_cap(info: zipfile.ZipInfo, limits: Limits) -> int:
+    return max(limits.max_ratio * max(info.compress_size, 1), limits.ratio_floor_bytes)
+
+
+class _CappedReader(io.RawIOBase):
+    """A member's decompressed bytes, counted as they are read: past the archive budget
+    or the member's compression-ratio cap the read is refused (the sizes the archive
+    declares are not trusted)."""
+
+    def __init__(self, raw, info: zipfile.ZipInfo, budget: _Budget, limits: Limits):
+        self._raw = raw
+        self._budget = budget
+        self._read = 0
+        self._cap = _ratio_cap(info, limits)
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buf) -> int:
+        n = self._raw.readinto(buf)
+        self._read += n
+        self._budget.bytes -= n
+        if self._budget.bytes < 0:
+            raise DropFormatError("download exceeds the uncompressed size limit")
+        if self._read > self._cap:
+            raise DropFormatError("a file in the download exceeds the compression-ratio limit")
+        return n
+
+    def close(self) -> None:
+        self._raw.close()
+        super().close()
+
+
+def _lines(text_stream, name: str, limits: Limits):
+    """Lines of at most max_line_chars (line end excluded), read one at a time."""
+    while True:
+        try:
+            line = text_stream.readline(limits.max_line_chars + 3)
+        except UnicodeDecodeError:
+            raise DropFormatError(f"{name}: not UTF-8") from None
+        if not line:
+            return
+        if len(line.rstrip("\r\n")) > limits.max_line_chars:
+            raise DropFormatError(f"{name}: a line exceeds the length limit")
+        yield line
+
+
+def _member_rows(zf: zipfile.ZipFile, info: zipfile.ZipInfo, budget: _Budget,
+                 limits: Limits):
+    """(lowercased header, row iterator) for one member, streamed from a bounded reader;
+    each row counts against the archive's row budget."""
+    name = info.filename
+    # Cheap early refusal on the declared size; the streamed count is the real limit.
+    if info.file_size > budget.bytes or info.file_size > _ratio_cap(info, limits):
+        raise DropFormatError("a file in the download exceeds the size or ratio limit")
+    stream = io.TextIOWrapper(
+        io.BufferedReader(_CappedReader(zf.open(info), info, budget, limits), 64 * 1024),
+        encoding="utf-8-sig", newline="")
+    reader = csv.reader(_lines(stream, name, limits), strict=True)
+
+    def _next() -> list[str] | None:
+        try:
+            for row in reader:
+                if row:
+                    return row
+        except csv.Error:
+            raise DropFormatError(f"{name}: malformed CSV") from None
+        except (zipfile.BadZipFile, EOFError):
+            raise DropFormatError(f"{name}: unreadable") from None
+        return None
+
+    header = _next()
+    if header is None:
+        stream.close()
         raise DropFormatError(f"{name}: no header row")
-    return [h.strip().lower() for h in parsed[0]], parsed[1:]
+
+    def _rows():
+        try:
+            while (row := _next()) is not None:
+                budget.rows -= 1
+                if budget.rows < 0:
+                    raise DropFormatError("download exceeds the row limit")
+                yield row
+        finally:
+            stream.close()
+
+    return [h.strip().lower() for h in header], _rows()
 
 
 def _check_row(row: list[str], width: int, name: str) -> tuple[str, str]:
@@ -162,13 +237,16 @@ def _check_row(row: list[str], width: int, name: str) -> tuple[str, str]:
 
 
 def parse_download(blob: bytes, limits: Limits = Limits()) -> ParsedDownload:
-    """Parse a DROP download ZIP, entirely in memory (nothing is extracted to disk).
+    """Parse a DROP download ZIP in memory (nothing is extracted to disk), streaming each
+    CSV row by row from a bounded reader.
 
-    Refused (DropFormatError): an oversize archive, too many members, a member name that
-    is a path (traversal), a directory or anything that is not a DROP CSV name (nested
-    archives included), two files of one DataType, a header other than Id,Hash (any
-    case: the spec shows both `Id,Hash` and `ID,Hash`) or Id,Hash,ListType for Removed,
-    a malformed Id or Hash, one Id with two hashes, or more rows than the limit.
+    Refused (DropFormatError): an oversize archive, too many members, more decompressed
+    bytes than the budget or a member past the compression-ratio cap (zip bombs), a
+    member name that is a path (traversal), a directory or anything that is not a DROP
+    CSV name (nested archives included), two files of one DataType, a header other than
+    Id,Hash in any case (the spec writes `ID,Hash` for downloads, `Id,Status` for
+    uploads) or ID,Hash,ListType for Removed, a malformed Id or Hash, one Id with two
+    hashes (per list, Removed included), an over-long line, or more rows than the limit.
     """
     if len(blob) > limits.max_zip_bytes:
         raise DropFormatError("download exceeds the ZIP size limit")
@@ -181,8 +259,7 @@ def parse_download(blob: bytes, limits: Limits = Limits()) -> ParsedDownload:
         raise DropFormatError("download has too many files")
     out = ParsedDownload()
     seen_types: set[str] = set()
-    budget = limits.max_uncompressed_bytes
-    rows_total = 0
+    budget = _Budget(limits)
     for info in infos:
         name = info.filename
         if ("/" in name or "\\" in name or ".." in name or ":" in name
@@ -193,36 +270,38 @@ def parse_download(blob: bytes, limits: Limits = Limits()) -> ParsedDownload:
         if data_type in seen_types:
             raise DropFormatError(f"download contains two {data_type} files")
         seen_types.add(data_type)
-        data = _read_member(zf, info, budget)
-        budget -= len(data)
-        header, rows = _rows(data, name, limits)
-        rows_total += len(rows)
-        if rows_total > limits.max_rows:
-            raise DropFormatError("download exceeds the row limit")
+        header, rows = _member_rows(zf, info, budget, limits)
         if data_type == "Removed":
             if header != ["id", "hash", "listtype"]:
                 raise DropFormatError(f"{name}: header is not ID,Hash,ListType")
-            kept = 0
+            # One Id, one hash, per list type: the same rule as the lists themselves.
+            removed_by_id: dict[tuple[str, str], str] = {}
             for row in rows:
                 drop_id, hash_ = _check_row(row, 3, name)
                 list_type = row[2].strip()
+                if list_type not in _KEPT and list_type not in _IGNORED:
+                    raise DropFormatError(f"{name}: a row has an unknown ListType")
+                if removed_by_id.setdefault((list_type, drop_id), hash_) != hash_:
+                    raise DropFormatError(f"{name}: one Id carries two hashes")
+            kept = 0
+            for (list_type, drop_id), hash_ in removed_by_id.items():
                 if list_type in _KEPT:
                     out.removed.append((_KEPT[list_type], drop_id, hash_))
                     kept += 1
-                elif list_type in _IGNORED:
+                else:
                     key = f"removed_{list_type}"
                     out.ignored_counts[key] = out.ignored_counts.get(key, 0) + 1
-                else:
-                    raise DropFormatError(f"{name}: a row has an unknown ListType")
             out.list_counts[REMOVED] = kept
             out.list_files[REMOVED] = name
             continue
         if header != ["id", "hash"]:
             raise DropFormatError(f"{name}: header is not Id,Hash")
         if data_type in _IGNORED:
+            count = 0
             for row in rows:
                 _check_row(row, 2, name)
-            out.ignored_counts[data_type] = len(rows)
+                count += 1
+            out.ignored_counts[data_type] = count
             continue
         list_type = _KEPT[data_type]
         by_id: dict[str, str] = {}

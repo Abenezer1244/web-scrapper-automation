@@ -168,6 +168,58 @@ def test_bounds_are_enforced():
         drop.parse_download(b"this is not a zip")
 
 
+def test_the_row_and_byte_budgets_span_all_files():
+    email = _csv("ID,Hash", [(_id(i), _h(f"e{i}")) for i in range(30)])
+    phone = _csv("ID,Hash", [(_id(i), _h(f"p{i}")) for i in range(30)])
+    blob = _zip({"20260312_4821_Email.csv": email, "20260312_4821_Phone.csv": phone})
+    assert len(drop.parse_download(blob, drop.Limits(max_rows=60)).items) == 60
+    for limits in (drop.Limits(max_rows=59),
+                   drop.Limits(max_uncompressed_bytes=len(email) + len(phone) - 1)):
+        with pytest.raises(drop.DropFormatError):
+            drop.parse_download(blob, limits)
+
+
+def test_a_zip_bomb_is_refused_by_the_ratio_cap():
+    """A member that inflates far past 100:1 (here about 1000:1) is refused before its
+    rows are read, though it is well inside the total size budget."""
+    bomb = _zip({"20260312_4821_NDZ.csv": "ID,Hash\r\n" + "\r\n" * 2_000_000})
+    info = zipfile.ZipFile(io.BytesIO(bomb)).infolist()[0]
+    assert info.file_size > 100 * info.compress_size  # it really is a high-ratio member
+    assert info.file_size < drop.Limits().max_uncompressed_bytes
+    with pytest.raises(drop.DropFormatError, match="ratio"):
+        drop.parse_download(bomb)
+    # A small member is exempt from the ratio (a header-only file compresses badly).
+    assert drop.parse_download(_zip({"20260312_4821_Email.csv": _GOOD})).list_counts == {
+        "email": 1}
+
+
+def test_a_member_whose_declared_size_was_tampered_with_is_refused():
+    """The reader never trusts the archive's declared size: shrinking it in the central
+    directory and the local header truncates the stream, which then fails its CRC."""
+    blob = bytearray(_zip({"20260312_4821_Email.csv": _GOOD}))
+    real = len(_GOOD)
+    for sig, offset in ((b"PK\x03\x04", 22), (b"PK\x01\x02", 24)):
+        at = blob.index(sig) + offset
+        assert int.from_bytes(blob[at:at + 4], "little") == real
+        blob[at:at + 4] = (real - 10).to_bytes(4, "little")
+    with pytest.raises(drop.DropFormatError):
+        drop.parse_download(bytes(blob))
+
+
+def test_removed_rows_carry_one_hash_per_id_and_list():
+    def removed(rows):
+        return drop.parse_download(_zip({"20260312_4821_Removed.csv":
+                                         _csv("ID,Hash,ListType", rows)}))
+    # Repeated row: kept once. The same Id on two lists is two items.
+    same = removed([(_id(1), _h("a"), "Email"), (_id(1), _h("a"), "Email"),
+                    (_id(1), _h("p"), "Phone")])
+    assert sorted(same.removed) == [("email", _id(1), _h("a")), ("phone", _id(1), _h("p"))]
+    for rows in ([(_id(1), _h("a"), "Email"), (_id(1), _h("b"), "Email")],
+                 [(_id(2), _h("a"), "NDZ"), (_id(2), _h("b"), "NDZ")]):
+        with pytest.raises(drop.DropFormatError, match="two hashes"):
+            removed(rows)
+
+
 def test_a_refusal_never_echoes_the_data():
     secret = _h("secret-hash")
     with pytest.raises(drop.DropFormatError) as err:

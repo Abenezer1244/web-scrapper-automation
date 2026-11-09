@@ -559,6 +559,35 @@ BEGIN
                 FROM PUBLIC, bridgeleads_app;
             GRANT EXECUTE ON FUNCTION public.privacy_review_release_rows() TO bridgeleads_system;
         END IF;
+        -- Web-form intake (137): no runtime role holds its tables; the API submits and
+        -- confirms, and the worker sends the outbox, only through definer functions.
+        IF to_regclass('public.privacy_email_outbox') IS NOT NULL THEN
+            REVOKE ALL ON privacy_request_tokens, privacy_email_outbox
+                FROM PUBLIC, bridgeleads_app, bridgeleads_system;
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+                REVOKE ALL ON privacy_request_tokens, privacy_email_outbox FROM anon;
+            END IF;
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+                REVOKE ALL ON privacy_request_tokens, privacy_email_outbox FROM authenticated;
+            END IF;
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
+                REVOKE ALL ON privacy_request_tokens, privacy_email_outbox FROM service_role;
+            END IF;
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bridgeleads_purge') THEN
+                REVOKE ALL ON privacy_request_tokens, privacy_email_outbox FROM bridgeleads_purge;
+            END IF;
+            GRANT EXECUTE ON FUNCTION public.privacy_web_submit(text, text, text, text,
+                boolean, timestamptz, text) TO bridgeleads_app;
+            GRANT EXECUTE ON FUNCTION public.privacy_web_confirm(text) TO bridgeleads_app;
+            GRANT EXECUTE ON FUNCTION public.privacy_outbox_claim(integer) TO bridgeleads_system;
+            GRANT EXECUTE ON FUNCTION public.privacy_outbox_token(uuid, text, timestamptz)
+                TO bridgeleads_system;
+            GRANT EXECUTE ON FUNCTION public.privacy_outbox_sent(uuid) TO bridgeleads_system;
+            GRANT EXECUTE ON FUNCTION public.privacy_outbox_failed(uuid, text)
+                TO bridgeleads_system;
+            GRANT EXECUTE ON FUNCTION public.privacy_tokens_purge() TO bridgeleads_system;
+            GRANT EXECUTE ON FUNCTION public.privacy_requests_due(interval) TO bridgeleads_system;
+        END IF;
     END IF;
     -- Job degradations (117): worker-only history of phases that failed on a DONE
     -- job, plus the skip-trace repair queue. Nobody deletes (rows go with their job);

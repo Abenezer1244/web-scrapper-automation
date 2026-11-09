@@ -67,6 +67,17 @@ _ZONES: dict[str, tuple[int, int]] = {
     # an image (CPU), so it fails CLOSED (_FALLBACK_ZONES). 20/hour covers a user
     # trying a few photos; nobody changes their photo every few seconds.
     "avatar": (20, 3600),
+    # POST /privacy/requests (Phase 6 P8): every valid submission sends an email to an
+    # address nobody has proven they own, so the form must not become a mail cannon.
+    # Per IP, per /24 (or /48), per address, per address domain, and one global daily
+    # budget. They REFUSE (503) while Redis is down (_HARD_FAIL_ZONES): a per-process
+    # fallback would multiply the global budget by the number of API processes.
+    # Confirm shares the per-IP bucket.
+    "privacy_ip": (10, 3600),
+    "privacy_net": (30, 3600),
+    "privacy_address": (3, 86400),
+    "privacy_domain": (100, 86400),
+    "privacy_budget": (500, 86400),
 }
 
 _redis_client: aioredis.Redis | None = None
@@ -202,6 +213,11 @@ def client_ip(request: Request) -> str:
 _FALLBACK_ZONES = frozenset(
     {"auth", "webhook", "stripe", "export", "writes", "lookup_quote", "avatar"}
 )
+# Zones that refuse outright while Redis is down: their limit is global (one shared send
+# budget), which a per-process fallback cannot enforce (Codex review of Phase 6 P8).
+_HARD_FAIL_ZONES = frozenset(
+    {"privacy_ip", "privacy_net", "privacy_address", "privacy_domain", "privacy_budget"}
+)
 # Insertion-ordered (dict preserves order), so the oldest keys are the cheapest
 # to find when we need to reclaim space.
 _fallback_hits: dict[str, list[float]] = {}
@@ -298,6 +314,12 @@ async def rate_limit(request: Request, zone: str = "general", identifier: str | 
             "rate_limit fail-open: Redis error while checking zone=%s key=%s: %s",
             zone, redis_key, exc,
         )
+        if zone in _HARD_FAIL_ZONES:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Temporarily unavailable. Please try again later.",
+                headers={"Retry-After": "60"},
+            )
         # I2: for security-critical zones, fall back to a per-process limiter
         # instead of fully failing open — a Redis incident must not hand an
         # attacker an unthrottled /auth/login or webhook-spray window.

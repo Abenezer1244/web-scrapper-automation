@@ -209,3 +209,27 @@ def test_an_operator_without_mfa_is_refused(c):
     _q(c, "UPDATE users SET mfa_enabled = false WHERE email_hmac = :h", h=blind_index(email))
     with pytest.raises(DBAPIError):
         _run(c, email, "record", "--kind", "opt_out", "--channel", "email", "--contact", "x")
+
+
+def test_inbox_lists_open_requests_and_show_decrypts_one_for_the_operator(c, capsys):
+    email = _admin(c)
+    rid = _verified_request(c, email, "opt_out")
+    capsys.readouterr()
+    _run(c, email, "inbox")
+    out = capsys.readouterr().out
+    assert rid in out and "last: verified" in out
+    _run(c, email, "show", "--request", rid)
+    assert "contact: by email" in capsys.readouterr().out
+    _run(c, email, "event", "--request", rid, "--type", "decided", "--decision-code",
+         "suppressed")
+    capsys.readouterr()
+    _run(c, email, "inbox")
+    assert rid not in capsys.readouterr().out                 # decided: no longer open
+
+
+def test_a_reader_command_also_needs_an_admin_with_mfa(c):
+    email = _admin(c)
+    _q(c, "UPDATE users SET mfa_enabled = false WHERE email_hmac = :h", h=blind_index(email))
+    for argv in (("inbox",), ("show", "--request", str(uuid.uuid4()))):
+        with pytest.raises(DBAPIError):
+            _run(c, email, *argv)

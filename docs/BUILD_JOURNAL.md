@@ -19,6 +19,51 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-11-09 — Privacy: the public request form, its email and deadlines (compliance Phase 6 P8)
+
+**Built / Shipped:** branch `feat/privacy-phase6-p8` + bridgeleads-web `feat/privacy-request-form`
+(owner: "fix and do all yourself"). Plan, reconciliations and review log:
+`tasks/todo-privacy-phase6-p8.md`. Off until the owner sets `PRIVACY_INTAKE_ENABLED` (backend) and
+`NEXT_PUBLIC_PRIVACY_FORM_ENABLED` (frontend footer link) after counsel reviews the copy (D9).
+- Migration 137: a web submission IS the received request (statutory clock), recorded unverified
+  through `privacy_web_submit()`; `privacy_web_confirm()` consumes a single-use, purpose-checked token
+  (only its SHA-256 stored); durable outbox with a 15-minute claim; worker-only readers for the
+  outbox and the deadline alert. No role gains a table privilege; the grant script restores grants.
+- `src/privacy/deadlines.py`: opt-out 15 business days (weekends + observed federal holidays),
+  others 45 calendar days, California time, versioned rules (owner defaults pending counsel).
+- `POST /privacy/requests` + `/confirm`: identical answers, 0.6 s floor, gate before validation,
+  five rate-limit zones that refuse (503) without Redis, nothing personal logged or audited.
+- Worker: sends one email per submission (receipt + one-time link; no submitted data, no claim of
+  completion); daily alerts at 7 and 2 days. CLI `inbox` and `show` (admin + MFA checked).
+- Frontend: public BFF `/api/privacy` (Origin allowlist, field allowlist, client-IP assertion), the
+  form, a confirm page that acts only on a click with the token read from the URL fragment, footer
+  link behind a flag, the pages excluded from analytics.
+- Also today: PR #613 (assumed-mailing backfill reused the last row's attempt count); bridgeleads-web
+  #323 (legal pages pointed at bridgeleads.com, a domain someone else owns); `PRIVACY_ENFORCEMENT_VERSION=1`
+  set on api, worker, beat (skip-deploys).
+
+**Tried / Decided:** v1 kept submissions in a pending table until confirmed; Codex showed the clock
+starts on receipt, so v2 records the request at once. Quota for repeats: round 1 said repeats must
+not spend it, round 2 showed that makes the 429 an oracle; settled for enumeration safety (every
+valid submission charged alike). Not adopted: CAPTCHA (needs owner Cloudflare setup), ASN limits,
+provisional suppression of an unverified opt-out (the operator acts within the deadline, alerted).
+
+**Failed / Blocked:** I cannot merge (the permission classifier treats `gh pr merge` as a production
+deploy) or configure Cloudflare. Git Bash heredocs broke on nested quotes again: wrote the edit
+scripts to files instead. Local Redis was down mid-run; the new zones then refused, as designed.
+
+**Caught & fixed:** Codex consult (6 High), build round 1 (2 High, 5 Medium), round 2 (2 High,
+2 Medium), frontend (1 Medium), round 3 GO. Mine: downgrade guard keyed on channel 'web' (operators
+use it too); the confirm page acted on load (a JS-running mail scanner could confirm).
+
+**Pending / Handoff:** owner: merge #613, #323 and the two P8 PRs; Cloudflare Email Routing for
+privacy@, security@, legal@, support@ bridgeleads.io; counsel review of D1-D9, the deadline rules and
+the page copy; then enable the form. Legal (Codex, for counsel): DROP retrieval duties for registered
+data brokers from 2026-08-01 (D8).
+
+**Facts learned:** a FastAPI route dependency runs before body validation (a disabled route can 404
+every body). `src.api.middleware` re-exports a function named `rate_limit` that shadows the module.
+
 ## 2026-11-08 — Privacy: activation, the operator side (compliance Phase 6 P7)
 
 **Built / Shipped:** branch `feat/privacy-phase6-p7` (owner "approved" P7; O1 CLI first, O2 delete

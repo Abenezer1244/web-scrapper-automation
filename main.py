@@ -14,6 +14,7 @@ from src.api import (
     email_prefs_router,
     jobs_router,
     notifications_router,
+    privacy_router,
     scrapers_router,
     segments_router,
     webhooks_router,
@@ -107,6 +108,7 @@ app.include_router(batches_router)
 app.include_router(notifications_router)
 app.include_router(analytics_router)
 app.include_router(email_prefs_router)
+app.include_router(privacy_router)
 
 
 # ─── Global exception handler ─────────────────────────────────────────────────

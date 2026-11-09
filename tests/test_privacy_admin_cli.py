@@ -225,3 +225,11 @@ def test_inbox_lists_open_requests_and_show_decrypts_one_for_the_operator(c, cap
     capsys.readouterr()
     _run(c, email, "inbox")
     assert rid not in capsys.readouterr().out                 # decided: no longer open
+
+
+def test_a_reader_command_also_needs_an_admin_with_mfa(c):
+    email = _admin(c)
+    _q(c, "UPDATE users SET mfa_enabled = false WHERE email_hmac = :h", h=blind_index(email))
+    for argv in (("inbox",), ("show", "--request", str(uuid.uuid4()))):
+        with pytest.raises(DBAPIError):
+            _run(c, email, *argv)

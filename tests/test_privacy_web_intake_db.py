@@ -226,7 +226,14 @@ def test_a_failed_send_backs_off_and_gives_up_after_ten_attempts(conn):
         1, True, None, None, "ResendError")
     assert conn.execute(text("SELECT count(*) FROM privacy_outbox_claim(100) "
                              "WHERE outbox_id = :o"), {"o": outbox}).scalar() == 0
-    for _ in range(9):
+    # Without the claim, a failure report changes nothing (a lapsed worker's late report).
+    conn.execute(text("SELECT privacy_outbox_failed(:o, 'ResendError')"), {"o": outbox})
+    assert conn.execute(text("SELECT attempts FROM privacy_email_outbox WHERE id = :o"),
+                        {"o": outbox}).scalar() == 1
+    for _ in range(9):  # each retry comes due, is claimed again and fails again
+        conn.execute(text("UPDATE privacy_email_outbox SET next_attempt_at = now() "
+                          "WHERE id = :o"), {"o": outbox})
+        assert _claim(conn, rid).outbox_id == outbox
         conn.execute(text("SELECT privacy_outbox_failed(:o, 'ResendError')"), {"o": outbox})
     assert conn.execute(text("SELECT gave_up_at IS NOT NULL FROM privacy_email_outbox "
                              "WHERE id = :o"), {"o": outbox}).scalar() is True

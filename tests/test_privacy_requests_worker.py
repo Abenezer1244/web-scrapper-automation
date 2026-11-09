@@ -122,14 +122,18 @@ def test_without_an_email_key_nothing_is_sent_and_nothing_is_lost(conn, sent, mo
                         {"r": rid}).scalar() is None
 
 
-def test_the_daily_alert_lists_requests_due_soon_by_id_only(conn, monkeypatch):
-    soon, to = _submit(conn, "opt_out", days=3)
+def test_the_daily_alerts_list_requests_due_soon_by_id_only(conn, monkeypatch):
+    urgent, to = _submit(conn, "opt_out", days=1)
+    soon, _ = _submit(conn, "access", days=5)
     later, _ = _submit(conn, "delete", days=40)
     alerts = []
     import src.workers.ops_alerts as ops
     monkeypatch.setattr(ops, "send_ops_alert", lambda *a: alerts.append(a) or True)
-    result = worker.privacy_request_deadlines()
-    [(kind, _key, _subject, body)] = alerts
-    assert kind == "privacy_deadline" and soon in body and later not in body
-    assert to not in body
-    assert result["due"] >= 1
+    worker.privacy_request_deadlines()
+    by_kind = {kind: body for kind, _key, _subject, body in alerts}
+    assert set(by_kind) == {"privacy_deadline_urgent", "privacy_deadline"}
+    assert urgent in by_kind["privacy_deadline_urgent"]
+    assert soon not in by_kind["privacy_deadline_urgent"]
+    assert urgent in by_kind["privacy_deadline"] and soon in by_kind["privacy_deadline"]
+    assert later not in by_kind["privacy_deadline"]
+    assert all(to not in body for body in by_kind.values())

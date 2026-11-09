@@ -80,18 +80,24 @@ async def test_a_submission_is_recorded_as_a_received_unverified_request(client,
         await _cleanup(db, email)
 
 
-async def test_a_repeat_is_answered_identically_records_nothing_and_costs_nothing(
+async def test_a_repeat_is_answered_like_a_new_request_and_costs_the_same(
         client, db, enabled):
-    email = _email()
+    repeated, fresh = _email(), _email()
     try:
-        # More repeats than the per-address quota (3 a day): a repeat sends nothing,
-        # so it never spends it, and every answer is the same.
-        answers = [await client.post("/privacy/requests", json=_form(email)) for _ in range(5)]
-        assert {(a.status_code, json.dumps(a.json())) for a in answers} == {
-            (202, json.dumps({"status": "received"}))}
-        assert len(await _requests(db, email)) == 1
+        # A repeat records nothing, but it spends the per-address quota exactly like a
+        # new request, so the 4th attempt is refused whether or not one exists already.
+        repeats = [await client.post("/privacy/requests", json=_form(repeated))
+                   for _ in range(4)]
+        news = [await client.post("/privacy/requests", json=_form(fresh, kind=k))
+                for k in ("opt_out", "delete", "access", "correct")]
+        assert [r.status_code for r in repeats] == [r.status_code for r in news] == [
+            202, 202, 202, 429]
+        assert {json.dumps(r.json()) for r in repeats[:3] + news[:3]} == {
+            json.dumps({"status": "received"})}
+        assert len(await _requests(db, repeated)) == 1
+        assert len(await _requests(db, fresh)) == 3
     finally:
-        await _cleanup(db, email)
+        await _cleanup(db, repeated, fresh)
 
 
 async def test_an_agent_gets_the_email_and_the_request_goes_to_review(client, db, enabled):

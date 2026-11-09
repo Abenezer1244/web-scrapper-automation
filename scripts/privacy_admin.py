@@ -3,8 +3,9 @@
 Run under `railway run --service worker python scripts/privacy_admin.py <command> ...`.
 It writes through migration 136's operator functions as the migration role
 (DATABASE_URL_MIGRATE); every function checks that --operator-email is an admin with
-MFA enabled and records that user. Nothing here prints a name, an address or a contact:
-only request, rule and result ids and counts.
+MFA enabled and records that user. Only `show` prints personal data (the requester's own
+contact and request, which the operator needs to act); everything else prints request,
+rule and result ids and counts.
 
 Commands
   record      a request received by email or post (kind, channel, deadline, contact)
@@ -24,6 +25,8 @@ Commands
   lift        an opt-out ends: the rule stops and its leads are re-decided. A deletion
               rule is never lifted (erased data cannot come back).
   status      a request's events and rules
+  inbox       open requests, soonest deadline first (ids, kinds, dates, last event)
+  show        one request's decrypted contact and details, for the operator only
 
 The database is the authority for every lifecycle rule (migration 136); this script only
 builds keys from plain input and keeps the derived state (the results flag) consistent
@@ -66,7 +69,7 @@ from src.privacy.subjects import (  # noqa: E402
     person_key_value,
     phone_key_value,
 )
-from src.utils.crypto import blind_index, encrypt_field  # noqa: E402
+from src.utils.crypto import blind_index, decrypt_field, encrypt_field  # noqa: E402
 
 _SCAN_BATCH = 500
 
@@ -323,6 +326,35 @@ def cmd_status(db, op, args) -> None:
     db.rollback()
 
 
+def cmd_inbox(db, op, args) -> None:
+    rows = db.execute(text(
+        "SELECT r.id, r.kind, r.channel, r.received_at, coalesce("
+        "  (SELECT max(e.deadline_at) FROM privacy_request_events e"
+        "    WHERE e.request_id = r.id AND e.event_type = 'extended'), r.deadline_at) AS due,"
+        "  (SELECT e.event_type FROM privacy_request_events e WHERE e.request_id = r.id"
+        "    ORDER BY e.seq DESC LIMIT 1) AS last "
+        "FROM privacy_requests r WHERE NOT EXISTS (SELECT 1 FROM privacy_request_events e"
+        "  WHERE e.request_id = r.id AND e.event_type IN ('decided', 'closed', 'withdrawn')) "
+        "ORDER BY due, r.id")).all()
+    for r in rows:
+        print(f"  {r.id}  {r.kind:8} {r.channel:6} received {r.received_at:%Y-%m-%d}  "
+              f"due {r.due:%Y-%m-%d}  last: {r.last}")
+    db.rollback()
+    print(f"{len(rows)} open request(s)")
+
+
+def cmd_show(db, op, args) -> None:
+    row = db.execute(text(
+        "SELECT contact_encrypted, details_encrypted FROM privacy_request_payloads "
+        "WHERE request_id = :r"), {"r": args.request}).first()
+    db.rollback()
+    if row is None:
+        raise SystemExit("no such request, or its payload was deleted (retention)")
+    print("contact: " + decrypt_field(row.contact_encrypted))
+    if row.details_encrypted:
+        print("details: " + decrypt_field(row.details_encrypted))
+
+
 def _parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -364,12 +396,15 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--rule", required=True)
     p.add_argument("--result", required=True)
     sub.add_parser("status").add_argument("--request", required=True)
+    sub.add_parser("inbox")
+    sub.add_parser("show").add_argument("--request", required=True)
     return ap
 
 
 _COMMANDS = {"record": cmd_record, "event": cmd_event, "add-rule": cmd_add_rule,
              "candidates": cmd_candidates, "activate": cmd_activate, "held": cmd_held,
-             "release": cmd_release, "lift": cmd_lift, "status": cmd_status}
+             "release": cmd_release, "lift": cmd_lift, "status": cmd_status,
+             "inbox": cmd_inbox, "show": cmd_show}
 
 
 def main(argv=None, session_factory=operator_session) -> None:

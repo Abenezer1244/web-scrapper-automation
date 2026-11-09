@@ -1,7 +1,7 @@
 from pathlib import Path
 from typing import ClassVar, Literal
 
-from pydantic import field_validator, model_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -103,6 +103,23 @@ class Settings(BaseSettings):
     # The public privacy-request form, POST /privacy/requests (Phase 6 P8). Off (404)
     # until the page copy has counsel's review (D9) and the legal mailbox exists.
     PRIVACY_INTAKE_ENABLED: bool = False
+    # California DROP (Delete Act) list pulls (P9 foundation, src/workers/privacy_drop.py).
+    # Whether BridgeLeads must register as a data broker and process DROP is counsel's
+    # decision (D8). Nothing runs unless DROP_ENABLED is true AND DROP_API_KEY is set.
+    # The key is issued in the DROP Data Broker Portal: env only, never logged.
+    # DROP_BASE_URL: production https://api.drop.privacy.ca.gov, or the sandbox
+    # https://api.drop.privacy.ca.gov/sandbox; any other URL is refused.
+    DROP_ENABLED: bool = False
+    DROP_API_KEY: str = Field(default="", repr=False)
+    DROP_BASE_URL: str = "https://api.drop.privacy.ca.gov"
+    # Terms / Privacy acceptance (compliance Phase 3d, src/api/legal_acceptance.py).
+    # LEGAL_ACCEPTANCE_REQUIRED: signup and verify-email refuse (422) a submission
+    # without exactly the current versions. LEGAL_REACCEPT_ENFORCED: signed-in calls
+    # (sessions and API keys) from an account that has not accepted the current
+    # versions get 403 legal_acceptance_required, except the exempt routes. Turn on
+    # only after the frontend shows the acceptance dialog.
+    LEGAL_ACCEPTANCE_REQUIRED: bool = False
+    LEGAL_REACCEPT_ENFORCED: bool = False
 
     # H3 PII encryption read mode. While False (tolerant), decrypt_field() treats
     # any value that is not a valid fe1:-prefixed Fernet token as legacy

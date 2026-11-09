@@ -55,6 +55,7 @@ scrapers.json   your scrapers: counties, record types, fields, schedules, delive
                 settings (webhook secrets and access tokens are never included)
 batches.json    your batch scrapes
 runs.json       every run, with the lead file it produced (lead_file)
+legal_acceptances.json  each Terms / Privacy version you accepted, how, and when
 leads/          one CSV per finished run: the same file its Download button gives you
 
 This file contains personal information about the people in your leads. Keep it safe.
@@ -119,7 +120,7 @@ def _build_zip(user_id: str, zip_path: Path) -> None:
     """Write the account's ZIP to zip_path. Raises _TooLargeError over the row cap."""
     from src.api.results_category import download_rows_select
     from src.api.schemas import ScraperConfigResponse
-    from src.db.models import BatchRun, Job, ScraperBatch, ScraperConfig, User
+    from src.db.models import BatchRun, Job, LegalAcceptance, ScraperBatch, ScraperConfig, User
     from src.db.session import rls_sync_session
     from src.utils.data_exporter import DataExporter
     from src.utils.lead_export import config_export_options
@@ -147,6 +148,12 @@ def _build_zip(user_id: str, zip_path: Path) -> None:
         zf.writestr("scrapers.json", _json(
             [ScraperConfigResponse.model_validate(c).model_dump(mode="json") for c in configs]))
         zf.writestr("batches.json", _json([_batch(b) for b in batches]))
+        acceptances = db.scalars(select(LegalAcceptance)
+                                 .where(LegalAcceptance.user_id == user_id)
+                                 .order_by(LegalAcceptance.accepted_at)).all()
+        zf.writestr("legal_acceptances.json", _json([
+            {"document": a.document, "version": a.version, "flow": a.flow,
+             "accepted_at": a.accepted_at} for a in acceptances]))
 
         runs, total = [], 0
         for job in jobs:

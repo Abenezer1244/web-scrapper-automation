@@ -588,6 +588,41 @@ BEGIN
             GRANT EXECUTE ON FUNCTION public.privacy_tokens_purge() TO bridgeleads_system;
             GRANT EXECUTE ON FUNCTION public.privacy_requests_due(interval) TO bridgeleads_system;
         END IF;
+        -- Retention (138): the worker purges through the function only; nobody holds the
+        -- legal-hold table (operators write it through an owner-only function).
+        IF to_regclass('public.privacy_legal_holds') IS NOT NULL THEN
+            REVOKE ALL ON privacy_legal_holds FROM PUBLIC, bridgeleads_app, bridgeleads_system;
+            GRANT EXECUTE ON FUNCTION public.privacy_retention_purge(integer)
+                TO bridgeleads_system;
+        END IF;
+    END IF;
+    -- California DROP ledger (139): nobody holds the tables (the ALL TABLES grant above
+    -- would hand the worker read/write access to DROP identifiers); the worker records
+    -- pulls and reads pending hashes only through 139's definer functions.
+    IF to_regclass('public.drop_downloads') IS NOT NULL THEN
+        REVOKE ALL ON drop_downloads, drop_identifiers
+            FROM PUBLIC, bridgeleads_app, bridgeleads_system;
+        IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+            REVOKE ALL ON drop_downloads, drop_identifiers FROM anon;
+        END IF;
+        IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+            REVOKE ALL ON drop_downloads, drop_identifiers FROM authenticated;
+        END IF;
+        IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
+            REVOKE ALL ON drop_downloads, drop_identifiers FROM service_role;
+        END IF;
+        IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bridgeleads_purge') THEN
+            REVOKE ALL ON drop_downloads, drop_identifiers FROM bridgeleads_purge;
+        END IF;
+        GRANT EXECUTE ON FUNCTION public.drop_begin_download(text, jsonb, jsonb, jsonb)
+            TO bridgeleads_system;
+        GRANT EXECUTE ON FUNCTION public.drop_add_identifiers(uuid, text, text[], text[])
+            TO bridgeleads_system;
+        GRANT EXECUTE ON FUNCTION public.drop_mark_removed(text, text[], text[])
+            TO bridgeleads_system;
+        GRANT EXECUTE ON FUNCTION public.drop_last_pull() TO bridgeleads_system;
+        GRANT EXECUTE ON FUNCTION public.drop_pending_hashes(uuid, text, uuid, integer)
+            TO bridgeleads_system;
     END IF;
     -- Job degradations (117): worker-only history of phases that failed on a DONE
     -- job, plus the skip-trace repair queue. Nobody deletes (rows go with their job);

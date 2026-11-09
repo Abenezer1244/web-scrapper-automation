@@ -1,0 +1,795 @@
+openapi: 3.1.0
+info:
+  title: DROP Data Broker API
+  version: 1.2.0
+  summary: Delete Act - Data Broker Integration API
+  description: |
+    The DROP (Delete Request and Opt-out Platform) Data Broker API enables
+    data brokers to integrate with DROP to programmatically retrieve consumer
+    deletion request data and report status updates.
+
+    ## How It Works
+
+    1. **Download** - Request or download a ZIP archive of CSV files containing hashed consumer identifiers.
+    2. **Process** - Match hashed identifiers against your records and take the required action: delete, opt out, exempt, or not found.
+    3. **Upload** - Submit CSV response files reporting the status for each work item.
+
+    ## Authentication
+
+    All requests require an API key passed in the `X-API-KEY` header. API keys are
+    generated in the [Data Broker Portal](https://databroker.drop.privacy.ca.gov/Dashboard)
+    after registration and fee payment are complete.
+
+    ## Notifications
+
+    DROP sends notifications to data brokers for key events. Notifications are delivered via
+    email (default for all brokers) and optionally via webhook (configurable in the Data Broker Portal).
+
+    ### Events
+
+    | Event Name | Description | Email | Webhook |
+    | --- | --- | --- | --- |
+    | List Download Ready | Selected lists are ready for download | default | optional |
+    | Upload Confirmation | Your upload has been received and is being processed | default | optional |
+    | List Upload Processed | Your list has been processed and responses are available for review | default | optional |
+    | Amendment Confirmation | Your amendment upload has been received and is being processed | default | optional |
+    | Amendment Upload Processed | Your amendment list has been processed and is ready for review | default | optional |
+    | API Key Issued | An API key has been issued for your account | default | n/a |
+    | API Key Changed | A new API key has been issued; all previous keys have been deactivated | default | n/a |
+
+    ### Webhook Configuration
+
+    To enable webhook notifications:
+
+    1. Go to Notification settings in the Data Broker Portal.
+    2. Toggle Webhook to Active.
+    3. Enter your HTTPS endpoint URL.
+    4. Save changes.
+
+    Signing Secret:
+    When you enable webhooks, a signing secret is generated and shown in the portal. Store this
+    secret securely in your webhook receiver configuration. It is used to verify that incoming
+    webhook requests are sent by DROP. Rotate the secret as needed for security.
+
+    ### Supported Webhook Messages
+
+    | Event type | When it is sent |
+    | --- | --- |
+    | download.ready | Download package is ready |
+    | upload.received | Upload was received |
+    | upload.processed | Upload processing completed |
+    | amendment.received | Amendment upload was received |
+    | amendment.processed | Amendment processing completed |
+
+    ### Webhook HTTP Headers
+
+    Each webhook request includes:
+
+    | Header | Description |
+    | --- | --- |
+    | X-Webhook-Event-Id | Unique ID for the logical event |
+    | X-Webhook-Event-Type | Event type |
+    | X-Webhook-Delivery-Id | Unique ID for this delivery attempt |
+    | X-Webhook-Timestamp | UTC timestamp for the request |
+    | X-Webhook-Version | Webhook version |
+    | X-Webhook-Signature | HMAC-SHA256 signature |
+
+    ### Webhook Body
+
+    Each webhook request includes a JSON body:
+
+    ```json
+    {
+      "message": "message text"
+    }
+    ```
+
+    Example:
+
+    ```http
+    POST https://example.com/drop/webhook
+    Content-Type: application/json
+    X-Webhook-Event-Id: 00000000-0000-0000-0000-000000000000
+    X-Webhook-Event-Type: download.ready
+    X-Webhook-Delivery-Id: 11111111-1111-1111-1111-111111111111
+    X-Webhook-Timestamp: 2026-07-02T18:30:00.0000000Z
+    X-Webhook-Version: 1.0
+    X-Webhook-Signature: sha256=abc123...
+
+    {
+      "message": "download ready"
+    }
+    ```
+
+    ### Secret Verification
+
+    DROP signs each webhook using the data broker's webhook signing secret.
+
+    To verify:
+
+    1. Read the raw request body exactly as received.
+    2. Read `X-Webhook-Timestamp`.
+    3. Build the signing string: `<timestamp>.<raw request body>`.
+    4. Compute HMAC-SHA256 using the webhook signing secret.
+    5. Compare the hex digest to `X-Webhook-Signature` after removing the `sha256=` prefix.
+    6. Reject the request if the signature is invalid.
+
+    Example logic:
+
+    ```javascript
+    const expected = hmacSha256Hex(secret, `${timestamp}.${rawBody}`);
+    const received = signatureHeader.replace("sha256=", "");
+
+    if (constantTimeEqual(expected, received)) {
+      // valid DROP webhook
+    } else {
+      // reject
+    }
+    ```
+
+    Recommended: reject old timestamps, for example older than 5 minutes, to reduce replay risk.
+
+    ### Expected Response
+
+    Return any `2xx` status when the webhook is received successfully.
+
+    Preferred response: `HTTP/1.1 204 No Content`
+
+    DROP treats non-2xx responses as failed delivery and may retry.
+
+    ## Standardization and Hashing
+
+    DROP provides hashed identifiers. To match DROP identifiers against your own records,
+    standardize and hash the identifiers in your records using the same rules.
+
+    All hashes use **SHA-256** with UTF-8 input encoding. Hash output is **Base64**.
+
+    ### Standardization Rules
+
+    Apply the identifier-specific standardization rules before hashing.
+
+    - Email: remove all whitespace, then lowercase. Do not remove dots, plus signs, or other characters.
+    - DOB: format as `YYYYMMDD` with no separators.
+    - Phone: keep digits only, then retain the last 10 digits, or all digits if fewer than 10 remain.
+    - ZIP: Keep alphanumeric characters only, For ZIP+4, drop the +4. Convert to lowercase, remove leading zeros, and use the first five characters present
+    - Names: normalize Unicode, lowercase, transliterate supported Greek and Cyrillic characters, fold supported Latin characters to plain ASCII where possible, then keep only letters and digits.
+    - MAID: keep only hexadecimal characters (`0-9`, `a-f`), then lowercase. The standardized value must be 32 characters.
+    - VIN: keep only alphanumeric characters, then lowercase. The standardized value must be 17 characters.
+    - CTVID: keep only alphanumeric characters, then lowercase. The standardized value must be 8 to 32 characters.
+
+    ### Composite Hashing
+
+    NDZ and NameVIN use composite hashing. Each field is standardized and hashed first,
+    then the resulting Base64 hashes are concatenated in the required order and hashed again.
+
+    - NDZ uses `FirstName + LastName + DOB + ZIP`
+    - NameVIN uses `FirstName + LastName + VIN`
+
+    Names are standardized and hashed per field: first name and last name separately.
+servers:
+- url: https://api.drop.privacy.ca.gov
+  description: Production
+- url: https://api.drop.privacy.ca.gov/sandbox
+  description: Sandbox
+externalDocs:
+  description: Human-readable integration guide
+  url: ./docs.html
+tags:
+- name: Download
+  description: Request or download consumer deletion lists(s)
+- name: Upload
+  description: Submit new or amended status response files
+x-tagGroups:
+- name: Core workflow
+  tags:
+  - Download
+  - Upload
+security:
+- ApiKeyAuth: []
+paths:
+  /data/download:
+    get:
+      operationId: downloadData
+      summary: Request or download consumer deletion request data
+      description: |
+        Requests the current ZIP archive.
+
+        If the ZIP is ready, the response returns the ZIP file. If the ZIP is still being prepared,
+        the response returns a JSON message and the data broker should call `GET /data/download` again later.
+
+        The ZIP contains one CSV per selected list type. If a selected list has no new records,
+        the CSV contains only the header row. If previously delivered identifiers were removed,
+        the ZIP also includes one Removed CSV file.
+      tags:
+      - Download
+      x-codeSamples:
+      - lang: Shell
+        label: curl
+        source: |-
+          curl -X GET "https://api.drop.privacy.ca.gov/data/download" \
+            -H "accept: application/zip, application/json" \
+            -H "X-API-KEY: your-api-key-here" \
+            --output download.zip
+      - lang: PowerShell
+        label: Invoke-WebRequest
+        source: |-
+          $apiKey = "your-api-key-here"
+          $url = "https://api.drop.privacy.ca.gov/data/download"
+          $headers = @{
+              "X-API-KEY" = $apiKey
+              "Accept"    = "application/zip, application/json"
+          }
+          Invoke-WebRequest -Uri $url -Headers $headers -OutFile "download.zip"
+      security:
+      - ApiKeyAuth: []
+      responses:
+        '200':
+          description: ZIP is ready and returned, or no new consumer request data or removed identifiers are available.
+          headers:
+            Content-Disposition:
+              description: Returned when the response body is a ZIP file.
+              schema:
+                type: string
+              example: attachment; filename="20260312_4821_DROP.zip"
+          content:
+            application/zip:
+              schema:
+                type: string
+                format: binary
+              description: Binary ZIP archive containing CSV files.
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessageResponse'
+              examples:
+                noNewData:
+                  summary: No new data
+                  value:
+                    message: No new consumer request data or removed identifiers are available since your last completed download.
+        '202':
+          description: The request was received and the download package is being prepared.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessageResponse'
+              example:
+                message: No download package is available yet. Your request was received, and the package is being created.
+                  Call GET /data/download again later.
+          headers:
+            Retry-After:
+              description: Suggested number of seconds to wait before calling GET /data/download again.
+              schema:
+                type: integer
+                minimum: 1
+              example: 60
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Previous download is not complete.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessageResponse'
+              example:
+                message: Complete the current batch or contact DROP support if a re-download is needed.
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/ServerError'
+  /data/upload:
+    post:
+      operationId: uploadData
+      summary: Upload new status response files
+      description: |
+        Submit new status responses.
+
+        One or more CSV response files may be uploaded in the same request.
+
+        Each CSV must:
+        - Use the header `Id,Status`
+        - Use a downloaded file name or allowed suffix pattern
+        - Contain status codes `2`, `3`, `4`, or `5`
+        - Be uploaded as a CSV file, not a ZIP archive
+
+        The files are sent as `multipart/form-data` with the field name `files`.
+        Accepted files are queued for validation. Full row-level validation may continue after the response is returned.
+      tags:
+      - Upload
+      x-codeSamples:
+      - lang: Shell
+        label: curl
+        source: |-
+          curl -X POST "https://api.drop.privacy.ca.gov/data/upload" \
+            -H "accept: application/json" \
+            -H "X-API-KEY: your-api-key-here" \
+            -F "files=@20260312_4821_Email.csv;type=text/csv"
+      security:
+      - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+              - files
+              properties:
+                files:
+                  type: array
+                  items:
+                    type: string
+                    format: binary
+                  description: One or more CSV response files. Each file must use a downloaded file name or allowed suffix
+                    pattern and must have `Id,Status` as the header row.
+            examples:
+              uploadEmail:
+                $ref: '#/components/examples/UploadEmailFile'
+      responses:
+        '202':
+          description: At least one file was accepted and queued for validation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UploadResponse'
+              examples:
+                accepted:
+                  $ref: '#/components/examples/UploadAcceptedResponse'
+                mixed:
+                  $ref: '#/components/examples/UploadMixedResponse'
+        '400':
+          description: Request is malformed or no files were accepted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UploadResponse'
+              examples:
+                invalidHeader:
+                  $ref: '#/components/examples/UploadInvalidHeaderResponse'
+                duplicateFile:
+                  $ref: '#/components/examples/UploadDuplicateFileResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: No active download is waiting for responses.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessageResponse'
+              example:
+                message: No active download is waiting for responses. Use GET /data/download to request or download a new
+                  ZIP file.
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/ServerError'
+  /data/amend:
+    post:
+      operationId: uploadAmend
+      summary: Correct or update previously submitted status responses
+      description: |
+        Correct or update previously submitted status responses.
+
+        One or more amended CSV response files may be uploaded in the same request.
+
+        The request format is identical to `/data/upload`. Use this endpoint when you need to correct or update a response that was already submitted.
+
+        Accepted files are queued for validation. Full row-level validation may continue after the response is returned.
+      tags:
+      - Upload
+      x-codeSamples:
+      - lang: Shell
+        label: curl
+        source: |-
+          curl -X POST "https://api.drop.privacy.ca.gov/data/amend" \
+            -H "accept: application/json" \
+            -H "X-API-KEY: your-api-key-here" \
+            -F "files=@20260312_4821_Email.csv;type=text/csv"
+      security:
+      - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+              - files
+              properties:
+                files:
+                  type: array
+                  items:
+                    type: string
+                    format: binary
+                  description: One or more amended CSV response files. Same naming and schema requirements as the `/data/upload`
+                    endpoint.
+            examples:
+              amendEmail:
+                $ref: '#/components/examples/UploadEmailFile'
+      responses:
+        '202':
+          description: At least one file was accepted and queued for validation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UploadResponse'
+              examples:
+                accepted:
+                  $ref: '#/components/examples/UploadAmendAcceptedResponse'
+                mixed:
+                  $ref: '#/components/examples/UploadMixedResponse'
+        '400':
+          description: Request is malformed or no files were accepted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UploadResponse'
+              examples:
+                invalidHeader:
+                  $ref: '#/components/examples/UploadInvalidHeaderResponse'
+                duplicateFile:
+                  $ref: '#/components/examples/UploadDuplicateFileResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: The amend request cannot be processed in the current state.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessageResponse'
+              example:
+                message: The amend request cannot be processed in the current state.
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/ServerError'
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-KEY
+      description: API key issued through the Data Broker Portal. The key grants access only to the consumer deletion lists
+        selected during setup.
+  schemas:
+    ListType:
+      type: string
+      enum:
+      - NDZ
+      - Email
+      - Phone
+      - MAID
+      - NameVIN
+      - CTVID
+      description: Consumer deletion list type. Removed is a file type, not a consumer deletion list type.
+    FileNamingConvention:
+      type: object
+      description: Structure embedded in DROP CSV file names.
+      properties:
+        YYYYMMDD:
+          type: string
+          pattern: ^[0-9]{8}$
+          description: File date.
+        DataBrokerId:
+          type: string
+          pattern: ^[0-9]{4}$
+          description: Short data broker identifier, currently 4 digits.
+        DataType:
+          $ref: '#/components/schemas/DataType'
+        OptionalSuffix:
+          type: string
+          maxLength: 10
+          description: Optional suffix appended before `.csv` when uploading multiple response files for the same downloaded
+            list, for example `part01` in `20260312_4821_Email_part01.csv`.
+          pattern: ^[A-Za-z0-9]{1,10}$
+    UploadResponse:
+      type: object
+      description: Response returned after upload or amend files are accepted or rejected.
+      required:
+      - message
+      - acceptedCount
+      - rejectedCount
+      - accepted
+      - rejected
+      properties:
+        message:
+          type: string
+          description: Summary of the upload result.
+        acceptedCount:
+          type: integer
+          description: Number of files accepted for validation.
+          example: 1
+        rejectedCount:
+          type: integer
+          description: Number of files rejected before validation.
+          example: 0
+        accepted:
+          type: array
+          description: Files accepted for validation.
+          items:
+            $ref: '#/components/schemas/AcceptedFileResult'
+        rejected:
+          type: array
+          description: Files rejected before validation.
+          items:
+            $ref: '#/components/schemas/RejectedFileResult'
+    StatusCode:
+      type: integer
+      description: |
+        Status code reported for each work item in the uploaded CSV.
+      enum:
+      - 2
+      - 3
+      - 4
+      - 5
+      x-enum-descriptions:
+      - Exempted - match found and all personal information is exempt
+      - Deleted - match found and non-exempt personal information was deleted
+      - Opted out - multiple consumers are linked to the same identifier and all were opted out of sale or sharing
+      - Not found - no match found after completing the matching process
+    DownloadedCSVRow:
+      type: object
+      description: A single row from a deletion list CSV file. All deletion list files use `ID,Hash`. For NDZ and NameVIN,
+        the `Hash` value is the final hash generated through composite hashing.
+      properties:
+        ID:
+          $ref: '#/components/schemas/WorkItemId'
+        Hash:
+          $ref: '#/components/schemas/HashBase64'
+      required:
+      - ID
+      - Hash
+    UploadCSVRow:
+      type: object
+      description: A single row in the response CSV uploaded by the data broker.
+      required:
+      - Id
+      - Status
+      properties:
+        Id:
+          $ref: '#/components/schemas/WorkItemId'
+        Status:
+          $ref: '#/components/schemas/StatusCode'
+    MessageResponse:
+      type: object
+      required:
+      - message
+      properties:
+        message:
+          type: string
+          description: Human-readable response message.
+    AcceptedFileResult:
+      type: object
+      required:
+      - fileName
+      - fileSizeBytes
+      properties:
+        fileName:
+          type: string
+          description: Name of the accepted CSV file.
+          example: 20260312_4821_Email.csv
+        fileSizeBytes:
+          type: integer
+          description: Size of the accepted file in bytes.
+          example: 2849112
+    RejectedFileResult:
+      type: object
+      required:
+      - fileName
+      - message
+      properties:
+        fileName:
+          type: string
+          description: Name of the rejected file.
+          example: notes.txt
+        message:
+          type: string
+          description: Reason the file was rejected.
+          example: Only CSV files are accepted.
+    RemovedCSVRow:
+      type: object
+      description: A single row from the Removed CSV file.
+      properties:
+        ID:
+          $ref: '#/components/schemas/WorkItemId'
+        Hash:
+          $ref: '#/components/schemas/HashBase64'
+        ListType:
+          $ref: '#/components/schemas/ListType'
+      required:
+      - ID
+      - Hash
+      - ListType
+    HashBase64:
+      type: string
+      minLength: 44
+      maxLength: 44
+      pattern: ^[A-Za-z0-9+/]{43}=$
+      description: SHA-256 hash output encoded as Base64.
+      example: KA18MT/ph6IHYjzT9zwETySDQyvSh87YuoSBpOQtkhE=
+    WorkItemId:
+      type: string
+      minLength: 12
+      maxLength: 12
+      pattern: ^[A-Za-z0-9]{12}$
+      description: DROP work item identifier from the downloaded file. Must be a 12-character Base62 (alphanumeric) value.
+      example: 'A7kP2xQ9Lm4R'
+    DataType:
+      type: string
+      enum:
+      - NDZ
+      - Email
+      - Phone
+      - MAID
+      - NameVIN
+      - CTVID
+      - Removed
+      description: CSV data type used in DROP file names. Removed is used for removed identifiers and is not a consumer deletion
+        list type.
+  responses:
+    BadRequest:
+      description: Bad request. Fix the request, file, or CSV format before retrying.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/MessageResponse'
+          example:
+            message: Upload request is invalid. Fix the rejected files and try again.
+    Unauthorized:
+      description: API key is missing or invalid.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/MessageResponse'
+          example:
+            message: API key is missing or invalid. Fix or regenerate the API key and try again.
+    Forbidden:
+      description: Broker is not eligible to access this operation.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/MessageResponse'
+          examples:
+            forbidden:
+              summary: Not eligible
+              value:
+                message: Your account is not eligible for this operation. Resolve any account, registration, payment, or access
+                  issue and try again.
+            noSelectedLists:
+              summary: No selected lists
+              value:
+                message: No identifier list preferences are enabled. Select at least one list and try again.
+    NotFound:
+      description: Endpoint URL is wrong or resource path does not exist.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/MessageResponse'
+          example:
+            message: The requested endpoint was not found. Check the URL/path and try again.
+    TooManyRequests:
+      description: Too many requests. Wait before retrying.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/MessageResponse'
+          example:
+            message: Too many requests. Wait and try again.
+      headers:
+        Retry-After:
+          description: Suggested number of seconds to wait before retrying.
+          schema:
+            type: integer
+            minimum: 1
+          example: 30
+    ServerError:
+      description: Temporary system error. Retry later.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/MessageResponse'
+          example:
+            message: The system is temporarily unavailable. Try again later.
+  examples:
+    DownloadArchiveContents:
+      summary: ZIP archive contents
+      description: The ZIP contains one CSV per selected list type and may include a Removed CSV file.
+      value: |
+        20260312_4821_Email.csv
+        20260312_4821_NDZ.csv
+        20260312_4821_Removed.csv
+    DownloadEmailCsv:
+      summary: Example downloaded Email CSV
+      value: |
+        ID,Hash
+        A7kP2xQ9Lm4R,KA18MT/ph6IHYjzT9zwETySDQyvSh87YuoSBpOQtkhE=
+    DownloadNdzCsv:
+      summary: Example downloaded NDZ CSV
+      value: |
+        ID,Hash
+        A7kP2xQ9Lm4R,PQOfn1RffEKmqMmNAzDKKaoZCwxWbQZkQzPWmQo9REA=
+    UploadStatusCsv:
+      summary: Example upload CSV
+      value: |
+        Id,Status
+        A7kP2xQ9Lm4R,2
+        680,5
+    UploadEmailFile:
+      summary: Multipart upload example
+      description: Upload one or more CSV response files using a downloaded file name or allowed suffix pattern.
+      value:
+        files:
+        - '@20260312_4821_Email.csv'
+        - '@20260312_4821_Email_part01.csv'
+    UploadAcceptedResponse:
+      summary: Accepted upload
+      description: DROP accepted the file and queued it for validation.
+      value:
+        message: Upload received. Accepted files were queued for validation.
+        acceptedCount: 1
+        rejectedCount: 0
+        accepted:
+        - fileName: 20260312_4821_Email.csv
+          fileSizeBytes: 2849112
+        rejected: []
+    UploadInvalidHeaderResponse:
+      summary: Rejected upload with invalid CSV header
+      description: The CSV header was not exactly `Id,Status`.
+      value:
+        message: Upload request is invalid. Fix the rejected files and try again.
+        acceptedCount: 0
+        rejectedCount: 1
+        accepted: []
+        rejected:
+        - fileName: 20260312_4821_Email.csv
+          message: 'Invalid CSV header. Expected: Id,Status.'
+    UploadDuplicateFileResponse:
+      summary: Rejected duplicate file name
+      description: The same file name was already uploaded for the current download. Use a unique optional suffix.
+      value:
+        message: Upload request is invalid. Fix the rejected files and try again.
+        acceptedCount: 0
+        rejectedCount: 1
+        accepted: []
+        rejected:
+        - fileName: 20260312_4821_Email.csv
+          message: A file with this name was already uploaded for the current download. Use a unique suffix and try again
+    UploadAmendAcceptedResponse:
+      summary: Accepted amendment
+      description: DROP accepted the amended file and queued it for validation.
+      value:
+        message: Upload received. Accepted files were queued for validation.
+        acceptedCount: 1
+        rejectedCount: 0
+        accepted:
+        - fileName: 20260312_4821_Email.csv
+          fileSizeBytes: 2849112
+        rejected: []
+    DownloadRemovedCsv:
+      summary: Example Removed CSV
+      value: |
+        ID,Hash,ListType
+        A7kP2xQ9Lm4R,KA18MT/ph6IHYjzT9zwETySDQyvSh87YuoSBpOQtkhE=,Email
+    UploadMixedResponse:
+      summary: Accepted and rejected files
+      description: One file was accepted and one file was rejected before validation.
+      value:
+        message: Upload received. Accepted files were queued for validation. Rejected files were not accepted.
+        acceptedCount: 1
+        rejectedCount: 1
+        accepted:
+        - fileName: 20260312_4821_Email.csv
+          fileSizeBytes: 2849112
+        rejected:
+        - fileName: notes.txt
+          message: Only CSV files are accepted.

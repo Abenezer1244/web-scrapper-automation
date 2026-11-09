@@ -12,7 +12,8 @@ send_privacy_outbox (beat, every minute)
 
 privacy_request_deadlines (beat, daily)
   Ops alerts listing open requests due within 7 days, and separately within 2 days
-  (ids, kinds, dates only); purges
+  (ids, kinds, dates only); the 24-month retention purge (migration 138, D5: counts
+  only in the log); purges
   tokens expired for 30 days.
 """
 from __future__ import annotations
@@ -141,7 +142,12 @@ def privacy_request_deadlines() -> dict:
         due = db.execute(text("SELECT * FROM public.privacy_requests_due(CAST(:w AS interval))"),
                          {"w": _ALERT_WINDOW}).all()
         purged = db.execute(text("SELECT public.privacy_tokens_purge()")).scalar() or 0
+        retention = db.execute(text(
+            "SELECT * FROM public.privacy_retention_purge(:n)"), {"n": 500}).one()
         db.commit()
+    if retention.requests_deleted or retention.payloads_deleted:
+        _logger.info("privacy retention: %s request(s) and %s payload(s) deleted",
+                     retention.requests_deleted, retention.payloads_deleted)
     today = datetime.now(UTC).strftime("%Y-%m-%d")
     urgent_by = datetime.now(UTC) + _URGENT
     urgent = [r for r in due if r.deadline_at <= urgent_by]
@@ -155,7 +161,9 @@ def privacy_request_deadlines() -> dict:
                 "Open privacy requests (decide them with scripts/privacy_admin.py):\n"
                 + "\n".join(f"{r.request_id} {r.kind} due {_day(r.deadline_at)}"
                             for r in rows))
-    return {"due": len(due), "urgent": len(urgent), "purged_tokens": purged}
+    return {"due": len(due), "urgent": len(urgent), "purged_tokens": purged,
+            "retention_requests": retention.requests_deleted,
+            "retention_payloads": retention.payloads_deleted}
 
 
 try:  # pragma: no cover -- registration only

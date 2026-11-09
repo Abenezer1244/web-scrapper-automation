@@ -84,10 +84,12 @@ Owner's choice after the consult: "Foundation now, rest later". No change to how
 is read, sent, written, withheld or erased. Nothing runs unless `DROP_ENABLED=true` AND
 `DROP_API_KEY` is set (both default off/empty).
 - [x] `src/privacy/drop.py`: spec-exact Email/Phone standardization + `base64(sha256(utf8))`
-      (None when a value standardizes to nothing); bounded in-memory ZIP parser (size,
-      members, uncompressed bytes, rows, line length; refuses paths/traversal, nested
+      (None when a value standardizes to nothing); in-memory ZIP parser that streams each
+      CSV row by row from a counting reader (64 MiB ZIP, 256 MiB decompressed across
+      members, 100:1 per-member ratio with members under 64 KiB exempt, 2M rows, 256-char
+      lines; declared sizes are only an early check); refuses paths/traversal, nested
       archives, non-DROP names, two files of one DataType, bad header/Id/Hash, one Id with
-      two hashes); header case-insensitive (`ID,Hash` / `Id,Hash`); Removed is
+      two hashes per list (Removed included); header case-insensitive (`ID,Hash` / `Id,Hash`); Removed is
       `ID,Hash,ListType`; NDZ/MAID/NameVIN/CTVID counted and ignored; status CSV writer
       (`Id,Status`, codes 2-5, UTF-8, CRLF) and status file naming; `DropClient` for
       download/upload/amend (X-API-KEY, Accept, 200 ZIP / 200 JSON / 202, 429 and 5xx and
@@ -96,12 +98,17 @@ is read, sent, written, withheld or erased. Nothing runs unless `DROP_ENABLED=tr
       only in development/test environments). Never logs the key, an Id or a hash.
 - [x] Migration 139: `drop_downloads` (+ `list_files`, the per-list CSV names the status
       file must reuse; a no-new-data pull is a row with NULL file_name, as cadence
-      evidence) and `drop_identifiers` (CHECKed Id/hash shape, `due_at` = download + 45 d,
+      evidence) and `drop_identifiers` (CHECKed Id/hash shape, `due_at` = `drop_due_at(downloaded_at)`,
       unique (download, list, Id), index (list, hash)). RLS on, no table grant to any role;
       definer functions (bridgeleads_system EXECUTE only): `drop_begin_download`,
       `drop_add_identifiers` (<= 5000, idempotent), `drop_mark_removed` (list+Id+hash),
       `drop_last_pull`, `drop_pending_hashes` (keyset, for the report). Re-grant block in
       scripts/provision_rls_roles.sql. Downgrade refuses while ledger rows exist.
+      **Report window, CONFIGURATION COUNSEL MUST CONFIRM** (Codex review, Medium): one
+      dated rule in `drop_due_at()`: 45 days for a list downloaded before 2027-01-01, 30
+      days for one downloaded on or after it (AB 883), the date read in California time
+      (America/Los_Angeles). Changing it is a new migration; recorded rows keep their due
+      time. Tested on both sides of the boundary (Pacific and UTC instants).
 - [x] `src/workers/privacy_drop.py::pull_drop_lists`, beat `pull-drop-lists` DAILY with a
       7-day spacing (deviation from "weekly": a 202 or a failure is retried the next day,
       not a week later; the pulls themselves stay weekly). Records in one transaction;
@@ -118,7 +125,7 @@ is read, sent, written, withheld or erased. Nothing runs unless `DROP_ENABLED=tr
 - Erasure of DROP-matched records (an audited DROP-identifier erasure; operator review for
   ambiguous matches).
 - Status decisions and reporting (upload/amend of `Id,Status` files after each barrier;
-  tracking of the 45-day due dates). NOTE: DROP answers 409 to a new download while the
+  tracking of the 45/30-day due dates). NOTE: DROP answers 409 to a new download while the
   previous batch's statuses are unreported, so once a ZIP has been pulled every later
   pull fails with 409 and alerts until reporting exists. Do not enable before that.
 - Digest columns maintained on every contact writer (the report hashes in batches instead).

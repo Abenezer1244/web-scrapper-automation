@@ -8,6 +8,7 @@ import base64
 import hashlib
 import json
 import uuid
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -72,7 +73,7 @@ def _pgcode(conn, sql: str, **params) -> str | None:
     return getattr(err.value.orig, "pgcode", None)
 
 
-def test_a_download_and_its_identifiers_are_recorded_with_a_45_day_due_date(conn):
+def test_a_download_and_its_identifiers_are_recorded_with_the_dated_due_rule(conn):
     did = _begin(conn, _zip_name(), {"email": 2, "phone": 1})
     assert _add(conn, did, "email", [(_id(1), _h("e1")), (_id(2), _h("e2"))]) == 2
     assert _add(conn, did, "phone", [(_id(3), _h("p1"))]) == 1
@@ -81,10 +82,34 @@ def test_a_download_and_its_identifiers_are_recorded_with_a_45_day_due_date(conn
                     "ON d.id = i.download_id WHERE d.id = :d ORDER BY i.drop_id", d=did).all()
     assert [(r.list_type, r.drop_id, r.hash) for r in rows] == [
         ("email", _id(1), _h("e1")), ("email", _id(2), _h("e2")), ("phone", _id(3), _h("p1"))]
-    assert {str(r.w) for r in rows} == {"45 days, 0:00:00"}
+    # The ledger stores exactly what the dated rule gives for this download's time.
+    expected = _q(conn, "SELECT drop_due_at(downloaded_at) - downloaded_at FROM "
+                        "drop_downloads WHERE id = :d", d=did).scalar()
+    assert {r.w for r in rows} == {expected}
     assert all(r.removed_at is None for r in rows)
     counts = _q(conn, "SELECT list_counts FROM drop_downloads WHERE id = :d", d=did).scalar()
     assert counts == {"email": 2, "phone": 1}
+
+
+@pytest.mark.parametrize(("downloaded_at", "days"), [
+    ("2026-11-09 12:00:00-08", 45),
+    ("2026-12-31 23:59:59-08", 45),   # the last Pacific moment of 2026
+    ("2027-01-01 07:59:59+00", 45),   # the same moment, in UTC
+    ("2027-01-01 00:00:00-08", 30),   # the first Pacific moment of 2027 (AB 883)
+    ("2027-01-01 08:00:00+00", 30),
+    ("2027-06-01 12:00:00-07", 30),
+])
+def test_the_report_window_is_45_days_before_2027_and_30_from_then(conn, downloaded_at,
+                                                                     days):
+    """COUNSEL TO CONFIRM (migration 139, drop_due_at): the date is California time."""
+    did = str(_q(conn, "INSERT INTO drop_downloads (file_name, downloaded_at) "
+                       "VALUES (:f, CAST(:t AS timestamptz)) RETURNING id",
+                 f=_zip_name(), t=downloaded_at).scalar())
+    assert _add(conn, did, "email", [(_id(1), _h("e1"))]) == 1
+    window = _q(conn, "SELECT i.due_at - d.downloaded_at FROM drop_identifiers i "
+                      "JOIN drop_downloads d ON d.id = i.download_id WHERE d.id = :d",
+                d=did).scalar()
+    assert window == timedelta(days=days)
 
 
 def test_recording_the_same_download_again_changes_nothing(conn):
@@ -152,7 +177,7 @@ def test_batches_are_bounded(conn):
 def test_no_role_without_a_grant_reaches_any_of_it(conn):
     probe = f"r_probe_{uuid.uuid4().hex[:8]}"
     conn.execute(text(f"CREATE ROLE {probe} NOLOGIN"))
-    for fn in _FUNCTIONS:
+    for fn in _FUNCTIONS + ("drop_due_at(timestamptz)",):
         assert _q(conn, "SELECT has_function_privilege(:r, :f, 'EXECUTE')",
                   r=probe, f=f"public.{fn}").scalar() is False, fn
     for table in ("drop_downloads", "drop_identifiers"):
@@ -175,6 +200,8 @@ def test_runtime_roles_hold_no_table_and_only_the_worker_executes(conn):
             assert _q(conn, "SELECT has_function_privilege(:r, :f, 'EXECUTE')",
                       r=role, f=f"public.{fn}").scalar() is (role == "bridgeleads_system"), \
                 (role, fn)
+        assert _q(conn, "SELECT has_function_privilege(:r, 'public.drop_due_at(timestamptz)', "
+                        "'EXECUTE')", r=role).scalar() is False, role
 
 
 def test_rls_is_on_and_the_functions_are_definers_with_a_pinned_path(conn):

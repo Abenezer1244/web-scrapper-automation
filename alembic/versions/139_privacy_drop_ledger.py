@@ -12,7 +12,15 @@ operator's read-only match report. Dormant until DROP_ENABLED and DROP_API_KEY a
                      (the status file must reuse it).
   drop_identifiers   one row per Email/Phone work item: DROP's Id, its Base64 SHA-256
                      hash, when it arrived, when DROP withdrew it (the Removed file) and
-                     its report-by time (download + 45 days, the regulation's window).
+                     its report-by time (drop_due_at() of the download time).
+
+The report window is ONE dated rule, in drop_due_at() (CONFIGURATION COUNSEL MUST CONFIRM):
+45 days for a list downloaded before 2027-01-01, 30 days for one downloaded on or after it
+(AB 883), the date read in California time (America/Los_Angeles). Changing the rule is a
+new migration; identifiers already recorded keep the due time they were given.
+
+  drop_due_at()           the dated rule above (no role executes it; the definer
+                          functions call it as the owner).
 
 Functions (SECURITY DEFINER, search_path pinned, bridgeleads_system EXECUTE only):
   drop_begin_download()   records a pull; idempotent per ZIP name (returns the same id).
@@ -49,7 +57,19 @@ _WORKER_FUNCTIONS = (
     "drop_pending_hashes(uuid, text, uuid, integer)",
 )
 
+_DUE_AT = "drop_due_at(timestamptz)"
+
 _SQL = r"""
+-- The report-by time of a list downloaded at p_downloaded_at. COUNSEL TO CONFIRM: 45
+-- days before 2027-01-01, 30 days from then (AB 883), dated in California time.
+CREATE FUNCTION public.drop_due_at(p_downloaded_at timestamptz) RETURNS timestamptz
+LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $fn$
+    SELECT p_downloaded_at
+           + CASE WHEN (p_downloaded_at AT TIME ZONE 'America/Los_Angeles')::date
+                       >= date '2027-01-01'
+                  THEN interval '30 days' ELSE interval '45 days' END
+$fn$;
+
 CREATE FUNCTION public.drop_begin_download(p_file_name text, p_list_counts jsonb,
                                            p_ignored_counts jsonb, p_list_files jsonb)
 RETURNS uuid
@@ -101,7 +121,7 @@ BEGIN
     END IF;
     -- Malformed ids or hashes fail the table's CHECKs: the whole batch is refused.
     INSERT INTO public.drop_identifiers (download_id, list_type, drop_id, hash, due_at)
-    SELECT p_download, p_list_type, i.id, i.hash, v_at + interval '45 days'
+    SELECT p_download, p_list_type, i.id, i.hash, public.drop_due_at(v_at)
       FROM unnest(p_ids, p_hashes) AS i(id, hash)
     ON CONFLICT (download_id, list_type, drop_id) DO NOTHING;
     GET DIAGNOSTICS v_n = ROW_COUNT;
@@ -197,6 +217,9 @@ def upgrade() -> None:
 
     stmts = [_guarded(r, f"REVOKE ALL ON public.{t} FROM {r};")
              for t in _TABLES for r in _LOCKED_OUT]
+    stmts.append(f"REVOKE ALL ON FUNCTION public.{_DUE_AT} FROM PUBLIC;")
+    stmts += [_guarded(r, f"REVOKE ALL ON FUNCTION public.{_DUE_AT} FROM {r};")
+              for r in _LOCKED_OUT]
     for fn in _WORKER_FUNCTIONS:
         stmts.append(f"REVOKE ALL ON FUNCTION public.{fn} FROM PUBLIC;")
         stmts += [_guarded(r, f"REVOKE ALL ON FUNCTION public.{fn} FROM {r};")
@@ -217,7 +240,7 @@ def downgrade() -> None:
         END
         $refuse$
     """))
-    for fn in _WORKER_FUNCTIONS:
+    for fn in _WORKER_FUNCTIONS + (_DUE_AT,):
         op.execute(text(f"DROP FUNCTION IF EXISTS public.{fn}"))
     op.execute(text("DROP TABLE public.drop_identifiers"))
     op.execute(text("DROP TABLE public.drop_downloads"))

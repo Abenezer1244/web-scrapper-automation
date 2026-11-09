@@ -80,3 +80,16 @@ R (retention):
   decides on hashes, IP/UA, separate checkboxes [D].
 - Exemptions are exact: me/refresh/logout/legal status+accept, account export + deletion
   (privacy rights), billing portal (cancel); webhooks and Celery are never user calls.
+
+## R build reviews
+- Round 1: NO-GO (High: outbox claim race between selection and delete; Low: two terminal
+  events). Both fixed in a9fc3d0b, with regression tests.
+- Round 2: both fixes confirmed. One Medium REJECTED with evidence: a confirm/purge
+  deadlock (confirm locks token then request; purge locks request then deletes tokens).
+  Unreachable: a token lives at most 30 days (privacy_outbox_token), an email that cannot
+  be sent gives up within about two days (10 attempts, 6 h cap), and privacy_web_confirm's
+  UPDATE locks only a live, unconsumed token, while the purge only touches requests closed
+  24 months ago with no unsent email. So no live token can exist on a purgeable request;
+  and a deadlock, if it ever occurred, would abort one side harmlessly (Postgres detects it).
+  Changing 137's confirm (already in production) for an unreachable case is not worth a
+  definition swap in 138.

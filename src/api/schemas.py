@@ -6,7 +6,7 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Any, Literal, TypedDict
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 
 from src.config.constants import (
     HEARTBEAT_STALE_MINUTES,
@@ -279,6 +279,26 @@ class BreakGlassLoginRequest(BaseModel):
     larger cap than MfaLoginRequest's 32 (Codex)."""
     mfa_token: str = Field(max_length=4096)
     code: str = Field(min_length=6, max_length=64)
+
+
+class LegalDocumentStatus(BaseModel):
+    current: str
+    accepted: bool
+
+
+class LegalStatusResponse(BaseModel):
+    """GET /auth/legal: whether this account has accepted the current versions."""
+    required: bool
+    terms: LegalDocumentStatus
+    privacy: LegalDocumentStatus
+
+
+class LegalAcceptRequest(BaseModel):
+    """POST /auth/legal/accept: the versions the dialog showed. Recorded only when they
+    are exactly the current ones; otherwise 409 legal_version_changed."""
+    model_config = ConfigDict(extra="forbid")
+    accepted_terms_version: str = Field(max_length=32, pattern=_LEGAL_VERSION)
+    accepted_privacy_version: str = Field(max_length=32, pattern=_LEGAL_VERSION)
 
 
 class UserResponse(BaseModel):

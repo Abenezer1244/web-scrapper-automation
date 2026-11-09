@@ -1,7 +1,7 @@
 from pathlib import Path
 from typing import ClassVar, Literal
 
-from pydantic import field_validator, model_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -103,6 +103,15 @@ class Settings(BaseSettings):
     # The public privacy-request form, POST /privacy/requests (Phase 6 P8). Off (404)
     # until the page copy has counsel's review (D9) and the legal mailbox exists.
     PRIVACY_INTAKE_ENABLED: bool = False
+    # California DROP (Delete Act) list pulls (P9 foundation, src/workers/privacy_drop.py).
+    # Whether BridgeLeads must register as a data broker and process DROP is counsel's
+    # decision (D8). Nothing runs unless DROP_ENABLED is true AND DROP_API_KEY is set.
+    # The key is issued in the DROP Data Broker Portal: env only, never logged.
+    # DROP_BASE_URL: production https://api.drop.privacy.ca.gov, or the sandbox
+    # https://api.drop.privacy.ca.gov/sandbox; any other URL is refused.
+    DROP_ENABLED: bool = False
+    DROP_API_KEY: str = Field(default="", repr=False)
+    DROP_BASE_URL: str = "https://api.drop.privacy.ca.gov"
 
     # H3 PII encryption read mode. While False (tolerant), decrypt_field() treats
     # any value that is not a valid fe1:-prefixed Fernet token as legacy

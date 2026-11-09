@@ -233,3 +233,12 @@ def test_a_reader_command_also_needs_an_admin_with_mfa(c):
     for argv in (("inbox",), ("show", "--request", str(uuid.uuid4()))):
         with pytest.raises(DBAPIError):
             _run(c, email, *argv)
+
+
+def test_an_operator_places_and_releases_a_legal_hold(c):
+    email = _admin(c)
+    rid = _verified_request(c, email, "delete")
+    _run(c, email, "hold", "--request", rid)
+    _run(c, email, "unhold", "--request", rid)
+    assert [a for (a,) in _q(c, "SELECT action FROM privacy_legal_holds WHERE request_id = :r "
+                                "ORDER BY created_at", r=rid).all()] == ["hold", "release"]

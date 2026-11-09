@@ -252,8 +252,9 @@ def test_record_uses_the_deadline_rules_and_extend_counts_from_the_deadline(c):
     rid = _verified_request(c, email, "opt_out")
     due = _q(c, "SELECT deadline_at, received_at FROM privacy_requests WHERE id = :r",
              r=rid).one()
-    # 15 business days, not 45 calendar days (the date, in California time).
-    assert due.deadline_at.date() <= deadline_for("opt_out", datetime.now(UTC)).date()
+    # 15 business days, not 45 calendar days. Compared as instants: the end of the day in
+    # California is the NEXT day in UTC, so comparing .date() depends on the machine's zone.
+    assert due.deadline_at <= deadline_for("opt_out", datetime.now(UTC))
     assert (due.deadline_at - due.received_at).days < 30
     _run(c, email, "event", "--request", rid, "--type", "extended", "--extend-days", "10")
     extended = _q(c, "SELECT deadline_at FROM privacy_request_events WHERE request_id = :r "

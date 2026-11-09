@@ -312,6 +312,14 @@ def _refuse_if_pending_deletion(user: User, request: Request | None) -> None:
     )
 
 
+async def _refuse_if_legal_acceptance_required(db, user: User,
+                                                request: Request | None) -> None:
+    """Phase 3d: off unless LEGAL_REACCEPT_ENFORCED (src/api/legal_acceptance.py)."""
+    from src.api.legal_acceptance import refuse_if_acceptance_required
+
+    await refuse_if_acceptance_required(db, user, request)
+
+
 async def get_auth_context(
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer)],
     db: Annotated[AsyncSession, Depends(get_db)],
@@ -364,6 +372,7 @@ async def get_auth_context(
                 detail="API access requires a Business or Agency plan.",
             )
         _refuse_if_pending_deletion(user_match, request)
+        await _refuse_if_legal_acceptance_required(db, user_match, request)
         return AuthContext(
             user=user_match,
             auth_method="api_key",
@@ -450,6 +459,7 @@ async def get_auth_context(
             raise _CREDENTIALS_EXCEPTION
 
     _refuse_if_pending_deletion(user, request)
+    await _refuse_if_legal_acceptance_required(db, user, request)
     return AuthContext(
         user=user,
         auth_method="jwt",

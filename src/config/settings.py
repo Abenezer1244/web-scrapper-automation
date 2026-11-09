@@ -112,6 +112,14 @@ class Settings(BaseSettings):
     DROP_ENABLED: bool = False
     DROP_API_KEY: str = Field(default="", repr=False)
     DROP_BASE_URL: str = "https://api.drop.privacy.ca.gov"
+    # Terms / Privacy acceptance (compliance Phase 3d, src/api/legal_acceptance.py).
+    # LEGAL_ACCEPTANCE_REQUIRED: signup and verify-email refuse (422) a submission
+    # without exactly the current versions. LEGAL_REACCEPT_ENFORCED: signed-in calls
+    # (sessions and API keys) from an account that has not accepted the current
+    # versions get 403 legal_acceptance_required, except the exempt routes. Turn on
+    # only after the frontend shows the acceptance dialog.
+    LEGAL_ACCEPTANCE_REQUIRED: bool = False
+    LEGAL_REACCEPT_ENFORCED: bool = False
 
     # H3 PII encryption read mode. While False (tolerant), decrypt_field() treats
     # any value that is not a valid fe1:-prefixed Fernet token as legacy

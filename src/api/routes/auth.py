@@ -82,6 +82,9 @@ from src.api.schemas import (
     EmailChangeConfirm,
     EmailChangeRequest,
     ForgotPasswordRequest,
+    LegalAcceptRequest,
+    LegalDocumentStatus,
+    LegalStatusResponse,
     LegalVersions,
     LoginResponse,
     LogoutRequest,
@@ -294,6 +297,49 @@ async def me(
     current_user: CurrentUser, db: AsyncSession = Depends(get_rls_db)
 ) -> UserResponse:
     return await _user_response(db, current_user)
+
+
+@router.get("/legal", response_model=LegalStatusResponse)
+async def legal_status(
+    current_user: CurrentUser, db: AsyncSession = Depends(get_rls_db)
+) -> LegalStatusResponse:
+    """Whether this account has accepted the current Terms and Privacy versions."""
+    from src.api.legal_acceptance import accepted_documents
+    from src.config.constants import LEGAL_DOCUMENT_VERSIONS
+
+    accepted = await accepted_documents(db, current_user.id)
+    docs = {d: LegalDocumentStatus(current=v, accepted=d in accepted)
+            for d, v in LEGAL_DOCUMENT_VERSIONS.items()}
+    return LegalStatusResponse(required=not all(s.accepted for s in docs.values()), **docs)
+
+
+@router.post("/legal/accept", response_model=LegalStatusResponse)
+async def accept_legal(
+    body: LegalAcceptRequest,
+    current_user: Annotated[User, Depends(require_session)],
+    db: AsyncSession = Depends(get_rls_db),
+) -> LegalStatusResponse:
+    """Record acceptance of the CURRENT versions (flow 'reaccept'). A signed-in session
+    only: an API key cannot accept terms for its owner. Stale versions (the documents
+    changed after the dialog loaded) record nothing: 409 legal_version_changed."""
+    from src.api.legal_acceptance import VERSION_CHANGED_DETAIL
+    from src.config.constants import LEGAL_DOCUMENT_VERSIONS
+    from src.db.models import LegalAcceptance
+
+    submitted = {"terms": body.accepted_terms_version,
+                 "privacy": body.accepted_privacy_version}
+    if submitted != LEGAL_DOCUMENT_VERSIONS:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                            detail=VERSION_CHANGED_DETAIL)
+    # Idempotent under concurrency (two tabs agreeing at once): the unique
+    # (user_id, document, version) makes the second insert a no-op, not a 500.
+    await db.execute(
+        pg_insert(LegalAcceptance)
+        .values([{"user_id": current_user.id, "document": d, "version": v,
+                  "flow": "reaccept"} for d, v in LEGAL_DOCUMENT_VERSIONS.items()])
+        .on_conflict_do_nothing(constraint="uq_legal_acceptances_user_doc_version"))
+    await db.commit()
+    return await legal_status(current_user, db)
 
 
 @router.put("/notification-preferences", response_model=UserResponse)

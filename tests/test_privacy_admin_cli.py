@@ -242,3 +242,20 @@ def test_an_operator_places_and_releases_a_legal_hold(c):
     _run(c, email, "unhold", "--request", rid)
     assert [a for (a,) in _q(c, "SELECT action FROM privacy_legal_holds WHERE request_id = :r "
                                 "ORDER BY created_at", r=rid).all()] == ["hold", "release"]
+
+
+def test_record_uses_the_deadline_rules_and_extend_counts_from_the_deadline(c):
+    from datetime import UTC, datetime
+
+    from src.privacy.deadlines import deadline_for
+    email = _admin(c)
+    rid = _verified_request(c, email, "opt_out")
+    due = _q(c, "SELECT deadline_at, received_at FROM privacy_requests WHERE id = :r",
+             r=rid).one()
+    # 15 business days, not 45 calendar days (the date, in California time).
+    assert due.deadline_at.date() <= deadline_for("opt_out", datetime.now(UTC)).date()
+    assert (due.deadline_at - due.received_at).days < 30
+    _run(c, email, "event", "--request", rid, "--type", "extended", "--extend-days", "10")
+    extended = _q(c, "SELECT deadline_at FROM privacy_request_events WHERE request_id = :r "
+                     "AND event_type = 'extended'", r=rid).scalar()
+    assert (extended - due.deadline_at).days == 10

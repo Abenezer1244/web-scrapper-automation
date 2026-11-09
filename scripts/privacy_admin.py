@@ -193,7 +193,14 @@ def _commit_if_rules_load(db) -> None:
 
 
 def cmd_record(db, op, args) -> None:
-    deadline = datetime.now(UTC) + timedelta(days=args.deadline_days)
+    from src.privacy.deadlines import deadline_for
+
+    # The same rules as the web form (src/privacy/deadlines.py): 15 business days for an
+    # opt-out, 45 calendar days otherwise. --deadline-days overrides, for a request that
+    # arrived earlier than it is being recorded.
+    now = datetime.now(UTC)
+    deadline = (now + timedelta(days=args.deadline_days) if args.deadline_days
+                else deadline_for(args.kind, now))
     rid = db.execute(text(
         "SELECT privacy_record_request(:k, :c, :d, :h, :contact, :details, CAST(:a AS uuid))"),
         {"k": args.kind, "c": args.channel, "d": deadline,
@@ -205,8 +212,17 @@ def cmd_record(db, op, args) -> None:
 
 
 def cmd_event(db, op, args) -> None:
-    deadline = (datetime.now(UTC) + timedelta(days=args.extend_days)
-                if args.extend_days else None)
+    deadline = None
+    if args.extend_days:
+        # From the deadline in force (the last extension, else the original), not today.
+        current = db.execute(text(
+            "SELECT coalesce((SELECT max(deadline_at) FROM privacy_request_events "
+            "WHERE request_id = CAST(:r AS uuid) AND event_type = 'extended'), "
+            "(SELECT deadline_at FROM privacy_requests WHERE id = CAST(:r AS uuid)))"),
+            {"r": args.request}).scalar()
+        if current is None:
+            raise SystemExit("no such request")
+        deadline = current + timedelta(days=args.extend_days)
     seq = db.execute(text(
         "SELECT privacy_record_event(CAST(:r AS uuid), :t, :v, :d, :dl, CAST(:a AS uuid))"),
         {"r": args.request, "t": args.type, "v": args.verification_level,
@@ -378,7 +394,8 @@ def _parser() -> argparse.ArgumentParser:
     p = sub.add_parser("record")
     p.add_argument("--kind", required=True, choices=("opt_out", "delete", "access", "correct"))
     p.add_argument("--channel", required=True, choices=("email", "postal", "web"))
-    p.add_argument("--deadline-days", type=int, default=45)
+    p.add_argument("--deadline-days", type=int,
+                   help="override the deadline rules (src/privacy/deadlines.py)")
     p.add_argument("--contact", required=True, help="how to reach the requester (encrypted)")
     p.add_argument("--requester-email")
     p.add_argument("--details", help="free text from the request (encrypted)")

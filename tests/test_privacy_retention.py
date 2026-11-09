@@ -183,3 +183,21 @@ def test_the_grant_script_restores_the_purge_grant() -> None:
             / "scripts/provision_rls_roles.sql").read_text(encoding="utf-8")
     assert "GRANT EXECUTE ON FUNCTION public.privacy_retention_purge(integer)" in body
     assert "REVOKE ALL ON privacy_legal_holds FROM PUBLIC, bridgeleads_app, bridgeleads_system;" in body
+
+
+def test_a_request_with_two_terminal_events_is_kept(conn):
+    """terminal_at is the ONE closed/withdrawn event; malformed data fails closed."""
+    rid = _request(conn, closed_months_ago=25)
+    _q(conn, "INSERT INTO privacy_request_events (request_id, seq, event_type, actor, "
+             "occurred_at) VALUES (:r, 4, 'withdrawn', 'system', now() - interval '26 months')",
+       r=rid)
+    _q(conn, _PURGE)
+    assert _exists(conn, "privacy_request_payloads", rid)
+
+
+def test_a_live_claim_blocks_the_purge_even_on_a_sent_row(conn):
+    rid = _request(conn, closed_months_ago=25)
+    _q(conn, "INSERT INTO privacy_email_outbox (request_id, kind, sent_at, claimed_until) "
+             "VALUES (:r, 'verification', now(), now() + interval '10 minutes')", r=rid)
+    _q(conn, _PURGE)
+    assert _exists(conn, "privacy_request_payloads", rid)

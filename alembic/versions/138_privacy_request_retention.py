@@ -74,8 +74,11 @@ BEGIN
                EXISTS (SELECT 1 FROM public.privacy_suppressions s
                         WHERE s.request_id = r.id) AS has_rule
           FROM public.privacy_requests r
+         -- terminal_at: the request's ONE closed/withdrawn event. Malformed data with
+         -- two yields NULL here and the request is skipped (fail closed).
          WHERE (SELECT min(e.occurred_at) FROM public.privacy_request_events e
-                 WHERE e.request_id = r.id AND e.event_type IN ('closed', 'withdrawn'))
+                 WHERE e.request_id = r.id AND e.event_type IN ('closed', 'withdrawn')
+                HAVING count(*) = 1)
                <= now() - interval '24 months'
            AND NOT EXISTS (SELECT 1 FROM public.privacy_email_outbox o
                             WHERE o.request_id = r.id
@@ -96,6 +99,17 @@ BEGIN
          LIMIT least(greatest(coalesce(p_limit, 1), 1), 500)
            FOR UPDATE OF r SKIP LOCKED
     LOOP
+        -- The outbox can change between selection and here (a worker claims a row):
+        -- lock the request's rows and look again before deleting anything. A claim in
+        -- progress makes this wait; a committed claim or an unsent email skips it.
+        PERFORM 1 FROM public.privacy_email_outbox o WHERE o.request_id = v_req.id
+          FOR UPDATE;
+        IF EXISTS (SELECT 1 FROM public.privacy_email_outbox o
+                    WHERE o.request_id = v_req.id
+                      AND ((o.sent_at IS NULL AND o.gave_up_at IS NULL)
+                           OR o.claimed_until > now())) THEN
+            CONTINUE;
+        END IF;
         DELETE FROM public.privacy_request_payloads p WHERE p.request_id = v_req.id;
         GET DIAGNOSTICS v_n = ROW_COUNT;
         v_payloads := v_payloads + v_n;

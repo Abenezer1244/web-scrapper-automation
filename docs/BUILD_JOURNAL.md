@@ -19,6 +19,49 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-11-10 — Compliance: everything merged and switched on (retention, re-acceptance, DROP foundation, live form)
+
+**Built / Shipped:** all merged to main and deployed (schema 139). #614/#615 (P8 form + OpenAPI
+regen), #617 (retention purge, migration 138: 24-month purge of terminal requests, append-only legal
+holds, outbox re-checked under lock; CLI `--extend-days` counts from the current deadline), #618 +
+bridgeleads-web #325 (Phase 3d re-acceptance: gate in `get_auth_context` for sessions and API keys,
+`/auth/legal` + `/auth/legal/accept`), #619 (Phase 7 legal drafts, 9 documents), #620 (DROP
+foundation, migration 139: hashing, bounded ZIP parser, spec v1.2.0 client; dormant behind
+`DROP_ENABLED` + `DROP_API_KEY`), bridgeleads-web #324 (form). Cloudflare Email Routing via API:
+privacy@, security@, legal@, support@, leads@ bridgeleads.io forward to the owner. Flags on:
+`LEGAL_REACCEPT_ENFORCED`, `LEGAL_ACCEPTANCE_REQUIRED` (owner set), `PRIVACY_INTAKE_ENABLED` (api),
+`NEXT_PUBLIC_PRIVACY_FORM_ENABLED` (Vercel, via `vercel redeploy` of the current prod deployment).
+End-to-end test of the live form: submitted through `bridgeleads.io/api/privacy` (202), email sent by
+the outbox, owner clicked the link (in_review), then withdrawn by the operator. Inbox 0 open.
+
+**Tried / Decided:** P9 DROP: owner chose "foundation now, rest later"; withholding, erasure and
+status reporting wait on counsel's D8 answer. Closed the test request as `withdrawn`, not `closed`:
+`closed` requires a `decided` event, and inventing a decision would falsify the audit trail.
+
+**Failed / Blocked:** `railway variables` for the legal flags was blocked by the classifier (owner
+ran it); `PRIVACY_INTAKE_ENABLED` later went through. Decrypting the admin account's email to find
+the operator was blocked; the owner supplied it. Gmail MCP connector fails auth (no dynamic client
+registration), so the confirmation email could only be proven from worker logs. An accidental
+`git stash pop` applied another session's stash; reverted with `git restore`, stash intact.
+`git worktree remove/prune` cannot delete `.git/worktrees/*` (Permission denied, OneDrive); the
+worktrees are gone from `git worktree list` but the metadata dirs linger (100+ from past sessions).
+
+**Caught & fixed:** #614 merged with a stale OpenAPI file (fixed in #615: rerun
+`scripts/export_openapi.py` whenever routes change). Stale local test-DB functions (old 137
+signatures) made tests pass locally and fail in CI. UTC vs Pacific date compare in the CLI test.
+gitleaks false positives on the vendored DROP spec (fingerprinted `.gitleaksignore`). Merge conflict
+on #620 in settings/.env.example (kept both). Many Codex NO-GOs, all resolved or rejected with
+evidence (rotation HMACs, generation on lift, confirm/purge deadlock).
+
+**Pending / Handoff:** owner: delete the Cloudflare API token (dashboard + `$HOME\.cloudflare_token`);
+engage privacy counsel for D8 (data broker / DROP), the live form copy, the drafts D1-D9 and the
+deadline rules (2027-01-01 change); fill legal-page placeholders (COMPANY_POSTAL_ADDRESS, API_BASE_URL).
+Engineering after D8: DROP withholding, erasure, status reporting. Do not enable DROP before then.
+
+**Facts learned:** the privacy operator is `admin@bridgeleads.io` (the only admin with MFA); the
+owner's Gmail account is not an admin. Run the CLI from the main repo dir (railway is linked there)
+with an absolute script path. A test request ends with `withdrawn`.
+
 ## 2026-11-09 — Privacy: the public request form, its email and deadlines (compliance Phase 6 P8)
 
 **Built / Shipped:** branch `feat/privacy-phase6-p8` + bridgeleads-web `feat/privacy-request-form`

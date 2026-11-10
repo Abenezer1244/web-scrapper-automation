@@ -18,6 +18,21 @@ from src.db.session import system_sync_session
 from src.workers.skip_trace_dispatcher import dispatch_pending_skip_trace
 
 
+def _clear_admission_gate() -> None:
+    """Simulate the NEXT scheduled tick: the previous tick's admission gate has
+    expired by then (src/workers/skip_trace_dispatcher.py, _admit_tick)."""
+    import redis as sync_redis
+
+    from src.config import settings
+    from src.workers.skip_trace_dispatcher import _ADMISSION_GATE_KEY
+
+    client = sync_redis.from_url(settings.REDIS_URL, **settings.redis_kwargs())
+    try:
+        client.delete(_ADMISSION_GATE_KEY)
+    finally:
+        client.close()
+
+
 def _seed_pending(
     user_id: str, *, status: str = "queued", submitted_at=None,
     is_duplicate: bool = False, duplicate_reason: str | None = None,
@@ -272,6 +287,7 @@ async def test_a_lead_being_updated_right_now_is_left_for_the_next_tick(
         assert _pending_state(pending_id)[0] == "queued"
         writer.commit()
 
+    _clear_admission_gate()  # what the next scheduled tick finds
     out = dispatch_pending_skip_trace()
 
     assert out == {"submitted_batches": 0, "submitted_rows": 0, "errors": []}

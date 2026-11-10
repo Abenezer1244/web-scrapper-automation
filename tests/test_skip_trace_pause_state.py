@@ -26,6 +26,16 @@ from src.utils.skip_trace_pause_state import NEVER, NOT_PAUSED, PAUSED, UNKNOWN,
 from src.workers import skip_trace_capacity as cap
 from src.workers import skip_trace_dispatcher
 from src.workers.skip_trace_dispatcher import dispatch_pending_skip_trace
+
+
+def _clear_admission_gate() -> None:
+    """Simulate the NEXT scheduled tick: the previous tick's admission gate has
+    expired by then (src/workers/skip_trace_dispatcher.py, _admit_tick)."""
+    client = sync_redis.from_url(settings.REDIS_URL, **settings.redis_kwargs())
+    try:
+        client.delete(skip_trace_dispatcher._ADMISSION_GATE_KEY)
+    finally:
+        client.close()
 from tests.test_skip_trace_credit_cap import (  # noqa: F401 - fixtures used by name
     _seed,
     dispatcher,
@@ -526,6 +536,7 @@ async def test_paused_then_resumed_leaves_no_stale_paused(make_account, dispatch
         db.execute(text("UPDATE pending_skip_trace_rows SET submitted_at = :t "
                         "WHERE user_id = :u"), {"t": now - DAY - H, "u": u})
         db.commit()
+    _clear_admission_gate()  # the next scheduled tick
     dispatch_pending_skip_trace()
 
     assert not r.hexists(pause.KEY, u)
@@ -605,6 +616,7 @@ async def test_a_failing_resume_read_never_changes_the_tick(dispatcher, monkeypa
     def broken(db, now, caps):
         db.execute(text("SELECT 1/0"))
     monkeypatch.setattr(skip_trace_dispatcher, "resume_times", broken)
+    _clear_admission_gate()  # the next scheduled tick
     with caplog.at_level(logging.WARNING):
         assert dispatch_pending_skip_trace() == expected
     assert any("DivisionByZero" in rec.getMessage() for rec in caplog.records)

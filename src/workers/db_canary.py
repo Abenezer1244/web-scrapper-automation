@@ -16,6 +16,16 @@ The streak lives in Redis. When Redis is unavailable the canary logs and does
 NOT alert: it cannot tell a blip from an outage, and the alert cooldown fails
 open, so alerting then would mean an e-mail every 2 minutes.
 
+One sample per tick: during a deploy two beat containers can briefly coexist
+and publish the same tick twice, and a worker can be handed a task again. Each
+run moves the streak, so one bad sample counted twice could page early. A run
+first claims a sampling gate (SET NX, kept for ``_SAMPLE_GATE_S``); a run that
+finds it taken returns without probing. It is a minimum-spacing throttle, not
+exact deduplication: a redelivery more than ``_SAMPLE_GATE_S`` after the first
+run still counts, and a tick that arrives early after a late one is skipped,
+which can delay an alert or a recovery notice by one tick. When the gate cannot
+be claimed the canary still probes and logs, but changes nothing in Redis.
+
 This is the second line of detection. The first is an external uptime monitor
 on GET /ready, which does not share Railway, Redis or this worker.
 """
@@ -37,6 +47,10 @@ _SLOW_SECONDS = 3.0
 _ALERT_AFTER = 3          # consecutive bad probes, i.e. ~6 minutes at the 2-minute beat
 _STREAK_KEY = "bl:db_canary:bad_streak"
 _STREAK_TTL_S = 3600      # a streak older than this is stale, start over
+_SAMPLE_GATE_KEY = "bl:db_canary:sample_gate"
+# Shorter than the 120 s beat interval, so a regular tick that arrives up to 30 s
+# early still samples; long enough to drop a duplicate published seconds apart.
+_SAMPLE_GATE_S = 90
 
 
 def _probe() -> tuple[bool, float, str | None]:
@@ -61,6 +75,20 @@ def _redis_client():
         settings.REDIS_URL, socket_timeout=2, socket_connect_timeout=2,
         **settings.redis_kwargs(),
     )
+
+
+def _claim_sample() -> bool | None:
+    """True when this run may count its probe, False when another run already
+    sampled this tick, None when Redis is unavailable. Never raises."""
+    try:
+        client = _redis_client()
+        try:
+            return bool(client.set(_SAMPLE_GATE_KEY, "1", nx=True, ex=_SAMPLE_GATE_S))
+        finally:
+            client.close()
+    except Exception as exc:  # noqa: BLE001
+        _logger.warning("DB canary: sample gate unavailable (%s), not counting", type(exc).__name__)
+        return None
 
 
 def _update_streak(bad: bool) -> tuple[int, int] | None:
@@ -112,9 +140,14 @@ def _announce_recovery(previous: int) -> bool:
 
 
 def run_db_latency_canary() -> dict:
+    claimed = _claim_sample()
+    if claimed is False:
+        return {"answered": None, "seconds": None, "error": None, "streak": None,
+                "alerted": False, "skipped": "duplicate"}
     answered, seconds, error = _probe()
     bad = not answered or seconds > _SLOW_SECONDS
-    counted = _update_streak(bad)
+    # Without the gate this probe may be a duplicate, so it changes nothing.
+    counted = _update_streak(bad) if claimed else None
     streak = counted[0] if counted else None
     stats = {
         "answered": answered,
@@ -122,6 +155,7 @@ def run_db_latency_canary() -> dict:
         "error": error,
         "streak": streak,
         "alerted": False,
+        "skipped": "",
     }
     if not bad:
         if counted and counted[1] >= _ALERT_AFTER:
@@ -141,8 +175,8 @@ def run_db_latency_canary() -> dict:
             "primary",
             f"Database {what}",
             (
-                f"{streak} probes in a row, 2 minutes apart, were bad (> {_SLOW_SECONDS:.0f}s "
-                f"or failed).\n"
+                f"{streak} sampled probes in a row (scheduled every 2 minutes) were bad "
+                f"(> {_SLOW_SECONDS:.0f}s or failed).\n"
                 f"Last probe: answered={answered} seconds={seconds:.2f} error={error}\n\n"
                 "Check now:\n"
                 "  * https://api.bridgeleads.io/ready (503 = the API cannot reach the DB)\n"

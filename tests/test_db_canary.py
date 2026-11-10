@@ -7,11 +7,13 @@ port where nothing listens, and the streak lives in the real test Redis. The
 alert is observed through the durable audit row send_ops_alert always writes.
 """
 
+import threading
+import time
 from datetime import UTC, datetime
 
 import pytest
 import redis as sync_redis
-from sqlalchemy import create_engine, delete, select
+from sqlalchemy import create_engine, delete, event, select
 from sqlalchemy.pool import NullPool
 
 import src.db.session as db_session
@@ -48,12 +50,21 @@ def _clean_state():
     now: a test may point settings.REDIS_URL at a dead port, and this teardown
     can run before that patch is undone."""
     redis_url = settings.REDIS_URL
-    _redis(redis_url).delete(db_canary._STREAK_KEY, _COOLDOWN_KEY)
+    _redis(redis_url).delete(db_canary._STREAK_KEY, _COOLDOWN_KEY, db_canary._SAMPLE_GATE_KEY)
     yield
-    _redis(redis_url).delete(db_canary._STREAK_KEY, _COOLDOWN_KEY)
+    _redis(redis_url).delete(db_canary._STREAK_KEY, _COOLDOWN_KEY, db_canary._SAMPLE_GATE_KEY)
     with db_session.system_sync_session() as db:
         db.execute(delete(AuditEvent).where(AuditEvent.path.in_([_ALERT_PATH, _RECOVERED_PATH])))
         db.commit()
+
+
+def _next_tick() -> dict:
+    """Run the canary as the NEXT scheduled tick: the previous tick's sampling gate
+    is cleared first, as its 90 s expiry would before a tick 2 minutes later. Only
+    for tests that build a streak across ticks; duplicates within a tick are
+    tested against the raw function."""
+    _redis().delete(db_canary._SAMPLE_GATE_KEY)
+    return db_canary.run_db_latency_canary()
 
 
 @pytest.fixture
@@ -79,13 +90,13 @@ def test_healthy_database_answers_and_clears_the_streak():
 def test_alerts_on_the_third_bad_probe_and_not_before(database_down):
     since = datetime.now(UTC)
 
-    first = db_canary.run_db_latency_canary()
-    second = db_canary.run_db_latency_canary()
+    first = _next_tick()
+    second = _next_tick()
     assert (first["streak"], second["streak"]) == (1, 2)
     assert first["answered"] is False and first["error"] == "OperationalError"
     assert _alert_rows(since) == []
 
-    third = db_canary.run_db_latency_canary()
+    third = _next_tick()
 
     assert third["streak"] == 3
     rows = _alert_rows(since)
@@ -95,15 +106,15 @@ def test_alerts_on_the_third_bad_probe_and_not_before(database_down):
 
 def test_one_good_probe_resets_the_streak(database_down, monkeypatch):
     since = datetime.now(UTC)
-    db_canary.run_db_latency_canary()
-    db_canary.run_db_latency_canary()
+    _next_tick()
+    _next_tick()
 
     monkeypatch.undo()  # the real test database again
-    assert db_canary.run_db_latency_canary()["streak"] == 0
+    assert _next_tick()["streak"] == 0
 
     engine = create_engine(_REFUSED_URL, poolclass=NullPool, connect_args={"connect_timeout": 2})
     monkeypatch.setattr(db_session, "canary_engine", engine)
-    assert db_canary.run_db_latency_canary()["streak"] == 1
+    assert _next_tick()["streak"] == 1
     assert _alert_rows(since) == []
     engine.dispose()
 
@@ -130,7 +141,7 @@ def test_a_slow_answer_counts_as_bad(monkeypatch):
     since = datetime.now(UTC)
 
     for _ in range(db_canary._ALERT_AFTER):
-        stats = db_canary.run_db_latency_canary()
+        stats = _next_tick()
         assert stats["answered"] is True and stats["error"] is None
 
     assert stats["streak"] == db_canary._ALERT_AFTER
@@ -144,11 +155,11 @@ def test_recovery_after_an_alert_says_so_and_rearms_the_alert(database_down, mon
     inside the cooldown window would reach the threshold and send nothing."""
     since = datetime.now(UTC)
     for _ in range(db_canary._ALERT_AFTER):
-        db_canary.run_db_latency_canary()
+        _next_tick()
     _redis().set(_COOLDOWN_KEY, "1")  # what a delivered alert leaves behind
 
     monkeypatch.undo()  # the real test database again
-    stats = db_canary.run_db_latency_canary()
+    stats = _next_tick()
 
     assert stats["streak"] == 0
     assert len(_alert_rows(since, _RECOVERED_PATH)) == 1
@@ -165,6 +176,128 @@ def test_no_recovery_notice_after_a_blip():
 
     assert _alert_rows(since, _RECOVERED_PATH) == []
 
+
+
+# ─── One sample per tick ──────────────────────────────────────────────────────
+# Connection attempts are counted with SQLAlchemy's do_connect event on a real
+# engine, so a skipped run is shown never to reach the database at all.
+
+def _counting_engine(url, on_connect=None):
+    engine = create_engine(url, poolclass=NullPool, connect_args={"connect_timeout": 2})
+    attempts: list[int] = []
+
+    @event.listens_for(engine, "do_connect")
+    def _count(*_args):
+        attempts.append(1)
+        if on_connect is not None:
+            on_connect()
+
+    return engine, attempts
+
+
+def test_a_duplicate_run_in_the_same_tick_does_not_probe_or_count(monkeypatch):
+    engine, attempts = _counting_engine(_REFUSED_URL)
+    monkeypatch.setattr(db_session, "canary_engine", engine)
+
+    first = db_canary.run_db_latency_canary()
+    second = db_canary.run_db_latency_canary()
+
+    assert first["answered"] is False and first["streak"] == 1 and first["skipped"] == ""
+    assert second == {"answered": None, "seconds": None, "error": None, "streak": None,
+                      "alerted": False, "skipped": "duplicate"}
+    assert attempts == [1]                                   # one probe, not two
+    assert _redis().get(db_canary._STREAK_KEY) == "1"        # one sample counted
+    assert 0 < _redis().ttl(db_canary._SAMPLE_GATE_KEY) <= db_canary._SAMPLE_GATE_S
+    engine.dispose()
+
+
+def test_concurrent_runs_probe_once(monkeypatch):
+    """The winner is held inside its connection attempt while the other run goes,
+    so the two genuinely overlap."""
+    entered = threading.Event()
+    release = threading.Event()
+
+    def hold():
+        entered.set()
+        release.wait(timeout=10)
+
+    engine, attempts = _counting_engine(db_session.canary_engine.url, on_connect=hold)
+    monkeypatch.setattr(db_session, "canary_engine", engine)
+    results: list[dict] = []
+    errors: list[BaseException] = []
+
+    def run():
+        try:
+            results.append(db_canary.run_db_latency_canary())
+        except BaseException as exc:  # noqa: BLE001 -- reported in the test thread
+            errors.append(exc)
+
+    winner = threading.Thread(target=run)
+    loser = threading.Thread(target=run)
+    try:
+        winner.start()
+        assert entered.wait(timeout=10), "the winner never reached its probe"
+        loser.start()
+        loser.join(timeout=15)
+        assert not loser.is_alive()
+        assert results == [{"answered": None, "seconds": None, "error": None, "streak": None,
+                            "alerted": False, "skipped": "duplicate"}]   # while the winner probed
+    finally:
+        release.set()
+        winner.join(timeout=15)
+        engine.dispose()
+
+    assert not winner.is_alive()
+    assert errors == []
+    assert attempts == [1]
+    assert sorted(r["skipped"] for r in results) == ["", "duplicate"]
+
+def test_without_the_gate_a_probe_changes_nothing(monkeypatch):
+    """Redis down for the gate: the probe still runs and logs, but it may be a
+    duplicate, so it must not clear an outage streak, clear the alert cooldown or
+    announce a recovery."""
+    since = datetime.now(UTC)
+    redis_url = settings.REDIS_URL
+    _redis(redis_url).set(db_canary._STREAK_KEY, db_canary._ALERT_AFTER)
+    _redis(redis_url).set(_COOLDOWN_KEY, "1")
+    monkeypatch.setattr(settings, "REDIS_URL", "redis://127.0.0.1:1/0")
+
+    stats = db_canary.run_db_latency_canary()
+
+    assert stats["answered"] is True and stats["streak"] is None and stats["alerted"] is False
+    assert _redis(redis_url).get(db_canary._STREAK_KEY) == str(db_canary._ALERT_AFTER)
+    assert _redis(redis_url).get(_COOLDOWN_KEY) == "1"
+    assert _alert_rows(since) == [] and _alert_rows(since, _RECOVERED_PATH) == []
+
+
+
+def test_a_failed_gate_alone_still_changes_nothing(monkeypatch):
+    """Only the gate fails (Redis rejects a zero expiry) while the streak commands
+    would work: the probe must still not clear the outage streak or announce a
+    recovery, since it may be a duplicate."""
+    since = datetime.now(UTC)
+    _redis().set(db_canary._STREAK_KEY, db_canary._ALERT_AFTER)
+    _redis().set(_COOLDOWN_KEY, "1")
+    monkeypatch.setattr(db_canary, "_SAMPLE_GATE_S", 0)
+
+    stats = db_canary.run_db_latency_canary()
+
+    assert stats["answered"] is True and stats["streak"] is None and stats["alerted"] is False
+    assert _redis().get(db_canary._STREAK_KEY) == str(db_canary._ALERT_AFTER)
+    assert _redis().get(_COOLDOWN_KEY) == "1"
+    assert _alert_rows(since, _RECOVERED_PATH) == []
+
+def test_the_next_tick_samples_again_once_the_gate_expires(monkeypatch):
+    """Tested on the gate itself: no probe runs between the claims, so a slow
+    connection attempt cannot outlast the 1 s gate and blur the result."""
+    monkeypatch.setattr(db_canary, "_SAMPLE_GATE_S", 1)
+
+    assert db_canary._claim_sample() is True
+    assert 0 < _redis().pttl(db_canary._SAMPLE_GATE_KEY) <= 1000
+    assert db_canary._claim_sample() is False          # same tick: a duplicate
+    time.sleep(1.5)  # one bounded wait past the 1 s gate
+
+    assert db_canary._claim_sample() is True           # the next tick samples
 
 @pytest.mark.parametrize(
     "asyncpg_url, expected_query",

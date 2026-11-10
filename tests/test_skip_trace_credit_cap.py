@@ -825,7 +825,9 @@ async def test_a_second_claimer_is_shut_out_while_a_pass_holds_the_lock(
         make_account, dispatcher, monkeypatch):
     """Two dispatchers at once (a beat double-fire): while one pass holds the claim
     lock, the other defers and claims nothing, so they cannot both spend the same
-    allowance. Real second session, real advisory lock, deterministic order."""
+    allowance. Real second session, real advisory lock, deterministic order. Both
+    run the tick body directly: the task's admission gate would drop the second
+    before it ever reached the lock this test is about."""
     import threading
 
     u = await make_account()
@@ -836,14 +838,14 @@ async def test_a_second_claimer_is_shut_out_while_a_pass_holds_the_lock(
 
     def allocate_while_another_tick_runs(*a, **k):
         if not second:
-            t = threading.Thread(target=lambda: second.update(out=dispatch_pending_skip_trace()))
+            t = threading.Thread(target=lambda: second.update(out=skip_trace_dispatcher._dispatch_tick()))
             second["started"] = True
             t.start()
             t.join(timeout=60)
         return real_allocate(*a, **k)
     monkeypatch.setattr(skip_trace_dispatcher, "allocate", allocate_while_another_tick_runs)
 
-    dispatch_pending_skip_trace()
+    skip_trace_dispatcher._dispatch_tick()
 
     assert second["out"].get("deferred") == "claim_locked"
     assert second["out"]["submitted_rows"] == 0

@@ -52,6 +52,64 @@ _SPEND_WINDOW = SPEND_WINDOW
 _REFILL_MAX_ROUNDS = 12
 _REFILL_DEADLINE = timedelta(seconds=2)
 
+# ADMISSION SPACING. SKIP_TRACE_MAX_BATCHES_PER_TICK is per execution, and two
+# executions can land seconds apart: during a deploy two beat containers briefly
+# coexist and publish the same tick, and a worker can be handed a task again. Both
+# would then submit their batches. An execution first claims this gate (SET NX,
+# kept for _admission_gate_seconds() after the tick, whatever the tick did); one
+# that finds it taken does nothing. Best-effort minimum spacing between admitted
+# executions, not a provider rate guarantee: it does not bound a rolling window,
+# and when Redis cannot be asked the tick runs anyway (fails OPEN). Spend safety
+# never depends on it: the claim lock and the caps in Postgres are authoritative.
+_ADMISSION_GATE_KEY = "bl:skip_trace_dispatch:gate"
+_ADMISSION_REDIS_TIMEOUT_S = 2
+
+
+def _admission_gate_seconds() -> int:
+    """Three quarters of the interval (225 s at 300): drops a duplicate published
+    seconds apart, while a regular tick that arrives a little early still runs."""
+    return max(30, int(settings.SKIP_TRACE_DISPATCH_INTERVAL_SECONDS * 0.75))
+
+
+def _admit_tick() -> bool:
+    """False only when another execution holds the gate. Any failure to ask Redis
+    admits the tick (fail open); a failure to close the client changes nothing."""
+    from celery.exceptions import SoftTimeLimitExceeded, TimeLimitExceeded
+
+    try:
+        import redis as sync_redis
+
+        client = sync_redis.from_url(
+            settings.REDIS_URL,
+            socket_connect_timeout=_ADMISSION_REDIS_TIMEOUT_S,
+            socket_timeout=_ADMISSION_REDIS_TIMEOUT_S,
+            retry_on_timeout=False,
+            **settings.redis_kwargs(),
+        )
+    except (SoftTimeLimitExceeded, TimeLimitExceeded):
+        raise
+    except Exception as exc:  # noqa: BLE001 -- fail open: the gate is spacing, not safety
+        _logger.warning("Dispatcher: admission gate unavailable (%s), running the tick",
+                        type(exc).__name__)
+        return True
+    try:
+        try:
+            claimed = client.set(_ADMISSION_GATE_KEY, "1", nx=True, ex=_admission_gate_seconds())
+        except (SoftTimeLimitExceeded, TimeLimitExceeded):
+            raise
+        except Exception as exc:  # noqa: BLE001 -- fail open: the gate is spacing, not safety
+            _logger.warning("Dispatcher: admission gate unavailable (%s), running the tick",
+                            type(exc).__name__)
+            return True
+        return bool(claimed)
+    finally:
+        try:
+            client.close()
+        except (SoftTimeLimitExceeded, TimeLimitExceeded):
+            raise
+        except Exception:  # noqa: BLE001, S110 -- the decision above stands
+            pass
+
 
 @app.task(name="src.workers.skip_trace_dispatcher.dispatch_pending_skip_trace")
 def dispatch_pending_skip_trace() -> dict:
@@ -60,11 +118,12 @@ def dispatch_pending_skip_trace() -> dict:
     Returns a small dict summarizing the tick's activity (for log dumping
     and Flower inspection): {submitted_batches, submitted_rows, errors}.
 
-    Every tick that could dispatch then publishes the PAUSE STATE (Phase
-    1b-1b-iii), whatever the tick did: returned early at the cap, deferred, or
-    raised. A switched-off dispatcher publishes a tombstone instead, so the API
-    reads UNKNOWN rather than a stale 'paused'. Both are best-effort and never
-    change the tick's result.
+    Every ADMITTED tick then publishes the PAUSE STATE (Phase 1b-1b-iii),
+    whatever the tick did: returned early at the cap, deferred, or raised. A
+    duplicate inside the admission gate returns {"skipped": "duplicate"} and
+    publishes nothing (the admitted tick does). A switched-off dispatcher
+    publishes a tombstone instead, so the API reads UNKNOWN rather than a stale
+    'paused'. Both are best-effort and never change the tick's result.
     """
     if not settings.SKIP_TRACE_ENABLED:
         _logger.debug("SKIP_TRACE_ENABLED=False — dispatcher tick skipped")
@@ -75,6 +134,11 @@ def dispatch_pending_skip_trace() -> dict:
         _logger.warning("TRACERFY_API_TOKEN missing — dispatcher tick skipped")
         _publish_pause_state(tombstone=True)
         return {"skipped": "no_token"}
+
+    if not _admit_tick():
+        _logger.info("Dispatcher: another tick ran within %ds; duplicate skipped",
+                     _admission_gate_seconds())
+        return {"skipped": "duplicate"}
 
     try:
         return _dispatch_tick()

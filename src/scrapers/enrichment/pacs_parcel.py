@@ -336,8 +336,8 @@ def query_digits(value: object) -> str:
 
 
 def _resolve_one(session, site: PacsSite, tokens: dict, parcel_key: str, still_held,
-                 query: str | None = None, mode: dict | None = None, land_id: str | None = None
-                 ) -> tuple[MailingAnswer, str | None]:
+                 query: str | None = None, mode: dict | None = None, land_id: str | None = None,
+                 detail_parser=None) -> tuple[MailingAnswer, str | None]:
     """Search POST, then detail GET, for one parcel. (answer, block_reason).
     `mode` is the form's search-mode field (pacs.search_type_field); `land_id` is
     PacsSite.land_id for this parcel's callers, or None."""
@@ -357,12 +357,17 @@ def _resolve_one(session, site: PacsSite, tokens: dict, parcel_key: str, still_h
     if blocked or resp is None:
         return MailingAnswer(REQUEST_FAILED), blocked
     # The detail page must name the row the grid matched, not either spelling (Codex).
-    return parse_detail(resp.text, matched_key), None
+    return (detail_parser or parse_detail)(resp.text, matched_key), None
 
 
-def resolve_mailing(county: str, parcel_ids: list[str], *, time_budget_s: float = CALL_BUDGET_S
-                    ) -> dict[str, MailingAnswer]:
+def resolve_mailing(county: str, parcel_ids: list[str], *, time_budget_s: float = CALL_BUDGET_S,
+                    detail_parser=None) -> dict[str, MailingAnswer]:
     """Owner mailing addresses for one county's PACS parcels, keyed by CALLER id.
+
+    ``detail_parser(html, parcel_key)`` replaces ``parse_detail`` for a caller that
+    needs other cells of the same page (Benton tax balances); it gets the same
+    lease, pacing, block handling and grid match, and returns an object with an
+    ``outcome`` attribute.
 
     Every requested id gets an answer. Parcels this call did not reach (budget,
     lease, cooldown, a block mid-pass) are ``source_unavailable``, so the caller
@@ -447,7 +452,8 @@ def resolve_mailing(county: str, parcel_ids: list[str], *, time_budget_s: float 
             if not admission.still_held():
                 break
             answer, blocked = _resolve_one(session, site, tokens, key, admission.still_held,
-                                           query=queries[key], mode=mode, land_id=land_ids[key])
+                                           query=queries[key], mode=mode, land_id=land_ids[key],
+                                           detail_parser=detail_parser)
             if blocked:
                 record_source_blocked(site.source_key, f"PACS {blocked}")
                 _logger.warning("%s blocked (%s); pass stopped", site.source_key, blocked)

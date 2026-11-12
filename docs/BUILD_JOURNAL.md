@@ -19,6 +19,45 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-11-12 — Clallam: two broken integrations fixed, death certificates and tax foreclosure built
+
+**Built / Shipped:** branch `feat/clallam-seven-record-types` (local, not pushed), on top of the
+Benton session's EagleWeb pagination fix `60c75d4d`. Pre-foreclosure drops Clallam's discontinuances
+of trustee's sale and looks each notice up on the recorder (`00b9d93b`, `b2ab050b`); probate drops
+"Writ of Exec" and TOD revocations; new `death_certificate` type in the EagleWeb template
+(`4c280eb7`, `405024ea`, `3c3af382`, `8aa24213`); new `src/scrapers/clallam_wa_tax_delinquent.py`
+(`e468a272`, `13f23330`, `767be95e`). Plan, matrix and decisions: `tasks/clallam-seven.md`.
+
+**Tried / Decided:** probate and divorce were asked to come from the court; Clallam's court search
+is an attorney-only Odyssey subscription and JIS-Link reportedly bars building databases, so probate
+stays on the recorder (as for every other county) and divorce stays off (recorder: 0 in a year).
+Tax: the certificate PDF has no bill year, so each parcel is re-read on the county property portal
+for its current unpaid years; that also drops redeemed parcels. The 18-month cap (owner decision
+2026-06-16) hides every certificate parcel, so the module applies it and returns 0 until the owner
+exempts the source. Trustee sale: sale date and amount exist only in the recorded images, and
+wapublicnotices.com bars scraping. Code violation: no public case list anywhere in the county.
+
+**Failed / Blocked:** no local test DB, so DB-backed tests did not run. Playwright UI checks not run:
+nothing user-visible changed and nothing is activated. A full routed `scrape()` test was not written:
+detail pages are fetched with real HTTP and the testing rules forbid mocking it; wiring was proven
+live instead (a July notice dropped because of a September discontinuance).
+
+**Caught & fixed:** six Codex NO-GOs, all resolved: lookup read one page only; lookup ran before the
+parcel filter; bare DEATH accepted "Affidavit of Death"; my instrument-year fix changed the in-job
+retry hash (reverted, shortcut note left); tax PDF page / tax-row / owner / filing-date gaps; tax
+partial snapshots, 16- vs 12-digit parcel identity, stale portal status. My own: a scripted edit
+put a literal backspace into a regex; a test route leaked a fulfilled 302 onto the real county site.
+
+**Pending / Handoff:** owner: merge order with `60c75d4d`; add death_certificate to connector
+`3c1dc2fe`; exempt the tax source from the cap (or not) and add its connector; licensing for the
+blocked types. Follow-up: keep year-dashed instruments via a legacy-hash copy.
+
+**Facts learned:** Clallam EagleWeb defaults to 5 rows a page (max 100), caps searches at 10,000 rows
+and 5 years, and files discontinuances under `NTS` with "DISCONTINUANCE <instrument>" in the party
+cell; a document-number search lists the notice and every discontinuance citing it. Clallam's `EXEC`
+is "Writ of Exec", `SUCC` is "Sat of UCC-2", `LETTR` is "Letter". The PACS page shows unpaid tax by
+year, or "There is currently No Amount Due on this property".
+
 ## 2026-11-10 — Compliance: everything merged and switched on (retention, re-acceptance, DROP foundation, live form)
 
 **Built / Shipped:** all merged to main and deployed (schema 139). #614/#615 (P8 form + OpenAPI

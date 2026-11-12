@@ -81,14 +81,58 @@ PACS maps id+`0000` (PR #580). Volume is too small to prove much; the defects be
       07/01-07/14/2026: NTS 2026-1484470 dropped via lookup (discontinued 09/18, after the window).
 - [x] Codex review: NO-GO (1 High, 1 Medium, 1 Low) on 00b9d93b -> fixed in b2ab050b -> GO
 
-## Phase 2 — new types (after approval)
-- [ ] death_certificate via EagleWeb `DEATH`
-- [ ] tax_delinquent: `clallam_wa_tax_delinquent.py` + registry allowlist + fixture test
-- [ ] per-type Codex review; connector migration written but only applied with owner approval
+## Phase 2 — new types
+- [x] death_certificate via EagleWeb (4c280eb7, 405024ea, 3c3af382, 8aa24213). Whole-label gate:
+      Death / Death Certificate / Certificate of Death only. Live 09/01-11/12/2026: 17 = the 17 Death
+      rows (10 with a parcel, 7 name-only "PUBLIC SEE RECORD"). Codex: NO-GO (Affidavit of Death and
+      hyphenated TOD passed) -> fixed; my instrument-year fix changed the in-job retry hash -> reverted,
+      left as a shortcut note.
+- [x] tax_delinquent: `src/scrapers/clallam_wa_tax_delinquent.py` (e468a272, 13f23330, 767be95e).
+      Newest certificate from the Treasurer page -> PDF per page -> each PID re-read on the property
+      portal (Geographic ID must match; "No Amount Due" = redeemed; prior-year balances -> bill_year
+      + amount; status date must be current) -> 18-month cap unless exempt. Live 2026-11-12: 8
+      parcels -> 0 leads (capped); exempt -> 8 complete leads. Codex: NO-GO twice -> fixed -> GO.
+- [x] Connector rows NOT written: activation is an owner decision (see Review).
 
-## Phase 3 — UI + report
-- [ ] Playwright (Chromium) checks of the frontend at 320/375/390/430/tablet/desktop, light/dark
-- [ ] cross-cutting Codex challenge; final matrix; BUILD_JOURNAL entry
+## Phase 3 — report
+- [ ] Playwright UI checks: not run. No frontend change, and nothing is activated, so the live UI
+      cannot show the new types yet; run after activation (needs a test account, no paid lookups).
+- [x] cross-cutting Codex challenge: NO-GO (2 High, 1 Medium) -> fixed in 767be95e -> GO for merge.
+
+## Final seven-type matrix (2026-11-12)
+
+| type | agency / source | access | adapter | owner/parcel/address | tests | Codex | status |
+|---|---|---|---|---|---|---|---|
+| probate | Auditor EagleWeb (erecording.clallamcountywa.gov) `DEATH`, `TOD` | public, no captcha, no anti-automation terms | existing template, fixed | recorder parties; parcel via detail page; PACS mailing | 8 + pagination suite | GO | **Implemented, awaiting validation** (merge + prod run) |
+| pre_foreclosure | same, `NTS`/`NTSCL`/`LISP` | same | existing template, fixed | 13/13 live with parcel | 7 + pagination suite | GO | **Implemented, awaiting validation** |
+| death_certificate | same, `DEATH` | same | new type in template | 10/17 with parcel; name-only rows rely on enrichment | 9 | GO | **Implemented, awaiting validation** (connector off) |
+| tax_delinquent | Treasurer certificate + Assessor/Treasurer PACS portal | public | new module | 8/8 owner, situs, mailing; 12-digit id for 0000 rows | 19 | GO | **Partial**: blocked by the 18-month cap (owner decision) |
+| trustee_sale | sale date/amount only in recorded NTS images; legal notices on wapublicnotices.com (bars scraping, $10k/incident) | blocked | none | - | - | agreed | **Blocked by source access** |
+| divorce | Superior Court: Odyssey portal attorney-only subscription; recorder 0/yr (8 in 5 yrs) | blocked | none | - | - | agreed | **Blocked by legal/data restrictions** |
+| code_violation | county DCD, Port Angeles PD: complaint intake only, no public case list | blocked | none | - | - | agreed | **Blocked by source access** |
 
 ## Review
-(to fill in)
+
+**Root causes found.** (1) The shared EagleWeb loop stopped at the first results page with no
+matching type; Clallam shows 5 rows a page, so Clallam runs read about one page (live: 0 records
+where the recorder had 14 NTS). Fixed by the Benton session (60c75d4d), which this branch is based on.
+(2) Clallam files Discontinuances of Trustee's Sale under its NTS type; they became pre-foreclosure
+leads and the cancelled notices stayed live. (3) Probate matched "Writ of Exec" and TOD revocations.
+
+**Baseline.** Production, ever: 2 Clallam customer runs, 4 leads (1 NTS, 3 TOD), all complete,
+0 failed, 0 NULL records_found. Live after: pre_foreclosure 0 -> 13, probate 0 -> 76 for
+09/01-11/12/2026; death_certificate 17; tax 8 (0 under the cap).
+
+**Owner decisions / prerequisites.**
+1. Merge order: 60c75d4d (Benton, local/unpushed) must land first or with this branch.
+2. Activate death_certificate: add it to Clallam connector 3c1dc2fe `record_types` (changes public coverage).
+3. Tax: exempt `clallam_county_tax_foreclosure_certificate` from the 18-month cap (TAX_CAP_EXEMPT_SOURCES)
+   or keep tax unavailable; then a manual-mode connector row for ClallamWATaxDelinquentScraper.
+   The certificate refreshes once a year (filed ~September; sale in November).
+4. trustee_sale / divorce / code_violation: only through licensing or county agreements
+   (newspaper legal-notice license, AOC data-dissemination contract, records-request feed).
+
+**Known limits.** Leads delivered before this fix are not re-checked for discontinuances. Name-only
+death certificates (no parcel) depend on enrichment to qualify. Billing dedup keys on parcel|address
+(frozen), so a tax and a recorder lead for one property may not collapse when addresses differ.
+DB-backed tests (progress reporting, billing, dedup) could not run locally: no test database.

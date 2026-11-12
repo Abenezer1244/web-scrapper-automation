@@ -48,13 +48,17 @@ Phase 1a (≤5 files) — assessor enrichment
 - [x] Codex review: 1 Medium (owner name left in mailing cell of fixture) — fixed
 
 Phase 1b (≤5 files) — trustee_sale
-- [ ] `src/scrapers/sources/nts_nwmarket.py` (listing → PDF ids, Asotin filter)
-- [ ] crawl task in `nts_crawler.py` + `scheduler.py` entry
-- [ ] `AsotinWATrusteeSaleScraper` + `asotin` in `NTS_MATCH_COUNTIES`
-- [ ] migration 140: Asotin trustee_sale row, `active=false`, `assessor_url` set
-- [ ] tests with real PDF fixture
+- [x] `src/scrapers/sources/nts_nwmarket.py`: sitemap discovery (listing pagination is robots-disallowed), PDF link, Asotin-property filter
+- [x] `crawl_nts_nwmarket_asotin` + beat 10:00 UTC; 20 s crawl delay on every request; Redis memo keyed (advert, lastmod)
+- [x] shared parser: Aztec "continued … by oral proclamation to <date>" → latest forward date; address stops at "I. NOTICE"
+- [x] `AsotinWATrusteeSaleScraper` + `asotin` in `NTS_MATCH_COUNTIES`
+- [x] migration 140: Asotin trustee_sale row, `active=false`, `assessor_url` set
+- [x] tests: real sitemap/advert/3 PDFs; NTS suites 131→131 unchanged before/after parser change
+- [x] Codex review: 2 High + 1 Medium (memo ignored lastmod; failed insert memoised; empty extraction healthy) — fixed, re-review clean
+- [ ] DB-backed tests + a live crawl run — need test DB / owner approval
 
 Phase 2 — Helion recorder (probate / pre_foreclosure / divorce / death_certificate) + delivery criteria decision.
+  Note: Lewiston Tribune also prints Asotin Superior Court probate notices to creditors (e.g. nwmarket 156517) — possible probate source.
 Phase 3 — tax_delinquent crawl.
 
 ## Review

@@ -384,6 +384,8 @@ def crawl_nts_nwmarket_asotin() -> dict:
     waits the robots.txt crawl delay. An advert is remembered in Redis only after its PDF
     was read and parsed, so a failure is retried next run and a success never re-fetched.
     """
+    from urllib.parse import urlparse
+
     import redis as sync_redis
 
     from src.config import settings
@@ -392,7 +394,7 @@ def crawl_nts_nwmarket_asotin() -> dict:
     from src.scrapers.sources import nts_nwmarket as nwm
     from src.scrapers.sources import nts_pdf
     from src.scrapers.sources import nts_tacoma_index as nts
-    from src.utils.safe_http import safe_get
+    from src.utils.safe_http import safe_get, safe_get_following
 
     today = datetime.now(UTC).date()
     deadline = time.monotonic() + _NWM_DEADLINE_S
@@ -435,10 +437,15 @@ def crawl_nts_nwmarket_asotin() -> dict:
             attempted += 1
             try:
                 time.sleep(nwm.CRAWL_DELAY_S)
-                r = safe_get(advert, timeout=25, same_origin_as=nwm.BASE_URL, headers=headers)
-                pdf_url = nwm.extract_pdf_url(r.text) if r.status_code == 200 else None
+                # Follows the site's case-canonicalising 301 (every hop re-validated);
+                # the answer must still come from nwmarket itself.
+                r = safe_get_following(advert, timeout=25, require_https=True, headers=headers)
+                on_host = urlparse(r.url).hostname == urlparse(nwm.BASE_URL).hostname
+                pdf_url = nwm.extract_pdf_url(r.text) if r.status_code == 200 and on_host else None
                 if pdf_url is None:
                     summary["errored"] += 1
+                    _logger.warning("Asotin NTS advert %s: HTTP %d at %s, no notice PDF link",
+                                    advert, r.status_code, r.url)
                     continue
                 time.sleep(nwm.CRAWL_DELAY_S)
                 text = _fetch_pdf_text(pdf_url)

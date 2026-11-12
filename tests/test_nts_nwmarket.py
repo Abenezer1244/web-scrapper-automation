@@ -31,7 +31,7 @@ class TestDiscovery:
         assert 0 < len(recent) < len(every)
         assert set(recent) <= set(every)
         assert all(v >= "2026-11-10" for v in recent.values())
-        assert all(u.startswith("https://www.nwmarket.com/marketplace/advert/-Notices_") for u in every)
+        assert all(u.startswith("https://www.nwmarket.com/marketplace/advert/-notices_") for u in every)
 
     def test_non_advert_and_off_host_locations_are_dropped(self):
         xml = (
@@ -40,8 +40,9 @@ class TestDiscovery:
             "<url><loc>https://www.nwmarket.com/marketplace/advert/-Notices_7</loc>"
             "<lastmod>2026-11-11</lastmod></url>"
         )
+        # The sitemap's "-Notices_" is asked for as the "-notices_" the site 301s to.
         assert nwm.recent_adverts(xml, date(2026, 11, 1)) == [
-            ("https://www.nwmarket.com/marketplace/advert/-Notices_7", "2026-11-11")]
+            ("https://www.nwmarket.com/marketplace/advert/-notices_7", "2026-11-11")]
 
     def test_a_republished_advert_carries_its_newest_version(self):
         # The version is what the crawler remembers: a postponement republished at the
@@ -53,7 +54,7 @@ class TestDiscovery:
             "<lastmod>2026-11-05</lastmod></url>"
         )
         assert nwm.recent_adverts(xml, date(2026, 11, 1)) == [
-            ("https://www.nwmarket.com/marketplace/advert/-Notices_9", "2026-11-12")]
+            ("https://www.nwmarket.com/marketplace/advert/-notices_9", "2026-11-12")]
 
     def test_advert_page_yields_its_pdf(self):
         html = (_FIX / "nts_nwmarket_advert_2318.html").read_text(encoding="utf-8")

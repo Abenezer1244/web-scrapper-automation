@@ -63,7 +63,9 @@ def recent_adverts(sitemap_xml: str, since: date) -> list[tuple[str, str]]:
             continue
         if lastmod and date.fromisoformat(lastmod) < since:
             continue
-        url = f"https://{_HOST}{parsed.path}"
+        # The site 301s "-Notices_N" to "-notices_N"; ask for the canonical form so a
+        # fetch is one request, not two inside the crawl delay (seen live 2026-11-12).
+        url = f"https://{_HOST}{parsed.path.lower()}"
         out[url] = max(out.get(url, ""), lastmod)
     return list(out.items())
 

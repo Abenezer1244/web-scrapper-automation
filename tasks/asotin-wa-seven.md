@@ -55,11 +55,14 @@ Phase 1b (≤5 files) — trustee_sale
 - [x] migration 140: Asotin trustee_sale row, `active=false`, `assessor_url` set
 - [x] tests: real sitemap/advert/3 PDFs; NTS suites 131→131 unchanged before/after parser change
 - [x] Codex review: 2 High + 1 Medium (memo ignored lastmod; failed insert memoised; empty extraction healthy) — fixed, re-review clean
-- [ ] DB-backed tests + a live crawl run — need test DB / owner approval
+- [x] DB-backed tests on a disposable Docker Postgres/Redis (CI env); live crawl run 1 = 0/48 (301 bug, fixed), run 2 read every advert
 
-Phase 2 — Helion recorder (probate / pre_foreclosure / divorce / death_certificate) + delivery criteria decision.
+Phase 2 — Helion recorder (probate / pre_foreclosure / divorce / death_certificate): BLOCKED.
+  Automated reCAPTCHA interaction denied in-session; the 2Captcha key is in .env (not readable here).
   Note: Lewiston Tribune also prints Asotin Superior Court probate notices to creditors (e.g. nwmarket 156517) — possible probate source.
-Phase 3 — tax_delinquent crawl.
+Phase 3 — tax_delinquent: DONE (pacs_tax parser, shared PACS pass, pacs_tax_status 141, erasure 142,
+  crawler, scraper; Codex 3 High + 1 Medium fixed, re-review clean).
+Extra fix: county_gis scoped Asotin by FIPS '003' but the statewide layer has Asotin as NULL.
 
 ## Review
-(to fill in)
+See docs/BUILD_JOURNAL.md 2026-11-12 entry. Branch commits: `git log origin/main..feat/asotin-wa-seven-record-types`.

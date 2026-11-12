@@ -553,3 +553,28 @@ def test_the_owner_name_fallback_never_overrides_the_recording(outcome, eligible
     # A row that already has an address is never looked up.
     row.property_address = "1 MAIN ST"
     assert name_lookup_eligible(row) is False
+
+
+# ── Phase 3: death_certificate (Chelan recorder "DC"), code only ─────────────
+
+def test_chelan_death_certificate_type_takes_dc_only_and_names_the_decedent():
+    base = _PAGES[0]["data"]
+    dc = dict(base[0], DocType="DC", DirectName="STATE OF WASHINGTON DEPARTMENT OF HEALTH",
+              IndirectName="PARTY9 PERSON", TransactionItemId=999)
+    tod = next(r for p in _PAGES for r in p["data"] if r["DocType"] == "TOD")
+    s = ChelanAcclaimWebScraper(f"{_HOST}/AcclaimWeb", "chelan", "wa",
+                                record_types=["death_certificate"], record_type="death_certificate")
+    recs = s._records_from_raw([_grid_item(dc), _grid_item(tod)])
+    assert [r.doc_type for r in recs] == ["DC"]
+    assert recs[0].party_name == "PARTY9 PERSON"  # the decedent, not the issuing agency
+    assert ChelanAcclaimWebScraper.collection_scope("death_certificate") is not None
+
+
+async def test_a_type_the_site_has_no_vocabulary_for_is_refused_not_unfiltered():
+    # Codex P3 review: Douglas has no death_certificate codes; running it would have
+    # skipped the document filter and admitted every recording.
+    d = AcclaimWebScraper("https://edocs.douglascountywa.gov/AcclaimWeb", "douglas", "wa",
+                          record_types=["death_certificate"], record_type="death_certificate")
+    with pytest.raises(ScraperExecutionError, match="no document vocabulary"):
+        await d.scrape("10/06/2026", "10/06/2026")
+    assert d.page is None  # refused before any browser or portal request

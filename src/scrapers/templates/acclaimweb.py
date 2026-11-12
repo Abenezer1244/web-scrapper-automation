@@ -139,6 +139,8 @@ _CHELAN_DOC_TYPE_MAP = {
     **_DOC_TYPE_MAP,
     "probate": ["DC", "TOD"],
     "pre_foreclosure": ["NTS", "NTSCOM", "LP"],
+    # Recorded death certificates alone, as King defines the type (king_wa_probate.py).
+    "death_certificate": ["DC"],
 }
 
 
@@ -274,6 +276,14 @@ class AcclaimWebScraper(BridgeScraper):
         AcclaimWeb can return large result sets — split into 7-day chunks
         to keep things manageable and avoid timeouts.
         """
+        # A type this site has no vocabulary for would skip the document filter and
+        # admit every recording: refuse it before touching the portal.
+        if self.active_record_type and self.active_record_type not in self.DOC_TYPE_MAP:
+            raise ScraperExecutionError(
+                self.county, "AcclaimWeb",
+                f"no document vocabulary for {self.active_record_type} on this site",
+                record_type=self.active_record_type, date_from=date_from, date_to=date_to,
+            )
         start = datetime.strptime(date_from, "%m/%d/%Y")
         end = datetime.strptime(date_to, "%m/%d/%Y")
         chunk_days = 7
@@ -916,7 +926,7 @@ class AcclaimWebScraper(BridgeScraper):
                     if oriented is None:
                         continue
                     record.party_name, record.heirs = oriented
-                elif active_rt == "probate":
+                elif active_rt in ("probate", "death_certificate"):
                     # Death certs index the issuing agency / filing state as
                     # grantor, with the DECEDENT as grantee; promote the decedent
                     # and strip "Estate of" captions. No-op when grantor is the
@@ -1085,3 +1095,17 @@ class ChelanAcclaimWebScraper(AcclaimWebScraper):
     DOC_TYPE_MAP = _CHELAN_DOC_TYPE_MAP
     READS_DETAIL_APN = True
     APN_SHAPE = re.compile(r"\d{12}")  # Chelan parcel numbers: 12 digits
+
+    @classmethod
+    def collection_scope(cls, record_type: str):
+        """The shared keyword presentation has no death_certificate entry; Chelan's is
+        the recorder's own DEATH CERTIFICATE (DC) document type, shown as King's is."""
+        if record_type != "death_certificate":
+            return super().collection_scope(record_type)
+        from src.scrapers.doc_scope import CollectionScope, DocTypeItem
+
+        return CollectionScope(
+            kind="document_type",
+            items=(DocTypeItem(label="Death Certificate", exact=False),),
+            note="Recorded death certificates (the recorder's DC document code).",
+        )

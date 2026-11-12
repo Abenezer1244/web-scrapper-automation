@@ -68,11 +68,18 @@ PACS maps id+`0000` (PR #580). Volume is too small to prove much; the defects be
 
 ## Phase 1 (≤5 files) — fix the two live integrations
 - [x] Codex consult on this plan
-- [ ] pre_foreclosure: skip discontinuance rows (raw grantee `DISCONTINU… <instrument>`); verify each NTS candidate by instrument search; drop cancelled originals (`eagleweb.py`)
-- [ ] probate: exclude "WRIT OF EXEC" (`eagleweb.py`)
-- [ ] tests with recorded Clallam row fixtures; pytest on a test DB; ruff
-- [ ] live before/after scrape of Clallam probate + pre_foreclosure (no DB writes)
-- [ ] Codex review of the diff
+- [x] Based on 60c75d4d (Benton session's EagleWeb pagination fix: the old loop stopped at
+      the first page with no matching type; Clallam shows 5 rows a page, so runs read ~1 page)
+- [x] pre_foreclosure: skip discontinuance rows; on Clallam look up each deliverable NTS by
+      instrument (whole result set, rows must equal the portal total) and drop cancelled ones
+- [x] probate: exclude "WRIT OF EXEC" and "REVOCATION OF TRANSFER ON DEATH"
+- [x] tests: 7 new (real captured pages, routed Chromium); 56 pass with pagination/probate suites; ruff clean.
+      DB-free only: no local test DB exists (standing constraint). No routed scrape() test (Codex Low):
+      detail fetch uses real HTTP and the testing rules forbid mocking it; wiring proven live instead.
+- [x] live (no DB writes), 09/01-11/12/2026: pre_foreclosure 0 -> 13 (14 NTS = 10 kept + 4
+      discontinuances; + 3 lis pendens); probate 0 -> 76 (59 TOD, 17 Death; 3 revocations removed).
+      07/01-07/14/2026: NTS 2026-1484470 dropped via lookup (discontinued 09/18, after the window).
+- [x] Codex review: NO-GO (1 High, 1 Medium, 1 Low) on 00b9d93b -> fixed in b2ab050b -> GO
 
 ## Phase 2 — new types (after approval)
 - [ ] death_certificate via EagleWeb `DEATH`

@@ -7,6 +7,7 @@ first page with no matching row (page 3), so it returned 2 of the 5. Pages are
 served for the real portal host with page.route, so nothing reaches the network.
 """
 import gzip
+import re
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -28,10 +29,21 @@ def _page(n: int) -> str:
     return gzip.decompress((_FIXTURES / f"page{n}.html.gz").read_bytes()).decode("utf-8")
 
 
-async def _run(serve_page, max_pages: int | None = None, record_type: str = "pre_foreclosure") -> list:
-    """Collect pre-foreclosure rows across the week; serve_page(n) -> HTML for page n."""
+async def _run(serve_page, max_pages: int | None = None, record_type: str = "pre_foreclosure",
+               fill: bool = False, documents: Path | None = None) -> list:
+    """Collect pre-foreclosure rows across the week; serve_page(n) -> HTML for page n.
+    fill=True then reads each parcel-less row's recorded document (served from
+    fixtures/eagleweb_benton_week/documents, the real recorder PDFs)."""
     async def serve(route):
         query = parse_qs(urlparse(route.request.url).query)
+        doc = re.search(r"/downloads/(\d{4}_\d{6})\.pdf", route.request.url)
+        if doc:
+            path = (documents or _FIXTURES / "documents") / f"{doc.group(1)}.pdf"
+            if path.exists():
+                await route.fulfill(status=200, content_type="application/pdf", body=path.read_bytes())
+            else:
+                await route.fulfill(status=404, body="")
+            return
         if "docSearchResults.jsp" not in route.request.url:
             await route.fulfill(status=404, body="")
             return
@@ -45,7 +57,10 @@ async def _run(serve_page, max_pages: int | None = None, record_type: str = "pre
     async with scraper:
         await scraper.page.route(f"https://{_HOST}/**", serve)
         await scraper.page.goto(_RESULTS)
-        return await scraper._extract_all_pages()
+        records = await scraper._extract_all_pages()
+        if fill:
+            await scraper._fill_parcels_from_recorded_documents(records)
+        return records
 
 
 def _without_total(html: str) -> str:
@@ -145,6 +160,28 @@ async def test_death_certificate_keeps_only_recorded_death_certificates():
     assert all("DEPT OF HEALTH" not in (r.party_name or "") for r in records)
 
 
+async def test_truncated_parcels_are_read_off_the_recorded_document():
+    """All 5 of the week's filings show a truncated parcel ("Parcel: 1118911...").
+    Their recorded images give the full parcel; 2026-027018 also names Walla Walla
+    County parcels, so it is quarantined rather than pinned to one parcel."""
+    records = await _run(_page, fill=True)
+    by_number = {r.enrichment_data["instrument_number"]: r for r in records}
+    assert by_number["027155"].parcel_id == "111891100002006"
+    assert by_number["027262"].parcel_id == "101891020008011"
+    assert by_number["027553"].parcel_id == "102842040000021"
+    assert by_number["027478"].parcel_id == "102984020805002"  # a lis pendens
+    assert by_number["027155"].property_address == "1712S TACOMA ST, KENNEWICK, WA 99337"
+    assert by_number["027155"].enrichment_data["parcel_source"] == "recorded_document"
+    multi = by_number["027018"]
+    assert multi.parcel_id is None and multi.enrichment_data["recorded_document_multi_property"] is True
+
+
+async def test_unreadable_documents_fail_the_run_rather_than_drop_every_lead(tmp_path):
+    # An empty document folder: every recorded-document read returns 404.
+    with pytest.raises(RuntimeError, match="no recorded document could be read"):
+        await _run(_page, fill=True, documents=tmp_path)
+
+
 def test_a_same_day_window_still_searches_once():
     assert _date_chunks("11/12/2026", "11/12/2026", 7) == [("11/12/2026", "11/12/2026")]
 
@@ -170,3 +207,82 @@ def test_instrument_year_filter_rolls_with_the_calendar():
     # The floor never rises: in 2027 a 2024 instrument number is still not a parcel.
     assert _looks_like_instrument_year("2024023467", year=2027)
     assert _looks_like_instrument_year("2028000001", year=2027)
+
+
+def _copy_documents(dest: Path, **replace: bytes) -> Path:
+    """The week's real recorded PDFs, with some replaced by the given bytes."""
+    for f in (_FIXTURES / "documents").glob("*.pdf"):
+        (dest / f.name).write_bytes(replace.get(f.stem, f.read_bytes()))
+    return dest
+
+
+def _pdf(pages_from: Path | None = None, repeat: int = 1, blank_pages: int = 0) -> bytes:
+    from io import BytesIO
+
+    from pypdf import PdfReader, PdfWriter
+
+    w = PdfWriter()
+    for _ in range(repeat):
+        if pages_from is not None:
+            for page in PdfReader(pages_from).pages:
+                w.add_page(page)
+    for _ in range(blank_pages):
+        w.add_blank_page(width=612, height=792)
+    buf = BytesIO()
+    w.write(buf)
+    return buf.getvalue()
+
+
+async def test_a_document_past_the_page_cap_is_quarantined_not_pinned(tmp_path):
+    """Pages that are not read could name another property (Codex)."""
+    long_doc = _pdf(_FIXTURES / "documents" / "2026_027155.pdf", repeat=5)  # 6 pages x 5 = 30
+    records = await _run(_page, fill=True, documents=_copy_documents(tmp_path, **{"2026_027155": long_doc}))
+    by_number = {r.enrichment_data["instrument_number"]: r for r in records}
+    assert by_number["027155"].parcel_id is None
+    assert by_number["027262"].parcel_id == "101891020008011"  # the others still fill
+
+
+async def test_image_only_scans_count_as_failed_reads(tmp_path):
+    blank = _pdf(blank_pages=4)
+    docs = {f.stem: blank for f in (_FIXTURES / "documents").glob("*.pdf")}
+    with pytest.raises(RuntimeError, match="no recorded document could be read"):
+        await _run(_page, fill=True, documents=_copy_documents(tmp_path, **docs))
+
+
+async def test_an_oversized_document_is_refused_while_streaming(tmp_path, monkeypatch):
+    import src.scrapers.templates.eagleweb as ew
+
+    monkeypatch.setattr(ew, "_RECORDED_DOCUMENT_MAX_BYTES", 50_000)  # every real NTS is larger
+    with pytest.raises(RuntimeError, match="no recorded document could be read"):
+        await _run(_page, fill=True)
+
+
+async def test_the_document_link_never_reaches_the_record_or_its_hash():
+    records = await _run(_page)
+    assert all(getattr(r, "_document_href", None) for r in records)
+    assert all("_document_href" not in str(r.to_dict()) and "viewAttachment" not in str(r.to_dict())
+               for r in records)
+
+
+async def test_a_stalled_document_download_times_out(monkeypatch):
+    """A response that never arrives must not hold the run until the worker deadline."""
+    import asyncio
+
+    import src.scrapers.templates.eagleweb as ew
+
+    monkeypatch.setattr(ew, "_RECORDED_DOCUMENT_TIMEOUT_MS", 1_500)
+    scraper = EagleWebScraper(f"https://{_HOST}/recorder/web/", "benton", "wa", ["pre_foreclosure"],
+                              record_type="pre_foreclosure")
+
+    async def serve(route):
+        if "/downloads/" in route.request.url:
+            await asyncio.sleep(30)  # stalls far past the deadline
+            return
+        await route.fulfill(status=200, content_type="text/html", body=_page(1))
+
+    async with scraper:
+        await scraper.page.route(f"https://{_HOST}/**", serve)
+        await scraper.page.goto(_RESULTS)
+        with pytest.raises(Exception, match="(?i)abort"):
+            await asyncio.wait_for(scraper._fetch_document(
+                f"https://{_HOST}/recorder/eagleweb/downloads/2026_027155.pdf?id=DOC1.A0&parent=DOC1"), 10)

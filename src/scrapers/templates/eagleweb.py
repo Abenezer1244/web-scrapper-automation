@@ -77,9 +77,18 @@ _DOC_TYPE_EXCLUDE = {
                 "WRIT OF EXEC",
                 # A living owner cancelling a TOD deed is neither a death nor a TOD signal.
                 "REVOCATION OF TRANSFER ON DEATH"],
-    # The bare DEATH code also hits "Transfer on Death Deed" (a living owner's deed).
-    "death_certificate": ["TRANSFER ON DEATH", "LACK OF PROBATE", "TRUSTEE"],
 }
+
+# death_certificate keeps a row only when its WHOLE label is one of these (Codex: the
+# bare DEATH keyword also hits "Affidavit of Death" and Transfer-on-Death deeds).
+_DEATH_CERT_LABELS = frozenset({"DEATH", "DEATH CERTIFICATE", "CERTIFICATE OF DEATH"})
+
+
+def _doc_label(desc: str) -> str:
+    """The document-type label of a results Description cell, without its instrument
+    number, upper-cased with hyphens and runs of whitespace collapsed to one space."""
+    label = re.split(r"\b\d{4}-\d{5,}\b|\b\d{5,}\b", desc, maxsplit=1)[0]
+    return " ".join(label.replace("-", " ").upper().split())
 
 # Clallam files a Discontinuance of Trustee's Sale under its NTS type. The only
 # marker is "DISCONTINUANCE <original instrument>" in the party cell (verified live
@@ -1054,7 +1063,8 @@ class EagleWebScraper(BridgeScraper):
                     parcel_source_counts["table"] += 1
 
                 # Parse AFN from description and store in enrichment_data
-                afn_match = re.search(r"\b(\d{5,})\b", desc)
+                # Year-dashed instruments (Clallam 2026-1486473) keep their year.
+                afn_match = re.search(r"\b(\d{4}-\d{5,})\b", desc) or re.search(r"\b(\d{5,})\b", desc)
                 if afn_match:
                     record.enrichment_data["instrument_number"] = afn_match.group(1)
                     if detail_href:
@@ -1208,6 +1218,8 @@ class EagleWebScraper(BridgeScraper):
                                 kws = _DOC_TYPE_MAP.get(active_rt, [])
                             if not _doc_type_matches(doc_upper, kws):
                                 continue  # Skip non-matching doc types
+                            if active_rt == "death_certificate" and _doc_label(desc) not in _DEATH_CERT_LABELS:
+                                continue  # e.g. "Affidavit of Death", a TOD deed
                             excludes = _DOC_TYPE_EXCLUDE.get(active_rt, [])
                             if any(neg in doc_upper for neg in excludes):
                                 continue  # e.g. "LACK OF PROBATE AFFIDAVIT"

@@ -70,9 +70,33 @@ Licensing: the Assessor's search page cites RCW 42.56.070(9) (no commercial list
 - [x] Live (read-only, Oct 1–12): 9 leads -> 6 one-APN `found` -> **6/6 statewide-GIS situs, 6/6 PACS owner mailing** (before: 0/9 addresses). 2 TODs `ambiguous` (several parcels), 1 DC `none` -> name fallback `no_match` (stays undelivered)
 - [x] Tests: 59 in the Chelan/AcclaimWeb files (APN parse incl. `&amp;`/`;`/repeat-label/plat numbers, shape, retry, refusal, unreadable-200, one-request-per-recording, name-fallback rule)
 
-### Phase 3: death_certificate for Chelan (recorder `DC`). Code only, connector change waits for owner approval
-### Phase 4 (owner decisions): trustee_sale sale-date via NTS images; tax_delinquent from the Treasurer foreclosure list; SmartGov code cases
-### Blocked: divorce, court probate (paid subscription / in person)
+### Phase 3: death_certificate (DONE, code only, Codex GO)
+- [x] `_CHELAN_DOC_TYPE_MAP["death_certificate"] = ["DC"]`, decedent orientation, "Death Certificate" scope. Live Oct 1–12: 1 DC; its page has no legal (no APN); a name lookup of the decedent returned `no_match`, so the lead has no address and is not delivered
+- [x] Fail closed: a type a site has no vocabulary for is refused before any request (it used to skip the filter)
+- [ ] Activation (owner): add `death_certificate` to the Chelan connector's `record_types` (no migration needed; `ALL_RECORD_TYPES` already has it)
+
+### Phase 4 (owner decisions, not started)
+- trustee_sale: sale date only in scan-only NTS PDFs (`/Image/DocumentPdfAllPages/{id}`, free, 300 dpi, no text layer). Needs OCR (Tesseract is a new dependency: SBOM check plus Railway image change). About 2 NTS per month
+- tax_delinquent: Treasurer "Real Property Auction List" (HTML, 13 parcels, updated 11/09/2026, Owner/Amount Due/Situs; no tax years or redemption status) and per-parcel PACS cid=90 balances. County terms forbid "any for-profit commercial purpose or use" without written consent. Public Surplus forbids robots. Legal call first
+
+## Seven-category matrix (measured 2026-11-12)
+
+Live window for coverage numbers: recorded 10/01–10/12/2026, read-only.
+
+| Category | Official source | Access | Freshness | Implementation | Verified fields | Coverage in window | Tests / Codex | Status |
+|---|---|---|---|---|---|---|---|---|
+| Probate (`probate`) | Auditor AcclaimWeb: DC + TOD | Public disclaimer; no stated automation terms | Banner "released through 08/10/2026"; Sept/Oct docs indexed | Existing, repaired (2a, 2b) | Instrument, record date (Pacific), doc code, parties, legal; APN from the recording (TOD/NTS) | 7 leads: 6 TOD (living owner, opt-in) + 1 DC. 4 one-APN found -> GIS situs + PACS mailing; 2 multi-parcel held for review; DC has no parcel and no name match | 61 fixture tests; Codex GO | **Implemented but awaiting validation**: blocked on owner-role verification (assessor current owner never stored for Chelan), and court probate needs the paid Clerk subscription |
+| Pre-foreclosure (`pre_foreclosure`) | AcclaimWeb NTS, NTSCOM, LP (NOD = discontinuance, excluded) | as above | as above | Existing, repaired | + Borrower and related DT on the detail page (not yet used) | 2 NTS, both with one APN -> 2/2 situs + mailing | same | **Implemented but awaiting validation** (no deploy yet; amounts not extracted, so no financial fields) |
+| Auction (`trustee_sale`) | AcclaimWeb NTS images | Free PDF, no login | ~2/month | None | Sale date/time/place are in the image only | 0 | n/a | **Partial**: needs an OCR decision |
+| Tax delinquent (`tax_delinquent`) | Treasurer auction list + PACS cid=90 | Public HTML; county ToU bars commercial use without consent | Annual list (11/09/2026), per-parcel live | None | Parcel, owner, amount due, situs (list) | 0 | n/a | **Blocked by legal/data limitations** (owner legal call) |
+| Code violation (`code_violation`) | County CDD + 5 cities | Complaint forms; SmartGov public shows no cases (robots disallow) | n/a | None | none | 0 | n/a | **Blocked by source/access conditions** (records request only) |
+| Divorce (`divorce`) | Superior Court Clerk OnBase; Odyssey unconfirmed | Paid subscription / in person; no recorder doc type | n/a | None | none | 0 | n/a | **Blocked by source/access conditions** |
+| Death certificate (`death_certificate`) | AcclaimWeb DC recordings (DOH certificates restricted, RCW 70.58A) | Public index | as recorder | New, code only | Decedent, record date, instrument (no parcel on DC pages) | 1 DC, 0 deliverable (no address) | test + Codex GO | **Partial**: collected correctly, rarely qualifies; connector not activated |
+
+Data quality before vs after, same window: before, 2 probate rows were found (1 a generic affidavit), 0 pre-foreclosure, 0 addresses. After: 12/12 days read in full (rows == portal total), 9 typed leads, 6 linked to a recorded parcel with situs and mailing.
 
 ## Review
-(to fill in)
+- Three commits on `feat/chelan-seven-record-types` (06b9ede4, 65ab961f, 9d9a6d8f). Not pushed, not deployed; no production data changed (production reads were SELECT only).
+- Douglas is behaviour-preserving apart from three changes: a 30 s search-form deadline with one retry, a refusal for record types it has no codes for, and a regression-verified rows == total read (6 days live).
+- Not done: customer-facing Playwright validation (nothing is deployed and nothing frontend-side changed); marketing coverage unchanged; no production scraper enabled.
+- Release blockers for calling probate/pre_foreclosure "verified and release-ready": owner-role verification (assessor current owner / title status are blank for Chelan), a deploy, and one observed production run of each.

@@ -114,6 +114,7 @@ _NWM_WINDOW_DAYS = 7
 _NWM_MAX_ADVERTS = 60          # per run; the rest wait for the next run, logged
 _NWM_DEADLINE_S = 45 * 60      # under the 55 min soft limit
 _NWM_SEEN_TTL_S = 14 * 86400   # outlives the window
+_NWM_MIN_TEXT_CHARS = 100      # below this a PDF is unreadable (scan); real notices are 800+
 
 
 @app.task(name="src.workers.nts_crawler.crawl_nts_tacoma_index")
@@ -389,6 +390,7 @@ def crawl_nts_nwmarket_asotin() -> dict:
     from src.db.models import NtsNotice
     from src.db.session import system_sync_session
     from src.scrapers.sources import nts_nwmarket as nwm
+    from src.scrapers.sources import nts_pdf
     from src.scrapers.sources import nts_tacoma_index as nts
     from src.utils.safe_http import safe_get
 
@@ -409,19 +411,23 @@ def crawl_nts_nwmarket_asotin() -> dict:
         _alert_if_crawl_barren(nwm.SOURCE, discovered=0, upserted=0)
         return summary
 
-    adverts = nwm.recent_advert_urls(resp.text, today - timedelta(days=_NWM_WINDOW_DAYS))
+    adverts = nwm.recent_adverts(resp.text, today - timedelta(days=_NWM_WINDOW_DAYS))
     summary["discovered"] = len(adverts)
-    seen_key = "bl:nts_nwmarket:seen:{}".format
+
+    def seen_key(advert: str, version: str) -> str:
+        # Keyed on the advert's lastmod too: a republished (postponed) notice is new.
+        return f"bl:nts_nwmarket:seen:{advert.rsplit('_', 1)[-1]}:{version}"
+
     try:
         rds = sync_redis.from_url(settings.REDIS_URL, **settings.redis_kwargs())
-        todo = [u for u in adverts if not rds.exists(seen_key(u.rsplit("_", 1)[-1]))]
+        todo = [(u, v) for u, v in adverts if not rds.exists(seen_key(u, v))]
     except Exception as exc:  # noqa: BLE001 — without the memo, read everything (slower, not wrong)
         _logger.warning("Asotin NTS seen-set unavailable, reading all: %s", str(exc)[:120])
         rds, todo = None, adverts
 
     attempted = 0
     with system_sync_session() as db:
-        for i, advert in enumerate(todo):
+        for i, (advert, version) in enumerate(todo):
             if i >= _NWM_MAX_ADVERTS or time.monotonic() > deadline:
                 # Never truncate silently: the rest stay unseen and are read next run.
                 _logger.warning("Asotin NTS run stopped with %d adverts unread", len(todo) - i)
@@ -435,8 +441,14 @@ def crawl_nts_nwmarket_asotin() -> dict:
                     summary["errored"] += 1
                     continue
                 time.sleep(nwm.CRAWL_DELAY_S)
-                blocks, _ = _fetch_legals_issue(pdf_url)
-                for block in blocks:
+                text = _fetch_pdf_text(pdf_url)
+                if len(text) < _NWM_MIN_TEXT_CHARS:
+                    # A scanned or broken PDF is a failed read, never a "no sale" read.
+                    summary["errored"] += 1
+                    _logger.warning("Asotin NTS PDF %s yielded no usable text", pdf_url)
+                    continue
+                failed_before = summary["errored"] + summary.get("dropped_undated", 0)
+                for block in nts_pdf.split_notice_blocks(text):
                     if not nwm.is_asotin_property(block):
                         summary["other_county"] += 1
                         continue
@@ -445,9 +457,13 @@ def crawl_nts_nwmarket_asotin() -> dict:
                         county=nwm.COUNTY, parse_fn=nts.parse_tacoma_notice, today=today,
                         summary=summary)
                 db.commit()
+                if summary["errored"] + summary.get("dropped_undated", 0) > failed_before:
+                    # A notice failed to store, or a real sale whose date did not parse:
+                    # not "read", so it is retried next run (and after a parser fix).
+                    continue
                 summary["read"] += 1
                 if rds is not None:
-                    rds.set(seen_key(advert.rsplit("_", 1)[-1]), "1", ex=_NWM_SEEN_TTL_S)
+                    rds.set(seen_key(advert, version), "1", ex=_NWM_SEEN_TTL_S)
             except Exception as exc:  # noqa: BLE001 — one advert must not stop the run
                 db.rollback()
                 summary["errored"] += 1
@@ -532,6 +548,15 @@ def _fetch_legals_issue(pdf_url: str) -> tuple[list[str], bool]:
     The flag separates "this week's issue carries no trustee sale" (a real issue,
     0 blocks) from "the extraction produced nothing usable" (0 blocks too).
     """
+    from src.scrapers.sources import nts_pdf
+
+    text = _fetch_pdf_text(pdf_url)
+    return nts_pdf.split_notice_blocks(text), nts_pdf.looks_like_legals_issue(text)
+
+
+def _fetch_pdf_text(pdf_url: str) -> str:
+    """Download one PDF (SSRF-guarded, byte-capped) and return its normalized text.
+    Raises on download/extract failure."""
     import os
     import tempfile
 
@@ -552,8 +577,7 @@ def _fetch_legals_issue(pdf_url: str) -> tuple[list[str], bool]:
             os.remove(path)
         except OSError:
             pass
-    text = nts_pdf.normalize_pdf_text(nts_pdf.extract_pdf_text(data))
-    return nts_pdf.split_notice_blocks(text), nts_pdf.looks_like_legals_issue(text)
+    return nts_pdf.normalize_pdf_text(nts_pdf.extract_pdf_text(data))
 
 
 def _ingest_pdf_blocks(

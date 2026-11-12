@@ -25,11 +25,12 @@ def _notice(name: str) -> str:
 class TestDiscovery:
     def test_window_keeps_only_recent_adverts_on_our_host(self):
         xml = (_FIX / "nts_nwmarket_sitemap.xml").read_text(encoding="utf-8")
-        every = nwm.recent_advert_urls(xml, date(2000, 1, 1))
-        recent = nwm.recent_advert_urls(xml, date(2026, 11, 10))
+        every = dict(nwm.recent_adverts(xml, date(2000, 1, 1)))
+        recent = dict(nwm.recent_adverts(xml, date(2026, 11, 10)))
         assert len(every) == 266  # 366 advert entries; the live sitemap repeats 100 of them
         assert 0 < len(recent) < len(every)
         assert set(recent) <= set(every)
+        assert all(v >= "2026-11-10" for v in recent.values())
         assert all(u.startswith("https://www.nwmarket.com/marketplace/advert/-Notices_") for u in every)
 
     def test_non_advert_and_off_host_locations_are_dropped(self):
@@ -39,8 +40,20 @@ class TestDiscovery:
             "<url><loc>https://www.nwmarket.com/marketplace/advert/-Notices_7</loc>"
             "<lastmod>2026-11-11</lastmod></url>"
         )
-        assert nwm.recent_advert_urls(xml, date(2026, 11, 1)) == [
-            "https://www.nwmarket.com/marketplace/advert/-Notices_7"]
+        assert nwm.recent_adverts(xml, date(2026, 11, 1)) == [
+            ("https://www.nwmarket.com/marketplace/advert/-Notices_7", "2026-11-11")]
+
+    def test_a_republished_advert_carries_its_newest_version(self):
+        # The version is what the crawler remembers: a postponement republished at the
+        # same URL must look new, whichever duplicate the sitemap lists first.
+        xml = (
+            "<url><loc>https://www.nwmarket.com/marketplace/advert/-Notices_9</loc>"
+            "<lastmod>2026-11-12</lastmod></url>"
+            "<url><loc>https://www.nwmarket.com/marketplace/advert/-Notices_9</loc>"
+            "<lastmod>2026-11-05</lastmod></url>"
+        )
+        assert nwm.recent_adverts(xml, date(2026, 11, 1)) == [
+            ("https://www.nwmarket.com/marketplace/advert/-Notices_9", "2026-11-12")]
 
     def test_advert_page_yields_its_pdf(self):
         html = (_FIX / "nts_nwmarket_advert_2318.html").read_text(encoding="utf-8")
@@ -102,3 +115,13 @@ def test_the_crawl_task_is_registered_and_scheduled():
     assert "src.workers.nts_crawler.crawl_nts_nwmarket_asotin" in app.tasks
     tasks = {v["task"] for v in app.conf.beat_schedule.values()}
     assert "src.workers.nts_crawler.crawl_nts_nwmarket_asotin" in tasks
+
+
+def test_a_readable_non_sale_pdf_is_a_read_not_an_extraction_failure():
+    # Real 2026-11-12 WSU bid notice: enough text to be a real read, no trustee sale.
+    from src.workers.nts_crawler import _NWM_MIN_TEXT_CHARS
+
+    text = _notice("nts_nwmarket_other_156590.pdf")
+    assert len(text) >= _NWM_MIN_TEXT_CHARS
+    assert nts_pdf.split_notice_blocks(text) == []
+    assert not nwm.is_asotin_property(text)

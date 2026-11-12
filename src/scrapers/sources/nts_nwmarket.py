@@ -48,13 +48,15 @@ _ASOTIN_PROPERTY = re.compile(
 )
 
 
-def recent_advert_urls(sitemap_xml: str, since: date) -> list[str]:
-    """Advert URLs (host-pinned) whose sitemap ``lastmod`` is on or after ``since``.
+def recent_adverts(sitemap_xml: str, since: date) -> list[tuple[str, str]]:
+    """``(advert_url, lastmod)`` for host-pinned adverts changed on or after ``since``.
 
-    An entry with no lastmod is kept: we cannot tell it is old, and dropping it could
-    silently lose a sale. Sitemap order, de-duplicated.
+    ``lastmod`` is the advert's version: a postponement republished at the same URL
+    gets a new one, so a crawler that remembers (url, lastmod) re-reads it. The live
+    sitemap repeats some adverts; the latest lastmod wins. An entry with no lastmod is
+    kept with version "" (we cannot tell it is old). Sitemap order.
     """
-    out: list[str] = []
+    out: dict[str, str] = {}
     for loc, lastmod in _SITEMAP_ENTRY.findall(sitemap_xml):
         parsed = urlparse(loc)
         if parsed.hostname != _HOST or not _ADVERT_PATH.match(parsed.path):
@@ -62,9 +64,8 @@ def recent_advert_urls(sitemap_xml: str, since: date) -> list[str]:
         if lastmod and date.fromisoformat(lastmod) < since:
             continue
         url = f"https://{_HOST}{parsed.path}"
-        if url not in out:
-            out.append(url)
-    return out
+        out[url] = max(out.get(url, ""), lastmod)
+    return list(out.items())
 
 
 def extract_pdf_url(advert_html: str) -> str | None:

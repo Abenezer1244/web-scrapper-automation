@@ -108,3 +108,14 @@ def test_a_parcel_list_continued_on_the_next_line_is_multi_property():
     text = gzip.decompress((_DIR / "2026_025237.txt.gz").read_bytes()).decode("utf-8")
     text = text.replace("ParcelNumber 110984020208009", "ParcelNumber(s): 110984020208009,\n128993050001007")
     assert parse_recorded_nts(text)["multi_property"] is True
+
+
+def test_a_space_grouped_parcel_is_read():
+    text = gzip.decompress((_DIR / "2026_025237.txt.gz").read_bytes()).decode("utf-8")
+    text = text.replace("ParcelNumber 110984020208009", "Parcel Number: 1 1098 402 0208 009")
+    assert parse_recorded_nts(text)["parcels"] == ["110984020208009"]
+
+
+def test_a_blank_line_ends_a_name():
+    p = parse_recorded_nts("Current Beneficiary: ACME BANK\n\nNOTICE OF TRUSTEE SALE\nSome text")
+    assert p["beneficiary"] == "ACME BANK"

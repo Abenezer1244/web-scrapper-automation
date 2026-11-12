@@ -79,6 +79,8 @@ _PARCEL_LABEL = re.compile(
 )
 # One parcel-shaped number (dashes allowed, no spaces: spaces would merge neighbours).
 _PARCEL_NUMBER = re.compile(r"\d[\d\-]{9,24}\d")
+_GROUPED_NUMBER = re.compile(r"\d[\d\- ]{9,30}\d")
+_LIST_SEPARATOR = re.compile(r"[,;&]|\band\b", re.I)
 # A continuation line that only lists more numbers ("128993050001007, and").
 _NUMBERS_ONLY = re.compile(r"^[\d\-\s,;&]*(?:and)?[\d\-\s,;&]*$", re.I)
 _COMMONLY_KNOWN = re.compile(_loose("commonly known as") + r"\s*:?\s*(.+)(?:\n(.+))?", re.I)
@@ -164,7 +166,8 @@ def _name(pattern: re.Pattern, text: str, max_lines: int = 4) -> str | None:
     if not m:
         return None
     parts = [m.group(1)]
-    for line in text[m.end():].lstrip("\n").split("\n")[:max_lines]:
+    # [1:]: the match ends at its own line's end; a blank line stops the name.
+    for line in text[m.end():].split("\n")[1:max_lines + 1]:
         if not line.strip() or _NEXT_FIELD.match(line) or ":" in line:
             break
         parts.append(line)
@@ -179,10 +182,17 @@ def _parcels(text: str) -> list[str]:
     for m in _PARCEL_LABEL.finditer(text):
         lines = text[m.end():].split("\n")
         chunk = [lines[0]] + [ln for ln in lines[1:3] if ln.strip() and _NUMBERS_ONLY.match(ln)]
-        for raw in _PARCEL_NUMBER.findall(" ".join(chunk)):
-            p = benton_parcel(raw)
-            if p and p not in found:
-                found.append(p)
+        # Split the list on its separators, then read each item both ways: as
+        # unspaced numbers, and as one space-grouped number ("1 1098 402 0208 009").
+        for item in _LIST_SEPARATOR.split(" ".join(chunk)):
+            candidates = _PARCEL_NUMBER.findall(item)
+            grouped = _GROUPED_NUMBER.search(item)
+            if grouped:
+                candidates.append(grouped.group(0))
+            for raw in candidates:
+                p = benton_parcel(raw)
+                if p and p not in found:
+                    found.append(p)
     return found
 
 

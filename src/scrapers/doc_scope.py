@@ -146,6 +146,12 @@ _PREFORECLOSURE_LABELS: dict[str, str] = {
 }
 _PREFORECLOSURE_BUCKET = {"NTS", "NOD", "LISP", "NTSCL"}
 
+_DEATH_CERTIFICATE_LABELS: dict[str, str] = {
+    "CERT OF DEATH": "Death Certificate",  # Benton's index label
+    "CERTIFICATE OF DEATH": "Death Certificate",
+    "DEATH CERTIFICATE": "Death Certificate",
+}
+
 _TAX_LABELS: dict[str, str] = {
     "TAX LIEN": "Tax Lien",
     "FEDERAL TAX LIEN": "Federal Tax Lien",
@@ -169,6 +175,7 @@ _PRESENTATION: dict[str, tuple[dict[str, str], set[str], str]] = {
         "Other foreclosure-stage filings (county-specific codes)",
     ),
     "tax_delinquent": (_TAX_LABELS, _TAX_BUCKET, "Other tax filings (county-specific codes)"),
+    "death_certificate": (_DEATH_CERTIFICATE_LABELS, set(), "Other death certificate filings"),
 }
 
 # Divorce scope is NOT derived from a connector's keyword list: divorce-capable

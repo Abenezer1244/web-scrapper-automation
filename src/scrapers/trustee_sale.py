@@ -270,6 +270,7 @@ class _TrusteeSaleScraper(BridgeScraper):
                 NtsNotice.is_active.is_(True),
                 # A privacy-withheld notice (132) is inactive too; never built from.
                 NtsNotice.privacy_suppression_id.is_(None),
+                NtsNotice.cancelled_at.is_(None),
                 NtsNotice.auction_date.isnot(None),
                 NtsNotice.auction_date >= today,
             ]
@@ -382,3 +383,22 @@ class ClarkWATrusteeSaleScraper(_TrusteeSaleScraper):
     """Clark County (WA) auction leads — The Columbian classifieds NTS cache."""
 
     COUNTY = "clark"
+
+
+class BentonWATrusteeSaleScraper(_TrusteeSaleScraper):
+    """Benton County (WA) auction leads — notices read off the county recorder's own
+    recorded images (src/scrapers/sources/nts_benton_crawl.py), not a newspaper."""
+
+    COUNTY = "benton"
+
+    @classmethod
+    def collection_scope(cls, record_type: str):
+        from src.scrapers.doc_scope import CollectionScope, DocTypeItem
+
+        if record_type != RECORD_TYPE:
+            return None
+        return CollectionScope(
+            kind="document_type",
+            items=(DocTypeItem(label="Notice of Trustee Sale", exact=True),),
+            note="Recorded trustee-sale notices read from the Benton County Auditor's recorded documents.",
+        )

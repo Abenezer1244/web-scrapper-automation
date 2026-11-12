@@ -119,3 +119,27 @@ def test_a_space_grouped_parcel_is_read():
 def test_a_blank_line_ends_a_name():
     p = parse_recorded_nts("Current Beneficiary: ACME BANK\n\nNOTICE OF TRUSTEE SALE\nSome text")
     assert p["beneficiary"] == "ACME BANK"
+
+
+def test_a_dated_single_parcel_notice_becomes_an_auction_row():
+    from src.scrapers.sources.nts_benton_recorder import recorded_notice_to_row
+
+    row = recorded_notice_to_row(_parse("2026_025237"), "https://rec/doc", date(2026, 11, 12))
+    assert row["source"] == "benton_recorder" and row["ts_number"] == "REC-2026-025237"
+    assert row["county"] == "benton" and row["parcel"] == "110984020208009"
+    assert row["auction_date"] == date(2027, 2, 5) and row["is_active"] is True
+    assert row["principal_owing"] == Decimal("212407.68") and row["principal_owing_basis"] == "principal"
+
+
+def test_a_notice_a_discontinuance_names_is_stored_inactive():
+    from src.scrapers.sources.nts_benton_recorder import recorded_notice_to_row
+
+    row = recorded_notice_to_row(_parse("2026_025237"), "u", date(2026, 11, 12), frozenset({"2026-025237"}))
+    assert row["is_active"] is False
+
+
+def test_multi_property_and_undated_notices_are_never_auction_rows():
+    from src.scrapers.sources.nts_benton_recorder import recorded_notice_to_row
+
+    assert recorded_notice_to_row(_parse("2026_027018"), "u", date(2026, 11, 12)) is None  # two counties
+    assert recorded_notice_to_row(_parse("2026_024803"), "u", date(2026, 11, 12)) is None  # OCR-damaged date

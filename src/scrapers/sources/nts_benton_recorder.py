@@ -224,3 +224,53 @@ def parse_recorded_nts(text: str) -> dict[str, Any]:
         "multi_property": len(parcels) > 1 or bool(other_counties),
         "other_counties": other_counties,
     }
+
+
+def ts_key(instrument_number: str) -> str:
+    """The nts_notices key for a recorded notice: the RECORDER document, not the sale.
+
+    Many Benton notices print no TS number, and an amended notice is a new recorded
+    document, so the instrument number is the stable identity (Codex)."""
+    return f"REC-{instrument_number}"
+
+
+def recorded_notice_to_row(parsed: dict[str, Any], source_url: str, today: date,
+                           cancelled: frozenset[str] = frozenset()) -> dict[str, Any] | None:
+    """A parsed recorded NTS -> an nts_notices upsert row, or None when it must not be
+    an auction lead: no instrument, no sale date, several properties, or no single
+    Benton parcel. ``cancelled`` holds instrument numbers a recorded Discontinuance
+    names; such a notice is stored inactive so no lead is built from it."""
+    import hashlib
+
+    from src.utils.address_intel import address_match_key
+
+    instrument = parsed.get("instrument_number")
+    auction = parsed.get("auction_date")
+    if not instrument or auction is None or parsed.get("multi_property") or len(parsed.get("parcels") or []) != 1:
+        return None
+    parcel = parsed["parcels"][0]
+    addr = _clean(parsed.get("property_address"), 512)
+    payload = "|".join(str(v or "") for v in (instrument, auction, addr, parsed.get("trustee"),
+                                               parsed.get("beneficiary"), parsed.get("principal_owing"), parcel))
+    return {
+        "source": SOURCE,
+        "ts_number": ts_key(instrument),
+        "county": COUNTY,
+        "state": STATE,
+        "parcel": parcel,
+        "property_address": addr,
+        "property_address_normalized": _clean(address_match_key(addr), 512) if addr else None,
+        "auction_date": auction,
+        "auction_time": _clean(parsed.get("auction_time"), 16),
+        "auction_location": None,
+        "grantor": _clean(parsed.get("grantor"), 512),
+        "trustee": _clean(parsed.get("trustee"), 255),
+        "beneficiary": _clean(parsed.get("beneficiary"), 255),
+        "principal_owing": parsed.get("principal_owing"),
+        "principal_owing_basis": parsed.get("principal_owing_basis"),
+        "note_amount": None,
+        "nod_date": None,
+        "source_url": source_url[:512],
+        "raw_hash": hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+        "is_active": auction >= today and instrument not in cancelled,
+    }

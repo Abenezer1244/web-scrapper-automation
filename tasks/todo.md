@@ -64,25 +64,21 @@ Started 2026-11-12. NOTHING pushed/deployed. Owner approval needed before each p
       Live Benton 60d: 23 certificates, 12 with parcel, 0 agency names. Probate returns the same 23 in Benton.
       Billing dedup is per user on property / name+date, not record type -> no double billing across the two types.
       Needs the connector row's record_types updated at deploy (owner).
-- [ ] 2b Benton parcel resolution / trustee_sale -- REDESIGNED, needs owner OK (schema change):
-      * survey 90d: 29 Benton pre_foreclosure filings, only 4 with a full parcel; truncated prefixes mostly 1-9 digits
-        (statewide-layer prefix match infeasible). Assessor site (Spatialest/Schneider) terms BAN scraping -> not used.
-      * recorded document PDFs are free on the recorder's public site (disclaimer: fees only for official copies) and
-        have a text layer. 13 NTS in 60d: Section IV sum owing 13/13, "commonly known as" address 13/13, auction date
-        >=7/13 (crude regex), printed parcel 2/13. Lis pendens: parcel or address ~half.
-      * Codex design consult: PLAN CHANGES NEEDED (P1 x6): recorder-document identity separate from sale identity
-        (no TS# on many); keep incomplete notices for parcel fill but gate trustee_sale on auction date; model
-        cancellation (crawl discontinuances, link by reference); multi-property/multi-county notices need child rows
-        or quarantine; parcel fill must happen in the scraper BEFORE the parcel filter/billing hash/privacy gate;
-        exact address contract (situs+city+unit+FIPS, single parcel) with provenance; NTSCL kept distinct.
-      -> new nts schema (migration) + Benton recorder NTS crawler + parcel fill + trustee_sale subclass: own phase.
-- [ ] 2c tax_delinquent -- BLOCKED on owner decision:
-      * source works: Treasurer foreclosure PDF (3 parcels, min bid, sale 11/16+11/19/2026 GovEase) + Benton PACS
-        detail per parcel: per-year balance (2023-2026 tax/penalty/interest), owner, mailing, "as of" date.
-      * CONFLICT: 18-month hard tax cap (owner decision 2026-06-16, recency over volume). Foreclosure-list parcels are
-        3+ years delinquent by law (RCW 84.64), so every Benton row would be capped out -> 0 leads. King is exempt
-        only because its feed is a current delinquency roll. Options: exempt the Benton source, or don't ship.
-      * there is no public Benton list of recently-delinquent parcels (would need crawling every parcel).
+- [x] 2b recorded-document pipeline (owner OK 2026-11-12 "Yes, build it"):
+      * parser src/scrapers/sources/nts_benton_recorder.py (33b94e3d, e67b09aa, b3f315ad): 13 real notices,
+        parcel/address/Section IV 13/13, sale date 9/13 (4 OCR-damaged dates left unparsed). Codex 3 rounds -> PASS.
+      * pre_foreclosure parcel fill in eagleweb (ac138c95): live 90d Benton 26/29 kept (was 4; 1 before paging fix);
+        22 filled, 2 multi-property held, 1 no parcel, 0 failed. Codex 2 rounds -> PASS.
+      * trustee_sale (uncommitted at time of writing): crawl_nts_benton_recorder -> nts_notices (REC-<instrument>),
+        BentonWATrusteeSaleScraper, benton in NTS_MATCH_COUNTIES, beat 10:20 UTC, migration 141 (connector INACTIVE),
+        142 nts_notices.cancelled_at (sticky; excluded by matcher live/past/refresh, scraper, finalizer; linked results
+        cleared; advisory lock NTS_CANCEL_LOCK_KEY exclusive in crawl / shared in matcher+finalizer).
+        Live read-only 150d: 53 NTS read, 0 failed, 43 auction rows, 33 active upcoming.
+        Codex: 5 rounds (cancellation P1s, heartbeat/count P2s, concurrency) -> PASS. 7 files in one fix (>5 rule) noted.
+- [x] 2c tax_delinquent (owner: exempt the source): bca255cf + 68f5fa48. Live 3/3 owner-verified with mailing.
+      Migration 140 connector INACTIVE. Codex 2 rounds -> PASS.
+- [ ] blocked: code_violation (no case-level public source), divorce (GR 31 + no index source; recorder has a
+      "Dissolution" doc type -- not built, needs owner/legal call).
 ## Phase 3: coverage/registry update only for verified types; journal
 # NTS amount type marker (owner decision 2026-11-06: keep fallback amounts, mark them)
 

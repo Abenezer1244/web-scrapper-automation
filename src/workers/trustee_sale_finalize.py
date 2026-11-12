@@ -124,6 +124,9 @@ def finalize_trustee_sale_job(db, job_id: str, user_id: Any) -> int:
     (fail-closed). Does NOT commit — the caller's transaction owns the write (committed
     with billing).
     """
+    from src.workers.nts_matcher_task import take_nts_cancel_lock_shared
+
+    take_nts_cancel_lock_shared(db)  # a concurrent Benton cancellation lands first or waits
     rows = db.execute(
         _sa_text(
             "SELECT id, enrichment_data FROM results "
@@ -150,10 +153,13 @@ def finalize_trustee_sale_job(db, job_id: str, user_id: Any) -> int:
                     enrichment_data = COALESCE(enrichment_data, '{}'::json)::jsonb
                                       || jsonb_build_object('nts', CAST(:nts AS jsonb))
                 WHERE id = :rid
-                  -- Never from a notice a privacy rule withholds (migration 132).
+                  -- Never from a notice a privacy rule withholds (migration 132), nor
+                  -- one a recorded Discontinuance cancelled (migration 142): a retry
+                  -- must not restore a cancelled sale from the snapshot.
                   AND NOT EXISTS (SELECT 1 FROM nts_notices n
                                   WHERE n.id = CAST(:notice_id AS uuid)
-                                    AND n.privacy_suppression_id IS NOT NULL)
+                                    AND (n.privacy_suppression_id IS NOT NULL
+                                         OR n.cancelled_at IS NOT NULL))
                 """
             ),
             params,

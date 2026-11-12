@@ -326,6 +326,13 @@ app.conf.beat_schedule = {
         "task": "src.workers.nts_crawler.crawl_nts_columbian_clark",
         "schedule": crontab(hour=10, minute=35, day_of_week="*"),  # 10:35 UTC daily
     },
+    "crawl-nts-benton-recorder": {
+        # NTS Tier 1 (Benton): no legal-newspaper source; notices are read off the
+        # Benton Auditor's recorded images. Daily, before the 11:00 matcher. Re-reading
+        # the 150-day window is what keeps a recorded Discontinuance applied.
+        "task": "src.workers.nts_crawler.crawl_nts_benton_recorder",
+        "schedule": crontab(hour=10, minute=20),  # 10:20 UTC daily
+    },
     "recover-deferred-mailing": {
         # The recovery half of `mailing_lookup_deferred`, which shipped as a
         # marker that nothing ever read: parcels a source outage skipped were

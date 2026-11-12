@@ -1063,8 +1063,10 @@ class EagleWebScraper(BridgeScraper):
                     parcel_source_counts["table"] += 1
 
                 # Parse AFN from description and store in enrichment_data
-                # Year-dashed instruments (Clallam 2026-1486473) keep their year.
-                afn_match = re.search(r"\b(\d{4}-\d{5,})\b", desc) or re.search(r"\b(\d{5,})\b", desc)
+                # shortcut: a year-dashed instrument (Clallam 2026-1486473) loses its year
+                # here; keeping it changes raw_html_hash, the within-job retry key (Codex),
+                # so fix it with a legacy-hash copy before changing this.
+                afn_match = re.search(r"\b(\d{5,})\b", desc)
                 if afn_match:
                     record.enrichment_data["instrument_number"] = afn_match.group(1)
                     if detail_href:

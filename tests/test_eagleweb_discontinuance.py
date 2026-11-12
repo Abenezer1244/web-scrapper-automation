@@ -148,8 +148,6 @@ async def test_death_certificate_extraction_keeps_only_recorded_deaths():
     assert labels == {"Death"}, labels
     assert "2026-1486473" in {r.doc_type.split("\n")[-1].strip() for r in records}
     assert all(r.party_name and "PUBLIC" not in r.party_name for r in records)
-    # The instrument keeps its year (it used to be cut to 1486473 for the CSV).
-    assert {r.enrichment_data["instrument_number"] for r in records} >= {"2026-1486473"}
 
 
 @pytest.mark.parametrize(("desc", "certificate"), [
@@ -159,6 +157,8 @@ async def test_death_certificate_extraction_keeps_only_recorded_deaths():
     ("Affidavit of Death\n2026-1480002", False),           # Codex counterexample
     ("Transfer-on-Death Deed\n2026-1480003", False),       # hyphenated TOD deed
     ("Revocation of Transfer on Death Deed\n2026-1486485", False),
+    ("Death", True),                                        # no instrument at all
+    ("Death\n202607210034", True),                          # Kitsap-style 12 digits
 ])
 def test_death_certificate_needs_the_whole_label(desc, certificate):
     from src.scrapers.templates.eagleweb import _DEATH_CERT_LABELS, _doc_label

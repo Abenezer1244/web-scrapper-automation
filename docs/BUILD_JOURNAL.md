@@ -22,7 +22,7 @@ to understand *why* the code is the way it is and *what's been attempted before*
 ## 2026-11-12 — Asotin County: auction leads, tax delinquency, assessor enrichment (branch only)
 
 **Built / Shipped:** branch `feat/asotin-wa-seven-record-types` (worktree `bl-wt/asotin-7`), NOT
-pushed or deployed; both Asotin connectors seeded INACTIVE (migrations 140, 141), so public
+pushed or deployed; both Asotin connectors seeded INACTIVE (migrations 150, 151), so public
 coverage is unchanged. (1) PACS assessor (TrueAutomation cid=10, 17-digit Geo IDs) in the parcel
 mailing hook. (2) trustee_sale from the Lewiston Tribune's notices on nwmarket.com: sitemap
 discovery (robots bars listing pagination), 20 s crawl delay, Redis memo keyed (advert, lastmod).
@@ -30,7 +30,7 @@ discovery (robots bars listing pagination), 20 s crawl delay, Redis memo keyed (
 parcel's PACS tax table into `pacs_tax_status` (system-only RLS) through a shared PACS pass
 (`resolve_tax` = `resolve_mailing`'s lease/pacing/identity chain); the scraper refuses below
 95% coverage and holds leads missing owner/address/mailing. Privacy: names kept only while a
-parcel owes, gated by authorize(), erased by `privacy_erase_pacs_tax` (142).
+parcel owes, gated by authorize(), erased by `privacy_erase_pacs_tax` (152).
 
 **Tried / Decided:** owner approved solving Helion's reCAPTCHA with 2Captcha and a per-parcel
 crawl. Tax qualification = prior-year arrears (as King/Snohomish), though 10% of a 60-parcel
@@ -50,8 +50,8 @@ privacy tombstones, inventory refresh drifting hourly. Shared NTS parser read a 
 Aztec sale at its original past date (now the latest "continued … to <date>").
 
 **Pending / Handoff:** owner: decide the Helion captcha path (key/permission); approve release
-(flip both connectors active) after the tax crawl reaches 95% coverage; renumber 140-142 if
-another branch lands first.
+(flip both connectors active) after the tax crawl reaches 95% coverage. Migrations are
+150-152 (Benton holds 140-142, Chelan 140): whichever merges second repoints one down_revision.
 
 **Facts learned:** the WA statewide parcel layer publishes Asotin with FIPS_NR NULL, not '003'
 (13,629 parcels) — Asotin situs lookups returned nothing until fixed. Asotin PACS shows only the

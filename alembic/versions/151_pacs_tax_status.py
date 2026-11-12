@@ -5,8 +5,8 @@ role-existence guard, exactly as 058 nts_notices), filled by workers/pacs_tax_cr
 Also seeds Asotin's tax_delinquent connector INACTIVE: the registry and
 /scrapers/connectors hide it, so public coverage does not move until release.
 
-Revision ID: 141
-Revises: 140
+Revision ID: 151
+Revises: 150
 Create Date: 2026-11-12
 """
 
@@ -14,8 +14,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects.postgresql import UUID
 
-revision = "141"
-down_revision = "140"
+revision = "151"
+down_revision = "150"
 branch_labels = None
 depends_on = None
 

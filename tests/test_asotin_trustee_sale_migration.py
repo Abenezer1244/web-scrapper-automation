@@ -1,4 +1,4 @@
-"""Migration 140 (Asotin trustee_sale connector) — valid seed, and seeded INACTIVE.
+"""Migration 150 (Asotin trustee_sale connector) — valid seed, and seeded INACTIVE.
 
 No DB: loads the migration module and checks its row points at a real, allowlisted
 subclass for the same county, and that it stays hidden until the release is approved.
@@ -13,12 +13,12 @@ from src.workers.nts_matcher_task import NTS_MATCH_COUNTIES
 
 _MIG_PATH = (
     Path(__file__).resolve().parents[1]
-    / "alembic" / "versions" / "140_add_asotin_trustee_sale_connector.py"
+    / "alembic" / "versions" / "150_add_asotin_trustee_sale_connector.py"
 )
 
 
 def _load_migration():
-    spec = importlib.util.spec_from_file_location("_mig140", _MIG_PATH)
+    spec = importlib.util.spec_from_file_location("_mig150", _MIG_PATH)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
@@ -26,7 +26,7 @@ def _load_migration():
 
 def test_chains_onto_current_head():
     mig = _load_migration()
-    assert (mig.revision, mig.down_revision) == ("140", "139")
+    assert (mig.revision, mig.down_revision) == ("150", "139")
 
 
 def test_connector_points_at_a_real_allowlisted_asotin_subclass():

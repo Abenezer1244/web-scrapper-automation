@@ -1982,7 +1982,7 @@ class NtsNotice(Base):
 
 
 class PacsTaxStatus(Base):
-    """Per-parcel property-tax status read off a county's PACS page (migration 141).
+    """Per-parcel property-tax status read off a county's PACS page (migration 151).
 
     For counties that publish no delinquent list (Asotin first): one row per parcel in
     the county's inventory, refreshed by the rolling crawler (workers/pacs_tax_crawler,

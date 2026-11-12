@@ -17,7 +17,7 @@ enforcer has not reached yet carries none (Codex consult). Every row of every st
 scanned, flagged or not.
 
 Stores, in order: results (every tenant), king_parcel_owners, nts_notices,
-county_records, pacs_tax_status (its own function, migration 142). The function also
+county_records, pacs_tax_status (its own function, migration 152). The function also
 reaches each matched result's skip-trace cache
 entries (its subject hash, plus the keys of its pending lookups computed here),
 lookups, Tracerfy links, dialer rows and exports.

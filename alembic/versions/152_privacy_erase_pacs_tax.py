@@ -1,4 +1,4 @@
-"""Erasure reaches pacs_tax_status (the Asotin per-parcel tax cache, migration 141).
+"""Erasure reaches pacs_tax_status (the Asotin per-parcel tax cache, migration 151).
 
 pacs_tax_status holds an owner name and addresses for parcels that owe past-due tax,
 so a deletion rule must be able to erase them like king_parcel_owners and nts_notices.
@@ -8,15 +8,15 @@ only an ACTIVE, never-lifted DELETION rule (privacy_erasure_rule), the same per-
 advisory lock, executable only by bridgeleads_system. src/privacy/erase.py calls it for
 the "pacs_tax" store.
 
-Revision ID: 142
-Revises: 141
+Revision ID: 152
+Revises: 151
 Create Date: 2026-11-12
 """
 from alembic import op
 from sqlalchemy import text
 
-revision = "142"
-down_revision = "141"
+revision = "152"
+down_revision = "151"
 branch_labels = None
 depends_on = None
 
@@ -108,7 +108,7 @@ def downgrade() -> None:
     if op.get_bind().execute(text(
             "SELECT 1 FROM public.pacs_tax_status WHERE privacy_suppression_id IS NOT NULL "
             "AND owner_name IS NULL LIMIT 1")).first():
-        raise RuntimeError("erased pacs_tax_status rows exist; refusing to downgrade 142")
+        raise RuntimeError("erased pacs_tax_status rows exist; refusing to downgrade 152")
     op.execute(text(f"""
         DO $drop$
         DECLARE

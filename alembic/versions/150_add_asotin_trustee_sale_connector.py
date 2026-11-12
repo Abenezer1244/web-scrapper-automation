@@ -13,14 +13,16 @@ owner-name PACS fallback in enrichment.
 
 Data INSERT only. Idempotent: WHERE NOT EXISTS on (county, state, scraper_class).
 
-Revision ID: 140
+Revision ID: 150
 Revises: 139
+Note: numbered 150+ so it cannot collide with the Benton/Chelan branches (140-142); whichever
+branch merges second points its first down_revision at the other branch's head.
 Create Date: 2026-11-12
 """
 
 from alembic import op
 
-revision = "140"
+revision = "150"
 down_revision = "139"
 branch_labels = None
 depends_on = None

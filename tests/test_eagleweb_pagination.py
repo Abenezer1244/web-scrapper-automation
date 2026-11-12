@@ -28,7 +28,7 @@ def _page(n: int) -> str:
     return gzip.decompress((_FIXTURES / f"page{n}.html.gz").read_bytes()).decode("utf-8")
 
 
-async def _run(serve_page, max_pages: int | None = None) -> list:
+async def _run(serve_page, max_pages: int | None = None, record_type: str = "pre_foreclosure") -> list:
     """Collect pre-foreclosure rows across the week; serve_page(n) -> HTML for page n."""
     async def serve(route):
         query = parse_qs(urlparse(route.request.url).query)
@@ -39,7 +39,7 @@ async def _run(serve_page, max_pages: int | None = None) -> list:
         await route.fulfill(status=200, content_type="text/html", body=serve_page(n))
 
     scraper = EagleWebScraper(f"https://{_HOST}/recorder/web/", "benton", "wa",
-                              ["probate", "pre_foreclosure"], record_type="pre_foreclosure")
+                              ["probate", "pre_foreclosure", "death_certificate"], record_type=record_type)
     if max_pages:
         scraper._MAX_PAGES = max_pages
     async with scraper:
@@ -132,6 +132,17 @@ async def test_a_result_that_ends_exactly_on_the_cap_page_is_complete():
     """No total to reconcile and the last page is the cap page: no Next link, no error."""
     records = await _run(lambda n: _without_total(_page(n)), max_pages=8)
     assert len(records) == 5
+
+
+async def test_death_certificate_keeps_only_recorded_death_certificates():
+    """Benton records Washington death certificates with the State as co-grantor; the
+    week has two, on pages 2 and 5. The decedent must be the lead, not the agency."""
+    records = await _run(_page, record_type="death_certificate")
+    assert [r.doc_type.splitlines()[0] for r in records] == ["Cert Of Death", "Cert Of Death"]
+    first = next(r for r in records if r.enrichment_data["instrument_number"] == "027085")
+    assert first.party_name == "LEISTRITZ, MIKE E"
+    assert first.parcel_id == "115802011127002"
+    assert all("DEPT OF HEALTH" not in (r.party_name or "") for r in records)
 
 
 def test_a_same_day_window_still_searches_once():

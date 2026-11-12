@@ -75,6 +75,23 @@ Licensing: the Assessor's search page cites RCW 42.56.070(9) (no commercial list
 - [x] Fail closed: a type a site has no vocabulary for is refused before any request (it used to skip the filter)
 - [ ] Activation (owner): add `death_certificate` to the Chelan connector's `record_types` (no migration needed; `ALL_RECORD_TYPES` already has it)
 
+### Phase 4a: trustee_sale via OCR (owner-approved 2026-11-12, PLAN — not started)
+Feasibility checked: NTS PDFs are free at `/AcclaimWeb/Image/DocumentPdfAllPages/{TransactionItemId}` (no login), and installed `pypdf` extracts each page as an image (2550×3481). The only new dependency is the **Tesseract binary** (`apt-get install tesseract-ocr`, Apache-2.0), called by subprocess with no new pip package. It is about 2 Chelan NTS a month.
+Codex pre-build consult (2026-11-12): no P0. The P1s are: a staging/review boundary before `nts_notices`; per-field OCR evidence gates; isolated PDF/image/OCR decoding; recording + DT linkage (not APN alone); revision ordering for re-recordings and cancellations; amount semantics kept atomic. The owner chose **the full build with operator review** (every OCR'd notice is approved against its image before customers see it).
+
+**4a-1: staging + isolated extractor** (DONE, Codex GO after 5 rounds; commit 4b29dab1 on `feat/chelan-nts-ocr`)
+- [x] Migration 141: `nts_recorder_documents` (county, instrument number, transaction item id, record date, doc code, pdf sha256, page count, recording APN, related DT, borrower from the detail page, ocr text, parser/OCR version, extracted fields with per-field token confidence, status `pending_review|approved|rejected|superseded`, reviewer, reviewed_at). No user data, no RLS user scope (source data, like `nts_notices`)
+- [x] `src/scrapers/sources/nts_recorder_ocr.py`: PDF bytes -> killable child process (`python -I -m …`) with byte/page/image/pixel caps, wall-time limit, private temp dir, fixed argv, no shell -> pypdf page images -> `tesseract` TSV (word confidences) -> `parse_nts_notice` + field evidence. Over-limit = explicit rejection
+- [x] Tests (41 + 1 Linux-only): real child processes with stand-in tesseract executables (TSV, flood, hang with descendant, fail). STILL OPEN: golden OCR text of the 2 real PDFs needs tesseract installed locally (UAC prompt was cancelled). Planned: golden OCR-text fixtures for the 2 real PDFs, subprocess contract (timeout, missing binary, nonzero exit, cleanup, output cap), malformed/encrypted/oversized PDFs, OCR-corruption fixtures that must quarantine
+
+**4a-2: discovery + operator review** (≤5 files; the pending_review retention purge must land BEFORE any row is written — Codex)
+- [ ] `crawl_nts_chelan_recorder` task: a recorder-document discovery adapter (NTS/NTSCOM/NOD-discontinuance codes, overlapping window, complete reads), own time limits + overlap lock + source admission -> detail page (APN, DT, borrower) -> OCR -> staging. Completeness-aware health (a verified zero is healthy)
+- [ ] Operator CLI: list pending, show fields + image link, approve/reject (who, when). Approval writes the canonical notice
+
+**4a-3: canonical notices + delivery** (≤5 files)
+- [ ] Approved -> `nts_notices` (source `chelan_recorder`), revision ordering by recording metadata, discontinuance cancels the episode; DT reference persisted; Chelan in `NTS_MATCH_COUNTIES` with exact recording/DT linkage
+- [ ] `ChelanWATrusteeSaleScraper`, beat entry, Dockerfile `tesseract-ocr`, migration adding `trustee_sale` to the connector, collection_scope says "recorder", not "newspaper"
+
 ### Phase 4 (owner decisions, not started)
 - trustee_sale: sale date only in scan-only NTS PDFs (`/Image/DocumentPdfAllPages/{id}`, free, 300 dpi, no text layer). Needs OCR (Tesseract is a new dependency: SBOM check plus Railway image change). About 2 NTS per month
 - tax_delinquent: Treasurer "Real Property Auction List" (HTML, 13 parcels, updated 11/09/2026, Owner/Amount Due/Situs; no tax years or redemption status) and per-parcel PACS cid=90 balances. County terms forbid "any for-profit commercial purpose or use" without written consent. Public Surplus forbids robots. Legal call first

@@ -1,0 +1,439 @@
+
+
+<html>
+
+<head id="Head1" > 
+
+     
+
+    
+
+    
+
+    
+
+</head>
+
+<head><link href="../../../../../App_Themes/Chelan/Site.css" type="text/css" rel="stylesheet" /><title>
+
+
+
+</title></head>
+
+<body>
+
+        <div class="detailsTop">
+
+            
+
+            
+
+            
+
+            
+
+            <br />
+
+            <div style="font-size: xx-small">
+
+            
+
+            <div id="AddToCartDivInternal" style="width: 100%">
+
+                 
+
+                <hr style="color: #444; background-color: #444; height: 2px; clear: both;" />
+
+            </div>
+
+            <div style="margin: 0px; text-align: left; width:260px;" >
+
+                
+
+				<div class="detailsBookPage">
+
+                    <div class="detailLabel">
+
+                        Book / Page:
+
+                    </div>
+
+                    <span>
+
+                        
+
+                        <button type="button" class="t-button docNavButtons" value=""  disabled="disabled"  ><img src="/Content/Images/navLeft16.png" style="border:none; padding: 0px; margin:0px;"/></button>
+
+                    </span>
+
+                   <span>
+
+                        <button type="button" class="t-button docNavButtons" value=""  disabled="disabled" ><img src="/Content/Images/navRight16.png" style="border:none; padding: 0px; margin:0px;"/></button>
+
+                    </span>
+
+                    <span>
+
+                        
+
+                        <input type="text" id="jmpBook" value="" style="width: 34px" onkeydown="JumpToTrigger(event,'BP');" />
+
+                        
+
+                    </span>
+
+                    <span>
+
+                        /
+
+                    </span>
+
+                    <span>
+
+                        
+
+                        <input type="text" id="jmpPg" value="" style="width: 34px" onkeydown="JumpToTrigger(event,'BP');" />
+
+                    </span>
+
+                    <span>
+
+                        <button type="button" id="btnJumpToBkPg" onclick="JumpToBookPage('1789524','2')" class="t-button docButton">Go</button>
+
+                    </span>
+
+                </div>
+
+                <!-- Document # Navigation -->
+
+                <div>
+
+                   <div class="detailLabel">
+
+                        Auditor File Number:
+
+                    </div>
+
+                    <span>
+
+                        <button data-bind="disable: negativeInstrumentNumber('2627907')" type="button" class="t-button docNavButtons" value="" onclick="LoadInternalContent('1789524', 'PrevInstrumentDoc/1789524')">
+
+                        <img src="/Content/Images/navLeft16.png" /></button>
+
+                    </span>
+
+                    <span>
+
+                        <button data-bind="disable: negativeInstrumentNumber('2627907')" type="button" class="t-button docNavButtons" value="" onclick="LoadInternalContent('1789524', 'NextInstrumentDoc/1789524')">
+
+                        <img src="/Content/Images/navRight16.png" /></button>
+
+                    </span>
+
+                    <span>
+
+                        <input data-bind="disable: negativeInstrumentNumber('2627907'), value: displayInstrumentNumber('2627907')" type="text" id="jmpInstrumentNumber" name="jmpInstrumentNumber"
+
+                            style="width: 81px" onkeydown="JumpToTrigger(event,'IN');" />
+
+                    </span>
+
+                    <span>
+
+                        <button data-bind="disable: negativeInstrumentNumber('2627907')" type="button" id="btnJumpToInst" 
+
+                        onclick="JumpToInstrumentNumber('1789524','2');"
+
+                           class="t-button docButton">Go</button>
+
+                    </span>                
+
+                </div>
+
+                <hr style="color: #444; background-color: #444; height: 2px; clear: both;" />                
+
+                <div style="width: 100%; text-align: center">
+
+                    <button type="button" id="PrevButton" class="t-button docNavButtons" title="Previous" onclick="GetPrevTranItemId('1789524', '-1')">
+
+                    <img src="/Content/Images/navLeft16.png" /></button>
+
+                    <span style="font-weight: bold"> Search Results </span>
+
+                    <button type="button" id="NextButton" class="t-button docNavButtons"title="Next" onclick="GetNextTranItemId('1789524', '-1')">
+
+                    <img src="/Content/Images/navRight16.png" /></button>
+
+                    
+
+                </div>
+
+
+
+            </div>
+
+        </div>
+
+            <div class="detailsTop2">
+
+                <hr style="color: #444; background-color: #444; height: 2px; clear: both;" />
+
+                <div class="error">
+
+                    
+
+                    
+
+                </div>
+
+                <br />
+
+                <div class="docDetailRow">
+
+                    <div class="detailLabel">
+
+                    Record Date:
+
+                    
+
+                    </div>
+
+                    <div class="formInput">
+
+                        10/7/2026
+
+
+                    </div>
+
+                    <hr style="border: none; clear: both;" />
+
+                </div>
+
+                <div class="docDetailRow">
+
+                    <div class="detailLabel">
+
+                        Book Type:
+
+                    </div>
+
+                    <div class="formInput">
+
+                        GR
+
+                        -
+
+                        General Recording
+
+                    </div>
+
+                    <hr style="border: none; clear: both;" />
+
+                </div>
+
+                <div data-bind="visible: NullOrZeroBookPage('', '') == false" class="docDetailRow">
+
+                    <div class="detailLabel">
+
+                        Book / Page:&nbsp;&nbsp;
+
+                    </div>
+
+                    <div class="formInput">
+
+                        /
+
+                    </div>
+
+                    <hr style="border: none; clear: both;" />
+
+                </div>
+
+                <div data-bind="visible: negativeInstrumentNumber('2627907') == false" class="docDetailRow">
+
+                    <div class="detailLabel">
+
+                        AFN:&nbsp;&nbsp;
+
+                        
+
+                    </div>
+
+                    <div class="formInput">
+
+                        2627907
+
+                    </div>
+
+                    <hr style="border: none; clear: both;" />
+
+                </div>
+
+                
+
+                <div data-bind="visible: NullOrZeroSecSeqNumber('') == false" class="docDetailRow">
+
+                    <div class="detailLabel">
+
+                        Secondary #:&nbsp;&nbsp;
+
+                        
+
+                    </div>
+
+                    <div class="formInput">
+
+                        
+
+                    </div>
+
+                    <hr style="border: none; clear: both;" />
+
+                </div>
+
+
+
+                <hr style="color: #444; background-color: #444; height: 2px; clear: both;" />
+
+            </div>
+
+            <div class="docBlock">
+
+                
+
+                <div class="docDetailRow">
+
+                    <div class="detailLabel">
+
+                        Number of Pages:
+
+                    </div>
+
+                    <div class="listDocDetails" style="width: 100px;">
+
+                       4
+
+                       <div class="expandDown" style="display:none;"><img src="/Content/Images/moveDown.png" /></div>
+
+                    </div>
+
+                    <hr style="border: none; clear: both;" />
+
+                </div>
+
+                
+
+                <div class="docDetailRow">
+
+                    <div class="detailLabel">
+
+                        Doc Type:
+
+                    </div>
+
+                    <div class="listDocDetails" style="width: 100px;">
+
+                       TOD - TRANSFER ON DEATH DEED
+
+                       <div class="expandDown" style="display:none;"><img src="/Content/Images/moveDown.png" /></div>
+
+                    </div>
+
+                    <hr style="border: none; clear: both;" />
+
+                </div>
+
+                
+
+                <div class="docDetailRow">
+
+                    <div class="detailLabel">
+
+                        DocLegal:
+
+                    </div>
+
+                    <div class="listDocDetails" style="width: 100px;">
+
+                       <span class="" >APN 232020860053</span><br /><span class="" >BLA 2017-082 LOT B</span><br />
+
+                       <div class="expandDown" style="display:none;"><img src="/Content/Images/moveDown.png" /></div>
+
+                    </div>
+
+                    <hr style="border: none; clear: both;" />
+
+                </div>
+
+                
+
+                <div class="docDetailRow">
+
+                    <div class="detailLabel">
+
+                        Grantor:
+
+                    </div>
+
+                    <div class="listDocDetails" style="width: 100px;">
+
+                       <span class="" >PARTY1 PERSON</span><br /><span class="" >PARTY2 PERSON</span><br />
+
+                       <div class="expandDown" style="display:none;"><img src="/Content/Images/moveDown.png" /></div>
+
+                    </div>
+
+                    <hr style="border: none; clear: both;" />
+
+                </div>
+
+                
+
+                <div class="docDetailRow">
+
+                    <div class="detailLabel">
+
+                        Grantee:
+
+                    </div>
+
+                    <div class="listDocDetails" style="width: 100px;">
+
+                       <span class="" >PARTY3 PERSON</span><br />
+
+                       <div class="expandDown" style="display:none;"><img src="/Content/Images/moveDown.png" /></div>
+
+                    </div>
+
+                    <hr style="border: none; clear: both;" />
+
+                </div>
+
+                
+
+               <div class="expand" style="display:none;"><img src="/Content/Images/moveRight.png" /></div>
+
+            </div> 
+
+            
+
+            <hr style="color: #444; background-color: #444; height: 2px; clear: both;" />
+
+        </div>
+
+        <div class="detailsBottom">
+
+            <div class="ExceptionMessageStyle ImageExceptionStyle">
+
+                
+
+            </div>
+
+        </div>
+
+        
+
+</body>
+
+</html>
+

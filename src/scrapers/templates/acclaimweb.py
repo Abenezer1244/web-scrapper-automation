@@ -15,20 +15,20 @@ Chelan, Douglas, Pend Oreille
 """
 
 import asyncio
+import html
 import json
 import re
 from datetime import datetime, timedelta
 from urllib.parse import parse_qsl, urlencode, urlparse
 from zoneinfo import ZoneInfo
 
-from src.api.middleware.security import add_scrape_domain, validate_scraping_target
+from src.api.middleware.security import add_scrape_domain
 from src.scrapers.base_scraper import (
     BridgeScraper,
     ScrapedRecord,
     normalize_party_text,
 )
 from src.scrapers.divorce import is_divorce_doc, orient_divorce_party
-from src.scrapers.enrichment.pacs import mailing_from_detail, parse_pacs_result_html
 from src.scrapers.preforeclosure import (
     is_cancellation_or_admin,
     orient_pre_foreclosure_party,
@@ -42,7 +42,6 @@ from src.scrapers.reliability import (
     detect_block,
 )
 from src.utils.logger import setup_logger
-from src.utils.pinned_http import pinned_session
 
 # Substrings an AcclaimWeb results page renders for a genuine zero-result window.
 _EMPTY_MARKERS = ("no results", "0 records", "no records", "no documents found")
@@ -178,7 +177,43 @@ def _grid_item(row: dict) -> dict:
         "grantee": str(row.get("IndirectName") or ""),
         "legal": str(row.get("DocLegalDescription") or ""),
         "parcel": "",
+        "item_id": str(row.get("TransactionItemId") or ""),
     }
+
+
+# A recording's detail page prints its legal description as "DocLegal: APN 232020860053
+# SP 2019-008 LOT 7" (Chelan, live 2026-11-12); one document can name several APNs.
+_DOC_LEGAL_RE = re.compile(
+    r"DocLegal:(.*?)(?:Grantor:|Grantee:|Borrower:|Trustee|Related|$)", re.S | re.I
+)
+# Any 9+ digit number (dashes allowed between digits) after the "APN" label. Shorter
+# numbers in a legal are plats and lots ("SP 2019-008"). Taking every one, not a parsed
+# list, means a separator we did not foresee yields two candidates, never a first guess.
+_APN_NUMBER_RE = re.compile(r"\d(?:-?\d){8,}")
+_APN_LOOKUP_KEY = "recording_apn_lookup"
+_DETAIL_PACE_S = 1.5
+
+
+def parse_detail_apns(html_text: str) -> list[str] | None:
+    """The distinct APN candidates a recording detail page names, in order.
+
+    None when the page is not a detail page (no "Doc Type:" field), so "no APN" is
+    never mistaken for a page we could not read. A death certificate's page has no
+    legal at all (Doc Type, Agency, Deceased): it names a person, not a parcel -> [].
+    """
+    text = html.unescape(re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html_text or "")))
+    if "Doc Type:" not in text:
+        return None
+    m = _DOC_LEGAL_RE.search(text)
+    label = re.search(r"\bAPN\b", m.group(1), re.I) if m else None
+    if not label:
+        return []
+    apns: list[str] = []
+    for number in _APN_NUMBER_RE.findall(m.group(1)[label.end():]):
+        apn = number.replace("-", "")
+        if apn not in apns:
+            apns.append(apn)
+    return apns
 
 
 class AcclaimWebScraper(BridgeScraper):
@@ -190,6 +225,10 @@ class AcclaimWebScraper(BridgeScraper):
 
     # The site's document vocabulary; a county whose codes differ subclasses with its own.
     DOC_TYPE_MAP = _DOC_TYPE_MAP
+    # Whether each lead's recording detail page is read for its APN (see _read_parcels),
+    # and the shape a single APN must have to become the lead's parcel.
+    READS_DETAIL_APN = False
+    APN_SHAPE = re.compile(r"\d{12}")
 
     @classmethod
     def collection_scope(cls, record_type: str):
@@ -303,6 +342,9 @@ class AcclaimWebScraper(BridgeScraper):
             # One day at a time in single-date mode (chunk_end is clamped to end there).
             chunk_start = chunk_start + timedelta(days=1) if self._single_date_mode else chunk_end
 
+        if self.READS_DETAIL_APN:
+            await self._read_parcels(all_records)
+
         # Enrich records missing addresses via county assessor (PACS) lookup.
         # Only look up person names — companies won't match in the assessor.
         _CO_WORDS = {"INC", "LLC", "CORP", "CORPORATION", "BANK", "TRUST",
@@ -316,9 +358,9 @@ class AcclaimWebScraper(BridgeScraper):
             and not any(w in _CO_WORDS for w in r.party_name.upper().split())
         ]
         if needs_address:
-            _logger.info("PACS: %d person-named records to look up (skipping %d companies)",
+            _logger.info("Owner lookup: %d person-named records (skipping %d companies)",
                          len(needs_address), len(all_records) - len(needs_address))
-            await self._lookup_pacs_addresses(needs_address)
+            await self._lookup_addresses_by_owner(needs_address)
 
         _logger.info("acclaimweb complete - %d records (enrichment runs after save)", len(all_records))
         return all_records
@@ -812,6 +854,9 @@ class AcclaimWebScraper(BridgeScraper):
                 # depend on the legal_description we're now changing.
                 inst = item.get("instrument", "").strip()
                 record.enrichment_data = {"instrument_number": inst, "source": "acclaimweb"}
+                if self.READS_DETAIL_APN and item.get("item_id"):
+                    # Only where the APN is read: a new key changes the row hash below.
+                    record.enrichment_data["source_document_id"] = item["item_id"]
 
                 # Date recorded — normalize various date formats
                 date_str = item.get("date_recorded", "").strip()
@@ -929,145 +974,97 @@ class AcclaimWebScraper(BridgeScraper):
 
         return records
 
-    # County assessor (PACS) URLs for address lookup by owner name.
-    # Tyler PropertyAccess is used by many WA counties. Douglas is NOT one of them:
-    # pacs.co.douglas.wa.us does not resolve, and its assessor runs TerraScan
-    # TaxSifter, looked up through src/scrapers/enrichment/taxsifter.py instead.
-    _PACS_URLS = {
-        "chelan": "https://pacs.co.chelan.wa.us/PropertyAccess/?cid=90",
-    }
+    async def _read_parcels(self, records: list[ScrapedRecord]) -> None:
+        """Set each lead's parcel from its own recording (the detail page's "APN").
 
-    async def _lookup_pacs_addresses(self, records: list[ScrapedRecord]) -> None:
-        """Look up property addresses from county assessor (PACS) by owner name.
+        The parcel then drives the existing parcel-keyed enrichment (statewide GIS
+        situs, PACS mailing): evidence from the recorded document, not a guess from an
+        owner's name. Outcome per row (enrichment_data["recording_apn_lookup"]):
 
-        Uses HTTP POST to the Tyler PropertyAccess search — no browser needed.
-        Concurrent lookups, 5 at a time to be respectful.
+        - found: exactly one APN of the site's shape -> parcel_id.
+        - ambiguous: several candidates, or one of another shape -> no parcel; the
+          candidates are kept for review. Which parcel the lead is about is not ours
+          to pick.
+        - none: the recording names no parcel (a death certificate) -> the owner-name
+          fallback in enrichment may look the person up.
+
+        A page that cannot be read, after one retry, RAISES TransientScrapeError (a
+        403/429 raises ScraperBlockedError) before anything is saved: the worker re-runs
+        the job. A row is never saved half-read, because a re-run of the same job could
+        not repair it (same fingerprint) and a later run would give the same recording
+        a second identity (Codex 2b). One request per recording, paced.
         """
-        from concurrent.futures import ThreadPoolExecutor
-        from urllib.parse import urlparse
+        by_doc: dict[str, list[ScrapedRecord]] = {}
+        for r in records:
+            doc_id = (r.enrichment_data or {}).get("source_document_id")
+            if doc_id and not r.parcel_id:
+                by_doc.setdefault(doc_id, []).append(r)
 
-        pacs_url = self._PACS_URLS.get(self.county.lower())
-        if not pacs_url:
-            from src.scrapers.enrichment.taxsifter import TAXSIFTER_ORIGINS
-            if self.county.lower() in TAXSIFTER_ORIGINS:
-                await self._lookup_taxsifter_addresses(records)
-                return
-            _logger.info("No PACS URL for %s — skipping address lookup", self.county)
+        for i, (doc_id, recs) in enumerate(by_doc.items()):
+            if i:
+                await asyncio.sleep(_DETAIL_PACE_S)
+            url = f"{self.base_url}/details/documentdetails/{doc_id}/1/1/11"
+            apns: list[str] | None = None
+            why = ""
+            for attempt in (1, 2):
+                if attempt == 2:
+                    await asyncio.sleep(_DETAIL_PACE_S * 2)
+                try:
+                    # From the page, not page.request: an in-page fetch passes the
+                    # context's SSRF route guard and carries the portal session.
+                    status, page_html = await asyncio.wait_for(self.page.evaluate(
+                        """async ([url, ms]) => {
+                            const r = await fetch(url, {signal: AbortSignal.timeout(ms)});
+                            return [r.status, await r.text()];
+                        }""",
+                        [url, _PORTAL_TIMEOUT_S * 1000],
+                    ), _PORTAL_TIMEOUT_S + 5)
+                except Exception as exc:  # noqa: BLE001 -- retried, then raised below
+                    status, page_html, why = 0, "", type(exc).__name__
+                if status in (403, 429):
+                    raise ScraperBlockedError(
+                        self.county, "AcclaimWeb", f"recording detail page refused (HTTP {status})",
+                        record_type=self.active_record_type,
+                    )
+                apns = parse_detail_apns(page_html) if status == 200 else None
+                if apns is not None:
+                    break
+                why = "not a detail page" if status == 200 else (why or f"HTTP {status}")
+            if apns is None:
+                raise TransientScrapeError(
+                    self.county, "AcclaimWeb", f"recording detail page unreadable ({why})",
+                    record_type=self.active_record_type,
+                )
+            if not apns:
+                outcome = "none"
+            elif len(apns) == 1 and self.APN_SHAPE.fullmatch(apns[0]):
+                outcome = "found"
+            else:
+                outcome = "ambiguous"
+            for rec in recs:
+                rec.enrichment_data[_APN_LOOKUP_KEY] = outcome
+                if outcome == "found":
+                    rec.parcel_id = apns[0]
+                elif outcome == "ambiguous":
+                    rec.enrichment_data["apn_candidates"] = apns
+        if by_doc:
+            outcomes = [r.enrichment_data[_APN_LOOKUP_KEY] for rs in by_doc.values() for r in rs]
+            _logger.info("Recording APN: %s", {o: outcomes.count(o) for o in sorted(set(outcomes))})
+
+    async def _lookup_addresses_by_owner(self, records: list[ScrapedRecord]) -> None:
+        """In-scrape owner-name address lookup, for a TerraScan TaxSifter county (Douglas).
+
+        Chelan has none here: its leads carry the recording's own APN (_read_parcels),
+        and its PACS owner-name fallback runs after save in enrichment, paced and behind
+        the restricted-source switch (KNOWN_ASSESSOR_URLS). The lookup that used to run
+        here posted without the portal's search mode, so it never found anyone.
+        """
+        from src.scrapers.enrichment.taxsifter import TAXSIFTER_ORIGINS
+
+        if self.county.lower() not in TAXSIFTER_ORIGINS:
+            _logger.info("No owner-name address source for %s in the scrape", self.county)
             return
-
-        _logger.info("Looking up addresses for %d records via PACS (%s)...", len(records), self.county)
-
-        # M8 SSRF hardening (mirrors src/scrapers/enrichment/pacs.py): pacs_url is a
-        # static trusted constant, but validate defense-in-depth before any outbound
-        # request — refuse non-HTTPS, and resolve=True rejects a host that resolves
-        # to a private/loopback/metadata IP. Every request below goes through a
-        # pinned session (audit #5 5b-ii: resolved once, refused if any answer is
-        # blocked, connected to the checked address, so a rebinding answer after
-        # this validation cannot reach an internal host; no ambient proxy) with
-        # allow_redirects=False (a poisoned 3xx can't bounce to an internal host;
-        # PACS posts back to the same URL, so there is no legitimate redirect).
-        # Validated once here because the same pacs_url is reused by the init
-        # session and every per-lookup session.
-        if urlparse(pacs_url).scheme != "https":
-            _logger.warning("PACS lookup refused non-HTTPS URL for %s", self.county)
-            return
-        try:
-            validate_scraping_target(pacs_url, require_allowlisted=False, resolve=True)
-        except Exception as exc:
-            _logger.warning("PACS URL failed SSRF validation: %s", str(exc)[:80])
-            return
-
-        # Get initial page for VIEWSTATE
-        sess = pinned_session()
-        sess.headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0"
-        try:
-            init = sess.get(pacs_url, timeout=10, allow_redirects=False)
-        except Exception as exc:
-            _logger.warning("PACS init failed: %s", str(exc)[:80])
-            return
-
-        # The init page is fetched only to confirm VIEWSTATE is present; each
-        # per-name lookup below re-fetches and parses its own VIEWSTATE tokens.
-        vs_match = re.search(r'__VIEWSTATE.*?value="([^"]+)"', init.text)
-        if not vs_match:
-            _logger.warning("PACS: no VIEWSTATE found")
-            return
-
-        def _lookup_one(name: str) -> dict | None:
-            """Search PACS by owner name, return {address, mailing, value} or None.
-
-            parcel_id is intentionally NOT returned (owner-name match is weak
-            evidence — see parse_pacs_result_html / Codex point C)."""
-            try:
-                # Each lookup needs its own session (shared sessions cause
-                # VIEWSTATE conflicts under concurrency). Pinned + allow_redirects=
-                # False; pacs_url already SSRF-validated above.
-                _s = pinned_session()
-                _s.headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0"
-                r0 = _s.get(pacs_url, timeout=8, allow_redirects=False)
-                vs = re.search(r'__VIEWSTATE.*?value="([^"]+)"', r0.text)
-                ev = re.search(r'__EVENTVALIDATION.*?value="([^"]+)"', r0.text)
-                vsg = re.search(r'__VIEWSTATEGENERATOR.*?value="([^"]+)"', r0.text)
-                if not vs:
-                    return None
-
-                data = {
-                    "__VIEWSTATE": vs.group(1),
-                    "__EVENTVALIDATION": ev.group(1) if ev else "",
-                    "__VIEWSTATEGENERATOR": vsg.group(1) if vsg else "",
-                    "propertySearchOptions$ownerName": name,
-                    "propertySearchOptions$search": "Search",
-                }
-                r = _s.post(pacs_url, data=data, timeout=10, allow_redirects=False)
-                if r.status_code != 200:
-                    return None
-
-                # Check for "None found"
-                if "None found" in r.text:
-                    return None
-
-                # Shared hardened parser (Codex point C): requires exactly ONE
-                # plausible result row and never returns parcel_id — an owner-name
-                # match is weak evidence and parcel_id is the identity/dedup/billing
-                # key. Replaces the old flatten-all-rows / first-10-digit-cell parse
-                # that could trust row 1 of an ambiguous match (and mislabel the
-                # account number as the parcel).
-                result = parse_pacs_result_html(r.text, name)
-                if result and result.get("prop_id"):
-                    # The grid's address cell is the situs; the owner's mailing
-                    # address lives only on the detail page, under its own label.
-                    mailing = mailing_from_detail(_s, pacs_url, result.pop("prop_id"), timeout=10)
-                    if mailing:
-                        result["mailing"] = mailing
-                elif result:
-                    result.pop("prop_id", None)
-                return result
-            except Exception:
-                return None
-
-        # Run lookups concurrently (5 at a time)
-        found = 0
-        loop = asyncio.get_event_loop()
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            for batch_start in range(0, len(records), 20):
-                batch = records[batch_start:batch_start + 20]
-                tasks = [loop.run_in_executor(executor, _lookup_one, r.party_name) for r in batch]
-                results_list = await asyncio.gather(*tasks, return_exceptions=True)
-
-                for record, result in zip(batch, results_list, strict=False):
-                    if isinstance(result, dict) and result:
-                        if result.get("address"):
-                            record.property_address = result["address"]
-                        if result.get("mailing"):
-                            record.mailing_address = result["mailing"]
-                        # parcel_id intentionally NOT set from owner-name PACS
-                        # lookup (Codex point C — weak evidence, identity key).
-                        if result.get("value"):
-                            record.enrichment_data = record.enrichment_data or {}
-                            record.enrichment_data["assessed_value"] = result["value"]
-                        found += 1
-
-        _logger.info("PACS lookup: found addresses for %d/%d records", found, len(records))
+        await self._lookup_taxsifter_addresses(records)
 
     async def _lookup_taxsifter_addresses(self, records: list[ScrapedRecord]) -> None:
         """The PACS lookup's counterpart for a TerraScan TaxSifter county (Douglas).
@@ -1086,3 +1083,5 @@ class ChelanAcclaimWebScraper(AcclaimWebScraper):
     """Chelan County's AcclaimWeb: same portal, its own document codes."""
 
     DOC_TYPE_MAP = _CHELAN_DOC_TYPE_MAP
+    READS_DETAIL_APN = True
+    APN_SHAPE = re.compile(r"\d{12}")  # Chelan parcel numbers: 12 digits

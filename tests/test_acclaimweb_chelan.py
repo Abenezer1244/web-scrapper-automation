@@ -363,3 +363,193 @@ def test_grid_item_maps_the_portal_fields():
     assert item["doc_type"] == row["DocType"]
     assert item["legal"] == row["DocLegalDescription"]
     assert item["date_recorded"] == "10/07/2026"
+
+
+# ── Phase 2b: the parcel comes from the lead's own recording ─────────────────
+
+def _detail(tid):
+    return (_FIX / f"detail_{tid}.html").read_text(encoding="utf-8")
+
+
+def test_the_recording_detail_page_names_its_apn():
+    from src.scrapers.templates.acclaimweb import parse_detail_apns
+
+    assert parse_detail_apns(_detail("1789524")) == ["232020860053"]  # TOD
+    assert parse_detail_apns(_detail("1788730")) == ["222014846080"]  # NTS
+
+
+@pytest.mark.parametrize("html,expected", [
+    ("Doc Type: D <b>DocLegal:</b> APN 111111111111, 222222222222 LOT 1 <b>Grantor:</b> X",
+     ["111111111111", "222222222222"]),
+    ("Doc Type: D <b>DocLegal:</b> APN 1111-1111-1111 LOT 1 <b>Grantor:</b> X", ["111111111111"]),
+    ("Doc Type: D <b>DocLegal:</b> PLAT OF NOWHERE LOT 1 <b>Grantor:</b> X", []),  # no APN
+    # A death certificate's real page shape (live 2026-11-12): no legal, no parcel.
+    ("Doc Type: DC - DEATH CERTIFICATE Agency: STATE OF WASHINGTON DEPARTMENT OF HEALTH "
+     "Deceased: PARTY1 PERSON", []),
+    ("<html>Session expired</html>", None),  # not a detail page: not "no APN"
+    # Codex 2b P1: no list separator may hide a second parcel behind the first.
+    ("Doc Type: D <b>DocLegal:</b> APN 111111111111 &amp; 222222222222 LOT 1 <b>Grantor:</b> X",
+     ["111111111111", "222222222222"]),
+    ("Doc Type: D <b>DocLegal:</b> APN 111111111111; 222222222222 <b>Grantor:</b> X",
+     ["111111111111", "222222222222"]),
+    ("Doc Type: D <b>DocLegal:</b> APN 111111111111 LOT 1 APN 222222222222 <b>Grantor:</b> X",
+     ["111111111111", "222222222222"]),
+    # Plat and lot numbers in the legal are not parcels.
+    ("Doc Type: D <b>DocLegal:</b> APN 232020860053 SP 2019-008 LOT 7 <b>Grantor:</b> X",
+     ["232020860053"]),
+])
+def test_detail_apn_parsing(html, expected):
+    from src.scrapers.templates.acclaimweb import parse_detail_apns
+
+    assert parse_detail_apns(html) == expected
+
+
+async def test_leads_get_their_recordings_apn_and_douglas_is_untouched(browser):
+    page = await _portal(browser, _PAGES)
+    served = []
+
+    async def detail(route):
+        tid = route.request.url.split("/documentdetails/")[1].split("/")[0]
+        served.append(tid)
+        await route.fulfill(status=200, content_type="text/html", body=_detail("1789524"))
+
+    await page.route(f"{_HOST}/AcclaimWeb/details/documentdetails/**", detail)
+    s = _scraper(page, record_type="probate")
+    recs = await s._search_and_read("10/07/2026", "10/07/2026")
+    assert all(r.enrichment_data.get("source_document_id") for r in recs)
+    await s._read_parcels(recs)
+    tod = [r for r in recs if r.enrichment_data["source_document_id"] == "1789524"]
+    assert tod and tod[0].parcel_id == "232020860053"
+    assert tod[0].enrichment_data["recording_apn_lookup"] == "found"
+    assert served == ["1789524"]  # one request per recording
+
+    # Douglas rows carry no document id (their hash is unchanged) and nothing is fetched.
+    served.clear()
+    dpage = await _portal(browser, [_DOUGLAS], first_body="sort=&group=&filter=")
+    d = _scraper(dpage, cls=AcclaimWebScraper, record_type="pre_foreclosure")
+    drecs = await d._search_and_read("10/06/2026", "10/06/2026")
+    assert drecs and not any("source_document_id" in r.enrichment_data for r in drecs)
+    assert served == []
+
+
+async def test_several_apns_on_one_recording_leave_the_parcel_for_review(browser):
+    from src.scrapers.base_scraper import ScrapedRecord
+
+    page = await _portal(browser, _PAGES)
+    two = "Doc Type: D <b>DocLegal:</b> APN 111111111111, 222222222222 LOT 1 <b>Grantor:</b> X"
+
+    async def detail(route):
+        await route.fulfill(status=200, content_type="text/html", body=two)
+
+    await page.route(f"{_HOST}/AcclaimWeb/details/documentdetails/**", detail)
+    s = _scraper(page)
+    rec = ScrapedRecord(party_name="PARTY1 PERSON", enrichment_data={"source_document_id": "1"})
+    await s._read_parcels([rec])
+    assert rec.parcel_id is None
+    assert rec.enrichment_data["recording_apn_lookup"] == "ambiguous"
+    assert rec.enrichment_data["apn_candidates"] == ["111111111111", "222222222222"]
+
+
+# ── Codex 2b round 2: shape, blocking, breaker, retry, the name-fallback rule ──
+
+async def _detail_portal(browser, answer):
+    """A portal page whose recording detail pages answer ``answer(n)`` (status, body) for
+    the n-th request; returns (page, requests seen)."""
+    page = await _portal(browser, _PAGES)
+    seen = []
+
+    async def detail(route):
+        seen.append(route.request.url)
+        status, body = answer(len(seen))
+        await route.fulfill(status=status, content_type="text/html", body=body)
+
+    await page.route(f"{_HOST}/AcclaimWeb/details/documentdetails/**", detail)
+    return page, seen
+
+
+def _recs(n):
+    from src.scrapers.base_scraper import ScrapedRecord
+
+    return [ScrapedRecord(party_name=f"PARTY{i} PERSON", enrichment_data={"source_document_id": str(i)})
+            for i in range(n)]
+
+
+async def test_one_apn_of_the_wrong_shape_is_held_for_review(browser):
+    page, _ = await _detail_portal(
+        browser, lambda n: (200, "Doc Type: D DocLegal: APN 123456789 LOT 1 Grantor: X"))
+    s = _scraper(page)
+    [rec] = _recs(1)
+    await s._read_parcels([rec])
+    assert rec.parcel_id is None and rec.enrichment_data["recording_apn_lookup"] == "ambiguous"
+
+
+async def test_a_refusal_stops_the_run_before_anything_is_saved(browser):
+    from src.scrapers.reliability import ScraperBlockedError
+
+    page, seen = await _detail_portal(browser, lambda n: (429, "slow down"))
+    s = _scraper(page)
+    recs = _recs(4)
+    with pytest.raises(ScraperBlockedError):
+        await s._read_parcels(recs)
+    assert len(seen) == 1  # no retry and no further request after a 429
+
+
+async def test_an_unreadable_recording_fails_the_run_transiently_not_the_row(browser):
+    # A row is never saved half-read: a re-run of the job could not repair it.
+    page, seen = await _detail_portal(browser, lambda n: (500, "error"))
+    s = _scraper(page)
+    recs = _recs(3)
+    with pytest.raises(TransientScrapeError, match="unreadable"):
+        await s._read_parcels(recs)
+    assert len(seen) == 2  # the first recording, tried twice
+    assert not any("recording_apn_lookup" in r.enrichment_data for r in recs)
+
+
+async def test_an_unreadable_200_is_retried(browser):
+    page, seen = await _detail_portal(
+        browser, lambda n: (200, "<html>Please wait</html>") if n == 1 else (200, _detail("1788730")))
+    s = _scraper(page)
+    [rec] = _recs(1)
+    await s._read_parcels([rec])
+    assert len(seen) == 2 and rec.parcel_id == "222014846080"
+
+
+async def test_one_failure_is_retried_once(browser):
+    page, seen = await _detail_portal(
+        browser, lambda n: (500, "error") if n == 1 else (200, _detail("1788730")))
+    s = _scraper(page)
+    [rec] = _recs(1)
+    await s._read_parcels([rec])
+    assert len(seen) == 2 and rec.parcel_id == "222014846080"
+
+
+async def test_one_request_per_recording_even_with_several_leads(browser):
+    from src.scrapers.base_scraper import ScrapedRecord
+
+    page, seen = await _detail_portal(browser, lambda n: (200, _detail("1789524")))
+    s = _scraper(page)
+    recs = [ScrapedRecord(party_name=f"P{i}", enrichment_data={"source_document_id": "1789524"})
+            for i in range(3)]
+    await s._read_parcels(recs)
+    assert len(seen) == 1 and {r.parcel_id for r in recs} == {"232020860053"}
+
+
+@pytest.mark.parametrize("outcome,eligible", [
+    (None, True),          # any other county's row: unchanged
+    ("none", True),        # a death certificate: the recording names no parcel
+    ("found", False),      # the recording's parcel decides the address
+    ("ambiguous", False),  # held for review, never a name guess
+    ("failed", False),     # unread page: undelivered, not given another identity
+])
+def test_the_owner_name_fallback_never_overrides_the_recording(outcome, eligible):
+    from src.db.models import Result
+    from src.workers.tasks_helpers.enrich import name_lookup_eligible
+
+    ed = {"instrument_number": "1"}
+    if outcome:
+        ed["recording_apn_lookup"] = outcome
+    row = Result(party_name="PARTY1 PERSON", property_address=None, enrichment_data=ed)
+    assert name_lookup_eligible(row) is eligible
+    # A row that already has an address is never looked up.
+    row.property_address = "1 MAIN ST"
+    assert name_lookup_eligible(row) is False

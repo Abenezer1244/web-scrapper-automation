@@ -653,6 +653,22 @@ _SQL_MARK_PROPERTY = f"""
 """
 
 
+def name_lookup_eligible(res) -> bool:
+    """Whether the owner-name PACS fallback may look this row up.
+
+    A row with a name and no address, except: a row whose recording was read for its
+    APN (Chelan, ``recording_apn_lookup``) is searched only when that recording names
+    no parcel at all ("none", e.g. a death certificate). With a parcel ("found"),
+    several ("ambiguous") or an unread page ("failed"), a name match could attach a
+    different property than the recorded one, and give the same recording two
+    identities across runs (Codex 2b P1).
+    """
+    ed = res.enrichment_data if isinstance(res.enrichment_data, dict) else {}
+    return bool(res.party_name) and not res.property_address and (
+        ed.get("recording_apn_lookup", "none") == "none"
+    )
+
+
 def _end_transaction_before_network(db, job_id: str) -> None:
     """End any open transaction before a slow network call.
 
@@ -1569,11 +1585,7 @@ def _run_inline_enrichment(
                      "COUNTY_GIS_RESTRICTED_MAILING_ENABLED is off", job_id, _name_site.source_key)
         connector_assessor_url = None
     if connector_assessor_url and is_pacs_url(connector_assessor_url):
-        results_no_addr = [
-            res for res in all_results
-            if res.party_name
-            and not res.property_address
-        ]
+        results_no_addr = [res for res in all_results if name_lookup_eligible(res)]
         # Names an earlier run of this account never got an answer for go first. The
         # pass stops at a budget or a breaker, so a fixed order would re-ask the same
         # first names every run and never reach the rest (Island, 2026-10-04: 19 of 140

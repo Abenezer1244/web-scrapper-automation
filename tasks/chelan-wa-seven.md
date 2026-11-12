@@ -64,10 +64,11 @@ Licensing: the Assessor's search page cites RCW 42.56.070(9) (no commercial list
 - [x] Tests: 32 in `tests/test_acclaimweb_chelan.py` on real captured Chelan (43 rows, 4 pages) and Douglas responses (person names redacted). The late-answer test fails on a mutant without request correlation
 - [x] Verify: affected suites pass (117), ruff clean. Main and the branch fail the same 40+19 local tests for environment reasons (no Redis). Live: Chelan 10 days and Douglas 6 days, rows read == portal total, AFNs continuous across days
 
-### Phase 2b: property linkage (D8)
-- [ ] Read the APN from each lead's recording detail page (`/details/documentdetails/{TransactionItemId}/1/1/11`: "DocLegal: APN 232020860053 …"). Parcel from the recording, not an owner-name guess; the existing statewide GIS (situs) + PACS parcel (mailing) enrichment then applies
-- [ ] Delete the broken in-template Chelan PACS name lookup (cid=90, no searchType, unpaced, ungated); `KNOWN_ASSESSOR_URLS["chelan_WA"]` = PACS cid=91 for the hardened name fallback
-- [ ] Tests + live check (address/mailing on real Oct leads), Codex review
+### Phase 2b: property linkage (D8) (DONE, Codex GO after 3 rounds)
+- [x] Each Chelan lead reads the APN from its own recording's detail page (`/details/documentdetails/{TransactionItemId}/1/1/11`, "DocLegal: APN 232020860053 …"), via an in-page fetch so the context SSRF guard applies. Outcomes: one 12-digit APN -> `found` (parcel_id); several or an odd shape -> `ambiguous` (`apn_candidates`, held for review); no legal (death certificates) -> `none`. An unreadable page after one retry raises Transient/Blocked before save, so no row is half-read. One request per recording, paced 1.5 s
+- [x] The broken in-template PACS name lookup is deleted (Douglas keeps TaxSifter). `KNOWN_ASSESSOR_URLS["chelan_WA"]` = Assessor PACS cid=91, so the hardened, paced, license-gated post-save name fallback runs. `enrich.name_lookup_eligible`: a row whose recording was read is name-searched only when the recording names no parcel (`none`), so a name match never overrides recorded parcel evidence
+- [x] Live (read-only, Oct 1–12): 9 leads -> 6 one-APN `found` -> **6/6 statewide-GIS situs, 6/6 PACS owner mailing** (before: 0/9 addresses). 2 TODs `ambiguous` (several parcels), 1 DC `none` -> name fallback `no_match` (stays undelivered)
+- [x] Tests: 59 in the Chelan/AcclaimWeb files (APN parse incl. `&amp;`/`;`/repeat-label/plat numbers, shape, retry, refusal, unreadable-200, one-request-per-recording, name-fallback rule)
 
 ### Phase 3: death_certificate for Chelan (recorder `DC`). Code only, connector change waits for owner approval
 ### Phase 4 (owner decisions): trustee_sale sale-date via NTS images; tax_delinquent from the Treasurer foreclosure list; SmartGov code cases

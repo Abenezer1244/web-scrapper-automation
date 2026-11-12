@@ -257,6 +257,28 @@ def test_every_shared_store_resumes_across_pages(s, monkeypatch, batch):
                      ).scalar() == 0
 
 
+def test_the_pacs_tax_cache_is_erased_like_the_other_shared_stores(s):
+    """Migration 142: an owing parcel's owner and addresses go; a neighbour's stay."""
+    rule_id, row = _active_rule(s, "delete")
+    rule = load_erasure_rule(s, rule_id, row)
+    ids = {}
+    for parcel, name in ((_PARCEL, "SMITH JOHN"), ("0000000001", "SMITH JOHN"),
+                         (_PARCEL + "9", "DOE JANE")):
+        ids[parcel] = str(s.execute(text(
+            "INSERT INTO pacs_tax_status (id, county, state, parcel_id, outcome, "
+            "delinquent_amount, owner_name, property_address, mailing_address) VALUES "
+            "(gen_random_uuid(), 'king', 'WA', :p, 'found', 100, :n, '1 TEST ST', "
+            "'PO BOX 1') RETURNING id"), {"p": parcel, "n": name}).scalar())
+    assert _sweep(s, rule, "pacs_tax").get("pacs_tax") == 1
+    left = dict(s.execute(text(
+        "SELECT parcel_id, owner_name IS NULL AND mailing_address IS NULL AND "
+        "property_address IS NULL AND privacy_suppression_id IS NOT NULL "
+        "FROM pacs_tax_status WHERE id = ANY(CAST(:i AS uuid[]))"),
+        {"i": list(ids.values())}).all())
+    assert left == {_PARCEL: True, "0000000001": False, _PARCEL + "9": False}
+    assert _sweep(s, rule, "pacs_tax").get("pacs_tax", 0) == 0
+
+
 def test_a_phone_anchor_erases_only_the_named_subject(s):
     rule_id, row = _active_rule(s, "delete", anchor=("phone", "2065550100"))
     rule = load_erasure_rule(s, rule_id, row)

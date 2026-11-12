@@ -1981,6 +1981,43 @@ class NtsNotice(Base):
         nullable=True)
 
 
+class PacsTaxStatus(Base):
+    """Per-parcel property-tax status read off a county's PACS page (migration 141).
+
+    For counties that publish no delinquent list (Asotin first): one row per parcel in
+    the county's inventory, refreshed by the rolling crawler (workers/pacs_tax_crawler,
+    system role). SHARED and system-only under RLS like nts_notices; tenants get leads
+    through the ordinary job pipeline (scrapers/asotin_wa_tax_delinquent).
+
+    ``checked_at`` moves only on a settled answer, so a failing pass never makes the
+    cache look fresh; ``attempted_at`` orders the round-robin. Owner name and addresses
+    are kept ONLY for a parcel that owes past-due tax (data minimisation), and only
+    when the privacy rules allow it.
+    """
+
+    __tablename__ = "pacs_tax_status"
+    __table_args__ = (UniqueConstraint("county", "state", "parcel_id", name="uq_pacs_tax_status_parcel"),)
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    county = Column(String(64), nullable=False)
+    state = Column(String(4), nullable=False)
+    parcel_id = Column(String(64), nullable=False)
+    outcome = Column(String(32), nullable=True)  # last settled pacs_tax outcome
+    as_of = Column(Date, nullable=True)
+    delinquent_amount = Column(Numeric(12, 2), nullable=True)
+    oldest_delinquent_year = Column(Integer, nullable=True)
+    years_owing = Column(JSON, nullable=True)
+    owner_name = Column(String(512), nullable=True)
+    property_address = Column(String(512), nullable=True)
+    mailing_address = Column(String(512), nullable=True)
+    attempted_at = Column(DateTime(timezone=True), nullable=True)
+    checked_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    privacy_suppression_id = Column(
+        UUID(as_uuid=False), ForeignKey("privacy_suppressions.id", ondelete="RESTRICT"),
+        nullable=True)
+
+
 class ExternalSourceHealth(Base):
     """Health of an EXTERNAL enrichment source (migration 083).
 

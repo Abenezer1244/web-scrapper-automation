@@ -17,7 +17,8 @@ enforcer has not reached yet carries none (Codex consult). Every row of every st
 scanned, flagged or not.
 
 Stores, in order: results (every tenant), king_parcel_owners, nts_notices,
-county_records. The function also reaches each matched result's skip-trace cache
+county_records, pacs_tax_status (its own function, migration 142). The function also
+reaches each matched result's skip-trace cache
 entries (its subject hash, plus the keys of its pending lookups computed here),
 lookups, Tracerfy links, dialer rows and exports.
 """
@@ -41,7 +42,7 @@ from src.privacy.authorize import (
 )
 from src.scrapers.enrichment.skip_trace import pending_row_subject_key
 
-STORES = ("results", "king", "nts", "county")
+STORES = ("results", "king", "nts", "county", "pacs_tax")
 BATCH = 500
 _MAX_CACHE_KEYS = 2000  # privacy_erase_batch's own bound
 _NIL = str(uuid.UUID(int=0))
@@ -66,6 +67,13 @@ _KING_SQL = text(
 _NTS_SQL = text(
     "SELECT id::text AS id, grantor, parcel, county, state FROM nts_notices "
     "WHERE grantor IS NOT NULL AND id > CAST(:after AS uuid) ORDER BY id LIMIT :n"
+)
+_PACS_TAX_CALL = text(
+    "SELECT privacy_erase_pacs_tax(CAST(:rule AS uuid), CAST(:pacs_tax AS uuid[]))")
+# Only a parcel that owes keeps an owner; one already withheld by any rule has none.
+_PACS_TAX_SQL = text(
+    "SELECT id::text AS id, owner_name, parcel_id, county, state FROM pacs_tax_status "
+    "WHERE owner_name IS NOT NULL AND id > CAST(:after AS uuid) ORDER BY id LIMIT :n"
 )
 _COUNTY_SQL = text(
     "SELECT id::text AS id, county, state, party_name, heirs, parcel_id, enrichment_data "
@@ -169,8 +177,17 @@ def _scan_county(db, rule: ErasureRule, after: str | None):
     return rows, matched, {"county": matched, "_last": rows[-1].id if rows else None}
 
 
+def _scan_pacs_tax(db, rule: ErasureRule, after: str | None):
+    rows = db.execute(_PACS_TAX_SQL, {"after": after or _NIL, "n": BATCH}).all()
+    # As the crawler's own gate: the owner is the tax-delinquent lead's party.
+    matched = [r.id for r in rows if _is_subject(
+        rule, _lead(parcel_id=r.parcel_id, party_name=r.owner_name),
+        record_type="tax_delinquent", county=r.county, state=r.state)]
+    return rows, matched, {"pacs_tax": matched, "_last": rows[-1].id if rows else None}
+
+
 _SCANS = {"results": _scan_results, "king": _scan_king, "nts": _scan_nts,
-          "county": _scan_county}
+          "county": _scan_county, "pacs_tax": _scan_pacs_tax}
 
 
 def erase_step(db, rule: ErasureRule, cursor: dict | None) -> Step:
@@ -182,7 +199,10 @@ def erase_step(db, rule: ErasureRule, cursor: dict | None) -> Step:
         raise ValueError(f"unknown erasure store {store!r}")
     rows, matched, args = _SCANS[store](db, rule, cursor.get("after"))
     step = Step(scanned=len(rows))
-    if matched:
+    if matched and store == "pacs_tax":
+        step.counts = dict(db.execute(
+            _PACS_TAX_CALL, {"rule": rule.rule_row, "pacs_tax": matched}).scalar())
+    elif matched:
         params = {"rule": rule.rule_row, "res": [], "keys": [], "king": [], "nts": [],
                   "county": []}
         params.update({k: v for k, v in args.items() if not k.startswith("_")})

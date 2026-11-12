@@ -333,6 +333,13 @@ app.conf.beat_schedule = {
         "task": "src.workers.nts_crawler.crawl_nts_nwmarket_asotin",
         "schedule": crontab(hour=10, minute=0),  # 10:00 UTC daily
     },
+    "crawl-pacs-tax": {
+        # Asotin has no delinquent list: walk every parcel's PACS tax table a batch an
+        # hour (20 min budget, the county's PACS lease shared with mailing recovery).
+        # A full pass is ~4 days; the scraper refuses to answer below 95% coverage.
+        "task": "src.workers.pacs_tax_crawler.crawl_pacs_tax",
+        "schedule": crontab(minute=25),  # hourly at :25
+    },
     "recover-deferred-mailing": {
         # The recovery half of `mailing_lookup_deferred`, which shipped as a
         # marker that nothing ever read: parcels a source outage skipped were

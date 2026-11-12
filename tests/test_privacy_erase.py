@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from datetime import UTC, datetime
 
 import pytest
 from sqlalchemy import text
@@ -319,3 +320,23 @@ def test_a_withheld_notice_can_never_keep_a_grantor(s):
                 "INSERT INTO nts_notices (id, source, ts_number, grantor, is_active, "
                 "privacy_suppression_id) VALUES (:i, 'test', :t, 'JOHN SMITH', false, :r)"),
                 {"i": nts, "t": nts[:12], "r": row})
+
+
+def test_a_crawl_never_clears_a_tax_cache_tombstone(s):
+    """Codex High: the crawler's settle must keep a privacy tombstone and its row
+    nameless, whatever the newly parsed page says."""
+    from src.workers.pacs_tax_crawler import _SETTLE
+
+    _, row = _active_rule(s, "delete")
+    s.execute(text(
+        "INSERT INTO pacs_tax_status (id, county, state, parcel_id, outcome, "
+        "privacy_suppression_id) VALUES (gen_random_uuid(), 'asotin', 'WA', 'T1', 'found', "
+        "CAST(:r AS uuid))"), {"r": row})
+    s.execute(_SETTLE, {
+        "county": "asotin", "state": "WA", "parcel": "T1", "now": datetime.now(UTC),
+        "outcome": "found", "as_of": None, "amount": 100, "oldest": 2025, "years": None,
+        "owner": "SMITH JOHN", "situs": "1 TEST ST", "mailing": "PO BOX 1", "suppression": None})
+    kept = s.execute(text(
+        "SELECT owner_name, property_address, mailing_address, privacy_suppression_id::text "
+        "FROM pacs_tax_status WHERE parcel_id = 'T1'")).one()
+    assert tuple(kept) == (None, None, None, row)

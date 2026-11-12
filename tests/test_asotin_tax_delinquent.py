@@ -27,14 +27,20 @@ _OWING, _PAID, _UNREACHED = "10014003000000000", "10040300100010000", "100403008
 _PAGES = {_OWING: "asotin_pacs_detail_1651.html", _PAID: "asotin_pacs_detail_2712.html"}
 
 
+_CLEAN = ("DELETE FROM pacs_tax_status WHERE county = 'asotin'",
+          "DELETE FROM external_source_health WHERE source_key = 'pacs_tax_inventory:asotin'")
+
+
 @pytest.fixture
 def db():
     with system_sync_session() as s:
-        s.execute(text("DELETE FROM pacs_tax_status WHERE county = 'asotin'"))
+        for sql in _CLEAN:
+            s.execute(text(sql))
         s.commit()
         yield s
         s.rollback()
-        s.execute(text("DELETE FROM pacs_tax_status WHERE county = 'asotin'"))
+        for sql in _CLEAN:
+            s.execute(text(sql))
         s.commit()
 
 
@@ -84,6 +90,26 @@ class TestCrawl:
         assert after.delinquent_amount == before.delinquent_amount
         assert after.checked_at == before.checked_at      # freshness did not move
         assert after.attempted_at > before.attempted_at   # but it rotated back
+
+    def test_a_page_for_another_parcel_is_not_an_answer(self, db):
+        crawler.crawl_county("asotin", db, fetch=_fetch, resolve=_resolve)
+        before = _rows(db)[_OWING]
+
+        def mismatch(county, parcel_ids, *, time_budget_s):
+            return {pid: pacs_tax.TaxAnswer("parcel_mismatch") for pid in parcel_ids}
+
+        crawler.crawl_county("asotin", db, fetch=_fetch, resolve=mismatch)
+        after = _rows(db)[_OWING]
+        assert (after.delinquent_amount, after.outcome) == (before.delinquent_amount, "found")
+        assert after.checked_at == before.checked_at  # never counted as coverage
+
+    def test_the_inventory_is_read_once_a_week_not_every_run(self, db):
+        crawler.crawl_county("asotin", db, fetch=_fetch, resolve=_resolve)
+
+        def no_fetch(url):
+            raise AssertionError("inventory re-read inside its week")
+
+        crawler.crawl_county("asotin", db, fetch=no_fetch, resolve=_resolve)
 
     def test_a_layer_without_features_is_an_error_not_an_empty_county(self):
         with pytest.raises(ValueError):

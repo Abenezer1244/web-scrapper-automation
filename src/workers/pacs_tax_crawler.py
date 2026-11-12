@@ -50,11 +50,20 @@ _SETTLE = text(
     UPDATE pacs_tax_status SET
         outcome = :outcome, as_of = :as_of, delinquent_amount = :amount,
         oldest_delinquent_year = :oldest, years_owing = CAST(:years AS json),
-        owner_name = :owner, property_address = :situs, mailing_address = :mailing,
-        privacy_suppression_id = :suppression, attempted_at = :now, checked_at = :now
+        -- A privacy tombstone is never cleared here (lifting is the privacy flow's job),
+        -- and a row under one never takes a name back, even from a racing crawl.
+        owner_name = CASE WHEN coalesce(privacy_suppression_id, CAST(:suppression AS uuid))
+                          IS NULL THEN :owner END,
+        property_address = CASE WHEN coalesce(privacy_suppression_id,
+                          CAST(:suppression AS uuid)) IS NULL THEN :situs END,
+        mailing_address = CASE WHEN coalesce(privacy_suppression_id,
+                          CAST(:suppression AS uuid)) IS NULL THEN :mailing END,
+        privacy_suppression_id = coalesce(privacy_suppression_id, CAST(:suppression AS uuid)),
+        attempted_at = :now, checked_at = :now
     WHERE county = :county AND state = :state AND parcel_id = :parcel
     """
 )
+_INVENTORY_KEY = "pacs_tax_inventory:{}".format  # external_source_health heartbeat
 _TOUCH = text(
     "UPDATE pacs_tax_status SET attempted_at = :now "
     "WHERE county = :county AND state = :state AND parcel_id = :parcel"
@@ -101,7 +110,9 @@ def _settled_row(answer, gate) -> dict:
     row.update(as_of=answer.as_of, amount=answer.delinquent_amount,
                oldest=answer.oldest_delinquent_year,
                years=json.dumps({str(s.year): str(s.amount_due) for s in answer.past_due}))
-    if answer.delinquent_amount > 0:
+    # Personal fields only with an owner: an ownerless row could neither be delivered
+    # (the scraper holds it) nor be found by erasure, which keys on the owner.
+    if answer.delinquent_amount > 0 and answer.owner_name:
         row.update(owner=answer.owner_name, situs=answer.property_address,
                    mailing=answer.mailing_address)
         row.update(gate(row))
@@ -136,13 +147,15 @@ def crawl_county(county: str, db, *, fetch, resolve, now: datetime | None = None
 
     now = now or datetime.now(UTC)
     summary = {"county": county, "inventory_added": 0, "asked": 0, "settled": 0, "owing": 0}
-    newest = db.execute(text("SELECT max(created_at) FROM pacs_tax_status WHERE county = :c"),
-                        {"c": county}).scalar()
-    if newest is None or now - newest > _INVENTORY_EVERY:
+    from src.scrapers.enrichment.source_health import get_source_state, mark_source_healthy
+
+    last = (get_source_state(db, _INVENTORY_KEY(county)) or {}).get("last_success_at")
+    if last is None or now - last > _INVENTORY_EVERY:
         ids = statewide_parcel_ids(county, fetch)
         summary["inventory_added"] = db.execute(
             _INSERT, {"county": county, "state": _STATE, "ids": ids}).rowcount or 0
         db.commit()
+        mark_source_healthy(db, _INVENTORY_KEY(county))  # refreshed: next one in a week
     batch = [r.parcel_id for r in db.execute(
         _NEXT, {"county": county, "state": _STATE, "n": _BATCH})]
     if not batch:
@@ -165,7 +178,9 @@ def crawl_county(county: str, db, *, fetch, resolve, now: datetime | None = None
     return summary
 
 
-_SETTLED = frozenset({"found", "parcel_not_found", "parcel_mismatch"})
+# What a settled answer is HERE: a mismatch page proves nothing about the requested
+# parcel, so it neither replaces the last good row nor counts as coverage.
+_SETTLED = frozenset({"found", "parcel_not_found"})
 
 
 @app.task(name="src.workers.pacs_tax_crawler.crawl_pacs_tax")

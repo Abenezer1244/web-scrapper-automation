@@ -18,6 +18,7 @@ Lewis, Lincoln, Mason, Okanogan, Pacific, Spokane, Stevens, Thurston, Whitman
 import re
 
 from src.api.middleware.security import add_scrape_domain
+from src.config import settings
 from src.scrapers.base_scraper import (
     BridgeScraper,
     ScrapedRecord,
@@ -67,8 +68,21 @@ _DOC_TYPE_EXCLUDE = {
     # polluting probate results on island + pacific. No genuine probate instrument
     # carries "TRUSTEE"; pre_foreclosure's "TRUSTEE SALE" is unaffected because the
     # exclude list is per-record-type.
-    "probate": ["LACK OF PROBATE", "TRUSTEE"],
+    "probate": ["LACK OF PROBATE", "TRUSTEE",
+                # Clallam's EXEC code is "Writ of Exec" (judgment collection), not an
+                # executor filing; a writ of execution is never probate anywhere.
+                "WRIT OF EXEC",
+                # A living owner cancelling a TOD deed is neither a death nor a TOD signal.
+                "REVOCATION OF TRANSFER ON DEATH"],
 }
+
+# Clallam files a Discontinuance of Trustee's Sale under its NTS type. The only
+# marker is "DISCONTINUANCE <original instrument>" in the party cell (verified live
+# 2026-11-12: 2026-1486992 discontinues 2026-1484470). Instrument numbers keep the year.
+_DISCONTINUANCE_RE = re.compile(r"\bDISCONTINU\w*\s+(\d{4}-\d{5,})", re.IGNORECASE)
+_INSTRUMENT_RE = re.compile(r"\b(\d{4}-\d{5,})\b")
+_NTS_LABELS = ["TRUSTEE SALE", "TRUSTEE'S SALE"]
+_DISCONTINUANCE_LOOKUP_COUNTIES = frozenset({"clallam"})
 
 
 def _date_chunks(date_from: str, date_to: str, chunk_days: int) -> list[tuple[str, str]]:
@@ -272,6 +286,11 @@ class EagleWebScraper(BridgeScraper):
 
             await self.polite_delay()
 
+        # The per-notice lookup is verified on Clallam only (live 2026-11-12); Benton
+        # also numbers instruments YYYY-NNNNNN but its lookup page is unverified.
+        if self.active_record_type == "pre_foreclosure" and self.county.lower() in _DISCONTINUANCE_LOOKUP_COUNTIES:
+            all_records = await self._drop_discontinued(all_records)
+
         # Drop records without parcel_id if required — these are upstream
         # data gaps (e.g., Thurston death certificates with empty Parcel
         # field), not scraper bugs, and they cannot be GIS-enriched.
@@ -289,6 +308,62 @@ class EagleWebScraper(BridgeScraper):
         # (src/workers/tasks_helpers/enrich.py) adds the addresses.
         _logger.info("EagleWeb complete — %d records (enrichment runs after save)", len(all_records))
         return all_records
+
+    async def _drop_discontinued(self, records: list[ScrapedRecord]) -> list[ScrapedRecord]:
+        """Drop trustee-sale notices the recorder shows as discontinued, at any date.
+
+        A recorder search by an NTS's own instrument number also lists every
+        discontinuance that cites it, so one lookup per notice also catches
+        cancellations recorded after the scrape window. Only notices with a
+        year-dashed instrument (Clallam's ``2026-1484470``) are checked.
+        """
+        kept: list[ScrapedRecord] = []
+        for record in records:
+            label = (record.doc_type or "").upper()
+            match = _INSTRUMENT_RE.search(label)
+            if match and any(lbl in label for lbl in _NTS_LABELS):
+                if await self._instrument_discontinued(match.group(1)):
+                    _logger.info("Dropped NTS %s: the recorder lists a discontinuance of it", match.group(1))
+                    continue
+                await self.polite_delay()
+            kept.append(record)
+        return kept
+
+    async def _instrument_discontinued(self, instrument: str) -> bool:
+        """True when a recorder search for ``instrument`` lists a discontinuance citing it.
+
+        Fails loud (RuntimeError) when the lookup cannot be read: an unverified
+        notice must not be delivered as active foreclosure."""
+        search_url = f"{self.base_url.split('/web/')[0]}/eagleweb/docSearch.jsp"
+        last_error: Exception | None = None
+        for attempt in range(1, settings.MAX_RETRIES + 1):
+            try:
+                await self.page.goto(search_url, wait_until="domcontentloaded",
+                                     timeout=settings.DEFAULT_TIMEOUT * 1000)
+                await self.page.evaluate("""(n) => {
+                    for (const id of ['RecDateIDStart', 'RecDateIDEnd']) {
+                        const el = document.getElementById(id); if (el) el.value = '';
+                    }
+                    document.getElementById('DocNumID').value = n;
+                }""", instrument)
+                async with self.page.expect_navigation(
+                    url="**/docSearchResults*", timeout=settings.DEFAULT_TIMEOUT * 2000,
+                    wait_until="domcontentloaded",
+                ):
+                    await self.page.evaluate("document.forms.docSearch.submit()")
+                body = await self.page.inner_text("body")
+                # Positive control: the notice's own result row (instrument then its
+                # recording date) must be listed; the "You searched for" echo is not.
+                if not re.search(rf"{re.escape(instrument)}\s+\d{{1,2}}/\d{{1,2}}/\d{{4}}", body):
+                    raise RuntimeError(f"lookup for {instrument} did not return the notice itself")
+                return bool(re.search(rf"\bDISCONTINU\w*\s+{re.escape(instrument)}\b", body, re.IGNORECASE))
+            except Exception as exc:
+                last_error = exc
+                _logger.warning("Discontinuance lookup %s attempt %d/%d failed: %s",
+                                instrument, attempt, settings.MAX_RETRIES, str(exc)[:120])
+        raise RuntimeError(
+            f"{self.county}: could not verify NTS {instrument} against discontinuances: {last_error}"
+        )
 
     async def _wait_through_cloudflare(self, timeout_s: int = 35) -> None:
         """Wait for a Cloudflare managed JS challenge to auto-clear after navigate.
@@ -1124,7 +1199,9 @@ class EagleWebScraper(BridgeScraper):
                                 # foreclosure was cancelled/cured (Discontinuance,
                                 # Rescission) or is pure trustee admin (Substitution
                                 # of Trustee) is NOT active distress — drop it.
-                                if is_cancellation_or_admin(desc):
+                                # Clallam marks its discontinuances only in the party
+                                # cell, so check the raw summary too (before orientation).
+                                if is_cancellation_or_admin(desc) or _DISCONTINUANCE_RE.search(summary):
                                     continue
                                 # Borrower orientation: an NTS is often indexed with
                                 # the trustee company as grantor and the borrower as

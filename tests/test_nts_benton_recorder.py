@@ -1,0 +1,83 @@
+"""Benton recorded NTS parser, pinned against the text layer of 13 real recorded notices
+(Benton County Auditor, recorded 09/29-11/09/2026; fixtures are pypdf's extraction of
+each recorder PDF). The expectations below were each checked by reading the notice.
+"""
+import gzip
+from datetime import date
+from decimal import Decimal
+from pathlib import Path
+
+import pytest
+
+from src.scrapers.sources.nts_benton_recorder import benton_parcel, parse_recorded_nts
+
+_DIR = Path(__file__).parent / "fixtures" / "benton_nts"
+
+
+def _parse(name: str) -> dict:
+    return parse_recorded_nts(gzip.decompress((_DIR / f"{name}.txt.gz").read_bytes()).decode("utf-8"))
+
+
+def test_every_notice_yields_its_parcel_address_and_section_iv_principal():
+    files = sorted(_DIR.glob("*.txt.gz"))
+    assert len(files) == 13
+    for f in files:
+        p = _parse(f.name[:-7])
+        assert p["instrument_number"] and p["notice_code"] == "NTS", f.name
+        assert p["parcels"] and all(len(x) == 15 for x in p["parcels"]), f.name
+        assert p["property_address"], f.name
+        assert p["principal_owing"] is not None and p["principal_owing_basis"] == "principal", f.name
+
+
+def test_a_clean_residential_notice():
+    p = _parse("2026_025237")
+    assert p["instrument_number"] == "2026-025237"
+    assert p["recorded_date"] == date(2026, 10, 2)
+    assert p["ts_number"] == "WA05000075-26-1"
+    assert p["parcels"] == ["110984020208009"]
+    assert p["auction_date"] == date(2027, 2, 5) and p["auction_time"] == "01:00PM"
+    assert p["principal_owing"] == Decimal("212407.68")
+    assert p["property_address"] == "713 SMITH AVE, RICHLAND ,WA 99352"
+    assert p["grantor"] == "TRACY RAE PALMER, AN UNMARRIED PERSON"
+    assert p["multi_property"] is False and p["commercial"] is False
+
+
+def test_numeric_sale_date_and_dashed_parcel():
+    p = _parse("2026_027262")  # "will on March 12,2027"; parcel printed 1-0189-102-0008-011
+    assert p["parcels"] == ["101891020008011"]
+    assert p["auction_date"] == date(2027, 3, 12)
+    p = _parse("2026_025590")  # "will on 2/12/2027, at 10:00AM"
+    assert p["auction_date"] == date(2027, 2, 12) and p["auction_time"] == "10:00AM"
+
+
+def test_a_later_date_in_the_notice_is_not_the_sale():
+    """2026-027553's notary block says 'on October 29, 2026'; the sale is 2/26/2027."""
+    assert _parse("2026_027553")["auction_date"] == date(2027, 2, 26)
+
+
+@pytest.mark.parametrize("name", ["2026_024803", "2026_025119", "2026_025258", "2026_028388"])
+def test_an_ocr_damaged_sale_date_is_left_unparsed_not_guessed(name):
+    # "21512027" (2/5/2027 with slashes read as 1), "FebruaryS,2027", "41212027".
+    assert _parse(name)["auction_date"] is None
+
+
+def test_the_street_and_city_lines_are_joined():
+    assert _parse("2026_024803")["property_address"] == "6025W OKANOGAN LOOP, KENNEWICK, WASHINGTON 99336"
+
+
+def test_grantor_label_variants():
+    assert _parse("2026_025590")["grantor"].startswith("TIMOTHY MCINTOSH AND MANNA MCINTOSH")  # "for Recording Purposes"
+    assert _parse("2026_027262")["grantor"] == "LuisA.Perez"  # "Grantor(s) of Deed of Trust <name>"
+    assert _parse("2026_027155")["grantor"] == "LOVELY J.RANGEL, AN UNMARRIED WOMAN"
+
+
+def test_a_notice_for_property_in_two_counties_is_flagged_not_pinned():
+    p = _parse("2026_027018")  # Benton + Walla Walla parcels in one notice
+    assert p["multi_property"] is True and p["other_counties"] == ["Walla Walla"]
+    assert p["parcels"] == ["118803050002002"]
+
+
+def test_benton_parcel_shape():
+    assert benton_parcel("1-1880-305-0002-002") == "118803050002002"
+    assert benton_parcel("24173") is None           # a PACS property id printed beside it
+    assert benton_parcel("30-08-02-53-0701") is None  # a Walla Walla parcel

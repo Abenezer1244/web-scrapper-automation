@@ -248,7 +248,10 @@ def _detect_template(base_url: str):
 
     # AcclaimWeb (Tyler) — Chelan, Douglas, Pend Oreille
     if "/acclaimweb" in url_lower:
-        from src.scrapers.templates.acclaimweb import AcclaimWebScraper
+        from src.scrapers.templates.acclaimweb import AcclaimWebScraper, ChelanAcclaimWebScraper
+        # Exact host: Chelan's document codes differ from the other AcclaimWeb sites.
+        if urlparse(url_lower).hostname == "acclaim.co.chelan.wa.us":
+            return ChelanAcclaimWebScraper
         return AcclaimWebScraper
 
     # Skagit County Recording Search — custom ASP.NET portal. The county moved it from

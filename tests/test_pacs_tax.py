@@ -54,3 +54,10 @@ def test_before_the_first_due_date_nothing_is_past_due():
 def test_a_credit_balance_is_not_a_debt():
     credit = pt.Statement(2026, "1", Decimal("-689.64"), Decimal("0"), Decimal("0"))
     assert pt.TaxAnswer(pt.FOUND, as_of=date(2026, 11, 12), statements=[credit]).delinquent_amount == 0
+
+
+def test_the_lead_identity_comes_off_the_same_page():
+    a = pt.parse_tax(_page("asotin_pacs_detail_2712.html"), "10040300100010000")
+    assert a.owner_name == "OWNER REDACTED"  # fixture names are redacted
+    assert a.mailing_address == "831 18TH AVE, CLARKSTON, WA 99403"
+    assert a.property_address and a.property_address.endswith("CLARKSTON, WA 99403")

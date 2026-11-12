@@ -50,6 +50,10 @@ class TaxAnswer:
     outcome: str
     as_of: date | None = None
     statements: list[Statement] = field(default_factory=list)
+    # The lead's identity, read off the same page that proved the parcel.
+    owner_name: str | None = None
+    property_address: str | None = None
+    mailing_address: str | None = None
 
     @property
     def past_due(self) -> list[Statement]:
@@ -81,12 +85,22 @@ def _money(text: str) -> Decimal | None:
 
 def parse_tax(html: str, parcel_key: str) -> TaxAnswer:
     """One PACS detail page -> its tax statements for ``parcel_key`` (normalised)."""
-    geo_ids = parse_pacs_detail_html(html)["geo_ids"]
+    from src.scrapers.enrichment.pacs_parcel import FOUND as MAIL_FOUND
+    from src.scrapers.enrichment.pacs_parcel import parse_detail
+
+    page = parse_pacs_detail_html(html)
+    geo_ids = page["geo_ids"]
     if not geo_ids:
         return TaxAnswer(UNPARSED)
     if len(geo_ids) != 1 or normalize_pacs_parcel(geo_ids[0]) != parcel_key:
         return TaxAnswer(PARCEL_MISMATCH)
     soup = BeautifulSoup(html, "html.parser")
+    owners = [td.find_next_sibling("td").get_text(" ", strip=True)
+              for td in soup.find_all("td", string=re.compile(r"^\s*Name:\s*$"))
+              if td.find_next_sibling("td")]
+    owners = list(dict.fromkeys(o for o in owners if o))
+    situs = ", ".join(line for line in (page["situs"] or []) if line) or None
+    mail = parse_detail(html, parcel_key)  # same co-owner / ambiguity rules as mailing
     as_of_m = _AS_OF.search(soup.get_text(" "))
     table = soup.find("table", id="ctl00_details_detailsTable")
     if as_of_m is None or table is None:
@@ -103,4 +117,8 @@ def parse_tax(html: str, parcel_key: str) -> TaxAnswer:
         if due is None or penalty is None or interest is None:
             return TaxAnswer(UNPARSED)
         statements.append(Statement(int(cells[0]), cells[1], due, penalty, interest))
-    return TaxAnswer(FOUND, as_of=as_of, statements=statements)
+    return TaxAnswer(
+        FOUND, as_of=as_of, statements=statements,
+        owner_name=" & ".join(owners)[:512] or None, property_address=situs,
+        mailing_address=mail.mailing_address if mail.outcome == MAIL_FOUND else None,
+    )

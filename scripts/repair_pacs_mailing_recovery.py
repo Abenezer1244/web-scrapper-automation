@@ -134,7 +134,8 @@ _REPAIR_SQL = f"""
 _CLALLAM_FIX_SHAPES = (
     re.compile(r'"clallam":\s*PacsSite\([^)]*land_suffix="0000"[^)]*short_id_len=12'),
     re.compile(r"land_id=land_ids\[key\]"),
-    re.compile(r"parse_detail\(resp\.text,\s*matched_key\)"),
+    # `parse` since the tax pass shares _resolve_one (its default is parse_detail).
+    re.compile(r"(?:parse_detail|parse)\(resp\.text,\s*matched_key\)"),
 )
 
 

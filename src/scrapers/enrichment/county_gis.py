@@ -692,7 +692,7 @@ def _empty() -> dict[str, str | None]:
 # The PACS counties and Thurston (audit 2026-10-02: every one of them stored 0% mailing
 # because it had no source here) answer through pacs_parcel.py / thurston_assessor.py,
 # which close parcel identity on the county's own page before taking an address.
-_PACS_MAILING_COUNTIES = ("benton", "clallam", "jefferson", "grant", "whatcom", "island", "chelan")
+_PACS_MAILING_COUNTIES = ("benton", "clallam", "jefferson", "grant", "whatcom", "island", "chelan", "asotin")
 _BULK_MAILING_SOURCES: dict[str, str] = {
     "snohomish_WA": "snohomish_assessor_roll",
     "clark_WA": "clark_pic",

@@ -6,8 +6,8 @@ Every lead in a county without its own mailing source is enriched through the WA
 statewide parcel layer, which is situs-only and answers ``mailing_address=None`` by
 design (county_gis.py). Measured 2026-10-02 on done jobs: Benton probate 0/7,
 Chelan 0/2, Okanogan 0/13, Clark 0/1,634 (Clark has its own module, clark_pic).
-Seven WA counties publish the owner mailing address per parcel on a PACS portal
-with no login: Benton, Clallam, Jefferson, Grant, Whatcom, Island and Chelan. The
+Eight WA counties publish the owner mailing address per parcel on a PACS portal
+with no login: Benton, Clallam, Jefferson, Grant, Whatcom, Island, Chelan and Asotin. The
 same ASP.NET form serves all of them (``propertySearchOptions$geoid``, verified on
 each portal 2026-10-02; Island was offline for maintenance that day).
 
@@ -128,6 +128,8 @@ PACS_SITES: dict[str, PacsSite] = {
     "whatcom": PacsSite("whatcom", "https://property.whatcomcounty.us/propertyaccess/PropertySearch.aspx?cid=0", True),
     "island": PacsSite("island", "https://assessor.islandcountywa.gov/propertyaccess/PropertySearch.aspx?cid=0", True),
     "chelan": PacsSite("chelan", "https://pacs.co.chelan.wa.us/PropertyAccess/PropertySearch.aspx?cid=91", True),
+    # Vendor-hosted (cid=10); Geo IDs are 17 digits. No RCW 42.56.070 clause on the page (2026-11-12).
+    "asotin": PacsSite("asotin", "https://propertysearch.trueautomation.com/PropertyAccess/PropertySearch.aspx?cid=10", False),
 }
 
 _PACE_S = 3.0

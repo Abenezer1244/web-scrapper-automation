@@ -326,6 +326,13 @@ app.conf.beat_schedule = {
         "task": "src.workers.nts_crawler.crawl_nts_columbian_clark",
         "schedule": crontab(hour=10, minute=35, day_of_week="*"),  # 10:35 UTC daily
     },
+    "crawl-nts-nwmarket-asotin": {
+        # NTS (Asotin): Lewiston Tribune legal notices on nwmarket.com, one PDF per
+        # notice, discovered from the sitemap at the robots.txt 20 s crawl delay. Up to
+        # ~45 min, so it starts early enough to finish before the 11:00 matcher.
+        "task": "src.workers.nts_crawler.crawl_nts_nwmarket_asotin",
+        "schedule": crontab(hour=10, minute=0),  # 10:00 UTC daily
+    },
     "recover-deferred-mailing": {
         # The recovery half of `mailing_lookup_deferred`, which shipped as a
         # marker that nothing ever read: parcels a source outage skipped were

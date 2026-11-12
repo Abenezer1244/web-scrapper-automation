@@ -107,6 +107,14 @@ _ARCHIVE_REFRESH_DAYS = 7     # re-read an issue whose newest row is older than 
 # statutory RCW 61.24.040 notices.
 _CLARK_MAX_ADS = 60  # hard cap on ad-detail fetches per run (the listing is ~32)
 
+# ── Lewiston Tribune on nwmarket.com (Asotin County) ──
+# ~15 new adverts/day, two requests each at the 20 s robots.txt delay. The window heals
+# a missed run or a lagging sitemap; the Redis memo keeps each advert to one read.
+_NWM_WINDOW_DAYS = 7
+_NWM_MAX_ADVERTS = 60          # per run; the rest wait for the next run, logged
+_NWM_DEADLINE_S = 45 * 60      # under the 55 min soft limit
+_NWM_SEEN_TTL_S = 14 * 86400   # outlives the window
+
 
 @app.task(name="src.workers.nts_crawler.crawl_nts_tacoma_index")
 def crawl_nts_tacoma_index() -> dict:
@@ -362,6 +370,112 @@ def crawl_nts_columbian_clark() -> dict:
     _alert_if_crawl_barren(
         col.SOURCE, discovered=len(ad_urls), upserted=summary["upserted"],
         errored=summary["errored"], alert_on_zero_upserts=False,
+    )
+    return summary
+
+
+@app.task(name="src.workers.nts_crawler.crawl_nts_nwmarket_asotin")
+def crawl_nts_nwmarket_asotin() -> dict:
+    """Crawl + upsert Asotin County NTS notices from the Lewiston Tribune (nwmarket.com).
+
+    Sitemap -> adverts changed in the last _NWM_WINDOW_DAYS -> each advert page -> its PDF
+    -> shared parser -> kept only when the property is in Asotin County, WA. Every request
+    waits the robots.txt crawl delay. An advert is remembered in Redis only after its PDF
+    was read and parsed, so a failure is retried next run and a success never re-fetched.
+    """
+    import redis as sync_redis
+
+    from src.config import settings
+    from src.db.models import NtsNotice
+    from src.db.session import system_sync_session
+    from src.scrapers.sources import nts_nwmarket as nwm
+    from src.scrapers.sources import nts_tacoma_index as nts
+    from src.utils.safe_http import safe_get
+
+    today = datetime.now(UTC).date()
+    deadline = time.monotonic() + _NWM_DEADLINE_S
+    summary = {"source": nwm.SOURCE, "discovered": 0, "read": 0, "upserted": 0,
+               "skipped": 0, "other_county": 0, "errored": 0, "expired": 0}
+    headers = {"User-Agent": _PDF_BROWSER_UA}
+
+    try:
+        resp = safe_get(nwm.SITEMAP_URL, timeout=25, same_origin_as=nwm.BASE_URL, headers=headers)
+    except Exception as exc:  # noqa: BLE001 — a bad sitemap fetch must not crash the beat
+        _logger.warning("Asotin NTS sitemap fetch failed: %s", str(exc)[:140])
+        _alert_if_crawl_barren(nwm.SOURCE, discovered=0, upserted=0)
+        return summary
+    if resp.status_code != 200:
+        _logger.warning("Asotin NTS sitemap HTTP %d", resp.status_code)
+        _alert_if_crawl_barren(nwm.SOURCE, discovered=0, upserted=0)
+        return summary
+
+    adverts = nwm.recent_advert_urls(resp.text, today - timedelta(days=_NWM_WINDOW_DAYS))
+    summary["discovered"] = len(adverts)
+    seen_key = "bl:nts_nwmarket:seen:{}".format
+    try:
+        rds = sync_redis.from_url(settings.REDIS_URL, **settings.redis_kwargs())
+        todo = [u for u in adverts if not rds.exists(seen_key(u.rsplit("_", 1)[-1]))]
+    except Exception as exc:  # noqa: BLE001 — without the memo, read everything (slower, not wrong)
+        _logger.warning("Asotin NTS seen-set unavailable, reading all: %s", str(exc)[:120])
+        rds, todo = None, adverts
+
+    attempted = 0
+    with system_sync_session() as db:
+        for i, advert in enumerate(todo):
+            if i >= _NWM_MAX_ADVERTS or time.monotonic() > deadline:
+                # Never truncate silently: the rest stay unseen and are read next run.
+                _logger.warning("Asotin NTS run stopped with %d adverts unread", len(todo) - i)
+                break
+            attempted += 1
+            try:
+                time.sleep(nwm.CRAWL_DELAY_S)
+                r = safe_get(advert, timeout=25, same_origin_as=nwm.BASE_URL, headers=headers)
+                pdf_url = nwm.extract_pdf_url(r.text) if r.status_code == 200 else None
+                if pdf_url is None:
+                    summary["errored"] += 1
+                    continue
+                time.sleep(nwm.CRAWL_DELAY_S)
+                blocks, _ = _fetch_legals_issue(pdf_url)
+                for block in blocks:
+                    if not nwm.is_asotin_property(block):
+                        summary["other_county"] += 1
+                        continue
+                    summary["upserted"] += _ingest_pdf_blocks(
+                        db, NtsNotice, [block], pdf_url=pdf_url, source=nwm.SOURCE,
+                        county=nwm.COUNTY, parse_fn=nts.parse_tacoma_notice, today=today,
+                        summary=summary)
+                db.commit()
+                summary["read"] += 1
+                if rds is not None:
+                    rds.set(seen_key(advert.rsplit("_", 1)[-1]), "1", ex=_NWM_SEEN_TTL_S)
+            except Exception as exc:  # noqa: BLE001 — one advert must not stop the run
+                db.rollback()
+                summary["errored"] += 1
+                _logger.warning("Asotin NTS advert %s failed: %s", advert, str(exc)[:120])
+
+        # SOURCE-SCOPED expiry, as Clark: past auction or not re-read in _CACHE_DAYS.
+        summary["expired"] = db.execute(
+            _sa_text(
+                """
+                UPDATE nts_notices SET is_active = false
+                WHERE source = :source AND is_active
+                  AND (auction_date < :today OR fetched_at < :cutoff)
+                """
+            ),
+            {"source": nwm.SOURCE, "today": today,
+             "cutoff": datetime.now(UTC) - _td_days(_CACHE_DAYS)},
+        ).rowcount or 0
+        db.commit()
+        # A read is the sitemap plus at least one parsed advert, or nothing new to read.
+        if summary["read"] or (adverts and not todo):
+            _record_crawl_heartbeat(db, nwm.COUNTY)
+
+    _logger.info("Asotin NTS crawl done: %s", summary)
+    # Most adverts are not Asotin trustee sales, so 0 upserts is normal (as Clark). Alert
+    # when discovery found nothing, or when every advert this run attempted failed.
+    _alert_if_crawl_barren(
+        nwm.SOURCE, discovered=attempted or len(adverts), upserted=summary["upserted"],
+        errored=attempted - summary["read"], alert_on_zero_upserts=False,
     )
     return summary
 

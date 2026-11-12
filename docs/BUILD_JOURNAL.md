@@ -42,7 +42,7 @@ nothing user-visible changed and nothing is activated. A full routed `scrape()` 
 detail pages are fetched with real HTTP and the testing rules forbid mocking it; wiring was proven
 live instead (a July notice dropped because of a September discontinuance).
 
-**Caught & fixed:** six Codex NO-GOs, all resolved: lookup read one page only; lookup ran before the
+**Caught & fixed:** five Codex NO-GOs, all resolved: lookup read one page only; lookup ran before the
 parcel filter; bare DEATH accepted "Affidavit of Death"; my instrument-year fix changed the in-job
 retry hash (reverted, shortcut note left); tax PDF page / tax-row / owner / filing-date gaps; tax
 partial snapshots, 16- vs 12-digit parcel identity, stale portal status. My own: a scripted edit

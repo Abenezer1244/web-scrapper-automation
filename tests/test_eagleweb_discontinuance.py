@@ -133,6 +133,23 @@ async def test_probate_extraction_drops_tod_revocations_and_keeps_deaths_and_tod
     assert found.get("2026-1486516") == "Transfer on Death Deed", found
 
 
+async def test_death_certificate_extraction_keeps_only_recorded_deaths():
+    """Same real page: the Death row is the only death_certificate lead; TOD deeds and
+    the TOD revocation (which hit the bare DEATH code) are not."""
+    scraper = EagleWebScraper(_BASE, "clallam", "WA", ["probate", "pre_foreclosure"],
+                              record_type="death_certificate")
+    assert scraper.require_parcel_id is False  # name-only recorded deaths are kept
+    async with scraper:
+        await scraper.page.route(f"https://{_HOST}/**", lambda route: route.fulfill(
+            status=200, content_type="text/html", body=_html("probate_week_0901_p2")))
+        await scraper.page.goto(_RESULTS)
+        records = await scraper._extract_page(1)
+    labels = {r.doc_type.split("\n")[0] for r in records}
+    assert labels == {"Death"}, labels
+    assert "2026-1486473" in {r.doc_type.split("\n")[-1].strip() for r in records}
+    assert all(r.party_name and "PUBLIC" not in r.party_name for r in records)
+
+
 @pytest.mark.parametrize("label", [
     "WRIT OF EXEC\n2026-1480000",                                # Clallam EXEC code
     "REVOCATION OF TRANSFER ON DEATH DEED\n2026-1486485",        # live Clallam row

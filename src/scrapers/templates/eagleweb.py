@@ -56,6 +56,9 @@ _DOC_TYPE_MAP = {
     "divorce": ["DIVORCE", "DISSOLUTION", "DECREE OF DISSOLUTION",
                 # Abbreviated codes
                 "DISS", "DISOL"],
+    # Recorded death certificates only (King's death_certificate uses the same
+    # recorder category). Clallam labels them "Death".
+    "death_certificate": ["DEATH CERTIFICATE", "CERTIFICATE OF DEATH", "DEATH"],
 }
 
 # Doc type phrases that LOOK like a match but document the opposite.
@@ -74,6 +77,8 @@ _DOC_TYPE_EXCLUDE = {
                 "WRIT OF EXEC",
                 # A living owner cancelling a TOD deed is neither a death nor a TOD signal.
                 "REVOCATION OF TRANSFER ON DEATH"],
+    # The bare DEATH code also hits "Transfer on Death Deed" (a living owner's deed).
+    "death_certificate": ["TRANSFER ON DEATH", "LACK OF PROBATE", "TRUSTEE"],
 }
 
 # Clallam files a Discontinuance of Trustee's Sale under its NTS type. The only
@@ -185,7 +190,7 @@ class EagleWebScraper(BridgeScraper):
         #     extraction regex failed, so dropping is correct. Default ON.
         #   - Explicit caller override (True/False) always wins.
         if require_parcel_id is None:
-            require_parcel_id = self.active_record_type not in ("probate", "divorce")
+            require_parcel_id = self.active_record_type not in ("probate", "divorce", "death_certificate")
         self.require_parcel_id = require_parcel_id
 
         from urllib.parse import urlparse
@@ -1225,7 +1230,7 @@ class EagleWebScraper(BridgeScraper):
                                 if oriented is None:
                                     continue
                                 record.party_name, record.heirs = oriented
-                            elif active_rt == "probate":
+                            elif active_rt in ("probate", "death_certificate"):
                                 # Death-certificate party orientation via the shared
                                 # single-source helper. On a Cert of Death the recorder
                                 # indexes the issuing AGENCY/state as grantor with the

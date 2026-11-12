@@ -30,11 +30,11 @@ _OLD_TYPES = '["probate", "pre_foreclosure"]'
 _NEW_TYPES = '["probate", "pre_foreclosure", "death_certificate"]'
 _TAX_SCRAPER_CLASS = "src.scrapers.clallam_wa_tax_delinquent.ClallamWATaxDelinquentScraper"
 _TAX_BASE_URL = "https://www.clallamcountywa.gov/1077/Tax-Foreclosure-Sales"
+# Fixed id, so downgrade deletes only the row this revision inserted (Codex).
+_TAX_CONNECTOR_ID = "7c1a1a2e-3f0c-4c6e-9f40-140000000140"
 
 
 def upgrade() -> None:
-    import uuid as _uuid
-
     op.execute(f"""
         UPDATE county_connectors
         SET record_types = '{_NEW_TYPES}'
@@ -47,7 +47,7 @@ def upgrade() -> None:
             id, county, state, record_types, scraper_class, scraper_mode, render_mode, base_url, health_status, active
         )
         SELECT
-            '{_uuid.uuid4()}', '{_COUNTY}', 'wa', '["tax_delinquent"]', '{_TAX_SCRAPER_CLASS}',
+            '{_TAX_CONNECTOR_ID}', '{_COUNTY}', 'wa', '["tax_delinquent"]', '{_TAX_SCRAPER_CLASS}',
             'manual', 'static', '{_TAX_BASE_URL}', 'unknown', true
         WHERE NOT EXISTS (
             SELECT 1 FROM county_connectors
@@ -58,10 +58,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.execute(
-        "DELETE FROM county_connectors WHERE lower(county) = 'clallam' AND lower(state) = 'wa' "
-        f"AND scraper_class = '{_TAX_SCRAPER_CLASS}'"
-    )
+    op.execute(f"DELETE FROM county_connectors WHERE id = '{_TAX_CONNECTOR_ID}'")
     op.execute(f"""
         UPDATE county_connectors
         SET record_types = '{_OLD_TYPES}'

@@ -357,7 +357,11 @@ def _resolve_one(session, site: PacsSite, tokens: dict, parcel_key: str, still_h
     if blocked or resp is None:
         return MailingAnswer(REQUEST_FAILED), blocked
     # The detail page must name the row the grid matched, not either spelling (Codex).
-    return (detail_parser or parse_detail)(resp.text, matched_key), None
+    # The literal parse_detail(...) call is what scripts/repair_pacs_mailing_recovery.py
+    # fingerprints as "#580 present": keep it spelled this way.
+    if detail_parser is not None:
+        return detail_parser(resp.text, matched_key), None
+    return parse_detail(resp.text, matched_key), None
 
 
 def resolve_mailing(county: str, parcel_ids: list[str], *, time_budget_s: float = CALL_BUDGET_S,

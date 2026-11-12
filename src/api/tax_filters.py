@@ -57,6 +57,11 @@ DEFAULT_TAX_CAP_MONTHS = 18
 # string here AFTER confirming its feed has King-like delinquency-roll semantics.
 TAX_CAP_EXEMPT_SOURCES = frozenset({
     "king_county_delinquent_taxes",  # King — Socrata delinquency roll (see above)
+    # Benton — the Treasurer's tax-FORECLOSURE listing (owner decision 2026-11-12).
+    # Benton publishes no delinquency roll; a parcel reaches this list only after
+    # three delinquent years (RCW 84.64), so the cap would hide every row. Each row
+    # is still delinquent RIGHT NOW (checked against the live account at scrape).
+    "benton_county_tax_foreclosure",
 })
 
 # Bind-parameter name for the raw-SQL twin (tax_cap_sql). Callers bind this to

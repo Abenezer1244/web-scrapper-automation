@@ -286,11 +286,6 @@ class EagleWebScraper(BridgeScraper):
 
             await self.polite_delay()
 
-        # The per-notice lookup is verified on Clallam only (live 2026-11-12); Benton
-        # also numbers instruments YYYY-NNNNNN but its lookup page is unverified.
-        if self.active_record_type == "pre_foreclosure" and self.county.lower() in _DISCONTINUANCE_LOOKUP_COUNTIES:
-            all_records = await self._drop_discontinued(all_records)
-
         # Drop records without parcel_id if required — these are upstream
         # data gaps (e.g., Thurston death certificates with empty Parcel
         # field), not scraper bugs, and they cannot be GIS-enriched.
@@ -303,6 +298,12 @@ class EagleWebScraper(BridgeScraper):
                     "Dropped %d/%d records with no parcel_id (upstream data gap)",
                     dropped, before,
                 )
+
+        # After the parcel filter, so only deliverable notices are looked up.
+        # The per-notice lookup is verified on Clallam only (live 2026-11-12); Benton
+        # also numbers instruments YYYY-NNNNNN but its lookup page is unverified.
+        if self.active_record_type == "pre_foreclosure" and self.county.lower() in _DISCONTINUANCE_LOOKUP_COUNTIES:
+            all_records = await self._drop_discontinued(all_records)
 
         # Records are returned raw; the run_scrape_job worker's enrichment pass
         # (src/workers/tasks_helpers/enrich.py) adds the addresses.
@@ -351,7 +352,18 @@ class EagleWebScraper(BridgeScraper):
                     wait_until="domcontentloaded",
                 ):
                     await self.page.evaluate("document.forms.docSearch.submit()")
+                # Read the whole result set: a discontinuance listed past the first
+                # page must not pass as "not discontinued".
+                await self._use_largest_page_size()
                 body = await self.page.inner_text("body")
+                await self._extract_page(1)
+                total = 1 if re.search(r"\bOne item found", body, re.IGNORECASE) else None
+                m = re.search(r"([\d,]+)\s+items?\s+found", body, re.IGNORECASE)
+                if m:
+                    total = int(m.group(1).replace(",", ""))
+                if total is None or self._page_rows_seen != total:
+                    raise RuntimeError(
+                        f"lookup for {instrument} showed {self._page_rows_seen} of {total} rows")
                 # Positive control: the notice's own result row (instrument then its
                 # recording date) must be listed; the "You searched for" echo is not.
                 if not re.search(rf"{re.escape(instrument)}\s+\d{{1,2}}/\d{{1,2}}/\d{{4}}", body):

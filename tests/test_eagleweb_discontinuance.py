@@ -5,6 +5,7 @@ Fixtures are real Clallam EagleWeb pages captured 2026-11-12 (read-only):
   notice itself AND 2026-1486992, filed as "Notice of Trustee Sale" with the grantee
   cell "... DISCONTINUANCE 2026-1484470".
 - lookup_active: the same search for NTS 2026-1486313, which has no discontinuance.
+- probate_week_0901_p2: page 2 (100 rows) of all documents recorded 09/01-09/08/2026.
 Pages are served with page.route in real Chromium, so nothing reaches the network.
 """
 import gzip
@@ -40,19 +41,24 @@ def _scraper() -> EagleWebScraper:
 
 
 async def _route_portal(scraper: EagleWebScraper, lookups: dict[str, str], searched: list[str]):
-    """Serve the search form, the POST redirect, and the results page for the posted number."""
+    """Serve the search form, the POST redirect, and the results page for the posted number.
+
+    The results page is the last posted number's page for every results URL, including
+    the page-size switch the lookup makes before reading."""
+    current = {}
+
     async def serve(route):
         url = route.request.url
         if "docSearchPOST.jsp" in url:
             number = parse_qs(route.request.post_data or "").get("DocNumID", [""])[0]
             searched.append(number)
+            current["n"] = number
             # A fulfilled 302 is followed outside page.route (to the real portal), so
             # redirect client-side to keep every request inside this handler.
             await route.fulfill(status=200, content_type="text/html",
                                 body=f"<script>location.replace('{_RESULTS}&n={number}')</script>")
         elif "docSearchResults.jsp" in url:
-            number = url.rsplit("&n=", 1)[-1]
-            await route.fulfill(status=200, content_type="text/html", body=lookups[number])
+            await route.fulfill(status=200, content_type="text/html", body=lookups[current["n"]])
         elif "docSearch.jsp" in url:
             await route.fulfill(status=200, content_type="text/html", body=_html("docSearch"))
         else:
@@ -101,6 +107,30 @@ async def test_lookup_that_does_not_return_the_notice_itself_fails_loud():
         await _route_portal(scraper, {"2026-1484470": _html("lookup_active")}, [])
         with pytest.raises(RuntimeError, match="could not verify NTS 2026-1484470"):
             await scraper._drop_discontinued([_nts("2026-1484470")])
+
+
+async def test_lookup_whose_rows_do_not_add_up_to_the_portal_total_fails_loud():
+    """Codex: a discontinuance listed past what was read must not pass as 'active'."""
+    scraper = _scraper()
+    truncated = _html("lookup_discontinued").replace("2 items found", "7 items found")
+    async with scraper:
+        await _route_portal(scraper, {"2026-1484470": truncated}, [])
+        with pytest.raises(RuntimeError, match="showed 2 of 7 rows"):
+            await scraper._instrument_discontinued("2026-1484470")
+
+
+async def test_probate_extraction_drops_tod_revocations_and_keeps_deaths_and_tod_deeds():
+    scraper = EagleWebScraper(_BASE, "clallam", "WA", ["probate", "pre_foreclosure"],
+                              record_type="probate")
+    async with scraper:
+        await scraper.page.route(f"https://{_HOST}/**", lambda route: route.fulfill(
+            status=200, content_type="text/html", body=_html("probate_week_0901_p2")))
+        await scraper.page.goto(_RESULTS)
+        records = await scraper._extract_page(1)
+    found = {r.doc_type.split("\n")[-1].strip(): r.doc_type.split("\n")[0] for r in records}
+    assert "2026-1486485" not in found, found                     # Revocation of TOD
+    assert found.get("2026-1486473") == "Death", found
+    assert found.get("2026-1486516") == "Transfer on Death Deed", found
 
 
 @pytest.mark.parametrize("label", [

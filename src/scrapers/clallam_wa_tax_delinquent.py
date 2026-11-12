@@ -44,6 +44,8 @@ for _url in (_LANDING_URL, _PORTAL):
 
 # A certificate older than this is not the current list (the county files one a year).
 _MAX_CERT_AGE_DAYS = 400
+# The portal prints today's date on a live page; older means a cached or stale page.
+_MAX_STATUS_AGE_DAYS = 3
 
 _LINK_RE = re.compile(r'<a[^>]+href="([^"]*DocumentCenter/View/\d+[^"]*)"[^>]*>(.*?)</a>', re.I | re.S)
 _ROW_RE = re.compile(r"(\d{2} \d{2} \d{2} \d{6} \d{4}) \$([\d,]+\.\d\d)(.*?)//\s*PID\s*(\d+)", re.S)
@@ -177,12 +179,22 @@ def parse_portal_status(html: str) -> dict:
     }
 
 
-def build_record(row: dict, status: dict, cert: dict, cap_min_year: int | None) -> tuple[ScrapedRecord | None, str]:
+def lead_parcel_id(geographic_id: str) -> str:
+    """The parcel id a lead carries: the 12-digit statewide id Clallam's recorder leads
+    use when the account is the base parcel's "0000" land row (proven equal, PR #580 /
+    pacs_parcel.PACS_SITES["clallam"]), so tax and recorder leads share identity;
+    any other suffix is a separate account and keeps all 16 digits."""
+    return geographic_id[:12] if len(geographic_id) == 16 and geographic_id.endswith("0000") else geographic_id
+
+
+def build_record(row: dict, status: dict, cert: dict, cap_min_year: int | None,
+                 today: date) -> tuple[ScrapedRecord | None, str]:
     """(record, outcome). outcome names why a parcel is not a lead."""
     if row["parcel"] not in status["geo_ids"]:
         return None, "identity_mismatch"
-    if status["as_of"] is None:
-        raise ValueError(f"PID {row['pid']}: portal page has no tax as-of date")
+    as_of = status["as_of"]
+    if as_of is None or not 0 <= (today - as_of).days <= _MAX_STATUS_AGE_DAYS:
+        raise ValueError(f"PID {row['pid']}: portal tax status as of {as_of} is not current")
     prior = {y: amt for y, amt in status["balances"].items() if y < status["as_of"].year and amt > 0}
     if not prior:
         return None, "no_prior_year_balance"   # redeemed, sold, or paid down
@@ -194,7 +206,7 @@ def build_record(row: dict, status: dict, cert: dict, cap_min_year: int | None) 
     if not status["owner"]:
         raise ValueError(f"PID {row['pid']}: portal page has no owner name")
     rec = ScrapedRecord()
-    rec.parcel_id = row["parcel"]          # 16 digits as a string; never truncated
+    rec.parcel_id = lead_parcel_id(row["parcel"])
     rec.party_name = BridgeScraper.clean(status["owner"])
     rec.property_address = status["situs"]
     rec.mailing_address = status["mailing"]
@@ -212,6 +224,7 @@ def build_record(row: dict, status: dict, cert: dict, cap_min_year: int | None) 
         "certificate_filed": cert["filed"].isoformat(),
         "certificate_amount": row["cert_amount"],
         "certificate_parcel": row["parcel_raw"],
+        "geographic_id": row["parcel"],    # all 16 digits, zeros and suffix kept
         # The certificate's row as printed (location, interested parties, legal).
         "certificate_row_text": row["certificate_row_text"],
         "portal_prop_id": row["pid"],
@@ -272,7 +285,7 @@ class ClallamWATaxDelinquentScraper(BridgeScraper):
                             params={"cid": "0", "year": str(today.year), "prop_id": row["pid"]},
                             timeout=settings.DEFAULT_TIMEOUT)
             page.raise_for_status()
-            record, outcome = build_record(row, parse_portal_status(page.text), cert, cap_min_year)
+            record, outcome = build_record(row, parse_portal_status(page.text), cert, cap_min_year, today)
             outcomes[outcome] = outcomes.get(outcome, 0) + 1
             if outcome in ("identity_mismatch", "owner_ambiguous"):
                 _logger.warning("PID %s (certificate parcel %s): %s; not delivered",
@@ -284,8 +297,10 @@ class ClallamWATaxDelinquentScraper(BridgeScraper):
             await self.polite_delay()
         _logger.info("Clallam tax delinquent complete — %d parcels: %s (cap_min_year=%s)",
                      len(rows), outcomes, cap_min_year)
-        if outcomes.get("identity_mismatch") == len(rows):
-            raise ValueError("no certificate parcel matched its portal page; the source changed")
+        unresolved = outcomes.get("identity_mismatch", 0) + outcomes.get("owner_ambiguous", 0)
+        if unresolved:
+            # A partial list must not pass as the complete snapshot (Codex).
+            raise ValueError(f"{unresolved} certificate parcels could not be resolved: {outcomes}")
         return records
 
     async def __aenter__(self) -> "ClallamWATaxDelinquentScraper":

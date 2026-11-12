@@ -24,6 +24,7 @@ from src.workers.tasks_helpers.dedup import validate_tax_delinquent_records
 
 _F = Path(__file__).parent / "fixtures" / "clallam_tax"
 _LANDING = "https://www.clallamcountywa.gov/1077/Tax-Foreclosure-Sales"
+_TODAY = date(2026, 11, 12)  # the portal pages were captured this day
 _CERT = {"url": "https://www.clallamcountywa.gov/DocumentCenter/View/30353",
          "as_of": date(2026, 11, 6), "filed": date(2026, 9, 4)}
 
@@ -90,9 +91,11 @@ def test_a_certificate_page_that_extracts_empty_fails_loud():
 
 def test_delinquent_parcel_becomes_a_qualified_tax_lead():
     _, rows = parse_certificate(_pages())
-    record, outcome = build_record(rows[0], parse_portal_status(_portal()), _CERT, cap_min_year=None)
+    record, outcome = build_record(rows[0], parse_portal_status(_portal()), _CERT, cap_min_year=None, today=_TODAY)
     assert outcome == "lead"
-    assert record.parcel_id == "0330061400500000"
+    # The 0000 land row carries the recorder's 12-digit id; all 16 digits are kept too.
+    assert record.parcel_id == "033006140050"
+    assert record.enrichment_data["geographic_id"] == "0330061400500000"
     assert record.party_name == "JODI FURNISH"
     assert record.mailing_address == "153 JAMESTOWN RD, SEQUIM, WA 98382"
     assert record.property_address.startswith("153 JAMESTOWN RD")
@@ -107,7 +110,7 @@ def test_delinquent_parcel_becomes_a_qualified_tax_lead():
 
 def test_the_product_recency_cap_applies_unless_the_source_is_exempt():
     _, rows = parse_certificate(_pages())
-    assert build_record(rows[0], parse_portal_status(_portal()), _CERT, cap_min_year=2025) == (None, "capped_out")
+    assert build_record(rows[0], parse_portal_status(_portal()), _CERT, cap_min_year=2025, today=_TODAY) == (None, "capped_out")
 
 
 def test_a_redeemed_parcel_is_not_a_lead():
@@ -115,13 +118,13 @@ def test_a_redeemed_parcel_is_not_a_lead():
     assert status["balances"] == {}
     row = {"parcel": "0430033490800000", "parcel_raw": "04 30 03 349080 0000", "pid": "33855",
            "cert_amount": "7672.08", "certificate_row_text": ""}
-    assert build_record(row, status, _CERT, cap_min_year=None) == (None, "no_prior_year_balance")
+    assert build_record(row, status, _CERT, cap_min_year=None, today=_TODAY) == (None, "no_prior_year_balance")
 
 
 def test_a_portal_page_for_another_parcel_is_not_delivered():
     _, rows = parse_certificate(_pages())
     other = {**rows[0], "parcel": "0330061400501000"}  # same base, different suffix
-    assert build_record(other, parse_portal_status(_portal()), _CERT, cap_min_year=None) == (None, "identity_mismatch")
+    assert build_record(other, parse_portal_status(_portal()), _CERT, cap_min_year=None, today=_TODAY) == (None, "identity_mismatch")
 
 
 def test_a_portal_page_without_tax_status_fails_loud():
@@ -152,4 +155,18 @@ def test_two_different_owners_are_not_resolved_by_guessing():
     status = parse_portal_status(html)
     assert status["owner_conflict"] is True
     _, rows = parse_certificate(_pages())
-    assert build_record(rows[0], status, _CERT, cap_min_year=None) == (None, "owner_ambiguous")
+    assert build_record(rows[0], status, _CERT, cap_min_year=None, today=_TODAY) == (None, "owner_ambiguous")
+
+
+def test_only_the_0000_land_row_takes_the_12_digit_recorder_id():
+    from src.scrapers.clallam_wa_tax_delinquent import lead_parcel_id
+
+    assert lead_parcel_id("0330061400500000") == "033006140050"
+    assert lead_parcel_id("0330061400501000") == "0330061400501000"   # a separate account
+
+
+@pytest.mark.parametrize("today", [date(2026, 11, 16), date(2026, 11, 11)])
+def test_a_stale_or_future_portal_status_fails(today):
+    _, rows = parse_certificate(_pages())
+    with pytest.raises(ValueError, match="is not current"):
+        build_record(rows[0], parse_portal_status(_portal()), _CERT, cap_min_year=None, today=today)

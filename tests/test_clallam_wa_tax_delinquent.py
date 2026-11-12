@@ -1,7 +1,7 @@
 """Clallam tax-foreclosure leads, against real county pages captured 2026-11-12.
 
 - landing_2026-11-12: the Treasurer's Tax-Foreclosure-Sales page.
-- certificate_2026-11-06.pdf: the newest certificate it links (8 parcels).
+- certificate_2026-11-06.pdf: the newest certificate it links (8 parcels, 2 pages).
 - pacs_17038: a parcel on that certificate, owing 2017-2026.
 - pacs_33855: a parcel on the 9/4 certificate but not the 11/6 one ("No Amount Due").
 """
@@ -24,19 +24,27 @@ from src.workers.tasks_helpers.dedup import validate_tax_delinquent_records
 
 _F = Path(__file__).parent / "fixtures" / "clallam_tax"
 _LANDING = "https://www.clallamcountywa.gov/1077/Tax-Foreclosure-Sales"
+_CERT = {"url": "https://www.clallamcountywa.gov/DocumentCenter/View/30353",
+         "as_of": date(2026, 11, 6), "filed": date(2026, 9, 4)}
 
 
 def _gz(name: str) -> str:
     return gzip.decompress((_F / name).read_bytes()).decode("utf-8")
 
 
-def _cert_text() -> str:
-    return "\n".join(p.extract_text() for p in pypdf.PdfReader(_F / "certificate_2026-11-06.pdf").pages)
+def _pages() -> list[str]:
+    return [p.extract_text() for p in pypdf.PdfReader(_F / "certificate_2026-11-06.pdf").pages]
 
 
-_CERT = {"url": "https://www.clallamcountywa.gov/DocumentCenter/View/30353",
-         "as_of": date(2026, 11, 6), "filed": date(2026, 9, 4)}
+def _portal(pid: str = "17038") -> str:
+    return _gz(f"pacs_{pid}_2026-11-12.html.gz")
 
+
+def _link(href: str, text: str) -> str:
+    return f'<a href="{href}">{text}</a>'
+
+
+# --- certificate -----------------------------------------------------------------
 
 def test_selects_the_newest_certificate_and_keeps_the_court_filing_date():
     url, linked, filed = select_certificate(_gz("landing_2026-11-12.html.gz"), _LANDING)
@@ -46,31 +54,48 @@ def test_selects_the_newest_certificate_and_keeps_the_court_filing_date():
 
 def test_a_page_without_a_certificate_is_a_failure_not_an_empty_list():
     with pytest.raises(ValueError, match="no dated certificate"):
-        select_certificate("<html><a href='/DocumentCenter/View/1'>Bid form</a></html>", _LANDING)
+        select_certificate(_link("/DocumentCenter/View/1", "Bid form"), _LANDING)
+
+
+def test_an_update_date_is_never_passed_off_as_the_court_filing_date():
+    html = (_link("/DocumentCenter/View/3", "Updated Certificate - 11.06.2026")
+            + _link("/DocumentCenter/View/2", "2025 Certificate of Delinquency - Filed with Superior Court on 9/5/2025"))
+    with pytest.raises(ValueError, match="no 2026 certificate filing link"):
+        select_certificate(html, _LANDING)
 
 
 def test_certificate_rows_keep_the_16_digit_parcel_and_leading_zero():
-    as_of, rows = parse_certificate(_cert_text())
+    as_of, rows = parse_certificate(_pages())
     assert as_of == date(2026, 11, 6)
     assert len(rows) == 8
-    first = rows[0]
-    assert (first["parcel"], first["pid"], first["cert_amount"]) == ("0330061400500000", "17038", "34744.40")
+    assert (rows[0]["parcel"], rows[0]["pid"], rows[0]["cert_amount"]) == ("0330061400500000", "17038", "34744.40")
 
 
-def test_a_certificate_read_that_misses_a_parcel_fails_loud():
-    text = _cert_text().replace("13 32 10 510020 0000", "13 32 10 51002 0000")  # one row no longer parses
-    assert text != _cert_text()
-    with pytest.raises(ValueError, match="read 7 parcels of 8"):
-        parse_certificate(text)
+@pytest.mark.parametrize("page", [0, 1])
+def test_a_certificate_page_that_misses_a_parcel_fails_loud(page):
+    pages = _pages()
+    first_parcel = pages[page].split("ParcelNumber CertAmt LocationFullname")[1].split()[0:5]
+    pages[page] = pages[page].replace(" ".join(first_parcel), " ".join(first_parcel)[:-6] + "0000", 1)
+    with pytest.raises(ValueError, match=f"page {page + 1} read"):
+        parse_certificate(pages)
 
+
+def test_a_certificate_page_that_extracts_empty_fails_loud():
+    """Codex: an empty page used to drop its rows and its 'Described as:' together."""
+    with pytest.raises(ValueError, match="page 2 has no parcel list header"):
+        parse_certificate([_pages()[0], ""])
+
+
+# --- portal ----------------------------------------------------------------------
 
 def test_delinquent_parcel_becomes_a_qualified_tax_lead():
-    _, rows = parse_certificate(_cert_text())
-    status = parse_portal_status(_gz("pacs_17038_2026-11-12.html.gz"))
-    record, outcome = build_record(rows[0], status, _CERT, cap_min_year=None)
+    _, rows = parse_certificate(_pages())
+    record, outcome = build_record(rows[0], parse_portal_status(_portal()), _CERT, cap_min_year=None)
     assert outcome == "lead"
     assert record.parcel_id == "0330061400500000"
-    assert record.party_name and record.property_address and record.mailing_address
+    assert record.party_name == "JODI FURNISH"
+    assert record.mailing_address == "153 JAMESTOWN RD, SEQUIM, WA 98382"
+    assert record.property_address.startswith("153 JAMESTOWN RD")
     data = record.enrichment_data
     assert data["source"] == _SOURCE
     assert data["bill_year"] == 2017
@@ -81,27 +106,50 @@ def test_delinquent_parcel_becomes_a_qualified_tax_lead():
 
 
 def test_the_product_recency_cap_applies_unless_the_source_is_exempt():
-    _, rows = parse_certificate(_cert_text())
-    status = parse_portal_status(_gz("pacs_17038_2026-11-12.html.gz"))
-    assert build_record(rows[0], status, _CERT, cap_min_year=2025) == (None, "capped_out")
+    _, rows = parse_certificate(_pages())
+    assert build_record(rows[0], parse_portal_status(_portal()), _CERT, cap_min_year=2025) == (None, "capped_out")
 
 
 def test_a_redeemed_parcel_is_not_a_lead():
-    status = parse_portal_status(_gz("pacs_33855_2026-11-12.html.gz"))
+    status = parse_portal_status(_portal("33855"))
     assert status["balances"] == {}
     row = {"parcel": "0430033490800000", "parcel_raw": "04 30 03 349080 0000", "pid": "33855",
-           "cert_amount": "7672.08", "cert_situs": ""}
+           "cert_amount": "7672.08", "certificate_row_text": ""}
     assert build_record(row, status, _CERT, cap_min_year=None) == (None, "no_prior_year_balance")
 
 
 def test_a_portal_page_for_another_parcel_is_not_delivered():
-    _, rows = parse_certificate(_cert_text())
-    status = parse_portal_status(_gz("pacs_17038_2026-11-12.html.gz"))
+    _, rows = parse_certificate(_pages())
     other = {**rows[0], "parcel": "0330061400501000"}  # same base, different suffix
-    assert build_record(other, status, _CERT, cap_min_year=None) == (None, "identity_mismatch")
+    assert build_record(other, parse_portal_status(_portal()), _CERT, cap_min_year=None) == (None, "identity_mismatch")
 
 
 def test_a_portal_page_without_tax_status_fails_loud():
-    html = _gz("pacs_17038_2026-11-12.html.gz").replace("Year - Statement ID", "Year")
     with pytest.raises(ValueError, match="neither a tax-due table"):
-        parse_portal_status(html)
+        parse_portal_status(_portal().replace("Year - Statement ID", "Year"))
+
+
+def test_an_unreadable_oldest_year_row_fails_instead_of_changing_the_bill_year():
+    with pytest.raises(ValueError, match="unreadable tax-due row"):
+        parse_portal_status(_portal().replace("2017 - 11328 (Balance)", "Balance"))
+
+
+def test_a_statement_listed_twice_fails():
+    with pytest.raises(ValueError, match="listed twice"):
+        parse_portal_status(_portal().replace("2025 - 11049", "2025 - 11001"))
+
+
+def test_two_statements_in_one_year_are_summed():
+    balances = parse_portal_status(_portal().replace("2025 - 11049", "2024 - 11049"))["balances"]
+    assert balances[2024] == Decimal("3394.77") + Decimal("3581.49")
+    assert 2025 not in balances
+
+
+def test_two_different_owners_are_not_resolved_by_guessing():
+    html = _portal()
+    second = '<tr><td>Name:</td><td>SOMEONE ELSE</td></tr>'
+    html = html.replace("</table>", second + "</table>", 1)
+    status = parse_portal_status(html)
+    assert status["owner_conflict"] is True
+    _, rows = parse_certificate(_pages())
+    assert build_record(rows[0], status, _CERT, cap_min_year=None) == (None, "owner_ambiguous")

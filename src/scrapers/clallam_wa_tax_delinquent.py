@@ -50,7 +50,7 @@ _ROW_RE = re.compile(r"(\d{2} \d{2} \d{2} \d{6} \d{4}) \$([\d,]+\.\d\d)(.*?)//\s
 _AS_OF_RE = re.compile(r"\b(\d{2})-([A-Za-z]{3})-(\d{2})\b")
 _NO_AMOUNT_DUE = "There is currently No Amount Due on this property"
 _TAX_AS_OF_RE = re.compile(r"Property Tax Information as of\s*(\d{1,2}/\d{1,2}/\d{4})")
-_DUE_ROW_RE = re.compile(r"^(\d{4})\s*-\s*\d+")
+_DUE_ROW_RE = re.compile(r"^(\d{4})\s*-\s*(\d+)\b")
 
 
 def _anchor_date(text: str) -> date | None:
@@ -74,27 +74,35 @@ def select_certificate(html: str, base_url: str) -> tuple[str, date, date]:
             certs.append((when, urljoin(base_url, href), text))
     if not certs:
         raise ValueError("Clallam tax-foreclosure page links no dated certificate")
-    filed = [c for c in certs if "filed" in c[2].lower()]
     newest = max(certs)
-    filing_date = max(filed)[0] if filed else newest[0]
-    return newest[1], newest[0], filing_date
+    # The court filing of THIS cycle's certificate; an update date is not a filing.
+    filed = [c for c in certs if "filed" in c[2].lower() and c[0].year == newest[0].year]
+    if not filed:
+        raise ValueError(f"no {newest[0].year} certificate filing link; cannot date the leads")
+    return newest[1], newest[0], max(filed)[0]
 
 
-def parse_certificate(text: str) -> tuple[date, list[dict]]:
-    """(as-of date, rows) from the certificate PDF text. Raises on an incomplete read."""
-    m = _AS_OF_RE.search(text)
+def parse_certificate(pages: list[str]) -> tuple[date, list[dict]]:
+    """(as-of date, rows) from the certificate PDF's per-page text.
+
+    Every page must carry the list header and parse one row per "Described as:"
+    block, so a page that extracts empty or garbled fails instead of vanishing."""
+    m = _AS_OF_RE.search(pages[0] if pages else "")
     if not m:
         raise ValueError("certificate has no as-of date")
     as_of = datetime.strptime(f"{m.group(1)}-{m.group(2)}-{m.group(3)}", "%d-%b-%y").date()
-    rows = [
-        {"parcel": parcel.replace(" ", ""), "parcel_raw": parcel,
-         "cert_amount": amount.replace(",", ""), "pid": pid,
-         "cert_situs": " ".join(situs.split())}
-        for parcel, amount, situs, pid in _ROW_RE.findall(text)
-    ]
-    blocks = text.count("Described as:")
-    if not rows or len(rows) != blocks:
-        raise ValueError(f"certificate read {len(rows)} parcels of {blocks} listed")
+    rows: list[dict] = []
+    for n, text in enumerate(pages, 1):
+        if "ParcelNumber" not in (text or ""):
+            raise ValueError(f"certificate page {n} has no parcel list header")
+        found = _ROW_RE.findall(text)
+        blocks = text.count("Described as:")
+        if not found or len(found) != blocks:
+            raise ValueError(f"certificate page {n} read {len(found)} parcels of {blocks} listed")
+        rows += [{"parcel": parcel.replace(" ", ""), "parcel_raw": parcel,
+                  "cert_amount": amount.replace(",", ""), "pid": pid,
+                  "certificate_row_text": " ".join(rest.split())}
+                 for parcel, amount, rest, pid in found]
     return as_of, rows
 
 
@@ -103,6 +111,40 @@ def _money(raw: str) -> Decimal:
         return Decimal(raw.replace("$", "").replace(",", "").strip())
     except InvalidOperation as exc:
         raise ValueError(f"unreadable amount {raw!r}") from exc
+
+
+def _parse_tax_due(soup: BeautifulSoup) -> dict[int, Decimal]:
+    """The Pay Tax Due table -> {year: total due}. Every data row must read.
+
+    Columns are found by header, statements are summed within a year, and a repeated
+    statement or an unreadable row fails: one dropped year would change the oldest
+    unpaid year and the amount (Codex)."""
+    table = next((t for t in soup.find_all("table")
+                  if [" ".join(th.get_text(" ").split()) for th in t.find_all("th")][:1] == ["Year - Statement ID"]),
+                 None)
+    if table is None:
+        raise ValueError("portal page shows neither a tax-due table nor 'No Amount Due'")
+    headers = [" ".join(th.get_text(" ").split()) for th in table.find_all("th")]
+    if "Total Due" not in headers:
+        raise ValueError(f"tax-due table has no Total Due column: {headers}")
+    total_col = headers.index("Total Due")
+    balances: dict[int, Decimal] = {}
+    statements: set[str] = set()
+    for tr in table.find_all("tr"):
+        cells = [" ".join(td.get_text(" ").split()) for td in tr.find_all("td")]
+        if not cells:
+            continue  # the header row
+        m = _DUE_ROW_RE.match(cells[0])
+        if not m or len(cells) != len(headers):
+            raise ValueError(f"unreadable tax-due row {cells}")
+        if m.group(2) in statements:
+            raise ValueError(f"tax statement {m.group(2)} listed twice")
+        statements.add(m.group(2))
+        year = int(m.group(1))
+        balances[year] = balances.get(year, Decimal(0)) + _money(cells[total_col])
+    if not balances:
+        raise ValueError("portal tax-due table has no year rows")
+    return balances
 
 
 def parse_portal_status(html: str) -> dict:
@@ -115,29 +157,20 @@ def parse_portal_status(html: str) -> dict:
     text = " ".join(soup.get_text(" ").split())
     m = _TAX_AS_OF_RE.search(text)
     as_of = datetime.strptime(m.group(1), "%m/%d/%Y").date() if m else None
-    owner = None
-    for td in soup.find_all("td"):
-        if td.get_text(" ", strip=True) == "Name:":
-            value = td.find_next_sibling("td")
-            owner = " ".join(value.get_text(" ").split()) if value else None
-            break
+    owners = {" ".join(v.get_text(" ").split())
+              for td in soup.find_all("td") if td.get_text(" ", strip=True) == "Name:"
+              for v in [td.find_next_sibling("td")] if v is not None}
+    mailings = {compose_pacs_mailing(lines) for lines in detail["mailing"]}
     balances: dict[int, Decimal] = {}
     if _NO_AMOUNT_DUE not in text:
-        table = next((t for t in soup.find_all("table")
-                      if "Year - Statement ID" in t.get_text(" ") and "Total Due" in t.get_text(" ")), None)
-        if table is None:
-            raise ValueError("portal page shows neither a tax-due table nor 'No Amount Due'")
-        for tr in table.find_all("tr"):
-            cells = [" ".join(td.get_text(" ").split()) for td in tr.find_all("td")]
-            year = _DUE_ROW_RE.match(cells[0]) if cells else None
-            if year:
-                balances[int(year.group(1))] = balances.get(int(year.group(1)), Decimal(0)) + _money(cells[-1])
-        if not balances:
-            raise ValueError("portal tax-due table has no year rows")
+        balances = _parse_tax_due(soup)
+    # Several owner blocks, or blocks that disagree, are not resolved by guessing.
+    conflict = len(owners) > 1 or len(mailings) > 1
     return {
         "geo_ids": [g.replace(" ", "") for g in detail["geo_ids"]],
-        "owner": owner,
-        "mailing": compose_pacs_mailing(detail["mailing"][0]) if detail["mailing"] else None,
+        "owner": next(iter(owners)) if len(owners) == 1 else None,
+        "owner_conflict": conflict,
+        "mailing": next(iter(mailings)) if len(mailings) == 1 else None,
         "situs": ", ".join(detail["situs"]) if detail["situs"] else None,
         "as_of": as_of,
         "balances": balances,
@@ -156,6 +189,8 @@ def build_record(row: dict, status: dict, cert: dict, cap_min_year: int | None) 
     bill_year = min(prior)
     if cap_min_year is not None and bill_year < cap_min_year:
         return None, "capped_out"
+    if status["owner_conflict"]:
+        return None, "owner_ambiguous"
     if not status["owner"]:
         raise ValueError(f"PID {row['pid']}: portal page has no owner name")
     rec = ScrapedRecord()
@@ -177,7 +212,8 @@ def build_record(row: dict, status: dict, cert: dict, cap_min_year: int | None) 
         "certificate_filed": cert["filed"].isoformat(),
         "certificate_amount": row["cert_amount"],
         "certificate_parcel": row["parcel_raw"],
-        "certificate_situs": row["cert_situs"],
+        # The certificate's row as printed (location, interested parties, legal).
+        "certificate_row_text": row["certificate_row_text"],
         "portal_prop_id": row["pid"],
         "county": "clallam",
         "state": "WA",
@@ -222,8 +258,7 @@ class ClallamWATaxDelinquentScraper(BridgeScraper):
         pdf.raise_for_status()
         if "pdf" not in pdf.headers.get("content-type", "").lower():
             raise ValueError(f"certificate link {url} did not return a PDF")
-        text = "\n".join(p.extract_text() or "" for p in pypdf.PdfReader(BytesIO(pdf.content)).pages)
-        as_of, rows = parse_certificate(text)
+        as_of, rows = parse_certificate([p.extract_text() or "" for p in pypdf.PdfReader(BytesIO(pdf.content)).pages])
         if (today - as_of).days > _MAX_CERT_AGE_DAYS:
             raise ValueError(f"newest Clallam certificate is from {as_of}; no current list")
         cert = {"url": url, "as_of": as_of, "filed": filed}
@@ -239,9 +274,9 @@ class ClallamWATaxDelinquentScraper(BridgeScraper):
             page.raise_for_status()
             record, outcome = build_record(row, parse_portal_status(page.text), cert, cap_min_year)
             outcomes[outcome] = outcomes.get(outcome, 0) + 1
-            if outcome == "identity_mismatch":
-                _logger.warning("PID %s does not show certificate parcel %s; not delivered",
-                                row["pid"], row["parcel"])
+            if outcome in ("identity_mismatch", "owner_ambiguous"):
+                _logger.warning("PID %s (certificate parcel %s): %s; not delivered",
+                                row["pid"], row["parcel"], outcome)
             if record:
                 records.append(record)
             if self.on_progress:
@@ -249,6 +284,8 @@ class ClallamWATaxDelinquentScraper(BridgeScraper):
             await self.polite_delay()
         _logger.info("Clallam tax delinquent complete — %d parcels: %s (cap_min_year=%s)",
                      len(rows), outcomes, cap_min_year)
+        if outcomes.get("identity_mismatch") == len(rows):
+            raise ValueError("no certificate parcel matched its portal page; the source changed")
         return records
 
     async def __aenter__(self) -> "ClallamWATaxDelinquentScraper":

@@ -225,6 +225,17 @@ _WA_COUNTY_FIPS: dict[str, str] = {
     "stevens": "065", "thurston": "067", "wahkiakum": "069", "walla walla": "071",
     "whatcom": "073", "whitman": "075", "yakima": "077",
 }
+# The statewide layer publishes Asotin's parcels (13,629, every city in the county,
+# checked 2026-11-12) with FIPS_NR NULL, not '003'; no other county is in that bucket.
+_WA_NULL_FIPS_COUNTIES = frozenset({"asotin"})
+
+
+def _wa_fips_filter(county: str) -> str:
+    """The ``AND …`` county scope for a statewide-layer query, or "" if unknown."""
+    if county.lower() in _WA_NULL_FIPS_COUNTIES:
+        return " AND FIPS_NR IS NULL"
+    fips = _WA_COUNTY_FIPS.get(county.lower())
+    return f" AND FIPS_NR='{fips}'" if fips else ""
 
 
 def _format_kitsap(plain: str) -> list[str]:
@@ -466,11 +477,7 @@ def _query_wa_statewide(parcel_id: str, county: str) -> dict[str, str | None]:
     Filter: FIPS_NR for county scoping.
     """
     apn_clean = parcel_id.replace("-", "").strip()
-    fips = _WA_COUNTY_FIPS.get(county.lower())
-
-    where_clause = f"ORIG_PARCEL_ID={_arcgis_literal(apn_clean)}"
-    if fips:
-        where_clause += f" AND FIPS_NR='{fips}'"
+    where_clause = f"ORIG_PARCEL_ID={_arcgis_literal(apn_clean)}" + _wa_fips_filter(county)
 
     params = {
         "where": where_clause,
@@ -1501,7 +1508,6 @@ def _batch_query_wa_statewide(
     parcel into the canonical county format before querying, then we
     map results back to the caller's original parcel_id.
     """
-    fips = _WA_COUNTY_FIPS.get(county.lower())
     formatter = _WA_COUNTY_PARCEL_FORMATTERS.get(county.lower())
     results: dict[str, dict] = {}
     chunk_size = 50
@@ -1540,9 +1546,7 @@ def _batch_query_wa_statewide(
         in_values = list(query_to_originals.keys())
 
         in_clause = ",".join(_arcgis_literal(p) for p in in_values)
-        where = f"ORIG_PARCEL_ID IN ({in_clause})"
-        if fips:
-            where += f" AND FIPS_NR='{fips}'"
+        where = f"ORIG_PARCEL_ID IN ({in_clause})" + _wa_fips_filter(county)
 
         params = {
             "where": where,

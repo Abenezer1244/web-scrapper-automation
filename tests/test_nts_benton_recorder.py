@@ -81,3 +81,30 @@ def test_benton_parcel_shape():
     assert benton_parcel("1-1880-305-0002-002") == "118803050002002"
     assert benton_parcel("24173") is None           # a PACS property id printed beside it
     assert benton_parcel("30-08-02-53-0701") is None  # a Walla Walla parcel
+
+
+def test_beneficiary_label_is_consumed_through_its_colon():
+    # "...of the Deed of Trust and Grantee (for Recording Purposes under RCW 65.04.015):"
+    for name in ("2026_025590", "2026_025706"):
+        b = _parse(name)["beneficiary"]
+        assert "Grantee" not in b and "RCW" not in b, b
+
+
+def test_a_beneficiary_list_is_read_through_its_continuation_lines():
+    b = _parse("2026_027018")["beneficiary"]
+    assert not b.startswith("(ies)")
+    assert "CrystalRock Capital" in b and "Terry" in b
+
+
+def test_a_parcel_list_on_one_label_is_multi_property():
+    """Codex: 'ParcelNumber(s): A,B' used to keep only A, so the notice looked single."""
+    text = gzip.decompress((_DIR / "2026_025237.txt.gz").read_bytes()).decode("utf-8")
+    text = text.replace("ParcelNumber 110984020208009", "ParcelNumber(s): 110984020208009,128993050001007")
+    p = parse_recorded_nts(text)
+    assert p["parcels"] == ["110984020208009", "128993050001007"] and p["multi_property"] is True
+
+
+def test_a_parcel_list_continued_on_the_next_line_is_multi_property():
+    text = gzip.decompress((_DIR / "2026_025237.txt.gz").read_bytes()).decode("utf-8")
+    text = text.replace("ParcelNumber 110984020208009", "ParcelNumber(s): 110984020208009,\n128993050001007")
+    assert parse_recorded_nts(text)["multi_property"] is True

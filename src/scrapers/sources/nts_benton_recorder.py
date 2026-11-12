@@ -60,25 +60,27 @@ _GRANTOR = re.compile(
     r"(?:[^:\n]{0,60}:|\s*" + _loose("of Deed of Trust") + r")\s*(.+)$",
     re.I | re.M,
 )
-_TRUSTEE = re.compile(
-    r"^\s*" + _loose("Current Trustee") + r"(?:\s*" + _loose("of the Deed of Trust") + r")?\s*:?\s*(.+)$",
-    re.I | re.M,
-)
-_BENEFICIARY = re.compile(
-    r"^\s*" + _loose("Current Beneficiary") + r"(?:\s*" + _loose("of the Deed of Trust") + r")?\s*:?\s*(.+)$",
-    re.I | re.M,
-)
+# The label runs to the first colon on its line ("Current Beneficiary(ies):",
+# "... of the Deed of Trust and Grantee (for Recording Purposes ...):"); a line with no
+# colon prints the label then the value ("Current Trustee Affinia Default Services").
+_LABEL_TAIL = r"(?:[^:\n]{0,140}:|(?![^\n]*:)(?:\s*" + _loose("of the Deed of Trust") + r")?)\s*(.+)$"
+_TRUSTEE = re.compile(r"^\s*" + _loose("Current Trustee") + _LABEL_TAIL, re.I | re.M)
+_BENEFICIARY = re.compile(r"^\s*" + _loose("Current Beneficiary") + _LABEL_TAIL, re.I | re.M)
 # A wrapped name continues on the next line unless that line opens another field.
 _NEXT_FIELD = re.compile(
     r"^\s*(?:Current|Original|Grantee|Deed|Parcel|Title|Reference|Loan|TS\b|APN|Abbreviated|I\.)", re.I
 )
 # Parcel labels seen on Benton notices. The value is digits with optional dashes.
-_PARCEL = re.compile(
+_PARCEL_LABEL = re.compile(
     r"(?:" + "|".join([_loose("Tax Parcel"), _loose("Parcel Number"), _loose("Parcel No"),
                        _loose("Parcel ID"), r"\bAPN", _loose("Assessor's Parcel")]) + r")"
-    r"[^0-9\n]{0,24}?(\d[\d\- ]{9,24}\d)",
+    r"[^0-9\n]{0,24}?(?=\d)",
     re.I,
 )
+# One parcel-shaped number (dashes allowed, no spaces: spaces would merge neighbours).
+_PARCEL_NUMBER = re.compile(r"\d[\d\-]{9,24}\d")
+# A continuation line that only lists more numbers ("128993050001007, and").
+_NUMBERS_ONLY = re.compile(r"^[\d\-\s,;&]*(?:and)?[\d\-\s,;&]*$", re.I)
 _COMMONLY_KNOWN = re.compile(_loose("commonly known as") + r"\s*:?\s*(.+)(?:\n(.+))?", re.I)
 # Section I: "... will on <date>, at <time>" or "... that on <date>, <time>".
 _SALE = re.compile(
@@ -155,27 +157,40 @@ def _section_iv(text: str) -> tuple[Decimal | None, str | None]:
     return None, None
 
 
-def _name(pattern: re.Pattern, text: str) -> str | None:
-    """A labelled name, joined with its wrapped continuation line."""
+def _name(pattern: re.Pattern, text: str, max_lines: int = 4) -> str | None:
+    """A labelled name, joined with its wrapped continuation lines (up to the next
+    field, a line with a colon, or a blank line)."""
     m = pattern.search(text)
     if not m:
         return None
-    value = m.group(1)
-    rest = text[m.end():].lstrip("\n").split("\n", 1)[0]
-    if rest and not _NEXT_FIELD.match(rest) and ":" not in rest:
-        value = f"{value} {rest}"
-    return _clean(value)
+    parts = [m.group(1)]
+    for line in text[m.end():].lstrip("\n").split("\n")[:max_lines]:
+        if not line.strip() or _NEXT_FIELD.match(line) or ":" in line:
+            break
+        parts.append(line)
+    return _clean(" ".join(parts))
+
+
+def _parcels(text: str) -> list[str]:
+    """Every Benton parcel listed under a parcel label, including a list on one line
+    ("A,B") and a list continued on the next line. Numbers that are not Benton-shaped
+    (a PACS property id, another county's parcel) are not parcels here."""
+    found: list[str] = []
+    for m in _PARCEL_LABEL.finditer(text):
+        lines = text[m.end():].split("\n")
+        chunk = [lines[0]] + [ln for ln in lines[1:3] if ln.strip() and _NUMBERS_ONLY.match(ln)]
+        for raw in _PARCEL_NUMBER.findall(" ".join(chunk)):
+            p = benton_parcel(raw)
+            if p and p not in found:
+                found.append(p)
+    return found
 
 
 def parse_recorded_nts(text: str) -> dict[str, Any]:
     """Text of one recorded Benton NTS -> its facts. Missing facts are None."""
     heading = _HEADING.search(text)
     recorded = _RECORDED_AT.search(text)
-    parcels: list[str] = []
-    for m in _PARCEL.finditer(text):
-        p = benton_parcel(m.group(1))
-        if p and p not in parcels:
-            parcels.append(p)
+    parcels = _parcels(text)
     other_counties = sorted(set(_OTHER_COUNTY.findall(text)))
     iv = _SECTION_IV.search(text)
     sale = _SALE.search(text[:iv.start()] if iv else text)  # Section I precedes Section IV

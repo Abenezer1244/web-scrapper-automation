@@ -107,6 +107,15 @@ _ARCHIVE_REFRESH_DAYS = 7     # re-read an issue whose newest row is older than 
 # statutory RCW 61.24.040 notices.
 _CLARK_MAX_ADS = 60  # hard cap on ad-detail fetches per run (the listing is ~32)
 
+# ── Lewiston Tribune on nwmarket.com (Asotin County) ──
+# ~15 new adverts/day, two requests each at the 20 s robots.txt delay. The window heals
+# a missed run or a lagging sitemap; the Redis memo keeps each advert to one read.
+_NWM_WINDOW_DAYS = 7
+_NWM_MAX_ADVERTS = 60          # per run; the rest wait for the next run, logged
+_NWM_DEADLINE_S = 45 * 60      # under the 55 min soft limit
+_NWM_SEEN_TTL_S = 14 * 86400   # outlives the window
+_NWM_MIN_TEXT_CHARS = 100      # below this a PDF is unreadable (scan); real notices are 800+
+
 
 @app.task(name="src.workers.nts_crawler.crawl_nts_tacoma_index")
 def crawl_nts_tacoma_index() -> dict:
@@ -366,6 +375,134 @@ def crawl_nts_columbian_clark() -> dict:
     return summary
 
 
+@app.task(name="src.workers.nts_crawler.crawl_nts_nwmarket_asotin")
+def crawl_nts_nwmarket_asotin() -> dict:
+    """Crawl + upsert Asotin County NTS notices from the Lewiston Tribune (nwmarket.com).
+
+    Sitemap -> adverts changed in the last _NWM_WINDOW_DAYS -> each advert page -> its PDF
+    -> shared parser -> kept only when the property is in Asotin County, WA. Every request
+    waits the robots.txt crawl delay. An advert is remembered in Redis only after its PDF
+    was read and parsed, so a failure is retried next run and a success never re-fetched.
+    """
+    from urllib.parse import urlparse
+
+    import redis as sync_redis
+
+    from src.config import settings
+    from src.db.models import NtsNotice
+    from src.db.session import system_sync_session
+    from src.scrapers.sources import nts_nwmarket as nwm
+    from src.scrapers.sources import nts_pdf
+    from src.scrapers.sources import nts_tacoma_index as nts
+    from src.utils.safe_http import safe_get, safe_get_following
+
+    today = datetime.now(UTC).date()
+    deadline = time.monotonic() + _NWM_DEADLINE_S
+    summary = {"source": nwm.SOURCE, "discovered": 0, "read": 0, "upserted": 0,
+               "skipped": 0, "other_county": 0, "errored": 0, "expired": 0}
+    headers = {"User-Agent": _PDF_BROWSER_UA}
+
+    try:
+        resp = safe_get(nwm.SITEMAP_URL, timeout=25, same_origin_as=nwm.BASE_URL, headers=headers)
+    except Exception as exc:  # noqa: BLE001 — a bad sitemap fetch must not crash the beat
+        _logger.warning("Asotin NTS sitemap fetch failed: %s", str(exc)[:140])
+        _alert_if_crawl_barren(nwm.SOURCE, discovered=0, upserted=0)
+        return summary
+    if resp.status_code != 200:
+        _logger.warning("Asotin NTS sitemap HTTP %d", resp.status_code)
+        _alert_if_crawl_barren(nwm.SOURCE, discovered=0, upserted=0)
+        return summary
+
+    adverts = nwm.recent_adverts(resp.text, today - timedelta(days=_NWM_WINDOW_DAYS))
+    summary["discovered"] = len(adverts)
+
+    def seen_key(advert: str, version: str) -> str:
+        # Keyed on the advert's lastmod too: a republished (postponed) notice is new.
+        return f"bl:nts_nwmarket:seen:{advert.rsplit('_', 1)[-1]}:{version}"
+
+    try:
+        rds = sync_redis.from_url(settings.REDIS_URL, **settings.redis_kwargs())
+        todo = [(u, v) for u, v in adverts if not rds.exists(seen_key(u, v))]
+    except Exception as exc:  # noqa: BLE001 — without the memo, read everything (slower, not wrong)
+        _logger.warning("Asotin NTS seen-set unavailable, reading all: %s", str(exc)[:120])
+        rds, todo = None, adverts
+
+    attempted = 0
+    with system_sync_session() as db:
+        for i, (advert, version) in enumerate(todo):
+            if i >= _NWM_MAX_ADVERTS or time.monotonic() > deadline:
+                # Never truncate silently: the rest stay unseen and are read next run.
+                _logger.warning("Asotin NTS run stopped with %d adverts unread", len(todo) - i)
+                break
+            attempted += 1
+            try:
+                time.sleep(nwm.CRAWL_DELAY_S)
+                # Follows the site's case-canonicalising 301 (every hop re-validated);
+                # the answer must still come from nwmarket itself.
+                r = safe_get_following(advert, timeout=25, require_https=True, headers=headers)
+                on_host = urlparse(r.url).hostname == urlparse(nwm.BASE_URL).hostname
+                pdf_url = nwm.extract_pdf_url(r.text) if r.status_code == 200 and on_host else None
+                if pdf_url is None:
+                    summary["errored"] += 1
+                    _logger.warning("Asotin NTS advert %s: HTTP %d at %s, no notice PDF link",
+                                    advert, r.status_code, r.url)
+                    continue
+                time.sleep(nwm.CRAWL_DELAY_S)
+                text = _fetch_pdf_text(pdf_url)
+                if len(text) < _NWM_MIN_TEXT_CHARS:
+                    # A scanned or broken PDF is a failed read, never a "no sale" read.
+                    summary["errored"] += 1
+                    _logger.warning("Asotin NTS PDF %s yielded no usable text", pdf_url)
+                    continue
+                failed_before = summary["errored"] + summary.get("dropped_undated", 0)
+                for block in nts_pdf.split_notice_blocks(text):
+                    if not nwm.is_asotin_property(block):
+                        summary["other_county"] += 1
+                        continue
+                    summary["upserted"] += _ingest_pdf_blocks(
+                        db, NtsNotice, [block], pdf_url=pdf_url, source=nwm.SOURCE,
+                        county=nwm.COUNTY, parse_fn=nts.parse_tacoma_notice, today=today,
+                        summary=summary)
+                db.commit()
+                if summary["errored"] + summary.get("dropped_undated", 0) > failed_before:
+                    # A notice failed to store, or a real sale whose date did not parse:
+                    # not "read", so it is retried next run (and after a parser fix).
+                    continue
+                summary["read"] += 1
+                if rds is not None:
+                    rds.set(seen_key(advert, version), "1", ex=_NWM_SEEN_TTL_S)
+            except Exception as exc:  # noqa: BLE001 — one advert must not stop the run
+                db.rollback()
+                summary["errored"] += 1
+                _logger.warning("Asotin NTS advert %s failed: %s", advert, str(exc)[:120])
+
+        # SOURCE-SCOPED expiry, as Clark: past auction or not re-read in _CACHE_DAYS.
+        summary["expired"] = db.execute(
+            _sa_text(
+                """
+                UPDATE nts_notices SET is_active = false
+                WHERE source = :source AND is_active
+                  AND (auction_date < :today OR fetched_at < :cutoff)
+                """
+            ),
+            {"source": nwm.SOURCE, "today": today,
+             "cutoff": datetime.now(UTC) - _td_days(_CACHE_DAYS)},
+        ).rowcount or 0
+        db.commit()
+        # A read is the sitemap plus at least one parsed advert, or nothing new to read.
+        if summary["read"] or (adverts and not todo):
+            _record_crawl_heartbeat(db, nwm.COUNTY)
+
+    _logger.info("Asotin NTS crawl done: %s", summary)
+    # Most adverts are not Asotin trustee sales, so 0 upserts is normal (as Clark). Alert
+    # when discovery found nothing, or when every advert this run attempted failed.
+    _alert_if_crawl_barren(
+        nwm.SOURCE, discovered=attempted or len(adverts), upserted=summary["upserted"],
+        errored=attempted - summary["read"], alert_on_zero_upserts=False,
+    )
+    return summary
+
+
 def _discover_latest_legals_pdf(page_url: str, pdf_path_prefix: str) -> str | None:
     """Find the newest legal-notices PDF URL on a Pacific Publishing paper's page.
 
@@ -418,6 +555,15 @@ def _fetch_legals_issue(pdf_url: str) -> tuple[list[str], bool]:
     The flag separates "this week's issue carries no trustee sale" (a real issue,
     0 blocks) from "the extraction produced nothing usable" (0 blocks too).
     """
+    from src.scrapers.sources import nts_pdf
+
+    text = _fetch_pdf_text(pdf_url)
+    return nts_pdf.split_notice_blocks(text), nts_pdf.looks_like_legals_issue(text)
+
+
+def _fetch_pdf_text(pdf_url: str) -> str:
+    """Download one PDF (SSRF-guarded, byte-capped) and return its normalized text.
+    Raises on download/extract failure."""
     import os
     import tempfile
 
@@ -438,8 +584,7 @@ def _fetch_legals_issue(pdf_url: str) -> tuple[list[str], bool]:
             os.remove(path)
         except OSError:
             pass
-    text = nts_pdf.normalize_pdf_text(nts_pdf.extract_pdf_text(data))
-    return nts_pdf.split_notice_blocks(text), nts_pdf.looks_like_legals_issue(text)
+    return nts_pdf.normalize_pdf_text(nts_pdf.extract_pdf_text(data))
 
 
 def _ingest_pdf_blocks(

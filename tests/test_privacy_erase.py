@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from datetime import UTC, datetime
 
 import pytest
 from sqlalchemy import text
@@ -257,6 +258,28 @@ def test_every_shared_store_resumes_across_pages(s, monkeypatch, batch):
                      ).scalar() == 0
 
 
+def test_the_pacs_tax_cache_is_erased_like_the_other_shared_stores(s):
+    """Migration 142: an owing parcel's owner and addresses go; a neighbour's stay."""
+    rule_id, row = _active_rule(s, "delete")
+    rule = load_erasure_rule(s, rule_id, row)
+    ids = {}
+    for parcel, name in ((_PARCEL, "SMITH JOHN"), ("0000000001", "SMITH JOHN"),
+                         (_PARCEL + "9", "DOE JANE")):
+        ids[parcel] = str(s.execute(text(
+            "INSERT INTO pacs_tax_status (id, county, state, parcel_id, outcome, "
+            "delinquent_amount, owner_name, property_address, mailing_address) VALUES "
+            "(gen_random_uuid(), 'king', 'WA', :p, 'found', 100, :n, '1 TEST ST', "
+            "'PO BOX 1') RETURNING id"), {"p": parcel, "n": name}).scalar())
+    assert _sweep(s, rule, "pacs_tax").get("pacs_tax") == 1
+    left = dict(s.execute(text(
+        "SELECT parcel_id, owner_name IS NULL AND mailing_address IS NULL AND "
+        "property_address IS NULL AND privacy_suppression_id IS NOT NULL "
+        "FROM pacs_tax_status WHERE id = ANY(CAST(:i AS uuid[]))"),
+        {"i": list(ids.values())}).all())
+    assert left == {_PARCEL: True, "0000000001": False, _PARCEL + "9": False}
+    assert _sweep(s, rule, "pacs_tax").get("pacs_tax", 0) == 0
+
+
 def test_a_phone_anchor_erases_only_the_named_subject(s):
     rule_id, row = _active_rule(s, "delete", anchor=("phone", "2065550100"))
     rule = load_erasure_rule(s, rule_id, row)
@@ -297,3 +320,23 @@ def test_a_withheld_notice_can_never_keep_a_grantor(s):
                 "INSERT INTO nts_notices (id, source, ts_number, grantor, is_active, "
                 "privacy_suppression_id) VALUES (:i, 'test', :t, 'JOHN SMITH', false, :r)"),
                 {"i": nts, "t": nts[:12], "r": row})
+
+
+def test_a_crawl_never_clears_a_tax_cache_tombstone(s):
+    """Codex High: the crawler's settle must keep a privacy tombstone and its row
+    nameless, whatever the newly parsed page says."""
+    from src.workers.pacs_tax_crawler import _SETTLE
+
+    _, row = _active_rule(s, "delete")
+    s.execute(text(
+        "INSERT INTO pacs_tax_status (id, county, state, parcel_id, outcome, "
+        "privacy_suppression_id) VALUES (gen_random_uuid(), 'asotin', 'WA', 'T1', 'found', "
+        "CAST(:r AS uuid))"), {"r": row})
+    s.execute(_SETTLE, {
+        "county": "asotin", "state": "WA", "parcel": "T1", "now": datetime.now(UTC),
+        "outcome": "found", "as_of": None, "amount": 100, "oldest": 2025, "years": None,
+        "owner": "SMITH JOHN", "situs": "1 TEST ST", "mailing": "PO BOX 1", "suppression": None})
+    kept = s.execute(text(
+        "SELECT owner_name, property_address, mailing_address, privacy_suppression_id::text "
+        "FROM pacs_tax_status WHERE parcel_id = 'T1'")).one()
+    assert tuple(kept) == (None, None, None, row)

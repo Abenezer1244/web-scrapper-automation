@@ -39,6 +39,7 @@ _ALLOWED_SCRAPER_MODULES = frozenset([
     "src.scrapers.king_wa_probate",
     "src.scrapers.snohomish_wa_tax_delinquent",
     "src.scrapers.snohomish_wa_pre_foreclosure",
+    "src.scrapers.asotin_wa_tax_delinquent",
     "src.scrapers.trustee_sale",
     "src.scrapers.base_scraper",
 ])

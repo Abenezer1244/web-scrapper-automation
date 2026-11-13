@@ -6,8 +6,8 @@ Every lead in a county without its own mailing source is enriched through the WA
 statewide parcel layer, which is situs-only and answers ``mailing_address=None`` by
 design (county_gis.py). Measured 2026-10-02 on done jobs: Benton probate 0/7,
 Chelan 0/2, Okanogan 0/13, Clark 0/1,634 (Clark has its own module, clark_pic).
-Seven WA counties publish the owner mailing address per parcel on a PACS portal
-with no login: Benton, Clallam, Jefferson, Grant, Whatcom, Island and Chelan. The
+Eight WA counties publish the owner mailing address per parcel on a PACS portal
+with no login: Benton, Clallam, Jefferson, Grant, Whatcom, Island, Chelan and Asotin. The
 same ASP.NET form serves all of them (``propertySearchOptions$geoid``, verified on
 each portal 2026-10-02; Island was offline for maintenance that day).
 
@@ -128,6 +128,8 @@ PACS_SITES: dict[str, PacsSite] = {
     "whatcom": PacsSite("whatcom", "https://property.whatcomcounty.us/propertyaccess/PropertySearch.aspx?cid=0", True),
     "island": PacsSite("island", "https://assessor.islandcountywa.gov/propertyaccess/PropertySearch.aspx?cid=0", True),
     "chelan": PacsSite("chelan", "https://pacs.co.chelan.wa.us/PropertyAccess/PropertySearch.aspx?cid=91", True),
+    # Vendor-hosted (cid=10); Geo IDs are 17 digits. No RCW 42.56.070 clause on the page (2026-11-12).
+    "asotin": PacsSite("asotin", "https://propertysearch.trueautomation.com/PropertyAccess/PropertySearch.aspx?cid=10", False),
 }
 
 _PACE_S = 3.0
@@ -336,28 +338,31 @@ def query_digits(value: object) -> str:
 
 
 def _resolve_one(session, site: PacsSite, tokens: dict, parcel_key: str, still_held,
-                 query: str | None = None, mode: dict | None = None, land_id: str | None = None
-                 ) -> tuple[MailingAnswer, str | None]:
+                 query: str | None = None, mode: dict | None = None, land_id: str | None = None,
+                 parse=None, make=MailingAnswer) -> tuple:
     """Search POST, then detail GET, for one parcel. (answer, block_reason).
     `mode` is the form's search-mode field (pacs.search_type_field); `land_id` is
-    PacsSite.land_id for this parcel's callers, or None."""
+    PacsSite.land_id for this parcel's callers, or None. `parse(html, key)` reads the
+    detail page (default: the mailing answer); `make(outcome)` builds every other
+    answer, so the tax pass shares this exact identity chain."""
+    parse = parse or parse_detail
     data = {**tokens, **(mode or {}), "propertySearchOptions$geoid": query or parcel_key,
             "propertySearchOptions$search": "Search"}
     resp, blocked = _request(lambda: _http_post(session, site.search_url, data), still_held)
     if blocked or resp is None:
-        return MailingAnswer(REQUEST_FAILED), blocked
+        return make(REQUEST_FAILED), blocked
     outcome, prop_id, matched_key = parse_results(resp.text, parcel_key, land_id)
     if outcome != FOUND:
-        return MailingAnswer(outcome), None
+        return make(outcome), None
     time.sleep(_PACE_S + random.uniform(0, _JITTER_S))  # noqa: S311
     if not still_held():
-        return MailingAnswer(SOURCE_UNAVAILABLE), None
+        return make(SOURCE_UNAVAILABLE), None
     url = pacs_detail_url(site.search_url, prop_id)
     resp, blocked = _request(lambda: _http_get(session, url), still_held)
     if blocked or resp is None:
-        return MailingAnswer(REQUEST_FAILED), blocked
+        return make(REQUEST_FAILED), blocked
     # The detail page must name the row the grid matched, not either spelling (Codex).
-    return parse_detail(resp.text, matched_key), None
+    return parse(resp.text, matched_key), None
 
 
 def resolve_mailing(county: str, parcel_ids: list[str], *, time_budget_s: float = CALL_BUDGET_S
@@ -368,6 +373,21 @@ def resolve_mailing(county: str, parcel_ids: list[str], *, time_budget_s: float 
     lease, cooldown, a block mid-pass) are ``source_unavailable``, so the caller
     defers them. Never raises for a source problem.
     """
+    return _run_pass(county, parcel_ids, time_budget_s, parse_detail, MailingAnswer)
+
+
+def resolve_tax(county: str, parcel_ids: list[str], *, time_budget_s: float = CALL_BUDGET_S
+                ) -> dict:
+    """Tax statements (+ owner, situs, mailing) per parcel: ``pacs_tax.TaxAnswer`` keyed
+    by caller id, with every guarantee of ``resolve_mailing`` (same lease, pacing,
+    block cooldown, identity chain and layout-drift breaker)."""
+    from src.scrapers.enrichment import pacs_tax
+
+    return _run_pass(county, parcel_ids, time_budget_s, pacs_tax.parse_tax, pacs_tax.TaxAnswer)
+
+
+def _run_pass(county: str, parcel_ids: list[str], time_budget_s: float, parse, make) -> dict:
+    """One paced, lease-guarded pass over a county's parcels; see resolve_mailing."""
     from src.scrapers.enrichment.source_admission import SourceAdmission
     from src.scrapers.enrichment.source_health import (
         SourceUnavailableError,
@@ -375,7 +395,7 @@ def resolve_mailing(county: str, parcel_ids: list[str], *, time_budget_s: float 
         record_source_blocked,
     )
 
-    out = {pid: MailingAnswer(SOURCE_UNAVAILABLE) for pid in parcel_ids}
+    out = {pid: make(SOURCE_UNAVAILABLE) for pid in parcel_ids}
     site = PACS_SITES.get((county or "").lower())
     if site is None:
         return out
@@ -397,7 +417,7 @@ def resolve_mailing(county: str, parcel_ids: list[str], *, time_budget_s: float 
             # source_unavailable: deferred, not charged.
             unsupported += 1
         elif key is None:
-            out[pid] = MailingAnswer(PARCEL_NOT_FOUND)   # empty or all zeros: no parcel
+            out[pid] = make(PARCEL_NOT_FOUND)   # empty or all zeros: no parcel
         else:
             by_key.setdefault(key, []).append(pid)
             q = query_digits(pid)
@@ -447,7 +467,8 @@ def resolve_mailing(county: str, parcel_ids: list[str], *, time_budget_s: float 
             if not admission.still_held():
                 break
             answer, blocked = _resolve_one(session, site, tokens, key, admission.still_held,
-                                           query=queries[key], mode=mode, land_id=land_ids[key])
+                                           query=queries[key], mode=mode, land_id=land_ids[key],
+                                           parse=parse, make=make)
             if blocked:
                 record_source_blocked(site.source_key, f"PACS {blocked}")
                 _logger.warning("%s blocked (%s); pass stopped", site.source_key, blocked)

@@ -57,8 +57,8 @@ _DOC_TYPE_MAP = {
                 # Abbreviated codes
                 "DISS", "DISOL"],
     # Recorded death certificates only (King's death_certificate uses the same
-    # recorder category). Clallam labels them "Death".
-    "death_certificate": ["DEATH CERTIFICATE", "CERTIFICATE OF DEATH", "DEATH"],
+    # recorder category). Clallam labels them "Death", Benton "Cert Of Death".
+    "death_certificate": ["DEATH CERTIFICATE", "CERTIFICATE OF DEATH", "DEATH", "CERT OF DEATH"],
 }
 
 # Doc type phrases that LOOK like a match but document the opposite.
@@ -81,7 +81,7 @@ _DOC_TYPE_EXCLUDE = {
 
 # death_certificate keeps a row only when its WHOLE label is one of these (Codex: the
 # bare DEATH keyword also hits "Affidavit of Death" and Transfer-on-Death deeds).
-_DEATH_CERT_LABELS = frozenset({"DEATH", "DEATH CERTIFICATE", "CERTIFICATE OF DEATH"})
+_DEATH_CERT_LABELS = frozenset({"DEATH", "DEATH CERTIFICATE", "CERTIFICATE OF DEATH", "CERT OF DEATH"})
 
 
 def _doc_label(desc: str) -> str:
@@ -97,6 +97,24 @@ _DISCONTINUANCE_RE = re.compile(r"\bDISCONTINU\w*\s+(\d{4}-\d{5,})", re.IGNORECA
 _INSTRUMENT_RE = re.compile(r"\b(\d{4}-\d{5,})\b")
 _NTS_LABELS = ["TRUSTEE SALE", "TRUSTEE'S SALE"]
 _DISCONTINUANCE_LOOKUP_COUNTIES = frozenset({"clallam"})
+
+
+# Counties whose recorded-document images carry the parcel the index truncates
+# (live 2026-11-12: 25 of 29 Benton foreclosure filings in 90 days had none).
+_RECORDED_DOCUMENT_PARCEL_COUNTIES = frozenset({"benton"})
+_RECORDED_DOCUMENT_CAP = 150
+_RECORDED_DOCUMENT_MAX_BYTES = 15_000_000
+_RECORDED_DOCUMENT_TIMEOUT_MS = 60_000
+_RECORDED_DOCUMENT_MAX_PAGES = 20   # a recorded NTS runs 4-6 pages
+_RECORDED_DOCUMENT_MIN_TEXT = 200   # characters; below this the PDF is a scan without text
+
+
+def _pdf_page_count(data: bytes) -> int:
+    from io import BytesIO
+
+    from pypdf import PdfReader
+
+    return len(PdfReader(BytesIO(data)).pages)
 
 
 def _date_chunks(date_from: str, date_to: str, chunk_days: int) -> list[tuple[str, str]]:
@@ -300,6 +318,9 @@ class EagleWebScraper(BridgeScraper):
 
             await self.polite_delay()
 
+        if self.county.lower() in _RECORDED_DOCUMENT_PARCEL_COUNTIES and self.active_record_type == "pre_foreclosure":
+            await self._fill_parcels_from_recorded_documents(all_records)
+
         # Drop records without parcel_id if required — these are upstream
         # data gaps (e.g., Thurston death certificates with empty Parcel
         # field), not scraper bugs, and they cannot be GIS-enriched.
@@ -323,6 +344,107 @@ class EagleWebScraper(BridgeScraper):
         # (src/workers/tasks_helpers/enrich.py) adds the addresses.
         _logger.info("EagleWeb complete — %d records (enrichment runs after save)", len(all_records))
         return all_records
+
+    async def _fill_parcels_from_recorded_documents(self, records: list[ScrapedRecord]) -> None:
+        """Read the parcel (and street address) of parcel-less rows off the recorded
+        document itself.
+
+        Benton's index truncates the legal description ("Parcel: 11..."), so most of
+        its foreclosure filings would otherwise be dropped. The recorder serves each
+        recorded image as a PDF on its public site; it is fetched in the page (same
+        session, same origin as the portal) and read with the recorded-NTS parser.
+        A document naming several properties is quarantined, never pinned to one.
+        """
+        from urllib.parse import parse_qs, urlparse
+
+        from src.scrapers.sources.nts_benton_recorder import parse_recorded_nts
+        from src.scrapers.sources.nts_pdf import extract_pdf_text
+
+        portal_host = urlparse(self.base_url).hostname
+        todo = [r for r in records if not r.parcel_id and getattr(r, "_document_href", None)]
+        if len(todo) > _RECORDED_DOCUMENT_CAP:
+            raise RuntimeError(
+                f"{self.county}: {len(todo)} parcel-less filings exceed the {_RECORDED_DOCUMENT_CAP}"
+                " recorded-document reads per run; narrow the date window"
+            )
+        counts = {"filled": 0, "multi_property": 0, "too_long": 0, "no_parcel": 0, "failed": 0}
+        for i, record in enumerate(todo):
+            href = urlparse(record._document_href)
+            q = parse_qs(href.query)
+            name, doc_id, parent = (q.get(k, [""])[0] for k in ("docName", "id", "parent"))
+            well_formed = (re.fullmatch(r"\d{4}_\d{6}", name) and re.fullmatch(r"DOC\w+\.A0", doc_id)
+                           and re.fullmatch(r"DOC\w+", parent))
+            if href.hostname != portal_host or not well_formed:
+                counts["failed"] += 1
+                continue
+            url = f"https://{portal_host}/recorder/eagleweb/downloads/{name}.pdf?id={doc_id}&parent={parent}"
+            if i:
+                await self.polite_delay()
+            try:
+                data = await self._fetch_document(url)
+                if _pdf_page_count(data) > _RECORDED_DOCUMENT_MAX_PAGES:
+                    # Unread pages could name another property: never pin one parcel.
+                    counts["too_long"] += 1
+                    continue
+                text = extract_pdf_text(data, max_pages=_RECORDED_DOCUMENT_MAX_PAGES)
+                if len(text.strip()) < _RECORDED_DOCUMENT_MIN_TEXT:
+                    raise ValueError("no text layer")  # an image-only scan is a failed read
+                parsed = parse_recorded_nts(text)
+            except Exception as exc:  # a failed read is counted, and an all-failed pass raises
+                _logger.warning("%s: recorded document %s unreadable (%s)", self.county, name, type(exc).__name__)
+                counts["failed"] += 1
+                continue
+            if parsed["multi_property"]:
+                record.enrichment_data["recorded_document_multi_property"] = True
+                counts["multi_property"] += 1
+            elif parsed["parcels"]:
+                record.parcel_id = parsed["parcels"][0]
+                if parsed["property_address"] and not record.property_address:
+                    record.property_address = parsed["property_address"]
+                record.enrichment_data["parcel_source"] = "recorded_document"
+                counts["filled"] += 1
+            else:
+                counts["no_parcel"] += 1
+        _logger.info("%s: parcels from recorded documents %s", self.county, counts)
+        if todo and counts["failed"] == len(todo):
+            raise RuntimeError(f"{self.county}: no recorded document could be read; results incomplete")
+
+    async def _fetch_document(self, url: str) -> bytes:
+        """One recorded-document PDF, fetched inside the portal page (its session)."""
+        import base64
+
+        b64 = await self.page.evaluate(
+            """async ([u, cap, ms]) => {
+                // Same origin only (no redirects), never more than cap bytes, and a
+                // deadline over the headers AND the body (a stalled read aborts).
+                const ctl = new AbortController();
+                const timer = setTimeout(() => ctl.abort(), ms);
+                try {
+                const r = await fetch(u, {credentials: 'include', redirect: 'error', signal: ctl.signal});
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                const declared = parseInt(r.headers.get('content-length') || '0', 10);
+                if (declared > cap) throw new Error('document too large');
+                const reader = r.body.getReader();
+                const chunks = []; let total = 0;
+                for (;;) {
+                    const {done, value} = await reader.read();
+                    if (done) break;
+                    total += value.length;
+                    if (total > cap) { await reader.cancel(); throw new Error('document too large'); }
+                    chunks.push(value);
+                }
+                let s = '';
+                for (const c of chunks) for (let i = 0; i < c.length; i += 0x8000)
+                    s += String.fromCharCode.apply(null, c.subarray(i, i + 0x8000));
+                return btoa(s);
+                } finally { clearTimeout(timer); }
+            }""",
+            [url, _RECORDED_DOCUMENT_MAX_BYTES, _RECORDED_DOCUMENT_TIMEOUT_MS],
+        )
+        data = base64.b64decode(b64)
+        if not data.startswith(b"%PDF"):
+            raise ValueError("not a PDF")
+        return data
 
     async def _drop_discontinued(self, records: list[ScrapedRecord]) -> list[ScrapedRecord]:
         """Drop trustee-sale notices the recorder shows as discontinued, at any date.
@@ -998,12 +1120,16 @@ class EagleWebScraper(BridgeScraper):
                         // Capture detail link from first cell (instrument number is a link)
                         const link = cells[0].querySelector('a[href*="docDetail"], a[href*="Detail"], a[href*="viewDoc"]');
                         const detailHref = link ? link.href : '';
+                        // The recorded document's image link (Benton prints it in a
+                        // later cell); used to read a parcel the index truncates.
+                        const att = rows[i].querySelector('a[href*="viewAttachment"]');
+                        const attachHref = att ? att.href : '';
                         // Extract parcel from its column if available
                         let parcel = '';
                         if (headerMap.parcel !== undefined && cells[headerMap.parcel]) {
                             parcel = cells[headerMap.parcel].textContent.trim();
                         }
-                        results.push({desc, summary, summaryHtml, detailHref, parcel});
+                        results.push({desc, summary, summaryHtml, detailHref, parcel, attachHref});
                     }
                     return {results, shown: shownRows.length,
                             signature: shownRows.length ? shownRows[0].textContent.trim() : ''};
@@ -1071,6 +1197,9 @@ class EagleWebScraper(BridgeScraper):
                     record.enrichment_data["instrument_number"] = afn_match.group(1)
                     if detail_href:
                         record.enrichment_data["detail_href"] = detail_href
+                # A plain attribute, not a field: to_dict() (every hash, every saved
+                # row) never sees it, so it cannot move identity or reach a Result.
+                record._document_href = item.get("attachHref") or None
 
                 # Parse date
                 date_match = re.search(r"(\d{1,2}/\d{1,2}/\d{4})", summary)

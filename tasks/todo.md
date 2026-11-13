@@ -58,9 +58,28 @@ Started 2026-11-12. NOTHING pushed/deployed. Owner approval needed before each p
 - [x] Codex: GATE FAIL (3 x P2) -> fixed -> GATE FAIL (1 x P2 cap) -> fixed -> GATE PASS.
 - [x] security: no new input paths; page-size URL built from the portal's own URL (SSRF route guard still applies);
       error text carries county + counts only (P0-04).
-## Phase 2: trustee_sale for Benton from EagleWeb NTS (if approved), auction/amount NULL + labelled
-## Phase 3: tax_delinquent from Treasurer foreclosure PDF (if approved)
-## Phase 4: coverage/registry update only for verified types; journal
+## Phase 2 (owner said "proceed" 2026-11-12)
+- [x] 2a death_certificate (eagleweb keywords "CERT OF DEATH"/..., probate orientation, no parcel requirement) fd754af8,
+      doc_scope labels 472757f9 (I committed fd754af8 before the scope tests ran; they caught 2 failures; fixed).
+      Live Benton 60d: 23 certificates, 12 with parcel, 0 agency names. Probate returns the same 23 in Benton.
+      Billing dedup is per user on property / name+date, not record type -> no double billing across the two types.
+      Needs the connector row's record_types updated at deploy (owner).
+- [x] 2b recorded-document pipeline (owner OK 2026-11-12 "Yes, build it"):
+      * parser src/scrapers/sources/nts_benton_recorder.py (33b94e3d, e67b09aa, b3f315ad): 13 real notices,
+        parcel/address/Section IV 13/13, sale date 9/13 (4 OCR-damaged dates left unparsed). Codex 3 rounds -> PASS.
+      * pre_foreclosure parcel fill in eagleweb (ac138c95): live 90d Benton 26/29 kept (was 4; 1 before paging fix);
+        22 filled, 2 multi-property held, 1 no parcel, 0 failed. Codex 2 rounds -> PASS.
+      * trustee_sale (uncommitted at time of writing): crawl_nts_benton_recorder -> nts_notices (REC-<instrument>),
+        BentonWATrusteeSaleScraper, benton in NTS_MATCH_COUNTIES, beat 10:20 UTC, migration 141 (connector INACTIVE),
+        142 nts_notices.cancelled_at (sticky; excluded by matcher live/past/refresh, scraper, finalizer; linked results
+        cleared; advisory lock NTS_CANCEL_LOCK_KEY exclusive in crawl / shared in matcher+finalizer).
+        Live read-only 150d: 53 NTS read, 0 failed, 43 auction rows, 33 active upcoming.
+        Codex: 5 rounds (cancellation P1s, heartbeat/count P2s, concurrency) -> PASS. 7 files in one fix (>5 rule) noted.
+- [x] 2c tax_delinquent (owner: exempt the source): bca255cf + 68f5fa48. Live 3/3 owner-verified with mailing.
+      Migration 140 connector INACTIVE. Codex 2 rounds -> PASS.
+- [ ] blocked: code_violation (no case-level public source), divorce (GR 31 + no index source; recorder has a
+      "Dissolution" doc type -- not built, needs owner/legal call).
+## Phase 3: coverage/registry update only for verified types; journal
 # NTS amount type marker (owner decision 2026-11-06: keep fallback amounts, mark them)
 
 Branch `feat/nts-amount-basis` (worktree `C:/Users/micha/bl-wt/nts-basis`), stacked on fix/trustee-sale-silent-done (#598).

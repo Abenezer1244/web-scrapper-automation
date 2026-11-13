@@ -1,4 +1,4 @@
-"""Staging for Notice-of-Trustee-Sale documents read by OCR from a recorder. (141)
+"""Staging for Notice-of-Trustee-Sale documents read by OCR from a recorder. (154)
 
 Chelan publishes its NTS only as recorded documents whose sale date and amounts are
 in a scanned image (no text layer). OCR can misread a digit, and a wrong auction
@@ -16,16 +16,16 @@ Shared, system-only table, like nts_notices (058): RLS enabled, the system role
 granted in a role-existence guard (CI has no roles); FORCE is applied on prod by
 scripts/apply_rls_force.sql, which lists this table.
 
-Revision ID: 141
-Revises: 140
+Revision ID: 154
+Revises: 153
 Create Date: 2026-11-12
 """
 import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 
-revision = "141"
-down_revision = "140"
+revision = "154"
+down_revision = "153"
 branch_labels = None
 depends_on = None
 

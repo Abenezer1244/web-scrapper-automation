@@ -6,18 +6,20 @@ certificates only) and names the decedent (ChelanAcclaimWebScraper, commit 9d9a6
 A death certificate's recording names no parcel, so a lead gets an address only
 through the post-save owner-name fallback; leads without one are not delivered.
 
+Numbered 153 after Asotin's 150-152 merged first (it was 140 on the branch).
+
 This only appends to the Chelan connector's record_types (a JSON array, edited as
 066 does). Idempotent: the WHERE guard skips a row that already offers it.
 
-Revision ID: 140
-Revises: 139
+Revision ID: 153
+Revises: 152
 Create Date: 2026-11-12
 """
 
 from alembic import op
 
-revision = "140"
-down_revision = "139"
+revision = "153"
+down_revision = "152"
 branch_labels = None
 depends_on = None
 

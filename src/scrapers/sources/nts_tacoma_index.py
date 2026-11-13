@@ -185,7 +185,8 @@ _COMMONLY_KNOWN = re.compile(
     # parcel text leaks INTO property_address and poisons the normalized match key, so
     # a lead at that address won't attach by address.
     r"|\s+(?:Assessor'?s\s+)?Tax\s+Parcel\b|\s+Assessor'?s\s+Parcel\b|\s+Parcel\s+Number\b"
-    r"|\s+II\.\s|\n\n|\Z)",
+    # "…WA 99403 I. NOTICE IS HEREBY GIVEN…" (Aztec, Asotin) has no section break.
+    r"|\s+II\.\s|\s+I\.\s+NOTICE\b|\n\n|\Z)",
     re.I | re.S,
 )
 # ── Section IV "sum owing on the obligation" — real phrasings:
@@ -322,6 +323,16 @@ _POSTPONED = re.compile(
     r"(?:POSTPONED|CONTINUED|RESCHEDULED)\s+TO\s*:?\s*"
     rf"({_MONTH_DATE}|\d{{1,2}}/\d{{1,2}}/\d{{4}})"
     rf"(?:\s*(?:@|at)?\s*({_TIME}))?",
+    re.I,
+)
+# Aztec (Asotin, live 2026-07): each postponement is its own sentence, "…continued the
+# scheduled Trustee's Sale by oral proclamation to August 14, 2026, at the hour of
+# 10:00 AM and will … continue the scheduled Trustee's Sale by oral proclamation to
+# September 11, 2026 …". Same groups as _POSTPONED; the LATEST forward date wins.
+_CONTINUED_ORAL = re.compile(
+    r"continue[ds]?\s+the\s+(?:scheduled\s+)?trustee'?s?\s+sale\s+by\s+oral\s+proclamation\s+to\s*"
+    rf"({_MONTH_DATE}|\d{{1,2}}/\d{{1,2}}/\d{{4}})"
+    rf"(?:\s*,?\s*at\s+{_HOUR_OF}({_TIME}))?",
     re.I,
 )
 
@@ -532,13 +543,15 @@ def parse_nts_notice(text: str) -> dict[str, Any]:
         # Bounded to the sale sentence (+300 chars) so unrelated hearing/mediation
         # language elsewhere in the block can never reach it (Codex round 2).
         window = text[auction_match.start():auction_match.end() + 300]
-        pm = _POSTPONED.search(window)
-        if pm:
-            original, moved = _to_date(auction_date), _to_date(pm.group(1))
+        original = _to_date(auction_date)
+        # Every postponement in the window, latest wins (a notice can carry several).
+        for pm in [*_POSTPONED.finditer(window), *_CONTINUED_ORAL.finditer(window)]:
+            moved = _to_date(pm.group(1))
             # STRICTLY later, and only when the original itself parsed: an unconvertible
             # original must stay a visible parse failure, not be rescued into a live row
             # by some other date (Codex round 2).
             if moved and original and moved > original:
+                original = moved
                 auction_date = " ".join(pm.group(1).split()).strip().rstrip(",")
                 if pm.group(2):
                     auction_time = " ".join(pm.group(2).split())

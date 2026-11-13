@@ -53,7 +53,7 @@ DECLARE
         'contact_lookup_action_events',
         -- Profile & account (111): own avatar / sessions / email change
         'user_avatars', 'user_sessions', 'pending_email_changes',
-        -- NTS recorder staging (141): OCR'd notices awaiting review, system-only
+        -- NTS recorder staging (154): OCR'd notices awaiting review, system-only
         'nts_recorder_documents'
     ];
 BEGIN

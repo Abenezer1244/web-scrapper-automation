@@ -62,6 +62,10 @@ TAX_CAP_EXEMPT_SOURCES = frozenset({
     # three delinquent years (RCW 84.64), so the cap would hide every row. Each row
     # is still delinquent RIGHT NOW (checked against the live account at scrape).
     "benton_county_tax_foreclosure",
+    # Clallam — the tax-foreclosure certificate lists only parcels 3+ years delinquent
+    # (RCW 84.64.050), so every one fails the cap by definition; each is re-checked as
+    # still unpaid on the county portal at scrape time. Owner decision 2026-11-12.
+    "clallam_county_tax_foreclosure_certificate",
 })
 
 # Bind-parameter name for the raw-SQL twin (tax_cap_sql). Callers bind this to

@@ -166,6 +166,9 @@ _TRUSTED_TAX_SOURCES = frozenset({
     "king_county_delinquent_taxes",        # King — Socrata API
     "snohomish_county_delinquent_taxes",   # Snohomish — Treasurer bulk Current Tax List
     "benton_county_tax_foreclosure",       # Benton — Treasurer foreclosure listing x live PACS account
+    # Clallam — Treasurer's tax-foreclosure certificate, each parcel's balance re-read
+    # on the county property portal (clallam_wa_tax_delinquent.py).
+    "clallam_county_tax_foreclosure_certificate",
     "asotin_pacs_tax",                     # Asotin — per-parcel PACS tax tables (pacs_tax)
 })
 

@@ -326,6 +326,13 @@ app.conf.beat_schedule = {
         "task": "src.workers.nts_crawler.crawl_nts_columbian_clark",
         "schedule": crontab(hour=10, minute=35, day_of_week="*"),  # 10:35 UTC daily
     },
+    "crawl-nts-benton-recorder": {
+        # NTS Tier 1 (Benton): no legal-newspaper source; notices are read off the
+        # Benton Auditor's recorded images. Daily, before the 11:00 matcher. Re-reading
+        # the 150-day window is what keeps a recorded Discontinuance applied.
+        "task": "src.workers.nts_crawler.crawl_nts_benton_recorder",
+        "schedule": crontab(hour=10, minute=20),  # 10:20 UTC daily
+    },
     "crawl-nts-nwmarket-asotin": {
         # NTS (Asotin): Lewiston Tribune legal notices on nwmarket.com, one PDF per
         # notice, discovered from the sitemap at the robots.txt 20 s crawl delay. Up to

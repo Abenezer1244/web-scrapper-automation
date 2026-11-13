@@ -1979,6 +1979,10 @@ class NtsNotice(Base):
     privacy_suppression_id = Column(
         UUID(as_uuid=False), ForeignKey("privacy_suppressions.id", ondelete="RESTRICT"),
         nullable=True)
+    # Migration 156: a recorded Discontinuance cancelled this sale. Sticky (the upsert
+    # never writes it) and read by every pass, live or past: a cancelled sale is never
+    # an auction lead and never stamps an auction onto a pre-foreclosure lead.
+    cancelled_at = Column(DateTime(timezone=True), nullable=True)
 
 
 class NtsRecorderDocument(Base):

@@ -76,6 +76,54 @@ show Agency and Deceased only. NTS PDFs are free at `/Image/DocumentPdfAllPages/
 (1-bit 300 dpi scans, no text layer).
 
 ---
+
+## 2026-11-12 — Benton County: audit + five new record types (branch feat/benton-wa-seven-record-types, NOT pushed)
+
+**Built / Shipped:** local commits only, worktree `C:/Users/micha/bl-wt/benton-7`, nothing pushed or deployed.
+60c75d4d EagleWeb paging/date-window fix (all 11 EagleWeb counties): paging followed filtered rows and stopped at
+the first page with no matching doc type; now follows the portal's rows, reconciles to "N items found", takes the
+largest Results Per Page (Clallam 5 -> 100), waits for page loads, single-day window searches. Live 14d, 10
+counties: 12 -> 32 pre-foreclosure records. fd754af8/472757f9 death_certificate (recorded "Cert Of Death", King
+semantics). bca255cf/68f5fa48 Benton tax_delinquent (Treasurer foreclosure listing x live PACS account; source
+exempt from the 18-month cap by owner decision; migration 140, connector inactive). 33b94e3d..b3f315ad recorded-NTS
+parser. ac138c95 parcels read off the recorded image for Benton pre_foreclosure (live 90d: 26/29 kept, was 1).
+976a00c6 Benton auction leads from recorded notices (migrations 141 inactive connector, 142 nts_notices.cancelled_at).
+
+**Tried / Decided:** newspaper NTS source rejected: wapublicnotices.com terms ban scraping (liquidated damages);
+Tri-City Herald/McClatchy portal unverifiable. Benton assessor Spatialest/Schneider terms ban robots -> not used
+(PACS propertysearch carries no such clause and was already in use). Statewide parcel layer prefix-matching of
+truncated parcels rejected (17+ candidates). The recorder's own PDFs (free online viewing; fees only for official
+copies) carry parcel/address/sale/Section IV -> chosen. Code violation BLOCKED (no case-level public search, county
+or Kennewick/Richland/West Richland/Prosser/Benton City). Divorce BLOCKED (GR 31 bulk/commercial limits; the
+recorder has a "Dissolution" doc type, not built pending owner/legal).
+
+**Failed / Blocked:** my first paging fix counted rows on Clallam's outer layout table and ignored Island's marriage
+affidavits; two live 10-county runs caught both. A later live run caught pages read before load (fixed sleep). I
+committed fd754af8 before the scope tests ran (2 failures, fixed in 472757f9). Local suites needing Redis/Postgres
+(PACS, matcher, upsert, progress) cannot run on this laptop (no local DB password; 6543 refused) -> CI.
+
+**Caught & fixed:** Codex ~15 rounds: page-cap false failure, non-consecutive repeated pages, year-floor rollover,
+listing/table/owner layout drift read as "nothing" (tax), parcel lists hiding multi-property notices, OCR names,
+unbounded/undated downloads, document link in the record hash, cancelled sales resurfacing via the matcher's past
+pass, the finalizer snapshot, and a write race (settled with an advisory lock).
+
+**Renumbered:** Asotin merged first with 150-152 and Clallam takes 153, so the Benton migrations are
+154 (tax connector), 155 (trustee_sale connector), 156 (nts_notices.cancelled_at); text above says 140-142.
+Benton tax now reads accounts through Asotin's shared pacs_tax parser (my duplicate parser removed); past due
+follows its RCW 84.56.020 rule (current year included after April 30), as for every PACS county.
+
+**Pending / Handoff (owner):** push + PRs (merge 60c75d4d before or with the Clallam branch, which is based on it);
+deploy (migrations 140-142); first Benton recorder crawl; then UPDATE county_connectors SET active=true for the
+Benton tax and trustee_sale rows, and add death_certificate to Benton's EagleWeb row record_types. Expect EagleWeb
+jobs in other counties to FAIL LOUD where they used to return short lists silently.
+
+**Facts learned:** Benton EagleWeb shows 100 rows/page, a week ~760 rows; its index truncates parcels in the legal
+summary and the detail page's Legal Data is empty; recorded images are PDFs with a text layer whose OCR drops spaces
+and sometimes reads date slashes as digits. Benton probate == recorded Cert Of Death. Benton PACS detail shows per-
+year balances, owner and mailing. Only 1 Benton prod job had ever run (probate, 2026-10-02); pre_foreclosure never.
+
+---
+
 ## 2026-11-12 — Clallam: two broken integrations fixed, death certificates and tax foreclosure built
 
 **Built / Shipped:** branch `feat/clallam-seven-record-types` (local, not pushed), on top of the

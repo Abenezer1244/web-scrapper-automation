@@ -54,7 +54,22 @@ _RECENT_DAYS = 180
 # classifieds, Asotin=Lewiston Tribune on nwmarket.com). Matching is scoped PER COUNTY —
 # a notice only ever matches a lead in the SAME county — so a same street+zip in a
 # different county can never cross-match (the address key isn't county-unique).
-NTS_MATCH_COUNTIES = ("pierce", "snohomish", "king", "clark", "asotin")
+NTS_MATCH_COUNTIES = ("pierce", "snohomish", "king", "clark", "asotin", "benton")
+
+# Transaction-scoped advisory lock between a recorded-Discontinuance cancellation
+# (exclusive, nts_crawler.crawl_nts_benton_recorder) and every writer that stamps a
+# notice onto a lead (shared: this matcher, its refresh, trustee_sale_finalize). Shared
+# holders never block each other; whichever side comes second reads the other's
+# committed state, so a cancelled sale is never written back (Codex). The writers take
+# it before reading any notice and only read notices (no row locks a cancellation
+# needs), so the crawl holding its upsert row locks while it waits cannot deadlock them.
+NTS_CANCEL_LOCK_KEY = 6124040
+
+
+def take_nts_cancel_lock_shared(db) -> None:
+    from sqlalchemy import text as _sa_text
+
+    db.execute(_sa_text("SELECT pg_advisory_xact_lock_shared(:k)"), {"k": NTS_CANCEL_LOCK_KEY})
 
 # How far back a HISTORICAL (already-held) sale may be attached to a lead. Bounded so a
 # long-past sale is never presented as this lead's event: an auction older than this is
@@ -167,7 +182,7 @@ _REFRESH_MATCHED_SQL = """
       AND j.id = r.job_id AND sc.id = j.scraper_config_id
       AND sc.record_type = 'pre_foreclosure'
       AND n.is_active AND n.auction_date >= :today
-      AND n.privacy_suppression_id IS NULL
+      AND n.privacy_suppression_id IS NULL AND n.cancelled_at IS NULL
       AND (r.auction_date IS DISTINCT FROM n.auction_date
            OR (n.principal_owing IS NOT NULL
                AND (r.default_amount IS DISTINCT FROM n.principal_owing
@@ -180,6 +195,7 @@ def refresh_matched_from_notices(db) -> int:
     """Re-sync matched leads to their own live notice's date and principal. Commits."""
     from sqlalchemy import text as _sa_text
 
+    take_nts_cancel_lock_shared(db)
     n = db.execute(
         _sa_text(_REFRESH_MATCHED_SQL), {"today": datetime.now(UTC).date()}
     ).rowcount or 0
@@ -250,6 +266,7 @@ def _match_and_write(
 
     if not result_dicts:
         return 0
+    take_nts_cancel_lock_shared(db)  # before any notice is read (see NTS_CANCEL_LOCK_KEY)
 
     # Build matcher candidates (precompute addr_key) + indexes by addr_key + parcel.
     # The parcel index uses parcel_index_keys, not the bare normalized parcel: where a
@@ -280,7 +297,7 @@ def _match_and_write(
         _sa_text(
             _COLS + """
             WHERE is_active AND auction_date IS NOT NULL AND auction_date >= :today
-              AND privacy_suppression_id IS NULL
+              AND privacy_suppression_id IS NULL AND cancelled_at IS NULL
               AND lower(county) = :county
             ORDER BY auction_date ASC, id
             """
@@ -302,7 +319,7 @@ def _match_and_write(
             _COLS + """
             WHERE auction_date IS NOT NULL AND auction_date < :today
               -- A privacy-withheld notice (132) is never attached, past or live.
-              AND privacy_suppression_id IS NULL
+              AND privacy_suppression_id IS NULL AND cancelled_at IS NULL
               AND auction_date >= :floor AND lower(county) = :county
               AND fetched_at IS NOT NULL AND fetched_at >= :stale_before
             ORDER BY auction_date DESC
@@ -469,6 +486,11 @@ def _write_match(
                                         THEN enrichment_data::jsonb ELSE '{}'::jsonb END)
                                   || jsonb_build_object('nts', CAST(:nts AS jsonb))
             WHERE id = :rid
+              -- Re-checked at write time (the shared NTS_CANCEL_LOCK_KEY lock makes a
+              -- cancellation either fully visible here or wait for this transaction).
+              AND NOT EXISTS (SELECT 1 FROM nts_notices n
+                              WHERE n.id = CAST(:notice_id AS uuid)
+                                AND (n.cancelled_at IS NOT NULL OR n.privacy_suppression_id IS NOT NULL))
               AND (auction_date IS NULL
                    OR (:live AND auction_date < :today)
                    OR (NOT :live AND auction_date < :today

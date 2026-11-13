@@ -8,7 +8,8 @@ row. Every lead therefore has a real auction date + amount owing by construction
 
 Only counties with an NTS crawler feeding the cache have data: Pierce (Tacoma Daily
 Index), Snohomish (Snoho Tribune), King (Queen Anne News), Clark (The Columbian
-classifieds) — mirrors ``nts_matcher_task.NTS_MATCH_COUNTIES``. A county with no
+classifieds), Asotin (Lewiston Tribune on nwmarket.com) — mirrors
+``nts_matcher_task.NTS_MATCH_COUNTIES``. A county with no
 notices yields zero leads (the SELECT returns nothing), never an error.
 
 DB-backed, not a portal: like ``snohomish_wa_pre_foreclosure`` / ``snohomish_wa_
@@ -402,3 +403,9 @@ class BentonWATrusteeSaleScraper(_TrusteeSaleScraper):
             items=(DocTypeItem(label="Notice of Trustee Sale", exact=True),),
             note="Recorded trustee-sale notices read from the Benton County Auditor's recorded documents.",
         )
+
+
+class AsotinWATrusteeSaleScraper(_TrusteeSaleScraper):
+    """Asotin County (WA) auction leads — Lewiston Tribune (nwmarket.com) NTS cache."""
+
+    COUNTY = "asotin"

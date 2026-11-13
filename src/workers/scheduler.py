@@ -333,6 +333,20 @@ app.conf.beat_schedule = {
         "task": "src.workers.nts_crawler.crawl_nts_benton_recorder",
         "schedule": crontab(hour=10, minute=20),  # 10:20 UTC daily
     },
+    "crawl-nts-nwmarket-asotin": {
+        # NTS (Asotin): Lewiston Tribune legal notices on nwmarket.com, one PDF per
+        # notice, discovered from the sitemap at the robots.txt 20 s crawl delay. Up to
+        # ~45 min, so it starts early enough to finish before the 11:00 matcher.
+        "task": "src.workers.nts_crawler.crawl_nts_nwmarket_asotin",
+        "schedule": crontab(hour=10, minute=0),  # 10:00 UTC daily
+    },
+    "crawl-pacs-tax": {
+        # Asotin has no delinquent list: walk every parcel's PACS tax table a batch an
+        # hour (20 min budget, the county's PACS lease shared with mailing recovery).
+        # A full pass is ~4 days; the scraper refuses to answer below 95% coverage.
+        "task": "src.workers.pacs_tax_crawler.crawl_pacs_tax",
+        "schedule": crontab(minute=25),  # hourly at :25
+    },
     "recover-deferred-mailing": {
         # The recovery half of `mailing_lookup_deferred`, which shipped as a
         # marker that nothing ever read: parcels a source outage skipped were

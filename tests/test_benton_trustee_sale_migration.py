@@ -1,4 +1,4 @@
-"""Migration 141 (Benton trustee_sale connector) points at a real, allowlisted
+"""Migration 155 (Benton trustee_sale connector) points at a real, allowlisted
 subclass for the same county, and seeds the row inactive (owner turns it on)."""
 import importlib
 import importlib.util
@@ -8,11 +8,11 @@ from src.scrapers.registry import _ALLOWED_SCRAPER_MODULES
 from src.scrapers.trustee_sale import _TrusteeSaleScraper
 from src.workers.nts_matcher_task import NTS_MATCH_COUNTIES
 
-_MIG = Path(__file__).resolve().parents[1] / "alembic" / "versions" / "141_add_benton_trustee_sale_connector.py"
+_MIG = Path(__file__).resolve().parents[1] / "alembic" / "versions" / "155_add_benton_trustee_sale_connector.py"
 
 
 def _load():
-    spec = importlib.util.spec_from_file_location("_mig141", _MIG)
+    spec = importlib.util.spec_from_file_location("_mig155", _MIG)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
@@ -20,7 +20,7 @@ def _load():
 
 def test_chain_and_county():
     mig = _load()
-    assert (mig.revision, mig.down_revision, mig._COUNTY) == ("141", "140", "benton")
+    assert (mig.revision, mig.down_revision, mig._COUNTY) == ("155", "154", "benton")
 
 
 def test_connector_points_at_the_benton_subclass_and_is_inactive():
@@ -58,12 +58,12 @@ def test_a_cancelled_sale_is_excluded_from_every_notice_reader():
     assert "NtsNotice.cancelled_at.is_(None)" in inspect.getsource(ts)
 
 
-def test_cancelled_at_migration_chains_on_141():
+def test_cancelled_at_migration_chains_on_155():
     spec = importlib.util.spec_from_file_location(
-        "_mig142", _MIG.parent / "142_nts_notices_cancelled_at.py")
+        "_mig156", _MIG.parent / "156_nts_notices_cancelled_at.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    assert (mod.revision, mod.down_revision) == ("142", "141")
+    assert (mod.revision, mod.down_revision) == ("156", "155")
 
 
 def test_the_upsert_never_writes_cancelled_at():

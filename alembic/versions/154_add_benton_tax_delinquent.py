@@ -9,15 +9,15 @@ Inserted INACTIVE: the coverage page and scheduler only see it once the owner
 switches it on after deploy (UPDATE county_connectors SET active = true ...).
 Data INSERT only, idempotent.
 
-Revision ID: 140
-Revises: 139
+Revision ID: 154
+Revises: 153
 Create Date: 2026-11-12
 """
 
 from alembic import op
 
-revision = "140"
-down_revision = "139"
+revision = "154"
+down_revision = "153"
 branch_labels = None
 depends_on = None
 

@@ -154,7 +154,7 @@ def finalize_trustee_sale_job(db, job_id: str, user_id: Any) -> int:
                                       || jsonb_build_object('nts', CAST(:nts AS jsonb))
                 WHERE id = :rid
                   -- Never from a notice a privacy rule withholds (migration 132), nor
-                  -- one a recorded Discontinuance cancelled (migration 142): a retry
+                  -- one a recorded Discontinuance cancelled (migration 156): a retry
                   -- must not restore a cancelled sale from the snapshot.
                   AND NOT EXISTS (SELECT 1 FROM nts_notices n
                                   WHERE n.id = CAST(:notice_id AS uuid)

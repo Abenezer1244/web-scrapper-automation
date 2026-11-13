@@ -33,18 +33,15 @@ from __future__ import annotations
 
 import asyncio
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from urllib.parse import quote, urljoin
 
-from bs4 import BeautifulSoup
-
 from src.api.middleware.security import add_scrape_domain
 from src.config import settings
 from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord
-from src.scrapers.enrichment import pacs_parcel
-from src.scrapers.enrichment.pacs import compose_pacs_mailing, parse_pacs_detail_html
+from src.scrapers.enrichment import pacs_parcel, pacs_tax
 from src.scrapers.sources.nts_pdf import extract_pdf_text
 from src.utils.logger import setup_logger
 from src.utils.safe_http import safe_get
@@ -71,8 +68,6 @@ _DATE_RE = re.compile(r"\d{1,2}/\d{1,2}/\d{4}")
 _UPDATED_RE = re.compile(r"Last\s+Updated:\s*\w+,\s*(\w+\s+\d{1,2},\s*\d{4})", re.I)
 _TOTAL_RE = re.compile(r"TOTAL:\s*\$([\d,]+\.\d{2})", re.I)
 
-_YEAR_ROW_RE = re.compile(r"^(\d{4})\s*-\s*\d+")
-_AS_OF_RE = re.compile(r"Property\s+Tax\s+Information\s+as\s+of\s+(\d{1,2}/\d{1,2}/\d{4})", re.I)
 
 
 @dataclass
@@ -153,115 +148,58 @@ def find_listing_url(page_html: str, page_url: str = _PAGE_URL) -> str:
                        "cannot tell an empty cycle from a changed page")
 
 
-@dataclass
-class TaxAnswer:
-    """What one PACS page says about one parcel's account."""
-    outcome: str
-    as_of: str | None = None
-    years: dict[int, Decimal] = field(default_factory=dict)   # year -> total due
-    owners: list[str] = field(default_factory=list)
-    mailing: str | None = None
-    situs: str | None = None
-
-
-def parse_tax_detail(html: str, parcel_key: str) -> TaxAnswer:
-    """A PACS Property.aspx page -> the account's unpaid years, owner and mailing.
-
-    Same identity rule as the mailing lookup: the page must name exactly this parcel.
-    """
-    page = parse_pacs_detail_html(html)
-    if not page["geo_ids"]:
-        return TaxAnswer(pacs_parcel.UNPARSED)
-    if len(page["geo_ids"]) != 1 or pacs_parcel.normalize_pacs_parcel(page["geo_ids"][0]) != parcel_key:
-        return TaxAnswer(pacs_parcel.PARCEL_MISMATCH)
-    soup = BeautifulSoup(html, "html.parser")
-    as_of = _AS_OF_RE.search(soup.get_text(" ", strip=True))
-    table = soup.find("table", id=re.compile(r"PaymentTaxDue_paymentTable$"))
-    years: dict[int, Decimal] = {}
-    if table is not None:
-        if not table.find_all("tr", class_="dataRow"):
-            return TaxAnswer(pacs_parcel.UNPARSED)  # a balance table with no rows we can read
-        for row in table.find_all("tr", class_="dataRow"):
-            cells = row.find_all("td")
-            label = cells[0].get_text(" ", strip=True) if cells else ""
-            ym = _YEAR_ROW_RE.match(label)
-            total = row.find("td", class_="total")
-            if not ym or total is None:
-                return TaxAnswer(pacs_parcel.UNPARSED)
-            year = int(ym.group(1))
-            years[year] = years.get(year, Decimal("0")) + _money(total.get_text(strip=True))
-    elif "No Amount Due" not in soup.get_text(" ", strip=True):
-        return TaxAnswer(pacs_parcel.UNPARSED)  # neither a balance table nor "nothing due"
-    owners = []
-    for td in soup.find_all("td"):
-        if td.get_text(" ", strip=True).rstrip(":").strip().lower() == "name":
-            value = td.find_next_sibling("td")
-            if value is not None and value.get_text(" ", strip=True):
-                owners.append(re.sub(r"\s+", " ", value.get_text(" ", strip=True)))
-    if not owners:
-        return TaxAnswer(pacs_parcel.UNPARSED)  # no owner block: unreadable, not a mismatch
-    composed = {compose_pacs_mailing(lines) for lines in page["mailing"] if lines}
-    return TaxAnswer(
-        pacs_parcel.FOUND,
-        as_of=as_of.group(1) if as_of else None,
-        years={y: v for y, v in years.items() if v > 0},
-        owners=owners,
-        mailing=composed.pop() if len(composed) == 1 and None not in composed else None,
-        situs=" ".join(page["situs"]) if page["situs"] else None,
-    )
-
-
-def _owner_matches(listing_line: str, owners: list[str]) -> str | None:
-    """The PACS owner the Treasurer printed for this parcel, or None.
+def _owner_matches(listing_line: str, owner: str | None) -> str | None:
+    """The PACS owner if the Treasurer printed it for this parcel, else None.
 
     The listing prints TAXPAYER then situs and legal with no delimiter, so the
     owner is verified by prefix: the line must START with exactly the owner name
     the county's own parcel page shows."""
+    name = (owner or "").upper().strip()
     line = listing_line.upper()
-    for owner in owners:
-        name = owner.upper().strip()
-        if name and (line == name or line.startswith(name + " ")):
-            return owner
+    if name and (line == name or line.startswith(name + " ")):
+        return owner
     return None
 
 
-def build_records(listing: Listing, answers: dict[str, TaxAnswer], listing_url: str
+def build_records(listing: Listing, answers: dict[str, pacs_tax.TaxAnswer], listing_url: str
                   ) -> tuple[list[ScrapedRecord], dict[str, int]]:
-    """Join the listing with the live accounts. Returns (records, skip counts)."""
+    """Join the listing with the live accounts (pacs_tax answers). Returns
+    (records, skip counts). Past due follows pacs_tax (RCW 84.56.020: owing after
+    the first-half due date, the current year included), as for every PACS county."""
     records: list[ScrapedRecord] = []
     skipped = {"paid_or_redeemed": 0, "owner_not_verified": 0, "unresolved": 0}
     for item in listing.parcels:
         answer = answers.get(item.parcel)
-        if answer is None or answer.outcome != pacs_parcel.FOUND or not answer.as_of:
+        # A listed foreclosure parcel always has statements (a paid one shows them at
+        # $0.00); none at all, or no owner block, is an unreadable page, never "paid"
+        # or "someone else" (Codex).
+        if (answer is None or answer.outcome != pacs_tax.FOUND or answer.as_of is None
+                or not answer.statements or not answer.owner_name):
             skipped["unresolved"] += 1
             continue
-        as_of_year = datetime.strptime(answer.as_of, "%m/%d/%Y").year
-        # Delinquent = unpaid PRIOR years (same rule as the Snohomish roll); the
-        # current year is shown separately and may not be overdue yet.
-        prior = {y: v for y, v in answer.years.items() if y < as_of_year}
-        if not prior:
+        past_due = answer.past_due
+        if not past_due:
             skipped["paid_or_redeemed"] += 1
             continue
-        owner = _owner_matches(item.line, answer.owners)
+        owner = _owner_matches(item.line, answer.owner_name)
         if owner is None:
             skipped["owner_not_verified"] += 1
             continue
-        oldest = min(prior)
+        years = sorted({s.year for s in past_due})
         rec = ScrapedRecord()
         rec.parcel_id = item.parcel
         rec.party_name = BridgeScraper.clean(owner)
-        rec.property_address = answer.situs
-        rec.mailing_address = answer.mailing
+        rec.property_address = answer.property_address
+        rec.mailing_address = answer.mailing_address
         rec.date_recorded = None  # a tax account has years, not a filing date
         rec.enrichment_data = {
             "source": SOURCE,
-            "delinquent_amount": str(sum(prior.values()).quantize(Decimal("0.01"))),
-            "bill_year": oldest,
-            "delinquent_years": sorted(prior),
-            "delinquent_year_count": len(prior),
-            "oldest_tax_year": oldest,
-            "current_year_balance": str(answer.years.get(as_of_year, Decimal("0")).quantize(Decimal("0.01"))),
-            "as_of_date": answer.as_of,
+            "delinquent_amount": str(answer.delinquent_amount.quantize(Decimal("0.01"))),
+            "bill_year": answer.oldest_delinquent_year,
+            "delinquent_years": years,
+            "delinquent_year_count": len(years),
+            "oldest_tax_year": answer.oldest_delinquent_year,
+            "as_of_date": answer.as_of.strftime("%m/%d/%Y"),
             "account_number": item.parcel,
             "county": "benton",
             "state": "WA",
@@ -313,9 +251,7 @@ class BentonWATaxDelinquentScraper(BridgeScraper):
         if not listing.parcels:
             return []
         answers = await asyncio.to_thread(
-            pacs_parcel.resolve_mailing, "benton", [p.parcel for p in listing.parcels],
-            detail_parser=parse_tax_detail,
-        )
+            pacs_parcel.resolve_tax, "benton", [p.parcel for p in listing.parcels])
         records, skipped = build_records(listing, answers, listing_url)
         if skipped["unresolved"]:
             # A parcel whose account could not be read is not "not delinquent":

@@ -6,16 +6,16 @@ pass flips it daily and the matcher's past-sale pass deliberately ignores it. A
 separate, sticky timestamp lets every reader exclude a cancelled sale for good.
 Nullable, no default: existing rows are unaffected.
 
-Revision ID: 142
-Revises: 141
+Revision ID: 156
+Revises: 155
 Create Date: 2026-11-12
 """
 
 import sqlalchemy as sa
 from alembic import op
 
-revision = "142"
-down_revision = "141"
+revision = "156"
+down_revision = "155"
 branch_labels = None
 depends_on = None
 

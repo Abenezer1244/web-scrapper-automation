@@ -10,15 +10,15 @@ the crawl has filled the cache, so the coverage page never lists an empty source
 health_status is seeded 'healthy' like 081/082 (connectors hides unknown rows).
 Data INSERT only, idempotent.
 
-Revision ID: 141
-Revises: 140
+Revision ID: 155
+Revises: 154
 Create Date: 2026-11-12
 """
 
 from alembic import op
 
-revision = "141"
-down_revision = "140"
+revision = "155"
+down_revision = "154"
 branch_labels = None
 depends_on = None
 

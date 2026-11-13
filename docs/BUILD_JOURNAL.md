@@ -49,6 +49,11 @@ listing/table/owner layout drift read as "nothing" (tax), parcel lists hiding mu
 unbounded/undated downloads, document link in the record hash, cancelled sales resurfacing via the matcher's past
 pass, the finalizer snapshot, and a write race (settled with an advisory lock).
 
+**Renumbered:** Asotin merged first with 150-152 and Clallam takes 153, so the Benton migrations are
+154 (tax connector), 155 (trustee_sale connector), 156 (nts_notices.cancelled_at); text above says 140-142.
+Benton tax now reads accounts through Asotin's shared pacs_tax parser (my duplicate parser removed); past due
+follows its RCW 84.56.020 rule (current year included after April 30), as for every PACS county.
+
 **Pending / Handoff (owner):** push + PRs (merge 60c75d4d before or with the Clallam branch, which is based on it);
 deploy (migrations 140-142); first Benton recorder crawl; then UPDATE county_connectors SET active=true for the
 Benton tax and trustee_sale rows, and add death_certificate to Benton's EagleWeb row record_types. Expect EagleWeb
@@ -60,6 +65,43 @@ and sometimes reads date slashes as digits. Benton probate == recorded Cert Of D
 year balances, owner and mailing. Only 1 Benton prod job had ever run (probate, 2026-10-02); pre_foreclosure never.
 
 ---
+## 2026-11-12 — Asotin County: auction leads, tax delinquency, assessor enrichment (branch only)
+
+**Built / Shipped:** branch `feat/asotin-wa-seven-record-types` (worktree `bl-wt/asotin-7`), NOT
+pushed or deployed; both Asotin connectors seeded INACTIVE (migrations 150, 151), so public
+coverage is unchanged. (1) PACS assessor (TrueAutomation cid=10, 17-digit Geo IDs) in the parcel
+mailing hook. (2) trustee_sale from the Lewiston Tribune's notices on nwmarket.com: sitemap
+discovery (robots bars listing pagination), 20 s crawl delay, Redis memo keyed (advert, lastmod).
+(3) tax_delinquent: Asotin has no delinquent roll, so an hourly rolling crawl reads every
+parcel's PACS tax table into `pacs_tax_status` (system-only RLS) through a shared PACS pass
+(`resolve_tax` = `resolve_mailing`'s lease/pacing/identity chain); the scraper refuses below
+95% coverage and holds leads missing owner/address/mailing. Privacy: names kept only while a
+parcel owes, gated by authorize(), erased by `privacy_erase_pacs_tax` (152).
+
+**Tried / Decided:** owner approved solving Helion's reCAPTCHA with 2Captcha and a per-parcel
+crawl. Tax qualification = prior-year arrears (as King/Snohomish), though 10% of a 60-parcel
+sample owed only current-year tax 12 days after its due date. Erasure got a companion function
+rather than a redefinition of 135's audited one.
+
+**Failed / Blocked:** probate, pre_foreclosure, divorce, death_certificate: Asotin's only online
+recorder index (Helion Digital Research Room, pras.asotincountywa.gov) sits behind Google
+reCAPTCHA v2; an automated captcha attempt was denied in-session and the 2Captcha key lives in
+.env, which this session may not read. code_violation: no case-level public data (county and
+Clarkston are complaint-driven). First live NTS crawl read 0/48: the sitemap's "-Notices_N"
+301s to "-notices_N" and safe_get does not follow redirects; the barren alert fired as designed.
+
+**Caught & fixed:** Codex: memo ignoring lastmod, failed upserts memoised, empty PDF read as
+healthy; parcel_mismatch counted as coverage, ownerless rows outside erasure, crawls clearing
+privacy tombstones, inventory refresh drifting hourly. Shared NTS parser read a twice-postponed
+Aztec sale at its original past date (now the latest "continued … to <date>").
+
+**Pending / Handoff:** owner: decide the Helion captcha path (key/permission); approve release
+(flip both connectors active) after the tax crawl reaches 95% coverage. Migrations are
+150-152 (Benton holds 140-142, Chelan 140): whichever merges second repoints one down_revision.
+
+**Facts learned:** the WA statewide parcel layer publishes Asotin with FIPS_NR NULL, not '003'
+(13,629 parcels) — Asotin situs lookups returned nothing until fixed. Asotin PACS shows only the
+last three tax years. nwmarket's sitemap repeats ~100 adverts.
 
 ## 2026-11-10 — Compliance: everything merged and switched on (retention, re-acceptance, DROP foundation, live form)
 

@@ -1,4 +1,4 @@
-"""Migration 140 (Clallam death_certificate + tax connector) — the seed data must be valid.
+"""Migration 153 (Clallam death_certificate + tax connector) — the seed data must be valid.
 
 No DB: loads the migration and checks that its scraper class is a real, allowlisted
 scraper, that the recorder types it adds are ones the EagleWeb template serves, and that
@@ -15,19 +15,19 @@ from src.scrapers.templates.eagleweb import _DOC_TYPE_MAP
 from src.workers.tasks_helpers.dedup import _TRUSTED_TAX_SOURCES
 
 _MIG_PATH = (Path(__file__).resolve().parents[1] / "alembic" / "versions"
-             / "140_clallam_death_certificate_and_tax.py")
+             / "153_clallam_death_certificate_and_tax.py")
 
 
 def _load():
-    spec = importlib.util.spec_from_file_location("_mig140", _MIG_PATH)
+    spec = importlib.util.spec_from_file_location("_mig153", _MIG_PATH)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
 
 
-def test_chains_onto_139():
+def test_chains_onto_152():
     mig = _load()
-    assert (mig.revision, mig.down_revision) == ("140", "139")
+    assert (mig.revision, mig.down_revision) == ("153", "152")
 
 
 def test_recorder_types_only_add_death_certificate_and_the_template_serves_them():

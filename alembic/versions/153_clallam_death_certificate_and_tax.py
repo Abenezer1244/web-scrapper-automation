@@ -12,15 +12,15 @@ Owner approval 2026-11-12 (tasks/clallam-seven.md).
 
 Data only (no schema change). Idempotent.
 
-Revision ID: 140
-Revises: 139
+Revision ID: 153
+Revises: 152
 Create Date: 2026-11-12
 """
 
 from alembic import op
 
-revision = "140"
-down_revision = "139"
+revision = "153"
+down_revision = "152"
 branch_labels = None
 depends_on = None
 

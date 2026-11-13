@@ -1157,6 +1157,90 @@ def _record_crawl_heartbeat(db, county: str) -> None:
         _logger.error("NTS crawl heartbeat not recorded for %s: %s", county, str(exc)[:160])
 
 
+# Benton's recorded notices are read straight off the recorder (no newspaper source):
+# a notice is recorded 90-120 days before its sale (RCW 61.24.040), so the window
+# covers every sale still ahead plus the discontinuances that cancel them.
+_BENTON_RECORDER_WINDOW_DAYS = 150
+
+
+@app.task(name="src.workers.nts_crawler.crawl_nts_benton_recorder")
+def crawl_nts_benton_recorder() -> dict:
+    """Crawl Benton County's recorded Notices of Trustee's Sale into nts_notices.
+
+    Every NTS recorded in the window is read off its recorded image; a notice with a
+    sale date and exactly one Benton parcel is upserted (key REC-<instrument>), and
+    one a recorded Discontinuance names is stored inactive. Multi-property and
+    undated notices are counted, never stored as auction leads.
+    """
+    import asyncio
+
+    from src.db.models import NtsNotice
+    from src.db.session import system_sync_session
+    from src.scrapers.sources import nts_benton_crawl as crawl
+    from src.scrapers.sources import nts_benton_recorder as rec
+
+    today = datetime.now(UTC).date()
+    start = today - timedelta(days=_BENTON_RECORDER_WINDOW_DAYS)
+    summary = {"source": rec.SOURCE, "discovered": 0, "upserted": 0, "skipped": 0,
+               "errored": 0, "cancelled": 0}
+    try:
+        got = asyncio.run(crawl.collect(start.strftime("%m/%d/%Y"), today.strftime("%m/%d/%Y")))
+    except Exception as exc:  # noqa: BLE001 — an unreadable search must page, not crash the beat
+        _logger.warning("Benton recorder NTS crawl failed: %s", str(exc)[:200])
+        _alert_if_crawl_barren(rec.SOURCE, discovered=0, upserted=0)
+        return summary
+    summary["discovered"] = got.nts_rows
+    summary["errored"] = got.failed
+    cancelled = frozenset(got.cancelled)
+    with system_sync_session() as db:
+        for parsed, url in got.notices:
+            row = rec.recorded_notice_to_row(parsed, url, today, cancelled)
+            if row is None:
+                summary["skipped"] += 1
+                continue
+            row["fetched_at"] = datetime.now(UTC)  # the past-sale matcher pass reads it
+            _upsert_notice(db, NtsNotice, row)
+            summary["upserted"] += 1
+        if cancelled:
+            keys = [rec.ts_key(i) for i in sorted(cancelled)]
+            # Applied to every stored notice the discontinuances name, whether or not
+            # its own image was read today; cancelled_at is never cleared (Codex P1).
+            # Exclusive against the matcher/finalizer's shared lock (NTS_CANCEL_LOCK_KEY).
+            from src.workers.nts_matcher_task import NTS_CANCEL_LOCK_KEY
+
+            db.execute(_sa_text("SELECT pg_advisory_xact_lock(:k)"), {"k": NTS_CANCEL_LOCK_KEY})
+            res = db.execute(
+                _sa_text("UPDATE nts_notices SET cancelled_at = COALESCE(cancelled_at, now()), is_active = false "
+                         "WHERE source = :source AND ts_number = ANY(:keys)"),
+                {"source": rec.SOURCE, "keys": keys},
+            )
+            # Leads already stamped with a now-cancelled sale stop showing it, so the
+            # matcher can attach a replacement notice (Codex P1). A later statement, so
+            # its snapshot sees an attachment that committed while we waited.
+            db.execute(
+                _sa_text("""
+                    UPDATE results SET auction_date = NULL, default_amount = NULL,
+                        nts_match_confidence = NULL, nts_notice_id = NULL,
+                        enrichment_data = (CASE WHEN jsonb_typeof(enrichment_data::jsonb) = 'object'
+                                                THEN enrichment_data::jsonb - 'nts'
+                                                ELSE enrichment_data::jsonb END)
+                    WHERE nts_notice_id IN (
+                        SELECT id FROM nts_notices WHERE source = :source AND ts_number = ANY(:keys))
+                """),
+                {"source": rec.SOURCE, "keys": keys},
+            )
+            summary["cancelled"] = res.rowcount
+        db.commit()
+        # Fresh only when the source was actually read: some notice parsed, or the
+        # window conclusively held none (Codex P2).
+        if got.nts_rows == 0 or got.failed < got.nts_rows:
+            _record_crawl_heartbeat(db, rec.COUNTY)
+    _alert_if_crawl_barren(rec.SOURCE, discovered=summary["discovered"], upserted=summary["upserted"],
+                           errored=summary["errored"])
+    _logger.info("Benton recorder NTS crawl: %s", summary)
+    return summary
+
+
 def _td_days(days: int):
     from datetime import timedelta
     return timedelta(days=days)

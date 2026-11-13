@@ -205,7 +205,7 @@ def _kw_map(modpath, attr="_DOC_TYPE_MAP"):
 # the scraper's pre_foreclosure keyword set (no over-collect, no silent drop).
 _PARTITION_CASES = [
     ("douglas", "src.scrapers.templates.acclaimweb", "_DOC_TYPE_MAP"),
-    ("chelan", "src.scrapers.templates.acclaimweb", "_DOC_TYPE_MAP"),  # pre-staged (down)
+    ("chelan", "src.scrapers.templates.acclaimweb", "_CHELAN_DOC_TYPE_MAP"),  # its own codes
     ("columbia", "src.scrapers.templates.idocmarket", "_DOC_TYPE_MAP"),
     ("cowlitz", "src.scrapers.templates.laserfiche_weblink", "_DOC_TYPE_MAP"),
     ("okanogan", "src.scrapers.templates.tyler_selfservice", "_DOC_TYPE_MAP"),

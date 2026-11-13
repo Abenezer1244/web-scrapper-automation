@@ -1,5 +1,6 @@
-"""Audit #5 5b-ii: the PACS, AcclaimWeb-PACS and Tracerfy requests connect only to an
-address the SSRF policy approved.
+"""Audit #5 5b-ii: the PACS and Tracerfy requests connect only to an address the SSRF
+policy approved. (AcclaimWeb's own PACS lookup was removed 2026-11-12: it never found
+anyone; the PACS lookups left are the ones tested here.)
 
 Each of these validated its URL with ``validate_scraping_target(resolve=True)`` and
 then let a plain ``requests.Session`` resolve the host AGAIN to connect. A DNS answer
@@ -13,15 +14,12 @@ else is replaced: the production validator, session and transport all run. These
 URLs are HTTPS, so the listener counts TCP connections rather than HTTP requests:
 the question is whether the worker ever opened a socket to the internal address.
 """
-import asyncio
 import socket
 import threading
 
 import pytest
 
-from src.scrapers.base_scraper import ScrapedRecord
 from src.scrapers.enrichment import pacs, skip_trace
-from src.scrapers.templates import acclaimweb
 from src.workers.skip_trace_dispatcher import classify_submit_failure
 
 
@@ -81,7 +79,7 @@ def rebinding_dns(monkeypatch):
 
     monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
 
-    for module in (pacs, acclaimweb, skip_trace):
+    for module in (pacs, skip_trace):
         real_validate = module.validate_scraping_target
         calls = {"n": 0}
 
@@ -108,26 +106,6 @@ def test_pacs_never_connects_to_an_internal_address(internal_service, rebinding_
     assert pacs.lookup_pacs_by_name(url, "SMITH JOHN") == (pacs.LOOKUP_FAILED, None)
     assert _validated(rebinding_dns, pacs) == 1  # the real check ran and passed
     assert internal_service.accepted == 0
-
-
-def test_acclaimweb_pacs_never_connects_to_an_internal_address(
-    internal_service, rebinding_dns, monkeypatch,
-):
-    scraper = acclaimweb.AcclaimWebScraper(
-        base_url="https://edocs.example.gov/AcclaimWeb", county="chelan", state="WA",
-        record_types=["probate"],
-    )
-    monkeypatch.setattr(
-        acclaimweb.AcclaimWebScraper, "_PACS_URLS",
-        {"chelan": f"https://{_REBIND_HOST}:{internal_service.port}/PropertyAccess/"},
-    )
-    records = [ScrapedRecord(party_name="SMITH JOHN")]
-
-    asyncio.run(scraper._lookup_pacs_addresses(records))
-
-    assert _validated(rebinding_dns, acclaimweb) == 1
-    assert internal_service.accepted == 0
-    assert records[0].property_address is None
 
 
 @pytest.fixture

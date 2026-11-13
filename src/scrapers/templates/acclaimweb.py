@@ -15,17 +15,20 @@ Chelan, Douglas, Pend Oreille
 """
 
 import asyncio
+import html
+import json
 import re
 from datetime import datetime, timedelta
+from urllib.parse import parse_qsl, urlencode, urlparse
+from zoneinfo import ZoneInfo
 
-from src.api.middleware.security import add_scrape_domain, validate_scraping_target
+from src.api.middleware.security import add_scrape_domain
 from src.scrapers.base_scraper import (
     BridgeScraper,
     ScrapedRecord,
     normalize_party_text,
 )
 from src.scrapers.divorce import is_divorce_doc, orient_divorce_party
-from src.scrapers.enrichment.pacs import mailing_from_detail, parse_pacs_result_html
 from src.scrapers.preforeclosure import (
     is_cancellation_or_admin,
     orient_pre_foreclosure_party,
@@ -34,14 +37,28 @@ from src.scrapers.probate import orient_probate_party
 from src.scrapers.reliability import (
     ScraperBlockedError,
     ScraperExecutionError,
+    TransientScrapeError,
     classify_results_page,
     detect_block,
 )
 from src.utils.logger import setup_logger
-from src.utils.pinned_http import pinned_session
 
 # Substrings an AcclaimWeb results page renders for a genuine zero-result window.
 _EMPTY_MARKERS = ("no results", "0 records", "no records", "no documents found")
+
+# Every AcclaimWeb search loads its grid shell (PartialGrid) and then, when there are
+# rows, the rows as JSON {"data": [...], "total": N} from GridResults (Chelan Telerik
+# and Douglas alike, verified live 2026-11-12). A search with no rows loads the shell
+# and no GridResults. Reading those responses, not the DOM, is what ties a result to
+# the search we just ran: the DOM still shows the previous search's rows for a moment.
+_GRID_SHELL_PATH = "/search/partialgrid"
+_GRID_DATA_PATH = "/search/gridresults"
+_MAX_GRID_PAGES = 200
+# Deadline for any one portal answer: a response body, or a later grid page.
+_PORTAL_TIMEOUT_S = 30
+# GridResults RecordDate is "/Date(<epoch ms>)/" for the recording time in the county.
+_GRID_DATE_RE = re.compile(r"/Date\((-?\d+)\)/")
+_COUNTY_TZ = ZoneInfo("America/Los_Angeles")
 
 _logger = setup_logger("scraper.template.acclaimweb")
 
@@ -112,6 +129,95 @@ def _doc_type_matches(doc_type: str, keywords: list[str]) -> bool:
     return False
 
 
+# Chelan's grid shows only its own document codes (its Doc Type list, read live
+# 2026-11-12, has 109). Two shared tokens mean something else there:
+# "NOD" is NOTICE OF DISCONTINUANCE (a foreclosure called off) and "AFFD" is any
+# AFFIDAVIT. Lis pendens shows as "LP", never "LIS PENDENS". Probate signals in the
+# recorder are DEATH CERTIFICATE ("DC") and TRANSFER ON DEATH DEED ("TOD", a living
+# owner, gated downstream by include_living_owner_tod).
+_CHELAN_DOC_TYPE_MAP = {
+    **_DOC_TYPE_MAP,
+    "probate": ["DC", "TOD"],
+    "pre_foreclosure": ["NTS", "NTSCOM", "LP"],
+    # Recorded death certificates alone, as King defines the type (king_wa_probate.py).
+    "death_certificate": ["DC"],
+}
+
+
+def _grid_date(value: object) -> str | None:
+    """GridResults RecordDate -> MM/DD/YYYY, or None when it is not a date.
+
+    Chelan sends "/Date(<epoch ms>)/" (the recording time, read in the county's time
+    zone); Douglas sends "2026/10/06".
+    """
+    text = str(value or "")
+    try:
+        m = _GRID_DATE_RE.search(text)
+        if m:
+            return datetime.fromtimestamp(int(m.group(1)) / 1000, _COUNTY_TZ).strftime("%m/%d/%Y")
+        m = re.match(r"(\d{4})[/-](\d{2})[/-](\d{2})", text)
+        if m:
+            return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3))).strftime("%m/%d/%Y")
+        m = re.match(r"\d{2}/\d{2}/\d{4}", text)
+        return datetime.strptime(m.group(0), "%m/%d/%Y").strftime("%m/%d/%Y") if m else None
+    except (ValueError, OverflowError, OSError):
+        return None  # not a real date: the caller treats it as schema drift
+
+
+def _grid_item(row: dict) -> dict:
+    """One GridResults row in the shape _records_from_raw reads.
+
+    Chelan names the code DocType ("NTS"); Douglas names the text DocTypeDescription
+    ("DEED OF TRUST"). Douglas also sends ParcelNumber, deliberately not read here:
+    parcel_id is a dedup/billing key, and Douglas leads were keyed without it.
+    """
+    return {
+        "instrument": str(row.get("InstrumentNumber") or "").strip(),
+        "date_recorded": _grid_date(row.get("RecordDate")) or "",
+        "doc_type": str(row.get("DocType") or row.get("DocTypeDescription") or ""),
+        "grantor": str(row.get("DirectName") or ""),
+        "grantee": str(row.get("IndirectName") or ""),
+        "legal": str(row.get("DocLegalDescription") or ""),
+        "parcel": "",
+        "item_id": str(row.get("TransactionItemId") or ""),
+    }
+
+
+# A recording's detail page prints its legal description as "DocLegal: APN 232020860053
+# SP 2019-008 LOT 7" (Chelan, live 2026-11-12); one document can name several APNs.
+_DOC_LEGAL_RE = re.compile(
+    r"DocLegal:(.*?)(?:Grantor:|Grantee:|Borrower:|Trustee|Related|$)", re.S | re.I
+)
+# Any 9+ digit number (dashes allowed between digits) after the "APN" label. Shorter
+# numbers in a legal are plats and lots ("SP 2019-008"). Taking every one, not a parsed
+# list, means a separator we did not foresee yields two candidates, never a first guess.
+_APN_NUMBER_RE = re.compile(r"\d(?:-?\d){8,}")
+_APN_LOOKUP_KEY = "recording_apn_lookup"
+_DETAIL_PACE_S = 1.5
+
+
+def parse_detail_apns(html_text: str) -> list[str] | None:
+    """The distinct APN candidates a recording detail page names, in order.
+
+    None when the page is not a detail page (no "Doc Type:" field), so "no APN" is
+    never mistaken for a page we could not read. A death certificate's page has no
+    legal at all (Doc Type, Agency, Deceased): it names a person, not a parcel -> [].
+    """
+    text = html.unescape(re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html_text or "")))
+    if "Doc Type:" not in text:
+        return None
+    m = _DOC_LEGAL_RE.search(text)
+    label = re.search(r"\bAPN\b", m.group(1), re.I) if m else None
+    if not label:
+        return []
+    apns: list[str] = []
+    for number in _APN_NUMBER_RE.findall(m.group(1)[label.end():]):
+        apn = number.replace("-", "")
+        if apn not in apns:
+            apns.append(apn)
+    return apns
+
+
 class AcclaimWebScraper(BridgeScraper):
     """Template scraper for all Tyler AcclaimWeb recorder sites.
 
@@ -119,12 +225,19 @@ class AcclaimWebScraper(BridgeScraper):
     shared AcclaimWeb interface.
     """
 
+    # The site's document vocabulary; a county whose codes differ subclasses with its own.
+    DOC_TYPE_MAP = _DOC_TYPE_MAP
+    # Whether each lead's recording detail page is read for its APN (see _read_parcels),
+    # and the shape a single APN must have to become the lead's parcel.
+    READS_DETAIL_APN = False
+    APN_SHAPE = re.compile(r"\d{12}")
+
     @classmethod
     def collection_scope(cls, record_type: str):
-        """SHOW descriptor derived from this template's own _DOC_TYPE_MAP."""
+        """SHOW descriptor derived from this site's own DOC_TYPE_MAP."""
         from src.scrapers.doc_scope import from_keyword_map
 
-        return from_keyword_map(_DOC_TYPE_MAP, record_type)
+        return from_keyword_map(cls.DOC_TYPE_MAP, record_type)
 
     def __init__(
         self,
@@ -163,6 +276,14 @@ class AcclaimWebScraper(BridgeScraper):
         AcclaimWeb can return large result sets — split into 7-day chunks
         to keep things manageable and avoid timeouts.
         """
+        # A type this site has no vocabulary for would skip the document filter and
+        # admit every recording: refuse it before touching the portal.
+        if self.active_record_type and self.active_record_type not in self.DOC_TYPE_MAP:
+            raise ScraperExecutionError(
+                self.county, "AcclaimWeb",
+                f"no document vocabulary for {self.active_record_type} on this site",
+                record_type=self.active_record_type, date_from=date_from, date_to=date_to,
+            )
         start = datetime.strptime(date_from, "%m/%d/%Y")
         end = datetime.strptime(date_to, "%m/%d/%Y")
         chunk_days = 7
@@ -206,12 +327,14 @@ class AcclaimWebScraper(BridgeScraper):
         # results page on ANY day-chunk RAISES and fails the whole job (the
         # scheduler re-runs it) — we never swallow a bad chunk and continue, which
         # would silently under-deliver a partial date window under a DONE job.
-        while chunk_start < end:
+        # A single-date site searches one day per chunk, so date_to itself is a chunk.
+        while chunk_start < end or (self._single_date_mode and chunk_start == end):
             # Use 1-day chunks in single-date mode, 7-day chunks otherwise
             effective_days = 1 if self._single_date_mode else chunk_days
             chunk_end = min(chunk_start + timedelta(days=effective_days), end)
             cf = chunk_start.strftime("%m/%d/%Y")
-            ct = chunk_end.strftime("%m/%d/%Y")
+            # The single date field is searched for cf alone.
+            ct = cf if self._single_date_mode else chunk_end.strftime("%m/%d/%Y")
 
             _logger.info("Chunk: %s to %s", cf, ct)
 
@@ -219,19 +342,18 @@ class AcclaimWebScraper(BridgeScraper):
             if chunk_start != start:
                 await self._go_to_search()
 
-            # Fill dates and submit
             await self._fill_dates(cf, ct)
-            await self._submit_search()
-
-            # Extract all pages
-            chunk_records = await self._extract_all_pages()
+            chunk_records = await self._search_and_read(cf, ct)
 
             new_count = self.dedupe_extend(chunk_records, seen_hashes, all_records)
 
             _logger.info("Chunk %s-%s: %d new records (total: %d)", cf, ct, new_count, len(all_records))
 
-            chunk_start = chunk_end
-            pass
+            # One day at a time in single-date mode (chunk_end is clamped to end there).
+            chunk_start = chunk_start + timedelta(days=1) if self._single_date_mode else chunk_end
+
+        if self.READS_DETAIL_APN:
+            await self._read_parcels(all_records)
 
         # Enrich records missing addresses via county assessor (PACS) lookup.
         # Only look up person names — companies won't match in the assessor.
@@ -246,9 +368,9 @@ class AcclaimWebScraper(BridgeScraper):
             and not any(w in _CO_WORDS for w in r.party_name.upper().split())
         ]
         if needs_address:
-            _logger.info("PACS: %d person-named records to look up (skipping %d companies)",
+            _logger.info("Owner lookup: %d person-named records (skipping %d companies)",
                          len(needs_address), len(all_records) - len(needs_address))
-            await self._lookup_pacs_addresses(needs_address)
+            await self._lookup_addresses_by_owner(needs_address)
 
         _logger.info("acclaimweb complete - %d records (enrichment runs after save)", len(all_records))
         return all_records
@@ -360,8 +482,17 @@ class AcclaimWebScraper(BridgeScraper):
         except Exception:
             pass
 
-        # Fallback: navigate directly (reliable even when the link is hidden)
-        await self.page.goto(search_url, wait_until="domcontentloaded", timeout=15_000)
+        # Fallback: navigate directly (reliable even when the link is hidden). Douglas
+        # sometimes takes >15 s to serve this page (seen live 2026-11-12, and 1 of its 3
+        # October jobs failed): one retry, then the timeout propagates and fails the job.
+        for attempt in (1, 2):
+            try:
+                await self.page.goto(search_url, wait_until="domcontentloaded", timeout=30_000)
+                break
+            except Exception as exc:
+                if attempt == 2 or "Timeout" not in type(exc).__name__:
+                    raise
+                _logger.warning("Search form timed out; retrying once")
         await self.page.wait_for_timeout(2_000)
 
     async def _fill_dates(self, date_from: str, date_to: str) -> None:
@@ -523,350 +654,203 @@ class AcclaimWebScraper(BridgeScraper):
             ) from exc
 
     async def _submit_search(self) -> None:
-        """Click the Search button and wait for results grid to populate."""
+        """Click the Search button. _search_and_read waits on the responses it causes."""
+        search_btn = self.page.locator("#SearchBtn")
+        if await search_btn.count() == 0:
+            # :visible: Chelan also has a hidden HelpButton whose text contains "Search".
+            search_btn = self.page.locator(
+                "button:has-text('Search'):visible, input[type='submit'][value='Search']:visible"
+            )
+        if await search_btn.count() == 0:
+            body = await self.page.inner_text("body")
+            raise ScraperExecutionError(
+                self.county, "AcclaimWeb",
+                "no search button found (search never ran)",
+                record_type=self.active_record_type, context=body[:120],
+            )
+        await search_btn.first.click()
+
+    async def _search_and_read(self, date_from: str, date_to: str) -> list[ScrapedRecord]:
+        """Run the filled-in search and return every row it found, of every page.
+
+        Only requests issued after our click count: a late answer to an earlier
+        request is never read as this search's. The grid shell (PartialGrid) of a
+        search with rows binds the grid to GridResults; an empty search's shell has no
+        such binding (Chelan and Douglas alike, live 2026-11-12). So zero is returned
+        only for a successful shell with no binding AND the page's empty marker.
+        Anything else RAISES: network/timeout/HTTP failures as TransientScrapeError
+        (the worker re-runs the job), short, stale or malformed results as
+        ScraperExecutionError.
+        """
+        origin = urlparse(self.base_url).hostname
+        ours: set = set()
+        loop = asyncio.get_running_loop()
+        grid_data: asyncio.Future = loop.create_future()
+
+        def _ours(resp, method: str, path: str) -> bool:
+            req = resp.request
+            u = urlparse(resp.url)
+            return (req in ours and req.method == method and u.hostname == origin
+                    and u.path.lower().endswith(path))
+
+        def _on_request(req) -> None:
+            ours.add(req)
+
+        def _on_response(resp) -> None:
+            if not grid_data.done() and _ours(resp, "POST", _GRID_DATA_PATH):
+                grid_data.set_result(resp)
+
+        def _transient(why: str, exc: BaseException | None = None) -> TransientScrapeError:
+            return TransientScrapeError(
+                self.county, "AcclaimWeb", why, record_type=self.active_record_type,
+                date_from=date_from, date_to=date_to,
+                context=str(exc)[:120] if exc else None,
+            )
+
+        self.page.on("request", _on_request)
+        self.page.on("response", _on_response)
         try:
-            # Find the search button
-            search_btn = self.page.locator("#SearchBtn")
-            btn_count = await search_btn.count()
-            _logger.info("SearchBtn count: %d", btn_count)
+            try:
+                async with self.page.expect_response(
+                    lambda r: _ours(r, "GET", _GRID_SHELL_PATH), timeout=30_000,
+                ) as shell_info:
+                    await self._submit_search()
+                shell = await shell_info.value
+                shell_body = await asyncio.wait_for(shell.text(), _PORTAL_TIMEOUT_S)
+            except ScraperExecutionError:
+                raise
+            except Exception as exc:
+                raise _transient("the search never loaded its results grid", exc) from exc
+            if shell.status != 200:
+                raise _transient(f"results grid shell answered HTTP {shell.status}")
+            has_rows = _GRID_DATA_PATH.rsplit("/", 1)[-1] in shell_body.lower()
+            first = None
+            if has_rows:
+                try:
+                    first = await asyncio.wait_for(grid_data, 30)
+                except TimeoutError as exc:
+                    raise _transient("the grid has rows but they never loaded", exc) from exc
+        finally:
+            self.page.remove_listener("request", _on_request)
+            self.page.remove_listener("response", _on_response)
 
-            if btn_count == 0:
-                search_btn = self.page.locator(
-                    "button:has-text('Search'), input[type='submit'][value='Search']"
+        if first is None:
+            page_text = await self.page.inner_text("body")
+            verdict = classify_results_page(
+                row_count=0, page_text=page_text, empty_markers=_EMPTY_MARKERS
+            )
+            if verdict == "block":
+                raise ScraperBlockedError(
+                    self.county, "AcclaimWeb",
+                    f"block wall on results page ({detect_block(page_text)})",
+                    record_type=self.active_record_type, context=page_text[:120],
                 )
-                btn_count = await search_btn.count()
-                _logger.info("Fallback search button count: %d", btn_count)
-
-            if btn_count == 0:
-                body = await self.page.inner_text("body")
+            if verdict != "empty":
                 raise ScraperExecutionError(
                     self.county, "AcclaimWeb",
-                    "no search button found (search never ran)",
-                    record_type=self.active_record_type, context=body[:120],
+                    "grid loaded with no rows and no empty marker (search may have failed)",
+                    record_type=self.active_record_type, date_from=date_from,
+                    date_to=date_to, context=page_text[:120],
                 )
+            _logger.info("No results for %s-%s (verified empty)", date_from, date_to)
+            return []
 
-            await search_btn.first.click()
-            _logger.info("Search button clicked, waiting for results...")
+        if first.status != 200:
+            raise _transient(f"grid rows answered HTTP {first.status}")
+        rows = await self._read_grid_rows(first, date_from, date_to)
+        return self._records_from_raw([_grid_item(r) for r in rows])
 
-            # Wait for results to populate — either Kendo Grid (Douglas, Pend Oreille)
-            # or plain HTML table (Chelan). Use a short timeout (10s) instead of 60s
-            # because Chelan iterates day-by-day and 60s * 30 days = 30 min of wasted
-            # wait time on a selector that Chelan never produces.
-            try:
-                await self.page.wait_for_selector(
-                    "#SearchResultGrid tbody tr, .k-grid-content tr, "
-                    ".no-results, .k-grid-norecords, "
-                    "table.k-grid tbody tr, [data-role='grid'] tbody tr, "
-                    "table tbody tr td:nth-child(5)",  # Chelan plain table: 5+ columns
-                    timeout=10_000,
-                )
-                _logger.info("Results selector found")
-            except Exception:
-                await self.page.wait_for_timeout(3_000)
-                _logger.info("Results selector timeout, continuing anyway")
+    async def _read_grid_rows(self, first, date_from: str, date_to: str) -> list[dict]:
+        """All rows of the search whose first GridResults response is ``first``.
 
-            # (Removed a redundant unconditional 3s Kendo-AJAX wait here — the
-            # event-driven selector wait above plus the loading-indicator wait
-            # below already gate on the grid being populated. Saves ~3s per
-            # day-chunk; Chelan's single-date mode runs ~45 chunks per 45-day run.)
-
-            # Wait for any Kendo loading indicator to disappear
-            try:
-                loading = self.page.locator(".k-loading-mask, .k-loading-image")
-                if await loading.count() > 0:
-                    await loading.first.wait_for(state="hidden", timeout=10_000)
-                    _logger.info("Kendo loading indicator cleared")
-            except Exception:
-                pass
-
-            # Log page state after search
-            body = await self.page.inner_text("body")
-            _logger.info("After search URL: %s", self.page.url)
-            _logger.debug("After search text: %d chars", len(body))  # P0-04
-
-        except ScraperExecutionError:
-            raise
-        except Exception as exc:
-            raise ScraperExecutionError(
-                self.county, "AcclaimWeb", "search submit failed",
-                record_type=self.active_record_type, context=str(exc)[:120],
-            ) from exc
-
-    async def _extract_all_pages(self) -> list[ScrapedRecord]:
-        """Extract records from all result pages in the Kendo Grid."""
-        all_records: list[ScrapedRecord] = []
-        seen_hashes: set[str] = set()
-        page_num = 0
-        max_pages = 50
-
-        while page_num < max_pages:
-            page_num += 1
-
-            # Bounded retry on a transient extraction failure, then fail loud.
-            records = None
-            last_exc: ScraperExecutionError | None = None
-            for attempt in range(1, 4):
-                try:
-                    records = await self._extract_page(page_num)
-                    break
-                except ScraperExecutionError as exc:
-                    last_exc = exc
-                    _logger.warning(
-                        "Page %d extract attempt %d/3 failed: %s",
-                        page_num, attempt, str(exc)[:100],
-                    )
-                    if attempt < 3:
-                        await self.page.wait_for_timeout(1_500 * attempt)
-            if records is None:
-                raise last_exc or ScraperExecutionError(
-                    self.county, "AcclaimWeb",
-                    "page extraction failed after retries (no recorded cause)",
-                    record_type=self.active_record_type, page=page_num,
-                )
-
-            new_count = self.dedupe_extend(records, seen_hashes, all_records)
-            _logger.info("Page %d — %d new records (total: %d)", page_num, new_count, len(all_records))
-
-            if new_count == 0:
-                break
-
-            has_next = await self._go_next_page()
-            if not has_next:
-                break
-
-            pass
-
-        return all_records
-
-    async def _extract_page(self, page_num: int = 1) -> list[ScrapedRecord]:
-        """Extract records from the current Kendo Grid results page.
-
-        AcclaimWeb renders results in a Kendo Grid with standard columns:
-        Instrument #, Record Date, Doc Type, Grantor, Grantee, Legal Description
+        Chelan's grid asks for one page (``page=1&size=N`` -> ``{"data", "total"}``);
+        the rest are asked the same way with the page number changed. Douglas's asks
+        for everything at once (no page field -> ``{"Data", "Total"}``).
         """
+        def _fail(why: str) -> ScraperExecutionError:
+            return ScraperExecutionError(
+                self.county, "AcclaimWeb", why, record_type=self.active_record_type,
+                date_from=date_from, date_to=date_to,
+            )
+
+        def _total_rows(body) -> tuple[object, object]:
+            if not isinstance(body, dict):
+                return None, None
+            return body.get("total", body.get("Total")), body.get("data", body.get("Data"))
+
+        def _transient(why: str, exc: BaseException | None = None) -> TransientScrapeError:
+            return TransientScrapeError(
+                self.county, "AcclaimWeb", why, record_type=self.active_record_type,
+                date_from=date_from, date_to=date_to, context=str(exc)[:120] if exc else None,
+            )
+
+        try:
+            first_text = await asyncio.wait_for(first.text(), _PORTAL_TIMEOUT_S)
+        except Exception as exc:  # the body never arrived: worth a re-run
+            raise _transient("grid rows could not be read", exc) from exc
+        try:
+            total, rows = _total_rows(json.loads(first_text))
+        except ValueError as exc:
+            raise _fail("grid rows were not JSON") from exc
+        if not isinstance(total, int) or not isinstance(rows, list):
+            raise _fail("grid rows had no total/data")
+        if total <= 0:
+            # The shell bound a grid (it has rows) and the rows say none: not a zero we
+            # verified. Zero comes only from a shell with no grid binding.
+            raise _fail("the grid was bound but reported no rows")
+        form = dict(parse_qsl(first.request.post_data or ""))
+        page = 1
+        while len(rows) < total:
+            if "page" not in form:
+                raise _fail(f"read {len(rows)} grid rows of {total} and the grid is not paged")
+            page += 1
+            if page > _MAX_GRID_PAGES:
+                raise _fail(f"more than {_MAX_GRID_PAGES} grid pages")
+            form["page"] = str(page)
+            try:
+                status, text = await asyncio.wait_for(self.page.evaluate(
+                    """async ([url, body, ms]) => {
+                        const r = await fetch(url, {method: 'POST', body,
+                            signal: AbortSignal.timeout(ms), headers: {
+                            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                            'X-Requested-With': 'XMLHttpRequest'}});
+                        return [r.status, await r.text()];
+                    }""",
+                    [first.url, urlencode(form), _PORTAL_TIMEOUT_S * 1000],
+                ), _PORTAL_TIMEOUT_S + 5)
+            except Exception as exc:  # the fetch failed or hung (network): worth a re-run
+                raise _transient(f"grid page {page} request failed", exc) from exc
+            if status != 200:
+                raise _transient(f"grid page {page} answered HTTP {status}")
+            try:
+                more_total, more = _total_rows(json.loads(text))
+            except ValueError:
+                more_total, more = None, None
+            if more_total != total or not isinstance(more, list) or not more:
+                raise _fail(f"grid page {page} unreadable or changed")
+            rows.extend(more)
+
+        if not all(isinstance(r, dict) for r in rows):
+            raise _fail("grid row is not an object (schema drift)")
+        ids = {r.get("TransactionItemId") for r in rows}
+        if len(rows) != total or len(ids) != total:
+            raise _fail(f"read {len(rows)} grid rows ({len(ids)} distinct) of {total}")
+        lo = datetime.strptime(date_from, "%m/%d/%Y").date()
+        hi = datetime.strptime(date_to, "%m/%d/%Y").date()
+        for r in rows:
+            day = _grid_date(r.get("RecordDate"))
+            if not r.get("InstrumentNumber") or day is None:
+                raise _fail("grid row without an instrument number or record date (schema drift)")
+            if not lo <= datetime.strptime(day, "%m/%d/%Y").date() <= hi:
+                raise _fail("grid row dated outside the searched days (stale results)")
+        _logger.info("Read %d of %d grid rows for %s-%s", len(rows), total, date_from, date_to)
+        return rows
+
+    def _records_from_raw(self, raw: list[dict]) -> list[ScrapedRecord]:
+        """Grid rows -> leads of the active record type (other types are dropped)."""
         records: list[ScrapedRecord] = []
 
         try:
-            # First, log grid diagnostic info
-            diag = await self.page.evaluate("""
-                (() => {
-                    const d = {
-                        has_jquery: typeof $ !== 'undefined',
-                        grid_el: !!document.querySelector('#SearchResultGrid'),
-                        grid_rows: document.querySelectorAll('#SearchResultGrid tbody tr, .k-grid-content tbody tr').length,
-                        all_tables: document.querySelectorAll('table').length,
-                        all_trs: document.querySelectorAll('table tbody tr').length,
-                    };
-                    if (d.has_jquery) {
-                        const grid = $('#SearchResultGrid').data('kendoGrid');
-                        d.has_kendo_grid = !!grid;
-                        if (grid) {
-                            const view = grid.dataSource.view();
-                            d.kendo_view_len = view ? view.length : 0;
-                            d.kendo_total = grid.dataSource.total();
-                            if (view && view.length > 0) {
-                                d.first_row_keys = Object.keys(view[0]).filter(k => !k.startsWith('_'));
-                            }
-                        }
-                    }
-                    return d;
-                })()
-            """)
-            _logger.info("Grid diagnostics: %s", diag)
-
-            raw = await self.page.evaluate("""
-                (() => {
-                    // Try Kendo Grid data first (most reliable)
-                    if (typeof $ !== 'undefined') {
-                        const grid = $('#SearchResultGrid').data('kendoGrid');
-                        if (grid) {
-                            const data = grid.dataSource.view();
-                            if (data && data.length > 0) {
-                                return Array.from(data).map(item => ({
-                                    instrument: item.InstrumentNumber || item.Instrument || item.AFN || item.instrumentNumber || '',
-                                    date_recorded: item.RecordDate || item.RecordingDate || item.recordDate || item.RecordedDate || '',
-                                    doc_type: item.DocType || item.DocumentType || item.DocTypeName || item.docType || item.DocumentDescription || '',
-                                    grantor: item.Grantor || item.GrantorName || item.grantor || item.DirectName || '',
-                                    grantee: item.Grantee || item.GranteeName || item.grantee || item.IndirectName || '',
-                                    legal: item.LegalDescription || item.Legal || item.legalDescription || '',
-                                    parcel: item.ParcelId || item.Parcel || item.APN || item.parcelId || '',
-                                }));
-                            }
-                        }
-
-                        // Try alternate grid selectors
-                        const altGrids = ['.k-grid', '[data-role="grid"]', '#resultsGrid', '#searchResults'];
-                        for (const sel of altGrids) {
-                            const el = $(sel).data('kendoGrid');
-                            if (el) {
-                                const data = el.dataSource.view();
-                                if (data && data.length > 0) {
-                                    return Array.from(data).map(item => {
-                                        const keys = Object.keys(item).filter(k => !k.startsWith('_'));
-                                        return {
-                                            instrument: item[keys.find(k => /instrument|afn/i.test(k))] || '',
-                                            date_recorded: item[keys.find(k => /date|record/i.test(k))] || '',
-                                            doc_type: item[keys.find(k => /doc.*type|document/i.test(k))] || '',
-                                            grantor: item[keys.find(k => /grantor|direct/i.test(k))] || '',
-                                            grantee: item[keys.find(k => /grantee|indirect/i.test(k))] || '',
-                                            legal: item[keys.find(k => /legal/i.test(k))] || '',
-                                            parcel: item[keys.find(k => /parcel|apn/i.test(k))] || '',
-                                        };
-                                    });
-                                }
-                            }
-                        }
-                    }
-
-                    // Fallback 1: Kendo-style selectors (for standard deployments)
-                    let rows = document.querySelectorAll(
-                        '#SearchResultGrid tbody tr, .k-grid-content tbody tr, table.k-grid tbody tr'
-                    );
-                    if (rows.length) {
-                        return Array.from(rows).map(row => {
-                            const cells = row.querySelectorAll('td');
-                            if (cells.length < 4) return null;
-                            return {
-                                instrument: (cells[0] || {}).textContent?.trim() || '',
-                                date_recorded: (cells[1] || {}).textContent?.trim() || '',
-                                doc_type: (cells[2] || {}).textContent?.trim() || '',
-                                // Party cells: return innerHTML so structural
-                                // separators (<br>/<div>) between stacked owners
-                                // survive to Python's normalize_party_text().
-                                // textContent would concatenate co-owners.
-                                grantor: (cells[3] || {}).innerHTML?.trim() || '',
-                                grantee: (cells[4] || {}).innerHTML?.trim() || '',
-                                legal: (cells[5] || {}).textContent?.trim() || '',
-                                parcel: '',
-                            };
-                        }).filter(r => r !== null);
-                    }
-
-                    // Fallback 2: header-aware scan of every table on the page.
-                    // Chelan County and other non-Kendo AcclaimWeb deployments
-                    // render results as a plain HTML table. Find the widest
-                    // table whose header row contains recognisable AcclaimWeb
-                    // column names, then map each data row by column index.
-                    const tables = Array.from(document.querySelectorAll('table'));
-                    const HEADER_SYNONYMS = {
-                        instrument: /^(afn|instrument|document.?no|doc.?no|number|inst)/i,
-                        date_recorded: /(record.*date|recorded|date.*record|filing.*date|date$)/i,
-                        doc_type: /(doc.*type|document.*type|type)/i,
-                        grantor: /(grantor|direct|from)/i,
-                        grantee: /(grantee|indirect|to)/i,
-                        legal: /(legal|description|desc)/i,
-                    };
-                    let best = null;
-                    for (const t of tables) {
-                        const headerCells = Array.from(
-                            t.querySelectorAll('thead tr th, thead tr td, tr:first-child th, tr:first-child td')
-                        );
-                        if (headerCells.length < 4) continue;
-                        const headers = headerCells.map(c => (c.textContent || '').trim().toLowerCase());
-                        const colMap = {};
-                        for (const [key, pattern] of Object.entries(HEADER_SYNONYMS)) {
-                            const idx = headers.findIndex(h => pattern.test(h));
-                            if (idx >= 0) colMap[key] = idx;
-                        }
-                        // Require at least date + grantor + doc_type for a valid match
-                        if (colMap.date_recorded == null || colMap.grantor == null) continue;
-                        const bodyRows = t.querySelectorAll('tbody tr');
-                        // Require >=2 body rows — Chelan's filter-bar table has
-                        // header cells AND 1 body row (the filter inputs), which
-                        // tricks us into picking it over the real data table.
-                        if (bodyRows.length < 2) continue;
-                        if (!best || bodyRows.length > best.rows.length) {
-                            best = { table: t, rows: bodyRows, colMap };
-                        }
-                    }
-                    if (best) {
-                        return Array.from(best.rows).map(row => {
-                            const cells = row.querySelectorAll('td');
-                            if (cells.length < 3) return null;
-                            const getCell = k => best.colMap[k] != null && cells[best.colMap[k]]
-                                ? (cells[best.colMap[k]].textContent || '').trim() : '';
-                            // Party cells: read innerHTML so structural separators
-                            // (<br>/<div>) between stacked owners survive to
-                            // Python's normalize_party_text(). textContent would
-                            // concatenate co-owners.
-                            const getCellHtml = k => best.colMap[k] != null && cells[best.colMap[k]]
-                                ? (cells[best.colMap[k]].innerHTML || '').trim() : '';
-                            const r = {
-                                instrument: getCell('instrument'),
-                                date_recorded: getCell('date_recorded'),
-                                doc_type: getCell('doc_type'),
-                                grantor: getCellHtml('grantor'),
-                                grantee: getCellHtml('grantee'),
-                                legal: getCell('legal'),
-                                parcel: '',
-                            };
-                            // Filter out header / summary / pager rows
-                            if (!r.date_recorded && !r.grantor && !r.instrument) return null;
-                            return r;
-                        }).filter(r => r !== null);
-                    }
-                    // Fallback 3: Chelan-style headless data table.
-                    // Chelan County AcclaimWeb renders the filter bar as a
-                    // separate <table> with header cells, and the ACTUAL data
-                    // in a second <table> with NO <thead> and NO <th> cells.
-                    // Detect by finding a table with 7+ td cells per body row
-                    // and no headers, then map by AcclaimWeb's known column
-                    // order: [View, Row#, Grantor, Grantee, AFN, RecordDate,
-                    // Book/Page, DocType, DocLegal].
-                    for (const t of tables) {
-                        const bodyRows = Array.from(t.querySelectorAll('tbody tr'));
-                        if (bodyRows.length < 2) continue;
-                        const firstCells = bodyRows[0].querySelectorAll('td');
-                        if (firstCells.length < 7) continue;
-                        // Skip if this table HAS proper headers (was already checked above)
-                        const ths = t.querySelectorAll('thead th, tr:first-child th');
-                        if (ths.length >= 4) continue;
-                        return bodyRows.map(row => {
-                            const cells = row.querySelectorAll('td');
-                            if (cells.length < 7) return null;
-                            // AcclaimWeb column order (0-indexed):
-                            // 0=View 1=Row# 2=Grantor 3=Grantee 4=AFN 5=Date 6=Book/Page 7=DocType 8=Legal
-                            return {
-                                instrument: (cells[4] || {}).textContent?.trim() || '',
-                                date_recorded: (cells[5] || {}).textContent?.trim() || '',
-                                doc_type: (cells[7] || {}).textContent?.trim() || '',
-                                // Party cells: innerHTML so stacked-owner
-                                // separators survive to normalize_party_text().
-                                grantor: (cells[2] || {}).innerHTML?.trim() || '',
-                                grantee: (cells[3] || {}).innerHTML?.trim() || '',
-                                legal: (cells[8] || {}).textContent?.trim() || '',
-                                parcel: '',
-                            };
-                        }).filter(r => r !== null && (r.date_recorded || r.grantor));
-                    }
-                    return [];
-                })()
-            """)
-
-            if not raw:
-                if page_num == 1:
-                    page_text = await self.page.inner_text("body")
-                    verdict = classify_results_page(
-                        row_count=0, page_text=page_text, empty_markers=_EMPTY_MARKERS
-                    )
-                    if verdict == "block":
-                        raise ScraperBlockedError(
-                            self.county, "AcclaimWeb",
-                            f"block wall on results page ({detect_block(page_text)})",
-                            record_type=self.active_record_type, page=page_num,
-                            context=page_text[:120],
-                        )
-                    if verdict == "ambiguous":
-                        raise ScraperExecutionError(
-                            self.county, "AcclaimWeb",
-                            "no result rows and no empty-marker (search may have "
-                            "silently failed / been blocked)",
-                            record_type=self.active_record_type, page=page_num,
-                            context=page_text[:120],
-                        )
-                    _logger.info("No results for this chunk (genuine empty window)")
-                return []
-
             for item in raw:
                 if not item:
                     continue
@@ -880,6 +864,9 @@ class AcclaimWebScraper(BridgeScraper):
                 # depend on the legal_description we're now changing.
                 inst = item.get("instrument", "").strip()
                 record.enrichment_data = {"instrument_number": inst, "source": "acclaimweb"}
+                if self.READS_DETAIL_APN and item.get("item_id"):
+                    # Only where the APN is read: a new key changes the row hash below.
+                    record.enrichment_data["source_document_id"] = item["item_id"]
 
                 # Date recorded — normalize various date formats
                 date_str = item.get("date_recorded", "").strip()
@@ -910,7 +897,7 @@ class AcclaimWebScraper(BridgeScraper):
                     if not doc_type or not is_divorce_doc(doc_type, precise_source=False):
                         continue
                 elif active_rt:
-                    keywords = self._doc_type_keyword_override or _DOC_TYPE_MAP.get(active_rt, [])
+                    keywords = self._doc_type_keyword_override or self.DOC_TYPE_MAP.get(active_rt, [])
                     if keywords:
                         if not doc_type or not _doc_type_matches(doc_type, keywords):
                             continue
@@ -939,7 +926,7 @@ class AcclaimWebScraper(BridgeScraper):
                     if oriented is None:
                         continue
                     record.party_name, record.heirs = oriented
-                elif active_rt == "probate":
+                elif active_rt in ("probate", "death_certificate"):
                     # Death certs index the issuing agency / filing state as
                     # grantor, with the DECEDENT as grantee; promote the decedent
                     # and strip "Estate of" captions. No-op when grantor is the
@@ -985,158 +972,109 @@ class AcclaimWebScraper(BridgeScraper):
                 if record.party_name or record.date_recorded:
                     records.append(record)
 
-            _logger.info("Extracted %d records from page", len(records))
+            _logger.info("%d %s records from %d grid rows", len(records), self.active_record_type, len(raw))
 
         except ScraperExecutionError:
             raise  # block / ambiguous — propagate, never silent []
         except Exception as exc:
             raise ScraperExecutionError(
-                self.county, "AcclaimWeb", "page extraction failed",
-                record_type=self.active_record_type, page=page_num,
-                context=str(exc)[:120],
+                self.county, "AcclaimWeb", "grid row processing failed",
+                record_type=self.active_record_type, context=str(exc)[:120],
             ) from exc
 
         return records
 
-    # County assessor (PACS) URLs for address lookup by owner name.
-    # Tyler PropertyAccess is used by many WA counties. Douglas is NOT one of them:
-    # pacs.co.douglas.wa.us does not resolve, and its assessor runs TerraScan
-    # TaxSifter, looked up through src/scrapers/enrichment/taxsifter.py instead.
-    _PACS_URLS = {
-        "chelan": "https://pacs.co.chelan.wa.us/PropertyAccess/?cid=90",
-    }
+    async def _read_parcels(self, records: list[ScrapedRecord]) -> None:
+        """Set each lead's parcel from its own recording (the detail page's "APN").
 
-    async def _lookup_pacs_addresses(self, records: list[ScrapedRecord]) -> None:
-        """Look up property addresses from county assessor (PACS) by owner name.
+        The parcel then drives the existing parcel-keyed enrichment (statewide GIS
+        situs, PACS mailing): evidence from the recorded document, not a guess from an
+        owner's name. Outcome per row (enrichment_data["recording_apn_lookup"]):
 
-        Uses HTTP POST to the Tyler PropertyAccess search — no browser needed.
-        Concurrent lookups, 5 at a time to be respectful.
+        - found: exactly one APN of the site's shape -> parcel_id.
+        - ambiguous: several candidates, or one of another shape -> no parcel; the
+          candidates are kept for review. Which parcel the lead is about is not ours
+          to pick.
+        - none: the recording names no parcel (a death certificate) -> the owner-name
+          fallback in enrichment may look the person up.
+
+        A page that cannot be read, after one retry, RAISES TransientScrapeError (a
+        403/429 raises ScraperBlockedError) before anything is saved: the worker re-runs
+        the job. A row is never saved half-read, because a re-run of the same job could
+        not repair it (same fingerprint) and a later run would give the same recording
+        a second identity (Codex 2b). One request per recording, paced.
         """
-        from concurrent.futures import ThreadPoolExecutor
-        from urllib.parse import urlparse
+        by_doc: dict[str, list[ScrapedRecord]] = {}
+        for r in records:
+            doc_id = (r.enrichment_data or {}).get("source_document_id")
+            if doc_id and not r.parcel_id:
+                by_doc.setdefault(doc_id, []).append(r)
 
-        pacs_url = self._PACS_URLS.get(self.county.lower())
-        if not pacs_url:
-            from src.scrapers.enrichment.taxsifter import TAXSIFTER_ORIGINS
-            if self.county.lower() in TAXSIFTER_ORIGINS:
-                await self._lookup_taxsifter_addresses(records)
-                return
-            _logger.info("No PACS URL for %s — skipping address lookup", self.county)
+        for i, (doc_id, recs) in enumerate(by_doc.items()):
+            if i:
+                await asyncio.sleep(_DETAIL_PACE_S)
+            url = f"{self.base_url}/details/documentdetails/{doc_id}/1/1/11"
+            apns: list[str] | None = None
+            why = ""
+            for attempt in (1, 2):
+                if attempt == 2:
+                    await asyncio.sleep(_DETAIL_PACE_S * 2)
+                try:
+                    # From the page, not page.request: an in-page fetch passes the
+                    # context's SSRF route guard and carries the portal session.
+                    status, page_html = await asyncio.wait_for(self.page.evaluate(
+                        """async ([url, ms]) => {
+                            const r = await fetch(url, {signal: AbortSignal.timeout(ms)});
+                            return [r.status, await r.text()];
+                        }""",
+                        [url, _PORTAL_TIMEOUT_S * 1000],
+                    ), _PORTAL_TIMEOUT_S + 5)
+                except Exception as exc:  # noqa: BLE001 -- retried, then raised below
+                    status, page_html, why = 0, "", type(exc).__name__
+                if status in (403, 429):
+                    raise ScraperBlockedError(
+                        self.county, "AcclaimWeb", f"recording detail page refused (HTTP {status})",
+                        record_type=self.active_record_type,
+                    )
+                apns = parse_detail_apns(page_html) if status == 200 else None
+                if apns is not None:
+                    break
+                why = "not a detail page" if status == 200 else (why or f"HTTP {status}")
+            if apns is None:
+                raise TransientScrapeError(
+                    self.county, "AcclaimWeb", f"recording detail page unreadable ({why})",
+                    record_type=self.active_record_type,
+                )
+            if not apns:
+                outcome = "none"
+            elif len(apns) == 1 and self.APN_SHAPE.fullmatch(apns[0]):
+                outcome = "found"
+            else:
+                outcome = "ambiguous"
+            for rec in recs:
+                rec.enrichment_data[_APN_LOOKUP_KEY] = outcome
+                if outcome == "found":
+                    rec.parcel_id = apns[0]
+                elif outcome == "ambiguous":
+                    rec.enrichment_data["apn_candidates"] = apns
+        if by_doc:
+            outcomes = [r.enrichment_data[_APN_LOOKUP_KEY] for rs in by_doc.values() for r in rs]
+            _logger.info("Recording APN: %s", {o: outcomes.count(o) for o in sorted(set(outcomes))})
+
+    async def _lookup_addresses_by_owner(self, records: list[ScrapedRecord]) -> None:
+        """In-scrape owner-name address lookup, for a TerraScan TaxSifter county (Douglas).
+
+        Chelan has none here: its leads carry the recording's own APN (_read_parcels),
+        and its PACS owner-name fallback runs after save in enrichment, paced and behind
+        the restricted-source switch (KNOWN_ASSESSOR_URLS). The lookup that used to run
+        here posted without the portal's search mode, so it never found anyone.
+        """
+        from src.scrapers.enrichment.taxsifter import TAXSIFTER_ORIGINS
+
+        if self.county.lower() not in TAXSIFTER_ORIGINS:
+            _logger.info("No owner-name address source for %s in the scrape", self.county)
             return
-
-        _logger.info("Looking up addresses for %d records via PACS (%s)...", len(records), self.county)
-
-        # M8 SSRF hardening (mirrors src/scrapers/enrichment/pacs.py): pacs_url is a
-        # static trusted constant, but validate defense-in-depth before any outbound
-        # request — refuse non-HTTPS, and resolve=True rejects a host that resolves
-        # to a private/loopback/metadata IP. Every request below goes through a
-        # pinned session (audit #5 5b-ii: resolved once, refused if any answer is
-        # blocked, connected to the checked address, so a rebinding answer after
-        # this validation cannot reach an internal host; no ambient proxy) with
-        # allow_redirects=False (a poisoned 3xx can't bounce to an internal host;
-        # PACS posts back to the same URL, so there is no legitimate redirect).
-        # Validated once here because the same pacs_url is reused by the init
-        # session and every per-lookup session.
-        if urlparse(pacs_url).scheme != "https":
-            _logger.warning("PACS lookup refused non-HTTPS URL for %s", self.county)
-            return
-        try:
-            validate_scraping_target(pacs_url, require_allowlisted=False, resolve=True)
-        except Exception as exc:
-            _logger.warning("PACS URL failed SSRF validation: %s", str(exc)[:80])
-            return
-
-        # Get initial page for VIEWSTATE
-        sess = pinned_session()
-        sess.headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0"
-        try:
-            init = sess.get(pacs_url, timeout=10, allow_redirects=False)
-        except Exception as exc:
-            _logger.warning("PACS init failed: %s", str(exc)[:80])
-            return
-
-        # The init page is fetched only to confirm VIEWSTATE is present; each
-        # per-name lookup below re-fetches and parses its own VIEWSTATE tokens.
-        vs_match = re.search(r'__VIEWSTATE.*?value="([^"]+)"', init.text)
-        if not vs_match:
-            _logger.warning("PACS: no VIEWSTATE found")
-            return
-
-        def _lookup_one(name: str) -> dict | None:
-            """Search PACS by owner name, return {address, mailing, value} or None.
-
-            parcel_id is intentionally NOT returned (owner-name match is weak
-            evidence — see parse_pacs_result_html / Codex point C)."""
-            try:
-                # Each lookup needs its own session (shared sessions cause
-                # VIEWSTATE conflicts under concurrency). Pinned + allow_redirects=
-                # False; pacs_url already SSRF-validated above.
-                _s = pinned_session()
-                _s.headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0"
-                r0 = _s.get(pacs_url, timeout=8, allow_redirects=False)
-                vs = re.search(r'__VIEWSTATE.*?value="([^"]+)"', r0.text)
-                ev = re.search(r'__EVENTVALIDATION.*?value="([^"]+)"', r0.text)
-                vsg = re.search(r'__VIEWSTATEGENERATOR.*?value="([^"]+)"', r0.text)
-                if not vs:
-                    return None
-
-                data = {
-                    "__VIEWSTATE": vs.group(1),
-                    "__EVENTVALIDATION": ev.group(1) if ev else "",
-                    "__VIEWSTATEGENERATOR": vsg.group(1) if vsg else "",
-                    "propertySearchOptions$ownerName": name,
-                    "propertySearchOptions$search": "Search",
-                }
-                r = _s.post(pacs_url, data=data, timeout=10, allow_redirects=False)
-                if r.status_code != 200:
-                    return None
-
-                # Check for "None found"
-                if "None found" in r.text:
-                    return None
-
-                # Shared hardened parser (Codex point C): requires exactly ONE
-                # plausible result row and never returns parcel_id — an owner-name
-                # match is weak evidence and parcel_id is the identity/dedup/billing
-                # key. Replaces the old flatten-all-rows / first-10-digit-cell parse
-                # that could trust row 1 of an ambiguous match (and mislabel the
-                # account number as the parcel).
-                result = parse_pacs_result_html(r.text, name)
-                if result and result.get("prop_id"):
-                    # The grid's address cell is the situs; the owner's mailing
-                    # address lives only on the detail page, under its own label.
-                    mailing = mailing_from_detail(_s, pacs_url, result.pop("prop_id"), timeout=10)
-                    if mailing:
-                        result["mailing"] = mailing
-                elif result:
-                    result.pop("prop_id", None)
-                return result
-            except Exception:
-                return None
-
-        # Run lookups concurrently (5 at a time)
-        found = 0
-        loop = asyncio.get_event_loop()
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            for batch_start in range(0, len(records), 20):
-                batch = records[batch_start:batch_start + 20]
-                tasks = [loop.run_in_executor(executor, _lookup_one, r.party_name) for r in batch]
-                results_list = await asyncio.gather(*tasks, return_exceptions=True)
-
-                for record, result in zip(batch, results_list, strict=False):
-                    if isinstance(result, dict) and result:
-                        if result.get("address"):
-                            record.property_address = result["address"]
-                        if result.get("mailing"):
-                            record.mailing_address = result["mailing"]
-                        # parcel_id intentionally NOT set from owner-name PACS
-                        # lookup (Codex point C — weak evidence, identity key).
-                        if result.get("value"):
-                            record.enrichment_data = record.enrichment_data or {}
-                            record.enrichment_data["assessed_value"] = result["value"]
-                        found += 1
-
-        _logger.info("PACS lookup: found addresses for %d/%d records", found, len(records))
+        await self._lookup_taxsifter_addresses(records)
 
     async def _lookup_taxsifter_addresses(self, records: list[ScrapedRecord]) -> None:
         """The PACS lookup's counterpart for a TerraScan TaxSifter county (Douglas).
@@ -1150,33 +1088,24 @@ class AcclaimWebScraper(BridgeScraper):
 
         await fill_addresses_by_owner(self.county, records)
 
-    async def _go_next_page(self) -> bool:
-        """Click the Next page button in the Kendo pager."""
-        try:
-            # Kendo pager next button
-            next_btn = self.page.locator(
-                ".k-pager-nav[title='Go to the next page'], "
-                "a[title='Next page'], "
-                "button[title='Next page'], "
-                ".k-i-arrow-e, "
-                "a.k-link:has-text('>')"
-            )
-            if await next_btn.count() > 0:
-                first = next_btn.first
-                # Check if disabled
-                disabled = await first.get_attribute("disabled")
-                cls = await first.get_attribute("class") or ""
-                if disabled or "k-disabled" in cls or "disabled" in cls.lower():
-                    return False
 
-                # Check parent for disabled state
-                parent_cls = await first.evaluate("el => el.parentElement?.className || ''")
-                if "k-disabled" in parent_cls:
-                    return False
+class ChelanAcclaimWebScraper(AcclaimWebScraper):
+    """Chelan County's AcclaimWeb: same portal, its own document codes."""
 
-                await first.click()
-                await self.page.wait_for_timeout(3_000)
-                return True
-        except Exception:
-            pass
-        return False
+    DOC_TYPE_MAP = _CHELAN_DOC_TYPE_MAP
+    READS_DETAIL_APN = True
+    APN_SHAPE = re.compile(r"\d{12}")  # Chelan parcel numbers: 12 digits
+
+    @classmethod
+    def collection_scope(cls, record_type: str):
+        """The shared keyword presentation has no death_certificate entry; Chelan's is
+        the recorder's own DEATH CERTIFICATE (DC) document type, shown as King's is."""
+        if record_type != "death_certificate":
+            return super().collection_scope(record_type)
+        from src.scrapers.doc_scope import CollectionScope, DocTypeItem
+
+        return CollectionScope(
+            kind="document_type",
+            items=(DocTypeItem(label="Death Certificate", exact=False),),
+            note="Recorded death certificates (the recorder's DC document code).",
+        )

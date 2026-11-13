@@ -19,6 +19,64 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-11-12 — Chelan: why it never delivered a lead, and the seven-type audit (branch `feat/chelan-seven-record-types`)
+
+**Built / Shipped (branch only, not pushed):** `06b9ede4` AcclaimWeb reads every row of every search
+from the responses that search caused (POST `/Search/GridResults`: Chelan paged `{data,total}`,
+Douglas unpaged `{Data,Total}`), with Chelan's own document codes. `65ab961f` Chelan leads get their
+parcel from their own recording's detail page ("DocLegal: APN …"); the broken in-template PACS
+owner lookup is deleted. `9d9a6d8f` Chelan `death_certificate` (recorder "DC"), code only. Plan,
+matrix and evidence: `tasks/chelan-wa-seven.md`.
+
+**Tried / Decided:** Response-driven reading instead of fixing the DOM pager: both portals bind
+their grid to the same JSON endpoint, so one path covers Telerik (Chelan) and Kendo (Douglas).
+Only requests issued after our click count (Playwright request identity). Zero is accepted only
+from a successful grid shell with no grid binding plus the empty marker. A Chelan subclass routed
+by exact host (not a per-county branch in the shared class), so `collection_scope` and the
+doc-type partition test stay truthful. Parcel from the recording (APN), not the owner's name:
+the recording's own evidence, and it feeds the existing statewide-GIS and PACS-parcel enrichment
+unchanged. Douglas's grid carries a `ParcelNumber` too; deliberately NOT mapped (parcel is a
+dedup/billing key, and Douglas leads were keyed without it). A recording page that cannot be read
+fails the run (transient) instead of saving a half-read row: a same-job re-run cannot repair a
+saved row (same fingerprint, insert-if-absent), and a later run would give the recording a
+second identity. Codex rounds: 2a NO-GO x3 then GO; 2b NO-GO x2 then GO; Phase 3 GO.
+
+**Failed / Blocked:** trustee_sale needs OCR (sale date only in scan-only PDF images; no OCR
+dependency in the repo). tax_delinquent: the Treasurer publishes a once-a-year pre-sale list
+(13 parcels, updated 11/09/2026) plus per-parcel PACS balances; the county terms of use forbid
+"any for-profit commercial purpose or use" without written consent and Public Surplus forbids
+robots, so both wait on the owner's legal call. Divorce and court probate: Clerk OnBase is a paid
+subscription; the recorder has no dissolution document type. Code violation: no public case-level
+data in the county (complaint form; SmartGov public side shows no cases and its robots.txt
+disallows Parcels/Reports) or any of the five cities. Docker/Redis not running locally, so the
+Redis-dependent suites fail locally on main and on the branch alike (compared: none new).
+
+**Caught & fixed:** NOD is NOTICE OF DISCONTINUANCE in Chelan (a cancelled foreclosure was being
+sold as pre-foreclosure); lis pendens shows as `LP`; `AFFD` is any affidavit. The stale grid read
+(asked 10/07, got 10/06), the pager that never advanced (11 of ~43 rows a day), paging that stopped
+at the first page with no row of the wanted type, single-date mode skipping `date_to`. A hidden
+HelpButton matching `button:has-text('Search')`. `page.request` bypasses the context SSRF route
+guard (moved to an in-page fetch). APN parsing that kept only the first of `111 &amp; 222`. The
+death certificate detail page (no legal) being read as a failure. Douglas failing open for a
+record type it has no vocabulary for.
+
+**Pending / Handoff (owner):** push/PR/merge/deploy of the three commits. Activation decisions:
+add `death_certificate` to the Chelan connector; whether TOD (living owner) leads are wanted (6 of
+7 Chelan probate leads in Oct 1–12 were TODs). Owner verification for Chelan probate/NTS: the
+assessor's current owner is never stored for Chelan (PACS licensing note), so `current_owner` /
+`title_status` stay blank (Codex P2). Legal review of the county terms for the tax list; an OCR
+dependency decision for trustee_sale. Test DB `bridgeleads_chelan_test` (local) can be dropped.
+
+**Facts learned:** Chelan AcclaimWeb banner "Released through 08/10/2026" yet September/October
+documents are indexed and viewable. Chelan PACS cid=90 is the Treasurer view, cid=91 the Assessor.
+Both AcclaimWeb portals answer POST `/Search/GridResults`; a non-empty grid shell embeds the string
+`GridResults`, an empty one does not. Chelan detail page `/details/documentdetails/{TransactionItemId}/1/1/11`
+shows "DocLegal: APN <12 digits> …"; NTS pages also name the Borrower and the related DT; DC pages
+show Agency and Deceased only. NTS PDFs are free at `/Image/DocumentPdfAllPages/{TransactionItemId}`
+(1-bit 300 dpi scans, no text layer).
+
+---
+
 ## 2026-11-12 — Benton County: audit + five new record types (branch feat/benton-wa-seven-record-types, NOT pushed)
 
 **Built / Shipped:** local commits only, worktree `C:/Users/micha/bl-wt/benton-7`, nothing pushed or deployed.
@@ -65,6 +123,7 @@ and sometimes reads date slashes as digits. Benton probate == recorded Cert Of D
 year balances, owner and mailing. Only 1 Benton prod job had ever run (probate, 2026-10-02); pre_foreclosure never.
 
 ---
+
 ## 2026-11-12 — Clallam: two broken integrations fixed, death certificates and tax foreclosure built
 
 **Built / Shipped:** branch `feat/clallam-seven-record-types` (local, not pushed), on top of the
@@ -104,6 +163,8 @@ cell; a document-number search lists the notice and every discontinuance citing 
 is "Writ of Exec", `SUCC` is "Sat of UCC-2", `LETTR` is "Letter". The PACS page shows unpaid tax by
 year, or "There is currently No Amount Due on this property".
 
+---
+
 ## 2026-11-12 — Asotin County: auction leads, tax delinquency, assessor enrichment (branch only)
 
 **Built / Shipped:** branch `feat/asotin-wa-seven-record-types` (worktree `bl-wt/asotin-7`), NOT
@@ -141,6 +202,8 @@ Aztec sale at its original past date (now the latest "continued … to <date>").
 **Facts learned:** the WA statewide parcel layer publishes Asotin with FIPS_NR NULL, not '003'
 (13,629 parcels) — Asotin situs lookups returned nothing until fixed. Asotin PACS shows only the
 last three tax years. nwmarket's sitemap repeats ~100 adverts.
+
+---
 
 ## 2026-11-10 — Compliance: everything merged and switched on (retention, re-acceptance, DROP foundation, live form)
 

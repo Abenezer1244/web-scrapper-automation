@@ -39,6 +39,8 @@ def test_the_pacs_fallback_urls_moved_with_identical_values():
     assert KNOWN_ASSESSOR_URLS == {
         "pierce_WA": "https://atip.piercecountywa.gov/app/parcelSearch",
         "island_WA": "https://assessor.islandcountywa.gov/propertyaccess/?cid=0",
+        # Added 2026-11-12 (Chelan owner-name fallback; the Assessor's PACS portal).
+        "chelan_WA": "https://pacs.co.chelan.wa.us/PropertyAccess/PropertySearch.aspx?cid=91",
     }
 
 

@@ -226,7 +226,7 @@ def test_after_108_every_template_url_shape_still_resolves():
     own host and on tylerhost.net, AcclaimWeb, and Tyler SelfService. (Every
     production template connector's URL is pinned in test_doc_type_select_wiring.)"""
     from src.scrapers.registry import connector_scraper_class
-    from src.scrapers.templates.acclaimweb import AcclaimWebScraper
+    from src.scrapers.templates.acclaimweb import AcclaimWebScraper, ChelanAcclaimWebScraper
     from src.scrapers.templates.eagleweb import EagleWebScraper
     from src.scrapers.templates.tyler_selfservice import TylerSelfServiceScraper
 
@@ -237,8 +237,12 @@ def test_after_108_every_template_url_shape_still_resolves():
     assert connector_scraper_class(
         row("https://grantcountywa-recorder.tylerhost.net/grantrecorder/web/")
     ) is EagleWebScraper
+    # Chelan: AcclaimWeb with its own document codes (a subclass of the template).
     assert connector_scraper_class(
         row("https://acclaim.co.chelan.wa.us/acclaimweb")
+    ) is ChelanAcclaimWebScraper
+    assert connector_scraper_class(
+        row("https://edocs.douglascountywa.gov/AcclaimWeb")
     ) is AcclaimWebScraper
     assert connector_scraper_class(
         row("https://okanogancountywa-web.tylerhost.net/Web")

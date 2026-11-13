@@ -146,21 +146,16 @@ _AVAILABILITY: dict[tuple[str, str], dict] = {
         },
         "note": "AcclaimWeb recorder — best-effort document-type text match (client-side).",
     },
-    # Chelan — AcclaimWeb (same family/partition as douglas). health=down at enable
-    # time (portal reachable but the scraper stalls — the condition causing the down
-    # status), so PRE-STAGED: list_connectors hides down connectors, so the selector
-    # appears only once chelan's health recovers. Rests on the verified AcclaimWeb
-    # family mechanism + the partition-invariant test (a per-county live spot-check
-    # wasn't possible while the scraper times out).
+    # Chelan — AcclaimWeb, but its grid shows only its own codes (Doc Type list read
+    # live 2026-11-12). Partitions ChelanAcclaimWebScraper's map, not douglas's. No
+    # notice_of_default: Chelan's "NOD" is NOTICE OF DISCONTINUANCE (a sale called off).
     ("chelan", "wa"): {
-        "available": ["notice_of_default", "notice_of_trustee_sale", "lis_pendens", "foreclosure"],
+        "available": ["notice_of_trustee_sale", "lis_pendens"],
         "method": "keyword", "confidence": "keyword", "default": "notice_of_trustee_sale",
         "supported_for_selection": True,
         "tokens": {
-            "notice_of_default": ["NOTICE OF DEFAULT", "NOD"],
-            "notice_of_trustee_sale": ["NOTICE OF TRUSTEE", "TRUSTEE SALE", "TRUSTEE'S SALE", "NTS"],
-            "lis_pendens": ["LIS PENDENS"],
-            "foreclosure": ["FORECLOSURE"],
+            "notice_of_trustee_sale": ["NTS", "NTSCOM"],
+            "lis_pendens": ["LP"],
         },
         "note": "AcclaimWeb recorder — best-effort document-type text match (client-side).",
     },

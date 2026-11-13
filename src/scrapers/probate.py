@@ -499,8 +499,9 @@ _BARE_PROBATE_RE = re.compile(r"\bPROBATE\b", re.IGNORECASE)
 # (multi-word) stays on the TOD path. "TOD" is absent here on purpose: a bare TOD code
 # is a living-owner deed, handled by _TOD_DOC_RE. (WILL/HEIR are NOT here — they are
 # words that also appear in multi-word labels, so _DEATH_MARKER_RE handles them.)
+# "DC" is Chelan's DEATH CERTIFICATE code (its Doc Type list, read live 2026-11-12).
 _ABBREV_DEATH_CODES: frozenset[str] = frozenset(
-    {"DEATH", "LETTR", "EXEC", "SUCC", "AFFD", "PTREC"}
+    {"DEATH", "LETTR", "EXEC", "SUCC", "AFFD", "PTREC", "DC"}
 )
 
 

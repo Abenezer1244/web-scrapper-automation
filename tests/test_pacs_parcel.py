@@ -22,6 +22,7 @@ from src.scrapers.enrichment.snohomish_assessor_roll import AMBIGUOUS, FOUND, SO
 
 _FIXTURES = Path(__file__).parent / "fixtures"
 _PARCEL = "131073011125003"
+_ASOTIN_PARCEL = "10040300100010000"  # owner names redacted in both Asotin fixtures
 _SITE = pp.PACS_SITES["benton"]
 
 
@@ -108,8 +109,20 @@ class TestParseResults:
         html = _results([("0" + _PARCEL[:6] + "-" + _PARCEL[6:], "58808")])
         assert pp.parse_results(html, _PARCEL)[:2] == (FOUND, "58808")
 
+    def test_real_asotin_grid_takes_the_17_digit_geo_id_and_never_a_prefix(self):
+        html = _fixture(f"asotin_pacs_results_{_ASOTIN_PARCEL}.html")
+        assert pp.parse_results(html, _ASOTIN_PARCEL)[:2] == (FOUND, "2712")
+        # A truncated id only prefixes the county's row: never settled, never taken.
+        assert pp.parse_results(html, _ASOTIN_PARCEL[:13])[:2] == (AMBIGUOUS, None)
+
 
 class TestParseDetail:
+    def test_real_asotin_detail_page(self):
+        answer = pp.parse_detail(_fixture("asotin_pacs_detail_2712.html"), _ASOTIN_PARCEL)
+        assert (answer.outcome, answer.role) == (FOUND, "owner")
+        assert answer.mailing_address == "831 18TH AVE, CLARKSTON, WA 99403"
+        assert pp.parse_detail(_fixture("asotin_pacs_detail_2712.html"), _ASOTIN_PARCEL[:13]).outcome == pp.PARCEL_MISMATCH
+
     def test_real_benton_detail_page(self):
         answer = pp.parse_detail(_fixture("benton_pacs_detail_58808.html"), _PARCEL)
         assert answer.outcome == FOUND

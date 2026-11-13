@@ -51,10 +51,10 @@ _RECENT_DAYS = 180
 
 # Counties with an NTS cache source wired up (Pierce=Tacoma Daily Index, Snohomish=
 # Snohomish County Tribune, King=Queen Anne & Magnolia News, Clark=The Columbian
-# classifieds). Matching is scoped PER COUNTY — a notice only ever matches a lead in the
-# SAME county — so a same street+zip in a different county can never cross-match (the
-# address key isn't county-unique).
-NTS_MATCH_COUNTIES = ("pierce", "snohomish", "king", "clark")
+# classifieds, Asotin=Lewiston Tribune on nwmarket.com). Matching is scoped PER COUNTY —
+# a notice only ever matches a lead in the SAME county — so a same street+zip in a
+# different county can never cross-match (the address key isn't county-unique).
+NTS_MATCH_COUNTIES = ("pierce", "snohomish", "king", "clark", "asotin")
 
 # How far back a HISTORICAL (already-held) sale may be attached to a lead. Bounded so a
 # long-past sale is never presented as this lead's event: an auction older than this is

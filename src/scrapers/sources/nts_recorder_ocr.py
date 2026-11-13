@@ -15,8 +15,10 @@ A child that crashes, overruns or is killed is a rejection with a reason.
 from __future__ import annotations
 
 import hashlib
+import html
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -253,3 +255,58 @@ def read_notice(pdf: bytes, record_date: date, **kw) -> dict:
         "evidence": evidence, "flags": review_flags(parsed, evidence, record_date),
         "parser_version": PARSER_VERSION,
     }
+
+
+# ── the recording's own facts, from its detail page (no OCR involved) ─────────
+
+_RELATED_DT_RE = re.compile(r"(\d{5,})\s*\[DT\]")
+
+
+def _detail_text(detail_html: str) -> str | None:
+    text = html.unescape(re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", detail_html or "")))
+    return text if "Doc Type:" in text else None
+
+
+def related_deeds_of_trust(detail_html: str) -> list[str] | None:
+    """The deed-of-trust recording numbers the detail page links ("Related Number:
+    2531058 [DT]"), in order. None when the page is not a detail page."""
+    text = _detail_text(detail_html)
+    if text is None:
+        return None
+    i = text.find("Related Number:")
+    if i < 0:
+        return []
+    found: list[str] = []
+    for n in _RELATED_DT_RE.findall(text[i:]):
+        if n not in found:
+            found.append(n)
+    return found
+
+
+def corroborate(fields: dict, recording_apns: list[str] | None,
+                related_dts: list[str] | None) -> tuple[dict[str, str], list[str]]:
+    """Compare what OCR read with what the recording itself says (its detail page):
+    the parcel against the recording's APN, the deed of trust against its related DT.
+    Returns (agreements, flags). Agreement is strong evidence the OCR read those two
+    right; a difference is flagged for the reviewer, and nothing is edited either way."""
+    agree: dict[str, str] = {}
+    flags: list[str] = []
+    parcel = (fields.get("parcel") or "").replace("-", "").strip()
+    if recording_apns is None:
+        flags.append("recording detail page unreadable: parcel not cross-checked")
+    elif not parcel:
+        pass  # review_flags already reports the parcel as not read
+    elif parcel in recording_apns:
+        agree["parcel"] = "matches the recording's APN"
+    else:
+        flags.append(f"parcel {parcel} differs from the recording's APN "
+                     f"{', '.join(recording_apns) or '(none)'}")
+    deed = (fields.get("deed_reference") or "").strip()
+    if related_dts is None:
+        flags.append("recording detail page unreadable: deed of trust not cross-checked")
+    elif deed and deed in related_dts:
+        agree["deed_reference"] = "matches the recording's related deed of trust"
+    elif deed:
+        flags.append(f"deed of trust {deed} differs from the recording's related "
+                     f"{', '.join(related_dts) or '(none)'}")
+    return agree, flags

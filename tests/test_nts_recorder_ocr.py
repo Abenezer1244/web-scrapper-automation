@@ -378,3 +378,35 @@ def test_sale_dates_are_checked_against_recording(sale, expect):
 def test_stored_fields_never_carry_the_borrower(tmp_path):
     out = read_notice(recorder_pdf(1), date(2026, 10, 2), tesseract=_tool(tmp_path, "tess_ok", _OK))
     assert out["ok"] and "grantor" not in out["fields"]
+
+
+# ── the recording's own facts (detail page) and the cross-check ───────────────
+
+def _detail_fixture(tid: str) -> str:
+    return (Path(__file__).parent / "fixtures" / "acclaimweb_chelan" / f"detail_{tid}.html").read_text(
+        encoding="utf-8")
+
+
+def test_the_detail_page_names_the_related_deed_of_trust():
+    from src.scrapers.sources.nts_recorder_ocr import related_deeds_of_trust
+
+    assert related_deeds_of_trust(_detail_fixture("1788730")) == ["2531058"]
+    assert related_deeds_of_trust(_detail_fixture("1789524")) == []  # a TOD links no deed of trust
+    assert related_deeds_of_trust("<html>Session expired</html>") is None
+
+
+@pytest.mark.parametrize("fields,apns,dts,agree,flag", [
+    ({"parcel": "222014846080", "deed_reference": "2531058"}, ["222014846080"], ["2531058"],
+     {"parcel", "deed_reference"}, None),
+    ({"parcel": "222014846088", "deed_reference": "2531058"}, ["222014846080"], ["2531058"],
+     {"deed_reference"}, "parcel 222014846088 differs"),
+    ({"parcel": "222014846080", "deed_reference": "2531053"}, ["222014846080"], ["2531058"],
+     {"parcel"}, "deed of trust 2531053 differs"),
+    ({"parcel": "222014846080"}, None, None, set(), "detail page unreadable"),
+])
+def test_ocr_is_cross_checked_against_the_recording(fields, apns, dts, agree, flag):
+    from src.scrapers.sources.nts_recorder_ocr import corroborate
+
+    got_agree, flags = corroborate(fields, apns, dts)
+    assert set(got_agree) == agree
+    assert (flag is None and flags == []) or any(flag in f for f in flags)

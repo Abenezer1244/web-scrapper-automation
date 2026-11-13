@@ -84,11 +84,17 @@ Codex pre-build consult (2026-11-12): no P0. The P1s are: a staging/review bound
 - [x] `src/scrapers/sources/nts_recorder_ocr.py`: PDF bytes -> killable child process (`python -I -m …`) with byte/page/image/pixel caps, wall-time limit, private temp dir, fixed argv, no shell -> pypdf page images -> `tesseract` TSV (word confidences) -> `parse_nts_notice` + field evidence. Over-limit = explicit rejection
 - [x] Tests (41 + 1 Linux-only): real child processes with stand-in tesseract executables (TSV, flood, hang with descendant, fail). STILL OPEN: golden OCR text of the 2 real PDFs needs tesseract installed locally (UAC prompt was cancelled). Planned: golden OCR-text fixtures for the 2 real PDFs, subprocess contract (timeout, missing binary, nonzero exit, cleanup, output cap), malformed/encrypted/oversized PDFs, OCR-corruption fixtures that must quarantine
 
-**4a-2: discovery + operator review** (≤5 files; the pending_review retention purge must land BEFORE any row is written — Codex)
+**4a-2: discovery + staging** (DONE, Codex GO after 4 rounds. 7 files: over the 5-file rule because Codex's deadline finding needed `safe_http.py` and the purge needed its own beat entry in `scheduler.py`)
+- [x] `ChelanAcclaimWebScraper.discover()`: complete NTS/NTSCOM rows per day, one bounded retry per day (portal stalls ~1 min, seen live)
+- [x] `crawl_nts_chelan_recorder` (NOT scheduled): Redis lock (atomic Lua release); one time budget from lock to end; detail + PDF via `_bounded_fetch` (SSRF-guarded, no redirects, byte cap, wall-clock deadline via `safe_download_to_file(deadline_s=...)` reading with urllib3 `read1`); OCR; `stage_recorder_document`; every recording counted staged/failed/kept/invalid/unread; ops alert on any problem
+- [x] Recording cross-check: OCR parcel vs the recording's APN, OCR deed reference vs its related DT (`corroborate`), flags only
+- [x] `purge_nts_recorder_staging` on its own daily beat (09:40 UTC): pending > 30 days loses OCR text and OCR'd fields
+- [x] Live (read-only source, local test DB), 09/15–10/20/2026: 5 recordings discovered and staged; 2 fully corroborated (parcel + DT); 2 flagged parcel mismatches (OCR misreads); 1 commercial notice with no sale date read; TS# not read in 3 of 5 (shared parser's patterns; flagged, not invented)
+- [ ] Operator review CLI (list/show/approve/reject) moves to 4a-3, with the approval write it needs
 - [ ] `crawl_nts_chelan_recorder` task: a recorder-document discovery adapter (NTS/NTSCOM/NOD-discontinuance codes, overlapping window, complete reads), own time limits + overlap lock + source admission -> detail page (APN, DT, borrower) -> OCR -> staging. Completeness-aware health (a verified zero is healthy)
 - [ ] Operator CLI: list pending, show fields + image link, approve/reject (who, when). Approval writes the canonical notice
 
-**4a-3: canonical notices + delivery** (≤5 files)
+**4a-3: operator review + canonical notices + delivery**
 - [ ] Approved -> `nts_notices` (source `chelan_recorder`), revision ordering by recording metadata, discontinuance cancels the episode; DT reference persisted; Chelan in `NTS_MATCH_COUNTIES` with exact recording/DT linkage
 - [ ] `ChelanWATrusteeSaleScraper`, beat entry, Dockerfile `tesseract-ocr`, migration adding `trustee_sale` to the connector, collection_scope says "recorder", not "newspaper"
 

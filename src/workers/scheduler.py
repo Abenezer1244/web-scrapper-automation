@@ -333,6 +333,12 @@ app.conf.beat_schedule = {
         "task": "src.workers.nts_crawler.crawl_nts_nwmarket_asotin",
         "schedule": crontab(hour=10, minute=0),  # 10:00 UTC daily
     },
+    "purge-nts-recorder-staging": {
+        # OCR'd recorder notices nobody reviewed lose their text (it names the borrower)
+        # after RECORDER_PENDING_TTL_DAYS, on this schedule, not only when a crawl runs.
+        "task": "src.workers.nts_crawler.purge_nts_recorder_staging",
+        "schedule": crontab(hour=9, minute=40),  # 09:40 UTC daily
+    },
     "crawl-pacs-tax": {
         # Asotin has no delinquent list: walk every parcel's PACS tax table a batch an
         # hour (20 min budget, the county's PACS lease shared with mailing recovery).

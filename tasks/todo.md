@@ -1,3 +1,66 @@
+# Benton County WA: audit 2 live types + investigate 5 new (branch feat/benton-wa-seven-record-types, worktree C:/Users/micha/bl-wt/benton-7)
+
+Started 2026-11-12. NOTHING pushed/deployed. Owner approval needed before each phase.
+
+## Baseline (measured 2026-11-12, prod read-only)
+- Connector row (DB only, not in repo): record_types [probate, pre_foreclosure], EagleWeb template, health=healthy.
+- Prod jobs ever: 1 (probate, 2026-10-02): 7 found, 4 new, 3 superseded dups. pre_foreclosure: 0 prod runs ever.
+- Probate rows = recorded "Cert Of Death" (Auditor), not court cases. 3/7 no parcel/address/mailing (legal desc truncated "Parc...").
+- doc_type stored with recording no. glued on ("Cert Of Death\n2026-023467").
+- Live non-persisting pre_foreclosure run, 90 days (current code): 11 matched rows, 10 DROPPED for no parcel ("no detail_href"), 1 returned.
+
+## Proven/code-confirmed defects (EagleWeb template, shared by 11 counties -> fix carefully)
+- D1 pagination stops at first page with 0 matching rows (all-types search) -> later pages never read (eagleweb.py:718). Live repro pending.
+- D2 single-day window runs 0 chunks (`while chunk_start < end`, :192) -> DONE with 0, portal never searched.
+- D3 Benton detail_href not captured -> 10/11 pre-foreclosure rows dropped silently (:255).
+- D4 doc_type carries recording number (newline).
+- D5 silent truncation: 50-page cap, page exception -> [] , no "N items found" reconciliation.
+- D6 hard-coded 2024-2026 year filter in parcel fallback (:962, :1121).
+- D7 PR/EXEC deeds: party_name = living PR, classified as death.
+- D8 identity: instrument number not in any key.
+
+## Category verdicts (sources researched 2026-11-12)
+| type | source | verdict |
+|---|---|---|
+| probate (live) | Auditor EagleWeb "Cert Of Death" + PR/TOD docs | KEEP, fix D1-D8 |
+| pre_foreclosure (live) | EagleWeb LIS PENDENS / NTS / NTSCL | FIX (currently ~9% yield) |
+| trustee_sale | EagleWeb NTS/NTSCL index: rec no., date, parties, parcel. Auction date + principal NOT in index (image $1/pg, some index-only) | PARTIAL - owner decision |
+| tax_delinquent | Treasurer foreclosure PDF: 3 parcels, min bid, sale 11/16 + 11/19/2026 (GovEase). No public bulk delinquency list | PARTIAL (foreclosure list only, ~annual) |
+| code_violation | County: complaint form only; new Tyler system 7/2026 public search unverified. Cities: no case portals found | BLOCKED pending manual portal check / PRR |
+| divorce | Odyssey case summary only; GR 31(g) bulk/commercial-solicitation limits | BLOCKED (legal) |
+| death_certificate | Same Auditor "Cert Of Death" docs already sold as probate; DOH copies restricted; archives index ends 2017 | OWNER DECISION: alias subset vs leave off |
+
+
+## Codex consult 2026-11-12: PLAN CHANGES NEEDED (folded in)
+- P1 D1 fix = runtime risk for all 11 EagleWeb counties (90d = 13 chunks x up to 50 pages vs 1800s timeout). Benchmark pages/chunk first;
+  prefer portal-side doc-type filter for Benton if it is reliable, else full paging with real page-advance tracking.
+- P1 keep a termination safeguard: detect repeated page, real exhaustion, extraction failure; hitting the cap = incomplete, not done.
+- P1 trustee_sale contract needs auction date + notice id (finalizer rejects otherwise). EagleWeb NTS index rows stay pre_foreclosure.
+  -> Benton trustee_sale BLOCKED until an auction-date source exists (e.g. Benton legal-notice publication); owner decision.
+- P2 parcel/party changes can shift billing keys vs past deliveries: compare old/new keys before any replay.
+- P2 collection identity should use the immutable instrument number, separate from the billing key.
+- P2 D2: `<=` alone loops forever; bounded fix + tests (same-day, inverted, chunk boundary overlap).
+
+## Phase 1 (owner approved 2026-11-12): EagleWeb paging/date-window completeness (eagleweb.py + tests + fixtures)
+- [x] live repro D1: Benton week 10/23-10/30 = 763 rows / 8 pages; matches on p1,2,4,6,7; old loop stopped at p3 (2 of 5)
+- [x] D3 root cause REVISED: not a scraper bug. Benton index truncates the legal ("Parcel: 118803050002...") and the
+      detail page's Legal Data is empty; truncated parcels are already (correctly) rejected. Needs a parcel-resolution
+      source -> Phase 1b (statewide layer prefix gives 17 candidates; not unique on its own).
+- [x] fix: follow real pages (rows shown, not filtered rows); fail loud on unreadable page / any repeated page /
+      cap with Next left / rows != "N items found"; switch to largest "Results Per Page" (Clallam 5 -> 100);
+      same-day window searches once, inverted raises; instrument-year filter floor 2024, top rolls.
+- [x] tests: tests/test_eagleweb_pagination.py (12, real Chromium, page.route replay of captured Benton/Island/Clallam
+      pages). Paging tests fail on origin/main code (2 == 5, DID NOT RAISE x2).
+- [x] live non-persisting 14d, 10 reachable EagleWeb counties: old 12 records -> new 32 (benton 0->2, clallam 0->5,
+      kitsap 1->5, thurston 6->15); 205s -> 275s wall; spokane = pre-existing Cloudflare block.
+      Two intermediate live runs caught real bugs in my first version (row count on the wrong table; rows the
+      extractor skips) -- both fixed and covered.
+- [x] Codex: GATE FAIL (3 x P2) -> fixed -> GATE FAIL (1 x P2 cap) -> fixed -> GATE PASS.
+- [x] security: no new input paths; page-size URL built from the portal's own URL (SSRF route guard still applies);
+      error text carries county + counts only (P0-04).
+## Phase 2: trustee_sale for Benton from EagleWeb NTS (if approved), auction/amount NULL + labelled
+## Phase 3: tax_delinquent from Treasurer foreclosure PDF (if approved)
+## Phase 4: coverage/registry update only for verified types; journal
 # NTS amount type marker (owner decision 2026-11-06: keep fallback amounts, mark them)
 
 Branch `feat/nts-amount-basis` (worktree `C:/Users/micha/bl-wt/nts-basis`), stacked on fix/trustee-sale-silent-done (#598).

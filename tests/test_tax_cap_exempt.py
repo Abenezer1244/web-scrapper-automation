@@ -50,7 +50,8 @@ def test_raw_sql_twin_matches_orm_shape():
     frag = tax_cap_sql("r")
     assert "r.delinquent_bill_year IS NULL" in frag
     assert "r.delinquent_bill_year >= :tax_cap_min_year" in frag
-    assert "r.enrichment_data->>'source' IN ('king_county_delinquent_taxes')" in frag
+    assert f"r.enrichment_data->>'source' IN ({_exempt_sources_sql()})" in frag
+    assert "'king_county_delinquent_taxes'" in frag
 
 
 def test_exempt_sql_rejects_unsafe_token(monkeypatch):

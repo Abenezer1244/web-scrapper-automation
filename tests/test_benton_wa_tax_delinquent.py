@@ -147,3 +147,14 @@ def test_records_pass_the_tax_invariant_once_the_source_is_trusted():
     validate_tax_delinquent_records(records, "tax_delinquent")  # raises on an untrusted source
     assert all(_extract_tax_fields(r.enrichment_data, "tax_delinquent")[1] is not None for r in records)
     assert {r.enrichment_data["source"] for r in records} == {SOURCE}
+
+
+def test_separate_co_owner_cells_still_verify_against_the_listed_taxpayer():
+    """pacs_tax joins two owner cells as 'A & B'; the listing prints only A."""
+    a = _answers()["102892110004002"]
+    co = TaxAnswer(pacs_tax.FOUND, as_of=a.as_of, statements=a.statements,
+                   owner_name="NELSON SHIRLEY L & DOE JOHN Q", property_address=a.property_address,
+                   mailing_address=a.mailing_address)
+    records, skipped = build_records(parse_listing(_listing_text()), {**_answers(), "102892110004002": co}, "u")
+    assert skipped["owner_not_verified"] == 0
+    assert {r.parcel_id: r.party_name for r in records}["102892110004002"] == "NELSON SHIRLEY L"

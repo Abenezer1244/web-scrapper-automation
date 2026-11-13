@@ -154,10 +154,14 @@ def _owner_matches(listing_line: str, owner: str | None) -> str | None:
     The listing prints TAXPAYER then situs and legal with no delimiter, so the
     owner is verified by prefix: the line must START with exactly the owner name
     the county's own parcel page shows."""
-    name = (owner or "").upper().strip()
     line = listing_line.upper()
-    if name and (line == name or line.startswith(name + " ")):
-        return owner
+    # pacs_tax joins separate owner cells with " & ", which a single owner can also
+    # contain ("HELGESON GERALD J & VICKIE L"): try the whole name first, then each
+    # owner alone, so either shape verifies against the Treasurer's taxpayer (Codex).
+    whole = (owner or "").strip()
+    for name in [whole, *(part.strip() for part in whole.split(" & "))]:
+        if name and (line == name.upper() or line.startswith(name.upper() + " ")):
+            return name
     return None
 
 

@@ -1983,7 +1983,7 @@ class NtsNotice(Base):
 
 class NtsRecorderDocument(Base):
     """NTS documents read by OCR from a county recorder, staged for operator review
-    (migration 154). A notice reaches nts_notices only once approved; ``ocr_text`` (the
+    (migration 155). A notice reaches nts_notices only once approved; ``ocr_text`` (the
     borrower's name is in it) is kept only while the row awaits review. Shared,
     system-only like NtsNotice."""
 

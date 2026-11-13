@@ -169,6 +169,11 @@ _PRESENTATION: dict[str, tuple[dict[str, str], set[str], str]] = {
         "Other foreclosure-stage filings (county-specific codes)",
     ),
     "tax_delinquent": (_TAX_LABELS, _TAX_BUCKET, "Other tax filings (county-specific codes)"),
+    "death_certificate": (
+        {k: _PROBATE_LABELS[k] for k in ("DEATH CERTIFICATE", "CERTIFICATE OF DEATH", "DEATH")},
+        set(),
+        "Other death filings (county-specific codes)",
+    ),
 }
 
 # Divorce scope is NOT derived from a connector's keyword list: divorce-capable

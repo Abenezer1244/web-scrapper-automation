@@ -18,6 +18,7 @@ Lewis, Lincoln, Mason, Okanogan, Pacific, Spokane, Stevens, Thurston, Whitman
 import re
 
 from src.api.middleware.security import add_scrape_domain
+from src.config import settings
 from src.scrapers.base_scraper import (
     BridgeScraper,
     ScrapedRecord,
@@ -55,6 +56,9 @@ _DOC_TYPE_MAP = {
     "divorce": ["DIVORCE", "DISSOLUTION", "DECREE OF DISSOLUTION",
                 # Abbreviated codes
                 "DISS", "DISOL"],
+    # Recorded death certificates only (King's death_certificate uses the same
+    # recorder category). Clallam labels them "Death".
+    "death_certificate": ["DEATH CERTIFICATE", "CERTIFICATE OF DEATH", "DEATH"],
 }
 
 # Doc type phrases that LOOK like a match but document the opposite.
@@ -67,8 +71,61 @@ _DOC_TYPE_EXCLUDE = {
     # polluting probate results on island + pacific. No genuine probate instrument
     # carries "TRUSTEE"; pre_foreclosure's "TRUSTEE SALE" is unaffected because the
     # exclude list is per-record-type.
-    "probate": ["LACK OF PROBATE", "TRUSTEE"],
+    "probate": ["LACK OF PROBATE", "TRUSTEE",
+                # Clallam's EXEC code is "Writ of Exec" (judgment collection), not an
+                # executor filing; a writ of execution is never probate anywhere.
+                "WRIT OF EXEC",
+                # A living owner cancelling a TOD deed is neither a death nor a TOD signal.
+                "REVOCATION OF TRANSFER ON DEATH"],
 }
+
+# death_certificate keeps a row only when its WHOLE label is one of these (Codex: the
+# bare DEATH keyword also hits "Affidavit of Death" and Transfer-on-Death deeds).
+_DEATH_CERT_LABELS = frozenset({"DEATH", "DEATH CERTIFICATE", "CERTIFICATE OF DEATH"})
+
+
+def _doc_label(desc: str) -> str:
+    """The document-type label of a results Description cell, without its instrument
+    number, upper-cased with hyphens and runs of whitespace collapsed to one space."""
+    label = re.split(r"\b\d{4}-\d{5,}\b|\b\d{5,}\b", desc, maxsplit=1)[0]
+    return " ".join(label.replace("-", " ").upper().split())
+
+# Clallam files a Discontinuance of Trustee's Sale under its NTS type. The only
+# marker is "DISCONTINUANCE <original instrument>" in the party cell (verified live
+# 2026-11-12: 2026-1486992 discontinues 2026-1484470). Instrument numbers keep the year.
+_DISCONTINUANCE_RE = re.compile(r"\bDISCONTINU\w*\s+(\d{4}-\d{5,})", re.IGNORECASE)
+_INSTRUMENT_RE = re.compile(r"\b(\d{4}-\d{5,})\b")
+_NTS_LABELS = ["TRUSTEE SALE", "TRUSTEE'S SALE"]
+_DISCONTINUANCE_LOOKUP_COUNTIES = frozenset({"clallam"})
+
+
+def _date_chunks(date_from: str, date_to: str, chunk_days: int) -> list[tuple[str, str]]:
+    """Inclusive MM/DD/YYYY search windows covering date_from..date_to.
+
+    A same-day window yields one chunk (it used to yield none, so the portal was never
+    searched). Boundaries overlap by one day, as they always have; the per-scrape hash
+    dedupe absorbs the repeated boundary rows."""
+    from datetime import datetime, timedelta
+    start = datetime.strptime(date_from, "%m/%d/%Y")
+    end = datetime.strptime(date_to, "%m/%d/%Y")
+    if start > end:
+        raise ValueError(f"inverted date window {date_from} > {date_to}")
+    chunks = []
+    while True:
+        chunk_end = min(start + timedelta(days=chunk_days), end)
+        chunks.append((start.strftime("%m/%d/%Y"), chunk_end.strftime("%m/%d/%Y")))
+        if chunk_end >= end:
+            return chunks
+        start = chunk_end
+
+
+def _looks_like_instrument_year(digits: str, year: int | None = None) -> bool:
+    """True when a 10+ digit run starts with a recent recording year (an instrument
+    number like 2026023467), so it must not be taken as a parcel. 2024 is the floor
+    the filter has always rejected; the top rolls with the calendar."""
+    from datetime import date
+    year = year or date.today().year
+    return digits[:4] in {str(y) for y in range(min(2024, year - 2), year + 2)}
 
 
 def _doc_type_matches(doc_upper: str, keywords: list[str]) -> bool:
@@ -142,13 +199,16 @@ class EagleWebScraper(BridgeScraper):
         #     extraction regex failed, so dropping is correct. Default ON.
         #   - Explicit caller override (True/False) always wins.
         if require_parcel_id is None:
-            require_parcel_id = self.active_record_type not in ("probate", "divorce")
+            require_parcel_id = self.active_record_type not in ("probate", "divorce", "death_certificate")
         self.require_parcel_id = require_parcel_id
 
         from urllib.parse import urlparse
         domain = urlparse(base_url).hostname
         if domain:
             add_scrape_domain(domain)
+
+    # Per-search page cap; reaching it with a Next link left fails the job.
+    _MAX_PAGES = 50
 
     async def scrape(self, date_from: str, date_to: str) -> list[ScrapedRecord]:
         """Scrape records from an EagleWeb site using date chunking.
@@ -164,11 +224,8 @@ class EagleWebScraper(BridgeScraper):
         Returns:
             List of ScrapedRecord instances.
         """
-        from datetime import datetime, timedelta
-
-        start = datetime.strptime(date_from, "%m/%d/%Y")
-        end = datetime.strptime(date_to, "%m/%d/%Y")
         chunk_days = 7  # 7-day chunks keep result sets small
+        chunks = _date_chunks(date_from, date_to, chunk_days)
 
         _logger.info(
             "EagleWeb scraper — %s/%s — %s to %s (%d-day chunks)",
@@ -187,17 +244,12 @@ class EagleWebScraper(BridgeScraper):
 
         all_records: list[ScrapedRecord] = []
         seen_hashes: set[str] = set()
-        chunk_start = start
-
-        while chunk_start < end:
-            chunk_end = min(chunk_start + timedelta(days=chunk_days), end)
-            cf = chunk_start.strftime("%m/%d/%Y")
-            ct = chunk_end.strftime("%m/%d/%Y")
+        for chunk_index, (cf, ct) in enumerate(chunks):
 
             _logger.info("Chunk: %s to %s", cf, ct)
 
             # Navigate back to search form for each chunk
-            if chunk_start != start:
+            if chunk_index:
                 # Try "New Search" link first (stays in session)
                 navigated = False
                 try:
@@ -246,7 +298,6 @@ class EagleWebScraper(BridgeScraper):
             new_count = self.dedupe_extend(chunk_records, seen_hashes, all_records)
             _logger.info("Chunk %s-%s: %d new records (total: %d)", cf, ct, new_count, len(all_records))
 
-            chunk_start = chunk_end
             await self.polite_delay()
 
         # Drop records without parcel_id if required — these are upstream
@@ -262,10 +313,83 @@ class EagleWebScraper(BridgeScraper):
                     dropped, before,
                 )
 
+        # After the parcel filter, so only deliverable notices are looked up.
+        # The per-notice lookup is verified on Clallam only (live 2026-11-12); Benton
+        # also numbers instruments YYYY-NNNNNN but its lookup page is unverified.
+        if self.active_record_type == "pre_foreclosure" and self.county.lower() in _DISCONTINUANCE_LOOKUP_COUNTIES:
+            all_records = await self._drop_discontinued(all_records)
+
         # Records are returned raw; the run_scrape_job worker's enrichment pass
         # (src/workers/tasks_helpers/enrich.py) adds the addresses.
         _logger.info("EagleWeb complete — %d records (enrichment runs after save)", len(all_records))
         return all_records
+
+    async def _drop_discontinued(self, records: list[ScrapedRecord]) -> list[ScrapedRecord]:
+        """Drop trustee-sale notices the recorder shows as discontinued, at any date.
+
+        A recorder search by an NTS's own instrument number also lists every
+        discontinuance that cites it, so one lookup per notice also catches
+        cancellations recorded after the scrape window. Only notices with a
+        year-dashed instrument (Clallam's ``2026-1484470``) are checked.
+        """
+        kept: list[ScrapedRecord] = []
+        for record in records:
+            label = (record.doc_type or "").upper()
+            match = _INSTRUMENT_RE.search(label)
+            if match and any(lbl in label for lbl in _NTS_LABELS):
+                if await self._instrument_discontinued(match.group(1)):
+                    _logger.info("Dropped NTS %s: the recorder lists a discontinuance of it", match.group(1))
+                    continue
+                await self.polite_delay()
+            kept.append(record)
+        return kept
+
+    async def _instrument_discontinued(self, instrument: str) -> bool:
+        """True when a recorder search for ``instrument`` lists a discontinuance citing it.
+
+        Fails loud (RuntimeError) when the lookup cannot be read: an unverified
+        notice must not be delivered as active foreclosure."""
+        search_url = f"{self.base_url.split('/web/')[0]}/eagleweb/docSearch.jsp"
+        last_error: Exception | None = None
+        for attempt in range(1, settings.MAX_RETRIES + 1):
+            try:
+                await self.page.goto(search_url, wait_until="domcontentloaded",
+                                     timeout=settings.DEFAULT_TIMEOUT * 1000)
+                await self.page.evaluate("""(n) => {
+                    for (const id of ['RecDateIDStart', 'RecDateIDEnd']) {
+                        const el = document.getElementById(id); if (el) el.value = '';
+                    }
+                    document.getElementById('DocNumID').value = n;
+                }""", instrument)
+                async with self.page.expect_navigation(
+                    url="**/docSearchResults*", timeout=settings.DEFAULT_TIMEOUT * 2000,
+                    wait_until="domcontentloaded",
+                ):
+                    await self.page.evaluate("document.forms.docSearch.submit()")
+                # Read the whole result set: a discontinuance listed past the first
+                # page must not pass as "not discontinued".
+                await self._use_largest_page_size()
+                body = await self.page.inner_text("body")
+                await self._extract_page(1)
+                total = 1 if re.search(r"\bOne item found", body, re.IGNORECASE) else None
+                m = re.search(r"([\d,]+)\s+items?\s+found", body, re.IGNORECASE)
+                if m:
+                    total = int(m.group(1).replace(",", ""))
+                if total is None or self._page_rows_seen != total:
+                    raise RuntimeError(
+                        f"lookup for {instrument} showed {self._page_rows_seen} of {total} rows")
+                # Positive control: the notice's own result row (instrument then its
+                # recording date) must be listed; the "You searched for" echo is not.
+                if not re.search(rf"{re.escape(instrument)}\s+\d{{1,2}}/\d{{1,2}}/\d{{4}}", body):
+                    raise RuntimeError(f"lookup for {instrument} did not return the notice itself")
+                return bool(re.search(rf"\bDISCONTINU\w*\s+{re.escape(instrument)}\b", body, re.IGNORECASE))
+            except Exception as exc:
+                last_error = exc
+                _logger.warning("Discontinuance lookup %s attempt %d/%d failed: %s",
+                                instrument, attempt, settings.MAX_RETRIES, str(exc)[:120])
+        raise RuntimeError(
+            f"{self.county}: could not verify NTS {instrument} against discontinuances: {last_error}"
+        )
 
     async def _wait_through_cloudflare(self, timeout_s: int = 35) -> None:
         """Wait for a Cloudflare managed JS challenge to auto-clear after navigate.
@@ -693,15 +817,35 @@ class EagleWebScraper(BridgeScraper):
 
     async def _extract_all_pages(self) -> list[ScrapedRecord]:
         """Extract records from all result pages, then fetch missing parcel IDs."""
+        import re
+
         all_records: list[ScrapedRecord] = []
         seen_hashes: set[str] = set()
         page_num = 0
-        max_pages = 50
+        max_pages = self._MAX_PAGES
+        rows_seen_total = 0
+        items_found: int | None = None
+        seen_signatures: set[str] = set()
 
-        while page_num < max_pages:
+        await self._use_largest_page_size()
+
+        while True:
             page_num += 1
 
             records = await self._extract_page(page_num)
+            # Paging follows the portal's rows, never the filtered output: the search
+            # is all-types, so a page with no matching doc types is normal mid-result.
+            rows_seen = self._page_rows_seen
+            if rows_seen is None:
+                raise RuntimeError(f"{self.county}: EagleWeb page {page_num} could not be read; results incomplete")
+            if rows_seen and self._page_signature in seen_signatures:
+                raise RuntimeError(f"{self.county}: EagleWeb page {page_num} repeated an earlier page; pagination stuck")
+            seen_signatures.add(self._page_signature)
+            rows_seen_total += rows_seen
+            if page_num == 1:
+                m = re.search(r"([\d,]+)\s+items?\s+found", await self.page.inner_text("body"), re.IGNORECASE)
+                items_found = int(m.group(1).replace(",", "")) if m else None
+
             new_count = 0
             new_records: list[ScrapedRecord] = []
             for record in records:
@@ -713,9 +857,10 @@ class EagleWebScraper(BridgeScraper):
                     new_records.append(record)
                     new_count += 1
 
-            _logger.info("Page %d — %d new records (total: %d)", page_num, new_count, len(all_records))
+            _logger.info("Page %d — %d rows, %d new matching records (total: %d)",
+                         page_num, rows_seen, new_count, len(all_records))
 
-            if new_count == 0:
+            if rows_seen == 0:
                 break
 
             # Fetch parcel IDs from detail pages via HTTP (fast, concurrent)
@@ -728,17 +873,54 @@ class EagleWebScraper(BridgeScraper):
                 _logger.info("  Fetching parcel IDs for %d records via HTTP...", len(needs_parcel))
                 await self._fetch_parcel_ids_from_details(needs_parcel)
 
-            # Check for Next page link
-            has_next = await self._go_next_page()
-            if not has_next:
+            if items_found is not None and rows_seen_total >= items_found:
+                break  # every row the portal reported has been read
+            if page_num >= max_pages:
+                if not await self._next_page_link():
+                    break  # the result set ends exactly on the cap page
+                raise RuntimeError(
+                    f"{self.county}: EagleWeb hit the {max_pages}-page cap with more results; results incomplete"
+                )
+            if not await self._go_next_page():
                 break
 
             await self.polite_delay()
+
+        if items_found is not None and rows_seen_total != items_found:
+            raise RuntimeError(
+                f"{self.county}: EagleWeb read {rows_seen_total} rows but the portal reported {items_found}; results incomplete"
+            )
 
         parcels_found = sum(1 for r in all_records if r.parcel_id)
         _logger.info("Parcel IDs found: %d/%d (%.0f%%)", parcels_found, len(all_records),
                      (parcels_found / len(all_records) * 100) if all_records else 0)
         return all_records
+
+    async def _use_largest_page_size(self) -> None:
+        """Switch the results to the largest "Results Per Page" the portal offers.
+
+        Some sites default to 5 rows a page (Clallam), which turns a week into 40+
+        page loads. The portal's own pageSize() handler just reloads page 1 of the same
+        search with ``pageSize=N``; we load that URL. No selector = nothing to do."""
+        from urllib.parse import parse_qs, urljoin, urlparse
+
+        sizes = await self.page.evaluate(r"""
+            (() => {
+                for (const sel of document.querySelectorAll('select')) {
+                    if (!(sel.getAttribute('onchange') || '').includes('pageSize')) continue;
+                    const vals = Array.from(sel.options).map(o => parseInt(o.value, 10)).filter(n => n > 0);
+                    return {max: Math.max(...vals), current: parseInt(sel.value, 10)};
+                }
+                return null;
+            })()
+        """)
+        if not sizes or not sizes["max"] or sizes["max"] <= (sizes["current"] or 0):
+            return
+        search_id = parse_qs(urlparse(self.page.url).query).get("searchId", ["0"])[0]
+        url = urljoin(self.page.url, f"docSearchResults.jsp?searchId={search_id}&page=1"
+                                     f"&pageSize={sizes['max']}&sort=&sort2=&dir=")
+        await self.page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+        _logger.info("Results per page %s -> %s", sizes["current"], sizes["max"])
 
     async def _extract_page(self, page_num: int = 1) -> list[ScrapedRecord]:
         """Extract records from the current EagleWeb results page via JavaScript.
@@ -748,11 +930,14 @@ class EagleWebScraper(BridgeScraper):
         Also captures detail page links for parcel ID extraction.
         """
         records: list[ScrapedRecord] = []
+        # Paging evidence for _extract_all_pages: None = page unreadable, else rows shown.
+        self._page_rows_seen: int | None = None
+        self._page_signature: str | None = None
 
         try:
             # Extract directly via JavaScript — more reliable than BeautifulSoup
             # Also capture detail page links (href containing docDetail) for parcel lookups
-            raw = await self.page.evaluate(r"""
+            page_data = await self.page.evaluate(r"""
                 (() => {
                     const tables = document.querySelectorAll('table');
                     let bestTable = null, bestRows = 0;
@@ -763,7 +948,21 @@ class EagleWebScraper(BridgeScraper):
                             if (rows > bestRows) { bestRows = rows; bestTable = t; }
                         }
                     }
-                    if (!bestTable) return [];
+                    if (!bestTable) return {results: [], shown: 0, signature: ''};
+                    // Every result row the portal shows, whatever its type or date
+                    // format (paging evidence; the filters below drop some rows).
+                    // Counted on the table that OWNS the Description/Summary header:
+                    // bestTable can be the page's outer layout table (Clallam).
+                    const ownHeaders = t => Array.from(t.querySelectorAll(
+                        ':scope > thead > tr > th, :scope > tbody > tr > th, :scope > tr > th'
+                    )).map(h => h.textContent.trim().toUpperCase());
+                    const resultsTable = Array.from(tables).find(t => {
+                        const h = ownHeaders(t);
+                        return h.includes('DESCRIPTION') || h.includes('SUMMARY');
+                    }) || bestTable;
+                    const shownRows = Array.from(resultsTable.querySelectorAll(
+                        ':scope > tbody > tr, :scope > tr'
+                    )).filter(r => r.querySelectorAll(':scope > td').length >= 2);
 
                     // Build header-to-index map for flexible column extraction
                     const ths = Array.from(bestTable.querySelectorAll('th'));
@@ -806,14 +1005,22 @@ class EagleWebScraper(BridgeScraper):
                         }
                         results.push({desc, summary, summaryHtml, detailHref, parcel});
                     }
-                    return results;
+                    return {results, shown: shownRows.length,
+                            signature: shownRows.length ? shownRows[0].textContent.trim() : ''};
                 })()
             """)
+            raw = page_data["results"]
 
+            if not raw and page_data["shown"]:
+                # Rows were shown, none in a parseable shape (e.g. marriage affidavits).
+                self._page_rows_seen = page_data["shown"]
+                self._page_signature = page_data["signature"]
+                return []
             if not raw:
                 page_text = await self.page.inner_text("body")
                 if "No documents found" in page_text or "0 items found" in page_text:
                     _logger.info("No results found on this page")
+                    self._page_rows_seen = 0
                     return []
                 # No results table AND no genuine empty-marker. On page 1 this
                 # means the search page never rendered (block / captcha / error,
@@ -827,9 +1034,13 @@ class EagleWebScraper(BridgeScraper):
                         f"Block marker: {detect_block(page_text) or 'none'}; "  # P0-04: never the page text
                         f"body {len(page_text or '')} chars"
                     )
+                # Paging stops on the portal's total or its last Next link, so a
+                # page we navigated to must render; a missing table is a failed read.
                 _logger.warning("Could not find results table via JS (page %d)", page_num)
-                return []
+                return []  # _page_rows_seen stays None -> caller raises
 
+            self._page_rows_seen = page_data["shown"]
+            self._page_signature = page_data["signature"]
             import re
             parcel_source_counts = {"table": 0, "summary_labeled": 0, "summary_digit": 0, "none_yet": 0}
             for item in raw:
@@ -852,6 +1063,9 @@ class EagleWebScraper(BridgeScraper):
                     parcel_source_counts["table"] += 1
 
                 # Parse AFN from description and store in enrichment_data
+                # shortcut: a year-dashed instrument (Clallam 2026-1486473) loses its year
+                # here; keeping it changes raw_html_hash, the within-job retry key (Codex),
+                # so fix it with a legacy-hash copy before changing this.
                 afn_match = re.search(r"\b(\d{5,})\b", desc)
                 if afn_match:
                     record.enrichment_data["instrument_number"] = afn_match.group(1)
@@ -959,7 +1173,7 @@ class EagleWebScraper(BridgeScraper):
                                 if parcel_match:
                                     pid = parcel_match.group(1)
                                     # Skip instrument numbers (start with 2024/2025/2026)
-                                    if pid[:4] not in ("2024", "2025", "2026"):
+                                    if not _looks_like_instrument_year(pid):
                                         record.parcel_id = pid
                                         parcel_source_counts["summary_digit"] += 1
                                     else:
@@ -1006,6 +1220,8 @@ class EagleWebScraper(BridgeScraper):
                                 kws = _DOC_TYPE_MAP.get(active_rt, [])
                             if not _doc_type_matches(doc_upper, kws):
                                 continue  # Skip non-matching doc types
+                            if active_rt == "death_certificate" and _doc_label(desc) not in _DEATH_CERT_LABELS:
+                                continue  # e.g. "Affidavit of Death", a TOD deed
                             excludes = _DOC_TYPE_EXCLUDE.get(active_rt, [])
                             if any(neg in doc_upper for neg in excludes):
                                 continue  # e.g. "LACK OF PROBATE AFFIDAVIT"
@@ -1014,7 +1230,9 @@ class EagleWebScraper(BridgeScraper):
                                 # foreclosure was cancelled/cured (Discontinuance,
                                 # Rescission) or is pure trustee admin (Substitution
                                 # of Trustee) is NOT active distress — drop it.
-                                if is_cancellation_or_admin(desc):
+                                # Clallam marks its discontinuances only in the party
+                                # cell, so check the raw summary too (before orientation).
+                                if is_cancellation_or_admin(desc) or _DISCONTINUANCE_RE.search(summary):
                                     continue
                                 # Borrower orientation: an NTS is often indexed with
                                 # the trustee company as grantor and the borrower as
@@ -1026,7 +1244,7 @@ class EagleWebScraper(BridgeScraper):
                                 if oriented is None:
                                     continue
                                 record.party_name, record.heirs = oriented
-                            elif active_rt == "probate":
+                            elif active_rt in ("probate", "death_certificate"):
                                 # Death-certificate party orientation via the shared
                                 # single-source helper. On a Cert of Death the recorder
                                 # indexes the issuing AGENCY/state as grantor with the
@@ -1057,6 +1275,7 @@ class EagleWebScraper(BridgeScraper):
             raise  # block/error signal — must fail the job, not return []
         except Exception as exc:
             _logger.warning("Error extracting page: %s", str(exc)[:80])
+            self._page_rows_seen = None  # partial page: caller must not treat it as read
 
         return records
 
@@ -1118,7 +1337,7 @@ class EagleWebScraper(BridgeScraper):
                 if legal_idx > -1:
                     section = text[legal_idx:legal_idx + 1000]
                     m = _re.search(r'\b(\d{10,})\b', section)
-                    if m and not m.group(1).startswith(("2024", "2025", "2026")):
+                    if m and not _looks_like_instrument_year(m.group(1)):
                         return m.group(1)
             except Exception:
                 pass
@@ -1147,19 +1366,23 @@ class EagleWebScraper(BridgeScraper):
 
         _logger.info("  Detail pages (HTTP): found %d parcel IDs from %d lookups", found, len(items))
 
+    async def _next_page_link(self):
+        """The enabled Next page link, or None."""
+        next_link = self.page.locator("a:has-text('Next'), a:has-text('next'), a:has-text('>>')")
+        if await next_link.count() == 0:
+            return None
+        first = next_link.first
+        cls = await first.get_attribute("class") or ""
+        return None if "disabled" in cls.lower() else first
+
     async def _go_next_page(self) -> bool:
-        """Click the Next page link if present."""
-        try:
-            next_link = self.page.locator("a:has-text('Next'), a:has-text('next'), a:has-text('>>')")
-            if await next_link.count() > 0:
-                # Check if it's clickable (not disabled)
-                first = next_link.first
-                cls = await first.get_attribute("class") or ""
-                if "disabled" in cls.lower():
-                    return False
-                await first.click()
-                await self.page.wait_for_timeout(2_000)
-                return True
-        except Exception:
-            pass
-        return False
+        """Click the Next page link if present. A failed or timed-out load raises:
+        swallowing it would end paging early and silently."""
+        link = await self._next_page_link()
+        if link is None:
+            return False
+        # Wait for the next page to finish loading: a fixed sleep let slow pages be
+        # read half-rendered (live 2026-11-12: Clallam/Island rows went missing).
+        async with self.page.expect_navigation(wait_until="load", timeout=60_000):
+            await link.click()
+        return True

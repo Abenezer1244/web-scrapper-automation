@@ -33,6 +33,7 @@ from src.scrapers.preforeclosure import (
 )
 from src.scrapers.probate import orient_probate_party
 from src.scrapers.reliability import ScraperExecutionError, TransientScrapeError
+from src.utils.celery_limits import reraise_time_limit
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("scraper.clark_wa")
@@ -167,6 +168,9 @@ def verify_chunk(
     if not (_same_day(m["begin"], date_from) and _same_day(m["end"], date_to)):
         raise fail(f"results answer {m['begin']}..{m['end']}, not the submitted window")
     total = true_total
+    bad = [i for i in doc_ids if not str(i).isdigit()]
+    if bad:
+        raise fail(f"{len(bad)} result rows without a numeric document id")
     distinct = len(set(doc_ids))
     if distinct != len(doc_ids):
         raise fail(f"{len(doc_ids) - distinct} duplicate document rows across pages")
@@ -298,6 +302,7 @@ class ClarkWAScraper(BridgeScraper):
             else:
                 _logger.info("No SetDisclaimer function — continuing")
         except Exception as exc:
+            reraise_time_limit(exc)
             _logger.info("Disclaimer: %s", str(exc)[:80])
 
     async def _search_chunk(self, date_from: str, date_to: str) -> list[ScrapedRecord]:
@@ -324,7 +329,8 @@ class ClarkWAScraper(BridgeScraper):
             cb = self.page.locator(f"#dt-DocumentType-{val}")
             try:
                 await cb.check(timeout=5000)
-            except Exception:
+            except Exception as exc:
+                reraise_time_limit(exc)
                 # Fallback: force via JS
                 await self.page.evaluate(f"""() => {{
                     const cb = document.querySelector('#dt-DocumentType-{val}');
@@ -378,6 +384,7 @@ class ClarkWAScraper(BridgeScraper):
                 timeout=60_000,
             )
         except Exception as exc:
+            reraise_time_limit(exc)
             raise TransientScrapeError(
                 "clark", "LandmarkWeb", "results never rendered",
                 record_type=self._record_type, date_from=date_from, date_to=date_to,
@@ -420,7 +427,8 @@ class ClarkWAScraper(BridgeScraper):
                 "/\\d/.test(document.querySelector('#showCountSpan')?.textContent || '')",
                 timeout=20_000,
             )
-        except Exception:
+        except Exception as exc:
+            reraise_time_limit(exc)
             return None
         txt = await self.page.evaluate("document.querySelector('#showCountSpan').textContent")
         digits = re.sub(r"\D", "", txt or "")
@@ -441,6 +449,7 @@ class ClarkWAScraper(BridgeScraper):
                 arg=prev_first_id, timeout=30_000,
             )
         except Exception as exc:
+            reraise_time_limit(exc)
             raise TransientScrapeError(
                 "clark", "LandmarkWeb", "next results page never loaded",
                 record_type=self._record_type,

@@ -37,6 +37,12 @@ def test_short_read_fails():
         _check(_288, ids=[str(i) for i in range(287)])
 
 
+def test_rows_without_the_portals_numeric_id_fail():
+    # Row ids are "doc_<documentId>_<row>"; a changed format must not be counted as documents.
+    with pytest.raises(ScraperExecutionError, match="numeric document id"):
+        _check(_288, ids=[str(i) for i in range(287)] + [""])
+
+
 def test_duplicate_rows_across_pages_fail():
     with pytest.raises(ScraperExecutionError, match="duplicate"):
         _check(_288, ids=[str(i) for i in range(287)] + ["0"])

@@ -84,6 +84,48 @@ DEATH CERTIFICATE 405, WILL 1. 1,128 of 3,467 rows `is_duplicate`.
   re-review PASS. Live read-only 2026-11-14: probate Q1 288 docs -> 281 leads; explicit zero day;
   729-row window over 2 pages reconciled; pre_foreclosure 60 d 74 leads (58 NTS, 16 LP).
   Open finding: recorder PIDs are 6/7/8/9/10 digits (9 = PAN); not normalized without evidence.
-- [ ] Phase 2: trustee_sale per owner decision
-- [ ] Phase 3: death_certificate type
-- [ ] Per-type Codex reviews, final adversarial review, report
+- [x] Phase 2: Clark trustee_sale hold (`SourceUnavailableError`, fixed customer text, permanent,
+  never billed). Codex: FAIL (message never reached users; test fixture leaked rows), both fixed,
+  re-review PASS. Worker-level test needs the real test DB (CI only).
+- [x] Phase 3: death_certificate (code 62, decedent oriented, PID required). Live 60 d: 21 docs ->
+  18 leads. No connector change (ships dark). Codex: no findings.
+- [x] Final adversarial review (Review C): NO-GO with 4 findings, resolved below.
+- [ ] Owner: push / PR / deploy / connector changes (all need approval)
+
+## Review C (final adversarial, 2026-11-14) — resolution
+1. High "a server cap fails busy windows permanently": REFUTED by measurement. A 2023-01-01..
+   2026-10-31 probate window (Show Count 3,885) read completely over 8 pages of 500 and
+   reconciled; header then reads "Returned 500 records of" (blank), which resolve_total already
+   refuses. Clark 30-day windows hold ~150. No bisection code added.
+2. Medium "catch-alls swallow Celery time limits": FIXED, `reraise_time_limit` in all three handlers.
+3. Medium "no real-portal contract test": PARTIAL. Added row-id format check + test; DOM path is
+   verified by the live runs above, not by a committed HTML fixture (real rows carry names).
+4. Medium rollout: production has ONE Clark trustee_sale config, manual (no schedule), so no
+   repeated failure notices. Canary will mark connector 8037af43 'down' once (one ops alert) and
+   hide Auction leads from the Clark picker: expected for the hold.
+
+## Seven-type matrix (2026-11-14)
+
+| type | implementation | source | status |
+|---|---|---|---|
+| probate | existing, repaired | Auditor recorder LandmarkWeb (free, no login) | Implemented, awaiting deploy validation |
+| pre_foreclosure | existing, repaired | same (NTS, LP, NOTDEF, NF, FORECL, TRSL) | Implemented, awaiting deploy validation |
+| trustee_sale | existing, held | Columbian classifieds (barren); recorder images need OCR | Blocked by source access (hold), OCR later |
+| death_certificate | new | recorder DEATH CERTIFICATE (recorded copies) | Implemented, inactive (connector change needs approval) |
+| tax_delinquent | none | no delinquency list; Bid4Assets seasonal; paydici balances | Blocked by source access |
+| code_violation | none | county ArcGIS layer, "not subject to public disclosure, no dump" | Blocked by legal/data restrictions |
+| divorce | none | Odyssey index; AOC policy bars commercial solicitation | Blocked by legal/data restrictions |
+
+## Activation prerequisites (owner approval for each)
+1. PR + CI green (CI runs the DB-backed worker test).
+2. Deploy api, then worker, then beat (no migration in this branch).
+3. Verify: one Clark probate and one pre_foreclosure manual run finish DONE with records_found set.
+4. death_certificate: `UPDATE county_connectors SET record_types = record_types || '["death_certificate"]'
+   WHERE id = '70bb5315-1cec-428b-9f7d-b5058293083e';` (or a migration) only after approval.
+5. Clark OCR trustee_sale: after feat/chelan-nts-ocr merges.
+
+## Review
+Three defect families fixed in the live Clark recorder scraper, Clark Auction leads put on an
+honest hold, a dark death_certificate type added, three types documented as blocked with
+evidence. Not done: Playwright UI QA (no frontend change; meaningful only after deploy), PID
+normalization (6-10 digit PIDs observed, mailing coverage historically 98.8%), OCR trustee_sale.

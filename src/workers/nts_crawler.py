@@ -1269,6 +1269,36 @@ _RECORDER_PDF_MAX_BYTES = 20 * 1024 * 1024
 # A pending row older than this loses its OCR text (it names the borrower).
 RECORDER_PENDING_TTL_DAYS = 30
 RECORDER_EXPIRED_NOTE = "expired unreviewed"
+# A notice waiting longer than this for review is a lead customers are not getting, so
+# the county's cache stops counting as fresh (the trustee_sale scraper reports it).
+RECORDER_REVIEW_LAG_DAYS = 3
+
+
+def chelan_cache_is_fresh(summary: dict) -> bool:
+    """Whether a crawl run may record Chelan's NTS heartbeat: the source was read in
+    full (discovery done, every recording staged or already settled). Pure. Review lag
+    is judged separately, at delivery time (chelan_unresolved_reason)."""
+    if summary.get("error") or summary.get("skipped"):
+        return False
+    return not any(summary.get(k) for k in ("failed", "invalid", "unread"))
+
+
+def chelan_unresolved_reason(db, now: datetime) -> str | None:
+    """Why Chelan's notice cache is short, or None: a recording first seen more than
+    RECORDER_REVIEW_LAG_DAYS ago that is still awaiting review, or could not be read
+    (failed, including expired unreviewed), until an operator approves or rejects it.
+    It counts wherever the recording now sits, inside the crawl window or not (Codex)."""
+    from sqlalchemy import func, select
+
+    from src.db.models import NtsRecorderDocument as Doc
+
+    oldest = db.execute(select(func.min(Doc.created_at)).where(
+        Doc.county == "chelan", Doc.status.in_(("pending_review", "failed")),
+        Doc.created_at < now - timedelta(days=RECORDER_REVIEW_LAG_DAYS))).scalar()
+    if oldest is None:
+        return None
+    return (f"recorded trustee-sale notices unresolved since {oldest.date().isoformat()} "
+            "(operator review: scripts/nts_review.py list)")
 
 
 def purge_stale_recorder_documents(db, now: datetime | None = None) -> int:
@@ -1384,7 +1414,7 @@ class ReviewError(ValueError):
     """An approval or rejection the staged row's state or the reviewer's input forbids."""
 
 
-def _recorder_doc_for_review(db, doc_id: str):
+def _recorder_doc_for_review(db, doc_id: str, statuses: tuple[str, ...] = ("pending_review",)):
     from sqlalchemy import select
 
     from src.db.models import NtsRecorderDocument as Doc
@@ -1392,8 +1422,8 @@ def _recorder_doc_for_review(db, doc_id: str):
     doc = db.execute(select(Doc).where(Doc.id == doc_id).with_for_update()).scalar_one_or_none()
     if doc is None:
         raise ReviewError("no staged document with that id")
-    if doc.status != "pending_review":
-        raise ReviewError(f"the document is {doc.status}, not pending review")
+    if doc.status not in statuses:
+        raise ReviewError(f"the document is {doc.status}, not " + " or ".join(s.replace("_", " ") for s in statuses))
     if (doc.county, doc.state) != ("chelan", "WA"):
         raise ReviewError("only Chelan County recordings are reviewed here")
     return doc
@@ -1533,10 +1563,12 @@ def approve_recorder_document(db, doc_id: str, *, reviewer: str, values: dict,
 def reject_recorder_document(db, doc_id: str, *, reviewer: str, reason: str) -> None:
     """The staged read is not a usable notice (wrong document, unreadable, a sale the
     reviewer cannot confirm): nothing reaches nts_notices, and the OCR text and OCR'd
-    fields go. ``reason`` is one of REJECT_REASONS. Caller commits."""
+    fields go. ``reason`` is one of REJECT_REASONS. A recording that could not be read
+    (failed) can be rejected too, so a scan no retry will ever read stops being retried
+    and stops holding the county's cache stale. Caller commits."""
     if reason not in REJECT_REASONS:
         raise ReviewError(f"the reason must be one of {REJECT_REASONS}")
-    doc = _recorder_doc_for_review(db, doc_id)
+    doc = _recorder_doc_for_review(db, doc_id, ("pending_review", "failed"))
     now = datetime.now(UTC)
     doc.status, doc.ocr_text, doc.decision_note = "rejected", None, reason
     doc.reviewed_by, doc.reviewed_at, doc.updated_at = reviewer, now, now
@@ -1562,7 +1594,7 @@ _CHELAN_DOC_RESERVE_S = _DETAIL_FETCH_S + _PDF_FETCH_S + 2 * 60 + 2 * _CHELAN_PA
 @app.task(name="src.workers.nts_crawler.crawl_nts_chelan_recorder",
           soft_time_limit=50 * 60, time_limit=55 * 60)
 def crawl_nts_chelan_recorder() -> dict:
-    """Stage Chelan County NTS recordings for review (phase 4a-2; not scheduled yet).
+    """Stage Chelan County NTS recordings for review (beat: crawl-nts-chelan-recorder).
 
     Purge first, then: recorder search (browser) for NTS/NTSCOM over the last
     _CHELAN_WINDOW_DAYS -> each recording not yet staged -> its detail page and PDF
@@ -1663,6 +1695,10 @@ def crawl_nts_chelan_recorder() -> dict:
                 _logger.warning("Chelan NTS %s not staged: %s", doc["item_id"], type(exc).__name__)
                 status = "failed"
             summary["staged" if status == "pending_review" else status] += 1
+        with system_sync_session() as db:
+            if chelan_cache_is_fresh(summary):
+                _record_crawl_heartbeat(db, "chelan")
+            error = chelan_unresolved_reason(db, datetime.now(UTC))
         _logger.info("Chelan NTS recorder crawl: %s", summary)
         return summary
     except SoftTimeLimitExceeded:

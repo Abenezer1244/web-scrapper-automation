@@ -216,6 +216,22 @@ def test_rejection_writes_no_notice_and_keeps_only_the_recordings_facts(db, tmp_
     assert db.execute(select(NtsNotice).where(NtsNotice.ts_number == "REC-2627534")).first() is None
 
 
+def test_an_unreadable_recording_can_be_rejected_so_it_stops_being_retried(db, tmp_path):
+    doc = {"item_id": "9900020", "instrument": "2627543", "doc_code": "NTS", "record_date": "09/28/2026"}
+    assert stage_recorder_document(db, county="chelan", state="WA", doc=doc, detail_html=_DETAIL,
+                                   pdf=b"<html>not a pdf</html>", tesseract=_tool(tmp_path, "tess_ok", _OK)) == "failed"
+    db.flush()
+    doc_id = str(db.execute(select(Doc.id).where(Doc.transaction_item_id == "9900020")).scalar_one())
+    with pytest.raises(ReviewError, match="not pending review"):
+        approve_recorder_document(db, doc_id, reviewer="op-1", values=_values())   # nothing to confirm
+    reject_recorder_document(db, doc_id, reviewer="op-1", reason="unreadable")
+    db.flush()
+    assert db.get(Doc, doc_id).status == "rejected"
+    # Settled: the next crawl's re-read leaves it alone.
+    assert stage_recorder_document(db, county="chelan", state="WA", doc=doc, detail_html=_DETAIL,
+                                   pdf=recorder_pdf(1), tesseract=_tool(tmp_path, "tess_ok", _OK)) == "kept"
+
+
 # ── privacy and concurrency ──
 
 def _withholding_rule(db, monkeypatch, subject: str) -> str:

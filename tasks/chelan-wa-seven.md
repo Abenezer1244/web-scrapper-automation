@@ -113,8 +113,11 @@ Codex consult on 4a-3 (2026-11-13), reconciled:
 - P2 dual paths (pre_foreclosure + trustee_sale for one recording): a live check before activation (dedup hash, matcher attachment)
 - P2 REC- identity: notice id re-selected by (source, ts_number), fetched_at set explicitly; approval is one-shot (a correction = supersede with a fresh approval, out of scope)
 
-4a-3b: delivery (≤5 files)
-- [ ] `ChelanWATrusteeSaleScraper` (collection_scope: recorded notices, reviewed), migration 159 adds the inactive Chelan `trustee_sale` connector (Benton 155 pattern), Chelan in `NTS_MATCH_COUNTIES`, crawl records the `nts_crawl:chelan` heartbeat when discovery completed, beat entry for `crawl_nts_chelan_recorder`, Dockerfile `tesseract-ocr`
+4a-3b: delivery (8 files: over the 5-file rule; the Dockerfile, matcher and beat changes are one line each)
+- [x] `ChelanWATrusteeSaleScraper` (scope: recorded notices, each reviewed), migration 159 adds the Chelan `trustee_sale` connector INACTIVE (Benton 155 pattern; stays off until 4a-3c), beat `crawl-nts-chelan-recorder` 09:50 UTC (50-min limit ends before the 11:00 matcher), Dockerfile `tesseract-ocr`
+- [x] Freshness: the crawl records `nts_crawl:chelan` only after a complete read (`chelan_cache_is_fresh`). Review lag is judged at delivery time: the Chelan scraper's `_source_gap` hook (`chelan_unresolved_reason`) reports the cache short while any recording first seen more than 3 days ago is still pending review or unreadable (failed, including expired), wherever it now sits; the crawl alerts on the same reason
+- Codex review 1 (NO-GO, 1 High 2 Medium), fixed: (High) Chelan is NOT in `NTS_MATCH_COUNTIES` yet: matching would stamp approved sales onto pre_foreclosure leads customers already get, before discontinuances are reconciled; 4a-3c adds it. (Medium x2) withholding a heartbeat cannot enforce the review deadline (an earlier heartbeat stays valid 3 days) and missed failed/expired rows outside the window: moved to the delivery-time check above
+- [x] A recording whose scan cannot be read (`failed`) can be rejected (`unreadable`), so it stops being retried and stops holding the cache stale; `list` shows unreadable rows too
 
 4a-3c: discontinuance (needs a live look at a Chelan NOD detail page first)
 - [ ] Recorded Notice of Discontinuance (`NOD`) naming an approved NTS sets `cancelled_at` + inactive and clears stamped leads (Benton's statement, same advisory lock)

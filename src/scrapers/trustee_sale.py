@@ -8,7 +8,8 @@ row. Every lead therefore has a real auction date + amount owing by construction
 
 Only counties with an NTS crawler feeding the cache have data: Pierce (Tacoma Daily
 Index), Snohomish (Snoho Tribune), King (Queen Anne News), Clark (The Columbian
-classifieds), Asotin (Lewiston Tribune on nwmarket.com) — mirrors
+classifieds), Asotin (Lewiston Tribune on nwmarket.com), Benton (the county recorder's
+own recorded notices) — mirrors
 ``nts_matcher_task.NTS_MATCH_COUNTIES``. A county with no
 notices yields zero leads (the SELECT returns nothing), never an error.
 
@@ -306,6 +307,7 @@ class _TrusteeSaleScraper(BridgeScraper):
                         *conditions[:-1], NtsNotice.auction_date > horizon
                     )
                 ).scalar_one()
+            source_gap = self._source_gap(db, datetime.now(UTC))
         _logger.info(
             "trustee_sale %s: auctions %s..%s (%s) -> %d notice(s)",
             self.COUNTY, today, horizon or "no horizon",
@@ -322,7 +324,7 @@ class _TrusteeSaleScraper(BridgeScraper):
         records = [_record_from_notice(n) for n in notices]
         stale = cache_staleness_reason(
             (heartbeat or {}).get("last_success_at"), last_fetched_at, datetime.now(UTC)
-        )
+        ) or source_gap
         if stale and not records:
             # An empty result from a cache nobody is refreshing is not "no sales".
             raise ScraperExecutionError(
@@ -354,6 +356,11 @@ class _TrusteeSaleScraper(BridgeScraper):
             # record count is real and is what the Records tile reads.
             self.on_progress(0, 0, len(records))
         return records
+
+    def _source_gap(self, db, now: datetime) -> str | None:
+        """Why this county's cache is known to lack notices its source holds, beyond
+        crawl freshness, or None. Counties whose crawl writes notices directly have none."""
+        return None
 
     async def __aenter__(self) -> _TrusteeSaleScraper:
         return self
@@ -402,6 +409,34 @@ class BentonWATrusteeSaleScraper(_TrusteeSaleScraper):
             kind="document_type",
             items=(DocTypeItem(label="Notice of Trustee Sale", exact=True),),
             note="Recorded trustee-sale notices read from the Benton County Auditor's recorded documents.",
+        )
+
+
+class ChelanWATrusteeSaleScraper(_TrusteeSaleScraper):
+    """Chelan County (WA) auction leads — recorded notices (scan-only, OCR'd), each one
+    checked by an operator against its recorded image before it is a notice
+    (nts_crawler.approve_recorder_document), not a newspaper."""
+
+    COUNTY = "chelan"
+
+    def _source_gap(self, db, now: datetime) -> str | None:
+        # A recording not yet reviewed (or not readable) is a sale missing from the cache,
+        # however fresh the crawl is (Codex): checked here, at delivery time.
+        from src.workers.nts_crawler import chelan_unresolved_reason
+
+        return chelan_unresolved_reason(db, now)
+
+    @classmethod
+    def collection_scope(cls, record_type: str):
+        from src.scrapers.doc_scope import CollectionScope, DocTypeItem
+
+        if record_type != RECORD_TYPE:
+            return None
+        return CollectionScope(
+            kind="document_type",
+            items=(DocTypeItem(label="Notice of Trustee Sale", exact=True),),
+            note="Recorded trustee-sale notices from the Chelan County Auditor's recorded documents, "
+                 "each reviewed against its recorded image.",
         )
 
 

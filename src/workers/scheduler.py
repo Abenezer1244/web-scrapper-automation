@@ -340,6 +340,13 @@ app.conf.beat_schedule = {
         "task": "src.workers.nts_crawler.crawl_nts_nwmarket_asotin",
         "schedule": crontab(hour=10, minute=0),  # 10:00 UTC daily
     },
+    "crawl-nts-chelan-recorder": {
+        # NTS (Chelan): recorded notices are scans; each new one is OCR'd into staging for
+        # an operator to approve (scripts/nts_review.py). Daily; the 30-day window overlaps
+        # so a recording indexed late is still found. Up to ~50 min, done before 11:00.
+        "task": "src.workers.nts_crawler.crawl_nts_chelan_recorder",
+        "schedule": crontab(hour=9, minute=50),  # 09:50 UTC daily
+    },
     "purge-nts-recorder-staging": {
         # OCR'd recorder notices nobody reviewed lose their text (it names the borrower)
         # after RECORDER_PENDING_TTL_DAYS, on this schedule, not only when a crawl runs.

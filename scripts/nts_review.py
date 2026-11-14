@@ -5,7 +5,8 @@ The operator must be an admin with MFA (the privacy operators' check, run as the
 migration role and rolled back); every read and write then goes through the system role.
 
 Commands
-  list      notices awaiting review: id, instrument, code, recorded, pages, flags (no names)
+  list      notices awaiting review, and unreadable ones (retried daily until rejected):
+            id, status, instrument, code, recorded, pages, flags (no names)
   show      one notice's OCR text, read fields, evidence, flags and the recorded image's URL.
             The text names the borrower: for the operator's eyes only.
   approve   write the notice confirmed against the image. Required: --doc, --sale-date
@@ -73,14 +74,15 @@ def _image_url(doc) -> str:
 
 
 def cmd_list(db, op, args) -> None:
-    rows = db.execute(select(Doc).where(Doc.status == "pending_review")
+    rows = db.execute(select(Doc).where(Doc.status.in_(("pending_review", "failed")))
                       .order_by(Doc.record_date, Doc.instrument_number)).scalars().all()
     for d in rows:
         f = d.fields or {}
-        print(f"{d.id}  {d.instrument_number}  {d.doc_code:<6} recorded {d.record_date}  "
+        print(f"{d.id}  {d.status:<14} {d.instrument_number}  {d.doc_code:<6} recorded {d.record_date}  "
               f"pages {d.page_count}  flags {len(f.get('flags') or [])}  "
               f"corroborated {bool(f.get('corroborated'))}")
-    print(f"{len(rows)} awaiting review")
+    print(f"{len(rows)} awaiting review or unreadable (an unreadable one is retried daily "
+          f"until rejected: reject --reason unreadable)")
 
 
 def cmd_show(db, op, args) -> None:

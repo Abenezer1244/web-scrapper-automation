@@ -50,10 +50,9 @@ def test_the_scope_says_recorded_and_reviewed_not_newspaper():
     assert ChelanWATrusteeSaleScraper.collection_scope("probate") is None
 
 
-def test_the_crawl_runs_daily_before_the_matcher_but_chelan_is_not_matched_yet():
-    # Matching would stamp approved sales onto pre_foreclosure leads customers already
-    # receive, before recorded discontinuances are reconciled (Codex High): 4a-3c adds it.
-    assert "chelan" not in NTS_MATCH_COUNTIES
+def test_chelan_notices_reach_the_matcher_and_the_crawl_runs_daily_before_it():
+    # Added with discontinuance reconciliation (4a-3c), not before (Codex High, 4a-3b).
+    assert "chelan" in NTS_MATCH_COUNTIES
     from src.workers.scheduler import app
 
     crawl = app.conf.beat_schedule["crawl-nts-chelan-recorder"]

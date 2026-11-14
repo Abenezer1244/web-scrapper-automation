@@ -283,6 +283,36 @@ def related_deeds_of_trust(detail_html: str) -> list[str] | None:
     return found
 
 
+# One related document per link: <a onclick="JumpToTransactionItemId('616487')">2248127</a>,
+# optionally tagged with its type ("2625826 [NTS]"). Live 2026-11-14.
+_RELATED_LINK_RE = re.compile(
+    r"JumpToTransactionItemId\('\d+'\)\"\s*>\s*(\d{5,})\s*(?:\[([A-Z]{1,12})\])?\s*</a>")
+
+
+def detail_doc_code(detail_html: str) -> str | None:
+    """The document code the detail page states ("Doc Type: NOD - NOTICE OF ..."), or
+    None when it is not a readable detail page."""
+    text = _detail_text(detail_html)
+    m = re.search(r"Doc Type:\s*([A-Z]{1,12})\s+-", text or "")
+    return m.group(1) if m else None
+
+
+def related_numbers(detail_html: str) -> list[tuple[str, str | None]] | None:
+    """Every document the detail page's "Related Number" block links, as (recording
+    number, type code or None when untagged), in order. None when the page is not a
+    readable detail page; [] when it links nothing."""
+    if _detail_text(detail_html) is None:
+        return None
+    i = detail_html.find("Related Number")
+    if i < 0:
+        return []
+    found: list[tuple[str, str | None]] = []
+    for number, code in _RELATED_LINK_RE.findall(detail_html[i:i + 20000]):
+        if (number, code or None) not in found:
+            found.append((number, code or None))
+    return found
+
+
 def corroborate(fields: dict, recording_apns: list[str] | None,
                 related_dts: list[str] | None) -> tuple[dict[str, str], list[str]]:
     """Compare what OCR read with what the recording itself says (its detail page):

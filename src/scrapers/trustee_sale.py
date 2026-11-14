@@ -8,8 +8,8 @@ row. Every lead therefore has a real auction date + amount owing by construction
 
 Only counties with an NTS crawler feeding the cache have data: Pierce (Tacoma Daily
 Index), Snohomish (Snoho Tribune), King (Queen Anne News), Clark (The Columbian
-classifieds), Asotin (Lewiston Tribune on nwmarket.com), Benton (the county recorder's
-own recorded notices) — mirrors
+classifieds), Asotin (Lewiston Tribune on nwmarket.com), Benton and Chelan (the county
+recorder's own recorded notices; Chelan's are OCR'd and operator-reviewed) — mirrors
 ``nts_matcher_task.NTS_MATCH_COUNTIES``. A county with no
 notices yields zero leads (the SELECT returns nothing), never an error.
 

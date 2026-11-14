@@ -119,8 +119,20 @@ Codex consult on 4a-3 (2026-11-13), reconciled:
 - Codex review 1 (NO-GO, 1 High 2 Medium), fixed: (High) Chelan is NOT in `NTS_MATCH_COUNTIES` yet: matching would stamp approved sales onto pre_foreclosure leads customers already get, before discontinuances are reconciled; 4a-3c adds it. (Medium x2) withholding a heartbeat cannot enforce the review deadline (an earlier heartbeat stays valid 3 days) and missed failed/expired rows outside the window: moved to the delivery-time check above
 - [x] A recording whose scan cannot be read (`failed`) can be rejected (`unreadable`), so it stops being retried and stops holding the cache stale; `list` shows unreadable rows too
 
-4a-3c: discontinuance (needs a live look at a Chelan NOD detail page first)
-- [ ] Recorded Notice of Discontinuance (`NOD`) naming an approved NTS sets `cancelled_at` + inactive and clears stamped leads (Benton's statement, same advisory lock)
+4a-3c: discontinuance
+- Live (2026-11-14, read-only): 4 Chelan NODs Aug-Nov 2026. Their public detail page carries a structured "Related Number" block, one link per document with an optional type tag: "2620779 [NTS]"; "2109037" (untagged); "2534205 [DT]"; "2248127" + "2625826 [NTS]". No PDF/OCR needed. Fixture: AFN 2628164 (names redacted)
+- Codex consult (no P0; 6 P1, 2 P2), reconciled:
+  - Auto-cancel ONLY where a related number IS an approved notice's own recording number (direct). A loan-only reference (DT or untagged, overlapping an approved notice's DTs) or a page linking nothing goes to the operator (pending_review, which holds the cache stale); never inferred from APN
+  - Approval consults stored discontinuances recorded on/after the notice: direct -> written cancelled; loan-only -> refuses until `--discontinued-by <nod>` or `--not-discontinued`
+  - The crawl reaches back to its last complete read after an outage (cap 60 days); a first run needs only the window (only notices inside it are staged; their NODs follow them)
+  - Stored failed rows are retried even outside the search window
+  - The page must state `Doc Type: NOD`; failed/invalid stays failed (retried, holds the cache stale)
+  - NTS_CANCEL_LOCK_KEY taken before anything is read, in staging, approval and resolution
+  - Migration 158 amended (unpushed, never deployed): status `discontinuance`, exempt from the reviewer CHECK (automated); ORM mirror updated; provenance (`cancelled`: instrument + basis direct/operator) on the NOD row
+- [x] `related_numbers` / `detail_doc_code` (detail page), `stage_discontinuance`, `resolve_discontinuance`, approval consult, crawl NOD discovery + reach-back + stored-failure retry
+- [x] `scripts/nts_review.py resolve-nod --cancels <instrument>... | --no-effect`; approve `--discontinued-by` / `--not-discontinued`
+- [x] Chelan added to `NTS_MATCH_COUNTIES`
+- [ ] Before the owner switches the connector on: one live check of a real recording through both paths (pre_foreclosure lead + trustee_sale lead: dedup hash, matcher attachment)
 
 ### Phase 4 (owner decisions, not started)
 - trustee_sale: sale date only in scan-only NTS PDFs (`/Image/DocumentPdfAllPages/{id}`, free, 300 dpi, no text layer). Needs OCR (Tesseract is a new dependency: SBOM check plus Railway image change). About 2 NTS per month

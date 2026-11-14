@@ -61,7 +61,8 @@ def upgrade() -> None:
         sa.UniqueConstraint("county", "transaction_item_id",
                             name="uq_nts_recorder_documents_county_item"),
         sa.CheckConstraint(
-            "status IN ('pending_review', 'approved', 'rejected', 'superseded', 'failed')",
+            "status IN ('pending_review', 'approved', 'rejected', 'superseded', 'failed', "
+            "'discontinuance')",
             name="ck_nts_recorder_documents_status",
         ),
         # Only a row awaiting review keeps OCR text (it carries the borrower's name).
@@ -69,9 +70,11 @@ def upgrade() -> None:
             "status = 'pending_review' OR ocr_text IS NULL",
             name="ck_nts_recorder_documents_text_retention",
         ),
-        # A decided row records who decided it and when.
+        # A decided row records who decided it and when. A discontinuance the crawl
+        # applied by itself (a direct reference) has no reviewer; one an operator
+        # resolved records them.
         sa.CheckConstraint(
-            "status IN ('pending_review', 'failed') OR "
+            "status IN ('pending_review', 'failed', 'discontinuance') OR "
             "(reviewed_by IS NOT NULL AND reviewed_at IS NOT NULL)",
             name="ck_nts_recorder_documents_decided",
         ),

@@ -1996,13 +1996,14 @@ class NtsRecorderDocument(Base):
         UniqueConstraint("county", "transaction_item_id",
                          name="uq_nts_recorder_documents_county_item"),
         CheckConstraint(
-            "status IN ('pending_review', 'approved', 'rejected', 'superseded', 'failed')",
+            "status IN ('pending_review', 'approved', 'rejected', 'superseded', 'failed', "
+            "'discontinuance')",
             name="ck_nts_recorder_documents_status",
         ),
         CheckConstraint("status = 'pending_review' OR ocr_text IS NULL",
                         name="ck_nts_recorder_documents_text_retention"),
         CheckConstraint(
-            "status IN ('pending_review', 'failed') OR "
+            "status IN ('pending_review', 'failed', 'discontinuance') OR "
             "(reviewed_by IS NOT NULL AND reviewed_at IS NOT NULL)",
             name="ck_nts_recorder_documents_decided",
         ),

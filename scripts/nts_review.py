@@ -14,6 +14,11 @@ Commands
             --sale-time, --address, --amount with --amount-basis (principal|sum_owing),
             --trustee, --beneficiary. --supersedes <instrument> when the image says it amends
             an approved notice; --independent when it shares a deed of trust but is a new sale.
+            A discontinuance on file that cites only this notice's loan must be answered:
+            --discontinued-by <its instrument> or --not-discontinued.
+  resolve-nod  a discontinuance the crawl could not apply on its own (it cites a loan, or
+            links nothing): --cancels <instrument> for each approved notice it ends
+            (repeatable), or --no-effect.
   reject    --doc and --reason (a fixed code, never free text that could name someone):
             nothing is written, the OCR text is dropped.
 """
@@ -42,6 +47,7 @@ from src.workers.nts_crawler import (  # noqa: E402
     ReviewError,
     approve_recorder_document,
     reject_recorder_document,
+    resolve_discontinuance,
 )
 
 
@@ -93,6 +99,9 @@ def cmd_show(db, op, args) -> None:
     print(f"{d.instrument_number} {d.doc_code} recorded {d.record_date} status {d.status}")
     print(f"image: {_image_url(d)}")
     print(f"recording APNs: {f.get('recording_apns')}  deed of trust: {f.get('related_deeds_of_trust')}")
+    if d.doc_code == "NOD":
+        print(f"discontinuance: related {f.get('related')}  ended {f.get('cancelled')}  note: {d.decision_note}")
+        return
     print("read fields: " + json.dumps(f.get("fields"), indent=1, default=str))
     print("flags: " + json.dumps(f.get("flags"), indent=1))
     print("evidence: " + json.dumps(f.get("evidence"), indent=1, default=str))
@@ -117,7 +126,9 @@ def cmd_approve(db, op, args) -> None:
         "trustee": args.trustee, "beneficiary": args.beneficiary,
     }
     notice = approve_recorder_document(db, args.doc, reviewer=op, values=values,
-                                       supersedes=args.supersedes, independent=args.independent)
+                                       supersedes=args.supersedes, independent=args.independent,
+                                       discontinued_by=args.discontinued_by,
+                                       not_discontinued=args.not_discontinued)
     db.commit()
     print(f"approved: notice {notice}")
 
@@ -128,7 +139,16 @@ def cmd_reject(db, op, args) -> None:
     print("rejected")
 
 
-_COMMANDS = {"list": cmd_list, "show": cmd_show, "approve": cmd_approve, "reject": cmd_reject}
+def cmd_resolve_nod(db, op, args) -> None:
+    if bool(args.cancels) == bool(args.no_effect):
+        raise SystemExit("give --cancels <instrument> (repeatable) or --no-effect")
+    resolve_discontinuance(db, args.doc, reviewer=op, cancels=args.cancels or [])
+    db.commit()
+    print("resolved")
+
+
+_COMMANDS = {"list": cmd_list, "show": cmd_show, "approve": cmd_approve, "reject": cmd_reject,
+             "resolve-nod": cmd_resolve_nod}
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -142,10 +162,16 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--sale-date", required=True)
     p.add_argument("--parcel", required=True)
     p.add_argument("--grantor", required=True)
-    for opt in ("--sale-time", "--address", "--amount", "--trustee", "--beneficiary", "--supersedes"):
+    for opt in ("--sale-time", "--address", "--amount", "--trustee", "--beneficiary", "--supersedes",
+                "--discontinued-by"):
         p.add_argument(opt)
+    p.add_argument("--not-discontinued", action="store_true")
     p.add_argument("--amount-basis", choices=("principal", "sum_owing"))
     p.add_argument("--independent", action="store_true")
+    p = sub.add_parser("resolve-nod")
+    p.add_argument("--doc", required=True)
+    p.add_argument("--cancels", action="append")
+    p.add_argument("--no-effect", action="store_true")
     p = sub.add_parser("reject")
     p.add_argument("--doc", required=True)
     p.add_argument("--reason", required=True, choices=REJECT_REASONS)

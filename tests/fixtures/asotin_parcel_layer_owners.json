@@ -1,0 +1,184 @@
+{
+ "features": [
+  {
+   "attributes": {
+    "PARCEL_ID": "10412300600050000",
+    "Prop_ID": "4687",
+    "NAME": "HOLLOWAY, MARGARET J",
+    "BILLING1": "2300 RIVERVIEW BLVD",
+    "BILLING2": " ",
+    "CITY": "CLARKSTON",
+    "ST": "WA",
+    "ZIP": "99403",
+    "FULL_ADD": "2300 RIVERVIEW BLVD",
+    "SITE_CITY": "CLARKSTON",
+    "SITE_ZIP": "99403"
+   }
+  },
+  {
+   "attributes": {
+    "PARCEL_ID": "10440001900000000",
+    "Prop_ID": "5178",
+    "NAME": "WEBER, NORMA E ESTATE C/O GLENN L. WEBER PR",
+    "BILLING1": "29000 N HILL RD",
+    "BILLING2": " ",
+    "CITY": "CHATTAROY",
+    "ST": "WA",
+    "ZIP": "99003",
+    "FULL_ADD": "100 MAPLE ST",
+    "SITE_CITY": "ASOTIN",
+    "SITE_ZIP": "99402"
+   }
+  },
+  {
+   "attributes": {
+    "PARCEL_ID": "11320003200000000",
+    "Prop_ID": "8079",
+    "NAME": "ASHFORD, EDITH (ESTATE)",
+    "BILLING1": "800 VALLEY DR",
+    "BILLING2": " ",
+    "CITY": "CLARKSTON",
+    "ST": "WA",
+    "ZIP": "99403",
+    "FULL_ADD": "800 VALLEY DR",
+    "SITE_CITY": "CLARKSTON",
+    "SITE_ZIP": "99403"
+   }
+  },
+  {
+   "attributes": {
+    "PARCEL_ID": "11320001800000000",
+    "Prop_ID": "8058",
+    "NAME": "ASHFORD, EDITH (ESTATE)",
+    "BILLING1": "800 VALLEY DR",
+    "BILLING2": " ",
+    "CITY": "CLARKSTON",
+    "ST": "WA",
+    "ZIP": "99403",
+    "FULL_ADD": " ",
+    "SITE_CITY": " ",
+    "SITE_ZIP": " "
+   }
+  },
+  {
+   "attributes": {
+    "PARCEL_ID": "10042000900040000",
+    "Prop_ID": "3410",
+    "NAME": "OLSEN, TOM J JR",
+    "BILLING1": "LIFE ESTATE SARA OLSEN MCKAY",
+    "BILLING2": "400 12TH ST",
+    "CITY": "CLARKSTON",
+    "ST": "WA",
+    "ZIP": "99403",
+    "FULL_ADD": "400 12TH ST",
+    "SITE_CITY": "CLARKSTON",
+    "SITE_ZIP": "99403"
+   }
+  },
+  {
+   "attributes": {
+    "PARCEL_ID": "60010502700000000",
+    "Prop_ID": "16961",
+    "NAME": "WARD JR, ROGER A & TARA D",
+    "BILLING1": "PO BOX 600",
+    "BILLING2": " ",
+    "CITY": "LEWISTON",
+    "ST": "ID",
+    "ZIP": "83501",
+    "FULL_ADD": "909 6TH ST",
+    "SITE_CITY": "CLARKSTON",
+    "SITE_ZIP": "99403"
+   }
+  },
+  {
+   "attributes": {
+    "PARCEL_ID": "13560000100000000",
+    "Prop_ID": "10361",
+    "NAME": "WARD JR, ROGER A & TARA D",
+    "BILLING1": "PO BOX 600",
+    "BILLING2": " ",
+    "CITY": "LEWISTON",
+    "ST": "ID",
+    "ZIP": "83501",
+    "FULL_ADD": "1785 CHERRY ST",
+    "SITE_CITY": "CLARKSTON",
+    "SITE_ZIP": "99403"
+   }
+  },
+  {
+   "attributes": {
+    "PARCEL_ID": "10011801200010000",
+    "Prop_ID": "1389",
+    "NAME": "HERRERA, JR, NOEL",
+    "BILLING1": "401 ELM ST",
+    "BILLING2": " ",
+    "CITY": "CLARKSTON",
+    "ST": "WA",
+    "ZIP": "99403",
+    "FULL_ADD": "401 ELM ST",
+    "SITE_CITY": "CLARKSTON",
+    "SITE_ZIP": "99403"
+   }
+  },
+  {
+   "attributes": {
+    "PARCEL_ID": "10010201800000000",
+    "Prop_ID": "1034",
+    "NAME": "FINCH, RONALD JOSEPH & DAVIS, DONNA",
+    "BILLING1": "900 3RD ST",
+    "BILLING2": " ",
+    "CITY": "CLARKSTON",
+    "ST": "WA",
+    "ZIP": "99403",
+    "FULL_ADD": "900 3RD ST",
+    "SITE_CITY": "CLARKSTON",
+    "SITE_ZIP": "99403"
+   }
+  },
+  {
+   "attributes": {
+    "PARCEL_ID": "10411000700030000",
+    "Prop_ID": "4542",
+    "NAME": "TILLMAN, MARTIN S & MELODY S",
+    "BILLING1": "2100 2ND AVE",
+    "BILLING2": " ",
+    "CITY": "CLARKSTON",
+    "ST": "WA",
+    "ZIP": "99403",
+    "FULL_ADD": "2100 2ND AVE",
+    "SITE_CITY": "CLARKSTON",
+    "SITE_ZIP": "99403"
+   }
+  },
+  {
+   "attributes": {
+    "PARCEL_ID": "67160000200000000",
+    "Prop_ID": "17411",
+    "NAME": "WAL- MART REAL ESTATE BUSINESS TRUST",
+    "BILLING1": "ATTN:  PROPERTY TAX DEPT",
+    "BILLING2": "PO BOX 8050, MS 0555",
+    "CITY": "BENTONVILLE",
+    "ST": "AR",
+    "ZIP": "72716",
+    "FULL_ADD": "308 5TH ST",
+    "SITE_CITY": "CLARKSTON",
+    "SITE_ZIP": "99403"
+   }
+  },
+  {
+   "attributes": {
+    "PARCEL_ID": "67160000100000000",
+    "Prop_ID": "17410",
+    "NAME": "WAL- MART REAL ESTATE BUSINESS TRUST",
+    "BILLING1": "ATTN:  PROPERTY TAX DEPT",
+    "BILLING2": "PO BOX 8050, MS 0555",
+    "CITY": "BENTONVILLE",
+    "ST": "AR",
+    "ZIP": "72716",
+    "FULL_ADD": "306 5TH ST",
+    "SITE_CITY": "CLARKSTON",
+    "SITE_ZIP": "99403"
+   }
+  }
+ ]
+}

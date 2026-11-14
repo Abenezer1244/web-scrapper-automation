@@ -2022,6 +2022,47 @@ class PacsTaxStatus(Base):
         nullable=True)
 
 
+class ProbateNoticeRow(Base):
+    """A published probate notice to creditors and the parcels tied to it (migration 160).
+
+    Filled by the nwmarket crawler for Asotin (workers/nts_crawler); read by the Asotin
+    probate scraper. SHARED and system-only under RLS like nts_notices. ``parcels`` holds
+    the estate's parcels decided at crawl time (enrichment/asotin_parcels, owner rule
+    "name + family tie"); ``personal_reps`` only decides that tie and is never delivered.
+    An erased notice keeps no person (ck_probate_notices_privacy_withheld).
+    """
+
+    __tablename__ = "probate_notices"
+    __table_args__ = (
+        UniqueConstraint("county", "state", "cause_no", name="uq_probate_notices_cause"),
+        CheckConstraint(
+            "privacy_suppression_id IS NULL OR (decedent IS NULL AND personal_reps IS NULL "
+            "AND claims_address IS NULL AND parcels IS NULL)",
+            name="ck_probate_notices_privacy_withheld"),
+    )
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    county = Column(String(64), nullable=False)
+    state = Column(String(4), nullable=False)
+    source = Column(String(32), nullable=False)
+    cause_no = Column(String(32), nullable=False)
+    first_published = Column(Date, nullable=False)
+    decedent = Column(String(256), nullable=True)
+    personal_reps = Column(JSON, nullable=True)
+    claims_address = Column(String(256), nullable=True)
+    advert_id = Column(String(32), nullable=True)
+    pdf_url = Column(String(512), nullable=True)
+    match_outcome = Column(String(16), nullable=True)  # matched | held | failed
+    held_reasons = Column(JSON, nullable=True)
+    parcels = Column(JSON, nullable=True)
+    matched_at = Column(DateTime(timezone=True), nullable=True)
+    fetched_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    privacy_suppression_id = Column(
+        UUID(as_uuid=False), ForeignKey("privacy_suppressions.id", ondelete="RESTRICT"),
+        nullable=True)
+
+
 class ExternalSourceHealth(Base):
     """Health of an EXTERNAL enrichment source (migration 083).
 

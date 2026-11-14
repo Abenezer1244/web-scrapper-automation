@@ -17,7 +17,11 @@ enforcer has not reached yet carries none (Codex consult). Every row of every st
 scanned, flagged or not.
 
 Stores, in order: results (every tenant), king_parcel_owners, nts_notices,
-county_records, pacs_tax_status (its own function, migration 152). The function also
+county_records, pacs_tax_status (its own function, migration 152), probate_notices (its
+own function, migration 160). A probate notice is the subject's when any parcel tied to
+the estate, with the decedent as its party, is withheld by the rule; a notice tied to no
+parcel has no anchor, so (as every name-only row) it is never erased automatically and
+ages out of the table instead. The function also
 reaches each matched result's skip-trace cache
 entries (its subject hash, plus the keys of its pending lookups computed here),
 lookups, Tracerfy links, dialer rows and exports.
@@ -42,7 +46,7 @@ from src.privacy.authorize import (
 )
 from src.scrapers.enrichment.skip_trace import pending_row_subject_key
 
-STORES = ("results", "king", "nts", "county", "pacs_tax")
+STORES = ("results", "king", "nts", "county", "pacs_tax", "probate")
 BATCH = 500
 _MAX_CACHE_KEYS = 2000  # privacy_erase_batch's own bound
 _NIL = str(uuid.UUID(int=0))
@@ -74,6 +78,14 @@ _PACS_TAX_CALL = text(
 _PACS_TAX_SQL = text(
     "SELECT id::text AS id, owner_name, parcel_id, county, state FROM pacs_tax_status "
     "WHERE owner_name IS NOT NULL AND id > CAST(:after AS uuid) ORDER BY id LIMIT :n"
+)
+_PROBATE_CALL = text(
+    "SELECT privacy_erase_probate(CAST(:rule AS uuid), CAST(:probate AS uuid[]))")
+# A withheld notice has no parcels (160's CHECK), so every notice that can still name
+# the subject is one with parcels.
+_PROBATE_SQL = text(
+    "SELECT id::text AS id, parcels, county, state FROM probate_notices "
+    "WHERE parcels IS NOT NULL AND id > CAST(:after AS uuid) ORDER BY id LIMIT :n"
 )
 _COUNTY_SQL = text(
     "SELECT id::text AS id, county, state, party_name, heirs, parcel_id, enrichment_data "
@@ -186,8 +198,24 @@ def _scan_pacs_tax(db, rule: ErasureRule, after: str | None):
     return rows, matched, {"pacs_tax": matched, "_last": rows[-1].id if rows else None}
 
 
+def _scan_probate(db, rule: ErasureRule, after: str | None):
+    rows = db.execute(_PROBATE_SQL, {"after": after or _NIL, "n": BATCH}).all()
+
+    def leads(parcels) -> list[dict]:
+        return [p for p in (parcels if isinstance(parcels, list) else [])
+                if isinstance(p, dict)]
+
+    # As the probate scraper delivers it: the decedent is the party of each tied parcel,
+    # and the parcel's owner of record rides along.
+    matched = [r.id for r in rows if any(_is_subject(
+        rule, _lead(parcel_id=p.get("parcel_id"), party_name=p.get("party_name"),
+                    enrichment_data={"assessor_current_owner": p.get("owner_name")}),
+        record_type="probate", county=r.county, state=r.state) for p in leads(r.parcels))]
+    return rows, matched, {"probate": matched, "_last": rows[-1].id if rows else None}
+
+
 _SCANS = {"results": _scan_results, "king": _scan_king, "nts": _scan_nts,
-          "county": _scan_county, "pacs_tax": _scan_pacs_tax}
+          "county": _scan_county, "pacs_tax": _scan_pacs_tax, "probate": _scan_probate}
 
 
 def erase_step(db, rule: ErasureRule, cursor: dict | None) -> Step:
@@ -202,6 +230,9 @@ def erase_step(db, rule: ErasureRule, cursor: dict | None) -> Step:
     if matched and store == "pacs_tax":
         step.counts = dict(db.execute(
             _PACS_TAX_CALL, {"rule": rule.rule_row, "pacs_tax": matched}).scalar())
+    elif matched and store == "probate":
+        step.counts = dict(db.execute(
+            _PROBATE_CALL, {"rule": rule.rule_row, "probate": matched}).scalar())
     elif matched:
         params = {"rule": rule.rule_row, "res": [], "keys": [], "king": [], "nts": [],
                   "county": []}

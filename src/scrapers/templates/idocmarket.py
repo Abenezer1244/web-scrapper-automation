@@ -76,6 +76,9 @@ _COMPANY_WORDS = {
 # caps a single search's result set server-side (~1000 rows); chunking keeps each
 # search under the cap so no leads are silently dropped on busier counties.
 _CHUNK_DAYS = 30
+# Pause between searches. ~12 unpaced searches in an hour got a 403 block (2026-11-14,
+# lifted ~90 min later); a backfill of many chunks must not burst like that.
+_SEARCH_PAUSE_MS = 20_000
 
 # Trailing fiduciary-role connector left dangling on a grantor when the estate
 # name spilled to the other party line: "SMITH, JANE, ADMINISTRATOR OF" ->
@@ -275,6 +278,8 @@ class IDocMarketScraper(BridgeScraper):
             # were complete (missed leads look like "none recorded"). Log which
             # chunk failed first so the failure is actionable.
             try:
+                if chunk_start > start:
+                    await self.page.wait_for_timeout(_SEARCH_PAUSE_MS)
                 await self.navigate(self.base_url)
                 await self.page.wait_for_timeout(1_500)
                 await self._fill_dates(cf, ct)

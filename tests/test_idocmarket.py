@@ -240,13 +240,23 @@ _ONE = _page_html([_card("CERTIFICATE OF DEATH", "90020", "10/2/2026", ["DOE, JA
 _TWO = _page_html([_card("CERTIFICATE OF DEATH", "90021", "11/2/2026", ["ROE, RICH"], ["THE PUBLIC"])])
 
 
-async def test_every_chunk_of_the_window_is_searched_and_read(browser):
+async def test_every_chunk_of_the_window_is_searched_read_and_paced(browser, monkeypatch):
+    import time
+
+    from src.scrapers.templates import idocmarket
+
+    monkeypatch.setattr(idocmarket, "_SEARCH_PAUSE_MS", 1_500)
+    t0 = time.monotonic()
     recs = await _run(browser, {"2026-10-01": (200, _ONE), "2026-10-31": (200, _TWO)},
                       "10/01/2026", "11/15/2026")
     assert [r.enrichment_data["instrument_number"] for r in recs] == ["90020", "90021"]
+    assert time.monotonic() - t0 >= 1.5  # the second search waited
 
 
-async def test_a_blocked_later_chunk_fails_the_whole_window(browser):
+async def test_a_blocked_later_chunk_fails_the_whole_window(browser, monkeypatch):
+    from src.scrapers.templates import idocmarket
+
+    monkeypatch.setattr(idocmarket, "_SEARCH_PAUSE_MS", 0)
     # The portal's 403 block on chunk 2 must not deliver chunk 1 as the full window.
     with pytest.raises(RuntimeError, match="HTTP 403"):
         await _run(browser, {"2026-10-01": (200, _ONE), "2026-10-31": (403, "403 Forbidden")},

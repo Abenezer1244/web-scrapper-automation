@@ -50,7 +50,15 @@ Phase 2 — storage + crawl (DONE 2026-11-14)
       seen-key v2 replay, failed lookup not memoised. Codex: 3 High + 3 Medium fixed -> GO.
 - Live (local DB, rolled back): 26-4-00122-02 matched (1 parcel), 26-4-00117-02 held.
 Phase 3 — scraper + connector
-- [ ] `AsotinWAProbateScraper` reads probate_notices by first_published window, resolves
-      parcels at scrape time; HOLDS notices with 0 matched parcels or missing owner /
-      parcel / property address / mailing; one lead per matched parcel
-- [ ] connector row INACTIVE (probate), registry allowlist, assessor_url
+- [x] `AsotinWAProbateScraper` (src/scrapers/asotin_wa_probate.py) reads matched
+      probate_notices by first_published window (parcels were tied at crawl time);
+      one lead per tied parcel; parcels missing parcel / owner / address / mailing HELD
+- [x] connector row INACTIVE (migration 161, probate, assessor_url), registry allowlist
+- [x] Codex review: NO-GO (2 High, 2 Medium) -> fixed -> GO; last Medium closed.
+      Fixes: no owner-of-record copy in enrichment (C/O string can name the PR); empty
+      run fails while in-window notices are 'failed' (layer pending); windows starting
+      before the 180-day retention fail; street-only property_address (billing key
+      parcel|address must not drift when a city appears).
+- Owner note (not changed, app-wide): enrichment (tasks_helpers/enrich.py) shows the
+  assessor's owner string as Current Owner on every probate lead; for an estate parcel
+  that string can read "... ESTATE C/O <rep> PR". Codex: not a blocker for this connector.

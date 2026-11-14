@@ -234,3 +234,30 @@ def test_wrongly_typed_layer_values_are_a_failed_answer():
                 dict(_ROWS[0], CITY={"x": 1}), dict(_ROWS[0], ZIP=True)):
         with pytest.raises(LayerError):
             parse_layer_response({"features": [{"attributes": bad}]})
+
+
+# ── third Codex pass ─────────────────────────────────────────────────────────
+
+def test_claims_address_with_any_extra_word_is_another_address():
+    row = dict(_row("HERRERA"), ZIP="99403", CITY="CLARKSTON", ST="WA")
+    for claims in ("401 Elm St Floor 2, Clarkston, WA 99403", "401 Elm St Rear, Clarkston, WA 99403",
+                   "401 Elm St, Lewiston, WA 99403"):
+        assert match_estate("NOEL HERRERA, JR.", ("SAM K. LEE",), claims, [row]).held == ["no_family_tie"]
+    assert match_estate("NOEL HERRERA, JR.", ("SAM K. LEE",), "Attn: 401 Elm Street, Clarkston, WA 99403-1234",
+                        [row]).leads[0].ties == ("billing_is_claims_address",)
+
+
+def test_trust_addressee_is_not_its_trustee():
+    row = dict(_row("HOLLOWAY"), BILLING1="C/O JOHN SMITH TRUST", BILLING2="2300 RIVERVIEW BLVD")
+    assert match_estate("MARGARET J. HOLLOWAY", ("JOHN SMITH",), None, [row]).held == ["no_family_tie"]
+
+
+def test_numbers_in_text_fields_are_a_failed_answer():
+    import pytest
+
+    from src.scrapers.enrichment.asotin_parcels import LayerError, parse_layer_response
+
+    for bad in (dict(_ROWS[0], CITY=5), dict(_ROWS[0], FULL_ADD=401), dict(_ROWS[0], Prop_ID=True)):
+        with pytest.raises(LayerError):
+            parse_layer_response({"features": [{"attributes": bad}]})
+    assert parse_layer_response({"features": [{"attributes": dict(_ROWS[0], Prop_ID=4687)}]})

@@ -51,6 +51,11 @@ _ESTATE_MARK = re.compile(r"\bESTATE\b|\bEST\b(?= OF\b|$)|\bDECEASED\b|\bDEC'?D\
 _NOT_DECEDENT_ESTATE = re.compile(r"\b(?:LIFE|REAL)\s+ESTATE\b|\bESTATES\b")
 _STREET_LINE = re.compile(r"^(?:\d|P\.?\s*O\.?\s*(?:BOX|DRAWER)\b|POST OFFICE BOX\b|BOX\b"
                           r"|PMB\b|RR\b|HC\b)")
+# An addressee line naming a trust or an estate is an entity, not the person in it.
+_ORG_WORDS = frozenset({"TRUST", "TRST", "TRUSTEE", "TRUSTEES", "ESTATE", "FAMILY", "LIVING",
+                        "REVOCABLE", "IRREVOCABLE", "PARTNERSHIP", "HEIRS"})
+_TEXT_FIELDS = ("PARCEL_ID", "NAME", "BILLING1", "BILLING2", "CITY", "ST", "ZIP", "FULL_ADD",
+                "SITE_CITY", "SITE_ZIP")
 _SAFE_SURNAME = re.compile(r"^[A-Z][A-Z'\-]{1,40}$")
 _ADDR_WORDS = {
     "STREET": "ST", "AVENUE": "AVE", "AV": "AVE", "DRIVE": "DR", "ROAD": "RD",
@@ -229,7 +234,7 @@ def _addressees(attrs: dict) -> tuple[list[Person], list[NoticeName]]:
     for ln in lines:
         if ln.startswith("C/O"):
             ln = ln[3:]
-        if _CORPORATE.search(ln):
+        if _CORPORATE.search(ln) or _ORG_WORDS & set(_tokens(ln)):
             continue
         if "," in ln:
             people += owner_people(ln)
@@ -273,11 +278,12 @@ def _billing_is_claims(attrs: dict, claims_address: str | None) -> bool:
         return False
     claims = _norm_address(claims_address)
     street = _norm_address(parts[0])
-    zipm = re.search(r"\b(\d{5})(?: \d{4})?$", claims)
-    # The whole street line, not followed by a unit the billing line does not have.
-    return bool(zipm and zipm.group(1) == parts[3] and street
-                and re.search(rf"(?:^| ){re.escape(street)}(?= (?!APT\b|STE\b|UNIT\b|NO\b|\d)|$)",
-                              claims))
+    if not street:
+        return False
+    # The billing street line in full, followed by NOTHING but the billing city, state and
+    # ZIP: any other word there (a unit, a floor, a suite) makes it another address.
+    tail = rf"{re.escape(_norm_address(parts[1]))} {parts[2]} {parts[3]}(?: \d{{4}})?"
+    return re.search(rf"(?:^| ){re.escape(street)} {tail}$", claims) is not None
 
 
 def _estate_marked(segment: str) -> bool:
@@ -368,8 +374,9 @@ def parse_layer_response(data: object) -> list[dict]:
         attrs = f.get("attributes") if isinstance(f, dict) else None
         if (not isinstance(attrs, dict) or not isinstance(attrs.get("NAME"), str)
                 or not isinstance(attrs.get("PARCEL_ID"), str)
-                or any(isinstance(v, bool) or not isinstance(v, (str, int, float, type(None)))
-                       for v in attrs.values())):
+                or any(not isinstance(attrs.get(k), (str, type(None))) for k in _TEXT_FIELDS)
+                or isinstance(attrs.get("Prop_ID"), bool)
+                or not isinstance(attrs.get("Prop_ID"), (str, int, type(None)))):
             raise LayerError("layer answered a malformed feature")
         rows.append(attrs)
     return rows

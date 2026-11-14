@@ -81,6 +81,7 @@ class Person:
 @dataclass(frozen=True)
 class ParcelLead:
     parcel_id: str
+    party_name: str        # the decedent as the county holds them: 'LAST, FIRST M SUFFIX'
     prop_id: str
     owner_name: str
     property_address: str
@@ -177,6 +178,11 @@ def owner_segments(owner_name: str) -> list[tuple[Person, str]]:
         if last and given:
             out.append((Person(given[0], " ".join(given[1:]), last, suffix), seg))
     return out
+
+
+def comma_name(p: Person) -> str:
+    """'LAST, FIRST MIDDLE SUFFIX': recorder order, readable without guessing."""
+    return f"{p.last}, " + " ".join(x for x in (p.first, p.middle, p.suffix) if x)
 
 
 def owner_people(owner_name: str) -> list[Person]:
@@ -350,7 +356,8 @@ def match_estate(decedent_name: str, personal_reps: tuple[str, ...] | list[str],
             result.held.append("missing_mailing_address")
             continue
         result.leads.append(ParcelLead(
-            parcel_id=parcel, prop_id=_clean(a.get("Prop_ID")),
+            parcel_id=parcel, party_name=comma_name(owners[0][0]),
+            prop_id=_clean(a.get("Prop_ID")),
             owner_name=_clean(a.get("NAME")), property_address=situs,
             property_city=_clean(a.get("SITE_CITY")) or None,
             property_zip=_clean(a.get("SITE_ZIP")) or None,

@@ -61,6 +61,7 @@ def test_rep_sharing_surname_ties_the_parcel():
     assert [lead.parcel_id for lead in m.leads] == ["10412300600050000"]
     lead = m.leads[0]
     assert lead.ties == ("rep_shares_surname",)
+    assert lead.party_name == "HOLLOWAY, MARGARET J"
     assert lead.property_address == "2300 RIVERVIEW BLVD"
     assert lead.mailing_address == "2300 RIVERVIEW BLVD, CLARKSTON, WA 99403"
 
@@ -75,6 +76,7 @@ def test_estate_marked_owner_with_rep_named_on_parcel():
     m = match_estate("NORMA E. WEBER", ("GLENN L. WEBER",), None, _ROWS)
     assert m.leads[0].ties == ("estate_marked", "rep_on_parcel", "rep_shares_surname")
     assert m.leads[0].mailing_address == "29000 N HILL RD, CHATTAROY, WA 99003"
+    assert m.leads[0].party_name == "WEBER, NORMA E"
 
 
 def test_estate_marked_owner_alone_is_a_tie_and_parcels_without_situs_are_held():

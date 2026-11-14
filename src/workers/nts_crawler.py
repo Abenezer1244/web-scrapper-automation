@@ -391,15 +391,18 @@ def crawl_nts_nwmarket_asotin() -> dict:
     from src.config import settings
     from src.db.models import NtsNotice
     from src.db.session import system_sync_session
+    from src.scrapers.enrichment.asotin_parcels import query_surname
     from src.scrapers.sources import nts_nwmarket as nwm
     from src.scrapers.sources import nts_pdf
     from src.scrapers.sources import nts_tacoma_index as nts
     from src.utils.safe_http import safe_get, safe_get_following
+    from src.workers import probate_ingest
 
     today = datetime.now(UTC).date()
     deadline = time.monotonic() + _NWM_DEADLINE_S
     summary = {"source": nwm.SOURCE, "discovered": 0, "read": 0, "upserted": 0,
-               "skipped": 0, "other_county": 0, "errored": 0, "expired": 0}
+               "skipped": 0, "other_county": 0, "errored": 0, "expired": 0,
+               "probate": {}, "probate_rechecked": 0, "probate_purged": 0}
     headers = {"User-Agent": _PDF_BROWSER_UA}
 
     try:
@@ -418,7 +421,9 @@ def crawl_nts_nwmarket_asotin() -> dict:
 
     def seen_key(advert: str, version: str) -> str:
         # Keyed on the advert's lastmod too: a republished (postponed) notice is new.
-        return f"bl:nts_nwmarket:seen:{advert.rsplit('_', 1)[-1]}:{version}"
+        # v2: probate notices are read from the same adverts (2026-11-14), so adverts
+        # remembered before that are read once more.
+        return f"bl:nwmarket:v2:seen:{advert.rsplit('_', 1)[-1]}:{version}"
 
     try:
         rds = sync_redis.from_url(settings.REDIS_URL, **settings.redis_kwargs())
@@ -429,6 +434,9 @@ def crawl_nts_nwmarket_asotin() -> dict:
 
     attempted = 0
     with system_sync_session() as db:
+        # Loaded once; a rule set that cannot be evaluated fails the run (never ingest
+        # people without the privacy rules).
+        gate = probate_ingest.privacy_gate(db)
         for i, (advert, version) in enumerate(todo):
             if i >= _NWM_MAX_ADVERTS or time.monotonic() > deadline:
                 # Never truncate silently: the rest stay unseen and are read next run.
@@ -454,6 +462,13 @@ def crawl_nts_nwmarket_asotin() -> dict:
                     summary["errored"] += 1
                     _logger.warning("Asotin NTS PDF %s yielded no usable text", pdf_url)
                     continue
+                # Probate first, on the whole advert: the NTS filter below keeps only
+                # trustee sales. A failure here fails the advert (retried next run).
+                outcome = probate_ingest.ingest_text(
+                    db, text, advert_id=advert.rsplit("_", 1)[-1], pdf_url=pdf_url,
+                    now=datetime.now(UTC), lookup=query_surname, gate=gate)
+                if outcome is not None:
+                    summary["probate"][outcome] = summary["probate"].get(outcome, 0) + 1
                 failed_before = summary["errored"] + summary.get("dropped_undated", 0)
                 for block in nts_pdf.split_notice_blocks(text):
                     if not nwm.is_asotin_property(block):
@@ -489,6 +504,14 @@ def crawl_nts_nwmarket_asotin() -> dict:
              "cutoff": datetime.now(UTC) - _td_days(_CACHE_DAYS)},
         ).rowcount or 0
         db.commit()
+        try:
+            summary["probate_purged"] = probate_ingest.purge_expired(db, today=today)
+            db.commit()
+            summary["probate_rechecked"] = probate_ingest.rematch_due(
+                db, today=today, now=datetime.now(UTC), lookup=query_surname, gate=gate)
+        except Exception as exc:  # noqa: BLE001 — upkeep must not lose the crawl's heartbeat
+            db.rollback()
+            _logger.warning("Asotin probate upkeep failed: %s", str(exc)[:120])
         # A read is the sitemap plus at least one parsed advert, or nothing new to read.
         if summary["read"] or (adverts and not todo):
             _record_crawl_heartbeat(db, nwm.COUNTY)

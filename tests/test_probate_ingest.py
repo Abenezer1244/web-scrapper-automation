@@ -43,14 +43,21 @@ def _open(_parcels, _county):
     return None
 
 
+_CLEAN = text("DELETE FROM probate_notices WHERE source = 'lmtribune_probate'")
+
+
 @pytest.fixture
 def s():
+    # rematch_due commits per notice, so the table is cleaned before and after.
     with system_sync_session() as session:
-        session.execute(text("DELETE FROM probate_notices WHERE source = 'lmtribune_probate'"))
+        session.execute(_CLEAN)
+        session.commit()
         try:
             yield session
         finally:
             session.rollback()
+            session.execute(_CLEAN)
+            session.commit()
 
 
 def _row(s, cause: str):
@@ -146,3 +153,47 @@ def test_a_held_notice_is_rechecked_and_can_become_a_lead(s):
                           gate=_open) == 1
     row = _row(s, "26-4-00117-02")
     assert row["match_outcome"] == "matched" and row["parcels"][0]["ties"] == ["estate_marked"]
+
+
+def test_a_rematch_never_overwrites_a_newer_crawl_answer(s):
+    _ingest(s, "asotin_probate_notice_a", lookup=_down)          # stored as failed
+    s.commit()
+    later = _NOW + timedelta(days=1)
+
+    def lookup_while_a_crawl_rereads(surname):
+        # The crawl re-reads the advert (layer back) while this rematch waits on the layer.
+        with system_sync_session() as other:
+            assert _ingest(other, "asotin_probate_notice_a", now=later) == "matched"
+            other.commit()
+        raise LayerError("layer HTTP 503")                         # the rematch's own answer
+
+    assert pi.rematch_due(s, today=later.date(), now=later, lookup=lookup_while_a_crawl_rereads,
+                          gate=_open) == 1
+    assert _row(s, "26-4-00122-02")["match_outcome"] == "matched"
+
+
+def test_one_failing_recheck_backs_off_and_the_rest_continue(s):
+    _ingest(s, "asotin_probate_notice_a", lookup=_down)
+    _ingest(s, "asotin_probate_notice_b", lookup=_down)
+    s.commit()
+    later = _NOW + timedelta(days=1)
+
+    def lookup(surname):
+        if surname == "HOLLOWAY":
+            raise RuntimeError("unexpected answer")
+        return _layer(_ROWS)(surname)
+
+    assert pi.rematch_due(s, today=later.date(), now=later, lookup=lookup, gate=_open) == 2
+    a, b = _row(s, "26-4-00122-02"), _row(s, "26-4-00117-02")
+    assert a["match_outcome"] == "failed" and a["matched_at"] == later   # backed off
+    assert b["match_outcome"] == "held"
+    # Backed off: not due again until REMATCH_EVERY has passed.
+    assert pi.rematch_due(s, today=later.date(), now=later, lookup=lookup, gate=_open) == 0
+
+
+def test_rematch_stops_at_the_deadline(s):
+    _ingest(s, "asotin_probate_notice_a", lookup=_down)
+    s.commit()
+    later = _NOW + timedelta(days=1)
+    assert pi.rematch_due(s, today=later.date(), now=later, lookup=_layer(_ROWS), gate=_open,
+                          deadline=0.0) == 0

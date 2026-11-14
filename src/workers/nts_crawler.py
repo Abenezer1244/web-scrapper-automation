@@ -115,6 +115,10 @@ _NWM_MAX_ADVERTS = 60          # per run; the rest wait for the next run, logged
 _NWM_DEADLINE_S = 45 * 60      # under the 55 min soft limit
 _NWM_SEEN_TTL_S = 14 * 86400   # outlives the window
 _NWM_MIN_TEXT_CHARS = 100      # below this a PDF is unreadable (scan); real notices are 800+
+# Probate re-checks run after the advert loop, inside this much of the soft limit's slack
+# (each is one county-layer query, 20 s timeout at worst; the loop's own last advert can
+# overrun the deadline by about two fetch timeouts).
+_NWM_UPKEEP_S = 3 * 60
 
 
 @app.task(name="src.workers.nts_crawler.crawl_nts_tacoma_index")
@@ -405,6 +409,18 @@ def crawl_nts_nwmarket_asotin() -> dict:
                "probate": {}, "probate_rechecked": 0, "probate_purged": 0}
     headers = {"User-Agent": _PDF_BROWSER_UA}
 
+    # Retention first and on its own: expired probate notices are deleted even when the
+    # sitemap or the privacy rules are unavailable this run.
+    with system_sync_session() as db:
+        summary["probate_purged"] = probate_ingest.purge_expired(db, today=today)
+        db.commit()
+    # The rules, loaded in a short session of their own (no transaction stays open across
+    # the crawl's network calls). A rule set that cannot be evaluated fails the run: no
+    # person is ingested without the privacy rules.
+    with system_sync_session() as db:
+        gate = probate_ingest.privacy_gate(db)
+        db.rollback()
+
     try:
         resp = safe_get(nwm.SITEMAP_URL, timeout=25, same_origin_as=nwm.BASE_URL, headers=headers)
     except Exception as exc:  # noqa: BLE001 — a bad sitemap fetch must not crash the beat
@@ -434,9 +450,6 @@ def crawl_nts_nwmarket_asotin() -> dict:
 
     attempted = 0
     with system_sync_session() as db:
-        # Loaded once; a rule set that cannot be evaluated fails the run (never ingest
-        # people without the privacy rules).
-        gate = probate_ingest.privacy_gate(db)
         for i, (advert, version) in enumerate(todo):
             if i >= _NWM_MAX_ADVERTS or time.monotonic() > deadline:
                 # Never truncate silently: the rest stay unseen and are read next run.
@@ -469,6 +482,9 @@ def crawl_nts_nwmarket_asotin() -> dict:
                     now=datetime.now(UTC), lookup=query_surname, gate=gate)
                 if outcome is not None:
                     summary["probate"][outcome] = summary["probate"].get(outcome, 0) + 1
+                # The county layer did not answer: stored as failed (re-checked), and the
+                # advert is not remembered either, so the next run reads it again.
+                probate_failed = outcome == "failed"
                 failed_before = summary["errored"] + summary.get("dropped_undated", 0)
                 for block in nts_pdf.split_notice_blocks(text):
                     if not nwm.is_asotin_property(block):
@@ -479,7 +495,8 @@ def crawl_nts_nwmarket_asotin() -> dict:
                         county=nwm.COUNTY, parse_fn=nts.parse_tacoma_notice, today=today,
                         summary=summary)
                 db.commit()
-                if summary["errored"] + summary.get("dropped_undated", 0) > failed_before:
+                if (summary["errored"] + summary.get("dropped_undated", 0) > failed_before
+                        or probate_failed):
                     # A notice failed to store, or a real sale whose date did not parse:
                     # not "read", so it is retried next run (and after a parser fix).
                     continue
@@ -505,10 +522,9 @@ def crawl_nts_nwmarket_asotin() -> dict:
         ).rowcount or 0
         db.commit()
         try:
-            summary["probate_purged"] = probate_ingest.purge_expired(db, today=today)
-            db.commit()
             summary["probate_rechecked"] = probate_ingest.rematch_due(
-                db, today=today, now=datetime.now(UTC), lookup=query_surname, gate=gate)
+                db, today=today, now=datetime.now(UTC), lookup=query_surname, gate=gate,
+                deadline=deadline + _NWM_UPKEEP_S)
         except Exception as exc:  # noqa: BLE001 — upkeep must not lose the crawl's heartbeat
             db.rollback()
             _logger.warning("Asotin probate upkeep failed: %s", str(exc)[:120])

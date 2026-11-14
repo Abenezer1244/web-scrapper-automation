@@ -17,6 +17,7 @@ tombstones stay, so a republished notice cannot bring the person back.
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Callable
 from datetime import date, datetime, timedelta
 
@@ -69,22 +70,37 @@ _UPSERT = text("""
     RETURNING id
 """)
 _REMATCH_DUE = text("""
-    SELECT id::text AS id, county, decedent, personal_reps, claims_address
+    SELECT id::text AS id, county, decedent, personal_reps, claims_address, fetched_at,
+           matched_at
       FROM probate_notices
      WHERE privacy_suppression_id IS NULL AND match_outcome IN ('held', 'failed')
        AND first_published >= :since AND (matched_at IS NULL OR matched_at < :stale)
      ORDER BY matched_at NULLS FIRST LIMIT :n
 """)
+# Every rematch write is conditional on the row being exactly as it was read (no crawl
+# re-read it since: fetched_at; no other rematch answered: matched_at), so a slow
+# rematch can never overwrite a newer answer. The same WHERE in all three.
 _SET_MATCH = text("""
     UPDATE probate_notices SET match_outcome = :outcome, held_reasons = CAST(:held AS json),
            parcels = CAST(:parcels AS json), matched_at = :now
      WHERE id = CAST(:id AS uuid) AND privacy_suppression_id IS NULL
+       AND match_outcome IN ('held', 'failed') AND fetched_at = :seen_fetched
+       AND matched_at IS NOT DISTINCT FROM :seen_matched
 """)
 _TOMBSTONE = text("""
     UPDATE probate_notices SET decedent = NULL, personal_reps = NULL, claims_address = NULL,
            parcels = NULL, match_outcome = 'withheld', held_reasons = NULL, matched_at = :now,
            privacy_suppression_id = CAST(:suppression AS uuid)
      WHERE id = CAST(:id AS uuid) AND privacy_suppression_id IS NULL
+       AND match_outcome IN ('held', 'failed') AND fetched_at = :seen_fetched
+       AND matched_at IS NOT DISTINCT FROM :seen_matched
+""")
+# A row whose re-check raised: pushed back one interval so it cannot starve the others.
+_BACK_OFF = text("""
+    UPDATE probate_notices SET matched_at = :now
+     WHERE id = CAST(:id AS uuid) AND privacy_suppression_id IS NULL
+       AND match_outcome IN ('held', 'failed') AND fetched_at = :seen_fetched
+       AND matched_at IS NOT DISTINCT FROM :seen_matched
 """)
 _PURGE = text("""
     DELETE FROM probate_notices
@@ -167,24 +183,38 @@ def ingest_text(db, notice_text: str, *, advert_id: str | None, pdf_url: str | N
     return outcome
 
 
-def rematch_due(db, *, today: date, now: datetime, lookup: Lookup, gate: Gate) -> int:
+def rematch_due(db, *, today: date, now: datetime, lookup: Lookup, gate: Gate,
+                deadline: float | None = None) -> int:
     """Re-check recent held/failed notices (an owner record may since name the estate, or
-    the layer is back). Returns how many were re-checked. Commits per notice."""
+    the layer is back). Returns how many were re-checked. Commits per notice; stops at
+    ``deadline`` (time.monotonic()); one notice failing never stops the others."""
     due = db.execute(_REMATCH_DUE, {"since": today - timedelta(days=REMATCH_DAYS),
                                     "stale": now - REMATCH_EVERY, "n": REMATCH_BATCH}).all()
     db.commit()   # no transaction waits on the layer
+    done = 0
     for row in due:
-        reps = row.personal_reps if isinstance(row.personal_reps, list) else []
-        outcome, held, parcels = match_notice(row.decedent, reps, row.claims_address, lookup)
-        suppression = gate(parcels, row.county) if parcels else None
-        if suppression:
-            db.execute(_TOMBSTONE, {"id": row.id, "now": now, "suppression": suppression})
-        else:
-            db.execute(_SET_MATCH, {"id": row.id, "now": now, "outcome": outcome,
-                                    "held": json.dumps(held) if held else None,
-                                    "parcels": json.dumps(parcels) if parcels else None})
-        db.commit()
-    return len(due)
+        if deadline is not None and time.monotonic() > deadline:
+            break
+        seen = {"id": row.id, "now": now, "seen_fetched": row.fetched_at,
+                "seen_matched": row.matched_at}
+        try:
+            reps = row.personal_reps if isinstance(row.personal_reps, list) else []
+            outcome, held, parcels = match_notice(row.decedent, reps, row.claims_address, lookup)
+            suppression = gate(parcels, row.county) if parcels else None
+            if suppression:
+                db.execute(_TOMBSTONE, {**seen, "suppression": suppression})
+            else:
+                db.execute(_SET_MATCH, {**seen, "outcome": outcome,
+                                        "held": json.dumps(held) if held else None,
+                                        "parcels": json.dumps(parcels) if parcels else None})
+            db.commit()
+        except Exception as exc:  # noqa: BLE001 — one notice must not starve the rest
+            db.rollback()
+            _logger.warning("Probate re-check of %s failed: %s", row.id, str(exc)[:120])
+            db.execute(_BACK_OFF, seen)
+            db.commit()
+        done += 1
+    return done
 
 
 def purge_expired(db, *, today: date) -> int:

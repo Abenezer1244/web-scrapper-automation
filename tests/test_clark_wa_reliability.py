@@ -94,3 +94,20 @@ def test_rows_become_leads_with_raw_pid_string():
     assert recs[0].parcel_id == "109583514"
     assert recs[0].party_name == "DOE JANE"
     assert recs[0].enrichment_data["recording_number"] == "6358783"
+
+
+def test_death_certificate_selects_code_62_and_keeps_the_decedent():
+    s = ClarkWAScraper("death_certificate")
+    assert s._checkbox_values == ["62"]
+    rows = [{  # real shape (instrument 6353261): portal labels grantor "Decedent", grantee "Public"
+        "docId": "1", "grantor": "ROE RICHARD", "grantee": "PUBLIC", "date": "10/05/2026",
+        "docType": "DEATH CERTIFICATE", "legal": "SUB: PARK EST BK311 P363 LOT: 16 PID: 185188032",
+        "recNum": "6353261",
+    }, {  # no parcel: not property-linked, never a lead
+        "docId": "2", "grantor": "ROE JANE", "grantee": "PUBLIC", "date": "10/05/2026",
+        "docType": "DEATH CERTIFICATE", "legal": "", "recNum": "6353262",
+    }]
+    recs = s._records_from_rows(rows)
+    assert [(r.party_name, r.heirs, r.parcel_id) for r in recs] == [("ROE RICHARD", None, "185188032")]
+    scope = ClarkWAScraper.collection_scope("death_certificate")
+    assert scope is not None and [i.label for i in scope.items] == ["Death Certificate"]

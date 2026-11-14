@@ -53,6 +53,8 @@ _DOC_TYPES = {
                          "NOTICE OF FORECLOSURE", "FORECLOSURE", "TRUSTEES SALE"],
     "divorce": ["DISSOLUTION", "DIVORCE"],
     "tax_delinquent": ["CERTIFICATE OF DELIQUENCY", "CERTIFICATE OF SALE", "FEDERAL TAX LIEN"],
+    # Recorded copies filed against a property (code DEATH), not the vital-records index.
+    "death_certificate": ["DEATH CERTIFICATE"],
 }
 
 # Map record_type → checkbox value IDs on the Document Type tab.
@@ -73,6 +75,7 @@ _DOC_TYPE_CHECKBOX_VALUES = {
     "pre_foreclosure": ["167", "129", "166", "157", "93", "257"],
     "divorce": ["68", "71"],                        # DISSOLUTION, DIVORCE
     "tax_delinquent": ["97"],                       # FEDERAL TAX LIEN
+    "death_certificate": ["62"],                    # DEATH CERTIFICATE
 }
 
 # Verified checkbox-id -> raw portal label (live modal, 2026-06-22). This is the
@@ -548,7 +551,7 @@ class ClarkWAScraper(BridgeScraper):
                 if oriented is None:
                     continue
                 grantor, grantee = oriented
-            elif self._record_type == "probate":
+            elif self._record_type in ("probate", "death_certificate"):
                 # Death certs index the issuing agency / filing state as grantor,
                 # with the DECEDENT as grantee; promote the decedent and strip
                 # "Estate of" captions. No-op when grantor is already the decedent

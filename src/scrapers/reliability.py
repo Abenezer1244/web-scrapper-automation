@@ -86,6 +86,16 @@ class TransientScrapeError(ScraperExecutionError):
     """
 
 
+class SourceUnavailableError(ScraperExecutionError):
+    """A record type the county source is KNOWN not to serve right now (a deliberate
+    hold, not a fault). Permanent, never retried. ``public_message`` is fixed text
+    written for the customer and is the only part the worker shows them."""
+
+    def __init__(self, county: str, platform: str, public_message: str, **kwargs) -> None:
+        self.public_message = public_message
+        super().__init__(county, platform, public_message, **kwargs)
+
+
 class ScraperBlockedError(TransientScrapeError):
     """Captcha / bot-block / login / session-timeout wall.
 

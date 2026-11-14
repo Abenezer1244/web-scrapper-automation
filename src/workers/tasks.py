@@ -1041,6 +1041,12 @@ def run_scrape_job(self, job_id: str) -> None:
                 db.rollback()
             except Exception:
                 pass
+            from src.scrapers.reliability import SourceUnavailableError
+            if isinstance(exc, SourceUnavailableError):
+                # A known, deliberate source gap: tell the customer why, never retry,
+                # and keep it out of error tracking (it is not a bug).
+                _fail_attempt(exc.public_message, report=False)
+                return
             # Transient portal hiccup (page never rendered, pagination flaked, block
             # wall, Playwright timeout) → re-queue this job with backoff instead of
             # permanently failing the whole day's scrape on ONE flaky page. Bounded by

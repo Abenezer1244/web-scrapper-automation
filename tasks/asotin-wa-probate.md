@@ -19,9 +19,9 @@ Asotin PACS has NO owner-name search mode (Account Number / Address / DBA only) 
 and not worked around via DBA. The county's own public ArcGIS layer
 `services6.arcgis.com/VsJGTl1jmCYBc0EX/.../Parcels/FeatureServer/0` (13,651 rows, Query
 capability, linked from asotincountywa.gov/179/Parcel-Map "search for parcels by owner")
-has NAME ("OZARD, COLLEEN J"), PARCEL_ID (17-digit), Prop_ID, BILLING1/2+CITY/ST/ZIP,
-FULL_ADD+SITE_CITY. Live: decedent COLLEEN J. OZARD -> exactly one parcel; JEANETTE L.
-CAMPBELL -> none (held). Estate owners also appear as "NAME (ESTATE)", "NAME ESTATE C/O ...".
+has NAME ("LAST, FIRST M"), PARCEL_ID (17-digit), Prop_ID, BILLING1/2+CITY/ST/ZIP,
+FULL_ADD+SITE_CITY. Live: decedent in 26-4-00122-02 -> exactly one parcel; decedent in
+26-4-00117-02 -> none (held). Estate owners also appear as "NAME (ESTATE)", "NAME ESTATE C/O ...".
 
 ## Plan
 Phase 1 (pure, no DB) — parser + matcher

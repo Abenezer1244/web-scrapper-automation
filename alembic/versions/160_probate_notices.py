@@ -13,7 +13,7 @@ A CHECK keeps an erased (or otherwise withheld) notice nameless for good, so no 
 crawl can write the person back (Codex consult).
 
 Revision ID: 160
-Revises: 157
+Revises: 159
 Create Date: 2026-11-14
 """
 import sqlalchemy as sa
@@ -22,7 +22,7 @@ from sqlalchemy import text
 from sqlalchemy.dialects.postgresql import UUID
 
 revision = "160"
-down_revision = "157"
+down_revision = "159"
 branch_labels = None
 depends_on = None
 

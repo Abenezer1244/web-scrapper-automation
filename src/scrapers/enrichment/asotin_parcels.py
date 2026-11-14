@@ -108,7 +108,7 @@ def _norm(text: str) -> str:
 
 @dataclass(frozen=True)
 class NoticeName:
-    """A name as a notice prints it ('COLLEEN J. OZARD'): natural order, surname last."""
+    """A name as a notice prints it ('MARGARET J. HOLLOWAY'): natural order, surname last."""
     tokens: tuple[str, ...]
     suffix: str
 
@@ -118,7 +118,7 @@ class NoticeName:
 
 
 def notice_name(name: str) -> NoticeName | None:
-    """'COLLEEN J. OZARD' / 'JOHN A. DOE, JR.'; None without a first name and a surname."""
+    """'MARGARET J. HOLLOWAY' / 'JOHN A. DOE, JR.'; None without a first name and a surname."""
     toks = _tokens(name)
     suffix = ""
     if toks and toks[-1] in _SUFFIXES:

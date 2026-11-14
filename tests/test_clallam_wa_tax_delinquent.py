@@ -170,3 +170,77 @@ def test_a_stale_or_future_portal_status_fails(today):
     _, rows = parse_certificate(_pages())
     with pytest.raises(ValueError, match="is not current"):
         build_record(rows[0], parse_portal_status(_portal()), _CERT, cap_min_year=None, today=today)
+
+
+# --- portal read retry (one unreadable page failed a canary, 2026-11-14) -------------
+
+_BUSY = "<html><body>Service unavailable. Owner: JANE Q DOE, 12 ELM ST</body></html>"
+
+
+def _serve(responses: list, calls: list[str]):
+    """safe_get serving recorded responses in order: a page body (str) or an exception."""
+    import requests
+
+    def _get(url, **kw):
+        calls.append(kw["params"]["prop_id"])
+        item = responses[len(calls) - 1]
+        if isinstance(item, Exception):
+            raise item
+        resp = requests.Response()
+        resp.status_code, resp._content, resp.url = 200, item.encode(), url
+        return resp
+    return _get
+
+
+def _scraper(monkeypatch, retries: int = 3):
+    import src.scrapers.clallam_wa_tax_delinquent as m
+    from src.config import settings
+    monkeypatch.setattr(settings, "POLITE_DELAY_MS", 0)
+    monkeypatch.setattr(settings, "MAX_RETRIES", retries)
+    return m, m.ClallamWATaxDelinquentScraper()
+
+
+def test_one_unreadable_portal_page_is_retried_and_logged_without_page_text(monkeypatch, caplog):
+    import asyncio
+    m, s = _scraper(monkeypatch)
+    calls: list[str] = []
+    monkeypatch.setattr(m, "safe_get", _serve([_BUSY, _portal()], calls))
+    status = asyncio.run(s._portal_status("17038", 2026))
+    assert calls == ["17038", "17038"]
+    assert status == parse_portal_status(_portal())
+    assert "PortalPageUnreadableError" in caplog.text
+    assert "JANE" not in caplog.text and "ELM" not in caplog.text
+
+
+def test_a_dropped_connection_is_retried(monkeypatch):
+    import asyncio
+
+    import requests
+    m, s = _scraper(monkeypatch)
+    calls: list[str] = []
+    monkeypatch.setattr(m, "safe_get", _serve([requests.ConnectionError("reset"), _portal()], calls))
+    assert asyncio.run(s._portal_status("17038", 2026)) == parse_portal_status(_portal())
+    assert len(calls) == 2
+
+
+def test_a_portal_page_unreadable_on_every_attempt_still_fails(monkeypatch):
+    import asyncio
+    m, s = _scraper(monkeypatch, retries=3)
+    calls: list[str] = []
+    monkeypatch.setattr(m, "safe_get", _serve([_BUSY] * 3, calls))
+    with pytest.raises(m.PortalPageUnreadableError):
+        asyncio.run(s._portal_status("17038", 2026))
+    assert len(calls) == 3
+
+
+def test_a_data_integrity_failure_is_not_retried_away(monkeypatch):
+    """A statement listed twice is a real defect: a later clean page must not replace it."""
+    import asyncio
+    m, s = _scraper(monkeypatch)
+    page = _portal()
+    doubled = page.replace("2025 - 11049", "2025 - 11001")
+    calls: list[str] = []
+    monkeypatch.setattr(m, "safe_get", _serve([doubled, page], calls))
+    with pytest.raises(ValueError, match="listed twice"):
+        asyncio.run(s._portal_status("17038", 2026))
+    assert len(calls) == 1

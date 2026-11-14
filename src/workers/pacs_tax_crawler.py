@@ -29,7 +29,7 @@ from src.workers import app
 
 _logger = setup_logger("workers.pacs_tax_crawler")
 
-COUNTIES = ("asotin",)              # PACS counties with no delinquent list
+COUNTIES = ("asotin", "columbia")   # PACS counties with no delinquent list
 _STATE = "WA"
 _BATCH = 400                        # more than one budget can reach; the rest wait
 _BUDGET_S = 20 * 60                 # inside the hourly slot, leaving the lease free

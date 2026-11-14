@@ -37,7 +37,7 @@ from src.db.session import system_sync_session
 from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord
 from src.scrapers.enrichment.source_health import get_source_state
 from src.scrapers.preforeclosure import strip_vesting_clause
-from src.scrapers.reliability import ScraperExecutionError
+from src.scrapers.reliability import ScraperExecutionError, SourceUnavailableError
 from src.utils.lead_signals import auction_reference_date
 from src.utils.logger import setup_logger
 
@@ -225,6 +225,10 @@ class _TrusteeSaleScraper(BridgeScraper):
     """
 
     COUNTY: str = ""  # lowercase county slug, set by subclass
+    # Set when the county's cache source is known NOT to carry its trustee sales, so a
+    # healthy crawler heartbeat cannot vouch for an empty list. The run fails with
+    # this reason instead of reporting a zero (permanent: retrying cannot fix it).
+    SOURCE_UNAVAILABLE: str | None = None
 
     def __init__(self, record_type: str = RECORD_TYPE) -> None:
         super().__init__()
@@ -260,6 +264,10 @@ class _TrusteeSaleScraper(BridgeScraper):
         # window means "auctions in the next 90 days". date_recorded then always falls
         # inside the window the user asked for, instead of provably outside it. An
         # unparseable/absent window keeps the old behavior (every upcoming auction).
+        if self.SOURCE_UNAVAILABLE:
+            raise SourceUnavailableError(
+                self.COUNTY, "nts_cache", self.SOURCE_UNAVAILABLE, record_type=RECORD_TYPE,
+            )
         self.report_stage("searching")
         today = auction_reference_date()   # county-local, not UTC — see lead_signals
         span = _window_span_days(date_from, date_to)
@@ -381,9 +389,18 @@ class KingWATrusteeSaleScraper(_TrusteeSaleScraper):
 
 
 class ClarkWATrusteeSaleScraper(_TrusteeSaleScraper):
-    """Clark County (WA) auction leads — The Columbian classifieds NTS cache."""
+    """Clark County (WA) auction leads — on hold (owner decision 2026-11-14).
+
+    The Columbian classifieds carry almost no Clark trustee sales (2 ever, last
+    2026-07-28; 0 of 21 live ads on 2026-11-14) while the recorder records ~29 a
+    month, so its cache cannot prove "no sales". Clark notices come back through the
+    recorder images + OCR review pipeline (tasks/clark-wa-seven.md)."""
 
     COUNTY = "clark"
+    SOURCE_UNAVAILABLE = (
+        "Auction leads for Clark County are temporarily unavailable: the current "
+        "notice source does not carry Clark trustee sales. No leads were charged."
+    )
 
 
 class BentonWATrusteeSaleScraper(_TrusteeSaleScraper):

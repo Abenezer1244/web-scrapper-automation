@@ -118,13 +118,15 @@ DEATH CERTIFICATE 405, WILL 1. 1,128 of 3,467 rows `is_duplicate`.
 | code_violation | none | county ArcGIS layer, "not subject to public disclosure, no dump" | Blocked by legal/data restrictions |
 | divorce | none | Odyssey index; AOC policy bars commercial solicitation | Blocked by legal/data restrictions |
 
-## Activation prerequisites (owner approval for each)
-1. PR + CI green (CI runs the DB-backed worker test).
-2. Deploy api, then worker, then beat (no migration in this branch).
-3. Verify: one Clark probate and one pre_foreclosure manual run finish DONE with records_found set.
-4. death_certificate: `UPDATE county_connectors SET record_types = record_types || '["death_certificate"]'
-   WHERE id = '70bb5315-1cec-428b-9f7d-b5058293083e';` (or a migration) only after approval.
-5. Clark OCR trustee_sale: after feat/chelan-nts-ocr merges.
+## Activation prerequisites (status 2026-11-14)
+1. [x] PR + CI green: #631, Test passed in 43 min incl. the DB-backed worker test.
+2. [x] Deploy api, worker, beat: Railway auto-deploy of main 92db4278 (no migration).
+3. [ ] One PERSISTED Clark probate and pre_foreclosure run DONE with records_found set: NOT run.
+   Only non-persisting checks on the prod worker (pre_foreclosure 15 leads) and the persisted
+   death_certificate job fe8f35b3. The first customer probate / pre_foreclosure run is the check.
+4. [x] death_certificate added to connector 70bb5315 (done once, guarded `NOT ? 'death_certificate'`;
+   do not re-run an unguarded append, it would duplicate the entry).
+5. [ ] Clark OCR trustee_sale: after feat/chelan-nts-ocr merges.
 
 ## Go-live verification (2026-11-14)
 - Non-persisting run on the prod worker: death_certificate 10/15-11/13 6 leads, pre_foreclosure
@@ -151,7 +153,9 @@ Owner" / "Title Status" stay empty for Clark (that reconciliation is King-only).
 12:1 (1). The county parcel layer (TaxlotsPublic Prop_id) accepts 8 and 9 digits as printed, so no
 leading zeros are lost. 10/12-digit and some 7-digit ids are recorder typos (1428590000 is
 142859000; 9200786 is 92007860; 1181107374 resolves neither way; one legal says "INCORRECT
-PARCEL"). They get no address and are not billed. Fix: only an explicit "PID:" is a parcel (the
+PARCEL"). In this audit those rows got no address and were not billed; that is an observed
+outcome, not a guarantee: a typo that happens to equal another valid parcel would resolve to that
+parcel, and nothing here can detect it. Fix: only an explicit "PID:" is a parcel (the
 unlabelled fallback fired once, on a BLK number), the whole digit run is kept verbatim, and all
 PIDs of a multi-parcel deed (140 rows) go to enrichment_data["parcel_ids"]. No repair of typos:
 guessing a zero could pick another owner's parcel. Codex consult + gate PASS; live lead counts

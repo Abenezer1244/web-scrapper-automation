@@ -29,7 +29,9 @@ parcel is only an explicit "PID:", kept verbatim, every PID of a multi-parcel de
 found, 24 already delivered by earlier probate runs, 8 new billed, all complete; CSV 8/8 on every
 core column. A UI "Run now" on Clark Auction leads failed with the exact customer text, unbilled.
 Parcel typos (1428590000 for 142859000) are NOT repaired: a guessed zero could name another
-owner; they stay unaddressed and unbilled.
+owner. In the audit they got no address and were not billed (observed, not guaranteed: a typo
+equal to another valid parcel would resolve to it). Persisted probate / pre_foreclosure runs were
+not made; only non-persisting checks.
 
 **Failed / Blocked:** `playwright-cli` is not installed on this laptop; QA ran from a Python
 Playwright script with a headed window the owner signed into (session kept in the scratchpad).

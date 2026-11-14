@@ -205,6 +205,7 @@ def safe_download_to_file(
     timeout: int = 30,
     max_redirects: int = 5,
     chunk_size: int = 65536,
+    deadline_s: float | None = None,
 ) -> int:
     """Stream a server-side download to ``dest_path`` with an SSRF guard and a
     hard byte cap. Returns the number of bytes written.
@@ -224,6 +225,9 @@ def safe_download_to_file(
         require_allowlisted: also require each hop's host be on the scrape allowlist.
         require_https: refuse a plaintext/scheme-downgraded hop (default True).
         follow_redirects: if False, any 3xx raises instead of being followed.
+        deadline_s: optional limit on the whole download's wall time. ``timeout`` only
+            bounds each wait for bytes, so a slow drip could otherwise run far past it;
+            the check runs between chunks (so it can overrun by one ``timeout`` at most).
 
     Raises:
         ValueError: blocked hop, scheme downgrade, disallowed/too-many redirects,
@@ -233,6 +237,9 @@ def safe_download_to_file(
     if max_bytes <= 0:
         raise ValueError("max_bytes must be positive")
 
+    import time as _time
+
+    deadline = None if deadline_s is None else _time.monotonic() + deadline_s
     current = url
     resp = None
     for _ in range(max_redirects + 1):
@@ -271,7 +278,9 @@ def safe_download_to_file(
                 f"Download too large: declared {declared} bytes > cap {max_bytes}"
             )
 
-        total = _stream_capped(resp.iter_content(chunk_size), dest_path, max_bytes)
+        chunks = (resp.iter_content(chunk_size) if deadline is None
+                  else _read1_chunks(resp, chunk_size))
+        total = _stream_capped(chunks, dest_path, max_bytes, deadline)
     finally:
         resp.close()
 
@@ -280,16 +289,32 @@ def safe_download_to_file(
     return total
 
 
-def _stream_capped(chunks, dest_path: str, max_bytes: int) -> int:
+def _read1_chunks(resp, chunk_size: int):
+    """Yield what each single network read returns (urllib3 ``read1``). With a deadline,
+    ``iter_content`` is not enough: it waits for a full chunk, so a server dripping bytes
+    inside the read timeout could hold it far past the deadline (Codex). ``read1`` returns
+    after one receive, so the deadline is checked after every one."""
+    while True:
+        data = resp.raw.read1(chunk_size, decode_content=True)
+        if not data:
+            return
+        yield data
+
+
+def _stream_capped(chunks, dest_path: str, max_bytes: int, deadline: float | None = None) -> int:
     """Write an iterable of byte chunks to ``dest_path``, aborting past ``max_bytes``.
 
     Pure (no network/SSRF) so the size-cap behaviour is unit-testable directly.
     Raises ``ValueError`` the moment the running total exceeds ``max_bytes`` — the
     partial file is left on disk for the caller to clean up.
     """
+    import time as _time
+
     total = 0
     with open(dest_path, "wb") as fh:
         for chunk in chunks:
+            if deadline is not None and _time.monotonic() > deadline:
+                raise ValueError("Download exceeded its time limit")
             if not chunk:
                 continue
             total += len(chunk)

@@ -75,6 +75,65 @@ Licensing: the Assessor's search page cites RCW 42.56.070(9) (no commercial list
 - [x] Fail closed: a type a site has no vocabulary for is refused before any request (it used to skip the filter)
 - [ ] Activation (owner): add `death_certificate` to the Chelan connector's `record_types` (no migration needed; `ALL_RECORD_TYPES` already has it)
 
+### Phase 4a: trustee_sale via OCR (owner-approved 2026-11-12, PLAN — not started)
+Feasibility checked: NTS PDFs are free at `/AcclaimWeb/Image/DocumentPdfAllPages/{TransactionItemId}` (no login), and installed `pypdf` extracts each page as an image (2550×3481). The only new dependency is the **Tesseract binary** (`apt-get install tesseract-ocr`, Apache-2.0), called by subprocess with no new pip package. It is about 2 Chelan NTS a month.
+Codex pre-build consult (2026-11-12): no P0. The P1s are: a staging/review boundary before `nts_notices`; per-field OCR evidence gates; isolated PDF/image/OCR decoding; recording + DT linkage (not APN alone); revision ordering for re-recordings and cancellations; amount semantics kept atomic. The owner chose **the full build with operator review** (every OCR'd notice is approved against its image before customers see it).
+
+**4a-1: staging + isolated extractor** (DONE, Codex GO after 5 rounds; commit 4b29dab1 on `feat/chelan-nts-ocr`)
+- [x] Migration 158 (was 141 on the branch): `nts_recorder_documents` (county, instrument number, transaction item id, record date, doc code, pdf sha256, page count, recording APN, related DT, borrower from the detail page, ocr text, parser/OCR version, extracted fields with per-field token confidence, status `pending_review|approved|rejected|superseded`, reviewer, reviewed_at). No user data, no RLS user scope (source data, like `nts_notices`)
+- [x] `src/scrapers/sources/nts_recorder_ocr.py`: PDF bytes -> killable child process (`python -I -m …`) with byte/page/image/pixel caps, wall-time limit, private temp dir, fixed argv, no shell -> pypdf page images -> `tesseract` TSV (word confidences) -> `parse_nts_notice` + field evidence. Over-limit = explicit rejection
+- [x] Tests (41 + 1 Linux-only): real child processes with stand-in tesseract executables (TSV, flood, hang with descendant, fail). STILL OPEN: golden OCR text of the 2 real PDFs needs tesseract installed locally (UAC prompt was cancelled). Planned: golden OCR-text fixtures for the 2 real PDFs, subprocess contract (timeout, missing binary, nonzero exit, cleanup, output cap), malformed/encrypted/oversized PDFs, OCR-corruption fixtures that must quarantine
+
+**4a-2: discovery + staging** (DONE, Codex GO after 4 rounds. 7 files: over the 5-file rule because Codex's deadline finding needed `safe_http.py` and the purge needed its own beat entry in `scheduler.py`)
+- [x] `ChelanAcclaimWebScraper.discover()`: complete NTS/NTSCOM rows per day, one bounded retry per day (portal stalls ~1 min, seen live)
+- [x] `crawl_nts_chelan_recorder` (NOT scheduled): Redis lock (atomic Lua release); one time budget from lock to end; detail + PDF via `_bounded_fetch` (SSRF-guarded, no redirects, byte cap, wall-clock deadline via `safe_download_to_file(deadline_s=...)` reading with urllib3 `read1`); OCR; `stage_recorder_document`; every recording counted staged/failed/kept/invalid/unread; ops alert on any problem
+- [x] Recording cross-check: OCR parcel vs the recording's APN, OCR deed reference vs its related DT (`corroborate`), flags only
+- [x] `purge_nts_recorder_staging` on its own daily beat (09:40 UTC): pending > 30 days loses OCR text and OCR'd fields
+- [x] Live (read-only source, local test DB), 09/15–10/20/2026: 5 recordings discovered and staged; 2 fully corroborated (parcel + DT); 2 flagged parcel mismatches (OCR misreads); 1 commercial notice with no sale date read; TS# not read in 3 of 5 (shared parser's patterns; flagged, not invented)
+- [ ] Operator review CLI (list/show/approve/reject) moves to 4a-3, with the approval write it needs
+- [ ] `crawl_nts_chelan_recorder` task: a recorder-document discovery adapter (NTS/NTSCOM/NOD-discontinuance codes, overlapping window, complete reads), own time limits + overlap lock + source admission -> detail page (APN, DT, borrower) -> OCR -> staging. Completeness-aware health (a verified zero is healthy)
+- [ ] Operator CLI: list pending, show fields + image link, approve/reject (who, when). Approval writes the canonical notice
+
+**4a-3: operator review + canonical notices + delivery** (owner "Go" 2026-11-13; split to keep each phase ≤5 files)
+
+4a-3a: review + approval write (3 files)
+- [ ] `approve_recorder_document(db, doc_id, reviewer, values)` / `reject_recorder_document` in `nts_crawler.py`. Approve: row locked, must be `pending_review`; reviewer supplies the values read off the image (sale date, parcel, grantor required; time, address, amount + basis, trustee, beneficiary, trustee's TS# optional). Parcel must be one of the recording's own APNs (12 digits). Writes `nts_notices` through `_upsert_notice` (privacy gate included): source `chelan_recorder`, key `REC-<instrument>` (Benton's rule: the recording, not the sale, is the identity), `source_url` = detail page. Doc becomes `approved`, OCR text cleared (CHECK), `fields` = approved values minus grantor, `nts_notice_id` set
+- [ ] Revision ordering: approved docs sharing a related DT are one foreclosure; the newest recording (record_date, then instrument) is the live notice, older ones' notices go inactive and their docs `superseded`. Approving an older one leaves it inactive/superseded
+- [ ] Reject: reason required, OCR text cleared, never written to `nts_notices`
+- [ ] `scripts/nts_review.py`: `list` (pending, no names), `show` (OCR text + flags + evidence + image URL; operator only), `approve`, `reject`. Operator must be an admin with MFA (same check as `privacy_admin.py`). Runs under `railway run --service worker`
+- [ ] Tests on the real test DB: approve writes the notice + clears text; wrong parcel refused; non-pending refused; supersede both orders; reject; privacy gate withholds; CLI operator check
+
+Codex consult on 4a-3 (2026-11-13), reconciled:
+- P1 sessions: the operator check runs in the migration-role session and is rolled back first, then every write goes through `system_sync_session` (one transaction)
+- P1 DT equality is not identity: no automatic grouping. A revision is EXPLICIT: `approve --supersedes <instrument>` (the reviewer reads "amended" off the image). If another approved, uncancelled Chelan notice shares this recording's DT, approval refuses until the reviewer passes `--supersedes` or `--independent`. Missing DT is never grouped
+- P1 concurrency: the whole approval holds `pg_advisory_xact_lock(NTS_CANCEL_LOCK_KEY)` (exclusive, same key the matcher takes shared), then locks the staged row
+- P1 superseded leads: superseding = Benton's cancellation (cancelled_at + inactive + stamped leads cleared), factored into one shared helper. Every matcher pass and the finalizer already exclude cancelled_at
+- P1 delivery before discontinuance: the 4a-3b connector ships INACTIVE and must not be switched on until 4a-3c (NOD reconciliation) ships
+- P2 Borrower is not stored in staging (the task line above was wrong): the reviewer types the grantor from the image; it goes through `_privacy_gate`, never into staging JSON or logs
+- P2 dual paths (pre_foreclosure + trustee_sale for one recording): a live check before activation (dedup hash, matcher attachment)
+- P2 REC- identity: notice id re-selected by (source, ts_number), fetched_at set explicitly; approval is one-shot (a correction = supersede with a fresh approval, out of scope)
+
+4a-3b: delivery (8 files: over the 5-file rule; the Dockerfile, matcher and beat changes are one line each)
+- [x] `ChelanWATrusteeSaleScraper` (scope: recorded notices, each reviewed), migration 159 adds the Chelan `trustee_sale` connector INACTIVE (Benton 155 pattern; stays off until 4a-3c), beat `crawl-nts-chelan-recorder` 09:50 UTC (50-min limit ends before the 11:00 matcher), Dockerfile `tesseract-ocr`
+- [x] Freshness: the crawl records `nts_crawl:chelan` only after a complete read (`chelan_cache_is_fresh`). Review lag is judged at delivery time: the Chelan scraper's `_source_gap` hook (`chelan_unresolved_reason`) reports the cache short while any recording first seen more than 3 days ago is still pending review or unreadable (failed, including expired), wherever it now sits; the crawl alerts on the same reason
+- Codex review 1 (NO-GO, 1 High 2 Medium), fixed: (High) Chelan is NOT in `NTS_MATCH_COUNTIES` yet: matching would stamp approved sales onto pre_foreclosure leads customers already get, before discontinuances are reconciled; 4a-3c adds it. (Medium x2) withholding a heartbeat cannot enforce the review deadline (an earlier heartbeat stays valid 3 days) and missed failed/expired rows outside the window: moved to the delivery-time check above
+- [x] A recording whose scan cannot be read (`failed`) can be rejected (`unreadable`), so it stops being retried and stops holding the cache stale; `list` shows unreadable rows too
+
+4a-3c: discontinuance
+- Live (2026-11-14, read-only): 4 Chelan NODs Aug-Nov 2026. Their public detail page carries a structured "Related Number" block, one link per document with an optional type tag: "2620779 [NTS]"; "2109037" (untagged); "2534205 [DT]"; "2248127" + "2625826 [NTS]". No PDF/OCR needed. Fixture: AFN 2628164 (names redacted)
+- Codex consult (no P0; 6 P1, 2 P2), reconciled:
+  - Auto-cancel ONLY where a related number IS an approved notice's own recording number (direct). A loan-only reference (DT or untagged, overlapping an approved notice's DTs) or a page linking nothing goes to the operator (pending_review, which holds the cache stale); never inferred from APN
+  - Approval consults stored discontinuances recorded on/after the notice: direct -> written cancelled; loan-only -> refuses until `--discontinued-by <nod>` or `--not-discontinued`
+  - The crawl reaches back to its last complete read after an outage (cap 60 days); a first run needs only the window (only notices inside it are staged; their NODs follow them)
+  - Stored failed rows are retried even outside the search window
+  - The page must state `Doc Type: NOD`; failed/invalid stays failed (retried, holds the cache stale)
+  - NTS_CANCEL_LOCK_KEY taken before anything is read, in staging, approval and resolution
+  - Migration 158 amended (unpushed, never deployed): status `discontinuance`, exempt from the reviewer CHECK (automated); ORM mirror updated; provenance (`cancelled`: instrument + basis direct/operator) on the NOD row
+- [x] `related_numbers` / `detail_doc_code` (detail page), `stage_discontinuance`, `resolve_discontinuance`, approval consult, crawl NOD discovery + reach-back + stored-failure retry
+- [x] `scripts/nts_review.py resolve-nod --cancels <instrument>... | --no-effect`; approve `--discontinued-by` / `--not-discontinued`
+- [x] Chelan added to `NTS_MATCH_COUNTIES`
+- [ ] Before the owner switches the connector on: one live check of a real recording through both paths (pre_foreclosure lead + trustee_sale lead: dedup hash, matcher attachment)
+
 ### Phase 4 (owner decisions, not started)
 - trustee_sale: sale date only in scan-only NTS PDFs (`/Image/DocumentPdfAllPages/{id}`, free, 300 dpi, no text layer). Needs OCR (Tesseract is a new dependency: SBOM check plus Railway image change). About 2 NTS per month
 - tax_delinquent: Treasurer "Real Property Auction List" (HTML, 13 parcels, updated 11/09/2026, Owner/Amount Due/Situs; no tax years or redemption status) and per-parcel PACS cid=90 balances. County terms forbid "any for-profit commercial purpose or use" without written consent. Public Surplus forbids robots. Legal call first

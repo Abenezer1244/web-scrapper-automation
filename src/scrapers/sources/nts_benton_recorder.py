@@ -9,7 +9,15 @@ That text layer drops spaces inside phrases ("CurrentTrusteeoftheDeed ofTrust:",
 "sum owingon theobligation"), so labels are matched whitespace-insensitively and
 values are read from the original lines. Nothing is repaired by guessing: OCR
 sometimes reads the slashes of a date as digits ("21512027" for 2/5/2027), and
-such a value is left unparsed.
+such a value is left unparsed. The notice states the sale date twice (Section I "will on
+<date>", Section V "... encumbrances on <date>"); the second is read when the first is unreadable,
+and two readable dates that disagree give no date at all.
+
+The owner is the Grantor of the deed of trust. A recording cover sheet can print its
+own "Grantor(s):" (the trustee or lender that recorded the notice), so a grantor that
+names the trustee, beneficiary or servicer is skipped, and the borrower phrases
+("Original Mortgagor(s):", "from X, as Grantor", "executed by X as Trustor") are read
+when no grantor line names the borrower.
 
 RCW 61.24.040 fixes the notice's form, which is what makes this parseable:
   heading     "<instrument> NTS|NTSCL" + recording date/time
@@ -54,10 +62,28 @@ _TS_NO = re.compile(
     re.I,
 )
 # "Grantor:", "Grantor(s):", "Grantor(s) for Recording Purposes under RCW 65.04.015:",
-# "Grantor(s) of Deed of Trust <name>" (no colon).
+# "Grantor(s) of Deed of Trust <name>" (no colon), "Grantor CANDICE MARIE JACKSON" (no colon).
 _GRANTOR = re.compile(
-    r"^\s*" + _loose("Grantor") + r"\s*(?:\(\s*s\s*\))?"
-    r"(?:[^:\n]{0,60}:|\s*" + _loose("of Deed of Trust") + r")\s*(.+)$",
+    r"^[ \t]*" + _loose("Grantor") + r"[ \t]*(?:\([ \t]*s[ \t]*\))?"
+    # A colonless label takes its value from the same line only (Codex: a bare
+    # "Grantor" line must not swallow the next field).
+    r"(?:[^:\n]{0,60}:\s*|[ \t]*" + _loose("of Deed of Trust") + r"[ \t]*|(?![^\n]*:)[ \t]+(?=[A-Z]))(.+)$",
+    re.I | re.M,
+)
+# The borrower in the notice's own words, for when no grantor line names them.
+_MORTGAGOR = re.compile(r"^[ \t]*" + _loose("Original Mortgagor") + r"[ \t]*(?:\(\s*s\s*\))?[ \t]*:[ \t]*(.+)$",
+                        re.I | re.M)
+# Bounded, and a blank line ends the name (one wrapped line is allowed).
+_WRAPPED = r"([^,\n](?:[^,\n]|\n(?![ \t]*\n)){1,160}?)"
+_BORROWER_PHRASES = (
+    re.compile(r"\bfrom\s*" + _WRAPPED + r"\s*,\s*" + _loose("as Grantor"), re.I),
+    re.compile(_loose("executed by") + r"\s*(.{3,200}?)\s*,?\s*" + _loose("as Trustor"), re.I | re.S),
+)
+# Parties that are not the owner. [^:] crosses a line break: cover sheets wrap the label
+# ("CurrentTrusteeof" / "DeedofTrust: EisenhowerCarlsonPLLC").
+_NOT_OWNER = re.compile(
+    r"(?:" + "|".join(_loose(x) for x in ("Current Trustee", "Current Beneficiary", "Current Mortgage Servicer",
+                                          "Original Trustee")) + r")[^:]{0,80}:[ \t]*(\S[^\n]*)$",
     re.I | re.M,
 )
 # The label runs to the first colon on its line ("Current Beneficiary(ies):",
@@ -89,6 +115,11 @@ _SALE = re.compile(
     r"(?:" + _loose("will on") + "|" + _loose("that on") + r")\s*"
     rf"((?:{_MONTH_RE})\s*\d{{1,2}}\s*,\s*\d{{4}}|\d{{1,2}}/\d{{1,2}}/\d{{4}})(?!\d)"
     r"\s*,?\s*(?:at\s*)?(\d{1,2}:\d{2}\s*[AP]\.?\s*M\.?)?",
+    re.I,
+)
+# Section V's restatement of the sale date (RCW 61.24.040 form).
+_SALE_RESTATED = re.compile(
+    _loose("encumbrances on") + rf"\s*((?:{_MONTH_RE})\s*\d{{1,2}}\s*,\s*\d{{4}}|\d{{1,2}}/\d{{1,2}}/\d{{4}})(?!\d)",
     re.I,
 )
 _SECTION_IV = re.compile(_loose("sum owing on the obligation"), re.I)
@@ -163,8 +194,11 @@ def _name(pattern: re.Pattern, text: str, max_lines: int = 4) -> str | None:
     """A labelled name, joined with its wrapped continuation lines (up to the next
     field, a line with a colon, or a blank line)."""
     m = pattern.search(text)
-    if not m:
-        return None
+    return _name_at(m, text, max_lines) if m else None
+
+
+def _name_at(m: re.Match, text: str, max_lines: int = 4) -> str | None:
+    """The name a label match starts, joined with its wrapped continuation lines."""
     parts = [m.group(1)]
     # [1:]: the match ends at its own line's end; a blank line stops the name.
     for line in text[m.end():].split("\n")[1:max_lines + 1]:
@@ -172,6 +206,55 @@ def _name(pattern: re.Pattern, text: str, max_lines: int = 4) -> str | None:
             break
         parts.append(line)
     return _clean(" ".join(parts))
+
+
+def _party_key(name: str | None) -> str:
+    """A name compared without spacing or punctuation (the text layer drops spaces)."""
+    return re.sub(r"[^a-z0-9]", "", (name or "").lower())
+
+
+def _grantor(text: str) -> str | None:
+    """The deed-of-trust grantor: the first grantor line that does not name the trustee,
+    beneficiary or servicer, else a borrower phrase. None when nothing names them."""
+    # Whole names, wrapped lines included, from colon and colonless labels alike (Codex).
+    others = [_name_at(m, text) for p in (_NOT_OWNER, _TRUSTEE, _BENEFICIARY) for m in p.finditer(text)]
+    skip = [k for k in map(_party_key, others) if len(k) >= 6]
+
+    def owner(name: str | None) -> str | None:
+        key = _party_key(name)
+        if not name or not key or _NEXT_FIELD.match(name):
+            return None
+        # A wrap can split a name differently in two places: one name prefixing the other is the same party.
+        if any(key.startswith(k) or k.startswith(key) for k in skip):
+            return None
+        return _clean(name)
+
+    for m in _GRANTOR.finditer(text):
+        if found := owner(_name_at(m, text)):
+            return found
+    m = _MORTGAGOR.search(text)
+    if m and (found := owner(_name_at(m, text))):
+        return found
+    for pattern in _BORROWER_PHRASES:
+        m = pattern.search(text)
+        if m and (found := owner(m.group(1))):
+            return found
+    return None
+
+
+def _sale_date(text: str) -> tuple[date | None, str | None]:
+    """Section I's sale (date, time). Section V's restated date stands in for an unreadable
+    first one; two readable dates that disagree give no date (never a guess)."""
+    iv = _SECTION_IV.search(text)
+    head = text[:iv.start()] if iv else text  # Section I precedes Section IV
+    sale = _SALE.search(head)
+    first = _to_date(sale.group(1)) if sale else None
+    again = _SALE_RESTATED.search(text)  # Section V's restatement, after Section IV
+    second = _to_date(again.group(1)) if again else None
+    if first and second and first != second:
+        return None, None
+    time = _clean(sale.group(2), 32) if sale and sale.group(2) else None
+    return first or second, time
 
 
 def _parcels(text: str) -> list[str]:
@@ -202,8 +285,7 @@ def parse_recorded_nts(text: str) -> dict[str, Any]:
     recorded = _RECORDED_AT.search(text)
     parcels = _parcels(text)
     other_counties = sorted(set(_OTHER_COUNTY.findall(text)))
-    iv = _SECTION_IV.search(text)
-    sale = _SALE.search(text[:iv.start()] if iv else text)  # Section I precedes Section IV
+    auction_date, auction_time = _sale_date(text)
     amount, basis = _section_iv(text)
     ts = _TS_NO.search(text)
     return {
@@ -212,13 +294,13 @@ def parse_recorded_nts(text: str) -> dict[str, Any]:
         "recorded_date": datetime.strptime(recorded.group(1), "%m/%d/%Y").date() if recorded else None,
         "ts_number": ts.group(1) if ts else None,
         "commercial": bool(heading and heading.group(2) == "NTSCL") or bool(_COMMERCIAL.search(text)),
-        "grantor": _name(_GRANTOR, text),
+        "grantor": _grantor(text),
         "trustee": _name(_TRUSTEE, text),
         "beneficiary": _name(_BENEFICIARY, text),
         "parcels": parcels,
         "property_address": _address(text),
-        "auction_date": _to_date(sale.group(1)) if sale else None,
-        "auction_time": _clean(sale.group(2), 32) if sale and sale.group(2) else None,
+        "auction_date": auction_date,
+        "auction_time": auction_time,
         "principal_owing": amount,
         "principal_owing_basis": basis,
         "multi_property": len(parcels) > 1 or bool(other_counties),

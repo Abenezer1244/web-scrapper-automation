@@ -1,0 +1,309 @@
+
+<html>
+<head id="Head1" > 
+    <script type="text/javascript" src="/Scripts/jquery.cookie.js"></script> 
+    <script type="text/javascript" src="/scripts/jquery.hoverIntent.js"></script>
+    <script src="/Scripts/AcclaimDetailPages.js" type="text/javascript"></script>
+    <script type="text/javascript" src="/Scripts/knockout-2.js"></script>
+</head>
+<head><link href="../../../../../App_Themes/Chelan/Site.css" type="text/css" rel="stylesheet" /><title>
+
+</title></head>
+<body>
+        <div class="detailsTop">
+            
+            <input type="hidden" id="hdnTransactionItemId" value="1790020" />
+            <input type="hidden" id="hdnTabId" value="*id*" />
+            <input type="hidden" id="hdnInstrumentNumber" value="2628164" />
+            <br />
+            <div style="font-size: xx-small">
+            
+            <div id="AddToCartDivInternal" style="width: 100%">
+                 
+                <hr style="color: #444; background-color: #444; height: 2px; clear: both;" />
+            </div>
+            <div style="margin: 0px; text-align: left; width:260px;" >
+                
+				<div class="detailsBookPage">
+                    <div class="detailLabel">
+                        Book / Page:
+                    </div>
+                    <span>
+                        
+                        <button type="button" class="t-button docNavButtons" value=""  disabled="disabled"  ><img src="/Content/Images/navLeft16.png" style="border:none; padding: 0px; margin:0px;"/></button>
+                    </span>
+                   <span>
+                        <button type="button" class="t-button docNavButtons" value=""  disabled="disabled" ><img src="/Content/Images/navRight16.png" style="border:none; padding: 0px; margin:0px;"/></button>
+                    </span>
+                    <span>
+                        <input id="bookTypeId" name="bookTypeId" type="hidden" value="2" />
+                        <input type="text" id="jmpBook" value="" style="width: 34px" onkeydown="JumpToTrigger(event,'BP');" />
+                        
+                    </span>
+                    <span>
+                        /
+                    </span>
+                    <span>
+                        
+                        <input type="text" id="jmpPg" value="" style="width: 34px" onkeydown="JumpToTrigger(event,'BP');" />
+                    </span>
+                    <span>
+                        <button type="button" id="btnJumpToBkPg" onclick="JumpToBookPage('1790020','2')" class="t-button docButton">Go</button>
+                    </span>
+                </div>
+                <!-- Document # Navigation -->
+                <div>
+                   <div class="detailLabel">
+                        Auditor File Number:
+                    </div>
+                    <span>
+                        <button data-bind="disable: negativeInstrumentNumber('2628164')" type="button" class="t-button docNavButtons" value="" onclick="LoadInternalContent('1790020', 'PrevInstrumentDoc/1790020')">
+                        <img src="/Content/Images/navLeft16.png" /></button>
+                    </span>
+                    <span>
+                        <button data-bind="disable: negativeInstrumentNumber('2628164')" type="button" class="t-button docNavButtons" value="" onclick="LoadInternalContent('1790020', 'NextInstrumentDoc/1790020')">
+                        <img src="/Content/Images/navRight16.png" /></button>
+                    </span>
+                    <span>
+                        <input data-bind="disable: negativeInstrumentNumber('2628164'), value: displayInstrumentNumber('2628164')" type="text" id="jmpInstrumentNumber" name="jmpInstrumentNumber"
+                            style="width: 81px" onkeydown="JumpToTrigger(event,'IN');" />
+                    </span>
+                    <span>
+                        <button data-bind="disable: negativeInstrumentNumber('2628164')" type="button" id="btnJumpToInst" 
+                        onclick="JumpToInstrumentNumber('1790020','2');"
+                           class="t-button docButton">Go</button>
+                    </span>                
+                </div>
+                <hr style="color: #444; background-color: #444; height: 2px; clear: both;" />                
+                <div style="width: 100%; text-align: center">
+                    <button type="button" id="PrevButton" class="t-button docNavButtons" title="Previous" onclick="GetPrevTranItemId('1790020', '-1')">
+                    <img src="/Content/Images/navLeft16.png" /></button>
+                    <span style="font-weight: bold"> Search Results </span>
+                    <button type="button" id="NextButton" class="t-button docNavButtons"title="Next" onclick="GetNextTranItemId('1790020', '-1')">
+                    <img src="/Content/Images/navRight16.png" /></button>
+                    <script type="text/javascript">
+                      var DisablePrevButton = false;
+                         var DisableNextButton = false;
+                        var currentTab = getActiveTab();
+                       if (DisablePrevButton) {
+                         $(currentTab).find("#PrevButton").prop("disabled",true);
+                           $(currentTab).find("#PrevButton").css("opacity",0.2);
+                         $(currentTab).find("#PrevButton").prop("title", "Button is disabled, because this is first record in the search results grid");
+                      } else {
+                           $(currentTab).find("#PrevButton").prop("disabled",false);
+                            $(currentTab).find("#PrevButton").css("opacity",1);
+                           $(currentTab).find("#PrevButton").prop("title", "Previous");
+                       }
+                      if (DisableNextButton) {
+                          $(currentTab).find("#NextButton").prop("disabled",true);
+                            $(currentTab).find("#NextButton").css("opacity",0.2);
+                          $(currentTab).find("#NextButton").prop("title","Button is disabled, because this is last record in the search results grid");
+                      }
+                        else {
+                           $(currentTab).find("#NextButton").prop("disabled",false);
+                           $(currentTab).find("#NextButton").css("opacity",1);
+                           $(currentTab).find("#NextButton").prop("title", "Next");
+                       }
+
+                    </script>
+                </div>
+
+            </div>
+        </div>
+            <div class="detailsTop2">
+                <hr style="color: #444; background-color: #444; height: 2px; clear: both;" />
+                <div class="error">
+                    
+                    <input type="hidden" id="exceptionMsg" value="" />
+                </div>
+                <br />
+                <div class="docDetailRow">
+                    <div class="detailLabel">
+                    Record Date:
+                    
+                    </div>
+                    <div class="formInput">
+                        10/13/2026
+
+                    </div>
+                    <hr style="border: none; clear: both;" />
+                </div>
+                <div class="docDetailRow">
+                    <div class="detailLabel">
+                        Book Type:
+                    </div>
+                    <div class="formInput">
+                        GR
+                        -
+                        General Recording
+                    </div>
+                    <hr style="border: none; clear: both;" />
+                </div>
+                <div data-bind="visible: NullOrZeroBookPage('', '') == false" class="docDetailRow">
+                    <div class="detailLabel">
+                        Book / Page:&nbsp;&nbsp;
+                    </div>
+                    <div class="formInput">
+                        /
+                    </div>
+                    <hr style="border: none; clear: both;" />
+                </div>
+                <div data-bind="visible: negativeInstrumentNumber('2628164') == false" class="docDetailRow">
+                    <div class="detailLabel">
+                        AFN:&nbsp;&nbsp;
+                        
+                    </div>
+                    <div class="formInput">
+                        2628164
+                    </div>
+                    <hr style="border: none; clear: both;" />
+                </div>
+                
+                <div data-bind="visible: NullOrZeroSecSeqNumber('') == false" class="docDetailRow">
+                    <div class="detailLabel">
+                        Secondary #:&nbsp;&nbsp;
+                        
+                    </div>
+                    <div class="formInput">
+                        
+                    </div>
+                    <hr style="border: none; clear: both;" />
+                </div>
+
+                <hr style="color: #444; background-color: #444; height: 2px; clear: both;" />
+            </div>
+            <div class="docBlock">
+                
+                <div class="docDetailRow">
+                    <div class="detailLabel">
+                        Number of Pages:
+                    </div>
+                    <div class="listDocDetails" style="width: 100px;">
+                       2
+                       <div class="expandDown" style="display:none;"><img src="/Content/Images/moveDown.png" /></div>
+                    </div>
+                    <hr style="border: none; clear: both;" />
+                </div>
+                
+                <div class="docDetailRow">
+                    <div class="detailLabel">
+                        Doc Type:
+                    </div>
+                    <div class="listDocDetails" style="width: 100px;">
+                       NOD - NOTICE OF DISCONTINUANCE
+                       <div class="expandDown" style="display:none;"><img src="/Content/Images/moveDown.png" /></div>
+                    </div>
+                    <hr style="border: none; clear: both;" />
+                </div>
+                
+                <div class="docDetailRow">
+                    <div class="detailLabel">
+                        DocLegal:
+                    </div>
+                    <div class="listDocDetails" style="width: 100px;">
+                       <span class="" >APN 271831520405</span><br /><span class="" >CHIWAWA RIVER PINES 6 LOT 81</span><br />
+                       <div class="expandDown" style="display:none;"><img src="/Content/Images/moveDown.png" /></div>
+                    </div>
+                    <hr style="border: none; clear: both;" />
+                </div>
+                
+                <div class="docDetailRow">
+                    <div class="detailLabel">
+                        Trustee:
+                    </div>
+                    <div class="listDocDetails" style="width: 100px;">
+                       <span class="" >LAND AMERICA TRANSNATION</span><br />
+                       <div class="expandDown" style="display:none;"><img src="/Content/Images/moveDown.png" /></div>
+                    </div>
+                    <hr style="border: none; clear: both;" />
+                </div>
+                
+                <div class="docDetailRow">
+                    <div class="detailLabel">
+                        Borrower:
+                    </div>
+                    <div class="listDocDetails" style="width: 100px;"> DOE JANE </div>
+                    </div>
+                    <hr style="border: none; clear: both;" />
+                </div>
+                
+                <div class="docDetailRow">
+                    <div class="detailLabel">
+                        Related Number:
+                    </div>
+                    <div class="listDocDetails" style="width: 100px;">
+                       <a onclick="JumpToTransactionItemId('616487')">2248127</a><br /><a onclick="JumpToTransactionItemId('1775273')">2625826 [NTS]</a><br />
+                       <div class="expandDown" style="display:none;"><img src="/Content/Images/moveDown.png" /></div>
+                    </div>
+                    <hr style="border: none; clear: both;" />
+                </div>
+                
+               <div class="expand" style="display:none;"><img src="/Content/Images/moveRight.png" /></div>
+            </div> 
+            
+            <hr style="color: #444; background-color: #444; height: 2px; clear: both;" />
+        </div>
+        <div class="detailsBottom">
+            <div class="ExceptionMessageStyle ImageExceptionStyle">
+                
+            </div>
+        </div>
+        <script type="text/javascript">
+            (function () {
+                function DocDetailsViewModel() {
+                    var self = this;
+
+                    self.numericInstrumentNumber = function (value) {
+                        try {
+                            return parseFloat(value);
+                        }
+                        catch (err) {
+                            return 0;
+                        }
+                    };
+
+                    self.negativeInstrumentNumber = function (value) {
+                        try {
+                            if (isNaN(self.numericInstrumentNumber(value)) == false) {
+                                if (self.numericInstrumentNumber(value) <= 0) return true;
+                            }
+                            return false;
+                        }
+                        catch (err) {
+                            return false;
+                        }
+                    };
+                    self.NullOrZeroBookPage = function (bk, pg) {
+                        try {
+                            if (bk === '0' && pg ==='0') {
+                                return true;
+                            }
+                            return false;
+                        }
+                        catch (err) {
+                            return false;
+                        }
+                    }
+
+                    self.NullOrZeroSecSeqNumber = function (secSeqNum) {
+                        try {
+                            if (secSeqNum=== null || secSeqNum ==='0') {
+                                return true;
+                            }
+                            return false;
+                        }
+                        catch (err) {
+                            return false;
+                        }
+                    }
+                    self.displayInstrumentNumber = function (value) {
+                        if (self.negativeInstrumentNumber(value)) return "";
+                        return value.toString();
+                    };
+                }
+
+                ko.applyBindings(new DocDetailsViewModel());
+            })();
+        </script>
+</body>
+</html>

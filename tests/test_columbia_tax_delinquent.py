@@ -1,4 +1,4 @@
-"""Columbia tax_delinquent and its connector migration (158), on the real test database.
+"""Columbia tax_delinquent and its connector migration (160), on the real test database.
 
 The reader is Asotin's (pacs_tax_status cache) with Columbia's county and source. New
 rule for both: a situs without a house number is not a property address. Live
@@ -99,13 +99,13 @@ def test_columbia_is_crawled_scoped_and_trusted():
     assert ColumbiaWATaxDelinquentScraper.SOURCE in _TRUSTED_TAX_SOURCES
 
 
-# ─── Migration 158 ──────────────────────────────────────────────────────────
-_MIG = Path(__file__).resolve().parents[1] / "alembic" / "versions" / "158_columbia_seven_types.py"
+# ─── Migration 160 ──────────────────────────────────────────────────────────
+_MIG = Path(__file__).resolve().parents[1] / "alembic" / "versions" / "160_columbia_seven_types.py"
 _DECOY_ID = "57cd7eed-0000-4000-8000-000000000158"  # same county + URL, not the recorder
 
 
 def _load():
-    spec = importlib.util.spec_from_file_location("_mig158", _MIG)
+    spec = importlib.util.spec_from_file_location("_mig160", _MIG)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
@@ -133,7 +133,7 @@ def test_migration_seed_points_at_an_allowlisted_columbia_reader():
     from src.scrapers.registry import _ALLOWED_SCRAPER_MODULES
 
     mig = _load()
-    assert (mig.revision, mig.down_revision) == ("158", "157")
+    assert (mig.revision, mig.down_revision) == ("160", "159")
     module_path, name = mig._TAX_CLASS.rsplit(".", 1)
     assert module_path in _ALLOWED_SCRAPER_MODULES
     assert getattr(importlib.import_module(module_path), name).COUNTY == "columbia"

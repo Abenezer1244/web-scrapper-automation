@@ -20,6 +20,7 @@ from src.scrapers.trustee_sale import (
     KingWATrusteeSaleScraper,
     PierceWATrusteeSaleScraper,
     SnohomishWATrusteeSaleScraper,
+    _named_leads,
     _record_from_notice,
     _TrusteeSaleScraper,
 )
@@ -147,3 +148,13 @@ class TestRecordMapping:
     def test_null_principal_owing_is_none(self):
         rec = _record_from_notice(_notice(principal_owing=None))
         assert rec.enrichment_data["nts_source"]["default_amount"] is None
+
+
+def test_a_notice_with_no_owner_name_is_held_not_delivered():
+    """Benton 2026-020482: the grantor went unread, and the lead went out with no name."""
+    named = _record_from_notice(_notice())
+    nameless = _record_from_notice(_notice(id="notice-no-name", ts_number="WA-24-000", grantor=None,
+                                           parcel="107981080000037"))
+    blank = _record_from_notice(_notice(id="notice-blank", ts_number="WA-24-001", grantor="   "))
+    assert nameless.party_name in (None, "") and blank.party_name in (None, "")
+    assert _named_leads([named, nameless, blank], "benton") == [named]

@@ -70,9 +70,9 @@ public index. Our death_certificate = the publicly RECORDED certificate in the A
   Original Phase 2 scope: (`pacs_parcel.py` site + detail `year`, `pacs.py` detail URL year,
   `county_gis.py` mailing county list, tests): connector `assessor_url`.
 - [x] **Phase 3 — tax_delinquent** (9f0dc9b0 + final-review fixes): Asotin's reader made county-generic,
-  Columbia subclass; house-number rule for situs; crawler + trusted source + registry; migration 158
+  Columbia subclass; house-number rule for situs; crawler + trusted source + registry; migration 160 (was 158)
   (recorder offers death_certificate; tax connector INACTIVE, fixed id). Codex r1 NO-GO -> r2 GO.
-- [x] **Phase 4 folded into migration 158**, minus `assessor_url` (owner decision: no name lookup).
+- [x] **Phase 4 folded into migration 160**, minus `assessor_url` (owner decision: no name lookup).
 - [x] iDocMarket searches paced 20 s (4640df3f); live re-proof 3 searches, no block.
 - [x] Trustee_sale / divorce / code_violation: documented blocked (paid access / no public case data).
 - [x] Codex per phase (all GO); final adversarial r1-r3 NO-GO, all fixed; r4 GO. Full suite 8,391 passed.
@@ -81,7 +81,7 @@ public index. Our death_certificate = the publicly RECORDED certificate in the A
 ## Review (2026-11-14)
 
 **Shipped on the branch (not pushed):** 1ab28c52 recorder repair + death_certificate; f0b6141f PACS
-current-roll year; 4640df3f search pacing; 9f0dc9b0 tax_delinquent + migration 158; final-review fixes
+current-roll year; 4640df3f search pacing; 9f0dc9b0 tax_delinquent + migration 160 (renumbered after main took 158-159); final-review fixes
 (tax table without statements = unparsed; inventory raw count vs layer count, blank/duplicate ids
 explicit, >1% blank fails; stale page date is not an answer; 6 h silence alert; reader requires an
 inventory refreshed within 14 days; no assessor_url on Columbia rows).
@@ -98,7 +98,7 @@ inventory refreshed within 14 days; no assessor_url on Columbia rows).
 | divorce | Superior Court Odyssey (paid) / Digital Archives | Blocked by source access | GR 31; owner reviewing pricing |
 | code_violation | county / Dayton / Starbuck | Blocked by source access | no public case log |
 
-**Before activation:** deploy (migration 158 runs on API boot; renumber if another county lands first);
+**Before activation:** deploy (migration 160 runs on API boot; renumber again if another county lands first);
 recorder: read iDocMarket Site Terms, keep searches paced (403 seen after ~12/hour); tax: wait for
 >=95% fresh coverage, run paid/owing/held canaries, then set the tax connector active; do not add the
 county to public coverage until the owner approves.

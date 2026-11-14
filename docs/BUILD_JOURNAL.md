@@ -30,7 +30,7 @@ promoted grantee). `f0b6141f` Columbia PACS: `pacs.ownership_year()` reads the n
 county's own form offers and both requests of both lookup paths name it (Property.aspx answers 500
 without `&year=`); only `_YEAR_HOSTS` get a year. `4640df3f` 20 s between iDocMarket searches.
 `9f0dc9b0` Columbia tax_delinquent: Asotin's PACS tax reader made county-generic, Columbia subclass,
-crawler + trusted source + registry, migration 158 (recorder offers death_certificate; tax connector
+crawler + trusted source + registry, migration 160, numbered 158 until main took 158-159 (recorder offers death_certificate; tax connector
 seeded INACTIVE with a fixed id). Final-review fixes `1173939e`: see Caught & fixed. Full CI-equivalent suite after them: 8,391 passed, 0 failed. Plan, matrix, evidence:
 `tasks/columbia-wa-seven.md`.
 
@@ -63,7 +63,7 @@ read shifted lines): never edit files during a full run.
 **Pending / Handoff:** Owner: push/PR/deploy; read iDocMarket Site Terms; pricing for trustee_sale /
 divorce. After deploy: verify Columbia rows' assessor_url stay NULL, wait for >= 95% tax coverage
 (~5,280 keyed parcels), run owing/paid/held/privacy canaries, then activate the tax connector. Next
-PR: legal-description -> parcel matcher. Migration 158 may need renumbering if Adams/Clark land first.
+PR: legal-description -> parcel matcher. Renumbered to 160 when merging main (158-159 taken); renumber again if another county lands first.
 
 **Facts learned:** Columbia PACS (Harris 9.0.50): Geo IDs 13 digits = statewide ORIG_PARCEL_ID;
 newest roll "2026 - 2027" is the current-ownership roll; detail pages need `&year=`. Statewide layer
@@ -71,6 +71,148 @@ FIPS 013: 5,477 features, 7 without id, 190 duplicate features (multi-part) = 5,
 iDocMarket COLWA1: one results page per search, "Showing N of N", ~858 documents Jan-Nov 2026; it
 blocks bursts. The recorded legal ("SYNDICATE 9 5", "T09N R40E 23 LOT 3") matched the right PACS
 parcel where names failed.
+
+## 2026-11-13/14 — Chelan: trustee sales from scanned recordings, with an operator in the loop (#625, #632)
+
+**Built / Shipped:**
+- **#625** merged 2026-11-13 (`d7188fe2`, deployed with Asotin/Clallam/Benton; production 139 -> 157). Chelan reads every recorded document through `POST /Search/GridResults`, links leads to the recording's own parcel, and offers `death_certificate` (migration 157). Production check: Chelan connector = probate, pre_foreclosure, death_certificate, active.
+- **#632** merged 2026-11-14 21:55 UTC (`6e1270f0`), production 157 -> 159. Chelan's Notices of Trustee's Sale are scan-only PDFs, so:
+  - **Staging (migration 158).** A daily crawl (`crawl-nts-chelan-recorder`, 09:50 UTC) finds NTS/NTSCOM/NOD recordings and OCRs each NTS in an isolated child process into `nts_recorder_documents`. Tesseract runs under a strict PDF profile with byte, page and time caps.
+  - **Operator review.** `scripts/nts_review.py` (admin + MFA): `list`, `show`, `approve`, `reject`, `resolve-nod`. Approval writes `nts_notices` (source `chelan_recorder`, key `REC-<instrument>`). The parcel must be one of the recording's own APNs and an amount needs its basis. The reviewer supplies `--grantor`; that value is never written to staging JSON. The raw OCR text can contain the borrower's name: it is cleared on approval or rejection, or after 30 days unreviewed. Rejection takes fixed codes only.
+  - **Revisions.** A second notice on a shared deed of trust is refused until the reviewer says `--supersedes` (cancels the older notice and frees its leads) or `--independent`.
+  - **Discontinuances.** Read from the NOD detail page's structured "Related Number" links, with no OCR. A NOD cancels a notice by itself only when it names that notice's own recording number. A loan-only reference matching an approved notice, or a page that links nothing, waits for the operator, even when the same NOD also cancels another notice directly. Approval checks NODs recorded on or after the notice: a direct reference writes it cancelled; a loan-only one requires `--discontinued-by <instrument>` or `--not-discontinued`. Pending NODs are resolved with `resolve-nod --doc <id> --cancels <instrument>` (repeatable) or `--no-effect`. NODs never expire.
+  - **Delivery (migration 159).** `ChelanWATrusteeSaleScraper` and its connector, **inserted inactive**. Chelan joined `NTS_MATCH_COUNTIES`. A new `_TrusteeSaleScraper._source_gap` hook (no-op elsewhere) reports Chelan's cache short when a recording first seen more than 3 days ago is still `pending_review` or `failed` (expired rows included), inside or outside the discovery window.
+  - **Shared code.** Benton's cancellation block became `_cancel_notices` (same SQL, same lock order). The Dockerfile installs `tesseract-ocr`.
+  - **Production check (2026-11-14, read-only):** `alembic_version` = 159 and the Chelan trustee_sale connector present with `active = false` (SQL against production); api, worker and beat deployments SUCCESS from the merge (`railway deployment list`); `tesseract 5.5.0` with `eng` data (`railway ssh --service worker tesseract --version / --list-langs`).
+
+**Tried / Decided:**
+- **Review is mandatory.** The owner chose full build with operator review: every OCR'd notice is approved against its image before customers see it.
+- **Identity.** The recording, not the sale, is the identity (`REC-<instrument>`, Benton's rule).
+- **Revisions.** These are explicit, never inferred: one deed of trust can carry successive foreclosures (Codex).
+- **Review lag.** It is judged at delivery time, not by withholding the crawl heartbeat. A heartbeat written just before the deadline stays valid three more days (Codex).
+- **Migration 158** was amended in place for the `discontinuance` status, because it had never been pushed or deployed.
+- **Crawl reach.** A first run needs only the 30-day window: only notices inside it are staged, and their discontinuances follow them. After an outage the crawl reaches back to its last complete read, capped at 60 days, because discovery reads the portal one day at a time.
+
+**Failed / Blocked:**
+- **Can't merge myself.** My `gh pr merge` was denied by the permission classifier as a production merge, so the owner ran the merge for both PRs. #632 waited for main twice (#629, #631) and needed main merged in each time.
+- **Local test gaps.** The Redis-dependent tests can't run locally: the Chelan crawl lock test, and `test_job_degradations_wiring.py`, which fails 23/25 identically on the merged #625 branch without this code. CI ran them green.
+- **Still blocked:**
+  - tax_delinquent: legal review of the county's terms of use (owner).
+  - code_violation: no public case data, county or its 5 cities.
+  - divorce: paid OnBase.
+  - probate/pre_foreclosure: the current owner can't be verified, because PACS owner names are never stored (licensing).
+
+**Caught & fixed (Codex, before shipping):**
+- **4a-3a**, NO-GO then GO:
+  - A recording citing several deeds of trust skipped the same-loan check.
+  - Free-text rejection reasons could keep a borrower's name.
+  - NaN, Infinity, overflow and sub-cent amounts were accepted.
+  - No privacy-rule or two-session tests.
+- **4a-3b**, NO-GO then GO:
+  - Adding Chelan to the matcher would have stamped approved sales onto delivered pre_foreclosure leads before discontinuances were handled. It was deferred to 4a-3c.
+  - The heartbeat could not enforce the review deadline and missed failed/expired rows outside the window.
+- **4a-3c**, NO-GO twice then GO:
+  - The 30-day purge would have expired pending discontinuances and dropped their references.
+  - A NOD naming one notice directly and citing another's loan settled without the operator.
+  - Persistent failures, including ones rediscovered in the window, could take the whole 20-per-run allowance. Now each run combines fresh recordings with at most 5 rotating retries (longest-waiting first, rediscovered failures included), puts NODs first across that queue, and reads at most 20.
+- **Tests I fixed myself:** a test ran a raw `UPDATE` and then `expire_all()` without flushing first, so the expiry discarded the unflushed approval; it now flushes first. A users insert needed `email_hmac`.
+
+**Pending / Handoff:**
+- **First crawl.** Next scheduled: 2026-11-15 09:50 UTC. Verify it ran, how many notices it staged, and any unreadable.
+- **Review the queue (owner):** `railway run --service worker python scripts/nts_review.py --operator-email <admin> list`.
+- **Before switching the connector on:** one approved real recording checked through both pre_foreclosure and trustee_sale (dedup hash, matcher attachment). Then the owner activates it.
+
+**Facts learned:**
+- **NOD detail pages.** Chelan NOD detail pages link what they end as `<a onclick="JumpToTransactionItemId('id')">NNN [CODE]</a>`, tag optional. In 4 NODs from Aug to Nov 2026: `[NTS]`, `[DT]`, untagged, and two links on one page.
+- **Codes.** Chelan `NOD` = Notice of Discontinuance (not Notice of Default).
+- **NTS PDFs.** One 1-bit image per page with a white-first palette, which must be inverted before OCR.
+- **Merge timing.** `gh pr merge --auto --match-head-commit` merges once the repository's requirements pass. For #632, Railway started building api, worker and beat within a minute of the merge; check that the deploys succeed each time.
+
+## 2026-11-13/14 — Clallam goes live; one tax canary failure; retry fix (#630)
+
+**Built / Shipped:** The owner restored the Railway plan. The 2026-11-13 deploy took production from
+alembic 139 to 157 (Asotin, Clallam, Benton, Chelan). Clallam rows checked: recorder `3c1dc2fe`
+now probate + pre_foreclosure + death_certificate, and the tax connector `7c1a1a2e…0140` was created.
+With owner approval, ran one canary for the tax connector (healthy, 8 records) and one manual
+pre_foreclosure run on the only Clallam customer config, through the same `enqueue_scrape_job`
+path as Run now (job `d34d83ad`, 08/15–11/13: 15 found, 13 new and billed, 0 degradations). All
+10 delivered trustee-sale notices were looked up again in the recorder: none discontinued, and a
+known-discontinued control (2026-1484470) was detected. PR #630 (`b5b025b0`): per-parcel PACS
+portal reads retry on transient failures only. Railway auto-deployed it; canary healthy after.
+
+**Failed / Blocked:** A rerun of the tax canary on 2026-11-14 (about 00:50 UTC) failed with
+`ValueError`. It marked the connector `down`, hid it from customers, and sent an ops alert. The
+next manual scrape and the next canary passed with 8 records. **Root cause not found.** The canary
+logs the exception class only (Codex P2: scraper messages can carry page content), and the
+container's file log was lost when the worker was redeployed. What I ruled out:
+- The as-of check: the portal's date is the Pacific calendar date, 0–1 days behind UTC, inside 0–3.
+- The landing page: its DocumentCenter links are unchanged since the 11-12 capture.
+- Network errors: they surface as `requests` classes, not `ValueError`.
+- A repeat: 12 rounds of every step from the production worker (landing, PDF, 8 portal pages,
+  record build; about 120 reads) produced 0 failures.
+
+What remains as candidates, all intermittent and all raising `ValueError`:
+- a portal page with no tax table (now retried by #630);
+- the certificate link returning non-PDF content, or a redirect that is refused (not retried);
+- a portal page variant that fails the owner or as-of check in `build_record` (not retried).
+
+**Tried / Decided:** Retry only what can be transient. An integrity failure (duplicate
+statement, unreadable amount) or an SSRF refusal must stay fatal, so that a later clean page
+cannot hide it (Codex Medium). Retry logs carry PID + class only; Codex rated logging `str(exc)`
+High because the parse errors embed table cells and headers.
+
+**Pending / Handoff:** Make the next failure diagnosable. Proposal: the canary also logs the raise
+site of the exception (file:line:function from the innermost traceback frame). That is safe for
+PII and pinpoints the cause for any scraper. Not built yet; needs owner approval. The canary samples
+5 of 59 (connector, type) pairs per hour, so a new connector can stay `unknown` for many hours.
+A `down` flip has no matching recovery alert.
+
+**Facts learned:** Railway auto-deploys api/worker/beat on a push to main. Production one-off
+scripts: `railway ssh --service worker -- sh -c "echo <b64> | base64 -d > /tmp/x.py &&
+PYTHONPATH=/app python /tmp/x.py"`. The worker's DB role is RLS-scoped (set
+`app.current_user_id`). The worker's R2 key cannot `GetObject`.
+
+---
+## 2026-11-14 — Clark: why Auction leads were always empty, and silent window loss in the recorder (branch `feat/clark-wa-seven-record-types`)
+
+**Built / Shipped (branch only, not pushed):** `5c84374b` the Clark LandmarkWeb scraper proves each
+window complete: the results header must echo the submitted doc types (as a set) and dates, the
+distinct document ids read across pages must equal the full count (Show Count, else a numeric
+"records of N", else retry), and zero needs the portal's own "No results." row. `7a60462d` Clark
+`trustee_sale` held via a new `SourceUnavailableError` (fixed customer text, permanent, unbilled;
+the worker shows that text). `87bfbe18` Clark `death_certificate` (code 62), connector unchanged.
+`c163c7bf` Celery time limits escape every Clark catch-all; non-numeric row ids fail. Plan, matrix,
+activation steps: `tasks/clark-wa-seven.md`.
+
+**Tried / Decided:** Auction leads root cause is the SOURCE, not code: The Columbian's legal-notice
+listing had 0 trustee sales of 21 ads (2 Clark notices ever), while the recorder records ~29 a month
+as free "Unofficial Copy" raster images. Owner chose hold now, OCR later on Chelan's review pipeline
+(not duplicated here: it owns migrations 158-159 and the staging table). death_certificate built
+dark. tax_delinquent (no county list), code_violation (county map layer metadata: "not subject to
+public disclosure", no dump) and divorce (AOC dissemination policy bars commercial solicitation) are
+documented as blocked; nothing built.
+
+**Failed / Blocked:** the worker-level hold test needs the real test DB, which is not available on
+this laptop (CI only). No Playwright UI QA: no frontend change, and it is only meaningful after a
+deploy.
+
+**Caught & fixed:** five ways a Clark run finished DONE with a window's leads silently missing (chunk
+`except: continue`, render timeout read as zero, pagination errors ending the read, wrapper table
+parsed, no total check). Codex gates: Phase 1 FAIL (header fallback could certify a 500-row first
+page; any empty cell accepted as zero), Phase 2 FAIL (hold text never reached users; fixture leaked
+rows), final NO-GO (cap, time limits, contract tests, rollout). All fixed or refuted by
+measurement, final GO.
+
+**Pending / Handoff:** owner: PR, deploy (api, worker, beat; no migration), then optionally add
+`death_certificate` to connector `70bb5315`. Canary will mark Clark Auction leads `down` once (one ops
+alert) and hide it from the picker: expected. Clark OCR trustee_sale after `feat/chelan-nts-ocr`.
+
+**Facts learned:** Clark LandmarkWeb loads 500 rows per page and the header then reads "Returned 500
+records of" with a BLANK total; only "Show Count" gives it (3,885 read over 8 pages, no cap seen).
+Rows are `tr#doc_<documentId>_<row>`. Death certificates are indexed Decedent / "PUBLIC". Clark
+recorder PIDs come out 6-10 digits (9 = PAN); not normalized.
+
+---
 
 ## 2026-11-12 — Chelan: why it never delivered a lead, and the seven-type audit (branch `feat/chelan-seven-record-types`)
 

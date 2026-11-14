@@ -20,17 +20,17 @@ fresh database has none and the UPDATE is then a no-op. It is matched by that id
 its county, state and iDocMarket URL, never by URL alone. The tax row has a fixed id,
 so downgrade removes only the row this migration inserted.
 
-Idempotent. Numbered 158 on main@157; renumber if another county's migration merges first.
+Idempotent. Numbered 160 on main@159 (it was 158 on the branch; 158-159 merged first).
 
-Revision ID: 158
-Revises: 157
+Revision ID: 160
+Revises: 159
 Create Date: 2026-11-14
 """
 
 from alembic import op
 
-revision = "158"
-down_revision = "157"
+revision = "160"
+down_revision = "159"
 branch_labels = None
 depends_on = None
 

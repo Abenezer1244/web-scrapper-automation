@@ -356,3 +356,78 @@ def test_no_pair_is_probed_twice_in_a_tick():
     rows = [_row(i, ("probate", "divorce"), status="unknown", checked=False) for i in range(2)]
     units = health._canary_units(rows, k=100)
     assert len(units) == len({(c.id, rt) for c, rt in units}) == 4
+
+
+# --- raise site: where a canary failure started, without its (PII-bearing) text ---
+
+def _caught(fn):
+    try:
+        fn()
+    except Exception as exc:  # noqa: BLE001
+        return exc
+    raise AssertionError("expected a raise")
+
+
+def test_the_raise_site_names_our_file_line_and_function_not_the_page():
+    from bs4 import BeautifulSoup
+
+    from src.scrapers.clallam_wa_tax_delinquent import _parse_tax_due
+
+    exc = _caught(lambda: _parse_tax_due(BeautifulSoup("<p>Jane Q Doe, 12 Elm St</p>", "html.parser")))
+    site = health._raise_site(exc)
+    assert site.startswith("src/scrapers/clallam_wa_tax_delinquent.py:"), site
+    assert site.endswith(" in _parse_tax_due"), site
+    assert "jane" not in site.lower() and "elm" not in site.lower()
+
+
+def test_a_library_frame_shows_only_its_file_name():
+    import json
+
+    site = health._raise_site(_caught(lambda: json.loads("{")))
+    assert "/" not in site.split(":")[0] and "\\" not in site, site  # no directory, no user name
+    assert " in " in site
+
+
+def test_a_library_raise_under_our_code_shows_both_sites():
+    from src.scrapers.clallam_wa_tax_delinquent import parse_portal_status
+
+    site = health._raise_site(_caught(lambda: parse_portal_status(123)))  # bs4 rejects it
+    ours, lib = site.split(" -> ")
+    assert ours.startswith("src/scrapers/clallam_wa_tax_delinquent.py:"), site
+    assert ours.endswith(" in parse_portal_status"), site
+    assert not lib.startswith("src/") and "/" not in lib.split(":")[0], site
+
+
+def test_an_explicit_cause_is_followed():
+    def inner():
+        raise KeyError("Jane Q Doe")
+
+    def outer():
+        try:
+            inner()
+        except KeyError as e:
+            raise ValueError("wrapped Jane Q Doe") from e
+
+    site = health._raise_site(_caught(outer))
+    assert " in outer; cause KeyError at " in site and site.endswith(" in inner"), site
+    assert "jane" not in site.lower()
+
+
+def test_an_exception_never_raised_has_no_site():
+    assert health._raise_site(ValueError("x")) == "unknown"
+
+
+def test_the_page_and_the_log_carry_the_raise_site_but_not_the_text(connector, monkeypatch, caplog):
+    import logging
+
+    _portal(monkeypatch, now=RuntimeError("Jane Q Canary, 12 Elm St"), history=[])
+    alerts: list = []
+    with caplog.at_level(logging.ERROR, logger="worker.scheduler"):
+        health._probe_unit(connector(), "probate", alerts)
+    body = alerts[0][3]
+    assert "error_class=RuntimeError\nraise_site=" in body
+    assert body.rstrip().endswith(" in fetch"), body  # the scraper call that raised
+    logged = " ".join(r.getMessage() for r in caplog.records)
+    assert "RuntimeError at " in logged and logged.rstrip().endswith(" in fetch"), logged
+    for out in (body, logged):
+        assert "jane" not in out.lower() and "elm st" not in out.lower()

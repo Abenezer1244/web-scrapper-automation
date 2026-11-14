@@ -25,13 +25,21 @@ CAMPBELL -> none (held). Estate owners also appear as "NAME (ESTATE)", "NAME EST
 
 ## Plan
 Phase 1 (pure, no DB) — parser + matcher
-- [ ] `src/scrapers/sources/probate_nwmarket.py`: `parse_probate_notice(text)` -> decedent,
+- [x] `src/scrapers/sources/probate_nwmarket.py`: `parse_probate_notice(text)` -> decedent,
       cause_no, first_published, personal_reps, claims_address; `is_asotin_probate` (cause
       suffix -02 AND Asotin court phrase)
-- [ ] `src/scrapers/enrichment/asotin_parcels.py`: owner-name -> parcels from the county
+- [x] `src/scrapers/enrichment/asotin_parcels.py`: owner-name -> parcels from the county
       layer; exact LAST, FIRST [MIDDLE-INITIAL] match (+ "(ESTATE)"/"ESTATE" and "& co-owner"
       forms); all parcels of that exact owner, never fuzzy; SSRF-validated host-pinned GET
-- [ ] tests + fixtures (real notice text/PDF + real layer JSON, names redacted)
+- [x] tests + fixtures (real notice text + real layer JSON, names redacted) — 41 pass, ruff clean
+Owner decision 2026-11-14: "Name + family tie" (over Codex's stricter rule): exact name AND one tie
+(owner segment estate-marked / rep named on parcel / rep shares decedent's whole surname / billing = claims
+address in full). Codex consult: never set parcel from name alone; hold everything else.
+Phase 1 Codex review: 4 High + 4 Medium, then 2 High + 1 Medium, then 3 partial -> all fixed, final GO (3b992f0e).
+Live: 26-4-00122-02 -> 1 lead (rep_shares_surname); 26-4-00117-02 -> exact match, held no_family_tie.
+Phase 2 must also (Codex consult): parse probate on whole advert text BEFORE the NTS county filter; version
+the Redis seen-key so already-seen adverts are replayed once; mark seen only after both pipelines commit.
+
 Phase 2 — storage + crawl
 - [ ] migration 158 `probate_notices` (+RLS system-only, privacy erase coverage), model
 - [ ] crawl hook: in the existing nwmarket advert loop, Asotin probate blocks -> upsert by

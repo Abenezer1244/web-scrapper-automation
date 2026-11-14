@@ -141,6 +141,9 @@ async def test_a_window_older_than_retention_fails(db):
     mdy = lambda d: f"{d.month:02d}/{d.day:02d}/{d.year}"  # noqa: E731
     with pytest.raises(ScraperExecutionError, match="before the oldest notice kept"):
         await _scrape(mdy(old - timedelta(days=10)), mdy(old))
+    # Reaching past retention at all is refused too (it could only be partial).
+    with pytest.raises(ScraperExecutionError, match="before the oldest notice kept"):
+        await _scrape(mdy(old), mdy(date.today()))
 
 
 async def test_the_owner_of_record_with_a_representative_is_not_copied(db):

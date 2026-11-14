@@ -106,15 +106,13 @@ class AsotinWAProbateScraper(BridgeScraper):
                 _COUNTY, "probate_notices",
                 f"unusable date window {date_from!r}..{date_to!r}", record_type=RECORD_TYPE)
         kept_from = auction_reference_date() - timedelta(days=RETENTION_DAYS)
-        if end < kept_from:
+        if start < kept_from:
+            # Notices older than retention are deleted: a search reaching past them
+            # could only be partial, so it is refused rather than reported complete.
             raise ScraperExecutionError(
                 _COUNTY, "probate_notices",
-                f"the window ends {end}, before the oldest notice kept ({kept_from}); "
+                f"the window starts {start}, before the oldest notice kept ({kept_from}); "
                 "older notices are deleted after retention", record_type=RECORD_TYPE)
-        if start < kept_from:
-            _logger.warning("asotin probate: window starts %s, before the oldest notice "
-                            "kept (%s); only %s..%s is covered", start, kept_from,
-                            kept_from, end)
         records = self._read(start, end)
         if self.on_progress:
             self.on_progress(0, 0, len(records))

@@ -9,16 +9,18 @@ module reads.
 THE MATCH RULE (owner decision 2026-11-14, "name + family tie"). A notice names a person,
 never a property, and a name alone could be a living namesake (Codex). A parcel is tied to
 the estate only when BOTH hold:
-  1. EXACT NAME: the parcel's owner (any co-owner) has the decedent's last name, first name
-     and suffix, and, when the notice gives a middle name or initial, a compatible middle.
-     Never fuzzy, never a prefix.
-  2. A FAMILY TIE, any of: the owner record is marked as an estate; a personal
-     representative is named on the parcel (owner or billing lines); a personal
-     representative shares the decedent's surname; the billing address is the notice's
-     address for claims.
+  1. EXACT NAME: one owner named on the parcel has the decedent's surname, first name and
+     suffix, and every middle name or initial the notice gives (an initial agrees with a
+     full name). Never fuzzy, never a prefix.
+  2. A FAMILY TIE, any of: THAT owner's part of the record is marked as an estate; a
+     personal representative is a person named on the parcel (an owner or a C/O or
+     billing addressee, compared as a whole name); a representative shares the
+     decedent's surname; the billing address is the notice's address for claims (same
+     street line and ZIP, compared in full).
 If the decedent's exactly-matched parcels are billed to different mailing addresses, they
 may be two people, so the notice is held. A tied parcel without a usable property or
-mailing address is held too. Everything held is reported with its reason, never delivered.
+mailing address is held too. An owner record whose layout is ambiguous names nobody.
+Everything held is reported with its reason, never delivered.
 """
 from __future__ import annotations
 
@@ -39,20 +41,28 @@ _PAGE = 1000  # the layer's maxRecordCount is 2000; a surname never comes close
 _SUFFIXES = frozenset({"JR", "SR", "II", "III", "IV"})
 # Words that end the person part of an owner segment ("SMITH, JOHN A ESTATE C/O ...").
 _NOISE = frozenset({"ESTATE", "EST", "TRST", "TRUST", "TRUSTEE", "TRUSTEES", "TR", "ETAL",
-                    "ET", "AL", "C/O", "PR", "LIVING", "FAMILY", "REVOCABLE", "DECEASED",
-                    "DECD", "DEC'D", "HEIRS", "OF"})
-_CORPORATE = re.compile(r"\b(?:LLC|INC|CORP|COMPANY|CO|LLP|LP|BANK|CHURCH|CITY|COUNTY|STATE"
-                        r"|DISTRICT|ASSOCIATION|ASSN|PROPERTIES|INVESTMENTS?)\b")
-# A decedent's estate, not a life estate, real estate or a subdivision ("ESTATES").
-_ESTATE_MARK = re.compile(
-    r"(?<!LIFE )(?<!REAL )\bESTATE\b(?!S)|\(EST\)|\bEST OF\b|\bDECEASED\b|\bDEC'?D\b")
-_STREET_LINE = re.compile(r"^(?:\d|P\.?\s*O\.?\s*BOX\b|POST OFFICE BOX\b|BOX\b|PMB\b|RR\b|HC\b)")
+                    "ET", "AL", "PR", "LIVING", "FAMILY", "REVOCABLE",
+                    "DECEASED", "DECD", "DEC'D", "HEIRS", "OF", "LIFE"})
+_CORPORATE = re.compile(r"\b(?:LLC|INC|CORP|COMPANY|LLP|LP|BANK|CHURCH|CITY|COUNTY|STATE"
+                        r"|DISTRICT|ASSOCIATION|ASSN|PROPERTIES|INVESTMENTS?|BUSINESS)\b")
+# A decedent's estate; never a life estate, real estate or a subdivision ("ESTATES").
+# Read on whitespace/punctuation-normalized text, so "LIFE-ESTATE" is "LIFE ESTATE".
+_ESTATE_MARK = re.compile(r"\bESTATE\b|\bEST\b(?= OF\b|$)|\bDECEASED\b|\bDEC'?D\b")
+_NOT_DECEDENT_ESTATE = re.compile(r"\b(?:LIFE|REAL)\s+ESTATE\b|\bESTATES\b")
+_STREET_LINE = re.compile(r"^(?:\d|P\.?\s*O\.?\s*(?:BOX|DRAWER)\b|POST OFFICE BOX\b|BOX\b"
+                          r"|PMB\b|RR\b|HC\b)")
 _SAFE_SURNAME = re.compile(r"^[A-Z][A-Z'\-]{1,40}$")
+_ADDR_WORDS = {
+    "STREET": "ST", "AVENUE": "AVE", "AV": "AVE", "DRIVE": "DR", "ROAD": "RD",
+    "BOULEVARD": "BLVD", "COURT": "CT", "LANE": "LN", "PLACE": "PL", "CIRCLE": "CIR",
+    "HIGHWAY": "HWY", "PARKWAY": "PKWY", "TERRACE": "TER", "NORTH": "N", "SOUTH": "S",
+    "EAST": "E", "WEST": "W", "APARTMENT": "APT", "SUITE": "STE", "UNIT": "UNIT",
+}
 
 
 class LayerError(RuntimeError):
-    """The layer did not answer (HTTP error, ArcGIS error body, truncated page). Never a
-    "no parcels" answer."""
+    """The layer did not answer (HTTP error, ArcGIS error body, truncated or malformed
+    page). Never a "no parcels" answer."""
 
 
 @dataclass(frozen=True)
@@ -83,112 +93,192 @@ class EstateMatch:
 
 
 def _tokens(text: str) -> list[str]:
-    return [t for t in re.sub(r"[^A-Z0-9'\- ]", " ", (text or "").upper()).split() if t]
+    return re.sub(r"[^A-Z0-9' ]", " ", (text or "").upper()).split()
 
 
-def notice_person(name: str) -> Person | None:
-    """'COLLEEN J. OZARD' / 'JOHN A. DOE, JR.' -> Person; None if it has no first + last."""
+def _norm(text: str) -> str:
+    return " ".join(re.sub(r"[^A-Z0-9']", " ", (text or "").upper()).split())
+
+
+@dataclass(frozen=True)
+class NoticeName:
+    """A name as a notice prints it ('COLLEEN J. OZARD'): natural order, surname last."""
+    tokens: tuple[str, ...]
+    suffix: str
+
+    @property
+    def last(self) -> str:
+        return self.tokens[-1]
+
+
+def notice_name(name: str) -> NoticeName | None:
+    """'COLLEEN J. OZARD' / 'JOHN A. DOE, JR.'; None without a first name and a surname."""
     toks = _tokens(name)
     suffix = ""
     if toks and toks[-1] in _SUFFIXES:
         suffix = toks.pop()
-    if len(toks) < 2:
-        return None
-    return Person(toks[0], " ".join(toks[1:-1]), toks[-1], suffix)
+    return NoticeName(tuple(toks), suffix) if len(toks) >= 2 else None
+
+
+def notice_person(name: str) -> Person | None:
+    n = notice_name(name)
+    return None if n is None else Person(n.tokens[0], " ".join(n.tokens[1:-1]), n.last, n.suffix)
+
+
+def _given_names(src: str) -> tuple[list[str], str]:
+    """Given names before the first noise word, and a trailing suffix."""
+    given: list[str] = []
+    for tok in _tokens(src):
+        if tok in _NOISE or tok.startswith("("):
+            break
+        given.append(tok)
+    suffix = ""
+    if given and given[-1] in _SUFFIXES:
+        suffix = given.pop()
+    return given, suffix
+
+
+def owner_segments(owner_name: str) -> list[tuple[Person, str]]:
+    """Each person named in a layer NAME with the raw text of their own segment:
+    'LAST, FIRST M & FIRST2', 'LAST JR, FIRST', 'LAST, FIRST & LAST2, FIRST2',
+    'LAST, JR, FIRST'. A segment that is an organization, or whose layout is ambiguous
+    ('& JANE SMITH': a middle name or another surname?), names nobody."""
+    out: list[tuple[Person, str]] = []
+    last = ""
+    for seg in (owner_name or "").upper().split("&"):
+        seg = seg.split("C/O", 1)[0]          # an addressee, not an owner
+        if _CORPORATE.search(seg):
+            last = ""
+            continue
+        parts = [p.strip() for p in seg.split(",") if p.strip()]
+        if len(parts) >= 2:
+            lt = _tokens(parts[0])
+            suffix = ""
+            if lt and lt[-1] in _SUFFIXES:
+                suffix = lt.pop()
+            rest = parts[1:]
+            if rest and rest[0].strip(" .") in _SUFFIXES:     # 'HERNANDEZ, JR, NAT'
+                suffix, rest = rest[0].strip(" ."), rest[1:]
+            given, gsuffix = _given_names(" ".join(rest))
+            suffix = gsuffix or suffix
+            last = " ".join(lt)
+        elif last and parts:
+            given, suffix = _given_names(parts[0])
+            # Inherit the surname only for a bare given name and initials ('MYRANDA S').
+            if not given or any(len(t) > 1 for t in given[1:]):
+                continue
+        else:
+            continue
+        if last and given:
+            out.append((Person(given[0], " ".join(given[1:]), last, suffix), seg))
+    return out
 
 
 def owner_people(owner_name: str) -> list[Person]:
-    """The people named in a layer NAME ('LAST, FIRST M & FIRST2', 'LAST JR, FIRST',
-    'LAST, FIRST & LAST2, FIRST2', 'LAST, JR, FIRST'). Organizations yield nobody."""
-    upper = (owner_name or "").upper()
-    if _CORPORATE.search(upper):
-        return []
+    return [p for p, _ in owner_segments(owner_name)]
+
+
+def _middles_ok(notice_middles: list[str], owner_middles: list[str]) -> bool:
+    """Every middle the notice gives must agree, in order (an initial agrees with a name
+    starting with it). Extra owner middles are allowed."""
+    if len(owner_middles) < len(notice_middles):
+        return False
+    for a, b in zip(notice_middles, owner_middles, strict=False):
+        if len(a) == 1 or len(b) == 1:
+            if a[0] != b[0]:
+                return False
+        elif a != b:
+            return False
+    return True
+
+
+def name_matches(notice: NoticeName, owner: Person) -> bool:
+    """The notice's name is this owner's, exactly (multi-word surnames included)."""
+    last = owner.last.split()
+    k = len(last)
+    if len(notice.tokens) < k + 1 or list(notice.tokens[-k:]) != last:
+        return False
+    return (notice.tokens[0] == owner.first and notice.suffix == owner.suffix
+            and _middles_ok(list(notice.tokens[1:-k]), owner.middle.split()))
+
+
+def _addressee_people(attrs: dict) -> list[Person]:
+    """People named on the parcel besides the owners: 'C/O <name>' in the NAME or the
+    billing lines, and a billing line in 'LAST, FIRST' form. Street lines name nobody."""
     people: list[Person] = []
-    last = ""
-    for seg in upper.split("&"):
-        parts = [p.strip() for p in seg.split(",") if p.strip()]
-        suffix = ""
-        if len(parts) >= 2:
-            lt = _tokens(parts[0])
-            if lt and lt[-1] in _SUFFIXES:
-                suffix = lt.pop()
-            if parts[1].strip(" .") in _SUFFIXES:   # 'HERNANDEZ, JR, NAT'
-                suffix, parts = parts[1].strip(" ."), [parts[0]] + parts[2:]
-            last = " ".join(lt)
-            given_src = " ".join(parts[1:])
-        elif last:                                   # '& MYRANDA S' continues the surname
-            given_src = parts[0] if parts else ""
-        else:
+    name = _clean(attrs.get("NAME")).upper()
+    lines = [name.split("C/O", 1)[1]] if "C/O" in name else []
+    for key in ("BILLING1", "BILLING2"):
+        ln = _clean(attrs.get(key)).upper()
+        if not ln or _STREET_LINE.match(ln):
             continue
-        given: list[str] = []
-        for tok in _tokens(given_src):
-            if tok in _NOISE or tok.startswith("("):
-                break
-            given.append(tok)
-        if given and given[-1] in _SUFFIXES:
-            suffix = given.pop()
-        if last and given:
-            people.append(Person(given[0], " ".join(given[1:]), last, suffix))
+        lines.append(ln)
+    for ln in lines:
+        if ln.startswith("C/O"):
+            ln = ln[3:]
+        if "," in ln:
+            people += owner_people(ln)
+        else:
+            given, suffix = _given_names(ln)
+            if len(given) >= 2:
+                people.append(Person(given[0], " ".join(given[1:-1]), given[-1], suffix))
     return people
-
-
-def _middle_ok(notice_middle: str, owner_middle: str) -> bool:
-    if not notice_middle:
-        return True          # the notice gave no middle: any owner middle is the same name
-    if not owner_middle:
-        return False         # the notice gave one and the record has none: not exact
-    a, b = notice_middle.split()[0], owner_middle.split()[0]
-    if len(a) == 1 or len(b) == 1:
-        return a[0] == b[0]
-    return a == b
-
-
-def same_person(notice: Person, owner: Person) -> bool:
-    return (notice.last == owner.last and notice.first == owner.first
-            and notice.suffix == owner.suffix and _middle_ok(notice.middle, owner.middle))
-
-
-def _street_key(text: str | None) -> tuple[str, str] | None:
-    """(house/box number, zip) of an address, for comparing two of them."""
-    up = (text or "").upper()
-    num = re.search(r"\b(?:BOX|DRAWER)\s*(\d+)|^\s*(\d+)\b|\b(\d+)\s+[A-Z]", up)
-    zipc = re.search(r"\b(\d{5})(?:-\d{4})?\s*$", up)
-    if not (num and zipc):
-        return None
-    return (next(g for g in num.groups() if g), zipc.group(1))
 
 
 def _clean(value: object) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()
 
 
-def mailing_of(attrs: dict) -> str | None:
-    """'STREET, CITY, ST ZIP' from the billing lines: the first street/box line and what
-    follows it; lines before it are addressees (C/O, a co-owner) and are not an address."""
+def _norm_address(text: str) -> str:
+    up = _norm(text)
+    up = re.sub(r"\bP O\b|\bPOST OFFICE\b", "PO", up)
+    return " ".join(_ADDR_WORDS.get(t, t) for t in up.split())
+
+
+def mailing_parts(attrs: dict) -> tuple[str, str, str, str] | None:
+    """(street lines, city, state, zip) from the billing lines: the first street/box line
+    and what follows it; lines before it are addressees (C/O, a co-owner)."""
     lines = [_clean(attrs.get("BILLING1")), _clean(attrs.get("BILLING2"))]
     start = next((i for i, ln in enumerate(lines) if _STREET_LINE.match(ln.upper())), None)
-    city, st, zipc = _clean(attrs.get("CITY")), _clean(attrs.get("ST")), _clean(attrs.get("ZIP"))
-    if start is None or not (city and re.fullmatch(r"[A-Z]{2}", st.upper())
-                             and re.fullmatch(r"\d{5}", zipc)):
+    city, st, zipc = _clean(attrs.get("CITY")), _clean(attrs.get("ST")).upper(), _clean(attrs.get("ZIP"))
+    if start is None or not (city and re.fullmatch(r"[A-Z]{2}", st) and re.fullmatch(r"\d{5}", zipc)):
         return None
-    street = " ".join(ln for ln in lines[start:] if ln)
-    return f"{street}, {city}, {st.upper()} {zipc}"
+    return " ".join(ln for ln in lines[start:] if ln), city, st, zipc
 
 
-def _ties(attrs: dict, decedent: Person, reps: list[Person], claims_address: str | None,
-          mailing: str | None) -> list[str]:
-    name = _clean(attrs.get("NAME")).upper()
-    billing = " ".join(_clean(attrs.get(k)).upper() for k in ("BILLING1", "BILLING2"))
+def mailing_of(attrs: dict) -> str | None:
+    parts = mailing_parts(attrs)
+    return None if parts is None else f"{parts[0]}, {parts[1]}, {parts[2]} {parts[3]}"
+
+
+def _billing_is_claims(attrs: dict, claims_address: str | None) -> bool:
+    """The billing street line, in full, appears in the claims address with its ZIP."""
+    parts = mailing_parts(attrs)
+    if parts is None or not claims_address:
+        return False
+    claims = _norm_address(claims_address)
+    street = _norm_address(parts[0])
+    zipm = re.search(r"\b(\d{5})(?: \d{4})?$", claims)
+    return bool(zipm and zipm.group(1) == parts[3] and street
+                and re.search(rf"(?:^| ){re.escape(street)}(?: |$)", claims))
+
+
+def _estate_marked(segment: str) -> bool:
+    text = _norm(segment)
+    return bool(_ESTATE_MARK.search(_NOT_DECEDENT_ESTATE.sub(" ", text)))
+
+
+def _ties(attrs: dict, decedent_segments: list[str], decedent: NoticeName,
+          reps: list[NoticeName], claims_address: str | None) -> list[str]:
     out = []
-    if _ESTATE_MARK.search(name):
+    if any(_estate_marked(seg) for seg in decedent_segments):
         out.append("estate_marked")
-    words = set(_tokens(f"{name} {billing}"))
-    if any(r.first in words and r.last in words for r in reps):
+    on_parcel = owner_people(_clean(attrs.get("NAME"))) + _addressee_people(attrs)
+    if any(name_matches(r, p) for r in reps for p in on_parcel):
         out.append("rep_on_parcel")
     if any(r.last == decedent.last for r in reps):
         out.append("rep_shares_surname")
-    claims = _street_key(claims_address)
-    if claims is not None and claims == _street_key(mailing):
+    if _billing_is_claims(attrs, claims_address):
         out.append("billing_is_claims_address")
     return out
 
@@ -197,29 +287,31 @@ def match_estate(decedent_name: str, personal_reps: tuple[str, ...] | list[str],
                  claims_address: str | None, rows: list[dict]) -> EstateMatch:
     """Decide which of ``rows`` (layer attributes) are the estate's parcels. Pure."""
     result = EstateMatch()
-    decedent = notice_person(decedent_name)
+    decedent = notice_name(decedent_name)
     if decedent is None:
         result.held.append("decedent_name_unreadable")
         return result
-    reps = [p for p in (notice_person(r) for r in personal_reps) if p is not None]
-    matched = [a for a in rows
-               if any(same_person(decedent, o) for o in owner_people(_clean(a.get("NAME"))))]
+    reps = [n for n in (notice_name(r) for r in personal_reps) if n is not None]
+    matched: list[tuple[dict, list[str]]] = []
+    for a in rows:
+        segs = [seg for p, seg in owner_segments(_clean(a.get("NAME"))) if name_matches(decedent, p)]
+        if segs:
+            matched.append((a, segs))
     result.name_matched = len(matched)
     if not matched:
         result.held.append("no_parcel_in_decedents_name")
         return result
-    mailings = {mailing_of(a) for a in matched}
-    if len({m for m in mailings if m}) > 1:
+    if len({m for m in (mailing_of(a) for a, _ in matched) if m}) > 1:
         result.held.append("matched_parcels_billed_to_different_addresses")
         return result
-    for a in matched:
-        mailing = mailing_of(a)
-        ties = _ties(a, decedent, reps, claims_address, mailing)
+    for a, segs in matched:
+        ties = _ties(a, segs, decedent, reps, claims_address)
         if not ties:
             result.held.append("no_family_tie")
             continue
         situs = _clean(a.get("FULL_ADD"))
         parcel = _clean(a.get("PARCEL_ID"))
+        mailing = mailing_of(a)
         if not re.fullmatch(r"\d{16,17}", parcel):
             result.held.append("parcel_id_unreadable")
             continue
@@ -236,6 +328,26 @@ def match_estate(decedent_name: str, personal_reps: tuple[str, ...] | list[str],
             property_zip=_clean(a.get("SITE_ZIP")) or None,
             mailing_address=mailing, ties=tuple(ties)))
     return result
+
+
+def parse_layer_response(data: object) -> list[dict]:
+    """The attribute dicts of a layer query answer; LayerError for anything that is not
+    a complete, well-formed answer (an error body, a truncated page, a malformed feature).
+    An empty feature list is a real "no parcels"."""
+    if not isinstance(data, dict) or data.get("error"):
+        raise LayerError("layer answered an error body")
+    if data.get("exceededTransferLimit"):
+        raise LayerError("layer truncated the answer")
+    features = data.get("features")
+    if not isinstance(features, list):
+        raise LayerError("layer answer has no feature list")
+    rows = []
+    for f in features:
+        attrs = f.get("attributes") if isinstance(f, dict) else None
+        if not isinstance(attrs, dict) or "NAME" not in attrs or "PARCEL_ID" not in attrs:
+            raise LayerError("layer answered a malformed feature")
+        rows.append(attrs)
+    return rows
 
 
 def query_surname(surname: str) -> list[dict]:
@@ -261,8 +373,4 @@ def query_surname(surname: str) -> list[dict]:
         data = resp.json()
     except ValueError as exc:
         raise LayerError("layer answered non-JSON") from exc
-    if not isinstance(data, dict) or data.get("error") or "features" not in data:
-        raise LayerError("layer answered an error body")
-    if data.get("exceededTransferLimit"):
-        raise LayerError("layer truncated the answer")
-    return [f.get("attributes") or {} for f in data["features"]]
+    return parse_layer_response(data)

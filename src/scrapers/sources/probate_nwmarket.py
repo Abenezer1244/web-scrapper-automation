@@ -42,18 +42,19 @@ _FIRST_PUBLISHED = re.compile(
     r"DATE\s+OF\s+FIRST\s+PUBLICATION\s*:?\s*(?P<d>[A-Z][a-z]+\.?\s+\d{1,2}\s*,\s*\d{4})", re.I)
 # "Personal Representative: NAME" / "Co-Personal Representatives: A and B". Stops at the
 # next labelled field. Not the "named below" sentence: that one has no colon.
-_REPS = re.compile(
-    r"(?:CO-)?PERSONAL\s+REPRESENTATIVES?\s*:\s*(?P<names>.+?)"
-    r"(?=\s+(?:ATTORNEYS?\s+FOR|ADDRESS\s+FOR|DATED|COURT\s+OF|PRESENTED|/S/|SIGNED)|\s*$)",
-    re.I,
+# Every labelled field a notice prints, in any order: a value ends where the next begins.
+_NEXT_LABEL = (
+    r"(?=\s+(?:DATE\s+OF\s+FIRST\s+PUBLICATION|(?:CO-)?PERSONAL\s+REPRESENTATIVES?\s*:"
+    r"|ATTORNEYS?\s+FOR|ADDRESS\s+FOR|DATED|COURT\s+OF|PRESENTED|/S/|SIGNED"
+    r"|(?:CAUSE|CASE|PROBATE)\s+NO\b|SUPERIOR\s+COURT)|\s*$)"
 )
+_REPS = re.compile(
+    r"(?:CO-)?PERSONAL\s+REPRESENTATIVES?\s*:\s*(?P<names>.+?)" + _NEXT_LABEL, re.I)
 _CLAIMS_ADDRESS = re.compile(
     r"ADDRESS\s+FOR\s+MAILING\s*(?:OR|/|AND)?\s*(?:SERVICE|NOTICE)?\s*:\s*(?P<addr>.+?)"
-    r"(?=\s+(?:COURT\s+OF|DATED|PRESENTED|ATTORNEYS?\s+FOR|/S/)|\s*$)",
-    re.I,
-)
-_NAME_SPLIT = re.compile(r"\s*(?:,\s*and\s+|\s+and\s+|;|,)\s*", re.I)
-_PERSON_NAME = re.compile(r"^[A-Za-z][A-Za-z.'\- ]{1,60}$")
+    + _NEXT_LABEL, re.I)
+_NAME_SPLIT = re.compile(r"\s*(?:,\s*and\s+|\s+and\s+|;|,(?!\s*(?:JR|SR|II|III|IV)\b))\s*", re.I)
+_PERSON_NAME = re.compile(r"^[A-Za-z][A-Za-z.,'\- ]{1,60}$")
 
 
 @dataclass(frozen=True)

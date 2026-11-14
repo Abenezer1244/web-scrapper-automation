@@ -130,3 +130,70 @@ def test_no_parcel_and_prefix_names_are_held():
         "no_parcel_in_decedents_name"]
     # "MARGARET J. HOLLOW" is a prefix of the owner's surname, not the owner.
     assert match_estate("MARGARET J. HOLLOW", ("AMANDA J. HOLLOW",), None, _ROWS).name_matched == 0
+
+
+# ── regressions from the Phase 1 Codex review ────────────────────────────────
+
+def test_same_house_number_and_zip_on_another_street_is_not_the_claims_address():
+    m = match_estate("NOEL HERRERA, JR.", ("SAM K. LEE",), "401 Oak St, Clarkston, WA 99403", _ROWS)
+    assert m.leads == [] and m.held == ["no_family_tie"]
+
+
+def test_po_box_spellings_compare_equal():
+    row = dict(_row("WARD JR"), BILLING1="P.O. BOX 600")
+    m = match_estate("ROGER A. WARD, JR.", ("SAM K. LEE",), "Post Office Box 600, Lewiston, ID 83501",
+                     [row])
+    assert m.leads[0].ties == ("billing_is_claims_address",)
+
+
+def test_estate_marker_on_another_co_owner_is_not_the_decedents():
+    row = dict(_row("FINCH"), NAME="FINCH, RONALD JOSEPH & DAVIS, DONNA (ESTATE)")
+    assert match_estate("RONALD J. FINCH", ("SAM K. LEE",), None, [row]).held == ["no_family_tie"]
+    assert match_estate("DONNA DAVIS", ("SAM K. LEE",), None, [row]).leads[0].ties == ("estate_marked",)
+
+
+def test_life_estate_spelled_with_a_hyphen_is_not_an_estate():
+    row = dict(_row("HOLLOWAY"), NAME="HOLLOWAY, MARGARET J LIFE-ESTATE")
+    assert match_estate("MARGARET J. HOLLOWAY", ("SAM K. LEE",), None, [row]).held == ["no_family_tie"]
+
+
+def test_rep_must_be_a_whole_person_on_the_parcel():
+    # ROBERT from a street name and DAVIS from a co-owner are not "ROBERT DAVIS".
+    row = dict(_row("FINCH"), BILLING1="800 ROBERT ST")
+    m = match_estate("RONALD J. FINCH", ("ROBERT DAVIS",), None, [row])
+    assert m.held == ["no_family_tie"]
+    # A C/O addressee who is the representative is a tie.
+    row = dict(_row("HOLLOWAY"), BILLING1="C/O SAM K LEE", BILLING2="2300 RIVERVIEW BLVD")
+    assert match_estate("MARGARET J. HOLLOWAY", ("SAM K. LEE",), None, [row]).leads[0].ties == (
+        "rep_on_parcel",)
+
+
+def test_ambiguous_co_owner_layout_names_nobody():
+    # '& JANE SMITH' could be Jane Smith, not Jane Smith Doe: never inherit the surname.
+    assert owner_people("DOE, JOHN & JANE SMITH") == [Person("JOHN", "", "DOE", "")]
+
+
+def test_every_middle_the_notice_gives_must_agree():
+    row = dict(_row("FINCH"), NAME="FINCH, RONALD ALAN ROBERT")
+    assert match_estate("RONALD ALAN JAMES FINCH", ("AMY FINCH",), None, [row]).name_matched == 0
+    assert match_estate("RONALD A. R. FINCH", ("AMY FINCH",), None, [row]).name_matched == 1
+
+
+def test_person_beside_an_organization_and_multi_word_surname():
+    assert owner_people("DOE, JOHN & ACME LLC") == [Person("JOHN", "", "DOE", "")]
+    row = dict(_row("HOLLOWAY"), NAME="DE LA CRUZ, MARIA")
+    assert match_estate("MARIA DE LA CRUZ", ("ANA DE LA CRUZ",), None, [row]).name_matched == 1
+
+
+def test_layer_answers():
+    import pytest
+
+    from src.scrapers.enrichment.asotin_parcels import LayerError, parse_layer_response
+
+    assert parse_layer_response({"features": []}) == []
+    assert parse_layer_response({"features": [{"attributes": _ROWS[0]}]}) == [_ROWS[0]]
+    for bad in ({"error": {"code": 400}}, {"features": [], "exceededTransferLimit": True},
+                {"features": None}, {"features": [{}]}, {"features": [{"attributes": {"X": 1}}]},
+                [], "x"):
+        with pytest.raises(LayerError):
+            parse_layer_response(bad)

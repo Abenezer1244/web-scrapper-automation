@@ -73,3 +73,20 @@ def test_alias_keeps_the_legal_name():
     text = _text("asotin_probate_notice_a").replace(
         "MARGARET J. HOLLOWAY, Deceased", "MARGARET J. HOLLOWAY, a/k/a PEGGY HOLLOWAY, Deceased")
     assert parse_probate_notice(text).decedent == "MARGARET J. HOLLOWAY"
+
+
+def test_fields_in_another_order_do_not_bleed():
+    text = _text("asotin_probate_notice_b")
+    head, tail = text.split("DATE OF FIRST PUBLICA", 1)
+    first_pub = "DATE OF FIRST PUBLICA" + tail.split(" PERSONAL REPRESENTA", 1)[0]
+    rest = tail.split(" PERSONAL REPRESENTA", 1)[1]
+    reordered = head + "PERSONAL REPRESENTA" + rest.replace(" ADDRESS FOR", " " + first_pub + " ADDRESS FOR", 1)
+    n = parse_probate_notice(reordered)
+    assert n.personal_reps == ("CYNTHIA J. MOORE",)
+    assert n.first_published == date(2026, 11, 5)
+    assert "PUBLICATION" not in n.claims_address.upper()
+
+
+def test_rep_with_suffix_is_one_person():
+    text = _text("asotin_probate_notice_b").replace("Cynthia J. Moore ADDRESS", "John A. Moore, Jr. ADDRESS")
+    assert parse_probate_notice(text).personal_reps == ("JOHN A. MOORE, JR",)

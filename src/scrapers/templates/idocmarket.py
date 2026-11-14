@@ -11,7 +11,9 @@ WA counties using iDocMarket:
     Columbia (COLWA1) — the only WA county on the platform.
 
 The per-county search page is a server-rendered ASP.NET MVC form:
-- `#StartRecordDate` / `#EndRecordDate` text inputs (MM/DD/YYYY)
+- `#StartRecordDate` / `#EndRecordDate` <duet-date-picker> components: typed into
+  their inner `#start-record-date` / `#end-record-date` inputs (MM/DD/YYYY); they
+  submit hidden ISO `StartRecordDate` / `EndRecordDate` fields
 - an `input[type=submit]` "Search" button (anti-CSRF __RequestVerificationToken
   is a hidden field on the form — we submit the real form, never a raw POST)
 - results render back on the same URL as `div.row.result-item` cards:
@@ -45,6 +47,7 @@ from src.scrapers.preforeclosure import (
     is_cancellation_or_admin,
     orient_pre_foreclosure_party,
 )
+from src.scrapers.probate import clean_counterparty, strip_estate_caption, strip_filing_agency
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("scraper.template.idocmarket")
@@ -69,12 +72,6 @@ _COMPANY_WORDS = {
     "NA", "DBA", "FUND", "HOLDINGS", "PROPERTIES",
 }
 
-# Grantee token-set for recorder placeholders that are not real heirs — a
-# one-sided filing (e.g. a Certificate of Death) lists "THE PUBLIC" as grantee.
-# A grantee whose words are a subset of these is dropped (robust to trailing
-# punctuation / whitespace vs an exact-string match).
-_HEIR_NOISE_TOKENS = {"THE", "PUBLIC"}
-
 # Split the requested window into <=30-day searches. The portal has no pager and
 # caps a single search's result set server-side (~1000 rows); chunking keeps each
 # search under the cap so no leads are silently dropped on busier counties.
@@ -82,11 +79,12 @@ _CHUNK_DAYS = 30
 
 # Trailing fiduciary-role connector left dangling on a grantor when the estate
 # name spilled to the other party line: "SMITH, JANE, ADMINISTRATOR OF" ->
-# "SMITH, JANE". Anchored at end so it never cuts into the actual name.
+# "SMITH, JANE". Also a trailing status word: "POWERS, ZELLA, DECEASED" -> "POWERS,
+# ZELLA". Anchored at end so it never cuts into the actual name.
 _ROLE_TAIL_RE = re.compile(
-    r",?\s+(?:AS\s+)?(?:SUCCESSOR\s+)?"
+    r",?\s+(?:(?:AS\s+)?(?:SUCCESSOR\s+)?"
     r"(?:ADMINISTRATOR|ADMINISTRATRIX|EXECUTOR|EXECUTRIX|"
-    r"PERSONAL\s+REPRESENTATIVE|TRUSTEE)\s+(?:OF|FOR)\s*$",
+    r"PERSONAL\s+REPRESENTATIVE|TRUSTEE)\s+(?:OF|FOR)|DECEASED)\s*$",
     re.IGNORECASE,
 )
 
@@ -99,21 +97,14 @@ _ROLE_TAIL_RE = re.compile(
 # (bare "DEATH" would wrongly catch "TRANSFER ON DEATH DEED", which a LIVING
 # owner records for estate planning — not a deceased-owner lead).
 _DOC_TYPE_MAP = {
-    # Probate / estate signals that name the decedent or fiduciary as a party.
-    # "PROBATE" (whole word) also catches "LACK OF PROBATE AFFIDAVIT".
-    # "ADMINISTRATOR"/"ADMINISTRATRIX"/"EXECUTOR"/"EXECUTRIX"/"TESTAMENTARY"
-    # whole-word match the possessive deed forms ("ADMINISTRATOR'S DEED" etc.).
-    # Both word orders of the death certificate are listed (the portal emits
-    # "CERTIFICATE OF DEATH"); the decedent is the grantor on those, verified
-    # live (clean person names, no filing-agency-as-grantor).
-    "probate": [
-        "PROBATE", "TESTAMENTARY", "ADMINISTRATRIX", "EXECUTRIX",
-        "ADMINISTRATOR", "EXECUTOR", "DECEDENT",
-        "LETTERS OF ADMINISTRATION", "PERSONAL REPRESENTATIVE",
-        "ESTATE OF", "DECREE OF DISTRIBUTION",
-        "CERTIFICATE OF DEATH", "DEATH CERTIFICATE",
-        "AFFIDAVIT OF SUCCESSOR",
-    ],
+    # Probate = the Lack of Probate Affidavit only, on its whole label (owner decision
+    # 2026-11-14). Its grantor is the decedent (verified: BLATT grantor -> grantee now
+    # holds that legal on PACS). Fiduciary deeds and letters name the representative,
+    # and a deed means the estate already sold, so neither is a probate lead here.
+    "probate": ["LACK OF PROBATE AFFIDAVIT"],
+    # The recorded certificate (the portal's label is "CERTIFICATE OF DEATH"); the
+    # decedent is the grantor. Kept only on an exact label (_WHOLE_LABELS).
+    "death_certificate": ["CERTIFICATE OF DEATH", "DEATH CERTIFICATE"],
     # Pre-foreclosure: the borrower (homeowner) is named on these. Excludes
     # SUBSTITUTION OF TRUSTEE / APPOINTMENT OF SUCCESSOR TRUSTEE and the
     # TRUSTEE'S DEED (completed-sale, post-foreclosure) admin docs.
@@ -123,6 +114,55 @@ _DOC_TYPE_MAP = {
         "LIS PENDENS", "FORECLOSURE",
     ],
 }
+
+
+# Record types kept only on an exact whole label ("AFFIDAVIT OF DEATH", a TOD deed or
+# an executor's deed is not one). The decedent is the grantor on every one of them.
+_WHOLE_LABELS = {
+    "death_certificate": frozenset({"CERTIFICATE OF DEATH", "DEATH CERTIFICATE"}),
+    "probate": frozenset({"LACK OF PROBATE AFFIDAVIT"}),
+}
+
+# "Showing: A of B results" — the portal's own count for the searched window.
+_COUNTER_RE = re.compile(r"Showing:\s*([\d,]+)\s+of\s+([\d,]+)")
+
+
+def check_counter(text: str, cards: int) -> None:
+    """Raise unless the page proves it listed the whole window.
+
+    Unknown is never zero: a missing counter, shown != total (the server cap), or a
+    card count that disagrees with the counter (selector drift) fails the chunk.
+    "0 of 0" with no cards is the only zero.
+    """
+    m = _COUNTER_RE.search(text or "")
+    if not m:
+        raise RuntimeError("iDocMarket results counter not found: result count unknown")
+    shown, total = (int(g.replace(",", "")) for g in m.groups())
+    if not shown == total == cards:
+        raise RuntimeError(
+            f"iDocMarket results incomplete: showing {shown} of {total}, {cards} cards read"
+        )
+
+
+def keep_doc_type(doc_type: str, record_type: str, keywords: list[str]) -> bool:
+    """Whether a row's document type belongs to ``record_type``."""
+    if not doc_type or not _doc_type_matches(doc_type, keywords):
+        return False
+    labels = _WHOLE_LABELS.get(record_type)
+    return labels is None or " ".join(doc_type.upper().split()) in labels
+
+
+def decedent_party(grantor: str, grantee: str) -> tuple[str, str | None]:
+    """``(party_name, heirs)`` for a death certificate / lack-of-probate affidavit.
+
+    The grantor is the decedent; the grantee is never promoted in its place (a named
+    grantee beside a placeholder grantor is an heir, not a death). A grantor that is
+    empty or only a filing agency is not a readable decedent: the chunk fails.
+    """
+    party = strip_estate_caption(strip_filing_agency(grantor or ""))
+    if not party:
+        raise RuntimeError("iDocMarket decedent card without a readable grantor")
+    return party, clean_counterparty(grantee or "")
 
 
 def _doc_type_matches(doc_type: str, keywords: list[str]) -> bool:
@@ -197,17 +237,13 @@ class IDocMarketScraper(BridgeScraper):
             date_to: End date MM/DD/YYYY.
         """
         active_rt = self.active_record_type
-        # Fail CLOSED: we only emit records we can positively classify by doc
-        # type. An unknown/missing record_type has no keyword list, so rather
-        # than ingest every recorded document as a "lead", refuse and return
-        # nothing (the job completes with 0, surfacing the misconfiguration).
+        # Fail CLOSED: we only emit records we can positively classify by doc type.
+        # An unknown/missing record_type is a misconfiguration, never a zero.
         if not active_rt or active_rt not in _DOC_TYPE_MAP:
-            _logger.error(
-                "iDocMarket: no doc-type filter for record_type=%r (%s/%s) — refusing "
-                "to ingest unclassified records",
-                active_rt, self.county, self.state,
+            raise ValueError(
+                f"iDocMarket: no doc-type filter for record_type={active_rt!r} "
+                f"({self.county}/{self.state})"
             )
-            return []
 
         start = datetime.strptime(self._norm_date(date_from), "%m/%d/%Y")
         end = datetime.strptime(self._norm_date(date_to), "%m/%d/%Y")
@@ -304,21 +340,24 @@ class IDocMarketScraper(BridgeScraper):
         swallowing it — a search that runs with empty/wrong dates would return a
         wrong-window result set and mislabel it, which is worse than a failed job.
         """
+        # The date fields are <duet-date-picker> components (since 2026-11): type into
+        # the visible inner input; the component writes the ISO date to the hidden
+        # StartRecordDate / EndRecordDate fields the form submits.
         try:
-            await self.page.wait_for_selector("#StartRecordDate", timeout=15_000)
+            await self.page.wait_for_selector("#start-record-date", timeout=15_000)
         except Exception as exc:
             raise RuntimeError(
                 f"iDocMarket search form not found at {self.base_url}: {str(exc)[:120]}"
             ) from exc
-        await self.page.fill("#StartRecordDate", date_from)
-        await self.page.fill("#EndRecordDate", date_to)
-        # Verify BOTH values stuck. The portal reformats input (strips leading
-        # zeros: "04/19/2026" -> "4/19/2026"), so compare parsed dates, not raw
-        # strings — but still catch an empty / unchanged field on either end,
-        # which would run a wrong-window search.
-        for field, expected in (("#StartRecordDate", date_from), ("#EndRecordDate", date_to)):
-            actual = (await self.page.input_value(field) or "").strip()
-            if self._parse_date(actual) != self._parse_date(expected):
+        for visible, value in (("#start-record-date", date_from), ("#end-record-date", date_to)):
+            await self.page.fill(visible, value)
+            await self.page.press(visible, "Tab")  # the picker parses on blur
+        # Verify the SUBMITTED values on both ends: an empty or unparsed field would
+        # run a wrong-window search.
+        for field, expected in (("StartRecordDate", date_from), ("EndRecordDate", date_to)):
+            actual = (await self.page.eval_on_selector(
+                f"input[name={field}]", "e => e.value") or "").strip()
+            if self._parse_iso(actual) != self._parse_date(expected):
                 raise RuntimeError(
                     f"iDocMarket date fill failed for {field} "
                     f"(got {actual!r}, expected {expected!r})"
@@ -330,6 +369,14 @@ class IDocMarketScraper(BridgeScraper):
         """Parse a portal date (MM/DD/YYYY or M/D/YYYY), or None if unparseable."""
         try:
             return datetime.strptime(d.strip(), "%m/%d/%Y")
+        except (ValueError, AttributeError):
+            return None
+
+    @staticmethod
+    def _parse_iso(d: str) -> datetime | None:
+        """Parse the picker's submitted YYYY-MM-DD value, or None."""
+        try:
+            return datetime.strptime(d.strip(), "%Y-%m-%d")
         except (ValueError, AttributeError):
             return None
 
@@ -346,12 +393,15 @@ class IDocMarketScraper(BridgeScraper):
         ).first
         if await submit.count() == 0:
             raise RuntimeError("iDocMarket search submit button not found")
-        try:
-            async with self.page.expect_navigation(timeout=25_000):
-                await submit.click()
-        except Exception:
-            # Some submits re-render without a full navigation event.
-            await self.page.wait_for_timeout(3_000)
+        # Search is a full form POST (verified live 2026-11-14). A click that does not
+        # navigate, or a non-200 answer (the portal's 403 block), fails the chunk: the
+        # page left behind is not the result of this search.
+        async with self.page.expect_navigation(timeout=60_000) as nav:
+            await submit.click()
+        response = await nav.value
+        if response is None or response.status != 200:
+            status = response.status if response is not None else "none"
+            raise RuntimeError(f"iDocMarket search answered HTTP {status}")
         # Wait for result cards; an empty window legitimately has none, so fall
         # through after a short wait (the "Showing: 0 of 0" counter confirms it).
         try:
@@ -364,9 +414,8 @@ class IDocMarketScraper(BridgeScraper):
         """Extract and doc-type-filter every result card on the current page.
 
         iDocMarket renders all matches for the searched window on a single page
-        (no pager). We read the "Showing: A of B results" counter and warn if
-        A < B (truncated by the server-side cap) so a shortened chunk is visible
-        in the logs. ``active_rt`` is validated by the caller to be in
+        (no pager). ``check_counter`` fails the chunk unless the "Showing: A of B
+        results" counter proves every row was read. ``active_rt`` is validated by the caller to be in
         ``_DOC_TYPE_MAP``, so a keyword list always exists (filtering is never
         silently disabled).
         """
@@ -388,7 +437,7 @@ class IDocMarketScraper(BridgeScraper):
                             it.querySelectorAll('.short-parties span')
                         ).map(s => norm(s)).filter(Boolean);
                     }
-                    const dateSpan = it.querySelector('.col-md-1 span');
+                    const dateSpan = it.querySelector('[aria-label^="Record Date"]');
                     const legalSpans = it.querySelectorAll('.first-legals span');
                     return {
                         doc_type: norm(it.querySelector('.doc-title')),
@@ -398,18 +447,12 @@ class IDocMarketScraper(BridgeScraper):
                         legal: legalSpans.length > 1 ? norm(legalSpans[legalSpans.length - 1]) : '',
                     };
                 });
-                const counter = (document.body.innerText.match(/Showing:\\s*([\\d,]+)\\s+of\\s+([\\d,]+)/) || []);
-                return {rows, shown: counter[1] || '', total: counter[2] || ''};
+                return {rows, text: document.body.innerText};
             }"""
         )
 
         rows = raw.get("rows", []) if raw else []
-        shown, total = raw.get("shown", ""), raw.get("total", "")
-        if shown and total and shown.replace(",", "") != total.replace(",", ""):
-            _logger.warning(
-                "iDocMarket results truncated: showing %s of %s — widen chunking if leads are missed",
-                shown, total,
-            )
+        check_counter((raw or {}).get("text", ""), len(rows))
 
         keywords = self._doc_type_keyword_override or _DOC_TYPE_MAP[active_rt]
 
@@ -417,19 +460,26 @@ class IDocMarketScraper(BridgeScraper):
         for item in rows:
             doc_type = (item.get("doc_type") or "").strip()
 
-            # Filter by the requested record type. A row with no doc type can't
-            # be classified — drop it so unrelated filings don't leak through.
-            if not doc_type or not _doc_type_matches(doc_type, keywords):
+            # Every card the counter counted must be classifiable: a missing title is
+            # selector drift, and skipping it would turn a counted card into a zero.
+            if not doc_type:
+                raise RuntimeError("iDocMarket card without a document type")
+            if not keep_doc_type(doc_type, active_rt, keywords):
                 continue
 
             record = ScrapedRecord()
             record.doc_type = doc_type.upper() or None
 
-            # Date — normalize M/D/YYYY -> MM/DD/YYYY.
+            # Date — normalize M/D/YYYY -> MM/DD/YYYY. A kept row without a record
+            # date or document number is schema drift: fail, never deliver it undated.
             date_str = (item.get("date_recorded") or "").strip()
             m = re.search(r"(\d{1,2})/(\d{1,2})/(\d{4})", date_str)
-            if m:
-                record.date_recorded = f"{int(m.group(1)):02d}/{int(m.group(2)):02d}/{m.group(3)}"
+            docnum = (item.get("docnum") or "").strip().lstrip("#").strip()
+            if not m or not docnum:
+                raise RuntimeError(
+                    f"iDocMarket {doc_type} card without record date or document number"
+                )
+            record.date_recorded = f"{int(m.group(1)):02d}/{int(m.group(2)):02d}/{m.group(3)}"
 
             # Parties. Stacked owners join as " / ".
             grantors = item.get("grantors") or []
@@ -440,6 +490,8 @@ class IDocMarketScraper(BridgeScraper):
                 if sp:
                     grantors = sp[:1]
                     grantees = sp[1:2]
+            if not grantors and not grantees:
+                raise RuntimeError(f"iDocMarket {doc_type} card without party names")
 
             grantor = self._clean_party(normalize_party_text(" / ".join(grantors)))
             grantee = self._clean_party(normalize_party_text(" / ".join(grantees)))
@@ -460,21 +512,13 @@ class IDocMarketScraper(BridgeScraper):
                     continue
                 record.party_name, record.heirs = oriented
             else:
-                # Probate: the decedent / fiduciary is the grantor.
-                if grantor:
-                    record.party_name = grantor
-                # Set heirs only if the grantee carries a real name — drop
-                # recorder placeholders like "THE PUBLIC" (token-set check is
-                # robust to trailing punctuation / extra whitespace).
-                if grantee:
-                    heir_tokens = set(_WORD_RE.findall(grantee.upper()))
-                    if heir_tokens and not heir_tokens <= _HEIR_NOISE_TOKENS:
-                        record.heirs = grantee
+                # Probate / death certificate: the decedent is the grantor, never
+                # swapped for the grantee ("THE PUBLIC" there is dropped).
+                record.party_name, record.heirs = decedent_party(grantor, grantee)
 
             # Doc number is a document id, NOT a legal description — keep it in
             # enrichment_data; legal_description holds the REAL legal only (None when
             # the index has none; never DOC# as a stand-in).
-            docnum = (item.get("docnum") or "").strip().lstrip("#").strip()
             record.enrichment_data = {"instrument_number": docnum, "source": "idocmarket"}
             legal = (item.get("legal") or "").strip()
             if legal:
@@ -486,8 +530,7 @@ class IDocMarketScraper(BridgeScraper):
             # stable + distinct without depending on legal_description.
             record.raw_html_hash = self.make_hash(record.to_dict())
 
-            if record.party_name or record.date_recorded:
-                records.append(record)
+            records.append(record)
 
         _logger.info(
             "iDocMarket extracted %d/%d cards matching %s",

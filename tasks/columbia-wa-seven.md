@@ -60,7 +60,14 @@ public index. Our death_certificate = the publicly RECORDED certificate in the A
   probate party = decedent ("ESTATE OF X", "X, DECEASED", affidavit grantor), PR goes to `heirs`,
   rows with only a PR name are not name-looked-up; split CERTIFICATE OF DEATH into `death_certificate`.
   Offline fixtures from the saved live HTML.
-- [ ] **Phase 2 — Columbia PACS** (`pacs_parcel.py` site + detail `year`, `pacs.py` detail URL year,
+- [x] **Phase 2 — Columbia PACS** (2026-11-14, pending Codex gate). `pacs.ownership_year()` reads the
+  newest `taxyear` option from the county's own form (host list `_YEAR_HOSTS`, Columbia only; other
+  portals unchanged); both requests of both paths name it; no year offered -> name path FAILED, parcel
+  pass deferred (never a miss). Live: mailing 3/3 found (incl. Richland out-of-county, 50/50 co-owner),
+  bogus parcel `parcel_not_found`; tax 2/2 found as of 11/14/2026; exact unique name found, rural
+  no-situs owner no_match. Tests: 200 pass on a disposable CI-equivalent DB; 5 of 7 new Columbia tests
+  fail on the old code. Phase 3 note: tax situs can be locality-only ("DAYTON, WA 99328") -> must hold.
+  Original Phase 2 scope: (`pacs_parcel.py` site + detail `year`, `pacs.py` detail URL year,
   `county_gis.py` mailing county list, tests): connector `assessor_url`.
 - [ ] **Phase 3 — tax_delinquent** (`pacs_tax_crawler.COUNTIES`, `columbia_wa_tax_delinquent.py`,
   registry, migration 158 seeding an INACTIVE connector, tests).

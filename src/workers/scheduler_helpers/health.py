@@ -447,17 +447,36 @@ def _alert_done_without_count(now: datetime) -> list[str]:
 # Probes per canary tick. A unit is one (connector, record type): probing only a
 # connector's first record type left every other type uncertified (P0-08, Codex).
 CANARY_UNITS_PER_TICK = 5
+# Slots per tick kept for the random rotation, whatever the priority backlog (Codex P1:
+# a connector whose probe never records a verdict must not crowd out every other probe).
+CANARY_ROUTINE_SLOTS = 2
 # Its "history" windows are forward auction horizons and zero upcoming auctions is
 # legitimate, so an empty probe never downgrades it; it has its own stale-source path.
 _NO_ZERO_OUTPUT_DOWNGRADE = frozenset({"trustee_sale"})
 
 
 def _canary_units(connectors, k: int = CANARY_UNITS_PER_TICK) -> list:
-    """A random sample of (connector, record_type) pairs, rotating through all of them."""
+    """(connector, record_type) pairs to probe this tick.
+
+    A connector never certified (no last_checked, or status 'unknown') is hidden from
+    customers until a probe decides it, so one type of each such connector goes first:
+    a random sample of them, capped so CANARY_ROUTINE_SLOTS stay for the random rotation
+    through every other pair. A connector switched on used to wait for the rotation,
+    a day or more (Benton tax_delinquent, 2026-11-14)."""
     import random
 
-    units = [(c, rt) for c in connectors for rt in (c.record_types or [])]
-    return random.sample(units, min(k, len(units)))
+    pending = [c for c in connectors if c.record_types and (c.last_checked is None or c.health_status == "unknown")]
+    first = [(c, random.choice(c.record_types))
+             for c in random.sample(pending, min(len(pending), max(k - CANARY_ROUTINE_SLOTS, 0)))]
+    # Pending connectors stay out of the rotation, so a stuck backlog gets only the
+    # priority slots; their other types rotate in once a probe certifies them.
+    waiting = {c.id for c in pending}
+    rest = [(c, rt) for c in connectors if c.id not in waiting for rt in (c.record_types or [])]
+    units = first + random.sample(rest, min(k - len(first), len(rest)))
+    # Slots the rotation cannot fill go to the rest of the pending pairs.
+    chosen = {(c.id, rt) for c, rt in units}
+    spare = [(c, rt) for c in pending for rt in c.record_types if (c.id, rt) not in chosen]
+    return units + random.sample(spare, min(k - len(units), len(spare)))
 
 
 def _canary_check_impl() -> None:

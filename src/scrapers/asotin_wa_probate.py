@@ -14,13 +14,19 @@ STRICT QUALITY: a parcel missing its parcel number, owner, property address or m
 address is HELD (counted in the log), never delivered. Notices with no tied parcel were
 held at crawl time and never reach this scraper.
 
-NEVER A FALSE ZERO: an empty list from a crawl that has stopped reading the newspaper
-fails the job instead (the same heartbeat as Asotin's auction leads).
+NEVER A FALSE ZERO: an empty list fails the job instead when the crawl has stopped
+reading the newspaper (the same heartbeat as Asotin's auction leads), when a notice in
+the window is still waiting on the county layer ("failed", re-checked by the crawl), or
+when the window is older than the notices kept (probate_ingest.RETENTION_DAYS).
+
+The property address is the street alone, never with the optional city: the billing
+dedup key is parcel|address, so an address that grew a city between crawls would bill
+the same parcel twice (Codex). ZIP and state go in their own fields.
 """
 from __future__ import annotations
 
 import hashlib
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 
 from sqlalchemy import func, select
 
@@ -30,7 +36,9 @@ from src.scrapers.base_scraper import BridgeScraper, ScrapedRecord
 from src.scrapers.enrichment.source_health import get_source_state
 from src.scrapers.reliability import ScraperExecutionError
 from src.scrapers.trustee_sale import _parse_mdy, cache_staleness_reason, nts_crawl_heartbeat_key
+from src.utils.lead_signals import auction_reference_date
 from src.utils.logger import setup_logger
+from src.workers.probate_ingest import RETENTION_DAYS
 
 _logger = setup_logger("scraper.asotin_wa_probate")
 
@@ -44,19 +52,11 @@ def deliverable(parcel: dict) -> bool:
     return all(isinstance(parcel.get(k), str) and parcel[k].strip() for k in _REQUIRED)
 
 
-def _situs(parcel: dict) -> str:
-    street = parcel["property_address"].strip()
-    city, zip_ = (parcel.get("property_city") or "").strip(), (parcel.get("property_zip") or "").strip()
-    if city and zip_:
-        return f"{street}, {city}, {_STATE} {zip_}"
-    return street
-
-
 def record_from_parcel(notice: ProbateNoticeRow, parcel: dict) -> ScrapedRecord:
     rec = ScrapedRecord()
     rec.party_name = parcel["party_name"]
     rec.parcel_id = parcel["parcel_id"]
-    rec.property_address = _situs(parcel)
+    rec.property_address = parcel["property_address"].strip()
     rec.property_zip = (parcel.get("property_zip") or "").strip() or None
     rec.property_state = _STATE
     rec.mailing_address = parcel["mailing_address"]
@@ -67,7 +67,6 @@ def record_from_parcel(notice: ProbateNoticeRow, parcel: dict) -> ScrapedRecord:
         "source": notice.source,
         "cause_no": notice.cause_no,
         "first_published": d.isoformat(),
-        "assessor_current_owner": parcel.get("owner_name"),
         "parcel_ties": list(parcel.get("ties") or []),
         # The estate was tied to this parcel by name plus a family tie, not by a
         # recorded deed: say so on the lead.
@@ -106,6 +105,16 @@ class AsotinWAProbateScraper(BridgeScraper):
             raise ScraperExecutionError(
                 _COUNTY, "probate_notices",
                 f"unusable date window {date_from!r}..{date_to!r}", record_type=RECORD_TYPE)
+        kept_from = auction_reference_date() - timedelta(days=RETENTION_DAYS)
+        if end < kept_from:
+            raise ScraperExecutionError(
+                _COUNTY, "probate_notices",
+                f"the window ends {end}, before the oldest notice kept ({kept_from}); "
+                "older notices are deleted after retention", record_type=RECORD_TYPE)
+        if start < kept_from:
+            _logger.warning("asotin probate: window starts %s, before the oldest notice "
+                            "kept (%s); only %s..%s is covered", start, kept_from,
+                            kept_from, end)
         records = self._read(start, end)
         if self.on_progress:
             self.on_progress(0, 0, len(records))
@@ -121,6 +130,14 @@ class AsotinWAProbateScraper(BridgeScraper):
                 ProbateNoticeRow.first_published >= start,
                 ProbateNoticeRow.first_published <= end,
             ).order_by(ProbateNoticeRow.first_published, ProbateNoticeRow.cause_no)).scalars().all()
+            # Notices the county layer has not answered yet: an unknown, not a zero.
+            pending = db.execute(select(func.count()).select_from(ProbateNoticeRow).where(
+                *scope,
+                ProbateNoticeRow.match_outcome == "failed",
+                ProbateNoticeRow.privacy_suppression_id.is_(None),
+                ProbateNoticeRow.first_published >= start,
+                ProbateNoticeRow.first_published <= end,
+            )).scalar_one()
             heartbeat = get_source_state(db, nts_crawl_heartbeat_key(_COUNTY))
             last_fetched_at = db.execute(
                 select(func.max(ProbateNoticeRow.fetched_at)).where(*scope)).scalar_one()
@@ -138,6 +155,15 @@ class AsotinWAProbateScraper(BridgeScraper):
                 _COUNTY, "probate_notices",
                 f"0 probate leads, and {stale}. Refusing to report an empty list that may "
                 "only mean the crawler is failing", record_type=RECORD_TYPE)
+        if pending and not records:
+            raise ScraperExecutionError(
+                _COUNTY, "probate_notices",
+                f"0 probate leads, but {pending} notice(s) in the window are still waiting on "
+                "the county parcel layer; refusing to report an empty list",
+                record_type=RECORD_TYPE)
+        if pending:
+            _logger.warning("asotin probate: %d notice(s) in the window still waiting on the "
+                            "county parcel layer; this list may be short", pending)
         if stale:
             _logger.warning("asotin probate: delivering %d lead(s) from a stale cache: %s",
                             len(records), stale)

@@ -9,7 +9,7 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import json
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -123,6 +123,45 @@ async def test_an_empty_list_from_a_stale_crawl_fails_loudly(db):
         await _scrape()
     _crawled(db)
     assert await _scrape() == []                                   # fresh crawl: a real zero
+
+
+async def test_a_notice_waiting_on_the_county_layer_is_not_a_zero(db):
+    _ingest(db, "asotin_probate_notice_a")
+    db.execute(text("UPDATE probate_notices SET match_outcome = 'failed', parcels = NULL "
+                    "WHERE cause_no = '26-4-00122-02'"))
+    db.commit()
+    _crawled(db)                      # the newspaper itself was read: heartbeat is fresh
+    with pytest.raises(ScraperExecutionError, match="waiting on the county parcel layer"):
+        await _scrape()
+
+
+async def test_a_window_older_than_retention_fails(db):
+    _crawled(db)
+    old = date.today() - timedelta(days=pi.RETENTION_DAYS + 30)
+    mdy = lambda d: f"{d.month:02d}/{d.day:02d}/{d.year}"  # noqa: E731
+    with pytest.raises(ScraperExecutionError, match="before the oldest notice kept"):
+        await _scrape(mdy(old - timedelta(days=10)), mdy(old))
+
+
+async def test_the_owner_of_record_with_a_representative_is_not_copied(db):
+    # The county prints the representative inside the owner field ("C/O ... PR"): the
+    # lead carries the decedent only, never that string.
+    _ingest(db, "asotin_probate_notice_a")
+    db.execute(text(
+        "UPDATE probate_notices SET parcels = CAST(:p AS json) WHERE cause_no = '26-4-00122-02'"),
+        {"p": json.dumps([{
+            "parcel_id": "10412300600050000", "party_name": "WEBER, NORMA E",
+            "owner_name": "WEBER, NORMA E ESTATE C/O GLENN L. WEBER PR",
+            "property_address": "1 MAIN ST", "property_city": "CLARKSTON",
+            "property_zip": "99403", "mailing_address": "PO BOX 1, CHATTAROY, WA 99003",
+            "ties": ["estate_marked"]}])})
+    db.commit()
+    _crawled(db)
+    [rec] = await _scrape()
+    assert "GLENN" not in json.dumps(rec.to_dict())
+    # Street only (a stable billing key); ZIP and state in their own fields.
+    assert (rec.property_address, rec.property_zip, rec.property_state) == (
+        "1 MAIN ST", "99403", "WA")
 
 
 async def test_an_unusable_window_fails_instead_of_guessing(db):

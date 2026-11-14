@@ -1,16 +1,19 @@
-"""Columbia (WA): death_certificate + PACS owner lookup on the recorder, tax connector.
+"""Columbia (WA): death_certificate on the recorder, and the tax connector.
 
 WHY (tasks/columbia-wa-seven.md, owner decisions 2026-11-14):
 - The iDocMarket recorder connector now collects recorded CERTIFICATE OF DEATH as
   death_certificate (IDocMarketScraper), so the connector offers it.
-- Its assessor_url was NULL, so the post-save owner-name lookup never ran for
-  Columbia. It points at the county's PACS portal (pacs.ownership_year names the
-  current roll; the portal cites RCW 42.56 authorization only).
 - Seeds the tax_delinquent connector (ColumbiaWATaxDelinquentScraper, read from the
   pacs_tax_status cache that workers/pacs_tax_crawler fills) INACTIVE: the registry
-  and /scrapers/connectors hide it until the crawl covers >= 95% of the county, as
-  Asotin's (151). Same assessor_url on both rows: the name lookup takes the first
-  active Columbia connector's URL, so it must not depend on which row that is.
+  and /scrapers/connectors hide it until an operator activates it (nothing does that
+  automatically: do it once the crawl covers >= 95% of the county), as Asotin's (151).
+
+NO assessor_url on either row, on purpose: a PACS assessor_url turns on the owner-NAME
+lookup for recorder leads (enrich.py), and the owner decided Columbia gets addresses
+only from its recorded legal description (a matcher still to be built), never from a
+name match alone. The enrichment takes the first active Columbia connector's
+assessor_url, so the tax row must not carry one either. Parcel-keyed mailing for tax
+leads (pacs_parcel, PACS_SITES) does not depend on it.
 
 The recorder row was created outside migrations (production id 57cd7eed...), so a
 fresh database has none and the UPDATE is then a no-op. It is matched by that id AND
@@ -43,10 +46,8 @@ _RECORDER = (f"id = '{_RECORDER_ID}' AND lower(county) = 'columbia' AND lower(st
 def upgrade() -> None:
     op.execute(f"""
         UPDATE county_connectors
-        SET record_types = CASE WHEN record_types::jsonb ? 'death_certificate' THEN record_types
-                                ELSE (record_types::jsonb || '["death_certificate"]'::jsonb)::json END,
-            assessor_url = '{_PACS_URL}'
-        WHERE {_RECORDER}
+        SET record_types = (record_types::jsonb || '["death_certificate"]'::jsonb)::json
+        WHERE {_RECORDER} AND NOT (record_types::jsonb ? 'death_certificate')
     """)
     op.execute(f"""
         INSERT INTO county_connectors (
@@ -54,7 +55,7 @@ def upgrade() -> None:
             base_url, assessor_url, health_status, active
         )
         SELECT '{_TAX_ID}', 'columbia', 'wa', '["tax_delinquent"]',
-               '{_TAX_CLASS}', 'manual', 'static', '{_PACS_URL}', '{_PACS_URL}',
+               '{_TAX_CLASS}', 'manual', 'static', '{_PACS_URL}', NULL,
                'healthy', false
         WHERE NOT EXISTS (
             SELECT 1 FROM county_connectors
@@ -67,8 +68,7 @@ def downgrade() -> None:
     op.execute(f"DELETE FROM county_connectors WHERE id = '{_TAX_ID}'")
     op.execute(f"""
         UPDATE county_connectors
-        SET assessor_url = CASE WHEN assessor_url = '{_PACS_URL}' THEN NULL ELSE assessor_url END,
-            record_types = (
+        SET record_types = (
                 SELECT COALESCE(jsonb_agg(elem ORDER BY ord), '[]'::jsonb)::json
                 FROM jsonb_array_elements_text(record_types::jsonb) WITH ORDINALITY AS t(elem, ord)
                 WHERE elem <> 'death_certificate'

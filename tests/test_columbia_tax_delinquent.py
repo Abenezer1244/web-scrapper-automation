@@ -19,16 +19,20 @@ from src.scrapers.columbia_wa_tax_delinquent import ColumbiaWATaxDelinquentScrap
 from src.scrapers.reliability import ScraperExecutionError
 
 _CLEAN = "DELETE FROM pacs_tax_status WHERE county IN ('columbia', 'asotin')"
+_CLEAN_INV = ("DELETE FROM external_source_health WHERE source_key IN "
+              "('pacs_tax_inventory:columbia', 'pacs_tax_inventory:asotin')")
 
 
 @pytest.fixture
 def db():
     with system_sync_session() as s:
         s.execute(text(_CLEAN))
+        s.execute(text(_CLEAN_INV))
         s.commit()
         yield s
         s.rollback()
         s.execute(text(_CLEAN))
+        s.execute(text(_CLEAN_INV))
         s.commit()
 
 
@@ -40,6 +44,9 @@ def _seed(db, parcel: str, *, situs: str, oldest: int = 2024, county: str = "col
         ":asof, 812.40, :old, 'OWNER REDACTED', :situs, 'PO BOX 1, DAYTON, WA 99328', :chk)"),
         {"c": county, "p": parcel, "asof": date(2026, 11, 14), "old": oldest, "situs": situs,
          "chk": datetime.now(UTC)})
+    from src.scrapers.enrichment.source_health import mark_source_healthy
+
+    mark_source_healthy(db, f"pacs_tax_inventory:{county}")  # the crawl's weekly inventory
 
 
 async def test_only_parcels_with_a_house_numbered_situs_are_delivered(db):
@@ -150,9 +157,9 @@ def test_migration_upgrades_the_recorder_seeds_tax_inactive_and_reverts():
         with system_sync_session() as s:
             rows = {r[0]: r[1:] for r in _connectors(s)}
             assert rows[mig._RECORDER_ID] == ("", '["probate", "pre_foreclosure", "death_certificate"]',
-                                              mig._PACS_URL, True)
+                                              None, True)
             assert rows[_DECOY_ID] == before  # matched by id, never by URL alone
-            assert rows[mig._TAX_ID] == (mig._TAX_CLASS, '["tax_delinquent"]', mig._PACS_URL, False)
+            assert rows[mig._TAX_ID] == (mig._TAX_CLASS, '["tax_delinquent"]', None, False)
         _run(mig.downgrade)
         with system_sync_session() as s:
             assert {r[0]: r[1:] for r in _connectors(s)} == {mig._RECORDER_ID: before, _DECOY_ID: before}
@@ -161,6 +168,16 @@ def test_migration_upgrades_the_recorder_seeds_tax_inactive_and_reverts():
             s.execute(text("DELETE FROM county_connectors WHERE county = 'columbia'"))
             s.commit()
         _run(mig.upgrade)  # leave the database as `alembic upgrade head` did (the tax seed)
+
+
+def test_columbia_never_gets_an_owner_name_lookup():
+    # Owner decision 2026-11-14: Columbia recorder leads get a property only from their
+    # recorded legal description, never from a name match. The name lookup runs only
+    # with a PACS assessor_url (connector row, else this built-in map).
+    from src.scrapers.enrichment.assessor_urls import KNOWN_ASSESSOR_URLS
+
+    assert "columbia_WA" not in KNOWN_ASSESSOR_URLS
+    assert "assessor_url = '" not in _MIG.read_text(encoding="utf-8")
 
 
 def test_a_database_without_the_recorder_row_still_migrates():
@@ -172,3 +189,131 @@ def test_a_database_without_the_recorder_row_still_migrates():
     _run(mig.upgrade)
     with system_sync_session() as s:
         assert [r[0] for r in _connectors(s)] == [mig._TAX_ID]
+
+
+# ─── Final-review fixes: unknown is never "paid", short or stale reads never count ─────
+_FIX = Path(__file__).parent / "fixtures"
+_GEO = "1180050890000"
+_CLEAN_HEALTH = "DELETE FROM external_source_health WHERE source_key = 'pacs_tax_inventory:columbia'"
+
+
+def _detail_page() -> str:
+    return (_FIX / f"columbia_pacs_detail_{_GEO}.html").read_text(encoding="utf-8")
+
+
+def test_a_real_columbia_page_has_statements():
+    from src.scrapers.enrichment import pacs_tax
+
+    answer = pacs_tax.parse_tax(_detail_page(), _GEO)
+    assert answer.outcome == "found" and len(answer.statements) == 2
+
+
+def test_a_statement_table_without_rows_is_unparsed_not_paid():
+    from src.scrapers.enrichment import pacs_tax
+
+    drifted = _detail_page().replace("rowEnd", "rowX")  # the row class renamed
+    assert pacs_tax.parse_tax(drifted, _GEO).outcome == "unparsed"
+
+
+def _layer(n: int, counted: int):
+    feats = [{"attributes": {"ORIG_PARCEL_ID": str(1180050890000 + i)}} for i in range(n)]
+    return lambda url: {"count": counted} if "returnCountOnly" in url else {"features": feats}
+
+
+def test_an_inventory_shorter_than_the_layers_count_fails():
+    from src.workers import pacs_tax_crawler as crawler
+
+    assert len(crawler.statewide_parcel_ids("columbia", _layer(3, 3))) == 3
+    with pytest.raises(ValueError, match="counted 5"):
+        crawler.statewide_parcel_ids("columbia", _layer(3, 5))
+
+
+def test_a_stale_page_is_asked_but_never_settled(db):
+    from src.scrapers.enrichment import pacs_tax
+    from src.workers import pacs_tax_crawler as crawler
+
+    db.execute(text(_CLEAN_HEALTH))
+    now = datetime(2026, 11, 14, 18, 0, tzinfo=UTC)
+
+    def resolve(county, parcel_ids, *, time_budget_s):
+        old = pacs_tax.parse_tax(_detail_page(), _GEO)  # as of 11/14/2026
+        old.as_of = date(2026, 10, 1)                   # the county serving an old snapshot
+        return dict.fromkeys(parcel_ids, old)
+
+    summary = crawler.crawl_county("columbia", db, fetch=_layer(1, 1), resolve=resolve, now=now)
+    assert (summary["asked"], summary["settled"]) == (1, 0)
+    row = db.execute(text("SELECT checked_at, attempted_at FROM pacs_tax_status "
+                          "WHERE county = 'columbia'")).one()
+    assert row.checked_at is None and row.attempted_at is not None
+    db.execute(text(_CLEAN_HEALTH))
+    db.commit()
+
+
+def test_a_crawl_that_learns_nothing_raises_the_silence_alarm(db):
+    from datetime import timedelta
+
+    from src.workers import pacs_tax_crawler as crawler
+
+    db.execute(text(_CLEAN_HEALTH))
+    db.commit()
+    now = datetime.now(UTC)
+    assert crawler.silent_since("columbia", db, now) is None  # no inventory yet: nothing to say
+
+    def unavailable(county, parcel_ids, *, time_budget_s):  # e.g. the year selector vanished
+        from src.scrapers.enrichment import pacs_tax
+        return {pid: pacs_tax.TaxAnswer("source_unavailable") for pid in parcel_ids}
+
+    crawler.crawl_county("columbia", db, fetch=_layer(2, 2), resolve=unavailable, now=now)
+    assert crawler.silent_since("columbia", db, now) is None             # just loaded
+    assert crawler.silent_since("columbia", db, now + timedelta(hours=7)) is not None
+    db.execute(text(_CLEAN_HEALTH))
+    db.commit()
+
+
+async def test_an_inventory_not_refreshed_for_two_weeks_is_not_an_answer(db):
+    from datetime import timedelta
+
+    _seed(db, "1180050890000", situs="500 S 5TH ST, DAYTON, WA 99328")
+    db.execute(text("UPDATE external_source_health SET last_success_at = :t "
+                    "WHERE source_key = 'pacs_tax_inventory:columbia'"),
+               {"t": datetime.now(UTC) - timedelta(days=15)})
+    db.commit()
+    with pytest.raises(ScraperExecutionError, match="inventory"):
+        await ColumbiaWATaxDelinquentScraper().scrape("01/01/2026", "11/14/2026")
+
+
+def _layer_with_ids(ids: list[str]):
+    feats = [{"attributes": {"ORIG_PARCEL_ID": i}} for i in ids]
+    return lambda url: {"count": len(feats)} if "returnCountOnly" in url else {"features": feats}
+
+
+def test_blank_and_duplicate_features_are_handled_explicitly():
+    from src.workers import pacs_tax_crawler as crawler
+
+    # The live shape: duplicates for multi-part parcels, a few features with no id.
+    ids = [str(1180050890000 + i) for i in range(200)] + ["1180050890000", None]
+    assert len(crawler.statewide_parcel_ids("columbia", _layer_with_ids(ids))) == 200
+    # A renamed or emptied id field: most features blank, never a smaller inventory.
+    with pytest.raises(ValueError, match="no parcel id"):
+        crawler.statewide_parcel_ids("columbia", _layer_with_ids(["1180050890000"] + [None] * 9))
+
+
+def test_an_empty_inventory_fails_and_keeps_the_last_heartbeat(db):
+    from src.scrapers.enrichment.source_health import get_source_state, mark_source_healthy
+    from src.workers import pacs_tax_crawler as crawler
+
+    with pytest.raises(ValueError, match="no parcels"):
+        crawler.statewide_parcel_ids("columbia", _layer_with_ids([]))
+    mark_source_healthy(db, "pacs_tax_inventory:columbia")
+    db.commit()
+    before = get_source_state(db, "pacs_tax_inventory:columbia")["last_success_at"]
+    # A refresh that is due (8 days later) and reads an empty layer: the run fails and
+    # the heartbeat does not move, so the 14-day reader gate still expires on time.
+    from datetime import timedelta
+
+    later = datetime.now(UTC) + timedelta(days=8)
+    with pytest.raises(ValueError):
+        crawler.crawl_county("columbia", db, fetch=_layer_with_ids([]),
+                             resolve=lambda *a, **k: {}, now=later)
+    db.rollback()
+    assert get_source_state(db, "pacs_tax_inventory:columbia")["last_success_at"] == before

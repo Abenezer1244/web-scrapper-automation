@@ -106,7 +106,19 @@ class AsotinWATaxDelinquentScraper(BridgeScraper):
         since = datetime.now(UTC) - _FRESH
         county = self.COUNTY
         scope = (PacsTaxStatus.county == county, PacsTaxStatus.state == _STATE)
+        from src.scrapers.enrichment.source_health import get_source_state
+        from src.workers.pacs_tax_crawler import INVENTORY_KEY, INVENTORY_MAX_AGE
+
         with system_sync_session() as db:
+            # Coverage is measured against the cached inventory, so that inventory must
+            # itself be current: a refresh failing for weeks would otherwise go unseen.
+            inv = (get_source_state(db, INVENTORY_KEY(county)) or {}).get("last_success_at")
+            if inv is None or datetime.now(UTC) - inv > INVENTORY_MAX_AGE:
+                raise ScraperExecutionError(
+                    county, "pacs_tax_inventory",
+                    f"the parcel inventory was last refreshed {inv or 'never'}; "
+                    f"refusing to measure coverage against it", record_type=RECORD_TYPE,
+                )
             total = db.execute(select(func.count()).select_from(PacsTaxStatus)
                                .where(*scope)).scalar_one()
             fresh = db.execute(select(func.count()).select_from(PacsTaxStatus)

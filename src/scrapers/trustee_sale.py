@@ -218,6 +218,19 @@ def _record_from_notice(notice: NtsNotice) -> ScrapedRecord:
     return rec
 
 
+def _named_leads(records: list[ScrapedRecord], county: str) -> list[ScrapedRecord]:
+    """The leads that name their owner. A notice whose grantor was not read is held,
+    never delivered as an anonymous auction lead; it stays in nts_notices, so the
+    pre_foreclosure matcher still dates that property's lead."""
+    held = [r for r in records if not r.party_name]
+    if held:
+        _logger.warning(
+            "trustee_sale %s: %d auction lead(s) held, no owner name read from the notice: parcels %s",
+            county, len(held), ", ".join(r.parcel_id or "?" for r in held),
+        )
+    return [r for r in records if r.party_name]
+
+
 class _TrusteeSaleScraper(BridgeScraper):
     """Base: read active, future-dated NTS notices for ``COUNTY`` into leads.
 
@@ -321,7 +334,7 @@ class _TrusteeSaleScraper(BridgeScraper):
                 self.COUNTY, beyond, span, horizon,
             )
 
-        records = [_record_from_notice(n) for n in notices]
+        records = _named_leads([_record_from_notice(n) for n in notices], self.COUNTY)
         stale = cache_staleness_reason(
             (heartbeat or {}).get("last_success_at"), last_fetched_at, datetime.now(UTC)
         ) or source_gap

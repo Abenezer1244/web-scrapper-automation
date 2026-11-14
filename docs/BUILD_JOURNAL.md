@@ -19,6 +19,52 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-11-13/14 — Clallam goes live; one tax canary failure; retry fix (#630)
+
+**Built / Shipped:** The owner restored the Railway plan. The 2026-11-13 deploy took production from
+alembic 139 to 157 (Asotin, Clallam, Benton, Chelan). Clallam rows checked: recorder `3c1dc2fe`
+now probate + pre_foreclosure + death_certificate, and the tax connector `7c1a1a2e…0140` was created.
+With owner approval, ran one canary for the tax connector (healthy, 8 records) and one manual
+pre_foreclosure run on the only Clallam customer config, through the same `enqueue_scrape_job`
+path as Run now (job `d34d83ad`, 08/15–11/13: 15 found, 13 new and billed, 0 degradations). All
+10 delivered trustee-sale notices were looked up again in the recorder: none discontinued, and a
+known-discontinued control (2026-1484470) was detected. PR #630 (`b5b025b0`): per-parcel PACS
+portal reads retry on transient failures only. Railway auto-deployed it; canary healthy after.
+
+**Failed / Blocked:** A rerun of the tax canary on 2026-11-14 (about 00:50 UTC) failed with
+`ValueError`. It marked the connector `down`, hid it from customers, and sent an ops alert. The
+next manual scrape and the next canary passed with 8 records. **Root cause not found.** The canary
+logs the exception class only (Codex P2: scraper messages can carry page content), and the
+container's file log was lost when the worker was redeployed. What I ruled out:
+- The as-of check: the portal's date is the Pacific calendar date, 0–1 days behind UTC, inside 0–3.
+- The landing page: its DocumentCenter links are unchanged since the 11-12 capture.
+- Network errors: they surface as `requests` classes, not `ValueError`.
+- A repeat: 12 rounds of every step from the production worker (landing, PDF, 8 portal pages,
+  record build; about 120 reads) produced 0 failures.
+
+What remains as candidates, all intermittent and all raising `ValueError`:
+- a portal page with no tax table (now retried by #630);
+- the certificate link returning non-PDF content, or a redirect that is refused (not retried);
+- a portal page variant that fails the owner or as-of check in `build_record` (not retried).
+
+**Tried / Decided:** Retry only what can be transient. An integrity failure (duplicate
+statement, unreadable amount) or an SSRF refusal must stay fatal, so that a later clean page
+cannot hide it (Codex Medium). Retry logs carry PID + class only; Codex rated logging `str(exc)`
+High because the parse errors embed table cells and headers.
+
+**Pending / Handoff:** Make the next failure diagnosable. Proposal: the canary also logs the raise
+site of the exception (file:line:function from the innermost traceback frame). That is safe for
+PII and pinpoints the cause for any scraper. Not built yet; needs owner approval. The canary samples
+5 of 59 (connector, type) pairs per hour, so a new connector can stay `unknown` for many hours.
+A `down` flip has no matching recovery alert.
+
+**Facts learned:** Railway auto-deploys api/worker/beat on a push to main. Production one-off
+scripts: `railway ssh --service worker -- sh -c "echo <b64> | base64 -d > /tmp/x.py &&
+PYTHONPATH=/app python /tmp/x.py"`. The worker's DB role is RLS-scoped (set
+`app.current_user_id`). The worker's R2 key cannot `GetObject`.
+
+---
+
 ## 2026-11-12 — Chelan: why it never delivered a lead, and the seven-type audit (branch `feat/chelan-seven-record-types`)
 
 **Built / Shipped (branch only, not pushed):** `06b9ede4` AcclaimWeb reads every row of every search

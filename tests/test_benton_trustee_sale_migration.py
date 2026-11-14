@@ -87,5 +87,6 @@ def test_the_finalizer_never_restores_a_cancelled_sale():
     assert "n.cancelled_at IS NOT NULL" in inspect.getsource(fin)
     assert "take_nts_cancel_lock_shared(db)" in inspect.getsource(fin.finalize_trustee_sale_job)
     import src.workers.nts_crawler as crawler
-    src = inspect.getsource(crawler.crawl_nts_benton_recorder)
+    assert "_cancel_notices(" in inspect.getsource(crawler.crawl_nts_benton_recorder)
+    src = inspect.getsource(crawler._cancel_notices)
     assert src.index("pg_advisory_xact_lock(") < src.index("UPDATE nts_notices SET cancelled_at")

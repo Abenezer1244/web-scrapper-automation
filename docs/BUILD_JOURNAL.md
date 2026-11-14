@@ -19,6 +19,45 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-11-14 — Clark: why Auction leads were always empty, and silent window loss in the recorder (branch `feat/clark-wa-seven-record-types`)
+
+**Built / Shipped (branch only, not pushed):** `5c84374b` the Clark LandmarkWeb scraper proves each
+window complete: the results header must echo the submitted doc types (as a set) and dates, the
+distinct document ids read across pages must equal the full count (Show Count, else a numeric
+"records of N", else retry), and zero needs the portal's own "No results." row. `7a60462d` Clark
+`trustee_sale` held via a new `SourceUnavailableError` (fixed customer text, permanent, unbilled;
+the worker shows that text). `87bfbe18` Clark `death_certificate` (code 62), connector unchanged.
+`c163c7bf` Celery time limits escape every Clark catch-all; non-numeric row ids fail. Plan, matrix,
+activation steps: `tasks/clark-wa-seven.md`.
+
+**Tried / Decided:** Auction leads root cause is the SOURCE, not code: The Columbian's legal-notice
+listing had 0 trustee sales of 21 ads (2 Clark notices ever), while the recorder records ~29 a month
+as free "Unofficial Copy" raster images. Owner chose hold now, OCR later on Chelan's review pipeline
+(not duplicated here: it owns migrations 158-159 and the staging table). death_certificate built
+dark. tax_delinquent (no county list), code_violation (county map layer metadata: "not subject to
+public disclosure", no dump) and divorce (AOC dissemination policy bars commercial solicitation) are
+documented as blocked; nothing built.
+
+**Failed / Blocked:** the worker-level hold test needs the real test DB, which is not available on
+this laptop (CI only). No Playwright UI QA: no frontend change, and it is only meaningful after a
+deploy.
+
+**Caught & fixed:** five ways a Clark run finished DONE with a window's leads silently missing (chunk
+`except: continue`, render timeout read as zero, pagination errors ending the read, wrapper table
+parsed, no total check). Codex gates: Phase 1 FAIL (header fallback could certify a 500-row first
+page; any empty cell accepted as zero), Phase 2 FAIL (hold text never reached users; fixture leaked
+rows), final NO-GO (cap, time limits, contract tests, rollout). All fixed or refuted by
+measurement, final GO.
+
+**Pending / Handoff:** owner: PR, deploy (api, worker, beat; no migration), then optionally add
+`death_certificate` to connector `70bb5315`. Canary will mark Clark Auction leads `down` once (one ops
+alert) and hide it from the picker: expected. Clark OCR trustee_sale after `feat/chelan-nts-ocr`.
+
+**Facts learned:** Clark LandmarkWeb loads 500 rows per page and the header then reads "Returned 500
+records of" with a BLANK total; only "Show Count" gives it (3,885 read over 8 pages, no cap seen).
+Rows are `tr#doc_<documentId>_<row>`. Death certificates are indexed Decedent / "PUBLIC". Clark
+recorder PIDs come out 6-10 digits (9 = PAN); not normalized.
+
 ## 2026-11-12 — Chelan: why it never delivered a lead, and the seven-type audit (branch `feat/chelan-seven-record-types`)
 
 **Built / Shipped (branch only, not pushed):** `06b9ede4` AcclaimWeb reads every row of every search

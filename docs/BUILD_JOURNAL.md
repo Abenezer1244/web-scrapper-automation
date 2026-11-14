@@ -19,6 +19,74 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-11-14 — Benton live: UI check, owner/sale-date fix (#629), canary priority (#634)
+
+**Built / Shipped:** After the owner restored the Railway plan, deployed migrations 154–156. Ran
+the first Benton recorder crawl on the prod worker: 42 notices read, 0 failed, 33 stored. Turned on
+Benton tax_delinquent and trustee_sale, and added death_certificate to Benton's recorder row. A live
+run through the UI (Benton Auction Leads, skip trace off) delivered 18 leads; one had no owner name.
+- **#629** (`5ea0ecdb`) `nts_benton_recorder.py`:
+  - reads `Grantor NAME` with no colon (same line only);
+  - skips a grantor that names the trustee, beneficiary or servicer (cover sheets list the recording party as "Grantor(s)");
+  - falls back to `Original Mortgagor(s):`, `from X, as Grantor` and `executed by X as Trustor`;
+  - reads the Section V restated sale date (`... encumbrances on <date>`) when Section I is unreadable; two readable dates that disagree give none.
+  
+  `trustee_sale._named_leads` now holds any auction lead with no owner name (all counties).
+  Re-crawl: 29 upcoming (was 25) and 0 notices without an owner. A UI re-run delivered 21 leads, all
+  with owner and date.
+- **#634** (`fcca88c0`) `_canary_units`: never-certified connectors (`last_checked` NULL or
+  `unknown`) are probed first, one type each, capped at `k - CANARY_ROUTINE_SLOTS`. Benton tax had sat
+  ~22h hidden from customers waiting for the random rotation. It went healthy at the first tick after
+  deploy (22:17 UTC); the UI now offers all 5 Benton types.
+- Data fixes:
+  - `nts_notices` REC-2026-014784, past and inactive: grantor changed from Wells Fargo to the parsed owner.
+  - One result from the owner's own test run: U.S. Bank changed to Alvin L Whitish.
+- Test fix: `test_auction_coverage` read its clock at import while the endpoint reads it per
+  request, so a ~40-minute CI run crossing midnight UTC moved the boundary cases by a day. Each row
+  now reads the clock when it is built.
+
+**Tried / Decided:**
+- **Sale dates.** A date was never repaired by OCR guessing ("FebruaryS" → 5). The statute's own
+  restatement is read instead.
+- **Stale owner row.** Fixed with a targeted one-row update, not a 200-day re-crawl. Codex: a wider
+  crawl stamps more cancellations, and COALESCE keeps the old grantor whenever a parse returns NULL.
+- **Railway config.** `railway config migrate` was NOT run. #538 (2026-10-25) had already moved build
+  and start settings to the dashboard and deliberately rejected the IaC file: it owns each service's
+  whole variable set. The "Config as Code is deprecated" warning came only from an untracked leftover
+  `railway.toml` in the main checkout (identical to `c939bb84^`), which was deleted. Today's three
+  GitHub deploys booted correctly without it.
+
+**Failed / Blocked:**
+- The auto-mode classifier blocked `railway ssh` crawl runs, `git push`, PR merges and a
+  browser-driver helper until the owner explicitly asked for them. The owner pushed and merged #634
+  themselves.
+- `test_auction_coverage` and other endpoint tests fail locally with 503 (auth needs Redis). They run
+  in CI only.
+- Still blocked in Benton:
+  - code_violation: no public case search.
+  - divorce: GR 31, and no Dissolution recordings.
+
+**Caught & fixed:** Codex on #629 found:
+- High: wrapped or colonless trustee names were not excluded;
+- High: a bare `Grantor` line took the next field as the owner;
+- Medium: wrapped borrower fallbacks were cut short.
+
+All three were fixed with tests; the re-review passed. Codex on #634 (consult): a NULL-first queue
+could starve the rotation, so 2 slots stay reserved and pending connectors stay out of the routine
+pool. A test then caught the routine pool still drawing pending connectors' other types.
+
+**Pending / Handoff:** Benton tax lists 3 parcels for the 11/16 and 11/19 GovEase sales. After the
+sales it may return few or no leads until the Treasurer posts a new listing; the canary will mark
+it `degraded` and alert.
+
+**Facts learned:**
+- On Benton notices, a cover sheet's "Grantor(s)" is the recording party.
+- Every RCW 61.24.040 notice restates the sale date in Section V.
+- The canary's random 5-of-N rotation made new connectors invisible for a day or more.
+- Deleting a scraper sets `scraper_configs.active=false`, so its jobs and results are kept.
+
+---
+
 ## 2026-11-13/14 — Clallam goes live; one tax canary failure; retry fix (#630)
 
 **Built / Shipped:** The owner restored the Railway plan. The 2026-11-13 deploy took production from

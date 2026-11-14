@@ -202,10 +202,23 @@ def name_matches(notice: NoticeName, owner: Person) -> bool:
             and _middles_ok(list(notice.tokens[1:-k]), owner.middle.split()))
 
 
-def _addressee_people(attrs: dict) -> list[Person]:
+def _natural_same(rep: NoticeName, other: NoticeName) -> bool:
+    """Two natural-order names are the same person: same words in order (an initial
+    agrees with a name starting with it) and the same suffix. No surname is assumed."""
+    if rep.suffix != other.suffix or len(rep.tokens) != len(other.tokens):
+        return False
+    if rep.tokens[0] != other.tokens[0] or rep.tokens[-1] != other.tokens[-1]:
+        return False
+    return _middles_ok(list(rep.tokens[1:-1]), list(other.tokens[1:-1]))
+
+
+def _addressees(attrs: dict) -> tuple[list[Person], list[NoticeName]]:
     """People named on the parcel besides the owners: 'C/O <name>' in the NAME or the
-    billing lines, and a billing line in 'LAST, FIRST' form. Street lines name nobody."""
+    billing lines, and billing addressee lines. Comma-order lines are read like owners;
+    natural-order ones are kept whole (their surname boundary is unknown). Street lines
+    and organizations name nobody."""
     people: list[Person] = []
+    natural: list[NoticeName] = []
     name = _clean(attrs.get("NAME")).upper()
     lines = [name.split("C/O", 1)[1]] if "C/O" in name else []
     for key in ("BILLING1", "BILLING2"):
@@ -216,13 +229,15 @@ def _addressee_people(attrs: dict) -> list[Person]:
     for ln in lines:
         if ln.startswith("C/O"):
             ln = ln[3:]
+        if _CORPORATE.search(ln):
+            continue
         if "," in ln:
             people += owner_people(ln)
         else:
             given, suffix = _given_names(ln)
             if len(given) >= 2:
-                people.append(Person(given[0], " ".join(given[1:-1]), given[-1], suffix))
-    return people
+                natural.append(NoticeName(tuple(given), suffix))
+    return people, natural
 
 
 def _clean(value: object) -> str:
@@ -259,8 +274,10 @@ def _billing_is_claims(attrs: dict, claims_address: str | None) -> bool:
     claims = _norm_address(claims_address)
     street = _norm_address(parts[0])
     zipm = re.search(r"\b(\d{5})(?: \d{4})?$", claims)
+    # The whole street line, not followed by a unit the billing line does not have.
     return bool(zipm and zipm.group(1) == parts[3] and street
-                and re.search(rf"(?:^| ){re.escape(street)}(?: |$)", claims))
+                and re.search(rf"(?:^| ){re.escape(street)}(?= (?!APT\b|STE\b|UNIT\b|NO\b|\d)|$)",
+                              claims))
 
 
 def _estate_marked(segment: str) -> bool:
@@ -268,15 +285,19 @@ def _estate_marked(segment: str) -> bool:
     return bool(_ESTATE_MARK.search(_NOT_DECEDENT_ESTATE.sub(" ", text)))
 
 
-def _ties(attrs: dict, decedent_segments: list[str], decedent: NoticeName,
+def _ties(attrs: dict, decedent_owners: list[tuple[Person, str]],
           reps: list[NoticeName], claims_address: str | None) -> list[str]:
     out = []
-    if any(_estate_marked(seg) for seg in decedent_segments):
+    if any(_estate_marked(seg) for _, seg in decedent_owners):
         out.append("estate_marked")
-    on_parcel = owner_people(_clean(attrs.get("NAME"))) + _addressee_people(attrs)
-    if any(name_matches(r, p) for r in reps for p in on_parcel):
+    people, natural = _addressees(attrs)
+    people += owner_people(_clean(attrs.get("NAME")))
+    if any(name_matches(r, p) for r in reps for p in people) or any(
+            _natural_same(r, n) for r in reps for n in natural):
         out.append("rep_on_parcel")
-    if any(r.last == decedent.last for r in reps):
+    # The decedent's WHOLE surname as the record holds it ("DE LA CRUZ", not "CRUZ").
+    surnames = {tuple(p.last.split()) for p, _ in decedent_owners}
+    if any(len(r.tokens) > len(sn) and r.tokens[-len(sn):] == sn for r in reps for sn in surnames):
         out.append("rep_shares_surname")
     if _billing_is_claims(attrs, claims_address):
         out.append("billing_is_claims_address")
@@ -292,11 +313,12 @@ def match_estate(decedent_name: str, personal_reps: tuple[str, ...] | list[str],
         result.held.append("decedent_name_unreadable")
         return result
     reps = [n for n in (notice_name(r) for r in personal_reps) if n is not None]
-    matched: list[tuple[dict, list[str]]] = []
+    matched: list[tuple[dict, list[tuple[Person, str]]]] = []
     for a in rows:
-        segs = [seg for p, seg in owner_segments(_clean(a.get("NAME"))) if name_matches(decedent, p)]
-        if segs:
-            matched.append((a, segs))
+        owners = [(p, seg) for p, seg in owner_segments(_clean(a.get("NAME")))
+                  if name_matches(decedent, p)]
+        if owners:
+            matched.append((a, owners))
     result.name_matched = len(matched)
     if not matched:
         result.held.append("no_parcel_in_decedents_name")
@@ -304,8 +326,8 @@ def match_estate(decedent_name: str, personal_reps: tuple[str, ...] | list[str],
     if len({m for m in (mailing_of(a) for a, _ in matched) if m}) > 1:
         result.held.append("matched_parcels_billed_to_different_addresses")
         return result
-    for a, segs in matched:
-        ties = _ties(a, segs, decedent, reps, claims_address)
+    for a, owners in matched:
+        ties = _ties(a, owners, reps, claims_address)
         if not ties:
             result.held.append("no_family_tie")
             continue
@@ -344,7 +366,10 @@ def parse_layer_response(data: object) -> list[dict]:
     rows = []
     for f in features:
         attrs = f.get("attributes") if isinstance(f, dict) else None
-        if not isinstance(attrs, dict) or "NAME" not in attrs or "PARCEL_ID" not in attrs:
+        if (not isinstance(attrs, dict) or not isinstance(attrs.get("NAME"), str)
+                or not isinstance(attrs.get("PARCEL_ID"), str)
+                or any(isinstance(v, bool) or not isinstance(v, (str, int, float, type(None)))
+                       for v in attrs.values())):
             raise LayerError("layer answered a malformed feature")
         rows.append(attrs)
     return rows

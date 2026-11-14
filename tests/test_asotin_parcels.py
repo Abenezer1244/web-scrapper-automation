@@ -197,3 +197,40 @@ def test_layer_answers():
                 [], "x"):
         with pytest.raises(LayerError):
             parse_layer_response(bad)
+
+
+# ── regressions from the Phase 1 Codex re-review ─────────────────────────────
+
+def test_claims_address_with_a_unit_is_another_address():
+    m = match_estate("NOEL HERRERA, JR.", ("SAM K. LEE",), "401 Elm St Apt 9, Clarkston, WA 99403",
+                     [dict(_row("HERRERA"), ZIP="99403")])
+    assert m.held == ["no_family_tie"]
+
+
+def test_compound_surname_tie_needs_the_whole_surname():
+    row = dict(_row("HOLLOWAY"), NAME="DE LA CRUZ, MARIA")
+    assert match_estate("MARIA DE LA CRUZ", ("BOB CRUZ",), None, [row]).held == ["no_family_tie"]
+    assert match_estate("MARIA DE LA CRUZ", ("ANA DE LA CRUZ",), None, [row]).leads[0].ties == (
+        "rep_shares_surname",)
+
+
+def test_organization_addressee_is_not_a_representative():
+    row = dict(_row("HOLLOWAY"), BILLING1="C/O ACME LLC", BILLING2="2300 RIVERVIEW BLVD")
+    assert match_estate("MARGARET J. HOLLOWAY", ("ACME LLC",), None, [row]).held == ["no_family_tie"]
+
+
+def test_natural_order_addressee_keeps_a_compound_surname():
+    row = dict(_row("HOLLOWAY"), BILLING1="C/O ANA DE LA CRUZ", BILLING2="2300 RIVERVIEW BLVD")
+    assert match_estate("MARGARET J. HOLLOWAY", ("ANA DE LA CRUZ",), None, [row]).leads[0].ties == (
+        "rep_on_parcel",)
+
+
+def test_wrongly_typed_layer_values_are_a_failed_answer():
+    import pytest
+
+    from src.scrapers.enrichment.asotin_parcels import LayerError, parse_layer_response
+
+    for bad in (dict(_ROWS[0], NAME=None), dict(_ROWS[0], PARCEL_ID=10412300600050000),
+                dict(_ROWS[0], CITY={"x": 1}), dict(_ROWS[0], ZIP=True)):
+        with pytest.raises(LayerError):
+            parse_layer_response({"features": [{"attributes": bad}]})

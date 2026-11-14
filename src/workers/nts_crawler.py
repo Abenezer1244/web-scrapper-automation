@@ -1203,34 +1203,9 @@ def crawl_nts_benton_recorder() -> dict:
             _upsert_notice(db, NtsNotice, row)
             summary["upserted"] += 1
         if cancelled:
-            keys = [rec.ts_key(i) for i in sorted(cancelled)]
             # Applied to every stored notice the discontinuances name, whether or not
             # its own image was read today; cancelled_at is never cleared (Codex P1).
-            # Exclusive against the matcher/finalizer's shared lock (NTS_CANCEL_LOCK_KEY).
-            from src.workers.nts_matcher_task import NTS_CANCEL_LOCK_KEY
-
-            db.execute(_sa_text("SELECT pg_advisory_xact_lock(:k)"), {"k": NTS_CANCEL_LOCK_KEY})
-            res = db.execute(
-                _sa_text("UPDATE nts_notices SET cancelled_at = COALESCE(cancelled_at, now()), is_active = false "
-                         "WHERE source = :source AND ts_number = ANY(:keys)"),
-                {"source": rec.SOURCE, "keys": keys},
-            )
-            # Leads already stamped with a now-cancelled sale stop showing it, so the
-            # matcher can attach a replacement notice (Codex P1). A later statement, so
-            # its snapshot sees an attachment that committed while we waited.
-            db.execute(
-                _sa_text("""
-                    UPDATE results SET auction_date = NULL, default_amount = NULL,
-                        nts_match_confidence = NULL, nts_notice_id = NULL,
-                        enrichment_data = (CASE WHEN jsonb_typeof(enrichment_data::jsonb) = 'object'
-                                                THEN enrichment_data::jsonb - 'nts'
-                                                ELSE enrichment_data::jsonb END)
-                    WHERE nts_notice_id IN (
-                        SELECT id FROM nts_notices WHERE source = :source AND ts_number = ANY(:keys))
-                """),
-                {"source": rec.SOURCE, "keys": keys},
-            )
-            summary["cancelled"] = res.rowcount
+            summary["cancelled"] = _cancel_notices(db, rec.SOURCE, [rec.ts_key(i) for i in sorted(cancelled)])
         db.commit()
         # Fresh only when the source was actually read: some notice parsed, or the
         # window conclusively held none (Codex P2).
@@ -1240,6 +1215,36 @@ def crawl_nts_benton_recorder() -> dict:
                            errored=summary["errored"])
     _logger.info("Benton recorder NTS crawl: %s", summary)
     return summary
+
+
+def _cancel_notices(db, source: str, keys: list[str]) -> int:
+    """The sales these notices announced are off (a recorded discontinuance, or a
+    later notice that replaces them): cancelled_at set once and never cleared, inactive,
+    and leads already stamped with them cleared so the matcher can attach a live notice
+    (Codex P1). Exclusive against the matcher/finalizer's shared NTS_CANCEL_LOCK_KEY
+    (re-entrant within one transaction). Returns the notices changed. Caller commits."""
+    from src.workers.nts_matcher_task import NTS_CANCEL_LOCK_KEY
+
+    db.execute(_sa_text("SELECT pg_advisory_xact_lock(:k)"), {"k": NTS_CANCEL_LOCK_KEY})
+    res = db.execute(
+        _sa_text("UPDATE nts_notices SET cancelled_at = COALESCE(cancelled_at, now()), is_active = false "
+                 "WHERE source = :source AND ts_number = ANY(:keys)"),
+        {"source": source, "keys": keys},
+    )
+    # A later statement, so its snapshot sees an attachment that committed while we waited.
+    db.execute(
+        _sa_text("""
+            UPDATE results SET auction_date = NULL, default_amount = NULL,
+                nts_match_confidence = NULL, nts_notice_id = NULL,
+                enrichment_data = (CASE WHEN jsonb_typeof(enrichment_data::jsonb) = 'object'
+                                        THEN enrichment_data::jsonb - 'nts'
+                                        ELSE enrichment_data::jsonb END)
+            WHERE nts_notice_id IN (
+                SELECT id FROM nts_notices WHERE source = :source AND ts_number = ANY(:keys))
+        """),
+        {"source": source, "keys": keys},
+    )
+    return res.rowcount or 0
 
 
 def _td_days(days: int):
@@ -1363,6 +1368,179 @@ def purge_nts_recorder_staging() -> int:
     if n:
         _logger.info("NTS recorder staging: %d unreviewed notices expired", n)
     return n
+
+
+# ── operator review: a staged recording becomes a notice only on approval (4a-3a) ──
+CHELAN_RECORDER_SOURCE = "chelan_recorder"
+_AMOUNT_BASES = ("principal", "sum_owing")   # migration 128's CHECK
+_AMOUNT_MAX = 10 ** 10                       # nts_notices.principal_owing is Numeric(12, 2)
+# Fixed codes, not free text: a typed reason could carry the borrower's name past the
+# point where the OCR text is dropped (Codex).
+REJECT_REASONS = ("not_a_trustee_sale_notice", "unreadable", "sale_not_confirmable",
+                  "wrong_property", "duplicate_recording")
+
+
+class ReviewError(ValueError):
+    """An approval or rejection the staged row's state or the reviewer's input forbids."""
+
+
+def _recorder_doc_for_review(db, doc_id: str):
+    from sqlalchemy import select
+
+    from src.db.models import NtsRecorderDocument as Doc
+
+    doc = db.execute(select(Doc).where(Doc.id == doc_id).with_for_update()).scalar_one_or_none()
+    if doc is None:
+        raise ReviewError("no staged document with that id")
+    if doc.status != "pending_review":
+        raise ReviewError(f"the document is {doc.status}, not pending review")
+    if (doc.county, doc.state) != ("chelan", "WA"):
+        raise ReviewError("only Chelan County recordings are reviewed here")
+    return doc
+
+
+def _recording_facts(doc) -> dict:
+    f = doc.fields or {}
+    return {"recording_apns": f.get("recording_apns"), "related_deeds_of_trust": f.get("related_deeds_of_trust")}
+
+
+def approve_recorder_document(db, doc_id: str, *, reviewer: str, values: dict,
+                              supersedes: str | None = None, independent: bool = False,
+                              today=None) -> str:
+    """The operator has compared the staged read with the recorded image: write the
+    notice they confirmed. Returns the nts_notices id. Caller commits.
+
+    ``values`` are what the reviewer read off the image: auction_date (date), parcel
+    and grantor are required; auction_time, property_address, principal_owing (Decimal)
+    with principal_owing_basis, trustee and beneficiary are optional. The parcel must be
+    one of the recording's own APNs. The grantor goes through the privacy gate into
+    nts_notices only, never into staging.
+
+    A later notice for the same sale is linked EXPLICITLY (``supersedes``: the older
+    approved recording's instrument number), never inferred: one deed of trust can carry
+    successive foreclosures (Codex P1). While another approved, live notice shares this
+    recording's deed of trust, approval refuses until the reviewer says which it is.
+    The whole decision holds NTS_CANCEL_LOCK_KEY, so two approvals cannot both win.
+    """
+    import hashlib
+    from decimal import Decimal
+
+    from sqlalchemy import select
+
+    from src.db.models import NtsNotice
+    from src.db.models import NtsRecorderDocument as Doc
+    from src.utils.address_intel import address_match_key
+    from src.workers.nts_matcher_task import NTS_CANCEL_LOCK_KEY
+
+    if supersedes and independent:
+        raise ReviewError("--supersedes and --independent contradict each other")
+    db.execute(_sa_text("SELECT pg_advisory_xact_lock(:k)"), {"k": NTS_CANCEL_LOCK_KEY})
+    doc = _recorder_doc_for_review(db, doc_id)
+    today = today or datetime.now(UTC).date()
+
+    parcel = (values.get("parcel") or "").strip()
+    if parcel not in (_recording_facts(doc)["recording_apns"] or []):
+        raise ReviewError("the parcel is not one of this recording's own APNs")
+    auction = values.get("auction_date")
+    if auction is None:
+        raise ReviewError("a sale date is required")
+    grantor = " ".join((values.get("grantor") or "").split())
+    if not grantor:
+        raise ReviewError("the grantor (borrower) read off the image is required")
+    amount, basis = values.get("principal_owing"), values.get("principal_owing_basis")
+    if (amount is None) != (basis is None):
+        raise ReviewError("an amount needs its basis and a basis needs its amount")
+    if amount is not None and not (
+            basis in _AMOUNT_BASES and isinstance(amount, Decimal) and amount.is_finite()
+            and 0 < amount < _AMOUNT_MAX and amount == amount.quantize(Decimal("0.01"))):
+        raise ReviewError(f"the amount must be a positive dollar amount (cents at most) "
+                          f"and its basis one of {_AMOUNT_BASES}")
+
+    def _key(instrument: str) -> str:
+        return f"REC-{instrument}"
+
+    live_approved = (
+        select(Doc).join(NtsNotice, NtsNotice.id == Doc.nts_notice_id)
+        .where(Doc.county == doc.county, Doc.state == doc.state, Doc.status == "approved",
+               NtsNotice.cancelled_at.is_(None))
+    )
+    target = None
+    if supersedes:
+        target = db.execute(live_approved.where(Doc.instrument_number == supersedes)
+                            .with_for_update(of=Doc)).scalar_one_or_none()
+        if target is None:
+            raise ReviewError("--supersedes names no approved, live notice")
+        def _order(d):  # recorded later = newer; same day: the higher instrument number
+            return (d.record_date, int(d.instrument_number) if d.instrument_number.isdigit() else -1)
+
+        if _order(target) >= _order(doc):
+            raise ReviewError("a notice can only supersede an earlier recording")
+    elif not independent:
+        # Every deed of trust the recording cites, not only a single one (Codex High).
+        dts = set(_recording_facts(doc)["related_deeds_of_trust"] or [])
+        same_dt = [d for d in db.execute(live_approved).scalars()
+                   if dts & set(_recording_facts(d)["related_deeds_of_trust"] or [])]
+        if same_dt:
+            raise ReviewError(
+                "approved notice(s) " + ", ".join(sorted(d.instrument_number for d in same_dt))
+                + " share this deed of trust: pass --supersedes <instrument> or --independent")
+
+    key = _key(doc.instrument_number)
+    already_cancelled = db.execute(
+        select(NtsNotice.cancelled_at).where(NtsNotice.source == CHELAN_RECORDER_SOURCE,
+                                             NtsNotice.ts_number == key)).scalar()
+    addr = " ".join((values.get("property_address") or "").split())[:512] or None
+    approved = {
+        "auction_date": auction.isoformat(), "parcel": parcel,
+        "auction_time": (values.get("auction_time") or None),
+        "property_address": addr,
+        "principal_owing": None if amount is None else str(amount),
+        "principal_owing_basis": basis,
+        "trustee": (values.get("trustee") or None), "beneficiary": (values.get("beneficiary") or None),
+    }
+    payload = "|".join(str(v or "") for v in (doc.instrument_number, *approved.values()))
+    now = datetime.now(UTC)
+    _upsert_notice(db, NtsNotice, {
+        "source": CHELAN_RECORDER_SOURCE, "ts_number": key, "county": "chelan", "state": "WA",
+        "parcel": parcel, "property_address": addr,
+        "property_address_normalized": (address_match_key(addr) or None) if addr else None,
+        "auction_date": auction, "auction_time": (approved["auction_time"] or "")[:16] or None,
+        "auction_location": None, "grantor": grantor[:512],
+        "trustee": (approved["trustee"] or "")[:255] or None,
+        "beneficiary": (approved["beneficiary"] or "")[:255] or None,
+        "principal_owing": amount, "principal_owing_basis": basis,
+        "note_amount": None, "nod_date": None,
+        "source_url": f"{_CHELAN_RECORDER}/details/documentdetails/{doc.transaction_item_id}/1/1/11",
+        "raw_hash": hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+        "is_active": auction >= today and already_cancelled is None,
+        "fetched_at": now,
+    })
+    notice_id = db.execute(select(NtsNotice.id).where(NtsNotice.source == CHELAN_RECORDER_SOURCE,
+                                                      NtsNotice.ts_number == key)).scalar_one()
+    if target is not None:
+        _cancel_notices(db, CHELAN_RECORDER_SOURCE, [_key(target.instrument_number)])
+        target.status = "superseded"
+        target.decision_note = f"superseded by {doc.instrument_number}"
+        target.updated_at = now
+    doc.status, doc.ocr_text, doc.nts_notice_id = "approved", None, notice_id
+    doc.reviewed_by, doc.reviewed_at, doc.updated_at = reviewer, now, now
+    doc.decision_note = (f"supersedes {supersedes}" if supersedes
+                         else "independent of other notices on its deed of trust" if independent else None)
+    doc.fields = {**_recording_facts(doc), "approved": approved}  # no grantor, no OCR text
+    return str(notice_id)
+
+
+def reject_recorder_document(db, doc_id: str, *, reviewer: str, reason: str) -> None:
+    """The staged read is not a usable notice (wrong document, unreadable, a sale the
+    reviewer cannot confirm): nothing reaches nts_notices, and the OCR text and OCR'd
+    fields go. ``reason`` is one of REJECT_REASONS. Caller commits."""
+    if reason not in REJECT_REASONS:
+        raise ReviewError(f"the reason must be one of {REJECT_REASONS}")
+    doc = _recorder_doc_for_review(db, doc_id)
+    now = datetime.now(UTC)
+    doc.status, doc.ocr_text, doc.decision_note = "rejected", None, reason
+    doc.reviewed_by, doc.reviewed_at, doc.updated_at = reviewer, now, now
+    doc.fields = _recording_facts(doc)
 
 
 # Atomic "delete the lock only if it is still ours" (a plain GET then DELETE could

@@ -94,9 +94,30 @@ Codex pre-build consult (2026-11-12): no P0. The P1s are: a staging/review bound
 - [ ] `crawl_nts_chelan_recorder` task: a recorder-document discovery adapter (NTS/NTSCOM/NOD-discontinuance codes, overlapping window, complete reads), own time limits + overlap lock + source admission -> detail page (APN, DT, borrower) -> OCR -> staging. Completeness-aware health (a verified zero is healthy)
 - [ ] Operator CLI: list pending, show fields + image link, approve/reject (who, when). Approval writes the canonical notice
 
-**4a-3: operator review + canonical notices + delivery**
-- [ ] Approved -> `nts_notices` (source `chelan_recorder`), revision ordering by recording metadata, discontinuance cancels the episode; DT reference persisted; Chelan in `NTS_MATCH_COUNTIES` with exact recording/DT linkage
-- [ ] `ChelanWATrusteeSaleScraper`, beat entry, Dockerfile `tesseract-ocr`, migration adding `trustee_sale` to the connector, collection_scope says "recorder", not "newspaper"
+**4a-3: operator review + canonical notices + delivery** (owner "Go" 2026-11-13; split to keep each phase ≤5 files)
+
+4a-3a: review + approval write (3 files)
+- [ ] `approve_recorder_document(db, doc_id, reviewer, values)` / `reject_recorder_document` in `nts_crawler.py`. Approve: row locked, must be `pending_review`; reviewer supplies the values read off the image (sale date, parcel, grantor required; time, address, amount + basis, trustee, beneficiary, trustee's TS# optional). Parcel must be one of the recording's own APNs (12 digits). Writes `nts_notices` through `_upsert_notice` (privacy gate included): source `chelan_recorder`, key `REC-<instrument>` (Benton's rule: the recording, not the sale, is the identity), `source_url` = detail page. Doc becomes `approved`, OCR text cleared (CHECK), `fields` = approved values minus grantor, `nts_notice_id` set
+- [ ] Revision ordering: approved docs sharing a related DT are one foreclosure; the newest recording (record_date, then instrument) is the live notice, older ones' notices go inactive and their docs `superseded`. Approving an older one leaves it inactive/superseded
+- [ ] Reject: reason required, OCR text cleared, never written to `nts_notices`
+- [ ] `scripts/nts_review.py`: `list` (pending, no names), `show` (OCR text + flags + evidence + image URL; operator only), `approve`, `reject`. Operator must be an admin with MFA (same check as `privacy_admin.py`). Runs under `railway run --service worker`
+- [ ] Tests on the real test DB: approve writes the notice + clears text; wrong parcel refused; non-pending refused; supersede both orders; reject; privacy gate withholds; CLI operator check
+
+Codex consult on 4a-3 (2026-11-13), reconciled:
+- P1 sessions: the operator check runs in the migration-role session and is rolled back first, then every write goes through `system_sync_session` (one transaction)
+- P1 DT equality is not identity: no automatic grouping. A revision is EXPLICIT: `approve --supersedes <instrument>` (the reviewer reads "amended" off the image). If another approved, uncancelled Chelan notice shares this recording's DT, approval refuses until the reviewer passes `--supersedes` or `--independent`. Missing DT is never grouped
+- P1 concurrency: the whole approval holds `pg_advisory_xact_lock(NTS_CANCEL_LOCK_KEY)` (exclusive, same key the matcher takes shared), then locks the staged row
+- P1 superseded leads: superseding = Benton's cancellation (cancelled_at + inactive + stamped leads cleared), factored into one shared helper. Every matcher pass and the finalizer already exclude cancelled_at
+- P1 delivery before discontinuance: the 4a-3b connector ships INACTIVE and must not be switched on until 4a-3c (NOD reconciliation) ships
+- P2 Borrower is not stored in staging (the task line above was wrong): the reviewer types the grantor from the image; it goes through `_privacy_gate`, never into staging JSON or logs
+- P2 dual paths (pre_foreclosure + trustee_sale for one recording): a live check before activation (dedup hash, matcher attachment)
+- P2 REC- identity: notice id re-selected by (source, ts_number), fetched_at set explicitly; approval is one-shot (a correction = supersede with a fresh approval, out of scope)
+
+4a-3b: delivery (≤5 files)
+- [ ] `ChelanWATrusteeSaleScraper` (collection_scope: recorded notices, reviewed), migration 159 adds the inactive Chelan `trustee_sale` connector (Benton 155 pattern), Chelan in `NTS_MATCH_COUNTIES`, crawl records the `nts_crawl:chelan` heartbeat when discovery completed, beat entry for `crawl_nts_chelan_recorder`, Dockerfile `tesseract-ocr`
+
+4a-3c: discontinuance (needs a live look at a Chelan NOD detail page first)
+- [ ] Recorded Notice of Discontinuance (`NOD`) naming an approved NTS sets `cancelled_at` + inactive and clears stamped leads (Benton's statement, same advisory lock)
 
 ### Phase 4 (owner decisions, not started)
 - trustee_sale: sale date only in scan-only NTS PDFs (`/Image/DocumentPdfAllPages/{id}`, free, 300 dpi, no text layer). Needs OCR (Tesseract is a new dependency: SBOM check plus Railway image change). About 2 NTS per month

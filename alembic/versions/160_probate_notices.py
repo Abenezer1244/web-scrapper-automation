@@ -160,6 +160,8 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.execute(text("SET LOCAL lock_timeout = '5s'"))
+    # Held to the end of the downgrade: no erase can commit a tombstone after the check.
+    op.execute(text("LOCK TABLE public.probate_notices IN ACCESS EXCLUSIVE MODE"))
     if op.get_bind().execute(text(
             "SELECT 1 FROM public.probate_notices WHERE privacy_suppression_id IS NOT NULL "
             "LIMIT 1")).first():

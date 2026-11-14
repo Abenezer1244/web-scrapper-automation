@@ -20,8 +20,9 @@ Stores, in order: results (every tenant), king_parcel_owners, nts_notices,
 county_records, pacs_tax_status (its own function, migration 152), probate_notices (its
 own function, migration 160). A probate notice is the subject's when any parcel tied to
 the estate, with the decedent as its party, is withheld by the rule; a notice tied to no
-parcel has no anchor, so (as every name-only row) it is never erased automatically and
-ages out of the table instead. The function also
+parcel has no anchor, so (as every name-only row) it is never erased automatically; the
+nwmarket crawl's retention purge deletes such notices (Phase 2b, required before probate
+ingestion is switched on). The function also
 reaches each matched result's skip-trace cache
 entries (its subject hash, plus the keys of its pending lookups computed here),
 lookups, Tracerfy links, dialer rows and exports.

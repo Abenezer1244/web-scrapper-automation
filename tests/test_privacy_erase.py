@@ -250,10 +250,17 @@ def test_every_shared_store_resumes_across_pages(s, monkeypatch, batch):
             "INSERT INTO county_records (id, county, state, record_hash, party_name, "
             "parcel_id) VALUES (gen_random_uuid(), 'king', 'WA', :h, 'SMITH JOHN', :p)"),
             {"h": uuid.uuid4().hex, "p": _PARCEL})
+        s.execute(text(
+            "INSERT INTO probate_notices (id, county, state, source, cause_no, first_published, "
+            "decedent, parcels) VALUES (gen_random_uuid(), 'king', 'WA', 'test', :c, "
+            "current_date, 'JOHN SMITH', CAST(:p AS json))"),
+            {"c": f"26-4-0000{i}-02", "p": json.dumps(
+                [{"parcel_id": _PARCEL, "party_name": "SMITH, JOHN", "owner_name": "SMITH, JOHN"}])})
     # King keys on the normalised parcel: only the exact parcel is the subject's.
     assert _sweep(s, rule, "king").get("king") == 1
     assert _sweep(s, rule, "nts").get("nts") == 3
     assert _sweep(s, rule, "county").get("county") == 3
+    assert _sweep(s, rule, "probate").get("probate") == 3
     assert s.execute(text("SELECT count(*) FROM nts_notices WHERE grantor = 'JOHN SMITH'")
                      ).scalar() == 0
 

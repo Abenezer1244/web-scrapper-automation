@@ -671,7 +671,12 @@ class AcclaimWebScraper(BridgeScraper):
         await search_btn.first.click()
 
     async def _search_and_read(self, date_from: str, date_to: str) -> list[ScrapedRecord]:
-        """Run the filled-in search and return every row it found, of every page.
+        """Run the filled-in search; every row it found, as leads of the active type."""
+        rows = await self._search_rows(date_from, date_to)
+        return self._records_from_raw([_grid_item(r) for r in rows])
+
+    async def _search_rows(self, date_from: str, date_to: str) -> list[dict]:
+        """Run the filled-in search and return every grid row it found, of every page.
 
         Only requests issued after our click count: a late answer to an earlier
         request is never read as this search's. The grid shell (PartialGrid) of a
@@ -757,8 +762,7 @@ class AcclaimWebScraper(BridgeScraper):
 
         if first.status != 200:
             raise _transient(f"grid rows answered HTTP {first.status}")
-        rows = await self._read_grid_rows(first, date_from, date_to)
-        return self._records_from_raw([_grid_item(r) for r in rows])
+        return await self._read_grid_rows(first, date_from, date_to)
 
     async def _read_grid_rows(self, first, date_from: str, date_to: str) -> list[dict]:
         """All rows of the search whose first GridResults response is ``first``.
@@ -1109,3 +1113,60 @@ class ChelanAcclaimWebScraper(AcclaimWebScraper):
             items=(DocTypeItem(label="Death Certificate", exact=False),),
             note="Recorded death certificates (the recorder's DC document code).",
         )
+
+    async def discover(self, date_from: str, date_to: str, codes: set[str]) -> list[dict]:
+        """Every recorded document with one of ``codes`` in the window (MM/DD/YYYY,
+        both days included): {item_id, instrument, doc_code, record_date} each.
+
+        For the NTS crawler (nts_crawler.crawl_nts_chelan_recorder). Unlike a lead
+        scrape it filters nothing but the code: no party orientation, no type map. Each
+        day is read with the same complete, response-driven search as scrape(), so a
+        partial day raises instead of returning a short list. Call inside ``async with``.
+        """
+        start = datetime.strptime(date_from, "%m/%d/%Y")
+        end = datetime.strptime(date_to, "%m/%d/%Y")
+        search_url = f"{self.base_url}/search/SearchTypeRecordDate"
+
+        async def _open_search() -> None:
+            # The portal may send any fresh load back through its disclaimer.
+            await self.page.goto(search_url, wait_until="domcontentloaded", timeout=60_000)
+            await self._accept_disclaimer()
+            if "SearchTypeRecordDate" not in self.page.url:
+                await self.page.goto(search_url, wait_until="domcontentloaded", timeout=60_000)
+
+        await self.navigate(search_url)
+        await self._accept_disclaimer()
+        if "SearchTypeRecordDate" not in self.page.url:
+            await self.page.goto(search_url, wait_until="domcontentloaded", timeout=30_000)
+        if await self.page.locator("#RecordDate").count() == 0:
+            raise ScraperExecutionError(self.county, "AcclaimWeb",
+                                        "discovery expects the single record-date search")
+        self._single_date_mode = True
+        found: list[dict] = []
+        day = start
+        while day <= end:
+            d = day.strftime("%m/%d/%Y")
+            if day != start:
+                await self._go_to_search()
+            await self._fill_dates(d, d)
+            try:
+                rows = await self._search_rows(d, d)
+            except TransientScrapeError:
+                # One stalled search must not discard the whole window (seen live: the
+                # portal stalled ~1 min mid-run). Reload the form and read the day once more;
+                # a second failure raises, so a day is never silently skipped.
+                await asyncio.sleep(15)
+                await _open_search()
+                await self._fill_dates(d, d)
+                rows = await self._search_rows(d, d)
+            for row in rows:
+                code = str(row.get("DocType") or "").strip().upper()
+                if code in codes:
+                    found.append({
+                        "item_id": str(row.get("TransactionItemId") or "").strip(),
+                        "instrument": str(row.get("InstrumentNumber") or "").strip(),
+                        "doc_code": code,
+                        "record_date": _grid_date(row.get("RecordDate")),
+                    })
+            day += timedelta(days=1)
+        return found

@@ -19,6 +19,92 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-11-13/14 — Clallam goes live; one tax canary failure; retry fix (#630)
+
+**Built / Shipped:** The owner restored the Railway plan. The 2026-11-13 deploy took production from
+alembic 139 to 157 (Asotin, Clallam, Benton, Chelan). Clallam rows checked: recorder `3c1dc2fe`
+now probate + pre_foreclosure + death_certificate, and the tax connector `7c1a1a2e…0140` was created.
+With owner approval, ran one canary for the tax connector (healthy, 8 records) and one manual
+pre_foreclosure run on the only Clallam customer config, through the same `enqueue_scrape_job`
+path as Run now (job `d34d83ad`, 08/15–11/13: 15 found, 13 new and billed, 0 degradations). All
+10 delivered trustee-sale notices were looked up again in the recorder: none discontinued, and a
+known-discontinued control (2026-1484470) was detected. PR #630 (`b5b025b0`): per-parcel PACS
+portal reads retry on transient failures only. Railway auto-deployed it; canary healthy after.
+
+**Failed / Blocked:** A rerun of the tax canary on 2026-11-14 (about 00:50 UTC) failed with
+`ValueError`. It marked the connector `down`, hid it from customers, and sent an ops alert. The
+next manual scrape and the next canary passed with 8 records. **Root cause not found.** The canary
+logs the exception class only (Codex P2: scraper messages can carry page content), and the
+container's file log was lost when the worker was redeployed. What I ruled out:
+- The as-of check: the portal's date is the Pacific calendar date, 0–1 days behind UTC, inside 0–3.
+- The landing page: its DocumentCenter links are unchanged since the 11-12 capture.
+- Network errors: they surface as `requests` classes, not `ValueError`.
+- A repeat: 12 rounds of every step from the production worker (landing, PDF, 8 portal pages,
+  record build; about 120 reads) produced 0 failures.
+
+What remains as candidates, all intermittent and all raising `ValueError`:
+- a portal page with no tax table (now retried by #630);
+- the certificate link returning non-PDF content, or a redirect that is refused (not retried);
+- a portal page variant that fails the owner or as-of check in `build_record` (not retried).
+
+**Tried / Decided:** Retry only what can be transient. An integrity failure (duplicate
+statement, unreadable amount) or an SSRF refusal must stay fatal, so that a later clean page
+cannot hide it (Codex Medium). Retry logs carry PID + class only; Codex rated logging `str(exc)`
+High because the parse errors embed table cells and headers.
+
+**Pending / Handoff:** Make the next failure diagnosable. Proposal: the canary also logs the raise
+site of the exception (file:line:function from the innermost traceback frame). That is safe for
+PII and pinpoints the cause for any scraper. Not built yet; needs owner approval. The canary samples
+5 of 59 (connector, type) pairs per hour, so a new connector can stay `unknown` for many hours.
+A `down` flip has no matching recovery alert.
+
+**Facts learned:** Railway auto-deploys api/worker/beat on a push to main. Production one-off
+scripts: `railway ssh --service worker -- sh -c "echo <b64> | base64 -d > /tmp/x.py &&
+PYTHONPATH=/app python /tmp/x.py"`. The worker's DB role is RLS-scoped (set
+`app.current_user_id`). The worker's R2 key cannot `GetObject`.
+
+---
+## 2026-11-14 — Clark: why Auction leads were always empty, and silent window loss in the recorder (branch `feat/clark-wa-seven-record-types`)
+
+**Built / Shipped (branch only, not pushed):** `5c84374b` the Clark LandmarkWeb scraper proves each
+window complete: the results header must echo the submitted doc types (as a set) and dates, the
+distinct document ids read across pages must equal the full count (Show Count, else a numeric
+"records of N", else retry), and zero needs the portal's own "No results." row. `7a60462d` Clark
+`trustee_sale` held via a new `SourceUnavailableError` (fixed customer text, permanent, unbilled;
+the worker shows that text). `87bfbe18` Clark `death_certificate` (code 62), connector unchanged.
+`c163c7bf` Celery time limits escape every Clark catch-all; non-numeric row ids fail. Plan, matrix,
+activation steps: `tasks/clark-wa-seven.md`.
+
+**Tried / Decided:** Auction leads root cause is the SOURCE, not code: The Columbian's legal-notice
+listing had 0 trustee sales of 21 ads (2 Clark notices ever), while the recorder records ~29 a month
+as free "Unofficial Copy" raster images. Owner chose hold now, OCR later on Chelan's review pipeline
+(not duplicated here: it owns migrations 158-159 and the staging table). death_certificate built
+dark. tax_delinquent (no county list), code_violation (county map layer metadata: "not subject to
+public disclosure", no dump) and divorce (AOC dissemination policy bars commercial solicitation) are
+documented as blocked; nothing built.
+
+**Failed / Blocked:** the worker-level hold test needs the real test DB, which is not available on
+this laptop (CI only). No Playwright UI QA: no frontend change, and it is only meaningful after a
+deploy.
+
+**Caught & fixed:** five ways a Clark run finished DONE with a window's leads silently missing (chunk
+`except: continue`, render timeout read as zero, pagination errors ending the read, wrapper table
+parsed, no total check). Codex gates: Phase 1 FAIL (header fallback could certify a 500-row first
+page; any empty cell accepted as zero), Phase 2 FAIL (hold text never reached users; fixture leaked
+rows), final NO-GO (cap, time limits, contract tests, rollout). All fixed or refuted by
+measurement, final GO.
+
+**Pending / Handoff:** owner: PR, deploy (api, worker, beat; no migration), then optionally add
+`death_certificate` to connector `70bb5315`. Canary will mark Clark Auction leads `down` once (one ops
+alert) and hide it from the picker: expected. Clark OCR trustee_sale after `feat/chelan-nts-ocr`.
+
+**Facts learned:** Clark LandmarkWeb loads 500 rows per page and the header then reads "Returned 500
+records of" with a BLANK total; only "Show Count" gives it (3,885 read over 8 pages, no cap seen).
+Rows are `tr#doc_<documentId>_<row>`. Death certificates are indexed Decedent / "PUBLIC". Clark
+recorder PIDs come out 6-10 digits (9 = PAN); not normalized.
+
+---
+
 ## 2026-11-12 — Chelan: why it never delivered a lead, and the seven-type audit (branch `feat/chelan-seven-record-types`)
 
 **Built / Shipped (branch only, not pushed):** `06b9ede4` AcclaimWeb reads every row of every search

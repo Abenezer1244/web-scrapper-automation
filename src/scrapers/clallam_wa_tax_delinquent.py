@@ -23,6 +23,7 @@ from decimal import Decimal, InvalidOperation
 from io import BytesIO
 from urllib.parse import urljoin, urlparse
 
+import requests
 from bs4 import BeautifulSoup
 
 from src.api.middleware.security import add_scrape_domain
@@ -115,6 +116,18 @@ def _money(raw: str) -> Decimal:
         raise ValueError(f"unreadable amount {raw!r}") from exc
 
 
+class PortalPageUnreadableError(ValueError):
+    """The portal served a page with no tax status at all (an error or busy page).
+    The only parse failure worth a retry: every other one is a data-integrity failure."""
+
+
+def _retryable(exc: Exception) -> bool:
+    if isinstance(exc, requests.HTTPError):
+        code = exc.response.status_code if exc.response is not None else 0
+        return code >= 500 or code == 429
+    return isinstance(exc, (PortalPageUnreadableError, requests.ConnectionError, requests.Timeout))
+
+
 def _parse_tax_due(soup: BeautifulSoup) -> dict[int, Decimal]:
     """The Pay Tax Due table -> {year: total due}. Every data row must read.
 
@@ -125,7 +138,7 @@ def _parse_tax_due(soup: BeautifulSoup) -> dict[int, Decimal]:
                   if [" ".join(th.get_text(" ").split()) for th in t.find_all("th")][:1] == ["Year - Statement ID"]),
                  None)
     if table is None:
-        raise ValueError("portal page shows neither a tax-due table nor 'No Amount Due'")
+        raise PortalPageUnreadableError("portal page shows neither a tax-due table nor 'No Amount Due'")
     headers = [" ".join(th.get_text(" ").split()) for th in table.find_all("th")]
     if "Total Due" not in headers:
         raise ValueError(f"tax-due table has no Total Due column: {headers}")
@@ -281,11 +294,8 @@ class ClallamWATaxDelinquentScraper(BridgeScraper):
         records: list[ScrapedRecord] = []
         outcomes: dict[str, int] = {}
         for i, row in enumerate(rows, 1):
-            page = safe_get(_PORTAL, require_allowlisted=True, headers=_HEADERS,
-                            params={"cid": "0", "year": str(today.year), "prop_id": row["pid"]},
-                            timeout=settings.DEFAULT_TIMEOUT)
-            page.raise_for_status()
-            record, outcome = build_record(row, parse_portal_status(page.text), cert, cap_min_year, today)
+            status = await self._portal_status(row["pid"], today.year)
+            record, outcome = build_record(row, status, cert, cap_min_year, today)
             outcomes[outcome] = outcomes.get(outcome, 0) + 1
             if outcome in ("identity_mismatch", "owner_ambiguous"):
                 _logger.warning("PID %s (certificate parcel %s): %s; not delivered",
@@ -302,6 +312,28 @@ class ClallamWATaxDelinquentScraper(BridgeScraper):
             # A partial list must not pass as the complete snapshot (Codex).
             raise ValueError(f"{unresolved} certificate parcels could not be resolved: {outcomes}")
         return records
+
+    async def _portal_status(self, pid: str, year: int) -> dict:
+        """One parcel's portal status, retried: a single unreadable page (seen 2026-11-14)
+        must not fail the whole snapshot. Still raises once every attempt has failed."""
+        attempts = max(1, settings.MAX_RETRIES)
+        for attempt in range(1, attempts + 1):
+            try:
+                page = safe_get(_PORTAL, require_allowlisted=True, headers=_HEADERS,
+                                params={"cid": "0", "year": str(year), "prop_id": pid},
+                                timeout=settings.DEFAULT_TIMEOUT)
+                page.raise_for_status()
+                return parse_portal_status(page.text)
+            except Exception as exc:
+                if not _retryable(exc):
+                    raise
+                # Class only: exception text can carry page content (owner data).
+                _logger.warning("PID %s portal read attempt %d/%d failed: %s",
+                                pid, attempt, attempts, type(exc).__name__)
+                if attempt == attempts:
+                    raise
+                await self.polite_delay()
+        raise AssertionError("unreachable")
 
     async def __aenter__(self) -> "ClallamWATaxDelinquentScraper":
         return self

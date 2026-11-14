@@ -20,12 +20,14 @@ def _parse(name: str) -> dict:
 
 def test_every_notice_yields_its_parcel_address_and_section_iv_principal():
     files = sorted(_DIR.glob("*.txt.gz"))
-    assert len(files) == 13
+    assert len(files) == 18
     for f in files:
         p = _parse(f.name[:-7])
         assert p["instrument_number"] and p["notice_code"] == "NTS", f.name
         assert p["parcels"] and all(len(x) == 15 for x in p["parcels"]), f.name
-        assert p["property_address"], f.name
+        assert p["grantor"], f.name
+        # 2026-019264 prints "Commonly known as: 59111 E 95 PR SE" with no city or zip.
+        assert p["property_address"] or f.name.startswith("2026_019264"), f.name
         assert p["principal_owing"] is not None and p["principal_owing_basis"] == "principal", f.name
 
 
@@ -55,10 +57,28 @@ def test_a_later_date_in_the_notice_is_not_the_sale():
     assert _parse("2026_027553")["auction_date"] == date(2027, 2, 26)
 
 
-@pytest.mark.parametrize("name", ["2026_024803", "2026_025119", "2026_025258", "2026_028388"])
-def test_an_ocr_damaged_sale_date_is_left_unparsed_not_guessed(name):
-    # "21512027" (2/5/2027 with slashes read as 1), "FebruaryS,2027", "41212027".
-    assert _parse(name)["auction_date"] is None
+@pytest.mark.parametrize("name, sale", [
+    ("2026_024803", date(2027, 2, 5)),   # Section I "21512027"; Section V "encumbranceson 2/5/2027"
+    ("2026_025258", date(2027, 2, 5)),   # Section I "FebruaryS,2027"; Section V "February5,2027"
+    ("2026_028388", date(2027, 4, 2)),   # Section I "41212027"
+    ("2026_019264", date(2026, 12, 4)),  # Section I "12/4/202610:00AM" runs the time into the year
+])
+def test_an_unreadable_sale_date_is_read_from_its_section_v_restatement(name, sale):
+    assert _parse(name)["auction_date"] == sale
+
+
+def test_a_sale_date_unreadable_in_both_places_is_left_unparsed_not_guessed():
+    # Section I "21512027" and Section V "215/2027": no readable copy, no date.
+    assert _parse("2026_025119")["auction_date"] is None
+
+
+def test_two_readable_sale_dates_that_disagree_give_no_date():
+    text = gzip.decompress((_DIR / "2026_025237.txt.gz").read_bytes()).decode("utf-8")
+    p = parse_recorded_nts(text)
+    assert p["auction_date"] == date(2027, 2, 5)
+    restated = text.replace("encumbranceson February5,2027", "encumbranceson February6,2027")
+    assert restated != text
+    assert parse_recorded_nts(restated)["auction_date"] is None
 
 
 def test_the_street_and_city_lines_are_joined():
@@ -69,6 +89,21 @@ def test_grantor_label_variants():
     assert _parse("2026_025590")["grantor"].startswith("TIMOTHY MCINTOSH AND MANNA MCINTOSH")  # "for Recording Purposes"
     assert _parse("2026_027262")["grantor"] == "LuisA.Perez"  # "Grantor(s) of Deed of Trust <name>"
     assert _parse("2026_027155")["grantor"] == "LOVELY J.RANGEL, AN UNMARRIED WOMAN"
+    # "Grantor CANDICE MARIE JACKSON, ..." with no colon.
+    assert _parse("2026_020482")["grantor"] == "CANDICE MARIE JACKSON, AN UNMARRIED WOMAN"
+
+
+@pytest.mark.parametrize("name, owner", [
+    # Cover sheet "Grantor(s):U.S.Bank NationalAssociation" (the beneficiary); page 2 names the borrower.
+    ("2026_022125", "Alvin L Whitish a single man"),
+    # Cover sheet "Grantor(s): WellsFargoBank,N.A." (the beneficiary).
+    ("2026_014784", "Glen R. Ziegler and wife Donna Ziegler"),
+    # Cover sheet "Grantor: EisenhowerCarlsonPLLC" (the trustee, its label wrapped over two lines);
+    # the borrower is only in "from SyedJ.Amir, as Grantor".
+    ("2026_023349", "SyedJ.Amir"),
+])
+def test_a_grantor_that_is_the_trustee_or_lender_is_not_the_owner(name, owner):
+    assert _parse(name)["grantor"] == owner
 
 
 def test_a_notice_for_property_in_two_counties_is_flagged_not_pinned():
@@ -142,4 +177,38 @@ def test_multi_property_and_undated_notices_are_never_auction_rows():
     from src.scrapers.sources.nts_benton_recorder import recorded_notice_to_row
 
     assert recorded_notice_to_row(_parse("2026_027018"), "u", date(2026, 11, 12)) is None  # two counties
-    assert recorded_notice_to_row(_parse("2026_024803"), "u", date(2026, 11, 12)) is None  # OCR-damaged date
+    assert recorded_notice_to_row(_parse("2026_025119"), "u", date(2026, 11, 12)) is None  # no readable date
+
+
+def _owner(text: str) -> str | None:
+    return parse_recorded_nts(text)["grantor"]
+
+
+def test_a_wrapped_trustee_name_is_still_not_the_owner():
+    """Codex: the skip list compared single lines, so a wrapped trustee got through."""
+    text = ("Grantor: Example Trustee Services\nLLC\n"
+            "Current Trustee: Example Trustee Services\nLLC\n"
+            "This Deed of Trust was executed by JANE Q DOE, AN UNMARRIED WOMAN as Trustor(s), to secure\n")
+    assert _owner(text) == "JANE Q DOE, AN UNMARRIED WOMAN"
+
+
+def test_a_colonless_trustee_label_is_still_not_the_owner():
+    text = ("Grantor: Affinia Default Services\n"
+            "Current Trustee Affinia Default Services\n"
+            "This Deed of Trust was executed by JANE Q DOE as Trustor(s)\n")
+    assert _owner(text) == "JANE Q DOE"
+
+
+def test_a_bare_grantor_line_does_not_take_the_next_field():
+    """Codex: 'Grantor' alone on its line used to read the next line as the owner."""
+    text = "Grantor\nCurrent Trustee Acme Trustee LLC\nCurrent Beneficiary: Big Bank\n"
+    assert _owner(text) is None
+
+
+def test_wrapped_borrower_fallbacks_read_the_whole_name():
+    text = ("Grantor: Big Bank NA\nCurrent Beneficiary: Big Bank NA\n"
+            "Original Mortgagor(s): Jane Doe and\nJohn Doe\n\nLegal: LOT 1\n")
+    assert _owner(text) == "Jane Doe and John Doe"
+    text = ("Grantor: Big Bank NA\nCurrent Beneficiary: Big Bank NA\n"
+            "recorded with the Auditor (the Deed of Trust), from Jane Doe and\nJohn Doe, as Grantor, to\n")
+    assert _owner(text) == "Jane Doe and John Doe"

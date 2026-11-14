@@ -1985,6 +1985,57 @@ class NtsNotice(Base):
     cancelled_at = Column(DateTime(timezone=True), nullable=True)
 
 
+class NtsRecorderDocument(Base):
+    """NTS documents read by OCR from a county recorder, staged for operator review
+    (migration 158). A notice reaches nts_notices only once approved; ``ocr_text`` (the
+    borrower's name is in it) is kept only while the row awaits review. Shared,
+    system-only like NtsNotice."""
+
+    __tablename__ = "nts_recorder_documents"
+    __table_args__ = (
+        UniqueConstraint("county", "transaction_item_id",
+                         name="uq_nts_recorder_documents_county_item"),
+        CheckConstraint(
+            "status IN ('pending_review', 'approved', 'rejected', 'superseded', 'failed', "
+            "'discontinuance')",
+            name="ck_nts_recorder_documents_status",
+        ),
+        CheckConstraint("status = 'pending_review' OR ocr_text IS NULL",
+                        name="ck_nts_recorder_documents_text_retention"),
+        CheckConstraint(
+            "status IN ('pending_review', 'failed', 'discontinuance') OR "
+            "(reviewed_by IS NOT NULL AND reviewed_at IS NOT NULL)",
+            name="ck_nts_recorder_documents_decided",
+        ),
+        Index("ix_nts_recorder_documents_pending", "county", "record_date",
+              postgresql_where=text("status = 'pending_review'")),
+    )
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid)
+    county = Column(String(64), nullable=False)
+    state = Column(String(2), nullable=False)
+    transaction_item_id = Column(String(32), nullable=False)
+    instrument_number = Column(String(32), nullable=False)
+    doc_code = Column(String(16), nullable=False)
+    record_date = Column(Date, nullable=False)
+    recording_apn = Column(String(64), nullable=True)
+    related_deed_of_trust = Column(String(32), nullable=True)
+    pdf_sha256 = Column(String(64), nullable=True)
+    page_count = Column(Integer, nullable=True)
+    ocr_text = Column(Text, nullable=True)
+    ocr_engine = Column(String(64), nullable=True)
+    parser_version = Column(String(32), nullable=True)
+    fields = Column(JSONB, nullable=True)
+    status = Column(String(16), nullable=False, server_default="pending_review")
+    decision_note = Column(Text, nullable=True)
+    reviewed_by = Column(String(255), nullable=True)
+    reviewed_at = Column(DateTime(timezone=True), nullable=True)
+    nts_notice_id = Column(UUID(as_uuid=False), ForeignKey("nts_notices.id", ondelete="SET NULL"),
+                           nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
 class PacsTaxStatus(Base):
     """Per-parcel property-tax status read off a county's PACS page (migration 151).
 

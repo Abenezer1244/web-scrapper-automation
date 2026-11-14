@@ -320,3 +320,39 @@ def test_types_sharing_a_connector_still_see_each_others_status(connector, monke
 
     assert _status(c) == "down"
     assert sent == [("canary", f"{c.county}/WA/probate")]   # already down for the second type
+
+
+def _row(n, record_types=("probate",), status="healthy", checked=True):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(id=f"c{n}", county=f"c{n}", record_types=list(record_types), health_status=status,
+                           last_checked=datetime.now(UTC) if checked else None)
+
+
+def test_a_connector_never_checked_is_probed_on_the_next_tick():
+    """Benton tax_delinquent waited ~22h unchecked, hidden from customers, for the rotation."""
+    routine = [_row(i) for i in range(40)]
+    new = _row("new", ("tax_delinquent",), status="unknown", checked=False)
+    for _ in range(20):
+        assert (new, "tax_delinquent") in health._canary_units([*routine, new])
+
+
+def test_an_unknown_status_with_a_timestamp_still_goes_first():
+    reset = _row("reset", status="unknown", checked=True)
+    assert health._canary_units([*(_row(i) for i in range(40)), reset])[0][0] is reset
+
+
+def test_a_priority_backlog_never_takes_the_routine_slots():
+    """Codex P1: connectors whose probe never records a verdict must not starve the rest."""
+    stuck = [_row(f"s{i}", ("probate", "pre_foreclosure"), status="unknown", checked=False) for i in range(10)]
+    routine = [_row(i) for i in range(40)]
+    units = health._canary_units([*stuck, *routine])
+    assert len(units) == health.CANARY_UNITS_PER_TICK
+    assert sum(c in stuck for c, _ in units) == health.CANARY_UNITS_PER_TICK - health.CANARY_ROUTINE_SLOTS
+    assert len({c.id for c, _ in units if c in stuck}) == health.CANARY_UNITS_PER_TICK - health.CANARY_ROUTINE_SLOTS
+
+
+def test_no_pair_is_probed_twice_in_a_tick():
+    rows = [_row(i, ("probate", "divorce"), status="unknown", checked=False) for i in range(2)]
+    units = health._canary_units(rows, k=100)
+    assert len(units) == len({(c.id, rt) for c, rt in units}) == 4

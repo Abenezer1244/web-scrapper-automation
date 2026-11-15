@@ -19,6 +19,62 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-11-15 — Probate representatives in deletion, and a guarded Current Owner (branch `fix/probate-rep-erasure-owner`)
+
+**Built / Shipped:**
+- `src/privacy/authorize.py`: `authorize()` takes `extra_subjects`, people tied to a row who are not in
+  its columns. `natural_order_subjects()` reads them one name at a time, in natural order, with role
+  `contact`.
+- `src/privacy/erase.py` `_scan_probate`: also judges each notice's `personal_reps`. A representative's
+  own deletion rule on any tied parcel now erases (tombstones) the whole notice.
+- `src/workers/probate_ingest.py`: the ingest and re-check gate passes the representatives too, so such a
+  notice is stored as a `withheld` tombstone. `Gate` is now `(parcels, county, reps)`.
+- `src/utils/lead_formatting.py` `current_owner_fields()`, used by both writers in
+  `tasks_helpers/enrich.py` (King, and the PACS path #642 added for every PACS county, Asotin included)
+  and by `scripts/backfill_king_probate_current_owner.py`: an owner string with
+  care-of or representative wording (C/O, C\O, CARE OF, ATTN, PR, PERS/PER/PERSONAL REP, executor,
+  administrator) leaves Current Owner and Title Status blank. Re-enrichment removes a stored pair.
+
+**Tried / Decided:**
+- The owner first approved removing Current Owner for probate. That rested on my wrong claim that the
+  field was filled for every county; it is filled only for King. A read-only production count found
+  2,000 stored King values (1,947 probate, 53 death certificate), none with care-of or representative
+  wording. The owner then chose "guard, keep": nothing customers see today changes.
+- Codex reviewed every phase. Phase C was NO-GO on four Mediums, all handled:
+  - A bare `CO` hid companies, so it was dropped.
+  - The backfill script bypassed the guard, so it now goes through the helper.
+  - `CARE-OF` is covered, and `REP` matches only as a whole word.
+  - Stored pairs that re-enrichment never selects: no sweep. Production has 0 matching values with the
+    final regex, and both writers are guarded. Codex accepted this.
+- Representatives are read in natural order, because notices print them that way. Probate's recorder
+  order would read "GLENN WEBER" with GLENN as the surname. A test pins this.
+- The gate still keeps nobody under review. A representative named without the rule's parcel (REVIEW)
+  withholds the notice, exactly as a decedent already did. A test pins this.
+
+**Failed / Blocked:**
+- My first re-check test committed a privacy rule: `rematch_due` commits per notice, and rules can never be
+  deleted. It now runs in a rolled-back outer transaction, with each commit a savepoint.
+- While clearing those leaked rows from the local test database, I disabled and re-enabled the table's
+  triggers. Re-enabling reset `privacy_suppressions_no_update` from ALWAYS to ORIGIN, which
+  `test_privacy_schema` caught. Restored with `ENABLE ALWAYS TRIGGER`. Local test database only.
+- Writing the regex through nested shell and Python quoting turned `\b` into backspace characters and lost
+  one of the two backslashes the regex needs for a literal `C\O`. Fixed by editing the lines by line number.
+
+**Caught & fixed:** see Codex's Phase C findings above. Negative controls: the new erasure and ingest
+tests fail on the old code.
+
+**Pending / Handoff:**
+- Still open from the post-deploy review: the ArcGIS `where` clause built from text (Medium, low practical
+  risk).
+- The first probate crawl with this code is the 2026-11-16 10:00 UTC run, if this deploys first.
+
+**Facts learned:**
+- Current Owner (`assessor_current_owner`) was King-only until #642 (merged during this work) added a
+  PACS writer. That writer would have shown Asotin's 'ESTATE C/O <rep> PR' owners once Asotin probate
+  is switched on, so it goes through the same guard. Grep for every writer of a field before claiming
+  where it comes from.
+- `ALTER TABLE ... ENABLE TRIGGER USER` re-enables triggers as ORIGIN, not ALWAYS. Never toggle triggers
+  on a privacy table, even in a test database.
 ## 2026-11-15 — Chelan's first live crawl and connector activation; stale document-type selections (#644, FE #328)
 
 **Built / Shipped:**

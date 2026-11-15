@@ -19,7 +19,8 @@ scanned, flagged or not.
 Stores, in order: results (every tenant), king_parcel_owners, nts_notices,
 county_records, pacs_tax_status (its own function, migration 152), probate_notices (its
 own function, migration 160). A probate notice is the subject's when any parcel tied to
-the estate, with the decedent as its party, is withheld by the rule; a notice tied to no
+the estate, with the decedent as its party and its personal representatives beside them,
+is withheld by the rule; a notice tied to no
 parcel has no anchor, so (as every name-only row) it is never erased automatically; the
 nwmarket crawl's retention purge deletes such notices (Phase 2b, required before probate
 ingestion is switched on). The function also
@@ -44,6 +45,7 @@ from src.privacy.authorize import (
     authorize,
     build_snapshot,
     load_rule_rows,
+    natural_order_subjects,
 )
 from src.scrapers.enrichment.skip_trace import pending_row_subject_key
 
@@ -85,7 +87,7 @@ _PROBATE_CALL = text(
 # A withheld notice has no parcels (160's CHECK), so every notice that can still name
 # the subject is one with parcels.
 _PROBATE_SQL = text(
-    "SELECT id::text AS id, parcels, county, state FROM probate_notices "
+    "SELECT id::text AS id, parcels, personal_reps, county, state FROM probate_notices "
     "WHERE parcels IS NOT NULL AND id > CAST(:after AS uuid) ORDER BY id LIMIT :n"
 )
 _COUNTY_SQL = text(
@@ -128,9 +130,10 @@ def load_erasure_rule(db, rule_id: str, rule_row: str) -> ErasureRule:
     return ErasureRule(rule_id, rule_row, snapshot, row_ids)
 
 
-def _is_subject(rule: ErasureRule, row, *, record_type, county, state) -> bool:
+def _is_subject(rule: ErasureRule, row, *, record_type, county, state,
+                extra_subjects=()) -> bool:
     decision = authorize(rule.snapshot, row, record_type=record_type, county=county,
-                         state=state)
+                         state=state, extra_subjects=extra_subjects)
     return decision.outcome == WITHHELD and bool(rule.row_ids & set(decision.suppression_ids))
 
 
@@ -206,12 +209,24 @@ def _scan_probate(db, rule: ErasureRule, after: str | None):
         return [p for p in (parcels if isinstance(parcels, list) else [])
                 if isinstance(p, dict)]
 
+    def reps(r) -> list:
+        # The notice's personal representatives, in the notice's natural order: their
+        # own rule on a tied parcel erases the notice too (they are stored on it).
+        return natural_order_subjects(
+            r.personal_reps if isinstance(r.personal_reps, list) else [],
+            source_field="personal_reps")
+
     # As the probate scraper delivers it: the decedent is the party of each tied parcel,
     # and the parcel's owner of record rides along.
-    matched = [r.id for r in rows if any(_is_subject(
-        rule, _lead(parcel_id=p.get("parcel_id"), party_name=p.get("party_name"),
-                    enrichment_data={"assessor_current_owner": p.get("owner_name")}),
-        record_type="probate", county=r.county, state=r.state) for p in leads(r.parcels))]
+    matched = []
+    for r in rows:
+        extra = reps(r)
+        if any(_is_subject(
+                rule, _lead(parcel_id=p.get("parcel_id"), party_name=p.get("party_name"),
+                            enrichment_data={"assessor_current_owner": p.get("owner_name")}),
+                record_type="probate", county=r.county, state=r.state, extra_subjects=extra)
+               for p in leads(r.parcels)):
+            matched.append(r.id)
     return rows, matched, {"probate": matched, "_last": rows[-1].id if rows else None}
 
 

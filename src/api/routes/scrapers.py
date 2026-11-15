@@ -488,7 +488,14 @@ async def get_scraper(
     config = result.scalar_one_or_none()
     if config is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scraper not found")
-    return (await _with_run_eligibility(db, current_user, [config]))[0]
+    response = (await _with_run_eligibility(db, current_user, [config]))[0]
+    if config.record_type == "pre_foreclosure":
+        from src.scrapers.doc_types import selectable_availability, selectable_doc_type_labels
+
+        response.doc_type_options = selectable_doc_type_labels(config.county, config.state)
+        avail = selectable_availability(config.county, config.state)
+        response.doc_type_confidence = avail.get("confidence") if avail else None
+    return response
 
 
 @router.delete("/{scraper_id}", status_code=status.HTTP_204_NO_CONTENT)

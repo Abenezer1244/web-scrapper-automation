@@ -88,6 +88,15 @@ def _cell_lines(td) -> list[str]:
     return [" ".join(ln.split()) for ln in td.get_text("\n").split("\n") if ln.strip()]
 
 
+def pacs_owner_names(html_text: str) -> str | None:
+    """The detail page's owner names ("Name:" cells), joined with " & ", or None."""
+    soup = BeautifulSoup(html_text, "html.parser")
+    owners = [td.find_next_sibling("td").get_text(" ", strip=True)
+              for td in soup.find_all("td", string=re.compile(r"^\s*Name:\s*$"))
+              if td.find_next_sibling("td")]
+    return " & ".join(dict.fromkeys(o for o in owners if o))[:512] or None
+
+
 def parse_pacs_detail_html(html_text: str) -> dict:
     """The identity and address cells of a PACS Property.aspx page.
 

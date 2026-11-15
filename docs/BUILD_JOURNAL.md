@@ -82,6 +82,69 @@ parcel where names failed.
 
 ---
 
+## 2026-11-15 — Asotin probate merged and deployed (#639); post-deploy security review
+
+**Built / Shipped:** #639 was squash-merged as `c8fcfecb` at 2026-11-15 20:47 UTC. Railway rebuilt api,
+worker and beat, and all three reported SUCCESS. The api boot log shows `159 -> 160` (probate_notices)
+and `160 -> 161` (connector). A read-only production check found `alembic_version` = 161 and all four
+Asotin connectors with `active = false`. The new worker lists `crawl_nts_nwmarket_asotin` among its
+tasks, and beat started cleanly.
+
+**Tried / Decided:**
+- Squash rather than a merge commit. Two early branch commits held decedent names taken from the public
+  notices; squashing kept them out of main's history.
+- Deleted the remote branch after checking that its tree equals `c8fcfecb`'s. GitHub still keeps
+  `refs/pull/639/head`, so the commits stay reachable through the PR. Removing them needs GitHub
+  Support, and the repository is private.
+- Removed the local worktree, the branch, and the test containers `bl-asotin-pg` and `bl-asotin-redis`
+  with their anonymous volumes.
+
+**Failed / Blocked:**
+- CI on the PR did not start for hours. Both sides had added a top entry to this journal, so the PR was
+  conflicted, and GitHub runs no pull_request workflows on a conflicted PR. It happened twice: main moved
+  again (#638) during the 39-minute Test run. Both times the merge was resolved by keeping both entries,
+  and the merged tree was re-tested before pushing.
+- Asotin tax coverage is 6,086 of 13,612 parcels checked within 10 days (44.7%), short of the 95% gate.
+  The parcel inventory heartbeat was 2026-11-13 23:25 UTC. The connectors stay off.
+
+**Caught & fixed:** nothing new in code.
+
+**Post-deploy security review** (§15, scoped to `c8fcfecb`; Claude and Codex, Codex verdict GO, no
+Critical or High):
+- Live catalog checks: RLS is on for `probate_notices`. The only policies are for `bridgeleads_system`
+  and `bridgeleads_purge`. `anon`, `authenticated` and `bridgeleads_app` cannot SELECT.
+  `privacy_erase_probate` is SECURITY DEFINER, owned by `bridgeleads_purge`, with
+  `search_path = pg_catalog, pg_temp`, and only the purge and system roles can execute it.
+- Static checks pass for secrets, http URLs, dependencies, SSRF (`safe_get`), CSV sanitizing and tenant
+  scoping.
+- **Medium (open): erasure misses representatives.** `src/privacy/erase.py` `_scan_probate` matches a
+  deletion rule only against each parcel's decedent and owner of record, never `personal_reps`. A
+  representative's own deletion request leaves their name on the notice until the 180-day retention.
+- **Medium (open; Codex severity, Claude reads it as low practical risk):** the ArcGIS `where` clause in
+  `asotin_parcels.query_surname` is built from text. The surname must match `^[A-Z][A-Z'\-]{1,40}$` and
+  its quotes are doubled; ArcGIS REST has no bound parameters.
+- Low: `probate_ingest` logs `str(exc)[:120]` on a re-check failure, so a database error's parameters
+  would only be kept out of the log by the 120-character cut.
+
+**Pending / Handoff:**
+- The first scheduled chance to write `probate_notices` is the 2026-11-16 10:00 UTC crawl (it may also fail
+  or find no probate notice). Check it with
+  aggregates only (outcome counts, `max(fetched_at)`, heartbeat age); a heartbeat alone does not prove
+  ingestion.
+- The two Medium findings above.
+- Owner decision: the app-wide "Current Owner" (`tasks_helpers/enrich.py`, `assessor_current_owner`) can
+  show an "ESTATE C/O <rep> PR" string for probate leads in any county. Codex recommends not filling it
+  for probate until a display rule is approved, and dealing with values already stored.
+- Asotin activation waits on 95% tax coverage and owner release approval.
+
+**Facts learned:**
+- A conflicted PR gets no pull_request CI, which looks exactly like CI that hasn't started. Two branches
+  that both add a top journal entry can conflict, as these did.
+- `crawl_nts_nwmarket_asotin` runs daily at 10:00 UTC whether or not the connector is active, so a deploy
+  after 10:00 waits a day for its first crawl.
+
+---
+
 ## 2026-11-14 — Asotin probate from Lewiston Tribune notices to creditors (branch `feat/asotin-wa-probate-notices`)
 
 **Built / Shipped (branch only, not merged):** Asotin's recorder (Helion) is behind a reCAPTCHA,

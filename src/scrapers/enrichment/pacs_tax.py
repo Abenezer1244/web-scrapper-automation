@@ -29,7 +29,11 @@ from decimal import Decimal, InvalidOperation
 
 from bs4 import BeautifulSoup
 
-from src.scrapers.enrichment.pacs import normalize_pacs_parcel, parse_pacs_detail_html
+from src.scrapers.enrichment.pacs import (
+    normalize_pacs_parcel,
+    pacs_owner_names,
+    parse_pacs_detail_html,
+)
 
 FOUND = "found"
 UNPARSED = "unparsed"
@@ -98,10 +102,7 @@ def parse_tax(html: str, parcel_key: str) -> TaxAnswer:
     if len(geo_ids) != 1 or normalize_pacs_parcel(geo_ids[0]) != parcel_key:
         return TaxAnswer(PARCEL_MISMATCH)
     soup = BeautifulSoup(html, "html.parser")
-    owners = [td.find_next_sibling("td").get_text(" ", strip=True)
-              for td in soup.find_all("td", string=re.compile(r"^\s*Name:\s*$"))
-              if td.find_next_sibling("td")]
-    owners = list(dict.fromkeys(o for o in owners if o))
+    owner_name = pacs_owner_names(html)
     situs = ", ".join(line for line in (page["situs"] or []) if line) or None
     mail = parse_detail(html, parcel_key)  # same co-owner / ambiguity rules as mailing
     as_of_m = _AS_OF.search(soup.get_text(" "))
@@ -124,6 +125,6 @@ def parse_tax(html: str, parcel_key: str) -> TaxAnswer:
         return TaxAnswer(UNPARSED)  # a renamed row class must not read as "paid"
     return TaxAnswer(
         FOUND, as_of=as_of, statements=statements,
-        owner_name=" & ".join(owners)[:512] or None, property_address=situs,
+        owner_name=owner_name, property_address=situs,
         mailing_address=mail.mailing_address if mail.outcome == MAIL_FOUND else None,
     )

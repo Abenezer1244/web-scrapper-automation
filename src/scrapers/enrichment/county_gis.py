@@ -943,6 +943,8 @@ def batch_enrich_parcels_gis(
                     continue
                 row = dict(results.get(pid) or _empty())
                 row["mailing_address"] = answer.mailing_address
+                # The assessor's current owner, when the source names it (PACS).
+                row["owner_name"] = getattr(answer, "owner_name", None)
                 row["mailing_source"] = _BULK_MAILING_SOURCES[county_key]
                 row["mailing_role"] = answer.role
                 row["mailing_revision"] = answer.revision

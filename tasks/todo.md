@@ -364,3 +364,33 @@ Root cause: county coverage gap in the shared enrichment (no mailing source outs
   definer function callable through PUBLIC within the hour.
 - Owner: disable the Supabase Data API in the dashboard (nothing uses it); send the customer note (draft in session
   scratchpad). Customer already re-ran Pierce after the fix: settled 2026-11-07, 8 found / 1 not found.
+
+## Canary: per-type down state + recovery alert (2026-11-15)
+
+Why: `health_status` is one flag per connector, so (a) a second broken record type on an
+already-down connector never paged, and (b) a connector-level down->healthy flip can be
+another type recovering. Codex consult before build; owner chose Redis + email-only recovery.
+
+- [x] Redis marker per (connector id, record type) = the bad kind it was paged with
+      (`canary` / `canary_zero_output`); written only after the unit's status commits
+- [x] DOWN pages when THIS type is not already marked down (was: connector-level status)
+- [x] Same-type success (records this week, or historical hit) clears the marker and,
+      if one was set, sends "Canary RECOVERED" to e-mail + audit row only (no Better
+      Stack: its webhook would open a new incident, not resolve the DOWN one)
+- [x] Tests on real Postgres + Redis: Lewis mixed-type false recovery, second-type DOWN
+      pages, zero-output recovery, inconclusive history is not recovery, no PII in bodies
+- [x] Codex review gate, ruff, canary + ops-alert tests
+
+Accepted limits (Codex): Redis is best-effort (lost key = missed recovery mail or one
+extra DOWN page, still cooldown-limited); marker cleared before the send, so a failed
+e-mail loses that recovery (the audit row still records it); DOWN cooldowns untouched,
+so a flap back to down within the cooldown stays suppressed as today.
+
+Review: Codex consult -> owner picked Redis + e-mail-only -> build -> Codex NO-GO x2
+(High: undelivered DOWN never retried; Mediums: time limits swallowed by the Redis
+handlers, webhook=False untested through the real sender) -> fixed: DOWN marker stored
+`canary_unsent` and promoted to `canary` only after delivery, reraise_time_limit in every
+Redis handler, real-sender tests sync + running loop -> Codex GO. 55 passed locally
+(test_canary_check, test_ops_alerts); enrichment canary 11 passed. Pre-existing local-only
+failure: test_db_canary::test_the_next_tick_samples_again_once_the_gate_expires fails on
+unchanged main too (key gone before pttl; slow local Redis connect), unrelated.

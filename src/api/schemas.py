@@ -1067,6 +1067,12 @@ class ScraperConfigResponse(BaseModel):
     # Filled by GET /scrapers and GET /scrapers/{id}. Null on every other route
     # means "not computed", never "allowed".
     run_eligibility: ConfigRunEligibilityResponse | None = None
+    # Filled by GET /scrapers/{id} for a pre-foreclosure scraper whose county offers a
+    # document-type choice: the county's CURRENT {token: label} list and how it is
+    # matched. Read from the registry, not the connectors list, so the Edit page can
+    # repair a saved selection even while the county's connector is down or hidden.
+    doc_type_options: dict[str, str] | None = None
+    doc_type_confidence: str | None = None
 
     model_config = {"from_attributes": True}
 

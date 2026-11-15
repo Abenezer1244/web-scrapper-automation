@@ -1936,6 +1936,10 @@ class NtsNotice(Base):
             "principal_owing_basis IN ('principal', 'sum_owing')",
             name="ck_nts_notices_principal_owing_basis",
         ),
+        CheckConstraint(
+            "address_source IS NULL OR address_source IN ('assessor_situs', 'notice')",
+            name="ck_nts_notices_address_source",
+        ),
         Index(
             "ix_nts_notices_addr_active", "property_address_normalized",
             postgresql_where=text("is_active AND property_address_normalized IS NOT NULL"),
@@ -1983,6 +1987,12 @@ class NtsNotice(Base):
     # never writes it) and read by every pass, live or past: a cancelled sale is never
     # an auction lead and never stamps an auction onto a pre-foreclosure lead.
     cancelled_at = Column(DateTime(timezone=True), nullable=True)
+    # Migration 163: 'assessor_situs' when property_address is the parcel's current site
+    # address, looked up and frozen at approval; 'notice' when it is what the notice
+    # printed; NULL for every older row and other source. address_on_notice keeps the
+    # printed address when the assessor's replaced it.
+    address_source = Column(String(32), nullable=True)
+    address_on_notice = Column(String(512), nullable=True)
 
 
 class NtsRecorderDocument(Base):

@@ -1,17 +1,21 @@
-"""Columbia (WA): death_certificate on the recorder, and the tax connector.
+"""Columbia (WA): recorder switched off, death_certificate on it, and the tax connector.
 
 WHY (tasks/columbia-wa-seven.md, owner decisions 2026-11-14):
-- The iDocMarket recorder connector now collects recorded CERTIFICATE OF DEATH as
-  death_certificate (IDocMarketScraper), so the connector offers it.
+- The recorder connector is set INACTIVE. iDocMarket's Site Terms §2 prohibit
+  "systematically" or "programmatically" downloading its data; access must be manual.
+  It stays off until Tyler / the County give written permission; downgrade never turns
+  it back on. (Production was switched off by hand the same day; this keeps it so.)
+- It now collects recorded CERTIFICATE OF DEATH as death_certificate
+  (IDocMarketScraper), so the connector offers it once permitted.
 - Seeds the tax_delinquent connector (ColumbiaWATaxDelinquentScraper, read from the
   pacs_tax_status cache that workers/pacs_tax_crawler fills) INACTIVE: the registry
   and /scrapers/connectors hide it until an operator activates it (nothing does that
   automatically: do it once the crawl covers >= 95% of the county), as Asotin's (151).
 
 NO assessor_url on either row, on purpose: a PACS assessor_url turns on the owner-NAME
-lookup for recorder leads (enrich.py), and the owner decided Columbia gets addresses
-only from its recorded legal description (a matcher still to be built), never from a
-name match alone. The enrichment takes the first active Columbia connector's
+lookup for recorder leads (enrich.py), and the owner decided Columbia never gets
+addresses from a name match alone (a legal-description matcher was measured and set
+aside: about 0 placements a quarter from the index's first legal). The enrichment takes the first active Columbia connector's
 assessor_url, so the tax row must not carry one either. Parcel-keyed mailing for tax
 leads (pacs_parcel, PACS_SITES) does not depend on it.
 
@@ -44,6 +48,7 @@ _RECORDER = (f"id = '{_RECORDER_ID}' AND lower(county) = 'columbia' AND lower(st
 
 
 def upgrade() -> None:
+    op.execute(f"UPDATE county_connectors SET active = false WHERE {_RECORDER}")
     op.execute(f"""
         UPDATE county_connectors
         SET record_types = (record_types::jsonb || '["death_certificate"]'::jsonb)::json
@@ -65,6 +70,8 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    # The recorder's `active` is left as it is: switching it on again would resume
+    # access the source's terms prohibit.
     op.execute(f"DELETE FROM county_connectors WHERE id = '{_TAX_ID}'")
     op.execute(f"""
         UPDATE county_connectors

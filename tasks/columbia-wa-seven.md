@@ -76,7 +76,7 @@ public index. Our death_certificate = the publicly RECORDED certificate in the A
 - [x] iDocMarket searches paced 20 s (4640df3f); live re-proof 3 searches, no block.
 - [x] Trustee_sale / divorce / code_violation: documented blocked (paid access / no public case data).
 - [x] Codex per phase (all GO); final adversarial r1-r3 NO-GO, all fixed; r4 GO. Full suite 8,391 passed.
-- [ ] Next PR: recorded-legal-description -> parcel matcher for Columbia recorder leads (owner decision).
+- [x] Legal-description matcher: measured and set aside (owner decision), see below.
 
 ## Review (2026-11-14)
 
@@ -90,16 +90,16 @@ inventory refreshed within 14 days; no assessor_url on Columbia rows).
 
 | Type | Source | Status | Verified evidence |
 |---|---|---|---|
-| probate | iDocMarket LACK OF PROBATE AFFIDAVIT | Implemented, pending validation | live 2 rows (08/16-11/13); no address until legal matcher |
-| death_certificate | iDocMarket CERTIFICATE OF DEATH (recorded) | Implemented, pending validation | live 9 rows / 4 in 10/15-11/13 with dates; no address until matcher |
-| pre_foreclosure | iDocMarket NTS (borrower rows only) | Implemented, pending validation | live 1 row; lender->trustee NTS dropped |
+| probate | iDocMarket LACK OF PROBATE AFFIDAVIT | Blocked by source terms (code done, connector OFF) | live 2 rows (08/16-11/13); iDocMarket ToS §2 |
+| death_certificate | iDocMarket CERTIFICATE OF DEATH (recorded) | Blocked by source terms (code done, connector OFF) | live 9 rows / 4 in 10/15-11/13 with dates |
+| pre_foreclosure | iDocMarket NTS (borrower rows only) | Blocked by source terms (code done, connector OFF) | live 1 row; lender->trustee NTS dropped |
 | tax_delinquent | PACS per-parcel crawl, 5,280 distinct parcels | Implemented, pending validation (connector INACTIVE) | live tax pages 2/2 found; activate at >=95% coverage + canaries |
 | trustee_sale | sale date only in subscription images / newspaper | Blocked by source access | owner reviewing pricing |
 | divorce | Superior Court Odyssey (paid) / Digital Archives | Blocked by source access | GR 31; owner reviewing pricing |
 | code_violation | county / Dayton / Starbuck | Blocked by source access | no public case log |
 
 **Before activation:** deploy (migration 160 runs on API boot; renumber again if another county lands first);
-recorder: read iDocMarket Site Terms, keep searches paced (403 seen after ~12/hour); tax: wait for
+recorder: stays OFF (see below); tax: wait for
 >=95% fresh coverage, run paid/owing/held canaries, then set the tax connector active; do not add the
 county to public coverage until the owner approves.
 
@@ -127,3 +127,25 @@ delivery hold yet (separate PR).
 1. Delivery hold for recorder leads without verified owner/parcel/address (no general hold exists; Asotin Codex finding).
 2. Legal-description -> parcel resolver (stronger than name match; new code) — build now or later?
 3. tax_delinquent per-parcel crawl of 5,477 parcels, paced like Asotin — approve the first broad run.
+
+## iDocMarket terms and the recorder (2026-11-14, owner decisions)
+iDocMarket Site Terms (www.idocmarket.com/Terms) §2: "It is strictly prohibited ... to systematically
+download or programmatically download data ... The User agrees to access the information contained in
+the site manually and not programmatically by macro or other automated means." §4 forbids disguising
+origin. No exception; contact idocsupport@tylertech.com. About 20 automated test searches were run from
+this machine before the terms were read.
+- Production connector 57cd7eed set active=false by hand (owner-approved; no customer configs).
+  Canary, registry, API listings, batches and jobs select only active connectors, so no new run can
+  resolve the recorder. (Its domain stays on a worker's in-process allowlist until restart, and
+  deactivation cannot stop a run already in flight; Columbia had never run a job.)
+- Migration 160 keeps it off; downgrade never switches it on. Code stays (tested) for a permitted feed.
+- Re-enable only with written permission from Tyler Technologies or the Columbia County Auditor.
+
+## Legal-description matcher: measured, set aside (owner decision)
+Columbia's own ArcGIS layer TaxParcels (services9.arcgis.com/zq1Ay6bxXC1T1CBk, 5,488 rows) carries every
+parcel's full Legal + Geo_ID, so candidates need no code->name crosswalk. But on the 13 real recorder
+leads (08/16-11/13): 8 have no legal or an unsupported form, 4 platted legals are ambiguous (lots split
+across 2-3 parcels; the index gives only the first legal, without "ELY 20'"), 1 unique hit fails the
+full-extent rule (record: lot 19; parcel: lots 19 & 20). About 0 placements a quarter. Preconditions to
+revisit: permitted access AND the full legal (document text). Design + Codex consult:
+bl-wt/codex_columbia_legal_consult_r1.txt (identity must be set before save, Chelan contract).

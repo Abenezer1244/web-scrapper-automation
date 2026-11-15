@@ -60,10 +60,18 @@ never checked the inventory's age (14 days); `^\s*\d` accepted "1ST ST" and a ZI
 Two full-suite failures were my own edits made while the 51-minute suite ran (`inspect.getsource`
 read shifted lines): never edit files during a full run.
 
-**Pending / Handoff:** Owner: push/PR/deploy; read iDocMarket Site Terms; pricing for trustee_sale /
+**Later the same day:** iDocMarket's Site Terms (§2) prohibit programmatic or systematic downloading,
+with no exception, and I had run ~20 automated searches before reading them. Production connector
+57cd7eed was switched off by hand (owner-approved; no customer configs) and migration 160 keeps it off:
+probate, death_certificate and pre_foreclosure are blocked by source terms, code kept for a permitted
+feed. The legal-description matcher was measured on the 13 real leads (county TaxParcels layer has full
+legals): ~0 placements a quarter (8 no/unsupported legal, 4 ambiguous split lots, 1 fails full extent);
+set aside by owner decision. Lesson: read a source's terms BEFORE the first automated request.
+
+**Pending / Handoff:** Owner: push/PR/deploy; written permission from Tyler/County if the recorder is wanted; pricing for trustee_sale /
 divorce. After deploy: verify Columbia rows' assessor_url stay NULL, wait for >= 95% tax coverage
-(~5,280 keyed parcels), run owing/paid/held/privacy canaries, then activate the tax connector. Next
-PR: legal-description -> parcel matcher. Renumbered to 160 when merging main (158-159 taken); renumber again if another county lands first.
+(~5,280 keyed parcels), run owing/paid/held/privacy canaries, then activate the tax connector. The
+legal-description matcher was set aside (see "Later the same day" above). Renumbered to 160 when merging main (158-159 taken); renumber again if another county lands first.
 
 **Facts learned:** Columbia PACS (Harris 9.0.50): Geo IDs 13 digits = statewide ORIG_PARCEL_ID;
 newest roll "2026 - 2027" is the current-ownership roll; detail pages need `&year=`. Statewide layer

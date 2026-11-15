@@ -156,13 +156,16 @@ def test_migration_upgrades_the_recorder_seeds_tax_inactive_and_reverts():
         _run(mig.upgrade)  # idempotent
         with system_sync_session() as s:
             rows = {r[0]: r[1:] for r in _connectors(s)}
+            # Switched off: iDocMarket's terms prohibit programmatic access.
             assert rows[mig._RECORDER_ID] == ("", '["probate", "pre_foreclosure", "death_certificate"]',
-                                              None, True)
+                                              None, False)
             assert rows[_DECOY_ID] == before  # matched by id, never by URL alone
             assert rows[mig._TAX_ID] == (mig._TAX_CLASS, '["tax_delinquent"]', None, False)
         _run(mig.downgrade)
         with system_sync_session() as s:
-            assert {r[0]: r[1:] for r in _connectors(s)} == {mig._RECORDER_ID: before, _DECOY_ID: before}
+            # Downgrade never switches the recorder back on.
+            assert {r[0]: r[1:] for r in _connectors(s)} == {
+                mig._RECORDER_ID: ("", '["probate", "pre_foreclosure"]', None, False), _DECOY_ID: before}
     finally:
         with system_sync_session() as s:
             s.execute(text("DELETE FROM county_connectors WHERE county = 'columbia'"))

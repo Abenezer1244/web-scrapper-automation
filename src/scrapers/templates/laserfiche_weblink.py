@@ -164,6 +164,47 @@ def _primary_party(names: list[str]) -> list[str]:
     return [n for n in names if _surname_key(n) == key]
 
 
+def read_recorder_pdf(url: str, app_root: str, max_bytes: int, fetch) -> bytes:
+    """A recorded document's PDF, from its own recorder only, byte-capped, or ValueError.
+    ``fetch(url, path, max_bytes)`` streams it to ``path`` and must abort past the cap
+    (safe_download_to_file does)."""
+    import os
+    import tempfile
+
+    from src.utils.safe_http import same_origin
+
+    # scheme + host + PORT: the session cookie must reach nothing else (Codex 3b P2)
+    if not url.startswith("https://") or not same_origin(url, app_root):
+        raise ValueError("PDF served from another host")
+    fd, path = tempfile.mkstemp(suffix=".pdf")
+    os.close(fd)
+    try:
+        try:
+            fetch(url, path, max_bytes)
+        except Exception as exc:
+            raise ValueError(f"PDF download failed ({type(exc).__name__})") from exc
+        with open(path, "rb") as fh:
+            data = fh.read(max_bytes + 1)
+    finally:
+        os.remove(path)
+    if len(data) > max_bytes:
+        raise ValueError(f"PDF over {max_bytes} bytes")
+    if not data.startswith(b"%PDF-"):
+        raise ValueError("download is not a PDF")
+    return data
+
+
+def _nts_kind(doc_type: str) -> str | None:
+    """"nts" for a Notice of Trustee's Sale, "nod" for its Discontinuance, else None
+    (Cowlitz labels: "Notice Of Trustees Sale", "Discont Of Trustees Sale")."""
+    doc = (doc_type or "").upper()
+    if "TRUSTEE" not in doc or "SALE" not in doc:
+        return None
+    if doc.startswith("DISCONT"):
+        return "nod"
+    return "nts" if doc.startswith("NOTICE") else None
+
+
 def _afn_base(afn: str) -> str:
     """Grid AFN "3799745-0" -> entry AFN "3799745"."""
     return (afn or "").strip().split("-")[0]
@@ -621,6 +662,75 @@ class LaserficheWebLinkScraper(BridgeScraper):
         except Exception as exc:
             _logger.info("Scroll advance failed: %s", str(exc)[:80])
             return False
+
+    # ── NTS crawler support (nts_crawler.crawl_nts_cowlitz_recorder) ─────────────
+    async def discover(self, date_from: str, date_to: str) -> list[dict]:
+        """Every recorded Notice of Trustee's Sale and Discontinuance of Trustee's Sale in
+        the window, from the same complete per-day read as scrape(); each with its entry
+        properties: {item_id, instrument, doc_code, record_date, recording_apns, related,
+        href}. doc_code is the recorder's code ("NTTRUS"), except a discontinuance is
+        "NOD", the staging table's code for one. Call inside ``async with``."""
+        rows = await self._collect(date_from, date_to)
+        found: list[dict] = []
+        for row in rows:
+            kind = _nts_kind(row["doc_type"])
+            if kind is None:
+                continue
+            fields = await self._read_entry(row)
+            code = (fields.get("Rec Doc Document Type") or [""])[0].strip().upper()
+            if (kind == "nod") != (code == "DISTRS") or (kind == "nts") != (code == "NTTRUS"):
+                raise self._fail(f"AFN {row['afn']}: type {row['doc_type']!r} carries code {code!r}")
+            m = re.search(r"[?&]id=(\d+)", row.get("href") or "")
+            if not m:
+                raise self._fail(f"AFN {row['afn']}: no document id")
+            found.append({
+                "item_id": m.group(1),
+                "instrument": _afn_base(row["afn"]),
+                "doc_code": "NOD" if kind == "nod" else code,
+                "record_date": datetime.strptime(row["date"], "%m/%d/%Y").strftime("%m/%d/%Y"),
+                "recording_apns": list(dict.fromkeys(
+                    p.strip() for p in fields.get("Rec Doc Parcel", []) if p.strip())),
+                "related": [a.strip() for a in fields.get("Rec Doc Related AFN", []) if a.strip()],
+                "href": row["href"],
+            })
+        return found
+
+    async def fetch_pdf(self, doc: dict, max_bytes: int) -> bytes:
+        """The recorded document as the viewer's free "Print (as PDF)" serves it (no
+        watermark). The viewer generates it and starts a browser download of a
+        session-bound URL (/PDF10/<id>/<doc>); that download is cancelled at once and
+        the URL re-read through safe_download_to_file, so the byte cap and time limit
+        hold WHILE it streams (Codex 3b P2). Raises on any failure: never an empty
+        document."""
+        import asyncio
+
+        from src.utils.safe_http import safe_download_to_file, same_origin
+
+        afn = doc["instrument"]
+        await self.navigate(urljoin(self.app_root + "/", doc["href"]))
+        await self._entry_fields(afn)
+        try:
+            async with self.page.expect_download(timeout=120_000) as dl:
+                await self.page.locator("#STR_DOWNLOAD_PDF").click()
+                await self.page.get_by_role("button", name="Download & Print").click()
+            download = await dl.value
+            url = download.url
+            await download.cancel()
+        except Exception as exc:
+            raise self._fail(f"AFN {afn}: PDF not served ({type(exc).__name__})") from exc
+        if not same_origin(url, self.app_root):  # checked before any cookie is read
+            raise self._fail(f"AFN {afn}: PDF served from another host")
+        cookies = "; ".join(f"{c['name']}={c['value']}" for c in await self.page.context.cookies(url))
+        headers = {"Cookie": cookies, "User-Agent": await self.page.evaluate("navigator.userAgent")}
+
+        def _fetch(u: str, path: str, cap: int) -> None:
+            safe_download_to_file(u, path, max_bytes=cap, require_https=True, follow_redirects=False,
+                                  headers=headers, timeout=60, deadline_s=120)
+
+        try:
+            return await asyncio.to_thread(read_recorder_pdf, url, self.app_root, max_bytes, _fetch)
+        except ValueError as exc:
+            raise self._fail(f"AFN {afn}: {exc}") from exc
 
     def _type_matches(self, doc_type: str) -> bool:
         """Whether a raw row's document type belongs to the active record type."""

@@ -30,7 +30,7 @@ promoted grantee). `f0b6141f` Columbia PACS: `pacs.ownership_year()` reads the n
 county's own form offers and both requests of both lookup paths name it (Property.aspx answers 500
 without `&year=`); only `_YEAR_HOSTS` get a year. `4640df3f` 20 s between iDocMarket searches.
 `9f0dc9b0` Columbia tax_delinquent: Asotin's PACS tax reader made county-generic, Columbia subclass,
-crawler + trusted source + registry, migration 160, numbered 158 until main took 158-159 (recorder offers death_certificate; tax connector
+crawler + trusted source + registry, migration 162, numbered 158 then 160 until main took 158-161 (recorder offers death_certificate; tax connector
 seeded INACTIVE with a fixed id). Final-review fixes `1173939e`: see Caught & fixed. Full CI-equivalent suite after them: 8,391 passed, 0 failed. Plan, matrix, evidence:
 `tasks/columbia-wa-seven.md`.
 
@@ -62,7 +62,7 @@ read shifted lines): never edit files during a full run.
 
 **Later the same day:** iDocMarket's Site Terms (§2) prohibit programmatic or systematic downloading,
 with no exception, and I had run ~20 automated searches before reading them. Production connector
-57cd7eed was switched off by hand (owner-approved; no customer configs) and migration 160 keeps it off:
+57cd7eed was switched off by hand (owner-approved; no customer configs) and migration 162 keeps it off:
 probate, death_certificate and pre_foreclosure are blocked by source terms, code kept for a permitted
 feed. The legal-description matcher was measured on the 13 real leads (county TaxParcels layer has full
 legals): ~0 placements a quarter (8 no/unsupported legal, 4 ambiguous split lots, 1 fails full extent);
@@ -71,7 +71,7 @@ set aside by owner decision. Lesson: read a source's terms BEFORE the first auto
 **Pending / Handoff:** Owner: push/PR/deploy; written permission from Tyler/County if the recorder is wanted; pricing for trustee_sale /
 divorce. After deploy: verify Columbia rows' assessor_url stay NULL, wait for >= 95% tax coverage
 (~5,280 keyed parcels), run owing/paid/held/privacy canaries, then activate the tax connector. The
-legal-description matcher was set aside (see "Later the same day" above). Renumbered to 160 when merging main (158-159 taken); renumber again if another county lands first.
+legal-description matcher was set aside (see "Later the same day" above). Renumbered to 162 when merging main (158-161 taken); renumber again if another county lands first.
 
 **Facts learned:** Columbia PACS (Harris 9.0.50): Geo IDs 13 digits = statewide ORIG_PARCEL_ID;
 newest roll "2026 - 2027" is the current-ownership roll; detail pages need `&year=`. Statewide layer
@@ -82,6 +82,67 @@ parcel where names failed.
 
 ---
 
+## 2026-11-14 — Asotin probate from Lewiston Tribune notices to creditors (branch `feat/asotin-wa-probate-notices`)
+
+**Built / Shipped (branch only, not merged):** Asotin's recorder (Helion) is behind a reCAPTCHA,
+so probate now comes from the probate notices to creditors the nwmarket crawl already downloads.
+- Phase 1: `src/scrapers/sources/probate_nwmarket.py` reads a notice (cause `NN-4-NNNNN-02` plus
+  the Asotin court phrase; decedent, personal representatives, claims address, first publication).
+  `src/scrapers/enrichment/asotin_parcels.py` matches the decedent to parcels in the county's
+  public ArcGIS Parcels layer.
+- Phase 2: migration 160 `probate_notices` is system-only under RLS, with erasure through
+  `privacy_erase_probate`, owned by `bridgeleads_purge`, and a CHECK that keeps tombstones nameless.
+  `src/workers/probate_ingest.py` is hooked into `crawl_nts_nwmarket_asotin`: it matches before
+  writing, runs the privacy gate, re-checks held and failed notices for 30 days, and keeps notices
+  180 days.
+- Phase 3: `src/scrapers/asotin_wa_probate.py` delivers one lead per tied parcel. Migration 161
+  seeds the connector **inactive**, and the module is allowlisted.
+
+**Tried / Decided:**
+- Owner match rule "name + family tie" (2026-11-14). A parcel is delivered only on an exact name
+  match plus one tie: an estate-marked owner, a representative named on the parcel, a
+  representative sharing the whole surname, or billing address = claims address. Everything else
+  is held. Codex had proposed a stricter rule; the owner chose this one.
+- Asotin PACS has no owner-name search. Using the DBA field to get around that was rejected, and
+  the county ArcGIS layer is used instead.
+- Personal representatives only decide the tie and are never delivered.
+
+**Caught & fixed (Codex):**
+- Phase 1, about 12 rounds:
+  - address collisions, units and floor words, now a structural city/state/ZIP compare;
+  - estate markers leaking across co-owners; co-owner surname inheritance;
+  - organisations and trusts used as C/O addressees;
+  - wrongly typed values from the layer.
+- Phase 2:
+  - a transaction held open across network calls;
+  - a stale re-check overwriting newer answers, fixed with revision-conditional updates;
+  - one bad notice starving the others, fixed with per-row backoff;
+  - retention blocked by a failing sitemap read;
+  - layer failures remembered as "read".
+- Phase 3, NO-GO → GO:
+  - the owner-of-record copy could carry "C/O <rep> PR", so it was dropped;
+  - a fresh crawl heartbeat could hide notices still waiting on the layer;
+  - windows reaching past retention now fail;
+  - a street-only address keeps the parcel|address billing key from drifting.
+
+**Failed / Blocked:**
+- Railway trial expiry blocked the 11-13 deploy until the owner restored the plan.
+- `codex review --commit` refuses a custom prompt. `codex exec` waits on stdin unless it is given
+  `< /dev/null`.
+
+**Pending / Handoff:**
+- Push and PR; the owner runs `gh pr create`.
+- Activate with the Asotin release, after tax coverage reaches 95%.
+- Owner question: enrichment shows the assessor owner string as Current Owner on every county's
+  probate leads, and for an estate parcel that string can name the representative ("C/O ... PR").
+  Codex: not a blocker for this connector.
+- Divorce, death_certificate and pre_foreclosure remain blocked on the Helion captcha.
+
+**Facts learned:**
+- The Lewiston Tribune feed also carries Spokane (`-32`) and Idaho (CV29/CV35) probates.
+- Asotin sees about 2 probates per 4 days.
+- Live check 2026-11-14: cause 26-4-00122-02 matched one parcel through the shared surname;
+  cause 26-4-00117-02 was held (exact name match, no family tie).
 ## 2026-11-14 — Clark goes live: death certificates verified end to end, browser QA, parcel ids
 
 **Built / Shipped:** #631 merged (main `92db4278`), Railway auto-deployed api/worker/beat; owner

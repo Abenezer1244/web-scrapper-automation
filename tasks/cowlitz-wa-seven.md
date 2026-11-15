@@ -88,7 +88,14 @@ Run Phases 1-3 in a row (Codex review per phase). Build tax_delinquent from the 
   if needed) and prove it per window (count == total, AFN coverage), else raise; `_extract_page`
   errors raise; keep all parcels of a multi-parcel doc, no auto-pick; per-county minimum parcel length
   (Cowlitz 5). Offline fixtures from saved live HTML. Live re-proof on one bounded window.
-- [ ] **Phase 2 — death_certificate** (template map split, doc scope/registry, migration adding the type
+- [x] **Phase 2 — done 2026-11-15 (Codex GO; one Low added as scrape-level tests).** Map split
+  (probate no longer carries certificates), death_certificate routed through orient_probate_party,
+  shared agency regexes accept the recorder's "DEPARMENT" (1 prod Cowlitz probate lead named the
+  agency as decedent), migration 162 verified up / re-run / down / up on the local DB. Billing
+  identity is record-type-free (tasks.py:1251/1477), so reclassifying never re-bills. Live
+  10/15-11/14: 1,428/1,428 rows, 4 certificates -> 3 leads (2 found, 1 ambiguous with 6 parcels;
+  1 with no parcel dropped). Original scope:
+  **Phase 2 — death_certificate** (template map split, doc scope/registry, migration adding the type
   to connector `edfee01c`): decedent = grantee when the State is grantor; parcel required.
 - [ ] **Phase 3 — trustee_sale** (recorder NTS + Discontinuance, image fetch + existing OCR + existing
   review flow): first verify the free page-image endpoint; never invent a sale date or amount.

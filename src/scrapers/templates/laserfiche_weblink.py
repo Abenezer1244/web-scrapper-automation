@@ -47,10 +47,13 @@ _DOC_TYPE_MAP = {
     # CONTRACT". "ESTATE OF" only appears on genuine probate filings.
     "probate": [
         "PROBATE", "LETTERS TESTAMENTARY", "LETTERS OF ADMINISTRATION",
-        "PERSONAL REPRESENTATIVE", "PERSONAL REP", "DEATH CERTIFICATE",
+        "PERSONAL REPRESENTATIVE", "PERSONAL REP",
         "AFFIDAVIT OF HEIRSHIP", "TRANSFER ON DEATH", "ESTATE OF",
         "WILL", "HEIR",
     ],
+    # The publicly RECORDED certificate ("Death Certificate", "Death Certificate to
+    # Perfect Death Deed"), as King/Chelan/Clark define the type; never a vital record.
+    "death_certificate": ["DEATH CERTIFICATE"],
     "pre_foreclosure": [
         "LIS PENDENS", "NOTICE OF TRUSTEE", "TRUSTEE SALE",
         "TRUSTEE'S SALE", "NOTICE OF DEFAULT", "FORECLOSURE",
@@ -529,7 +532,7 @@ class LaserficheWebLinkScraper(BridgeScraper):
             everyone = [n.strip() for side in (grantor, grantee) for n in side.split(" / ") if n.strip()]
             others = [n for n in dict.fromkeys(everyone) if n not in lead]
             record.heirs = " / ".join(others) or None
-        elif self.active_record_type == "probate":
+        elif self.active_record_type in ("probate", "death_certificate"):
             # Agency grantor + decedent grantee (Certificate of Death) is promoted;
             # "Estate of" captions are stripped.
             record.party_name, record.heirs = orient_probate_party(grantor, grantee, doc_type)

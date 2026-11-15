@@ -18,7 +18,12 @@ Volume reference (Cowlitz 2026-04-12):
 - 7-day total: 475 records (all types)
 """
 
+import html
 import re
+from datetime import datetime, timedelta
+from urllib.parse import urljoin
+
+from bs4 import BeautifulSoup
 
 from src.api.middleware.security import add_scrape_domain
 from src.scrapers.base_scraper import (
@@ -32,7 +37,7 @@ from src.scrapers.preforeclosure import (
     orient_pre_foreclosure_party,
 )
 from src.scrapers.probate import orient_probate_party
-from src.scrapers.reliability import detect_block
+from src.scrapers.reliability import ScraperExecutionError, detect_block
 from src.utils.logger import setup_logger
 
 _logger = setup_logger("scraper.template.laserfiche")
@@ -58,6 +63,112 @@ _DOC_TYPE_MAP = {
         "DIVORCE", "DISSOLUTION", "DECREE OF DISSOLUTION",
     ],
 }
+
+
+_APN_LOOKUP_KEY = "recording_apn_lookup"
+_COUNT_RE = re.compile(r"(\d[\d,]*)\s+Results?\b")
+_FIELD_LABEL_RE = re.compile(r"^Rec Doc [A-Za-z ]+$")
+
+
+def parse_result_count(body: str) -> int | None:
+    """The portal's "N Results" count (commas allowed), or None if not rendered."""
+    m = _COUNT_RE.search(body or "")
+    return int(m.group(1).replace(",", "")) if m else None
+
+
+def parse_entry_html(soup: BeautifulSoup) -> dict[str, list[str]]:
+    """Entry properties from the DocView's ``#metadataTable``: one ``tr.fieldPane`` per
+    field, the label in its first cell and one ``div`` per value in the second (a
+    multi-valued field keeps every value). {} when the table has not rendered."""
+    fields: dict[str, list[str]] = {}
+    table = soup.find(id="metadataTable")
+    if table is None:
+        return fields
+    for tr in table.find_all("tr", class_="fieldPane"):
+        cells = tr.find_all("td", recursive=False)
+        if len(cells) < 2:
+            continue
+        label = cells[0].get_text(" ", strip=True)
+        if not _FIELD_LABEL_RE.match(label):
+            continue
+        values = [d.get_text(" ", strip=True) for d in cells[1].find_all("div", recursive=False)]
+        if not values and cells[1].get_text(strip=True):
+            values = [cells[1].get_text(" ", strip=True)]
+        fields[label] = [v for v in values if v]
+    return fields
+
+
+def entry_render_complete(soup: BeautifulSoup) -> bool:
+    """Whether the properties table finished rendering. The viewer renders one empty
+    ``tr.fieldPane`` placeholder per field and then that field's labelled row (live
+    2026-11-15: an NTS 8 + 8, a death certificate 10 + 10; empty fields are omitted from
+    both), so a table with fewer labelled rows than placeholders is still loading."""
+    table = soup.find(id="metadataTable")
+    if table is None:
+        return False
+    rows = table.find_all("tr", class_="fieldPane")
+    placeholders = sum(1 for tr in rows if not tr.find_all("td", recursive=False))
+    labelled = sum(1 for tr in rows if len(tr.find_all("td", recursive=False)) >= 2)
+    return labelled > 0 and labelled == placeholders
+
+
+def entry_contradicts_row(row: dict, fields: dict[str, list[str]]) -> str | None:
+    """Why the entry properties cannot be the complete record behind this grid row, or
+    None. The grid shows the FIRST value of each field (party names cut to the column
+    width), so every value it shows must appear in the properties: a missing one means
+    the pane did not finish loading or the portal changed shape."""
+    entry_type = (fields.get("Rec Doc Type Desc") or [""])[0].strip().upper()
+    row_type = (row.get("doc_type") or "").strip().upper()
+    if not row_type or not entry_type.startswith(row_type):
+        return "document type differs from the result row"
+    parcel = (row.get("parcel") or "").strip()
+    if parcel and parcel not in [p.strip() for p in fields.get("Rec Doc Parcel", [])]:
+        return f"result-row parcel {parcel!r} missing"
+    for side in ("grantor", "grantee"):
+        shown = normalize_party_text(row.get(side) or "").upper()
+        values = [v.upper() for v in fields.get(f"Rec Doc {side.title()}", [])]
+        if shown and not any(v.startswith(shown) or shown.startswith(v) for v in values):
+            return f"result-row {side} missing"
+    return None
+
+
+_SURNAME_PARTICLES = frozenset({"DE", "DEL", "DELA", "LA", "LE", "LOS", "LAS", "DI", "DA", "DOS",
+                                "DU", "VAN", "VON", "DER", "DEN", "ST", "SAN", "SANTA", "MC", "MAC", "O"})
+
+
+def _surname_key(name: str) -> str | None:
+    """The surname of a LAST FIRST index name, or None when it cannot be told apart
+    reliably (a compound or hyphenated surname: "DE LA CRUZ", "SMITH-JONES")."""
+    tokens = name.upper().split()
+    if len(tokens) < 2:
+        return None
+    first = tokens[0].rstrip(",.")
+    # Hyphenated / apostrophe surnames (SMITH-JONES, O'BRIEN) and particles are uncertain.
+    if not re.fullmatch(r"[A-Z]+", first) or first in _SURNAME_PARTICLES:
+        return None
+    return first
+
+
+def _primary_party(names: list[str]) -> list[str]:
+    """The lead: the index's primary person, plus co-parties sharing that surname. The
+    full entry properties list junior lienholders, occupants and agencies beside the
+    borrower (live 2026-11-15: an NTS with six person-like grantees, an LP naming
+    "SECRETARY OF HOUSING & URBAN DEVELOPMENT"); none of them may be presented as the
+    lead. When the surname is uncertain only the primary person is kept."""
+    key = _surname_key(names[0])
+    if key is None:
+        return names[:1]
+    return [n for n in names if _surname_key(n) == key]
+
+
+def _afn_base(afn: str) -> str:
+    """Grid AFN "3799745-0" -> entry AFN "3799745"."""
+    return (afn or "").strip().split("-")[0]
+
+
+def _is_trustee_sale_notice(doc_type: str) -> bool:
+    doc = (doc_type or "").upper()
+    return "NOTICE" in doc and "TRUSTEE" in doc and "SALE" in doc
 
 
 def _doc_type_matches(doc_type: str, keywords: list[str]) -> bool:
@@ -134,343 +245,329 @@ class LaserficheWebLinkScraper(BridgeScraper):
             add_scrape_domain(host)
 
     async def scrape(self, date_from: str, date_to: str) -> list[ScrapedRecord]:
-        """Scrape records from a Laserfiche WebLink portal."""
+        """Scrape records from a Laserfiche WebLink portal.
 
+        1. Collect EVERY raw result row of the window, proven complete against the
+           portal's "N Results" count (windows that come up short are split).
+        2. Keep the rows of the active record type.
+        3. Read each kept document's full entry properties: the results grid shows
+           only the FIRST grantee / parcel of a multi-valued field.
+        """
         _logger.info(
             "Laserfiche WebLink scraper - %s/%s - %s to %s",
             self.county, self.state, date_from, date_to,
         )
+        rows = await self._collect(date_from, date_to)
+        kept = [r for r in rows if self._type_matches(r["doc_type"])]
+        records: list[ScrapedRecord] = []
+        for row in kept:
+            fields = await self._read_entry(row)
+            record = self._build_record(row, fields)
+            if record is not None:
+                records.append(record)
 
-        # Navigate to the search page
+        if self.require_parcel_id:
+            # An ambiguous (multi-parcel) recording is retained with no parcel: it is
+            # never delivered or billed (no address), but it is not silently lost.
+            records = [
+                r for r in records
+                if r.parcel_id or r.enrichment_data.get(_APN_LOOKUP_KEY) == "ambiguous"
+            ]
+        _logger.info(
+            "Laserfiche %s %s: %d raw rows, %d of type, %d records",
+            self.county, self.active_record_type, len(rows), len(kept), len(records),
+        )
+        return records
+
+    def _fail(self, reason: str, date_from: str | None = None, date_to: str | None = None):
+        return ScraperExecutionError(
+            self.county, "Laserfiche WebLink", reason,
+            record_type=self.active_record_type, date_from=date_from, date_to=date_to,
+        )
+
+    async def _collect(self, date_from: str, date_to: str) -> list[dict]:
+        """Every raw row of the window, one search per day, or raise.
+
+        The virtual-scroll grid loses rows on large result sets (live 2026-11-15: 8
+        days, 339 of 399; 30 days, 1,048 of 1,428) but a single day reads whole (97/97,
+        74/74). A day whose captured rows differ from the portal's own count fails the
+        job: a partial day is never delivered as complete.
+        """
+        start = datetime.strptime(date_from, "%m/%d/%Y")
+        end = datetime.strptime(date_to, "%m/%d/%Y")
+        if start > end:
+            raise self._fail("date_from is after date_to", date_from, date_to)
+        days = (end - start).days + 1
+        rows: list[dict] = []
+        for i in range(days):
+            day = (start + timedelta(days=i)).strftime("%m/%d/%Y")
+            total, day_rows = await self._search(day, day)
+            if len(day_rows) != total:
+                raise self._fail(
+                    f"captured {len(day_rows)} of {total} rows for {day}", day, day,
+                )
+            rows.extend(day_rows)
+            if self.on_progress:
+                self.on_progress(i + 1, days, None, unit="day")
+        return rows
+
+    async def _search(self, date_from: str, date_to: str) -> tuple[int, list[dict]]:
+        """Run one date-range search; return (portal count, distinct raw rows)."""
         search_url = f"{self.app_root}/CustomSearch.aspx?SearchName=Search&dbid=0&repo=CCIMAGES"
         await self.navigate(search_url)
         try:
             await self.page.wait_for_load_state("networkidle", timeout=15_000)
-        except Exception:
+        except Exception:  # noqa: BLE001 -- the date fill below fails loud if the page is not there
             pass
         await self.page.wait_for_timeout(2_000)
-
-        # Fill date range
-        _logger.info("Filling dates: %s to %s", date_from, date_to)
         try:
             await self.page.locator("#Search_Input0").fill(date_from)
             await self.page.locator("#Search_Input0_end").fill(date_to)
+            await self.page.locator("input[type='submit'][value='Submit']").first.click()
         except Exception as exc:
-            # A failed date-fill means the search never ran — fail loud rather
-            # than return [] (which would score as a healthy 0-record scrape).
-            raise RuntimeError(
-                f"{self.county}: Laserfiche date-fill failed — search page never "
-                f"loaded / blocked: {type(exc).__name__}"  # P0-04; chained below
+            # A failed fill/submit means the search never ran; never read it as 0.
+            raise self._fail(
+                f"search form unusable ({type(exc).__name__}); page never loaded / blocked",
+                date_from, date_to,
             ) from exc
 
-        # Submit search
-        try:
-            await self.page.locator("input[type='submit'][value='Submit']").click()
-            await self.page.wait_for_timeout(3_000)
-            try:
-                await self.page.wait_for_load_state("networkidle", timeout=15_000)
-            except Exception:
-                pass
-        except Exception as exc:
-            raise RuntimeError(
-                f"{self.county}: Laserfiche submit failed — search never ran: "
-                f"{type(exc).__name__}"  # P0-04; chained below
-            ) from exc
-
-        # Wait for the async PrimeFaces datatable to populate, THEN read the
-        # count. The "N Results" header and the rows load a moment AFTER
-        # networkidle settles, so a single immediate read catches the
-        # datatable's transient "No records found" placeholder and wrongly
-        # bails with total=0 (this silently zeroed every Laserfiche county —
-        # e.g. Cowlitz, which actually has thousands of records in-window).
-        # Poll for the count text, which appears for both populated AND
-        # genuinely-empty ("0 Results") searches.
-        total = 0
-        count_seen = False
-        for _ in range(30):  # up to ~30s
-            body = await self.page.inner_text("body")
-            count_match = re.search(r"(\d+)\s+Results?", body)
-            if count_match:
-                total = int(count_match.group(1))
-                count_seen = True
+        # The "N Results" header and rows load a moment AFTER networkidle settles;
+        # poll for the count, which renders for populated AND empty ("0 Results")
+        # searches. A one-result search opens that document's viewer instead.
+        total = None
+        for _ in range(30):
+            if "DocView.aspx" in self.page.url:
+                return 1, [await self._row_from_open_entry()]
+            total = parse_result_count(await self.page.inner_text("body"))
+            if total is not None:
                 break
             await self.page.wait_for_timeout(1_000)
-        # The "N Results" header renders for BOTH populated AND genuinely-empty
-        # ("0 Results") searches, so its TOTAL ABSENCE means the results page
-        # never rendered (block / error / portal down) — fail loud instead of
-        # returning a false-empty [].
-        if not count_seen:
+        if total is None:
             body = await self.page.inner_text("body")
-            raise RuntimeError(
-                f"{self.county}: Laserfiche results count never appeared — page "
-                f"never loaded / blocked. Block marker: {detect_block(body) or 'none'}; "  # P0-04
-                f"body {len(body)} chars"
+            raise self._fail(
+                f"results count never appeared (block marker: {detect_block(body) or 'none'}; "
+                f"body {len(body)} chars)", date_from, date_to,
             )
-        _logger.info("Search returned %d total results", total)
+        _logger.info("Search %s-%s returned %d total results", date_from, date_to, total)
         if total == 0:
-            return []
+            return 0, []
 
-        # Laserfiche WebLink uses PrimeFaces virtual-scroll datatable —
-        # only ~40 rows are in the DOM at once. We incrementally scroll
-        # the results container and capture visible rows at each
-        # position. Dedupe is by AFN (instrument number) so rows
-        # that stay in the DOM across scrolls aren't counted twice.
-        all_records: list[ScrapedRecord] = []
-        seen_afns: set[str] = set()
-        seen_hashes: set[str] = set()
-        empty_scroll_streak = 0
-        max_scrolls = 200
+        # PrimeFaces virtual-scroll datatable: only ~40 rows are in the DOM at once, so
+        # scroll and capture. A row is keyed by its document link (one per entry).
+        rows: dict[str, dict] = {}
 
-        for scroll_idx in range(max_scrolls):
-            page_records = await self._extract_page()
+        async def capture() -> int:
             new = 0
-            for r in page_records:
-                afn = (r.enrichment_data or {}).get("instrument_number", "") if r.enrichment_data else ""
-                key = afn or self.make_hash(r.to_dict())
-                if key in seen_afns or key in seen_hashes:
-                    continue
-                seen_afns.add(key)
-                h = self.make_hash(r.to_dict())
-                seen_hashes.add(h)
-                # Full-record hash (includes enrichment_data.instrument_number via
-                # to_dict) — a unique per-row fingerprint; never the bare AFN, which
-                # would collapse multi-party/parcel rows under one recording.
-                r.raw_html_hash = h
-                all_records.append(r)
-                new += 1
+            for r in await self._extract_rows():
+                key = r["href"] or f"{r['afn']}|{r['date']}|{r['doc_type']}"
+                if key not in rows:
+                    rows[key] = r
+                    new += 1
+            return new
 
-            if len(all_records) >= total:
-                _logger.info("Scroll %d: captured %d/%d — done", scroll_idx, len(all_records), total)
+        await self.page.wait_for_timeout(1_500)
+        empty_streak = 0
+        for _ in range(200):
+            new = await capture()
+            if len(rows) >= total:
                 break
-
-            if new == 0:
-                empty_scroll_streak += 1
-                # PrimeFaces only recycles rows every ~1.5 viewports of
-                # scroll, so several consecutive 800px scrolls can
-                # return 0 new rows before the DOM advances. Tolerate
-                # up to 8 empty scrolls before giving up.
-                if empty_scroll_streak >= 8:
-                    _logger.info(
-                        "Scroll %d: no new rows after 8 attempts — stopping at %d/%d",
-                        scroll_idx, len(all_records), total,
-                    )
-                    break
-            else:
-                empty_scroll_streak = 0
-
-            if scroll_idx % 5 == 0:
-                _logger.info("Scroll %d: %d new (total: %d/%d)", scroll_idx, new, len(all_records), total)
-
-            # Advance the virtual scroll viewport. Scroll by roughly a
-            # viewport-height less than the full client height so we
-            # overlap by one row (guards against the top/bottom row
-            # being cut off during virtual-row recycling).
-            advanced = await self._advance_scroll()
-            if not advanced:
-                _logger.info("Scroll %d: reached bottom at %d/%d — sweeping", scroll_idx, len(all_records), total)
-                # Bottom sweep: near the end the remaining scroll
-                # distance can be smaller than PrimeFaces's virtual
-                # recycle threshold, so the final frames never render.
-                # Oscillate up/down in 400px steps to force the widget
-                # to re-render rows we may have skipped.
+            empty_streak = 0 if new else empty_streak + 1
+            if empty_streak >= 8:
+                break
+            if not await self._advance_scroll():
+                # Near the end the remaining distance can be below the recycle
+                # threshold, so the last frames never render: oscillate to force them.
                 for sweep_top in (-2400, -1600, -800, 0, -2000, -1200, -400):
-                    await self.page.evaluate(f"""() => {{
-                        const vt = document.querySelector('.ui-datatable-virtual-table') || document.querySelector('table');
-                        if (!vt) return;
-                        let el = vt;
-                        for (let i = 0; i < 10 && el; i++) {{
-                            const s = window.getComputedStyle(el);
-                            if ((s.overflowY === 'scroll' || s.overflowY === 'auto') && el.scrollHeight > el.clientHeight) {{
-                                const max = el.scrollHeight - el.clientHeight;
-                                el.scrollTop = Math.max(0, max + ({sweep_top}));
-                                el.dispatchEvent(new Event('scroll', {{ bubbles: true }}));
-                                return;
-                            }}
-                            el = el.parentElement;
-                        }}
-                    }}""")
+                    await self._scroll_to_bottom_offset(sweep_top)
                     await self.page.wait_for_timeout(900)
-                    sweep_records = await self._extract_page()
-                    for r in sweep_records:
-                        afn = (r.enrichment_data or {}).get("instrument_number", "") if r.enrichment_data else ""
-                        key = afn or self.make_hash(r.to_dict())
-                        if key in seen_afns:
-                            continue
-                        seen_afns.add(key)
-                        h = self.make_hash(r.to_dict())
-                        r.raw_html_hash = h
-                        all_records.append(r)
-                    if len(all_records) >= total:
+                    await capture()
+                    if len(rows) >= total:
                         break
-                _logger.info("Bottom sweep complete: %d/%d", len(all_records), total)
                 break
             await self.page.wait_for_timeout(1_200)
+        return total, list(rows.values())
 
-        # Filter by active record type
-        filtered = self._filter_by_type(all_records)
-        _logger.info(
-            "Laserfiche %s: %d/%d after %s filter",
-            self.county, len(filtered), len(all_records), self.active_record_type or "none",
-        )
+    async def _scroll_to_bottom_offset(self, offset: int) -> None:
+        await self.page.evaluate("""(offset) => {
+            const vt = document.querySelector('.ui-datatable-virtual-table') || document.querySelector('table');
+            if (!vt) return;
+            let el = vt;
+            for (let i = 0; i < 10 && el; i++) {
+                const s = window.getComputedStyle(el);
+                if ((s.overflowY === 'scroll' || s.overflowY === 'auto') && el.scrollHeight > el.clientHeight) {
+                    el.scrollTop = Math.max(0, el.scrollHeight - el.clientHeight + offset);
+                    el.dispatchEvent(new Event('scroll', { bubbles: true }));
+                    return;
+                }
+                el = el.parentElement;
+            }
+        }""", offset)
 
-        # Drop records without parcel_id if required
-        if self.require_parcel_id:
-            before = len(filtered)
-            filtered = [r for r in filtered if r.parcel_id]
-            dropped = before - len(filtered)
-            if dropped:
-                _logger.info("Dropped %d/%d records with no parcel_id", dropped, before)
+    async def _extract_rows(self) -> list[dict]:
+        """Raw rows currently in the results table (no filtering).
 
-        return filtered
-
-    async def _extract_page(self) -> list[ScrapedRecord]:
-        """Extract records from the current results table.
-
-        Laserfiche WebLink renders results in a standard HTML table.
-        Column order (Cowlitz verified):
-        0=checkbox, 1=AFN, 2=Recording Date, 3=Doc Type, 4=Volume,
-        5=Page, 6=Grantor, 7=Grantee, 8=Parcel
+        Column order (Cowlitz verified): 0=checkbox, 1=AFN (links to the entry's
+        DocView), 2=Recording Date, 3=Doc Type, 4=Volume, 5=Page, 6=Grantor,
+        7=Grantee, 8=Parcel. Errors propagate: a failed read is not zero rows.
         """
-        records: list[ScrapedRecord] = []
-        try:
-            raw = await self.page.evaluate(r"""() => {
-                // Find the results table — pick the table with the most
-                // rows where at least one row has a date (M/D/YYYY) in
-                // the 3rd cell. Laserfiche WebLink doesn't always include
-                // recognisable header text in the results table itself.
-                const tables = Array.from(document.querySelectorAll('table'));
-                let best = null;
-                for (const t of tables) {
-                    const rows = Array.from(t.querySelectorAll('tr'));
-                    if (rows.length < 3) continue;
-                    // Check if any row has a date pattern in cell[2]
-                    let hasDate = false;
-                    for (let i = 0; i < Math.min(rows.length, 5); i++) {
-                        const cells = rows[i].querySelectorAll('td');
-                        if (cells.length >= 6) {
-                            const val = (cells[2]?.textContent || '').trim();
-                            if (/\d{1,2}\/\d{1,2}\/\d{4}/.test(val)) { hasDate = true; break; }
-                        }
-                    }
-                    if (hasDate && (!best || rows.length > best.rows.length)) {
-                        best = { table: t, rows: rows };
+        return await self.page.evaluate(r"""() => {
+            const tables = Array.from(document.querySelectorAll('table'));
+            let best = null;
+            for (const t of tables) {
+                const rows = Array.from(t.querySelectorAll('tr'));
+                if (rows.length < 3) continue;
+                let hasDate = false;
+                for (let i = 0; i < Math.min(rows.length, 5); i++) {
+                    const cells = rows[i].querySelectorAll('td');
+                    if (cells.length >= 6 && /\d{1,2}\/\d{1,2}\/\d{4}/.test((cells[2]?.textContent || '').trim())) {
+                        hasDate = true; break;
                     }
                 }
-                if (!best) return [];
+                if (hasDate && (!best || rows.length > best.rows.length)) best = { rows: rows };
+            }
+            if (!best) return [];
+            const out = [];
+            for (const row of best.rows) {
+                const cells = row.querySelectorAll('td');
+                if (cells.length < 9) continue;
+                const vals = Array.from(cells).map(c => (c.textContent || '').trim());
+                if (!/\d{1,2}\/\d{1,2}\/\d{4}/.test(vals[2] || '')) continue;
+                const a = cells[1].querySelector('a[href]');
+                out.push({
+                    afn: vals[1] || '', date: vals[2] || '', doc_type: vals[3] || '',
+                    volume: vals[4] || '', page_num: vals[5] || '',
+                    grantor: (cells[6].innerHTML || '').trim(),
+                    grantee: (cells[7].innerHTML || '').trim(),
+                    parcel: vals[8] || '',
+                    href: a ? a.getAttribute('href') : '',
+                });
+            }
+            return out;
+        }""")
 
-                const out = [];
-                // Skip header row(s) — find first row with a date pattern
-                for (const row of best.rows) {
-                    const cells = row.querySelectorAll('td');
-                    if (cells.length < 6) continue;
-                    // Extract text from each cell
-                    const vals = Array.from(cells).map(c => (c.textContent || '').trim());
-                    // Party cells (grantor/grantee) can stack multiple co-owners
-                    // separated by structural markup (<br>, nameSeperator). Read
-                    // their innerHTML so those separators survive into
-                    // normalize_party_text() on the Python side — textContent
-                    // would collapse "OWNER A" + "OWNER B" into one token.
-                    const htmlOf = (i) => cells[i] ? (cells[i].innerHTML || '').trim() : '';
-                    // Look for a date in position 2 (MM/DD/YYYY or M/D/YYYY)
-                    const dateVal = vals[2] || '';
-                    if (!/\d{1,2}\/\d{1,2}\/\d{4}/.test(dateVal)) continue;
-                    out.push({
-                        afn: vals[1] || '',
-                        date: dateVal,
-                        doc_type: vals[3] || '',
-                        volume: vals[4] || '',
-                        page_num: vals[5] || '',
-                        grantor: htmlOf(6),
-                        grantee: htmlOf(7),
-                        parcel: vals[8] || '',
-                    });
-                }
-                return out;
-            }""")
+    async def _entry_fields(self, afn: str) -> dict[str, list[str]]:
+        """Fields of the entry open in the viewer; raise unless the table finished
+        rendering (entry_render_complete), two consecutive reads agree, and they name
+        ``afn``. Both viewer paths (grid row, one-result search) go through here."""
+        fields: dict[str, list[str]] = {}
+        previous = None
+        for _ in range(20):
+            soup = await self.get_soup_async()
+            fields = parse_entry_html(soup)
+            if (entry_render_complete(soup) and fields.get("Rec Doc AFN")
+                    and fields.get("Rec Doc Type Desc") and fields == previous):
+                break
+            previous = fields
+            await self.page.wait_for_timeout(1_000)
+        else:
+            raise self._fail(f"entry properties for AFN {afn or '?'} never settled")
+        got = fields["Rec Doc AFN"][0]
+        if afn and got != _afn_base(afn):
+            raise self._fail(f"entry properties for AFN {afn} name AFN {got!r}")
+        return fields
 
-            for item in raw:
-                record = ScrapedRecord()
-                # Date
-                date_match = re.search(r"(\d{1,2}/\d{1,2}/\d{4})", item.get("date", ""))
-                if date_match:
-                    record.date_recorded = date_match.group(1)
-                # Doc type
-                doc_type = item.get("doc_type", "").strip()
-                record.doc_type = doc_type if doc_type else None
-                # Party cells (HTML from the cell — normalize so stacked
-                # co-owners keep their " / " boundary).
-                grantor = normalize_party_text(item.get("grantor", ""))
-                grantee = normalize_party_text(item.get("grantee", ""))
-                if self.active_record_type == "pre_foreclosure":
-                    # A doc type that signals the foreclosure was cancelled/cured
-                    # (Discontinuance, Rescission) or is pure trustee admin
-                    # (Substitution of Trustee) is NOT active distress — drop it.
-                    if is_cancellation_or_admin(doc_type):
-                        continue
-                    # Borrower orientation: an NTS is often indexed with the
-                    # trustee company as grantor and the borrower as grantee.
-                    # Put the real person (homeowner) in party_name; drop
-                    # bank-vs-trustee records with no homeowner.
-                    oriented = orient_pre_foreclosure_party(grantor, grantee)
-                    if oriented is None:
-                        continue
-                    record.party_name, record.heirs = oriented
-                elif self.active_record_type == "probate":
-                    # On a Certificate of Death the recorder indexes the issuing
-                    # agency (WA Dept of Health) or bare filing state as grantor,
-                    # with the DECEDENT in the grantee slot. Promote the decedent
-                    # and strip "Estate of" captions. No-op when the grantor is
-                    # already the decedent (TOD deeds, affidavits).
-                    record.party_name, record.heirs = orient_probate_party(
-                        grantor, grantee, doc_type
-                    )
-                    if not record.party_name:
-                        # Guard #2: no decedent on either side. The append gate
-                        # below keeps any row with a DATE, so a party-less
-                        # probate lead would ship and still be billed (Codex).
-                        continue
-                elif self.active_record_type == "divorce":
-                    # Both spouses are valid leads; only correct the case where the
-                    # recorder indexed a court/state/agency as grantor. No-op when
-                    # the grantor is already a person. (Doc-type gating happens in
-                    # _filter_by_type via the shared divorce classifier.)
-                    record.party_name, record.heirs = orient_divorce_party(
-                        grantor, grantee, doc_type
-                    )
-                else:
-                    # Grantor → party_name, Grantee → heirs (unchanged).
-                    if grantor:
-                        record.party_name = grantor
-                    if grantee:
-                        record.heirs = grantee
-                # Parcel
-                parcel = item.get("parcel", "").strip()
-                if parcel and re.match(r"[\d\w]", parcel):
-                    record.parcel_id = parcel
-                # Instrument number
-                afn = item.get("afn", "").strip()
-                record.enrichment_data = {
-                    "instrument_number": afn,
-                    "source": "laserfiche_weblink",
-                }
-                # Volume/Page is the RECORD location (recorder's book/page), NOT a
-                # property legal description — keep it for reference in
-                # enrichment_data, but never present it as legal_description. This
-                # source carries no real legal description, so legal_description
-                # stays None rather than a misleading stand-in.
-                vol = item.get("volume", "").strip()
-                pg = item.get("page_num", "").strip()
-                if vol or pg:
-                    record.enrichment_data["volume_page"] = f"Vol {vol} Pg {pg}".strip()
+    async def _row_from_open_entry(self) -> dict:
+        """The raw row of a one-result search, read from the viewer it opened."""
+        fields = await self._entry_fields("")
+        row = {
+            "afn": fields["Rec Doc AFN"][0],
+            "date": (fields.get("Rec Doc Recording Date") or [""])[0],
+            "doc_type": (fields.get("Rec Doc Type Desc") or [""])[0],
+            "volume": "", "page_num": "", "grantor": "", "grantee": "", "parcel": "",
+            "href": self.page.url,
+            "fields": fields,
+        }
+        if not re.search(r"\d{1,2}/\d{1,2}/\d{4}", row["date"]) or not row["doc_type"]:
+            raise self._fail(f"one-result entry {row['afn']} has no date or document type")
+        return row
 
-                if record.party_name or record.date_recorded:
-                    records.append(record)
+    async def _read_entry(self, row: dict) -> dict[str, list[str]]:
+        """Full entry properties of one kept row (all grantees, all parcels)."""
+        if row.get("fields"):
+            return row["fields"]
+        href = row.get("href") or ""
+        if "DocView.aspx" not in href:
+            raise self._fail(f"result row {row.get('afn') or '?'} has no document link")
+        await self.navigate(urljoin(self.app_root + "/", href))
+        await self.page.wait_for_timeout(1_000)
+        fields = await self._entry_fields(row["afn"])
+        problem = entry_contradicts_row(row, fields)
+        if problem:
+            raise self._fail(f"entry properties for AFN {row['afn']} incomplete: {problem}")
+        return fields
 
-            _logger.info("Extracted %d records from page", len(records))
-        except Exception as exc:
-            _logger.warning("Extraction error: %s", str(exc)[:120])
+    def _build_record(self, row: dict, fields: dict[str, list[str]]) -> ScrapedRecord | None:
+        """One lead from a raw row and its full entry properties, or None to drop it."""
+        record = ScrapedRecord()
+        date_match = re.search(r"(\d{1,2}/\d{1,2}/\d{4})", row.get("date", ""))
+        record.date_recorded = date_match.group(1) if date_match else None
+        doc_type = (row.get("doc_type") or "").strip()
+        record.doc_type = doc_type or None
+        # Stacked names keep their " / " boundary through normalize_party_text.
+        grantor = normalize_party_text("<br>".join(html.escape(n) for n in fields.get("Rec Doc Grantor", [])))
+        grantee = normalize_party_text("<br>".join(html.escape(n) for n in fields.get("Rec Doc Grantee", [])))
 
-        return records
+        if self.active_record_type == "pre_foreclosure":
+            # Cancelled/cured (Discontinuance, Rescission) or pure trustee admin is
+            # not active distress.
+            if is_cancellation_or_admin(doc_type):
+                return None
+            if _is_trustee_sale_notice(doc_type):
+                # The recorder indexes the TRUSTEE as grantor on a notice of trustee's
+                # sale, sometimes an individual attorney: the borrower is a grantee.
+                oriented = orient_pre_foreclosure_party(None, grantee)
+                if oriented is not None:
+                    oriented = (oriented[0], grantor or None)
+            else:
+                oriented = orient_pre_foreclosure_party(grantor, grantee)
+            if oriented is None:
+                return None  # no homeowner on either side (bank vs trustee)
+            lead = _primary_party([n.strip() for n in oriented[0].split(" / ") if n.strip()])
+            record.party_name = " / ".join(lead)
+            # Every other indexed party (trustee, lender, title company, other people)
+            # stays visible beside the lead, in index order.
+            everyone = [n.strip() for side in (grantor, grantee) for n in side.split(" / ") if n.strip()]
+            others = [n for n in dict.fromkeys(everyone) if n not in lead]
+            record.heirs = " / ".join(others) or None
+        elif self.active_record_type == "probate":
+            # Agency grantor + decedent grantee (Certificate of Death) is promoted;
+            # "Estate of" captions are stripped.
+            record.party_name, record.heirs = orient_probate_party(grantor, grantee, doc_type)
+            if not record.party_name:
+                return None  # a party-less probate lead must never ship or bill
+        elif self.active_record_type == "divorce":
+            record.party_name, record.heirs = orient_divorce_party(grantor, grantee, doc_type)
+        else:
+            record.party_name = grantor or None
+            record.heirs = grantee or None
+
+        record.enrichment_data = {
+            "instrument_number": row.get("afn", "").strip(),
+            "source": "laserfiche_weblink",
+        }
+        parcels = list(dict.fromkeys(p.strip() for p in fields.get("Rec Doc Parcel", []) if p.strip()))
+        if len(parcels) == 1:
+            record.parcel_id = parcels[0]
+            record.enrichment_data[_APN_LOOKUP_KEY] = "found"
+        elif parcels:
+            # Several parcels on one recording: never pick one (it could attach the
+            # wrong property); hold the row with its candidates instead.
+            record.enrichment_data[_APN_LOOKUP_KEY] = "ambiguous"
+            record.enrichment_data["apn_candidates"] = parcels
+        else:
+            record.enrichment_data[_APN_LOOKUP_KEY] = "none"
+        related = [a.strip() for a in fields.get("Rec Doc Related AFN", []) if a.strip()]
+        if related:
+            record.enrichment_data["related_afns"] = related
+        code = (fields.get("Rec Doc Document Type") or [""])[0].strip()
+        if code:
+            record.enrichment_data["doc_type_code"] = code
+        # Volume/Page is the recorder's book/page, never a legal description.
+        vol, pg = row.get("volume", "").strip(), row.get("page_num", "").strip()
+        if vol or pg:
+            record.enrichment_data["volume_page"] = f"Vol {vol} Pg {pg}".strip()
+        record.raw_html_hash = self.make_hash(record.to_dict())
+        return record
 
     async def _advance_scroll(self) -> bool:
         """Advance the virtual-scroll results container by one viewport.
@@ -522,24 +619,14 @@ class LaserficheWebLinkScraper(BridgeScraper):
             _logger.info("Scroll advance failed: %s", str(exc)[:80])
             return False
 
-    def _filter_by_type(self, records: list[ScrapedRecord]) -> list[ScrapedRecord]:
-        """Keep only records whose doc_type matches the active record type."""
+    def _type_matches(self, doc_type: str) -> bool:
+        """Whether a raw row's document type belongs to the active record type."""
         if not self.active_record_type or self.active_record_type == "all":
-            return records
+            return True
         keywords = self._doc_type_keyword_override or _DOC_TYPE_MAP.get(self.active_record_type, [])
         if not keywords:
-            return records
-        is_divorce = self.active_record_type == "divorce"
-        kept = []
-        for r in records:
-            doc = (r.doc_type or "").upper()
-            if is_divorce:
-                # Generic keyword connector — fail closed on ambiguous bare
-                # "DISSOLUTION" via the shared 3-state classifier so corporate/
-                # entity dissolutions stay out of divorce results.
-                if is_divorce_doc(r.doc_type, precise_source=False):
-                    kept.append(r)
-                continue
-            if _doc_type_matches(doc, keywords):
-                kept.append(r)
-        return kept
+            return True
+        if self.active_record_type == "divorce":
+            # Fail closed on ambiguous bare "DISSOLUTION" (corporate dissolutions).
+            return is_divorce_doc(doc_type, precise_source=False)
+        return _doc_type_matches((doc_type or "").upper(), keywords)

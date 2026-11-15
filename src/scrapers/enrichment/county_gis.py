@@ -119,6 +119,10 @@ _KNOWN_GIS_ENDPOINTS: dict[str, dict] = {
             "/Assessor/Parcels/MapServer/0/query"
         ),
         "parcel_field": "PARCNO",
+        # Cowlitz parcel numbers can be 5 characters ("03110", "21044"); the default
+        # 6-char floor skipped all 27 such leads (2026-11-15). County query only: the
+        # statewide fallback keeps its 6-char floor.
+        "min_parcel_len": 5,
         "address_part_fields": [
             "SITUS_STREET_NUMBER", "SITUS_STREET_DIRECTION", "SITUS_STREET_NAME",
             "SITUS_STREET_SUFFIX", "SITUS_STREET_UNIT",
@@ -184,6 +188,13 @@ _KNOWN_GIS_ENDPOINTS: dict[str, dict] = {
 }
 
 _MAILING_KEYS = ("mailing_street_fields", "mailing_locality_fields", "mailing_fields")
+
+
+def gis_min_parcel_len(county: str | None, state: str | None) -> int:
+    """Shortest parcel id worth a GIS lookup in this county: 6, unless the county's own
+    layer is known to use shorter ids (Cowlitz: 5). Every eligibility gate uses this."""
+    cfg = _KNOWN_GIS_ENDPOINTS.get(f"{(county or '').lower()}_{(state or '').upper()}") or {}
+    return cfg.get("min_parcel_len", 6)
 
 
 def _effective_gis_config(county_key: str) -> dict | None:
@@ -1405,13 +1416,14 @@ def _batch_query_county(
     out_fields = gis_config.get("out_fields", "*")
     results: dict[str, dict] = {}
     chunk_size = 50
+    min_len = gis_config.get("min_parcel_len", 6)
 
     for i in range(0, len(parcel_ids), chunk_size):
         chunk = parcel_ids[i:i + chunk_size]
         # clean (query/server form) -> every caller id that spells it that way.
         clean_to_originals: dict[str, list[str]] = {}
         for pid in chunk:
-            if pid and len(pid.strip()) >= 6:
+            if pid and len(pid.strip()) >= min_len:
                 clean_to_originals.setdefault(pid.replace("-", "").strip(), []).append(pid)
         if not clean_to_originals:
             continue

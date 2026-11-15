@@ -340,6 +340,40 @@ def canonical_tokens_for(county: str, state: str, doc_types: list[str]) -> list:
     return out
 
 
+class StaleDocTypeSelectionError(ValueError):
+    """A saved selection names document types this county no longer offers.
+
+    Happens when the registry narrows a county after customers saved a selection
+    (Chelan, #625: its "NOD" turned out to be a Notice of Discontinuance). The job
+    must not run, since dropping the types would quietly change what the customer
+    chose, but the customer must be told why in words they can act on.
+    ``public_message`` is the only part the worker shows them. It stays a ValueError
+    so callers that already guard the strict check keep their behaviour."""
+
+    def __init__(self, county: str, state: str, stale: list[str]) -> None:
+        self.county = county
+        self.state = state
+        self.stale = list(stale)
+        labels = [CANONICAL_DOC_TYPE_LABELS.get(d, d) for d in self.stale]
+        place = f"{county.strip().title()} County"
+        self.public_message = (
+            f"{place} no longer offers {_join_labels(labels)} as a document type. "
+            f"This scraper did not run, so it would not search document types you did not "
+            f"choose. Create a new {place} pre-foreclosure scraper to choose from the "
+            f"current list, or contact support."
+        )
+        super().__init__(
+            f"document type(s) {self.stale!r} not mappable for {county}, {state} "
+            f"(stale selection after a registry change). Refusing to broaden output"
+        )
+
+
+def _join_labels(labels: list[str]) -> str:
+    if len(labels) <= 1:
+        return "".join(labels)
+    return ", ".join(labels[:-1]) + " or " + labels[-1]
+
+
 def canonical_tokens_or_raise(county: str, state: str, doc_types: list[str]) -> list:
     """Map an EXPLICIT canonical selection to the scraper's own tokens, FAIL-CLOSED.
 
@@ -362,14 +396,14 @@ def canonical_tokens_or_raise(county: str, state: str, doc_types: list[str]) -> 
             "explicit doc_types selection is empty (pass None for legacy/full output)"
         )
     tokens = a["tokens"]
+    # Name every unusable type at once (a missing or empty token list is as unusable
+    # as an unknown name), so the customer sees the whole change, not the first item.
+    stale = [d for d in doc_types if tokens.get(d) in (None, "", [])]
+    if stale:
+        raise StaleDocTypeSelectionError(county, state, stale)
     out: list = []
     for d in doc_types:
-        tok = tokens.get(d)
-        if tok is None:
-            raise ValueError(
-                f"document type {d!r} is not mappable for {county}, {state} "
-                f"(stale selection after a registry change?). Refusing to broaden output"
-            )
+        tok = tokens[d]
         if isinstance(tok, list):
             out.extend(tok)
         else:

@@ -1,6 +1,8 @@
 """Body logic for the health beat tasks: watchdog_stuck_jobs + canary_check."""
 
+import traceback
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import NamedTuple
 
 from src.config.constants import (
@@ -625,21 +627,63 @@ def _probe_unit(connector, record_type: str, pending_alerts: list) -> None:
         from src.utils.celery_limits import reraise_time_limit
 
         reraise_time_limit(exc)  # out of time is not the source being down
+        site = _raise_site(exc)
         if isinstance(exc, UnsupportedCountyError):
             _logger.warning("Canary: no scraper for %s %s", where, record_type)
         else:
-            _logger.error("Canary failed for %s %s: %s", where, record_type, type(exc).__name__)
+            _logger.error("Canary failed for %s %s: %s at %s", where, record_type,
+                          type(exc).__name__, site)
         connector.health_status = "down"
-        # A previously-working source just broke: page ops. Exception CLASS only
-        # (scraper errors can embed raw page content, a PII risk: Codex P2).
+        # A previously-working source just broke: page ops. Exception CLASS and
+        # raise site only, never its text (scraper errors can embed raw page
+        # content, a PII risk: Codex P2).
         if prev_status != "down":
             pending_alerts.append((
                 "canary", f"{where}/{record_type}",
                 f"Canary DOWN: {where} {record_type} (was {prev_status})",
                 f"connector={where}\nrecord_type={record_type}\n"
                 f"previous_status={prev_status}\n"
-                f"error_class={type(exc).__name__}",
+                f"error_class={type(exc).__name__}\n"
+                f"raise_site={site}",
             ))
+
+
+_SRC_ROOT = Path(__file__).resolve().parents[2]  # <repo>/src
+
+
+def _frame_site(frame) -> str:
+    """'src/...py:LINE in FUNC' for our code; only the file name for anything else
+    (a library path can carry a user name). No source text, no locals."""
+    try:
+        rel = Path(frame.filename).resolve().relative_to(_SRC_ROOT).as_posix()
+        where = f"src/{rel}"
+    except (ValueError, OSError):
+        where = Path(frame.filename.replace("\\", "/")).name or "?"
+    return f"{where}:{frame.lineno} in {frame.name}"
+
+
+def _raise_site(exc: BaseException) -> str:
+    """Where the error was raised, PII-safe: the canary logs only the exception
+    class, so without this a failure cannot be traced. Follows up to 3 explicit
+    causes (raise ... from ...). Never raises."""
+    try:
+        sites, seen = [], set()
+        while exc is not None and id(exc) not in seen and len(sites) < 3:
+            seen.add(id(exc))
+            frames = traceback.StackSummary.extract(
+                traceback.walk_tb(exc.__traceback__), lookup_lines=False, capture_locals=False)
+            if frames:
+                site = _frame_site(frames[-1])
+                ours = [f for f in frames if _frame_site(f).startswith("src/")]
+                if ours and ours[-1] is not frames[-1]:
+                    site = f"{_frame_site(ours[-1])} -> {site}"
+            else:
+                site = "unknown"
+            sites.append(site if not sites else f"cause {type(exc).__name__} at {site}")
+            exc = exc.__cause__
+        return "; ".join(sites)
+    except Exception:  # noqa: BLE001 -- diagnostics must never stop the canary
+        return "unknown"
 
 
 async def _canary_scrape(scraper_class, date_from: str, date_to: str,

@@ -39,13 +39,12 @@ from src.utils.logger import setup_logger
 _logger = setup_logger("scraper.clark_wa")
 
 _BASE_URL = "https://e-docs.clark.wa.gov/LandmarkWeb"
-_PID_PATTERN = re.compile(r"PID[:\s]*(\d{6,12})", re.IGNORECASE)
-# Fallback: Clark's legal column may print the parcel without the "PID:" prefix.
-# Accept any 6-12 digit run that appears alongside Lot/Block/Sub/Plat tokens.
-_PID_FALLBACK_PATTERN = re.compile(
-    r"(?:LOT|BLOCK|SUB|PLAT|TRACT|PARCEL|APN)[^\n]{0,80}?\b(\d{6,12})\b",
-    re.IGNORECASE,
-)
+# Only the recorder's explicit "PID: <digits>" label is a parcel (3,525 of 3,526 prod
+# legals, 2026-11-14). The whole digit run is kept verbatim: no length window, no
+# repair. A later PID can be glued to the text before it ("RGE: 3EPID: ..."), so no
+# left word boundary. Unlabelled numbers (a BLK, a book page) are never a parcel: a
+# valid-but-wrong one would name the wrong owner.
+_PID_PATTERN = re.compile(r"PID:\s*(\d+)", re.IGNORECASE)
 
 # Map record_type → checkbox labels to select
 _DOC_TYPES = {
@@ -534,15 +533,15 @@ class ClarkWAScraper(BridgeScraper):
                 continue
 
             legal = (item.get("legal") or "").strip()
-            pid_match = _PID_PATTERN.search(legal)
-            if not pid_match:
-                pid_match = _PID_FALLBACK_PATTERN.search(legal)
-            if not pid_match and not self._skip_pid:
+            # Every labelled parcel, in order, deduped. A deed can cover several; the
+            # first stays the lead's parcel and the rest are kept as provenance.
+            parcel_ids = list(dict.fromkeys(_PID_PATTERN.findall(legal)))
+            if not parcel_ids and not self._skip_pid:
                 dropped_no_pid += 1
                 continue
 
             record = ScrapedRecord()
-            record.parcel_id = pid_match.group(1) if pid_match else None
+            record.parcel_id = parcel_ids[0] if parcel_ids else None
             # Party names: normalize stacked owners (nameSeperator div) -> " / "
             grantor = normalize_party_text(item.get("grantor"))
             grantee = normalize_party_text(item.get("grantee"))
@@ -589,6 +588,7 @@ class ClarkWAScraper(BridgeScraper):
                 "source": "clark_county_recorder",
                 "recording_number": item.get("recNum"),
                 "parcel_id": record.parcel_id,
+                "parcel_ids": parcel_ids,
                 "legal_description": legal,
                 "doc_type": record.doc_type,
             }

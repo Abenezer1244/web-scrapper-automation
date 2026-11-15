@@ -90,7 +90,9 @@ DEATH CERTIFICATE 405, WILL 1. 1,128 of 3,467 rows `is_duplicate`.
 - [x] Phase 3: death_certificate (code 62, decedent oriented, PID required). Live 60 d: 21 docs ->
   18 leads. No connector change (ships dark). Codex: no findings.
 - [x] Final adversarial review (Review C): NO-GO with 4 findings, resolved below.
-- [ ] Owner: push / PR / deploy / connector changes (all need approval)
+- [x] Owner approved push / deploy / turn on (2026-11-14). PR #631 merged (main 92db4278), Railway
+  auto-deployed api/worker/beat; death_certificate added to connector 70bb5315.
+- [x] Go-live verification, browser QA and parcel-id audit (below).
 
 ## Review C (final adversarial, 2026-11-14) — resolution
 1. High "a server cap fails busy windows permanently": REFUTED by measurement. A 2023-01-01..
@@ -108,24 +110,60 @@ DEATH CERTIFICATE 405, WILL 1. 1,128 of 3,467 rows `is_duplicate`.
 
 | type | implementation | source | status |
 |---|---|---|---|
-| probate | existing, repaired | Auditor recorder LandmarkWeb (free, no login) | Implemented, awaiting deploy validation |
-| pre_foreclosure | existing, repaired | same (NTS, LP, NOTDEF, NF, FORECL, TRSL) | Implemented, awaiting deploy validation |
+| probate | existing, repaired | Auditor recorder LandmarkWeb (free, no login) | Live, verified on prod worker |
+| pre_foreclosure | existing, repaired | same (NTS, LP, NOTDEF, NF, FORECL, TRSL) | Live, verified on prod worker (11/01-11/13: 15 leads) |
 | trustee_sale | existing, held | Columbian classifieds (barren); recorder images need OCR | Blocked by source access (hold), OCR later |
-| death_certificate | new | recorder DEATH CERTIFICATE (recorded copies) | Implemented, inactive (connector change needs approval) |
+| death_certificate | new | recorder DEATH CERTIFICATE (recorded copies) | Live 2026-11-14, real job verified end to end |
 | tax_delinquent | none | no delinquency list; Bid4Assets seasonal; paydici balances | Blocked by source access |
 | code_violation | none | county ArcGIS layer, "not subject to public disclosure, no dump" | Blocked by legal/data restrictions |
 | divorce | none | Odyssey index; AOC policy bars commercial solicitation | Blocked by legal/data restrictions |
 
-## Activation prerequisites (owner approval for each)
-1. PR + CI green (CI runs the DB-backed worker test).
-2. Deploy api, then worker, then beat (no migration in this branch).
-3. Verify: one Clark probate and one pre_foreclosure manual run finish DONE with records_found set.
-4. death_certificate: `UPDATE county_connectors SET record_types = record_types || '["death_certificate"]'
-   WHERE id = '70bb5315-1cec-428b-9f7d-b5058293083e';` (or a migration) only after approval.
-5. Clark OCR trustee_sale: after feat/chelan-nts-ocr merges.
+## Activation prerequisites (status 2026-11-14)
+1. [x] PR + CI green: #631, Test passed in 43 min incl. the DB-backed worker test.
+2. [x] Deploy api, worker, beat: Railway auto-deploy of main 92db4278 (no migration).
+3. [ ] One PERSISTED Clark probate and pre_foreclosure run DONE with records_found set: NOT run.
+   Only non-persisting checks on the prod worker (pre_foreclosure 15 leads) and the persisted
+   death_certificate job fe8f35b3. The first customer probate / pre_foreclosure run is the check.
+4. [x] death_certificate added to connector 70bb5315 (done once, guarded `NOT ? 'death_certificate'`;
+   do not re-run an unguarded append, it would duplicate the entry).
+5. [ ] Clark OCR trustee_sale: after feat/chelan-nts-ocr merges.
+
+## Go-live verification (2026-11-14)
+- Non-persisting run on the prod worker: death_certificate 10/15-11/13 6 leads, pre_foreclosure
+  11/01-11/13 15 leads, trustee_sale raises SourceUnavailableError with the customer text.
+- Real death_certificate job fe8f35b3 (owner account b6d2095d, 08/15-11/13, contact lookup off):
+  DONE in 3 min; 32 found, 24 already delivered (earlier probate runs), 8 new billed; all 8 with
+  owner, parcel, property and mailing address; 0 degradations. CSV export: 8 rows, every core column
+  8/8, phone/email empty (lookup off).
+- Real Auction-leads run ac972e54 from the UI "Run now": failed, retry 0, billed 0, reserved 0, the
+  exact customer text in the run log and the "This run didn't finish" panel.
+
+## Browser QA (Playwright Chromium, owner signed in; 2026-11-14)
+Pages: run results (fe8f35b3), scraper list, dashboard, new-scraper wizard with Clark selected.
+Widths 320, 375, 390, 430, 768, 1024, 1440, 1920, light and dark: 64 of 64 with no horizontal
+overflow and no console errors. Clark shows 4 types incl. Death Certificate (Auction Leads still
+listed until the canary samples it). Notes for the frontend: the sidebar "Today - Running" dot
+stayed on after the Auction-leads run failed; the failed-run card has a large empty area.
+Data note: "Heirs" on a Clark death certificate is the person indexed beside PUBLIC (likely the
+filer/spouse); the role is inferred, not stated by the recorder (same as probate). "Current
+Owner" / "Title Status" stay empty for Clark (that reconciliation is King-only).
+
+## Parcel-id audit (2026-11-14, branch fix/clark-parcel-ids)
+3,526 Clark leads by PID length: 6:4, 7:32 (4 no mailing), 8:816 (14), 9:2,659 (8), 10:14 (14),
+12:1 (1). The county parcel layer (TaxlotsPublic Prop_id) accepts 8 and 9 digits as printed, so no
+leading zeros are lost. 10/12-digit and some 7-digit ids are recorder typos (1428590000 is
+142859000; 9200786 is 92007860; 1181107374 resolves neither way; one legal says "INCORRECT
+PARCEL"). In this audit those rows got no address and were not billed; that is an observed
+outcome, not a guarantee: a typo that happens to equal another valid parcel would resolve to that
+parcel, and nothing here can detect it. Fix: only an explicit "PID:" is a parcel (the
+unlabelled fallback fired once, on a BLK number), the whole digit run is kept verbatim, and all
+PIDs of a multi-parcel deed (140 rows) go to enrichment_data["parcel_ids"]. No repair of typos:
+guessing a zero could pick another owner's parcel. Codex consult + gate PASS; live lead counts
+unchanged (281 / 711 / 74 / 0). Merge only while no Clark job runs (enrichment_data is part of the
+in-job row fingerprint).
 
 ## Review
 Three defect families fixed in the live Clark recorder scraper, Clark Auction leads put on an
 honest hold, a dark death_certificate type added, three types documented as blocked with
-evidence. Not done: Playwright UI QA (no frontend change; meaningful only after deploy), PID
-normalization (6-10 digit PIDs observed, mailing coverage historically 98.8%), OCR trustee_sale.
+evidence. Live and verified 2026-11-14 (above). Still open: OCR trustee_sale (after
+feat/chelan-nts-ocr), the three blocked types, and the "Heirs" role inference.

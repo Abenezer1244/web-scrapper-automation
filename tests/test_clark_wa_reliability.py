@@ -117,3 +117,35 @@ def test_death_certificate_selects_code_62_and_keeps_the_decedent():
     assert [(r.party_name, r.heirs, r.parcel_id) for r in recs] == [("ROE RICHARD", None, "185188032")]
     scope = ClarkWAScraper.collection_scope("death_certificate")
     assert scope is not None and [i.label for i in scope.items] == ["Death Certificate"]
+
+
+def _row(legal, doc_id="9"):
+    return {"docId": doc_id, "grantor": "ROE RICHARD", "grantee": "PUBLIC", "date": "10/05/2026",
+            "docType": "DEATH CERTIFICATE", "legal": legal, "recNum": "1"}
+
+
+def test_only_an_explicit_pid_label_is_a_parcel():
+    # Real prod legal (2026-11-14): no "PID:" label, so the BLK number is NOT a parcel.
+    s = ClarkWAScraper("death_certificate")
+    assert s._records_from_rows([_row("SUB: BROWNS ADD  BKA P15 LOT: 15, 16 BLK: 8159000")]) == []
+
+
+def test_pid_kept_verbatim_whole_run_no_repair():
+    s = ClarkWAScraper("death_certificate")
+    # A recorder typo stays as printed (no trailing-zero "repair"), and a long run is
+    # never truncated to its first 12 digits.
+    for legal, want in [("PID: 1428590000 SEC: 32 TWP: 2 RGE: 4E", "1428590000"),
+                        ("LOT: 4 PID: 35770268", "35770268"),
+                        ("PID: 1234567890123", "1234567890123")]:
+        (rec,) = s._records_from_rows([_row(legal)])
+        assert rec.parcel_id == want
+
+
+def test_multi_parcel_deed_keeps_first_and_records_all():
+    # Real shape: the second PID is glued to the previous field ("3EPID:").
+    s = ClarkWAScraper("death_certificate")
+    (rec,) = s._records_from_rows([_row(
+        "PID: 2078940000 SEC: 32 TWP: 3 RGE: 3EPID: 2078950000 SEC: 32 TWP: 3 RGE: 3E"
+        "PID: 2078940000")])
+    assert rec.parcel_id == "2078940000"
+    assert rec.enrichment_data["parcel_ids"] == ["2078940000", "2078950000"]

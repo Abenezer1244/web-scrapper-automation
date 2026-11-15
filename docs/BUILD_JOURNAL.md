@@ -19,6 +19,20 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-11-15 — Absentee owner said "yes" for owners living in the house
+
+**Found:** checking two Chelan test runs, both leads were flagged absentee with the mailing address equal to the property. Measured in prod: 647 delivered leads with identical normalized addresses still flagged absentee (644 King, 3 Chelan), ~3 customers.
+
+**Root causes:** (1) Chelan stores a comma-less full situs ("609 LYNN ST WENATCHEE, WA 98801"); compose_situs appended the structured city again, hiding it from `_street_absorbed_city`. (2) King unit spellings: "UNIT #27" left a dangling "UNIT" after the hash strip; bare "C22" vs "#C22"; "2651B" vs "2651 B".
+
+**Fix:** compose_situs no longer re-adds a city the street already ends with. Unit rules are comparison-only (`_compare_street`, `_same_street_modulo_unit_spelling`) so `address_match_key` (stored on NTS notices) and parcel-locate keys are untouched. Pairwise only: a bare trailing token is dropped only when the other side marks that same unit id.
+
+**Codex:** consult rejected blind trailing-token stripping ("123 E AVENUE A") and house-letter joining before "B ST"; review FAILed on "123N MAIN" vs "123 N MAIN" (directional read as a house letter) and hyphen units; both fixed, re-review PASS.
+
+**Backfill:** `scripts/backfill_owner_flags.py --recompute-absentee` writes absentee_owner only, keyset-paged, guarded on unchanged inputs. Prod dry run: 57,653 TRUE rows, 715 -> False, 84 -> None (property side has no ZIP/city to confirm).
+
+---
+
 ## 2026-11-15 — Asotin probate merged and deployed (#639); post-deploy security review
 
 **Built / Shipped:** #639 was squash-merged as `c8fcfecb` at 2026-11-15 20:47 UTC. Railway rebuilt api,

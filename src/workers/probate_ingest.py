@@ -36,7 +36,7 @@ REMATCH_EVERY = timedelta(hours=20)
 REMATCH_BATCH = 20
 
 Lookup = Callable[[str], list[dict]]
-Gate = Callable[[list[dict], str], "str | None"]
+Gate = Callable[[list[dict], str, list], "str | None"]  # (parcels, county, reps)
 
 _UPSERT = text("""
     INSERT INTO probate_notices (
@@ -134,21 +134,28 @@ def match_notice(decedent: str, reps: list[str], claims: str | None,
 
 def privacy_gate(db) -> Gate:
     """A notice-level gate: the id of a rule that covers any tied parcel, else None.
-    The lead is judged as the probate scraper delivers it (decedent as party)."""
-    from src.privacy.authorize import ROW_COLUMNS, authorize, load_rule_snapshot
+    The lead is judged as the probate scraper delivers it (decedent as party), with the
+    notice's personal representatives beside it: they are stored on the notice too."""
+    from src.privacy.authorize import (
+        ROW_COLUMNS,
+        authorize,
+        load_rule_snapshot,
+        natural_order_subjects,
+    )
 
     with db.begin_nested():
         snapshot = load_rule_snapshot(db)
 
-    def gate(parcels: list[dict], county: str) -> str | None:
+    def gate(parcels: list[dict], county: str, reps: list) -> str | None:
         if not snapshot.by_anchor:
             return None
+        extra = natural_order_subjects(reps, source_field="personal_reps")
         for p in parcels:
             lead = dict.fromkeys(ROW_COLUMNS) | {
                 "parcel_id": p["parcel_id"], "party_name": p["party_name"],
                 "enrichment_data": {"assessor_current_owner": p["owner_name"]}}
             decision = authorize(snapshot, lead, record_type="probate", county=county,
-                                 state=STATE)
+                                 state=STATE, extra_subjects=extra)
             if not decision.deliverable:
                 return decision.suppression_ids[0]
         return None
@@ -165,7 +172,7 @@ def ingest_text(db, notice_text: str, *, advert_id: str | None, pdf_url: str | N
         return None
     reps = list(notice.personal_reps)
     outcome, held, parcels = match_notice(notice.decedent, reps, notice.claims_address, lookup)
-    suppression = gate(parcels, pn.COUNTY) if parcels else None
+    suppression = gate(parcels, pn.COUNTY, reps) if parcels else None
     if suppression:
         outcome, held, parcels = "withheld", [], []
     params = {
@@ -200,7 +207,7 @@ def rematch_due(db, *, today: date, now: datetime, lookup: Lookup, gate: Gate,
         try:
             reps = row.personal_reps if isinstance(row.personal_reps, list) else []
             outcome, held, parcels = match_notice(row.decedent, reps, row.claims_address, lookup)
-            suppression = gate(parcels, row.county) if parcels else None
+            suppression = gate(parcels, row.county, reps) if parcels else None
             if suppression:
                 db.execute(_TOMBSTONE, {**seen, "suppression": suppression})
             else:

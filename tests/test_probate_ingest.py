@@ -39,7 +39,7 @@ def _down(_surname):
     raise LayerError("layer HTTP 503")
 
 
-def _open(_parcels, _county):
+def _open(_parcels, _county, _reps):
     return None
 
 
@@ -117,7 +117,7 @@ def test_a_privacy_rule_on_a_tied_parcel_tombstones_the_notice_for_good(s):
                                      subject=("person", "holloway|margaret"))
     gate = pi.privacy_gate(s)
     assert gate([{"parcel_id": parcel, "party_name": "HOLLOWAY, MARGARET J",
-                  "owner_name": "HOLLOWAY, MARGARET J"}], "asotin") == rule_row
+                  "owner_name": "HOLLOWAY, MARGARET J"}], "asotin", []) == rule_row
     assert _ingest(s, "asotin_probate_notice_a", gate=gate) == "withheld"
     row = _row(s, "26-4-00122-02")
     assert (row["decedent"], row["personal_reps"], row["claims_address"], row["parcels"]) == (
@@ -126,6 +126,39 @@ def test_a_privacy_rule_on_a_tied_parcel_tombstones_the_notice_for_good(s):
     # A later crawl, even one whose gate no longer sees the rule, never writes it back.
     assert _ingest(s, "asotin_probate_notice_a") == "withheld"
     assert _row(s, "26-4-00122-02")["decedent"] is None
+
+
+def _rep_rule(s) -> str:
+    # The notice's first personal representative (natural order on the notice), with
+    # her own rule on the estate's tied parcel.
+    anchor = keys.property_anchor_value("10412300600050000", "asotin", "WA")
+    return _active_rule(s, "opt_out", anchor=("property", anchor),
+                        subject=("person", "dunn|rachel"))[1]
+
+
+def _tombstoned(s, rule_row: str) -> None:
+    row = _row(s, "26-4-00122-02")
+    assert row["match_outcome"] == "withheld"
+    assert (row["decedent"], row["personal_reps"], row["claims_address"], row["parcels"]) == (
+        None, None, None, None)
+    assert str(row["privacy_suppression_id"]) == rule_row
+
+
+def test_a_personal_representatives_rule_on_a_tied_parcel_tombstones_at_ingest(s):
+    rule_row = _rep_rule(s)
+    gate = pi.privacy_gate(s)
+    assert _ingest(s, "asotin_probate_notice_a", gate=gate) == "withheld"
+    _tombstoned(s, rule_row)
+
+
+def test_a_personal_representatives_rule_tombstones_at_the_recheck(s):
+    _ingest(s, "asotin_probate_notice_a", lookup=_down)          # failed, reps stored
+    s.commit()
+    rule_row = _rep_rule(s)
+    later = _NOW + pi.REMATCH_EVERY + timedelta(minutes=1)
+    assert pi.rematch_due(s, today=later.date(), now=later, lookup=_layer(_ROWS),
+                          gate=pi.privacy_gate(s)) == 1
+    _tombstoned(s, rule_row)
 
 
 def test_retention_deletes_old_notices_but_keeps_tombstones(s):

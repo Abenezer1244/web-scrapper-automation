@@ -30,7 +30,7 @@ promoted grantee). `f0b6141f` Columbia PACS: `pacs.ownership_year()` reads the n
 county's own form offers and both requests of both lookup paths name it (Property.aspx answers 500
 without `&year=`); only `_YEAR_HOSTS` get a year. `4640df3f` 20 s between iDocMarket searches.
 `9f0dc9b0` Columbia tax_delinquent: Asotin's PACS tax reader made county-generic, Columbia subclass,
-crawler + trusted source + registry, migration 162, numbered 158 then 160 until main took 158-161 (recorder offers death_certificate; tax connector
+crawler + trusted source + registry, migration 163, numbered 158/160/162 until main took 158-162 (recorder offers death_certificate; tax connector
 seeded INACTIVE with a fixed id). Final-review fixes `1173939e`: see Caught & fixed. Full CI-equivalent suite after them: 8,391 passed, 0 failed. Plan, matrix, evidence:
 `tasks/columbia-wa-seven.md`.
 
@@ -62,7 +62,7 @@ read shifted lines): never edit files during a full run.
 
 **Later the same day:** iDocMarket's Site Terms (§2) prohibit programmatic or systematic downloading,
 with no exception, and I had run ~20 automated searches before reading them. Production connector
-57cd7eed was switched off by hand (owner-approved; no customer configs) and migration 162 keeps it off:
+57cd7eed was switched off by hand (owner-approved; no customer configs) and migration 163 keeps it off:
 probate, death_certificate and pre_foreclosure are blocked by source terms, code kept for a permitted
 feed. The legal-description matcher was measured on the 13 real leads (county TaxParcels layer has full
 legals): ~0 placements a quarter (8 no/unsupported legal, 4 ambiguous split lots, 1 fails full extent);
@@ -71,7 +71,7 @@ set aside by owner decision. Lesson: read a source's terms BEFORE the first auto
 **Pending / Handoff:** Owner: push/PR/deploy; written permission from Tyler/County if the recorder is wanted; pricing for trustee_sale /
 divorce. After deploy: verify Columbia rows' assessor_url stay NULL, wait for >= 95% tax coverage
 (~5,280 keyed parcels), run owing/paid/held/privacy canaries, then activate the tax connector. The
-legal-description matcher was set aside (see "Later the same day" above). Renumbered to 162 when merging main (158-161 taken); renumber again if another county lands first.
+legal-description matcher was set aside (see "Later the same day" above). Renumbered to 163 when merging main (158-162 taken); renumber again if another county lands first.
 
 **Facts learned:** Columbia PACS (Harris 9.0.50): Geo IDs 13 digits = statewide ORIG_PARCEL_ID;
 newest roll "2026 - 2027" is the current-ownership roll; detail pages need `&year=`. Statewide layer
@@ -79,6 +79,60 @@ FIPS 013: 5,477 features, 7 without id, 190 duplicate features (multi-part) = 5,
 iDocMarket COLWA1: one results page per search, "Showing N of N", ~858 documents Jan-Nov 2026; it
 blocks bursts. The recorded legal ("SYNDICATE 9 5", "T09N R40E 23 LOT 3") matched the right PACS
 parcel where names failed.
+
+---
+
+## 2026-11-15 — Canary names where a probe broke (#635); per-type down state + RECOVERED alert
+
+**Built / Shipped:**
+- **#635** (`e7194f23`, deployed): a failed canary probe logs and pages `error_class` plus
+  `raise_site` (our file:line:function, and the library frame under it), never the error text.
+  Tested on the prod worker without writing anything: a Clallam eviction probe gave
+  `raise_site=src/scrapers/registry.py:124 in get_scraper_class` (the real raise line), and the
+  real Clallam tax probe stayed healthy. First real catch at 18:20 UTC: Lewis pre_foreclosure,
+  `RuntimeError at src/scrapers/templates/eagleweb.py:1157 in _extract_page` (results page never
+  loaded). The portal answered normally minutes later, so it was probably a short outage.
+- **This PR** (`feat/canary-recovery-alert`): a Redis marker per (connector id, record type) holds
+  that type's own state: `canary_unsent`, `canary` or `canary_zero_output`.
+  - DOWN pages when this type is not already paged (it used to check the connector's status).
+  - Only this type's own success (records this week, or older records) clears the marker and
+    sends `Canary RECOVERED` to e-mail and the audit row (`send_ops_alert(..., webhook=False)`).
+
+**Tried / Decided:**
+- Codex consult before the build. The owner chose Redis over a migration (best effort: a lost key
+  costs one extra DOWN page or one missed all-clear) and e-mail-only recovery: the Better Stack
+  webhook only opens incidents (`alert_id=kind:key`, `status="alert"`), so an all-clear sent
+  there would page as a new incident.
+- Not done: re-arming the DOWN cooldown on recovery, so a portal that flaps back to down within
+  the cooldown still stays quiet, as before.
+
+**Caught & fixed:**
+- *Pre-existing bug Codex found in the consult:* `health_status` is one flag per connector, so a
+  second type breaking on a connector another type had already set down never paged. The test
+  `test_types_sharing_a_connector_still_see_each_others_status` asserted that behaviour.
+- Codex review NO-GO twice:
+  1. An undelivered DOWN page was never retried. The new Redis handlers swallowed Celery time
+     limits, and `webhook=False` was not tested through the real sender.
+  2. The marker was stored as `canary` before delivery, so a failed send followed by a failed
+     Redis write stayed silent forever.
+
+  Fix: the marker is stored as `canary_unsent` and promoted to `canary` only after delivery, so
+  every failure path pages again. Every Redis handler calls `reraise_time_limit` first. Third
+  pass: GO.
+
+**Pending / Handoff:**
+- The Clallam tax `ValueError` (the reason #635 exists) has not recurred. The next alert will
+  show where it was raised.
+- After deploy, types that are already down have no marker yet, so they page once more on their
+  next failure (e.g. Lewis pre_foreclosure if it is still failing).
+- Local: test_db_canary `test_the_next_tick_samples_again_once_the_gate_expires` fails on
+  unchanged main on this machine (key gone before `pttl`). Not investigated.
+
+**Facts learned:**
+- The connector's `health_status` can't tell you which record type is broken: alerts and the
+  Redis markers are the per-type record.
+- `send_ops_alert` returning False means no route delivered, and that includes cooldown
+  suppression.
 
 ---
 
@@ -206,6 +260,9 @@ so probate now comes from the probate notices to creditors the nwmarket crawl al
 - Asotin sees about 2 probates per 4 days.
 - Live check 2026-11-14: cause 26-4-00122-02 matched one parcel through the shared surname;
   cause 26-4-00117-02 was held (exact name match, no family tie).
+
+---
+
 ## 2026-11-14 — Clark goes live: death certificates verified end to end, browser QA, parcel ids
 
 **Built / Shipped:** #631 merged (main `92db4278`), Railway auto-deployed api/worker/beat; owner

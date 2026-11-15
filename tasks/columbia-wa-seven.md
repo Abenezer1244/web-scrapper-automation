@@ -70,9 +70,9 @@ public index. Our death_certificate = the publicly RECORDED certificate in the A
   Original Phase 2 scope: (`pacs_parcel.py` site + detail `year`, `pacs.py` detail URL year,
   `county_gis.py` mailing county list, tests): connector `assessor_url`.
 - [x] **Phase 3 — tax_delinquent** (9f0dc9b0 + final-review fixes): Asotin's reader made county-generic,
-  Columbia subclass; house-number rule for situs; crawler + trusted source + registry; migration 162 (was 158, then 160)
+  Columbia subclass; house-number rule for situs; crawler + trusted source + registry; migration 163 (was 158, 160, 162)
   (recorder offers death_certificate; tax connector INACTIVE, fixed id). Codex r1 NO-GO -> r2 GO.
-- [x] **Phase 4 folded into migration 162**, minus `assessor_url` (owner decision: no name lookup).
+- [x] **Phase 4 folded into migration 163**, minus `assessor_url` (owner decision: no name lookup).
 - [x] iDocMarket searches paced 20 s (4640df3f); live re-proof 3 searches, no block.
 - [x] Trustee_sale / divorce / code_violation: documented blocked (paid access / no public case data).
 - [x] Codex per phase (all GO); final adversarial r1-r3 NO-GO, all fixed; r4 GO. Full suite 8,391 passed.
@@ -81,7 +81,7 @@ public index. Our death_certificate = the publicly RECORDED certificate in the A
 ## Review (2026-11-14)
 
 **Shipped on the branch (not pushed):** 1ab28c52 recorder repair + death_certificate; f0b6141f PACS
-current-roll year; 4640df3f search pacing; 9f0dc9b0 tax_delinquent + migration 162 (renumbered twice as main took 158-161); final-review fixes
+current-roll year; 4640df3f search pacing; 9f0dc9b0 tax_delinquent + migration 163 (renumbered as main took 158-162); final-review fixes
 (tax table without statements = unparsed; inventory raw count vs layer count, blank/duplicate ids
 explicit, >1% blank fails; stale page date is not an answer; 6 h silence alert; reader requires an
 inventory refreshed within 14 days; no assessor_url on Columbia rows).
@@ -98,7 +98,7 @@ inventory refreshed within 14 days; no assessor_url on Columbia rows).
 | divorce | Superior Court Odyssey (paid) / Digital Archives | Blocked by source access | GR 31; owner reviewing pricing |
 | code_violation | county / Dayton / Starbuck | Blocked by source access | no public case log |
 
-**Before activation:** deploy (migration 162 runs on API boot; renumber again if another county lands first);
+**Before activation:** deploy (migration 163 runs on API boot; renumber again if another county lands first);
 recorder: stays OFF (see below); tax: wait for
 >=95% fresh coverage, run paid/owing/held canaries, then set the tax connector active; do not add the
 county to public coverage until the owner approves.
@@ -138,7 +138,7 @@ this machine before the terms were read.
   Canary, registry, API listings, batches and jobs select only active connectors, so no new run can
   resolve the recorder. (Its domain stays on a worker's in-process allowlist until restart, and
   deactivation cannot stop a run already in flight; Columbia had never run a job.)
-- Migration 162 keeps it off; downgrade never switches it on. Code stays (tested) for a permitted feed.
+- Migration 163 keeps it off; downgrade never switches it on. Code stays (tested) for a permitted feed.
 - Re-enable only with written permission from Tyler Technologies or the Columbia County Auditor.
 
 ## Legal-description matcher: measured, set aside (owner decision)

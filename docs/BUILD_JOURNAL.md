@@ -83,6 +83,130 @@ so probate now comes from the probate notices to creditors the nwmarket crawl al
 
 ---
 
+## 2026-11-14 — Benton live: UI check, owner/sale-date fix (#629), canary priority (#634)
+
+**Built / Shipped:** After the owner restored the Railway plan, deployed migrations 154–156. Ran
+the first Benton recorder crawl on the prod worker: 42 notices read, 0 failed, 33 stored. Turned on
+Benton tax_delinquent and trustee_sale, and added death_certificate to Benton's recorder row. A live
+run through the UI (Benton Auction Leads, skip trace off) delivered 18 leads; one had no owner name.
+- **#629** (`5ea0ecdb`) `nts_benton_recorder.py`:
+  - reads `Grantor NAME` with no colon (same line only);
+  - skips a grantor that names the trustee, beneficiary or servicer (cover sheets list the recording party as "Grantor(s)");
+  - falls back to `Original Mortgagor(s):`, `from X, as Grantor` and `executed by X as Trustor`;
+  - reads the Section V restated sale date (`... encumbrances on <date>`) when Section I is unreadable; two readable dates that disagree give none.
+  
+  `trustee_sale._named_leads` now holds any auction lead with no owner name (all counties).
+  Re-crawl: 29 upcoming (was 25) and 0 notices without an owner. A UI re-run delivered 21 leads, all
+  with owner and date.
+- **#634** (`fcca88c0`) `_canary_units`: never-certified connectors (`last_checked` NULL or
+  `unknown`) are probed first, one type each, capped at `k - CANARY_ROUTINE_SLOTS`. Benton tax had sat
+  ~22h hidden from customers waiting for the random rotation. It went healthy at the first tick after
+  deploy (22:17 UTC); the UI now offers all 5 Benton types.
+- Data fixes:
+  - `nts_notices` REC-2026-014784, past and inactive: grantor changed from Wells Fargo to the parsed owner.
+  - One result from the owner's own test run: U.S. Bank changed to Alvin L Whitish.
+- Test fix: `test_auction_coverage` read its clock at import while the endpoint reads it per
+  request, so a ~40-minute CI run crossing midnight UTC moved the boundary cases by a day. Each row
+  now reads the clock when it is built.
+
+**Tried / Decided:**
+- **Sale dates.** A date was never repaired by OCR guessing ("FebruaryS" → 5). The statute's own
+  restatement is read instead.
+- **Stale owner row.** Fixed with a targeted one-row update, not a 200-day re-crawl. Codex: a wider
+  crawl stamps more cancellations, and COALESCE keeps the old grantor whenever a parse returns NULL.
+- **Railway config.** `railway config migrate` was NOT run. #538 (2026-10-25) had already moved build
+  and start settings to the dashboard and deliberately rejected the IaC file: it owns each service's
+  whole variable set. The "Config as Code is deprecated" warning came only from an untracked leftover
+  `railway.toml` in the main checkout (identical to `c939bb84^`), which was deleted. Today's three
+  GitHub deploys booted correctly without it.
+
+**Failed / Blocked:**
+- The auto-mode classifier blocked `railway ssh` crawl runs, `git push`, PR merges and a
+  browser-driver helper until the owner explicitly asked for them. The owner pushed and merged #634
+  themselves.
+- `test_auction_coverage` and other endpoint tests fail locally with 503 (auth needs Redis). They run
+  in CI only.
+- Still blocked in Benton:
+  - code_violation: no public case search.
+  - divorce: GR 31, and no Dissolution recordings.
+
+**Caught & fixed:** Codex on #629 found:
+- High: wrapped or colonless trustee names were not excluded;
+- High: a bare `Grantor` line took the next field as the owner;
+- Medium: wrapped borrower fallbacks were cut short.
+
+All three were fixed with tests; the re-review passed. Codex on #634 (consult): a NULL-first queue
+could starve the rotation, so 2 slots stay reserved and pending connectors stay out of the routine
+pool. A test then caught the routine pool still drawing pending connectors' other types.
+
+**Pending / Handoff:** Benton tax lists 3 parcels for the 11/16 and 11/19 GovEase sales. After the
+sales it may return few or no leads until the Treasurer posts a new listing; the canary will mark
+it `degraded` and alert.
+
+**Facts learned:**
+- On Benton notices, a cover sheet's "Grantor(s)" is the recording party.
+- Every RCW 61.24.040 notice restates the sale date in Section V.
+- The canary's random 5-of-N rotation made new connectors invisible for a day or more.
+- Deleting a scraper sets `scraper_configs.active=false`, so its jobs and results are kept.
+
+---
+
+## 2026-11-13/14 — Chelan: trustee sales from scanned recordings, with an operator in the loop (#625, #632)
+
+**Built / Shipped:**
+- **#625** merged 2026-11-13 (`d7188fe2`, deployed with Asotin/Clallam/Benton; production 139 -> 157). Chelan reads every recorded document through `POST /Search/GridResults`, links leads to the recording's own parcel, and offers `death_certificate` (migration 157). Production check: Chelan connector = probate, pre_foreclosure, death_certificate, active.
+- **#632** merged 2026-11-14 21:55 UTC (`6e1270f0`), production 157 -> 159. Chelan's Notices of Trustee's Sale are scan-only PDFs, so:
+  - **Staging (migration 158).** A daily crawl (`crawl-nts-chelan-recorder`, 09:50 UTC) finds NTS/NTSCOM/NOD recordings and OCRs each NTS in an isolated child process into `nts_recorder_documents`. Tesseract runs under a strict PDF profile with byte, page and time caps.
+  - **Operator review.** `scripts/nts_review.py` (admin + MFA): `list`, `show`, `approve`, `reject`, `resolve-nod`. Approval writes `nts_notices` (source `chelan_recorder`, key `REC-<instrument>`). The parcel must be one of the recording's own APNs and an amount needs its basis. The reviewer supplies `--grantor`; that value is never written to staging JSON. The raw OCR text can contain the borrower's name: it is cleared on approval or rejection, or after 30 days unreviewed. Rejection takes fixed codes only.
+  - **Revisions.** A second notice on a shared deed of trust is refused until the reviewer says `--supersedes` (cancels the older notice and frees its leads) or `--independent`.
+  - **Discontinuances.** Read from the NOD detail page's structured "Related Number" links, with no OCR. A NOD cancels a notice by itself only when it names that notice's own recording number. A loan-only reference matching an approved notice, or a page that links nothing, waits for the operator, even when the same NOD also cancels another notice directly. Approval checks NODs recorded on or after the notice: a direct reference writes it cancelled; a loan-only one requires `--discontinued-by <instrument>` or `--not-discontinued`. Pending NODs are resolved with `resolve-nod --doc <id> --cancels <instrument>` (repeatable) or `--no-effect`. NODs never expire.
+  - **Delivery (migration 159).** `ChelanWATrusteeSaleScraper` and its connector, **inserted inactive**. Chelan joined `NTS_MATCH_COUNTIES`. A new `_TrusteeSaleScraper._source_gap` hook (no-op elsewhere) reports Chelan's cache short when a recording first seen more than 3 days ago is still `pending_review` or `failed` (expired rows included), inside or outside the discovery window.
+  - **Shared code.** Benton's cancellation block became `_cancel_notices` (same SQL, same lock order). The Dockerfile installs `tesseract-ocr`.
+  - **Production check (2026-11-14, read-only):** `alembic_version` = 159 and the Chelan trustee_sale connector present with `active = false` (SQL against production); api, worker and beat deployments SUCCESS from the merge (`railway deployment list`); `tesseract 5.5.0` with `eng` data (`railway ssh --service worker tesseract --version / --list-langs`).
+
+**Tried / Decided:**
+- **Review is mandatory.** The owner chose full build with operator review: every OCR'd notice is approved against its image before customers see it.
+- **Identity.** The recording, not the sale, is the identity (`REC-<instrument>`, Benton's rule).
+- **Revisions.** These are explicit, never inferred: one deed of trust can carry successive foreclosures (Codex).
+- **Review lag.** It is judged at delivery time, not by withholding the crawl heartbeat. A heartbeat written just before the deadline stays valid three more days (Codex).
+- **Migration 158** was amended in place for the `discontinuance` status, because it had never been pushed or deployed.
+- **Crawl reach.** A first run needs only the 30-day window: only notices inside it are staged, and their discontinuances follow them. After an outage the crawl reaches back to its last complete read, capped at 60 days, because discovery reads the portal one day at a time.
+
+**Failed / Blocked:**
+- **Can't merge myself.** My `gh pr merge` was denied by the permission classifier as a production merge, so the owner ran the merge for both PRs. #632 waited for main twice (#629, #631) and needed main merged in each time.
+- **Local test gaps.** The Redis-dependent tests can't run locally: the Chelan crawl lock test, and `test_job_degradations_wiring.py`, which fails 23/25 identically on the merged #625 branch without this code. CI ran them green.
+- **Still blocked:**
+  - tax_delinquent: legal review of the county's terms of use (owner).
+  - code_violation: no public case data, county or its 5 cities.
+  - divorce: paid OnBase.
+  - probate/pre_foreclosure: the current owner can't be verified, because PACS owner names are never stored (licensing).
+
+**Caught & fixed (Codex, before shipping):**
+- **4a-3a**, NO-GO then GO:
+  - A recording citing several deeds of trust skipped the same-loan check.
+  - Free-text rejection reasons could keep a borrower's name.
+  - NaN, Infinity, overflow and sub-cent amounts were accepted.
+  - No privacy-rule or two-session tests.
+- **4a-3b**, NO-GO then GO:
+  - Adding Chelan to the matcher would have stamped approved sales onto delivered pre_foreclosure leads before discontinuances were handled. It was deferred to 4a-3c.
+  - The heartbeat could not enforce the review deadline and missed failed/expired rows outside the window.
+- **4a-3c**, NO-GO twice then GO:
+  - The 30-day purge would have expired pending discontinuances and dropped their references.
+  - A NOD naming one notice directly and citing another's loan settled without the operator.
+  - Persistent failures, including ones rediscovered in the window, could take the whole 20-per-run allowance. Now each run combines fresh recordings with at most 5 rotating retries (longest-waiting first, rediscovered failures included), puts NODs first across that queue, and reads at most 20.
+- **Tests I fixed myself:** a test ran a raw `UPDATE` and then `expire_all()` without flushing first, so the expiry discarded the unflushed approval; it now flushes first. A users insert needed `email_hmac`.
+
+**Pending / Handoff:**
+- **First crawl.** Next scheduled: 2026-11-15 09:50 UTC. Verify it ran, how many notices it staged, and any unreadable.
+- **Review the queue (owner):** `railway run --service worker python scripts/nts_review.py --operator-email <admin> list`.
+- **Before switching the connector on:** one approved real recording checked through both pre_foreclosure and trustee_sale (dedup hash, matcher attachment). Then the owner activates it.
+
+**Facts learned:**
+- **NOD detail pages.** Chelan NOD detail pages link what they end as `<a onclick="JumpToTransactionItemId('id')">NNN [CODE]</a>`, tag optional. In 4 NODs from Aug to Nov 2026: `[NTS]`, `[DT]`, untagged, and two links on one page.
+- **Codes.** Chelan `NOD` = Notice of Discontinuance (not Notice of Default).
+- **NTS PDFs.** One 1-bit image per page with a white-first palette, which must be inverted before OCR.
+- **Merge timing.** `gh pr merge --auto --match-head-commit` merges once the repository's requirements pass. For #632, Railway started building api, worker and beat within a minute of the merge; check that the deploys succeed each time.
+
 ## 2026-11-13/14 — Clallam goes live; one tax canary failure; retry fix (#630)
 
 **Built / Shipped:** The owner restored the Railway plan. The 2026-11-13 deploy took production from

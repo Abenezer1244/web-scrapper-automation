@@ -24,7 +24,12 @@ from httpx import AsyncClient
 from src.config.constants import AUCTION_PUBLICATION_LAG_DAYS
 from src.db.models import Job, Result, ScraperConfig, User
 
-NOW = datetime.now(UTC)
+
+def _now() -> datetime:
+    """Read at use, like the endpoint's own today: a module-level clock taken at import
+    went stale when a ~40-minute CI run crossed midnight UTC, and the exact-boundary
+    cases then landed a day off (test_auction_coverage flaked)."""
+    return datetime.now(UTC)
 
 
 def _auth(token: str) -> dict:
@@ -46,7 +51,7 @@ async def _prefc_config(db, user: User, county: str = "king") -> ScraperConfig:
 async def _job(db, user: User, config: ScraperConfig) -> str:
     job_id = str(uuid.uuid4())
     db.add(Job(id=str(job_id), user_id=user.id, scraper_config_id=config.id,
-               status="done", created_at=NOW))
+               status="done", created_at=_now()))
     await db.commit()
     return job_id
 
@@ -56,7 +61,7 @@ async def _row(db, job_id: str, user_id: str, *, recorded_days_ago: int | None,
     rid = str(uuid.uuid4())
     recorded = (
         None if recorded_days_ago is None
-        else (NOW - timedelta(days=recorded_days_ago)).strftime("%m/%d/%Y")
+        else (_now() - timedelta(days=recorded_days_ago)).strftime("%m/%d/%Y")
     )
     db.add(Result(
         id=rid, job_id=job_id, user_id=user_id,
@@ -64,7 +69,7 @@ async def _row(db, job_id: str, user_id: str, *, recorded_days_ago: int | None,
         parcel_id=f"PARCEL-{uuid.uuid4().hex[:8]}",
         property_address="1 TEST ST", doc_type="NOTICE OF TRUSTEE SALE",
         auction_date=(None if auction_in_days is None
-                      else (NOW + timedelta(days=auction_in_days)).date()),
+                      else (_now() + timedelta(days=auction_in_days)).date()),
     ))
     await db.commit()
     return rid

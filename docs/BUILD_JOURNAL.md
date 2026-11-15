@@ -29,8 +29,9 @@ to understand *why* the code is the way it is and *what's been attempted before*
   own deletion rule on any tied parcel now erases (tombstones) the whole notice.
 - `src/workers/probate_ingest.py`: the ingest and re-check gate passes the representatives too, so such a
   notice is stored as a `withheld` tombstone. `Gate` is now `(parcels, county, reps)`.
-- `src/utils/lead_formatting.py` `current_owner_fields()`, used by `tasks_helpers/enrich.py` (King
-  probate/death certificate) and `scripts/backfill_king_probate_current_owner.py`: an owner string with
+- `src/utils/lead_formatting.py` `current_owner_fields()`, used by both writers in
+  `tasks_helpers/enrich.py` (King, and the PACS path #642 added for every PACS county, Asotin included)
+  and by `scripts/backfill_king_probate_current_owner.py`: an owner string with
   care-of or representative wording (C/O, C\O, CARE OF, ATTN, PR, PERS/PER/PERSONAL REP, executor,
   administrator) leaves Current Owner and Title Status blank. Re-enrichment removes a stored pair.
 
@@ -68,8 +69,10 @@ tests fail on the old code.
 - The first probate crawl with this code is the 2026-11-16 10:00 UTC run, if this deploys first.
 
 **Facts learned:**
-- Current Owner (`assessor_current_owner`) is written only in the King enrichment block and by the King
-  backfill script. Every other county leaves it empty.
+- Current Owner (`assessor_current_owner`) was King-only until #642 (merged during this work) added a
+  PACS writer. That writer would have shown Asotin's 'ESTATE C/O <rep> PR' owners once Asotin probate
+  is switched on, so it goes through the same guard. Grep for every writer of a field before claiming
+  where it comes from.
 - `ALTER TABLE ... ENABLE TRIGGER USER` re-enables triggers as ORIGIN, not ALWAYS. Never toggle triggers
   on a privacy table, even in a test database.
 

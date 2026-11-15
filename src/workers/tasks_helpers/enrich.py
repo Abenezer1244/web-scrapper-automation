@@ -1351,14 +1351,16 @@ def _run_inline_enrichment(
                         # path does. Display-only: never overwrites party_name, never drops
                         # the lead (heirs are valid sellers; the assessor lags). Benton,
                         # 2026-11-15: a death certificate recorded for a sale named a parcel
-                        # an unrelated buyer now owns, and nothing on the lead said so.
+                        # an unrelated buyer now owns, and nothing on the lead said so. An
+                        # owner string naming a care-of or a representative (Asotin prints
+                        # 'ESTATE C/O <rep> PR') is not shown, and a stored pair is removed.
                         _owner = gis_data.get("owner_name")
                         if _owner and config.record_type in ("probate", "death_certificate"):
-                            from src.utils.lead_formatting import classify_probate_title_status
+                            from src.utils.lead_formatting import current_owner_fields
                             _ed = dict(res.enrichment_data) if isinstance(res.enrichment_data, dict) else {}
-                            _ed["assessor_current_owner"] = _owner
-                            _ed["title_status"] = classify_probate_title_status(res.party_name, _owner)
-                            res.enrichment_data = _ed
+                            _ed.pop("assessor_current_owner", None)
+                            _ed.pop("title_status", None)
+                            res.enrichment_data = _ed | current_owner_fields(res.party_name, _owner)
                         if mail and bulk_source:
                             _bulk_fills.append((res, gis_data))
                         # Migration 085 (#188) — capture the REAL situs parts BEFORE the

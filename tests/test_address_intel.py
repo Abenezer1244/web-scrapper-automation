@@ -326,3 +326,12 @@ class TestSamePlaceWrittenDifferently:
     def test_same_unit_spelling_different_zip_is_absentee(self):
         f = compute_owner_flags("275 W ROY ST 412, SEATTLE, WA 98119", "275 W ROY ST #412, SEATTLE, WA 98109")
         assert f["absentee_owner"] is True
+
+    def test_house_letter_is_not_a_directional(self):
+        f = compute_owner_flags("123N MAIN ST, SEATTLE, WA 98101", "123 N MAIN ST, SEATTLE, WA 98101")
+        assert f["absentee_owner"] is True
+
+    def test_hyphenated_bare_unit_vs_marked_unit(self):
+        f = compute_owner_flags("22222 24TH AVE S C-22, DES MOINES, WA 98198",
+                                "22222 24TH AVE S #C-22, DES MOINES, WA 98198")
+        assert f["absentee_owner"] is False

@@ -29,6 +29,7 @@ from src.privacy.authorize import (
     authorize,
     build_snapshot,
     load_rule_snapshot,
+    natural_order_subjects,
 )
 from src.privacy.subjects import NORMALIZATION_VERSION
 from src.workers.property_identity import compute_property_key, property_key_input
@@ -260,6 +261,29 @@ def test_an_heir_is_a_subject_too():
     d = authorize(_snap(_history(["pending", "active"])),
                   _row(party_name="JONES MARY", heirs="SMITH JOHN"), **_CTX)
     assert d.outcome == WITHHELD
+
+
+def test_a_person_named_beside_the_row_is_judged_like_its_own_subjects():
+    # A probate notice's personal representative is printed in natural order.
+    snap = _snap(_history(["pending", "active"]))
+    rep = natural_order_subjects(["JOHN SMITH"], source_field="personal_reps")
+    d = authorize(snap, _row(party_name="JONES MARY"), **_CTX, extra_subjects=rep)
+    assert d.outcome == WITHHELD
+    # Read in natural order, never the row's recorder order: "SMITH JOHN" is John Smith
+    # only as a recorder prints him.
+    reversed_ = natural_order_subjects(["SMITH JOHN"], source_field="personal_reps")
+    assert authorize(snap, _row(party_name="JONES MARY"), **_CTX,
+                     extra_subjects=reversed_).outcome == ALLOWED
+    # Several people: each read on its own; nothing extra changes nothing.
+    two = natural_order_subjects(["MARY JONES", "JOHN SMITH"], source_field="personal_reps")
+    assert authorize(snap, _row(party_name="JONES MARY"), **_CTX,
+                     extra_subjects=two).outcome == WITHHELD
+    assert authorize(snap, _row(party_name="JONES MARY"), **_CTX).outcome == ALLOWED
+
+
+def test_only_text_names_anybody_beside_the_row():
+    assert natural_order_subjects([None, "", "  ", 7, ["JOHN SMITH"]],
+                                  source_field="personal_reps") == []
 
 
 def test_a_phone_in_the_extra_contacts_is_an_anchor():

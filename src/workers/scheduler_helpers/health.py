@@ -533,19 +533,28 @@ def _canary_check_impl() -> None:
     from src.workers.ops_alerts import send_ops_alert
 
     committed_alerts: list[tuple[str, str, str, str]] = []
+    # DOWN alert key -> its type's marker, promoted to paged once that page went out.
+    down_markers: dict[str, str] = {}
     try:
         for connector, record_type in units:
             unit_alerts: list[tuple[str, str, str, str]] = []
-            _probe_unit(connector, record_type, unit_alerts)
+            mark = _probe_unit(connector, record_type, unit_alerts)
             connector.last_checked = datetime.now(UTC)
             if _record_unit(connector):
                 committed_alerts.extend(unit_alerts)
+                committed_alerts.extend(_apply_mark(connector, record_type, mark))
+                if mark and mark[0] == _DOWN_UNSENT:
+                    down_markers[f"{connector.county}/{connector.state}/{record_type}"] = (
+                        _bad_key(connector, record_type))
             else:
                 _logger.warning("Canary %s/%s %s: connector row is gone; result not recorded",
                                 connector.county, connector.state, record_type)
     finally:
         for kind, key, subject, body in committed_alerts:
-            send_ops_alert(kind, key, subject, body)
+            delivered = send_ops_alert(kind, key, subject, body,
+                                       webhook=kind != "canary_recovered")
+            if kind == "canary" and delivered and key in down_markers:
+                _mark_down_paged(down_markers[key])
 
 
 def _record_unit(connector) -> bool:
@@ -564,8 +573,13 @@ def _record_unit(connector) -> bool:
     return result.rowcount == 1
 
 
-def _probe_unit(connector, record_type: str, pending_alerts: list) -> None:
-    """Probe one (connector, record type); set health_status; queue any ops alert."""
+def _probe_unit(connector, record_type: str, pending_alerts: list) -> tuple[str, str] | None:
+    """Probe one (connector, record type); set health_status; queue any ops alert.
+
+    Returns this type's own verdict for _apply_mark: ("ok", evidence) when the type
+    yielded, (alert kind, "") when it was paged as broken, None when the probe proved
+    neither (an inconclusive history, or an empty trustee_sale).
+    """
     import asyncio
 
     from src.scrapers.registry import UnsupportedCountyError, get_scraper_class
@@ -573,6 +587,11 @@ def _probe_unit(connector, record_type: str, pending_alerts: list) -> None:
     where = f"{connector.county}/{connector.state}"
     # M6: alert only on the TRANSITION into a bad state (the cooldown also dedupes).
     prev_status = connector.health_status
+    # Whether THIS type is already paged down. The connector's status cannot say: a
+    # second type breaking on a connector another type had already taken down was never
+    # paged (Codex).
+    already_down = _marked_bad(connector, record_type) == "canary"
+    mark = None
     try:
         scraper_class, matched_type = get_scraper_class(connector.county, connector.state, record_type)
         # Probe a 7-day window. A 1-day window produces false-positive "degraded"
@@ -586,6 +605,7 @@ def _probe_unit(connector, record_type: str, pending_alerts: list) -> None:
         )
         if records:
             connector.health_status = "healthy"
+            mark = ("ok", f"{len(records)} records in the last 7 days")
         elif record_type in _NO_ZERO_OUTPUT_DOWNGRADE and prev_status == "healthy":
             pass  # see _NO_ZERO_OUTPUT_DOWNGRADE
         else:
@@ -596,6 +616,8 @@ def _probe_unit(connector, record_type: str, pending_alerts: list) -> None:
             history = _canary_probe_historical(scraper_class, today, matched_type)
             if history == "hit":
                 connector.health_status = "healthy"
+                mark = ("ok", "none this week, older records found: extraction works, "
+                              "but check the source is still publishing")
                 _logger.info("Canary %s %s: source_lagged (current week empty, "
                              "historical records OK) -> healthy", where, record_type)
             elif history == "empty":
@@ -609,6 +631,7 @@ def _probe_unit(connector, record_type: str, pending_alerts: list) -> None:
                 connector.health_status = "degraded"
                 # Zero upcoming auctions is legitimate: a trustee_sale pair is never paged.
                 if record_type not in _NO_ZERO_OUTPUT_DOWNGRADE:
+                    mark = ("canary_zero_output", "")
                     pending_alerts.append((
                         "canary_zero_output", f"{where}/{record_type}",
                         f"Canary ZERO OUTPUT: {where} {record_type} (was {prev_status})",
@@ -634,10 +657,13 @@ def _probe_unit(connector, record_type: str, pending_alerts: list) -> None:
             _logger.error("Canary failed for %s %s: %s at %s", where, record_type,
                           type(exc).__name__, site)
         connector.health_status = "down"
+        # Stored as unsent until the page is delivered, so every failure on the way
+        # (no route, Redis, a time limit) leaves it to page again, never silent (Codex).
+        mark = ("canary", "") if already_down else (_DOWN_UNSENT, "")
         # A previously-working source just broke: page ops. Exception CLASS and
         # raise site only, never its text (scraper errors can embed raw page
         # content, a PII risk: Codex P2).
-        if prev_status != "down":
+        if not already_down:
             pending_alerts.append((
                 "canary", f"{where}/{record_type}",
                 f"Canary DOWN: {where} {record_type} (was {prev_status})",
@@ -646,6 +672,106 @@ def _probe_unit(connector, record_type: str, pending_alerts: list) -> None:
                 f"error_class={type(exc).__name__}\n"
                 f"raise_site={site}",
             ))
+    return mark
+
+
+# Which (connector, record type) pairs are paged as broken, and how. health_status is one
+# flag per connector, so it can tell neither a second type breaking from the first nor a
+# type's own recovery from another type's success. Redis, best-effort (owner + Codex,
+# 2026-11-15): a lost key costs one extra DOWN page (still cooldown-limited) or one
+# missed all-clear, never a wrong health_status.
+_BAD_PREFIX = "canary:bad:"
+# Down, and its page has not (yet) gone out on any route: the next probe pages again.
+_DOWN_UNSENT = "canary_unsent"
+
+
+def _bad_key(connector, record_type: str) -> str:
+    return f"{_BAD_PREFIX}{connector.id}:{record_type}"
+
+
+def _redis():
+    import redis as sync_redis
+
+    from src.config import settings
+
+    return sync_redis.from_url(settings.REDIS_URL, **settings.redis_kwargs())
+
+
+def _text(value) -> str | None:
+    return value.decode() if isinstance(value, bytes) else value
+
+
+def _marked_bad(connector, record_type: str) -> str | None:
+    """The alert kind this type is paged as broken with, or None. Unreadable -> None,
+    so a still-broken type pages again (noisy beats silent; the cooldown dedupes)."""
+    try:
+        r = _redis()
+        try:
+            return _text(r.get(_bad_key(connector, record_type)))
+        finally:
+            r.close()
+    except Exception as exc:  # noqa: BLE001 -- the canary must not depend on Redis
+        from src.utils.celery_limits import reraise_time_limit
+
+        reraise_time_limit(exc)
+        _logger.warning("Canary: down marker unreadable (%s); paging as new", type(exc).__name__)
+        return None
+
+
+def _apply_mark(connector, record_type: str, mark) -> list[tuple[str, str, str, str]]:
+    """Record this type's verdict once its status is written; return any all-clear.
+
+    Only this type's own success clears its marker, so another type on the connector
+    probing healthy never announces a recovery that did not happen.
+    """
+    if mark is None:
+        return []
+    state, evidence = mark
+    key = _bad_key(connector, record_type)
+    try:
+        r = _redis()
+        try:
+            if state != "ok":
+                r.set(key, state)
+                return []
+            pipe = r.pipeline()  # MULTI: read and clear as one step
+            pipe.get(key)
+            pipe.delete(key)
+            was, _ = pipe.execute()
+        finally:
+            r.close()
+    except Exception as exc:  # noqa: BLE001 -- the canary must not depend on Redis
+        from src.utils.celery_limits import reraise_time_limit
+
+        reraise_time_limit(exc)
+        _logger.warning("Canary: down marker not updated (%s)", type(exc).__name__)
+        return []
+    was = _text(was)
+    if not was:
+        return []
+    where = f"{connector.county}/{connector.state}"
+    label = "DOWN" if was in ("canary", _DOWN_UNSENT) else "ZERO OUTPUT"
+    return [(
+        "canary_recovered", f"{where}/{record_type}",
+        f"Canary RECOVERED: {where} {record_type} (was {label})",
+        f"connector={where}\nrecord_type={record_type}\nwas={label}\nevidence={evidence}",
+    )]
+
+
+def _mark_down_paged(key: str) -> None:
+    """A down type's page went out: later probes stay quiet until it recovers."""
+    try:
+        r = _redis()
+        try:
+            r.set(key, "canary", xx=True)
+        finally:
+            r.close()
+    except Exception as exc:  # noqa: BLE001 -- the canary must not depend on Redis
+        from src.utils.celery_limits import reraise_time_limit
+
+        reraise_time_limit(exc)
+        _logger.warning("Canary: down page not marked sent (%s); it pages again",
+                        type(exc).__name__)
 
 
 _SRC_ROOT = Path(__file__).resolve().parents[2]  # <repo>/src

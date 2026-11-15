@@ -135,6 +135,9 @@ class MailingAnswer:
     mailing_address: str | None = None
     role: str | None = None
     revision: str | None = None
+    # The assessor's current owner, when the source page names it (PACS). Display-only:
+    # probate/death-certificate rows record it beside the decedent (title_status).
+    owner_name: str | None = None
 
     @property
     def is_found(self) -> bool:

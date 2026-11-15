@@ -63,6 +63,7 @@ from src.scrapers.enrichment.pacs import (
     compose_pacs_mailing,
     normalize_pacs_parcel,
     pacs_detail_url,
+    pacs_owner_names,
     parse_pacs_detail_html,
     post_search,
     search_type_field,
@@ -297,7 +298,8 @@ def parse_detail(html: str, parcel_key: str) -> MailingAnswer:
         return MailingAnswer(UNPARSED)
     if len(composed) != 1:
         return MailingAnswer(AMBIGUOUS)  # co-owners with different addresses
-    return MailingAnswer(FOUND, mailing_address=composed.pop(), role="owner")
+    return MailingAnswer(FOUND, mailing_address=composed.pop(), role="owner",
+                         owner_name=pacs_owner_names(html))
 
 
 def _request(do, still_held) -> tuple[requests.Response | None, str | None]:

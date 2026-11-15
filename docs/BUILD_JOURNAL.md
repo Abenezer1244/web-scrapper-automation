@@ -19,6 +19,123 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-11-15 — Canary names where a probe broke (#635); per-type down state + RECOVERED alert
+
+**Built / Shipped:**
+- **#635** (`e7194f23`, deployed): a failed canary probe logs and pages `error_class` plus
+  `raise_site` (our file:line:function, and the library frame under it), never the error text.
+  Tested on the prod worker without writing anything: a Clallam eviction probe gave
+  `raise_site=src/scrapers/registry.py:124 in get_scraper_class` (the real raise line), and the
+  real Clallam tax probe stayed healthy. First real catch at 18:20 UTC: Lewis pre_foreclosure,
+  `RuntimeError at src/scrapers/templates/eagleweb.py:1157 in _extract_page` (results page never
+  loaded). The portal answered normally minutes later, so it was probably a short outage.
+- **This PR** (`feat/canary-recovery-alert`): a Redis marker per (connector id, record type) holds
+  that type's own state: `canary_unsent`, `canary` or `canary_zero_output`.
+  - DOWN pages when this type is not already paged (it used to check the connector's status).
+  - Only this type's own success (records this week, or older records) clears the marker and
+    sends `Canary RECOVERED` to e-mail and the audit row (`send_ops_alert(..., webhook=False)`).
+
+**Tried / Decided:**
+- Codex consult before the build. The owner chose Redis over a migration (best effort: a lost key
+  costs one extra DOWN page or one missed all-clear) and e-mail-only recovery: the Better Stack
+  webhook only opens incidents (`alert_id=kind:key`, `status="alert"`), so an all-clear sent
+  there would page as a new incident.
+- Not done: re-arming the DOWN cooldown on recovery, so a portal that flaps back to down within
+  the cooldown still stays quiet, as before.
+
+**Caught & fixed:**
+- *Pre-existing bug Codex found in the consult:* `health_status` is one flag per connector, so a
+  second type breaking on a connector another type had already set down never paged. The test
+  `test_types_sharing_a_connector_still_see_each_others_status` asserted that behaviour.
+- Codex review NO-GO twice:
+  1. An undelivered DOWN page was never retried. The new Redis handlers swallowed Celery time
+     limits, and `webhook=False` was not tested through the real sender.
+  2. The marker was stored as `canary` before delivery, so a failed send followed by a failed
+     Redis write stayed silent forever.
+
+  Fix: the marker is stored as `canary_unsent` and promoted to `canary` only after delivery, so
+  every failure path pages again. Every Redis handler calls `reraise_time_limit` first. Third
+  pass: GO.
+
+**Pending / Handoff:**
+- The Clallam tax `ValueError` (the reason #635 exists) has not recurred. The next alert will
+  show where it was raised.
+- After deploy, types that are already down have no marker yet, so they page once more on their
+  next failure (e.g. Lewis pre_foreclosure if it is still failing).
+- Local: test_db_canary `test_the_next_tick_samples_again_once_the_gate_expires` fails on
+  unchanged main on this machine (key gone before `pttl`). Not investigated.
+
+**Facts learned:**
+- The connector's `health_status` can't tell you which record type is broken: alerts and the
+  Redis markers are the per-type record.
+- `send_ops_alert` returning False means no route delivered, and that includes cooldown
+  suppression.
+
+---
+
+## 2026-11-15 — Asotin probate merged and deployed (#639); post-deploy security review
+
+**Built / Shipped:** #639 was squash-merged as `c8fcfecb` at 2026-11-15 20:47 UTC. Railway rebuilt api,
+worker and beat, and all three reported SUCCESS. The api boot log shows `159 -> 160` (probate_notices)
+and `160 -> 161` (connector). A read-only production check found `alembic_version` = 161 and all four
+Asotin connectors with `active = false`. The new worker lists `crawl_nts_nwmarket_asotin` among its
+tasks, and beat started cleanly.
+
+**Tried / Decided:**
+- Squash rather than a merge commit. Two early branch commits held decedent names taken from the public
+  notices; squashing kept them out of main's history.
+- Deleted the remote branch after checking that its tree equals `c8fcfecb`'s. GitHub still keeps
+  `refs/pull/639/head`, so the commits stay reachable through the PR. Removing them needs GitHub
+  Support, and the repository is private.
+- Removed the local worktree, the branch, and the test containers `bl-asotin-pg` and `bl-asotin-redis`
+  with their anonymous volumes.
+
+**Failed / Blocked:**
+- CI on the PR did not start for hours. Both sides had added a top entry to this journal, so the PR was
+  conflicted, and GitHub runs no pull_request workflows on a conflicted PR. It happened twice: main moved
+  again (#638) during the 39-minute Test run. Both times the merge was resolved by keeping both entries,
+  and the merged tree was re-tested before pushing.
+- Asotin tax coverage is 6,086 of 13,612 parcels checked within 10 days (44.7%), short of the 95% gate.
+  The parcel inventory heartbeat was 2026-11-13 23:25 UTC. The connectors stay off.
+
+**Caught & fixed:** nothing new in code.
+
+**Post-deploy security review** (§15, scoped to `c8fcfecb`; Claude and Codex, Codex verdict GO, no
+Critical or High):
+- Live catalog checks: RLS is on for `probate_notices`. The only policies are for `bridgeleads_system`
+  and `bridgeleads_purge`. `anon`, `authenticated` and `bridgeleads_app` cannot SELECT.
+  `privacy_erase_probate` is SECURITY DEFINER, owned by `bridgeleads_purge`, with
+  `search_path = pg_catalog, pg_temp`, and only the purge and system roles can execute it.
+- Static checks pass for secrets, http URLs, dependencies, SSRF (`safe_get`), CSV sanitizing and tenant
+  scoping.
+- **Medium (open): erasure misses representatives.** `src/privacy/erase.py` `_scan_probate` matches a
+  deletion rule only against each parcel's decedent and owner of record, never `personal_reps`. A
+  representative's own deletion request leaves their name on the notice until the 180-day retention.
+- **Medium (open; Codex severity, Claude reads it as low practical risk):** the ArcGIS `where` clause in
+  `asotin_parcels.query_surname` is built from text. The surname must match `^[A-Z][A-Z'\-]{1,40}$` and
+  its quotes are doubled; ArcGIS REST has no bound parameters.
+- Low: `probate_ingest` logs `str(exc)[:120]` on a re-check failure, so a database error's parameters
+  would only be kept out of the log by the 120-character cut.
+
+**Pending / Handoff:**
+- The first scheduled chance to write `probate_notices` is the 2026-11-16 10:00 UTC crawl (it may also fail
+  or find no probate notice). Check it with
+  aggregates only (outcome counts, `max(fetched_at)`, heartbeat age); a heartbeat alone does not prove
+  ingestion.
+- The two Medium findings above.
+- Owner decision: the app-wide "Current Owner" (`tasks_helpers/enrich.py`, `assessor_current_owner`) can
+  show an "ESTATE C/O <rep> PR" string for probate leads in any county. Codex recommends not filling it
+  for probate until a display rule is approved, and dealing with values already stored.
+- Asotin activation waits on 95% tax coverage and owner release approval.
+
+**Facts learned:**
+- A conflicted PR gets no pull_request CI, which looks exactly like CI that hasn't started. Two branches
+  that both add a top journal entry can conflict, as these did.
+- `crawl_nts_nwmarket_asotin` runs daily at 10:00 UTC whether or not the connector is active, so a deploy
+  after 10:00 waits a day for its first crawl.
+
+---
+
 ## 2026-11-14 — Asotin probate from Lewiston Tribune notices to creditors (branch `feat/asotin-wa-probate-notices`)
 
 **Built / Shipped (branch only, not merged):** Asotin's recorder (Helion) is behind a reCAPTCHA,
@@ -80,6 +197,9 @@ so probate now comes from the probate notices to creditors the nwmarket crawl al
 - Asotin sees about 2 probates per 4 days.
 - Live check 2026-11-14: cause 26-4-00122-02 matched one parcel through the shared surname;
   cause 26-4-00117-02 was held (exact name match, no family tie).
+
+---
+
 ## 2026-11-14 — Clark goes live: death certificates verified end to end, browser QA, parcel ids
 
 **Built / Shipped:** #631 merged (main `92db4278`), Railway auto-deployed api/worker/beat; owner

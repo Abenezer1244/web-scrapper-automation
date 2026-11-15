@@ -231,7 +231,7 @@ def _route(name: str, send, kind: str, key: str, subject: str, body: str) -> str
     return "ok"
 
 
-def _send_and_record(kind: str, key: str, subject: str, body: str) -> bool:
+def _send_and_record(kind: str, key: str, subject: str, body: str, webhook: bool = True) -> bool:
     """Every configured route, then one durable row. True when any route delivered."""
     results = {"email": "off", "webhook": "off"}
     try:
@@ -239,7 +239,7 @@ def _send_and_record(kind: str, key: str, subject: str, body: str) -> bool:
             results["email"] = _route("email", _send_email, kind, key, subject, body)
         elif settings.OPS_ALERT_EMAIL:
             _logger.warning("OPS_ALERT_EMAIL set but RESEND_API_KEY missing, e-mail route off")
-        if settings.OPS_ALERT_WEBHOOK_URL:
+        if webhook and settings.OPS_ALERT_WEBHOOK_URL:
             results["webhook"] = _route("webhook", _send_webhook, kind, key, subject, body)
         if results["email"] == "off" and results["webhook"] == "off":
             # WARNING, not a silent return: production once ran with OPS_ALERT_EMAIL blank
@@ -259,7 +259,7 @@ def _send_and_record(kind: str, key: str, subject: str, body: str) -> bool:
     return delivered
 
 
-def send_ops_alert(kind: str, key: str, subject: str, body: str) -> bool:
+def send_ops_alert(kind: str, key: str, subject: str, body: str, *, webhook: bool = True) -> bool:
     """Send an operational alert on every configured route. Never raises.
 
     ``kind``/``key`` form the cooldown bucket (e.g. ("canary", "pierce/WA")).
@@ -270,6 +270,10 @@ def send_ops_alert(kind: str, key: str, subject: str, body: str) -> bool:
     the loop's default executor and this returns False at once: the outcome lands in
     the audit row, and no network or database call ever blocks the loop. Every other
     caller is a sync Celery worker and gets the real result.
+
+    ``webhook=False`` keeps an all-clear off Better Stack: its webhook only opens
+    incidents, so a recovery sent there would page as a new one instead of closing
+    the old one.
     """
     # Every alert-worthy condition leaves a durable row, whether or not anything goes
     # out, because the delivery path is exactly what turned out to be broken:
@@ -292,9 +296,9 @@ def send_ops_alert(kind: str, key: str, subject: str, body: str) -> bool:
         except RuntimeError:
             loop = None  # ordinary sync caller (every Celery worker call site)
         if loop is not None:
-            loop.run_in_executor(None, _send_and_record, kind, key, subject, body)
+            loop.run_in_executor(None, _send_and_record, kind, key, subject, body, webhook)
             return False
-        return _send_and_record(kind, key, subject, body)
+        return _send_and_record(kind, key, subject, body, webhook)
     except Exception as exc:  # noqa: BLE001 — never fail the caller
         _logger.error("ops alert dispatch failed [%s:%s]: %s", kind, key, str(exc)[:200])
         return False

@@ -170,6 +170,7 @@ _TRUSTED_TAX_SOURCES = frozenset({
     # on the county property portal (clallam_wa_tax_delinquent.py).
     "clallam_county_tax_foreclosure_certificate",
     "asotin_pacs_tax",                     # Asotin — per-parcel PACS tax tables (pacs_tax)
+    "ferry_taxsifter_tax",                 # Ferry — per-parcel TaxSifter Treasurer pages
 })
 
 

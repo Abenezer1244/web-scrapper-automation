@@ -29,7 +29,10 @@ from src.workers import app
 
 _logger = setup_logger("workers.pacs_tax_crawler")
 
-COUNTIES = ("asotin",)              # PACS counties with no delinquent list
+# Counties with no delinquent list -> their per-parcel tax source. Ferry (TaxSifter)
+# publishes its Treasurer pages, not a list (the 2026 sale list was never posted).
+COUNTIES = ("asotin", "ferry")
+_TAX_SOURCE = {"asotin": "pacs", "ferry": "taxsifter"}
 _STATE = "WA"
 _BATCH = 400                        # more than one budget can reach; the rest wait
 _BUDGET_S = 20 * 60                 # inside the hourly slot, leaving the lease free
@@ -187,8 +190,10 @@ _SETTLED = frozenset({"found", "parcel_not_found"})
 def crawl_pacs_tax() -> dict:
     """Beat entry: one bounded run per county; never raises for a source problem."""
     from src.db.session import system_sync_session
-    from src.scrapers.enrichment.pacs_parcel import resolve_tax
+    from src.scrapers.enrichment import pacs_parcel, taxsifter
     from src.utils.safe_http import safe_get
+
+    resolvers = {"pacs": pacs_parcel.resolve_tax, "taxsifter": taxsifter.resolve_tax}
 
     def fetch(url: str) -> dict:
         resp = safe_get(url, timeout=30)
@@ -199,7 +204,8 @@ def crawl_pacs_tax() -> dict:
     for county in COUNTIES:
         try:
             with system_sync_session() as db:
-                summary = crawl_county(county, db, fetch=fetch, resolve=resolve_tax)
+                summary = crawl_county(county, db, fetch=fetch,
+                                       resolve=resolvers[_TAX_SOURCE[county]])
         except Exception as exc:  # noqa: BLE001 — one county must not stop the others
             _logger.error("PACS tax crawl %s failed: %s", county, str(exc)[:200])
             summary = {"county": county, "error": type(exc).__name__}

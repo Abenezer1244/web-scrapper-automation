@@ -43,7 +43,7 @@ def coverage(total: int, fresh: int) -> float:
     return fresh / total if total else 0.0
 
 
-def record_from_row(row: PacsTaxStatus) -> ScrapedRecord:
+def record_from_row(row: PacsTaxStatus, source: str = SOURCE) -> ScrapedRecord:
     rec = ScrapedRecord()
     rec.party_name = row.owner_name
     rec.parcel_id = row.parcel_id
@@ -52,7 +52,7 @@ def record_from_row(row: PacsTaxStatus) -> ScrapedRecord:
     rec.doc_type = "Delinquent Property Tax"
     rec.date_recorded = f"{row.as_of.month}/{row.as_of.day}/{row.as_of.year}"
     rec.enrichment_data = {
-        "source": SOURCE,
+        "source": source,
         "delinquent_amount": str(row.delinquent_amount),
         "bill_year": row.oldest_delinquent_year,
         "years_owing": row.years_owing,
@@ -70,7 +70,13 @@ def deliverable(row: PacsTaxStatus) -> bool:
 
 
 class AsotinWATaxDelinquentScraper(BridgeScraper):
-    """Read Asotin's qualifying delinquent parcels out of pacs_tax_status."""
+    """Read Asotin's qualifying delinquent parcels out of pacs_tax_status.
+
+    Any county the tax crawler fills reuses this class by overriding COUNTY/SOURCE
+    (Ferry: scrapers/ferry_wa_tax_delinquent)."""
+
+    COUNTY = _COUNTY
+    SOURCE = SOURCE
 
     @classmethod
     def collection_scope(cls, record_type: str):
@@ -91,7 +97,7 @@ class AsotinWATaxDelinquentScraper(BridgeScraper):
         # Tax status is a snapshot, not a filing: the date window does not apply.
         self.report_stage("searching")
         since = datetime.now(UTC) - _FRESH
-        scope = (PacsTaxStatus.county == _COUNTY, PacsTaxStatus.state == _STATE)
+        scope = (PacsTaxStatus.county == self.COUNTY, PacsTaxStatus.state == _STATE)
         with system_sync_session() as db:
             total = db.execute(select(func.count()).select_from(PacsTaxStatus)
                                .where(*scope)).scalar_one()
@@ -108,16 +114,16 @@ class AsotinWATaxDelinquentScraper(BridgeScraper):
         cov = coverage(total, fresh)
         if cov < _MIN_COVERAGE:
             raise ScraperExecutionError(
-                _COUNTY, "pacs_tax_cache",
+                self.COUNTY, "pacs_tax_cache",
                 f"the tax cache covers {fresh} of {total} parcels from the last "
                 f"{_FRESH.days} days ({cov:.0%}); refusing to report a partial list",
                 record_type=RECORD_TYPE,
             )
-        records = [record_from_row(r) for r in rows if deliverable(r)]
+        records = [record_from_row(r, self.SOURCE) for r in rows if deliverable(r)]
         held = len(rows) - len(records)
-        _logger.info("asotin tax_delinquent: %d qualifying parcel(s), %d delivered, %d held "
+        _logger.info("%s tax_delinquent: %d qualifying parcel(s), %d delivered, %d held "
                      "(missing owner/address/mailing); coverage %.1f%%",
-                     len(rows), len(records), held, cov * 100)
+                     self.COUNTY, len(rows), len(records), held, cov * 100)
         if self.on_progress:
             self.on_progress(0, 0, len(records))
         return records

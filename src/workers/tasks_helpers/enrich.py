@@ -1986,7 +1986,7 @@ def _run_inline_enrichment(
             # (suspenders, so probate/death-cert King rows sharing this enrichment
             # path are never touched).
             from src.scrapers.king_wa_tax_delinquent import is_tax_placeholder_party
-            from src.utils.lead_formatting import classify_probate_title_status
+            from src.utils.lead_formatting import current_owner_fields
             # (is_tax_delinquent computed above, where it also selects `needs`.)
             # Probate + death-cert: party_name is the DECEASED. The Assessor's owner
             # is who holds title NOW — often an heir/trust. Surface it + a conservative
@@ -2080,12 +2080,14 @@ def _run_inline_enrichment(
                             res.party_name = owner
                         # Display-only: record the Assessor's current owner + a humble
                         # "differs/entity" flag. NEVER overwrite party_name, NEVER drop the
-                        # lead (Assessor lag; heirs are valid motivated sellers).
+                        # lead (Assessor lag; heirs are valid motivated sellers). An owner
+                        # string naming a care-of or a representative is not shown, and
+                        # one stored by an earlier enrichment is removed.
                         if is_probate_family and owner:
                             ed = dict(res.enrichment_data) if isinstance(res.enrichment_data, dict) else {}
-                            ed["assessor_current_owner"] = owner
-                            ed["title_status"] = classify_probate_title_status(res.party_name, owner)
-                            res.enrichment_data = ed
+                            ed.pop("assessor_current_owner", None)
+                            ed.pop("title_status", None)
+                            res.enrichment_data = ed | current_owner_fields(res.party_name, owner)
                         # The county printed a malformed parcel and we recovered the
                         # real one. parcel_id STAYS as the county printed it (it feeds
                         # the frozen dedup_hash); the resolved PIN + the evidence that

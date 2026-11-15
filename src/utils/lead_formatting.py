@@ -569,6 +569,30 @@ def _surname_key(surname: str | None) -> str:
     return re.sub(r"[^A-Z]", "", (surname or "").upper())
 
 
+# Wording that puts someone other than the owner into an owner-of-record string:
+# care-of, attention, or an estate's representative ('SMITH JOHN ESTATE C/O JANE DOE
+# PR'). Such a string names a living representative, so it is never shown as the
+# current owner (owner decision 2026-11-15).
+_REPRESENTATIVE_WORDING_RE = re.compile(
+    r"(?:\bC\s*/\s*O\b|\bC\\O\b|\bCARE\s+OF\b|\bCO\b|\bATTN\b|\bPR\b"
+    r"|\bPERS(?:ONAL)?\.?\s+REP|\bPER\.?\s+REP|\bEXEC(?:UTOR|UTRIX|S)?\b"
+    r"|\bADMIN(?:ISTRATOR|ISTRATRIX|S)?\b)",
+    re.IGNORECASE,
+)
+
+
+def current_owner_fields(party_name: str | None, owner: str | None) -> dict[str, str]:
+    """The probate lead's display-only current owner and title status, or nothing.
+
+    Nothing when there is no owner, or when the owner string names a care-of or a
+    representative: the caller removes both keys then, since the status is read from
+    the same string."""
+    if not owner or not owner.strip() or _REPRESENTATIVE_WORDING_RE.search(owner):
+        return {}
+    return {"assessor_current_owner": owner,
+            "title_status": classify_probate_title_status(party_name, owner)}
+
+
 def classify_probate_title_status(
     party_name: str | None, current_owner: str | None
 ) -> str:

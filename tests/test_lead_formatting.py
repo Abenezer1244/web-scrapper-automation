@@ -7,6 +7,7 @@ from src.utils.lead_formatting import (
     NAME_ORDER_NATURAL,
     NAME_ORDER_RECORDER,
     classify_probate_title_status,
+    current_owner_fields,
     normalize_phone_for_dialer,
     parse_property_for_display,
     split_first_person,
@@ -558,3 +559,44 @@ class TestParseAddressNonUsAndPlaceholders:
     ])
     def test_us_units_boxes_hyphens_zip4_leading_zero(self, addr, expected):
         assert parse_property_for_display(addr) == expected
+
+
+
+class TestCurrentOwnerFields:
+    """The display-only current owner never shows a care-of or a representative."""
+
+    @pytest.mark.parametrize("owner", [
+        "WEBER NORMA E ESTATE C/O GLENN L WEBER PR",
+        "SMITH JOHN C / O JANE DOE",
+        r"SMITH JOHN C\O JANE DOE",
+        "SMITH JOHN CARE OF JANE DOE",
+        "SMITH JOHN CO JANE DOE",
+        "SMITH JOHN ATTN JANE DOE",
+        "ESTATE OF JOHN SMITH JANE DOE PR",
+        "JOHN SMITH ESTATE JANE DOE PERS REP",
+        "JOHN SMITH ESTATE JANE DOE PERS. REP",
+        "JOHN SMITH ESTATE JANE DOE PER REP",
+        "JOHN SMITH ESTATE JANE DOE PERSONAL REPRESENTATIVE",
+        "JANE DOE EXECUTOR",
+        "JANE DOE EXECUTRIX",
+        "JANE DOE EXEC",
+        "JANE DOE ADMINISTRATOR",
+        "JANE DOE ADMINISTRATRIX",
+        "jane doe admin",
+    ])
+    def test_a_care_of_or_representative_is_never_the_current_owner(self, owner):
+        assert current_owner_fields("SMITH, JOHN", owner) == {}
+
+    @pytest.mark.parametrize("owner", [
+        "COOPER JOHN", "PRATT DOROTHY L", "PRICE COLE", "SMITH JOHN & MARY",
+        "EXECUTIVE PARK LLC", "ADMINISTRATIVE HOLDINGS LLC", "CORBIN PRESTON",
+        "SMITH FAMILY TRUST", "JONES-MITCHELL ANNA",
+    ])
+    def test_ordinary_owner_names_are_kept(self, owner):
+        fields = current_owner_fields("SMITH, JOHN", owner)
+        assert fields == {"assessor_current_owner": owner,
+                          "title_status": classify_probate_title_status("SMITH, JOHN", owner)}
+
+    @pytest.mark.parametrize("owner", [None, "", "   "])
+    def test_no_owner_gives_nothing(self, owner):
+        assert current_owner_fields("SMITH, JOHN", owner) == {}

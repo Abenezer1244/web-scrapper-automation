@@ -165,6 +165,22 @@ acceptable, citing RCW 42.56.070.
 To editor@ferrycountyview.com, "Licensing question: legal notices (trustee sales, probate notices)": asks whether
 the paper licenses a weekly digital copy or feed of trustee-sale and probate notices for commercial use, format, price.
 
+## Follow-ups done (2026-11-15, second pass)
+- Prod read-only check (Supabase): one old Ferry row `27c9759a-485d-4e58-8ff2-1fed789c3e7a`, created 2026-03-20,
+  state 'WA', record_types probate+pre_foreclosure, scraper_class empty, health 'down', **active=false**, base_url
+  `ferrycountyauditor.com/DisplayPage?paname=publicrecords`. That domain was the county's elections site and now
+  serves a parked ad page. Harmless while inactive: only ACTIVE rows seed the scrape allowlist
+  (`security.py` ~L391) and registry matching is case-insensitive, so it neither collides with migration 163 nor
+  allowlists the parked domain. **Owner decision:** delete/retire it (a prod data change, not done).
+- Playwright QA (Chromium, not Claude in Chrome): https://bridgeleads.io/coverage at 320/375/390/430/768/1024/1440/
+  1920 px, light and dark: Ferry is NOT listed at any width; no horizontal scroll; control: Chelan, Clallam, Benton
+  and King are listed (Asotin, inactive, is not). Screenshots in the session scratchpad `qa/`.
+- Raw research captures holding names (docket pages, TaxSifter pages, the 2022 foreclosure exhibit) deleted from the
+  local temp folder; only public policy pages kept.
+- Source-rights register: Ferry rows + four questions for counsel added
+  (`docs/legal/audit-2026-11/05-SOURCE-RIGHTS-REGISTER.md`).
+- Outreach: Gmail connector still needs re-auth (`/mcp`); drafts not created, nothing sent.
+
 ## Review
 - Tests: tax 25 (test_taxsifter_tax 18 + test_ferry_tax_delinquent 7... see gates), court 49 + migration 5;
   neighbouring suites green; ruff clean. Gates ledger in the session scratchpad.

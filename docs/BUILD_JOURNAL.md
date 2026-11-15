@@ -75,6 +75,55 @@ tests fail on the old code.
   where it comes from.
 - `ALTER TABLE ... ENABLE TRIGGER USER` re-enables triggers as ORIGIN, not ALWAYS. Never toggle triggers
   on a privacy table, even in a test database.
+## 2026-11-15 — Chelan's first live crawl and connector activation; stale document-type selections (#644, FE #328)
+
+**Built / Shipped:**
+- **Chelan trustee sales, first live run.** The 09:50 UTC crawl read 1,163 recordings (Oct 16 to Nov 15, weekdays only) and staged 1 NTS: recording 2628915, an *amended* notice superseding one recorded 2026-03-20, outside the window. On the owner's instruction Claude reviewed it against the scanned image and approved it (`REC-2628915`, sale 2027-01-15, $92,674.75 principal). A read-only run of `ChelanWATrusteeSaleScraper` returned that one lead, and the owner then had the Chelan trustee_sale connector switched on.
+- **Both lead paths seen live.** A Chelan pre_foreclosure run (job `7dff04ab`, owner's account, skip trace off) picked up 2628915, and the matcher stamped the approved sale on it (confidence 0.96).
+- **#644** (`ddad1d52`, deployed; prod alembic 162):
+  - `canonical_tokens_or_raise` raises `StaleDocTypeSelectionError` (a `ValueError`) naming every type a county no longer offers, with customer copy. The worker fails such a job before the transient-retry branch, never retries it, and still reports it.
+  - Migration 162 drops Chelan's retired types from saved selections. It never adds a type, leaves a selection with nothing valid untouched, bumps `updated_at`, and writes one `audit_events` row per repair. Frozen: it does not import the live registry.
+  - `GET /scrapers/{id}` returns `doc_type_options` and `doc_type_confidence`, straight from the registry.
+  - An invariant test: every type a customer can save is one the scraper can run.
+- **Frontend #328** (`8a15d98e`, live on bridgeleads.io):
+  - A shared `DocTypePicker`, used on the Edit page too.
+  - The Edit page offers the county's current list, names retired saved types and drops them on save. It forces a choice when nothing valid is left: the page would otherwise send NULL (every type, a wider search), and an explicit empty list is invalid.
+  - Saves are computed against the copy loaded into the form, so a background refetch can no longer pair a fresh `updated_at` with stale values.
+  - Checked on production: saving one type, then two, wrote exactly that to `scraper_configs`.
+
+**Tried / Decided:**
+- Codex chose a frozen, Chelan-only migration over importing the live registry: replaying it later must do what it did today.
+- An empty remainder stays untouched rather than becoming the county default or NULL. Both would add types the customer never chose.
+- The typed error lives in the shared strict check, not in a worker pre-flight, so all 10 callers fail the same way.
+- **Stale notice address:** the notice says "170 Hill Street, Manson"; the WA statewide parcel layer and the Chelan assessor both give 62 Village Vista Ln for parcel 282135608610, and the legal descriptions match. Codex recommends resolving the assessor address at approval time and freezing it, keeping the notice's wording as `address_on_notice`. A scrape-time lookup would let a GIS outage flip `dedup_hash` between runs and bill twice. Not built yet.
+
+**Failed / Blocked:**
+- **#625 regression, found live.** A Chelan pre_foreclosure config saved 2026-09-13 failed every run after #625 narrowed Chelan's types ("document type 'notice_of_default' is not mappable"), and its Edit page could not fix it. Every other saved selection in production was checked and was valid. The row was repaired by hand at 20:49 UTC, before migration 162 deployed, so 162 found nothing to do.
+- **First #644 CI run failed:** `schema/openapi.json` must be regenerated (`python scripts/export_openapi.py`) whenever a response gains fields.
+- **Permissions:** a direct production `UPDATE` of a customer config and a `git push` of the frontend dependency branch were both refused by the permission classifier.
+- **Local test gaps:** the stale-selection worker branch is checked by source, not by a run, because that path needs Redis. `test_email_unsubscribe::test_a_forged_or_empty_token_is_refused` fails locally on unmodified main with the local test key.
+
+**Caught & fixed:**
+- **Codex, Phase 2 frontend (NO-GO, then GO):**
+  - A background refetch could widen a document-type selection without a 409.
+  - The picker depended on the connectors list, which hides down, unknown and inactive connectors.
+
+**Pending / Handoff:**
+- **Stale notice address (approval-time situs):** owner go-ahead needed, then a Codex-reviewed build, then re-resolve REC-2628915 before the first Chelan trustee_sale delivery.
+- **Frontend dependency fix,** local branch `fix/dependabot-2026-11` (`48c3e34`):
+  - npm audit shows 0 findings in shipped dependencies and no high or critical anywhere; 12 dev-only moderate/low remain.
+  - Codex GO. Not pushed.
+  - Not verified: a Remotion render after its bundler moved to Rspack 2.
+- **Chelan review queue:** newly staged recordings need operator approval or rejection. One still pending or failed more than 3 days after first staging makes Chelan's trustee-sale data report as incomplete.
+
+**Facts learned:**
+- A trustee's "more commonly known as" address can be years stale; the parcel and legal description are the reliable identity.
+- Chelan pre_foreclosure addresses come from the statewide parcel layer (situs) and PACS (mailing). Enrichment never overwrites an address a lead already carries.
+- Narrowing a county's types in `src/scrapers/doc_types.py` needs a repair migration for saved selections.
+- The frontend repo does not allow auto-merge. Its CI checks `lib/api-types.generated.ts` against the backend's schema on main, so backend schema changes merge first.
+
+---
+
 ## 2026-11-15 — Canary names where a probe broke (#635); per-type down state + RECOVERED alert
 
 **Built / Shipped:**

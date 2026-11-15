@@ -410,3 +410,129 @@ def test_ocr_is_cross_checked_against_the_recording(fields, apns, dts, agree, fl
     got_agree, flags = corroborate(fields, apns, dts)
     assert set(got_agree) == agree
     assert (flag is None and flags == []) or any(flag in f for f in flags)
+
+
+# ── Cowlitz's Laserfiche WebLink "Print (as PDF)" shape (three live NTS pages,
+# 2026-11-15): one 1-bit CCITT Group 4 image per page, DecodeParms exactly /K -1
+# /Columns /Rows, /DeviceGray, drawn as "q q <m> cm /img0 Do Q Q" plus an EMPTY text
+# object. The CCITT bytes are never decoded by the child; tesseract reads them as TIFF.
+LASERFICHE_DRAW = b"q\nq 612 0 0 792 0 0 cm /img0 Do Q\nQ\nq\nBT\n48 756 Td\nET\nQ\n"
+
+
+def _g4_strip(img) -> bytes:
+    """Raw Group 4 bytes of a 1-bit PIL image (PIL's TIFF encoder, one strip)."""
+    b = io.BytesIO()
+    img.save(b, "TIFF", compression="group4", rowsperstrip=img.size[1])
+    tif = Image.open(io.BytesIO(b.getvalue()))
+    offset, count = tif.tag_v2[273][0], tif.tag_v2[279][0]
+    return b.getvalue()[offset:offset + count]
+
+
+def laserfiche_pdf(pages: int = 1, width: int = 850, height: int = 1100, *, draw: bytes = LASERFICHE_DRAW,
+                   parms: dict | None = None, colorspace="/DeviceGray", black_top_half: bool = True,
+                   name: str = "/img0") -> bytes:
+    img = Image.new("1", (width, height), 1)  # white page
+    if black_top_half:
+        img.paste(0, (0, 0, width, height // 2))
+    raw = _g4_strip(img)
+    w = PdfWriter()
+    for _ in range(pages):
+        page = w.add_blank_page(612, 792)
+        x = StreamObject()
+        x._data = raw
+        dp = parms if parms is not None else {"/K": -1, "/Columns": width, "/Rows": height}
+        x.update({
+            NameObject("/Type"): NameObject("/XObject"), NameObject("/Subtype"): NameObject("/Image"),
+            NameObject("/Width"): NumberObject(width), NameObject("/Height"): NumberObject(height),
+            NameObject("/BitsPerComponent"): NumberObject(1),
+            NameObject("/ColorSpace"): NameObject(colorspace),
+            NameObject("/Filter"): NameObject("/CCITTFaxDecode"),
+            NameObject("/DecodeParms"): DictionaryObject(
+                {NameObject(k): NumberObject(v) for k, v in dp.items()}),
+        })
+        page[NameObject("/Resources")] = DictionaryObject({
+            NameObject("/ProcSet"): ArrayObject([NameObject("/PDF"), NameObject("/ImageB")]),
+            NameObject("/XObject"): DictionaryObject({NameObject(name): w._add_object(x)}),
+        })
+        content = StreamObject()
+        content._data = draw
+        page[NameObject("/Contents")] = w._add_object(content)
+    b = io.BytesIO()
+    w.write(b)
+    return b.getvalue()
+
+
+def test_a_laserfiche_ccitt_pdf_reaches_ocr_as_the_page_it_shows(tmp_path):
+    res = ocr_pdf(laserfiche_pdf(pages=2), tesseract=_tool(tmp_path, "tess_ok", _OK))
+    assert res.ok, res.reason
+    assert res.pages == 2
+    # tesseract got each page as an image of the page's size. Colour sense is proven on
+    # the real recorder document (live OCR of NTS 3799745 read its text at ~96%
+    # confidence), not here: PIL and leptonica disagree on Group 4 photometrics.
+    assert [w[2].split(":")[0] for w in res.words] == ["Trustee", "850x1100", "Trustee", "850x1100"]
+
+
+def test_the_ccitt_bytes_reach_tesseract_unchanged(tmp_path):
+    """The child never decodes CCITT: the TIFF it writes carries the PDF's exact bytes."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "_child", Path(__file__).resolve().parents[1] / "src" / "scrapers" / "sources" / "nts_ocr_child.py")
+    child = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(child)
+    raw = _g4_strip(Image.new("1", (64, 32), 1))
+    tif = child._g4_tiff(64, 32, raw)
+    assert tif.endswith(raw)
+    im = Image.open(io.BytesIO(tif))
+    # one strip, Group 4 (259=4), WhiteIsZero (262=0, PDF's default /BlackIs1 false)
+    assert im.size == (64, 32) and im.tag_v2[259] == 4 and im.tag_v2[262] == 0
+    assert im.tag_v2[278] == 32 and im.tag_v2[279] == (len(raw),)
+    # header: little-endian, IFD at 8, ascending tags, next-IFD 0, strip right after it
+    import struct
+
+    assert tif[:8] == b"II*\x00" + struct.pack("<I", 8)
+    n = struct.unpack_from("<H", tif, 8)[0]
+    tags = [struct.unpack_from("<H", tif, 10 + 12 * i)[0] for i in range(n)]
+    assert tags == sorted(tags)
+    assert struct.unpack_from("<I", tif, 10 + 12 * n)[0] == 0
+    offset = 10 + 12 * n + 4
+    assert im.tag_v2[273] == (offset,) and tif[offset:] == raw
+
+
+@pytest.mark.parametrize("pdf,reason", [
+    (laserfiche_pdf(parms={"/K": 0, "/Columns": 850, "/Rows": 1100}),
+     "unsupported pdf: CCITT parameters"),                                    # Group 3
+    (laserfiche_pdf(parms={"/K": -1, "/Columns": 851, "/Rows": 1100}),
+     "unsupported pdf: CCITT parameters"),                                    # width mismatch
+    (laserfiche_pdf(parms={"/K": -1, "/Columns": 850, "/Rows": 1100, "/BlackIs1": 1}),
+     "unsupported pdf: CCITT parameters"),                                    # extra parameter
+    (laserfiche_pdf(colorspace="/DeviceRGB"), "unsupported pdf: image is not a plain 1-bit CCITT"),
+    (laserfiche_pdf(draw=b"q\nq 612 0 0 792 0 0 cm /img0 Do Q\nQ\nq\nBT\n48 756 Td\n(SALE 1/1/2030) Tj\nET\nQ\n"),
+     "unsupported pdf: page does not draw exactly its one image"),            # text drawn over
+    (laserfiche_pdf(draw=b"q\nq 306 0 0 396 0 0 cm /img0 Do Q\nQ\nq\nBT\n48 756 Td\nET\nQ\n"),
+     "unsupported pdf: image does not cover exactly the page"),               # a quarter page
+    # "/img0%" is written as /img0#25; in the content stream "%" starts a comment, so
+    # "Do" never runs and the page shows nothing (Codex 3a High).
+    (laserfiche_pdf(name="/img0%", draw=b"q q 612 0 0 792 0 0 cm /img0% Do Q Q q BT 48 756 Td ET Q"),
+     "unsupported pdf: page does not draw exactly its one image"),
+    # U+00A0 is not PDF whitespace: a PDF reader sees one token "Do\xa0Q", not "Do Q".
+    (laserfiche_pdf(draw="q q 612 0 0 792 0 0 cm /img0 Do\xa0Q Q q BT 48 756 Td ET Q".encode("latin-1")),
+     "unsupported pdf: page does not draw exactly its one image"),
+], ids=["group3", "width-mismatch", "extra-parm", "rgb", "text-overlay", "quarter-page",
+        "comment-name", "non-pdf-whitespace"])
+def test_laserfiche_documents_outside_the_shape_are_rejected_before_ocr(tmp_path, pdf, reason):
+    ran = tmp_path / "ran"
+    tool = _tool(tmp_path, "tess_mark", f"open({str(ran)!r}, 'w').write('x')\n")
+    res = ocr_pdf(pdf, tesseract=tool)
+    assert res.ok is False and res.reason.startswith(reason), res.reason
+    assert not ran.exists()
+
+
+def test_nul_is_pdf_whitespace_between_matrix_operands_in_both_shapes(tmp_path):
+    """NUL separates tokens in PDF (ISO 32000 7.2.3); the grammar accepts it, so the
+    matrix must be split the same way, not with str.split() (Codex 3a Medium)."""
+    tool = _tool(tmp_path, "tess_ok", _OK)
+    lf = ocr_pdf(laserfiche_pdf(draw=b"q q 612\x000 0 792 0 0 cm /img0 Do Q Q q BT 48 756 Td ET Q"), tesseract=tool)
+    assert lf.ok, lf.reason
+    chelan = ocr_pdf(recorder_pdf(1, draw=b"q 612\x000 0 835 0 0 cm /Im0 Do Q"), tesseract=tool)
+    assert chelan.ok, chelan.reason

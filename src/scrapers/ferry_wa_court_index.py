@@ -9,8 +9,10 @@ history then decides what it is (classify_probate / classify_divorce).
 CONNECTORS STAY INACTIVE. GR 31(g)(4) bars commercial solicitation of people named in
 court records distributed in bulk, and nothing here ties a case to a Ferry parcel: a
 name alone is not ownership. So no lead is ever DELIVERED from this module. A window
-that holds qualifying filings fails the job with the held count (never a silent
-zero); a window with none, inside the index's reach, is a verified zero.
+that holds qualifying filings fails the job with the held count. A window with none
+also fails: the index's completeness against the clerk's own records cannot be
+proven (one later opening does not show every earlier one arrived), so no zero from
+it is a verified zero (Codex Review C).
 
 NEVER A FALSE ZERO: the index trails the clerk (newest Ferry opening on 2026-11-15:
 November 2025). A window ending after the newest opening the index shows is not
@@ -104,7 +106,11 @@ class _FerryCourtIndexScraper(BridgeScraper):
                 f"{len(cases)} {self.RECORD_TYPE} filing(s) in the window, none tied to a "
                 "Ferry parcel (no court-to-parcel matcher; GR 31 review pending): held, "
                 "not delivered", record_type=self.RECORD_TYPE)
-        return []
+        raise ScraperExecutionError(
+            _COUNTY, "wa_digital_archives",
+            f"no {self.RECORD_TYPE} filing found in the window, but the court index's "
+            "completeness against the clerk cannot be verified: not a verified zero",
+            record_type=self.RECORD_TYPE)
 
 
 class FerryWAProbateScraper(_FerryCourtIndexScraper):

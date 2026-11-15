@@ -45,6 +45,8 @@ def db():
 
 
 def _fetch(url: str) -> dict:
+    if "returnCountOnly=true" in url:
+        return {"count": 3}
     return json.loads((_FIX / "wa_statewide_asotin_3_parcels.json").read_text(encoding="utf-8"))
 
 

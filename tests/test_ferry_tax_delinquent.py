@@ -46,6 +46,8 @@ def db():
 
 def _fetch(url: str) -> dict:
     assert "FIPS_NR%3D%27019%27" in url  # Ferry's own scope, never another county's
+    if "returnCountOnly=true" in url:
+        return {"count": 3}
     return json.loads((_FIX / "wa_statewide_ferry_3_parcels.json").read_text(encoding="utf-8"))
 
 
@@ -64,14 +66,15 @@ def _rows(db) -> dict:
     return {m["parcel_id"]: SimpleNamespace(**m) for m in found.mappings().all()}
 
 
-def test_ferry_is_crawled_through_taxsifter_and_asotin_through_pacs():
-    assert crawler.COUNTIES == ("asotin", "ferry")
+def test_ferry_is_wired_to_taxsifter_but_not_scheduled_until_approved():
     assert crawler._TAX_SOURCE == {"asotin": "pacs", "ferry": "taxsifter"}
+    assert "ferry" not in crawler.COUNTIES  # the first broad crawl needs owner approval
 
 
 def test_the_beat_task_hands_ferry_to_the_taxsifter_resolver(monkeypatch):
     from src.scrapers.enrichment import pacs_parcel
 
+    monkeypatch.setattr(crawler, "COUNTIES", ("asotin", "ferry"))
     used = {}
     monkeypatch.setattr(crawler, "crawl_county",
                         lambda county, db, *, fetch, resolve: used.setdefault(county, resolve)
@@ -96,30 +99,59 @@ def test_inventory_then_one_pass(db):
     assert unreached.attempted_at is None and unreached.checked_at is None
 
 
-def _seed(db, parcel: str, *, owing: str, oldest: int | None, county="ferry", mailing=True):
+def test_a_truncated_inventory_read_is_an_error_not_a_smaller_county():
+    def short(url):
+        return {"count": 4} if "returnCountOnly=true" in url else _fetch(url)
+
+    with pytest.raises(ValueError, match="read 3 of 4"):
+        crawler.statewide_parcel_ids("ferry", short)
+
+
+def _seed(db, parcel: str, *, owing: str, oldest: int | None, county="ferry", mailing=True,
+          as_of: date | None = None):
     db.execute(text(
         "INSERT INTO pacs_tax_status (id, county, state, parcel_id, outcome, as_of, "
         "delinquent_amount, oldest_delinquent_year, owner_name, property_address, "
         "mailing_address, checked_at) VALUES (gen_random_uuid(), :c, 'WA', :p, "
         "'found', :asof, :amt, :old, 'REDACTED OWNER', '100 REDACTED RD, REPUBLIC 99166', "
         ":mail, :chk)"),
-        {"c": county, "p": parcel, "asof": date(2026, 11, 12), "amt": Decimal(owing),
+        {"c": county, "p": parcel, "asof": as_of or datetime.now(UTC).date(), "amt": Decimal(owing),
          "old": oldest, "mail": "PO BOX 100, REPUBLIC, WA 99166" if mailing else None,
          "chk": datetime.now(UTC)})
 
 
 async def test_delivers_ferry_prior_year_debt_only(db):
-    _seed(db, "33600000001000", owing="900.00", oldest=2024)              # delivered
-    _seed(db, "33600000002000", owing="679.84", oldest=2026)              # current year only
-    _seed(db, "33600000003000", owing="500.00", oldest=2025, mailing=False)  # held
-    _seed(db, "33600000004000", owing="800.00", oldest=2024, county="asotin")  # not Ferry
+    year = datetime.now(UTC).year
+    _seed(db, "33600000001000", owing="900.00", oldest=year - 2)          # delivered
+    _seed(db, "33600000002000", owing="679.84", oldest=year)              # current year only
+    _seed(db, "33600000004000", owing="800.00", oldest=year - 2, county="asotin")  # not Ferry
     db.commit()
     records = await FerryWATaxDelinquentScraper().scrape("01/01/2026", "11/15/2026")
     assert [r.parcel_id for r in records] == ["33600000001000"]
     rec = records[0]
     assert rec.enrichment_data["source"] == "ferry_taxsifter_tax"
-    assert rec.enrichment_data["bill_year"] == 2024
+    assert rec.enrichment_data["bill_year"] == year - 2
     assert rec.enrichment_data["delinquent_amount"] == "900.00"
+
+
+async def test_a_held_parcel_fails_the_run_instead_of_shortening_it(db):
+    year = datetime.now(UTC).year
+    _seed(db, "33600000001000", owing="900.00", oldest=year - 2)
+    _seed(db, "33600000003000", owing="500.00", oldest=year - 1, mailing=False)  # rural: held
+    db.commit()
+    with pytest.raises(ScraperExecutionError, match="1 of 2 qualifying parcel"):
+        await FerryWATaxDelinquentScraper().scrape("01/01/2026", "11/15/2026")
+
+
+@pytest.mark.parametrize("age_days", [15, -3], ids=["stale source date", "future source date"])
+async def test_a_source_date_outside_its_window_is_not_fresh(db, age_days):
+    from datetime import timedelta
+
+    _seed(db, "33600000001000", owing="900.00", oldest=datetime.now(UTC).year - 2,
+          as_of=datetime.now(UTC).date() - timedelta(days=age_days))
+    db.commit()
+    with pytest.raises(ScraperExecutionError, match="refusing to report a partial list"):
+        await FerryWATaxDelinquentScraper().scrape("01/01/2026", "11/15/2026")
 
 
 async def test_an_empty_ferry_cache_is_never_a_zero(db):

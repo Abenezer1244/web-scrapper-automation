@@ -77,6 +77,11 @@ class AsotinWATaxDelinquentScraper(BridgeScraper):
 
     COUNTY = _COUNTY
     SOURCE = SOURCE
+    # The county's own "as of" date must be this recent for a row to count as fresh
+    # (None: the fetch time alone decides, as Asotin's PACS stamps the view date).
+    MAX_SOURCE_AGE: timedelta | None = None
+    # Fail instead of returning a shorter list when a qualifying parcel is held.
+    FAIL_ON_HELD = False
 
     @classmethod
     def collection_scope(cls, record_type: str):
@@ -98,14 +103,19 @@ class AsotinWATaxDelinquentScraper(BridgeScraper):
         self.report_stage("searching")
         since = datetime.now(UTC) - _FRESH
         scope = (PacsTaxStatus.county == self.COUNTY, PacsTaxStatus.state == _STATE)
+        fresh_rule = [PacsTaxStatus.checked_at >= since]
+        if self.MAX_SOURCE_AGE is not None:
+            today = datetime.now(UTC).date()
+            fresh_rule += [PacsTaxStatus.as_of >= today - self.MAX_SOURCE_AGE,
+                           PacsTaxStatus.as_of <= today + timedelta(days=1)]
         with system_sync_session() as db:
             total = db.execute(select(func.count()).select_from(PacsTaxStatus)
                                .where(*scope)).scalar_one()
             fresh = db.execute(select(func.count()).select_from(PacsTaxStatus)
-                               .where(*scope, PacsTaxStatus.checked_at >= since)).scalar_one()
+                               .where(*scope, *fresh_rule)).scalar_one()
             rows = db.execute(select(PacsTaxStatus).where(
                 *scope,
-                PacsTaxStatus.checked_at >= since,
+                *fresh_rule,
                 PacsTaxStatus.outcome == "found",
                 PacsTaxStatus.privacy_suppression_id.is_(None),
                 PacsTaxStatus.delinquent_amount > 0,
@@ -121,6 +131,13 @@ class AsotinWATaxDelinquentScraper(BridgeScraper):
             )
         records = [record_from_row(r, self.SOURCE) for r in rows if deliverable(r)]
         held = len(rows) - len(records)
+        if held and self.FAIL_ON_HELD:
+            raise ScraperExecutionError(
+                self.COUNTY, "lead_quality",
+                f"{held} of {len(rows)} qualifying parcel(s) lack an owner, property address or "
+                "mailing address and are held; refusing to return a shorter list",
+                record_type=RECORD_TYPE,
+            )
         _logger.info("%s tax_delinquent: %d qualifying parcel(s), %d delivered, %d held "
                      "(missing owner/address/mailing); coverage %.1f%%",
                      self.COUNTY, len(rows), len(records), held, cov * 100)

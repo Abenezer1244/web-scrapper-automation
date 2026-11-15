@@ -31,7 +31,9 @@ _logger = setup_logger("workers.pacs_tax_crawler")
 
 # Counties with no delinquent list -> their per-parcel tax source. Ferry (TaxSifter)
 # publishes its Treasurer pages, not a list (the 2026 sale list was never posted).
-COUNTIES = ("asotin", "ferry")
+# Ferry is wired (_TAX_SOURCE) but NOT scheduled: the owner approves its first broad
+# crawl separately (tasks/ferry-wa-seven.md). Adding it here starts that crawl on deploy.
+COUNTIES = ("asotin",)
 _TAX_SOURCE = {"asotin": "pacs", "ferry": "taxsifter"}
 _STATE = "WA"
 _BATCH = 400                        # more than one budget can reach; the rest wait
@@ -83,7 +85,13 @@ def statewide_parcel_ids(county: str, fetch) -> list[str]:
     scope = _wa_fips_filter(county)
     if not scope:
         raise ValueError(f"no statewide scope for {county}")
+    counted = fetch(f"{_WA_STATEWIDE_ENDPOINT}?" + urlencode(
+        {"where": "1=1" + scope, "returnCountOnly": "true", "f": "json"}))
+    expected = counted.get("count") if isinstance(counted, dict) else None
+    if not isinstance(expected, int) or expected <= 0:
+        raise ValueError(f"statewide layer gave no feature count: {str(counted)[:120]}")
     ids: list[str] = []
+    features_read = 0
     offset = 0
     while True:
         query = urlencode({
@@ -95,9 +103,13 @@ def statewide_parcel_ids(county: str, fetch) -> list[str]:
         features = data.get("features") if isinstance(data, dict) else None
         if features is None:
             raise ValueError(f"statewide layer answered without features: {str(data)[:120]}")
+        features_read += len(features)
         ids += [str(f["attributes"]["ORIG_PARCEL_ID"]).strip() for f in features
                 if (f.get("attributes") or {}).get("ORIG_PARCEL_ID")]
         if not data.get("exceededTransferLimit"):
+            # A truncated read would let a partial inventory pass the coverage gate (Codex).
+            if features_read != expected:
+                raise ValueError(f"statewide layer read {features_read} of {expected} features")
             return sorted(set(ids))
         offset += len(features)
 

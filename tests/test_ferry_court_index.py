@@ -81,8 +81,9 @@ def test_an_open_estate_in_the_window_is_held_never_delivered():
     assert "25-4-00006-10" in FakeIndex.searches and "25-4-00012-10" in FakeIndex.searches
 
 
-def test_a_guardianship_window_is_a_verified_zero():
-    assert _run(court.FerryWAProbateScraper, "10/01/2025", "10/20/2025") == []
+def test_a_window_with_no_estate_is_still_not_a_verified_zero():
+    with pytest.raises(ScraperExecutionError, match="not a verified zero"):
+        _run(court.FerryWAProbateScraper, "10/01/2025", "10/20/2025")  # a guardianship only
 
 
 def test_a_dissolution_in_the_window_is_held_never_delivered():
@@ -90,8 +91,9 @@ def test_a_dissolution_in_the_window_is_held_never_delivered():
         _run(court.FerryWADivorceScraper, "01/01/2025", "10/20/2025")
 
 
-def test_a_closed_estate_alone_is_a_verified_zero():
-    assert _run(court.FerryWAProbateScraper, "02/27/2025", "10/20/2025") == []
+def test_a_closed_estate_alone_is_not_a_lead_and_not_a_verified_zero():
+    with pytest.raises(ScraperExecutionError, match="no probate filing found"):
+        _run(court.FerryWAProbateScraper, "02/27/2025", "10/20/2025")
 
 
 def test_the_court_modules_are_allowlisted():

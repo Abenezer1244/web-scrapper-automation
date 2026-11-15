@@ -470,6 +470,34 @@ class ChelanWATrusteeSaleScraper(_TrusteeSaleScraper):
         )
 
 
+class CowlitzWATrusteeSaleScraper(_TrusteeSaleScraper):
+    """Cowlitz County (WA) auction leads: recorded notices (CCITT scans from the
+    Laserfiche viewer, OCR'd), each one checked by an operator against its recorded
+    image before it is a notice (nts_crawler.approve_recorder_document)."""
+
+    COUNTY = "cowlitz"
+
+    def _source_gap(self, db, now: datetime) -> str | None:
+        # A recording not yet reviewed (or not readable) is a sale missing from the cache,
+        # however fresh the crawl is: checked here, at delivery time (as Chelan).
+        from src.workers.nts_crawler import recorder_unresolved_reason
+
+        return recorder_unresolved_reason(db, now, "cowlitz")
+
+    @classmethod
+    def collection_scope(cls, record_type: str):
+        from src.scrapers.doc_scope import CollectionScope, DocTypeItem
+
+        if record_type != RECORD_TYPE:
+            return None
+        return CollectionScope(
+            kind="document_type",
+            items=(DocTypeItem(label="Notice of Trustee Sale", exact=True),),
+            note="Recorded trustee-sale notices from the Cowlitz County Auditor's recorded documents, "
+                 "each reviewed against its recorded image.",
+        )
+
+
 class AsotinWATrusteeSaleScraper(_TrusteeSaleScraper):
     """Asotin County (WA) auction leads — Lewiston Tribune (nwmarket.com) NTS cache."""
 

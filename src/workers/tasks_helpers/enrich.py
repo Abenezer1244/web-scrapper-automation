@@ -1346,6 +1346,19 @@ def _run_inline_enrichment(
                         # below mirrors mailing_recovery's writer; `row_mail` keeps the
                         # ORM branches from writing it a second time.
                         row_mail = None if bulk_source else mail
+                        # Probate + death-cert: party_name is the DECEASED; record who
+                        # holds title NOW and the humble differs/entity flag, as King's
+                        # path does. Display-only: never overwrites party_name, never drops
+                        # the lead (heirs are valid sellers; the assessor lags). Benton,
+                        # 2026-11-15: a death certificate recorded for a sale named a parcel
+                        # an unrelated buyer now owns, and nothing on the lead said so.
+                        _owner = gis_data.get("owner_name")
+                        if _owner and config.record_type in ("probate", "death_certificate"):
+                            from src.utils.lead_formatting import classify_probate_title_status
+                            _ed = dict(res.enrichment_data) if isinstance(res.enrichment_data, dict) else {}
+                            _ed["assessor_current_owner"] = _owner
+                            _ed["title_status"] = classify_probate_title_status(res.party_name, _owner)
+                            res.enrichment_data = _ed
                         if mail and bulk_source:
                             _bulk_fills.append((res, gis_data))
                         # Migration 085 (#188) — capture the REAL situs parts BEFORE the

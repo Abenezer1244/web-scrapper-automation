@@ -281,6 +281,18 @@ def test_a_person_named_beside_the_row_is_judged_like_its_own_subjects():
     assert authorize(snap, _row(party_name="JONES MARY"), **_CTX).outcome == ALLOWED
 
 
+def test_a_person_beside_the_row_reviews_like_the_rows_own_subjects():
+    snap = _snap(_history(["pending", "active"]))
+    [rep] = natural_order_subjects(["JOHN SMITH"], source_field="personal_reps")
+    assert (rep.role, rep.source_field) == ("contact", "personal_reps")
+    unreadable = natural_order_subjects(["J."], source_field="personal_reps")
+    d = authorize(snap, _row(party_name="JONES MARY"), **_CTX, extra_subjects=unreadable)
+    assert (d.outcome, d.reason) == (REVIEW, REVIEW_UNRESOLVED_SUBJECT)
+    d = authorize(snap, _row(party_name="JONES MARY", parcel_id="999999-0000"), **_CTX,
+                  extra_subjects=[rep])
+    assert (d.outcome, d.reason) == (REVIEW, REVIEW_SUBJECT_WITHOUT_ANCHOR)
+
+
 def test_only_text_names_anybody_beside_the_row():
     assert natural_order_subjects([None, "", "  ", 7, ["JOHN SMITH"]],
                                   source_field="personal_reps") == []

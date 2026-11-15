@@ -393,14 +393,16 @@ def test_a_personal_representatives_own_rule_erases_the_notice(s):
     recorder_order = _probate(s, "26-4-00014-02", [lead], decedent="ADA DOE",
                               reps=("SMITH JOHN",))
     no_reps = _probate(s, "26-4-00015-02", [lead], decedent="ADA DOE", reps=None)
+    # An unreadable representative on the rule's parcel is a review, never an erasure.
+    unreadable = _probate(s, "26-4-00016-02", [lead], decedent="ADA DOE", reps=("J.",))
     assert _sweep(s, rule, "probate").get("probate") == 1
-    ids = [rep, other_parcel, no_parcel, recorder_order, no_reps]
+    ids = [rep, other_parcel, no_parcel, recorder_order, no_reps, unreadable]
     left = dict(s.execute(text(
         "SELECT id::text, decedent IS NULL AND personal_reps IS NULL AND claims_address IS NULL "
         "AND parcels IS NULL AND privacy_suppression_id IS NOT NULL FROM probate_notices "
         "WHERE id = ANY(CAST(:i AS uuid[]))"), {"i": ids}).all())
     assert left == {rep: True, other_parcel: False, no_parcel: False,
-                    recorder_order: False, no_reps: False}
+                    recorder_order: False, no_reps: False, unreadable: False}
 
 
 def test_a_withheld_probate_notice_can_never_keep_a_person(s):

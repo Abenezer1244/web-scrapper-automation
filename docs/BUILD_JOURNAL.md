@@ -82,6 +82,36 @@ parcel where names failed.
 
 ---
 
+## 2026-11-14 — Clark goes live: death certificates verified end to end, browser QA, parcel ids
+
+**Built / Shipped:** #631 merged (main `92db4278`), Railway auto-deployed api/worker/beat; owner
+approved adding `death_certificate` to connector `70bb5315`. Branch `fix/clark-parcel-ids`: a
+parcel is only an explicit "PID:", kept verbatim, every PID of a multi-parcel deed recorded.
+
+**Tried / Decided:** verified with a real job (fe8f35b3, owner account, contact lookup off): 32
+found, 24 already delivered by earlier probate runs, 8 new billed, all complete; CSV 8/8 on every
+core column. A UI "Run now" on Clark Auction leads failed with the exact customer text, unbilled.
+Parcel typos (1428590000 for 142859000) are NOT repaired: a guessed zero could name another
+owner. In the audit they got no address and were not billed (observed, not guaranteed: a typo
+equal to another valid parcel would resolve to it). Persisted probate / pre_foreclosure runs were
+not made; only non-persisting checks.
+
+**Failed / Blocked:** `playwright-cli` is not installed on this laptop; QA ran from a Python
+Playwright script with a headed window the owner signed into (session kept in the scratchpad).
+
+**Caught & fixed:** the unlabelled PID fallback took a BLK number; the PID pattern could truncate
+a long run. Both gone (Codex consult + gate PASS).
+
+**Pending / Handoff:** merge `fix/clark-parcel-ids` while no Clark job runs (row fingerprint
+includes enrichment_data). Frontend: the sidebar Running dot stays on after a failed run.
+Open data question: "Heirs" on Clark death certificates is the person indexed beside PUBLIC, an
+inferred role.
+
+**Facts learned:** Clark Prop_id is numeric; 8- and 9-digit ids are both valid as printed.
+next-themes stores the theme in `localStorage.theme` (QA sets it to force dark).
+
+---
+
 ## 2026-11-14 — Benton live: UI check, owner/sale-date fix (#629), canary priority (#634)
 
 **Built / Shipped:** After the owner restored the Railway plan, deployed migrations 154–156. Ran

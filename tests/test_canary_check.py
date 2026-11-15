@@ -64,8 +64,13 @@ def _portal(monkeypatch, *, now, history):
 
 
 def _probe(c, record_type="probate"):
+    """One unit as the run does it: probe, record that type's own verdict, and a DOWN
+    page delivered."""
     alerts: list = []
-    health._probe_unit(c, record_type, alerts)
+    mark = health._probe_unit(c, record_type, alerts)
+    alerts += health._apply_mark(c, record_type, mark)
+    if any(kind == "canary" for kind, *_ in alerts):
+        health._mark_down_paged(health._bad_key(c, record_type))
     return c.health_status, [(kind, key) for kind, key, _s, _b in alerts]
 
 
@@ -210,7 +215,7 @@ def _run_only(monkeypatch, wanted):
         (r, rt) for cid, rt in order for r in rows if r.id == cid])
     sent: list = []
     import src.workers.ops_alerts as ops
-    monkeypatch.setattr(ops, "send_ops_alert", lambda kind, key, _s, _b: sent.append((kind, key)))
+    monkeypatch.setattr(ops, "send_ops_alert", lambda kind, key, _s, _b, **_kw: sent.append((kind, key)))
     return sent
 
 
@@ -309,8 +314,9 @@ def test_a_connector_deleted_mid_run_is_not_paged(connector, monkeypatch):
     assert _status(a) is None and _status(b) == "healthy"
 
 
-def test_types_sharing_a_connector_still_see_each_others_status(connector, monkeypatch):
-    """One status flag per connector: the second type's 'previous status' is the first's."""
+def test_a_second_type_breaking_on_a_down_connector_is_paged_too(connector, monkeypatch):
+    """One status flag per connector, but each type pages for itself: the second type
+    used to go unpaged because the first had already set the connector down (Codex)."""
     c = connector(record_types=("probate", "pre_foreclosure"))
     _portal(monkeypatch, now=lambda rt: RuntimeError("x") if rt == "probate" else RuntimeError("y"),
             history=[])
@@ -319,7 +325,8 @@ def test_types_sharing_a_connector_still_see_each_others_status(connector, monke
     health._canary_check_impl()
 
     assert _status(c) == "down"
-    assert sent == [("canary", f"{c.county}/WA/probate")]   # already down for the second type
+    assert sent == [("canary", f"{c.county}/WA/probate"),
+                    ("canary", f"{c.county}/WA/pre_foreclosure")]
 
 
 def _row(n, record_types=("probate",), status="healthy", checked=True):
@@ -431,3 +438,139 @@ def test_the_page_and_the_log_carry_the_raise_site_but_not_the_text(connector, m
     assert "RuntimeError at " in logged and logged.rstrip().endswith(" in fetch"), logged
     for out in (body, logged):
         assert "jane" not in out.lower() and "elm st" not in out.lower()
+
+
+# ─── Per-type down state and the all-clear ─────────────────────────────────────
+
+def test_a_type_that_works_again_sends_one_all_clear(connector, monkeypatch):
+    c = connector()
+    _portal(monkeypatch, now=RuntimeError("portal broke"), history=[])
+    assert _probe(c) == ("down", [("canary", f"{c.county}/WA/probate")])
+    _portal(monkeypatch, now=["r"], history=[])
+    assert _probe(c) == ("healthy", [("canary_recovered", f"{c.county}/WA/probate")])
+    assert _probe(c) == ("healthy", [])  # recovered once, not every tick
+
+
+def test_another_type_working_is_not_a_recovery(connector, monkeypatch):
+    """Lewis, 2026-11-15: pre_foreclosure broke; probate probing fine sets the
+    connector healthy, which must not announce that pre_foreclosure came back."""
+    c = connector(record_types=("probate", "pre_foreclosure"))
+    _portal(monkeypatch, now=lambda rt: RuntimeError("x") if rt == "pre_foreclosure" else ["r"],
+            history=[])
+    assert _probe(c, "pre_foreclosure") == ("down", [("canary", f"{c.county}/WA/pre_foreclosure")])
+    assert _probe(c, "probate") == ("healthy", [])
+    # Still broken, and the healthy connector flag does not make it page as new.
+    assert _probe(c, "pre_foreclosure") == ("down", [])
+
+
+def test_zero_output_that_yields_again_is_an_all_clear(connector, monkeypatch):
+    c = connector()
+    _portal(monkeypatch, now=[], history=[])
+    assert _probe(c) == ("degraded", [("canary_zero_output", f"{c.county}/WA/probate")])
+    _portal(monkeypatch, now=[], history=["r"])  # older records: extraction works
+    assert _probe(c) == ("healthy", [("canary_recovered", f"{c.county}/WA/probate")])
+
+
+def test_an_inconclusive_probe_is_not_a_recovery(connector, monkeypatch):
+    c = connector()
+    _portal(monkeypatch, now=RuntimeError("portal broke"), history=[])
+    _probe(c)
+    _portal(monkeypatch, now=[], history=TimeoutError("portal slow"))
+    assert _probe(c) == ("degraded", [])  # proves nothing: keeps the marker
+    _portal(monkeypatch, now=["r"], history=[])
+    assert _probe(c) == ("healthy", [("canary_recovered", f"{c.county}/WA/probate")])
+
+
+def test_an_unreadable_marker_pages_rather_than_stays_quiet(connector, monkeypatch):
+    from src.config import settings
+
+    c = connector()
+    _portal(monkeypatch, now=RuntimeError("portal broke"), history=[])
+    _probe(c)
+    monkeypatch.setattr(settings, "REDIS_URL", "redis://127.0.0.1:1/15")  # nothing listens
+    assert _probe(c) == ("down", [("canary", f"{c.county}/WA/probate")])
+
+
+def test_the_all_clear_skips_better_stack_and_carries_no_page_text(connector, monkeypatch):
+    """Better Stack's webhook only opens incidents: an all-clear there pages anew."""
+    c = connector()
+    _portal(monkeypatch, now=RuntimeError("Jane Q Canary, 12 Elm St"), history=[])
+    _probe(c)
+    _portal(monkeypatch, now=["r", "r"], history=[])
+    monkeypatch.setattr(health, "_canary_units", lambda rows: [(r, "probate") for r in rows
+                                                               if r.id == c.id])
+    sent: list = []
+    import src.workers.ops_alerts as ops
+    monkeypatch.setattr(ops, "send_ops_alert",
+                        lambda kind, key, subject, body, webhook=True:
+                        sent.append((kind, subject, body, webhook)))
+
+    health._canary_check_impl()
+
+    assert len(sent) == 1
+    kind, subject, body, webhook = sent[0]
+    assert (kind, webhook) == ("canary_recovered", False)
+    assert subject == f"Canary RECOVERED: {c.county}/WA probate (was DOWN)"
+    assert "evidence=2 records in the last 7 days" in body
+    assert "jane" not in (subject + body).lower()
+
+
+def test_a_down_page_that_never_went_out_is_retried(connector, monkeypatch):
+    """Marked down but delivered on no route: the next probe pages again (Codex High)."""
+    c = connector()
+    _portal(monkeypatch, now=RuntimeError("portal broke"), history=[])
+    monkeypatch.setattr(health, "_canary_units", lambda rows: [(r, "probate") for r in rows
+                                                               if r.id == c.id])
+    attempts: list = []
+    import src.workers.ops_alerts as ops
+    monkeypatch.setattr(ops, "send_ops_alert",
+                        lambda kind, _k, _s, _b, **_kw: attempts.append(kind) or len(attempts) > 1)
+
+    for _ in range(3):
+        health._canary_check_impl()
+
+    assert attempts == ["canary", "canary"]  # undelivered, retried and delivered, then quiet
+
+
+def test_a_down_marker_is_unsent_until_its_page_is_delivered(connector, monkeypatch, redis_client):
+    """Saved as unsent before the send and promoted only after delivery, so a failure
+    between the two can only page again, never go silent (Codex High, second pass)."""
+    c = connector()
+    _portal(monkeypatch, now=RuntimeError("portal broke"), history=[])
+    monkeypatch.setattr(health, "_canary_units", lambda rows: [(r, "probate") for r in rows
+                                                               if r.id == c.id])
+    delivered = {"ok": False}
+    import src.workers.ops_alerts as ops
+    monkeypatch.setattr(ops, "send_ops_alert", lambda *_a, **_kw: delivered["ok"])
+
+    def marker():
+        return _text(redis_client.get(health._bad_key(c, "probate")))
+
+    health._canary_check_impl()
+    assert marker() == "canary_unsent"
+    delivered["ok"] = True
+    health._canary_check_impl()
+    assert marker() == "canary"
+
+
+def _text(v):
+    return v.decode() if isinstance(v, bytes) else v
+
+
+@pytest.mark.parametrize("step", ["read", "write"])
+def test_a_time_limit_inside_the_marker_step_stops_the_run(connector, monkeypatch, step):
+    """Out of time is not Redis being down: it must reach the task, not be swallowed."""
+    from celery.exceptions import SoftTimeLimitExceeded
+
+    c = connector()
+    _portal(monkeypatch, now=["r"], history=[])
+
+    def out_of_time():
+        raise SoftTimeLimitExceeded()
+
+    monkeypatch.setattr(health, "_redis", out_of_time)
+    with pytest.raises(SoftTimeLimitExceeded):
+        if step == "read":
+            health._probe_unit(c, "probate", [])
+        else:
+            health._apply_mark(c, "probate", ("ok", "1 records in the last 7 days"))

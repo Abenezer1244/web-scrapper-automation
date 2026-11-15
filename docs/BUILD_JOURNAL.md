@@ -19,66 +19,52 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
-## 2026-11-14 — Columbia: a connector that never ran once, and the seven-type audit (branch `feat/columbia-wa-seven-record-types`)
+## 2026-11-15 — Chelan's first live crawl and connector activation; stale document-type selections (#644, FE #328)
 
-**Built / Shipped (branch only, not pushed):** `1ab28c52` iDocMarket searches work again: the date
-fields became `<duet-date-picker>` components (typed into the inner input, the submitted ISO field
-verified); the search must navigate with HTTP 200; "Showing A of B" must equal the cards read; a card
-without title, parties, date or document number fails the chunk; probate = LACK OF PROBATE AFFIDAVIT
-only; new `death_certificate` from recorded CERTIFICATE OF DEATH with the grantor as decedent (never a
-promoted grantee). `f0b6141f` Columbia PACS: `pacs.ownership_year()` reads the newest taxyear the
-county's own form offers and both requests of both lookup paths name it (Property.aspx answers 500
-without `&year=`); only `_YEAR_HOSTS` get a year. `4640df3f` 20 s between iDocMarket searches.
-`9f0dc9b0` Columbia tax_delinquent: Asotin's PACS tax reader made county-generic, Columbia subclass,
-crawler + trusted source + registry, migration 163, numbered 158/160/162 until main took 158-162 (recorder offers death_certificate; tax connector
-seeded INACTIVE with a fixed id). Final-review fixes `1173939e`: see Caught & fixed. Full CI-equivalent suite after them: 8,391 passed, 0 failed. Plan, matrix, evidence:
-`tasks/columbia-wa-seven.md`.
+**Built / Shipped:**
+- **Chelan trustee sales, first live run.** The 09:50 UTC crawl read 1,163 recordings (Oct 16 to Nov 15, weekdays only) and staged 1 NTS: recording 2628915, an *amended* notice superseding one recorded 2026-03-20, outside the window. On the owner's instruction Claude reviewed it against the scanned image and approved it (`REC-2628915`, sale 2027-01-15, $92,674.75 principal). A read-only run of `ChelanWATrusteeSaleScraper` returned that one lead, and the owner then had the Chelan trustee_sale connector switched on.
+- **Both lead paths seen live.** A Chelan pre_foreclosure run (job `7dff04ab`, owner's account, skip trace off) picked up 2628915, and the matcher stamped the approved sale on it (confidence 0.96).
+- **#644** (`ddad1d52`, deployed; prod alembic 162):
+  - `canonical_tokens_or_raise` raises `StaleDocTypeSelectionError` (a `ValueError`) naming every type a county no longer offers, with customer copy. The worker fails such a job before the transient-retry branch, never retries it, and still reports it.
+  - Migration 162 drops Chelan's retired types from saved selections. It never adds a type, leaves a selection with nothing valid untouched, bumps `updated_at`, and writes one `audit_events` row per repair. Frozen: it does not import the live registry.
+  - `GET /scrapers/{id}` returns `doc_type_options` and `doc_type_confidence`, straight from the registry.
+  - An invariant test: every type a customer can save is one the scraper can run.
+- **Frontend #328** (`8a15d98e`, live on bridgeleads.io):
+  - A shared `DocTypePicker`, used on the Edit page too.
+  - The Edit page offers the county's current list, names retired saved types and drops them on save. It forces a choice when nothing valid is left: the page would otherwise send NULL (every type, a wider search), and an explicit empty list is invalid.
+  - Saves are computed against the copy loaded into the form, so a background refetch can no longer pair a fresh `updated_at` with stale values.
+  - Checked on production: saving one type, then two, wrote exactly that to `scraper_configs`.
 
-**Tried / Decided:** Reuse over new frameworks: the PACS mailing/tax modules and Asotin's crawler fit
-Columbia once the year rule existed. Owner decisions: drop PR deeds (the grantor is the personal
-representative and the estate already sold: the old code searched the PR's own house); tax built and
-enabled (hourly crawl; connector activated by hand at >= 95% coverage); trustee_sale and divorce wait on
-the owner's pricing review (subscription-only sale dates; Odyssey $100+/yr); no general delivery hold
-in a county PR; NO owner-name lookup for Columbia (Codex High: a decedent off title plus a living
-namesake passes the exact single-match rule) -> recorder leads get addresses only from a
-recorded-legal-description matcher, next PR. Probate and death_certificate keep the frozen
-cross-county billing identity (one charge per property/person).
+**Tried / Decided:**
+- Codex chose a frozen, Chelan-only migration over importing the live registry: replaying it later must do what it did today.
+- An empty remainder stays untouched rather than becoming the county default or NULL. Both would add types the customer never chose.
+- The typed error lives in the shared strict check, not in a worker pre-flight, so all 10 callers fail the same way.
+- **Stale notice address:** the notice says "170 Hill Street, Manson"; the WA statewide parcel layer and the Chelan assessor both give 62 Village Vista Ln for parcel 282135608610, and the legal descriptions match. Codex recommends resolving the assessor address at approval time and freezing it, keeping the notice's wording as `address_on_notice`. A scrape-time lookup would let a GIS outage flip `dedup_hash` between runs and bill twice. Not built yet.
 
-**Failed / Blocked:** iDocMarket answered 403 Forbidden to this machine after ~12 searches in an hour
-of probing; it lifted ~90 min later (pacing added; site terms not yet read). The name lookup returned
-`no_match` for every decedent tried: decedents are usually off the title, and rural parcels have no
-situs street. Court probate/divorce: no free date-range index. Code violation: no public case log.
-`codex exec` hangs on stdin unless given `< /dev/null` (one review round lost).
+**Failed / Blocked:**
+- **#625 regression, found live.** A Chelan pre_foreclosure config saved 2026-09-13 failed every run after #625 narrowed Chelan's types ("document type 'notice_of_default' is not mappable"), and its Edit page could not fix it. Every other saved selection in production was checked and was valid. The row was repaired by hand at 20:49 UTC, before migration 162 deployed, so 162 found nothing to do.
+- **First #644 CI run failed:** `schema/openapi.json` must be regenerated (`python scripts/export_openapi.py`) whenever a response gains fields.
+- **Permissions:** a direct production `UPDATE` of a customer config and a `git push` of the frontend dependency branch were both refused by the permission classifier.
+- **Local test gaps:** the stale-selection worker branch is checked by source, not by a run, because that path needs Redis. `test_email_unsubscribe::test_a_forged_or_empty_token_is_refused` fails locally on unmodified main with the local test key.
 
-**Caught & fixed:** Every Columbia row had `date_recorded = None` (the date moved into
-`<p aria-label="Record Date: ...">`). Codex final adversarial review, 4 rounds: a statement table with
-no statement row parsed as "paid" (now unparsed; live, even exempt parcels have 2 rows); the inventory
-never checked the layer's own count, and an empty layer renewed the heartbeat (now raw count vs
-`returnCountOnly`, blank ids explicit with >1% failing, empty fails); a stale page date counted as an
-answer (>3 days off is not); a year-discovery stall never alerted (6 h silence alert); the tax reader
-never checked the inventory's age (14 days); `^\s*\d` accepted "1ST ST" and a ZIP as house numbers.
-Two full-suite failures were my own edits made while the 51-minute suite ran (`inspect.getsource`
-read shifted lines): never edit files during a full run.
+**Caught & fixed:**
+- **Codex, Phase 2 frontend (NO-GO, then GO):**
+  - A background refetch could widen a document-type selection without a 409.
+  - The picker depended on the connectors list, which hides down, unknown and inactive connectors.
 
-**Later the same day:** iDocMarket's Site Terms (§2) prohibit programmatic or systematic downloading,
-with no exception, and I had run ~20 automated searches before reading them. Production connector
-57cd7eed was switched off by hand (owner-approved; no customer configs) and migration 163 keeps it off:
-probate, death_certificate and pre_foreclosure are blocked by source terms, code kept for a permitted
-feed. The legal-description matcher was measured on the 13 real leads (county TaxParcels layer has full
-legals): ~0 placements a quarter (8 no/unsupported legal, 4 ambiguous split lots, 1 fails full extent);
-set aside by owner decision. Lesson: read a source's terms BEFORE the first automated request.
+**Pending / Handoff:**
+- **Stale notice address (approval-time situs):** owner go-ahead needed, then a Codex-reviewed build, then re-resolve REC-2628915 before the first Chelan trustee_sale delivery.
+- **Frontend dependency fix,** local branch `fix/dependabot-2026-11` (`48c3e34`):
+  - npm audit shows 0 findings in shipped dependencies and no high or critical anywhere; 12 dev-only moderate/low remain.
+  - Codex GO. Not pushed.
+  - Not verified: a Remotion render after its bundler moved to Rspack 2.
+- **Chelan review queue:** newly staged recordings need operator approval or rejection. One still pending or failed more than 3 days after first staging makes Chelan's trustee-sale data report as incomplete.
 
-**Pending / Handoff:** Owner: push/PR/deploy; written permission from Tyler/County if the recorder is wanted; pricing for trustee_sale /
-divorce. After deploy: verify Columbia rows' assessor_url stay NULL, wait for >= 95% tax coverage
-(~5,280 keyed parcels), run owing/paid/held/privacy canaries, then activate the tax connector. The
-legal-description matcher was set aside (see "Later the same day" above). Renumbered to 163 when merging main (158-162 taken); renumber again if another county lands first.
-
-**Facts learned:** Columbia PACS (Harris 9.0.50): Geo IDs 13 digits = statewide ORIG_PARCEL_ID;
-newest roll "2026 - 2027" is the current-ownership roll; detail pages need `&year=`. Statewide layer
-FIPS 013: 5,477 features, 7 without id, 190 duplicate features (multi-part) = 5,280 parcels.
-iDocMarket COLWA1: one results page per search, "Showing N of N", ~858 documents Jan-Nov 2026; it
-blocks bursts. The recorded legal ("SYNDICATE 9 5", "T09N R40E 23 LOT 3") matched the right PACS
-parcel where names failed.
+**Facts learned:**
+- A trustee's "more commonly known as" address can be years stale; the parcel and legal description are the reliable identity.
+- Chelan pre_foreclosure addresses come from the statewide parcel layer (situs) and PACS (mailing). Enrichment never overwrites an address a lead already carries.
+- Narrowing a county's types in `src/scrapers/doc_types.py` needs a repair migration for saved selections.
+- The frontend repo does not allow auto-merge. Its CI checks `lib/api-types.generated.ts` against the backend's schema on main, so backend schema changes merge first.
 
 ---
 

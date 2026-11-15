@@ -138,6 +138,57 @@ def _street_absorbed_city(p: dict, m: dict, p_street: str, m_street: str) -> boo
     return False
 
 
+# Comparison-only unit handling for absentee. Kept OUT of _normalize_street because
+# that one also builds address_match_key (stored on NTS notices) and the King/Pierce
+# parcel-locate keys; changing it would orphan stored keys.
+_UNIT_WORDS = r"APT|APARTMENT|UNIT|STE|SUITE|SPC|SPACE|LOT|RM|ROOM|BLDG"
+# "UNIT #27" -> "UNIT 27": the hash strip would otherwise eat "#27" and leave a
+# dangling "UNIT" that the designator strip cannot see.
+_DESIGNATOR_HASH_RE = re.compile(rf"\b({_UNIT_WORDS})\s*#\s*", re.IGNORECASE)
+# The unit id a street MARKS ("#C22", "APT 5", "UNIT #4B"), read from the raw street.
+_MARKED_UNIT_RE = re.compile(
+    rf"(?:#|\b(?:{_UNIT_WORDS})\b)\s*#?\s*([A-Z0-9-]+)\s*$", re.IGNORECASE
+)
+
+
+def _compare_street(street: str | None) -> str:
+    return _normalize_street(_DESIGNATOR_HASH_RE.sub(r"\1 ", street or ""))
+
+
+def _marked_unit(street: str | None) -> str | None:
+    m = _MARKED_UNIT_RE.search((street or "").upper())
+    return m.group(1).replace("-", "") if m else None
+
+
+def _same_street_modulo_unit_spelling(p_raw: str, m_raw: str, p_street: str, m_street: str) -> bool:
+    """True when the two streets differ only in how the SAME unit or house letter is
+    written. Pairwise on purpose (Codex): a bare trailing token is dropped only when
+    the other side marks that exact unit id, so "123 E AVENUE A" never loses its "A".
+
+      * bare vs marked unit: "22222 24TH AVE S C22" vs "22222 24TH AVE S #C22"
+      * split house letter: "2651B NW 57TH ST" vs "2651 B NW 57TH ST", only when a
+        real street word follows (not "2651 B ST", which may be B Street).
+    The caller still needs a matching ZIP / city before it returns same-place.
+    """
+    tp, tm = p_street.split(" "), m_street.split(" ")
+    for long_t, short_t, short_raw in ((tp, tm, m_raw), (tm, tp, p_raw)):
+        if len(long_t) == len(short_t) + 1 and long_t[:-1] == short_t:
+            if _marked_unit(short_raw) == long_t[-1]:
+                return True
+    for a, b in ((tp, tm), (tm, tp)):
+        if (
+            len(b) == len(a) + 1
+            and re.fullmatch(r"\d+[A-Z]", a[0])
+            and b[0].isdigit()
+            and re.fullmatch(r"[A-Z]", b[1])
+            and a[0] == b[0] + b[1]
+            and a[1:] == b[2:]
+            and any(t not in _TRAILING_OPTIONAL_TOKENS for t in a[1:])
+        ):
+            return True
+    return False
+
+
 def _normalize_full(addr: str) -> str:
     s = _PUNCT_RE.sub(" ", addr).upper()
     return _WS_RE.sub(" ", s).strip()
@@ -208,8 +259,8 @@ def _addresses_differ(property_address: str, mailing_address: str) -> bool | Non
 
     p = parse_property_for_display(property_address)
     m = parse_property_for_display(mailing_address)
-    p_street = _normalize_street(p["street"])
-    m_street = _normalize_street(m["street"])
+    p_street = _compare_street(p["street"])
+    m_street = _compare_street(m["street"])
 
     if not p_street or not m_street:
         # No parsed street on a side — fall back to a whole-string compare. Equal
@@ -219,6 +270,7 @@ def _addresses_differ(property_address: str, mailing_address: str) -> bool | Non
         p_street != m_street
         and not _same_street_modulo_trailing_tokens(p_street, m_street)
         and not _street_absorbed_city(p, m, p_street, m_street)
+        and not _same_street_modulo_unit_spelling(p["street"] or "", m["street"] or "", p_street, m_street)
     ):
         return True
 
@@ -253,6 +305,12 @@ def address_match_key(address: str | None) -> str | None:
         return None
     zip5 = (parsed["zip"] or "")[:5]
     return f"{street}|{zip5}" if zip5 else street
+
+
+def _ends_with_words(street: str, tail: str) -> bool:
+    """Token-boundary, case/space-insensitive 'street ends with tail', original words kept."""
+    s, t = street.upper().split(), tail.upper().split()
+    return bool(t) and len(s) > len(t) and s[-len(t):] == t
 
 
 def compose_situs(
@@ -308,6 +366,12 @@ def compose_situs(
     have = parse_property_for_display(line)
     street = (have["street"] or line).strip()
     city = have["city"] or (property_city.strip() if property_city else None)
+    if not have["city"] and city and _ends_with_words(street, city):
+        # Comma-less situs ("609 LYNN ST WENATCHEE, WA 98801"): the city is already
+        # glued to the street. Appending it again gave "... WENATCHEE, WENATCHEE",
+        # which hid the shape from _street_absorbed_city and flagged owner-occupied
+        # Chelan leads absentee. Leave the line as the county printed it.
+        city = None
     state = have["state"] or (property_state.strip() if property_state else None)
     zipc = have["zip"] or (property_zip.strip() if property_zip else None)
 

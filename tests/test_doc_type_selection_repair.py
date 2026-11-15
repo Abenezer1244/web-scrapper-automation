@@ -49,7 +49,7 @@ def test_stale_types_raise_a_typed_error_naming_every_one():
     assert isinstance(err, ValueError)  # callers guarding ValueError keep their behaviour
     assert err.public_message.startswith(
         "Chelan County no longer offers Notice of Default or Foreclosure as a document type.")
-    assert "Create a new Chelan County pre-foreclosure scraper" in err.public_message
+    assert err.public_message.endswith("Edit this scraper to choose from the current list, or contact support.")
     assert "—" not in err.public_message  # no em dash in customer copy
 
 
@@ -167,3 +167,38 @@ def test_162_repairs_stale_chelan_selections_and_nothing_else(conn):
     _run_162(conn)  # a replay changes nothing and audits nothing new
     assert conn.execute(text("SELECT count(*) FROM audit_events WHERE event = 'scraper_doc_types_repaired' "
                              "AND user_id = :u"), {"u": uid}).scalar_one() == 2
+
+
+# -- GET /scrapers/{id} carries the county's current choice ----------------------
+
+async def _saved_config(user_id: str, county: str, record_type: str, doc_types):
+    import src.db.session as _db_session
+    from src.db.models import ScraperConfig
+
+    async with _db_session.AsyncSessionLocal() as s:
+        cfg = ScraperConfig(
+            id=str(uuid.uuid4()), user_id=user_id, name="dt", county=county, state="WA",
+            record_type=record_type, fields={"party_name": True}, enrichment={},
+            schedule={"frequency": "manual"}, deliver={"formats": ["csv"], "emails": []},
+            doc_types=doc_types,
+        )
+        s.add(cfg)
+        await s.commit()
+        return cfg.id
+
+
+async def test_get_scraper_returns_the_countys_current_options(client, db, starter_user, starter_token):
+    """The Edit page reads the options from the scraper itself, so it can repair a
+    stale selection even when the county's connector is hidden from the connectors
+    list (down or unknown health)."""
+    auth = {"Authorization": f"Bearer {starter_token}"}
+    pf = await _saved_config(starter_user.id, "chelan", "pre_foreclosure", _OLD_FOUR)
+    body = (await client.get(f"/scrapers/{pf}", headers=auth)).json()
+    assert body["doc_type_options"] == {"notice_of_trustee_sale": "Notice of Trustee Sale",
+                                        "lis_pendens": "Lis Pendens"}
+    assert body["doc_type_confidence"] == "keyword"
+    assert body["doc_types"] == _OLD_FOUR  # the stored selection is reported as is
+
+    probate = await _saved_config(starter_user.id, "chelan", "probate", None)
+    body = (await client.get(f"/scrapers/{probate}", headers=auth)).json()
+    assert body["doc_type_options"] is None and body["doc_type_confidence"] is None

@@ -359,8 +359,7 @@ class StaleDocTypeSelectionError(ValueError):
         self.public_message = (
             f"{place} no longer offers {_join_labels(labels)} as a document type. "
             f"This scraper did not run, so it would not search document types you did not "
-            f"choose. Create a new {place} pre-foreclosure scraper to choose from the "
-            f"current list, or contact support."
+            f"choose. Edit this scraper to choose from the current list, or contact support."
         )
         super().__init__(
             f"document type(s) {self.stale!r} not mappable for {county}, {state} "

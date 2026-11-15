@@ -519,3 +519,24 @@ def test_bare_city_shaped_names_are_not_treated_as_a_locality():
 def _mod_bare_locality(value):
     from src.scrapers.probate import _BARE_LOCALITY_RE
     return bool(_BARE_LOCALITY_RE.match(value))
+
+
+def test_benton_typo_depth_of_health_is_the_agency():
+    """Benton indexes 2026-027909's grantor as '..., STATE OF WA, DEPTH OF HEALTH'."""
+    assert strip_filing_agency("HAY, JAMES LEROY, STATE OF WA, DEPTH OF HEALTH") == "HAY, JAMES LEROY"
+    party, _ = orient_probate_party("HAY, JAMES LEROY, STATE OF WA, DEPTH OF HEALTH",
+                                    "HAY, BARBARA LOIS", "Cert Of Death")
+    assert party == "HAY, JAMES LEROY"
+
+
+def test_state_qualified_dshs_is_the_agency():
+    """Benton 2026-026847: '..., STATE OF WA, DSHS'."""
+    assert strip_filing_agency("COUNCE, WILLIAM CARL, STATE OF WA, DSHS") == "COUNCE, WILLIAM CARL"
+    assert orient_probate_party("STATE OF WA, DSHS", "DOE, JANE", "Cert Of Death") == ("DOE, JANE", None)
+
+
+def test_depth_and_dshs_never_strip_on_their_own():
+    """Only the full phrases are agencies: a surname DEPTH or a lone DSHS token is left alone."""
+    assert strip_filing_agency("DEPTH, MARY") == "DEPTH, MARY"
+    assert strip_filing_agency("DSHS") == "DSHS"
+    assert strip_filing_agency("DEPTH, MARY OF HEALTH") == "DEPTH, MARY OF HEALTH"

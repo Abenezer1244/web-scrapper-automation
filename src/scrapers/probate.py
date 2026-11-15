@@ -86,7 +86,12 @@ _AGENCY_SUBJECT = (
 )
 _AGENCY_DEPT_RE = re.compile(
     rf"(?:{_STATE_QUALIFIER})?"
-    rf"(?:DEPARTMENT|DEPT|BUREAU|OFFICE)\.?\s+OF\s+{_AGENCY_SUBJECT}\b",
+    # DEPTH: Benton's index types "STATE OF WA, DEPTH OF HEALTH" (live 2026-11-15,
+    # 2026-027909); only ever inside the full "<dept> OF <agency>" phrase.
+    rf"(?:DEPARTMENT|DEPTH|DEPT|BUREAU|OFFICE)\.?\s+OF\s+{_AGENCY_SUBJECT}\b"
+    # "STATE OF WA, DSHS" (Benton 2026-026847): the acronym only after a state, so a
+    # bare "DSHS" token is never an agency phrase on its own.
+    rf"|\b{_STATE_QUALIFIER}DSHS\b",
     re.IGNORECASE,
 )
 

@@ -570,7 +570,8 @@ class TestCurrentOwnerFields:
         "SMITH JOHN C / O JANE DOE",
         r"SMITH JOHN C\O JANE DOE",
         "SMITH JOHN CARE OF JANE DOE",
-        "SMITH JOHN CO JANE DOE",
+        "SMITH JOHN CARE-OF JANE DOE",
+        "SMITH JOHN CARE - OF JANE DOE",
         "SMITH JOHN ATTN JANE DOE",
         "ESTATE OF JOHN SMITH JANE DOE PR",
         "JOHN SMITH ESTATE JANE DOE PERS REP",
@@ -591,6 +592,8 @@ class TestCurrentOwnerFields:
         "COOPER JOHN", "PRATT DOROTHY L", "PRICE COLE", "SMITH JOHN & MARY",
         "EXECUTIVE PARK LLC", "ADMINISTRATIVE HOLDINGS LLC", "CORBIN PRESTON",
         "SMITH FAMILY TRUST", "JONES-MITCHELL ANNA",
+        # A bare CO is as often a company; REP is only a representative as a word.
+        "ACME CO", "ACME CO LLC", "PERSONAL REPAIR SHOP LLC", "PERS REPAIRS INC",
     ])
     def test_ordinary_owner_names_are_kept(self, owner):
         fields = current_owner_fields("SMITH, JOHN", owner)

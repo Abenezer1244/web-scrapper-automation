@@ -572,11 +572,12 @@ def _surname_key(surname: str | None) -> str:
 # Wording that puts someone other than the owner into an owner-of-record string:
 # care-of, attention, or an estate's representative ('SMITH JOHN ESTATE C/O JANE DOE
 # PR'). Such a string names a living representative, so it is never shown as the
-# current owner (owner decision 2026-11-15).
+# current owner (owner decision 2026-11-15). A bare 'CO' is left alone: it is as
+# often a company ('ACME CO').
 _REPRESENTATIVE_WORDING_RE = re.compile(
-    r"(?:\bC\s*/\s*O\b|\bC\\O\b|\bCARE\s+OF\b|\bCO\b|\bATTN\b|\bPR\b"
-    r"|\bPERS(?:ONAL)?\.?\s+REP|\bPER\.?\s+REP|\bEXEC(?:UTOR|UTRIX|S)?\b"
-    r"|\bADMIN(?:ISTRATOR|ISTRATRIX|S)?\b)",
+    r"(?:\bC\s*/\s*O\b|\bC\\O\b|\bCARE(?:\s+|\s*-\s*)OF\b|\bATTN\b|\bPR\b"
+    r"|\bPERS(?:ONAL)?\.?\s+REP(?:RESENTATIVE)?S?\b|\bPER\.?\s+REP(?:RESENTATIVE)?S?\b"
+    r"|\bEXEC(?:UTOR|UTRIX|S)?\b|\bADMIN(?:ISTRATOR|ISTRATRIX|S)?\b)",
     re.IGNORECASE,
 )
 

@@ -73,6 +73,133 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-11-15 — Asotin probate merged and deployed (#639); post-deploy security review
+
+**Built / Shipped:** #639 was squash-merged as `c8fcfecb` at 2026-11-15 20:47 UTC. Railway rebuilt api,
+worker and beat, and all three reported SUCCESS. The api boot log shows `159 -> 160` (probate_notices)
+and `160 -> 161` (connector). A read-only production check found `alembic_version` = 161 and all four
+Asotin connectors with `active = false`. The new worker lists `crawl_nts_nwmarket_asotin` among its
+tasks, and beat started cleanly.
+
+**Tried / Decided:**
+- Squash rather than a merge commit. Two early branch commits held decedent names taken from the public
+  notices; squashing kept them out of main's history.
+- Deleted the remote branch after checking that its tree equals `c8fcfecb`'s. GitHub still keeps
+  `refs/pull/639/head`, so the commits stay reachable through the PR. Removing them needs GitHub
+  Support, and the repository is private.
+- Removed the local worktree, the branch, and the test containers `bl-asotin-pg` and `bl-asotin-redis`
+  with their anonymous volumes.
+
+**Failed / Blocked:**
+- CI on the PR did not start for hours. Both sides had added a top entry to this journal, so the PR was
+  conflicted, and GitHub runs no pull_request workflows on a conflicted PR. It happened twice: main moved
+  again (#638) during the 39-minute Test run. Both times the merge was resolved by keeping both entries,
+  and the merged tree was re-tested before pushing.
+- Asotin tax coverage is 6,086 of 13,612 parcels checked within 10 days (44.7%), short of the 95% gate.
+  The parcel inventory heartbeat was 2026-11-13 23:25 UTC. The connectors stay off.
+
+**Caught & fixed:** nothing new in code.
+
+**Post-deploy security review** (§15, scoped to `c8fcfecb`; Claude and Codex, Codex verdict GO, no
+Critical or High):
+- Live catalog checks: RLS is on for `probate_notices`. The only policies are for `bridgeleads_system`
+  and `bridgeleads_purge`. `anon`, `authenticated` and `bridgeleads_app` cannot SELECT.
+  `privacy_erase_probate` is SECURITY DEFINER, owned by `bridgeleads_purge`, with
+  `search_path = pg_catalog, pg_temp`, and only the purge and system roles can execute it.
+- Static checks pass for secrets, http URLs, dependencies, SSRF (`safe_get`), CSV sanitizing and tenant
+  scoping.
+- **Medium (open): erasure misses representatives.** `src/privacy/erase.py` `_scan_probate` matches a
+  deletion rule only against each parcel's decedent and owner of record, never `personal_reps`. A
+  representative's own deletion request leaves their name on the notice until the 180-day retention.
+- **Medium (open; Codex severity, Claude reads it as low practical risk):** the ArcGIS `where` clause in
+  `asotin_parcels.query_surname` is built from text. The surname must match `^[A-Z][A-Z'\-]{1,40}$` and
+  its quotes are doubled; ArcGIS REST has no bound parameters.
+- Low: `probate_ingest` logs `str(exc)[:120]` on a re-check failure, so a database error's parameters
+  would only be kept out of the log by the 120-character cut.
+
+**Pending / Handoff:**
+- The first scheduled chance to write `probate_notices` is the 2026-11-16 10:00 UTC crawl (it may also fail
+  or find no probate notice). Check it with
+  aggregates only (outcome counts, `max(fetched_at)`, heartbeat age); a heartbeat alone does not prove
+  ingestion.
+- The two Medium findings above.
+- Owner decision: the app-wide "Current Owner" (`tasks_helpers/enrich.py`, `assessor_current_owner`) can
+  show an "ESTATE C/O <rep> PR" string for probate leads in any county. Codex recommends not filling it
+  for probate until a display rule is approved, and dealing with values already stored.
+- Asotin activation waits on 95% tax coverage and owner release approval.
+
+**Facts learned:**
+- A conflicted PR gets no pull_request CI, which looks exactly like CI that hasn't started. Two branches
+  that both add a top journal entry can conflict, as these did.
+- `crawl_nts_nwmarket_asotin` runs daily at 10:00 UTC whether or not the connector is active, so a deploy
+  after 10:00 waits a day for its first crawl.
+
+---
+
+## 2026-11-14 — Asotin probate from Lewiston Tribune notices to creditors (branch `feat/asotin-wa-probate-notices`)
+
+**Built / Shipped (branch only, not merged):** Asotin's recorder (Helion) is behind a reCAPTCHA,
+so probate now comes from the probate notices to creditors the nwmarket crawl already downloads.
+- Phase 1: `src/scrapers/sources/probate_nwmarket.py` reads a notice (cause `NN-4-NNNNN-02` plus
+  the Asotin court phrase; decedent, personal representatives, claims address, first publication).
+  `src/scrapers/enrichment/asotin_parcels.py` matches the decedent to parcels in the county's
+  public ArcGIS Parcels layer.
+- Phase 2: migration 160 `probate_notices` is system-only under RLS, with erasure through
+  `privacy_erase_probate`, owned by `bridgeleads_purge`, and a CHECK that keeps tombstones nameless.
+  `src/workers/probate_ingest.py` is hooked into `crawl_nts_nwmarket_asotin`: it matches before
+  writing, runs the privacy gate, re-checks held and failed notices for 30 days, and keeps notices
+  180 days.
+- Phase 3: `src/scrapers/asotin_wa_probate.py` delivers one lead per tied parcel. Migration 161
+  seeds the connector **inactive**, and the module is allowlisted.
+
+**Tried / Decided:**
+- Owner match rule "name + family tie" (2026-11-14). A parcel is delivered only on an exact name
+  match plus one tie: an estate-marked owner, a representative named on the parcel, a
+  representative sharing the whole surname, or billing address = claims address. Everything else
+  is held. Codex had proposed a stricter rule; the owner chose this one.
+- Asotin PACS has no owner-name search. Using the DBA field to get around that was rejected, and
+  the county ArcGIS layer is used instead.
+- Personal representatives only decide the tie and are never delivered.
+
+**Caught & fixed (Codex):**
+- Phase 1, about 12 rounds:
+  - address collisions, units and floor words, now a structural city/state/ZIP compare;
+  - estate markers leaking across co-owners; co-owner surname inheritance;
+  - organisations and trusts used as C/O addressees;
+  - wrongly typed values from the layer.
+- Phase 2:
+  - a transaction held open across network calls;
+  - a stale re-check overwriting newer answers, fixed with revision-conditional updates;
+  - one bad notice starving the others, fixed with per-row backoff;
+  - retention blocked by a failing sitemap read;
+  - layer failures remembered as "read".
+- Phase 3, NO-GO → GO:
+  - the owner-of-record copy could carry "C/O <rep> PR", so it was dropped;
+  - a fresh crawl heartbeat could hide notices still waiting on the layer;
+  - windows reaching past retention now fail;
+  - a street-only address keeps the parcel|address billing key from drifting.
+
+**Failed / Blocked:**
+- Railway trial expiry blocked the 11-13 deploy until the owner restored the plan.
+- `codex review --commit` refuses a custom prompt. `codex exec` waits on stdin unless it is given
+  `< /dev/null`.
+
+**Pending / Handoff:**
+- Push and PR; the owner runs `gh pr create`.
+- Activate with the Asotin release, after tax coverage reaches 95%.
+- Owner question: enrichment shows the assessor owner string as Current Owner on every county's
+  probate leads, and for an estate parcel that string can name the representative ("C/O ... PR").
+  Codex: not a blocker for this connector.
+- Divorce, death_certificate and pre_foreclosure remain blocked on the Helion captcha.
+
+**Facts learned:**
+- The Lewiston Tribune feed also carries Spokane (`-32`) and Idaho (CV29/CV35) probates.
+- Asotin sees about 2 probates per 4 days.
+- Live check 2026-11-14: cause 26-4-00122-02 matched one parcel through the shared surname;
+  cause 26-4-00117-02 was held (exact name match, no family tie).
+
+---
+
 ## 2026-11-14 — Clark goes live: death certificates verified end to end, browser QA, parcel ids
 
 **Built / Shipped:** #631 merged (main `92db4278`), Railway auto-deployed api/worker/beat; owner

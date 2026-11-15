@@ -250,10 +250,17 @@ def test_every_shared_store_resumes_across_pages(s, monkeypatch, batch):
             "INSERT INTO county_records (id, county, state, record_hash, party_name, "
             "parcel_id) VALUES (gen_random_uuid(), 'king', 'WA', :h, 'SMITH JOHN', :p)"),
             {"h": uuid.uuid4().hex, "p": _PARCEL})
+        s.execute(text(
+            "INSERT INTO probate_notices (id, county, state, source, cause_no, first_published, "
+            "decedent, parcels) VALUES (gen_random_uuid(), 'king', 'WA', 'test', :c, "
+            "current_date, 'JOHN SMITH', CAST(:p AS json))"),
+            {"c": f"26-4-0000{i}-02", "p": json.dumps(
+                [{"parcel_id": _PARCEL, "party_name": "SMITH, JOHN", "owner_name": "SMITH, JOHN"}])})
     # King keys on the normalised parcel: only the exact parcel is the subject's.
     assert _sweep(s, rule, "king").get("king") == 1
     assert _sweep(s, rule, "nts").get("nts") == 3
     assert _sweep(s, rule, "county").get("county") == 3
+    assert _sweep(s, rule, "probate").get("probate") == 3
     assert s.execute(text("SELECT count(*) FROM nts_notices WHERE grantor = 'JOHN SMITH'")
                      ).scalar() == 0
 
@@ -340,3 +347,41 @@ def test_a_crawl_never_clears_a_tax_cache_tombstone(s):
         "SELECT owner_name, property_address, mailing_address, privacy_suppression_id::text "
         "FROM pacs_tax_status WHERE parcel_id = 'T1'")).one()
     assert tuple(kept) == (None, None, None, row)
+
+
+def _probate(s, cause: str, parcels, decedent: str = "JOHN SMITH") -> str:
+    return str(s.execute(text(
+        "INSERT INTO probate_notices (id, county, state, source, cause_no, first_published, "
+        "decedent, personal_reps, claims_address, parcels, match_outcome) VALUES "
+        "(gen_random_uuid(), 'king', 'WA', 'test', :c, current_date, :d, "
+        "CAST('[\"MARY SMITH\"]' AS json), 'PO BOX 1', CAST(:p AS json), 'matched') "
+        "RETURNING id"), {"c": cause, "d": decedent, "p": json.dumps(parcels)}).scalar())
+
+
+def test_probate_notices_are_erased_through_their_tied_parcels(s):
+    """Migration 160: the subject's estate notice loses every person; a notice on
+    another parcel, and a name-only notice (no anchor: never automatic), are kept."""
+    rule_id, row = _active_rule(s, "delete")
+    rule = load_erasure_rule(s, rule_id, row)
+    lead = {"parcel_id": _PARCEL, "party_name": "SMITH, JOHN", "owner_name": "SMITH, JOHN"}
+    subject = _probate(s, "26-4-00001-02", [{**lead, "parcel_id": "0000000009"}, lead])
+    neighbour = _probate(s, "26-4-00002-02", [{**lead, "parcel_id": "0000000001"}])
+    name_only = _probate(s, "26-4-00003-02", None)
+    assert _sweep(s, rule, "probate").get("probate") == 1
+    left = dict(s.execute(text(
+        "SELECT id::text, decedent IS NULL AND personal_reps IS NULL AND claims_address IS NULL "
+        "AND parcels IS NULL AND privacy_suppression_id IS NOT NULL FROM probate_notices "
+        "WHERE id = ANY(CAST(:i AS uuid[]))"), {"i": [subject, neighbour, name_only]}).all())
+    assert left == {subject: True, neighbour: False, name_only: False}
+    assert _sweep(s, rule, "probate").get("probate", 0) == 0
+
+
+def test_a_withheld_probate_notice_can_never_keep_a_person(s):
+    _, row = _active_rule(s, "opt_out")
+    with pytest.raises(Exception, match="ck_probate_notices_privacy_withheld"):
+        with s.begin_nested():
+            s.execute(text(
+                "INSERT INTO probate_notices (id, county, state, source, cause_no, "
+                "first_published, decedent, privacy_suppression_id) VALUES "
+                "(gen_random_uuid(), 'king', 'WA', 'test', '26-4-00004-02', current_date, "
+                "'JOHN SMITH', CAST(:r AS uuid))"), {"r": row})

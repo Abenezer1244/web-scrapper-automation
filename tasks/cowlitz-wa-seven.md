@@ -1,6 +1,7 @@
 # Cowlitz County, WA — seven record types (branch `feat/cowlitz-wa-seven-record-types`)
 
-Worktree `C:\Users\micha\bl-wt\cowlitz-7`, base origin/main c8fcfecb. Discovery 2026-11-15: read-only
+Worktree `C:\Users\micha\bl-wt\cowlitz-7`, started from origin/main c8fcfecb; origin/main (head 163) merged
+in at a0222a63, Cowlitz migrations renumbered 164-166. Discovery 2026-11-15: read-only
 production SQL, public county pages, bounded read-only recorder searches (6 searches, paced), no logins,
 nothing bought, no Tracerfy, nothing written to production.
 
@@ -97,12 +98,54 @@ Run Phases 1-3 in a row (Codex review per phase). Build tax_delinquent from the 
   1 with no parcel dropped). Original scope:
   **Phase 2 — death_certificate** (template map split, doc scope/registry, migration adding the type
   to connector `edfee01c`): decedent = grantee when the State is grantor; parcel required.
-- [ ] **Phase 3 — trustee_sale** (recorder NTS + Discontinuance, image fetch + existing OCR + existing
-  review flow): first verify the free page-image endpoint; never invent a sale date or amount.
-- [ ] **Phase 4 — tax_delinquent** only if the owner approves the source (see questions).
-- [ ] Codex review per record type (7, incl. blocker evidence for divorce / code_violation) + final
-  adversarial review. Full suite on a disposable local DB. Playwright QA (Playwright, not Claude in Chrome).
-- [ ] Recovery (needs approval): re-enrich the 27 short-parcel leads already in production.
+- [x] **Phase 3 — trustee_sale (auction leads), done.** 3a `10c27137`: the OCR child reads Laserfiche's
+  CCITT Group 4 "Print (as PDF)" (bytes wrapped as TIFF, never decoded in Python; PDF-token drawing
+  grammar after a Codex High). 3b `6d1d6304`: Chelan's recorded-NTS review pipeline made per county;
+  Cowlitz discovery (NTTRUS / DISTRS from entry properties), fetch_pdf (browser download cancelled,
+  URL re-read through safe_download_to_file, same-origin), crawl staging each notice inside one budget,
+  reach-back + fail-loud gap; shared fix: deferred retries count as unread (Chelan too). 3c `d840718f`:
+  reader, NTS_MATCH_COUNTIES, beat 09:00 UTC, connector INACTIVE (now migration 165). Live 11/03-11/13:
+  13 recordings, 9 PDFs OCR'd; OCR unaided read the amount 9/9, the sale date 4/9 (operator confirms
+  every field against the image). 2 of 9 notices have no parcel in the index: not approvable.
+  Codex: 3a r3 GO, 3b r3 GO, 3c GO.
+- [x] **Phase 4 — tax_delinquent, done** `60dc1370` + `8bce696e`: the Treasurer's live listing (13
+  certified, 7 listed, updated 11/5) reconciled with Count and title-report links; holder must equal
+  the Assessor's DEED_HOLDER_NAME (live 7/7); stale (>45 d), future-dated or other-cycle listings fail;
+  past a (tentative) sale date the run fails ("outcome not published"); amount = minimum bid with its
+  basis; bill_year None (validator exception for this source only); status "tax_foreclosure_sale_tentative".
+  Connector INACTIVE (migration 166). Codex r1 NO-GO, r2 GO for merge inactive.
+- [x] Codex: pre-build consult; per phase (every record type, incl. blocker evidence); final
+  adversarial review r1 NO-GO (stale base; migration collision), after merging main r2 **GO for merge
+  and deploy with 165/166 inactive**.
+- [x] Full suite on the Phase 1-3a head: 8,825 passed, 54 skipped (49 min). Merged head: see review.
+- [ ] Playwright UI QA: not done (the new types are not deployed anywhere a UI can reach).
+- [ ] Recovery (needs approval): re-enrich the 27 short-parcel leads already in production; fix the
+  1 production Cowlitz probate lead whose party is the State agency.
+
+## Readiness matrix (2026-11-15)
+
+| Type | Source | Status | Remaining before customers |
+|---|---|---|---|
+| probate | Recorder (Affidavit Lack of Probate, TOD deed) | Implemented, live-verified, awaiting deploy | deploy; recovery of 19 short-parcel leads |
+| pre_foreclosure | Recorder (NTS, Lis Pendens) | Implemented, live-verified, awaiting deploy | deploy; recovery of 8 short-parcel leads |
+| death_certificate | Recorder (recorded Death Certificate) | Implemented, live-verified; migration 164 turns it on at deploy | deploy |
+| trustee_sale | Recorder NTS images, OCR + operator review | Implemented, connector INACTIVE (165) | deploy, first crawl, operator reviews, then activate |
+| tax_delinquent | Treasurer's live foreclosure listing | Implemented, connector INACTIVE (166) | show the minimum-bid basis in exports/UI, then activate before 12/7/2026 |
+| divorce | Superior Court (Odyssey, paid + GR 31) | Blocked by source access / legal | none planned |
+| code_violation | none: complaint intake only (county + 5 cities) | Blocked by source access | none planned |
+
+## Review (2026-11-15)
+- The two live scrapers were silently incomplete (75% of rows; grid hid co-grantees and extra
+  parcels) and 5-character parcels never reached any GIS gate. All three are fixed at the root.
+- Auction leads reuse Chelan's reviewed pipeline instead of a new one; the refactor kept Chelan's
+  behaviour (its suites pass) except the stricter "deferred retries are unread" rule.
+- Deploy prerequisites (Codex final): migrate to 166 and check the Cowlitz rows (recorder +
+  death_certificate; 165/166 inactive); deploy worker + beat together and confirm Chromium,
+  Tesseract (eng), Redis locking and recorder alerts in the image; watch the first Cowlitz crawl;
+  before activating 165 review the first notices; before activating 166 expose the minimum-bid basis.
+- Follow-ups: Chelan's pre-existing silent 60-day reach clamp; cross-type identity of recorder vs
+  approved-notice leads for the same property (all counties); Cowlitz deed-holder mailing depends on
+  COUNTY_GIS_RESTRICTED_MAILING_ENABLED (owner/counsel).
 
 Nothing is pushed, merged, deployed, or enabled without owner approval. Connectors for new types are
 seeded INACTIVE.

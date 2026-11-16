@@ -4,8 +4,10 @@ Dedicated connector, separate from Cowlitz's Laserfiche recorder row: the regist
 matches by record_type. base_url is the Treasurer's stable Foreclosure index, which seeds
 the SSRF allowlist; the scraper finds the newest yearly page and its listing at run time.
 
-Inserted INACTIVE: the owner switches it on after deploy. Its leads expire with the sale
-(December 7, 2026 for the 2026 cycle). Data INSERT only, idempotent.
+Inserted INACTIVE. Do not switch it on until customer-facing amounts and exports show
+that this amount is the foreclosure minimum bid (delinquent_amount_basis), not unpaid tax
+alone (Codex final review). The run fails once the tentative sale date (December 7, 2026
+for the 2026 cycle) has passed. Data INSERT only, idempotent.
 
 Revision ID: 166
 Revises: 165

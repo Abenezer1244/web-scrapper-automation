@@ -5529,6 +5529,31 @@
             ],
             "title": "Deliver"
           },
+          "doc_type_confidence": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Doc Type Confidence"
+          },
+          "doc_type_options": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Doc Type Options"
+          },
           "doc_types": {
             "anyOf": [
               {

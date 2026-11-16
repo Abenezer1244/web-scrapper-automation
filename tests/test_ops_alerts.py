@@ -354,3 +354,40 @@ def test_a_non_http_webhook_url_is_refused(monkeypatch, tmp_path, details, caplo
         assert send_ops_alert("canary", "x/WA", "s", "b") is False
     assert details == ["[undelivered] [email:off webhook:fail] s"]
     assert any("ValueError" in r.getMessage() for r in caplog.records)
+
+
+def test_an_email_only_alert_never_reaches_the_webhook(monkeypatch, webhook_server, details):
+    """A canary all-clear: Better Stack's webhook only opens incidents, so an
+    all-clear sent there would page as a new one."""
+    url, received, _ = webhook_server
+    monkeypatch.setattr(settings, "OPS_ALERT_EMAIL", "ops@test.bridgeleads.io")
+    monkeypatch.setattr(settings, "RESEND_API_KEY", "re_test_not_real")
+    monkeypatch.setattr(settings, "OPS_ALERT_WEBHOOK_URL", url)
+    monkeypatch.setattr(ops_alerts, "_cooldown_acquired", lambda *_a: True)
+    _fake_resend(monkeypatch, fail=False)
+
+    assert send_ops_alert("canary_recovered", "x/WA/probate", "Recovered", "b",
+                          webhook=False) is True
+    assert received == []
+    assert details == ["[sent] [email:ok webhook:off] Recovered"]
+
+
+async def test_an_email_only_alert_from_a_running_loop_skips_the_webhook_too(
+        monkeypatch, webhook_server, details):
+    import asyncio
+
+    url, received, _ = webhook_server
+    monkeypatch.setattr(settings, "OPS_ALERT_EMAIL", "ops@test.bridgeleads.io")
+    monkeypatch.setattr(settings, "RESEND_API_KEY", "re_test_not_real")
+    monkeypatch.setattr(settings, "OPS_ALERT_WEBHOOK_URL", url)
+    monkeypatch.setattr(ops_alerts, "_cooldown_acquired", lambda *_a: True)
+    _fake_resend(monkeypatch, fail=False)
+
+    assert send_ops_alert("canary_recovered", "x/WA/probate", "Recovered", "b",
+                          webhook=False) is False  # handed to the executor
+    for _ in range(100):  # the executor writes the audit row when it is done
+        if details:
+            break
+        await asyncio.sleep(0.05)
+    assert received == []
+    assert details == ["[sent] [email:ok webhook:off] Recovered"]

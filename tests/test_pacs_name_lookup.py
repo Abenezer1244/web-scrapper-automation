@@ -446,3 +446,45 @@ async def test_a_restricted_portal_is_name_searched_only_with_the_restricted_swi
     else:
         assert asked_names == []
         assert pacs.PACS_NAME_LOOKUP_KEY not in ed
+
+
+# ─── Columbia: the detail page answers HTTP 500 without &year= ──────────────────
+from pathlib import Path  # noqa: E402
+
+COL_URL = "https://propertysearch.co.columbia.wa.us/PropertyAccess/PropertySearch.aspx?cid=0"
+COL_RESULTS = "https://propertysearch.co.columbia.wa.us/PropertyAccess/SearchResults.aspx?cid=0"
+COL_DETAIL = "https://propertysearch.co.columbia.wa.us/PropertyAccess/Property.aspx?cid=0&prop_id=58808"
+COL_FORM = (Path(__file__).parent / "fixtures" / "columbia_pacs_search_form.html").read_text(encoding="utf-8")
+
+
+def _columbia(form: str = COL_FORM) -> _Portal:
+    p = _Portal(_Resp(302, location="SearchResults.aspx?cid=0"), {
+        COL_RESULTS: _Resp(200, _grid("DOE JANE")),
+        COL_DETAIL: _Resp(500, "Runtime Error"),          # what the county serves without a year
+        COL_DETAIL + "&year=2026": _Resp(200, DETAIL),
+    })
+    p.pages[COL_URL] = _Resp(200, form)
+    return p
+
+
+def test_columbia_search_and_detail_name_the_current_roll(portal):
+    p = portal(_columbia())
+    outcome, result = lookup_pacs_by_name(COL_URL, "DOE JANE")
+    assert outcome == LOOKUP_FOUND and result["mailing"] == "PO BOX 9, CLINTON, WA 98236"
+    post = next(c for c in p.calls if c[0] == "POST")
+    assert post[2]["propertySearchOptions$taxyear"] == "2026"  # the form's newest year
+    assert ("GET", COL_DETAIL + "&year=2026") in p.calls
+
+
+def test_columbia_form_without_a_year_fails_instead_of_reading_an_unknown_roll(portal):
+    no_year = COL_FORM.replace('name="propertySearchOptions$taxyear"', 'name="gone"')
+    p = portal(_columbia(no_year))
+    assert lookup_pacs_by_name(COL_URL, "DOE JANE") == (LOOKUP_FAILED, None)
+    assert not any(c[0] == "POST" for c in p.calls)
+
+
+def test_other_portals_still_send_no_year(portal):
+    p = portal(_redirect_to(_Resp(200, _grid("DOE JANE"))))
+    lookup_pacs_by_name(URL, "DOE JANE")
+    post = next(c for c in p.calls if c[0] == "POST")
+    assert "propertySearchOptions$taxyear" not in post[2]

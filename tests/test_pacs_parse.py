@@ -268,3 +268,55 @@ def test_name_path_requires_the_row_to_name_the_searched_owner():
     co = _page(_row("9876543210", "1234567890", "1 FIR LN, COUPEVILLE WA 98239", "DOE JANE & DOE JOHN"))
     assert parse_pacs_result_html(co, "DOE JANE") is not None
     assert parse_pacs_result_html(co, "DOE JOHN") is None
+
+
+# ─── Columbia: year-bound detail pages ────────────────────────────────────────
+_COL = "https://propertysearch.co.columbia.wa.us/PropertyAccess/PropertySearch.aspx?cid=0"
+_COL_FORM = (Path(__file__).parent / "fixtures" / "columbia_pacs_search_form.html").read_text(encoding="utf-8")
+
+
+def test_columbia_year_is_the_newest_roll_its_form_offers():
+    from src.scrapers.enrichment.pacs import ownership_year
+
+    assert ownership_year(_COL, _COL_FORM) == "2026"  # live form, 2026-11-14
+    newer = _COL_FORM.replace('<option selected="selected" value="2026">',
+                              '<option value="2027">2027 - 2028</option><option selected="selected" value="2026">')
+    assert ownership_year(_COL, newer) == "2027"  # the roll-over follows the county
+
+
+def test_columbia_form_without_years_raises():
+    from src.scrapers.enrichment.pacs import ownership_year
+
+    with pytest.raises(ValueError):
+        ownership_year(_COL, "<form></form>")
+
+
+def test_portals_that_need_no_year_get_none_even_when_their_form_has_one():
+    from src.scrapers.enrichment.pacs import ownership_year
+
+    assert ownership_year("https://propertysearch.co.benton.wa.us/propertyaccess/PropertySearch.aspx?cid=0",
+                          _COL_FORM) is None
+
+
+def test_detail_url_names_the_year_only_when_given():
+    assert pacs_detail_url(_COL, "264873", "2026") == \
+        "https://propertysearch.co.columbia.wa.us/PropertyAccess/Property.aspx?cid=0&prop_id=264873&year=2026"
+    with pytest.raises(ValueError):
+        pacs_detail_url(_COL, "264873", "26&x=1")
+
+
+def test_real_columbia_detail_page_reads_identity_situs_and_mailing():
+    page = parse_pacs_detail_html(
+        (Path(__file__).parent / "fixtures" / "columbia_pacs_detail_1180050890000.html").read_text(encoding="utf-8"))
+    assert page["geo_ids"] == ["1180050890000"] and page["prop_ids"] == ["264873"]
+    assert page["situs"] == ["500 S 5TH ST", "DAYTON, WA 99328"]
+    assert page["mailing"] == [["500 S 5TH ST", "DAYTON, WA 99328"]]
+
+
+def test_no_existing_pacs_county_is_sent_a_year():
+    from src.scrapers.enrichment.pacs import ownership_year
+    from src.scrapers.enrichment.pacs_parcel import PACS_SITES
+
+    others = [s for c, s in PACS_SITES.items() if c != "columbia"]
+    assert len(others) == 8
+    assert all(ownership_year(s.search_url, _COL_FORM) is None for s in others)

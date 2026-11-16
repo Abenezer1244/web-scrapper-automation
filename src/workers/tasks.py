@@ -1047,6 +1047,13 @@ def run_scrape_job(self, job_id: str) -> None:
                 # and keep it out of error tracking (it is not a bug).
                 _fail_attempt(exc.public_message, report=False)
                 return
+            from src.scrapers.doc_types import StaleDocTypeSelectionError
+            if isinstance(exc, StaleDocTypeSelectionError):
+                # The saved selection outlived a registry change: retrying cannot fix
+                # it, so tell the customer what changed. Still reported, because a
+                # registry change shipped without repairing saved selections.
+                _fail_attempt(exc.public_message, report=True)
+                return
             # Transient portal hiccup (page never rendered, pagination flaked, block
             # wall, Playwright timeout) → re-queue this job with backoff instead of
             # permanently failing the whole day's scrape on ONE flaky page. Bounded by

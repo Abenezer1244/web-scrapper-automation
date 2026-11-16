@@ -7,15 +7,15 @@ the SSRF allowlist; the scraper finds the newest yearly page and its listing at 
 Inserted INACTIVE: the owner switches it on after deploy. Its leads expire with the sale
 (December 7, 2026 for the 2026 cycle). Data INSERT only, idempotent.
 
-Revision ID: 164
-Revises: 163
+Revision ID: 166
+Revises: 165
 Create Date: 2026-11-15
 """
 
 from alembic import op
 
-revision = "164"
-down_revision = "163"
+revision = "166"
+down_revision = "165"
 branch_labels = None
 depends_on = None
 

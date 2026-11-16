@@ -349,13 +349,15 @@ def test_a_crawl_never_clears_a_tax_cache_tombstone(s):
     assert tuple(kept) == (None, None, None, row)
 
 
-def _probate(s, cause: str, parcels, decedent: str = "JOHN SMITH") -> str:
+def _probate(s, cause: str, parcels, decedent: str = "JOHN SMITH",
+             reps=("MARY SMITH",)) -> str:
     return str(s.execute(text(
         "INSERT INTO probate_notices (id, county, state, source, cause_no, first_published, "
         "decedent, personal_reps, claims_address, parcels, match_outcome) VALUES "
         "(gen_random_uuid(), 'king', 'WA', 'test', :c, current_date, :d, "
-        "CAST('[\"MARY SMITH\"]' AS json), 'PO BOX 1', CAST(:p AS json), 'matched') "
-        "RETURNING id"), {"c": cause, "d": decedent, "p": json.dumps(parcels)}).scalar())
+        "CAST(:r AS json), 'PO BOX 1', CAST(:p AS json), 'matched') RETURNING id"),
+        {"c": cause, "d": decedent, "r": json.dumps(None if reps is None else list(reps)),
+         "p": json.dumps(parcels)}).scalar())
 
 
 def test_probate_notices_are_erased_through_their_tied_parcels(s):
@@ -374,6 +376,33 @@ def test_probate_notices_are_erased_through_their_tied_parcels(s):
         "WHERE id = ANY(CAST(:i AS uuid[]))"), {"i": [subject, neighbour, name_only]}).all())
     assert left == {subject: True, neighbour: False, name_only: False}
     assert _sweep(s, rule, "probate").get("probate", 0) == 0
+
+
+def test_a_personal_representatives_own_rule_erases_the_notice(s):
+    """The rule's person (SMITH JOHN) is not the decedent but a personal representative,
+    printed in natural order; the rule's parcel is the estate's SECOND tied parcel."""
+    rule_id, row = _active_rule(s, "delete")
+    rule = load_erasure_rule(s, rule_id, row)
+    lead = {"parcel_id": _PARCEL, "party_name": "DOE, ADA", "owner_name": "DOE, ADA"}
+    elsewhere = {**lead, "parcel_id": "0000000009"}
+    rep = _probate(s, "26-4-00011-02", [elsewhere, lead], decedent="ADA DOE",
+                   reps=("JANE ROE", "JOHN SMITH"))
+    other_parcel = _probate(s, "26-4-00012-02", [elsewhere], decedent="ADA DOE",
+                            reps=("JOHN SMITH",))
+    no_parcel = _probate(s, "26-4-00013-02", None, decedent="ADA DOE", reps=("JOHN SMITH",))
+    recorder_order = _probate(s, "26-4-00014-02", [lead], decedent="ADA DOE",
+                              reps=("SMITH JOHN",))
+    no_reps = _probate(s, "26-4-00015-02", [lead], decedent="ADA DOE", reps=None)
+    # An unreadable representative on the rule's parcel is a review, never an erasure.
+    unreadable = _probate(s, "26-4-00016-02", [lead], decedent="ADA DOE", reps=("J.",))
+    assert _sweep(s, rule, "probate").get("probate") == 1
+    ids = [rep, other_parcel, no_parcel, recorder_order, no_reps, unreadable]
+    left = dict(s.execute(text(
+        "SELECT id::text, decedent IS NULL AND personal_reps IS NULL AND claims_address IS NULL "
+        "AND parcels IS NULL AND privacy_suppression_id IS NOT NULL FROM probate_notices "
+        "WHERE id = ANY(CAST(:i AS uuid[]))"), {"i": ids}).all())
+    assert left == {rep: True, other_parcel: False, no_parcel: False,
+                    recorder_order: False, no_reps: False, unreadable: False}
 
 
 def test_a_withheld_probate_notice_can_never_keep_a_person(s):

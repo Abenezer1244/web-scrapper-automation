@@ -8,6 +8,9 @@ dict(row, NAME=...) so each rule is pinned on the real field layout.
 import json
 from pathlib import Path
 
+import pytest
+
+from src.scrapers.enrichment import asotin_parcels as ap
 from src.scrapers.enrichment.asotin_parcels import (
     Person,
     mailing_of,
@@ -263,3 +266,42 @@ def test_numbers_in_text_fields_are_a_failed_answer():
         with pytest.raises(LayerError):
             parse_layer_response({"features": [{"attributes": bad}]})
     assert parse_layer_response({"features": [{"attributes": dict(_ROWS[0], Prop_ID=4687)}]})
+
+
+@pytest.mark.parametrize(("surname", "where"), [
+    ("Holloway", "NAME LIKE '%HOLLOWAY%'"),
+    ("O'BRIEN", "NAME LIKE '%BRIEN%'"),          # no quote ever reaches the clause
+    ("SMITH-JONES", "NAME LIKE '%SMITH%'"),       # first of two equal runs
+    ("VAN-DER-BERG", "NAME LIKE '%BERG%'"),
+    ("NG", "NAME LIKE '%NG%'"),
+])
+def test_the_where_clause_carries_letters_only(surname, where):
+    assert ap.surname_where(surname) == where
+
+
+@pytest.mark.parametrize("surname", [
+    "SMITH\n",                                    # '$' alone would let a newline through
+    "SMITH' OR '1'='1", "SMITH%", "SMITH_", "SMITH;", "A", "'SMITH", "-SMITH",
+    "A-B", "O'O", "", "S" * 42, "MÜLLER",
+])
+def test_anything_but_a_plain_name_is_refused(surname):
+    with pytest.raises(ValueError):
+        ap.surname_where(surname)
+
+
+def test_a_truncated_answer_is_a_failed_lookup_not_a_short_list():
+    with pytest.raises(ap.LayerError):
+        ap.parse_layer_response({"features": [], "exceededTransferLimit": True})
+
+
+def test_a_surname_the_layer_cannot_be_asked_about_holds_the_notice():
+    # match_notice asks through surname_where; a refused surname is held, never failed
+    # (a failed notice is re-checked forever) and never a crash.
+    from src.workers.probate_ingest import match_notice
+
+    def lookup(surname):
+        ap.surname_where(surname + "\n")          # refused, as an unsafe surname is
+        return []
+
+    assert match_notice("MARGARET J. HOLLOWAY", [], None, lookup) == (
+        "held", ["surname_not_queryable"], [])

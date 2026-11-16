@@ -14,15 +14,15 @@ tax_delinquent until the crawl covers >=95% of Ferry's parcels.
 
 Data INSERT only. Idempotent: WHERE NOT EXISTS on (county, state, scraper_class).
 
-Revision ID: 164
-Revises: 163
+Revision ID: 165
+Revises: 164
 Create Date: 2026-11-15
 """
 
 from alembic import op
 
-revision = "164"
-down_revision = "163"
+revision = "165"
+down_revision = "164"
 branch_labels = None
 depends_on = None
 
@@ -31,11 +31,11 @@ _ARCHIVES = "https://digitalarchives.wa.gov/Collections/TitleInfo/3007"
 # Fixed ids: downgrade removes exactly the rows this migration inserted (Codex).
 _ROWS = (
     # (id, record_types, scraper_class, render_mode, base_url)
-    ("f3e0a7c1-0019-4d63-9a01-000000000164", '["tax_delinquent"]',
+    ("f3e0a7c1-0019-4d63-9a01-000000000165", '["tax_delinquent"]',
      "src.scrapers.ferry_wa_tax_delinquent.FerryWATaxDelinquentScraper", "static", _TAXSIFTER),
-    ("f3e0a7c1-0019-4d63-9a02-000000000164", '["probate"]',
+    ("f3e0a7c1-0019-4d63-9a02-000000000165", '["probate"]',
      "src.scrapers.ferry_wa_court_index.FerryWAProbateScraper", "playwright", _ARCHIVES),
-    ("f3e0a7c1-0019-4d63-9a03-000000000164", '["divorce"]',
+    ("f3e0a7c1-0019-4d63-9a03-000000000165", '["divorce"]',
      "src.scrapers.ferry_wa_court_index.FerryWADivorceScraper", "playwright", _ARCHIVES),
 )
 

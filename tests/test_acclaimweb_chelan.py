@@ -301,6 +301,116 @@ async def test_douglas_grid_parcel_of_another_shape_is_kept_for_review_not_keyed
     assert recs[0].enrichment_data["grid_parcel_unmatched"] == "123456789012"
 
 
+async def test_douglas_lists_a_recording_twice_and_it_is_read_once(browser):
+    # Live 10/19/2026: 50 rows, Total 50, one SURVEYS FOR AUDITOR listed twice (only GUID differs).
+    data = copy.deepcopy(_DOUGLAS)
+    lis = next(r for r in data["Data"] if r["DocTypeDescription"] == "LIS PENDENS")
+    data["Data"].append({**lis, "GUID": "another-guid"})
+    data["Total"] = len(data["Data"])
+    page = await _portal(browser, [data], first_body="sort=&group=&filter=")
+    s = _scraper(page, cls=DouglasAcclaimWebScraper, record_type="pre_foreclosure")
+    recs = await s._search_and_read("10/06/2026", "10/06/2026")
+    assert len(recs) == 1
+
+
+async def test_a_paged_grid_repeating_an_identical_row_still_fails(browser):
+    # Paged (Chelan): a repeat can be a repeated page hiding a missed row, so no collapse.
+    pages = copy.deepcopy(_PAGES)
+    pages[3]["data"].append({**pages[3]["data"][0], "GUID": "another-guid"})
+    for p in pages:
+        p["total"] = 44
+    s = _scraper(await _portal(browser, pages))
+    with pytest.raises(ScraperExecutionError, match="distinct"):
+        await s._search_and_read("10/07/2026", "10/07/2026")
+
+
+_KENDO_SINGLE = """<html><body><input id="RecordDatePicker">
+<script>
+const picker = {value(v) { document.getElementById('RecordDatePicker').value = v; }, trigger() {}};
+window.$ = (sel) => ({data: (k) => (sel === '#RecordDatePicker' && k === 'kendoDatePicker') ? picker : undefined});
+</script></body></html>"""
+
+
+class _SearchesThroughFillDates(DouglasAcclaimWebScraper):
+    """The real _fill_dates on a page whose only date field is a Kendo single picker."""
+
+    async def navigate(self, url):
+        self.searched = []
+        await self.page.goto(url)
+
+    async def _accept_disclaimer(self):
+        pass
+
+    async def _go_to_search(self):
+        pass
+
+    async def _search_and_read(self, date_from, date_to):
+        self.searched.append(await self.page.input_value("#RecordDatePicker"))
+        return []
+
+
+async def test_a_kendo_single_date_site_searches_every_day_of_the_window(browser):
+    page = await browser.new_page()
+    await page.route(f"{_SEARCH}*", lambda r: r.fulfill(status=200, content_type="text/html",
+                                                        body=_KENDO_SINGLE))
+    s = _SearchesThroughFillDates(f"{_HOST}/AcclaimWeb", "douglas", "WA",
+                                  record_types=["pre_foreclosure"], record_type="pre_foreclosure")
+    s.page = page
+    await s.scrape("10/01/2026", "10/09/2026")
+    # Pre-detection only knows #RecordDate; the fill finds the single picker and the loop
+    # must then step one day at a time through the end date (Codex), not a week.
+    assert s.searched == [f"10/0{d}/2026" for d in range(1, 10)]
+
+
+async def test_a_repeated_item_that_differs_is_still_a_failed_read(browser):
+    data = copy.deepcopy(_DOUGLAS)
+    lis = next(r for r in data["Data"] if r["DocTypeDescription"] == "LIS PENDENS")
+    data["Data"].append({**lis, "GUID": "another-guid", "DirectName": "SOMEONE ELSE"})
+    data["Total"] = len(data["Data"])
+    page = await _portal(browser, [data], first_body="sort=&group=&filter=")
+    s = _scraper(page, cls=DouglasAcclaimWebScraper, record_type="pre_foreclosure")
+    with pytest.raises(ScraperExecutionError, match="distinct"):
+        await s._search_and_read("10/06/2026", "10/06/2026")
+
+
+class _NoDateFieldYet:
+    """A page whose date fields are not on it yet when scrape() looks (live Douglas 2026-11-15)."""
+    url = "https://edocs.douglascountywa.gov/AcclaimWeb/search/SearchTypeRecordDate"
+
+    def locator(self, _sel):
+        raise RuntimeError("not loaded")
+
+
+class _RecordsSearches(DouglasAcclaimWebScraper):
+    async def navigate(self, url):
+        self.searched = []
+
+    async def _accept_disclaimer(self):
+        pass
+
+    async def _go_to_search(self):
+        pass
+
+    async def _fill_dates(self, date_from, date_to):
+        pass
+
+    async def _search_and_read(self, date_from, date_to):
+        self.searched.append((date_from, date_to))
+        return []
+
+
+@pytest.mark.parametrize("window,expected", [
+    (("10/19/2026", "10/19/2026"), [("10/19/2026", "10/19/2026")]),
+    (("10/01/2026", "10/08/2026"), [("10/01/2026", "10/08/2026")]),
+])
+async def test_a_window_is_always_searched_even_when_its_date_mode_was_not_detected(window, expected):
+    s = _RecordsSearches("https://edocs.douglascountywa.gov/AcclaimWeb", "douglas", "WA",
+                         record_types=["pre_foreclosure"], record_type="pre_foreclosure")
+    s.page = _NoDateFieldYet()
+    assert await s.scrape(*window) == []
+    assert s.searched == expected  # never zero searches reported as a zero
+
+
 async def test_other_acclaimweb_sites_never_key_on_the_grid_parcel(browser):
     page = await _portal(browser, [_DOUGLAS], first_body="sort=&group=&filter=")
     s = _scraper(page, cls=AcclaimWebScraper, record_type="pre_foreclosure")
@@ -380,6 +490,38 @@ def test_douglas_probate_document_names_from_its_live_list(desc):
 @pytest.mark.parametrize("desc", ["REAL ESTATE CONTRACT", "DEED OF TRUST", "TRUST"])
 def test_douglas_probate_terms_do_not_admit_ordinary_documents(desc):
     assert not _doc_type_matches(desc, DouglasAcclaimWebScraper.DOC_TYPE_MAP["probate"])
+
+
+@pytest.mark.parametrize("desc,hit", [("DEATH CERTIFICATE", True), ("AFFIDAVIT OF DEATH", False),
+                                      ("TRANSFER ON DEATH DEED", False), ("AFFI DEATH JOINT TENANT", False)])
+def test_douglas_death_certificate_is_the_recorded_certificate_only(desc, hit):
+    assert _doc_type_matches(desc, DouglasAcclaimWebScraper.DOC_TYPE_MAP["death_certificate"]) is hit
+
+
+def test_death_certificate_scope_is_the_recorders_own_document_type():
+    for cls in (ChelanAcclaimWebScraper, DouglasAcclaimWebScraper):
+        scope = cls.collection_scope("death_certificate")
+        assert scope.kind == "document_type"
+        assert [i.label for i in scope.items] == ["Death Certificate"]
+    # A site with no death_certificate vocabulary does not claim the document type.
+    generic = AcclaimWebScraper.collection_scope("death_certificate")
+    assert generic is None or generic.kind != "document_type"
+
+
+async def test_douglas_death_certificate_names_the_decedent_and_keeps_its_parcel(browser):
+    data = copy.deepcopy(_DOUGLAS)
+    dc = copy.deepcopy(data["Data"][0])
+    dc.update(DocTypeDescription="DEATH CERTIFICATE", DirectName="STATE OF WASHINGTON",
+              IndirectName="DOE JOHN A ESTATE OF", ParcelNumber="01234567890",
+              InstrumentNumber="9990001", TransactionItemId=9990001)
+    data["Data"].append(dc)
+    data["Total"] = len(data["Data"])
+    page = await _portal(browser, [data], first_body="sort=&group=&filter=")
+    s = _scraper(page, cls=DouglasAcclaimWebScraper, record_type="death_certificate")
+    recs = await s._search_and_read("10/06/2026", "10/06/2026")
+    assert len(recs) == 1
+    assert recs[0].party_name == "DOE JOHN A"
+    assert recs[0].parcel_id == "01234567890"  # leading zero kept, string
 
 
 def test_douglas_release_of_lis_pendens_is_not_a_lead():

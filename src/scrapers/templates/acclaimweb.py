@@ -150,6 +150,8 @@ _CHELAN_DOC_TYPE_MAP = {
 _DOUGLAS_DOC_TYPE_MAP = {
     **_DOC_TYPE_MAP,
     "probate": [*_DOC_TYPE_MAP["probate"], "HEIRSHIP", "TESTAMENTARY"],
+    # Recorded death certificates alone (21 in the 12 months to 2026-11-15; 6 carry a parcel).
+    "death_certificate": ["DEATH CERTIFICATE"],
 }
 
 
@@ -171,6 +173,19 @@ def _grid_date(value: object) -> str | None:
         return datetime.strptime(m.group(0), "%m/%d/%Y").strftime("%m/%d/%Y") if m else None
     except (ValueError, OverflowError, OSError):
         return None  # not a real date: the caller treats it as schema drift
+
+
+def _only_twins(rows: list) -> bool:
+    """True when every repeated TransactionItemId repeats an identical row (but for GUID)."""
+    first: dict = {}
+    for r in rows:
+        if not isinstance(r, dict):
+            return False
+        key = r.get("TransactionItemId")
+        bare = {k: v for k, v in r.items() if k != "GUID"}
+        if first.setdefault(key, bare) != bare:
+            return False
+    return True
 
 
 def _grid_item(row: dict) -> dict:
@@ -246,7 +261,19 @@ class AcclaimWebScraper(BridgeScraper):
 
     @classmethod
     def collection_scope(cls, record_type: str):
-        """SHOW descriptor derived from this site's own DOC_TYPE_MAP."""
+        """SHOW descriptor derived from this site's own DOC_TYPE_MAP.
+
+        The shared keyword presentation has no death_certificate entry; a site that
+        collects it (Chelan, Douglas) uses the recorder's own DEATH CERTIFICATE document
+        type, shown as King's is."""
+        if record_type == "death_certificate" and record_type in cls.DOC_TYPE_MAP:
+            from src.scrapers.doc_scope import CollectionScope, DocTypeItem
+
+            return CollectionScope(
+                kind="document_type",
+                items=(DocTypeItem(label="Death Certificate", exact=False),),
+                note="Recorded death certificates (the recorder's own death certificate document type).",
+            )
         from src.scrapers.doc_scope import from_keyword_map
 
         return from_keyword_map(cls.DOC_TYPE_MAP, record_type)
@@ -340,7 +367,11 @@ class AcclaimWebScraper(BridgeScraper):
         # scheduler re-runs it) — we never swallow a bad chunk and continue, which
         # would silently under-deliver a partial date window under a DONE job.
         # A single-date site searches one day per chunk, so date_to itself is a chunk.
-        while chunk_start < end or (self._single_date_mode and chunk_start == end):
+        # A one-day window is always searched once: without that, a site whose single
+        # date field was not yet on the page at pre-detection (Douglas, live 2026-11-15)
+        # ran no search at all and reported a verified-looking zero.
+        searched = False
+        while chunk_start < end or (chunk_start == end and (self._single_date_mode or not searched)):
             # Use 1-day chunks in single-date mode, 7-day chunks otherwise
             effective_days = 1 if self._single_date_mode else chunk_days
             chunk_end = min(chunk_start + timedelta(days=effective_days), end)
@@ -356,6 +387,7 @@ class AcclaimWebScraper(BridgeScraper):
 
             await self._fill_dates(cf, ct)
             chunk_records = await self._search_and_read(cf, ct)
+            searched = True
 
             new_count = self.dedupe_extend(chunk_records, seen_hashes, all_records)
 
@@ -579,6 +611,9 @@ class AcclaimWebScraper(BridgeScraper):
             _logger.info("Kendo fill result: %s", filled)
 
             if filled in ('kendo_ok', 'kendo_single'):
+                if filled == 'kendo_single':
+                    # One date was searched: the loop must step a day, not a week (Codex).
+                    self._single_date_mode = True
                 await self.page.wait_for_timeout(1_000)
                 return
 
@@ -849,6 +884,13 @@ class AcclaimWebScraper(BridgeScraper):
         if not all(isinstance(r, dict) for r in rows):
             raise _fail("grid row is not an object (schema drift)")
         ids = {r.get("TransactionItemId") for r in rows}
+        if len(rows) == total and len(ids) != total and "page" not in form and _only_twins(rows):
+            # Douglas's one unpaged answer can list a recording twice, identical but for
+            # its row GUID, and count both (10/19/2026: a SURVEYS FOR AUDITOR). Every row
+            # was read; the twin is the same document. A paged grid stays strict: there a
+            # repeat can be a repeated page hiding missed rows.
+            rows = list({r.get("TransactionItemId"): r for r in rows}.values())
+            total = len(rows)
         if len(rows) != total or len(ids) != total:
             raise _fail(f"read {len(rows)} grid rows ({len(ids)} distinct) of {total}")
         lo = datetime.strptime(date_from, "%m/%d/%Y").date()
@@ -1124,6 +1166,16 @@ class DouglasAcclaimWebScraper(AcclaimWebScraper):
     DOC_TYPE_MAP = _DOUGLAS_DOC_TYPE_MAP
     GRID_PARCEL_SHAPE = re.compile(r"\d{11}")
 
+    def _records_from_raw(self, raw: list[dict]) -> list[ScrapedRecord]:
+        """Douglas indexes a death certificate's decedent as "<NAME> ESTATE OF"."""
+        records = super()._records_from_raw(raw)
+        if self.active_record_type in ("probate", "death_certificate"):
+            from src.scrapers.probate import strip_inverted_estate_caption
+
+            for r in records:
+                r.party_name = strip_inverted_estate_caption(r.party_name)
+        return records
+
 
 class ChelanAcclaimWebScraper(AcclaimWebScraper):
     """Chelan County's AcclaimWeb: same portal, its own document codes."""
@@ -1131,20 +1183,6 @@ class ChelanAcclaimWebScraper(AcclaimWebScraper):
     DOC_TYPE_MAP = _CHELAN_DOC_TYPE_MAP
     READS_DETAIL_APN = True
     APN_SHAPE = re.compile(r"\d{12}")  # Chelan parcel numbers: 12 digits
-
-    @classmethod
-    def collection_scope(cls, record_type: str):
-        """The shared keyword presentation has no death_certificate entry; Chelan's is
-        the recorder's own DEATH CERTIFICATE (DC) document type, shown as King's is."""
-        if record_type != "death_certificate":
-            return super().collection_scope(record_type)
-        from src.scrapers.doc_scope import CollectionScope, DocTypeItem
-
-        return CollectionScope(
-            kind="document_type",
-            items=(DocTypeItem(label="Death Certificate", exact=False),),
-            note="Recorded death certificates (the recorder's DC document code).",
-        )
 
     async def discover(self, date_from: str, date_to: str, codes: set[str]) -> list[dict]:
         """Every recorded document with one of ``codes`` in the window (MM/DD/YYYY,

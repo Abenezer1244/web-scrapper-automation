@@ -1987,7 +1987,7 @@ class NtsNotice(Base):
     # never writes it) and read by every pass, live or past: a cancelled sale is never
     # an auction lead and never stamps an auction onto a pre-foreclosure lead.
     cancelled_at = Column(DateTime(timezone=True), nullable=True)
-    # Migration 163: 'assessor_situs' when property_address is the parcel's current site
+    # Migration 164: 'assessor_situs' when property_address is the parcel's current site
     # address, looked up and frozen at approval; 'notice' when it is what the notice
     # printed; NULL for every older row and other source. address_on_notice keeps the
     # printed address when the assessor's replaced it.

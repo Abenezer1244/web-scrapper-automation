@@ -214,7 +214,7 @@ def _record_from_notice(notice: NtsNotice) -> ScrapedRecord:
             "source": notice.source,
             "source_url": notice.source_url,
             # The address the notice printed, when property_address is the parcel's
-            # current site address instead (migration 163); None otherwise.
+            # current site address instead (migration 164); None otherwise.
             "address_on_notice": (
                 notice.address_on_notice if notice.address_source == "assessor_situs" else None
             ),

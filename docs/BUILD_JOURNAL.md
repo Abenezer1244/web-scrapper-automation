@@ -19,6 +19,45 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-11-16 — Chelan notices take the parcel's current address (#650); follow-up tests
+
+**Built / Shipped:**
+- **#650** (`6475d4e1`, deployed; prod alembic 164). The 2026-11-15 entry listed this as pending.
+  - Migration 164: `nts_notices.address_source` (`assessor_situs` | `notice`) and `address_on_notice`.
+  - `approve` looks up the parcel's site address (`lookup_parcel_situs`, via `enrich_parcel_gis`, the same form pre-foreclosure enrichment stores) before taking the lock, and freezes it on the notice. `--keep-notice-address` opts out.
+  - `refresh-address` does the same for notices approved earlier. It is refused once the notice has been delivered as a trustee-sale lead, or while a trustee-sale run in its county is unfinished.
+  - `_TrusteeSaleScraper.scrape` reads notices under `NTS_CANCEL_LOCK_KEY`, shared.
+- **REC-2628915** refreshed in production: `170 HILL STREET` became `62 VILLAGE VISTA LN MANSON, WA 98831`, the same as the parcel's pre-foreclosure lead. The printed address is kept in `address_on_notice`. No customer had a Chelan trustee-sale scraper configuration, and `refresh-address`'s own check found no delivered trustee-sale lead for the notice, so nothing had gone out with the old address.
+- **Frontend #329** (`93c6b09b`, live): the Dependabot critical and highs are cleared.
+- **This PR:** two tests for gaps Codex left open.
+  - `tests/test_stale_doc_type_worker.py` runs the real `run_scrape_job` on a stale selection. The job fails with the customer copy, is not re-queued, nothing is billed or held, and it is reported once.
+  - `tests/test_nts_refresh_concurrency.py` runs two real sessions: a trustee-sale read during an uncommitted refresh waits and then sees the new address, and the scraper's shared lock is released once its read is done.
+  - Each test was shown to fail with the code it guards disabled. The race test watches `pg_locks` for the reader's queued lock rather than sleeping.
+
+**Tried / Decided:**
+- Codex chose an approval-time, frozen address over a scrape-time lookup: a layer outage would otherwise flip a lead's `dedup_hash` between runs and bill twice.
+- Codex chose a guarded refresh command over silently rewriting delivered leads.
+
+**Failed / Blocked:**
+- Main gained Columbia's migration 163 while #650 was in review; ours was renumbered to 164.
+- The permission classifier refused `git push`, `gh pr merge --auto` and an amended commit pushed together. The owner ran those. A short SHA was rejected by `--match-head-commit`; the full SHA is required.
+- #650's Test job took 45 minutes, against about 31 before.
+
+**Caught & fixed:**
+- **Codex review of #650, NO-GO twice:**
+  - A refresh could commit while a trustee-sale run held the old address.
+  - A run starting after the refresh's active-job check could still read the old address. Fixed by the scraper's shared lock.
+
+**Pending / Handoff:**
+- **Chelan review queue:** newly staged recordings still need operator approval or rejection.
+- **Dev-only dependency alerts:** 12 remain, waiting on typescript-eslint and ts-morph; deepmerge has no fix.
+
+**Facts learned:**
+- A trustee's "more commonly known as" address can be years stale. The parcel and legal description are the reliable identity.
+- The trustee-sale scraper's freshness and cancellation guarantees now include the shared cancellation lock on its notice read; Benton cancellations and refreshes can briefly delay it.
+
+---
+
 ## 2026-11-16 — Asotin parcel-layer query: letters only (branch `fix/asotin-arcgis-letters-only`)
 
 **Built / Shipped:** `src/scrapers/enrichment/asotin_parcels.py` `surname_where()`. The where clause now

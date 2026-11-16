@@ -44,8 +44,13 @@ def db():
         s.commit()
 
 
+# The pages' own "as of" is 2026-11-12: the crawl runs "that day", or every answer is stale.
+_NOW = datetime(2026, 11, 12, 18, 0, tzinfo=UTC)
+
+
 def _fetch(url: str) -> dict:
-    return json.loads((_FIX / "wa_statewide_asotin_3_parcels.json").read_text(encoding="utf-8"))
+    layer = json.loads((_FIX / "wa_statewide_asotin_3_parcels.json").read_text(encoding="utf-8"))
+    return {"count": len(layer["features"])} if "returnCountOnly" in url else layer
 
 
 def _resolve(county, parcel_ids, *, time_budget_s):
@@ -64,7 +69,7 @@ def _rows(db) -> dict:
 
 class TestCrawl:
     def test_inventory_then_one_pass(self, db):
-        summary = crawler.crawl_county("asotin", db, fetch=_fetch, resolve=_resolve)
+        summary = crawler.crawl_county("asotin", db, fetch=_fetch, resolve=_resolve, now=_NOW)
         assert summary["inventory_added"] == 3
         assert (summary["asked"], summary["settled"], summary["owing"]) == (2, 2, 1)
         rows = _rows(db)
@@ -79,37 +84,38 @@ class TestCrawl:
         assert unreached.attempted_at is None and unreached.checked_at is None
 
     def test_a_failed_answer_keeps_the_last_good_row(self, db):
-        crawler.crawl_county("asotin", db, fetch=_fetch, resolve=_resolve)
+        crawler.crawl_county("asotin", db, fetch=_fetch, resolve=_resolve, now=_NOW)
         before = _rows(db)[_OWING]
 
         def broken(county, parcel_ids, *, time_budget_s):
             return {pid: pacs_tax.TaxAnswer("unparsed") for pid in parcel_ids}
 
-        crawler.crawl_county("asotin", db, fetch=_fetch, resolve=broken)
+        crawler.crawl_county("asotin", db, fetch=_fetch, resolve=broken,
+                             now=_NOW + timedelta(hours=1))
         after = _rows(db)[_OWING]
         assert after.delinquent_amount == before.delinquent_amount
         assert after.checked_at == before.checked_at      # freshness did not move
         assert after.attempted_at > before.attempted_at   # but it rotated back
 
     def test_a_page_for_another_parcel_is_not_an_answer(self, db):
-        crawler.crawl_county("asotin", db, fetch=_fetch, resolve=_resolve)
+        crawler.crawl_county("asotin", db, fetch=_fetch, resolve=_resolve, now=_NOW)
         before = _rows(db)[_OWING]
 
         def mismatch(county, parcel_ids, *, time_budget_s):
             return {pid: pacs_tax.TaxAnswer("parcel_mismatch") for pid in parcel_ids}
 
-        crawler.crawl_county("asotin", db, fetch=_fetch, resolve=mismatch)
+        crawler.crawl_county("asotin", db, fetch=_fetch, resolve=mismatch, now=_NOW)
         after = _rows(db)[_OWING]
         assert (after.delinquent_amount, after.outcome) == (before.delinquent_amount, "found")
         assert after.checked_at == before.checked_at  # never counted as coverage
 
     def test_the_inventory_is_read_once_a_week_not_every_run(self, db):
-        crawler.crawl_county("asotin", db, fetch=_fetch, resolve=_resolve)
+        crawler.crawl_county("asotin", db, fetch=_fetch, resolve=_resolve, now=_NOW)
 
         def no_fetch(url):
             raise AssertionError("inventory re-read inside its week")
 
-        crawler.crawl_county("asotin", db, fetch=no_fetch, resolve=_resolve)
+        crawler.crawl_county("asotin", db, fetch=no_fetch, resolve=_resolve, now=_NOW)
 
     def test_a_layer_without_features_is_an_error_not_an_empty_county(self):
         with pytest.raises(ValueError):
@@ -127,6 +133,9 @@ def _seed(db, parcel: str, *, owing: str, oldest: int | None, owner=True, mailin
          "own": "OWNER REDACTED" if owner else None, "situs": "1 TEST ST, CLARKSTON, WA 99403",
          "mail": "PO BOX 1, CLARKSTON, WA 99403" if mailing else None,
          "chk": datetime.now(UTC) if checked else datetime.now(UTC) - timedelta(days=30)})
+    from src.scrapers.enrichment.source_health import mark_source_healthy
+
+    mark_source_healthy(db, "pacs_tax_inventory:asotin")  # the crawl's weekly inventory
 
 
 class TestScraper:

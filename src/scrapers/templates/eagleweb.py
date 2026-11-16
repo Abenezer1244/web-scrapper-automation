@@ -107,6 +107,11 @@ _RECORDED_DOCUMENT_MAX_BYTES = 15_000_000
 _RECORDED_DOCUMENT_TIMEOUT_MS = 60_000
 _RECORDED_DOCUMENT_MAX_PAGES = 20   # a recorded NTS runs 4-6 pages
 _RECORDED_DOCUMENT_MIN_TEXT = 200   # characters; below this the PDF is a scan without text
+# Record types whose parcel is read off the recording's cover sheet (a recorded death
+# certificate: live 2026-11-15, 6 of 11 Benton certificates had no full parcel in the index).
+_COVER_SHEET_PARCEL_TYPES = frozenset({"probate", "death_certificate"})
+# Wall-clock budget for one run's cover-sheet reads (the job's own limit is 30 minutes).
+_COVER_SHEET_BUDGET_S = 15 * 60
 
 
 def _pdf_page_count(data: bytes) -> int:
@@ -320,6 +325,9 @@ class EagleWebScraper(BridgeScraper):
 
         if self.county.lower() in _RECORDED_DOCUMENT_PARCEL_COUNTIES and self.active_record_type == "pre_foreclosure":
             await self._fill_parcels_from_recorded_documents(all_records)
+        elif (self.county.lower() in _RECORDED_DOCUMENT_PARCEL_COUNTIES
+              and self.active_record_type in _COVER_SHEET_PARCEL_TYPES):
+            await self._fill_parcels_from_cover_sheets(all_records)
 
         # Drop records without parcel_id if required — these are upstream
         # data gaps (e.g., Thurston death certificates with empty Parcel
@@ -408,6 +416,105 @@ class EagleWebScraper(BridgeScraper):
         _logger.info("%s: parcels from recorded documents %s", self.county, counts)
         if todo and counts["failed"] == len(todo):
             raise RuntimeError(f"{self.county}: no recorded document could be read; results incomplete")
+
+    async def _fill_parcels_from_cover_sheets(self, records: list[ScrapedRecord]) -> None:
+        """Set the parcel of each parcel-less row from its recording's cover sheet.
+
+        Outcome per row in enrichment_data["recording_apn_lookup"], the vocabulary the
+        AcclaimWeb counties use (src/scrapers/sources/recording_cover_sheet.py): only a
+        "none" row (the recording names no parcel) may be looked up by owner name later
+        (enrich.name_lookup_eligible).
+
+        Failures are split (Codex P2):
+        - the document itself cannot be used (no link, not a PDF, too long, no text
+          layer): the row is saved "unreadable", which blocks the name lookup. A re-run
+          would meet the same document, so failing the run would only repeat.
+        - the fetch failed in transit (twice): TransientScrapeError before anything is
+          saved, so the job re-runs instead of saving a row a re-run could not repair.
+        - more parcel-less rows than the cap: a permanent ScraperExecutionError asking
+          for a shorter window (retrying the same window cannot help).
+        """
+        import time
+        from urllib.parse import parse_qs, urlparse
+
+        from src.scrapers.reliability import ScraperExecutionError, TransientScrapeError
+        from src.scrapers.sources.recording_cover_sheet import CoverSheetParcel
+
+        portal_host = urlparse(self.base_url).hostname
+        todo = [r for r in records if not r.parcel_id]
+        if len(todo) > _RECORDED_DOCUMENT_CAP:
+            raise ScraperExecutionError(
+                self.county, "EagleWeb",
+                f"{len(todo)} recordings need a cover-sheet read, over the {_RECORDED_DOCUMENT_CAP} "
+                "per run; run a shorter date range", record_type=self.active_record_type)
+        deadline = time.monotonic() + _COVER_SHEET_BUDGET_S
+        for i, record in enumerate(todo):
+            href = urlparse(getattr(record, "_document_href", None) or "")
+            q = parse_qs(href.query)
+            name, doc_id, parent = (q.get(k, [""])[0] for k in ("docName", "id", "parent"))
+            if href.hostname != portal_host or not (
+                    re.fullmatch(r"\d{4}_\d{6}", name) and re.fullmatch(r"DOC\w+\.A0", doc_id)
+                    and re.fullmatch(r"DOC\w+", parent)):
+                got = CoverSheetParcel("unreadable", evidence="no document link in the index row")
+            else:
+                if time.monotonic() > deadline:
+                    raise TransientScrapeError(self.county, "EagleWeb",
+                                               f"cover-sheet reads ran past {_COVER_SHEET_BUDGET_S}s",
+                                               record_type=self.active_record_type)
+                got = await self._read_cover_sheet(
+                    f"https://{portal_host}/recorder/eagleweb/downloads/{name}.pdf?id={doc_id}&parent={parent}",
+                    name, getattr(record, "_index_parcel_prefix", None), delay_first=bool(i))
+            record.enrichment_data["recording_apn_lookup"] = got.outcome
+            record.enrichment_data["recording_apn_evidence"] = got.evidence
+            if got.outcome == "found":
+                record.parcel_id = got.parcel
+                record.enrichment_data["parcel_source"] = "recorded_document"
+            elif got.candidates:
+                record.enrichment_data["apn_candidates"] = got.candidates
+        outcomes = [r.enrichment_data["recording_apn_lookup"] for r in todo]
+        _logger.info("%s: cover-sheet parcels %s", self.county,
+                     {o: outcomes.count(o) for o in sorted(set(outcomes))})
+
+    async def _read_cover_sheet(self, url: str, name: str, prefix: str | None, *, delay_first: bool):
+        """One recording's cover-sheet outcome. A transit failure twice raises
+        TransientScrapeError; a document that is not usable is "unreadable"."""
+        from src.scrapers.reliability import TransientScrapeError
+        from src.scrapers.sources.nts_pdf import extract_pdf_text as extract
+        from src.scrapers.sources.recording_cover_sheet import (
+            CoverSheetParcel,
+            has_parcel_field,
+            read_cover_sheet_parcel,
+        )
+
+        data = None
+        why = ""
+        for attempt in (1, 2):
+            if delay_first or attempt == 2:
+                await self.polite_delay()
+            try:
+                data = await self._fetch_document(url)
+                break
+            except ValueError as exc:  # "not a PDF": the document, not the transport
+                return CoverSheetParcel("unreadable", evidence=f"document unusable ({exc})")
+            except Exception as exc:  # noqa: BLE001 -- transport; retried once, then raised
+                if "too large" in str(exc):
+                    return CoverSheetParcel("unreadable", evidence="document unusable (too large)")
+                why = type(exc).__name__
+        if data is None:
+            raise TransientScrapeError(self.county, "EagleWeb", f"recorded document {name} not fetched ({why})",
+                                       record_type=self.active_record_type)
+        try:
+            if _pdf_page_count(data) > _RECORDED_DOCUMENT_MAX_PAGES:
+                return CoverSheetParcel("unreadable", evidence="document unusable (too many pages)")
+            text = extract(data, max_pages=1)  # RCW 65.04.045: the cover sheet is page one
+            if not has_parcel_field(text):
+                # Some filers put their own sheet first: look one page further (Codex P2).
+                text = extract(data, max_pages=2)
+        except Exception as exc:  # noqa: BLE001 -- a corrupt PDF is the document, not the fetch
+            return CoverSheetParcel("unreadable", evidence=f"document unusable ({type(exc).__name__})")
+        if len(text.strip()) < _RECORDED_DOCUMENT_MIN_TEXT:
+            return CoverSheetParcel("unreadable", evidence="document unusable (no text layer)")
+        return read_cover_sheet_parcel(text, prefix)
 
     async def _fetch_document(self, url: str) -> bytes:
         """One recorded-document PDF, fetched inside the portal page (its session)."""
@@ -1200,6 +1307,11 @@ class EagleWebScraper(BridgeScraper):
                 # A plain attribute, not a field: to_dict() (every hash, every saved
                 # row) never sees it, so it cannot move identity or reach a Result.
                 record._document_href = item.get("attachHref") or None
+                # The index's truncated parcel ("Parcel: 1079810..."), from the raw
+                # summary: legal_description is only set for some rows and is cut to
+                # 200 characters, so the cover-sheet check cannot rely on it (Codex P1).
+                _prefix = re.search(r"Parcel:\s*(\d{4,})\.\.\.", f"{summary} {desc}", re.I)
+                record._index_parcel_prefix = _prefix.group(1) if _prefix else None
 
                 # Parse date
                 date_match = re.search(r"(\d{1,2}/\d{1,2}/\d{4})", summary)

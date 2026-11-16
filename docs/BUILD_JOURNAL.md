@@ -19,6 +19,228 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-11-15 — Probate representatives in deletion, and a guarded Current Owner (branch `fix/probate-rep-erasure-owner`)
+
+**Built / Shipped:**
+- `src/privacy/authorize.py`: `authorize()` takes `extra_subjects`, people tied to a row who are not in
+  its columns. `natural_order_subjects()` reads them one name at a time, in natural order, with role
+  `contact`.
+- `src/privacy/erase.py` `_scan_probate`: also judges each notice's `personal_reps`. A representative's
+  own deletion rule on any tied parcel now erases (tombstones) the whole notice.
+- `src/workers/probate_ingest.py`: the ingest and re-check gate passes the representatives too, so such a
+  notice is stored as a `withheld` tombstone. `Gate` is now `(parcels, county, reps)`.
+- `src/utils/lead_formatting.py` `current_owner_fields()`, used by both writers in
+  `tasks_helpers/enrich.py` (King, and the PACS path #642 added for every PACS county, Asotin included)
+  and by `scripts/backfill_king_probate_current_owner.py`: an owner string with
+  care-of or representative wording (C/O, C\O, CARE OF, ATTN, PR, PERS/PER/PERSONAL REP, executor,
+  administrator) leaves Current Owner and Title Status blank. Re-enrichment removes a stored pair.
+
+**Tried / Decided:**
+- The owner first approved removing Current Owner for probate. That rested on my wrong claim that the
+  field was filled for every county; it is filled only for King. A read-only production count found
+  2,000 stored King values (1,947 probate, 53 death certificate), none with care-of or representative
+  wording. The owner then chose "guard, keep": nothing customers see today changes.
+- Codex reviewed every phase. Phase C was NO-GO on four Mediums, all handled:
+  - A bare `CO` hid companies, so it was dropped.
+  - The backfill script bypassed the guard, so it now goes through the helper.
+  - `CARE-OF` is covered, and `REP` matches only as a whole word.
+  - Stored pairs that re-enrichment never selects: no sweep. Production has 0 matching values with the
+    final regex, and both writers are guarded. Codex accepted this.
+- Representatives are read in natural order, because notices print them that way. Probate's recorder
+  order would read "GLENN WEBER" with GLENN as the surname. A test pins this.
+- The gate still keeps nobody under review. A representative named without the rule's parcel (REVIEW)
+  withholds the notice, exactly as a decedent already did. A test pins this.
+
+**Failed / Blocked:**
+- My first re-check test committed a privacy rule: `rematch_due` commits per notice, and rules can never be
+  deleted. It now runs in a rolled-back outer transaction, with each commit a savepoint.
+- While clearing those leaked rows from the local test database, I disabled and re-enabled the table's
+  triggers. Re-enabling reset `privacy_suppressions_no_update` from ALWAYS to ORIGIN, which
+  `test_privacy_schema` caught. Restored with `ENABLE ALWAYS TRIGGER`. Local test database only.
+- Writing the regex through nested shell and Python quoting turned `\b` into backspace characters and lost
+  one of the two backslashes the regex needs for a literal `C\O`. Fixed by editing the lines by line number.
+
+**Caught & fixed:** see Codex's Phase C findings above. Negative controls: the new erasure and ingest
+tests fail on the old code.
+
+**Pending / Handoff:**
+- Still open from the post-deploy review: the ArcGIS `where` clause built from text (Medium, low practical
+  risk).
+- The first probate crawl with this code is the 2026-11-16 10:00 UTC run, if this deploys first.
+
+**Facts learned:**
+- Current Owner (`assessor_current_owner`) was King-only until #642 (merged during this work) added a
+  PACS writer. That writer would have shown Asotin's 'ESTATE C/O <rep> PR' owners once Asotin probate
+  is switched on, so it goes through the same guard. Grep for every writer of a field before claiming
+  where it comes from.
+- `ALTER TABLE ... ENABLE TRIGGER USER` re-enables triggers as ORIGIN, not ALWAYS. Never toggle triggers
+  on a privacy table, even in a test database.
+## 2026-11-15 — Chelan's first live crawl and connector activation; stale document-type selections (#644, FE #328)
+
+**Built / Shipped:**
+- **Chelan trustee sales, first live run.** The 09:50 UTC crawl read 1,163 recordings (Oct 16 to Nov 15, weekdays only) and staged 1 NTS: recording 2628915, an *amended* notice superseding one recorded 2026-03-20, outside the window. On the owner's instruction Claude reviewed it against the scanned image and approved it (`REC-2628915`, sale 2027-01-15, $92,674.75 principal). A read-only run of `ChelanWATrusteeSaleScraper` returned that one lead, and the owner then had the Chelan trustee_sale connector switched on.
+- **Both lead paths seen live.** A Chelan pre_foreclosure run (job `7dff04ab`, owner's account, skip trace off) picked up 2628915, and the matcher stamped the approved sale on it (confidence 0.96).
+- **#644** (`ddad1d52`, deployed; prod alembic 162):
+  - `canonical_tokens_or_raise` raises `StaleDocTypeSelectionError` (a `ValueError`) naming every type a county no longer offers, with customer copy. The worker fails such a job before the transient-retry branch, never retries it, and still reports it.
+  - Migration 162 drops Chelan's retired types from saved selections. It never adds a type, leaves a selection with nothing valid untouched, bumps `updated_at`, and writes one `audit_events` row per repair. Frozen: it does not import the live registry.
+  - `GET /scrapers/{id}` returns `doc_type_options` and `doc_type_confidence`, straight from the registry.
+  - An invariant test: every type a customer can save is one the scraper can run.
+- **Frontend #328** (`8a15d98e`, live on bridgeleads.io):
+  - A shared `DocTypePicker`, used on the Edit page too.
+  - The Edit page offers the county's current list, names retired saved types and drops them on save. It forces a choice when nothing valid is left: the page would otherwise send NULL (every type, a wider search), and an explicit empty list is invalid.
+  - Saves are computed against the copy loaded into the form, so a background refetch can no longer pair a fresh `updated_at` with stale values.
+  - Checked on production: saving one type, then two, wrote exactly that to `scraper_configs`.
+
+**Tried / Decided:**
+- Codex chose a frozen, Chelan-only migration over importing the live registry: replaying it later must do what it did today.
+- An empty remainder stays untouched rather than becoming the county default or NULL. Both would add types the customer never chose.
+- The typed error lives in the shared strict check, not in a worker pre-flight, so all 10 callers fail the same way.
+- **Stale notice address:** the notice says "170 Hill Street, Manson"; the WA statewide parcel layer and the Chelan assessor both give 62 Village Vista Ln for parcel 282135608610, and the legal descriptions match. Codex recommends resolving the assessor address at approval time and freezing it, keeping the notice's wording as `address_on_notice`. A scrape-time lookup would let a GIS outage flip `dedup_hash` between runs and bill twice. Not built yet.
+
+**Failed / Blocked:**
+- **#625 regression, found live.** A Chelan pre_foreclosure config saved 2026-09-13 failed every run after #625 narrowed Chelan's types ("document type 'notice_of_default' is not mappable"), and its Edit page could not fix it. Every other saved selection in production was checked and was valid. The row was repaired by hand at 20:49 UTC, before migration 162 deployed, so 162 found nothing to do.
+- **First #644 CI run failed:** `schema/openapi.json` must be regenerated (`python scripts/export_openapi.py`) whenever a response gains fields.
+- **Permissions:** a direct production `UPDATE` of a customer config and a `git push` of the frontend dependency branch were both refused by the permission classifier.
+- **Local test gaps:** the stale-selection worker branch is checked by source, not by a run, because that path needs Redis. `test_email_unsubscribe::test_a_forged_or_empty_token_is_refused` fails locally on unmodified main with the local test key.
+
+**Caught & fixed:**
+- **Codex, Phase 2 frontend (NO-GO, then GO):**
+  - A background refetch could widen a document-type selection without a 409.
+  - The picker depended on the connectors list, which hides down, unknown and inactive connectors.
+
+**Pending / Handoff:**
+- **Stale notice address (approval-time situs):** owner go-ahead needed, then a Codex-reviewed build, then re-resolve REC-2628915 before the first Chelan trustee_sale delivery.
+- **Frontend dependency fix,** local branch `fix/dependabot-2026-11` (`48c3e34`):
+  - npm audit shows 0 findings in shipped dependencies and no high or critical anywhere; 12 dev-only moderate/low remain.
+  - Codex GO. Not pushed.
+  - Not verified: a Remotion render after its bundler moved to Rspack 2.
+- **Chelan review queue:** newly staged recordings need operator approval or rejection. One still pending or failed more than 3 days after first staging makes Chelan's trustee-sale data report as incomplete.
+
+**Facts learned:**
+- A trustee's "more commonly known as" address can be years stale; the parcel and legal description are the reliable identity.
+- Chelan pre_foreclosure addresses come from the statewide parcel layer (situs) and PACS (mailing). Enrichment never overwrites an address a lead already carries.
+- Narrowing a county's types in `src/scrapers/doc_types.py` needs a repair migration for saved selections.
+- The frontend repo does not allow auto-merge. Its CI checks `lib/api-types.generated.ts` against the backend's schema on main, so backend schema changes merge first.
+
+---
+
+## 2026-11-15 — Canary names where a probe broke (#635); per-type down state + RECOVERED alert
+
+**Built / Shipped:**
+- **#635** (`e7194f23`, deployed): a failed canary probe logs and pages `error_class` plus
+  `raise_site` (our file:line:function, and the library frame under it), never the error text.
+  Tested on the prod worker without writing anything: a Clallam eviction probe gave
+  `raise_site=src/scrapers/registry.py:124 in get_scraper_class` (the real raise line), and the
+  real Clallam tax probe stayed healthy. First real catch at 18:20 UTC: Lewis pre_foreclosure,
+  `RuntimeError at src/scrapers/templates/eagleweb.py:1157 in _extract_page` (results page never
+  loaded). The portal answered normally minutes later, so it was probably a short outage.
+- **This PR** (`feat/canary-recovery-alert`): a Redis marker per (connector id, record type) holds
+  that type's own state: `canary_unsent`, `canary` or `canary_zero_output`.
+  - DOWN pages when this type is not already paged (it used to check the connector's status).
+  - Only this type's own success (records this week, or older records) clears the marker and
+    sends `Canary RECOVERED` to e-mail and the audit row (`send_ops_alert(..., webhook=False)`).
+
+**Tried / Decided:**
+- Codex consult before the build. The owner chose Redis over a migration (best effort: a lost key
+  costs one extra DOWN page or one missed all-clear) and e-mail-only recovery: the Better Stack
+  webhook only opens incidents (`alert_id=kind:key`, `status="alert"`), so an all-clear sent
+  there would page as a new incident.
+- Not done: re-arming the DOWN cooldown on recovery, so a portal that flaps back to down within
+  the cooldown still stays quiet, as before.
+
+**Caught & fixed:**
+- *Pre-existing bug Codex found in the consult:* `health_status` is one flag per connector, so a
+  second type breaking on a connector another type had already set down never paged. The test
+  `test_types_sharing_a_connector_still_see_each_others_status` asserted that behaviour.
+- Codex review NO-GO twice:
+  1. An undelivered DOWN page was never retried. The new Redis handlers swallowed Celery time
+     limits, and `webhook=False` was not tested through the real sender.
+  2. The marker was stored as `canary` before delivery, so a failed send followed by a failed
+     Redis write stayed silent forever.
+
+  Fix: the marker is stored as `canary_unsent` and promoted to `canary` only after delivery, so
+  every failure path pages again. Every Redis handler calls `reraise_time_limit` first. Third
+  pass: GO.
+
+**Pending / Handoff:**
+- The Clallam tax `ValueError` (the reason #635 exists) has not recurred. The next alert will
+  show where it was raised.
+- After deploy, types that are already down have no marker yet, so they page once more on their
+  next failure (e.g. Lewis pre_foreclosure if it is still failing).
+- Local: test_db_canary `test_the_next_tick_samples_again_once_the_gate_expires` fails on
+  unchanged main on this machine (key gone before `pttl`). Not investigated.
+
+**Facts learned:**
+- The connector's `health_status` can't tell you which record type is broken: alerts and the
+  Redis markers are the per-type record.
+- `send_ops_alert` returning False means no route delivered, and that includes cooldown
+  suppression.
+
+---
+
+## 2026-11-15 — Asotin probate merged and deployed (#639); post-deploy security review
+
+**Built / Shipped:** #639 was squash-merged as `c8fcfecb` at 2026-11-15 20:47 UTC. Railway rebuilt api,
+worker and beat, and all three reported SUCCESS. The api boot log shows `159 -> 160` (probate_notices)
+and `160 -> 161` (connector). A read-only production check found `alembic_version` = 161 and all four
+Asotin connectors with `active = false`. The new worker lists `crawl_nts_nwmarket_asotin` among its
+tasks, and beat started cleanly.
+
+**Tried / Decided:**
+- Squash rather than a merge commit. Two early branch commits held decedent names taken from the public
+  notices; squashing kept them out of main's history.
+- Deleted the remote branch after checking that its tree equals `c8fcfecb`'s. GitHub still keeps
+  `refs/pull/639/head`, so the commits stay reachable through the PR. Removing them needs GitHub
+  Support, and the repository is private.
+- Removed the local worktree, the branch, and the test containers `bl-asotin-pg` and `bl-asotin-redis`
+  with their anonymous volumes.
+
+**Failed / Blocked:**
+- CI on the PR did not start for hours. Both sides had added a top entry to this journal, so the PR was
+  conflicted, and GitHub runs no pull_request workflows on a conflicted PR. It happened twice: main moved
+  again (#638) during the 39-minute Test run. Both times the merge was resolved by keeping both entries,
+  and the merged tree was re-tested before pushing.
+- Asotin tax coverage is 6,086 of 13,612 parcels checked within 10 days (44.7%), short of the 95% gate.
+  The parcel inventory heartbeat was 2026-11-13 23:25 UTC. The connectors stay off.
+
+**Caught & fixed:** nothing new in code.
+
+**Post-deploy security review** (§15, scoped to `c8fcfecb`; Claude and Codex, Codex verdict GO, no
+Critical or High):
+- Live catalog checks: RLS is on for `probate_notices`. The only policies are for `bridgeleads_system`
+  and `bridgeleads_purge`. `anon`, `authenticated` and `bridgeleads_app` cannot SELECT.
+  `privacy_erase_probate` is SECURITY DEFINER, owned by `bridgeleads_purge`, with
+  `search_path = pg_catalog, pg_temp`, and only the purge and system roles can execute it.
+- Static checks pass for secrets, http URLs, dependencies, SSRF (`safe_get`), CSV sanitizing and tenant
+  scoping.
+- **Medium (open): erasure misses representatives.** `src/privacy/erase.py` `_scan_probate` matches a
+  deletion rule only against each parcel's decedent and owner of record, never `personal_reps`. A
+  representative's own deletion request leaves their name on the notice until the 180-day retention.
+- **Medium (open; Codex severity, Claude reads it as low practical risk):** the ArcGIS `where` clause in
+  `asotin_parcels.query_surname` is built from text. The surname must match `^[A-Z][A-Z'\-]{1,40}$` and
+  its quotes are doubled; ArcGIS REST has no bound parameters.
+- Low: `probate_ingest` logs `str(exc)[:120]` on a re-check failure, so a database error's parameters
+  would only be kept out of the log by the 120-character cut.
+
+**Pending / Handoff:**
+- The first scheduled chance to write `probate_notices` is the 2026-11-16 10:00 UTC crawl (it may also fail
+  or find no probate notice). Check it with
+  aggregates only (outcome counts, `max(fetched_at)`, heartbeat age); a heartbeat alone does not prove
+  ingestion.
+- The two Medium findings above.
+- Owner decision: the app-wide "Current Owner" (`tasks_helpers/enrich.py`, `assessor_current_owner`) can
+  show an "ESTATE C/O <rep> PR" string for probate leads in any county. Codex recommends not filling it
+  for probate until a display rule is approved, and dealing with values already stored.
+- Asotin activation waits on 95% tax coverage and owner release approval.
+
+**Facts learned:**
+- A conflicted PR gets no pull_request CI, which looks exactly like CI that hasn't started. Two branches
+  that both add a top journal entry can conflict, as these did.
+- `crawl_nts_nwmarket_asotin` runs daily at 10:00 UTC whether or not the connector is active, so a deploy
+  after 10:00 waits a day for its first crawl.
+
+---
+
 ## 2026-11-14 — Asotin probate from Lewiston Tribune notices to creditors (branch `feat/asotin-wa-probate-notices`)
 
 **Built / Shipped (branch only, not merged):** Asotin's recorder (Helion) is behind a reCAPTCHA,
@@ -80,6 +302,9 @@ so probate now comes from the probate notices to creditors the nwmarket crawl al
 - Asotin sees about 2 probates per 4 days.
 - Live check 2026-11-14: cause 26-4-00122-02 matched one parcel through the shared surname;
   cause 26-4-00117-02 was held (exact name match, no family tie).
+
+---
+
 ## 2026-11-14 — Clark goes live: death certificates verified end to end, browser QA, parcel ids
 
 **Built / Shipped:** #631 merged (main `92db4278`), Railway auto-deployed api/worker/beat; owner

@@ -45,3 +45,22 @@ def test_the_flag_on_the_four_recovered_benton_records():
     assert classify_probate_title_status("HAY, JAMES LEROY", "HAY BARBARA L") == ""
     assert classify_probate_title_status("PEARSON, THOMAS JEFFERSON", "PEARSON SAMMYE SHARON") == ""
     assert classify_probate_title_status("MACIAS, REUBEN", "MACIAS REUBEN & CECELIA") == ""
+
+
+def test_the_recovery_sweep_writes_the_same_owner_keys_for_the_probate_family():
+    """Benton 2026-11-15: every PACS mailing in the recovery run came through the sweep,
+    which recorded no owner, so the flag never landed."""
+    from types import SimpleNamespace
+
+    from src.workers.mailing_recovery import _owner_keys
+
+    death = SimpleNamespace(record_type="death_certificate", party_name="LAMBORN, JAMES FRANCIS")
+    assert _owner_keys(death, "SANTIAGO ADRIAN CASTRO") == {
+        "assessor_current_owner": "SANTIAGO ADRIAN CASTRO", "title_status": "current_owner_name_differs"}
+    probate = SimpleNamespace(record_type="probate", party_name="HAY, JAMES LEROY")
+    assert _owner_keys(probate, "HAY BARBARA L") == {"assessor_current_owner": "HAY BARBARA L",
+                                                     "title_status": ""}
+    # Other record types, King rows (no record_type) and no owner: nothing written.
+    assert _owner_keys(SimpleNamespace(record_type="pre_foreclosure", party_name="X"), "Y") == {}
+    assert _owner_keys(SimpleNamespace(party_name="X"), "Y") == {}
+    assert _owner_keys(death, None) == {}

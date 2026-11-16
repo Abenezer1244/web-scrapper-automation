@@ -3,7 +3,7 @@
 Real parsing, no mocks. Pins the absentee/out-of-state semantics Codex specified:
 component compare, unit-only difference is NOT absentee, NULL when unknown.
 """
-from src.utils.address_intel import _normalize_street, compute_owner_flags
+from src.utils.address_intel import _normalize_street, compose_situs, compute_owner_flags
 
 
 class TestNormalizeStreet:
@@ -246,3 +246,92 @@ class TestCommalessSitusCity:
         shortcut — this test pins that the new helper does not widen it."""
         f = compute_owner_flags("123 EVERETT, WA 98204", "456 MAPLE ST, EVERETT, WA 98204")
         assert f["absentee_owner"] is True
+
+
+class TestSamePlaceWrittenDifferently:
+    """Production rows (2026-11-15) flagged absentee although property and mailing are
+    the same place: 644 King + 3 Chelan. Each case below is a delivered lead's shape."""
+
+    def test_chelan_comma_less_situs_with_structured_city(self):
+        f = compute_owner_flags(
+            "609 LYNN ST WENATCHEE, WA 98801", "609 LYNN ST, WENATCHEE, WA 98801",
+            property_city="WENATCHEE", property_state="WA", property_zip="98801",
+        )
+        assert f["absentee_owner"] is False
+
+    def test_chelan_multiword_city(self):
+        f = compute_owner_flags(
+            "62 VILLAGE VISTA LN EAST  WENATCHEE, WA 98802",
+            "62 VILLAGE VISTA LN, EAST WENATCHEE, WA 98802",
+            property_city="East Wenatchee", property_state="WA", property_zip="98802",
+        )
+        assert f["absentee_owner"] is False
+
+    def test_compose_situs_does_not_repeat_a_glued_city(self):
+        assert compose_situs("609 LYNN ST WENATCHEE, WA 98801", "WENATCHEE", "WA", "98801") == \
+            "609 LYNN ST WENATCHEE, WA 98801"
+
+    def test_compose_situs_still_adds_a_missing_city(self):
+        assert compose_situs("609 LYNN ST", "WENATCHEE", "WA", "98801") == \
+            "609 LYNN ST, WENATCHEE, WA 98801"
+
+    def test_glued_city_but_different_zip_is_still_absentee(self):
+        f = compute_owner_flags(
+            "609 LYNN ST WENATCHEE, WA 98801", "609 LYNN ST, WENATCHEE, WA 98802",
+            property_city="WENATCHEE", property_state="WA", property_zip="98801",
+        )
+        assert f["absentee_owner"] is True
+
+    def test_unit_hash_after_designator(self):
+        f = compute_owner_flags("3435 AUBURN WAY S UNIT #27, AUBURN, WA 98092",
+                                "3435 AUBURN WAY S UNIT 27, AUBURN, WA 98092")
+        assert f["absentee_owner"] is False
+
+    def test_bare_unit_vs_marked_unit(self):
+        for prop, mail in (
+            ("22222 24TH AVE S C22, DES MOINES, WA 98198", "22222 24TH AVE S #C22, DES MOINES WA 98198"),
+            ("22328 88TH WAY S T101, KENT, WA 98031", "22328 88TH WAY S #T101, KENT, WA 98031"),
+            ("275 W ROY ST 412, SEATTLE, WA 98119", "275 W ROY ST #412, SEATTLE, WA 98119"),
+            ("28610 16TH AVE S 202, FEDERAL WAY, WA 98003", "28610 16TH AVE S #202, FEDERAL WAY, WA 98003"),
+        ):
+            assert compute_owner_flags(prop, mail)["absentee_owner"] is False, prop
+
+    def test_split_house_letter(self):
+        f = compute_owner_flags("2651B NW 57TH ST, SEATTLE, WA 98107",
+                                "2651 B NW 57TH ST, SEATTLE, WA 98107")
+        assert f["absentee_owner"] is False
+
+    # Collisions Codex flagged: these must stay different places.
+    def test_lettered_street_is_not_a_unit(self):
+        f = compute_owner_flags("123 E AVENUE A, SEATTLE, WA 98101", "123 E AVENUE, SEATTLE, WA 98101")
+        assert f["absentee_owner"] is True
+
+    def test_bare_token_only_dropped_when_the_other_side_marks_that_unit(self):
+        f = compute_owner_flags("275 W ROY ST 412, SEATTLE, WA 98119", "275 W ROY ST #413, SEATTLE, WA 98119")
+        assert f["absentee_owner"] is True
+
+    def test_house_letter_before_b_street_is_not_joined(self):
+        f = compute_owner_flags("2651B ST, SEATTLE, WA 98107", "2651 B ST, SEATTLE, WA 98107")
+        assert f["absentee_owner"] is True
+
+    def test_different_house_letters(self):
+        f = compute_owner_flags("2651B NW 57TH ST, SEATTLE, WA 98107", "2651 C NW 57TH ST, SEATTLE, WA 98107")
+        assert f["absentee_owner"] is True
+
+    def test_numbered_highway_is_kept(self):
+        f = compute_owner_flags("100 STATE HWY 20, SEDRO WOOLLEY, WA 98284",
+                                "100 STATE HWY 9, SEDRO WOOLLEY, WA 98284")
+        assert f["absentee_owner"] is True
+
+    def test_same_unit_spelling_different_zip_is_absentee(self):
+        f = compute_owner_flags("275 W ROY ST 412, SEATTLE, WA 98119", "275 W ROY ST #412, SEATTLE, WA 98109")
+        assert f["absentee_owner"] is True
+
+    def test_house_letter_is_not_a_directional(self):
+        f = compute_owner_flags("123N MAIN ST, SEATTLE, WA 98101", "123 N MAIN ST, SEATTLE, WA 98101")
+        assert f["absentee_owner"] is True
+
+    def test_hyphenated_bare_unit_vs_marked_unit(self):
+        f = compute_owner_flags("22222 24TH AVE S C-22, DES MOINES, WA 98198",
+                                "22222 24TH AVE S #C-22, DES MOINES, WA 98198")
+        assert f["absentee_owner"] is False

@@ -19,6 +19,75 @@ to understand *why* the code is the way it is and *what's been attempted before*
 
 ---
 
+## 2026-11-15 — Cowlitz County: repaired recorder, death certificates, auction leads, tax (branch, unmerged)
+
+**Built / Shipped:** branch `feat/cowlitz-wa-seven-record-types` (not pushed). Plan, matrix and review:
+`tasks/cowlitz-wa-seven.md`.
+- `0799c118`: the Laserfiche template reads one day per search and fails unless captured rows equal the
+  portal's count. It reads each kept document's properties table, holds multi-parcel recordings as
+  ambiguous, and takes an NTS borrower from the grantees. `gis_min_parcel_len()` (Cowlitz 5) now drives
+  every generic GIS gate.
+- `b737a3de`: death_certificate split from probate (migration now 164). Agency regex accepts "DEPARMENT".
+- `10c27137`: the OCR child accepts Laserfiche's CCITT Group 4 PDF, wrapped as TIFF; the drawing grammar
+  uses PDF tokens.
+- `6d1d6304`: the recorded-NTS review pipeline is per county. Cowlitz discovery, PDF fetch and crawl.
+- `d840718f`: Cowlitz trustee_sale reader, matcher county and beat; connector inactive (now 165).
+- `60dc1370`, `8bce696e`: Cowlitz tax_delinquent from the Treasurer's live foreclosure listing;
+  connector inactive (now 166).
+- `a0222a63`: merged origin/main (head 163); Cowlitz migrations renumbered 164-166.
+
+**Tried / Decided:**
+- Bisecting short windows was the first fix for the partial capture. It was too slow: 8-day windows
+  were still short (339 of 399), so the scraper now searches one day at a time.
+- The DocView plain-text view returns nothing, and Laserfiche PDFs have no text layer, so auction leads
+  need OCR. The existing pipeline (operator approves every notice) was reused rather than building a
+  second one.
+- Tesseract `--psm 6` reads the two-column sale-date line whole. It is used for the Laserfiche shape only.
+- Tax: Cowlitz has no per-parcel account source we may use (its property app carries an RCW
+  42.56.070(9) acknowledgement), so the Treasurer's re-issued listing is the status. Each holder is
+  confirmed against the Assessor's deed holder.
+
+**Failed / Blocked:**
+- divorce and court probate: Odyssey is a paid clerk subscription, plus GR 31.
+- code_violation: no public case index for the county or Longview, Kelso, Castle Rock, Kalama or Woodland.
+- My first full-suite run was invalid: `-p no:logging` disables `caplog`.
+- Bash heredocs twice wrote literal NUL or backspace bytes where `\x00` and `\b` were meant. Edit
+  scripts now go in a file.
+- The first Codex final review used a stale base: main had added migrations 162 and 163.
+
+**Caught & fixed:**
+- Production baseline: the template silently kept 1,068 of 1,428 rows. 27 of 27 short-parcel leads
+  had no address. One probate lead names the State agency as decedent.
+- The grid shows only the first grantee and parcel. The old code also named an attorney trustee as the
+  borrower.
+- Codex findings fixed, each with tests:
+  - the worker's own 6-character GIS gate;
+  - an incomplete DocView read accepted as complete;
+  - hyphenated surnames grouped together;
+  - a resource-name comment trick in the PDF drawing grammar;
+  - false-fresh crawls from deferred retries (Chelan had it too);
+  - the PDF size cap only checked after download;
+  - a null tax year rejected by the validator;
+  - a tentative sale date treated as final;
+  - an owner name mis-split by the parser.
+
+**Pending / Handoff:**
+- Owner approval for push, merge and deploy.
+- Prerequisites to check at deploy: alembic 166, recorder row plus death_certificate, 165/166 inactive,
+  Chromium and Tesseract in the worker image.
+- Watch the first Cowlitz NTS crawl and review its notices before activating 165.
+- Expose the minimum-bid basis before activating 166, and do it before 12/7/2026.
+- Production recovery of 27 short-parcel leads and 1 agency-as-party lead.
+- Playwright UI QA after deploy.
+- Chelan's silent 60-day reach clamp.
+
+**Facts learned:**
+- Cowlitz Laserfiche: AFNs are sequential, and a -1 suffix marks a second entry under one recording.
+- The DocView properties table renders one empty placeholder row per field.
+- Codes: NTTRUS for an NTS, DISTRS for a discontinuance. Related AFN means the deed of trust for an NTS,
+  and the NTS and/or deed of trust for a discontinuance.
+- PDFs come from `/WLAUDPublic/PDF10/<guid>/<docid>`, bound to the session cookie.
+- The Cowlitz GIS layer's TAX_STATUS is blank on every parcel.
 ## 2026-11-15 — Ferry County: tax_delinquent + court-index probate/divorce (all connectors inactive)
 
 **Built / Shipped:** branch `feat/ferry-wa-seven-record-types` (local, not pushed). `taxsifter.resolve_tax`

@@ -340,6 +340,13 @@ app.conf.beat_schedule = {
         "task": "src.workers.nts_crawler.crawl_nts_nwmarket_asotin",
         "schedule": crontab(hour=10, minute=0),  # 10:00 UTC daily
     },
+    "crawl-nts-cowlitz-recorder": {
+        # NTS (Cowlitz): recorded notices are CCITT scans read from the Laserfiche viewer;
+        # each new one is OCR'd into staging for an operator to approve
+        # (scripts/nts_review.py). Daily; scheduled 50 min before Chelan's 09:50 OCR run.
+        "task": "src.workers.nts_crawler.crawl_nts_cowlitz_recorder",
+        "schedule": crontab(hour=9, minute=0),  # 09:00 UTC daily
+    },
     "crawl-nts-chelan-recorder": {
         # NTS (Chelan): recorded notices are scans; each new one is OCR'd into staging for
         # an operator to approve (scripts/nts_review.py). Daily; the 30-day window overlaps

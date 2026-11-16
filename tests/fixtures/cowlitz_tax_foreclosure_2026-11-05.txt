@@ -1,0 +1,104 @@
+     
+Foreclosure Property Information
+Last Update 11/5/2026 1:40:24 PM ● Count = 7
+Cause Number 26-2-00582-08
+ 
+Real Estate Parcels have links to maps and title reports below the table
+(link to the map is the parcel number and link to title report is the property number)
+Parcel/Prop ID Record Title Holder
+Address
+Acreage
+Value Approximate Abbreviated Reference Minimum Bid
+6204902
+3045710
+SAMPLE OWNER1 Bare Land in COWLITZ
+Jurisdiction: COWLITZ
+Acres: 0.2500
+Assd Val: 44700
+4388.20
+WL2408005
+3018024
+SAMPLE 
+OWNER2 ETAL
+5228 OCEAN BEACH HWY 
+LONGVIEW, WA 98632
+Jurisdiction: COWLITZ
+Acres: 0.8000
+Assd Val: 372430
+22912.46
+09531
+3033148
+SAMPLE OWNER3 708 WASHINGTON WAY 
+LONGVIEW, WA 98632
+Jurisdiction: LONGVIEW
+Acres: 0.2486
+Assd Val: 261090
+35 (AP 17) -56   27 -8N -2W  AP 17 
+TR 56.
+15862.77
+080980081
+3031306
+SAMPLE OWNER4 4721 MERLIN ST 
+LONGVIEW, WA 98632
+Jurisdiction: LONGVIEW
+Acres: 0.0000
+Assd Val: 178980
+13305.56
+2417301
+3038913
+LOWER COLUMBIA 
+COMMUNITY 
+ACTION
+Jurisdiction: KELSO
+Acres: 0.2600
+Assd Val: 51720
+817 (KELSO OUTLOT) -KEOL -390A   
+35 -8N -2W
+4117.49
+WK0412001
+3015484
+SAMPLE OWNER5 Bare Land in COWLITZ
+Jurisdiction: COWLITZ
+Acres: 3.7000
+Assd Val: 3800
+4 -10N -2W  T-12B . 2186.16
+EF2102003
+5966566
+SAMPLE OWNER6
+Jurisdiction: COWLITZ
+Acres: 0.2500
+Assd Val: 1530
+2045.79
+6204902: https://gis.cowlitzwa.gov/ccportal/apps/experiencebuilder/experience/?id=ddc4520d9f394f2486d58a59a0933dc1#data_s=where%3AdataSource_1-Parcels_5051-
+0%3APARCNO%3D%276204902%27&zoom_to_selection=true
+3045710: https://apps.co.cowlitz.wa.us/Foreclosures/2026/3045710_6204902.pdf
+DEBRA GARDNER
+TREASURER
+Foreclosure Department
+County Administration Building
+207 N 4th Ave
+Kelso, WA 98626-4124
+TEL (360) 577-3060
+FAX (360) 578-2071
+www.co.cowlitz.wa.us/treasurer
+email tapleyk@cowlitzwa.gov
+
+WL2408005: https://gis.cowlitzwa.gov/ccportal/apps/experiencebuilder/experience/?id=ddc4520d9f394f2486d58a59a0933dc1#data_s=where%3AdataSource_1-Parcels_5051-
+0%3APARCNO%3D%27WL2408005%27&zoom_to_selection=true
+3018024: https://apps.co.cowlitz.wa.us/Foreclosures/2026/3018024_WL2408005.pdf
+09531: https://gis.cowlitzwa.gov/ccportal/apps/experiencebuilder/experience/?id=ddc4520d9f394f2486d58a59a0933dc1#data_s=where%3AdataSource_1-Parcels_5051-
+0%3APARCNO%3D%2709531%27&zoom_to_selection=true
+3033148: https://apps.co.cowlitz.wa.us/Foreclosures/2026/3033148_09531.pdf
+080980081: https://gis.cowlitzwa.gov/ccportal/apps/experiencebuilder/experience/?id=ddc4520d9f394f2486d58a59a0933dc1#data_s=where%3AdataSource_1-Parcels_5051-
+0%3APARCNO%3D%27080980081%27&zoom_to_selection=true
+3031306: https://apps.co.cowlitz.wa.us/Foreclosures/2026/3031306_080980081.pdf
+2417301: https://gis.cowlitzwa.gov/ccportal/apps/experiencebuilder/experience/?id=ddc4520d9f394f2486d58a59a0933dc1#data_s=where%3AdataSource_1-Parcels_5051-
+0%3APARCNO%3D%272417301%27&zoom_to_selection=true
+3038913: https://apps.co.cowlitz.wa.us/Foreclosures/2026/3038913_2417301.pdf
+WK0412001: https://gis.cowlitzwa.gov/ccportal/apps/experiencebuilder/experience/?id=ddc4520d9f394f2486d58a59a0933dc1#data_s=where%3AdataSource_1-Parcels_5051-
+0%3APARCNO%3D%27WK0412001%27&zoom_to_selection=true
+3015484: https://apps.co.cowlitz.wa.us/Foreclosures/2026/3015484_WK0412001.pdf
+EF2102003: https://gis.cowlitzwa.gov/ccportal/apps/experiencebuilder/experience/?id=ddc4520d9f394f2486d58a59a0933dc1#data_s=where%3AdataSource_1-Parcels_5051-
+0%3APARCNO%3D%27EF2102003%27&zoom_to_selection=true
+5966566: https://apps.co.cowlitz.wa.us/Foreclosures/2026/5966566_EF2102003.pdf
+

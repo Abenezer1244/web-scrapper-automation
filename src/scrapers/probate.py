@@ -87,13 +87,17 @@ _AGENCY_SUBJECT = (
 _AGENCY_DEPT_RE = re.compile(
     rf"(?:{_STATE_QUALIFIER})?"
     # DEPTH: Benton's index types "STATE OF WA, DEPTH OF HEALTH" (live 2026-11-15,
-    # 2026-027909); only ever inside the full "<dept> OF <agency>" phrase.
-    rf"(?:DEPARTMENT|DEPTH|DEPT|BUREAU|OFFICE)\.?\s+OF\s+{_AGENCY_SUBJECT}\b"
+    # 2026-027909); DEPARMENT: Cowlitz's "STATE OF WASHINGTON DEPARMENT OF HEALTH"
+    # (live 2026-11-15). Only ever inside the full "<dept> OF <agency>" phrase.
+    rf"(?:DEPARTMENT|DEPARMENT|DEPTH|DEPT|BUREAU|OFFICE)\.?\s+OF\s+{_AGENCY_SUBJECT}\b"
     # "STATE OF WA, DSHS" (Benton 2026-026847): the acronym only after a state, so a
     # bare "DSHS" token is never an agency phrase on its own.
     rf"|\b{_STATE_QUALIFIER}DSHS\b",
     re.IGNORECASE,
 )
+
+# "DEPARMENT" is the Cowlitz recorder's own spelling ("STATE OF WASHINGTON DEPARMENT
+# OF HEALTH", live 2026-11-15); without it the agency became the decedent.
 
 # The same agencies with the "OF" dropped and the words re-ordered. King's recorder
 # emits all three orders for one agency across a single 90-day window (verified live
@@ -108,8 +112,8 @@ _AGENCY_DEPT_RE = re.compile(
 # "HEALTH DEPARTMENT" and leaves the mangled fragment "SEATTLE-KING COUNTY PUBLIC"
 # as the party (Codex).
 _AGENCY_TRAILING_RE = re.compile(
-    rf"(?:{_STATE_QUALIFIER})?(?:PUBLIC\s+)?{_AGENCY_SUBJECT}\s+(?:DEPARTMENT|DEPT)\b\.?"
-    rf"|(?:DEPARTMENT|DEPT)\.?\s+{_STATE_QUALIFIER}(?:PUBLIC\s+)?{_AGENCY_SUBJECT}\b",
+    rf"(?:{_STATE_QUALIFIER})?(?:PUBLIC\s+)?{_AGENCY_SUBJECT}\s+(?:DEPARTMENT|DEPARMENT|DEPT)\b\.?"
+    rf"|(?:DEPARTMENT|DEPARMENT|DEPT)\.?\s+{_STATE_QUALIFIER}(?:PUBLIC\s+)?{_AGENCY_SUBJECT}\b",
     re.IGNORECASE,
 )
 
@@ -170,7 +174,7 @@ _NON_PERSON_RE = re.compile(
     # words (MORTUARY, CREMATORY, CORONER) that are not used as personal surnames.
     r"|\bFUNERAL\s+(?:HOME|SERVICE|CHAPEL)\b|\bMORTUARY\b|\bCREMAT(?:ORY|ORIUM|ION)\b"
     r"|\bCORONER\b|\bMEDICAL\s+EXAMINER\b|\bDSHS\b"
-    r"|\b(?:DEPARTMENT|DEPT|BUREAU|OFFICE)\s+OF\s+(?:LICENSING|REVENUE|VITAL|SOCIAL)\b"
+    r"|\b(?:DEPARTMENT|DEPARMENT|DEPT|BUREAU|OFFICE)\s+OF\s+(?:LICENSING|REVENUE|VITAL|SOCIAL)\b"
     r"|\b(?:LLC|L\.?L\.?C|INC|CORP|CORPORATION|COMPANY|BANK|ESCROW|ASSOCIATION)\b"
     r"|\bTITLE\s+CO\b",
     re.IGNORECASE,

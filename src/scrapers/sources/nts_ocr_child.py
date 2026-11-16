@@ -13,7 +13,18 @@ documents read 2026-11-12):
   /DeviceGray or a two-entry pure black/white /Indexed palette (Chelan's is
   [/Indexed /DeviceRGB 1 <FFFFFF000000>]: index 0 is WHITE, so it is inverted).
 Image and content streams are inflated here with an output ceiling, so nothing else is
-ever decoded. Anything else is "unsupported pdf".
+ever decoded.
+
+A second shape is Cowlitz's Laserfiche WebLink "Print (as PDF)" (three live NTS pages
+read 2026-11-15):
+- the same resources rule;
+- page contents: exactly ``q q <matrix> cm /<that image> Do Q Q q BT <x> <y> Td ET Q``:
+  the image, then an EMPTY text object (no show operator; the page has no font, so it
+  can draw nothing);
+- the image: 1-bit /CCITTFaxDecode Group 4 (DecodeParms exactly /K -1, /Columns = its
+  width, /Rows = its height), /DeviceGray, no masks or decode arrays.
+The CCITT data is never decoded here: its bytes are wrapped unchanged in a one-strip
+Group 4 TIFF that tesseract reads. Anything else is "unsupported pdf".
 
 Tesseract runs with a fixed argument list, no shell, one thread, a timeout (its whole
 process tree is killed on overrun), output to a file size-checked before it is read,
@@ -41,9 +52,18 @@ MAX_TSV_BYTES = 2 * 1024 * 1024     # tesseract's output for one page
 MAX_FILE_BYTES = 16 * 1024 * 1024   # any file written while OCR runs (Linux)
 MAX_WORDS = 50_000
 _ADDRESS_SPACE = 1536 * 1024 * 1024
+# PDF whitespace only (ISO 32000 7.2.3): Python's \s also accepts separators a PDF
+# reader does not, and names are plain tokens: a delimiter such as "%" in a name would
+# make the rest of the stream a comment, so its "Do" never runs (Codex 3a High).
+_WS = r"[\x00\t\n\x0c\r ]"
+_NAME = r"([A-Za-z0-9_]+)"
 _NUM = r"[-+]?(?:\d+\.?\d*|\.\d+)"
-_MATRIX = rf"((?:{_NUM}\s+){{6}})cm\s+"
-_DRAW_ONE_IMAGE = re.compile(rf"^\s*q\s+{_MATRIX}(?:{_MATRIX})?/(\S+)\s+Do\s+Q\s*$")
+_MATRIX = rf"((?:{_NUM}{_WS}+){{6}})cm{_WS}+"
+_DRAW_ONE_IMAGE = re.compile(
+    rf"^{_WS}*q{_WS}+{_MATRIX}(?:{_MATRIX})?/{_NAME}{_WS}+Do{_WS}+Q{_WS}*$")
+_DRAW_LASERFICHE = re.compile(
+    rf"^{_WS}*q{_WS}+q{_WS}+{_MATRIX}/{_NAME}{_WS}+Do{_WS}+Q{_WS}+Q{_WS}+q{_WS}+BT{_WS}+"
+    rf"{_NUM}{_WS}+{_NUM}{_WS}+Td{_WS}+ET{_WS}+Q{_WS}*$")
 _PAGE_TOLERANCE = 2.0  # points: how closely the drawn image must cover the page
 _WHITE, _BLACK = b"\xff\xff\xff", b"\x00\x00\x00"
 
@@ -101,7 +121,8 @@ def _check_covers_page(page, matrices: list[str]) -> None:
         raise UnsupportedPdfError("page has annotations")
     a, b, c, d, e, f = 1.0, 0.0, 0.0, 1.0, 0.0, 0.0
     for text in matrices:  # each cm applies before the CTM so far: M x CTM
-        a2, b2, c2, d2, e2, f2 = _finite(float(x) for x in text.split())
+        # split on PDF whitespace: str.split() does not split on NUL, which _WS allows
+        a2, b2, c2, d2, e2, f2 = _finite(float(x) for x in re.split(f"{_WS}+", text) if x)
         a, b, c, d, e, f = _finite((a2 * a + b2 * c, a2 * b + b2 * d, c2 * a + d2 * c,
                                     c2 * b + d2 * d, e2 * a + f2 * c + e, e2 * b + f2 * d + f))
     box = _finite(float(x) for x in page.get("/MediaBox", []))
@@ -144,13 +165,23 @@ def _page_image(page):
     if not hasattr(xobjs, "keys") or len(list(xobjs.keys())) != 1:
         raise UnsupportedPdfError("page is not exactly one image")
     name = list(xobjs.keys())[0]
-    m = _DRAW_ONE_IMAGE.match(_page_content(page).decode("latin-1"))
-    if not m or "/" + m.group(3) != name:
+    content = _page_content(page).decode("latin-1")
+    m = _DRAW_ONE_IMAGE.match(content)
+    if m:
+        matrices, drawn = [g for g in m.groups()[:2] if g], m.group(3)
+    else:
+        m = _DRAW_LASERFICHE.match(content)
+        if not m:
+            raise UnsupportedPdfError("page does not draw exactly its one image")
+        matrices, drawn = [m.group(1)], m.group(2)
+    if "/" + drawn != name:
         raise UnsupportedPdfError("page does not draw exactly its one image")
-    _check_covers_page(page, [g for g in m.groups()[:2] if g])
+    _check_covers_page(page, matrices)
     img = xobjs[name].get_object()
     filt = img.get("/Filter")
     filt = list(filt) if isinstance(filt, list) else [filt]
+    if filt == ["/CCITTFaxDecode"]:
+        return _ccitt_image(img)
     if (img.get("/Subtype") != "/Image" or filt != ["/FlateDecode"]
             or int(img.get("/BitsPerComponent", 0)) != 1
             or any(k in img for k in ("/SMask", "/Mask", "/Decode", "/DecodeParms", "/ImageMask"))):
@@ -166,7 +197,46 @@ def _page_image(page):
     raw = img._data  # the stream as stored (compressed)
     if len(raw) > MAX_STREAM_BYTES:
         raise UnsupportedPdfError("image stream too large")
-    return w, h, raw, invert
+    return "flate", w, h, raw, invert
+
+
+def _ccitt_image(img):
+    """A Laserfiche page image: 1-bit CCITT Group 4, gray, nothing optional."""
+    if (img.get("/Subtype") != "/Image" or int(img.get("/BitsPerComponent", 0)) != 1
+            or img.get("/ColorSpace") != "/DeviceGray"
+            or any(k in img for k in ("/SMask", "/Mask", "/Decode", "/ImageMask"))):
+        raise UnsupportedPdfError("image is not a plain 1-bit CCITT image")
+    w, h = int(img.get("/Width", 0)), int(img.get("/Height", 0))
+    if w <= 0 or h <= 0 or w * h > MAX_IMAGE_PIXELS:
+        raise UnsupportedPdfError("image size out of bounds")
+    parms = img.get("/DecodeParms")
+    parms = parms.get_object() if parms is not None else None
+    if not hasattr(parms, "keys") or set(parms.keys()) != {"/K", "/Columns", "/Rows"}             or int(parms["/K"]) != -1 or int(parms["/Columns"]) != w or int(parms["/Rows"]) != h:
+        raise UnsupportedPdfError("CCITT parameters are not plain Group 4 at the image size")
+    raw = img._data
+    if not raw or len(raw) > MAX_STREAM_BYTES:
+        raise UnsupportedPdfError("image stream too large")
+    return "ccitt", w, h, raw, False
+
+
+def _g4_tiff(w: int, h: int, raw: bytes) -> bytes:
+    """The CCITT bytes, unchanged, as a one-strip Group 4 TIFF. PDF's default /BlackIs1
+    false means the coded white runs are white, which TIFF calls WhiteIsZero (0)."""
+    import struct
+
+    entries = [  # tag, type (3 SHORT / 4 LONG), value
+        (256, 4, w), (257, 4, h), (258, 3, 1), (259, 3, 4), (262, 3, 0),
+        (273, 4, 0), (277, 3, 1), (278, 4, h), (279, 4, len(raw)),
+    ]
+    ifd_size = 2 + 12 * len(entries) + 4
+    data_at = 8 + ifd_size
+    out = bytearray(b"II*\x00" + struct.pack("<I", 8) + struct.pack("<H", len(entries)))
+    for tag, typ, value in entries:
+        value = data_at if tag == 273 else value
+        packed = struct.pack("<HH", value, 0) if typ == 3 else struct.pack("<I", value)
+        out += struct.pack("<HHI", tag, typ, 1) + packed
+    out += struct.pack("<I", 0) + raw
+    return bytes(out)
 
 
 def _kill_tree(proc: subprocess.Popen) -> None:
@@ -222,22 +292,29 @@ def main() -> None:
     if os.environ.get("SYSTEMROOT"):  # Windows needs it to start any program
         env["SYSTEMROOT"] = os.environ["SYSTEMROOT"]
     words: list = []
-    for pno, (w, h, raw, invert) in enumerate(images, start=1):
-        try:
-            pixels = _bounded_inflate(raw, ((w + 7) // 8) * h, exact=((w + 7) // 8) * h)
-        except UnsupportedPdfError as exc:
-            return _result(workdir, {"ok": False, "reason": f"unsupported pdf: {exc}"})
-        except zlib.error:
-            return _result(workdir, {"ok": False, "reason": f"page {pno} image undecodable"})
-        img = Image.frombytes("1", (w, h), pixels)
-        if invert:
-            img = ImageOps.invert(img.convert("L")).convert("1")
-        png = os.path.join(workdir, f"p{pno}.png")
-        img.save(png)
+    for pno, (kind, w, h, raw, invert) in enumerate(images, start=1):
+        if kind == "ccitt":
+            png = os.path.join(workdir, f"p{pno}.tif")  # tesseract decodes G4 itself
+            with open(png, "wb") as fh:
+                fh.write(_g4_tiff(w, h, raw))
+        else:
+            try:
+                pixels = _bounded_inflate(raw, ((w + 7) // 8) * h, exact=((w + 7) // 8) * h)
+            except UnsupportedPdfError as exc:
+                return _result(workdir, {"ok": False, "reason": f"unsupported pdf: {exc}"})
+            except zlib.error:
+                return _result(workdir, {"ok": False, "reason": f"page {pno} image undecodable"})
+            img = Image.frombytes("1", (w, h), pixels)
+            if invert:
+                img = ImageOps.invert(img.convert("L")).convert("1")
+            png = os.path.join(workdir, f"p{pno}.png")
+            img.save(png)
         outbase = os.path.join(workdir, f"p{pno}")
         try:
             proc = subprocess.Popen(  # noqa: S603 -- fixed argv, no shell
-                [tesseract, png, outbase, "-l", "eng", "tsv"],
+                # Laserfiche notices are two-column forms: default segmentation cut the
+                # sale-date line ("will on 1/8/2"); one uniform block reads it whole.
+                [tesseract, png, outbase, "-l", "eng", *(["--psm", "6"] if kind == "ccitt" else []), "tsv"],
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 env=env, cwd=workdir, start_new_session=os.name == "posix",
             )

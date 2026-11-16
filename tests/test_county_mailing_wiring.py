@@ -294,3 +294,64 @@ class TestRecovery:
         assert r.mailing_address is None
         assert r.enrichment_data["mailing_recovery_attempts"] == 1
         assert r.enrichment_data["mailing_lookup_deferred"] is True
+
+
+# Verbatim Cowlitz Assessor/Parcels feature for PARCNO '03110' (queried 2026-11-15).
+# Cowlitz parcel numbers can be 5 characters; every one of the 27 such production
+# leads went without an address because each eligibility gate required 6.
+_COWLITZ_03110 = {"attributes": {
+    "PARCNO": "03110", "SITUS_STREET_NUMBER": "2040", "SITUS_STREET_DIRECTION": "",
+    "SITUS_STREET_NAME": "44TH", "SITUS_STREET_SUFFIX": "AVE", "SITUS_STREET_UNIT": "",
+    "SITUS_CITY": "LONGVIEW", "SITUS_ZIP_CODE": "98632", "DEED_HOLDER_ADDRESS_1": "",
+    "DEED_HOLDER_ADDRESS_2": "2040 44TH AVE", "DEED_HOLDER_CITY": "LONGVIEW",
+    "DEED_HOLDER_STATE": "WA", "DEED_HOLDER_ZIPCODE": "98632"}}
+
+
+def _cowlitz_layer(monkeypatch) -> list:
+    """Serve the county layer from the verbatim feature; record which ids were asked."""
+    asked: list = []
+    from src.config import settings
+
+    # Cowlitz deed-holder mailing sits behind the legal switch (owner decision
+    # 2026-09-13); production runs with it on.
+    monkeypatch.setattr(settings, "COUNTY_GIS_RESTRICTED_MAILING_ENABLED", True)
+
+    def _query(parcel_ids, gis_config, unreached=None):
+        asked.extend(parcel_ids)
+        min_len = gis_config.get("min_parcel_len", 6)
+        want = {p.strip(): [p] for p in parcel_ids if len(p.strip()) >= min_len}
+        return cg._map_county_features(
+            [f for f in [_COWLITZ_03110] if f["attributes"]["PARCNO"] in want], gis_config, want)
+
+    monkeypatch.setattr(cg, "_batch_query_county", _query)
+    return asked
+
+
+class TestCowlitzShortParcels:
+    def test_cowlitz_floor_is_five_and_every_other_county_keeps_six(self):
+        assert cg.gis_min_parcel_len("Cowlitz", "wa") == 5
+        assert cg.gis_min_parcel_len("benton", "WA") == 6
+        assert cg.gis_min_parcel_len(None, None) == 6
+
+    async def test_a_five_character_parcel_reaches_the_county_layer_in_a_job(
+            self, db, business_user, redis_client, monkeypatch):
+        asked = _cowlitz_layer(monkeypatch)
+        job_id = await _job(db, business_user, "cowlitz")
+        rid = await _row(db, business_user, job_id, "03110")
+        await _run_job_enrichment(db, job_id, redis_client)
+        assert "03110" in asked
+        r = await _get(db, rid)
+        assert r.property_address == "2040 44TH AVE"
+        assert r.mailing_address == "2040 44TH AVE, LONGVIEW, WA 98632"
+
+    async def test_a_deferred_five_character_row_is_recovered_by_the_sweep(
+            self, db, business_user, redis_client, monkeypatch):
+        from src.workers import mailing_recovery as mr
+
+        asked = _cowlitz_layer(monkeypatch)
+        job_id = await _job(db, business_user, "cowlitz", status="done")
+        rid = await _row(db, business_user, job_id, "03110",
+                         enrichment={"mailing_lookup_deferred": True})
+        await asyncio.to_thread(mr.recover_deferred_gis_mailing)
+        assert "03110" in asked
+        assert (await _get(db, rid)).mailing_address == "2040 44TH AVE, LONGVIEW, WA 98632"

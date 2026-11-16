@@ -259,8 +259,10 @@ def build_records(cycle: Cycle, listing: Listing, today: date,
             "state": "WA",
             "owner_verified": True,  # Treasurer's title holder = the Assessor's deed holder
             "owner_role": "record_title_holder",
-            "foreclosure_status": ("tax_foreclosure_sale_scheduled" if sale
+            # The county calls its date "tentative": never presented as scheduled.
+            "foreclosure_status": ("tax_foreclosure_sale_tentative" if sale
                                    else "tax_foreclosure_sale_date_pending"),
+            "listed_as_of": listing.last_update.strftime("%m/%d/%Y"),
             "foreclosure_minimum_bid": str(p.minimum_bid),
             "foreclosure_sale_dates": [sale.strftime("%m/%d/%Y")] if sale else [],
             "foreclosure_cause_number": listing.cause_number,

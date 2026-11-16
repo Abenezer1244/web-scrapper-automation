@@ -82,6 +82,7 @@ def test_before_the_sale_every_listed_parcel_is_a_lead():
     assert ed["bill_year"] is None                       # not published per parcel: never guessed
     assert ed["foreclosure_sale_dates"] == ["12/07/2026"] and ed["as_of_date"] == "11/05/2026"
     assert r["080980081"].enrichment_data["foreclosure_status"] == "tax_foreclosure_sale_date_pending"
+    assert ed["foreclosure_status"] == "tax_foreclosure_sale_tentative"   # the county's own word
 
 
 def test_after_a_tentative_sale_date_the_run_fails_instead_of_a_quiet_zero():

@@ -213,6 +213,11 @@ def _record_from_notice(notice: NtsNotice) -> ScrapedRecord:
             "auction_location": notice.auction_location,
             "source": notice.source,
             "source_url": notice.source_url,
+            # The address the notice printed, when property_address is the parcel's
+            # current site address instead (migration 164); None otherwise.
+            "address_on_notice": (
+                notice.address_on_notice if notice.address_source == "assessor_situs" else None
+            ),
         },
     }
     return rec
@@ -288,6 +293,13 @@ class _TrusteeSaleScraper(BridgeScraper):
         horizon = today + timedelta(days=span) if span is not None else None
 
         with system_sync_session() as db:
+            # Read under the cancellation lock, shared: an operator's address refresh
+            # (exclusive) either sees this job running and refuses, or commits before
+            # this read, so a run never delivers an address a refresh has since replaced
+            # (Codex P1). Held only for this read transaction.
+            from src.workers.nts_matcher_task import take_nts_cancel_lock_shared
+
+            take_nts_cancel_lock_shared(db)
             conditions = [
                 func.lower(NtsNotice.county) == self.COUNTY,
                 NtsNotice.is_active.is_(True),

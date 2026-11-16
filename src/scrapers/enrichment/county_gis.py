@@ -1527,28 +1527,23 @@ def _batch_query_wa_statewide(
     results: dict[str, dict] = {}
     chunk_size = 50
 
-    for i in range(0, len(parcel_ids), chunk_size):
-        chunk = parcel_ids[i:i + chunk_size]
-
-        # Build (query_value, original_parcel_id) pairs so we can map
-        # responses back to the scraper's parcel_id regardless of format.
-        # Formatters may return multiple candidate formats (e.g., Kitsap
-        # uses two different dash patterns) — we try them all.
-        query_pairs: list[tuple[str, str]] = []
-        for pid in chunk:
-            if not pid or len(pid.strip()) < 6:
-                continue
-            plain = pid.replace("-", "").strip()
-            if formatter:
-                candidates = formatter(plain)
-                if candidates:
-                    for c in candidates:
-                        query_pairs.append((c, pid))
-                    continue
-            query_pairs.append((plain, pid))
-
-        if not query_pairs:
+    # Build (query_value, original_parcel_id) pairs so we can map responses back to
+    # the scraper's parcel_id regardless of format. Formatters may return several
+    # candidate formats (Kitsap uses two dash patterns) — we try them all.
+    all_pairs: list[tuple[str, str]] = []
+    for pid in parcel_ids:
+        if not pid or len(pid.strip()) < 6:
             continue
+        plain = pid.replace("-", "").strip()
+        candidates = (formatter(plain) if formatter else None) or [plain]
+        all_pairs.extend((c, pid) for c in candidates)
+
+    # Chunked by QUERY VALUES, not parcels: the IN clause rides in a GET URL, and
+    # Kitsap's two spellings per parcel made a 50-parcel chunk 100 values long. Past
+    # ~26 Kitsap parcels the service refused the URL and the whole batch came back
+    # empty, so no Kitsap probate lead got a property address (2026-11-16).
+    for i in range(0, len(all_pairs), chunk_size):
+        query_pairs = all_pairs[i:i + chunk_size]
 
         # Reverse map: query_value -> every caller parcel_id that asked for it. The
         # same _callers_for resolver as the county path, so a returned id that
@@ -1575,6 +1570,9 @@ def _batch_query_wa_statewide(
             # S4: safe_http (SSRF defense-in-depth) — see batch note above.
             resp = safe_get(_WA_STATEWIDE_ENDPOINT, params=params, timeout=30)
             if resp.status_code != 200:
+                # Never silent: this is how a whole county's addresses went missing.
+                _logger.warning("Statewide GIS batch: HTTP %s for %d %s parcel value(s)",
+                                resp.status_code, len(query_pairs), county)
                 continue
 
             data = resp.json()

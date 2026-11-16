@@ -88,6 +88,27 @@ to understand *why* the code is the way it is and *what's been attempted before*
   and the NTS and/or deed of trust for a discontinuance.
 - PDFs come from `/WLAUDPublic/PDF10/<guid>/<docid>`, bound to the session cookie.
 - The Cowlitz GIS layer's TAX_STATUS is blank on every parcel.
+## 2026-11-16 — Asotin parcel-layer query: letters only (branch `fix/asotin-arcgis-letters-only`)
+
+**Built / Shipped:** `src/scrapers/enrichment/asotin_parcels.py` `surname_where()`. The where clause now
+searches the surname's longest A-Z letter run only (O'BRIEN -> BRIEN, SMITH-JONES -> SMITH), so nothing
+else from a notice reaches it. This closes the post-deploy review's ArcGIS Medium; Codex says GO and
+the Medium resolved.
+
+**Tried / Decided:**
+- Service-side parameters were tried first. The hosted layer's `displayField` is NAME, but it ignores
+  ArcGIS's `text` parameter: `where=1=1&text=SMITH` returned all 13,651 parcels against 89 for the
+  LIKE, and `text` alone is rejected.
+- Downloading the whole layer was rejected: the cost per run, and keeping every owner name in the
+  county.
+- A broader LIKE only adds candidates, and `match_estate` keeps exact name matches.
+
+**Caught & fixed:** the old check used `re.match` with `$`, which in Python also accepts a trailing
+newline, so "SMITH\n" passed. It now uses `fullmatch` on both the surname and the letter run, checked at
+runtime rather than with `assert`.
+
+**Pending / Handoff:** a short letter run, such as NG, can exceed the 1,000-row page. That is still a
+failed lookup (`LayerError`), never a short list.
 
 ---
 

@@ -1503,10 +1503,26 @@ def _recording_facts(doc) -> dict:
     return {"recording_apns": f.get("recording_apns"), "related_deeds_of_trust": f.get("related_deeds_of_trust")}
 
 
+def lookup_parcel_situs(county: str, state: str, parcel: str) -> str | None:
+    """The parcel's current site address from the county/statewide parcel layer, in the
+    same form pre-foreclosure enrichment stores (so a parcel's leads carry one address),
+    or None when the layer has none or cannot be reached.
+
+    A trustee's printed address can be years out of date (Chelan REC-2628915: the notice
+    said 170 Hill Street; the assessor and the parcel layer give 62 Village Vista Ln for
+    the same legal description). Network: call it OUTSIDE any transaction holding
+    NTS_CANCEL_LOCK_KEY, and freeze what it returns (Codex): a lookup per scrape would let
+    a layer outage flip the address, and with it the lead's dedup hash, between runs."""
+    from src.scrapers.enrichment.county_gis import enrich_parcel_gis
+
+    found = enrich_parcel_gis(parcel, county, state).get("property_address")
+    return " ".join((found or "").split())[:512] or None
+
+
 def approve_recorder_document(db, doc_id: str, *, reviewer: str, values: dict,
                               supersedes: str | None = None, independent: bool = False,
                               discontinued_by: str | None = None, not_discontinued: bool = False,
-                              today=None) -> str:
+                              situs: str | None = None, today=None) -> str:
     """The operator has compared the staged read with the recorded image: write the
     notice they confirmed. Returns the nts_notices id. Caller commits.
 
@@ -1526,6 +1542,11 @@ def approve_recorder_document(db, doc_id: str, *, reviewer: str, values: dict,
     notice is written cancelled. One that cites only its loan (a deed of trust) may end
     this sale or another on the same loan, so approval refuses until the reviewer says
     ``discontinued_by`` (that discontinuance's instrument) or ``not_discontinued``.
+
+    ``situs`` is the parcel's current site address from :func:`lookup_parcel_situs`,
+    resolved by the caller before this takes the lock. When given it becomes the
+    notice's property_address (address_source 'assessor_situs') and the printed address
+    is kept as address_on_notice; without it the printed address stands ('notice').
     """
     import hashlib
     from decimal import Decimal
@@ -1618,11 +1639,13 @@ def approve_recorder_document(db, doc_id: str, *, reviewer: str, values: dict,
     already_cancelled = db.execute(
         select(NtsNotice.cancelled_at).where(NtsNotice.source == prof["source"],
                                              NtsNotice.ts_number == key)).scalar()
-    addr = " ".join((values.get("property_address") or "").split())[:512] or None
+    printed = " ".join((values.get("property_address") or "").split())[:512] or None
+    situs = " ".join((situs or "").split())[:512] or None
+    addr = situs or printed
     approved = {
         "auction_date": auction.isoformat(), "parcel": parcel,
         "auction_time": (values.get("auction_time") or None),
-        "property_address": addr,
+        "property_address": addr, "address_on_notice": printed,
         "principal_owing": None if amount is None else str(amount),
         "principal_owing_basis": basis,
         "trustee": (values.get("trustee") or None), "beneficiary": (values.get("beneficiary") or None),
@@ -1633,6 +1656,8 @@ def approve_recorder_document(db, doc_id: str, *, reviewer: str, values: dict,
         "source": prof["source"], "ts_number": key, "county": doc.county, "state": doc.state,
         "parcel": parcel, "property_address": addr,
         "property_address_normalized": (address_match_key(addr) or None) if addr else None,
+        "address_source": "assessor_situs" if situs else ("notice" if printed else None),
+        "address_on_notice": printed,
         "auction_date": auction, "auction_time": (approved["auction_time"] or "")[:16] or None,
         "auction_location": None, "grantor": grantor[:512],
         "trustee": (approved["trustee"] or "")[:255] or None,
@@ -1663,6 +1688,68 @@ def approve_recorder_document(db, doc_id: str, *, reviewer: str, values: dict,
     doc.decision_note = "; ".join(n for n in notes if n) or None
     doc.fields = {**_recording_facts(doc), "approved": approved}  # no grantor, no OCR text
     return str(notice_id)
+
+
+def refresh_notice_address(db, doc_id: str, *, reviewer: str, situs: str | None) -> tuple[str | None, str]:
+    """Give an already-approved notice its parcel's current site address (``situs``, from
+    :func:`lookup_parcel_situs`, resolved by the caller before this takes the lock),
+    keeping the printed address as address_on_notice. For notices approved before
+    approval did this itself. Returns (old address, new address). Caller commits.
+
+    Refused once the notice has gone out as a trustee-sale lead: its address is part of
+    that lead's identity (dedup_hash is parcel|address), so changing it would deliver,
+    and bill, the same sale again."""
+    from sqlalchemy import select
+
+    from src.db.models import NtsNotice
+    from src.utils.address_intel import address_match_key
+    from src.workers.nts_matcher_task import NTS_CANCEL_LOCK_KEY
+
+    situs = " ".join((situs or "").split())[:512] or None
+    if situs is None:
+        raise ReviewError("no current site address was found for this parcel; nothing changed")
+    db.execute(_sa_text("SELECT pg_advisory_xact_lock(:k)"), {"k": NTS_CANCEL_LOCK_KEY})
+    doc = _recorder_doc_for_review(db, doc_id, ("approved",))
+    notice = db.execute(select(NtsNotice).where(NtsNotice.id == doc.nts_notice_id)
+                        .with_for_update()).scalar_one()
+    if notice.address_source == "assessor_situs" and notice.property_address == situs:
+        return notice.property_address, situs
+    delivered = db.execute(_sa_text("""
+        SELECT 1 FROM results r
+          JOIN jobs j ON j.id = r.job_id
+          JOIN scraper_configs sc ON sc.id = j.scraper_config_id
+         WHERE sc.record_type = 'trustee_sale'
+           AND CAST(r.enrichment_data AS jsonb) -> 'nts_source' ->> 'notice_id' = :n
+         LIMIT 1"""), {"n": str(notice.id)}).first()
+    if delivered:
+        raise ReviewError("this notice has already been delivered as a trustee-sale lead; "
+                          "its address is part of that lead's identity and stays as it is")
+    # A trustee-sale run reads notices before it takes the lock, so one still running may
+    # hold the old address and deliver it after this commits; the next run would then
+    # deliver the same sale again under the new address (Codex P1). Under the exclusive
+    # lock: a run that finished is caught above, one that starts later reads the new one.
+    running = db.execute(_sa_text("""
+        SELECT 1 FROM jobs j
+          JOIN scraper_configs sc ON sc.id = j.scraper_config_id
+         WHERE sc.record_type = 'trustee_sale' AND lower(sc.county) = :county
+           AND j.status NOT IN ('done', 'failed', 'cancelled')
+         LIMIT 1"""), {"county": doc.county.lower()}).first()
+    if running:
+        raise ReviewError(f"a {doc.county.title()} trustee-sale run is in progress; "
+                          f"refresh the address once it finishes")
+    old = notice.property_address
+    printed = notice.address_on_notice or old
+    now = datetime.now(UTC)
+    notice.property_address = situs
+    notice.property_address_normalized = address_match_key(situs) or None
+    notice.address_source, notice.address_on_notice = "assessor_situs", printed
+    approved = dict((doc.fields or {}).get("approved") or {})
+    approved.update({"property_address": situs, "address_on_notice": printed})
+    doc.fields = {**(doc.fields or {}), "approved": approved}
+    doc.decision_note = "; ".join(x for x in (doc.decision_note, f"address set to the parcel's site "
+                                              f"address by {reviewer}") if x)[:512]
+    doc.updated_at = now
+    return old, situs
 
 
 def reject_recorder_document(db, doc_id: str, *, reviewer: str, reason: str) -> None:

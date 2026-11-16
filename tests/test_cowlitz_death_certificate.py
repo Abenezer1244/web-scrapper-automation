@@ -1,4 +1,4 @@
-"""Cowlitz death_certificate: recorded death certificates leave probate for their own type (164).
+"""Cowlitz death_certificate: recorded death certificates leave probate for their own type (165).
 
 Live labels (Cowlitz recorder, 10/15-11/14/2026): "Death Certificate" (agency grantor,
 decedent grantee; or decedent grantor, "PUBLIC THE" grantee) and "Death Certificate to
@@ -13,7 +13,7 @@ from src.scrapers.reliability import ScraperExecutionError
 from src.scrapers.templates.laserfiche_weblink import _DOC_TYPE_MAP, LaserficheWebLinkScraper
 
 _BASE = "https://www.cowlitzinfo.net/WLAudPublic/welcome.aspx?dbid=0&repo=CCIMAGES"
-_MIG = Path(__file__).resolve().parents[1] / "alembic" / "versions" / "164_cowlitz_death_certificate.py"
+_MIG = Path(__file__).resolve().parents[1] / "alembic" / "versions" / "165_cowlitz_death_certificate.py"
 
 
 def _scraper(record_type):
@@ -57,11 +57,11 @@ def test_a_certificate_naming_no_person_is_dropped():
     assert _scraper("death_certificate")._build_record(_row("Death Certificate"), fields) is None
 
 
-def test_migration_chains_onto_163_and_only_touches_cowlitz():
-    spec = importlib.util.spec_from_file_location("_mig164", _MIG)
+def test_migration_chains_onto_164_and_only_touches_cowlitz():
+    spec = importlib.util.spec_from_file_location("_mig165", _MIG)
     mig = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mig)
-    assert (mig.revision, mig.down_revision) == ("164", "163")
+    assert (mig.revision, mig.down_revision) == ("165", "164")
     src = _MIG.read_text(encoding="utf-8")
     assert src.count("lower(county) = 'cowlitz'") == 2
     assert "death_certificate" in _DOC_TYPE_MAP

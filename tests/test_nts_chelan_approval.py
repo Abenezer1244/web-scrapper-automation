@@ -41,6 +41,16 @@ _APN, _DT = "222014846080", "2531058"   # the fixture detail page's own recordin
 _SALE = date.today() + timedelta(days=60)
 
 
+@pytest.fixture(autouse=True)
+def _no_parcel_layer(monkeypatch):
+    """The CLI's approve looks the parcel up on the statewide layer (migration 164). These
+    tests are about review, not addresses: the real off switch keeps them off the network
+    (tests/test_nts_chelan_situs.py covers the lookup)."""
+    import src.scrapers.enrichment.county_gis as cg
+
+    monkeypatch.setattr(cg.settings, "GIS_ENRICHMENT_ENABLED", False, raising=False)
+
+
 @pytest.fixture
 def c():
     with sync_engine.connect() as conn:

@@ -139,12 +139,12 @@ def test_the_source_is_trusted_cap_exempt_and_allowlisted():
     assert "src.scrapers.cowlitz_wa_tax_delinquent" in _ALLOWED_SCRAPER_MODULES
 
 
-def test_migration_166_seeds_an_inactive_connector_at_this_scraper():
-    path = Path(__file__).resolve().parents[1] / "alembic" / "versions" / "166_add_cowlitz_tax_delinquent.py"
-    spec = importlib.util.spec_from_file_location("_mig166", path)
+def test_migration_167_seeds_an_inactive_connector_at_this_scraper():
+    path = Path(__file__).resolve().parents[1] / "alembic" / "versions" / "167_add_cowlitz_tax_delinquent.py"
+    spec = importlib.util.spec_from_file_location("_mig167", path)
     mig = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mig)
-    assert (mig.revision, mig.down_revision) == ("166", "165")
+    assert (mig.revision, mig.down_revision) == ("167", "166")
     module_path, cls = mig._SCRAPER_CLASS.rsplit(".", 1)
     assert getattr(importlib.import_module(module_path), cls) is ctd.CowlitzWATaxDelinquentScraper
     assert "'unknown',\n            false" in path.read_text(encoding="utf-8")

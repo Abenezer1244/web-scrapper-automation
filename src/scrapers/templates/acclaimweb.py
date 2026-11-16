@@ -144,6 +144,15 @@ _CHELAN_DOC_TYPE_MAP = {
 }
 
 
+# Douglas's grid shows the description text ("AFFIT OF HEIRSHIP", "LETTER OF
+# TESTAMENTARY"), which the shared multi-word probate phrases miss (live list
+# 2026-11-15). Pre-foreclosure stays the shared map: doc_types.py partitions it.
+_DOUGLAS_DOC_TYPE_MAP = {
+    **_DOC_TYPE_MAP,
+    "probate": [*_DOC_TYPE_MAP["probate"], "HEIRSHIP", "TESTAMENTARY"],
+}
+
+
 def _grid_date(value: object) -> str | None:
     """GridResults RecordDate -> MM/DD/YYYY, or None when it is not a date.
 
@@ -168,8 +177,8 @@ def _grid_item(row: dict) -> dict:
     """One GridResults row in the shape _records_from_raw reads.
 
     Chelan names the code DocType ("NTS"); Douglas names the text DocTypeDescription
-    ("DEED OF TRUST"). Douglas also sends ParcelNumber, deliberately not read here:
-    parcel_id is a dedup/billing key, and Douglas leads were keyed without it.
+    ("DEED OF TRUST"). Douglas also sends the recording's ParcelNumber, carried as
+    grid_parcel and read only by a scraper that declares its shape (GRID_PARCEL_SHAPE).
     """
     return {
         "instrument": str(row.get("InstrumentNumber") or "").strip(),
@@ -179,6 +188,7 @@ def _grid_item(row: dict) -> dict:
         "grantee": str(row.get("IndirectName") or ""),
         "legal": str(row.get("DocLegalDescription") or ""),
         "parcel": "",
+        "grid_parcel": str(row.get("ParcelNumber") or "").strip(),
         "item_id": str(row.get("TransactionItemId") or ""),
     }
 
@@ -231,6 +241,8 @@ class AcclaimWebScraper(BridgeScraper):
     # and the shape a single APN must have to become the lead's parcel.
     READS_DETAIL_APN = False
     APN_SHAPE = re.compile(r"\d{12}")
+    # The grid's own ParcelNumber is the lead's parcel when it has exactly this shape.
+    GRID_PARCEL_SHAPE: re.Pattern | None = None
 
     @classmethod
     def collection_scope(cls, record_type: str):
@@ -964,6 +976,13 @@ class AcclaimWebScraper(BridgeScraper):
 
                 # Parcel ID
                 parcel = item.get("parcel", "").strip()
+                grid_parcel = item.get("grid_parcel", "")
+                if not parcel and self.GRID_PARCEL_SHAPE and grid_parcel:
+                    if self.GRID_PARCEL_SHAPE.fullmatch(grid_parcel):
+                        parcel = grid_parcel
+                    else:
+                        # Not a parcel of this county's shape: kept for review, never keyed.
+                        record.enrichment_data["grid_parcel_unmatched"] = grid_parcel
                 if parcel:
                     record.parcel_id = parcel
 
@@ -1091,6 +1110,19 @@ class AcclaimWebScraper(BridgeScraper):
         from src.scrapers.enrichment.taxsifter import fill_addresses_by_owner
 
         await fill_addresses_by_owner(self.county, records)
+
+
+class DouglasAcclaimWebScraper(AcclaimWebScraper):
+    """Douglas County's AcclaimWeb: its grid names each recording's 11-digit parcel.
+
+    Douglas leads were keyed (billing dedup_hash = parcel|address) with that parcel
+    until the 2026-11 grid rewrite dropped it; reading it again restores the keys of
+    the leads already delivered (all 12 production rows equal the grid's ParcelNumber,
+    checked 2026-11-15).
+    """
+
+    DOC_TYPE_MAP = _DOUGLAS_DOC_TYPE_MAP
+    GRID_PARCEL_SHAPE = re.compile(r"\d{11}")
 
 
 class ChelanAcclaimWebScraper(AcclaimWebScraper):

@@ -44,6 +44,7 @@ _CANCELLATION_ADMIN: tuple[str, ...] = (
     "RECONVEY",                    # (DEED OF) RECONVEYANCE — loan paid off
     "SATISFACTION",                # satisfaction of mortgage / judgment
     "RELEASE OF LIS PENDENS",
+    "RELEASE LIS PENDENS",         # Douglas recorder spelling (no "OF")
     "RELEASE OF MORTGAGE",
     "RELEASE OF DEED OF TRUST",
     "RELEASE OF NOTICE",           # RELEASE OF NOTICE OF DEFAULT / OF TRUSTEE'S SALE

@@ -21,6 +21,7 @@ from src.scrapers.templates.acclaimweb import (
     _DOC_TYPE_MAP,
     AcclaimWebScraper,
     ChelanAcclaimWebScraper,
+    DouglasAcclaimWebScraper,
     _doc_type_matches,
     _grid_date,
     _grid_item,
@@ -274,7 +275,7 @@ _DOUGLAS = json.loads((_FIX / "douglas_gridresults_20261006.json").read_text())
 
 async def test_douglas_unpaged_grid_is_read_whole(browser):
     page = await _portal(browser, [_DOUGLAS], first_body="sort=&group=&filter=")
-    s = _scraper(page, cls=AcclaimWebScraper, record_type="pre_foreclosure")
+    s = _scraper(page, cls=DouglasAcclaimWebScraper, record_type="pre_foreclosure")
     s.county = "douglas"
     recs = await s._search_and_read("10/06/2026", "10/06/2026")
     lis = [r for r in _DOUGLAS["Data"] if r["DocTypeDescription"] == "LIS PENDENS"]
@@ -282,8 +283,29 @@ async def test_douglas_unpaged_grid_is_read_whole(browser):
     assert len(recs) == len(lis)
     assert recs[0].doc_type == "LIS PENDENS"
     assert recs[0].date_recorded == "10/06/2026"
-    # Douglas leads stay keyed without a parcel (see _grid_item).
-    assert recs[0].parcel_id in (None, "")
+    # The lead carries its recording's own 11-digit parcel (the billing key Douglas's
+    # delivered leads were hashed with).
+    assert len(lis[0]["ParcelNumber"]) == 11, "fixture control"
+    assert recs[0].parcel_id == lis[0]["ParcelNumber"]
+    assert "grid_parcel_unmatched" not in recs[0].enrichment_data
+
+
+async def test_douglas_grid_parcel_of_another_shape_is_kept_for_review_not_keyed(browser):
+    data = copy.deepcopy(_DOUGLAS)
+    lis = next(r for r in data["Data"] if r["DocTypeDescription"] == "LIS PENDENS")
+    lis["ParcelNumber"] = "123456789012"  # 12 digits: not a Douglas parcel
+    page = await _portal(browser, [data], first_body="sort=&group=&filter=")
+    s = _scraper(page, cls=DouglasAcclaimWebScraper, record_type="pre_foreclosure")
+    recs = await s._search_and_read("10/06/2026", "10/06/2026")
+    assert recs[0].parcel_id is None
+    assert recs[0].enrichment_data["grid_parcel_unmatched"] == "123456789012"
+
+
+async def test_other_acclaimweb_sites_never_key_on_the_grid_parcel(browser):
+    page = await _portal(browser, [_DOUGLAS], first_body="sort=&group=&filter=")
+    s = _scraper(page, cls=AcclaimWebScraper, record_type="pre_foreclosure")
+    recs = await s._search_and_read("10/06/2026", "10/06/2026")
+    assert recs and all(r.parcel_id is None for r in recs)
 
 
 async def test_douglas_unpaged_grid_short_of_its_total_fails(browser):
@@ -299,7 +321,8 @@ def test_douglas_dates_and_doc_type_text_are_read():
     item = _grid_item(_DOUGLAS["Data"][0])
     assert item["date_recorded"] == "10/06/2026"
     assert item["doc_type"] == _DOUGLAS["Data"][0]["DocTypeDescription"]
-    assert item["parcel"] == ""
+    assert item["parcel"] == ""  # only a scraper with GRID_PARCEL_SHAPE reads grid_parcel
+    assert item["grid_parcel"] == str(_DOUGLAS["Data"][0].get("ParcelNumber") or "")
 
 
 async def _first_response(s):
@@ -339,15 +362,40 @@ def test_chelan_death_certificate_code_is_a_death_and_tod_stays_a_living_owner()
     assert classify_probate_signal("TOD") is ProbateSignal.TOD_LIVING_OWNER
 
 
-def test_douglas_vocabulary_is_unchanged():
+def test_the_shared_vocabulary_is_unchanged():
     assert AcclaimWebScraper.DOC_TYPE_MAP is _DOC_TYPE_MAP
 
 
-def test_registry_routes_only_chelans_host_to_the_chelan_scraper():
+def test_douglas_pre_foreclosure_is_the_shared_map_that_doc_types_partitions():
+    assert DouglasAcclaimWebScraper.DOC_TYPE_MAP["pre_foreclosure"] == _DOC_TYPE_MAP["pre_foreclosure"]
+
+
+@pytest.mark.parametrize("desc", ["AFFIT OF HEIRSHIP", "LETTER OF TESTAMENTARY",
+                                  "LACK OF PROBATE AFFIDAVIT", "LETTERS OF ADMINISTRATION",
+                                  "AFFIDAVIT OF DEATH", "LAST WILL AND TESTAMENT", "DEATH CERTIFICATE"])
+def test_douglas_probate_document_names_from_its_live_list(desc):
+    assert _doc_type_matches(desc, DouglasAcclaimWebScraper.DOC_TYPE_MAP["probate"])
+
+
+@pytest.mark.parametrize("desc", ["REAL ESTATE CONTRACT", "DEED OF TRUST", "TRUST"])
+def test_douglas_probate_terms_do_not_admit_ordinary_documents(desc):
+    assert not _doc_type_matches(desc, DouglasAcclaimWebScraper.DOC_TYPE_MAP["probate"])
+
+
+def test_douglas_release_of_lis_pendens_is_not_a_lead():
+    from src.scrapers.preforeclosure import is_cancellation_or_admin
+
+    assert _doc_type_matches("RELEASE LIS PENDENS", _DOC_TYPE_MAP["pre_foreclosure"])  # control
+    assert is_cancellation_or_admin("RELEASE LIS PENDENS")
+    assert not is_cancellation_or_admin("LIS PENDENS")
+
+
+def test_registry_routes_chelan_and_douglas_hosts_to_their_scrapers():
     from src.scrapers.registry import _detect_template
 
     assert _detect_template("https://acclaim.co.chelan.wa.us/acclaimweb") is ChelanAcclaimWebScraper
-    assert _detect_template("https://edocs.douglascountywa.gov/AcclaimWeb") is AcclaimWebScraper
+    assert _detect_template("https://edocs.douglascountywa.gov/AcclaimWeb") is DouglasAcclaimWebScraper
+    assert _detect_template("https://edocs.douglascountywa.gov.evil.example/AcclaimWeb") is AcclaimWebScraper
 
 
 def test_grid_dates_are_read_in_the_countys_time_zone():
